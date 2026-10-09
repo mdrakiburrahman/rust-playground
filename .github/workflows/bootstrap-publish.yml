@@ -55,7 +55,6 @@ jobs:
       - name: Publish branch and SHA runtime image
         env:
           GITHUB_HEAD_REF: ${{ github.head_ref }}
-          GITHUB_SHA: ${{ github.event.pull_request.head.sha }}
         run: npx --no-install nx run hello-world:publish
 
       - name: Verify devcontainer manifest
@@ -71,5 +70,5 @@ jobs:
           REGISTRY_ENVIRONMENT: ci
           REGISTRY_IMAGE: hello-world
           REGISTRY_OWNER: ${{ github.repository_owner }}
-          REGISTRY_TAG: sha-${{ github.event.pull_request.head.sha }}
+          REGISTRY_TAG: sha-${{ github.sha }}
         run: npx --no-install nx run tools-scripts:registry-manifest

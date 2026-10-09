@@ -83,6 +83,10 @@ test('normal and source configurations share workspace, user, and lifecycle beha
   assert.match(compose, /target: \/workspaces\/rust-playground/u);
   assert.match(compose, /target: \/home\/vscode\/\.azure/u);
   assert.match(compose, /target: \/home\/vscode\/\.config\/gh/u);
+  assert.match(
+    compose,
+    /source: node_modules[\s\S]*target: \/workspaces\/rust-playground\/node_modules/u,
+  );
   assert.equal(compose.match(/read_only: false/gu)?.length, 2);
 
   const localCompose = readFileSync(
@@ -368,6 +372,9 @@ test('post-create validates tools, installs pinned cargo-make, then runs npm ci'
       if (command === 'rustc') {
         return 'rustc 1.96.1 (stable)\n';
       }
+      if (command === 'id') {
+        return '1000\n';
+      }
       return `${command} version\n`;
     },
     commandExists(command) {
@@ -389,6 +396,9 @@ test('post-create validates tools, installs pinned cargo-make, then runs npm ci'
     'capture:cargo:clippy --version:/repo',
     'exists:cargo-make',
     'execute:cargo:install cargo-make --version 0.37.24 --locked:/repo',
+    'capture:id:-u:/repo',
+    'capture:id:-g:/repo',
+    `execute:sudo:chown -R 1000:1000 ${join('/repo', 'node_modules')}:/repo`,
     'execute:npm:ci:/repo',
   ]);
 });
@@ -402,6 +412,9 @@ test('post-create replaces an unpinned cargo-make and fails wrong Rust early', (
       }
       if (command === 'cargo-make') {
         return 'cargo-make 0.37.23\n';
+      }
+      if (command === 'id') {
+        return '1000\n';
       }
       return 'ok\n';
     },
@@ -417,6 +430,7 @@ test('post-create replaces an unpinned cargo-make and fails wrong Rust early', (
   runPostCreate({ dryRun: false }, dependencies, '/repo');
   assert.deepEqual(executions, [
     'cargo install cargo-make --version 0.37.24 --locked --force',
+    `sudo chown -R 1000:1000 ${join('/repo', 'node_modules')}`,
     'npm ci',
   ]);
 

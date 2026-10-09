@@ -130,6 +130,7 @@ export function runPostCreate(
     dependencies.stdout(
       `Would ensure: cargo-make ${cargoMakeVersion} (installed with --locked)\n`,
     );
+    dependencies.stdout('Would normalize: node_modules ownership\n');
     dependencies.stdout('Would run: npm ci\n');
     return;
   }
@@ -181,7 +182,28 @@ export function runPostCreate(
     dependencies.execute('cargo', args, repositoryRoot);
   }
 
+  const userId = numericId(
+    dependencies.capture('id', ['-u'], repositoryRoot),
+    'user ID',
+  );
+  const groupId = numericId(
+    dependencies.capture('id', ['-g'], repositoryRoot),
+    'group ID',
+  );
+  dependencies.execute(
+    'sudo',
+    ['chown', '-R', `${userId}:${groupId}`, join(repositoryRoot, 'node_modules')],
+    repositoryRoot,
+  );
   dependencies.execute('npm', ['ci'], repositoryRoot);
+}
+
+function numericId(value: string, description: string): string {
+  const normalized = value.trim();
+  if (!/^\d+$/u.test(normalized)) {
+    throw new Error(`Unable to determine the container ${description}.`);
+  }
+  return normalized;
 }
 
 function isMainModule(): boolean {

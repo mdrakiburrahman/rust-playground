@@ -16,3 +16,9 @@ services:
         source: ${HOST_GH_CONFIG_DIR:?Run the devcontainer initializeCommand first}
         target: /home/vscode/.config/gh
         read_only: false
+      - type: volume
+        source: node_modules
+        target: /workspaces/rust-playground/node_modules
+
+volumes:
+  node_modules:
