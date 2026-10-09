@@ -192,7 +192,13 @@ export function runPostCreate(
   );
   dependencies.execute(
     'sudo',
-    ['chown', '-R', `${userId}:${groupId}`, join(repositoryRoot, 'node_modules')],
+    [
+      'chown',
+      '-R',
+      `${userId}:${groupId}`,
+      join(repositoryRoot, 'node_modules'),
+      join(repositoryRoot, '.nx'),
+    ],
     repositoryRoot,
   );
   dependencies.execute('npm', ['ci'], repositoryRoot);

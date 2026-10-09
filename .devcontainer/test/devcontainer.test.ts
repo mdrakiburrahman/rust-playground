@@ -87,6 +87,10 @@ test('normal and source configurations share workspace, user, and lifecycle beha
     compose,
     /source: node_modules[\s\S]*target: \/workspaces\/rust-playground\/node_modules/u,
   );
+  assert.match(
+    compose,
+    /source: nx_cache[\s\S]*target: \/workspaces\/rust-playground\/\.nx/u,
+  );
   assert.equal(compose.match(/read_only: false/gu)?.length, 2);
 
   const localCompose = readFileSync(
@@ -398,7 +402,7 @@ test('post-create validates tools, installs pinned cargo-make, then runs npm ci'
     'execute:cargo:install cargo-make --version 0.37.24 --locked:/repo',
     'capture:id:-u:/repo',
     'capture:id:-g:/repo',
-    `execute:sudo:chown -R 1000:1000 ${join('/repo', 'node_modules')}:/repo`,
+    `execute:sudo:chown -R 1000:1000 ${join('/repo', 'node_modules')} ${join('/repo', '.nx')}:/repo`,
     'execute:npm:ci:/repo',
   ]);
 });
@@ -430,7 +434,7 @@ test('post-create replaces an unpinned cargo-make and fails wrong Rust early', (
   runPostCreate({ dryRun: false }, dependencies, '/repo');
   assert.deepEqual(executions, [
     'cargo install cargo-make --version 0.37.24 --locked --force',
-    `sudo chown -R 1000:1000 ${join('/repo', 'node_modules')}`,
+    `sudo chown -R 1000:1000 ${join('/repo', 'node_modules')} ${join('/repo', '.nx')}`,
     'npm ci',
   ]);
 
@@ -716,6 +720,34 @@ test('publish rejects an alias that flattened an OCI index', () => {
   );
   assert.equal(executions.length, 1);
   assert.match(executions[0] ?? '', /^docker buildx imagetools create /u);
+});
+
+test('publish retries transient registry inspection failures', () => {
+  let captures = 0;
+  const sleeps: number[] = [];
+  const dependencies: PublishDependencies = {
+    capture() {
+      captures += 1;
+      if (captures === 1) {
+        return manifestResult(undefined, 1, 'Get "https://ghcr.io/v2/": EOF');
+      }
+      return manifestResult(provenanceIndex());
+    },
+    environment: {},
+    execute() {
+      assert.fail('current manifests must not be republished');
+    },
+    nodeExecutable: '/node',
+    sleep(milliseconds) {
+      sleeps.push(milliseconds);
+    },
+    stdout() {},
+  };
+
+  publishDevcontainer({ branch: 'feature/example' }, dependencies, repositoryRoot);
+
+  assert.equal(captures, 3);
+  assert.deepEqual(sleeps, [1_000]);
 });
 
 test('publish treats registry errors as failures instead of missing manifests', () => {

@@ -37,6 +37,7 @@ export interface PublishDependencies {
   environment: NodeJS.ProcessEnv;
   execute(command: string, args: readonly string[], cwd: string): void;
   nodeExecutable: string;
+  sleep?(milliseconds: number): void;
   stdout(message: string): void;
 }
 
@@ -89,6 +90,14 @@ const defaultDependencies: PublishDependencies = {
     }
   },
   nodeExecutable: process.execPath,
+  sleep(milliseconds) {
+    Atomics.wait(
+      new Int32Array(new SharedArrayBuffer(4)),
+      0,
+      0,
+      milliseconds,
+    );
+  },
   stdout(message) {
     process.stdout.write(message);
   },
@@ -135,29 +144,42 @@ function inspectRemoteManifest(
   dependencies: PublishDependencies,
   repositoryRoot: string,
 ): RemoteManifest | undefined {
-  const result = dependencies.capture(
-    'docker',
-    ['manifest', 'inspect', reference],
-    repositoryRoot,
-  );
-  if (result.status === 0) {
-    let manifest: unknown;
-    try {
-      manifest = JSON.parse(result.stdout);
-    } catch (error) {
-      throw new Error(`Registry returned invalid manifest JSON for ${reference}.`, {
-        cause: error,
-      });
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const result = dependencies.capture(
+      'docker',
+      ['manifest', 'inspect', reference],
+      repositoryRoot,
+    );
+    if (result.status === 0) {
+      let manifest: unknown;
+      try {
+        manifest = JSON.parse(result.stdout);
+      } catch (error) {
+        throw new Error(`Registry returned invalid manifest JSON for ${reference}.`, {
+          cause: error,
+        });
+      }
+      return { identity: manifestIdentity(manifest), reference };
     }
-    return { identity: manifestIdentity(manifest), reference };
-  }
 
-  const errorOutput = `${result.stderr}\n${result.stdout}`.trim();
-  if (missingManifestPattern.test(errorOutput)) {
-    return undefined;
+    const errorOutput = `${result.stderr}\n${result.stdout}`.trim();
+    if (missingManifestPattern.test(errorOutput)) {
+      return undefined;
+    }
+    if (attempt < 2 && isTransientRegistryError(errorOutput)) {
+      dependencies.sleep?.(1_000 * (attempt + 1));
+      continue;
+    }
+    throw new Error(
+      `Unable to inspect remote manifest ${reference} (exit ${String(result.status)}): ${errorOutput}`,
+    );
   }
-  throw new Error(
-    `Unable to inspect remote manifest ${reference} (exit ${String(result.status)}): ${errorOutput}`,
+  throw new Error(`Unable to inspect remote manifest ${reference}.`);
+}
+
+function isTransientRegistryError(value: string): boolean {
+  return /\b(?:EOF|connection reset|TLS handshake timeout|temporary failure|timeout|unexpected status(?: code)?:? 5\d\d)\b/iu.test(
+    value,
   );
 }
 

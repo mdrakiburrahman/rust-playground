@@ -19,6 +19,10 @@ services:
       - type: volume
         source: node_modules
         target: /workspaces/rust-playground/node_modules
+      - type: volume
+        source: nx_cache
+        target: /workspaces/rust-playground/.nx
 
 volumes:
   node_modules:
+  nx_cache:
