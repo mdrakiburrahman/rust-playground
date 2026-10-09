@@ -11,6 +11,13 @@ const dockerTagPattern = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/u;
 const gitShaPattern = /^[0-9a-f]{7,64}$/iu;
 const platformPattern =
   /^[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._-]*(?:\/[a-z0-9][a-z0-9._-]*)?$/u;
+const remoteManifestMissingPatterns = [
+  /\bmanifest unknown\b/iu,
+  /\bno such manifest\b/iu,
+  /\b(?:GET|HEAD) request to [^\r\n]*\/manifests\/[^\r\n]*:\s*404 Not Found\b/iu,
+] as const;
+const remoteManifestFailurePattern =
+  /\b(?:401|403|408|429|5\d\d)\b|\b(?:authentication required|bad gateway|connection refused|connection reset|denied|failed to authorize|forbidden|gateway timeout|i\/o timeout|internal server error|service unavailable|temporarily unavailable|timed out|timeout|tls handshake|too many requests|unauthorized)\b/iu;
 
 const gitShaEnvironmentVariables = [
   'REGISTRY_SHA',
@@ -72,7 +79,9 @@ export interface DockerBuildExecutorDependencies {
 export interface DockerBuildPlan {
   readonly args: readonly string[];
   readonly imageReferences: readonly string[];
+  readonly immutableImageReferences: readonly string[];
   readonly manifestFile?: string;
+  readonly requireCleanWorktree: boolean;
 }
 
 export class SpawnCommandRunner implements CommandRunner {
@@ -134,20 +143,50 @@ export async function runDockerBuildExecutorWithDependencies(
 
   try {
     const plan = createDockerBuildPlan(options, context, dependencies);
+    const workspaceRoot = path.resolve(context.root);
 
-    if (context.isVerbose) {
-      dependencies.logger.info(
-        `Running ${formatCommand('docker', redactBuildArguments(plan.args))}`,
-      );
+    if (plan.requireCleanWorktree) {
+      requireCleanGitWorktree(dependencies.commandRunner, workspaceRoot);
     }
 
-    const result = dependencies.commandRunner.run('docker', plan.args, {
-      cwd: path.resolve(context.root),
-    });
-    const failure = commandFailure('docker buildx build', result);
-    if (failure) {
-      dependencies.logger.error(failure);
-      return { success: false };
+    const buildImageReferences = selectBuildImageReferences(
+      plan,
+      dependencies,
+      workspaceRoot,
+      context.isVerbose,
+    );
+
+    if (buildImageReferences.length > 0) {
+      const buildArguments = replaceDockerBuildImageReferences(
+        plan,
+        buildImageReferences,
+      );
+
+      if (context.isVerbose) {
+        dependencies.logger.info(
+          `Running ${formatCommand(
+            'docker',
+            redactBuildArguments(buildArguments),
+          )}`,
+        );
+      }
+
+      const result = dependencies.commandRunner.run(
+        'docker',
+        buildArguments,
+        {
+          cwd: workspaceRoot,
+        },
+      );
+      const failure = commandFailure('docker buildx build', result);
+      if (failure) {
+        dependencies.logger.error(failure);
+        return { success: false };
+      }
+    } else {
+      dependencies.logger.info(
+        'All selected image tags already exist as immutable remote manifests; skipping docker buildx build.',
+      );
     }
 
     if (plan.manifestFile) {
@@ -182,6 +221,17 @@ export function createDockerBuildPlan(
     options.platforms === undefined
       ? []
       : validateStringArray(options.platforms, 'platforms', true);
+  const rawImmutableTags =
+    options.immutableTags === undefined
+      ? []
+      : validateStringArray(options.immutableTags, 'immutableTags', true);
+  const requireCleanWorktree =
+    options.requireCleanWorktree === undefined
+      ? false
+      : validateBoolean(
+          options.requireCleanWorktree,
+          'requireCleanWorktree',
+        );
   const expandTokens = createTokenExpander(context, dependencies);
 
   const file = path.normalize(
@@ -203,6 +253,29 @@ export function createDockerBuildPlan(
     validateDockerTag(expandTokens(tag, `tags[${index}]`)),
   );
   rejectDuplicates(tags, 'tags after token expansion');
+  const immutableTags = rawImmutableTags.map((tag, index) =>
+    validateDockerTag(
+      expandTokens(tag, `immutableTags[${index}]`),
+    ),
+  );
+  rejectDuplicates(
+    immutableTags,
+    'immutableTags after token expansion',
+  );
+
+  if (immutableTags.length > 0 && output !== 'push') {
+    throw new Error(
+      'immutableTags can only be used with output "push".',
+    );
+  }
+  const selectedTags = new Set(tags);
+  for (const immutableTag of immutableTags) {
+    if (!selectedTags.has(immutableTag)) {
+      throw new Error(
+        `immutableTags contains "${immutableTag}", which is not present in tags after token expansion.`,
+      );
+    }
+  }
 
   const buildArgs = rawBuildArgs.map((argument, index) =>
     validateNonBlank(
@@ -225,6 +298,9 @@ export function createDockerBuildPlan(
   }
 
   const imageReferences = tags.map((tag) => `${image}:${tag}`);
+  const immutableImageReferences = immutableTags.map(
+    (tag) => `${image}:${tag}`,
+  );
   const args: string[] = ['buildx', 'build', '--file', file];
 
   for (const imageReference of imageReferences) {
@@ -253,8 +329,188 @@ export function createDockerBuildPlan(
   return {
     args,
     imageReferences,
+    immutableImageReferences,
+    requireCleanWorktree,
     ...(manifestFile ? { manifestFile } : {}),
   };
+}
+
+function requireCleanGitWorktree(
+  commandRunner: CommandRunner,
+  workspaceRoot: string,
+): void {
+  const args = [
+    'status',
+    '--porcelain=v1',
+    '--untracked-files=all',
+  ] as const;
+  const result = commandRunner.run('git', args, {
+    captureOutput: true,
+    cwd: workspaceRoot,
+  });
+  const failure = commandFailure(`git ${args.join(' ')}`, result);
+  if (failure) {
+    throw new Error(`Unable to verify a clean Git worktree: ${failure}`);
+  }
+
+  const changes = result.stdout?.trim();
+  if (changes) {
+    throw new Error(
+      `Git worktree must be clean before publication; tracked or untracked changes were found:\n${changes}`,
+    );
+  }
+}
+
+function selectBuildImageReferences(
+  plan: DockerBuildPlan,
+  dependencies: Pick<
+    DockerBuildExecutorDependencies,
+    'commandRunner' | 'logger'
+  >,
+  workspaceRoot: string,
+  isVerbose: boolean,
+): string[] {
+  const immutableImageReferences = new Set(
+    plan.immutableImageReferences,
+  );
+  const selectedImageReferences: string[] = [];
+
+  for (const imageReference of plan.imageReferences) {
+    if (!immutableImageReferences.has(imageReference)) {
+      selectedImageReferences.push(imageReference);
+      continue;
+    }
+
+    if (
+      remoteManifestExists(
+        imageReference,
+        dependencies,
+        workspaceRoot,
+        isVerbose,
+      )
+    ) {
+      dependencies.logger.info(
+        `Immutable image tag already exists; omitting it from this build: ${imageReference}`,
+      );
+      continue;
+    }
+
+    selectedImageReferences.push(imageReference);
+  }
+
+  return selectedImageReferences;
+}
+
+function remoteManifestExists(
+  imageReference: string,
+  dependencies: Pick<
+    DockerBuildExecutorDependencies,
+    'commandRunner' | 'logger'
+  >,
+  workspaceRoot: string,
+  isVerbose: boolean,
+): boolean {
+  const args = [
+    'buildx',
+    'imagetools',
+    'inspect',
+    imageReference,
+  ] as const;
+
+  if (isVerbose) {
+    dependencies.logger.info(
+      `Running ${formatCommand('docker', args)}`,
+    );
+  }
+
+  const result = dependencies.commandRunner.run('docker', args, {
+    captureOutput: true,
+    cwd: workspaceRoot,
+  });
+  if (
+    result.error === undefined &&
+    result.signal == null &&
+    result.status === 0
+  ) {
+    return true;
+  }
+  if (isMissingRemoteManifest(result, imageReference)) {
+    return false;
+  }
+
+  const failure =
+    commandFailure('docker buildx imagetools inspect', result) ??
+    'docker buildx imagetools inspect failed.';
+  throw new Error(
+    `Unable to inspect immutable image tag "${imageReference}": ${failure}`,
+  );
+}
+
+function isMissingRemoteManifest(
+  result: CommandResult,
+  imageReference: string,
+): boolean {
+  if (
+    result.error !== undefined ||
+    result.signal != null ||
+    result.status === null ||
+    result.status === 0
+  ) {
+    return false;
+  }
+
+  const output = [result.stderr, result.stdout]
+    .filter((value): value is string => value !== undefined)
+    .join('\n');
+  if (!output || remoteManifestFailurePattern.test(output)) {
+    return false;
+  }
+
+  const exactBuildxNotFoundPattern = new RegExp(
+    `(?:^|\\r?\\n)ERROR:\\s+${escapeRegularExpression(
+      imageReference,
+    )}:\\s+not found\\s*(?:\\r?\\n|$)`,
+    'iu',
+  );
+  const referenceManifestNotFoundPattern = new RegExp(
+    `\\bmanifest for ["']?${escapeRegularExpression(
+      imageReference,
+    )}["']? (?:was )?not found\\b`,
+    'iu',
+  );
+  if (
+    exactBuildxNotFoundPattern.test(output) ||
+    referenceManifestNotFoundPattern.test(output)
+  ) {
+    return true;
+  }
+
+  return remoteManifestMissingPatterns.some((pattern) =>
+    pattern.test(output),
+  );
+}
+
+function escapeRegularExpression(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+}
+
+function replaceDockerBuildImageReferences(
+  plan: DockerBuildPlan,
+  imageReferences: readonly string[],
+): string[] {
+  const tagArgumentsStart = 4;
+  const tagArgumentsEnd =
+    tagArgumentsStart + plan.imageReferences.length * 2;
+  const tagArguments = imageReferences.flatMap((imageReference) => [
+    '--tag',
+    imageReference,
+  ]);
+
+  return [
+    ...plan.args.slice(0, tagArgumentsStart),
+    ...tagArguments,
+    ...plan.args.slice(tagArgumentsEnd),
+  ];
 }
 
 export function validateDockerTag(tag: string): string {
@@ -465,6 +721,13 @@ function validateNonBlank(value: string, optionName: string): string {
   }
   if (value.includes('\0')) {
     throw new Error(`${optionName} must not contain a null character.`);
+  }
+  return value;
+}
+
+function validateBoolean(value: unknown, optionName: string): boolean {
+  if (typeof value !== 'boolean') {
+    throw new Error(`${optionName} must be a boolean.`);
   }
   return value;
 }

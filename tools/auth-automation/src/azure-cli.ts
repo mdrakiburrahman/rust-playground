@@ -7,7 +7,8 @@ import type {
 
 export const DEFAULT_TENANT = "72f988bf-86f1-41af-91ab-2d7cd011db47";
 
-const TENANT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$/;
+const TENANT_PATTERN =
+  /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 const WSL_DISTRO_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 export const WSL_PID_MARKER = "__AUTH_AUTOMATION_WSL_PID__=";
 const WSL_COMMAND_WRAPPER =
@@ -19,10 +20,10 @@ export function validateTenant(tenant: string): string {
   const normalized = tenant.trim();
   if (!TENANT_PATTERN.test(normalized)) {
     throw new Error(
-      "Tenant must be a GUID or verified tenant domain containing only letters, digits, dots, and hyphens.",
+      "Tenant must be a canonical GUID (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx); tenant domains are not accepted.",
     );
   }
-  return normalized;
+  return normalized.toLowerCase();
 }
 
 export function validateTarget(target: string): CliTarget {

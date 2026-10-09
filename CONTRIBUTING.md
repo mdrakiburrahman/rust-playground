@@ -39,8 +39,12 @@ credential manager from inside WSL:
 
 ```bash
 git config --global credential.helper \
-  "/mnt/c/Program Files/Git/mingw64/bin/git-credential-manager.exe"
+  '/mnt/c/"Program Files"/Git/mingw64/bin/git-credential-manager.exe'
 ```
+
+The outer single quotes preserve the inner double quotes around
+`Program Files` in the stored helper value, so Git invokes the path as one
+executable.
 
 Create the host credential directories that the devcontainer mounts:
 
@@ -61,11 +65,18 @@ Docker daemon configuration, adjusts namespace sysctls, and clears existing
 Docker containers, volumes, and networks.
 
 The bootstrap runs `az login` when the native Linux Azure CLI is not already
-authenticated. GitHub CLI authentication can be completed inside the
-devcontainer with:
+authenticated. For local package publication, a fresh GitHub CLI login inside
+the devcontainer must request the `write:packages` package scope:
 
 ```bash
-gh auth login --hostname github.com --git-protocol https --web
+gh auth login --hostname github.com --git-protocol https --web \
+  --scopes write:packages
+```
+
+Add that scope to an existing login with:
+
+```bash
+gh auth refresh --hostname github.com --scopes write:packages
 ```
 
 The Azure and GitHub CLI directories are mounted read/write, so login and

@@ -61,6 +61,7 @@
     },
     "build": {
       "executor": "nx:run-commands",
+      "cache": false,
       "options": {
         "command": "cargo build --locked --package greeting --all-features",
         "cwd": "."

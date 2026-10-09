@@ -278,6 +278,359 @@ test('falls back to non-shell Git commands only when Git tokens are requested', 
   );
 });
 
+test('rejects dirty tracked or untracked publication worktrees before Docker starts', async (suite) => {
+  const cases = [
+    {
+      changes: ' M bin/hello-world/src/main.rs\n',
+      name: 'tracked change',
+    },
+    {
+      changes: '?? bin/hello-world/local.txt\n',
+      name: 'untracked change',
+    },
+  ] as const;
+
+  for (const testCase of cases) {
+    await suite.test(testCase.name, async () => {
+      const harness = createHarness((command, args) => {
+        if (
+          command === 'git' &&
+          args.join(' ') ===
+            'status --porcelain=v1 --untracked-files=all'
+        ) {
+          return { status: 0, stdout: testCase.changes };
+        }
+        return successfulCommand;
+      });
+      const result = await runDockerBuildExecutorWithDependencies(
+        baseOptions({
+          output: 'push',
+          requireCleanWorktree: true,
+        }),
+        createContext(),
+        harness.dependencies,
+      );
+
+      assert.deepEqual(result, { success: false });
+      assert.deepEqual(
+        harness.invocations.map(({ args, command }) => ({
+          args,
+          command,
+        })),
+        [
+          {
+            args: [
+              'status',
+              '--porcelain=v1',
+              '--untracked-files=all',
+            ],
+            command: 'git',
+          },
+        ],
+      );
+      assert.match(
+        harness.errors.join('\n'),
+        /worktree must be clean.*tracked or untracked/isu,
+      );
+    });
+  }
+});
+
+test('publishes mutable and missing immutable tags in one build', async () => {
+  const sha = 'a'.repeat(40);
+  const immutableTag = `sha-${sha}`;
+  const immutableReference =
+    `example.test/hello-world:${immutableTag}`;
+  const harness = createHarness((command, args) => {
+    if (command === 'git') {
+      return { status: 0, stdout: '' };
+    }
+    if (
+      command === 'docker' &&
+      args.join(' ').startsWith('buildx imagetools inspect ')
+    ) {
+      return {
+        status: 1,
+        stderr: `ERROR: ${immutableReference}: not found`,
+      };
+    }
+    return successfulCommand;
+  });
+  const result = await runDockerBuildExecutorWithDependencies(
+    baseOptions({
+      immutableTags: [immutableTag],
+      manifestFile: 'artifacts/publish-images.txt',
+      output: 'push',
+      requireCleanWorktree: true,
+      tags: ['branch-feature', immutableTag],
+    }),
+    createContext(),
+    harness.dependencies,
+  );
+
+  assert.deepEqual(result, { success: true });
+  assert.deepEqual(
+    harness.invocations.map(({ args, command, options }) => ({
+      args,
+      command,
+      options,
+    })),
+    [
+      {
+        args: [
+          'status',
+          '--porcelain=v1',
+          '--untracked-files=all',
+        ],
+        command: 'git',
+        options: {
+          captureOutput: true,
+          cwd: path.resolve(createContext().root),
+        },
+      },
+      {
+        args: [
+          'buildx',
+          'imagetools',
+          'inspect',
+          immutableReference,
+        ],
+        command: 'docker',
+        options: {
+          captureOutput: true,
+          cwd: path.resolve(createContext().root),
+        },
+      },
+      {
+        args: [
+          'buildx',
+          'build',
+          '--file',
+          path.join(
+            path.resolve(createContext().root, 'bin/hello-world'),
+            'Dockerfile',
+          ),
+          '--tag',
+          'example.test/hello-world:branch-feature',
+          '--tag',
+          immutableReference,
+          '--push',
+          path.resolve(createContext().root, 'bin/hello-world'),
+        ],
+        command: 'docker',
+        options: {
+          cwd: path.resolve(createContext().root),
+        },
+      },
+    ],
+  );
+  assert.deepEqual(harness.manifests, [
+    {
+      contents:
+        'example.test/hello-world:branch-feature\n' +
+        `${immutableReference}\n`,
+      filePath: path.resolve(
+        createContext().root,
+        'artifacts/publish-images.txt',
+      ),
+    },
+  ]);
+});
+
+test('repeat publication omits existing immutable tags but updates mutable tags', async () => {
+  const immutableTag = `sha-${'b'.repeat(40)}`;
+  const immutableReference =
+    `example.test/hello-world:${immutableTag}`;
+  const harness = createHarness((command, args) => {
+    if (
+      command === 'docker' &&
+      args.join(' ').startsWith('buildx imagetools inspect ')
+    ) {
+      return { status: 0, stdout: 'Name: existing manifest\n' };
+    }
+    return successfulCommand;
+  });
+  const result = await runDockerBuildExecutorWithDependencies(
+    baseOptions({
+      immutableTags: [immutableTag],
+      manifestFile: 'artifacts/repeat-images.txt',
+      output: 'push',
+      tags: ['branch-feature', immutableTag],
+    }),
+    createContext(),
+    harness.dependencies,
+  );
+
+  assert.deepEqual(result, { success: true });
+  assert.equal(harness.invocations.length, 2);
+  assert.deepEqual(harness.invocations[0]?.args, [
+    'buildx',
+    'imagetools',
+    'inspect',
+    immutableReference,
+  ]);
+  assert.deepEqual(harness.invocations[1]?.args, [
+    'buildx',
+    'build',
+    '--file',
+    path.join(
+      path.resolve(createContext().root, 'bin/hello-world'),
+      'Dockerfile',
+    ),
+    '--tag',
+    'example.test/hello-world:branch-feature',
+    '--push',
+    path.resolve(createContext().root, 'bin/hello-world'),
+  ]);
+  assert.deepEqual(harness.manifests, [
+    {
+      contents:
+        'example.test/hello-world:branch-feature\n' +
+        `${immutableReference}\n`,
+      filePath: path.resolve(
+        createContext().root,
+        'artifacts/repeat-images.txt',
+      ),
+    },
+  ]);
+  assert.match(
+    harness.information.join('\n'),
+    /Immutable image tag already exists/u,
+  );
+});
+
+test('skips Docker builds when every selected tag is an existing immutable tag', async () => {
+  const immutableTag = `sha-${'c'.repeat(40)}`;
+  const immutableReference =
+    `example.test/hello-world:${immutableTag}`;
+  const harness = createHarness(() => ({
+    status: 0,
+    stdout: 'Name: existing manifest\n',
+  }));
+  const result = await runDockerBuildExecutorWithDependencies(
+    baseOptions({
+      immutableTags: [immutableTag],
+      manifestFile: 'artifacts/immutable-images.txt',
+      output: 'push',
+      tags: [immutableTag],
+    }),
+    createContext(),
+    harness.dependencies,
+  );
+
+  assert.deepEqual(result, { success: true });
+  assert.deepEqual(
+    harness.invocations.map(({ args, command }) => ({
+      args,
+      command,
+    })),
+    [
+      {
+        args: [
+          'buildx',
+          'imagetools',
+          'inspect',
+          immutableReference,
+        ],
+        command: 'docker',
+      },
+    ],
+  );
+  assert.deepEqual(harness.manifests, [
+    {
+      contents: `${immutableReference}\n`,
+      filePath: path.resolve(
+        createContext().root,
+        'artifacts/immutable-images.txt',
+      ),
+    },
+  ]);
+  assert.match(
+    harness.information.join('\n'),
+    /skipping docker buildx build/u,
+  );
+});
+
+test('fails closed on authentication and transient manifest inspection errors', async (suite) => {
+  const immutableTag = `sha-${'d'.repeat(40)}`;
+  const cases: Array<{
+    readonly error?: Error;
+    readonly expected: RegExp;
+    readonly name: string;
+    readonly status: number | null;
+    readonly stderr?: string;
+  }> = [
+    {
+      expected: /401 Unauthorized/u,
+      name: 'authentication failure',
+      status: 1,
+      stderr:
+        'unexpected status from HEAD request to ' +
+        `https://example.test/v2/hello-world/manifests/${immutableTag}: 401 Unauthorized`,
+    },
+    {
+      expected: /503 Service Unavailable/u,
+      name: 'transient registry failure',
+      status: 1,
+      stderr:
+        'unexpected status from HEAD request to ' +
+        `https://example.test/v2/hello-world/manifests/${immutableTag}: 503 Service Unavailable`,
+    },
+    {
+      expected: /authentication required/u,
+      name: 'missing text accompanied by authentication failure',
+      status: 1,
+      stderr: 'manifest not found: authentication required',
+    },
+    {
+      expected: /other-image.*not found/u,
+      name: 'not found response for a different reference',
+      status: 1,
+      stderr: 'ERROR: example.test/other-image:latest: not found',
+    },
+    {
+      expected: /resolver host not found/u,
+      name: 'generic not found response',
+      status: 1,
+      stderr: 'manifest resolver host not found',
+    },
+    {
+      error: new Error('docker is missing'),
+      expected: /Failed to start docker buildx imagetools inspect/u,
+      name: 'inspection spawn failure',
+      status: null,
+    },
+  ];
+
+  for (const testCase of cases) {
+    await suite.test(testCase.name, async () => {
+      const harness = createHarness(() => ({
+        ...(testCase.error ? { error: testCase.error } : {}),
+        status: testCase.status,
+        ...(testCase.stderr ? { stderr: testCase.stderr } : {}),
+      }));
+      const result = await runDockerBuildExecutorWithDependencies(
+        baseOptions({
+          immutableTags: [immutableTag],
+          output: 'push',
+          tags: [immutableTag],
+        }),
+        createContext(),
+        harness.dependencies,
+      );
+
+      assert.deepEqual(result, { success: false });
+      assert.equal(harness.invocations.length, 1);
+      assert.deepEqual(
+        harness.invocations[0]?.args.slice(0, 3),
+        ['buildx', 'imagetools', 'inspect'],
+      );
+      assert.match(harness.errors.join('\n'), testCase.expected);
+      assert.equal(harness.manifests.length, 0);
+    });
+  }
+});
+
 test('rejects invalid plans before Docker starts', async (suite) => {
   const cases: Array<{
     readonly expected: RegExp;
@@ -332,6 +685,33 @@ test('rejects invalid plans before Docker starts', async (suite) => {
       expected: /provide tags through the tags option/u,
       name: 'tag embedded in image',
       options: baseOptions({ image: 'example.test/application:latest' }),
+    },
+    {
+      expected: /immutableTags must contain at least one value/u,
+      name: 'empty immutable tags',
+      options: baseOptions({ immutableTags: [] }),
+    },
+    {
+      expected: /immutableTags can only be used with output "push"/u,
+      name: 'immutable load tag',
+      options: baseOptions({
+        immutableTags: ['dev'],
+      }),
+    },
+    {
+      expected: /not present in tags after token expansion/u,
+      name: 'immutable tag is not selected',
+      options: baseOptions({
+        immutableTags: ['sha-deadbeef'],
+        output: 'push',
+      }),
+    },
+    {
+      expected: /requireCleanWorktree must be a boolean/u,
+      name: 'invalid clean worktree option',
+      options: baseOptions({
+        requireCleanWorktree: 'yes' as unknown as boolean,
+      }),
     },
   ];
 
@@ -501,9 +881,69 @@ test('publishes a complete strict executor schema', () => {
     'context',
     'file',
     'image',
+    'immutableTags',
     'manifestFile',
     'output',
     'platforms',
+    'requireCleanWorktree',
     'tags',
   ]);
+});
+
+test('configures runtime publication namespaces, immutability, and uncached Cargo builds', () => {
+  const helloWorldProject = JSON.parse(
+    readFileSync(
+      new URL(
+        '../../../../../../bin/hello-world/project.json',
+        import.meta.url,
+      ),
+      'utf8',
+    ),
+  ) as {
+    targets: {
+      build: { cache?: boolean };
+      publish: {
+        configurations?: {
+          main?: { tags?: string[] };
+        };
+        options: {
+          immutableTags?: string[];
+          requireCleanWorktree?: boolean;
+          tags?: string[];
+        };
+      };
+    };
+  };
+  const greetingProject = JSON.parse(
+    readFileSync(
+      new URL(
+        '../../../../../../crates/greeting/project.json',
+        import.meta.url,
+      ),
+      'utf8',
+    ),
+  ) as {
+    targets: {
+      build: { cache?: boolean };
+    };
+  };
+
+  assert.deepEqual(helloWorldProject.targets.publish.options.tags, [
+    'branch-{gitBranch}',
+    'sha-{gitSha}',
+  ]);
+  assert.deepEqual(
+    helloWorldProject.targets.publish.options.immutableTags,
+    ['sha-{gitSha}'],
+  );
+  assert.equal(
+    helloWorldProject.targets.publish.options.requireCleanWorktree,
+    true,
+  );
+  assert.deepEqual(
+    helloWorldProject.targets.publish.configurations?.main?.tags,
+    ['sha-{gitSha}', 'latest'],
+  );
+  assert.equal(helloWorldProject.targets.build.cache, false);
+  assert.equal(greetingProject.targets.build.cache, false);
 });

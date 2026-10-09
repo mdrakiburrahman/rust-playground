@@ -6,7 +6,9 @@ the running process, and uses Playwright for only the safe browser steps.
 
 The current default tenant is
 `72f988bf-86f1-41af-91ab-2d7cd011db47`. Override it with
-`--tenant <tenant-guid-or-domain>`.
+`--tenant <canonical-tenant-guid>`. Tenant domains and aliases such as
+`organizations` are rejected because `az account show` reports a GUID
+`tenantId`, which must be compared exactly.
 
 ## Windows: current Azure CLI
 
@@ -152,6 +154,11 @@ the tool enumerates descendants of the launched wrapper PID and invokes
 `Stop-Process -Id` on those numeric PIDs only; it never terminates processes by
 name. For a WSL target, it first terminates the reported Linux Azure CLI PID
 tree and then confirms the Windows `wsl.exe` wrapper tree has exited.
+
+`SIGINT` and `SIGTERM` are graceful cancellation requests. The CLI waits for
+the exact launched process tree to exit, closes its browser context, removes
+browser-login capture files, and then returns the conventional signal exit code
+(`130` for `SIGINT`, `143` for `SIGTERM`).
 
 ## Development targets
 

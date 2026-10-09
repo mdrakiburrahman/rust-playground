@@ -41,9 +41,19 @@ chmod 700 "$HOME/.azure" "$HOME/.config/gh"
 The host's `~/.azure` directory is bind-mounted read/write at
 `/home/vscode/.azure`, and `~/.config/gh` is mounted at
 `/home/vscode/.config/gh`. Run `az login` in WSL before starting the container
-when Azure access is needed. Run `gh auth login` in the devcontainer before
-local GHCR publication. Login and logout changes in the container therefore
-also affect the mounted WSL host state.
+when Azure access is needed. Before local GHCR publication, request the
+`write:packages` package scope with a fresh login or add it to an existing
+login:
+
+```bash
+gh auth login --hostname github.com --git-protocol https --web \
+  --scopes write:packages
+gh auth refresh --hostname github.com --scopes write:packages
+```
+
+The `read:packages` package scope supports downloads but not publication.
+Login and logout changes in the container also affect the mounted WSL host
+state.
 
 Install the pinned host CLI dependencies:
 
@@ -285,8 +295,8 @@ that CI or either publication workflow is currently green.
   and public package visibility as described in the publishing guide.
 - **Azure authentication is missing:** run `az login` in WSL and verify
   `az account show`; the mounted directory must be owned by the WSL user.
-- **GitHub authentication is missing:** run `gh auth login` in the
-  devcontainer and verify `gh auth status`.
+- **GitHub authentication is missing:** run the fresh-login or existing-login
+  refresh command above in the devcontainer, then verify `gh auth status`.
 - **Docker forwarding fails:** verify `docker version` on the WSL host and in
   the workspace.
 - **Stale project:** run `npx nx run devcontainer:down -- --volumes`, then start

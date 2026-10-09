@@ -68,6 +68,7 @@
     },
     "build": {
       "executor": "nx:run-commands",
+      "cache": false,
       "inputs": [
         "production",
         "^production"
@@ -195,9 +196,13 @@
         "context": "{absWorkspaceRoot}",
         "image": "ghcr.io/mdrakiburrahman/rust-playground/hello-world",
         "tags": [
-          "{gitBranch}",
+          "branch-{gitBranch}",
           "sha-{gitSha}"
         ],
+        "immutableTags": [
+          "sha-{gitSha}"
+        ],
+        "requireCleanWorktree": true,
         "platforms": [
           "linux/amd64"
         ],
@@ -213,7 +218,7 @@
         }
       },
       "metadata": {
-        "description": "Push branch/SHA tags, or SHA/latest with the main configuration, after the documented explicit registry login."
+        "description": "From a clean worktree, update a namespaced branch or latest tag while publishing each immutable SHA tag at most once."
       }
     }
   },

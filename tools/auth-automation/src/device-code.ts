@@ -10,8 +10,8 @@ const URL_PATTERN =
   /https:\/\/(?:www\.)?(?:microsoft\.com\/(?:devicelogin|link)|aka\.ms\/devicelogin|login\.microsoft\.com\/device|login\.microsoftonline\.com\/[^\s"'<>]+)(?=[\s"'<>),.;]|$)/i;
 
 const CODE_PATTERNS = [
-  /(?:enter|use)\s+(?:the\s+)?(?:user\s+|device\s+)?code\s*[:=]?\s*["']?([A-Z0-9][A-Z0-9-]{5,20})/i,
-  /(?:user|device)\s+code\s*[:=]\s*["']?([A-Z0-9][A-Z0-9-]{5,20})/i,
+  /(?:enter|use)\s+(?:the\s+)?(?:user\s+|device\s+)?code\s*[:=]?\s*["']?([A-Z0-9][A-Z0-9-]{5,20})(?=[\s"'.,;:)])/i,
+  /(?:user|device)\s+code\s*[:=]\s*["']?([A-Z0-9][A-Z0-9-]{5,20})(?=[\s"'.,;:)])/i,
   /code\s+["']?([A-Z0-9][A-Z0-9-]{5,20})["']?\s+(?:at|on|to authenticate)/i,
 ];
 

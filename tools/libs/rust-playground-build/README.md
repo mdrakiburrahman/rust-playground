@@ -15,7 +15,9 @@ Use `rust-playground-build:docker-build` from an Nx target:
     "file": "{absProjectRoot}/Dockerfile",
     "context": "{absWorkspaceRoot}",
     "image": "ghcr.io/example/application",
-    "tags": ["{gitBranch}", "sha-{gitSha}"],
+    "tags": ["branch-{gitBranch}", "sha-{gitSha}"],
+    "immutableTags": ["sha-{gitSha}"],
+    "requireCleanWorktree": true,
     "platforms": ["linux/amd64", "linux/arm64"],
     "output": "push",
     "manifestFile": "{absWorkspaceRoot}/artifacts/application-images.txt"
@@ -29,6 +31,8 @@ Use `rust-playground-build:docker-build` from an Nx target:
 | `context` | No | Build context; defaults to the Dockerfile directory. |
 | `image` | Yes | Repository without a tag or digest. |
 | `tags` | Yes | Non-empty list of tags, validated after expansion. |
+| `immutableTags` | No | Subset of push tags that are published only when their remote manifest is missing. |
+| `requireCleanWorktree` | No | Reject tracked or untracked Git changes before any Docker command. |
 | `buildArgs` | No | Values passed as separate `--build-arg` arguments. |
 | `platforms` | No | `os/architecture[/variant]` values. |
 | `output` | Yes | `load` adds only `--load`; `push` adds only `--push`. |
@@ -37,6 +41,18 @@ Use `rust-playground-build:docker-build` from an Nx target:
 Load mode accepts zero or one platform because Docker cannot load a
 multi-platform manifest into the local engine. Use push mode for multiple
 platforms.
+
+For immutable push tags, the executor runs
+`docker buildx imagetools inspect` before the build. An existing manifest is
+omitted from the build while mutable tags continue to update. Only explicit
+missing-manifest responses are accepted as absent; authentication, registry,
+network, and other inspection failures stop publication. All missing immutable
+and mutable tags are passed to one build. If every selected tag is an existing
+immutable tag, the executor succeeds without a build.
+
+When `requireCleanWorktree` is enabled, `git status --porcelain=v1
+--untracked-files=all` must report no tracked or untracked changes before the
+first Docker inspection or build command.
 
 ## Tokens
 
@@ -54,7 +70,9 @@ Git values first use common CI environment variables, including
 `REGISTRY_SHA`, `GITHUB_SHA`, `REGISTRY_BRANCH`, and `GITHUB_HEAD_REF`, and
 otherwise use argument-array Git commands. Missing requested values fail the
 executor. Branch tokens are normalized, sanitized, and bounded to 128
-characters. Every final tag is validated against Docker's tag grammar.
+characters. Prefix mutable branch tags (for example, `branch-{gitBranch}`) so
+branch names cannot collide with release or immutable tag namespaces. Every
+final tag is validated against Docker's tag grammar.
 
 Docker and Git commands are spawned directly with argument arrays and
 `shell: false`. Verbose command logging redacts assigned build-argument values.

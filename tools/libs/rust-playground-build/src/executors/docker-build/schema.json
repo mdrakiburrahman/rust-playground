@@ -32,6 +32,21 @@
         "minLength": 1
       }
     },
+    "immutableTags": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "description": "Subset of selected push tags that must not be overwritten. Existing remote manifests are omitted from the build; only a confirmed missing manifest is published.",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "requireCleanWorktree": {
+      "type": "boolean",
+      "default": false,
+      "description": "Reject tracked or untracked Git worktree changes before any Docker command runs."
+    },
     "buildArgs": {
       "type": "array",
       "description": "Build arguments passed as separate --build-arg values without shell evaluation.",
@@ -76,9 +91,13 @@
       "context": "{absWorkspaceRoot}",
       "image": "ghcr.io/example/application",
       "tags": [
-        "{gitBranch}",
+        "branch-{gitBranch}",
         "sha-{gitSha}"
       ],
+      "immutableTags": [
+        "sha-{gitSha}"
+      ],
+      "requireCleanWorktree": true,
       "platforms": [
         "linux/amd64",
         "linux/arm64"

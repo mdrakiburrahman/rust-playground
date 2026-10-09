@@ -27,6 +27,7 @@ import {
 } from '../scripts/post-create.ts';
 import {
   branchAlias,
+  publicationAliases,
   publishDevcontainer,
   type ProcessResult,
   type PublishDependencies,
@@ -624,6 +625,45 @@ function provenanceIndex(reverse = false): unknown {
   };
 }
 
+test('publication aliases isolate reserved and immutable branch identities', () => {
+  assert.deepEqual(publicationAliases('main'), ['main', 'latest']);
+  assert.deepEqual(publicationAliases('refs/heads/main'), ['main', 'latest']);
+
+  const contentHash = 'a'.repeat(64);
+  const adversarialCases = new Map<string, string>([
+    ['Main', 'branch-main'],
+    ['MAIN', 'branch-main'],
+    ['refs/heads/Main', 'branch-main'],
+    ['refs/heads/MAIN', 'branch-main'],
+    ['latest', 'branch-latest'],
+    ['Latest', 'branch-latest'],
+    ['LATEST', 'branch-latest'],
+    ['refs/heads/latest', 'branch-latest'],
+    ['refs/heads/Latest', 'branch-latest'],
+    [contentHash, `branch-${contentHash}`],
+    [contentHash.toUpperCase(), `branch-${contentHash}`],
+    [`refs/heads/${contentHash}`, `branch-${contentHash}`],
+    ['sha-release', 'branch-sha-release'],
+    ['SHA-release', 'branch-sha-release'],
+    [`sha-${contentHash}`, `branch-sha-${contentHash}`],
+    [`refs/heads/sha-${contentHash}`, `branch-sha-${contentHash}`],
+    ['release/v1.2.3', 'branch-release-v1.2.3'],
+    ['v1.2.3', 'branch-v1.2.3'],
+    ['branch-main', 'branch-branch-main'],
+  ]);
+
+  for (const [branch, expectedAlias] of adversarialCases) {
+    const aliases = publicationAliases(branch);
+    assert.deepEqual(aliases, [expectedAlias], branch);
+    assert.match(aliases[0] ?? '', /^branch-/u, branch);
+    assert.notEqual(aliases[0], 'main', branch);
+    assert.notEqual(aliases[0], 'latest', branch);
+    assert.doesNotMatch(aliases[0] ?? '', /^[a-f0-9]{64}$/u, branch);
+    assert.doesNotMatch(aliases[0] ?? '', /^sha-/u, branch);
+    assert.ok((aliases[0]?.length ?? 129) <= 128, branch);
+  }
+});
+
 test('publish is idempotent for an OCI index with provenance', () => {
   const captures: string[] = [];
   const executions: string[] = [];
@@ -631,7 +671,7 @@ test('publish is idempotent for an OCI index with provenance', () => {
     capture(command, args) {
       captures.push(`${command} ${args.join(' ')}`);
       return manifestResult(
-        args.at(-1)?.endsWith(':feature-example')
+        args.at(-1)?.endsWith(':branch-feature-example')
           ? provenanceIndex(true)
           : provenanceIndex(),
       );
@@ -648,7 +688,27 @@ test('publish is idempotent for an OCI index with provenance', () => {
   assert.deepEqual(executions, []);
 });
 
-test('publish builds a missing immutable image and updates main/latest aliases', () => {
+test('exact main publication is idempotent when main/latest are current', () => {
+  let captures = 0;
+  const dependencies: PublishDependencies = {
+    capture() {
+      captures += 1;
+      return manifestResult(provenanceIndex());
+    },
+    environment: {},
+    execute() {
+      assert.fail('current main/latest aliases must not be republished');
+    },
+    nodeExecutable: '/node',
+    stdout() {},
+  };
+
+  publishDevcontainer({ branch: 'main' }, dependencies, repositoryRoot);
+
+  assert.equal(captures, 3);
+});
+
+test('publish builds a missing immutable image and exact main/latest aliases', () => {
   const executions: string[] = [];
   const inspectCounts = new Map<string, number>();
   const manifest = provenanceIndex();
@@ -690,13 +750,48 @@ test('publish builds a missing immutable image and updates main/latest aliases',
   assert.doesNotMatch(executions.join('\n'), /docker image (?:pull|tag|push)/u);
 });
 
+test('case-variant Main publishes only a namespaced branch alias', () => {
+  let aliasInspections = 0;
+  const executions: string[] = [];
+  const dependencies: PublishDependencies = {
+    capture(_command, args) {
+      const reference = args.at(-1) ?? '';
+      if (!reference.endsWith(':branch-main')) {
+        return manifestResult(provenanceIndex());
+      }
+      aliasInspections += 1;
+      return aliasInspections === 1
+        ? manifestResult(undefined, 1, 'manifest unknown')
+        : manifestResult(provenanceIndex());
+    },
+    environment: {},
+    execute(command, args) {
+      executions.push(`${command} ${args.join(' ')}`);
+    },
+    nodeExecutable: '/node',
+    stdout() {},
+  };
+
+  publishDevcontainer({ branch: 'Main' }, dependencies, repositoryRoot);
+
+  assert.equal(executions.length, 1);
+  assert.match(
+    executions[0] ?? '',
+    /--tag ghcr\.io\/mdrakiburrahman\/rust-playground\/devcontainer:branch-main/u,
+  );
+  assert.doesNotMatch(
+    executions[0] ?? '',
+    /--tag [^ ]+:(?:main|latest)(?: |$)/u,
+  );
+});
+
 test('publish rejects an alias that flattened an OCI index', () => {
   let aliasInspections = 0;
   const executions: string[] = [];
   const dependencies: PublishDependencies = {
     capture(_command, args) {
       const reference = args.at(-1) ?? '';
-      if (!reference.endsWith(':feature-example')) {
+      if (!reference.endsWith(':branch-feature-example')) {
         return manifestResult(provenanceIndex());
       }
       aliasInspections += 1;
@@ -775,8 +870,15 @@ test('publish treats registry errors as failures instead of missing manifests', 
 });
 
 test('branch aliases are valid, deterministic, and bounded', () => {
-  assert.equal(branchAlias('refs/heads/Feature/Add API'), 'feature-add-api');
+  assert.equal(
+    branchAlias('refs/heads/Feature/Add API'),
+    'branch-feature-add-api',
+  );
   const long = branchAlias(`feature/${'x'.repeat(200)}`);
   assert.ok(long.length <= 128);
   assert.equal(long, branchAlias(`feature/${'x'.repeat(200)}`));
+  assert.notEqual(
+    branchAlias(`feature/${'X'.repeat(200)}`),
+    branchAlias(`feature/${'x'.repeat(200)}`),
+  );
 });

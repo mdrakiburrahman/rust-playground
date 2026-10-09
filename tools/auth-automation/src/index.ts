@@ -1,9 +1,11 @@
 export {
   AuthAutomationService,
+  AuthOperationCancelledError,
   type AuthAutomationDependencies,
   type BrowserLoginOptions,
   type LoginOptions,
   type StatusOptions,
+  isAuthOperationCancelled,
 } from "./auth-service.js";
 export {
   buildAccountShowCommand,

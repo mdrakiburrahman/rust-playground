@@ -6,7 +6,11 @@ import { Command, InvalidArgumentError } from "commander";
 import { DEFAULT_TENANT, validateTarget } from "./azure-cli.js";
 import type { CliTarget } from "./contracts.js";
 import { createRuntimeDependencies } from "./runtime.js";
-import { AuthAutomationService } from "./auth-service.js";
+import {
+  AuthAutomationService,
+  isAuthOperationCancelled,
+  type AuthAutomationDependencies,
+} from "./auth-service.js";
 
 interface CommonCliOptions {
   readonly target: CliTarget;
@@ -26,6 +30,14 @@ interface BrowserLoginCliOptions {
   readonly account: string;
   readonly timeoutMs: number;
   readonly urlTimeoutMs: number;
+}
+
+export type CliSignal = "SIGINT" | "SIGTERM";
+
+export interface SignalHost {
+  exitCode?: string | number;
+  on(signal: CliSignal, listener: () => void): unknown;
+  off(signal: CliSignal, listener: () => void): unknown;
 }
 
 function parsePositiveInteger(value: string): number {
@@ -54,7 +66,11 @@ function addCommonOptions(command: Command): Command {
       parseTarget,
       "current",
     )
-    .option("--tenant <tenant>", "Azure tenant GUID or domain", DEFAULT_TENANT)
+    .option(
+      "--tenant <tenant>",
+      "Canonical Azure tenant GUID; domains are not accepted",
+      DEFAULT_TENANT,
+    )
     .option(
       "--wsl-distro <name>",
       "Named WSL distribution used with --target wsl",
@@ -118,7 +134,11 @@ export function createProgram(
       "--account <tile>",
       "Accessible name or unique text of an existing account tile",
     )
-    .option("--tenant <tenant>", "Azure tenant GUID or domain", DEFAULT_TENANT)
+    .option(
+      "--tenant <tenant>",
+      "Canonical Azure tenant GUID; domains are not accepted",
+      DEFAULT_TENANT,
+    )
     .option(
       "--timeout-ms <milliseconds>",
       "Overall command timeout",
@@ -159,17 +179,74 @@ export function createProgram(
   return program;
 }
 
-export async function main(argv = process.argv): Promise<void> {
-  const dependencies = createRuntimeDependencies();
-  const program = createProgram(new AuthAutomationService(dependencies));
+function conventionalSignalExitCode(signal: CliSignal): number {
+  return signal === "SIGINT" ? 130 : 143;
+}
+
+export async function runWithSignalHandling(
+  action: () => Promise<unknown>,
+  cancelActive: () => Promise<void>,
+  dependencies: AuthAutomationDependencies,
+  signalHost: SignalHost = process,
+): Promise<void> {
+  let receivedSignal: CliSignal | undefined;
+  let cancellation: Promise<void> | undefined;
+  const handleSignal = (signal: CliSignal): void => {
+    if (receivedSignal) {
+      return;
+    }
+    receivedSignal = signal;
+    cancellation = (async () => {
+      try {
+        await cancelActive();
+      } catch {
+        dependencies.logger.error(
+          "Interrupted authentication cleanup could not be fully confirmed.",
+        );
+      } finally {
+        signalHost.exitCode = conventionalSignalExitCode(signal);
+      }
+    })();
+  };
+  const onSigint = (): void => handleSignal("SIGINT");
+  const onSigterm = (): void => handleSignal("SIGTERM");
+  signalHost.on("SIGINT", onSigint);
+  signalHost.on("SIGTERM", onSigterm);
+
   try {
-    await program.parseAsync(argv);
+    await action();
   } catch (error) {
-    dependencies.logger.error(
-      error instanceof Error ? error.message : String(error),
-    );
-    process.exitCode = 1;
+    if (!receivedSignal && !isAuthOperationCancelled(error)) {
+      dependencies.logger.error(
+        error instanceof Error ? error.message : String(error),
+      );
+      signalHost.exitCode = 1;
+    }
+  } finally {
+    if (cancellation) {
+      await cancellation;
+    }
+    signalHost.off("SIGINT", onSigint);
+    signalHost.off("SIGTERM", onSigterm);
+    if (receivedSignal) {
+      signalHost.exitCode = conventionalSignalExitCode(receivedSignal);
+    }
   }
+}
+
+export async function main(
+  argv = process.argv,
+  dependencies = createRuntimeDependencies(),
+  signalHost: SignalHost = process,
+): Promise<void> {
+  const service = new AuthAutomationService(dependencies);
+  const program = createProgram(service);
+  await runWithSignalHandling(
+    () => program.parseAsync(argv),
+    () => service.cancelActive(),
+    dependencies,
+    signalHost,
+  );
 }
 
 const entryPath = process.argv[1];

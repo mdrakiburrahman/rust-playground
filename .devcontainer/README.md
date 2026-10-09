@@ -23,6 +23,8 @@ Common Nx targets:
 - `nx run devcontainer:publish`: publish a missing immutable image and update
   its branch alias with registry-level Buildx imagetools copying; `main` also
   updates `latest` without flattening OCI indexes or provenance attestations.
+  Only exact `main` or `refs/heads/main` may use those reserved tags; every
+  other branch is isolated under a deterministic `branch-` alias.
 - `nx run devcontainer:verify`: type-check and test lifecycle scripts, then
   verify generated references.
 - `nx run devcontainer:down -- --volumes`: remove only this workspace's

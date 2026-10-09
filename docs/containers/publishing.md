@@ -11,11 +11,25 @@ the publication workflows are currently green.
 ## Authenticate to GHCR
 
 The devcontainer mounts the WSL host's `~/.config/gh` directory read/write.
-Authenticate GitHub CLI, verify the selected account, and pass the token to
-Docker only through the registry login target:
+For a fresh GitHub CLI login, request GitHub Packages write access:
 
 ```bash
-gh auth login --hostname github.com --git-protocol https --web
+gh auth login --hostname github.com --git-protocol https --web \
+  --scopes write:packages
+```
+
+For an existing login, add the package write scope:
+
+```bash
+gh auth refresh --hostname github.com --scopes write:packages
+```
+
+Local publication requires the `write:packages` package scope.
+`read:packages` supports package downloads but is not sufficient for a push.
+Verify the selected account, then pass the token to Docker only through the
+registry login target:
+
+```bash
 gh auth status
 npx nx run tools-scripts:registry-login -- \
   --owner mdrakiburrahman \

@@ -7,6 +7,7 @@ import {
   buildLoginCommand,
   buildWslPathCommand,
   DEFAULT_TENANT,
+  validateTenant,
   WSL_BROWSER_COMMAND,
   WSL_PID_MARKER,
 } from "../src/azure-cli.js";
@@ -17,6 +18,12 @@ import {
   parseCapturedUrlFile,
 } from "../src/browser-login.js";
 import { AuthAutomationService } from "../src/auth-service.js";
+import {
+  main,
+  runWithSignalHandling,
+  type CliSignal,
+  type SignalHost,
+} from "../src/cli.js";
 import {
   decideBrowserAction,
   decideBrowserRedirectAction,
@@ -141,6 +148,30 @@ class MemorySink implements LogSink {
 
   error(message: string): void {
     this.messages.push(message);
+  }
+}
+
+class FakeSignalHost implements SignalHost {
+  exitCode: string | number | undefined;
+  private readonly listeners = new Map<
+    CliSignal,
+    Set<() => void>
+  >();
+
+  on(signal: CliSignal, listener: () => void): void {
+    const listeners = this.listeners.get(signal) ?? new Set();
+    listeners.add(listener);
+    this.listeners.set(signal, listeners);
+  }
+
+  off(signal: CliSignal, listener: () => void): void {
+    this.listeners.get(signal)?.delete(listener);
+  }
+
+  emit(signal: CliSignal): void {
+    for (const listener of this.listeners.get(signal) ?? []) {
+      listener();
+    }
   }
 }
 
@@ -437,6 +468,40 @@ class SequenceBrowserSession implements BrowserSession {
   }
 }
 
+class BlockingBrowserSession implements BrowserSession {
+  readonly observing = deferred<void>();
+  closeCount = 0;
+  private observationReject:
+    | ((error: Error) => void)
+    | undefined;
+  private closed = false;
+
+  async navigate(_url: string): Promise<void> {}
+
+  observe(): Promise<PageSnapshot> {
+    this.observing.resolve();
+    return new Promise<PageSnapshot>((_resolve, reject) => {
+      this.observationReject = reject;
+    });
+  }
+
+  async fillDeviceCode(_code: string): Promise<void> {}
+
+  async clickControl(_control: SafeControl): Promise<void> {}
+
+  async clickAccount(_accountName: string): Promise<void> {}
+
+  async close(): Promise<void> {
+    if (!this.closed) {
+      this.closed = true;
+      this.closeCount += 1;
+      this.observationReject?.(
+        new Error("Browser context closed by cancellation."),
+      );
+    }
+  }
+}
+
 class FakeBrowser implements BrowserAdapter {
   request: BrowserLaunchRequest | undefined;
 
@@ -654,6 +719,36 @@ test("parses streaming Azure device-code prompt variants", () => {
       "Open https://login.microsoft.com/device-neighbor and enter the code QWER-TYUI.",
     ),
     undefined,
+  );
+
+  const splitInsideCodeParser = new DeviceCodeParser();
+  assert.equal(
+    splitInsideCodeParser.push(
+      "Open https://login.microsoft.com/device and enter the code ABCDEF",
+    ),
+    undefined,
+  );
+  assert.deepEqual(
+    splitInsideCodeParser.push("123 to authenticate."),
+    {
+      verificationUrl: "https://login.microsoft.com/device",
+      userCode: "ABCDEF123",
+    },
+  );
+});
+
+test("accepts only canonical tenant GUIDs", () => {
+  assert.equal(
+    validateTenant(DEFAULT_TENANT.toUpperCase()),
+    DEFAULT_TENANT,
+  );
+  assert.throws(
+    () => validateTenant("contoso.onmicrosoft.com"),
+    /canonical GUID.*domains are not accepted/i,
+  );
+  assert.throws(
+    () => validateTenant("organizations"),
+    /canonical GUID/,
   );
 });
 
@@ -1029,6 +1124,100 @@ test("withTimeout waits for asynchronous process cleanup before rejecting", asyn
   cleanupGate.resolve();
   await assert.rejects(observed, /expected timeout/);
   assert.equal(rejected, true);
+});
+
+test("SIGINT waits for active device-login process cleanup and returns exit code 130", async () => {
+  const processes = new ControlledProcessAdapter("");
+  const sink = new MemorySink();
+  const signalHost = new FakeSignalHost();
+  const dependencies = {
+    environment: environment("linux"),
+    processes,
+    browser: new FakeBrowser(
+      new SequenceBrowserSession([snapshot({ bodyText: "unused" })]),
+    ),
+    fileSystem: new FakeFileSystem(),
+    timer: new ManualTimer(),
+    logger: new SecretSafeLogger(sink),
+  };
+
+  const runningMain = main(
+    [
+      "node",
+      "auth-automation",
+      "login",
+      "--target",
+      "current",
+      "--prompt-timeout-ms",
+      "60000",
+    ],
+    dependencies,
+    signalHost,
+  );
+  while (processes.startedCommands.length === 0) {
+    await Promise.resolve();
+  }
+  signalHost.emit("SIGINT");
+  await runningMain;
+
+  assert.equal(processes.terminated, true);
+  assert.equal(processes.loginCompleted, true);
+  assert.equal(signalHost.exitCode, 130);
+  assert.doesNotMatch(
+    sink.messages.join("\n"),
+    /cleanup could not be fully confirmed|Authentication operation was cancelled/,
+  );
+});
+
+test("SIGTERM closes browser, terminates WSL login, removes capture files, and returns 143", async () => {
+  const processes = new BrowserLoginProcessAdapter();
+  const fileSystem = new FakeFileSystem();
+  fileSystem.files.set(
+    `${fileSystem.uniqueDirectory}\\${BROWSER_CAPTURE_URL_FILE}`,
+    `${BROWSER_AUTHORIZE_URL}\n`,
+  );
+  const session = new BlockingBrowserSession();
+  const sink = new MemorySink();
+  const signalHost = new FakeSignalHost();
+  const dependencies = {
+    environment: environment("win32", {
+      LOCALAPPDATA: "C:\\Users\\tester\\AppData\\Local",
+    }),
+    processes,
+    browser: new FakeBrowser(session),
+    fileSystem,
+    timer: new ManualTimer(),
+    logger: new SecretSafeLogger(sink),
+  };
+
+  const runningMain = main(
+    [
+      "node",
+      "auth-automation",
+      "login-browser",
+      "--wsl-distro",
+      "Ubuntu-24.04",
+      "--account",
+      "user@example.com",
+    ],
+    dependencies,
+    signalHost,
+  );
+  await session.observing.promise;
+  signalHost.emit("SIGTERM");
+  await runningMain;
+
+  assert.equal(processes.terminated, true);
+  assert.equal(session.closeCount, 1);
+  assert.deepEqual(fileSystem.removedDirectories, [
+    fileSystem.uniqueDirectory,
+  ]);
+  assert.equal(fileSystem.files.size, 0);
+  assert.equal(signalHost.exitCode, 143);
+  assert.doesNotMatch(
+    sink.messages.join("\n"),
+    /cleanup could not be fully confirmed|Authentication operation was cancelled/,
+  );
 });
 
 test("browser login captures the URL, uses safe controls, verifies localhost, and cleans up", async () => {
@@ -1465,7 +1654,7 @@ test("safety failures wait for confirmed launched-process exit", async () => {
 });
 
 test(
-  "NodeProcessAdapter terminates a Windows cmd wrapper and all descendants",
+  "SIGINT handling awaits real Windows cmd wrapper and descendant cleanup",
   { skip: process.platform !== "win32", timeout: 20_000 },
   async (context) => {
     const childSource =
@@ -1536,9 +1725,26 @@ test(
     assert.equal(isProcessRunning(ids.child), true);
     assert.equal(isProcessRunning(ids.grandchild), true);
 
-    await running.terminate();
-    await running.completion;
+    const signalHost = new FakeSignalHost();
+    const signalHandling = runWithSignalHandling(
+      () => running.completion.then(() => undefined),
+      () => running.terminate(),
+      {
+        environment: environment("win32"),
+        processes: adapter,
+        browser: new FakeBrowser(
+          new SequenceBrowserSession([snapshot({ bodyText: "unused" })]),
+        ),
+        fileSystem: new FakeFileSystem(),
+        timer: new SystemTimer(),
+        logger: new SecretSafeLogger(new MemorySink()),
+      },
+      signalHost,
+    );
+    signalHost.emit("SIGINT");
+    await signalHandling;
 
+    assert.equal(signalHost.exitCode, 130);
     assert.equal(isProcessRunning(running.pid), false);
     assert.equal(isProcessRunning(ids.child), false);
     assert.equal(isProcessRunning(ids.grandchild), false);

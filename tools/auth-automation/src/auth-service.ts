@@ -92,6 +92,15 @@ interface Deferred<T> {
   resolve(value: T): void;
 }
 
+interface ActiveOperation {
+  cancelled: boolean;
+  failure?: unknown;
+  running?: RunningProcess;
+  session?: BrowserSession;
+  readonly completion: Promise<void>;
+  complete(): void;
+}
+
 interface CliCompletionState {
   result?: ProcessResult;
   error?: unknown;
@@ -101,6 +110,19 @@ type CliGraceOutcome =
   | { readonly kind: "success" }
   | { readonly kind: "failed" }
   | { readonly kind: "pending" };
+
+export class AuthOperationCancelledError extends Error {
+  constructor() {
+    super("Authentication operation was cancelled.");
+    this.name = "AuthOperationCancelledError";
+  }
+}
+
+export function isAuthOperationCancelled(
+  error: unknown,
+): error is AuthOperationCancelledError {
+  return error instanceof AuthOperationCancelledError;
+}
 
 function deferred<T>(): Deferred<T> {
   let resolvePromise!: (value: T) => void;
@@ -138,13 +160,69 @@ function pageDiagnostic(sessionSnapshot: {
 }
 
 export class AuthAutomationService {
+  private activeOperation: ActiveOperation | undefined;
+
   constructor(private readonly dependencies: AuthAutomationDependencies) {}
+
+  private beginOperation(): ActiveOperation {
+    if (this.activeOperation) {
+      throw new Error("Another authentication operation is already active.");
+    }
+    const completed = deferred<void>();
+    const operation: ActiveOperation = {
+      cancelled: false,
+      completion: completed.promise,
+      complete: () => completed.resolve(),
+    };
+    this.activeOperation = operation;
+    return operation;
+  }
+
+  private finishOperation(operation: ActiveOperation): void {
+    operation.complete();
+    if (this.activeOperation === operation) {
+      this.activeOperation = undefined;
+    }
+  }
+
+  private throwIfCancelled(operation: ActiveOperation): void {
+    if (operation.cancelled) {
+      throw new AuthOperationCancelledError();
+    }
+  }
+
+  async cancelActive(): Promise<void> {
+    const operation = this.activeOperation;
+    if (!operation) {
+      return;
+    }
+    operation.cancelled = true;
+    const cleanupResults = await Promise.allSettled([
+      operation.running?.terminate(),
+      operation.session?.close(),
+    ]);
+    await operation.completion;
+    const rejected = cleanupResults.find(
+      (result): result is PromiseRejectedResult =>
+        result.status === "rejected",
+    );
+    if (rejected) {
+      throw rejected.reason;
+    }
+    if (
+      operation.failure &&
+      !isAuthOperationCancelled(operation.failure)
+    ) {
+      throw operation.failure;
+    }
+  }
 
   private async automateBrowser(
     session: BrowserSession,
     details: DeviceCodeDetails,
     accountHint: string | undefined,
     timeoutMs: number,
+    operation: ActiveOperation,
   ): Promise<void> {
     const { logger, timer } = this.dependencies;
     const deadline = timer.now() + timeoutMs;
@@ -162,8 +240,10 @@ export class AuthAutomationService {
       timer,
       "Timed out opening the Microsoft device-login page.",
     );
+    this.throwIfCancelled(operation);
 
     while (timer.now() < deadline) {
+      this.throwIfCancelled(operation);
       lastSnapshot = await session.observe();
       const decision = decideBrowserAction(lastSnapshot, {
         codeEntered,
@@ -204,6 +284,7 @@ export class AuthAutomationService {
         );
       }
       await timer.sleep(POLL_INTERVAL_MS);
+      this.throwIfCancelled(operation);
     }
 
     const diagnostic = lastSnapshot
@@ -217,12 +298,15 @@ export class AuthAutomationService {
   private async convertWindowsPathToWsl(
     windowsPath: string,
     wslDistro: string,
+    operation: ActiveOperation,
   ): Promise<string> {
+    this.throwIfCancelled(operation);
     const { environment, processes } = this.dependencies;
     const result = await processes.run(
       buildWslPathCommand(windowsPath, wslDistro, environment),
       WSL_PATH_TIMEOUT_MS,
     );
+    this.throwIfCancelled(operation);
     if (result.exitCode !== 0) {
       throw new Error(
         "Unable to convert the browser-login runtime path for WSL.",
@@ -245,11 +329,13 @@ export class AuthAutomationService {
     tenant: string,
     completion: Promise<ProcessResult>,
     timeoutMs: number,
+    operation: ActiveOperation,
   ): Promise<BrowserAuthorizationRequest> {
     const { fileSystem, timer } = this.dependencies;
     const deadline = timer.now() + timeoutMs;
 
     while (timer.now() < deadline) {
+      this.throwIfCancelled(operation);
       const content = await fileSystem.readTextFile(urlFilePath);
       if (content !== undefined) {
         return assertSafeBrowserAuthorizationUrl(
@@ -269,6 +355,7 @@ export class AuthAutomationService {
           .then(() => ({ kind: "poll" as const })),
       ]);
       if (outcome.kind === "completed") {
+        this.throwIfCancelled(operation);
         const finalContent = await fileSystem.readTextFile(urlFilePath);
         if (finalContent !== undefined) {
           return assertSafeBrowserAuthorizationUrl(
@@ -351,6 +438,7 @@ export class AuthAutomationService {
     timeoutMs: number,
     completion: Promise<ProcessResult>,
     completionState: CliCompletionState,
+    operation: ActiveOperation,
   ): Promise<void> {
     const { logger, timer } = this.dependencies;
     const deadline = timer.now() + timeoutMs;
@@ -364,6 +452,7 @@ export class AuthAutomationService {
         timer,
         "Timed out opening the Microsoft browser authorization page.",
       );
+      this.throwIfCancelled(operation);
     } catch {
       const snapshot = await session.observe().catch(() => undefined);
       if (snapshot && this.browserSnapshotReachedCallback(snapshot, request)) {
@@ -384,6 +473,7 @@ export class AuthAutomationService {
     }
 
     while (timer.now() < deadline) {
+      this.throwIfCancelled(operation);
       const snapshot = await session.observe().catch(() => {
         throw new Error(
           "Unable to inspect the browser authorization page safely.",
@@ -533,6 +623,7 @@ export class AuthAutomationService {
         );
       }
       await timer.sleep(POLL_INTERVAL_MS);
+      this.throwIfCancelled(operation);
     }
     throw new Error(
       "Timed out waiting for the browser authorization localhost callback.",
@@ -540,6 +631,21 @@ export class AuthAutomationService {
   }
 
   async login(options: LoginOptions): Promise<AzureAccount> {
+    const operation = this.beginOperation();
+    try {
+      return await this.loginInternal(options, operation);
+    } catch (error) {
+      operation.failure = error;
+      throw error;
+    } finally {
+      this.finishOperation(operation);
+    }
+  }
+
+  private async loginInternal(
+    options: LoginOptions,
+    operation: ActiveOperation,
+  ): Promise<AzureAccount> {
     const {
       environment,
       processes,
@@ -560,6 +666,7 @@ export class AuthAutomationService {
     const deadline = timer.now() + timeoutMs;
     const remaining = (): number => Math.max(1, deadline - timer.now());
     const command = buildLoginCommand(tenant, options, environment);
+    this.throwIfCancelled(operation);
     const parser = new DeviceCodeParser();
     const deviceCode = deferred<DeviceCodeDetails>();
     let detailsFound = false;
@@ -579,14 +686,21 @@ export class AuthAutomationService {
       onStdout: onOutput,
       onStderr: onOutput,
     });
+    operation.running = running;
     let cliFinished = false;
     const completion = running.completion.then(
       (result) => {
         cliFinished = true;
+        if (operation.running === running) {
+          operation.running = undefined;
+        }
         return result;
       },
       (error: unknown) => {
         cliFinished = true;
+        if (operation.running === running) {
+          operation.running = undefined;
+        }
         throw error;
       },
     );
@@ -617,6 +731,7 @@ export class AuthAutomationService {
 
       const profile = resolveBrowserProfile(environment);
       await fileSystem.ensureDirectory(profile.profilePath);
+      this.throwIfCancelled(operation);
       logger.info(
         `Launching ${profile.browserKind === "edge" ? "Microsoft Edge" : "Playwright Chromium"} with the dedicated auth-automation profile.`,
       );
@@ -625,15 +740,21 @@ export class AuthAutomationService {
         profilePath: profile.profilePath,
         actionTimeoutMs: Math.min(DEFAULT_ACTION_TIMEOUT_MS, remaining()),
       });
+      operation.session = session;
       try {
+        this.throwIfCancelled(operation);
         await this.automateBrowser(
           session,
           { ...details, verificationUrl },
           options.accountHint?.trim() || undefined,
           remaining(),
+          operation,
         );
       } finally {
         await session.close();
+        if (operation.session === session) {
+          operation.session = undefined;
+        }
         session = undefined;
       }
 
@@ -650,12 +771,12 @@ export class AuthAutomationService {
         );
       }
 
-      const account = await this.status({
+      const account = await this.statusInternal({
         target: options.target,
         wslDistro: options.wslDistro,
         tenant,
         timeoutMs: Math.min(STATUS_TIMEOUT_MS, remaining()),
-      });
+      }, operation);
       logger.info(`Azure CLI tenant verified: ${account.tenantId}.`);
       return account;
     } catch (error) {
@@ -669,6 +790,12 @@ export class AuthAutomationService {
       }
       if (session) {
         await session.close().catch(() => undefined);
+        if (operation.session === session) {
+          operation.session = undefined;
+        }
+      }
+      if (operation.cancelled) {
+        throw new AuthOperationCancelledError();
       }
       if (terminationFailure) {
         const detail =
@@ -685,6 +812,21 @@ export class AuthAutomationService {
   }
 
   async loginBrowser(options: BrowserLoginOptions): Promise<AzureAccount> {
+    const operation = this.beginOperation();
+    try {
+      return await this.loginBrowserInternal(options, operation);
+    } catch (error) {
+      operation.failure = error;
+      throw error;
+    } finally {
+      this.finishOperation(operation);
+    }
+  }
+
+  private async loginBrowserInternal(
+    options: BrowserLoginOptions,
+    operation: ActiveOperation,
+  ): Promise<AzureAccount> {
     const {
       environment,
       processes,
@@ -738,17 +880,21 @@ export class AuthAutomationService {
     let operationError: unknown;
 
     try {
+      this.throwIfCancelled(operation);
       await fileSystem.writeTextFile(
         helperWindowsPath,
         BROWSER_CAPTURE_HELPER,
       );
+      this.throwIfCancelled(operation);
       const helperWslPath = await this.convertWindowsPathToWsl(
         helperWindowsPath,
         wslDistro,
+        operation,
       );
       const urlFileWslPath = await this.convertWindowsPathToWsl(
         urlFileWindowsPath,
         wslDistro,
+        operation,
       );
       const command = buildBrowserLoginCommand(
         tenant,
@@ -762,14 +908,21 @@ export class AuthAutomationService {
         `Starting Azure CLI browser login in WSL distribution ${wslDistro}.`,
       );
       running = processes.start(command);
+      operation.running = running;
       completion = running.completion.then(
         (processResult) => {
           cliFinished = true;
+          if (operation.running === running) {
+            operation.running = undefined;
+          }
           cliCompletionState.result = processResult;
           return processResult;
         },
         (error: unknown) => {
           cliFinished = true;
+          if (operation.running === running) {
+            operation.running = undefined;
+          }
           cliCompletionState.error = error;
           throw error;
         },
@@ -781,7 +934,9 @@ export class AuthAutomationService {
           tenant,
           completion,
           Math.min(urlTimeoutMs, remaining()),
+          operation,
         );
+      this.throwIfCancelled(operation);
       logger.addSecret(authorizationRequest.authorizationUrl);
       logger.addSecret(authorizationRequest.redirectUri);
       logger.addSecret(authorizationRequest.state);
@@ -791,13 +946,16 @@ export class AuthAutomationService {
 
       const profile = resolveBrowserProfile(environment);
       await fileSystem.ensureDirectory(profile.profilePath);
+      this.throwIfCancelled(operation);
       session = await browser.launch({
         browserKind: "edge",
         profilePath: profile.profilePath,
         actionTimeoutMs: Math.min(DEFAULT_ACTION_TIMEOUT_MS, remaining()),
       });
+      operation.session = session;
       let browserFlowError: unknown;
       try {
+        this.throwIfCancelled(operation);
         await this.automateBrowserRedirect(
           session,
           authorizationRequest,
@@ -805,6 +963,7 @@ export class AuthAutomationService {
           remaining(),
           completion,
           cliCompletionState,
+          operation,
         );
       } catch (error) {
         browserFlowError = error;
@@ -818,6 +977,9 @@ export class AuthAutomationService {
           );
         }
       } finally {
+        if (operation.session === session) {
+          operation.session = undefined;
+        }
         session = undefined;
       }
       if (browserFlowError) {
@@ -841,12 +1003,12 @@ export class AuthAutomationService {
         );
       }
 
-      result = await this.status({
+      result = await this.statusInternal({
         target: "wsl",
         wslDistro,
         tenant,
         timeoutMs: Math.min(STATUS_TIMEOUT_MS, remaining()),
-      });
+      }, operation);
       logger.info(`Azure CLI tenant verified: ${result.tenantId}.`);
     } catch (error) {
       operationError = error;
@@ -860,9 +1022,15 @@ export class AuthAutomationService {
           );
         }
       }
+      if (operation.cancelled) {
+        operationError = new AuthOperationCancelledError();
+      }
     } finally {
       if (session) {
         await session.close().catch(() => undefined);
+        if (operation.session === session) {
+          operation.session = undefined;
+        }
       }
       try {
         await fileSystem.removeDirectory(runtimeDirectory);
@@ -886,11 +1054,28 @@ export class AuthAutomationService {
   }
 
   async status(options: StatusOptions): Promise<AzureAccount> {
+    const operation = this.beginOperation();
+    try {
+      return await this.statusInternal(options, operation);
+    } catch (error) {
+      operation.failure = error;
+      throw error;
+    } finally {
+      this.finishOperation(operation);
+    }
+  }
+
+  private async statusInternal(
+    options: StatusOptions,
+    operation: ActiveOperation,
+  ): Promise<AzureAccount> {
+    this.throwIfCancelled(operation);
     const { environment, processes, logger } = this.dependencies;
     const tenant = validateTenant(options.tenant ?? DEFAULT_TENANT);
     const timeoutMs = positiveTimeout(options.timeoutMs, STATUS_TIMEOUT_MS);
     const command = buildAccountShowCommand(options, environment);
     const result = await processes.run(command, timeoutMs);
+    this.throwIfCancelled(operation);
     if (result.exitCode !== 0) {
       throw new Error(describeProcessFailure(command.label, result, logger));
     }

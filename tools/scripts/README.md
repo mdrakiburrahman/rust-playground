@@ -23,9 +23,10 @@ npx nx run tools-scripts:registry-public -- \
 ```
 
 In CI, `registry-login` uses `GHCR_TOKEN` and then `GITHUB_TOKEN`. Locally it
-uses `gh auth token`. The selected token is supplied only to
-`docker login ghcr.io --username OWNER --password-stdin`; it is not placed in
-argv, emitted by the CLI, or written to repository files.
+uses `gh auth token`, whose login needs the `write:packages` package scope for
+publication; `read:packages` supports downloads only. The selected token is
+supplied only to `docker login ghcr.io --username OWNER --password-stdin`; it
+is not placed in argv, emitted by the CLI, or written to repository files.
 
 Tag metadata contains a sanitized mutable branch tag, an immutable
 `sha-FULL_GIT_SHA` tag, and structured `latest` metadata only for the default

@@ -28,6 +28,18 @@ export interface DockerBuildExecutorSchema {
   readonly tags: readonly string[];
 
   /**
+   * Selected tags that must never be overwritten after their remote manifest
+   * exists. Supported only for push output.
+   */
+  readonly immutableTags?: readonly string[];
+
+  /**
+   * Requires the Git worktree to have no tracked or untracked changes before
+   * any Docker command runs.
+   */
+  readonly requireCleanWorktree?: boolean;
+
+  /**
    * Values passed to Docker as individual `--build-arg` arguments.
    */
   readonly buildArgs?: readonly string[];

@@ -18,12 +18,15 @@ const defaultRepositoryRoot = realpathSync(
 );
 const missingManifestPattern =
   /\b(?:manifest unknown|name unknown|no such manifest|manifest .* not found)\b/iu;
+const branchAliasPrefix = 'branch-';
+const maximumTagLength = 128;
+const aliasHashLength = 12;
 
 const usage = `Usage: node .devcontainer/scripts/publish.ts [--branch <name>]
 
 Publishes the immutable content-hash image when absent, then updates the current
-branch alias. The main branch also updates latest. Docker authentication must
-already be configured.
+branch alias. Only the exact main branch updates main and latest; every other
+branch uses the branch- namespace. Docker authentication must already be configured.
 `;
 
 export interface ProcessResult {
@@ -184,23 +187,49 @@ function isTransientRegistryError(value: string): boolean {
 }
 
 export function branchAlias(branch: string): string {
-  const withoutRefPrefix = branch
-    .trim()
-    .replace(/^refs\/heads\//u, '')
-    .toLowerCase();
-  let alias = withoutRefPrefix
+  return branchAliasForIdentity(normalizeBranchIdentity(branch));
+}
+
+export function publicationAliases(branch: string): readonly string[] {
+  const identity = normalizeBranchIdentity(branch);
+  return identity === 'main'
+    ? ['main', 'latest']
+    : [branchAliasForIdentity(identity)];
+}
+
+function normalizeBranchIdentity(branch: string): string {
+  return branch.trim().replace(/^refs\/heads\//u, '');
+}
+
+function branchAliasForIdentity(identity: string): string {
+  const slug = identity
+    .toLowerCase()
     .replace(/[^a-z0-9_.-]+/gu, '-')
     .replace(/^[.-]+/u, '')
     .replace(/-+/gu, '-')
     .replace(/[.-]+$/u, '');
-  if (alias.length === 0) {
-    throw new Error(`Branch name cannot produce a container tag: ${branch}`);
+  if (slug.length === 0) {
+    throw new Error(`Branch name cannot produce a container tag: ${identity}`);
   }
-  if (alias.length > 128) {
-    const suffix = createHash('sha256').update(alias).digest('hex').slice(0, 12);
-    alias = `${alias.slice(0, 115).replace(/[.-]+$/u, '')}-${suffix}`;
+
+  const alias = `${branchAliasPrefix}${slug}`;
+  if (alias.length <= maximumTagLength) {
+    return alias;
   }
-  return alias;
+
+  const suffix = createHash('sha256')
+    .update(identity)
+    .digest('hex')
+    .slice(0, aliasHashLength);
+  const maximumSlugLength =
+    maximumTagLength -
+    branchAliasPrefix.length -
+    1 -
+    aliasHashLength;
+  const truncatedSlug = slug
+    .slice(0, maximumSlugLength)
+    .replace(/[.-]+$/u, '');
+  return `${branchAliasPrefix}${truncatedSlug}-${suffix}`;
 }
 
 function resolveBranch(
@@ -270,10 +299,9 @@ export function publishDevcontainer(
     dependencies.stdout(`Image ${immutableReference} already exists; skipping push.\n`);
   }
 
-  const alias = branchAlias(
+  const aliases = publicationAliases(
     resolveBranch(options.branch, dependencies, repositoryRoot),
   );
-  const aliases = [...new Set([alias, ...(alias === 'main' ? ['latest'] : [])])];
   const staleAliases: string[] = [];
   for (const tag of aliases) {
     const reference = `${imageRepository}:${tag}`;
