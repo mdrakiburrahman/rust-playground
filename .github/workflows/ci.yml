@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Verify in source devcontainer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install host CLI dependencies
+        run: npm ci
+
+      - name: Prepare CI host environment
+        run: npx --no-install nx run tools-scripts:ci-prepare
+
+      - name: Start source devcontainer
+        id: devcontainer
+        run: npx --no-install nx run tools-scripts:ci-start-source
+
+      - name: Verify every Nx target
+        env:
+          CONTAINER_ID: ${{ steps.devcontainer.outputs.container_id }}
+        run: npx --no-install nx run tools-scripts:ci-verify
+
+      - name: Remove CI devcontainer resources
+        if: always()
+        env:
+          CI_LABEL: ${{ steps.devcontainer.outputs.ci_label }}
+          COMPOSE_PROJECT: ${{ steps.devcontainer.outputs.compose_project }}
+          CONTAINER_ID: ${{ steps.devcontainer.outputs.container_id }}
+        run: npx --no-install nx run tools-scripts:ci-cleanup

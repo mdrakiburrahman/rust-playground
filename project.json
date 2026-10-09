@@ -1,0 +1,168 @@
+{
+  "name": "rust",
+  "$schema": "./node_modules/nx/schemas/project-schema.json",
+  "projectType": "library",
+  "implicitDependencies": [
+    "greeting",
+    "hello-world"
+  ],
+  "metadata": {
+    "description": "Aggregate targets for the Rust workspace."
+  },
+  "targets": {
+    "format": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": [
+        {
+          "projects": [
+            "greeting",
+            "hello-world"
+          ],
+          "target": "format"
+        }
+      ],
+      "options": {
+        "commands": []
+      },
+      "metadata": {
+        "description": "Format every Rust package through its Nx project."
+      }
+    },
+    "format-check": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": [
+        {
+          "projects": [
+            "greeting",
+            "hello-world"
+          ],
+          "target": "format-check"
+        }
+      ],
+      "options": {
+        "commands": []
+      },
+      "metadata": {
+        "description": "Check formatting for every Rust package through its Nx project."
+      }
+    },
+    "lint": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": [
+        {
+          "projects": [
+            "greeting",
+            "hello-world"
+          ],
+          "target": "lint"
+        }
+      ],
+      "options": {
+        "commands": []
+      },
+      "metadata": {
+        "description": "Run strict Clippy checks for every Rust package."
+      }
+    },
+    "build": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": [
+        {
+          "projects": [
+            "greeting",
+            "hello-world"
+          ],
+          "target": "build"
+        }
+      ],
+      "options": {
+        "commands": []
+      },
+      "metadata": {
+        "description": "Build every Rust package through its Nx project."
+      }
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": [
+        {
+          "projects": [
+            "greeting",
+            "hello-world"
+          ],
+          "target": "test"
+        }
+      ],
+      "options": {
+        "commands": []
+      },
+      "metadata": {
+        "description": "Run package tests without duplicating workspace doc-tests."
+      }
+    },
+    "lockfile-check": {
+      "executor": "nx:run-commands",
+      "cache": true,
+      "inputs": [
+        "{workspaceRoot}/Cargo.toml",
+        "{workspaceRoot}/Cargo.lock",
+        "{workspaceRoot}/crates/*/Cargo.toml",
+        "{workspaceRoot}/bin/*/Cargo.toml"
+      ],
+      "options": {
+        "command": "cargo metadata --locked --format-version 1 --no-deps",
+        "cwd": "."
+      },
+      "metadata": {
+        "description": "Verify that workspace metadata resolves without changing Cargo.lock."
+      }
+    },
+    "doc-test": {
+      "executor": "nx:run-commands",
+      "cache": true,
+      "inputs": [
+        "{workspaceRoot}/Cargo.toml",
+        "{workspaceRoot}/Cargo.lock",
+        "{workspaceRoot}/rust-toolchain.toml",
+        "{workspaceRoot}/crates/*/Cargo.toml",
+        "{workspaceRoot}/crates/*/src/**/*",
+        "{workspaceRoot}/bin/*/Cargo.toml",
+        "{workspaceRoot}/bin/*/src/**/*"
+      ],
+      "options": {
+        "command": "cargo test --locked --workspace --doc --all-features",
+        "cwd": "."
+      },
+      "metadata": {
+        "description": "Run workspace doc-tests once."
+      }
+    },
+    "verify": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": [
+        "format-check",
+        "lint",
+        "build",
+        "test",
+        "lockfile-check",
+        "doc-test"
+      ],
+      "options": {
+        "commands": []
+      },
+      "metadata": {
+        "description": "Run all package checks plus workspace-only Rust checks."
+      }
+    }
+  },
+  "tags": [
+    "scope:rust",
+    "type:aggregate"
+  ]
+}

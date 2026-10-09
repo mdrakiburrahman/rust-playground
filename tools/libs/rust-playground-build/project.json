@@ -1,0 +1,40 @@
+{
+  "name": "rust-playground-build",
+  "$schema": "../../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "library",
+  "sourceRoot": "tools/libs/rust-playground-build/src",
+  "metadata": {
+    "description": "Local Nx plugin for public, general-purpose Docker Buildx execution.",
+    "js": {
+      "isInPackageManagerWorkspaces": true
+    }
+  },
+  "targets": {
+    "typecheck": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "npx --no-install tsc --project tools/libs/rust-playground-build/tsconfig.json"
+      }
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "npx --no-install tsx --test tools/libs/rust-playground-build/src/executors/docker-build/executor.test.ts"
+      }
+    },
+    "verify": {
+      "executor": "nx:run-commands",
+      "dependsOn": [
+        "typecheck",
+        "test"
+      ],
+      "options": {
+        "commands": []
+      }
+    }
+  },
+  "tags": [
+    "scope:tools",
+    "type:nx-plugin"
+  ]
+}

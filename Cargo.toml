@@ -1,0 +1,32 @@
+[workspace]
+members = ["bin/*", "crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+authors = ["Raki <mdrakiburrahman@users.noreply.github.com>"]
+license = "MIT"
+repository = "https://github.com/mdrakiburrahman/rust-playground"
+readme = "README.md"
+
+[workspace.dependencies]
+anyhow = "1"
+assert_cmd = "2"
+clap = { version = "4", features = ["derive"] }
+greeting = { path = "crates/greeting" }
+predicates = "3"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+clone_on_ref_ptr = "warn"
+expect_used = "warn"
+large_enum_variant = "warn"
+missing_errors_doc = "warn"
+unwrap_used = "warn"

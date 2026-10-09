@@ -1,0 +1,9 @@
+.git
+.github
+.nx
+dev
+docs
+node_modules
+target
+tools
+*.log

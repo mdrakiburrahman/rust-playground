@@ -1,0 +1,41 @@
+{
+  "name": "rust-playground",
+  "dockerComposeFile": "docker-compose.yml",
+  "service": "workspace",
+  "runServices": [
+    "workspace"
+  ],
+  "workspaceFolder": "/workspaces/rust-playground",
+  "shutdownAction": "stopCompose",
+  "containerUser": "vscode",
+  "remoteUser": "vscode",
+  "updateRemoteUserUID": true,
+  "initializeCommand": [
+    "node",
+    ".devcontainer/scripts/initialize.ts"
+  ],
+  "postCreateCommand": [
+    "node",
+    ".devcontainer/scripts/post-create.ts"
+  ],
+  "waitFor": "postCreateCommand",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "vadimcn.vscode-lldb"
+      ],
+      "settings": {
+        "files.watcherExclude": {
+          "**/.git/objects/**": true,
+          "**/.nx/**": true,
+          "**/node_modules/**": true,
+          "**/target/**": true
+        },
+        "rust-analyzer.check.command": "clippy",
+        "terminal.integrated.defaultProfile.linux": "bash"
+      }
+    }
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "name": "rust-playground",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "nx": {},
+  "overrides": {
+    "axios": "1.20.0",
+    "brace-expansion": "5.0.12",
+    "smol-toml": "1.9.0"
+  },
+  "devDependencies": {
+    "@devcontainers/cli": "0.89.0",
+    "@nx/devkit": "23.2.1",
+    "@types/node": "24.7.0",
+    "commander": "14.0.1",
+    "nx": "23.2.1",
+    "playwright": "1.63.0",
+    "tsx": "4.20.6",
+    "typescript": "5.9.2"
+  }
+}

@@ -1,0 +1,18 @@
+services:
+  workspace:
+    image: ghcr.io/mdrakiburrahman/rust-playground/devcontainer:d84da0b0dffa796063b6748360647001c3b29521c0c547dcf4f4faf6d7b5a2fd
+    command: sleep infinity
+    init: true
+    volumes:
+      - type: bind
+        source: ..
+        target: /workspaces/rust-playground
+        consistency: cached
+      - type: bind
+        source: ${HOST_AZURE_DIR:?Run the devcontainer initializeCommand first}
+        target: /home/vscode/.azure
+        read_only: false
+      - type: bind
+        source: ${HOST_GH_CONFIG_DIR:?Run the devcontainer initializeCommand first}
+        target: /home/vscode/.config/gh
+        read_only: false
