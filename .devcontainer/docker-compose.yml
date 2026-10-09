@@ -22,7 +22,11 @@ services:
       - type: volume
         source: nx_cache
         target: /workspaces/rust-playground/.nx
+      - type: volume
+        source: rust_target
+        target: /workspaces/rust-playground/target
 
 volumes:
   node_modules:
   nx_cache:
+  rust_target:

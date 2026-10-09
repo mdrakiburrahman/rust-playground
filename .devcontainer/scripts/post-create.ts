@@ -131,6 +131,7 @@ export function runPostCreate(
       `Would ensure: cargo-make ${cargoMakeVersion} (installed with --locked)\n`,
     );
     dependencies.stdout('Would normalize: node_modules ownership\n');
+    dependencies.stdout('Would trust: the mounted Git workspace\n');
     dependencies.stdout('Would run: npm ci\n');
     return;
   }
@@ -198,7 +199,13 @@ export function runPostCreate(
       `${userId}:${groupId}`,
       join(repositoryRoot, 'node_modules'),
       join(repositoryRoot, '.nx'),
+      join(repositoryRoot, 'target'),
     ],
+    repositoryRoot,
+  );
+  dependencies.execute(
+    'git',
+    ['config', '--global', '--add', 'safe.directory', repositoryRoot],
     repositoryRoot,
   );
   dependencies.execute('npm', ['ci'], repositoryRoot);

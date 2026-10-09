@@ -91,6 +91,10 @@ test('normal and source configurations share workspace, user, and lifecycle beha
     compose,
     /source: nx_cache[\s\S]*target: \/workspaces\/rust-playground\/\.nx/u,
   );
+  assert.match(
+    compose,
+    /source: rust_target[\s\S]*target: \/workspaces\/rust-playground\/target/u,
+  );
   assert.equal(compose.match(/read_only: false/gu)?.length, 2);
 
   const localCompose = readFileSync(
@@ -402,7 +406,8 @@ test('post-create validates tools, installs pinned cargo-make, then runs npm ci'
     'execute:cargo:install cargo-make --version 0.37.24 --locked:/repo',
     'capture:id:-u:/repo',
     'capture:id:-g:/repo',
-    `execute:sudo:chown -R 1000:1000 ${join('/repo', 'node_modules')} ${join('/repo', '.nx')}:/repo`,
+    `execute:sudo:chown -R 1000:1000 ${join('/repo', 'node_modules')} ${join('/repo', '.nx')} ${join('/repo', 'target')}:/repo`,
+    'execute:git:config --global --add safe.directory /repo:/repo',
     'execute:npm:ci:/repo',
   ]);
 });
@@ -434,7 +439,8 @@ test('post-create replaces an unpinned cargo-make and fails wrong Rust early', (
   runPostCreate({ dryRun: false }, dependencies, '/repo');
   assert.deepEqual(executions, [
     'cargo install cargo-make --version 0.37.24 --locked --force',
-    `sudo chown -R 1000:1000 ${join('/repo', 'node_modules')} ${join('/repo', '.nx')}`,
+    `sudo chown -R 1000:1000 ${join('/repo', 'node_modules')} ${join('/repo', '.nx')} ${join('/repo', 'target')}`,
+    'git config --global --add safe.directory /repo',
     'npm ci',
   ]);
 
