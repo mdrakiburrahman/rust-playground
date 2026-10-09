@@ -1,0 +1,45 @@
+{
+  "$schema": "./node_modules/nx/schemas/nx-schema.json",
+  "useDaemonProcess": false,
+  "plugins": [
+    {
+      "plugin": "./tools/libs/rust-playground-build/src/index.ts"
+    }
+  ],
+  "namedInputs": {
+    "default": [
+      "{projectRoot}/**/*",
+      "!{projectRoot}/target/**/*",
+      "!{projectRoot}/node_modules/**/*",
+      "!{projectRoot}/logs/**/*",
+      "!{projectRoot}/docs/**/*",
+      "!{projectRoot}/**/*.md"
+    ],
+    "production": [
+      "default"
+    ]
+  },
+  "targetDefaults": {
+    "build": {
+      "inputs": [
+        "production"
+      ],
+      "cache": true
+    },
+    "lint": {
+      "inputs": [
+        "default"
+      ],
+      "cache": true
+    },
+    "test": {
+      "inputs": [
+        "default"
+      ],
+      "cache": false
+    },
+    "verify": {
+      "cache": false
+    }
+  }
+}

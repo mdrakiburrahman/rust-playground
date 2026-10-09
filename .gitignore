@@ -1,0 +1,31 @@
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+
+# Node / Nx
+node_modules/
+.nx/
+
+# Rust
+debug/
+target/
+**/*.rs.bk
+*.pdb
+**/mutants.out*/
+
+# Devcontainer-local state
+.devcontainer/.env
+.devcontainer/.devcontainer-hash.txt
+
+# Generated build state, coverage, and logs
+.ci-logs/
+coverage/
+dist/
+logs/
+*.log
+out/
+
+# Editors
+.idea/
+.vscode/settings.json

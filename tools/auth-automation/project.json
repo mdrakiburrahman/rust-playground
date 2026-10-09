@@ -1,0 +1,68 @@
+{
+  "name": "auth-automation",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "sourceRoot": "tools/auth-automation/src",
+  "projectType": "library",
+  "tags": [
+    "scope:tools",
+    "type:automation"
+  ],
+  "targets": {
+    "login": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "tsx tools/auth-automation/src/cli.ts login",
+        "cwd": ".",
+        "forwardAllArgs": true
+      }
+    },
+    "login-browser": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "tsx tools/auth-automation/src/cli.ts login-browser",
+        "cwd": ".",
+        "forwardAllArgs": true
+      }
+    },
+    "status": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "tsx tools/auth-automation/src/cli.ts status",
+        "cwd": ".",
+        "forwardAllArgs": true
+      }
+    },
+    "browser-install": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "playwright install chromium",
+        "cwd": "."
+      }
+    },
+    "typecheck": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "tsc -p tools/auth-automation/tsconfig.json --noEmit",
+        "cwd": "."
+      }
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "tsx --test tools/auth-automation/test/auth-automation.test.ts",
+        "cwd": "."
+      }
+    },
+    "verify": {
+      "executor": "nx:run-commands",
+      "dependsOn": [
+        "typecheck",
+        "test"
+      ],
+      "options": {
+        "command": "node -e \"console.log('auth-automation verification complete')\"",
+        "cwd": "."
+      }
+    }
+  }
+}

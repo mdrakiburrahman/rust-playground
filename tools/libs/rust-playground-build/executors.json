@@ -1,0 +1,9 @@
+{
+  "executors": {
+    "docker-build": {
+      "implementation": "./src/executors/docker-build/executor",
+      "schema": "./src/executors/docker-build/schema.json",
+      "description": "Build, load, or push a Docker image with docker buildx."
+    }
+  }
+}

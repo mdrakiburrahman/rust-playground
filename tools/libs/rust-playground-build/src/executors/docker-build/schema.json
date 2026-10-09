@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "version": 2,
+  "cli": "nx",
+  "title": "Docker build executor",
+  "description": "Builds an image with docker buildx and explicitly loads or pushes the result.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "file": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Path to the Dockerfile. Supports {absWorkspaceRoot}, {absProjectRoot}, {projectName}, {env:NAME}, {gitSha}, {gitShortSha}, {gitBranch}, and {gitBranchTag} tokens."
+    },
+    "context": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Docker build context. Defaults to the Dockerfile directory and supports the same tokens as file."
+    },
+    "image": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Image repository without a tag or digest. Supports executor tokens."
+    },
+    "tags": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "description": "Image tags. Tokens are expanded before strict Docker tag validation.",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "immutableTags": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "description": "Subset of selected push tags that must not be overwritten. Existing remote manifests are omitted from the build; only a confirmed missing manifest is published.",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "requireCleanWorktree": {
+      "type": "boolean",
+      "default": false,
+      "description": "Reject tracked or untracked Git worktree changes before any Docker command runs."
+    },
+    "buildArgs": {
+      "type": "array",
+      "description": "Build arguments passed as separate --build-arg values without shell evaluation.",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "platforms": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "description": "Target platforms in os/architecture[/variant] form. Load mode accepts at most one platform.",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "output": {
+      "type": "string",
+      "enum": [
+        "load",
+        "push"
+      ],
+      "description": "Uses --load for load mode or --push for push mode."
+    },
+    "manifestFile": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Optional path for a newline-delimited manifest of fully qualified image references, written only after success."
+    }
+  },
+  "required": [
+    "file",
+    "image",
+    "tags",
+    "output"
+  ],
+  "examples": [
+    {
+      "file": "{absProjectRoot}/Dockerfile",
+      "context": "{absWorkspaceRoot}",
+      "image": "ghcr.io/example/application",
+      "tags": [
+        "{gitBranchTag}",
+        "sha-{gitSha}"
+      ],
+      "immutableTags": [
+        "sha-{gitSha}"
+      ],
+      "requireCleanWorktree": true,
+      "platforms": [
+        "linux/amd64",
+        "linux/arm64"
+      ],
+      "output": "push",
+      "manifestFile": "{absWorkspaceRoot}/artifacts/images.txt"
+    }
+  ]
+}

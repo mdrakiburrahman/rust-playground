@@ -1,0 +1,16 @@
+[package]
+name = "greeting"
+description = "Reusable greeting validation and formatting"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+
+[dependencies]
+thiserror.workspace = true
+
+[lints]
+workspace = true

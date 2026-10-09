@@ -1,0 +1,229 @@
+{
+  "name": "hello-world",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "sourceRoot": "bin/hello-world/src",
+  "projectType": "application",
+  "implicitDependencies": [
+    "greeting"
+  ],
+  "namedInputs": {
+    "default": [
+      "{projectRoot}/Cargo.toml",
+      "{projectRoot}/README.md",
+      "{projectRoot}/src/**/*",
+      "{projectRoot}/tests/**/*",
+      "{workspaceRoot}/Cargo.toml",
+      "{workspaceRoot}/Cargo.lock",
+      "{workspaceRoot}/rust-toolchain.toml",
+      "{workspaceRoot}/rustfmt.toml"
+    ],
+    "production": [
+      "default",
+      "!{projectRoot}/README.md",
+      "!{projectRoot}/tests/**/*"
+    ]
+  },
+  "metadata": {
+    "description": "Command-line greeting application and runtime container."
+  },
+  "targets": {
+    "format": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "cargo fmt --package hello-world",
+        "cwd": "."
+      },
+      "metadata": {
+        "description": "Format the hello-world package."
+      }
+    },
+    "format-check": {
+      "executor": "nx:run-commands",
+      "cache": true,
+      "inputs": [
+        "default"
+      ],
+      "options": {
+        "command": "cargo fmt --package hello-world -- --check",
+        "cwd": "."
+      },
+      "metadata": {
+        "description": "Check formatting for the hello-world package."
+      }
+    },
+    "lint": {
+      "executor": "nx:run-commands",
+      "inputs": [
+        "default",
+        "^default"
+      ],
+      "options": {
+        "command": "cargo clippy --locked --package hello-world --all-targets --all-features -- -D warnings",
+        "cwd": "."
+      },
+      "metadata": {
+        "description": "Run Clippy for every hello-world target with warnings denied."
+      }
+    },
+    "build": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "inputs": [
+        "production",
+        "^production"
+      ],
+      "options": {
+        "command": "cargo build --locked --package hello-world --all-features",
+        "cwd": "."
+      },
+      "metadata": {
+        "description": "Build the hello-world package."
+      }
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "inputs": [
+        "default",
+        "^default"
+      ],
+      "options": {
+        "command": "cargo test --locked --package hello-world --bins --tests --examples --all-features",
+        "cwd": "."
+      },
+      "metadata": {
+        "description": "Run hello-world binary and integration tests; workspace doc-tests run in rust:doc-test."
+      }
+    },
+    "verify": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": [
+        "format-check",
+        "lint",
+        "build",
+        "test"
+      ],
+      "options": {
+        "commands": []
+      },
+      "metadata": {
+        "description": "Run all hello-world quality targets."
+      }
+    },
+    "run": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "cargo run --locked --package hello-world --",
+        "cwd": ".",
+        "forwardAllArgs": true
+      },
+      "metadata": {
+        "description": "Run hello-world and forward arguments to the CLI."
+      }
+    },
+    "image": {
+      "executor": "rust-playground-build:docker-build",
+      "cache": false,
+      "inputs": [
+        "default",
+        "^default",
+        "{projectRoot}/Dockerfile",
+        "{workspaceRoot}/.dockerignore"
+      ],
+      "outputs": [
+        "{workspaceRoot}/target/images/hello-world-load.txt"
+      ],
+      "options": {
+        "file": "{absProjectRoot}/Dockerfile",
+        "context": "{absWorkspaceRoot}",
+        "image": "ghcr.io/mdrakiburrahman/rust-playground/hello-world",
+        "tags": [
+          "dev"
+        ],
+        "platforms": [
+          "linux/amd64"
+        ],
+        "output": "load",
+        "manifestFile": "{absWorkspaceRoot}/target/images/hello-world-load.txt"
+      },
+      "configurations": {
+        "ci": {
+          "tags": [
+            "sha-{gitSha}"
+          ]
+        },
+        "ci-main": {
+          "tags": [
+            "sha-{gitSha}",
+            "latest"
+          ]
+        }
+      },
+      "metadata": {
+        "description": "Build and load the linux/amd64 runtime image with a dev-safe local tag."
+      }
+    },
+    "image-smoke": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": [
+        "image"
+      ],
+      "options": {
+        "command": "docker run --rm --platform linux/amd64 ghcr.io/mdrakiburrahman/rust-playground/hello-world:dev --name Nx",
+        "cwd": "."
+      },
+      "metadata": {
+        "description": "Run the locally loaded dev image and require a successful greeting."
+      }
+    },
+    "publish": {
+      "executor": "rust-playground-build:docker-build",
+      "cache": false,
+      "inputs": [
+        "default",
+        "^default",
+        "{projectRoot}/Dockerfile",
+        "{workspaceRoot}/.dockerignore"
+      ],
+      "outputs": [
+        "{workspaceRoot}/target/images/hello-world-publish.txt"
+      ],
+      "options": {
+        "file": "{absProjectRoot}/Dockerfile",
+        "context": "{absWorkspaceRoot}",
+        "image": "ghcr.io/mdrakiburrahman/rust-playground/hello-world",
+        "tags": [
+          "{gitBranchTag}",
+          "sha-{gitSha}"
+        ],
+        "immutableTags": [
+          "sha-{gitSha}"
+        ],
+        "requireCleanWorktree": true,
+        "platforms": [
+          "linux/amd64"
+        ],
+        "output": "push",
+        "manifestFile": "{absWorkspaceRoot}/target/images/hello-world-publish.txt"
+      },
+      "configurations": {
+        "main": {
+          "tags": [
+            "sha-{gitSha}",
+            "latest"
+          ]
+        }
+      },
+      "metadata": {
+        "description": "From a clean worktree, update a namespaced branch or latest tag while publishing each immutable SHA tag at most once."
+      }
+    }
+  },
+  "tags": [
+    "scope:rust",
+    "type:application"
+  ]
+}

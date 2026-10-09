@@ -1,0 +1,78 @@
+name: Publish devcontainer
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .dockerignore
+      - .devcontainer/**
+      - .github/workflows/publish-devcontainer.yml
+      - nx.json
+      - package-lock.json
+      - package.json
+      - rust-toolchain.toml
+      - tools/scripts/**
+      - tsconfig.json
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-devcontainer-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    name: Publish devcontainer image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install host CLI dependencies
+        run: npm ci
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REGISTRY_ENVIRONMENT: ci
+          REGISTRY_OWNER: ${{ github.repository_owner }}
+        run: npx --no-install nx run tools-scripts:registry-login
+
+      - name: Hash, build, and publish devcontainer
+        run: npx --no-install nx run devcontainer:publish
+
+      - name: Verify main manifest
+        if: github.ref == 'refs/heads/main'
+        env:
+          REGISTRY_ENVIRONMENT: ci
+          REGISTRY_IMAGE: devcontainer
+          REGISTRY_OWNER: ${{ github.repository_owner }}
+          REGISTRY_TAG: main
+        run: npx --no-install nx run tools-scripts:registry-manifest
+
+      - name: Verify latest manifest
+        if: github.ref == 'refs/heads/main'
+        env:
+          REGISTRY_ENVIRONMENT: ci
+          REGISTRY_IMAGE: devcontainer
+          REGISTRY_OWNER: ${{ github.repository_owner }}
+          REGISTRY_TAG: latest
+        run: npx --no-install nx run tools-scripts:registry-manifest

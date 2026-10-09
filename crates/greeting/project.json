@@ -1,0 +1,104 @@
+{
+  "name": "greeting",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "sourceRoot": "crates/greeting/src",
+  "projectType": "library",
+  "namedInputs": {
+    "default": [
+      "{projectRoot}/Cargo.toml",
+      "{projectRoot}/README.md",
+      "{projectRoot}/src/**/*",
+      "{projectRoot}/tests/**/*",
+      "{workspaceRoot}/Cargo.toml",
+      "{workspaceRoot}/Cargo.lock",
+      "{workspaceRoot}/rust-toolchain.toml",
+      "{workspaceRoot}/rustfmt.toml"
+    ],
+    "production": [
+      "default",
+      "!{projectRoot}/README.md",
+      "!{projectRoot}/tests/**/*"
+    ]
+  },
+  "metadata": {
+    "description": "Reusable greeting validation and formatting library."
+  },
+  "targets": {
+    "format": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "cargo fmt --package greeting",
+        "cwd": "."
+      },
+      "metadata": {
+        "description": "Format the greeting package."
+      }
+    },
+    "format-check": {
+      "executor": "nx:run-commands",
+      "cache": true,
+      "inputs": [
+        "default"
+      ],
+      "options": {
+        "command": "cargo fmt --package greeting -- --check",
+        "cwd": "."
+      },
+      "metadata": {
+        "description": "Check formatting for the greeting package."
+      }
+    },
+    "lint": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "cargo clippy --locked --package greeting --all-targets --all-features -- -D warnings",
+        "cwd": "."
+      },
+      "metadata": {
+        "description": "Run Clippy for every greeting target with warnings denied."
+      }
+    },
+    "build": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "cargo build --locked --package greeting --all-features",
+        "cwd": "."
+      },
+      "metadata": {
+        "description": "Build the greeting package."
+      }
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "cargo test --locked --package greeting --lib --tests --examples --all-features",
+        "cwd": "."
+      },
+      "metadata": {
+        "description": "Run greeting unit and integration tests; workspace doc-tests run in rust:doc-test."
+      }
+    },
+    "verify": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": [
+        "format-check",
+        "lint",
+        "build",
+        "test"
+      ],
+      "options": {
+        "commands": []
+      },
+      "metadata": {
+        "description": "Run all greeting quality targets."
+      }
+    }
+  },
+  "tags": [
+    "scope:rust",
+    "type:library"
+  ]
+}

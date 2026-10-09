@@ -1,0 +1,7 @@
+services:
+  workspace:
+    image: rust-playground-devcontainer-local:source
+    pull_policy: build
+    build:
+      context: ..
+      dockerfile: .devcontainer/Dockerfile
