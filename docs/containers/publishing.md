@@ -35,7 +35,7 @@ From WSL, the exact local branch/SHA runtime publication flow is:
 npx nx run devcontainer:up-source
 npx --no-install devcontainer exec \
   --workspace-folder . \
-  --config .devcontainer/devcontainer.local.json \
+  --config .devcontainer/source/devcontainer.json \
   bash -lc 'npx nx run tools-scripts:registry-login -- --owner mdrakiburrahman --environment local && npx nx run hello-world:publish'
 ```
 

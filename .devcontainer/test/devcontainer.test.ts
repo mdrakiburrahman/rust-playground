@@ -42,7 +42,12 @@ test('normal and source configurations share workspace, user, and lifecycle beha
   ) as Record<string, unknown>;
   const source = JSON.parse(
     readFileSync(
-      join(repositoryRoot, '.devcontainer', 'devcontainer.local.json'),
+      join(
+        repositoryRoot,
+        '.devcontainer',
+        'source',
+        'devcontainer.json',
+      ),
       'utf8',
     ),
   ) as Record<string, unknown>;
@@ -63,8 +68,8 @@ test('normal and source configurations share workspace, user, and lifecycle beha
   }
   assert.equal(normal.dockerComposeFile, 'docker-compose.yml');
   assert.deepEqual(source.dockerComposeFile, [
-    'docker-compose.yml',
-    'docker-compose.local.yml',
+    '../docker-compose.yml',
+    '../docker-compose.local.yml',
   ]);
 
   const compose = readFileSync(
@@ -90,7 +95,12 @@ test('normal and source configurations share workspace, user, and lifecycle beha
 test('source and image-build configurations share pinned tools and features', () => {
   const source = JSON.parse(
     readFileSync(
-      join(repositoryRoot, '.devcontainer', 'devcontainer.local.json'),
+      join(
+        repositoryRoot,
+        '.devcontainer',
+        'source',
+        'devcontainer.json',
+      ),
       'utf8',
     ),
   ) as {
@@ -163,7 +173,12 @@ test('Dockerfile is Ubuntu 24.04 with the purposeful Rust build packages', () =>
 test('feature lock covers source and image-build features with immutable digests', () => {
   const source = JSON.parse(
     readFileSync(
-      join(repositoryRoot, '.devcontainer', 'devcontainer.local.json'),
+      join(
+        repositoryRoot,
+        '.devcontainer',
+        'source',
+        'devcontainer.json',
+      ),
       'utf8',
     ),
   ) as {
@@ -180,6 +195,17 @@ test('feature lock covers source and image-build features with immutable digests
       { integrity: string; resolved: string; version: string }
     >;
   };
+  const sourceLock = JSON.parse(
+    readFileSync(
+      join(
+        repositoryRoot,
+        '.devcontainer',
+        'source',
+        'devcontainer-lock.json',
+      ),
+      'utf8',
+    ),
+  ) as typeof lock;
   const imageBuild = JSON.parse(
     readFileSync(
       join(repositoryRoot, '.devcontainer', 'devcontainer.build.json'),
@@ -196,6 +222,7 @@ test('feature lock covers source and image-build features with immutable digests
     Object.keys(lock.features).sort(),
     Object.keys(imageBuild.features).sort(),
   );
+  assert.deepEqual(sourceLock, lock);
   for (const [feature, entry] of Object.entries(lock.features)) {
     assert.match(entry.version, /^\d+\.\d+\.\d+$/u, feature);
     assert.match(entry.integrity, /^sha256:[a-f0-9]{64}$/u, feature);
@@ -233,7 +260,10 @@ test('Nx project exposes the complete devcontainer lifecycle', () => {
   }
   for (const target of ['up-source', 'test-source']) {
     const command = project.targets[target]?.options?.command ?? '';
-    assert.match(command, /--config \.devcontainer\/devcontainer\.local\.json/u);
+    assert.match(
+      command,
+      /--config \.devcontainer\/source\/devcontainer\.json/u,
+    );
     assert.doesNotMatch(command, /--platform|--push/u);
   }
 });
@@ -297,7 +327,7 @@ test('content hash is order-independent, path-aware, and line-ending normalized'
     true,
   );
   assert.equal(
-    isContentHashInput('.devcontainer/devcontainer.local.json'),
+    isContentHashInput('.devcontainer/source/devcontainer.json'),
     false,
   );
   assert.equal(

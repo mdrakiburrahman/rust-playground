@@ -20,6 +20,14 @@ interface LoginCliOptions extends CommonCliOptions {
   readonly promptTimeoutMs: number;
 }
 
+interface BrowserLoginCliOptions {
+  readonly tenant: string;
+  readonly wslDistro: string;
+  readonly account: string;
+  readonly timeoutMs: number;
+  readonly urlTimeoutMs: number;
+}
+
 function parsePositiveInteger(value: string): number {
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed) || parsed <= 0) {
@@ -65,7 +73,7 @@ export function createProgram(
   const program = new Command()
     .name("auth-automation")
     .description(
-      "Safe Playwright automation for Azure CLI device-code login.",
+      "Safe Playwright automation for Azure CLI device-code and browser login.",
     )
     .showHelpAfterError();
 
@@ -94,6 +102,42 @@ export function createProgram(
         accountHint: options.account,
         timeoutMs: options.timeoutMs,
         promptTimeoutMs: options.promptTimeoutMs,
+      });
+    });
+
+  program
+    .command("login-browser")
+    .description(
+      "Run policy-compliant Azure CLI browser login in a named WSL distribution from Windows.",
+    )
+    .requiredOption(
+      "--wsl-distro <name>",
+      "Named WSL distribution containing Azure CLI",
+    )
+    .requiredOption(
+      "--account <tile>",
+      "Accessible name or unique text of an existing account tile",
+    )
+    .option("--tenant <tenant>", "Azure tenant GUID or domain", DEFAULT_TENANT)
+    .option(
+      "--timeout-ms <milliseconds>",
+      "Overall command timeout",
+      parsePositiveInteger,
+      300_000,
+    )
+    .option(
+      "--url-timeout-ms <milliseconds>",
+      "Time allowed for Azure CLI to produce its browser authorization request",
+      parsePositiveInteger,
+      60_000,
+    )
+    .action(async (options: BrowserLoginCliOptions) => {
+      await service.loginBrowser({
+        wslDistro: options.wslDistro,
+        accountHint: options.account,
+        tenant: options.tenant,
+        timeoutMs: options.timeoutMs,
+        urlTimeoutMs: options.urlTimeoutMs,
       });
     });
 

@@ -1,16 +1,32 @@
+import path from "node:path";
 import {
   buildAccountShowCommand,
+  buildBrowserLoginCommand,
   buildLoginCommand,
+  buildWslPathCommand,
   DEFAULT_TENANT,
   validateTenant,
+  validateWslDistro,
 } from "./azure-cli.js";
-import { decideBrowserAction } from "./browser-policy.js";
+import {
+  BROWSER_CAPTURE_HELPER,
+  BROWSER_CAPTURE_HELPER_FILE,
+  BROWSER_CAPTURE_URL_FILE,
+  parseCapturedUrlFile,
+} from "./browser-login.js";
+import {
+  decideBrowserAction,
+  decideBrowserRedirectAction,
+} from "./browser-policy.js";
 import type {
   BrowserAdapter,
   BrowserSession,
   FileSystemAdapter,
   HostEnvironment,
+  PageSnapshot,
   ProcessAdapter,
+  ProcessResult,
+  RunningProcess,
   SafeLogger,
   TargetOptions,
   TimerAdapter,
@@ -19,10 +35,16 @@ import {
   DeviceCodeParser,
   type DeviceCodeDetails,
 } from "./device-code.js";
-import { resolveBrowserProfile } from "./profile.js";
 import {
+  resolveBrowserProfile,
+  resolveRuntimeRoot,
+} from "./profile.js";
+import {
+  assertSafeBrowserAuthorizationUrl,
   assertSafeVerificationUrl,
   describeProcessFailure,
+  isExpectedLocalhostRedirect,
+  type BrowserAuthorizationRequest,
 } from "./security.js";
 import { verifyAzureAccount, type AzureAccount } from "./tenant.js";
 import { withTimeout } from "./timing.js";
@@ -33,6 +55,8 @@ const DEFAULT_ACTION_TIMEOUT_MS = 10_000;
 const STATUS_TIMEOUT_MS = 30_000;
 const POLL_INTERVAL_MS = 250;
 const MAX_SAFE_ACTIONS = 20;
+const WSL_PATH_TIMEOUT_MS = 15_000;
+const BROWSER_CLI_COMPLETION_GRACE_MS = 3_000;
 
 export interface LoginOptions extends TargetOptions {
   readonly tenant?: string;
@@ -44,6 +68,14 @@ export interface LoginOptions extends TargetOptions {
 export interface StatusOptions extends TargetOptions {
   readonly tenant?: string;
   readonly timeoutMs?: number;
+}
+
+export interface BrowserLoginOptions {
+  readonly wslDistro: string;
+  readonly tenant?: string;
+  readonly accountHint: string;
+  readonly timeoutMs?: number;
+  readonly urlTimeoutMs?: number;
 }
 
 export interface AuthAutomationDependencies {
@@ -59,6 +91,16 @@ interface Deferred<T> {
   readonly promise: Promise<T>;
   resolve(value: T): void;
 }
+
+interface CliCompletionState {
+  result?: ProcessResult;
+  error?: unknown;
+}
+
+type CliGraceOutcome =
+  | { readonly kind: "success" }
+  | { readonly kind: "failed" }
+  | { readonly kind: "pending" };
 
 function deferred<T>(): Deferred<T> {
   let resolvePromise!: (value: T) => void;
@@ -169,6 +211,331 @@ export class AuthAutomationService {
       : "";
     throw new Error(
       `Timed out waiting for the safe device-code browser flow${diagnostic}.`,
+    );
+  }
+
+  private async convertWindowsPathToWsl(
+    windowsPath: string,
+    wslDistro: string,
+  ): Promise<string> {
+    const { environment, processes } = this.dependencies;
+    const result = await processes.run(
+      buildWslPathCommand(windowsPath, wslDistro, environment),
+      WSL_PATH_TIMEOUT_MS,
+    );
+    if (result.exitCode !== 0) {
+      throw new Error(
+        "Unable to convert the browser-login runtime path for WSL.",
+      );
+    }
+    const converted = result.stdout.trim();
+    if (
+      !converted.startsWith("/") ||
+      converted.includes("\r") ||
+      converted.includes("\n") ||
+      converted.includes("\0")
+    ) {
+      throw new Error("WSL returned an invalid browser-login runtime path.");
+    }
+    return converted;
+  }
+
+  private async waitForBrowserAuthorizationRequest(
+    urlFilePath: string,
+    tenant: string,
+    completion: Promise<ProcessResult>,
+    timeoutMs: number,
+  ): Promise<BrowserAuthorizationRequest> {
+    const { fileSystem, timer } = this.dependencies;
+    const deadline = timer.now() + timeoutMs;
+
+    while (timer.now() < deadline) {
+      const content = await fileSystem.readTextFile(urlFilePath);
+      if (content !== undefined) {
+        return assertSafeBrowserAuthorizationUrl(
+          parseCapturedUrlFile(content),
+          tenant,
+        );
+      }
+
+      const remaining = Math.max(1, deadline - timer.now());
+      const outcome = await Promise.race([
+        completion.then((result) => ({
+          kind: "completed" as const,
+          result,
+        })),
+        timer
+          .sleep(Math.min(POLL_INTERVAL_MS, remaining))
+          .then(() => ({ kind: "poll" as const })),
+      ]);
+      if (outcome.kind === "completed") {
+        const finalContent = await fileSystem.readTextFile(urlFilePath);
+        if (finalContent !== undefined) {
+          return assertSafeBrowserAuthorizationUrl(
+            parseCapturedUrlFile(finalContent),
+            tenant,
+          );
+        }
+        const status =
+          outcome.result.exitCode === null
+            ? "terminated"
+            : `exited with code ${outcome.result.exitCode}`;
+        throw new Error(
+          `Azure CLI browser login ${status} before producing an authorization request; process output was suppressed.`,
+        );
+      }
+    }
+    throw new Error(
+      "Timed out waiting for Azure CLI to produce a browser authorization request.",
+    );
+  }
+
+  private browserSnapshotReachedCallback(
+    snapshot: PageSnapshot,
+    request: BrowserAuthorizationRequest,
+  ): boolean {
+    return [snapshot.url, ...snapshot.navigationUrls].some((url) =>
+      isExpectedLocalhostRedirect(
+        url,
+        request.redirectUri,
+        request.state,
+      ),
+    );
+  }
+
+  private async waitForBrowserCliGrace(
+    completion: Promise<ProcessResult>,
+    completionState: CliCompletionState,
+  ): Promise<CliGraceOutcome> {
+    if (completionState.result) {
+      return completionState.result.exitCode === 0
+        ? { kind: "success" }
+        : { kind: "failed" };
+    }
+    if (completionState.error) {
+      return { kind: "failed" };
+    }
+
+    const { timer } = this.dependencies;
+    return Promise.race([
+      completion.then(
+        (result): CliGraceOutcome =>
+          result.exitCode === 0
+            ? { kind: "success" }
+            : { kind: "failed" },
+        (): CliGraceOutcome => ({ kind: "failed" }),
+      ),
+      timer
+        .sleep(BROWSER_CLI_COMPLETION_GRACE_MS)
+        .then((): CliGraceOutcome => ({ kind: "pending" })),
+    ]);
+  }
+
+  private browserCliSucceeded(state: CliCompletionState): boolean {
+    return state.result?.exitCode === 0;
+  }
+
+  private browserCliFinishedWithFailure(
+    state: CliCompletionState,
+  ): boolean {
+    return Boolean(
+      state.error ||
+        (state.result && state.result.exitCode !== 0),
+    );
+  }
+
+  private async automateBrowserRedirect(
+    session: BrowserSession,
+    request: BrowserAuthorizationRequest,
+    accountHint: string,
+    timeoutMs: number,
+    completion: Promise<ProcessResult>,
+    completionState: CliCompletionState,
+  ): Promise<void> {
+    const { logger, timer } = this.dependencies;
+    const deadline = timer.now() + timeoutMs;
+    let accountSelected = false;
+    let safeActions = 0;
+
+    try {
+      await withTimeout(
+        session.navigate(request.authorizationUrl),
+        Math.min(DEFAULT_ACTION_TIMEOUT_MS, timeoutMs),
+        timer,
+        "Timed out opening the Microsoft browser authorization page.",
+      );
+    } catch {
+      const snapshot = await session.observe().catch(() => undefined);
+      if (snapshot && this.browserSnapshotReachedCallback(snapshot, request)) {
+        const outcome = await this.waitForBrowserCliGrace(
+          completion,
+          completionState,
+        );
+        if (outcome.kind === "failed") {
+          throw new Error(
+            "Azure CLI browser login failed after the localhost callback; process output was suppressed.",
+          );
+        }
+        return;
+      }
+      throw new Error(
+        "Unable to open the Microsoft browser authorization page.",
+      );
+    }
+
+    while (timer.now() < deadline) {
+      const snapshot = await session.observe().catch(() => {
+        throw new Error(
+          "Unable to inspect the browser authorization page safely.",
+        );
+      });
+      if (this.browserCliSucceeded(completionState)) {
+        logger.info(
+          "Azure CLI browser login completed before the browser page settled.",
+        );
+        return;
+      }
+      if (this.browserCliFinishedWithFailure(completionState)) {
+        throw new Error(
+          "Azure CLI browser login failed before the localhost callback; process output was suppressed.",
+        );
+      }
+      if (this.browserSnapshotReachedCallback(snapshot, request)) {
+        const outcome = await this.waitForBrowserCliGrace(
+          completion,
+          completionState,
+        );
+        if (outcome.kind === "failed") {
+          throw new Error(
+            "Azure CLI browser login failed after the localhost callback; process output was suppressed.",
+          );
+        }
+        logger.info(
+          "Browser authorization reached the expected localhost callback.",
+        );
+        return;
+      }
+      const decision = decideBrowserRedirectAction(snapshot, {
+        accountHint,
+        accountSelected,
+        expectedRedirectUri: request.redirectUri,
+        expectedState: request.state,
+      });
+      if (decision.kind === "complete") {
+        logger.info(
+          "Browser authorization reached the expected localhost callback.",
+        );
+        return;
+      }
+      if (decision.kind === "fail") {
+        await Promise.resolve();
+        if (this.browserCliSucceeded(completionState)) {
+          logger.info(
+            "Azure CLI browser login completed before the browser page settled.",
+          );
+          return;
+        }
+        if (
+          decision.category === "unsafe-url" &&
+          (accountSelected || safeActions > 0)
+        ) {
+          const outcome = await this.waitForBrowserCliGrace(
+            completion,
+            completionState,
+          );
+          if (outcome.kind === "success") {
+            logger.info(
+              "Azure CLI browser login completed during the post-account redirect grace period.",
+            );
+            return;
+          }
+          if (outcome.kind === "failed") {
+            throw new Error(
+              "Azure CLI browser login failed during the post-account redirect; process output was suppressed.",
+            );
+          }
+        }
+        throw new Error(decision.reason);
+      }
+
+      try {
+        if (decision.kind === "click-account") {
+          await session.clickAccount(decision.accountName);
+          accountSelected = true;
+          safeActions += 1;
+          logger.info("Selected the requested existing account tile.");
+        } else if (decision.kind === "click-control") {
+          await session.clickControl(decision.control);
+          safeActions += 1;
+          logger.info(`Selected the safe ${decision.control} control.`);
+        }
+      } catch {
+        const afterAction = await session.observe().catch(() => undefined);
+        if (
+          afterAction &&
+          this.browserSnapshotReachedCallback(afterAction, request)
+        ) {
+          const outcome = await this.waitForBrowserCliGrace(
+            completion,
+            completionState,
+          );
+          if (outcome.kind === "failed") {
+            throw new Error(
+              "Azure CLI browser login failed after the localhost callback; process output was suppressed.",
+            );
+          }
+          logger.info(
+            "Browser authorization reached the expected localhost callback.",
+          );
+          return;
+        }
+        if (afterAction) {
+          await Promise.resolve();
+          if (this.browserCliSucceeded(completionState)) {
+            logger.info(
+              "Azure CLI browser login completed before the browser page settled.",
+            );
+            return;
+          }
+          const afterDecision = decideBrowserRedirectAction(afterAction, {
+            accountHint,
+            accountSelected,
+            expectedRedirectUri: request.redirectUri,
+            expectedState: request.state,
+          });
+          if (afterDecision.kind === "fail") {
+            if (
+              afterDecision.category === "unsafe-url" &&
+              (accountSelected || safeActions > 0)
+            ) {
+              const outcome = await this.waitForBrowserCliGrace(
+                completion,
+                completionState,
+              );
+              if (outcome.kind === "success") {
+                logger.info(
+                  "Azure CLI browser login completed during the post-account redirect grace period.",
+                );
+                return;
+              }
+            }
+            throw new Error(afterDecision.reason);
+          }
+        }
+        throw new Error(
+          "A safe browser authorization action failed before the localhost callback.",
+        );
+      }
+
+      if (safeActions > MAX_SAFE_ACTIONS) {
+        throw new Error(
+          "The browser authorization page exceeded the safe automation action limit.",
+        );
+      }
+      await timer.sleep(POLL_INTERVAL_MS);
+    }
+    throw new Error(
+      "Timed out waiting for the browser authorization localhost callback.",
     );
   }
 
@@ -315,6 +682,207 @@ export class AuthAutomationService {
       }
       throw error;
     }
+  }
+
+  async loginBrowser(options: BrowserLoginOptions): Promise<AzureAccount> {
+    const {
+      environment,
+      processes,
+      browser,
+      fileSystem,
+      timer,
+      logger,
+    } = this.dependencies;
+    if (environment.platform !== "win32") {
+      throw new Error(
+        "login-browser must run on native Windows and target a named WSL distribution.",
+      );
+    }
+
+    const tenant = validateTenant(options.tenant ?? DEFAULT_TENANT);
+    const wslDistro = validateWslDistro(options.wslDistro);
+    const accountHint = options.accountHint.trim();
+    if (!accountHint) {
+      throw new Error(
+        "login-browser requires --account matching an existing account tile.",
+      );
+    }
+    const timeoutMs = positiveTimeout(
+      options.timeoutMs,
+      DEFAULT_LOGIN_TIMEOUT_MS,
+    );
+    const urlTimeoutMs = positiveTimeout(
+      options.urlTimeoutMs,
+      DEFAULT_PROMPT_TIMEOUT_MS,
+    );
+    const deadline = timer.now() + timeoutMs;
+    const remaining = (): number => Math.max(1, deadline - timer.now());
+    const runtimeDirectory = await fileSystem.createUniqueDirectory(
+      resolveRuntimeRoot(environment),
+      "browser-login-",
+    );
+    const helperWindowsPath = path.win32.join(
+      runtimeDirectory,
+      BROWSER_CAPTURE_HELPER_FILE,
+    );
+    const urlFileWindowsPath = path.win32.join(
+      runtimeDirectory,
+      BROWSER_CAPTURE_URL_FILE,
+    );
+    let running: RunningProcess | undefined;
+    let completion: Promise<ProcessResult> | undefined;
+    let cliFinished = false;
+    const cliCompletionState: CliCompletionState = {};
+    let session: BrowserSession | undefined;
+    let result: AzureAccount | undefined;
+    let operationError: unknown;
+
+    try {
+      await fileSystem.writeTextFile(
+        helperWindowsPath,
+        BROWSER_CAPTURE_HELPER,
+      );
+      const helperWslPath = await this.convertWindowsPathToWsl(
+        helperWindowsPath,
+        wslDistro,
+      );
+      const urlFileWslPath = await this.convertWindowsPathToWsl(
+        urlFileWindowsPath,
+        wslDistro,
+      );
+      const command = buildBrowserLoginCommand(
+        tenant,
+        wslDistro,
+        helperWslPath,
+        urlFileWslPath,
+        environment,
+      );
+
+      logger.info(
+        `Starting Azure CLI browser login in WSL distribution ${wslDistro}.`,
+      );
+      running = processes.start(command);
+      completion = running.completion.then(
+        (processResult) => {
+          cliFinished = true;
+          cliCompletionState.result = processResult;
+          return processResult;
+        },
+        (error: unknown) => {
+          cliFinished = true;
+          cliCompletionState.error = error;
+          throw error;
+        },
+      );
+
+      const authorizationRequest =
+        await this.waitForBrowserAuthorizationRequest(
+          urlFileWindowsPath,
+          tenant,
+          completion,
+          Math.min(urlTimeoutMs, remaining()),
+        );
+      logger.addSecret(authorizationRequest.authorizationUrl);
+      logger.addSecret(authorizationRequest.redirectUri);
+      logger.addSecret(authorizationRequest.state);
+      logger.info(
+        "Captured and validated the Azure CLI browser authorization request.",
+      );
+
+      const profile = resolveBrowserProfile(environment);
+      await fileSystem.ensureDirectory(profile.profilePath);
+      session = await browser.launch({
+        browserKind: "edge",
+        profilePath: profile.profilePath,
+        actionTimeoutMs: Math.min(DEFAULT_ACTION_TIMEOUT_MS, remaining()),
+      });
+      let browserFlowError: unknown;
+      try {
+        await this.automateBrowserRedirect(
+          session,
+          authorizationRequest,
+          accountHint,
+          remaining(),
+          completion,
+          cliCompletionState,
+        );
+      } catch (error) {
+        browserFlowError = error;
+      }
+      try {
+        await session.close();
+      } catch {
+        if (!browserFlowError) {
+          browserFlowError = new Error(
+            "Unable to close the browser-login context safely.",
+          );
+        }
+      } finally {
+        session = undefined;
+      }
+      if (browserFlowError) {
+        throw browserFlowError;
+      }
+
+      const loginResult = await withTimeout(
+        completion,
+        remaining(),
+        timer,
+        "Azure CLI browser login did not finish before the timeout.",
+        () => running?.terminate(),
+      );
+      if (loginResult.exitCode !== 0) {
+        const status =
+          loginResult.exitCode === null
+            ? "was terminated"
+            : `exited with code ${loginResult.exitCode}`;
+        throw new Error(
+          `Azure CLI browser login ${status}; process output was suppressed.`,
+        );
+      }
+
+      result = await this.status({
+        target: "wsl",
+        wslDistro,
+        tenant,
+        timeoutMs: Math.min(STATUS_TIMEOUT_MS, remaining()),
+      });
+      logger.info(`Azure CLI tenant verified: ${result.tenantId}.`);
+    } catch (error) {
+      operationError = error;
+      if (running && !cliFinished) {
+        try {
+          await running.terminate();
+        } catch (terminationError) {
+          operationError = new Error(
+            "Browser login failed and launched-process exit could not be confirmed.",
+            { cause: terminationError },
+          );
+        }
+      }
+    } finally {
+      if (session) {
+        await session.close().catch(() => undefined);
+      }
+      try {
+        await fileSystem.removeDirectory(runtimeDirectory);
+      } catch (cleanupError) {
+        operationError = new Error(
+          operationError
+            ? "Browser login failed and temporary authorization files could not be removed."
+            : "Temporary browser-login authorization files could not be removed.",
+          { cause: cleanupError },
+        );
+      }
+    }
+
+    if (operationError) {
+      throw operationError;
+    }
+    if (!result) {
+      throw new Error("Browser login did not produce a verified Azure account.");
+    }
+    return result;
   }
 
   async status(options: StatusOptions): Promise<AzureAccount> {

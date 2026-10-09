@@ -81,7 +81,7 @@ npm ci
 ```
 
 The source configuration builds `.devcontainer/Dockerfile` and applies the
-locked features from `.devcontainer/devcontainer.local.json`:
+locked features from `.devcontainer/source/devcontainer.json`:
 
 ```bash
 npx nx run devcontainer:up-source

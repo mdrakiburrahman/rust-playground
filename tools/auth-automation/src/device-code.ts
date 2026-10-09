@@ -7,7 +7,7 @@ const ANSI_ESCAPE_PATTERN =
   /[\u001B\u009B][[\]()#;?]*(?:(?:[A-Za-z\d]*(?:;[-A-Za-z\d/#&.:=?%@~_]+)*)?\u0007|(?:(?:\d{1,4}(?:[;:]\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]))/g;
 
 const URL_PATTERN =
-  /https:\/\/(?:www\.)?(?:microsoft\.com\/(?:devicelogin|link)|aka\.ms\/devicelogin|login\.microsoftonline\.com\/[^\s"'<>]+)/i;
+  /https:\/\/(?:www\.)?(?:microsoft\.com\/(?:devicelogin|link)|aka\.ms\/devicelogin|login\.microsoft\.com\/device|login\.microsoftonline\.com\/[^\s"'<>]+)(?=[\s"'<>),.;]|$)/i;
 
 const CODE_PATTERNS = [
   /(?:enter|use)\s+(?:the\s+)?(?:user\s+|device\s+)?code\s*[:=]?\s*["']?([A-Z0-9][A-Z0-9-]{5,20})/i,

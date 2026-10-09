@@ -3,7 +3,7 @@
 The default configuration uses Docker Compose with the immutable image pinned
 in `docker-compose.yml`. The source configuration adds
 `docker-compose.local.yml`, builds `.devcontainer/Dockerfile`, and applies the
-locked Dev Container Features from `devcontainer.local.json`.
+locked Dev Container Features from `source/devcontainer.json`.
 
 Image publication is intentionally separate from the Compose lifecycle.
 `devcontainer.build.json` is a Dockerfile-based configuration with the same

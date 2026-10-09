@@ -38,6 +38,35 @@ An internal shell wrapper reports the numeric Linux Azure CLI PID before
 replacing itself with `az`, so abort handling can terminate and confirm that
 exact Linux process tree.
 
+## Windows: WSL browser login for Conditional Access
+
+When tenant Conditional Access blocks device-code authentication, use the
+policy-compliant browser redirect flow from native Windows:
+
+```powershell
+npx nx run auth-automation:login-browser -- --wsl-distro Ubuntu-24.04 --account user@example.com
+npx nx run auth-automation:login-browser -- --wsl-distro Ubuntu-24.04 --account user@example.com --tenant 72f988bf-86f1-41af-91ab-2d7cd011db47
+```
+
+This target runs normal `az login --tenant ...` inside the named WSL
+distribution. A static helper captures the authorization request without
+opening a WSL browser. Windows validates the exact
+`https://login.microsoftonline.com/<tenant>/oauth2/v2.0/authorize` endpoint,
+opens it in the dedicated Edge profile, selects only the requested existing
+account tile and safe controls, and requires the expected HTTP `localhost`
+callback before accepting success.
+
+The localhost callback may be transient after Azure CLI closes its listener.
+The tool tracks main-frame navigation history and coordinates a short
+post-account grace period with Azure CLI completion; success still requires
+CLI exit code `0` followed by tenant verification with `az account show`.
+
+The full authorization URL, callback URL, authorization code, and tokens are
+never logged. The capture helper and URL file live in a unique per-run
+application-cache directory and are removed after success, timeout, or error.
+Password, MFA, identity-verification, and Conditional Access rejection pages
+abort the flow and trigger confirmed WSL/Windows PID-tree cleanup.
+
 ## WSL-native Azure CLI and browser
 
 Inside WSL/Linux, install the pinned Playwright Chromium build, use WSLg (or
@@ -107,6 +136,10 @@ It never types or stores a username, password, MFA code, authenticator
 response, recovery code, or other identity challenge. Password and
 MFA/identity challenge pages fail immediately with a clear diagnostic. There
 is no option that enables password or MFA automation.
+
+`login-browser` is limited to native Windows targeting a named WSL
+distribution. It performs no text entry and treats only the validated
+localhost OAuth callback as success.
 
 Azure CLI output is parsed as it streams; the tool does not wait for `az login`
 to exit before opening the browser. Raw login output is not echoed, device

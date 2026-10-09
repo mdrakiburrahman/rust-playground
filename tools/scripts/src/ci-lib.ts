@@ -284,7 +284,7 @@ function createDevcontainerUpArgs(
 ): string[] {
   const configFile =
     options.kind === 'source'
-      ? 'devcontainer.local.json'
+      ? path.join('source', 'devcontainer.json')
       : 'devcontainer.json';
   const args = [
     '--no-install',

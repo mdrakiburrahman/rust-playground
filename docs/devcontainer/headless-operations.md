@@ -78,7 +78,7 @@ container:
 up_json="$(
   npx --no-install devcontainer up \
     --workspace-folder . \
-    --config .devcontainer/devcontainer.local.json \
+    --config .devcontainer/source/devcontainer.json \
     --frozen-lockfile
 )"
 container_id="$(jq -er '.containerId' <<<"$up_json")"
@@ -155,7 +155,7 @@ Capture the workspace ID and its exact Compose project:
 up_json="$(
   npx --no-install devcontainer up \
     --workspace-folder . \
-    --config .devcontainer/devcontainer.local.json \
+    --config .devcontainer/source/devcontainer.json \
     --frozen-lockfile
 )"
 container_id="$(jq -er '.containerId' <<<"$up_json")"
@@ -236,11 +236,11 @@ to a recoverable remote.
    npx nx run devcontainer:test-source
    npx --no-install devcontainer exec \
      --workspace-folder . \
-     --config .devcontainer/devcontainer.local.json \
+     --config .devcontainer/source/devcontainer.json \
      bash -lc 'npx nx run hello-world:image-smoke'
    npx --no-install devcontainer exec \
      --workspace-folder . \
-     --config .devcontainer/devcontainer.local.json \
+     --config .devcontainer/source/devcontainer.json \
      bash -lc 'npx nx run tools-scripts:registry-login -- --owner mdrakiburrahman --environment local && npx nx run devcontainer:publish && npx nx run hello-world:publish'
    ```
 

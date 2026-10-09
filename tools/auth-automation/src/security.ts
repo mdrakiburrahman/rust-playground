@@ -6,6 +6,12 @@ const JSON_SECRET_PATTERN =
   /(["']?(?:access[_-]?token|refresh[_-]?token|client[_-]?secret|password)["']?\s*[:=]\s*["']?)[^"',\s}]+/gi;
 const BEARER_PATTERN = /(Bearer\s+)[A-Za-z0-9._~+/-]+=*/gi;
 
+export interface BrowserAuthorizationRequest {
+  readonly authorizationUrl: string;
+  readonly redirectUri: string;
+  readonly state: string;
+}
+
 export function assertSafeVerificationUrl(value: string): string {
   let parsed: URL;
   try {
@@ -27,8 +33,15 @@ export function assertSafeVerificationUrl(value: string): string {
     host === "aka.ms" && path.startsWith("/devicelogin");
   const isMicrosoftOnline =
     host === "login.microsoftonline.com" && path.length > 1;
+  const isMicrosoftLoginDevice =
+    host === "login.microsoft.com" && path === "/device";
 
-  if (!isMicrosoftDeviceLogin && !isAkaDeviceLogin && !isMicrosoftOnline) {
+  if (
+    !isMicrosoftDeviceLogin &&
+    !isAkaDeviceLogin &&
+    !isMicrosoftOnline &&
+    !isMicrosoftLoginDevice
+  ) {
     throw new Error(
       `Refusing unrecognized device-login host "${parsed.hostname}".`,
     );
@@ -76,6 +89,103 @@ export function isSafeMicrosoftAuthenticationUrl(value: string): boolean {
         host.endsWith(".microsoft.com") ||
         host === "microsoftonline.com" ||
         host.endsWith(".microsoftonline.com"))
+    );
+  } catch {
+    return false;
+  }
+}
+
+export function assertSafeBrowserAuthorizationUrl(
+  value: string,
+  tenant: string,
+): BrowserAuthorizationRequest {
+  if (value !== value.trim()) {
+    throw new Error("Captured browser authorization URL contains whitespace.");
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error("Captured browser authorization URL is invalid.");
+  }
+
+  const expectedPath = `/${tenant.toLowerCase()}/oauth2/v2.0/authorize`;
+  if (
+    parsed.protocol !== "https:" ||
+    parsed.hostname.toLowerCase() !== "login.microsoftonline.com" ||
+    parsed.pathname.toLowerCase() !== expectedPath ||
+    parsed.username ||
+    parsed.password ||
+    parsed.hash
+  ) {
+    throw new Error(
+      "Captured browser authorization URL is not the expected Microsoft tenant authorize endpoint.",
+    );
+  }
+
+  const clientId = parsed.searchParams.get("client_id");
+  const responseType = parsed.searchParams.get("response_type");
+  const redirectValue = parsed.searchParams.get("redirect_uri");
+  const state = parsed.searchParams.get("state");
+  if (
+    !clientId ||
+    !responseType?.split(/\s+/).includes("code") ||
+    !redirectValue ||
+    !state
+  ) {
+    throw new Error(
+      "Captured browser authorization URL is missing required OAuth parameters.",
+    );
+  }
+
+  let redirectUri: URL;
+  try {
+    redirectUri = new URL(redirectValue);
+  } catch {
+    throw new Error("Captured browser redirect URI is invalid.");
+  }
+  const redirectPort = Number(redirectUri.port);
+  if (
+    redirectUri.protocol !== "http:" ||
+    redirectUri.hostname.toLowerCase() !== "localhost" ||
+    !Number.isInteger(redirectPort) ||
+    redirectPort < 1 ||
+    redirectPort > 65_535 ||
+    redirectUri.username ||
+    redirectUri.password ||
+    redirectUri.hash
+  ) {
+    throw new Error(
+      "Captured browser redirect URI must be an HTTP localhost callback with an explicit port.",
+    );
+  }
+
+  return {
+    authorizationUrl: value,
+    redirectUri: redirectUri.toString(),
+    state,
+  };
+}
+
+export function isExpectedLocalhostRedirect(
+  value: string,
+  expectedRedirectUri: string,
+  expectedState: string,
+): boolean {
+  try {
+    const current = new URL(value);
+    const expected = new URL(expectedRedirectUri);
+    return (
+      current.protocol === "http:" &&
+      current.hostname.toLowerCase() === "localhost" &&
+      current.hostname.toLowerCase() === expected.hostname.toLowerCase() &&
+      current.port === expected.port &&
+      current.pathname === expected.pathname &&
+      Boolean(current.searchParams.get("code")) &&
+      current.searchParams.get("state") === expectedState &&
+      !current.username &&
+      !current.password
     );
   } catch {
     return false;

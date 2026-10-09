@@ -1,8 +1,8 @@
 {
   "name": "rust-playground (source)",
   "dockerComposeFile": [
-    "docker-compose.yml",
-    "docker-compose.local.yml"
+    "../docker-compose.yml",
+    "../docker-compose.local.yml"
   ],
   "service": "workspace",
   "runServices": [

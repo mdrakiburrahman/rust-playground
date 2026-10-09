@@ -39,12 +39,22 @@ async function firstVisible(
 
 class PlaywrightBrowserSession implements BrowserSession {
   private closed = false;
+  private readonly navigationUrls: string[] = [];
 
   constructor(
     private readonly context: BrowserContext,
     private readonly page: Page,
     private readonly actionTimeoutMs: number,
-  ) {}
+  ) {
+    this.page.on("framenavigated", (frame) => {
+      if (frame === this.page.mainFrame()) {
+        this.navigationUrls.push(frame.url());
+        if (this.navigationUrls.length > 20) {
+          this.navigationUrls.shift();
+        }
+      }
+    });
+  }
 
   async navigate(url: string): Promise<void> {
     await this.page.goto(url, {
@@ -119,6 +129,7 @@ class PlaywrightBrowserSession implements BrowserSession {
 
     return {
       url: this.page.url(),
+      navigationUrls: [...this.navigationUrls],
       deviceCodeInputVisible:
         Boolean(deviceCodeInput) && DEVICE_CODE_PAGE_PATTERN.test(bodyText),
       usernameInputVisible: Boolean(usernameInput),

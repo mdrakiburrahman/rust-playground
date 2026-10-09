@@ -180,7 +180,7 @@ test('starts the source config, validates the exact container, and writes output
       '--workspace-folder',
       workspace,
       '--config',
-      join(workspace, '.devcontainer', 'devcontainer.local.json'),
+      join(workspace, '.devcontainer', 'source', 'devcontainer.json'),
       '--frozen-lockfile',
       '--id-label',
       'rust-playground.ci-run=100-2-source',

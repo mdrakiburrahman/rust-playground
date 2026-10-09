@@ -59,6 +59,10 @@ export interface TimerAdapter {
 
 export interface FileSystemAdapter {
   ensureDirectory(path: string): Promise<void>;
+  createUniqueDirectory(parentPath: string, prefix: string): Promise<string>;
+  writeTextFile(path: string, content: string): Promise<void>;
+  readTextFile(path: string): Promise<string | undefined>;
+  removeDirectory(path: string): Promise<void>;
 }
 
 export interface SafeLogger {
@@ -81,6 +85,7 @@ export type SafeControl = "Next" | "Continue" | "Accept" | "Consent";
 
 export interface PageSnapshot {
   readonly url: string;
+  readonly navigationUrls: readonly string[];
   readonly deviceCodeInputVisible: boolean;
   readonly usernameInputVisible: boolean;
   readonly passwordInputVisible: boolean;

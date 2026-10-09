@@ -1,21 +1,33 @@
 export {
   AuthAutomationService,
   type AuthAutomationDependencies,
+  type BrowserLoginOptions,
   type LoginOptions,
   type StatusOptions,
 } from "./auth-service.js";
 export {
   buildAccountShowCommand,
+  buildBrowserLoginCommand,
   buildLoginCommand,
+  buildWslPathCommand,
   DEFAULT_TENANT,
+  validateWslDistro,
   validateTarget,
   validateTenant,
 } from "./azure-cli.js";
 export {
   decideBrowserAction,
+  decideBrowserRedirectAction,
   type BrowserDecision,
   type BrowserFlowState,
+  type BrowserRedirectFlowState,
 } from "./browser-policy.js";
+export {
+  BROWSER_CAPTURE_HELPER,
+  BROWSER_CAPTURE_HELPER_FILE,
+  BROWSER_CAPTURE_URL_FILE,
+  parseCapturedUrlFile,
+} from "./browser-login.js";
 export type {
   BrowserAdapter,
   BrowserSession,
@@ -39,6 +51,7 @@ export {
 } from "./device-code.js";
 export {
   resolveBrowserProfile,
+  resolveRuntimeRoot,
   type BrowserProfile,
 } from "./profile.js";
 export { NodeProcessAdapter } from "./process-adapter.js";
@@ -52,9 +65,12 @@ export {
 } from "./process-tree.js";
 export {
   assertSafeVerificationUrl,
+  assertSafeBrowserAuthorizationUrl,
+  isExpectedLocalhostRedirect,
   isSafeMicrosoftAuthenticationUrl,
   redactSensitiveText,
   SecretSafeLogger,
+  type BrowserAuthorizationRequest,
 } from "./security.js";
 export {
   verifyAzureAccount,

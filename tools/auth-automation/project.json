@@ -16,6 +16,14 @@
         "forwardAllArgs": true
       }
     },
+    "login-browser": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "tsx tools/auth-automation/src/cli.ts login-browser",
+        "cwd": ".",
+        "forwardAllArgs": true
+      }
+    },
     "status": {
       "executor": "nx:run-commands",
       "options": {

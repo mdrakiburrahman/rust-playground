@@ -36,6 +36,15 @@ updates:
       timezone: Etc/UTC
     open-pull-requests-limit: 10
 
+  - package-ecosystem: devcontainers
+    directory: /.devcontainer/source
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 10
+
   - package-ecosystem: docker
     directory: /.devcontainer
     schedule:
