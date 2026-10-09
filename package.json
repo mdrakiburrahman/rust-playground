@@ -15,7 +15,7 @@
     "@devcontainers/cli": "0.89.0",
     "@nx/devkit": "23.2.1",
     "@types/node": "24.7.0",
-    "commander": "14.0.1",
+    "commander": "15.0.0",
     "nx": "23.2.1",
     "playwright": "1.63.0",
     "tsx": "4.20.6",
