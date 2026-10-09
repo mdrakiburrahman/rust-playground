@@ -196,7 +196,7 @@
         "context": "{absWorkspaceRoot}",
         "image": "ghcr.io/mdrakiburrahman/rust-playground/hello-world",
         "tags": [
-          "branch-{gitBranch}",
+          "{gitBranchTag}",
           "sha-{gitSha}"
         ],
         "immutableTags": [

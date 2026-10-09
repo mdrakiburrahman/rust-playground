@@ -10,7 +10,7 @@
     "file": {
       "type": "string",
       "minLength": 1,
-      "description": "Path to the Dockerfile. Supports {absWorkspaceRoot}, {absProjectRoot}, {projectName}, {env:NAME}, {gitSha}, {gitShortSha}, and {gitBranch} tokens."
+      "description": "Path to the Dockerfile. Supports {absWorkspaceRoot}, {absProjectRoot}, {projectName}, {env:NAME}, {gitSha}, {gitShortSha}, {gitBranch}, and {gitBranchTag} tokens."
     },
     "context": {
       "type": "string",
@@ -91,7 +91,7 @@
       "context": "{absWorkspaceRoot}",
       "image": "ghcr.io/example/application",
       "tags": [
-        "branch-{gitBranch}",
+        "{gitBranchTag}",
         "sha-{gitSha}"
       ],
       "immutableTags": [

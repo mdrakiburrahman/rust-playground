@@ -15,7 +15,7 @@ Use `rust-playground-build:docker-build` from an Nx target:
     "file": "{absProjectRoot}/Dockerfile",
     "context": "{absWorkspaceRoot}",
     "image": "ghcr.io/example/application",
-    "tags": ["branch-{gitBranch}", "sha-{gitSha}"],
+    "tags": ["{gitBranchTag}", "sha-{gitSha}"],
     "immutableTags": ["sha-{gitSha}"],
     "requireCleanWorktree": true,
     "platforms": ["linux/amd64", "linux/arm64"],
@@ -65,14 +65,18 @@ String options support:
 - `{gitSha}`: lowercase full Git object ID.
 - `{gitShortSha}`: first 12 characters of the Git object ID.
 - `{gitBranch}`: lowercase Docker-tag-safe branch value.
+- `{gitBranchTag}`: `branch-`-namespaced branch tag bounded to 128
+  characters.
 
 Git values first use common CI environment variables, including
 `REGISTRY_SHA`, `GITHUB_SHA`, `REGISTRY_BRANCH`, and `GITHUB_HEAD_REF`, and
 otherwise use argument-array Git commands. Missing requested values fail the
-executor. Branch tokens are normalized, sanitized, and bounded to 128
-characters. Prefix mutable branch tags (for example, `branch-{gitBranch}`) so
-branch names cannot collide with release or immutable tag namespaces. Every
-final tag is validated against Docker's tag grammar.
+executor. Branch tokens are normalized and sanitized. Values that exceed their
+available tag space retain a readable prefix plus a deterministic 16-character
+SHA-256 suffix, so long branches with the same prefix remain distinct.
+`{gitBranchTag}` includes its `branch-` namespace in the 128-character bound,
+preventing branch names from colliding with release or immutable namespaces.
+Every final tag is validated against Docker's tag grammar.
 
 Docker and Git commands are spawned directly with argument arrays and
 `shell: false`. Verbose command logging redacts assigned build-argument values.

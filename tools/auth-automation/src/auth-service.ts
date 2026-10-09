@@ -21,6 +21,7 @@ import {
 import type {
   BrowserAdapter,
   BrowserSession,
+  CommandSpec,
   FileSystemAdapter,
   HostEnvironment,
   PageSnapshot,
@@ -214,6 +215,36 @@ export class AuthAutomationService {
       !isAuthOperationCancelled(operation.failure)
     ) {
       throw operation.failure;
+    }
+  }
+
+  private async runTrackedProcess(
+    command: CommandSpec,
+    timeoutMs: number,
+    operation: ActiveOperation,
+  ): Promise<ProcessResult> {
+    this.throwIfCancelled(operation);
+    const running = this.dependencies.processes.start(command);
+    operation.running = running;
+    try {
+      const result = await withTimeout(
+        running.completion,
+        timeoutMs,
+        this.dependencies.timer,
+        `${command.label} timed out after ${timeoutMs}ms.`,
+        () => running.terminate(),
+      );
+      this.throwIfCancelled(operation);
+      return result;
+    } catch (error) {
+      if (operation.cancelled) {
+        throw new AuthOperationCancelledError();
+      }
+      throw error;
+    } finally {
+      if (operation.running === running) {
+        operation.running = undefined;
+      }
     }
   }
 
@@ -1070,12 +1101,15 @@ export class AuthAutomationService {
     operation: ActiveOperation,
   ): Promise<AzureAccount> {
     this.throwIfCancelled(operation);
-    const { environment, processes, logger } = this.dependencies;
+    const { environment, logger } = this.dependencies;
     const tenant = validateTenant(options.tenant ?? DEFAULT_TENANT);
     const timeoutMs = positiveTimeout(options.timeoutMs, STATUS_TIMEOUT_MS);
     const command = buildAccountShowCommand(options, environment);
-    const result = await processes.run(command, timeoutMs);
-    this.throwIfCancelled(operation);
+    const result = await this.runTrackedProcess(
+      command,
+      timeoutMs,
+      operation,
+    );
     if (result.exitCode !== 0) {
       throw new Error(describeProcessFailure(command.label, result, logger));
     }

@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import * as path from 'node:path';
 import type { ExecutorContext } from '@nx/devkit';
@@ -8,6 +9,9 @@ import type {
 } from './schema.js';
 
 const dockerTagPattern = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/u;
+const dockerTagMaximumLength = 128;
+const gitBranchTagPrefix = 'branch-';
+const gitBranchHashLength = 16;
 const gitShaPattern = /^[0-9a-f]{7,64}$/iu;
 const platformPattern =
   /^[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._-]*(?:\/[a-z0-9][a-z0-9._-]*)?$/u;
@@ -524,26 +528,57 @@ export function validateDockerTag(tag: string): string {
 }
 
 export function sanitizeGitBranch(branch: string): string {
-  const normalized = branch
-    .trim()
-    .replace(/^refs\/heads\//iu, '')
-    .replace(/^refs\/remotes\/[^/]+\//iu, '')
-    .replace(/^origin\//iu, '');
+  return sanitizeGitBranchToLength(branch, dockerTagMaximumLength);
+}
+
+export function createGitBranchTag(branch: string): string {
+  const branchValue = sanitizeGitBranchToLength(
+    branch,
+    dockerTagMaximumLength - gitBranchTagPrefix.length,
+  );
+  return validateDockerTag(`${gitBranchTagPrefix}${branchValue}`);
+}
+
+function sanitizeGitBranchToLength(
+  branch: string,
+  maximumLength: number,
+): string {
+  const normalized = normalizeGitBranchIdentity(branch);
   const sanitized = normalized
     .normalize('NFKD')
     .toLowerCase()
     .replace(/[^a-z0-9._-]+/gu, '-')
     .replace(/[._-]{2,}/gu, '-')
     .replace(/^[._-]+|[._-]+$/gu, '');
-  const truncated = sanitized.slice(0, 128).replace(/[._-]+$/gu, '');
 
-  if (!truncated || truncated === 'head') {
+  if (!sanitized || sanitized === 'head') {
     throw new Error(
       `Git branch "${branch}" does not contain a usable Docker tag value.`,
     );
   }
 
-  return validateDockerTag(truncated);
+  if (sanitized.length <= maximumLength) {
+    return validateDockerTag(sanitized);
+  }
+
+  const hash = createHash('sha256')
+    .update(normalized.normalize('NFKD'), 'utf8')
+    .digest('hex')
+    .slice(0, gitBranchHashLength);
+  const readableLength =
+    maximumLength - hash.length - 1;
+  const readablePrefix = sanitized
+    .slice(0, readableLength)
+    .replace(/[._-]+$/gu, '');
+  return validateDockerTag(`${readablePrefix}-${hash}`);
+}
+
+function normalizeGitBranchIdentity(branch: string): string {
+  return branch
+    .trim()
+    .replace(/^refs\/heads\//iu, '')
+    .replace(/^refs\/remotes\/[^/]+\//iu, '')
+    .replace(/^origin\//iu, '');
 }
 
 function createTokenExpander(
@@ -556,7 +591,9 @@ function createTokenExpander(
   const workspaceRoot = path.resolve(context.root);
   let projectRoot: string | undefined;
   let gitSha: string | undefined;
+  let rawGitBranch: string | undefined;
   let gitBranch: string | undefined;
+  let gitBranchTag: string | undefined;
 
   return (value, optionName) => {
     let expanded = value.replaceAll('{absWorkspaceRoot}', workspaceRoot);
@@ -606,12 +643,25 @@ function createTokenExpander(
         .replaceAll('{gitSha}', gitSha)
         .replaceAll('{gitShortSha}', gitSha.slice(0, 12));
     }
-    if (expanded.includes('{gitBranch}')) {
-      gitBranch ??= resolveGitBranch(
+    if (
+      expanded.includes('{gitBranch}') ||
+      expanded.includes('{gitBranchTag}')
+    ) {
+      rawGitBranch ??= resolveGitBranchIdentity(
         workspaceRoot,
         dependencies.environment,
         dependencies.commandRunner,
       );
+    }
+    if (expanded.includes('{gitBranchTag}')) {
+      gitBranchTag ??= createGitBranchTag(rawGitBranch ?? '');
+      expanded = expanded.replaceAll(
+        '{gitBranchTag}',
+        gitBranchTag,
+      );
+    }
+    if (expanded.includes('{gitBranch}')) {
+      gitBranch ??= sanitizeGitBranch(rawGitBranch ?? '');
       expanded = expanded.replaceAll('{gitBranch}', gitBranch);
     }
 
@@ -658,7 +708,7 @@ function resolveGitSha(
   return normalized;
 }
 
-function resolveGitBranch(
+function resolveGitBranchIdentity(
   workspaceRoot: string,
   environment: NodeJS.ProcessEnv,
   commandRunner: CommandRunner,
@@ -671,7 +721,7 @@ function resolveGitBranch(
       ['branch', '--show-current'],
       'Git branch',
     );
-  return sanitizeGitBranch(rawBranch);
+  return rawBranch;
 }
 
 function firstEnvironmentValue(

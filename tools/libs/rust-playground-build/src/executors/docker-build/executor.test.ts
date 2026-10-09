@@ -7,6 +7,7 @@ import {
   type CommandOptions,
   type CommandResult,
   type CommandRunner,
+  createGitBranchTag,
   type DockerBuildExecutorDependencies,
   runDockerBuildExecutorWithDependencies,
   sanitizeGitBranch,
@@ -111,6 +112,30 @@ function baseOptions(
   };
 }
 
+interface RuntimeProjectConfiguration {
+  readonly targets: {
+    readonly build: { readonly cache?: boolean };
+    readonly publish: {
+      readonly configurations?: {
+        readonly main?: { readonly tags?: string[] };
+      };
+      readonly options: DockerBuildExecutorSchema;
+    };
+  };
+}
+
+function readRuntimeProject(): RuntimeProjectConfiguration {
+  return JSON.parse(
+    readFileSync(
+      new URL(
+        '../../../../../../bin/hello-world/project.json',
+        import.meta.url,
+      ),
+      'utf8',
+    ),
+  ) as RuntimeProjectConfiguration;
+}
+
 test('builds a load command as an argument array and writes a scan manifest', async () => {
   const context = createContext(true);
   const harness = createHarness(() => successfulCommand, {
@@ -193,7 +218,11 @@ test('pushes multiple platforms and expands sanitized CI Git tokens', async () =
       context: '{absWorkspaceRoot}',
       output: 'push',
       platforms: ['linux/amd64', 'linux/arm64/v8'],
-      tags: ['{gitBranch}', 'sha-{gitSha}', 'short-{gitShortSha}'],
+      tags: [
+        '{gitBranchTag}',
+        'sha-{gitSha}',
+        'short-{gitShortSha}',
+      ],
     }),
     createContext(),
     harness.dependencies,
@@ -209,7 +238,11 @@ test('pushes multiple platforms and expands sanitized CI Git tokens', async () =
     args.slice(args.indexOf('--platform'), args.indexOf('--platform') + 2),
     ['--platform', 'linux/amd64,linux/arm64/v8'],
   );
-  assert.ok(args.includes('example.test/hello-world:feature-add-registry-v2'));
+  assert.ok(
+    args.includes(
+      'example.test/hello-world:branch-feature-add-registry-v2',
+    ),
+  );
   assert.ok(
     args.includes(`example.test/hello-world:sha-${sha.toLowerCase()}`),
   );
@@ -855,12 +888,23 @@ test('turns manifest write failures into executor failures', async () => {
 });
 
 test('validates and sanitizes tag values deterministically', () => {
+  const sharedLongPrefix = `feature/${'a'.repeat(180)}`;
+  const firstLongBranch = `${sharedLongPrefix}-one`;
+  const secondLongBranch = `${sharedLongPrefix}-two`;
+  const firstLongTag = createGitBranchTag(firstLongBranch);
+  const secondLongTag = createGitBranchTag(secondLongBranch);
+
   assert.equal(validateDockerTag(' release_1.2-rc1 '), 'release_1.2-rc1');
   assert.equal(
     sanitizeGitBranch('refs/heads/Feature/Add Registry@V2'),
     'feature-add-registry-v2',
   );
-  assert.equal(sanitizeGitBranch(`feature/${'a'.repeat(200)}`).length, 128);
+  assert.equal(createGitBranchTag('refs/heads/latest'), 'branch-latest');
+  assert.equal(firstLongTag.length, 128);
+  assert.match(firstLongTag, /^branch-[a-z0-9-]+-[0-9a-f]{16}$/u);
+  assert.equal(createGitBranchTag(firstLongBranch), firstLongTag);
+  assert.notEqual(firstLongTag, secondLongTag);
+  assert.equal(sanitizeGitBranch(firstLongBranch).length, 128);
   assert.throws(() => validateDockerTag('-invalid'), /Invalid Docker tag/u);
   assert.throws(() => sanitizeGitBranch('---'), /does not contain a usable/u);
 });
@@ -891,29 +935,7 @@ test('publishes a complete strict executor schema', () => {
 });
 
 test('configures runtime publication namespaces, immutability, and uncached Cargo builds', () => {
-  const helloWorldProject = JSON.parse(
-    readFileSync(
-      new URL(
-        '../../../../../../bin/hello-world/project.json',
-        import.meta.url,
-      ),
-      'utf8',
-    ),
-  ) as {
-    targets: {
-      build: { cache?: boolean };
-      publish: {
-        configurations?: {
-          main?: { tags?: string[] };
-        };
-        options: {
-          immutableTags?: string[];
-          requireCleanWorktree?: boolean;
-          tags?: string[];
-        };
-      };
-    };
-  };
+  const helloWorldProject = readRuntimeProject();
   const greetingProject = JSON.parse(
     readFileSync(
       new URL(
@@ -929,7 +951,7 @@ test('configures runtime publication namespaces, immutability, and uncached Carg
   };
 
   assert.deepEqual(helloWorldProject.targets.publish.options.tags, [
-    'branch-{gitBranch}',
+    '{gitBranchTag}',
     'sha-{gitSha}',
   ]);
   assert.deepEqual(
@@ -946,4 +968,58 @@ test('configures runtime publication namespaces, immutability, and uncached Carg
   );
   assert.equal(helloWorldProject.targets.build.cache, false);
   assert.equal(greetingProject.targets.build.cache, false);
+});
+
+test('actual runtime publish target bounds very long branch tags without collisions', async () => {
+  const options = readRuntimeProject().targets.publish.options;
+  const sha = 'e'.repeat(40);
+
+  async function executeTarget(branch: string): Promise<string> {
+    const harness = createHarness((command, args) => {
+      if (
+        command === 'docker' &&
+        args[0] === 'buildx' &&
+        args[1] === 'imagetools'
+      ) {
+        return { status: 0, stdout: 'Name: existing manifest\n' };
+      }
+      return successfulCommand;
+    }, {
+      REGISTRY_BRANCH: branch,
+      REGISTRY_SHA: sha,
+    });
+    const result = await runDockerBuildExecutorWithDependencies(
+      options,
+      createContext(),
+      harness.dependencies,
+    );
+
+    assert.deepEqual(result, { success: true });
+    assert.equal(harness.errors.length, 0);
+    const buildInvocation = harness.invocations.find(
+      ({ args, command }) =>
+        command === 'docker' &&
+        args[0] === 'buildx' &&
+        args[1] === 'build',
+    );
+    assert.ok(buildInvocation);
+    const tagArgumentIndex = buildInvocation.args.indexOf('--tag');
+    assert.ok(tagArgumentIndex >= 0);
+    const imageReference =
+      buildInvocation.args[tagArgumentIndex + 1] ?? '';
+    return imageReference.slice(imageReference.lastIndexOf(':') + 1);
+  }
+
+  const sharedLongPrefix = `feature/${'z'.repeat(180)}`;
+  const firstBranch = `${sharedLongPrefix}-one`;
+  const secondBranch = `${sharedLongPrefix}-two`;
+  const firstTag = await executeTarget(firstBranch);
+  const repeatedFirstTag = await executeTarget(firstBranch);
+  const secondTag = await executeTarget(secondBranch);
+
+  assert.equal(firstTag, createGitBranchTag(firstBranch));
+  assert.equal(firstTag.length, 128);
+  assert.match(firstTag, /^branch-[a-z0-9-]+-[0-9a-f]{16}$/u);
+  assert.equal(repeatedFirstTag, firstTag);
+  assert.notEqual(secondTag, firstTag);
 });

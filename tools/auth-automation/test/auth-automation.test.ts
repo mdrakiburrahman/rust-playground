@@ -281,6 +281,24 @@ class FakeFileSystem implements FileSystemAdapter {
   }
 }
 
+function accountShowResult(): ProcessResult {
+  return {
+    exitCode: 0,
+    signal: null,
+    stdout: JSON.stringify({
+      tenantId: DEFAULT_TENANT,
+      id: "subscription-id",
+      name: "Test subscription",
+      state: "Enabled",
+    }),
+    stderr: "",
+  };
+}
+
+function isAccountShowCommand(command: CommandSpec): boolean {
+  return command.args.includes("account") && command.args.includes("show");
+}
+
 class ControlledProcessAdapter implements ProcessAdapter {
   readonly loginCompletion = deferred<ProcessResult>();
   readonly startedCommands: CommandSpec[] = [];
@@ -303,6 +321,13 @@ class ControlledProcessAdapter implements ProcessAdapter {
     handlers: ProcessOutputHandlers = {},
   ): RunningProcess {
     this.startedCommands.push(command);
+    if (isAccountShowCommand(command)) {
+      return {
+        pid: 4343,
+        completion: Promise.resolve(accountShowResult()),
+        terminate: async () => undefined,
+      };
+    }
     if (this.prompt) {
       handlers.onStdout?.(this.prompt);
     }
@@ -322,17 +347,7 @@ class ControlledProcessAdapter implements ProcessAdapter {
 
   async run(command: CommandSpec, _timeoutMs: number): Promise<ProcessResult> {
     this.runCommands.push(command);
-    return {
-      exitCode: 0,
-      signal: null,
-      stdout: JSON.stringify({
-        tenantId: DEFAULT_TENANT,
-        id: "subscription-id",
-        name: "Test subscription",
-        state: "Enabled",
-      }),
-      stderr: "",
-    };
+    return accountShowResult();
   }
 
   completeLogin(
@@ -363,6 +378,13 @@ class BrowserLoginProcessAdapter implements ProcessAdapter {
 
   start(command: CommandSpec): RunningProcess {
     this.startedCommands.push(command);
+    if (isAccountShowCommand(command)) {
+      return {
+        pid: 5353,
+        completion: Promise.resolve(accountShowResult()),
+        terminate: async () => undefined,
+      };
+    }
     return {
       pid: 5252,
       completion: this.completion.promise,
@@ -387,17 +409,7 @@ class BrowserLoginProcessAdapter implements ProcessAdapter {
         stderr: "",
       };
     }
-    return {
-      exitCode: 0,
-      signal: null,
-      stdout: JSON.stringify({
-        tenantId: DEFAULT_TENANT,
-        id: "subscription-id",
-        name: "Test subscription",
-        state: "Enabled",
-      }),
-      stderr: "",
-    };
+    return accountShowResult();
   }
 
   finish(
@@ -414,6 +426,135 @@ class BrowserLoginProcessAdapter implements ProcessAdapter {
       stdout: "",
       stderr: "",
     });
+  }
+}
+
+class StalledStatusProcessAdapter implements ProcessAdapter {
+  readonly started = deferred<void>();
+  readonly completion = deferred<ProcessResult>();
+  startedCommand: CommandSpec | undefined;
+  terminated = false;
+  runCalled = false;
+
+  start(command: CommandSpec): RunningProcess {
+    this.startedCommand = command;
+    this.started.resolve();
+    return {
+      pid: 6262,
+      completion: this.completion.promise,
+      terminate: async () => {
+        this.terminated = true;
+        this.completion.resolve({
+          exitCode: null,
+          signal: "SIGTERM",
+          stdout: "",
+          stderr: "",
+        });
+      },
+    };
+  }
+
+  async run(
+    _command: CommandSpec,
+    _timeoutMs: number,
+  ): Promise<ProcessResult> {
+    this.runCalled = true;
+    throw new Error("status must not use ProcessAdapter.run()");
+  }
+}
+
+class PostLoginStatusStallAdapter implements ProcessAdapter {
+  readonly loginCompletion = deferred<ProcessResult>();
+  readonly statusStarted = deferred<void>();
+  readonly statusCompletion = deferred<ProcessResult>();
+  statusTerminated = false;
+
+  start(
+    command: CommandSpec,
+    handlers: ProcessOutputHandlers = {},
+  ): RunningProcess {
+    if (isAccountShowCommand(command)) {
+      this.statusStarted.resolve();
+      return {
+        pid: 6464,
+        completion: this.statusCompletion.promise,
+        terminate: async () => {
+          this.statusTerminated = true;
+          this.statusCompletion.resolve({
+            exitCode: null,
+            signal: "SIGTERM",
+            stdout: "",
+            stderr: "",
+          });
+        },
+      };
+    }
+    handlers.onStdout?.(
+      "Open https://login.microsoft.com/device and enter the code ABCDEF123 to authenticate.",
+    );
+    return {
+      pid: 6363,
+      completion: this.loginCompletion.promise,
+      terminate: async () => {
+        this.loginCompletion.resolve({
+          exitCode: null,
+          signal: "SIGTERM",
+          stdout: "",
+          stderr: "",
+        });
+      },
+    };
+  }
+
+  async run(
+    _command: CommandSpec,
+    _timeoutMs: number,
+  ): Promise<ProcessResult> {
+    throw new Error("post-login status must not use ProcessAdapter.run()");
+  }
+
+  finishLogin(): void {
+    this.loginCompletion.resolve({
+      exitCode: 0,
+      signal: null,
+      stdout: "",
+      stderr: "",
+    });
+  }
+}
+
+class RealStatusFixtureAdapter implements ProcessAdapter {
+  readonly ready = deferred<void>();
+  running: RunningProcess | undefined;
+  runCalled = false;
+  output = "";
+
+  constructor(
+    private readonly realAdapter: NodeProcessAdapter,
+    private readonly fixtureCommand: CommandSpec,
+  ) {}
+
+  start(
+    _command: CommandSpec,
+    _handlers: ProcessOutputHandlers = {},
+  ): RunningProcess {
+    this.running = this.realAdapter.start(this.fixtureCommand, {
+      onStdout: (chunk) => {
+        this.output += chunk;
+        if (chunk.includes("READY")) {
+          this.ready.resolve();
+        }
+      },
+    });
+    return this.running;
+  }
+
+  async run(
+    _command: CommandSpec,
+    _timeoutMs: number,
+  ): Promise<ProcessResult> {
+    this.runCalled = true;
+    throw new Error("status must not use ProcessAdapter.run()");
   }
 }
 
@@ -1220,6 +1361,84 @@ test("SIGTERM closes browser, terminates WSL login, removes capture files, and r
   );
 });
 
+test("SIGINT terminates a tracked stalled status process instead of waiting", async () => {
+  const processes = new StalledStatusProcessAdapter();
+  const signalHost = new FakeSignalHost();
+  const sink = new MemorySink();
+  const runningMain = main(
+    [
+      "node",
+      "auth-automation",
+      "status",
+      "--target",
+      "current",
+    ],
+    {
+      environment: environment("linux"),
+      processes,
+      browser: new FakeBrowser(
+        new SequenceBrowserSession([snapshot({ bodyText: "unused" })]),
+      ),
+      fileSystem: new FakeFileSystem(),
+      timer: new ManualTimer(),
+      logger: new SecretSafeLogger(sink),
+    },
+    signalHost,
+  );
+
+  await processes.started.promise;
+  signalHost.emit("SIGINT");
+  await runningMain;
+
+  assert.equal(processes.runCalled, false);
+  assert.equal(processes.terminated, true);
+  assert.equal(signalHost.exitCode, 130);
+  assert.doesNotMatch(
+    sink.messages.join("\n"),
+    /cleanup could not be fully confirmed/,
+  );
+});
+
+test("SIGTERM interrupts tracked post-login account verification", async () => {
+  const processes = new PostLoginStatusStallAdapter();
+  const signalHost = new FakeSignalHost();
+  const session = new SequenceBrowserSession([
+    snapshot({ deviceCodeInputVisible: true }),
+    snapshot({
+      deviceCodeInputVisible: true,
+      controls: ["Next"],
+    }),
+    snapshot({ bodyText: "You have signed in." }),
+  ]);
+  const runningMain = main(
+    [
+      "node",
+      "auth-automation",
+      "login",
+      "--target",
+      "current",
+    ],
+    {
+      environment: environment("linux"),
+      processes,
+      browser: new FakeBrowser(session),
+      fileSystem: new FakeFileSystem(),
+      timer: new ManualTimer(),
+      logger: new SecretSafeLogger(new MemorySink()),
+    },
+    signalHost,
+  );
+
+  await session.closed.promise;
+  processes.finishLogin();
+  await processes.statusStarted.promise;
+  signalHost.emit("SIGTERM");
+  await runningMain;
+
+  assert.equal(processes.statusTerminated, true);
+  assert.equal(signalHost.exitCode, 143);
+});
+
 test("browser login captures the URL, uses safe controls, verifies localhost, and cleans up", async () => {
   const processes = new BrowserLoginProcessAdapter();
   const fileSystem = new FakeFileSystem();
@@ -1540,7 +1759,10 @@ test("login parses before process exit, uses Windows Edge for WSL, and verifies 
   processes.completeLogin();
   const account = await resultPromise;
   assert.equal(account.tenantId, DEFAULT_TENANT);
-  assert.equal(processes.runCommands[0].command, "wsl.exe");
+  assert.equal(
+    processes.startedCommands.find(isAccountShowCommand)?.command,
+    "wsl.exe",
+  );
   assert.equal(session.closeCount, 1);
 });
 
@@ -1652,6 +1874,179 @@ test("safety failures wait for confirmed launched-process exit", async () => {
   assert.equal(processes.loginCompleted, true);
   assert.equal(rejected, true);
 });
+
+test(
+  "SIGTERM interrupts a real stalled Windows status process tree",
+  { skip: process.platform !== "win32", timeout: 20_000 },
+  async (context) => {
+    const fixtureSource =
+      'console.log("READY"); setInterval(() => {}, 1000);';
+    const fixtureBootstrap = `eval(Buffer.from('${Buffer.from(fixtureSource).toString("base64")}','base64').toString('utf8'))`;
+    const fixtureAdapter = new RealStatusFixtureAdapter(
+      new NodeProcessAdapter(new SystemTimer()),
+      {
+        command: "cmd.exe",
+        args: ["/d", "/s", "/c", "node", "-e", fixtureBootstrap],
+        label: "Windows stalled status fixture",
+      },
+    );
+    const signalHost = new FakeSignalHost();
+    const runningMain = main(
+      [
+        "node",
+        "auth-automation",
+        "status",
+        "--target",
+        "windows",
+      ],
+      {
+        environment: environment("win32"),
+        processes: fixtureAdapter,
+        browser: new FakeBrowser(
+          new SequenceBrowserSession([snapshot({ bodyText: "unused" })]),
+        ),
+        fileSystem: new FakeFileSystem(),
+        timer: new SystemTimer(),
+        logger: new SecretSafeLogger(new MemorySink()),
+      },
+      signalHost,
+    );
+    await promiseWithin(
+      fixtureAdapter.ready.promise,
+      5_000,
+      "Windows status fixture did not become ready.",
+    );
+    const rootPid = fixtureAdapter.running?.pid;
+    assert.ok(rootPid);
+    context.after(() => {
+      if (isProcessRunning(rootPid)) {
+        stopWindowsPids([rootPid]);
+      }
+    });
+
+    signalHost.emit("SIGTERM");
+    await runningMain;
+
+    assert.equal(fixtureAdapter.runCalled, false);
+    assert.equal(signalHost.exitCode, 143);
+    assert.equal(isProcessRunning(rootPid), false);
+  },
+);
+
+test(
+  "SIGINT interrupts a real stalled WSL status process tree",
+  { skip: process.platform !== "win32", timeout: 30_000 },
+  async (context) => {
+    const distro = "Ubuntu-24.04";
+    const availability = spawnSync(
+      "wsl.exe",
+      ["--distribution", distro, "--exec", "true"],
+      { windowsHide: true },
+    );
+    if (availability.status !== 0) {
+      context.skip(`${distro} is not available for the WSL status regression.`);
+      return;
+    }
+
+    const fixtureAdapter = new RealStatusFixtureAdapter(
+      new NodeProcessAdapter(new SystemTimer()),
+      {
+        command: "wsl.exe",
+        args: [
+          "--distribution",
+          distro,
+          "--exec",
+          "sh",
+          "-c",
+          `printf '${WSL_PID_MARKER}%s\\n' "$$" >&2; exec "$@"`,
+          "auth-automation",
+          "sh",
+          "-c",
+          'printf "READY LINUX:%s\\n" "$$"; sleep 300',
+        ],
+        label: "WSL stalled status fixture",
+        termination: {
+          kind: "wsl",
+          distro,
+          pidMarker: WSL_PID_MARKER,
+        },
+      },
+    );
+    const signalHost = new FakeSignalHost();
+    const runningMain = main(
+      [
+        "node",
+        "auth-automation",
+        "status",
+        "--target",
+        "wsl",
+        "--wsl-distro",
+        distro,
+      ],
+      {
+        environment: environment("win32"),
+        processes: fixtureAdapter,
+        browser: new FakeBrowser(
+          new SequenceBrowserSession([snapshot({ bodyText: "unused" })]),
+        ),
+        fileSystem: new FakeFileSystem(),
+        timer: new SystemTimer(),
+        logger: new SecretSafeLogger(new MemorySink()),
+      },
+      signalHost,
+    );
+    await promiseWithin(
+      fixtureAdapter.ready.promise,
+      10_000,
+      "WSL status fixture did not become ready.",
+    );
+    const windowsRootPid = fixtureAdapter.running?.pid;
+    const linuxRootPid = Number(
+      fixtureAdapter.output.match(/LINUX:(\d+)/)?.[1],
+    );
+    assert.ok(windowsRootPid);
+    assert.ok(linuxRootPid);
+    context.after(() => {
+      spawnSync(
+        "wsl.exe",
+        [
+          "--distribution",
+          distro,
+          "--exec",
+          "kill",
+          "-KILL",
+          String(linuxRootPid),
+        ],
+        { windowsHide: true },
+      );
+      if (isProcessRunning(windowsRootPid)) {
+        stopWindowsPids([windowsRootPid]);
+      }
+    });
+
+    signalHost.emit("SIGINT");
+    await runningMain;
+
+    const remaining = spawnSync(
+      "wsl.exe",
+      [
+        "--distribution",
+        distro,
+        "--exec",
+        "ps",
+        "-p",
+        String(linuxRootPid),
+        "-o",
+        "pid=",
+      ],
+      { encoding: "utf8", windowsHide: true },
+    );
+    assert.equal(fixtureAdapter.runCalled, false);
+    assert.equal(signalHost.exitCode, 130);
+    assert.equal(remaining.stdout.trim(), "");
+    assert.equal(isProcessRunning(windowsRootPid), false);
+  },
+);
 
 test(
   "SIGINT handling awaits real Windows cmd wrapper and descendant cleanup",
