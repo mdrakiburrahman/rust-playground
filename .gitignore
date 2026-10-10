@@ -32,3 +32,6 @@ out/
 # Editors
 .idea/
 .vscode/settings.json
+
+# Scratch
+.temp/
