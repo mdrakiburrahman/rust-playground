@@ -136,7 +136,7 @@ npx --no-install nx run loadtest:e2e
 The sample sends logs, metrics, and traces to the Rust collector and writes
 readable local Parquet. `loadtest:up` rebuilds both local Dockerfiles, including
 uncommitted fork edits. See [loadtest](projects/loadtest/README.md) and
-[the contributor workflow](CONTRIBUTING.md#rust-collector-and-local-telemetry-lake).
+[collector development](projects/otelcol-rust/README.md#editing-the-fork).
 
 ## Public GHCR images
 

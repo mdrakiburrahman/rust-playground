@@ -16,6 +16,50 @@ bind mount is gitignored and preserved when containers stop. Collector writes
 use your non-root UID/GID, not privileged containers or checkout-wide chmod.
 Re-running `up` rebuilds local source and recreates changed services.
 
+## Architecture and what to observe
+
+```text
+[1] Local source                         [2] Nx + Docker Compose
+    bin/hello-world/ -------------------> builds hello-world image
+    submodules/otel-arrow/ -------------> builds otelcol-rust image
+    (including uncommitted fork edits)             |
+                                                  v
+    +-------------------- private Compose network -------------------+
+    |                                                                |
+    | [3] hello-world             OTLP HTTP/protobuf                  |
+    |     greeting log     --+                                        |
+    |     greetings counter +----> [4] otelcol-rust :4318              |
+    |     greeting span    --+          OTLP receiver                 |
+    |                                  -> Parquet exporter           |
+    +------------------------------------------|---------------------+
+                                               | flush + bind mount
+                                               v
+    [5] Local, gitignored onelake/
+        demo/                     continuous run; retained after down
+        e2e/e2e-<uuid>/            isolated finite test output
+          logs/ + log_attrs/      greeting body + run.id
+          univariate_metrics/     hello_world.greetings
+          number_data_points/     counter values + joined attributes
+          spans/ + span_attrs/    greeting spans + correlated IDs
+                         |
+                         v
+    [6] loadtest:inspect / loadtest:e2e
+        schemas, row counts, sample rows / content assertions + PASS
+```
+
+1. Edit the app or collector fork. Local edits enter the build without first
+   publishing a package; see [collector development](../otelcol-rust/README.md).
+2. `loadtest:up` builds both Dockerfiles and waits for collector readiness.
+3. `loadtest:logs` shows repeated `Hello, World!` greetings and collector
+   listener startup. The app exports a log, counter datapoint, and span.
+4. The receiver accepts all three signals; the exporter closes Parquet files
+   on its age threshold and during graceful shutdown.
+5. Browse `onelake/demo/` for files, or a fresh `onelake/e2e/e2e-<uuid>/`
+   after E2E. This is a **local folder**, not Microsoft Fabric OneLake.
+6. `loadtest:inspect` shows schemas, counts, and two sample rows per table.
+   `loadtest:e2e` must print `PASS` for marked logs, metric datapoints, and
+   correlated traces; it does not treat file existence as successful delivery.
+
 ## E2E acceptance
 
 ```bash
