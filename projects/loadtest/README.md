@@ -22,14 +22,14 @@ Re-running `up` rebuilds local source and recreates changed services.
 [1] Local source                         [2] Nx + Docker Compose
     bin/hello-world/ -------------------> builds hello-world image
     submodules/otel-arrow/ -------------> builds otelcol-rust image
-    (including uncommitted fork edits)             |
+    (including uncommitted fork edits)            |
                                                   v
     +-------------------- private Compose network -------------------+
     |                                                                |
-    | [3] hello-world             OTLP HTTP/protobuf                  |
-    |     greeting log     --+                                        |
-    |     greetings counter +----> [4] otelcol-rust :4318              |
-    |     greeting span    --+          OTLP receiver                 |
+    | [3] hello-world             OTLP HTTP/protobuf                 |
+    |     greeting log     --+                                       |
+    |     greetings counter +----> [4] otelcol-rust :4318            |
+    |     greeting span    --+          OTLP receiver                |
     |                                  -> Parquet exporter           |
     +------------------------------------------|---------------------+
                                                | flush + bind mount
@@ -95,11 +95,11 @@ snapshot. Delete only specific unwanted run directories when finished.
 The experimental exporter writes OTAP payload tables, not three flattened
 JSON-like tables:
 
-| Signal | Main tables | Associated attributes |
-| --- | --- | --- |
-| Logs | `logs` | `log_attrs` |
-| Metrics | `univariate_metrics`, `number_data_points` | `number_dp_attrs` |
-| Traces | `spans` | `span_attrs` |
+| Signal  | Main tables                                | Associated attributes |
+| ------- | ------------------------------------------ | --------------------- |
+| Logs    | `logs`                                     | `log_attrs`           |
+| Metrics | `univariate_metrics`, `number_data_points` | `number_dp_attrs`     |
+| Traces  | `spans`                                    | `span_attrs`          |
 
 Metric datapoints reference metric IDs; attribute rows reference their record's
 ID with `parent_id`. `resource_attrs` and `scope_attrs` provide additional
