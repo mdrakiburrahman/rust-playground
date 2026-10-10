@@ -390,11 +390,26 @@ test('startup rejects a container whose inspected CI label does not match', () =
 });
 
 test('runs the full verification aggregation and clean-tree gate in the exact container', () => {
-  const runner = new FakeRunner([success()]);
+  const runner = new FakeRunner([success(), success()]);
 
   verifyDevcontainer({ containerId: sourceContainerId }, runner);
 
   assert.deepEqual(runner.calls, [
+    {
+      args: [
+        'exec',
+        '--user',
+        'root',
+        '--workdir',
+        '/workspaces/rust-playground',
+        sourceContainerId,
+        'bash',
+        '-lc',
+        'install -d -m 0755 -o "$(id -u vscode)" -g "$(id -g vscode)" onelake',
+      ],
+      command: 'docker',
+      options: undefined,
+    },
     {
       args: [
         'exec',
@@ -411,6 +426,16 @@ test('runs the full verification aggregation and clean-tree gate in the exact co
       options: undefined,
     },
   ]);
+  runner.assertComplete();
+});
+
+test('does not run verification when CI output directory preparation fails', () => {
+  const runner = new FakeRunner([failure(1, 'cannot prepare output')]);
+  assert.throws(
+    () => verifyDevcontainer({ containerId: sourceContainerId }, runner),
+    CommandError,
+  );
+  assert.equal(runner.calls.length, 1);
   runner.assertComplete();
 });
 
