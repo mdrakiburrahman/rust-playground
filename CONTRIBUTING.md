@@ -1,147 +1,167 @@
 # Contributing
 
-The supported development environment is Linux in the repository's local
+If you use Windows, use it only to enter WSL. All development happens on
+Linux inside the repository's
 [VS Code devcontainer](https://code.visualstudio.com/docs/devcontainers/containers).
-Windows is used only to enter WSL. CI builds and tests the same source
-devcontainer.
+CI uses the same development environment.
 
-## Windows and WSL prerequisites
+## Enter the devcontainer
 
-Run the Windows bootstrap from PowerShell 7 as Administrator:
-
-```powershell
-.\dev\bootstrap-dev-env.ps1
-```
-
-> [!WARNING]
-> This is the full developer-machine bootstrap. It removes Docker Desktop and
-> existing WSL distributions, configures Defender and `.wslconfig`, and
-> installs a fresh Ubuntu 24.04 distribution.
-
-Clone the repository into the WSL filesystem rather than `/mnt/c`:
+After completing the one-time setup below, run these commands from WSL:
 
 ```bash
-sudo install -d -m 0775 -o "$USER" -g "$USER" /workspaces
-cd /workspaces
-git clone https://github.com/mdrakiburrahman/rust-playground.git rust-playground
-cd rust-playground
-```
-
-Set the repository-local developer identity that commits should use:
-
-```bash
-git config --local user.name "Raki Rahman"
-git config --local user.email "mdrakiburrahman@gmail.com"
-```
-
-To share Git for Windows credentials with WSL, configure its bundled
-credential manager from inside WSL:
-
-```bash
-git config --global credential.helper \
-  '/mnt/c/"Program Files"/Git/mingw64/bin/git-credential-manager.exe'
-```
-
-Create the host credential directories that the devcontainer mounts:
-
-```bash
-mkdir -p "$HOME/.azure" "$HOME/.config/gh"
-chmod 700 "$HOME/.azure" "$HOME/.config/gh"
-```
-
-Run the Linux host bootstrap:
-
-```bash
-./dev/bootstrap-dev-env.sh
-```
-
-This is the full administrator bootstrap for generic host prerequisites. It
-configures Azure CLI, Docker, Node.js, and the Dev Containers CLI, replaces the
-Docker daemon configuration, adjusts namespace sysctls, and clears existing
-Docker containers, volumes, and networks.
-
-The bootstrap runs `az login` when the native Linux Azure CLI is not already
-authenticated. For local package publication, a fresh GitHub CLI login inside
-the devcontainer must request the `write:packages` package scope:
-
-```bash
-gh auth login --hostname github.com --git-protocol https --web \
-  --scopes write:packages
-```
-
-Add that scope to an existing login with:
-
-```bash
-gh auth refresh --hostname github.com --scopes write:packages
-```
-
-The Azure and GitHub CLI directories are mounted read/write, so login and
-logout changes made in the devcontainer also affect the WSL host state. Never
-copy either credential directory into the repository.
-
-## Configure and open the devcontainer
-
-Install the root tooling from the checked-in lockfile:
-
-```bash
+cd /workspaces/rust-playground
 npm ci
-```
-
-The source configuration builds `.devcontainer/Dockerfile` and applies the
-locked features from `.devcontainer/source/devcontainer.json`:
-
-```bash
-npx nx run devcontainer:up-source
-```
-
-The published configuration pulls the immutable image pinned in
-`.devcontainer/docker-compose.yml`:
-
-```bash
 npx nx run devcontainer:up
+WORKSPACE_HEX=$(printf '%s' "$(wslpath -w .)" | od -An -tx1 | tr -d '[:space:]')
+code --folder-uri "vscode-remote://dev-container+${WORKSPACE_HEX}/workspaces/rust-playground"
 ```
 
-The `initializeCommand` creates `~/.azure` and `~/.config/gh` when needed and
-writes the ignored `.devcontainer/.env` consumed by Compose. Repository
-dependencies are installed by the post-create step, not maintained manually
-on the host.
-
-Open the repository from WSL:
+This starts the default immutable devcontainer image and opens the repository
+inside it. To enter the same container from a terminal without VS Code, run:
 
 ```bash
-code .
+npx --no-install devcontainer exec \
+  --workspace-folder . \
+  --config .devcontainer/devcontainer.json \
+  bash
 ```
 
-Choose **Dev Containers: Reopen in Container** to use the default published
-configuration. To work in the source-built container, start it with the Nx
-target above and choose **Dev Containers: Attach to Running Container**.
+## First-time setup
+
+1. Install VS Code and its WSL and Dev Containers extensions from PowerShell:
+
+   ```powershell
+   winget install -e --id Microsoft.VisualStudioCode
+   code --install-extension ms-vscode-remote.remote-wsl
+   code --install-extension ms-vscode-remote.remote-containers
+   ```
+
+1. Run the Windows bootstrap from PowerShell 7 as Administrator:
+
+   ```powershell
+   $GIT_ROOT = git rev-parse --show-toplevel
+   & "$GIT_ROOT\dev\bootstrap-dev-env.ps1"
+   ```
+
+1. Enter Ubuntu 24.04, clone your fork into the WSL filesystem, and configure
+   your Git identity:
+
+   ```bash
+   sudo install -d -m 0775 -o "$USER" -g "$USER" /workspaces
+   cd /workspaces
+
+   read -rp "Enter your name (for example, FirstName LastName): " user_name
+   read -rp "Enter your email: " user_email
+   read -rp "Enter your fork URL: " git_fork_url
+
+   git config --global user.name "$user_name"
+   git config --global user.email "$user_email"
+   git clone "$git_fork_url" rust-playground
+   cd rust-playground
+   ```
+
+   Do not clone the development copy under `/mnt/c`; Docker bind mounts and
+   Linux filesystem operations are substantially more reliable under
+   `/workspaces`.
+
+   To reuse Git for Windows credentials from WSL:
+
+   ```bash
+   git config --global credential.helper \
+     '/mnt/c/"Program Files"/Git/mingw64/bin/git-credential-manager.exe'
+   ```
+
+1. Run the idempotent Linux host bootstrap:
+
+   ```bash
+   GIT_ROOT=$(git rev-parse --show-toplevel)
+   chmod +x "$GIT_ROOT/dev/bootstrap-dev-env.sh"
+   "$GIT_ROOT/dev/bootstrap-dev-env.sh"
+   ```
+
+   The bootstrap installs and configures Azure CLI, GitHub CLI, Docker,
+   Node.js, and the Dev Containers CLI. It also restarts Docker and clears
+   existing Docker containers, volumes, and networks.
+
+1. Start and enter the devcontainer:
+
+   ```bash
+   npm ci
+   npx nx run devcontainer:up
+   WORKSPACE_HEX=$(printf '%s' "$(wslpath -w .)" | od -An -tx1 | tr -d '[:space:]')
+   code --folder-uri "vscode-remote://dev-container+${WORKSPACE_HEX}/workspaces/rust-playground"
+   ```
+
+   The devcontainer initialization creates the host credential directories
+   used for the read/write mounts at `~/.azure` and `~/.config/gh`.
+   Repository dependencies are installed inside the container by its
+   post-create command.
+
+1. Authenticate from inside the devcontainer when needed:
+
+   ```bash
+   az login
+   gh auth login
+   ```
+
+   For local package publication, add the `write:packages` scope:
+
+   ```bash
+   gh auth refresh --hostname github.com --scopes write:packages
+   ```
+
+   Authentication changes are shared with the WSL host through the mounted
+   credential directories. Never copy either directory into the repository.
 
 ## Verify changes
 
-Inside the devcontainer:
+Run checks inside the devcontainer:
 
 ```bash
 npx nx run-many -t verify --all --parallel=1
 npx nx run hello-world:image-smoke
 ```
 
-For Rust-only changes, the aggregate target is:
+For Rust-only changes:
 
 ```bash
 npx nx run rust:verify
 ```
 
-Stop only this workspace's Compose project when finished:
+## Build the devcontainer from source
+
+The default workflow uses the immutable image pinned in
+`.devcontainer/docker-compose.yml`. Only use the source configuration when
+changing the devcontainer itself:
+
+```bash
+npx nx run devcontainer:down
+npx nx run devcontainer:up-source
+```
+
+In VS Code, choose **Dev Containers: Attach to Running Container** and select
+the `rust-playground (source)` container.
+
+## Stop the devcontainer
+
+After closing VS Code, run this from the WSL host:
 
 ```bash
 npx nx run devcontainer:down
 ```
 
 Add `-- --volumes` only when the workspace's named volumes should also be
-deleted. The cleanup target never performs a global Docker prune.
+deleted:
 
-For editor-free WSL operation, source and published lifecycle commands, the
-fresh-machine regression sequence, monitoring, and safe cleanup, see
+```bash
+npx nx run devcontainer:down -- --volumes
+```
+
+The cleanup target affects only this workspace and never performs a global
+Docker prune.
+
+For editor-free operation, monitoring, and troubleshooting, see
 [Headless devcontainer operations](docs/devcontainer/headless-operations.md).
-For image publication and verification, see
+For image publication, see
 [Container publishing](docs/containers/publishing.md).
