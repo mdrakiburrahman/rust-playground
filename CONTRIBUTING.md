@@ -23,7 +23,7 @@ Clone the repository into the WSL filesystem rather than `/mnt/c`:
 ```bash
 sudo install -d -m 0775 -o "$USER" -g "$USER" /workspaces
 cd /workspaces
-git clone <your-fork-url> rust-playground
+git clone https://github.com/mdrakiburrahman/rust-playground.git rust-playground
 cd rust-playground
 ```
 
