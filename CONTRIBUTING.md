@@ -30,8 +30,8 @@ cd rust-playground
 Set the repository-local developer identity that commits should use:
 
 ```bash
-git config --local user.name "FirstName LastName"
-git config --local user.email "alias@example.com"
+git config --local user.name "Raki Rahman"
+git config --local user.email "mdrakiburrahman@gmail.com"
 ```
 
 To share Git for Windows credentials with WSL, configure its bundled
@@ -41,10 +41,6 @@ credential manager from inside WSL:
 git config --global credential.helper \
   '/mnt/c/"Program Files"/Git/mingw64/bin/git-credential-manager.exe'
 ```
-
-The outer single quotes preserve the inner double quotes around
-`Program Files` in the stored helper value, so Git invokes the path as one
-executable.
 
 Create the host credential directories that the devcontainer mounts:
 
