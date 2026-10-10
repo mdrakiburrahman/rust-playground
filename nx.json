@@ -41,5 +41,6 @@
     "verify": {
       "cache": false
     }
-  }
+  },
+  "analytics": false
 }
