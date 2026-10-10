@@ -26,6 +26,12 @@ logs/
 *.log
 out/
 
+# Local telemetry lake (demo data and isolated E2E runs)
+/onelake/
+
 # Editors
 .idea/
 .vscode/settings.json
+
+# Scratch
+.temp/

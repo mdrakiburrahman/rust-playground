@@ -1,0 +1,4 @@
+[submodule "submodules/otel-arrow"]
+	path = submodules/otel-arrow
+	url = https://github.com/mdrakiburrahman/otel-arrow.git
+	branch = dev/mdrrahman/explore

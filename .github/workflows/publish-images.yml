@@ -8,6 +8,7 @@ on:
       - .dockerignore
       - .github/workflows/publish-images.yml
       - bin/hello-world/**
+      - projects/loadtest/reader/**
       - Cargo.lock
       - Cargo.toml
       - crates/**

@@ -1,5 +1,5 @@
 [workspace]
-members = ["bin/*", "crates/*"]
+members = ["bin/*", "crates/*", "projects/loadtest/reader"]
 resolver = "2"
 
 [workspace.package]
@@ -15,7 +15,11 @@ readme = "README.md"
 anyhow = "1"
 assert_cmd = "2"
 clap = { version = "4", features = ["derive"] }
+ctrlc = { version = "3", features = ["termination"] }
 greeting = { path = "crates/greeting" }
+opentelemetry = "0.31"
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["http-proto", "reqwest-blocking-client", "reqwest-rustls", "logs", "metrics", "trace"] }
+opentelemetry_sdk = "0.31"
 predicates = "3"
 thiserror = "2"
 tracing = "0.1"

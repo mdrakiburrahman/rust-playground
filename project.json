@@ -4,7 +4,8 @@
   "projectType": "library",
   "implicitDependencies": [
     "greeting",
-    "hello-world"
+    "hello-world",
+    "loadtest"
   ],
   "metadata": {
     "description": "Aggregate targets for the Rust workspace."
@@ -17,7 +18,8 @@
         {
           "projects": [
             "greeting",
-            "hello-world"
+            "hello-world",
+            "loadtest"
           ],
           "target": "format"
         }
@@ -36,7 +38,8 @@
         {
           "projects": [
             "greeting",
-            "hello-world"
+            "hello-world",
+            "loadtest"
           ],
           "target": "format-check"
         }
@@ -55,7 +58,8 @@
         {
           "projects": [
             "greeting",
-            "hello-world"
+            "hello-world",
+            "loadtest"
           ],
           "target": "lint"
         }
@@ -77,6 +81,10 @@
             "hello-world"
           ],
           "target": "build"
+        },
+        {
+          "projects": ["loadtest"],
+          "target": "reader-build"
         }
       ],
       "options": {
@@ -93,7 +101,8 @@
         {
           "projects": [
             "greeting",
-            "hello-world"
+            "hello-world",
+            "loadtest"
           ],
           "target": "test"
         }
@@ -112,7 +121,8 @@
         "{workspaceRoot}/Cargo.toml",
         "{workspaceRoot}/Cargo.lock",
         "{workspaceRoot}/crates/*/Cargo.toml",
-        "{workspaceRoot}/bin/*/Cargo.toml"
+        "{workspaceRoot}/bin/*/Cargo.toml",
+        "{workspaceRoot}/projects/loadtest/reader/Cargo.toml"
       ],
       "options": {
         "command": "cargo metadata --locked --format-version 1 --no-deps",
@@ -132,7 +142,9 @@
         "{workspaceRoot}/crates/*/Cargo.toml",
         "{workspaceRoot}/crates/*/src/**/*",
         "{workspaceRoot}/bin/*/Cargo.toml",
-        "{workspaceRoot}/bin/*/src/**/*"
+        "{workspaceRoot}/bin/*/src/**/*",
+        "{workspaceRoot}/projects/loadtest/reader/Cargo.toml",
+        "{workspaceRoot}/projects/loadtest/reader/src/**/*"
       ],
       "options": {
         "command": "cargo test --locked --workspace --doc --all-features",

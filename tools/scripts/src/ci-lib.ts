@@ -154,6 +154,17 @@ export function verifyDevcontainer(
   runChecked(runner, 'docker', [
     'exec',
     '--user',
+    'root',
+    '--workdir',
+    containerWorkspace,
+    containerId,
+    'bash',
+    '-lc',
+    'install -d -m 0755 -o "$(id -u vscode)" -g "$(id -g vscode)" onelake',
+  ]);
+  runChecked(runner, 'docker', [
+    'exec',
+    '--user',
     'vscode',
     '--workdir',
     containerWorkspace,

@@ -59,6 +59,7 @@ npx --no-install devcontainer exec \
    git config --global user.email "$user_email"
    git clone "$git_fork_url" rust-playground
    cd rust-playground
+   git submodule update --init --recursive
    ```
 
    Do not clone the development copy under `/mnt/c`; Docker bind mounts and
@@ -128,6 +129,11 @@ For Rust-only changes:
 ```bash
 npx nx run rust:verify
 ```
+
+For collector source development and submodule updates, see the
+[otelcol-rust README](projects/otelcol-rust/README.md). For the Compose demo,
+local Parquet output, and E2E verification, see the
+[loadtest README](projects/loadtest/README.md).
 
 ## Build the devcontainer from source
 

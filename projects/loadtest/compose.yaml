@@ -1,0 +1,28 @@
+services:
+  otelcol-rust:
+    image: ghcr.io/mdrakiburrahman/rust-playground/otelcol-rust:dev
+    build:
+      context: ../..
+      dockerfile: projects/otelcol-rust/Dockerfile
+    user: "${LOADTEST_UID:?Run through Nx}:${LOADTEST_GID:?Run through Nx}"
+    volumes:
+      - type: bind
+        source: ${ONELAKE_HOST_PATH:?Run through Nx}
+        target: /onelake
+        bind:
+          create_host_path: false
+    stop_grace_period: 30s
+  hello-world:
+    image: ghcr.io/mdrakiburrahman/rust-playground/hello-world:dev
+    build:
+      context: ../..
+      dockerfile: bin/hello-world/Dockerfile
+    depends_on:
+      otelcol-rust:
+        condition: service_healthy
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otelcol-rust:4318
+      OTEL_SERVICE_NAME: hello-world
+      RUST_LOG: info
+    command: ["--telemetry", "--repeat", "--interval-ms", "1000", "--run-id", "demo"]
+    stop_grace_period: 30s
