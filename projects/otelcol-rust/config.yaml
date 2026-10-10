@@ -1,0 +1,27 @@
+version: otel_dataflow/v1
+engine: {}
+groups:
+  default:
+    pipelines:
+      main:
+        nodes:
+          otlp:
+            type: receiver:otlp
+            config:
+              protocols:
+                http:
+                  listening_addr: "0.0.0.0:4318"
+                grpc:
+                  listening_addr: "0.0.0.0:4317"
+          parquet:
+            type: exporter:parquet
+            config:
+              storage:
+                file:
+                  base_uri: /onelake
+              writer_options:
+                target_rows_per_file: 1000
+                flush_when_older_than: 2s
+        connections:
+          - from: otlp
+            to: parquet

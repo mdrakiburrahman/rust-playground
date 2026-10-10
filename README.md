@@ -113,11 +113,30 @@ docker run --rm --platform linux/amd64 \
   uses.
 - `tools/` - TypeScript CLIs, lifecycle helpers, and the local Nx Docker build
   plugin.
+- `projects/otelcol-rust/` - Nx build/configuration and Docker image for the
+  editable otel-arrow fork at `submodules/otel-arrow`.
+- `projects/loadtest/` - Two-service Compose demo and content-verified Parquet
+  E2E; generated telemetry lives in gitignored `onelake/`.
 - `.devcontainer/` - Reproducible source-built and immutable prebuilt
   development environments.
 
 See [Rust project layout](docs/rust/project-layout.md) and
 [adding Rust projects](docs/rust/adding-projects.md).
+
+## Local Rust telemetry collector
+
+```bash
+git submodule update --init --recursive
+npx --no-install nx run loadtest:up
+npx --no-install nx run loadtest:inspect
+npx --no-install nx run loadtest:down
+npx --no-install nx run loadtest:e2e
+```
+
+The sample sends logs, metrics, and traces to the Rust collector and writes
+readable local Parquet. `loadtest:up` rebuilds both local Dockerfiles, including
+uncommitted fork edits. See [loadtest](projects/loadtest/README.md) and
+[the contributor workflow](CONTRIBUTING.md#rust-collector-and-local-telemetry-lake).
 
 ## Public GHCR images
 

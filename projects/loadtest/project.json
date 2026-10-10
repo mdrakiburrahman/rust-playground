@@ -1,0 +1,82 @@
+{
+  "name": "loadtest",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "application",
+  "implicitDependencies": ["otelcol-rust", "hello-world"],
+  "targets": {
+    "reader-build": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {"command": "cargo build --locked --package parquet-inspect"}
+    },
+    "format": {
+      "executor": "nx:run-commands",
+      "options": {"command": "cargo fmt --package parquet-inspect"}
+    },
+    "format-check": {
+      "executor": "nx:run-commands",
+      "options": {"command": "cargo fmt --package parquet-inspect -- --check"}
+    },
+    "lint": {
+      "executor": "nx:run-commands",
+      "options": {"command": "cargo clippy --locked --package parquet-inspect --all-targets -- -D warnings"}
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "options": {
+        "commands": [
+          "cargo test --locked --package parquet-inspect",
+          "npx --no-install tsx --test projects/loadtest/test/*.test.ts"
+        ],
+        "parallel": false
+      }
+    },
+    "typecheck": {
+      "executor": "nx:run-commands",
+      "options": {"command": "npx --no-install tsc --project projects/loadtest/tsconfig.json"}
+    },
+    "build": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": [
+        {"projects": ["otelcol-rust", "hello-world"], "target": "image"},
+        "reader-build"
+      ],
+      "options": {"commands": []}
+    },
+    "up": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {"command": "npx --no-install tsx projects/loadtest/src/main.ts up", "forwardAllArgs": false}
+    },
+    "down": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {"command": "npx --no-install tsx projects/loadtest/src/main.ts down", "forwardAllArgs": false}
+    },
+    "logs": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {"command": "npx --no-install tsx projects/loadtest/src/main.ts logs", "forwardAllArgs": false}
+    },
+    "inspect": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["reader-build"],
+      "options": {"command": "npx --no-install tsx projects/loadtest/src/main.ts inspect", "forwardAllArgs": false}
+    },
+    "e2e": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["build"],
+      "options": {"command": "npx --no-install tsx projects/loadtest/src/main.ts e2e", "forwardAllArgs": false}
+    },
+    "verify": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["format-check", "lint", "typecheck", "test", "e2e"],
+      "options": {"commands": []}
+    }
+  },
+  "tags": ["scope:rust", "type:e2e"]
+}

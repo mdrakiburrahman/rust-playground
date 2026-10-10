@@ -26,6 +26,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+          submodules: recursive
 
       - name: Set up Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -55,3 +56,12 @@ jobs:
           COMPOSE_PROJECT: ${{ steps.devcontainer.outputs.compose_project }}
           CONTAINER_ID: ${{ steps.devcontainer.outputs.container_id }}
         run: npx --no-install nx run tools-scripts:ci-cleanup
+
+      - name: Upload telemetry E2E diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: telemetry-e2e-diagnostics
+          path: onelake/e2e/
+          if-no-files-found: ignore
+          retention-days: 7

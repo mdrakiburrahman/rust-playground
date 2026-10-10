@@ -173,6 +173,7 @@ test('Dockerfile is Ubuntu 24.04 with the purposeful Rust build packages', () =>
     'lldb',
     'mold',
     'pkg-config',
+    'protobuf-compiler',
   ]) {
     assert.ok(
       dockerfile

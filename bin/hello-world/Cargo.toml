@@ -12,7 +12,11 @@ readme = "README.md"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+ctrlc.workspace = true
 greeting.workspace = true
+opentelemetry.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry_sdk.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

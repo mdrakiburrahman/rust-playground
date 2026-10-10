@@ -17,4 +17,5 @@ RUN apt-get update \
         lldb \
         mold \
         pkg-config \
+        protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*

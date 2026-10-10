@@ -59,6 +59,7 @@ npx --no-install devcontainer exec \
    git config --global user.email "$user_email"
    git clone "$git_fork_url" rust-playground
    cd rust-playground
+   git submodule update --init --recursive
    ```
 
    Do not clone the development copy under `/mnt/c`; Docker bind mounts and
@@ -128,6 +129,89 @@ For Rust-only changes:
 ```bash
 npx nx run rust:verify
 ```
+
+## Rust collector and local telemetry lake
+
+The `otelcol-rust` Nx project builds `df_engine` directly from the editable
+`submodules/otel-arrow` fork. Initialize the full source and nested proto
+submodules after cloning or switching to this change:
+
+```bash
+git submodule update --init --recursive
+```
+
+CI checks out the committed gitlink SHA, not a moving branch tip. For local
+collector development, explicitly attach the submodule to the exploration
+branch (ordinary initialization leaves it detached):
+
+```bash
+git -C submodules/otel-arrow switch dev/mdrrahman/explore
+npx --no-install nx run otelcol-rust:build
+npx --no-install nx run otelcol-rust:image-smoke
+```
+
+If the branch is not yet local, create it from the remote tracking branch:
+
+```bash
+git -C submodules/otel-arrow switch --track origin/dev/mdrrahman/explore
+```
+
+The collector uses the fork's pinned Rust toolchain, independently of this
+workspace's Rust version. Rustup installs it when first invoked there.
+Native builds also need `protoc`; the source devcontainer includes
+`protobuf-compiler`. When using an older prebuilt devcontainer, rebuild from
+source or install that missing package before native collector builds.
+The collector Dockerfile includes its own build prerequisites.
+
+Both native and image builds consume local source, including uncommitted edits:
+no Cargo git dependency or remote prebuilt collector bypasses the submodule.
+Rebuild and restart the two-container demo after changing collector code:
+
+```bash
+npx --no-install nx run loadtest:up
+npx --no-install nx run loadtest:logs
+npx --no-install nx run loadtest:inspect
+npx --no-install nx run loadtest:down
+```
+
+`loadtest:up` builds both Dockerfiles and starts an instrumented hello-world
+loop. Parquet appears under gitignored `onelake/demo/`; shutdown preserves it.
+This is a **local folder**, not a connection to Microsoft Fabric OneLake.
+Run as your non-root devcontainer user: Compose uses that user's UID/GID
+for collector writes so files remain readable without broad permission changes.
+Ports are private to the Compose network.
+
+To execute finite E2E verification and inspect its output:
+
+```bash
+npx --no-install nx run loadtest:e2e
+ONELAKE_INSPECT_PATH=onelake/e2e/<run-id> \
+  npx --no-install nx run loadtest:inspect
+```
+
+Each E2E run gets a fresh directory and verifies actual log records,
+counter datapoints, and correlated spans from readable Parquet. On failure,
+inspect that directory's `compose.log`. The exporter stores OTAP tables with
+`id`/`parent_id` relationships, not a single flattened table for each signal.
+See [loadtest](projects/loadtest/README.md) for the layout.
+
+The runner resolves bind mounts through the current devcontainer's Docker
+mount metadata. With a custom hostname or remote Docker daemon, set
+`LOADTEST_HOST_WORKSPACE` to the daemon-visible path to this checkout.
+
+To incorporate remote fork changes without discarding your local edits:
+
+```bash
+git -C submodules/otel-arrow fetch origin
+git -C submodules/otel-arrow switch dev/mdrrahman/explore
+git -C submodules/otel-arrow merge --ff-only origin/dev/mdrrahman/explore
+git submodule update --init --recursive
+```
+
+When committing your own collector changes, push them to the fork first,
+then stage and commit `submodules/otel-arrow` in rust-playground to pin the
+new SHA. Run E2E before pushing the superproject. Do not use
+`git submodule update --remote` in CI or reset a dirty submodule.
 
 ## Build the devcontainer from source
 

@@ -15,7 +15,9 @@
       "{workspaceRoot}/Cargo.toml",
       "{workspaceRoot}/Cargo.lock",
       "{workspaceRoot}/rust-toolchain.toml",
-      "{workspaceRoot}/rustfmt.toml"
+      "{workspaceRoot}/rustfmt.toml",
+      "{workspaceRoot}/projects/loadtest/reader/Cargo.toml",
+      "{workspaceRoot}/projects/loadtest/reader/src/**/*"
     ],
     "production": [
       "default",
