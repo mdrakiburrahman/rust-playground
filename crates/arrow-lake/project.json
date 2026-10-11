@@ -1,0 +1,21 @@
+{
+  "name": "arrow-lake",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "library",
+  "sourceRoot": "crates/arrow-lake/src",
+  "namedInputs": {
+    "default": ["{projectRoot}/**/*", "{workspaceRoot}/Cargo.toml", "{workspaceRoot}/Cargo.lock", "{workspaceRoot}/rust-toolchain.toml"]
+  },
+  "targets": {
+    "format": {"executor": "nx:run-commands", "options": {"command": "cargo fmt --package arrow-lake"}},
+    "format-check": {"executor": "nx:run-commands", "options": {"command": "cargo fmt --package arrow-lake -- --check"}},
+    "lint": {"executor": "nx:run-commands", "options": {"command": "cargo clippy --locked --package arrow-lake --all-targets --all-features -- -D warnings"}},
+    "build": {"executor": "nx:run-commands", "cache": false, "options": {"command": "cargo build --locked --package arrow-lake --all-features"}},
+    "test": {
+      "executor": "nx:run-commands",
+      "options": {"commands": ["cargo test --locked --package arrow-lake --all-features", "cargo test --locked --package arrow-lake --no-default-features"], "parallel": false}
+    },
+    "verify": {"executor": "nx:run-commands", "dependsOn": ["format-check", "lint", "build", "test"], "options": {"commands": []}}
+  },
+  "tags": ["scope:rust", "type:library"]
+}

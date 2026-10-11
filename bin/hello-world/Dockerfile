@@ -5,12 +5,10 @@ FROM --platform=linux/amd64 rust:1.96.1-bookworm@sha256:a339861ae23e9abb272cea45
 WORKDIR /workspace
 
 COPY Cargo.toml Cargo.lock ./
-COPY crates/greeting/Cargo.toml crates/greeting/README.md crates/greeting/
-COPY crates/greeting/src crates/greeting/src
-COPY bin/hello-world/Cargo.toml bin/hello-world/README.md bin/hello-world/
-COPY bin/hello-world/src bin/hello-world/src
-COPY projects/loadtest/reader/Cargo.toml projects/loadtest/reader/
-COPY projects/loadtest/reader/src projects/loadtest/reader/src
+COPY crates crates
+COPY bin bin
+COPY projects projects
+COPY submodules/otel-arrow submodules/otel-arrow
 
 RUN cargo build --locked --release --package hello-world \
     && strip target/release/hello-world

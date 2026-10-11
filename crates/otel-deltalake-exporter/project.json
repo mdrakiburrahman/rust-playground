@@ -1,0 +1,19 @@
+{
+  "name": "otel-deltalake-exporter",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "library",
+  "sourceRoot": "crates/otel-deltalake-exporter/src",
+  "implicitDependencies": ["arrow-lake"],
+  "namedInputs": {
+    "default": ["{projectRoot}/**/*", "{workspaceRoot}/Cargo.toml", "{workspaceRoot}/Cargo.lock", "{workspaceRoot}/submodules/otel-arrow/rust/otap-dataflow/**/*.rs", "{workspaceRoot}/submodules/otel-arrow/rust/otap-dataflow/**/Cargo.toml"]
+  },
+  "targets": {
+    "format": {"executor": "nx:run-commands", "options": {"command": "cargo fmt --package otel-deltalake-exporter"}},
+    "format-check": {"executor": "nx:run-commands", "options": {"command": "cargo fmt --package otel-deltalake-exporter -- --check"}},
+    "lint": {"executor": "nx:run-commands", "options": {"command": "cargo clippy --locked --package otel-deltalake-exporter --all-targets -- -D warnings"}},
+    "build": {"executor": "nx:run-commands", "cache": false, "options": {"command": "cargo build --locked --package otel-deltalake-exporter"}},
+    "test": {"executor": "nx:run-commands", "options": {"command": "cargo test --locked --package otel-deltalake-exporter"}},
+    "verify": {"executor": "nx:run-commands", "dependsOn": ["format-check", "lint", "build", "test"], "options": {"commands": []}}
+  },
+  "tags": ["scope:rust", "type:library"]
+}

@@ -5,6 +5,7 @@ services:
       context: ../..
       dockerfile: projects/otelcol-rust/Dockerfile
     user: "${LOADTEST_UID:?Run through Nx}:${LOADTEST_GID:?Run through Nx}"
+    command: ["--num-cores", "${LOADTEST_CORES:-2}", "--http-admin-bind", "0.0.0.0:8080", "--config", "/etc/otelcol-rust/config.yaml"]
     volumes:
       - type: bind
         source: ${ONELAKE_HOST_PATH:?Run through Nx}

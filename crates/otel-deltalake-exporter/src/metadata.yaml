@@ -1,0 +1,6 @@
+type: deltalake
+status:
+  class: exporter
+  codeowners:
+    active:
+      - mdrakiburrahman

@@ -7,25 +7,25 @@
     "reader-build": {
       "executor": "nx:run-commands",
       "cache": false,
-      "options": {"command": "cargo build --locked --package parquet-inspect"}
+      "options": {"command": "cargo build --locked --package delta-inspect"}
     },
     "format": {
       "executor": "nx:run-commands",
-      "options": {"command": "cargo fmt --package parquet-inspect"}
+      "options": {"command": "cargo fmt --package delta-inspect"}
     },
     "format-check": {
       "executor": "nx:run-commands",
-      "options": {"command": "cargo fmt --package parquet-inspect -- --check"}
+      "options": {"command": "cargo fmt --package delta-inspect -- --check"}
     },
     "lint": {
       "executor": "nx:run-commands",
-      "options": {"command": "cargo clippy --locked --package parquet-inspect --all-targets -- -D warnings"}
+      "options": {"command": "cargo clippy --locked --package delta-inspect --all-targets -- -D warnings"}
     },
     "test": {
       "executor": "nx:run-commands",
       "options": {
         "commands": [
-          "cargo test --locked --package parquet-inspect",
+          "cargo test --locked --package delta-inspect",
           "npx --no-install tsx --test projects/loadtest/test/*.test.ts"
         ],
         "parallel": false

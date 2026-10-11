@@ -115,7 +115,7 @@ docker run --rm --platform linux/amd64 \
   plugin.
 - `projects/otelcol-rust/` - Nx build/configuration and Docker image for the
   editable otel-arrow fork at `submodules/otel-arrow`.
-- `projects/loadtest/` - Two-service Compose demo and content-verified Parquet
+- `projects/loadtest/` - Two-service Compose demo and content-verified Delta
   E2E; generated telemetry lives in gitignored `onelake/`.
 - `.devcontainer/` - Reproducible source-built and immutable prebuilt
   development environments.
@@ -134,9 +134,16 @@ npx --no-install nx run loadtest:e2e
 ```
 
 The sample sends logs, metrics, and traces to the Rust collector and writes
-readable local Parquet. `loadtest:up` rebuilds both local Dockerfiles, including
-uncommitted fork edits. See [loadtest](projects/loadtest/README.md) and
+readable local Delta tables containing Parquet. Multiple collector cores stream
+files concurrently and share batched Delta commits per table. `loadtest:up`
+rebuilds both local Dockerfiles, including uncommitted fork edits.
+See [loadtest](projects/loadtest/README.md) and
 [collector development](projects/otelcol-rust/README.md#editing-the-fork).
+
+The [arrow-lake SDK](crates/arrow-lake/README.md) accepts pure Arrow batches
+for Parquet-only or Delta writing. OTEL-specific routing and joins live in the
+separate [Delta adapter](crates/otel-deltalake-exporter/README.md). Writer-side
+Delta operations use Delta Kernel; delta-rs is confined to the loadtest reader.
 
 ## Public GHCR images
 
