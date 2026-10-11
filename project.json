@@ -3,6 +3,9 @@
   "$schema": "./node_modules/nx/schemas/project-schema.json",
   "projectType": "library",
   "implicitDependencies": [
+    "arrow-lake",
+    "otel-deltalake-exporter",
+    "otelcol-rust",
     "greeting",
     "hello-world",
     "loadtest"
@@ -17,6 +20,9 @@
       "dependsOn": [
         {
           "projects": [
+            "arrow-lake",
+            "otel-deltalake-exporter",
+            "otelcol-rust",
             "greeting",
             "hello-world",
             "loadtest"
@@ -37,6 +43,9 @@
       "dependsOn": [
         {
           "projects": [
+            "arrow-lake",
+            "otel-deltalake-exporter",
+            "otelcol-rust",
             "greeting",
             "hello-world",
             "loadtest"
@@ -57,6 +66,9 @@
       "dependsOn": [
         {
           "projects": [
+            "arrow-lake",
+            "otel-deltalake-exporter",
+            "otelcol-rust",
             "greeting",
             "hello-world",
             "loadtest"
@@ -77,6 +89,9 @@
       "dependsOn": [
         {
           "projects": [
+            "arrow-lake",
+            "otel-deltalake-exporter",
+            "otelcol-rust",
             "greeting",
             "hello-world"
           ],
@@ -100,6 +115,9 @@
       "dependsOn": [
         {
           "projects": [
+            "arrow-lake",
+            "otel-deltalake-exporter",
+            "otelcol-rust",
             "greeting",
             "hello-world",
             "loadtest"
@@ -122,7 +140,9 @@
         "{workspaceRoot}/Cargo.lock",
         "{workspaceRoot}/crates/*/Cargo.toml",
         "{workspaceRoot}/bin/*/Cargo.toml",
-        "{workspaceRoot}/projects/loadtest/reader/Cargo.toml"
+        "{workspaceRoot}/projects/loadtest/reader/Cargo.toml",
+        "{workspaceRoot}/projects/otelcol-rust/Cargo.toml",
+        "{workspaceRoot}/submodules/otel-arrow/rust/otap-dataflow/**/Cargo.toml"
       ],
       "options": {
         "command": "cargo metadata --locked --format-version 1 --no-deps",
@@ -144,7 +164,11 @@
         "{workspaceRoot}/bin/*/Cargo.toml",
         "{workspaceRoot}/bin/*/src/**/*",
         "{workspaceRoot}/projects/loadtest/reader/Cargo.toml",
-        "{workspaceRoot}/projects/loadtest/reader/src/**/*"
+        "{workspaceRoot}/projects/loadtest/reader/src/**/*",
+        "{workspaceRoot}/projects/otelcol-rust/Cargo.toml",
+        "{workspaceRoot}/projects/otelcol-rust/src/**/*",
+        "{workspaceRoot}/submodules/otel-arrow/rust/otap-dataflow/**/*.rs",
+        "{workspaceRoot}/submodules/otel-arrow/rust/otap-dataflow/**/Cargo.toml"
       ],
       "options": {
         "command": "cargo test --locked --workspace --doc --all-features",

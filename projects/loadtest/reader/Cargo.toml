@@ -1,5 +1,5 @@
 [package]
-name = "parquet-inspect"
+name = "delta-inspect"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,6 +9,14 @@ license.workspace = true
 anyhow.workspace = true
 parquet = { version = "58.3", default-features = false }
 serde_json = "1"
+deltalake-core = { version = "=1.1.1", default-features = false, features = ["rustls"] }
+url = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[dev-dependencies]
+arrow-lake = { path = "../../../crates/arrow-lake" }
+arrow = { version = "58.3", default-features = false }
+tempfile = "3"
 
 [lints]
 workspace = true

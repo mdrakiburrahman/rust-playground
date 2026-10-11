@@ -1,7 +1,8 @@
 # otelcol-rust
 
-An Nx-owned build of the fork's `otel-arrow-dfe` package (`df_engine` binary).
-The binary is installed as `otelcol-rust` inside the Docker image.
+A root-workspace collector binary that links `otel-deltalake-exporter` and
+calls the fork's shared `otel-arrow-dfe` startup entry point. The reusable
+Arrow/Delta SDK and adapter live in rust-playground, not in the fork.
 
 ```bash
 git submodule update --init --recursive
@@ -10,26 +11,35 @@ npx --no-install nx run otelcol-rust:config-check
 npx --no-install nx run otelcol-rust:image-smoke
 ```
 
-The deliberately small feature set is `otlp,parquet,crypto-ring`, with default
-features disabled. The existing composition root registers supported nodes;
-there is no duplicated collector entrypoint or Go component-parity promise.
-Builds use the fork's own toolchain and Cargo.lock and read the local working
-tree, including uncommitted changes. Nx build/image targets are uncached;
+The upstream feature set remains `otlp,parquet,crypto-ring`, with defaults
+disabled. Parquet enables the shared OTAP preparation and file-backend hooks;
+the external adapter registers `exporter:deltalake`. There is no duplicated
+collector startup or Go component-parity promise. Builds use the root
+workspace's toolchain and Cargo.lock and read local source, including
+uncommitted fork changes. Nx build/image targets are uncached;
 Docker still caches unchanged layers and Cargo artifacts.
 
 `config.yaml` accepts OTLP HTTP/protobuf on 4318 and gRPC on 4317 and exports
-all three signals to `/onelake`. The `loadtest` project supplies that bind mount.
-Age-based flushes and graceful shutdown close small local Parquet files.
-The exporter is experimental, not a production durability guarantee.
+all three signals to independent Delta payload tables beneath `/onelake`.
+The `loadtest` project supplies that bind mount. Multiple collector cores write
+Parquet concurrently and share batched Delta Kernel commits per table. The
+native/image demo defaults to two cores; `LOADTEST_CORES` controls Compose.
+`commit_options` defaults to a 10-second collection window, 64 files per commit,
+and 256 queued/committing files per table. Age-based Parquet flushes stage private
+files; parent publication waits for child commits. Graceful shutdown forces
+partial batches and drains all dependency waves.
+Native timestamps have exact nanosecond companions, and join namespaces
+prevent false joins across cores and after restart. This is an experimental
+append-only local writer, not a production or cross-table durability guarantee.
 
 `otelcol-rust:run` is for a native collector invocation; its config expects a
 writable `/onelake`. Prefer `loadtest:up` for the managed local mount and sample
-traffic. Native build artifacts stay in root `target/otelcol-rust/`.
+traffic. Native build artifacts stay in root `target/`.
 
 ## Toolchain and build prerequisites
 
-The collector uses the fork's pinned Rust toolchain independently of the root
-workspace. Rustup installs it when first invoked inside the fork.
+The root-owned collector uses the root's pinned Rust toolchain. Tests run
+inside the fork still use its independently pinned toolchain.
 Native builds need `protoc`; the source devcontainer includes
 `protobuf-compiler`. With an older prebuilt devcontainer, rebuild from source
 or install that package before native collector builds. The collector

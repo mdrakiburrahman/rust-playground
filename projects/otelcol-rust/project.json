@@ -2,13 +2,13 @@
   "name": "otelcol-rust",
   "$schema": "../../node_modules/nx/schemas/project-schema.json",
   "projectType": "application",
+  "implicitDependencies": ["otel-deltalake-exporter"],
   "targets": {
     "build": {
       "executor": "nx:run-commands",
       "cache": false,
       "options": {
-        "cwd": "submodules/otel-arrow/rust/otap-dataflow",
-        "command": "CARGO_TARGET_DIR=../../../../target/otelcol-rust cargo build --locked --package otel-arrow-dfe --bin df_engine --no-default-features --features otlp,parquet,crypto-ring"
+        "command": "cargo build --locked --package otelcol-rust"
       }
     },
     "config-check": {
@@ -16,7 +16,7 @@
       "cache": false,
       "dependsOn": ["build"],
       "options": {
-        "command": "target/otelcol-rust/debug/df_engine --validate-and-exit --config projects/otelcol-rust/config.yaml"
+        "command": "target/debug/otelcol-rust --validate-and-exit --config projects/otelcol-rust/config.yaml"
       }
     },
     "run": {
@@ -24,7 +24,7 @@
       "cache": false,
       "dependsOn": ["build"],
       "options": {
-        "command": "target/otelcol-rust/debug/df_engine --num-cores 1 --config projects/otelcol-rust/config.yaml",
+        "command": "target/debug/otelcol-rust --num-cores 2 --config projects/otelcol-rust/config.yaml",
         "forwardAllArgs": true
       }
     },
@@ -48,10 +48,14 @@
         "command": "docker run --rm ghcr.io/mdrakiburrahman/rust-playground/otelcol-rust:dev --validate-and-exit --config /etc/otelcol-rust/config.yaml"
       }
     },
+    "format": {"executor": "nx:run-commands", "options": {"command": "cargo fmt --package otelcol-rust"}},
+    "format-check": {"executor": "nx:run-commands", "options": {"command": "cargo fmt --package otelcol-rust -- --check"}},
+    "lint": {"executor": "nx:run-commands", "options": {"command": "cargo clippy --locked --package otelcol-rust --all-targets -- -D warnings"}},
+    "test": {"executor": "nx:run-commands", "options": {"command": "cargo test --locked --package otelcol-rust"}},
     "verify": {
       "executor": "nx:run-commands",
       "cache": false,
-      "dependsOn": ["config-check"],
+      "dependsOn": ["config-check", "format-check", "lint", "test"],
       "options": {"commands": []}
     }
   },
