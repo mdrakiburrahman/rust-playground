@@ -13,7 +13,7 @@
   },
   "devDependencies": {
     "@devcontainers/cli": "0.89.0",
-    "@nx/devkit": "23.2.1",
+    "@nx/devkit": "23.3.0",
     "@types/node": "24.7.0",
     "apache-arrow": "21.2.0",
     "commander": "14.0.1",
