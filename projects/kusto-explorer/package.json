@@ -17,7 +17,7 @@
   "devDependencies": {
     "@kusto/monaco-kusto": "15.0.1",
     "esbuild": "0.28.2",
-    "monaco-editor": "0.55.1",
+    "monaco-editor": "0.57.0",
     "typescript": "7.0.2"
   }
 }
