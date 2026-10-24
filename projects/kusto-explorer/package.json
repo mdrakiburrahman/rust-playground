@@ -18,6 +18,6 @@
     "@kusto/monaco-kusto": "15.0.1",
     "esbuild": "0.28.2",
     "monaco-editor": "0.55.1",
-    "typescript": "5.9.2"
+    "typescript": "7.0.2"
   }
 }
