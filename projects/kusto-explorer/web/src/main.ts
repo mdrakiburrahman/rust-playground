@@ -1,5 +1,5 @@
-import 'monaco-editor/esm/vs/editor/edcore.main.js';
-import * as monaco from 'monaco-editor/esm/vs/editor/editor.api.js';
+import * as monaco from 'monaco-editor/editor';
+import 'monaco-editor/features/register.all';
 import { getKustoWorker, kustoDefaults } from '@kusto/monaco-kusto/release/esm/monaco.contribution.js';
 import { DARK_THEME, LIGHT_THEME, defineThemes } from './themes';
 import '../styles/app.css';

@@ -28,13 +28,15 @@ const assetsDir = join(outDir, 'assets');
 const uiFiles = ['kusto_explorer_ui.js', 'kusto_explorer_ui_bg.wasm'];
 const compressible = /\.(css|html|js|json|svg|ttf|txt|wasm)$/;
 
-// Monaco's ESM sources import some modules without a file extension.
-const monacoEsmExtension = {
-  name: 'monaco-esm-extension',
+// The language service imports Monaco through the legacy `monaco-editor/esm/vs/...` paths, which
+// Monaco 0.56+ no longer exposes through its `exports` map, and Monaco's ESM sources import some
+// modules without a file extension. Resolve both by file path.
+const monacoEsmPaths = {
+  name: 'monaco-esm-paths',
   setup(build) {
-    build.onResolve({ filter: /^monaco-editor\/esm\/.+/ }, (args) => {
-      if (/\.(js|css)$/.test(args.path)) return undefined;
-      return build.resolve(`${args.path}.js`, { kind: args.kind, resolveDir: args.resolveDir });
+    build.onResolve({ filter: /^monaco-editor\/esm\/vs\/.+/ }, (args) => {
+      const file = join(projectDir, 'node_modules', args.path);
+      return build.resolve(/\.(js|css)$/.test(file) ? file : `${file}.js`, { kind: args.kind, resolveDir: args.resolveDir });
     });
   },
 };
@@ -120,7 +122,7 @@ const result = await esbuild.build({
   loader: { '.ttf': 'file' },
   // The language service runtime treats any CommonJS wrapper as Node.js and reads `global`.
   define: { global: 'globalThis' },
-  plugins: [monacoEsmExtension, nodeBuiltinStub],
+  plugins: [monacoEsmPaths, nodeBuiltinStub],
   logLevel: 'warning',
   metafile: true,
 });

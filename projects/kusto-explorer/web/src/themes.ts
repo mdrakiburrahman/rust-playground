@@ -1,4 +1,4 @@
-import type * as monaco from 'monaco-editor/esm/vs/editor/editor.api.js';
+import type * as monaco from 'monaco-editor/editor';
 
 type Palette = Record<string, string>;
 
