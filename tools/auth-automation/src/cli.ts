@@ -35,7 +35,7 @@ interface BrowserLoginCliOptions {
 export type CliSignal = "SIGINT" | "SIGTERM";
 
 export interface SignalHost {
-  exitCode?: string | number;
+  exitCode?: string | number | null;
   on(signal: CliSignal, listener: () => void): unknown;
   off(signal: CliSignal, listener: () => void): unknown;
 }
