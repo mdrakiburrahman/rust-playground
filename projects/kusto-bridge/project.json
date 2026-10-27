@@ -1,0 +1,125 @@
+{
+  "name": "kusto-bridge",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "application",
+  "sourceRoot": "projects/kusto-bridge/src",
+  "namedInputs": {
+    "default": [
+      "{projectRoot}/**/*",
+      "!{projectRoot}/docs/**/*",
+      "!{projectRoot}/**/*.md",
+      "{workspaceRoot}/Cargo.toml",
+      "{workspaceRoot}/Cargo.lock",
+      "{workspaceRoot}/rust-toolchain.toml"
+    ]
+  },
+  "targets": {
+    "clean": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install tsx tools/scripts/src/clean.ts projects/kusto-bridge",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      }
+    },
+    "format": {
+      "executor": "nx:run-commands",
+      "options": {"command": "cargo fmt --package kusto-bridge"}
+    },
+    "format-check": {
+      "executor": "nx:run-commands",
+      "options": {"command": "cargo fmt --package kusto-bridge -- --check"}
+    },
+    "lint": {
+      "executor": "nx:run-commands",
+      "options": {"command": "cargo clippy --locked --package kusto-bridge --all-targets -- -D warnings"}
+    },
+    "build": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {"command": "cargo build --locked --package kusto-bridge"}
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "options": {"command": "cargo test --locked --package kusto-bridge"}
+    },
+    "doc": {
+      "executor": "nx:run-commands",
+      "options": {"command": "RUSTDOCFLAGS='-D warnings' cargo doc --locked --package kusto-bridge --no-deps"}
+    },
+    "image": {
+      "executor": "rust-playground-build:docker-build",
+      "cache": false,
+      "inputs": [
+        "default",
+        "^default",
+        "{projectRoot}/Dockerfile",
+        "{workspaceRoot}/.dockerignore",
+        "{workspaceRoot}/Cargo.toml",
+        "{workspaceRoot}/Cargo.lock",
+        "{workspaceRoot}/rust-toolchain.toml",
+        "{workspaceRoot}/submodules/otel-arrow/**/*"
+      ],
+      "outputs": [
+        "{workspaceRoot}/target/images/kusto-bridge-load.txt"
+      ],
+      "options": {
+        "file": "{absProjectRoot}/Dockerfile",
+        "context": "{absWorkspaceRoot}",
+        "image": "ghcr.io/mdrakiburrahman/rust-playground/kusto-bridge",
+        "tags": ["dev"],
+        "platforms": ["linux/amd64"],
+        "output": "load",
+        "manifestFile": "{absWorkspaceRoot}/target/images/kusto-bridge-load.txt"
+      },
+      "configurations": {
+        "ci-verify": {
+          "cacheFrom": ["type=gha,version=2,scope={projectName}-image"],
+          "cacheTo": ["type=gha,version=2,scope={projectName}-image,mode=max"]
+        }
+      }
+    },
+    "publish": {
+      "executor": "rust-playground-build:docker-build",
+      "cache": false,
+      "inputs": [
+        "default",
+        "^default",
+        "{projectRoot}/Dockerfile",
+        "{workspaceRoot}/.dockerignore",
+        "{workspaceRoot}/Cargo.toml",
+        "{workspaceRoot}/Cargo.lock",
+        "{workspaceRoot}/rust-toolchain.toml",
+        "{workspaceRoot}/submodules/otel-arrow/**/*"
+      ],
+      "outputs": [
+        "{workspaceRoot}/target/images/kusto-bridge-publish.txt"
+      ],
+      "options": {
+        "file": "{absProjectRoot}/Dockerfile",
+        "context": "{absWorkspaceRoot}",
+        "image": "ghcr.io/mdrakiburrahman/rust-playground/kusto-bridge",
+        "tags": ["{gitBranchTag}", "sha-{gitSha}"],
+        "immutableTags": ["sha-{gitSha}"],
+        "requireCleanWorktree": true,
+        "buildArgs": ["VCS_REF={gitSha}"],
+        "platforms": ["linux/amd64"],
+        "output": "push",
+        "manifestFile": "{absWorkspaceRoot}/target/images/kusto-bridge-publish.txt"
+      },
+      "configurations": {
+        "main": {
+          "tags": ["{gitBranchTag}", "sha-{gitSha}", "latest"]
+        }
+      }
+    },
+    "verify": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["format-check", "lint", "test", "doc"],
+      "options": {"commands": []}
+    }
+  },
+  "tags": ["scope:rust", "type:application", "type:runtime-image"]
+}
