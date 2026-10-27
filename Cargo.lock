@@ -2749,6 +2749,7 @@ dependencies = [
  "anyhow",
  "arrow 58.4.0",
  "arrow-deltalake",
+ "deltalake-azure",
  "deltalake-core",
  "hex",
  "parquet 58.4.0",
@@ -2825,6 +2826,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "deltalake-azure"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16ef4cf47139555d7c837f021d3ecdd616e3d137517ec61235346f59145336bb"
+dependencies = [
+ "bytes",
+ "deltalake-core",
+ "object_store",
+ "thiserror 2.0.21",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "deltalake-core"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2855,6 +2870,7 @@ dependencies = [
  "either",
  "foldhash 0.2.0",
  "futures",
+ "humantime",
  "indexmap 2.14.2",
  "itertools 0.14.0",
  "object_store",
