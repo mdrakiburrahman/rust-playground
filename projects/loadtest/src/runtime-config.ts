@@ -34,6 +34,8 @@ export interface BenchmarkRuntimeOptions {
   quiver?: boolean;
   mode?: LoadtestMode;
   azure?: AzureTargets;
+  azureConfigHostDirectory?: string;
+  azureEnvironment?: NodeJS.ProcessEnv;
 }
 
 export function buildBenchmarkRuntimeConfigs(
@@ -97,9 +99,27 @@ export function buildBenchmarkRuntimeConfigs(
 }
 
 export function buildBenchmarkComposeOverride(hostDirectory: string, options: BenchmarkRuntimeOptions = {}): string {
+  const cloud: Record<string, { environment: Record<string, string>; volumes: object[] }> = {};
+  if (options.mode === 'azure') {
+    if (!options.azureConfigHostDirectory) throw new Error('Azure runtime requires isolated writable CLI configuration');
+    const environment: Record<string, string> = { AZURE_CONFIG_DIR: '/run/azure', AZURE_USE_AZURE_CLI: 'true' };
+    for (const key of ['AZURE_SUBSCRIPTION_ID', 'AZURE_STORAGE_ACCOUNT', 'AZURE_STORAGE_CONTAINER', 'AZURE_STORAGE_CHECKPOINT_CONTAINER']) {
+      const value = options.azureEnvironment?.[key];
+      if (!value) throw new Error(`Azure runtime requires ${key}`);
+      environment[key] = value;
+    }
+    for (const service of ['direct-1', 'dataflow-1']) {
+      cloud[service] = { environment, volumes: [{
+        type: 'bind', source: path.join(options.azureConfigHostDirectory, service),
+        target: '/run/azure', bind: { create_host_path: false },
+      }] };
+    }
+  }
   return JSON.stringify({
     services: {
+      ...(cloud['direct-1'] ? { 'direct-1': cloud['direct-1'] } : {}),
       'dataflow-1': {
+        ...(cloud['dataflow-1'] ? { environment: cloud['dataflow-1'].environment } : {}),
         volumes: [{
           type: 'bind',
           source: path.join(hostDirectory, 'dataflow-state-1/dataflow.yaml'),
@@ -111,7 +131,7 @@ export function buildBenchmarkComposeOverride(hostDirectory: string, options: Be
           source: path.join(hostDirectory, benchmarkQuiver.dataflowHostDirectory),
           target: benchmarkQuiver.dataflowDirectory,
           bind: { create_host_path: false },
-        }] : [])],
+        }] : []), ...(cloud['dataflow-1']?.volumes ?? [])],
       },
     },
   }, null, 2);

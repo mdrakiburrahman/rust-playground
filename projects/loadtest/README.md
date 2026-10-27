@@ -82,6 +82,15 @@ failure, not successful skipped qualification. Real Azure QAP qualification is
 separate from local emulator functionality and remains unverified until a live
 authorized run produces the required observations.
 
+Azure collector images must include the shared pinned CLI installer from
+`infra/docker/install-azure-cli.sh`. At runtime the runner makes a separate
+writable Azure CLI config copy for each collector, below the ignored
+`onelake/benchmark/latest/azure-cli/` directory. Directories are mode `0700`,
+files `0600`; collectors use the invoking UID/GID. The host cache is never
+mounted into a collector, and config/credentials never enter an image or its
+build context. Copying config is not proof of valid cloud authorization:
+token refresh and owned storage access must still succeed.
+
 To stop only this workspace's loadtest without deleting its data:
 
 ```bash
