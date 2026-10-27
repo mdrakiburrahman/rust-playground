@@ -583,6 +583,15 @@ def exclusive(control, generation, steps):
     control.complete_bootstrap(operator, generation, definitively_drained=True)
 
 
+def initializer_env(values, c, tables, generation):
+    """Environment for the Delta initializer child; the captured generation is its only authority."""
+    return {
+        **os.environ, **values, **c.generated(),
+        "ARROWCOL_AZURE_TABLE_MANIFEST": str(tables.resolve()),
+        "ARROWCOL_EXPECTED_RESET_GENERATION": generation,
+    }
+
+
 def provision(azure, tables, wait_seconds, output, infra_only, values):
     from publisher_control import FENCED, READY, PublisherControl
     c = azure.c
@@ -625,11 +634,8 @@ def provision(azure, tables, wait_seconds, output, infra_only, values):
         raise Failure("Delta initializer is unavailable; infra exists, full bootstrap is NOT complete.")
     # The child admits its own UUID only if its fresh session generation equals this
     # captured value, drains and unregisters it. Nothing is adopted across processes.
-    result = run_tree(["bash", str(initializer)], 1800, cwd=ROOT, env={
-        **os.environ, **values, **c.generated(),
-        "ARROWCOL_AZURE_TABLE_MANIFEST": str(tables.resolve()),
-        "ARROWCOL_EXPECTED_RESET_GENERATION": generation,
-    })
+    result = run_tree(["bash", str(initializer)], 1800, cwd=ROOT,
+                      env=initializer_env(values, c, tables, generation))
     if result.returncode:
         raise Failure("Delta initialization failed; KQL reconciliation was not attempted. " +
                       c.redact(result.stderr))

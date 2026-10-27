@@ -1,7 +1,10 @@
 //! Offline proof of the shared `initialize-azure` body (`initialize_tables_with`): all 26
 //! canonical tables go through the real bootstrap initializer over injected control metadata and a
 //! disposable local store, and the manifest is published only after every table drains. Uses the
-//! dev-only `arrow-deltalake/test-control` seam; no Azure, no environment, no CLI dispatch.
+//! dev-only `arrow-deltalake/test-control` seam; no Azure endpoint, token or process environment.
+//! The parent-chain case composes the real Python parent's child environment, the
+//! `initialize-delta.sh` contract, the real CLI parser and the parent's manifest validation; it does
+//! not execute the release binary, whose control transport is Azure-only by design.
 //! Compiled only in debug test builds, matching the seam gate in arrow-deltalake.
 #![cfg(debug_assertions)]
 
@@ -411,4 +414,146 @@ async fn unknown_write_mid_run_retains_member_and_withholds_manifest() -> Result
     assert!(written.keys().all(|dir| dir.starts_with("sandbox/direct/")));
     assert!(!scratch.manifest().exists());
     Ok(())
+}
+
+fn repository() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..")
+}
+
+/// Runs the test-only Python driver of the real `bootstrap.py` parent and parses its JSON.
+fn parent(arguments: &[&std::ffi::OsStr]) -> Result<serde_json::Value> {
+    let output = std::process::Command::new("python3")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/parent_chain.py"))
+        .args(arguments)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .output()
+        .context("python3 is required for the parent chain proof")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "parent driver failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+/// Guarantees: the environment the real Python parent composes for the child satisfies every
+/// precondition of `initialize-delta.sh`; the script's exact argv parses through the real CLI;
+/// the shared env parser and 26-table body then initialize every table over the guarded store
+/// and drain; and the parent's real manifest/Delta-log validation accepts that manifest and
+/// those logs, reaching its first ARM call with no Kusto command. Removing one log makes the
+/// parent report NotReady without Kusto.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parent_child_env_cli_body_and_parent_validation_compose() -> Result<()> {
+    use arrowcol_loadgen::initialize::InitializeAzureConfig;
+    use arrowcol_loadgen::{Cli, Command};
+    use clap::Parser;
+
+    let scratch = Scratch::new()?;
+    let values = scratch.0.join("values.json");
+    std::fs::write(
+        &values,
+        serde_json::to_vec(&serde_json::json!({
+            "AZURE_SUBSCRIPTION_ID": "11111111-2222-4333-8444-555555555555",
+            "AZURE_STORAGE_ACCOUNT": ACCOUNT,
+            "AZURE_STORAGE_CONTAINER": CONTAINER,
+            "ARROWCOL_AZURE_TABLE_ROOT": ROOT,
+        }))?,
+    )?;
+    let child: BTreeMap<String, String> = serde_json::from_value(parent(&[
+        "child-env".as_ref(),
+        values.as_os_str(),
+        scratch.manifest().as_os_str(),
+        GENERATION.as_ref(),
+    ])?)?;
+
+    let script = std::fs::read_to_string(repository().join("infra/azure/initialize-delta.sh"))?;
+    let required: Vec<&str> = script
+        .lines()
+        .filter_map(|line| line.strip_prefix(": \"${")?.split_once(":?").map(|(key, _)| key))
+        .collect();
+    assert_eq!(required.len(), 6, "{required:?}");
+    for key in &required {
+        assert!(child.get(*key).is_some_and(|value| !value.is_empty()), "{key}");
+    }
+    assert!(script.contains("initialize-azure --manifest \"$ARROWCOL_AZURE_TABLE_MANIFEST\""));
+    let manifest = child["ARROWCOL_AZURE_TABLE_MANIFEST"].as_str();
+    let cli = Cli::try_parse_from(["arrowcol-loadgen", "initialize-azure", "--manifest", manifest])?;
+    let Command::InitializeAzure(args) = cli.command else {
+        anyhow::bail!("initialize-delta.sh argv did not dispatch to initialize-azure");
+    };
+    assert_eq!(args.manifest, PathBuf::from(manifest));
+
+    let config = InitializeAzureConfig::from_lookup(|key| child.get(key).cloned())?;
+    let expected = child["ARROWCOL_EXPECTED_RESET_GENERATION"].clone();
+    arrow_deltalake::publisher::canonical_uuid(&expected)?;
+    let metadata = Memory::new(authority("fenced-v1"));
+    let control = Arc::clone(&metadata) as Arc<dyn ControlMetadata>;
+    let data = local(&scratch)?;
+    let account = config.account.clone();
+    initialize_tables_with(
+        args,
+        &config.root,
+        &config.account,
+        &config.container,
+        move |url, schema, partitions| {
+            DeltaTable::initialize_url_for_bootstrap_with_control(
+                url,
+                schema,
+                partitions,
+                TestBootstrapControl {
+                    metadata: Arc::clone(&control),
+                    sandbox_id: SANDBOX.into(),
+                    account: account.clone(),
+                    expected_generation: expected.clone(),
+                    data: Arc::clone(&data),
+                },
+            )
+        },
+    )
+    .await?;
+    assert_eq!(metadata.members()?, 0);
+    assert_eq!(logs(&scratch.data())?.len(), TABLES);
+
+    let reconcile = || {
+        parent(&[
+            "reconcile".as_ref(),
+            values.as_os_str(),
+            scratch.manifest().as_os_str(),
+            scratch.data().as_os_str(),
+        ])
+    };
+    let accepted = reconcile()?;
+    assert_eq!(accepted["outcome"], "stopped-before-kusto", "{accepted}");
+    assert_eq!(accepted["validated"], TABLES);
+    assert_eq!(accepted["kql"], 0);
+
+    let first = logs(&scratch.data())?.into_keys().next().context("log")?;
+    std::fs::remove_file(scratch.data().join(first).join("00000000000000000000.json"))?;
+    let missing = reconcile()?;
+    assert_eq!(missing["outcome"], "not-ready", "{missing}");
+    assert!(
+        missing["detail"].as_str().is_some_and(|detail| detail.contains(": 1;")),
+        "{missing}"
+    );
+    assert_eq!(missing["kql"], 0);
+    Ok(())
+}
+
+/// Guarantees: the shared env parser fails on each key `initialize()` requires before any table.
+#[test]
+fn shared_env_parser_requires_every_initializer_key() {
+    use arrowcol_loadgen::initialize::InitializeAzureConfig;
+    let keys = [
+        "ARROWCOL_AZURE_TABLE_ROOT",
+        "AZURE_STORAGE_ACCOUNT",
+        "AZURE_STORAGE_CONTAINER",
+        "AZURE_STORAGE_CHECKPOINT_CONTAINER",
+    ];
+    for absent in keys {
+        let error = InitializeAzureConfig::from_lookup(|key| (key != absent).then(|| "x".to_owned()))
+            .err()
+            .map(|error| error.to_string());
+        assert_eq!(error, Some(format!("missing {absent}")));
+    }
 }
