@@ -482,5 +482,35 @@ class BicepContractTests(unittest.TestCase):
         self.assertIn("if (!checkpointExists)", container)
 
 
+class ProvisionCoordinationTests(unittest.TestCase):
+    def test_existing_sandbox_is_fenced_before_any_deployment(self):
+        azure = FakeAzure()
+        c = azure.c
+        existing = {
+            "properties": {"metadata": {
+                **azure.metadata, "project": "rust-playground",
+            }}
+        }
+        with patch.object(b, "guard_existing"), \
+                patch.object(azure, "arm", return_value=existing), \
+                patch.object(azure, "cli", side_effect=b.Failure("stop before deployment")):
+            with self.assertRaisesRegex(b.Failure, "stop before deployment"):
+                b.deploy(azure)
+        self.assertEqual(azure.events[0], ("control", "fenced"))
+        self.assertEqual(azure.metadata["resetstate"], "fenced")
+
+    def test_occupancy_acquired_after_arm_read_prevents_provision(self):
+        azure = FakeAzure()
+        existing = {"properties": {"metadata": dict(azure.metadata)}}
+        azure.metadata["occupancy"] = "testing"
+        with patch.object(b, "guard_existing"), \
+                patch.object(azure, "arm", return_value=existing), \
+                patch.object(azure, "cli") as cli:
+            with self.assertRaisesRegex(b.Failure, "Cloud tests own"):
+                b.deploy(azure)
+            cli.assert_not_called()
+        self.assertEqual(azure.events, [])
+
+
 if __name__ == "__main__":
     unittest.main()
