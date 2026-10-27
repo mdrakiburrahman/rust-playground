@@ -569,6 +569,7 @@ pub struct ReceiptFacts {
     pub rows_published: Option<u64>,
     pub bytes_published: Option<u64>,
     pub error_code: Option<String>,
+    pub error_message: Option<String>,
 }
 
 impl ReceiptFacts {
@@ -594,8 +595,95 @@ impl ReceiptFacts {
             rows_published: publication.map(|value| value.rows_published().get()),
             bytes_published: publication.map(|value| value.bytes_published().get()),
             error_code: status.error().map(|value| format!("{:?}", value.code()).to_lowercase()),
+            error_message: status.error().map(|value| receipt_error_message(value.message())),
         }
     }
+}
+
+fn receipt_error_message(message: &str) -> String {
+    let private_values = std::env::vars().filter_map(|(name, value)| {
+        let name = name.to_ascii_uppercase();
+        (value.len() >= 8
+            && [
+                "SECRET",
+                "PASSWORD",
+                "TOKEN",
+                "CONNECTION_STRING",
+                "SUBSCRIPTION",
+                "TENANT_ID",
+                "CLIENT_ID",
+                "RESOURCE_GROUP",
+                "STORAGE_ACCOUNT",
+                "ACCOUNT_KEY",
+                "KUSTO_ENDPOINT",
+            ]
+            .iter()
+            .any(|part| name.contains(part)))
+        .then_some(value)
+    });
+    redact_receipt_message(message, private_values.collect())
+}
+
+fn redact_receipt_message(message: &str, mut private_values: Vec<String>) -> String {
+    private_values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    let mut message = message.to_owned();
+    for value in private_values {
+        if !value.is_empty() {
+            message = message.replace(&value, "[REDACTED]");
+        }
+    }
+    let message = crate::kusto::redact_text(&message);
+    let mut redact_next = false;
+    let source = message.split_whitespace().collect::<Vec<_>>();
+    let mut tokens = Vec::new();
+    let mut quoted = None;
+    for (index, token) in source.iter().enumerate() {
+        let lower = token.to_ascii_lowercase().replace(['\'', '"'], "");
+        let names = [
+            "password",
+            "pwd",
+            "client_secret",
+            "accountkey",
+            "account_key",
+            "authorization",
+            "access_token",
+            "key",
+        ];
+        let assignment = names
+            .iter()
+            .any(|key| lower.contains(&format!("{key}=")) || lower.contains(&format!("{key}:")));
+        let separate_assignment = names
+            .contains(&lower.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_'))
+            && source.get(index + 1).is_some_and(|next| next.starts_with(['=', ':']));
+        let credential = assignment || separate_assignment || lower == "bearer";
+        let path = token.trim_start_matches(['\'', '"', '(', '[']);
+        let windows_path = path
+            .as_bytes()
+            .windows(3)
+            .any(|bytes| bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && matches!(bytes[2], b'\\' | b'/'));
+        if quoted.is_some() || redact_next || credential || windows_path || path.contains("\\\\") {
+            tokens.push("[REDACTED]");
+        } else {
+            tokens.push(*token);
+        }
+        if let Some(quote) = quoted {
+            if token.contains(quote) {
+                quoted = None;
+            }
+        } else if credential {
+            quoted = ['\'', '"']
+                .into_iter()
+                .find(|quote| token.chars().filter(|ch| ch == quote).count() % 2 == 1);
+        }
+        redact_next = credential && (token.ends_with([':', '=']) || separate_assignment || lower == "bearer")
+            || redact_next && (lower == "bearer" || matches!(lower.as_str(), "=" | ":"));
+    }
+    tokens
+        .join(" ")
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(1_024)
+        .collect()
 }
 
 /// Converts a tonic status to stable bounded manifest fields.
@@ -610,7 +698,7 @@ pub fn status_fields(error: &anyhow::Error) -> (String, String) {
 }
 
 fn bounded_error(value: &str) -> String {
-    value.chars().take(1_024).collect()
+    receipt_error_message(value)
 }
 
 /// Groups receipt polls by identifier and rejects duplicate/missing response entries.
@@ -632,4 +720,174 @@ pub fn receipt_poll_map(
         bail!("receipt API omitted a requested identifier");
     }
     Ok(output)
+}
+
+#[cfg(test)]
+mod receipt_diagnostics_tests {
+    use super::*;
+
+    #[test]
+    fn receipt_cause_is_retained_without_private_credentials_or_paths() {
+        let message = redact_receipt_message(
+            "publication failed: unsupported UInt8 statistic; account private-account \
+             https://private.example/path?sig=credential C:\\Users\\private\\table \
+             /private/table 12345678-1234-1234-1234-123456789abc \
+             Server=hidden;Password=opaque-secret \
+             {\"client_secret\":\"another-secret\"} authorization: Bearer opaque-token \
+             AccountKey = spaced-secret key = second-secret Password=\"three word credential\"",
+            vec!["private-account".to_owned()],
+        );
+        assert!(message.contains("unsupported UInt8 statistic"));
+        for secret in [
+            "private-account",
+            "private.example",
+            "credential",
+            "C:\\",
+            "/private",
+            "12345678-1234-1234-1234-123456789abc",
+            "opaque-secret",
+            "another-secret",
+            "opaque-token",
+            "spaced-secret",
+            "second-secret",
+            "three",
+            "word",
+            "credential",
+        ] {
+            assert!(!message.contains(secret), "leaked {secret}: {message}");
+        }
+    }
+
+    #[test]
+    fn receipt_cause_is_bounded_control_free_and_utf8_safe() {
+        let message = redact_receipt_message(&format!("原因 \u{1b} unsupported {}", "é".repeat(2_000)), Vec::new());
+        assert!(message.contains("unsupported"));
+        assert_eq!(message.chars().count(), 1_024);
+        assert!(!message.chars().any(char::is_control));
+        assert!(serde_json::to_string(&message).is_ok());
+    }
+
+    #[tokio::test]
+    async fn terminal_status_cause_survives_actual_jsonl_and_legacy_entries() -> Result<()> {
+        use arrowcol_protocol::{ErrorCode, ErrorStatus};
+        struct TestRoot(std::path::PathBuf);
+        impl Drop for TestRoot {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = TestRoot(std::env::temp_dir().join(format!("receipt-canary-{}", uuid::Uuid::new_v4())));
+        let receipt_id: ReceiptId = "12345678-1234-1234-1234-123456789abc".parse()?;
+        let table = TableIdentity::new("telemetry".parse()?, "sqlserver".parse()?, "fixture".parse()?);
+        let cause = "unsupported UInt8 statistic https://private.example/path?sig=credential C:\\Users\\private\\table \
+                 /private/table 12345678-1234-1234-1234-123456789abc Password=opaque-secret \
+                 Authorization: Bearer opaque-token AccountKey = spaced-secret key = second-secret \
+                 abfss://private@account.dfs.core.windows.net/root Password=\"three word credential\"";
+        let status = ReceiptStatus::accepted(receipt_id, table, ImplementationPool::Direct, UnixMillis::new(1)?)
+            .transition_to(
+                ReceiptState::Failed,
+                UnixMillis::new(2)?,
+                None,
+                Some(ErrorStatus::new(ErrorCode::PublicationFailed, cause)?.with_receipt_id(receipt_id)),
+            )?;
+        let facts = ReceiptFacts::from_status(&status);
+        let manifest = crate::manifest::ReceiptManifestEntry {
+            run_id: "fixture".to_owned(),
+            logical_batch_id: "batch".to_owned(),
+            table: "fixture".to_owned(),
+            receipt_id,
+            state: facts.state,
+            purge_allowed: false,
+            terminal_at_unix_ms: 2,
+            delta_version: facts.delta_version,
+            rows_published: facts.rows_published,
+            bytes_published: facts.bytes_published,
+            error_code: facts.error_code,
+            error_message: facts.error_message,
+        };
+        let writer = crate::manifest::ManifestWriter::create(&root.0).await?;
+        writer.write_receipt(&manifest).await?;
+        let (code, message) = status_fields(&tonic::Status::internal(cause).into());
+        writer
+            .write_send(&crate::manifest::SendManifestEntry {
+                run_id: "fixture".to_owned(),
+                scenario: crate::cli::Scenario::Paired,
+                phase: "measure".to_owned(),
+                logical_batch_id: "batch".to_owned(),
+                ordinal: 0,
+                table_batch_ordinal: 0,
+                table: "fixture".to_owned(),
+                schema_version: 1,
+                schema_fingerprint: "fixture".to_owned(),
+                rows: 1,
+                arrow_bytes: 8,
+                payload_sha256: "fixture".to_owned(),
+                row_sha256: "fixture".to_owned(),
+                lane: 0,
+                pool: "direct".to_owned(),
+                attempt: 1,
+                sent_at_unix_ms: 1,
+                acknowledged_at_unix_ms: 2,
+                outcome: crate::manifest::AckOutcome::Error,
+                receipt_id: None,
+                error_code: Some(code),
+                error: Some(message),
+            })
+            .await?;
+        writer.flush().await?;
+        drop(writer);
+        let jsonl = std::fs::read_to_string(root.0.join(crate::manifest::RECEIPT_MANIFEST_FILE))?;
+        assert_eq!(jsonl.lines().count(), 1);
+        let decoded: crate::manifest::ReceiptManifestEntry = serde_json::from_str(jsonl.trim_end())?;
+        assert!(
+            decoded
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("unsupported UInt8 statistic"))
+        );
+        for secret in [
+            "private.example",
+            "credential",
+            "C:\\",
+            "/private",
+            "opaque-secret",
+            "opaque-token",
+            "spaced-secret",
+            "second-secret",
+            "private@account",
+            "three word",
+        ] {
+            assert!(!jsonl.contains(secret), "leaked canary: {secret}");
+        }
+        let sent_jsonl = std::fs::read_to_string(root.0.join(crate::manifest::SEND_MANIFEST_FILE))?;
+        assert_eq!(sent_jsonl.lines().count(), 1);
+        let sent: crate::manifest::SendManifestEntry = serde_json::from_str(sent_jsonl.trim_end())?;
+        assert!(
+            sent.error
+                .as_deref()
+                .is_some_and(|message| message.contains("unsupported UInt8 statistic"))
+        );
+        for secret in [
+            "private.example",
+            "credential",
+            "C:\\",
+            "/private",
+            "opaque-secret",
+            "opaque-token",
+            "spaced-secret",
+            "second-secret",
+            "private@account",
+            "three word",
+        ] {
+            assert!(!sent_jsonl.contains(secret), "leaked admission canary: {secret}");
+        }
+        let mut legacy = serde_json::to_value(&decoded)?;
+        legacy
+            .as_object_mut()
+            .context("manifest object")?
+            .remove("error_message");
+        let legacy: crate::manifest::ReceiptManifestEntry = serde_json::from_value(legacy)?;
+        assert!(legacy.error_message.is_none());
+        Ok(())
+    }
 }
