@@ -273,7 +273,16 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
     ) -> Result<SnapshotSummary> {
         let deadline = Instant::now() + timeout;
         loop {
-            let error = match delta_inspect::summarize(root).await {
+            let snapshot = if root.to_str().is_some_and(|root| root.starts_with("abfss://")) {
+                delta_inspect::summarize_cloud(
+                    root.to_str().context("non-UTF8 cloud root")?,
+                    &expected.keys().cloned().collect::<Vec<_>>(),
+                )
+                .await
+            } else {
+                delta_inspect::summarize(root).await
+            };
+            let error = match snapshot {
                 Ok(snapshot)
                     if expected.iter().all(|(table, rows)| {
                         snapshot.tables.get(table).is_some_and(|summary| summary.rows >= *rows)
@@ -312,7 +321,7 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
                     &mut failures,
                 );
                 check(
-                    direct.row_hashes.keys().eq(dataflow.row_hashes.keys()),
+                    direct.payload_row_hashes.keys().eq(dataflow.payload_row_hashes.keys()),
                     &format!("{table} deterministic row values differ between pools"),
                     &mut failures,
                 );
@@ -470,12 +479,26 @@ fn validate_delta_schema(
     contract: &SchemaContract,
     failures: &mut Vec<String>,
 ) {
-    let fields = summary
+    let mut fields = summary
         .schema
         .get("fields")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    fields.retain(|field| {
+        !summary
+            .partition_columns
+            .iter()
+            .any(|column| field["name"].as_str() == Some(column))
+    });
+    check(
+        summary
+            .partition_columns
+            .iter()
+            .all(|column| column == "__arrowcol_ingestion"),
+        &format!("{pool} {table} has an unexpected generated partition column"),
+        failures,
+    );
     let mut expected = Vec::<(String, String, bool)>::new();
     for field in &contract.fields {
         let delta_type = match field.arrow_type.as_str() {
