@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -10,6 +11,7 @@ export interface StressPlan {
   operationTimeoutSeconds: number;
   startupTimeoutSeconds: number;
   sampleTimeoutSeconds: number;
+  generator?: { warmupSeconds: number; measureSeconds: number; captureSettleSeconds: number };
   fixture: { batchRows: number; rowGroupRows: number; pageRows: number };
   limits: Omit<StressCriteria, 'start' | 'end' | 'phase' | 'endpointToleranceMs'>;
 }
@@ -22,7 +24,7 @@ function object(value: unknown): Record<string, unknown> {
 export function parseStressPlan(value: unknown): StressPlan {
   const plan = object(value);
   const fields = ['version', 'durationSeconds', 'waveIntervalSeconds', 'operationTimeoutSeconds',
-    'startupTimeoutSeconds', 'sampleTimeoutSeconds', 'fixture', 'limits'];
+    'startupTimeoutSeconds', 'sampleTimeoutSeconds', 'fixture', 'limits', 'generator'];
   if (Object.keys(plan).some(key => !fields.includes(key)) || plan.version !== 1) throw new Error('Unsupported stress-plan fields/version');
   for (const key of ['durationSeconds', 'waveIntervalSeconds', 'operationTimeoutSeconds', 'startupTimeoutSeconds', 'sampleTimeoutSeconds']) {
     if (typeof plan[key] !== 'number' || !Number.isSafeInteger(plan[key]) || plan[key] <= 0) {
@@ -55,11 +57,23 @@ export function parseStressPlan(value: unknown): StressPlan {
       Number(limits.minimumCycles) > duration / interval || Number(limits.minimumSamples) > duration / interval + 1) {
     throw new Error('Insufficient declared operation waves for the requested sample/cycle gates');
   }
-  return {
+  let generator: StressPlan['generator'];
+  if (plan.generator !== undefined) {
+    const declared = object(plan.generator);
+    const keys = ['warmupSeconds', 'measureSeconds', 'captureSettleSeconds'];
+    if (Object.keys(declared).length !== keys.length || keys.some(key =>
+      !Number.isSafeInteger(declared[key]) || Number(declared[key]) < 0 || Number(declared[key]) > 7 * 86400)) {
+      throw new Error('Declare complete bounded generator warmup, measure and capture-settle budgets');
+    }
+    generator = { warmupSeconds: Number(declared.warmupSeconds), measureSeconds: Number(declared.measureSeconds),
+      captureSettleSeconds: Number(declared.captureSettleSeconds) };
+  }
+  const parsed: StressPlan = {
     version: 1, durationSeconds: duration, waveIntervalSeconds: interval,
     operationTimeoutSeconds: Number(plan.operationTimeoutSeconds),
     startupTimeoutSeconds: Number(plan.startupTimeoutSeconds), sampleTimeoutSeconds: Number(plan.sampleTimeoutSeconds),
     fixture: { batchRows: Number(fixture.batchRows), rowGroupRows: Number(fixture.rowGroupRows), pageRows: Number(fixture.pageRows) },
+    ...(generator ? { generator } : {}),
     limits: {
       minimumCycles: Number(limits.minimumCycles), minimumSamples: Number(limits.minimumSamples),
       minimumDriverRowsPerSecond: Number(limits.minimumDriverRowsPerSecond),
@@ -67,6 +81,37 @@ export function parseStressPlan(value: unknown): StressPlan {
       maximumPhysicalBytes: Number(limits.maximumPhysicalBytes), maximumRelativeTrend: Number(limits.maximumRelativeTrend),
       maximumRelativeVariation: Number(limits.maximumRelativeVariation),
     },
+  };
+  if (generator) stressInputBudget(parsed, generator);
+  return parsed;
+}
+
+export function stressInputBudget(
+  plan: StressPlan,
+  actual: { warmupSeconds: number; captureSettleSeconds: number; measureSeconds?: number },
+) {
+  const minimumMeasure = plan.durationSeconds + plan.sampleTimeoutSeconds * 2 + 5;
+  const measureSeconds = actual.measureSeconds ?? plan.generator?.measureSeconds ?? minimumMeasure;
+  if (plan.generator && (actual.warmupSeconds !== plan.generator.warmupSeconds ||
+      actual.captureSettleSeconds !== plan.generator.captureSettleSeconds || measureSeconds !== plan.generator.measureSeconds)) {
+    throw new Error('Actual generator options differ from the immutable stress-plan declaration');
+  }
+  if (actual.warmupSeconds + actual.captureSettleSeconds >= plan.startupTimeoutSeconds) {
+    throw new Error('Stress startup budget must include capture settling and warmup');
+  }
+  if (measureSeconds < minimumMeasure) {
+    throw new Error('--measure is shorter than the predeclared stress window and sample budgets');
+  }
+  return {
+    persistedPlanSha256: createHash('sha256').update(`${JSON.stringify(plan, null, 2)}\n`).digest('hex'),
+    warmupSeconds: actual.warmupSeconds, captureSettleSeconds: actual.captureSettleSeconds, measureSeconds,
+    totalGeneratorSeconds: actual.warmupSeconds + measureSeconds,
+    totalDeclaredPhaseSeconds: actual.captureSettleSeconds + actual.warmupSeconds + measureSeconds,
+    helperProcessTimeoutSeconds: actual.warmupSeconds + measureSeconds + 600,
+    excludedFromDeclaredPhaseSeconds: 'helper initialization, receipt drain and validation; bounded separately',
+    startupTimeoutSeconds: plan.startupTimeoutSeconds, windowSeconds: plan.durationSeconds,
+    finalSampleSeconds: plan.sampleTimeoutSeconds,
+    remainingInputPolicy: 'actual remaining input rechecked after readiness and again before immutable window start',
   };
 }
 

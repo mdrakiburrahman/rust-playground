@@ -117,6 +117,15 @@ next ownership-checked load-generator scratch reset; preserve a needed failure
 privately before starting another run. Its bytes remain in staging accounting,
 without exporting its path.
 
+New stress plans may bind a complete `generator` declaration containing
+`warmupSeconds`, `measureSeconds`, and `captureSettleSeconds`. CLI warmup and
+capture-settle values must match; an omitted CLI measure uses the declared
+measure, while an explicit mismatch fails before reset. This declaration is
+part of the immutable plan, not a revision of an earlier run's evidence.
+`stress-input-budget.json` records the full warmup-plus-measure lifetime and
+separate startup, window, and final-sample budgets. A long declared lifetime
+never substitutes for the actual remaining-input checks before window start.
+
 Physical accounting includes all files under the declared source, tenant,
 checkpoint, WAL, router-state, and generator-staging roots: JSON history,
 checkpoints, uncommitted/orphan Parquet, and staging are not omitted. Logical
