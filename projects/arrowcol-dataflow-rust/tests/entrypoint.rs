@@ -4,10 +4,14 @@ use std::time::{Duration, Instant};
 type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 fn run(generation: Option<&str>, root: Option<&str>, validate: bool) -> TestResult<Output> {
+    run_config("config.smoke-quiver.yaml", generation, root, validate)
+}
+
+fn run_config(config: &str, generation: Option<&str>, root: Option<&str>, validate: bool) -> TestResult<Output> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_arrowcol-dataflow-rust"));
     command
         .arg("--config")
-        .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.smoke-quiver.yaml"))
+        .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(config))
         .env_remove("ARROWCOL_RESET_GENERATION")
         .env_remove("ARROWCOL_DELTA_ROOT")
         .env_remove("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")
@@ -46,6 +50,17 @@ fn run(generation: Option<&str>, root: Option<&str>, validate: bool) -> TestResu
 fn validation_exits_through_metrics_shutdown_hook() -> TestResult<()> {
     let output = run(None, None, true)?;
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    Ok(())
+}
+
+/// Scenario: Validation rejects an OTAP-only processor wired to pluggable Arrow pdata.
+/// Guarantees: The unclean shutdown hook does not exit first; the wiring error still surfaces non-zero.
+#[test]
+fn invalid_wiring_validation_reports_engine_error() -> TestResult<()> {
+    let output = run_config("config.incompatible-otap.yaml", None, None, true)?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("IncompatiblePdataWiring"), "{stderr}");
     Ok(())
 }
 
