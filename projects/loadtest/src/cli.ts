@@ -1,4 +1,5 @@
 import { parseMode, type LoadtestMode } from './mode.js';
+import type { StressPlan } from './stress-driver.js';
 
 export interface BenchmarkOptions {
   mode: LoadtestMode;
@@ -15,6 +16,8 @@ export interface BenchmarkOptions {
   quiver: boolean;
   /** SIGKILL and restart both collectors this long after generation starts (requires quiver). */
   crashAfterSeconds?: number;
+  stressPlan?: string;
+  stressConfiguration?: StressPlan;
 }
 
 const MAX_DURATION_SECONDS = 2_147_483_647;
@@ -46,6 +49,7 @@ export function parseBenchmarkOptions(args: string[], env: NodeJS.ProcessEnv = p
   let crashAfter: string | undefined;
   let validate = false;
   let quiver = false;
+  let stressPlan: string | undefined;
   for (let index = 0; index < args.length; index++) {
     if (args[index] === '--validate') {
       validate = true;
@@ -65,10 +69,14 @@ export function parseBenchmarkOptions(args: string[], env: NodeJS.ProcessEnv = p
     else if (option === '--measure') measure = value;
     else if (option === '--batch-rows') batchRows = value;
     else if (option === '--crash-after') crashAfter = value;
+    else if (option === '--stress-plan') stressPlan = value;
     else throw new Error(`Unknown option '${option}'. Options: ${benchmarkUsage}`);
   }
   if (crashAfter !== undefined && !quiver) {
     throw new Error('--crash-after requires --quiver: only disk-persisted batches survive a collector crash');
+  }
+  if (stressPlan && (!validate || crashAfter !== undefined)) {
+    throw new Error('--stress-plan requires --validate; planned crash recovery is a separate functional run');
   }
   const crashAfterSeconds = crashAfter === undefined ? undefined : parseDuration(crashAfter, '--crash-after');
   if (crashAfterSeconds === 0) throw new Error('--crash-after must be positive');
@@ -90,8 +98,9 @@ export function parseBenchmarkOptions(args: string[], env: NodeJS.ProcessEnv = p
     validate,
     quiver,
     ...(crashAfterSeconds === undefined ? {} : { crashAfterSeconds }),
+    ...(stressPlan === undefined ? {} : { stressPlan }),
   };
 }
 
 export const benchmarkUsage = '[--mode local|azure (default local)] [--warmup 30s] [--measure 1m (omit to run until Ctrl+C)] [--concurrency 4] [--batch-rows 8192] [--validate] ' +
-  '[--quiver] [--crash-after 20s (requires --quiver)]';
+  '[--quiver] [--crash-after 20s (requires --quiver)] [--stress-plan plan.json (requires --validate)]';

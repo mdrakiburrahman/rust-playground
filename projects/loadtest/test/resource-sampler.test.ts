@@ -5,11 +5,11 @@ import { createServer } from 'node:http';
 import path from 'node:path';
 import { test } from 'node:test';
 
-import { parseCounters, parseMetrics, parseResources, parseStatus, runResourceSampler, startResourceSampler } from '../src/resource-sampler.js';
+import { parseCounters, parseMetrics, parseResources, parseStatus, resourceScript, runResourceSampler, startResourceSampler } from '../src/resource-sampler.js';
 import { BENCHMARK_PROJECT } from '../src/cli.js';
 
 const status = 'Pid:\t1\nVmRSS:\t2048 kB\nRssAnon:\t1024 kB\nThreads:\t7\n';
-const resources = `\n__status__\n${status}\n__current__\n4096\n\n__stat__\nanon 2048\ninactive_file 1024\n\n__cpu__\nusage_usec 9000\nuser_usec 7000\nsystem_usec 2000\n`;
+const resources = `\n__status__\n${status}\n__current__\n4096\n\n__stat__\nanon 2048\ninactive_file 1024\n\n__cpu__\nusage_usec 9000\nuser_usec 7000\nsystem_usec 2000\n\n__events__\noom 2\noom_kill 1\n`;
 
 test('sampler parses PID 1 RSS, anonymous RSS, threads and cgroup working set/CPU', () => {
   assert.deepEqual(parseStatus(status), { pid: 1, rssBytes: 2097152, rssAnonBytes: 1048576, threads: 7 });
@@ -18,6 +18,8 @@ test('sampler parses PID 1 RSS, anonymous RSS, threads and cgroup working set/CP
   assert.equal(sample.memory.value.workingSetBytes, 3072);
   assert.equal(sample.cpu.value.usage_usec, 9000);
   assert.equal(sample.process.value.threads, 7);
+  assert.deepEqual(sample.events.value, { oom: 2, oom_kill: 1 });
+  assert.equal((parseResources(resources.replace('__events__', '__missing__')) as any).events.ok, false);
   assert.throws(() => parseStatus('Pid: 1'), /Missing/u);
   assert.equal((parseResources(resources.replace('4096', '12')) as any).memory.value.workingSetBytes, 0);
   const unavailable = parseResources(resources.replace(status, '__READ_ERROR__\n')) as any;
@@ -38,7 +40,37 @@ test('runtime counters/backlog retain numeric values without exposing metric lab
     arrowcol_delta_pending_commits: 7,
     arrowcol_direct_stream_outcomes_total: 5,
   });
+
   assert.throws(() => parseMetrics('not metrics'), /No Arrowcol/u);
+});
+
+test('executed sampler shell crosses nested Docker/image init layers and rejects a noncollector executable', () => {
+  const procFixture = `
+cat() {
+  case "$1" in
+    /proc/1/comm) printf 'docker-init';;
+    /proc/1/task/1/children) printf '42';;
+    /proc/42/comm) printf 'tini';;
+    /proc/42/task/42/children) printf '43';;
+    /proc/43/comm) printf 'arrowcol-rust';;
+    /proc/43/status) printf '%s' '${status.replace('Pid:\t1', 'Pid:\t43')}';;
+    /sys/fs/cgroup/memory.current) printf '4096';;
+    /sys/fs/cgroup/memory.stat) printf 'inactive_file 1024\\n';;
+    /sys/fs/cgroup/cpu.stat) printf 'usage_usec 9000\\n';;
+    /sys/fs/cgroup/memory.events) printf 'oom 0\\noom_kill 0\\n';;
+    *) return 1;;
+  esac
+}
+`;
+  const run = (executable: string) => spawnSync('sh', ['-c',
+    `${procFixture}\nreadlink() { printf '%s' '${executable}'; }\n${resourceScript}`,
+  ], { encoding: 'utf8' });
+  const valid = run('/usr/local/bin/arrowcol-rust');
+  assert.equal(valid.status, 0, valid.stderr);
+  assert.deepEqual(parseResources(valid.stdout).process, {
+    ok: true, value: { pid: 43, rssBytes: 2097152, rssAnonBytes: 1048576, threads: 7 },
+  });
+  assert.notEqual(run('/usr/bin/tini').status, 0, 'an init RSS proxy must not pass');
 });
 
 function fixture(t: { after: (callback: () => void) => void }): string {

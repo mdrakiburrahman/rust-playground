@@ -71,6 +71,9 @@ impl Drop for Fixture {
 #[test]
 fn actual_cli_keeps_complete_long_window_chunks_and_legacy_guard() -> Result<()> {
     let fixture = Fixture::new(2, 200)?;
+    let sibling = fixture.0.join("telemetry/sqlserver/corrupt/_delta_log");
+    fs::create_dir_all(&sibling)?;
+    fs::write(sibling.join("00000000000000000000.json"), "not a Delta action")?;
     let output = fixture.cli("evidence-chunks", "telemetry.sqlserver.fixture")?;
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let evidence: Value = serde_json::from_slice(&output.stdout)?;
@@ -90,6 +93,21 @@ fn actual_cli_keeps_complete_long_window_chunks_and_legacy_guard() -> Result<()>
             .chunks
             .iter()
             .all(|chunk| chunk.rows.iter().any(|(_, count)| *count == 2))
+    );
+    let metadata = Command::new(env!("CARGO_BIN_EXE_delta-inspect"))
+        .arg("file-metadata")
+        .arg(fixture.0.join("telemetry/sqlserver/fixture/part-0.parquet"))
+        .output()?;
+    assert!(metadata.status.success());
+    let metadata: Value = serde_json::from_slice(&metadata.stdout)?;
+    assert_eq!(metadata["rows"], 201);
+    assert_eq!(metadata["row_groups"].as_array().context("row groups")?.len(), 1);
+    assert!(
+        metadata["physical_schema"]
+            .as_str()
+            .context("physical schema")?
+            .to_lowercase()
+            .contains("int32 id")
     );
     let legacy = fixture.cli("evidence", "telemetry.sqlserver.fixture")?;
     assert!(!legacy.status.success(), "legacy guard must remain unchanged");
