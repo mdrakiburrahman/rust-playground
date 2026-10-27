@@ -28,6 +28,18 @@ controller and its drained table owners have been dropped. Closure runs on the
 main thread before metric flush. A refused close is logged, leaves its registry
 member registered, and exits nonzero without retrying unregister. Startup or
 controller errors retain the publisher registry for reconciliation.
+The receiver records `draining` during `DrainIngress`; it does not mark the
+process stopped while downstream exporters can still publish. After the
+controller and publisher close finish, the embedding main-thread hook persists
+`stopped` for every registered routing identity only on a clean drain and close.
+An unclean drain, unpublished identity, retired worker, or refused close instead persists `failed`;
+terminal-write errors are reported and make the process exit nonzero. Routing
+lease rows remain retained and are safe only with an explicitly stopped owner.
+An earlier transient NACK may recover only when the same stable publication ID
+later publishes successfully and its current worker is healthy. A different
+client resubmission ID does not prove recovery of the original publication.
+An interrupted or failed DFE send with no proven publication remains incomplete;
+the send-error abstraction does not prove that no downstream delivery occurred.
 
 `arrowcol-dataflow-components` links two external OTAP Dataflow Engine (DFE)
 nodes:

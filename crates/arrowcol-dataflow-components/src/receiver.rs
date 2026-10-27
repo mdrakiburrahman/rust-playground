@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use arrow_array::RecordBatch;
 use arrowcol_catalog::FlightSqlDdlHandler;
 use arrowcol_flight::{
-    AllowAllAuthenticator, ArrowColFlightService, BatchAdmission, DrainController, PutResultEmitter, RuntimeError,
-    RuntimeResult, StreamAbortReason, StreamCompletion, StreamContext, StreamLifecycle, StreamSummary,
+    AllowAllAuthenticator, ArrowColFlightService, BatchAdmission, DrainController, DrainOutcome, PutResultEmitter,
+    RuntimeError, RuntimeResult, StreamAbortReason, StreamCompletion, StreamContext, StreamLifecycle, StreamSummary,
 };
 use arrowcol_protocol::{
     AuthContext, AuthMethod, AuthenticatedPrincipal, CollectorInstanceId, ErrorCode, ImplementationPool,
@@ -351,7 +351,8 @@ impl StreamLifecycle for DfeStreamLifecycle {
         let bytes = arrow_deltalake::record_batch_logical_bytes(&batch).map_err(|_| RuntimeError::internal())?;
         self.metrics.batch_received(rows, bytes);
         let mut envelope = self.envelope.clone();
-        envelope.publication_id = Some(arrowcol_protocol::ReceiptId::new());
+        let publication_id = arrowcol_protocol::ReceiptId::new();
+        envelope.publication_id = Some(publication_id);
         envelope.ingested_at_ms = Some(now_unix_millis().map_err(|_| RuntimeError::internal())?);
         let records = encode_record_batch(envelope, batch).map_err(|_| RuntimeError::internal())?;
         let correlation_id = self
@@ -367,6 +368,9 @@ impl StreamLifecycle for DfeStreamLifecycle {
             .map_err(|_| RuntimeError::internal())?;
         let mut pending_send = PendingSendGuard::new(Arc::clone(&self.pending), correlation_id);
         let pdata = OtapPdata::new_todo_context(OtapPayload::from_pdata_arrow(records));
+        crate::shutdown::PROCESS_ROUTING_SHUTDOWN
+            .publication_finished(publication_id, false)
+            .map_err(|_| RuntimeError::internal())?;
         match self.sender.send(correlation_id, pdata).await {
             Ok(()) => {
                 pending_send.disarm();
@@ -592,7 +596,7 @@ impl receiver::Receiver<OtapPdata> for ArrowFlightReceiver {
                             finalize_registration(
                                 &self.routing,
                                 instance_id,
-                                CollectorState::Stopped,
+                                CollectorState::Draining,
                                 &self.metrics,
                             ).await;
                             await_tasks(flight, admin, registration, remaining).await;
@@ -648,7 +652,10 @@ async fn drain_streams(
     tokio::pin!(stop);
     loop {
         tokio::select! {
-            _ = &mut stop => return,
+            outcome = &mut stop => {
+                record_drain_outcome(outcome);
+                return;
+            },
             message = control.recv() => match message {
                 Ok(NodeControlMsg::Ack(ack)) => {
                     if let Some(id) = correlation_id(&ack.unwind.route.calldata) {
@@ -662,11 +669,18 @@ async fn drain_streams(
                 }
                 Ok(_) => {}
                 Err(_) => {
-                    let _ = (&mut stop).await;
+                    record_drain_outcome((&mut stop).await);
                     return;
                 }
             },
         }
+    }
+}
+
+fn record_drain_outcome(outcome: DrainOutcome) {
+    if !matches!(outcome, DrainOutcome::Drained) {
+        crate::shutdown::PROCESS_ROUTING_SHUTDOWN.record_failure();
+        tracing::error!(?outcome, "dataflow ingress did not drain cleanly");
     }
 }
 
@@ -714,11 +728,17 @@ async fn await_tasks(
     timeout: Duration,
 ) {
     let wait = async {
-        let _ = (&mut flight).await;
-        let _ = (&mut admin).await;
-        let _ = (&mut registration).await;
+        let flight = (&mut flight).await;
+        let admin = (&mut admin).await;
+        let registration = (&mut registration).await;
+        if !matches!(flight, Ok(Ok(()))) || !matches!(admin, Ok(Ok(()))) || registration.is_err() {
+            crate::shutdown::PROCESS_ROUTING_SHUTDOWN.record_failure();
+            tracing::error!("dataflow receiver shutdown task failed");
+        }
     };
     if tokio::time::timeout(timeout, wait).await.is_err() {
+        crate::shutdown::PROCESS_ROUTING_SHUTDOWN.record_failure();
+        tracing::error!("dataflow receiver shutdown tasks timed out");
         flight.abort();
         admin.abort();
         registration.abort();
@@ -750,6 +770,9 @@ async fn register_collector(
             lease_expires_at_unix_ms: expiry,
         })
         .await
+        .map_err(|error| error.to_string())?;
+    crate::shutdown::PROCESS_ROUTING_SHUTDOWN
+        .register(Arc::clone(store), instance_id)
         .map_err(|error| error.to_string())?;
     metrics.publish_pressure(store.as_ref()).await?;
     metrics.set_registered(true);
@@ -826,10 +849,17 @@ async fn finalize_registration(
     state: CollectorState,
     metrics: &Arc<RuntimeMetrics>,
 ) {
-    let Ok(now) = now_unix_millis() else {
-        return;
+    let result = match now_unix_millis() {
+        Ok(now) => store
+            .set_collector_state(instance_id, state, now)
+            .await
+            .map_err(|error| error.to_string()),
+        Err(error) => Err(error),
     };
-    let _ = store.set_collector_state(instance_id, state, now).await;
+    if let Err(error) = result {
+        crate::shutdown::PROCESS_ROUTING_SHUTDOWN.record_failure();
+        tracing::error!(%error, "dataflow could not persist ingress drain state");
+    }
     if metrics.publish_pressure(store.as_ref()).await.is_err() {
         metrics.set_registered(false);
     }

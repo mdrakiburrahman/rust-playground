@@ -173,6 +173,11 @@ impl GenericDeltaExporter {
                     .to_owned(),
             ));
         }
+        if let Some(publication_id) = table.envelope.publication_id {
+            crate::shutdown::PROCESS_ROUTING_SHUTDOWN
+                .publication_finished(publication_id, false)
+                .map_err(|error| ExportFailure::Transient(error.to_string()))?;
+        }
         let rows = u64::try_from(table.batch.num_rows()).unwrap_or(u64::MAX);
         let bytes = arrow_deltalake::record_batch_logical_bytes(&table.batch)
             .map_err(|error| ExportFailure::Permanent(error.to_string()));
@@ -268,6 +273,9 @@ impl DeltaBackend {
             self.options.max_pending_files,
         ))
         .map_err(|error| ExportFailure::Transient(format!("Delta owner runtime failed: {error:#}")))?;
+        crate::shutdown::PROCESS_ROUTING_SHUTDOWN
+            .track_worker(root, Arc::clone(&owner.retired))
+            .map_err(|error| ExportFailure::Transient(error.to_string()))?;
         tables.insert(decoded.envelope.table.clone(), Arc::clone(&owner));
         Ok(owner)
     }
@@ -1001,6 +1009,10 @@ async fn complete_publication(
     pdata: OtapPdata,
     result: Result<(), ExportFailure>,
 ) -> Result<(), Error> {
+    if record_publication_outcome(&crate::shutdown::PROCESS_ROUTING_SHUTDOWN, &pdata, result.is_ok()).is_err() {
+        crate::shutdown::PROCESS_ROUTING_SHUTDOWN.record_failure();
+        tracing::error!("dataflow publication outcome has no verifiable stable identity or accounting");
+    }
     match result {
         Ok(()) => effect_handler.notify_ack(AckMsg::new(pdata)).await,
         Err(error) if error.permanent() => {
@@ -1018,6 +1030,28 @@ async fn complete_publication(
                 .await
         }
     }
+}
+
+fn record_publication_outcome(
+    shutdown: &crate::RoutingShutdown,
+    pdata: &OtapPdata,
+    published: bool,
+) -> Result<(), String> {
+    let (_, payload) = pdata.clone().into_parts();
+    let PayloadData::PdataArrowRecords(records) = payload.into_data() else {
+        return Err("publication outcome is not Arrowcol pdata".to_owned());
+    };
+    let batches = decode_record_set(*records).map_err(|error| error.to_string())?;
+    let [batch] = batches.as_slice() else {
+        return Err("publication outcome must contain one root table".to_owned());
+    };
+    let identity = batch
+        .envelope
+        .publication_id
+        .ok_or("publication outcome has no stable identity")?;
+    shutdown
+        .publication_finished(identity, published)
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -1042,6 +1076,35 @@ mod tests {
     use super::*;
     use crate::envelope::{ArrowcolBatchEnvelope, encode_record_batch};
     use crate::metrics::RuntimeMetrics;
+
+    /// Scenario: exporter feedback NACKs a real encoded publication, then optionally ACKs its replay.
+    /// Guarantees: production identity decoding permits recovery only after that publication succeeds.
+    #[tokio::test]
+    async fn exporter_feedback_recovers_same_encoded_publication_without_hiding_unpublished_work() {
+        for recovered in [false, true] {
+            let store = Arc::new(MemoryRoutingStore::default());
+            let holder = CollectorInstanceId::new();
+            let lease = lease(&store, holder).await;
+            let shutdown = crate::RoutingShutdown::default();
+            shutdown
+                .register(Arc::clone(&store) as Arc<dyn RoutingStore>, holder)
+                .expect("register shutdown");
+            let pdata = envelope_pdata(envelope_for(&lease));
+            record_publication_outcome(&shutdown, &pdata, false).expect("NACK identity");
+            if recovered {
+                record_publication_outcome(&shutdown, &pdata, true).expect("replay publication");
+            }
+            assert_eq!(shutdown.finish(true).await.is_ok(), recovered);
+            assert_eq!(
+                store.load_view(now()).await.expect("view").collectors[&holder].state,
+                if recovered {
+                    arrowcol_routing::CollectorState::Stopped
+                } else {
+                    arrowcol_routing::CollectorState::Failed
+                }
+            );
+        }
+    }
 
     #[test]
     fn dfe_warn_and_nack_diagnostics_redact_raw_owner_and_group_error_chains() {

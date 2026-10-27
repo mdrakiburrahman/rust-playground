@@ -14,17 +14,103 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(generation) = arrowcol_buffer::CloudGeneration::process() {
         arrowcol_dataflow_components::configure_cloud_generation(generation.generation())?;
     }
+
     arrowcol_dataflow_components::initialize_shared_io()?;
     otel_arrow_dfe::run_with_shutdown_status(move |clean| {
-        let closed = if clean {
-            arrow_deltalake::publisher::PublisherSession::close_shared()
-        } else {
-            Ok(())
-        };
+        let result = finish_shutdown(
+            clean,
+            arrow_deltalake::publisher::PublisherSession::close_shared,
+            |clean| arrowcol_dataflow_components::finish_routing_shutdown(clean).map_err(|error| error.to_string()),
+        );
         drop(metrics);
-        if let Err(error) = closed {
-            eprintln!("publisher session close failed: {error:#}");
+        if let Err(error) = result {
+            eprintln!("dataflow shutdown failed: {error}");
             std::process::exit(1);
         }
     })
+}
+
+fn finish_shutdown<E: std::fmt::Display>(
+    clean: bool,
+    close: impl FnOnce() -> Result<(), E>,
+    terminal: impl FnOnce(bool) -> Result<(), String>,
+) -> Result<(), String> {
+    let closed = if clean {
+        close().map_err(|error| error.to_string())
+    } else {
+        Ok(())
+    };
+    let terminal = terminal(clean && closed.is_ok());
+    let mut errors = Vec::new();
+    if !clean {
+        errors.push("controller drain failed".to_owned());
+    }
+    if let Err(error) = closed {
+        errors.push(format!("publisher session close failed: {error}"));
+    }
+    if let Err(error) = terminal {
+        errors.push(format!("terminal routing state failed: {error}"));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    #[test]
+    fn clean_shutdown_closes_publisher_before_terminal_write() {
+        let closed = Cell::new(false);
+        let result = finish_shutdown(
+            true,
+            || {
+                closed.set(true);
+                Ok::<_, String>(())
+            },
+            |clean| {
+                assert!(closed.get());
+                assert!(clean);
+                Ok(())
+            },
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn failed_publisher_close_records_failed_and_returns_error() {
+        let result = finish_shutdown(
+            true,
+            || Err("publication close failed"),
+            |clean| {
+                assert!(!clean);
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn unclean_drain_records_failed_without_cleanly_closing_publisher() {
+        let result = finish_shutdown(
+            false,
+            || -> Result<(), String> { panic!("unclean drain must not close publishers as clean") },
+            |clean| {
+                assert!(!clean);
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn failed_terminal_write_is_an_error_even_after_clean_close() {
+        let result = finish_shutdown(true, || Ok::<_, String>(()), |_| Err("SQL unavailable".to_owned()));
+        assert!(result.is_err());
+    }
 }
