@@ -70,6 +70,16 @@ independent oracle, native, UI, or overall pass is claimed. Readiness must be
 established within the existing startup deadline before the immutable window;
 validator-cost diagnosis must preserve the native global five-minute deadline.
 
+Read-only diagnosis subsequently measured 318.4 seconds and 316.0 seconds in the
+two serial, pre-Kusto snapshot summaries: that failed command had not reached
+its native Kusto phase. A proposed parallel reader correction remains held for
+bounded-memory review; its timing measurements are not a native qualification.
+The approved readiness changes require compactable CPU fixtures from both
+pools and actual remaining generator input before starting the immutable
+window. Raw reader stderr is retained only in private staging outside the
+benchmark/onelake artifact trees; the CI uploader's private-log exclusion is
+additional defense, not the privacy boundary.
+
 ### Current acceptance gaps
 
 The separate-process append/maintenance exercise exposed 24 unlogged Parquet
@@ -83,8 +93,8 @@ group and subreaper with checked bounded cleanup.
 Actual reconciled candidate `ab38407754cd9d5904e1b81b34319219a9ba93e1`
 passed all eight replay tests and the hung-child cleanup regression, but the
 separate writer/maintenance process exercise **still failed**, reporting 24
-unreferenced Parquet files. Both crates were compiled from that candidate, with
-no concurrent target writer. Subsequent read-only source/blob and binary checks
+unreferenced Parquet files. The commands ran from that candidate with no
+concurrent target writer. Subsequent read-only source/blob and binary checks
 found that the process binary lacked the reclaim code, although the replay test
 binary contained it. Reusing one Cargo target across checkouts had retained a
 stale default-feature dependency. The failed receipt is not retroactively a
@@ -93,6 +103,36 @@ expected-code checks, and an actual process pass are required. Future candidate,
 helper, and image qualification must isolate build targets by source revision.
 Neither replay-orphan freedom nor a whole-storage byte plateau is qualified by
 the stale-artifact result.
+
+A new, initially empty, source-specific target at
+`6eb418175efba48cbf305e949858e8268c08304a` passed eight replay tests, three
+canonical tests, both process tests, and the increased-retention prune test.
+The actual separate writer/maintenance exercise completed six cycles, five
+overlaps and 24 publications, with three collisions, a maximum of two attempts,
+142 rows, 32 files, and **zero replay orphans**. Source and tracked status were
+unchanged before and after the execution.
+
+The executing writer/test binary had SHA-256
+`e6756dbfa6695f6b6ffc21ce5b75d1120e20fc82cb1e36fef917cfae322c17c8`;
+the service binary had SHA-256
+`de2704124e4342295c84490a17ba64ccb3dca37201876c9a208832b02ab91fad`.
+The writer contained the reclaim-code marker. An initial provenance guard
+incorrectly required that append-only marker in the maintenance service too
+and refused execution. The service never appends, so the linker discards that
+code; its corrected guard instead checked three relevant retention/prune
+markers from its own source. The failed guard receipt remains separate.
+The corrected guard and first actual process execution passed without changing
+production code or test assertions. This qualifies the bounded replay/process
+scenario, not a whole-storage plateau or the unrelated aggregate reader failure.
+
+Combined candidate `332125096696ae9a057c952e94da0415a2750dd2` passed all
+135 TypeScript tests with zero skips, TypeScript checking, and targeted Rust
+format checking. Its real maintenance CLI contract used the verified service
+binary above, with unchanged maintenance/library source and manifests.
+The optional generator declaration binds warmup, measure, capture settling and
+startup budgets to the persisted plan hash; old plans remain distinct.
+The host helper must still be rebuilt for the new progress fields. These
+checks do not qualify combined-source Rust binaries, images, or live stress.
 
 CI run `40459829984` at
 `ef0a14d33fc1025af0bda401fc15d893231ad455` finished with 44 successful jobs and
@@ -167,10 +207,30 @@ version one, with complete schema/multiset/partition, Spark checkpoint,
 stable query transaction, and idle-restart checks. All 417 source file
 hashes, sizes, and inventory entries remained unchanged.
 
+Test-only followups `533dfb9b9df49741c7b48241f0ee086e44211a79` and
+`7ab4966f11d6f4a9140c6f1423a5e05240db880b` add the ignored selector
+`actual_service_live_append_optimize_purge_prune_and_restart_on_disposable_copies`.
+Exact final assertions passed once in 41.69 seconds using the same fixed
+service binary on private mutable copies. Both pools advanced from 8,128 to
+8,192 rows after a separate canonical writer append, then to 8,256 after
+restart and another append. The scenario exercised real OPTIMIZE and PURGE,
+historical tenant-row retention, a durable committed cursor and clean stop,
+marked-copy unsafe VACUUM, retained checkpoint/current `C.json`, pruning
+strictly below the floor, and idle restart. Every planned obsolete vacuum
+candidate was physically absent and the retained active file remained.
+The Direct/DFE floors were 130/37. All 417 original source-file hashes, sizes
+and inventory entries were unchanged.
+
+The original orchestration envelope nevertheless returned one despite Cargo
+returning zero and printing the passing assertions. A separate custody/receipt
+check returned zero; the orchestration discrepancy remains unexplained.
+The assertions are a bounded pass, **not a whole-job pass**.
+
 These are explicit artifact-backed executions, **not ordinary CI execution of
-the ignored fixtures**. They qualify frozen-source reads and tenant
-snapshot/idle restart, not live append tail, combined PURGE/prune/recovery,
-the failed fixed window, native timeout, all-schema service execution, or Azure.
+the ignored fixtures**. They qualify frozen-source reads, snapshot/idle restart,
+and the disposable-copy joined lifecycle scenario, not the failed collector
+fixed window, production native global deadline, all-schema service execution,
+final combined-source E2E, or Azure.
 
 ### Checkpoint/prune interoperability proof
 
