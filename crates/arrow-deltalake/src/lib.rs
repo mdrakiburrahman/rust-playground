@@ -23,6 +23,8 @@ pub mod delta;
 mod delta_io;
 pub mod layout;
 #[cfg(feature = "delta")]
+pub mod maintenance;
+#[cfg(feature = "delta")]
 pub mod normalize;
 pub mod sizing;
 #[cfg(feature = "delta")]
