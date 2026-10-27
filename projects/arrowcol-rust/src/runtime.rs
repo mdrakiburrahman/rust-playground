@@ -52,8 +52,19 @@ pub enum RunOutcome {
 /// # Errors
 ///
 /// Returns startup, listener, control-loop, or graceful-shutdown failures.
-pub async fn run(config: CollectorConfig) -> Result<RunOutcome> {
+pub async fn run(mut config: CollectorConfig) -> Result<RunOutcome> {
     config.validate()?;
+    let root = config.delta.root.to_string_lossy().into_owned();
+    let generation = tokio::task::spawn_blocking(move || arrowcol_buffer::CloudGeneration::capture(&root))
+        .await
+        .context("validate cloud generation task")??;
+    if let Some(generation) = &generation {
+        config.identity.instance_key = generation.bind_instance_key(&config.identity.instance_key);
+        config.validate()?;
+        if let Some(stage) = config.buffer.native_quiver.stage_config()? {
+            generation.bind_durable_directory(&stage.directory)?;
+        }
+    }
     let instance_id = config.instance_id();
     let password = String::from_utf8(read_secret(&config.sql_server.password_file)?)
         .context("SQL Server password secret is not UTF-8")?;

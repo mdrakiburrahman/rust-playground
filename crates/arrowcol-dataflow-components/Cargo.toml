@@ -10,6 +10,7 @@ description = "Arrow Flight and generic Delta components for the Arrowcol DFE co
 readme = "README.md"
 
 [dependencies]
+arrowcol-buffer = { path = "../arrowcol-buffer" }
 anyhow.workspace = true
 arrow-array = { version = "58.3", default-features = false }
 arrow-schema = { version = "58.3", default-features = false }

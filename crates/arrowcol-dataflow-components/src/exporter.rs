@@ -47,6 +47,14 @@ pub struct GenericDeltaExporter {
 
 impl GenericDeltaExporter {
     fn shared(config: DeltaExporterConfig, metrics: Arc<RuntimeMetrics>) -> Result<Self, String> {
+        let generation = arrowcol_buffer::CloudGeneration::capture(&config.base_path.to_string_lossy())
+            .map_err(|error| error.to_string())?;
+        if generation.is_some()
+            && generation.as_ref().map(arrowcol_buffer::CloudGeneration::generation)
+                != crate::config::process_cloud_generation()
+        {
+            return Err("cloud exporter requires matching process admission generation".to_owned());
+        }
         let mut registry = BACKENDS
             .lock()
             .map_err(|_| "Delta backend registry lock poisoned".to_owned())?;
@@ -876,7 +884,10 @@ fn create_exporter(
     exporter_config: &ExporterConfig,
     _capabilities: &otel_arrow_dfe_engine::capability::registry::Capabilities,
 ) -> Result<ExporterWrapper<OtapPdata>, otel_arrow_dfe_config::error::Error> {
-    let config: DeltaExporterConfig = parse_config(&node_config.config)?;
+    let mut config: DeltaExporterConfig = parse_config(&node_config.config)?;
+    if let Some(root) = std::env::var_os("ARROWCOL_DELTA_ROOT") {
+        config.base_path = PathBuf::from(root);
+    }
     config.validate().map_err(config_error)?;
     let exporter = GenericDeltaExporter::shared(config, global_metrics()).map_err(config_error)?;
     Ok(ExporterWrapper::local(exporter, node, node_config, exporter_config))
@@ -1883,6 +1894,34 @@ mod tests {
         assert!(exposition.contains("arrowcol_dataflow_durable_released_batches_total 0\n"));
     }
 
+    #[tokio::test]
+    async fn stale_cloud_generation_cannot_publish_even_with_current_lease() {
+        let directory = tempfile::tempdir().expect("directory");
+        let store = Arc::new(MemoryRoutingStore::default());
+        let holder = CollectorInstanceId::new();
+        let current = lease(&store, holder).await;
+        let mut original = envelope_for(&current);
+        original.instance_key = "collector|cloud=g1".to_owned();
+
+        let g2 = durable_metrics(holder, Some("collector|cloud=g2"));
+        let exporter = fast_exporter(directory.path(), &store, &g2);
+        let error = exporter
+            .stage(envelope_pdata(original.clone()))
+            .await
+            .err()
+            .expect("G1 cannot be replayed as G2");
+        assert!(matches!(error, ExportFailure::Transient(message) if message.contains("stale cloud-generation")));
+        assert!(!directory.path().join("demo/generated/events/_delta_log").exists());
+
+        let g1 = durable_metrics(holder, Some("collector|cloud=g1"));
+        let exporter = fast_exporter(directory.path(), &store, &g1);
+        exporter
+            .export(envelope_pdata(original))
+            .await
+            .expect("same-generation replay");
+        assert!(delta_version_exists(directory.path(), 1));
+    }
+
     /// Scenario: A replayed batch was admitted by a collector with a different instance key, or this
     /// process has not learned its own instance key.
     /// Guarantees: The exporter refuses it transiently, never permanently, so the durable buffer keeps
@@ -2024,7 +2063,7 @@ mod tests {
         let store = Arc::new(MemoryRoutingStore::default());
         let holder = CollectorInstanceId::new();
         let lease = lease(&store, holder).await;
-        let exporter = GenericDeltaExporter::with_batching(
+        let mut exporter = GenericDeltaExporter::with_batching(
             directory.path().to_path_buf(),
             Arc::clone(&store) as Arc<dyn RoutingStore>,
             arrow_deltalake::commit::CommitOptions::default(),
@@ -2035,6 +2074,11 @@ mod tests {
             Arc::new(RuntimeMetrics::new(holder)),
         )
         .expect("exporter");
+        // Initial table I/O must not expire the freshness premise under load.
+        Arc::get_mut(&mut exporter.backend)
+            .expect("exclusive backend")
+            .leases
+            .set_ttl(std::time::Duration::from_secs(60));
         let mut publications = vec![exporter.stage(pdata(&lease, lease.fencing_epoch)).await.expect("first")];
         let before = store.operation_counts().load_view;
         for _ in 0..3 {

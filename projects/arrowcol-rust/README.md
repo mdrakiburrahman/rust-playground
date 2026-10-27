@@ -5,6 +5,25 @@ bounded zero-copy Arrow buffers in memory, fenced append-only Delta tables out.
 
 ## Data and control path
 
+Cloud startup requires `ARROWCOL_RESET_GENERATION` matching the ready storage
+authority for `ARROWCOL_DELTA_ROOT`. The validated epoch binds the existing
+deployment key and an immutable marker in the Quiver directory before recovery
+or admission. A G1 spool cannot be opened under G2, even at the same URI; old
+unbound cloud backlog needs explicit operator reconciliation. Same-generation
+crash replay retains its original receipt UUID and ingestion timestamp.
+
+Both collectors install a global OTel meter provider before Delta initialization.
+OTLP metrics use standard `OTEL_EXPORTER_OTLP_ENDPOINT` and
+`OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`; `OTEL_METRIC_EXPORT_INTERVAL`
+defaults to 2000 ms. Kernel instrumentation is independent of logging filters.
+Default `service.name` is `arrowcol-rust` (direct) or `arrowcol-dataflow-rust`
+(DFE), overridden by `OTEL_SERVICE_NAME`; `OTEL_RESOURCE_ATTRIBUTES` adds resource
+labels. Both include `telemetry.sdk.name=opentelemetry`,
+`telemetry.sdk.language=rust`, and `telemetry.sdk.version=0.31.0`.
+Graceful normal/error exits flush and shut down the provider. Runtime images
+use Tini and an empty UID10001-owned0700 `/var/lib/arrowcol-azure` as
+`AZURE_CONFIG_DIR`; authentication state is supplied only at runtime.
+
 ```text
 router / direct authenticated client
         |
@@ -154,6 +173,10 @@ are acknowledged without republishing. Receipts adopted while `flushing`
 reuse their stable publication transaction and original ingestion stamp, so
 rows committed just before the crash are not duplicated by replay.
 Graceful shutdown drains the Quiver backlog to Delta before releasing leases.
+After a clean drain returns and table handles are dropped, the process closes
+its shared publisher sessions once. Close failure is logged and exits nonzero,
+leaving the failed registry member registered; it is never retried or silently
+unregistered. An incomplete drain does not close publisher sessions.
 
 Validate without opening sockets or dependencies:
 
