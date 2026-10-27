@@ -1118,8 +1118,47 @@ impl DeltaTable {
         }
         let expected = crate::publisher::expected_generation_from_env()?;
         let session = PublisherSession::open_bootstrap(&url, &expected)?;
-        let initialized = Self::open_connection(url, partition_columns, None, Some(Arc::clone(&session)))
-            .and_then(|table| table.ensure_schema(normalize::schema(&schema)?));
+        Self::bootstrap_with_session(url, &schema, partition_columns, &session, None)
+    }
+
+    /// Test-only [`Self::initialize_url_for_bootstrap`] for an ADLS URL whose
+    /// control metadata and data store are injected. Admission, the guarded
+    /// store, schema initialization and drain/close are the production code;
+    /// only the Azure metadata transport, credential and blob endpoint are
+    /// replaced. Available only with the non-default `test-control` feature.
+    ///
+    /// # Errors
+    /// As [`Self::initialize_url_for_bootstrap`]; also rejects non-ADLS URLs
+    /// and accounts other than `control.account`.
+    #[cfg(feature = "test-control")]
+    pub fn initialize_url_for_bootstrap_with_control(
+        url: Url,
+        schema: SchemaRef,
+        partition_columns: Vec<String>,
+        control: crate::publisher::TestBootstrapControl,
+    ) -> Result<()> {
+        if url.scheme() == "file" {
+            bail!("the test control seam covers only ADLS bootstrap");
+        }
+        let session = PublisherSession::open_bootstrap_with_control(
+            control.metadata,
+            &control.sandbox_id,
+            &control.account,
+            &control.expected_generation,
+        )?;
+        Self::bootstrap_with_session(url, &schema, partition_columns, &session, Some(control.data))
+    }
+
+    fn bootstrap_with_session(
+        url: Url,
+        schema: &SchemaRef,
+        partition_columns: Vec<String>,
+        session: &Arc<PublisherSession>,
+        data: Option<Arc<dyn ObjectStore>>,
+    ) -> Result<()> {
+        let initialized =
+            Self::open_connection_with_store(url, partition_columns, None, Some(Arc::clone(session)), data)
+                .and_then(|table| table.ensure_schema(normalize::schema(schema)?));
         let closed = session.close_after_drain();
         match (initialized, closed) {
             (Ok(_), closed) => closed,
@@ -1153,10 +1192,22 @@ impl DeltaTable {
     }
 
     fn open_connection(
+        url: Url,
+        partition_columns: Vec<String>,
+        publication_fence: Option<Arc<dyn PublicationFence>>,
+        session: Option<Arc<PublisherSession>>,
+    ) -> Result<Arc<Self>> {
+        Self::open_connection_with_store(url, partition_columns, publication_fence, session, None)
+    }
+
+    /// `data` replaces only the inner transport; it is always wrapped by the
+    /// session's guard, so admission and URL/account checks are unchanged.
+    fn open_connection_with_store(
         mut url: Url,
         partition_columns: Vec<String>,
         publication_fence: Option<Arc<dyn PublicationFence>>,
         session: Option<Arc<PublisherSession>>,
+        data: Option<Arc<dyn ObjectStore>>,
     ) -> Result<Arc<Self>> {
         if !url.path().ends_with('/') {
             url.set_path(&format!("{}/", url.path()));
@@ -1173,9 +1224,13 @@ impl DeltaTable {
         if let Some(session) = &session {
             session.check()?;
         }
-        let store: Arc<dyn ObjectStore> = match &session {
-            Some(session) => session.store_for_url(&url)?,
-            None => Arc::new(object_store::local::LocalFileSystem::new()),
+        let store: Arc<dyn ObjectStore> = match (&session, data) {
+            (Some(session), Some(data)) => {
+                session.bind_store(&url, data, crate::publisher::MutationRetries::Disabled)?
+            }
+            (Some(session), None) => session.store_for_url(&url)?,
+            (None, None) => Arc::new(object_store::local::LocalFileSystem::new()),
+            (None, Some(_)) => bail!("an injected data store requires a publisher session"),
         };
         let root = if url.scheme() == "file" {
             let path = url
