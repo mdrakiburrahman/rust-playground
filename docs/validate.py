@@ -22,6 +22,7 @@ DOCUMENTS = [
     ROOT / "docs/architecture/arrowcol-platform/storage.md",
     ROOT / "docs/architecture/arrowcol-platform/observability.md",
     ROOT / "docs/architecture/loadtest/README.md",
+    ROOT / "infra/azure/README.md",
     ROOT / "docs/delivery-verification.md",
     ROOT / "docs/quiver/README.md",
     ROOT / "docs/containers/publishing.md",

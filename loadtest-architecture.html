@@ -49,7 +49,7 @@
   <div class="canvas" tabindex="0" role="region" aria-label="Lakehouse loadtest architecture; scroll horizontally on small screens">
     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 1010" role="img" aria-labelledby="title description">
       <title id="title">ArrowCol lakehouse loadtest architecture</title>
-      <desc id="description">Thirteen multi-customer schemas generate paired Arrow traffic through a router to independent Direct and Dataflow collector pools. SQL Server and Hive own catalog and control metadata, not payloads. Optional Quiver persists pending Arrow. Delta Kernel publishes sorted, ingestion-time-partitioned Parquet to independent local or ADLS roots. Standalone maintenance optimizes, purges and vacuums safely. A historical tenant fork captures a snapshot then tails data changes into an independent sink with Spark-compatible recovery logs. Local Kusto follows active snapshots through a functional bridge; Azure Kusto uses managed identity, external Delta and query acceleration. An independent delta-rs oracle validates results. Metrics, logs and traces feed LGTM. Cloud performance and local functional evidence remain distinct.</desc>
+      <desc id="description">Thirteen multi-customer schemas generate paired Arrow traffic through a router to independent Direct and Dataflow collector pools. SQL Server and Hive own catalog and control metadata, not payloads. Optional Quiver persists pending Arrow. Delta Kernel publishes sorted, ingestion-time-partitioned Parquet to independent local or ADLS roots. Standalone maintenance optimizes, purges and vacuums safely. A historical tenant fork captures a snapshot then tails data changes into an independent sink with Spark-compatible recovery logs. Local Kusto uses qualified native external Delta and QAP or an explicit active-snapshot bridge; Azure Kusto uses managed identity, external Delta and query acceleration. An independent delta-rs oracle validates results. Metrics, logs and traces feed LGTM. Cloud performance and local functional evidence remain distinct.</desc>
       <defs>
         <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r=".7" fill="#24354c"/></pattern>
         <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 10 5 0 10Z" fill="#79d6fa"/></marker>
@@ -122,8 +122,8 @@
       <text x="510" y="771" class="small">Skip OPTIMIZE / retain copied rows after purge</text>
       <rect x="950" y="614" width="420" height="178" rx="12" class="box" style="stroke:#65acbd"/>
       <text x="970" y="645" class="title">Kusto query surface</text>
-      <text x="970" y="672" class="body">Local: committed active-snapshot bridge</text>
-      <text x="970" y="696" class="body">Reconcile replacements, removals, restart</text>
+      <text x="970" y="672" class="body">Local: native Delta/QAP or explicit bridge</text>
+      <text x="970" y="696" class="body">Qualify append, replace, remove, restart</text>
       <text x="970" y="720" class="body">Azure: external Delta + native QAP</text>
       <text x="970" y="744" class="body">Dedicated UAMI storage read / Explorer</text>
       <text x="970" y="771" class="small">Local simulation does not prove Azure cache behavior</text>

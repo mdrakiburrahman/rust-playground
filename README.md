@@ -96,8 +96,9 @@ catalog, router, receipt, fencing, buffering, and capability contracts.
 The [interactive architecture source](loadtest-architecture.html) follows
 13 multi-customer schemas through both collector pools into independent Delta
 roots, ingestion-time partitions, standalone maintenance, historical tenant
-forks, and Kusto. Local mode uses disk and a functional Kusto bridge; Azure mode
-uses ADLS Gen2 and native external-Delta query acceleration with a dedicated
+forks, and Kusto. Local mode pairs disk with the Kusto emulator: qualified native
+external Delta/QAP where available, or an explicitly functional bridge. Azure
+mode uses ADLS Gen2 and native external-Delta query acceleration with a dedicated
 managed identity. Independent validation and LGTM observe the same run.
 
 The tenant fork preserves copied history after source purge; the local bridge

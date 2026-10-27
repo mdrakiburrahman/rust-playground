@@ -38,13 +38,16 @@ comes from `ARROWCOL_MODE`, falling back to `local`.
 | Surface | Local mode | Azure mode |
 | --- | --- | --- |
 | Source Delta | Local disk, separate pool roots | ADLS Gen2, separate pool roots |
-| Kusto | Emulator with a committed active-snapshot bridge | External Delta tables with native Query Acceleration Policy |
+| Kusto | Emulator: qualified native external Delta/QAP, or an explicit active-snapshot bridge | External Delta tables with native Query Acceleration Policy |
 | Storage identity | Scoped local mounts | Existing Azure CLI writer identity; dedicated Kusto storage-read UAMI |
 | Evidence | Functional integration, active-file visibility, recovery | Real QAP state, capacity, lag, correctness, and reacceleration |
 
-The emulator is not a performance benchmark or an implementation of Azure cache
-internals. Its bridge tracks the current active snapshot, including OPTIMIZE
-replacements and partition removals. A tenant fork has intentionally different
+The emulator is not a performance benchmark or proof of Azure cache internals.
+Native external-Delta/QAP support must be qualified against the pinned emulator
+and bounded refresh/recovery checks, not inferred from management-command
+acceptance alone. When the explicit bridge is selected, it tracks the current
+active snapshot, including OPTIMIZE replacements and partition removals.
+A tenant fork has intentionally different
 semantics: capture a snapshot, tail logical appends, ignore OPTIMIZE, and retain
 already-copied rows after source purge.
 
