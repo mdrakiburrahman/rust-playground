@@ -125,33 +125,48 @@ impl CloudGeneration {
     ///
     /// The immutable marker is fsynced before admission. Existing unbound backlog
     /// requires explicit operator reconciliation, never automatic epoch adoption.
+    /// Every successful bind also syncs the marker and directory ancestry, repairing
+    /// markers left visible by an earlier failed durability attempt.
     ///
     /// # Errors
     /// Rejects stale/unbound backlog, invalid markers, or durable filesystem failures.
     pub fn bind_durable_directory(&self, directory: &Path) -> Result<()> {
-        std::fs::create_dir_all(directory)?;
+        self.bind_durable_directory_with_sync(directory, &mut |file, _| file.sync_all())
+    }
+
+    fn bind_durable_directory_with_sync(
+        &self,
+        directory: &Path,
+        sync: &mut dyn FnMut(&File, &Path) -> std::io::Result<()>,
+    ) -> Result<()> {
+        let directory = std::path::absolute(directory)?;
+        std::fs::create_dir_all(&directory)?;
         let marker = directory.join(".arrowcol-cloud-generation.json");
         match std::fs::read(&marker) {
-            Ok(bytes) => return self.validate_marker(&bytes),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(bytes) => self.validate_marker(&bytes)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ensure!(
+                    std::fs::read_dir(&directory)?.next().is_none(),
+                    "unbound durable backlog requires cloud-generation reconciliation"
+                );
+                match OpenOptions::new().write(true).create_new(true).open(&marker) {
+                    Ok(mut file) => file.write_all(&serde_json::to_vec(self)?)?,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        self.validate_marker(&std::fs::read(&marker)?)?;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
             Err(error) => return Err(error.into()),
         }
-        ensure!(
-            std::fs::read_dir(directory)?.next().is_none(),
-            "unbound durable backlog requires cloud-generation reconciliation"
-        );
-        match OpenOptions::new().write(true).create_new(true).open(&marker) {
-            Ok(mut file) => {
-                file.write_all(&serde_json::to_vec(self)?)?;
-                file.sync_all()?;
-                File::open(directory)?.sync_all()?;
-                Ok(())
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                self.validate_marker(&std::fs::read(marker)?)
-            }
-            Err(error) => Err(error.into()),
+
+        sync(&File::open(&marker)?, &marker).context("persist cloud-generation marker")?;
+        // A previous failed attempt may have left any ancestor visible but unsynced.
+        for ancestor in directory.ancestors() {
+            sync(&File::open(ancestor)?, ancestor)
+                .with_context(|| format!("persist cloud-generation directory {}", ancestor.display()))?;
         }
+        Ok(())
     }
 
     fn validate_marker(&self, bytes: &[u8]) -> Result<()> {
@@ -165,6 +180,56 @@ impl CloudGeneration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visible_marker_requires_successful_durability_repair_before_admission() -> Result<()> {
+        fn admit(
+            generation: &CloudGeneration,
+            directory: &Path,
+            sync: &mut dyn FnMut(&File, &Path) -> std::io::Result<()>,
+        ) -> Result<()> {
+            generation.bind_durable_directory_with_sync(directory, sync)?;
+            std::fs::write(directory.join("admitted.wal"), b"receipt")?;
+            Ok(())
+        }
+
+        for failure in ["marker", "directory", "ancestry"] {
+            let parent = tempfile::tempdir()?;
+            let directory = parent.path().join("new/ancestry/spool");
+            let marker = directory.join(".arrowcol-cloud-generation.json");
+            let failed_path = match failure {
+                "marker" => marker.clone(),
+                "directory" => directory.clone(),
+                _ => directory.parent().context("spool parent")?.to_owned(),
+            };
+            let generation = CloudGeneration {
+                root: "abfss://container@account.dfs.core.windows.net/root".into(),
+                generation: uuid::Uuid::new_v4().to_string(),
+            };
+            let mut failures = 0;
+            let mut fail_sync = |file: &File, path: &Path| {
+                if path == failed_path {
+                    failures += 1;
+                    return Err(std::io::Error::other("injected durability failure"));
+                }
+                file.sync_all()
+            };
+            for _ in 0..2 {
+                assert!(admit(&generation, &directory, &mut fail_sync).is_err());
+                assert!(marker.exists(), "failed sync left a visible marker");
+                assert!(!directory.join("admitted.wal").exists());
+            }
+            assert_eq!(failures, 2, "a retry must repair, not trust visibility");
+            admit(&generation, &directory, &mut |file, _| file.sync_all())?;
+            generation.bind_durable_directory(&directory)?;
+            assert_eq!(std::fs::read(directory.join("admitted.wal"))?, b"receipt");
+            assert_eq!(
+                generation.persisted_directory_generation(&directory)?,
+                generation.generation()
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn stale_wal_cannot_be_rebound_to_same_uri_after_reset() -> Result<()> {
