@@ -50,8 +50,9 @@ and VACUUM. Longer `MaxAge` can retain stale cached rows.
 
 Cache statistics alone do not establish freshness: a reported 100% acceleration,
 zero pending files, and recent update time can coexist with stale query results.
-Require current `details.TableVersion`, healthy `details.IsHealthy`, expected
-`details.AcceleratedRows`, and actual cached row-multiset equality with both the
+Require current `TableVersion`, healthy `IsHealthy`, and expected
+`AcceleratedRowCount` from `QueryAccelerationState`, plus actual cached
+row-multiset equality with both the
 independent oracle and uncached fallback. Record observed convergence separately
 from the bounded deadline; focused native-probe acceptance does not prove the
 integrated 13-schema workload or Explorer/stress acceptance.

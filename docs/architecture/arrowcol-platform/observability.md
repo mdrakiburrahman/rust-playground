@@ -47,8 +47,8 @@ publication IDs, and checkpoint UUIDs out of metric labels.
 Local Kusto is a functional integration surface, not a performance benchmark.
 Its asynchronous cache visibility is separate from Direct receipt publication.
 With local `MaxAge=1min`, bound convergence checks to five minutes and require
-current `details.TableVersion`, healthy `details.IsHealthy`, expected
-`details.AcceleratedRows`, and cached row-multiset equality with both the
+current `TableVersion`, healthy `IsHealthy`, and expected `AcceleratedRowCount`
+from `QueryAccelerationState`, plus cached row-multiset equality with both the
 independent oracle and uncached fallback. A 100% acceleration statistic, zero
 pending files, or a fresh update timestamp alone can report success while
 cached queries remain stale. Azure QAP stress
