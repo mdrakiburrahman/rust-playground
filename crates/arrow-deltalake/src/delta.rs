@@ -1125,12 +1125,13 @@ impl DeltaTable {
     /// control metadata and data store are injected. Admission, the guarded
     /// store, schema initialization and drain/close are the production code;
     /// only the Azure metadata transport, credential and blob endpoint are
-    /// replaced. Available only with the non-default `test-control` feature.
+    /// replaced. Compiled only with the non-default `test-control` feature AND
+    /// `debug_assertions`; release builds omit it even with `--all-features`.
     ///
     /// # Errors
     /// As [`Self::initialize_url_for_bootstrap`]; also rejects non-ADLS URLs
     /// and accounts other than `control.account`.
-    #[cfg(feature = "test-control")]
+    #[cfg(all(feature = "test-control", debug_assertions))]
     pub fn initialize_url_for_bootstrap_with_control(
         url: Url,
         schema: SchemaRef,
