@@ -76,7 +76,7 @@ impl LayoutPolicy {
         self.validate(schema)?;
         let mut builder = WriterProperties::builder()
             .set_compression(Compression::UNCOMPRESSED)
-            .set_max_row_group_size(self.row_group_rows)
+            .set_max_row_group_row_count(Some(self.row_group_rows))
             .set_data_page_row_count_limit(self.page_rows)
             .set_statistics_enabled(EnabledStatistics::Page)
             .set_offset_index_disabled(false);
@@ -165,7 +165,7 @@ impl FileSortBuffer {
             .iter()
             .map(|name| {
                 Ok(SortColumn {
-                    values: batch.column(self.schema.index_of(name)?).clone(),
+                    values: std::sync::Arc::clone(batch.column(self.schema.index_of(name)?)),
                     options: Some(SortOptions {
                         descending: false,
                         nulls_first: false,

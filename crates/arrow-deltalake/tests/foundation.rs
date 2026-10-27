@@ -1,3 +1,5 @@
+#![cfg(feature = "delta")]
+
 use anyhow::Result;
 use arrow::array::{Int32Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
