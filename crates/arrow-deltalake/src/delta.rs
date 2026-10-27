@@ -1790,17 +1790,26 @@ impl DeltaTable {
     /// and counted as `orphan_cleanup_failed`, and the file stays on disk.
     fn reclaim_unsubmitted(&self, files: &[StagedAppend]) {
         for append in files {
+            // Only this table's own stages fall under its cleanup guard: a foreign stage
+            // (another table, possibly nested under this root) keeps its state and file.
+            if append.table.url != self.url {
+                continue;
+            }
+            let Some(relative) = append
+                .file
+                .path
+                .strip_prefix(&self.root)
+                .ok()
+                .and_then(Path::to_str)
+                .map(str::to_owned)
+            else {
+                continue;
+            };
             if !append.claim_reclaim() {
                 continue;
             }
             let reclaimed = (|| -> Result<()> {
-                let relative = append
-                    .file
-                    .path
-                    .strip_prefix(&self.root)?
-                    .to_str()
-                    .context("invalid staged path")?;
-                let url = self.staged_url(relative)?;
+                let url = self.staged_url(&relative)?;
                 self.discard_output(&append.file.path, &url, self.url.scheme() != "file")?;
                 if self.url.scheme() == "file"
                     && let Some(parent) = append.file.path.parent()
@@ -1813,9 +1822,10 @@ impl DeltaTable {
                 Ok(()) => crate::telemetry::publication_event("orphan_reclaimed"),
                 Err(error) => {
                     crate::telemetry::publication_event("orphan_cleanup_failed");
+                    // Paths and error text can carry storage URLs or service responses;
+                    // only a fixed failure class leaves this boundary.
                     tracing::warn!(
-                        path = %append.file.path.display(),
-                        error = %format!("{error:#}"),
+                        failure = cleanup_failure_class(&error),
                         "deduplicated staged file retained: cleanup failed"
                     );
                 }
@@ -2011,7 +2021,31 @@ pub struct DeltaFileWriter {
     accepted_input_bytes: u64,
 }
 
+/// Fixed, non-identifying class of a staged-file cleanup failure.
+fn cleanup_failure_class(error: &anyhow::Error) -> &'static str {
+    for cause in error.chain() {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            return match io.kind() {
+                std::io::ErrorKind::PermissionDenied => "io_permission_denied",
+                std::io::ErrorKind::NotFound => "io_not_found",
+                _ => "io_other",
+            };
+        }
+        if cause.downcast_ref::<crate::maintenance::MaintenanceError>().is_some() {
+            return "publication_guard";
+        }
+        if cause.downcast_ref::<object_store::Error>().is_some() {
+            return "object_store";
+        }
+    }
+    "other"
+}
+
 /// Completed append, including the table version.
+///
+/// When the publication was deduplicated (its identity was already committed),
+/// `version` is the original commit and `file` describes this call's fresh stage,
+/// which is reclaimed and may no longer exist.
 #[derive(Debug)]
 pub struct AppendResult {
     pub version: u64,
