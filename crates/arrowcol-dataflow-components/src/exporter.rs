@@ -790,7 +790,7 @@ impl GroupPublisher<'_> {
                     receipt_id = %entry.publication_id,
                     sink_kind = if error.permanent() { "permanent" } else { "transient" },
                     sink_code = ?arrowcol_protocol::ErrorCode::PublicationFailed,
-                    error_message = %arrowcol_buffer::safe_error_message(&error.to_string()),
+                    error_message = %error.safe_message(),
                     "Delta publication failed"
                 );
             }
@@ -881,6 +881,10 @@ enum ExportFailure {
 impl ExportFailure {
     fn permanent(&self) -> bool {
         matches!(self, Self::Permanent(_) | Self::Envelope(_))
+    }
+
+    fn safe_message(&self) -> String {
+        arrowcol_buffer::safe_error_message(&self.to_string())
     }
 }
 
@@ -1001,13 +1005,17 @@ async fn complete_publication(
         Err(error) if error.permanent() => {
             effect_handler
                 .notify_nack(NackMsg::new_permanent_with_cause(
-                    error.to_string(),
+                    error.safe_message(),
                     pdata,
                     NackCause::Refused,
                 ))
                 .await
         }
-        Err(error) => effect_handler.notify_nack(NackMsg::new(error.to_string(), pdata)).await,
+        Err(error) => {
+            effect_handler
+                .notify_nack(NackMsg::new(error.safe_message(), pdata))
+                .await
+        }
     }
 }
 
@@ -1033,6 +1041,33 @@ mod tests {
     use super::*;
     use crate::envelope::{ArrowcolBatchEnvelope, encode_record_batch};
     use crate::metrics::RuntimeMetrics;
+
+    #[test]
+    fn dfe_warn_and_nack_diagnostics_redact_raw_owner_and_group_error_chains() {
+        let raw = concat!(
+            "open owner: transient schema Int16 vs UInt8: ",
+            "https://canary-user:canary-password@canary-host.invalid/private?sig=canary-sas&sv=canary-version ",
+            "Authorization: Bearer canary-bearer ",
+            "abfss://canary-container@canary-account.dfs.core.windows.net/canary-path ",
+            "01234567-89ab-cdef-0123-456789abcdef ",
+            "Password=canary-password;AccountKey=canary-key;SharedAccessSignature=canary-signature; ",
+            "/canary-local/path file:///canary-file/path C:\\canary-windows\\path ",
+            "eyJhbGciOiJIUzI1NiJ9.eyJjYW5hcnkiOiJwcml2YXRlIn0.canaryJWTsignature"
+        );
+        for error in [
+            ExportFailure::Transient(raw.to_owned()),
+            ExportFailure::Permanent(raw.to_owned()),
+        ] {
+            let permanent = error.permanent();
+            let message = error.safe_message();
+            assert!(!message.contains("canary"), "{message}");
+            assert!(!message.contains("01234567-89ab-cdef-0123-456789abcdef"));
+            assert!(!message.contains("eyJ"));
+            assert!(message.contains("transient schema Int16 vs UInt8"));
+            assert!(message.contains("[REDACTED]"));
+            assert_eq!(error.permanent(), permanent);
+        }
+    }
 
     fn now() -> UnixMillis {
         crate::config::now_unix_millis().expect("now")

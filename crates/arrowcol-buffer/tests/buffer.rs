@@ -739,7 +739,12 @@ async fn sink_failure_stale_fence_and_cancellation_have_typed_behavior() -> anyh
 
     let retry_receipts = Arc::new(FakeReceipts::default());
     let retry_sink = FakeSink::succeeding();
-    retry_sink.push(SinkBehavior::Fail(SinkError::retryable("known write failure")))?;
+    retry_sink.push(SinkBehavior::Fail(SinkError::retryable(concat!(
+        "known write failure: Int16 vs UInt8; ",
+        "https://canary-user:canary-password@canary-host.invalid/path?sig=canary-signature; ",
+        "Bearer canary-token; Password=canary-connection; /canary-private/path; ",
+        "01234567-89ab-cdef-0123-456789abcdef"
+    ))))?;
     let mut config = config_large();
     config.max_batches_per_flush = 1;
     config.adaptive_size = adaptive(10_000, 10_000, 20_000, 1.0, 0.2);
@@ -756,6 +761,19 @@ async fn sink_failure_stale_fence_and_cancellation_have_typed_behavior() -> anyh
             .failure_disposition,
         Some(FailureDisposition::Retryable)
     );
+    let failed = retry_receipts
+        .receipt(retry_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("missing retry receipt"))?;
+    let message = failed
+        .error
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("missing persisted sink error"))?
+        .message();
+    assert!(!message.contains("canary"), "{message}");
+    assert!(!message.contains("01234567-89ab-cdef-0123-456789abcdef"));
+    assert!(message.contains("known write failure: Int16 vs UInt8"));
+    assert!(message.contains("[REDACTED]"));
 
     let cancelled_receipts = Arc::new(FakeReceipts::default());
     let cancelled_sink = FakeSink::succeeding();

@@ -94,6 +94,17 @@ when admitting recovered deliveries whose
 receipts are already `buffered` or `flushing` (`TrackedState`) and returns a
 `DeliveryCompletion` that resolves to a `DeliveryOutcome`.
 
+## Publication diagnostics
+
+`arrowcol_buffer::safe_error_message(&str) -> String` is the shared boundary for
+Direct receipt failures and publication warnings, and DFE warnings/NACKs.
+It replaces credential values, URIs (including Azure storage/SAS URLs), absolute
+filesystem paths, JWT-like tokens and UUID-like private identifiers with
+`[REDACTED]` before stripping controls and limiting output to 1,024 UTF-8 bytes.
+Error kinds and schema/type causes remain readable; receipt dispositions and
+retry decisions are unchanged. Table and receipt identities are separate
+structured warning fields.
+
 ## Validation
 
 ```bash

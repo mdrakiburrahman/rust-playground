@@ -1452,11 +1452,69 @@ fn receipt_error(error: arrowcol_receipts::ReceiptError) -> BufferError {
     BufferError::new(BufferErrorKind::ReceiptStore, error.to_string())
 }
 
-/// Bounds already-sanitized sink diagnostics and removes control characters.
+/// Redacts credentials, URIs, absolute paths and private identifiers from sink diagnostics.
+///
+/// Preserves causal text, replaces sensitive values with `[REDACTED]`, removes
+/// control characters and bounds the result to 1,024 UTF-8 bytes. Redaction runs
+/// before truncation, so a partially truncated credential cannot escape.
 #[must_use]
 pub fn safe_error_message(message: &str) -> String {
-    let mut safe = String::with_capacity(message.len().min(1_024));
-    for character in message.chars() {
+    use std::borrow::Cow;
+    use std::sync::LazyLock;
+
+    use regex::Regex;
+
+    // Match loadgen kusto::redact_text (34b899) URI/path/GUID/UPN/JWT canaries
+    // and auth-automation's named-secret/Bearer replacement convention.
+    static REDACTIONS: LazyLock<Result<Vec<(Regex, &'static str)>, regex::Error>> = LazyLock::new(|| {
+        [
+            (
+                r#"(?i)\b(?:authorization|proxy-authorization)\s*[:=]\s*(?:"[^"]*"|'[^']*'|(?:bearer|basic)\s+[^\s,;]+|[^\s,;]+)"#,
+                "[REDACTED]",
+            ),
+            (r"(?i)\bbearer\s+[a-z0-9._~+/\-=]+", "[REDACTED]"),
+            (
+                r#"(?i)["']?\b(?:password|pwd|accountkey|accountname|sharedaccesssignature|sharedaccesskey|access[_-]?token|refresh[_-]?token|client[_-]?secret|sig|se|sv|sp)["']?\s*[:=]\s*(?:"[^"]*"|'[^']*'|\{(?:[^}]|}})*\}|[^\s;,&"'<>]+)"#,
+                "[REDACTED]",
+            ),
+            (
+                r#"(?i)\b[a-z][a-z0-9+.-]*://[^\s"'<>)\]}]+"#,
+                "[REDACTED]",
+            ),
+            (
+                r"\b[a-zA-Z0-9_-]{8,}\.[a-zA-Z0-9_-]{8,}\.[a-zA-Z0-9_-]{8,}\b",
+                "[REDACTED]",
+            ),
+            (
+                r"(?i)\beyj[a-z0-9._-]{29,}",
+                "[REDACTED]",
+            ),
+            (
+                r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+                "[REDACTED]",
+            ),
+            (
+                r#"[^\s"'`()\[\]{},;<>:@]+@[^\s"'`()\[\]{},;<>:@]+\.[^\s"'`()\[\]{},;<>:@]+"#,
+                "[REDACTED]",
+            ),
+            (r#"["'](?:/|[a-zA-Z]:[\\/]|\\\\)[^"']*["']"#, "[REDACTED]"),
+            (r#"\b[a-zA-Z]:[\\/][^\s"'<>),;\]}]+"#, "[REDACTED]"),
+            (r#"\\\\[^\s"'<>),;\]}]+"#, "[REDACTED]"),
+            (r#"(^|[\s"'(=,:])[/\\][^\s"'<>),;:\]}]+"#, " [REDACTED]"),
+        ]
+        .into_iter()
+        .map(|(pattern, replacement)| Regex::new(pattern).map(|regex| (regex, replacement)))
+        .collect()
+    });
+    let Ok(redactions) = REDACTIONS.as_ref() else {
+        return "publication failed (diagnostic redaction unavailable)".to_owned();
+    };
+    let mut redacted = Cow::Borrowed(message);
+    for (pattern, replacement) in redactions {
+        redacted = Cow::Owned(pattern.replace_all(&redacted, *replacement).into_owned());
+    }
+    let mut safe = String::with_capacity(redacted.len().min(1_024));
+    for character in redacted.chars() {
         if safe.len() >= 1_024 {
             break;
         }
@@ -1476,6 +1534,91 @@ pub fn safe_error_message(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::safe_error_message;
+
+    const CANARY_ERROR: &str = concat!(
+        "transient publication failed: Int16 vs UInt8; ",
+        "https://canary-user:canary-url-password@canary-host.invalid/canary-url-path?sig=canary-url-sig&se=canary-expiry; ",
+        "sv=canary-sv&sp=canary-sp&sig=canary-sas; ",
+        "Authorization: Bearer canary-auth-token; Bearer canary-bearer-token; ",
+        "abfss://canary-container@canary-account.dfs.core.windows.net/canary-storage-path; ",
+        "https://canary-blob.blob.core.windows.net/canary-blob-container/canary-blob-path; ",
+        "private tenant 01234567-89ab-cdef-0123-456789abcdef; ",
+        "Password=canary-password;AccountKey=canary-account-key;SharedAccessSignature=canary-connection-sas; ",
+        "file:///canary-file/path; /canary-local/path; C:\\canary-windows\\path; \\\\canary-server\\share; ",
+        "eyJhbGciOiJIUzI1NiJ9.eyJjYW5hcnkiOiJwcml2YXRlIn0.canaryJWTsignature"
+    );
+
+    #[test]
+    fn direct_warn_and_receipt_diagnostics_redact_canaries_but_keep_schema_cause() -> anyhow::Result<()> {
+        let error = crate::SinkError::retryable(CANARY_ERROR);
+        let message = safe_error_message(error.message());
+        let receipt_error = arrowcol_protocol::ErrorStatus::new(error.code(), message.clone())?;
+        assert_eq!(receipt_error.message(), message);
+        assert!(!message.contains("canary"), "{message}");
+        assert!(!message.contains("01234567-89ab-cdef-0123-456789abcdef"));
+        assert!(!message.contains("eyJ"));
+        assert!(message.contains("transient publication failed: Int16 vs UInt8"));
+        assert!(message.contains("[REDACTED]"));
+        Ok(())
+    }
+
+    #[test]
+    fn sensitive_values_are_redacted_before_byte_truncation() {
+        for value in [
+            "Authorization=Basic canary-basic-token",
+            r#"password="canary password with spaces""#,
+            "Pwd={canary password;with semicolon}",
+            r#"{"client_secret":"canary-secret","access_token":"canary-token"}"#,
+            r#""/canary folder/private file""#,
+            r#""C:\canary folder\private file""#,
+        ] {
+            assert!(!safe_error_message(value).contains("canary"));
+        }
+        let message = format!(
+            "{} https://canary-user:canary-password@canary-host.invalid",
+            "x".repeat(1_000)
+        );
+        assert!(!safe_error_message(&message).contains("canary"));
+        assert_eq!(
+            safe_error_message("schema Int16/UInt8: permanent mismatch"),
+            "schema Int16/UInt8: permanent mismatch"
+        );
+    }
+
+    #[test]
+    fn native_client_canaries_and_diagnostic_contract_stay_aligned() {
+        let message = concat!(
+            "Partial query failure: abfss://private@acct.dfs.core.windows.net/x?sig=CANARYSIG ",
+            "on /subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg identity ",
+            "99999999-aaaa-bbbb-cccc-dddddddddddd ",
+            "bearer eyJhbGciOiJIUzI1NiJ9.privateCanaryJwtPayload.privateCanarySignature ",
+            "/delta/private/x C:\\privateCanaryWindows\\x;Password=privateCanaryPassword; ",
+            r#"{"client_secret":"privateCanarySecret"} authorization: Bearer privateCanaryOpaqueToken "#,
+            "privateCanaryUser@example.invalid: schema Int16 vs UInt8"
+        );
+        let safe = safe_error_message(message);
+        for canary in [
+            "CANARYSIG",
+            "acct.dfs",
+            "11111111-2222",
+            "99999999-aaaa",
+            "eyJhbGciOi",
+            "/delta/private",
+            "privateCanary",
+        ] {
+            assert!(!safe.contains(canary), "{canary} leaked: {safe}");
+        }
+        assert!(safe.contains("Partial query failure"));
+        assert!(safe.contains("schema Int16 vs UInt8"));
+        assert_eq!(
+            safe_error_message("TableVersion 4 at 2026-10-27T03:41:46Z"),
+            "TableVersion 4 at 2026-10-27T03:41:46Z"
+        );
+        let bounded = safe_error_message(&format!("{}\n", "界".repeat(1_100)));
+        assert!(bounded.chars().count() <= 1_024);
+        assert!(bounded.len() <= 1_024);
+        assert!(!bounded.chars().any(char::is_control));
+    }
 
     #[test]
     fn sink_diagnostics_are_bounded_control_free_and_utf8_safe() {
