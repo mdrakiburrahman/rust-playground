@@ -204,6 +204,9 @@ Legacy or unversioned metadata (`resetstate=ready`/`fenced`, or no
      `ready-v1` at the same generation.
 - **Ready redeploy and standalone `reconcile`:** these register a normal member
   around deploy, cluster start and KQL.
+  Under test occupancy, `reconcile` also requires the exact occupancy owner and
+  the captured generation (`--reset-generation` or `ARROWCOL_RESET_GENERATION`).
+  It does not require an empty registry, because live collectors stay registered.
 - **Failure handling:** `NotReady` (exit 3) cleanly releases the member. Any
   other failure, or an unknown start or admin outcome, marks the member uncertain.
   An uncertain member keeps blocking stop and cleanup until an operator reconciles it.
