@@ -881,6 +881,16 @@ impl BufferManager {
         sink_error: &SinkError,
     ) -> (Option<IncompleteWork>, Option<IncompleteWork>) {
         let message = safe_error_message(sink_error.message());
+        for entry in &job.entries {
+            tracing::warn!(
+                table = %job.context.table,
+                receipt_id = %entry.receipt.receipt_id,
+                sink_kind = ?sink_error.kind(),
+                sink_code = ?sink_error.code(),
+                error_message = %message,
+                "Delta publication failed"
+            );
+        }
         let error = match ErrorStatus::new(sink_error.code(), message) {
             Ok(error) => error,
             Err(cause) => {
@@ -1442,7 +1452,9 @@ fn receipt_error(error: arrowcol_receipts::ReceiptError) -> BufferError {
     BufferError::new(BufferErrorKind::ReceiptStore, error.to_string())
 }
 
-fn safe_error_message(message: &str) -> String {
+/// Bounds already-sanitized sink diagnostics and removes control characters.
+#[must_use]
+pub fn safe_error_message(message: &str) -> String {
     let mut safe = String::with_capacity(message.len().min(1_024));
     for character in message.chars() {
         if safe.len() >= 1_024 {
@@ -1458,5 +1470,19 @@ fn safe_error_message(message: &str) -> String {
         "publication failed".to_owned()
     } else {
         safe
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_error_message;
+
+    #[test]
+    fn sink_diagnostics_are_bounded_control_free_and_utf8_safe() {
+        assert_eq!(safe_error_message(""), "publication failed");
+        assert_eq!(safe_error_message("outer:\ninner\tcause\u{1b}"), "outer: inner cause ");
+        assert_eq!(safe_error_message(&"é".repeat(600)), "é".repeat(512));
+        assert_eq!(safe_error_message(&"x".repeat(1_025)).len(), 1_024);
+        assert_eq!(safe_error_message("safe error chain"), "safe error chain");
     }
 }

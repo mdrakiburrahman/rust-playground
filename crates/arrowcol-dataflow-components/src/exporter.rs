@@ -784,6 +784,16 @@ impl GroupPublisher<'_> {
         }
         let outcome = result.map(|_| ());
         for mut entry in group.drain(..) {
+            if let Err(error) = &outcome {
+                tracing::warn!(
+                    table = %self.identity,
+                    receipt_id = %entry.publication_id,
+                    sink_kind = if error.permanent() { "permanent" } else { "transient" },
+                    sink_code = ?arrowcol_protocol::ErrorCode::PublicationFailed,
+                    error_message = %arrowcol_buffer::safe_error_message(&error.to_string()),
+                    "Delta publication failed"
+                );
+            }
             entry.complete(&outcome);
         }
     }
