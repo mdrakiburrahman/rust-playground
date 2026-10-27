@@ -1,6 +1,6 @@
 //! Process-level concurrency proof: a separate blind-append writer process runs
 //! while the standalone service binary applies OPTIMIZE, PURGE and VACUUM LITE.
-#![cfg(unix)]
+#![cfg(target_os = "linux")]
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use arrow::array::{Int64Array, RecordBatch, StringArray};

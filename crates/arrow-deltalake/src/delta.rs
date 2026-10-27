@@ -2044,8 +2044,10 @@ fn cleanup_failure_class(error: &anyhow::Error) -> &'static str {
 /// Completed append, including the table version.
 ///
 /// When the publication was deduplicated (its identity was already committed),
-/// `version` is the original commit and `file` describes this call's fresh stage,
-/// which is reclaimed and may no longer exist.
+/// `version` is the snapshot version at which the existing commit was observed,
+/// which may be later than the commit that originally published the identity, and
+/// `file` describes this call's fresh stage, which is reclaimed and may no longer
+/// exist.
 #[derive(Debug)]
 pub struct AppendResult {
     pub version: u64,
