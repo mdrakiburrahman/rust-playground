@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod cli;
+pub mod final_compaction;
 pub mod generator;
 pub mod initialize;
 mod kusto;

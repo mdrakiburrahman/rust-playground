@@ -25,6 +25,8 @@ pub enum Command {
     Drain(ValidateArgs),
     /// After the clean mutator drain, prove from actual SQL state that every routed publisher released.
     PublisherRelease(PublisherReleaseArgs),
+    /// Compact all local source tables after positive publisher release.
+    FinalCompaction(FinalCompactionArgs),
     /// Record bounded read-only QAP observations without changing tables or policies.
     ObserveQap(ObserveQapArgs),
     /// Initialize both Azure pools from the canonical schemas while reset is fenced.
@@ -33,6 +35,23 @@ pub enum Command {
     AzureManifest(InitializeAzureArgs),
     /// Print the exact public Flight SQL schema fixture.
     PrintSchemas,
+}
+
+/// One bounded final-compaction phase, local by default and unsupported on Azure.
+#[derive(Clone, Debug, Args)]
+pub struct FinalCompactionArgs {
+    #[arg(long, env = "LOADTEST_RESULTS", default_value = "/results")]
+    pub results: PathBuf,
+    #[arg(long, env = "LOADTEST_DIRECT_ROOT", default_value = "/delta/direct")]
+    pub direct_root: PathBuf,
+    #[arg(long, env = "LOADTEST_DATAFLOW_ROOT", default_value = "/delta/dataflow")]
+    pub dataflow_root: PathBuf,
+    /// Explicit request (Azure rejects it); local compaction is already on by default.
+    #[arg(long, conflicts_with = "skip_final_compaction")]
+    pub final_compaction: bool,
+    /// Record intentional opt-out without opening or mutating any Delta table.
+    #[arg(long)]
+    pub skip_final_compaction: bool,
 }
 
 /// Sanitized live QAP observation inputs.

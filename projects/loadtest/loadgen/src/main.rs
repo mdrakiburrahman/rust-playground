@@ -11,6 +11,7 @@ async fn main() -> Result<()> {
         Command::Validate(arguments) => validation::validate(arguments).await,
         Command::Drain(arguments) => validation::drain(arguments).await,
         Command::PublisherRelease(arguments) => arrowcol_loadgen::release::publisher_release(arguments).await,
+        Command::FinalCompaction(arguments) => arrowcol_loadgen::final_compaction::run(arguments).await,
         Command::ObserveQap(arguments) => {
             anyhow::ensure!(
                 !arguments.timeout.get().is_zero(),

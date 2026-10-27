@@ -554,6 +554,54 @@ The read-only validator, Kusto and Explorer remain available; their lifetime
 does not authorize occupancy release. Ordinary non-validation runs retain the
 live stack. Stopped-mutator receipts are not distributed registry-close proof.
 
+### Released-writer final compaction
+
+The standalone `arrowcol-loadgen final-compaction` subcommand is intended between
+the positive publisher-release gate and final validation. Lifecycle invocation
+is runner-owned. It honors `LOADTEST_RESULTS`, `LOADTEST_DIRECT_ROOT` and
+`LOADTEST_DATAFLOW_ROOT` (or `--results`, `--direct-root`, `--dataflow-root`).
+Local compaction is on by default; `--skip-final-compaction` records an explicit
+opt-out (`skipped=true`, **not** `passed=true`). Azure roots retain the existing
+skip default; explicitly requesting `--final-compaction` on Azure fails visibly.
+
+Before opening tables it requires `publisher-release.json` with `passed=true`
+and the same nonnull `run_id` as `run-metadata.json`. It then uses Kernel active
+snapshots and the core's `sealed_final` OPTIMIZE policy on exactly 13 canonical
+`telemetry/sqlserver/<table>` directories in each pool. This flag only changes
+OPTIMIZE's newest/open-partition churn protection, not retention or authority.
+No VACUUM, PURGE, checkpoint, log pruning, cache-policy reset or delta-rs mutation
+is performed.
+
+One cooperative **300-second** deadline covers preconditions, snapshots, exact
+row comparisons, planning and applying. Operations are joined; a timeout never
+abandons a mutator. Only the outer runner's process kill is a hard bound.
+Every progress pass starts with fresh dry-run plans for all 26 tables. At most
+three progress passes are allowed, with no external retry on an operation error.
+Success requires a final independent all-table empty plan, zero backlog and
+zero skipped/protected partitions. A nonreducing/no-op commit fails.
+
+Complete logical rows, including committed partition values, are canonically
+encoded using Arrow's row encoding and compared as exact multiplicity maps
+before and after (not sampled, and not only hash equality). Guards fail with
+their names: 4,096 active files and 8 MiB manifest strings per table, 256 MiB per
+input file, 128 MiB decoded row groups, 16 MiB batches, 10 million rows and
+65,536 distinct rows per table, 64 MiB retained canonical bytes per table and
+256 MiB per complete snapshot. The before/after maps can coexist; these are
+retained-data guards, not a process-RSS guarantee. Existing OPTIMIZE byte, row,
+action, layout and decode limits also remain in force. Nothing is truncated or
+replaced with a sample when a guard trips.
+
+The phase atomically publishes a new, fsynced `results/final-compaction.json`;
+it never overwrites existing evidence. The receipt includes `run_id`, `passed`,
+`skipped`, errors, actual per-pass plans/reports, before/after versions and a
+canonical-multiset digest/count per table. Its per-pool
+`pools.<pool>.validation_inventory` is exactly the validation inventory shape:
+`{tables: {<dotted identity>: {schema, version, files}}}` with decoded sorted
+relative paths. The validation owner must bind that inventory to its captured
+snapshot; the subcommand does not modify the validator. Failed operations
+retain prior commit reports and fail the command. This is row-preserving
+physical compaction, not a promise of QAP convergence time.
+
 The baseline Grafana gate is explicitly scoped to `source-sdk`: every one of
 the seven Kernel/publication families must have actual samples from **each**
 collector's OTLP resource, plus healthy live scrapes and individual source
