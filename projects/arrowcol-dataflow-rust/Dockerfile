@@ -44,6 +44,12 @@ COPY --chmod=0444 projects/arrowcol-dataflow-rust/config.quiver.yaml /etc/arrowc
 COPY --chmod=0444 projects/arrowcol-dataflow-rust/config.smoke-quiver.yaml /etc/arrowcol-dataflow-rust/config.smoke-quiver.yaml
 USER 10001:10001
 ENV AZURE_CONFIG_DIR=/var/lib/arrowcol-azure
+# Inject ARROWCOL_DELTA_ROOT and ARROWCOL_RESET_GENERATION at runtime; never bake an epoch.
+RUN az version >/dev/null \
+    && /usr/local/bin/arrowcol-dataflow-rust --help >/dev/null \
+    && find "$AZURE_CONFIG_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + \
+    && test -w "$AZURE_CONFIG_DIR" \
+    && test "$(stat -c '%a' "$AZURE_CONFIG_DIR")" = 700
 WORKDIR /onelake
 STOPSIGNAL SIGTERM
 EXPOSE 32010 32011
