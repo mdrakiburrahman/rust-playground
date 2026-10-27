@@ -2,6 +2,8 @@ export interface RangeEvidence {
   series: number;
   samples: number;
   maximum: number;
+  nan_samples?: number;
+  sparse_series?: number;
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -63,17 +65,50 @@ export function panelDiagnostics(document: unknown, request: unknown): Record<st
   };
 }
 
-/** Frames returned to the actual Grafana panel, not a separate probe query. */
-export function panelFrameEvidence(document: unknown): { frames: number; numericSamples: number } {
+/**
+ * Prometheus returns the literal value `NaN` from `histogram_quantile` for every step whose
+ * bucket rates are all zero, such as an idle drain tail. No other operations panel can
+ * produce NaN, so only these queries may opt in to treating NaN steps as absent.
+ */
+export function quantileQuery(expr: string): boolean {
+  return /\bhistogram_quantile\s*\(/u.test(expr);
+}
+
+export interface FrameEvidence {
+  frames: number;
+  numericSamples: number;
+  nanSamples?: number;
+  sparseFrames?: number;
+}
+
+/** Indexes of `null` values that Grafana marks as Prometheus NaN; any other entity is invalid. */
+function nanIndexes(entities: unknown, length: number): Set<number> {
+  if (entities === undefined || entities === null) return new Set();
+  const entity = record(entities);
+  if (!entity || Object.keys(entity).some(key => key !== 'NaN') || !Array.isArray(entity.NaN) ||
+      entity.NaN.some(index => !Number.isSafeInteger(index) || index < 0 || index >= length)) {
+    throw new Error('Grafana panel numeric field has non-NaN special values');
+  }
+  return new Set(entity.NaN as number[]);
+}
+
+/**
+ * Frames returned to the actual Grafana panel, not a separate probe query. With `allowNaN`,
+ * a frame may contain only Grafana-encoded NaN steps (`null` listed in `entities[].NaN`), but
+ * at least one frame must still carry three finite samples.
+ */
+export function panelFrameEvidence(document: unknown, allowNaN = false): FrameEvidence {
   const response = document as {
     results?: Record<string, {
       error?: unknown;
-      frames?: Array<{ schema?: { fields?: Array<{ type?: string }> }; data?: { values?: unknown[][] } }>;
+      frames?: Array<{ schema?: { fields?: Array<{ type?: string }> }; data?: { values?: unknown[][]; entities?: unknown[] } }>;
     }>;
   } | null;
   if (!response?.results || typeof response.results !== 'object') throw new Error('Grafana panel returned no datasource frames');
   let frames = 0;
   let numericSamples = 0;
+  let nanSamples = 0;
+  let sparseFrames = 0;
   for (const [resultIndex, result] of Object.values(response.results).entries()) {
     if (result.error || !Array.isArray(result.frames) || !result.frames.length) throw new Error('Grafana panel query failed or returned no frames');
     for (const [frameIndex, frame] of result.frames.entries()) {
@@ -82,21 +117,39 @@ export function panelFrameEvidence(document: unknown): { frames: number; numeric
         if (field.type !== 'number') continue;
         const values = frame.data?.values?.[index];
         if (!Array.isArray(values)) throw new Error('Grafana panel numeric field has no values');
-        samples += values.filter(value => typeof value === 'number' && Number.isFinite(value)).length;
+        if (!allowNaN) {
+          samples += values.filter(value => typeof value === 'number' && Number.isFinite(value)).length;
+          continue;
+        }
+        const nan = nanIndexes(frame.data?.entities?.[index], values.length);
+        for (const [position, value] of values.entries()) {
+          if (typeof value === 'number' && Number.isFinite(value) && value >= 0 && !nan.has(position)) samples++;
+          else if (value === null && nan.has(position)) nanSamples++;
+          else throw new Error(`Grafana panel has an invalid numeric sample (result ${resultIndex}, frame ${frameIndex})`);
+        }
       }
       if (samples < 3) {
-        throw new Error(`Grafana panel did not receive three actual numeric samples (result ${resultIndex}, frame ${frameIndex}, samples ${samples})`);
+        if (!allowNaN) {
+          throw new Error(`Grafana panel did not receive three actual numeric samples (result ${resultIndex}, frame ${frameIndex}, samples ${samples})`);
+        }
+        sparseFrames++;
       }
       frames++;
       numericSamples += samples;
     }
   }
   if (frames === 0) throw new Error('Grafana panel returned no datasource frames');
-  return { frames, numericSamples };
+  if (!allowNaN) return { frames, numericSamples };
+  if (sparseFrames === frames) throw new Error('Grafana panel has no frame with three finite samples');
+  return { frames, numericSamples, nanSamples, sparseFrames };
 }
 
-/** Missing, malformed and all-zero data are not proof of working telemetry. */
-export function metricRangeEvidence(document: unknown, minimumSamples = 3, allowZero = false): RangeEvidence {
+/**
+ * Missing, malformed and all-zero data are not proof of working telemetry. With `allowNaN`
+ * (quantile panels only), exact Prometheus `NaN` steps are counted and skipped, but at least
+ * one series must still have `minimumSamples` finite non-negative samples.
+ */
+export function metricRangeEvidence(document: unknown, minimumSamples = 3, allowZero = false, allowNaN = false): RangeEvidence {
   if (!Number.isInteger(minimumSamples) || minimumSamples < 3) throw new Error('At least three metric samples are required');
   const response = document as {
     status?: unknown;
@@ -105,21 +158,35 @@ export function metricRangeEvidence(document: unknown, minimumSamples = 3, allow
   if (response?.status !== 'success' || response.data?.resultType !== 'matrix' || !Array.isArray(response.data.result) ||
       response.data.result.length === 0) throw new Error('Grafana datasource returned no metric range');
   let samples = 0;
+  let nanSamples = 0;
+  let sparseSeries = 0;
   let maximum = Number.NEGATIVE_INFINITY;
   for (const series of response.data.result) {
     if (!Array.isArray(series.values) || series.values.length < minimumSamples) throw new Error('Insufficient metric samples');
     let previous = Number.NEGATIVE_INFINITY;
+    let finite = 0;
+    let latest = Number.NaN;
     for (const sample of series.values) {
       if (!Array.isArray(sample) || sample.length !== 2 || !Number.isFinite(sample[0]) || sample[0] <= previous ||
-          typeof sample[1] !== 'string' || sample[1].trim() === '' || !Number.isFinite(Number(sample[1])) || Number(sample[1]) < 0) {
+          typeof sample[1] !== 'string' || sample[1].trim() === '') {
         throw new Error('Invalid or non-monotonic metric samples');
       }
       previous = sample[0];
-      maximum = Math.max(maximum, Number(sample[1]));
-      samples++;
+      if (allowNaN && sample[1] === 'NaN') {
+        nanSamples++;
+        continue;
+      }
+      if (!Number.isFinite(Number(sample[1])) || Number(sample[1]) < 0) throw new Error('Invalid or non-monotonic metric samples');
+      latest = Number(sample[1]);
+      maximum = Math.max(maximum, latest);
+      finite++;
     }
-    if (!allowZero && Number(series.values.at(-1)?.[1]) <= 0) throw new Error('Latest metric sample does not prove a healthy exercised source');
+    samples += finite;
+    if (finite < minimumSamples) sparseSeries++;
+    if (!allowZero && !(latest > 0)) throw new Error('Latest metric sample does not prove a healthy exercised source');
   }
+  if (sparseSeries === response.data.result.length) throw new Error('No metric series has enough finite samples');
   if (!allowZero && maximum <= 0) throw new Error('All-zero metrics do not prove exercised instrumentation');
-  return { series: response.data.result.length, samples, maximum };
+  const evidence: RangeEvidence = { series: response.data.result.length, samples, maximum };
+  return allowNaN ? { ...evidence, nan_samples: nanSamples, sparse_series: sparseSeries } : evidence;
 }

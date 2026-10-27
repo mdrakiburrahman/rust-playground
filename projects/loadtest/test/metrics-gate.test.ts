@@ -2,9 +2,80 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
-import { metricRangeEvidence, panelDiagnostics, panelFrameEvidence } from '../src/metrics-gate.js';
+import { metricRangeEvidence, panelDiagnostics, panelFrameEvidence, quantileQuery } from '../src/metrics-gate.js';
 
 const range = (values: Array<[number, string]>) => ({ status: 'success', data: { resultType: 'matrix', result: [{ values }] } });
+const ranges = (...series: Array<Array<[number, string]>>) =>
+  ({ status: 'success', data: { resultType: 'matrix', result: series.map(values => ({ values })) } });
+const steps = (values: string[]): Array<[number, string]> => values.map((value, index) => [100 + index * 2, value]);
+
+test('only the histogram_quantile panel opts in to Prometheus NaN steps', () => {
+  const dashboard = JSON.parse(readFileSync(new URL('../observability/delta-operations.json', import.meta.url), 'utf8'));
+  const optedIn = dashboard.panels
+    .filter((panel: { targets: Array<{ expr: string }> }) => panel.targets.some(target => quantileQuery(target.expr)))
+    .map((panel: { id: number }) => panel.id);
+  // Every other panel sums, maxes or set-filters raw series; none divides, so none can yield NaN.
+  assert.deepEqual(optedIn, [6]);
+  for (const panel of dashboard.panels) {
+    for (const target of panel.targets) assert.doesNotMatch(target.expr, /\/|\bquantile(_over_time)?\s*\(/u, `panel ${panel.id}`);
+  }
+});
+
+test('CI quantile tail: NaN steps are skipped and counted only when the query opts in', () => {
+  // Shape of the pinned-LGTM reproduction: finite p95 while busy, NaN once every bucket rate is zero.
+  const tail = range(steps([...Array(47).fill('1.925'), ...Array(33).fill('NaN')]));
+  assert.throws(() => metricRangeEvidence(tail, 3, true), /Invalid or non-monotonic/u);
+  assert.deepEqual(metricRangeEvidence(tail, 3, true, true),
+    { series: 1, samples: 47, maximum: 1.925, nan_samples: 33, sparse_series: 0 });
+});
+
+test('quantile panels need one series with three finite samples; fully idle series are recorded', () => {
+  const busy = steps(['0.5', 'NaN', '0.7', '0.9']);
+  const idle = steps(['NaN', 'NaN', 'NaN']);
+  assert.deepEqual(metricRangeEvidence(ranges(busy, idle), 3, true, true),
+    { series: 2, samples: 3, maximum: 0.9, nan_samples: 4, sparse_series: 1 });
+  assert.throws(() => metricRangeEvidence(ranges(idle, idle), 3, true, true), /enough finite samples/u);
+  // Three finite samples spread across series are not one plotted line.
+  const one = steps(['0.5', 'NaN', 'NaN']);
+  assert.throws(() => metricRangeEvidence(ranges(one, one, one), 3, true, true), /enough finite samples/u);
+  // NaN still counts toward the structural step minimum but never toward the finite minimum.
+  assert.throws(() => metricRangeEvidence(range(steps(['1', '2'])), 3, true, true), /Insufficient/u);
+});
+
+test('NaN opt-in keeps rejecting infinities, negatives, malformed values and timestamp disorder', () => {
+  for (const bad of ['+Inf', '-Inf', 'Inf', 'nan', '-1', '', ' ', 'x']) {
+    assert.throws(() => metricRangeEvidence(range(steps(['1', '2', '3', bad])), 3, true, true), /Invalid/u, bad);
+  }
+  for (const disordered of [[[1, '1'], [1, 'NaN'], [3, '2'], [4, '3']], [[1, '1'], [3, 'NaN'], [2, '2'], [4, '3']]]) {
+    assert.throws(() => metricRangeEvidence(range(disordered as Array<[number, string]>), 3, true, true), /non-monotonic/u);
+  }
+  assert.throws(() => metricRangeEvidence(range([[1, '1'], [2, '2'], [3, '3'], [4, 'NaN', 'extra'] as unknown as [number, string]]),
+    3, true, true), /Invalid/u);
+});
+
+test('Grafana NaN encoding (null listed in entities.NaN) is accepted only for opted-in quantile panels', () => {
+  const frame = (values: unknown[], entities?: unknown) => ({
+    schema: { fields: [{ type: 'time' }, { type: 'number' }] },
+    data: { values: [values.map((_, index) => index), values], ...(entities === undefined ? {} : { entities: [null, entities] }) },
+  });
+  const panel = (...frames: unknown[]) => ({ results: { A: { frames } } });
+  const busy = frame([0.5, 0.7, null, 0.9, null], { NaN: [2, 4] });
+  const idle = frame([null, null, null], { NaN: [0, 1, 2] });
+  assert.deepEqual(panelFrameEvidence(panel(busy, idle), true), { frames: 2, numericSamples: 3, nanSamples: 5, sparseFrames: 1 });
+  assert.throws(() => panelFrameEvidence(panel(busy, idle)), /frame 1, samples 0/u);
+  assert.throws(() => panelFrameEvidence(panel(idle, idle), true), /no frame with three finite samples/u);
+  for (const invalid of [
+    frame([0.5, 0.7, 0.9, null]),
+    frame([0.5, 0.7, 0.9, null], { Inf: [3] }),
+    frame([0.5, 0.7, 0.9, null], { NaN: [3], NegInf: [] }),
+    frame([0.5, 0.7, 0.9, null], { NaN: [4] }),
+    frame([0.5, 0.7, 0.9, 1], { NaN: [3] }),
+    frame([0.5, 0.7, 0.9, -1]),
+    frame([0.5, 0.7, 0.9, 'NaN']),
+  ]) {
+    assert.throws(() => panelFrameEvidence(panel(invalid), true), /Invalid|invalid|special/u);
+  }
+});
 
 test('every rendered time-series panel overrides the datasource 60s floor with the actual 2s export cadence', () => {
   const dashboard = JSON.parse(readFileSync(new URL('../observability/delta-operations.json', import.meta.url), 'utf8'));

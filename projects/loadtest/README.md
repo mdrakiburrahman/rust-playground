@@ -699,6 +699,14 @@ direct range queries. Without this override the LGTM datasource's `60s` default
 can undersample short-lived maintenance series in the actual rendered plot.
 The instant inventory table is unchanged; every returned time-series frame must
 still contain at least three actual numeric samples in the same 300-second window.
+The duration-distribution panel (`histogram_quantile`, panel 6) is the only
+query that opts in to Prometheus `NaN` steps, which it returns whenever every
+bucket rate in the window is zero, such as an idle drain tail. Its exact `NaN`
+range values and Grafana's matching `null` plus `entities[].NaN` frame values are
+counted (`nan_samples`/`nanSamples`, `sparse_series`/`sparseFrames`) and skipped,
+but at least one series and one rendered frame must still carry three finite
+non-negative samples. Infinities, negatives, malformed values and timestamp
+disorder still fail, and required metrics never accept `NaN`.
 `service-qualification` additionally requires real maintenance removals and
 physical deletion, tenant skipping/checkpoint metrics and native QAP per pool;
 bridge metrics are required only when enabled. Measured zero backlog/retries are

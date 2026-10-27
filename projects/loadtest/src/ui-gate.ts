@@ -6,7 +6,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { chromium, type Browser, type Locator, type Page } from 'playwright';
 
 import { safeKustoError } from './kusto.js';
-import { metricRangeEvidence, panelDiagnostics, panelFrameEvidence } from './metrics-gate.js';
+import { metricRangeEvidence, panelDiagnostics, panelFrameEvidence, quantileQuery } from './metrics-gate.js';
 import { requiredMetrics } from './metric-contract.js';
 
 export const kustoExplorerStartArguments = [
@@ -366,7 +366,10 @@ export async function runGrafanaGate(options: UiGateOptions): Promise<void> {
       const samples = [];
       for (const target of panel.targets) {
         if (typeof target.expr !== 'string' || !target.expr) throw new Error(`Missing panel ${id} datasource query`);
-        samples.push({ query: target.expr, ...metricRangeEvidence(await queryRange(target.expr), 3, true) });
+        samples.push({
+          query: target.expr,
+          ...metricRangeEvidence(await queryRange(target.expr), 3, true, quantileQuery(target.expr)),
+        });
       }
       const [response] = await Promise.all([
         page.waitForResponse(response => {
@@ -385,7 +388,7 @@ export async function runGrafanaGate(options: UiGateOptions): Promise<void> {
       evidence.active_panel = {
         id, http_status: response.status(), ...panelDiagnostics(responseDocument, response.request().postDataJSON()),
       };
-      const delivered = panelFrameEvidence(responseDocument);
+      const delivered = panelFrameEvidence(responseDocument, panel.targets.every(target => quantileQuery(target.expr)));
       await page.getByText(panel.title, { exact: true }).waitFor({ state: 'visible', timeout: 30_000 });
       await page.waitForFunction(() => [...document.querySelectorAll('canvas')].some(canvas => canvas.width > 100 && canvas.height > 100),
         null, { timeout: 30_000 });
