@@ -65,6 +65,14 @@ Isolated cloud runs can reconcile their own bindings with
 destroying another run's data. Absolute paths, traversal and connection-string
 injection in manifests are rejected.
 
+For tables first created by live generators, `reconcile --wait-seconds 120`
+waits only for HTTP-404 missing declared version-zero logs (maximum 600 seconds).
+No KQL runs until every declared log is valid. Exit `3` writes a single JSON
+diagnostic to stderr:
+`{"status":"not_ready","code":"DELTA_LOGS_ABSENT","retryable":true,"kql_attempted":false}`.
+Authorization, ownership, malformed logs and other failures are not readiness
+retries and exit `1`; the caller must surface them. Success exits `0`.
+
 KQL reconciliation enables exactly `ExternalTable,AutomatedFlows` managed-identity
 usages, creates or alters inferred-schema Delta external tables, and enables QAP
 with the identity's object ID. `QueryAcceleration` is not a managed-identity
