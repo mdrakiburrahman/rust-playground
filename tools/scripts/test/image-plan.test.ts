@@ -95,6 +95,40 @@ test('fails closed when a source-built publication is missing or unexpected', ()
   );
 });
 
+test('all seven loadtest images retain local build behavior with clean Git revision metadata', () => {
+  const expected = [
+    'arrowcol-rust', 'arrowcol-dataflow-rust', 'arrowcol-router-rust',
+    'kusto-explorer', 'kusto-bridge', 'arrow-tenant-stream', 'delta-maintenance',
+  ];
+  const loadtest = JSON.parse(readFileSync(join(workspace, 'projects/loadtest/project.json'), 'utf8')) as ProjectConfiguration;
+  const images = loadtest.targets?.build?.dependsOn?.filter(
+    dependency => typeof dependency === 'object' && dependency.target === 'image',
+  );
+  assert.deepEqual(images, [{ projects: expected, target: 'image' }]);
+  const projects = workspaceProjects();
+  for (const project of expected) {
+    const target = projects[project].targets?.image;
+    assert.equal(target?.executor, 'rust-playground-build:docker-build', project);
+    assert.equal(target?.cache, false, project);
+    const options = target?.options;
+    assert.equal(options?.file, '{absProjectRoot}/Dockerfile', project);
+    assert.equal(options?.context, '{absWorkspaceRoot}', project);
+    assert.equal(options?.image, `ghcr.io/mdrakiburrahman/rust-playground/${project}`, project);
+    assert.deepEqual(options?.tags, ['dev'], project);
+    assert.deepEqual(options?.platforms, ['linux/amd64'], project);
+    assert.equal(options?.output, 'load', project);
+    assert.equal(options?.manifestFile, `{absWorkspaceRoot}/target/images/${project}-load.txt`, project);
+    assert.deepEqual(options?.buildArgs, ['VCS_REF={gitSha}'], project);
+    assert.equal(options?.requireCleanWorktree, true, project);
+    const ci = target?.configurations?.['ci-verify'];
+    assert.equal(ci?.buildArgs, undefined, project);
+    assert.equal(ci?.requireCleanWorktree, undefined, project);
+    const dockerfile = readFileSync(join(workspace, projectPath(project).replace(/project\.json$/u, 'Dockerfile')), 'utf8');
+    assert.match(dockerfile, /^ARG VCS_REF=local$/mu, project);
+    assert.match(dockerfile, /org\.opencontainers\.image\.revision="\$\{VCS_REF\}"/u, project);
+  }
+});
+
 // Collector images compile the otel-arrow protobuf crates and bake read-only configuration files.
 const COLLECTOR_IMAGE_PROJECTS = [
   'otelcol-rust',

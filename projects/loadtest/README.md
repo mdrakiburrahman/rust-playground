@@ -155,13 +155,16 @@ across all 13 tables. Kusto provides live functional inspection of committed
 output. Native Delta external-table/QAP validation is the default target;
 the compatibility bridge is optional and is never Azure QAP evidence.
 
-**Each start replaces the previous loadtest. Its SQL, Hive, and Kusto volumes,
-Delta tables, and results are deleted.** Other Docker projects and workspace
-files are left alone. You do not need to choose a name or clean up an earlier
-test yourself.
+**A start replaces only a previously sealed, validated local attempt.** Its
+corpus and evidence must be verified in the private per-attempt archive before
+SQL, Hive and Kusto volumes or ephemeral tables/results can be deleted.
+Failed, interrupted, nonvalidated, Azure or unmarked legacy attempts block
+reset and retain their original data. Other Docker projects and workspace
+files are left alone.
 
 The test runs until **Ctrl+C**. Stopping the generator leaves the stack running
-so you can inspect the charts and output; the next start resets it.
+so you can inspect the charts and output; that unsealed attempt blocks the next
+start rather than allowing its evidence to be silently reset.
 
 ## Fenced Azure schema bootstrap
 
@@ -344,6 +347,60 @@ request contract. Replaying the **same publication identity** must instead be
 idempotent. Exact snapshot row multisets and stable publication IDs, rather than
 ACK counts alone, are the correctness evidence.
 
+## Per-attempt evidence custody
+
+A successful **validated local** attempt now stops its owned router only after
+the actual Grafana, native validation and Explorer gates have finished, all
+generator/helpers have returned, observer/sampler shutdown and diagnostics have
+completed, and the original source/maintenance/tenant mutators are reverified
+as cleanly stopped. The router is not kept live after qualified success.
+Other live writable mounts into the corpus are refused; read-only Kusto/bridge
+source mounts are permitted. No measurement window, query or evidence threshold
+changes.
+
+Before that attempt can be reset, its corpus (including tenant/checkpoint/WAL
+state), results/receipts/Grafana evidence, source/lockfile provenance, seven
+source-bound image identities and three selected helper executables are copied
+and content-verified under the workspace's private
+`.temp/loadtest-attempt-evidence/<attempt-uuid>/`. This path is outside **all**
+benchmark reset directories. Only the exact run's reader stderr diagnostic
+files are included from loadgen scratch; secret scratch, environment and
+credential files are never archived. The archive is private (0700 directories,
+0600 files), contains potentially sensitive diagnostics and must **not** be
+committed or uploaded wholesale as a public artifact.
+
+The seven local image targets now pass `VCS_REF={gitSha}` and require a clean
+Git worktree, matching the existing publication metadata policy. Tags, Dockerfile
+contents, build contexts and runtime behavior are unchanged. Archived OCI
+revision labels and inspected image/container IDs identify those builds, not a
+cryptographic Docker-context attestation. Git cleanliness does not cover ignored
+files that Docker includes or prove absence of source mutation during a build.
+The existing `target/images/*-load.txt` files are tag lists, not full build
+receipts or context digests.
+
+The bounded copy uses 1 MiB stream buffers, at most 100,000 inventory entries,
+16 GiB of files, a 256 MiB manifest and 300 seconds of post-attempt work. Files
+and directories are synchronized before an exclusive atomic seal is published.
+At seal time every selected original and helper identity is checked before and
+after copying. Before reset, all private archived bytes and permissions are
+reverified, and the original corpus must still be unchanged. Rebuilding an
+external helper or changing an external lockfile/diagnostic does not invalidate
+its already sealed copy; those archived bytes remain immutable.
+Symlinks and special files are refused, except for metadata about the one
+configured, stopped router upgrade socket: it is neither opened, copied nor
+deleted and is **not restorable**. Kusto's named volume/native cache is **not**
+exported or claimed to be a consistent database image; the preserved native
+evidence consists of the original validation/export receipts and source corpus.
+
+Failures, interrupted starts, nonvalidated or Azure attempts remain **unsealed**:
+their original roots are retained and the next reset refuses before any process
+signal, Docker mutation or deletion. There is no automatic failure archive or
+unsafe retry. A missing, partial, altered or stale seal likewise blocks reset;
+the original attempt and any private partial archive remain for diagnosis.
+Existing legacy roots without an attempt marker are never adopted or silently
+deleted. Consecutive required Nx E2Es therefore preserve the first qualified
+attempt synchronously before the second can reset its ephemeral runtime.
+
 ## Watch and inspect
 
 - **Grafana:** <http://localhost:3000/d/arrowcol> (`admin` / `admin`).
@@ -521,9 +578,10 @@ npx nx run loadtest:verify
 
 Its functional E2E uses 1,024-row batches while retaining all 13 schemas and all
 26 external-table assertions. It runs twice in sequence: the baseline, then
-`--quiver --crash-after 15s`. The second run resets the first, so the retained
-results are from the Quiver crash run. Ordinary `loadtest:run` defaults are
-unchanged.
+`--quiver --crash-after 15s`. The second run resets the first only after its
+validated corpus and evidence are privately sealed. The ephemeral `latest`
+results are from the Quiver crash run; both successful attempts have separate
+private archives. Ordinary `loadtest:run` workload defaults are unchanged.
 
 Inspect these files under `onelake/benchmark/latest/results/`:
 
@@ -547,8 +605,9 @@ The running emulator and native data remain available after finite runs and
 Ctrl+C. Its owned `kusto-data` volume is mounted at `/kustodata`; the persistent
 database uses `/kustodata/dbs/loadtest/{md,data}`. Only the Direct and Dataflow
 output roots are exposed at `/delta/direct` and `/delta/dataflow`, both read-only.
-The next loadtest start removes the owned volume after checking its project,
-name, and workspace identity; it does not clean up other Docker projects.
+The next loadtest start removes the owned volume only after checking its project,
+name, workspace identity and the previous attempt's verified artifact seal;
+it does not clean up other Docker projects. The seal is not a native volume backup.
 
 Override the emulator memory limit and published port when needed:
 

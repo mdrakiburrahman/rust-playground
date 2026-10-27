@@ -61,6 +61,8 @@
         "context": "{absWorkspaceRoot}",
         "image": "ghcr.io/mdrakiburrahman/rust-playground/delta-maintenance",
         "tags": ["dev"],
+        "buildArgs": ["VCS_REF={gitSha}"],
+        "requireCleanWorktree": true,
         "platforms": ["linux/amd64"],
         "output": "load",
         "manifestFile": "{absWorkspaceRoot}/target/images/delta-maintenance-load.txt"

@@ -69,6 +69,8 @@
         "context": "{absWorkspaceRoot}",
         "image": "ghcr.io/mdrakiburrahman/rust-playground/kusto-bridge",
         "tags": ["dev"],
+        "buildArgs": ["VCS_REF={gitSha}"],
+        "requireCleanWorktree": true,
         "platforms": ["linux/amd64"],
         "output": "load",
         "manifestFile": "{absWorkspaceRoot}/target/images/kusto-bridge-load.txt"

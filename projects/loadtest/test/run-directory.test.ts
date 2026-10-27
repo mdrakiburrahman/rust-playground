@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { BENCHMARK_PROJECT } from '../src/cli.js';
 import { deltaTableLocations } from '../src/main.js';
 import { acquireBenchmarkController, benchmarkDirectories, checkedBenchmarkPath, resetBenchmark, stopBenchmark } from '../src/lifecycle.js';
+import { attemptFixture } from './attempt-fixture.js';
 
 function fixture(t: { after: (callback: () => void) => void }): string {
   const workspace = mkdtempSync(path.resolve('projects/loadtest/test/.fixture-reset-'));
@@ -63,6 +64,9 @@ function mockDocker(workspace: string): { commands: string[][]; docker: (args: s
     if (args.includes('inspect')) {
       const resource = [...containers, ...volumes, ...networks].find(resource => resource.id === args.at(-1));
       assert(resource);
+      if (args.some(arg => arg.includes('"mounts"'))) {
+        return JSON.stringify({ ...resource, state: { Running: false, ExitCode: 0, OOMKilled: false }, mounts: [] });
+      }
       return JSON.stringify(resource);
     }
     if (args[0] === 'stop') return '';
@@ -156,11 +160,12 @@ test('final capture stops every mutator but keeps Kusto and live-evidence servic
   assert(partial.commands.every(args => args[0] !== 'stop'));
 });
 
-test('starting again removes old output and owned SQL, Hive and Kusto resources without an identity flag', async t => {
+test('starting again removes only already sealed output and owned SQL, Hive and Kusto resources', async t => {
   const workspace = fixture(t);
   const latest = path.join(workspace, 'onelake/benchmark/latest');
   mkdirSync(latest, { recursive: true });
   writeFileSync(path.join(latest, 'old.json'), '{}');
+  await attemptFixture(workspace).seal();
   const { docker, commands } = mockDocker(workspace);
   assert.equal(await resetBenchmark(workspace, docker), latest);
   assert(!existsSync(path.join(latest, 'old.json')));
@@ -174,6 +179,7 @@ test('starting again removes old output and owned SQL, Hive and Kusto resources 
     assert(commands.every(args => !args.includes(volume) || args.includes('inspect')));
   }
   writeFileSync(path.join(latest, 'second.json'), '{}');
+  await attemptFixture(workspace).seal();
   assert.equal(await resetBenchmark(workspace, docker), latest);
   assert(!existsSync(path.join(latest, 'second.json')));
 });
@@ -184,6 +190,7 @@ for (const owner of [undefined, '/another-workspace']) {
     const latest = path.join(workspace, 'onelake/benchmark/latest');
     mkdirSync(latest, { recursive: true });
     writeFileSync(path.join(latest, 'keep.txt'), 'keep');
+    await attemptFixture(workspace).seal();
     const { docker, commands } = mockDocker(workspace);
     await assert.rejects(resetBenchmark(workspace, args => {
       if (args[0] === 'ps') return '';
@@ -201,7 +208,7 @@ for (const owner of [undefined, '/another-workspace']) {
   });
 }
 
-test('legacy benchmark data is reset but unrelated directories survive', async t => {
+test('legacy benchmark data without an evidence marker blocks reset and unrelated directories survive', async t => {
   const workspace = fixture(t);
   const legacy = path.join(workspace, 'onelake/benchmark/previous');
   mkdirSync(path.join(legacy, 'router-state'), { recursive: true });
@@ -210,9 +217,10 @@ test('legacy benchmark data is reset but unrelated directories survive', async t
   mkdirSync(unrelated);
   writeFileSync(path.join(unrelated, 'keep.txt'), 'keep');
   assert.deepEqual(benchmarkDirectories(workspace), [legacy]);
-  const { docker } = mockDocker(workspace);
-  await resetBenchmark(workspace, docker);
-  assert(!existsSync(legacy));
+  const { docker, commands } = mockDocker(workspace);
+  await assert.rejects(resetBenchmark(workspace, docker), /reset refused/u);
+  assert(existsSync(legacy));
+  assert.deepEqual(commands, []);
   assert.equal(readFileSync(path.join(unrelated, 'keep.txt'), 'utf8'), 'keep');
 });
 
@@ -236,6 +244,7 @@ test('another workspace ownership and cleanup failures cannot silently start a n
   const latest = path.join(workspace, 'onelake/benchmark/latest');
   mkdirSync(latest, { recursive: true });
   writeFileSync(path.join(latest, 'keep.txt'), 'keep');
+  await attemptFixture(workspace).seal();
   const { docker, commands } = mockDocker('/another-workspace');
   await assert.rejects(resetBenchmark(workspace, docker), /another workspace/u);
   assert(commands.every(args => !args.includes('rm') && args[0] !== 'stop'));
