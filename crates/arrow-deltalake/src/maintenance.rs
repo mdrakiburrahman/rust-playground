@@ -1027,7 +1027,7 @@ impl DeltaTable {
     /// Remove one output that was definitively never published. An authority
     /// check precedes every table mutation; `NotFound` is success and every
     /// other failure is returned.
-    fn discard_output(&self, local: &std::path::Path, url: &Url, uploaded: bool) -> Result<()> {
+    pub(crate) fn discard_output(&self, local: &std::path::Path, url: &Url, uploaded: bool) -> Result<()> {
         if self.url.scheme() == "file" {
             self.check_publication()?;
         }

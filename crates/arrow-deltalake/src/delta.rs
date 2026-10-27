@@ -1777,6 +1777,53 @@ impl DeltaTable {
     }
 
     fn commit_files_inner(&self, files: &[StagedAppend], identity: Option<(&str, i64)>) -> Result<u64> {
+        let version = self.publish_files(files, identity)?;
+        self.reclaim_unsubmitted(files);
+        Ok(version)
+    }
+
+    /// After a successful publication call, delete staged files that no commit attempt
+    /// ever carried: their identities were already published by another delivery.
+    /// Every file that was offered to any attempt, and everything after an error, is
+    /// retained because an uncertain attempt may have published that exact path.
+    /// A cleanup failure never fails the already-successful publication; it is logged
+    /// and counted as `orphan_cleanup_failed`, and the file stays on disk.
+    fn reclaim_unsubmitted(&self, files: &[StagedAppend]) {
+        for append in files {
+            if !append.claim_reclaim() {
+                continue;
+            }
+            let reclaimed = (|| -> Result<()> {
+                let relative = append
+                    .file
+                    .path
+                    .strip_prefix(&self.root)?
+                    .to_str()
+                    .context("invalid staged path")?;
+                let url = self.staged_url(relative)?;
+                self.discard_output(&append.file.path, &url, self.url.scheme() != "file")?;
+                if self.url.scheme() == "file"
+                    && let Some(parent) = append.file.path.parent()
+                {
+                    sync_directory(parent)?;
+                }
+                Ok(())
+            })();
+            match reclaimed {
+                Ok(()) => crate::telemetry::publication_event("orphan_reclaimed"),
+                Err(error) => {
+                    crate::telemetry::publication_event("orphan_cleanup_failed");
+                    tracing::warn!(
+                        path = %append.file.path.display(),
+                        error = %format!("{error:#}"),
+                        "deduplicated staged file retained: cleanup failed"
+                    );
+                }
+            }
+        }
+    }
+
+    fn publish_files(&self, files: &[StagedAppend], identity: Option<(&str, i64)>) -> Result<u64> {
         let mut observation = crate::telemetry::PublicationObservation::start();
         let _guard = self
             .commit_lock
@@ -1828,6 +1875,12 @@ impl DeltaTable {
                 self.sync_replayed_local_state(snapshot.version())?;
                 observation.finish("deduplicated");
                 return Ok(snapshot.version());
+            }
+            // Claim before touching the file or any check that can stall, so a concurrent
+            // reclaim of the same borrowed stage either already won (refused here) or
+            // must keep it.
+            for append in &pending {
+                append.claim_submission()?;
             }
             let read_version = snapshot.version();
             let proposed_version = read_version.checked_add(1).context("Delta version overflow")?;
@@ -1974,6 +2027,44 @@ pub struct StagedAppend {
     pub(crate) stats: StructArray,
     pub(crate) publication: Option<(String, i64)>,
     pub(crate) ingested_at_ms: Option<i64>,
+    /// `STAGE_FRESH`, then exactly one irreversible claim: `STAGE_SUBMITTED` before the
+    /// file is offered to any commit attempt, or `STAGE_RECLAIMED` before it is deleted.
+    /// A fresh file cannot be named by a published or uncertain Delta action: its path
+    /// is a fresh UUID created exclusively by `stage`, and this type is never cloned.
+    /// The compare-exchange makes deletion and submission mutually exclusive even when
+    /// the same staged file is borrowed by concurrent commit calls.
+    stage_state: std::sync::atomic::AtomicU8,
+}
+
+const STAGE_FRESH: u8 = 0;
+const STAGE_SUBMITTED: u8 = 1;
+const STAGE_RECLAIMED: u8 = 2;
+
+impl StagedAppend {
+    /// Claim this file for a commit attempt. Refuses a file already reclaimed.
+    fn claim_submission(&self) -> Result<()> {
+        match self.stage_state.compare_exchange(
+            STAGE_FRESH,
+            STAGE_SUBMITTED,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        ) {
+            Ok(_) | Err(STAGE_SUBMITTED) => Ok(()),
+            Err(_) => bail!("staged file was reclaimed after its publication was deduplicated; it cannot be committed"),
+        }
+    }
+
+    /// Claim a never-submitted file for deletion. False keeps the file.
+    fn claim_reclaim(&self) -> bool {
+        self.stage_state
+            .compare_exchange(
+                STAGE_FRESH,
+                STAGE_RECLAIMED,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+    }
 }
 
 /// Return a batch whose Arrow memory charge is the memory the sort buffer actually retains.
@@ -2172,6 +2263,7 @@ impl DeltaFileWriter {
             stats,
             publication: self.publication,
             ingested_at_ms: self.ingested_at_ms,
+            stage_state: std::sync::atomic::AtomicU8::new(STAGE_FRESH),
         })
     }
 

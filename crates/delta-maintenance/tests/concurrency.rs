@@ -10,7 +10,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use url::Url;
@@ -33,7 +33,68 @@ const WRITER: [i64; 4] = [16, 17, 18, 19];
 const LATEST: [i64; 2] = [18, 19];
 const PURGE_RETENTION_SECS: &str = "1590";
 
+/// Hard deadline for the driver; every child wait is bounded by it.
+const DRIVER_DEADLINE: Duration = Duration::from_secs(300);
+/// The outer process allows the driver its deadline plus time to start and reap.
+const OUTER_DEADLINE: Duration = Duration::from_secs(360);
+
 type Row = (i64, String);
+
+/// A spawned child owned by this test: dropping it without a successful wait kills
+/// and reaps that exact process, so a failed assertion never leaves it running
+/// while the temporary root is removed.
+struct OwnedChild {
+    child: Child,
+    reaped: bool,
+}
+
+impl OwnedChild {
+    fn spawn(command: &mut Command) -> Result<Self> {
+        Ok(Self {
+            child: command.spawn()?,
+            reaped: false,
+        })
+    }
+
+    fn running(&mut self) -> Result<bool> {
+        match self.child.try_wait()? {
+            Some(_) => {
+                self.reaped = true;
+                Ok(false)
+            }
+            None => Ok(true),
+        }
+    }
+
+    /// Poll until exit or `deadline`; on timeout kill and reap, then fail.
+    fn wait_until(&mut self, deadline: Instant, what: &str) -> Result<ExitStatus> {
+        loop {
+            if let Some(status) = self.child.try_wait()? {
+                self.reaped = true;
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                self.kill_and_reap();
+                bail!("{what} (pid {}) exceeded its deadline and was killed", self.child.id());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn kill_and_reap(&mut self) {
+        if !self.reaped {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            self.reaped = true;
+        }
+    }
+}
+
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        self.kill_and_reap();
+    }
+}
 
 fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -108,7 +169,7 @@ fn writer(root: &Path, base: i64) -> Result<()> {
     Ok(())
 }
 
-fn service(root: &Path, operations: &[&str]) -> Result<Vec<serde_json::Value>> {
+fn service(root: &Path, operations: &[&str], deadline: Instant) -> Result<Vec<serde_json::Value>> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_delta-maintenance"));
     command.env_remove("OTEL_EXPORTER_OTLP_ENDPOINT").args([
         "--root",
@@ -130,22 +191,28 @@ fn service(root: &Path, operations: &[&str]) -> Result<Vec<serde_json::Value>> {
     for operation in operations {
         command.args(["--operation", operation]);
     }
-    let output = command.output()?;
-    let reports = std::str::from_utf8(&output.stdout)?
+    // Files, not pipes: a child blocked on a full pipe could never reach the deadline.
+    let stdout_path = root.join("service.stdout");
+    let stderr_path = root.join("service.stderr");
+    command
+        .stdin(Stdio::null())
+        .stdout(fs::File::create(&stdout_path)?)
+        .stderr(fs::File::create(&stderr_path)?);
+    let status = OwnedChild::spawn(&mut command)?.wait_until(deadline, "service")?;
+    let stdout = fs::read(&stdout_path)?;
+    let stderr = fs::read(&stderr_path)?;
+    let reports = std::str::from_utf8(&stdout)?
         .lines()
         .map(|line| Ok(serde_json::from_str::<serde_json::Value>(line)?))
         .collect::<Result<Vec<_>>>()?;
     ensure!(
         reports.len() == operations.len(),
         "service exit {:?}: {}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stderr)
+        status.code(),
+        String::from_utf8_lossy(&stderr)
     );
     let failed = reports.iter().any(|report| !report["error_kind"].is_null());
-    ensure!(
-        output.status.success() != failed,
-        "exit status must reflect report errors"
-    );
+    ensure!(status.success() != failed, "exit status must reflect report errors");
     Ok(reports)
 }
 
@@ -223,6 +290,7 @@ fn rows(root: &Path, files: &BTreeMap<String, String>) -> Result<Vec<Row>> {
 fn driver(root: &Path) -> Result<()> {
     let base = (now_ms()? / MINUTE) * MINUTE - 30 * MINUTE;
     let started = Instant::now();
+    let deadline = started + DRIVER_DEADLINE;
     fs::create_dir_all(table_dir(root))?;
     let table = open(root)?;
     let mut expected = Vec::new();
@@ -242,15 +310,17 @@ fn driver(root: &Path) -> Result<()> {
     }
     expected.sort();
 
-    let mut child = Command::new(std::env::current_exe()?)
-        .args([TEST, "--exact", "--nocapture", "--test-threads=1"])
-        .env(ROLE, "writer")
-        .env(ROOT, root)
-        .env(BASE, base.to_string())
-        .spawn()?;
+    let mut child = OwnedChild::spawn(
+        Command::new(std::env::current_exe()?)
+            .args([TEST, "--exact", "--nocapture", "--test-threads=1"])
+            .env(ROLE, "writer")
+            .env(ROOT, root)
+            .env(BASE, base.to_string()),
+    )?;
+    let start_deadline = (started + Duration::from_secs(120)).min(deadline);
     while !root.join("writer-started").exists() {
-        if started.elapsed() > Duration::from_secs(120) {
-            child.kill()?;
+        if Instant::now() >= start_deadline || !child.running()? {
+            child.kill_and_reap();
             bail!("writer never started");
         }
         std::thread::sleep(Duration::from_millis(5));
@@ -261,7 +331,7 @@ fn driver(root: &Path) -> Result<()> {
     let mut collisions = 0_u64;
     let mut concurrent_cycles = 0;
     for _ in 0..CYCLES {
-        for report in service(root, &operations)? {
+        for report in service(root, &operations, deadline)? {
             let label = match report["error_kind"].as_str() {
                 Some(kind) => {
                     ensure!(
@@ -283,12 +353,12 @@ fn driver(root: &Path) -> Result<()> {
             };
             *outcomes.entry(label).or_default() += 1;
         }
-        if child.try_wait()?.is_none() {
+        if child.running()? {
             concurrent_cycles += 1;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    ensure!(child.wait()?.success(), "writer process failed");
+    ensure!(child.wait_until(deadline, "writer")?.success(), "writer process failed");
     ensure!(concurrent_cycles > 0, "no service cycle overlapped the writer");
     ensure!(
         max_attempts <= u64::from(MAX_COMMIT_ATTEMPTS),
@@ -296,14 +366,14 @@ fn driver(root: &Path) -> Result<()> {
     );
 
     std::thread::sleep(Duration::from_millis(20));
-    for report in service(root, &operations)? {
+    for report in service(root, &operations, deadline)? {
         ensure!(report["error_kind"].is_null(), "quiescent apply failed: {report}");
     }
     std::thread::sleep(Duration::from_millis(20));
-    let settled = service(root, &["vacuum"])?;
+    let settled = service(root, &["vacuum"], deadline)?;
     ensure!(settled[0]["error_kind"].is_null(), "{}", settled[0]);
     let version = log_actions(root)?.last().map(|(version, _)| *version);
-    for report in service(root, &operations)? {
+    for report in service(root, &operations, deadline)? {
         let inner = &report["report"];
         // VACUUM LITE never commits; its repeat must find nothing left to delete.
         let idle = if report["operation"] == "vacuum" {
@@ -324,44 +394,10 @@ fn driver(root: &Path) -> Result<()> {
     physical_parquet(&table_dir(root), &table_dir(root), &mut physical)?;
     let active_paths: BTreeSet<String> = files.keys().map(|path| decode(path)).collect();
     ensure!(active_paths.is_subset(&physical), "active Add missing on disk");
-    // Each new-delivery replay stages its own file; on a deduplicated commit that file
-    // stays unreferenced (kept because unknown-success retries may reuse staged paths),
-    // and log-only VACUUM LITE never collects it. Model the orphans exactly.
-    let mentioned: BTreeSet<String> = actions
-        .iter()
-        .filter_map(|(_, action)| action.get("add").or_else(|| action.get("remove")))
-        .filter_map(|file| file["path"].as_str().map(decode))
-        .collect();
-    let orphans: BTreeMap<String, String> = physical
-        .difference(&active_paths)
-        .map(|path| {
-            let value = path
-                .split('/')
-                .next()
-                .and_then(|dir| dir.strip_prefix(&format!("{INGESTION_PARTITION}=")))
-                .context("orphan partition")?;
-            Ok((path.clone(), value.to_owned()))
-        })
-        .collect::<Result<_>>()?;
-    ensure!(
-        orphans.keys().all(|path| !mentioned.contains(path)),
-        "a logged file survived outside the active set"
-    );
-    ensure!(
-        orphans.len() == usize::try_from(PUBLICATIONS)?,
-        "expected one orphan per deduplicated replay, found {}",
-        orphans.len()
-    );
-    let mut replayed: Vec<Row> = Vec::new();
-    for index in 0..PUBLICATIONS {
-        let value = partition(base, writer_offset(index))?;
-        replayed.extend(writer_ids(index).into_iter().map(|id| (id, value.clone())));
-    }
-    replayed.sort();
-    ensure!(
-        rows(root, &orphans)? == replayed,
-        "orphans must be exactly the replayed rows"
-    );
+    // Each replay stages its own file; a deduplicated new delivery reclaims it, so
+    // no Parquet file may exist outside the active set.
+    let orphans: BTreeSet<&String> = physical.difference(&active_paths).collect();
+    ensure!(orphans.is_empty(), "unreferenced Parquet files remain: {orphans:?}");
     ensure!(rows(root, &files)? == expected, "row multiset changed");
 
     let latest: BTreeSet<String> = LATEST
@@ -402,10 +438,7 @@ fn driver(root: &Path) -> Result<()> {
         txns.len() == usize::try_from(PUBLICATIONS)? && txns.values().all(|count| *count == 1),
         "each writer publication commits exactly once: {txns:?}"
     );
-    ensure!(
-        started.elapsed() < Duration::from_secs(300),
-        "run exceeded the partition model window"
-    );
+    ensure!(Instant::now() < deadline, "run exceeded the partition model window");
     println!(
         "concurrency proof: cycles={CYCLES} overlapping={concurrent_cycles} publications={PUBLICATIONS} \
          max_attempts={max_attempts} collisions={collisions} outcomes={outcomes:?} rows={} files={} replay_orphans={}",
@@ -425,8 +458,9 @@ fn driver(root: &Path) -> Result<()> {
 /// `MAX_COMMIT_ATTEMPTS`; OPTIMIZE touches only the latest 2 sealed partitions and
 /// PURGE only expired ones; the final row multiset equals retained seed rows plus
 /// all writer rows; every active Add exists on disk and the only other Parquet files
-/// are the 24 never-logged replay stagings (known limitation); the repeat is a no-op
-/// with no new version.
+/// are none: deduplicated replay stagings are reclaimed; the repeat is a no-op with no
+/// new version. Every child process is owned, waited with a finite deadline, and
+/// killed and reaped on failure.
 #[test]
 fn separate_writer_process_with_service_optimize_purge_vacuum() -> Result<()> {
     match std::env::var(ROLE).as_deref() {
@@ -437,12 +471,14 @@ fn separate_writer_process_with_service_optimize_purge_vacuum() -> Result<()> {
         Ok("driver") => driver(&PathBuf::from(std::env::var(ROOT)?)),
         _ => {
             let root = tempfile::tempdir()?;
-            let status = Command::new(std::env::current_exe()?)
-                .args([TEST, "--exact", "--nocapture", "--test-threads=1"])
-                .env(ROLE, "driver")
-                .env(ROOT, root.path())
-                .env("ARROWCOL_PARTITION_GRANULARITY", "minute")
-                .status()?;
+            let mut driver = OwnedChild::spawn(
+                Command::new(std::env::current_exe()?)
+                    .args([TEST, "--exact", "--nocapture", "--test-threads=1"])
+                    .env(ROLE, "driver")
+                    .env(ROOT, root.path())
+                    .env("ARROWCOL_PARTITION_GRANULARITY", "minute"),
+            )?;
+            let status = driver.wait_until(Instant::now() + OUTER_DEADLINE, "driver")?;
             ensure!(status.success(), "driver failed");
             Ok(())
         }
