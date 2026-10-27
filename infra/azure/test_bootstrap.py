@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 import uuid
@@ -384,7 +385,7 @@ class OccupancyTests(unittest.TestCase):
         self.assertNotIn(("cli", "post"), azure.events)
         self.assertEqual(azure.metadata["occupancy"], "testing")
 
-    def test_unknown_arm_stop_outcome_keeps_hold_and_rerun_resumes(self):
+    def test_unknown_arm_stop_outcome_keeps_blocking_hold_without_replay(self):
         azure = FakeAzure()
         with patch.object(azure, "cli", side_effect=b.Failure("ARM timeout")):
             with self.assertRaises(b.Failure):
@@ -396,8 +397,41 @@ class OccupancyTests(unittest.TestCase):
                 b.occupancy(azure, "occupy" if candidate != holder else "release", candidate)
         with self.assertRaises(b.Failure):
             b.require_released(azure.metadata)
+        azure.events.clear()
+        with self.assertRaisesRegex(b.Failure, "ambiguous"):
+            self.stop(azure)
+        self.assertNotIn(("cli", "post"), azure.events)
+        self.assertEqual(azure.metadata["occupancy"], "stopping")
+        self.assertEqual(azure.metadata["occupancyid"], holder)
+
+    def test_unknown_stop_wait_keeps_hold(self):
+        azure = FakeAzure()
+        with patch.object(azure, "cli", return_value=None), \
+                patch.object(b, "retry_ready", side_effect=b.Failure("timeout")):
+            with self.assertRaises(b.Failure):
+                b.stop_cluster(azure)
+        self.assertEqual(azure.metadata["occupancy"], "stopping")
+
+    def test_definite_hold_cas_conflict_writes_nothing_and_stays_retryable(self):
+        azure = FakeAzure()
+        with patch.object(azure, "set_control", side_effect=b.ControlConflict("busy")):
+            with self.assertRaises(b.Failure):
+                self.stop(azure)
+        self.assertNotIn(("cli", "post"), azure.events)
+        self.assertEqual(azure.metadata.get("occupancy", "released"), "released")
         self.stop(azure)
         self.assertEqual(azure.metadata["occupancy"], "released")
+
+    def test_cli_timeout_kills_process_group_and_reports_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "child-survived"
+            script = f"(sleep 2; touch {marker}) & sleep 30"
+            started = time.monotonic()
+            with self.assertRaisesRegex(b.Failure, "outcome unknown"):
+                b.run_tree(["bash", "-c", script], 0.5)
+            self.assertLess(time.monotonic() - started, 10)
+            time.sleep(2.5)
+            self.assertFalse(marker.exists())
     def test_fenced_sandbox_cannot_be_occupied(self):
         azure = FakeAzure()
         azure.metadata["resetstate"] = "fenced"
