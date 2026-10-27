@@ -28,6 +28,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 const SANDBOX: &str = "0123456789ab";
 const ACCOUNT: &str = "acct";
@@ -420,21 +421,84 @@ fn repository() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..")
 }
 
+const PARENT_DEADLINE: Duration = Duration::from_secs(120);
+const REAP_DEADLINE: Duration = Duration::from_secs(5);
+
+enum Bounded {
+    Finished(std::process::ExitStatus, Vec<u8>, Vec<u8>),
+    TimedOut(u32),
+}
+
+/// Runs an owned child with output in private files under `dir` (no pipe waits), an absolute
+/// `deadline`, and on expiry a kill followed by a checked reap within [`REAP_DEADLINE`].
+fn run_bounded(mut command: std::process::Command, dir: &Path, deadline: Duration) -> Result<Bounded> {
+    let id = uuid::Uuid::new_v4();
+    let (out, err) = (dir.join(format!("child-{id}.out")), dir.join(format!("child-{id}.err")));
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::fs::File::create(&out)?)
+        .stderr(std::fs::File::create(&err)?)
+        .spawn()
+        .context("spawn bounded child")?;
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Bounded::Finished(status, std::fs::read(&out)?, std::fs::read(&err)?));
+        }
+        if started.elapsed() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let pid = child.id();
+    let _ = child.kill();
+    let killed = Instant::now();
+    while child.try_wait()?.is_none() {
+        anyhow::ensure!(
+            killed.elapsed() < REAP_DEADLINE,
+            "child {pid} was not reaped after kill"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(Bounded::TimedOut(pid))
+}
+
 /// Runs the test-only Python driver of the real `bootstrap.py` parent and parses its JSON.
-fn parent(arguments: &[&std::ffi::OsStr]) -> Result<serde_json::Value> {
-    let output = std::process::Command::new("python3")
+fn parent(dir: &Path, arguments: &[&std::ffi::OsStr]) -> Result<serde_json::Value> {
+    let mut command = std::process::Command::new("python3");
+    command
         .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/parent_chain.py"))
         .args(arguments)
         .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .output()
-        .context("python3 is required for the parent chain proof")?;
-    anyhow::ensure!(
-        output.status.success(),
-        "parent driver failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    Ok(serde_json::from_slice(&output.stdout)?)
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default());
+    match run_bounded(command, dir, PARENT_DEADLINE)? {
+        Bounded::Finished(status, stdout, stderr) => {
+            anyhow::ensure!(
+                status.success(),
+                "parent driver failed: {}",
+                String::from_utf8_lossy(&stderr)
+            );
+            Ok(serde_json::from_slice(&stdout)?)
+        }
+        Bounded::TimedOut(pid) => anyhow::bail!("parent driver {pid} exceeded its deadline; killed and reaped"),
+    }
+}
+
+/// Guarantees: a hanging child is killed at the deadline and reaped (its PID no longer exists),
+/// and the caller gets a failure well before the child would have exited.
+#[cfg(target_os = "linux")]
+#[test]
+fn hanging_child_is_killed_and_reaped_at_deadline() -> Result<()> {
+    let scratch = Scratch::new()?;
+    let mut command = std::process::Command::new("sleep");
+    command.arg("60");
+    let started = Instant::now();
+    let Bounded::TimedOut(pid) = run_bounded(command, &scratch.0, Duration::from_millis(300))? else {
+        anyhow::bail!("sleep 60 finished inside a 300ms deadline");
+    };
+    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    assert!(!Path::new(&format!("/proc/{pid}")).exists(), "child {pid} not reaped");
+    Ok(())
 }
 
 /// Guarantees: the environment the real Python parent composes for the child satisfies every
@@ -460,12 +524,15 @@ async fn parent_child_env_cli_body_and_parent_validation_compose() -> Result<()>
             "ARROWCOL_AZURE_TABLE_ROOT": ROOT,
         }))?,
     )?;
-    let child: BTreeMap<String, String> = serde_json::from_value(parent(&[
-        "child-env".as_ref(),
-        values.as_os_str(),
-        scratch.manifest().as_os_str(),
-        GENERATION.as_ref(),
-    ])?)?;
+    let child: BTreeMap<String, String> = serde_json::from_value(parent(
+        &scratch.0,
+        &[
+            "child-env".as_ref(),
+            values.as_os_str(),
+            scratch.manifest().as_os_str(),
+            GENERATION.as_ref(),
+        ],
+    )?)?;
 
     let script = std::fs::read_to_string(repository().join("infra/azure/initialize-delta.sh"))?;
     let required: Vec<&str> = script
@@ -516,12 +583,15 @@ async fn parent_child_env_cli_body_and_parent_validation_compose() -> Result<()>
     assert_eq!(logs(&scratch.data())?.len(), TABLES);
 
     let reconcile = || {
-        parent(&[
-            "reconcile".as_ref(),
-            values.as_os_str(),
-            scratch.manifest().as_os_str(),
-            scratch.data().as_os_str(),
-        ])
+        parent(
+            &scratch.0,
+            &[
+                "reconcile".as_ref(),
+                values.as_os_str(),
+                scratch.manifest().as_os_str(),
+                scratch.data().as_os_str(),
+            ],
+        )
     };
     let accepted = reconcile()?;
     assert_eq!(accepted["outcome"], "stopped-before-kusto", "{accepted}");
