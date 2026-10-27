@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type RequestListener } from 'node:http';
 import path from 'node:path';
@@ -13,12 +12,12 @@ import {
   benchmarkCoreServices, LOADGEN_PHASE_TIMEOUT_MS, loadgenSpawnPlan, localLoadgenEnvironment, VALIDATE_RESERVE_MS,
   type BenchmarkNetwork,
 } from '../src/main.js';
+import { fixtureDirectory } from './fixture-directory.js';
 
 const ready = { Tables: [{ Columns: [{ ColumnName: 'NodeId', ColumnType: 'string' }], Rows: [['local-node']] }] };
 
 function fixture(t: TestContext): string {
-  const directory = path.resolve(`projects/loadtest/test/.fixture-kusto-${randomUUID()}`);
-  mkdirSync(directory);
+  const directory = fixtureDirectory('kusto-');
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   return directory;
 }

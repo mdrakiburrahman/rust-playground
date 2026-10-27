@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
-import { linkSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { linkSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
 import { physicalInventory } from '../src/stress-storage.js';
+import { fixtureDirectory } from './fixture-directory.js';
 
 test('physical accounting includes JSON/checkpoints/WAL/staging/orphans and deduplicates hard links', async t => {
-  const root = mkdtempSync(path.resolve('projects/loadtest/test/.fixture-physical-'));
+  const root = fixtureDirectory('physical-');
   t.after(() => rmSync(root, { recursive: true, force: true }));
   for (const directory of ['_delta_log', 'quiver', 'staging']) mkdirSync(path.join(root, directory));
   const files = {

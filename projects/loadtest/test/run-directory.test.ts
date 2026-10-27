@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -11,9 +11,10 @@ import { BENCHMARK_PROJECT } from '../src/cli.js';
 import { deltaTableLocations } from '../src/main.js';
 import { acquireBenchmarkController, benchmarkDirectories, checkedBenchmarkPath, resetBenchmark, stopBenchmark } from '../src/lifecycle.js';
 import { attemptFixture } from './attempt-fixture.js';
+import { fixtureDirectory } from './fixture-directory.js';
 
 function fixture(t: { after: (callback: () => void) => void }): string {
-  const workspace = mkdtempSync(path.resolve('projects/loadtest/test/.fixture-reset-'));
+  const workspace = fixtureDirectory('reset-');
   t.after(() => rmSync(workspace, { recursive: true, force: true }));
   return workspace;
 }

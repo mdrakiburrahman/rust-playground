@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
 
@@ -8,9 +8,10 @@ import YAML from 'yaml';
 import { helperIdentities, safeCollectorPolicies, safeComposeSettings, sha256, writeProvenance } from '../src/provenance.js';
 import { parseBenchmarkOptions } from '../src/cli.js';
 import { buildBenchmarkRuntimeConfigs } from '../src/runtime-config.js';
+import { fixtureDirectory } from './fixture-directory.js';
 
 test('helper identities bind actual selected host artifacts and mounted copies without private paths', t => {
-  const root = mkdtempSync(path.resolve('projects/loadtest/test/.fixture-helper-provenance-'));
+  const root = fixtureDirectory('helper-provenance-');
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const selected = path.join(root, 'private-source-target', 'debug');
   const stale = path.join(root, 'target', 'debug');
@@ -41,7 +42,7 @@ test('helper identities bind actual selected host artifacts and mounted copies w
 });
 
 test('stack-start provenance refuses selected helper replacement after its initial receipt', t => {
-  const root = mkdtempSync(path.resolve('projects/loadtest/test/.fixture-helper-startup-'));
+  const root = fixtureDirectory('helper-startup-');
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const selected = path.join(root, 'selected', 'debug');
   const mounted = path.join(root, 'projects/loadtest/.temp/bin/latest');

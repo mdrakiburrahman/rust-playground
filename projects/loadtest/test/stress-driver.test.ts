@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
 import { parseStressPlan, runStressDriver, stressInputBudget, type StressPlan } from '../src/stress-driver.js';
 import { parseBenchmarkOptions } from '../src/cli.js';
 import { evaluateStress } from '../src/stress-criteria.js';
+import { fixtureDirectory } from './fixture-directory.js';
 
 const plan: StressPlan = {
   version: 1, durationSeconds: 9, waveIntervalSeconds: 3, operationTimeoutSeconds: 1,
@@ -74,7 +75,7 @@ test('real runner rejects a changed declared generator before any Docker/reset c
 });
 
 function fixture(t: { after: (callback: () => void) => void }): string {
-  const directory = mkdtempSync(path.resolve('projects/loadtest/test/.fixture-stress-'));
+  const directory = fixtureDirectory('stress-');
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   return directory;
 }

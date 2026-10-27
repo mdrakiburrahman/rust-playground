@@ -36,6 +36,26 @@ preserved while credentials, private URLs/paths/identifiers, known private
 environment values, and control characters are removed, with a 1,024-character
 Unicode-safe bound. These artifacts are written before stack cleanup.
 
+## Test fixture isolation
+
+Tests that need repository ancestry allocate unique trees through
+`test/fixture-directory.ts` under the already ignored `.temp/test-fixtures/`.
+Each test removes only its own tree. Tests without ancestry requirements may
+use OS temporary directories; Unix socket fixtures keep their short OS paths.
+Do not create transient files under the test source directory: image tasks
+check the entire worktree, including untracked files, while tests run.
+
+From a clean checkout, run the loadtest tests with the regression monitor:
+
+```bash
+npx --no-install tsx projects/loadtest/test/check-fixture-isolation.ts -- npx nx run loadtest:test
+```
+
+The monitor checks `git status --porcelain=v1 --untracked-files=all` before,
+throughout, and after the command, and fails on any observed change or test
+failure. The fixture allocator regression also verifies that live fixture
+files are ignored and both repository lockfiles remain reachable.
+
 ## Fixed-window local functional rehearsal
 
 `--validate --stress-plan <file>` runs real OPTIMIZE, checkpoint, and VACUUM LITE

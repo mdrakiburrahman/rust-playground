@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import path from 'node:path';
 import { test } from 'node:test';
 
 import { parseCounters, parseMetrics, parseResources, parseStatus, resourceScript, runResourceSampler, startResourceSampler } from '../src/resource-sampler.js';
 import { BENCHMARK_PROJECT } from '../src/cli.js';
+import { fixtureDirectory } from './fixture-directory.js';
 
 const status = 'Pid:\t1\nVmRSS:\t2048 kB\nRssAnon:\t1024 kB\nThreads:\t7\n';
 const resources = `\n__status__\n${status}\n__current__\n4096\n\n__stat__\nanon 2048\ninactive_file 1024\n\n__cpu__\nusage_usec 9000\nuser_usec 7000\nsystem_usec 2000\n\n__events__\noom 2\noom_kill 1\n`;
@@ -74,7 +75,7 @@ cat() {
 });
 
 function fixture(t: { after: (callback: () => void) => void }): string {
-  const directory = mkdtempSync(path.resolve('projects/loadtest/test/.fixture-sampler-'));
+  const directory = fixtureDirectory('sampler-');
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   return directory;
 }

@@ -10,9 +10,10 @@ import { test } from 'node:test';
 import { beginAttemptEvidence, requireSealedAttemptEvidence, sealAttemptEvidence } from '../src/attempt-evidence.js';
 import { resetBenchmark } from '../src/lifecycle.js';
 import { attemptFixture } from './attempt-fixture.js';
+import { fixtureDirectory } from './fixture-directory.js';
 
 function fixture(t: { after: (callback: () => void) => void }, shortSocketPath = false) {
-  const workspace = mkdtempSync(shortSocketPath ? path.join(tmpdir(), 'a48-') : path.resolve('projects/loadtest/test/.fixture-evidence-'));
+  const workspace = shortSocketPath ? mkdtempSync(path.join(tmpdir(), 'a48-')) : fixtureDirectory('evidence-');
   t.after(() => rmSync(workspace, { recursive: true, force: true }));
   return { workspace, ...attemptFixture(workspace) };
 }

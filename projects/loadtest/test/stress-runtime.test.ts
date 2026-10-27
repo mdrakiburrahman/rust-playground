@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
 import { LocalStressRuntime } from '../src/stress-runtime.js';
 
 for (const foreign of [true, false]) {
   test(`failed launcher ${foreign ? 'never stops a foreign' : 'stops only its positively owned'} maintenance container`, async t => {
-    const owned = mkdtempSync(path.resolve('projects/loadtest/test/.fixture-stress-runtime-'));
+    const owned = fixtureDirectory('stress-runtime-');
     t.after(() => rmSync(owned, { recursive: true, force: true }));
     const directory = path.join(owned, 'benchmark');
     mkdirSync(directory);
@@ -22,6 +22,7 @@ console.log(JSON.stringify(process.argv[2] === 'summarize'
     const id = 'a'.repeat(64);
     writeFileSync(path.join(directory, 'docker'), `#!${process.execPath}
 import {appendFileSync, readFileSync, writeFileSync} from 'node:fs';
+import { fixtureDirectory } from './fixture-directory.js';
 const args = process.argv.slice(2);
 const log = ${JSON.stringify(log)}, state = ${JSON.stringify(state)};
 appendFileSync(log, JSON.stringify(args) + '\\n');

@@ -1,14 +1,15 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { test, type TestContext } from 'node:test';
 
 import { BENCHMARK_PROJECT } from '../src/cli.js';
 import { admitPublisherRelease, sqlIdentity } from '../src/publisher-release.js';
+import { fixtureDirectory } from './fixture-directory.js';
 
 function fixture(t: TestContext) {
-  const workspace = mkdtempSync(path.resolve('projects/loadtest/test/.fixture-release-'));
+  const workspace = fixtureDirectory('release-');
   t.after(() => rmSync(workspace, { recursive: true, force: true }));
   const directory = path.join(workspace, 'projects/loadtest/.temp/benchmark/latest');
   const results = path.join(directory, 'results');
