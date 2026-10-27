@@ -328,26 +328,80 @@ pub fn sample_rows(directory: &Path, identity: &str, summary: &TableSummary) -> 
 pub fn sample_corpus(directory: &Path, identity: &str, summary: &TableSummary) -> Result<ValidationCorpus> {
     let root = table_root(directory, identity)?;
     let mut builder = CorpusBuilder::new(summary)?;
-    // Batches bound decoded rows held in memory; rows still reach the builder in file order.
-    for batch in summary.files.chunks(decode_workers().saturating_mul(2)) {
-        let decoded = decode_in_order(batch, |file| -> Result<Vec<(Value, String, String)>> {
-            let path = local_active_file(&root, root.join(&file.path).to_str().context("non-UTF8 data path")?)?;
-            let reader = SerializedFileReader::new(File::open(path)?)?;
-            let mut rows = Vec::new();
-            for row in reader.get_row_iter(None)? {
-                let value = with_partitions(row_value(&row?), &summary.schema, &file.partition_values)?;
-                let (encoded, digest) = corpus::encode_row(&value)?;
-                rows.push((value, encoded, digest));
+    decode_batches(
+        &summary.files,
+        |file| {
+            local_active_file(&root, root.join(&file.path).to_str().context("non-UTF8 data path")?)
+                .and_then(|path| aggregate_corpus_file(&path, &summary.schema, &file.partition_values))
+        },
+        |file, aggregate| {
+            let aggregate = aggregate?;
+            for row in aggregate.distinct {
+                builder.add_counted(row.value, row.encoded, row.digest, row.count, &file.partition_values)?;
             }
-            Ok(rows)
+            aggregate.failure.map_or(Ok(()), Err)
+        },
+    )?;
+    builder.finish(summary)
+}
+
+struct CorpusRow {
+    value: Value,
+    encoded: String,
+    digest: String,
+    count: u64,
+}
+
+/// One file's distinct rows in first-occurrence order with exact multiplicities, plus the row error
+/// that ended decoding early, reported only after the preceding rows are merged.
+struct FileCorpus {
+    distinct: Vec<CorpusRow>,
+    rows_read: u64,
+    failure: Option<anyhow::Error>,
+}
+
+/// Collapses duplicates while decoding so retained memory is bounded by distinct rows, not file
+/// rows. A file holds one partition, so more than [`MAX_CHUNK_DISTINCT_ROWS`] distinct rows always
+/// fails the builder's partition guard: decoding stops at that row instead of materializing the rest.
+/// Merging rows in first-occurrence order makes every builder guard fire as in a serial row pass.
+fn aggregate_corpus_file(path: &Path, schema: &Value, partition_values: &PartitionValues) -> Result<FileCorpus> {
+    let reader = SerializedFileReader::new(File::open(path)?)?;
+    let mut index = std::collections::HashMap::<String, usize>::new();
+    let mut aggregate = FileCorpus {
+        distinct: Vec::new(),
+        rows_read: 0,
+        failure: None,
+    };
+    for row in reader.get_row_iter(None)? {
+        let decoded = row
+            .map_err(anyhow::Error::from)
+            .and_then(|row| with_partitions(row_value(&row), schema, partition_values))
+            .and_then(|value| corpus::encode_row(&value).map(|(encoded, digest)| (value, encoded, digest)));
+        let (value, encoded, digest) = match decoded {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                aggregate.failure = Some(error);
+                break;
+            }
+        };
+        aggregate.rows_read = aggregate.rows_read.checked_add(1).context("row count overflow")?;
+        if let Some(&position) = index.get(&encoded) {
+            let row = &mut aggregate.distinct[position];
+            row.count = row.count.checked_add(1).context("row multiplicity overflow")?;
+            continue;
+        }
+        index.insert(encoded.clone(), aggregate.distinct.len());
+        aggregate.distinct.push(CorpusRow {
+            value,
+            encoded,
+            digest,
+            count: 1,
         });
-        for (file, rows) in batch.iter().zip(decoded) {
-            for (value, encoded, digest) in rows? {
-                builder.add_encoded(value, encoded, digest, &file.partition_values)?;
-            }
+        if aggregate.distinct.len() > MAX_CHUNK_DISTINCT_ROWS {
+            break;
         }
     }
-    builder.finish(summary)
+    Ok(aggregate)
 }
 
 struct FileDecode {
@@ -387,6 +441,22 @@ fn summarize_file(
 
 fn decode_workers() -> usize {
     std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+}
+
+/// Decodes files in parallel batches of at most twice the worker count and hands each result to
+/// `consume` in input order before the next batch starts, so at most one batch of per-file results
+/// is retained and the first error is the one a serial pass reports.
+fn decode_batches<T: Sync, R: Send>(
+    items: &[T],
+    decode: impl Fn(&T) -> R + Sync,
+    mut consume: impl FnMut(&T, R) -> Result<()>,
+) -> Result<()> {
+    for batch in items.chunks(decode_workers().saturating_mul(2)) {
+        for (item, result) in batch.iter().zip(decode_in_order(batch, &decode)) {
+            consume(item, result)?;
+        }
+    }
+    Ok(())
 }
 
 /// Decodes independent active files on every available core and returns results in input order,
@@ -588,33 +658,37 @@ async fn summarize_roots(directory: &Path, roots: Vec<PathBuf>) -> Result<Snapsh
                 .context("active file lacks committed partition values")?;
             active.push((path, relative, partition_values));
         }
-        let decoded = decode_in_order(&active, |(path, _, partition_values)| {
-            summarize_file(path, &schema, partition_values, &partition_columns)
-        });
         let mut files = Vec::with_capacity(active.len());
         let mut rows = 0_u64;
         let mut bytes = 0_u64;
         let mut row_hashes = BTreeMap::<String, u64>::new();
         let mut payload_row_hashes = BTreeMap::<String, u64>::new();
-        for ((_, relative, partition_values), decoded) in active.into_iter().zip(decoded) {
-            let decoded = decoded?;
-            for (digest, count) in decoded.row_hashes {
-                *row_hashes.entry(digest).or_default() += count;
-            }
-            for (digest, count) in decoded.payload_row_hashes {
-                *payload_row_hashes.entry(digest).or_default() += count;
-            }
-            files.push(FileSummary {
-                path: relative,
-                bytes: decoded.bytes,
-                rows: decoded.rows,
-                partition_values: partition_values.clone(),
-            });
-            rows = rows.checked_add(decoded.rows).context("snapshot row count overflow")?;
-            bytes = bytes
-                .checked_add(decoded.bytes)
-                .context("snapshot byte count overflow")?;
-        }
+        decode_batches(
+            &active,
+            |(path, _, partition_values)| summarize_file(path, &schema, partition_values, &partition_columns),
+            |(_, relative, partition_values), decoded| {
+                let decoded = decoded?;
+                for (digest, count) in decoded.row_hashes {
+                    let total = row_hashes.entry(digest).or_default();
+                    *total = total.checked_add(count).context("row multiplicity overflow")?;
+                }
+                for (digest, count) in decoded.payload_row_hashes {
+                    let total = payload_row_hashes.entry(digest).or_default();
+                    *total = total.checked_add(count).context("row multiplicity overflow")?;
+                }
+                files.push(FileSummary {
+                    path: relative.clone(),
+                    bytes: decoded.bytes,
+                    rows: decoded.rows,
+                    partition_values: (*partition_values).clone(),
+                });
+                rows = rows.checked_add(decoded.rows).context("snapshot row count overflow")?;
+                bytes = bytes
+                    .checked_add(decoded.bytes)
+                    .context("snapshot byte count overflow")?;
+                Ok(())
+            },
+        )?;
         files.sort_by(|left, right| left.path.cmp(&right.path));
         let minimum_file_bytes = files.iter().map(|file| file.bytes).min().unwrap_or(0);
         let maximum_file_bytes = files.iter().map(|file| file.bytes).max().unwrap_or(0);
@@ -949,6 +1023,108 @@ mod tests {
         fs::write(root.join("part-007.parquet"), b"not parquet")?;
         assert!(summarize(directory.path()).await.is_err());
         assert!(sample_corpus(directory.path(), "telemetry.sqlserver.many", summary).is_err());
+        Ok(())
+    }
+
+    fn write_single_file_table(root: &Path, partition: &str, ids: Vec<i32>) -> Result<PathBuf> {
+        use arrow::{
+            array::{Int32Array, RecordBatch},
+            datatypes::{DataType, Field, Schema},
+        };
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+        fs::create_dir_all(root.join("_delta_log"))?;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let data = root.join("part.parquet");
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int32Array::from(ids))])?;
+        let mut writer = ArrowWriter::try_new(File::create(&data)?, schema, None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+        let delta_schema = json!({"type":"struct","fields":[
+            {"name":"id","type":"integer","nullable":false,"metadata":{}},
+            {"name":"__arrowcol_ingestion","type":"string","nullable":false,"metadata":{}}
+        ]});
+        let actions = [
+            json!({"protocol":{"minReaderVersion":1,"minWriterVersion":2}}),
+            json!({"metaData":{"id":"fixture-single","format":{"provider":"parquet","options":{}},
+                "schemaString":delta_schema.to_string(),"partitionColumns":["__arrowcol_ingestion"],"configuration":{}}}),
+            json!({"add":{"path":"part.parquet","partitionValues":{"__arrowcol_ingestion":partition},
+                "size":fs::metadata(&data)?.len(),"modificationTime":1,"dataChange":true}}),
+        ];
+        fs::write(
+            root.join("_delta_log/00000000000000000000.json"),
+            actions.iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n",
+        )?;
+        Ok(data)
+    }
+
+    /// Scenario: one active file holds tens of thousands of duplicate rows, and another adds a
+    /// 257th distinct row in its partition followed by many more rows.
+    /// Guarantees: corpus decoding retains only distinct rows with exact multiplicities, stops at the
+    /// first excess distinct row instead of materializing the file, and still fails the existing guard.
+    #[tokio::test]
+    async fn corpus_file_aggregation_bounds_retained_rows_and_fails_at_first_excess_distinct() -> Result<()> {
+        let directory = TestDirectory::new("corpus-bounded")?;
+        let partition = "2026-10-27-03-00";
+        let partitions = BTreeMap::from([("__arrowcol_ingestion".to_owned(), Some(partition.to_owned()))]);
+
+        let valid_root = directory.path().join("telemetry/sqlserver/valid");
+        let ids = [vec![7; 30_000], vec![8; 10_000], vec![7; 5]].concat();
+        let valid_file = write_single_file_table(&valid_root, partition, ids)?;
+        let snapshot = summarize(directory.path()).await?;
+        let summary = &snapshot.tables["telemetry.sqlserver.valid"];
+        let aggregate = aggregate_corpus_file(&valid_file, &summary.schema, &partitions)?;
+        assert!(aggregate.failure.is_none());
+        assert_eq!(aggregate.rows_read, 40_005);
+        assert_eq!(
+            aggregate
+                .distinct
+                .iter()
+                .map(|row| (row.value.clone(), row.count))
+                .collect::<Vec<_>>(),
+            [
+                (json!({"id":7,"__arrowcol_ingestion":partition}), 30_005),
+                (json!({"id":8,"__arrowcol_ingestion":partition}), 10_000),
+            ]
+        );
+        let corpus = sample_corpus(directory.path(), "telemetry.sqlserver.valid", summary)?;
+        assert_eq!(corpus.expected_rows, 40_005);
+        assert_eq!(
+            corpus
+                .chunks
+                .iter()
+                .flat_map(|chunk| chunk.rows.clone())
+                .collect::<Vec<_>>(),
+            [
+                (json!({"id":7,"__arrowcol_ingestion":partition}), 30_005),
+                (json!({"id":8,"__arrowcol_ingestion":partition}), 10_000),
+            ]
+        );
+
+        let excess_root = directory.path().join("telemetry/sqlserver/excess");
+        let ids = [vec![0; 20_000], (1..=300).collect(), vec![1; 20_000]].concat();
+        let excess_file = write_single_file_table(&excess_root, partition, ids)?;
+        let snapshot = summarize(directory.path()).await?;
+        let summary = &snapshot.tables["telemetry.sqlserver.excess"];
+        assert_eq!(summary.rows, 40_300);
+        let aggregate = aggregate_corpus_file(&excess_file, &summary.schema, &partitions)?;
+        assert!(aggregate.failure.is_none());
+        assert_eq!(aggregate.distinct.len(), MAX_CHUNK_DISTINCT_ROWS + 1);
+        assert_eq!(
+            aggregate.rows_read,
+            20_000 + 256,
+            "decoding stops at the 257th distinct row"
+        );
+        assert_eq!(aggregate.distinct[0].count, 20_000);
+        let error = sample_corpus(directory.path(), "telemetry.sqlserver.excess", summary)
+            .err()
+            .context("257 distinct rows in one partition must fail")?;
+        assert!(
+            error
+                .to_string()
+                .contains("a single partition exceeds 256 distinct rows"),
+            "{error:#}"
+        );
         Ok(())
     }
 

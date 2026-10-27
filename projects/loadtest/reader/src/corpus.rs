@@ -188,16 +188,18 @@ impl CorpusBuilder {
 
     pub(crate) fn add(&mut self, value: Value, partitions: &PartitionValues) -> Result<()> {
         let (encoded, digest) = encode_row(&value)?;
-        self.add_encoded(value, encoded, digest, partitions)
+        self.add_counted(value, encoded, digest, 1, partitions)
     }
 
-    /// Adds a row whose canonical encoding and digest were computed by [`encode_row`], letting
-    /// callers hash rows in parallel while still adding them in a deterministic order.
-    pub(crate) fn add_encoded(
+    /// Adds `count` copies of a row whose canonical encoding and digest came from [`encode_row`].
+    /// Callers that pre-aggregate a file must add its rows in first-occurrence order so the distinct
+    /// guards fire exactly as they would for a row-by-row pass.
+    pub(crate) fn add_counted(
         &mut self,
         value: Value,
         encoded: String,
         digest: String,
+        count: u64,
         partitions: &PartitionValues,
     ) -> Result<()> {
         let partition = match &self.partition_column {
@@ -209,11 +211,12 @@ impl CorpusBuilder {
                 .filter(|value| !value.is_empty())
                 .context("exact chunked oracle does not support null or empty partition values")?,
         };
-        *self.hashes.entry(digest).or_default() += 1;
+        let hash = self.hashes.entry(digest).or_default();
+        *hash = hash.checked_add(count).context("row multiplicity overflow")?;
         let rows = self.partitions.entry(partition).or_default();
         let before = rows.len();
         let entry = rows.entry(encoded).or_insert((value, 0));
-        entry.1 = entry.1.checked_add(1).context("row multiplicity overflow")?;
+        entry.1 = entry.1.checked_add(count).context("row multiplicity overflow")?;
         if rows.len() > before {
             ensure!(
                 rows.len() <= MAX_CHUNK_DISTINCT_ROWS,
@@ -225,7 +228,7 @@ impl CorpusBuilder {
                 "validation corpus exceeds {MAX_CORPUS_DISTINCT_ROWS} distinct rows"
             );
         }
-        self.rows = self.rows.checked_add(1).context("row count overflow")?;
+        self.rows = self.rows.checked_add(count).context("row count overflow")?;
         Ok(())
     }
 
