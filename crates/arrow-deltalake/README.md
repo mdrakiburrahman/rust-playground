@@ -1,6 +1,6 @@
 # arrow-deltalake
 
-Streaming Arrow `RecordBatch` -> Parquet / Delta. Local Linux, append-only.
+Streaming Arrow `RecordBatch` -> Parquet / Delta. Local Linux and ADLS Gen2.
 No OTEL or Flight dependency. Writes use pinned Delta Kernel 0.29.0;
 delta-rs is only the independent loadtest reader.
 
@@ -125,7 +125,7 @@ ownership is released.
   stage != commit       queue admission != durable delivery
   drop before submit -> no commit
   drop after submit  -> may still commit; cancellation is not rollback
-  commit error       -> fail waiters + poison coordinator; no blind retry
+  terminal error     -> fail waiters + poison coordinator; no blind retry
 
   OTEL adapter's dependency gate (not a cross-table transaction):
 
@@ -137,8 +137,12 @@ ownership is released.
   start_draining() -> bypass delay for every remaining dependency wave
 ```
 
-Data files are synced before publication. Conflicts and uncertain outcomes
-are explicit errors; orphan files remain for inspection. The 10-second
+Data files are synced before publication. Safe CAS collisions retry with jitter,
+up to eight attempts and a ten-second retry-admission window. Stable transaction
+identities reconcile uncertain success before any resubmission; an unreadable
+outcome fails closed, and unidentified uncertain appends are never replayed.
+Exhaustion and semantic/schema conflicts remain visible errors; orphan files
+remain for inspection. The 10-second
 collection window is not a visibility bound: dependency waves add latency.
 
 ## Publication fencing
@@ -155,6 +159,47 @@ transaction receives `CommitReceiptError::PublicationFenced` through
 `wait_typed()`; the coordinator is then poisoned just like other uncertain or
 commit failures. Existing `wait()` remains available and wraps the typed error
 in `anyhow::Error`.
+
+## Shared tables, ADLS identity and reset fencing
+
+Legacy local `open` retains its lifetime writer lock. `open_url` and
+`open_uri_with_fence` permit independent maintenance/streaming processes while
+Delta's conditional-create log publication arbitrates each commit. Independent
+submissions remain independent; only the same application ID/version deduplicates.
+Transaction retention must remain unset. Checkpoints retain transaction fences.
+
+`object_store_for_url` supplies the same refreshable Azure CLI identity to
+readers/checkpoint clients without opening a writer. Azure runtimes require `az`
+2.54 or later, the authorized CLI configuration mounted privately, and
+`AZURE_CONFIG_DIR` pointing at it. A token cache alone is not sufficient.
+The provider invokes `az account get-access-token` with the Storage scope;
+no credentials are embedded in jobs or table metadata. Child execution/output
+has a five-second deadline, cancellation kills the child, concurrent credential
+admission is bounded to six seconds, and output is limited to 64 KiB.
+Cached tokens expire at the earlier of 60 seconds or their expiry minus 30 seconds.
+CLI stderr and token responses are never included in errors.
+
+Normal Azure open/upload/commit requires owned, ready checkpoint-container
+metadata and the same captured reset generation. Bootstrap-only
+`initialize_url_for_bootstrap` instead requires the owned, fenced generation,
+normalizes its raw input schema, validates existing roots, and returns no writer.
+`StorageAuthority::open/check` lets checkpoint services enforce the same authority
+immediately before and after each mutation; failed authority forbids cleanup.
+Core repeats authority after slow local staging/checkpoint preparation, and the
+committer materializes at most 8 MiB of action arrays before its final check.
+
+Azure HTTP attempts time out after ten seconds, with at most two retries,
+ten-second retry admission, and backoff capped at 250 ms. Conservatively, one
+credential acquisition plus three HTTP attempts and two backoffs is at most
+36.5 seconds of configured asynchronous waiting after request preparation.
+A metadata authority request adds up to six seconds of credential admission
+and ten seconds of HTTP waiting. These are **not a hard whole-operation or
+server-completion deadline**: CPU scheduling, runtime suspension, serialization,
+and already-sent server requests are outside these client bounds. Reset grace
+alone is not proof of fencing. Stop/quiesce services before destructive reset;
+the stalled-auth tests specifically prove a cancelled CLI cannot later resume a
+data/log publication. Real ADLS/reset qualification still requires authorized
+subscription access.
 
 ## Arrow representation
 
