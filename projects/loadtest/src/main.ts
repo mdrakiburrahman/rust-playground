@@ -21,7 +21,7 @@ import {
   benchmarkComposeFiles, benchmarkQuiver, buildBenchmarkComposeOverride, buildBenchmarkRuntimeConfigs, dataflowConfigFile,
 } from './runtime-config.js';
 import { acquireBenchmarkController, resetBenchmark, stopBenchmark, type BenchmarkController } from './lifecycle.js';
-import { azureTargets, modeEnvironment, type AzureTargets } from './mode.js';
+import { azureTargets, modeEnvironment, stageAzureCliConfig, type AzureTargets } from './mode.js';
 import { kustoComposeStartArguments, kustoStatusSummary, readKustoStatus, requireHealthyKusto, safeKustoError, startKusto } from './kusto.js';
 import { kustoExplorerStartArguments, runGrafanaGate, runUiGate } from './ui-gate.js';
 
@@ -196,7 +196,7 @@ function stageHelperBinaries(): string {
   return destination;
 }
 
-function writeDirectConfig(directory: string, service: string, network: BenchmarkNetwork, quiver: boolean, azure?: AzureTargets): void {
+function writeDirectConfig(directory: string, service: string, network: BenchmarkNetwork, quiver: boolean, azure?: AzureTargets, privateEnv?: NodeJS.ProcessEnv): void {
   const state = path.join(directory, `direct-state-${service.split('-')[1]}`);
   mkdirSync(state, { recursive: true });
   const generationFile = path.join(state, 'generation');
@@ -218,12 +218,14 @@ function writeDirectConfig(directory: string, service: string, network: Benchmar
   mkdirSync(dataflowState, { recursive: true });
   writeFileSync(path.join(dataflowState, 'dataflow.yaml'), runtime.dataflowYaml);
   writeFileSync(path.join(directory, 'router-state/compose-runtime.json'),
-    `${buildBenchmarkComposeOverride(hostPath(directory), { quiver })}\n`);
+    `${buildBenchmarkComposeOverride(hostPath(directory), { quiver, ...(azure ? {
+      mode: 'azure', azureConfigHostDirectory: hostPath(path.join(directory, 'azure-cli')), azureEnvironment: privateEnv,
+    } : {}) })}\n`);
   writeFileSync(generationFile, `${generation}\n`);
 }
 
-function writeRuntimeConfigs(directory: string, network: BenchmarkNetwork, quiver: boolean, azure?: AzureTargets): void {
-  writeDirectConfig(directory, 'direct-1', network, quiver, azure);
+function writeRuntimeConfigs(directory: string, network: BenchmarkNetwork, quiver: boolean, azure?: AzureTargets, privateEnv?: NodeJS.ProcessEnv): void {
+  writeDirectConfig(directory, 'direct-1', network, quiver, azure, privateEnv);
   writeRouterConfig(directory, 500);
 }
 
@@ -491,7 +493,8 @@ async function benchmark(options: BenchmarkOptions, controller: BenchmarkControl
     run(path.join(workspace, 'projects/arrowcol-infra/scripts/bootstrap-secrets.sh'), []);
     mkdirSync(path.join(workspace, 'projects/loadtest/.temp'), { recursive: true });
     network = selectBenchmarkNetwork();
-    writeRuntimeConfigs(directory, network, options.quiver, azure);
+    if (azure) stageAzureCliConfig(directory, privateEnv);
+    writeRuntimeConfigs(directory, network, options.quiver, azure, privateEnv);
     writeFileSync(path.join(directory, 'router-state/network.json'), `${JSON.stringify(network, null, 2)}\n`);
     env = benchmarkEnvironment(directory, options, network, stageHelperBinaries(), privateEnv, azure);
   } catch (error) {
@@ -586,7 +589,7 @@ async function benchmark(options: BenchmarkOptions, controller: BenchmarkControl
       },
       restart: async () => {
         // A restarted Direct process is a new receipt-owner generation that adopts its predecessor's receipts.
-        writeDirectConfig(directory, 'direct-1', network, true, azure);
+        writeDirectConfig(directory, 'direct-1', network, true, azure, privateEnv);
         await composeAsync(project, env, [
           '--profile', 'benchmark', 'up', '--detach', '--no-build', '--no-deps', '--wait', '--wait-timeout', '300',
           'direct-1', 'dataflow-1',

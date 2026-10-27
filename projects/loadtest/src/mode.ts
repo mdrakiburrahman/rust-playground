@@ -1,4 +1,5 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
+import { homedir } from 'node:os';
 import path from 'node:path';
 import { parseEnv } from 'node:util';
 
@@ -19,6 +20,27 @@ export function modeEnvironment(workspace: string, mode: LoadtestMode, inherited
     }
   }
   return { ...files, ...inherited, ARROWCOL_MODE: mode };
+}
+
+/** Runtime-only writable copies; Compose runs these collectors as the invoking UID/GID. */
+export function stageAzureCliConfig(directory: string, env: NodeJS.ProcessEnv): void {
+  const source = path.resolve(env.AZURE_CONFIG_DIR ?? path.join(homedir(), '.azure'));
+  if (!existsSync(source) || !lstatSync(source).isDirectory() || readdirSync(source).length === 0) {
+    throw new Error('Azure mode requires an existing authenticated Azure CLI config directory');
+  }
+  const protect = (entry: string): void => {
+    const stat = lstatSync(entry);
+    if (stat.isSymbolicLink()) throw new Error('Azure runtime config must not contain symbolic links');
+    chmodSync(entry, stat.isDirectory() ? 0o700 : 0o600);
+    if (stat.isDirectory()) for (const child of readdirSync(entry)) protect(path.join(entry, child));
+  };
+  const root = path.join(directory, 'azure-cli');
+  mkdirSync(root, { mode: 0o700 });
+  for (const service of ['direct-1', 'dataflow-1']) {
+    const target = path.join(root, service);
+    cpSync(source, target, { recursive: true, errorOnExist: true, force: false });
+    protect(target);
+  }
 }
 
 export interface AzureTargets {
