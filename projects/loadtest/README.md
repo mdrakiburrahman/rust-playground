@@ -200,6 +200,7 @@ prefix. Initialization does not insert data or prove Azure/QAP readiness.
 | `--batch-rows` | Rows per Arrow batch | `8192` |
 | `--measure` | Stop after a finite measurement, such as `5m` | Until Ctrl+C |
 | `--validate` | Check Delta snapshots and native Kusto data after the generator finishes | Off |
+| `--final-compaction` / `--no-final-compaction` | Enable or explicitly opt out of post-release local compaction; explicit Azure enablement fails before startup | On for validated local runs; unchanged/off for Azure |
 | `--quiver` | Both collectors persist every batch to [Quiver](#disk-persistence-with-quiver) on local disk before acknowledging it, then publish to Delta from disk | Off |
 | `--crash-after` | With `--quiver`, `kill -9` both collectors this long after they start persisting, restart them, and require replay from disk | Off |
 
@@ -518,8 +519,37 @@ startup failure is only a warning.
 
 Validation first drains publication and collects live Grafana health/plot
 evidence while mutators remain running. It then cleanly stops **all** source,
-maintenance and tenant mutators, records run-bound drain receipts, and only then
-captures immutable Delta versions and runs the cached/fallback correctness gate.
+maintenance and tenant mutators and records run-bound drain receipts. Validated
+local runs then execute `publisher-release`, followed by `final-compaction`,
+before capturing the final immutable Delta versions and running the unchanged
+cached/fallback correctness gate. `--no-final-compaction` passes the explicit
+`--skip-final-compaction` request to the helper; skipped evidence is not a
+successful compaction. The helper owns the compaction plan, bounded full-row
+before/after comparison, final inventory and cooperative 300-second phase budget.
+The runner's existing 600-second hard process backstop is unchanged; neither
+deadline promises preemption of synchronous work or a guaranteed diagnostics reserve.
+
+`publisher-release.json` is actual post-exit SQL evidence, not a local publisher
+registry or reader-lease claim. The run's `routing.json` now includes its run ID.
+Release requires exactly one same-run publisher ID/key in each pool, each
+durably stopped in `routing_collectors`, with no other ready/draining generation,
+even if its heartbeat expired. Historical stopped/failed rows are allowed.
+Routing leases have only active/draining states and no clean-stop release path:
+they may remain unexpired, but every holder must be a same-run stopped publisher.
+Expiry is recorded as evidence, not used as release proof. The direct publisher
+must additionally have a matching `collector_instances` receipt-owner row with
+state stopped and a nonnull stop timestamp, zero unreleased receipt table leases,
+and zero accepted/buffered/flushing receipts. Historical outstanding receipts
+also fail admission. Dataflow has no receipt-owner requirement: its proof is
+routing stopped plus owned clean exit zero. Missing required rows fail closed.
+
+`publisher-admission.json` binds that SQL report to the stack-start SQL container
+ID/start time/image, same-run root, SDK binary digest and exact cleanly stopped
+writer containers. Ownership and generations are re-inspected around the SQL
+read. SQL release is never attempted before clean writer exit, and a release
+failure prevents final compaction and validation. Azure does not enter these
+local-only phases by default; `--mode azure --final-compaction` is explicitly
+unsupported and fails before effects.
 The read-only validator, Kusto and Explorer remain available; their lifetime
 does not authorize occupancy release. Ordinary non-validation runs retain the
 live stack. Stopped-mutator receipts are not distributed registry-close proof.

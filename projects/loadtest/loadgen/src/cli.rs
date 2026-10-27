@@ -23,6 +23,8 @@ pub enum Command {
     Validate(ValidateArgs),
     /// Drain publication while collectors are still running, without capturing snapshots.
     Drain(ValidateArgs),
+    /// After the clean mutator drain, prove from actual SQL state that every routed publisher released.
+    PublisherRelease(PublisherReleaseArgs),
     /// Record bounded read-only QAP observations without changing tables or policies.
     ObserveQap(ObserveQapArgs),
     /// Initialize both Azure pools from the canonical schemas while reset is fenced.
@@ -52,6 +54,42 @@ pub struct ObserveQapArgs {
     #[arg(long = "table")]
     pub tables: Vec<String>,
     /// One deadline for authentication and every management request.
+    #[arg(long, default_value = "30s")]
+    pub timeout: DurationArg,
+}
+
+/// Read-only post-drain publisher-release proof inputs.
+#[derive(Clone, Debug, Args)]
+pub struct PublisherReleaseArgs {
+    /// Benchmark result directory holding this run's routing and drain evidence.
+    #[arg(long, env = "LOADTEST_RESULTS", default_value = "/results")]
+    pub results: PathBuf,
+
+    /// SQL Server host that held the run's routing and receipt state.
+    #[arg(long, env = "ARROWCOL_SQL_HOST", default_value = "sqlserver")]
+    pub sql_host: String,
+
+    /// SQL Server port.
+    #[arg(long, env = "ARROWCOL_SQL_PORT", default_value_t = 1_433)]
+    pub sql_port: u16,
+
+    /// Arrowcol application database.
+    #[arg(long, env = "ARROWCOL_SQL_DATABASE", default_value = "arrowcol")]
+    pub sql_database: String,
+
+    /// Arrowcol runtime principal.
+    #[arg(long, env = "ARROWCOL_SQL_USERNAME", default_value = "arrowcol_app")]
+    pub sql_username: String,
+
+    /// File containing the runtime principal password.
+    #[arg(
+        long,
+        env = "ARROWCOL_SQL_PASSWORD_FILE",
+        default_value = "/run/secrets/arrowcol-app-password"
+    )]
+    pub sql_password_file: PathBuf,
+
+    /// Connection and per-read bound for the SQL state reads.
     #[arg(long, default_value = "30s")]
     pub timeout: DurationArg,
 }

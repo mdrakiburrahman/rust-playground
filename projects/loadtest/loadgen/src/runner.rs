@@ -172,7 +172,7 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
         crate::kusto::degraded(&arguments.results, &run_id, &error)?;
     }
     let receipt_report = receipt_report?;
-    let routing = capture_routing(&arguments).await?;
+    let routing = capture_routing(&arguments, &run_id).await?;
     manifests.write_json(ROUTING_EVIDENCE_FILE, &routing).await?;
     manifests.flush().await?;
 
@@ -726,7 +726,7 @@ impl ReceiptTracker {
     }
 }
 
-async fn capture_routing(arguments: &RunArgs) -> Result<RoutingEvidence> {
+async fn capture_routing(arguments: &RunArgs, run_id: &str) -> Result<RoutingEvidence> {
     let config = SqlServerRoutingConfig::with_password_file(
         &arguments.sql_host,
         arguments.sql_port,
@@ -769,6 +769,7 @@ async fn capture_routing(arguments: &RunArgs) -> Result<RoutingEvidence> {
         })
         .collect();
     Ok(RoutingEvidence {
+        run_id: run_id.to_owned(),
         loaded_at_unix_ms: view.loaded_at_unix_ms.get(),
         collectors,
         leases,
@@ -777,6 +778,7 @@ async fn capture_routing(arguments: &RunArgs) -> Result<RoutingEvidence> {
 
 #[derive(Serialize)]
 struct RoutingEvidence {
+    run_id: String,
     loaded_at_unix_ms: u64,
     collectors: Vec<RoutingCollectorEvidence>,
     leases: Vec<RoutingLeaseEvidence>,

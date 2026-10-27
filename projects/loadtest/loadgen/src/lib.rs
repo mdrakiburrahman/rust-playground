@@ -7,6 +7,7 @@ pub mod generator;
 pub mod initialize;
 mod kusto;
 pub mod manifest;
+pub mod release;
 pub mod runner;
 pub mod schema;
 pub mod sdk;

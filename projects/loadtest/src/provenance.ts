@@ -12,7 +12,7 @@ export function sha256(text: string | Buffer): string {
   return createHash('sha256').update(text).digest('hex');
 }
 
-function executableIdentity(file: string): { sha256: string; bytes: number } {
+export function executableIdentity(file: string): { sha256: string; bytes: number } {
   let descriptor: number | undefined;
   try {
     descriptor = openSync(file, 'r');

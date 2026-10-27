@@ -12,6 +12,8 @@ export interface BenchmarkOptions {
   batchRows: number;
   seed: number;
   validate: boolean;
+  /** Local validated runs compact after SQL publisher release unless explicitly disabled. */
+  finalCompaction?: boolean;
   /** Persist every batch to Quiver on local disk before publishing it to Delta. */
   quiver: boolean;
   /** SIGKILL and restart both collectors this long after generation starts (requires quiver). */
@@ -50,6 +52,7 @@ export function parseBenchmarkOptions(args: string[], env: NodeJS.ProcessEnv = p
   let validate = false;
   let quiver = false;
   let stressPlan: string | undefined;
+  let finalCompaction: boolean | undefined;
   for (let index = 0; index < args.length; index++) {
     if (args[index] === '--validate') {
       validate = true;
@@ -57,6 +60,11 @@ export function parseBenchmarkOptions(args: string[], env: NodeJS.ProcessEnv = p
     }
     if (args[index] === '--quiver') {
       quiver = true;
+      continue;
+    }
+    if (args[index] === '--final-compaction' || args[index] === '--no-final-compaction') {
+      if (finalCompaction !== undefined) throw new Error('Specify final compaction only once');
+      finalCompaction = args[index] === '--final-compaction';
       continue;
     }
     const inline = /^(--[a-z-]+)=(.*)$/u.exec(args[index]);
@@ -85,8 +93,14 @@ export function parseBenchmarkOptions(args: string[], env: NodeJS.ProcessEnv = p
   if (crashAfterSeconds !== undefined && measureSeconds !== undefined && crashAfterSeconds >= warmupSeconds + measureSeconds) {
     throw new Error('--crash-after must be shorter than --warmup + --measure so the crash interrupts live load');
   }
+  const parsedMode = parseMode(mode);
+  if (parsedMode === 'azure' && finalCompaction === true) {
+    throw new Error('Explicit --final-compaction is unsupported in Azure mode; no cloud writes were started');
+  }
+  if (finalCompaction === true && !validate) throw new Error('--final-compaction requires --validate');
   return {
-    mode: parseMode(mode),
+    mode: parsedMode,
+    finalCompaction: finalCompaction ?? parsedMode === 'local',
     warmupSeconds,
     measureSeconds,
     captureSettleSeconds: 30,
@@ -103,4 +117,5 @@ export function parseBenchmarkOptions(args: string[], env: NodeJS.ProcessEnv = p
 }
 
 export const benchmarkUsage = '[--mode local|azure (default local)] [--warmup 30s] [--measure 1m (omit to run until Ctrl+C)] [--concurrency 4] [--batch-rows 8192] [--validate] ' +
-  '[--quiver] [--crash-after 20s (requires --quiver)] [--stress-plan plan.json (requires --validate)]';
+  '[--quiver] [--crash-after 20s (requires --quiver)] [--stress-plan plan.json (requires --validate)] ' +
+  '[--final-compaction|--no-final-compaction (validated local default on; Azure unsupported)]';

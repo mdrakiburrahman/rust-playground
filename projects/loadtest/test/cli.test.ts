@@ -47,3 +47,14 @@ test('defaults and overrides', () => {
   assert.throws(() => parseBenchmarkOptions(['--unknown', '1']), /Unknown/u);
   assert.throws(() => parseBenchmarkOptions(['--concurrency']), /requires a value/u);
 });
+
+test('final compaction defaults on only locally; explicit Azure requests fail before effects', () => {
+  assert.equal(parseBenchmarkOptions(['--validate'], {}).finalCompaction, true);
+  assert.equal(parseBenchmarkOptions(['--validate', '--no-final-compaction'], {}).finalCompaction, false);
+  assert.equal(parseBenchmarkOptions(['--validate', '--mode', 'azure'], {}).finalCompaction, false);
+  assert.equal(parseBenchmarkOptions(['--validate', '--no-final-compaction'], { ARROWCOL_MODE: 'azure' }).finalCompaction, false);
+  assert.throws(() => parseBenchmarkOptions(['--validate', '--mode', 'azure', '--final-compaction'], {}), /unsupported in Azure/u);
+  assert.throws(() => parseBenchmarkOptions(['--validate', '--final-compaction'], { ARROWCOL_MODE: 'azure' }), /unsupported in Azure/u);
+  assert.throws(() => parseBenchmarkOptions(['--final-compaction'], {}), /requires --validate/u);
+  assert.throws(() => parseBenchmarkOptions(['--no-final-compaction', '--final-compaction'], {}), /only once/u);
+});
