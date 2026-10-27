@@ -1947,6 +1947,55 @@ fn prune_log_retains_checkpoint_json_and_age_gates_old_floor_json() -> Result<()
     Ok(())
 }
 
+/// Scenario: floor `F` with old `F.json`, then a newer checkpoint `C2` while the old
+/// floor checkpoint `F.checkpoint.parquet` is young (e.g. freshly rewritten).
+/// Guarantees: deleting checkpoints below `C2` is age-gated like JSON: Noop plan,
+/// StalePlan apply and zero deletes until it ages, after which the advance deletes it.
+#[test]
+fn prune_log_age_gates_old_floor_checkpoint() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let (table, maintenance) = prunable_history(root.path())?;
+    let floor = vacuum_and_checkpoint(&maintenance)?;
+    let config = short_prune(now_ms()? + 1_000);
+    let plan = maintenance.plan_prune_log(&config)?;
+    maintenance.apply_prune_log(&plan, &config, &control())?;
+    for index in 10..12 {
+        append(&table, index, index * 10..index * 10 + 2)?;
+    }
+    let second = vacuum_and_checkpoint(&maintenance)?;
+    let config = short_prune(now_ms()? + 1_000);
+    let pending = maintenance.plan_prune_log(&config)?;
+    assert_eq!(pending.checkpoint_version, Some(second));
+    let old_checkpoint = format!("_delta_log/{floor:020}.checkpoint.parquet");
+    assert!(pending.deletions.contains(&old_checkpoint));
+
+    let set_modified = |time: std::time::SystemTime| -> Result<()> {
+        fs::File::options()
+            .write(true)
+            .open(checkpoint_path(root.path(), floor))?
+            .set_modified(time)?;
+        Ok(())
+    };
+    set_modified(std::time::SystemTime::now() + Duration::from_secs(3_600))?;
+    let before = log_files(root.path())?;
+    let plan = maintenance.plan_prune_log(&config)?;
+    assert_eq!((plan.checkpoint_version, plan.report().outcome), (None, Outcome::Noop));
+    assert_eq!(
+        kind(maintenance.apply_prune_log(&pending, &config, &control())),
+        Some(MaintenanceErrorKind::StalePlan)
+    );
+    assert_eq!(log_files(root.path())?, before);
+    assert!(checkpoint_path(root.path(), floor).is_file(), "young checkpoint kept");
+    assert_eq!(maintenance.log_floor()?.context("floor")?.checkpoint_version, floor);
+
+    set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1))?;
+    let report = maintenance.apply_prune_log(&pending, &config, &control())?;
+    assert_eq!(report.outcome, Outcome::Pruned);
+    assert!(!checkpoint_path(root.path(), floor).exists());
+    assert_eq!(log_files(root.path())?, vec![json_path(root.path(), second)]);
+    Ok(())
+}
+
 /// Scenario: a durable floor at C, a second proven plan at C2, then a delayed older
 /// checkpoint rewrites `_last_checkpoint` below the floor (or it is corrupted).
 /// Guarantees: planning and the pending apply neither panic nor delete; the floor is

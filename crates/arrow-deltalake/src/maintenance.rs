@@ -4022,9 +4022,9 @@ impl DeltaTable {
         Ok(())
     }
 
-    /// Whether every log object left below `floor` (JSON `< floor`, plus the
-    /// retained `floor` JSON when `include_floor` because a newer checkpoint will
-    /// make it deletable; checkpoints `< floor`) is eligible: commit timestamp (when present) and
+    /// Whether every log object left below `floor` (JSON and checkpoints `< floor`,
+    /// plus the `floor` JSON and checkpoint when `include_floor` because a newer
+    /// checkpoint will make them deletable) is eligible: commit timestamp (when present) and
     /// object modification time older than `log_cutoff_ms`, and every remove
     /// older than the progress cutoff, with progress covering the floor.
     #[allow(clippy::too_many_arguments)]
@@ -4063,7 +4063,7 @@ impl DeltaTable {
             }
         }
         Ok(checkpoints
-            .range(..floor)
+            .range(..end)
             .all(|version| old(modified(format!("{version:020}.checkpoint.parquet")))))
     }
 
@@ -4227,6 +4227,20 @@ impl DeltaTable {
             _ if target.is_some() => return stale("the planned checkpoint is no longer provably prunable"),
             _ => return Ok(None),
         };
+        // Every checkpoint planned for deletion (all `< C`, including an old floor
+        // checkpoint on advance) must be older than the log cutoff.
+        let young_checkpoint = checkpoints.range(..checkpoint).any(|version| {
+            names
+                .get(&format!("{version:020}.checkpoint.parquet"))
+                .is_none_or(|meta| meta.last_modified.timestamp_millis() >= log_cutoff_ms)
+        });
+        if young_checkpoint {
+            return if target.is_some() {
+                stale("a checkpoint below the planned checkpoint is younger than the log retention")
+            } else {
+                Ok(None)
+            };
+        }
         let mut deletions: Vec<(u64, u8)> = json
             .range(..checkpoint)
             .map(|version| (*version, 0))
