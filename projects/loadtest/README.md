@@ -317,6 +317,22 @@ Both collectors use two CPUs and matching buffer limits: 128 MiB overall,
 budget. The Kusto container has a separate 4 GiB memory limit. Keep host memory
 available for the other services.
 
+The 4 GiB default is a container ceiling, not a measured safe working set.
+Serial heavy-query admission does not reclaim the emulator's retained engine
+memory or bound other clients. Most other Compose services have **no container
+memory limit**; SQL Server's 16 GiB setting is an internal engine budget, not a
+container limit. There is therefore no finite aggregate Compose memory ceiling.
+The public-repository E2E job uses `ubuntu-24.04`, whose standard runner has
+[16 GB RAM](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
+Do not size it as though each unbounded service consumes zero. A preserved
+functional development run reached 3.855 GiB of idle Kusto cgroup usage and
+nearly 4 GiB during serial validation. Its recorded simultaneous all-container
+working-set peak was 14.989 GiB, including 7.178 GiB in the development workspace.
+Adding 2 GiB for a proposed 6 GiB Kusto ceiling would exceed a 13 GiB workload
+budget on that runner. The proposed increase is therefore not applied. The
+benchmark-project-only peak was 7.811 GiB, but excluding the workspace requires
+separately accounting for the host validator; it is not a host-wide bound.
+
 To change the SQL budget (in MiB):
 
 ```bash
@@ -501,10 +517,15 @@ Snapshot capture for both pools and table-oracle preparation run across tables.
 Blocking decode/hash jobs share one process-wide CPU cap sized from available
 CPUs; file-level decoders do not create nested workers inside those jobs.
 Kusto data queries have a separate two-request admission cap shared by client
-clones, independent of CPU decoding. Management observations do not consume
-query permits. The caller's absolute deadline includes queue time; query errors
-still fail immediately without retry. Query evidence records the admission cap,
-queue and request durations, and query text bytes.
+clones, independent of CPU decoding. Full-multiset, partition and row-count
+scans additionally share a one-request heavy-query cap: two concurrent scans
+already exhausted the local emulator's memory during development. Schema
+queries may still use both data-query permits; management observations do not
+consume query permits. The caller's absolute deadline includes both admission
+queues; query errors still fail immediately without retry. Query evidence
+records both admission caps, the heavy-query classification, total queue and
+request durations, and query text bytes. These are client-family bounds, not
+cluster-wide guarantees against memory pressure from other processes.
 The independent reader still reads each captured file twice: the first pass
 builds the snapshot hashes, and the second constructs the exact bounded corpus
 and verifies those hashes. Snapshot hashes alone cannot replace decoded rows
