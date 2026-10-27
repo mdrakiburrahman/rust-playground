@@ -2,7 +2,7 @@
 
 use std::{env, sync::Arc};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow_deltalake::delta::DeltaTable;
 use arrowcol_catalog::{DdlCommand, DdlParser};
@@ -91,13 +91,41 @@ pub async fn initialize(args: InitializeAzureArgs) -> Result<()> {
     let container = env::var("AZURE_STORAGE_CONTAINER").context("missing AZURE_STORAGE_CONTAINER")?;
     let _checkpoint =
         env::var("AZURE_STORAGE_CHECKPOINT_CONTAINER").context("missing AZURE_STORAGE_CHECKPOINT_CONTAINER")?;
-    let root = checked_root(&root, &account, &container)?;
+    initialize_tables_with(
+        args,
+        &root,
+        &account,
+        &container,
+        DeltaTable::initialize_url_for_bootstrap,
+    )
+    .await
+}
+
+/// Shared body of [`initialize`]: validates the root, initializes every canonical table through
+/// `bootstrap` in order, and writes the manifest only after all of them succeed. Production passes
+/// [`DeltaTable::initialize_url_for_bootstrap`]; offline proofs pass the injected-control variant.
+///
+/// # Errors
+///
+/// Fails closed on an unsafe root before any table I/O, stops at the first failing table, and
+/// writes no manifest unless every table succeeded.
+pub async fn initialize_tables_with<F>(
+    args: InitializeAzureArgs,
+    root: &str,
+    account: &str,
+    container: &str,
+    mut bootstrap: F,
+) -> Result<()>
+where
+    F: FnMut(Url, Arc<Schema>, Vec<String>) -> Result<()>,
+{
+    let root = checked_root(root, account, container)?;
     let entries = entries()?;
     for (entry, schema) in &entries {
         let url = root
             .join(&entry.relative_path)
             .context("invalid canonical table path")?;
-        DeltaTable::initialize_url_for_bootstrap(url, Arc::clone(schema), vec![INGESTION.to_owned()])
+        bootstrap(url, Arc::clone(schema), vec![INGESTION.to_owned()])
             .with_context(|| format!("bootstrap canonical table {}", entry.name))?;
     }
     write_manifest(args).await
