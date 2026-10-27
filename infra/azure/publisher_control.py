@@ -49,6 +49,10 @@ class PublisherControl:
         metadata, etag = self.azure.head_control()
         if metadata.get("sandboxid") != self.azure.c.sandbox:
             raise Failure("Publisher authority sandbox ownership mismatch.")
+        if (metadata.get("resetstate") in ("ready", "fenced") or
+                "publisherregistryversion" not in metadata):
+            raise Failure("Legacy or unversioned reset authority; no implicit migration. "
+                          "Re-create the disposable sandbox authority explicitly.")
         if metadata.get("resetstate") not in STATES:
             raise Failure("Publisher authority requires a known versioned v1 state.")
         canonical_uuid(metadata.get("resetgeneration"))
@@ -95,6 +99,9 @@ class PublisherControl:
             require_released(metadata)
             if registry:
                 raise Failure("Bootstrap requires exclusive empty publisher registry.")
+        elif metadata["occupancy"] == "stopping":
+            # A stop hold is claimed only from an empty registry; no member may join it.
+            raise Failure("A cluster stop holds the sandbox; publisher admission refused.")
         if publisher in registry:
             raise Failure("Publisher identity is already registered; no implicit retry/adoption.")
         registry[publisher] = {"generation": generation, "state": "active"}

@@ -13,6 +13,7 @@ import bootstrap as b
 
 
 SUB = "00000000-0000-0000-0000-000000000001"
+REAL_AZURE = b.Azure
 
 
 class FakeAzure:
@@ -27,15 +28,24 @@ class FakeAzure:
         self.items = {c.data: [{"name": "table/data.parquet", "snapshot": None,
                                 "version": None, "deleted": False}], c.checkpoints: []}
         self.directories = {c.data: [], c.checkpoints: []}
-        self.metadata = {"sandboxid": c.sandbox, "resetstate": "ready",
-                         "resetgeneration": str(uuid.uuid4())}
+        self.metadata = {"sandboxid": c.sandbox, "resetstate": "ready-v1",
+                         "resetgeneration": str(uuid.uuid4()), "occupancy": "released",
+                         "publisherregistryversion": "1", "publishers": "{}"}
+        self.cluster_state = "Running"
+        self.checkpoint_exists = True
         self.etag = '"one"'
         self.events = []
 
     def arm(self, method, path, **kwargs):
         if path.endswith("/blobServices/default"):
             return {"properties": self.settings}
-        return {"tags": dict(self.tags), "properties": {"isHnsEnabled": True}}
+        if path.endswith("/containers/" + self.c.checkpoints):
+            return {"properties": {"metadata": dict(self.metadata)}} if self.checkpoint_exists else None
+        return {"tags": dict(self.tags), "properties": {
+            "isHnsEnabled": True, "uri": "https://cluster.example", "state": self.cluster_state}}
+
+    def kql(self, command, database=None):
+        self.events.append(("kql", command.split()[0]))
 
     def collection(self, path, **kwargs):
         return self.databases if path.endswith("/databases") else self.containers
@@ -51,14 +61,14 @@ class FakeAzure:
         self.directories[container].remove(name)
 
     def control(self):
-        return dict(self.metadata), self.etag
+        return REAL_AZURE.control(self)
 
     def head_control(self):
         return dict(self.metadata), self.etag
 
     def set_control(self, metadata, etag):
         if etag != self.etag:
-            raise b.Failure("HTTP 412: metadata changed")
+            raise b.ControlConflict("HTTP 412: metadata changed")
         self.metadata = dict(metadata)
         self.etag = str(uuid.uuid4())
         self.events.append(("control", metadata["resetstate"]))
@@ -230,8 +240,8 @@ class ResetTests(unittest.TestCase):
         run.return_value.returncode = 1
         with self.assertRaises(b.Failure):
             b._unqualified_reset_sequence(self.azure, ["stop"])
-        self.assertEqual(self.azure.events, [("control", "fenced")])
-        self.assertEqual(self.azure.metadata["resetstate"], "fenced")
+        self.assertEqual(self.azure.events, [("control", "fenced-v1")])
+        self.assertEqual(self.azure.metadata["resetstate"], "fenced-v1")
 
     @patch.object(b.time, "sleep")
     @patch.object(b, "run_tree")
@@ -241,12 +251,13 @@ class ResetTests(unittest.TestCase):
         before = self.azure.metadata["resetgeneration"]
         b._unqualified_reset_sequence(self.azure, ["stop"])
         sleep.assert_called_once_with(60)
-        self.assertEqual(self.azure.events[0], ("control", "fenced"))
+        self.assertEqual(self.azure.events[0], ("control", "fenced-v1"))
         self.assertIn(("DELETE", "table/data.parquet"), self.azure.events)
         self.assertNotEqual(self.azure.metadata["resetgeneration"], before)
         self.assertEqual(sum(len(items) for items in self.azure.items.values()), 0)
         self.assertEqual(self.azure.databases, [])
-        self.assertEqual(self.azure.metadata["resetstate"], "fenced")
+        self.assertEqual(self.azure.metadata["resetstate"], "fenced-v1")
+        self.assertEqual(self.azure.metadata["publishers"], "{}")
         self.assertFalse(any("fence.json" in event[1] for event in self.azure.events))
         b.reset(self.azure, False, None)
 
@@ -258,7 +269,7 @@ class ResetTests(unittest.TestCase):
         with patch.object(self.azure, "blob"):
             with self.assertRaisesRegex(b.Failure, "left workload"):
                 b._unqualified_reset_sequence(self.azure, ["stop"])
-        self.assertEqual(self.azure.metadata["resetstate"], "fenced")
+        self.assertEqual(self.azure.metadata["resetstate"], "cleaning-v1")
 
     @patch.object(b, "run_tree")
     def test_success_exit_without_verified_stop_receipt_is_not_enough(self, run):
@@ -266,7 +277,7 @@ class ResetTests(unittest.TestCase):
         run.return_value.stdout = "not stopped"
         with self.assertRaisesRegex(b.Failure, "did not verify"):
             b._unqualified_reset_sequence(self.azure, ["stop"])
-        self.assertEqual(self.azure.events, [("control", "fenced")])
+        self.assertEqual(self.azure.events, [("control", "fenced-v1")])
 
     @patch.object(b.time, "sleep")
     @patch.object(b, "run_tree")
@@ -337,7 +348,7 @@ class OccupancyTests(unittest.TestCase):
                 b.occupancy(azure, "release", str(uuid.uuid4()))
             with self.assertRaises(b.Failure):
                 b.occupancy(azure, "occupy", str(uuid.uuid4()))
-            b.occupancy(azure, "release", owner)
+            b.occupancy(azure, "release", owner, generation=azure.metadata["resetgeneration"])
         self.assertEqual(azure.metadata["occupancy"], "released")
 
     def stop(self, azure, during_stop=None):
@@ -434,7 +445,7 @@ class OccupancyTests(unittest.TestCase):
             self.assertFalse(marker.exists())
     def test_fenced_sandbox_cannot_be_occupied(self):
         azure = FakeAzure()
-        azure.metadata["resetstate"] = "fenced"
+        azure.metadata["resetstate"] = "fenced-v1"
         with self.assertRaises(b.Failure):
             b.occupancy(azure, "occupy", str(uuid.uuid4()))
 
@@ -564,8 +575,10 @@ class StorageApiTests(unittest.TestCase):
 
     def leased_storage(self, **metadata):
         c = self.azure.c
-        state = {"metadata": {"sandboxid": c.sandbox, "resetstate": "ready",
+        state = {"metadata": {"sandboxid": c.sandbox, "resetstate": "ready-v1",
                               "resetgeneration": str(uuid.uuid4()), "project": "rust-playground",
+                              "occupancy": "released", "publisherregistryversion": "1",
+                              "publishers": "{}",
                               **metadata},
                  "lease": None, "calls": [], "etag": 1}
         def blob(method, container, name="", query=None, body=None, headers=None, missing_ok=False):
@@ -615,7 +628,7 @@ class StorageApiTests(unittest.TestCase):
             with self.assertRaises(b.ControlConflict):
                 self.azure.set_control({**metadata, "resetstate": "fenced"}, etag)
         self.assertNotIn(("PUT", "metadata"), state["calls"])
-        self.assertEqual(state["metadata"]["resetstate"], "ready")
+        self.assertEqual(state["metadata"]["resetstate"], "ready-v1")
 
     def test_concurrent_change_between_read_and_lease_writes_nothing_and_releases(self):
         state, blob = self.leased_storage()
@@ -638,7 +651,7 @@ class StorageApiTests(unittest.TestCase):
             metadata, etag = self.azure.control()
             with self.assertRaises(b.ControlConflict):
                 self.azure.set_control({**metadata, "resetstate": "fenced"}, etag)
-        self.assertEqual(state["metadata"]["resetstate"], "ready")
+        self.assertEqual(state["metadata"]["resetstate"], "ready-v1")
 
     def test_unknown_write_failure_is_not_reported_as_conflict(self):
         state, blob = self.leased_storage()
@@ -662,8 +675,12 @@ class StorageApiTests(unittest.TestCase):
         self.assertEqual(state["calls"], [])
     def test_missing_ownership_state_generation_or_etag_fails_closed(self):
         c = self.azure.c
-        complete = {"x-ms-meta-sandboxid": c.sandbox, "x-ms-meta-resetstate": "ready",
-                    "x-ms-meta-resetgeneration": str(uuid.uuid4()), "etag": '"one"'}
+        complete = {"x-ms-meta-sandboxid": c.sandbox, "x-ms-meta-resetstate": "ready-v1",
+                    "x-ms-meta-resetgeneration": str(uuid.uuid4()),
+                    "x-ms-meta-occupancy": "released", "x-ms-meta-publisherregistryversion": "1",
+                    "x-ms-meta-publishers": "{}", "etag": '"one"'}
+        with patch.object(self.azure, "blob", return_value=(b"", complete)):
+            self.azure.control()
         for missing in complete:
             headers = {key: value for key, value in complete.items() if key != missing}
             with patch.object(self.azure, "blob", return_value=(b"", headers)):
@@ -801,7 +818,7 @@ class RunTreeTests(unittest.TestCase):
                     b._unqualified_reset_sequence(azure, command)
             time.sleep(2.5)
             self.assertFalse(marker.exists())
-        self.assertEqual(azure.metadata["resetstate"], "fenced")
+        self.assertEqual(azure.metadata["resetstate"], "fenced-v1")
 
 class BicepContractTests(unittest.TestCase):
     def test_kusto_application_principal_is_distinct_from_storage_object_principal(self):
@@ -818,34 +835,276 @@ class BicepContractTests(unittest.TestCase):
 
 
 class ProvisionCoordinationTests(unittest.TestCase):
-    def test_existing_sandbox_is_fenced_before_any_deployment(self):
-        azure = FakeAzure()
-        c = azure.c
-        existing = {
-            "properties": {"metadata": {
-                **azure.metadata, "project": "rust-playground",
-            }}
-        }
-        with patch.object(b, "guard_existing"), \
-                patch.object(azure, "arm", return_value=existing), \
-                patch.object(azure, "cli", side_effect=b.Failure("stop before deployment")):
-            with self.assertRaisesRegex(b.Failure, "stop before deployment"):
-                b.deploy(azure)
-        self.assertEqual(azure.events[0], ("control", "fenced"))
-        self.assertEqual(azure.metadata["resetstate"], "fenced")
+    """Dispatched entrypoints (provision/reconcile/stop/occupy/release) ownership matrix."""
 
-    def test_occupancy_acquired_after_arm_read_prevents_provision(self):
+    def setUp(self):
+        from publisher_control import PublisherControl
+        self.azure = FakeAzure()
+        self.control = PublisherControl(self.azure)
+        self.directory = tempfile.TemporaryDirectory()
+        self.output = Path(self.directory.name) / ".env.azure"
+        self.tables = Path(self.directory.name) / "tables.json"
+        self.tables.write_text('["Logs"]')
+        self.deployed = []
+        self.observed = []
+        self.child = {}
+        self.stop_unknown = False
+        self.patches = [
+            patch.object(b, "guard_existing"),
+            patch.object(b, "retry_ready", lambda action, label, timeout=600: action()),
+            patch.object(b, "reconcile", side_effect=self.fake_reconcile),
+            patch.object(b, "run_tree", side_effect=self.fake_child),
+            patch.object(self.azure, "cli", side_effect=self.fake_cli),
+            contextlib.redirect_stdout(io.StringIO()),
+        ]
+        for item in self.patches:
+            item.__enter__()
+
+    def tearDown(self):
+        for item in reversed(self.patches):
+            item.__exit__(None, None, None)
+        self.directory.cleanup()
+
+    def registry(self):
+        return json.loads(self.azure.metadata["publishers"])
+
+    def fake_cli(self, *args):
+        if args[:3] == ("deployment", "sub", "create"):
+            params = json.loads(Path(args[-1][1:]).read_text())["parameters"]
+            self.deployed.append((params["checkpointExists"]["value"], params["controlMetadata"]["value"],
+                                  dict(self.registry()) if self.azure.checkpoint_exists else None))
+            if not params["checkpointExists"]["value"]:
+                self.azure.metadata = {**params["controlMetadata"]["value"],
+                                       "sandboxid": self.azure.c.sandbox, "project": "rust-playground"}
+                self.azure.checkpoint_exists = True
+            self.azure.events.append(("arm", "deploy"))
+            return None
+        operation = args[-1].split("?")[0].rsplit("/", 1)[-1]
+        self.azure.events.append(("arm", operation))
+        self.observed.append((operation, self.azure.metadata["resetstate"], dict(self.registry())))
+        if operation == "start":
+            self.azure.cluster_state = "Running"
+        if operation == "stop":
+            if self.stop_unknown:
+                raise b.Failure("ARM stop outcome unknown")
+            self.azure.cluster_state = "Stopped"
+
+    def fake_reconcile(self, azure, tables, wait_seconds=0):
+        self.observed.append(("kql", azure.metadata["resetstate"], dict(self.registry())))
+        azure.events.append(("kql", "reconcile"))
+
+    def fake_child(self, command, timeout, cwd=None, env=None):
+        generation = env["ARROWCOL_EXPECTED_RESET_GENERATION"]
+        child = str(uuid.uuid4())
+        self.child["generation"], self.child["id"] = generation, child
+        # Rust child: admits own UUID at the expected generation, drains, unregisters.
+        self.control.admit(child, generation, bootstrap=True)
+        self.control.clean_release(child, generation, definitively_drained=True)
+        if self.child.get("then"):
+            self.child["then"]()
+        result = type("Result", (), {})()
+        result.returncode, result.stdout, result.stderr = 0, "", ""
+        return result
+
+    def provision(self, infra_only=False):
+        b.provision(self.azure, self.tables, 0, self.output, infra_only, {})
+
+    def test_fresh_container_initializes_v1_then_parent_member_owns_start_and_kql(self):
+        self.azure.checkpoint_exists, self.azure.cluster_state = False, "Stopped"
+        self.provision()
+        exists, fresh, _ = self.deployed[0]
+        self.assertFalse(exists)
+        self.assertEqual(fresh["resetstate"], "fenced-v1")
+        self.assertEqual((fresh["occupancy"], fresh["publishers"], fresh["publisherregistryversion"]),
+                         ("released", "{}", "1"))
+        self.assertEqual(str(uuid.UUID(fresh["resetgeneration"])), fresh["resetgeneration"])
+        self.assertEqual(self.child["generation"], fresh["resetgeneration"])
+        for operation, state, registry in self.observed:  # start and KQL
+            self.assertEqual(state, "fenced-v1")
+            self.assertEqual(len(registry), 1, operation)
+            self.assertNotIn(self.child["id"], registry)
+        self.assertEqual([item[0] for item in self.observed], ["start", "kql"])
+        self.assertEqual(self.azure.metadata["resetstate"], "ready-v1")
+        self.assertEqual(self.azure.metadata["resetgeneration"], fresh["resetgeneration"])
+        self.assertEqual(self.registry(), {})
+        self.assertEqual(b.load_env(self.output)["ARROWCOL_RESET_GENERATION"], fresh["resetgeneration"])
+
+    def test_redeploy_preserves_all_container_state_under_registered_member(self):
+        self.azure.metadata["custom"] = "preserved"
+        before = dict(self.azure.metadata)
+        self.provision()
+        exists, metadata, registry = self.deployed[0]
+        self.assertTrue(exists)
+        self.assertEqual(metadata, {})
+        self.assertEqual(len(registry), 1)  # deploy ran under a normal member
+        self.assertEqual(self.azure.metadata, before)
+        self.assertEqual({event[1] for event in self.azure.events if event[0] == "control"}, {"ready-v1"})
+        self.assertNotIn("generation", self.child)  # no rotation or re-initialization
+        self.assertEqual(b.load_env(self.output)["ARROWCOL_RESET_GENERATION"], before["resetgeneration"])
+
+    def test_legacy_or_unversioned_authority_is_refused_without_migration(self):
+        for legacy in ({"resetstate": "ready"}, {"resetstate": "fenced"}):
+            azure = FakeAzure()
+            azure.metadata = {"sandboxid": azure.c.sandbox, "resetgeneration": str(uuid.uuid4()), **legacy}
+            before = dict(azure.metadata)
+            with patch.object(azure, "cli") as cli:
+                for entry in (lambda: b.provision(azure, self.tables, 0, self.output, False, {}),
+                              lambda: b.reconcile_command(azure, self.tables, ""),
+                              lambda: b.stop_cluster(azure),
+                              lambda: b.occupancy(azure, "occupy", str(uuid.uuid4()))):
+                    with self.assertRaisesRegex(b.Failure, "Legacy or unversioned"):
+                        entry()
+                cli.assert_not_called()
+            self.assertEqual(azure.metadata, before)
+            self.assertEqual(azure.events, [])
+
+    def test_cleanup_owned_or_nonempty_fenced_authority_refuses_provision(self):
+        for state, publishers in (("cleaning-v1", {str(uuid.uuid4()): "active"}),
+                                  ("fenced-v1", {str(uuid.uuid4()): "uncertain"})):
+            generation = self.azure.metadata["resetgeneration"]
+            self.azure.metadata.update(resetstate=state, publishers=json.dumps(
+                {k: {"generation": generation, "state": v} for k, v in publishers.items()}))
+            with self.assertRaises(b.Failure):
+                self.provision()
+            self.assertNotIn(("arm", "deploy"), self.azure.events)
+
+    def test_stop_hold_first_blocks_bootstrap_before_any_io(self):
+        self.azure.metadata["resetstate"] = "fenced-v1"
+        self.stop_unknown = True
+        with self.assertRaises(b.Failure):
+            b.stop_cluster(self.azure)
+        self.assertEqual(self.azure.metadata["occupancy"], "stopping")
+        self.azure.events.clear()
+        with self.assertRaises(b.Failure):
+            self.provision()
+        self.assertEqual([e for e in self.azure.events if e[0] in ("arm", "kql")], [])
+        with self.assertRaises(b.Failure):
+            self.control.admit(str(uuid.uuid4()), self.azure.metadata["resetgeneration"], bootstrap=True)
+
+    def test_bootstrap_member_first_blocks_stop_before_arm(self):
+        self.azure.metadata["resetstate"] = "fenced-v1"
+        results = []
+        def stop_during(azure, tables, wait_seconds=0):
+            self.fake_reconcile(azure, tables, wait_seconds)
+            try:
+                b.stop_cluster(azure)
+            except b.Failure as exc:
+                results.append(str(exc))
+        with patch.object(b, "reconcile", side_effect=stop_during):
+            self.provision()
+        self.assertEqual(len(results), 1)
+        self.assertIn("protect the cluster", results[0])
+        self.assertNotIn(("arm", "stop"), self.azure.events)
+        self.assertEqual(self.azure.metadata["resetstate"], "ready-v1")
+
+    def test_stop_between_child_drain_and_parent_admission_fails_parent_before_kql(self):
+        self.azure.metadata["resetstate"] = "fenced-v1"
+        self.stop_unknown = True
+        def stop_now():
+            with self.assertRaises(b.Failure):
+                b.stop_cluster(self.azure)
+        self.child["then"] = stop_now
+        with self.assertRaises(b.Failure):
+            self.provision()
+        self.assertNotIn("start", [item[0] for item in self.observed])
+        self.assertNotIn("kql", [item[0] for item in self.observed])
+        self.assertEqual(self.registry(), {})
+        self.assertEqual(self.azure.metadata["occupancy"], "stopping")
+
+    def test_normal_member_blocks_stop_and_stop_hold_blocks_normal_admission(self):
+        generation = self.azure.metadata["resetgeneration"]
+        member = str(uuid.uuid4())
+        self.control.admit(member, generation)
+        with self.assertRaisesRegex(b.Failure, "protect the cluster"):
+            b.stop_cluster(self.azure)
+        self.assertNotIn(("arm", "stop"), self.azure.events)
+        self.control.clean_release(member, generation, definitively_drained=True)
+        self.stop_unknown = True
+        with self.assertRaises(b.Failure):
+            b.stop_cluster(self.azure)
+        with self.assertRaisesRegex(b.Failure, "stop holds"):
+            self.control.admit(str(uuid.uuid4()), generation)
+        with self.assertRaises(b.Failure):
+            b.reconcile_command(self.azure, self.tables, "")
+        self.assertEqual(self.registry(), {})
+
+    def test_public_reconcile_holds_member_for_start_and_kql_then_releases(self):
+        self.azure.cluster_state = "Stopped"
+        b.reconcile_command(self.azure, self.tables, "")
+        self.assertEqual([item[0] for item in self.observed], ["start", "kql"])
+        self.assertTrue(all(len(item[2]) == 1 for item in self.observed))
+        self.assertEqual(self.registry(), {})
+
+    def test_unknown_arm_start_keeps_member_blocking_and_stop_refused(self):
+        self.azure.cluster_state = "Stopped"
+        def unknown(*args):
+            self.fake_cli(*args)
+            raise b.Failure("ARM start outcome unknown")
+        with patch.object(self.azure, "cli", side_effect=unknown):
+            with self.assertRaises(b.Failure):
+                b.reconcile_command(self.azure, self.tables, "")
+        self.azure.cluster_state = "Running"  # a Running snapshot is not drain proof
+        self.assertEqual([entry["state"] for entry in self.registry().values()], ["uncertain"])
+        with self.assertRaisesRegex(b.Failure, "protect the cluster"):
+            b.stop_cluster(self.azure)
+        self.assertNotIn(("arm", "stop"), self.azure.events)
+
+    def test_not_ready_reconcile_clean_releases_member(self):
+        with patch.object(b, "reconcile", side_effect=b.NotReady("absent")):
+            with self.assertRaises(b.NotReady):
+                b.reconcile_command(self.azure, self.tables, "")
+        self.assertEqual(self.registry(), {})
+
+    def test_release_requires_generation_owner_and_empty_registry(self):
+        owner = str(uuid.uuid4())
+        generation = self.azure.metadata["resetgeneration"]
+        b.occupancy(self.azure, "occupy", owner)
+        member = str(uuid.uuid4())
+        self.control.admit(member, generation)
+        for args in ((owner, generation), (owner, str(uuid.uuid4())), (owner, None),
+                     (str(uuid.uuid4()), generation)):
+            with self.assertRaises(b.Failure):
+                b.occupancy(self.azure, "release", args[0], generation=args[1])
+            self.assertEqual(self.azure.metadata["occupancy"], "testing")
+        self.control.uncertain(member, generation)
+        with self.assertRaisesRegex(b.Failure, "occupancy retained"):
+            b.occupancy(self.azure, "release", owner, generation=generation)
+        self.assertEqual(self.azure.metadata["occupancy"], "testing")
         azure = FakeAzure()
-        existing = {"properties": {"metadata": dict(azure.metadata)}}
-        azure.metadata["occupancy"] = "testing"
-        with patch.object(b, "guard_existing"), \
-                patch.object(azure, "arm", return_value=existing), \
-                patch.object(azure, "cli") as cli:
-            with self.assertRaisesRegex(b.Failure, "Cloud tests own"):
-                b.deploy(azure)
+        from publisher_control import PublisherControl
+        control, generation = PublisherControl(azure), azure.metadata["resetgeneration"]
+        b.occupancy(azure, "occupy", owner)
+        control.admit(member, generation)
+        control.clean_release(member, generation, definitively_drained=True)
+        b.occupancy(azure, "release", owner, generation=generation)
+        self.assertEqual(azure.metadata["occupancy"], "released")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_main_dispatches_v1_paths_and_refuses_legacy(self):
+        env = Path(self.directory.name) / ".env"
+        env.write_text(f"AZURE_SUBSCRIPTION_ID={SUB}\n")
+        legacy = FakeAzure()
+        legacy.metadata = {"sandboxid": legacy.c.sandbox, "resetstate": "ready",
+                           "resetgeneration": str(uuid.uuid4())}
+        stderr = io.StringIO()
+        with patch.object(b, "Azure", return_value=legacy), patch.object(b, "preflight"), \
+                patch.object(legacy, "cli") as cli, contextlib.redirect_stderr(stderr):
+            for command in (["provision"], ["reconcile"], ["stop", "--execute"],
+                            ["occupy", "--occupancy-id", str(uuid.uuid4())]):
+                self.assertEqual(b.main([*command, "--env-file", str(env), "--output", str(self.output),
+                                         "--tables", str(self.tables)]), 1)
             cli.assert_not_called()
-        self.assertEqual(azure.events, [])
-
+        self.assertEqual(stderr.getvalue().count("Legacy or unversioned"), 4)
+        owner = str(uuid.uuid4())
+        with patch.object(b, "Azure", return_value=self.azure), patch.object(b, "preflight"):
+            self.assertEqual(b.main(["occupy", "--occupancy-id", owner, "--env-file", str(env),
+                                     "--output", str(self.output)]), 0)
+            generation = b.load_env(self.output)["ARROWCOL_RESET_GENERATION"]
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(b.main(["release", "--occupancy-id", owner, "--env-file", str(env)]), 1)
+            self.assertEqual(b.main(["release", "--occupancy-id", owner, "--reset-generation",
+                                     generation, "--env-file", str(env)]), 0)
+        self.assertEqual(self.azure.metadata["occupancy"], "released")
 
 class PublisherRegistryTests(unittest.TestCase):
     def metadata(self, entries):
