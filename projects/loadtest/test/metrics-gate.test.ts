@@ -1,9 +1,25 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
 import { metricRangeEvidence, panelDiagnostics, panelFrameEvidence } from '../src/metrics-gate.js';
 
 const range = (values: Array<[number, string]>) => ({ status: 'success', data: { resultType: 'matrix', result: [{ values }] } });
+
+test('every rendered time-series panel overrides the datasource 60s floor with the actual 2s export cadence', () => {
+  const dashboard = JSON.parse(readFileSync(new URL('../observability/delta-operations.json', import.meta.url), 'utf8'));
+  const panels = dashboard.panels.filter((panel: { type: string }) => panel.type === 'timeseries');
+  assert.deepEqual(panels.map((panel: { id: number }) => panel.id), [1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15]);
+  for (const panel of panels) {
+    assert.equal(panel.interval, '2s', `panel ${panel.id} must set Grafana's panel query interval`);
+    assert.equal(panel.datasource.uid, 'prometheus');
+    assert.ok(panel.targets.length > 0);
+  }
+  const table = dashboard.panels.find((panel: { id: number }) => panel.id === 9);
+  assert.equal(table.type, 'table');
+  assert.equal(table.targets[0].instant, true);
+  assert.equal(table.interval, undefined);
+});
 
 test('real samples, not JSON validity or a zero fallback, prove exercised metrics', () => {
   assert.deepEqual(metricRangeEvidence(range([[1, '0'], [2, '4'], [3, '8']])), { series: 1, samples: 3, maximum: 8 });
@@ -13,6 +29,23 @@ test('real samples, not JSON validity or a zero fallback, prove exercised metric
     range([[1, '1'], [1, '2'], [3, '3']])]) {
     assert.throws(() => metricRangeEvidence(invalid));
   }
+});
+
+test('the CI eight-frame response fails even when four dense frames mask four sparse maintenance frames', () => {
+  const frame = (samples: number) => ({
+    schema: { fields: [{ type: 'number' }] },
+    data: { values: [Array.from({ length: samples }, (_, index) => index + 1)] },
+  });
+  const response = { results: { A: { frames: Array.from({ length: 8 }, (_, index) => frame(index < 4 ? 3 : 1)) } } };
+  const request = { queries: [{ refId: 'A', intervalMs: 60_000, maxDataPoints: 1600 }] };
+  assert.throws(() => panelFrameEvidence(response), /frame 4, samples 1/u);
+  assert.deepEqual(panelDiagnostics(response, request).queryResolution,
+    [{ refId: 'A', intervalMs: 60_000, maxDataPoints: 1600 }]);
+  // A finer request alone is not evidence that the sparse response was fixed.
+  request.queries[0].intervalMs = 2000;
+  assert.throws(() => panelFrameEvidence(response), /frame 4, samples 1/u);
+  assert.deepEqual(panelFrameEvidence({ results: { A: { frames: Array.from({ length: 8 }, () => frame(3)) } } }),
+    { frames: 8, numericSamples: 24 });
 });
 
 test('panel diagnostics identify a sparse failing frame without relaxing any frame threshold', () => {
