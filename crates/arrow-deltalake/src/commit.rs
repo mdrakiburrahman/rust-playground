@@ -81,6 +81,13 @@ enum Request {
         SchemaRef,
         oneshot::Sender<std::result::Result<DeltaFileWriter, CommitReceiptError>>,
     ),
+    NewPublication(
+        SchemaRef,
+        String,
+        i64,
+        i64,
+        oneshot::Sender<std::result::Result<DeltaFileWriter, CommitReceiptError>>,
+    ),
     Publish(Box<Publication>),
 }
 
@@ -278,6 +285,28 @@ impl BatchedTable {
             .map_err(anyhow::Error::new)
     }
 
+    /// Create a file carrying the stable identity and stamp of one admitted publication.
+    ///
+    /// # Errors
+    /// Returns schema, fencing, partition or worker failures.
+    pub async fn new_file_with_publication(
+        &self,
+        schema: SchemaRef,
+        app_id: String,
+        version: i64,
+        ingested_at_ms: i64,
+    ) -> Result<DeltaFileWriter> {
+        let (reply, receive) = oneshot::channel();
+        self.sender
+            .send(Request::NewPublication(schema, app_id, version, ingested_at_ms, reply))
+            .await
+            .context("Delta worker stopped")?;
+        receive
+            .await
+            .context("Delta worker stopped during publication preparation")?
+            .map_err(anyhow::Error::new)
+    }
+
     /// Admit one eligible durable file, waiting asynchronously when capacity is full.
     ///
     /// # Errors
@@ -409,6 +438,17 @@ fn run_worker(
                         }
                         let _ = reply.send(result);
                     }
+                    Some(Request::NewPublication(schema, app_id, version, stamp, reply)) => {
+                        let result = match (&table, &failure) {
+                            (Ok(table), None) => table
+                                .new_file_with_publication(schema, app_id, version, stamp)
+                                .map_err(CommitReceiptError::from_anyhow),
+                            _ => Err(failure.clone().unwrap_or_else(|| {
+                                CommitReceiptError::commit_failed("Delta table initialization failed")
+                            })),
+                        };
+                        let _ = reply.send(result);
+                    }
                     Some(Request::Publish(publication)) => {
                         if let Some(error) = &failure {
                             let _ = publication.reply.send(Err(error.clone()));
@@ -438,7 +478,7 @@ fn run_worker(
                     Request::Ready(reply) => {
                         let _ = reply.send(Err(message.clone()));
                     }
-                    Request::NewFile(_, reply) => {
+                    Request::NewFile(_, reply) | Request::NewPublication(_, _, _, _, reply) => {
                         let _ = reply.send(Err(message.clone()));
                     }
                     Request::Publish(publication) => {
