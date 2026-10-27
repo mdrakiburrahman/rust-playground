@@ -19,11 +19,12 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
+use arrow_deltalake::AzureCliTokenProvider;
 use delta_inspect::{SnapshotInventory, SnapshotSummary, TableInventory, TableSummary};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::{sync::Mutex, task::JoinHandle};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::{cli::RunArgs, transport::now_unix_millis};
@@ -35,7 +36,6 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const CACHE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_CACHE_TIMEOUT: Duration = Duration::from_secs(300);
-const TOKEN_LIFETIME: Duration = Duration::from_secs(30 * 60);
 const TOKEN_TIMEOUT: Duration = Duration::from_secs(60);
 /// Shortest policy the service accepts; bounds cache staleness after each Delta commit.
 const LOCAL_MAX_AGE: &str = "00:01:00";
@@ -66,7 +66,8 @@ struct KustoClient {
     database: String,
     mode: Mode,
     results: PathBuf,
-    token: Arc<Mutex<Option<(String, Instant)>>>,
+    /// Shared bounded Azure CLI provider scoped to this cluster; absent in local mode.
+    token: Option<Arc<AzureCliTokenProvider>>,
 }
 
 impl KustoClient {
@@ -109,6 +110,13 @@ impl KustoClient {
                     .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-')),
             "invalid Kusto database name"
         );
+        let token = match mode {
+            Mode::Local => None,
+            Mode::Azure => Some(Arc::new(AzureCliTokenProvider::new(
+                &format!("https://{}/.default", endpoint.host_str().unwrap_or_default()),
+                TOKEN_TIMEOUT,
+            )?)),
+        };
         Ok(Self {
             http: Client::builder()
                 .timeout(REQUEST_TIMEOUT)
@@ -119,56 +127,16 @@ impl KustoClient {
             database: database.to_owned(),
             mode,
             results: results.to_owned(),
-            token: Arc::default(),
+            token,
         })
     }
 
     /// Azure tokens come from the ambient Azure CLI login and are never logged or persisted.
     async fn token(&self) -> Result<Option<String>> {
-        if self.mode == Mode::Local {
-            return Ok(None);
+        match &self.token {
+            None => Ok(None),
+            Some(provider) => provider.token().await.map(Some),
         }
-        let mut cached = self.token.lock().await;
-        if let Some((token, at)) = cached.as_ref()
-            && at.elapsed() < TOKEN_LIFETIME
-        {
-            return Ok(Some(token.clone()));
-        }
-        let resource = self.endpoint.as_str().trim_end_matches('/').to_owned();
-        let command = tokio::process::Command::new("az")
-            .args([
-                "account",
-                "get-access-token",
-                "--resource",
-                &resource,
-                "--query",
-                "accessToken",
-                "--output",
-                "tsv",
-            ])
-            .stdin(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .output();
-        // Bounded; stderr is discarded because it may echo account details.
-        let output = tokio::time::timeout(TOKEN_TIMEOUT, command)
-            .await
-            .context("Azure CLI token request timed out")?
-            .context("run Azure CLI for a Kusto access token")?;
-        ensure!(
-            output.status.success(),
-            "Azure CLI could not obtain a Kusto access token ({})",
-            output.status
-        );
-        let token = String::from_utf8(output.stdout)
-            .context("Azure CLI token is not UTF-8")?
-            .trim()
-            .to_owned();
-        ensure!(
-            !token.is_empty() && !token.contains(char::is_whitespace),
-            "Azure CLI returned an invalid Kusto token"
-        );
-        *cached = Some((token.clone(), Instant::now()));
-        Ok(Some(token))
     }
 
     async fn execute(&self, command: &str, management: bool, phase: &str) -> Result<Vec<BTreeMap<String, Value>>> {
@@ -184,20 +152,24 @@ impl KustoClient {
         if let Some(token) = self.token().await? {
             builder = builder.bearer_auth(token);
         }
-        let response = builder.send().await.context("Kusto HTTP request failed")?;
+        let response = builder
+            .send()
+            .await
+            .map_err(|error| anyhow::anyhow!("Kusto HTTP request failed: {}", redact_text(&error.to_string())))?;
         let status = response.status();
         let text = response.text().await.context("Kusto response body failed")?;
         let body: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({"error": text}));
+        let public = sanitize(&body);
         append(
             &self.results.join("kusto-queries.jsonl"),
             &json!({
                 "at_unix_ms": now_unix_millis(), "phase": phase,
-                "management": management, "csl": command,
-                "http_status": status.as_u16(), "response": body
+                "management": management, "csl": redact_text(command),
+                "http_status": status.as_u16(), "response": public
             }),
         )?;
-        ensure!(status.is_success(), "Kusto HTTP {status}: {body}");
-        decode_response(&body)
+        ensure!(status.is_success(), "Kusto HTTP {status}: {public}");
+        decode_response(&body).map_err(|error| anyhow::anyhow!(redact_text(&format!("{error:#}"))))
     }
 
     async fn bootstrap(&self) -> Result<()> {
@@ -308,11 +280,23 @@ impl KustoClient {
     }
 
     async fn acceleration(&self, name: &str, max_age: &str, commit_ms: Option<u64>) -> Result<Acceleration> {
+        Ok(self
+            .acceleration_row(name, max_age, commit_ms)
+            .await?
+            .unwrap_or_default())
+    }
+
+    async fn acceleration_row(
+        &self,
+        name: &str,
+        max_age: &str,
+        commit_ms: Option<u64>,
+    ) -> Result<Option<Acceleration>> {
         let rows = self
             .execute(&acceleration_command(name, max_age, commit_ms)?, true, "qap")
             .await?;
         ensure!(rows.len() <= 1, "duplicate acceleration statistics for {name}");
-        Ok(rows.first().map(Acceleration::from_row).unwrap_or_default())
+        Ok(rows.first().map(Acceleration::from_row))
     }
 
     /// Best-effort sanitized `QueryAccelerationState`; never fails validation on its own.
@@ -558,7 +542,7 @@ impl Exposure {
 
     fn persist(&mut self, error: Option<&anyhow::Error>) -> Result<()> {
         if let Some(error) = error {
-            let message = format!("{error:#}");
+            let message = short_error(error);
             if self.status.error.as_ref() != Some(&message) {
                 eprintln!("Kusto DEGRADED (collector load continues): {message}");
             }
@@ -631,16 +615,18 @@ impl Exposure {
             .filter_map(|row| row.get("TableName").and_then(Value::as_str))
             .filter(|name| name.starts_with("direct_sqlserver_") || name.starts_with("dataflow_sqlserver_"))
         {
-            if live.load(Ordering::Acquire)
-                && !self.status.live_tables.contains(name)
-                && self
-                    .client
-                    .count(&external_source(name)?, "live-observation")
-                    .await
-                    .is_ok_and(|rows| rows > 0)
-                && live.load(Ordering::Acquire)
-            {
-                self.status.live_tables.insert(name.to_owned());
+            if !live.load(Ordering::Acquire) || self.status.live_tables.contains(name) {
+                continue;
+            }
+            match self.client.count(&external_source(name)?, "live-observation").await {
+                Ok(rows) if rows > 0 && live.load(Ordering::Acquire) => {
+                    self.status.live_tables.insert(name.to_owned());
+                }
+                Ok(_) => {}
+                // Infrastructure may still be rebinding the table or the run root may not have its
+                // first commit yet; anything else (auth, partial failure, malformed) is degraded.
+                Err(error) if not_yet_readable(&error) => {}
+                Err(error) => return Err(error.context(format!("live observation of {name}"))),
             }
         }
         Ok(())
@@ -976,10 +962,8 @@ fn sanitize(value: &Value) -> Value {
             let parsed = json_value(value);
             if parsed.is_object() || parsed.is_array() {
                 sanitize(&parsed)
-            } else if text.contains("://") || text.starts_with('/') || text.contains("@'") || text.contains("sig=") {
-                json!("[redacted]")
             } else {
-                value.clone()
+                Value::String(redact_text(text))
             }
         }
         other => other.clone(),
@@ -987,12 +971,48 @@ fn sanitize(value: &Value) -> Value {
 }
 
 fn short_error(error: &anyhow::Error) -> String {
-    sanitize(&json!(format!("{error:#}")))
-        .as_str()
-        .unwrap_or("[redacted]")
-        .chars()
-        .take(512)
-        .collect()
+    redact_text(&format!("{error:#}")).chars().take(512).collect()
+}
+
+/// Replaces location-, identity-, and credential-shaped tokens (URIs, absolute paths, Azure
+/// resource IDs, GUIDs such as subscription or managed identity IDs, UPNs, SAS signatures, and
+/// JWTs) while keeping the surrounding diagnostic text.
+fn redact_text(text: &str) -> String {
+    fn sensitive(token: &str) -> bool {
+        let lower = token.to_ascii_lowercase();
+        lower.contains("://")
+            || token.starts_with('/')
+            || token.starts_with('\\')
+            || lower.contains("sig=")
+            || lower.contains("/subscriptions/")
+            || (lower.starts_with("eyj") && token.len() >= 32)
+            || (token.contains('@') && token.contains('.'))
+            || token.as_bytes().windows(36).any(|window| {
+                window.iter().enumerate().all(|(index, byte)| {
+                    if matches!(index, 8 | 13 | 18 | 23) {
+                        *byte == b'-'
+                    } else {
+                        byte.is_ascii_hexdigit()
+                    }
+                })
+            })
+    }
+    let mut output = String::with_capacity(text.len());
+    let mut token = String::new();
+    let flush = |token: &mut String, output: &mut String| {
+        output.push_str(if sensitive(token) { "[redacted]" } else { token });
+        token.clear();
+    };
+    for character in text.chars() {
+        if character.is_whitespace() || "\"'`()[]{},;<>".contains(character) {
+            flush(&mut token, &mut output);
+            output.push(character);
+        } else {
+            token.push(character);
+        }
+    }
+    flush(&mut token, &mut output);
+    output
 }
 
 fn cache_timeout() -> Result<Duration> {
@@ -1102,6 +1122,21 @@ impl ReplayQuiescence {
         }
         now.duration_since(*self.quiet_since.get_or_insert(now)) >= REPLAY_QUIET_PERIOD
     }
+}
+
+/// Kusto's answer for an external table whose definition or Delta log does not exist yet.
+fn not_yet_readable(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}");
+    message.contains("Kusto HTTP 400")
+        && [
+            "EntityNotFound",
+            "not found",
+            "does not exist",
+            "_delta_log",
+            "General_BadRequest",
+        ]
+        .iter()
+        .any(|marker| message.contains(marker))
 }
 
 /// Azure oracle roots are credential-free `abfss://` URLs read by the independent cloud reader.
@@ -1243,68 +1278,7 @@ pub(crate) async fn validate(
             });
         }
     }
-    let deadline = Instant::now() + cache_timeout()?;
-    let started = Instant::now();
-    let mut cached: BTreeMap<String, Value> = BTreeMap::new();
-    let mut attempts: BTreeMap<String, u64> = BTreeMap::new();
-    let mut last_failure: BTreeMap<String, String> = BTreeMap::new();
-    while cached.len() < checks.len() {
-        for check in &checks {
-            if cached.contains_key(&check.name) {
-                continue;
-            }
-            let before = client
-                .acceleration(&check.name, &check.max_age, check.commit_ms)
-                .await?;
-            let state = CacheState::from_details(&client.details(&check.name).await);
-            if !before.ready() || !state.current(check.summary.version, check.summary.rows) {
-                last_failure.insert(check.name.clone(), format!("cache not ready: {before:?} {state:?}"));
-                continue;
-            }
-            *attempts.entry(check.name.clone()).or_default() += 1;
-            let result = client
-                .multiset(&external_source(&check.name)?, &check.summary.schema, &check.samples)
-                .await?;
-            let after = client
-                .acceleration(&check.name, &check.max_age, check.commit_ms)
-                .await?;
-            // A stale-but-ready-looking cache is retried until it converges or the deadline elapses.
-            let verdict = result.check(check.summary.rows, &check.samples).and_then(|()| {
-                ensure!(result == check.fallback, "cached multiset differs from fallback");
-                ensure!(after.ready(), "cache left ready state during the query: {after:?}");
-                Ok(())
-            });
-            match verdict {
-                Ok(()) => {
-                    cached.insert(
-                        check.name.clone(),
-                        json!({
-                            "query": external_source(&check.name)?,
-                            "result": result.evidence(),
-                            "attempts": attempts[&check.name],
-                            "converged_after_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                            "before": before, "after": after, "state": state,
-                        }),
-                    );
-                }
-                Err(error) => {
-                    last_failure.insert(check.name.clone(), format!("{error:#}"));
-                }
-            }
-        }
-        if cached.len() == checks.len() {
-            break;
-        }
-        ensure!(
-            Instant::now() < deadline,
-            "accelerated cache did not converge to the captured Delta snapshot: {:?}",
-            last_failure
-                .iter()
-                .filter(|(name, _)| !cached.contains_key(*name))
-                .collect::<BTreeMap<_, _>>()
-        );
-        tokio::time::sleep(CACHE_POLL_INTERVAL).await;
-    }
+    let cached = converge(&client, &checks, cache_timeout()?).await?;
     let mut evidence = BTreeMap::new();
     for check in &checks {
         let statistics = client
@@ -1344,8 +1318,181 @@ pub(crate) async fn validate(
     }))
 }
 
+const OBSERVATIONS_PER_TABLE: usize = 32;
+
+/// Waits, under one fixed deadline covering every request, sleep and token refresh, until each
+/// table's accelerated cache reports the captured version and returns the oracle multiset. A
+/// success observed at or after the deadline is not accepted.
+async fn converge(client: &KustoClient, checks: &[TableCheck], timeout: Duration) -> Result<BTreeMap<String, Value>> {
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let elapsed = || u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let mut cached: BTreeMap<String, Value> = BTreeMap::new();
+    let mut attempts: BTreeMap<String, u64> = BTreeMap::new();
+    let mut observations: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    let mut last_failure: BTreeMap<String, String> = BTreeMap::new();
+    let observe = |observations: &mut BTreeMap<String, Vec<Value>>, name: &str, observation: Value| {
+        let history = observations.entry(name.to_owned()).or_default();
+        if history.len() == OBSERVATIONS_PER_TABLE {
+            history.remove(0);
+        }
+        history.push(observation);
+    };
+    let polling = async {
+        loop {
+            for check in checks {
+                if cached.contains_key(&check.name) {
+                    continue;
+                }
+                *attempts.entry(check.name.clone()).or_default() += 1;
+                let before = client
+                    .acceleration(&check.name, &check.max_age, check.commit_ms)
+                    .await?;
+                let state = CacheState::from_details(&client.details(&check.name).await);
+                if !before.ready() || !state.current(check.summary.version, check.summary.rows) {
+                    let reason = format!("cache not ready: {before:?} {state:?}");
+                    observe(
+                        &mut observations,
+                        &check.name,
+                        json!({
+                            "elapsed_ms": elapsed(), "outcome": "not-ready", "statistics": before, "state": state
+                        }),
+                    );
+                    last_failure.insert(check.name.clone(), reason);
+                    continue;
+                }
+                let result = client
+                    .multiset(&external_source(&check.name)?, &check.summary.schema, &check.samples)
+                    .await?;
+                let after = client
+                    .acceleration(&check.name, &check.max_age, check.commit_ms)
+                    .await?;
+                // A stale-but-ready-looking cache is retried until it converges or the deadline elapses.
+                let verdict = result.check(check.summary.rows, &check.samples).and_then(|()| {
+                    ensure!(result == check.fallback, "cached multiset differs from fallback");
+                    ensure!(after.ready(), "cache left ready state during the query: {after:?}");
+                    ensure!(
+                        Instant::now() < deadline,
+                        "cache verified only after the fixed deadline"
+                    );
+                    Ok(())
+                });
+                let outcome = match &verdict {
+                    Ok(()) => "converged".to_owned(),
+                    Err(error) => short_error(error),
+                };
+                observe(
+                    &mut observations,
+                    &check.name,
+                    json!({
+                        "elapsed_ms": elapsed(), "outcome": outcome, "result": result.evidence(),
+                        "statistics": before, "state": state
+                    }),
+                );
+                match verdict {
+                    Ok(()) => {
+                        cached.insert(
+                            check.name.clone(),
+                            json!({
+                                "query": external_source(&check.name)?,
+                                "result": result.evidence(),
+                                "attempts": attempts[&check.name],
+                                "converged_after_ms": elapsed(),
+                                "deadline_ms": u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                                "before": before, "after": after, "state": state,
+                            }),
+                        );
+                    }
+                    Err(error) => {
+                        last_failure.insert(check.name.clone(), short_error(&error));
+                    }
+                }
+            }
+            if cached.len() == checks.len() || Instant::now() >= deadline {
+                return Ok::<(), anyhow::Error>(());
+            }
+            tokio::time::sleep_until(tokio::time::Instant::from_std(
+                (Instant::now() + CACHE_POLL_INTERVAL).min(deadline),
+            ))
+            .await;
+        }
+    };
+    if let Ok(outcome) = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), polling).await {
+        outcome?;
+    }
+    ensure!(
+        cached.len() == checks.len(),
+        "accelerated cache did not converge to the captured Delta snapshot within {timeout:?}: {:?}",
+        checks
+            .iter()
+            .filter(|check| !cached.contains_key(&check.name))
+            .map(|check| (
+                check.name.as_str(),
+                last_failure
+                    .get(&check.name)
+                    .map_or("no observation before the deadline", String::as_str)
+            ))
+            .collect::<BTreeMap<_, _>>()
+    );
+    for (name, evidence) in &mut cached {
+        evidence["observations"] = json!(observations.remove(name).unwrap_or_default());
+    }
+    Ok(cached)
+}
+
+/// Read-only, phase-aligned QAP observation for live telemetry while load is running. It never
+/// creates or alters tables, policies, or databases and makes no correctness claim: `Fresh` is
+/// `null` because no captured source generation is referenced. Missing measurements stay `null`;
+/// absent or not-yet-provisioned tables are reported per table as unavailable.
+#[allow(dead_code, reason = "exported for the runner's live LGTM observation CLI")]
+pub async fn observe_qap(
+    endpoint: &str,
+    results: &Path,
+    database: Option<&str>,
+    tables: &[String],
+    deadline: Duration,
+) -> Result<Value> {
+    let client = match database {
+        Some(database) => KustoClient::with_mode(endpoint, results, Mode::from_env()?, database)?,
+        None => KustoClient::new(endpoint, results)?,
+    };
+    tokio::time::timeout(deadline, async {
+        let mut observed = BTreeMap::new();
+        for name in tables {
+            observed.insert(name.clone(), observe_table(&client, name).await);
+        }
+        json!({
+            "observed_unix_ms": now_unix_millis(), "backend": BACKEND, "mode": client.mode,
+            "capacity": client.capacity().await, "tables": observed
+        })
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("QAP observation exceeded its {deadline:?} deadline"))
+}
+
+async fn observe_table(client: &KustoClient, name: &str) -> Value {
+    let observed = async {
+        let (policy, max_age) = client.max_age(name).await?;
+        let statistics = match client.acceleration_row(name, &max_age, None).await? {
+            Some(row) => {
+                let mut statistics = serde_json::to_value(row)?;
+                statistics["Fresh"] = Value::Null;
+                statistics
+            }
+            None => Value::Null,
+        };
+        let details = client.details(name).await;
+        let state = CacheState::from_details(&details);
+        Ok::<_, anyhow::Error>(json!({
+            "available": true, "policy": policy, "statistics": statistics, "state": state, "details": details
+        }))
+    }
+    .await;
+    observed.unwrap_or_else(|error| json!({"available": false, "error": short_error(&error)}))
+}
+
 pub(crate) fn validation_failure(results: &Path, error: &anyhow::Error) -> Result<Value> {
-    let report = json!({"passed":false, "backend": BACKEND, "error":format!("{error:#}")});
+    let report = json!({"passed":false, "backend": BACKEND, "error": short_error(error)});
     write_json(&results.join("kusto-validation.json"), &report)?;
     Ok(report)
 }
@@ -1362,7 +1509,7 @@ pub(crate) fn degraded(results: &Path, run_id: &str, error: &anyhow::Error) -> R
         }
     };
     status.state = "degraded".to_owned();
-    status.error = Some(format!("{error:#}"));
+    status.error = Some(short_error(error));
     write_json(&path, &status)
 }
 
@@ -1823,8 +1970,252 @@ mod tests {
         Ok(())
     }
 
+    const CANARIES: [&str; 6] = [
+        "CANARYSIG",
+        "acct.dfs",
+        "11111111-2222",
+        "99999999-aaaa",
+        "eyJhbGciOi",
+        "/delta/private",
+    ];
+
+    fn assert_public(text: &str) {
+        for canary in CANARIES {
+            assert!(!text.contains(canary), "{canary} leaked: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn private_identifiers_never_reach_logs_status_or_reports() -> Result<()> {
+        let directory = Directory::new()?;
+        let message = "Partial query failure: abfss://private@acct.dfs.core.windows.net/x?sig=CANARYSIG \
+            on /subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg identity \
+            99999999-aaaa-bbbb-cccc-dddddddddddd bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.CANARY";
+        let server = Server::start(move |_| {
+            Ok(Some(json!([
+                {"FrameType":"DataTable","TableKind":"PrimaryResult","Columns":[{"ColumnName":"Rows"}],"Rows":[[7]]},
+                {"FrameType":"DataSetCompletion","HasErrors":true,"OneApiErrors":[{"error":{
+                    "message": message,
+                    "@context": format!("{{\"details\":\"{}\"}}", message.replace('"', "'")),
+                }}]}
+            ])))
+        })?;
+        let client = KustoClient::with_mode(&server.endpoint, &directory.0, Mode::Local, DATABASE)?;
+        let error = client
+            .execute(
+                "external_table(\"x\") | where p == h@'/delta/private/x'",
+                false,
+                "validation",
+            )
+            .await
+            .err()
+            .context("HTTP 200 partial failure must fail closed")?;
+        assert_public(&format!("{error:#}"));
+        assert!(
+            format!("{error:#}").contains("Partial query failure"),
+            "diagnostics are kept"
+        );
+        degraded(&directory.0, "run", &error)?;
+        validation_failure(&directory.0, &error)?;
+        for file in ["kusto-queries.jsonl", STATUS, "kusto-validation.json"] {
+            assert_public(&fs::read_to_string(directory.0.join(file))?);
+        }
+        assert_eq!(
+            redact_text("TableVersion 4 at 2026-10-27T03:41:46Z"),
+            "TableVersion 4 at 2026-10-27T03:41:46Z"
+        );
+        Ok(())
+    }
+
+    fn deadline_check() -> TableCheck {
+        TableCheck {
+            name: "direct_x".to_owned(),
+            table: "telemetry.sqlserver.x".to_owned(),
+            pool: "direct",
+            summary: TableSummary {
+                schema: json!({"fields":[{"name":"id","type":"long"}]}),
+                version: 4,
+                active_files: 1,
+                rows: 1,
+                bytes: 1,
+                minimum_file_bytes: 1,
+                maximum_file_bytes: 1,
+                row_hashes: BTreeMap::new(),
+                payload_row_hashes: BTreeMap::new(),
+                files: Vec::new(),
+                partition_columns: Vec::new(),
+            },
+            samples: vec![(json!({"id":1}), 1)],
+            commit_ms: None,
+            max_age: "00:01:00".to_owned(),
+            policy: Value::Null,
+            fallback: Multiset {
+                buckets: BTreeMap::from([(1, (1, 5))]),
+            },
+        }
+    }
+
+    fn ready_cache(delay: Arc<AtomicU64>) -> Result<Server> {
+        Server::start(move |request| {
+            let command = request["csl"].as_str().context("command missing")?;
+            if command.contains("query_acceleration statistics") {
+                return Ok(Some(response(
+                    &[
+                        "HotSize",
+                        "LastUpdatedDateTime",
+                        "PendingFiles",
+                        "PendingBytes",
+                        "Complete",
+                        "Eligible",
+                        "Fresh",
+                    ],
+                    vec![json!([10, "2026-10-27T00:00:00Z", 0, 0, 100.0, 1, 1])],
+                )));
+            }
+            if command.ends_with(" details") {
+                return Ok(Some(response(
+                    &["QueryAccelerationState"],
+                    vec![json!([
+                        "{\"TableVersion\":4,\"IsHealthy\":true,\"RowCount\":1,\"AcceleratedRowCount\":1}"
+                    ])],
+                )));
+            }
+            ensure!(
+                command.starts_with("external_table(\"direct_x\")"),
+                "unexpected {command}"
+            );
+            thread::sleep(Duration::from_millis(delay.load(Ordering::Relaxed)));
+            Ok(Some(response(&["Sample", "Rows", "Hash"], vec![json!([1, 1, 5])])))
+        })
+    }
+
+    #[tokio::test]
+    async fn cache_success_after_the_fixed_deadline_is_rejected() -> Result<()> {
+        let directory = Directory::new()?;
+        let delay = Arc::new(AtomicU64::new(0));
+        let server = ready_cache(Arc::clone(&delay))?;
+        let client = KustoClient::with_mode(&server.endpoint, &directory.0, Mode::Local, DATABASE)?;
+        let checks = [deadline_check()];
+        let converged = converge(&client, &checks, Duration::from_secs(10)).await?;
+        let observations = converged["direct_x"]["observations"]
+            .as_array()
+            .context("observations recorded")?;
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0]["outcome"], "converged");
+        // Every table is ready, but its only cached query returns after the deadline.
+        delay.store(1_500, Ordering::Relaxed);
+        let started = Instant::now();
+        let late = converge(&client, &checks, Duration::from_millis(500)).await;
+        assert!(late.is_err(), "a cached result after the deadline must not pass");
+        assert!(
+            started.elapsed() < Duration::from_millis(1_400),
+            "the deadline covers in-flight requests"
+        );
+        delay.store(0, Ordering::Relaxed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_observation_is_read_only_and_never_fabricates_measurements() -> Result<()> {
+        let directory = Directory::new()?;
+        let commands = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&commands);
+        let server = Server::start(move |request| {
+            let command = request["csl"].as_str().context("command missing")?.to_owned();
+            seen.lock()
+                .map_err(|_| anyhow::anyhow!("poisoned"))?
+                .push(command.clone());
+            if command.contains("direct_absent") {
+                let mut failed = response(&["Rows"], vec![]);
+                failed["Exceptions"] = json!(["'direct_absent' was not found"]);
+                return Ok(Some(failed));
+            }
+            if command.ends_with("policy query_acceleration") {
+                return Ok(Some(response(
+                    &["Policy"],
+                    vec![json!([
+                        "{\"IsEnabled\":true,\"Hot\":\"1.00:00:00\",\"MaxAge\":\"00:01:00\"}"
+                    ])],
+                )));
+            }
+            if command.contains("query_acceleration statistics") && command.contains("direct_ready") {
+                return Ok(Some(response(
+                    &[
+                        "HotSize",
+                        "LastUpdatedDateTime",
+                        "PendingFiles",
+                        "PendingBytes",
+                        "Complete",
+                        "Eligible",
+                        "Fresh",
+                    ],
+                    vec![json!([10, "2026-10-27T00:00:00Z", 2, null, 50.0, 1, 1])],
+                )));
+            }
+            if command.ends_with(" details") {
+                return Ok(Some(response(
+                    &["QueryAccelerationState"],
+                    vec![json!(["{\"TableVersion\":3,\"IsHealthy\":true}"])],
+                )));
+            }
+            if command == ".show capacity" {
+                return Ok(Some(response(&["Resource", "Total"], vec![json!(["Ingestions", 2])])));
+            }
+            Ok(Some(response(&[], vec![])))
+        })?;
+        let tables = ["direct_ready", "direct_empty", "direct_absent"].map(str::to_owned);
+        let observed = observe_qap(
+            &server.endpoint,
+            &directory.0,
+            Some(DATABASE),
+            &tables,
+            Duration::from_secs(10),
+        )
+        .await?;
+        let ready = &observed["tables"]["direct_ready"];
+        assert_eq!(ready["available"], true);
+        assert_eq!(ready["statistics"]["AccelerationPendingDataFilesCount"], 2);
+        assert_eq!(ready["statistics"]["AccelerationPendingDataFilesSize"], Value::Null);
+        assert_eq!(ready["statistics"]["AccelerationCompletePercentage"], 50.0);
+        assert_eq!(ready["statistics"]["Eligible"], true);
+        assert_eq!(ready["statistics"]["Fresh"], Value::Null, "no correctness claim");
+        assert_eq!(ready["state"]["TableVersion"], 3);
+        assert_eq!(ready["state"]["AcceleratedRowCount"], Value::Null);
+        assert_eq!(observed["tables"]["direct_empty"]["statistics"], Value::Null);
+        assert_eq!(observed["tables"]["direct_absent"]["available"], false);
+        assert_eq!(observed["capacity"]["available"], true);
+        let commands = commands.lock().map_err(|_| anyhow::anyhow!("poisoned"))?;
+        assert!(
+            commands
+                .iter()
+                .all(|command| command.starts_with(".show") || command.starts_with("external_table")),
+            "observation must not change state: {commands:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn only_recognized_absence_is_pending_during_azure_startup() {
+        assert!(not_yet_readable(&anyhow::anyhow!(
+            "Kusto HTTP 400 Bad Request: {{\"error\":{{\"code\":\"General_BadRequest\"}}}}"
+        )));
+        assert!(not_yet_readable(
+            &anyhow::anyhow!("Kusto HTTP 400 Bad Request: _delta_log was not found").context("live observation")
+        ));
+        for surfaced in [
+            "Kusto HTTP 401 Unauthorized: {}",
+            "Kusto HTTP 403 Forbidden: EntityNotFound",
+            "Kusto HTTP 500 Internal Server Error: {}",
+            "Kusto HTTP request failed: timed out",
+            "Kusto query reported errors: PartialQueryFailure",
+            "Kusto count missing",
+        ] {
+            assert!(!not_yet_readable(&anyhow::anyhow!("{surfaced}")), "{surfaced}");
+        }
+    }
+
     /// Real-emulator check of every native validation step against a pool root mounted at
-    /// `/delta/direct`. `scripts/kusto-qap-it.sh` writes, mutates and VACUUMs the fixture.
+    /// `/delta/direct`. `loadgen/scripts/kusto-qap-it.sh` writes, mutates and VACUUMs the fixture.
     #[tokio::test]
     #[ignore = "requires KUSTO_IT_ENDPOINT and KUSTO_IT_ROOT (emulator mounting the root at /delta/direct)"]
     async fn native_qap_converges_on_emulator() -> Result<()> {
