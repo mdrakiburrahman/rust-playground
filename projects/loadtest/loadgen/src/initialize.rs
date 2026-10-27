@@ -2,7 +2,7 @@
 
 use std::{env, sync::Arc};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow_deltalake::delta::DeltaTable;
 use arrowcol_catalog::{DdlCommand, DdlParser};
