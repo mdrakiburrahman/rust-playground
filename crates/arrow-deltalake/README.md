@@ -197,10 +197,11 @@ immediately before and after each mutation; failed authority forbids cleanup.
 Core repeats authority after slow local staging/checkpoint preparation, and the
 committer materializes at most 8 MiB of action arrays before its final check.
 
-Azure HTTP attempts time out after ten seconds, with at most two retries,
-ten-second retry admission, and backoff capped at 250 ms. Conservatively, one
-credential acquisition plus three HTTP attempts and two backoffs is at most
-36.5 seconds of configured asynchronous waiting after request preparation.
+Azure HTTP attempts time out after ten seconds and opaque transport retries are
+disabled, including for raw stores shared with checkpoint clients. Delta CAS
+collisions still use their separate eight-attempt classified outer policy.
+One credential acquisition plus one HTTP attempt allows at most 16 seconds of
+configured asynchronous waiting after request preparation.
 A metadata authority request adds up to six seconds of credential admission
 and ten seconds of HTTP waiting. These are **not a hard whole-operation or
 server-completion deadline**: CPU scheduling, runtime suspension, serialization,
