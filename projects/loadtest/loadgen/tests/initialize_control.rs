@@ -5,8 +5,8 @@
 //! The parent-chain case composes the real Python parent's child environment, the
 //! `initialize-delta.sh` contract, the real CLI parser and the parent's manifest validation; it does
 //! not execute the release binary, whose control transport is Azure-only by design.
-//! Compiled only in debug test builds, matching the seam gate in arrow-deltalake.
-#![cfg(debug_assertions)]
+//! Compiled only in debug unix test builds, matching the seam gate in arrow-deltalake.
+#![cfg(all(unix, debug_assertions))]
 
 use anyhow::{Context, Result};
 use arrow_deltalake::delta::DeltaTable;
@@ -25,6 +25,7 @@ use object_store::{
 };
 use std::collections::BTreeMap;
 use std::fmt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -103,6 +104,7 @@ struct Scratch(PathBuf);
 impl Scratch {
     fn new() -> Result<Self> {
         let path = std::env::temp_dir().join(format!("loadgen-initialize-control-{}", uuid::Uuid::new_v4()));
+        std::fs::DirBuilder::new().mode(0o700).create(&path)?;
         std::fs::create_dir_all(path.join("data"))?;
         Ok(Self(path))
     }
@@ -424,43 +426,123 @@ fn repository() -> PathBuf {
 const PARENT_DEADLINE: Duration = Duration::from_secs(120);
 const REAP_DEADLINE: Duration = Duration::from_secs(5);
 
+/// The child operations supervision needs; a seam so poll/kill faults can be injected.
+trait Proc {
+    fn id(&self) -> u32;
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>>;
+    fn kill(&mut self) -> std::io::Result<()>;
+}
+
+impl Proc for std::process::Child {
+    fn id(&self) -> u32 {
+        std::process::Child::id(self)
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        std::process::Child::try_wait(self)
+    }
+
+    fn kill(&mut self) -> std::io::Result<()> {
+        std::process::Child::kill(self)
+    }
+}
+
+/// Owns a live child until it is observed exited; termination (explicit or on drop) kills it
+/// and reaps it within [`REAP_DEADLINE`].
+struct Owned<P: Proc>(Option<P>);
+
+impl<P: Proc> Owned<P> {
+    /// Kills and reaps the owned child, returning its PID only when both succeeded.
+    fn terminate(&mut self) -> Result<u32> {
+        let mut child = self.0.take().context("no owned child to terminate")?;
+        let pid = child.id();
+        let killed = child.kill();
+        let started = Instant::now();
+        loop {
+            if child.try_wait().with_context(|| format!("reap child {pid}"))?.is_some() {
+                break;
+            }
+            anyhow::ensure!(
+                started.elapsed() < REAP_DEADLINE,
+                "child {pid} was not reaped after kill"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        killed.with_context(|| format!("kill child {pid}"))?;
+        Ok(pid)
+    }
+}
+
+impl<P: Proc> Drop for Owned<P> {
+    fn drop(&mut self) {
+        if self.0.is_some()
+            && let Err(error) = self.terminate()
+        {
+            eprintln!("bounded child cleanup failed: {error:#}");
+        }
+    }
+}
+
+#[derive(Debug)]
+enum Supervised {
+    Exited(std::process::ExitStatus),
+    TimedOut(u32),
+}
+
+/// Polls `child` until it exits or `deadline` passes. A poll error or expiry always kills and
+/// reaps it; any kill, poll or reap failure is returned instead of a result.
+fn supervise<P: Proc>(child: P, deadline: Duration) -> Result<Supervised> {
+    let mut owned = Owned(Some(child));
+    let started = Instant::now();
+    loop {
+        let polled = owned.0.as_mut().context("owned child")?.try_wait();
+        match polled {
+            Ok(Some(status)) => {
+                owned.0 = None;
+                return Ok(Supervised::Exited(status));
+            }
+            Ok(None) if started.elapsed() >= deadline => return Ok(Supervised::TimedOut(owned.terminate()?)),
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(error) => {
+                return Err(match owned.terminate() {
+                    Ok(pid) => anyhow::Error::new(error).context(format!("poll child {pid} failed; killed and reaped")),
+                    Err(cleanup) => {
+                        anyhow::Error::new(error).context(format!("poll child failed; cleanup failed: {cleanup:#}"))
+                    }
+                });
+            }
+        }
+    }
+}
+
 enum Bounded {
     Finished(std::process::ExitStatus, Vec<u8>, Vec<u8>),
     TimedOut(u32),
 }
 
-/// Runs an owned child with output in private files under `dir` (no pipe waits), an absolute
-/// `deadline`, and on expiry a kill followed by a checked reap within [`REAP_DEADLINE`].
+fn private_file(path: &Path) -> Result<std::fs::File> {
+    Ok(std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?)
+}
+
+/// Runs an owned child with output in new 0600 files under `dir` (no pipe waits), an absolute
+/// `deadline`, and checked kill/reap on expiry or poll failure.
 fn run_bounded(mut command: std::process::Command, dir: &Path, deadline: Duration) -> Result<Bounded> {
     let id = uuid::Uuid::new_v4();
     let (out, err) = (dir.join(format!("child-{id}.out")), dir.join(format!("child-{id}.err")));
-    let mut child = command
+    let child = command
         .stdin(std::process::Stdio::null())
-        .stdout(std::fs::File::create(&out)?)
-        .stderr(std::fs::File::create(&err)?)
+        .stdout(private_file(&out)?)
+        .stderr(private_file(&err)?)
         .spawn()
         .context("spawn bounded child")?;
-    let started = Instant::now();
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(Bounded::Finished(status, std::fs::read(&out)?, std::fs::read(&err)?));
-        }
-        if started.elapsed() >= deadline {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
+    match supervise(child, deadline)? {
+        Supervised::Exited(status) => Ok(Bounded::Finished(status, std::fs::read(&out)?, std::fs::read(&err)?)),
+        Supervised::TimedOut(pid) => Ok(Bounded::TimedOut(pid)),
     }
-    let pid = child.id();
-    let _ = child.kill();
-    let killed = Instant::now();
-    while child.try_wait()?.is_none() {
-        anyhow::ensure!(
-            killed.elapsed() < REAP_DEADLINE,
-            "child {pid} was not reaped after kill"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    Ok(Bounded::TimedOut(pid))
 }
 
 /// Runs the test-only Python driver of the real `bootstrap.py` parent and parses its JSON.
@@ -485,7 +567,8 @@ fn parent(dir: &Path, arguments: &[&std::ffi::OsStr]) -> Result<serde_json::Valu
 }
 
 /// Guarantees: a hanging child is killed at the deadline and reaped (its PID no longer exists),
-/// and the caller gets a failure well before the child would have exited.
+/// and the caller gets a failure well before the child would have exited; a finishing child's
+/// status and output come back from new owner-only (0600) files.
 #[cfg(target_os = "linux")]
 #[test]
 fn hanging_child_is_killed_and_reaped_at_deadline() -> Result<()> {
@@ -498,6 +581,105 @@ fn hanging_child_is_killed_and_reaped_at_deadline() -> Result<()> {
     };
     assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
     assert!(!Path::new(&format!("/proc/{pid}")).exists(), "child {pid} not reaped");
+
+    let mut command = std::process::Command::new("sh");
+    command.args(["-c", "echo out; echo err >&2"]);
+    let Bounded::Finished(status, stdout, stderr) = run_bounded(command, &scratch.0, PARENT_DEADLINE)? else {
+        anyhow::bail!("echo timed out");
+    };
+    assert!(status.success());
+    assert_eq!((stdout.as_slice(), stderr.as_slice()), (&b"out\n"[..], &b"err\n"[..]));
+    let mut outputs = 0;
+    for entry in std::fs::read_dir(&scratch.0)? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().starts_with("child-") {
+            outputs += 1;
+            assert_eq!(entry.metadata()?.permissions().mode() & 0o777, 0o600);
+        }
+    }
+    assert_eq!(outputs, 4);
+    Ok(())
+}
+
+/// Scripted child: `polls` answers successive `try_wait` calls before any kill (then "running");
+/// after `kill` it reports exited unless `kill` fails.
+#[derive(Default)]
+struct Script {
+    polls: Vec<std::io::Result<Option<std::process::ExitStatus>>>,
+    kill_fails: bool,
+    killed: Arc<Mutex<usize>>,
+    reaped: Arc<Mutex<bool>>,
+}
+
+impl Proc for Script {
+    fn id(&self) -> u32 {
+        4242
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        use std::os::unix::process::ExitStatusExt;
+        if *self.killed.lock().unwrap_or_else(PoisonError::into_inner) > 0 {
+            *self.reaped.lock().unwrap_or_else(PoisonError::into_inner) = true;
+            return Ok(Some(std::process::ExitStatus::from_raw(9)));
+        }
+        if self.polls.is_empty() {
+            Ok(None)
+        } else {
+            self.polls.remove(0)
+        }
+    }
+
+    fn kill(&mut self) -> std::io::Result<()> {
+        *self.killed.lock().unwrap_or_else(PoisonError::into_inner) += 1;
+        if self.kill_fails {
+            Err(std::io::Error::other("kill denied"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Guarantees: a poll error before the deadline kills and reaps the still-live child before the
+/// error is returned; a failed kill is returned rather than reported as a clean timeout; and a
+/// dropped guard that still owns a child kills and reaps it.
+#[test]
+fn supervision_faults_always_kill_reap_and_propagate() -> Result<()> {
+    let poll_error = Script {
+        polls: vec![Ok(None), Err(std::io::Error::other("wait failed"))],
+        ..Script::default()
+    };
+    let (killed, reaped) = (Arc::clone(&poll_error.killed), Arc::clone(&poll_error.reaped));
+    let error = supervise(poll_error, PARENT_DEADLINE)
+        .err()
+        .context("poll error was swallowed")?;
+    assert!(format!("{error:#}").contains("killed and reaped"), "{error:#}");
+    assert_eq!(*killed.lock().unwrap_or_else(PoisonError::into_inner), 1);
+    assert!(*reaped.lock().unwrap_or_else(PoisonError::into_inner));
+
+    let kill_denied = Script {
+        kill_fails: true,
+        ..Script::default()
+    };
+    let killed = Arc::clone(&kill_denied.killed);
+    let error = supervise(kill_denied, Duration::ZERO)
+        .err()
+        .context("kill failure reported as timeout")?;
+    assert!(format!("{error:#}").contains("kill child 4242"), "{error:#}");
+    assert_eq!(*killed.lock().unwrap_or_else(PoisonError::into_inner), 1);
+
+    let dropped = Script::default();
+    let (killed, reaped) = (Arc::clone(&dropped.killed), Arc::clone(&dropped.reaped));
+    drop(Owned(Some(dropped)));
+    assert_eq!(*killed.lock().unwrap_or_else(PoisonError::into_inner), 1);
+    assert!(*reaped.lock().unwrap_or_else(PoisonError::into_inner));
+
+    let exited = Script {
+        polls: vec![Ok(None), Ok(Some(std::os::unix::process::ExitStatusExt::from_raw(0)))],
+        ..Script::default()
+    };
+    let killed = Arc::clone(&exited.killed);
+    assert!(matches!(supervise(exited, PARENT_DEADLINE)?, Supervised::Exited(status) if status.success()));
+    assert_eq!(*killed.lock().unwrap_or_else(PoisonError::into_inner), 0);
     Ok(())
 }
 
