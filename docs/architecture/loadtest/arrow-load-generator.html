@@ -48,7 +48,7 @@
     <div>
       <div class="eyebrow">SCHEMA-GENERATED ARROW LOAD TEST</div>
       <h1>One logical batch. Two collector paths.</h1>
-      <p>Generate once, route twice, validate every published table.</p>
+      <p>Generate multi-customer Arrow, route twice, validate committed partitioned tables.</p>
     </div>
     <code class="setting">arrowcol-loadgen &middot; paired mode</code>
   </header>
@@ -153,7 +153,7 @@
       <text x="190" y="292" class="label">arrowcol-loadgen</text>
       <text x="190" y="317" class="small">Deterministic global scheduler</text>
       <rect x="65" y="346" width="224" height="136" rx="12" fill="#14263b" stroke="#415d7d"/>
-      <text x="84" y="372" class="lane">13 exact schemas</text>
+      <text x="84" y="372" class="lane">13 schemas + customer_id</text>
       <text x="84" y="398" class="lane">seed + round-robin table order</text>
       <text x="84" y="424" class="lane">configurable lanes + batch rows</text>
       <text x="84" y="450" class="lane">direct / dataflow / paired</text>
@@ -219,7 +219,7 @@
       <rect x="980" y="220" width="210" height="125" rx="16" fill="#173a35" stroke="#80e2b6"/>
       <image href="assets/delta-lake.svg" x="1006" y="241" width="158" height="34" preserveAspectRatio="xMidYMid meet"/>
       <text x="1085" y="301" class="small"><tspan font-family="ui-monospace, SFMono-Regular, Consolas, monospace">direct/</tspan> &middot; published = purge</text>
-      <text x="1085" y="324" class="tiny">adaptive Parquet files</text>
+      <text x="1085" y="324" class="tiny">sorted / minute partitions</text>
 
       <path d="M920 572H980" stroke="#f3bd75" stroke-width="3" marker-end="url(#orange)"/>
       <rect x="980" y="535" width="210" height="125" rx="16" fill="#3a3025" stroke="#f3bd75"/>

@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>ArrowCol lakehouse loadtest architecture</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #0b1220; color: #ecf3ff; font-family: system-ui, sans-serif; }
+    main { max-width: 1500px; margin: auto; padding: 34px 32px 22px; }
+    header { display: flex; justify-content: space-between; align-items: end; gap: 24px; margin-bottom: 22px; }
+    .eyebrow { color: #76dccb; font-size: 11px; font-weight: 650; letter-spacing: 2px; margin-bottom: 10px; }
+    h1 { font-size: clamp(30px, 3.5vw, 46px); line-height: 1.15; letter-spacing: -1.5px; margin: 0 0 10px; }
+    header p { margin: 0; color: #b1bfd4; font-size: 15px; }
+    code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+    .setting { color: #b8c7dd; font-size: 12px; padding: 10px 14px; border: 1px solid #35465f; border-radius: 8px; white-space: nowrap; }
+    .canvas { overflow-x: auto; border: 1px solid #304159; border-radius: 18px; background: #101b2c; }
+    svg { display: block; width: 100%; min-width: 1120px; }
+    svg text { font-family: system-ui, sans-serif; }
+    .box { fill: #16263a; stroke: #39516c; stroke-width: 1.5; }
+    .title { fill: #edf4ff; font-size: 19px; font-weight: 700; }
+    .body { fill: #b8c8dd; font-size: 13px; }
+    .small { fill: #99aec9; font-size: 11px; }
+    .section { fill: #8de1ce; font-size: 12px; font-weight: 700; letter-spacing: 1.5px; }
+    .edge { fill: none; stroke: #79d6fa; stroke-width: 2; marker-end: url(#arrow); }
+    .maintenance { fill: none; stroke: #f3bd75; stroke-width: 2; marker-end: url(#amber); }
+    .signal { fill: none; stroke: #bca8f7; stroke-width: 1.6; stroke-dasharray: 6 5; marker-end: url(#purple); }
+    .notes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; margin: 18px 4px; color: #b1bfd4; font-size: 12px; line-height: 1.55; }
+    .notes strong { color: #ecf3ff; }
+    footer { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px; color: #859bb9; font-size: 11px; }
+    a { color: #9dc9e7; text-underline-offset: 3px; }
+    a:focus-visible, .canvas:focus-visible { outline: 3px solid #73d5f7; outline-offset: 4px; }
+    @media (max-width: 800px) { main { padding: 24px 16px; } header { align-items: start; flex-direction: column; } .notes { grid-template-columns: 1fr; } }
+    @media print { body { print-color-adjust: exact; -webkit-print-color-adjust: exact; } main { padding: 10px; } svg { min-width: 0; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <div class="eyebrow">ARROWCOL / END-TO-END LAKEHOUSE QUALIFICATION</div>
+      <h1>One workload. Two pools. A living lakehouse.</h1>
+      <p>Generated Arrow through publication, maintenance, tenant forks, Kusto, and independent validation.</p>
+    </div>
+    <code class="setting">local default &nbsp;|&nbsp; Azure opt-in</code>
+  </header>
+  <div class="canvas" tabindex="0" role="region" aria-label="Lakehouse loadtest architecture; scroll horizontally on small screens">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 1010" role="img" aria-labelledby="title description">
+      <title id="title">ArrowCol lakehouse loadtest architecture</title>
+      <desc id="description">Thirteen multi-customer schemas generate paired Arrow traffic through a router to independent Direct and Dataflow collector pools. SQL Server and Hive own catalog and control metadata, not payloads. Optional Quiver persists pending Arrow. Delta Kernel publishes sorted, ingestion-time-partitioned Parquet to independent local or ADLS roots. Standalone maintenance optimizes, purges and vacuums safely. A historical tenant fork captures a snapshot then tails data changes into an independent sink with Spark-compatible recovery logs. Local Kusto follows active snapshots through a functional bridge; Azure Kusto uses managed identity, external Delta and query acceleration. An independent delta-rs oracle validates results. Metrics, logs and traces feed LGTM. Cloud performance and local functional evidence remain distinct.</desc>
+      <defs>
+        <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r=".7" fill="#24354c"/></pattern>
+        <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 10 5 0 10Z" fill="#79d6fa"/></marker>
+        <marker id="amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 10 5 0 10Z" fill="#f3bd75"/></marker>
+        <marker id="purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 10 5 0 10Z" fill="#bca8f7"/></marker>
+      </defs>
+      <rect width="1400" height="1010" fill="url(#grid)"/>
+      <text x="30" y="34" class="section">01 / CONTROL, GENERATION, AND ADMISSION</text>
+      <rect x="30" y="55" width="310" height="130" rx="12" class="box"/>
+      <text x="50" y="85" class="title">Catalog + generated clients</text>
+      <text x="50" y="111" class="body">Flight SQL / SQL Server / Hive</text>
+      <text x="50" y="135" class="body">13 schemas, explicit customer_id</text>
+      <text x="50" y="159" class="small">Immutable contracts / Rust + TypeScript SDKs</text>
+      <path d="M340 119H385" class="edge"/>
+      <rect x="385" y="55" width="310" height="130" rx="12" class="box"/>
+      <text x="405" y="85" class="title">Deterministic load generator</text>
+      <text x="405" y="111" class="body">Paired logical batches / multiple customers</text>
+      <text x="405" y="135" class="body">Seed, manifests, payload hashes, faults</text>
+      <text x="405" y="159" class="small">Independent submissions remain independent</text>
+      <path d="M695 119H740" class="edge"/>
+      <rect x="740" y="55" width="300" height="130" rx="12" class="box"/>
+      <text x="760" y="85" class="title">Streaming Flight router</text>
+      <text x="760" y="111" class="body">Separate pool / table ownership</text>
+      <text x="760" y="135" class="body">Leases, fencing, bounded backpressure</text>
+      <text x="760" y="159" class="small">SQL holds receipts and control, never Arrow</text>
+      <rect x="1080" y="55" width="290" height="130" rx="12" class="box" style="stroke:#8171ad"/>
+      <text x="1100" y="85" class="title">Run lifecycle</text>
+      <text x="1100" y="111" class="body">Scoped Compose / evidence capture</text>
+      <text x="1100" y="135" class="body">Bootstrap, run, stop, explicit reset</text>
+      <text x="1100" y="159" class="small">Private .env stays outside version control</text>
+      <path d="M890 185V215H355V245" class="edge"/>
+      <path d="M890 215H1015V245" class="edge"/>
+      <text x="30" y="225" class="section">02 / TWO INDEPENDENT PUBLICATION PATHS</text>
+      <rect x="30" y="245" width="650" height="130" rx="12" class="box" style="stroke:#65acbd"/>
+      <text x="50" y="276" class="title">Direct collector pool</text>
+      <text x="50" y="303" class="body">Bounded Arrow buffers / durable SQL receipt state / poll until published</text>
+      <text x="50" y="329" class="body">Optional native Quiver: fsynced pending payloads and crash replay</text>
+      <text x="50" y="353" class="small">A receipt confirms publication, not client-payload deduplication</text>
+      <rect x="720" y="245" width="650" height="130" rx="12" class="box" style="stroke:#65acbd"/>
+      <text x="740" y="276" class="title">Dataflow collector pool</text>
+      <text x="740" y="303" class="body">Flight channel / bounded pdata pipeline / downstream Ack and Nack</text>
+      <text x="740" y="329" class="body">Default best-effort admission; optional Quiver durable admission</text>
+      <text x="740" y="353" class="small">Admission is not a direct receipt or a client purge signal</text>
+      <path d="M355 375V429" class="edge"/>
+      <path d="M1045 375V429" class="edge"/>
+      <text x="30" y="409" class="section">03 / SORTED, PARTITIONED DELTA LAKE</text>
+      <rect x="30" y="429" width="1340" height="125" rx="12" class="box" style="stroke:#5aaf8b"/>
+      <text x="50" y="460" class="title">Delta Kernel publication / independent Direct and Dataflow roots</text>
+      <text x="50" y="486" class="body">Arrow to customer-sorted Parquet / UTC ingestion-time minute partitions / data before atomic transaction log</text>
+      <text x="50" y="512" class="body">Stable publication transaction identity across retries and replay / bounded classified collision retries</text>
+      <text x="50" y="536" class="small">Local disk: functional integration and recovery. ADLS Gen2: conditional publication with Azure identity. No cross-table atomicity.</text>
+      <path d="M210 554V614" class="edge"/>
+      <path d="M690 554V614" class="edge"/>
+      <path d="M1170 554V614" class="edge"/>
+      <text x="30" y="594" class="section">04 / THREE READERS, DIFFERENT SEMANTICS</text>
+      <rect x="30" y="614" width="420" height="178" rx="12" class="box" style="stroke:#b89159"/>
+      <text x="50" y="645" class="title">Standalone maintenance</text>
+      <text x="50" y="672" class="body">Plan / revalidate / apply / no-op</text>
+      <text x="50" y="696" class="body">OPTIMIZE: real rewrite, dataChange=false</text>
+      <text x="50" y="720" class="body">PURGE: remove expired active partitions</text>
+      <text x="50" y="744" class="body">VACUUM LITE: retained tombstones only</text>
+      <text x="50" y="771" class="small">7-day floor / explicit isolated unsafe-test override</text>
+      <path d="M60 614V570H110V554" class="maintenance"/>
+      <rect x="490" y="614" width="420" height="178" rx="12" class="box" style="stroke:#5aaf8b"/>
+      <text x="510" y="645" class="title">Historical tenant fork</text>
+      <text x="510" y="672" class="body">Captured snapshot, then committed tail</text>
+      <text x="510" y="696" class="body">DataFusion predicate + projection / skipping</text>
+      <text x="510" y="720" class="body">Independent sink files / replay transaction IDs</text>
+      <text x="510" y="744" class="body">Spark metadata / offset / commit logs</text>
+      <text x="510" y="771" class="small">Skip OPTIMIZE / retain copied rows after purge</text>
+      <rect x="950" y="614" width="420" height="178" rx="12" class="box" style="stroke:#65acbd"/>
+      <text x="970" y="645" class="title">Kusto query surface</text>
+      <text x="970" y="672" class="body">Local: committed active-snapshot bridge</text>
+      <text x="970" y="696" class="body">Reconcile replacements, removals, restart</text>
+      <text x="970" y="720" class="body">Azure: external Delta + native QAP</text>
+      <text x="970" y="744" class="body">Dedicated UAMI storage read / Explorer</text>
+      <text x="970" y="771" class="small">Local simulation does not prove Azure cache behavior</text>
+      <path d="M240 792V831" class="signal"/>
+      <path d="M700 792V831" class="signal"/>
+      <path d="M1160 792V831" class="signal"/>
+      <rect x="30" y="831" width="650" height="144" rx="12" class="box" style="stroke:#8171ad"/>
+      <text x="50" y="862" class="title">Independent validation + sanitized evidence</text>
+      <text x="50" y="889" class="body">delta-rs oracle: partitions, cloud paths, rows, schemas, parity</text>
+      <text x="50" y="913" class="body">Fault/restart checks / tenant isolation / bounded scan metrics</text>
+      <text x="50" y="937" class="body">Azure QAP: capacity, state, lag, correctness, reacceleration</text>
+      <text x="50" y="959" class="small">Source SHA + configuration + measured results; skipped cloud checks are not a pass</text>
+      <rect x="720" y="831" width="650" height="144" rx="12" class="box" style="stroke:#8171ad"/>
+      <text x="740" y="862" class="title">LGTM / Grafana</text>
+      <text x="740" y="889" class="body">Low-cardinality metrics / logs / traces / process resources</text>
+      <text x="740" y="913" class="body">Publication retries, maintenance, stream checkpoint/lag, bridge</text>
+      <text x="740" y="937" class="body">Separate Arrow Flight and optional OTEL baseline dashboards</text>
+      <text x="740" y="959" class="small">Live signals, not dashboard JSON alone / stop Azure cluster after live tests</text>
+    </svg>
+  </div>
+  <div class="notes">
+    <div><strong>Publication is not client deduplication.</strong> Stable transaction identities protect a retry of the same publication. Identical independent requests can both append. Existing Direct and Dataflow admission contracts still apply.</div>
+    <div><strong>Two consumers, two meanings.</strong> A tenant fork retains historical copied rows. The local Kusto bridge tracks the current active snapshot, including maintenance replacements and partition removals.</div>
+    <div><strong>Evidence has a boundary.</strong> Local mode proves functional behavior, not Azure QAP performance. Retention bounds recovery; missing required source history must fail visibly. Reset is preview-first and owned-data-only.</div>
+  </div>
+  <footer>
+    <span>Architecture view; consult qualification evidence for the tested revision and measured limitations.</span>
+    <span><a href="README.md">Repository</a> / <a href="projects/loadtest/README.md">Loadtest CLI</a> / <a href="docs/architecture/arrowcol-platform/README.md">Platform contracts</a></span>
+  </footer>
+</main>
+</body>
+</html>

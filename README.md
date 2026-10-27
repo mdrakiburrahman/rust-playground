@@ -89,6 +89,24 @@ walks through those files with `quiver-cli`. See the
 [platform architecture](docs/architecture/arrowcol-platform/README.md) for the full
 catalog, router, receipt, fencing, buffering, and capability contracts.
 
+### Lakehouse loadtest architecture
+
+[![ArrowCol lakehouse loadtest: two pools, maintenance, tenant forks, Kusto, and LGTM](loadtest-architecture.png)](loadtest-architecture.html)
+
+The [interactive architecture source](loadtest-architecture.html) follows
+13 multi-customer schemas through both collector pools into independent Delta
+roots, ingestion-time partitions, standalone maintenance, historical tenant
+forks, and Kusto. Local mode uses disk and a functional Kusto bridge; Azure mode
+uses ADLS Gen2 and native external-Delta query acceleration with a dedicated
+managed identity. Independent validation and LGTM observe the same run.
+
+The tenant fork preserves copied history after source purge; the local bridge
+instead reconciles the current active snapshot. Stable publication identities
+protect retries of the same publication, not duplicate independent client
+requests. Local functional results are not Azure QAP performance evidence.
+See the [loadtest guide](projects/loadtest/README.md) for the current CLI,
+credential boundaries, lifecycle commands, and qualification artifacts.
+
 ### Finite qualification quick start
 
 Run from the repository root in the source devcontainer:
