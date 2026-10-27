@@ -1060,6 +1060,45 @@ impl DeltaTable {
         Ok(table)
     }
 
+    /// [`Self::open_url`] for a schema already in canonical Delta representation
+    /// (for example another table's Kernel schema), keeping its timestamp companions.
+    ///
+    /// # Errors
+    /// Rejects unsupported URLs, credentials, incompatible partitions or table metadata.
+    pub fn open_url_canonical(
+        url: Url,
+        schema: &normalize::CanonicalSchema,
+        partition_columns: Vec<String>,
+    ) -> Result<Arc<Self>> {
+        let table = Self::open_connection(url, partition_columns, None, None)?;
+        table.ensure_schema(Arc::clone(schema.schema()))?;
+        Ok(table)
+    }
+
+    /// [`Self::open_url_with_session`] for a canonical schema; see [`Self::open_url_canonical`].
+    /// Must not be called on the shared Delta I/O runtime.
+    ///
+    /// # Errors
+    /// Rejects a URL outside the session's storage, plus [`Self::open_url`] errors.
+    pub fn open_url_with_session_canonical(
+        url: Url,
+        schema: &normalize::CanonicalSchema,
+        partition_columns: Vec<String>,
+        session: Arc<PublisherSession>,
+    ) -> Result<Arc<Self>> {
+        let table = Self::open_connection(url, partition_columns, None, Some(session))?;
+        table.ensure_schema(Arc::clone(schema.schema()))?;
+        Ok(table)
+    }
+
+    /// The table's current schema as Delta Kernel reports it, in canonical representation.
+    ///
+    /// # Errors
+    /// Returns snapshot/log or schema conversion errors.
+    pub fn arrow_schema(&self) -> Result<SchemaRef> {
+        Ok(Arc::new(self.snapshot()?.schema().as_ref().try_into_arrow()?))
+    }
+
     /// Initialize an owned, fenced Azure sandbox without enabling normal data publication.
     /// Existing roots are validated rather than replaced.
     ///
@@ -1676,13 +1715,39 @@ impl DeltaTable {
         self.new_file_partitioned_inner(input, values, Some(properties))
     }
 
+    /// [`Self::new_file_partitioned_with_properties`] for batches already in canonical
+    /// representation. [`DeltaFileWriter::write`] then validates each batch with
+    /// [`normalize::canonical_batch`] instead of normalizing it again, so timestamp
+    /// companions keep their exact nanoseconds.
+    ///
+    /// # Errors
+    /// Rejects invalid partitions, schemas or encoding controls.
+    pub fn new_canonical_file_partitioned_with_properties(
+        self: &Arc<Self>,
+        schema: &normalize::CanonicalSchema,
+        values: BTreeMap<String, Option<String>>,
+        properties: WriterProperties,
+    ) -> Result<DeltaFileWriter> {
+        self.new_file_bound(Arc::clone(schema.schema()), values, Some(properties), true)
+    }
+
     fn new_file_partitioned_inner(
         self: &Arc<Self>,
         input: SchemaRef,
         values: BTreeMap<String, Option<String>>,
         properties: Option<WriterProperties>,
     ) -> Result<DeltaFileWriter> {
-        let snapshot = self.ensure_schema(normalize::schema(&input)?)?;
+        self.new_file_bound(normalize::schema(&input)?, values, properties, false)
+    }
+
+    fn new_file_bound(
+        self: &Arc<Self>,
+        normalized: SchemaRef,
+        values: BTreeMap<String, Option<String>>,
+        properties: Option<WriterProperties>,
+        canonical_input: bool,
+    ) -> Result<DeltaFileWriter> {
+        let snapshot = self.ensure_schema(normalized)?;
         let schema = Arc::new(snapshot.schema().as_ref().try_into_arrow()?);
         let transaction = snapshot.transaction(self.committer(), &self.engine)?;
         let state = transaction.write_state()?;
@@ -1725,6 +1790,7 @@ impl DeltaTable {
             sorter: None,
             accepted_rows: 0,
             accepted_input_bytes: 0,
+            canonical_input,
         })
     }
 
@@ -1956,6 +2022,8 @@ pub struct DeltaFileWriter {
     sorter: Option<crate::layout::FileSortBuffer>,
     accepted_rows: usize,
     accepted_input_bytes: u64,
+    /// Batches are already canonical: validate instead of normalizing again.
+    canonical_input: bool,
 }
 
 /// Completed append, including the table version.
@@ -2006,7 +2074,8 @@ impl DeltaFileWriter {
         self.ingested_at_ms = Some(ingested_at_ms);
         Ok(self)
     }
-    /// Normalize and append a raw Arrow batch.
+    /// Normalize and append a raw Arrow batch (or validate a canonical one, for
+    /// [`DeltaTable::new_canonical_file_partitioned_with_properties`] writers).
     ///
     /// # Errors
     /// Rejects incompatible batches and returns write/statistics errors.
@@ -2035,7 +2104,11 @@ impl DeltaFileWriter {
 
     async fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         let input_bytes = record_batch_logical_bytes(batch)?;
-        let mut batch = normalize::batch(batch)?;
+        let mut batch = if self.canonical_input {
+            normalize::canonical_batch(batch)?
+        } else {
+            normalize::batch(batch)?
+        };
         for (name, expected) in &self.partition_values {
             if let Ok(index) = batch.schema().index_of(name) {
                 let column = batch
