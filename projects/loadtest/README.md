@@ -476,7 +476,12 @@ valid, but missing metrics never become manufactured zeroes.
 
 Validation runs a read-only native QAP observer every ten seconds, with one
 30-second authentication/query deadline and a separate 40-second owned-process
-budget. Sanitized all-26-table observations and export receipts are retained in
+budget. At most two tables are observed concurrently; policy, statistics and
+details remain serial within each table, and capacity is requested once after
+all tables. Both lanes are polled by one parent task so response-artifact appends
+cannot interleave; expiration drops all local request futures, but does not
+prove immediate server-side query cancellation. This is a concurrency bound,
+not a requests-per-second guarantee. Sanitized all-26-table observations and export receipts are retained in
 `results/qap-observations/` and `results/qap-observer.jsonl`. It sends per-pool
 completion, pending files, cached bytes, unhealthy catalogs and last-update age
 to LGTM through OTLP. Missing measurements suppress their aggregate, not become

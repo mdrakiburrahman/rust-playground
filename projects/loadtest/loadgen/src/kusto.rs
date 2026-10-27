@@ -21,6 +21,7 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use arrow_deltalake::AzureCliTokenProvider;
 use delta_inspect::{SnapshotInventory, SnapshotSummary, TableInventory, TableSummary, ValidationCorpus};
+use futures::{StreamExt, stream};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1600,8 +1601,13 @@ pub async fn observe_qap(
         client.queries_completed = Arc::clone(&queries_completed);
         tokio::time::timeout(deadline, async {
             let mut observed = BTreeMap::new();
-            for name in tables {
-                observed.insert(name.clone(), observe_table(&client, name).await);
+            // Poll both lanes in this parent task: synchronous artifact appends cannot interleave,
+            // and dropping the deadline future cancels every in-flight table request.
+            let mut pending = stream::iter(tables)
+                .map(|name| async { (name.clone(), observe_table(&client, name).await) })
+                .buffer_unordered(2);
+            while let Some((name, table)) = pending.next().await {
+                observed.insert(name, table);
             }
             json!({
                 "observed_unix_ms": now_unix_millis(), "backend": BACKEND, "mode": client.mode,
