@@ -1,11 +1,12 @@
-//! Standalone Delta maintenance service: bounded OPTIMIZE, PURGE and VACUUM LITE
-//! over an allowlist of tables, dry-run by default, with Prometheus metrics.
+//! Standalone Delta maintenance service: bounded OPTIMIZE, PURGE, VACUUM LITE,
+//! checkpointing and proven `_delta_log` pruning over an allowlist of tables,
+//! dry-run by default, with Prometheus metrics.
 
 use anyhow::{Context, Result, bail};
 use arrow_deltalake::delta::DeltaTable;
 use arrow_deltalake::maintenance::{
     Granularity, MaintenanceControl, MaintenanceErrorKind, MaintenancePlan, MaintenanceReport, OptimizeConfig, Outcome,
-    PurgeConfig, VacuumConfig, error_details, now_ms,
+    PruneConfig, PurgeConfig, VacuumConfig, error_details, now_ms,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, VecDeque};
@@ -32,10 +33,18 @@ pub enum Operation {
     Vacuum,
     /// Kernel checkpoint once enough commits accumulate; never deletes history.
     Checkpoint,
+    /// Delete `_delta_log` history proven equivalent to a checkpoint.
+    PruneLog,
 }
 
 impl Operation {
-    const ALL: [Self; 4] = [Self::Optimize, Self::Purge, Self::Vacuum, Self::Checkpoint];
+    const ALL: [Self; 5] = [
+        Self::Optimize,
+        Self::Purge,
+        Self::Vacuum,
+        Self::Checkpoint,
+        Self::PruneLog,
+    ];
 
     const fn label(self) -> &'static str {
         match self {
@@ -43,6 +52,7 @@ impl Operation {
             Self::Purge => "purge",
             Self::Vacuum => "vacuum",
             Self::Checkpoint => "checkpoint",
+            Self::PruneLog => "prune-log",
         }
     }
 }
@@ -67,6 +77,11 @@ pub struct Settings {
     pub optimize: OptimizeConfig,
     /// Minimum commits after the hinted checkpoint before `checkpoint` writes one.
     pub checkpoint_every_commits: u64,
+    /// `prune-log` commit-age retention; `None` uses `delta.logRetentionDuration`
+    /// (default 30 days). Shorter values need the unsafe test override.
+    pub log_retention_ms: Option<i64>,
+    /// Maximum log objects one `prune-log` apply deletes.
+    pub max_prune_files: usize,
 }
 
 impl Settings {
@@ -95,6 +110,12 @@ impl Settings {
         }
         if self.checkpoint_every_commits == 0 {
             bail!("--checkpoint-every-commits must be nonzero");
+        }
+        if self.max_prune_files == 0 {
+            bail!("--max-prune-files must be nonzero");
+        }
+        if self.log_retention_ms.is_some_and(|retention| retention < 0) {
+            bail!("log retention must not be negative");
         }
         if self.operations.is_empty() {
             bail!("at least one --operation is required");
@@ -393,6 +414,19 @@ fn run_operation(
     let plan = match operation {
         Operation::Checkpoint => {
             return table.checkpoint_if_due(settings.checkpoint_every_commits, settings.apply);
+        }
+        Operation::PruneLog => {
+            let config = PruneConfig {
+                log_retention_ms: settings.log_retention_ms,
+                unsafe_allow_short_retention_for_tests: settings.unsafe_short_vacuum_for_tests,
+                max_prune_files: settings.max_prune_files,
+                ..PruneConfig::new(anchor)
+            };
+            let plan = table.plan_prune_log(&config)?;
+            if settings.apply {
+                return table.apply_prune_log(&plan, &config, control);
+            }
+            return Ok(plan.report());
         }
         Operation::Optimize => {
             let config = OptimizeConfig {

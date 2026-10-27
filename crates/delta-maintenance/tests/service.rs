@@ -169,6 +169,110 @@ fn checkpoint_bounds_replay_without_deleting_history() -> Result<()> {
     Ok(())
 }
 
+/// Service command on the wall clock (no fixed anchor), as VACUUM and pruning require.
+fn wall_clock_service(root: &Path) -> Result<Command> {
+    let mut command = Command::cargo_bin("delta-maintenance")?;
+    command.env_remove("OTEL_EXPORTER_OTLP_ENDPOINT").args([
+        "--root",
+        Url::from_directory_path(root).map_err(|()| anyhow!("URL"))?.as_str(),
+        "--table",
+        "events",
+        "--granularity",
+        "minute",
+    ]);
+    Ok(command)
+}
+
+/// Scenario: OPTIMIZE, short-retention VACUUM LITE (progress record) and a
+/// checkpoint on a marked disposable root, then `prune-log` dry run, apply and repeat.
+/// Guarantees: short log retention needs the unsafe flag; the dry run deletes
+/// nothing; apply deletes JSON `0..=C` without a commit, keeping the checkpoint;
+/// a repeat is a no-op and VACUUM LITE still works over the pruned history.
+#[test]
+fn prune_log_dry_run_then_apply() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("events");
+    table(&path)?;
+    std::fs::write(path.join(arrow_deltalake::maintenance::DISPOSABLE_TEST_MARKER), b"")?;
+    let optimized = wall_clock_service(root.path())?
+        .args(["--operation", "optimize", "--apply"])
+        .output()?;
+    assert!(
+        optimized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&optimized.stderr)
+    );
+    assert_eq!(lines(&optimized.stdout)?[0]["report"]["outcome"], "committed");
+    std::thread::sleep(Duration::from_millis(20));
+    let prepared = wall_clock_service(root.path())?
+        .args([
+            "--operation",
+            "vacuum",
+            "--operation",
+            "checkpoint",
+            "--vacuum-retention-secs",
+            "0",
+            "--unsafe-short-vacuum-for-tests",
+            "--checkpoint-every-commits",
+            "1",
+            "--apply",
+        ])
+        .output()?;
+    assert!(
+        prepared.status.success(),
+        "{}",
+        String::from_utf8_lossy(&prepared.stderr)
+    );
+    let outcomes: Vec<_> = lines(&prepared.stdout)?
+        .iter()
+        .map(|report| report["report"]["outcome"].clone())
+        .collect();
+    assert_eq!(outcomes, ["deleted", "checkpointed"]);
+    let json = version(&path)?;
+    assert!(json > 1);
+
+    let refused = wall_clock_service(root.path())?
+        .args(["--operation", "prune-log", "--log-retention-secs", "0"])
+        .output()?;
+    assert_eq!(refused.status.code(), Some(1));
+    assert_eq!(lines(&refused.stdout)?[0]["error_kind"], "unsafe_request");
+
+    let prune = [
+        "--operation",
+        "prune-log",
+        "--log-retention-secs",
+        "0",
+        "--unsafe-short-vacuum-for-tests",
+    ];
+    let dry = wall_clock_service(root.path())?.args(prune).output()?;
+    assert!(dry.status.success(), "{}", String::from_utf8_lossy(&dry.stderr));
+    let report = &lines(&dry.stdout)?[0];
+    assert_eq!(report["operation"], "prune_log");
+    assert_eq!(report["report"]["outcome"], "planned");
+    assert_eq!(report["report"]["files_removed"], json);
+    assert_eq!(version(&path)?, json, "dry run deletes nothing");
+
+    let applied = wall_clock_service(root.path())?.args(prune).arg("--apply").output()?;
+    assert!(applied.status.success(), "{}", String::from_utf8_lossy(&applied.stderr));
+    let report = &lines(&applied.stdout)?[0]["report"];
+    assert_eq!(report["outcome"], "pruned");
+    assert_eq!(report["files_deleted"], json);
+    assert_eq!(version(&path)?, 0, "JSON 0..=C pruned");
+    let log = path.join("_delta_log");
+    assert!(log.join("_last_checkpoint").is_file());
+    assert!(log.join(format!("{:020}.checkpoint.parquet", json - 1)).is_file());
+    assert!(path.join("_arrowcol_maintenance").join("log-floor.json").is_file());
+
+    let repeat = wall_clock_service(root.path())?.args(prune).arg("--apply").output()?;
+    assert!(repeat.status.success(), "{}", String::from_utf8_lossy(&repeat.stderr));
+    assert_eq!(lines(&repeat.stdout)?[0]["report"]["outcome"], "noop");
+    let vacuum = wall_clock_service(root.path())?
+        .args(["--operation", "vacuum"])
+        .output()?;
+    assert!(vacuum.status.success(), "{}", String::from_utf8_lossy(&vacuum.stderr));
+    Ok(())
+}
+
 /// Scenario: unsafe or invalid requests.
 /// Guarantees: traversal names and short VACUUM retention fail visibly with nonzero exit.
 #[test]

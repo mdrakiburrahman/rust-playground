@@ -21,7 +21,7 @@ const MIB: u64 = 1024 * 1024;
 #[derive(Debug, Parser)]
 #[command(
     version,
-    about = "Bounded Delta OPTIMIZE, PURGE and VACUUM LITE over allowlisted tables"
+    about = "Bounded Delta OPTIMIZE, PURGE, VACUUM LITE, checkpoint and proven log pruning over allowlisted tables"
 )]
 struct Cli {
     /// Root URL containing the allowlisted tables (file:///..., abfss://...).
@@ -30,7 +30,7 @@ struct Cli {
     /// Allowlisted table directory names under the root (repeatable).
     #[arg(long = "table", required = true)]
     tables: Vec<String>,
-    /// Operations to run per table, in optimize, purge, vacuum order (repeatable).
+    /// Operations to run per table, in optimize, purge, vacuum, checkpoint, prune-log order (repeatable).
     #[arg(long = "operation", value_enum, required = true)]
     operations: Vec<Operation>,
     /// Mutate the tables. Without this flag only dry-run plans are reported.
@@ -60,7 +60,8 @@ struct Cli {
     anchor_ms: Option<i64>,
     #[arg(long, default_value_t = 7 * 24 * 3600)]
     vacuum_retention_secs: u64,
-    /// Allow VACUUM retention below 7 days on a marked disposable temp root only.
+    /// Allow VACUUM retention below 7 days, and log retention below the table's
+    /// `delta.logRetentionDuration`, on a marked disposable temp root only.
     #[arg(long)]
     unsafe_short_vacuum_for_tests: bool,
     #[arg(long, default_value_t = 128)]
@@ -70,6 +71,12 @@ struct Cli {
     /// `checkpoint` writes once this many commits follow the hinted checkpoint.
     #[arg(long, default_value_t = 100)]
     checkpoint_every_commits: u64,
+    /// `prune-log` minimum commit age; defaults to `delta.logRetentionDuration` (else 30 days).
+    #[arg(long)]
+    log_retention_secs: Option<u64>,
+    /// Maximum log objects one `prune-log` apply deletes; the rest is backlog.
+    #[arg(long, default_value_t = 10_000)]
+    max_prune_files: usize,
     /// Prometheus listen address.
     #[arg(long, default_value = "127.0.0.1:9467")]
     listen: SocketAddr,
@@ -100,6 +107,8 @@ fn settings(cli: Cli) -> Result<Settings> {
         vacuum_retention_ms: millis(cli.vacuum_retention_secs)?,
         unsafe_short_vacuum_for_tests: cli.unsafe_short_vacuum_for_tests,
         checkpoint_every_commits: cli.checkpoint_every_commits,
+        log_retention_ms: cli.log_retention_secs.map(millis).transpose()?,
+        max_prune_files: cli.max_prune_files,
         optimize: OptimizeConfig {
             target_file_bytes: target,
             small_file_bytes: (target / 2).max(1),

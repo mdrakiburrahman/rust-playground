@@ -8,7 +8,7 @@
 use crate::delta::{DeltaTable, INGESTION_PARTITION, PURGE_WATERMARK, collision_backoff, object_store_for_url};
 use crate::delta_io::shared_executor;
 use crate::layout::{FileSortBuffer, LayoutPolicy};
-use crate::sync_directory;
+use crate::{sync_directory, sync_file};
 use anyhow::{Context, Result};
 use arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, RecordBatch, RecordBatchOptions, make_array, new_null_array,
@@ -24,7 +24,7 @@ use delta_kernel_default_engine::executor::TaskExecutor;
 use delta_kernel_default_engine::parquet::DataFileMetadata;
 use delta_kernel_default_engine::stats::FileStatsAccumulator;
 use delta_kernel_default_engine::{DefaultEngineBuilder, build_add_file_metadata};
-use object_store::{ObjectStore, ObjectStoreExt, PutMode};
+use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::properties::WriterProperties;
@@ -766,6 +766,8 @@ pub enum Outcome {
     Partial,
     /// A Kernel checkpoint was written; no commit and no history deletion.
     Checkpointed,
+    /// Proven-redundant `_delta_log` history was deleted; no commit.
+    Pruned,
 }
 
 impl Outcome {
@@ -780,6 +782,7 @@ impl Outcome {
             Self::Deleted => "deleted",
             Self::Partial => "partial",
             Self::Checkpointed => "checkpointed",
+            Self::Pruned => "pruned",
         }
     }
 }
@@ -2299,6 +2302,8 @@ pub struct VacuumConfig {
     pub delete_chunk: usize,
     pub max_plan_bytes: usize,
     pub max_active_files: usize,
+    /// Read bound for the floor checkpoint seeding replay after log pruning.
+    pub max_checkpoint_bytes: u64,
 }
 
 impl VacuumConfig {
@@ -2315,6 +2320,7 @@ impl VacuumConfig {
             delete_chunk: 256,
             max_plan_bytes: 8 * 1024 * 1024,
             max_active_files: 1_000_000,
+            max_checkpoint_bytes: DEFAULT_MAX_CHECKPOINT_BYTES,
         }
     }
 
@@ -2347,9 +2353,22 @@ pub struct VacuumPlan {
     pub backlog_files: u64,
 }
 
+#[derive(Default)]
 struct LogReplay {
     active: BTreeSet<String>,
     tombstones: BTreeMap<String, (String, Option<i64>)>,
+    /// Latest version per application transaction id.
+    txns: BTreeMap<String, i64>,
+    /// Set when a later txn action carried a lower version than an earlier one.
+    txn_regressed: bool,
+    table_id: Option<String>,
+}
+
+/// Facts about one replayed JSON commit used by the log-pruning proof.
+struct CommitFacts {
+    /// Latest of `commitInfo.timestamp` and `commitInfo.inCommitTimestamp`, if any.
+    timestamp: Option<i64>,
+    remove_stamps: Vec<Option<i64>>,
 }
 
 impl DeltaTable {
@@ -2364,12 +2383,20 @@ impl DeltaTable {
         if !unsafe_override {
             return unsafe_request("VACUUM retention below 7 days requires the unsafe test override");
         }
+        self.check_disposable_test_root("VACUUM retention")
+    }
+
+    /// Short-retention overrides are confined to marked disposable local roots under the temp directory.
+    fn check_disposable_test_root(&self, what: &str) -> Result<()> {
+        let unsafe_request = |message: String| Err(fail(MaintenanceErrorKind::UnsafeRequest, message));
         if self.url.scheme() != "file" {
-            return unsafe_request("short VACUUM retention is only allowed for disposable local test roots");
+            return unsafe_request(format!("short {what} is only allowed for disposable local test roots"));
         }
         let temp = fs::canonicalize(std::env::temp_dir())?;
         if !self.root.starts_with(&temp) || self.root == temp || !self.root.join(DISPOSABLE_TEST_MARKER).is_file() {
-            return unsafe_request("short VACUUM retention requires a marked disposable root under the temp directory");
+            return unsafe_request(format!(
+                "short {what} requires a marked disposable root under the temp directory"
+            ));
         }
         Ok(())
     }
@@ -2401,9 +2428,9 @@ impl DeltaTable {
     /// hinted checkpoint, bounding snapshot replay for writers and readers.
     ///
     /// Checkpoints retain every application transaction (no txn retention) and
-    /// the table metadata including the purge watermark. JSON history is never
-    /// deleted, so VACUUM LITE's complete-history proof is unaffected. Without
-    /// `apply` a due checkpoint is only reported as planned.
+    /// the table metadata including the purge watermark. Checkpointing never
+    /// deletes JSON history; only `prune_log` does, after proving the checkpoint
+    /// equivalent to it. Without `apply` a due checkpoint is only reported as planned.
     ///
     /// # Errors
     /// Rejects `min_commits == 0`; returns authority, replay or write failures.
@@ -2436,21 +2463,13 @@ impl DeltaTable {
         Ok(report)
     }
 
-    /// Replay complete JSON history 0..=version without listing data directories.
-    fn replay_log(&self, version: u64, config: &VacuumConfig) -> Result<LogReplay> {
-        let unsupported = |message: String| fail(MaintenanceErrorKind::Unsupported, message);
-        if usize::try_from(version).unwrap_or(usize::MAX) >= config.max_log_files {
-            return Err(fail(
-                MaintenanceErrorKind::ResourceLimit,
-                "log history exceeds the replay bound",
-            ));
-        }
+    /// List the direct children of `_delta_log/` with their metadata, bounded.
+    fn list_log(&self, limit: usize) -> Result<BTreeMap<String, ObjectMeta>> {
         let prefix = self.object_path("_delta_log/")?;
         let store = Arc::clone(&self.store);
-        let limit = config.max_log_files.saturating_mul(4);
-        let names = shared_executor()?.block_on(async move {
+        shared_executor()?.block_on(async move {
             use futures::StreamExt;
-            let mut names = BTreeSet::new();
+            let mut names = BTreeMap::new();
             let mut entries = store.list(Some(&prefix));
             let mut seen = 0_usize;
             while let Some(entry) = entries.next().await {
@@ -2468,67 +2487,237 @@ impl DeltaTable {
                         .prefix_match(&prefix)
                         .is_some_and(|mut parts| parts.nth(1).is_none())
                 {
-                    names.insert(name.to_owned());
+                    names.insert(name.to_owned(), entry.clone());
                 }
             }
             Ok::<_, anyhow::Error>(names)
-        })?;
-        let mut replay = LogReplay {
-            active: BTreeSet::new(),
-            tombstones: BTreeMap::new(),
-        };
-        for current in 0..=version {
-            let name = format!("{current:020}.json");
-            if !names.contains(&name) {
-                return Err(unsupported(format!(
-                    "VACUUM LITE requires complete JSON log history; {name} is missing (checkpoint-only history unsupported)"
-                )));
-            }
-            let path = self.object_path(&format!("_delta_log/{name}"))?;
-            let store = Arc::clone(&self.store);
-            let limit = config.max_log_file_bytes;
-            let bytes = shared_executor()?.block_on(async move {
-                let object = store.get(&path).await?;
-                if object.meta.size > limit {
+        })
+    }
+
+    /// Read one bounded JSON commit; a missing commit is an unexplained history gap.
+    fn read_commit(&self, version: u64, limit: u64) -> Result<Vec<u8>> {
+        let name = format!("{version:020}.json");
+        let path = self.object_path(&format!("_delta_log/{name}"))?;
+        let store = Arc::clone(&self.store);
+        shared_executor()?.block_on(async move {
+            let object = match store.get(&path).await {
+                Ok(object) => object,
+                Err(object_store::Error::NotFound { .. }) => {
                     return Err(fail(
-                        MaintenanceErrorKind::ResourceLimit,
-                        "log file exceeds its read bound",
+                        MaintenanceErrorKind::Unsupported,
+                        format!("log history gap: {name} is missing"),
                     ));
                 }
-                Ok(object.bytes().await?)
-            })?;
-            for line in bytes
-                .split(|byte| *byte == b'\n')
-                .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
-            {
-                let action: serde_json::Value = serde_json::from_slice(line)?;
-                if let Some(add) = action.get("add") {
-                    let raw = add
-                        .get("path")
-                        .and_then(serde_json::Value::as_str)
-                        .context("add without path")?;
-                    if add.get("deletionVector").is_some_and(|vector| !vector.is_null()) {
-                        return Err(unsupported("deletion vectors are unsupported by VACUUM LITE".into()));
+                Err(error) => return Err(error.into()),
+            };
+            if object.meta.size > limit {
+                return Err(fail(
+                    MaintenanceErrorKind::ResourceLimit,
+                    "log file exceeds its read bound",
+                ));
+            }
+            Ok(object.bytes().await?.to_vec())
+        })
+    }
+
+    /// Apply one JSON commit to a hand-written replay; never consults Kernel.
+    fn replay_commit(&self, replay: &mut LogReplay, bytes: &[u8]) -> Result<CommitFacts> {
+        let unsupported = |message: &str| fail(MaintenanceErrorKind::Unsupported, message.to_owned());
+        let mut facts = CommitFacts {
+            timestamp: None,
+            remove_stamps: Vec::new(),
+        };
+        for line in bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
+        {
+            let action: serde_json::Value = serde_json::from_slice(line)?;
+            if let Some(add) = action.get("add") {
+                let raw = add
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .context("add without path")?;
+                if add.get("deletionVector").is_some_and(|vector| !vector.is_null()) {
+                    return Err(unsupported("deletion vectors are unsupported by VACUUM LITE"));
+                }
+                let key = self.log_key(raw)?;
+                replay.tombstones.remove(&key);
+                replay.active.insert(key);
+            } else if let Some(remove) = action.get("remove") {
+                let raw = remove
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .context("remove without path")?;
+                if remove.get("deletionVector").is_some_and(|vector| !vector.is_null()) {
+                    return Err(unsupported("deletion vectors are unsupported by VACUUM LITE"));
+                }
+                let key = self.log_key(raw)?;
+                replay.active.remove(&key);
+                let stamp = remove.get("deletionTimestamp").and_then(serde_json::Value::as_i64);
+                facts.remove_stamps.push(stamp);
+                replay.tombstones.insert(key, (raw.to_owned(), stamp));
+            } else if let Some(txn) = action.get("txn") {
+                let app_id = txn
+                    .get("appId")
+                    .and_then(serde_json::Value::as_str)
+                    .context("txn without appId")?;
+                let version = txn
+                    .get("version")
+                    .and_then(serde_json::Value::as_i64)
+                    .context("txn without version")?;
+                let latest = replay.txns.entry(app_id.to_owned()).or_insert(version);
+                if version < *latest {
+                    replay.txn_regressed = true;
+                }
+                *latest = version;
+            } else if let Some(metadata) = action.get("metaData") {
+                replay.table_id = metadata
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+            } else if let Some(info) = action.get("commitInfo") {
+                for field in ["timestamp", "inCommitTimestamp"] {
+                    if let Some(stamp) = info.get(field).and_then(serde_json::Value::as_i64) {
+                        facts.timestamp = Some(facts.timestamp.map_or(stamp, |current| current.max(stamp)));
                     }
-                    let key = self.log_key(raw)?;
-                    replay.tombstones.remove(&key);
-                    replay.active.insert(key);
-                } else if let Some(remove) = action.get("remove") {
-                    let raw = remove
-                        .get("path")
-                        .and_then(serde_json::Value::as_str)
-                        .context("remove without path")?;
-                    if remove.get("deletionVector").is_some_and(|vector| !vector.is_null()) {
-                        return Err(unsupported("deletion vectors are unsupported by VACUUM LITE".into()));
-                    }
-                    let key = self.log_key(raw)?;
-                    replay.active.remove(&key);
-                    let stamp = remove.get("deletionTimestamp").and_then(serde_json::Value::as_i64);
-                    replay.tombstones.insert(key, (raw.to_owned(), stamp));
                 }
             }
         }
+        Ok(facts)
+    }
+
+    /// Direct Parquet read of the classic checkpoint at `version`, independent of Kernel.
+    fn read_checkpoint(&self, version: u64, limit: u64) -> Result<LogReplay> {
+        let unsupported = |message: String| fail(MaintenanceErrorKind::Unsupported, message);
+        let name = format!("{version:020}.checkpoint.parquet");
+        let path = self.object_path(&format!("_delta_log/{name}"))?;
+        let store = Arc::clone(&self.store);
+        let missing = name.clone();
+        let rows = shared_executor()?.block_on(async move {
+            let object = match store.get(&path).await {
+                Ok(object) => object,
+                Err(object_store::Error::NotFound { .. }) => {
+                    return Err(fail(
+                        MaintenanceErrorKind::Unsupported,
+                        format!("checkpoint {missing} is missing"),
+                    ));
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if object.meta.size > limit {
+                return Err(fail(
+                    MaintenanceErrorKind::ResourceLimit,
+                    "checkpoint exceeds its read bound",
+                ));
+            }
+            checkpoint_rows(object.bytes().await?)
+        })?;
+        let mut replay = LogReplay::default();
+        for raw in rows.adds {
+            if !replay.active.insert(self.log_key(&raw)?) {
+                return Err(unsupported(format!("{name} adds {raw} twice")));
+            }
+        }
+        for (raw, stamp) in rows.removes {
+            let key = self.log_key(&raw)?;
+            if replay.active.contains(&key) || replay.tombstones.insert(key, (raw.clone(), stamp)).is_some() {
+                return Err(unsupported(format!("{name} has conflicting actions for {raw}")));
+            }
+        }
+        for (app_id, txn_version) in rows.txns {
+            if replay.txns.insert(app_id.clone(), txn_version).is_some() {
+                return Err(unsupported(format!("{name} repeats txn {app_id}")));
+            }
+        }
+        let ids: BTreeSet<String> = rows.table_ids.into_iter().collect();
+        if ids.len() != 1 {
+            return Err(unsupported(format!("{name} must carry exactly one table id")));
+        }
+        replay.table_id = ids.into_iter().next();
         Ok(replay)
+    }
+
+    /// Replay JSON history for VACUUM LITE without listing data directories.
+    ///
+    /// Complete history `0..=version` is replayed directly. After log pruning,
+    /// replay instead starts from the durable floor checkpoint `F` (read
+    /// directly from Parquet) followed by contiguous JSON `F+1..=version`, and
+    /// only while a progress record proves every tombstone that checkpoint may
+    /// have dropped was already vacuumed. Any other gap fails with `Unsupported`.
+    fn replay_log(&self, version: u64, table_id: &str, config: &VacuumConfig) -> Result<LogReplay> {
+        let names = self.list_log(config.max_log_files.saturating_mul(4))?;
+        let json = |current: u64| format!("{current:020}.json");
+        let gap = (0..=version).find(|current| !names.contains_key(&json(*current)));
+        let (mut replay, first) = match gap {
+            None => {
+                if usize::try_from(version).unwrap_or(usize::MAX) >= config.max_log_files {
+                    return Err(fail(
+                        MaintenanceErrorKind::ResourceLimit,
+                        "log history exceeds the replay bound",
+                    ));
+                }
+                (LogReplay::default(), 0)
+            }
+            Some(gap) => {
+                let floor = self.pruned_history_floor(table_id, version, &names).map_err(|error| {
+                    fail(
+                        MaintenanceErrorKind::Unsupported,
+                        format!(
+                            "VACUUM LITE requires complete JSON log history; {} is missing and no proven log floor explains it: {error:#}",
+                            json(gap)
+                        ),
+                    )
+                })?;
+                if usize::try_from(version - floor).unwrap_or(usize::MAX) >= config.max_log_files {
+                    return Err(fail(
+                        MaintenanceErrorKind::ResourceLimit,
+                        "log history exceeds the replay bound",
+                    ));
+                }
+                let seeded = self.read_checkpoint(floor, config.max_checkpoint_bytes)?;
+                if seeded.table_id.as_deref() != Some(table_id) {
+                    return Err(fail(
+                        MaintenanceErrorKind::Unsupported,
+                        "floor checkpoint belongs to a different table id",
+                    ));
+                }
+                (seeded, floor + 1)
+            }
+        };
+        for current in first..=version {
+            if !names.contains_key(&json(current)) {
+                return Err(fail(
+                    MaintenanceErrorKind::Unsupported,
+                    format!(
+                        "VACUUM LITE requires contiguous JSON log history above the floor; {} is missing",
+                        json(current)
+                    ),
+                ));
+            }
+            let bytes = self.read_commit(current, config.max_log_file_bytes)?;
+            self.replay_commit(&mut replay, &bytes)?;
+        }
+        Ok(replay)
+    }
+
+    /// The durable floor `F` that explains missing JSON at or below it.
+    fn pruned_history_floor(&self, table_id: &str, version: u64, names: &BTreeMap<String, ObjectMeta>) -> Result<u64> {
+        let floor = self.log_floor()?.context("no log floor record")?;
+        if floor.table_id != table_id {
+            anyhow::bail!("log floor record belongs to a different table id");
+        }
+        let checkpoint = floor.checkpoint_version;
+        if checkpoint > version {
+            anyhow::bail!("log floor {checkpoint} is above the replayed version {version}");
+        }
+        if !names.contains_key(&format!("{checkpoint:020}.checkpoint.parquet")) {
+            anyhow::bail!("floor checkpoint {checkpoint} is missing");
+        }
+        let progress = self.vacuum_lite_progress()?.context("no VACUUM LITE progress record")?;
+        if progress.table_id != table_id || progress.version < checkpoint {
+            anyhow::bail!("VACUUM LITE progress does not cover the log floor");
+        }
+        Ok(checkpoint)
     }
 
     fn active_keys(&self, state: &ActiveState) -> Result<BTreeSet<String>> {
@@ -2549,7 +2738,7 @@ impl DeltaTable {
         }
         let state = self.active_state(config.max_active_files)?;
         state.fingerprint.validate_supported(false)?;
-        let replay = self.replay_log(state.snapshot.version(), config)?;
+        let replay = self.replay_log(state.snapshot.version(), &state.fingerprint.table_id, config)?;
         if replay.active != self.active_keys(&state)? {
             return Err(fail(
                 MaintenanceErrorKind::Unsupported,
@@ -2631,9 +2820,11 @@ impl DeltaTable {
         plan.header.fingerprint.require_same(&state.fingerprint)?;
         report.version = state.snapshot.version();
         if plan.candidates.is_empty() {
+            self.record_vacuum_progress(plan, effective, config)
+                .map_err(|error| progress_failure(&error, &report))?;
             return Ok(report);
         }
-        let replay = self.replay_log(state.snapshot.version(), config)?;
+        let replay = self.replay_log(state.snapshot.version(), &state.fingerprint.table_id, config)?;
         for candidate in &plan.candidates {
             let key = self.log_key(&candidate.path)?;
             match replay.tombstones.get(&key) {
@@ -2711,6 +2902,1024 @@ impl DeltaTable {
         }
         report.files_removed = report.files_deleted + report.files_already_absent;
         report.outcome = Outcome::Deleted;
+        self.record_vacuum_progress(plan, effective, config)
+            .map_err(|error| progress_failure(&error, &report))?;
+        Ok(report)
+    }
+
+    /// Record durable VACUUM LITE progress after a complete, uninterrupted apply.
+    ///
+    /// The version is the plan's read version (the history actually scanned),
+    /// and the claim is re-proven by replaying that version: every tombstone
+    /// older than `cutoff_ms` must be one of the plan's (now deleted or absent)
+    /// candidates. Plans with a backlog never record progress.
+    fn record_vacuum_progress(&self, plan: &VacuumPlan, cutoff_ms: i64, config: &VacuumConfig) -> Result<()> {
+        if plan.backlog_files != 0 {
+            return Ok(());
+        }
+        let table_id = &plan.header.fingerprint.table_id;
+        let replay = self.replay_log(plan.header.read_version, table_id, config)?;
+        let planned = plan
+            .candidates
+            .iter()
+            .map(|candidate| self.log_key(&candidate.path))
+            .collect::<Result<BTreeSet<_>>>()?;
+        if let Some((key, _)) = replay
+            .tombstones
+            .iter()
+            .find(|(key, (_, stamp))| stamp.is_some_and(|stamp| stamp < cutoff_ms) && !planned.contains(*key))
+        {
+            return Err(fail(
+                MaintenanceErrorKind::StalePlan,
+                format!("expired tombstone {key} is not covered by the plan; progress not recorded"),
+            ));
+        }
+        let record = VacuumLiteProgress {
+            table_id: table_id.clone(),
+            version: plan.header.read_version,
+            cutoff_ms,
+        };
+        self.update_record(VACUUM_PROGRESS_RECORD, |current| merge_progress(current, &record))
+    }
+}
+
+fn progress_failure(error: &anyhow::Error, report: &MaintenanceReport) -> anyhow::Error {
+    fail_with(
+        error_kind(error).unwrap_or(MaintenanceErrorKind::Uncertain),
+        format!("deletes finished but the VACUUM LITE progress record was not written: {error:#}"),
+        report,
+    )
+}
+
+/// Table-root directory for maintenance records; never inside `_delta_log`.
+pub const MAINTENANCE_DIR: &str = "_arrowcol_maintenance";
+/// VACUUM LITE progress record under [`MAINTENANCE_DIR`].
+pub const VACUUM_PROGRESS_RECORD: &str = "vacuum-lite.json";
+/// Durable log floor record under [`MAINTENANCE_DIR`].
+pub const LOG_FLOOR_RECORD: &str = "log-floor.json";
+/// Default `delta.logRetentionDuration` (30 days).
+pub const DEFAULT_LOG_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+/// Default read bound for one checkpoint file.
+pub const DEFAULT_MAX_CHECKPOINT_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_RECORD_BYTES: u64 = 64 * 1024;
+const MAX_RECORD_ATTEMPTS: u32 = 8;
+
+/// Durable VACUUM LITE progress: every tombstone in the replayed history
+/// `0..=version` with `deletionTimestamp < cutoff_ms` was physically deleted
+/// or confirmed absent. Monotonic: a record only replaces one it dominates.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VacuumLiteProgress {
+    pub table_id: String,
+    pub version: u64,
+    pub cutoff_ms: i64,
+}
+
+/// Durable log floor written before any log deletion: history at or below
+/// `checkpoint_version` may be missing and is represented by that checkpoint.
+/// Monotonic: never lowered.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogFloor {
+    pub table_id: String,
+    pub checkpoint_version: u64,
+}
+
+fn merge_progress(
+    current: Option<&VacuumLiteProgress>,
+    next: &VacuumLiteProgress,
+) -> Result<Option<VacuumLiteProgress>> {
+    match current {
+        None => Ok(Some(next.clone())),
+        Some(current) if current.table_id != next.table_id => Err(fail(
+            MaintenanceErrorKind::MetadataChanged,
+            "VACUUM LITE progress record belongs to a different table id",
+        )),
+        Some(current) if next.version >= current.version && next.cutoff_ms >= current.cutoff_ms && next != current => {
+            Ok(Some(next.clone()))
+        }
+        // Equal, older or incomparable claims keep the existing record.
+        Some(_) => Ok(None),
+    }
+}
+
+fn merge_floor(current: Option<&LogFloor>, next: &LogFloor) -> Result<Option<LogFloor>> {
+    match current {
+        None => Ok(Some(next.clone())),
+        Some(current) if current.table_id != next.table_id => Err(fail(
+            MaintenanceErrorKind::MetadataChanged,
+            "log floor record belongs to a different table id",
+        )),
+        Some(current) if next.checkpoint_version > current.checkpoint_version => Ok(Some(next.clone())),
+        Some(_) => Ok(None),
+    }
+}
+
+async fn fetch_record(
+    store: Arc<dyn ObjectStore>,
+    path: object_store::path::Path,
+) -> Result<Option<(Vec<u8>, UpdateVersion)>> {
+    match store.get(&path).await {
+        Ok(object) => {
+            if object.meta.size > MAX_RECORD_BYTES {
+                return Err(fail(
+                    MaintenanceErrorKind::ResourceLimit,
+                    "maintenance record exceeds its read bound",
+                ));
+            }
+            let version = UpdateVersion {
+                e_tag: object.meta.e_tag.clone(),
+                version: object.meta.version.clone(),
+            };
+            Ok(Some((object.bytes().await?.to_vec(), version)))
+        }
+        Err(object_store::Error::NotFound { .. }) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Rows of a classic checkpoint relevant to the pruning proof.
+#[derive(Default)]
+struct CheckpointRows {
+    adds: Vec<String>,
+    removes: Vec<(String, Option<i64>)>,
+    txns: Vec<(String, i64)>,
+    table_ids: Vec<String>,
+}
+
+fn struct_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<Option<&'a arrow::array::StructArray>> {
+    batch
+        .column_by_name(name)
+        .map(|column| {
+            column.as_struct_opt().ok_or_else(|| {
+                fail(
+                    MaintenanceErrorKind::Unsupported,
+                    format!("checkpoint column {name} is not a struct"),
+                )
+            })
+        })
+        .transpose()
+}
+
+fn child_strings(parent: &arrow::array::StructArray, field: &str) -> Result<Option<arrow::array::StringArray>> {
+    parent
+        .column_by_name(field)
+        .map(|column| {
+            Ok(arrow::compute::cast(column, &DataType::Utf8)?
+                .as_string::<i32>()
+                .clone())
+        })
+        .transpose()
+}
+
+fn child_i64(parent: &arrow::array::StructArray, field: &str) -> Result<Option<arrow::array::Int64Array>> {
+    parent
+        .column_by_name(field)
+        .map(|column| {
+            Ok(arrow::compute::cast(column, &DataType::Int64)?
+                .as_primitive::<Int64Type>()
+                .clone())
+        })
+        .transpose()
+}
+
+fn required_string(values: Option<&arrow::array::StringArray>, row: usize, what: &str) -> Result<String> {
+    values
+        .filter(|values| values.is_valid(row))
+        .map(|values| values.value(row).to_owned())
+        .ok_or_else(|| {
+            fail(
+                MaintenanceErrorKind::Unsupported,
+                format!("checkpoint {what} is missing"),
+            )
+        })
+}
+
+fn child_valid(parent: &arrow::array::StructArray, field: &str, row: usize) -> bool {
+    parent.column_by_name(field).is_some_and(|column| column.is_valid(row))
+}
+
+/// Parse a classic checkpoint with the Parquet reader only (no Kernel replay).
+fn checkpoint_rows<R: parquet::file::reader::ChunkReader + 'static>(reader: R) -> Result<CheckpointRows> {
+    let unsupported = |message: &str| fail(MaintenanceErrorKind::Unsupported, message.to_owned());
+    let mut rows = CheckpointRows::default();
+    for batch in ParquetRecordBatchReaderBuilder::try_new(reader)?.build()? {
+        let batch = batch?;
+        for forbidden in ["sidecar", "checkpointMetadata"] {
+            if batch
+                .column_by_name(forbidden)
+                .is_some_and(|column| column.null_count() < column.len())
+            {
+                return Err(unsupported(
+                    "V2 checkpoints with sidecars or checkpoint metadata are unsupported",
+                ));
+            }
+        }
+        if let Some(add) = struct_column(&batch, "add")? {
+            let paths = child_strings(add, "path")?;
+            for row in 0..add.len() {
+                if add.is_valid(row) {
+                    if child_valid(add, "deletionVector", row) {
+                        return Err(unsupported("deletion vectors are unsupported"));
+                    }
+                    rows.adds.push(required_string(paths.as_ref(), row, "add.path")?);
+                }
+            }
+        }
+        if let Some(remove) = struct_column(&batch, "remove")? {
+            let paths = child_strings(remove, "path")?;
+            let stamps = child_i64(remove, "deletionTimestamp")?;
+            for row in 0..remove.len() {
+                if remove.is_valid(row) {
+                    if child_valid(remove, "deletionVector", row) {
+                        return Err(unsupported("deletion vectors are unsupported"));
+                    }
+                    let stamp = stamps
+                        .as_ref()
+                        .and_then(|stamps| stamps.is_valid(row).then(|| stamps.value(row)));
+                    rows.removes
+                        .push((required_string(paths.as_ref(), row, "remove.path")?, stamp));
+                }
+            }
+        }
+        if let Some(txn) = struct_column(&batch, "txn")? {
+            let app_ids = child_strings(txn, "appId")?;
+            let versions = child_i64(txn, "version")?;
+            for row in 0..txn.len() {
+                if txn.is_valid(row) {
+                    let version = versions
+                        .as_ref()
+                        .filter(|versions| versions.is_valid(row))
+                        .map(|versions| versions.value(row))
+                        .ok_or_else(|| unsupported("checkpoint txn.version is missing"))?;
+                    rows.txns
+                        .push((required_string(app_ids.as_ref(), row, "txn.appId")?, version));
+                }
+            }
+        }
+        if let Some(metadata) = struct_column(&batch, "metaData")? {
+            let ids = child_strings(metadata, "id")?;
+            for row in 0..metadata.len() {
+                if metadata.is_valid(row) {
+                    rows.table_ids.push(required_string(ids.as_ref(), row, "metaData.id")?);
+                }
+            }
+        }
+    }
+    Ok(rows)
+}
+
+/// First difference between an independent JSON replay and a checkpoint view.
+fn proof_mismatch(
+    source: &str,
+    expected_active: &BTreeSet<String>,
+    expected_txns: &BTreeMap<String, i64>,
+    actual_active: &BTreeSet<String>,
+    actual_txns: &BTreeMap<String, i64>,
+) -> Option<String> {
+    if let Some(path) = expected_active.symmetric_difference(actual_active).next() {
+        return Some(format!(
+            "{source} active file set differs from the JSON replay at {path}"
+        ));
+    }
+    for (app_id, version) in expected_txns {
+        if actual_txns.get(app_id) != Some(version) {
+            return Some(format!(
+                "{source} txn {app_id} is {:?}; the JSON replay has {version}",
+                actual_txns.get(app_id)
+            ));
+        }
+    }
+    actual_txns
+        .keys()
+        .find(|app_id| !expected_txns.contains_key(*app_id))
+        .map(|app_id| format!("{source} has txn {app_id} absent from the JSON replay"))
+}
+
+/// Parse a Delta interval such as `interval 30 days`; `None` when unrecognized.
+fn parse_interval_ms(value: &str) -> Option<i64> {
+    let mut parts = value.split_whitespace();
+    let first = parts.next()?;
+    let (count, unit) = if first.eq_ignore_ascii_case("interval") {
+        (parts.next()?, parts.next()?)
+    } else {
+        (first, parts.next()?)
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    let count: i64 = count.parse().ok().filter(|count| *count >= 0)?;
+    let unit = unit.to_ascii_lowercase();
+    let unit_ms = match unit.strip_suffix('s').unwrap_or(&unit) {
+        "millisecond" => 1,
+        "second" => 1_000,
+        "minute" => 60_000,
+        "hour" => 3_600_000,
+        "day" => 86_400_000,
+        "week" => 604_800_000,
+        _ => return None,
+    };
+    count.checked_mul(unit_ms)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum LogObject {
+    Json(u64),
+    Checkpoint(u64),
+    Crc(u64),
+    Other(u64),
+}
+
+/// Classify a `_delta_log/` child name; `None` for unversioned names such as `_last_checkpoint`.
+fn classify_log_name(name: &str) -> Option<LogObject> {
+    let (digits, rest) = name.split_at_checked(20)?;
+    if !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let version = digits.parse().ok()?;
+    Some(match rest.strip_prefix('.')? {
+        "json" => LogObject::Json(version),
+        "checkpoint.parquet" => LogObject::Checkpoint(version),
+        "crc" => LogObject::Crc(version),
+        _ => LogObject::Other(version),
+    })
+}
+
+/// Validate one planned deletion against checkpoint `C`; returns its sort key.
+fn deletion_key(name: &str, checkpoint: u64) -> Result<(u64, u8)> {
+    let invalid = || {
+        fail(
+            MaintenanceErrorKind::InvalidPlan,
+            format!("{name} is not prunable below checkpoint {checkpoint}"),
+        )
+    };
+    match name.strip_prefix("_delta_log/").and_then(classify_log_name) {
+        Some(LogObject::Json(version)) if version <= checkpoint => Ok((version, 0)),
+        Some(LogObject::Checkpoint(version)) if version < checkpoint => Ok((version, 1)),
+        _ => Err(invalid()),
+    }
+}
+
+/// `_delta_log` pruning bounds. Log retention defaults to the table's
+/// `delta.logRetentionDuration` (30 days when unset); a shorter override needs
+/// the unsafe test override plus a marked disposable local temp root.
+#[derive(Clone, Debug)]
+pub struct PruneConfig {
+    pub log_retention_ms: Option<i64>,
+    /// Explicit wall-clock UTC anchor for the commit-age cutoff.
+    pub now_ms: i64,
+    pub unsafe_allow_short_retention_for_tests: bool,
+    /// Maximum log objects deleted by one apply; the rest is reported as backlog.
+    pub max_prune_files: usize,
+    pub max_log_files: usize,
+    pub max_log_file_bytes: u64,
+    pub max_checkpoint_bytes: u64,
+    pub max_active_files: usize,
+}
+
+impl PruneConfig {
+    /// Defaults for everything except the anchor.
+    #[must_use]
+    pub const fn new(now_ms: i64) -> Self {
+        Self {
+            log_retention_ms: None,
+            now_ms,
+            unsafe_allow_short_retention_for_tests: false,
+            max_prune_files: 10_000,
+            max_log_files: 100_000,
+            max_log_file_bytes: 64 * 1024 * 1024,
+            max_checkpoint_bytes: DEFAULT_MAX_CHECKPOINT_BYTES,
+            max_active_files: 1_000_000,
+        }
+    }
+}
+
+/// Serializable `_delta_log` pruning dry-run plan.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrunePlan {
+    pub header: PlanHeader,
+    pub log_retention_ms: i64,
+    /// Explicit UTC anchor; `log_cutoff_ms = now_ms - log_retention_ms`.
+    pub now_ms: i64,
+    /// Every pruned commit is older than this.
+    pub log_cutoff_ms: i64,
+    /// Newest proven checkpoint `C`; `None` when nothing is eligible.
+    pub checkpoint_version: Option<u64>,
+    /// The VACUUM LITE progress record the proof relied on.
+    pub progress: Option<VacuumLiteProgress>,
+    /// Log objects to delete in ascending version order: `NNN.json` for
+    /// `0..=C` and classic checkpoints below `C`.
+    pub deletions: Vec<String>,
+    pub backlog_files: u64,
+}
+
+impl PrunePlan {
+    /// Dry-run report: `Planned` with deletions, otherwise `Noop`.
+    #[must_use]
+    pub fn report(&self) -> MaintenanceReport {
+        let mut report = MaintenanceReport::new("prune_log", &self.header);
+        report.outcome = if self.deletions.is_empty() {
+            Outcome::Noop
+        } else {
+            Outcome::Planned
+        };
+        report.version = self.checkpoint_version.unwrap_or(self.header.read_version);
+        report.cutoff_ms = Some(self.log_cutoff_ms);
+        report.files_removed = u64::try_from(self.deletions.len()).unwrap_or(u64::MAX);
+        report.backlog_files = self.backlog_files;
+        report
+    }
+}
+
+/// A checkpoint `C` proven equivalent to the history it replaces.
+struct PruneProof {
+    checkpoint_version: u64,
+    deletions: Vec<String>,
+    backlog: u64,
+}
+
+impl DeltaTable {
+    /// The durable VACUUM LITE progress record, if any.
+    ///
+    /// # Errors
+    /// Returns storage or malformed-record errors.
+    pub fn vacuum_lite_progress(&self) -> Result<Option<VacuumLiteProgress>> {
+        self.read_record(VACUUM_PROGRESS_RECORD)
+    }
+
+    /// The durable log floor record, if any.
+    ///
+    /// # Errors
+    /// Returns storage or malformed-record errors.
+    pub fn log_floor(&self) -> Result<Option<LogFloor>> {
+        self.read_record(LOG_FLOOR_RECORD)
+    }
+
+    fn read_record<T: serde::de::DeserializeOwned>(&self, name: &str) -> Result<Option<T>> {
+        let path = self.object_path(&format!("{MAINTENANCE_DIR}/{name}"))?;
+        let fetched = shared_executor()?.block_on(fetch_record(Arc::clone(&self.store), path))?;
+        fetched
+            .map(|(bytes, _)| {
+                serde_json::from_slice(&bytes).map_err(|error| {
+                    fail(
+                        MaintenanceErrorKind::Unsupported,
+                        format!("malformed maintenance record {name}: {error}"),
+                    )
+                })
+            })
+            .transpose()
+    }
+
+    /// Durably replace a maintenance record with `merge(current)` when it returns
+    /// `Some`. Local roots serialize writers with an exclusive lock and publish by
+    /// fsynced rename; object stores use create-if-absent or etag-conditional puts.
+    fn update_record<T>(&self, name: &str, merge: impl Fn(Option<&T>) -> Result<Option<T>>) -> Result<()>
+    where
+        T: Serialize + serde::de::DeserializeOwned,
+    {
+        let parse = |bytes: &[u8]| {
+            serde_json::from_slice::<T>(bytes).map_err(|error| {
+                fail(
+                    MaintenanceErrorKind::Unsupported,
+                    format!("malformed maintenance record {name}: {error}"),
+                )
+            })
+        };
+        if self.url.scheme() == "file" {
+            let directory = self.root.join(MAINTENANCE_DIR);
+            if !directory.is_dir() {
+                fs::create_dir_all(&directory)?;
+                sync_directory(&self.root)?;
+            }
+            let lock = fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(directory.join(".lock"))?;
+            fs2::FileExt::lock_exclusive(&lock)?;
+            let target = directory.join(name);
+            let current = match fs::read(&target) {
+                Ok(bytes) => Some(parse(&bytes)?),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            let Some(next) = merge(current.as_ref())? else {
+                return Ok(());
+            };
+            let staged = directory.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()));
+            fs::write(&staged, serde_json::to_vec(&next)?)?;
+            sync_file(&staged)?;
+            fs::rename(&staged, &target)?;
+            sync_file(&target)?;
+            sync_directory(&directory)?;
+            sync_directory(&self.root)?;
+            fs2::FileExt::unlock(&lock)?;
+            return Ok(());
+        }
+        let path = self.object_path(&format!("{MAINTENANCE_DIR}/{name}"))?;
+        for _ in 0..MAX_RECORD_ATTEMPTS {
+            let fetched = shared_executor()?.block_on(fetch_record(Arc::clone(&self.store), path.clone()))?;
+            let (current, mode) = match fetched {
+                Some((bytes, version)) => (Some(parse(&bytes)?), PutMode::Update(version)),
+                None => (None, PutMode::Create),
+            };
+            let Some(next) = merge(current.as_ref())? else {
+                return Ok(());
+            };
+            let payload = serde_json::to_vec(&next)?;
+            let store = Arc::clone(&self.store);
+            let target = path.clone();
+            let result = shared_executor()?
+                .block_on(async move { store.put_opts(&target, payload.into(), PutOptions::from(mode)).await });
+            match result {
+                Ok(_) => return Ok(()),
+                Err(object_store::Error::Precondition { .. } | object_store::Error::AlreadyExists { .. }) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(fail(
+            MaintenanceErrorKind::Exhausted,
+            format!("maintenance record {name} kept changing concurrently"),
+        ))
+    }
+
+    /// Effective log retention: the table property (default 30 days) unless a
+    /// configured override applies; shorter overrides need the unsafe test gate.
+    fn log_retention(&self, config: &PruneConfig, fingerprint: &TableFingerprint) -> Result<i64> {
+        let table = match fingerprint.configuration.get("delta.logRetentionDuration") {
+            Some(value) => parse_interval_ms(value).ok_or_else(|| {
+                fail(
+                    MaintenanceErrorKind::Unsupported,
+                    format!("unrecognized delta.logRetentionDuration {value:?}"),
+                )
+            })?,
+            None => DEFAULT_LOG_RETENTION_MS,
+        };
+        let Some(requested) = config.log_retention_ms else {
+            return Ok(table);
+        };
+        if requested < 0 {
+            return Err(fail(MaintenanceErrorKind::UnsafeRequest, "negative log retention"));
+        }
+        if requested < table {
+            if !config.unsafe_allow_short_retention_for_tests {
+                return Err(fail(
+                    MaintenanceErrorKind::UnsafeRequest,
+                    "log retention below delta.logRetentionDuration requires the unsafe test override",
+                ));
+            }
+            self.check_disposable_test_root("log retention")?;
+        }
+        Ok(requested)
+    }
+
+    /// Kernel's view of version `version`: table id, active add keys and the
+    /// requested application transactions.
+    fn kernel_view_at(
+        &self,
+        version: u64,
+        app_ids: &BTreeSet<String>,
+        max_active: usize,
+    ) -> Result<(String, BTreeSet<String>, BTreeMap<String, i64>)> {
+        let unsupported = |message: String| fail(MaintenanceErrorKind::Unsupported, message);
+        let snapshot = Snapshot::builder_for(self.url.as_str())
+            .at_version(version)
+            .build(&self.engine)
+            .map_err(|error| unsupported(format!("Kernel cannot load version {version}: {error}")))?;
+        if snapshot.version() != version {
+            return Err(unsupported(format!(
+                "Kernel loaded {} instead of {version}",
+                snapshot.version()
+            )));
+        }
+        let fingerprint = TableFingerprint::of(&snapshot);
+        if fingerprint
+            .configuration
+            .contains_key("delta.setTransactionRetentionDuration")
+        {
+            return Err(unsupported(
+                "transaction retention must remain unset to prune history".to_owned(),
+            ));
+        }
+        let scan = Arc::clone(&snapshot).scan_builder().build()?;
+        let mut active = BTreeSet::new();
+        for metadata in scan.scan_metadata(&self.engine)? {
+            let batch = metadata?.scan_files.apply_selection_vector()?.try_into_record_batch()?;
+            for file in parse_scan_rows(&batch, &fingerprint.partition_columns)? {
+                if active.len() >= max_active {
+                    return Err(fail(
+                        MaintenanceErrorKind::ResourceLimit,
+                        format!("active file count exceeds {max_active}"),
+                    ));
+                }
+                if !active.insert(self.log_key(&file.path)?) {
+                    return Err(unsupported(format!("duplicate active path {}", file.path)));
+                }
+            }
+        }
+        let mut txns = BTreeMap::new();
+        for app_id in app_ids {
+            if let Some(txn_version) = snapshot.get_app_id_version(app_id, &self.engine)? {
+                txns.insert(app_id.clone(), txn_version);
+            }
+        }
+        Ok((fingerprint.table_id, active, txns))
+    }
+
+    /// Compare an independent replay with checkpoint `version`, both through a
+    /// direct Parquet read of the checkpoint file and through Kernel loading it.
+    fn verify_checkpoint(
+        &self,
+        version: u64,
+        expected: &LogReplay,
+        table_id: &str,
+        config: &PruneConfig,
+    ) -> Result<()> {
+        let unsupported = |message: String| fail(MaintenanceErrorKind::Unsupported, message);
+        if expected.txn_regressed {
+            return Err(unsupported(
+                "a txn version regressed in the JSON replay; refusing to prune".to_owned(),
+            ));
+        }
+        if expected.table_id.as_deref() != Some(table_id) {
+            return Err(unsupported("replayed table id differs from the table".to_owned()));
+        }
+        let parquet = self.read_checkpoint(version, config.max_checkpoint_bytes)?;
+        if parquet.table_id.as_deref() != Some(table_id) {
+            return Err(unsupported(format!(
+                "checkpoint {version} belongs to a different table id"
+            )));
+        }
+        if let Some(mismatch) = proof_mismatch(
+            &format!("checkpoint {version} Parquet"),
+            &expected.active,
+            &expected.txns,
+            &parquet.active,
+            &parquet.txns,
+        ) {
+            return Err(unsupported(mismatch));
+        }
+        let mut app_ids: BTreeSet<String> = expected.txns.keys().cloned().collect();
+        app_ids.insert(PURGE_WATERMARK.to_owned());
+        let (kernel_table, kernel_active, kernel_txns) =
+            self.kernel_view_at(version, &app_ids, config.max_active_files)?;
+        if kernel_table != table_id {
+            return Err(unsupported(format!(
+                "Kernel version {version} has a different table id"
+            )));
+        }
+        if let Some(mismatch) = proof_mismatch(
+            &format!("Kernel snapshot {version}"),
+            &expected.active,
+            &expected.txns,
+            &kernel_active,
+            &kernel_txns,
+        ) {
+            return Err(unsupported(mismatch));
+        }
+        Ok(())
+    }
+
+    /// Hand-written replay of `first..=last` on top of `replay`; every JSON must exist.
+    fn replay_range(
+        &self,
+        replay: &mut LogReplay,
+        first: u64,
+        last: u64,
+        config: &PruneConfig,
+        mut visit: impl FnMut(u64, &CommitFacts) -> bool,
+    ) -> Result<()> {
+        for version in first..=last {
+            let bytes = self.read_commit(version, config.max_log_file_bytes)?;
+            let facts = self.replay_commit(replay, &bytes)?;
+            if !visit(version, &facts) {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Find (or, with `target`, re-prove) the newest checkpoint `C` whose
+    /// history may be deleted. See the crate README for the proof conditions.
+    fn prove_prune(
+        &self,
+        config: &PruneConfig,
+        log_cutoff_ms: i64,
+        table_id: &str,
+        head: u64,
+        target: Option<u64>,
+    ) -> Result<Option<PruneProof>> {
+        let unsupported = |message: String| fail(MaintenanceErrorKind::Unsupported, message);
+        let stale = |message: &str| Err(fail(MaintenanceErrorKind::StalePlan, message.to_owned()));
+        let names = self.list_log(config.max_log_files.saturating_mul(4))?;
+        let (mut json, mut checkpoints, mut other) = (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
+        for name in names.keys() {
+            match classify_log_name(name) {
+                Some(LogObject::Json(version)) => json.insert(version),
+                Some(LogObject::Checkpoint(version)) => checkpoints.insert(version),
+                Some(LogObject::Other(version)) => other.insert(version),
+                Some(LogObject::Crc(_)) | None => false,
+            };
+        }
+        let (Some(hint), Some(progress)) = (self.hinted_checkpoint_version()?, self.vacuum_lite_progress()?) else {
+            return if target.is_some() {
+                stale("checkpoint hint or VACUUM LITE progress record disappeared")
+            } else {
+                Ok(None)
+            };
+        };
+        if progress.table_id != table_id {
+            return Err(fail(
+                MaintenanceErrorKind::MetadataChanged,
+                "VACUUM LITE progress record belongs to a different table id",
+            ));
+        }
+        let floor = match self.log_floor()? {
+            Some(floor) if floor.table_id != table_id => {
+                return Err(fail(
+                    MaintenanceErrorKind::MetadataChanged,
+                    "log floor record belongs to a different table id",
+                ));
+            }
+            floor => floor.map(|floor| floor.checkpoint_version),
+        };
+        let upper = hint.min(progress.version).min(head);
+        if let Some(version) = other.range(..=upper).next() {
+            return Err(unsupported(format!(
+                "unsupported log object at version {version} (multi-part, V2 or compacted); refusing to prune"
+            )));
+        }
+        let candidates: Vec<u64> = checkpoints
+            .range(floor.unwrap_or(0)..=upper)
+            .rev()
+            .copied()
+            .filter(|candidate| target.is_none_or(|target| target == *candidate))
+            .collect();
+        let above_floor = |candidate: u64| floor.is_none_or(|floor| candidate > floor);
+        let seed = |replay: &mut LogReplay| -> Result<u64> {
+            match floor {
+                Some(floor) => {
+                    *replay = self.read_checkpoint(floor, config.max_checkpoint_bytes)?;
+                    Ok(floor + 1)
+                }
+                None => Ok(0),
+            }
+        };
+        let mut chosen = None;
+        if let Some(&newest) = candidates.iter().find(|candidate| above_floor(**candidate)) {
+            let mut replay = LogReplay::default();
+            let first = seed(&mut replay)?;
+            if usize::try_from(newest - first).unwrap_or(usize::MAX) >= config.max_log_files {
+                return Err(fail(
+                    MaintenanceErrorKind::ResourceLimit,
+                    "log history exceeds the replay bound",
+                ));
+            }
+            if let Some(missing) = (first..=newest).find(|version| !json.contains(version)) {
+                return Err(unsupported(format!(
+                    "log history gap: {missing:020}.json is missing above the log floor"
+                )));
+            }
+            let vacuumed = |stamp: &Option<i64>| stamp.is_some_and(|stamp| stamp < progress.cutoff_ms);
+            let mut eligible = replay.tombstones.values().all(|(_, stamp)| vacuumed(stamp));
+            let mut through = None;
+            if eligible {
+                self.replay_range(&mut replay, first, newest, config, |version, facts| {
+                    let modified = names
+                        .get(&format!("{version:020}.json"))
+                        .map(|meta| meta.last_modified.timestamp_millis());
+                    let stamp = [facts.timestamp, modified].into_iter().flatten().max();
+                    eligible =
+                        stamp.is_some_and(|stamp| stamp < log_cutoff_ms) && facts.remove_stamps.iter().all(vacuumed);
+                    if eligible {
+                        through = Some(version);
+                    }
+                    eligible
+                })?;
+            }
+            chosen = candidates
+                .iter()
+                .copied()
+                .find(|candidate| above_floor(*candidate) && through.is_some_and(|through| *candidate <= through));
+        }
+        let checkpoint = match (chosen, floor) {
+            (Some(checkpoint), _) => {
+                let mut replay = LogReplay::default();
+                let first = seed(&mut replay)?;
+                self.replay_range(&mut replay, first, checkpoint, config, |_, _| true)?;
+                self.verify_checkpoint(checkpoint, &replay, table_id, config)?;
+                checkpoint
+            }
+            // Completing an interrupted prune: the full proof held before the floor
+            // was written; re-verify that Kernel still agrees with the checkpoint.
+            (None, Some(floor))
+                if candidates.contains(&floor)
+                    && (json.range(..=floor).next().is_some() || checkpoints.range(..floor).next().is_some()) =>
+            {
+                let replay = self.read_checkpoint(floor, config.max_checkpoint_bytes)?;
+                self.verify_checkpoint(floor, &replay, table_id, config)?;
+                floor
+            }
+            _ if target.is_some() => return stale("the planned checkpoint is no longer provably prunable"),
+            _ => return Ok(None),
+        };
+        let mut deletions: Vec<(u64, u8)> = json
+            .range(..=checkpoint)
+            .map(|version| (*version, 0))
+            .chain(checkpoints.range(..checkpoint).map(|version| (*version, 1)))
+            .collect();
+        deletions.sort_unstable();
+        let backlog = u64::try_from(deletions.len().saturating_sub(config.max_prune_files)).unwrap_or(u64::MAX);
+        deletions.truncate(config.max_prune_files);
+        Ok(Some(PruneProof {
+            checkpoint_version: checkpoint,
+            deletions: deletions
+                .into_iter()
+                .map(|(version, kind)| {
+                    if kind == 0 {
+                        format!("_delta_log/{version:020}.json")
+                    } else {
+                        format!("_delta_log/{version:020}.checkpoint.parquet")
+                    }
+                })
+                .collect(),
+            backlog,
+        }))
+    }
+
+    /// Plan `_delta_log` pruning: choose the newest checkpoint `C` proven
+    /// equivalent to JSON history `0..=C` (or to the previous floor checkpoint
+    /// plus later JSON), whose tombstones VACUUM LITE already processed and
+    /// whose commits are all older than the log retention. Deletes nothing.
+    ///
+    /// # Errors
+    /// Rejects unsafe retention, unsupported logs, record or checkpoint
+    /// disagreements and bounds.
+    pub fn plan_prune_log(&self, config: &PruneConfig) -> Result<PrunePlan> {
+        if config.max_prune_files == 0 {
+            return Err(fail(MaintenanceErrorKind::InvalidPlan, "prune bound must be positive"));
+        }
+        let state = self.active_state(config.max_active_files)?;
+        state.fingerprint.validate_supported(false)?;
+        let retention = self.log_retention(config, &state.fingerprint)?;
+        validate_anchor("prune", config.now_ms)?;
+        let log_cutoff_ms = config
+            .now_ms
+            .checked_sub(retention)
+            .ok_or_else(|| fail(MaintenanceErrorKind::InvalidPlan, "log retention exceeds the anchor"))?;
+        let header = PlanHeader::new(self, &state)?;
+        let proof = self.prove_prune(
+            config,
+            log_cutoff_ms,
+            &state.fingerprint.table_id,
+            state.snapshot.version(),
+            None,
+        )?;
+        let (checkpoint_version, deletions, backlog_files) = match proof {
+            Some(proof) => (Some(proof.checkpoint_version), proof.deletions, proof.backlog),
+            None => (None, Vec::new(), 0),
+        };
+        Ok(PrunePlan {
+            header,
+            log_retention_ms: retention,
+            now_ms: config.now_ms,
+            log_cutoff_ms,
+            checkpoint_version,
+            progress: self.vacuum_lite_progress()?,
+            deletions,
+            backlog_files,
+        })
+    }
+
+    /// Delete planned `_delta_log` history after re-proving it. No Delta commit
+    /// is written. The durable log floor is recorded before the first delete;
+    /// deletes run in ascending version order, treat absence as success, and
+    /// never touch checkpoint `C`, `_last_checkpoint` or anything newer.
+    /// Cancellation between deletes returns a `Partial` report.
+    ///
+    /// # Errors
+    /// Returns invalid, stale, unsafe, metadata, authority or storage errors
+    /// (with partial progress attached once deletion started).
+    pub fn apply_prune_log(
+        &self,
+        plan: &PrunePlan,
+        config: &PruneConfig,
+        control: &MaintenanceControl,
+    ) -> Result<MaintenanceReport> {
+        plan.header.validate(self)?;
+        let mut report = MaintenanceReport::new("prune_log", &plan.header);
+        report.cutoff_ms = Some(plan.log_cutoff_ms);
+        report.backlog_files = plan.backlog_files;
+        let Some(checkpoint) = plan.checkpoint_version else {
+            return Ok(report);
+        };
+        report.version = checkpoint;
+        if plan.deletions.is_empty() {
+            return Ok(report);
+        }
+        if plan.deletions.len() > config.max_prune_files {
+            return Err(fail(MaintenanceErrorKind::InvalidPlan, "plan exceeds the prune bound"));
+        }
+        let mut previous = None;
+        for name in &plan.deletions {
+            let key = deletion_key(name, checkpoint)?;
+            if previous.is_some_and(|previous| previous >= key) {
+                return Err(fail(
+                    MaintenanceErrorKind::InvalidPlan,
+                    "planned deletions must be strictly ascending",
+                ));
+            }
+            previous = Some(key);
+        }
+        validate_anchor("prune plan", plan.now_ms)?;
+        if plan.now_ms.checked_sub(plan.log_retention_ms) != Some(plan.log_cutoff_ms) {
+            return Err(fail(
+                MaintenanceErrorKind::InvalidPlan,
+                "plan cutoff does not match its recorded anchor and retention",
+            ));
+        }
+        let state = self.active_state(config.max_active_files)?;
+        plan.header.fingerprint.require_same(&state.fingerprint)?;
+        let planned_policy = PruneConfig {
+            log_retention_ms: Some(plan.log_retention_ms),
+            ..config.clone()
+        };
+        self.log_retention(&planned_policy, &state.fingerprint)?;
+        let current = self.log_retention(config, &state.fingerprint)?;
+        validate_anchor("prune", config.now_ms)?;
+        let current_cutoff = config
+            .now_ms
+            .checked_sub(current)
+            .ok_or_else(|| fail(MaintenanceErrorKind::InvalidPlan, "log retention exceeds the anchor"))?;
+        let effective = plan.log_cutoff_ms.min(current_cutoff);
+        report.cutoff_ms = Some(effective);
+        let table_id = state.fingerprint.table_id.clone();
+        self.prove_prune(config, effective, &table_id, state.snapshot.version(), Some(checkpoint))?
+            .ok_or_else(|| {
+                fail(
+                    MaintenanceErrorKind::StalePlan,
+                    "planned checkpoint is no longer provable",
+                )
+            })?;
+        if control.interrupted() {
+            report.outcome = Outcome::Partial;
+            report.interrupted = true;
+            return Ok(report);
+        }
+        if let Err(error) = self.check_publication() {
+            return Err(fail_with(
+                MaintenanceErrorKind::UnsafeRequest,
+                format!("authority check failed: {error}"),
+                &report,
+            ));
+        }
+        let floor = LogFloor {
+            table_id,
+            checkpoint_version: checkpoint,
+        };
+        self.update_record(LOG_FLOOR_RECORD, |current| merge_floor(current, &floor))
+            .map_err(|error| {
+                fail_with(
+                    error_kind(&error).unwrap_or(MaintenanceErrorKind::Uncertain),
+                    format!("log floor record not written; nothing deleted: {error:#}"),
+                    &report,
+                )
+            })?;
+        let mut interrupted = false;
+        for name in &plan.deletions {
+            if control.interrupted() {
+                interrupted = true;
+                break;
+            }
+            if let Err(error) = self.check_publication() {
+                return Err(fail_with(
+                    MaintenanceErrorKind::UnsafeRequest,
+                    format!("authority check failed: {error}"),
+                    &report,
+                ));
+            }
+            let path = self.object_path(name)?;
+            let store = Arc::clone(&self.store);
+            match shared_executor()?.block_on(async move { store.delete(&path).await }) {
+                Ok(()) => report.files_deleted += 1,
+                Err(object_store::Error::NotFound { .. }) => report.files_already_absent += 1,
+                Err(error) => {
+                    return Err(fail_with(
+                        MaintenanceErrorKind::Uncertain,
+                        format!("delete of {name} failed: {error}"),
+                        &report,
+                    ));
+                }
+            }
+        }
+        if self.url.scheme() == "file" {
+            sync_directory(&self.root.join("_delta_log"))?;
+        }
+        report.files_removed = report.files_deleted + report.files_already_absent;
+        if interrupted {
+            report.outcome = Outcome::Partial;
+            report.interrupted = true;
+        } else {
+            report.outcome = Outcome::Pruned;
+        }
         Ok(report)
     }
 }
@@ -2850,5 +4059,109 @@ mod durability_tests {
         assert!(synced.contains(&log.join(format!("{committed:020}.json"))));
         sync_hook::reset(&root);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod prune_tests {
+    use super::*;
+
+    fn set(paths: &[&str]) -> BTreeSet<String> {
+        paths.iter().map(|path| (*path).to_owned()).collect()
+    }
+
+    fn txns(entries: &[(&str, i64)]) -> BTreeMap<String, i64> {
+        entries
+            .iter()
+            .map(|(id, version)| ((*id).to_owned(), *version))
+            .collect()
+    }
+
+    #[test]
+    fn proof_mismatch_detects_every_difference() {
+        let active = set(&["a", "b"]);
+        let expected = txns(&[("arrowcol.publication.1", 1), (PURGE_WATERMARK, 5)]);
+        assert_eq!(proof_mismatch("x", &active, &expected, &active, &expected), None);
+        assert!(proof_mismatch("x", &active, &expected, &set(&["a"]), &expected).is_some());
+        assert!(proof_mismatch("x", &active, &expected, &set(&["a", "b", "c"]), &expected).is_some());
+        let missing = txns(&[(PURGE_WATERMARK, 5)]);
+        assert!(
+            proof_mismatch("x", &active, &expected, &active, &missing)
+                .is_some_and(|message| message.contains("arrowcol.publication.1"))
+        );
+        let older = txns(&[("arrowcol.publication.1", 1), (PURGE_WATERMARK, 4)]);
+        assert!(proof_mismatch("x", &active, &expected, &active, &older).is_some());
+        let extra = txns(&[("arrowcol.publication.1", 1), (PURGE_WATERMARK, 5), ("other", 1)]);
+        assert!(proof_mismatch("x", &active, &expected, &active, &extra).is_some());
+    }
+
+    #[test]
+    fn records_are_table_bound_and_monotonic() -> Result<()> {
+        let progress = |version, cutoff_ms| VacuumLiteProgress {
+            table_id: "t".into(),
+            version,
+            cutoff_ms,
+        };
+        assert_eq!(merge_progress(None, &progress(3, 10))?, Some(progress(3, 10)));
+        assert_eq!(
+            merge_progress(Some(&progress(3, 10)), &progress(4, 11))?,
+            Some(progress(4, 11))
+        );
+        assert_eq!(merge_progress(Some(&progress(3, 10)), &progress(3, 10))?, None);
+        assert_eq!(merge_progress(Some(&progress(3, 10)), &progress(2, 11))?, None);
+        assert_eq!(merge_progress(Some(&progress(3, 10)), &progress(4, 9))?, None);
+        let other = VacuumLiteProgress {
+            table_id: "u".into(),
+            ..progress(9, 99)
+        };
+        assert_eq!(
+            merge_progress(Some(&progress(3, 10)), &other)
+                .err()
+                .as_ref()
+                .and_then(error_kind),
+            Some(MaintenanceErrorKind::MetadataChanged)
+        );
+        let floor = |checkpoint_version| LogFloor {
+            table_id: "t".into(),
+            checkpoint_version,
+        };
+        assert_eq!(merge_floor(None, &floor(2))?, Some(floor(2)));
+        assert_eq!(merge_floor(Some(&floor(2)), &floor(5))?, Some(floor(5)));
+        assert_eq!(merge_floor(Some(&floor(5)), &floor(2))?, None);
+        assert_eq!(merge_floor(Some(&floor(5)), &floor(5))?, None);
+        let foreign = LogFloor {
+            table_id: "u".into(),
+            checkpoint_version: 9,
+        };
+        assert!(merge_floor(Some(&floor(5)), &foreign).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn log_names_intervals_and_deletion_keys_parse_strictly() {
+        assert_eq!(parse_interval_ms("interval 30 days"), Some(DEFAULT_LOG_RETENTION_MS));
+        assert_eq!(parse_interval_ms("INTERVAL 1 hour"), Some(3_600_000));
+        assert_eq!(parse_interval_ms("2 weeks"), Some(2 * 604_800_000));
+        assert_eq!(parse_interval_ms("interval -1 days"), None);
+        assert_eq!(parse_interval_ms("interval 1 fortnight"), None);
+        assert_eq!(parse_interval_ms("interval 1 day extra"), None);
+        assert_eq!(classify_log_name("00000000000000000007.json"), Some(LogObject::Json(7)));
+        assert_eq!(
+            classify_log_name("00000000000000000007.checkpoint.parquet"),
+            Some(LogObject::Checkpoint(7))
+        );
+        assert_eq!(classify_log_name("00000000000000000007.crc"), Some(LogObject::Crc(7)));
+        assert_eq!(
+            classify_log_name("00000000000000000007.checkpoint.0000000001.0000000002.parquet"),
+            Some(LogObject::Other(7))
+        );
+        assert_eq!(classify_log_name("_last_checkpoint"), None);
+        assert_eq!(classify_log_name("0000000000000000007.json"), None);
+        assert!(deletion_key("_delta_log/00000000000000000003.json", 3).is_ok());
+        assert!(deletion_key("_delta_log/00000000000000000004.json", 3).is_err());
+        assert!(deletion_key("_delta_log/00000000000000000002.checkpoint.parquet", 3).is_ok());
+        assert!(deletion_key("_delta_log/00000000000000000003.checkpoint.parquet", 3).is_err());
+        assert!(deletion_key("_delta_log/_last_checkpoint", 3).is_err());
+        assert!(deletion_key("part-0.parquet", 3).is_err());
     }
 }
