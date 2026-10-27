@@ -20,7 +20,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -97,7 +97,8 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
 }
 
 fn require_release(results: &Path, run_id: &str) -> Result<()> {
-    let release: PublisherRelease = read_json(&results.join("publisher-release.json"))?;
+    let release: PublisherRelease =
+        read_json(&results.join("publisher-release.json")).context("invalid publisher release receipt")?;
     ensure!(
         release.passed && release.run_id.as_deref() == Some(run_id),
         "publisher release must pass for the same nonnull run_id"
@@ -107,7 +108,7 @@ fn require_release(results: &Path, run_id: &str) -> Result<()> {
 
 fn cloud_root(path: &Path) -> bool {
     path.to_str()
-        .is_some_and(|raw| Url::parse(raw).is_ok_and(|url| url.scheme() != "file"))
+        .is_some_and(|raw| Url::parse(raw).is_ok_and(|url| matches!(url.scheme(), "abfss" | "abfs" | "az" | "https")))
 }
 
 /// Whether to compact, skip intentionally, or retain Azure's existing default.
@@ -629,7 +630,7 @@ struct ValidationInventory {
 
 #[derive(Serialize)]
 struct Receipt {
-    run_id: String,
+    run_id: Option<String>,
     passed: bool,
     skipped: bool,
     error: Option<String>,
@@ -639,7 +640,20 @@ struct Receipt {
     pools: BTreeMap<String, PoolEvidence>,
 }
 
-fn atomic_receipt(results: &Path, receipt: &Receipt, deadline: Option<Instant>) -> Result<()> {
+fn write_receipt(file: &mut File, receipt: &Receipt) -> Result<()> {
+    file.set_len(0)?;
+    file.rewind()?;
+    serde_json::to_writer_pretty(&mut *file, receipt)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn atomic_receipt(results: &Path, receipt: &mut Receipt, deadline: Instant, mut operation: Result<()>) -> Result<()> {
+    if let Err(error) = &operation {
+        receipt.passed = false;
+        receipt.error = Some(format!("{error:#}"));
+    }
     let destination = results.join(ARTIFACT);
     ensure!(
         !destination.exists(),
@@ -648,22 +662,29 @@ fn atomic_receipt(results: &Path, receipt: &Receipt, deadline: Option<Instant>) 
     let temporary = results.join(format!(".final-compaction-{}.tmp", uuid::Uuid::new_v4()));
     let result = (|| -> Result<()> {
         let mut file = OpenOptions::new().write(true).create_new(true).open(&temporary)?;
-        serde_json::to_writer_pretty(&mut file, receipt)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-        if let Some(deadline) = deadline {
-            check(deadline)?;
+        write_receipt(&mut file, receipt)?;
+        if operation.is_ok()
+            && let Err(error) = check(deadline)
+        {
+            receipt.passed = false;
+            receipt.skipped = false;
+            receipt.error = Some(format!("{error:#}"));
+            operation = Err(error);
+            // Failure evidence must survive expiry, including after committed work.
+            write_receipt(&mut file, receipt)?;
         }
         // A hard link atomically publishes without replacing any pre-existing receipt.
         fs::hard_link(&temporary, &destination)?;
         fs::remove_file(&temporary)?;
+        #[cfg(unix)]
         File::open(results)?.sync_all()?;
         Ok(())
     })();
     if result.is_err() && temporary.exists() {
         fs::remove_file(&temporary).context("clean failed receipt temporary file")?;
     }
-    result
+    result?;
+    operation
 }
 
 /// Run final compaction off the async executor, retaining custody until it finishes.
@@ -679,15 +700,8 @@ pub async fn run(args: FinalCompactionArgs) -> Result<()> {
 }
 
 fn run_sync(args: &FinalCompactionArgs, deadline: Instant) -> Result<()> {
-    check(deadline)?;
-    let metadata: RunMetadata = read_json(&args.results.join("run-metadata.json"))?;
-    ensure!(!metadata.run_id.is_empty(), "empty run_id");
-    ensure!(
-        !args.results.join(ARTIFACT).exists(),
-        "final-compaction receipt already exists; preserve it"
-    );
     let mut receipt = Receipt {
-        run_id: metadata.run_id,
+        run_id: None,
         passed: false,
         skipped: false,
         error: None,
@@ -697,11 +711,20 @@ fn run_sync(args: &FinalCompactionArgs, deadline: Instant) -> Result<()> {
         pools: BTreeMap::new(),
     };
     let result = (|| -> Result<()> {
+        check(deadline).context("run_id unavailable: budget check before metadata read")?;
+        let metadata: RunMetadata = read_json(&args.results.join("run-metadata.json"))
+            .context("run_id unavailable: invalid or missing run-metadata.json")?;
+        ensure!(!metadata.run_id.is_empty(), "run_id unavailable: empty run_id");
+        receipt.run_id = Some(metadata.run_id);
+        ensure!(
+            !args.results.join(ARTIFACT).exists(),
+            "final-compaction receipt already exists; preserve it"
+        );
         if !enabled(args)? {
             receipt.skipped = true;
             return Ok(());
         }
-        require_release(&args.results, &receipt.run_id)?;
+        require_release(&args.results, receipt.run_id.as_deref().context("run_id unavailable")?)?;
         let roots = BTreeMap::from([
             ("direct".to_owned(), local_root(&args.direct_root)?),
             ("dataflow".to_owned(), local_root(&args.dataflow_root)?),
@@ -748,11 +771,7 @@ fn run_sync(args: &FinalCompactionArgs, deadline: Instant) -> Result<()> {
         receipt.passed = true;
         Ok(())
     })();
-    if let Err(error) = &result {
-        receipt.error = Some(format!("{error:#}"));
-    }
-    atomic_receipt(&args.results, &receipt, result.is_ok().then_some(deadline))?;
-    result
+    atomic_receipt(&args.results, &mut receipt, deadline, result)
 }
 
 #[cfg(test)]
@@ -778,6 +797,13 @@ mod tests {
         fs::write(results.join("run-metadata.json"), br#"{"run_id":"run-1"}"#)?;
         fs::write(results.join("publisher-release.json"), serde_json::to_vec(&release)?)?;
         Ok(())
+    }
+
+    fn failure_receipt(results: &Path) -> Result<Value> {
+        let evidence: Value = read_json(&results.join(ARTIFACT))?;
+        assert_eq!(evidence["passed"], false);
+        assert!(evidence["error"].as_str().is_some_and(|error| !error.is_empty()));
+        Ok(evidence)
     }
 
     fn file(index: usize) -> DataFile {
@@ -1002,6 +1028,49 @@ mod tests {
                 .contains("cooperative budget exhausted")
         );
         assert_eq!((fixture.captures, fixture.applies), (0, 0));
+        let root = tempfile::tempdir()?;
+        assert!(run_sync(&args(root.path()), Instant::now()).is_err());
+        let evidence = failure_receipt(root.path())?;
+        assert_eq!(evidence["run_id"], Value::Null);
+        assert!(
+            evidence["error"]
+                .as_str()
+                .context("error")?
+                .contains("budget exhausted")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn publication_expiry_records_failure_and_retains_committed_reports() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut fixture = Fixture::new(&[1, 0]);
+        let mut receipt = Receipt {
+            run_id: Some("run-1".into()),
+            passed: true,
+            skipped: false,
+            error: None,
+            budget_secs: BUDGET.as_secs(),
+            max_progress_passes: MAX_PASSES,
+            passes: execute(&mut fixture)?,
+            pools: BTreeMap::new(),
+        };
+        assert_eq!(fixture.applies, 1);
+        let expected = serde_json::to_value(&receipt.passes)?;
+        let error = atomic_receipt(root.path(), &mut receipt, Instant::now(), Ok(()))
+            .err()
+            .context("publication must fail its budget")?;
+        assert!(error.to_string().contains("budget exhausted"));
+        let evidence = failure_receipt(root.path())?;
+        assert_eq!(evidence["run_id"], "run-1");
+        assert_eq!(evidence["passes"], expected);
+        assert!(
+            evidence["error"]
+                .as_str()
+                .context("error")?
+                .contains("budget exhausted")
+        );
+        assert_eq!(fs::read_dir(root.path())?.count(), 1);
         Ok(())
     }
 
@@ -1085,19 +1154,21 @@ mod tests {
         fs::write(root.path().join("run-metadata.json"), br#"{"run_id":"run-1"}"#)?;
         assert!(run_sync(&arguments, Instant::now() + BUDGET).is_err());
         assert!(!arguments.direct_root.exists());
+        failure_receipt(root.path())?;
         for release in [
             serde_json::json!({"run_id":"run-1","passed":false}),
             serde_json::json!({"run_id":null,"passed":true}),
             serde_json::json!({"run_id":"","passed":true}),
             serde_json::json!({"run_id":"wrong","passed":true}),
+            serde_json::json!({"passed":true}),
+            serde_json::json!({"run_id":"run-1"}),
         ] {
             let case = tempfile::tempdir()?;
             receipts(case.path(), release)?;
             let arguments = args(case.path());
             assert!(run_sync(&arguments, Instant::now() + BUDGET).is_err());
             assert!(!arguments.direct_root.exists());
-            let evidence: Value = read_json(&case.path().join(ARTIFACT))?;
-            assert_eq!(evidence["passed"], false);
+            let evidence = failure_receipt(case.path())?;
             assert!(
                 evidence["error"]
                     .as_str()
@@ -1124,6 +1195,56 @@ mod tests {
             let arguments = args(root.path());
             assert!(run_sync(&arguments, Instant::now() + BUDGET).is_err());
             assert!(!arguments.direct_root.exists());
+            let evidence = failure_receipt(root.path())?;
+            assert_eq!(evidence["run_id"], Value::Null);
+            assert!(
+                evidence["error"]
+                    .as_str()
+                    .context("error")?
+                    .contains("run_id unavailable")
+            );
+        }
+        for metadata in [None, Some(b"{".as_slice()), Some(br#"{"run_id":42}"#.as_slice())] {
+            let root = tempfile::tempdir()?;
+            if let Some(bytes) = metadata {
+                fs::write(root.path().join("run-metadata.json"), bytes)?;
+            }
+            assert!(run_sync(&args(root.path()), Instant::now() + BUDGET).is_err());
+            let evidence = failure_receipt(root.path())?;
+            assert_eq!(evidence["run_id"], Value::Null);
+            assert!(
+                evidence["error"]
+                    .as_str()
+                    .context("error")?
+                    .contains("run_id unavailable")
+            );
+        }
+        let root = tempfile::tempdir()?;
+        File::create(root.path().join("run-metadata.json"))?.set_len(MAX_JSON_BYTES + 1)?;
+        assert!(run_sync(&args(root.path()), Instant::now() + BUDGET).is_err());
+        let evidence = failure_receipt(root.path())?;
+        assert_eq!(evidence["run_id"], Value::Null);
+        assert!(evidence["error"].as_str().context("error")?.contains("JSON size bound"));
+        Ok(())
+    }
+
+    #[test]
+    fn windows_drive_paths_and_unknown_schemes_stay_local() -> Result<()> {
+        for path in [
+            r"C:\delta\direct",
+            "C:/delta/direct",
+            "file:///delta/direct",
+            "other:local",
+        ] {
+            assert!(!cloud_root(Path::new(path)), "{path}");
+        }
+        let mut arguments = args(Path::new("results"));
+        arguments.direct_root = r"C:\delta\direct".into();
+        arguments.dataflow_root = r"D:\delta\dataflow".into();
+        arguments.final_compaction = true;
+        assert!(enabled(&arguments)?);
+        for scheme in ["abfss", "abfs", "az", "https"] {
+            assert!(cloud_root(Path::new(&format!("{scheme}://account/container"))));
         }
         Ok(())
     }

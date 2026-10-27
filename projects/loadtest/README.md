@@ -563,6 +563,8 @@ is runner-owned. It honors `LOADTEST_RESULTS`, `LOADTEST_DIRECT_ROOT` and
 Local compaction is on by default; `--skip-final-compaction` records an explicit
 opt-out (`skipped=true`, **not** `passed=true`). Azure roots retain the existing
 skip default; explicitly requesting `--final-compaction` on Azure fails visibly.
+Only `abfss`, `abfs`, `az` and `https` roots select Azure behavior; Windows
+drive paths and other non-Azure roots are treated as filesystem paths.
 
 Before opening tables it requires `publisher-release.json` with `passed=true`
 and the same nonnull `run_id` as `run-metadata.json`. It then uses Kernel active
@@ -594,7 +596,12 @@ replaced with a sample when a guard trips.
 The phase atomically publishes a new, fsynced `results/final-compaction.json`;
 it never overwrites existing evidence. The receipt includes `run_id`, `passed`,
 `skipped`, errors, actual per-pass plans/reports, before/after versions and a
-canonical-multiset digest/count per table. Its per-pool
+canonical-multiset digest/count per table. Invalid or unavailable run metadata
+produces `passed=false`, `run_id=null` and an explicit error. If the budget
+expires while preparing publication, failure evidence is published without
+reapplying that expired deadline; completed commit reports are retained.
+The receipt file is synchronized on every platform; parent-directory fsync is
+Unix-only and skipped on non-Unix platforms. Its per-pool
 `pools.<pool>.validation_inventory` is exactly the validation inventory shape:
 `{tables: {<dotted identity>: {schema, version, files}}}` with decoded sorted
 relative paths. The validation owner must bind that inventory to its captured
