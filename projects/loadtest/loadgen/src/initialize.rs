@@ -86,19 +86,47 @@ fn entries() -> Result<Vec<(ManifestEntry, Arc<Schema>)>> {
 /// Fails closed for missing configuration, unsafe roots, unfenced storage, incompatible existing
 /// tables, or manifest write failures. Never emits storage URLs or credentials to stdout.
 pub async fn initialize(args: InitializeAzureArgs) -> Result<()> {
-    let root = env::var("ARROWCOL_AZURE_TABLE_ROOT").context("missing ARROWCOL_AZURE_TABLE_ROOT")?;
-    let account = env::var("AZURE_STORAGE_ACCOUNT").context("missing AZURE_STORAGE_ACCOUNT")?;
-    let container = env::var("AZURE_STORAGE_CONTAINER").context("missing AZURE_STORAGE_CONTAINER")?;
-    let _checkpoint =
-        env::var("AZURE_STORAGE_CHECKPOINT_CONTAINER").context("missing AZURE_STORAGE_CHECKPOINT_CONTAINER")?;
+    let config = InitializeAzureConfig::from_lookup(|key| env::var(key).ok())?;
     initialize_tables_with(
         args,
-        &root,
-        &account,
-        &container,
+        &config.root,
+        &config.account,
+        &config.container,
         DeltaTable::initialize_url_for_bootstrap,
     )
     .await
+}
+
+/// Storage configuration [`initialize`] reads; production looks keys up in the process environment.
+#[derive(Clone, Debug)]
+pub struct InitializeAzureConfig {
+    /// Canonical ADLS table root.
+    pub root: String,
+    /// Owned storage account.
+    pub account: String,
+    /// Owned data container.
+    pub container: String,
+}
+
+impl InitializeAzureConfig {
+    /// Reads every required initializer key, in order, from `lookup`.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `missing <KEY>` for the first absent key; the checkpoint container is required
+    /// even though only its presence is checked here.
+    pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        let required = |key: &str| lookup(key).with_context(|| format!("missing {key}"));
+        let root = required("ARROWCOL_AZURE_TABLE_ROOT")?;
+        let account = required("AZURE_STORAGE_ACCOUNT")?;
+        let container = required("AZURE_STORAGE_CONTAINER")?;
+        required("AZURE_STORAGE_CHECKPOINT_CONTAINER")?;
+        Ok(Self {
+            root,
+            account,
+            container,
+        })
+    }
 }
 
 /// Shared body of [`initialize`]: validates the root, initializes every canonical table through
