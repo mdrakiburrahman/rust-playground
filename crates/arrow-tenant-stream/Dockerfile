@@ -20,20 +20,14 @@ LABEL org.opencontainers.image.title="arrow-tenant-stream" \
       org.opencontainers.image.source="https://github.com/mdrakiburrahman/rust-playground" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.revision="${VCS_REF}"
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
-    && install -d --mode 0755 /etc/apt/keyrings \
-    && curl --fail --silent --show-error --max-time 60 https://packages.microsoft.com/keys/microsoft.asc -o /tmp/microsoft.asc \
-    && gpg --dearmor --output /etc/apt/keyrings/microsoft.gpg /tmp/microsoft.asc \
-    && chmod 0644 /etc/apt/keyrings/microsoft.gpg \
-    && printf 'deb [arch=%s signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/azure-cli/ bookworm main\n' "$(dpkg --print-architecture)" > /etc/apt/sources.list.d/azure-cli.list \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends azure-cli=2.91.0-1~bookworm \
-    && rm -f /tmp/microsoft.asc \
-    && rm -rf /var/lib/apt/lists/* \
+COPY --chmod=0444 infra/docker/install-azure-cli.sh /tmp/install-azure-cli.sh
+RUN sh /tmp/install-azure-cli.sh \
+    && rm -f /tmp/install-azure-cli.sh \
     && groupadd --gid 10001 app \
     && useradd --uid 10001 --gid app --no-create-home --no-log-init --home-dir /nonexistent --shell /usr/sbin/nologin app \
-    && install -d --owner app --group app --mode 0750 /var/lib/tenant-stream
+    && install -d --owner app --group app --mode 0750 /var/lib/tenant-stream \
+    && install -d --owner app --group app --mode 0700 /var/lib/tenant-stream-azure
+ENV AZURE_CONFIG_DIR=/var/lib/tenant-stream-azure
 COPY --from=builder --chmod=0555 /usr/local/bin/arrow-tenant-stream /usr/local/bin/arrow-tenant-stream
 USER 10001:10001
 WORKDIR /var/lib/tenant-stream

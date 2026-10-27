@@ -185,24 +185,35 @@ async fn drive(
     tokio::pin!(shutdown);
     let run_result: Result<()> = async {
         loop {
-            tokio::select! {
-                result = &mut metrics_task => {
-                    result.context("tenant metrics task panicked")??;
-                    bail!("tenant metrics server exited unexpectedly");
+            let (outcome, stopping) = {
+                let step = drain_step_on_shutdown(stream.step(&mut sink), shutdown.as_mut());
+                tokio::pin!(step);
+                tokio::select! {
+                    result = &mut metrics_task => {
+                        step.await.context("drain microbatch after metrics failure")?;
+                        result.context("tenant metrics task panicked")??;
+                        bail!("tenant metrics server exited unexpectedly");
+                    }
+                    result = &mut step => result?,
                 }
-                signal = &mut shutdown => { signal?; break; }
-                result = stream.step(&mut sink) => {
-                    match result? {
-                        Step::Idle if options.once => break,
-                        Step::Idle => {
-                            tokio::select! {
-                                signal = &mut shutdown => { signal?; break; }
-                                () = tokio::time::sleep(Duration::from_millis(options.poll_ms)) => {}
-                            }
+            };
+            match outcome {
+                Step::Idle if stopping => break,
+                Step::Idle if options.once => break,
+                Step::Idle => {
+                    tokio::select! {
+                        signal = &mut shutdown => { signal?; break; }
+                        result = &mut metrics_task => {
+                            result.context("tenant metrics task panicked")??;
+                            bail!("tenant metrics server exited unexpectedly");
                         }
-                        Step::Committed { batch, files, replay } => {
-                            println!("batch={batch} source_files={files} sink_replay={replay}");
-                        }
+                        () = tokio::time::sleep(Duration::from_millis(options.poll_ms)) => {}
+                    }
+                }
+                Step::Committed { batch, files, replay } => {
+                    println!("batch={batch} source_files={files} sink_replay={replay}");
+                    if stopping {
+                        break;
                     }
                 }
             }
@@ -212,6 +223,21 @@ async fn drive(
     .await;
     metrics_task.abort();
     run_result
+}
+
+async fn drain_step_on_shutdown(
+    step: impl std::future::Future<Output = Result<Step>>,
+    shutdown: impl std::future::Future<Output = Result<()>>,
+) -> Result<(Step, bool)> {
+    tokio::pin!(step);
+    tokio::select! {
+        result = &mut step => Ok((result?, false)),
+        signal = shutdown => {
+            let result = step.await?;
+            signal?;
+            Ok((result, true))
+        }
+    }
 }
 
 async fn shutdown_signal() -> Result<()> {
@@ -226,4 +252,53 @@ async fn shutdown_signal() -> Result<()> {
     #[cfg(not(unix))]
     tokio::signal::ctrl_c().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shutdown_drains_inflight_microbatch_and_preserves_its_failure() -> Result<()> {
+        for fail in [false, true] {
+            let (started, started_rx) = tokio::sync::oneshot::channel();
+            let (finish, finish_rx) = tokio::sync::oneshot::channel();
+            let (stop, stop_rx) = tokio::sync::oneshot::channel();
+            let (observed, observed_rx) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(drain_step_on_shutdown(
+                async move {
+                    started
+                        .send(())
+                        .map_err(|()| anyhow::anyhow!("start receiver closed"))?;
+                    finish_rx.await.context("finish signal")?;
+                    ensure!(!fail, "injected ambiguous sink failure");
+                    Ok(Step::Idle)
+                },
+                async move {
+                    stop_rx.await.context("stop signal")?;
+                    observed
+                        .send(())
+                        .map_err(|()| anyhow::anyhow!("shutdown observer closed"))?;
+                    Ok(())
+                },
+            ));
+            started_rx.await?;
+            stop.send(())
+                .map_err(|()| anyhow::anyhow!("shutdown receiver closed"))?;
+            observed_rx.await?;
+            tokio::task::yield_now().await;
+            assert!(!task.is_finished(), "shutdown discarded an outstanding mutation");
+            finish
+                .send(())
+                .map_err(|()| anyhow::anyhow!("microbatch was cancelled"))?;
+            let result = task.await?;
+            if fail {
+                let error = result.err().context("failure must not become a clean drain")?;
+                assert!(format!("{error:#}").contains("injected ambiguous sink failure"));
+            } else {
+                assert_eq!(result?, (Step::Idle, true));
+            }
+        }
+        Ok(())
+    }
 }
