@@ -84,7 +84,11 @@ impl AzureResetFence {
     }
 
     pub(crate) async fn check(&self) -> Result<()> {
-        if self.read_generation(false).await? != self.generation {
+        self.check_mode(false).await
+    }
+
+    pub(crate) async fn check_mode(&self, bootstrap: bool) -> Result<()> {
+        if self.read_generation(bootstrap).await? != self.generation {
             bail!("Azure reset generation changed; reopen under the new authority");
         }
         Ok(())
