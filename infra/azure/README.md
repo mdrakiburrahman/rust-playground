@@ -112,9 +112,14 @@ reset additionally requires every integrated publisher to have a verified
 whole-publication bound covering credential acquisition (including the Azure CLI
 child process), retries, and outstanding storage writes. HTTP request timeouts
 alone do not bound authentication: a publisher stalled in an unbounded CLI
-refresh can otherwise resume after deletion. Until the bounded/cancellable
-credential provider and stalled-auth regression are integrated and verified, do
-not execute reset against active or potentially suspended remote publishers.
+refresh can otherwise resume after deletion. The core's bounded/cancellable
+credential provider and stalled-auth regression close that specific auth-stall
+case, but do not prove a hard whole-operation or server-completion deadline:
+scheduling, serialization, and already-sent server effects remain relevant.
+Do not execute reset against active or potentially suspended remote publishers.
+Stop and establish quiescence for every publisher sharing the sandbox; the
+local runner's stop receipt is evidence only for that workspace, not other
+devboxes. The 60-second delay cannot replace that distributed lifecycle evidence.
 Offline reset tests establish orchestration ordering, not that cross-process
 publication deadline or live Azure safety.
 
