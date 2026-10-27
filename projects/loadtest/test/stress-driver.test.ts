@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
-import { parseStressPlan, runStressDriver, type StressPlan } from '../src/stress-driver.js';
+import { parseStressPlan, runStressDriver, stressInputBudget, type StressPlan } from '../src/stress-driver.js';
 import { parseBenchmarkOptions } from '../src/cli.js';
 import { evaluateStress } from '../src/stress-criteria.js';
 
@@ -25,6 +27,50 @@ test('requires a complete predeclared plan and separate correctness/crash gates'
   assert.throws(() => parseBenchmarkOptions(['--stress-plan', 'fixture.json']), /requires --validate/u);
   assert.throws(() => parseBenchmarkOptions(['--stress-plan', 'fixture.json', '--validate', '--quiver', '--crash-after', '1s']));
   assert.equal(parseBenchmarkOptions(['--validate', '--stress-plan', 'fixture.json']).stressPlan, 'fixture.json');
+});
+
+test('a new immutable plan binds full generator/startup budgets without changing window or limits', () => {
+  const next = parseStressPlan({ ...plan, startupTimeoutSeconds: 300,
+    generator: { warmupSeconds: 120, measureSeconds: 480, captureSettleSeconds: 10 } });
+  const budget = stressInputBudget(next, { warmupSeconds: 120, captureSettleSeconds: 10 });
+  assert.equal(budget.totalGeneratorSeconds, 600);
+  assert.equal(budget.totalDeclaredPhaseSeconds, 610);
+  assert.equal(budget.helperProcessTimeoutSeconds, 1200);
+  assert.equal(budget.persistedPlanSha256,
+    createHash('sha256').update(`${JSON.stringify(next, null, 2)}\n`).digest('hex'));
+  assert.notEqual(budget.persistedPlanSha256,
+    stressInputBudget(plan, { warmupSeconds: 0, captureSettleSeconds: 0 }).persistedPlanSha256);
+  assert.equal(budget.startupTimeoutSeconds, 300);
+  assert.equal(budget.measureSeconds, 480);
+  assert.deepEqual(next.limits, plan.limits);
+  assert.equal(next.durationSeconds, plan.durationSeconds);
+  assert.equal(next.waveIntervalSeconds, plan.waveIntervalSeconds);
+  for (const patch of [{ warmupSeconds: 5 }, { captureSettleSeconds: 0 }, { measureSeconds: 481 }]) {
+    assert.throws(() => stressInputBudget(next, { warmupSeconds: 120, captureSettleSeconds: 10, ...patch }),
+      /immutable stress-plan declaration/u);
+  }
+  for (const generator of [
+    { warmupSeconds: 120 }, { ...next.generator, unknown: 1 }, { ...next.generator, measureSeconds: 1 },
+    { ...next.generator, warmupSeconds: 300 }, { ...next.generator, captureSettleSeconds: -1 },
+  ]) assert.throws(() => parseStressPlan({ ...next, generator }));
+  assert.equal(stressInputBudget(plan, { warmupSeconds: 0, captureSettleSeconds: 0 }).measureSeconds, 16);
+});
+
+test('real runner rejects a changed declared generator before any Docker/reset command', t => {
+  const directory = fixture(t);
+  const declared = { ...plan, startupTimeoutSeconds: 300,
+    generator: { warmupSeconds: 120, measureSeconds: 480, captureSettleSeconds: 30 } };
+  const file = path.join(directory, 'new-plan.json');
+  writeFileSync(file, JSON.stringify(declared));
+  const marker = path.join(directory, 'docker-called');
+  writeFileSync(path.join(directory, 'docker'), `#!/bin/sh\nprintf called > '${marker}'\nexit 99\n`, { mode: 0o755 });
+  const result = spawnSync(process.execPath, ['--import', 'tsx', 'projects/loadtest/src/main.ts',
+    '--validate', '--warmup', '5s', '--batch-rows', String(plan.fixture.batchRows), '--stress-plan', file],
+  { env: { ...process.env, PATH: `${directory}:${process.env.PATH}` }, encoding: 'utf8', timeout: 15_000 });
+  assert.ifError(result.error);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /immutable stress-plan declaration/u);
+  assert(!existsSync(marker), 'mismatch must fail before any reset or Docker work');
 });
 
 function fixture(t: { after: (callback: () => void) => void }): string {

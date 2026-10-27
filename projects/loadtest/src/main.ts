@@ -19,7 +19,7 @@ import { writeProvenance } from './provenance.js';
 import { runQuiverCrash, QUIVER_RECOVERY_FILE } from './quiver-crash.js';
 import { runOwnedProcess } from './owned-process.js';
 import { startQapObserver } from './qap-observer.js';
-import { readStressPlan, runStressDriver } from './stress-driver.js';
+import { readStressPlan, runStressDriver, stressInputBudget } from './stress-driver.js';
 import { LocalStressRuntime } from './stress-runtime.js';
 import {
   benchmarkComposeFiles, benchmarkQuiver, buildBenchmarkComposeOverride, buildBenchmarkRuntimeConfigs, dataflowConfigFile,
@@ -520,6 +520,8 @@ async function benchmark(
   ]) {
     mkdirSync(path.join(directory, child), { recursive: true });
   }
+  if (stressPlan) writeFileSync(path.join(directory, 'results/stress-input-budget.json'),
+    `${JSON.stringify(stressInputBudget(stressPlan, options), null, 2)}\n`, { flag: 'wx' });
   let network: BenchmarkNetwork;
   let env: NodeJS.ProcessEnv;
   try {
@@ -798,14 +800,7 @@ async function main(): Promise<void> {
     const plan = readStressPlan(options.stressPlan);
     options.stressConfiguration = plan;
     if (options.batchRows !== plan.fixture.batchRows) throw new Error('--batch-rows must equal the predeclared stress fixture batchRows');
-    const minimumMeasure = plan.durationSeconds + plan.sampleTimeoutSeconds * 2 + 5;
-    if (options.warmupSeconds + options.captureSettleSeconds >= plan.startupTimeoutSeconds) {
-      throw new Error('Stress startup budget must include capture settling and warmup');
-    }
-    if (options.measureSeconds !== undefined && options.measureSeconds < minimumMeasure) {
-      throw new Error('--measure is shorter than the predeclared stress window and sample budgets');
-    }
-    options.measureSeconds ??= minimumMeasure;
+    options.measureSeconds = stressInputBudget(plan, options).measureSeconds;
   }
   const privateEnv = modeEnvironment(workspace, options.mode, process.env);
   const controller = await acquireBenchmarkController(workspace);
