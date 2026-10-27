@@ -124,9 +124,10 @@ fn prune(root: &Path) -> Result<u64> {
         maintenance.log_floor()?.context("durable floor")?.checkpoint_version,
         version
     );
-    for old in 0..=version {
+    for old in 0..version {
         assert!(!root.join(format!("_delta_log/{old:020}.json")).exists());
     }
+    assert!(root.join(format!("_delta_log/{version:020}.json")).is_file());
     assert!(
         root.join(format!("_delta_log/{version:020}.checkpoint.parquet"))
             .is_file()
@@ -231,18 +232,23 @@ async fn tenant_snapshot_tail_and_sink_replay_survive_proven_kernel_log_pruning(
     assert_eq!(target.lookup_txn(&query_id)?, Some(1));
     let target_version = target.version()?;
 
+    append(&source, "minute-2", 20, 2).await?;
     let floor = prune(source_root.path())?;
     assert_eq!(floor, source.version()?);
+    assert!(
+        floor > 2,
+        "stale unread version 2 must be strictly below the retained floor"
+    );
     let pending_text = std::str::from_utf8(&pending)?;
     let pending_cursor: serde_json::Value =
         serde_json::from_str(pending_text.lines().nth(2).context("Spark single-source offset line")?)?;
     assert_eq!(
         pending_cursor["cursor"],
         serde_json::json!({
-            "phase": "tail", "version": floor + 1, "index": 0,
+            "phase": "tail", "version": floor, "index": 0,
         })
     );
-    assert_eq!(source.lookup_txn("prune-source-publication")?, Some(1));
+    assert_eq!(source.lookup_txn("prune-source-publication")?, Some(2));
     assert_eq!(prune(target_root.path())?, target_version);
     assert_eq!(target.lookup_txn(&query_id)?, Some(1));
     let mut current = stream(source_root.path(), target_root.path(), checkpoint_root.path()).await?;
@@ -281,8 +287,6 @@ async fn tenant_snapshot_tail_and_sink_replay_survive_proven_kernel_log_pruning(
     stale.close().await?;
 
     let mut current = stream(source_root.path(), target_root.path(), checkpoint_root.path()).await?;
-    assert_eq!(current.step(&mut writer).await?, Step::Idle);
-    append(&source, "minute-2", 20, 2).await?;
     assert_eq!(
         current.step(&mut writer).await?,
         Step::Committed {
@@ -295,11 +299,24 @@ async fn tenant_snapshot_tail_and_sink_replay_survive_proven_kernel_log_pruning(
     current.close().await?;
     let mut restarted = stream(source_root.path(), target_root.path(), checkpoint_root.path()).await?;
     assert_eq!(restarted.step(&mut writer).await?, Step::Idle);
+    append(&source, "minute-3", 30, 3).await?;
+    assert_eq!(
+        restarted.step(&mut writer).await?,
+        Step::Committed {
+            batch: 3,
+            files: 1,
+            replay: false
+        }
+    );
+    assert_eq!(restarted.step(&mut writer).await?, Step::Idle);
+    restarted.close().await?;
+    let mut restarted = stream(source_root.path(), target_root.path(), checkpoint_root.path()).await?;
+    assert_eq!(restarted.step(&mut writer).await?, Step::Idle);
     restarted.close().await?;
     assert_eq!(std::fs::read(checkpoint_root.path().join("metadata"))?, metadata);
-    assert_eq!(target.lookup_txn(&query_id)?, Some(2));
-    assert_eq!(target.version()?, target_version + 1);
-    assert!(!checkpoint_root.path().join("offsets/3").exists());
+    assert_eq!(target.lookup_txn(&query_id)?, Some(3));
+    assert_eq!(target.version()?, target_version + 2);
+    assert!(!checkpoint_root.path().join("offsets/4").exists());
     let expected = vec![
         ("a".into(), 0, "minute-0".into()),
         ("a".into(), 2, "minute-0".into()),
@@ -307,6 +324,8 @@ async fn tenant_snapshot_tail_and_sink_replay_survive_proven_kernel_log_pruning(
         ("a".into(), 12, "minute-1".into()),
         ("a".into(), 20, "minute-2".into()),
         ("a".into(), 22, "minute-2".into()),
+        ("a".into(), 30, "minute-3".into()),
+        ("a".into(), 32, "minute-3".into()),
     ];
     assert_eq!(rows(target_root.path()).await?, expected);
     Ok(())
