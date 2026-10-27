@@ -3,6 +3,7 @@
 
 import argparse
 import base64
+from email.utils import formatdate
 import hashlib
 import json
 import os
@@ -177,6 +178,8 @@ class Azure:
         encoded = body.encode() if isinstance(body, str) else body
         request = urllib.request.Request(url, encoded, method=method, headers={
             "Authorization": "Bearer " + self.token(resource),
+            **({"x-ms-date": formatdate(usegmt=True)}
+               if resource == "https://storage.azure.com/" else {}),
             **(headers or {}),
         })
         try:
