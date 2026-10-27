@@ -20,6 +20,10 @@ import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
 
+if __name__ == "__main__":
+    # publisher_control imports from "bootstrap"; share this module's classes.
+    sys.modules.setdefault("bootstrap", sys.modules[__name__])
+
 ROOT = Path(__file__).resolve().parents[2]
 API = "2024-04-13"
 # Short exclusive lease serializing authority metadata read-modify-write only.
@@ -320,15 +324,9 @@ class Azure:
         return metadata, headers["etag"]
 
     def control(self):
-        metadata, etag = self.head_control()
-        if metadata.get("sandboxid") != self.c.sandbox:
-            raise Failure("Reset authority container ownership mismatch.")
-        if metadata.get("resetstate") not in ("ready", "fenced"):
-            raise Failure("Reset authority is missing or invalid; fail closed.")
-        try:
-            uuid.UUID(metadata["resetgeneration"])
-        except (KeyError, ValueError) as exc:
-            raise Failure("Reset authority generation is missing or invalid.") from exc
+        """Validated v1 authority only; legacy/unversioned metadata is refused."""
+        from publisher_control import PublisherControl
+        metadata, _, etag = PublisherControl(self).read()
         return metadata, etag
 
     def lease(self, action, lease_id, proposed=False):
@@ -439,26 +437,28 @@ def guard_existing(azure):
             owned(resource, c)
 
 
-def deploy(azure):
+def fresh_authority():
+    """Initial v1 metadata for a NEW checkpoint container only; never rewritten by ARM."""
+    return {"resetstate": "fenced-v1", "resetgeneration": str(uuid.uuid4()),
+            "occupancy": "released", "publisherregistryversion": "1", "publishers": "{}"}
+
+
+def checkpoint_container(azure):
+    c = azure.c
+    return azure.arm("GET", c.storage_id + "/blobServices/default/containers/" +
+                     c.checkpoints, missing_ok=True, api="2023-05-01")
+
+
+def deploy(azure, fresh=None):
+    """Declarative ARM deployment. Never writes metadata of an existing checkpoint container.
+
+    fresh is passed only when the container is absent; Bicep then creates it with
+    fenced-v1 + empty registry + released + a fresh generation. Otherwise the
+    container is not declared, so redeploy preserves all live authority state.
+    Existing-sandbox callers hold a registered publisher member around this call.
+    """
     c = azure.c
     guard_existing(azure)
-    container = azure.arm("GET", c.storage_id + "/blobServices/default/containers/" +
-                          c.checkpoints, missing_ok=True, api="2023-05-01")
-    control = (container["properties"]["metadata"] if container else
-               {"resetstate": "fenced", "resetgeneration": str(uuid.uuid4())})
-    if container and (control.get("sandboxid") != c.sandbox or
-                      control.get("resetstate") not in ("ready", "fenced")):
-        raise Failure("Existing checkpoint container has no valid reset authority.")
-    if control.get("occupancy") == "testing":
-        raise Failure("Cloud tests own the sandbox; provisioning requires their explicit release.")
-    if container:
-        # Fence with a data-plane compare/exchange before ARM work. Otherwise a
-        # test can acquire occupancy between the preliminary read and deployment.
-        metadata, etag = azure.control()
-        require_released(metadata)
-        metadata.update(resetstate="fenced", resetgeneration=str(uuid.uuid4()))
-        azure.set_control(metadata, etag)
-        control = metadata
     params = {
         "location": c.location, "resourceGroupName": c.group,
         "sandboxId": c.sandbox, "storageAccountName": c.account,
@@ -466,8 +466,8 @@ def deploy(azure):
         "databaseName": c.database, "dataContainer": c.data,
         "checkpointContainer": c.checkpoints, "operatorObjectId": c.operator,
         "operatorKustoPrincipalId": c.operator_application if c.operator_type == "App" else c.operator,
-        "controlMetadata": control,
-        "checkpointExists": container is not None,
+        "controlMetadata": fresh or {},
+        "checkpointExists": fresh is None,
         "operatorType": c.operator_type, "clusterSku": c.sku,
         "minimumInstances": c.minimum, "maximumInstances": c.maximum,
     }
@@ -484,13 +484,118 @@ def deploy(azure):
         os.unlink(name)
     cluster = azure.arm("GET", c.cluster_id)
     c.uri = cluster["properties"]["uri"].rstrip("/")
+    retry_ready(lambda: azure.blobs(c.data), "Storage RBAC")
+    print("Declarative resources and storage access: ready")
+
+
+def ensure_running(azure):
+    """Start a Stopped cluster and wait for Kusto. Callers MUST hold a registered member.
+
+    The member keeps stop (which requires an empty registry) from claiming its hold.
+    Any start failure is an unknown outcome: the caller marks its member uncertain.
+    """
+    c = azure.c
+    cluster = azure.arm("GET", c.cluster_id)
+    owned(cluster, c)
+    c.uri = cluster["properties"]["uri"].rstrip("/")
     if cluster["properties"].get("state") == "Stopped":
         azure.cli("rest", "--method", "post", "--url",
                   "https://management.azure.com" + c.cluster_id + "/start?api-version=" + API)
     retry_ready(lambda: azure.kql(".show cluster"), "Kusto")
-    retry_ready(lambda: azure.blobs(c.data), "Storage RBAC")
-    print("Declarative resources, Kusto and storage access: ready")
+    print("Kusto cluster: running")
 
+
+def held(control, publisher, generation, work):
+    """Run hosted-state work under a registered member.
+
+    NotReady is raised only before any KQL after definite steps, so the member is
+    clean-released. Any other exception or interruption is an unknown outcome:
+    the member is marked uncertain (best effort) and is never auto-cleared.
+    """
+    try:
+        return work()
+    except NotReady:
+        control.clean_release(publisher, generation, definitively_drained=True)
+        raise
+    except BaseException:
+        try:
+            control.uncertain(publisher, generation)
+        except Exception:
+            pass  # Still active: blocks fence, cleanup and stop.
+        raise
+
+
+def provision(azure, tables, wait_seconds, output, infra_only, values):
+    from publisher_control import FENCED, READY, PublisherControl
+    c = azure.c
+    control = PublisherControl(azure)
+    guard_existing(azure)
+    if checkpoint_container(azure) is None:
+        fresh = fresh_authority()
+        deploy(azure, fresh)
+        metadata, registry, _ = control.read()
+        if (metadata["resetgeneration"] != fresh["resetgeneration"] or
+                metadata["resetstate"] != FENCED or registry or
+                metadata["occupancy"] != "released"):
+            raise Failure("New checkpoint authority does not match its initialized generation; "
+                          "concurrent first provisioning is unsupported.")
+        generation = fresh["resetgeneration"]
+    else:
+        metadata, registry, _ = control.read()
+        require_released(metadata)
+        generation = metadata["resetgeneration"]
+        member = str(uuid.uuid4())
+        if metadata["resetstate"] == READY:
+            control.admit(member, generation)
+            def ready_work():
+                deploy(azure)
+                ensure_running(azure)
+                if not infra_only:
+                    reconcile(azure, tables, wait_seconds)
+            held(control, member, generation, ready_work)
+            control.clean_release(member, generation, definitively_drained=True)
+            write_private(output, {**c.generated(), "ARROWCOL_RESET_GENERATION": generation})
+            print("Ready sandbox reconciled under a registered member; authority preserved.")
+            return
+        if metadata["resetstate"] != FENCED or registry:
+            raise Failure("Authority is cleanup-owned or has registered publishers; provisioning refused.")
+        control.admit(member, generation, bootstrap=True)
+        held(control, member, generation, lambda: deploy(azure))
+        control.clean_release(member, generation, definitively_drained=True)
+    write_private(output, c.generated())
+    if infra_only:
+        print("INFRA-ONLY: Delta initialization and external-table/QAP reconciliation NOT verified.")
+        return
+    initializer = ROOT / "infra/azure/initialize-delta.sh"
+    if not initializer.is_file():
+        raise Failure("Delta initializer is unavailable; infra exists, full bootstrap is NOT complete.")
+    # The child admits its own UUID only if its fresh session generation equals this
+    # captured value, drains and unregisters it. Nothing is adopted across processes.
+    result = run_tree(["bash", str(initializer)], 1800, cwd=ROOT, env={
+        **os.environ, **values, **c.generated(),
+        "ARROWCOL_AZURE_TABLE_MANIFEST": str(tables.resolve()),
+        "ARROWCOL_EXPECTED_RESET_GENERATION": generation,
+    })
+    if result.returncode:
+        raise Failure("Delta initialization failed; KQL reconciliation was not attempted. " +
+                      c.redact(result.stderr))
+    # Fresh parent member BEFORE any Kusto/ARM I/O; fails closed if cleanup or a
+    # stop hold won after the child drained.
+    parent = str(uuid.uuid4())
+    control.admit(parent, generation, bootstrap=True)
+    def bootstrap_work():
+        control.bootstrap_owner(parent, generation)
+        ensure_running(azure)
+        control.bootstrap_owner(parent, generation)
+        reconcile(azure, tables, wait_seconds)
+        control.bootstrap_owner(parent, generation)
+    held(control, parent, generation, bootstrap_work)
+    control.complete_bootstrap(parent, generation, definitively_drained=True)
+    metadata, _, _ = control.read()
+    if metadata["resetstate"] != READY or metadata["resetgeneration"] != generation:
+        raise Failure("Authority changed after bootstrap completion; not exporting readiness.")
+    write_private(output, {**c.generated(), "ARROWCOL_RESET_GENERATION": generation})
+    print("Full bootstrap ready-v1 at the captured generation.")
 
 def reconcile(azure, manifest, wait_seconds=0):
     c = azure.c
@@ -610,20 +715,22 @@ def reset_preview(azure):
 
 
 def _unqualified_reset_sequence(azure, stop_command):
-    """Non-dispatched sequence; not executable until distributed drain is qualified."""
+    """Gated v1 operator sequence. NOT dispatched: public reset --execute stays blocked."""
+    from publisher_control import READY, PublisherControl
     c = azure.c
+    control = PublisherControl(azure)
     databases, inventory = reset_inventory(azure)
     count = sum(len(items) for items in inventory.values())
     print(f"Reset preview: owned databases={len(databases)}, containers=2, stored objects={count}")
     print("Preserve cluster, account, containers and managed identity.")
     if not stop_command:
         raise Failure("Execution requires the runner's --stop-command to stop local writers/consumers.")
-    metadata, etag = azure.control()
+    metadata, _, _ = control.read()
     require_released(metadata)
-    metadata.update(resetstate="fenced", resetgeneration=str(uuid.uuid4()))
-    azure.set_control(metadata, etag)
+    generation = metadata["resetgeneration"]
+    if metadata["resetstate"] == READY:
+        control.fence(generation)
     result = run_tree(stop_command, 180, cwd=ROOT)
-
     if result.returncode:
         raise Failure("Writer/consumer stop failed; reset fence retained, no workload data deleted. " +
                       c.redact(str(result.stderr)))
@@ -639,13 +746,21 @@ def _unqualified_reset_sequence(azure, stop_command):
         raise Failure("Runner did not verify workspace-owned services stopped; reset fence retained.")
     print("Distributed reset fence active; waiting 60s for bounded in-flight publications.")
     time.sleep(60)
+    # Persistent exclusive cleanup authority: fenced-v1 + same generation + empty
+    # registry + released, claimed in one leased CAS before any inventory or delete.
+    operator = str(uuid.uuid4())
+    try:
+        control.claim_cleanup(operator, generation)
+    except Failure as exc:
+        raise Failure("Reset authority changed during quiescence or publishers remain; "
+                      "refusing data deletion.") from exc
     databases, inventory = reset_inventory(azure)
-    if azure.control()[0] != metadata:
-        raise Failure("Reset authority changed during quiescence; refusing data deletion.")
     if databases:
+        control.cleanup_operator(operator, generation)
         azure.cli("rest", "--method", "delete", "--url", "https://management.azure.com" +
                   c.cluster_id + "/databases/" + c.database + "?api-version=" + API)
     for container, blobs in inventory.items():
+        control.cleanup_operator(operator, generation)
         for blob in sorted(blobs, key=lambda item: item["name"].count("/"), reverse=True):
             if blob.get("directory"):
                 azure.delete_directory(container, blob["name"])
@@ -661,12 +776,11 @@ def _unqualified_reset_sequence(azure, stop_command):
     remaining = [b for name in (c.data, c.checkpoints) for b in azure.blobs(name)]
     remaining.extend(path for name in (c.data, c.checkpoints) for path in azure.paths(name))
     if remaining:
-        raise Failure("Reset left workload state behind; fence retained.")
+        raise Failure("Reset left workload state behind; cleanup authority retained.")
     retry_ready(lambda: no_databases(azure), "Database deletion")
-    if azure.control()[0] != metadata:
-        raise Failure("Reset authority changed during deletion; reset is not verified.")
-    print("Reset verified: zero databases and zero blobs, versions or snapshots; container metadata remains fenced.")
-
+    control.finish_cleanup(operator, generation, str(uuid.uuid4()), definitively_cleaned=True)
+    print("Reset verified: zero databases and zero blobs, versions or snapshots; "
+          "authority is fenced-v1 at a fresh generation.")
 
 def no_databases(azure):
     if azure.collection(azure.c.cluster_id + "/databases"):
@@ -674,9 +788,9 @@ def no_databases(azure):
 
 
 def require_released(metadata):
-    if metadata.get("occupancy", "released") != "released":
-        raise Failure("Cloud tests own the sandbox; wait for explicit occupancy release.")
-
+    # v1 occupancy is mandatory; absence is never treated as released.
+    if metadata.get("occupancy") != "released":
+        raise Failure("Cloud tests or a stop hold own the sandbox; wait for explicit release.")
 
 def publisher_registry(metadata):
     """Validate shared wire format without inferring completion from missing data."""
@@ -719,22 +833,39 @@ def require_drained_publishers(metadata):
 
 
 def require_released_or_owner(metadata, owner):
-    if metadata.get("occupancy", "released") == "released":
+    if metadata.get("occupancy") == "released":
         return
-    if not owner or metadata.get("occupancyid") != owner:
+    if (metadata.get("occupancy") != "testing" or not owner or
+            metadata.get("occupancyid") != owner):
         raise Failure("Only the active cloud test owner may reconcile isolated table bindings.")
 
 
-def occupancy(azure, action, owner, output=None):
+def reconcile_command(azure, tables, owner):
+    """Public reconcile: registered normal member around cluster start and all KQL."""
+    from publisher_control import PublisherControl
+    control = PublisherControl(azure)
+    metadata, _, _ = control.read()
+    require_released_or_owner(metadata, owner)
+    generation, member = metadata["resetgeneration"], str(uuid.uuid4())
+    control.admit(member, generation)
+    def work():
+        ensure_running(azure)
+        reconcile(azure, tables)
+    held(control, member, generation, work)
+    control.clean_release(member, generation, definitively_drained=True)
+
+
+def occupancy(azure, action, owner, output=None, generation=None):
+    from publisher_control import READY, PublisherControl
     try:
         owner = str(uuid.UUID(owner))
     except ValueError as exc:
         raise Failure("Occupancy requires the runner's UUID --occupancy-id.") from exc
-    metadata, etag = azure.control()
-    current = metadata.get("occupancy", "released")
+    metadata, registry, etag = PublisherControl(azure).read()
+    current = metadata["occupancy"]
     if action == "occupy":
-        if metadata["resetstate"] != "ready":
-            raise Failure("Cannot start cloud tests while reset authority is fenced.")
+        if metadata["resetstate"] != READY:
+            raise Failure("Cannot start cloud tests unless authority is ready-v1.")
         if current == "stopping":
             raise Failure("A cluster stop holds the sandbox; tests cannot start.")
         if current != "released" and (current != "testing" or metadata.get("occupancyid") != owner):
@@ -743,20 +874,25 @@ def occupancy(azure, action, owner, output=None):
     else:
         if current != "testing" or metadata.get("occupancyid") != owner:
             raise Failure("Only the exact occupancy owner can release cloud tests.")
+        if not generation or metadata["resetgeneration"] != generation:
+            raise Failure("Release requires the captured ARROWCOL_RESET_GENERATION of this test.")
+        if registry:
+            # Runner drain receipts are not registry close; never force-clear members.
+            raise Failure("Registered active or uncertain publishers remain; occupancy retained.")
         metadata.update(occupancy="released")
+    # The leased CAS compares the full read (state, generation, registry, owner).
     azure.set_control(metadata, etag)
     if action == "occupy" and output is not None:
         # Re-read after CAS: never infer generation from the occupancy/run UUID.
         current, _ = azure.control()
         if (current.get("occupancyid") != owner or current.get("occupancy") != "testing" or
-                current.get("resetstate") != "ready" or
+                current.get("resetstate") != READY or
                 current.get("resetgeneration") != metadata["resetgeneration"]):
             raise Failure("Authority changed after occupancy; do not admit collectors.")
         values = azure.c.generated()
         values["ARROWCOL_RESET_GENERATION"] = current["resetgeneration"]
         write_private(output, values)
     print("Cloud test occupancy: " + ("TESTING" if action == "occupy" else "RELEASED"))
-
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
@@ -767,6 +903,7 @@ def main(argv=None):
     parser.add_argument("--infra-only", action="store_true")
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--occupancy-id", default="")
+    parser.add_argument("--reset-generation", default="")
     parser.add_argument("--wait-seconds", type=int, default=0)
     parser.add_argument("--stop-command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
@@ -785,40 +922,9 @@ def main(argv=None):
             preflight(azure)
         elif args.command == "provision":
             preflight(azure)
-            deploy(azure)
-            write_private(args.output, c.generated())
-            if not args.infra_only:
-                metadata, etag = azure.control()
-                require_released(metadata)
-                metadata.update(resetstate="fenced", resetgeneration=str(uuid.uuid4()))
-                azure.set_control(metadata, etag)
-                metadata, etag = azure.control()
-                # The foundation initializer owns schema/protocol correctness.
-                initializer = ROOT / "infra/azure/initialize-delta.sh"
-                if not initializer.is_file():
-                    raise Failure("Delta initializer is unavailable; infra exists, full bootstrap is NOT complete.")
-                # The child compares its fresh session generation with this captured
-                # value before any table I/O; it never infers or adopts a generation.
-                result = run_tree(["bash", str(initializer)], 1800, cwd=ROOT, env={
-                    **os.environ, **values, **c.generated(),
-                    "ARROWCOL_AZURE_TABLE_MANIFEST": str(args.tables.resolve()),
-                    "ARROWCOL_EXPECTED_RESET_GENERATION": metadata["resetgeneration"],
-                })
-                if result.returncode:
-                    raise Failure("Delta initialization failed; KQL reconciliation was not attempted. " +
-                                  c.redact(result.stderr))
-                reconcile(azure, args.tables, args.wait_seconds)
-                metadata["resetstate"] = "ready"
-                azure.set_control(metadata, etag)
-                write_private(args.output, {
-                    **c.generated(), "ARROWCOL_RESET_GENERATION": metadata["resetgeneration"],
-                })
-                print("Full bootstrap ready; reset fence cleared.")
-            else:
-                print("INFRA-ONLY: Delta initialization and external-table/QAP reconciliation NOT verified.")
+            provision(azure, args.tables, args.wait_seconds, args.output, args.infra_only, values)
         elif args.command == "reconcile":
-            require_released_or_owner(azure.control()[0], args.occupancy_id)
-            reconcile(azure, args.tables)
+            reconcile_command(azure, args.tables, args.occupancy_id)
         elif args.command == "reset":
             reset(azure, args.execute, args.stop_command or [
                 "npx", "--no-install", "tsx", "projects/loadtest/src/main.ts", "--stop",
@@ -836,7 +942,8 @@ def main(argv=None):
                 print("Stop preview: preserve cluster; --execute requests stop after test occupancy release.")
         elif args.command in ("occupy", "release"):
             occupancy(azure, args.command, args.occupancy_id,
-                      args.output if args.command == "occupy" else None)
+                      args.output if args.command == "occupy" else None,
+                      args.reset_generation or values.get("ARROWCOL_RESET_GENERATION"))
         return 0
     except NotReady:
         print(json.dumps({"status": "not_ready", "code": "DELTA_LOGS_ABSENT",
@@ -849,24 +956,29 @@ def main(argv=None):
 
 
 def stop_cluster(azure):
-    """Serialize stop with occupy through a persistent occupancy=stopping hold.
+    """Serialize stop with occupy, bootstrap and start through a persistent stopping hold.
 
-    The hold is taken by CAS from released before any ARM call, so a competing
-    occupy either wins first (stop fails before ARM) or is rejected afterwards.
-    It is released only after this process's own definite ARM submission and an
-    observed Stopped state. An existing hold is never replayed or released: a
-    prior submission may still complete late, and a new stop plus a Stopped
-    snapshot does not prove that request drained. Any unknown CAS, submission or
-    wait outcome leaves a blocking hold for explicit operator reconciliation. A
-    definite CAS conflict writes nothing and stays retryable.
+    The hold is claimed from released + EMPTY registry + ready-v1/fenced-v1 in one
+    leased CAS before any ARM call. A registered normal or bootstrap member (held
+    around every public start/KQL) therefore blocks stop, and every admission
+    rejects occupancy=stopping. The hold is released only after this process's
+    own definite ARM submission and an observed Stopped state. An existing hold
+    is never replayed or released: a prior submission may still complete late.
+    Any unknown CAS, submission or wait outcome leaves a blocking hold for
+    explicit operator reconciliation. A definite CAS conflict stays retryable.
     """
-    metadata, etag = azure.control()
-    current = metadata.get("occupancy", "released")
+    from publisher_control import FENCED, READY, PublisherControl
+    metadata, registry, etag = PublisherControl(azure).read()
+    current = metadata["occupancy"]
     if current == "stopping":
         raise Failure("A prior stop hold may have an ambiguous ARM submission; not replaying "
                       "or releasing it. Reconcile the old request explicitly.")
     if current != "released":
         raise Failure("Cloud tests own the sandbox; wait for explicit occupancy release.")
+    if metadata["resetstate"] not in (READY, FENCED):
+        raise Failure("Cleanup owns the authority; stop refused.")
+    if registry:
+        raise Failure("Registered publishers or bootstrap owners protect the cluster; stop refused.")
     hold = str(uuid.uuid4())
     metadata.update(occupancy="stopping", occupancyid=hold)
     azure.set_control(metadata, etag)

@@ -97,8 +97,8 @@ cannot substitute for that distributed authority.
 
 Registry metadata alone cannot activate a new protocol safely: older
 reset-aware binaries ignore unknown registry fields while accepting
-`resetstate=ready`. Activation must version an authority state those binaries
-already enforce, so incompatible binaries fail closed rather than publish
+legacy `resetstate=ready`. Activation therefore uses versioned `ready-v1`, which
+those binaries already reject, so incompatible binaries fail closed rather than publish
 without registering. Arbitrary OAuth clients and binaries predating reset
 fencing are outside the cooperative protocol and must be stopped before cleanup.
 An uncertain server write remains an uncertain registration even if a later
@@ -182,27 +182,60 @@ checkpoint containers are never rewritten by Bicep, and arbitrary older tools
 remain outside the proof and must be stopped. The lease serializes only the
 short read-modify-write; it never expires or releases publisher membership.
 
-These are usable control-plane helpers and deterministic race/unknown-response
-tests, not activation of all Rust mutation surfaces. Existing checkpoint
-containers are excluded from Bicep metadata writes on redeployment. The public
-bootstrap still refuses unknown/versioned authority rather than downgrade it;
-fresh Bicep creation does not assert registry coverage. Activation and public
-bootstrap wiring must wait for compatible registered writers, maintenance,
-stream/sink/checkpoint paths, and exclusive bootstrap initialization.
+#### Public v1 entrypoint wiring
+
+`provision`, `reconcile`, `occupy`, `release` and `stop` use only v1 authority.
+Legacy or unversioned metadata (`resetstate=ready`/`fenced`, or no
+`publisherregistryversion`) is refused with no implicit migration.
+
+- **New checkpoint container:** Bicep creates it once with `fenced-v1`, an empty
+  registry, `occupancy=released` and a fresh random `resetgeneration`.
+- **Existing container:** redeployment writes no container metadata, so all
+  existing authority state is preserved.
+- **Full bootstrap order:**
+  1. The Rust initializer receives the captured generation as
+     `ARROWCOL_EXPECTED_RESET_GENERATION`. It admits its own UUID, drains it,
+     and unregisters it.
+  2. The parent then admits a fresh bootstrap UUID before any cluster start or
+     KQL. If cleanup or a stop hold won the gap, this admission fails before I/O.
+  3. Cluster start and KQL reconciliation run under that member.
+  4. `complete_bootstrap` atomically removes the member and publishes `ready-v1`.
+  5. Provision exports `ARROWCOL_RESET_GENERATION` only after it re-reads
+     `ready-v1` at the same generation.
+- **Ready redeploy and standalone `reconcile`:** these register a normal member
+  around deploy, cluster start and KQL.
+- **Failure handling:** `NotReady` (exit 3) cleanly releases the member. Any
+  other failure, or an unknown start or admin outcome, marks the member uncertain.
+  An uncertain member keeps blocking stop and cleanup until an operator reconciles it.
+
+Arbitrary lease-less or old tools and concurrent first provisioning remain
+outside the proof. The gated reset operator path exists but is not dispatched.
 
 The test runner acquires shared occupancy before live tests and releases it only
 after its owned writers/consumers stop successfully:
 
 ```bash
 python3 infra/azure/bootstrap.py occupy --occupancy-id "$RUN_UUID"
-python3 infra/azure/bootstrap.py release --occupancy-id "$RUN_UUID"
+python3 infra/azure/bootstrap.py release --occupancy-id "$RUN_UUID" \
+  --reset-generation "$ARROWCOL_RESET_GENERATION"
 ```
 
-Only the exact UUID owner can release a `testing` occupancy. Provision and
-reset reject any non-released occupancy. `stop --execute` first moves
-`released` to `stopping` with a fresh hold UUID in one lease-guarded
-compare-and-set, before any ARM call. A competing `occupy` either wins first,
-so stop fails without calling ARM, or is rejected while the hold exists. The
+`occupy` requires `ready-v1`. `release` requires the same three conditions in
+one leased transition, or occupancy is retained:
+
+- the exact UUID owner;
+- the generation captured at occupancy (`--reset-generation`, or
+  `ARROWCOL_RESET_GENERATION` from the environment);
+- an empty publisher registry. Any active or uncertain member fails release,
+  with no force clear.
+
+Provision and reset reject any non-released occupancy. `stop --execute` first
+moves `released` to `stopping` with a fresh hold UUID in one lease-guarded
+compare-and-set, before any ARM call. That same transition also requires an
+empty registry and `ready-v1`/`fenced-v1`, not `cleaning-v1`, so any registered
+bootstrap or normal member blocks stop. Every admission rejects `stopping`. A
+competing `occupy`, bootstrap or reconcile either wins first, so stop fails
+without calling ARM, or is rejected while the hold exists. The
 hold is released only after this process's own definite ARM submission and an
 observed `Stopped` state. An unknown compare-and-set, submission or wait
 outcome, including an Azure CLI timeout (which kills the whole CLI process
@@ -210,9 +243,10 @@ group), leaves a blocking hold. A later `stop --execute` never replays or
 releases an existing hold, because the old request may still land late; it
 needs explicit operator reconciliation. A definite compare-and-set conflict
 writes nothing and stays retryable. Lifecycle authority is metadata on the preserved checkpoint
-container, not a blob: `sandboxid`, `resetstate`, `resetgeneration`, `occupancy`,
-and `occupancyid`. Updates use the lease-guarded compare-and-set above. Writers fail closed unless
-ownership matches and `resetstate=ready`, checking before open, upload and each
+container, not a blob: `sandboxid`, `resetstate`, `resetgeneration`, `publisherregistryversion`,
+`publishers`, `occupancy` and `occupancyid`. Updates use the lease-guarded
+compare-and-set above. Writers fail closed unless ownership matches and
+`resetstate=ready-v1`, checking before open, upload and each
 commit attempt. A restarted writer must not bypass a fenced sandbox.
 
 Successful full provision and `occupy` export the exact ready container
@@ -271,7 +305,7 @@ python3 infra/azure/bootstrap.py stop --execute
 ```
 
 The executing command waits until ARM reports `Stopped`. Reprovisioning starts a
-stopped cluster and waits for real Kusto readiness.
+stopped cluster under a registered member and waits for real Kusto readiness.
 
 ## Verification and evidence
 
