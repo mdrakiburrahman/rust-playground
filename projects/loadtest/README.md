@@ -8,7 +8,14 @@ can return a bounded complete row multiset with multiplicities for Kusto
 validation; it rejects a changed snapshot or more than 256 distinct rows rather
 than silently sampling away differences.
 
-![Architecture](.imgs/loadtest-architecture.png)
+[![Architecture](../../loadtest-architecture.png)](../../loadtest-architecture.html)
+
+The independent delta-rs oracle reconstructs partition columns from committed
+`Add.partitionValues`, not directory names, and excludes uncommitted Parquet
+files. `delta-inspect evidence <root> --table catalog.schema.table` returns a
+captured snapshot plus its bounded row multiset. Local roots and explicit-table
+`abfss://` roots are supported; cloud reads use the existing Azure CLI identity
+and fail visibly without credentials. Deletion vectors are explicitly rejected.
 
 ```bash
 npx nx run loadtest:run -- --warmup 2m --concurrency 8 --batch-rows 1024
