@@ -424,13 +424,22 @@ dependencies = [
  "anyhow",
  "arrow 58.4.0",
  "async-trait",
+ "chrono",
  "delta_kernel",
  "delta_kernel_default_engine",
  "fs2",
  "futures",
+ "object_store",
+ "opentelemetry 0.31.0",
+ "opentelemetry_sdk 0.31.0",
  "parquet 58.4.0",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "tracing-subscriber",
  "url",
  "uuid",
 ]
@@ -677,6 +686,31 @@ dependencies = [
  "num-traits",
  "regex",
  "regex-syntax",
+]
+
+[[package]]
+name = "arrow-tenant-stream"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow 58.4.0",
+ "arrow-deltalake",
+ "async-trait",
+ "bytes",
+ "clap",
+ "datafusion",
+ "delta_kernel",
+ "delta_kernel_default_engine",
+ "fs2",
+ "futures",
+ "object_store",
+ "parquet 58.4.0",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "url",
+ "uuid",
 ]
 
 [[package]]
@@ -2171,6 +2205,7 @@ dependencies = [
  "datafusion-datasource-arrow",
  "datafusion-datasource-csv",
  "datafusion-datasource-json",
+ "datafusion-datasource-parquet",
  "datafusion-execution",
  "datafusion-expr",
  "datafusion-expr-common",
@@ -2191,6 +2226,7 @@ dependencies = [
  "log",
  "object_store",
  "parking_lot",
+ "parquet 58.4.0",
  "tempfile",
  "tokio",
  "url",
@@ -2263,6 +2299,7 @@ dependencies = [
  "libc",
  "log",
  "object_store",
+ "parquet 58.4.0",
  "tokio",
  "uuid",
  "web-time",
@@ -2377,6 +2414,37 @@ dependencies = [
  "object_store",
  "tokio",
  "tokio-stream",
+]
+
+[[package]]
+name = "datafusion-datasource-parquet"
+version = "54.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cc35b92cd560082155e80d9c826929c852d3c51543f4affd3a51c464a0aab3a"
+dependencies = [
+ "arrow 58.4.0",
+ "async-trait",
+ "bytes",
+ "datafusion-common",
+ "datafusion-common-runtime",
+ "datafusion-datasource",
+ "datafusion-execution",
+ "datafusion-expr",
+ "datafusion-functions",
+ "datafusion-functions-aggregate-common",
+ "datafusion-physical-expr",
+ "datafusion-physical-expr-adapter",
+ "datafusion-physical-expr-common",
+ "datafusion-physical-plan",
+ "datafusion-pruning",
+ "datafusion-session",
+ "futures",
+ "itertools 0.14.0",
+ "log",
+ "object_store",
+ "parking_lot",
+ "parquet 58.4.0",
+ "tokio",
 ]
 
 [[package]]
@@ -2745,6 +2813,7 @@ dependencies = [
  "anyhow",
  "arrow 58.4.0",
  "arrow-deltalake",
+ "deltalake-azure",
  "deltalake-core",
  "hex",
  "parquet 58.4.0",
@@ -2821,6 +2890,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "deltalake-azure"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16ef4cf47139555d7c837f021d3ecdd616e3d137517ec61235346f59145336bb"
+dependencies = [
+ "bytes",
+ "deltalake-core",
+ "object_store",
+ "thiserror 2.0.21",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "deltalake-core"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2851,6 +2934,7 @@ dependencies = [
  "either",
  "foldhash 0.2.0",
  "futures",
+ "humantime",
  "indexmap 2.14.2",
  "itertools 0.14.0",
  "object_store",
@@ -5130,6 +5214,8 @@ dependencies = [
  "percent-encoding",
  "rand 0.9.5",
  "thiserror 2.0.21",
+ "tokio",
+ "tokio-stream",
 ]
 
 [[package]]

@@ -100,7 +100,16 @@ pub async fn initialize(args: InitializeAzureArgs) -> Result<()> {
         DeltaTable::initialize_url_for_bootstrap(url, Arc::clone(schema), vec![INGESTION.to_owned()])
             .with_context(|| format!("bootstrap canonical table {}", entry.name))?;
     }
-    let manifest = entries.into_iter().map(|(entry, _)| entry).collect::<Vec<_>>();
+    write_manifest(args).await
+}
+
+/// Writes canonical names/relative paths only, without contacting storage or claiming readiness.
+///
+/// # Errors
+///
+/// Returns fixture validation or manifest filesystem errors.
+pub async fn write_manifest(args: InitializeAzureArgs) -> Result<()> {
+    let manifest = entries()?.into_iter().map(|(entry, _)| entry).collect::<Vec<_>>();
     let bytes = serde_json::to_vec_pretty(&manifest)?;
     tokio::fs::write(&args.manifest, bytes)
         .await

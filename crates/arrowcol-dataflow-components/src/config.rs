@@ -478,7 +478,7 @@ impl CommitConfig {
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct DeltaExporterConfig {
-    /// Absolute local root for logical Arrowcol tables.
+    /// Absolute local root or abfss URI for logical Arrowcol tables.
     pub base_path: PathBuf,
     /// Authoritative routing lease store.
     pub routing: RoutingStoreConfig,
@@ -495,8 +495,8 @@ pub struct DeltaExporterConfig {
 
 impl DeltaExporterConfig {
     pub(crate) fn validate(&self) -> Result<(), String> {
-        if !self.base_path.is_absolute() {
-            return Err("Delta base_path must be absolute".to_owned());
+        if !self.base_path.is_absolute() && !self.base_path.to_string_lossy().starts_with("abfss://") {
+            return Err("Delta base_path must be absolute or an abfss URI".to_owned());
         }
         if self.authority_timeout.is_zero() {
             return Err("Delta authority_timeout must be positive".to_owned());

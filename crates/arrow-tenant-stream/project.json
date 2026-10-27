@@ -1,0 +1,102 @@
+{
+  "name": "arrow-tenant-stream",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "application",
+  "sourceRoot": "crates/arrow-tenant-stream/src",
+  "implicitDependencies": ["arrow-deltalake"],
+  "namedInputs": {
+    "default": ["{projectRoot}/**/*", "{workspaceRoot}/Cargo.toml", "{workspaceRoot}/Cargo.lock", "{workspaceRoot}/rust-toolchain.toml"]
+  },
+  "targets": {
+    "clean": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install tsx tools/scripts/src/clean.ts crates/arrow-tenant-stream",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      }
+    },
+    "format": {"executor": "nx:run-commands", "options": {"command": "cargo fmt --package arrow-tenant-stream"}},
+    "format-check": {"executor": "nx:run-commands", "options": {"command": "cargo fmt --package arrow-tenant-stream -- --check"}},
+    "lint": {"executor": "nx:run-commands", "options": {"command": "cargo clippy --locked --package arrow-tenant-stream --all-targets -- -D warnings"}},
+    "build": {"executor": "nx:run-commands", "cache": false, "options": {"command": "cargo build --locked --package arrow-tenant-stream"}},
+    "test": {"executor": "nx:run-commands", "options": {"command": "cargo test --locked --package arrow-tenant-stream"}},
+    "verify": {"executor": "nx:run-commands", "dependsOn": ["format-check", "lint", "build", "test"], "options": {"commands": []}},
+    "image": {
+      "executor": "rust-playground-build:docker-build",
+      "cache": false,
+      "inputs": [
+        "default",
+        "^default",
+        "{projectRoot}/Dockerfile",
+        "{workspaceRoot}/.dockerignore",
+        "{workspaceRoot}/Cargo.toml",
+        "{workspaceRoot}/Cargo.lock",
+        "{workspaceRoot}/rust-toolchain.toml",
+        "{workspaceRoot}/submodules/otel-arrow/**/*",
+        "{workspaceRoot}/infra/docker/install-azure-cli.sh"
+      ],
+      "outputs": ["{workspaceRoot}/target/images/arrow-tenant-stream-load.txt"],
+      "options": {
+        "file": "{absProjectRoot}/Dockerfile",
+        "context": "{absWorkspaceRoot}",
+        "image": "ghcr.io/mdrakiburrahman/rust-playground/arrow-tenant-stream",
+        "tags": ["dev"],
+        "platforms": ["linux/amd64"],
+        "output": "load",
+        "manifestFile": "{absWorkspaceRoot}/target/images/arrow-tenant-stream-load.txt"
+      },
+      "configurations": {
+        "ci-verify": {
+          "cacheFrom": ["type=gha,version=2,scope={projectName}-image"],
+          "cacheTo": ["type=gha,version=2,scope={projectName}-image,mode=max"]
+        }
+      }
+    },
+    "publish": {
+      "executor": "rust-playground-build:docker-build",
+      "cache": false,
+      "inputs": [
+        "default",
+        "^default",
+        "{projectRoot}/Dockerfile",
+        "{workspaceRoot}/.dockerignore",
+        "{workspaceRoot}/Cargo.toml",
+        "{workspaceRoot}/Cargo.lock",
+        "{workspaceRoot}/rust-toolchain.toml",
+        "{workspaceRoot}/submodules/otel-arrow/**/*",
+        "{workspaceRoot}/infra/docker/install-azure-cli.sh"
+      ],
+      "outputs": ["{workspaceRoot}/target/images/arrow-tenant-stream-publish.txt"],
+      "options": {
+        "file": "{absProjectRoot}/Dockerfile",
+        "context": "{absWorkspaceRoot}",
+        "image": "ghcr.io/mdrakiburrahman/rust-playground/arrow-tenant-stream",
+        "tags": ["{gitBranchTag}", "sha-{gitSha}"],
+        "immutableTags": ["sha-{gitSha}"],
+        "requireCleanWorktree": true,
+        "buildArgs": ["VCS_REF={gitSha}"],
+        "platforms": ["linux/amd64"],
+        "output": "push",
+        "manifestFile": "{absWorkspaceRoot}/target/images/arrow-tenant-stream-publish.txt"
+      },
+      "configurations": {
+        "main": {
+          "tags": ["{gitBranchTag}", "sha-{gitSha}", "latest"]
+        }
+      }
+    },
+    "image-smoke": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["image"],
+      "options": {
+        "command": "bash crates/arrow-tenant-stream/scripts/image-smoke.sh",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      }
+    }
+  },
+  "tags": ["scope:rust", "type:application", "type:runtime-image"]
+}

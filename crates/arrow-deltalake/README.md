@@ -1,6 +1,6 @@
 # arrow-deltalake
 
-Streaming Arrow `RecordBatch` -> Parquet / Delta. Local Linux, append-only.
+Streaming Arrow `RecordBatch` -> Parquet / Delta. Local Linux and ADLS Gen2.
 No OTEL or Flight dependency. Writes use pinned Delta Kernel 0.29.0;
 delta-rs is only the independent loadtest reader.
 
@@ -125,7 +125,7 @@ ownership is released.
   stage != commit       queue admission != durable delivery
   drop before submit -> no commit
   drop after submit  -> may still commit; cancellation is not rollback
-  commit error       -> fail waiters + poison coordinator; no blind retry
+  terminal error     -> fail waiters + poison coordinator; no blind retry
 
   OTEL adapter's dependency gate (not a cross-table transaction):
 
@@ -137,8 +137,12 @@ ownership is released.
   start_draining() -> bypass delay for every remaining dependency wave
 ```
 
-Data files are synced before publication. Conflicts and uncertain outcomes
-are explicit errors; orphan files remain for inspection. The 10-second
+Data files are synced before publication. Safe CAS collisions retry with jitter,
+up to eight attempts and a ten-second retry-admission window. Stable transaction
+identities reconcile uncertain success before any resubmission; an unreadable
+outcome fails closed, and unidentified uncertain appends are never replayed.
+Exhaustion and semantic/schema conflicts remain visible errors; orphan files
+remain for inspection. The 10-second
 collection window is not a visibility bound: dependency waves add latency.
 
 ## Publication fencing
@@ -155,6 +159,109 @@ transaction receives `CommitReceiptError::PublicationFenced` through
 `wait_typed()`; the coordinator is then poisoned just like other uncertain or
 commit failures. Existing `wait()` remains available and wraps the typed error
 in `anyhow::Error`.
+
+## Shared tables, ADLS identity and reset fencing
+
+Legacy local `open` retains its lifetime writer lock. `open_url` and
+`open_uri_with_fence` permit independent maintenance/streaming processes while
+Delta's conditional-create log publication arbitrates each commit. Independent
+submissions remain independent; only the same application ID/version deduplicates.
+Transaction retention must remain unset. Checkpoints retain transaction fences.
+
+`object_store_for_url` supplies the same refreshable Azure CLI identity to
+readers/checkpoint clients without opening a writer. Azure runtimes require `az`
+2.54 or later, the authorized CLI configuration mounted privately, and
+`AZURE_CONFIG_DIR` pointing at it. A token cache alone is not sufficient.
+The provider invokes `az account get-access-token` with the Storage scope;
+no credentials are embedded in jobs or table metadata. Child execution/output
+has a five-second deadline, cancellation kills the child, concurrent credential
+admission is bounded to six seconds, and output is limited to 64 KiB.
+Cached tokens expire at the earlier of 60 seconds or their expiry minus 30 seconds.
+CLI stderr and token responses are never included in errors.
+
+Normal Azure open/upload/commit requires owned, ready checkpoint-container
+metadata and the same captured reset generation. Bootstrap-only
+`initialize_url_for_bootstrap` instead requires the owned, fenced generation,
+normalizes its raw input schema, validates existing roots, and returns no writer.
+`StorageAuthority::open/check` lets checkpoint services enforce the same authority
+immediately before and after each mutation; failed authority forbids cleanup.
+Core repeats authority after slow local staging/checkpoint preparation, and the
+committer materializes at most 8 MiB of action arrays before its final check.
+
+Azure HTTP attempts time out after ten seconds, with at most two retries,
+ten-second retry admission, and backoff capped at 250 ms. Conservatively, one
+credential acquisition plus three HTTP attempts and two backoffs is at most
+36.5 seconds of configured asynchronous waiting after request preparation.
+A metadata authority request adds up to six seconds of credential admission
+and ten seconds of HTTP waiting. These are **not a hard whole-operation or
+server-completion deadline**: CPU scheduling, runtime suspension, serialization,
+and already-sent server requests are outside these client bounds. Reset grace
+alone is not proof of fencing. Stop/quiesce services before destructive reset;
+the stalled-auth tests specifically prove a cancelled CLI cannot later resume a
+data/log publication. Real ADLS/reset qualification still requires authorized
+subscription access.
+
+## Telemetry
+
+Install the process's global OpenTelemetry meter provider before any Delta work,
+then attach `telemetry::kernel_metrics_reporter()` with Kernel's
+`WithMetricsReporterLayer` to the global tracing subscriber. Apply log filters
+only to the logging layer, not the Kernel reporting layer. The crate does not
+install another subscriber/exporter or create placeholder observations.
+
+The `arrow-deltalake` meter exports these actual instruments:
+
+| Instrument | Unit | Bounded attributes |
+|---|---|---|
+| `delta.kernel.events` | counter | `event`, `outcome` |
+| `delta.kernel.duration` | s, histogram | `event`, `phase` |
+| `delta.kernel.values` | 1, histogram | `event`, `field` |
+| `delta.kernel.bytes` | By, histogram | `event`, `field` |
+| `delta.kernel.version` | 1, gauge | `event` |
+| `delta.publication.events` | counter | `outcome` |
+| `delta.publication.duration` | s, histogram | `outcome` |
+
+Kernel event coverage includes log-segment and protocol loading, snapshot,
+transaction prepare/committer/total timings and file counts/bytes, domain and
+transaction lookup/cache results, CRC, JSON/Parquet reads, scan selection and
+predicate/dedup/transform work, and storage listing/reading/copying. The match is
+exhaustive for pinned Kernel 0.29. Publication outcomes include `attempt`,
+`conflict`, `retryable_io`, `committed`, `deduplicated`, `reconciled`, `exhausted`
+and `failure`; the duration records one terminal observation per publication.
+No table URI, account, application UUID or correlation ID is a metric label.
+Prometheus/OTLP exporters may normalize dots and append unit/type suffixes.
+
+## Publication file layout
+
+Collector `new_file_with_publication` files containing `customer_id` use the
+shared whole-file sort buffer, not isolated per-batch sorting. All rows from one
+receipt are sorted together before Parquet encoding; its stable transaction,
+ingestion partition, normalized schema, row count and original logical input-byte
+accounting are preserved. Legacy `new_file` stays streaming and unchanged.
+Schemas without `customer_id` keep streaming unless sort columns are explicit.
+
+| Environment option | Default |
+|---|---|
+| `ARROWCOL_LAYOUT_SORT_COLUMNS` | `customer_id` (comma-separated, ordered keys) |
+| `ARROWCOL_LAYOUT_BLOOM_COLUMNS` | `customer_id` |
+| `ARROWCOL_LAYOUT_MAX_ROWS` | 262144 |
+| `ARROWCOL_LAYOUT_MAX_INPUT_BYTES` | 67108864 |
+| `ARROWCOL_LAYOUT_ROW_GROUP_ROWS` | 16384 |
+| `ARROWCOL_LAYOUT_PAGE_ROWS` | 2048 |
+
+Policies enable row-group/page statistics, offset indexes and selected Bloom
+filters. Qualification may explicitly set row groups to 512 and pages to 128
+for an 8192-row/16-customer source; production defaults are not changed. The
+regression exercises multiple interleaved batches through a real publication:
+sorted output selects one of 16 groups by customer bounds, while an unsorted
+control with identical encoding controls selects all 16.
+
+Bounds apply to retained physical Arrow arrays; sorting/concatenation requires
+additional proportional workspace. An oversized publication fails visibly before
+commit and must be split upstream into independently identified publications;
+it never silently commits a partial receipt. Explicit
+`new_file_with_publication_and_layout` supports per-caller policies or `None`
+for streaming without changing process environment.
 
 ## Arrow representation
 

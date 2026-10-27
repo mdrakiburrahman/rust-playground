@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import {
-  expectedTableRows, kustoExplorerClusterUri, kustoExplorerStartArguments, kustoExplorerUrl, tableRowMismatches,
+  expectedTableRows, kustoExplorerClusterUri, kustoExplorerStartArguments, kustoExplorerUrl, tableRowMismatches, tableSummaryQuery,
 } from '../src/ui-gate.js';
 
 const validation = {
@@ -20,6 +20,16 @@ test('kusto-explorer starts alone, waits for its health check and is addressed t
   ]);
   assert.equal(kustoExplorerUrl, 'http://kusto-explorer:8080/');
   assert.equal(kustoExplorerClusterUri, 'http://kusto:8080');
+});
+
+test('native QAP UI queries enumerate external tables rather than a native-table wildcard', () => {
+  const query = tableSummaryQuery(['direct_x', 'dataflow_y']);
+  assert(query.includes("external_table('direct_x')"));
+  assert(query.includes("external_table('dataflow_y')"));
+  assert(query.includes('| summarize Rows=count()'));
+  assert(!query.includes('direct_*'));
+  assert.throws(() => tableSummaryQuery([]), /safe validated/u);
+  assert.throws(() => tableSummaryQuery(["x'); drop"]), /safe validated/u);
 });
 
 test('expected table rows come from a passing Kusto validation with bracket-quoted names', () => {

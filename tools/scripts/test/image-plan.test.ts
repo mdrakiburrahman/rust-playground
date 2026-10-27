@@ -38,12 +38,13 @@ function workspaceProjects(): Record<string, ProjectConfiguration> {
   return projects;
 }
 
-test('discovers the five production images and retains the sample publication', () => {
+test('discovers production images and retains the sample publication', () => {
   assert.deepEqual(PRODUCTION_RUNTIME_IMAGE_PROJECTS, [
     'otelcol-rust',
     'arrowcol-rust',
     'arrowcol-dataflow-rust',
     'arrowcol-router-rust',
+    'kusto-bridge',
     'kusto-explorer',
   ]);
   assert.deepEqual(RETAINED_RUNTIME_IMAGE_PROJECTS, ['hello-world']);
@@ -98,10 +99,11 @@ const COLLECTOR_IMAGE_PROJECTS = [
 ];
 // Web images compile a wasm UI and serve read-only static assets instead of configuration files.
 const WEB_IMAGE_PROJECTS = ['kusto-explorer'];
+const SERVICE_IMAGE_PROJECTS = ['kusto-bridge'];
 
 test('every production runtime image is classified for Dockerfile policy', () => {
   assert.deepEqual(
-    [...COLLECTOR_IMAGE_PROJECTS, ...WEB_IMAGE_PROJECTS].sort(),
+    [...COLLECTOR_IMAGE_PROJECTS, ...WEB_IMAGE_PROJECTS, ...SERVICE_IMAGE_PROJECTS].sort(),
     [...PRODUCTION_RUNTIME_IMAGE_PROJECTS].sort(),
   );
 });
@@ -131,7 +133,10 @@ test('runtime Dockerfiles pin build and runtime bases and enforce production bou
       project,
     );
     assert.match(dockerfile, /COPY submodules\/otel-arrow/u, project);
-    assert.match(dockerfile, /ca-certificates curl/u, project);
+    assert.match(dockerfile, /ca-certificates/u, project);
+    if (!SERVICE_IMAGE_PROJECTS.includes(project)) {
+      assert.match(dockerfile, /ca-certificates curl/u, project);
+    }
     assert.match(
       dockerfile,
       /org\.opencontainers\.image\.source/u,
@@ -149,7 +154,7 @@ test('runtime Dockerfiles pin build and runtime bases and enforce production bou
     if (COLLECTOR_IMAGE_PROJECTS.includes(project)) {
       assert.match(dockerfile, /cmake protobuf-compiler/u, project);
       assert.match(dockerfile, /COPY --chmod=0444/u, project);
-    } else {
+    } else if (WEB_IMAGE_PROJECTS.includes(project)) {
       assert.match(dockerfile, /rustup target add wasm32-unknown-unknown/u, project);
       assert.match(
         dockerfile,
@@ -159,8 +164,21 @@ test('runtime Dockerfiles pin build and runtime bases and enforce production bou
       assert.match(dockerfile, /find \/out\/www -type d -exec chmod 0555/u, project);
       assert.match(dockerfile, /find \/out\/www -type f -exec chmod 0444/u, project);
       assert.match(dockerfile, /COPY --from=builder --chmod=0555/u, project);
+    } else {
+      assert.match(dockerfile, /install -D --mode=0555/u, project);
+      assert.match(dockerfile, /COPY --from=builder/u, project);
     }
   }
+});
+
+test('Explorer context override retains root exclusions before browser-only exclusions', () => {
+  const patterns = (file: string): string[] => readFileSync(join(workspace, file), 'utf8')
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith('#'));
+  const root = patterns('.dockerignore');
+  const explorer = patterns('projects/kusto-explorer/Dockerfile.dockerignore');
+  assert.deepEqual(explorer.slice(0, root.length), root);
 });
 
 interface PublishWorkflow {
@@ -227,6 +245,7 @@ test('publish workflow discovers, smokes, publishes, and verifies the matrix wit
   }
   assert(paths.has('bin/hello-world/**'));
   assert(paths.has('crates/**'));
+  assert(paths.has('infra/docker/**'));
   assert(paths.has('submodules/otel-arrow'));
   assert(paths.has('submodules/otel-arrow/**'));
   assert(paths.has('tools/libs/rust-playground-build/**'));

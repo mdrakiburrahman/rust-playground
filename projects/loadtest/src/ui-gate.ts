@@ -16,11 +16,18 @@ export const kustoExplorerStartArguments = [
 export const kustoExplorerUrl = 'http://kusto-explorer:8080/';
 export const kustoExplorerClusterUri = 'http://kusto:8080';
 
-export const tableSummaryQuery = [
-  'union withsource=TableName direct_*, dataflow_*',
-  '| summarize Rows=count() by TableName',
-  '| order by TableName asc',
-].join('\n');
+export function tableSummaryQuery(names: Iterable<string>): string {
+  const tables = [...names].sort();
+  if (tables.length === 0 || tables.some(name => !/^[A-Za-z_][A-Za-z0-9_]*$/u.test(name))) {
+    throw new Error('External-table summary requires safe validated table names');
+  }
+  return [
+    `union ${tables.map(name =>
+      `(external_table('${name}') | summarize Rows=count() | extend TableName='${name}')`).join(',\n')}`,
+    '| project TableName, Rows',
+    '| order by TableName asc',
+  ].join('\n');
+}
 
 const browserProfile = ['--profile', 'ui-gate'];
 const viewport = { width: 1600, height: 960 };
@@ -175,17 +182,18 @@ async function exercise(page: Page, expected: ReadonlyMap<string, number>, optio
 
   await page.locator('[data-testid=status-connection][data-state=connected]').waitFor({ timeout: 60_000 });
   await page.waitForFunction(
-    (minimum) => document.querySelectorAll('[data-testid=tree-node][data-kind=table]').length >= minimum,
+    (minimum) => document.querySelectorAll('[data-testid=tree-node][data-kind=external-table]').length >= minimum,
     expected.size,
     { timeout: 60_000 },
   );
-  const treeTables = await page.locator('[data-testid=tree-node][data-kind=table]')
+  const treeTables = await page.locator('[data-testid=tree-node][data-kind=external-table]')
     .evaluateAll((nodes) => nodes.map((node) => node.getAttribute('data-name') ?? ''));
   const missing = [...expected.keys()].filter((name) => !treeTables.includes(name));
   evidence.checks.connection_tree = { tables: treeTables.length, missing };
   if (missing.length > 0) throw new Error(`The connection tree is missing ${missing.join(', ')}`);
 
-  await runQuery(page, tableSummaryQuery);
+  const summaryQuery = tableSummaryQuery(expected.keys());
+  await runQuery(page, summaryQuery);
   const statusRows = count(await page.locator('[data-testid=status-rows]').innerText());
   if (statusRows !== expected.size) throw new Error(`The status bar shows ${statusRows} result rows, expected ${expected.size}`);
   await screenshot('kusto-explorer-results-dark.png');
@@ -200,12 +208,12 @@ async function exercise(page: Page, expected: ReadonlyMap<string, number>, optio
   const exported = JSON.parse(readFileSync(exportFile, 'utf8')) as unknown;
   const mismatches = tableRowMismatches(expected, exported);
   const rows = [...expected.values()].reduce((total, value) => total + value, 0);
-  evidence.checks.table_rows = { query: tableSummaryQuery, status_bar_rows: statusRows, tables: expected.size, rows, mismatches };
+  evidence.checks.table_rows = { query: summaryQuery, status_bar_rows: statusRows, tables: expected.size, rows, mismatches };
   if (mismatches.length > 0) throw new Error(`UI results differ from kusto-validation.json: ${mismatches.join('; ')}`);
   for (const toast of await page.locator('[data-testid=toast] button[aria-label=Dismiss]').all()) await toast.click();
   await page.locator('[data-testid=toast]').first().waitFor({ state: 'detached', timeout: 10_000 });
 
-  const management = '.show tables | count';
+  const management = '.show external tables | count';
   await runQuery(page, management);
   const tableCount = count(await page.locator('[data-testid=grid-row] .kx-grid-cell').first().innerText());
   evidence.checks.management_command = { query: management, count: tableCount };
@@ -213,7 +221,7 @@ async function exercise(page: Page, expected: ReadonlyMap<string, number>, optio
     throw new Error(`${management} returned ${tableCount}, but the connection tree lists ${treeTables.length} tables`);
   }
 
-  const chart = `${tableSummaryQuery}\n| render columnchart`;
+  const chart = `${summaryQuery}\n| render columnchart`;
   await runQuery(page, chart);
   await page.locator('[data-testid=chart] rect.kx-bar').first().waitFor({ timeout: 30_000 });
   const bars = await page.locator('[data-testid=chart] rect.kx-bar').count();
@@ -327,6 +335,8 @@ export async function runGrafanaGate(options: UiGateOptions): Promise<void> {
     }
     await page.waitForFunction(() => [...document.querySelectorAll('canvas')].some(canvas => canvas.width > 100 && canvas.height > 100),
       null, { timeout: 30_000 });
+    await page.getByText(/delta_(kernel|publication)_events(?:_total)?/u).first()
+      .waitFor({ state: 'visible', timeout: 30_000 });
     await page.screenshot({ path: path.join(options.results, 'grafana-delta-operations.png'), fullPage: true });
     evidence.screenshot = 'grafana-delta-operations.png';
     evidence.passed = true;

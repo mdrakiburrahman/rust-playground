@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawn, spawnSync } from 'node:child_process';
+import { execFile, spawn, spawnSync } from 'node:child_process';
 import { randomBytes, randomUUID } from 'node:crypto';
 import {
   chmodSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, writeFileSync,
@@ -7,6 +7,7 @@ import {
 import { hostname } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 
 import {
   benchmarkUsage,
@@ -219,7 +220,7 @@ function writeDirectConfig(directory: string, service: string, network: Benchmar
   writeFileSync(path.join(dataflowState, 'dataflow.yaml'), runtime.dataflowYaml);
   writeFileSync(path.join(directory, 'router-state/compose-runtime.json'),
     `${buildBenchmarkComposeOverride(hostPath(directory), { quiver, ...(azure ? {
-      mode: 'azure', azureConfigHostDirectory: hostPath(path.join(directory, 'azure-cli')), azureEnvironment: privateEnv,
+      mode: 'azure', azure, azureConfigHostDirectory: hostPath(path.join(directory, 'azure-cli')), azureEnvironment: privateEnv,
     } : {}) })}\n`);
   writeFileSync(generationFile, `${generation}\n`);
 }
@@ -259,6 +260,10 @@ function benchmarkEnvironment(
       ARROWCOL_AZURE_TABLE_ROOT: azure.root,
       LOADTEST_DIRECT_ROOT: azure.directRoot,
       LOADTEST_DATAFLOW_ROOT: azure.dataflowRoot,
+      LOADTEST_MAINTENANCE_ROOT: `${azure.directRoot}/telemetry/sqlserver/`,
+      LOADTEST_TENANT_SOURCE: `${azure.directRoot}/telemetry/sqlserver/sqlserver_cpu_utilization`,
+      LOADTEST_TENANT_TARGET: `${azure.tenantRoot}/sqlserver_cpu_utilization`,
+      LOADTEST_TENANT_CHECKPOINT: `${azure.checkpointRoot}/tenant-cpu`,
       AZURE_USE_AZURE_CLI: 'true',
     } : {}),
     LOADTEST_COMPOSE_OVERRIDE_FILE: path.join(directory, 'router-state/compose-runtime.json'),
@@ -401,6 +406,7 @@ export function localLoadgenEnvironment(
   const infra = path.join(workspace, 'projects/arrowcol-infra/secrets');
   return {
     ...context.env,
+    ...(context.options.mode === 'azure' ? { AZURE_CONFIG_DIR: path.join(context.directory, 'azure-cli/loadgen') } : {}),
     LOADTEST_RESULTS: results,
     LOADTEST_DIRECT_ROOT: context.options.mode === 'azure' ? context.env.LOADTEST_DIRECT_ROOT : path.join(context.directory, 'direct'),
     LOADTEST_DATAFLOW_ROOT: context.options.mode === 'azure' ? context.env.LOADTEST_DATAFLOW_ROOT : path.join(context.directory, 'dataflow'),
@@ -412,8 +418,8 @@ export function localLoadgenEnvironment(
     LOADTEST_SCRATCH_ROOT: 'projects/loadtest/.temp/loadgen/latest',
     LOADTEST_DIRECT_ADMIN_ENDPOINTS: `http://${context.network.direct}:8081`,
     LOADTEST_DATAFLOW_ADMIN_ENDPOINTS: `http://${context.network.dataflow}:32011`,
-    LOADTEST_KUSTO_ENDPOINT: context.options.mode === 'azure' ? undefined : `http://${context.network.kusto}:8080`,
-    LOADTEST_KUSTO_BRIDGE_ENDPOINT: context.options.mode === 'azure' ? undefined : `http://${context.network.kustoBridge}:9464`,
+    LOADTEST_KUSTO_ENDPOINT: context.options.mode === 'azure' ? context.env.AZURE_KUSTO_URI : `http://${context.network.kusto}:8080`,
+    LOADTEST_KUSTO_BRIDGE_ENDPOINT: context.options.mode === 'azure' ? undefined : context.env.LOADTEST_KUSTO_BRIDGE_ENDPOINT,
     ARROWCOL_SQL_HOST: context.network.sql,
     ARROWCOL_SQL_PASSWORD_FILE: path.join(infra, 'arrowcol-app-password.txt'),
     ARROWCOL_SDK_GEN: path.join(cargoTargetDirectory(), 'debug/arrowcol-sdk-gen'),
@@ -467,8 +473,20 @@ export function deltaTableLocations(directory: string): string {
   ].join('\n');
 }
 
-async function benchmark(options: BenchmarkOptions, controller: BenchmarkController): Promise<BenchmarkContext> {
-  const privateEnv = modeEnvironment(workspace, options.mode, process.env);
+async function reconcileAzure(context: BenchmarkContext, occupancyId: string): Promise<void> {
+  const manifest = path.join(context.directory, 'router-state/azure-tables.json');
+  run(path.join(cargoTargetDirectory(), 'debug/arrowcol-loadgen'), ['azure-manifest', '--manifest', manifest], context.env);
+  // The helper waits only for absent logs; auth, ownership and malformed logs fail immediately.
+  await promisify(execFile)('python3', [
+    'infra/azure/bootstrap.py', 'reconcile', '--tables', manifest,
+    '--occupancy-id', occupancyId, '--wait-seconds', '120',
+  ], { cwd: workspace, env: { ...context.env, AZURE_CONFIG_DIR: path.join(context.directory, 'azure-cli/infra') },
+    encoding: 'utf8', timeout: 180_000, maxBuffer: 8 * 1024 * 1024 });
+}
+
+async function benchmark(
+  options: BenchmarkOptions, controller: BenchmarkController, privateEnv: NodeJS.ProcessEnv, occupancyId: string,
+): Promise<BenchmarkContext> {
   const azure = options.mode === 'azure'
     ? azureTargets(privateEnv, `run-${Date.now()}-${randomBytes(4).toString('hex')}`)
     : undefined;
@@ -481,7 +499,7 @@ async function benchmark(options: BenchmarkOptions, controller: BenchmarkControl
   controller.checkRunning();
   step('Bootstrapping secrets and preparing benchmark');
   for (const child of [
-    'direct', 'dataflow', 'otel', 'results', 'router-state',
+    'direct', 'dataflow', 'tenant', 'tenant-checkpoints', 'otel', 'results', 'router-state',
     'direct-state-1',
     ...(options.quiver ? [benchmarkQuiver.directHostDirectory, benchmarkQuiver.dataflowHostDirectory] : []),
   ]) {
@@ -538,7 +556,7 @@ async function benchmark(options: BenchmarkOptions, controller: BenchmarkControl
     if (kustoStartup.state === 'degraded') {
       step(`Kusto startup DEGRADED: ${kustoStartup.error}. Load generation will continue; see results/kusto-startup.json`);
     }
-    if (kustoStartup.state !== 'degraded') {
+    if (kustoStartup.state !== 'degraded' && privateEnv.LOADTEST_KUSTO_BRIDGE_ENDPOINT) {
       compose(project, env, ['--profile', 'benchmark', 'up', '--detach', '--no-build', '--wait', '--wait-timeout', '300', 'kusto-bridge'], 360_000);
     }
     controller.checkRunning();
@@ -601,7 +619,15 @@ async function benchmark(options: BenchmarkOptions, controller: BenchmarkControl
     });
     const load = runLocalLoadgen(context, 'run', path.join(directory, 'results'), controller)
       .finally(() => loadEnded.abort());
-    const [loadOutcome, crashOutcome] = await Promise.allSettled([load, crash]);
+    const reconciliation = azure ? reconcileAzure({ ...context, project }, occupancyId) : undefined;
+    const [loadOutcome, crashOutcome, reconcileOutcome] = await Promise.allSettled([load, crash, reconciliation]);
+    if (reconcileOutcome.status === 'rejected') {
+      phase = 'azure-external-reconcile';
+      if (loadOutcome.status === 'rejected') {
+        throw new AggregateError([reconcileOutcome.reason, loadOutcome.reason], 'Azure reconciliation and load generation failed');
+      }
+      throw reconcileOutcome.reason;
+    }
     if (loadOutcome.status === 'rejected') throw loadOutcome.reason;
     if (crashOutcome.status === 'rejected') {
       phase = 'quiver-recovery';
@@ -693,23 +719,30 @@ async function main(): Promise<void> {
   const controller = await acquireBenchmarkController(workspace);
   const occupancyId = randomUUID();
   let occupied = false;
+  let failure: unknown;
   try {
     if (options.mode === 'azure') {
       azureTargets(privateEnv, 'preflight');
       run('python3', ['infra/azure/bootstrap.py', 'occupy', '--occupancy-id', occupancyId], privateEnv);
       occupied = true;
     }
-    await benchmark(options, controller);
+    // Occupy exports the exact ready storage generation; never substitute a run UUID.
+    await benchmark(options, controller, modeEnvironment(workspace, options.mode, process.env), occupancyId);
+  } catch (error) {
+    failure = error;
   } finally {
     try {
       if (occupied) {
-        await stopBenchmark(workspace, args => run('docker', args));
+        await stopBenchmark(workspace, args => run('docker', args, process.env, 360_000), { requireCleanMutators: true });
         run('python3', ['infra/azure/bootstrap.py', 'release', '--occupancy-id', occupancyId], privateEnv);
       }
+    } catch (error) {
+      failure = failure ? new AggregateError([failure, error], 'Benchmark and cloud drain/release failed; occupancy is not force-cleared') : error;
     } finally {
       controller.close();
     }
   }
+  if (failure) throw failure;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

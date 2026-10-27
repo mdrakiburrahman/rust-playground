@@ -24,8 +24,9 @@ npx nx run loadtest:run -- --warmup 2m --concurrency 8 --batch-rows 1024
 This starts a fresh SQL Server, Hive, router, Direct collector, Dataflow
 collector, Kusto emulator, [kusto-explorer](../kusto-explorer/README.md) query
 UI, and monitoring stack, then sends the same Arrow batches to both collectors
-across all 13 tables. Kusto mirrors the committed output into native tables for
-live functional inspection.
+across all 13 tables. Kusto provides live functional inspection of committed
+output. Native Delta external-table/QAP validation is the default target;
+the compatibility bridge is optional and is never Azure QAP evidence.
 
 **Each start replaces the previous loadtest. Its SQL, Hive, and Kusto volumes,
 Delta tables, and results are deleted.** Other Docker projects and workspace
@@ -84,7 +85,8 @@ authorized run produces the required observations.
 
 Azure collector images must include the shared pinned CLI installer from
 `infra/docker/install-azure-cli.sh`. At runtime the runner makes a separate
-writable Azure CLI config copy for each collector, below the ignored
+writable Azure CLI config copy for each collector, loadgen, infra helper, tenant
+stream and maintenance service, below the ignored
 `onelake/benchmark/latest/azure-cli/` directory. Directories are mode `0700`,
 files `0600`; collectors use the invoking UID/GID. The host cache is never
 mounted into a collector, and config/credentials never enter an image or its
@@ -101,6 +103,58 @@ Successful stop emits one JSON receipt with `stopped:true`,
 `scope:"workspace-owned-loadtest"` and `dataPreserved:true`. This local stop is
 not a distributed fencing guarantee: Azure reset must also enforce the owned
 checkpoint-container metadata fence and occupancy CAS.
+
+### Qualification evidence
+
+Correct query counts alone do not prove an accelerated index is ready.
+Qualification must record native QAP cache state/statistics and compare both
+cached and deliberately fresh fallback queries with the complete independent
+Delta row multiset. `MaxAge` limits acceptable index staleness; it is not a
+refresh-cadence guarantee. OPTIMIZE rewrites require reacceleration, which is not
+by itself proof of a whole-table reset.
+See the public [query acceleration policy](https://learn.microsoft.com/en-us/kusto/management/query-acceleration-policy)
+and [troubleshooting guide](https://learn.microsoft.com/en-us/kusto/management/query-acceleration-troubleshooting-guide)
+for supported table features, cache limits and unhealthy-catalog behavior.
+
+For isolated Azure runs, the runner writes the same canonical 26-table manifest
+without mutating storage (`arrowcol-loadgen azure-manifest --manifest PATH`),
+then reconciles external-table bindings while generation is active. The
+infrastructure helper has a fixed 120-second absent-log wait and distinguishes
+not-ready logs from authentication, ownership or malformed-log failures; there
+is no general retry-until-green loop. Occupancy exports the actual ready
+`ARROWCOL_RESET_GENERATION`, and the runner reloads that private environment
+before starting either collector. A run UUID is not a storage generation.
+Cloud cleanup stops all owned services, permits a bounded five-minute drain,
+and refuses occupancy release after a forced, OOM or unverifiable mutator exit.
+This exit check is not proof of registry closure: the infrastructure release
+must independently require an empty same-generation publisher registry. Unknown
+drains retain occupancy and registrations; no force-clear is attempted.
+
+The optional `tenant` and `maintenance` Compose profiles use the real
+`arrow-tenant-stream` and `delta-maintenance` images, both included in
+`loadtest:build` (and therefore the E2E image closure). Both collectors and both
+services use `init: true` to reap CLI descendants. Tenant sources are read-only;
+its writable sink and checkpoint use separate directories. Azure replaces
+source, sink, checkpoint and maintenance roots and mounts a separate private
+CLI config for each service. Profiles are not started by ordinary baseline runs.
+
+Local maintenance sees disposable loadtest roots under `/tmp/arrowcol-stress`.
+This mount alone does **not** authorize short-retention VACUUM: the table must
+also have the core's explicit disposable-test marker and the invocation must
+opt in. The profile defaults to real OPTIMIZE only. Normal and Azure VACUUM keep
+the seven-day retention floor; a fresh cloud run without aged tombstones cannot
+claim physical-cleanup or steady-state evidence. Source layout qualification
+sets `ARROWCOL_LAYOUT_ROW_GROUP_ROWS=512` and `ARROWCOL_LAYOUT_PAGE_ROWS=128`
+on the actual collectors; ordinary defaults remain 16384/2048.
+
+The fixed-window stress evaluator requires both operation cycles and export
+samples at the same declared maintenance-wave phase. It rejects missing
+telemetry, counter resets/jumps, driver stalls, unexpected restarts/OOM,
+exhausted retries, resource ceilings and unstable trend/variation. Independent
+operation evidence must show net file reduction with unchanged row multisets
+for OPTIMIZE, and actual physical reclamation without removing active files for
+VACUUM. These evaluators do not turn an unexecuted or timed-out scenario into a
+pass; local component tests do not establish Azure QAP behavior.
 
 Both collectors use two CPUs and matching buffer limits: 128 MiB overall,
 32 MiB per table, and 32 MiB per flush. SQL Server defaults to a 16 GiB memory
@@ -204,29 +258,30 @@ therefore accepts the [Microsoft emulator license terms][emulator-install].
 The emulator supports HTTP only, without Microsoft Entra authentication.
 
 The database is `loadtest`. Each of the 13 SQL table names appears in both pools:
-`direct_<sqlserver_table>` and `dataflow_<sqlserver_table>`, for 26 native Kusto
+`direct_<sqlserver_table>` and `dataflow_<sqlserver_table>`, for 26 native Delta external
 tables. For example:
 
 ```kusto
-direct_sqlserver_wait_stats
+external_table('direct_sqlserver_wait_stats')
 | take 5
 ```
 
 Committed Parquet files become queryable incrementally while generation runs.
 Tables may be pending until their first Delta commit; readiness of the cluster
-does not establish completeness of the mirror. Only the current fixed-schema,
-append-only workload is supported. Schema changes or removal of previously
-ingested active files degrade synchronization rather than silently leaving
-stale tables. Timestamp `__unix_nanos` companion columns retain the original
+does not establish cache eligibility. Native QAP uses `MaxAge=00:01:00`;
+validation waits within its declared timeout for actual eligible cache statistics
+and checks both the cached query and the one-second fallback against the oracle.
+The optional bridge is not the default and is not accelerated-cache evidence.
+Timestamp `__unix_nanos` companion columns retain the original
 integer nanoseconds; Kusto `datetime` alone is not nanosecond-exact.
 
-To inspect all native-table counts from the Docker host:
+To inspect an external table from the Docker host:
 
 ```bash
 curl --fail-with-body --silent --show-error \
   "http://localhost:${KUSTO_PORT:-8080}/v2/rest/query" \
   -H 'Content-Type: application/json' \
-  -d '{"db":"loadtest","csl":"union withsource=TableName direct_*, dataflow_* | summarize Rows=count() by TableName | order by TableName asc"}'
+  -d '{"db":"loadtest","csl":"external_table(\"direct_sqlserver_wait_stats\") | count"}'
 ```
 
 For an interactive view, open kusto-explorer at <http://localhost:8090>. It lists
@@ -267,7 +322,7 @@ npx nx run loadtest:verify
 ```
 
 Its functional E2E uses 1,024-row batches while retaining all 13 schemas and all
-26 native-table assertions. It runs twice in sequence: the baseline, then
+26 external-table assertions. It runs twice in sequence: the baseline, then
 `--quiver --crash-after 15s`. The second run resets the first, so the retained
 results are from the Quiver crash run. Ordinary `loadtest:run` defaults are
 unchanged.
@@ -278,9 +333,8 @@ Inspect these files under `onelake/benchmark/latest/results/`:
 | --- | --- |
 | `kusto-startup.json` | Independent, sanitized emulator start/probe outcome |
 | `kusto-status.json` | Rust synchronization state, live visibility, file count, and any error |
-| `kusto-ingestions.jsonl` | Committed-file ingestion and replay evidence |
 | `kusto-queries.jsonl` | Executed KQL and query results, including live observations |
-| `kusto-validation.json` | Final native-table correctness assertions |
+| `kusto-validation.json` | Final cached/fallback external-table correctness and QAP observations |
 | `kusto-explorer-validation.json` | UI gate checks, screenshots, and any browser console errors |
 | `kusto-explorer-export.json` | Per-table row counts exported through the UI |
 | `kusto-explorer-*.png` | UI screenshots in the dark and light themes, or `kusto-explorer-failure.png` |
@@ -309,8 +363,8 @@ KUSTO_MEMORY_LIMIT=4g KUSTO_PORT=18080 npx nx run loadtest:run -- --measure 5m -
 [Microsoft's emulator license prohibits benchmark tests][emulator-overview].
 Do not measure or publish Kusto emulator throughput or latency; it is not a
 production Azure Data Explorer performance proxy. This integration exercises
-native local-file ingestion and query correctness only, not managed/queued or
-streaming ingestion. Live mirroring consumes shared host resources, so collector
+native local-file Delta/QAP query functionality only, not cloud performance.
+Cache work consumes shared host resources, so collector
 measurements with this stack must not be described as unaffected by Kusto.
 Its configured resource limits are retained in provenance.
 

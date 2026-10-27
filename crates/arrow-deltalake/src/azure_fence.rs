@@ -14,6 +14,10 @@ pub(crate) struct AzureResetFence {
 }
 
 impl AzureResetFence {
+    pub(crate) fn generation(&self) -> &str {
+        &self.generation
+    }
+
     pub(crate) async fn open(account: &str, credentials: AzureCredentialProvider, bootstrap: bool) -> Result<Self> {
         let container = std::env::var("AZURE_STORAGE_CHECKPOINT_CONTAINER").unwrap_or_else(|_| "checkpoints".into());
         if !account.bytes().all(|byte| byte.is_ascii_alphanumeric())
@@ -84,7 +88,11 @@ impl AzureResetFence {
     }
 
     pub(crate) async fn check(&self) -> Result<()> {
-        if self.read_generation(false).await? != self.generation {
+        self.check_mode(false).await
+    }
+
+    pub(crate) async fn check_mode(&self, bootstrap: bool) -> Result<()> {
+        if self.read_generation(bootstrap).await? != self.generation {
             bail!("Azure reset generation changed; reopen under the new authority");
         }
         Ok(())

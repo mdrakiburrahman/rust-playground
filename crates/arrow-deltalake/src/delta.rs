@@ -33,14 +33,53 @@ use url::Url;
 
 type LocalEngine = DefaultEngine<SharedExecutor>;
 
+fn configured_publication_layout(schema: &SchemaRef) -> Result<Option<crate::layout::LayoutPolicy>> {
+    let columns = |name| -> Result<Option<Vec<String>>> {
+        match std::env::var(name) {
+            Ok(value) => Ok(Some(value.split(',').map(str::trim).map(str::to_owned).collect())),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    };
+    let sort_columns = columns("ARROWCOL_LAYOUT_SORT_COLUMNS")?;
+    if schema.field_with_name("customer_id").is_err() && sort_columns.is_none() {
+        return Ok(None);
+    }
+    let mut policy = crate::layout::LayoutPolicy::default();
+    if let Some(columns) = sort_columns {
+        policy.sort_columns = columns;
+    }
+    if let Some(columns) = columns("ARROWCOL_LAYOUT_BLOOM_COLUMNS")? {
+        policy.bloom_columns = columns;
+    }
+    for (name, value) in [
+        ("ARROWCOL_LAYOUT_MAX_ROWS", &mut policy.max_rows),
+        ("ARROWCOL_LAYOUT_MAX_INPUT_BYTES", &mut policy.max_input_bytes),
+        ("ARROWCOL_LAYOUT_ROW_GROUP_ROWS", &mut policy.row_group_rows),
+        ("ARROWCOL_LAYOUT_PAGE_ROWS", &mut policy.page_rows),
+    ] {
+        match std::env::var(name) {
+            Ok(setting) => *value = setting.parse().with_context(|| format!("invalid {name}"))?,
+            Err(std::env::VarError::NotPresent) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    policy.validate(schema)?;
+    Ok(Some(policy))
+}
+
 fn azure_store(url: &Url) -> Result<object_store::azure::MicrosoftAzure> {
     Ok(object_store::azure::MicrosoftAzureBuilder::from_env()
         .with_url(url.as_str())
-        .with_use_azure_cli(true)
+        .with_credentials(Arc::new(crate::azure_cli::BoundedAzureCli::default()))
         .with_retry(object_store::RetryConfig {
             max_retries: 2,
             retry_timeout: Duration::from_secs(10),
-            ..Default::default()
+            backoff: object_store::BackoffConfig {
+                init_backoff: Duration::from_millis(100),
+                max_backoff: Duration::from_millis(250),
+                base: 2.0,
+            },
         })
         .with_client_options(object_store::ClientOptions::new().with_timeout(Duration::from_secs(10)))
         .build()?)
@@ -68,6 +107,13 @@ pub struct StorageAuthority {
 }
 
 impl StorageAuthority {
+    /// Captured cloud reset epoch, to bind durable routing before receipt admission.
+    /// Local storage has no cloud reset epoch.
+    #[must_use]
+    pub fn generation(&self) -> Option<&str> {
+        self.fence.as_ref().map(|fence| fence.generation())
+    }
+
     /// Capture the current owned, ready reset generation.
     ///
     /// # Errors
@@ -805,6 +851,54 @@ struct LogFingerprint {
 
 pub(crate) struct DurableCommitter;
 
+struct GuardedCommitter {
+    authority: Option<Arc<crate::azure_fence::AzureResetFence>>,
+    bootstrap: bool,
+}
+
+impl Committer for GuardedCommitter {
+    fn commit(
+        &self,
+        engine: &dyn Engine,
+        actions: DeltaResultIterator<'_, FilteredEngineData>,
+        metadata: CommitMetadata,
+    ) -> DeltaResult<CommitResponse> {
+        let mut prepared = Vec::new();
+        let mut bytes = 0_usize;
+        for action in actions {
+            let batch = action?.apply_selection_vector()?.try_into_record_batch()?;
+            bytes = bytes
+                .checked_add(batch.get_array_memory_size())
+                .ok_or_else(|| delta_kernel::Error::generic("commit payload size overflow"))?;
+            if bytes > 8 * 1024 * 1024 {
+                return Err(delta_kernel::Error::generic(
+                    "commit action payload exceeds 8 MiB admission bound",
+                ));
+            }
+            prepared.push(Ok(FilteredEngineData::with_all_rows_selected(Box::new(
+                ArrowEngineData::new(batch),
+            ))));
+        }
+        if let Some(authority) = &self.authority {
+            let authority = Arc::clone(authority);
+            let bootstrap = self.bootstrap;
+            shared_executor()
+                .map_err(|error| delta_kernel::Error::generic(error.to_string()))?
+                .block_on(async move { authority.check_mode(bootstrap).await })
+                .map_err(|error| delta_kernel::Error::generic(error.to_string()))?;
+        }
+        DurableCommitter.commit(engine, Box::new(prepared.into_iter()), metadata)
+    }
+
+    fn is_catalog_committer(&self) -> bool {
+        false
+    }
+
+    fn publish(&self, engine: &dyn Engine, metadata: PublishMetadata) -> DeltaResult<()> {
+        DurableCommitter.publish(engine, metadata)
+    }
+}
+
 impl Committer for DurableCommitter {
     fn commit(
         &self,
@@ -856,6 +950,12 @@ fn committed<S>(result: CommitResult<S>) -> Result<u64> {
 }
 
 impl DeltaTable {
+    pub(crate) fn committer(&self) -> Box<dyn Committer> {
+        Box::new(GuardedCommitter {
+            authority: self.reset_fence.clone(),
+            bootstrap: self.bootstrap_only,
+        })
+    }
     /// Open a local or ADLS table without taking the collector's lifetime ownership lock.
     /// Atomic log creation coordinates independent processes; callers own their WAL fencing.
     ///
@@ -1006,6 +1106,7 @@ impl DeltaTable {
             .map(|batch| batch.and_then(|batch| batch.apply_selection_vector()))
             .collect::<DeltaResult<Vec<_>>>()?;
         let location = writer.checkpoint_path()?;
+        self.check_publication()?;
         self.engine
             .parquet_handler()
             .write_parquet_file(location.clone(), Box::new(data.into_iter().map(Ok)))?;
@@ -1083,6 +1184,7 @@ impl DeltaTable {
             .context("invalid staged path")?;
         let path = object_store::path::Path::from_url_path(self.staged_url(relative)?.path())?;
         let bytes = fs::read(&file.path)?;
+        self.check_publication()?;
         let store = Arc::clone(&self.store);
         shared_executor()?
             .block_on(async move { store.put_opts(&path, bytes.into(), PutMode::Create.into()).await })?;
@@ -1307,7 +1409,7 @@ impl DeltaTable {
                     self.partition_columns.clone(),
                 ));
             }
-            let transaction = builder.build(&self.engine, Box::new(DurableCommitter))?;
+            let transaction = builder.build(&self.engine, self.committer())?;
             match transaction.commit(&self.engine)? {
                 CommitResult::Committed(_) | CommitResult::Conflicted(_) => {}
                 CommitResult::Retryable(retry) => {
@@ -1354,7 +1456,7 @@ impl DeltaTable {
             for field in additions {
                 builder = builder.add_column(field);
             }
-            let transaction = builder.build(&self.engine, Box::new(DurableCommitter))?;
+            let transaction = builder.build(&self.engine, self.committer())?;
             committed(transaction.commit(&self.engine)?)?;
             return self.snapshot();
         }
@@ -1382,6 +1484,23 @@ impl DeltaTable {
         version: i64,
         stamp: i64,
     ) -> Result<DeltaFileWriter> {
+        let layout = configured_publication_layout(&normalize::schema(&input)?)?;
+        self.new_file_with_publication_and_layout(input, app_id, version, stamp, layout)
+    }
+
+    /// Create a replayable publication with explicit whole-file sorting controls.
+    /// `None` retains streaming encoding; a policy bounds the entire publication.
+    ///
+    /// # Errors
+    /// Rejects invalid identities, partitions, layout policies and file creation failures.
+    pub fn new_file_with_publication_and_layout(
+        self: &Arc<Self>,
+        input: SchemaRef,
+        app_id: String,
+        version: i64,
+        stamp: i64,
+        layout: Option<crate::layout::LayoutPolicy>,
+    ) -> Result<DeltaFileWriter> {
         let mut values = BTreeMap::new();
         let input = if self.partition_columns == [INGESTION_PARTITION] {
             values.insert(INGESTION_PARTITION.to_owned(), Some(ingestion_partition_value(stamp)?));
@@ -1397,9 +1516,16 @@ impl DeltaTable {
         } else {
             input
         };
-        self.new_file_partitioned_inner(input, values, None)?
-            .with_transaction(app_id, version)?
-            .with_ingestion_time(stamp)
+        let properties = layout
+            .as_ref()
+            .map(|policy| policy.writer_properties(&normalize::schema(&input)?))
+            .transpose()?;
+        let mut writer = self.new_file_partitioned_inner(input, values, properties)?;
+        if let Some(policy) = layout {
+            let physical = Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?);
+            writer.sorter = Some(crate::layout::FileSortBuffer::new(physical, policy)?);
+        }
+        writer.with_transaction(app_id, version)?.with_ingestion_time(stamp)
     }
 
     /// Bind one file to explicit string-valued Hive partitions.
@@ -1435,7 +1561,7 @@ impl DeltaTable {
     ) -> Result<DeltaFileWriter> {
         let snapshot = self.ensure_schema(normalize::schema(&input)?)?;
         let schema = Arc::new(snapshot.schema().as_ref().try_into_arrow()?);
-        let transaction = snapshot.transaction(Box::new(DurableCommitter), &self.engine)?;
+        let transaction = snapshot.transaction(self.committer(), &self.engine)?;
         let state = transaction.write_state()?;
         let mut builder = state.write_context_builder();
         if !values.is_empty() {
@@ -1473,6 +1599,9 @@ impl DeltaTable {
             publication: None,
             ingested_at_ms: None,
             partition_values: values,
+            sorter: None,
+            accepted_rows: 0,
+            accepted_input_bytes: 0,
         })
     }
 
@@ -1501,12 +1630,14 @@ impl DeltaTable {
     }
 
     fn commit_files_inner(&self, files: &[StagedAppend], identity: Option<(&str, i64)>) -> Result<u64> {
+        let mut observation = crate::telemetry::PublicationObservation::start();
         let _guard = self
             .commit_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("Delta commit lock poisoned"))?;
         let started = Instant::now();
         for attempt in 0..8 {
+            observation.event("attempt");
             self.check_publication()?;
             let snapshot = self.snapshot()?;
             Self::validate_retention(&snapshot)?;
@@ -1517,6 +1648,7 @@ impl DeltaTable {
                     bail!("publication transaction fenced by newer application version");
                 }
                 if previous == version {
+                    observation.finish("deduplicated");
                     return Ok(snapshot.version());
                 }
             }
@@ -1545,13 +1677,14 @@ impl DeltaTable {
                 pending.push(append);
             }
             if pending.is_empty() && identity.is_none() {
+                observation.finish("deduplicated");
                 return Ok(snapshot.version());
             }
             let read_version = snapshot.version();
             let proposed_version = read_version.checked_add(1).context("Delta version overflow")?;
             let canonical: arrow::datatypes::Schema = snapshot.schema().as_ref().try_into_arrow()?;
             let mut transaction = snapshot
-                .transaction(Box::new(DurableCommitter), &self.engine)?
+                .transaction(self.committer(), &self.engine)?
                 .with_operation("INSERT".into())
                 .with_engine_info("arrow-deltalake")
                 .with_data_change(true);
@@ -1595,26 +1728,65 @@ impl DeltaTable {
                     })
                     .map_err(anyhow::Error::new)?;
             }
+            let identifiable = identity.is_some() || pending.iter().all(|append| append.publication.is_some());
+            let reconcile = || -> Result<Option<u64>> {
+                let latest = self
+                    .snapshot()
+                    .context("unknown publication outcome; reconciliation failed")?;
+                Self::validate_retention(&latest)?;
+                let mut ids = pending
+                    .iter()
+                    .filter_map(|append| append.publication.as_ref().map(|(id, version)| (id.as_str(), *version)))
+                    .collect::<Vec<_>>();
+                if let Some(id) = identity {
+                    ids.push(id);
+                }
+                for (id, version) in ids {
+                    match latest.get_app_id_version(id, &self.engine)? {
+                        Some(previous) if previous > version => {
+                            bail!("publication transaction fenced by newer application version")
+                        }
+                        Some(previous) if previous == version => {}
+                        _ => return Ok(None),
+                    }
+                }
+                Ok(Some(latest.version()))
+            };
             match transaction.commit(&self.engine) {
                 Ok(CommitResult::Committed(commit)) => {
                     sync_directory(&self.root)?;
+                    observation.finish("committed");
                     return Ok(commit.commit_version());
                 }
-                Ok(CommitResult::Conflicted(_)) => {}
+                Ok(CommitResult::Conflicted(_)) => observation.event("conflict"),
                 Ok(CommitResult::Retryable(retry)) => {
+                    observation.event("retryable_io");
                     // Refresh/check every stable identity on the next iteration BEFORE
                     // resubmission. If refresh fails, the uncertain outcome stays an error.
-                    if identity.is_none() && pending.iter().any(|append| append.publication.is_none()) {
+                    if !identifiable {
                         bail!("uncertain publication without retry identity: {}", retry.error);
                     }
+                    if let Some(version) = reconcile()? {
+                        observation.finish("reconciled");
+                        return Ok(version);
+                    }
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    // Kernel can surface post-publication I/O as Err, not only Retryable.
+                    // A proven transaction is success; an unreadable outcome stays an error.
+                    if identifiable && let Some(version) = reconcile()? {
+                        observation.finish("reconciled");
+                        return Ok(version);
+                    }
+                    return Err(error.into());
+                }
             }
             if started.elapsed() > Duration::from_secs(10) {
                 break;
             }
             collision_backoff(attempt);
         }
+        observation.finish("exhausted");
         bail!("Delta publication collision/retry budget exhausted (8 attempts / 10 seconds)")
     }
 }
@@ -1630,6 +1802,9 @@ pub struct DeltaFileWriter {
     publication: Option<(String, i64)>,
     ingested_at_ms: Option<i64>,
     partition_values: BTreeMap<String, Option<String>>,
+    sorter: Option<crate::layout::FileSortBuffer>,
+    accepted_rows: usize,
+    accepted_input_bytes: u64,
 }
 
 /// Completed append, including the table version.
@@ -1698,13 +1873,13 @@ impl DeltaFileWriter {
     /// Rows accepted by successful writes to the current file.
     #[must_use]
     pub const fn rows_written(&self) -> usize {
-        self.parquet.rows_written()
+        self.accepted_rows
     }
 
     /// Logical bytes from caller-provided Arrow batches accepted by this file.
     #[must_use]
     pub const fn input_bytes_written(&self) -> u64 {
-        self.parquet.input_bytes_written()
+        self.accepted_input_bytes
     }
 
     async fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
@@ -1777,19 +1952,44 @@ impl DeltaFileWriter {
             Arc::clone(self.context.physical_data_schema()).into(),
         )?;
         let physical = evaluator.evaluate(&data)?.try_into_record_batch()?;
+        let rows = self
+            .accepted_rows
+            .checked_add(batch.num_rows())
+            .context("file row count overflow")?;
+        let bytes = self
+            .accepted_input_bytes
+            .checked_add(input_bytes)
+            .context("file input byte count overflow")?;
         self.stats.merge(&physical)?;
-        self.parquet
-            .write_accounted(&physical, batch.num_rows(), input_bytes)
-            .await
+        if let Some(sorter) = &mut self.sorter {
+            if !sorter.try_push(&physical)? {
+                bail!(
+                    "publication exceeds sorted-file budget; split upstream into independently identified publications"
+                );
+            }
+        } else {
+            self.parquet
+                .write_accounted(&physical, batch.num_rows(), input_bytes)
+                .await?;
+        }
+        self.accepted_rows = rows;
+        self.accepted_input_bytes = bytes;
+        Ok(())
     }
 
     /// Finalize and synchronize Parquet without publishing it.
     ///
     /// # Errors
     /// Returns close, synchronization, or statistics errors.
-    pub async fn stage(self) -> Result<StagedAppend> {
+    pub async fn stage(mut self) -> Result<StagedAppend> {
         if self.failed {
             bail!("Delta file previously failed; refusing to commit its partial data");
+        }
+        if let Some(sorter) = self.sorter.take() {
+            let sorted = sorter.finish()?;
+            self.parquet
+                .write_accounted(&sorted, self.accepted_rows, self.accepted_input_bytes)
+                .await?;
         }
         let file = self.parquet.finish().await?;
         let stats = self.stats.finish()?.context("cannot commit an empty Delta file")?;

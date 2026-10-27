@@ -307,6 +307,7 @@ struct FakeSink {
     behavior: Mutex<VecDeque<SinkBehavior>>,
     leases: Mutex<HashMap<arrowcol_protocol::TableIdentity, TableLease>>,
     reasons: Arc<AsyncMutex<Vec<FlushReason>>>,
+    publications: AsyncMutex<Vec<(ReceiptId, UnixMillis)>>,
     expected_array: Mutex<Option<ArrayRef>>,
     zero_copy_seen: Arc<AtomicU8>,
     version: Arc<AtomicU64>,
@@ -318,6 +319,7 @@ impl FakeSink {
             behavior: Mutex::new(VecDeque::new()),
             leases: Mutex::new(HashMap::new()),
             reasons: Arc::new(AsyncMutex::new(Vec::new())),
+            publications: AsyncMutex::new(Vec::new()),
             expected_array: Mutex::new(None),
             zero_copy_seen: Arc::new(AtomicU8::new(0)),
             version: Arc::new(AtomicU64::new(0)),
@@ -359,6 +361,10 @@ impl PublicationSink for FakeSink {
 
     async fn begin(&self, context: PublicationContext) -> Result<Box<dyn PublicationSession>, SinkError> {
         self.reasons.lock().await.push(context.flush_reason);
+        self.publications
+            .lock()
+            .await
+            .push((context.receipt_id, context.ingested_at_ms));
         let behavior = self
             .behavior
             .lock()
@@ -544,7 +550,7 @@ async fn lease_refresh_cannot_rebind_queued_work_to_new_ownership() -> anyhow::R
 }
 
 #[tokio::test]
-async fn retains_arrow_arrays_by_reference_and_groups_receipts() -> anyhow::Result<()> {
+async fn retains_arrow_arrays_by_reference_and_keeps_publications_independent() -> anyhow::Result<()> {
     let validation = validation("zero_copy").await?;
     let lease = lease(validation.registered().identity())?;
     let receipts = Arc::new(FakeReceipts::default());
@@ -560,9 +566,60 @@ async fn retains_arrow_arrays_by_reference_and_groups_receipts() -> anyhow::Resu
 
     assert_eq!(sink.zero_copy_seen.load(Ordering::Acquire), 1);
     let publications = receipts.publications.lock().await;
-    assert_eq!(publications.len(), 1);
-    assert_eq!(publications[0].len(), 2);
+    assert_eq!(publications.len(), 2);
+    assert!(publications.iter().all(|publication| publication.len() == 1));
     assert_eq!(manager.pressure()?.global.bytes, 0);
+    Ok(())
+}
+
+/// Scenario: Identical payloads arrive independently, then one publication is
+/// recovered with a different flush boundary.
+/// Guarantees: Only the recovered receipt reuses its identity and original UTC
+/// stamp; equal payload bytes never merge two independent submissions.
+#[tokio::test]
+async fn replay_preserves_receipt_identity_and_ingestion_stamp_across_regrouping() -> anyhow::Result<()> {
+    let validation = validation("stable_publications").await?;
+    let lease = lease(validation.registered().identity())?;
+    let receipts = Arc::new(FakeReceipts::default());
+    let sink = FakeSink::succeeding();
+    let manager = manager(config_large(), Arc::clone(&receipts), Arc::clone(&sink))?;
+    let (first, _) = admission(&validation, &lease, &[7, 7], &receipts).await?;
+    let (second, _) = admission(&validation, &lease, &[7, 7], &receipts).await?;
+    let first_id = first.receipt.receipt_id;
+    let second_id = second.receipt.receipt_id;
+    let stamp = UnixMillis::new(1_700_000_012_345)?;
+    let next_stamp = UnixMillis::new(stamp.get() + 60_000)?;
+    let mut replay = Admission {
+        receipt: first.receipt,
+        delivery: first.delivery.clone(),
+        lease: first.lease.clone(),
+        batches: first.batches.clone(),
+    };
+    manager
+        .admit_tracked_at(first, arrowcol_buffer::TrackedState::Accepted, stamp)
+        .await?;
+    manager
+        .admit_tracked_at(second, arrowcol_buffer::TrackedState::Accepted, next_stamp)
+        .await?;
+    manager.drain().await?;
+    {
+        let mut records = receipts.records.lock().await;
+        let record = records
+            .get_mut(&first_id)
+            .ok_or_else(|| anyhow::anyhow!("first receipt missing"))?;
+        record.state = ReceiptState::Publishing;
+        replay.receipt = ReceiptVersion::new(first_id, record.revision);
+    }
+    manager
+        .admit_tracked_at(replay, arrowcol_buffer::TrackedState::Flushing, stamp)
+        .await?;
+    manager.drain().await?;
+    assert_ne!(first_id, second_id);
+    assert_eq!(
+        sink.publications.lock().await.as_slice(),
+        [(first_id, stamp), (second_id, next_stamp), (first_id, stamp)]
+    );
+    manager.shutdown().await?;
     Ok(())
 }
 
@@ -1165,6 +1222,7 @@ async fn quiver_stage_replays_and_adopts_receipts_after_crash() -> anyhow::Resul
     let successor_lease = lease(validation.registered().identity())?;
     let receipts = Arc::new(FakeReceipts::default());
     let directory = tempfile::tempdir()?;
+    let admitted_before = now()?;
     let mut ids = Vec::new();
     {
         let sink = FakeSink::succeeding();
@@ -1177,6 +1235,8 @@ async fn quiver_stage_replays_and_adopts_receipts_after_crash() -> anyhow::Resul
         }
         // Crash: the consumer never ran and the open segment was never finalized.
     }
+    let crashed_at = now()?;
+    tokio::time::sleep(Duration::from_millis(5)).await;
 
     let sink = FakeSink::succeeding();
     let manager = manager(quick_flush_config(), Arc::clone(&receipts), Arc::clone(&sink))?;
@@ -1193,6 +1253,15 @@ async fn quiver_stage_replays_and_adopts_receipts_after_crash() -> anyhow::Resul
     let snapshot = successor.snapshot();
     assert_eq!(snapshot.recovered_bundles, 2);
     assert_eq!(snapshot.adopted_receipts, 2);
+    let publications = sink.publications.lock().await;
+    assert_eq!(publications.len(), 2);
+    assert!(
+        publications.iter().all(|(id, stamp)| {
+            ids.contains(id) && stamp.get() >= admitted_before.get() && stamp.get() <= crashed_at.get()
+        }),
+        "crash replay must preserve the persisted admission time, not the replay clock"
+    );
+    drop(publications);
     successor.shutdown().await;
     manager.shutdown().await?;
     Ok(())
@@ -1233,6 +1302,165 @@ async fn quiver_stage_acknowledges_already_published_replay_without_republishing
     );
     successor.shutdown().await;
     manager.shutdown().await?;
+    Ok(())
+}
+
+struct RecordingDeltaSink {
+    inner: arrowcol_buffer::DeltaPublicationSink,
+    seen: Arc<AsyncMutex<Vec<(ReceiptId, UnixMillis)>>>,
+}
+
+#[async_trait]
+impl PublicationSink for RecordingDeltaSink {
+    async fn begin(&self, context: PublicationContext) -> Result<Box<dyn PublicationSession>, SinkError> {
+        self.seen
+            .lock()
+            .await
+            .push((context.receipt_id, context.ingested_at_ms));
+        self.inner.begin(context).await
+    }
+}
+
+/// Scenario: Delta committed a persisted publication, but the process died
+/// before recording SQL completion or releasing its Quiver bundle.
+/// Guarantees: Reopening the actual log and bundle preserves receipt and stamp,
+/// skips the committed transaction, and retains independent identical input.
+#[tokio::test]
+async fn quiver_replays_after_delta_log_commit_before_bundle_release() -> anyhow::Result<()> {
+    use arrow_deltalake::commit::{BatchedTable, CommitOptions};
+    use arrowcol_buffer::{
+        DELIVERY_MANIFEST_FORMAT, DELIVERY_MANIFEST_VERSION, DELTA_SUBSCRIBER, DeliveryBundle, DeliveryManifest,
+        DeltaPublicationSink,
+    };
+    use otel_arrow_dfe_quiver::QuiverEngineBuilder;
+    use otel_arrow_dfe_quiver::subscriber::SubscriberId;
+
+    let validation = validation("quiver_log_crash").await?;
+    let predecessor = lease(validation.registered().identity())?;
+    let successor = lease(validation.registered().identity())?;
+    let receipts = Arc::new(FakeReceipts::default());
+    let (original, _) = admission(&validation, &predecessor, &[7, 7], &receipts).await?;
+    let id = original.receipt.receipt_id;
+    let stamp = UnixMillis::new(1_700_000_012_345)?;
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().join("delta");
+    let spool = directory.path().join("quiver");
+    let manifest = DeliveryManifest {
+        format: DELIVERY_MANIFEST_FORMAT.to_owned(),
+        version: DELIVERY_MANIFEST_VERSION,
+        receipt_id: id,
+        ingested_at_ms: Some(stamp),
+        receipt_revision: original.receipt.revision,
+        owner_instance_id: predecessor.holder_instance_id(),
+        lease_id: predecessor.lease_id(),
+        fencing_token: predecessor.fencing_token().get(),
+        table_id: original.delivery.table_id(),
+        table: original.delivery.table().clone(),
+        schema_version: original.delivery.schema_version(),
+        schema_fingerprint: original.delivery.schema_fingerprint(),
+        rows: original.delivery.rows().get(),
+        batches: original.delivery.batches().get(),
+        arrow_memory_bytes: original.delivery.arrow_memory_bytes().get(),
+    };
+    {
+        let engine = QuiverEngineBuilder::new(quiver_config(&spool).quiver_config())
+            .build()
+            .await?;
+        let subscriber = SubscriberId::new(DELTA_SUBSCRIBER)?;
+        engine.register_subscriber(subscriber.clone())?;
+        engine.activate_subscriber(&subscriber)?;
+        engine
+            .ingest(&DeliveryBundle::new(&manifest, original.batches[0].clone())?)
+            .await?;
+        let table = BatchedTable::open(&root, CommitOptions::default()).await?;
+        let sink = DeltaPublicationSink::new(
+            table,
+            manifest.table.clone(),
+            manifest.schema_fingerprint,
+            predecessor.publication_fence(),
+        );
+        let mut session = sink
+            .begin(PublicationContext {
+                receipt_id: id,
+                ingested_at_ms: stamp,
+                table: manifest.table.clone(),
+                schema_version: manifest.schema_version,
+                schema_fingerprint: manifest.schema_fingerprint,
+                arrow_schema: original.batches[0].schema(),
+                fence: predecessor.publication_fence(),
+                flush_reason: FlushReason::ExplicitDrain,
+            })
+            .await?;
+        session.write(&original.batches[0]).await?;
+        session.finish().await?;
+        let mut records = receipts.records.lock().await;
+        let record = records.get_mut(&id).ok_or_else(|| anyhow::anyhow!("receipt missing"))?;
+        record.state = ReceiptState::Publishing;
+        record.revision = 2;
+        drop(records);
+        // No SQL publish or subscriber acknowledgement follows the log commit.
+        engine.shutdown().await?;
+    }
+    let table = BatchedTable::open(&root, CommitOptions::default()).await?;
+    let seen = Arc::new(AsyncMutex::new(Vec::new()));
+    let sink: Arc<dyn PublicationSink> = Arc::new(RecordingDeltaSink {
+        inner: DeltaPublicationSink::new(
+            table,
+            manifest.table.clone(),
+            manifest.schema_fingerprint,
+            successor.publication_fence(),
+        ),
+        seen: Arc::clone(&seen),
+    });
+    let buffer = BufferManager::new(quick_flush_config(), Arc::<FakeReceipts>::clone(&receipts), sink)?;
+    let stage = open_stage(&spool, &buffer, &receipts, &successor).await?;
+    assert_eq!(stage.snapshot().backlog_bundles, 1);
+    stage.start();
+    wait_for_published(&receipts, &[id]).await?;
+    wait_for_empty_backlog(&stage).await?;
+    assert_eq!(seen.lock().await.as_slice(), [(id, stamp)]);
+    let (independent, _) = admission(&validation, &successor, &[7, 7], &receipts).await?;
+    let independent_id = independent.receipt.receipt_id;
+    assert_ne!(id, independent_id);
+    persist(&stage, &independent, &successor).await?;
+    wait_for_published(&receipts, &[independent_id]).await?;
+    wait_for_empty_backlog(&stage).await?;
+    stage.shutdown().await;
+    buffer.shutdown().await?;
+    let mut adds = 0;
+    let mut transactions = Vec::new();
+    for entry in std::fs::read_dir(root.join("_delta_log"))? {
+        let path = entry?.path();
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        for line in std::fs::read_to_string(path)?.lines() {
+            let action: serde_json::Value = serde_json::from_str(line)?;
+            adds += usize::from(action.get("add").is_some());
+            if let Some(app_id) = action
+                .get("txn")
+                .and_then(|txn| txn.get("appId"))
+                .and_then(|id| id.as_str())
+            {
+                transactions.push(app_id.to_owned());
+            }
+        }
+    }
+    assert_eq!(adds, 2, "committed replay skipped; independent equal payload retained");
+    assert_eq!(
+        transactions
+            .iter()
+            .filter(|app| *app == &format!("arrowcol.publication.{id}"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        transactions
+            .iter()
+            .filter(|app| *app == &format!("arrowcol.publication.{independent_id}"))
+            .count(),
+        1
+    );
     Ok(())
 }
 

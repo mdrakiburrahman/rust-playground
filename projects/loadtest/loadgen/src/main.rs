@@ -9,6 +9,7 @@ async fn main() -> Result<()> {
         Command::Run(arguments) => runner::run(*arguments).await,
         Command::Validate(arguments) => validation::validate(arguments).await,
         Command::InitializeAzure(arguments) => arrowcol_loadgen::initialize::initialize(arguments).await,
+        Command::AzureManifest(arguments) => arrowcol_loadgen::initialize::write_manifest(arguments).await,
         Command::PrintSchemas => {
             print!("{}", arrowcol_loadgen::schema::schema_ddl());
             Ok(())

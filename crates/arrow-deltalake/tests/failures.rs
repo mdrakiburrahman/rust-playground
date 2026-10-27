@@ -19,6 +19,7 @@ use std::sync::{
 enum Fault {
     Conflict,
     Uncertain,
+    UncertainUnreadable,
     ObserveReads,
 }
 
@@ -50,7 +51,7 @@ impl ObjectStore for FaultStore {
                         source: Box::new(std::io::Error::other("injected external commit conflict")),
                     });
                 }
-                Fault::Uncertain => {
+                Fault::Uncertain | Fault::UncertainUnreadable => {
                     self.inner.put_opts(path, payload, options).await?;
                     return Err(object_store::Error::Generic {
                         store: "fault_store",
@@ -72,6 +73,15 @@ impl ObjectStore for FaultStore {
     }
 
     async fn get_opts(&self, path: &Path, options: GetOptions) -> object_store::Result<GetResult> {
+        if matches!(self.fault, Fault::UncertainUnreadable)
+            && self.attempts.load(Ordering::SeqCst) != 0
+            && path.as_ref().ends_with("00000000000000000001.json")
+        {
+            return Err(object_store::Error::Generic {
+                store: "fault_store",
+                source: Box::new(std::io::Error::other("injected reconciliation read failure")),
+            });
+        }
         if matches!(self.fault, Fault::ObserveReads) && !options.head {
             self.reads.fetch_add(1, Ordering::SeqCst);
             let active = self.active_reads.fetch_add(1, Ordering::SeqCst) + 1;
@@ -127,16 +137,19 @@ async fn failed_append(fault: Fault) -> Result<()> {
     file.write(&input).await?;
     let result = file.finish().await;
     assert!(result.is_err());
-    assert_eq!(store.attempts.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        store.attempts.load(Ordering::Relaxed),
+        if matches!(fault, Fault::Conflict) { 8 } else { 1 }
+    );
     assert!(!directory.path().join("_delta_log/00000000000000000002.json").exists());
     assert_eq!(table.version()?, if matches!(fault, Fault::Uncertain) { 1 } else { 0 });
     Ok(())
 }
 
 /// Scenario: an external writer wins the versioned log's atomic creation.
-/// Guarantees: Kernel conflict is surfaced and no append is silently replayed.
+/// Guarantees: eight CAS attempts exhaust visibly without overwriting an external publication.
 #[tokio::test]
-async fn commit_conflict_is_not_retried() -> Result<()> {
+async fn commit_conflict_exhausts_bounded_retry_budget() -> Result<()> {
     failed_append(Fault::Conflict).await
 }
 
@@ -145,6 +158,52 @@ async fn commit_conflict_is_not_retried() -> Result<()> {
 #[tokio::test]
 async fn uncertain_published_commit_is_not_replayed() -> Result<()> {
     failed_append(Fault::Uncertain).await
+}
+
+/// Scenario: storage publishes a stable transaction but loses its success response.
+/// Guarantees: replay discovers that identity and never submits a duplicate log version.
+#[tokio::test]
+async fn identified_unknown_success_reconciles_before_retry() -> Result<()> {
+    identified_unknown_success(Fault::Uncertain, true).await
+}
+
+/// Scenario: publication may have succeeded but its transaction cannot be read back.
+/// Guarantees: reconciliation failure stops publication instead of guessing or retrying.
+#[tokio::test]
+async fn unidentified_outcome_after_reconciliation_failure_stops() -> Result<()> {
+    identified_unknown_success(Fault::UncertainUnreadable, false).await
+}
+
+async fn identified_unknown_success(fault: Fault, succeeds: bool) -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let store = Arc::new(FaultStore {
+        inner: LocalFileSystem::new(),
+        fault,
+        attempts: AtomicUsize::new(0),
+        reads: AtomicUsize::new(0),
+        active_reads: AtomicUsize::new(0),
+        peak_reads: AtomicUsize::new(0),
+    });
+    let table = DeltaTable::open_with_store(directory.path(), Arc::<FaultStore>::clone(&store))?;
+    let input = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+        vec![Arc::new(Int32Array::from(vec![1]))],
+    )?;
+    let mut file = table
+        .new_file(input.schema())?
+        .with_transaction("unknown-success".into(), 0)?;
+    file.write(&input).await?;
+    let result = file.finish().await;
+    assert_eq!(result.is_ok(), succeeds, "{result:?}");
+    assert_eq!(store.attempts.load(Ordering::SeqCst), 1);
+    assert!(!directory.path().join("_delta_log/00000000000000000002.json").exists());
+    let published = std::fs::read_to_string(directory.path().join("_delta_log/00000000000000000001.json"))?;
+    assert_eq!(published.lines().filter(|line| line.contains("\"add\":")).count(), 1);
+    if succeeds {
+        assert_eq!(table.lookup_txn("unknown-success")?, Some(0));
+        assert_eq!(table.version()?, 1);
+    }
+    Ok(())
 }
 
 /// Scenario: reopening a table must replay many commits before reaching its original metadata.

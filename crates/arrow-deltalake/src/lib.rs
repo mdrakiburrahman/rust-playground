@@ -12,6 +12,8 @@ use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "delta")]
+mod azure_cli;
+#[cfg(feature = "delta")]
 mod azure_fence;
 #[cfg(feature = "delta")]
 pub mod commit;
@@ -19,9 +21,14 @@ pub mod commit;
 pub mod delta;
 #[cfg(feature = "delta")]
 mod delta_io;
+pub mod layout;
+#[cfg(feature = "delta")]
+pub mod maintenance;
 #[cfg(feature = "delta")]
 pub mod normalize;
 pub mod sizing;
+#[cfg(feature = "delta")]
+pub mod telemetry;
 
 /// Stable size and row counters for one completed Parquet file.
 ///
