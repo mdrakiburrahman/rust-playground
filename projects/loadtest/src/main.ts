@@ -652,6 +652,7 @@ async function benchmark(
       quiver: options.quiver, loadEnded: loadEnded.signal, checkRunning: () => controller.checkRunning(),
       fixture: stressPlan.fixture, windowSeconds: stressPlan.durationSeconds,
       sampleTimeoutSeconds: stressPlan.sampleTimeoutSeconds, measureSeconds: options.measureSeconds,
+      privateScratch: path.join(workspace, 'projects/loadtest/.temp/loadgen/latest/diagnostics'),
       physicalRoots: Object.fromEntries([
         'direct', 'dataflow', 'tenant', 'tenant-checkpoints', 'direct-state-1', 'dataflow-state-1', 'router-state',
       ].map(name => [name, path.join(directory, name)]).concat([

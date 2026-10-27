@@ -6,8 +6,10 @@ import { LocalStressRuntime } from '../src/stress-runtime.js';
 
 for (const foreign of [true, false]) {
   test(`failed launcher ${foreign ? 'never stops a foreign' : 'stops only its positively owned'} maintenance container`, async t => {
-    const directory = mkdtempSync(path.resolve('projects/loadtest/test/.fixture-stress-runtime-'));
-    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    const owned = mkdtempSync(path.resolve('projects/loadtest/test/.fixture-stress-runtime-'));
+    t.after(() => rmSync(owned, { recursive: true, force: true }));
+    const directory = path.join(owned, 'benchmark');
+    mkdirSync(directory);
     mkdirSync(path.join(directory, 'results'));
     const reader = path.join(directory, 'reader');
     writeFileSync(reader, `#!${process.execPath}
@@ -45,6 +47,7 @@ else if (args[0] === 'stop') {
       quiver: false, physicalRoots: {}, loadEnded: new AbortController().signal, checkRunning: () => {},
       fixture: { batchRows: 2, rowGroupRows: 1, pageRows: 1 },
       windowSeconds: 9, sampleTimeoutSeconds: 1, measureSeconds: 30,
+      privateScratch: path.join(owned, 'private'),
     });
     await assert.rejects(runtime.operate(1, Date.now() + 10_000), error => {
       if (foreign) {

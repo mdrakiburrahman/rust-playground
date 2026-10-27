@@ -107,6 +107,15 @@ green. Docker CLI termination is not container termination: owned maintenance
 containers require the current runtime's ownership token and Compose identity
 before cleanup by immutable container ID. Stopped failures remain available for
 private Docker-log diagnosis; unverified containers are never stopped.
+Raw independent-reader stderr is retained only in an owned mode-0700 gitignored
+scratch directory outside `results`, with mode-0600 files. The public result
+tree retains fixed failure classes, not raw stderr or private diagnostic paths;
+a `.private.log` filename alone is not an artifact-publication boundary.
+Only the latest capture's final 64 KiB of stderr is retained, independently of
+the complete, untruncated JSON row oracle. This private custody lasts until the
+next ownership-checked load-generator scratch reset; preserve a needed failure
+privately before starting another run. Its bytes remain in staging accounting,
+without exporting its path.
 
 Physical accounting includes all files under the declared source, tenant,
 checkpoint, WAL, router-state, and generator-staging roots: JSON history,
