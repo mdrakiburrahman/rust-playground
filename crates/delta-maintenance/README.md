@@ -78,6 +78,10 @@ The `Dockerfile` installs the Azure CLI with the shared signed helper `infra/doc
 
 `AZURE_CONFIG_DIR=/var/lib/delta-maintenance-azure` is an empty 0700 directory owned by UID 10001. Runners should mount an isolated runtime directory over it. No credentials or config are baked into the image.
 
+`tini` is PID 1 so orphaned Azure CLI descendants are reaped.
+
+The `HEALTHCHECK` runs a bounded `curl` (3 s, 1 MiB) against the real Prometheus listener at `DELTA_MAINTENANCE_HEALTH_URL` (default `http://127.0.0.1:9467/metrics`). Only scheduled runs serve the listener, so one-shot runs never report healthy. Set the variable when using a different `--listen`.
+
 ## Nx
 
 ```bash

@@ -7,10 +7,17 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow_deltalake::delta::{
     DeltaTable, INGESTION_PARTITION, PURGE_WATERMARK, PublicationFence, PublicationFenceContext, PublicationFenceError,
 };
+use arrow_deltalake::layout::LayoutPolicy;
 use arrow_deltalake::maintenance::{
     DISPOSABLE_TEST_MARKER, Granularity, MaintenanceControl, MaintenanceErrorKind, MaintenancePlan, OptimizeConfig,
     Outcome, PurgeConfig, VacuumConfig, error_kind, now_ms,
 };
+use async_trait::async_trait;
+use delta_kernel::object_store::{
+    self, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, local::LocalFileSystem,
+};
+use futures::stream::BoxStream;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -683,5 +690,504 @@ fn vacuum_rejects_incomplete_history_and_unsafe_paths() -> Result<()> {
         kind(maintenance.plan_vacuum(&config)),
         Some(MaintenanceErrorKind::Unsupported)
     );
+    Ok(())
+}
+
+const DAY: i64 = 24 * 3_600_000;
+
+fn parquet_files(root: &Path, partition: &str) -> Result<usize> {
+    let directory = root.join(format!("{INGESTION_PARTITION}={partition}"));
+    Ok(fs::read_dir(directory)?
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|extension| extension == "parquet"))
+        .count())
+}
+
+/// Scenario: a PURGE plan applied after retention grew, and forged plan cutoffs/anchors.
+/// Guarantees: the cutoff is bound to the plan's recorded anchor/retention and is never
+/// later than the apply configuration allows; rejected plans remove nothing and never
+/// advance the purge watermark; the honest plan still applies.
+#[test]
+fn purge_plan_cutoff_is_bound_to_recorded_and_current_policy() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = create(root.path())?;
+    let mut all = Vec::new();
+    for index in 0..4 {
+        append(&table, index, index * 10..index * 10 + 3)?;
+        all.extend(expected(index * 10..index * 10 + 3, &minute(index)));
+    }
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let plan = maintenance.plan_purge(&purge_config())?;
+    assert_eq!(plan.cutoff_ms, BASE + 2 * MINUTE);
+    let version = maintenance.version()?;
+    let unchanged = |label: &str| -> Result<()> {
+        assert_eq!(maintenance.version()?, version, "{label}: version");
+        assert_eq!(maintenance.lookup_txn(PURGE_WATERMARK)?, None, "{label}: watermark");
+        assert_eq!(rows(root.path())?, sorted(all.clone()), "{label}: rows");
+        Ok(())
+    };
+
+    // Retention grew from 90 s to 150 s: the current cutoff is 00:01, so 00:01 is retained.
+    let longer = PurgeConfig::new(150_000, purge_config().anchor_ms, Granularity::Minute);
+    assert_eq!(
+        kind(maintenance.apply_purge(&plan, &longer, &control())),
+        Some(MaintenanceErrorKind::StalePlan)
+    );
+    unchanged("increased retention")?;
+
+    let mut forged = plan.clone();
+    forged.cutoff_ms = BASE + 3 * MINUTE;
+    assert_eq!(
+        kind(maintenance.apply_purge(&forged, &purge_config(), &control())),
+        Some(MaintenanceErrorKind::InvalidPlan)
+    );
+    unchanged("tampered cutoff")?;
+
+    // Internally consistent but shorter recorded retention: later than the config allows.
+    let mut shorter = plan.clone();
+    shorter.retention_ms = 30_000;
+    shorter.cutoff_ms = BASE + 3 * MINUTE;
+    assert_eq!(
+        kind(maintenance.apply_purge(&shorter, &purge_config(), &control())),
+        Some(MaintenanceErrorKind::StalePlan)
+    );
+    unchanged("forged shorter retention")?;
+
+    let mut future = plan.clone();
+    future.anchor_ms = now_ms()? + DAY;
+    future.cutoff_ms = Granularity::Minute.floor_ms(future.anchor_ms - future.retention_ms);
+    assert_eq!(
+        kind(maintenance.apply_purge(&future, &purge_config(), &control())),
+        Some(MaintenanceErrorKind::InvalidPlan)
+    );
+    let future_config = PurgeConfig::new(90_000, now_ms()? + DAY, Granularity::Minute);
+    assert_eq!(
+        kind(maintenance.plan_purge(&future_config)),
+        Some(MaintenanceErrorKind::InvalidPlan)
+    );
+    unchanged("future anchor")?;
+
+    let report = maintenance.apply_purge(&plan, &purge_config(), &control())?;
+    assert_eq!((report.outcome, report.files_removed), (Outcome::Committed, 2));
+    assert_eq!(maintenance.lookup_txn(PURGE_WATERMARK)?, Some(BASE + 2 * MINUTE));
+    Ok(())
+}
+
+/// Scenario: a short-retention VACUUM plan applied under a longer retention, and forged
+/// plan cutoff/retention/anchor values.
+/// Guarantees: only tombstones older than BOTH the plan's recorded cutoff and the current
+/// configuration's cutoff are deleted; every rejection happens before any delete.
+#[test]
+fn vacuum_plan_cutoff_is_bound_to_recorded_and_current_policy() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = create(root.path())?;
+    append(&table, 0, 0..2)?;
+    append(&table, 0, 5..7)?;
+    append(&table, 1, 10..12)?;
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let optimize = maintenance.plan_optimize(&optimize_config())?;
+    maintenance.apply_optimize(&optimize, &optimize_config(), &control())?;
+    let tombstones: Vec<PathBuf> = optimize
+        .bins
+        .iter()
+        .flat_map(|bin| &bin.files)
+        .map(|file| data_path(root.path(), &file.path))
+        .collect::<Result<_>>()?;
+    assert_eq!(tombstones.len(), 2);
+    fs::write(root.path().join(DISPOSABLE_TEST_MARKER), b"")?;
+    let now = now_ms()? + 1_000;
+    let mut short = VacuumConfig::new(0, now);
+    short.unsafe_allow_short_retention_for_tests = true;
+    let plan = maintenance.plan_vacuum(&short)?;
+    assert_eq!((plan.candidates.len(), plan.now_ms, plan.cutoff_ms), (2, now, now));
+    let intact = |label: &str| {
+        for path in &tombstones {
+            assert!(path.exists(), "{label}: {} must not be deleted", path.display());
+        }
+    };
+
+    let longer = VacuumConfig {
+        retention_ms: 3_600_000,
+        ..short.clone()
+    };
+    assert_eq!(
+        kind(maintenance.apply_vacuum(&plan, &longer, &control())),
+        Some(MaintenanceErrorKind::StalePlan)
+    );
+    intact("changed retention");
+    assert_eq!(
+        kind(maintenance.apply_vacuum(&plan, &VacuumConfig::new(7 * DAY, now), &control())),
+        Some(MaintenanceErrorKind::UnsafeRequest),
+        "a short-retention plan needs the unsafe override at apply time too"
+    );
+    intact("seven-day configuration");
+
+    let mut forged = plan.clone();
+    forged.cutoff_ms += DAY;
+    assert_eq!(
+        kind(maintenance.apply_vacuum(&forged, &short, &control())),
+        Some(MaintenanceErrorKind::InvalidPlan)
+    );
+    let mut forged = plan.clone();
+    forged.retention_ms = 7 * DAY;
+    assert_eq!(
+        kind(maintenance.apply_vacuum(&forged, &short, &control())),
+        Some(MaintenanceErrorKind::InvalidPlan)
+    );
+    let mut forged = plan.clone();
+    forged.now_ms = now + 30 * DAY;
+    forged.retention_ms = 7 * DAY;
+    forged.cutoff_ms = forged.now_ms - forged.retention_ms;
+    assert_eq!(
+        kind(maintenance.apply_vacuum(&forged, &short, &control())),
+        Some(MaintenanceErrorKind::InvalidPlan)
+    );
+    let mut negative = plan.clone();
+    negative.now_ms = -1;
+    negative.cutoff_ms = -1;
+    assert_eq!(
+        kind(maintenance.apply_vacuum(&negative, &short, &control())),
+        Some(MaintenanceErrorKind::InvalidPlan)
+    );
+    assert_eq!(
+        kind(maintenance.plan_vacuum(&VacuumConfig::new(7 * DAY, now + 30 * DAY))),
+        Some(MaintenanceErrorKind::InvalidPlan)
+    );
+    intact("forged plan");
+
+    let report = maintenance.apply_vacuum(&plan, &short, &control())?;
+    assert_eq!((report.files_deleted, report.cutoff_ms), (2, Some(now)));
+    assert!(tombstones.iter().all(|path| !path.exists()));
+    Ok(())
+}
+
+fn tiny_layout(max_rows: usize) -> LayoutPolicy {
+    LayoutPolicy {
+        sort_columns: vec!["id".into()],
+        max_rows,
+        bloom_columns: Vec::new(),
+        ..LayoutPolicy::default()
+    }
+}
+
+/// Scenario: a constrained sorted layout whose actual outputs do not reduce the file count,
+/// then one whose actual outputs exceed the per-commit action budget.
+/// Guarantees: OPTIMIZE verifies actual outputs before the transaction, removes rejected
+/// rewrites, commits nothing when nothing is beneficial (version and rows unchanged) and
+/// commits only the bins that fit; sorting is never disabled to reach a reduction.
+#[test]
+fn optimize_verifies_actual_outputs_before_committing() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = create(root.path())?;
+    let mut all = Vec::new();
+    for index in 0..3 {
+        for part in 0..4 {
+            let ids = index * 100 + part * 10..index * 100 + part * 10 + 2;
+            append(&table, index, ids.clone())?;
+            all.extend(expected(ids, &minute(index)));
+        }
+    }
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let version = maintenance.version()?;
+
+    // max_rows 2 with 2-row inputs: four inputs always become four outputs.
+    let nonbeneficial = OptimizeConfig {
+        layout: Some(tiny_layout(2)),
+        ..optimize_config()
+    };
+    let plan = maintenance.plan_optimize(&nonbeneficial)?;
+    assert_eq!(plan.bins.len(), 2);
+    let report = maintenance.apply_optimize(&plan, &nonbeneficial, &control())?;
+    assert_eq!((report.outcome, report.nonbeneficial_bins), (Outcome::Noop, 2));
+    assert_eq!((report.files_removed, report.files_added), (0, 0));
+    assert_eq!(maintenance.version()?, version);
+    assert_eq!(rows(root.path())?, sorted(all.clone()));
+    for index in 0..3 {
+        assert_eq!(
+            parquet_files(root.path(), &minute(index))?,
+            4,
+            "rejected outputs removed"
+        );
+    }
+
+    // max_rows 5: four 2-row inputs become two outputs (estimated one), six actions per bin.
+    let budget = OptimizeConfig {
+        layout: Some(tiny_layout(5)),
+        max_actions_per_commit: 10,
+        ..optimize_config()
+    };
+    let plan = maintenance.plan_optimize(&budget)?;
+    assert_eq!(plan.bins.len(), 2);
+    let report = maintenance.apply_optimize(&plan, &budget, &control())?;
+    assert_eq!(report.outcome, Outcome::Committed);
+    assert_eq!(
+        (report.files_removed, report.files_added, report.backlog_files),
+        (4, 2, 4)
+    );
+    assert_eq!(maintenance.version()?, version + 1);
+    assert_eq!(rows(root.path())?, sorted(all.clone()));
+    let left = (0..2)
+        .map(|index| files_in(root.path(), &minute(index)))
+        .collect::<Result<Vec<_>>>()?;
+    assert!(left == vec![2, 4] || left == vec![4, 2], "{left:?}");
+
+    let single = OptimizeConfig {
+        max_actions_per_commit: 5,
+        ..budget
+    };
+    let plan = maintenance.plan_optimize(&single)?;
+    assert_eq!(plan.bins.len(), 1);
+    let report = maintenance.apply_optimize(&plan, &single, &control())?;
+    assert_eq!((report.outcome, report.backlog_files), (Outcome::Noop, 4));
+    assert_eq!(maintenance.version()?, version + 1);
+    assert_eq!(rows(root.path())?, sorted(all));
+    for (index, files) in (0..2).zip(&left) {
+        assert_eq!(
+            parquet_files(root.path(), &minute(index))?,
+            4 + 2 * usize::from(*files == 2),
+            "over-budget outputs removed"
+        );
+    }
+    Ok(())
+}
+
+fn customer_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("customer_id", DataType::Utf8, false),
+        Field::new("id", DataType::Int64, false),
+        Field::new(INGESTION_PARTITION, DataType::Utf8, false),
+    ]))
+}
+
+fn append_customers(table: &Arc<DeltaTable>, index: i64, customers: &[&str], first_id: i64) -> Result<()> {
+    let partition = minute(index);
+    let rows = customers.len();
+    let batch = RecordBatch::try_new(
+        customer_schema(),
+        vec![
+            Arc::new(StringArray::from(customers.to_vec())),
+            Arc::new(Int64Array::from_iter_values(first_id..first_id + rows as i64)),
+            Arc::new(StringArray::from(vec![partition.as_str(); rows])),
+        ],
+    )?;
+    run(async {
+        let mut file = table
+            .new_file_partitioned(
+                customer_schema(),
+                BTreeMap::from([(INGESTION_PARTITION.to_owned(), Some(partition.clone()))]),
+            )?
+            .with_ingestion_time(BASE + index * MINUTE + 1)?;
+        file.write(&batch).await?;
+        file.finish().await?;
+        Ok::<_, anyhow::Error>(())
+    })?
+}
+
+/// Scenario: a table with a `customer_id` column compacted with the default
+/// (unset) OPTIMIZE layout.
+/// Guarantees: the shared publication layout is used, so the compacted file is sorted
+/// by customer across the whole file rather than concatenated in input order.
+#[test]
+fn optimize_default_layout_preserves_whole_file_customer_order() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = DeltaTable::open_url(
+        url_of(root.path())?,
+        customer_schema(),
+        vec![INGESTION_PARTITION.into()],
+    )?;
+    append_customers(&table, 0, &["c5", "c1", "c9"], 0)?;
+    append_customers(&table, 0, &["c3", "c7", "c2"], 10)?;
+    append_customers(&table, 0, &["c8", "c0", "c4"], 20)?;
+    append_customers(&table, 1, &["c6"], 30)?;
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let config = optimize_config();
+    assert!(config.layout.is_none());
+    let plan = maintenance.plan_optimize(&config)?;
+    assert_eq!(plan.bins.len(), 1);
+    let report = maintenance.apply_optimize(&plan, &config, &control())?;
+    assert_eq!(
+        (report.outcome, report.files_added, report.rows_added),
+        (Outcome::Committed, 1, 9)
+    );
+    let outputs: Vec<String> = active_files(root.path())?
+        .into_iter()
+        .filter(|(_, partition)| *partition == minute(0))
+        .map(|(path, _)| path)
+        .collect();
+    assert_eq!(outputs.len(), 1);
+    let reader =
+        ParquetRecordBatchReaderBuilder::try_new(fs::File::open(data_path(root.path(), &outputs[0])?)?)?.build()?;
+    let mut pairs = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+        let customers = arrow::compute::cast(
+            batch.column_by_name("customer_id").context("customer")?,
+            &DataType::Utf8,
+        )?;
+        let customers = customers.as_any().downcast_ref::<StringArray>().context("customers")?;
+        let ids = batch.column_by_name("id").context("id")?;
+        let ids = ids.as_any().downcast_ref::<Int64Array>().context("ids")?;
+        for row in 0..batch.num_rows() {
+            pairs.push((customers.value(row).to_owned(), ids.value(row)));
+        }
+    }
+    let order: Vec<&str> = pairs.iter().map(|(customer, _)| customer.as_str()).collect();
+    assert_eq!(order, ["c0", "c1", "c2", "c3", "c4", "c5", "c7", "c8", "c9"]);
+    let mut ids: Vec<i64> = pairs.iter().map(|(_, id)| *id).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, [0, 1, 2, 10, 11, 12, 20, 21, 22]);
+    Ok(())
+}
+
+/// Commit-log fault injection for maintenance publication.
+#[derive(Debug)]
+struct UncertainStore {
+    inner: LocalFileSystem,
+    target: String,
+    unreadable: AtomicBool,
+    attempts: AtomicUsize,
+}
+
+impl std::fmt::Display for UncertainStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "uncertain-commit store")
+    }
+}
+
+#[async_trait]
+impl ObjectStore for UncertainStore {
+    async fn put_opts(
+        &self,
+        path: &object_store::path::Path,
+        payload: PutPayload,
+        options: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        if path.as_ref().ends_with(&self.target) {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            self.inner.put_opts(path, payload, options).await?;
+            return Err(object_store::Error::Generic {
+                store: "uncertain_store",
+                source: Box::new(std::io::Error::other("injected failure after publishing the log")),
+            });
+        }
+        self.inner.put_opts(path, payload, options).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        path: &object_store::path::Path,
+        options: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(path, options).await
+    }
+
+    async fn get_opts(&self, path: &object_store::path::Path, options: GetOptions) -> object_store::Result<GetResult> {
+        if self.unreadable.load(Ordering::SeqCst)
+            && self.attempts.load(Ordering::SeqCst) != 0
+            && path.as_ref().ends_with(&self.target)
+        {
+            return Err(object_store::Error::Generic {
+                store: "uncertain_store",
+                source: Box::new(std::io::Error::other("injected reconciliation read failure")),
+            });
+        }
+        self.inner.get_opts(path, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        paths: BoxStream<'static, object_store::Result<object_store::path::Path>>,
+    ) -> BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(paths)
+    }
+
+    fn list(&self, prefix: Option<&object_store::path::Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&object_store::path::Path>) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+
+    async fn rename_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: RenameOptions,
+    ) -> object_store::Result<()> {
+        self.inner.rename_opts(from, to, options).await
+    }
+}
+
+/// Scenario: the commit-log write succeeds but the store reports an error, once with a
+/// readable log (reconcilable) and once with the new commit unreadable during reconciliation.
+/// Guarantees: an uncertain OPTIMIZE publication never deletes its rewrite outputs;
+/// a visible plan id resolves as applied, an unreadable outcome returns an explicit
+/// uncertain error with every output retained, and no row is lost or duplicated.
+#[test]
+fn optimize_uncertain_commit_never_discards_outputs() -> Result<()> {
+    for unreadable in [false, true] {
+        let root = tempfile::tempdir()?;
+        let table = create(root.path())?;
+        let mut all = Vec::new();
+        for (index, ids) in [(0, 0..3), (0, 10..13), (1, 20..23)] {
+            append(&table, index, ids.clone())?;
+            all.extend(expected(ids, &minute(index)));
+        }
+        let target = format!("{:020}.json", table.version()? + 1);
+        drop(table);
+        let store = Arc::new(UncertainStore {
+            inner: LocalFileSystem::new(),
+            target,
+            unreadable: AtomicBool::new(unreadable),
+            attempts: AtomicUsize::new(0),
+        });
+        let maintenance = DeltaTable::open_with_store(root.path(), Arc::clone(&store) as Arc<dyn ObjectStore>)?;
+        let plan = maintenance.plan_optimize(&optimize_config())?;
+        assert_eq!(plan.bins.len(), 1);
+        let result = maintenance.apply_optimize(&plan, &optimize_config(), &control());
+        assert!(store.attempts.load(Ordering::SeqCst) >= 1);
+        if unreadable {
+            let error = result.err().context("unreadable outcome must not report success")?;
+            assert_eq!(error_kind(&error), Some(MaintenanceErrorKind::Uncertain), "{error:#}");
+            assert!(format!("{error:#}").contains("outputs retained"), "{error:#}");
+            store.unreadable.store(false, Ordering::SeqCst);
+        } else {
+            let report = result?;
+            assert!(
+                matches!(report.outcome, Outcome::Committed | Outcome::AlreadyApplied),
+                "{report:?}"
+            );
+        }
+        assert_eq!(
+            parquet_files(root.path(), &minute(0))?,
+            3,
+            "output retained beside inputs"
+        );
+        let active = active_files(root.path())?;
+        assert_eq!(active.values().filter(|partition| **partition == minute(0)).count(), 1);
+        for relative in active.keys() {
+            assert!(
+                data_path(root.path(), relative)?.exists(),
+                "{relative} is active and present"
+            );
+        }
+        assert_eq!(rows(root.path())?, sorted(all));
+        assert_eq!(
+            maintenance
+                .apply_optimize(&plan, &optimize_config(), &control())?
+                .outcome,
+            Outcome::AlreadyApplied
+        );
+    }
     Ok(())
 }

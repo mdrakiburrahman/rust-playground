@@ -39,7 +39,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use url::Url;
 
 /// Serialized plan format understood by this build.
-pub const PLAN_FORMAT: u32 = 1;
+pub const PLAN_FORMAT: u32 = 2;
+/// Tolerated clock skew for explicit retention anchors.
+pub const MAX_ANCHOR_SKEW_MS: i64 = 5 * 60_000;
 /// Reserved application-transaction namespace for idempotent maintenance plans.
 /// Collector writers reject every `arrowcol.purge*` identity.
 pub const PLAN_APP_PREFIX: &str = "arrowcol.purge.plan.";
@@ -193,6 +195,17 @@ pub fn now_ms() -> Result<i64> {
     Ok(i64::try_from(
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
     )?)
+}
+
+/// Reject negative anchors and anchors beyond the wall clock plus skew.
+fn validate_anchor(name: &str, anchor_ms: i64) -> Result<()> {
+    if anchor_ms < 0 || anchor_ms > now_ms()?.saturating_add(MAX_ANCHOR_SKEW_MS) {
+        return Err(fail(
+            MaintenanceErrorKind::InvalidPlan,
+            format!("{name} anchor {anchor_ms} is negative or in the future"),
+        ));
+    }
+    Ok(())
 }
 
 /// UTC ingestion partition granularity (`ARROWCOL_PARTITION_GRANULARITY`).
@@ -791,6 +804,8 @@ pub struct MaintenanceReport {
     pub files_already_absent: u64,
     pub backlog_files: u64,
     pub skipped_partitions: u64,
+    /// OPTIMIZE bins whose actual rewrite would not reduce the file count.
+    pub nonbeneficial_bins: u64,
     pub interrupted: bool,
     pub outputs: Vec<String>,
 }
@@ -919,14 +934,12 @@ impl DeltaTable {
                 Ok(Some(published)) => return Ok(published),
                 Ok(None) => {}
                 Err(error) => {
-                    // A plan-id-fenced uncertain attempt is retried; a later
-                    // definitive error still never authorizes output cleanup.
                     if !uncertain {
-                        self.discard_outputs(outputs);
-                    } else {
-                        report.outputs = outputs.iter().map(|output| output.relative.clone()).collect();
+                        return Err(self.discard_after(outputs, error, report));
                     }
-                    return Err(error);
+                    // A raw commit error can follow actual publication: reconcile
+                    // by plan id and never clean up outputs blindly.
+                    return self.unknown_outcome(&app_id, outputs, report, &format!("{error:#}"));
                 }
             }
             if started.elapsed() > COMMIT_BUDGET {
@@ -935,34 +948,113 @@ impl DeltaTable {
             collision_backoff(attempt);
         }
         if uncertain {
-            report.outputs = outputs.iter().map(|output| output.relative.clone()).collect();
-            return Err(fail_with(
-                MaintenanceErrorKind::Uncertain,
-                "commit budget exhausted after an uncertain attempt; outputs retained",
+            return self.unknown_outcome(
+                &app_id,
+                outputs,
                 report,
-            ));
+                "commit budget exhausted after an uncertain attempt",
+            );
         }
-        self.discard_outputs(outputs);
-        Err(fail_with(
+        let error = fail_with(
             MaintenanceErrorKind::Exhausted,
             format!(
                 "maintenance commit budget exhausted ({MAX_COMMIT_ATTEMPTS} attempts / {}s)",
                 COMMIT_BUDGET.as_secs()
             ),
             report,
+        );
+        Err(self.discard_after(outputs, error, report))
+    }
+
+    /// Resolve an attempt whose publication may have happened. A visible plan id
+    /// means it was published; otherwise (or if the refresh fails) every output
+    /// is retained and the outcome is reported as unknown.
+    fn unknown_outcome(
+        &self,
+        app_id: &str,
+        outputs: &[StagedOutput],
+        report: &mut MaintenanceReport,
+        cause: &str,
+    ) -> Result<Published> {
+        let reconciled = self.snapshot().and_then(|snapshot| {
+            Ok(snapshot
+                .get_app_id_version(app_id, &self.engine)?
+                .map(|_| snapshot.version()))
+        });
+        if let Ok(Some(version)) = reconciled {
+            return Ok(Published::AlreadyApplied(version));
+        }
+        report.outputs = outputs.iter().map(|output| output.relative.clone()).collect();
+        let detail = match reconciled {
+            Ok(_) => "plan id not visible after refresh".to_owned(),
+            Err(error) => format!("reconciliation failed: {error:#}"),
+        };
+        Err(fail_with(
+            MaintenanceErrorKind::Uncertain,
+            format!("publication outcome unknown ({detail}); outputs retained: {cause}"),
+            report,
         ))
     }
 
-    /// Delete outputs that were definitively never published.
-    fn discard_outputs(&self, outputs: &[StagedOutput]) {
-        for output in outputs {
-            let _ = fs::remove_file(&output.local);
-            if output.uploaded
-                && let Ok(path) = object_store::path::Path::from_url_path(output.url.path())
-                && let Ok(executor) = shared_executor()
-            {
-                let store = Arc::clone(&self.store);
-                let _ = executor.block_on(async move { store.delete(&path).await });
+    /// Remove one output that was definitively never published. An authority
+    /// check precedes every table mutation; `NotFound` is success and every
+    /// other failure is returned.
+    fn discard_output(&self, local: &std::path::Path, url: &Url, uploaded: bool) -> Result<()> {
+        if self.url.scheme() == "file" {
+            self.check_publication()?;
+        }
+        match fs::remove_file(local) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(anyhow::Error::new(error).context(format!("remove {}", local.display()))),
+        }
+        if uploaded {
+            let path = object_store::path::Path::from_url_path(url.path())?;
+            self.check_publication()?;
+            let store = Arc::clone(&self.store);
+            match shared_executor()?.block_on(async move { store.delete(&path).await }) {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                Err(error) => return Err(anyhow::Error::new(error).context(format!("delete {url}"))),
+            }
+        }
+        Ok(())
+    }
+
+    /// Delete outputs that were definitively never published, collecting every failure.
+    fn discard_outputs(&self, outputs: &[StagedOutput]) -> std::result::Result<(), String> {
+        let failures: Vec<String> = outputs
+            .iter()
+            .filter_map(|output| {
+                self.discard_output(&output.local, &output.url, output.uploaded)
+                    .err()
+                    .map(|error| format!("{}: {error:#}", output.relative))
+            })
+            .collect();
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+
+    /// Clean up unpublished outputs after `error`. A cleanup failure keeps the
+    /// original error's kind and text, adds the cleanup failures and reports
+    /// the retained outputs.
+    fn discard_after(
+        &self,
+        outputs: &[StagedOutput],
+        error: anyhow::Error,
+        report: &mut MaintenanceReport,
+    ) -> anyhow::Error {
+        match self.discard_outputs(outputs) {
+            Ok(()) => error,
+            Err(cleanup) => {
+                report.outputs = outputs.iter().map(|output| output.relative.clone()).collect();
+                fail_with(
+                    error_kind(&error).unwrap_or(MaintenanceErrorKind::Uncertain),
+                    format!("{error:#}; cleanup of unpublished outputs failed (retained): {cleanup}"),
+                    report,
+                )
             }
         }
     }
@@ -1324,14 +1416,8 @@ impl DeltaTable {
             return Ok(report);
         }
         state.fingerprint.validate_supported(false)?;
-        let inputs: BTreeSet<String> = plan
-            .bins
-            .iter()
-            .flat_map(|bin| &bin.files)
-            .map(|file| file.path.clone())
-            .collect();
-        let still_active = |state: &ActiveState| -> Result<()> {
-            for file in plan.bins.iter().flat_map(|bin| &bin.files) {
+        let still_active = |state: &ActiveState, bins: &[&OptimizeBin]| -> Result<()> {
+            for file in bins.iter().flat_map(|bin| &bin.files) {
                 if state.file(&file.path).is_none_or(|active| active.size != file.size) {
                     return Err(fail(
                         MaintenanceErrorKind::StalePlan,
@@ -1341,39 +1427,65 @@ impl DeltaTable {
             }
             Ok(())
         };
-        still_active(&state)?;
+        still_active(&state, &plan.bins.iter().collect::<Vec<_>>())?;
         let mut outputs = Vec::new();
+        let mut kept: Vec<&OptimizeBin> = Vec::new();
+        let mut actions = 0_usize;
         for bin in &plan.bins {
-            let result = self.rewrite_bin(&state.snapshot, bin, config, control);
-            match result {
-                Ok(mut written) => outputs.append(&mut written),
-                Err(error) => {
-                    self.discard_outputs(&outputs);
-                    return Err(error);
-                }
+            let written = match self.rewrite_bin(&state.snapshot, bin, config, control) {
+                Ok(written) => written,
+                Err(error) => return Err(self.discard_after(&outputs, error, &mut report)),
+            };
+            let expected: Option<u64> = bin.files.iter().map(|file| file.rows).sum();
+            if expected.is_some_and(|rows| rows != written.iter().map(|output| output.rows).sum::<u64>()) {
+                outputs.extend(written);
+                let error = fail(
+                    MaintenanceErrorKind::StalePlan,
+                    "rewritten row count differs from input statistics",
+                );
+                return Err(self.discard_after(&outputs, error, &mut report));
             }
+            // Verify the actual outputs: never commit a rewrite that does not
+            // reduce the file count or that exceeds the per-commit action budget.
+            let cost = bin.files.len() + written.len();
+            let beneficial = written.len() < bin.files.len();
+            if !beneficial || actions + cost > config.max_actions_per_commit {
+                if beneficial {
+                    report.backlog_files += bin.files.len() as u64;
+                } else {
+                    report.nonbeneficial_bins += 1;
+                }
+                if let Err(cleanup) = self.discard_outputs(&written) {
+                    outputs.extend(written);
+                    let error = fail(
+                        MaintenanceErrorKind::Uncertain,
+                        format!("dropping an unpublishable rewrite failed: {cleanup}"),
+                    );
+                    return Err(self.discard_after(&outputs, error, &mut report));
+                }
+                continue;
+            }
+            actions += cost;
+            kept.push(bin);
+            outputs.extend(written);
         }
+        let inputs: BTreeSet<String> = kept
+            .iter()
+            .flat_map(|bin| &bin.files)
+            .map(|file| file.path.clone())
+            .collect();
+        report.files_removed = inputs.len() as u64;
+        report.rows_removed = kept
+            .iter()
+            .flat_map(|bin| &bin.files)
+            .filter_map(|file| file.rows)
+            .sum();
+        report.bytes_removed = kept.iter().flat_map(|bin| &bin.files).map(|file| file.size).sum();
         report.files_added = outputs.len() as u64;
         report.rows_added = outputs.iter().map(|output| output.rows).sum();
         report.bytes_added = outputs.iter().map(|output| output.bytes).sum();
-        if report.rows_added
-            != plan
-                .bins
-                .iter()
-                .flat_map(|bin| &bin.files)
-                .map(|file| file.rows.unwrap_or(0))
-                .sum::<u64>()
-            && plan
-                .bins
-                .iter()
-                .flat_map(|bin| &bin.files)
-                .all(|file| file.rows.is_some())
-        {
-            self.discard_outputs(&outputs);
-            return Err(fail(
-                MaintenanceErrorKind::StalePlan,
-                "rewritten row count differs from input statistics",
-            ));
+        if kept.is_empty() {
+            return Ok(report);
         }
         let published = self.publish(
             &plan.header,
@@ -1384,7 +1496,7 @@ impl DeltaTable {
             &outputs,
             &mut report,
             |state| {
-                still_active(state)?;
+                still_active(state, &kept)?;
                 Ok(Prepared {
                     remove: inputs.clone(),
                     watermark: None,
@@ -1416,7 +1528,13 @@ impl DeltaTable {
         let probe = self.write_context(snapshot, &bin.partition_values)?;
         let logical: SchemaRef = Arc::new(probe.logical_data_schema().as_ref().try_into_arrow()?);
         let physical: SchemaRef = Arc::new(probe.physical_data_schema().as_ref().try_into_arrow()?);
-        let properties = match &config.layout {
+        // Default to the shared publication layout so compaction preserves the
+        // customer's whole-file sort order instead of concatenating inputs.
+        let layout = match &config.layout {
+            Some(layout) => Some(layout.clone()),
+            None => crate::delta::configured_publication_layout(&logical)?,
+        };
+        let properties = match &layout {
             Some(layout) => {
                 layout.validate(&logical)?;
                 layout.writer_properties(&physical)?
@@ -1432,6 +1550,7 @@ impl DeltaTable {
             logical: Arc::clone(&logical),
             properties,
             config,
+            layout,
             buffer: None,
             current: None,
             outputs: Vec::new(),
@@ -1453,10 +1572,13 @@ impl DeltaTable {
         })();
         match result {
             Ok(()) => Ok(writer.outputs),
-            Err(error) => {
-                writer.abandon();
-                Err(error)
-            }
+            Err(error) => match writer.abandon() {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(fail(
+                    error_kind(&error).unwrap_or(MaintenanceErrorKind::Uncertain),
+                    format!("{error:#}; cleanup of unpublished outputs failed (retained): {cleanup}"),
+                )),
+            },
         }
     }
 
@@ -1491,7 +1613,12 @@ impl DeltaTable {
                 ));
             }
         }
-        let reader = builder.with_batch_size(config.batch_rows).build()?;
+        // Sorted outputs need batches no larger than one sorted file.
+        let batch_rows = writer
+            .layout
+            .as_ref()
+            .map_or(config.batch_rows, |layout| config.batch_rows.min(layout.max_rows));
+        let reader = builder.with_batch_size(batch_rows).build()?;
         let mut rows = 0_u64;
         for batch in reader {
             let batch = batch?;
@@ -1585,6 +1712,7 @@ struct BinWriter<'a> {
     logical: SchemaRef,
     properties: WriterProperties,
     config: &'a OptimizeConfig,
+    layout: Option<LayoutPolicy>,
     buffer: Option<FileSortBuffer>,
     current: Option<OpenOutput>,
     outputs: Vec<StagedOutput>,
@@ -1595,7 +1723,7 @@ impl BinWriter<'_> {
         if batch.num_rows() == 0 {
             return Ok(());
         }
-        if let Some(layout) = self.config.layout.clone() {
+        if let Some(layout) = self.layout.clone() {
             if self.buffer.is_none() {
                 self.buffer = Some(FileSortBuffer::new(Arc::clone(&self.logical), layout.clone())?);
             }
@@ -1709,7 +1837,7 @@ impl BinWriter<'_> {
         let staged = (|| -> Result<StagedOutput> {
             writer.close()?;
             File::open(&local)?.sync_all()?;
-            sync_directory(local.parent().context("missing output directory")?)?;
+            self.table.sync_local_output(&local)?;
             let metadata = fs::metadata(&local)?;
             if metadata.len() > self.config.max_output_file_bytes {
                 return Err(fail(
@@ -1749,13 +1877,23 @@ impl BinWriter<'_> {
         self.close_current()
     }
 
-    fn abandon(&mut self) {
+    fn abandon(&mut self) -> std::result::Result<(), String> {
+        let mut failures = Vec::new();
         if let Some(output) = self.current.take() {
             drop(output.writer);
-            let _ = fs::remove_file(&output.local);
+            if let Err(error) = self.table.discard_output(&output.local, &self.table.url, false) {
+                failures.push(format!("{}: {error:#}", output.relative));
+            }
         }
-        self.table.discard_outputs(&self.outputs);
+        if let Err(error) = self.table.discard_outputs(&self.outputs) {
+            failures.push(error);
+        }
         self.outputs.clear();
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
     }
 }
 
@@ -1778,8 +1916,11 @@ impl DeltaTable {
         shared_executor()?
             .block_on(async move { store.put_opts(&path, bytes.into(), PutMode::Create.into()).await })?;
         output.uploaded = true;
-        let _ = fs::remove_file(&output.local);
-        Ok(())
+        match fs::remove_file(&output.local) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(anyhow::Error::new(error).context("remove uploaded staging file")),
+        }
     }
 }
 
@@ -1817,8 +1958,20 @@ impl PurgeConfig {
                 "purge retention, anchor and bounds must be positive",
             ));
         }
-        Ok(())
+        validate_anchor("purge", self.anchor_ms)
     }
+
+    fn cutoff(&self) -> Result<i64> {
+        purge_cutoff(self.granularity, self.anchor_ms, self.retention_ms)
+    }
+}
+
+fn purge_cutoff(granularity: Granularity, anchor_ms: i64, retention_ms: i64) -> Result<i64> {
+    Ok(granularity.floor_ms(
+        anchor_ms
+            .checked_sub(retention_ms)
+            .ok_or_else(|| fail(MaintenanceErrorKind::InvalidPlan, "retention exceeds the anchor"))?,
+    ))
 }
 
 /// One whole expired ingestion partition.
@@ -1912,12 +2065,7 @@ impl DeltaTable {
         let state = self.active_state(config.max_active_files)?;
         state.fingerprint.validate_supported(true)?;
         let (valid, skipped) = ingestion_partitions(&state, config.granularity)?;
-        let cutoff = config.granularity.floor_ms(
-            config
-                .anchor_ms
-                .checked_sub(config.retention_ms)
-                .context("retention exceeds the anchor")?,
-        );
+        let cutoff = config.cutoff()?;
         let width = config.granularity.width_ms();
         let newest = valid.keys().next_back().copied();
         let mut partitions = Vec::new();
@@ -1990,6 +2138,21 @@ impl DeltaTable {
         let invalid = |message: &str| Err(fail(MaintenanceErrorKind::InvalidPlan, message.to_owned()));
         if plan.granularity != config.granularity {
             return invalid("plan granularity differs from the apply configuration");
+        }
+        // Bind the plan to its recorded policy and to the current one before any I/O:
+        // a forged cutoff or a now-longer retention never authorizes removal.
+        if plan.retention_ms <= 0 {
+            return invalid("plan retention must be positive");
+        }
+        validate_anchor("purge plan", plan.anchor_ms)?;
+        if purge_cutoff(plan.granularity, plan.anchor_ms, plan.retention_ms)? != plan.cutoff_ms {
+            return invalid("plan cutoff does not match its recorded anchor and retention");
+        }
+        if plan.cutoff_ms > config.cutoff()? {
+            return Err(fail(
+                MaintenanceErrorKind::StalePlan,
+                "plan cutoff is later than the apply configuration allows (retention increased or anchor moved); replan",
+            ));
         }
         let planned: BTreeSet<(String, u64)> = plan
             .partitions
@@ -2117,6 +2280,13 @@ impl VacuumConfig {
             max_active_files: 1_000_000,
         }
     }
+
+    fn cutoff(&self) -> Result<i64> {
+        validate_anchor("vacuum", self.now_ms)?;
+        self.now_ms
+            .checked_sub(self.retention_ms)
+            .ok_or_else(|| fail(MaintenanceErrorKind::InvalidPlan, "retention exceeds the anchor"))
+    }
 }
 
 /// One expired tombstone eligible for physical deletion.
@@ -2131,6 +2301,8 @@ pub struct VacuumCandidate {
 pub struct VacuumPlan {
     pub header: PlanHeader,
     pub retention_ms: i64,
+    /// Explicit UTC anchor the plan was computed at; `cutoff_ms = now_ms - retention_ms`.
+    pub now_ms: i64,
     pub cutoff_ms: i64,
     pub candidates: Vec<VacuumCandidate>,
     pub undated_tombstones: u64,
@@ -2292,10 +2464,7 @@ impl DeltaTable {
                 "log replay disagrees with Kernel's active file set",
             ));
         }
-        let cutoff = config
-            .now_ms
-            .checked_sub(config.retention_ms)
-            .context("retention exceeds the anchor")?;
+        let cutoff = config.cutoff()?;
         let mut candidates = Vec::new();
         let (mut undated, mut retained, mut backlog) = (0_u64, 0_u64, 0_u64);
         for (raw, stamp) in replay.tombstones.values() {
@@ -2318,6 +2487,7 @@ impl DeltaTable {
         let plan = VacuumPlan {
             header: PlanHeader::new(self, &state)?,
             retention_ms: config.retention_ms,
+            now_ms: config.now_ms,
             cutoff_ms: cutoff,
             candidates,
             undated_tombstones: undated,
@@ -2352,8 +2522,18 @@ impl DeltaTable {
         if plan.candidates.len() > config.max_deletes || config.delete_chunk == 0 {
             return Err(fail(MaintenanceErrorKind::InvalidPlan, "plan exceeds the delete bound"));
         }
+        // Bind the plan to its recorded policy and to the current one before any
+        // delete: only tombstones older than BOTH cutoffs may be removed.
+        validate_anchor("vacuum plan", plan.now_ms)?;
+        if plan.now_ms.checked_sub(plan.retention_ms) != Some(plan.cutoff_ms) {
+            return Err(fail(
+                MaintenanceErrorKind::InvalidPlan,
+                "plan cutoff does not match its recorded anchor and retention",
+            ));
+        }
+        let effective = plan.cutoff_ms.min(config.cutoff()?);
         let mut report = MaintenanceReport::new("vacuum", &plan.header);
-        report.cutoff_ms = Some(plan.cutoff_ms);
+        report.cutoff_ms = Some(effective);
         report.backlog_files = plan.backlog_files;
         let state = self.active_state(config.max_active_files)?;
         plan.header.fingerprint.require_same(&state.fingerprint)?;
@@ -2365,7 +2545,16 @@ impl DeltaTable {
         for candidate in &plan.candidates {
             let key = self.log_key(&candidate.path)?;
             match replay.tombstones.get(&key) {
-                Some((_, Some(stamp))) if *stamp == candidate.deletion_timestamp_ms && *stamp < plan.cutoff_ms => {}
+                Some((_, Some(stamp))) if *stamp == candidate.deletion_timestamp_ms && *stamp < effective => {}
+                Some((_, Some(stamp))) if *stamp == candidate.deletion_timestamp_ms => {
+                    return Err(fail(
+                        MaintenanceErrorKind::StalePlan,
+                        format!(
+                            "{} is not older than the effective cutoff {effective} (retention changed); replan",
+                            candidate.path
+                        ),
+                    ));
+                }
                 _ => {
                     return Err(fail(
                         MaintenanceErrorKind::StalePlan,

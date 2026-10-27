@@ -144,6 +144,11 @@ outcome fails closed, and unidentified uncertain appends are never replayed.
 Local reconciliation/deduplication synchronizes retained replay logs/checkpoints
 and their directories before acknowledging: read-back visibility alone does not
 repair a failed local durability operation.
+Local tables fsync the canonical table root and every ancestor on open/reopen,
+every partition directory from a staged file's leaf up to the table root before
+its Add can commit (multi-column Hive paths included), and the
+`_last_checkpoint` hint file after checkpoint finalization. Any fsync failure is
+returned and nothing is published.
 Exhaustion and semantic/schema conflicts remain visible errors; orphan files
 remain for inspection. The 10-second
 collection window is not a visibility bound: dependency waves add latency.
@@ -187,6 +192,9 @@ child reaper. Container runtimes must supply an init/subreaper for orphaned
 descendants. The provider never signals the caller's process group. Regression
 tests cover both deadline expiry and outer cancellation with delayed descendant
 work, not only delayed work in a wrapper shell.
+`AzureCliTokenProvider::new(scope, deadline)` exposes the same bounded
+acquisition for another exact `https://<host>/.default` scope (for example a
+Kusto cluster); `token().await` returns only the bearer string.
 
 Normal Azure open/upload/commit requires owned, ready checkpoint-container
 metadata and the same captured reset generation. Bootstrap-only

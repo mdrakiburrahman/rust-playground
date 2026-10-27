@@ -38,6 +38,9 @@ impl Drop for OwnedProcessGroup {
 
 pub(crate) struct BoundedAzureCli {
     program: OsString,
+    /// Arguments placed before the fixed CLI arguments; empty in production.
+    leading_args: Vec<OsString>,
+    scope: String,
     deadline: Duration,
     cache: Mutex<Option<Cached>>,
 }
@@ -55,10 +58,14 @@ fn failure(message: &'static str) -> Error {
     }
 }
 
+const STORAGE_SCOPE: &str = "https://storage.azure.com/.default";
+
 impl Default for BoundedAzureCli {
     fn default() -> Self {
         Self {
             program: OsString::from("az"),
+            leading_args: Vec::new(),
+            scope: STORAGE_SCOPE.to_owned(),
             deadline: Duration::from_secs(5),
             cache: Mutex::new(None),
         }
@@ -75,14 +82,9 @@ impl BoundedAzureCli {
         }
         let mut command = tokio::process::Command::new(&self.program);
         command
-            .args([
-                "account",
-                "get-access-token",
-                "--output",
-                "json",
-                "--scope",
-                "https://storage.azure.com/.default",
-            ])
+            .args(&self.leading_args)
+            .args(["account", "get-access-token", "--output", "json", "--scope"])
+            .arg(&self.scope)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -175,10 +177,62 @@ impl CredentialProvider for BoundedAzureCli {
     }
 }
 
+/// Azure CLI bearer-token source for one OAuth scope, sharing the storage provider's
+/// bounded acquisition: owned process-group kill on deadline or cancellation, 64 KiB
+/// output bound, no stdout/stderr text in errors and a short token cache.
+pub struct AzureCliTokenProvider(BoundedAzureCli);
+
+impl std::fmt::Debug for AzureCliTokenProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AzureCliTokenProvider")
+    }
+}
+
+impl AzureCliTokenProvider {
+    /// Bind a provider to `scope`, which must be exactly `https://<host>/.default`.
+    ///
+    /// # Errors
+    /// Rejects scopes with another scheme or path, a port, credentials, query or fragment.
+    pub fn new(scope: &str, deadline: Duration) -> anyhow::Result<Self> {
+        let url = url::Url::parse(scope).map_err(|_| anyhow::anyhow!("invalid Azure CLI scope"))?;
+        anyhow::ensure!(
+            url.scheme() == "https"
+                && url.host_str().is_some_and(|host| !host.is_empty())
+                && url.port().is_none()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.query().is_none()
+                && url.fragment().is_none()
+                && url.path() == "/.default"
+                && url.as_str() == scope,
+            "Azure CLI scope must be exactly https://<host>/.default"
+        );
+        anyhow::ensure!(
+            !deadline.is_zero() && deadline <= Duration::from_secs(60),
+            "Azure CLI deadline must be within (0, 60s]"
+        );
+        Ok(Self(BoundedAzureCli {
+            scope: scope.to_owned(),
+            deadline,
+            ..BoundedAzureCli::default()
+        }))
+    }
+
+    /// Return a bearer token for the bound scope.
+    ///
+    /// # Errors
+    /// Returns bounded acquisition, process or token-metadata failures without CLI output.
+    pub async fn token(&self) -> anyhow::Result<String> {
+        match self.0.get_credential().await?.as_ref() {
+            AzureCredential::BearerToken(token) => Ok(token.clone()),
+            _ => anyhow::bail!("Azure CLI returned an unsupported credential"),
+        }
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     /// Scenario: the actual CLI shape is a shell wrapper with a Python descendant.
     /// Guarantees: acquisition timeout kills descendant work, not only the wrapper.
@@ -198,49 +252,115 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     async fn wrapper_descendants_stop(cancel: bool) -> anyhow::Result<()> {
+        // The descendant sleeps well past both the provider deadline and the
+        // start-readiness bound, so a slow fork under load cannot be mistaken for
+        // cleanup, and a missed kill always produces the late side effect.
+        let (deadline, descendant_sleep) = if cancel {
+            (Duration::from_secs(30), Duration::from_secs(3))
+        } else {
+            (Duration::from_secs(2), Duration::from_secs(5))
+        };
         let root = tempfile::tempdir()?;
-        let executable = root.path().join("fake-az");
+        let script = root.path().join("fake-az");
         let pid_path = root.path().join("descendant-pid");
         let late = root.path().join("descendant-work");
         std::fs::write(
-            &executable,
+            &script,
             format!(
-                "#!/bin/sh\nsh -c 'echo $$ > \"{}\"; sleep 0.4; echo late > \"{}\"' &\nwait\n",
-                pid_path.display(),
-                late.display(),
+                "sh -c 'echo $$ > \"{pid}.tmp\" && mv \"{pid}.tmp\" \"{pid}\"; sleep {sleep}; echo late > \"{late}\"' &\nwait\n",
+                pid = pid_path.display(),
+                sleep = descendant_sleep.as_secs_f64(),
+                late = late.display(),
             ),
         )?;
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))?;
-        let provider = BoundedAzureCli {
-            program: executable.into_os_string(),
-            deadline: if cancel {
-                Duration::from_secs(3)
-            } else {
-                Duration::from_millis(150)
-            },
-            cache: Mutex::new(None),
-        };
+        let provider = script_provider(&script, deadline);
+        let started_at = Instant::now();
         let request = tokio::spawn(async move { provider.get_credential().await });
-        tokio::time::timeout(Duration::from_secs(2), async {
+        let ready = tokio::time::timeout(deadline.min(Duration::from_secs(10)), async {
             while !pid_path.exists() {
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
-        .await?;
+        .await;
+        if ready.is_err() {
+            let outcome = if request.is_finished() {
+                format!("{:?}", request.await.map(|result| result.map(|_| ())))
+            } else {
+                request.abort();
+                "still running".to_owned()
+            };
+            anyhow::bail!("start phase: descendant pid not published within readiness bound; request {outcome}");
+        }
         let pid = std::fs::read_to_string(&pid_path)?.trim().parse::<u32>()?;
         if cancel {
             request.abort();
-            assert!(request.await.is_err_and(|error| error.is_cancelled()));
+            let joined = request.await;
+            anyhow::ensure!(
+                joined.as_ref().is_err_and(|error| error.is_cancelled()),
+                "cancel phase: request was not cancelled: {:?}",
+                joined.map(|result| result.map(|_| ()))
+            );
         } else {
-            assert!(request.await?.is_err());
+            let outcome = request.await?;
+            anyhow::ensure!(outcome.is_err(), "timeout phase: provider unexpectedly succeeded");
+            anyhow::ensure!(
+                started_at.elapsed() < descendant_sleep,
+                "timeout phase: provider returned only after descendant work could finish"
+            );
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        assert!(!late.exists(), "descendant resumed delayed token work");
+        let settle = (started_at + descendant_sleep + Duration::from_secs(1)).saturating_duration_since(Instant::now());
+        tokio::time::sleep(settle).await;
+        anyhow::ensure!(!late.exists(), "cleanup phase: descendant resumed delayed token work");
         if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
             let state = status.rsplit_once(") ").map(|(_, rest)| rest.chars().next());
-            assert_eq!(state, Some(Some('Z')), "descendant is still alive: {status}");
+            anyhow::ensure!(
+                state == Some(Some('Z')),
+                "cleanup phase: descendant is still alive: {status}"
+            );
         }
         Ok(())
+    }
+
+    /// Scenario: a non-storage scope is requested through the public wrapper.
+    /// Guarantees: only exact `https://<host>/.default` scopes are accepted and the scope reaches the CLI.
+    #[tokio::test]
+    async fn public_provider_binds_exact_scope() -> anyhow::Result<()> {
+        for invalid in [
+            "http://c.kusto.windows.net/.default",
+            "https://c.kusto.windows.net/other",
+            "https://u:p@c.kusto.windows.net/.default",
+            "https://c.kusto.windows.net:444/.default",
+            "https://c.kusto.windows.net/.default?x=1",
+            "not a url",
+        ] {
+            assert!(
+                AzureCliTokenProvider::new(invalid, Duration::from_secs(1)).is_err(),
+                "{invalid}"
+            );
+        }
+        let root = tempfile::tempdir()?;
+        let script = root.path().join("fake-az");
+        std::fs::write(
+            &script,
+            "[ \"$6\" = https://c.kusto.windows.net/.default ] || exit 3\nprintf '{\"tokenType\":\"Bearer\",\"accessToken\":\"kusto-token\",\"expires_on\":4102444800}'\n",
+        )?;
+        let mut provider = AzureCliTokenProvider::new("https://c.kusto.windows.net/.default", Duration::from_secs(5))?;
+        provider.0.program = OsString::from("/bin/sh");
+        provider.0.leading_args = vec![script.into_os_string()];
+        assert_eq!(provider.token().await?, "kusto-token");
+        Ok(())
+    }
+
+    /// Fixtures are interpreted by `/bin/sh` rather than exec'd: a concurrently
+    /// forking test can briefly inherit the fixture's write descriptor, making
+    /// `execve` of a freshly written script fail with ETXTBSY.
+    fn script_provider(script: &std::path::Path, deadline: Duration) -> BoundedAzureCli {
+        BoundedAzureCli {
+            program: OsString::from("/bin/sh"),
+            leading_args: vec![script.as_os_str().to_owned()],
+            deadline,
+            ..BoundedAzureCli::default()
+        }
     }
 
     /// Scenario: CLI refresh stalls after authority was checked.
@@ -252,17 +372,9 @@ mod tests {
         let late_write = root.path().join("late-publication");
         std::fs::write(
             &executable,
-            format!(
-                "#!/bin/sh\nsleep 0.3\nprintf late > '{}'\nprintf '{{}}'\n",
-                late_write.display(),
-            ),
+            format!("sleep 0.3\nprintf late > '{}'\nprintf '{{}}'\n", late_write.display(),),
         )?;
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))?;
-        let provider = BoundedAzureCli {
-            program: executable.into_os_string(),
-            deadline: Duration::from_millis(20),
-            cache: Mutex::new(None),
-        };
+        let provider = script_provider(&executable, Duration::from_millis(20));
         assert!(provider.get_credential().await.is_err());
         tokio::time::sleep(Duration::from_millis(400)).await;
         assert!(!late_write.exists());
@@ -281,16 +393,11 @@ mod tests {
         std::fs::write(
             &executable,
             format!(
-                "#!/bin/sh\nprintf started > '{}'\nsleep 0.3\nprintf '{{\"tokenType\":\"Bearer\",\"accessToken\":\"test-token\",\"expires_on\":4102444800}}'\n",
+                "printf started > '{}'\nsleep 0.3\nprintf '{{\"tokenType\":\"Bearer\",\"accessToken\":\"test-token\",\"expires_on\":4102444800}}'\n",
                 started.display(),
             ),
         )?;
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))?;
-        let provider = BoundedAzureCli {
-            program: executable.into_os_string(),
-            deadline: Duration::from_millis(100),
-            cache: Mutex::new(None),
-        };
+        let provider = script_provider(&executable, Duration::from_millis(100));
         let ready = Arc::new(AtomicBool::new(true));
         let table = root.path().join("table");
         std::fs::create_dir(&table)?;
@@ -336,14 +443,9 @@ mod tests {
         let executable = root.path().join("fake-az");
         std::fs::write(
             &executable,
-            "#!/bin/sh\nprintf '{\"tokenType\":\"Bearer\",\"accessToken\":\"test-token\",\"expires_on\":4102444800}'\n",
+            "printf '{\"tokenType\":\"Bearer\",\"accessToken\":\"test-token\",\"expires_on\":4102444800}'\n",
         )?;
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))?;
-        let provider = BoundedAzureCli {
-            program: executable.clone().into_os_string(),
-            deadline: Duration::from_secs(1),
-            cache: Mutex::new(None),
-        };
+        let provider = script_provider(&executable, Duration::from_secs(1));
         let first = provider.get_credential().await?;
         std::fs::remove_file(&executable)?;
         assert!(Arc::ptr_eq(&first, &provider.get_credential().await?));
@@ -353,13 +455,8 @@ mod tests {
             "{\"tokenType\":\"Bearer\",\"accessToken\":\"test-token\",\"expires_on\":0}",
             "{}",
         ] {
-            std::fs::write(&executable, format!("#!/bin/sh\nprintf '%s' '{metadata}'\n"))?;
-            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))?;
-            let invalid = BoundedAzureCli {
-                program: executable.clone().into_os_string(),
-                deadline: Duration::from_secs(1),
-                cache: Mutex::new(None),
-            };
+            std::fs::write(&executable, format!("printf '%s' '{metadata}'\n"))?;
+            let invalid = script_provider(&executable, Duration::from_secs(1));
             assert!(invalid.get_credential().await.is_err());
         }
         Ok(())
