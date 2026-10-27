@@ -24,6 +24,39 @@ export. The generic Delta exporter accepts only this pluggable representation
 and sends the original arbitrary batch to `arrow-deltalake`; it does not invoke
 OTAP schema preparation.
 
+Each admitted batch also carries a fresh server UUID (`publication_id`) and
+original UTC ingestion milliseconds in this persisted envelope. The exporter
+keeps grouped scheduling but writes one file per publication with transaction
+`arrowcol.publication.<UUID>` version `0`. Quiver replay preserves that identity
+and timestamp even if flush grouping changes; independent equal payloads have
+different UUIDs and remain independent. Legacy durable envelopes missing these
+fields are refused transiently for operator reconciliation, never silently
+relabeled or acknowledged.
+
+The correctness tradeoff is more, smaller Parquet files: one file per admitted
+publication, not one file per grouped flush. The exporter stages the whole
+group, submits unforced files, and forces only the final file of each bounded
+worker-capacity wave, then joins all commit receipts before acknowledging any
+batch. Independent transaction IDs can therefore share one Delta log commit
+without coupling their replay identity. File-count metrics count those files,
+not the number of flush groups.
+
+For legacy pdata with either field absent, `stage` returns a transient error
+before opening a table or writing a file. The exporter sends a retryable NACK
+with the unchanged pdata and a diagnostic requesting operator reconciliation;
+it sends neither an ACK nor a permanent/refused NACK. A durable buffer retains
+and retries it according to its configured retention policy. Operators must
+not enable destructive `drop_oldest`/expiry policies if retention is required.
+
+`base_path` accepts an absolute local path or an
+`abfss://container@account.dfs.core.windows.net/prefix` root. Set
+`ARROWCOL_PARTITION_GRANULARITY=minute`, `hour`, or `day` to partition on core
+`__arrowcol_ingestion` from the saved admission timestamp, not event time; the
+unset default remains unpartitioned. Runtime collector images install Azure
+CLI >=2.54 from Microsoft's signed Bookworm repository; mount authenticated
+configuration for UID 10001 and point
+`AZURE_CONFIG_DIR` at it instead of embedding credentials.
+
 ## Delivery semantics
 
 `native_quiver` on `receiver:arrow_flight` selects the Flight completion mode.
@@ -41,7 +74,8 @@ The wait is bounded by `limits.admission_timeout`. Any rejection or the
 timeout fails the stream with a retryable `UNAVAILABLE` error
 (`capacity_exhausted` or `backpressure_timeout`); later batches of a rejected
 stream fail fast. Acknowledged data survives a crash and is replayed, so
-delivery is at-least-once and duplicates are possible.
+delivery remains at-least-once, while retries of the same stable publication
+are transaction-deduplicated. Independent client resubmissions remain separate.
 
 In both modes:
 

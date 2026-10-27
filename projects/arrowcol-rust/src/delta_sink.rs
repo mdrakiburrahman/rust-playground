@@ -76,7 +76,8 @@ impl PublicationSink for ProductionDeltaSink {
             table
         } else {
             let fence: Arc<dyn DeltaFence> = handle.delta_fence();
-            let opened = BatchedTable::open_with_fence(self.table_path(&context.table), self.options.clone(), fence)
+            let root = self.table_path(&context.table);
+            let opened = BatchedTable::open_uri_with_fence(&root.to_string_lossy(), self.options.clone(), fence)
                 .await
                 .map_err(|error| SinkError::retryable(format!("open Delta table coordinator: {error:#}")))?;
             handle.install_delta_table(opened).await
@@ -126,6 +127,14 @@ impl PublicationSession for CountingSession {
 ///
 /// Returns the failed filesystem operation.
 pub async fn verify_writable_root(root: &Path) -> std::io::Result<()> {
+    let uri = root.to_string_lossy();
+    if uri.contains("://") {
+        let uri = uri.into_owned();
+        return tokio::task::spawn_blocking(move || arrow_deltalake::delta::verify_writable_uri(&uri))
+            .await
+            .map_err(std::io::Error::other)?
+            .map_err(std::io::Error::other);
+    }
     tokio::fs::create_dir_all(root).await?;
     let probe = root.join(format!(".arrowcol-write-probe-{}", Uuid::new_v4()));
     let mut file = tokio::fs::OpenOptions::new()
