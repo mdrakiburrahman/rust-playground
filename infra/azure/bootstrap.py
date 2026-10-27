@@ -175,23 +175,26 @@ def write_private(path, values):
             os.unlink(temporary)
 
 
-def run_tree(command, timeout):
+def run_tree(command, timeout, cwd=None, env=None):
     """Run a command in its own session; on timeout kill the whole process group.
 
     A timeout leaves the outcome unknown, so callers must not treat it as a
     definite failure of a mutating request.
     """
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               text=True, start_new_session=True)
+                               text=True, start_new_session=True, cwd=cwd, env=env)
     try:
         stdout, stderr = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
+    except BaseException as exc:  # timeout or outer interruption: tear down the whole tree
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
         process.communicate()
-        raise Failure("Command timed out; outcome unknown and process group killed.")
+        if not isinstance(exc, subprocess.TimeoutExpired):
+            raise
+        raise Failure("Command timed out; outcome unknown and process group killed. "
+                      "Authority stays blocking; no automatic clear.")
     return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 class Azure:
@@ -619,8 +622,8 @@ def _unqualified_reset_sequence(azure, stop_command):
     require_released(metadata)
     metadata.update(resetstate="fenced", resetgeneration=str(uuid.uuid4()))
     azure.set_control(metadata, etag)
-    result = subprocess.run(stop_command, cwd=ROOT, timeout=180, check=False,
-                            capture_output=True, text=True)
+    result = run_tree(stop_command, 180, cwd=ROOT)
+
     if result.returncode:
         raise Failure("Writer/consumer stop failed; reset fence retained, no workload data deleted. " +
                       c.redact(str(result.stderr)))
@@ -794,11 +797,13 @@ def main(argv=None):
                 initializer = ROOT / "infra/azure/initialize-delta.sh"
                 if not initializer.is_file():
                     raise Failure("Delta initializer is unavailable; infra exists, full bootstrap is NOT complete.")
-                result = subprocess.run(["bash", str(initializer)], cwd=ROOT, timeout=1800,
-                                        env={**os.environ, **values, **c.generated(),
-                                             "ARROWCOL_AZURE_TABLE_MANIFEST": str(args.tables.resolve())},
-                                        check=False,
-                                        capture_output=True, text=True)
+                # The child compares its fresh session generation with this captured
+                # value before any table I/O; it never infers or adopts a generation.
+                result = run_tree(["bash", str(initializer)], 1800, cwd=ROOT, env={
+                    **os.environ, **values, **c.generated(),
+                    "ARROWCOL_AZURE_TABLE_MANIFEST": str(args.tables.resolve()),
+                    "ARROWCOL_EXPECTED_RESET_GENERATION": metadata["resetgeneration"],
+                })
                 if result.returncode:
                     raise Failure("Delta initialization failed; KQL reconciliation was not attempted. " +
                                   c.redact(result.stderr))
