@@ -234,6 +234,11 @@ async fn run_phase(
     table_count: usize,
     receipt_failures: Arc<AtomicU64>,
 ) -> Result<()> {
+    let phase_started_at = now_unix_millis();
+    let phase_duration_ms = duration
+        .map(|duration| u64::try_from(duration.as_millis()))
+        .transpose()
+        .context("driver phase duration exceeds the evidence bound")?;
     let deadline = duration.map(|duration| Instant::now() + duration);
     let first_ordinal = scheduler.scheduled();
     let mut lanes = JoinSet::new();
@@ -378,9 +383,16 @@ async fn run_phase(
                     cancellation.cancel();
                     bail!("driver scheduled-row count overflow");
                 };
+                let observed_at = now_unix_millis();
+                let phase_remaining_ms = deadline
+                    .map(|deadline| u64::try_from(deadline.saturating_duration_since(Instant::now()).as_millis()))
+                    .transpose()
+                    .context("remaining driver phase duration exceeds the evidence bound")?;
                 let frame = serde_json::json!({
                     "run_id": run_id, "phase": phase, "scenario": scenario.as_str(),
-                    "timestamp": now_unix_millis(), "scheduled_rows": rows,
+                    "phase_started_at": phase_started_at, "phase_duration_ms": phase_duration_ms,
+                    "phase_remaining_ms": phase_remaining_ms,
+                    "timestamp": observed_at, "scheduled_rows": rows,
                     "send_policy_failures": send_policy_failures.load(Ordering::Relaxed),
                     "receipt_failures": receipt_failures.load(Ordering::Relaxed),
                 });

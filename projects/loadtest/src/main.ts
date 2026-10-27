@@ -650,6 +650,8 @@ async function benchmark(
       reader: path.join(cargoTargetDirectory(), 'debug/delta-inspect'),
       directAdmin: `http://${network.direct}:8081`, dataflowAdmin: `http://${network.dataflow}:32011`,
       quiver: options.quiver, loadEnded: loadEnded.signal, checkRunning: () => controller.checkRunning(),
+      fixture: stressPlan.fixture, windowSeconds: stressPlan.durationSeconds,
+      sampleTimeoutSeconds: stressPlan.sampleTimeoutSeconds, measureSeconds: options.measureSeconds,
       physicalRoots: Object.fromEntries([
         'direct', 'dataflow', 'tenant', 'tenant-checkpoints', 'direct-state-1', 'dataflow-state-1', 'router-state',
       ].map(name => [name, path.join(directory, name)]).concat([

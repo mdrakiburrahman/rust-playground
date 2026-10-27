@@ -43,6 +43,8 @@ else if (args[0] === 'stop') {
       env: { ...process.env, PATH: `${directory}:${process.env.PATH}` }, reader,
       directAdmin: 'http://127.0.0.1:1', dataflowAdmin: 'http://127.0.0.1:1',
       quiver: false, physicalRoots: {}, loadEnded: new AbortController().signal, checkRunning: () => {},
+      fixture: { batchRows: 2, rowGroupRows: 1, pageRows: 1 },
+      windowSeconds: 9, sampleTimeoutSeconds: 1, measureSeconds: 30,
     });
     await assert.rejects(runtime.operate(1, Date.now() + 10_000), error => {
       if (foreign) {
