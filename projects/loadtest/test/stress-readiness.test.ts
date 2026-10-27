@@ -6,6 +6,7 @@ import { test, type TestContext } from 'node:test';
 import { pathToFileURL } from 'node:url';
 import { LocalStressRuntime, maintenanceArguments } from '../src/stress-runtime.js';
 import { parseStressPlan, runStressDriver } from '../src/stress-driver.js';
+import { fixtureDirectory } from './fixture-directory.js';
 
 const target = 'telemetry.sqlserver.sqlserver_cpu_utilization';
 const tableParts = target.split('.');
@@ -25,7 +26,6 @@ function fixture(t: TestContext, privateInsideResults = false) {
   const canary = 'password=PRIVATE_READER_SENTINEL /private/canary-source.parquet';
   writeFileSync(reader, `#!${process.execPath}
 import {appendFileSync,readFileSync} from 'node:fs';
-import { fixtureDirectory } from './fixture-directory.js';
 appendFileSync(${JSON.stringify(calls)},JSON.stringify(process.argv.slice(2))+'\\n');
 const [command,input]=process.argv.slice(2);
 const file=command==='summarize' ? input+'/fixture.json' : input+'.layout.json';
