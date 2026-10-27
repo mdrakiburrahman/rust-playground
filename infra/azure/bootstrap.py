@@ -629,7 +629,7 @@ def require_released_or_owner(metadata, owner):
         raise Failure("Only the active cloud test owner may reconcile isolated table bindings.")
 
 
-def occupancy(azure, action, owner):
+def occupancy(azure, action, owner, output=None):
     try:
         owner = str(uuid.UUID(owner))
     except ValueError as exc:
@@ -646,6 +646,16 @@ def occupancy(azure, action, owner):
             raise Failure("Only the exact occupancy owner can release cloud tests.")
         metadata.update(occupancy="released")
     azure.set_control(metadata, etag)
+    if action == "occupy" and output is not None:
+        # Re-read after CAS: never infer generation from the occupancy/run UUID.
+        current, _ = azure.control()
+        if (current.get("occupancyid") != owner or current.get("occupancy") != "testing" or
+                current.get("resetstate") != "ready" or
+                current.get("resetgeneration") != metadata["resetgeneration"]):
+            raise Failure("Authority changed after occupancy; do not admit collectors.")
+        values = azure.c.generated()
+        values["ARROWCOL_RESET_GENERATION"] = current["resetgeneration"]
+        write_private(output, values)
     print("Cloud test occupancy: " + ("TESTING" if action == "occupy" else "RELEASED"))
 
 
@@ -696,6 +706,9 @@ def main(argv=None):
                 reconcile(azure, args.tables)
                 metadata["resetstate"] = "ready"
                 azure.set_control(metadata, etag)
+                write_private(args.output, {
+                    **c.generated(), "ARROWCOL_RESET_GENERATION": metadata["resetgeneration"],
+                })
                 print("Full bootstrap ready; reset fence cleared.")
             else:
                 print("INFRA-ONLY: Delta initialization and external-table/QAP reconciliation NOT verified.")
@@ -721,7 +734,8 @@ def main(argv=None):
             else:
                 print("Stop preview: preserve cluster; --execute requests stop after test occupancy release.")
         elif args.command in ("occupy", "release"):
-            occupancy(azure, args.command, args.occupancy_id)
+            occupancy(azure, args.command, args.occupancy_id,
+                      args.output if args.command == "occupy" else None)
         return 0
     except (Failure, ValueError, OSError, subprocess.TimeoutExpired) as exc:
         message = c.redact(str(exc)) if c else "Invalid or missing private Azure configuration."
