@@ -5,7 +5,7 @@ use crate::{
     CompletedFile, CompletedFileObservation, ParquetFileWriter, normalize, record_batch_logical_bytes, sync_directory,
 };
 use anyhow::{Context, Result, bail};
-use arrow::array::{RecordBatch, StructArray};
+use arrow::array::{Array, RecordBatch, StructArray};
 use arrow::datatypes::SchemaRef;
 use delta_kernel::committer::{CommitMetadata, CommitResponse, Committer, FileSystemCommitter, PublishMetadata};
 use delta_kernel::engine::arrow_conversion::{TryFromArrow, TryIntoArrow};
@@ -18,7 +18,7 @@ use delta_kernel_default_engine::parquet::DataFileMetadata;
 use delta_kernel_default_engine::stats::FileStatsAccumulator;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder, build_add_file_metadata};
 use fs2::FileExt;
-use object_store::{ObjectStore, PutMode};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode};
 use parquet::file::properties::WriterProperties;
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -32,6 +32,81 @@ use std::time::{Duration, Instant};
 use url::Url;
 
 type LocalEngine = DefaultEngine<SharedExecutor>;
+
+fn azure_store(url: &Url) -> Result<object_store::azure::MicrosoftAzure> {
+    Ok(object_store::azure::MicrosoftAzureBuilder::from_env()
+        .with_url(url.as_str())
+        .with_use_azure_cli(true)
+        .with_retry(object_store::RetryConfig {
+            max_retries: 2,
+            retry_timeout: Duration::from_secs(10),
+            ..Default::default()
+        })
+        .with_client_options(object_store::ClientOptions::new().with_timeout(Duration::from_secs(10)))
+        .build()?)
+}
+
+/// Shared refreshable storage authentication for readers and checkpoint clients.
+/// This does not acquire table ownership or authorize writes past a sandbox reset fence.
+///
+/// # Errors
+/// Rejects unsupported URLs and invalid credential configuration.
+pub fn object_store_for_url(url: &Url) -> Result<Arc<dyn ObjectStore>> {
+    let store: Arc<dyn ObjectStore> = match url.scheme() {
+        "file" => Arc::new(object_store::local::LocalFileSystem::new()),
+        "abfs" | "abfss" | "az" => Arc::new(azure_store(url)?),
+        _ => bail!("only file and ADLS URLs are supported"),
+    };
+    Ok(store)
+}
+
+/// Captured sandbox generation for a source/checkpoint service.
+/// Check immediately before and after each checkpoint mutation; a failure is
+/// terminal for that service generation, not permission to retry against a reset.
+pub struct StorageAuthority {
+    fence: Option<Arc<crate::azure_fence::AzureResetFence>>,
+}
+
+impl StorageAuthority {
+    /// Capture the current owned, ready reset generation.
+    ///
+    /// # Errors
+    /// Rejects missing/mismatched container authority and authentication failures.
+    pub fn open(url: &Url) -> Result<Self> {
+        if url.scheme() == "file" {
+            return Ok(Self { fence: None });
+        }
+        let store = azure_store(url)?;
+        let account = if url.scheme() == "az" {
+            std::env::var("AZURE_STORAGE_ACCOUNT").or_else(|_| std::env::var("AZURE_STORAGE_ACCOUNT_NAME"))?
+        } else {
+            url.host_str()
+                .context("missing Azure account")?
+                .split('.')
+                .next()
+                .context("missing Azure account")?
+                .to_owned()
+        };
+        let credentials = Arc::clone(store.credentials());
+        let fence = shared_executor()?
+            .block_on(async move { crate::azure_fence::AzureResetFence::open(&account, credentials, false).await })?;
+        Ok(Self {
+            fence: Some(Arc::new(fence)),
+        })
+    }
+
+    /// Fail closed if reset state or generation differs from the captured authority.
+    ///
+    /// # Errors
+    /// Returns reset fencing, ownership, authentication or storage-read failures.
+    pub fn check(&self) -> Result<()> {
+        if let Some(fence) = &self.fence {
+            let fence = Arc::clone(fence);
+            shared_executor()?.block_on(async move { fence.check().await })?;
+        }
+        Ok(())
+    }
+}
 
 /// Retained transaction fence preventing expired ingestion replay after PURGE.
 pub const PURGE_WATERMARK: &str = "arrowcol.purge.before-ms";
@@ -76,6 +151,31 @@ pub(crate) fn collision_backoff(attempt: u32) {
 /// Returns runtime creation errors, including a previous initialization failure.
 pub fn initialize_shared_io() -> Result<()> {
     shared_executor().map(|_| ())
+}
+
+/// Verify storage authority and conditional write/delete access without creating a Delta commit.
+///
+/// # Errors
+/// Returns invalid URI, reset fencing, authentication or storage errors.
+pub fn verify_writable_uri(root: &str) -> Result<()> {
+    let url = match Url::parse(root) {
+        Ok(url) => url,
+        Err(_) => {
+            fs::create_dir_all(root)?;
+            Url::from_directory_path(fs::canonicalize(root)?).map_err(|()| anyhow::anyhow!("invalid path"))?
+        }
+    };
+    let table = DeltaTable::open_connection(url, Vec::new(), None, false)?;
+    table.check_publication()?;
+    let path = table.object_path(&format!(".arrowcol-probe-{}", uuid::Uuid::new_v4()))?;
+    let store = Arc::clone(&table.store);
+    shared_executor()?.block_on(async move {
+        store
+            .put_opts(&path, b"arrowcol".to_vec().into(), PutMode::Create.into())
+            .await?;
+        store.delete(&path).await
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -171,7 +271,7 @@ mod io_tests {
     }
 
     /// Scenario: an external writer publishes after a warm snapshot's final freshness check.
-    /// Guarantees: atomic version creation still detects conflict and never retries or overwrites it.
+    /// Guarantees: a safe append collision refreshes and retries without overwriting either publication.
     #[tokio::test(flavor = "current_thread")]
     async fn incremental_snapshot_preserves_external_commit_conflict() -> Result<()> {
         use std::io::Write;
@@ -214,10 +314,44 @@ mod io_tests {
         let mut file = table.new_file(input.schema())?;
         file.write(&input).await?;
         fence.armed.store(true, Ordering::SeqCst);
-        let error = file.finish().await.err().context("expected external commit conflict")?;
-        assert!(error.to_string().contains("conflicted"));
-        assert_eq!(table.version()?, 2);
-        assert!(!directory.path().join("_delta_log/00000000000000000003.json").exists());
+        let append = file.finish().await?;
+        assert_eq!(append.version, 3);
+        assert_eq!(table.version()?, 3);
+        let mut paths = HashSet::new();
+        for version in 1..=3 {
+            let log = fs::read_to_string(directory.path().join(format!("_delta_log/{version:020}.json")))?;
+            for line in log.lines() {
+                let action: serde_json::Value = serde_json::from_str(line)?;
+                if let Some(path) = action
+                    .get("add")
+                    .and_then(|add| add.get("path"))
+                    .and_then(serde_json::Value::as_str)
+                {
+                    paths.insert(path.to_owned());
+                }
+            }
+        }
+        assert_eq!(paths.len(), 2);
+        assert!(append.file.path.exists());
+        Ok(())
+    }
+
+    /// Scenario: URL-significant characters occur in a physical Hive directory.
+    /// Guarantees: local and ADLS request paths encode segments exactly once.
+    #[test]
+    fn staged_urls_round_trip_special_partition_literals() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut table = DeltaTable::open(directory.path())?;
+        let table = Arc::get_mut(&mut table).context("unique table owner")?;
+        for root in ["file:///tmp/table/", "abfss://data@example.dfs.core.windows.net/table/"] {
+            table.url = Url::parse(root)?;
+            let url = table.staged_url("p=space %?#λ/part.parquet")?;
+            assert!(url.query().is_none() && url.fragment().is_none());
+            let path = object_store::path::Path::from_url_path(url.path())?;
+            assert!(path.as_ref().ends_with("p=space %?#λ/part.parquet"));
+            let relative = url.as_str().strip_prefix(table.url.as_str()).context("relative path")?;
+            assert_eq!(table.relative_url(relative)?, url);
+        }
         Ok(())
     }
 
@@ -636,6 +770,8 @@ pub struct DeltaTable {
     pub(crate) commit_lock: Mutex<()>,
     pub(crate) store: Arc<dyn ObjectStore>,
     partition_columns: Vec<String>,
+    reset_fence: Option<Arc<crate::azure_fence::AzureResetFence>>,
+    bootstrap_only: bool,
     snapshot_cache: Mutex<Option<CachedSnapshot>>,
     reuse_snapshots: bool,
     publication_fence: Option<Arc<dyn PublicationFence>>,
@@ -725,24 +861,78 @@ impl DeltaTable {
     ///
     /// # Errors
     /// Rejects unsupported URLs, credentials, incompatible partitions or table metadata.
-    pub fn open_url(mut url: Url, schema: SchemaRef, partition_columns: Vec<String>) -> Result<Arc<Self>> {
+    pub fn open_url(url: Url, schema: SchemaRef, partition_columns: Vec<String>) -> Result<Arc<Self>> {
+        let table = Self::open_connection(url, partition_columns, None, false)?;
+        table.ensure_schema(normalize::schema(&schema)?)?;
+        Ok(table)
+    }
+
+    /// Initialize an owned, fenced Azure sandbox without enabling normal data publication.
+    /// Existing roots are validated rather than replaced.
+    ///
+    /// # Errors
+    /// Requires matching sandbox container metadata in the fenced state.
+    pub fn initialize_url_for_bootstrap(url: Url, schema: SchemaRef, partition_columns: Vec<String>) -> Result<()> {
+        let table = Self::open_connection(url, partition_columns, None, true)?;
+        table.ensure_schema(normalize::schema(&schema)?)?;
+        Ok(())
+    }
+
+    /// Open a collector-owned local path or an independently coordinated ADLS URI.
+    ///
+    /// # Errors
+    /// Returns storage, authority or ownership errors.
+    pub fn open_uri_with_fence(root: &str, publication_fence: Arc<dyn PublicationFence>) -> Result<Arc<Self>> {
+        match Url::parse(root) {
+            Ok(url) if url.scheme() != "file" => Self::open_connection(
+                url,
+                if std::env::var_os("ARROWCOL_PARTITION_GRANULARITY").is_some() {
+                    vec![INGESTION_PARTITION.to_owned()]
+                } else {
+                    Vec::new()
+                },
+                Some(publication_fence),
+                false,
+            ),
+            Ok(url) => Self::open_with_fence(
+                url.to_file_path().map_err(|()| anyhow::anyhow!("invalid local URI"))?,
+                publication_fence,
+            ),
+            Err(_) => Self::open_with_fence(root, publication_fence),
+        }
+    }
+
+    fn open_connection(
+        mut url: Url,
+        partition_columns: Vec<String>,
+        publication_fence: Option<Arc<dyn PublicationFence>>,
+        bootstrap_only: bool,
+    ) -> Result<Arc<Self>> {
         if !url.path().ends_with('/') {
             url.set_path(&format!("{}/", url.path()));
         }
+        let mut reset_fence = None;
         let store: Arc<dyn ObjectStore> = match url.scheme() {
             "file" => Arc::new(object_store::local::LocalFileSystem::new()),
-            "abfs" | "abfss" | "az" => Arc::new(
-                object_store::azure::MicrosoftAzureBuilder::from_env()
-                    .with_url(url.as_str())
-                    .with_use_azure_cli(true)
-                    .with_retry(object_store::RetryConfig {
-                        max_retries: 2,
-                        retry_timeout: Duration::from_secs(10),
-                        ..Default::default()
-                    })
-                    .with_client_options(object_store::ClientOptions::new().with_timeout(Duration::from_secs(10)))
-                    .build()?,
-            ),
+            "abfs" | "abfss" | "az" => {
+                let store = azure_store(&url)?;
+                let account = if url.scheme() == "az" {
+                    std::env::var("AZURE_STORAGE_ACCOUNT").or_else(|_| std::env::var("AZURE_STORAGE_ACCOUNT_NAME"))?
+                } else {
+                    url.host_str()
+                        .context("missing Azure account")?
+                        .split('.')
+                        .next()
+                        .context("missing Azure account")?
+                        .to_owned()
+                };
+                let credentials = Arc::clone(store.credentials());
+                let fence = shared_executor()?.block_on(async move {
+                    crate::azure_fence::AzureResetFence::open(&account, credentials, bootstrap_only).await
+                })?;
+                reset_fence = Some(Arc::new(fence));
+                Arc::new(store)
+            }
             _ => bail!("only file and ADLS URLs are supported"),
         };
         let root = if url.scheme() == "file" {
@@ -773,10 +963,22 @@ impl DeltaTable {
             commit_lock: Mutex::new(()),
             snapshot_cache: Mutex::new(None),
             reuse_snapshots: false,
-            publication_fence: None,
+            publication_fence,
+            reset_fence,
+            bootstrap_only,
         });
-        table.ensure_schema(normalize::schema(&schema)?)?;
         Ok(table)
+    }
+
+    pub(crate) fn check_publication(&self) -> Result<()> {
+        if self.bootstrap_only {
+            bail!("bootstrap initialization cannot publish data");
+        }
+        if let Some(fence) = &self.reset_fence {
+            let fence = Arc::clone(fence);
+            shared_executor()?.block_on(async move { fence.check().await })?;
+        }
+        Ok(())
     }
 
     /// Resolve an application transaction from Kernel replay, including checkpoints.
@@ -787,6 +989,42 @@ impl DeltaTable {
         let snapshot = self.snapshot()?;
         Self::validate_retention(&snapshot)?;
         Ok(snapshot.get_app_id_version(app_id, &self.engine)?)
+    }
+
+    /// Write a classic V1 Kernel checkpoint, retaining application transactions.
+    ///
+    /// # Errors
+    /// Returns authority, checkpoint replay, write or synchronization failures.
+    pub fn checkpoint(&self) -> Result<u64> {
+        self.check_publication()?;
+        let snapshot = self.snapshot()?;
+        Self::validate_retention(&snapshot)?;
+        let writer = Arc::clone(&snapshot).create_checkpoint_writer(&self.engine)?;
+        let data = writer.checkpoint_data(&self.engine)?;
+        let state = data.state();
+        let data = data
+            .map(|batch| batch.and_then(|batch| batch.apply_selection_vector()))
+            .collect::<DeltaResult<Vec<_>>>()?;
+        let location = writer.checkpoint_path()?;
+        self.engine
+            .parquet_handler()
+            .write_parquet_file(location.clone(), Box::new(data.into_iter().map(Ok)))?;
+        let path = object_store::path::Path::from_url_path(location.path())?;
+        let store = Arc::clone(&self.store);
+        let size = shared_executor()?
+            .block_on(async move { store.head(&path).await })?
+            .size;
+        if let Ok(path) = location.to_file_path() {
+            File::open(path)?.sync_all()?;
+        }
+        let state = Arc::into_inner(state).context("checkpoint state remains shared")?;
+        let statistics = delta_kernel::checkpoint::LastCheckpointHintStats::from_reconciliation_state(state, size, 0)?;
+        self.check_publication()?;
+        writer.finalize(&self.engine, &statistics)?;
+        if self.url.scheme() == "file" {
+            sync_directory(&self.root.join("_delta_log"))?;
+        }
+        Ok(snapshot.version())
     }
 
     fn validate_retention(snapshot: &SnapshotRef) -> Result<()> {
@@ -800,15 +1038,38 @@ impl DeltaTable {
     }
 
     pub(crate) fn object_path(&self, relative: &str) -> Result<object_store::path::Path> {
-        if relative.starts_with('/') || relative.split('/').any(|part| part == ".." || part == ".") {
-            bail!("unsafe relative Delta path");
-        }
         Ok(object_store::path::Path::from_url_path(
-            self.url.join(relative)?.path(),
+            self.relative_url(relative)?.path(),
         )?)
     }
 
+    pub(crate) fn relative_url(&self, relative: &str) -> Result<Url> {
+        if relative.starts_with('/')
+            || relative.contains(['?', '#', '\\'])
+            || relative.split('/').any(|part| part == ".." || part == ".")
+        {
+            bail!("unsafe relative Delta path");
+        }
+        let url = self.url.join(relative)?;
+        let path = object_store::path::Path::from_url_path(url.path())?;
+        let root = object_store::path::Path::from_url_path(self.url.path())?;
+        if url.scheme() != self.url.scheme() || url.host_str() != self.url.host_str() || !path.prefix_matches(&root) {
+            bail!("Delta file path escapes its table");
+        }
+        Ok(url)
+    }
+
+    fn staged_url(&self, relative: &str) -> Result<Url> {
+        let mut url = self.url.clone();
+        url.path_segments_mut()
+            .map_err(|()| anyhow::anyhow!("invalid table base URL"))?
+            .pop_if_empty()
+            .extend(relative.split('/'));
+        Ok(url)
+    }
+
     fn upload_file(&self, file: &CompletedFile) -> Result<()> {
+        self.check_publication()?;
         if self.url.scheme() == "file" {
             return Ok(());
         }
@@ -820,7 +1081,7 @@ impl DeltaTable {
             .strip_prefix(&self.root)?
             .to_str()
             .context("invalid staged path")?;
-        let path = self.object_path(relative)?;
+        let path = object_store::path::Path::from_url_path(self.staged_url(relative)?.path())?;
         let bytes = fs::read(&file.path)?;
         let store = Arc::clone(&self.store);
         shared_executor()?
@@ -915,6 +1176,8 @@ impl DeltaTable {
             snapshot_cache: Mutex::new(None),
             reuse_snapshots,
             publication_fence,
+            reset_fence: None,
+            bootstrap_only: false,
         }))
     }
 
@@ -1058,7 +1321,7 @@ impl DeltaTable {
         let snapshot = self.snapshot()?;
         Self::validate_retention(&snapshot)?;
         if !self.partition_columns.is_empty()
-            && snapshot.table_configuration().metadata().partition_columns() != &self.partition_columns
+            && snapshot.table_configuration().metadata().partition_columns() != self.partition_columns
         {
             bail!("incompatible table partition columns");
         }
@@ -1209,6 +1472,7 @@ impl DeltaTable {
             failed: false,
             publication: None,
             ingested_at_ms: None,
+            partition_values: values,
         })
     }
 
@@ -1243,6 +1507,7 @@ impl DeltaTable {
             .map_err(|_| anyhow::anyhow!("Delta commit lock poisoned"))?;
         let started = Instant::now();
         for attempt in 0..8 {
+            self.check_publication()?;
             let snapshot = self.snapshot()?;
             Self::validate_retention(&snapshot)?;
             if let Some((app_id, version)) = identity
@@ -1303,7 +1568,7 @@ impl DeltaTable {
                     .strip_prefix(&self.root)?
                     .to_str()
                     .context("invalid data file path")?;
-                let url = self.url.join(relative)?;
+                let url = self.staged_url(relative)?;
                 let modified = i64::try_from(
                     fs::metadata(&append.file.path)?
                         .modified()?
@@ -1364,6 +1629,7 @@ pub struct DeltaFileWriter {
     failed: bool,
     publication: Option<(String, i64)>,
     ingested_at_ms: Option<i64>,
+    partition_values: BTreeMap<String, Option<String>>,
 }
 
 /// Completed append, including the table version.
@@ -1444,6 +1710,38 @@ impl DeltaFileWriter {
     async fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         let input_bytes = record_batch_logical_bytes(batch)?;
         let mut batch = normalize::batch(batch)?;
+        for (name, expected) in &self.partition_values {
+            if let Ok(index) = batch.schema().index_of(name) {
+                let column = batch
+                    .column(index)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .context("partition columns must contain string literals")?;
+                for row in 0..batch.num_rows() {
+                    let actual = if column.is_null(row) {
+                        None
+                    } else {
+                        Some(column.value(row))
+                    };
+                    if actual != expected.as_deref() {
+                        bail!("batch partition value differs from bound write context");
+                    }
+                }
+            } else {
+                let mut fields = batch.schema().fields().to_vec();
+                fields.push(Arc::new(arrow::datatypes::Field::new(
+                    name,
+                    arrow::datatypes::DataType::Utf8,
+                    expected.is_none(),
+                )));
+                let mut columns = batch.columns().to_vec();
+                columns.push(Arc::new(arrow::array::StringArray::from(vec![
+                    expected.as_deref();
+                    batch.num_rows()
+                ])));
+                batch = RecordBatch::try_new(Arc::new(arrow::datatypes::Schema::new(fields)), columns)?;
+            }
+        }
         if self.schema.field_with_name(INGESTION_PARTITION).is_ok()
             && batch.schema().field_with_name(INGESTION_PARTITION).is_err()
         {
