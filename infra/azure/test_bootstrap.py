@@ -105,6 +105,17 @@ class ConfigTests(unittest.TestCase):
                       "AZURE_OPERATOR_APPLICATION_ID": SUB})
         self.assertEqual(c.operator_application, SUB)
 
+    def test_isolated_root_preserves_only_owned_account_container(self):
+        c = b.Config({"AZURE_SUBSCRIPTION_ID": SUB})
+        root = f"abfss://{c.data}@{c.account}.dfs.core.windows.net/loadtest/run-example/"
+        isolated = b.Config({"AZURE_SUBSCRIPTION_ID": SUB, "ARROWCOL_AZURE_TABLE_ROOT": root})
+        self.assertEqual(isolated.table_prefix, "loadtest/run-example")
+        self.assertEqual(isolated.generated()["ARROWCOL_AZURE_TABLE_ROOT"], root)
+        for unsafe in (root.replace(c.account, "foreign"), root + "../escape",
+                       root + "?token=secret", root.replace(c.data + "@", "foreign@")):
+            with self.assertRaises(b.Failure):
+                b.Config({"AZURE_SUBSCRIPTION_ID": SUB, "ARROWCOL_AZURE_TABLE_ROOT": unsafe})
+
     def test_config_parser_does_not_execute_expansion(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / ".env"
@@ -370,6 +381,24 @@ class ReconcileTests(unittest.TestCase):
         self.assertTrue(all("/telemetry/sqlserver/table/_delta_log/" in root for root in roots))
         self.assertIn("['direct_table'] kind=delta", commands[1])
         self.assertIn("['dataflow_table'] kind=delta", commands[3])
+
+    def test_isolated_root_prefix_is_used_for_log_validation_and_kql(self):
+        azure = FakeAzure()
+        azure.c.table_prefix = "loadtest/run-example"
+        roots, commands = [], []
+        def blob(method, container, name, **kwargs):
+            roots.append(name)
+            return b'{"protocol":{}}\n{"metaData":{}}', {}
+        azure.blob = blob
+        azure.arm = lambda *args, **kwargs: {"properties": {"principalId": SUB}}
+        azure.kql = lambda command: commands.append(command)
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "tables.json"
+            manifest.write_text('[{"name":"direct_table","relative_path":"direct/catalog/schema/table"}]')
+            with contextlib.redirect_stdout(io.StringIO()):
+                b.reconcile(azure, manifest)
+        self.assertTrue(roots[0].startswith("loadtest/run-example/direct/"))
+        self.assertIn("/loadtest/run-example/direct/catalog/schema/table;", commands[1])
 
 
 class StorageApiTests(unittest.TestCase):

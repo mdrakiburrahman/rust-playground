@@ -101,6 +101,19 @@ class Config:
         self.cluster_id = self.base + "/providers/Microsoft.Kusto/clusters/" + self.cluster
         self.identity_id = self.base + "/providers/Microsoft.ManagedIdentity/userAssignedIdentities/" + self.identity
         self.uri = f"https://{self.cluster}.{self.location}.kusto.windows.net"
+        self.table_root = get("ARROWCOL_AZURE_TABLE_ROOT",
+                              f"abfss://{self.data}@{self.account}.dfs.core.windows.net/")
+        parsed = urllib.parse.urlsplit(self.table_root)
+        if (parsed.scheme != "abfss" or
+                parsed.netloc != f"{self.data}@{self.account}.dfs.core.windows.net" or
+                parsed.query or parsed.fragment):
+            raise Failure("Azure table root must stay inside the exact owned account and data container.")
+        self.table_prefix = parsed.path.strip("/")
+        if self.table_prefix and not re.fullmatch(r"[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*",
+                                                  self.table_prefix):
+            raise Failure("Azure table root has an unsafe relative prefix.")
+        self.table_root = f"abfss://{parsed.netloc}/" + (
+            self.table_prefix + "/" if self.table_prefix else "")
 
     def redact(self, text):
         for value in (self.subscription, self.sandbox, self.account, self.cluster,
@@ -120,7 +133,7 @@ class Config:
             "AZURE_STORAGE_CHECKPOINT_CONTAINER": self.checkpoints,
             "AZURE_KUSTO_CLUSTER": self.cluster, "AZURE_KUSTO_DATABASE": self.database,
             "AZURE_KUSTO_IDENTITY_NAME": self.identity, "AZURE_KUSTO_URI": self.uri,
-            "ARROWCOL_AZURE_TABLE_ROOT": f"abfss://{self.data}@{self.account}.dfs.core.windows.net/",
+            "ARROWCOL_AZURE_TABLE_ROOT": self.table_root,
             "ARROWCOL_AZURE_CHECKPOINT_ROOT": f"abfss://{self.checkpoints}@{self.account}.dfs.core.windows.net/",
         }
 
@@ -406,7 +419,9 @@ def reconcile(azure, manifest):
             raise Failure("Initialization manifest contains an invalid table name.")
         if not re.fullmatch(r"[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*", table["relative_path"]):
             raise Failure("Initialization manifest contains an unsafe relative path.")
-        data, _ = azure.blob("GET", c.data, table["relative_path"] +
+        relative = "/".join(part for part in (c.table_prefix, table["relative_path"]) if part)
+        table["storage_path"] = relative
+        data, _ = azure.blob("GET", c.data, relative +
                              "/_delta_log/00000000000000000000.json",
                              missing_ok=True)
         if not data:
@@ -419,7 +434,7 @@ def reconcile(azure, manifest):
     azure.kql(f".alter-merge database ['{c.database}'] policy managed_identity '{policy}'")
     qap = json.dumps({"IsEnabled": True, "Hot": f"{c.hot}.00:00:00", "ManagedIdentity": identity})
     for table in tables:
-        connection = (f"abfss://{c.data}@{c.account}.dfs.core.windows.net/{table['relative_path']}"
+        connection = (f"abfss://{c.data}@{c.account}.dfs.core.windows.net/{table['storage_path']}"
                       f";managed_identity={identity}")
         retry_ready(lambda: azure.kql(
             f".create-or-alter external table ['{table['name']}'] kind=delta (h@'{connection}')"
