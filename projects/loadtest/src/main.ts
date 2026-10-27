@@ -547,7 +547,7 @@ async function benchmark(
   const resultsDirectory = path.relative(workspace, path.join(directory, 'results'));
   try {
     step('Validating Compose configuration');
-    writeProvenance(workspace, directory, project, options, env);
+    writeProvenance(workspace, directory, project, options, env, path.join(cargoTargetDirectory(), 'debug'));
     compose(project, env, ['--profile', 'benchmark', 'config', '--quiet']);
     phase = 'image-build';
     step('Building sqlserver and hive-metastore images (can take several minutes on first run)');
@@ -590,7 +590,7 @@ async function benchmark(
     }
     controller.checkRunning();
     phase = 'startup-provenance';
-    writeProvenance(workspace, directory, project, options, env, true);
+    writeProvenance(workspace, directory, project, options, env, path.join(cargoTargetDirectory(), 'debug'), true);
     phase = 'sampler-start';
     stopSampler = await startResourceSampler({
       project, results: path.join(directory, 'results'),

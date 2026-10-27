@@ -126,6 +126,13 @@ part of the immutable plan, not a revision of an earlier run's evidence.
 separate startup, window, and final-sample budgets. A long declared lifetime
 never substitutes for the actual remaining-input checks before window start.
 
+Provenance records sizes and SHA-256 identities for the selected host loadgen,
+SDK generator and reader, plus the two mounted helper copies. Mounted copies
+must match the selected host artifacts; the identities are checked again after
+stack startup. Helper filesystem paths are not exported. These hashes bind
+actual artifacts, not a claim that a build was fresh or source-correct; cold
+source-specific build and source pre/post receipts remain required.
+
 Physical accounting includes all files under the declared source, tenant,
 checkpoint, WAL, router-state, and generator-staging roots: JSON history,
 checkpoints, uncommitted/orphan Parquet, and staging are not omitted. Logical
