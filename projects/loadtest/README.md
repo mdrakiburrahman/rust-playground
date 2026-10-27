@@ -548,6 +548,7 @@ that the two pools have equal physical row multiplicities.
 They also require the kusto-explorer UI gate. After the KQL assertions pass, the
 runner starts a Playwright browser container (Compose profile `ui-gate`) on the
 stack's network and drives `http://kusto-explorer:8080` like a user. The gate
+explicitly expands the External tables folder when collapsed, then
 checks the configured cluster is `http://kusto:8080`, the connections tree lists
 all 26 tables, and the per-table row counts exported from the UI match
 `kusto-validation.json`. It also runs a management command and a column chart,

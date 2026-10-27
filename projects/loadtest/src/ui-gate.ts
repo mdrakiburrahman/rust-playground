@@ -3,7 +3,7 @@ import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
-import { chromium, type Browser, type Page } from 'playwright';
+import { chromium, type Browser, type Locator, type Page } from 'playwright';
 
 import { safeKustoError } from './kusto.js';
 import { metricRangeEvidence, panelDiagnostics, panelFrameEvidence } from './metrics-gate.js';
@@ -164,7 +164,15 @@ function count(text: string): number {
   return Number(text.replace(/[^0-9]/gu, ''));
 }
 
-async function exercise(page: Page, expected: ReadonlyMap<string, number>, options: UiGateOptions, evidence: Evidence): Promise<UiGateResult> {
+export async function expandExternalTableFolder(folder: Pick<Locator, 'waitFor' | 'getAttribute' | 'click'>): Promise<void> {
+  await folder.waitFor({ state: 'visible', timeout: 60_000 });
+  const expanded = await folder.getAttribute('aria-expanded');
+  if (expanded === 'false') await folder.click();
+  else if (expanded !== 'true') throw new Error('External tables folder has no expansion state');
+}
+
+/** Browser-only checks, also usable against an existing stack without changing its lifecycle. */
+export async function exerciseExplorer(page: Page, expected: ReadonlyMap<string, number>, options: Pick<UiGateOptions, 'results'>, evidence: Evidence): Promise<UiGateResult> {
   const screenshot = async (name: string): Promise<void> => {
     await page.screenshot({ path: path.join(options.results, name) });
     evidence.screenshots.push(name);
@@ -184,6 +192,7 @@ async function exercise(page: Page, expected: ReadonlyMap<string, number>, optio
   if (config.ready.ready !== true) throw new Error('kusto-explorer /readyz reports Kusto as unreachable');
 
   await page.locator('[data-testid=status-connection][data-state=connected]').waitFor({ timeout: 60_000 });
+  await expandExternalTableFolder(page.locator('[data-testid=tree-node][data-kind=folder][data-name="External tables"]'));
   await page.waitForFunction(
     (minimum) => document.querySelectorAll('[data-testid=tree-node][data-kind=external-table]').length >= minimum,
     expected.size,
@@ -274,7 +283,7 @@ export async function runUiGate(options: UiGateOptions): Promise<UiGateResult> {
       if (message.type() === 'error') evidence.console_errors.push(message.text().slice(0, 500));
     });
     page.on('pageerror', (error) => evidence.console_errors.push(`page error: ${error.message}`.slice(0, 500)));
-    const result = await exercise(page, expected, options, evidence);
+    const result = await exerciseExplorer(page, expected, options, evidence);
     if (evidence.console_errors.length > 0) {
       throw new Error(`The page logged errors: ${evidence.console_errors.join(' | ')}`);
     }

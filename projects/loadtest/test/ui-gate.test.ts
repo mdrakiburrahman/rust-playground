@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import {
-  expectedTableRows, kustoExplorerClusterUri, kustoExplorerStartArguments, kustoExplorerUrl, tableRowMismatches, tableSummaryQuery,
+  expandExternalTableFolder, expectedTableRows, kustoExplorerClusterUri, kustoExplorerStartArguments, kustoExplorerUrl, tableRowMismatches, tableSummaryQuery,
 } from '../src/ui-gate.js';
 
 const validation = {
@@ -13,6 +13,33 @@ const validation = {
     "['dataflow_sqlserver_cpu_utilization']": { expected_rows: 23552, actual: { Rows: 23552, Invalid: 0 } },
   },
 };
+
+test('external-table discovery expands a collapsed folder without collapsing an open one', async () => {
+  for (const expanded of ['false', 'true', null]) {
+    const calls: string[] = [];
+    const result = expandExternalTableFolder({
+      waitFor: async () => { calls.push('visible'); },
+      getAttribute: async (name) => { assert.equal(name, 'aria-expanded'); return expanded; },
+      click: async () => { calls.push('click'); },
+    });
+    if (expanded === null) await assert.rejects(result, /no expansion state/u);
+    else await result;
+    assert.deepEqual(calls, expanded === 'false' ? ['visible', 'click'] : ['visible']);
+  }
+});
+
+test('external-table folder failures propagate instead of silently skipping discovery', async () => {
+  await assert.rejects(expandExternalTableFolder({
+    waitFor: async () => { throw new Error('folder missing'); },
+    getAttribute: async () => 'false',
+    click: async () => { throw new Error('must not click'); },
+  }), /folder missing/u);
+  await assert.rejects(expandExternalTableFolder({
+    waitFor: async () => {},
+    getAttribute: async () => 'false',
+    click: async () => { throw new Error('click failed'); },
+  }), /click failed/u);
+});
 
 test('kusto-explorer starts alone, waits for its health check and is addressed through Compose DNS', () => {
   assert.deepEqual(kustoExplorerStartArguments, [
