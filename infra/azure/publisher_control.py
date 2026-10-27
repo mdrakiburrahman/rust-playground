@@ -81,8 +81,9 @@ class PublisherControl:
     def admit(self, publisher, generation, bootstrap=False):
         """Normal admission needs ready-v1; bootstrap needs fenced-v1+empty+released.
 
-        bootstrap=True mirrors the Rust child initializer's own admission rule; the
-        Python parent never registers itself as the bootstrap owner.
+        bootstrap=True is used by the Rust child for its own UUID and, after the
+        child has unregistered, by the Python parent for its own FRESH UUID before
+        any hosted-state I/O. Neither adopts the other's identity.
         """
         publisher, generation = canonical_uuid(publisher), canonical_uuid(generation)
         metadata, registry, etag = self.read()
@@ -175,17 +176,26 @@ class PublisherControl:
         metadata["resetstate"] = FENCED
         return self.cas(metadata, {}, etag)
 
-    def finalize_ready(self, generation):
-        """Parent finalization after the Rust child's exclusive bootstrap.
+    def bootstrap_owner(self, publisher, generation):
+        """Re-verify exclusive bootstrap ownership before each parent KQL/ARM step."""
+        publisher, metadata, registry, etag = self.member(publisher, generation)
+        require_released(metadata)
+        if (metadata["resetstate"] != FENCED or set(registry) != {publisher} or
+                registry[publisher]["state"] != "active"):
+            raise Failure("Caller does not hold exclusive definite bootstrap authority.")
+        return publisher, metadata, etag
 
-        The child admits its own fresh UUID under fenced-v1+empty+released and
-        deregisters only after definitive physical drain. The parent never
-        registers or adopts the child's identity. It opens admission only if the
-        SAME generation captured before launching the child is still fenced-v1
-        with an empty registry. Any cleanup in between leaves cleaning-v1 or a
-        rotated generation, and an uncertain child leaves a member, so this
-        CAS fails closed.
+    def complete_bootstrap(self, publisher, generation, *, definitively_drained):
+        """Remove the caller's own exclusive bootstrap member and set ready-v1 in one CAS.
+
+        Custody: the Rust child admits, drains and unregisters its own UUID. The
+        Python parent then admits a FRESH UUID with admit(bootstrap=True) for the
+        same captured generation BEFORE any Kusto or other hosted-state I/O, holds
+        it through all of that work and completes here. It never adopts the
+        child's UUID. Unknown admin outcomes keep the member active or uncertain.
         """
-        metadata, etag = self.drained(canonical_uuid(generation))
+        publisher, metadata, etag = self.bootstrap_owner(publisher, generation)
+        if definitively_drained is not True:
+            raise Failure("Bootstrap completion requires definitive completion of every request.")
         metadata["resetstate"] = READY
         return self.cas(metadata, {}, etag)
