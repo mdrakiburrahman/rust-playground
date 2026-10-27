@@ -345,6 +345,29 @@ class PublisherControlTests(unittest.TestCase):
             self.control.finish_cleanup(cleaner, self.generation, str(uuid.uuid4()),
                                         definitively_cleaned=True)
         self.assertEqual(self.registry()[cleaner]["state"], "uncertain")
+
+    def test_abort_cleanup_requires_held_custody_and_no_deletion_and_keeps_generation(self):
+        cleaner = str(uuid.uuid4())
+        self.control.fence(self.generation)
+        with self.assertRaises(Failure):  # no custody held
+            self.control.abort_cleanup(cleaner, self.generation, nothing_deleted=True)
+        self.control.claim_cleanup(cleaner, self.generation)
+        for attempt in (lambda: self.control.abort_cleanup(cleaner, self.generation, nothing_deleted=False),
+                        lambda: self.control.abort_cleanup(str(uuid.uuid4()), self.generation,
+                                                           nothing_deleted=True),
+                        lambda: self.control.abort_cleanup(cleaner, str(uuid.uuid4()), nothing_deleted=True)):
+            with self.assertRaises(Failure):
+                attempt()
+        self.assertEqual(self.azure.metadata["resetstate"], CLEANING)
+        self.control.abort_cleanup(cleaner, self.generation, nothing_deleted=True)
+        self.assertEqual((self.azure.metadata["resetstate"], self.azure.metadata["resetgeneration"],
+                          self.registry()), (FENCED, self.generation, {}))
+        self.control.claim_cleanup(cleaner, self.generation)
+        self.control.uncertain(cleaner, self.generation)
+        with self.assertRaises(Failure):
+            self.control.abort_cleanup(cleaner, self.generation, nothing_deleted=True)
+        self.assertEqual(self.azure.metadata["resetstate"], CLEANING)
+
     def test_cas_unknown_on_parent_completion_does_not_report_success(self):
         self.control.fence(self.generation)
         self.child_bootstrap(self.generation)

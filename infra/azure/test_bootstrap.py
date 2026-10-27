@@ -166,9 +166,19 @@ class ResetTests(unittest.TestCase):
         self.azure = FakeAzure()
         self.quiet = contextlib.redirect_stdout(io.StringIO())
         self.quiet.__enter__()
+        self.directory = tempfile.TemporaryDirectory()
+        self.record = Path(self.directory.name) / ".env.azure.reset.json"
+        self.record_patch = patch.object(b, "RESET_RECORD", self.record)
+        self.record_patch.__enter__()
 
     def tearDown(self):
+        self.record_patch.__exit__(None, None, None)
+        self.directory.cleanup()
         self.quiet.__exit__(None, None, None)
+
+    def receipt(self, generation=None):
+        return json.dumps({"stopped": True, "scope": "workspace-owned-loadtest", "dataPreserved": True,
+                           "resetGeneration": generation or self.azure.metadata["resetgeneration"]}) + "\n"
 
     def test_preview_has_no_mutations(self):
         b.reset(self.azure, False, None)
@@ -182,7 +192,7 @@ class ResetTests(unittest.TestCase):
     def test_public_execute_always_fails_closed_even_with_stop_receipt(self):
         with patch.object(b, "run_tree") as run:
             run.return_value.returncode = 0
-            run.return_value.stdout = '{"stopped":true,"scope":"workspace-owned-loadtest","dataPreserved":true}\n'
+            run.return_value.stdout = self.receipt()
             with self.assertRaisesRegex(b.Failure, "Destructive reset is disabled"):
                 b.reset(self.azure, True, ["stop"])
             run.assert_not_called()
@@ -247,7 +257,7 @@ class ResetTests(unittest.TestCase):
     @patch.object(b, "run_tree")
     def test_reset_fences_quiesces_then_deletes_every_blob_and_database(self, run, sleep):
         run.return_value.returncode = 0
-        run.return_value.stdout = '{"stopped":true,"scope":"workspace-owned-loadtest","dataPreserved":true}\n'
+        run.return_value.stdout = self.receipt()
         before = self.azure.metadata["resetgeneration"]
         b._unqualified_reset_sequence(self.azure, ["stop"])
         sleep.assert_called_once_with(60)
@@ -265,7 +275,7 @@ class ResetTests(unittest.TestCase):
     @patch.object(b, "run_tree")
     def test_physical_emptiness_failure_is_visible(self, run, sleep):
         run.return_value.returncode = 0
-        run.return_value.stdout = '{"stopped":true,"scope":"workspace-owned-loadtest","dataPreserved":true}\n'
+        run.return_value.stdout = self.receipt()
         with patch.object(self.azure, "blob"):
             with self.assertRaisesRegex(b.Failure, "left workload"):
                 b._unqualified_reset_sequence(self.azure, ["stop"])
@@ -283,7 +293,7 @@ class ResetTests(unittest.TestCase):
     @patch.object(b, "run_tree")
     def test_removes_empty_hns_directories_deepest_first(self, run, sleep):
         run.return_value.returncode = 0
-        run.return_value.stdout = '{"stopped":true,"scope":"workspace-owned-loadtest","dataPreserved":true}\n'
+        run.return_value.stdout = self.receipt()
         self.azure.directories[self.azure.c.data] = ["table", "table/empty", "table/empty/deeper"]
         b._unqualified_reset_sequence(self.azure, ["stop"])
         self.assertEqual(self.azure.directories[self.azure.c.data], [])
@@ -294,7 +304,7 @@ class ResetTests(unittest.TestCase):
     @patch.object(b, "run_tree")
     def test_late_inflight_publication_is_inventoried_after_grace(self, run, sleep):
         run.return_value.returncode = 0
-        run.return_value.stdout = '{"stopped":true,"scope":"workspace-owned-loadtest","dataPreserved":true}\n'
+        run.return_value.stdout = self.receipt()
         sleep.side_effect = lambda _: self.azure.items[self.azure.c.data].append({
             "name": "table/late.parquet", "version": None, "snapshot": None, "deleted": False,
         })
@@ -305,11 +315,293 @@ class ResetTests(unittest.TestCase):
     @patch.object(b, "run_tree")
     def test_fence_change_during_quiescence_refuses_all_deletion(self, run, sleep):
         run.return_value.returncode = 0
-        run.return_value.stdout = '{"stopped":true,"scope":"workspace-owned-loadtest","dataPreserved":true}\n'
+        run.return_value.stdout = self.receipt()
         sleep.side_effect = lambda _: self.azure.metadata.update(resetgeneration=str(uuid.uuid4()))
         with self.assertRaisesRegex(b.Failure, "during quiescence"):
             b._unqualified_reset_sequence(self.azure, ["stop"])
         self.assertFalse(any(event[0] in ("DELETE", "DELETE_DIRECTORY", "cli") for event in self.azure.events))
+
+    # --- gap 5: generation-bound runner stop receipt ---------------------------------
+
+    @patch.object(b, "run_tree")
+    def test_stop_receipt_must_bind_captured_generation(self, run):
+        run.return_value.returncode = 0
+        generation = self.azure.metadata["resetgeneration"]
+        legacy = '{"stopped":true,"scope":"workspace-owned-loadtest","dataPreserved":true}\n'
+        for stdout in (self.receipt(str(uuid.uuid4())), legacy, self.receipt(generation.upper())):
+            run.return_value.stdout = stdout
+            with self.assertRaisesRegex(b.Failure, "this reset generation"):
+                b._unqualified_reset_sequence(self.azure, ["stop"])
+            self.assertEqual(run.call_args.kwargs["env"]["ARROWCOL_RESET_GENERATION"], generation)
+        self.assertEqual(self.azure.events, [("control", "fenced-v1")])
+        self.assertFalse(self.record.exists())
+
+    # --- gap 2: reset never starts/stops; stop-vs-reset in both orders ---------------
+
+    def run_stop(self):
+        def cli(*args):
+            self.azure.events.append(("arm-stop",))
+            self.azure.cluster_state = "Stopped"
+        with patch.object(self.azure, "cli", side_effect=cli), \
+                patch.object(b, "retry_ready", lambda action, label, timeout=600: action()):
+            b.stop_cluster(self.azure)
+
+    def assert_no_deletion(self):
+        self.assertFalse(any(event[0] in ("DELETE", "DELETE_DIRECTORY", "cli")
+                             for event in self.azure.events), self.azure.events)
+
+    @patch.object(b, "run_tree")
+    def test_non_running_cluster_refused_before_fence(self, run):
+        for state in ("Stopped", "Stopping", "Starting"):
+            self.azure.cluster_state = state
+            with self.assertRaisesRegex(b.Failure, "Running"):
+                b._unqualified_reset_sequence(self.azure, ["stop"])
+        run.assert_not_called()
+        self.assertEqual(self.azure.events, [])
+
+    @patch.object(b, "run_tree")
+    def test_stop_first_held_or_completed_reset_has_no_effect(self, run):
+        self.azure.metadata.update(occupancy="stopping", occupancyid=str(uuid.uuid4()))
+        with self.assertRaisesRegex(b.Failure, "stop hold"):
+            b._unqualified_reset_sequence(self.azure, ["stop"])
+        self.azure.metadata.update(occupancy="released")
+        self.azure.metadata.pop("occupancyid")
+        self.run_stop()
+        before = list(self.azure.events)
+        with self.assertRaisesRegex(b.Failure, "Running"):
+            b._unqualified_reset_sequence(self.azure, ["stop"])
+        run.assert_not_called()
+        self.assertEqual(self.azure.events, before)
+        self.assertEqual(self.azure.metadata["resetstate"], "ready-v1")
+
+    @patch.object(b.time, "sleep")
+    @patch.object(b, "run_tree")
+    def test_stop_completing_during_quiescence_aborts_claim_before_deletion(self, run, sleep):
+        run.return_value.returncode, run.return_value.stdout = 0, self.receipt()
+        generation = self.azure.metadata["resetgeneration"]
+        sleep.side_effect = lambda _: self.run_stop()  # fenced-v1+empty: stop may claim
+        with self.assertRaisesRegex(b.Failure, "a stop won"):
+            b._unqualified_reset_sequence(self.azure, ["stop"])
+        self.assert_no_deletion()
+        self.assertEqual(self.azure.events.count(("arm-stop",)), 1)
+        self.assertEqual([e for e in self.azure.events if e[0] == "control"][-2:],
+                         [("control", "cleaning-v1"), ("control", "fenced-v1")])
+        self.assertEqual((self.azure.metadata["resetstate"], self.azure.metadata["resetgeneration"],
+                          self.azure.metadata["publishers"], self.azure.metadata["occupancy"]),
+                         ("fenced-v1", generation, "{}", "released"))
+        self.assertFalse(self.record.exists())
+
+    @patch.object(b.time, "sleep")
+    @patch.object(b, "run_tree")
+    def test_stop_hold_in_flight_at_claim_refuses_definitely(self, run, sleep):
+        run.return_value.returncode, run.return_value.stdout = 0, self.receipt()
+        sleep.side_effect = lambda _: self.azure.metadata.update(
+            occupancy="stopping", occupancyid=str(uuid.uuid4()))
+        with self.assertRaisesRegex(b.Failure, "during quiescence"):
+            b._unqualified_reset_sequence(self.azure, ["stop"])
+        self.assert_no_deletion()
+        self.assertEqual(self.azure.metadata["resetstate"], "fenced-v1")
+        self.assertFalse(self.record.exists())
+
+    @patch.object(b.time, "sleep")
+    @patch.object(b, "run_tree")
+    def test_cleanup_claimed_first_stop_is_refused_without_arm(self, run, sleep):
+        run.return_value.returncode, run.return_value.stdout = 0, self.receipt()
+        original, refused = self.azure.blob, []
+        def blob(method, *args, **kwargs):
+            if method == "DELETE" and not refused:
+                with self.assertRaisesRegex(b.Failure, "Cleanup owns"):
+                    self.run_stop()
+                refused.append(True)
+            return original(method, *args, **kwargs)
+        with patch.object(self.azure, "blob", side_effect=blob):
+            b._unqualified_reset_sequence(self.azure, ["stop"])
+        self.assertEqual(refused, [True])
+        self.assertNotIn(("arm-stop",), self.azure.events)
+        self.assertEqual(self.azure.cluster_state, "Running")
+
+    # --- gap 1: persisted custody record and read-only-first resume -------------------
+
+    def start_reset(self, run):
+        run.return_value.returncode, run.return_value.stdout = 0, self.receipt()
+        return self.azure.metadata["resetgeneration"]
+
+    def assert_clean_finish(self, record):
+        self.assertFalse(self.record.exists())
+        self.assertEqual((self.azure.metadata["resetstate"], self.azure.metadata["resetgeneration"],
+                          self.azure.metadata["publishers"]), ("fenced-v1", record["next"], "{}"))
+        self.assertEqual(sum(len(items) for items in self.azure.items.values()), 0)
+        self.assertEqual(self.azure.databases, [])
+
+    def test_fresh_sequence_refuses_when_custody_record_exists(self):
+        b.write_reset_record(self.record, {"sandbox": self.azure.c.sandbox, "operator": str(uuid.uuid4()),
+                                           "generation": str(uuid.uuid4()), "next": str(uuid.uuid4())})
+        with self.assertRaisesRegex(b.Failure, "resume"):
+            b._unqualified_reset_sequence(self.azure, ["stop"])
+        self.assertEqual(self.azure.events, [])
+
+    @patch.object(b.time, "sleep")
+    @patch.object(b, "run_tree")
+    def test_record_persisted_before_claim_and_interruption_after_claim_resumes(self, run, sleep):
+        generation = self.start_reset(run)
+        original = self.azure.set_control
+        def set_control(metadata, etag):
+            if metadata["resetstate"] == "cleaning-v1":
+                record = b.read_reset_record(self.record)  # durable BEFORE claim CAS
+                self.assertEqual(record["generation"], generation)
+                self.assertEqual(json.loads(metadata["publishers"]),
+                                 {record["operator"]: {"generation": generation, "state": "active"}})
+            return original(metadata, etag)
+        def crash(*args, **kwargs):
+            raise KeyboardInterrupt
+        with patch.object(self.azure, "set_control", side_effect=set_control), \
+                patch.object(self.azure, "blob", side_effect=crash):
+            with self.assertRaises(KeyboardInterrupt):
+                b._unqualified_reset_sequence(self.azure, ["stop"])
+        record = b.read_reset_record(self.record)
+        self.assertEqual(self.azure.metadata["resetstate"], "cleaning-v1")
+        self.assertEqual(oct(self.record.stat().st_mode & 0o777), "0o600")
+        b._unqualified_reset_resume(self.azure)
+        self.assert_clean_finish(record)
+
+    @patch.object(b.time, "sleep")
+    @patch.object(b, "run_tree")
+    def test_ambiguous_claim_not_applied_reclaims_same_operator_on_resume(self, run, sleep):
+        self.start_reset(run)
+        original = self.azure.set_control
+        def lost(metadata, etag):
+            if metadata["resetstate"] == "cleaning-v1":
+                raise b.Failure("timeout before apply")
+            return original(metadata, etag)
+        with patch.object(self.azure, "set_control", side_effect=lost):
+            with self.assertRaisesRegex(b.Failure, "outcome unknown"):
+                b._unqualified_reset_sequence(self.azure, ["stop"])
+        self.assert_no_deletion()
+        self.assertEqual(self.azure.metadata["resetstate"], "fenced-v1")
+        record = b.read_reset_record(self.record)
+        b._unqualified_reset_resume(self.azure)
+        self.assert_clean_finish(record)
+
+    @patch.object(b.time, "sleep")
+    @patch.object(b, "run_tree")
+    def test_ambiguous_claim_applied_continues_without_new_identity(self, run, sleep):
+        self.start_reset(run)
+        original = self.azure.set_control
+        def applied_then_lost(metadata, etag):
+            original(metadata, etag)
+            if metadata["resetstate"] == "cleaning-v1":
+                raise b.Failure("response lost after apply")
+        with patch.object(self.azure, "set_control", side_effect=applied_then_lost):
+            with self.assertRaisesRegex(b.Failure, "outcome unknown"):
+                b._unqualified_reset_sequence(self.azure, ["stop"])
+        self.assert_no_deletion()
+        record = b.read_reset_record(self.record)
+        self.assertEqual(list(json.loads(self.azure.metadata["publishers"])), [record["operator"]])
+        b._unqualified_reset_resume(self.azure)
+        self.assert_clean_finish(record)
+
+    @patch.object(b.time, "sleep")
+    @patch.object(b, "run_tree")
+    def test_applied_delete_with_lost_response_is_observed_not_replayed(self, run, sleep):
+        self.start_reset(run)
+        original = self.azure.blob
+        def lost(method, container, name, **kwargs):
+            original(method, container, name, **kwargs)
+            raise b.Failure("DELETE response lost")
+        with patch.object(self.azure, "blob", side_effect=lost):
+            with self.assertRaisesRegex(b.Failure, "response lost"):
+                b._unqualified_reset_sequence(self.azure, ["stop"])
+        record = b.read_reset_record(self.record)
+        self.assertEqual(self.azure.metadata["resetstate"], "cleaning-v1")
+        b._unqualified_reset_resume(self.azure)
+        self.assertEqual(self.azure.events.count(("DELETE", "table/data.parquet")), 1)
+        self.assert_clean_finish(record)
+
+    @patch.object(b.time, "sleep")
+    @patch.object(b, "run_tree")
+    def test_pending_database_delete_is_observed_and_never_false_clean(self, run, sleep):
+        self.start_reset(run)
+        def submit(*args):
+            self.azure.events.append(("cli", args[2]))
+            self.azure.databases = [{"name": self.azure.c.database,
+                                     "properties": {"provisioningState": "Deleting"}}]
+        with patch.object(self.azure, "cli", side_effect=submit), \
+                patch.object(b, "retry_ready", lambda action, label, timeout=600: action()):
+            with self.assertRaisesRegex(b.Failure, "still in progress"):
+                b._unqualified_reset_sequence(self.azure, ["stop"])
+            record = b.read_reset_record(self.record)
+            self.assertEqual(self.azure.metadata["resetstate"], "cleaning-v1")
+            with self.assertRaisesRegex(b.Failure, "still in progress"):
+                b._unqualified_reset_resume(self.azure)
+            self.assertEqual(self.azure.metadata["resetstate"], "cleaning-v1")
+            self.assertEqual(self.azure.events.count(("cli", "delete")), 1)
+            self.azure.databases = []
+            b._unqualified_reset_resume(self.azure)
+        self.assertEqual(self.azure.events.count(("cli", "delete")), 1)
+        self.assert_clean_finish(record)
+
+    @patch.object(b.time, "sleep")
+    @patch.object(b, "run_tree")
+    def test_ambiguous_finish_is_recognized_by_persisted_successor(self, run, sleep):
+        self.start_reset(run)
+        original = self.azure.set_control
+        def applied_then_lost(metadata, etag):
+            original(metadata, etag)
+            if metadata["resetstate"] == "fenced-v1" and json.loads(metadata["publishers"]) == {} \
+                    and self.record.exists() and \
+                    metadata["resetgeneration"] == b.read_reset_record(self.record)["next"]:
+                raise b.Failure("finish response lost")
+        with patch.object(self.azure, "set_control", side_effect=applied_then_lost):
+            with self.assertRaisesRegex(b.Failure, "definitive success"):
+                b._unqualified_reset_sequence(self.azure, ["stop"])
+        record = b.read_reset_record(self.record)
+        events = list(self.azure.events)
+        b._unqualified_reset_resume(self.azure)
+        self.assertEqual(self.azure.events, events)
+        self.assert_clean_finish(record)
+
+    @patch.object(b.time, "sleep")
+    @patch.object(b, "run_tree")
+    def test_emptiness_failure_keeps_custody_and_record(self, run, sleep):
+        self.start_reset(run)
+        with patch.object(self.azure, "blob"):
+            with self.assertRaisesRegex(b.Failure, "left workload"):
+                b._unqualified_reset_sequence(self.azure, ["stop"])
+        self.assertTrue(self.record.exists())
+        self.assertEqual(self.azure.metadata["resetstate"], "cleaning-v1")
+
+    def test_resume_never_takes_over_foreign_uncertain_or_other_generation(self):
+        generation = self.azure.metadata["resetgeneration"]
+        operator = str(uuid.uuid4())
+        record = {"sandbox": self.azure.c.sandbox, "operator": operator,
+                  "generation": generation, "next": str(uuid.uuid4())}
+        b.write_reset_record(self.record, record)
+        cases = {
+            "uncertain own": ("cleaning-v1", generation, {operator: "uncertain"}),
+            "foreign": ("cleaning-v1", generation, {str(uuid.uuid4()): "active"}),
+            "own plus foreign": ("cleaning-v1", generation, {operator: "active", str(uuid.uuid4()): "active"}),
+            "fenced with member": ("fenced-v1", generation, {str(uuid.uuid4()): "active"}),
+            "ready same generation": ("ready-v1", generation, {}),
+        }
+        for label, (state, gen, members) in cases.items():
+            with self.subTest(label):
+                publishers = {key: {"generation": gen, "state": value} for key, value in members.items()}
+                self.azure.metadata.update(resetstate=state, resetgeneration=gen,
+                                           publishers=json.dumps(publishers, separators=(",", ":"), sort_keys=True))
+                before = dict(self.azure.metadata)
+                with self.assertRaisesRegex(b.Failure, "never taking over"):
+                    b._unqualified_reset_resume(self.azure)
+                self.assertEqual(self.azure.metadata, before)
+        other = str(uuid.uuid4())
+        self.azure.metadata.update(resetstate="cleaning-v1", resetgeneration=other, publishers=json.dumps(
+            {operator: {"generation": other, "state": "active"}}, separators=(",", ":")))
+        with self.assertRaisesRegex(b.Failure, "neither"):
+            b._unqualified_reset_resume(self.azure)
+        b.write_reset_record(self.record, {**record, "sandbox": "another"})
+        with self.assertRaisesRegex(b.Failure, "another sandbox"):
+            b._unqualified_reset_resume(self.azure)
+        self.assertEqual(self.azure.events, [])
+        self.assertTrue(self.record.exists())
 
 
 class OccupancyTests(unittest.TestCase):
@@ -815,7 +1107,7 @@ class RunTreeTests(unittest.TestCase):
             with patch.object(b, "run_tree", lambda cmd, timeout, **kw: real(cmd, 0.5, **kw)), \
                     contextlib.redirect_stdout(io.StringIO()):
                 with self.assertRaisesRegex(b.Failure, "outcome unknown"):
-                    b._unqualified_reset_sequence(azure, command)
+                    b._unqualified_reset_sequence(azure, command, Path(directory) / "reset.json")
             time.sleep(2.5)
             self.assertFalse(marker.exists())
         self.assertEqual(azure.metadata["resetstate"], "fenced-v1")
@@ -1214,6 +1506,35 @@ class ProvisionCoordinationTests(unittest.TestCase):
             self.assertEqual(b.main(["release", "--occupancy-id", owner, "--reset-generation",
                                      generation, "--env-file", str(env)]), 0)
         self.assertEqual(self.azure.metadata["occupancy"], "released")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_dispatched_entrypoints_have_no_effect_while_cleanup_owns_authority(self):
+        """Gap 4: cleaning-v1 excludes every public mutator before ARM/KQL/blob I/O."""
+        env = Path(self.directory.name) / ".env"
+        env.write_text(f"AZURE_SUBSCRIPTION_ID={SUB}\n")
+        generation, operator = self.azure.metadata["resetgeneration"], str(uuid.uuid4())
+        self.azure.metadata.update(resetstate="cleaning-v1", publishers=json.dumps(
+            {operator: {"generation": generation, "state": "active"}}, separators=(",", ":")))
+        before = dict(self.azure.metadata)
+        owner = str(uuid.uuid4())
+        commands = (["provision"], ["provision", "--infra-only"], ["reconcile"],
+                    ["reconcile", "--occupancy-id", owner, "--reset-generation", generation],
+                    ["stop", "--execute"], ["occupy", "--occupancy-id", owner],
+                    ["release", "--occupancy-id", owner, "--reset-generation", generation],
+                    ["reset", "--execute"])
+        with patch.object(b, "Azure", return_value=self.azure), patch.object(b, "preflight"), \
+                contextlib.redirect_stderr(io.StringIO()):
+            for command in commands:
+                with self.subTest(command=command):
+                    self.assertEqual(b.main([*command, "--env-file", str(env), "--output", str(self.output),
+                                             "--tables", str(self.tables)]), 1)
+        self.assertEqual(self.azure.metadata, before)
+        self.assertEqual((self.azure.events, self.deployed, self.observed, self.child), ([], [], [], {}))
+        self.assertFalse(self.output.exists())
+        for bootstrap in (False, True):
+            with self.assertRaisesRegex(b.Failure, "fenced, cleanup-owned"):
+                self.control.admit(str(uuid.uuid4()), generation, bootstrap=bootstrap)
+        self.assertEqual(self.azure.metadata, before)
 
 class PublisherRegistryTests(unittest.TestCase):
     def metadata(self, entries):

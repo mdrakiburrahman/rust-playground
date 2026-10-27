@@ -305,6 +305,56 @@ metadata remains fenced without leaving a marker blob. A subsequent full
 The foundation's explicit empty-root initializer is the only bootstrap path that
 can create schema roots while fenced; normal publishers have no bypass.
 
+### Gated operator path (not dispatched)
+
+The following describes the operator sequence behind the still-disabled public
+`reset --execute`. Nothing below is reachable from the CLI.
+
+- **Running gate.** Reset never starts or stops the cluster. It refuses a
+  non-`Running` cluster before fencing. If a released `stop` wins during
+  quiescence (fenced, empty registry), the post-claim check observes the
+  non-`Running` cluster and `abort_cleanup` returns `cleaning-v1` to `fenced-v1`
+  at the same generation, before any deletion. Once cleanup owns the
+  authority, `stop` is refused before any ARM call.
+- **Generation-bound stop receipt.** The runner stop command receives the
+  captured generation as `ARROWCOL_RESET_GENERATION`. It must print
+  `{"stopped":true,"scope":"workspace-owned-loadtest","dataPreserved":true,"resetGeneration":G}`.
+  A receipt without that exact lowercase generation is rejected. The receipt
+  is workspace-local evidence. Registry closure remains the drain proof.
+- **Custody record.** Before the claim CAS, the operator UUID, the captured
+  generation, the precomputed successor generation and the sandbox are
+  written atomically to the gitignored, mode-`0600` `.env.azure.reset.json`.
+  A fresh sequence refuses while that record exists.
+  - Resume first re-reads the authority.
+  - If the successor generation is already present, the earlier finish
+    applied, and resume only removes the record.
+  - If the authority is fenced and empty at the recorded generation (the claim
+    never applied), resume re-claims with the same operator UUID.
+  - Otherwise resume requires `cleaning-v1` with exactly that one active
+    operator.
+  - Foreign, uncertain, extra or other-generation members are refused, never
+    taken over or cleared.
+  - An unknown claim, delete or finish keeps the record and custody.
+- **Observe-first deletion.** Every step re-inventories. An applied blob DELETE
+  whose response was lost is not replayed. A database already `Deleting` is
+  not resubmitted, and a pending database delete fails rather than reporting
+  clean. Unknown stop/start outcomes are never replayed by reset.
+
+### Writer inventory (enablement gate input)
+
+| Writer | Published source | Reset-relevant tests | Status |
+| --- | --- | --- | --- |
+| Rust core publisher session | `7307a94` (`publisher.rs`, `delta.rs`) | `bootstrap_is_exclusive_and_generation_pinned`, `stopping_occupancy_blocks_all_admission`, `stale_generation_refuses_write_and_cleanup`, `uncertain_outcomes_retain_member`, `azure_admission_requires_configured_generation`, `unknown_shared_admission_is_permanent` | Offline pass |
+| `arrowcol-rust`, `arrowcol-dataflow-rust`, `delta-maintenance` binaries | `7307a94` (`close_shared` on exit) | Core `clean_drain_deregisters_only_self`, `inflight_upload_refuses_close_until_settled` | Offline pass |
+| Tenant stream (sink and checkpoint) | `5dd2c85` | Shared admission across sink and checkpoint | Offline pass |
+| Azure copy/rename | `7307a94` | `azure_server_side_copy_is_unreachable` | Unsupported before I/O |
+| Collector replay | `8b82339`, `590a329` | Replay epoch fencing | Actual WAL drain **pending** |
+| Loadgen `initialize-azure` child | `89d3eee` | Expected-generation integration of `7307a94` | **Unverified** |
+| Python parent (bootstrap/reconcile/release/stop) | this directory | `test_bootstrap`, `test_publisher_control` | Offline pass |
+
+Offline passes are orchestration evidence only. Public enablement still
+requires the pending rows plus live qualification.
+
 After live tests release occupancy, the lifecycle owner stops (never deletes)
 the cluster:
 
