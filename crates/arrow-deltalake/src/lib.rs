@@ -25,6 +25,8 @@ pub mod layout;
 #[cfg(feature = "delta")]
 pub mod normalize;
 pub mod sizing;
+#[cfg(feature = "delta")]
+pub mod telemetry;
 
 /// Stable size and row counters for one completed Parquet file.
 ///
