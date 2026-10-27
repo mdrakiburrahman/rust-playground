@@ -463,6 +463,12 @@ the seven Kernel/publication families must have actual samples from **each**
 collector's OTLP resource, plus healthy live scrapes and individual source
 counter/byte/duration/value/version panel screenshots paired with their exact datasource
 queries. A baseline pass is not full service telemetry qualification.
+All fourteen Delta operations time-series panels set Grafana's panel query
+minimum interval to `2s`, matching the OTLP metric export cadence and the gate's
+direct range queries. Without this override the LGTM datasource's `60s` default
+can undersample short-lived maintenance series in the actual rendered plot.
+The instant inventory table is unchanged; every returned time-series frame must
+still contain at least three actual numeric samples in the same 300-second window.
 `service-qualification` additionally requires real maintenance removals and
 physical deletion, tenant skipping/checkpoint metrics and native QAP per pool;
 bridge metrics are required only when enabled. Measured zero backlog/retries are
