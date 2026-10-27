@@ -92,7 +92,15 @@
     "reader-build": {
       "executor": "nx:run-commands",
       "cache": false,
-      "dependsOn": ["lint", "test"],
+      "dependsOn": [
+        "lint",
+        "test",
+        {"projects": ["arrowcol-sdk-gen"], "target": "lint"},
+        {"projects": ["arrowcol-sdk-gen"], "target": "build"},
+        {"projects": ["arrowcol-sdk-gen"], "target": "test"},
+        {"projects": ["arrowcol-sdk-gen"], "target": "compatibility"},
+        {"projects": ["arrowcol-sdk-gen"], "target": "package-artifact"}
+      ],
       "options": {
         "command": "projects/loadtest/scripts/build-reader-bundle.sh"
       }

@@ -38,7 +38,10 @@ test('lint and tests finish before static helper installation for every loadtest
   const project = JSON.parse(readFileSync(path.join(root, 'projects/loadtest/project.json'), 'utf8')) as ProjectConfiguration;
   const targets = project.targets;
   assert.ok(targets);
-  assert.deepEqual(targets['reader-build'].dependsOn, ['lint', 'test']);
+  const sdkWriters = ['lint', 'build', 'test', 'compatibility', 'package-artifact'];
+  assert.deepEqual(targets['reader-build'].dependsOn, [
+    'lint', 'test', ...sdkWriters.map(target => ({ projects: ['arrowcol-sdk-gen'], target })),
+  ]);
   assert.deepEqual(targets.lint.dependsOn ?? [], []);
   assert.deepEqual(targets.test.dependsOn ?? [], []);
   assert.equal(targets['reader-build'].options?.command, 'projects/loadtest/scripts/build-reader-bundle.sh');
@@ -50,6 +53,14 @@ test('lint and tests finish before static helper installation for every loadtest
     'npx --no-install tsx projects/loadtest/src/main.ts --warmup 5s --measure 60s --batch-rows 1024 --validate --quiver --crash-after 15s',
   ]);
   assert.equal(targets.e2e.options?.parallel, false);
+  const sdk = JSON.parse(readFileSync(path.join(root, 'crates/arrowcol-sdk-gen/project.json'), 'utf8')) as ProjectConfiguration;
+  assert.ok(sdk.targets);
+  for (const writer of ['lint', 'build', 'test']) assert.deepEqual(sdk.targets[writer].dependsOn ?? [], []);
+  assert.deepEqual(sdk.targets.compatibility.dependsOn, ['generate']);
+  assert.deepEqual(sdk.targets['package-artifact'].dependsOn, ['generated-test']);
+  assert.deepEqual(sdk.targets['generated-test'].dependsOn, ['check']);
+  assert.deepEqual(sdk.targets.check.dependsOn, ['generate']);
+  assert.deepEqual(sdk.targets.generate.dependsOn ?? [], []);
   const ordered: string[] = [];
   const active = new Set<string>();
   const visit = (name: string): void => {
