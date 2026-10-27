@@ -1097,7 +1097,7 @@ fn short_error(error: &anyhow::Error) -> String {
 /// Replaces location-, identity-, and credential-shaped tokens (URIs, absolute paths, Azure
 /// resource IDs, GUIDs such as subscription or managed identity IDs, UPNs, SAS signatures, and
 /// JWTs) while keeping the surrounding diagnostic text.
-fn redact_text(text: &str) -> String {
+pub(crate) fn redact_text(text: &str) -> String {
     fn sensitive(token: &str) -> bool {
         let lower = token.to_ascii_lowercase();
         lower.contains("://")
