@@ -3628,7 +3628,7 @@ fn deletion_key(name: &str, checkpoint: u64) -> Result<(u64, u8)> {
         )
     };
     match name.strip_prefix("_delta_log/").and_then(classify_log_name) {
-        Some(LogObject::Json(version)) if version <= checkpoint => Ok((version, 0)),
+        Some(LogObject::Json(version)) if version < checkpoint => Ok((version, 0)),
         Some(LogObject::Checkpoint(version)) if version < checkpoint => Ok((version, 1)),
         _ => Err(invalid()),
     }
@@ -3682,7 +3682,7 @@ pub struct PrunePlan {
     /// The VACUUM LITE progress record the proof relied on.
     pub progress: Option<VacuumLiteProgress>,
     /// Log objects to delete in ascending version order: `NNN.json` for
-    /// `0..=C` and classic checkpoints below `C`.
+    /// `0..C` (`C.json` is retained, as in Delta log cleanup) and classic checkpoints below `C`.
     pub deletions: Vec<String>,
     pub backlog_files: u64,
 }
@@ -4022,8 +4022,9 @@ impl DeltaTable {
         Ok(())
     }
 
-    /// Whether every log object left at or below `floor` (JSON `<= floor`,
-    /// checkpoints `< floor`) is eligible: commit timestamp (when present) and
+    /// Whether every log object left below `floor` (JSON `< floor`, plus the
+    /// retained `floor` JSON when `include_floor` because a newer checkpoint will
+    /// make it deletable; checkpoints `< floor`) is eligible: commit timestamp (when present) and
     /// object modification time older than `log_cutoff_ms`, and every remove
     /// older than the progress cutoff, with progress covering the floor.
     #[allow(clippy::too_many_arguments)]
@@ -4036,13 +4037,15 @@ impl DeltaTable {
         progress: &VacuumLiteProgress,
         log_cutoff_ms: i64,
         config: &PruneConfig,
+        include_floor: bool,
     ) -> Result<bool> {
         if progress.version < floor {
             return Ok(false);
         }
         let modified = |name: String| names.get(&name).map(|meta| meta.last_modified.timestamp_millis());
         let old = |stamp: Option<i64>| stamp.is_some_and(|stamp| stamp < log_cutoff_ms);
-        for version in json.range(..=floor) {
+        let end = if include_floor { floor.saturating_add(1) } else { floor };
+        for version in json.range(..end) {
             let bytes = self.read_commit(*version, config.max_log_file_bytes)?;
             let facts = self.replay_commit(&mut LogReplay::default(), &bytes)?;
             let stamp = [facts.timestamp, modified(format!("{version:020}.json"))]
@@ -4155,31 +4158,47 @@ impl DeltaTable {
                 )));
             }
             let vacuumed = |stamp: &Option<i64>| stamp.is_some_and(|stamp| stamp < progress.cutoff_ms);
-            let mut eligible = replay.tombstones.values().all(|(_, stamp)| vacuumed(stamp));
-            let mut through = None;
-            if eligible {
+            let seeded = replay.tombstones.values().all(|(_, stamp)| vacuumed(stamp));
+            // Candidate `C` needs every remove in `..=C` vacuumed (later VACUUM LITE
+            // seeds from checkpoint `C`, which may drop tombstones) but only the
+            // deleted JSON `< C` aged; `C.json` itself is retained.
+            let (mut aged_below, mut vacuumed_through) = (seeded.then_some(first), None);
+            if seeded {
                 self.replay_range(&mut replay, first, newest, config, |version, facts| {
                     let modified = names
                         .get(&format!("{version:020}.json"))
                         .map(|meta| meta.last_modified.timestamp_millis());
                     let stamp = [facts.timestamp, modified].into_iter().flatten().max();
-                    eligible =
-                        stamp.is_some_and(|stamp| stamp < log_cutoff_ms) && facts.remove_stamps.iter().all(vacuumed);
-                    if eligible {
-                        through = Some(version);
+                    let vacuumed_here = facts.remove_stamps.iter().all(vacuumed);
+                    let aged = stamp.is_some_and(|stamp| stamp < log_cutoff_ms);
+                    if vacuumed_here {
+                        vacuumed_through = Some(version);
+                        if aged {
+                            aged_below = Some(version + 1);
+                        }
                     }
-                    eligible
+                    vacuumed_here && aged
                 })?;
             }
-            chosen = candidates
-                .iter()
-                .copied()
-                .find(|candidate| above_floor(*candidate) && through.is_some_and(|through| *candidate <= through));
+            chosen = candidates.iter().copied().find(|candidate| {
+                above_floor(*candidate)
+                    && aged_below.is_some_and(|limit| *candidate <= limit)
+                    && vacuumed_through.is_some_and(|through| *candidate <= through)
+            });
         }
         // History left at or below the floor by an interrupted prune must satisfy
         // the same eligibility as a fresh proof under the effective cutoff.
         if let Some(floor) = floor
-            && !self.leftovers_eligible(floor, &json, &checkpoints, &names, &progress, log_cutoff_ms, config)?
+            && !self.leftovers_eligible(
+                floor,
+                &json,
+                &checkpoints,
+                &names,
+                &progress,
+                log_cutoff_ms,
+                config,
+                chosen.is_some(),
+            )?
         {
             return if target.is_some() {
                 stale("history left below the log floor is not eligible for pruning under the current policy")
@@ -4199,7 +4218,7 @@ impl DeltaTable {
             // was written; re-verify that Kernel still agrees with the checkpoint.
             (None, Some(floor))
                 if candidates.contains(&floor)
-                    && (json.range(..=floor).next().is_some() || checkpoints.range(..floor).next().is_some()) =>
+                    && (json.range(..floor).next().is_some() || checkpoints.range(..floor).next().is_some()) =>
             {
                 let replay = self.read_checkpoint(floor, config.max_checkpoint_bytes)?;
                 self.verify_checkpoint(floor, &replay, table_id, config)?;
@@ -4209,7 +4228,7 @@ impl DeltaTable {
             _ => return Ok(None),
         };
         let mut deletions: Vec<(u64, u8)> = json
-            .range(..=checkpoint)
+            .range(..checkpoint)
             .map(|version| (*version, 0))
             .chain(checkpoints.range(..checkpoint).map(|version| (*version, 1)))
             .collect();
@@ -4235,7 +4254,8 @@ impl DeltaTable {
     /// Plan `_delta_log` pruning: choose the newest checkpoint `C` proven
     /// equivalent to JSON history `0..=C` (or to the previous floor checkpoint
     /// plus later JSON), whose tombstones VACUUM LITE already processed and
-    /// whose commits are all older than the log retention. Deletes nothing.
+    /// whose deletable commits (`< C`; `C.json` is retained) are all older
+    /// than the log retention. Deletes nothing.
     ///
     /// # Errors
     /// Rejects unsafe retention, unsupported logs, record or checkpoint
@@ -4719,7 +4739,11 @@ mod prune_tests {
         );
         assert_eq!(classify_log_name("_last_checkpoint"), None);
         assert_eq!(classify_log_name("0000000000000000007.json"), None);
-        assert!(deletion_key("_delta_log/00000000000000000003.json", 3).is_ok());
+        assert!(deletion_key("_delta_log/00000000000000000002.json", 3).is_ok());
+        assert!(
+            deletion_key("_delta_log/00000000000000000003.json", 3).is_err(),
+            "C.json is retained"
+        );
         assert!(deletion_key("_delta_log/00000000000000000004.json", 3).is_err());
         assert!(deletion_key("_delta_log/00000000000000000002.checkpoint.parquet", 3).is_ok());
         assert!(deletion_key("_delta_log/00000000000000000003.checkpoint.parquet", 3).is_err());
@@ -4831,7 +4855,7 @@ mod record_durability_tests {
         let plan = maintenance.plan_prune_log(&config)?;
         let checkpoint = plan.checkpoint_version.context("provable checkpoint")?;
         let before = json_count(&root)?;
-        assert_eq!(plan.deletions.len(), before);
+        assert_eq!(plan.deletions.len(), before - 1, "C.json is retained");
         let records = root.join(MAINTENANCE_DIR);
         let floor = records.join(LOG_FLOOR_RECORD);
 
@@ -4853,7 +4877,7 @@ mod record_durability_tests {
         sync_hook::reset(&root);
         let report = maintenance.apply_prune_log(&plan, &config, &control())?;
         assert_eq!(report.outcome, Outcome::Pruned);
-        assert_eq!(json_count(&root)?, 0);
+        assert_eq!(json_count(&root)?, 1);
         assert_eq!(
             maintenance.log_floor()?.map(|floor| floor.checkpoint_version),
             Some(checkpoint)

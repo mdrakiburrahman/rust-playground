@@ -1357,21 +1357,25 @@ fn prune_log_deletes_proven_history_and_keeps_table_state() -> Result<()> {
     );
     let plan = maintenance.plan_prune_log(&config)?;
     assert_eq!(plan.checkpoint_version, Some(checkpoint));
-    let expected: Vec<String> = (0..=checkpoint)
+    let expected: Vec<String> = (0..checkpoint)
         .map(|version| format!("_delta_log/{version:020}.json"))
         .collect();
-    assert_eq!(plan.deletions, expected);
+    assert_eq!(plan.deletions, expected, "JSON strictly below C");
     let dry = plan.report();
-    assert_eq!((dry.outcome, dry.files_removed), (Outcome::Planned, checkpoint + 1));
+    assert_eq!((dry.outcome, dry.files_removed), (Outcome::Planned, checkpoint));
     assert_eq!(log_files(root.path())?, json_before, "dry run deletes nothing");
     assert_eq!(maintenance.log_floor()?, None, "dry run writes no floor");
 
     let report = maintenance.apply_prune_log(&plan, &config, &control())?;
     assert_eq!(
         (report.outcome, report.files_deleted, report.version),
-        (Outcome::Pruned, checkpoint + 1, checkpoint)
+        (Outcome::Pruned, checkpoint, checkpoint)
     );
-    assert!(log_files(root.path())?.is_empty(), "JSON 0..=C pruned");
+    assert_eq!(
+        log_files(root.path())?,
+        vec![json_path(root.path(), checkpoint)],
+        "JSON < C pruned, C.json retained"
+    );
     assert!(checkpoint_path(root.path(), checkpoint).is_file());
     assert!(root.path().join("_delta_log").join("_last_checkpoint").is_file());
     let floor = maintenance.log_floor()?.context("floor")?;
@@ -1406,15 +1410,16 @@ fn prune_log_deletes_proven_history_and_keeps_table_state() -> Result<()> {
     assert!(second > checkpoint);
     let again = reopened.plan_prune_log(&short_prune(now_ms()? + 1_000))?;
     assert_eq!(again.checkpoint_version, Some(second));
-    let mut expected: Vec<String> = (checkpoint + 1..=second)
+    let mut expected: Vec<String> = (checkpoint..second)
         .map(|version| format!("_delta_log/{version:020}.json"))
         .collect();
-    expected.insert(0, format!("_delta_log/{checkpoint:020}.checkpoint.parquet"));
-    assert_eq!(again.deletions, expected);
+    expected.insert(1, format!("_delta_log/{checkpoint:020}.checkpoint.parquet"));
+    assert_eq!(again.deletions, expected, "the old floor's JSON becomes deletable");
     let report = reopened.apply_prune_log(&again, &short_prune(now_ms()? + 1_000), &control())?;
     assert_eq!(report.outcome, Outcome::Pruned);
     assert!(!checkpoint_path(root.path(), checkpoint).exists());
     assert!(checkpoint_path(root.path(), second).is_file());
+    assert_eq!(log_files(root.path())?, vec![json_path(root.path(), second)]);
     assert_eq!(
         reopened.log_floor()?.map(|floor| floor.checkpoint_version),
         Some(second)
@@ -1524,7 +1529,7 @@ fn prune_log_recovers_from_partial_apply() -> Result<()> {
     };
     let partial = maintenance.plan_prune_log(&bounded)?;
     assert_eq!(partial.deletions.len(), 2);
-    assert_eq!(partial.backlog_files, checkpoint - 1);
+    assert_eq!(partial.backlog_files, checkpoint - 2);
     assert_eq!(
         maintenance
             .apply_prune_log(&partial, &bounded, &control())?
@@ -1548,10 +1553,16 @@ fn prune_log_recovers_from_partial_apply() -> Result<()> {
 
     let complete = maintenance.plan_prune_log(&short_prune(now_ms()? + 1_000))?;
     assert_eq!(complete.checkpoint_version, Some(checkpoint));
-    assert_eq!(complete.deletions.len(), usize::try_from(checkpoint - 1)?);
+    assert_eq!(complete.deletions.len(), usize::try_from(checkpoint - 2)?);
     let report = maintenance.apply_prune_log(&complete, &short_prune(now_ms()? + 1_000), &control())?;
     assert_eq!(report.outcome, Outcome::Pruned);
-    assert_eq!(log_files(root.path())?, vec![json_path(root.path(), checkpoint + 1)]);
+    assert_eq!(
+        log_files(root.path())?,
+        vec![
+            json_path(root.path(), checkpoint),
+            json_path(root.path(), checkpoint + 1)
+        ]
+    );
     assert_eq!(txn_versions(&maintenance)?, txns);
     let mut expected = rows_before;
     expected.extend(expected_rows(4, 40..42));
@@ -1875,6 +1886,67 @@ fn modified_ms(path: &Path) -> Result<i64> {
     )?)
 }
 
+/// Scenario: `C.json` is young (it is retained, so it never blocks pruning), then the
+/// floor advances from `F` to `C2` while the retained `F.json` is young.
+/// Guarantees: the retained checkpoint's JSON is excluded from the age gate, but the
+/// old floor's JSON is age-gated once it becomes deletable: Noop plan, StalePlan
+/// apply and zero deletes until it ages, after which the advance deletes it.
+#[test]
+fn prune_log_retains_checkpoint_json_and_age_gates_old_floor_json() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let (table, maintenance) = prunable_history(root.path())?;
+    let floor = vacuum_and_checkpoint(&maintenance)?;
+    let future = std::time::SystemTime::now() + Duration::from_secs(3_600);
+    let set_modified = |path: PathBuf, time: std::time::SystemTime| -> Result<()> {
+        fs::File::options().write(true).open(path)?.set_modified(time)?;
+        Ok(())
+    };
+    set_modified(json_path(root.path(), floor), future)?;
+    let config = short_prune(now_ms()? + 1_000);
+    let plan = maintenance.plan_prune_log(&config)?;
+    assert_eq!(plan.checkpoint_version, Some(floor), "young C.json does not block");
+    maintenance.apply_prune_log(&plan, &config, &control())?;
+    assert_eq!(log_files(root.path())?, vec![json_path(root.path(), floor)]);
+
+    for index in 10..12 {
+        append(&table, index, index * 10..index * 10 + 2)?;
+    }
+    set_modified(
+        json_path(root.path(), floor),
+        std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+    )?;
+    let second = vacuum_and_checkpoint(&maintenance)?;
+    let config = short_prune(now_ms()? + 1_000);
+    let pending = maintenance.plan_prune_log(&config)?;
+    assert_eq!(pending.checkpoint_version, Some(second));
+    assert_eq!(pending.deletions[0], format!("_delta_log/{floor:020}.json"));
+
+    set_modified(json_path(root.path(), floor), future)?;
+    let before = log_files(root.path())?;
+    let plan = maintenance.plan_prune_log(&config)?;
+    assert_eq!((plan.checkpoint_version, plan.report().outcome), (None, Outcome::Noop));
+    assert_eq!(
+        kind(maintenance.apply_prune_log(&pending, &config, &control())),
+        Some(MaintenanceErrorKind::StalePlan)
+    );
+    assert_eq!(
+        log_files(root.path())?,
+        before,
+        "young old-floor JSON blocks the advance"
+    );
+    assert_eq!(maintenance.log_floor()?.context("floor")?.checkpoint_version, floor);
+
+    set_modified(
+        json_path(root.path(), floor),
+        std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+    )?;
+    let report = maintenance.apply_prune_log(&pending, &config, &control())?;
+    assert_eq!(report.outcome, Outcome::Pruned);
+    assert_eq!(log_files(root.path())?, vec![json_path(root.path(), second)]);
+    assert_eq!(maintenance.log_floor()?.context("floor")?.checkpoint_version, second);
+    Ok(())
+}
+
 /// Scenario: a durable floor at C, a second proven plan at C2, then a delayed older
 /// checkpoint rewrites `_last_checkpoint` below the floor (or it is corrupted).
 /// Guarantees: planning and the pending apply neither panic nor delete; the floor is
@@ -1958,8 +2030,10 @@ fn prune_log_resume_respects_increased_retention() -> Result<()> {
     );
     let resume = maintenance.plan_prune_log(&short_prune(now_ms()? + 1_000))?;
     assert_eq!(resume.checkpoint_version, Some(checkpoint));
-    assert_eq!(resume.deletions.len(), usize::try_from(checkpoint - 1)?);
-    let leftovers = log_files(root.path())?;
+    assert_eq!(resume.deletions.len(), usize::try_from(checkpoint - 2)?);
+    let all_files = log_files(root.path())?;
+    let retained = json_path(root.path(), checkpoint);
+    let leftovers: Vec<PathBuf> = all_files.iter().filter(|path| **path != retained).cloned().collect();
     let newest = leftovers
         .iter()
         .map(|path| modified_ms(path))
@@ -1984,7 +2058,7 @@ fn prune_log_resume_respects_increased_retention() -> Result<()> {
         kind(maintenance.apply_prune_log(&resume, &stricter, &control())),
         Some(MaintenanceErrorKind::StalePlan)
     );
-    assert_eq!(log_files(root.path())?, leftovers, "zero additional deletes");
+    assert_eq!(log_files(root.path())?, all_files, "zero additional deletes");
 
     while now_ms()? <= anchor + 1 {
         std::thread::sleep(Duration::from_millis(5));
@@ -1998,7 +2072,7 @@ fn prune_log_resume_respects_increased_retention() -> Result<()> {
     assert_eq!(plan.deletions.len(), leftovers.len());
     let report = maintenance.apply_prune_log(&plan, &later, &control())?;
     assert_eq!(report.outcome, Outcome::Pruned);
-    assert!(log_files(root.path())?.is_empty());
+    assert_eq!(log_files(root.path())?, vec![retained]);
     assert!(checkpoint_path(root.path(), checkpoint).is_file());
     Ok(())
 }

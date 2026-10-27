@@ -249,15 +249,16 @@ fn prune_log_dry_run_then_apply() -> Result<()> {
     let report = &lines(&dry.stdout)?[0];
     assert_eq!(report["operation"], "prune_log");
     assert_eq!(report["report"]["outcome"], "planned");
-    assert_eq!(report["report"]["files_removed"], json);
+    assert_eq!(report["report"]["files_removed"], json - 1, "C.json is retained");
     assert_eq!(version(&path)?, json, "dry run deletes nothing");
 
     let applied = wall_clock_service(root.path())?.args(prune).arg("--apply").output()?;
     assert!(applied.status.success(), "{}", String::from_utf8_lossy(&applied.stderr));
     let report = &lines(&applied.stdout)?[0]["report"];
     assert_eq!(report["outcome"], "pruned");
-    assert_eq!(report["files_deleted"], json);
-    assert_eq!(version(&path)?, 0, "JSON 0..=C pruned");
+    assert_eq!(report["files_deleted"], json - 1);
+    assert_eq!(version(&path)?, 1, "JSON < C pruned, C.json retained");
+    assert!(path.join("_delta_log").join(format!("{:020}.json", json - 1)).is_file());
     let log = path.join("_delta_log");
     assert!(log.join("_last_checkpoint").is_file());
     assert!(log.join(format!("{:020}.checkpoint.parquet", json - 1)).is_file());
