@@ -261,6 +261,14 @@ ingestion partition, normalized schema, row count and original logical input-byt
 accounting are preserved. Legacy `new_file` stays streaming and unchanged.
 Schemas without `customer_id` keep streaming unless sort columns are explicit.
 
+After normalization and Kernel physical projection, shared IPC or sliced buffers
+are compacted into owned physical arrays only when Arrow's memory charge exceeds
+twice their logical bytes. Compaction happens before charging the retained sort
+buffer; original logical input-byte observation counters remain unchanged. This
+avoids charging one shared IPC allocation repeatedly through its columns without
+increasing batch sizes or the configured bounds. A genuinely oversized
+publication still fails rather than committing a partial receipt.
+
 | Environment option | Default |
 | --- | --- |
 | `ARROWCOL_LAYOUT_SORT_COLUMNS` | `customer_id` (comma-separated, ordered keys) |

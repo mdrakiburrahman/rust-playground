@@ -5,7 +5,80 @@ evidence. It records delivered files and local verification only. It does not
 claim that any GitHub issue is closed, that a pull request is merged, or that a
 GHCR image has been pushed.
 
-## Delivery matrix
+## Lakehouse integration scope
+
+The current integration covers only the following five issues. The older matrix
+below is retained as historical context, not as additional integration scope.
+
+| Issue | Implementation surfaces | Qualification boundary |
+| --- | --- | --- |
+| [#50](https://github.com/mdrakiburrahman/rust-playground/issues/50) | `infra/azure/`: Bicep, provisioning, identity, generation authority, guarded operator commands | Offline policy and recovery checks are not a live Azure deployment or reset qualification |
+| [#44](https://github.com/mdrakiburrahman/rust-playground/issues/44) | Native external Delta/QAP in `projects/loadtest/loadgen/`; optional `projects/kusto-bridge/` | Native active-snapshot semantics differ from the historical tenant fork; local emulator results are not Azure performance evidence |
+| [#36](https://github.com/mdrakiburrahman/rust-playground/issues/36) | `crates/arrow-deltalake/`; `crates/delta-maintenance/` | Production uses Delta Kernel; checkpoints and eligible log pruning preserve publication/query transactions, not a whole-storage byte plateau |
+| [#48](https://github.com/mdrakiburrahman/rust-playground/issues/48) | `projects/loadtest/`: lifecycle, generated clients, all-13-schema fixtures, independent reader, LGTM | Component checks, source-built images, live workload correctness, and measured stress are separate claims |
+| [#47](https://github.com/mdrakiburrahman/rust-playground/issues/47) | `crates/arrow-tenant-stream/`; sorted customer layout in `crates/arrow-deltalake/` | Historical snapshot then logical tail, Spark-compatible recovery, and independent sink replay are distinct from native Kusto snapshot tracking |
+
+The [root loadtest architecture](../loadtest-architecture.html) and its
+[browser-rendered PNG](../loadtest-architecture.png) show the integrated
+publication, consumer, authority, and evidence boundaries.
+
+## Source-bound integration evidence
+
+These are intermediate records, not a final-head green-CI or cloud qualification.
+Raw runtime logs remain private. Exported evidence must select causal fields and
+redact them before truncation; the receipt redactor is not a general-purpose
+sanitizer for arbitrary startup logs or configuration dumps.
+
+| Source and command | Observed result |
+| --- | --- |
+| `238c4a218bc6f4079515cf2f29bb082f74b7811c`: combined ten-package, all-feature Cargo tests | 332 passed, zero failed, four existing ignored tests |
+| Same source: `npx --no-install nx run tools-scripts:verify` | 95 tests passed |
+| Same source: `npx --no-install nx run loadtest:build --outputStyle=static` | All nine tasks succeeded, zero cache hits, 18 minutes 6 seconds; these are local images, not published registry references |
+| Same source: `npx --no-install tsx projects/loadtest/src/main.ts --mode local --warmup 5s --measure 30s --batch-rows 1024 --validate` | Failed during Direct receipt drain: 658 receipts, 608 published, 50 failed, all on `telemetry.sqlserver.sqlserver_database_properties`; both collectors reported the sorted-file input-budget failure |
+| Quiver canonical fixture and walkthrough at that source | Six tests passed; all 3,546 original CSV rows retain their original values after adding explicit synthetic customer labels |
+
+The actual failure cause was `write Delta data file: batch exceeds sorted-file
+input budget; slice it before retrying`, not an inferred UInt8 conversion error.
+The source-built Direct, DFE, router, and Explorer image IDs and the three reader
+bundle hashes were recorded with that failed run. A subsequent correction must
+be rebuilt into both collector images and rerun with the required 1,024-row
+workload; lowering that workload is not equivalent qualification.
+
+### Checkpoint/prune interoperability proof
+
+The bounded native harness ran on clean native source
+`191e3e5d8b8a15b58ec222a810f70207acd1c86c`, with maintenance source
+`01d5259fa1b10c1733da27b7aff77ba6b04a09dd`:
+
+```bash
+DELTA_MAINTENANCE_REF=01d5259fa1b10c1733da27b7aff77ba6b04a09dd \
+  projects/loadtest/loadgen/scripts/kusto-qap-it.sh prune
+```
+
+Both cycles passed after checkpoint, eligible pruning, physical tombstone
+vacuum, and emulator restart. Source floors advanced from 5/4 to 7/6. Each table
+retained its current `C.json` and checkpoint; eligible history strictly below
+`C`, including the previous floor, was removed. Publication and query
+transactions remained present. Cached, fallback, and independent exact rows
+agreed at version/row-count pairs 5/50 and 4/110, then 7/50 and 6/130.
+
+The emulator was pinned to
+`mcr.microsoft.com/azuredataexplorer/kustainer-linux@sha256:51e2250da2faf292de903f871a073eb37d3f2641cf63381b183879d21ebb1013`.
+The 300-second limit was **per phase**. Zero retention was restricted to marked
+temporary test fixtures with `--unsafe-short-vacuum-for-tests`; the production
+VACUUM default remains seven days. This is not the production global five-minute
+all-table deadline, all-13-schema Flight qualification, Azure I/O, or a claim that
+total storage bytes plateau.
+
+### Live Azure limitation
+
+The configured subscription returned ARM `SubscriptionNotFound`, including after
+credential refresh. No alternate subscription was selected. Provisioning,
+real Azure stress, physical reset, and cluster stop are not qualified by local,
+offline, or skipped credential-gated checks. Public reset execution remains
+disabled; preview is not execution approval.
+
+## Historical delivery matrix
 
 | Issue | Delivered scope | Concrete files and features | Verification |
 | --- | --- | --- | --- |

@@ -36,7 +36,7 @@ preserved while credentials, private URLs/paths/identifiers, known private
 environment values, and control characters are removed, with a 1,024-character
 Unicode-safe bound. These artifacts are written before stack cleanup.
 
-### Fixed-window local functional rehearsal
+## Fixed-window local functional rehearsal
 
 `--validate --stress-plan <file>` runs real OPTIMIZE, checkpoint, and VACUUM LITE
 jobs against `sqlserver_cpu_utilization` in both pools while paired input runs.
