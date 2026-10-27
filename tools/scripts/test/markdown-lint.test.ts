@@ -96,7 +96,12 @@ test('root lint retains Clippy dependencies and adds uncached Markdown checks', 
     Array.isArray(dependency.projects) && dependency.projects.includes('arrowcol-buffer')));
   assert.equal(scripts.targets['markdown-lint']?.cache, false);
   assert.equal(scripts.targets['markdown-lint-fix']?.cache, false);
-  assert.equal(scripts.targets['markdown-lint']?.options?.command, 'npx --no-install markdownlint-cli2');
+  assert.deepEqual(scripts.targets['markdown-lint']?.options?.commands, [
+    'python3 -B -m unittest discover -s docs -p test_validate.py',
+    'python3 docs/validate.py',
+    'npx --no-install markdownlint-cli2',
+  ]);
+  assert.equal(scripts.targets['markdown-lint']?.options?.parallel, false);
   assert.equal(scripts.targets['markdown-lint-fix']?.options?.command, 'npx --no-install markdownlint-cli2 --fix');
   assert.equal(root.targets['fail-on-untracked-files']?.cache, false);
   assert.deepEqual(root.targets['fail-on-untracked-files']?.dependsOn, [
