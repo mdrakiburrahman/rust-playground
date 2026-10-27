@@ -3,6 +3,33 @@ import { readFileSync } from 'node:fs';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 
+export interface OwnedProcessOutcome {
+  exit_code: number | null;
+  signal: number | null;
+  timed_out: boolean;
+  interrupted: boolean;
+  descendants: boolean;
+}
+
+export class OwnedProcessError extends Error {
+  constructor(readonly outcome: OwnedProcessOutcome | null, readonly supervisor_timed_out = false) {
+    super('Owned mutation process did not complete cleanly; retain occupancy');
+  }
+}
+
+function checkedOutcome(value: unknown): OwnedProcessOutcome {
+  if (!value || typeof value !== 'object') throw new OwnedProcessError(null);
+  const result = value as Record<string, unknown>;
+  const numeric = (value: unknown, min: number, max: number): value is number | null =>
+    value === null || (typeof value === 'number' && Number.isSafeInteger(value) && value >= min && value <= max);
+  if (Object.keys(result).length !== 5 || !numeric(result.exit_code, 0, 255) ||
+      !numeric(result.signal, 1, 64) || typeof result.timed_out !== 'boolean' ||
+      typeof result.interrupted !== 'boolean' || typeof result.descendants !== 'boolean' ||
+      (result.exit_code !== null && result.signal !== null)) throw new OwnedProcessError(null);
+  return { exit_code: result.exit_code, signal: result.signal, timed_out: result.timed_out,
+    interrupted: result.interrupted, descendants: result.descendants };
+}
+
 function groupExists(pid: number): boolean {
   try {
     process.kill(-pid, 0);
@@ -51,8 +78,9 @@ export async function runOwnedProcess(
   let receipt = '';
   child.stdout.setEncoding('utf8').on('data', (data: string) => {
     receipt += data;
-    if (/^[1-9][0-9]*\n$/u.test(receipt) && Number.isSafeInteger(Number(receipt.trim()))) {
-      commandGroup = Number(receipt.trim());
+    const first = receipt.split('\n')[0];
+    if (receipt.includes('\n') && /^[1-9][0-9]*$/u.test(first) && Number.isSafeInteger(Number(first))) {
+      commandGroup = Number(first);
     }
   });
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -64,7 +92,7 @@ export async function runOwnedProcess(
         timer = setTimeout(() => expire(false), 5000);
         return;
       }
-      reject(new Error('Owned mutation supervisor exceeded its deadline; retain occupancy'));
+      reject(new OwnedProcessError(null, true));
     };
     timer = setTimeout(() => expire(true), options.timeoutMs + 6000);
   });
@@ -78,9 +106,20 @@ export async function runOwnedProcess(
     });
     const outcome = await Promise.race([completion, deadline]);
     const descendantsRemain = commandGroup !== undefined && groupExists(commandGroup);
-    if (outcome.code !== 0 || outcome.signal !== null || commandGroup === undefined || descendantsRemain) {
-      throw new Error(`Owned mutation process did not complete cleanly (${descendantsRemain ? 'live descendants' : outcome.signal ?? outcome.code}); retain occupancy`);
+    let status: OwnedProcessOutcome | null = null;
+    const lines = receipt.trimEnd().split('\n');
+    if (lines.length === 2) {
+      try {
+        status = checkedOutcome(JSON.parse(lines[1]) as unknown);
+      } catch {
+        throw new OwnedProcessError(null);
+      }
     }
+    if (outcome.code !== 0 || outcome.signal !== null || commandGroup === undefined || descendantsRemain) {
+      throw new OwnedProcessError(status);
+    }
+    if (!status || status.exit_code !== 0 || status.signal !== null || status.timed_out ||
+        status.interrupted || status.descendants) throw new OwnedProcessError(status);
   } finally {
     clearTimeout(timer);
     process.removeListener('SIGINT', interrupt);

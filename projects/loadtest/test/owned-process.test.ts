@@ -6,7 +6,30 @@ import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { test } from 'node:test';
 
-import { runOwnedProcess } from '../src/owned-process.js';
+import { OwnedProcessError, runOwnedProcess } from '../src/owned-process.js';
+
+test('owned process exposes only checked numeric outcomes for actual failure, signal and timeout', async () => {
+  for (const [script, timeoutMs, expected] of [
+    ['console.error("https://secret.invalid/password");process.exit(3)', 2000,
+      { exit_code: 3, signal: null, timed_out: false }],
+    ['process.kill(process.pid,"SIGTERM")', 2000,
+      { exit_code: null, signal: 15, timed_out: false }],
+    ['setInterval(()=>{},1000)', 200,
+      { exit_code: null, signal: null, timed_out: true }],
+  ] as const) {
+    await assert.rejects(runOwnedProcess(process.execPath, ['-e', script], {
+      cwd: process.cwd(), env: process.env, timeoutMs,
+    }), (error: unknown) => {
+      assert(error instanceof OwnedProcessError);
+      assert(error.outcome);
+      for (const [key, value] of Object.entries(expected)) {
+        assert.equal(error.outcome[key as keyof typeof error.outcome], value);
+      }
+      assert(!JSON.stringify(error).includes('secret.invalid'));
+      return true;
+    });
+  }
+});
 
 test('owned process accepts clean completion, rejects failure and validates deadlines', async () => {
   const options = { cwd: process.cwd(), env: process.env, timeoutMs: 2000 };

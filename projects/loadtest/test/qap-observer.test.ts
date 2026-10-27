@@ -1,8 +1,74 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { test } from 'node:test';
 
-import { exportQapPoints, qapPoints } from '../src/qap-observer.js';
+import { exportQapPoints, qapPoints, startQapObserver } from '../src/qap-observer.js';
+
+for (const mode of ['child-failure', 'invalid-output', 'invalid-diagnostic'] as const) {
+  test(`observer reports fixed privacy-safe phases for actual ${mode}`, async t => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'qap-diagnostic-'));
+    t.after(() => rm(root, { force: true, recursive: true }));
+    const binary = path.join(root, 'helper');
+    await writeFile(binary, `#!/usr/bin/env python3
+import json,pathlib,sys
+args=sys.argv
+root=pathlib.Path(args[args.index('--results')+1])
+output=pathlib.Path(args[args.index('--output')+1])
+mode=${JSON.stringify(mode)}
+print('https://secret.invalid/password',file=sys.stderr)
+if mode=='child-failure':
+ (root/'observation-diagnostic.json').write_text(json.dumps({'code':'deadline_exceeded','elapsed_ms':30000,'queries_completed':64}))
+ sys.exit(3)
+if mode=='invalid-diagnostic':
+ (root/'observation-diagnostic.json').write_text('{"code":"https://secret.invalid/password"}')
+output.write_text('https://secret.invalid/password')
+`);
+    await chmod(binary, 0o700);
+    const server = createServer((request, response) => {
+      request.resume();
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end('{}');
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    t.after(() => new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())));
+    const address = server.address();
+    assert(address && typeof address !== 'string');
+    const stop = startQapObserver({ binary, cwd: root, env: process.env, results: root,
+      endpoint: 'http://secret.invalid', otlpEndpoint: `http://127.0.0.1:${address.port}` });
+    const deadline = Date.now() + 5000;
+    let text = '';
+    while (Date.now() < deadline) {
+      try {
+        text = await readFile(path.join(root, 'qap-observer.jsonl'), 'utf8');
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+      if (text) break;
+      await delay(10);
+    }
+    await assert.rejects(stop(), /qualification is incomplete/u);
+    assert(text, 'the actual child must produce a failure receipt');
+    assert(!text.includes('secret.invalid') && !text.includes(root));
+    const failure = JSON.parse(text.trim()) as Record<string, unknown>;
+    assert.equal(failure.sequence, 0);
+    assert.equal(failure.exported, false);
+    assert.equal(failure.phase, mode === 'child-failure' ? 'helper' : 'output');
+    assert.equal(failure.code, mode === 'child-failure' ? 'helper_failed' : 'output_failed');
+    assert(Number.isSafeInteger(failure.elapsed_ms) && Number(failure.elapsed_ms) >= 0);
+    assert.equal(failure.diagnostic_invalid, mode === 'invalid-diagnostic');
+    if (mode === 'child-failure') {
+      assert.equal(failure.helper_code, 'deadline_exceeded');
+      assert.equal(failure.queries_completed, 64);
+      assert.equal(failure.helper_elapsed_ms, 30000);
+      assert.deepEqual(failure.process, { exit_code: 3, signal: null, timed_out: false,
+        interrupted: false, descendants: false });
+    }
+  });
+}
 
 interface FixtureTable {
   available: boolean;
