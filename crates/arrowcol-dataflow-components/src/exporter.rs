@@ -241,7 +241,7 @@ impl DeltaBackend {
         let root = table_path(&self.base_path, &decoded.envelope.table);
         let table = BatchedTable::open_uri_with_fence(&root.to_string_lossy(), self.options.clone(), publication_fence)
             .await
-            .map_err(|error| ExportFailure::Transient(error.to_string()))?;
+            .map_err(|error| ExportFailure::Transient(format!("{error:#}")))?;
         let (sender, receiver) = mpsc::channel(self.batching.per_table_capacity.batches as usize);
         let (drain, drain_rx) = watch::channel(false);
         let estimator = AdaptiveFileSizeEstimator::new(self.batching.adaptive_file.build())
@@ -728,16 +728,16 @@ impl GroupPublisher<'_> {
                     .await
                     .map_err(|error| {
                         worker_failed = true;
-                        ExportFailure::Transient(error.to_string())
+                        ExportFailure::Transient(format!("{error:#}"))
                     })?;
                 writer
                     .write(&entry.batch)
                     .await
-                    .map_err(|error| ExportFailure::Permanent(error.to_string()))?;
+                    .map_err(|error| ExportFailure::Permanent(format!("{error:#}")))?;
                 let append = writer
                     .stage()
                     .await
-                    .map_err(|error| ExportFailure::Transient(error.to_string()))?;
+                    .map_err(|error| ExportFailure::Transient(format!("{error:#}")))?;
                 updated_estimator
                     .observe(append.observation())
                     .map_err(|error| ExportFailure::Permanent(format!("file sizing observation failed: {error}")))?;
@@ -753,7 +753,7 @@ impl GroupPublisher<'_> {
                 let force = index + 1 == total || (index + 1) % self.max_pending_files == 0;
                 receipts.push(table.submit(append, force).await.map_err(|error| {
                     worker_failed = true;
-                    ExportFailure::Transient(error.to_string())
+                    ExportFailure::Transient(format!("{error:#}"))
                 })?);
             }
             let mut version = 0;
