@@ -18,6 +18,8 @@ use sha2::{Digest, Sha256};
 use crate::sdk::GeneratedTable;
 
 const MAX_FLIGHT_DATA_BYTES: usize = 31 * 1024 * 1024;
+/// Interleaved tenants deliberately provide an unsorted input for layout tests.
+pub const CUSTOMER_COUNT: usize = 16;
 
 /// One immutable logical batch reused by paired pool sends and retries.
 #[derive(Clone)]
@@ -83,8 +85,8 @@ pub struct ScheduledTable {
 
 /// Builds one exact-schema batch from the generated SDK descriptor schema.
 ///
-/// Values reproduce the deterministic one-row fallback corpus: every row in a
-/// table batch repeats the same seed-derived typed value.
+/// Customer keys interleave across rows; other fields retain the deterministic
+/// seed-derived corpus. Retries and paired pools reuse the encoded batch.
 ///
 /// # Errors
 ///
@@ -179,6 +181,15 @@ fn deterministic_column(
                 .context("deterministic timestamp overflow")?;
             row_hasher.update(value.to_be_bytes());
             Arc::new(TimestampNanosecondArray::from_value(value, rows).with_timezone("UTC"))
+        }
+        DataType::Utf8 if name == "customer_id" => {
+            let values = (0..rows)
+                .map(|row| format!("customer-{:04}", row % CUSTOMER_COUNT))
+                .collect::<Vec<_>>();
+            for value in &values {
+                hash_bytes(row_hasher, value.as_bytes());
+            }
+            Arc::new(StringArray::from_iter_values(values))
         }
         DataType::Utf8 => {
             let value = if is_guid(table, name) {
@@ -280,6 +291,7 @@ mod tests {
     use std::sync::Arc;
 
     use anyhow::Result;
+    use arrow::array::Array;
     use arrow::datatypes::{Field, Schema};
     use arrow_flight::decode::FlightRecordBatchStream;
     use arrowcol_catalog::{DdlCommand, DdlParser};
@@ -306,6 +318,7 @@ mod tests {
                 "v1".to_owned(),
             ],
             schema: Arc::new(Schema::new(vec![
+                Field::new("customer_id", DataType::Utf8, false),
                 Field::new(
                     "sample_time_utc",
                     DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
@@ -326,6 +339,25 @@ mod tests {
         assert_eq!(first.record_batch, second.record_batch);
         assert_eq!(first.payload_sha256, second.payload_sha256);
         assert_eq!(first.row_sha256, second.row_sha256);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn customer_workload_is_interleaved_reproducible_and_covers_all_customers() -> Result<()> {
+        let batch = build_logical_batch(generated_table()?, CUSTOMER_COUNT * 3 + 1, 7).await?;
+        let keys = batch
+            .record_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .context("customer keys are not strings")?;
+        for row in 0..keys.len() {
+            assert_eq!(keys.value(row), format!("customer-{:04}", row % CUSTOMER_COUNT));
+        }
+        assert_eq!(keys.value(0), keys.value(CUSTOMER_COUNT));
+        let shorter = build_logical_batch(generated_table()?, CUSTOMER_COUNT, 7).await?;
+        assert_ne!(batch.payload_sha256, shorter.payload_sha256);
+        assert_ne!(batch.row_sha256, shorter.row_sha256);
         Ok(())
     }
 
