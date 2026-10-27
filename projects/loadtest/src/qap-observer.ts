@@ -23,11 +23,11 @@ async function helperDiagnostic(directory: string): Promise<HelperDiagnostic | n
     throw new Error('QAP helper diagnostic unreadable');
   }
   const value = record(JSON.parse(content) as unknown);
-  if (!value || !['completed', 'deadline_exceeded', 'helper_failed'].includes(String(value.code)) ||
+  if (!value || (value.code !== 'completed' && value.code !== 'deadline_exceeded' && value.code !== 'helper_failed') ||
       typeof value.elapsed_ms !== 'number' || !Number.isSafeInteger(value.elapsed_ms) || value.elapsed_ms < 0 ||
       typeof value.queries_completed !== 'number' || !Number.isSafeInteger(value.queries_completed) ||
       value.queries_completed < 0) throw new Error('QAP helper diagnostic invalid');
-  return { code: value.code as HelperDiagnostic['code'], elapsed_ms: value.elapsed_ms,
+  return { code: value.code, elapsed_ms: value.elapsed_ms,
     queries_completed: value.queries_completed };
 }
 
