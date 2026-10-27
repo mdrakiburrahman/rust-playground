@@ -430,18 +430,44 @@ export function localLoadgenEnvironment(
   };
 }
 
+/** Hard backstop for one non-load loadgen command; the runner kills the command after it. */
+export const LOADGEN_PHASE_TIMEOUT_MS = 600_000;
+/** Part of the backstop kept for validate's own fail-closed report and exit. */
+export const VALIDATE_RESERVE_MS = 30_000;
+
+/**
+ * Timeout and private environment for one loadgen command. Validate alone receives an absolute
+ * deadline inside the unchanged backstop, so its inner waits end and its failed report is written
+ * before the kill; an inherited deadline never bounds run or drain.
+ */
+export function loadgenSpawnPlan(
+  command: 'run' | 'drain' | 'validate',
+  options: Pick<BenchmarkContext['options'], 'measureSeconds' | 'warmupSeconds'>,
+  environment: NodeJS.ProcessEnv,
+  nowMs: number,
+): { timeout: number | undefined; env: NodeJS.ProcessEnv } {
+  const env: NodeJS.ProcessEnv = { ...environment, LOADTEST_COLLECTORS_DRAINED: String(command === 'validate') };
+  delete env.LOADTEST_VALIDATE_DEADLINE_UNIX_MS;
+  if (command === 'validate') env.LOADTEST_VALIDATE_DEADLINE_UNIX_MS = String(nowMs + LOADGEN_PHASE_TIMEOUT_MS - VALIDATE_RESERVE_MS);
+  const timeout = command !== 'run'
+    ? LOADGEN_PHASE_TIMEOUT_MS
+    : options.measureSeconds === undefined ? undefined : (options.warmupSeconds + options.measureSeconds + 600) * 1000;
+  return { timeout, env };
+}
+
 async function runLocalLoadgen(
   context: Pick<BenchmarkContext, 'directory' | 'env' | 'network' | 'options'>,
   command: 'run' | 'drain' | 'validate',
   results: string,
   controller: BenchmarkController,
 ): Promise<void> {
+  const plan = loadgenSpawnPlan(command, context.options, localLoadgenEnvironment(context, results), Date.now());
   await runInteractive(
     path.join(cargoTargetDirectory(), 'debug/arrowcol-loadgen'),
     [command],
-    { ...localLoadgenEnvironment(context, results), LOADTEST_COLLECTORS_DRAINED: String(command === 'validate') },
+    plan.env,
     controller,
-    command !== 'run' ? 600_000 : context.options.measureSeconds === undefined ? undefined : (context.options.warmupSeconds + context.options.measureSeconds + 600) * 1000,
+    plan.timeout,
   );
 }
 

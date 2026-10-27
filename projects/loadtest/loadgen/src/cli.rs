@@ -358,6 +358,15 @@ pub struct ValidateArgs {
     /// The runner has recorded clean stopped mutators for this exact run.
     #[arg(long, env = "LOADTEST_COLLECTORS_DRAINED", default_value_t = false)]
     pub collectors_drained: bool,
+
+    /// Absolute Unix-millisecond bound for this whole command, set privately by the runner so
+    /// every inner wait ends, and fail-closed evidence is written, before the runner's hard kill.
+    #[arg(
+        long,
+        env = "LOADTEST_VALIDATE_DEADLINE_UNIX_MS",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub validate_deadline_unix_ms: Option<u64>,
 }
 
 #[cfg(test)]
@@ -498,5 +507,29 @@ mod tests {
             kusto_bridge_endpoint: None,
         };
         assert_eq!(arguments.effective_scenarios(), vec![Scenario::Paired]);
+    }
+
+    #[test]
+    fn validate_deadline_is_optional_and_strictly_parsed() -> Result<()> {
+        let parse = |extra: &[&str]| {
+            Cli::try_parse_from(["arrowcol-loadgen", "validate"].iter().chain(extra)).map(|cli| match cli.command {
+                Command::Validate(arguments) => Some(arguments.validate_deadline_unix_ms),
+                _ => None,
+            })
+        };
+        if std::env::var_os("LOADTEST_VALIDATE_DEADLINE_UNIX_MS").is_none() {
+            assert_eq!(parse(&[])?, Some(None), "standalone validation keeps its own budgets");
+        }
+        assert_eq!(
+            parse(&["--validate-deadline-unix-ms", "1800000000000"])?,
+            Some(Some(1_800_000_000_000))
+        );
+        for invalid in ["0", "-1", "1.5", "", "17e11", "18446744073709551616", " 1800000000000"] {
+            assert!(
+                parse(&["--validate-deadline-unix-ms", invalid]).is_err(),
+                "{invalid:?} must be rejected"
+            );
+        }
+        Ok(())
     }
 }

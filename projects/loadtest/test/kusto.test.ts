@@ -9,7 +9,10 @@ import { parseBenchmarkOptions } from '../src/cli.js';
 import {
   kustoComposeStartArguments, kustoStatusSummary, readKustoStatus, requireHealthyKusto, safeKustoError, startKusto,
 } from '../src/kusto.js';
-import { benchmarkCoreServices, localLoadgenEnvironment, type BenchmarkNetwork } from '../src/main.js';
+import {
+  benchmarkCoreServices, LOADGEN_PHASE_TIMEOUT_MS, loadgenSpawnPlan, localLoadgenEnvironment, VALIDATE_RESERVE_MS,
+  type BenchmarkNetwork,
+} from '../src/main.js';
 
 const ready = { Tables: [{ Columns: [{ ColumnName: 'NodeId', ColumnType: 'string' }], Rows: [['local-node']] }] };
 
@@ -61,6 +64,27 @@ test('both local helper commands always receive the allocated internal Kusto end
     }, '/workspace/onelake/benchmark/latest/results');
     assert.equal(optional.LOADTEST_KUSTO_BRIDGE_ENDPOINT, mode === 'local' ? 'http://explicit-bridge:9464' : undefined);
   }
+});
+
+test('validate alone receives an absolute deadline inside the unchanged 600s backstop', () => {
+  assert.equal(LOADGEN_PHASE_TIMEOUT_MS, 600_000);
+  assert.equal(VALIDATE_RESERVE_MS, 30_000);
+  const now = 1_800_000_000_000;
+  const options = parseBenchmarkOptions([]);
+  const inherited = { LOADTEST_VALIDATE_DEADLINE_UNIX_MS: '1', LOADTEST_RESULTS: '/results' };
+  const validate = loadgenSpawnPlan('validate', options, inherited, now);
+  assert.equal(validate.timeout, 600_000);
+  assert.equal(validate.env.LOADTEST_VALIDATE_DEADLINE_UNIX_MS, String(now + 570_000));
+  assert.equal(validate.env.LOADTEST_COLLECTORS_DRAINED, 'true');
+  assert.equal(validate.env.LOADTEST_RESULTS, '/results');
+  const drain = loadgenSpawnPlan('drain', options, inherited, now);
+  assert.equal(drain.timeout, 600_000);
+  assert.equal('LOADTEST_VALIDATE_DEADLINE_UNIX_MS' in drain.env, false, 'an inherited deadline never bounds drain');
+  assert.equal(drain.env.LOADTEST_COLLECTORS_DRAINED, 'false');
+  const run = loadgenSpawnPlan('run', parseBenchmarkOptions(['--warmup', '60', '--measure', '120']), inherited, now);
+  assert.equal(run.timeout, (60 + 120 + 600) * 1000);
+  assert.equal('LOADTEST_VALIDATE_DEADLINE_UNIX_MS' in run.env, false);
+  assert.equal(inherited.LOADTEST_VALIDATE_DEADLINE_UNIX_MS, '1', 'the caller environment is not mutated');
 });
 
 test('readiness uses the documented cluster command without requiring the not-yet-created database', async t => {
