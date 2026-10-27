@@ -231,6 +231,38 @@ and `failure`; the duration records one terminal observation per publication.
 No table URI, account, application UUID or correlation ID is a metric label.
 Prometheus/OTLP exporters may normalize dots and append unit/type suffixes.
 
+## Publication file layout
+
+Collector `new_file_with_publication` files containing `customer_id` use the
+shared whole-file sort buffer, not isolated per-batch sorting. All rows from one
+receipt are sorted together before Parquet encoding; its stable transaction,
+ingestion partition, normalized schema, row count and original logical input-byte
+accounting are preserved. Legacy `new_file` stays streaming and unchanged.
+Schemas without `customer_id` keep streaming unless sort columns are explicit.
+
+| Environment option | Default |
+|---|---|
+| `ARROWCOL_LAYOUT_SORT_COLUMNS` | `customer_id` (comma-separated, ordered keys) |
+| `ARROWCOL_LAYOUT_BLOOM_COLUMNS` | `customer_id` |
+| `ARROWCOL_LAYOUT_MAX_ROWS` | 262144 |
+| `ARROWCOL_LAYOUT_MAX_INPUT_BYTES` | 67108864 |
+| `ARROWCOL_LAYOUT_ROW_GROUP_ROWS` | 16384 |
+| `ARROWCOL_LAYOUT_PAGE_ROWS` | 2048 |
+
+Policies enable row-group/page statistics, offset indexes and selected Bloom
+filters. Qualification may explicitly set row groups to 512 and pages to 128
+for an 8192-row/16-customer source; production defaults are not changed. The
+regression exercises multiple interleaved batches through a real publication:
+sorted output selects one of 16 groups by customer bounds, while an unsorted
+control with identical encoding controls selects all 16.
+
+Bounds apply to retained physical Arrow arrays; sorting/concatenation requires
+additional proportional workspace. An oversized publication fails visibly before
+commit and must be split upstream into independently identified publications;
+it never silently commits a partial receipt. Explicit
+`new_file_with_publication_and_layout` supports per-caller policies or `None`
+for streaming without changing process environment.
+
 ## Arrow representation
 
 ```text
