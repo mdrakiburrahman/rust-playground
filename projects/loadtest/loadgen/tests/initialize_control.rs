@@ -2,6 +2,8 @@
 //! canonical tables go through the real bootstrap initializer over injected control metadata and a
 //! disposable local store, and the manifest is published only after every table drains. Uses the
 //! dev-only `arrow-deltalake/test-control` seam; no Azure, no environment, no CLI dispatch.
+//! Compiled only in debug test builds, matching the seam gate in arrow-deltalake.
+#![cfg(debug_assertions)]
 
 use anyhow::{Context, Result};
 use arrow_deltalake::delta::DeltaTable;
