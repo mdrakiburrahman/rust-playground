@@ -353,6 +353,10 @@ ACK counts alone, are the correctness evidence.
 installing the static helpers. This also applies to standalone reader/build
 requests and the shared Rust build target: Cargo tests must finish writing
 their normal binaries before static installation and E2E helper staging.
+It also waits for the existing SDK generator lint, build, test, compatibility
+and package-artifact targets. Their generation/check/package chain invokes
+`cargo run` against the same host generator binary, so standalone reader/build
+requests now include that SDK generation and generated-package validation cost.
 
 A successful **validated local** attempt now stops its owned router only after
 the actual Grafana, native validation and Explorer gates have finished, all
