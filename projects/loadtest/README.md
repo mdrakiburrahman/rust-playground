@@ -479,6 +479,15 @@ than 45 seconds. These are state/lag observations, **not correctness or reset
 proof**. Azure observation uses a seventh isolated writable private CLI cache.
 The observer finishes before cleanup/release; observation/export failure fails
 qualification and conservatively retains Azure occupancy for inspection.
+Each helper attempt also writes `observation-diagnostic.json` with a fixed
+`completed`, `deadline_exceeded` or `helper_failed` code, elapsed milliseconds
+and completed-response count (including HTTP failures, excluding unfinished
+requests). Failed observer receipts identify the phase and sequence and include
+checked numeric child exit/signal and timeout outcomes when available; missing
+or invalid diagnostics remain explicit unknowns. These diagnostic fields never
+copy stderr, endpoints, queries or table labels. A supervisor backstop timeout
+is separate from a reported child timeout. No diagnostic receipt retroactively
+classifies failures from older helpers that discarded their error output.
 
 The optional maintenance profile also requests checkpoints every 100 commits
 (`LOADTEST_CHECKPOINT_EVERY_COMMITS` overrides this). Checkpoints bound replay

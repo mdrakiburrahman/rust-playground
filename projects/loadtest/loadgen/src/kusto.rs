@@ -13,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, UNIX_EPOCH},
 };
@@ -68,6 +68,7 @@ struct KustoClient {
     results: PathBuf,
     /// Shared bounded Azure CLI provider scoped to this cluster; absent in local mode.
     token: Option<Arc<AzureCliTokenProvider>>,
+    queries_completed: Arc<AtomicU64>,
 }
 
 impl KustoClient {
@@ -128,6 +129,7 @@ impl KustoClient {
             mode,
             results: results.to_owned(),
             token,
+            queries_completed: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -168,6 +170,7 @@ impl KustoClient {
                 "http_status": status.as_u16(), "response": public
             }),
         )?;
+        self.queries_completed.fetch_add(1, Ordering::Relaxed);
         ensure!(status.is_success(), "Kusto HTTP {status}: {public}");
         decode_response(&body).map_err(|error| anyhow::anyhow!(redact_text(&format!("{error:#}"))))
     }
@@ -1586,22 +1589,42 @@ pub async fn observe_qap(
     tables: &[String],
     deadline: Duration,
 ) -> Result<Value> {
-    let client = match database {
-        Some(database) => KustoClient::with_mode(endpoint, results, Mode::from_env()?, database)?,
-        None => KustoClient::new(endpoint, results)?,
-    };
-    tokio::time::timeout(deadline, async {
-        let mut observed = BTreeMap::new();
-        for name in tables {
-            observed.insert(name.clone(), observe_table(&client, name).await);
-        }
-        json!({
-            "observed_unix_ms": now_unix_millis(), "backend": BACKEND, "mode": client.mode,
-            "capacity": client.capacity().await, "tables": observed
+    let started = Instant::now();
+    let queries_completed = Arc::new(AtomicU64::new(0));
+    let mut timed_out = false;
+    let outcome = async {
+        let mut client = match database {
+            Some(database) => KustoClient::with_mode(endpoint, results, Mode::from_env()?, database)?,
+            None => KustoClient::new(endpoint, results)?,
+        };
+        client.queries_completed = Arc::clone(&queries_completed);
+        tokio::time::timeout(deadline, async {
+            let mut observed = BTreeMap::new();
+            for name in tables {
+                observed.insert(name.clone(), observe_table(&client, name).await);
+            }
+            json!({
+                "observed_unix_ms": now_unix_millis(), "backend": BACKEND, "mode": client.mode,
+                "capacity": client.capacity().await, "tables": observed
+            })
         })
-    })
-    .await
-    .map_err(|_| anyhow::anyhow!("QAP observation exceeded its {deadline:?} deadline"))
+        .await
+        .map_err(|_| {
+            timed_out = true;
+            anyhow::anyhow!("QAP observation exceeded its {deadline:?} deadline")
+        })
+    }
+    .await;
+    write_json(
+        &results.join("observation-diagnostic.json"),
+        &json!({
+            "code": if timed_out { "deadline_exceeded" } else if outcome.is_ok() { "completed" } else { "helper_failed" },
+            "elapsed_ms": u64::try_from(started.elapsed().as_millis())?,
+            "queries_completed": queries_completed.load(Ordering::Relaxed),
+        }),
+    )
+    .context("write QAP observation diagnostic")?;
+    outcome
 }
 
 async fn observe_table(client: &KustoClient, name: &str) -> Value {
@@ -2496,12 +2519,66 @@ mod tests {
         assert_eq!(observed["tables"]["direct_absent"]["available"], false);
         assert_eq!(observed["capacity"]["available"], true);
         let commands = commands.lock().map_err(|_| anyhow::anyhow!("poisoned"))?;
+        let diagnostic: Value = serde_json::from_slice(&fs::read(directory.0.join("observation-diagnostic.json"))?)?;
+        assert_eq!(diagnostic["code"], "completed");
+        assert_eq!(diagnostic["queries_completed"], commands.len());
         assert!(
             commands
                 .iter()
                 .all(|command| command.starts_with(".show") || command.starts_with("external_table")),
             "observation must not change state: {commands:?}"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn observation_diagnostics_classify_real_deadline_and_setup_failure_without_error_text() -> Result<()> {
+        let directory = Directory::new()?;
+        let server = Server::start(|request| {
+            if request["csl"]
+                .as_str()
+                .is_some_and(|command| command.ends_with("policy query_acceleration"))
+            {
+                return Ok(Some(response(
+                    &["Policy"],
+                    vec![json!(["{\"IsEnabled\":true,\"MaxAge\":\"00:01:00\"}"])],
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            Ok(Some(response(&[], vec![])))
+        })?;
+        assert!(
+            observe_qap(
+                &server.endpoint,
+                &directory.0,
+                Some(DATABASE),
+                &["direct_ready".to_owned()],
+                Duration::from_millis(50),
+            )
+            .await
+            .is_err()
+        );
+        let diagnostic: Value = serde_json::from_slice(&fs::read(directory.0.join("observation-diagnostic.json"))?)?;
+        assert_eq!(diagnostic["code"], "deadline_exceeded");
+        assert_eq!(diagnostic["queries_completed"], 1);
+        assert!(diagnostic["elapsed_ms"].as_u64().is_some_and(|elapsed| elapsed >= 50));
+        assert!(
+            observe_qap(
+                "https://private.invalid/password?secret=canary",
+                &directory.0,
+                Some(DATABASE),
+                &[],
+                Duration::from_secs(30),
+            )
+            .await
+            .is_err()
+        );
+        let diagnostic: Value = serde_json::from_slice(&fs::read(directory.0.join("observation-diagnostic.json"))?)?;
+        assert_eq!(diagnostic["code"], "helper_failed");
+        assert_eq!(diagnostic["queries_completed"], 0);
+        assert_eq!(diagnostic.as_object().map(serde_json::Map::len), Some(3));
+        assert!(!diagnostic.to_string().contains("private"));
+        assert!(!diagnostic.to_string().contains("canary"));
         Ok(())
     }
 

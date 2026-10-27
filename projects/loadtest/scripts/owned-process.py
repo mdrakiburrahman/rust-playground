@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Reap this invocation's CLI descendants even when container PID 1 is not an init."""
 import ctypes
+import json
 import os
 import signal
 import subprocess
@@ -58,9 +59,17 @@ def main():
             time.sleep(0.025)
         status = child.poll()
         descendants = has_children() if status is not None else True
-        return 0 if status == 0 and not interrupted and not descendants else 1
+        timed_out = status is None and not interrupted and time.monotonic() >= deadline
     finally:
         cleanup(child.pid)
+    print(json.dumps({
+        "exit_code": status if status is not None and status >= 0 else None,
+        "signal": -status if status is not None and status < 0 else None,
+        "timed_out": timed_out,
+        "interrupted": interrupted,
+        "descendants": descendants,
+    }), flush=True)
+    return 0 if status == 0 and not interrupted and not descendants else 1
 
 
 if __name__ == "__main__":

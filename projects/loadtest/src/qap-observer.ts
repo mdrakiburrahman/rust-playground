@@ -2,11 +2,34 @@ import { appendFile, mkdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
-import { runOwnedProcess } from './owned-process.js';
+import { OwnedProcessError, runOwnedProcess } from './owned-process.js';
 
 type Pool = 'direct' | 'dataflow';
 interface Point { name: string; pool: Pool; value: number; unit?: string }
 type RecordValue = Record<string, unknown>;
+
+interface HelperDiagnostic {
+  code: 'completed' | 'deadline_exceeded' | 'helper_failed';
+  elapsed_ms: number;
+  queries_completed: number;
+}
+
+async function helperDiagnostic(directory: string): Promise<HelperDiagnostic | null> {
+  let content: string;
+  try {
+    content = await readFile(path.join(directory, 'observation-diagnostic.json'), 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw new Error('QAP helper diagnostic unreadable');
+  }
+  const value = record(JSON.parse(content) as unknown);
+  if (!value || !['completed', 'deadline_exceeded', 'helper_failed'].includes(String(value.code)) ||
+      typeof value.elapsed_ms !== 'number' || !Number.isSafeInteger(value.elapsed_ms) || value.elapsed_ms < 0 ||
+      typeof value.queries_completed !== 'number' || !Number.isSafeInteger(value.queries_completed) ||
+      value.queries_completed < 0) throw new Error('QAP helper diagnostic invalid');
+  return { code: value.code as HelperDiagnostic['code'], elapsed_ms: value.elapsed_ms,
+    queries_completed: value.queries_completed };
+}
 
 function record(value: unknown): RecordValue | undefined {
   return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as RecordValue : undefined;
@@ -100,20 +123,28 @@ export function startQapObserver(options: {
   if (!Number.isSafeInteger(intervalMs) || intervalMs <= 0) throw new Error('QAP observation interval must be positive');
   const stop = new AbortController();
   let failure: unknown;
+  let phase: 'artifact' | 'helper' | 'output' | 'export' = 'artifact';
+  let sequence = -1;
+  let started = Date.now();
+  let provenance: string | undefined;
   const completed = (async () => {
     const observations = path.join(options.results, 'qap-observations');
     await mkdir(observations, { recursive: true });
-    let sequence = 0;
     while (!stop.signal.aborted) {
-      const started = Date.now();
-      const provenance = path.join(observations, String(sequence++));
+      started = Date.now();
+      phase = 'artifact';
+      provenance = path.join(observations, String(++sequence));
       await mkdir(provenance);
       const output = path.join(provenance, 'observation.json');
+      phase = 'helper';
       await runOwnedProcess(options.binary, ['observe-qap', '--endpoint', options.endpoint,
         '--results', provenance, '--output', output, '--timeout', '30s'],
       { cwd: options.cwd, env: options.env, timeoutMs: 40_000 });
+      phase = 'output';
       const observation = qapPoints(JSON.parse(await readFile(output, 'utf8')) as unknown);
+      phase = 'export';
       await exportQapPoints(options.otlpEndpoint, observation.observed, observation.points);
+      phase = 'artifact';
       await appendFile(path.join(options.results, 'qap-observer.jsonl'), `${JSON.stringify({
         observed_unix_ms: observation.observed, artifact: path.relative(options.results, output),
         queries: path.relative(options.results, path.join(provenance, 'kusto-queries.jsonl')),
@@ -129,8 +160,22 @@ export function startQapObserver(options: {
   })().catch(async error => {
     failure = error;
     const observed = Date.now();
+    let diagnostic: HelperDiagnostic | null = null;
+    let diagnosticInvalid = false;
+    if (provenance) {
+      try {
+        diagnostic = await helperDiagnostic(provenance);
+      } catch {
+        diagnosticInvalid = true;
+      }
+    }
     await appendFile(path.join(options.results, 'qap-observer.jsonl'), `${JSON.stringify({
       observed_unix_ms: observed, exported: false, error: 'QAP observation or OTLP export failed',
+      code: `${phase}_failed`, phase, sequence, elapsed_ms: Math.max(0, observed - started),
+      helper_code: diagnostic?.code ?? null, queries_completed: diagnostic?.queries_completed ?? null,
+      helper_elapsed_ms: diagnostic?.elapsed_ms ?? null, diagnostic_invalid: diagnosticInvalid,
+      process: error instanceof OwnedProcessError ? error.outcome : null,
+      supervisor_timed_out: error instanceof OwnedProcessError ? error.supervisor_timed_out : null,
     })}\n`);
     await exportQapPoints(options.otlpEndpoint, observed, ['direct', 'dataflow'].map(pool => ({
       name: 'qap_observation_complete', pool: pool as Pool, value: 0,
