@@ -764,6 +764,8 @@ pub enum Outcome {
     Deleted,
     /// Interrupted with partial physical progress (VACUUM only).
     Partial,
+    /// A Kernel checkpoint was written; no commit and no history deletion.
+    Checkpointed,
 }
 
 impl Outcome {
@@ -777,6 +779,7 @@ impl Outcome {
             Self::AlreadyApplied => "already_applied",
             Self::Deleted => "deleted",
             Self::Partial => "partial",
+            Self::Checkpointed => "checkpointed",
         }
     }
 }
@@ -2376,6 +2379,61 @@ impl DeltaTable {
             .relative_url(raw)
             .map_err(|_| fail(MaintenanceErrorKind::UnsafeRequest, format!("unsafe log path {raw:?}")))?
             .to_string())
+    }
+
+    /// Version named by the advisory `_last_checkpoint` hint, if readable.
+    fn hinted_checkpoint_version(&self) -> Result<Option<u64>> {
+        let path = self.object_path("_delta_log/_last_checkpoint")?;
+        let store = Arc::clone(&self.store);
+        let bytes = shared_executor()?.block_on(async move {
+            match store.get(&path).await {
+                Ok(object) if object.meta.size <= 1024 * 1024 => Ok(Some(object.bytes().await?)),
+                Ok(_) | Err(object_store::Error::NotFound { .. }) => Ok(None),
+                Err(error) => Err(anyhow::Error::from(error)),
+            }
+        })?;
+        Ok(bytes
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|hint| hint.get("version").and_then(serde_json::Value::as_u64)))
+    }
+
+    /// Write a Kernel checkpoint once at least `min_commits` commits follow the
+    /// hinted checkpoint, bounding snapshot replay for writers and readers.
+    ///
+    /// Checkpoints retain every application transaction (no txn retention) and
+    /// the table metadata including the purge watermark. JSON history is never
+    /// deleted, so VACUUM LITE's complete-history proof is unaffected. Without
+    /// `apply` a due checkpoint is only reported as planned.
+    ///
+    /// # Errors
+    /// Rejects `min_commits == 0`; returns authority, replay or write failures.
+    pub fn checkpoint_if_due(&self, min_commits: u64, apply: bool) -> Result<MaintenanceReport> {
+        if min_commits == 0 {
+            return Err(fail(
+                MaintenanceErrorKind::InvalidPlan,
+                "checkpoint interval must be nonzero",
+            ));
+        }
+        let version = self.version()?;
+        let mut report = MaintenanceReport {
+            operation: "checkpoint".to_owned(),
+            read_version: version,
+            version,
+            ..MaintenanceReport::default()
+        };
+        let due = match self.hinted_checkpoint_version()? {
+            Some(hinted) => version.saturating_sub(hinted) >= min_commits,
+            None => version.saturating_add(1) >= min_commits,
+        };
+        report.outcome = match (due, apply) {
+            (false, _) => Outcome::Noop,
+            (true, false) => Outcome::Planned,
+            (true, true) => {
+                report.version = self.checkpoint()?;
+                Outcome::Checkpointed
+            }
+        };
+        Ok(report)
     }
 
     /// Replay complete JSON history 0..=version without listing data directories.
