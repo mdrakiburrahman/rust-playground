@@ -170,7 +170,7 @@ class ResetTests(unittest.TestCase):
         self.assertEqual(self.azure.events, [])
 
     def test_public_execute_always_fails_closed_even_with_stop_receipt(self):
-        with patch.object(b.subprocess, "run") as run:
+        with patch.object(b, "run_tree") as run:
             run.return_value.returncode = 0
             run.return_value.stdout = '{"stopped":true,"scope":"workspace-owned-loadtest","dataPreserved":true}\n'
             with self.assertRaisesRegex(b.Failure, "Destructive reset is disabled"):
@@ -225,7 +225,7 @@ class ResetTests(unittest.TestCase):
             b.reset(self.azure, True, ["stop"])
         self.assertEqual(self.azure.events, [])
 
-    @patch.object(b.subprocess, "run")
+    @patch.object(b, "run_tree")
     def test_stop_failure_retains_fence_without_deleting_data(self, run):
         run.return_value.returncode = 1
         with self.assertRaises(b.Failure):
@@ -234,7 +234,7 @@ class ResetTests(unittest.TestCase):
         self.assertEqual(self.azure.metadata["resetstate"], "fenced")
 
     @patch.object(b.time, "sleep")
-    @patch.object(b.subprocess, "run")
+    @patch.object(b, "run_tree")
     def test_reset_fences_quiesces_then_deletes_every_blob_and_database(self, run, sleep):
         run.return_value.returncode = 0
         run.return_value.stdout = '{"stopped":true,"scope":"workspace-owned-loadtest","dataPreserved":true}\n'
@@ -251,7 +251,7 @@ class ResetTests(unittest.TestCase):
         b.reset(self.azure, False, None)
 
     @patch.object(b.time, "sleep")
-    @patch.object(b.subprocess, "run")
+    @patch.object(b, "run_tree")
     def test_physical_emptiness_failure_is_visible(self, run, sleep):
         run.return_value.returncode = 0
         run.return_value.stdout = '{"stopped":true,"scope":"workspace-owned-loadtest","dataPreserved":true}\n'
@@ -260,7 +260,7 @@ class ResetTests(unittest.TestCase):
                 b._unqualified_reset_sequence(self.azure, ["stop"])
         self.assertEqual(self.azure.metadata["resetstate"], "fenced")
 
-    @patch.object(b.subprocess, "run")
+    @patch.object(b, "run_tree")
     def test_success_exit_without_verified_stop_receipt_is_not_enough(self, run):
         run.return_value.returncode = 0
         run.return_value.stdout = "not stopped"
@@ -269,7 +269,7 @@ class ResetTests(unittest.TestCase):
         self.assertEqual(self.azure.events, [("control", "fenced")])
 
     @patch.object(b.time, "sleep")
-    @patch.object(b.subprocess, "run")
+    @patch.object(b, "run_tree")
     def test_removes_empty_hns_directories_deepest_first(self, run, sleep):
         run.return_value.returncode = 0
         run.return_value.stdout = '{"stopped":true,"scope":"workspace-owned-loadtest","dataPreserved":true}\n'
@@ -280,7 +280,7 @@ class ResetTests(unittest.TestCase):
         self.assertEqual(directories, ["table/empty/deeper", "table/empty", "table"])
 
     @patch.object(b.time, "sleep")
-    @patch.object(b.subprocess, "run")
+    @patch.object(b, "run_tree")
     def test_late_inflight_publication_is_inventoried_after_grace(self, run, sleep):
         run.return_value.returncode = 0
         run.return_value.stdout = '{"stopped":true,"scope":"workspace-owned-loadtest","dataPreserved":true}\n'
@@ -291,7 +291,7 @@ class ResetTests(unittest.TestCase):
         self.assertIn(("DELETE", "table/late.parquet"), self.azure.events)
 
     @patch.object(b.time, "sleep")
-    @patch.object(b.subprocess, "run")
+    @patch.object(b, "run_tree")
     def test_fence_change_during_quiescence_refuses_all_deletion(self, run, sleep):
         run.return_value.returncode = 0
         run.return_value.stdout = '{"stopped":true,"scope":"workspace-owned-loadtest","dataPreserved":true}\n'
@@ -724,6 +724,7 @@ class InitializerHookTests(unittest.TestCase):
                 "ARROWCOL_AZURE_TABLE_ROOT": "abfss://data@example.dfs.core.windows.net/",
                 "AZURE_STORAGE_ACCOUNT": "example", "AZURE_STORAGE_CONTAINER": "data",
                 "AZURE_STORAGE_CHECKPOINT_CONTAINER": "checkpoints",
+                "ARROWCOL_EXPECTED_RESET_GENERATION": str(uuid.uuid4()),
             }
             result = b.subprocess.run(
                 ["bash", str(b.ROOT / "infra/azure/initialize-delta.sh")], env=env,
@@ -745,6 +746,62 @@ class InitializerHookTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("bootstrap must provide", result.stderr)
 
+
+    def test_hook_requires_captured_expected_generation_before_cargo(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cargo = Path(directory) / "cargo"
+            cargo.write_text("#!/bin/sh\necho CARGO_RAN\n")
+            cargo.chmod(0o700)
+            env = {key: value for key, value in os.environ.items()
+                   if key != "ARROWCOL_EXPECTED_RESET_GENERATION"}
+            env.update({
+                "PATH": directory + ":" + os.environ["PATH"],
+                "ARROWCOL_AZURE_TABLE_MANIFEST": str(Path(directory) / "m.json"),
+                "ARROWCOL_AZURE_TABLE_ROOT": "abfss://data@example.dfs.core.windows.net/",
+                "AZURE_STORAGE_ACCOUNT": "example", "AZURE_STORAGE_CONTAINER": "data",
+                "AZURE_STORAGE_CHECKPOINT_CONTAINER": "checkpoints",
+            })
+            result = b.subprocess.run(
+                ["bash", str(b.ROOT / "infra/azure/initialize-delta.sh")], env=env,
+                capture_output=True, text=True, check=False,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("CARGO_RAN", result.stdout)
+        self.assertIn("captured reset generation", result.stderr)
+
+
+class RunTreeTests(unittest.TestCase):
+    def script(self, directory):
+        marker = Path(directory) / "grandchild-survived"
+        return marker, ["bash", "-c", f"(sleep 2; touch {marker}) & sleep 30"]
+
+    def test_outer_interruption_kills_process_group_and_reraises(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker, command = self.script(directory)
+            original = b.subprocess.Popen.communicate
+            def interrupted(process, timeout=None):
+                if timeout is not None:
+                    raise KeyboardInterrupt
+                return original(process)
+            with patch.object(b.subprocess.Popen, "communicate", interrupted):
+                with self.assertRaises(KeyboardInterrupt):
+                    b.run_tree(command, 60)
+            time.sleep(2.5)
+            self.assertFalse(marker.exists())
+
+    def test_runner_stop_timeout_kills_tree_and_keeps_fence_blocking(self):
+        azure = FakeAzure()
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(b, "reset_inventory", return_value=([], {})):
+            marker, command = self.script(directory)
+            real = b.run_tree
+            with patch.object(b, "run_tree", lambda cmd, timeout, **kw: real(cmd, 0.5, **kw)), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(b.Failure, "outcome unknown"):
+                    b._unqualified_reset_sequence(azure, command)
+            time.sleep(2.5)
+            self.assertFalse(marker.exists())
+        self.assertEqual(azure.metadata["resetstate"], "fenced")
 
 class BicepContractTests(unittest.TestCase):
     def test_kusto_application_principal_is_distinct_from_storage_object_principal(self):
