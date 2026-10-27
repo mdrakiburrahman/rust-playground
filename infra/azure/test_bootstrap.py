@@ -936,9 +936,12 @@ class ProvisionCoordinationTests(unittest.TestCase):
         exists, metadata, registry = self.deployed[0]
         self.assertTrue(exists)
         self.assertEqual(metadata, {})
-        self.assertEqual(len(registry), 1)  # deploy ran under a normal member
+        self.assertEqual(len(registry), 1)  # deploy ran under exclusive operator custody
         self.assertEqual(self.azure.metadata, before)
-        self.assertEqual({event[1] for event in self.azure.events if event[0] == "control"}, {"ready-v1"})
+        self.assertEqual([event[1] for event in self.azure.events if event[0] == "control"],
+                         ["fenced-v1", "ready-v1"])
+        self.assertTrue(all(state == "fenced-v1" and len(members) == 1
+                            for _, state, members in self.observed))
         self.assertNotIn("generation", self.child)  # no rotation or re-initialization
         self.assertEqual(b.load_env(self.output)["ARROWCOL_RESET_GENERATION"], before["resetgeneration"])
 
@@ -1027,6 +1030,97 @@ class ProvisionCoordinationTests(unittest.TestCase):
         with self.assertRaises(b.Failure):
             b.reconcile_command(self.azure, self.tables, "")
         self.assertEqual(self.registry(), {})
+
+    def hook_before(self, method, action):
+        """Run a competing transition once immediately before the named CAS method."""
+        from publisher_control import PublisherControl
+        original = getattr(PublisherControl, method)
+        fired = []
+        def wrapper(control, *args, **kwargs):
+            if not fired:
+                fired.append(True)
+                action()
+            return original(control, *args, **kwargs)
+        return patch.object(PublisherControl, method, wrapper)
+
+    def hosted_io(self):
+        return [e for e in self.azure.events if e[0] == "kql" or e in (("arm", "deploy"), ("arm", "start"))]
+
+    def test_occupy_before_ready_provision_custody_fails_provision_before_io(self):
+        other = str(uuid.uuid4())
+        with self.hook_before("claim_exclusive", lambda: b.occupancy(self.azure, "occupy", other)):
+            with self.assertRaises(b.Failure):
+                self.provision()
+        self.assertEqual(self.hosted_io(), [])
+        self.assertEqual((self.azure.metadata["occupancy"], self.azure.metadata["occupancyid"]),
+                         ("testing", other))
+        self.assertEqual((self.azure.metadata["resetstate"], self.registry()), ("ready-v1", {}))
+
+    def test_ready_provision_custody_first_rejects_occupy_until_ready(self):
+        refused = []
+        def deploy_then_occupy(*args):
+            self.fake_cli(*args)
+            if args[:3] == ("deployment", "sub", "create"):
+                with self.assertRaisesRegex(b.Failure, "ready-v1"):
+                    b.occupancy(self.azure, "occupy", str(uuid.uuid4()))
+                refused.append(True)
+        with patch.object(self.azure, "cli", side_effect=deploy_then_occupy):
+            self.provision()
+        self.assertEqual(refused, [True])
+        self.assertEqual((self.azure.metadata["occupancy"], self.azure.metadata["resetstate"]),
+                         ("released", "ready-v1"))
+
+    def test_released_reconcile_races_occupy_in_both_orders(self):
+        other = str(uuid.uuid4())
+        with self.hook_before("claim_exclusive", lambda: b.occupancy(self.azure, "occupy", other)):
+            with self.assertRaises(b.Failure):
+                b.reconcile_command(self.azure, self.tables, "", 0, None)
+        self.assertEqual(self.hosted_io(), [])
+        b.occupancy(self.azure, "release", other, generation=self.azure.metadata["resetgeneration"])
+        def occupy_during(azure, tables, wait_seconds=0):
+            self.fake_reconcile(azure, tables, wait_seconds)
+            with self.assertRaisesRegex(b.Failure, "ready-v1"):
+                b.occupancy(azure, "occupy", str(uuid.uuid4()))
+        with patch.object(b, "reconcile", side_effect=occupy_during):
+            b.reconcile_command(self.azure, self.tables, "", 0, None)
+        self.assertEqual((self.azure.metadata["occupancy"], self.azure.metadata["resetstate"],
+                          self.registry()), ("released", "ready-v1", {}))
+
+    def test_occupied_reconcile_pins_owner_inside_admission_both_orders(self):
+        owner_a, owner_b = str(uuid.uuid4()), str(uuid.uuid4())
+        generation = self.azure.metadata["resetgeneration"]
+        b.occupancy(self.azure, "occupy", owner_a)
+        def swap():
+            b.occupancy(self.azure, "release", owner_a, generation=generation)
+            b.occupancy(self.azure, "occupy", owner_b)
+        with self.hook_before("admit", swap):
+            with self.assertRaisesRegex(b.Failure, "owner changed"):
+                b.reconcile_command(self.azure, self.tables, owner_a, 0, generation)
+        self.assertEqual(self.hosted_io(), [])
+        self.assertEqual((self.azure.metadata["occupancyid"], self.registry()), (owner_b, {}))
+        b.occupancy(self.azure, "release", owner_b, generation=generation)
+        b.occupancy(self.azure, "occupy", owner_a)
+        def swap_during(azure, tables, wait_seconds=0):
+            self.fake_reconcile(azure, tables, wait_seconds)
+            with self.assertRaisesRegex(b.Failure, "retained"):
+                b.occupancy(azure, "release", owner_a, generation=generation)
+            with self.assertRaises(b.Failure):
+                b.occupancy(azure, "occupy", owner_b)
+        with patch.object(b, "reconcile", side_effect=swap_during):
+            b.reconcile_command(self.azure, self.tables, owner_a, 0, generation)
+        self.assertEqual((self.azure.metadata["occupancyid"], self.registry()), (owner_a, {}))
+
+    def test_normal_collectors_and_same_owner_reoccupy_still_admitted(self):
+        owner = str(uuid.uuid4())
+        generation = self.azure.metadata["resetgeneration"]
+        b.occupancy(self.azure, "occupy", owner)
+        collector = str(uuid.uuid4())
+        self.control.admit(collector, generation)
+        b.occupancy(self.azure, "occupy", owner)
+        b.reconcile_command(self.azure, self.tables, owner, 0, generation)
+        self.assertEqual(set(self.registry()), {collector})
+        self.control.clean_release(collector, generation, definitively_drained=True)
+        b.occupancy(self.azure, "release", owner, generation=generation)
 
     def test_public_reconcile_holds_member_for_start_and_kql_then_releases(self):
         self.azure.cluster_state = "Stopped"

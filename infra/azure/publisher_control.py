@@ -82,15 +82,23 @@ class PublisherControl:
             ) from exc
         return metadata
 
-    def admit(self, publisher, generation, bootstrap=False):
+    def admit(self, publisher, generation, bootstrap=False, occupant=None):
         """Normal admission needs ready-v1; bootstrap needs fenced-v1+empty+released.
 
         bootstrap=True is used by the Rust child for its own UUID and, after the
         child has unregistered, by the Python parent for its own FRESH UUID before
         any hosted-state I/O. Neither adopts the other's identity.
+
+        occupant pins the caller's occupancy predicate inside this same leased
+        transition: occupancy must be testing by exactly that owner. The resulting
+        member then blocks that owner's release (empty registry required), and a
+        different owner cannot occupy while testing is held.
         """
         publisher, generation = canonical_uuid(publisher), canonical_uuid(generation)
         metadata, registry, etag = self.read()
+        if occupant is not None and (metadata["occupancy"] != "testing" or
+                                     metadata.get("occupancyid") != canonical_uuid(occupant)):
+            raise Failure("Test occupancy owner changed before admission; refused before I/O.")
         if metadata["resetgeneration"] != generation:
             raise Failure("Admission generation changed.")
         if metadata["resetstate"] != (FENCED if bootstrap else READY):
@@ -106,6 +114,27 @@ class PublisherControl:
             raise Failure("Publisher identity is already registered; no implicit retry/adoption.")
         registry[publisher] = {"generation": generation, "state": "active"}
         return self.cas(metadata, registry, etag)
+
+    def claim_exclusive(self, operator, generation):
+        """ready-v1 + released + EMPTY registry -> fenced-v1 + {operator} in one CAS.
+
+        Exclusive operator custody for ready redeploy and released reconcile using
+        existing wire values: while it holds, occupy (needs ready-v1), normal and
+        bootstrap admission (need ready-v1 / empty), cleanup and stop (need empty)
+        all fail closed. Leaves only via complete_bootstrap (back to ready-v1) or
+        remains blocking (active/uncertain) on unknown outcomes.
+        """
+        operator, generation = canonical_uuid(operator), canonical_uuid(generation)
+        metadata, registry, etag = self.read()
+        if metadata["resetgeneration"] != generation:
+            raise Failure("Exclusive operator generation changed.")
+        if metadata["resetstate"] != READY:
+            raise Failure("Exclusive operator custody requires ready-v1.")
+        require_released(metadata)
+        if registry:
+            raise Failure("Exclusive operator custody requires an empty publisher registry.")
+        metadata["resetstate"] = FENCED
+        return self.cas(metadata, {operator: {"generation": generation, "state": "active"}}, etag)
 
     def fence(self, generation):
         generation = canonical_uuid(generation)
