@@ -9,8 +9,8 @@ use arrow_deltalake::delta::{
 };
 use arrow_deltalake::layout::LayoutPolicy;
 use arrow_deltalake::maintenance::{
-    DISPOSABLE_TEST_MARKER, Granularity, MaintenanceControl, MaintenanceErrorKind, MaintenancePlan, OptimizeConfig,
-    Outcome, PurgeConfig, VacuumConfig, error_kind, now_ms,
+    DISPOSABLE_TEST_MARKER, Granularity, LogFloor, MaintenanceControl, MaintenanceErrorKind, MaintenancePlan,
+    OptimizeConfig, Outcome, PruneConfig, PurgeConfig, VacuumConfig, error_kind, now_ms,
 };
 use async_trait::async_trait;
 use delta_kernel::object_store::{
@@ -159,8 +159,13 @@ fn data_path(root: &Path, relative: &str) -> Result<PathBuf> {
 
 /// Sorted row multiset read from the actual active Parquet files.
 fn rows(root: &Path) -> Result<Vec<Row>> {
+    rows_of(root, active_files(root)?)
+}
+
+/// Sorted row multiset read from the given (path -> partition) Parquet files.
+fn rows_of(root: &Path, active: BTreeMap<String, String>) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
-    for (relative, partition) in active_files(root)? {
+    for (relative, partition) in active {
         let reader = ParquetRecordBatchReaderBuilder::try_new(fs::File::open(data_path(root, &relative)?)?)?.build()?;
         for batch in reader {
             let batch = batch?;
@@ -1189,5 +1194,462 @@ fn optimize_uncertain_commit_never_discards_outputs() -> Result<()> {
             Outcome::AlreadyApplied
         );
     }
+    Ok(())
+}
+
+const PUBLICATIONS: [&str; 2] = ["arrowcol.publication.prune-0", "arrowcol.publication.prune-1"];
+
+fn append_published(table: &Arc<DeltaTable>, index: i64, ids: Range<i64>, app_id: &str) -> Result<u64> {
+    run(async {
+        let mut file = table
+            .new_file_partitioned(
+                schema(),
+                BTreeMap::from([(INGESTION_PARTITION.to_owned(), Some(minute(index)))]),
+            )?
+            .with_ingestion_time(BASE + index * MINUTE + 1)?
+            .with_transaction(app_id.to_owned(), 1)?;
+        file.write(&batch(ids, &minute(index))?).await?;
+        Ok::<_, anyhow::Error>(file.finish().await?.version)
+    })?
+}
+
+fn json_path(root: &Path, version: u64) -> PathBuf {
+    root.join("_delta_log").join(format!("{version:020}.json"))
+}
+
+fn checkpoint_path(root: &Path, version: u64) -> PathBuf {
+    root.join("_delta_log")
+        .join(format!("{version:020}.checkpoint.parquet"))
+}
+
+fn short_vacuum(now: i64) -> VacuumConfig {
+    let mut config = VacuumConfig::new(0, now);
+    config.unsafe_allow_short_retention_for_tests = true;
+    config
+}
+
+fn short_prune(now: i64) -> PruneConfig {
+    PruneConfig {
+        log_retention_ms: Some(0),
+        unsafe_allow_short_retention_for_tests: true,
+        ..PruneConfig::new(now)
+    }
+}
+
+/// Txn versions the pruning proof must preserve.
+fn txn_versions(table: &DeltaTable) -> Result<Vec<Option<i64>>> {
+    PUBLICATIONS
+        .iter()
+        .chain([&PURGE_WATERMARK])
+        .map(|app_id| table.lookup_txn(app_id))
+        .collect()
+}
+
+/// Active (path -> partition) after pruning: the hinted checkpoint's adds plus later JSON.
+fn pruned_active(root: &Path) -> Result<BTreeMap<String, String>> {
+    use arrow::array::AsArray;
+    let hint: serde_json::Value = serde_json::from_slice(&fs::read(root.join("_delta_log").join("_last_checkpoint"))?)?;
+    let checkpoint = hint["version"].as_u64().context("hint version")?;
+    let mut active = BTreeMap::new();
+    for batch in
+        ParquetRecordBatchReaderBuilder::try_new(fs::File::open(checkpoint_path(root, checkpoint))?)?.build()?
+    {
+        let batch = batch?;
+        let add = batch.column_by_name("add").context("add")?.as_struct();
+        let paths = add.column_by_name("path").context("add.path")?.as_string::<i32>();
+        for row in 0..batch.num_rows() {
+            if add.is_valid(row) {
+                let path = paths.value(row).to_owned();
+                let partition = path
+                    .split('/')
+                    .next()
+                    .and_then(|segment| segment.strip_prefix(&format!("{INGESTION_PARTITION}=")))
+                    .context("partition segment")?
+                    .to_owned();
+                active.insert(path, partition);
+            }
+        }
+    }
+    let mut version = checkpoint + 1;
+    while json_path(root, version).is_file() {
+        for action in commit_actions(root, version)? {
+            if let Some(add) = action.get("add") {
+                let partition = add["partitionValues"][INGESTION_PARTITION]
+                    .as_str()
+                    .context("partition")?
+                    .to_owned();
+                active.insert(add["path"].as_str().context("path")?.to_owned(), partition);
+            } else if let Some(remove) = action.get("remove") {
+                active.remove(remove["path"].as_str().context("path")?);
+            }
+        }
+        version += 1;
+    }
+    Ok(active)
+}
+
+/// Appends with two publication txns, OPTIMIZE and PURGE (tombstones plus the
+/// purge watermark), and a marked disposable root. Returns the maintenance handle.
+fn prunable_history(root: &Path) -> Result<(Arc<DeltaTable>, Arc<DeltaTable>)> {
+    let table = create(root)?;
+    for index in 0..4 {
+        append_published(
+            &table,
+            index,
+            index * 10..index * 10 + 2,
+            PUBLICATIONS[usize::try_from(index % 2)?],
+        )?;
+        append(&table, index, index * 10 + 5..index * 10 + 7)?;
+    }
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root)?)?;
+    let optimize = maintenance.plan_optimize(&OptimizeConfig {
+        latest_partitions: Some(1),
+        ..optimize_config()
+    })?;
+    maintenance.apply_optimize(&optimize, &optimize_config(), &control())?;
+    let purge = maintenance.plan_purge(&purge_config())?;
+    maintenance.apply_purge(&purge, &purge_config(), &control())?;
+    fs::write(root.join(DISPOSABLE_TEST_MARKER), b"")?;
+    Ok((table, maintenance))
+}
+
+/// VACUUM LITE apply (writes progress at the vacuum read version) then a checkpoint there.
+fn vacuum_and_checkpoint(maintenance: &DeltaTable) -> Result<u64> {
+    let now = now_ms()? + 1_000;
+    let plan = maintenance.plan_vacuum(&short_vacuum(now))?;
+    let report = maintenance.apply_vacuum(&plan, &short_vacuum(now), &control())?;
+    assert!(matches!(report.outcome, Outcome::Deleted | Outcome::Noop));
+    let progress = maintenance.vacuum_lite_progress()?.context("progress recorded")?;
+    assert_eq!(
+        progress.version, plan.header.read_version,
+        "progress records the scanned version"
+    );
+    let checkpoint = maintenance.checkpoint_if_due(1, true)?;
+    assert_eq!(checkpoint.outcome, Outcome::Checkpointed);
+    Ok(checkpoint.version)
+}
+
+/// Scenario: publications, OPTIMIZE and PURGE tombstones, VACUUM LITE with a test
+/// retention, a checkpoint, then a dry run, an apply and later maintenance.
+/// Guarantees: the dry run deletes nothing; the apply deletes exactly JSON `0..=C`
+/// after writing the table-bound floor, keeps checkpoint C and `_last_checkpoint`,
+/// preserves every txn (publications and purge watermark), rows and the active set;
+/// appends, OPTIMIZE, VACUUM LITE and a second, floor-seeded prune keep working,
+/// and repeats are Noop.
+#[test]
+fn prune_log_deletes_proven_history_and_keeps_table_state() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let (table, maintenance) = prunable_history(root.path())?;
+    let txns = txn_versions(&maintenance)?;
+    assert!(txns.iter().all(Option::is_some), "{txns:?}");
+    let checkpoint = vacuum_and_checkpoint(&maintenance)?;
+    let active = active_files(root.path())?;
+    let rows_before = rows(root.path())?;
+    let json_before = log_files(root.path())?;
+
+    let config = short_prune(now_ms()? + 1_000);
+    assert_eq!(
+        kind(maintenance.plan_prune_log(&PruneConfig {
+            unsafe_allow_short_retention_for_tests: false,
+            ..config.clone()
+        })),
+        Some(MaintenanceErrorKind::UnsafeRequest)
+    );
+    let plan = maintenance.plan_prune_log(&config)?;
+    assert_eq!(plan.checkpoint_version, Some(checkpoint));
+    let expected: Vec<String> = (0..=checkpoint)
+        .map(|version| format!("_delta_log/{version:020}.json"))
+        .collect();
+    assert_eq!(plan.deletions, expected);
+    let dry = plan.report();
+    assert_eq!((dry.outcome, dry.files_removed), (Outcome::Planned, checkpoint + 1));
+    assert_eq!(log_files(root.path())?, json_before, "dry run deletes nothing");
+    assert_eq!(maintenance.log_floor()?, None, "dry run writes no floor");
+
+    let report = maintenance.apply_prune_log(&plan, &config, &control())?;
+    assert_eq!(
+        (report.outcome, report.files_deleted, report.version),
+        (Outcome::Pruned, checkpoint + 1, checkpoint)
+    );
+    assert!(log_files(root.path())?.is_empty(), "JSON 0..=C pruned");
+    assert!(checkpoint_path(root.path(), checkpoint).is_file());
+    assert!(root.path().join("_delta_log").join("_last_checkpoint").is_file());
+    let floor = maintenance.log_floor()?.context("floor")?;
+    assert_eq!(floor.checkpoint_version, checkpoint);
+    assert_eq!(maintenance.version()?, checkpoint, "pruning writes no Delta commit");
+    assert_eq!(txn_versions(&maintenance)?, txns);
+    let reopened = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    assert_eq!(txn_versions(&reopened)?, txns);
+    assert_eq!(pruned_active(root.path())?, active);
+    assert_eq!(rows_of(root.path(), pruned_active(root.path())?)?, rows_before);
+    assert_eq!(
+        maintenance
+            .plan_prune_log(&short_prune(now_ms()? + 1_000))?
+            .report()
+            .outcome,
+        Outcome::Noop,
+        "repeat prune"
+    );
+
+    // Later appends, OPTIMIZE and VACUUM LITE (seeded from the floor checkpoint).
+    append(&table, 4, 40..42)?;
+    append(&table, 4, 45..47)?;
+    append(&table, 5, 50..51)?;
+    let optimize = reopened.plan_optimize(&OptimizeConfig {
+        latest_partitions: Some(1),
+        ..optimize_config()
+    })?;
+    let optimized = reopened.apply_optimize(&optimize, &optimize_config(), &control())?;
+    assert_eq!(optimized.outcome, Outcome::Committed);
+    let rows_later = rows_of(root.path(), pruned_active(root.path())?)?;
+    let second = vacuum_and_checkpoint(&reopened)?;
+    assert!(second > checkpoint);
+    let again = reopened.plan_prune_log(&short_prune(now_ms()? + 1_000))?;
+    assert_eq!(again.checkpoint_version, Some(second));
+    let mut expected: Vec<String> = (checkpoint + 1..=second)
+        .map(|version| format!("_delta_log/{version:020}.json"))
+        .collect();
+    expected.insert(0, format!("_delta_log/{checkpoint:020}.checkpoint.parquet"));
+    assert_eq!(again.deletions, expected);
+    let report = reopened.apply_prune_log(&again, &short_prune(now_ms()? + 1_000), &control())?;
+    assert_eq!(report.outcome, Outcome::Pruned);
+    assert!(!checkpoint_path(root.path(), checkpoint).exists());
+    assert!(checkpoint_path(root.path(), second).is_file());
+    assert_eq!(
+        reopened.log_floor()?.map(|floor| floor.checkpoint_version),
+        Some(second)
+    );
+    assert_eq!(txn_versions(&reopened)?, txns);
+    assert_eq!(rows_of(root.path(), pruned_active(root.path())?)?, rows_later);
+    append(&table, 6, 60..62)?;
+    reopened.plan_vacuum(&short_vacuum(now_ms()? + 1_000))?;
+    Ok(())
+}
+
+/// Scenario: a checkpoint whose removes VACUUM LITE has not processed: no progress
+/// record, progress older than the checkpoint, or removes newer than the progress cutoff.
+/// Guarantees: pruning is Noop and nothing is deleted.
+#[test]
+fn prune_log_waits_for_vacuum_progress() -> Result<()> {
+    let no_progress = tempfile::tempdir()?;
+    let (_, maintenance) = prunable_history(no_progress.path())?;
+    maintenance.checkpoint_if_due(1, true)?;
+    let before = log_files(no_progress.path())?;
+    let config = short_prune(now_ms()? + 1_000);
+    let plan = maintenance.plan_prune_log(&config)?;
+    assert_eq!((plan.checkpoint_version, plan.report().outcome), (None, Outcome::Noop));
+    assert_eq!(
+        maintenance.apply_prune_log(&plan, &config, &control())?.outcome,
+        Outcome::Noop
+    );
+    assert_eq!(log_files(no_progress.path())?, before);
+
+    let stale = tempfile::tempdir()?;
+    let (table, maintenance) = prunable_history(stale.path())?;
+    let now = now_ms()? + 1_000;
+    maintenance.apply_vacuum(
+        &maintenance.plan_vacuum(&short_vacuum(now))?,
+        &short_vacuum(now),
+        &control(),
+    )?;
+    append(&table, 3, 30..31)?;
+    maintenance.checkpoint_if_due(1, true)?;
+    let before = log_files(stale.path())?;
+    let plan = maintenance.plan_prune_log(&short_prune(now_ms()? + 1_000))?;
+    assert_eq!(plan.report().outcome, Outcome::Noop, "progress V < C");
+    assert_eq!(log_files(stale.path())?, before);
+
+    let early = tempfile::tempdir()?;
+    let (_, maintenance) = prunable_history(early.path())?;
+    // A cutoff before the OPTIMIZE/PURGE removes: nothing is vacuumed, progress T is too old.
+    let anchor = now_ms()? - 120_000;
+    let plan = maintenance.plan_vacuum(&short_vacuum(anchor))?;
+    assert!(plan.candidates.is_empty());
+    maintenance.apply_vacuum(&plan, &short_vacuum(anchor), &control())?;
+    let progress = maintenance.vacuum_lite_progress()?.context("progress")?;
+    assert_eq!(progress.cutoff_ms, anchor);
+    maintenance.checkpoint_if_due(1, true)?;
+    let before = log_files(early.path())?;
+    let plan = maintenance.plan_prune_log(&short_prune(now_ms()? + 1_000))?;
+    assert_eq!(plan.report().outcome, Outcome::Noop, "remove stamps >= T");
+    assert_eq!(log_files(early.path())?, before);
+    Ok(())
+}
+
+/// Scenario: a fully provable checkpoint under the default and a one-day log retention.
+/// Guarantees: young commits are never pruned.
+#[test]
+fn prune_log_respects_log_retention() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let (_, maintenance) = prunable_history(root.path())?;
+    vacuum_and_checkpoint(&maintenance)?;
+    let before = log_files(root.path())?;
+    let now = now_ms()? + 1_000;
+    let default = maintenance.plan_prune_log(&PruneConfig::new(now))?;
+    assert_eq!(default.log_retention_ms, 30 * DAY);
+    assert_eq!(default.report().outcome, Outcome::Noop);
+    let day = maintenance.plan_prune_log(&PruneConfig {
+        log_retention_ms: Some(DAY),
+        ..short_prune(now)
+    })?;
+    assert_eq!((day.checkpoint_version, day.report().outcome), (None, Outcome::Noop));
+    assert_eq!(log_files(root.path())?, before);
+    Ok(())
+}
+
+/// Scenario: an apply cancelled before deleting, then a bounded apply that writes the
+/// floor and deletes only two JSON commits (a crash mid-prune).
+/// Guarantees: cancellation deletes nothing; with partial history VACUUM LITE,
+/// OPTIMIZE and checkpointing still work, and a fresh plan completes the prune.
+#[test]
+fn prune_log_recovers_from_partial_apply() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let (table, maintenance) = prunable_history(root.path())?;
+    let txns = txn_versions(&maintenance)?;
+    let checkpoint = vacuum_and_checkpoint(&maintenance)?;
+    let rows_before = rows(root.path())?;
+    let config = short_prune(now_ms()? + 1_000);
+    let plan = maintenance.plan_prune_log(&config)?;
+    let cancelled = maintenance.apply_prune_log(
+        &plan,
+        &config,
+        &MaintenanceControl::new(Arc::new(AtomicBool::new(true)), None),
+    )?;
+    assert_eq!((cancelled.outcome, cancelled.files_deleted), (Outcome::Partial, 0));
+    assert!(json_path(root.path(), 0).is_file());
+
+    let bounded = PruneConfig {
+        max_prune_files: 2,
+        ..config.clone()
+    };
+    let partial = maintenance.plan_prune_log(&bounded)?;
+    assert_eq!(partial.deletions.len(), 2);
+    assert_eq!(partial.backlog_files, checkpoint - 1);
+    assert_eq!(
+        maintenance
+            .apply_prune_log(&partial, &bounded, &control())?
+            .files_deleted,
+        2
+    );
+    assert!(!json_path(root.path(), 1).exists());
+    assert!(json_path(root.path(), 2).is_file());
+    assert_eq!(
+        maintenance.log_floor()?,
+        Some(LogFloor {
+            table_id: partial.header.fingerprint.table_id.clone(),
+            checkpoint_version: checkpoint,
+        })
+    );
+
+    let vacuum = maintenance.plan_vacuum(&short_vacuum(now_ms()? + 1_000))?;
+    assert_eq!(vacuum.header.read_version, checkpoint);
+    append(&table, 4, 40..42)?;
+    assert_eq!(maintenance.checkpoint_if_due(100, false)?.outcome, Outcome::Noop);
+
+    let complete = maintenance.plan_prune_log(&short_prune(now_ms()? + 1_000))?;
+    assert_eq!(complete.checkpoint_version, Some(checkpoint));
+    assert_eq!(complete.deletions.len(), usize::try_from(checkpoint - 1)?);
+    let report = maintenance.apply_prune_log(&complete, &short_prune(now_ms()? + 1_000), &control())?;
+    assert_eq!(report.outcome, Outcome::Pruned);
+    assert_eq!(log_files(root.path())?, vec![json_path(root.path(), checkpoint + 1)]);
+    assert_eq!(txn_versions(&maintenance)?, txns);
+    let mut expected = rows_before;
+    expected.extend(expected_rows(4, 40..42));
+    assert_eq!(rows_of(root.path(), pruned_active(root.path())?)?, sorted(expected));
+    assert_eq!(
+        maintenance
+            .plan_prune_log(&short_prune(now_ms()? + 1_000))?
+            .report()
+            .outcome,
+        Outcome::Noop
+    );
+    Ok(())
+}
+
+fn expected_rows(index: i64, ids: Range<i64>) -> Vec<Row> {
+    expected(ids, &minute(index))
+}
+
+/// Scenario: JSON missing above the log floor (behind a newer checkpoint Kernel can
+/// load from), and pruned history whose floor record was lost.
+/// Guarantees: VACUUM LITE refuses visibly with Unsupported and pruning deletes nothing.
+#[test]
+fn prune_log_unexplained_gaps_are_unsupported() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let (table, maintenance) = prunable_history(root.path())?;
+    let checkpoint = vacuum_and_checkpoint(&maintenance)?;
+    let config = short_prune(now_ms()? + 1_000);
+    maintenance.apply_prune_log(&maintenance.plan_prune_log(&config)?, &config, &control())?;
+    for index in 4..7 {
+        append(&table, index, index * 10..index * 10 + 1)?;
+    }
+    maintenance.checkpoint_if_due(1, true)?;
+    fs::remove_file(json_path(root.path(), checkpoint + 1))?;
+    let vacuum = short_vacuum(now_ms()? + 1_000);
+    assert_eq!(
+        kind(maintenance.plan_vacuum(&vacuum)),
+        Some(MaintenanceErrorKind::Unsupported)
+    );
+    // Progress still ends at the floor, so pruning has nothing provable and deletes nothing.
+    let before = log_files(root.path())?;
+    assert_eq!(
+        maintenance
+            .plan_prune_log(&short_prune(now_ms()? + 1_000))?
+            .report()
+            .outcome,
+        Outcome::Noop
+    );
+    assert_eq!(log_files(root.path())?, before);
+
+    let lost = tempfile::tempdir()?;
+    let (_, maintenance) = prunable_history(lost.path())?;
+    vacuum_and_checkpoint(&maintenance)?;
+    let config = short_prune(now_ms()? + 1_000);
+    maintenance.apply_prune_log(&maintenance.plan_prune_log(&config)?, &config, &control())?;
+    fs::remove_file(lost.path().join("_arrowcol_maintenance").join("log-floor.json"))?;
+    assert_eq!(
+        kind(maintenance.plan_vacuum(&vacuum)),
+        Some(MaintenanceErrorKind::Unsupported)
+    );
+    Ok(())
+}
+
+/// Scenario: a checkpoint rewritten without one publication txn row.
+/// Guarantees: the independent JSON replay disagrees, pruning refuses with
+/// Unsupported, and nothing is deleted.
+#[test]
+fn prune_log_refuses_checkpoint_missing_a_txn() -> Result<()> {
+    use arrow::array::{AsArray, BooleanArray};
+    let root = tempfile::tempdir()?;
+    let (_, maintenance) = prunable_history(root.path())?;
+    let checkpoint = vacuum_and_checkpoint(&maintenance)?;
+    let path = checkpoint_path(root.path(), checkpoint);
+    let reader = ParquetRecordBatchReaderBuilder::try_new(fs::File::open(&path)?)?;
+    let schema = Arc::clone(reader.schema());
+    let mut kept = Vec::new();
+    let mut dropped = 0;
+    for batch in reader.build()? {
+        let batch = batch?;
+        let txn = batch.column_by_name("txn").context("txn")?.as_struct();
+        let app_ids = txn.column_by_name("appId").context("appId")?.as_string::<i32>();
+        let keep: BooleanArray = (0..batch.num_rows())
+            .map(|row| Some(!(txn.is_valid(row) && app_ids.value(row) == PUBLICATIONS[0])))
+            .collect();
+        dropped += keep.false_count();
+        kept.push(arrow::compute::filter_record_batch(&batch, &keep)?);
+    }
+    assert_eq!(dropped, 1);
+    let mut writer = parquet::arrow::ArrowWriter::try_new(fs::File::create(&path)?, schema, None)?;
+    for batch in &kept {
+        writer.write(batch)?;
+    }
+    writer.close()?;
+    let before = log_files(root.path())?;
+    assert_eq!(
+        kind(maintenance.plan_prune_log(&short_prune(now_ms()? + 1_000))),
+        Some(MaintenanceErrorKind::Unsupported)
+    );
+    assert_eq!(log_files(root.path())?, before);
+    assert_eq!(maintenance.log_floor()?, None);
     Ok(())
 }

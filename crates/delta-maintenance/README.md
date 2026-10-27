@@ -12,6 +12,7 @@ It is a separate process, not a collector task. It opens tables with `DeltaTable
 | `purge` | Removes still-active files in expired `__arrowcol_ingestion` partitions. | `dataChange=true` removes, plus the `arrowcol.purge.before-ms` watermark, in the same transaction |
 | `vacuum` | VACUUM LITE: physically deletes tombstoned files older than the retention period, using `_delta_log` only (no data directory listing). | None |
 | `checkpoint` | Writes a classic Kernel checkpoint once `--checkpoint-every-commits` (default 100) commits follow the hinted checkpoint. This bounds snapshot replay for the collector and readers. Application transactions (publication and purge identities) and metadata are retained. JSON history is never deleted. | None (checkpoint Parquet + `_last_checkpoint` hint) |
+| `prune-log` | Deletes `_delta_log` history (`NNN.json` for `0..=C`, and older checkpoints) once checkpoint `C` is proven equivalent to it. See [Log pruning](#log-pruning). | None |
 
 ## Safety
 
@@ -22,15 +23,38 @@ It is a separate process, not a collector task. It opens tables with `DeltaTable
 - **Bad partitions are never deleted.** Malformed or null partition values fail closed.
 - **No empty commits.** No-op runs and repeated runs leave the table version unchanged. The watermark is never committed on its own.
 - **VACUUM retention has a 7-day floor.** Shorter retention needs `--unsafe-short-vacuum-for-tests` and a marked disposable temp root.
-- **VACUUM needs complete history.** It requires contiguous JSON commits `0..=version` and fails visibly otherwise.
+- **VACUUM needs explained history.** It requires contiguous JSON commits `0..=version`, or, after `prune-log`, a durable log floor `F` whose checkpoint exists, covered by the VACUUM LITE progress record, followed by contiguous JSON `F+1..=version`. Any other gap fails visibly with `unsupported`.
 - **VACUUM rejects unsafe paths.** Traversal and external paths are rejected.
 - **VACUUM reports partial progress.** Cancelling mid-delete reports a `partial` outcome.
 
 On Azure the service opens tables through the shared publisher session and closes it after the run; a failed close exits nonzero and leaves its registration in place. Reset execution stays disabled, so the service does not claim infra-reset safety.
 
+### Log pruning
+
+`prune-log` never guesses; when any condition fails it reports `noop` (or refuses with `unsupported` on a disagreement) and deletes nothing.
+
+**VACUUM LITE progress.** Only a complete VACUUM LITE apply (not a dry run, not partial or cancelled, no backlog) writes `_arrowcol_maintenance/vacuum-lite.json` under the table root (never inside `_delta_log`): `{table_id, version, cutoff_ms}`. It states that every remove in commits `0..=version` with `deletionTimestamp < cutoff_ms` was physically deleted or confirmed absent. `version` is the version that VACUUM actually replayed. The record is bound to the table id and is monotonic: it is replaced only by a record with both a greater-or-equal version and a greater-or-equal cutoff. It is written with an exclusive lock, temp file, fsync and rename on local roots, and with create-if-absent or etag-conditional puts on object stores.
+
+**Proof.** A plan picks the newest classic checkpoint `C` such that:
+
+1. checkpoint `C` exists, `_last_checkpoint` points at a version `>= C`, and no multi-part, V2 or compacted log object exists at or below it;
+2. an independent, hand-written replay of every JSON commit `0..=C` (every file must be present) yields the same table id, the same active add-path set, and the same `appId -> version` for every application transaction — publications, maintenance plans and the `arrowcol.purge.before-ms` watermark — as both a direct Parquet read of checkpoint `C` and Delta Kernel loading the snapshot at `C` from it. Txn-retention properties are refused;
+3. the progress record has the same table id, `version >= C`, and every remove in `0..=C` has a `deletionTimestamp` (missing fails) older than its `cutoff_ms`. Kernel checkpoints drop expired tombstones, so this is what keeps pruning from leaking never-vacuumed files;
+4. every commit in `0..=C` is older than `now - log retention`, using the later of `commitInfo.timestamp`/`inCommitTimestamp` and the file's modification time.
+
+Log retention is `--log-retention-secs`, defaulting to `delta.logRetentionDuration` (30 days when unset). A shorter value needs `--unsafe-short-vacuum-for-tests` and a marked disposable temp root, exactly like short VACUUM retention.
+
+**Apply.** Apply re-proves everything against fresh state and checks publication authority. It then durably writes `_arrowcol_maintenance/log-floor.json` (`{table_id, checkpoint_version: C}`; table-bound, never lowered, fsynced) **before** the first delete. It then deletes `NNN.json` for `0..=C` and checkpoints below `C` in ascending order. `NotFound` counts as already absent. At most `--max-prune-files` (default 10,000) objects are deleted per run; the rest is reported as backlog. It stops between deletes on cancel or deadline with a `partial` outcome. Checkpoint `C`, `_last_checkpoint` and anything newer are never deleted, and no Delta commit is written.
+
+After a floor `F` exists, the next proof replays the Parquet contents of checkpoint `F` plus JSON `F+1..=C'`; checkpoint `F`'s tombstones must also be older than the progress cutoff. A run interrupted after writing the floor is completed by a later plan that re-verifies checkpoint `F` against Kernel and deletes the leftovers below it. The full proof held before that floor was written.
+
 ### Log growth
 
-`_delta_log` grows without bound by design. VACUUM LITE proves tombstones from contiguous JSON commits `0..=version`, and the service never deletes JSON history, checkpoints, or the transaction identities they carry. Each append adds one JSON commit, and each `checkpoint` adds one Parquet file. `checkpoint` bounds replay *time*, not log *size*. VACUUM refuses with `resource_limit` once the log exceeds `max_log_files` (100,000 commits); it never falls back to a partial scan. Long-running tables need a future, explicitly designed history-cleanup policy that preserves those proofs.
+Without `prune-log`, `_delta_log` grows without bound: VACUUM LITE proves tombstones from the log, and `checkpoint` bounds replay *time*, not log *size*. VACUUM refuses with `resource_limit` once the replayed history exceeds `max_log_files` (100,000 commits); it never falls back to a partial scan.
+
+With `vacuum`, `checkpoint` and `prune-log` scheduled, the **number** of JSON commits and old checkpoint files plateaus at about max(VACUUM retention, log retention) worth of commits, plus the checkpoint interval. A commit becomes prunable only once its removes are vacuumed (VACUUM retention, at least 7 days) and it is older than the log retention (30 days by default). That plateau is reachable inside a short stress window only under the test overrides (`--vacuum-retention-secs 0 --log-retention-secs 0 --unsafe-short-vacuum-for-tests` on a disposable root).
+
+**Known limitation: total log bytes are not bounded.** Checkpoints carry every application transaction forever, because transaction retention is disallowed. That includes one `arrowcol.publication.<uuid>` per receipt and one `arrowcol.purge.plan.<uuid>` per maintenance plan. The newest checkpoint therefore grows with the number of publications and plans. Pruning bounds only the count of historical JSON commits and old checkpoint files, not total `_delta_log` bytes. Only classic single-file checkpoints are supported.
 
 ## Usage
 
@@ -67,7 +91,7 @@ delta-maintenance --root abfss://c@acct.dfs.core.windows.net/delta/ --table even
 
 The only labels are `operation` and `outcome`. Table names are never used as labels. Series:
 
-- `delta_maintenance_runs_total`, with outcomes: planned, noop, committed, already_applied, deleted, partial, and error kinds
+- `delta_maintenance_runs_total`, with outcomes: planned, noop, committed, already_applied, deleted, checkpointed, pruned, partial, and error kinds
 - Files, rows and bytes processed
 - Commit collisions, retries and exhausted retries
 - Backlog
