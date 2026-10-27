@@ -359,8 +359,9 @@ pub struct ValidateArgs {
     #[arg(long, env = "LOADTEST_COLLECTORS_DRAINED", default_value_t = false)]
     pub collectors_drained: bool,
 
-    /// Absolute Unix-millisecond bound for this whole command, set privately by the runner so
-    /// every inner wait ends, and fail-closed evidence is written, before the runner's hard kill.
+    /// Absolute Unix-millisecond bound for this whole command, set privately by the runner. Inner
+    /// waits are clamped to it and cancelled at their next await, and a failed report is written;
+    /// synchronous reader work cannot be preempted, so only the runner's hard kill is a hard bound.
     #[arg(
         long,
         env = "LOADTEST_VALIDATE_DEADLINE_UNIX_MS",

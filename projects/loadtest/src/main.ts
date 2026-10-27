@@ -432,13 +432,14 @@ export function localLoadgenEnvironment(
 
 /** Hard backstop for one non-load loadgen command; the runner kills the command after it. */
 export const LOADGEN_PHASE_TIMEOUT_MS = 600_000;
-/** Part of the backstop kept for validate's own fail-closed report and exit. */
+/** Part of the backstop left for validate's fail-closed report; unpreemptible reader work can consume it. */
 export const VALIDATE_RESERVE_MS = 30_000;
 
 /**
  * Timeout and private environment for one loadgen command. Validate alone receives an absolute
- * deadline inside the unchanged backstop, so its inner waits end and its failed report is written
- * before the kill; an inherited deadline never bounds run or drain.
+ * deadline inside the unchanged backstop; its inner waits stop cooperatively at that deadline and
+ * write a failed report, while the backstop remains the only hard bound. An inherited deadline
+ * never bounds run or drain.
  */
 export function loadgenSpawnPlan(
   command: 'run' | 'drain' | 'validate',

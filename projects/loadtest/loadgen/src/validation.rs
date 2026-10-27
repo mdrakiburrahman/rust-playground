@@ -107,9 +107,10 @@ impl Budget {
     }
 
     /// Runs one phase under the absolute bound; reaching it drops the phase, cancelling in-flight
-    /// requests at their next await. Synchronous reader stretches cannot be preempted, so a result
-    /// that completes at or after the bound is rejected rather than accepted late. Without a bound
-    /// the phase runs exactly as before.
+    /// requests at their next await. Cancellation is cooperative only: synchronous reader stretches
+    /// cannot be preempted and may overrun the bound (and the runner's reserve), so a result that
+    /// completes at or after the bound is rejected rather than accepted late. Without a bound the
+    /// phase runs exactly as before.
     async fn within<T>(&self, phase: ValidatePhase, work: impl Future<Output = Result<T>>) -> Result<T> {
         let Some(deadline) = self.deadline else {
             return work.await;
@@ -170,16 +171,17 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
         Ok(budget) => budget,
         Err(error) => return fail_early(&arguments, None, ValidatePhase::Deadline, error).await,
     };
-    let inputs = async {
-        Ok::<_, anyhow::Error>((
-            read_json_lines::<SendManifestEntry>(&arguments.results.join(SEND_MANIFEST_FILE)).await?,
-            read_json_lines::<ReceiptManifestEntry>(&arguments.results.join(RECEIPT_MANIFEST_FILE)).await?,
-            read_json::<Vec<SchemaContract>>(&arguments.results.join(SCHEMA_CONTRACT_FILE)).await?,
-            read_json::<RoutingEvidence>(&arguments.results.join(ROUTING_EVIDENCE_FILE)).await?,
-            read_json::<Value>(&arguments.results.join(CAPABILITY_EVIDENCE_FILE)).await?,
-        ))
-    }
-    .await;
+    let inputs = budget
+        .within(ValidatePhase::Inputs, async {
+            Ok::<_, anyhow::Error>((
+                read_json_lines::<SendManifestEntry>(&arguments.results.join(SEND_MANIFEST_FILE)).await?,
+                read_json_lines::<ReceiptManifestEntry>(&arguments.results.join(RECEIPT_MANIFEST_FILE)).await?,
+                read_json::<Vec<SchemaContract>>(&arguments.results.join(SCHEMA_CONTRACT_FILE)).await?,
+                read_json::<RoutingEvidence>(&arguments.results.join(ROUTING_EVIDENCE_FILE)).await?,
+                read_json::<Value>(&arguments.results.join(CAPABILITY_EVIDENCE_FILE)).await?,
+            ))
+        })
+        .await;
     let (sends, receipts, contracts, routing, capabilities) = match inputs {
         Ok(inputs) => inputs,
         Err(error) => return fail_early(&arguments, Some(&budget), ValidatePhase::Inputs, error).await,
@@ -192,13 +194,14 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
         failed_phase = Some(ValidatePhase::Deadline);
     }
     let kusto_settle = if arguments.collectors_drained {
-        let drained = async {
-            let metadata = read_json(&arguments.results.join("run-metadata.json")).await?;
-            let publication = read_json(&arguments.results.join("publication-drain.json")).await?;
-            let mutators = read_json(&arguments.results.join("mutator-drain.json")).await?;
-            check_drain_receipts(&metadata, &publication, &mutators)
-        }
-        .await;
+        let drained = budget
+            .within(ValidatePhase::DrainReceipts, async {
+                let metadata = read_json(&arguments.results.join("run-metadata.json")).await?;
+                let publication = read_json(&arguments.results.join("publication-drain.json")).await?;
+                let mutators = read_json(&arguments.results.join("mutator-drain.json")).await?;
+                check_drain_receipts(&metadata, &publication, &mutators)
+            })
+            .await;
         drained.err().map(|error| {
             failures.push(format!("drain receipts rejected: {error:#}"));
             failed_phase.get_or_insert(ValidatePhase::DrainReceipts);
@@ -521,8 +524,12 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
     );
     validate_capabilities(&capabilities, arguments.quiver, &mut failures);
 
+    let mut diagnostics = Vec::new();
     let kusto = if let Some(endpoint) = &arguments.kusto_endpoint {
-        let progress = std::sync::Mutex::new(crate::kusto::KustoProgress::default());
+        let bound = crate::kusto::KustoBound {
+            ceiling: budget.deadline,
+            ..crate::kusto::KustoBound::default()
+        };
         let validation = if let Some(error) = kusto_settle {
             Err(error)
         } else if let (Some(direct), Some(dataflow)) = (&direct, &dataflow) {
@@ -537,8 +544,7 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
                             &arguments.dataflow_root,
                             direct,
                             dataflow,
-                            budget.deadline,
-                            &progress,
+                            &bound,
                         ),
                     )
                     .await
@@ -551,24 +557,17 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
                 "Kusto validation requires both independent Delta snapshots"
             ))
         };
-        Some(match validation {
+        match validation {
             Ok(report) => {
                 crate::kusto::write_validation(&arguments.results, &report)?;
-                report
+                Some(report)
             }
             Err(error) => {
                 failures.push(format!("Kusto validation failed: {error:#}"));
                 failed_phase.get_or_insert(ValidatePhase::Kusto);
-                let metadata: Value = read_json(&arguments.results.join(crate::manifest::RUN_METADATA_FILE)).await?;
-                crate::kusto::degraded(
-                    &arguments.results,
-                    metadata["run_id"].as_str().context("run identity missing")?,
-                    &error,
-                )?;
-                let progress = progress.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
-                crate::kusto::validation_failure(&arguments.results, &error, &progress)?
+                record_kusto_failure(&arguments.results, &error, &bound.into_progress(), &mut diagnostics).await
             }
-        })
+        }
     } else {
         None
     };
@@ -577,6 +576,7 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
         failures,
         failed_phase,
         deadline: budget.evidence(),
+        diagnostics,
         admitted_rows,
         required_rows,
         direct,
@@ -912,30 +912,26 @@ async fn write_report(results: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 /// Records a failure that happened before the per-pool checks could run, with the same report keys
-/// as a full report and the existing degraded Kusto status, then fails the command.
+/// as a full report, then fails the command.
 async fn fail_early(
     arguments: &ValidateArgs,
     budget: Option<&Budget>,
     phase: ValidatePhase,
     error: anyhow::Error,
 ) -> Result<()> {
+    let mut diagnostics = Vec::new();
     let kusto = if arguments.kusto_endpoint.is_some() {
-        let metadata = read_json::<Value>(&arguments.results.join(crate::manifest::RUN_METADATA_FILE)).await;
-        match metadata.as_ref().ok().and_then(|metadata| metadata["run_id"].as_str()) {
-            Some(run_id) => {
-                crate::kusto::degraded(&arguments.results, run_id, &error)?;
-                Some(crate::kusto::validation_failure(
-                    &arguments.results,
-                    &error,
-                    &crate::kusto::KustoProgress::default(),
-                )?)
-            }
-            None => None,
-        }
+        record_kusto_failure(
+            &arguments.results,
+            &error,
+            &crate::kusto::KustoProgress::default(),
+            &mut diagnostics,
+        )
+        .await
     } else {
         None
     };
-    let report = serde_json::json!({
+    let mut report = serde_json::json!({
         "passed": false,
         "failures": [format!("validation stopped in phase {phase:?}: {error:#}")],
         "failed_phase": phase,
@@ -944,6 +940,9 @@ async fn fail_early(
         "direct": null, "dataflow": null, "routing": null,
         "kusto": kusto,
     });
+    if !diagnostics.is_empty() {
+        report["diagnostics"] = serde_json::json!(diagnostics);
+    }
     let mut bytes = serde_json::to_vec_pretty(&report)?;
     bytes.push(b'\n');
     write_report(&arguments.results, &bytes).await?;
@@ -951,6 +950,34 @@ async fn fail_early(
         "loadtest validation failed in phase {phase:?}; see {}",
         arguments.results.join(VALIDATION_FILE).display()
     )))
+}
+
+/// Writes the failed Kusto report first and then the existing degraded status. Either secondary
+/// write failing (including a missing run identity or a corrupt status) becomes an explicit
+/// diagnostic instead of preventing the primary report; no run identity or status is invented.
+async fn record_kusto_failure(
+    results: &Path,
+    error: &anyhow::Error,
+    progress: &crate::kusto::KustoProgress,
+    diagnostics: &mut Vec<String>,
+) -> Option<Value> {
+    let report = match crate::kusto::validation_failure(results, error, progress) {
+        Ok(report) => Some(report),
+        Err(write) => {
+            diagnostics.push(format!("failed Kusto report not written: {write:#}"));
+            None
+        }
+    };
+    let status = async {
+        let metadata: Value = read_json(&results.join(crate::manifest::RUN_METADATA_FILE)).await?;
+        let run_id = metadata["run_id"].as_str().context("run identity missing")?;
+        crate::kusto::degraded(results, run_id, error)
+    }
+    .await;
+    if let Err(status) = status {
+        diagnostics.push(format!("degraded Kusto status not written: {status:#}"));
+    }
+    report
 }
 
 #[derive(Deserialize, Serialize)]
@@ -991,6 +1018,9 @@ struct ValidationReport {
     failed_phase: Option<ValidatePhase>,
     #[serde(skip_serializing_if = "Option::is_none")]
     deadline: Option<Value>,
+    /// Secondary evidence that could not be written; never hides the primary failure.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    diagnostics: Vec<String>,
     admitted_rows: BTreeMap<String, BTreeMap<String, u64>>,
     required_rows: BTreeMap<String, BTreeMap<String, u64>>,
     direct: Option<SnapshotSummary>,
@@ -1121,38 +1151,57 @@ mod tests {
         }
     }
 
-    fn validate_arguments(results: &Path, deadline: u64) -> Result<ValidateArgs> {
+    fn validate_arguments(results: &Path, deadline: u64, extra: &[&str]) -> Result<ValidateArgs> {
         use clap::Parser;
         let deadline = deadline.to_string();
-        let cli = crate::cli::Cli::try_parse_from([
-            "arrowcol-loadgen",
-            "validate",
-            "--results",
-            results.to_str().context("results path")?,
-            "--validate-deadline-unix-ms",
-            &deadline,
-        ])?;
+        let cli = crate::cli::Cli::try_parse_from(
+            [
+                "arrowcol-loadgen",
+                "validate",
+                "--results",
+                results.to_str().context("results path")?,
+                "--validate-deadline-unix-ms",
+                &deadline,
+            ]
+            .iter()
+            .copied()
+            .chain(extra.iter().copied()),
+        )?;
         match cli.command {
             crate::cli::Command::Validate(arguments) => Ok(arguments),
             _ => bail!("expected validate command"),
         }
     }
 
-    #[tokio::test]
-    async fn early_failures_write_a_failed_report_before_exiting() -> Result<()> {
+    fn results_directory(test: &str) -> Result<Results> {
         let results = Results(std::path::PathBuf::from(format!(
-            "target/loadgen-validation-tests/{}",
+            "target/loadgen-validation-tests/{}-{test}",
             std::process::id()
         )));
+        if results.0.exists() {
+            std::fs::remove_dir_all(&results.0)?;
+        }
         std::fs::create_dir_all(&results.0)?;
-        let now = u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
+        Ok(results)
+    }
+
+    fn unix_now_ms() -> Result<u64> {
+        Ok(u64::try_from(
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
+        )?)
+    }
+
+    #[tokio::test]
+    async fn early_failures_write_a_failed_report_before_exiting() -> Result<()> {
+        let results = results_directory("early")?;
+        let now = unix_now_ms()?;
         for (deadline, phase) in [
             (now + 2 * 86_400_000, "deadline"),
             (now + 570_000, "inputs"),
             (1, "inputs"),
         ] {
             let started = Instant::now();
-            let error = validate(validate_arguments(&results.0, deadline)?)
+            let error = validate(validate_arguments(&results.0, deadline, &[])?)
                 .await
                 .err()
                 .context("an early failure must fail the command")?;
@@ -1173,6 +1222,82 @@ mod tests {
             } else {
                 assert_eq!(report["deadline"]["deadline_unix_ms"], deadline);
             }
+        }
+        Ok(())
+    }
+
+    const UNREACHABLE_KUSTO: [&str; 2] = ["--kusto-endpoint", "http://127.0.0.1:1"];
+
+    /// Missing run identity or a corrupt degraded status must not cost the primary failed reports.
+    async fn assert_kusto_diagnostics(results: &Path, phase: &str, corrupt_status: Option<&str>) -> Result<()> {
+        let report: Value = read_json(&results.join(VALIDATION_FILE)).await?;
+        assert_eq!(report["passed"], false);
+        assert_eq!(report["failed_phase"], phase);
+        assert_eq!(report["kusto"]["passed"], false, "{report}");
+        let kusto: Value = read_json(&results.join("kusto-validation.json")).await?;
+        assert_eq!(kusto["passed"], false);
+        assert!(kusto["error"].as_str().is_some_and(|error| !error.is_empty()));
+        let diagnostics = report["diagnostics"].as_array().context("diagnostics missing")?;
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(
+            diagnostics[0]
+                .as_str()
+                .is_some_and(|diagnostic| diagnostic.starts_with("degraded Kusto status not written")),
+            "{diagnostics:?}"
+        );
+        let status = results.join("kusto-status.json");
+        match corrupt_status {
+            None => assert!(!status.exists(), "no status is invented without a run identity"),
+            Some(corrupt) => assert_eq!(
+                std::fs::read_to_string(&status)?,
+                corrupt,
+                "corrupt status left as found"
+            ),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn early_kusto_failure_reports_survive_missing_metadata_and_corrupt_status() -> Result<()> {
+        let deadline = unix_now_ms()? + 570_000;
+        let results = results_directory("early-kusto-metadata")?;
+        let error = validate(validate_arguments(&results.0, deadline, &UNREACHABLE_KUSTO)?).await;
+        assert!(error.is_err());
+        assert_kusto_diagnostics(&results.0, "inputs", None).await?;
+
+        let results = results_directory("early-kusto-status")?;
+        std::fs::write(results.0.join("run-metadata.json"), r#"{"run_id":"current"}"#)?;
+        std::fs::write(results.0.join("kusto-status.json"), "{corrupt")?;
+        let error = validate(validate_arguments(&results.0, deadline, &UNREACHABLE_KUSTO)?).await;
+        assert!(error.is_err());
+        assert_kusto_diagnostics(&results.0, "inputs", Some("{corrupt")).await
+    }
+
+    #[tokio::test]
+    async fn late_kusto_failure_reports_survive_missing_metadata_and_corrupt_status() -> Result<()> {
+        let deadline = unix_now_ms()? + 570_000;
+        let arguments = [UNREACHABLE_KUSTO[0], UNREACHABLE_KUSTO[1], "--collectors-drained"];
+        for (test, corrupt_status) in [("late-kusto-metadata", None), ("late-kusto-status", Some("{corrupt"))] {
+            let results = results_directory(test)?;
+            for (file, contents) in [
+                (SEND_MANIFEST_FILE, ""),
+                (RECEIPT_MANIFEST_FILE, ""),
+                (SCHEMA_CONTRACT_FILE, "[]"),
+                (
+                    ROUTING_EVIDENCE_FILE,
+                    r#"{"loaded_at_unix_ms":0,"collectors":[],"leases":[]}"#,
+                ),
+                (CAPABILITY_EVIDENCE_FILE, "{}"),
+            ] {
+                std::fs::write(results.0.join(file), contents)?;
+            }
+            if let Some(corrupt) = corrupt_status {
+                std::fs::write(results.0.join("run-metadata.json"), r#"{"run_id":"current"}"#)?;
+                std::fs::write(results.0.join("kusto-status.json"), corrupt)?;
+            }
+            let error = validate(validate_arguments(&results.0, deadline, &arguments)?).await;
+            assert!(error.is_err());
+            assert_kusto_diagnostics(&results.0, "drain-receipts", corrupt_status).await?;
         }
         Ok(())
     }
