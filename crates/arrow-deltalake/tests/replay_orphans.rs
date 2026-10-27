@@ -167,6 +167,79 @@ fn replay_reports_observed_snapshot_version_not_original_commit() -> Result<()> 
     Ok(())
 }
 
+/// Commits whose log entry carries a txn for `app_id`, with that txn's version.
+fn txn_commits(root: &Path, app_id: &str) -> Result<Vec<(u64, Option<i64>)>> {
+    let mut commits = Vec::new();
+    for version in 0..=latest_log_version(root)? {
+        let log = fs::read_to_string(root.join(format!("_delta_log/{version:020}.json")))?;
+        for line in log.lines() {
+            let action: serde_json::Value = serde_json::from_str(line)?;
+            if let Some(txn) = action.get("txn")
+                && txn["appId"] == app_id
+            {
+                commits.push((version, txn["version"].as_i64()));
+            }
+        }
+    }
+    Ok(commits)
+}
+
+/// Highest JSON commit, after checking every version from 0 is present.
+fn latest_log_version(root: &Path) -> Result<u64> {
+    let mut versions = Vec::new();
+    for entry in fs::read_dir(root.join("_delta_log"))? {
+        let name = entry?.file_name();
+        if let Some(version) = name.to_str().and_then(|name| name.strip_suffix(".json")) {
+            versions.push(version.parse::<u64>()?);
+        }
+    }
+    versions.sort_unstable();
+    let last = versions.last().copied().context("empty log")?;
+    anyhow::ensure!(
+        versions.iter().copied().eq(0..=last),
+        "log versions not contiguous: {versions:?}"
+    );
+    Ok(last)
+}
+
+/// Scenario: identity X commits, an independent identity Y commits after it, then X is
+/// replayed as a new delivery, all deterministically on one table.
+/// Guarantees: the replay receipt is the observed head (later than X's original receipt,
+/// so receipt equality is not a valid exactly-once oracle); X's only txn is in its
+/// original receipt's commit, Y's commit carries no X txn, the replay creates no commit,
+/// and its stage is reclaimed.
+#[test]
+fn replay_receipt_after_independent_commit_points_to_single_txn_commit() -> Result<()> {
+    metrics();
+    let root = tempfile::tempdir()?;
+    let table = DeltaTable::open(root.path())?;
+    let deliver = |app_id: &str, id: i32| {
+        runtime()?.block_on(async {
+            let input = batch(id)?;
+            let mut file = table.new_file(input.schema())?.with_transaction(app_id.into(), 0)?;
+            file.write(&input).await?;
+            file.finish().await
+        })
+    };
+    let first = deliver("receipt-x", 1)?;
+    let independent = deliver("receipt-y", 2)?;
+    let replay = deliver("receipt-x", 1)?;
+    assert_eq!((first.version, independent.version, replay.version), (1, 2, 2));
+    assert_ne!(first.version, replay.version, "replay reports the observed head");
+    assert_eq!(txn_commits(root.path(), "receipt-x")?, vec![(first.version, Some(0))]);
+    assert_eq!(
+        txn_commits(root.path(), "receipt-y")?,
+        vec![(independent.version, Some(0))]
+    );
+    assert_eq!(latest_log_version(root.path())?, replay.version);
+    assert!(!root.path().join("_delta_log/00000000000000000003.json").exists());
+    assert_eq!(table.version()?, 2);
+    assert!(first.file.path.exists());
+    assert!(!replay.file.path.exists(), "replay stage must be reclaimed");
+    assert_eq!(parquet_files(root.path())?, 2);
+    Ok(())
+}
+
 /// Scenario: one commit call carries an already-published file and a new file.
 /// Guarantees: the new file commits, the deduplicated never-submitted file is
 /// reclaimed, and the published original is untouched.

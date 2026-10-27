@@ -20,6 +20,8 @@ const TEST: &str = "separate_writer_process_with_service_optimize_purge_vacuum";
 const ROLE: &str = "DELTA_MAINTENANCE_CONCURRENCY_ROLE";
 const ROOT: &str = "DELTA_MAINTENANCE_CONCURRENCY_ROOT";
 const BASE: &str = "DELTA_MAINTENANCE_CONCURRENCY_BASE";
+/// Writer receipts, outside the table directory.
+const RECEIPTS: &str = "writer-receipts";
 const MINUTE: i64 = 60_000;
 /// Predeclared bounds: writer publications (each replayed once) and service cycles.
 const PUBLICATIONS: i64 = 24;
@@ -251,18 +253,104 @@ fn writer_offset(index: i64) -> i64 {
     WRITER[usize::try_from(index).unwrap_or(0) % WRITER.len()]
 }
 
+fn writer_app(index: i64) -> String {
+    format!("conc.writer.{index}")
+}
+
+/// Durably append one `app,first,replay` receipt line for the driver's log oracle.
+fn record_receipt(root: &Path, app_id: &str, first: u64, replay: u64) -> Result<()> {
+    use std::io::Write;
+    let mut receipts = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(root.join(RECEIPTS))?;
+    writeln!(receipts, "{app_id},{first},{replay}")?;
+    receipts.sync_all()?;
+    Ok(())
+}
+
 /// Child role: independent publications, each followed by a replay of the same identity.
+/// A deduplicated replay reports the snapshot version it observed, which is later than
+/// the original commit whenever the concurrent service committed in between; the driver
+/// proves from the log that the replay itself never committed.
 fn writer(root: &Path, base: i64) -> Result<()> {
     let table = open(root)?;
     for index in 0..PUBLICATIONS {
-        let app_id = format!("conc.writer.{index}");
+        let app_id = writer_app(index);
         let ids = writer_ids(index);
         let first = publish(&table, base, writer_offset(index), &ids, Some(&app_id))?;
         if index == 0 {
             fs::write(root.join("writer-started"), b"1")?;
         }
         let replay = publish(&table, base, writer_offset(index), &ids, Some(&app_id))?;
-        ensure!(first == replay, "{app_id}: replay committed {replay}, original {first}");
+        ensure!(
+            replay >= first,
+            "{app_id}: replay observed version {replay} before its original commit {first}"
+        );
+        record_receipt(root, &app_id, first, replay)?;
+    }
+    Ok(())
+}
+
+/// Writer receipts by application ID: (original commit version, replay observed version).
+fn receipts(root: &Path) -> Result<BTreeMap<String, (u64, u64)>> {
+    let mut receipts = BTreeMap::new();
+    for line in fs::read_to_string(root.join(RECEIPTS))?.lines() {
+        let mut fields = line.split(',');
+        let (Some(app), Some(first), Some(replay), None) = (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            bail!("malformed writer receipt {line:?}");
+        };
+        ensure!(
+            receipts
+                .insert(app.to_owned(), (first.parse()?, replay.parse()?))
+                .is_none(),
+            "duplicate writer receipt for {app}"
+        );
+    }
+    Ok(receipts)
+}
+
+/// Every writer publication commits its transaction exactly once, at version 0, in the
+/// exact commit its original call reported; its replay observed a version in
+/// `[first, last]` and no commit in `(first, replay]` carries that identity.
+fn check_writer_receipts(
+    receipts: &BTreeMap<String, (u64, u64)>,
+    txns: &BTreeMap<String, Vec<(u64, Option<i64>)>>,
+    last: u64,
+) -> Result<()> {
+    let expected: BTreeSet<String> = (0..PUBLICATIONS).map(writer_app).collect();
+    let received: BTreeSet<String> = receipts.keys().cloned().collect();
+    ensure!(
+        received == expected,
+        "writer receipts {} of {PUBLICATIONS}: {received:?}",
+        received.len()
+    );
+    let committed: BTreeSet<String> = txns.keys().cloned().collect();
+    ensure!(committed == expected, "writer txn identities {committed:?}");
+    for (app, (first, replay)) in receipts {
+        let commits = txns.get(app).context("writer txn missing")?;
+        ensure!(
+            commits.len() == 1,
+            "{app}: txn committed {} times: {commits:?}",
+            commits.len()
+        );
+        ensure!(
+            commits.iter().all(|(_, version)| *version == Some(0)),
+            "{app}: txn version {commits:?}"
+        );
+        ensure!(
+            commits.iter().all(|(commit, _)| commit == first),
+            "{app}: original receipt {first} but txn commits {commits:?}"
+        );
+        ensure!(
+            first <= replay && *replay <= last,
+            "{app}: replay receipt {replay} outside [{first}, {last}]"
+        );
+        ensure!(
+            !commits.iter().any(|(commit, _)| commit > first && commit <= replay),
+            "{app}: replay committed its identity again: {commits:?}"
+        );
     }
     Ok(())
 }
@@ -507,8 +595,8 @@ fn driver(root: &Path) -> Result<()> {
         .map(|offset| partition(base, *offset))
         .collect::<Result<_>>()?;
     let mut optimized = BTreeSet::new();
-    let mut txns: BTreeMap<String, usize> = BTreeMap::new();
-    for (_, action) in &actions {
+    let mut txns: BTreeMap<String, Vec<(u64, Option<i64>)>> = BTreeMap::new();
+    for (commit, action) in &actions {
         if let Some(remove) = action.get("remove") {
             let value = remove["partitionValues"][INGESTION_PARTITION]
                 .as_str()
@@ -524,7 +612,9 @@ fn driver(root: &Path) -> Result<()> {
         if let Some(txn) = action.get("txn") {
             let app = txn["appId"].as_str().context("appId")?;
             if app.starts_with("conc.writer.") {
-                *txns.entry(app.to_owned()).or_default() += 1;
+                txns.entry(app.to_owned())
+                    .or_default()
+                    .push((*commit, txn["version"].as_i64()));
             }
         }
     }
@@ -532,10 +622,15 @@ fn driver(root: &Path) -> Result<()> {
         optimized == latest,
         "OPTIMIZE never compacted {latest:?}: {optimized:?}"
     );
+    // Every commit is still a JSON file (no checkpoint or log pruning runs here), so
+    // the txn scan covers the whole history.
+    let last = actions.last().map(|(version, _)| *version).context("empty log")?;
+    let versions: BTreeSet<u64> = actions.iter().map(|(version, _)| *version).collect();
     ensure!(
-        txns.len() == usize::try_from(PUBLICATIONS)? && txns.values().all(|count| *count == 1),
-        "each writer publication commits exactly once: {txns:?}"
+        versions == (0..=last).collect::<BTreeSet<_>>(),
+        "log versions are not contiguous through {last}"
     );
+    check_writer_receipts(&receipts(root)?, &txns, last)?;
     ensure!(Instant::now() < deadline, "run exceeded the partition model window");
     println!(
         "concurrency proof: cycles={CYCLES} overlapping={concurrent_cycles} publications={PUBLICATIONS} \
@@ -551,14 +646,19 @@ fn driver(root: &Path) -> Result<()> {
 /// (each replayed with the same identity) into retained minute partitions while the
 /// actual service binary runs 6 fixed OPTIMIZE+PURGE+VACUUM LITE apply cycles on a
 /// marked disposable root, then one quiescent cycle and a repeat.
-/// Guarantees: every writer publication and replay succeeds and commits exactly once;
+/// Guarantees: every writer publication and replay succeeds; each identity's txn is
+/// committed exactly once, at version 0, in the commit its original call reported, and
+/// its replay (which may observe later maintenance commits) never commits it again;
 /// maintenance failures are only bounded stale-plan/exhausted outcomes within
 /// `MAX_COMMIT_ATTEMPTS`; OPTIMIZE touches only the latest 2 sealed partitions and
 /// PURGE only expired ones; the final row multiset equals retained seed rows plus
 /// all writer rows; every active Add exists on disk and the only other Parquet files
 /// are none: deduplicated replay stagings are reclaimed; the repeat is a no-op with no
 /// new version. Every child process is owned, waited with a finite deadline, and
-/// killed and reaped on failure.
+/// killed and reaped on failure. The root lives under Cargo's per-target temporary
+/// directory (the driver tree's `TMPDIR`, so the service still sees a marked root
+/// under its temp directory); on any writer, driver or deadline failure it is kept
+/// and its path printed.
 #[test]
 fn separate_writer_process_with_service_optimize_purge_vacuum() -> Result<()> {
     match std::env::var(ROLE).as_deref() {
@@ -568,17 +668,30 @@ fn separate_writer_process_with_service_optimize_purge_vacuum() -> Result<()> {
         }
         Ok("driver") => driver(&PathBuf::from(std::env::var(ROOT)?)),
         _ => {
-            let root = tempfile::tempdir()?;
+            let temp = Path::new(env!("CARGO_TARGET_TMPDIR"));
+            fs::create_dir_all(temp)?;
+            let temp = fs::canonicalize(temp)?;
+            let root = tempfile::Builder::new()
+                .prefix("delta-maintenance-concurrency-")
+                .tempdir_in(&temp)?;
             let mut driver = ProcessTree::spawn(
                 Command::new(std::env::current_exe()?)
                     .args([TEST, "--exact", "--nocapture", "--test-threads=1"])
                     .env(ROLE, "driver")
                     .env(ROOT, root.path())
+                    .env("TMPDIR", &temp)
                     .env("ARROWCOL_PARTITION_GRANULARITY", "minute"),
             )?;
-            let status = driver.wait_until(Instant::now() + OUTER_DEADLINE)?;
-            ensure!(status.success(), "driver failed");
-            Ok(())
+            let outcome = driver.wait_until(Instant::now() + OUTER_DEADLINE);
+            if matches!(&outcome, Ok(status) if status.success()) {
+                return Ok(());
+            }
+            drop(driver);
+            let kept = root.keep();
+            eprintln!("concurrency failure root retained: {}", kept.display());
+            let status =
+                outcome.with_context(|| format!("driver custody failed; root retained at {}", kept.display()))?;
+            bail!("driver failed ({status}); root retained at {}", kept.display())
         }
     }
 }
