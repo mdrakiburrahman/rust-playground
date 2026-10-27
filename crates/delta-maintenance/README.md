@@ -7,7 +7,7 @@ It is a separate process, not a collector task. It opens tables with `DeltaTable
 ## Operations
 
 | Operation | Effect | Commit |
-|---|---|---|
+| --- | --- | --- |
 | `optimize` | Rewrites small files in the latest-N closed Hive partitions into sorted files of about 128 MiB. Rows, schema and partition values are preserved. | One atomic `dataChange=false` add+remove |
 | `purge` | Removes still-active files in expired `__arrowcol_ingestion` partitions. | `dataChange=true` removes, plus the `arrowcol.purge.before-ms` watermark, in the same transaction |
 | `vacuum` | VACUUM LITE: physically deletes tombstoned files older than the retention period, using `_delta_log` only (no data directory listing). | None |
@@ -51,7 +51,7 @@ delta-maintenance --root abfss://c@acct.dfs.core.windows.net/delta/ --table even
 ### Exit codes
 
 | Code | Meaning |
-|---|---|
+| --- | --- |
 | 0 | Success |
 | 1 | An operation failed. Its JSON report includes `error_kind`. |
 | 2 | Invalid configuration |
@@ -77,6 +77,10 @@ The only labels are `operation` and `outcome`. Table names are never used as lab
 The `Dockerfile` installs the Azure CLI with the shared signed helper `infra/docker/install-azure-cli.sh` and runs as UID 10001.
 
 `AZURE_CONFIG_DIR=/var/lib/delta-maintenance-azure` is an empty 0700 directory owned by UID 10001. Runners should mount an isolated runtime directory over it. No credentials or config are baked into the image.
+
+`tini` is PID 1 so orphaned Azure CLI descendants are reaped.
+
+The `HEALTHCHECK` runs a bounded `curl` (3 s, 1 MiB) against the real Prometheus listener at `DELTA_MAINTENANCE_HEALTH_URL` (default `http://127.0.0.1:9467/metrics`). Only scheduled runs serve the listener, so one-shot runs never report healthy. Set the variable when using a different `--listen`.
 
 ## Nx
 

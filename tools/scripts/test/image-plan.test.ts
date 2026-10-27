@@ -17,6 +17,9 @@ import {
 const workspace = fileURLToPath(new URL('../../../', import.meta.url));
 
 function projectPath(project: string): string {
+  if (project === 'delta-maintenance' || project === 'arrow-tenant-stream') {
+    return `crates/${project}/project.json`;
+  }
   return project === 'hello-world'
     ? 'bin/hello-world/project.json'
     : `projects/${project}/project.json`;
@@ -45,6 +48,8 @@ test('discovers production images and retains the sample publication', () => {
     'arrowcol-dataflow-rust',
     'arrowcol-router-rust',
     'kusto-bridge',
+    'delta-maintenance',
+    'arrow-tenant-stream',
     'kusto-explorer',
   ]);
   assert.deepEqual(RETAINED_RUNTIME_IMAGE_PROJECTS, ['hello-world']);
@@ -99,7 +104,7 @@ const COLLECTOR_IMAGE_PROJECTS = [
 ];
 // Web images compile a wasm UI and serve read-only static assets instead of configuration files.
 const WEB_IMAGE_PROJECTS = ['kusto-explorer'];
-const SERVICE_IMAGE_PROJECTS = ['kusto-bridge'];
+const SERVICE_IMAGE_PROJECTS = ['kusto-bridge', 'delta-maintenance', 'arrow-tenant-stream'];
 
 test('every production runtime image is classified for Dockerfile policy', () => {
   assert.deepEqual(
@@ -111,7 +116,7 @@ test('every production runtime image is classified for Dockerfile policy', () =>
 test('runtime Dockerfiles pin build and runtime bases and enforce production boundaries', () => {
   for (const project of PRODUCTION_RUNTIME_IMAGE_PROJECTS) {
     const dockerfile = readFileSync(
-      join(workspace, `projects/${project}/Dockerfile`),
+      join(workspace, projectPath(project).replace(/project\.json$/u, 'Dockerfile')),
       'utf8',
     );
     assert.match(
@@ -133,9 +138,17 @@ test('runtime Dockerfiles pin build and runtime bases and enforce production bou
       project,
     );
     assert.match(dockerfile, /COPY submodules\/otel-arrow/u, project);
-    assert.match(dockerfile, /ca-certificates/u, project);
-    if (!SERVICE_IMAGE_PROJECTS.includes(project)) {
-      assert.match(dockerfile, /ca-certificates curl/u, project);
+    if (dockerfile.includes('sh /tmp/install-azure-cli.sh')) {
+      assert.match(
+        dockerfile,
+        /COPY(?: --chmod=\d+)? infra\/docker\/install-azure-cli\.sh \/tmp\/install-azure-cli\.sh/u,
+        project,
+      );
+    } else {
+      assert.match(dockerfile, /ca-certificates/u, project);
+      if (!SERVICE_IMAGE_PROJECTS.includes(project)) {
+        assert.match(dockerfile, /ca-certificates curl/u, project);
+      }
     }
     assert.match(
       dockerfile,
@@ -165,10 +178,28 @@ test('runtime Dockerfiles pin build and runtime bases and enforce production bou
       assert.match(dockerfile, /find \/out\/www -type f -exec chmod 0444/u, project);
       assert.match(dockerfile, /COPY --from=builder --chmod=0555/u, project);
     } else {
-      assert.match(dockerfile, /install -D --mode=0555/u, project);
+      assert.match(dockerfile, /(?:install (?:-D )?--mode=0555|COPY --from=builder --chmod=0555)/u, project);
       assert.match(dockerfile, /COPY --from=builder/u, project);
     }
   }
+});
+
+test('Kernel consumer lint caches include their library dependencies', () => {
+  const projects = workspaceProjects();
+  for (const project of ['delta-maintenance', 'arrow-tenant-stream']) {
+    const config = projects[project];
+    assert(config, project);
+    assert(config.implicitDependencies?.includes('arrow-deltalake'), project);
+    assert.deepEqual(config.targets?.lint?.inputs, ['default', '^default'], project);
+  }
+});
+
+test('shared CLI helper installs TLS prerequisites through a signed pinned repository', () => {
+  const helper = readFileSync(join(workspace, 'infra/docker/install-azure-cli.sh'), 'utf8');
+  assert.match(helper, /apt-get install -y --no-install-recommends ca-certificates curl gpg/u);
+  assert.match(helper, /sha256sum --check --strict -/u);
+  assert.match(helper, /signed-by=\/usr\/share\/keyrings\/arrowcol-azure-cli\.gpg/u);
+  assert.match(helper, /apt-get install -y --no-install-recommends azure-cli=\d+\.\d+\.\d+-1~bookworm/u);
 });
 
 test('Explorer context override retains root exclusions before browser-only exclusions', () => {
@@ -241,7 +272,10 @@ test('publish workflow discovers, smokes, publishes, and verifies the matrix wit
 
   const paths = new Set(workflow.on.push.paths);
   for (const project of PRODUCTION_RUNTIME_IMAGE_PROJECTS) {
-    assert(paths.has(`projects/${project}/**`), project);
+    const source = projectPath(project).startsWith('crates/')
+      ? 'crates/**'
+      : `projects/${project}/**`;
+    assert(paths.has(source), project);
   }
   assert(paths.has('bin/hello-world/**'));
   assert(paths.has('crates/**'));

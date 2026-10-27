@@ -95,6 +95,54 @@ or uncertain publishers must leave blocking registrations, with no TTL or
 force-unregister shortcut. A local stop receipt, checkbox, or 60-second delay
 cannot substitute for that distributed authority.
 
+Registry metadata alone cannot activate a new protocol safely: older
+reset-aware binaries ignore unknown registry fields while accepting
+`resetstate=ready`. Activation must version an authority state those binaries
+already enforce, so incompatible binaries fail closed rather than publish
+without registering. Arbitrary OAuth clients and binaries predating reset
+fencing are outside the cooperative protocol and must be stopped before cleanup.
+An uncertain server write remains an uncertain registration even if a later
+transaction lookup proves logical commit success. Opaque SDK write retries must
+be disabled or tracked through definitive completion; logical reconciliation is
+not proof that no delayed request can still mutate storage. None of these
+activation conditions enables the currently disabled reset command.
+
+### Versioned control-plane implementation
+
+`publisher_control.PublisherControl` implements the internal Python transitions;
+it is deliberately not exposed as reset execution or protocol activation.
+The exact enforced states are `ready-v1` and `fenced-v1`. Legacy literal
+`ready`/`fenced` states are rejected by this implementation; old reset-aware
+clients reject the new literals. Registry headers are
+`publisherregistryversion=1` and compact JSON `publishers`, a map of canonical
+publisher UUIDs to `{generation: <canonical UUID>, state: active|uncertain}`.
+Capacity is 16 members and 4096 UTF-8 bytes for the registry, also enforcing the
+8192-byte total metadata header budget.
+
+Every transition reads and validates ownership, generation, registry, state and
+ETag, then performs one `If-Match` update preserving unrelated metadata.
+Normal admission requires `ready-v1`; admission failure or an unknown response
+never grants mutation permission or silently adopts a previous registration.
+Fencing preserves the generation and member set so existing members can clean
+drain; new admission is blocked. Rotation requires the same fenced generation,
+released test occupancy and an explicitly empty registry.
+
+Bootstrap/operator admission requires `fenced-v1`, released occupancy and an
+empty registry. Only its exclusive active member can complete bootstrap after
+definitive physical drain; removing that member and setting `ready-v1` happen in
+one CAS. There is no destructor release, expiry, force clear, or automatic retry.
+An uncertain member cannot clean-release even if logical transactions reconcile.
+Unknown CAS responses return `UnknownTransition`; retain the publisher identity
+and reconcile authority read-only rather than claim success.
+
+These are usable control-plane helpers and deterministic race/unknown-response
+tests, not activation of all Rust mutation surfaces. Existing checkpoint
+containers are excluded from Bicep metadata writes on redeployment. The public
+bootstrap still refuses unknown/versioned authority rather than downgrade it;
+fresh Bicep creation does not assert registry coverage. Activation and public
+bootstrap wiring must wait for compatible registered writers, maintenance,
+stream/sink/checkpoint paths, and exclusive bootstrap initialization.
+
 The test runner acquires shared occupancy before live tests and releases it only
 after its owned writers/consumers stop successfully:
 

@@ -19,7 +19,7 @@
     },
     "format": {"executor": "nx:run-commands", "options": {"command": "cargo fmt --package arrow-tenant-stream"}},
     "format-check": {"executor": "nx:run-commands", "options": {"command": "cargo fmt --package arrow-tenant-stream -- --check"}},
-    "lint": {"executor": "nx:run-commands", "options": {"command": "cargo clippy --locked --package arrow-tenant-stream --all-targets -- -D warnings"}},
+    "lint": {"executor": "nx:run-commands", "inputs": ["default", "^default"], "options": {"command": "cargo clippy --locked --package arrow-tenant-stream --all-targets -- -D warnings"}},
     "build": {"executor": "nx:run-commands", "cache": false, "options": {"command": "cargo build --locked --package arrow-tenant-stream"}},
     "test": {"executor": "nx:run-commands", "options": {"command": "cargo test --locked --package arrow-tenant-stream"}},
     "verify": {"executor": "nx:run-commands", "dependsOn": ["format-check", "lint", "build", "test"], "options": {"commands": []}},

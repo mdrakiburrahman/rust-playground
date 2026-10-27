@@ -86,6 +86,16 @@ replay. The loadtest uses minute partitions and explicit `customer_id` in all
 13 schemas. Customer sorting is a file/row-group layout policy, not a promise of
 global table ordering or end-to-end zero-copy.
 
+The publication path retains physical batches within a bounded file buffer and
+sorts the whole staged file once by customer before encoding Parquet. Production
+defaults are 16,384 rows per row group and 2,048 rows per page. The focused
+8,192-row, two-batch, 16-customer qualification explicitly uses 512-row groups
+and 128-row pages; its one-of-16 matching-group result is not a production
+tiny-receipt pruning claim. Independent publication files often contain only
+one production-sized row group. Direct receipts and DFE publications retain
+their independent file/transaction identities rather than coalescing unrelated
+client requests to manufacture larger groups.
+
 ## Maintenance and downstream ownership
 
 | Consumer | Source behavior | Recovery boundary |
@@ -94,7 +104,7 @@ global table ordering or end-to-end zero-copy.
 | Partition PURGE | Remove existing expired ingestion-time partitions with `dataChange=true` | Derive work from the active snapshot, not guessed directory names |
 | VACUUM LITE | Physically delete eligible retained tombstones, without a new data commit | Seven-day retention floor by default; insufficient history fails visibly; arbitrary orphan discovery is not LITE |
 | Historical tenant fork | Capture a snapshot, then tail committed data changes; skip OPTIMIZE | Independently encoded sink files survive source purge; missing required source history is an error |
-| Local Kusto bridge | Reconcile the current committed active snapshot | Replacements and removals change the visible generation; this is not historical-fork behavior |
+| Native Kusto external Delta/QAP | Follow the current committed active snapshot after asynchronous cache refresh | Replacements and removals must converge within the bounded correctness gate; cached queries must match the independent oracle and uncached fallback |
 
 Tenant sink transactions bind query/batch identity to publication so recovery
 after a sink commit cannot duplicate that batch. Spark-compatible metadata,

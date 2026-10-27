@@ -64,6 +64,12 @@
         "platforms": ["linux/amd64"],
         "output": "load",
         "manifestFile": "{absWorkspaceRoot}/target/images/delta-maintenance-load.txt"
+      },
+      "configurations": {
+        "ci-verify": {
+          "cacheFrom": ["type=gha,version=2,scope={projectName}-image"],
+          "cacheTo": ["type=gha,version=2,scope={projectName}-image,mode=max"]
+        }
       }
     },
     "image-smoke": {
@@ -77,6 +83,36 @@
         ],
         "parallel": false,
         "cwd": "{workspaceRoot}"
+      }
+    },
+    "publish": {
+      "executor": "rust-playground-build:docker-build",
+      "cache": false,
+      "inputs": [
+        "default",
+        "^default",
+        "{projectRoot}/Dockerfile",
+        "{workspaceRoot}/.dockerignore",
+        "{workspaceRoot}/infra/docker/install-azure-cli.sh",
+        "{workspaceRoot}/submodules/otel-arrow/**/*"
+      ],
+      "outputs": ["{workspaceRoot}/target/images/delta-maintenance-publish.txt"],
+      "options": {
+        "file": "{absProjectRoot}/Dockerfile",
+        "context": "{absWorkspaceRoot}",
+        "image": "ghcr.io/mdrakiburrahman/rust-playground/delta-maintenance",
+        "tags": ["{gitBranchTag}", "sha-{gitSha}"],
+        "immutableTags": ["sha-{gitSha}"],
+        "requireCleanWorktree": true,
+        "buildArgs": ["VCS_REF={gitSha}"],
+        "platforms": ["linux/amd64"],
+        "output": "push",
+        "manifestFile": "{absWorkspaceRoot}/target/images/delta-maintenance-publish.txt"
+      },
+      "configurations": {
+        "main": {
+          "tags": ["{gitBranchTag}", "sha-{gitSha}", "latest"]
+        }
       }
     },
     "verify": {

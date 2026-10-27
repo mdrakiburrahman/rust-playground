@@ -141,6 +141,14 @@ Data files are synced before publication. Safe CAS collisions retry with jitter,
 up to eight attempts and a ten-second retry-admission window. Stable transaction
 identities reconcile uncertain success before any resubmission; an unreadable
 outcome fails closed, and unidentified uncertain appends are never replayed.
+Local reconciliation/deduplication synchronizes retained replay logs/checkpoints
+and their directories before acknowledging: read-back visibility alone does not
+repair a failed local durability operation.
+Local tables fsync the canonical table root and every ancestor on open/reopen,
+every partition directory from a staged file's leaf up to the table root before
+its Add can commit (multi-column Hive paths included), and the
+`_last_checkpoint` hint file after checkpoint finalization. Any fsync failure is
+returned and nothing is published.
 Exhaustion and semantic/schema conflicts remain visible errors; orphan files
 remain for inspection. The 10-second
 collection window is not a visibility bound: dependency waves add latency.
@@ -174,10 +182,19 @@ readers/checkpoint clients without opening a writer. Azure runtimes require `az`
 `AZURE_CONFIG_DIR` pointing at it. A token cache alone is not sufficient.
 The provider invokes `az account get-access-token` with the Storage scope;
 no credentials are embedded in jobs or table metadata. Child execution/output
-has a five-second deadline, cancellation kills the child, concurrent credential
+has a five-second deadline, cancellation kills its dedicated Unix process group
+(including the packaged shell wrapper's Python descendants), concurrent credential
 admission is bounded to six seconds, and output is limited to 64 KiB.
 Cached tokens expire at the earlier of 60 seconds or their expiry minus 30 seconds.
 CLI stderr and token responses are never included in errors.
+Explicit timeout reaps the direct child; outer-future cancellation retains Tokio's
+child reaper. Container runtimes must supply an init/subreaper for orphaned
+descendants. The provider never signals the caller's process group. Regression
+tests cover both deadline expiry and outer cancellation with delayed descendant
+work, not only delayed work in a wrapper shell.
+`AzureCliTokenProvider::new(scope, deadline)` exposes the same bounded
+acquisition for another exact `https://<host>/.default` scope (for example a
+Kusto cluster); `token().await` returns only the bearer string.
 
 Normal Azure open/upload/commit requires owned, ready checkpoint-container
 metadata and the same captured reset generation. Bootstrap-only
@@ -188,10 +205,11 @@ immediately before and after each mutation; failed authority forbids cleanup.
 Core repeats authority after slow local staging/checkpoint preparation, and the
 committer materializes at most 8 MiB of action arrays before its final check.
 
-Azure HTTP attempts time out after ten seconds, with at most two retries,
-ten-second retry admission, and backoff capped at 250 ms. Conservatively, one
-credential acquisition plus three HTTP attempts and two backoffs is at most
-36.5 seconds of configured asynchronous waiting after request preparation.
+Azure HTTP attempts time out after ten seconds and opaque transport retries are
+disabled, including for raw stores shared with checkpoint clients. Delta CAS
+collisions still use their separate eight-attempt classified outer policy.
+One credential acquisition plus one HTTP attempt allows at most 16 seconds of
+configured asynchronous waiting after request preparation.
 A metadata authority request adds up to six seconds of credential admission
 and ten seconds of HTTP waiting. These are **not a hard whole-operation or
 server-completion deadline**: CPU scheduling, runtime suspension, serialization,
@@ -212,7 +230,7 @@ install another subscriber/exporter or create placeholder observations.
 The `arrow-deltalake` meter exports these actual instruments:
 
 | Instrument | Unit | Bounded attributes |
-|---|---|---|
+| --- | --- | --- |
 | `delta.kernel.events` | counter | `event`, `outcome` |
 | `delta.kernel.duration` | s, histogram | `event`, `phase` |
 | `delta.kernel.values` | 1, histogram | `event`, `field` |
@@ -241,7 +259,7 @@ accounting are preserved. Legacy `new_file` stays streaming and unchanged.
 Schemas without `customer_id` keep streaming unless sort columns are explicit.
 
 | Environment option | Default |
-|---|---|
+| --- | --- |
 | `ARROWCOL_LAYOUT_SORT_COLUMNS` | `customer_id` (comma-separated, ordered keys) |
 | `ARROWCOL_LAYOUT_BLOOM_COLUMNS` | `customer_id` |
 | `ARROWCOL_LAYOUT_MAX_ROWS` | 262144 |

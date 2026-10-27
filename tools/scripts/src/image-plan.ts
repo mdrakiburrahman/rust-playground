@@ -17,6 +17,8 @@ export const PRODUCTION_RUNTIME_IMAGE_PROJECTS = [
   'arrowcol-dataflow-rust',
   'arrowcol-router-rust',
   'kusto-bridge',
+  'delta-maintenance',
+  'arrow-tenant-stream',
   'kusto-explorer',
 ] as const;
 

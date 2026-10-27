@@ -2,7 +2,8 @@
 
 use crate::delta_io::{BATCH_ROWS, READ_AHEAD, SharedExecutor, shared_executor};
 use crate::{
-    CompletedFile, CompletedFileObservation, ParquetFileWriter, normalize, record_batch_logical_bytes, sync_directory,
+    CompletedFile, CompletedFileObservation, ParquetFileWriter, normalize, record_batch_logical_bytes, sync_ancestors,
+    sync_directory, sync_directory_chain, sync_file,
 };
 use anyhow::{Context, Result, bail};
 use arrow::array::{Array, RecordBatch, StructArray};
@@ -33,7 +34,7 @@ use url::Url;
 
 type LocalEngine = DefaultEngine<SharedExecutor>;
 
-fn configured_publication_layout(schema: &SchemaRef) -> Result<Option<crate::layout::LayoutPolicy>> {
+pub(crate) fn configured_publication_layout(schema: &SchemaRef) -> Result<Option<crate::layout::LayoutPolicy>> {
     let columns = |name| -> Result<Option<Vec<String>>> {
         match std::env::var(name) {
             Ok(value) => Ok(Some(value.split(',').map(str::trim).map(str::to_owned).collect())),
@@ -73,13 +74,9 @@ fn azure_store(url: &Url) -> Result<object_store::azure::MicrosoftAzure> {
         .with_url(url.as_str())
         .with_credentials(Arc::new(crate::azure_cli::BoundedAzureCli::default()))
         .with_retry(object_store::RetryConfig {
-            max_retries: 2,
+            max_retries: 0,
             retry_timeout: Duration::from_secs(10),
-            backoff: object_store::BackoffConfig {
-                init_backoff: Duration::from_millis(100),
-                max_backoff: Duration::from_millis(250),
-                base: 2.0,
-            },
+            ..Default::default()
         })
         .with_client_options(object_store::ClientOptions::new().with_timeout(Duration::from_secs(10)))
         .build()?)
@@ -229,6 +226,84 @@ mod io_tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
     use std::collections::HashSet;
+
+    /// Scenario: a new nested two-column Hive table publishes locally, with injected fsync faults.
+    /// Guarantees: root ancestry, leaf/intermediate partitions and the checkpoint hint are fsynced
+    /// before success; any fsync failure propagates and publishes nothing.
+    #[tokio::test]
+    async fn local_publication_syncs_partition_root_and_hint_ancestry() -> Result<()> {
+        use crate::sync_hook;
+        use arrow::array::{Int32Array, StringArray};
+        let base = tempfile::tempdir()?;
+        let base_path = fs::canonicalize(base.path())?;
+        let parent = base_path.join("nested");
+        let root = parent.join("table");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("p1", DataType::Utf8, false),
+            Field::new("p2", DataType::Utf8, false),
+        ]));
+        let columns = || vec!["p1".to_owned(), "p2".to_owned()];
+        let url = Url::from_directory_path(&root).map_err(|()| anyhow::anyhow!("URL"))?;
+        sync_hook::fail_on(&parent);
+        assert!(DeltaTable::open_url(url.clone(), Arc::clone(&schema), columns()).is_err());
+        sync_hook::reset(&base_path);
+        // The root now exists, but its ancestry was never proven durable; reopening must sync it.
+        let table = DeltaTable::open_url(url, Arc::clone(&schema), columns())?;
+        let synced = sync_hook::synced_under(&base_path);
+        for directory in [&root, &parent, &base_path] {
+            assert!(
+                synced.contains(directory),
+                "missing ancestor fsync {}",
+                directory.display()
+            );
+        }
+        let version = table.version()?;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["a"])),
+                Arc::new(StringArray::from(vec!["b"])),
+            ],
+        )?;
+        let values = BTreeMap::from([
+            ("p1".to_owned(), Some("a".to_owned())),
+            ("p2".to_owned(), Some("b".to_owned())),
+        ]);
+        let intermediate = root.join("p1=a");
+        let leaf = intermediate.join("p2=b");
+        sync_hook::fail_on(&intermediate);
+        let mut file = table.new_file_partitioned(Arc::clone(&schema), values.clone())?;
+        file.write(&batch).await?;
+        assert!(
+            file.stage().await.is_err(),
+            "intermediate fsync failure must block staging"
+        );
+        assert_eq!(table.version()?, version);
+        sync_hook::reset(&base_path);
+        let mut file = table.new_file_partitioned(Arc::clone(&schema), values)?;
+        file.write(&batch).await?;
+        let staged = file.stage().await?;
+        let synced = sync_hook::synced_under(&base_path);
+        for directory in [&leaf, &intermediate, &root] {
+            assert!(
+                synced.contains(directory),
+                "missing pre-commit fsync {}",
+                directory.display()
+            );
+        }
+        let committed = table.commit_files(&[staged])?;
+        assert_eq!(committed, version + 1);
+        let hint = root.join("_delta_log").join("_last_checkpoint");
+        sync_hook::fail_on(&hint);
+        assert!(table.checkpoint().is_err(), "hint fsync failure must propagate");
+        sync_hook::reset(&base_path);
+        assert_eq!(table.checkpoint()?, committed);
+        assert!(sync_hook::synced_under(&base_path).contains(&hint));
+        sync_hook::reset(&base_path);
+        Ok(())
+    }
 
     fn input_batch() -> Result<RecordBatch> {
         Ok(RecordBatch::try_new(
@@ -1040,7 +1115,9 @@ impl DeltaTable {
                 .to_file_path()
                 .map_err(|()| anyhow::anyhow!("invalid local table URL"))?;
             fs::create_dir_all(&path)?;
-            fs::canonicalize(path)?
+            let path = fs::canonicalize(path)?;
+            sync_ancestors(&path)?;
+            path
         } else {
             // Staging is intentionally retained after ambiguous failures, never
             // automatically removed on drop. VACUUM LITE cannot see these files.
@@ -1123,9 +1200,27 @@ impl DeltaTable {
         self.check_publication()?;
         writer.finalize(&self.engine, &statistics)?;
         if self.url.scheme() == "file" {
-            sync_directory(&self.root.join("_delta_log"))?;
+            // The hint is written by rename without a file fsync; make its contents durable.
+            let log = self.root.join("_delta_log");
+            let hint = log.join("_last_checkpoint");
+            if hint.try_exists()? {
+                sync_file(&hint)?;
+            }
+            sync_directory(&log)?;
         }
         Ok(snapshot.version())
+    }
+
+    /// Make a finished local file's directory entries durable before any Add can reference it.
+    /// Table-local outputs sync every partition directory up to the table root; remote
+    /// staging only needs its own directory.
+    pub(crate) fn sync_local_output(&self, file: &Path) -> Result<()> {
+        let parent = file.parent().context("local output has no directory")?;
+        if self.url.scheme() == "file" {
+            sync_directory_chain(parent, &self.root)
+        } else {
+            sync_directory(parent)
+        }
     }
 
     fn validate_retention(snapshot: &SnapshotRef) -> Result<()> {
@@ -1172,7 +1267,7 @@ impl DeltaTable {
     fn upload_file(&self, file: &CompletedFile) -> Result<()> {
         self.check_publication()?;
         if self.url.scheme() == "file" {
-            return Ok(());
+            return self.sync_local_output(&file.path);
         }
         if file.bytes > 512 * 1024 * 1024 {
             bail!("staged file exceeds bounded upload size");
@@ -1248,6 +1343,7 @@ impl DeltaTable {
     ) -> Result<Arc<Self>> {
         fs::create_dir_all(root.as_ref())?;
         let root = fs::canonicalize(root)?;
+        sync_ancestors(&root)?;
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -1613,6 +1709,28 @@ impl DeltaTable {
         Ok(self.snapshot()?.version())
     }
 
+    fn sync_replayed_local_state(&self, version: u64) -> Result<()> {
+        if self.url.scheme() != "file" {
+            return Ok(());
+        }
+        let log = self.root.join("_delta_log");
+        for entry in fs::read_dir(&log)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let is_replayed = name
+                .get(..20)
+                .and_then(|prefix| prefix.parse::<u64>().ok())
+                .is_some_and(|entry_version| entry_version <= version)
+                && (name.ends_with(".json") || name.ends_with(".parquet"));
+            if name == "_last_checkpoint" || is_replayed {
+                File::open(entry.path())?.sync_all()?;
+            }
+        }
+        sync_directory(&log)?;
+        sync_directory(&self.root)
+    }
+
     pub(crate) fn commit_files(&self, files: &[StagedAppend]) -> Result<u64> {
         if files.is_empty() {
             bail!("cannot publish an empty Delta data commit");
@@ -1648,6 +1766,7 @@ impl DeltaTable {
                     bail!("publication transaction fenced by newer application version");
                 }
                 if previous == version {
+                    self.sync_replayed_local_state(snapshot.version())?;
                     observation.finish("deduplicated");
                     return Ok(snapshot.version());
                 }
@@ -1677,6 +1796,7 @@ impl DeltaTable {
                 pending.push(append);
             }
             if pending.is_empty() && identity.is_none() {
+                self.sync_replayed_local_state(snapshot.version())?;
                 observation.finish("deduplicated");
                 return Ok(snapshot.version());
             }
@@ -1750,6 +1870,8 @@ impl DeltaTable {
                         _ => return Ok(None),
                     }
                 }
+                // Visibility is not proof of local durability after an I/O error.
+                self.sync_replayed_local_state(latest.version())?;
                 Ok(Some(latest.version()))
             };
             match transaction.commit(&self.engine) {
