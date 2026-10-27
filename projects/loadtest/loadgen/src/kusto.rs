@@ -12,7 +12,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, UNIX_EPOCH},
@@ -1351,6 +1351,32 @@ struct TableCheck {
     fallback: CorpusResult,
 }
 
+/// Kusto validation phase reached so far, recorded so a bounded failure names where it stopped.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum KustoPhase {
+    #[default]
+    NotStarted,
+    Bootstrap,
+    TableOracle,
+    Converge,
+    Evidence,
+}
+
+/// Partial state shared with the caller, readable after the validation future is cancelled.
+#[derive(Debug, Default, Serialize)]
+pub(crate) struct KustoProgress {
+    phase: KustoPhase,
+    table: Option<String>,
+    /// Latest cache observation per external table while converging.
+    last_qap: BTreeMap<String, Value>,
+}
+
+fn progress_update(progress: &Mutex<KustoProgress>, update: impl FnOnce(&mut KustoProgress)) {
+    update(&mut progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+}
+
+#[allow(clippy::too_many_arguments, reason = "both pools and the shared absolute bound")]
 pub(crate) async fn validate(
     endpoint: &str,
     results: &Path,
@@ -1358,6 +1384,8 @@ pub(crate) async fn validate(
     dataflow_root: &Path,
     direct: &SnapshotSummary,
     dataflow: &SnapshotSummary,
+    ceiling: Option<Instant>,
+    progress: &Mutex<KustoProgress>,
 ) -> Result<Value> {
     let mut status: ExposureStatus = serde_json::from_slice(&fs::read(results.join(STATUS))?)?;
     let metadata: Value = serde_json::from_slice(&fs::read(results.join("run-metadata.json"))?)?;
@@ -1365,8 +1393,10 @@ pub(crate) async fn validate(
         metadata["run_id"].as_str() == Some(&status.run_id),
         "Kusto evidence belongs to another run"
     );
+    progress_update(progress, |progress| progress.phase = KustoPhase::Bootstrap);
     let client = KustoClient::new(endpoint, results)?;
     client.bootstrap().await?;
+    progress_update(progress, |progress| progress.phase = KustoPhase::TableOracle);
     let mut checks = Vec::new();
     for (pool, root, snapshot) in [("direct", direct_root, direct), ("dataflow", dataflow_root, dataflow)] {
         ensure!(
@@ -1379,6 +1409,7 @@ pub(crate) async fn validate(
         );
         for (table, summary) in &snapshot.tables {
             let name = external_name(pool, table)?;
+            progress_update(progress, |progress| progress.table = Some(name.clone()));
             ensure!(summary.rows > 0, "expected a nonempty Delta snapshot for {name}");
             ensure!(
                 client.schema(&name).await? == columns(&summary.schema)?,
@@ -1409,9 +1440,15 @@ pub(crate) async fn validate(
             });
         }
     }
-    let cached = converge(&client, &checks, cache_timeout()?).await?;
+    progress_update(progress, |progress| {
+        progress.phase = KustoPhase::Converge;
+        progress.table = None;
+    });
+    let cached = converge(&client, &checks, cache_timeout()?, ceiling, progress).await?;
+    progress_update(progress, |progress| progress.phase = KustoPhase::Evidence);
     let mut evidence = BTreeMap::new();
     for check in &checks {
+        progress_update(progress, |progress| progress.table = Some(check.name.clone()));
         let statistics = client
             .acceleration(&check.name, &check.max_age, check.commit_ms)
             .await?;
@@ -1454,16 +1491,27 @@ const OBSERVATIONS_PER_TABLE: usize = 32;
 
 /// Waits, under one fixed deadline covering every request, sleep and token refresh, until each
 /// table's accelerated cache reports the captured version and returns the oracle multiset. A
-/// success observed at or after the deadline is not accepted.
-async fn converge(client: &KustoClient, checks: &[TableCheck], timeout: Duration) -> Result<BTreeMap<String, Value>> {
+/// success observed at or after the deadline is not accepted. The deadline is the earlier of the
+/// cache budget and the caller's absolute `ceiling`.
+async fn converge(
+    client: &KustoClient,
+    checks: &[TableCheck],
+    timeout: Duration,
+    ceiling: Option<Instant>,
+    progress: &Mutex<KustoProgress>,
+) -> Result<BTreeMap<String, Value>> {
     let started = Instant::now();
-    let deadline = started + timeout;
+    let deadline = ceiling.map_or(started + timeout, |ceiling| (started + timeout).min(ceiling));
+    let budget = deadline.saturating_duration_since(started);
     let elapsed = || u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let mut cached: BTreeMap<String, Value> = BTreeMap::new();
     let mut attempts: BTreeMap<String, u64> = BTreeMap::new();
     let mut observations: BTreeMap<String, Vec<Value>> = BTreeMap::new();
     let mut last_failure: BTreeMap<String, String> = BTreeMap::new();
     let observe = |observations: &mut BTreeMap<String, Vec<Value>>, name: &str, observation: Value| {
+        progress_update(progress, |progress| {
+            progress.last_qap.insert(name.to_owned(), observation.clone());
+        });
         let history = observations.entry(name.to_owned()).or_default();
         if history.len() == OBSERVATIONS_PER_TABLE {
             history.remove(0);
@@ -1472,6 +1520,10 @@ async fn converge(client: &KustoClient, checks: &[TableCheck], timeout: Duration
     };
     let polling = async {
         loop {
+            // No request starts at or after the deadline; the timer cancels any still in flight.
+            if Instant::now() >= deadline {
+                return Ok::<(), anyhow::Error>(());
+            }
             for check in checks {
                 if cached.contains_key(&check.name) {
                     continue;
@@ -1530,7 +1582,7 @@ async fn converge(client: &KustoClient, checks: &[TableCheck], timeout: Duration
                                 "result": result.evidence(),
                                 "attempts": attempts[&check.name],
                                 "converged_after_ms": elapsed(),
-                                "deadline_ms": u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                                "deadline_ms": u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
                                 "before": before, "after": after, "state": state,
                             }),
                         );
@@ -1540,8 +1592,8 @@ async fn converge(client: &KustoClient, checks: &[TableCheck], timeout: Duration
                     }
                 }
             }
-            if cached.len() == checks.len() || Instant::now() >= deadline {
-                return Ok::<(), anyhow::Error>(());
+            if cached.len() == checks.len() {
+                return Ok(());
             }
             tokio::time::sleep_until(tokio::time::Instant::from_std(
                 (Instant::now() + CACHE_POLL_INTERVAL).min(deadline),
@@ -1554,7 +1606,7 @@ async fn converge(client: &KustoClient, checks: &[TableCheck], timeout: Duration
     }
     ensure!(
         cached.len() == checks.len(),
-        "accelerated cache did not converge to the captured Delta snapshot within {timeout:?}: {:?}",
+        "accelerated cache did not converge to the captured Delta snapshot within {budget:?} (cache budget {timeout:?}): {:?}",
         checks
             .iter()
             .filter(|check| !cached.contains_key(&check.name))
@@ -1654,8 +1706,11 @@ async fn observe_table(client: &KustoClient, name: &str) -> Value {
     observed.unwrap_or_else(|error| json!({"available": false, "error": short_error(&error)}))
 }
 
-pub(crate) fn validation_failure(results: &Path, error: &anyhow::Error) -> Result<Value> {
-    let report = json!({"passed":false, "backend": BACKEND, "error": short_error(error)});
+pub(crate) fn validation_failure(results: &Path, error: &anyhow::Error, progress: &KustoProgress) -> Result<Value> {
+    let report = json!({
+        "passed": false, "backend": BACKEND, "error": short_error(error),
+        "phase": progress.phase, "table": progress.table, "last_qap": progress.last_qap,
+    });
     write_json(&results.join("kusto-validation.json"), &report)?;
     Ok(report)
 }
@@ -2180,7 +2235,7 @@ mod tests {
             "diagnostics are kept"
         );
         degraded(&directory.0, "run", &error)?;
-        validation_failure(&directory.0, &error)?;
+        validation_failure(&directory.0, &error, &KustoProgress::default())?;
         for file in ["kusto-queries.jsonl", STATUS, "kusto-validation.json"] {
             assert_public(&fs::read_to_string(directory.0.join(file))?);
         }
@@ -2404,7 +2459,7 @@ mod tests {
         check.corpus = chunked_corpus();
         check.fallback = chunked_result(2, 1, None);
         let checks = [check];
-        let converged = converge(&client, &checks, Duration::from_secs(10)).await?;
+        let converged = converge(&client, &checks, Duration::from_secs(10), None, &Mutex::default()).await?;
         assert_eq!(converged["direct_x"]["result"]["chunks"], 2);
         assert_eq!(converged["direct_x"]["result"]["rows"], 3);
         {
@@ -2422,7 +2477,7 @@ mod tests {
         // Every partition count and the first chunk are ready; only the final chunk is late.
         delay.store(1_500, Ordering::Relaxed);
         let started = Instant::now();
-        let late = converge(&client, &checks, Duration::from_millis(500)).await;
+        let late = converge(&client, &checks, Duration::from_millis(500), None, &Mutex::default()).await;
         assert!(late.is_err(), "a late final chunk must fail the fixed deadline");
         assert!(started.elapsed() < Duration::from_millis(1_400));
         delay.store(0, Ordering::Relaxed);
@@ -2436,7 +2491,7 @@ mod tests {
         let server = ready_cache(Arc::clone(&delay))?;
         let client = KustoClient::with_mode(&server.endpoint, &directory.0, Mode::Local, DATABASE)?;
         let checks = [deadline_check()];
-        let converged = converge(&client, &checks, Duration::from_secs(10)).await?;
+        let converged = converge(&client, &checks, Duration::from_secs(10), None, &Mutex::default()).await?;
         let observations = converged["direct_x"]["observations"]
             .as_array()
             .context("observations recorded")?;
@@ -2445,13 +2500,82 @@ mod tests {
         // Every table is ready, but its only cached query returns after the deadline.
         delay.store(1_500, Ordering::Relaxed);
         let started = Instant::now();
-        let late = converge(&client, &checks, Duration::from_millis(500)).await;
+        let late = converge(&client, &checks, Duration::from_millis(500), None, &Mutex::default()).await;
         assert!(late.is_err(), "a cached result after the deadline must not pass");
         assert!(
             started.elapsed() < Duration::from_millis(1_400),
             "the deadline covers in-flight requests"
         );
         delay.store(0, Ordering::Relaxed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn absolute_ceiling_shortens_the_cache_budget_and_keeps_partial_state() -> Result<()> {
+        let directory = Directory::new()?;
+        let delay = Arc::new(AtomicU64::new(0));
+        let server = ready_cache(Arc::clone(&delay))?;
+        let client = KustoClient::with_mode(&server.endpoint, &directory.0, Mode::Local, DATABASE)?;
+        // The cache reports version 4, so a version-5 snapshot never becomes current.
+        let mut stale = deadline_check();
+        stale.summary.version = 5;
+        let checks = [stale];
+        let progress = Mutex::new(KustoProgress::default());
+        let started = Instant::now();
+        let error = converge(
+            &client,
+            &checks,
+            Duration::from_secs(10),
+            Some(started + Duration::from_millis(600)),
+            &progress,
+        )
+        .await
+        .err()
+        .context("an unconverged cache must fail at the absolute ceiling")?;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(600) && elapsed < Duration::from_millis(1_400),
+            "the ceiling, not the 10s cache budget, bounds the wait: {elapsed:?}"
+        );
+        assert!(format!("{error:#}").contains("(cache budget 10s)"), "{error:#}");
+        let mut progress = progress.into_inner().map_err(|_| anyhow::anyhow!("poisoned"))?;
+        progress.phase = KustoPhase::Converge;
+        assert_eq!(progress.last_qap["direct_x"]["outcome"], "not-ready");
+        let report = validation_failure(&directory.0, &error, &progress)?;
+        let written: Value = serde_json::from_slice(&fs::read(directory.0.join("kusto-validation.json"))?)?;
+        assert_eq!(written, report);
+        assert_eq!(written["passed"], false);
+        assert_eq!(written["phase"], "converge");
+        assert_eq!(written["last_qap"]["direct_x"]["outcome"], "not-ready");
+
+        // A cached success that returns after the ceiling is rejected and its request cancelled.
+        let checks = [deadline_check()];
+        delay.store(1_500, Ordering::Relaxed);
+        let started = Instant::now();
+        let late = converge(
+            &client,
+            &checks,
+            Duration::from_secs(10),
+            Some(started + Duration::from_millis(500)),
+            &Mutex::default(),
+        )
+        .await;
+        assert!(late.is_err(), "a success after the absolute ceiling must not pass");
+        assert!(started.elapsed() < Duration::from_millis(1_400));
+
+        // An already elapsed ceiling fails without waiting for any request.
+        delay.store(0, Ordering::Relaxed);
+        let started = Instant::now();
+        let expired = converge(
+            &client,
+            &checks,
+            Duration::from_secs(10),
+            Some(started),
+            &Mutex::default(),
+        )
+        .await;
+        assert!(expired.is_err(), "an expired ceiling cannot report convergence");
+        assert!(started.elapsed() < Duration::from_millis(400));
         Ok(())
     }
 

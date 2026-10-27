@@ -1,10 +1,11 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    future::Future,
     path::Path,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use delta_inspect::{SnapshotSummary, TableSummary};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -39,6 +40,104 @@ pub async fn drain(arguments: ValidateArgs) -> Result<()> {
     Ok(())
 }
 
+/// A runner deadline further away than this is a unit or clock error, not a validation budget.
+const MAX_VALIDATE_BUDGET: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The validate phase that first failed, so a bounded failure is never reported blank.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum ValidatePhase {
+    Deadline,
+    Inputs,
+    DrainReceipts,
+    SettleDataflow,
+    SnapshotDirect,
+    SnapshotDataflow,
+    Kusto,
+}
+
+/// One absolute bound for the whole validate command. The runner's wall-clock deadline is
+/// converted to a monotonic instant once, so later wall-clock changes cannot extend it.
+#[derive(Clone, Copy, Debug)]
+struct Budget {
+    deadline: Option<Instant>,
+    deadline_unix_ms: Option<u64>,
+}
+
+impl Budget {
+    fn new(deadline_unix_ms: Option<u64>, now_unix: Duration, now: Instant) -> Result<Self> {
+        let Some(deadline_unix_ms) = deadline_unix_ms else {
+            return Ok(Self {
+                deadline: None,
+                deadline_unix_ms: None,
+            });
+        };
+        let now_ms = u64::try_from(now_unix.as_millis()).context("wall clock overflow")?;
+        // A deadline already in the past becomes an expired budget, which fails visibly.
+        let remaining = Duration::from_millis(deadline_unix_ms.saturating_sub(now_ms));
+        ensure!(
+            remaining <= MAX_VALIDATE_BUDGET,
+            "validate deadline is more than {MAX_VALIDATE_BUDGET:?} away"
+        );
+        Ok(Self {
+            deadline: Some(now.checked_add(remaining).context("validate deadline overflow")?),
+            deadline_unix_ms: Some(deadline_unix_ms),
+        })
+    }
+
+    fn from_clock(deadline_unix_ms: Option<u64>) -> Result<Self> {
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("wall clock is before the Unix epoch")?;
+        Self::new(deadline_unix_ms, now_unix, Instant::now())
+    }
+
+    fn expired_at(&self, now: Instant) -> bool {
+        self.deadline.is_some_and(|deadline| now >= deadline)
+    }
+
+    /// A phase's own budget, shortened to what remains of the absolute bound.
+    fn clamp_at(&self, own: Duration, now: Instant) -> Duration {
+        self.deadline
+            .map_or(own, |deadline| own.min(deadline.saturating_duration_since(now)))
+    }
+
+    fn clamp(&self, own: Duration) -> Duration {
+        self.clamp_at(own, Instant::now())
+    }
+
+    /// Runs one phase under the absolute bound; reaching it drops the phase, cancelling in-flight
+    /// requests at their next await. Synchronous reader stretches cannot be preempted, so a result
+    /// that completes at or after the bound is rejected rather than accepted late. Without a bound
+    /// the phase runs exactly as before.
+    async fn within<T>(&self, phase: ValidatePhase, work: impl Future<Output = Result<T>>) -> Result<T> {
+        let Some(deadline) = self.deadline else {
+            return work.await;
+        };
+        ensure!(
+            Instant::now() < deadline,
+            "validate deadline elapsed before phase {phase:?} started"
+        );
+        let value = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), work)
+            .await
+            .map_err(|_| anyhow::anyhow!("phase {phase:?} reached the validate deadline"))??;
+        ensure!(
+            Instant::now() < deadline,
+            "phase {phase:?} completed only after the validate deadline"
+        );
+        Ok(value)
+    }
+
+    fn evidence(&self) -> Option<Value> {
+        let deadline = self.deadline?;
+        Some(serde_json::json!({
+            "deadline_unix_ms": self.deadline_unix_ms,
+            "remaining_ms": u64::try_from(deadline.saturating_duration_since(Instant::now()).as_millis())
+                .unwrap_or(u64::MAX),
+        }))
+    }
+}
+
 fn check_drain_receipts(metadata: &Value, publication: &Value, mutators: &Value) -> Result<()> {
     let run_id = metadata["run_id"].as_str().context("missing validation run identity")?;
     anyhow::ensure!(
@@ -67,27 +166,60 @@ fn check_drain_receipts(metadata: &Value, publication: &Value, mutators: &Value)
 ///
 /// Returns malformed evidence/snapshot failures or an aggregate failed validation.
 pub async fn validate(arguments: ValidateArgs) -> Result<()> {
-    let sends: Vec<SendManifestEntry> = read_json_lines(&arguments.results.join(SEND_MANIFEST_FILE)).await?;
-    let receipts: Vec<ReceiptManifestEntry> = read_json_lines(&arguments.results.join(RECEIPT_MANIFEST_FILE)).await?;
-    let contracts: Vec<SchemaContract> = read_json(&arguments.results.join(SCHEMA_CONTRACT_FILE)).await?;
-    let routing: RoutingEvidence = read_json(&arguments.results.join(ROUTING_EVIDENCE_FILE)).await?;
-    let capabilities: Value = read_json(&arguments.results.join(CAPABILITY_EVIDENCE_FILE)).await?;
+    let budget = match Budget::from_clock(arguments.validate_deadline_unix_ms) {
+        Ok(budget) => budget,
+        Err(error) => return fail_early(&arguments, None, ValidatePhase::Deadline, error).await,
+    };
+    let inputs = async {
+        Ok::<_, anyhow::Error>((
+            read_json_lines::<SendManifestEntry>(&arguments.results.join(SEND_MANIFEST_FILE)).await?,
+            read_json_lines::<ReceiptManifestEntry>(&arguments.results.join(RECEIPT_MANIFEST_FILE)).await?,
+            read_json::<Vec<SchemaContract>>(&arguments.results.join(SCHEMA_CONTRACT_FILE)).await?,
+            read_json::<RoutingEvidence>(&arguments.results.join(ROUTING_EVIDENCE_FILE)).await?,
+            read_json::<Value>(&arguments.results.join(CAPABILITY_EVIDENCE_FILE)).await?,
+        ))
+    }
+    .await;
+    let (sends, receipts, contracts, routing, capabilities) = match inputs {
+        Ok(inputs) => inputs,
+        Err(error) => return fail_early(&arguments, Some(&budget), ValidatePhase::Inputs, error).await,
+    };
 
     let mut failures = Vec::new();
+    let mut failed_phase = None;
+    if budget.expired_at(Instant::now()) {
+        failures.push("validate deadline elapsed before validation started".to_owned());
+        failed_phase = Some(ValidatePhase::Deadline);
+    }
     let kusto_settle = if arguments.collectors_drained {
-        let metadata = read_json(&arguments.results.join("run-metadata.json")).await?;
-        let publication = read_json(&arguments.results.join("publication-drain.json")).await?;
-        let mutators = read_json(&arguments.results.join("mutator-drain.json")).await?;
-        check_drain_receipts(&metadata, &publication, &mutators)?;
-        None
+        let drained = async {
+            let metadata = read_json(&arguments.results.join("run-metadata.json")).await?;
+            let publication = read_json(&arguments.results.join("publication-drain.json")).await?;
+            let mutators = read_json(&arguments.results.join("mutator-drain.json")).await?;
+            check_drain_receipts(&metadata, &publication, &mutators)
+        }
+        .await;
+        drained.err().map(|error| {
+            failures.push(format!("drain receipts rejected: {error:#}"));
+            failed_phase.get_or_insert(ValidatePhase::DrainReceipts);
+            error.context("drain receipts rejected")
+        })
     } else if arguments.kusto_endpoint.is_some() {
-        crate::kusto::settle_dataflow(
-            &arguments.dataflow_admin_endpoints,
-            arguments.timeout.get(),
-            arguments.quiver,
-        )
-        .await
-        .err()
+        let settled = budget
+            .within(
+                ValidatePhase::SettleDataflow,
+                crate::kusto::settle_dataflow(
+                    &arguments.dataflow_admin_endpoints,
+                    budget.clamp(arguments.timeout.get()),
+                    arguments.quiver,
+                ),
+            )
+            .await
+            .err();
+        if settled.is_some() {
+            failed_phase.get_or_insert(ValidatePhase::SettleDataflow);
+        }
+        settled
     } else {
         None
     };
@@ -278,32 +410,35 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
         );
     }
 
-    let direct = if expected_tables.contains_key("direct") {
-        Some(
-            wait_for_snapshot(
-                &arguments.direct_root,
-                required_rows.get("direct").context("direct row expectations missing")?,
-                arguments.timeout.get(),
+    let mut snapshots = BTreeMap::new();
+    for (pool, root, phase) in [
+        ("direct", &arguments.direct_root, ValidatePhase::SnapshotDirect),
+        ("dataflow", &arguments.dataflow_root, ValidatePhase::SnapshotDataflow),
+    ] {
+        if !expected_tables.contains_key(pool) {
+            continue;
+        }
+        let expected = required_rows
+            .get(pool)
+            .with_context(|| format!("{pool} row expectations missing"))?;
+        match budget
+            .within(
+                phase,
+                wait_for_snapshot(root, expected, budget.clamp(arguments.timeout.get())),
             )
-            .await?,
-        )
-    } else {
-        None
-    };
-    let dataflow = if expected_tables.contains_key("dataflow") {
-        Some(
-            wait_for_snapshot(
-                &arguments.dataflow_root,
-                required_rows
-                    .get("dataflow")
-                    .context("dataflow row expectations missing")?,
-                arguments.timeout.get(),
-            )
-            .await?,
-        )
-    } else {
-        None
-    };
+            .await
+        {
+            Ok(snapshot) => {
+                snapshots.insert(pool, snapshot);
+            }
+            Err(error) => {
+                failures.push(format!("{pool} Delta snapshot did not become visible: {error:#}"));
+                failed_phase.get_or_insert(phase);
+            }
+        }
+    }
+    let direct = snapshots.remove("direct");
+    let dataflow = snapshots.remove("dataflow");
     if let Some(snapshot) = &direct {
         validate_snapshot(
             "direct",
@@ -387,23 +522,30 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
     validate_capabilities(&capabilities, arguments.quiver, &mut failures);
 
     let kusto = if let Some(endpoint) = &arguments.kusto_endpoint {
+        let progress = std::sync::Mutex::new(crate::kusto::KustoProgress::default());
         let validation = if let Some(error) = kusto_settle {
             Err(error)
         } else if let (Some(direct), Some(dataflow)) = (&direct, &dataflow) {
-            tokio::time::timeout(
-                arguments.timeout.get(),
-                crate::kusto::validate(
-                    endpoint,
-                    &arguments.results,
-                    &arguments.direct_root,
-                    &arguments.dataflow_root,
-                    direct,
-                    dataflow,
-                ),
-            )
-            .await
-            .context("Kusto validation deadline elapsed")
-            .and_then(|report| report)
+            budget
+                .within(ValidatePhase::Kusto, async {
+                    tokio::time::timeout(
+                        arguments.timeout.get(),
+                        crate::kusto::validate(
+                            endpoint,
+                            &arguments.results,
+                            &arguments.direct_root,
+                            &arguments.dataflow_root,
+                            direct,
+                            dataflow,
+                            budget.deadline,
+                            &progress,
+                        ),
+                    )
+                    .await
+                    .context("Kusto validation deadline elapsed")
+                    .and_then(|report| report)
+                })
+                .await
         } else {
             Err(anyhow::anyhow!(
                 "Kusto validation requires both independent Delta snapshots"
@@ -416,13 +558,15 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
             }
             Err(error) => {
                 failures.push(format!("Kusto validation failed: {error:#}"));
+                failed_phase.get_or_insert(ValidatePhase::Kusto);
                 let metadata: Value = read_json(&arguments.results.join(crate::manifest::RUN_METADATA_FILE)).await?;
                 crate::kusto::degraded(
                     &arguments.results,
                     metadata["run_id"].as_str().context("run identity missing")?,
                     &error,
                 )?;
-                crate::kusto::validation_failure(&arguments.results, &error)?
+                let progress = progress.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
+                crate::kusto::validation_failure(&arguments.results, &error, &progress)?
             }
         })
     } else {
@@ -431,6 +575,8 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
     let report = ValidationReport {
         passed: failures.is_empty(),
         failures,
+        failed_phase,
+        deadline: budget.evidence(),
         admitted_rows,
         required_rows,
         direct,
@@ -440,7 +586,7 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
     };
     let mut bytes = serde_json::to_vec_pretty(&report)?;
     bytes.push(b'\n');
-    fs::write(arguments.results.join(VALIDATION_FILE), bytes).await?;
+    write_report(&arguments.results, &bytes).await?;
     if !report.passed {
         bail!(
             "loadtest validation failed with {} issue(s); see {}",
@@ -756,6 +902,57 @@ async fn read_json_lines<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
         .collect()
 }
 
+/// Replaces the validation report atomically, so a killed command never leaves a partial file.
+async fn write_report(results: &Path, bytes: &[u8]) -> Result<()> {
+    let output = results.join(VALIDATION_FILE);
+    let temporary = output.with_extension("json.next");
+    fs::write(&temporary, bytes).await?;
+    fs::rename(&temporary, &output).await?;
+    Ok(())
+}
+
+/// Records a failure that happened before the per-pool checks could run, with the same report keys
+/// as a full report and the existing degraded Kusto status, then fails the command.
+async fn fail_early(
+    arguments: &ValidateArgs,
+    budget: Option<&Budget>,
+    phase: ValidatePhase,
+    error: anyhow::Error,
+) -> Result<()> {
+    let kusto = if arguments.kusto_endpoint.is_some() {
+        let metadata = read_json::<Value>(&arguments.results.join(crate::manifest::RUN_METADATA_FILE)).await;
+        match metadata.as_ref().ok().and_then(|metadata| metadata["run_id"].as_str()) {
+            Some(run_id) => {
+                crate::kusto::degraded(&arguments.results, run_id, &error)?;
+                Some(crate::kusto::validation_failure(
+                    &arguments.results,
+                    &error,
+                    &crate::kusto::KustoProgress::default(),
+                )?)
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    let report = serde_json::json!({
+        "passed": false,
+        "failures": [format!("validation stopped in phase {phase:?}: {error:#}")],
+        "failed_phase": phase,
+        "deadline": budget.and_then(Budget::evidence),
+        "admitted_rows": {}, "required_rows": {},
+        "direct": null, "dataflow": null, "routing": null,
+        "kusto": kusto,
+    });
+    let mut bytes = serde_json::to_vec_pretty(&report)?;
+    bytes.push(b'\n');
+    write_report(&arguments.results, &bytes).await?;
+    Err(error.context(format!(
+        "loadtest validation failed in phase {phase:?}; see {}",
+        arguments.results.join(VALIDATION_FILE).display()
+    )))
+}
+
 #[derive(Deserialize, Serialize)]
 struct RoutingEvidence {
     loaded_at_unix_ms: u64,
@@ -790,6 +987,10 @@ struct RoutingLeaseEvidence {
 struct ValidationReport {
     passed: bool,
     failures: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failed_phase: Option<ValidatePhase>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deadline: Option<Value>,
     admitted_rows: BTreeMap<String, BTreeMap<String, u64>>,
     required_rows: BTreeMap<String, BTreeMap<String, u64>>,
     direct: Option<SnapshotSummary>,
@@ -801,6 +1002,180 @@ struct ValidationReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const NOW_UNIX: Duration = Duration::from_millis(1_800_000_000_000);
+
+    #[test]
+    fn budget_is_derived_once_and_bounds_every_sequential_phase() -> Result<()> {
+        let now = Instant::now();
+        let unbounded = Budget::new(None, NOW_UNIX, now)?;
+        assert!(unbounded.deadline.is_none() && unbounded.evidence().is_none());
+        assert!(!unbounded.expired_at(now + Duration::from_secs(3_600)));
+        assert_eq!(
+            unbounded.clamp_at(Duration::from_secs(480), now),
+            Duration::from_secs(480)
+        );
+
+        let budget = Budget::new(Some(1_800_000_570_000), NOW_UNIX, now)?;
+        assert_eq!(budget.deadline, Some(now + Duration::from_secs(570)));
+        // Three sequential phases that each own the 8m drain timeout share the one 570s bound.
+        let mut elapsed = Duration::ZERO;
+        let mut granted = Vec::new();
+        for _ in 0..3 {
+            let wait = budget.clamp_at(Duration::from_secs(480), now + elapsed);
+            granted.push(wait);
+            elapsed += wait;
+        }
+        assert_eq!(
+            granted,
+            [Duration::from_secs(480), Duration::from_secs(90), Duration::ZERO]
+        );
+        assert_eq!(elapsed, Duration::from_secs(570));
+        assert!(budget.expired_at(now + elapsed));
+        assert!(!budget.expired_at(now + Duration::from_millis(569_999)));
+
+        for past in [1, 1_799_999_999_999, 1_800_000_000_000] {
+            let expired = Budget::new(Some(past), NOW_UNIX, now)?;
+            assert!(expired.expired_at(now), "{past} is not in the future");
+            assert_eq!(expired.clamp_at(Duration::from_secs(480), now), Duration::ZERO);
+        }
+        assert!(Budget::new(Some(1_800_000_000_000 + 86_400_000), NOW_UNIX, now).is_ok());
+        for too_far in [1_800_000_000_000 + 86_400_001, u64::MAX] {
+            assert!(
+                Budget::new(Some(too_far), NOW_UNIX, now).is_err(),
+                "{too_far} must be rejected"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn phases_fail_at_the_deadline_and_late_success_is_rejected() -> Result<()> {
+        let started = Instant::now();
+        let expired = Budget::new(Some(1), NOW_UNIX, started)?;
+        let polled = std::sync::atomic::AtomicBool::new(false);
+        let result = expired
+            .within(ValidatePhase::SnapshotDirect, async {
+                polled.store(true, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            })
+            .await;
+        assert!(result.is_err(), "an elapsed deadline cannot start a phase");
+        assert!(
+            !polled.load(std::sync::atomic::Ordering::Relaxed),
+            "the phase is never polled"
+        );
+
+        let budget = Budget {
+            deadline: Some(Instant::now() + Duration::from_millis(200)),
+            deadline_unix_ms: Some(1),
+        };
+        let started = Instant::now();
+        let late = budget
+            .within(ValidatePhase::Kusto, async {
+                tokio::time::sleep(Duration::from_millis(1_500)).await;
+                Ok("converged")
+            })
+            .await;
+        let error = late.err().context("a success after the deadline must be rejected")?;
+        assert!(format!("{error:#}").contains("Kusto"), "{error:#}");
+        assert!(
+            started.elapsed() < Duration::from_millis(1_000),
+            "the in-flight phase is dropped"
+        );
+
+        // A synchronous stretch cannot be preempted; its late success is still rejected.
+        let budget = Budget {
+            deadline: Some(Instant::now() + Duration::from_millis(100)),
+            deadline_unix_ms: Some(1),
+        };
+        let blocking = budget
+            .within(ValidatePhase::SnapshotDataflow, async {
+                std::thread::sleep(Duration::from_millis(300));
+                Ok("snapshot")
+            })
+            .await;
+        let error = blocking.err().context("a blocking phase that overran must fail")?;
+        assert!(format!("{error:#}").contains("completed only after"), "{error:#}");
+
+        let unbounded = Budget::new(None, NOW_UNIX, Instant::now())?;
+        let value = unbounded
+            .within(ValidatePhase::Kusto, async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok(7)
+            })
+            .await?;
+        assert_eq!(value, 7, "without a deadline phases run unchanged");
+        Ok(())
+    }
+
+    struct Results(std::path::PathBuf);
+
+    impl Drop for Results {
+        fn drop(&mut self) {
+            if self.0.exists()
+                && let Err(error) = std::fs::remove_dir_all(&self.0)
+            {
+                panic!("remove test directory: {error}");
+            }
+        }
+    }
+
+    fn validate_arguments(results: &Path, deadline: u64) -> Result<ValidateArgs> {
+        use clap::Parser;
+        let deadline = deadline.to_string();
+        let cli = crate::cli::Cli::try_parse_from([
+            "arrowcol-loadgen",
+            "validate",
+            "--results",
+            results.to_str().context("results path")?,
+            "--validate-deadline-unix-ms",
+            &deadline,
+        ])?;
+        match cli.command {
+            crate::cli::Command::Validate(arguments) => Ok(arguments),
+            _ => bail!("expected validate command"),
+        }
+    }
+
+    #[tokio::test]
+    async fn early_failures_write_a_failed_report_before_exiting() -> Result<()> {
+        let results = Results(std::path::PathBuf::from(format!(
+            "target/loadgen-validation-tests/{}",
+            std::process::id()
+        )));
+        std::fs::create_dir_all(&results.0)?;
+        let now = u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
+        for (deadline, phase) in [
+            (now + 2 * 86_400_000, "deadline"),
+            (now + 570_000, "inputs"),
+            (1, "inputs"),
+        ] {
+            let started = Instant::now();
+            let error = validate(validate_arguments(&results.0, deadline)?)
+                .await
+                .err()
+                .context("an early failure must fail the command")?;
+            assert!(started.elapsed() < Duration::from_secs(5), "no wait after the failure");
+            let report: Value = read_json(&results.0.join(VALIDATION_FILE)).await?;
+            assert_eq!(report["passed"], false, "{error:#}");
+            assert_eq!(report["failed_phase"], phase);
+            assert_eq!(report["failures"].as_array().map(Vec::len), Some(1));
+            assert!(
+                !results.0.join("validation.json.next").exists(),
+                "the report is replaced atomically"
+            );
+            if phase == "deadline" {
+                assert!(
+                    report["deadline"].is_null(),
+                    "a rejected bound is not reported as a budget"
+                );
+            } else {
+                assert_eq!(report["deadline"]["deadline_unix_ms"], deadline);
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn stopped_validation_rejects_missing_stale_and_partial_drain_receipts() -> Result<()> {
