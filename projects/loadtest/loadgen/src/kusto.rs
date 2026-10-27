@@ -1,59 +1,174 @@
+//! Kusto validation over native Delta external tables with query acceleration (QAP).
+//!
+//! Locally the emulator reads the committed Delta snapshots directly through `kind=delta`
+//! external tables with a one-minute `MaxAge` acceleration policy; no rows are copied. In Azure
+//! mode the provisioned external tables are only queried. Correctness is checked twice per table:
+//! once through the non-accelerated fallback (`MaxAge` override of one second) and once through the
+//! accelerated cache after it reports complete, fresh, and eligible state for the captured commit.
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     io::Write,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use delta_inspect::{SnapshotInventory, SnapshotSummary, TableInventory};
+use delta_inspect::{SnapshotInventory, SnapshotSummary, TableInventory, TableSummary};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-use tokio::task::JoinHandle;
+use tokio::{sync::Mutex, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use crate::{cli::RunArgs, transport::now_unix_millis};
 
 const DATABASE: &str = "loadtest";
 const STATUS: &str = "kusto-status.json";
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const BACKEND: &str = "native-qap";
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+const CACHE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const DEFAULT_CACHE_TIMEOUT: Duration = Duration::from_secs(300);
+const TOKEN_LIFETIME: Duration = Duration::from_secs(30 * 60);
+const TOKEN_TIMEOUT: Duration = Duration::from_secs(60);
+/// Shortest policy the service accepts; bounds cache staleness after each Delta commit.
+const LOCAL_MAX_AGE: &str = "00:01:00";
+const LOCAL_HOT_WINDOW: &str = "1.00:00:00";
+const TABLES_PER_POOL: usize = 13;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Mode {
+    Local,
+    Azure,
+}
+
+impl Mode {
+    fn from_env() -> Result<Self> {
+        match std::env::var("ARROWCOL_MODE").ok().as_deref().map(str::trim) {
+            None | Some("" | "local") => Ok(Self::Local),
+            Some("azure") => Ok(Self::Azure),
+            Some(other) => bail!("unsupported ARROWCOL_MODE {other:?}"),
+        }
+    }
+}
 
 #[derive(Clone)]
 struct KustoClient {
     http: Client,
     endpoint: Url,
+    database: String,
+    mode: Mode,
     results: PathBuf,
+    token: Arc<Mutex<Option<(String, Instant)>>>,
 }
 
 impl KustoClient {
     fn new(endpoint: &str, results: &Path) -> Result<Self> {
+        let mode = Mode::from_env()?;
+        let database = match mode {
+            Mode::Local => DATABASE.to_owned(),
+            Mode::Azure => {
+                ensure!(
+                    !std::env::var("LOADTEST_KUSTO_BRIDGE_ENDPOINT").is_ok_and(|value| !value.trim().is_empty()),
+                    "the local Kusto bridge cannot be used in Azure mode"
+                );
+                std::env::var("AZURE_KUSTO_DATABASE").context("AZURE_KUSTO_DATABASE is required in Azure mode")?
+            }
+        };
+        Self::with_mode(endpoint, results, mode, &database)
+    }
+
+    fn with_mode(endpoint: &str, results: &Path, mode: Mode, database: &str) -> Result<Self> {
         let endpoint = Url::parse(endpoint).context("invalid Kusto endpoint")?;
+        let scheme = match mode {
+            Mode::Local => "http",
+            Mode::Azure => "https",
+        };
         ensure!(
-            endpoint.scheme() == "http"
+            endpoint.scheme() == scheme
+                && endpoint.host_str().is_some()
                 && endpoint.username().is_empty()
                 && endpoint.password().is_none()
                 && endpoint.query().is_none()
                 && endpoint.fragment().is_none()
                 && endpoint.path() == "/",
-            "Kusto endpoint must be a plain HTTP emulator origin without credentials"
+            "Kusto endpoint must be a plain {scheme} origin without credentials"
+        );
+        ensure!(
+            !database.is_empty()
+                && database.len() <= 128
+                && database
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-')),
+            "invalid Kusto database name"
         );
         Ok(Self {
             http: Client::builder()
                 .timeout(REQUEST_TIMEOUT)
-                .connect_timeout(Duration::from_secs(3))
+                .connect_timeout(Duration::from_secs(5))
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             endpoint,
+            database: database.to_owned(),
+            mode,
             results: results.to_owned(),
+            token: Arc::default(),
         })
+    }
+
+    /// Azure tokens come from the ambient Azure CLI login and are never logged or persisted.
+    async fn token(&self) -> Result<Option<String>> {
+        if self.mode == Mode::Local {
+            return Ok(None);
+        }
+        let mut cached = self.token.lock().await;
+        if let Some((token, at)) = cached.as_ref()
+            && at.elapsed() < TOKEN_LIFETIME
+        {
+            return Ok(Some(token.clone()));
+        }
+        let resource = self.endpoint.as_str().trim_end_matches('/').to_owned();
+        let command = tokio::process::Command::new("az")
+            .args([
+                "account",
+                "get-access-token",
+                "--resource",
+                &resource,
+                "--query",
+                "accessToken",
+                "--output",
+                "tsv",
+            ])
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output();
+        // Bounded; stderr is discarded because it may echo account details.
+        let output = tokio::time::timeout(TOKEN_TIMEOUT, command)
+            .await
+            .context("Azure CLI token request timed out")?
+            .context("run Azure CLI for a Kusto access token")?;
+        ensure!(
+            output.status.success(),
+            "Azure CLI could not obtain a Kusto access token ({})",
+            output.status
+        );
+        let token = String::from_utf8(output.stdout)
+            .context("Azure CLI token is not UTF-8")?
+            .trim()
+            .to_owned();
+        ensure!(
+            !token.is_empty() && !token.contains(char::is_whitespace),
+            "Azure CLI returned an invalid Kusto token"
+        );
+        *cached = Some((token.clone(), Instant::now()));
+        Ok(Some(token))
     }
 
     async fn execute(&self, command: &str, management: bool, phase: &str) -> Result<Vec<BTreeMap<String, Value>>> {
@@ -63,17 +178,16 @@ impl KustoClient {
             "properties": "{\"Options\":{\"notruncation\":true}}"
         });
         if phase != "bootstrap" {
-            request["db"] = json!(DATABASE);
+            request["db"] = json!(self.database);
         }
-        let response = self
-            .http
-            .post(self.endpoint.join(route)?)
-            .json(&request)
-            .send()
-            .await
-            .context("Kusto HTTP request failed")?;
+        let mut builder = self.http.post(self.endpoint.join(route)?).json(&request);
+        if let Some(token) = self.token().await? {
+            builder = builder.bearer_auth(token);
+        }
+        let response = builder.send().await.context("Kusto HTTP request failed")?;
         let status = response.status();
-        let body: Value = response.json().await.context("Kusto returned non-JSON response")?;
+        let text = response.text().await.context("Kusto response body failed")?;
+        let body: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({"error": text}));
         append(
             &self.results.join("kusto-queries.jsonl"),
             &json!({
@@ -87,6 +201,9 @@ impl KustoClient {
     }
 
     async fn bootstrap(&self) -> Result<()> {
+        if self.mode == Mode::Azure {
+            return Ok(());
+        }
         let rows = self.execute(".show databases", true, "bootstrap").await?;
         if rows
             .iter()
@@ -105,25 +222,37 @@ impl KustoClient {
         Ok(())
     }
 
-    async fn tags(&self, table: &str) -> Result<BTreeSet<String>> {
-        let rows = self
-            .execute(
-                &format!(".show table {table} extents | project Tags"),
-                true,
-                "reconcile",
-            )
-            .await?;
-        let mut result = BTreeSet::new();
-        for row in rows {
-            let value = row.get("Tags").context("Kusto extent tags are missing")?;
-            result.extend(ingestion_tags(value)?);
-        }
-        Ok(result)
+    /// Defines (or redefines, picking up the current Delta schema) one accelerated external table.
+    async fn expose(&self, name: &str, location: &str) -> Result<()> {
+        ensure!(
+            self.mode == Mode::Local,
+            "Azure external tables are provisioned by infrastructure"
+        );
+        let table = identifier(name)?;
+        self.execute(
+            &format!(".create-or-alter external table {table} kind=delta (h@'{location}')"),
+            true,
+            "schema",
+        )
+        .await?;
+        self.execute(
+            &format!(
+                ".alter external table {table} policy query_acceleration {}",
+                literal(&local_policy().to_string())?
+            ),
+            true,
+            "schema",
+        )
+        .await?;
+        Ok(())
     }
 
-    async fn schema(&self, table: &str) -> Result<Vec<(String, String)>> {
+    async fn schema(&self, name: &str) -> Result<Vec<(String, String)>> {
         self.execute(
-            &format!("{table} | getschema | project ColumnName, ColumnType"),
+            &format!(
+                "{} | getschema | project ColumnName, ColumnType",
+                fallback_source(name)?
+            ),
             false,
             "schema",
         )
@@ -144,39 +273,107 @@ impl KustoClient {
         .collect()
     }
 
-    async fn ingest(&self, table: &str, file: &str, identity: &str, phase: &str) -> Result<()> {
-        let command = format!(
-            ".ingest into table {table} ({}) with (format=\"parquet\", ingestionMappingReference=\"loadtest\", \
-             tags={}, ingestIfNotExists={})",
-            literal(file)?,
-            literal(&json!([format!("ingest-by:loadtest:{identity}")]).to_string())?,
-            literal(&json!([format!("loadtest:{identity}")]).to_string())?,
-        );
-        self.execute(&command, true, phase).await?;
-        Ok(())
+    async fn count(&self, source: &str, phase: &str) -> Result<u64> {
+        self.execute(&format!("{source} | count"), false, phase)
+            .await?
+            .first()
+            .and_then(|row| row.get("Count"))
+            .and_then(number)
+            .context("Kusto count missing")
     }
-}
 
-fn ingestion_tags(value: &Value) -> Result<BTreeSet<String>> {
-    let tags = if let Some(text) = value.as_str() {
-        if text.trim_start().starts_with('[') {
-            serde_json::from_str::<Vec<String>>(text).context("invalid Kusto extent tag array")?
-        } else {
-            text.lines().map(str::to_owned).collect()
+    async fn max_age(&self, name: &str) -> Result<(Value, String)> {
+        let rows = self
+            .execute(
+                &format!(".show external table {} policy query_acceleration", identifier(name)?),
+                true,
+                "qap",
+            )
+            .await?;
+        let policy = rows
+            .first()
+            .and_then(|row| row.get("Policy"))
+            .map(json_value)
+            .context("query acceleration policy missing")?;
+        ensure!(
+            policy["IsEnabled"] == true,
+            "query acceleration is not enabled for {name}"
+        );
+        let max_age = policy["MaxAge"]
+            .as_str()
+            .context("query acceleration MaxAge missing")?
+            .to_owned();
+        timespan(&max_age)?;
+        Ok((sanitize(&policy), max_age))
+    }
+
+    async fn acceleration(&self, name: &str, max_age: &str, commit_ms: Option<u64>) -> Result<Acceleration> {
+        let rows = self
+            .execute(&acceleration_command(name, max_age, commit_ms)?, true, "qap")
+            .await?;
+        ensure!(rows.len() <= 1, "duplicate acceleration statistics for {name}");
+        Ok(rows.first().map(Acceleration::from_row).unwrap_or_default())
+    }
+
+    /// Best-effort sanitized `QueryAccelerationState`; never fails validation on its own.
+    async fn details(&self, name: &str) -> Value {
+        let Ok(table) = identifier(name) else {
+            return json!({"error": "invalid external table name"});
+        };
+        match self
+            .execute(&format!(".show external table {table} details"), true, "qap")
+            .await
+        {
+            Ok(rows) => rows.first().map_or(Value::Null, |row| {
+                json!({
+                    "QueryAccelerationPolicy": row.get("QueryAccelerationPolicy").map(|value| sanitize(&json_value(value))),
+                    "QueryAccelerationState": row.get("QueryAccelerationState").map(|value| sanitize(&json_value(value))),
+                })
+            }),
+            Err(error) => json!({"error": short_error(&error)}),
         }
-    } else {
-        serde_json::from_value::<Vec<String>>(value.clone()).context("invalid Kusto extent tags")?
-    };
-    Ok(tags
-        .iter()
-        .filter_map(|tag| tag.strip_prefix("ingest-by:loadtest:").map(str::to_owned))
-        .collect())
+    }
+
+    async fn capacity(&self) -> Value {
+        // Local emulator capacity is functional evidence only, never Azure performance evidence.
+        match self.execute(".show capacity", true, "qap").await {
+            Ok(rows) => json!({"available": true, "rows": sanitize(&json!(rows))}),
+            Err(error) => json!({"available": false, "error": short_error(&error)}),
+        }
+    }
+
+    async fn multiset(&self, source: &str, schema: &Value, samples: &[(Value, u64)]) -> Result<Multiset> {
+        let rows = self
+            .execute(&multiset_query(source, schema, samples)?, false, "validation")
+            .await?;
+        let mut buckets = BTreeMap::new();
+        for row in rows {
+            let sample = row.get("Sample").and_then(number).context("multiset bucket missing")?;
+            let count = row.get("Rows").and_then(number).context("multiset count missing")?;
+            let hash = row
+                .get("Hash")
+                .and_then(Value::as_i64)
+                .context("multiset hash missing")?;
+            ensure!(
+                buckets.insert(sample, (count, hash)).is_none(),
+                "duplicate multiset bucket {sample}"
+            );
+        }
+        Ok(Multiset { buckets })
+    }
 }
 
 fn decode_response(body: &Value) -> Result<Vec<BTreeMap<String, Value>>> {
     if body.get("error").is_some() || body.get("Error").is_some() {
         bail!("Kusto command failed: {body}");
     }
+    // v1 reports partial query failures inside an HTTP 200 body.
+    ensure!(
+        body.get("Exceptions")
+            .is_none_or(|errors| errors.is_null() || errors.as_array().is_some_and(Vec::is_empty)),
+        "Kusto partial query failure: {}",
+        body["Exceptions"]
+    );
     let tables = if let Some(frames) = body.as_array() {
         ensure!(
             frames.iter().any(|frame| frame["FrameType"] == "DataSetCompletion"),
@@ -259,7 +456,7 @@ fn identifier(value: &str) -> Result<String> {
     Ok(format!("['{value}']"))
 }
 
-fn table_name(pool: &str, identity: &str) -> Result<String> {
+fn external_name(pool: &str, identity: &str) -> Result<String> {
     ensure!(matches!(pool, "direct" | "dataflow"), "unknown Kusto source pool");
     let name = identity
         .strip_prefix("telemetry.sqlserver.")
@@ -268,7 +465,15 @@ fn table_name(pool: &str, identity: &str) -> Result<String> {
         name.starts_with("sqlserver_") && !name.contains('.'),
         "unexpected loadtest table identity"
     );
-    identifier(&format!("{pool}_{name}"))
+    let name = format!("{pool}_{name}");
+    identifier(&name)?;
+    Ok(name)
+}
+
+/// Committed Delta table root inside the Kusto container (mounted read-only at `/delta/<pool>`).
+fn table_location(pool: &str, identity: &str) -> Result<String> {
+    external_name(pool, identity)?;
+    Ok(format!("/delta/{pool}/{}", identity.replace('.', "/")))
 }
 
 fn columns(schema: &Value) -> Result<Vec<(String, String)>> {
@@ -293,22 +498,6 @@ fn columns(schema: &Value) -> Result<Vec<(String, String)>> {
         .collect()
 }
 
-fn file_identity(run_id: &str, pool: &str, table: &str, file: &str) -> String {
-    hex::encode(Sha256::digest(format!("{run_id}\0{pool}\0{table}\0{file}")))
-}
-
-fn container_file(pool: &str, table: &str, file: &str) -> Result<String> {
-    table_name(pool, table)?;
-    ensure!(
-        !file.is_empty()
-            && Path::new(file)
-                .components()
-                .all(|part| matches!(part, Component::Normal(_))),
-        "unsafe active file path"
-    );
-    Ok(format!("/delta/{pool}/{}/{file}", table.replace('.', "/")))
-}
-
 fn append(file: &Path, value: &Value) -> Result<()> {
     let mut output = OpenOptions::new().create(true).append(true).open(file)?;
     serde_json::to_writer(&mut output, value)?;
@@ -323,10 +512,14 @@ fn write_json(file: &Path, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
+/// `files_ingested` keeps its historical name for the runner; natively it counts committed active
+/// files exposed through external tables (no rows are copied).
 #[derive(Default, Deserialize, Serialize)]
-struct MirrorStatus {
+struct ExposureStatus {
     state: String,
     run_id: String,
+    #[serde(default)]
+    backend: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
     live_observed: bool,
@@ -339,27 +532,27 @@ struct MirrorStatus {
 struct TableProgress {
     version: u64,
     active_files: usize,
+    #[serde(default)]
     ingested_files: usize,
 }
 
-struct Mirror {
+struct Exposure {
     client: KustoClient,
-    status: MirrorStatus,
+    status: ExposureStatus,
     schemas: BTreeMap<String, Value>,
-    ingested: BTreeMap<String, BTreeSet<String>>,
 }
 
-impl Mirror {
+impl Exposure {
     fn new(endpoint: &str, results: &Path, run_id: &str) -> Result<Self> {
         Ok(Self {
             client: KustoClient::new(endpoint, results)?,
-            status: MirrorStatus {
+            status: ExposureStatus {
                 state: "healthy".to_owned(),
                 run_id: run_id.to_owned(),
-                ..MirrorStatus::default()
+                backend: BACKEND.to_owned(),
+                ..ExposureStatus::default()
             },
             schemas: BTreeMap::new(),
-            ingested: BTreeMap::new(),
         })
     }
 
@@ -375,149 +568,92 @@ impl Mirror {
             self.status.state = "healthy".to_owned();
             self.status.error = None;
         }
-        self.status.live_observed = self.status.live_tables.len() == 26;
-        self.status.files_ingested = self.ingested.values().map(BTreeSet::len).sum();
+        self.status.live_observed = self.status.live_tables.len() == 2 * TABLES_PER_POOL;
+        self.status.files_ingested = self.status.tables.values().map(|table| table.active_files).sum();
         write_json(&self.client.results.join(STATUS), &self.status)
     }
 
-    async fn ensure_table(&mut self, name: &str, schema: &Value) -> Result<()> {
-        if let Some(previous) = self.schemas.get(name) {
-            ensure!(
-                previous == schema,
-                "Delta schema changed for {name}; only fixed schemas are supported"
-            );
-            return Ok(());
-        }
-        let expected = columns(schema)?;
-        let declarations = expected
-            .iter()
-            .map(|(name, kind)| Ok(format!("{}:{kind}", identifier(name)?)))
-            .collect::<Result<Vec<_>>>()?
-            .join(",");
-        self.client
-            .execute(&format!(".create table {name} ({declarations})"), true, "schema")
-            .await?;
-        ensure!(
-            self.client.schema(name).await? == expected,
-            "Kusto schema differs for {name}"
-        );
-        let mapping = expected
-            .iter()
-            .map(|(name, kind)| json!({"Column":name, "DataType":kind, "Properties":{"Field":name}}))
-            .collect::<Vec<_>>();
-        self.client
-            .execute(
-                &format!(
-                    ".create-or-alter table {name} ingestion parquet mapping \"loadtest\" {}",
-                    literal(&serde_json::to_string(&mapping)?)?
-                ),
-                true,
-                "schema",
-            )
-            .await?;
-        self.ingested.insert(name.to_owned(), self.client.tags(name).await?);
-        self.schemas.insert(name.to_owned(), schema.clone());
-        Ok(())
-    }
-
-    async fn sync(&mut self, pool: &str, snapshot: &SnapshotInventory, live: &AtomicBool, all: bool) -> Result<()> {
-        for name in self
-            .schemas
-            .keys()
-            .filter(|name| name.starts_with(&format!("['{pool}_")))
-        {
+    /// Exposes every committed table once; source removals and schema changes are explicit errors
+    /// because the external table schema is fixed when it is defined.
+    async fn sync(&mut self, pool: &str, snapshot: &SnapshotInventory, live: &AtomicBool) -> Result<()> {
+        for name in self.schemas.keys().filter(|name| name.starts_with(&format!("{pool}_"))) {
             ensure!(
                 snapshot
                     .tables
                     .keys()
-                    .any(|table| table_name(pool, table).is_ok_and(|candidate| candidate == *name)),
+                    .any(|table| external_name(pool, table).is_ok_and(|candidate| candidate == *name)),
                 "Delta table disappeared for {name}"
             );
         }
-        for (table, snapshot) in &snapshot.tables {
-            if !all && !live.load(Ordering::Acquire) {
-                break;
-            }
-            let name = table_name(pool, table)?;
-            self.ensure_table(&name, &snapshot.schema).await?;
-            let expected = snapshot
-                .files
-                .iter()
-                .map(|file| file_identity(&self.status.run_id, pool, table, file))
-                .collect::<BTreeSet<_>>();
-            let known = self.ingested.get(&name).context("Kusto table reconciliation missing")?;
-            ensure!(
-                known.is_subset(&expected),
-                "active files were removed/replaced for {name}"
-            );
-            let missing = snapshot
-                .files
-                .iter()
-                .filter(|file| !known.contains(&file_identity(&self.status.run_id, pool, table, file)))
-                .take(if all { usize::MAX } else { 1 })
-                .cloned()
-                .collect::<Vec<_>>();
-            for file in missing {
-                let identity = file_identity(&self.status.run_id, pool, table, &file);
-                let source = container_file(pool, table, &file)?;
-                // Reconcile before each retry: an earlier timeout may have committed.
-                let known = self.client.tags(&name).await?;
-                self.ingested.insert(name.clone(), known);
-                if !self.ingested[&name].contains(&identity) {
-                    self.client
-                        .ingest(&name, &source, &identity, if all { "catchup" } else { "live" })
-                        .await?;
-                    let tags = self.client.tags(&name).await?;
-                    ensure!(
-                        tags.contains(&identity),
-                        "Kusto did not publish ingestion identity for {source}"
-                    );
-                    self.ingested.insert(name.clone(), tags);
+        for (table, inventory) in &snapshot.tables {
+            let name = external_name(pool, table)?;
+            columns(&inventory.schema)?;
+            if let Some(previous) = self.schemas.get(&name) {
+                ensure!(
+                    previous == &inventory.schema,
+                    "Delta schema changed for {name}; the external table must be redefined"
+                );
+            } else {
+                if self.client.mode == Mode::Local {
+                    self.client.expose(&name, &table_location(pool, table)?).await?;
                 }
-                append(
-                    &self.client.results.join("kusto-ingestions.jsonl"),
-                    &json!({
-                        "at_unix_ms":now_unix_millis(), "run_id":self.status.run_id,
-                        "pool":pool, "table":table, "delta_version":snapshot.version,
-                        "file":file, "identity":identity
-                    }),
-                )?;
+                self.schemas.insert(name.clone(), inventory.schema.clone());
             }
             if live.load(Ordering::Acquire)
                 && !self.status.live_tables.contains(&name)
-                && !self.ingested[&name].is_empty()
+                && !inventory.files.is_empty()
+                && self.client.count(&external_source(&name)?, "live-observation").await? > 0
+                && live.load(Ordering::Acquire)
             {
-                let rows = self
-                    .client
-                    .execute(&format!("{name} | count"), false, "live-observation")
-                    .await?;
-                if live.load(Ordering::Acquire)
-                    && rows
-                        .first()
-                        .and_then(|row| row.get("Count"))
-                        .and_then(Value::as_u64)
-                        .is_some_and(|count| count > 0)
-                {
-                    self.status.live_tables.insert(name.clone());
-                }
+                self.status.live_tables.insert(name.clone());
             }
             self.status.tables.insert(
-                name.clone(),
+                name,
                 TableProgress {
-                    version: snapshot.version,
-                    active_files: snapshot.files.len(),
-                    ingested_files: self.ingested[&name].len(),
+                    version: inventory.version,
+                    active_files: inventory.files.len(),
+                    ingested_files: inventory.files.len(),
                 },
             );
         }
         Ok(())
     }
 
-    async fn sync_roots(&mut self, direct: &Path, dataflow: &Path, live: &AtomicBool, all: bool) -> Result<()> {
+    /// Azure external tables are provisioned and rebound by infrastructure, possibly after load
+    /// starts: absent or not-yet-readable tables are pending, never a sticky degradation.
+    async fn observe_provisioned(&mut self, live: &AtomicBool) -> Result<()> {
+        let rows = self
+            .client
+            .execute(".show external tables | project TableName", true, "schema")
+            .await?;
+        for name in rows
+            .iter()
+            .filter_map(|row| row.get("TableName").and_then(Value::as_str))
+            .filter(|name| name.starts_with("direct_sqlserver_") || name.starts_with("dataflow_sqlserver_"))
+        {
+            if live.load(Ordering::Acquire)
+                && !self.status.live_tables.contains(name)
+                && self
+                    .client
+                    .count(&external_source(name)?, "live-observation")
+                    .await
+                    .is_ok_and(|rows| rows > 0)
+                && live.load(Ordering::Acquire)
+            {
+                self.status.live_tables.insert(name.to_owned());
+            }
+        }
+        Ok(())
+    }
+
+    async fn sync_roots(&mut self, direct: &Path, dataflow: &Path, live: &AtomicBool) -> Result<()> {
+        if self.client.mode == Mode::Azure {
+            return self.observe_provisioned(live).await;
+        }
         self.client.bootstrap().await?;
         for (pool, root) in [("direct", direct), ("dataflow", dataflow)] {
             let snapshot = delta_inspect::inventory(root).await?;
-            self.sync(pool, &snapshot, live, all).await?;
+            self.sync(pool, &snapshot, live).await?;
         }
         Ok(())
     }
@@ -540,12 +676,12 @@ impl LiveSync {
         let active = Arc::clone(&generating);
         let task = tokio::spawn(async move {
             let result = async {
-                let mut mirror = Mirror::new(&endpoint, &arguments.results, &run_id)?;
+                let mut exposure = Exposure::new(&endpoint, &arguments.results, &run_id)?;
                 while !stopped.is_cancelled() {
-                    let result = mirror
-                        .sync_roots(&arguments.direct_root, &arguments.dataflow_root, &active, false)
+                    let result = exposure
+                        .sync_roots(&arguments.direct_root, &arguments.dataflow_root, &active)
                         .await;
-                    mirror.persist(result.as_ref().err())?;
+                    exposure.persist(result.as_ref().err())?;
                     tokio::select! {
                         () = stopped.cancelled() => break,
                         () = tokio::time::sleep(POLL_INTERVAL) => {}
@@ -558,13 +694,13 @@ impl LiveSync {
                         arguments.quiver,
                     )
                     .await?;
-                    mirror
-                        .sync_roots(&arguments.direct_root, &arguments.dataflow_root, &active, true)
+                    exposure
+                        .sync_roots(&arguments.direct_root, &arguments.dataflow_root, &active)
                         .await
                 })
                 .await
                 .context("Kusto final catch-up timed out")?;
-                mirror.persist(final_sync.as_ref().err())?;
+                exposure.persist(final_sync.as_ref().err())?;
                 final_sync
             }
             .await;
@@ -585,6 +721,305 @@ impl LiveSync {
         self.stop.cancel();
         self.task.await.context("Kusto synchronization task failed")?
     }
+}
+
+/// One table's native `query_acceleration statistics` row; missing measurements stay `null`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct Acceleration {
+    hot_size: Option<u64>,
+    #[serde(rename = "LastUpdatedDateTime")]
+    last_updated: Option<String>,
+    #[serde(rename = "AccelerationPendingDataFilesCount")]
+    pending_files: Option<u64>,
+    #[serde(rename = "AccelerationPendingDataFilesSize")]
+    pending_bytes: Option<u64>,
+    #[serde(rename = "AccelerationCompletePercentage")]
+    complete_percent: Option<f64>,
+    /// Last refresh is newer than `now() - MaxAge`, so queries may use the cache.
+    eligible: bool,
+    /// Last refresh is not older than the captured Delta commit (or no reference exists).
+    fresh: bool,
+}
+
+/// v1 management responses encode `bool` columns as 0/1 while v2 queries use JSON booleans.
+fn flag(value: &Value) -> bool {
+    value.as_bool().unwrap_or_else(|| value.as_i64() == Some(1))
+}
+
+impl Acceleration {
+    fn from_row(row: &BTreeMap<String, Value>) -> Self {
+        Self {
+            hot_size: row.get("HotSize").and_then(number),
+            last_updated: row
+                .get("LastUpdatedDateTime")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            pending_files: row.get("PendingFiles").and_then(number),
+            pending_bytes: row.get("PendingBytes").and_then(number),
+            complete_percent: row.get("Complete").and_then(real),
+            eligible: row.get("Eligible").is_some_and(flag),
+            fresh: row.get("Fresh").is_some_and(flag),
+        }
+    }
+
+    /// Cache readiness referenced to the tested source generation, not to observation time: an
+    /// idle, already-current cache may legitimately keep a refresh time from before capture.
+    fn ready(&self) -> bool {
+        self.complete_percent.is_some_and(|percent| percent >= 100.0)
+            && self.pending_files == Some(0)
+            && self.eligible
+            && self.fresh
+    }
+}
+
+/// Health and source generation reported in `QueryAccelerationState`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct CacheState {
+    table_version: Option<u64>,
+    is_healthy: Option<bool>,
+    row_count: Option<u64>,
+    accelerated_row_count: Option<u64>,
+    not_healthy_reason: Option<String>,
+}
+
+impl CacheState {
+    fn from_details(details: &Value) -> Self {
+        let state = &details["QueryAccelerationState"];
+        Self {
+            table_version: state.get("TableVersion").and_then(Value::as_u64),
+            is_healthy: state.get("IsHealthy").and_then(Value::as_bool),
+            row_count: state.get("RowCount").and_then(Value::as_u64),
+            accelerated_row_count: state.get("AcceleratedRowCount").and_then(Value::as_u64),
+            not_healthy_reason: state
+                .get("NotHealthyReason")
+                .and_then(Value::as_str)
+                .filter(|reason| !reason.is_empty())
+                .map(str::to_owned),
+        }
+    }
+
+    /// The cache has accelerated exactly the captured Delta version and all of its rows.
+    fn current(&self, version: u64, rows: u64) -> bool {
+        self.table_version == Some(version) && self.is_healthy == Some(true) && self.accelerated_row_count == Some(rows)
+    }
+}
+
+/// Row-count and order-independent hash per oracle sample bucket (bucket 0 = unmatched rows).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct Multiset {
+    buckets: BTreeMap<u64, (u64, i64)>,
+}
+
+impl Multiset {
+    fn rows(&self) -> u64 {
+        self.buckets.values().map(|(count, _)| count).sum()
+    }
+
+    fn unmatched(&self) -> u64 {
+        self.buckets.get(&0).map_or(0, |(count, _)| *count)
+    }
+
+    fn hash(&self) -> i64 {
+        self.buckets
+            .values()
+            .fold(0_i64, |total, (_, hash)| total.wrapping_add(*hash))
+    }
+
+    /// Compares bucket counts against the independent Delta oracle.
+    fn check(&self, expected_rows: u64, samples: &[(Value, u64)]) -> Result<()> {
+        ensure!(
+            self.rows() == expected_rows,
+            "Kusto returned {} rows, Delta snapshot has {expected_rows}",
+            self.rows()
+        );
+        ensure!(
+            self.unmatched() == 0,
+            "{} Kusto rows match no Delta row",
+            self.unmatched()
+        );
+        for (index, (_, expected)) in samples.iter().enumerate() {
+            let actual = self.buckets.get(&(index as u64 + 1)).map_or(0, |(count, _)| *count);
+            ensure!(
+                actual == *expected,
+                "Delta row {index} appears {actual} times in Kusto, expected {expected}"
+            );
+        }
+        Ok(())
+    }
+
+    fn evidence(&self) -> Value {
+        json!({"rows": self.rows(), "unmatched": self.unmatched(), "multiset_hash": self.hash()})
+    }
+}
+
+fn local_policy() -> Value {
+    json!({"IsEnabled": true, "Hot": LOCAL_HOT_WINDOW, "MaxAge": LOCAL_MAX_AGE})
+}
+
+fn acceleration_command(name: &str, max_age: &str, commit_ms: Option<u64>) -> Result<String> {
+    identifier(name)?;
+    timespan(max_age)?;
+    let fresh = commit_ms.map_or_else(
+        || "true".to_owned(),
+        |millis| format!("LastUpdatedDateTime >= unixtime_milliseconds_todatetime({millis})"),
+    );
+    Ok(format!(
+        ".show external tables operations query_acceleration statistics \
+         | where ExternalTableName == {} \
+         | extend Eligible = LastUpdatedDateTime > now() - totimespan({}), Fresh = {fresh} \
+         | project HotSize = tolong(HotSize), LastUpdatedDateTime, \
+           PendingFiles = tolong(AccelerationPendingDataFilesCount), \
+           PendingBytes = tolong(column_ifexists('AccelerationPendingDataFilesSize', long(null))), \
+           Complete = todouble(AccelerationCompletePercentage), Eligible, Fresh",
+        literal(name)?,
+        literal(max_age)?
+    ))
+}
+
+fn timespan(value: &str) -> Result<Duration> {
+    let (days, clock) = match value.split_once('.') {
+        Some((days, clock)) if clock.contains(':') => (days.parse::<u64>()?, clock),
+        _ => (0, value),
+    };
+    let parts = clock.split(':').collect::<Vec<_>>();
+    ensure!(parts.len() == 3, "invalid Kusto timespan {value:?}");
+    let seconds = parts[2].split('.').next().unwrap_or_default();
+    let total =
+        days * 86_400 + parts[0].parse::<u64>()? * 3_600 + parts[1].parse::<u64>()? * 60 + seconds.parse::<u64>()?;
+    Ok(Duration::from_secs(total))
+}
+
+fn external_source(name: &str) -> Result<String> {
+    identifier(name)?;
+    Ok(format!("external_table({})", literal(name)?))
+}
+
+fn fallback_source(name: &str) -> Result<String> {
+    identifier(name)?;
+    Ok(format!("external_table({}, timespan(1s))", literal(name)?))
+}
+
+fn multiset_query(source: &str, schema: &Value, samples: &[(Value, u64)]) -> Result<String> {
+    ensure!(!samples.is_empty(), "Delta oracle produced no rows");
+    let cases = samples
+        .iter()
+        .enumerate()
+        .map(|(index, (row, _))| {
+            Ok(format!(
+                "coalesce(({}), false), {}",
+                payload_predicate(schema, row)?,
+                index + 1
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?
+        .join(", ");
+    Ok(format!(
+        "{source} | extend Sample = tolong(case({cases}, 0)) \
+         | summarize Rows = count(), Hash = sum(hash(tostring(pack_all())) % 1000000007) by Sample"
+    ))
+}
+
+fn number(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| {
+            value
+                .as_f64()
+                .filter(|value| value.fract() == 0.0 && *value >= 0.0)
+                .map(|value| value as u64)
+        })
+        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+}
+
+fn real(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+}
+
+fn json_value(value: &Value) -> Value {
+    value
+        .as_str()
+        .and_then(|text| serde_json::from_str(text).ok())
+        .unwrap_or_else(|| value.clone())
+}
+
+/// Drops locations, connection strings, and credentials from QAP observations.
+fn sanitize(value: &Value) -> Value {
+    const SENSITIVE: [&str; 11] = [
+        "path",
+        "uri",
+        "url",
+        "connection",
+        "location",
+        "secret",
+        "token",
+        "signature",
+        "password",
+        "cachedtable",
+        "catalogtable",
+    ];
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .filter(|(key, _)| {
+                    let key = key.to_ascii_lowercase();
+                    !SENSITIVE.iter().any(|word| key.contains(word))
+                })
+                .map(|(key, value)| (key.clone(), sanitize(value)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(sanitize).collect()),
+        Value::String(text) => {
+            let parsed = json_value(value);
+            if parsed.is_object() || parsed.is_array() {
+                sanitize(&parsed)
+            } else if text.contains("://") || text.starts_with('/') || text.contains("@'") || text.contains("sig=") {
+                json!("[redacted]")
+            } else {
+                value.clone()
+            }
+        }
+        other => other.clone(),
+    }
+}
+
+fn short_error(error: &anyhow::Error) -> String {
+    sanitize(&json!(format!("{error:#}")))
+        .as_str()
+        .unwrap_or("[redacted]")
+        .chars()
+        .take(512)
+        .collect()
+}
+
+fn cache_timeout() -> Result<Duration> {
+    std::env::var("LOADTEST_KUSTO_CACHE_TIMEOUT").map_or(Ok(DEFAULT_CACHE_TIMEOUT), |value| {
+        value
+            .parse::<crate::cli::DurationArg>()
+            .map(crate::cli::DurationArg::get)
+            .map_err(|_| anyhow::anyhow!("invalid LOADTEST_KUSTO_CACHE_TIMEOUT"))
+    })
+}
+
+/// Commit time of the captured Delta version: the generation the cache must have refreshed past.
+fn commit_millis(root: &Path, identity: &str, version: u64) -> Option<u64> {
+    // Cloud commits are bounded by the cache's exact TableVersion instead.
+    cloud_root(root).is_none().then_some(())?;
+    let file = root
+        .join(identity.replace('.', "/"))
+        .join("_delta_log")
+        .join(format!("{version:020}.json"));
+    let text = fs::read_to_string(&file).ok()?;
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find_map(|action| action["commitInfo"]["timestamp"].as_u64())
+        .or_else(|| {
+            let modified = fs::metadata(&file).ok()?.modified().ok()?;
+            u64::try_from(modified.duration_since(UNIX_EPOCH).ok()?.as_millis()).ok()
+        })
 }
 
 pub(crate) async fn settle_dataflow(endpoints: &[String], timeout: Duration, quiver: bool) -> Result<()> {
@@ -669,6 +1104,29 @@ impl ReplayQuiescence {
     }
 }
 
+/// Azure oracle roots are credential-free `abfss://` URLs read by the independent cloud reader.
+fn cloud_root(root: &Path) -> Option<&str> {
+    root.to_str().filter(|root| root.starts_with("abfss://"))
+}
+
+async fn frozen(root: &Path, snapshot: &SnapshotSummary) -> Result<bool> {
+    let current = if let Some(cloud) = cloud_root(root) {
+        let identities: Vec<String> = snapshot.tables.keys().cloned().collect();
+        captured_inventory(&delta_inspect::summarize_cloud(cloud, &identities).await?)
+    } else {
+        delta_inspect::inventory(root).await?
+    };
+    Ok(current == captured_inventory(snapshot))
+}
+
+async fn corpus(root: &Path, table: &str, summary: &TableSummary) -> Result<Vec<(Value, u64)>> {
+    if let Some(cloud) = cloud_root(root) {
+        delta_inspect::cloud_sample_rows(cloud, table, summary).await
+    } else {
+        delta_inspect::sample_rows(root, table, summary)
+    }
+}
+
 fn captured_inventory(snapshot: &SnapshotSummary) -> SnapshotInventory {
     SnapshotInventory {
         tables: snapshot
@@ -718,6 +1176,19 @@ fn payload_predicate(schema: &Value, sample: &Value) -> Result<String> {
         .map(|values| values.join(" and "))
 }
 
+/// Per-table oracle and evidence prepared before the bounded cache wait.
+struct TableCheck {
+    name: String,
+    table: String,
+    pool: &'static str,
+    summary: TableSummary,
+    samples: Vec<(Value, u64)>,
+    commit_ms: Option<u64>,
+    max_age: String,
+    policy: Value,
+    fallback: Multiset,
+}
+
 pub(crate) async fn validate(
     endpoint: &str,
     results: &Path,
@@ -726,105 +1197,168 @@ pub(crate) async fn validate(
     direct: &SnapshotSummary,
     dataflow: &SnapshotSummary,
 ) -> Result<Value> {
-    let mut status: MirrorStatus = serde_json::from_slice(&fs::read(results.join(STATUS))?)?;
+    let mut status: ExposureStatus = serde_json::from_slice(&fs::read(results.join(STATUS))?)?;
     let metadata: Value = serde_json::from_slice(&fs::read(results.join("run-metadata.json"))?)?;
     ensure!(
         metadata["run_id"].as_str() == Some(&status.run_id),
         "Kusto evidence belongs to another run"
     );
-    let mut mirror = Mirror::new(endpoint, results, &status.run_id)?;
-    let live = AtomicBool::new(false);
-    mirror.client.bootstrap().await?;
-    let mut evidence = BTreeMap::new();
+    let client = KustoClient::new(endpoint, results)?;
+    client.bootstrap().await?;
+    let mut checks = Vec::new();
     for (pool, root, snapshot) in [("direct", direct_root, direct), ("dataflow", dataflow_root, dataflow)] {
         ensure!(
-            snapshot.tables.len() == 13,
-            "{pool} Kusto validation requires all 13 tables"
+            snapshot.tables.len() == TABLES_PER_POOL,
+            "{pool} Kusto validation requires all {TABLES_PER_POOL} tables"
         );
-        let selected = captured_inventory(snapshot);
         ensure!(
-            delta_inspect::inventory(root).await? == selected,
+            frozen(root, snapshot).await?,
             "{pool} changed after the validation snapshot was captured"
         );
-        mirror.sync(pool, &selected, &live, true).await?;
         for (table, summary) in &snapshot.tables {
-            let name = table_name(pool, table)?;
+            let name = external_name(pool, table)?;
+            ensure!(summary.rows > 0, "expected a nonempty Delta snapshot for {name}");
             ensure!(
-                summary.rows > 0 && summary.row_hashes.len() == 1,
-                "expected one nonempty deterministic corpus for {name}"
+                client.schema(&name).await? == columns(&summary.schema)?,
+                "Kusto external table schema differs from Delta for {name}"
             );
-            ensure!(
-                mirror.client.schema(&name).await? == columns(&summary.schema)?,
-                "Kusto schema changed for {name}"
-            );
-            let sample = delta_inspect::sample_row(root, table, summary)?;
-            let predicate = payload_predicate(&summary.schema, &sample)?;
-            let query =
-                format!("{name} | summarize Rows=count(), Invalid=countif(not(coalesce(({predicate}), false)))");
-            let rows = mirror.client.execute(&query, false, "validation").await?;
-            let row = rows.first().context("Kusto validation result missing")?;
-            ensure!(
-                row.get("Rows").and_then(Value::as_u64) == Some(summary.rows),
-                "Kusto row count differs from captured {pool} snapshot for {table}: {row:?}"
-            );
-            ensure!(
-                row.get("Invalid").and_then(Value::as_u64) == Some(0),
-                "Kusto payload differs from Delta for {table}: {row:?}"
-            );
-            let file = summary.files.first().context("snapshot has no replay file")?;
-            mirror
-                .client
-                .ingest(
-                    &name,
-                    &container_file(pool, table, &file.path)?,
-                    &file_identity(&status.run_id, pool, table, &file.path),
-                    "replay",
-                )
+            let samples = corpus(root, table, summary).await?;
+            let fallback = client
+                .multiset(&fallback_source(&name)?, &summary.schema, &samples)
                 .await?;
-            let replay = mirror
-                .client
-                .execute(&format!("{name} | count"), false, "replay")
-                .await?;
-            ensure!(
-                replay.first().and_then(|row| row.get("Count")).and_then(Value::as_u64) == Some(summary.rows),
-                "Kusto replay changed row count for {name}"
-            );
-            evidence.insert(
+            fallback
+                .check(summary.rows, &samples)
+                .with_context(|| format!("non-accelerated fallback differs from Delta for {name}"))?;
+            let (policy, max_age) = client.max_age(&name).await?;
+            checks.push(TableCheck {
                 name,
-                json!({
-                    "delta_version":summary.version, "active_files":summary.active_files,
-                    "expected_rows":summary.rows, "actual":row, "replay_unchanged":true
-                }),
-            );
+                table: table.clone(),
+                pool,
+                summary: summary.clone(),
+                samples,
+                commit_ms: commit_millis(root, table, summary.version),
+                max_age,
+                policy,
+                fallback,
+            });
         }
-        mirror.sync(pool, &selected, &live, true).await?;
+    }
+    let deadline = Instant::now() + cache_timeout()?;
+    let started = Instant::now();
+    let mut cached: BTreeMap<String, Value> = BTreeMap::new();
+    let mut attempts: BTreeMap<String, u64> = BTreeMap::new();
+    let mut last_failure: BTreeMap<String, String> = BTreeMap::new();
+    while cached.len() < checks.len() {
+        for check in &checks {
+            if cached.contains_key(&check.name) {
+                continue;
+            }
+            let before = client
+                .acceleration(&check.name, &check.max_age, check.commit_ms)
+                .await?;
+            let state = CacheState::from_details(&client.details(&check.name).await);
+            if !before.ready() || !state.current(check.summary.version, check.summary.rows) {
+                last_failure.insert(check.name.clone(), format!("cache not ready: {before:?} {state:?}"));
+                continue;
+            }
+            *attempts.entry(check.name.clone()).or_default() += 1;
+            let result = client
+                .multiset(&external_source(&check.name)?, &check.summary.schema, &check.samples)
+                .await?;
+            let after = client
+                .acceleration(&check.name, &check.max_age, check.commit_ms)
+                .await?;
+            // A stale-but-ready-looking cache is retried until it converges or the deadline elapses.
+            let verdict = result.check(check.summary.rows, &check.samples).and_then(|()| {
+                ensure!(result == check.fallback, "cached multiset differs from fallback");
+                ensure!(after.ready(), "cache left ready state during the query: {after:?}");
+                Ok(())
+            });
+            match verdict {
+                Ok(()) => {
+                    cached.insert(
+                        check.name.clone(),
+                        json!({
+                            "query": external_source(&check.name)?,
+                            "result": result.evidence(),
+                            "attempts": attempts[&check.name],
+                            "converged_after_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                            "before": before, "after": after, "state": state,
+                        }),
+                    );
+                }
+                Err(error) => {
+                    last_failure.insert(check.name.clone(), format!("{error:#}"));
+                }
+            }
+        }
+        if cached.len() == checks.len() {
+            break;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "accelerated cache did not converge to the captured Delta snapshot: {:?}",
+            last_failure
+                .iter()
+                .filter(|(name, _)| !cached.contains_key(*name))
+                .collect::<BTreeMap<_, _>>()
+        );
+        tokio::time::sleep(CACHE_POLL_INTERVAL).await;
+    }
+    let mut evidence = BTreeMap::new();
+    for check in &checks {
+        let statistics = client
+            .acceleration(&check.name, &check.max_age, check.commit_ms)
+            .await?;
+        evidence.insert(
+            identifier(&check.name)?,
+            json!({
+                "pool": check.pool, "table": check.table,
+                "delta_version": check.summary.version, "active_files": check.summary.active_files,
+                "partition_columns": check.summary.partition_columns,
+                "commit_unix_ms": check.commit_ms,
+                "expected_rows": check.summary.rows, "distinct_rows": check.samples.len(),
+                "actual": {"Rows": check.fallback.rows(), "Invalid": check.fallback.unmatched()},
+                "fallback": {"query": fallback_source(&check.name)?, "result": check.fallback.evidence()},
+                "cached": cached[&check.name],
+                "qap": {
+                    "policy": check.policy,
+                    "statistics": statistics,
+                    "details": client.details(&check.name).await,
+                },
+            }),
+        );
     }
     ensure!(
-        status.live_observed && status.live_tables.len() == 26,
-        "all 26 Kusto tables were not observed while generation was active"
+        status.live_observed && status.live_tables.len() == 2 * TABLES_PER_POOL,
+        "all {} Kusto tables were not observed while generation was active",
+        2 * TABLES_PER_POOL
     );
     status.state = "healthy".to_owned();
+    status.backend = BACKEND.to_owned();
     status.error = None;
-    status.tables = mirror.status.tables;
-    status.files_ingested = mirror.ingested.values().map(BTreeSet::len).sum();
     write_json(&results.join(STATUS), &status)?;
-    Ok(json!({"passed":true, "run_id":status.run_id, "live_observed":true, "tables":evidence}))
+    Ok(json!({
+        "passed": true, "run_id": status.run_id, "backend": BACKEND, "mode": client.mode,
+        "live_observed": true, "capacity": client.capacity().await, "tables": evidence
+    }))
 }
 
 pub(crate) fn validation_failure(results: &Path, error: &anyhow::Error) -> Result<Value> {
-    let report = json!({"passed":false, "error":format!("{error:#}")});
+    let report = json!({"passed":false, "backend": BACKEND, "error":format!("{error:#}")});
     write_json(&results.join("kusto-validation.json"), &report)?;
     Ok(report)
 }
 
 pub(crate) fn degraded(results: &Path, run_id: &str, error: &anyhow::Error) -> Result<()> {
     let path = results.join(STATUS);
-    let mut status: MirrorStatus = if path.exists() {
+    let mut status: ExposureStatus = if path.exists() {
         serde_json::from_slice(&fs::read(&path)?)?
     } else {
-        MirrorStatus {
+        ExposureStatus {
             run_id: run_id.to_owned(),
-            ..MirrorStatus::default()
+            backend: BACKEND.to_owned(),
+            ..ExposureStatus::default()
         }
     };
     status.state = "degraded".to_owned();
@@ -840,7 +1374,7 @@ pub(crate) fn write_validation(results: &Path, report: &Value) -> Result<()> {
 mod tests {
     use super::*;
     use std::{
-        io::{Read, Write},
+        io::Read,
         net::{TcpListener, TcpStream},
         sync::atomic::{AtomicU64, AtomicUsize},
         thread,
@@ -957,6 +1491,19 @@ mod tests {
             ]))
             .is_err()
         );
+        assert!(
+            decode_response(&json!([
+                {"FrameType":"DataTable","TableKind":"PrimaryResult","Columns":[{"ColumnName":"Rows"}],"Rows":[[7]]},
+                {"FrameType":"DataSetCompletion","HasErrors":false,"OneApiErrors":[{"code":"LimitsExceeded"}]}
+            ]))
+            .is_err()
+        );
+        let mut partial = response(&["Rows"], vec![json!([7])]);
+        partial["Exceptions"] = json!(["Query execution has exceeded the allowed limits"]);
+        assert!(
+            decode_response(&partial).is_err(),
+            "v1 HTTP 200 exceptions must fail closed"
+        );
         assert!(decode_response(&response(&["Severity"], vec![json!([2])])).is_err());
         assert!(decode_response(&response(&["Rows"], vec![json!([1, 2])])).is_err());
         let parsed = decode_response(&json!([
@@ -995,13 +1542,150 @@ mod tests {
         assert!(predicate.contains("a\\\"b\\\\c"));
         assert!(columns(&json!({"fields":[{"name":"bad","type":"binary"}]})).is_err());
         assert!(identifier("x'); .drop database loadtest").is_err());
-        assert!(table_name("direct", "unexpected.sqlserver.sqlserver_wait_stats").is_err());
-        assert!(container_file("direct", "telemetry.sqlserver.sqlserver_wait_stats", "../outside").is_err());
-        assert!(container_file("direct", "telemetry.sqlserver.sqlserver_wait_stats", "/outside").is_err());
-        assert_ne!(
-            file_identity("a", "direct", "t", "f"),
-            file_identity("b", "direct", "t", "f")
+        assert!(external_name("direct", "unexpected.sqlserver.sqlserver_wait_stats").is_err());
+        assert!(table_location("direct", "telemetry.sqlserver.sqlserver_wait_stats/../x").is_err());
+        assert_eq!(
+            table_location("dataflow", "telemetry.sqlserver.sqlserver_wait_stats")?,
+            "/delta/dataflow/telemetry/sqlserver/sqlserver_wait_stats"
         );
+        assert_eq!(
+            fallback_source("direct_sqlserver_wait_stats")?,
+            "external_table(\"direct_sqlserver_wait_stats\", timespan(1s))"
+        );
+        assert!(external_source("x\") | take 1; //").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn multiset_requires_exact_oracle_counts_and_no_unmatched_rows() -> Result<()> {
+        let samples = vec![(json!({"id":1}), 2), (json!({"id":2}), 1)];
+        let exact = Multiset {
+            buckets: BTreeMap::from([(1, (2, 10)), (2, (1, -3))]),
+        };
+        exact.check(3, &samples)?;
+        assert_eq!(exact.hash(), 7);
+        let stale = Multiset {
+            buckets: BTreeMap::from([(1, (2, 10))]),
+        };
+        assert!(stale.check(3, &samples).is_err(), "removed rows must fail");
+        let extra = Multiset {
+            buckets: BTreeMap::from([(0, (1, 5)), (1, (2, 10)), (2, (1, -3))]),
+        };
+        assert!(extra.check(3, &samples).is_err(), "stale extra rows must fail");
+        assert!(extra.check(4, &samples).is_err());
+        let duplicated = Multiset {
+            buckets: BTreeMap::from([(1, (3, 10)), (2, (1, -3))]),
+        };
+        assert!(
+            duplicated.check(3, &samples).is_err(),
+            "reingested duplicates must fail"
+        );
+        let query = multiset_query(
+            "external_table(\"direct_x\", timespan(1s))",
+            &json!({"fields":[{"name":"id","type":"long"}]}),
+            &samples,
+        )?;
+        assert!(
+            query.contains("case(coalesce((['id'] == long(1)), false), 1, coalesce((['id'] == long(2)), false), 2, 0)")
+        );
+        assert!(multiset_query("t", &json!({"fields":[]}), &[]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn cache_readiness_is_referenced_to_the_captured_commit() -> Result<()> {
+        let ready = Acceleration {
+            hot_size: Some(10),
+            last_updated: Some("2026-01-01T00:00:00Z".to_owned()),
+            pending_files: Some(0),
+            pending_bytes: Some(0),
+            complete_percent: Some(100.0),
+            eligible: true,
+            fresh: true,
+        };
+        assert!(ready.ready());
+        for not_ready in [
+            Acceleration {
+                pending_files: Some(1),
+                ..ready.clone()
+            },
+            Acceleration {
+                complete_percent: Some(66.67),
+                ..ready.clone()
+            },
+            Acceleration {
+                eligible: false,
+                ..ready.clone()
+            },
+            Acceleration {
+                fresh: false,
+                ..ready.clone()
+            },
+            Acceleration::default(),
+        ] {
+            assert!(!not_ready.ready(), "{not_ready:?}");
+        }
+        // Freshness compares the refresh time with the Delta commit, so an idle table whose cache
+        // refreshed after its last commit but before snapshot capture remains ready.
+        let command = acceleration_command("direct_x", "00:01:00", Some(1_700_000_000_000))?;
+        assert!(command.contains("LastUpdatedDateTime >= unixtime_milliseconds_todatetime(1700000000000)"));
+        assert!(command.contains("LastUpdatedDateTime > now() - totimespan(\"00:01:00\")"));
+        assert!(acceleration_command("direct_x", "1m; .drop", None).is_err());
+        let details = json!({"QueryAccelerationState": {
+            "TableVersion": 4, "IsHealthy": true, "RowCount": 3, "AcceleratedRowCount": 3, "NotHealthyReason": ""
+        }});
+        let state = CacheState::from_details(&details);
+        assert!(state.current(4, 3));
+        assert!(flag(&json!(1)) && flag(&json!(true)) && !flag(&json!(0)) && !flag(&Value::Null));
+        assert!(!state.current(5, 3), "a cache of an older Delta version is not current");
+        assert!(!state.current(4, 4), "partially accelerated rows are not current");
+        assert!(!CacheState::from_details(&json!({})).current(4, 3));
+        assert_eq!(timespan("00:01:00")?, Duration::from_secs(60));
+        assert_eq!(timespan("1.00:00:00")?, Duration::from_secs(86_400));
+        assert_eq!(timespan("00:05:00.5000000")?, Duration::from_secs(300));
+        assert!(timespan("5m").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn qap_observations_are_sanitized() {
+        let observed = sanitize(&json!({
+            "IsEnabled": true, "MaxAge": "00:01:00", "CachedTableName": "$_cached_x",
+            "ConnectionStrings": ["abfss://c@a.dfs.core.windows.net/x;impersonate"],
+            "State": "{\"CompletePercentage\":100,\"DataPath\":\"/delta/direct/x\",\"Note\":\"h@'/delta'\"}",
+            "Nested": [{"Uri": "https://a?sig=secret", "HotSize": 7}]
+        }));
+        let text = observed.to_string();
+        assert!(
+            !text.contains("abfss") && !text.contains("/delta") && !text.contains("sig=") && !text.contains("$_cached"),
+            "{text}"
+        );
+        assert_eq!(observed["State"]["CompletePercentage"], 100);
+        assert_eq!(observed["Nested"][0]["HotSize"], 7);
+        assert_eq!(observed["MaxAge"], "00:01:00");
+    }
+
+    #[test]
+    fn azure_mode_requires_https_and_never_defines_tables() -> Result<()> {
+        let directory = Directory::new()?;
+        assert!(KustoClient::with_mode("http://cluster.kusto.windows.net", &directory.0, Mode::Azure, "db").is_err());
+        assert!(
+            KustoClient::with_mode(
+                "https://user:secret@cluster.kusto.windows.net",
+                &directory.0,
+                Mode::Azure,
+                "db"
+            )
+            .is_err()
+        );
+        assert!(
+            KustoClient::with_mode("https://cluster.kusto.windows.net", &directory.0, Mode::Azure, "bad db").is_err()
+        );
+        assert!(KustoClient::with_mode("https://localhost:8080", &directory.0, Mode::Local, DATABASE).is_err());
+        let client = KustoClient::with_mode("https://cluster.kusto.windows.net", &directory.0, Mode::Azure, "db")?;
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        assert!(runtime.block_on(client.expose("direct_x", "/delta/direct/x")).is_err());
+        assert!(runtime.block_on(client.bootstrap()).is_ok());
         Ok(())
     }
 
@@ -1047,79 +1731,64 @@ mod tests {
         assert!(replay.observe(true, vec![2, 0], at(18)));
     }
 
-    #[test]
-    fn extent_tags_support_the_emulators_newline_separated_strings() -> Result<()> {
-        let expected = BTreeSet::from(["one".to_owned(), "two".to_owned()]);
-        assert_eq!(
-            ingestion_tags(&json!("ingest-by:loadtest:one\r\ningest-by:loadtest:two"))?,
-            expected
-        );
-        assert_eq!(
-            ingestion_tags(&json!("[\"ingest-by:loadtest:one\",\"ingest-by:loadtest:two\"]"))?,
-            expected
-        );
-        assert!(ingestion_tags(&json!("")).is_ok_and(|tags| tags.is_empty()));
-        assert!(ingestion_tags(&json!("[invalid]")).is_err());
-        Ok(())
-    }
-
     #[tokio::test]
-    async fn lost_ingestion_response_is_reconciled_without_resending_and_removals_fail() -> Result<()> {
+    async fn committed_tables_are_exposed_once_and_source_changes_fail_explicitly() -> Result<()> {
         let directory = Directory::new()?;
-        let run_id = "run-test";
         let table = "telemetry.sqlserver.sqlserver_wait_stats";
-        let file = "part.parquet";
-        let identity = file_identity(run_id, "direct", table, file);
-        let calls = Arc::new(AtomicUsize::new(0));
-        let requests = Arc::clone(&calls);
+        let definitions = Arc::new(AtomicUsize::new(0));
+        let policies = Arc::new(AtomicUsize::new(0));
+        let (defined, altered) = (Arc::clone(&definitions), Arc::clone(&policies));
         let server = Server::start(move |request| {
             let command = request["csl"].as_str().context("command missing")?;
-            if command.contains("getschema") {
-                return Ok(Some(response(
-                    &["ColumnName", "ColumnType"],
-                    vec![json!(["id", "long"])],
-                )));
-            }
-            if command.starts_with(".ingest into") {
-                requests.fetch_add(1, Ordering::Relaxed);
-                return Ok(None);
-            }
-            if command.contains("extents") {
-                let ingested = requests.load(Ordering::Relaxed) != 0;
-                return Ok(Some(response(
-                    &["Tags"],
-                    if ingested {
-                        vec![json!([json!([format!("ingest-by:loadtest:{identity}")]).to_string()])]
-                    } else {
-                        vec![]
-                    },
-                )));
+            if command.starts_with(".create-or-alter external table") {
+                ensure!(command.contains("kind=delta (h@'/delta/direct/telemetry/sqlserver/sqlserver_wait_stats')"));
+                defined.fetch_add(1, Ordering::Relaxed);
+            } else if command.starts_with(".alter external table") {
+                ensure!(command.contains("query_acceleration") && command.contains("00:01:00"));
+                altered.fetch_add(1, Ordering::Relaxed);
+            } else if command.ends_with("| count") {
+                ensure!(command.starts_with("external_table(\"direct_sqlserver_wait_stats\")"));
+                return Ok(Some(response(&["Count"], vec![json!([3])])));
             }
             Ok(Some(response(&[], vec![])))
         })?;
-        let mut mirror = Mirror::new(&server.endpoint, &directory.0, run_id)?;
+        let client = KustoClient::with_mode(&server.endpoint, &directory.0, Mode::Local, DATABASE)?;
+        let mut exposure = Exposure {
+            client,
+            status: ExposureStatus::default(),
+            schemas: BTreeMap::new(),
+        };
         let snapshot = SnapshotInventory {
             tables: BTreeMap::from([(
                 table.to_owned(),
                 TableInventory {
                     schema: json!({"fields":[{"name":"id","type":"long"}]}),
                     version: 1,
-                    files: vec![file.to_owned()],
+                    files: vec!["part.parquet".to_owned()],
                 },
             )]),
         };
-        let live = AtomicBool::new(false);
-        assert!(mirror.sync("direct", &snapshot, &live, true).await.is_err());
-        mirror.sync("direct", &snapshot, &live, true).await?;
-        mirror.sync("direct", &snapshot, &live, true).await?;
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
-        assert_eq!(mirror.ingested.values().map(BTreeSet::len).sum::<usize>(), 1);
-        let mut removed = snapshot.clone();
-        removed.tables.get_mut(table).context("table")?.files.clear();
-        assert!(mirror.sync("direct", &removed, &live, true).await.is_err());
-        let mut changed = snapshot;
+        let live = AtomicBool::new(true);
+        exposure.sync("direct", &snapshot, &live).await?;
+        let mut optimized = snapshot.clone();
+        optimized.tables.get_mut(table).context("table")?.files = vec!["compacted.parquet".to_owned()];
+        optimized.tables.get_mut(table).context("table")?.version = 2;
+        exposure.sync("direct", &optimized, &live).await?;
+        assert_eq!(
+            definitions.load(Ordering::Relaxed),
+            1,
+            "file replacement needs no redefinition"
+        );
+        assert_eq!(policies.load(Ordering::Relaxed), 1);
+        assert!(exposure.status.live_tables.contains("direct_sqlserver_wait_stats"));
+        assert_eq!(exposure.status.tables["direct_sqlserver_wait_stats"].version, 2);
+        let mut changed = optimized.clone();
         changed.tables.get_mut(table).context("table")?.schema["fields"][0]["type"] = json!("string");
-        assert!(mirror.sync("direct", &changed, &live, true).await.is_err());
+        assert!(exposure.sync("direct", &changed, &live).await.is_err());
+        let removed = SnapshotInventory {
+            tables: BTreeMap::new(),
+        };
+        assert!(exposure.sync("direct", &removed, &live).await.is_err());
         Ok(())
     }
 
@@ -1145,11 +1814,69 @@ mod tests {
         };
         let sync = LiveSync::start(&arguments, "degraded-run").context("configured synchronization")?;
         assert!(sync.stop().await.is_err());
-        let status: MirrorStatus = serde_json::from_slice(&fs::read(directory.0.join(STATUS))?)?;
+        let status: ExposureStatus = serde_json::from_slice(&fs::read(directory.0.join(STATUS))?)?;
         assert_eq!(status.state, "degraded");
+        assert_eq!(status.backend, BACKEND);
         assert!(status.error.is_some());
         assert!(!status.live_observed);
-        assert!(KustoClient::new("http://user:password@localhost", &directory.0).is_err());
+        assert!(KustoClient::with_mode("http://user:secret@localhost/", &directory.0, Mode::Local, DATABASE).is_err());
+        Ok(())
+    }
+
+    /// Real-emulator check of every native validation step against a pool root mounted at
+    /// `/delta/direct`. `scripts/kusto-qap-it.sh` writes, mutates and VACUUMs the fixture.
+    #[tokio::test]
+    #[ignore = "requires KUSTO_IT_ENDPOINT and KUSTO_IT_ROOT (emulator mounting the root at /delta/direct)"]
+    async fn native_qap_converges_on_emulator() -> Result<()> {
+        let endpoint = std::env::var("KUSTO_IT_ENDPOINT")?;
+        let root = PathBuf::from(std::env::var("KUSTO_IT_ROOT")?);
+        let results = std::env::temp_dir().join(format!("kusto-it-{}", std::process::id()));
+        fs::create_dir_all(&results)?;
+        let client = KustoClient::new(&endpoint, &results)?;
+        client.bootstrap().await?;
+        let summary = delta_inspect::summarize(&root).await?;
+        ensure!(!summary.tables.is_empty(), "fixture has no Delta tables");
+        for (table, table_summary) in &summary.tables {
+            let name = external_name("direct", table)?;
+            if std::env::var_os("KUSTO_IT_EXPOSE").is_some() {
+                client.expose(&name, &table_location("direct", table)?).await?;
+            }
+            assert_eq!(client.schema(&name).await?, columns(&table_summary.schema)?);
+            let samples = delta_inspect::sample_rows(&root, table, table_summary)?;
+            let fallback = client
+                .multiset(&fallback_source(&name)?, &table_summary.schema, &samples)
+                .await?;
+            fallback.check(table_summary.rows, &samples)?;
+            let (_, max_age) = client.max_age(&name).await?;
+            let commit_ms = commit_millis(&root, table, table_summary.version);
+            let started = Instant::now();
+            loop {
+                let before = client.acceleration(&name, &max_age, commit_ms).await?;
+                let state = CacheState::from_details(&client.details(&name).await);
+                if before.ready() && state.current(table_summary.version, table_summary.rows) {
+                    let cached = client
+                        .multiset(&external_source(&name)?, &table_summary.schema, &samples)
+                        .await?;
+                    let verdict = cached.check(table_summary.rows, &samples);
+                    eprintln!(
+                        "{name} v{} rows {} +{}s ready {before:?} {state:?} cached={verdict:?} equal={}",
+                        table_summary.version,
+                        table_summary.rows,
+                        started.elapsed().as_secs(),
+                        cached == fallback
+                    );
+                    if verdict.is_ok() && cached == fallback {
+                        break;
+                    }
+                }
+                ensure!(
+                    started.elapsed() < Duration::from_secs(420),
+                    "{name} cache did not converge: {before:?} {state:?}"
+                );
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+        fs::remove_dir_all(&results)?;
         Ok(())
     }
 }
