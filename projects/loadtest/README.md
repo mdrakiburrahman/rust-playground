@@ -314,10 +314,10 @@ pass; local component tests do not establish Azure QAP behavior.
 
 Both collectors use two CPUs and matching buffer limits: 128 MiB overall,
 32 MiB per table, and 32 MiB per flush. SQL Server defaults to a 16 GiB memory
-budget. The Kusto container has a separate 4 GiB memory limit. Keep host memory
+budget. The Kusto container has a separate 6 GiB memory limit. Keep host memory
 available for the other services.
 
-The 4 GiB default is a container ceiling, not a measured safe working set.
+The 6 GiB default is a container ceiling, not a measured safe working set.
 Serial heavy-query admission does not reclaim the emulator's retained engine
 memory or bound other clients. Most other Compose services have **no container
 memory limit**; SQL Server's 16 GiB setting is an internal engine budget, not a
@@ -326,12 +326,15 @@ The public-repository E2E job uses `ubuntu-24.04`, whose standard runner has
 [16 GB RAM](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
 Do not size it as though each unbounded service consumes zero. A preserved
 functional development run reached 3.855 GiB of idle Kusto cgroup usage and
-nearly 4 GiB during serial validation. Its recorded simultaneous all-container
-working-set peak was 14.989 GiB, including 7.178 GiB in the development workspace.
-Adding 2 GiB for a proposed 6 GiB Kusto ceiling would exceed a 13 GiB workload
-budget on that runner. The proposed increase is therefore not applied. The
-benchmark-project-only peak was 7.811 GiB, but excluding the workspace requires
-separately accounting for the host validator; it is not a host-wide bound.
+nearly 4 GiB during serial validation. Its recorded simultaneous benchmark-project
+working-set peak was 7.811 GiB; adding 2 GiB for the 6 GiB Kusto ceiling gives
+9.811 GiB. CI has no development workspace container, so its 7.178 GiB residency
+is excluded from this workload sizing. This leaves approximately 6 GiB of the
+documented 16 GB runner RAM (5.09 GiB if interpreted as decimal GB) for the OS,
+Docker and host runner/validator. This measured sizing supports the 6 GiB
+default; it does not bound future growth in the other services or claim a
+qualification pass at the increased limit. `KUSTO_MEMORY_LIMIT` remains the
+explicit override.
 
 To change the SQL budget (in MiB):
 
