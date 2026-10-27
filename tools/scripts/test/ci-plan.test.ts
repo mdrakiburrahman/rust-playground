@@ -222,6 +222,18 @@ function workflow(name: string): Workflow {
   return parse(readFileSync(fileURLToPath(new URL(`../../../.github/workflows/${name}`, import.meta.url)), 'utf8')) as Workflow;
 }
 
+test('failed integration diagnostics exclude private raw logs at the actual uploader', () => {
+  const uploader = workflow('ci.yml').jobs.e2e?.steps?.find(step => step.with?.name === 'telemetry-e2e-diagnostics');
+  assert.ok(uploader);
+  assert.ok(uploader.uses?.startsWith('actions/upload-artifact@'));
+  const path = uploader.with?.path;
+  assert.ok(typeof path === 'string');
+  const patterns = path.split(/\r?\n/u).map(line => line.trim()).filter(Boolean);
+  assert.ok(patterns.includes('onelake/e2e/'));
+  assert.ok(patterns.includes('onelake/benchmark/latest/results/'));
+  assert.ok(patterns.includes('!**/*.private.log'), 'The real uploader must exclude private raw logs, not merely name them private');
+});
+
 test('workflow starts environment, Node checks, and image builds without unrelated barriers or concurrency caps', () => {
   const jobs = workflow('ci.yml').jobs;
   assert.equal(jobs.environment?.needs, undefined);

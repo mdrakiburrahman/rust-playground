@@ -242,6 +242,7 @@ jobs:
           path: |
             onelake/e2e/
             onelake/benchmark/latest/results/
+            !**/*.private.log
           if-no-files-found: ignore
           retention-days: 7
       - name: Preserve Kusto query and validation evidence
