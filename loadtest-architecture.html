@@ -27,7 +27,7 @@
     .edge { fill: none; stroke: #79d6fa; stroke-width: 2; marker-end: url(#arrow); }
     .maintenance { fill: none; stroke: #f3bd75; stroke-width: 2; marker-end: url(#amber); }
     .signal { fill: none; stroke: #bca8f7; stroke-width: 1.6; stroke-dasharray: 6 5; marker-end: url(#purple); }
-    .notes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; margin: 18px 4px; color: #b1bfd4; font-size: 12px; line-height: 1.55; }
+    .notes { display: grid; grid-template-columns: repeat(2, 1fr); gap: 18px; margin: 18px 4px; color: #b1bfd4; font-size: 12px; line-height: 1.55; }
     .notes strong { color: #ecf3ff; }
     footer { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px; color: #859bb9; font-size: 11px; }
     a { color: #9dc9e7; text-underline-offset: 3px; }
@@ -49,7 +49,7 @@
   <div class="canvas" tabindex="0" role="region" aria-label="Lakehouse loadtest architecture; scroll horizontally on small screens">
     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 1010" role="img" aria-labelledby="title description">
       <title id="title">ArrowCol lakehouse loadtest architecture</title>
-      <desc id="description">Thirteen multi-customer schemas generate paired Arrow traffic through a router to independent Direct and Dataflow collector pools. SQL Server and Hive own catalog and control metadata, not payloads. Optional Quiver persists pending Arrow. Delta Kernel publishes sorted, ingestion-time-partitioned Parquet to independent local or ADLS roots. Standalone maintenance optimizes, purges and vacuums safely. A historical tenant fork captures a snapshot then tails data changes into an independent sink with Spark-compatible recovery logs. Local Kusto uses native external Delta and QAP with asynchronous cache refresh; Azure Kusto uses managed identity, external Delta and query acceleration. An independent delta-rs oracle validates results. Metrics, logs and traces feed LGTM. Cloud performance and local functional evidence remain distinct.</desc>
+      <desc id="description">Thirteen multi-customer schemas generate paired Arrow traffic through a router to independent Direct and Dataflow collector pools. SQL Server and Hive own catalog and control metadata, not payloads. Optional Quiver persists pending Arrow. Delta Kernel publishes sorted, ingestion-time-partitioned Parquet to independent local or ADLS roots. Standalone maintenance plans and revalidates compaction, partition purge, retained-tombstone vacuum, checkpoints and guarded log pruning while preserving replay transactions. Azure mutators capture their reset generation before leased publisher admission and retain the original WAL generation. A historical tenant fork captures a snapshot then tails data changes into an independent sink with Spark-compatible recovery logs. Local Kusto uses native external Delta and QAP with asynchronous cache refresh; Azure Kusto uses managed identity, external Delta and query acceleration. An independent exact delta-rs oracle validates bounded disjoint partition chunks. Metrics, logs and traces feed LGTM, including a read-only QAP observer. Live plots precede clean mutator stop and immutable snapshot validation. Cloud performance and local functional evidence remain distinct.</desc>
       <defs>
         <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r=".7" fill="#24354c"/></pattern>
         <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 10 5 0 10Z" fill="#79d6fa"/></marker>
@@ -108,10 +108,10 @@
       <rect x="30" y="614" width="420" height="178" rx="12" class="box" style="stroke:#b89159"/>
       <text x="50" y="645" class="title">Standalone maintenance</text>
       <text x="50" y="672" class="body">Plan / revalidate / apply / no-op</text>
-      <text x="50" y="696" class="body">OPTIMIZE: real rewrite, dataChange=false</text>
-      <text x="50" y="720" class="body">PURGE: remove expired active partitions</text>
-      <text x="50" y="744" class="body">VACUUM LITE: retained tombstones only</text>
-      <text x="50" y="771" class="small">7-day floor / explicit isolated unsafe-test override</text>
+      <text x="50" y="696" class="body">OPTIMIZE dataChange=false / PURGE</text>
+      <text x="50" y="720" class="body">VACUUM LITE / Kernel checkpoints</text>
+      <text x="50" y="744" class="body">Guarded log prune / preserve replay txns</text>
+      <text x="50" y="771" class="small">7-day VACUUM floor / explicit safe-history guards</text>
       <path d="M60 614V570H110V554" class="maintenance"/>
       <rect x="490" y="614" width="420" height="178" rx="12" class="box" style="stroke:#5aaf8b"/>
       <text x="510" y="645" class="title">Historical tenant fork</text>
@@ -139,7 +139,7 @@
       <rect x="720" y="831" width="650" height="144" rx="12" class="box" style="stroke:#8171ad"/>
       <text x="740" y="862" class="title">LGTM / Grafana</text>
       <text x="740" y="889" class="body">Low-cardinality metrics / logs / traces / process resources</text>
-      <text x="740" y="913" class="body">Publication retries, maintenance, stream checkpoint/lag, native cache</text>
+      <text x="740" y="913" class="body">SDK versions / maintenance / tenant lag / read-only QAP observer</text>
       <text x="740" y="937" class="body">Separate Arrow Flight and optional OTEL baseline dashboards</text>
       <text x="740" y="959" class="small">Live signals, not dashboard JSON alone / stop Azure cluster after live tests</text>
     </svg>
@@ -147,7 +147,8 @@
   <div class="notes">
     <div><strong>Publication is not client deduplication.</strong> Stable transaction identities protect a retry of the same publication. Identical independent requests can both append. Existing Direct and Dataflow admission contracts still apply.</div>
     <div><strong>Two consumers, two meanings.</strong> A tenant fork retains historical copied rows. Native Kusto follows active Delta files after asynchronous refresh. Its 5-minute bounded gate compares cached, fallback and oracle multisets plus version/health/row details; cache statistics alone do not prove freshness.</div>
-    <div><strong>Evidence has a boundary.</strong> Local mode proves functional behavior, not Azure QAP performance. Missing required source history must fail visibly. Reset previews owned data; execution stays disabled until complete distributed publisher drain is enforced.</div>
+    <div><strong>Authority precedes Azure I/O.</strong> Each mutator pins its captured reset generation before publisher admission; WAL replay retains its original generation. Sink and checkpoint share the tenant session. Unknown physical outcomes retain blocking authority, without TTL expiry or a forced-release shortcut.</div>
+    <div><strong>Evidence has a boundary.</strong> Drain while admin endpoints are alive, inspect live plots, then cleanly stop mutators before immutable validation. Local mode is not Azure performance evidence. Missing required history fails visibly. Public reset remains preview-only pending live authority, drain and reset qualification.</div>
   </div>
   <footer>
     <span>Architecture view; consult qualification evidence for the tested revision and measured limitations.</span>

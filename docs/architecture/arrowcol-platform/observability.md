@@ -10,6 +10,7 @@ state. Receipt IDs and lease UUIDs are **not** metric labels.
 | Router | Decisions/failures, active streams, cached leases/events, maximum collector pressure |
 | Direct process | Streams, decoder bytes, received batches/rows/bytes, control failures, reconciled receipts, incomplete shutdown groups |
 | DFE | Channel occupancy, downstream Ack/Nack, pending commits, Delta files/rows/bytes/failures, delivery-guarantee truth |
+| Source collector SDK | Actual exported values for the seven-family [metric contract](../../../projects/loadtest/src/metric-contract.ts), SDK version, and separate Direct/DFE resources |
 | SQL receipts | State/count/rows/Arrow bytes, published totals, failures, creation-to-publication and flushing-to-publication latency |
 | SQL collectors/tables | Pressure, snapshot age, routing owner, lease age, time to expiry |
 | Native Quiver (Direct) | `arrowcol_direct_quiver_*`: disk used/capacity, backlog, persisted/published/rejected/deferred batches, batches recovered and receipts adopted after a restart, backpressure waits |
@@ -43,6 +44,24 @@ Dashboard definitions alone are not evidence of live service instrumentation.
 Qualification must record actual exported series and Grafana/query results
 against the tested source revision. Keep tenant IDs, file paths, receipt IDs,
 publication IDs, and checkpoint UUIDs out of metric labels.
+
+The read-only QAP observer uses its own private CLI cache and isolates every
+helper invocation's provenance directory. Missing numeric observations remain
+unavailable, not healthy-looking zeroes. Completeness and 45-second freshness
+checks precede native-state acceptance. SDK value/version panels and native QAP
+panels are separate, and each required panel must return actual query-range
+data, delivered Grafana frames, and an individual screenshot.
+
+Drain publications while admin endpoints are alive, inspect the live panels,
+then cleanly stop source, tenant and maintenance mutators before immutable
+snapshot/native validation. Keep Kusto, LGTM and Explorer available. A
+source-SDK baseline is not full-service qualification of tenant effects,
+maintenance or native QAP.
+
+Diagnostic cause chains are redacted before logs, receipt/send JSONL and
+byte-bound truncation. Redaction in a newer image does not retroactively
+qualify older raw runtime logs; preserve those privately rather than uploading
+them as sanitized evidence.
 
 Local Kusto is a functional integration surface, not a performance benchmark.
 Its asynchronous cache visibility is separate from Direct receipt publication.

@@ -57,6 +57,16 @@ independent oracle and uncached fallback. Record observed convergence separately
 from the bounded deadline; focused native-probe acceptance does not prove the
 integrated 13-schema workload or Explorer/stress acceptance.
 
+The exact corpus is packed into disjoint whole-partition chunks: at most 256
+distinct complete rows per chunk and 65,536 per captured table. A single
+oversized partition, an unsupported partition shape, or a changing capture
+fails explicitly; the oracle never samples or truncates rows to pass. Exact
+partition and total counts include duplicate multiplicities and reject
+unexpected rows. The cached phase has one global five-minute deadline across
+all tables and chunks; fallback validation is a separate phase. The focused
+all-13 native type harness uses sequential per-table waits, so its completion
+time is not proof of that production global budget.
+
 Native Kusto follows the current active snapshot after asynchronous refresh,
 including OPTIMIZE replacements and partition removals. A tenant fork has
 intentionally different semantics: capture a snapshot, tail logical appends,
@@ -67,6 +77,17 @@ rewrites real files with `dataChange=false`; PURGE removes existing expired
 partitions; VACUUM LITE uses retained tombstones and keeps the ordinary seven-day
 safety floor. Physical retention bounds recovery: missing required source history
 or files must fail visibly rather than advancing a consumer checkpoint.
+Kernel checkpoints preserve active state and publication/query transaction IDs.
+Optional log pruning additionally requires a proven checkpoint, durable vacuum
+progress, eligible retained history and a durable floor; it does not make
+expired source history available to a lagging consumer. No whole-storage byte
+plateau follows merely from configuring checkpoint cadence.
+
+Azure mutators capture `ARROWCOL_RESET_GENERATION` before leased publisher
+admission and owned data, log or checkpoint I/O. Original WAL generations remain bound across restart;
+the tenant sink and checkpoint share one process session. Explicit close follows
+drain, and uncertain physical outcomes retain their blocking registration.
+Bootstrap has its separate `ARROWCOL_EXPECTED_RESET_GENERATION` precondition.
 
 ## Operations and qualification
 
@@ -92,6 +113,13 @@ reader is a validation oracle, not the production transaction writer.
 Metrics, logs, and traces feed LGTM/Grafana. Maintenance, stream/checkpoint, native QAP,
 and publication signals must be observed live, not inferred from dashboard JSON.
 Keep the optional OTEL baseline separate from Arrow Flight panels.
+The lifecycle drains publications while admin endpoints are alive, captures
+actual panel query ranges, returned frames and screenshots, then cleanly stops
+the source, tenant and maintenance mutators before immutable Delta/native
+validation. Kusto, LGTM and Explorer remain available. Run- and
+generation-bound receipts are evidence, not proof that an unknown operation
+has completed. The source-SDK baseline scope is distinct from full-service
+qualification of maintenance, tenant effects and native QAP.
 
 Azure configuration remains in a gitignored private `.env`; do not commit
 subscription/resource values or credentials into diagrams, screenshots, logs,
