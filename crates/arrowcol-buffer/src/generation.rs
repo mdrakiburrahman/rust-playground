@@ -35,6 +35,10 @@ impl CloudGeneration {
             std::env::var("ARROWCOL_RESET_GENERATION").context("cloud admission requires ARROWCOL_RESET_GENERATION")?;
         uuid::Uuid::parse_str(&configured).context("ARROWCOL_RESET_GENERATION must be a UUID")?;
         let authority = arrow_deltalake::delta::StorageAuthority::open(&url)?;
+        authority
+            .session()
+            .context("cloud authority has no publisher session")?
+            .require_generation(&configured)?;
         authority.check()?;
         ensure!(
             authority.generation() == Some(configured.as_str()),
@@ -96,6 +100,27 @@ impl CloudGeneration {
         format!("{key}|cloud={}", self.generation)
     }
 
+    /// Checks the original durable epoch against this process's admitted session.
+    ///
+    /// # Errors
+    /// Refuses missing/unknown admission and malformed or mismatched persisted epochs.
+    pub async fn require_persisted_generation(&self, persisted: &str) -> Result<()> {
+        let url = url::Url::parse(&self.root).context("invalid captured Delta root URI")?;
+        let session = arrow_deltalake::publisher::PublisherSession::shared_for_url_async(&url).await?;
+        session.require_generation(persisted)
+    }
+
+    /// Reads the epoch from the existing fsynced spool marker, not from current env.
+    ///
+    /// # Errors
+    /// Refuses missing, invalid, or stale markers rather than inventing an epoch.
+    pub fn persisted_directory_generation(&self, directory: &Path) -> Result<String> {
+        let bytes = std::fs::read(directory.join(".arrowcol-cloud-generation.json"))?;
+        self.validate_marker(&bytes)?;
+        let persisted: Self = serde_json::from_slice(&bytes)?;
+        Ok(persisted.generation)
+    }
+
     /// Refuses stale or unbound WAL before opening the durable engine.
     ///
     /// The immutable marker is fsynced before admission. Existing unbound backlog
@@ -153,6 +178,7 @@ mod tests {
             ..g1.clone()
         };
         g1.bind_durable_directory(directory.path())?;
+        assert_eq!(g1.persisted_directory_generation(directory.path())?, g1.generation());
         std::fs::write(directory.path().join("wal"), b"generation-one-receipt")?;
         g1.bind_durable_directory(directory.path())?;
         assert_ne!(g1.bind_instance_key("collector"), g2.bind_instance_key("collector"));

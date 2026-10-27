@@ -303,6 +303,17 @@ impl DeltaBackend {
             instance_id: self.metrics.instance_id(),
             instance_key: self.metrics.instance_key(),
         };
+        if let Some(generation) = arrowcol_buffer::CloudGeneration::process() {
+            let (_, persisted) = decoded.envelope.instance_key.rsplit_once("|cloud=").ok_or_else(|| {
+                ExportFailure::Transient(
+                    "cloud durable batch has no persisted generation; reconciliation required".to_owned(),
+                )
+            })?;
+            generation
+                .require_persisted_generation(persisted)
+                .await
+                .map_err(|error| ExportFailure::Transient(error.to_string()))?;
+        }
         if decoded.envelope.holder_instance_id != process.instance_id {
             self.metrics.replayed_batch();
         }

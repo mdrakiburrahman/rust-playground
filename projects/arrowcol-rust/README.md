@@ -11,6 +11,11 @@ deployment key and an immutable marker in the Quiver directory before recovery
 or admission. A G1 spool cannot be opened under G2, even at the same URI; old
 unbound cloud backlog needs explicit operator reconciliation. Same-generation
 crash replay retains its original receipt UUID and ingestion timestamp.
+`DeliveryManifest` has no per-receipt generation field: the original cloud epoch
+is persisted in the fsynced `.arrowcol-cloud-generation.json` spool marker and
+durable instance key. Before Quiver recovery the marker's original epoch is
+checked with `PublisherSession::require_generation`; missing/unbound legacy
+backlog is refused, never assigned the current environment's epoch.
 
 Both collectors install a global OTel meter provider before Delta initialization.
 OTLP metrics use standard `OTEL_EXPORTER_OTLP_ENDPOINT` and
@@ -177,6 +182,10 @@ After a clean drain returns and table handles are dropped, the process closes
 its shared publisher sessions once. Close failure is logged and exits nonzero,
 leaving the failed registry member registered; it is never retried or silently
 unregistered. An incomplete drain does not close publisher sessions.
+Both images forward runtime `ARROWCOL_DELTA_ROOT` and
+`ARROWCOL_RESET_GENERATION` unchanged through Tini; no generation is baked in.
+Their build smoke runs `az version` and the real collector `--help` as UID10001,
+then empties the writable0700 CLI config directory before the final layer.
 
 Validate without opening sockets or dependencies:
 

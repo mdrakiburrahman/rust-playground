@@ -63,6 +63,8 @@ pub async fn run(mut config: CollectorConfig) -> Result<RunOutcome> {
         config.validate()?;
         if let Some(stage) = config.buffer.native_quiver.stage_config()? {
             generation.bind_durable_directory(&stage.directory)?;
+            let persisted = generation.persisted_directory_generation(&stage.directory)?;
+            generation.require_persisted_generation(&persisted).await?;
         }
     }
     let instance_id = config.instance_id();

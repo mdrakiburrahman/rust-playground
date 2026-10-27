@@ -7,6 +7,11 @@ publication app ID. A stale key is a retryable reconciliation diagnostic before
 any current-lease fast path or lease rebinding; Quiver retains it, never ACKs or
 relabels it under the new epoch. Reset execution remains separately disabled
 until all publisher/reader barriers are proven.
+The native WAL persists its original generation in the envelope's
+`instance_key` suffix. Each cloud replay calls
+`PublisherSession::require_generation` on that original suffix before lease
+adoption or writer creation; missing or mismatched epochs receive a transient
+NACK without relabeling or dropping the payload.
 
 The collector installs SDK0.31 OTLP metrics before Delta initialization. The DFE
 embedding hooks preserve an unfiltered Kernel layer on every global/thread-local
