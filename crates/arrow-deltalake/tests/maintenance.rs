@@ -1653,3 +1653,297 @@ fn prune_log_refuses_checkpoint_missing_a_txn() -> Result<()> {
     assert_eq!(maintenance.log_floor()?, None);
     Ok(())
 }
+
+/// Rewrite every UTF-8 value at `path` (struct fields; `value` selects map
+/// values) for which `edit` returns a replacement.
+fn edit_strings(
+    array: &arrow::array::ArrayRef,
+    path: &[&str],
+    edit: &mut dyn FnMut(&str) -> Option<String>,
+) -> Result<arrow::array::ArrayRef> {
+    use arrow::array::{AsArray, MapArray, StructArray};
+    let Some((head, rest)) = path.split_first() else {
+        let strings = array.as_string::<i32>();
+        let edited: StringArray = (0..strings.len())
+            .map(|row| {
+                strings
+                    .is_valid(row)
+                    .then(|| edit(strings.value(row)).unwrap_or_else(|| strings.value(row).to_owned()))
+            })
+            .collect();
+        return Ok(Arc::new(edited));
+    };
+    if let DataType::Map(field, ordered) = array.data_type() {
+        let map = array.as_map();
+        let entries = map.entries();
+        let index = usize::from(*head == "value");
+        let mut columns = entries.columns().to_vec();
+        columns[index] = edit_strings(&columns[index], rest, edit)?;
+        let entries = StructArray::try_new(entries.fields().clone(), columns, entries.nulls().cloned())?;
+        return Ok(Arc::new(MapArray::try_new(
+            Arc::clone(field),
+            map.offsets().clone(),
+            entries,
+            map.nulls().cloned(),
+            *ordered,
+        )?));
+    }
+    let parent = array.as_struct();
+    let index = parent
+        .fields()
+        .iter()
+        .position(|field| field.name() == head)
+        .with_context(|| format!("field {head}"))?;
+    let mut columns = parent.columns().to_vec();
+    columns[index] = edit_strings(&columns[index], rest, edit)?;
+    Ok(Arc::new(StructArray::try_new(
+        parent.fields().clone(),
+        columns,
+        parent.nulls().cloned(),
+    )?))
+}
+
+/// Add `key -> value` to `metaData.configuration` of every metaData row.
+fn add_configuration(array: &arrow::array::ArrayRef, key: &str, value: &str) -> Result<arrow::array::ArrayRef> {
+    use arrow::array::{AsArray, MapArray, StructArray};
+    use arrow::buffer::OffsetBuffer;
+    let metadata = array.as_struct();
+    let index = metadata
+        .fields()
+        .iter()
+        .position(|field| field.name() == "configuration")
+        .context("configuration")?;
+    let column = metadata.column(index);
+    let DataType::Map(field, ordered) = column.data_type() else {
+        bail!("configuration is not a map");
+    };
+    let map = column.as_map();
+    let (keys, values) = (map.keys().as_string::<i32>(), map.values().as_string::<i32>());
+    let (mut new_keys, mut new_values, mut lengths) = (Vec::new(), Vec::new(), Vec::new());
+    for row in 0..map.len() {
+        let range = usize::try_from(map.value_offsets()[row])?..usize::try_from(map.value_offsets()[row + 1])?;
+        for entry in range.clone() {
+            new_keys.push(Some(keys.value(entry).to_owned()));
+            new_values.push(values.is_valid(entry).then(|| values.value(entry).to_owned()));
+        }
+        let mut length = range.len();
+        if metadata.is_valid(row) {
+            new_keys.push(Some(key.to_owned()));
+            new_values.push(Some(value.to_owned()));
+            length += 1;
+        }
+        lengths.push(length);
+    }
+    let entries = map.entries();
+    let entries = StructArray::try_new(
+        entries.fields().clone(),
+        vec![
+            Arc::new(StringArray::from(new_keys)),
+            Arc::new(StringArray::from(new_values)),
+        ],
+        None,
+    )?;
+    let mut columns = metadata.columns().to_vec();
+    columns[index] = Arc::new(MapArray::try_new(
+        Arc::clone(field),
+        OffsetBuffer::from_lengths(lengths),
+        entries,
+        map.nulls().cloned(),
+        *ordered,
+    )?);
+    Ok(Arc::new(StructArray::try_new(
+        metadata.fields().clone(),
+        columns,
+        metadata.nulls().cloned(),
+    )?))
+}
+
+/// Rewrite checkpoint `version` in place, replacing the `column` of every batch.
+fn rewrite_checkpoint(
+    root: &Path,
+    version: u64,
+    column: &str,
+    rewrite: &mut dyn FnMut(&arrow::array::ArrayRef) -> Result<arrow::array::ArrayRef>,
+) -> Result<()> {
+    let path = checkpoint_path(root, version);
+    let reader = ParquetRecordBatchReaderBuilder::try_new(fs::File::open(&path)?)?;
+    let schema = Arc::clone(reader.schema());
+    let index = schema.index_of(column)?;
+    let mut batches = Vec::new();
+    for batch in reader.build()? {
+        let batch = batch?;
+        let mut columns = batch.columns().to_vec();
+        columns[index] = rewrite(&columns[index])?;
+        batches.push(RecordBatch::try_new(Arc::clone(&schema), columns)?);
+    }
+    let mut writer = parquet::arrow::ArrowWriter::try_new(fs::File::create(&path)?, schema, None)?;
+    for batch in &batches {
+        writer.write(batch)?;
+    }
+    writer.close()?;
+    Ok(())
+}
+
+/// A provable checkpoint whose Parquet file is then corrupted by `corrupt`.
+/// Pruning must refuse (Unsupported or MetadataChanged) and delete nothing.
+fn assert_corrupt_checkpoint_refused(corrupt: &mut dyn FnMut(&Path, u64) -> Result<()>) -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let (_, maintenance) = prunable_history(root.path())?;
+    let checkpoint = vacuum_and_checkpoint(&maintenance)?;
+    let config = short_prune(now_ms()? + 1_000);
+    assert_eq!(
+        maintenance.plan_prune_log(&config)?.checkpoint_version,
+        Some(checkpoint),
+        "provable before corruption"
+    );
+    corrupt(root.path(), checkpoint)?;
+    let before = log_files(root.path())?;
+    let refused = kind(maintenance.plan_prune_log(&short_prune(now_ms()? + 1_000)));
+    assert!(
+        matches!(
+            refused,
+            Some(MaintenanceErrorKind::Unsupported | MaintenanceErrorKind::MetadataChanged)
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(log_files(root.path())?, before);
+    assert_eq!(maintenance.log_floor()?, None);
+    Ok(())
+}
+
+/// Scenario: checkpoint C rewritten with the same paths, txns and table id but one
+/// add's partitionValue changed.
+/// Guarantees: the recovery-state comparison refuses the prune; nothing is deleted.
+#[test]
+fn prune_log_refuses_checkpoint_with_changed_partition_value() -> Result<()> {
+    assert_corrupt_checkpoint_refused(&mut |root, version| {
+        let mut changed = 0;
+        rewrite_checkpoint(root, version, "add", &mut |array| {
+            edit_strings(array, &["partitionValues", "value"], &mut |value| {
+                (changed == 0).then(|| {
+                    changed += 1;
+                    format!("{value}-changed")
+                })
+            })
+        })?;
+        assert_eq!(changed, 1);
+        Ok(())
+    })
+}
+
+/// Scenario: checkpoint C rewritten with a different (valid) metaData.schemaString.
+/// Guarantees: the recovery-state comparison refuses the prune; nothing is deleted.
+#[test]
+fn prune_log_refuses_checkpoint_with_changed_schema() -> Result<()> {
+    assert_corrupt_checkpoint_refused(&mut |root, version| {
+        let mut changed = 0;
+        rewrite_checkpoint(root, version, "metaData", &mut |array| {
+            edit_strings(array, &["schemaString"], &mut |schema| {
+                let mut parsed: serde_json::Value = serde_json::from_str(schema).ok()?;
+                parsed["fields"].as_array_mut()?.push(serde_json::json!({
+                    "name": "extra",
+                    "type": "string",
+                    "nullable": true,
+                    "metadata": {}
+                }));
+                changed += 1;
+                Some(parsed.to_string())
+            })
+        })?;
+        assert_eq!(changed, 1);
+        Ok(())
+    })
+}
+
+/// Scenario: checkpoint C rewritten with an extra metaData.configuration property.
+/// Guarantees: the recovery-state comparison refuses the prune; nothing is deleted.
+#[test]
+fn prune_log_refuses_checkpoint_with_changed_configuration() -> Result<()> {
+    assert_corrupt_checkpoint_refused(&mut |root, version| {
+        rewrite_checkpoint(root, version, "metaData", &mut |array| {
+            add_configuration(array, "arrowcol.test.injected", "1")
+        })
+    })
+}
+
+fn modified_ms(path: &Path) -> Result<i64> {
+    Ok(i64::try_from(
+        fs::metadata(path)?
+            .modified()?
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis(),
+    )?)
+}
+
+/// Scenario: a bounded short-retention prune leaves JSON at or below the floor, then
+/// the log retention grows so the newest leftover is young again.
+/// Guarantees: resuming at the floor applies the fresh-proof age check to every
+/// leftover: the plan is Noop and applying the earlier resume plan is StalePlan,
+/// with zero additional deletes; once the anchor makes every leftover old enough
+/// under the larger retention, the resume completes.
+#[test]
+fn prune_log_resume_respects_increased_retention() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let (_, maintenance) = prunable_history(root.path())?;
+    let checkpoint = vacuum_and_checkpoint(&maintenance)?;
+    let bounded = PruneConfig {
+        max_prune_files: 2,
+        ..short_prune(now_ms()? + 1_000)
+    };
+    let partial = maintenance.plan_prune_log(&bounded)?;
+    assert_eq!(
+        maintenance
+            .apply_prune_log(&partial, &bounded, &control())?
+            .files_deleted,
+        2
+    );
+    assert_eq!(
+        maintenance.log_floor()?.map(|floor| floor.checkpoint_version),
+        Some(checkpoint)
+    );
+    let resume = maintenance.plan_prune_log(&short_prune(now_ms()? + 1_000))?;
+    assert_eq!(resume.checkpoint_version, Some(checkpoint));
+    assert_eq!(resume.deletions.len(), usize::try_from(checkpoint - 1)?);
+    let leftovers = log_files(root.path())?;
+    let newest = leftovers
+        .iter()
+        .map(|path| modified_ms(path))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .max()
+        .context("leftover JSON")?;
+    while now_ms()? <= newest {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // The cutoff lands exactly on the newest leftover, which is therefore too young.
+    let anchor = now_ms()?;
+    let stricter = PruneConfig {
+        log_retention_ms: Some(anchor - newest),
+        unsafe_allow_short_retention_for_tests: true,
+        ..PruneConfig::new(anchor)
+    };
+    let plan = maintenance.plan_prune_log(&stricter)?;
+    assert_eq!((plan.checkpoint_version, plan.report().outcome), (None, Outcome::Noop));
+    assert!(plan.deletions.is_empty());
+    assert_eq!(
+        kind(maintenance.apply_prune_log(&resume, &stricter, &control())),
+        Some(MaintenanceErrorKind::StalePlan)
+    );
+    assert_eq!(log_files(root.path())?, leftovers, "zero additional deletes");
+
+    while now_ms()? <= anchor + 1 {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let later = PruneConfig {
+        now_ms: anchor + 1,
+        ..stricter
+    };
+    let plan = maintenance.plan_prune_log(&later)?;
+    assert_eq!(plan.checkpoint_version, Some(checkpoint));
+    assert_eq!(plan.deletions.len(), leftovers.len());
+    let report = maintenance.apply_prune_log(&plan, &later, &control())?;
+    assert_eq!(report.outcome, Outcome::Pruned);
+    assert!(log_files(root.path())?.is_empty());
+    assert!(checkpoint_path(root.path(), checkpoint).is_file());
+    Ok(())
+}
