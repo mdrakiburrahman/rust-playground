@@ -19,6 +19,7 @@ import { beginAttemptEvidence, sealAttemptEvidence, stoppedAttemptMutators, type
 import { writeProvenance } from './provenance.js';
 import { runQuiverCrash, QUIVER_RECOVERY_FILE } from './quiver-crash.js';
 import { runOwnedProcess } from './owned-process.js';
+import { admitPublisherRelease, sqlIdentity, type SqlIdentity } from './publisher-release.js';
 import { startQapObserver } from './qap-observer.js';
 import { readStressPlan, runStressDriver, stressInputBudget } from './stress-driver.js';
 import { LocalStressRuntime } from './stress-runtime.js';
@@ -442,7 +443,7 @@ export const VALIDATE_RESERVE_MS = 30_000;
  * never bounds run or drain.
  */
 export function loadgenSpawnPlan(
-  command: 'run' | 'drain' | 'validate',
+  command: 'run' | 'drain' | 'validate' | 'publisher-release' | 'final-compaction',
   options: Pick<BenchmarkContext['options'], 'measureSeconds' | 'warmupSeconds'>,
   environment: NodeJS.ProcessEnv,
   nowMs: number,
@@ -458,14 +459,14 @@ export function loadgenSpawnPlan(
 
 async function runLocalLoadgen(
   context: Pick<BenchmarkContext, 'directory' | 'env' | 'network' | 'options'>,
-  command: 'run' | 'drain' | 'validate',
+  command: 'run' | 'drain' | 'validate' | 'publisher-release' | 'final-compaction',
   results: string,
   controller: BenchmarkController,
 ): Promise<void> {
   const plan = loadgenSpawnPlan(command, context.options, localLoadgenEnvironment(context, results), Date.now());
   await runInteractive(
     path.join(cargoTargetDirectory(), 'debug/arrowcol-loadgen'),
-    [command],
+    [command, ...(command === 'final-compaction' && context.options.finalCompaction === false ? ['--skip-final-compaction'] : [])],
     plan.env,
     controller,
     plan.timeout,
@@ -574,6 +575,7 @@ async function benchmark(
   let stopSampler: (() => Promise<void>) | undefined;
   let stopQapObserver: (() => Promise<void>) | undefined;
   let stoppedMutators: StoppedMutator[] | undefined;
+  let stackSql: SqlIdentity | undefined;
   const resultsDirectory = path.relative(workspace, path.join(directory, 'results'));
   try {
     step('Validating Compose configuration');
@@ -592,6 +594,7 @@ async function benchmark(
     ], 3_600_000);
     controller.checkRunning();
     workspaceConnection = connectWorkspaceContainer(project, env);
+    if (!azure && options.validate) stackSql = sqlIdentity(workspace, args => run('docker', args));
     if (!azure) {
     phase = 'kusto-startup';
     step('Starting optional Kusto inspection target separately from the collectors');
@@ -728,6 +731,24 @@ async function benchmark(
       });
       phase = 'mutator-drain';
       step('Cleanly stopping all source, maintenance and tenant mutators before immutable snapshot capture');
+      if (!azure) {
+        assert(stackSql, 'Missing stack-start SQL generation');
+        stoppedMutators = await admitPublisherRelease({
+          workspace, directory, sql: stackSql, docker: args => run('docker', args),
+          sdk: path.join(cargoTargetDirectory(), 'debug/arrowcol-sdk-gen'),
+          stop: () => stopBenchmark(workspace, args => run('docker', args, process.env, 360_000), {
+            requireCleanMutators: true, mutatorsOnly: true,
+          }),
+          release: async () => {
+            phase = 'publisher-release';
+            await runLocalLoadgen(context, 'publisher-release', path.join(directory, 'results'), controller);
+          },
+          compact: async () => {
+            phase = 'final-compaction';
+            await runLocalLoadgen(context, 'final-compaction', path.join(directory, 'results'), controller);
+          },
+        });
+      } else {
       const cleanServices = await stopBenchmark(workspace, args => run('docker', args, process.env, 360_000), {
         requireCleanMutators: true, mutatorsOnly: true,
       });
@@ -738,6 +759,7 @@ async function benchmark(
       writeFileSync(path.join(directory, 'results/mutator-drain.json'), `${JSON.stringify({
         run_id: metadata.run_id, clean: true, services: cleanServices, finished_at: new Date().toISOString(),
       }, null, 2)}\n`);
+      }
       phase = 'output-validation';
       step('Validating Delta and native Kusto output');
       controller.checkRunning();
