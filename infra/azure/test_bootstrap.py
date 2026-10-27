@@ -81,6 +81,15 @@ class FakeAzure:
         if args[:2] == ("rest", "--method") and args[2] == "delete":
             self.databases = []
 
+    def delete_database(self):
+        self.events.append(("arm-delete-db",))
+        self.databases = []
+        return 200, None
+
+    def provider_operation(self, url):
+        self.events.append(("arm-operation",))
+        return "Succeeded"
+
     def blob(self, method, container, name, **kwargs):
         self.events.append((method, name))
         if method == "DELETE":
@@ -275,7 +284,7 @@ class ResetTests(unittest.TestCase):
         self.assertEqual(self.azure.databases, [])
         self.assertEqual(self.azure.metadata["resetstate"], "fenced-v1")
         self.assertEqual(self.azure.metadata["publishers"], "{}")
-        self.assertFalse(any("fence.json" in event[1] for event in self.azure.events))
+        self.assertFalse(any(len(event) > 1 and "fence.json" in event[1] for event in self.azure.events))
         b.reset(self.azure, False, None)
 
     @patch.object(b.time, "sleep")
@@ -354,7 +363,7 @@ class ResetTests(unittest.TestCase):
             b.stop_cluster(self.azure)
 
     def assert_no_deletion(self):
-        self.assertFalse(any(event[0] in ("DELETE", "DELETE_DIRECTORY", "cli")
+        self.assertFalse(any(event[0] in ("DELETE", "DELETE_DIRECTORY", "cli", "arm-delete-db")
                              for event in self.azure.events), self.azure.events)
 
     @patch.object(b, "run_tree")
@@ -524,28 +533,150 @@ class ResetTests(unittest.TestCase):
         self.assertEqual(self.azure.events.count(("DELETE", "table/data.parquet")), 1)
         self.assert_clean_finish(record)
 
+    # --- database DELETE: durable intent + provider operation receipt -----------------
+
+    OPERATION = "https://management.azure.com/providers/op/1"
+
+    def intent(self):
+        path = b.database_intent_path(self.record)
+        return json.loads(path.read_bytes()) if path.exists() else None
+
+    def assert_unresumable(self, generation):
+        self.assertEqual((self.azure.metadata["resetstate"], self.azure.metadata["resetgeneration"]),
+                         ("cleaning-v1", generation))
+        self.assertTrue(self.record.exists())
+        self.assertEqual(self.intent()["state"], "submitting")
+
     @patch.object(b.time, "sleep")
     @patch.object(b, "run_tree")
-    def test_pending_database_delete_is_observed_and_never_false_clean(self, run, sleep):
+    def test_accepted_database_delete_finishes_only_on_provider_success(self, run, sleep):
         self.start_reset(run)
-        def submit(*args):
-            self.azure.events.append(("cli", args[2]))
-            self.azure.databases = [{"name": self.azure.c.database,
-                                     "properties": {"provisioningState": "Deleting"}}]
-        with patch.object(self.azure, "cli", side_effect=submit), \
+        statuses = ["InProgress", "InProgress", "Succeeded"]
+        def submit():
+            self.azure.events.append(("arm-delete-db",))
+            self.assertEqual(self.intent()["state"], "submitting")  # durable BEFORE submission
+            self.azure.databases = []  # listing absence alone must not settle it
+            return 202, self.OPERATION
+        with patch.object(self.azure, "delete_database", side_effect=submit), \
+                patch.object(self.azure, "provider_operation", side_effect=lambda url: statuses.pop(0)), \
                 patch.object(b, "retry_ready", lambda action, label, timeout=600: action()):
             with self.assertRaisesRegex(b.Failure, "still in progress"):
                 b._unqualified_reset_sequence(self.azure, ["stop"])
             record = b.read_reset_record(self.record)
-            self.assertEqual(self.azure.metadata["resetstate"], "cleaning-v1")
+            self.assertEqual((self.intent()["state"], self.intent()["operation"]), ("accepted", self.OPERATION))
             with self.assertRaisesRegex(b.Failure, "still in progress"):
                 b._unqualified_reset_resume(self.azure)
             self.assertEqual(self.azure.metadata["resetstate"], "cleaning-v1")
-            self.assertEqual(self.azure.events.count(("cli", "delete")), 1)
-            self.azure.databases = []
             b._unqualified_reset_resume(self.azure)
-        self.assertEqual(self.azure.events.count(("cli", "delete")), 1)
+        self.assertEqual(self.azure.events.count(("arm-delete-db",)), 1)
+        self.assertIsNone(self.intent())
         self.assert_clean_finish(record)
+
+    @patch.object(b.time, "sleep")
+    @patch.object(b, "run_tree")
+    def test_delayed_unknown_database_delete_then_absent_listing_refuses_finish(self, run, sleep):
+        """An unknown DELETE may land after rotation+reprovision; absence never reconciles it."""
+        generation = self.start_reset(run)
+        def lost():
+            self.azure.events.append(("arm-delete-db",))
+            raise b.Failure("timed out; outcome unknown")
+        with patch.object(self.azure, "delete_database", side_effect=lost):
+            with self.assertRaisesRegex(b.Failure, "UNRESUMABLE"):
+                b._unqualified_reset_sequence(self.azure, ["stop"])
+        self.assert_unresumable(generation)
+        self.azure.databases = []  # the delayed request applied, or not: listing cannot tell
+        for _ in range(2):
+            with self.assertRaisesRegex(b.Failure, "UNRESUMABLE"):
+                b._unqualified_reset_resume(self.azure)
+            self.assert_unresumable(generation)
+        self.assertEqual(self.azure.events.count(("arm-delete-db",)), 1)  # never replayed
+        from publisher_control import PublisherControl
+        with self.assertRaisesRegex(b.Failure, "cleanup-owned"):  # no rebootstrap admission
+            PublisherControl(self.azure).admit(str(uuid.uuid4()), generation, bootstrap=True)
+        with self.assertRaisesRegex(b.Failure, "resume"):
+            self.record.rename(self.record.with_suffix(".moved"))
+            b._unqualified_reset_sequence(self.azure, ["stop"])
+
+    @patch.object(b.time, "sleep")
+    @patch.object(b, "run_tree")
+    def test_crash_during_database_submission_is_unresumable(self, run, sleep):
+        generation = self.start_reset(run)
+        def crash():
+            self.azure.databases = []
+            raise KeyboardInterrupt
+        with patch.object(self.azure, "delete_database", side_effect=crash):
+            with self.assertRaises(KeyboardInterrupt):
+                b._unqualified_reset_sequence(self.azure, ["stop"])
+        with self.assertRaisesRegex(b.Failure, "UNRESUMABLE"):
+            b._unqualified_reset_resume(self.azure)
+        self.assert_unresumable(generation)
+
+    @patch.object(b.time, "sleep")
+    @patch.object(b, "run_tree")
+    def test_accepted_without_provider_receipt_is_unresumable(self, run, sleep):
+        generation = self.start_reset(run)
+        for response in ((202, None), (202, "https://elsewhere.example/op"), (201, None)):
+            with self.subTest(response=response):
+                with patch.object(self.azure, "delete_database", return_value=response):
+                    with self.assertRaisesRegex(b.Failure, "UNRESUMABLE"):
+                        if self.record.exists():
+                            b._unqualified_reset_resume(self.azure)
+                        else:
+                            b._unqualified_reset_sequence(self.azure, ["stop"])
+                self.assert_unresumable(generation)
+
+    @patch.object(b.time, "sleep")
+    @patch.object(b, "run_tree")
+    def test_provider_terminal_failure_permits_single_resubmission(self, run, sleep):
+        self.start_reset(run)
+        submitted = []
+        def submit():
+            submitted.append(True)
+            if len(submitted) == 2:
+                self.azure.databases = []
+                return 200, None
+            return 202, self.OPERATION
+        with patch.object(self.azure, "delete_database", side_effect=submit), \
+                patch.object(self.azure, "provider_operation", return_value="Failed"):
+            with self.assertRaisesRegex(b.Failure, "Failed; resume may resubmit"):
+                b._unqualified_reset_sequence(self.azure, ["stop"])
+            self.assertIsNone(self.intent())
+            record = b.read_reset_record(self.record)
+            b._unqualified_reset_resume(self.azure)
+        self.assertEqual(len(submitted), 2)
+        self.assert_clean_finish(record)
+
+    @patch.object(b.time, "sleep")
+    @patch.object(b, "run_tree")
+    def test_database_deleting_without_own_intent_or_foreign_intent_is_refused(self, run, sleep):
+        self.start_reset(run)
+        self.azure.databases = [{"name": self.azure.c.database,
+                                 "properties": {"provisioningState": "Deleting"}}]
+        with self.assertRaisesRegex(b.Failure, "without this custody's intent"):
+            b._unqualified_reset_sequence(self.azure, ["stop"])
+        record = b.read_reset_record(self.record)
+        foreign = {"operator": str(uuid.uuid4()), "generation": record["generation"],
+                   "state": "completed", "operation": None}
+        b.publish_private(b.database_intent_path(self.record), foreign)
+        self.azure.databases = []
+        with self.assertRaisesRegex(b.Failure, "never adopting"):
+            b._unqualified_reset_resume(self.azure)
+        self.assertNotIn(("arm-delete-db",), self.azure.events)
+        self.assertEqual(self.azure.metadata["resetstate"], "cleaning-v1")
+
+    def test_real_transport_captures_status_and_provider_operation(self):
+        azure = REAL_AZURE(b.Config({"AZURE_SUBSCRIPTION_ID": SUB}))
+        with patch.object(azure, "request", return_value=(b"", {":status": "202",
+                                                               "azure-asyncoperation": self.OPERATION})) as request:
+            self.assertEqual(azure.delete_database(), (202, self.OPERATION))
+        self.assertEqual(request.call_args.args[0], "DELETE")
+        with patch.object(azure, "request", return_value=(None, {})):
+            self.assertEqual(azure.delete_database(), (404, None))
+        for response, expected in (((b"", {":status": "202"}), "InProgress"),
+                                   ((b'{"status":"Failed"}', {":status": "200"}), "Failed"),
+                                   ((b"", {":status": "200"}), "Succeeded")):
+            with patch.object(azure, "request", return_value=response):
+                self.assertEqual(azure.provider_operation(self.OPERATION), expected)
 
     @patch.object(b.time, "sleep")
     @patch.object(b, "run_tree")
