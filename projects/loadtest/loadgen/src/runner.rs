@@ -579,6 +579,7 @@ impl ReceiptTracker {
                                 rows_published: None,
                                 bytes_published: None,
                                 error_code: Some("receipt_poll_timeout".to_owned()),
+                                error_message: None,
                             })
                             .await?;
                         report.timeouts += 1;
@@ -640,6 +641,7 @@ impl ReceiptTracker {
                                         rows_published: facts.rows_published,
                                         bytes_published: facts.bytes_published,
                                         error_code: facts.error_code,
+                                        error_message: facts.error_message,
                                     })
                                     .await?;
                                 if facts.state == "published" && response.purge_allowed {

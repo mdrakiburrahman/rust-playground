@@ -4,9 +4,11 @@ Every synthetic table has a required `customer_id VARCHAR` first column. The
 deterministic input interleaves 16 customers (`customer-0000` through
 `customer-0015`) rather than pre-sorting the input. Direct and Dataflow receive
 the same immutable encoded batches, including retries. The independent reader
-can return a bounded complete row multiset with multiplicities for Kusto
-validation; it rejects a changed snapshot or more than 256 distinct rows rather
-than silently sampling away differences.
+returns complete row multisets with multiplicities for Kusto validation, without
+sampling or truncation. Native validation packs disjoint whole ingestion
+partitions into chunks of at most 256 distinct complete rows. It fails on a
+changed snapshot, a single partition over 256 distinct rows, or more than 65,536
+distinct rows across a table.
 
 [![Architecture](../../loadtest-architecture.png)](../../loadtest-architecture.html)
 
@@ -16,6 +18,23 @@ files. `delta-inspect evidence <root> --table catalog.schema.table` returns a
 captured snapshot plus its bounded row multiset. Local roots and explicit-table
 `abfss://` roots are supported; cloud reads use the existing Azure CLI identity
 and fail visibly without credentials. Deletion vectors are explicitly rejected.
+
+`delta-inspect evidence-chunks <root> --table catalog.schema.table` instead
+returns `{snapshot, corpus}`, with each table's corpus containing
+`partition_column`, exact `expected_rows`, `partition_rows`, and
+`chunks: [{partition_values, rows: [[complete_row, multiplicity]]}]`. Partition
+strings are the exact committed values; chunks never overlap, and their union
+equals the keys of `partition_rows`. Unpartitioned tables use one unfiltered
+chunk. The legacy `evidence` command keeps its original 256-distinct-row limit.
+Native cached and fallback validation checks every chunk and exact partition
+counts under the unchanged fixed five-minute cached deadline; timeout is failure.
+
+Terminal `receipts.jsonl` entries retain an optional sanitized `error_message`
+alongside `error_code`; missing legacy fields remain readable. Failed admissions
+in `sent-batches.jsonl` use the same client export boundary. Causal text is
+preserved while credentials, private URLs/paths/identifiers, known private
+environment values, and control characters are removed, with a 1,024-character
+Unicode-safe bound. These artifacts are written before stack cleanup.
 
 ```bash
 npx nx run loadtest:run -- --warmup 2m --concurrency 8 --batch-rows 1024

@@ -81,6 +81,8 @@ pub struct ReceiptManifestEntry {
     pub bytes_published: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
 }
 
 /// Ordered generated-schema contract retained with the run.
