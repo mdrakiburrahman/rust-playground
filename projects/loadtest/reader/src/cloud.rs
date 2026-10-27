@@ -6,7 +6,8 @@ use parquet::file::reader::{FileReader, SerializedFileReader};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    FileSummary, SnapshotSummary, TableSummary, payload_digest, row_value, validate_partition_columns, with_partitions,
+    FileSummary, SnapshotSummary, TableSummary, ValidationCorpus, corpus::CorpusBuilder, payload_digest, row_value,
+    validate_partition_columns, with_partitions,
 };
 
 async fn open_cloud_table(root: &str, identity: &str) -> Result<deltalake_core::DeltaTable> {
@@ -79,6 +80,31 @@ pub async fn cloud_sample_rows(
         bail!("captured cloud validation corpus changed");
     }
     Ok(corpus.into_values().collect())
+}
+
+/// Exact chunked corpus from precisely the captured cloud files; see [`crate::sample_corpus`].
+///
+/// # Errors
+///
+/// Rejects a changed snapshot/corpus, unavailable captured files, unsupported partitioning, a
+/// partition with more than 256 distinct rows, and corpora beyond the global distinct-row guard.
+pub async fn cloud_sample_corpus(root: &str, identity: &str, summary: &TableSummary) -> Result<ValidationCorpus> {
+    let delta = open_cloud_table(root, identity).await?;
+    if delta.snapshot()?.version() != summary.version {
+        bail!("cloud snapshot changed after capture");
+    }
+    let mut builder = CorpusBuilder::new(summary)?;
+    for file in &summary.files {
+        validate_active_path(&file.path)?;
+        let path = deltalake_core::Path::parse(&file.path)?;
+        let data = delta.object_store().get(&path).await?.bytes().await?;
+        let reader = SerializedFileReader::new(data)?;
+        for row in reader.get_row_iter(None)? {
+            let value = with_partitions(row_value(&row?), &summary.schema, &file.partition_values)?;
+            builder.add(value, &file.partition_values)?;
+        }
+    }
+    builder.finish(summary)
 }
 
 /// Summarizes an explicit table allowlist from ADLS using independent delta-rs
