@@ -14,6 +14,10 @@ pub(crate) struct AzureResetFence {
 }
 
 impl AzureResetFence {
+    pub(crate) fn generation(&self) -> &str {
+        &self.generation
+    }
+
     pub(crate) async fn open(account: &str, credentials: AzureCredentialProvider, bootstrap: bool) -> Result<Self> {
         let container = std::env::var("AZURE_STORAGE_CHECKPOINT_CONTAINER").unwrap_or_else(|_| "checkpoints".into());
         if !account.bytes().all(|byte| byte.is_ascii_alphanumeric())
