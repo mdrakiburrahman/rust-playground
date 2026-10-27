@@ -19,6 +19,7 @@ test('the normal command has no execution naming or generic fault modes', () => 
   const defaults = parseBenchmarkOptions([]);
   assert.equal(defaults.quiver, false);
   assert.equal(defaults.crashAfterSeconds, undefined);
+  assert.equal(defaults.drainTimeoutSeconds, 480, 'the fixed five-minute cached gate needs its own bounded outer validation budget');
 });
 
 test('--quiver enables disk persistence and --crash-after requires it', () => {

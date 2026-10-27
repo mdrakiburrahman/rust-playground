@@ -82,7 +82,7 @@ export function parseBenchmarkOptions(args: string[], env: NodeJS.ProcessEnv = p
     warmupSeconds,
     measureSeconds,
     captureSettleSeconds: 30,
-    drainTimeoutSeconds: 120,
+    drainTimeoutSeconds: 480,
     requestTimeoutSeconds: 60,
     concurrency: positiveInteger(concurrency, '--concurrency'),
     batchRows: positiveInteger(batchRows, '--batch-rows'),
