@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { closeSync, fstatSync, openSync, readFileSync, readSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 import YAML from 'yaml';
@@ -10,6 +10,43 @@ import { benchmarkComposeFiles, dataflowConfigFile } from './runtime-config.js';
 
 export function sha256(text: string | Buffer): string {
   return createHash('sha256').update(text).digest('hex');
+}
+
+function executableIdentity(file: string): { sha256: string; bytes: number } {
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(file, 'r');
+    const before = fstatSync(descriptor);
+    if (!before.isFile() || !(before.mode & 0o111)) throw new Error('Invalid executable');
+    const hash = createHash('sha256');
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    let bytes = 0, count: number;
+    while ((count = readSync(descriptor, buffer, 0, buffer.length, null)) !== 0) {
+      hash.update(buffer.subarray(0, count)); bytes += count;
+    }
+    const after = fstatSync(descriptor);
+    if (!Number.isSafeInteger(bytes) || bytes !== before.size ||
+        before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) {
+      throw new Error('Executable changed during hashing');
+    }
+    return { sha256: hash.digest('hex'), bytes };
+  } catch {
+    throw new Error('Helper executable provenance is unavailable or changed; private paths withheld');
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+}
+
+export function helperIdentities(selectedDirectory: string, mountedDirectory: string) {
+  const host = Object.fromEntries(['arrowcol-loadgen', 'arrowcol-sdk-gen', 'delta-inspect'].map(name =>
+    [name, executableIdentity(path.join(selectedDirectory, name))]));
+  const mounted = Object.fromEntries(['arrowcol-loadgen', 'arrowcol-sdk-gen'].map(name =>
+    [name, executableIdentity(path.join(mountedDirectory, name))]));
+  if (Object.entries(mounted).some(([name, value]) =>
+    value.sha256 !== host[name].sha256 || value.bytes !== host[name].bytes)) {
+    throw new Error('Mounted helper executable does not match the selected host artifact');
+  }
+  return { host, mounted };
 }
 
 type Document = Record<string, any>;
@@ -100,6 +137,7 @@ export function writeProvenance(
   project: string,
   options: BenchmarkOptions,
   env: NodeJS.ProcessEnv,
+  helperDirectory: string,
   started = false,
 ): void {
   const output = path.join(directory, 'results/provenance.json');
@@ -110,6 +148,10 @@ export function writeProvenance(
   };
   if (started) {
     const provenance = JSON.parse(readFileSync(output, 'utf8')) as Document;
+    const helpers = helperIdentities(helperDirectory, path.join(workspace, 'projects/loadtest/.temp/bin/latest'));
+    if (JSON.stringify(helpers) !== JSON.stringify(provenance.helpers)) {
+      throw new Error('Selected helper executable changed during stack startup');
+    }
     const ids = execute('docker', ['ps', '--all', '--quiet', '--filter', `label=com.docker.compose.project=${project}`])
       .trim().split('\n').filter(Boolean);
     provenance.containers = ids.map((id) => JSON.parse(execute('docker', [
@@ -137,6 +179,7 @@ export function writeProvenance(
   const provenance: Document = {
     createdAt: new Date().toISOString(), project, options,
     source: revision('.'), otelArrowSource: revision('submodules/otel-arrow'),
+    helpers: helperIdentities(helperDirectory, path.join(workspace, 'projects/loadtest/.temp/bin/latest')),
     configSha256: Object.fromEntries(files.map((file) => [file, sha256(readFileSync(path.join(workspace, file)))])),
     generatedDirectConfigSha256: sha256(readFileSync(path.join(directory, 'direct-state-1/direct.yaml'))),
     generatedDataflowConfigSha256: sha256(readFileSync(path.join(directory, 'dataflow-state-1/dataflow.yaml'))),

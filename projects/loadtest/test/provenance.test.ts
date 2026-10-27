@@ -1,12 +1,71 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
 
 import YAML from 'yaml';
 
-import { safeCollectorPolicies, safeComposeSettings, sha256 } from '../src/provenance.js';
+import { helperIdentities, safeCollectorPolicies, safeComposeSettings, sha256, writeProvenance } from '../src/provenance.js';
+import { parseBenchmarkOptions } from '../src/cli.js';
 import { buildBenchmarkRuntimeConfigs } from '../src/runtime-config.js';
+
+test('helper identities bind actual selected host artifacts and mounted copies without private paths', t => {
+  const root = mkdtempSync(path.resolve('projects/loadtest/test/.fixture-helper-provenance-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const selected = path.join(root, 'private-source-target', 'debug');
+  const stale = path.join(root, 'target', 'debug');
+  const mounted = path.join(root, 'mounted');
+  for (const directory of [selected, stale, mounted]) mkdirSync(directory, { recursive: true });
+  for (const name of ['arrowcol-loadgen', 'arrowcol-sdk-gen', 'delta-inspect']) {
+    writeFileSync(path.join(selected, name),
+      name === 'delta-inspect' ? Buffer.alloc(2 * 1024 * 1024 + 17, 0x61) : `selected-${name}\n`, { mode: 0o755 });
+    writeFileSync(path.join(stale, name), 'stale-default-target', { mode: 0o755 });
+    if (name !== 'delta-inspect') copyFileSync(path.join(selected, name), path.join(mounted, name));
+  }
+  const receipt = helperIdentities(selected, mounted);
+  assert.equal(receipt.host['delta-inspect'].sha256, sha256(Buffer.alloc(2 * 1024 * 1024 + 17, 0x61)));
+  assert.equal(receipt.host['delta-inspect'].bytes, 2 * 1024 * 1024 + 17);
+  assert.equal(receipt.host['arrowcol-loadgen'].sha256, receipt.mounted['arrowcol-loadgen'].sha256);
+  assert(!JSON.stringify(receipt).includes(root));
+  assert(!JSON.stringify(receipt).includes('private-source-target'));
+  assert.throws(() => helperIdentities(stale, mounted), /does not match the selected host artifact/u);
+  writeFileSync(path.join(mounted, 'arrowcol-loadgen'), 'stale-mounted-helper');
+  assert.throws(() => helperIdentities(selected, mounted), /does not match the selected host artifact/u);
+  copyFileSync(path.join(selected, 'arrowcol-loadgen'), path.join(mounted, 'arrowcol-loadgen'));
+  chmodSync(path.join(selected, 'delta-inspect'), 0o644);
+  assert.throws(() => helperIdentities(selected, mounted), /private paths withheld/u);
+  chmodSync(path.join(selected, 'delta-inspect'), 0o755);
+  unlinkSync(path.join(selected, 'delta-inspect'));
+  assert.throws(() => helperIdentities(selected, mounted), error =>
+    error instanceof Error && !error.message.includes(root) && /provenance is unavailable/u.test(error.message));
+});
+
+test('stack-start provenance refuses selected helper replacement after its initial receipt', t => {
+  const root = mkdtempSync(path.resolve('projects/loadtest/test/.fixture-helper-startup-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const selected = path.join(root, 'selected', 'debug');
+  const mounted = path.join(root, 'projects/loadtest/.temp/bin/latest');
+  const directory = path.join(root, 'benchmark');
+  for (const target of [selected, mounted, path.join(directory, 'results')]) mkdirSync(target, { recursive: true });
+  for (const name of ['arrowcol-loadgen', 'arrowcol-sdk-gen', 'delta-inspect']) {
+    writeFileSync(path.join(selected, name), name, { mode: 0o755 });
+    if (name !== 'delta-inspect') copyFileSync(path.join(selected, name), path.join(mounted, name));
+  }
+  const output = path.join(directory, 'results/provenance.json');
+  const initial = { helpers: helperIdentities(selected, mounted) };
+  writeFileSync(output, JSON.stringify(initial));
+  writeFileSync(path.join(root, 'docker'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  const options = parseBenchmarkOptions([]);
+  const env = { ...process.env, PATH: `${root}:${process.env.PATH}` };
+  writeProvenance(root, directory, 'fixture', options, env, selected, true);
+  const before = readFileSync(output, 'utf8');
+  assert.deepEqual(JSON.parse(before).helpers, initial.helpers);
+  writeFileSync(path.join(selected, 'arrowcol-loadgen'), 'replacement');
+  copyFileSync(path.join(selected, 'arrowcol-loadgen'), path.join(mounted, 'arrowcol-loadgen'));
+  assert.throws(() => writeProvenance(root, directory, 'fixture', options, env, selected, true),
+    /Selected helper executable changed during stack startup/u);
+  assert.equal(readFileSync(output, 'utf8'), before, 'retain the original artifact receipt rather than relabeling it');
+});
 
 test('provenance whitelists nonsensitive effective resource settings and never stores raw Compose environment', () => {
   const service = {
