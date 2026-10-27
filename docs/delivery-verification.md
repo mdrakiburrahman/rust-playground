@@ -158,6 +158,27 @@ Bounded, allowlisted frame-shape diagnostics preserve the unchanged per-frame
 threshold; a read-only query on an older preserved dataset is not a CI
 reproduction or a fix.
 
+At PR head `82b525014d3544763c467b959c33df65b15a5a13`, `npx nx run
+rust:verify` exited 0 in 4,161.3 seconds across the project and 98 dependencies;
+some unaffected Nx tasks used cache, so this is not a claim that all 99 packages
+were cold-built. CI run `40470284513` at that head had 43 successful jobs and
+three failures: two core metric assertions, a loadtest UI-frame check reporting
+four samples for a 60-second request, and the dependent aggregate verification.
+External GitGuardian human classification remains blocked.
+
+The declared all-13 collector stress attempt `e6c7f8c15c68` failed after
+903.7 seconds, three waves, and four samples. All six CPU-targeted maintenance
+operations exited 0, but the measured physical inventory grew from 42,528,459
+to 102,165,452 bytes and backlog stability failed (samples: 38, 26, 29, 32);
+the net backlog change was a decrease of six, not runaway growth. RSS passed,
+with no restart, OOM, or exhausted-retry failure. Ordinary seven-day VACUUM
+removed no files. The 15 Grafana metric checks and five panels passed, but DFE
+drain exited 1 with `flush channel closed`, native observer sequence 26 was
+incomplete at its 30-second deadline, and the final oracle was not reached. The
+deadline is established; the observer's original initiating exception was not
+retained. This is a failed stress attempt, not an overall qualification pass;
+the unapproved DFE structural fix is not part of this receipt.
+
 The local aggregate `npx --no-install nx run rust:verify --outputStyle=static`
 at the same source also failed, with return code 130. The underlying failed
 target was `loadtest:test`: the actual reader CLI evidence-chunks regression
