@@ -81,7 +81,7 @@ test('Azure runtime CLI caches are separate writable private copies, never the h
   assert.equal(readFileSync(dataflow, 'utf8'), 'fixture-identity');
   assert.equal(statSync(direct).mode & 0o777, 0o600);
   assert.equal(statSync(path.dirname(direct)).mode & 0o777, 0o700);
-  for (const service of ['loadgen', 'infra', 'tenant-stream', 'delta-maintenance']) {
+  for (const service of ['loadgen', 'infra', 'tenant-stream', 'delta-maintenance', 'qap-observer']) {
     const copy = path.join(run, 'azure-cli', service, 'msal_token_cache.json');
     assert.equal(readFileSync(copy, 'utf8'), 'fixture-identity');
     assert.equal(statSync(copy).mode & 0o777, 0o600);

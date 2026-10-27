@@ -14,3 +14,4 @@ pub mod transport;
 pub mod validation;
 
 pub use cli::{Cli, Command};
+pub use kusto::observe_qap;

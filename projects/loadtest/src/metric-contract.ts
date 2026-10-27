@@ -54,7 +54,8 @@ export function requiredMetrics(scope: 'source-sdk' | 'service-qualification', b
     for (const pool of ['direct', 'dataflow']) {
       for (const name of ['completion_percent', 'pending_artifacts', 'cached_bytes', 'unhealthy_catalogs', 'lag_seconds']) {
         const family = `qap_${name}`;
-        metrics.push({ name: `${pool}:${family}`, query: `sum(${family}{pool="${pool}"})`,
+        metrics.push({ name: `${pool}:${family}`, query: `sum(${family}{pool="${pool}"} and on(pool) ` +
+          '(qap_observation_complete == 1) and on(pool) (time() - qap_observation_unix_seconds < 45))',
           allowZero: !['completion_percent', 'cached_bytes'].includes(name) });
       }
     }
