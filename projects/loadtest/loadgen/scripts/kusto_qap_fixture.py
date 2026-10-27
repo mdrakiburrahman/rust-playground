@@ -1,20 +1,31 @@
 """Writes, mutates and VACUUMs the Delta fixtures used by kusto-qap-it.sh.
 
-usage: kusto_qap_fixture.py ROOT init|mutate|vacuum
+usage: kusto_qap_fixture.py ROOT init|mutate|vacuum|prune-prep|prune-post|prune-assert-1|prune-assert-2
        kusto_qap_fixture.py ROOT schemas SQLSERVER_SQL
 
 `schemas` writes all canonical tables from sqlserver.sql in the collectors' normalized Delta
 layout (microsecond timestamp followed by its `__unix_nanos` companion, partitioned by
 `__arrowcol_ingestion`) with boundary values for every declared type.
+
+`prune-assert-N` checks the `_delta_log` that delta-maintenance VACUUM/checkpoint/prune-log left
+after cycle N: the floor equals the newest checkpoint and head, no JSON or older checkpoint
+survives at or below it, and the checkpoint keeps the table id, every application transaction
+(receipts and the purge watermark) and the tombstones, whose files are physically gone.
 """
+import json
 import os
 import re
 import sys
 import datetime as dt
 import pyarrow as pa
-from deltalake import DeltaTable, write_deltalake
+import pyarrow.parquet as pq
+from urllib.parse import unquote
+from deltalake import CommitProperties, DeltaTable, PostCommitHookProperties, Transaction, write_deltalake
 
 root, step = sys.argv[1], sys.argv[2]
+NO_HOOKS = PostCommitHookProperties(create_checkpoint=False, cleanup_expired_logs=False)
+WATERMARK = "arrowcol.purge.before-ms"
+WATERMARKS = {"prep": 1_793_070_000_000, "post": 1_793_080_000_000}
 base = f"{root}/telemetry/sqlserver"
 SESS = f"{base}/sqlserver_active_sessions"
 AG = f"{base}/sqlserver_availability_group_states"
@@ -92,6 +103,43 @@ def ag(start, n, batch):
     })
 
 
+def prune_assert(cycle):
+    stages = ("prep",) if cycle == 1 else ("prep", "post")
+    for path in (SESS, AG):
+        name = path.rsplit("/", 1)[1]
+        expected = {f"arrowcol.publication.{stage}": 1 for stage in stages}
+        if path == SESS:
+            expected[WATERMARK] = WATERMARKS[stages[-1]]
+        log = f"{path}/_delta_log"
+        version = DeltaTable(path).version()
+        with open(f"{log}/_last_checkpoint", encoding="utf-8") as hint_file:
+            hint = json.load(hint_file)["version"]
+        with open(f"{path}/_arrowcol_maintenance/log-floor.json", encoding="utf-8") as floor_file:
+            floor = json.load(floor_file)
+        with open(f"{path}/_arrowcol_maintenance/vacuum-lite.json", encoding="utf-8") as progress_file:
+            progress = json.load(progress_file)
+        floor_version = floor["checkpoint_version"]
+        assert floor_version == hint == version, f"{name}: floor {floor_version} hint {hint} head {version}"
+        assert progress["table_id"] == floor["table_id"] and progress["version"] >= floor_version, f"{name}: {progress}"
+        entries = sorted(os.listdir(log))
+        commits = [int(entry[:20]) for entry in entries if re.fullmatch(r"\d{20}\.json", entry)]
+        checkpoints = [entry for entry in entries if ".checkpoint." in entry]
+        assert commits == [], f"{name}: JSON commits survive at or below floor {floor_version}: {commits}"
+        assert checkpoints == [f"{floor_version:020}.checkpoint.parquet"], f"{name}: {checkpoints}"
+        checkpoint = pq.read_table(f"{log}/{checkpoints[0]}").to_pylist()
+        metadata = [row["metaData"] for row in checkpoint if row.get("metaData")]
+        assert [entry["id"] for entry in metadata] == [floor["table_id"]], f"{name}: table id {metadata}"
+        txns = {row["txn"]["appId"]: row["txn"]["version"] for row in checkpoint if row.get("txn")}
+        assert txns == expected, f"{name}: checkpoint txns {txns} != {expected}"
+        adds = [unquote(row["add"]["path"]) for row in checkpoint if row.get("add")]
+        removes = [unquote(row["remove"]["path"]) for row in checkpoint if row.get("remove")]
+        assert removes, f"{name}: checkpoint dropped every tombstone"
+        assert sorted(adds) == sorted(unquote(uri).split(f"{name}/", 1)[1] for uri in DeltaTable(path).file_uris())
+        assert all(os.path.isfile(f"{path}/{add}") for add in adds), f"{name}: active file missing"
+        assert not any(os.path.exists(f"{path}/{remove}") for remove in removes), f"{name}: tombstone not vacuumed"
+        print("PRUNED", cycle, name, "floor", floor_version, "txns", len(txns), "adds", len(adds), "tombstones", len(removes))
+
+
 if step == "init":
     for path, make in ((SESS, sessions), (AG, ag)):
         write_deltalake(path, make(0, 50, "b1"), mode="append", partition_by=["__arrowcol_ingestion"])
@@ -105,6 +153,22 @@ elif step == "mutate":
 elif step == "vacuum":
     for path in (SESS, AG):
         DeltaTable(path).vacuum(retention_hours=0, enforce_retention_duration=False, dry_run=False)
+elif step in ("prune-prep", "prune-post"):
+    # Appends carry a publication receipt txn; sessions also PURGEs a partition under a raised
+    # watermark txn (dataChange=true tombstones), AG deletes rows and OPTIMIZEs (dataChange=false).
+    # delta-rs post-commit checkpoints/log cleanup stay off so only delta-maintenance shapes the log.
+    stage = step.split("-")[1]
+    batch, purged, start = ("b4", "b2", 125) if stage == "prep" else ("b5", "b3", 150)
+    for path, make in ((SESS, sessions), (AG, ag)):
+        receipt = CommitProperties(app_transactions=[Transaction(f"arrowcol.publication.{stage}", 1)])
+        write_deltalake(path, make(start, 25, batch), mode="append", partition_by=["__arrowcol_ingestion"],
+                        commit_properties=receipt, post_commithook_properties=NO_HOOKS)
+    DeltaTable(SESS).delete(f"__arrowcol_ingestion = '{purged}'", post_commithook_properties=NO_HOOKS,
+                            commit_properties=CommitProperties(app_transactions=[Transaction(WATERMARK, WATERMARKS[stage])]))
+    DeltaTable(AG).delete(f"failure_condition_level >= {start + 20}", post_commithook_properties=NO_HOOKS)
+    DeltaTable(AG).optimize.compact(post_commithook_properties=NO_HOOKS)
+elif step.startswith("prune-assert-"):
+    prune_assert(int(step.rsplit("-", 1)[1]))
 paths = (SESS, AG)
 if step == "schemas":
     with open(sys.argv[3], encoding="utf-8") as source:
