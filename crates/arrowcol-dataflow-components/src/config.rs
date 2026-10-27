@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use arrowcol_catalog::{
@@ -11,6 +11,28 @@ use arrowcol_flight::{RuntimeLimits, RuntimeResult};
 use arrowcol_protocol::{PositiveMeasurement, UnixMillis};
 use arrowcol_routing::{MemoryRoutingStore, RoutingStore, SqlServerRoutingConfig, SqlServerRoutingStore};
 use serde::Deserialize;
+
+static CLOUD_GENERATION: OnceLock<String> = OnceLock::new();
+
+/// Freezes the embedding collector's validated cloud epoch before DFE admission.
+///
+/// # Errors
+/// Rejects an attempted process-epoch change or conflicting initialization.
+pub fn configure_cloud_generation(generation: &str) -> Result<(), String> {
+    if let Some(existing) = CLOUD_GENERATION.get() {
+        if existing != generation {
+            return Err("DFE process cloud generation cannot change".to_owned());
+        }
+        return Ok(());
+    }
+    CLOUD_GENERATION
+        .set(generation.to_owned())
+        .map_err(|_| "DFE process cloud generation concurrently initialized".to_owned())
+}
+
+pub(crate) fn process_cloud_generation() -> Option<&'static str> {
+    CLOUD_GENERATION.get().map(String::as_str)
+}
 
 fn default_connect_timeout() -> Duration {
     Duration::from_secs(15)

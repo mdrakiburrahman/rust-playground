@@ -421,7 +421,10 @@ fn create_receiver(
     receiver_config: &ReceiverConfig,
     _capabilities: &otel_arrow_dfe_engine::capability::registry::Capabilities,
 ) -> Result<ReceiverWrapper<OtapPdata>, otel_arrow_dfe_config::error::Error> {
-    let config: FlightReceiverConfig = parse_config(&node_config.config)?;
+    let mut config: FlightReceiverConfig = parse_config(&node_config.config)?;
+    if let Some(generation) = crate::config::process_cloud_generation() {
+        config.registration.instance_key = format!("{}|cloud={generation}", config.registration.instance_key);
+    }
     config.validate().map_err(config_error)?;
     let routing = config.routing.build().map_err(config_error)?;
     let metrics = global_metrics();

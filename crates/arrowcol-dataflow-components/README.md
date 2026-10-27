@@ -1,5 +1,29 @@
 # Arrowcol DFE components
 
+Cloud collectors require `ARROWCOL_RESET_GENERATION` and `ARROWCOL_DELTA_ROOT`.
+Startup validates the configured UUID against ready storage authority before
+starting DFE. The epoch binds the existing persisted `instance_key`, not the
+publication app ID. A stale key is a retryable reconciliation diagnostic before
+any current-lease fast path or lease rebinding; Quiver retains it, never ACKs or
+relabels it under the new epoch. Reset execution remains separately disabled
+until all publisher/reader barriers are proven.
+
+The collector installs SDK0.31 OTLP metrics before Delta initialization. The DFE
+embedding hooks preserve an unfiltered Kernel layer on every global/thread-local
+subscriber (including Noop logging), and flush/shutdown metrics before DFE exits.
+Standard OTLP endpoint/protocol variables and millisecond metric interval are
+honored; the default interval is 2000 ms.
+Its default `service.name` is `arrowcol-dataflow-rust`; `OTEL_SERVICE_NAME`
+overrides it and `OTEL_RESOURCE_ATTRIBUTES` adds labels. SDK resource attributes
+are `telemetry.sdk.name=opentelemetry`, `telemetry.sdk.language=rust`, and
+`telemetry.sdk.version=0.31.0`.
+
+Only a clean controller shutdown closes shared publisher sessions, once the
+controller and its drained table owners have been dropped. Closure runs on the
+main thread before metric flush. A refused close is logged, leaves its registry
+member registered, and exits nonzero without retrying unregister. Startup or
+controller errors retain the publisher registry for reconciliation.
+
 `arrowcol-dataflow-components` links two external OTAP Dataflow Engine (DFE)
 nodes:
 

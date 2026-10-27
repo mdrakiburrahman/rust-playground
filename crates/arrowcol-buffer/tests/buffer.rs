@@ -1345,6 +1345,15 @@ async fn quiver_replays_after_delta_log_commit_before_bundle_release() -> anyhow
     let directory = tempfile::tempdir()?;
     let root = directory.path().join("delta");
     let spool = directory.path().join("quiver");
+    let g1: arrowcol_buffer::CloudGeneration = serde_json::from_value(serde_json::json!({
+        "root": "abfss://container@account.dfs.core.windows.net/same-root",
+        "generation": "f23fb193-a53a-43fd-882e-559c847a5ebc"
+    }))?;
+    let g2: arrowcol_buffer::CloudGeneration = serde_json::from_value(serde_json::json!({
+        "root": "abfss://container@account.dfs.core.windows.net/same-root",
+        "generation": "447a733b-65f7-4574-a4cb-763de89ce47d"
+    }))?;
+    g1.bind_durable_directory(&spool)?;
     let manifest = DeliveryManifest {
         format: DELIVERY_MANIFEST_FORMAT.to_owned(),
         version: DELIVERY_MANIFEST_VERSION,
@@ -1401,6 +1410,17 @@ async fn quiver_replays_after_delta_log_commit_before_bundle_release() -> anyhow
         // No SQL publish or subscriber acknowledgement follows the log commit.
         engine.shutdown().await?;
     }
+    let committed_logs = std::fs::read_dir(root.join("_delta_log"))?.count();
+    let saved_log = directory.path().join("pre_reset_delta_log");
+    std::fs::rename(root.join("_delta_log"), &saved_log)?;
+    assert!(g2.bind_durable_directory(&spool).is_err());
+    assert!(
+        !root.join("_delta_log").exists(),
+        "G2 refusal must not recreate Delta actions"
+    );
+    std::fs::rename(saved_log, root.join("_delta_log"))?;
+    assert_eq!(std::fs::read_dir(root.join("_delta_log"))?.count(), committed_logs);
+    g1.bind_durable_directory(&spool)?;
     let table = BatchedTable::open(&root, CommitOptions::default()).await?;
     let seen = Arc::new(AsyncMutex::new(Vec::new()));
     let sink: Arc<dyn PublicationSink> = Arc::new(RecordingDeltaSink {

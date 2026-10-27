@@ -9,9 +9,14 @@
 
 mod config;
 mod error;
+mod generation;
 mod manager;
 mod quiver;
 mod sink;
+mod telemetry;
+
+pub use generation::CloudGeneration;
+pub use telemetry::MetricsGuard;
 
 pub use config::{BufferConfig, CapacityLimits};
 pub use error::{BufferError, BufferErrorKind, BufferResult};
