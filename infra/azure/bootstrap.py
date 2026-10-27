@@ -258,15 +258,26 @@ class Azure:
             self.c.database + "?api-version=" + API, "https://management.azure.com/", missing_ok=True)
         if not headers:
             return 404, None
-        return int(headers[":status"]), headers.get("azure-asyncoperation") or headers.get("location")
+        # Only Azure-AsyncOperation carries an explicit status contract; Location-only is unknown.
+        return int(headers[":status"]), headers.get("azure-asyncoperation")
 
     def provider_operation(self, url):
-        """Read-only poll of an ARM async operation: Succeeded, Failed, Canceled or InProgress."""
+        """Read-only Azure-AsyncOperation poll: Succeeded, Failed, Canceled, InProgress or Unknown.
+
+        Anything without an explicit known status is Unknown, never a default success.
+        """
+        url = operation_url(url)  # validated before any token is fetched
         data, headers = self.request("GET", url, "https://management.azure.com/")
-        if headers.get(":status") == "202":
-            return "InProgress"
-        body = json.loads(data) if data else {}
-        return body.get("status") or "Succeeded"
+        if headers.get(":status") != "200":
+            return "Unknown"
+        try:
+            body = json.loads(data)
+        except (TypeError, ValueError):
+            return "Unknown"
+        status = body.get("status") if isinstance(body, dict) else None
+        if not isinstance(status, str):
+            return "Unknown"
+        return PROVIDER_STATUSES.get(status.lower(), "Unknown")
 
     def blob(self, method, container, name="", query=None, body=None, headers=None,
              missing_ok=False):
@@ -870,6 +881,23 @@ def database_intent_path(record_path):
     return record_path.with_name(".env.azure.reset.database.json")
 
 
+PROVIDER_STATUSES = {name.lower(): name for name in ("Succeeded", "Failed", "Canceled", "InProgress")}
+OPERATION_SAFE = re.compile(r"^[A-Za-z0-9/._~%=&?:+,;@!$'()*-]*$")
+
+
+def operation_url(url):
+    """Strictly validate a persisted ARM async-operation URL before any authenticated use."""
+    if not isinstance(url, str) or len(url) > 2048 or not OPERATION_SAFE.match(url):
+        raise Failure("Database delete operation URL is malformed; retaining custody.")
+    parts = urllib.parse.urlsplit(url)
+    if (parts.scheme != "https" or parts.netloc != "management.azure.com" or
+            parts.hostname != "management.azure.com" or parts.username or parts.password or
+            parts.port or parts.fragment or not parts.path.startswith("/") or "\\" in url or
+            ".." in parts.path.split("/")):
+        raise Failure("Database delete operation URL is not an ARM operation; retaining custody.")
+    return url
+
+
 def read_database_intent(record_path, record):
     """The owned database-DELETE intent bound to this exact custody, or None."""
     path = database_intent_path(record_path)
@@ -885,6 +913,10 @@ def read_database_intent(record_path, record):
         raise Failure("Database delete intent is malformed; refusing.")
     if (intent["operator"], intent["generation"]) != (record["operator"], record["generation"]):
         raise Failure("Database delete intent belongs to other custody; never adopting it.")
+    if intent["state"] == "accepted" or intent["operation"] is not None:
+        operation_url(intent["operation"])
+    if intent["state"] == "submitting" and intent["operation"] is not None:
+        raise Failure("Database delete intent is malformed; refusing.")
     return intent
 
 
@@ -913,8 +945,11 @@ def settle_database(azure, record, record_path, databases):
             raise Failure(UNKNOWN_DATABASE_DELETE) from exc
         if status in (200, 204, 404):
             update = {**intent, "state": "completed"}
-        elif (status == 202 and isinstance(operation, str) and
-              operation.startswith("https://management.azure.com/")):
+        elif status == 202 and operation is not None:
+            try:
+                operation = operation_url(operation)
+            except Failure as exc:
+                raise Failure(UNKNOWN_DATABASE_DELETE) from exc
             update = {**intent, "state": "accepted", "operation": operation}
         else:
             raise Failure(UNKNOWN_DATABASE_DELETE)
@@ -928,11 +963,15 @@ def settle_database(azure, record, record_path, databases):
             if status == "InProgress":
                 raise Failure("Database delete provider operation is still in progress.")
             return status
+        operation_url(intent["operation"])  # every resume re-validates before any token
         status = retry_ready(terminal, "Database delete operation")
-        if status != "Succeeded":
-            # Provider-terminal without success: that request can have no later effect.
+        if status in ("Failed", "Canceled"):
+            # Explicit provider-terminal failure: that request can have no later effect.
             remove_custody_file(path, intent)
             raise Failure(f"Provider reported the database delete {status}; resume may resubmit.")
+        if status != "Succeeded":
+            raise Failure("Database delete provider receipt is unknown; accepted intent and "
+                          "custody retained, never cleared or resubmitted.")
         update = {**intent, "state": "completed"}
         publish_private(path, update, previous=intent)
 

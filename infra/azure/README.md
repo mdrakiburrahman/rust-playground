@@ -361,15 +361,21 @@ The following describes the operator sequence behind the still-disabled public
     `.env.azure.reset.database.json` intent (`submitting`) bound to its
     operator UUID and generation.
   - Only a definitive response advances it: `200`/`204`/`404` to `completed`,
-    or `202` with an ARM `Azure-AsyncOperation`/`Location` URL to `accepted`.
-    An accepted intent is polled read-only and becomes `completed` only when
-    the provider operation reports `Succeeded`.
+    or `202` with an `Azure-AsyncOperation` URL to `accepted`. A
+    `Location`-only response is treated as unknown.
+  - The operation URL must be `https://management.azure.com/...`, with no
+    user info, port, fragment, dot segments or unsafe characters. It is
+    re-validated on every resume, before any token is fetched.
+  - An accepted intent is polled read-only and becomes `completed` only on an
+    explicit `Succeeded` status. A missing, malformed, non-string or
+    unrecognized status (for example `Queued`) is unknown: the accepted
+    intent and custody are retained, never cleared or resubmitted.
   - A transport failure, crash or other response leaves `submitting`. That
     custody is explicitly **unresumable**: no finish, rotation, rebootstrap or
     resubmission, and the record and `cleaning-v1` are retained for manual
     reconciliation. Timeouts are not claimed to prove anything.
-  - A provider-reported terminal failure removes the intent so resume may
-    resubmit once more under the same custody.
+  - Only an explicit provider `Failed` or `Canceled` removes the intent, so
+    resume may resubmit once more under the same custody.
   - A `Deleting` database without this custody's intent, or an intent from
     another operator or generation, is refused and never adopted.
   - Blob-only cleanup stays resumable as before.

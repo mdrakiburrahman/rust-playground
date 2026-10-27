@@ -672,11 +672,82 @@ class ResetTests(unittest.TestCase):
         self.assertEqual(request.call_args.args[0], "DELETE")
         with patch.object(azure, "request", return_value=(None, {})):
             self.assertEqual(azure.delete_database(), (404, None))
-        for response, expected in (((b"", {":status": "202"}), "InProgress"),
-                                   ((b'{"status":"Failed"}', {":status": "200"}), "Failed"),
-                                   ((b"", {":status": "200"}), "Succeeded")):
-            with patch.object(azure, "request", return_value=response):
+        with patch.object(azure, "request", return_value=(b"", {":status": "202", "location": self.OPERATION})):
+            self.assertEqual(azure.delete_database(), (202, None))  # Location-only is not a receipt
+        for response, expected in (
+                ((b'{"status":"Succeeded"}', {":status": "200"}), "Succeeded"),
+                ((b'{"status":"succeeded"}', {":status": "200"}), "Succeeded"),
+                ((b'{"status":"Failed"}', {":status": "200"}), "Failed"),
+                ((b'{"status":"Canceled"}', {":status": "200"}), "Canceled"),
+                ((b'{"status":"InProgress"}', {":status": "200"}), "InProgress"),
+                ((b"", {":status": "200"}), "Unknown"),
+                ((b"{}", {":status": "200"}), "Unknown"),
+                ((b"not json", {":status": "200"}), "Unknown"),
+                ((b"[]", {":status": "200"}), "Unknown"),
+                ((b'{"status":{"value":"Succeeded"}}', {":status": "200"}), "Unknown"),
+                ((b'{"status":null}', {":status": "200"}), "Unknown"),
+                ((b'{"status":"Queued"}', {":status": "200"}), "Unknown"),
+                ((b'{"status":"Running"}', {":status": "200"}), "Unknown"),
+                ((b'{"status":"Succeeded"}', {":status": "202"}), "Unknown"),
+                ((b"", {":status": "204"}), "Unknown")):
+            with self.subTest(response=response), patch.object(azure, "request", return_value=response):
                 self.assertEqual(azure.provider_operation(self.OPERATION), expected)
+
+    def test_operation_url_is_strictly_validated_before_any_token(self):
+        azure = REAL_AZURE(b.Config({"AZURE_SUBSCRIPTION_ID": SUB}))
+        bad = ["http://management.azure.com/op", "https://management.azure.com.evil.example/op",
+               "https://user@management.azure.com/op", "https://management.azure.com:8443/op",
+               "https://evil.example/op", "https://management.azure.com/op#frag",
+               "https://management.azure.com/a/../op", "https://management.azure.com/op x",
+               "https://management.azure.com/op\nX", "https://management.azure.com\\@evil/op",
+               "https://MANAGEMENT.azure.com/op", None, 7, "https://management.azure.com/" + "a" * 2100]
+        with patch.object(azure, "token", side_effect=AssertionError("token fetched")), \
+                patch.object(azure, "cli", side_effect=AssertionError("cli used")):
+            for url in bad:
+                with self.subTest(url=url), self.assertRaisesRegex(b.Failure, "operation URL"):
+                    azure.provider_operation(url)
+        self.assertEqual(b.operation_url(self.OPERATION + "?api-version=2024-04-13"),
+                         self.OPERATION + "?api-version=2024-04-13")
+
+    @patch.object(b.time, "sleep")
+    @patch.object(b, "run_tree")
+    def test_unknown_provider_receipt_retains_accepted_without_removal_or_resubmit(self, run, sleep):
+        generation = self.start_reset(run)
+        for status in ("Unknown", "Queued", "Running", None, {"status": "Succeeded"}, ""):
+            with self.subTest(status=status):
+                with patch.object(self.azure, "delete_database", return_value=(202, self.OPERATION)) as submit, \
+                        patch.object(self.azure, "provider_operation", return_value=status), \
+                        patch.object(b, "retry_ready", lambda action, label, timeout=600: action()):
+                    with self.assertRaisesRegex(b.Failure, "receipt is unknown"):
+                        if self.record.exists():
+                            b._unqualified_reset_resume(self.azure)
+                        else:
+                            b._unqualified_reset_sequence(self.azure, ["stop"])
+                self.assertEqual(self.intent()["state"], "accepted")
+                self.assertEqual((self.azure.metadata["resetstate"], self.azure.metadata["resetgeneration"]),
+                                 ("cleaning-v1", generation))
+                self.assertTrue(self.record.exists())
+        self.assertEqual(self.azure.events.count(("arm-delete-db",)), 0)  # patched: submitted once only
+        self.assertEqual(submit.call_count, 0)
+
+    @patch.object(b.time, "sleep")
+    @patch.object(b, "run_tree")
+    def test_tampered_persisted_operation_url_is_refused_on_resume(self, run, sleep):
+        generation = self.start_reset(run)
+        with patch.object(self.azure, "delete_database", return_value=(202, self.OPERATION)), \
+                patch.object(self.azure, "provider_operation", return_value="InProgress"), \
+                patch.object(b, "retry_ready", lambda action, label, timeout=600: action()):
+            with self.assertRaisesRegex(b.Failure, "in progress"):
+                b._unqualified_reset_sequence(self.azure, ["stop"])
+        accepted = self.intent()
+        tampered = {**accepted, "operation": "https://evil.example/op"}
+        b.publish_private(b.database_intent_path(self.record), tampered, previous=accepted)
+        with patch.object(self.azure, "provider_operation", side_effect=AssertionError("polled")), \
+                patch.object(self.azure, "delete_database", side_effect=AssertionError("resubmitted")):
+            with self.assertRaisesRegex(b.Failure, "operation URL"):
+                b._unqualified_reset_resume(self.azure)
+        self.assertEqual(self.intent(), tampered)
+        self.assertEqual(self.azure.metadata["resetgeneration"], generation)
 
     @patch.object(b.time, "sleep")
     @patch.object(b, "run_tree")
