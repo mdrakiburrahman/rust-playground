@@ -645,6 +645,39 @@ impl PublisherSession {
         }
     }
 
+    /// Synchronous [`Self::close_shared_async`].
+    ///
+    /// # Errors
+    /// See [`Self::close_shared_async`]; also rejects shared-runtime callers.
+    pub fn close_shared() -> Result<()> {
+        block_on_shared(Self::close_shared_async())
+    }
+
+    /// Process shutdown: close every cached shared session after its guarded
+    /// mutations drain. Never registers anything. Each session is attempted;
+    /// the first failure is returned and that member stays registered.
+    ///
+    /// # Errors
+    /// Returns the first close refusal, revocation or unknown-outcome failure.
+    pub async fn close_shared_async() -> Result<()> {
+        let sessions: Vec<_> = match SESSIONS.get() {
+            Some(cache) => cache
+                .lock()
+                .await
+                .values()
+                .filter_map(|entry| entry.clone().ok())
+                .collect(),
+            None => return Ok(()),
+        };
+        let mut first = None;
+        for session in sessions {
+            if let Err(error) = session.close_after_drain_async().await {
+                first.get_or_insert(error);
+            }
+        }
+        first.map_or(Ok(()), Err)
+    }
+
     /// Synchronous [`Self::open_async`].
     ///
     /// # Errors

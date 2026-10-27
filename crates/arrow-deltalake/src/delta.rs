@@ -1,6 +1,7 @@
 //! Local, append-only Delta tables backed exclusively by Delta Kernel.
 
 use crate::delta_io::{BATCH_ROWS, READ_AHEAD, SharedExecutor, shared_executor};
+use crate::publisher::{PublisherSession, SessionMode};
 use crate::{
     CompletedFile, CompletedFileObservation, ParquetFileWriter, normalize, record_batch_logical_bytes, sync_ancestors,
     sync_directory, sync_directory_chain, sync_file,
@@ -100,7 +101,7 @@ pub fn object_store_for_url(url: &Url) -> Result<Arc<dyn ObjectStore>> {
 /// Check immediately before and after each checkpoint mutation; a failure is
 /// terminal for that service generation, not permission to retry against a reset.
 pub struct StorageAuthority {
-    fence: Option<Arc<crate::azure_fence::AzureResetFence>>,
+    session: Option<Arc<PublisherSession>>,
 }
 
 impl StorageAuthority {
@@ -108,44 +109,42 @@ impl StorageAuthority {
     /// Local storage has no cloud reset epoch.
     #[must_use]
     pub fn generation(&self) -> Option<&str> {
-        self.fence.as_ref().map(|fence| fence.generation())
+        self.session.as_ref().and_then(|session| session.generation())
     }
 
-    /// Capture the current owned, ready reset generation.
+    /// The process publisher session backing this authority (Azure only).
+    #[must_use]
+    pub fn session(&self) -> Option<&Arc<PublisherSession>> {
+        self.session.as_ref()
+    }
+
+    /// Bind an explicitly opened publisher session.
+    #[must_use]
+    pub const fn from_session(session: Arc<PublisherSession>) -> Self {
+        Self { session: Some(session) }
+    }
+
+    /// Capture the process-wide registered publisher session for the URL's account.
+    /// Must not be called on the shared Delta I/O runtime.
     ///
     /// # Errors
     /// Rejects missing/mismatched container authority and authentication failures.
     pub fn open(url: &Url) -> Result<Self> {
         if url.scheme() == "file" {
-            return Ok(Self { fence: None });
+            return Ok(Self { session: None });
         }
-        let store = azure_store(url)?;
-        let account = if url.scheme() == "az" {
-            std::env::var("AZURE_STORAGE_ACCOUNT").or_else(|_| std::env::var("AZURE_STORAGE_ACCOUNT_NAME"))?
-        } else {
-            url.host_str()
-                .context("missing Azure account")?
-                .split('.')
-                .next()
-                .context("missing Azure account")?
-                .to_owned()
-        };
-        let credentials = Arc::clone(store.credentials());
-        let fence = shared_executor()?
-            .block_on(async move { crate::azure_fence::AzureResetFence::open(&account, credentials, false).await })?;
         Ok(Self {
-            fence: Some(Arc::new(fence)),
+            session: Some(PublisherSession::shared_for_url(url)?),
         })
     }
 
-    /// Fail closed if reset state or generation differs from the captured authority.
+    /// Fail closed if reset state, generation or registration differs from the captured authority.
     ///
     /// # Errors
-    /// Returns reset fencing, ownership, authentication or storage-read failures.
+    /// Returns reset fencing, revocation, authentication or storage-read failures.
     pub fn check(&self) -> Result<()> {
-        if let Some(fence) = &self.fence {
-            let fence = Arc::clone(fence);
-            shared_executor()?.block_on(async move { fence.check().await })?;
+        if let Some(session) = &self.session {
+            session.check()?;
         }
         Ok(())
     }
@@ -208,7 +207,7 @@ pub fn verify_writable_uri(root: &str) -> Result<()> {
             Url::from_directory_path(fs::canonicalize(root)?).map_err(|()| anyhow::anyhow!("invalid path"))?
         }
     };
-    let table = DeltaTable::open_connection(url, Vec::new(), None, false)?;
+    let table = DeltaTable::open_connection(url, Vec::new(), None, None)?;
     table.check_publication()?;
     let path = table.object_path(&format!(".arrowcol-probe-{}", uuid::Uuid::new_v4()))?;
     let store = Arc::clone(&table.store);
@@ -891,7 +890,7 @@ pub struct DeltaTable {
     pub(crate) commit_lock: Mutex<()>,
     pub(crate) store: Arc<dyn ObjectStore>,
     partition_columns: Vec<String>,
-    reset_fence: Option<Arc<crate::azure_fence::AzureResetFence>>,
+    session: Option<Arc<PublisherSession>>,
     bootstrap_only: bool,
     snapshot_cache: Mutex<Option<CachedSnapshot>>,
     reuse_snapshots: bool,
@@ -927,8 +926,7 @@ struct LogFingerprint {
 pub(crate) struct DurableCommitter;
 
 struct GuardedCommitter {
-    authority: Option<Arc<crate::azure_fence::AzureResetFence>>,
-    bootstrap: bool,
+    session: Option<Arc<PublisherSession>>,
 }
 
 impl Committer for GuardedCommitter {
@@ -954,13 +952,12 @@ impl Committer for GuardedCommitter {
                 ArrowEngineData::new(batch),
             ))));
         }
-        if let Some(authority) = &self.authority {
-            let authority = Arc::clone(authority);
-            let bootstrap = self.bootstrap;
+        if let Some(session) = &self.session {
+            let session = Arc::clone(session);
             shared_executor()
                 .map_err(|error| delta_kernel::Error::generic(error.to_string()))?
-                .block_on(async move { authority.check_mode(bootstrap).await })
-                .map_err(|error| delta_kernel::Error::generic(error.to_string()))?;
+                .block_on(async move { session.check_async().await })
+                .map_err(|error| delta_kernel::Error::generic(format!("{error:#}")))?;
         }
         DurableCommitter.commit(engine, Box::new(prepared.into_iter()), metadata)
     }
@@ -1027,8 +1024,7 @@ fn committed<S>(result: CommitResult<S>) -> Result<u64> {
 impl DeltaTable {
     pub(crate) fn committer(&self) -> Box<dyn Committer> {
         Box::new(GuardedCommitter {
-            authority: self.reset_fence.clone(),
-            bootstrap: self.bootstrap_only,
+            session: self.session.clone(),
         })
     }
     /// Open a local or ADLS table without taking the collector's lifetime ownership lock.
@@ -1037,7 +1033,27 @@ impl DeltaTable {
     /// # Errors
     /// Rejects unsupported URLs, credentials, incompatible partitions or table metadata.
     pub fn open_url(url: Url, schema: SchemaRef, partition_columns: Vec<String>) -> Result<Arc<Self>> {
-        let table = Self::open_connection(url, partition_columns, None, false)?;
+        let table = Self::open_connection(url, partition_columns, None, None)?;
+        table.ensure_schema(normalize::schema(&schema)?)?;
+        Ok(table)
+    }
+
+    /// [`Self::open_url`] under an explicitly owned publisher session. Every data,
+    /// log and checkpoint mutation goes through the session's guarded store, so the
+    /// session can only close cleanly after they all have definite outcomes. The
+    /// caller closes the session after dropping its tables; a bootstrap session
+    /// opens schema only and never publishes data.
+    /// Must not be called on the shared Delta I/O runtime.
+    ///
+    /// # Errors
+    /// Rejects a URL outside the session's storage, plus [`Self::open_url`] errors.
+    pub fn open_url_with_session(
+        url: Url,
+        schema: SchemaRef,
+        partition_columns: Vec<String>,
+        session: Arc<PublisherSession>,
+    ) -> Result<Arc<Self>> {
+        let table = Self::open_connection(url, partition_columns, None, Some(session))?;
         table.ensure_schema(normalize::schema(&schema)?)?;
         Ok(table)
     }
@@ -1047,10 +1063,28 @@ impl DeltaTable {
     ///
     /// # Errors
     /// Requires matching sandbox container metadata in the fenced state.
+    /// Azure admission registers a fresh bootstrap publisher only when the
+    /// container is `fenced-v1` at the generation in
+    /// [`crate::publisher::EXPECTED_GENERATION_ENV`], with an empty registry and
+    /// released occupancy, before any table I/O. The member then drains and
+    /// unregisters; it never sets `ready-v1`. An uncertain mutation leaves it
+    /// registered so reset cannot proceed over it.
     pub fn initialize_url_for_bootstrap(url: Url, schema: SchemaRef, partition_columns: Vec<String>) -> Result<()> {
-        let table = Self::open_connection(url, partition_columns, None, true)?;
-        table.ensure_schema(normalize::schema(&schema)?)?;
-        Ok(())
+        if url.scheme() == "file" {
+            let table = Self::open_connection(url, partition_columns, None, None)?;
+            table.ensure_schema(normalize::schema(&schema)?)?;
+            return Ok(());
+        }
+        let expected = crate::publisher::expected_generation_from_env()?;
+        let session = PublisherSession::open_bootstrap(&url, &expected)?;
+        let initialized = Self::open_connection(url, partition_columns, None, Some(Arc::clone(&session)))
+            .and_then(|table| table.ensure_schema(normalize::schema(&schema)?));
+        let closed = session.close_after_drain();
+        match (initialized, closed) {
+            (Ok(_), closed) => closed,
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(close)) => Err(error.context(format!("bootstrap registration retained: {close:#}"))),
+        }
     }
 
     /// Open a collector-owned local path or an independently coordinated ADLS URI.
@@ -1067,7 +1101,7 @@ impl DeltaTable {
                     Vec::new()
                 },
                 Some(publication_fence),
-                false,
+                None,
             ),
             Ok(url) => Self::open_with_fence(
                 url.to_file_path().map_err(|()| anyhow::anyhow!("invalid local URI"))?,
@@ -1081,34 +1115,26 @@ impl DeltaTable {
         mut url: Url,
         partition_columns: Vec<String>,
         publication_fence: Option<Arc<dyn PublicationFence>>,
-        bootstrap_only: bool,
+        session: Option<Arc<PublisherSession>>,
     ) -> Result<Arc<Self>> {
         if !url.path().ends_with('/') {
             url.set_path(&format!("{}/", url.path()));
         }
-        let mut reset_fence = None;
-        let store: Arc<dyn ObjectStore> = match url.scheme() {
-            "file" => Arc::new(object_store::local::LocalFileSystem::new()),
-            "abfs" | "abfss" | "az" => {
-                let store = azure_store(&url)?;
-                let account = if url.scheme() == "az" {
-                    std::env::var("AZURE_STORAGE_ACCOUNT").or_else(|_| std::env::var("AZURE_STORAGE_ACCOUNT_NAME"))?
-                } else {
-                    url.host_str()
-                        .context("missing Azure account")?
-                        .split('.')
-                        .next()
-                        .context("missing Azure account")?
-                        .to_owned()
-                };
-                let credentials = Arc::clone(store.credentials());
-                let fence = shared_executor()?.block_on(async move {
-                    crate::azure_fence::AzureResetFence::open(&account, credentials, bootstrap_only).await
-                })?;
-                reset_fence = Some(Arc::new(fence));
-                Arc::new(store)
-            }
+        let session = match (url.scheme(), session) {
+            (_, Some(session)) => Some(session),
+            ("file", None) => None,
+            ("abfs" | "abfss" | "az", None) => Some(PublisherSession::shared_for_url(&url)?),
             _ => bail!("only file and ADLS URLs are supported"),
+        };
+        let bootstrap_only = session
+            .as_ref()
+            .is_some_and(|session| session.mode() == SessionMode::Bootstrap);
+        if let Some(session) = &session {
+            session.check()?;
+        }
+        let store: Arc<dyn ObjectStore> = match &session {
+            Some(session) => session.store_for_url(&url)?,
+            None => Arc::new(object_store::local::LocalFileSystem::new()),
         };
         let root = if url.scheme() == "file" {
             let path = url
@@ -1141,7 +1167,7 @@ impl DeltaTable {
             snapshot_cache: Mutex::new(None),
             reuse_snapshots: false,
             publication_fence,
-            reset_fence,
+            session,
             bootstrap_only,
         });
         Ok(table)
@@ -1151,9 +1177,8 @@ impl DeltaTable {
         if self.bootstrap_only {
             bail!("bootstrap initialization cannot publish data");
         }
-        if let Some(fence) = &self.reset_fence {
-            let fence = Arc::clone(fence);
-            shared_executor()?.block_on(async move { fence.check().await })?;
+        if let Some(session) = &self.session {
+            session.check()?;
         }
         Ok(())
     }
@@ -1374,7 +1399,7 @@ impl DeltaTable {
             snapshot_cache: Mutex::new(None),
             reuse_snapshots,
             publication_fence,
-            reset_fence: None,
+            session: None,
             bootstrap_only: false,
         }))
     }

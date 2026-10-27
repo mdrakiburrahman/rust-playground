@@ -176,6 +176,9 @@ fn main_inner() -> Result<bool> {
     if let Some(listener) = listener {
         listener.join().map_err(|_| anyhow!("metrics listener panicked"))?;
     }
+    // Every table has been dropped; an undrained or uncertain member stays registered.
+    arrow_deltalake::publisher::PublisherSession::close_shared()
+        .map_err(|error| anyhow!("publisher session close failed; registration retained: {error:#}"))?;
     if let Some(provider) = provider {
         provider
             .shutdown()

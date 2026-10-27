@@ -10,7 +10,9 @@
 //! clobber metadata and must not exist. Leases serialize transitions only;
 //! registry membership never expires.
 
-use crate::publisher::{CasOutcome, ControlMetadata, MetadataSnapshot, Registry, ResetState};
+use crate::publisher::{CasOutcome, ControlMetadata, MetadataSnapshot};
+#[cfg(test)]
+use crate::publisher::{Registry, ResetState};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use object_store::azure::{AzureCredential, AzureCredentialProvider};
@@ -18,6 +20,7 @@ use reqwest::{Method, StatusCode};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
+#[cfg(test)]
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -245,19 +248,18 @@ impl ControlMetadata for AzureControlContainer {
     }
 }
 
-/// Reset generation captured at open; checks require the same authority.
+/// Unregistered generation check, superseded in production by
+/// [`crate::publisher::PublisherSession`]; kept to pin registry state parsing.
+#[cfg(test)]
 pub(crate) struct AzureResetFence {
     control: Arc<AzureControlContainer>,
     generation: String,
 }
 
+#[cfg(test)]
 impl AzureResetFence {
     pub(crate) fn generation(&self) -> &str {
         &self.generation
-    }
-
-    pub(crate) async fn open(account: &str, credentials: AzureCredentialProvider, bootstrap: bool) -> Result<Self> {
-        Self::with_control(Arc::new(AzureControlContainer::new(account, credentials)?), bootstrap).await
     }
 
     pub(crate) async fn with_control(control: Arc<AzureControlContainer>, bootstrap: bool) -> Result<Self> {

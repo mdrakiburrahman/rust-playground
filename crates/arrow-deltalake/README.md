@@ -147,8 +147,11 @@ repair a failed local durability operation.
 Local tables fsync the canonical table root and every ancestor on open/reopen,
 every partition directory from a staged file's leaf up to the table root before
 its Add can commit (multi-column Hive paths included), and the
-`_last_checkpoint` hint file after checkpoint finalization. Any fsync failure is
-returned and nothing is published.
+`_last_checkpoint` hint file after checkpoint finalization. Every fsync failure
+is returned. A failure before the commit file is created publishes nothing; a
+commit or hint fsync failure can follow a visible publication, so it fails the
+acknowledgment and the retry/reconciliation path (same publication txn) must
+re-establish durability rather than roll back.
 Exhaustion and semantic/schema conflicts remain visible errors; orphan files
 remain for inspection. The 10-second
 collection window is not a visibility bound: dependency waves add latency.

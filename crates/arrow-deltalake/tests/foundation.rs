@@ -121,3 +121,30 @@ async fn transaction_fences_survive_checkpoint_and_log_cleanup() -> Result<()> {
     assert!(table.commit_files_with_transaction(&[], "fenced", 3).is_err());
     Ok(())
 }
+
+/// Scenario: a process owns an explicit publisher session, publishes, then shuts down.
+/// Guarantees: mutations run through the session's guarded store, close succeeds only
+/// after they drain, and a closed session admits no further publication.
+#[tokio::test(flavor = "multi_thread")]
+async fn explicit_session_publishes_then_closes_after_drain() -> Result<()> {
+    use arrow_deltalake::publisher::{Phase, PublisherSession};
+    let root = tempfile::tempdir()?;
+    let input = batch()?;
+    let session = PublisherSession::local();
+    let url = Url::from_directory_path(root.path()).map_err(|()| anyhow::anyhow!("URL"))?;
+    let table = DeltaTable::open_url_with_session(url.clone(), input.schema(), vec!["p".into()], Arc::clone(&session))?;
+    let mut file = table.new_file_partitioned(input.schema(), BTreeMap::from([("p".into(), Some("a".into()))]))?;
+    file.write(&input).await?;
+    assert_eq!(
+        table.commit_files_with_transaction(&[file.stage().await?], "query-s", 0)?,
+        1
+    );
+    assert_eq!(session.status().inflight, 0);
+    assert!(session.status().uncertain.is_none());
+    session.close_after_drain_async().await?;
+    assert_eq!(session.status().phase, Phase::Closed);
+    assert!(table.commit_files_with_transaction(&[], "query-s", 1).is_err());
+    assert_eq!(table.lookup_txn("query-s")?, Some(0));
+    assert!(DeltaTable::open_url_with_session(url, input.schema(), vec!["p".into()], session).is_err());
+    Ok(())
+}
