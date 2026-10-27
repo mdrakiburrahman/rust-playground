@@ -8,7 +8,8 @@
     "arrowcol-router-rust",
     "arrowcol-infra",
     "arrowcol-sdk-gen",
-    "kusto-explorer"
+    "kusto-explorer",
+    "kusto-bridge"
   ],
   "targets": {
     "format": {
@@ -62,7 +63,8 @@
             "arrowcol-rust",
             "arrowcol-dataflow-rust",
             "arrowcol-router-rust",
-            "kusto-explorer"
+            "kusto-explorer",
+            "kusto-bridge"
           ],
           "target": "image"
         }

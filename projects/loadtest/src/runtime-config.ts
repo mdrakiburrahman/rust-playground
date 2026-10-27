@@ -1,6 +1,7 @@
 import path from 'node:path';
 
 import YAML from 'yaml';
+import type { AzureTargets, LoadtestMode } from './mode.js';
 
 export const benchmarkBufferBudget = Object.freeze({
   global_capacity: Object.freeze({ bytes: 134217728, rows: 4000000, batches: 2048 }),
@@ -31,6 +32,8 @@ interface DirectIdentity {
 export interface BenchmarkRuntimeOptions {
   /** Persist every batch to native Quiver (fsync before acknowledgement) before publishing it. */
   quiver?: boolean;
+  mode?: LoadtestMode;
+  azure?: AzureTargets;
 }
 
 export function buildBenchmarkRuntimeConfigs(
@@ -49,6 +52,11 @@ export function buildBenchmarkRuntimeConfigs(
   const direct = YAML.parse(directSource);
   const dataflow = YAML.parse(dataflowSource);
   const nodes = dataflow.groups.arrowcol.pipelines.ingest.nodes;
+  if (options.mode === 'azure') {
+    if (!options.azure) throw new Error('Azure runtime requires validated targets');
+    direct.delta.root = options.azure.directRoot;
+    nodes.delta.config.base_path = options.azure.dataflowRoot;
+  }
   for (const buffer of [direct.buffer, nodes.delta.config.batching]) {
     buffer.global_capacity = { ...benchmarkBufferBudget.global_capacity };
     buffer.per_table_capacity = { ...benchmarkBufferBudget.per_table_capacity };

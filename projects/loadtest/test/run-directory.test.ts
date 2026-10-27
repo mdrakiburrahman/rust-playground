@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 
 import { BENCHMARK_PROJECT } from '../src/cli.js';
 import { deltaTableLocations } from '../src/main.js';
-import { acquireBenchmarkController, benchmarkDirectories, checkedBenchmarkPath, resetBenchmark } from '../src/lifecycle.js';
+import { acquireBenchmarkController, benchmarkDirectories, checkedBenchmarkPath, resetBenchmark, stopBenchmark } from '../src/lifecycle.js';
 
 function fixture(t: { after: (callback: () => void) => void }): string {
   const workspace = mkdtempSync(path.resolve('projects/loadtest/test/.fixture-reset-'));
@@ -35,7 +35,7 @@ function mockDocker(workspace: string): { commands: string[][]; docker: (args: s
     { id: 'unrelated', name: 'unrelated', labels: labelled('another-project') },
   ];
   const volumes: Resource[] = [
-    ...['sqlserver-data', 'hive-warehouse', 'kusto-data'].map(volume => ({
+    ...['sqlserver-data', 'hive-warehouse', 'kusto-data', 'kusto-bridge-state'].map(volume => ({
       id: `${BENCHMARK_PROJECT}_${volume}`, name: `${BENCHMARK_PROJECT}_${volume}`,
       labels: { ...labelled(BENCHMARK_PROJECT), 'com.docker.compose.volume': volume,
         'io.arrowcol.loadtest.workspace': workspace },
@@ -85,6 +85,21 @@ test('Delta output has one fixed location', () => {
   ].join('\n'));
 });
 
+test('stop halts only verified workspace services and preserves every file and volume', async t => {
+  const workspace = fixture(t);
+  const latest = path.join(workspace, 'onelake/benchmark/latest');
+  mkdirSync(latest, { recursive: true });
+  writeFileSync(path.join(latest, 'keep.txt'), 'durable');
+  const { docker, commands } = mockDocker(workspace);
+  await stopBenchmark(workspace, docker);
+  assert(commands.some(args => args.join(' ') === 'stop --time 30 collector'));
+  assert(commands.every(args => !args.includes('rm')));
+  assert.equal(readFileSync(path.join(latest, 'keep.txt'), 'utf8'), 'durable');
+  const foreign = mockDocker('/foreign');
+  await assert.rejects(stopBenchmark(workspace, foreign.docker), /another workspace/u);
+  assert(foreign.commands.every(args => args[0] !== 'stop' && !args.includes('rm')));
+});
+
 test('starting again removes old output and owned SQL, Hive and Kusto resources without an identity flag', async t => {
   const workspace = fixture(t);
   const latest = path.join(workspace, 'onelake/benchmark/latest');
@@ -93,7 +108,7 @@ test('starting again removes old output and owned SQL, Hive and Kusto resources 
   const { docker, commands } = mockDocker(workspace);
   assert.equal(await resetBenchmark(workspace, docker), latest);
   assert(!existsSync(path.join(latest, 'old.json')));
-  for (const volume of ['sqlserver-data', 'hive-warehouse', 'kusto-data']) {
+  for (const volume of ['sqlserver-data', 'hive-warehouse', 'kusto-data', 'kusto-bridge-state']) {
     assert(commands.some(args => args.join(' ') === `volume rm ${BENCHMARK_PROJECT}_${volume}`));
   }
   assert(commands.some(args => args.join(' ') === 'rm collector'));

@@ -63,6 +63,7 @@ prefix. Initialization does not insert data or prove Azure/QAP readiness.
 
 | Option | Meaning | Default |
 | --- | --- | --- |
+| `--mode` | Select `local` disk/emulator or `azure` ADLS/Azure Kusto together | `ARROWCOL_MODE`, otherwise `local` |
 | `--warmup` | Warmup before measurement | `30s` |
 | `--concurrency` | Concurrent sending lanes | `4` |
 | `--batch-rows` | Rows per Arrow batch | `8192` |
@@ -70,6 +71,27 @@ prefix. Initialization does not insert data or prove Azure/QAP readiness.
 | `--validate` | Check Delta snapshots and native Kusto data after the generator finishes | Off |
 | `--quiver` | Both collectors persist every batch to [Quiver](#disk-persistence-with-quiver) on local disk before acknowledging it, then publish to Delta from disk | Off |
 | `--crash-after` | With `--quiver`, `kill -9` both collectors this long after they start persisting, restart them, and require replay from disk | Off |
+
+Azure mode reads private `.env`, then `.env.azure`, with explicit inherited
+environment taking precedence. It requires the configured owned ADLS root,
+account, data/checkpoint containers, Kusto URI and database; it never falls back
+to another subscription or to the emulator. Each run uses isolated roots below
+the configured private prefix. The runner acquires occupancy before cloud work
+and stops its owned writers before releasing it. Missing authorization is a
+failure, not successful skipped qualification. Real Azure QAP qualification is
+separate from local emulator functionality and remains unverified until a live
+authorized run produces the required observations.
+
+To stop only this workspace's loadtest without deleting its data:
+
+```bash
+npx --no-install tsx projects/loadtest/src/main.ts --stop
+```
+
+Successful stop emits one JSON receipt with `stopped:true`,
+`scope:"workspace-owned-loadtest"` and `dataPreserved:true`. This local stop is
+not a distributed fencing guarantee: Azure reset must also enforce the owned
+checkpoint-container metadata fence and occupancy CAS.
 
 Both collectors use two CPUs and matching buffer limits: 128 MiB overall,
 32 MiB per table, and 32 MiB per flush. SQL Server defaults to a 16 GiB memory
@@ -122,9 +144,10 @@ replay batches from disk.
 
 With `--quiver`, `--validate` requires **every acknowledged row** in Delta for
 both pools. Without it, Dataflow admission is best effort, so validation only
-requires a published batch per Dataflow table. Recovery is at least once:
-a batch whose publication landed just before the kill can be published again,
-so row counts are lower bounds.
+requires a published batch per Dataflow table. Independent source-client submissions may duplicate under the at-least-once
+request contract. Replaying the **same publication identity** must instead be
+idempotent. Exact snapshot row multisets and stable publication IDs, rather than
+ACK counts alone, are the correctness evidence.
 
 ## Watch and inspect
 

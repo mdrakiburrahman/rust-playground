@@ -1,4 +1,7 @@
+import { parseMode, type LoadtestMode } from './mode.js';
+
 export interface BenchmarkOptions {
+  mode: LoadtestMode;
   warmupSeconds: number;
   measureSeconds?: number;
   captureSettleSeconds: number;
@@ -34,7 +37,8 @@ function positiveInteger(value: string, name: string): number {
   return parsed;
 }
 
-export function parseBenchmarkOptions(args: string[]): BenchmarkOptions {
+export function parseBenchmarkOptions(args: string[], env: NodeJS.ProcessEnv = process.env): BenchmarkOptions {
+  let mode = env.ARROWCOL_MODE ?? 'local';
   let warmup = '30s';
   let concurrency = '4';
   let batchRows = '8192';
@@ -55,7 +59,8 @@ export function parseBenchmarkOptions(args: string[]): BenchmarkOptions {
     const option = inline?.[1] ?? args[index];
     const value = inline?.[2] ?? args[++index];
     if (value === undefined || value === '') throw new Error(`${option} requires a value`);
-    if (option === '--warmup') warmup = value;
+    if (option === '--mode') mode = value;
+    else if (option === '--warmup') warmup = value;
     else if (option === '--concurrency') concurrency = value;
     else if (option === '--measure') measure = value;
     else if (option === '--batch-rows') batchRows = value;
@@ -73,6 +78,7 @@ export function parseBenchmarkOptions(args: string[]): BenchmarkOptions {
     throw new Error('--crash-after must be shorter than --warmup + --measure so the crash interrupts live load');
   }
   return {
+    mode: parseMode(mode),
     warmupSeconds,
     measureSeconds,
     captureSettleSeconds: 30,
@@ -87,5 +93,5 @@ export function parseBenchmarkOptions(args: string[]): BenchmarkOptions {
   };
 }
 
-export const benchmarkUsage = '[--warmup 30s] [--measure 1m (omit to run until Ctrl+C)] [--concurrency 4] [--batch-rows 8192] [--validate] ' +
+export const benchmarkUsage = '[--mode local|azure (default local)] [--warmup 30s] [--measure 1m (omit to run until Ctrl+C)] [--concurrency 4] [--batch-rows 8192] [--validate] ' +
   '[--quiver] [--crash-after 20s (requires --quiver)]';
