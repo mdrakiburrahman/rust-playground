@@ -22,7 +22,7 @@ pub use config::{BufferConfig, CapacityLimits};
 pub use error::{BufferError, BufferErrorKind, BufferResult};
 pub use manager::{
     Admission, BufferManager, BufferPressureSnapshot, DeliveryCompletion, DeliveryOutcome, FlushReason, IncompleteWork,
-    ShutdownReport, TablePressureSnapshot, TrackedState,
+    ShutdownReport, TablePressureSnapshot, TrackedState, safe_error_message,
 };
 pub use quiver::{
     DELIVERY_MANIFEST_FORMAT, DELIVERY_MANIFEST_VERSION, DELIVERY_SLOT, DELTA_SUBSCRIBER, DeliveryBundle,
