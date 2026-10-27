@@ -79,8 +79,8 @@ export interface StressDriverOptions {
   results: string;
   loadEnded: AbortSignal;
   checkRunning: () => void;
-  /** Resolves only after actual generator measure-phase evidence is available. */
-  waitForInput: (deadline: number) => Promise<string>;
+  /** Resolves after BOTH actual compactable fixtures and sufficient remaining generator input are evidenced. */
+  waitForInput: (deadline: number) => Promise<{ runId: string; inputDeadline: number }>;
   /** Runs real operations on both pools. The deadline is absolute and may not be extended. */
   operate: (wave: number, deadline: number) => Promise<void>;
   sample: (wave: number, runId: string, deadline: number) => Promise<WaveSample>;
@@ -99,13 +99,18 @@ export async function runStressDriver(options: StressDriverOptions): Promise<Str
   };
   writeFileSync(path.join(results, 'stress-plan.json'), `${JSON.stringify(plan, null, 2)}\n`, { flag: 'wx' });
   try {
-    runId = await options.waitForInput(Date.now() + plan.startupTimeoutSeconds * 1000);
+    const input = await options.waitForInput(Date.now() + plan.startupTimeoutSeconds * 1000);
+    runId = input.runId;
     check();
     const start = Date.now();
+    if (!Number.isSafeInteger(input.inputDeadline) ||
+        input.inputDeadline < start + (plan.durationSeconds + plan.sampleTimeoutSeconds) * 1000) {
+      throw new Error('Remaining generator input cannot cover the immutable window at its actual start');
+    }
     criteria = { ...plan.limits, start, end: start + plan.durationSeconds * 1000,
       phase: 'wave-boundary', endpointToleranceMs: plan.sampleTimeoutSeconds * 1000 };
     writeFileSync(path.join(results, 'stress-window.json'), `${JSON.stringify({
-      run_id: runId, criteria, correctness: 'requires-final-source-and-native-validation',
+      run_id: runId, input_deadline: input.inputDeadline, criteria, correctness: 'requires-final-source-and-native-validation',
       inputCounter: 'scheduled logical rows, not ACKs or a correctness oracle',
       corpusLimits: { maximumDistinctRowsPerPartition: 256, maximumDistinctRowsPerTable: 65536, generatedPayloadPeriodRows: 16 },
       backlogUnit: 'work items; component counters retained in resource evidence',
@@ -138,7 +143,8 @@ export async function runStressDriver(options: StressDriverOptions): Promise<Str
   }
   const verdict: StressVerdict = criteria
     ? evaluateStress(samples, criteria)
-    : { status: 'insufficient-evidence', reasons: ['Actual source measure phase was not observed'], samples: 0, cycles: 0 };
+    : { status: 'insufficient-evidence',
+      reasons: ['Actual BOTH-pool fixture readiness and input coverage were not established before the window'], samples: 0, cycles: 0 };
   if (failure) {
     verdict.status = 'failed';
     verdict.reasons.push('Actual driver/operation/telemetry failure; window was not extended');

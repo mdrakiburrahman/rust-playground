@@ -58,7 +58,7 @@ still enforces the unchanged per-partition and whole-corpus guards.
   "durationSeconds": 180,
   "waveIntervalSeconds": 60,
   "operationTimeoutSeconds": 40,
-  "startupTimeoutSeconds": 180,
+  "startupTimeoutSeconds": 300,
   "sampleTimeoutSeconds": 10,
   "fixture": {"batchRows": 8192, "rowGroupRows": 512, "pageRows": 128},
   "limits": {
@@ -75,9 +75,20 @@ still enforces the unchanged per-partition and whole-corpus guards.
 ```
 
 These are example limits, not demonstrated capacity or a successful run.
-The immutable window starts at observed source measure-phase progress, after
-the bounded startup wait. `driver-progress.json` is atomically replaced every
-second with run identity, actual scheduled logical rows, send-policy failures,
+The immutable window starts only after BOTH actual CPU tables have committed
+nonempty source files, a physically measured multi-rowgroup file, and at least
+two small files in the newest eligible closed partition. Readiness mirrors the
+service's minute-granularity OPTIMIZE rules: the newest partition is protected
+even when closed, `latest-partitions=1`, and the target/small-file sizes are
+128/64 MiB. A declared warmup such as `--warmup 120s` can form this fixture;
+warmup and readiness must fit the original absolute startup deadline.
+`stress-readiness.json` records actual readiness time, snapshots, layout hashes,
+and the generator lifetime. Before starting, the remaining measured input must
+cover the entire immutable window plus the final sample budget; insufficient
+input fails before a window is created. Neither deadline is extended.
+`driver-progress.json` is atomically replaced every
+second with run identity, phase start/duration/monotonic remaining milliseconds,
+actual scheduled logical rows, send-policy failures,
 and terminal receipt failures. Scheduled input is a pace counter, **not ACK
 accounting or a correctness oracle**. Per-wave source snapshots, structured
 operation reports, complete measured-root inventories, raw numeric resource

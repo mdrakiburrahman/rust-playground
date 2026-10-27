@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
 import { parseStressPlan, runStressDriver, type StressPlan } from '../src/stress-driver.js';
@@ -39,7 +39,7 @@ test('actual clock controller executes exactly the declared waves and persists m
   const frameTimes: number[] = [];
   const verdict = await runStressDriver({
     plan, results, loadEnded: new AbortController().signal, checkRunning: () => {},
-    waitForInput: async () => 'offline-controller-fixture',
+    waitForInput: async () => ({ runId: 'offline-controller-fixture', inputDeadline: Date.now() + 60_000 }),
     operate: async (wave, deadline) => { assert(Date.now() < deadline); operations.push(wave); },
     sample: async wave => {
       const timestamp = Date.now(); frameTimes.push(timestamp);
@@ -62,11 +62,26 @@ test('actual operation failure is persisted once and never retried until green',
   let attempts = 0;
   await assert.rejects(runStressDriver({
     plan, results, loadEnded: new AbortController().signal, checkRunning: () => {},
-    waitForInput: async () => 'offline-failure-fixture',
+    waitForInput: async () => ({ runId: 'offline-failure-fixture', inputDeadline: Date.now() + 60_000 }),
     operate: async () => { attempts++; throw new Error('fixture operation failed'); },
     sample: async wave => ({ timestamp: Date.now(), wave, phase: 'wave-boundary', driverRows: 100,
       rssBytes: 100, physicalBytes: 100, backlog: 1, restarts: 0, oomEvents: 0, exhaustedRetries: 0 }),
   }), /fixture operation failed/u);
   assert.equal(attempts, 1);
   assert.equal(JSON.parse(readFileSync(path.join(results, 'stress-verdict.json'), 'utf8')).status, 'failed');
+});
+
+test('input coverage is rechecked at the actual start before creating any immutable window', async t => {
+  const results = fixture(t);
+  await assert.rejects(runStressDriver({
+    plan, results, loadEnded: new AbortController().signal, checkRunning: () => {},
+    waitForInput: async () => ({ runId: 'expired-input-fixture',
+      inputDeadline: Date.now() + plan.durationSeconds * 1000 }),
+    operate: async () => assert.fail('an insufficient input budget must not launch maintenance'),
+    sample: async () => assert.fail('an insufficient input budget must not sample a pretend window'),
+  }), /cannot cover the immutable window at its actual start/u);
+  assert(!existsSync(path.join(results, 'stress-window.json')));
+  const verdict = JSON.parse(readFileSync(path.join(results, 'stress-verdict.json'), 'utf8'));
+  assert.equal(verdict.status, 'failed');
+  assert.equal(verdict.cycles, 0);
 });
