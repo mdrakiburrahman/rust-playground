@@ -1613,6 +1613,28 @@ impl DeltaTable {
         Ok(self.snapshot()?.version())
     }
 
+    fn sync_replayed_local_state(&self, version: u64) -> Result<()> {
+        if self.url.scheme() != "file" {
+            return Ok(());
+        }
+        let log = self.root.join("_delta_log");
+        for entry in fs::read_dir(&log)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let is_replayed = name
+                .get(..20)
+                .and_then(|prefix| prefix.parse::<u64>().ok())
+                .is_some_and(|entry_version| entry_version <= version)
+                && (name.ends_with(".json") || name.ends_with(".parquet"));
+            if name == "_last_checkpoint" || is_replayed {
+                File::open(entry.path())?.sync_all()?;
+            }
+        }
+        sync_directory(&log)?;
+        sync_directory(&self.root)
+    }
+
     pub(crate) fn commit_files(&self, files: &[StagedAppend]) -> Result<u64> {
         if files.is_empty() {
             bail!("cannot publish an empty Delta data commit");
@@ -1648,6 +1670,7 @@ impl DeltaTable {
                     bail!("publication transaction fenced by newer application version");
                 }
                 if previous == version {
+                    self.sync_replayed_local_state(snapshot.version())?;
                     observation.finish("deduplicated");
                     return Ok(snapshot.version());
                 }
@@ -1677,6 +1700,7 @@ impl DeltaTable {
                 pending.push(append);
             }
             if pending.is_empty() && identity.is_none() {
+                self.sync_replayed_local_state(snapshot.version())?;
                 observation.finish("deduplicated");
                 return Ok(snapshot.version());
             }
@@ -1750,6 +1774,8 @@ impl DeltaTable {
                         _ => return Ok(None),
                     }
                 }
+                // Visibility is not proof of local durability after an I/O error.
+                self.sync_replayed_local_state(latest.version())?;
                 Ok(Some(latest.version()))
             };
             match transaction.commit(&self.engine) {

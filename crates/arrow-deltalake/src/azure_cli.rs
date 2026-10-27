@@ -14,6 +14,28 @@ struct Cached {
     until: Instant,
 }
 
+#[cfg(unix)]
+struct OwnedProcessGroup(rustix::process::Pid);
+
+#[cfg(unix)]
+impl OwnedProcessGroup {
+    fn kill(&self) -> Result<()> {
+        match rustix::process::kill_process_group(self.0, rustix::process::Signal::KILL) {
+            Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+            Err(_) => Err(failure("Azure CLI process-group cancellation failed")),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for OwnedProcessGroup {
+    fn drop(&mut self) {
+        if let Err(error) = self.kill() {
+            tracing::error!(%error, "Azure CLI owned process-group cleanup failed");
+        }
+    }
+}
+
 pub(crate) struct BoundedAzureCli {
     program: OsString,
     deadline: Duration,
@@ -51,7 +73,8 @@ impl BoundedAzureCli {
         {
             return Ok(Arc::clone(&cached.token));
         }
-        let mut child = tokio::process::Command::new(&self.program)
+        let mut command = tokio::process::Command::new(&self.program);
+        command
             .args([
                 "account",
                 "get-access-token",
@@ -63,9 +86,20 @@ impl BoundedAzureCli {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|_| failure("Azure CLI could not start"))?;
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
+        #[cfg(not(unix))]
+        return Err(failure("bounded Azure CLI process-tree cancellation requires Unix"));
+        let mut child = command.spawn().map_err(|_| failure("Azure CLI could not start"))?;
+        #[cfg(unix)]
+        let group = OwnedProcessGroup(
+            rustix::process::Pid::from_raw(
+                i32::try_from(child.id().ok_or_else(|| failure("Azure CLI PID unavailable"))?)
+                    .map_err(|_| failure("Azure CLI PID invalid"))?,
+            )
+            .ok_or_else(|| failure("Azure CLI PID invalid"))?,
+        );
         let stdout = child
             .stdout
             .take()
@@ -79,10 +113,12 @@ impl BoundedAzureCli {
         let status = match result {
             Ok(Ok(status)) if bytes.len() <= 65536 => status,
             _ => {
+                #[cfg(unix)]
+                group.kill()?;
                 child
-                    .kill()
+                    .wait()
                     .await
-                    .map_err(|_| failure("Azure CLI cancellation failed"))?;
+                    .map_err(|_| failure("Azure CLI child reaping failed"))?;
                 return Err(failure("Azure CLI acquisition timed out or exceeded output bound"));
             }
         };
@@ -143,6 +179,69 @@ impl CredentialProvider for BoundedAzureCli {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// Scenario: the actual CLI shape is a shell wrapper with a Python descendant.
+    /// Guarantees: acquisition timeout kills descendant work, not only the wrapper.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn wrapper_descendants_stop_on_acquisition_timeout() -> anyhow::Result<()> {
+        wrapper_descendants_stop(false).await
+    }
+
+    /// Scenario: the caller cancels an in-progress credential request.
+    /// Guarantees: dropping the future kills only its owned group, including descendants.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn wrapper_descendants_stop_on_outer_future_cancellation() -> anyhow::Result<()> {
+        wrapper_descendants_stop(true).await
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wrapper_descendants_stop(cancel: bool) -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let executable = root.path().join("fake-az");
+        let pid_path = root.path().join("descendant-pid");
+        let late = root.path().join("descendant-work");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nsh -c 'echo $$ > \"{}\"; sleep 0.4; echo late > \"{}\"' &\nwait\n",
+                pid_path.display(),
+                late.display(),
+            ),
+        )?;
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))?;
+        let provider = BoundedAzureCli {
+            program: executable.into_os_string(),
+            deadline: if cancel {
+                Duration::from_secs(3)
+            } else {
+                Duration::from_millis(150)
+            },
+            cache: Mutex::new(None),
+        };
+        let request = tokio::spawn(async move { provider.get_credential().await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !pid_path.exists() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await?;
+        let pid = std::fs::read_to_string(&pid_path)?.trim().parse::<u32>()?;
+        if cancel {
+            request.abort();
+            assert!(request.await.is_err_and(|error| error.is_cancelled()));
+        } else {
+            assert!(request.await?.is_err());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!late.exists(), "descendant resumed delayed token work");
+        if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            let state = status.rsplit_once(") ").map(|(_, rest)| rest.chars().next());
+            assert_eq!(state, Some(Some('Z')), "descendant is still alive: {status}");
+        }
+        Ok(())
+    }
 
     /// Scenario: CLI refresh stalls after authority was checked.
     /// Guarantees: cancellation kills the child; its delayed publication side effect cannot occur.

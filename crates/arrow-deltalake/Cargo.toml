@@ -29,6 +29,10 @@ futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 sha2 = "0.10"
 async-trait = "0.1"
+tracing.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["process"] }
 
 [dev-dependencies]
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
