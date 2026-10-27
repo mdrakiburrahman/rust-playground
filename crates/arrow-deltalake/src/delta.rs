@@ -987,13 +987,15 @@ impl Committer for DurableCommitter {
                 .location
                 .to_file_path()
                 .map_err(|_| delta_kernel::Error::generic("non-local commit location"))?;
-            File::open(&path)?.sync_all()?;
+            let durable =
+                |result: Result<()>| result.map_err(|error| delta_kernel::Error::generic(format!("{error:#}")));
+            durable(sync_file(&path))?;
             let parent = path
                 .parent()
                 .ok_or_else(|| delta_kernel::Error::generic("missing log parent"))?;
-            File::open(parent)?.sync_all()?;
+            durable(sync_directory(parent))?;
             if let Some(root) = parent.parent() {
-                File::open(root)?.sync_all()?;
+                durable(sync_directory(root))?;
             }
         }
         Ok(response)
@@ -1734,7 +1736,9 @@ impl DeltaTable {
         Ok(self.snapshot()?.version())
     }
 
-    fn sync_replayed_local_state(&self, version: u64) -> Result<()> {
+    /// Re-establish local durability of every replayed log/checkpoint file up to
+    /// `version` before acknowledging an identity already visible in the log.
+    pub(crate) fn sync_replayed_local_state(&self, version: u64) -> Result<()> {
         if self.url.scheme() != "file" {
             return Ok(());
         }
@@ -1749,7 +1753,7 @@ impl DeltaTable {
                 .is_some_and(|entry_version| entry_version <= version)
                 && (name.ends_with(".json") || name.ends_with(".parquet"));
             if name == "_last_checkpoint" || is_replayed {
-                File::open(entry.path())?.sync_all()?;
+                sync_file(&entry.path())?;
             }
         }
         sync_directory(&log)?;

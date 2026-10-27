@@ -931,6 +931,9 @@ impl DeltaTable {
             })();
             uncertain |= in_flight;
             match result {
+                Ok(Some(Published::AlreadyApplied(version))) => {
+                    return self.durable_applied(version, outputs, report);
+                }
                 Ok(Some(published)) => return Ok(published),
                 Ok(None) => {}
                 Err(error) => {
@@ -966,6 +969,25 @@ impl DeltaTable {
         Err(self.discard_after(outputs, error, report))
     }
 
+    /// Acknowledge a visible plan identity only after local replay is durable; a
+    /// failed repair keeps the outcome uncertain and every output retained.
+    fn durable_applied(
+        &self,
+        version: u64,
+        outputs: &[StagedOutput],
+        report: &mut MaintenanceReport,
+    ) -> Result<Published> {
+        if let Err(error) = self.sync_replayed_local_state(version) {
+            report.outputs = outputs.iter().map(|output| output.relative.clone()).collect();
+            return Err(fail_with(
+                MaintenanceErrorKind::Uncertain,
+                format!("plan visible at version {version} but local durability unproven; outputs retained: {error:#}"),
+                report,
+            ));
+        }
+        Ok(Published::AlreadyApplied(version))
+    }
+
     /// Resolve an attempt whose publication may have happened. A visible plan id
     /// means it was published; otherwise (or if the refresh fails) every output
     /// is retained and the outcome is reported as unknown.
@@ -982,7 +1004,7 @@ impl DeltaTable {
                 .map(|_| snapshot.version()))
         });
         if let Ok(Some(version)) = reconciled {
-            return Ok(Published::AlreadyApplied(version));
+            return self.durable_applied(version, outputs, report);
         }
         report.outputs = outputs.iter().map(|output| output.relative.clone()).collect();
         let detail = match reconciled {
@@ -1409,6 +1431,12 @@ impl DeltaTable {
             .get_app_id_version(&plan.header.app_id("optimize"), &self.engine)?
             .is_some()
         {
+            self.sync_replayed_local_state(report.version).map_err(|error| {
+                fail(
+                    MaintenanceErrorKind::Uncertain,
+                    format!("plan already visible but local durability unproven: {error:#}"),
+                )
+            })?;
             report.outcome = Outcome::AlreadyApplied;
             return Ok(report);
         }
@@ -2188,6 +2216,12 @@ impl DeltaTable {
             .get_app_id_version(&plan.header.app_id("delete"), &self.engine)?
             .is_some()
         {
+            self.sync_replayed_local_state(report.version).map_err(|error| {
+                fail(
+                    MaintenanceErrorKind::Uncertain,
+                    format!("plan already visible but local durability unproven: {error:#}"),
+                )
+            })?;
             report.outcome = Outcome::AlreadyApplied;
             return Ok(report);
         }
@@ -2658,5 +2692,105 @@ impl MaintenancePlan {
             Self::Purge(plan) => &plan.header,
             Self::Vacuum(plan) => &plan.header,
         }
+    }
+}
+
+#[cfg(test)]
+mod durability_tests {
+    use super::*;
+    use crate::delta::INGESTION_PARTITION;
+    use crate::sync_hook;
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field};
+    use std::collections::BTreeMap;
+
+    const BASE: i64 = 1_704_067_200_000;
+
+    /// Scenario: OPTIMIZE's JSON commit becomes visible but the log fsync fails.
+    /// Guarantees: neither reconciliation nor a repeated apply acknowledges the
+    /// visible plan until replayed log state is durable; outputs stay retained, and
+    /// a retry after repair succeeds as already applied without a second commit.
+    #[test]
+    fn visible_plan_is_not_acknowledged_until_replay_is_durable() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = fs::canonicalize(directory.path())?;
+        let url = Url::from_directory_path(&root).map_err(|()| anyhow::anyhow!("URL"))?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(INGESTION_PARTITION, DataType::Utf8, false),
+        ]));
+        let table = DeltaTable::open_url(url.clone(), Arc::clone(&schema), vec![INGESTION_PARTITION.into()])?;
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        for chunk in 0..6_i64 {
+            let minute = chunk / 2;
+            let partition = format!("2024-01-01-00-{minute:02}");
+            runtime.block_on(async {
+                let mut file = table
+                    .new_file_partitioned(
+                        Arc::clone(&schema),
+                        BTreeMap::from([(INGESTION_PARTITION.to_owned(), Some(partition.clone()))]),
+                    )?
+                    .with_ingestion_time(BASE + minute * 60_000 + 1)?;
+                file.write(&RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int64Array::from_iter_values(chunk * 10..chunk * 10 + 5)),
+                        Arc::new(arrow::array::StringArray::from(vec![partition.as_str(); 5])),
+                    ],
+                )?)
+                .await?;
+                file.finish().await.map(|_| ())
+            })?;
+        }
+        drop(table);
+        let maintenance = DeltaTable::open_for_maintenance(&url)?;
+        let config = OptimizeConfig {
+            granularity: Some(Granularity::Minute),
+            now_ms: Some(BASE + 60 * 60_000),
+            ..OptimizeConfig::default()
+        };
+        let plan = maintenance.plan_optimize(&config)?;
+        assert!(!plan.bins.is_empty());
+        let before = maintenance.version()?;
+        let log = root.join("_delta_log");
+        sync_hook::fail_on(&log);
+
+        let control = MaintenanceControl::new(Arc::new(std::sync::atomic::AtomicBool::new(false)), None);
+        let first = maintenance.apply_optimize(&plan, &config, &control);
+        assert!(matches!(
+            first.as_ref().err().and_then(error_kind),
+            Some(MaintenanceErrorKind::Uncertain)
+        ));
+        let committed = before + 1;
+        assert!(
+            log.join(format!("{committed:020}.json")).is_file(),
+            "publication must be visible"
+        );
+        assert_eq!(maintenance.version()?, committed);
+        let outputs = first
+            .err()
+            .and_then(|error| error.downcast::<MaintenanceError>().ok())
+            .map(|error| error.report.map(|report| report.outputs).unwrap_or_default())
+            .unwrap_or_default();
+        assert!(!outputs.is_empty());
+        for output in &outputs {
+            assert!(root.join(output).is_file(), "retained output {output}");
+        }
+
+        let repeated = maintenance.apply_optimize(&plan, &config, &control);
+        assert!(matches!(
+            repeated.as_ref().err().and_then(error_kind),
+            Some(MaintenanceErrorKind::Uncertain)
+        ));
+
+        sync_hook::reset(&root);
+        let repaired = maintenance.apply_optimize(&plan, &config, &control)?;
+        assert_eq!(repaired.outcome, Outcome::AlreadyApplied);
+        assert_eq!(maintenance.version()?, committed);
+        let synced = sync_hook::synced_under(&root);
+        assert!(synced.contains(&log));
+        assert!(synced.contains(&log.join(format!("{committed:020}.json"))));
+        sync_hook::reset(&root);
+        Ok(())
     }
 }
