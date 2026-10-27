@@ -21,7 +21,9 @@ LABEL org.opencontainers.image.title="arrow-tenant-stream" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.revision="${VCS_REF}"
 COPY --chmod=0444 infra/docker/install-azure-cli.sh /tmp/install-azure-cli.sh
-RUN sh /tmp/install-azure-cli.sh \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tini \
+    && sh /tmp/install-azure-cli.sh \
     && rm -f /tmp/install-azure-cli.sh \
     && groupadd --gid 10001 app \
     && useradd --uid 10001 --gid app --no-create-home --no-log-init --home-dir /nonexistent --shell /usr/sbin/nologin app \
@@ -35,4 +37,4 @@ STOPSIGNAL SIGTERM
 EXPOSE 9094
 HEALTHCHECK --interval=10s --timeout=3s --start-period=30s --retries=6 \
   CMD ["curl", "--fail", "--silent", "--show-error", "--max-time", "2", "http://127.0.0.1:9094/metrics"]
-ENTRYPOINT ["/usr/local/bin/arrow-tenant-stream"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/arrow-tenant-stream"]
