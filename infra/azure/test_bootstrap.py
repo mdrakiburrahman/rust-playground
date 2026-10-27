@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -423,6 +424,55 @@ class StorageApiTests(unittest.TestCase):
         }):
             with self.assertRaises(b.Failure):
                 self.azure.collection(self.azure.c.cluster_id + "/databases")
+
+
+class InitializerHookTests(unittest.TestCase):
+    def test_hook_invokes_only_owned_initializer_with_private_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            cargo = path / "cargo"
+            cargo.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\"\n")
+            cargo.chmod(0o700)
+            env = {
+                **os.environ, "PATH": directory + ":" + os.environ["PATH"],
+                "ARROWCOL_AZURE_TABLE_MANIFEST": str(path / ".env.azure.tables.json"),
+                "ARROWCOL_AZURE_TABLE_ROOT": "abfss://data@example.dfs.core.windows.net/",
+                "AZURE_STORAGE_ACCOUNT": "example", "AZURE_STORAGE_CONTAINER": "data",
+                "AZURE_STORAGE_CHECKPOINT_CONTAINER": "checkpoints",
+            }
+            result = b.subprocess.run(
+                ["bash", str(b.ROOT / "infra/azure/initialize-delta.sh")], env=env,
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.splitlines(), [
+                "run", "--locked", "--quiet", "--package", "arrowcol-loadgen",
+                "--", "initialize-azure", "--manifest", env["ARROWCOL_AZURE_TABLE_MANIFEST"],
+            ])
+
+    def test_hook_missing_private_configuration_fails_before_cargo(self):
+        env = {key: value for key, value in os.environ.items()
+               if key not in ("ARROWCOL_AZURE_TABLE_MANIFEST", "ARROWCOL_AZURE_TABLE_ROOT")}
+        result = b.subprocess.run(
+            ["bash", str(b.ROOT / "infra/azure/initialize-delta.sh")], env=env,
+            capture_output=True, text=True, check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("bootstrap must provide", result.stderr)
+
+
+class BicepContractTests(unittest.TestCase):
+    def test_kusto_application_principal_is_distinct_from_storage_object_principal(self):
+        source = (b.ROOT / "infra/azure/sandbox.bicep").read_text()
+        reader = source.split("resource reader ", 1)[1]
+        storage = source.split("resource readData ", 1)[1].split("resource writeData ", 1)[0]
+        self.assertIn("principalId: identity.properties.clientId", reader)
+        self.assertIn("principalId: identity.properties.principalId", storage)
+
+    def test_redeploy_does_not_replace_live_container_control_metadata(self):
+        source = (b.ROOT / "infra/azure/sandbox.bicep").read_text()
+        container = source.split("resource checkpoints ", 1)[1].split("resource readData ", 1)[0]
+        self.assertIn("if (!checkpointExists)", container)
 
 
 if __name__ == "__main__":
