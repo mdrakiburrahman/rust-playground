@@ -128,6 +128,47 @@ fn dry_run_then_apply_then_noop() -> Result<()> {
     Ok(())
 }
 
+/// Scenario: dry-run, apply and repeat of the checkpoint operation.
+/// Guarantees: a dry run writes nothing, apply writes one checkpoint without a
+/// commit or any JSON deletion, a repeat is a no-op, and VACUUM still sees the
+/// complete JSON history afterwards.
+#[test]
+fn checkpoint_bounds_replay_without_deleting_history() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("events");
+    table(&path)?;
+    let before = version(&path)?;
+    let log = path.join("_delta_log");
+    let checkpoints = || -> Result<usize> {
+        Ok(std::fs::read_dir(&log)?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".checkpoint.parquet"))
+            .count())
+    };
+    let args = ["--operation", "checkpoint", "--checkpoint-every-commits", "1"];
+    let dry = service(root.path())?.args(args).output()?;
+    assert!(dry.status.success(), "{}", String::from_utf8_lossy(&dry.stderr));
+    assert_eq!(lines(&dry.stdout)?[0]["report"]["outcome"], "planned");
+    assert_eq!(checkpoints()?, 0);
+
+    let applied = service(root.path())?.args(args).arg("--apply").output()?;
+    assert!(applied.status.success(), "{}", String::from_utf8_lossy(&applied.stderr));
+    assert_eq!(lines(&applied.stdout)?[0]["report"]["outcome"], "checkpointed");
+    assert_eq!(checkpoints()?, 1);
+    assert!(log.join("_last_checkpoint").is_file());
+    assert_eq!(version(&path)?, before, "no commit and no JSON deleted");
+
+    let repeat = service(root.path())?.args(args).arg("--apply").output()?;
+    assert!(repeat.status.success());
+    assert_eq!(lines(&repeat.stdout)?[0]["report"]["outcome"], "noop");
+    assert_eq!(checkpoints()?, 1);
+
+    let vacuum = service(root.path())?.args(["--operation", "vacuum"]).output()?;
+    assert!(vacuum.status.success(), "{}", String::from_utf8_lossy(&vacuum.stderr));
+    assert_ne!(lines(&vacuum.stdout)?[0]["error_kind"], "unsupported");
+    Ok(())
+}
+
 /// Scenario: unsafe or invalid requests.
 /// Guarantees: traversal names and short VACUUM retention fail visibly with nonzero exit.
 #[test]

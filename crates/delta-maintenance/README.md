@@ -11,6 +11,7 @@ It is a separate process, not a collector task. It opens tables with `DeltaTable
 | `optimize` | Rewrites small files in the latest-N closed Hive partitions into sorted files of about 128 MiB. Rows, schema and partition values are preserved. | One atomic `dataChange=false` add+remove |
 | `purge` | Removes still-active files in expired `__arrowcol_ingestion` partitions. | `dataChange=true` removes, plus the `arrowcol.purge.before-ms` watermark, in the same transaction |
 | `vacuum` | VACUUM LITE: physically deletes tombstoned files older than the retention period, using `_delta_log` only (no data directory listing). | None |
+| `checkpoint` | Writes a classic Kernel checkpoint once `--checkpoint-every-commits` (default 100) commits follow the hinted checkpoint. This bounds snapshot replay for the collector and readers. Application transactions (publication and purge identities) and metadata are retained. JSON history is never deleted. | None (checkpoint Parquet + `_last_checkpoint` hint) |
 
 ## Safety
 
@@ -25,7 +26,11 @@ It is a separate process, not a collector task. It opens tables with `DeltaTable
 - **VACUUM rejects unsafe paths.** Traversal and external paths are rejected.
 - **VACUUM reports partial progress.** Cancelling mid-delete reports a `partial` outcome.
 
-Distributed reset-barrier registration is **not** wired yet. The service does not claim infra-reset safety.
+On Azure the service opens tables through the shared publisher session and closes it after the run; a failed close exits nonzero and leaves its registration in place. Reset execution stays disabled, so the service does not claim infra-reset safety.
+
+### Log growth
+
+`_delta_log` grows without bound by design. VACUUM LITE proves tombstones from contiguous JSON commits `0..=version`, and the service never deletes JSON history, checkpoints, or the transaction identities they carry. Each append adds one JSON commit, and each `checkpoint` adds one Parquet file. `checkpoint` bounds replay *time*, not log *size*. VACUUM refuses with `resource_limit` once the log exceeds `max_log_files` (100,000 commits); it never falls back to a partial scan. Long-running tables need a future, explicitly designed history-cleanup policy that preserves those proofs.
 
 ## Usage
 

@@ -30,16 +30,19 @@ pub enum Operation {
     Optimize,
     Purge,
     Vacuum,
+    /// Kernel checkpoint once enough commits accumulate; never deletes history.
+    Checkpoint,
 }
 
 impl Operation {
-    const ALL: [Self; 3] = [Self::Optimize, Self::Purge, Self::Vacuum];
+    const ALL: [Self; 4] = [Self::Optimize, Self::Purge, Self::Vacuum, Self::Checkpoint];
 
     const fn label(self) -> &'static str {
         match self {
             Self::Optimize => "optimize",
             Self::Purge => "purge",
             Self::Vacuum => "vacuum",
+            Self::Checkpoint => "checkpoint",
         }
     }
 }
@@ -62,6 +65,8 @@ pub struct Settings {
     pub vacuum_retention_ms: i64,
     pub unsafe_short_vacuum_for_tests: bool,
     pub optimize: OptimizeConfig,
+    /// Minimum commits after the hinted checkpoint before `checkpoint` writes one.
+    pub checkpoint_every_commits: u64,
 }
 
 impl Settings {
@@ -87,6 +92,9 @@ impl Settings {
             if !valid {
                 bail!("invalid table name {name:?}: use [A-Za-z0-9_.-] without traversal");
             }
+        }
+        if self.checkpoint_every_commits == 0 {
+            bail!("--checkpoint-every-commits must be nonzero");
         }
         if self.operations.is_empty() {
             bail!("at least one --operation is required");
@@ -383,6 +391,9 @@ fn run_operation(
         None => now_ms()?,
     };
     let plan = match operation {
+        Operation::Checkpoint => {
+            return table.checkpoint_if_due(settings.checkpoint_every_commits, settings.apply);
+        }
         Operation::Optimize => {
             let config = OptimizeConfig {
                 granularity: settings.granularity,

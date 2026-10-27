@@ -67,6 +67,9 @@ struct Cli {
     target_file_mib: u64,
     #[arg(long)]
     latest_partitions: Option<usize>,
+    /// `checkpoint` writes once this many commits follow the hinted checkpoint.
+    #[arg(long, default_value_t = 100)]
+    checkpoint_every_commits: u64,
     /// Prometheus listen address.
     #[arg(long, default_value = "127.0.0.1:9467")]
     listen: SocketAddr,
@@ -96,6 +99,7 @@ fn settings(cli: Cli) -> Result<Settings> {
         anchor_ms: cli.anchor_ms,
         vacuum_retention_ms: millis(cli.vacuum_retention_secs)?,
         unsafe_short_vacuum_for_tests: cli.unsafe_short_vacuum_for_tests,
+        checkpoint_every_commits: cli.checkpoint_every_commits,
         optimize: OptimizeConfig {
             target_file_bytes: target,
             small_file_bytes: (target / 2).max(1),
