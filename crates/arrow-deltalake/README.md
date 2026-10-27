@@ -221,7 +221,7 @@ install another subscriber/exporter or create placeholder observations.
 The `arrow-deltalake` meter exports these actual instruments:
 
 | Instrument | Unit | Bounded attributes |
-|---|---|---|
+| --- | --- | --- |
 | `delta.kernel.events` | counter | `event`, `outcome` |
 | `delta.kernel.duration` | s, histogram | `event`, `phase` |
 | `delta.kernel.values` | 1, histogram | `event`, `field` |
@@ -250,7 +250,7 @@ accounting are preserved. Legacy `new_file` stays streaming and unchanged.
 Schemas without `customer_id` keep streaming unless sort columns are explicit.
 
 | Environment option | Default |
-|---|---|
+| --- | --- |
 | `ARROWCOL_LAYOUT_SORT_COLUMNS` | `customer_id` (comma-separated, ordered keys) |
 | `ARROWCOL_LAYOUT_BLOOM_COLUMNS` | `customer_id` |
 | `ARROWCOL_LAYOUT_MAX_ROWS` | 262144 |

@@ -146,7 +146,7 @@ groups. A recorded devcontainer execution returned the same 4,096 customer
 rows for both predicate layouts:
 
 | Scan | Rows returned | DataFusion bytes scanned | Row groups pruned by statistics | File ranges pruned |
-|---|---:|---:|---:|---:|
+| --- | ---: | ---: | ---: | ---: |
 | Sorted, customer predicate | 4,096 | 22,188 | 60 / 64 | 0 |
 | Unsorted, customer predicate | 4,096 | 404,480 | 0 / 64 | 0 |
 | Sorted, unfiltered projection | 65,536 | 352,000 | 0 / 64 | 0 |

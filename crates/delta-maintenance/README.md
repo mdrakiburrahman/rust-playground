@@ -7,7 +7,7 @@ It is a separate process, not a collector task. It opens tables with `DeltaTable
 ## Operations
 
 | Operation | Effect | Commit |
-|---|---|---|
+| --- | --- | --- |
 | `optimize` | Rewrites small files in the latest-N closed Hive partitions into sorted files of about 128 MiB. Rows, schema and partition values are preserved. | One atomic `dataChange=false` add+remove |
 | `purge` | Removes still-active files in expired `__arrowcol_ingestion` partitions. | `dataChange=true` removes, plus the `arrowcol.purge.before-ms` watermark, in the same transaction |
 | `vacuum` | VACUUM LITE: physically deletes tombstoned files older than the retention period, using `_delta_log` only (no data directory listing). | None |
@@ -51,7 +51,7 @@ delta-maintenance --root abfss://c@acct.dfs.core.windows.net/delta/ --table even
 ### Exit codes
 
 | Code | Meaning |
-|---|---|
+| --- | --- |
 | 0 | Success |
 | 1 | An operation failed. Its JSON report includes `error_kind`. |
 | 2 | Invalid configuration |
