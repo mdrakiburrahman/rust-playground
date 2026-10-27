@@ -328,7 +328,7 @@ mod io_tests {
         let store = Arc::new(PausedStagePut::default());
         let table = Arc::get_mut(&mut writer.table).context("unique stage table")?;
         table.url = Url::parse("abfss://fixture@example.invalid/table/")?;
-        table.store = store.clone();
+        table.store = Arc::<PausedStagePut>::clone(&store);
         let staged = tokio::time::timeout(Duration::from_secs(5), async {
             let progress = async {
                 store.entered.notified().await;
