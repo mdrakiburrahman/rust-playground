@@ -206,6 +206,41 @@ impl Planned {
     fn empty(&self) -> bool {
         self.bins == 0 && self.inputs.is_empty() && self.backlog_files == 0
     }
+
+    fn same_work(&self, other: &Self) -> bool {
+        fn inputs(plan: &Planned) -> BTreeMap<&str, &DataFile> {
+            plan.inputs.iter().map(|file| (file.path.as_str(), file)).collect()
+        }
+        self.table_id == other.table_id
+            && self.version == other.version
+            && self.bins == other.bins
+            && (self.plan_id == other.plan_id || inputs(self) == inputs(other))
+    }
+
+    fn proven_saturated(&self, report: &MaintenanceReport) -> bool {
+        report.outcome == Outcome::Noop
+            && report.operation == "optimize"
+            && report.plan_id.as_deref() == Some(self.plan_id.as_str())
+            && report.read_version == self.version
+            && report.version == self.version
+            && report.files_removed == 0
+            && report.files_added == 0
+            && report.rows_removed == 0
+            && report.rows_added == 0
+            && report.bytes_removed == 0
+            && report.bytes_added == 0
+            && report.outputs.is_empty()
+            && report.nonbeneficial_bins == self.bins as u64
+            && report.attempts == 0
+            && report.collisions == 0
+            && report.retries == 0
+            && report.skipped_partitions == 0
+            && report.backlog_files == 0
+            && report.files_deleted == 0
+            && report.files_already_absent == 0
+            && !report.interrupted
+            && self.backlog_files == 0
+    }
 }
 
 #[derive(Serialize)]
@@ -213,6 +248,7 @@ struct PassEvidence {
     number: usize,
     plans: BTreeMap<String, Planned>,
     reports: BTreeMap<String, MaintenanceReport>,
+    layout_saturated: BTreeMap<String, Planned>,
 }
 
 trait Backend {
@@ -242,6 +278,7 @@ fn finish<B: Backend>(
         .iter()
         .map(|(key, state)| (key.clone(), state.inventory.version))
         .collect();
+    let mut saturated = BTreeMap::<String, Planned>::new();
     loop {
         check(deadline)?;
         let plans = backend.plan(deadline)?;
@@ -257,14 +294,23 @@ fn finish<B: Backend>(
                 "{key}: protected or unsupported partitions prevent complete final-compaction"
             );
             ensure!(plan.bins > 0 || plan.inputs.is_empty(), "{key}: malformed empty plan");
+            if let Some(proven) = saturated.get(key) {
+                ensure!(
+                    plan.backlog_files == 0 && proven.same_work(plan),
+                    "{key}: layout-saturated version or plan changed"
+                );
+            }
         }
-        let empty = plans.values().all(Planned::empty);
+        let empty = plans
+            .iter()
+            .all(|(key, plan)| plan.empty() || saturated.contains_key(key));
         if empty {
             // Preserve the fresh all-table no-op plan as evidence, not a synthetic report.
             passes.push(PassEvidence {
                 number: passes.len() + 1,
                 plans,
                 reports: BTreeMap::new(),
+                layout_saturated: saturated.clone(),
             });
             break;
         }
@@ -276,11 +322,12 @@ fn finish<B: Backend>(
             number: passes.len() + 1,
             plans,
             reports: BTreeMap::new(),
+            layout_saturated: saturated.clone(),
         });
         let pass = passes.last_mut().context("missing compaction pass")?;
         let mut progress = false;
         for (key, plan) in &pass.plans {
-            if plan.empty() {
+            if plan.empty() || saturated.contains_key(key) {
                 continue;
             }
             ensure!(
@@ -294,6 +341,11 @@ fn finish<B: Backend>(
             // Keep the real result even when a later invariant fails.
             pass.reports.insert(key.clone(), report.clone());
             check(deadline)?;
+            if plan.proven_saturated(&report) {
+                saturated.insert(key.clone(), plan.clone());
+                pass.layout_saturated.insert(key.clone(), plan.clone());
+                continue;
+            }
             ensure!(
                 report.outcome == Outcome::Committed
                     && report.read_version == plan.version
@@ -307,7 +359,14 @@ fn finish<B: Backend>(
             versions.insert(key.clone(), report.version);
             progress = true;
         }
-        ensure!(progress, "compaction pass made no actual progress");
+        ensure!(
+            progress
+                || pass
+                    .plans
+                    .keys()
+                    .all(|key| pass.plans[key].empty() || saturated.contains_key(key)),
+            "compaction pass made no actual progress"
+        );
     }
     check(deadline)?;
     let after = backend.capture(deadline)?;
@@ -1010,6 +1069,143 @@ mod tests {
         Ok(passes)
     }
 
+    struct SaturatedFixture {
+        inner: Fixture,
+        mixed: bool,
+        changed: u8,
+        incomplete: bool,
+    }
+
+    impl Backend for SaturatedFixture {
+        fn capture(&mut self, deadline: Instant) -> Result<BTreeMap<String, State>> {
+            self.inner.capture(deadline)
+        }
+
+        fn plan(&mut self, deadline: Instant) -> Result<BTreeMap<String, Planned>> {
+            let mut plans = self.inner.plan(deadline)?;
+            if self.mixed {
+                let mut reducible = plans["table-00"].clone();
+                reducible.version = self.inner.versions["table-01"];
+                reducible.plan_id = format!("plan-{}", reducible.version);
+                plans.insert("table-01".into(), reducible);
+            }
+            let plan = plans.get_mut("table-00").context("saturated table")?;
+            plan.bins = 1;
+            plan.inputs = vec![file(0), file(1)];
+            if self.inner.applies > 0 {
+                match self.changed {
+                    1 => plan.version += 1,
+                    2 => {
+                        plan.plan_id = "changed".into();
+                        plan.inputs = vec![file(2), file(3)];
+                    }
+                    3 => plan.plan_id = "fresh-anchor-same-inputs".into(),
+                    _ => {}
+                }
+            }
+            Ok(plans)
+        }
+
+        fn apply(&mut self, key: &str, deadline: Instant) -> Result<MaintenanceReport> {
+            if key != "table-00" {
+                return self.inner.apply(key, deadline);
+            }
+            self.inner.applies += 1;
+            Ok(MaintenanceReport {
+                operation: "optimize".into(),
+                plan_id: Some("plan-1".into()),
+                read_version: 1,
+                version: 1,
+                nonbeneficial_bins: u64::from(!self.incomplete),
+                ..MaintenanceReport::default()
+            })
+        }
+    }
+
+    #[test]
+    fn saturated_only_and_mixed_tables_converge_without_reapplying_saturated_work() -> Result<()> {
+        for mixed in [false, true] {
+            let mut fixture = SaturatedFixture {
+                inner: Fixture::new(&[usize::from(mixed), 0]),
+                mixed,
+                changed: 3,
+                incomplete: false,
+            };
+            let expected = fixture.inner.keys.clone();
+            let mut passes = Vec::new();
+            finish(&mut fixture, &expected, Instant::now() + BUDGET, &mut passes)?;
+            assert_eq!(fixture.inner.applies, 1 + usize::from(mixed));
+            assert_eq!(passes.len(), 2);
+            assert_eq!(passes[0].layout_saturated.len(), 1);
+            assert_eq!(passes[1].layout_saturated.len(), 1);
+            assert_eq!(passes[0].reports["table-00"].outcome, Outcome::Noop);
+            assert!(passes[1].reports.is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_noop_or_changed_saturated_version_or_inputs_fails_closed() -> Result<()> {
+        for (incomplete, changed) in [(true, 0), (false, 1), (false, 2)] {
+            let mut fixture = SaturatedFixture {
+                inner: Fixture::new(&[0, 0]),
+                mixed: false,
+                changed,
+                incomplete,
+            };
+            let expected = fixture.inner.keys.clone();
+            let mut passes = Vec::new();
+            assert!(finish(&mut fixture, &expected, Instant::now() + BUDGET, &mut passes).is_err());
+            assert_eq!(fixture.inner.applies, 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn saturation_proof_rejects_all_unexplained_report_counters() -> Result<()> {
+        let plan = Planned {
+            table_id: "table".into(),
+            version: 1,
+            plan_id: "plan".into(),
+            bins: 2,
+            inputs: vec![file(0), file(1), file(2), file(3)],
+            backlog_files: 0,
+            protected_partitions: 0,
+            skipped_partitions: 0,
+        };
+        let valid = MaintenanceReport {
+            operation: "optimize".into(),
+            plan_id: Some("plan".into()),
+            read_version: 1,
+            version: 1,
+            nonbeneficial_bins: 2,
+            ..MaintenanceReport::default()
+        };
+        assert!(plan.proven_saturated(&valid));
+        for index in 0..15 {
+            let mut report = valid.clone();
+            match index {
+                0 => report.nonbeneficial_bins = 1,
+                1 => report.collisions = 1,
+                2 => report.retries = 1,
+                3 => report.skipped_partitions = 1,
+                4 => report.backlog_files = 1,
+                5 => report.interrupted = true,
+                6 => report.outputs.push("unexplained".into()),
+                7 => report.files_added = 1,
+                8 => report.files_removed = 1,
+                9 => report.version += 1,
+                10 => report.read_version += 1,
+                11 => report.outcome = Outcome::AlreadyApplied,
+                12 => report.attempts = 1,
+                13 => report.plan_id = None,
+                _ => report.operation = "purge".into(),
+            }
+            assert!(!plan.proven_saturated(&report), "invalid report case {index}");
+        }
+        Ok(())
+    }
+
     #[test]
     fn all_26_need_a_fresh_empty_plan_and_only_progress_continues() -> Result<()> {
         let mut fixture = Fixture::new(&[1, 1, 0]);
@@ -1441,6 +1637,89 @@ mod tests {
             run_sync(&arguments, Instant::now() + BUDGET).is_err(),
             "never overwrite prior evidence"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounded_sorted_outputs_prove_saturation_and_mixed_bins_still_reduce() -> Result<()> {
+        use arrow_deltalake::layout::LayoutPolicy;
+        for mixed in [false, true] {
+            let root = tempfile::tempdir()?;
+            let pool = root.path().join("direct");
+            let path = pool.join("telemetry/sqlserver/saturated");
+            fs::create_dir_all(&path)?;
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new(INGESTION_PARTITION, DataType::Utf8, false),
+            ]));
+            let table = DeltaTable::open_url(
+                Url::from_directory_path(&path).map_err(|()| anyhow::anyhow!("fixture URL"))?,
+                Arc::clone(&schema),
+                vec![INGESTION_PARTITION.into()],
+            )?;
+            for partition in 0..=usize::from(mixed) {
+                let value = format!("2024-01-01-00-0{partition}");
+                for _ in 0..2 {
+                    let mut writer = table
+                        .new_file_partitioned(
+                            Arc::clone(&schema),
+                            BTreeMap::from([(INGESTION_PARTITION.into(), Some(value.clone()))]),
+                        )?
+                        .with_ingestion_time(1_704_067_200_000)?;
+                    let ids = if partition == 0 { vec![2, 1] } else { vec![1] };
+                    let rows = ids.len();
+                    writer
+                        .write(&RecordBatch::try_new(
+                            Arc::clone(&schema),
+                            vec![
+                                Arc::new(Int64Array::from(ids)),
+                                Arc::new(StringArray::from(vec![value.as_str(); rows])),
+                            ],
+                        )?)
+                        .await?;
+                    writer.finish().await?;
+                }
+            }
+            let deadline = Instant::now() + BUDGET;
+            let mut local = Local::open(
+                &BTreeMap::from([("direct".into(), fs::canonicalize(pool)?)]),
+                &["saturated".into()],
+                deadline,
+            )?;
+            local.config.layout = Some(LayoutPolicy {
+                sort_columns: vec!["id".into()],
+                bloom_columns: Vec::new(),
+                max_rows: 2,
+                ..LayoutPolicy::default()
+            });
+            local.config.batch_rows = 2;
+            let expected = local.tables.keys().cloned().collect();
+            let mut passes = Vec::new();
+            let (before, after) = finish(&mut local, &expected, deadline, &mut passes)?;
+            let key = "direct/telemetry.sqlserver.saturated";
+            assert_eq!(before[key].multiset, after[key].multiset);
+            assert_eq!(
+                after[key].inventory.version,
+                before[key].inventory.version + u64::from(mixed)
+            );
+            if mixed {
+                let report = &passes[0].reports[key];
+                assert_eq!(report.outcome, Outcome::Committed);
+                assert_eq!(
+                    (report.files_removed, report.files_added, report.nonbeneficial_bins),
+                    (2, 1, 1)
+                );
+            }
+            let saturated_pass = &passes[usize::from(mixed)];
+            let report = &saturated_pass.reports[key];
+            assert_eq!(report.outcome, Outcome::Noop);
+            assert_eq!(report.nonbeneficial_bins, 1);
+            assert_eq!((report.files_removed, report.files_added), (0, 0));
+            assert_eq!(saturated_pass.layout_saturated[key].inputs.len(), 2);
+            let final_pass = passes.last().context("final fresh plan")?;
+            assert!(final_pass.reports.is_empty());
+            assert!(final_pass.plans[key].same_work(&final_pass.layout_saturated[key]));
+        }
         Ok(())
     }
 

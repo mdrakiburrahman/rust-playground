@@ -579,8 +579,15 @@ row comparisons, planning and applying. Operations are joined; a timeout never
 abandons a mutator. Only the outer runner's process kill is a hard bound.
 Every progress pass starts with fresh dry-run plans for all 26 tables. At most
 three progress passes are allowed, with no external retry on an operation error.
-Success requires a final independent all-table empty plan, zero backlog and
-zero skipped/protected partitions. A nonreducing/no-op commit fails.
+Success requires a final independent all-table plan with no unproven work,
+zero backlog and zero skipped/protected partitions. A nonreducing/no-op commit
+fails. A table may instead be proven layout-saturated: OPTIMIZE must return
+no-op at the exact planned version, with every bin reported nonbeneficial,
+zero mutations, outputs, attempts, collisions, retries, skips or interruption.
+Each pass records these table/version/input proofs in `layout_saturated`.
+The fresh final plan must match each saturated proof's version and plan ID or
+exact input-file set; changes fail closed. Saturated tables are not reapplied.
+Mixed passes still require strictly reducing commits from reducible work.
 
 Complete logical rows, including committed partition values, are canonically
 encoded using Arrow's row encoding and compared as exact multiplicity maps
