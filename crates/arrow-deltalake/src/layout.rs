@@ -12,6 +12,7 @@ use arrow::datatypes::SchemaRef;
 use parquet::basic::Compression;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::schema::types::ColumnPath;
+use std::sync::Arc;
 
 /// Configurable controls applied at the actual Parquet file boundary.
 #[derive(Clone, Debug)]
@@ -78,6 +79,7 @@ impl LayoutPolicy {
             .set_compression(Compression::UNCOMPRESSED)
             .set_max_row_group_row_count(Some(self.row_group_rows))
             .set_data_page_row_count_limit(self.page_rows)
+            .set_write_batch_size(self.page_rows.min(1_024))
             .set_statistics_enabled(EnabledStatistics::Page)
             .set_offset_index_disabled(false);
         for column in &self.bloom_columns {
@@ -165,7 +167,7 @@ impl FileSortBuffer {
             .iter()
             .map(|name| {
                 Ok(SortColumn {
-                    values: std::sync::Arc::clone(batch.column(self.schema.index_of(name)?)),
+                    values: Arc::clone(batch.column(self.schema.index_of(name)?)),
                     options: Some(SortOptions {
                         descending: false,
                         nulls_first: false,

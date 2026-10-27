@@ -686,6 +686,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrow-tenant-stream"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow 58.4.0",
+ "arrow-deltalake",
+ "async-trait",
+ "bytes",
+ "clap",
+ "datafusion",
+ "delta_kernel",
+ "delta_kernel_default_engine",
+ "fs2",
+ "futures",
+ "object_store",
+ "parquet 58.4.0",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "arrowcol-buffer"
 version = "0.1.0"
 dependencies = [
@@ -2177,6 +2202,7 @@ dependencies = [
  "datafusion-datasource-arrow",
  "datafusion-datasource-csv",
  "datafusion-datasource-json",
+ "datafusion-datasource-parquet",
  "datafusion-execution",
  "datafusion-expr",
  "datafusion-expr-common",
@@ -2197,6 +2223,7 @@ dependencies = [
  "log",
  "object_store",
  "parking_lot",
+ "parquet 58.4.0",
  "tempfile",
  "tokio",
  "url",
@@ -2269,6 +2296,7 @@ dependencies = [
  "libc",
  "log",
  "object_store",
+ "parquet 58.4.0",
  "tokio",
  "uuid",
  "web-time",
@@ -2383,6 +2411,37 @@ dependencies = [
  "object_store",
  "tokio",
  "tokio-stream",
+]
+
+[[package]]
+name = "datafusion-datasource-parquet"
+version = "54.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cc35b92cd560082155e80d9c826929c852d3c51543f4affd3a51c464a0aab3a"
+dependencies = [
+ "arrow 58.4.0",
+ "async-trait",
+ "bytes",
+ "datafusion-common",
+ "datafusion-common-runtime",
+ "datafusion-datasource",
+ "datafusion-execution",
+ "datafusion-expr",
+ "datafusion-functions",
+ "datafusion-functions-aggregate-common",
+ "datafusion-physical-expr",
+ "datafusion-physical-expr-adapter",
+ "datafusion-physical-expr-common",
+ "datafusion-physical-plan",
+ "datafusion-pruning",
+ "datafusion-session",
+ "futures",
+ "itertools 0.14.0",
+ "log",
+ "object_store",
+ "parking_lot",
+ "parquet 58.4.0",
+ "tokio",
 ]
 
 [[package]]
