@@ -12,6 +12,7 @@ pub(crate) const READ_AHEAD: usize = 8;
 pub(crate) const BATCH_ROWS: usize = 256;
 const WORKERS: usize = 2;
 const BLOCKING_WORKERS: usize = 32;
+const UPLOAD_LIMIT: usize = 32;
 const TASK_LIMIT: usize = 64;
 
 static EXECUTOR: OnceLock<std::result::Result<Arc<SharedExecutor>, String>> = OnceLock::new();
@@ -51,6 +52,7 @@ pub(crate) struct SharedExecutor {
     runtime: Runtime,
     admission: Arc<Admission>,
     blocking_admission: Arc<tokio::sync::Semaphore>,
+    upload_admission: Arc<tokio::sync::Semaphore>,
     background_failure: Arc<Mutex<Option<String>>>,
 }
 
@@ -104,8 +106,21 @@ impl SharedExecutor {
             runtime,
             admission: Arc::new(Admission::default()),
             blocking_admission: Arc::new(tokio::sync::Semaphore::new(BLOCKING_WORKERS)),
+            upload_admission: Arc::new(tokio::sync::Semaphore::new(UPLOAD_LIMIT)),
             background_failure: Arc::new(Mutex::new(None)),
         })
+    }
+
+    pub(crate) async fn upload_slot(&self) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.upload_admission)
+            .acquire_owned()
+            .await
+            .context("Delta upload admission failed")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn available_upload_slots(&self) -> usize {
+        self.upload_admission.available_permits()
     }
 
     fn check_background_failure(&self) {

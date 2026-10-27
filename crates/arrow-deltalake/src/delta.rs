@@ -227,11 +227,106 @@ mod io_tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use std::collections::HashSet;
 
+    #[derive(Debug)]
+    struct StageControl(std::sync::Mutex<crate::publisher::MetadataSnapshot>);
+
+    #[async_trait::async_trait]
+    impl crate::publisher::ControlMetadata for StageControl {
+        async fn read(&self) -> Result<crate::publisher::MetadataSnapshot> {
+            Ok(self
+                .0
+                .lock()
+                .map_err(|error| anyhow::anyhow!("stage control fixture poisoned: {error}"))?
+                .clone())
+        }
+
+        async fn compare_and_set(
+            &self,
+            expected: &crate::publisher::MetadataSnapshot,
+            metadata: &std::collections::BTreeMap<String, String>,
+        ) -> crate::publisher::CasOutcome {
+            use crate::publisher::CasOutcome;
+            let mut current = match self.0.lock() {
+                Ok(current) => current,
+                Err(error) => return CasOutcome::Rejected(format!("stage control fixture poisoned: {error}")),
+            };
+            if *current != *expected {
+                return CasOutcome::Conflict;
+            }
+            current.metadata = metadata.clone();
+            current.etag = uuid::Uuid::new_v4().to_string();
+            CasOutcome::Applied
+        }
+    }
+
+    /// Scenario: a registered publisher stages through an injected cloud-shaped data store.
+    /// Guarantees: authority checks work off the caller runtime without synchronous I/O-worker re-entry.
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_backed_cloud_stage_uses_async_authority_checks() -> Result<()> {
+        let _fixture = CLOUD_STAGE_FIXTURE.lock().await;
+        use crate::publisher::{MetadataSnapshot, PublisherSession, SessionMode};
+        use futures::TryStreamExt;
+        const SANDBOX: &str = "0123456789ab";
+        const GENERATION: &str = "00000000-0000-4000-8000-000000000001";
+        let control = Arc::new(StageControl(std::sync::Mutex::new(MetadataSnapshot {
+            etag: "0".into(),
+            metadata: [
+                ("sandboxid", SANDBOX),
+                ("resetstate", "ready-v1"),
+                ("resetgeneration", GENERATION),
+                ("publisherregistryversion", "1"),
+                ("publishers", "{}"),
+                ("occupancy", "released"),
+            ]
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+            .collect(),
+        })));
+        let session = PublisherSession::open_with_control(
+            Arc::<StageControl>::clone(&control),
+            SANDBOX,
+            "fixture",
+            SessionMode::Publisher,
+            Some(GENERATION),
+        )
+        .await?;
+        let directory = tempfile::tempdir()?;
+        let table = DeltaTable::open(directory.path())?;
+        let input = input_batch()?;
+        let mut writer = table.new_file(input.schema())?;
+        writer.write(&input).await?;
+        drop(table);
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let table = Arc::get_mut(&mut writer.table).context("unique stage table")?;
+        table.url = Url::parse("abfss://data@fixture.dfs.core.windows.net/table/")?;
+        table.store = Arc::<object_store::memory::InMemory>::clone(&store);
+        table.session = Some(Arc::clone(&session));
+        let staged = tokio::time::timeout(Duration::from_secs(5), writer.stage()).await;
+        let closed = session.close_after_drain_async().await;
+        let staged = staged.context("registered cloud-shaped stage exceeded deadline")??;
+        closed?;
+        assert!(staged.file.bytes > 0);
+        assert_eq!(store.list(None).try_collect::<Vec<_>>().await?.len(), 1);
+        Ok(())
+    }
+
+    // These fixtures deliberately exhaust the process-wide upload slots.
+    static CLOUD_STAGE_FIXTURE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[derive(Debug)]
+    struct NestedStagePut {
+        barrier: tokio::sync::Barrier,
+        entered: std::sync::atomic::AtomicUsize,
+        submitted: std::sync::atomic::AtomicUsize,
+        finished: std::sync::atomic::AtomicUsize,
+    }
+
     #[derive(Debug, Default)]
     struct PausedStagePut {
         inner: object_store::memory::InMemory,
         entered: tokio::sync::Notify,
         release: tokio::sync::Notify,
+        nested: Option<Arc<NestedStagePut>>,
     }
 
     impl std::fmt::Display for PausedStagePut {
@@ -248,13 +343,36 @@ mod io_tests {
             payload: object_store::PutPayload,
             options: object_store::PutOptions,
         ) -> object_store::Result<object_store::PutResult> {
-            self.entered.notify_one();
-            tokio::time::timeout(Duration::from_secs(2), self.release.notified())
+            if let Some(nested) = &self.nested {
+                use std::sync::atomic::Ordering;
+                nested.entered.fetch_add(1, Ordering::SeqCst);
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    nested.barrier.wait().await;
+                    nested.submitted.fetch_add(1, Ordering::SeqCst);
+                    let completed = Arc::clone(nested);
+                    tokio::task::spawn_blocking(move || {
+                        completed.finished.fetch_add(1, Ordering::SeqCst);
+                    })
+                    .await
+                })
                 .await
                 .map_err(|error| object_store::Error::Generic {
-                    store: "paused stage put",
+                    store: "nested stage put deadline",
+                    source: Box::new(error),
+                })?
+                .map_err(|error| object_store::Error::Generic {
+                    store: "nested stage put worker",
                     source: Box::new(error),
                 })?;
+            } else {
+                self.entered.notify_one();
+                tokio::time::timeout(Duration::from_secs(2), self.release.notified())
+                    .await
+                    .map_err(|error| object_store::Error::Generic {
+                        store: "paused stage put",
+                        source: Box::new(error),
+                    })?;
+            }
             self.inner.put_opts(path, payload, options).await
         }
 
@@ -318,6 +436,7 @@ mod io_tests {
     /// Guarantees: another caller task progresses and releases the put before its independent deadline.
     #[tokio::test(flavor = "current_thread")]
     async fn stage_upload_keeps_current_thread_runtime_responsive() -> Result<()> {
+        let _fixture = CLOUD_STAGE_FIXTURE.lock().await;
         use futures::TryStreamExt;
         let directory = tempfile::tempdir()?;
         let table = DeltaTable::open(directory.path())?;
@@ -344,6 +463,142 @@ mod io_tests {
         Ok(())
     }
 
+    /// Scenario: 32 actual stages enter a put barrier before each put requests blocking I/O.
+    /// Guarantees: every stage succeeds without exhausting the shared pool, and all nested jobs finish.
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_stage_uploads_allow_nested_blocking_io() -> Result<()> {
+        let _fixture = CLOUD_STAGE_FIXTURE.lock().await;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const UPLOADS: usize = 32;
+        let nested = Arc::new(NestedStagePut {
+            barrier: tokio::sync::Barrier::new(UPLOADS),
+            entered: AtomicUsize::new(0),
+            submitted: AtomicUsize::new(0),
+            finished: AtomicUsize::new(0),
+        });
+        let store = Arc::new(PausedStagePut {
+            nested: Some(Arc::clone(&nested)),
+            ..Default::default()
+        });
+        let directory = tempfile::tempdir()?;
+        let mut writers = Vec::with_capacity(UPLOADS);
+        for index in 0..UPLOADS {
+            let table = DeltaTable::open(directory.path().join(index.to_string()))?;
+            let input = input_batch()?;
+            let mut writer = table.new_file(input.schema())?;
+            writer.write(&input).await?;
+            drop(table);
+            let table = Arc::get_mut(&mut writer.table).context("unique stage table")?;
+            table.url = Url::parse(&format!("abfss://fixture@example.invalid/table-{index}/"))?;
+            table.store = Arc::<PausedStagePut>::clone(&store);
+            writers.push(writer);
+        }
+        let outcomes = tokio::time::timeout(
+            Duration::from_secs(10),
+            futures::future::join_all(writers.into_iter().map(DeltaFileWriter::stage)),
+        )
+        .await;
+        let cleanup = tokio::time::timeout(Duration::from_secs(5), async {
+            while nested.finished.load(Ordering::SeqCst) != nested.submitted.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        cleanup.context("nested upload jobs did not finish within cleanup deadline")?;
+        let outcomes = outcomes.context("concurrent stages exceeded their outer deadline")?;
+        let failed = outcomes.iter().filter(|result| result.is_err()).count();
+        let entered = nested.entered.load(Ordering::SeqCst);
+        let submitted = nested.submitted.load(Ordering::SeqCst);
+        let finished = nested.finished.load(Ordering::SeqCst);
+        eprintln!("STAGE_SATURATION entered={entered} submitted={submitted} finished={finished} failed={failed}");
+        assert_eq!(entered, UPLOADS);
+        assert_eq!(submitted, UPLOADS);
+        assert_eq!(finished, UPLOADS);
+        assert_eq!(failed, 0, "stage uploads must not starve nested blocking I/O");
+        Ok(())
+    }
+
+    /// Scenario: the caller drops stage while its shared-runtime put is paused.
+    /// Guarantees: payload admission and staging ownership survive until the put finishes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_stage_retains_upload_admission_until_put_finishes() -> Result<()> {
+        use futures::TryStreamExt;
+        let _fixture = CLOUD_STAGE_FIXTURE.lock().await;
+        let executor = shared_executor()?;
+        assert_eq!(executor.available_upload_slots(), 32);
+        let directory = tempfile::tempdir()?;
+        let table = DeltaTable::open(directory.path())?;
+        let input = input_batch()?;
+        let mut writer = table.new_file(input.schema())?;
+        writer.write(&input).await?;
+        drop(table);
+        let store = Arc::new(PausedStagePut::default());
+        let table = Arc::get_mut(&mut writer.table).context("unique stage table")?;
+        table.url = Url::parse("abfss://fixture@example.invalid/table/")?;
+        table.store = Arc::<PausedStagePut>::clone(&store);
+        let mut stage = Box::pin(writer.stage());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                () = store.entered.notified() => Ok(()),
+                result = stage.as_mut() => {
+                    result?;
+                    bail!("stage completed before its paused put was released")
+                }
+            }
+        })
+        .await??;
+        drop(stage);
+        let available_during_put = executor.available_upload_slots();
+        let ownership_retained = DeltaTable::open(directory.path()).is_err();
+        store.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if executor.available_upload_slots() == 32
+                    && store.inner.list(None).try_collect::<Vec<_>>().await?.len() == 1
+                {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .context("cancelled stage upload did not finish and release admission")??;
+        drop(DeltaTable::open(directory.path())?);
+        assert_eq!(available_during_put, 31);
+        assert!(ownership_retained, "in-flight put must retain staging ownership");
+        assert!(!directory.path().join("_delta_log/00000000000000000001.json").exists());
+        Ok(())
+    }
+
+    /// Scenario: every cloud upload slot is occupied while a local file stages.
+    /// Guarantees: local fsync does not acquire cloud upload admission.
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_stage_does_not_acquire_upload_admission() -> Result<()> {
+        let _fixture = CLOUD_STAGE_FIXTURE.lock().await;
+        let executor = shared_executor()?;
+        let mut slots = Vec::with_capacity(32);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for _ in 0..32 {
+                slots.push(executor.upload_slot().await?);
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("could not reserve the cloud fixture upload slots")??;
+        let directory = tempfile::tempdir()?;
+        let table = DeltaTable::open(directory.path())?;
+        let input = input_batch()?;
+        let mut writer = table.new_file(input.schema())?;
+        writer.write(&input).await?;
+        let staged = tokio::time::timeout(Duration::from_secs(5), writer.stage()).await;
+        let available_during_local_stage = executor.available_upload_slots();
+        drop(slots);
+        let staged = staged.context("local stage waited for cloud upload admission")??;
+        assert!(staged.file.bytes > 0);
+        assert_eq!(available_during_local_stage, 0);
+        assert_eq!(executor.available_upload_slots(), 32);
+        Ok(())
+    }
     /// Scenario: a new nested two-column Hive table publishes locally, with injected fsync faults.
     /// Guarantees: root ancestry, leaf/intermediate partitions and the checkpoint hint are fsynced
     /// before success; any fsync failure propagates and publishes nothing.
@@ -1388,6 +1643,16 @@ impl DeltaTable {
         Ok(table)
     }
 
+    async fn check_publication_async(&self) -> Result<()> {
+        if self.bootstrap_only {
+            bail!("bootstrap initialization cannot publish data");
+        }
+        if let Some(session) = &self.session {
+            session.check_async().await?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn check_publication(&self) -> Result<()> {
         if self.bootstrap_only {
             bail!("bootstrap initialization cannot publish data");
@@ -1504,10 +1769,13 @@ impl DeltaTable {
         Ok(url)
     }
 
-    fn upload_file(&self, file: &CompletedFile) -> Result<()> {
-        self.check_publication()?;
+    fn prepare_upload(
+        &self,
+        file: &CompletedFile,
+    ) -> Result<Option<(object_store::path::Path, object_store::PutPayload)>> {
         if self.url.scheme() == "file" {
-            return self.sync_local_output(&file.path);
+            self.sync_local_output(&file.path)?;
+            return Ok(None);
         }
         if file.bytes > 512 * 1024 * 1024 {
             bail!("staged file exceeds bounded upload size");
@@ -1519,12 +1787,9 @@ impl DeltaTable {
             .context("invalid staged path")?;
         let path = object_store::path::Path::from_url_path(self.staged_url(relative)?.path())?;
         let bytes = fs::read(&file.path)?;
-        self.check_publication()?;
-        let store = Arc::clone(&self.store);
-        shared_executor()?
-            .block_on(async move { store.put_opts(&path, bytes.into(), PutMode::Create.into()).await })?;
-        Ok(())
+        Ok(Some((path, bytes.into())))
     }
+
     /// Acquire exclusive local writer ownership, creating the directory if needed.
     ///
     /// # Errors
@@ -2538,15 +2803,33 @@ impl DeltaFileWriter {
         let file = self.parquet.finish().await?;
         let stats = self.stats.finish()?.context("cannot commit an empty Delta file")?;
         let executor = shared_executor()?;
+        self.table.check_publication_async().await?;
+        let upload_slot = if self.table.url.scheme() == "file" {
+            None
+        } else {
+            Some(executor.upload_slot().await?)
+        };
         let table = Arc::clone(&self.table);
-        let (file, uploaded) = executor
+        let (file, prepared, upload_slot) = executor
             .spawn_blocking(move || {
-                let uploaded = table.upload_file(&file);
-                (file, uploaded)
+                let prepared = table.prepare_upload(&file);
+                (file, prepared, upload_slot)
             })
             .await
-            .context("stage upload worker failed")?;
-        uploaded?;
+            .context("stage upload preparation worker failed")?;
+        if let Some((path, payload)) = prepared? {
+            self.table.check_publication_async().await?;
+            let table = Arc::clone(&self.table);
+            spawn_shared_io(async move {
+                let _upload_slot = upload_slot;
+                table.store.put_opts(&path, payload, PutMode::Create.into()).await
+            })
+            .context("start stage upload task")?
+            .await
+            .context("stage upload task failed")?
+            .context("stage upload failed")?;
+        }
+        self.table.check_publication_async().await?;
         Ok(StagedAppend {
             table: self.table,
             schema: self.schema,
