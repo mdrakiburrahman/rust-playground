@@ -452,9 +452,11 @@ impl Proc for std::process::Child {
 struct Owned<P: Proc>(Option<P>);
 
 impl<P: Proc> Owned<P> {
-    /// Kills and reaps the owned child, returning its PID only when both succeeded.
+    /// Kills and reaps the owned child, returning its PID only when both succeeded. The child
+    /// stays owned until its exit is observed, so a failed reap leaves it to the bounded [`Drop`]
+    /// retry instead of dropping a live, unmanaged child.
     fn terminate(&mut self) -> Result<u32> {
-        let mut child = self.0.take().context("no owned child to terminate")?;
+        let child = self.0.as_mut().context("no owned child to terminate")?;
         let pid = child.id();
         let killed = child.kill();
         let started = Instant::now();
@@ -468,6 +470,7 @@ impl<P: Proc> Owned<P> {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+        self.0 = None;
         killed.with_context(|| format!("kill child {pid}"))?;
         Ok(pid)
     }
@@ -602,11 +605,12 @@ fn hanging_child_is_killed_and_reaped_at_deadline() -> Result<()> {
 }
 
 /// Scripted child: `polls` answers successive `try_wait` calls before any kill (then "running");
-/// after `kill` it reports exited unless `kill` fails.
+/// after `kill` the first `reap_errors` polls fail, then it reports exited.
 #[derive(Default)]
 struct Script {
     polls: Vec<std::io::Result<Option<std::process::ExitStatus>>>,
     kill_fails: bool,
+    reap_errors: usize,
     killed: Arc<Mutex<usize>>,
     reaped: Arc<Mutex<bool>>,
 }
@@ -619,6 +623,10 @@ impl Proc for Script {
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         use std::os::unix::process::ExitStatusExt;
         if *self.killed.lock().unwrap_or_else(PoisonError::into_inner) > 0 {
+            if self.reap_errors > 0 {
+                self.reap_errors -= 1;
+                return Err(std::io::Error::other("reap failed"));
+            }
             *self.reaped.lock().unwrap_or_else(PoisonError::into_inner) = true;
             return Ok(Some(std::process::ExitStatus::from_raw(9)));
         }
@@ -640,8 +648,9 @@ impl Proc for Script {
 }
 
 /// Guarantees: a poll error before the deadline kills and reaps the still-live child before the
-/// error is returned; a failed kill is returned rather than reported as a clean timeout; and a
-/// dropped guard that still owns a child kills and reaps it.
+/// error is returned; a failed kill is returned rather than reported as a clean timeout; a failed
+/// reap is returned while the child stays owned, and the guard's drop then kills and reaps it;
+/// and a dropped guard that still owns a child kills and reaps it.
 #[test]
 fn supervision_faults_always_kill_reap_and_propagate() -> Result<()> {
     let poll_error = Script {
@@ -666,6 +675,35 @@ fn supervision_faults_always_kill_reap_and_propagate() -> Result<()> {
         .context("kill failure reported as timeout")?;
     assert!(format!("{error:#}").contains("kill child 4242"), "{error:#}");
     assert_eq!(*killed.lock().unwrap_or_else(PoisonError::into_inner), 1);
+
+    let reap_fails = Script {
+        reap_errors: 1,
+        ..Script::default()
+    };
+    let (killed, reaped) = (Arc::clone(&reap_fails.killed), Arc::clone(&reap_fails.reaped));
+    let mut owned = Owned(Some(reap_fails));
+    let error = owned.terminate().err().context("reap failure was swallowed")?;
+    assert!(format!("{error:#}").contains("reap child 4242"), "{error:#}");
+    assert!(owned.0.is_some(), "unreaped child released from custody");
+    assert!(!*reaped.lock().unwrap_or_else(PoisonError::into_inner));
+    drop(owned);
+    assert_eq!(*killed.lock().unwrap_or_else(PoisonError::into_inner), 2);
+    assert!(*reaped.lock().unwrap_or_else(PoisonError::into_inner));
+
+    let expiry_reap_fails = Script {
+        reap_errors: 1,
+        ..Script::default()
+    };
+    let (killed, reaped) = (
+        Arc::clone(&expiry_reap_fails.killed),
+        Arc::clone(&expiry_reap_fails.reaped),
+    );
+    let error = supervise(expiry_reap_fails, Duration::ZERO)
+        .err()
+        .context("reap failure at expiry reported as timeout")?;
+    assert!(format!("{error:#}").contains("reap child 4242"), "{error:#}");
+    assert_eq!(*killed.lock().unwrap_or_else(PoisonError::into_inner), 2);
+    assert!(*reaped.lock().unwrap_or_else(PoisonError::into_inner));
 
     let dropped = Script::default();
     let (killed, reaped) = (Arc::clone(&dropped.killed), Arc::clone(&dropped.reaped));
