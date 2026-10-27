@@ -29,7 +29,9 @@ impl KernelReporter {
             duration: meter.f64_histogram("delta.kernel.duration").with_unit("s").build(),
             values: meter.u64_histogram("delta.kernel.values").with_unit("1").build(),
             bytes: meter.u64_histogram("delta.kernel.bytes").with_unit("By").build(),
-            version: meter.u64_gauge("delta.kernel.version").with_unit("1").build(),
+            // No unit: Prometheus OTLP translation suffixes unit "1" gauges with `_ratio`,
+            // which would rename the required `delta_kernel_version` family.
+            version: meter.u64_gauge("delta.kernel.version").build(),
         }
     }
 
