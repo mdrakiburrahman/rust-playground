@@ -23,6 +23,8 @@ pub enum Command {
     Validate(ValidateArgs),
     /// Initialize both Azure pools from the canonical schemas while reset is fenced.
     InitializeAzure(InitializeAzureArgs),
+    /// Write the canonical Azure table manifest without accessing or mutating storage.
+    AzureManifest(InitializeAzureArgs),
     /// Print the exact public Flight SQL schema fixture.
     PrintSchemas,
 }

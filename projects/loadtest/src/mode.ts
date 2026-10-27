@@ -36,7 +36,7 @@ export function stageAzureCliConfig(directory: string, env: NodeJS.ProcessEnv): 
   };
   const root = path.join(directory, 'azure-cli');
   mkdirSync(root, { mode: 0o700 });
-  for (const service of ['direct-1', 'dataflow-1']) {
+  for (const service of ['direct-1', 'dataflow-1', 'loadgen', 'infra', 'tenant-stream', 'delta-maintenance']) {
     const target = path.join(root, service);
     cpSync(source, target, { recursive: true, errorOnExist: true, force: false });
     protect(target);
@@ -47,6 +47,8 @@ export interface AzureTargets {
   root: string;
   directRoot: string;
   dataflowRoot: string;
+  tenantRoot: string;
+  checkpointRoot: string;
   kustoEndpoint: string;
   database: string;
 }
@@ -60,6 +62,10 @@ export function azureTargets(env: NodeJS.ProcessEnv, run: string): AzureTargets 
   if (!/^[a-z0-9]{3,24}$/u.test(env.AZURE_STORAGE_ACCOUNT!)) throw new Error('Invalid AZURE_STORAGE_ACCOUNT');
   if (!/^[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])$/u.test(env.AZURE_STORAGE_CONTAINER!)) {
     throw new Error('Invalid AZURE_STORAGE_CONTAINER');
+  }
+  if (!/^[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])$/u.test(env.AZURE_STORAGE_CHECKPOINT_CONTAINER!) ||
+      env.AZURE_STORAGE_CHECKPOINT_CONTAINER === env.AZURE_STORAGE_CONTAINER) {
+    throw new Error('AZURE_STORAGE_CHECKPOINT_CONTAINER must be a separate valid container');
   }
   if (!/^[A-Za-z0-9_-]+$/u.test(run)) throw new Error('Invalid isolated Azure run name');
   if (!/^[A-Za-z][A-Za-z0-9_-]{0,127}$/u.test(env.AZURE_KUSTO_DATABASE!)) throw new Error('Invalid AZURE_KUSTO_DATABASE');
@@ -90,6 +96,8 @@ export function azureTargets(env: NodeJS.ProcessEnv, run: string): AzureTargets 
     root,
     directRoot: `${root}/direct`,
     dataflowRoot: `${root}/dataflow`,
+    tenantRoot: `${root}/tenant`,
+    checkpointRoot: `abfss://${env.AZURE_STORAGE_CHECKPOINT_CONTAINER}@${base.hostname}${new URL(root).pathname}/tenant-checkpoints`,
     kustoEndpoint: endpoint.origin,
     database: env.AZURE_KUSTO_DATABASE!,
   };

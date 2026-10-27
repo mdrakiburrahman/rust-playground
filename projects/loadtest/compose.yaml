@@ -132,6 +132,7 @@ services:
 
   direct-1:
     profiles: ["benchmark"]
+    init: true
     image: ghcr.io/mdrakiburrahman/rust-playground/arrowcol-rust:dev
     pull_policy: never
     user: "${LOADTEST_UID:?Run through Nx}:${LOADTEST_GID:?Run through Nx}"
@@ -140,6 +141,8 @@ services:
     environment:
       TOKIO_WORKER_THREADS: "${LOADTEST_CPUS:-2}"
       ARROWCOL_PARTITION_GRANULARITY: ${ARROWCOL_PARTITION_GRANULARITY:-minute}
+      ARROWCOL_LAYOUT_ROW_GROUP_ROWS: ${ARROWCOL_LAYOUT_ROW_GROUP_ROWS:-16384}
+      ARROWCOL_LAYOUT_PAGE_ROWS: ${ARROWCOL_LAYOUT_PAGE_ROWS:-2048}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${LOADTEST_TRACES_ENDPOINT:-http://lgtm:4318}
       OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
       OTEL_METRIC_EXPORT_INTERVAL: "2000"
@@ -171,6 +174,7 @@ services:
 
   dataflow-1:
     profiles: ["benchmark"]
+    init: true
     image: ghcr.io/mdrakiburrahman/rust-playground/arrowcol-dataflow-rust:dev
     pull_policy: never
     user: "${LOADTEST_UID:?Run through Nx}:${LOADTEST_GID:?Run through Nx}"
@@ -181,6 +185,8 @@ services:
       ARROWCOL_ADVERTISED_FLIGHT_ENDPOINT: ${LOADTEST_DATAFLOW_1_IP:-10.89.0.31}:32010
       ARROWCOL_DELTA_ROOT: ${LOADTEST_DATAFLOW_DELTA_ROOT:-/delta/dataflow}
       ARROWCOL_PARTITION_GRANULARITY: ${ARROWCOL_PARTITION_GRANULARITY:-minute}
+      ARROWCOL_LAYOUT_ROW_GROUP_ROWS: ${ARROWCOL_LAYOUT_ROW_GROUP_ROWS:-16384}
+      ARROWCOL_LAYOUT_PAGE_ROWS: ${ARROWCOL_LAYOUT_PAGE_ROWS:-2048}
       ARROWCOL_SQL_HOST: sqlserver
       ARROWCOL_HIVE_HOST: hive-metastore
       ARROWCOL_MAX_MESSAGE_BYTES: "33554432"
@@ -402,6 +408,89 @@ services:
         ipv4_address: ${LOADTEST_ROUTER_IP:-10.89.0.10}
     stop_grace_period: 5m
 
+  delta-maintenance:
+    profiles: ["maintenance"]
+    init: true
+    image: ghcr.io/mdrakiburrahman/rust-playground/delta-maintenance:dev
+    pull_policy: never
+    user: "${LOADTEST_UID:?Run through Nx}:${LOADTEST_GID:?Run through Nx}"
+    command:
+      - --root
+      - ${LOADTEST_MAINTENANCE_ROOT:-file:///tmp/arrowcol-stress/direct/telemetry/sqlserver/}
+      - --table
+      - sqlserver_cpu_utilization
+      - --operation
+      - optimize
+      - --apply
+      - --interval-secs
+      - "30"
+      - --max-idle-backoff-secs
+      - "30"
+      - --max-cycles
+      - "10"
+      - --operation-timeout-secs
+      - "60"
+      - --listen
+      - "0.0.0.0:9467"
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${LOADTEST_TRACES_ENDPOINT:-http://lgtm:4318}
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_METRIC_EXPORT_INTERVAL: "2000"
+    volumes:
+      - type: bind
+        source: ${ONELAKE_HOST_PATH:?Run through Nx}/direct
+        target: /tmp/arrowcol-stress/direct
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${ONELAKE_HOST_PATH:?Run through Nx}/dataflow
+        target: /tmp/arrowcol-stress/dataflow
+        bind:
+          create_host_path: false
+    stop_grace_period: 5m
+
+  tenant-stream:
+    profiles: ["tenant"]
+    init: true
+    image: ghcr.io/mdrakiburrahman/rust-playground/arrow-tenant-stream:dev
+    pull_policy: never
+    user: "${LOADTEST_UID:?Run through Nx}:${LOADTEST_GID:?Run through Nx}"
+    command:
+      - --source
+      - ${LOADTEST_TENANT_SOURCE:-file:///delta/direct/telemetry/sqlserver/sqlserver_cpu_utilization}
+      - --target
+      - ${LOADTEST_TENANT_TARGET:-file:///delta/tenant/sqlserver_cpu_utilization}
+      - --checkpoint
+      - ${LOADTEST_TENANT_CHECKPOINT:-file:///checkpoints/tenant-cpu}
+      - --customer-id
+      - customer-0000
+      - --metrics-listen
+      - "0.0.0.0:9094"
+    volumes:
+      - type: bind
+        source: ${ONELAKE_HOST_PATH:?Run through Nx}/direct
+        target: /delta/direct
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${ONELAKE_HOST_PATH:?Run through Nx}/dataflow
+        target: /delta/dataflow
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${ONELAKE_HOST_PATH:?Run through Nx}/tenant
+        target: /delta/tenant
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${ONELAKE_HOST_PATH:?Run through Nx}/tenant-checkpoints
+        target: /checkpoints
+        bind:
+          create_host_path: false
+    stop_grace_period: 5m
+
   validator:
     profiles: ["benchmark"]
     image: ghcr.io/mdrakiburrahman/rust-playground/arrowcol-router-rust:dev
@@ -417,7 +506,6 @@ services:
       LOADTEST_DRAIN_TIMEOUT: ${LOADTEST_DRAIN_TIMEOUT:-2m}
       LOADTEST_REQUIRE_ALL_COLLECTORS: ${LOADTEST_REQUIRE_ALL_COLLECTORS:-true}
       LOADTEST_KUSTO_ENDPOINT: http://${LOADTEST_KUSTO_IP:-10.89.0.50}:8080
-      LOADTEST_KUSTO_BRIDGE_ENDPOINT: http://${LOADTEST_KUSTO_BRIDGE_IP:-10.89.0.53}:9464
     volumes:
       - type: bind
         source: ${ONELAKE_HOST_PATH:?Run through Nx}/results

@@ -101,15 +101,27 @@ export function buildBenchmarkRuntimeConfigs(
 export function buildBenchmarkComposeOverride(hostDirectory: string, options: BenchmarkRuntimeOptions = {}): string {
   const cloud: Record<string, { environment: Record<string, string>; volumes: object[] }> = {};
   if (options.mode === 'azure') {
-    if (!options.azureConfigHostDirectory) throw new Error('Azure runtime requires isolated writable CLI configuration');
+    if (!options.azureConfigHostDirectory || !options.azure) throw new Error('Azure runtime requires isolated writable CLI configuration and validated roots');
     const environment: Record<string, string> = { AZURE_CONFIG_DIR: '/run/azure', AZURE_USE_AZURE_CLI: 'true' };
-    for (const key of ['AZURE_SUBSCRIPTION_ID', 'AZURE_STORAGE_ACCOUNT', 'AZURE_STORAGE_CONTAINER', 'AZURE_STORAGE_CHECKPOINT_CONTAINER']) {
+    for (const key of ['AZURE_SUBSCRIPTION_ID', 'AZURE_STORAGE_ACCOUNT', 'AZURE_STORAGE_CONTAINER',
+      'AZURE_STORAGE_CHECKPOINT_CONTAINER', 'ARROWCOL_RESET_GENERATION']) {
       const value = options.azureEnvironment?.[key];
       if (!value) throw new Error(`Azure runtime requires ${key}`);
       environment[key] = value;
     }
-    for (const service of ['direct-1', 'dataflow-1']) {
-      cloud[service] = { environment, volumes: [{
+    if (!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/iu.test(environment.ARROWCOL_RESET_GENERATION)) {
+      throw new Error('Azure runtime requires a metadata-issued ARROWCOL_RESET_GENERATION UUID');
+    }
+    const roots: Record<string, string> = {
+      'direct-1': options.azure.directRoot,
+      'dataflow-1': options.azure.dataflowRoot,
+      'tenant-stream': options.azure.tenantRoot,
+      'delta-maintenance': options.azure.directRoot,
+    };
+    for (const [service, root] of Object.entries(roots)) {
+      cloud[service] = { environment: { ...environment,
+        ARROWCOL_DELTA_ROOT: root,
+      }, volumes: [{
         type: 'bind', source: path.join(options.azureConfigHostDirectory, service),
         target: '/run/azure', bind: { create_host_path: false },
       }] };
@@ -118,6 +130,8 @@ export function buildBenchmarkComposeOverride(hostDirectory: string, options: Be
   return JSON.stringify({
     services: {
       ...(cloud['direct-1'] ? { 'direct-1': cloud['direct-1'] } : {}),
+      ...(cloud['tenant-stream'] ? { 'tenant-stream': cloud['tenant-stream'] } : {}),
+      ...(cloud['delta-maintenance'] ? { 'delta-maintenance': cloud['delta-maintenance'] } : {}),
       'dataflow-1': {
         ...(cloud['dataflow-1'] ? { environment: cloud['dataflow-1'].environment } : {}),
         volumes: [{

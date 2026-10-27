@@ -52,6 +52,15 @@ test('both local helper commands always receive the allocated internal Kusto end
   assert.equal(env.LOADTEST_KUSTO_ENDPOINT, 'http://10.89.42.50:8080');
   assert.equal(env.LOADTEST_DIRECT_ROOT, '/workspace/onelake/benchmark/latest/direct');
   assert.equal(env.LOADTEST_DATAFLOW_ROOT, '/workspace/onelake/benchmark/latest/dataflow');
+  assert.equal(env.LOADTEST_KUSTO_BRIDGE_ENDPOINT, undefined);
+  for (const mode of ['local', 'azure']) {
+    const optional = localLoadgenEnvironment({
+      directory: '/workspace/onelake/benchmark/latest', network,
+      options: parseBenchmarkOptions(['--mode', mode], {}),
+      env: { LOADTEST_KUSTO_BRIDGE_ENDPOINT: 'http://explicit-bridge:9464' },
+    }, '/workspace/onelake/benchmark/latest/results');
+    assert.equal(optional.LOADTEST_KUSTO_BRIDGE_ENDPOINT, mode === 'local' ? 'http://explicit-bridge:9464' : undefined);
+  }
 });
 
 test('readiness uses the documented cluster command without requiring the not-yet-created database', async t => {
