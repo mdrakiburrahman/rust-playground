@@ -1976,6 +1976,24 @@ pub struct StagedAppend {
     pub(crate) ingested_at_ms: Option<i64>,
 }
 
+/// Return a batch whose Arrow memory charge is the memory the sort buffer actually retains.
+///
+/// IPC-decoded and sliced columns share a parent allocation, so `get_array_memory_size`
+/// charges that allocation once per column. When the charge exceeds twice the logical
+/// slice bytes, copy rows into fresh buffers: the parent is released instead of retained
+/// and the unchanged sort-budget guard then measures real memory. Batches built with
+/// their own buffers are retained without a copy.
+fn owned_for_sort(batch: RecordBatch) -> Result<RecordBatch> {
+    let charged = u64::try_from(batch.get_array_memory_size()).context("Arrow memory charge exceeds u64")?;
+    let logical = crate::record_batch_logical_bytes(&batch)?;
+    if charged <= logical.saturating_mul(2) {
+        return Ok(batch);
+    }
+    let rows = u32::try_from(batch.num_rows()).context("sorted batch row count exceeds u32")?;
+    let indices = arrow::array::UInt32Array::from_iter_values(0..rows);
+    Ok(arrow::compute::take_record_batch(&batch, &indices)?)
+}
+
 impl StagedAppend {
     /// Return counters for the durable file awaiting Delta publication.
     #[must_use]
@@ -2113,6 +2131,7 @@ impl DeltaFileWriter {
             .context("file input byte count overflow")?;
         self.stats.merge(&physical)?;
         if let Some(sorter) = &mut self.sorter {
+            let physical = owned_for_sort(physical)?;
             if !sorter.try_push(&physical)? {
                 bail!(
                     "publication exceeds sorted-file budget; split upstream into independently identified publications"
