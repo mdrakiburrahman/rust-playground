@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 
@@ -26,6 +27,15 @@ async function drainGroup(pid: number): Promise<void> {
   if (groupExists(pid)) throw new Error('Owned child process group did not drain; mutation outcome remains unknown');
 }
 
+function supervisorExited(pid: number | undefined): boolean {
+  if (pid === undefined) return false;
+  try {
+    return /^\d+ \(.*\) [ZX] /su.test(readFileSync(`/proc/${pid}/stat`, 'utf8'));
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ENOENT';
+  }
+}
+
 /** Owns the entire Linux process group, including Azure CLI wrapper descendants. */
 export async function runOwnedProcess(
   command: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number },
@@ -47,7 +57,16 @@ export async function runOwnedProcess(
   });
   let timer: ReturnType<typeof setTimeout> | undefined;
   const deadline = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error('Owned mutation supervisor exceeded its deadline; retain occupancy')), options.timeoutMs + 6000);
+    const expire = (graceful: boolean): void => {
+      // A timer starved by a blocked event loop must not beat an exit that is merely not yet delivered;
+      // allow one bounded grace for the pending close, then fail closed.
+      if (graceful && (child.exitCode !== null || child.signalCode !== null || supervisorExited(child.pid))) {
+        timer = setTimeout(() => expire(false), 5000);
+        return;
+      }
+      reject(new Error('Owned mutation supervisor exceeded its deadline; retain occupancy'));
+    };
+    timer = setTimeout(() => expire(true), options.timeoutMs + 6000);
   });
   const interrupt = (): void => { child.kill('SIGTERM'); };
   process.once('SIGINT', interrupt);

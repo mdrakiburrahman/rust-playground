@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -13,6 +14,17 @@ test('owned process accepts clean completion, rejects failure and validates dead
   await assert.rejects(runOwnedProcess(process.execPath, ['-e', 'process.exit(3)'], options), /retain occupancy/u);
   await assert.rejects(runOwnedProcess(process.execPath, [], { ...options, timeoutMs: 0 }), /finite positive/u);
   await assert.rejects(runOwnedProcess('/definitely-absent-loadtest-binary', [], options), /retain occupancy/u);
+});
+
+test('a completed process is not failed by a backstop timer starved behind a blocked event loop', async () => {
+  // Mirrors run 8568: the CLI finished, then synchronous gate work blocked Node past the backstop.
+  const started = Date.now();
+  const outcome = runOwnedProcess(process.execPath, ['-e', 'process.exit(0)'], {
+    cwd: process.cwd(), env: process.env, timeoutMs: 200,
+  });
+  assert.equal(spawnSync('sleep', ['7.5']).status, 0);
+  assert(Date.now() - started > 6200, 'event loop must stay blocked beyond the backstop deadline');
+  await outcome;
 });
 
 for (const mode of ['deadline', 'parent-exit', 'interrupt']) {
