@@ -91,7 +91,8 @@ impl TenantSink for DeltaSink {
             "invalid tenant sink transaction identity"
         );
         // Previously staged failures remain uncommitted; never reuse them as a
-        // different batch. Retention-aware maintenance owns orphan cleanup.
+        // different batch. VACUUM LITE cannot discover never-logged orphans;
+        // those require separate, quiescent operator reconciliation.
         self.current = None;
         self.partitions = None;
         self.staged.clear();

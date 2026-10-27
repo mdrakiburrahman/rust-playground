@@ -295,20 +295,30 @@ mod tests {
             ..LayoutPolicy::default()
         };
         let properties = policy.writer_properties(&schema)?;
-        let mut buffer = FileSortBuffer::new(Arc::clone(&schema), policy)?;
+        let mut buffer = FileSortBuffer::new(Arc::clone(&schema), policy.clone())?;
         for offset in (0..rows as usize).step_by(8_192) {
             assert!(buffer.try_push(&batch.slice(offset, 8_192))?);
         }
         let sorted = buffer.finish()?;
-        for (name, data) in [("sorted.parquet", &sorted), ("unsorted.parquet", &batch)] {
-            let mut writer = ArrowWriter::try_new(
-                std::fs::File::create(directory.path().join(name))?,
-                Arc::clone(&schema),
-                Some(properties.clone()),
-            )?;
-            writer.write(data)?;
-            writer.close()?;
+        let table = arrow_deltalake::delta::DeltaTable::open(directory.path())?;
+        let mut publication = table.new_file_with_publication_and_layout(
+            Arc::clone(&schema),
+            "read-efficiency-source".into(),
+            0,
+            1,
+            Some(policy),
+        )?;
+        for offset in (0..rows as usize).step_by(8_192) {
+            publication.write(&batch.slice(offset, 8_192)).await?;
         }
+        publication.finish().await?;
+        let mut writer = ArrowWriter::try_new(
+            std::fs::File::create(directory.path().join("unsorted.parquet"))?,
+            Arc::clone(&schema),
+            Some(properties),
+        )?;
+        writer.write(&batch)?;
+        writer.close()?;
         let page_policy = LayoutPolicy {
             row_group_rows: rows as usize,
             page_rows: 1_024,
@@ -323,18 +333,18 @@ mod tests {
         writer.close()?;
         let url = url::Url::from_directory_path(directory.path()).map_err(|()| anyhow::anyhow!("invalid test URL"))?;
         let source = DeltaSource::open(url)?;
-        let frozen = BootstrapManifest {
-            source_url: source.url.to_string(),
-            table_id: "fixture".into(),
-            version: 0,
-            metadata: json!({"schemaString":r#"{"type":"struct","fields":[{"name":"customer_id","type":"string","nullable":false,"metadata":{}},{"name":"value","type":"integer","nullable":false,"metadata":{}},{"name":"payload","type":"string","nullable":false,"metadata":{}}]}"#,"partitionColumns":[]}),
-            protocol: json!({}),
-            files: Vec::new(),
-        };
+        let frozen = source.capture()?;
+        assert_eq!(frozen.files.len(), 1);
+        let committed_path = frozen.files[0].path.clone();
         let file = |name: &str| -> Result<SourceFile> {
+            let path = if name == "sorted.parquet" {
+                committed_path.as_str()
+            } else {
+                name
+            };
             Ok(SourceFile {
-                path: name.into(),
-                size: std::fs::metadata(directory.path().join(name))?.len(),
+                path: path.into(),
+                size: std::fs::metadata(directory.path().join(path))?.len(),
                 partition_values: BTreeMap::new(),
             })
         };
@@ -431,7 +441,7 @@ mod tests {
         let context = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
         let dataframe = context
             .read_parquet(
-                source.file_url("sorted.parquet")?.as_str(),
+                source.file_url(&committed_path)?.as_str(),
                 ParquetReadOptions::default(),
             )
             .await?
@@ -472,6 +482,7 @@ mod tests {
             "READ_EFFICIENCY {}",
             serde_json::to_string(&json!({
                 "rows":rows,"customers":16,"rowGroupRows":1024,
+                "sourceWriter":"DeltaTable::new_file_with_publication_and_layout",
                 "sortedFiltered":sorted_metrics,"unsortedFiltered":unsorted_metrics,
                 "sortedUnfiltered":full_metrics,"negativePredicate":missing_metrics,
                 "bloomInRangeAbsent":bloom_metrics,"singleRowGroupPageIndex":page_metrics,
