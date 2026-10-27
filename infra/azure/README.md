@@ -203,9 +203,13 @@ reset reject any non-released occupancy. `stop --execute` first moves
 `released` to `stopping` with a fresh hold UUID in one lease-guarded
 compare-and-set, before any ARM call. A competing `occupy` either wins first,
 so stop fails without calling ARM, or is rejected while the hold exists. The
-hold is released only after the cluster is observed `Stopped`; an unknown
-compare-and-set or ARM outcome leaves it held, and rerunning `stop --execute`
-resumes the same hold. Lifecycle authority is metadata on the preserved checkpoint
+hold is released only after this process's own definite ARM submission and an
+observed `Stopped` state. An unknown compare-and-set, submission or wait
+outcome, including an Azure CLI timeout (which kills the whole CLI process
+group), leaves a blocking hold. A later `stop --execute` never replays or
+releases an existing hold, because the old request may still land late; it
+needs explicit operator reconciliation. A definite compare-and-set conflict
+writes nothing and stays retryable. Lifecycle authority is metadata on the preserved checkpoint
 container, not a blob: `sandboxid`, `resetstate`, `resetgeneration`, `occupancy`,
 and `occupancyid`. Updates use the lease-guarded compare-and-set above. Writers fail closed unless
 ownership matches and `resetstate=ready`, checking before open, upload and each

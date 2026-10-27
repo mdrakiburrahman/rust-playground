@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -174,6 +175,25 @@ def write_private(path, values):
             os.unlink(temporary)
 
 
+def run_tree(command, timeout):
+    """Run a command in its own session; on timeout kill the whole process group.
+
+    A timeout leaves the outcome unknown, so callers must not treat it as a
+    definite failure of a mutating request.
+    """
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, start_new_session=True)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.communicate()
+        raise Failure("Command timed out; outcome unknown and process group killed.")
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
 class Azure:
     def __init__(self, config):
         self.c = config
@@ -181,10 +201,7 @@ class Azure:
         self.snapshots = {}
 
     def cli(self, *args):
-        result = subprocess.run(
-            ["az", *args, "--only-show-errors", "--output", "json"],
-            capture_output=True, text=True, timeout=3600, check=False,
-        )
+        result = run_tree(["az", *args, "--only-show-errors", "--output", "json"], 3600)
         if result.returncode:
             raise Failure(self.c.redact(result.stderr))
         return json.loads(result.stdout) if result.stdout.strip() else None
@@ -831,25 +848,31 @@ def stop_cluster(azure):
 
     The hold is taken by CAS from released before any ARM call, so a competing
     occupy either wins first (stop fails before ARM) or is rejected afterwards.
-    It is released only after Stopped is observed. Any unknown CAS or ARM
-    outcome leaves the hold in place; rerunning stop resumes the same hold.
+    It is released only after this process's own definite ARM submission and an
+    observed Stopped state. An existing hold is never replayed or released: a
+    prior submission may still complete late, and a new stop plus a Stopped
+    snapshot does not prove that request drained. Any unknown CAS, submission or
+    wait outcome leaves a blocking hold for explicit operator reconciliation. A
+    definite CAS conflict writes nothing and stays retryable.
     """
     metadata, etag = azure.control()
     current = metadata.get("occupancy", "released")
-    if current == "released":
-        metadata.update(occupancy="stopping", occupancyid=str(uuid.uuid4()))
-        azure.set_control(metadata, etag)
-    elif current != "stopping":
+    if current == "stopping":
+        raise Failure("A prior stop hold may have an ambiguous ARM submission; not replaying "
+                      "or releasing it. Reconcile the old request explicitly.")
+    if current != "released":
         raise Failure("Cloud tests own the sandbox; wait for explicit occupancy release.")
+    hold = str(uuid.uuid4())
+    metadata.update(occupancy="stopping", occupancyid=hold)
+    azure.set_control(metadata, etag)
     azure.cli("rest", "--method", "post", "--url", "https://management.azure.com" +
               azure.c.cluster_id + "/stop?api-version=" + API)
     retry_ready(lambda: stopped(azure), "Cluster stop", timeout=1200)
     metadata, etag = azure.control()
-    if metadata.get("occupancy") != "stopping":
+    if metadata.get("occupancy") != "stopping" or metadata.get("occupancyid") != hold:
         raise Failure("Stop hold changed unexpectedly; reconcile occupancy before reuse.")
     metadata["occupancy"] = "released"
     azure.set_control(metadata, etag)
-
 
 def stopped(azure):
     if azure.arm("GET", azure.c.cluster_id)["properties"].get("state") != "Stopped":
