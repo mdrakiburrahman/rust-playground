@@ -101,11 +101,22 @@ python3 infra/azure/bootstrap.py reset --execute
 
 Execution verifies exact ownership, HNS, disabled retention, the exact database
 allowlist, and the complete container allowlist/ownership. It persistently fences
-remote writers, stops the local workspace-owned loadtest, waits 60 seconds for
-bounded in-flight requests, inventories again, drops the owned database, and
+remote writers, stops the local workspace-owned loadtest, waits a 60-second
+quiescence interval, inventories again, drops the owned database, and
 deletes every owned blob, snapshot and version, including Delta/service
 checkpoints. It refuses preexisting soft-deleted objects rather than claiming
 hidden retained data is gone. Unknown resources cause failure, not deletion.
+
+**The 60-second interval is not independently a fencing proof.** Safe destructive
+reset additionally requires every integrated publisher to have a verified
+whole-publication bound covering credential acquisition (including the Azure CLI
+child process), retries, and outstanding storage writes. HTTP request timeouts
+alone do not bound authentication: a publisher stalled in an unbounded CLI
+refresh can otherwise resume after deletion. Until the bounded/cancellable
+credential provider and stalled-auth regression are integrated and verified, do
+not execute reset against active or potentially suspended remote publishers.
+Offline reset tests establish orchestration ordering, not that cross-process
+publication deadline or live Azure safety.
 
 Cluster, identity, account and both containers survive. Verification requires
 zero databases and literally zero blobs and HNS paths (including empty
