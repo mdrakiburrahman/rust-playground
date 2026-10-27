@@ -35,6 +35,30 @@ test yourself.
 The test runs until **Ctrl+C**. Stopping the generator leaves the stack running
 so you can inspect the charts and output; the next start resets it.
 
+## Fenced Azure schema bootstrap
+
+Infrastructure provisioning invokes:
+
+```bash
+cargo run --locked --quiet --package arrowcol-loadgen -- initialize-azure \
+  --manifest "$ARROWCOL_AZURE_TABLE_MANIFEST"
+```
+
+Private environment inputs are `ARROWCOL_AZURE_TABLE_ROOT`,
+`AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_CONTAINER`, and
+`AZURE_STORAGE_CHECKPOINT_CONTAINER`. The root must be a credential-free
+`abfss://` URL inside that account/container. The storage authority must remain
+owned and **fenced** during initialization; this command cannot acquire a data
+writer or bypass the reset fence.
+
+The canonical registry initializes both pools/all 13 schemas with required
+`__arrowcol_ingestion STRING` partitions. Core normalization runs exactly once,
+including timestamp companions. Existing compatible roots are preserved.
+Only after all 26 roots succeed is the `{name, relative_path}` JSON manifest
+written; paths such as `direct/telemetry/sqlserver/sqlserver_active_sessions`
+are relative to `ARROWCOL_AZURE_TABLE_ROOT`, including any private isolated-run
+prefix. Initialization does not insert data or prove Azure/QAP readiness.
+
 ## Options
 
 | Option | Meaning | Default |

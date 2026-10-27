@@ -21,8 +21,18 @@ pub enum Command {
     Run(Box<RunArgs>),
     /// Validate benchmark manifests and independent Delta snapshots.
     Validate(ValidateArgs),
+    /// Initialize both Azure pools from the canonical schemas while reset is fenced.
+    InitializeAzure(InitializeAzureArgs),
     /// Print the exact public Flight SQL schema fixture.
     PrintSchemas,
+}
+
+/// Owned sandbox bootstrap inputs. Credentials are supplied only by the environment.
+#[derive(Clone, Debug, Args)]
+pub struct InitializeAzureArgs {
+    /// Output manifest used by infrastructure reconciliation.
+    #[arg(long, env = "ARROWCOL_AZURE_TABLE_MANIFEST")]
+    pub manifest: PathBuf,
 }
 
 /// Benchmark scenario.
