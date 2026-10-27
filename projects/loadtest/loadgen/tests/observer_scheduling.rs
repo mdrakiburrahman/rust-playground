@@ -18,6 +18,7 @@ use std::{
 struct State {
     stop: AtomicBool,
     active: AtomicUsize,
+    handlers: AtomicUsize,
     peak: AtomicUsize,
     requests: Mutex<Vec<String>>,
 }
@@ -44,6 +45,7 @@ impl Fixture {
         let state = Arc::new(State {
             stop: AtomicBool::new(false),
             active: AtomicUsize::new(0),
+            handlers: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
             requests: Mutex::new(Vec::new()),
         });
@@ -89,6 +91,10 @@ impl Fixture {
             self.state.active.load(Ordering::Acquire) == 0,
             "active fixture handlers remain"
         );
+        ensure!(
+            self.state.handlers.load(Ordering::Acquire) == 0,
+            "unjoined fixture handlers remain"
+        );
         Ok(())
     }
 
@@ -121,6 +127,8 @@ impl Drop for Active<'_> {
 }
 
 fn handle(mut socket: TcpStream, state: &State, delay: Duration) -> Result<()> {
+    state.handlers.fetch_add(1, Ordering::AcqRel);
+    let _handler = Active(&state.handlers);
     let active = state.active.fetch_add(1, Ordering::AcqRel) + 1;
     state.peak.fetch_max(active, Ordering::AcqRel);
     let _active = Active(&state.active);
@@ -181,6 +189,10 @@ fn handle(mut socket: TcpStream, state: &State, delay: Duration) -> Result<()> {
         response(&[], vec![])
     };
     let body = response.to_string();
+    // End the measured processing region before a complete response becomes observable:
+    // a client may start its next request before this handler gets another scheduling turn.
+    // The separate handler guard still covers the write and is checked after joining.
+    drop(_active);
     match write!(
         socket,
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -284,11 +296,11 @@ async fn deadline_cancels_both_slots_and_joins_handlers_without_late_artifacts()
     let parsed: Value = serde_json::from_slice(&diagnostic)?;
     ensure!(parsed["code"] == "deadline_exceeded" && parsed["queries_completed"] == 0);
     let until = Instant::now() + Duration::from_secs(2);
-    while fixture.state.active.load(Ordering::Acquire) != 0 && Instant::now() < until {
+    while fixture.state.handlers.load(Ordering::Acquire) != 0 && Instant::now() < until {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     ensure!(
-        fixture.state.active.load(Ordering::Acquire) == 0,
+        fixture.state.handlers.load(Ordering::Acquire) == 0,
         "cancelled sockets must close"
     );
     fixture.finish()?;
