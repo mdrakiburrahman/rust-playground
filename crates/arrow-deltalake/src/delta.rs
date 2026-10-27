@@ -33,7 +33,7 @@ use url::Url;
 
 type LocalEngine = DefaultEngine<SharedExecutor>;
 
-fn configured_publication_layout(schema: &SchemaRef) -> Result<Option<crate::layout::LayoutPolicy>> {
+pub(crate) fn configured_publication_layout(schema: &SchemaRef) -> Result<Option<crate::layout::LayoutPolicy>> {
     let columns = |name| -> Result<Option<Vec<String>>> {
         match std::env::var(name) {
             Ok(value) => Ok(Some(value.split(',').map(str::trim).map(str::to_owned).collect())),
@@ -73,13 +73,9 @@ fn azure_store(url: &Url) -> Result<object_store::azure::MicrosoftAzure> {
         .with_url(url.as_str())
         .with_credentials(Arc::new(crate::azure_cli::BoundedAzureCli::default()))
         .with_retry(object_store::RetryConfig {
-            max_retries: 2,
+            max_retries: 0,
             retry_timeout: Duration::from_secs(10),
-            backoff: object_store::BackoffConfig {
-                init_backoff: Duration::from_millis(100),
-                max_backoff: Duration::from_millis(250),
-                base: 2.0,
-            },
+            ..Default::default()
         })
         .with_client_options(object_store::ClientOptions::new().with_timeout(Duration::from_secs(10)))
         .build()?)
