@@ -330,6 +330,19 @@ list/map elements need a named struct field. Container logical types live on
 the enclosing field because Delta has no element/key/value field metadata.
 Schema evolution is separate: a failed append may leave a new nullable column.
 
+Data that is already in this representation (for example rows read back with a
+table's Kernel schema, `DeltaTable::arrow_schema`) must not be normalized again,
+because its companions would collide with the reserved names. Validate the schema
+with `normalize::CanonicalSchema::try_new`, then use `DeltaTable::open_url_canonical`
+(or `open_url_with_session_canonical`) and
+`new_canonical_file_partitioned_with_properties`. A canonical schema is accepted
+only when normalization would leave it unchanged: every `Timestamp(us, UTC)` is
+immediately followed by its `<field>__unix_nanos` Int64 companion with the same
+nullability, at every nesting level, and no raw type remains. Each written batch must
+match that shape, and every companion must agree with its timestamp row by row (same
+nulls, `micros == floor(nanos / 1000)`). Companion nanos are kept exactly as given.
+The raw APIs still reject reserved companion names.
+
 ## Local table layout
 
 ```text
