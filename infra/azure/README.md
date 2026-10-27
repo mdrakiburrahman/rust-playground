@@ -352,13 +352,27 @@ The following describes the operator sequence behind the still-disabled public
     gets `412` against any successor object at that path.
   - Snapshots and versions are addressed by immutable identity.
   - Objects without an ETag are refused before any deletion.
-  - A database already `Deleting` is not resubmitted. A pending database
-    delete fails rather than reporting clean.
   - Unknown stop/start outcomes are never replayed by reset.
-  - **Open predicate:** the ARM database DELETE has no precondition. An
-    unknown submission that lands after rotation and reprovisioning could
-    remove the successor database. Live qualification must bound or observe
-    that before enablement.
+- **Database DELETE intent and provider receipt.** The ARM database DELETE has
+  no precondition, so a stale request landing after rotation and reprovision
+  could remove the successor database. Absence in a listing therefore never
+  reconciles a submission.
+  - Before submitting, the operator durably publishes a private
+    `.env.azure.reset.database.json` intent (`submitting`) bound to its
+    operator UUID and generation.
+  - Only a definitive response advances it: `200`/`204`/`404` to `completed`,
+    or `202` with an ARM `Azure-AsyncOperation`/`Location` URL to `accepted`.
+    An accepted intent is polled read-only and becomes `completed` only when
+    the provider operation reports `Succeeded`.
+  - A transport failure, crash or other response leaves `submitting`. That
+    custody is explicitly **unresumable**: no finish, rotation, rebootstrap or
+    resubmission, and the record and `cleaning-v1` are retained for manual
+    reconciliation. Timeouts are not claimed to prove anything.
+  - A provider-reported terminal failure removes the intent so resume may
+    resubmit once more under the same custody.
+  - A `Deleting` database without this custody's intent, or an intent from
+    another operator or generation, is refused and never adopted.
+  - Blob-only cleanup stays resumable as before.
 
 ### Writer inventory (enablement gate input)
 
@@ -369,7 +383,7 @@ The following describes the operator sequence behind the still-disabled public
 | Tenant stream (sink and checkpoint) | `5dd2c85` | Shared admission across sink and checkpoint | Offline pass |
 | Azure copy/rename | `7307a94` | `azure_server_side_copy_is_unreachable` | Unsupported before I/O |
 | Collector replay | `8b82339`, `590a329` | Replay epoch fencing | Actual WAL drain **pending** |
-| Loadgen `initialize-azure` child | `89d3eee` | Expected-generation integration of `7307a94` | **Unverified** |
+| Loadgen `initialize-azure` child | `89d3eee`, `9c01c6d` | `initialize_azure_dispatch` (6 missing/non-canonical expected-generation cases rejected before any Azure or control I/O) | Offline rejection pass; stale-G/cleaning runtime, Python wire, admission-before-blob and drain **unverified** |
 | Python parent (bootstrap/reconcile/release/stop) | this directory | `test_bootstrap`, `test_publisher_control` | Offline pass |
 
 Offline passes are orchestration evidence only. Public enablement still

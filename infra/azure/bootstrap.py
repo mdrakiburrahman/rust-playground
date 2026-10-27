@@ -233,7 +233,8 @@ class Azure:
         })
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
-                return response.read(), {key.lower(): value for key, value in response.headers.items()}
+                return response.read(), {**{key.lower(): value for key, value in response.headers.items()},
+                                         ":status": str(response.status)}
         except urllib.error.HTTPError as exc:
             if missing_ok and exc.code == 404:
                 return None, {}
@@ -249,6 +250,23 @@ class Azure:
                                json.dumps(body) if body is not None else None,
                                {"Content-Type": "application/json"}, missing_ok)
         return json.loads(data) if data else None
+
+    def delete_database(self):
+        """Submit the owned database DELETE; return (HTTP status, provider operation URL)."""
+        _, headers = self.request(
+            "DELETE", "https://management.azure.com" + self.c.cluster_id + "/databases/" +
+            self.c.database + "?api-version=" + API, "https://management.azure.com/", missing_ok=True)
+        if not headers:
+            return 404, None
+        return int(headers[":status"]), headers.get("azure-asyncoperation") or headers.get("location")
+
+    def provider_operation(self, url):
+        """Read-only poll of an ARM async operation: Succeeded, Failed, Canceled or InProgress."""
+        data, headers = self.request("GET", url, "https://management.azure.com/")
+        if headers.get(":status") == "202":
+            return "InProgress"
+        body = json.loads(data) if data else {}
+        return body.get("status") or "Succeeded"
 
     def blob(self, method, container, name="", query=None, body=None, headers=None,
              missing_ok=False):
@@ -799,28 +817,38 @@ def reset_lock(path):
         os.close(fd)  # closing the descriptor releases the flock
 
 
-def write_reset_record(path, record):
-    """Create-if-absent, durably (file and parent fsync) BEFORE the claim CAS.
+def publish_private(path, record, *, previous=None):
+    """Durably publish a custody file (file fsync, then parent fsync).
 
-    Never overwrites: a link() onto an existing record fails. A durability
-    failure propagates before any CAS; resume re-fsyncs before acting.
+    previous=None creates-if-absent via link() and never overwrites. Otherwise the
+    current bytes must equal this owner's previous record before an atomic replace.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".env.azure.reset.")
+    if previous is not None and path.read_bytes() != record_bytes(previous):
+        raise Failure("Custody file is not this operator's; never overwriting it.")
+    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".env.azure.reset.tmp.")
     try:
         with os.fdopen(fd, "wb") as stream:
             stream.write(record_bytes(record))
             stream.flush()
             os.fsync(stream.fileno())
         os.chmod(temporary, 0o600)
-        try:
-            os.link(temporary, path)
-        except FileExistsError as exc:
-            raise Failure("A cleanup custody record already exists; never overwriting it.") from exc
+        if previous is None:
+            try:
+                os.link(temporary, path)
+            except FileExistsError as exc:
+                raise Failure("A cleanup custody record already exists; never overwriting it.") from exc
+        else:
+            os.replace(temporary, path)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
     fsync_directory(path.parent)
+
+
+def write_reset_record(path, record):
+    """Create-if-absent, durably, BEFORE the claim CAS; resume re-fsyncs before acting."""
+    publish_private(path, record)
 
 
 def remove_reset_record(path, record):
@@ -831,6 +859,87 @@ def remove_reset_record(path, record):
         raise Failure("Cleanup custody record is unreadable; not removing it.") from exc
     if current != record_bytes(record):
         raise Failure("Cleanup custody record is not this operator's; never removing it.")
+    path.unlink()
+    fsync_directory(path.parent)
+
+
+DATABASE_STATES = {"submitting", "accepted", "completed"}
+
+
+def database_intent_path(record_path):
+    return record_path.with_name(".env.azure.reset.database.json")
+
+
+def read_database_intent(record_path, record):
+    """The owned database-DELETE intent bound to this exact custody, or None."""
+    path = database_intent_path(record_path)
+    try:
+        raw = path.read_bytes()
+        intent = json.loads(raw)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise Failure("Database delete intent is unreadable; refusing.") from exc
+    if (not isinstance(intent, dict) or set(intent) != {"operator", "generation", "state", "operation"} or
+            intent["state"] not in DATABASE_STATES or raw != record_bytes(intent)):
+        raise Failure("Database delete intent is malformed; refusing.")
+    if (intent["operator"], intent["generation"]) != (record["operator"], record["generation"]):
+        raise Failure("Database delete intent belongs to other custody; never adopting it.")
+    return intent
+
+
+UNKNOWN_DATABASE_DELETE = (
+    "Owned database DELETE submission outcome is unknown and no provider operation receipt "
+    "was captured. A late request could delete a successor database after rotation, so this "
+    "custody is UNRESUMABLE: cleaning-v1, the custody record and the intent are retained; "
+    "absence in a listing does not reconcile it.")
+
+
+def settle_database(azure, record, record_path, databases):
+    """Delete the owned database only under a durable intent with a provider receipt."""
+    path = database_intent_path(record_path)
+    intent = read_database_intent(record_path, record)
+    if intent is None:
+        if not databases:
+            return  # never submitted by this custody: absence is genuine
+        if databases[0].get("properties", {}).get("provisioningState") == "Deleting":
+            raise Failure("Owned database is Deleting without this custody's intent; refusing.")
+        intent = {"operator": record["operator"], "generation": record["generation"],
+                  "state": "submitting", "operation": None}
+        publish_private(path, intent)  # durable BEFORE submission
+        try:
+            status, operation = azure.delete_database()
+        except Failure as exc:
+            raise Failure(UNKNOWN_DATABASE_DELETE) from exc
+        if status in (200, 204, 404):
+            update = {**intent, "state": "completed"}
+        elif (status == 202 and isinstance(operation, str) and
+              operation.startswith("https://management.azure.com/")):
+            update = {**intent, "state": "accepted", "operation": operation}
+        else:
+            raise Failure(UNKNOWN_DATABASE_DELETE)
+        publish_private(path, update, previous=intent)
+        intent = update
+    if intent["state"] == "submitting":
+        raise Failure(UNKNOWN_DATABASE_DELETE)
+    if intent["state"] == "accepted":
+        def terminal():
+            status = azure.provider_operation(intent["operation"])
+            if status == "InProgress":
+                raise Failure("Database delete provider operation is still in progress.")
+            return status
+        status = retry_ready(terminal, "Database delete operation")
+        if status != "Succeeded":
+            # Provider-terminal without success: that request can have no later effect.
+            remove_custody_file(path, intent)
+            raise Failure(f"Provider reported the database delete {status}; resume may resubmit.")
+        update = {**intent, "state": "completed"}
+        publish_private(path, update, previous=intent)
+
+
+def remove_custody_file(path, record):
+    if path.read_bytes() != record_bytes(record):
+        raise Failure("Custody file is not this operator's; never removing it.")
     path.unlink()
     fsync_directory(path.parent)
 
@@ -858,7 +967,7 @@ def _unqualified_reset_sequence(azure, stop_command, record_path=None):
 def _locked_reset_sequence(azure, stop_command, record_path):
     from publisher_control import READY, PublisherControl, UnknownTransition
     c = azure.c
-    if read_reset_record(record_path) is not None:
+    if read_reset_record(record_path) is not None or database_intent_path(record_path).exists():
         raise Failure("A cleanup custody record exists; resume it instead of a fresh claim.")
     control = PublisherControl(azure)
     databases, inventory = reset_inventory(azure)
@@ -943,7 +1052,13 @@ def _locked_reset_resume(azure, record_path):
     metadata, registry, _ = control.read()
     operator, generation = record["operator"], record["generation"]
     if metadata["resetgeneration"] == record["next"]:
-        # Only this record knows the fresh successor: the finish CAS applied earlier.
+        # Only this record knows the fresh successor: the finish CAS applied earlier,
+        # which requires a completed database intent first.
+        intent = read_database_intent(record_path, record)
+        if intent is not None:
+            if intent["state"] != "completed":
+                raise Failure("Rotated authority with an incomplete database intent; refusing.")
+            remove_custody_file(database_intent_path(record_path), intent)
         remove_reset_record(record_path, record)
         print("Earlier cleanup already finished and rotated authority; record cleared.")
         return
@@ -964,13 +1079,6 @@ def _locked_reset_resume(azure, record_path):
     cleanup_with_custody(azure, control, record, record_path)
 
 
-def delete_owned_database(azure, database):
-    # Observe first: an earlier (possibly unknown) submission may be in flight.
-    if database.get("properties", {}).get("provisioningState") == "Deleting":
-        return
-    azure.cli("rest", "--method", "delete", "--url", "https://management.azure.com" +
-              azure.c.cluster_id + "/databases/" + azure.c.database + "?api-version=" + API)
-
 
 def cleanup_with_custody(azure, control, record, record_path):
     """Idempotent deletion under exclusive cleaning-v1 custody, then rotate.
@@ -986,9 +1094,8 @@ def cleanup_with_custody(azure, control, record, record_path):
     if any(not (blob["version"] or blob["snapshot"] or blob.get("etag"))
            for blobs in inventory.values() for blob in blobs):
         raise Failure("Inventoried object has no ETag; refusing an unconditional delete.")
-    if databases:
-        control.cleanup_operator(operator, generation)
-        delete_owned_database(azure, databases[0])
+    control.cleanup_operator(operator, generation)
+    settle_database(azure, record, record_path, databases)
     for container, blobs in inventory.items():
         control.cleanup_operator(operator, generation)
         for blob in sorted(blobs, key=lambda item: item["name"].count("/"), reverse=True):
@@ -1012,8 +1119,14 @@ def cleanup_with_custody(azure, control, record, record_path):
     remaining.extend(path for name in (c.data, c.checkpoints) for path in azure.paths(name))
     if remaining:
         raise Failure("Reset left workload state behind; cleanup authority retained.")
+    settle_database(azure, record, record_path, [])  # re-verify the receipt, never infer it
+    intent = read_database_intent(record_path, record)
+    if intent is not None and intent["state"] != "completed":
+        raise Failure(UNKNOWN_DATABASE_DELETE)
     retry_ready(lambda: no_databases(azure), "Database deletion")
     control.finish_cleanup(operator, generation, record["next"], definitively_cleaned=True)
+    if intent is not None:
+        remove_custody_file(database_intent_path(record_path), intent)
     remove_reset_record(record_path, record)
     print("Reset verified: zero databases and zero blobs, versions or snapshots; "
           "authority is fenced-v1 at a fresh generation.")
