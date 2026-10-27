@@ -79,7 +79,11 @@ class PublisherControl:
         return metadata
 
     def admit(self, publisher, generation, bootstrap=False):
-        """Normal admission needs ready-v1; bootstrap needs fenced-v1+empty+released."""
+        """Normal admission needs ready-v1; bootstrap needs fenced-v1+empty+released.
+
+        bootstrap=True mirrors the Rust child initializer's own admission rule; the
+        Python parent never registers itself as the bootstrap owner.
+        """
         publisher, generation = canonical_uuid(publisher), canonical_uuid(generation)
         metadata, registry, etag = self.read()
         if metadata["resetgeneration"] != generation:
@@ -171,12 +175,17 @@ class PublisherControl:
         metadata["resetstate"] = FENCED
         return self.cas(metadata, {}, etag)
 
-    def complete_bootstrap(self, publisher, generation, *, definitively_drained):
-        publisher, metadata, registry, etag = self.member(publisher, generation)
-        require_released(metadata)
-        if (metadata["resetstate"] != FENCED or set(registry) != {publisher} or
-                registry[publisher]["state"] != "active" or definitively_drained is not True):
-            raise Failure("Bootstrap readiness requires its exclusive definitively drained operator.")
+    def finalize_ready(self, generation):
+        """Parent finalization after the Rust child's exclusive bootstrap.
+
+        The child admits its own fresh UUID under fenced-v1+empty+released and
+        deregisters only after definitive physical drain. The parent never
+        registers or adopts the child's identity. It opens admission only if the
+        SAME generation captured before launching the child is still fenced-v1
+        with an empty registry. Any cleanup in between leaves cleaning-v1 or a
+        rotated generation, and an uncertain child leaves a member, so this
+        CAS fails closed.
+        """
+        metadata, etag = self.drained(canonical_uuid(generation))
         metadata["resetstate"] = READY
-        # The operator releases and enables admission in one ETag transition.
         return self.cas(metadata, {}, etag)
