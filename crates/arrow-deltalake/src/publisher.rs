@@ -296,9 +296,10 @@ pub enum CasOutcome {
 
 /// Test-only replacements for the Azure control container and blob endpoint
 /// used by `DeltaTable::initialize_url_for_bootstrap_with_control`. Exists only
-/// with the non-default `test-control` feature; production bootstrap always
+/// with the non-default `test-control` feature in builds with `debug_assertions`
+/// (never release, even with `--all-features`); production bootstrap always
 /// derives these from the URL, Azure CLI credential and subscription.
-#[cfg(feature = "test-control")]
+#[cfg(all(feature = "test-control", debug_assertions))]
 #[derive(Debug)]
 pub struct TestBootstrapControl {
     /// Serialized sandbox metadata (stands in for container metadata).
@@ -922,7 +923,7 @@ impl PublisherSession {
     ///
     /// # Errors
     /// See [`Self::open_bootstrap_async`].
-    #[cfg(feature = "test-control")]
+    #[cfg(all(feature = "test-control", debug_assertions))]
     pub fn open_bootstrap_with_control(
         control: Arc<dyn ControlMetadata>,
         sandbox_id: &str,

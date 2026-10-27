@@ -10,7 +10,9 @@ description = "Streaming pure-Arrow Parquet and Delta Kernel table writers"
 default = ["delta"]
 delta = ["dep:delta_kernel", "dep:delta_kernel_default_engine", "dep:fs2", "dep:url", "dep:opentelemetry"]
 # Test-only: drive real bootstrap admission with injected control metadata
-# and data store. Never enabled by default or by production binaries.
+# and data store. Never enabled by default or by production binaries; the
+# seam is additionally compiled only with debug_assertions, so release builds
+# omit it even with --all-features.
 test-control = ["delta"]
 
 [dependencies]
