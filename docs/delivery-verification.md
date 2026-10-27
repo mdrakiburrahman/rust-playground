@@ -44,6 +44,22 @@ bundle hashes were recorded with that failed run. A subsequent correction must
 be rebuilt into both collector images and rerun with the required 1,024-row
 workload; lowering that workload is not equivalent qualification.
 
+The corrected collector source
+`8c15aaf7ee75f7dd5c391c6b78bcc4e8de5c19b6` was rebuilt into both real
+collector images and reran that same 1,024-row command. All 636 Direct receipts
+published, including 49 for database properties. DFE recorded 636 best-effort
+admissions, zero error outcomes, zero publication-failure warnings, and zero
+occurrences of the previous budget cause. This does not substitute for final
+independent DFE row validation: the overall run subsequently failed the live
+Grafana SDK-metric gate and observer cleanup.
+
+The preserved live LGTM data showed `delta_kernel_version_ratio` for both
+collector service names, but no `delta_kernel_version`. The version gauge's
+dimensionless unit `"1"` caused the Prometheus translation suffix. The focused
+emitter correction removes that unit rather than weakening the required live
+query. Its actual rebuilt end-to-end qualification remains separate from the
+publication recovery above.
+
 ### Checkpoint/prune interoperability proof
 
 The bounded native harness ran on clean native source
