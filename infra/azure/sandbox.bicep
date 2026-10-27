@@ -9,6 +9,7 @@ param checkpointContainer string
 param controlMetadata object
 param checkpointExists bool
 param operatorObjectId string
+param operatorKustoPrincipalId string
 param operatorType string
 param clusterSku string
 param minimumInstances int
@@ -137,7 +138,7 @@ resource operator 'Microsoft.Kusto/clusters/principalAssignments@2024-04-13' = {
   parent: cluster
   name: 'sandbox-operator'
   properties: {
-    principalId: operatorObjectId
+    principalId: operatorKustoPrincipalId
     principalType: operatorType
     role: 'AllDatabasesAdmin'
     tenantId: tenant().tenantId

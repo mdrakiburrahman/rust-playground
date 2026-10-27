@@ -98,6 +98,13 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(b.Failure):
             b.Config({"AZURE_SUBSCRIPTION_ID": SUB, "AZURE_STORAGE_CHECKPOINT_CONTAINER": "arrowcol"})
 
+    def test_application_operator_requires_distinct_explicit_application_id(self):
+        with self.assertRaises(b.Failure):
+            b.Config({"AZURE_SUBSCRIPTION_ID": SUB, "AZURE_OPERATOR_TYPE": "App"})
+        c = b.Config({"AZURE_SUBSCRIPTION_ID": SUB, "AZURE_OPERATOR_TYPE": "App",
+                      "AZURE_OPERATOR_APPLICATION_ID": SUB})
+        self.assertEqual(c.operator_application, SUB)
+
     def test_config_parser_does_not_execute_expansion(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / ".env"
