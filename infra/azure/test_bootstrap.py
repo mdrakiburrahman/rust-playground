@@ -298,6 +298,31 @@ class ResetTests(unittest.TestCase):
 
 
 class OccupancyTests(unittest.TestCase):
+    def test_occupy_exports_exact_authority_generation_privately_not_run_uuid(self):
+        azure = FakeAzure()
+        owner = str(uuid.uuid4())
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / ".env.azure"
+            with contextlib.redirect_stdout(io.StringIO()):
+                b.occupancy(azure, "occupy", owner, output)
+            values = b.load_env(output)
+            self.assertEqual(values["ARROWCOL_RESET_GENERATION"], azure.metadata["resetgeneration"])
+            self.assertNotEqual(values["ARROWCOL_RESET_GENERATION"], owner)
+            self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+
+    def test_generation_change_after_occupy_cas_does_not_export_admission(self):
+        azure = FakeAzure()
+        original = azure.set_control
+        def change(metadata, etag):
+            original(metadata, etag)
+            azure.metadata["resetgeneration"] = str(uuid.uuid4())
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / ".env.azure"
+            with patch.object(azure, "set_control", side_effect=change):
+                with self.assertRaisesRegex(b.Failure, "Authority changed"):
+                    b.occupancy(azure, "occupy", str(uuid.uuid4()), output)
+            self.assertFalse(output.exists())
+
     def test_only_exact_test_owner_can_release(self):
         azure = FakeAzure()
         owner = str(uuid.uuid4())
