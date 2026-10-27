@@ -145,15 +145,17 @@ Bootstrap custody belongs to the single Rust child initializer that
 `fenced-v1`, released occupancy and an empty registry; its registration makes
 the registry non-empty, so a later cleanup claim fails. Cleanup and bootstrap
 claims therefore serialize through one container ETag and cannot both mutate.
-The Python parent never registers, adopts or deregisters the child. The child
-removes itself only after definitive physical drain; on failure or unknown drain
-it stays registered or uncertain and blocks readiness. The child never sets
-`ready-v1`. After a clean child exit the parent finishes manifest, Kusto managed
-identity, external table and query acceleration reconciliation, then
-`finalize_ready(generation)` sets `ready-v1` in one CAS only if the generation
-captured before the launch is still `fenced-v1` with an empty registry. A
-cleanup claim or rotation, or a remaining member, in between makes it fail
-closed. There is no destructor release, expiry, force clear, or automatic retry.
+The Python parent never adopts the child's UUID. The child removes itself only
+after definitive physical drain; on failure or unknown drain it stays registered
+or uncertain and blocks the parent. The child never sets `ready-v1`. After a
+clean child exit the parent admits its own fresh UUID through the same bootstrap
+rule for the generation captured before the launch, before any manifest, Kusto
+managed identity, external table or query acceleration I/O. If cleanup claimed
+or rotated in the idle gap, that admission fails before any I/O. The parent
+re-verifies with `bootstrap_owner` before each step, holds its member through all
+hosted-state work, and `complete_bootstrap` removes that member and sets
+`ready-v1` in one CAS only after every request completed definitively. An unknown
+admin outcome keeps the member active or marks it uncertain, so it failsclosed. There is no destructor release, expiry, force clear, or automatic retry.
 An uncertain member or operator cannot release even if logical transactions
 reconcile. Unknown CAS responses return `UnknownTransition`; retain the
 identity and reconcile authority read-only rather than claim success or adopt a

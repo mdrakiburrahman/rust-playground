@@ -70,44 +70,76 @@ class PublisherControlTests(unittest.TestCase):
             self.control.clean_release(child, generation, definitively_drained=True)
         return child
 
-    def test_child_owned_bootstrap_then_parent_finalizes_ready_in_single_cas(self):
+    def parent_admit(self, generation):
+        parent = str(uuid.uuid4())
+        self.control.admit(parent, generation, bootstrap=True)
+        return parent
+
+    def test_child_then_fresh_parent_member_completes_ready_in_single_cas(self):
         self.control.fence(self.generation)
         fresh, cleaner = str(uuid.uuid4()), str(uuid.uuid4())
         self.control.claim_cleanup(cleaner, self.generation)
         self.control.finish_cleanup(cleaner, self.generation, fresh, definitively_cleaned=True)
         child = self.child_bootstrap(fresh, drain=False)
-        with self.assertRaises(Failure):  # second bootstrap owner rejected
-            self.control.admit(str(uuid.uuid4()), fresh, bootstrap=True)
-        with self.assertRaises(Failure):  # parent cannot finalize before child drain
-            self.control.finalize_ready(fresh)
+        with self.assertRaises(Failure):  # parent cannot admit while child holds
+            self.parent_admit(fresh)
         self.control.clean_release(child, fresh, definitively_drained=True)
+        parent = self.parent_admit(fresh)
+        self.assertNotEqual(parent, child)
+        with self.assertRaises(Failure):  # cleanup cannot claim during parent KQL
+            self.control.claim_cleanup(cleaner, fresh)
+        self.control.bootstrap_owner(parent, fresh)
+        with self.assertRaises(Failure):  # child UUID is never adopted
+            self.control.complete_bootstrap(child, fresh, definitively_drained=True)
         before = len(self.azure.events)
-        self.control.finalize_ready(fresh)
+        self.control.complete_bootstrap(parent, fresh, definitively_drained=True)
         self.assertEqual(len(self.azure.events), before + 1)
         self.assertEqual(self.azure.metadata["resetstate"], READY)
         self.assertEqual(self.registry(), {})
 
-    def test_uncertain_child_blocks_parent_finalization(self):
+    def test_cleanup_wins_after_child_drain_parent_admission_fails_before_io(self):
+        self.control.fence(self.generation)
+        self.child_bootstrap(self.generation)
+        cleaner = str(uuid.uuid4())
+        self.control.claim_cleanup(cleaner, self.generation)
+        with self.assertRaises(Failure):  # parent must stop before any KQL
+            self.parent_admit(self.generation)
+        self.control.finish_cleanup(cleaner, self.generation, str(uuid.uuid4()),
+                                    definitively_cleaned=True)
+        with self.assertRaises(Failure):  # stale captured generation
+            self.parent_admit(self.generation)
+        self.assertEqual(self.azure.metadata["resetstate"], FENCED)
+        self.assertEqual(self.registry(), {})
+
+    def test_parent_wins_admission_then_cleanup_claim_fails(self):
+        self.control.fence(self.generation)
+        self.child_bootstrap(self.generation)
+        parent = self.parent_admit(self.generation)
+        with self.assertRaises(Failure):
+            self.control.claim_cleanup(str(uuid.uuid4()), self.generation)
+        self.control.bootstrap_owner(parent, self.generation)
+
+    def test_unknown_parent_admin_outcome_retains_member_and_blocks_ready(self):
+        self.control.fence(self.generation)
+        self.child_bootstrap(self.generation)
+        parent = self.parent_admit(self.generation)
+        self.control.uncertain(parent, self.generation)
+        for drained in (True, False):
+            with self.assertRaises(Failure):
+                self.control.complete_bootstrap(parent, self.generation,
+                                                definitively_drained=drained)
+        with self.assertRaises(Failure):
+            self.control.claim_cleanup(str(uuid.uuid4()), self.generation)
+        self.assertEqual(self.azure.metadata["resetstate"], FENCED)
+
+    def test_uncertain_child_blocks_parent_admission(self):
         self.control.fence(self.generation)
         child = self.child_bootstrap(self.generation, drain=False)
         self.control.uncertain(child, self.generation)
         with self.assertRaises(Failure):
             self.control.clean_release(child, self.generation, definitively_drained=True)
         with self.assertRaises(Failure):
-            self.control.finalize_ready(self.generation)
-        self.assertEqual(self.azure.metadata["resetstate"], FENCED)
-
-    def test_cleanup_between_child_drain_and_parent_finalize_fails_closed(self):
-        self.control.fence(self.generation)
-        self.child_bootstrap(self.generation)
-        cleaner = str(uuid.uuid4())
-        self.control.claim_cleanup(cleaner, self.generation)
-        with self.assertRaises(Failure):  # cleaning-v1 in progress
-            self.control.finalize_ready(self.generation)
-        self.control.finish_cleanup(cleaner, self.generation, str(uuid.uuid4()),
-                                    definitively_cleaned=True)
-        with self.assertRaises(Failure):  # rotated generation: bootstrap data gone
-            self.control.finalize_ready(self.generation)
+            self.parent_admit(self.generation)
         self.assertEqual(self.azure.metadata["resetstate"], FENCED)
     def test_unknown_cas_response_never_retries_or_admits_success(self):
         original = self.azure.set_control
@@ -221,7 +253,7 @@ class PublisherControlTests(unittest.TestCase):
                             lambda: self.control.admit(str(uuid.uuid4()), self.generation),
                             lambda: self.control.claim_cleanup(str(uuid.uuid4()), self.generation),
                             lambda: self.control.fence(self.generation),
-                            lambda: self.control.finalize_ready(self.generation),
+                            lambda: self.control.complete_bootstrap(cleaner, self.generation, definitively_drained=True),
                             lambda: self.control.clean_release(cleaner, self.generation,
                                                                definitively_drained=True)):
                 with self.assertRaises(Failure):
@@ -313,12 +345,14 @@ class PublisherControlTests(unittest.TestCase):
             self.control.finish_cleanup(cleaner, self.generation, str(uuid.uuid4()),
                                         definitively_cleaned=True)
         self.assertEqual(self.registry()[cleaner]["state"], "uncertain")
-    def test_cas_unknown_on_parent_finalize_does_not_report_success(self):
+    def test_cas_unknown_on_parent_completion_does_not_report_success(self):
         self.control.fence(self.generation)
         self.child_bootstrap(self.generation)
+        parent = self.parent_admit(self.generation)
         with patch.object(self.azure, "set_control", side_effect=Failure("timeout")):
             with self.assertRaises(UnknownTransition):
-                self.control.finalize_ready(self.generation)
+                self.control.complete_bootstrap(parent, self.generation,
+                                                definitively_drained=True)
         self.assertEqual(self.azure.metadata["resetstate"], FENCED)
 
 if __name__ == "__main__":
