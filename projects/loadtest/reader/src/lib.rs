@@ -427,10 +427,64 @@ pub async fn summarize(directory: &Path) -> Result<SnapshotSummary> {
     if roots.is_empty() {
         bail!("no Delta tables found in {}", directory.display());
     }
+    summarize_roots(&directory, roots).await
+}
+
+/// Summarizes only the explicitly named tables (dot-separated identities relative to the root),
+/// decoding nothing else; an empty list summarizes every table like [`summarize`].
+///
+/// # Errors
+///
+/// Rejects duplicate, empty, traversing, symlinked, or missing identities, identities that are
+/// not Delta table roots (or are nested below one), and everything [`summarize`] rejects.
+pub async fn summarize_selected(directory: &Path, identities: &[String]) -> Result<SnapshotSummary> {
+    if identities.is_empty() {
+        return summarize(directory).await;
+    }
+    if identities.iter().collect::<std::collections::BTreeSet<_>>().len() != identities.len() {
+        bail!("selected Delta table identities must be unique");
+    }
+    let directory =
+        fs::canonicalize(directory).with_context(|| format!("canonicalize Delta root {}", directory.display()))?;
+    let mut roots = Vec::with_capacity(identities.len());
+    for identity in identities {
+        if identity
+            .split('.')
+            .any(|part| part.is_empty() || part == ".." || part.contains(['/', '\\']))
+        {
+            bail!("invalid table identity {identity:?}");
+        }
+        let mut root = directory.clone();
+        for part in identity.split('.') {
+            if root.join("_delta_log").exists() {
+                bail!("table identity {identity:?} is nested below a Delta table");
+            }
+            root.push(part);
+            let metadata =
+                fs::symlink_metadata(&root).with_context(|| format!("selected Delta table {identity:?} is missing"))?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                bail!("selected Delta table {identity:?} is a symlink or not a directory");
+            }
+        }
+        let log = fs::symlink_metadata(root.join("_delta_log"))
+            .with_context(|| format!("selected path {identity:?} is not a Delta table"))?;
+        if log.file_type().is_symlink() || !log.is_dir() {
+            bail!("selected path {identity:?} is not a Delta table");
+        }
+        if table_identity(&directory, &root)? != *identity {
+            bail!("selected Delta table {identity:?} does not resolve to its own identity");
+        }
+        roots.push(root);
+    }
+    roots.sort();
+    summarize_roots(&directory, roots).await
+}
+
+async fn summarize_roots(directory: &Path, roots: Vec<PathBuf>) -> Result<SnapshotSummary> {
     let mut tables = BTreeMap::new();
     let mut total_files = 0_usize;
     for root in roots {
-        let identity = table_identity(&directory, &root)?;
+        let identity = table_identity(directory, &root)?;
         let url = url::Url::from_directory_path(&root).map_err(|()| anyhow::anyhow!("invalid table path"))?;
         let delta = deltalake_core::open_table(url)
             .await
@@ -631,6 +685,77 @@ mod tests {
             inventory(directory.path()).await?.tables["telemetry.sqlserver.partitioned"].files,
             ["opaque/file.parquet"]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn selected_summaries_decode_only_named_tables_and_reject_unsafe_identities() -> Result<()> {
+        let directory = TestDirectory::new("selected")?;
+        let base = directory.path().join("telemetry/sqlserver");
+        let schema = json!({"type":"struct","fields":[{"name":"id","type":"integer","nullable":false,"metadata":{}}]});
+        let commit = |root: &Path, id: &str| -> Result<()> {
+            fs::create_dir_all(root.join("_delta_log"))?;
+            let actions = [
+                json!({"protocol":{"minReaderVersion":1,"minWriterVersion":2}}),
+                json!({"metaData":{"id":id,"format":{"provider":"parquet","options":{}},
+                    "schemaString":schema.to_string(),"partitionColumns":[],"configuration":{}}}),
+            ];
+            fs::write(
+                root.join("_delta_log/00000000000000000000.json"),
+                actions.iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n",
+            )?;
+            Ok(())
+        };
+        commit(&base.join("target"), "target")?;
+        commit(&base.join("control"), "control")?;
+        // A corrupt sibling proves unselected tables are never opened or decoded.
+        fs::create_dir_all(base.join("corrupt/_delta_log"))?;
+        fs::write(base.join("corrupt/_delta_log/00000000000000000000.json"), "not json\n")?;
+        assert!(summarize(directory.path()).await.is_err());
+
+        let selected = summarize_selected(directory.path(), &["telemetry.sqlserver.target".to_owned()]).await?;
+        assert_eq!(
+            selected.tables.keys().collect::<Vec<_>>(),
+            ["telemetry.sqlserver.target"]
+        );
+        assert_eq!(selected.files, 0);
+        let both = [
+            "telemetry.sqlserver.target".to_owned(),
+            "telemetry.sqlserver.control".to_owned(),
+        ];
+        assert_eq!(
+            summarize_selected(directory.path(), &both)
+                .await?
+                .tables
+                .keys()
+                .collect::<Vec<_>>(),
+            ["telemetry.sqlserver.control", "telemetry.sqlserver.target"]
+        );
+        assert!(
+            summarize_selected(directory.path(), &[]).await.is_err(),
+            "empty list summarizes everything"
+        );
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(fs::canonicalize(base.join("target"))?, base.join("alias"))?;
+        for invalid in [
+            vec!["telemetry.sqlserver.missing".to_owned()],
+            vec!["telemetry.sqlserver".to_owned()],
+            vec!["telemetry.sqlserver.target._delta_log".to_owned()],
+            vec!["telemetry..target".to_owned()],
+            vec!["telemetry/sqlserver/target".to_owned()],
+            vec!["telemetry.sqlserver.corrupt".to_owned()],
+            vec!["telemetry.sqlserver.alias".to_owned()],
+            vec![
+                "telemetry.sqlserver.target".to_owned(),
+                "telemetry.sqlserver.target".to_owned(),
+            ],
+        ] {
+            assert!(
+                summarize_selected(directory.path(), &invalid).await.is_err(),
+                "{invalid:?}"
+            );
+        }
         Ok(())
     }
 
