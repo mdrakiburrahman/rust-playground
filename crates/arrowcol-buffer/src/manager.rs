@@ -1474,7 +1474,11 @@ pub fn safe_error_message(message: &str) -> String {
             ),
             (r"(?i)\bbearer\s+[a-z0-9._~+/\-=]+", "[REDACTED]"),
             (
-                r#"(?i)["']?\b(?:password|pwd|accountkey|accountname|sharedaccesssignature|sharedaccesskey|access[_-]?token|refresh[_-]?token|client[_-]?secret|sig|se|sv|sp)["']?\s*[:=]\s*(?:"[^"]*"|'[^']*'|\{(?:[^}]|}})*\}|[^\s;,&"'<>]+)"#,
+                r#"(?i)["']?\b(?:password|pwd|account_?key|key|accountname|sharedaccesssignature|sharedaccesskey|access[_-]?token|refresh[_-]?token|client[_-]?secret|sig|se|sv|sp)["']?\s*[:=]\s*(?:"[^"]*"|'[^']*'|\{(?:[^}]|}})*\}|[^\s;,&"'<>]+)"#,
+                "[REDACTED]",
+            ),
+            (
+                r#"(?i)(?:"[a-z][a-z0-9+.-]*://[^"]*"|'[a-z][a-z0-9+.-]*://[^']*')"#,
                 "[REDACTED]",
             ),
             (
@@ -1547,6 +1551,66 @@ mod tests {
         "file:///canary-file/path; /canary-local/path; C:\\canary-windows\\path; \\\\canary-server\\share; ",
         "eyJhbGciOiJIUzI1NiJ9.eyJjYW5hcnkiOiJwcml2YXRlIn0.canaryJWTsignature"
     );
+
+    #[test]
+    fn runner_jsonl_spaced_quoted_secrets_and_basic_auth_are_redacted() -> anyhow::Result<()> {
+        let cause = "unsupported UInt8 statistic https://private.example/path?sig=credential C:\\Users\\private\\table \
+                 /private/table 12345678-1234-1234-1234-123456789abc Password=opaque-secret \
+                 Authorization: Bearer opaque-token AccountKey = spaced-secret key = second-secret \
+                 abfss://private@account.dfs.core.windows.net/root Password=\"three word credential\" \
+                 Password = \"combined private credential\" AccountKey : 'joined private words' \
+                 Authorization:Basic opaque-basic-token Password = \"https://private.example quoted url-secret\"";
+        let safe = safe_error_message(cause);
+        let mut receipt_jsonl = serde_json::to_string(&serde_json::json!({ "error_message": safe }))?;
+        receipt_jsonl.push('\n');
+        let mut admission_jsonl = serde_json::to_string(&serde_json::json!({ "error": safe }))?;
+        admission_jsonl.push('\n');
+        for jsonl in [&receipt_jsonl, &admission_jsonl] {
+            assert!(jsonl.contains("unsupported UInt8 statistic"));
+            for canary in [
+                "private.example",
+                "credential",
+                "C:\\",
+                "/private",
+                "opaque-secret",
+                "opaque-token",
+                "spaced-secret",
+                "second-secret",
+                "private@account",
+                "three word",
+                "combined",
+                "joined",
+                "private words",
+                "opaque-basic-token",
+                "url-secret",
+                "quoted",
+            ] {
+                assert!(!jsonl.contains(canary), "leaked runner JSONL canary: {canary}");
+            }
+        }
+        for message in [
+            r#"schema Int16 vs UInt8: password = "two words here""#,
+            "schema Int16 vs UInt8: client_secret : 'a b c'",
+            "schema Int16 vs UInt8: Authorization: Basic opaque-basic-token",
+            r#"schema Int16 vs UInt8: "https://private.example/path?sig=credential quoted url-secret""#,
+            "schema Int16 vs UInt8: 'https://private.example/path?sig=credential quoted url-secret'",
+        ] {
+            let safe = safe_error_message(message);
+            assert!(safe.contains("schema Int16 vs UInt8"));
+            for canary in [
+                "two words",
+                "a b c",
+                "opaque-basic-token",
+                "private.example",
+                "credential",
+                "quoted",
+                "url-secret",
+            ] {
+                assert!(!safe.contains(canary), "leaked quoted-secret canary: {canary}");
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn direct_warn_and_receipt_diagnostics_redact_canaries_but_keep_schema_cause() -> anyhow::Result<()> {
