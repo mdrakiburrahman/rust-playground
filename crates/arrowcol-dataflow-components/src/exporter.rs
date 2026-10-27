@@ -255,7 +255,7 @@ impl DeltaBackend {
             state: Mutex::new(OwnerState { evidence, pending: 0 }),
             retired: Arc::clone(&retired),
         });
-        tokio::spawn(run_batch_worker(
+        arrow_deltalake::delta::spawn_shared_io(run_batch_worker(
             table,
             receiver,
             drain_rx,
@@ -266,7 +266,8 @@ impl DeltaBackend {
             decoded.envelope.table.clone(),
             retired,
             self.options.max_pending_files,
-        ));
+        ))
+        .map_err(|error| ExportFailure::Transient(format!("Delta owner runtime failed: {error:#}")))?;
         tables.insert(decoded.envelope.table.clone(), Arc::clone(&owner));
         Ok(owner)
     }
@@ -1452,6 +1453,76 @@ mod tests {
                 .join("demo/generated/events/_delta_log/00000000000000000001.json")
                 .exists()
         );
+    }
+
+    #[test]
+    fn shared_owner_survives_first_pipeline_runtime_shutdown() {
+        let directory = tempfile::tempdir().expect("directory");
+        let first_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("first pipeline runtime");
+        let (first, lease) = first_runtime.block_on(async {
+            let store = Arc::new(MemoryRoutingStore::default());
+            let holder = CollectorInstanceId::new();
+            let lease = lease(&store, holder).await;
+            let exporter = GenericDeltaExporter::with_batching(
+                directory.path().to_path_buf(),
+                store as Arc<dyn RoutingStore>,
+                arrow_deltalake::commit::CommitOptions::default(),
+                FileBatchConfig {
+                    max_age: std::time::Duration::from_secs(60),
+                    ..Default::default()
+                },
+                Arc::new(RuntimeMetrics::new(holder)),
+            )
+            .expect("shared backend");
+            let publication = exporter
+                .stage(pdata(&lease, lease.fencing_epoch))
+                .await
+                .expect("first core stage");
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                exporter.backend.flush_pending().await.expect("first core flush");
+                publication.wait().await.expect("first core publication");
+            })
+            .await
+            .expect("bounded first core publication");
+            (exporter, lease)
+        });
+        let second = GenericDeltaExporter {
+            backend: Arc::clone(&first.backend),
+        };
+        drop(first);
+        drop(first_runtime);
+        let second_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("remaining pipeline runtime");
+        second_runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                second
+                    .backend
+                    .flush_pending()
+                    .await
+                    .expect("remaining core shutdown flush");
+                let publication = second
+                    .stage(pdata(&lease, lease.fencing_epoch))
+                    .await
+                    .expect("remaining core stage");
+                second
+                    .backend
+                    .flush_pending()
+                    .await
+                    .expect("remaining core final flush");
+                publication.wait().await.expect("remaining core publication");
+            })
+            .await
+            .expect("bounded remaining core publication");
+            assert_eq!(
+                second.backend.capacity.batches.available_permits(),
+                second.backend.batching.global_capacity.batches as usize
+            );
+        });
     }
 
     #[tokio::test]
