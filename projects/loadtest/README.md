@@ -500,6 +500,11 @@ by cache convergence.
 Snapshot capture for both pools and table-oracle preparation run across tables.
 Blocking decode/hash jobs share one process-wide CPU cap sized from available
 CPUs; file-level decoders do not create nested workers inside those jobs.
+Kusto data queries have a separate two-request admission cap shared by client
+clones, independent of CPU decoding. Management observations do not consume
+query permits. The caller's absolute deadline includes queue time; query errors
+still fail immediately without retry. Query evidence records the admission cap,
+queue and request durations, and query text bytes.
 The independent reader still reads each captured file twice: the first pass
 builds the snapshot hashes, and the second constructs the exact bounded corpus
 and verifies those hashes. Snapshot hashes alone cannot replace decoded rows

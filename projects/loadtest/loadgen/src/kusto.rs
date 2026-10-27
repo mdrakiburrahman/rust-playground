@@ -25,7 +25,7 @@ use futures::{StreamExt, stream};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::task::JoinHandle;
+use tokio::{sync::Semaphore, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use crate::{cli::RunArgs, transport::now_unix_millis};
@@ -42,6 +42,8 @@ const TOKEN_TIMEOUT: Duration = Duration::from_secs(60);
 const LOCAL_MAX_AGE: &str = "00:01:00";
 const LOCAL_HOT_WINDOW: &str = "1.00:00:00";
 const TABLES_PER_POOL: usize = 13;
+// Query-engine memory is independent of the validator host's CPU count.
+const QUERY_CONCURRENCY: usize = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -70,6 +72,7 @@ struct KustoClient {
     /// Shared bounded Azure CLI provider scoped to this cluster; absent in local mode.
     token: Option<Arc<AzureCliTokenProvider>>,
     queries_completed: Arc<AtomicU64>,
+    query_permits: Arc<Semaphore>,
 }
 
 impl KustoClient {
@@ -131,6 +134,7 @@ impl KustoClient {
             results: results.to_owned(),
             token,
             queries_completed: Arc::new(AtomicU64::new(0)),
+            query_permits: Arc::new(Semaphore::new(QUERY_CONCURRENCY)),
         })
     }
 
@@ -143,6 +147,19 @@ impl KustoClient {
     }
 
     async fn execute(&self, command: &str, management: bool, phase: &str) -> Result<Vec<BTreeMap<String, Value>>> {
+        let queued = Instant::now();
+        let _query_permit = if management {
+            None
+        } else {
+            Some(
+                self.query_permits
+                    .acquire()
+                    .await
+                    .context("Kusto query admission closed")?,
+            )
+        };
+        let queue_ms = queued.elapsed().as_millis();
+        let started = Instant::now();
         let route = if management { "v1/rest/mgmt" } else { "v2/rest/query" };
         let mut request = json!({
             "csl": command,
@@ -167,6 +184,8 @@ impl KustoClient {
             &self.results.join("kusto-queries.jsonl"),
             &json!({
                 "at_unix_ms": now_unix_millis(), "phase": phase,
+                "query_concurrency": QUERY_CONCURRENCY, "queue_ms": queue_ms,
+                "elapsed_ms": started.elapsed().as_millis(), "query_bytes": command.len(),
                 "management": management, "csl": redact_text(command),
                 "http_status": status.as_u16(), "response": public
             }),
@@ -1555,6 +1574,7 @@ pub(crate) async fn validate(
     Ok(json!({
         "timings": bound.timings.evidence(),
         "oracle_workers": delta_inspect::scheduler::oracle_scheduler().workers(),
+        "query_concurrency": QUERY_CONCURRENCY,
         "passed": true, "run_id": status.run_id, "backend": BACKEND, "mode": client.mode,
         "live_observed": true, "capacity": client.capacity().await, "tables": evidence
     }))
@@ -1786,6 +1806,7 @@ pub(crate) fn validation_failure(results: &Path, error: &anyhow::Error, progress
         "phase": progress.phase, "table": progress.table, "last_qap": progress.last_qap,
         "timings": progress.timings,
         "oracle_workers": delta_inspect::scheduler::oracle_scheduler().workers(),
+        "query_concurrency": QUERY_CONCURRENCY,
     });
     write_json(&results.join("kusto-validation.json"), &report)?;
     Ok(report)
@@ -1953,6 +1974,126 @@ mod tests {
             {"FrameType":"DataSetCompletion","HasErrors":false}
         ]))?;
         assert_eq!(parsed[0]["Rows"].as_u64(), Some(9_007_199_254_740_993));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cloned_clients_bound_actual_inflight_queries_independently_of_cpu_workers() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&peak);
+        let server = thread::spawn(move || -> Result<()> {
+            let mut workers = Vec::new();
+            for _ in 0..8 {
+                let (mut socket, _) = listener.accept()?;
+                let (active, peak) = (Arc::clone(&active), Arc::clone(&peak));
+                workers.push(thread::spawn(move || -> Result<()> {
+                    socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+                    let mut header = Vec::new();
+                    while !header.ends_with(b"\r\n\r\n") {
+                        let mut byte = [0];
+                        socket.read_exact(&mut byte)?;
+                        header.push(byte[0]);
+                    }
+                    let header = String::from_utf8(header)?;
+                    let length = header
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(str::to_owned)
+                        })
+                        .context("content length missing")?
+                        .trim()
+                        .parse::<usize>()?;
+                    let mut request = vec![0; length];
+                    socket.read_exact(&mut request)?;
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(current, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(40));
+                    let body = response(&["Rows"], vec![json!([1])]).to_string();
+                    write!(
+                        socket,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )?;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(())
+                }));
+            }
+            for worker in workers {
+                worker
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("query test server panicked"))??;
+            }
+            Ok(())
+        });
+        let directory = Directory::new()?;
+        let client = KustoClient::with_mode(&endpoint, &directory.0, Mode::Local, DATABASE)?;
+        let mut pending = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let client = client.clone();
+            pending.spawn(async move { client.execute("print Rows=1", false, "validation").await });
+        }
+        while let Some(result) = pending.join_next().await {
+            assert_eq!(result??[0]["Rows"], 1);
+        }
+        server
+            .join()
+            .map_err(|_| anyhow::anyhow!("query test server panicked"))??;
+        assert_eq!(observed.load(Ordering::SeqCst), QUERY_CONCURRENCY);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queued_queries_obey_caller_deadline_and_management_does_not_wait_for_query_memory() -> Result<()> {
+        let server = Server::start(|_| Ok(Some(response(&["Rows"], vec![json!([1])]))))?;
+        let directory = Directory::new()?;
+        let client = KustoClient::with_mode(&server.endpoint, &directory.0, Mode::Local, DATABASE)?;
+        let permits = client.query_permits.acquire_many(QUERY_CONCURRENCY as u32).await?;
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                client.execute("print Rows=1", false, "validation"),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(client.queries_completed.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            client.execute(".show databases", true, "bootstrap").await?[0]["Rows"],
+            1
+        );
+        drop(permits);
+        assert_eq!(client.execute("print Rows=1", false, "validation").await?[0]["Rows"], 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn low_memory_failure_is_not_retried_and_releases_query_admission() -> Result<()> {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&requests);
+        let server = Server::start(move |_| {
+            Ok(Some(if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                json!([{"FrameType":"DataSetCompletion","HasErrors":true,
+                    "OneApiErrors":[{"code":"E_LOW_MEMORY_CONDITION"}]}])
+            } else {
+                response(&["Rows"], vec![json!([1])])
+            }))
+        })?;
+        let directory = Directory::new()?;
+        let client = KustoClient::with_mode(&server.endpoint, &directory.0, Mode::Local, DATABASE)?;
+        assert!(client.execute("print Rows=1", false, "validation").await.is_err());
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "partial failure must not be retried"
+        );
+        assert_eq!(client.query_permits.available_permits(), QUERY_CONCURRENCY);
+        assert_eq!(client.execute("print Rows=1", false, "validation").await?[0]["Rows"], 1);
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
         Ok(())
     }
 
