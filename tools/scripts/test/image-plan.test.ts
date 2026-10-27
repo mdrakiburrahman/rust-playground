@@ -171,6 +171,16 @@ test('runtime Dockerfiles pin build and runtime bases and enforce production bou
   }
 });
 
+test('Explorer context override retains root exclusions before browser-only exclusions', () => {
+  const patterns = (file: string): string[] => readFileSync(join(workspace, file), 'utf8')
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith('#'));
+  const root = patterns('.dockerignore');
+  const explorer = patterns('projects/kusto-explorer/Dockerfile.dockerignore');
+  assert.deepEqual(explorer.slice(0, root.length), root);
+});
+
 interface PublishWorkflow {
   concurrency?: {
     'cancel-in-progress'?: boolean;
