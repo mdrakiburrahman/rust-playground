@@ -1,7 +1,8 @@
 //! Real `initialize_url_for_bootstrap` admission, schema initialization and
 //! drain/close over injected control metadata and a disposable local store.
-//! Requires the non-default `test-control` feature; no Azure.
-#![cfg(feature = "test-control")]
+//! Requires the non-default `test-control` feature and `debug_assertions`
+//! (absent from release builds); no Azure.
+#![cfg(all(feature = "test-control", debug_assertions))]
 
 use anyhow::{Context, Result};
 use arrow::datatypes::{DataType, Field, Schema};
