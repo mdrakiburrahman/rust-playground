@@ -71,12 +71,20 @@ buffer for direct collectors that must not lose acknowledged payloads:
 - A consumer reads finalized bundles back from disk, admits them through
   `BufferManager::admit_tracked`, and acknowledges a bundle only after its
   receipt is published (or Delta committed). Terminal receipt failures drop the
-  bundle; unknown outcomes defer it for a retry with backoff.
+  bundle; unknown outcomes retry with bounded exponential backoff. The consumer
+  retains both the bundle claim and its in-flight permit while waiting: Quiver's
+  `defer()` releases the claim for immediate redelivery and must not be used to
+  schedule a separate delayed retry.
 - After a crash, replayed bundles are reconciled against SQL: published
   receipts are acknowledged without republishing, failed ones are dropped, and
   active receipts of a predecessor (or of an older lease) are adopted onto the
   current owner and lease through `ReceiptStore::adopt_receipts` before they are
-  published. Receipts adopted while `flushing` reuse the original receipt
+  published. A transient SQL database/conflict error before Delta publication
+  returns an unresolved completion to the durable stage rather than permanently
+  poisoning its table. Replay re-reads SQL before deciding which transition is
+  still needed, including a committed transition whose response was lost.
+  Fencing/permanent errors and untracked in-memory deliveries still fail closed.
+  Receipts adopted while `flushing` reuse the original receipt
   transaction and ingestion timestamp, so a commit that landed just before a
   crash is skipped rather than duplicated. Legacy manifests without a stamp
   use the durable receipt's immutable creation time, never replay time.

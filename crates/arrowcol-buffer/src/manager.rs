@@ -13,8 +13,8 @@ use arrowcol_protocol::{
     fingerprint_schema,
 };
 use arrowcol_receipts::{
-    FailureDisposition, PublicationBatch, ReceiptFailure, ReceiptRecord, ReceiptStore, ReceiptVersion,
-    ValidatedDelivery,
+    FailureDisposition, PublicationBatch, ReceiptErrorKind, ReceiptFailure, ReceiptRecord, ReceiptStore,
+    ReceiptVersion, ValidatedDelivery,
 };
 use tokio::sync::{Notify, Semaphore, oneshot};
 use tokio::time::Instant;
@@ -340,6 +340,10 @@ impl BufferManager {
     /// `Flushing` skip the transitions that already happened, so recovered
     /// deliveries can be published by their (adopting) owner. The returned
     /// record is the receipt as admitted.
+    ///
+    /// The caller must retain its durable payload on `Unknown` and reconcile
+    /// the receipt before retrying. A transient SQL error before publication
+    /// returns that outcome without permanently poisoning the table.
     ///
     /// # Errors
     ///
@@ -779,12 +783,27 @@ impl BufferManager {
             {
                 Ok(flushing) => flushing,
                 Err(error) => {
-                    return incomplete_job(
-                        job,
-                        &format!("could not persist flushing transition: {error}"),
-                        None,
-                        Some("receipt store failed before publication".to_owned()),
-                    );
+                    if matches!(error.kind(), ReceiptErrorKind::Database | ReceiptErrorKind::Conflict)
+                        && job.entries.iter().all(|entry| entry.completion.is_some())
+                    {
+                        // Delta has not been called. The durable owner can
+                        // re-read SQL even if the transition committed but its
+                        // response was lost, then replay the same receipt ID.
+                        tracing::warn!(
+                            table = %job.context.table,
+                            %error,
+                            kind = ?error.kind(),
+                            "durable publication awaiting receipt reconciliation before retry"
+                        );
+                        return JobResult {
+                            observation: None,
+                            incomplete: None,
+                            poison: None,
+                            outcome: DeliveryOutcome::Unknown,
+                        };
+                    }
+                    let reason = format!("could not persist flushing transition: {error}");
+                    return incomplete_job(job, &reason, None, Some(reason.clone()));
                 }
             }
         };
@@ -967,6 +986,7 @@ impl BufferManager {
                 table.poisoned = Some(format!("adaptive estimator rejected durable observation: {error}"));
             }
             if let Some(reason) = result.poison.or_else(|| table.poisoned.clone()) {
+                tracing::error!(table = %table.identity, %reason, "table publication failed closed");
                 table.poisoned = Some(reason.clone());
                 if let Some(queue) = table.queue.take() {
                     drained_incomplete.push(incomplete_from_entries(

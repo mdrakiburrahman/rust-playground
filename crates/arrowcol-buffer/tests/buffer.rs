@@ -36,6 +36,9 @@ enum ReceiptFailurePoint {
     Flush = 2,
     Publish = 3,
     Fail = 4,
+    FlushConflict = 5,
+    FlushResponseLost = 6,
+    FlushFenced = 7,
 }
 
 #[derive(Default)]
@@ -66,7 +69,11 @@ impl FakeReceipts {
             .is_ok()
         {
             Err(ReceiptError::new(
-                ReceiptErrorKind::Database,
+                match point {
+                    ReceiptFailurePoint::FlushConflict => ReceiptErrorKind::Conflict,
+                    ReceiptFailurePoint::FlushFenced => ReceiptErrorKind::Fenced,
+                    _ => ReceiptErrorKind::Database,
+                },
                 "injected receipt-store failure",
             ))
         } else {
@@ -175,13 +182,18 @@ impl ReceiptStore for FakeReceipts {
         lease_deadline: UnixMillis,
     ) -> ReceiptResult<Vec<ReceiptRecord>> {
         self.take_failure(ReceiptFailurePoint::Flush)?;
-        self.transition(
-            receipts,
-            ReceiptState::Buffered,
-            ReceiptState::Publishing,
-            lease_deadline,
-        )
-        .await
+        self.take_failure(ReceiptFailurePoint::FlushConflict)?;
+        self.take_failure(ReceiptFailurePoint::FlushFenced)?;
+        let transitioned = self
+            .transition(
+                receipts,
+                ReceiptState::Buffered,
+                ReceiptState::Publishing,
+                lease_deadline,
+            )
+            .await?;
+        self.take_failure(ReceiptFailurePoint::FlushResponseLost)?;
+        Ok(transitioned)
     }
 
     async fn heartbeat_receipts(
@@ -1113,6 +1125,31 @@ async fn wait_for_reason(sink: &FakeSink, count: usize) {
 
 struct FixedLeases(TableLease);
 
+struct RecoveringLeases {
+    lease: TableLease,
+    ready: std::sync::atomic::AtomicBool,
+    attempts: Mutex<Vec<std::time::Instant>>,
+}
+
+#[async_trait]
+impl StageLeases for RecoveringLeases {
+    async fn current_lease(
+        &self,
+        _table_id: uuid::Uuid,
+        _table: &arrowcol_protocol::TableIdentity,
+    ) -> Result<TableLease, String> {
+        self.attempts
+            .lock()
+            .map_err(|error| error.to_string())?
+            .push(std::time::Instant::now());
+        if self.ready.load(Ordering::Acquire) {
+            Ok(self.lease.clone())
+        } else {
+            Err("routing ownership has not recovered yet".to_owned())
+        }
+    }
+}
+
 #[async_trait]
 impl StageLeases for FixedLeases {
     async fn current_lease(
@@ -1282,6 +1319,171 @@ async fn quiver_stage_replays_and_adopts_receipts_after_crash() -> anyhow::Resul
     drop(publications);
     successor.shutdown().await;
     manager.shutdown().await?;
+    Ok(())
+}
+
+/// Scenario: Crash replay must wait for the successor's routing lease.
+/// Guarantees: Backoff and max_in_flight still bound recovery, and equal source
+/// submissions retain their distinct receipts and publish once after recovery.
+#[tokio::test]
+async fn quiver_recovery_retains_claim_and_permit_during_backoff() -> anyhow::Result<()> {
+    let validation = validation("quiver_backoff").await?;
+    let predecessor = lease(validation.registered().identity())?;
+    let successor = lease(validation.registered().identity())?;
+    let receipts = Arc::new(FakeReceipts::default());
+    let directory = tempfile::tempdir()?;
+    let mut ids = Vec::new();
+    {
+        let manager = manager(quick_flush_config(), Arc::clone(&receipts), FakeSink::succeeding())?;
+        let crashed = open_stage(directory.path(), &manager, &receipts, &predecessor).await?;
+        for _ in 0..3 {
+            let (admission, _) = admission(&validation, &predecessor, &[7, 8], &receipts).await?;
+            persist(&crashed, &admission, &predecessor).await?;
+            ids.push(admission.receipt.receipt_id);
+        }
+    }
+    let leases = Arc::new(RecoveringLeases {
+        lease: successor.clone(),
+        ready: std::sync::atomic::AtomicBool::new(false),
+        attempts: Mutex::new(Vec::new()),
+    });
+    let sink = FakeSink::succeeding();
+    let manager = manager(quick_flush_config(), Arc::clone(&receipts), Arc::clone(&sink))?;
+    let mut config = quiver_config(directory.path());
+    config.max_in_flight = 1;
+    config.retry_initial = Duration::from_millis(200);
+    config.retry_max = config.retry_initial;
+    let stage = QuiverStage::open(
+        config,
+        Arc::clone(&manager),
+        Arc::<FakeReceipts>::clone(&receipts),
+        Arc::<RecoveringLeases>::clone(&leases),
+        successor.holder_instance_id(),
+        Duration::from_secs(30),
+    )
+    .await?;
+    stage.start();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let empty = leases
+                .attempts
+                .lock()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?
+                .is_empty();
+            if !empty {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await??;
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    assert!(
+        leases
+            .attempts
+            .lock()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?
+            .windows(2)
+            .all(|calls| calls[1].duration_since(calls[0]) >= Duration::from_millis(190)),
+        "normal consumption must not bypass the retry delay or in-flight permit"
+    );
+    assert_eq!(stage.snapshot().recovered_bundles, 1);
+    assert_eq!(stage.snapshot().backlog_bundles, 3);
+    leases.ready.store(true, Ordering::Release);
+    wait_for_published(&receipts, &ids).await?;
+    wait_for_empty_backlog(&stage).await?;
+    assert_eq!(stage.snapshot().recovered_bundles, 3);
+    assert_eq!(stage.snapshot().adopted_receipts, 3);
+    let publications = sink.publications.lock().await;
+    assert_eq!(publications.len(), 3);
+    assert!(
+        ids.iter()
+            .all(|id| publications.iter().filter(|(published, _)| published == id).count() == 1)
+    );
+    drop(publications);
+    stage.shutdown().await;
+    manager.shutdown().await?;
+    Ok(())
+}
+
+/// Scenario: SQL rejects a recovered receipt's pre-publication transition.
+/// Guarantees: Durable replay re-reads the receipt instead of poisoning its
+/// table, and every independently submitted equal payload still publishes.
+#[tokio::test]
+async fn quiver_recovery_reconciles_prepublication_sql_errors() -> anyhow::Result<()> {
+    for failure in [
+        ReceiptFailurePoint::Flush,
+        ReceiptFailurePoint::FlushConflict,
+        ReceiptFailurePoint::FlushResponseLost,
+    ] {
+        let validation = validation("quiver_sql_retry").await?;
+        let predecessor = lease(validation.registered().identity())?;
+        let successor = lease(validation.registered().identity())?;
+        let receipts = Arc::new(FakeReceipts::default());
+        let directory = tempfile::tempdir()?;
+        let mut ids = Vec::new();
+        {
+            let manager = manager(quick_flush_config(), Arc::clone(&receipts), FakeSink::succeeding())?;
+            let crashed = open_stage(directory.path(), &manager, &receipts, &predecessor).await?;
+            for _ in 0..3 {
+                let (admission, _) = admission(&validation, &predecessor, &[7, 8], &receipts).await?;
+                persist(&crashed, &admission, &predecessor).await?;
+                receipts
+                    .mark_buffered(
+                        predecessor.holder_instance_id(),
+                        &[admission.receipt],
+                        predecessor.expires_at_unix_ms(),
+                    )
+                    .await?;
+                ids.push(admission.receipt.receipt_id);
+            }
+        }
+        receipts.fail_next(failure);
+        let sink = FakeSink::succeeding();
+        let manager = manager(quick_flush_config(), Arc::clone(&receipts), Arc::clone(&sink))?;
+        let stage = open_stage(directory.path(), &manager, &receipts, &successor).await?;
+        stage.start();
+        wait_for_published(&receipts, &ids).await?;
+        wait_for_empty_backlog(&stage).await?;
+        assert!(manager.pressure()?.tables.iter().all(|table| !table.poisoned));
+        let publications = sink.publications.lock().await;
+        assert_eq!(publications.len(), 3);
+        assert!(
+            ids.iter()
+                .all(|id| publications.iter().filter(|(published, _)| published == id).count() == 1)
+        );
+        drop(publications);
+        stage.shutdown().await;
+        assert!(manager.shutdown().await?.incomplete.is_empty());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn quiver_prepublication_fencing_still_poisons_and_preserves_durable_work() -> anyhow::Result<()> {
+    let validation = validation("quiver_fenced").await?;
+    let lease = lease(validation.registered().identity())?;
+    let receipts = Arc::new(FakeReceipts::default());
+    let sink = FakeSink::succeeding();
+    let manager = manager(quick_flush_config(), Arc::clone(&receipts), Arc::clone(&sink))?;
+    let directory = tempfile::tempdir()?;
+    let stage = open_stage(directory.path(), &manager, &receipts, &lease).await?;
+    let (admission, _) = admission(&validation, &lease, &[7], &receipts).await?;
+    persist(&stage, &admission, &lease).await?;
+    receipts.fail_next(ReceiptFailurePoint::FlushFenced);
+    stage.start();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !manager.pressure()?.tables.iter().any(|table| table.poisoned) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await??;
+    stage.shutdown().await;
+    assert_eq!(stage.snapshot().backlog_bundles, 1);
+    assert!(sink.publications.lock().await.is_empty());
+    assert_eq!(manager.shutdown().await?.incomplete.len(), 1);
     Ok(())
 }
 

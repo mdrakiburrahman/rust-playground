@@ -92,6 +92,7 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
     });
 
     let receipt_failures = Arc::new(AtomicU64::new(0));
+    let receipt_stop = CancellationToken::new();
     let (receipt_sender, receipt_task) = ReceiptTracker::start(
         transport.clone(),
         manifests.clone(),
@@ -99,6 +100,7 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
         arguments.drain_timeout.get(),
         arguments.lanes.saturating_mul(16).max(32),
         Arc::clone(&receipt_failures),
+        receipt_stop.clone(),
     );
     let kusto_sync = crate::kusto::LiveSync::start(&arguments, &run_id);
 
@@ -160,6 +162,35 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
         sync.finish_generation();
     }
     drop(receipt_sender);
+    if let Some(error) = run_error {
+        eprintln!("FAIL collector generation: {error:#}");
+        if let Err(evidence_error) = manifests
+            .write_json(
+                "run-error.json",
+                &serde_json::json!({"run_id": run_id, "error": format!("{error:#}")}),
+            )
+            .await
+        {
+            eprintln!("could not retain generation failure evidence: {evidence_error:#}");
+        }
+        receipt_stop.cancel();
+        if let Err(cleanup_error) = receipt_task
+            .await
+            .context("receipt tracker task failed")
+            .and_then(|report| report)
+        {
+            eprintln!("receipt tracker cleanup failed: {cleanup_error:#}");
+        }
+        if let Some(sync) = kusto_sync
+            && let Err(cleanup_error) = sync.abort().await
+        {
+            eprintln!("Kusto cleanup failed after generation error: {cleanup_error:#}");
+        }
+        if let Err(flush_error) = manifests.flush().await {
+            eprintln!("failure evidence flush failed: {flush_error:#}");
+        }
+        return Err(error);
+    }
     let receipt_report = receipt_task
         .await
         .context("receipt tracker task failed")
@@ -176,9 +207,6 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
     manifests.write_json(ROUTING_EVIDENCE_FILE, &routing).await?;
     manifests.flush().await?;
 
-    if let Some(error) = run_error {
-        return Err(error);
-    }
     if receipt_report.failures > 0 || receipt_report.timeouts > 0 {
         bail!(
             "direct receipt drain completed with {} explicit failures and {} timeouts; see {RECEIPT_MANIFEST_FILE}",
@@ -425,6 +453,8 @@ async fn run_phase(
             break;
         }
     }
+    lanes.abort_all();
+    while lanes.join_next().await.is_some() {}
     stop_progress.cancel();
     let progress_outcome = progress
         .await
@@ -612,6 +642,7 @@ impl ReceiptTracker {
         drain_timeout: Duration,
         capacity: usize,
         failures: Arc<AtomicU64>,
+        stop: CancellationToken,
     ) -> (
         mpsc::Sender<PendingReceipt>,
         tokio::task::JoinHandle<Result<ReceiptReport>>,
@@ -625,6 +656,12 @@ impl ReceiptTracker {
             let mut deadline = None;
             let mut report = ReceiptReport::default();
             loop {
+                if stop.is_cancelled() {
+                    let aborted = Self::abort_pending(&manifests, &run_id, pending, &mut receiver).await?;
+                    report.failures += aborted;
+                    failures.fetch_add(u64::try_from(aborted)?, Ordering::Relaxed);
+                    break;
+                }
                 if channel_closed && pending.is_empty() {
                     break;
                 }
@@ -652,6 +689,7 @@ impl ReceiptTracker {
                     break;
                 }
                 tokio::select! {
+                    () = stop.cancelled() => {}
                     received = receiver.recv(), if !channel_closed => {
                         match received {
                             Some(receipt) => {
@@ -671,7 +709,11 @@ impl ReceiptTracker {
                         }
                         let ids = pending.keys().copied().collect::<Vec<_>>();
                         for chunk in ids.chunks(256) {
-                            let responses = match transport.poll_receipts(chunk).await {
+                            let response = tokio::select! {
+                                () = stop.cancelled() => break,
+                                response = transport.poll_receipts(chunk) => response,
+                            };
+                            let responses = match response {
                                 Ok(responses) => responses,
                                 Err(_) => continue,
                             };
@@ -723,6 +765,42 @@ impl ReceiptTracker {
             Ok(report)
         });
         (sender, task)
+    }
+
+    async fn abort_pending(
+        manifests: &ManifestWriter,
+        run_id: &str,
+        mut pending: BTreeMap<ReceiptId, PendingReceipt>,
+        receiver: &mut mpsc::Receiver<PendingReceipt>,
+    ) -> Result<usize> {
+        receiver.close();
+        while let Some(receipt) = receiver.recv().await {
+            if pending.insert(receipt.receipt_id, receipt).is_some() {
+                bail!("duplicate server receipt identifier entered the poller");
+            }
+        }
+        let count = pending.len();
+        for receipt in pending.into_values() {
+            manifests
+                .write_receipt(&ReceiptManifestEntry {
+                    run_id: run_id.to_owned(),
+                    logical_batch_id: receipt.logical_batch_id,
+                    table: receipt.table,
+                    receipt_id: receipt.receipt_id,
+                    state: "aborted".to_owned(),
+                    purge_allowed: false,
+                    terminal_at_unix_ms: now_unix_millis(),
+                    delta_version: None,
+                    rows_published: None,
+                    bytes_published: None,
+                    error_code: Some("generation_failed".to_owned()),
+                    error_message: Some(
+                        "polling stopped after generation failed; publication outcome remains unresolved".to_owned(),
+                    ),
+                })
+                .await?;
+        }
+        Ok(count)
     }
 }
 
@@ -811,6 +889,48 @@ struct RoutingLeaseEvidence {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_generation_aborts_pending_and_queued_receipts_without_a_drain_wait() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let manifests = ManifestWriter::create(directory.path()).await?;
+        let (sender, mut receiver) = mpsc::channel(4);
+        let mut pending = BTreeMap::new();
+        let first = PendingReceipt {
+            logical_batch_id: "first".to_owned(),
+            table: "telemetry.sqlserver.cpu".to_owned(),
+            receipt_id: ReceiptId::new(),
+        };
+        pending.insert(first.receipt_id, first);
+        sender
+            .send(PendingReceipt {
+                logical_batch_id: "queued".to_owned(),
+                table: "telemetry.sqlserver.cpu".to_owned(),
+                receipt_id: ReceiptId::new(),
+            })
+            .await?;
+        // The channel is deliberately still open. Cancellation must not wait
+        // for its normal close-plus-480-second drain deadline.
+        let count = tokio::time::timeout(
+            Duration::from_secs(1),
+            ReceiptTracker::abort_pending(&manifests, "failed-run", pending, &mut receiver),
+        )
+        .await??;
+        assert_eq!(count, 2);
+        assert!(sender.is_closed());
+        manifests.flush().await?;
+        let evidence = tokio::fs::read_to_string(directory.path().join(RECEIPT_MANIFEST_FILE)).await?;
+        let rows = evidence
+            .lines()
+            .map(serde_json::from_str::<ReceiptManifestEntry>)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.state == "aborted"
+            && !row.purge_allowed
+            && row.delta_version.is_none()
+            && row.error_code.as_deref() == Some("generation_failed")));
+        Ok(())
+    }
 
     #[test]
     fn retry_policy_honors_attempts_without_a_window() {

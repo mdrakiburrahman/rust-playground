@@ -820,6 +820,17 @@ impl LiveSync {
         self.stop.cancel();
         self.task.await.context("Kusto synchronization task failed")?
     }
+
+    /// Stops owned work without a final catch-up after generation failed.
+    pub(crate) async fn abort(self) -> Result<()> {
+        self.finish_generation();
+        self.stop.cancel();
+        self.task.abort();
+        match self.task.await {
+            Err(error) if error.is_cancelled() => Ok(()),
+            result => result.context("Kusto synchronization task failed")?,
+        }
+    }
 }
 
 /// One table's native `query_acceleration statistics` row; missing measurements stay `null`.

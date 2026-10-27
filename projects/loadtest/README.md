@@ -376,6 +376,13 @@ flush runs. It then restarts them on the same disk.
   new table leases.
 
 The load generator keeps retrying through the outage for up to five minutes.
+If generation fails, it reports and retains the original error in `run-error.json`
+immediately instead of starting another receipt-drain timeout. Outstanding receipt
+observations are recorded as `aborted` with `generation_failed` and
+`purge_allowed:false`; these are unresolved outcomes, not successful delivery or
+server-side terminal states. Owned polling and live Kusto synchronization stop,
+without final catch-up, and the command fails. Successful generation still uses
+the full receipt-drain and correctness gates.
 `results/quiver-recovery.json` records the outage, the backlog on disk at the
 moment of the kill, and the replay counts. The run fails unless both collectors
 replay batches from disk.

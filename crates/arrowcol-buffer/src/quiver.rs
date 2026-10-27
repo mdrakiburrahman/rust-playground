@@ -25,7 +25,7 @@ use arrowcol_receipts::{
 use async_trait::async_trait;
 use otel_arrow_dfe_quiver::config::RetentionPolicy;
 use otel_arrow_dfe_quiver::record_bundle::{BundleDescriptor, PayloadRef, RecordBundle, SlotDescriptor, SlotId};
-use otel_arrow_dfe_quiver::subscriber::{BundleHandle, BundleRef, RegistryCallback, SubscriberId};
+use otel_arrow_dfe_quiver::subscriber::{BundleHandle, RegistryCallback, SubscriberId};
 use otel_arrow_dfe_quiver::{
     CancellationToken, DiskBudget, QuiverConfig, QuiverEngine, QuiverEngineBuilder, SegmentStore,
 };
@@ -635,65 +635,35 @@ impl QuiverStage {
 
     /// Delivers one persisted bundle and resolves it in Quiver; bundles whose
     /// outcome is unknown are deferred and retried with backoff.
-    async fn process(self: Arc<Self>, handle: QuiverHandle, attempt: u32) {
-        let resolution = {
-            let _processing = StorageOperation::start(&self.processing);
-            self.deliver(&handle, attempt).await
-        };
-        if let Some(bundle_ref) = self.resolve_handle(handle, resolution, attempt) {
-            let stage = Arc::clone(&self);
-            tokio::spawn(stage.retry(bundle_ref, attempt.saturating_add(1)));
-        }
-    }
-
-    /// Re-claims a deferred bundle after a backoff until it is resolved or the
-    /// stage stops.
-    async fn retry(self: Arc<Self>, mut bundle_ref: BundleRef, mut attempt: u32) {
+    async fn process(self: Arc<Self>, handle: QuiverHandle, mut attempt: u32) {
         loop {
-            let delay = self.retry_delay(attempt.saturating_sub(1));
-            tokio::select! {
-                () = self.cancel.cancelled() => return,
-                () = tokio::time::sleep(delay) => {}
-            }
-            let handle = match self.engine.claim_bundle(&self.subscriber, bundle_ref) {
-                Ok(handle) => handle,
-                Err(error) => {
-                    debug!(%error, "deferred bundle is no longer claimable");
-                    return;
-                }
-            };
             let resolution = {
                 let _processing = StorageOperation::start(&self.processing);
                 self.deliver(&handle, attempt).await
             };
-            match self.resolve_handle(handle, resolution, attempt) {
-                Some(next) => {
-                    bundle_ref = next;
+            match resolution {
+                Resolution::Ack => {
+                    self.counters.published_bundles.fetch_add(1, Ordering::Relaxed);
+                    handle.ack();
+                    return;
+                }
+                Resolution::Reject => {
+                    self.counters.rejected_bundles.fetch_add(1, Ordering::Relaxed);
+                    handle.reject();
+                    return;
+                }
+                Resolution::Retry(reason) => {
+                    self.counters.deferred_bundles.fetch_add(1, Ordering::Relaxed);
+                    debug!(%reason, attempt, "retrying persisted bundle after backoff");
+                    // defer() immediately exposes the bundle to next_bundle(),
+                    // bypassing backoff and the in-flight bound. Retain its
+                    // claim and permit until resolution or cancellation.
+                    tokio::select! {
+                        () = self.cancel.cancelled() => return,
+                        () = tokio::time::sleep(self.retry_delay(attempt)) => {}
+                    }
                     attempt = attempt.saturating_add(1);
                 }
-                None => return,
-            }
-        }
-    }
-
-    /// Applies a resolution to the bundle. Returns the bundle reference when
-    /// the bundle was deferred for another attempt.
-    fn resolve_handle(&self, handle: QuiverHandle, resolution: Resolution, attempt: u32) -> Option<BundleRef> {
-        match resolution {
-            Resolution::Ack => {
-                self.counters.published_bundles.fetch_add(1, Ordering::Relaxed);
-                handle.ack();
-                None
-            }
-            Resolution::Reject => {
-                self.counters.rejected_bundles.fetch_add(1, Ordering::Relaxed);
-                handle.reject();
-                None
-            }
-            Resolution::Retry(reason) => {
-                self.counters.deferred_bundles.fetch_add(1, Ordering::Relaxed);
-                debug!(%reason, attempt, "deferring persisted bundle");
-                Some(handle.defer())
             }
         }
     }
