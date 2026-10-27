@@ -17,6 +17,10 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, OnceLock};
 
+/// Installs the shared in-memory provider as the global meter provider. Every test
+/// calls this first: the crate binds its publication instruments to whichever global
+/// provider exists at first use, so a publication before installation would bind them
+/// to the no-op provider for the whole test binary.
 fn metrics() -> &'static (SdkMeterProvider, InMemoryMetricExporter) {
     static METRICS: OnceLock<(SdkMeterProvider, InMemoryMetricExporter)> = OnceLock::new();
     METRICS.get_or_init(|| {
@@ -168,6 +172,7 @@ fn replay_reports_observed_snapshot_version_not_original_commit() -> Result<()> 
 /// reclaimed, and the published original is untouched.
 #[test]
 fn mixed_pending_and_deduplicated_files_reclaim_only_the_duplicate() -> Result<()> {
+    metrics();
     let root = tempfile::tempdir()?;
     let table = DeltaTable::open(root.path())?;
     seed(&table)?;
@@ -193,6 +198,7 @@ fn mixed_pending_and_deduplicated_files_reclaim_only_the_duplicate() -> Result<(
 /// publishing an Add for a deleted file.
 #[test]
 fn reclaimed_stage_cannot_be_committed_later() -> Result<()> {
+    metrics();
     let root = tempfile::tempdir()?;
     let table = DeltaTable::open(root.path())?;
     seed(&table)?;
@@ -268,6 +274,7 @@ impl PublicationFence for PauseFence {
 /// attempt then publishes it with the file present on disk.
 #[test]
 fn concurrent_submission_wins_over_reclaim_of_shared_stage() -> Result<()> {
+    metrics();
     let root = tempfile::tempdir()?;
     let url =
         url::Url::from_directory_path(fs::canonicalize(root.path())?).map_err(|()| anyhow::anyhow!("table URL"))?;
@@ -328,6 +335,7 @@ impl PublicationFence for ExternalTxnFence {
 /// already offered to an attempt, is conservatively retained rather than deleted.
 #[test]
 fn collision_retry_retains_submitted_stage() -> Result<()> {
+    metrics();
     let root = tempfile::tempdir()?;
     let fence = Arc::new(ExternalTxnFence {
         armed: AtomicBool::new(false),
@@ -350,6 +358,7 @@ fn collision_retry_retains_submitted_stage() -> Result<()> {
 /// and state and then commits normally to its own table.
 #[test]
 fn deduplicated_call_never_reclaims_foreign_nested_stage() -> Result<()> {
+    metrics();
     let root = tempfile::tempdir()?;
     let outer = DeltaTable::open(root.path())?;
     seed(&outer)?;
@@ -374,6 +383,7 @@ fn deduplicated_call_never_reclaims_foreign_nested_stage() -> Result<()> {
 #[cfg(unix)]
 #[test]
 fn reclaim_failure_is_visible_and_never_fails_publication() -> Result<()> {
+    metrics();
     use std::os::unix::fs::PermissionsExt;
     metrics();
     let root = tempfile::tempdir()?;
