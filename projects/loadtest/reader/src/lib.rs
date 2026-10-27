@@ -202,6 +202,49 @@ pub fn sample_row(directory: &Path, identity: &str, summary: &TableSummary) -> R
     Ok(row_value(&row))
 }
 
+/// Reads the complete bounded row multiset from the captured active files.
+///
+/// # Errors
+///
+/// Rejects unsafe paths, changed row counts/hashes, and more than 256 distinct
+/// rows. This is a validation oracle for the synthetic corpus, not a bulk API.
+pub fn sample_rows(directory: &Path, identity: &str, summary: &TableSummary) -> Result<Vec<(Value, u64)>> {
+    if identity
+        .split('.')
+        .any(|part| part.is_empty() || part.contains(['/', '\\']))
+    {
+        bail!("invalid table identity");
+    }
+    let directory = fs::canonicalize(directory)?;
+    let root = fs::canonicalize(directory.join(identity.replace('.', "/")))?;
+    if !root.starts_with(&directory) {
+        bail!("table escapes Delta root");
+    }
+    let mut distinct = BTreeMap::<String, (Value, u64)>::new();
+    let mut hashes = BTreeMap::<String, u64>::new();
+    let mut rows = 0_u64;
+    for file in &summary.files {
+        let path = local_active_file(&root, root.join(&file.path).to_str().context("non-UTF8 data path")?)?;
+        let reader = SerializedFileReader::new(File::open(path)?)?;
+        for row in reader.get_row_iter(None)? {
+            let value = row_value(&row?);
+            let encoded = serde_json::to_string(&value)?;
+            let digest = format!("sha256:{}", hex::encode(Sha256::digest(encoded.as_bytes())));
+            *hashes.entry(digest).or_default() += 1;
+            let entry = distinct.entry(encoded).or_insert((value, 0));
+            entry.1 = entry.1.checked_add(1).context("row multiplicity overflow")?;
+            rows = rows.checked_add(1).context("row count overflow")?;
+            if distinct.len() > 256 {
+                bail!("validation corpus exceeds 256 distinct rows");
+            }
+        }
+    }
+    if rows != summary.rows || hashes != summary.row_hashes {
+        bail!("captured validation corpus changed");
+    }
+    Ok(distinct.into_values().collect())
+}
+
 /// Lists only committed, local active files. An empty root is pending, not a
 /// completed validation; corrupt tables and unsafe paths remain errors.
 ///
@@ -522,6 +565,13 @@ mod tests {
                 .any(|file| file == "orphan.parquet")
         );
         assert_eq!(selected, inventory(directory.path()).await?);
+        let corpus = sample_rows(directory.path(), "generic", &summary.tables["generic"])?;
+        assert_eq!(corpus.len(), 3);
+        assert_eq!(corpus.iter().map(|(_, count)| count).sum::<u64>(), 3);
+        let mut stale = summary.tables["generic"].clone();
+        stale.rows += 1;
+        assert!(sample_rows(directory.path(), "generic", &stale).is_err());
+        assert!(sample_rows(directory.path(), "../generic", &stale).is_err());
         Ok(())
     }
 
@@ -543,12 +593,35 @@ mod tests {
         writer.close().await?;
         let second = inventory(directory.path()).await?;
         let table = "telemetry.sqlserver.example";
+        let summary = summarize(directory.path()).await?;
+        assert_eq!(
+            sample_rows(directory.path(), table, &summary.tables[table])?,
+            vec![(json!({"id": 1}), 2)]
+        );
         assert_eq!(first.tables[table].files.len(), 1);
         assert_eq!(second.tables[table].files.len(), 2);
         assert!(second.tables[table].version > first.tables[table].version);
         assert!(second.tables[table].files.contains(&first.tables[table].files[0]));
         fs::write(root.join("_delta_log/00000000000000000003.json"), b"invalid")?;
         assert!(inventory(directory.path()).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn validation_corpus_is_bounded_without_truncating_successfully() -> Result<()> {
+        use arrow::array::{Int32Array, RecordBatch};
+        use arrow_deltalake::delta::DeltaTableWriter;
+        use std::sync::Arc;
+        let directory = TestDirectory::new("bounded-corpus")?;
+        let mut writer = DeltaTableWriter::open(directory.path().join("example"))?;
+        let batch = RecordBatch::try_from_iter(vec![("id", Arc::new(Int32Array::from_iter_values(0..257)) as _)])?;
+        writer.write(&batch).await?;
+        writer.close().await?;
+        let snapshot = summarize(directory.path()).await?;
+        let error = sample_rows(directory.path(), "example", &snapshot.tables["example"])
+            .err()
+            .context("expected corpus bound error")?;
+        assert!(error.to_string().contains("exceeds 256"));
         Ok(())
     }
 

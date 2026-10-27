@@ -258,6 +258,10 @@ pub struct RunArgs {
     /// Optional local Kusto emulator HTTP endpoint for live committed-file ingestion.
     #[arg(long, env = "LOADTEST_KUSTO_ENDPOINT")]
     pub kusto_endpoint: Option<String>,
+
+    /// Local active-snapshot bridge; never used as evidence of Azure QAP.
+    #[arg(long, env = "LOADTEST_KUSTO_BRIDGE_ENDPOINT")]
+    pub kusto_bridge_endpoint: Option<String>,
 }
 
 impl RunArgs {
@@ -426,6 +430,7 @@ mod tests {
             direct_admin_endpoints: Vec::new(),
             dataflow_admin_endpoints: Vec::new(),
             kusto_endpoint: None,
+            kusto_bridge_endpoint: None,
         };
         assert_eq!(arguments.effective_scenarios(), vec![Scenario::Paired]);
     }

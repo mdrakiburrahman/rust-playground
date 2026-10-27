@@ -1,5 +1,13 @@
 # loadtest
 
+Every synthetic table has a required `customer_id VARCHAR` first column. The
+deterministic input interleaves 16 customers (`customer-0000` through
+`customer-0015`) rather than pre-sorting the input. Direct and Dataflow receive
+the same immutable encoded batches, including retries. The independent reader
+can return a bounded complete row multiset with multiplicities for Kusto
+validation; it rejects a changed snapshot or more than 256 distinct rows rather
+than silently sampling away differences.
+
 ![Architecture](.imgs/loadtest-architecture.png)
 
 ```bash
