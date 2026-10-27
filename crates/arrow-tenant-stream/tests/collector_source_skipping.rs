@@ -397,7 +397,253 @@ fn capture_relocated_collector_source_manifests() -> Result<()> {
             page_rows: 128,
         });
     }
+
     let file = std::fs::OpenOptions::new().write(true).create_new(true).open(output)?;
     serde_json::to_writer_pretty(file, &fixtures)?;
+    Ok(())
+}
+
+async fn full_logical_scan(source: &DeltaSource, frozen: &BootstrapManifest) -> Result<Vec<RecordBatch>> {
+    use datafusion::common::ScalarValue;
+    use datafusion::prelude::lit;
+    let context = SessionContext::new_with_config(
+        SessionConfig::new()
+            .with_target_partitions(1)
+            .set_bool("datafusion.execution.parquet.schema_force_view_types", false),
+    );
+    let schema = frozen.schema()?;
+    let mut output = Vec::new();
+    for file in &frozen.files {
+        let mut frame = context
+            .read_parquet(source.file_url(&file.path)?.as_str(), ParquetReadOptions::default())
+            .await?;
+        for name in frozen.partition_columns()? {
+            let value = file.partition_values.get(&name).context("partition value")?;
+            let data_type = schema.field_with_name(&name)?.data_type();
+            let scalar = match value {
+                Some(value) => ScalarValue::try_from_string(value.clone(), data_type)?,
+                None => ScalarValue::try_from(data_type)?,
+            };
+            frame = frame.with_column(&name, lit(scalar))?;
+        }
+        let names = schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>();
+        for batch in frame.select_columns(&names)?.collect().await? {
+            output.push(RecordBatch::try_new(Arc::clone(&schema), batch.columns().to_vec())?);
+        }
+    }
+    Ok(output)
+}
+
+fn run_service(source: &std::path::Path, target: &std::path::Path, checkpoint: &std::path::Path) -> Result<String> {
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+    struct Process(Child);
+    impl Drop for Process {
+        fn drop(&mut self) {
+            if matches!(self.0.try_wait(), Ok(None))
+                && let Err(error) = self.0.kill()
+            {
+                eprintln!("service proof cleanup kill failed: {error}");
+            }
+            if let Err(error) = self.0.wait() {
+                eprintln!("service proof cleanup wait failed: {error}");
+            }
+        }
+    }
+    let stdout = tempfile::NamedTempFile::new()?;
+    let stderr = tempfile::NamedTempFile::new()?;
+    let mut child = Process(
+        Command::new(env!("CARGO_BIN_EXE_arrow-tenant-stream"))
+            .arg("--source")
+            .arg(source)
+            .arg("--target")
+            .arg(target)
+            .arg("--checkpoint")
+            .arg(checkpoint)
+            .args([
+                "--customer-id",
+                "customer-0003",
+                "--once",
+                "--max-actions",
+                "128",
+                "--row-group-rows",
+                "512",
+                "--metrics-listen",
+                "127.0.0.1:0",
+            ])
+            .stdout(Stdio::from(stdout.as_file().try_clone()?))
+            .stderr(Stdio::from(stderr.as_file().try_clone()?))
+            .spawn()?,
+    );
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        if let Some(status) = child.0.try_wait()? {
+            ensure!(
+                status.success(),
+                "actual service failed: {}",
+                std::fs::read_to_string(stderr.path())?
+            );
+            return Ok(std::fs::read_to_string(stdout.path())?);
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "actual service exceeded predeclared 120-second deadline"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the same immutable real collector CPU fixtures as the source-scan proof"]
+async fn actual_service_forks_frozen_collector_sources_and_restarts_idle_in_both_pools() -> Result<()> {
+    use arrow_tenant_stream::checkpoint::Checkpoint;
+    let manifest = std::env::var_os("ARROWCOL_SOURCE_READ_FIXTURE").context("fixture manifest required")?;
+    let fixtures: Vec<Fixture> = serde_json::from_slice(&std::fs::read(manifest)?)?;
+    let mut pools = fixtures.iter().map(|fixture| fixture.pool.as_str()).collect::<Vec<_>>();
+    pools.sort_unstable();
+    ensure!(pools == ["dfe", "direct"], "both pools required");
+    for fixture in fixtures {
+        let root = std::fs::canonicalize(fixture.root)?;
+        let url = url::Url::from_directory_path(&root).map_err(|()| anyhow::anyhow!("source URL"))?;
+        let source = DeltaSource::open(url)?;
+        ensure!(
+            source.capture()? == fixture.frozen,
+            "frozen source changed before service"
+        );
+        let all_source = full_logical_scan(&source, &fixture.frozen).await?;
+        let mut expected = Vec::new();
+        for batch in all_source {
+            let keys = batch
+                .column_by_name("customer_id")
+                .context("source customer")?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .context("source key type")?;
+            let mask = arrow::array::BooleanArray::from_iter(
+                (0..keys.len()).map(|row| Some(!keys.is_null(row) && keys.value(row) == "customer-0003")),
+            );
+            expected.push(filter_record_batch(&batch, &mask)?);
+        }
+        ensure!(
+            expected.iter().map(RecordBatch::num_rows).sum::<usize>() == 8_128,
+            "expected complete source customer rows"
+        );
+        let temporary = tempfile::tempdir()?;
+        let target = temporary.path().join("target");
+        let checkpoint = temporary.path().join("checkpoint");
+        let first = run_service(&root, &target, &checkpoint)?;
+        ensure!(
+            first.contains("batch=0") && !first.contains("sink_replay=true"),
+            "actual snapshot batch must commit"
+        );
+        let target_url = url::Url::from_directory_path(&target).map_err(|()| anyhow::anyhow!("target URL"))?;
+        let sink = DeltaSource::open(target_url.clone())?;
+        let snapshot = sink.capture()?;
+        ensure!(
+            snapshot.schema()? == fixture.frozen.schema()?,
+            "logical schema must be preserved"
+        );
+        ensure!(
+            snapshot.partition_columns()? == fixture.frozen.partition_columns()?,
+            "partition schema must be preserved"
+        );
+        let actual = full_logical_scan(&sink, &snapshot).await?;
+        ensure!(
+            multiset(&actual)? == multiset(&expected)?,
+            "entire target must equal independent full-source predicate"
+        );
+        ensure!(
+            actual.iter().map(RecordBatch::num_rows).sum::<usize>() == 8_128,
+            "no extra customer rows"
+        );
+        for batch in &actual {
+            let keys = batch
+                .column_by_name("customer_id")
+                .context("target customer")?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .context("target customer type")?;
+            ensure!(
+                keys.null_count() == 0 && keys.iter().all(|key| key == Some("customer-0003")),
+                "cross-customer target data"
+            );
+        }
+        let metadata = std::fs::read(checkpoint.join("metadata"))?;
+        let identity: serde_json::Value = serde_json::from_slice(&metadata)?;
+        let query_id = identity["id"].as_str().context("query UUID")?;
+        uuid::Uuid::parse_str(query_id)?;
+        ensure!(
+            metadata == serde_json::to_vec(&json!({"id":query_id}))?,
+            "Spark query metadata exact bytes"
+        );
+        let mut handle = Checkpoint::open_local(&checkpoint).await?;
+        let recovery = handle.recover().await?;
+        ensure!(
+            recovery.batch_id > 0 && recovery.pending_offset.is_none() && recovery.previous_offset.is_some(),
+            "checkpoint must recover only committed progress"
+        );
+        let committed = recovery.batch_id - 1;
+        handle.close().await?;
+        for batch in 0..=committed {
+            ensure!(
+                std::fs::read(checkpoint.join(format!("commits/{batch}")))? == b"v1\n{\"nextBatchWatermarkMs\":0}",
+                "exact Spark stateless commit bytes"
+            );
+            let offset = std::fs::read_to_string(checkpoint.join(format!("offsets/{batch}")))?;
+            let lines = offset.split('\n').collect::<Vec<_>>();
+            ensure!(lines.len() == 3 && lines[0] == "v1", "Spark offset envelope");
+            let metadata: serde_json::Value = serde_json::from_str(lines[1])?;
+            ensure!(
+                metadata["batchWatermarkMs"] == 0
+                    && metadata["conf"] == json!({})
+                    && metadata["batchTimestampMs"].is_i64(),
+                "Spark stateless offset metadata"
+            );
+            let _: serde_json::Value = serde_json::from_str(lines[2])?;
+        }
+        let table = arrow_deltalake::delta::DeltaTable::open_for_maintenance(&target_url)?;
+        ensure!(
+            table.lookup_txn(query_id)? == Some(committed),
+            "sink stable query/batch transaction"
+        );
+        let restarted = run_service(&root, &target, &checkpoint)?;
+        ensure!(!restarted.contains("batch="), "unchanged source restart must be idle");
+        ensure!(
+            sink.capture()? == snapshot,
+            "idle restart must not add target files or versions"
+        );
+        ensure!(
+            std::fs::read(checkpoint.join("metadata"))? == metadata,
+            "query identity must survive restart"
+        );
+        let mut handle = Checkpoint::open_local(&checkpoint).await?;
+        ensure!(
+            handle.recover().await? == recovery,
+            "idle restart must not advance checkpoint"
+        );
+        handle.close().await?;
+        ensure!(
+            multiset(&full_logical_scan(&sink, &snapshot).await?)? == multiset(&expected)?,
+            "idle restart must not duplicate target rows"
+        );
+        ensure!(
+            source.capture()? == fixture.frozen,
+            "frozen source changed during service proof"
+        );
+        println!(
+            "COLLECTOR_SOURCE_SERVICE {}",
+            serde_json::to_string(&json!({
+                "pool":fixture.pool,"sourceFiles":fixture.frozen.files.len(),"targetRows":8128,
+                "targetVersion":snapshot.version,"targetFiles":snapshot.files.len(),
+                "fullRowMultisetEqual":true,"partitionSchemaPreserved":true,
+                "sparkCheckpointRecovery":true,"restartIdle":true,"ownedProcessesReaped":true,
+                "childDeadlineSeconds":120,"liveAppendTailProven":false,
+            }))?
+        );
+    }
     Ok(())
 }
