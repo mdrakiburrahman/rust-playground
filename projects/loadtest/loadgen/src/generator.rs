@@ -392,6 +392,14 @@ mod tests {
             });
             let batch = build_logical_batch(table, 8_192, 7).await?;
 
+            for offset in (CUSTOMER_COUNT..batch.rows).step_by(CUSTOMER_COUNT) {
+                assert_eq!(
+                    batch.record_batch.slice(offset, CUSTOMER_COUNT),
+                    batch.record_batch.slice(0, CUSTOMER_COUNT),
+                    "{} complete payload rows must repeat every 16 customers, not introduce 8192 distinct rows",
+                    statement.identity
+                );
+            }
             assert_eq!(
                 batch.encoded.len(),
                 2,

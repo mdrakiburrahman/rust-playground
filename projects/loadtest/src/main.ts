@@ -19,6 +19,8 @@ import { writeProvenance } from './provenance.js';
 import { runQuiverCrash, QUIVER_RECOVERY_FILE } from './quiver-crash.js';
 import { runOwnedProcess } from './owned-process.js';
 import { startQapObserver } from './qap-observer.js';
+import { readStressPlan, runStressDriver } from './stress-driver.js';
+import { LocalStressRuntime } from './stress-runtime.js';
 import {
   benchmarkComposeFiles, benchmarkQuiver, buildBenchmarkComposeOverride, buildBenchmarkRuntimeConfigs, dataflowConfigFile,
 } from './runtime-config.js';
@@ -495,7 +497,11 @@ interface CloudRun {
 async function benchmark(
   options: BenchmarkOptions, controller: BenchmarkController, cloud: CloudRun,
 ): Promise<BenchmarkContext> {
-  const privateEnv = cloud.environment;
+  const stressPlan = options.stressConfiguration;
+  const privateEnv: NodeJS.ProcessEnv = stressPlan
+    ? { ...cloud.environment, ARROWCOL_LAYOUT_ROW_GROUP_ROWS: String(stressPlan.fixture.rowGroupRows),
+      ARROWCOL_LAYOUT_PAGE_ROWS: String(stressPlan.fixture.pageRows) }
+    : cloud.environment;
   const azure = options.mode === 'azure'
     ? azureTargets(privateEnv, `run-${Date.now()}-${randomBytes(4).toString('hex')}`)
     : undefined;
@@ -639,11 +645,29 @@ async function benchmark(
     });
     const load = runLocalLoadgen(context, 'run', path.join(directory, 'results'), controller)
       .finally(() => loadEnded.abort());
+    const stressRuntime = stressPlan ? new LocalStressRuntime({
+      workspace, directory, project, env, composeFiles: benchmarkComposeFiles(composeFile, env),
+      reader: path.join(cargoTargetDirectory(), 'debug/delta-inspect'),
+      directAdmin: `http://${network.direct}:8081`, dataflowAdmin: `http://${network.dataflow}:32011`,
+      quiver: options.quiver, loadEnded: loadEnded.signal, checkRunning: () => controller.checkRunning(),
+      physicalRoots: Object.fromEntries([
+        'direct', 'dataflow', 'tenant', 'tenant-checkpoints', 'direct-state-1', 'dataflow-state-1', 'router-state',
+      ].map(name => [name, path.join(directory, name)]).concat([
+        ['loadgen-staging', path.join(workspace, 'projects/loadtest/.temp/loadgen/latest')],
+      ])),
+    }) : undefined;
+    const stress = stressPlan && stressRuntime ? runStressDriver({
+      plan: stressPlan, results: path.join(directory, 'results'), loadEnded: loadEnded.signal,
+      checkRunning: () => controller.checkRunning(),
+      waitForInput: deadline => stressRuntime.waitForInput(deadline),
+      operate: (wave, deadline) => stressRuntime.operate(wave, deadline),
+      sample: (wave, runId, deadline) => stressRuntime.sample(wave, runId, deadline),
+    }) : undefined;
     const reconciliation = azure ? reconcileAzure({ ...context, project }, cloud.occupancyId).catch(error => {
       cloud.reconciliationFailed = true;
       throw error;
     }) : undefined;
-    const [loadOutcome, crashOutcome, reconcileOutcome] = await Promise.allSettled([load, crash, reconciliation]);
+    const [loadOutcome, crashOutcome, reconcileOutcome, stressOutcome] = await Promise.allSettled([load, crash, reconciliation, stress]);
     if (reconcileOutcome.status === 'rejected') {
       phase = 'azure-external-reconcile';
       if (loadOutcome.status === 'rejected') {
@@ -696,6 +720,10 @@ async function benchmark(
       });
       step(`kusto-explorer UI gate passed: ${gate.tables} tables and ${gate.rows} rows matched through the UI`);
       }
+    }
+    if (stressOutcome.status === 'rejected') {
+      phase = 'fixed-window-stress';
+      throw stressOutcome.reason;
     }
   } catch (error) {
     failure = error;
@@ -760,6 +788,22 @@ async function main(): Promise<void> {
     return;
   }
   const options = parseBenchmarkOptions(userArguments);
+  if (options.stressPlan) {
+    if (options.mode !== 'local') {
+      throw new Error('Azure stress requires a complete ADLS physical inventory adapter; local functional evidence cannot qualify Azure');
+    }
+    const plan = readStressPlan(options.stressPlan);
+    options.stressConfiguration = plan;
+    if (options.batchRows !== plan.fixture.batchRows) throw new Error('--batch-rows must equal the predeclared stress fixture batchRows');
+    const minimumMeasure = plan.durationSeconds + plan.sampleTimeoutSeconds * 2 + 5;
+    if (options.warmupSeconds + options.captureSettleSeconds >= plan.startupTimeoutSeconds) {
+      throw new Error('Stress startup budget must include capture settling and warmup');
+    }
+    if (options.measureSeconds !== undefined && options.measureSeconds < minimumMeasure) {
+      throw new Error('--measure is shorter than the predeclared stress window and sample budgets');
+    }
+    options.measureSeconds ??= minimumMeasure;
+  }
   const privateEnv = modeEnvironment(workspace, options.mode, process.env);
   const controller = await acquireBenchmarkController(workspace);
   const occupancyId = randomUUID();
