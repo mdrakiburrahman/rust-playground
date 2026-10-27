@@ -21,6 +21,8 @@ import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[2]
 API = "2024-04-13"
+# Short exclusive lease serializing authority metadata read-modify-write only.
+LEASE_SECONDS = 15
 TAGS = {"project": "rust-playground", "purpose": "disposable-arrowcol-sandbox"}
 RESET_EXECUTION_BLOCKER = (
     "Destructive reset is disabled: complete distributed publisher registration and "
@@ -32,6 +34,16 @@ RESET_EXECUTION_BLOCKER = (
 
 class Failure(RuntimeError):
     """A visible, sanitized operational failure."""
+
+
+class HttpFailure(Failure):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+class ControlConflict(Failure):
+    """An authority write was definitely not applied."""
 
 
 class NotReady(Failure):
@@ -166,6 +178,7 @@ class Azure:
     def __init__(self, config):
         self.c = config
         self.tokens = {}
+        self.snapshots = {}
 
     def cli(self, *args):
         result = subprocess.run(
@@ -199,7 +212,7 @@ class Azure:
             if missing_ok and exc.code == 404:
                 return None, {}
             detail = exc.read().decode(errors="replace")
-            raise Failure(f"HTTP {exc.code}: {self.c.redact(detail)}") from exc
+            raise HttpFailure(exc.code, f"HTTP {exc.code}: {self.c.redact(detail)}") from exc
         except urllib.error.URLError as exc:
             raise Failure(self.c.redact(str(exc.reason))) from exc
 
@@ -276,10 +289,18 @@ class Azure:
             raise Failure(self.c.redact(json.dumps(value)))
         return value
 
-    def control(self):
+    def head_control(self):
+        """Read authority metadata and remember its content for a later guarded write."""
         _, headers = self.blob("HEAD", self.c.checkpoints, query={"restype": "container"})
-        metadata = {key[10:]: value for key, value in headers.items()
+        metadata = {key[10:].lower(): value for key, value in headers.items()
                     if key.startswith("x-ms-meta-")}
+        if not headers.get("etag"):
+            raise Failure("Reset authority ETag is unavailable.")
+        self.snapshots[headers["etag"]] = dict(metadata)
+        return metadata, headers["etag"]
+
+    def control(self):
+        metadata, etag = self.head_control()
         if metadata.get("sandboxid") != self.c.sandbox:
             raise Failure("Reset authority container ownership mismatch.")
         if metadata.get("resetstate") not in ("ready", "fenced"):
@@ -288,16 +309,54 @@ class Azure:
             uuid.UUID(metadata["resetgeneration"])
         except (KeyError, ValueError) as exc:
             raise Failure("Reset authority generation is missing or invalid.") from exc
-        if not headers.get("etag"):
-            raise Failure("Reset authority ETag is unavailable.")
-        return metadata, headers["etag"]
+        return metadata, etag
+
+    def lease(self, action, lease_id, proposed=False):
+        headers = {"x-ms-lease-action": action}
+        if proposed:
+            headers.update({"x-ms-lease-duration": str(LEASE_SECONDS),
+                            "x-ms-proposed-lease-id": lease_id})
+        else:
+            headers["x-ms-lease-id"] = lease_id
+        self.blob("PUT", self.c.checkpoints, query={"comp": "lease", "restype": "container"},
+                  body=b"", headers=headers)
 
     def set_control(self, metadata, etag):
-        self.blob("PUT", self.c.checkpoints,
-                  query={"restype": "container", "comp": "metadata"}, body=b"",
-                  headers={"If-Match": etag, **{"x-ms-meta-" + key: value
-                                               for key, value in metadata.items()}})
+        """Compare-and-set authority metadata under an exclusive container lease.
 
+        Set Container Metadata ignores If-Match, so every protocol writer holds a
+        short container lease, re-reads, compares content with the caller's read,
+        then writes ALL metadata with x-ms-lease-id. A conflict, busy lease or 412
+        is definitely not applied. Other failures may have applied remotely.
+        """
+        expected = self.snapshots.get(etag)
+        if expected is None:
+            raise ControlConflict("Authority write has no matching prior read; nothing written.")
+        lease_id = str(uuid.uuid4())
+        try:
+            self.lease("acquire", lease_id, proposed=True)
+        except Failure as exc:
+            # 409 busy or an ambiguous acquire: no metadata write is attempted, and
+            # any lease we may hold expires within LEASE_SECONDS.
+            raise ControlConflict("Authority lease unavailable; nothing written.") from exc
+        try:
+            current, _ = self.head_control()
+            if current != expected:
+                raise ControlConflict("Authority changed since it was read; nothing written.")
+            try:
+                self.blob("PUT", self.c.checkpoints,
+                          query={"restype": "container", "comp": "metadata"}, body=b"",
+                          headers={"x-ms-lease-id": lease_id,
+                                   **{"x-ms-meta-" + key: value for key, value in metadata.items()}})
+            except HttpFailure as exc:
+                if exc.code == 412:
+                    raise ControlConflict("Authority lease lost before write; nothing written.") from exc
+                raise
+        finally:
+            try:
+                self.lease("release", lease_id)
+            except Failure:
+                pass  # Expiry bounds an unreleased lease.
     def collection(self, path, api=API):
         page = self.arm("GET", path, api=api)
         items = page["value"]
@@ -652,14 +711,17 @@ def occupancy(azure, action, owner, output=None):
     except ValueError as exc:
         raise Failure("Occupancy requires the runner's UUID --occupancy-id.") from exc
     metadata, etag = azure.control()
+    current = metadata.get("occupancy", "released")
     if action == "occupy":
         if metadata["resetstate"] != "ready":
             raise Failure("Cannot start cloud tests while reset authority is fenced.")
-        if metadata.get("occupancy", "released") != "released" and metadata.get("occupancyid") != owner:
+        if current == "stopping":
+            raise Failure("A cluster stop holds the sandbox; tests cannot start.")
+        if current != "released" and (current != "testing" or metadata.get("occupancyid") != owner):
             raise Failure("Another cloud test owns the sandbox.")
         metadata.update(occupancy="testing", occupancyid=owner)
     else:
-        if metadata.get("occupancyid") != owner:
+        if current != "testing" or metadata.get("occupancyid") != owner:
             raise Failure("Only the exact occupancy owner can release cloud tests.")
         metadata.update(occupancy="released")
     azure.set_control(metadata, etag)
@@ -746,10 +808,7 @@ def main(argv=None):
         elif args.command == "stop":
             owned(azure.arm("GET", c.cluster_id), c)
             if args.execute:
-                require_released(azure.control()[0])
-                azure.cli("rest", "--method", "post", "--url", "https://management.azure.com" +
-                          c.cluster_id + "/stop?api-version=" + API)
-                retry_ready(lambda: stopped(azure), "Cluster stop", timeout=1200)
+                stop_cluster(azure)
                 print("Owned Kusto cluster stopped; infrastructure preserved.")
             else:
                 print("Stop preview: preserve cluster; --execute requests stop after test occupancy release.")
@@ -765,6 +824,31 @@ def main(argv=None):
         message = c.redact(str(exc)) if c else "Invalid or missing private Azure configuration."
         print("ERROR: " + message, file=sys.stderr)
         return 1
+
+
+def stop_cluster(azure):
+    """Serialize stop with occupy through a persistent occupancy=stopping hold.
+
+    The hold is taken by CAS from released before any ARM call, so a competing
+    occupy either wins first (stop fails before ARM) or is rejected afterwards.
+    It is released only after Stopped is observed. Any unknown CAS or ARM
+    outcome leaves the hold in place; rerunning stop resumes the same hold.
+    """
+    metadata, etag = azure.control()
+    current = metadata.get("occupancy", "released")
+    if current == "released":
+        metadata.update(occupancy="stopping", occupancyid=str(uuid.uuid4()))
+        azure.set_control(metadata, etag)
+    elif current != "stopping":
+        raise Failure("Cloud tests own the sandbox; wait for explicit occupancy release.")
+    azure.cli("rest", "--method", "post", "--url", "https://management.azure.com" +
+              azure.c.cluster_id + "/stop?api-version=" + API)
+    retry_ready(lambda: stopped(azure), "Cluster stop", timeout=1200)
+    metadata, etag = azure.control()
+    if metadata.get("occupancy") != "stopping":
+        raise Failure("Stop hold changed unexpectedly; reconcile occupancy before reuse.")
+    metadata["occupancy"] = "released"
+    azure.set_control(metadata, etag)
 
 
 def stopped(azure):

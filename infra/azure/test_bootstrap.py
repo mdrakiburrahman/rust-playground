@@ -52,6 +52,9 @@ class FakeAzure:
     def control(self):
         return dict(self.metadata), self.etag
 
+    def head_control(self):
+        return dict(self.metadata), self.etag
+
     def set_control(self, metadata, etag):
         if etag != self.etag:
             raise b.Failure("HTTP 412: metadata changed")
@@ -336,6 +339,65 @@ class OccupancyTests(unittest.TestCase):
             b.occupancy(azure, "release", owner)
         self.assertEqual(azure.metadata["occupancy"], "released")
 
+    def stop(self, azure, during_stop=None):
+        def cli(*args):
+            azure.events.append(("cli", args[2]))
+            if during_stop:
+                during_stop()
+        with patch.object(azure, "cli", side_effect=cli), \
+                patch.object(b, "retry_ready", lambda action, label, timeout: None):
+            b.stop_cluster(azure)
+
+    def test_occupy_before_stop_blocks_stop_before_any_arm_call(self):
+        azure = FakeAzure()
+        with contextlib.redirect_stdout(io.StringIO()):
+            b.occupancy(azure, "occupy", str(uuid.uuid4()))
+        with self.assertRaises(b.Failure):
+            self.stop(azure)
+        self.assertNotIn(("cli", "post"), azure.events)
+        self.assertEqual(azure.metadata["occupancy"], "testing")
+
+    def test_stop_hold_rejects_occupy_during_stop_then_releases(self):
+        azure = FakeAzure()
+        rejected = []
+        def compete():
+            try:
+                b.occupancy(azure, "occupy", str(uuid.uuid4()))
+            except b.Failure:
+                rejected.append(azure.metadata["occupancy"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.stop(azure, compete)
+        self.assertEqual(rejected, ["stopping"])
+        self.assertEqual(azure.metadata["occupancy"], "released")
+
+    def test_occupy_racing_stop_hold_cas_prevents_arm_stop(self):
+        azure = FakeAzure()
+        original = azure.set_control
+        def occupy_first(metadata, etag):
+            with patch.object(azure, "set_control", side_effect=original), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                b.occupancy(azure, "occupy", str(uuid.uuid4()))
+            original(metadata, etag)
+        with patch.object(azure, "set_control", side_effect=occupy_first):
+            with self.assertRaises(b.Failure):
+                self.stop(azure)
+        self.assertNotIn(("cli", "post"), azure.events)
+        self.assertEqual(azure.metadata["occupancy"], "testing")
+
+    def test_unknown_arm_stop_outcome_keeps_hold_and_rerun_resumes(self):
+        azure = FakeAzure()
+        with patch.object(azure, "cli", side_effect=b.Failure("ARM timeout")):
+            with self.assertRaises(b.Failure):
+                b.stop_cluster(azure)
+        self.assertEqual(azure.metadata["occupancy"], "stopping")
+        holder = azure.metadata["occupancyid"]
+        for candidate in (str(uuid.uuid4()), holder):
+            with self.assertRaises(b.Failure):  # neither tests nor release by stop-id
+                b.occupancy(azure, "occupy" if candidate != holder else "release", candidate)
+        with self.assertRaises(b.Failure):
+            b.require_released(azure.metadata)
+        self.stop(azure)
+        self.assertEqual(azure.metadata["occupancy"], "released")
     def test_fenced_sandbox_cannot_be_occupied(self):
         azure = FakeAzure()
         azure.metadata["resetstate"] = "fenced"
@@ -466,24 +528,104 @@ class StorageApiTests(unittest.TestCase):
     def setUp(self):
         self.azure = b.Azure(b.Config({"AZURE_SUBSCRIPTION_ID": SUB}))
 
-    def test_container_metadata_read_and_conditional_update(self):
+    def leased_storage(self, **metadata):
         c = self.azure.c
-        generation = str(uuid.uuid4())
-        with patch.object(self.azure, "blob") as blob:
-            blob.return_value = (b"", {
-                "x-ms-meta-sandboxid": c.sandbox, "x-ms-meta-resetstate": "ready",
-                "x-ms-meta-resetgeneration": generation, "x-ms-meta-project": "rust-playground",
-                "etag": '"generation-one"',
-            })
+        state = {"metadata": {"sandboxid": c.sandbox, "resetstate": "ready",
+                              "resetgeneration": str(uuid.uuid4()), "project": "rust-playground",
+                              **metadata},
+                 "lease": None, "calls": [], "etag": 1}
+        def blob(method, container, name="", query=None, body=None, headers=None, missing_ok=False):
+            query, headers = query or {}, headers or {}
+            self.assertNotIn("If-Match", headers)
+            action = headers.get("x-ms-lease-action")
+            state["calls"].append(action or (method, query.get("comp")))
+            if method == "HEAD":
+                return b"", {**{"x-ms-meta-" + k: v for k, v in state["metadata"].items()},
+                             "etag": f'"{state["etag"]}"'}
+            if action == "acquire":
+                if state["lease"]:
+                    raise b.HttpFailure(409, "HTTP 409: LeaseAlreadyPresent")
+                self.assertEqual(headers["x-ms-lease-duration"], str(b.LEASE_SECONDS))
+                state["lease"] = headers["x-ms-proposed-lease-id"]
+                return b"", {}
+            if action == "release":
+                if headers["x-ms-lease-id"] == state["lease"]:
+                    state["lease"] = None
+                return b"", {}
+            if query.get("comp") == "metadata":
+                if headers.get("x-ms-lease-id") != state["lease"] or not state["lease"]:
+                    raise b.HttpFailure(412, "HTTP 412: LeaseIdMismatch")
+                state["metadata"] = {k[10:]: v for k, v in headers.items() if k.startswith("x-ms-meta-")}
+                state["etag"] += 1
+                return b"", {}
+            raise AssertionError((method, query, headers))
+        return state, blob
+
+    def test_metadata_write_is_lease_guarded_read_compare_write_release(self):
+        state, blob = self.leased_storage()
+        with patch.object(self.azure, "blob", side_effect=blob):
             metadata, etag = self.azure.control()
             metadata["resetstate"] = "fenced"
             self.azure.set_control(metadata, etag)
-            headers = blob.call_args.kwargs["headers"]
-            self.assertEqual(headers["If-Match"], '"generation-one"')
-            self.assertEqual(headers["x-ms-meta-resetgeneration"], generation)
-            self.assertEqual(headers["x-ms-meta-project"], "rust-playground")
-            self.assertEqual(headers["x-ms-meta-resetstate"], "fenced")
+        self.assertEqual(state["calls"], [("HEAD", None), "acquire", ("HEAD", None),
+                                          ("PUT", "metadata"), "release"])
+        self.assertEqual(state["metadata"]["resetstate"], "fenced")
+        self.assertEqual(state["metadata"]["project"], "rust-playground")
+        self.assertIsNone(state["lease"])
 
+    def test_busy_lease_writes_nothing(self):
+        state, blob = self.leased_storage()
+        with patch.object(self.azure, "blob", side_effect=blob):
+            metadata, etag = self.azure.control()
+            state["lease"] = str(uuid.uuid4())
+            with self.assertRaises(b.ControlConflict):
+                self.azure.set_control({**metadata, "resetstate": "fenced"}, etag)
+        self.assertNotIn(("PUT", "metadata"), state["calls"])
+        self.assertEqual(state["metadata"]["resetstate"], "ready")
+
+    def test_concurrent_change_between_read_and_lease_writes_nothing_and_releases(self):
+        state, blob = self.leased_storage()
+        with patch.object(self.azure, "blob", side_effect=blob):
+            metadata, etag = self.azure.control()
+            state["metadata"]["occupancy"] = "testing"  # competing leased writer won
+            with self.assertRaises(b.ControlConflict):
+                self.azure.set_control({**metadata, "resetstate": "fenced"}, etag)
+        self.assertNotIn(("PUT", "metadata"), state["calls"])
+        self.assertEqual(state["calls"][-1], "release")
+        self.assertIsNone(state["lease"])
+
+    def test_lost_lease_412_is_definitely_not_applied(self):
+        state, blob = self.leased_storage()
+        def expire_then(method, container, **kwargs):
+            if (kwargs.get("query") or {}).get("comp") == "metadata":
+                state["lease"] = str(uuid.uuid4())  # expired and re-acquired by another writer
+            return blob(method, container, **kwargs)
+        with patch.object(self.azure, "blob", side_effect=expire_then):
+            metadata, etag = self.azure.control()
+            with self.assertRaises(b.ControlConflict):
+                self.azure.set_control({**metadata, "resetstate": "fenced"}, etag)
+        self.assertEqual(state["metadata"]["resetstate"], "ready")
+
+    def test_unknown_write_failure_is_not_reported_as_conflict(self):
+        state, blob = self.leased_storage()
+        def timeout(method, container, **kwargs):
+            if (kwargs.get("query") or {}).get("comp") == "metadata":
+                blob(method, container, **kwargs)
+                raise b.Failure("timed out")
+            return blob(method, container, **kwargs)
+        with patch.object(self.azure, "blob", side_effect=timeout):
+            metadata, etag = self.azure.control()
+            with self.assertRaises(b.Failure) as raised:
+                self.azure.set_control({**metadata, "resetstate": "fenced"}, etag)
+        self.assertNotIsInstance(raised.exception, b.ControlConflict)
+        self.assertEqual(state["calls"][-1], "release")
+
+    def test_write_without_prior_read_is_refused(self):
+        state, blob = self.leased_storage()
+        with patch.object(self.azure, "blob", side_effect=blob):
+            with self.assertRaises(b.ControlConflict):
+                self.azure.set_control({"resetstate": "fenced"}, '"unread"')
+        self.assertEqual(state["calls"], [])
     def test_missing_ownership_state_generation_or_etag_fails_closed(self):
         c = self.azure.c
         complete = {"x-ms-meta-sandboxid": c.sandbox, "x-ms-meta-resetstate": "ready",

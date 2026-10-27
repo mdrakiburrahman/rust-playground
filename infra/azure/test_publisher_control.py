@@ -12,13 +12,7 @@ class Authority(FakeAzure):
     def __init__(self):
         super().__init__()
         self.metadata.update(resetstate=READY, publisherregistryversion="1",
-                             publishers="{}", custom="preserved")
-
-    def blob(self, method, container, **kwargs):
-        if method != "HEAD":
-            raise AssertionError("Only metadata reads are expected here")
-        return b"", {**{"x-ms-meta-" + key: value for key, value in self.metadata.items()},
-                     "etag": self.etag}
+                             publishers="{}", occupancy="released", custom="preserved")
 
 
 class PublisherControlTests(unittest.TestCase):
@@ -131,10 +125,14 @@ class PublisherControlTests(unittest.TestCase):
 
     def test_legacy_state_missing_registry_and_foreign_generation_fail_closed(self):
         for field, value in (("resetstate", "ready"), ("publisherregistryversion", "2"),
+                             ("occupancy", None), ("occupancy", "stopped"),
                              ("publishers", '{"bad":{}}')):
             with self.subTest(field=field):
                 azure = Authority()
-                azure.metadata[field] = value
+                if value is None:
+                    del azure.metadata[field]
+                else:
+                    azure.metadata[field] = value
                 with self.assertRaises(Failure):
                     PublisherControl(azure).read()
         self.azure.metadata["publishers"] = json.dumps({
@@ -150,7 +148,7 @@ class PublisherControlTests(unittest.TestCase):
         self.assertEqual(len(self.registry()), 1)
 
     def test_occupancy_blocks_fence_and_bootstrap(self):
-        self.azure.metadata["occupancy"] = "testing"
+        self.azure.metadata.update(occupancy="testing", occupancyid=str(uuid.uuid4()))
         with self.assertRaises(Failure):
             self.control.fence(self.generation)
         self.azure.metadata["resetstate"] = FENCED
