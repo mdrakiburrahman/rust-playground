@@ -4,6 +4,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
+import type { ProjectConfiguration } from '@nx/devkit';
 import YAML from 'yaml';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -32,6 +33,52 @@ const compose = YAML.parse(readFileSync(path.join(root, 'projects/loadtest/compo
   }>;
   volumes: Record<string, { labels?: Record<string, string> } | null>;
 };
+
+test('lint and tests finish before static helper installation for every loadtest build entry point', () => {
+  const project = JSON.parse(readFileSync(path.join(root, 'projects/loadtest/project.json'), 'utf8')) as ProjectConfiguration;
+  const targets = project.targets;
+  assert.ok(targets);
+  assert.deepEqual(targets['reader-build'].dependsOn, ['lint', 'test']);
+  assert.deepEqual(targets.lint.dependsOn ?? [], []);
+  assert.deepEqual(targets.test.dependsOn ?? [], []);
+  assert.equal(targets['reader-build'].options?.command, 'projects/loadtest/scripts/build-reader-bundle.sh');
+  assert.deepEqual(targets.verify.dependsOn, ['lint', 'test', 'e2e']);
+  assert.deepEqual(targets.e2e.dependsOn, ['build']);
+  assert.equal(targets.build.dependsOn?.[0], 'reader-build');
+  assert.deepEqual(targets.e2e.options?.commands, [
+    'npx --no-install tsx projects/loadtest/src/main.ts --warmup 5s --measure 30s --batch-rows 1024 --validate',
+    'npx --no-install tsx projects/loadtest/src/main.ts --warmup 5s --measure 60s --batch-rows 1024 --validate --quiver --crash-after 15s',
+  ]);
+  assert.equal(targets.e2e.options?.parallel, false);
+  const ordered: string[] = [];
+  const active = new Set<string>();
+  const visit = (name: string): void => {
+    assert.ok(!active.has(name), `cycle at ${name}`);
+    if (ordered.includes(name)) return;
+    active.add(name);
+    for (const dependency of targets[name].dependsOn ?? []) {
+      if (typeof dependency === 'string') visit(dependency);
+    }
+    active.delete(name);
+    ordered.push(name);
+  };
+  for (const entry of ['reader-build', 'build', 'e2e', 'verify']) {
+    ordered.length = 0;
+    visit(entry);
+    for (const writer of ['lint', 'test']) {
+      assert.ok(ordered.indexOf(writer) < ordered.indexOf('reader-build'), `${entry}: ${writer} must precede static installation`);
+    }
+  }
+  const shared = JSON.parse(readFileSync(path.join(root, 'project.json'), 'utf8')) as ProjectConfiguration;
+  assert.ok(shared.targets?.build.dependsOn?.some(dependency =>
+    typeof dependency === 'object' && dependency.target === 'reader-build'
+      && Array.isArray(dependency.projects) && dependency.projects.length === 1 && dependency.projects[0] === 'loadtest'));
+  const script = readFileSync(path.join(root, 'projects/loadtest/scripts/build-reader-bundle.sh'), 'utf8');
+  assert.ok(script.indexOf('cargo build --locked --package delta-inspect') < script.indexOf('install -m 0755'));
+  assert.ok(script.indexOf('--package arrowcol-sdk-gen') < script.indexOf('install -m 0755'));
+  assert.match(script, /static_root="\$target_root\/loadtest-static"/u);
+  assert.match(script, /"\$static_root\/x86_64-unknown-linux-gnu\/debug\/\$binary"/u);
+});
 
 test('real publisher services use an init and source layout overrides reach both collectors', () => {
   for (const service of ['direct-1', 'dataflow-1', 'tenant-stream', 'delta-maintenance']) {

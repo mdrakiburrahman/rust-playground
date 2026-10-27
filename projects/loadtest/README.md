@@ -349,6 +349,11 @@ ACK counts alone, are the correctness evidence.
 
 ## Per-attempt evidence custody
 
+`reader-build` waits for the existing loadtest lint and test targets before
+installing the static helpers. This also applies to standalone reader/build
+requests and the shared Rust build target: Cargo tests must finish writing
+their normal binaries before static installation and E2E helper staging.
+
 A successful **validated local** attempt now stops its owned router only after
 the actual Grafana, native validation and Explorer gates have finished, all
 generator/helpers have returned, observer/sampler shutdown and diagnostics have
