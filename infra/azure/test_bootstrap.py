@@ -461,6 +461,18 @@ class StorageApiTests(unittest.TestCase):
             with self.assertRaises(b.Failure):
                 self.azure.collection(self.azure.c.cluster_id + "/databases")
 
+    def test_oauth_storage_request_includes_azure_date_and_version(self):
+        response = unittest.mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b""
+        response.__enter__.return_value.headers = {}
+        with patch.object(self.azure, "token", return_value="test-token"), \
+                patch.object(b.urllib.request, "urlopen", return_value=response) as urlopen:
+            self.azure.blob("HEAD", self.azure.c.checkpoints, query={"restype": "container"})
+        headers = dict(urlopen.call_args.args[0].header_items())
+        self.assertIn("X-ms-date", headers)
+        self.assertEqual(headers["X-ms-version"], "2023-11-03")
+        self.assertEqual(headers["Authorization"], "Bearer test-token")
+
 
 class InitializerHookTests(unittest.TestCase):
     def test_hook_invokes_only_owned_initializer_with_private_manifest(self):
