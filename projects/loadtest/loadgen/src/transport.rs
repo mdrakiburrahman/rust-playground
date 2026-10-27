@@ -646,6 +646,11 @@ fn redact_receipt_message(message: &str, mut private_values: Vec<String>) -> Str
             "account_key",
             "authorization",
             "access_token",
+            "sharedaccesssignature",
+            "sas_token",
+            "api_key",
+            "apikey",
+            "signature",
             "key",
         ];
         let assignment = names
@@ -660,7 +665,8 @@ fn redact_receipt_message(message: &str, mut private_values: Vec<String>) -> Str
             .as_bytes()
             .windows(3)
             .any(|bytes| bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && matches!(bytes[2], b'\\' | b'/'));
-        if quoted.is_some() || redact_next || credential || windows_path || path.contains("\\\\") {
+        let private_location = windows_path || path.contains('\\') || path.starts_with('/') || token.contains("://");
+        if quoted.is_some() || redact_next || credential || private_location {
             tokens.push("[REDACTED]");
         } else {
             tokens.push(*token);
@@ -669,7 +675,7 @@ fn redact_receipt_message(message: &str, mut private_values: Vec<String>) -> Str
             if token.contains(quote) {
                 quoted = None;
             }
-        } else if credential || redact_next {
+        } else if credential || redact_next || private_location {
             quoted = ['\'', '"']
                 .into_iter()
                 .find(|quote| token.chars().filter(|ch| ch == quote).count() % 2 == 1);
@@ -743,7 +749,8 @@ mod receipt_diagnostics_tests {
              {\"client_secret\":\"another-secret\"} authorization: Bearer opaque-token \
              AccountKey = spaced-secret key = second-secret Password=\"three word credential\" \
              Password = \"combined private credential\" AccountKey : 'joined private words' \
-             Authorization:Basic opaque-basic-token Password = \"https://private.example quoted url-secret\"",
+             Authorization:Basic opaque-basic-token Password = \"https://private.example quoted url-secret\" \
+             \"https://private.example?sig=CANARYSIG standalone private-url-secret\"",
             vec!["private-account".to_owned()],
         );
         assert!(message.contains("unsupported UInt8 statistic"));
@@ -768,6 +775,9 @@ mod receipt_diagnostics_tests {
             "opaque-basic-token",
             "url-secret",
             "quoted",
+            "standalone",
+            "private-url-secret",
+            "CANARYSIG",
         ] {
             assert!(!message.contains(secret), "leaked {secret}: {message}");
         }
@@ -799,7 +809,8 @@ mod receipt_diagnostics_tests {
                  Authorization: Bearer opaque-token AccountKey = spaced-secret key = second-secret \
                  abfss://private@account.dfs.core.windows.net/root Password=\"three word credential\" \
                  Password = \"combined private credential\" AccountKey : 'joined private words' \
-                 Authorization:Basic opaque-basic-token Password = \"https://private.example quoted url-secret\"";
+                 Authorization:Basic opaque-basic-token Password = \"https://private.example quoted url-secret\" \
+                 \"https://private.example?sig=CANARYSIG standalone private-url-secret\"";
         let status = ReceiptStatus::accepted(receipt_id, table, ImplementationPool::Direct, UnixMillis::new(1)?)
             .transition_to(
                 ReceiptState::Failed,
@@ -879,6 +890,9 @@ mod receipt_diagnostics_tests {
             "opaque-basic-token",
             "url-secret",
             "quoted",
+            "standalone",
+            "private-url-secret",
+            "CANARYSIG",
         ] {
             assert!(!jsonl.contains(secret), "leaked canary: {secret}");
         }
@@ -907,6 +921,9 @@ mod receipt_diagnostics_tests {
             "opaque-basic-token",
             "url-secret",
             "quoted",
+            "standalone",
+            "private-url-secret",
+            "CANARYSIG",
         ] {
             assert!(!sent_jsonl.contains(secret), "leaked admission canary: {secret}");
         }
