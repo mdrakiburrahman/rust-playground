@@ -9,7 +9,9 @@
     "arrowcol-infra",
     "arrowcol-sdk-gen",
     "kusto-explorer",
-    "kusto-bridge"
+    "kusto-bridge",
+    "arrow-tenant-stream",
+    "delta-maintenance"
   ],
   "targets": {
     "format": {
@@ -64,7 +66,9 @@
             "arrowcol-dataflow-rust",
             "arrowcol-router-rust",
             "kusto-explorer",
-            "kusto-bridge"
+            "kusto-bridge",
+            "arrow-tenant-stream",
+            "delta-maintenance"
           ],
           "target": "image"
         }

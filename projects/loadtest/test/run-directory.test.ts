@@ -29,6 +29,7 @@ function mockDocker(workspace: string): { commands: string[][]; docker: (args: s
   const labelled = (project: string): Record<string, string> => ({
     'com.docker.compose.project': project,
     'com.docker.compose.project.config_files': path.join(workspace, 'projects/loadtest/compose.yaml'),
+    'com.docker.compose.service': 'direct-1',
   });
   const containers: Resource[] = [
     { id: 'collector', name: 'collector', labels: labelled(BENCHMARK_PROJECT) },
@@ -98,6 +99,36 @@ test('stop halts only verified workspace services and preserves every file and v
   const foreign = mockDocker('/foreign');
   await assert.rejects(stopBenchmark(workspace, foreign.docker), /another workspace/u);
   assert(foreign.commands.every(args => args[0] !== 'stop' && !args.includes('rm')));
+});
+
+test('cloud release prerequisite drains all mutators and rejects forced, OOM or unknown exits', async t => {
+  const workspace = fixture(t);
+  for (const service of ['direct-1', 'dataflow-1', 'tenant-stream', 'delta-maintenance']) {
+    for (const state of [
+      { Running: false, ExitCode: 0, OOMKilled: false },
+      { Running: false, ExitCode: 137, OOMKilled: false },
+      { Running: false, ExitCode: 0, OOMKilled: true },
+      { Running: true, ExitCode: 0, OOMKilled: false },
+      {},
+    ]) {
+      const { docker, commands } = mockDocker(workspace);
+      const strict = (args: string[]): string => {
+        if (args.includes('{{json .State}}')) return JSON.stringify(state);
+        const output = docker(args);
+        if (args[0] === 'inspect') {
+          const resource = JSON.parse(output);
+          resource.labels['com.docker.compose.service'] = service;
+          return JSON.stringify(resource);
+        }
+        return output;
+      };
+      const pending = stopBenchmark(workspace, strict, { requireCleanMutators: true });
+      if ('ExitCode' in state && state.ExitCode === 0 && state.OOMKilled === false && state.Running === false) await pending;
+      else await assert.rejects(pending, /retain occupancy and publisher registration/u);
+      assert(commands.some(args => args.join(' ') === 'stop --time 300 collector'));
+      assert(commands.every(args => !args.includes('rm')));
+    }
+  }
 });
 
 test('starting again removes old output and owned SQL, Hive and Kusto resources without an identity flag', async t => {

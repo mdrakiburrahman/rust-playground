@@ -240,7 +240,9 @@ function resources(docker: Docker, kind: 'container' | 'network' | 'volume'): Re
 }
 
 /** Stops only verified resources owned by this workspace, retaining data for inspection. */
-export async function stopBenchmark(workspace: string, docker: Docker): Promise<void> {
+export async function stopBenchmark(
+  workspace: string, docker: Docker, options: { requireCleanMutators?: boolean } = {},
+): Promise<void> {
   const directories = benchmarkDirectories(workspace);
   const projects = new Set([BENCHMARK_PROJECT, ...directories.map(directory => `rust-playground-loadtest-${path.basename(directory)}`)]);
   const containers = resources(docker, 'container').filter(resource => {
@@ -252,7 +254,19 @@ export async function stopBenchmark(workspace: string, docker: Docker): Promise<
     return true;
   });
   await stopBenchmarkProcesses(workspace, directories);
-  if (containers.length) docker(['stop', '--time', '30', ...containers.map(container => container.id)]);
+  if (containers.length) docker(['stop', '--time', options.requireCleanMutators ? '300' : '30', ...containers.map(container => container.id)]);
+  if (options.requireCleanMutators) {
+    for (const container of containers) {
+      const service = container.labels['com.docker.compose.service'];
+      if (!service) throw new Error('Cannot verify cloud drain without Compose service identity; retain occupancy');
+      if (!['direct-1', 'dataflow-1', 'tenant-stream', 'delta-maintenance'].includes(service)) continue;
+      const state: unknown = JSON.parse(docker(['inspect', '--format', '{{json .State}}', container.id]));
+      if (!state || typeof state !== 'object' || !('Running' in state) || state.Running !== false ||
+          !('ExitCode' in state) || state.ExitCode !== 0 || !('OOMKilled' in state) || state.OOMKilled !== false) {
+        throw new Error(`Cloud mutator ${service} did not exit cleanly; retain occupancy and publisher registration`);
+      }
+    }
+  }
 }
 
 export async function resetBenchmark(workspace: string, docker: Docker): Promise<string> {

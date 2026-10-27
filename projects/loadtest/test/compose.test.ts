@@ -28,9 +28,41 @@ const compose = YAML.parse(readFileSync(path.join(root, 'projects/loadtest/compo
     read_only?: boolean;
     cap_drop?: string[];
     user?: string;
+    init?: boolean;
   }>;
   volumes: Record<string, { labels?: Record<string, string> } | null>;
 };
+
+test('real publisher services use an init and source layout overrides reach both collectors', () => {
+  for (const service of ['direct-1', 'dataflow-1', 'tenant-stream', 'delta-maintenance']) {
+    assert.equal(compose.services[service].init, true, `${service} must reap Azure CLI descendants`);
+  }
+  for (const service of ['direct-1', 'dataflow-1']) {
+    assert.equal(compose.services[service].environment?.ARROWCOL_LAYOUT_ROW_GROUP_ROWS, '${ARROWCOL_LAYOUT_ROW_GROUP_ROWS:-16384}');
+    assert.equal(compose.services[service].environment?.ARROWCOL_LAYOUT_PAGE_ROWS, '${ARROWCOL_LAYOUT_PAGE_ROWS:-2048}');
+  }
+});
+
+test('real maintenance and tenant images are optional, build-covered, and use isolated writable roots', () => {
+  const project = JSON.parse(readFileSync(path.join(root, 'projects/loadtest/project.json'), 'utf8'));
+  const images = project.targets.build.dependsOn.find((dependency: unknown) =>
+    typeof dependency === 'object' && dependency !== null && 'target' in dependency && dependency.target === 'image').projects;
+  for (const [service, profile, image] of [
+    ['tenant-stream', 'tenant', 'arrow-tenant-stream'],
+    ['delta-maintenance', 'maintenance', 'delta-maintenance'],
+  ]) {
+    assert.deepEqual(compose.services[service].profiles, [profile]);
+    assert.equal(compose.services[service].image, `ghcr.io/mdrakiburrahman/rust-playground/${image}:dev`);
+    assert(images.includes(image));
+    assert(project.implicitDependencies.includes(image));
+  }
+  const tenant = compose.services['tenant-stream'];
+  assert(tenant.volumes?.some(volume => typeof volume === 'object' && volume.target === '/delta/direct' && volume.read_only));
+  assert(tenant.volumes?.some(volume => typeof volume === 'object' && volume.target === '/checkpoints' && !volume.read_only));
+  const maintenance = compose.services['delta-maintenance'];
+  assert(maintenance.volumes?.some(volume => typeof volume === 'object' && volume.target === '/tmp/arrowcol-stress/direct'));
+  assert(!maintenance.command?.includes('--unsafe-short-vacuum-for-tests'));
+});
 
 test('stack includes SQL, Hive, router, one collector per pool, Kusto, monitoring and validator', () => {
   const names = Object.keys(compose.services);
