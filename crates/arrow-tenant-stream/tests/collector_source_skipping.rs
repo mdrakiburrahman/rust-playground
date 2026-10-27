@@ -438,26 +438,74 @@ async fn full_logical_scan(source: &DeltaSource, frozen: &BootstrapManifest) -> 
     Ok(output)
 }
 
-fn run_service(source: &std::path::Path, target: &std::path::Path, checkpoint: &std::path::Path) -> Result<String> {
-    use std::process::{Child, Command, Stdio};
-    use std::time::{Duration, Instant};
-    struct Process(Child);
-    impl Drop for Process {
-        fn drop(&mut self) {
-            if matches!(self.0.try_wait(), Ok(None))
-                && let Err(error) = self.0.kill()
-            {
-                eprintln!("service proof cleanup kill failed: {error}");
+struct Process {
+    child: std::process::Child,
+    reaped: bool,
+}
+
+impl Process {
+    fn terminate(&mut self) -> Result<()> {
+        use std::time::{Duration, Instant};
+        if self.reaped {
+            return Ok(());
+        }
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            self.reaped = true;
+            return Ok(());
+        }
+        // An unknown wait state is not evidence that the owned child stopped.
+        let kill = self.child.kill();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if self.child.try_wait()?.is_some() {
+                self.reaped = true;
+                kill.context("owned child kill failed")?;
+                return Ok(());
             }
-            if let Err(error) = self.0.wait() {
-                eprintln!("service proof cleanup wait failed: {error}");
-            }
+            ensure!(
+                Instant::now() < deadline,
+                "owned child cleanup exceeded five seconds; kill={kill:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
+
+    fn finish(&mut self, timeout: std::time::Duration) -> Result<std::process::ExitStatus> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    self.reaped = true;
+                    return Ok(status);
+                }
+                Ok(None) if std::time::Instant::now() < deadline => {}
+                outcome => {
+                    let cleanup = self.terminate();
+                    cleanup.context("owned child termination/reaping failed")?;
+                    anyhow::bail!("owned child did not finish within {timeout:?}: {outcome:?}");
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        if !self.reaped
+            && let Err(error) = self.terminate()
+        {
+            eprintln!("owned child fallback cleanup failed: {error:#}");
+        }
+    }
+}
+
+fn run_service(source: &std::path::Path, target: &std::path::Path, checkpoint: &std::path::Path) -> Result<String> {
+    use std::process::{Command, Stdio};
     let stdout = tempfile::NamedTempFile::new()?;
     let stderr = tempfile::NamedTempFile::new()?;
-    let mut child = Process(
-        Command::new(env!("CARGO_BIN_EXE_arrow-tenant-stream"))
+    let mut child = Process {
+        child: Command::new(env!("CARGO_BIN_EXE_arrow-tenant-stream"))
             .arg("--source")
             .arg(source)
             .arg("--target")
@@ -478,23 +526,44 @@ fn run_service(source: &std::path::Path, target: &std::path::Path, checkpoint: &
             .stdout(Stdio::from(stdout.as_file().try_clone()?))
             .stderr(Stdio::from(stderr.as_file().try_clone()?))
             .spawn()?,
+        reaped: false,
+    };
+    let status = child.finish(std::time::Duration::from_secs(120))?;
+    ensure!(child.reaped, "child custody must finish before PASS");
+    ensure!(
+        status.success(),
+        "actual service failed: {}",
+        std::fs::read_to_string(stderr.path())?
     );
-    let deadline = Instant::now() + Duration::from_secs(120);
-    loop {
-        if let Some(status) = child.0.try_wait()? {
-            ensure!(
-                status.success(),
-                "actual service failed: {}",
-                std::fs::read_to_string(stderr.path())?
-            );
-            return Ok(std::fs::read_to_string(stdout.path())?);
-        }
-        ensure!(
-            Instant::now() < deadline,
-            "actual service exceeded predeclared 120-second deadline"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    Ok(std::fs::read_to_string(stdout.path())?)
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn hung_owned_child_is_killed_and_reaped_at_the_deadline() -> Result<()> {
+    let child = std::process::Command::new("sleep").arg("60").spawn()?;
+    let pid = child.id();
+    let mut process = Process { child, reaped: false };
+    let start = std::time::Instant::now();
+    let error = process
+        .finish(std::time::Duration::from_millis(50))
+        .err()
+        .context("hung child must time out")?;
+    ensure!(
+        error.to_string().contains("did not finish"),
+        "timeout must remain an error"
+    );
+    ensure!(process.reaped, "timed-out child must be positively reaped");
+    ensure!(process.child.try_wait()?.is_some(), "child status must be known");
+    ensure!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "owned PID must be gone, not zombie"
+    );
+    ensure!(
+        start.elapsed() < std::time::Duration::from_secs(6),
+        "cleanup must stay bounded"
+    );
+    Ok(())
 }
 
 #[tokio::test]
