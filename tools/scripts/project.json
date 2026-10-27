@@ -48,7 +48,12 @@
       "executor": "nx:run-commands",
       "cache": false,
       "options": {
-        "command": "npx --no-install markdownlint-cli2",
+        "commands": [
+          "python3 -B -m unittest discover -s docs -p test_validate.py",
+          "python3 docs/validate.py",
+          "npx --no-install markdownlint-cli2"
+        ],
+        "parallel": false,
         "cwd": "{workspaceRoot}",
         "forwardAllArgs": false
       }

@@ -57,6 +57,7 @@ RUNTIME_ROOTS = (
     "projects/loadtest/.temp/",
     "projects/arrowcol-rust/.data/",
 )
+RUNTIME_FILES = {".devcontainer/.env"}
 PATH_PREFIXES = (
     ".devcontainer/",
     ".github/",
@@ -104,7 +105,7 @@ def heading_anchors(text: str) -> set[str]:
 def load_nx_projects() -> dict[str, set[str]]:
     projects: dict[str, set[str]] = {}
     for path in ROOT.rglob("project.json"):
-        if any(part in {"node_modules", "target", "submodules", "onelake", ".temp"} for part in path.parts):
+        if any(part in {"node_modules", "target", "submodules", "onelake", ".temp"} for part in path.relative_to(ROOT).parts):
             continue
         data = json.loads(path.read_text(encoding="utf-8"))
         name = data.get("name")
@@ -116,7 +117,7 @@ def load_nx_projects() -> dict[str, set[str]]:
 def load_cargo_packages() -> set[str]:
     packages: set[str] = set()
     for path in ROOT.rglob("Cargo.toml"):
-        if any(part in {"target", "submodules", "onelake", ".temp"} for part in path.parts):
+        if any(part in {"target", "submodules", "onelake", ".temp"} for part in path.relative_to(ROOT).parts):
             continue
         with path.open("rb") as handle:
             data = tomllib.load(handle)
@@ -171,6 +172,7 @@ def static_path_tokens(value: str) -> set[str]:
                 continue
             if (
                 candidate.startswith(RUNTIME_ROOTS)
+                or candidate in RUNTIME_FILES
                 or "/secrets/" in candidate
                 or candidate.endswith("/secrets")
             ):
@@ -184,6 +186,7 @@ def static_path_tokens(value: str) -> set[str]:
             continue
         if (
             candidate.startswith(RUNTIME_ROOTS)
+            or candidate in RUNTIME_FILES
             or "/secrets/" in candidate
             or candidate.endswith("/secrets")
         ):
