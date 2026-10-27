@@ -72,8 +72,13 @@ validator-cost diagnosis must preserve the native global five-minute deadline.
 
 Read-only diagnosis subsequently measured 318.4 seconds and 316.0 seconds in the
 two serial, pre-Kusto snapshot summaries: that failed command had not reached
-its native Kusto phase. A proposed parallel reader correction remains held for
-bounded-memory review; its timing measurements are not a native qualification.
+its native Kusto phase. Parallel reader correction
+`6d8a88df4a1763b1db7bc2773eefc51ecf562bde` is paired with reviewed corrective
+tail `ada67e4c07a071e771c99e8fd7f5fce9e4a908b1`: file summaries merge in
+ordered two-worker batches, and sampled rows aggregate checked multiplicities
+within the existing distinct-row guards rather than retaining every decoded
+row. Source-isolated reader qualification remains pending; timing measurements
+are not a native qualification.
 The approved readiness changes require compactable CPU fixtures from both
 pools and actual remaining generator input before starting the immutable
 window. Raw reader stderr is retained only in private staging outside the
@@ -125,14 +130,22 @@ The corrected guard and first actual process execution passed without changing
 production code or test assertions. This qualifies the bounded replay/process
 scenario, not a whole-storage plateau or the unrelated aggregate reader failure.
 
-Combined candidate `332125096696ae9a057c952e94da0415a2750dd2` passed all
-135 TypeScript tests with zero skips, TypeScript checking, and targeted Rust
-format checking. Its real maintenance CLI contract used the verified service
+Combined candidate `18bbe96ec14443919e2e54317c97c8e4e824f361` passed all
+137 TypeScript tests with zero skips, TypeScript checking, full Rust format
+checking, locked workspace metadata, and `tools-scripts:verify`.
+Its real maintenance CLI contract used the verified service
 binary above, with unchanged maintenance/library source and manifests.
 The optional generator declaration binds warmup, measure, capture settling and
 startup budgets to the persisted plan hash; old plans remain distinct.
-The host helper must still be rebuilt for the new progress fields. These
-checks do not qualify combined-source Rust binaries, images, or live stress.
+The host helper must still be rebuilt for the new progress fields.
+Selected host and mounted helper hashes are recorded without filesystem paths,
+must match, and are rechecked after stack startup; they do not prove build
+freshness or source correctness on their own. The optional initializer fixtures
+use a nondefault core seam also gated by debug assertions, with only two
+additional loadgen dev-dependency lock edges and no package-version changes.
+Their library checks do not qualify the actual successful release CLI,
+environment/manifest, and Python child chain or enable public reset execution.
+These checks do not qualify combined-source Rust binaries, images, or live stress.
 
 CI run `40459829984` at
 `ef0a14d33fc1025af0bda401fc15d893231ad455` finished with 44 successful jobs and
