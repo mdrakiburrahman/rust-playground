@@ -136,7 +136,7 @@ test('stack includes SQL, Hive, router, one collector per pool, Kusto, monitorin
 test('Kusto is pinned, memory-bounded, loopback-only and keeps its documented default startup', () => {
   const kusto = compose.services.kusto;
   assert.match(kusto.image ?? '', /^mcr\.microsoft\.com\/azuredataexplorer\/kustainer-linux@sha256:[0-9a-f]{64}$/u);
-  assert.equal(kusto.mem_limit, '${KUSTO_MEMORY_LIMIT:-4g}');
+  assert.equal(kusto.mem_limit, '${KUSTO_MEMORY_LIMIT:-6g}');
   assert.deepEqual(kusto.environment, { ACCEPT_EULA: 'Y' });
   assert.deepEqual(kusto.ports, ['127.0.0.1:${KUSTO_PORT:-8080}:8080']);
   assert.equal(kusto.entrypoint, undefined);
