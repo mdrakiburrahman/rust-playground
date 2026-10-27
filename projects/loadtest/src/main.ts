@@ -15,6 +15,7 @@ import {
   type BenchmarkOptions,
 } from './cli.js';
 import { startResourceSampler } from './resource-sampler.js';
+import { beginAttemptEvidence, sealAttemptEvidence, stoppedAttemptMutators, type StoppedMutator } from './attempt-evidence.js';
 import { writeProvenance } from './provenance.js';
 import { runQuiverCrash, QUIVER_RECOVERY_FILE } from './quiver-crash.js';
 import { runOwnedProcess } from './owned-process.js';
@@ -24,7 +25,7 @@ import { LocalStressRuntime } from './stress-runtime.js';
 import {
   benchmarkComposeFiles, benchmarkQuiver, buildBenchmarkComposeOverride, buildBenchmarkRuntimeConfigs, dataflowConfigFile,
 } from './runtime-config.js';
-import { acquireBenchmarkController, resetBenchmark, stopBenchmark, stopReceipt, type BenchmarkController } from './lifecycle.js';
+import { acquireBenchmarkController, requirePreviousAttemptEvidence, resetBenchmark, stopBenchmark, stopReceipt, type BenchmarkController } from './lifecycle.js';
 import { azureTargets, modeEnvironment, stageAzureCliConfig, type AzureTargets } from './mode.js';
 import { kustoComposeStartArguments, kustoStatusSummary, readKustoStatus, requireHealthyKusto, safeKustoError, startKusto } from './kusto.js';
 import { kustoExplorerStartArguments, runGrafanaGate, runUiGate } from './ui-gate.js';
@@ -511,6 +512,7 @@ async function benchmark(
   step('Starting fresh: removing previous loadtest containers, volumes, and generated data');
   const project = BENCHMARK_PROJECT;
   const directory = await resetBenchmark(workspace, args => run('docker', args));
+  beginAttemptEvidence(workspace, directory);
   controller.checkRunning();
   step('Bootstrapping secrets and preparing benchmark');
   for (const child of [
@@ -544,6 +546,7 @@ async function benchmark(
   let phase = 'compose-validation';
   let stopSampler: (() => Promise<void>) | undefined;
   let stopQapObserver: (() => Promise<void>) | undefined;
+  let stoppedMutators: StoppedMutator[] | undefined;
   const resultsDirectory = path.relative(workspace, path.join(directory, 'results'));
   try {
     step('Validating Compose configuration');
@@ -701,6 +704,7 @@ async function benchmark(
       const cleanServices = await stopBenchmark(workspace, args => run('docker', args, process.env, 360_000), {
         requireCleanMutators: true, mutatorsOnly: true,
       });
+      stoppedMutators = stoppedAttemptMutators(workspace, args => run('docker', args), cleanServices);
       const metadata: unknown = JSON.parse(readFileSync(path.join(directory, 'results/run-metadata.json'), 'utf8'));
       assert(metadata && typeof metadata === 'object' && 'run_id' in metadata && typeof metadata.run_id === 'string',
         'Cannot bind stopped-mutator evidence without the run identity');
@@ -762,8 +766,25 @@ async function benchmark(
     step(`FAILED. Diagnostics: ${resultsDirectory}/compose.log`);
     throw failure;
   }
+  if (options.validate && !azure) {
+    if (!stoppedMutators) throw new Error('Attempt evidence requires positively verified stopped mutators');
+    try {
+      await sealAttemptEvidence(workspace, directory, path.join(cargoTargetDirectory(), 'debug'),
+        (args, timeout) => run('docker', args, process.env, timeout), stoppedMutators, env.ONELAKE_HOST_PATH,
+        undefined, () => controller.checkRunning());
+    } catch (error) {
+      writeFileSync(path.join(directory, 'results/runner-failure.json'), `${JSON.stringify({
+        timestamp: new Date().toISOString(), phase: 'attempt-evidence', kind: 'Error',
+      })}\n`);
+      throw error;
+    }
+    step('Validated attempt evidence sealed privately; owned router stopped after qualification');
+  } else {
+    step('Attempt remains unsealed; a subsequent reset is blocked to preserve its original data');
+  }
   step(`Load generation finished. ${azure ? 'Azure mode; QAP evidence is a separate required live gate' : kustoStatusSummary(readKustoStatus(path.join(directory, 'results')))}. ` +
-    `Results: ${resultsDirectory}. Stack kept for inspection; the next start resets it.`);
+    `Results: ${resultsDirectory}. Stack retained for inspection; ` +
+    (options.validate && !azure ? 'the next start verifies the private seal before reset.' : 'reset is blocked for this unsealed attempt.'));
   return {
     directory,
     env,
@@ -803,6 +824,7 @@ async function main(): Promise<void> {
     options.measureSeconds = stressInputBudget(plan, options).measureSeconds;
   }
   const privateEnv = modeEnvironment(workspace, options.mode, process.env);
+  requirePreviousAttemptEvidence(workspace);
   const controller = await acquireBenchmarkController(workspace);
   const occupancyId = randomUUID();
   const cloud: CloudRun = { environment: privateEnv, occupancyId, reconciliationFailed: false, qapObservationFailed: false };

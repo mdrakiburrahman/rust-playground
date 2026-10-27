@@ -8,6 +8,7 @@ import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import { BENCHMARK_PROJECT } from './cli.js';
+import { requireNoLiveAttemptWriters, requireSealedAttemptEvidence } from './attempt-evidence.js';
 
 type Docker = (args: string[]) => string;
 
@@ -289,8 +290,13 @@ export async function stopBenchmark(
   return cleanMutators;
 }
 
+export function requirePreviousAttemptEvidence(workspace: string): void {
+  for (const directory of benchmarkDirectories(workspace)) requireSealedAttemptEvidence(workspace, directory);
+}
+
 export async function resetBenchmark(workspace: string, docker: Docker): Promise<string> {
   const directories = benchmarkDirectories(workspace);
+  for (const directory of directories) requireSealedAttemptEvidence(workspace, directory);
   const scratchDirectories = [...new Set(['latest', ...directories.map(directory => path.basename(directory))])]
     .flatMap(name => ['secrets', 'bin', 'loadgen'].map(folder => checkedBenchmarkPath(workspace,
       path.join(workspace, 'projects/loadtest/.temp', folder, name))));
@@ -324,6 +330,7 @@ export async function resetBenchmark(workspace: string, docker: Docker): Promise
       }
     }
   }
+  for (const directory of directories) requireNoLiveAttemptWriters(workspace, directory, docker);
   await stopBenchmarkProcesses(workspace, directories);
   if (containers.length) {
     docker(['stop', '--time', '30', ...containers.map(container => container.id)]);
