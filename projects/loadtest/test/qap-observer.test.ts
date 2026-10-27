@@ -8,7 +8,7 @@ import { test } from 'node:test';
 
 import { exportQapPoints, qapPoints, startQapObserver } from '../src/qap-observer.js';
 
-for (const mode of ['child-failure', 'invalid-output', 'invalid-diagnostic'] as const) {
+for (const mode of ['child-failure', 'invalid-output', 'invalid-diagnostic', 'array-code', 'nested-array-code'] as const) {
   test(`observer reports fixed privacy-safe phases for actual ${mode}`, async t => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'qap-diagnostic-'));
     t.after(() => rm(root, { force: true, recursive: true }));
@@ -25,6 +25,9 @@ if mode=='child-failure':
  sys.exit(3)
 if mode=='invalid-diagnostic':
  (root/'observation-diagnostic.json').write_text('{"code":"https://secret.invalid/password"}')
+if mode in ('array-code','nested-array-code'):
+ code=['completed'] if mode=='array-code' else [['completed']]
+ (root/'observation-diagnostic.json').write_text(json.dumps({'code':code,'elapsed_ms':1,'queries_completed':0}))
 output.write_text('https://secret.invalid/password')
 `);
     await chmod(binary, 0o700);
@@ -59,7 +62,12 @@ output.write_text('https://secret.invalid/password')
     assert.equal(failure.phase, mode === 'child-failure' ? 'helper' : 'output');
     assert.equal(failure.code, mode === 'child-failure' ? 'helper_failed' : 'output_failed');
     assert(Number.isSafeInteger(failure.elapsed_ms) && Number(failure.elapsed_ms) >= 0);
-    assert.equal(failure.diagnostic_invalid, mode === 'invalid-diagnostic');
+    assert.equal(failure.diagnostic_invalid, ['invalid-diagnostic', 'array-code', 'nested-array-code'].includes(mode));
+    if (mode === 'array-code' || mode === 'nested-array-code') {
+      assert.equal(failure.helper_code, null);
+      assert.equal(failure.queries_completed, null);
+      assert(!text.includes('["completed"]'));
+    }
     if (mode === 'child-failure') {
       assert.equal(failure.helper_code, 'deadline_exceeded');
       assert.equal(failure.queries_completed, 64);
