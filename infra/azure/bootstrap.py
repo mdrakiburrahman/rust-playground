@@ -34,6 +34,10 @@ class Failure(RuntimeError):
     """A visible, sanitized operational failure."""
 
 
+class NotReady(Failure):
+    """Only an absent declared Delta log, never an auth or ownership failure."""
+
+
 def load_env(path):
     values = {}
     if not path.is_file():
@@ -409,7 +413,7 @@ def deploy(azure):
     print("Declarative resources, Kusto and storage access: ready")
 
 
-def reconcile(azure, manifest):
+def reconcile(azure, manifest, wait_seconds=0):
     c = azure.c
     tables = json.loads(manifest.read_text())
     if not isinstance(tables, list) or not tables:
@@ -430,14 +434,27 @@ def reconcile(azure, manifest):
             raise Failure("Initialization manifest contains an unsafe relative path.")
         relative = "/".join(part for part in (c.table_prefix, table["relative_path"]) if part)
         table["storage_path"] = relative
-        data, _ = azure.blob("GET", c.data, relative +
-                             "/_delta_log/00000000000000000000.json",
-                             missing_ok=True)
-        if not data:
-            raise Failure("Valid empty Delta root is missing; initialization must precede KQL.")
-        actions = [json.loads(line) for line in data.splitlines() if line.strip()]
-        if not any("metaData" in action for action in actions) or not any("protocol" in action for action in actions):
-            raise Failure("Delta initialization did not publish metadata and protocol.")
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        missing = 0
+        for table in tables:
+            data, _ = azure.blob("GET", c.data, table["storage_path"] +
+                                 "/_delta_log/00000000000000000000.json",
+                                 missing_ok=True)
+            if data is None:
+                missing += 1
+                continue
+            try:
+                actions = [json.loads(line) for line in data.splitlines() if line.strip()]
+            except json.JSONDecodeError as exc:
+                raise Failure("Delta initialization log is malformed.") from exc
+            if not any("metaData" in action for action in actions) or not any("protocol" in action for action in actions):
+                raise Failure("Delta initialization did not publish metadata and protocol.")
+        if not missing:
+            break
+        if time.monotonic() >= deadline:
+            raise NotReady(f"Declared Delta logs are absent: {missing}; no KQL was attempted.")
+        time.sleep(min(1, max(0, deadline - time.monotonic())))
     identity = azure.arm("GET", c.identity_id, api="2023-01-31")["properties"]["principalId"]
     policy = json.dumps([{"ObjectId": identity, "AllowedUsages": "ExternalTable,AutomatedFlows"}])
     azure.kql(f".alter-merge database ['{c.database}'] policy managed_identity '{policy}'")
@@ -668,12 +685,15 @@ def main(argv=None):
     parser.add_argument("--infra-only", action="store_true")
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--occupancy-id", default="")
+    parser.add_argument("--wait-seconds", type=int, default=0)
     parser.add_argument("--stop-command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     c = None
     try:
         values = {**load_env(args.env_file), **os.environ}
         c = Config(values)
+        if not 0 <= args.wait_seconds <= 600:
+            raise Failure("--wait-seconds must be in the range 0..600.")
         azure = Azure(c)
         if args.command == "config":
             write_private(args.output, c.generated())
@@ -703,7 +723,7 @@ def main(argv=None):
                 if result.returncode:
                     raise Failure("Delta initialization failed; KQL reconciliation was not attempted. " +
                                   c.redact(result.stderr))
-                reconcile(azure, args.tables)
+                reconcile(azure, args.tables, args.wait_seconds)
                 metadata["resetstate"] = "ready"
                 azure.set_control(metadata, etag)
                 write_private(args.output, {
@@ -737,6 +757,10 @@ def main(argv=None):
             occupancy(azure, args.command, args.occupancy_id,
                       args.output if args.command == "occupy" else None)
         return 0
+    except NotReady:
+        print(json.dumps({"status": "not_ready", "code": "DELTA_LOGS_ABSENT",
+                          "retryable": True, "kql_attempted": False}), file=sys.stderr)
+        return 3
     except (Failure, ValueError, OSError, subprocess.TimeoutExpired) as exc:
         message = c.redact(str(exc)) if c else "Invalid or missing private Azure configuration."
         print("ERROR: " + message, file=sys.stderr)
