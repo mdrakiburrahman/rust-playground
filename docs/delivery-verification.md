@@ -12,11 +12,11 @@ below is retained as historical context, not as additional integration scope.
 
 | Issue | Implementation surfaces | Qualification boundary |
 | --- | --- | --- |
-| [#50](https://github.com/mdrakiburrahman/rust-playground/issues/50) | `infra/azure/`: Bicep, provisioning, identity, generation authority, guarded operator commands | Offline policy and recovery checks are not a live Azure deployment or reset qualification |
-| [#44](https://github.com/mdrakiburrahman/rust-playground/issues/44) | Native external Delta/QAP in `projects/loadtest/loadgen/`; optional `projects/kusto-bridge/` | Native active-snapshot semantics differ from the historical tenant fork; local emulator results are not Azure performance evidence |
-| [#36](https://github.com/mdrakiburrahman/rust-playground/issues/36) | `crates/arrow-deltalake/`; `crates/delta-maintenance/` | Production uses Delta Kernel; checkpoints and eligible log pruning preserve publication/query transactions, not a whole-storage byte plateau |
-| [#48](https://github.com/mdrakiburrahman/rust-playground/issues/48) | `projects/loadtest/`: lifecycle, generated clients, all-13-schema fixtures, independent reader, LGTM | Component checks, source-built images, live workload correctness, and measured stress are separate claims |
-| [#47](https://github.com/mdrakiburrahman/rust-playground/issues/47) | `crates/arrow-tenant-stream/`; sorted customer layout in `crates/arrow-deltalake/` | Historical snapshot then logical tail, Spark-compatible recovery, and independent sink replay are distinct from native Kusto snapshot tracking |
+| #50 | `infra/azure/`: Bicep, provisioning, identity, generation authority, guarded operator commands | Offline policy and recovery checks are not a live Azure deployment or reset qualification |
+| #44 | Native external Delta/QAP in `projects/loadtest/loadgen/`; optional `projects/kusto-bridge/` | Native active-snapshot semantics differ from the historical tenant fork; local emulator results are not Azure performance evidence |
+| #36 | `crates/arrow-deltalake/`; `crates/delta-maintenance/` | Production uses Delta Kernel; checkpoints and eligible log pruning preserve publication/query transactions, not a whole-storage byte plateau |
+| #48 | `projects/loadtest/`: lifecycle, generated clients, all-13-schema fixtures, independent reader, LGTM | Component checks, source-built images, live workload correctness, and measured stress are separate claims |
+| #47 | `crates/arrow-tenant-stream/`; sorted customer layout in `crates/arrow-deltalake/` | Historical snapshot then logical tail, Spark-compatible recovery, and independent sink replay are distinct from native Kusto snapshot tracking |
 
 The [root loadtest architecture](../loadtest-architecture.html) and its
 [browser-rendered PNG](../loadtest-architecture.png) show the integrated
