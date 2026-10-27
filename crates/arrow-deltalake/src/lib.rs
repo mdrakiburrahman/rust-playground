@@ -24,6 +24,8 @@ mod delta_io;
 pub mod layout;
 #[cfg(feature = "delta")]
 pub mod normalize;
+#[cfg(feature = "delta")]
+pub mod publisher;
 pub mod sizing;
 #[cfg(feature = "delta")]
 pub mod telemetry;
