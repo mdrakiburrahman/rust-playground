@@ -181,14 +181,30 @@ impl BatchedTable {
         Self::open_inner(root, options, Some(publication_fence)).await
     }
 
+    /// Share a fenced publication coordinator for a local path or canonical ADLS URI.
+    ///
+    /// # Errors
+    /// Rejects inconsistent options, invalid authority or worker startup failures.
+    pub async fn open_uri_with_fence(
+        root: &str,
+        options: CommitOptions,
+        publication_fence: Arc<dyn PublicationFence>,
+    ) -> Result<Arc<Self>> {
+        Self::open_inner(Path::new(root), options, Some(publication_fence)).await
+    }
+
     async fn open_inner(
         root: impl AsRef<Path>,
         options: CommitOptions,
         publication_fence: Option<Arc<dyn PublicationFence>>,
     ) -> Result<Arc<Self>> {
         options.validate()?;
-        tokio::fs::create_dir_all(root.as_ref()).await?;
-        let root = tokio::fs::canonicalize(root).await?;
+        let root = if root.as_ref().to_str().is_some_and(|root| root.contains("://")) {
+            root.as_ref().to_path_buf()
+        } else {
+            tokio::fs::create_dir_all(root.as_ref()).await?;
+            tokio::fs::canonicalize(root).await?
+        };
         loop {
             let (owner, mut stopped) = {
                 let mut registry = TABLES.lock().map_err(|_| anyhow::anyhow!("Delta registry poisoned"))?;
@@ -358,7 +374,11 @@ fn run_worker(
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build();
     let table = publication_fence.map_or_else(
         || DeltaTable::open(root),
-        |publication_fence| DeltaTable::open_with_fence(root, publication_fence),
+        |publication_fence| {
+            root.to_str()
+                .context("invalid table URI")
+                .and_then(|root| DeltaTable::open_uri_with_fence(root, publication_fence))
+        },
     );
     let mut failure = table
         .as_ref()
