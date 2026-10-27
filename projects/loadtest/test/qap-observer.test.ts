@@ -77,6 +77,7 @@ test('actual HTTP OTLP export preserves measured zeros and rejects partial accep
       response.writeHead(200, { 'content-type': 'application/json' });
       response.end(JSON.stringify(reject ? { partialSuccess: { rejectedDataPoints: '1' } } : {}));
     });
+
   });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   t.after(() => new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())));

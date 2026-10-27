@@ -106,14 +106,17 @@ export function startQapObserver(options: {
     let sequence = 0;
     while (!stop.signal.aborted) {
       const started = Date.now();
-      const output = path.join(observations, `${sequence++}.json`);
+      const provenance = path.join(observations, String(sequence++));
+      await mkdir(provenance);
+      const output = path.join(provenance, 'observation.json');
       await runOwnedProcess(options.binary, ['observe-qap', '--endpoint', options.endpoint,
-        '--results', options.results, '--output', output, '--timeout', '30s'],
+        '--results', provenance, '--output', output, '--timeout', '30s'],
       { cwd: options.cwd, env: options.env, timeoutMs: 40_000 });
       const observation = qapPoints(JSON.parse(await readFile(output, 'utf8')) as unknown);
       await exportQapPoints(options.otlpEndpoint, observation.observed, observation.points);
       await appendFile(path.join(options.results, 'qap-observer.jsonl'), `${JSON.stringify({
-        observed_unix_ms: observation.observed, artifact: path.basename(output),
+        observed_unix_ms: observation.observed, artifact: path.relative(options.results, output),
+        queries: path.relative(options.results, path.join(provenance, 'kusto-queries.jsonl')),
         complete: observation.points.filter(point => point.name === 'qap_observation_complete'),
         exported: true,
       })}\n`);
