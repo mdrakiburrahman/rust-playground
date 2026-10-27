@@ -140,12 +140,20 @@ rejected. `finish_cleanup` requires definitive deletion completion and, in one
 CAS, removes the operator, rotates to a fresh generation and returns to
 `fenced-v1` with an empty registry.
 
-Bootstrap admission requires `fenced-v1`, released occupancy and an empty
-registry; its registration makes the registry non-empty, so a later cleanup claim
-fails. Cleanup and bootstrap claims therefore serialize through one container
-ETag and cannot both mutate. Only the exclusive bootstrap member can complete
-after definitive physical drain; removing it and setting `ready-v1` happen in
-one CAS. There is no destructor release, expiry, force clear, or automatic retry.
+Bootstrap custody belongs to the single Rust child initializer that
+`initialize-delta.sh` launches. The child admits its own fresh UUID under
+`fenced-v1`, released occupancy and an empty registry; its registration makes
+the registry non-empty, so a later cleanup claim fails. Cleanup and bootstrap
+claims therefore serialize through one container ETag and cannot both mutate.
+The Python parent never registers, adopts or deregisters the child. The child
+removes itself only after definitive physical drain; on failure or unknown drain
+it stays registered or uncertain and blocks readiness. The child never sets
+`ready-v1`. After a clean child exit the parent finishes manifest, Kusto managed
+identity, external table and query acceleration reconciliation, then
+`finalize_ready(generation)` sets `ready-v1` in one CAS only if the generation
+captured before the launch is still `fenced-v1` with an empty registry. A
+cleanup claim or rotation, or a remaining member, in between makes it fail
+closed. There is no destructor release, expiry, force clear, or automatic retry.
 An uncertain member or operator cannot release even if logical transactions
 reconcile. Unknown CAS responses return `UnknownTransition`; retain the
 identity and reconcile authority read-only rather than claim success or adopt a
@@ -157,7 +165,7 @@ Set Container Metadata accepts only `If-Modified-Since` as a condition, so an
 `If-Match` ETag is not a compare-and-set. Every protocol writer, Python and
 Rust, uses this exact sequence instead:
 
-1. Acquire a ``-second container lease with a fresh proposed lease
+1. Acquire a 15-second container lease with a fresh proposed lease
    ID. `409` or an ambiguous acquire is busy and writes nothing.
 2. Read authority metadata under the lease and compare its content with the
    caller's earlier read. A mismatch releases and writes nothing.
