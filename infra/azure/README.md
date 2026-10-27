@@ -389,7 +389,7 @@ The following describes the operator sequence behind the still-disabled public
 | Tenant stream (sink and checkpoint) | `5dd2c85` | Shared admission across sink and checkpoint | Offline pass |
 | Azure copy/rename | `7307a94` | `azure_server_side_copy_is_unreachable` | Unsupported before I/O |
 | Collector replay | `8b82339`, `590a329` | Replay epoch fencing | Actual WAL drain **pending** |
-| Loadgen `initialize-azure` child | `89d3eee`, `9c01c6d` | `initialize_azure_dispatch` (6 missing/non-canonical expected-generation cases rejected before any Azure or control I/O) | Offline rejection pass; stale-G/cleaning runtime, Python wire, admission-before-blob and drain **unverified** |
+| Loadgen `initialize-azure` child | `89d3eee`, `9c01c6d`, `d618bb7` | `initialize_azure_dispatch` (6 missing/non-canonical expected-generation cases rejected before any I/O); debug-only `initialize_control` over the core `test-control` seam: shared 26-table body with stale-G/cleaning/ready/stopping/live-member refusal before any blob, drain before manifest, unknown write retains member; parent child-env, `initialize-delta.sh` argv, CLI parse and Python manifest/log validation composed (no Kusto) | Component offline pass; the release child process, its Azure control/data wire and `run_tree` handling remain **unverified until live Azure qualification** |
 | Python parent (bootstrap/reconcile/release/stop) | this directory | `test_bootstrap`, `test_publisher_control` | Offline pass |
 
 Offline passes are orchestration evidence only. Public enablement still
