@@ -22,7 +22,10 @@
 //! * [`Checkpoint::open_local`] holds a non-blocking exclusive OS lock (`fs2`) on
 //!   `<root>/writer.flock` for the lifetime of the value. The OS drops it when the process dies.
 //!   Files are written to a temporary sibling, `fsync`ed, published with a no-clobber hard link
-//!   and the directory is `fsync`ed (directory `fsync` is skipped on non-Unix platforms).
+//!   and its directories up to the root are `fsync`ed (directory `fsync` is skipped on non-Unix
+//!   platforms). Visibility is not persistence: an entry that already exists (a retried write,
+//!   recovery, `metadata` at open, or a found immutable document) is `fsync`ed again, file and
+//!   directories, before it is accepted, so a publication whose `fsync` failed is never trusted.
 //! * [`Checkpoint::open_store`] creates `<prefix>/writer.lock` with a create-only put. The lock has
 //!   no expiry and is never stolen automatically. [`Checkpoint::close`] releases it with an
 //!   ETag/version-conditional update to a `released` state; a later writer takes over a released
@@ -213,7 +216,9 @@ enum Created {
 }
 
 impl Checkpoint {
-    /// Opens or creates a checkpoint in a local directory and locks it for this process.
+    /// Opens or creates a checkpoint in a local directory and locks it for this process. Every
+    /// open `fsync`s `offsets/`, `commits/`, the root and each ancestor of the absolute root, so a
+    /// freshly created root (including one created by the caller) is durable before it is used.
     ///
     /// # Errors
     ///
@@ -250,8 +255,11 @@ impl Checkpoint {
         }
         remove_stale_temp_files(&root)?;
         sync_dir(&root)?;
-        if let Some(parent) = root.parent().filter(|p| !p.as_os_str().is_empty()) {
-            sync_dir(parent)?;
+        // The root and any ancestors may have just been created (here or by the caller); fsync the
+        // whole absolute ancestry so the root's own directory entry survives a power loss.
+        let absolute = fs::canonicalize(&root).with_context(|| format!("resolving {}", root.display()))?;
+        for ancestor in absolute.ancestors().skip(1) {
+            sync_dir(ancestor)?;
         }
         Self::init(Backend::Local { root, _lock: lock }).await
     }
@@ -332,7 +340,10 @@ impl Checkpoint {
 
     async fn init(backend: Backend) -> Result<Self> {
         let id = match backend.read(None, METADATA).await? {
-            Some(bytes) => decode_metadata(&bytes).with_context(|| backend.describe(None, METADATA))?,
+            Some(bytes) => {
+                backend.ensure_durable(None, METADATA)?;
+                decode_metadata(&bytes).with_context(|| backend.describe(None, METADATA))?
+            }
             None => {
                 let offsets = batch_ids(&backend, OFFSETS).await?;
                 let commits = batch_ids(&backend, COMMITS).await?;
@@ -476,14 +487,20 @@ impl Checkpoint {
         self.publish(None, name, bytes).await
     }
 
-    /// Reads a document written with [`Self::write_immutable`].
+    /// Reads a document written with [`Self::write_immutable`]. On a local checkpoint a found
+    /// document is `fsync`ed (file and directories) before it is returned, so a document that is
+    /// visible after an earlier failed publication is never reused without being durable.
     ///
     /// # Errors
     ///
     /// Fails for invalid or reserved names, documents larger than [`MAX_DOCUMENT_BYTES`], and I/O errors.
     pub async fn read_immutable(&self, name: &str) -> Result<Option<Vec<u8>>> {
         validate_name(name)?;
-        self.backend.read(None, name).await
+        let bytes = self.backend.read(None, name).await?;
+        if bytes.is_some() {
+            self.backend.ensure_durable(None, name)?;
+        }
+        Ok(bytes)
     }
 
     /// Releases the writer lock. Dropping a local checkpoint also releases it; dropping a store
@@ -517,12 +534,14 @@ impl Checkpoint {
 
     async fn read_required(&self, dir: &str, batch_id: i64) -> Result<Vec<u8>> {
         let name = batch_id.to_string();
-        self.backend.read(Some(dir), &name).await?.ok_or_else(|| {
+        let bytes = self.backend.read(Some(dir), &name).await?.ok_or_else(|| {
             anyhow!(
                 "{} disappeared during recovery",
                 self.backend.describe(Some(dir), &name)
             )
-        })
+        })?;
+        self.backend.ensure_durable(Some(dir), &name)?;
+        Ok(bytes)
     }
 
     async fn read_offset(&self, batch_id: i64) -> Result<OffsetRecord> {
@@ -551,6 +570,15 @@ impl Backend {
             Self::Store { store, prefix, .. } => {
                 store_read(store.as_ref(), &store_path(prefix, dir, name), MAX_DOCUMENT_BYTES).await
             }
+        }
+    }
+
+    /// Local only: re-establishes durability of an entry that is visible but may come from a
+    /// publication whose `fsync` failed. Visibility alone is never treated as persistence.
+    fn ensure_durable(&self, dir: Option<&str>, name: &str) -> Result<()> {
+        match self {
+            Self::Local { root, .. } => local_make_durable(root, &local_path(root, dir, name)),
+            Self::Store { .. } => Ok(()),
         }
     }
 
@@ -709,14 +737,7 @@ fn local_create(root: &FsPath, path: &FsPath, bytes: &[u8]) -> Result<Created> {
     let dir = path
         .parent()
         .ok_or_else(|| anyhow!("{} has no parent directory", path.display()))?;
-    if !dir.exists() {
-        fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        let mut synced = dir;
-        while let Some(parent) = synced.parent().filter(|_| synced != root) {
-            sync_dir(parent)?;
-            synced = parent;
-        }
-    }
+    fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("entry");
     let temp = dir.join(format!(".{name}.{}.tmp", Uuid::new_v4().simple()));
     let written = (|| -> std::io::Result<()> {
@@ -728,12 +749,16 @@ fn local_create(root: &FsPath, path: &FsPath, bytes: &[u8]) -> Result<Created> {
     let _ = fs::remove_file(&temp);
     match published {
         Ok(()) => {
-            sync_dir(dir)?;
+            sync_dirs_to_root(root, dir)?;
             Ok(Created::New)
         }
         Err(e) if e.kind() == ErrorKind::AlreadyExists => {
             let file = File::open(path).with_context(|| format!("reading {}", path.display()))?;
-            Ok(Created::Existing(local_read_bounded(file, path)?))
+            let existing = local_read_bounded(file, path)?;
+            // The entry may be visible from an earlier attempt whose fsync failed; make it durable
+            // before reporting it as persisted.
+            local_make_durable(root, path)?;
+            Ok(Created::Existing(existing))
         }
         Err(e) => Err(e).with_context(|| format!("publishing {}", path.display())),
     }
@@ -751,15 +776,51 @@ fn remove_stale_temp_files(dir: &FsPath) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
+/// `fsync`s `path` and every directory from its parent up to and including `root`.
+fn local_make_durable(root: &FsPath, path: &FsPath) -> Result<()> {
+    OpenOptions::new()
+        .read(true)
+        .write(cfg!(not(unix)))
+        .open(path)
+        .and_then(|f| f.sync_all())
+        .with_context(|| format!("fsync of {}", path.display()))?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no parent directory", path.display()))?;
+    sync_dirs_to_root(root, dir)
+}
+
+/// `fsync`s `dir` and each ancestor up to and including `root` (`dir` must be below `root`), so
+/// newly created subdirectories and their entries are durable.
+fn sync_dirs_to_root(root: &FsPath, dir: &FsPath) -> Result<()> {
+    let mut current = dir;
+    loop {
+        sync_dir(current)?;
+        if current == root {
+            return Ok(());
+        }
+        current = current
+            .parent()
+            .filter(|p| p.starts_with(root))
+            .ok_or_else(|| anyhow!("{} is not below checkpoint root {}", dir.display(), root.display()))?;
+    }
+}
+
 fn sync_dir(dir: &FsPath) -> Result<()> {
+    #[cfg(test)]
+    tests::fault::on_sync_dir(dir)?;
+    sync_dir_os(dir)
+}
+
+#[cfg(unix)]
+fn sync_dir_os(dir: &FsPath) -> Result<()> {
     File::open(dir)
         .and_then(|d| d.sync_all())
         .with_context(|| format!("fsync of directory {}", dir.display()))
 }
 
 #[cfg(not(unix))]
-fn sync_dir(_dir: &FsPath) -> Result<()> {
+fn sync_dir_os(_dir: &FsPath) -> Result<()> {
     Ok(())
 }
 
@@ -1062,6 +1123,43 @@ fn decode_commit(bytes: &[u8]) -> Result<i64> {
 mod tests {
     use super::*;
     use object_store::memory::InMemory;
+
+    /// Deterministic per-thread directory-fsync fault injection (`#[tokio::test]` runs the
+    /// synchronous local I/O on the test thread).
+    pub(super) mod fault {
+        use std::cell::Cell;
+        use std::path::Path;
+
+        thread_local! {
+            pub(super) static FAIL: Cell<bool> = const { Cell::new(false) };
+            pub(super) static SYNCS: Cell<usize> = const { Cell::new(0) };
+            pub(super) static SYNCED: std::cell::RefCell<Vec<std::path::PathBuf>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+
+        pub(in super::super) fn on_sync_dir(dir: &Path) -> anyhow::Result<()> {
+            SYNCS.with(|c| c.set(c.get() + 1));
+            SYNCED.with(|s| s.borrow_mut().push(dir.to_path_buf()));
+            anyhow::ensure!(
+                !FAIL.with(Cell::get),
+                "injected fsync failure of directory {}",
+                dir.display()
+            );
+            Ok(())
+        }
+
+        pub(super) fn fail(on: bool) {
+            FAIL.with(|f| f.set(on));
+        }
+
+        pub(super) fn syncs() -> usize {
+            SYNCS.with(Cell::get)
+        }
+
+        pub(super) fn take_synced() -> Vec<std::path::PathBuf> {
+            SYNCED.with(|s| std::mem::take(&mut *s.borrow_mut()))
+        }
+    }
     use serde_json::json;
 
     const ID: &str = "4b0f5c8e-2d1a-4c3b-9e7f-0a1b2c3d4e5f";
@@ -1614,6 +1712,154 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(next.recover().await.unwrap().batch_id, 1);
+    }
+
+    #[tokio::test]
+    async fn local_open_fsyncs_new_root_and_its_whole_ancestry() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("tenants").join("t1").join("cp");
+
+        fault::fail(true);
+        assert!(err(Checkpoint::open_local(&root).await).contains("injected fsync"));
+        fault::fail(false);
+        assert!(
+            root.exists(),
+            "the root is visible even though its creation was not made durable"
+        );
+
+        fault::take_synced();
+        let cp = Checkpoint::open_local(&root).await.unwrap();
+        let synced = fault::take_synced();
+        for expected in [root.join("offsets"), root.join("commits"), root.clone()]
+            .into_iter()
+            .chain(root.ancestors().skip(1).map(FsPath::to_path_buf))
+        {
+            assert!(
+                synced.contains(&expected),
+                "{} not fsynced; synced {synced:?}",
+                expected.display()
+            );
+        }
+        drop(cp);
+
+        // Reopening an existing checkpoint re-establishes the same ancestry durability.
+        let cp = Checkpoint::open_local(&root).await.unwrap();
+        let synced = fault::take_synced();
+        assert!(
+            synced.contains(&base) && synced.contains(&base.join("tenants")),
+            "{synced:?}"
+        );
+        drop(cp);
+    }
+
+    #[tokio::test]
+    async fn local_directory_fsync_failure_is_never_treated_as_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("cp");
+        let mut cp = Checkpoint::open_local(&root).await.unwrap();
+        cp.recover().await.unwrap();
+
+        // Offset is published (visible) but the directory fsync fails.
+        fault::fail(true);
+        assert!(err(cp.prepare(0, &json!(1), 1).await).contains("injected fsync"));
+        assert!(root.join("offsets").join("0").exists());
+        // Neither a retry nor recovery may accept the visible entry while durability still fails.
+        assert!(err(cp.prepare(0, &json!(1), 1).await).contains("injected fsync"));
+        assert!(err(cp.recover().await).contains("injected fsync"));
+        fault::fail(false);
+        let before = fault::syncs();
+        cp.prepare(0, &json!(1), 1).await.unwrap();
+        assert!(fault::syncs() >= before + 2, "retry must fsync offsets/ and the root");
+
+        // Same for the commit: a failed fsync never advances, even though commits/0 is visible.
+        fault::fail(true);
+        assert!(err(cp.commit(0).await).contains("injected fsync"));
+        assert!(root.join("commits").join("0").exists());
+        assert!(err(cp.commit(0).await).contains("injected fsync"));
+        assert!(err(cp.recover().await).contains("injected fsync"));
+        fault::fail(false);
+        let before = fault::syncs();
+        assert_eq!(cp.recover().await.unwrap().batch_id, 1);
+        assert!(
+            fault::syncs() >= before + 2,
+            "recovery must fsync the accepted commit and offset"
+        );
+
+        // A new immutable subdirectory: plan visible after a failed fsync is not reused undurably.
+        fault::fail(true);
+        assert!(err(cp.write_immutable("batches/1.json", b"{}").await).contains("injected fsync"));
+        assert!(err(cp.read_immutable("batches/1.json").await).contains("injected fsync"));
+        assert!(err(cp.write_immutable("batches/1.json", b"{}").await).contains("injected fsync"));
+        fault::fail(false);
+        let before = fault::syncs();
+        assert_eq!(cp.read_immutable("batches/1.json").await.unwrap(), Some(b"{}".to_vec()));
+        assert!(fault::syncs() >= before + 2, "batches/ and the root are fsynced");
+        cp.write_immutable("batches/1.json", b"{}").await.unwrap();
+
+        // Opening fails closed on fsync failure; a clean reopen re-fsyncs metadata and resumes.
+        drop(cp);
+        let other = dir.path().join("fresh");
+        fault::fail(true);
+        assert!(Checkpoint::open_local(&other).await.is_err());
+        fault::fail(false);
+        let mut cp = Checkpoint::open_local(&root).await.unwrap();
+        assert_eq!(cp.recover().await.unwrap().batch_id, 1);
+        cp.prepare(1, &json!(2), 2).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn store_keys_are_physical_multi_segment_paths() {
+        for (prefix, expected) in [
+            (
+                "cp",
+                [
+                    "cp/batches/0.json",
+                    "cp/commits/0",
+                    "cp/metadata",
+                    "cp/offsets/0",
+                    "cp/writer.lock",
+                ],
+            ),
+            (
+                "tenants/t1/_checkpoint",
+                [
+                    "tenants/t1/_checkpoint/batches/0.json",
+                    "tenants/t1/_checkpoint/commits/0",
+                    "tenants/t1/_checkpoint/metadata",
+                    "tenants/t1/_checkpoint/offsets/0",
+                    "tenants/t1/_checkpoint/writer.lock",
+                ],
+            ),
+        ] {
+            let store = memory();
+            let mut cp = Checkpoint::open_store(Arc::clone(&store), StorePath::parse(prefix).unwrap())
+                .await
+                .unwrap();
+            cp.recover().await.unwrap();
+            cp.write_immutable("batches/0.json", b"{}").await.unwrap();
+            cp.prepare(0, &json!(1), 1).await.unwrap();
+            cp.commit(0).await.unwrap();
+            let mut keys: Vec<StorePath> = store
+                .list(None)
+                .map(|meta| meta.unwrap().location)
+                .collect::<Vec<_>>()
+                .await;
+            keys.sort();
+            let expected: Vec<StorePath> = expected.iter().map(|k| StorePath::parse(k).unwrap()).collect();
+            assert_eq!(keys, expected);
+            assert!(keys.iter().all(|k| !k.as_ref().contains("%2F")), "{keys:?}");
+            assert_eq!(cp.read_immutable("batches/0.json").await.unwrap(), Some(b"{}".to_vec()));
+            assert_eq!(cp.recover().await.unwrap().batch_id, 1);
+            let offset = StorePath::parse(format!("{prefix}/offsets/0")).unwrap();
+            assert_eq!(
+                store_read(store.as_ref(), &offset, MAX_DOCUMENT_BYTES)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                b"v1\n{\"batchWatermarkMs\":0,\"batchTimestampMs\":1,\"conf\":{}}\n1".to_vec()
+            );
+        }
     }
 
     #[tokio::test]

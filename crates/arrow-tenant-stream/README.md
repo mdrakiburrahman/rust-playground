@@ -39,6 +39,10 @@ Consumed batches with no matching rows still publish a transaction-only
 progress record, not an empty Add file. An idle poll creates neither an offset
 nor a sink commit. `tenant_stream_txn_only_batches_total` distinguishes necessary
 stream progress from maintenance no-ops.
+Failed or deduplicated writes may leave staged files that never entered the
+Delta log. VACUUM LITE only discovers log-backed candidates, not these orphans.
+They require separate operator reconciliation after writers are quiescent;
+this service does not silently substitute directory-listing cleanup.
 
 Local checkpoint ownership is a lifetime nonblocking filesystem lock. Local
 immutable publication uses a synchronized temporary file, an atomic
@@ -54,6 +58,10 @@ mutation. A failed authority check permanently fences that handle; it must
 not release a lock through a stale generation. Bounded-auth and live reset
 qualification remain required; pre/post checks alone do not prove that a
 blocked credential provider cannot publish a late write.
+Destructive cloud reset must stay disabled until target and checkpoint
+mutators share the once-per-process publication admission/drain protocol.
+Neither a local container stop nor a fixed grace period proves distributed
+quiescence; crashed, suspended, or uncertain mutators must block reset.
 
 ## Spark checkpoint wire format
 
@@ -95,7 +103,10 @@ checkpoints cannot be placed inside either vacuumable table root.
 
 `--once` drains currently available work until the first idle poll. Stop an
 indefinitely active producer first if a finite drain is required. SIGINT and
-SIGTERM stop processing and release checkpoint ownership cleanly.
+SIGTERM drain the current microbatch before releasing checkpoint ownership.
+Shutdown latency depends on that work and its storage requests; forced
+termination still requires crash recovery. An ambiguous/error outcome is
+not reported as a clean drain.
 
 Cloud source/target/checkpoint roots use storage URLs and environment/identity
 configuration, not credentials on the command line. The Debian bookworm
@@ -103,6 +114,10 @@ runtime installs `azure-cli=2.91.0-1~bookworm` through Microsoft's signed
 package repository. A deployment must still provide the approved runtime
 identity configuration; installing the CLI does not authenticate it or share
 a developer host's login. Never copy a token cache or `.env` into the image.
+The image has an empty, writable UID-10001 CLI directory at
+`/var/lib/tenant-stream-azure`, outside the data directory. Deployments should
+mount their isolated runtime CLI configuration there or override
+`AZURE_CONFIG_DIR`; the intentionally nonexistent home directory is not writable.
 
 After a cloud crash, stop every old writer for the checkpoint and only then
 restart with both `--recover-stale-checkpoint-lock` and
@@ -110,8 +125,16 @@ restart with both `--recover-stale-checkpoint-lock` and
 they do not prove that the old writer stopped. They are rejected for local
 locks, which the operating system releases on process exit.
 
-The service image builds from the workspace root with
-`docker build -f crates/arrow-tenant-stream/Dockerfile .`, runs as UID 10001,
+Build and load the development image with `npx nx run arrow-tenant-stream:image`.
+`npx nx run arrow-tenant-stream:image-smoke` also checks the runtime identity,
+empty writable private CLI directory, pinned CLI version, and healthcheck.
+The `image:ci-verify` configuration adds the standard GHA caches without
+changing the development tag. The `publish` target requires a clean worktree,
+pushes the namespaced branch and immutable SHA tags, and stamps `VCS_REF`;
+`publish:main` additionally updates `latest`. Build manifests use
+`target/images/arrow-tenant-stream-{load,publish}.txt`.
+
+The service image builds from the workspace root, runs as UID 10001,
 uses `/var/lib/tenant-stream`, and exposes port 9094. `/metrics` publishes
 snapshot/tail batches, prepared offsets, sink/checkpoint commits, transaction
 replay, transaction-only progress, idle/failure counts, bootstrap file backlog,
@@ -141,8 +164,10 @@ of all network traffic. Planning, listing, explicit source-file HEAD checks,
 and authentication traffic are not fully represented by that counter.
 File-range pruning counters are labeled as ranges, not whole files.
 
-The seeded fixture has 65,536 interleaved rows, 16 customers, and 1,024-row
-groups. A recorded devcontainer execution returned the same 4,096 customer
+The sorted fixture uses the actual Delta publication API and a Kernel-captured
+snapshot; the unsorted control is independently encoded. It has 65,536
+interleaved rows, 16 customers, and 1,024-row groups. A recorded devcontainer
+execution returned the same 4,096 customer
 rows for both predicate layouts:
 
 | Scan | Rows returned | DataFusion bytes scanned | Row groups pruned by statistics | File ranges pruned |
