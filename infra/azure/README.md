@@ -111,7 +111,7 @@ activation conditions enables the currently disabled reset command.
 
 `publisher_control.PublisherControl` implements the internal Python transitions;
 it is deliberately not exposed as reset execution or protocol activation.
-The exact enforced states are `ready-v1` and `fenced-v1`. Legacy literal
+The exact enforced states are `ready-v1`, `fenced-v1` and `cleaning-v1`. Legacy literal
 `ready`/`fenced` states are rejected by this implementation; old reset-aware
 clients reject the new literals. Registry headers are
 `publisherregistryversion=1` and compact JSON `publishers`, a map of canonical
@@ -127,14 +127,27 @@ Fencing preserves the generation and member set so existing members can clean
 drain; new admission is blocked. Rotation requires the same fenced generation,
 released test occupancy and an explicitly empty registry.
 
-Bootstrap/operator admission requires `fenced-v1`, released occupancy and an
-empty registry. Only its exclusive active member can complete bootstrap after
-definitive physical drain; removing that member and setting `ready-v1` happen in
-one CAS. There is no destructor release, expiry, force clear, or automatic retry.
-An uncertain member cannot clean-release even if logical transactions reconcile.
-Unknown CAS responses return `UnknownTransition`; retain the publisher identity
-and reconcile authority read-only rather than claim success.
+Cleanup authority is persistent, not a snapshot. `drained()` is only a
+read-only diagnostic; an empty fenced registry plus ETag is never deletion
+authority. `claim_cleanup` takes `fenced-v1`, released occupancy and an empty
+registry, then in one CAS sets `cleaning-v1` with the cleanup operator as the
+sole member. Deletion starts only after that definite success and each step can
+re-verify with `cleanup_operator`. While `cleaning-v1` holds, normal and
+bootstrap admission, fencing, competing cleanup claims and member release are
+rejected. `finish_cleanup` requires definitive deletion completion and, in one
+CAS, removes the operator, rotates to a fresh generation and returns to
+`fenced-v1` with an empty registry.
 
+Bootstrap admission requires `fenced-v1`, released occupancy and an empty
+registry; its registration makes the registry non-empty, so a later cleanup claim
+fails. Cleanup and bootstrap claims therefore serialize through one container
+ETag and cannot both mutate. Only the exclusive bootstrap member can complete
+after definitive physical drain; removing it and setting `ready-v1` happen in
+one CAS. There is no destructor release, expiry, force clear, or automatic retry.
+An uncertain member or operator cannot release even if logical transactions
+reconcile. Unknown CAS responses return `UnknownTransition`; retain the
+identity and reconcile authority read-only rather than claim success or adopt a
+possibly applied registration.
 These are usable control-plane helpers and deterministic race/unknown-response
 tests, not activation of all Rust mutation surfaces. Existing checkpoint
 containers are excluded from Bicep metadata writes on redeployment. The public

@@ -4,7 +4,7 @@ import uuid
 from unittest.mock import patch
 
 from bootstrap import Failure
-from publisher_control import FENCED, READY, PublisherControl, UnknownTransition
+from publisher_control import CLEANING, FENCED, READY, PublisherControl, UnknownTransition
 from test_bootstrap import FakeAzure
 
 
@@ -57,7 +57,7 @@ class PublisherControlTests(unittest.TestCase):
         with self.assertRaises(Failure):
             self.control.clean_release(self.publisher, self.generation, definitively_drained=True)
         with self.assertRaises(Failure):
-            self.control.rotate_drained(self.generation, str(uuid.uuid4()))
+            self.control.claim_cleanup(str(uuid.uuid4()), self.generation)
         self.assertEqual(self.registry()[self.publisher]["state"], "uncertain")
 
     def test_suspended_or_crashed_registration_does_not_expire(self):
@@ -70,8 +70,9 @@ class PublisherControlTests(unittest.TestCase):
 
     def test_exclusive_bootstrap_releases_and_sets_ready_in_single_cas(self):
         self.control.fence(self.generation)
-        fresh = str(uuid.uuid4())
-        self.control.rotate_drained(self.generation, fresh)
+        fresh, cleaner = str(uuid.uuid4()), str(uuid.uuid4())
+        self.control.claim_cleanup(cleaner, self.generation)
+        self.control.finish_cleanup(cleaner, self.generation, fresh, definitively_cleaned=True)
         self.control.admit(self.publisher, fresh, bootstrap=True)
         with self.assertRaises(Failure):
             self.control.admit(str(uuid.uuid4()), fresh, bootstrap=True)
@@ -156,15 +157,140 @@ class PublisherControlTests(unittest.TestCase):
         with self.assertRaises(Failure):
             self.control.admit(self.publisher, self.generation, bootstrap=True)
 
-    def test_generation_rotation_requires_empty_same_generation_fenced_registry(self):
+    def test_generation_rotation_requires_held_cleanup_and_fresh_uuid(self):
+        cleaner = str(uuid.uuid4())
         with self.assertRaises(Failure):
-            self.control.rotate_drained(self.generation, str(uuid.uuid4()))
+            self.control.claim_cleanup(cleaner, self.generation)
         self.control.fence(self.generation)
         with self.assertRaises(Failure):
-            self.control.rotate_drained(str(uuid.uuid4()), str(uuid.uuid4()))
+            self.control.claim_cleanup(cleaner, str(uuid.uuid4()))
+        self.control.claim_cleanup(cleaner, self.generation)
         with self.assertRaises(Failure):
-            self.control.rotate_drained(self.generation, self.generation)
+            self.control.finish_cleanup(cleaner, self.generation, self.generation,
+                                        definitively_cleaned=True)
+        with self.assertRaises(Failure):
+            self.control.finish_cleanup(cleaner, self.generation, str(uuid.uuid4()),
+                                        definitively_cleaned=False)
+        with self.assertRaises(Failure):
+            self.control.finish_cleanup(str(uuid.uuid4()), self.generation, str(uuid.uuid4()),
+                                        definitively_cleaned=True)
+        self.assertEqual(self.azure.metadata["resetstate"], CLEANING)
 
+    def test_drain_snapshot_then_bootstrap_admission_defeats_later_cleanup_claim(self):
+        cleaner = str(uuid.uuid4())
+        self.control.fence(self.generation)
+        self.control.drained(self.generation)  # snapshot only, not authority
+        self.control.admit(self.publisher, self.generation, bootstrap=True)
+        with self.assertRaises(Failure):
+            self.control.claim_cleanup(cleaner, self.generation)
+        with self.assertRaises(Failure):
+            self.control.cleanup_operator(cleaner, self.generation)
+        self.assertEqual(set(self.registry()), {self.publisher})
+        self.assertEqual(self.azure.metadata["resetstate"], FENCED)
+
+    def test_cleanup_claim_blocks_bootstrap_admission_through_all_deletion(self):
+        cleaner = str(uuid.uuid4())
+        self.control.fence(self.generation)
+        self.control.claim_cleanup(cleaner, self.generation)
+        for _ in range(3):  # each deletion step re-verifies held authority
+            self.control.cleanup_operator(cleaner, self.generation)
+            for attempt in (lambda: self.control.admit(str(uuid.uuid4()), self.generation, bootstrap=True),
+                            lambda: self.control.admit(str(uuid.uuid4()), self.generation),
+                            lambda: self.control.claim_cleanup(str(uuid.uuid4()), self.generation),
+                            lambda: self.control.fence(self.generation),
+                            lambda: self.control.complete_bootstrap(cleaner, self.generation,
+                                                                    definitively_drained=True),
+                            lambda: self.control.clean_release(cleaner, self.generation,
+                                                               definitively_drained=True)):
+                with self.assertRaises(Failure):
+                    attempt()
+        self.assertEqual(set(self.registry()), {cleaner})
+        self.assertEqual(self.azure.metadata["resetstate"], CLEANING)
+
+    def test_concurrent_bootstrap_and_cleanup_claims_cannot_both_win(self):
+        cleaner = str(uuid.uuid4())
+        self.control.fence(self.generation)
+        original = self.azure.set_control
+        competitor = PublisherControl(self.azure)
+        def bootstrap_wins_first(metadata, etag):
+            with patch.object(self.azure, "set_control", side_effect=original):
+                competitor.admit(self.publisher, self.generation, bootstrap=True)
+            original(metadata, etag)
+        with patch.object(self.azure, "set_control", side_effect=bootstrap_wins_first):
+            with self.assertRaises(UnknownTransition):
+                self.control.claim_cleanup(cleaner, self.generation)
+        self.assertEqual(set(self.registry()), {self.publisher})
+        self.assertEqual(self.azure.metadata["resetstate"], FENCED)
+        with self.assertRaises(Failure):
+            self.control.cleanup_operator(cleaner, self.generation)
+
+    def test_concurrent_cleanup_claim_defeats_bootstrap_admission(self):
+        cleaner = str(uuid.uuid4())
+        self.control.fence(self.generation)
+        original = self.azure.set_control
+        competitor = PublisherControl(self.azure)
+        def cleanup_wins_first(metadata, etag):
+            with patch.object(self.azure, "set_control", side_effect=original):
+                competitor.claim_cleanup(cleaner, self.generation)
+            original(metadata, etag)
+        with patch.object(self.azure, "set_control", side_effect=cleanup_wins_first):
+            with self.assertRaises(UnknownTransition):
+                self.control.admit(self.publisher, self.generation, bootstrap=True)
+        self.assertEqual(set(self.registry()), {cleaner})
+        self.assertEqual(self.azure.metadata["resetstate"], CLEANING)
+
+    def test_finish_cleanup_then_bootstrap_then_cleanup_ordering(self):
+        cleaner, fresh = str(uuid.uuid4()), str(uuid.uuid4())
+        self.control.fence(self.generation)
+        self.control.claim_cleanup(cleaner, self.generation)
+        with self.assertRaises(Failure):  # old generation cannot bootstrap during cleanup
+            self.control.admit(self.publisher, self.generation, bootstrap=True)
+        self.control.finish_cleanup(cleaner, self.generation, fresh, definitively_cleaned=True)
+        self.assertEqual((self.azure.metadata["resetstate"], self.registry()), (FENCED, {}))
+        with self.assertRaises(Failure):  # stale generation admission rejected
+            self.control.admit(self.publisher, self.generation, bootstrap=True)
+        self.control.admit(self.publisher, fresh, bootstrap=True)
+        with self.assertRaises(Failure):
+            self.control.claim_cleanup(str(uuid.uuid4()), fresh)
+        with self.assertRaises(Failure):
+            self.control.cleanup_operator(cleaner, fresh)
+
+    def test_unknown_cleanup_claim_is_never_adopted_and_blocks_bootstrap(self):
+        cleaner = str(uuid.uuid4())
+        self.control.fence(self.generation)
+        original = self.azure.set_control
+        def applied_then_lost(metadata, etag):
+            original(metadata, etag)
+            raise Failure("response lost")
+        with patch.object(self.azure, "set_control", side_effect=applied_then_lost):
+            with self.assertRaises(UnknownTransition):
+                self.control.claim_cleanup(cleaner, self.generation)
+        with self.assertRaises(Failure):
+            self.control.claim_cleanup(cleaner, self.generation)
+        with self.assertRaises(Failure):
+            self.control.admit(self.publisher, self.generation, bootstrap=True)
+        self.assertEqual(self.azure.metadata["resetstate"], CLEANING)
+
+    def test_unknown_finish_cleanup_does_not_report_bootstrap_eligibility(self):
+        cleaner = str(uuid.uuid4())
+        self.control.fence(self.generation)
+        self.control.claim_cleanup(cleaner, self.generation)
+        with patch.object(self.azure, "set_control", side_effect=Failure("timeout")):
+            with self.assertRaises(UnknownTransition):
+                self.control.finish_cleanup(cleaner, self.generation, str(uuid.uuid4()),
+                                            definitively_cleaned=True)
+        self.assertEqual(self.azure.metadata["resetstate"], CLEANING)
+        self.assertEqual(set(self.registry()), {cleaner})
+
+    def test_uncertain_cleanup_operator_never_releases(self):
+        cleaner = str(uuid.uuid4())
+        self.control.fence(self.generation)
+        self.control.claim_cleanup(cleaner, self.generation)
+        self.control.uncertain(cleaner, self.generation)
+        with self.assertRaises(Failure):
+            self.control.finish_cleanup(cleaner, self.generation, str(uuid.uuid4()),
+                                        definitively_cleaned=True)
+        self.assertEqual(self.registry()[cleaner]["state"], "uncertain")
     def test_cas_unknown_on_bootstrap_completion_does_not_report_success(self):
         self.control.fence(self.generation)
         self.control.admit(self.publisher, self.generation, bootstrap=True)

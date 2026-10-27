@@ -7,6 +7,10 @@ from bootstrap import Failure, publisher_registry, require_released
 
 READY = "ready-v1"
 FENCED = "fenced-v1"
+# Exclusive cleanup phase. Its claim CAS leaves fenced-v1 and bootstrap admission
+# makes the fenced registry non-empty, so cleanup and bootstrap serialize by ETag.
+CLEANING = "cleaning-v1"
+STATES = (READY, FENCED, CLEANING)
 MAX_METADATA_BYTES = 8192
 
 
@@ -49,8 +53,8 @@ class PublisherControl:
                     if key.startswith("x-ms-meta-")}
         if metadata.get("sandboxid") != self.azure.c.sandbox:
             raise Failure("Publisher authority sandbox ownership mismatch.")
-        if metadata.get("resetstate") not in (READY, FENCED):
-            raise Failure("Publisher authority requires versioned ready-v1/fenced-v1 state.")
+        if metadata.get("resetstate") not in STATES:
+            raise Failure("Publisher authority requires a known versioned v1 state.")
         canonical_uuid(metadata.get("resetgeneration"))
         registry = publisher_registry(metadata)
         if any(entry["generation"] != metadata["resetgeneration"]
@@ -76,13 +80,13 @@ class PublisherControl:
         return metadata
 
     def admit(self, publisher, generation, bootstrap=False):
+        """Normal admission needs ready-v1; bootstrap needs fenced-v1+empty+released."""
         publisher, generation = canonical_uuid(publisher), canonical_uuid(generation)
         metadata, registry, etag = self.read()
         if metadata["resetgeneration"] != generation:
             raise Failure("Admission generation changed.")
-        expected = FENCED if bootstrap else READY
-        if metadata["resetstate"] != expected:
-            raise Failure("Publisher admission is fenced or has incompatible authority.")
+        if metadata["resetstate"] != (FENCED if bootstrap else READY):
+            raise Failure("Publisher admission is fenced, cleanup-owned or incompatible.")
         if bootstrap:
             require_released(metadata)
             if registry:
@@ -98,6 +102,8 @@ class PublisherControl:
         require_released(metadata)
         if metadata["resetgeneration"] != generation:
             raise Failure("Cannot fence a different generation.")
+        if metadata["resetstate"] not in (READY, FENCED):
+            raise Failure("Cannot fence while cleanup owns authority.")
         metadata["resetstate"] = FENCED
         # Preserve member generation: admitted publishers may still clean-drain.
         return self.cas(metadata, registry, etag)
@@ -116,6 +122,8 @@ class PublisherControl:
 
     def clean_release(self, publisher, generation, *, definitively_drained):
         publisher, metadata, registry, etag = self.member(publisher, generation)
+        if metadata["resetstate"] == CLEANING:
+            raise Failure("The cleanup operator leaves only through finish_cleanup.")
         if definitively_drained is not True:
             raise Failure("Clean release requires definitive completion of every physical request.")
         if registry[publisher]["state"] != "active":
@@ -124,6 +132,7 @@ class PublisherControl:
         return self.cas(metadata, registry, etag)
 
     def drained(self, generation):
+        """Read-only diagnostic snapshot. Never cleanup authority by itself."""
         metadata, registry, etag = self.read()
         if metadata["resetstate"] != FENCED or metadata["resetgeneration"] != generation:
             raise Failure("Drain proof requires the same fenced authority generation.")
@@ -132,12 +141,35 @@ class PublisherControl:
         require_released(metadata)
         return metadata, etag
 
-    def rotate_drained(self, generation, new_generation):
-        canonical_uuid(new_generation)
+    def claim_cleanup(self, operator, generation):
+        """Take persistent exclusive cleanup authority from fenced-v1+empty in one CAS.
+
+        Deletion may begin only after this returns a definitive success. The state
+        stays cleaning-v1 with the operator registered until finish_cleanup.
+        """
+        operator, generation = canonical_uuid(operator), canonical_uuid(generation)
         metadata, etag = self.drained(generation)
+        metadata["resetstate"] = CLEANING
+        return self.cas(metadata, {operator: {"generation": generation, "state": "active"}}, etag)
+
+    def cleanup_operator(self, operator, generation):
+        operator, metadata, registry, etag = self.member(operator, generation)
+        require_released(metadata)
+        if (metadata["resetstate"] != CLEANING or set(registry) != {operator} or
+                registry[operator]["state"] != "active"):
+            raise Failure("Caller does not hold exclusive definite cleanup authority.")
+        return operator, metadata, etag
+
+    def finish_cleanup(self, operator, generation, new_generation, *, definitively_cleaned):
+        """Release cleanup and rotate to fenced-v1+empty in one CAS; enables bootstrap."""
+        canonical_uuid(new_generation)
+        operator, metadata, etag = self.cleanup_operator(operator, generation)
+        if definitively_cleaned is not True:
+            raise Failure("Cleanup release requires definitive completion of every deletion.")
         if new_generation == generation:
             raise Failure("Generation rotation requires a fresh UUID.")
         metadata["resetgeneration"] = new_generation
+        metadata["resetstate"] = FENCED
         return self.cas(metadata, {}, etag)
 
     def complete_bootstrap(self, publisher, generation, *, definitively_drained):
