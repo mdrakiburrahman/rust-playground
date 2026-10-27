@@ -1,0 +1,39 @@
+{
+  "renderer": "Playwright Chromium",
+  "browserVersion": "156.0.8078.4",
+  "deviceScaleFactor": 1,
+  "snapshots": [
+    {
+      "source": "loadtest-architecture.html",
+      "png": "loadtest-architecture.png",
+      "title": "ArrowCol lakehouse loadtest architecture",
+      "viewportWidth": 1500,
+      "sourceSha256": "09228a698a16ae3e2d691ff314b7c3a3d92b5e533c0c753cf523e0677afa7d25",
+      "pngSha256": "39e4a37c927aea7a629d77a5529f8a0c845e7de5f45a545c6cfb5ea49c75c1ac"
+    },
+    {
+      "source": "docs/architecture/loadtest/arrow-load-generator.html",
+      "png": "docs/architecture/loadtest/arrow-load-generator.png",
+      "title": "Arrow load generator | One batch. Two collector paths.",
+      "viewportWidth": 1360,
+      "sourceSha256": "db8753a133ac6bc7152d2ca0b8275c5b6fdbb343427dcf38448591eefcca6000",
+      "pngSha256": "e9b8d2281c6d49ccc3f481f50b331cc924564ab5caca1dcac809a10814f624fa"
+    },
+    {
+      "source": "docs/architecture/arrowcol-platform/diagrams/platform.html",
+      "png": "docs/architecture/arrowcol-platform/diagrams/platform.png",
+      "title": "Arrowcol | Shared control. Two delivery paths.",
+      "viewportWidth": 1360,
+      "sourceSha256": "7547b6921645c7e50dff04085d9c55e1350b4860218401a45c76059232fb5c09",
+      "pngSha256": "d96fd0e0088542e85691626f065aa3e680aba75f0cb69568ccaa791c99ce7ab8"
+    },
+    {
+      "source": "docs/architecture/arrowcol-platform/diagrams/delivery.html",
+      "png": "docs/architecture/arrowcol-platform/diagrams/delivery.png",
+      "title": "Arrowcol | Receipt first. Purge after publication.",
+      "viewportWidth": 1360,
+      "sourceSha256": "6c04a3099a20bc69dc6d7bc9a1a53a691ec50f3167e8372761bcd3b1974c8fad",
+      "pngSha256": "dc2e91857c8eecb269fc20087909174ddb0b30a27e92ca271c0d0ab74762b450"
+    }
+  ]
+}

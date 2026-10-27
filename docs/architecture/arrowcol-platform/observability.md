@@ -14,6 +14,11 @@ state. Receipt IDs and lease UUIDs are **not** metric labels.
 | SQL collectors/tables | Pressure, snapshot age, routing owner, lease age, time to expiry |
 | Native Quiver (Direct) | `arrowcol_direct_quiver_*`: disk used/capacity, backlog, persisted/published/rejected/deferred batches, batches recovered and receipts adopted after a restart, backpressure waits |
 | Native Quiver (DFE) | `arrowcol_dataflow_durable_*` backlog and admitted/released/failed batches; `arrowcol_dataflow_{replayed,rebound}_batches_total` and `arrowcol_dataflow_replay_deferred_total` after a restart |
+| Delta publication | Version collisions, safe retries, exhaustion, publication outcomes, and file/row/byte changes |
+| Standalone maintenance | Plans, applies, no-ops, stale plans, retention decisions, and rewritten/deleted files |
+| Tenant stream | Source cursor, lag/backlog, checkpoint and sink commits, replay, and scan/skipping observations |
+| Local Kusto bridge | Committed source version, active generation, refresh status, visibility lag, and explicit degradation |
+| Azure QAP evidence | Policy/state, accelerated bytes, capacity, query correctness, and touched-file reacceleration |
 
 DFE advertises
 `arrowcol_delivery_guarantee_info{delivery_guarantee="best_effort",...}` with
@@ -32,6 +37,21 @@ The optional OTEL baseline is never mixed into arbitrary-Arrow receipt/delivery
 panels. For finite/continuous runs, retained results, Grafana access, validation,
 and chaos commands, use the [load generator guide](../loadtest/README.md).
 
+## Evidence boundaries
+
+Dashboard definitions alone are not evidence of live service instrumentation.
+Qualification must record actual exported series and Grafana/query results
+against the tested source revision. Keep tenant IDs, file paths, receipt IDs,
+publication IDs, and checkpoint UUIDs out of metric labels.
+
+Local Kusto is a functional integration surface, not a performance benchmark.
+Its bridge status is separate from Direct receipt publication. Azure QAP stress
+must preserve sanitized policy/state/query observations and distinguish expected
+reacceleration of rewritten files from an unhealthy catalog, full reset, or
+uncached fallback. A skipped credential-gated cloud check is not a cloud pass.
+Use the [loadtest CLI guide](../../../projects/loadtest/README.md) for current
+mode selection and evidence locations, and the
+[root diagram](../../../loadtest-architecture.html) for the full signal path.
 Sources: [direct metrics](../../../projects/arrowcol-rust/src/metrics.rs),
 [DFE metrics/capabilities](../../../crates/arrowcol-dataflow-components/src/metrics.rs),
 [router metrics](../../../projects/arrowcol-router-rust/src/metrics.rs).

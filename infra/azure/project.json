@@ -1,0 +1,37 @@
+{
+  "name": "azure-infra",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "application",
+  "targets": {
+    "test": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "python3 -m unittest discover -s infra/azure -p 'test_*.py'",
+        "cwd": "{workspaceRoot}"
+      }
+    },
+    "verify": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "bash infra/azure/verify.sh",
+        "cwd": "{workspaceRoot}"
+      }
+    },
+    "provision": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "python3 infra/azure/bootstrap.py provision",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": true
+      }
+    },
+    "reset": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "python3 infra/azure/bootstrap.py reset",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": true
+      }
+    }
+  }
+}

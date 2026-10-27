@@ -443,6 +443,7 @@ impl RuntimeMetrics {
         rows: u64,
         bytes: u64,
         delta_version: Option<u64>,
+        files: u64,
     ) {
         saturating_sub_atomic(&self.pending_commits, 1);
         self.update_table(table, |state| {
@@ -454,7 +455,7 @@ impl RuntimeMetrics {
             }
         });
         if delta_version.is_some() {
-            self.delta_files.fetch_add(1, Ordering::Relaxed);
+            self.delta_files.fetch_add(files, Ordering::Relaxed);
             self.delta_rows.fetch_add(rows, Ordering::Relaxed);
             self.delta_bytes.fetch_add(bytes, Ordering::Relaxed);
         } else {

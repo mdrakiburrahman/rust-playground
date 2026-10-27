@@ -80,6 +80,16 @@
         }
       }
     },
+    "image-smoke": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["image"],
+      "options": {
+        "command": "bash projects/kusto-bridge/scripts/image-smoke.sh",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      }
+    },
     "publish": {
       "executor": "rust-playground-build:docker-build",
       "cache": false,

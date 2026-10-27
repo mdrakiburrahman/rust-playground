@@ -107,7 +107,7 @@ async fn identical_batches_receive_distinct_results_and_publish_together() -> Re
     let after = fixture.receipts.receipts(&ids).await?;
     assert!(after.iter().flatten().all(ReceiptRecord::can_client_purge));
     let groups = fixture.receipts.publication_groups().await;
-    assert_eq!(groups, vec![ids]);
+    assert_eq!(groups, ids.into_iter().map(|id| vec![id]).collect::<Vec<_>>());
     fixture.shutdown().await?;
     Ok(())
 }
@@ -262,19 +262,30 @@ async fn production_delta_sink_is_visible_to_a_parquet_reader() -> Result<()> {
         Arc::clone(&leases),
         arrowcol_rust::metrics::CollectorMetrics::new()?,
     );
-    let mut session = sink
-        .begin(PublicationContext {
-            table: identity.clone(),
-            schema_version: current.version(),
-            schema_fingerprint: current.fingerprint(),
-            arrow_schema: Arc::clone(&schema),
-            fence: lease.publication_fence(),
-            flush_reason: FlushReason::ExplicitDrain,
-        })
-        .await?;
+    let context = PublicationContext {
+        receipt_id: ReceiptId::new(),
+        ingested_at_ms: now()?,
+        table: identity.clone(),
+        schema_version: current.version(),
+        schema_fingerprint: current.fingerprint(),
+        arrow_schema: Arc::clone(&schema),
+        fence: lease.publication_fence(),
+        flush_reason: FlushReason::ExplicitDrain,
+    };
+    let mut session = sink.begin(context.clone()).await?;
     session.write(&batch).await?;
     let outcome = session.finish().await?;
     assert_eq!(outcome.publication.rows_published().get(), 2);
+    // A replay of this publication is skipped, but a separate submission of
+    // the same rows must retain its independent receipt identity.
+    let mut replay = sink.begin(context.clone()).await?;
+    replay.write(&batch).await?;
+    replay.finish().await?;
+    let mut independent = context;
+    independent.receipt_id = ReceiptId::new();
+    let mut duplicate_payload = sink.begin(independent).await?;
+    duplicate_payload.write(&batch).await?;
+    duplicate_payload.finish().await?;
 
     let table_root = sink.table_path(&identity);
     let mut logs = std::fs::read_dir(table_root.join("_delta_log"))?
@@ -284,6 +295,7 @@ async fn production_delta_sink_is_visible_to_a_parquet_reader() -> Result<()> {
         .collect::<Vec<_>>();
     logs.sort();
     let mut data_path = None;
+    let mut published_files = 0;
     for log in logs {
         for line in std::fs::read_to_string(log)?.lines() {
             let value: serde_json::Value = serde_json::from_str(line)?;
@@ -292,10 +304,15 @@ async fn production_delta_sink_is_visible_to_a_parquet_reader() -> Result<()> {
                 .and_then(|add| add.get("path"))
                 .and_then(serde_json::Value::as_str)
             {
+                published_files += 1;
                 data_path = Some(table_root.join(path));
             }
         }
     }
+    assert_eq!(
+        published_files, 2,
+        "one replay was deduplicated; independent equal payload was retained"
+    );
     let file = std::fs::File::open(data_path.context("Delta log contained no add action")?)?;
     let rows = ParquetRecordBatchReaderBuilder::try_new(file)?
         .build()?
@@ -367,6 +384,8 @@ async fn lost_ownership_fences_delta_before_visibility() -> Result<()> {
     );
     let mut session = sink
         .begin(PublicationContext {
+            receipt_id: ReceiptId::new(),
+            ingested_at_ms: now()?,
             table: identity,
             schema_version: current.version(),
             schema_fingerprint: current.fingerprint(),

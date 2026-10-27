@@ -16,7 +16,7 @@ use arrow::array::RecordBatch;
 use arrowcol_catalog::SchemaVersion;
 use arrowcol_protocol::{
     CollectorInstanceId, ErrorCode, ErrorStatus, FencingToken, LeaseId, ReceiptId, ReceiptState, SchemaFingerprint,
-    TableIdentity, TableLease,
+    TableIdentity, TableLease, UnixMillis,
 };
 use arrowcol_receipts::{
     AdoptionCandidate, FailureDisposition, ReceiptAdoption, ReceiptFailure, ReceiptRecord, ReceiptStore,
@@ -195,6 +195,10 @@ pub struct DeliveryManifest {
     pub version: u16,
     /// Server receipt of the delivery.
     pub receipt_id: ReceiptId,
+    /// Original UTC admission time. Legacy manifests recover it from the
+    /// receipt's immutable creation time, never from the replay clock.
+    #[serde(default)]
+    pub ingested_at_ms: Option<UnixMillis>,
     /// Receipt revision when the delivery was persisted.
     pub receipt_revision: u64,
     /// Collector that owned the receipt.
@@ -752,6 +756,9 @@ impl QuiverStage {
         batch: RecordBatch,
     ) -> Result<DeliveryCompletion, String> {
         let lease = self.leases.current_lease(manifest.table_id, &manifest.table).await?;
+        let ingested_at_ms = manifest
+            .ingested_at_ms
+            .ok_or("legacy manifest requires receipt timestamp")?;
         if lease.lease_id() != manifest.lease_id || Some(lease.fencing_token()) != manifest.fencing_token() {
             return Err("table lease changed after persistence".to_owned());
         }
@@ -762,7 +769,7 @@ impl QuiverStage {
             batches: vec![batch],
         };
         self.buffer
-            .admit_tracked(admission, TrackedState::Accepted)
+            .admit_tracked_at(admission, TrackedState::Accepted, ingested_at_ms)
             .await
             .map(|(_, completion)| completion)
             .map_err(|error| error.message().to_owned())
@@ -791,6 +798,7 @@ impl QuiverStage {
             ReceiptState::Buffered => TrackedState::Buffered,
             ReceiptState::Publishing => TrackedState::Flushing,
         };
+        let ingested_at_ms = manifest.ingested_at_ms.unwrap_or(record.created_at_unix_ms);
         let lease = self
             .leases
             .current_lease(manifest.table_id, &manifest.table)
@@ -810,7 +818,7 @@ impl QuiverStage {
             lease,
             batches: vec![batch],
         };
-        match self.buffer.admit_tracked(admission, state).await {
+        match self.buffer.admit_tracked_at(admission, state, ingested_at_ms).await {
             Ok((_, completion)) => Ok(completion),
             Err(error) if error.kind() == BufferErrorKind::CapacityExceeded => {
                 self.fail_receipt(&record, "persisted delivery exceeds buffer capacity")
@@ -917,6 +925,7 @@ fn direct_bundle(request: PersistRequest<'_>) -> BufferResult<DeliveryBundle> {
         format: DELIVERY_MANIFEST_FORMAT.to_owned(),
         version: DELIVERY_MANIFEST_VERSION,
         receipt_id: receipt.receipt_id,
+        ingested_at_ms: Some(now_unix_millis()?),
         receipt_revision: receipt.revision,
         owner_instance_id: owner,
         lease_id: lease.lease_id(),
@@ -961,6 +970,7 @@ mod tests {
             format: DELIVERY_MANIFEST_FORMAT.to_owned(),
             version: DELIVERY_MANIFEST_VERSION,
             receipt_id: ReceiptId::new(),
+            ingested_at_ms: Some(UnixMillis::new(1_700_000_012_345)?),
             receipt_revision: 0,
             owner_instance_id: CollectorInstanceId::new(),
             lease_id: LeaseId::new(),
@@ -987,6 +997,19 @@ mod tests {
     fn delivery_manifest_round_trips_and_rejects_other_formats() -> TestResult {
         let manifest = manifest(2)?;
         assert_eq!(DeliveryManifest::decode(&manifest.encode()?)?, manifest);
+        assert_eq!(
+            DeliveryManifest::decode(&manifest.encode()?)?.ingested_at_ms,
+            Some(UnixMillis::new(1_700_000_012_345)?)
+        );
+        let mut legacy = serde_json::to_value(&manifest)?;
+        legacy
+            .as_object_mut()
+            .ok_or("manifest was not an object")?
+            .remove("ingested_at_ms");
+        assert_eq!(
+            DeliveryManifest::decode(&serde_json::to_vec(&legacy)?)?.ingested_at_ms,
+            None
+        );
         let mut other = manifest.clone();
         other.version = DELIVERY_MANIFEST_VERSION + 1;
         assert!(DeliveryManifest::decode(&other.encode()?).is_err());

@@ -36,11 +36,15 @@ type LocalEngine = DefaultEngine<SharedExecutor>;
 fn azure_store(url: &Url) -> Result<object_store::azure::MicrosoftAzure> {
     Ok(object_store::azure::MicrosoftAzureBuilder::from_env()
         .with_url(url.as_str())
-        .with_use_azure_cli(true)
+        .with_credentials(Arc::new(crate::azure_cli::BoundedAzureCli::default()))
         .with_retry(object_store::RetryConfig {
             max_retries: 2,
             retry_timeout: Duration::from_secs(10),
-            ..Default::default()
+            backoff: object_store::BackoffConfig {
+                init_backoff: Duration::from_millis(100),
+                max_backoff: Duration::from_millis(250),
+                base: 2.0,
+            },
         })
         .with_client_options(object_store::ClientOptions::new().with_timeout(Duration::from_secs(10)))
         .build()?)
@@ -805,6 +809,54 @@ struct LogFingerprint {
 
 pub(crate) struct DurableCommitter;
 
+struct GuardedCommitter {
+    authority: Option<Arc<crate::azure_fence::AzureResetFence>>,
+    bootstrap: bool,
+}
+
+impl Committer for GuardedCommitter {
+    fn commit(
+        &self,
+        engine: &dyn Engine,
+        actions: DeltaResultIterator<'_, FilteredEngineData>,
+        metadata: CommitMetadata,
+    ) -> DeltaResult<CommitResponse> {
+        let mut prepared = Vec::new();
+        let mut bytes = 0_usize;
+        for action in actions {
+            let batch = action?.apply_selection_vector()?.try_into_record_batch()?;
+            bytes = bytes
+                .checked_add(batch.get_array_memory_size())
+                .ok_or_else(|| delta_kernel::Error::generic("commit payload size overflow"))?;
+            if bytes > 8 * 1024 * 1024 {
+                return Err(delta_kernel::Error::generic(
+                    "commit action payload exceeds 8 MiB admission bound",
+                ));
+            }
+            prepared.push(Ok(FilteredEngineData::with_all_rows_selected(Box::new(
+                ArrowEngineData::new(batch),
+            ))));
+        }
+        if let Some(authority) = &self.authority {
+            let authority = Arc::clone(authority);
+            let bootstrap = self.bootstrap;
+            shared_executor()
+                .map_err(|error| delta_kernel::Error::generic(error.to_string()))?
+                .block_on(async move { authority.check_mode(bootstrap).await })
+                .map_err(|error| delta_kernel::Error::generic(error.to_string()))?;
+        }
+        DurableCommitter.commit(engine, Box::new(prepared.into_iter()), metadata)
+    }
+
+    fn is_catalog_committer(&self) -> bool {
+        false
+    }
+
+    fn publish(&self, engine: &dyn Engine, metadata: PublishMetadata) -> DeltaResult<()> {
+        DurableCommitter.publish(engine, metadata)
+    }
+}
+
 impl Committer for DurableCommitter {
     fn commit(
         &self,
@@ -856,6 +908,12 @@ fn committed<S>(result: CommitResult<S>) -> Result<u64> {
 }
 
 impl DeltaTable {
+    pub(crate) fn committer(&self) -> Box<dyn Committer> {
+        Box::new(GuardedCommitter {
+            authority: self.reset_fence.clone(),
+            bootstrap: self.bootstrap_only,
+        })
+    }
     /// Open a local or ADLS table without taking the collector's lifetime ownership lock.
     /// Atomic log creation coordinates independent processes; callers own their WAL fencing.
     ///
@@ -1006,6 +1064,7 @@ impl DeltaTable {
             .map(|batch| batch.and_then(|batch| batch.apply_selection_vector()))
             .collect::<DeltaResult<Vec<_>>>()?;
         let location = writer.checkpoint_path()?;
+        self.check_publication()?;
         self.engine
             .parquet_handler()
             .write_parquet_file(location.clone(), Box::new(data.into_iter().map(Ok)))?;
@@ -1083,6 +1142,7 @@ impl DeltaTable {
             .context("invalid staged path")?;
         let path = object_store::path::Path::from_url_path(self.staged_url(relative)?.path())?;
         let bytes = fs::read(&file.path)?;
+        self.check_publication()?;
         let store = Arc::clone(&self.store);
         shared_executor()?
             .block_on(async move { store.put_opts(&path, bytes.into(), PutMode::Create.into()).await })?;
@@ -1307,7 +1367,7 @@ impl DeltaTable {
                     self.partition_columns.clone(),
                 ));
             }
-            let transaction = builder.build(&self.engine, Box::new(DurableCommitter))?;
+            let transaction = builder.build(&self.engine, self.committer())?;
             match transaction.commit(&self.engine)? {
                 CommitResult::Committed(_) | CommitResult::Conflicted(_) => {}
                 CommitResult::Retryable(retry) => {
@@ -1354,7 +1414,7 @@ impl DeltaTable {
             for field in additions {
                 builder = builder.add_column(field);
             }
-            let transaction = builder.build(&self.engine, Box::new(DurableCommitter))?;
+            let transaction = builder.build(&self.engine, self.committer())?;
             committed(transaction.commit(&self.engine)?)?;
             return self.snapshot();
         }
@@ -1435,7 +1495,7 @@ impl DeltaTable {
     ) -> Result<DeltaFileWriter> {
         let snapshot = self.ensure_schema(normalize::schema(&input)?)?;
         let schema = Arc::new(snapshot.schema().as_ref().try_into_arrow()?);
-        let transaction = snapshot.transaction(Box::new(DurableCommitter), &self.engine)?;
+        let transaction = snapshot.transaction(self.committer(), &self.engine)?;
         let state = transaction.write_state()?;
         let mut builder = state.write_context_builder();
         if !values.is_empty() {
@@ -1501,12 +1561,14 @@ impl DeltaTable {
     }
 
     fn commit_files_inner(&self, files: &[StagedAppend], identity: Option<(&str, i64)>) -> Result<u64> {
+        let mut observation = crate::telemetry::PublicationObservation::start();
         let _guard = self
             .commit_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("Delta commit lock poisoned"))?;
         let started = Instant::now();
         for attempt in 0..8 {
+            observation.event("attempt");
             self.check_publication()?;
             let snapshot = self.snapshot()?;
             Self::validate_retention(&snapshot)?;
@@ -1517,6 +1579,7 @@ impl DeltaTable {
                     bail!("publication transaction fenced by newer application version");
                 }
                 if previous == version {
+                    observation.finish("deduplicated");
                     return Ok(snapshot.version());
                 }
             }
@@ -1545,13 +1608,14 @@ impl DeltaTable {
                 pending.push(append);
             }
             if pending.is_empty() && identity.is_none() {
+                observation.finish("deduplicated");
                 return Ok(snapshot.version());
             }
             let read_version = snapshot.version();
             let proposed_version = read_version.checked_add(1).context("Delta version overflow")?;
             let canonical: arrow::datatypes::Schema = snapshot.schema().as_ref().try_into_arrow()?;
             let mut transaction = snapshot
-                .transaction(Box::new(DurableCommitter), &self.engine)?
+                .transaction(self.committer(), &self.engine)?
                 .with_operation("INSERT".into())
                 .with_engine_info("arrow-deltalake")
                 .with_data_change(true);
@@ -1595,26 +1659,65 @@ impl DeltaTable {
                     })
                     .map_err(anyhow::Error::new)?;
             }
+            let identifiable = identity.is_some() || pending.iter().all(|append| append.publication.is_some());
+            let reconcile = || -> Result<Option<u64>> {
+                let latest = self
+                    .snapshot()
+                    .context("unknown publication outcome; reconciliation failed")?;
+                Self::validate_retention(&latest)?;
+                let mut ids = pending
+                    .iter()
+                    .filter_map(|append| append.publication.as_ref().map(|(id, version)| (id.as_str(), *version)))
+                    .collect::<Vec<_>>();
+                if let Some(id) = identity {
+                    ids.push(id);
+                }
+                for (id, version) in ids {
+                    match latest.get_app_id_version(id, &self.engine)? {
+                        Some(previous) if previous > version => {
+                            bail!("publication transaction fenced by newer application version")
+                        }
+                        Some(previous) if previous == version => {}
+                        _ => return Ok(None),
+                    }
+                }
+                Ok(Some(latest.version()))
+            };
             match transaction.commit(&self.engine) {
                 Ok(CommitResult::Committed(commit)) => {
                     sync_directory(&self.root)?;
+                    observation.finish("committed");
                     return Ok(commit.commit_version());
                 }
-                Ok(CommitResult::Conflicted(_)) => {}
+                Ok(CommitResult::Conflicted(_)) => observation.event("conflict"),
                 Ok(CommitResult::Retryable(retry)) => {
+                    observation.event("retryable_io");
                     // Refresh/check every stable identity on the next iteration BEFORE
                     // resubmission. If refresh fails, the uncertain outcome stays an error.
-                    if identity.is_none() && pending.iter().any(|append| append.publication.is_none()) {
+                    if !identifiable {
                         bail!("uncertain publication without retry identity: {}", retry.error);
                     }
+                    if let Some(version) = reconcile()? {
+                        observation.finish("reconciled");
+                        return Ok(version);
+                    }
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    // Kernel can surface post-publication I/O as Err, not only Retryable.
+                    // A proven transaction is success; an unreadable outcome stays an error.
+                    if identifiable && let Some(version) = reconcile()? {
+                        observation.finish("reconciled");
+                        return Ok(version);
+                    }
+                    return Err(error.into());
+                }
             }
             if started.elapsed() > Duration::from_secs(10) {
                 break;
             }
             collision_backoff(attempt);
         }
+        observation.finish("exhausted");
         bail!("Delta publication collision/retry budget exhausted (8 attempts / 10 seconds)")
     }
 }

@@ -72,7 +72,7 @@ pub enum TrackedState {
     /// The receipt is already `buffered` by the admitting owner.
     Buffered,
     /// The receipt is already `flushing`; its earlier publication outcome is
-    /// unknown, so the delivery is published again (at least once).
+    /// unknown, so publication is retried with the same stable transaction.
     Flushing,
 }
 
@@ -214,6 +214,7 @@ struct QueueContext {
 
 struct QueuedDelivery {
     receipt: ReceiptVersion,
+    ingested_at_ms: UnixMillis,
     batches: Vec<RecordBatch>,
     already_flushing: bool,
     completion: Option<oneshot::Sender<DeliveryOutcome>>,
@@ -328,7 +329,8 @@ impl BufferManager {
     ///
     /// Returns validation, capacity, receipt-store, poison, or shutdown errors.
     pub async fn admit(self: &Arc<Self>, admission: Admission) -> BufferResult<ReceiptRecord> {
-        self.admit_inner(admission, TrackedState::Accepted, None).await
+        self.admit_inner(admission, TrackedState::Accepted, None, now_unix_millis()?)
+            .await
     }
 
     /// Admits one delivery from a local durable stage and returns a completion
@@ -347,8 +349,25 @@ impl BufferManager {
         admission: Admission,
         state: TrackedState,
     ) -> BufferResult<(ReceiptVersion, DeliveryCompletion)> {
+        self.admit_tracked_at(admission, state, now_unix_millis()?).await
+    }
+
+    /// Admits durable work with its original UTC admission timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation, capacity, receipt, and lifecycle errors as
+    /// [`Self::admit_tracked`].
+    pub async fn admit_tracked_at(
+        self: &Arc<Self>,
+        admission: Admission,
+        state: TrackedState,
+        ingested_at_ms: UnixMillis,
+    ) -> BufferResult<(ReceiptVersion, DeliveryCompletion)> {
         let (sender, receiver) = oneshot::channel();
-        let receipt = self.admit_tracked_inner(admission, state, sender).await?;
+        let receipt = self
+            .admit_tracked_inner(admission, state, sender, ingested_at_ms)
+            .await?;
         Ok((receipt, DeliveryCompletion { receiver }))
     }
 
@@ -387,14 +406,17 @@ impl BufferManager {
         admission: Admission,
         timeout: Duration,
     ) -> BufferResult<ReceiptRecord> {
-        tokio::time::timeout(timeout, self.admit_inner(admission, TrackedState::Accepted, None))
-            .await
-            .map_err(|_| {
-                BufferError::new(
-                    BufferErrorKind::BackpressureTimeout,
-                    "timed out waiting for bounded buffer capacity",
-                )
-            })?
+        tokio::time::timeout(
+            timeout,
+            self.admit_inner(admission, TrackedState::Accepted, None, now_unix_millis()?),
+        )
+        .await
+        .map_err(|_| {
+            BufferError::new(
+                BufferErrorKind::BackpressureTimeout,
+                "timed out waiting for bounded buffer capacity",
+            )
+        })?
     }
 
     /// Flushes every currently queued table/schema group without closing admission.
@@ -453,9 +475,12 @@ impl BufferManager {
         admission: Admission,
         state: TrackedState,
         completion: oneshot::Sender<DeliveryOutcome>,
+        ingested_at_ms: UnixMillis,
     ) -> BufferResult<ReceiptVersion> {
         if state == TrackedState::Accepted {
-            let record = self.admit_inner(admission, state, Some(completion)).await?;
+            let record = self
+                .admit_inner(admission, state, Some(completion), ingested_at_ms)
+                .await?;
             return Ok(ReceiptVersion::new(record.receipt_id, record.revision));
         }
         let _admission_guard = self.start_admission()?;
@@ -466,6 +491,7 @@ impl BufferManager {
             context,
             QueuedDelivery {
                 receipt: admission.receipt,
+                ingested_at_ms,
                 batches: admission.batches,
                 already_flushing: state == TrackedState::Flushing,
                 completion: Some(completion),
@@ -482,6 +508,7 @@ impl BufferManager {
         admission: Admission,
         state: TrackedState,
         completion: Option<oneshot::Sender<DeliveryOutcome>>,
+        ingested_at_ms: UnixMillis,
     ) -> BufferResult<ReceiptRecord> {
         debug_assert_eq!(state, TrackedState::Accepted);
         let _admission_guard = self.start_admission()?;
@@ -533,6 +560,7 @@ impl BufferManager {
             context,
             QueuedDelivery {
                 receipt: buffered_version,
+                ingested_at_ms,
                 batches: admission.batches,
                 already_flushing: false,
                 completion,
@@ -820,9 +848,16 @@ impl BufferManager {
     }
 
     async fn publish_job(&self, job: &FlushJob) -> Result<PublicationOutcome, SinkError> {
+        let entry = job
+            .entries
+            .first()
+            .ok_or_else(|| SinkError::retryable("empty publication job"))?;
+        debug_assert_eq!(job.entries.len(), 1);
         let mut session = self
             .sink
             .begin(PublicationContext {
+                receipt_id: entry.receipt.receipt_id,
+                ingested_at_ms: entry.ingested_at_ms,
                 table: job.context.table.clone(),
                 schema_version: job.context.schema_version,
                 schema_fingerprint: job.context.schema_fingerprint,
@@ -1280,11 +1315,15 @@ fn detach_queue(table: &mut TableState, reason: FlushReason) {
     if let Some(queue) = table.queue.take()
         && !queue.entries.is_empty()
     {
-        table.pending.push_back(FlushJob {
-            context: queue.context,
-            entries: queue.entries,
-            reason,
-        });
+        // Replay can regroup receipts differently. Each file and completion
+        // must therefore retain one publication identity, not a flush identity.
+        for entry in queue.entries {
+            table.pending.push_back(FlushJob {
+                context: queue.context.clone(),
+                entries: vec![entry],
+                reason,
+            });
+        }
     }
 }
 
