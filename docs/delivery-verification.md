@@ -16,10 +16,12 @@ GHCR image has been pushed.
 | #19 | GHCR-ready direct, DFE, and router images | Dockerfiles, Nx image/publish targets, and image-smoke scripts under `projects/arrowcol-rust/`, `projects/arrowcol-dataflow-rust/`, and `projects/arrowcol-router-rust/`; shared publication workflow | Three Arrow image-smoke targets and image-plan/manifest tests; no publication claimed from this workspace |
 | #22 | Load generated from catalog-owned schemas | `projects/loadtest/schemas/sqlserver.sql`; `projects/loadtest/loadgen/src/sdk.rs`; `generator.rs`; `transport.rs`; `crates/arrowcol-sdk-gen/` | SDK generator verification, exact artifact regeneration, generated-package tests, schema-contract manifests, and finite loadtest validation |
 
-## Final qualification snapshot
+## Historical qualification snapshot
 
-Qualification was recorded on October 12, 2026 from the current working tree.
-Generated evidence is local and gitignored.
+The following qualification was recorded on October 12, 2026. It is historical
+baseline evidence, not proof of the current lakehouse integration, Azure
+publication, maintenance, tenant streaming, or QAP stress. Generated evidence is
+local and gitignored.
 
 | Command | Result |
 | --- | --- |
@@ -33,7 +35,12 @@ Generated evidence is local and gitignored.
 | `python3 docs/validate.py` | Passed: 22 Markdown files, 21 local links/anchors, 111 Nx target references, 18 Cargo package references, 45 documented paths, and prohibited public-reference checks. |
 | `git diff --check` | Passed. |
 
-## Intentional limitations
+## Historical baseline limitations
+
+These limits describe that recorded baseline. For the current publication and
+consumer boundaries, see [storage](architecture/arrowcol-platform/storage.md),
+[delivery guarantees](architecture/arrowcol-platform/delivery-guarantees.md),
+and the [lakehouse loadtest](architecture/loadtest/README.md).
 
 - **Local shared-volume semantics:** the benchmark's three direct collectors
   share one host directory, and the three DFE collectors share another. This
