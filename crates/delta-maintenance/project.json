@@ -1,0 +1,90 @@
+{
+  "name": "delta-maintenance",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "application",
+  "sourceRoot": "crates/delta-maintenance/src",
+  "implicitDependencies": ["arrow-deltalake"],
+  "namedInputs": {
+    "default": [
+      "{projectRoot}/**/*",
+      "{workspaceRoot}/Cargo.toml",
+      "{workspaceRoot}/Cargo.lock",
+      "{workspaceRoot}/rust-toolchain.toml",
+      "{workspaceRoot}/rustfmt.toml"
+    ]
+  },
+  "metadata": {
+    "description": "Standalone Delta Kernel maintenance service: OPTIMIZE, PURGE and VACUUM LITE."
+  },
+  "targets": {
+    "clean": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install tsx tools/scripts/src/clean.ts crates/delta-maintenance",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      }
+    },
+    "format": {"executor": "nx:run-commands", "cache": false, "options": {"command": "cargo fmt --package delta-maintenance"}},
+    "format-check": {"executor": "nx:run-commands", "options": {"command": "cargo fmt --package delta-maintenance -- --check"}},
+    "lint": {
+      "executor": "nx:run-commands",
+      "inputs": ["default", "^default"],
+      "options": {"command": "cargo clippy --locked --package delta-maintenance --all-targets --all-features -- -D warnings"}
+    },
+    "build": {"executor": "nx:run-commands", "cache": false, "options": {"command": "cargo build --locked --package delta-maintenance --all-features"}},
+    "test": {
+      "executor": "nx:run-commands",
+      "inputs": ["default", "^default"],
+      "options": {"command": "cargo test --locked --package delta-maintenance --all-features"}
+    },
+    "run": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {"command": "cargo run --locked --package delta-maintenance --", "forwardAllArgs": true}
+    },
+    "image": {
+      "executor": "rust-playground-build:docker-build",
+      "cache": false,
+      "inputs": [
+        "default",
+        "^default",
+        "{projectRoot}/Dockerfile",
+        "{workspaceRoot}/.dockerignore",
+        "{workspaceRoot}/infra/docker/install-azure-cli.sh",
+        "{workspaceRoot}/submodules/otel-arrow/**/*"
+      ],
+      "outputs": ["{workspaceRoot}/target/images/delta-maintenance-load.txt"],
+      "options": {
+        "file": "{absProjectRoot}/Dockerfile",
+        "context": "{absWorkspaceRoot}",
+        "image": "ghcr.io/mdrakiburrahman/rust-playground/delta-maintenance",
+        "tags": ["dev"],
+        "platforms": ["linux/amd64"],
+        "output": "load",
+        "manifestFile": "{absWorkspaceRoot}/target/images/delta-maintenance-load.txt"
+      }
+    },
+    "image-smoke": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["image"],
+      "options": {
+        "commands": [
+          "docker run --rm --platform linux/amd64 ghcr.io/mdrakiburrahman/rust-playground/delta-maintenance:dev --version",
+          "docker run --rm --platform linux/amd64 --entrypoint sh ghcr.io/mdrakiburrahman/rust-playground/delta-maintenance:dev -c 'test \"$(id -u)\" = 10001 && test \"$(stat -c %a:%u \"$AZURE_CONFIG_DIR\")\" = 700:10001 && test -z \"$(ls -A \"$AZURE_CONFIG_DIR\")\" && az version >/dev/null'"
+        ],
+        "parallel": false,
+        "cwd": "{workspaceRoot}"
+      }
+    },
+    "verify": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["format-check", "lint", "build", "test"],
+      "options": {"commands": []}
+    }
+  },
+  "tags": ["scope:rust", "type:application", "type:runtime-image"]
+}
