@@ -8,10 +8,11 @@ description = "Streaming pure-Arrow Parquet and Delta Kernel table writers"
 
 [features]
 default = ["delta"]
-delta = ["dep:delta_kernel", "dep:delta_kernel_default_engine", "dep:fs2", "dep:url"]
+delta = ["dep:delta_kernel", "dep:delta_kernel_default_engine", "dep:fs2", "dep:url", "dep:opentelemetry"]
 
 [dependencies]
 anyhow.workspace = true
+opentelemetry = { workspace = true, optional = true }
 arrow = { version = "58.3", default-features = false }
 parquet = { version = "58.3", default-features = false, features = ["arrow", "async"] }
 tokio = { version = "1", features = ["fs", "io-util", "process", "rt-multi-thread", "sync", "time", "macros"] }
@@ -30,6 +31,8 @@ sha2 = "0.10"
 async-trait = "0.1"
 
 [dev-dependencies]
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+tracing-subscriber.workspace = true
 tempfile = "3"
 tokio = { version = "1", features = ["macros"] }
 

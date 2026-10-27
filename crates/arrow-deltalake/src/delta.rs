@@ -1561,12 +1561,14 @@ impl DeltaTable {
     }
 
     fn commit_files_inner(&self, files: &[StagedAppend], identity: Option<(&str, i64)>) -> Result<u64> {
+        let mut observation = crate::telemetry::PublicationObservation::start();
         let _guard = self
             .commit_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("Delta commit lock poisoned"))?;
         let started = Instant::now();
         for attempt in 0..8 {
+            observation.event("attempt");
             self.check_publication()?;
             let snapshot = self.snapshot()?;
             Self::validate_retention(&snapshot)?;
@@ -1577,6 +1579,7 @@ impl DeltaTable {
                     bail!("publication transaction fenced by newer application version");
                 }
                 if previous == version {
+                    observation.finish("deduplicated");
                     return Ok(snapshot.version());
                 }
             }
@@ -1605,6 +1608,7 @@ impl DeltaTable {
                 pending.push(append);
             }
             if pending.is_empty() && identity.is_none() {
+                observation.finish("deduplicated");
                 return Ok(snapshot.version());
             }
             let read_version = snapshot.version();
@@ -1682,16 +1686,19 @@ impl DeltaTable {
             match transaction.commit(&self.engine) {
                 Ok(CommitResult::Committed(commit)) => {
                     sync_directory(&self.root)?;
+                    observation.finish("committed");
                     return Ok(commit.commit_version());
                 }
-                Ok(CommitResult::Conflicted(_)) => {}
+                Ok(CommitResult::Conflicted(_)) => observation.event("conflict"),
                 Ok(CommitResult::Retryable(retry)) => {
+                    observation.event("retryable_io");
                     // Refresh/check every stable identity on the next iteration BEFORE
                     // resubmission. If refresh fails, the uncertain outcome stays an error.
                     if !identifiable {
                         bail!("uncertain publication without retry identity: {}", retry.error);
                     }
                     if let Some(version) = reconcile()? {
+                        observation.finish("reconciled");
                         return Ok(version);
                     }
                 }
@@ -1699,6 +1706,7 @@ impl DeltaTable {
                     // Kernel can surface post-publication I/O as Err, not only Retryable.
                     // A proven transaction is success; an unreadable outcome stays an error.
                     if identifiable && let Some(version) = reconcile()? {
+                        observation.finish("reconciled");
                         return Ok(version);
                     }
                     return Err(error.into());
@@ -1709,6 +1717,7 @@ impl DeltaTable {
             }
             collision_backoff(attempt);
         }
+        observation.finish("exhausted");
         bail!("Delta publication collision/retry budget exhausted (8 attempts / 10 seconds)")
     }
 }

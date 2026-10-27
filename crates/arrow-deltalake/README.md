@@ -201,6 +201,36 @@ the stalled-auth tests specifically prove a cancelled CLI cannot later resume a
 data/log publication. Real ADLS/reset qualification still requires authorized
 subscription access.
 
+## Telemetry
+
+Install the process's global OpenTelemetry meter provider before any Delta work,
+then attach `telemetry::kernel_metrics_reporter()` with Kernel's
+`WithMetricsReporterLayer` to the global tracing subscriber. Apply log filters
+only to the logging layer, not the Kernel reporting layer. The crate does not
+install another subscriber/exporter or create placeholder observations.
+
+The `arrow-deltalake` meter exports these actual instruments:
+
+| Instrument | Unit | Bounded attributes |
+|---|---|---|
+| `delta.kernel.events` | counter | `event`, `outcome` |
+| `delta.kernel.duration` | s, histogram | `event`, `phase` |
+| `delta.kernel.values` | 1, histogram | `event`, `field` |
+| `delta.kernel.bytes` | By, histogram | `event`, `field` |
+| `delta.kernel.version` | 1, gauge | `event` |
+| `delta.publication.events` | counter | `outcome` |
+| `delta.publication.duration` | s, histogram | `outcome` |
+
+Kernel event coverage includes log-segment and protocol loading, snapshot,
+transaction prepare/committer/total timings and file counts/bytes, domain and
+transaction lookup/cache results, CRC, JSON/Parquet reads, scan selection and
+predicate/dedup/transform work, and storage listing/reading/copying. The match is
+exhaustive for pinned Kernel 0.29. Publication outcomes include `attempt`,
+`conflict`, `retryable_io`, `committed`, `deduplicated`, `reconciled`, `exhausted`
+and `failure`; the duration records one terminal observation per publication.
+No table URI, account, application UUID or correlation ID is a metric label.
+Prometheus/OTLP exporters may normalize dots and append unit/type suffixes.
+
 ## Arrow representation
 
 ```text
