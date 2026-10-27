@@ -1,11 +1,28 @@
 use std::{collections::BTreeMap, path::Path};
 
 use anyhow::{Context, Result, bail};
+use parquet::file::reader::{FileReader, SerializedFileReader};
 use serde_json::json;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.len() == 2 && args[0] == "file-metadata" {
+        let reader = SerializedFileReader::new(std::fs::File::open(&args[1])?)?;
+        let metadata = reader.metadata();
+        let mut schema = Vec::new();
+        parquet::schema::printer::print_schema(&mut schema, metadata.file_metadata().schema_descr().root_schema());
+        let groups = metadata.row_groups().iter().map(|group| json!({
+            "rows": group.num_rows(), "columns": group.num_columns(), "uncompressed_bytes": group.total_byte_size(),
+        })).collect::<Vec<_>>();
+        println!(
+            "{}",
+            json!({
+                "physical_schema": String::from_utf8(schema)?, "rows": metadata.file_metadata().num_rows(), "row_groups": groups,
+            })
+        );
+        return Ok(());
+    }
     if args.len() == 1 {
         println!(
             "{}",
@@ -30,7 +47,7 @@ async fn main() -> Result<()> {
     let snapshot = if cloud {
         delta_inspect::summarize_cloud(root, &identities).await?
     } else {
-        delta_inspect::summarize(Path::new(root)).await?
+        delta_inspect::summarize_selected(Path::new(root), &identities).await?
     };
     if args[0] == "summarize" {
         println!("{}", serde_json::to_string(&snapshot)?);

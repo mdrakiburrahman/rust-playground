@@ -53,3 +53,14 @@ test('unexecuted later windows cannot rescue a failed declared window', () => {
   assert.equal(evaluateStress(rows, criteria).status, 'failed');
   assert.throws(() => evaluateStress(rows, { ...criteria, minimumSamples: 1 }), /Invalid/u);
 });
+
+test('predeclared acquisition lateness keeps real timestamps and never accepts a shortened window', () => {
+  const delayed = samples().map(sample => ({ ...sample, timestamp: sample.timestamp + 100 }));
+  assert.equal(evaluateStress(delayed, { ...criteria, endpointToleranceMs: 100 }).status, 'passed');
+  assert.equal(evaluateStress(delayed, criteria).status, 'insufficient-evidence');
+  const shortened = samples();
+  shortened[3].timestamp = 3999;
+  assert.equal(evaluateStress(shortened, { ...criteria, endpointToleranceMs: 100 }).status, 'insufficient-evidence');
+  const late = delayed.map(sample => ({ ...sample, timestamp: sample.timestamp + 1 }));
+  assert.equal(evaluateStress(late, { ...criteria, endpointToleranceMs: 100 }).status, 'insufficient-evidence');
+});

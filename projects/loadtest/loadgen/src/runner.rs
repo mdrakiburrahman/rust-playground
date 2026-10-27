@@ -1,6 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -88,12 +91,14 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
         }
     });
 
+    let receipt_failures = Arc::new(AtomicU64::new(0));
     let (receipt_sender, receipt_task) = ReceiptTracker::start(
         transport.clone(),
         manifests.clone(),
         run_id.clone(),
         arguments.drain_timeout.get(),
         arguments.lanes.saturating_mul(16).max(32),
+        Arc::clone(&receipt_failures),
     );
     let kusto_sync = crate::kusto::LiveSync::start(&arguments, &run_id);
 
@@ -116,6 +121,7 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
                 receipt_sender.clone(),
                 cancellation.clone(),
                 scheduled_table_count,
+                Arc::clone(&receipt_failures),
             )
             .await
         {
@@ -141,6 +147,7 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
             receipt_sender.clone(),
             cancellation.clone(),
             scheduled_table_count,
+            Arc::clone(&receipt_failures),
         )
         .await
         {
@@ -157,6 +164,7 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
         .await
         .context("receipt tracker task failed")
         .and_then(|report| report);
+    manifests.flush().await?;
     if let Some(sync) = kusto_sync
         && let Err(error) = sync.stop().await
     {
@@ -224,11 +232,13 @@ async fn run_phase(
     receipt_sender: mpsc::Sender<PendingReceipt>,
     cancellation: CancellationToken,
     table_count: usize,
+    receipt_failures: Arc<AtomicU64>,
 ) -> Result<()> {
     let deadline = duration.map(|duration| Instant::now() + duration);
     let first_ordinal = scheduler.scheduled();
     let mut lanes = JoinSet::new();
     let batches = Arc::new(batches.clone());
+    let send_policy_failures = Arc::new(AtomicU64::new(0));
     for lane in 0..arguments.lanes {
         let scheduler = Arc::clone(&scheduler);
         let batches = Arc::clone(&batches);
@@ -240,6 +250,7 @@ async fn run_phase(
         let phase = phase.to_owned();
         let request_timeout = arguments.request_timeout.get();
         let retry = RetryPolicy::from_arguments(arguments);
+        let send_policy_failures = Arc::clone(&send_policy_failures);
         lanes.spawn(async move {
             loop {
                 if cancellation.is_cancelled() {
@@ -254,83 +265,90 @@ async fn run_phase(
                     .get(&scheduled.table.identity.to_string())
                     .context("scheduled table has no generated batch")?;
                 let logical_batch_id = format!("{}:{}:{}:{}", run_id, scenario.as_str(), phase, scheduled.ordinal);
-                match scenario {
-                    Scenario::Direct => {
-                        send_pool_with_retry(
-                            &run_id,
-                            scenario,
-                            &phase,
-                            &logical_batch_id,
-                            scheduled.ordinal,
-                            scheduled.table_batch_ordinal,
-                            lane,
-                            ImplementationPool::Direct,
-                            Arc::clone(batch),
-                            &transport,
-                            &manifests,
-                            &receipt_sender,
-                            request_timeout,
-                            retry,
-                        )
-                        .await?;
+                let sent = async {
+                    match scenario {
+                        Scenario::Direct => {
+                            send_pool_with_retry(
+                                &run_id,
+                                scenario,
+                                &phase,
+                                &logical_batch_id,
+                                scheduled.ordinal,
+                                scheduled.table_batch_ordinal,
+                                lane,
+                                ImplementationPool::Direct,
+                                Arc::clone(batch),
+                                &transport,
+                                &manifests,
+                                &receipt_sender,
+                                request_timeout,
+                                retry,
+                            )
+                            .await?;
+                        }
+                        Scenario::Dataflow => {
+                            send_pool_with_retry(
+                                &run_id,
+                                scenario,
+                                &phase,
+                                &logical_batch_id,
+                                scheduled.ordinal,
+                                scheduled.table_batch_ordinal,
+                                lane,
+                                ImplementationPool::Dataflow,
+                                Arc::clone(batch),
+                                &transport,
+                                &manifests,
+                                &receipt_sender,
+                                request_timeout,
+                                retry,
+                            )
+                            .await?;
+                        }
+                        Scenario::Paired => {
+                            let direct = send_pool_with_retry(
+                                &run_id,
+                                scenario,
+                                &phase,
+                                &logical_batch_id,
+                                scheduled.ordinal,
+                                scheduled.table_batch_ordinal,
+                                lane,
+                                ImplementationPool::Direct,
+                                Arc::clone(batch),
+                                &transport,
+                                &manifests,
+                                &receipt_sender,
+                                request_timeout,
+                                retry,
+                            );
+                            let dataflow = send_pool_with_retry(
+                                &run_id,
+                                scenario,
+                                &phase,
+                                &logical_batch_id,
+                                scheduled.ordinal,
+                                scheduled.table_batch_ordinal,
+                                lane,
+                                ImplementationPool::Dataflow,
+                                Arc::clone(batch),
+                                &transport,
+                                &manifests,
+                                &receipt_sender,
+                                request_timeout,
+                                retry,
+                            );
+                            let (direct, dataflow) = tokio::join!(direct, dataflow);
+                            direct?;
+                            dataflow?;
+                        }
                     }
-                    Scenario::Dataflow => {
-                        send_pool_with_retry(
-                            &run_id,
-                            scenario,
-                            &phase,
-                            &logical_batch_id,
-                            scheduled.ordinal,
-                            scheduled.table_batch_ordinal,
-                            lane,
-                            ImplementationPool::Dataflow,
-                            Arc::clone(batch),
-                            &transport,
-                            &manifests,
-                            &receipt_sender,
-                            request_timeout,
-                            retry,
-                        )
-                        .await?;
-                    }
-                    Scenario::Paired => {
-                        let direct = send_pool_with_retry(
-                            &run_id,
-                            scenario,
-                            &phase,
-                            &logical_batch_id,
-                            scheduled.ordinal,
-                            scheduled.table_batch_ordinal,
-                            lane,
-                            ImplementationPool::Direct,
-                            Arc::clone(batch),
-                            &transport,
-                            &manifests,
-                            &receipt_sender,
-                            request_timeout,
-                            retry,
-                        );
-                        let dataflow = send_pool_with_retry(
-                            &run_id,
-                            scenario,
-                            &phase,
-                            &logical_batch_id,
-                            scheduled.ordinal,
-                            scheduled.table_batch_ordinal,
-                            lane,
-                            ImplementationPool::Dataflow,
-                            Arc::clone(batch),
-                            &transport,
-                            &manifests,
-                            &receipt_sender,
-                            request_timeout,
-                            retry,
-                        );
-                        let (direct, dataflow) = tokio::join!(direct, dataflow);
-                        direct?;
-                        dataflow?;
-                    }
+                    Ok::<(), anyhow::Error>(())
                 }
+                .await;
+                sent.inspect_err(|_| {
+                    send_policy_failures.fetch_add(1, Ordering::Relaxed);
+                })?;
             }
             Ok::<(), anyhow::Error>(())
         });
@@ -342,20 +360,49 @@ async fn run_phase(
         arguments.lanes,
         arguments.batch_rows
     );
+    let stop_progress = CancellationToken::new();
     let progress = {
         let scheduler = Arc::clone(&scheduler);
         let phase = phase.to_owned();
+        let run_id = run_id.to_owned();
+        let manifests = manifests.clone();
+        let stop = stop_progress.clone();
+        let cancellation = cancellation.clone();
+        let batch_rows = u64::try_from(arguments.batch_rows)?;
         let started = Instant::now();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(10));
-            tick.tick().await;
+            let mut sequence = 0_u64;
             loop {
-                tick.tick().await;
-                println!(
-                    "[loadgen] {phase} {:>4}s: {} batches sent",
-                    started.elapsed().as_secs(),
-                    scheduler.scheduled().saturating_sub(first_ordinal)
-                );
+                let scheduled = scheduler.scheduled().saturating_sub(first_ordinal);
+                let Some(rows) = scheduled.checked_mul(batch_rows) else {
+                    cancellation.cancel();
+                    bail!("driver scheduled-row count overflow");
+                };
+                let frame = serde_json::json!({
+                    "run_id": run_id, "phase": phase, "scenario": scenario.as_str(),
+                    "timestamp": now_unix_millis(), "scheduled_rows": rows,
+                    "send_policy_failures": send_policy_failures.load(Ordering::Relaxed),
+                    "receipt_failures": receipt_failures.load(Ordering::Relaxed),
+                });
+                if let Err(error) = manifests.write_json("driver-progress.json", &frame).await {
+                    cancellation.cancel();
+                    return Err(error);
+                }
+                if stop.is_cancelled() {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                if sequence.is_multiple_of(10) {
+                    println!(
+                        "[loadgen] {phase} {:>4}s: {} batches sent",
+                        started.elapsed().as_secs(),
+                        scheduled
+                    );
+                }
+                sequence += 1;
+                tokio::select! {
+                    () = stop.cancelled() => {}
+                    () = tokio::time::sleep(Duration::from_secs(1)) => {}
+                }
             }
         })
     };
@@ -366,12 +413,16 @@ async fn run_phase(
             break;
         }
     }
-    progress.abort();
+    stop_progress.cancel();
+    let progress_outcome = progress
+        .await
+        .context("driver progress task failed")
+        .and_then(|result| result);
     println!(
         "[loadgen] {phase} finished: {} batches sent",
         scheduler.scheduled().saturating_sub(first_ordinal)
     );
-    outcome
+    outcome.and(progress_outcome)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -548,6 +599,7 @@ impl ReceiptTracker {
         run_id: String,
         drain_timeout: Duration,
         capacity: usize,
+        failures: Arc<AtomicU64>,
     ) -> (
         mpsc::Sender<PendingReceipt>,
         tokio::task::JoinHandle<Result<ReceiptReport>>,
@@ -583,6 +635,7 @@ impl ReceiptTracker {
                             })
                             .await?;
                         report.timeouts += 1;
+                        failures.fetch_add(1, Ordering::Relaxed);
                     }
                     break;
                 }
@@ -648,6 +701,7 @@ impl ReceiptTracker {
                                     report.published += 1;
                                 } else {
                                     report.failures += 1;
+                                    failures.fetch_add(1, Ordering::Relaxed);
                                 }
                             }
                         }

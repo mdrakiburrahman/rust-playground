@@ -24,6 +24,8 @@ export interface StressCriteria {
   maximumPhysicalBytes: number;
   maximumRelativeTrend: number;
   maximumRelativeVariation: number;
+  /** Maximum predeclared acquisition lateness; actual timestamps are never rewritten. */
+  endpointToleranceMs?: number;
 }
 
 export interface StressVerdict {
@@ -45,15 +47,17 @@ function relativeTrend(values: number[]): number {
 
 /** Pure evaluator: never retries, extends the window, fabricates missing metrics, or waits until green. */
 export function evaluateStress(allSamples: WaveSample[], criteria: StressCriteria): StressVerdict {
+  const tolerance = criteria.endpointToleranceMs ?? 0;
   const limits = ['start', 'end', 'minimumCycles', 'minimumSamples', 'minimumDriverRowsPerSecond',
     'maximumBacklog', 'maximumRssBytes', 'maximumPhysicalBytes', 'maximumRelativeTrend', 'maximumRelativeVariation'] as const;
   if (limits.some(key => typeof criteria[key] !== 'number' || !Number.isFinite(criteria[key])) ||
+      !Number.isFinite(tolerance) || tolerance < 0 || tolerance > (criteria.end - criteria.start) / 4 ||
       criteria.end <= criteria.start || criteria.minimumSamples < 3 || criteria.minimumCycles < 1 ||
       !Number.isInteger(criteria.minimumCycles) || !Number.isInteger(criteria.minimumSamples) || !criteria.phase ||
       Object.entries(criteria).some(([key, value]) => !['start', 'end', 'phase'].includes(key) && Number(value) < 0)) {
     throw new Error('Invalid predeclared stress criteria');
   }
-  const window = allSamples.filter(sample => sample.timestamp >= criteria.start && sample.timestamp <= criteria.end);
+  const window = allSamples.filter(sample => sample.timestamp >= criteria.start && sample.timestamp <= criteria.end + tolerance);
   const matched = window.filter(sample => sample.phase === criteria.phase);
   const reasons: string[] = [];
   let failed = false;
@@ -86,13 +90,14 @@ export function evaluateStress(allSamples: WaveSample[], criteria: StressCriteri
   }
   const cycles = Math.max(0, new Set(matched.map(sample => sample.wave)).size - 1);
   const result: StressVerdict = { status: 'passed', reasons, samples: matched.length, cycles };
+  const first = matched[0], last = matched.at(-1);
   if (matched.length < criteria.minimumSamples || cycles < criteria.minimumCycles ||
-      matched[0]?.timestamp !== criteria.start || matched.at(-1)?.timestamp !== criteria.end) {
+      first === undefined || last === undefined || first.timestamp > criteria.start + tolerance || last.timestamp < criteria.end) {
     invalid = true;
     reasons.push('Insufficient matching-phase operation cycles, export samples or fixed-window coverage');
   }
   if (!invalid && matched.length >= 3) {
-    const duration = (criteria.end - criteria.start) / 1000;
+    const duration = (matched.at(-1)!.timestamp - matched[0].timestamp) / 1000;
     result.driverRowsPerSecond = (matched.at(-1)!.driverRows - matched[0].driverRows) / duration;
     if (result.driverRowsPerSecond < criteria.minimumDriverRowsPerSecond ||
         matched.slice(1).some((sample, index) => sample.driverRows <= matched[index].driverRows)) {

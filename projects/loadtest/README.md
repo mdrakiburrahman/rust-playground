@@ -36,6 +36,78 @@ preserved while credentials, private URLs/paths/identifiers, known private
 environment values, and control characters are removed, with a 1,024-character
 Unicode-safe bound. These artifacts are written before stack cleanup.
 
+### Fixed-window local functional rehearsal
+
+`--validate --stress-plan <file>` runs real OPTIMIZE, checkpoint, and VACUUM LITE
+jobs against `sqlserver_cpu_utilization` in both pools while paired input runs.
+The other twelve tables in each pool are append-only controls. It retains the
+ordinary all-thirteen-table final source/native checks and Explorer assertions.
+This is a **local functional rehearsal**, not Azure stress/performance evidence.
+Azure rejects this option before occupancy or workspace reset until a complete
+ADLS physical-inventory adapter is available.
+
+The version-one plan requires every field below. The source batch must also
+match `--batch-rows`; layout overrides apply to both actual source collectors.
+The current deterministic generator repeats sixteen complete payload rows,
+so 8,192 physical rows do not imply 8,192 distinct oracle rows. The live reader
+still enforces the unchanged per-partition and whole-corpus guards.
+
+```json
+{
+  "version": 1,
+  "durationSeconds": 180,
+  "waveIntervalSeconds": 60,
+  "operationTimeoutSeconds": 40,
+  "startupTimeoutSeconds": 180,
+  "sampleTimeoutSeconds": 10,
+  "fixture": {"batchRows": 8192, "rowGroupRows": 512, "pageRows": 128},
+  "limits": {
+    "minimumCycles": 3,
+    "minimumSamples": 4,
+    "minimumDriverRowsPerSecond": 100,
+    "maximumBacklog": 1000,
+    "maximumRssBytes": 4294967296,
+    "maximumPhysicalBytes": 10737418240,
+    "maximumRelativeTrend": 0.1,
+    "maximumRelativeVariation": 0.2
+  }
+}
+```
+
+These are example limits, not demonstrated capacity or a successful run.
+The immutable window starts at observed source measure-phase progress, after
+the bounded startup wait. `driver-progress.json` is atomically replaced every
+second with run identity, actual scheduled logical rows, send-policy failures,
+and terminal receipt failures. Scheduled input is a pace counter, **not ACK
+accounting or a correctness oracle**. Per-wave source snapshots, structured
+operation reports, complete measured-root inventories, raw numeric resource
+evidence, samples, and the one verdict are retained in `results/stress-*`.
+Source Parquet footer captures must prove multiple row groups before the first
+wave. The first OPTIMIZE in each pool must actually reduce file count through
+replacement; a no-op cannot qualify that fixture. Complete-row oracle limits
+remain 256 distinct rows per partition and 65,536 per table, with no truncation.
+
+Samples retain their real acquisition timestamps. The predeclared sample budget
+is also the maximum endpoint lateness; an early final sample cannot shorten the
+window. Input cessation, unavailable counters, operation/sample timeout,
+unexpected restart, OOM, exhausted source delivery, or unstable measured
+resources cannot pass. The controller never extends the window or retries until
+green. Docker CLI termination is not container termination: owned maintenance
+containers require the current runtime's ownership token and Compose identity
+before cleanup by immutable container ID. Stopped failures remain available for
+private Docker-log diagnosis; unverified containers are never stopped.
+
+Physical accounting includes all files under the declared source, tenant,
+checkpoint, WAL, router-state, and generator-staging roots: JSON history,
+checkpoints, uncommitted/orphan Parquet, and staging are not omitted. Logical
+file bytes and allocated blocks are separate; hard links are deduplicated.
+SQL/Kusto volumes and Docker layers are **not** included, and collector RSS
+covers only the two source processes. There is no whole-system physical plateau
+claim: checkpoint appId growth and retained JSON can legitimately fail the
+declared stability limits. Seven-day VACUUM may be a measured no-op on fresh
+data, not reclamation evidence. PURGE, short-retention/prune-log, tenant replay,
+and their post-maintenance exact oracle gates remain separate pending scenarios.
+
 ```bash
 npx nx run loadtest:run -- --warmup 2m --concurrency 8 --batch-rows 1024
 ```
