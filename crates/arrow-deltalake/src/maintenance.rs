@@ -2559,7 +2559,9 @@ impl DeltaTable {
     }
 
     /// Version named by the advisory `_last_checkpoint` hint, if readable.
-    fn hinted_checkpoint_version(&self) -> Result<Option<u64>> {
+    /// Strict mode (log pruning) rejects a malformed hint; checkpointing treats it
+    /// as absent so a fresh checkpoint can repair it.
+    fn hinted_checkpoint_version(&self, strict: bool) -> Result<Option<u64>> {
         let path = self.object_path("_delta_log/_last_checkpoint")?;
         let store = Arc::clone(&self.store);
         let bytes = shared_executor()?.block_on(async move {
@@ -2569,9 +2571,29 @@ impl DeltaTable {
                 Err(error) => Err(anyhow::Error::from(error)),
             }
         })?;
-        Ok(bytes
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-            .and_then(|hint| hint.get("version").and_then(serde_json::Value::as_u64)))
+        let Some(bytes) = bytes else {
+            return Ok(None);
+        };
+        if !strict {
+            return Ok(serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|hint| hint.get("version").and_then(serde_json::Value::as_u64)));
+        }
+        let hint: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+            fail(
+                MaintenanceErrorKind::Unsupported,
+                format!("malformed _last_checkpoint hint: {error}"),
+            )
+        })?;
+        hint.get("version")
+            .and_then(serde_json::Value::as_u64)
+            .map(Some)
+            .ok_or_else(|| {
+                fail(
+                    MaintenanceErrorKind::Unsupported,
+                    "_last_checkpoint hint has no version",
+                )
+            })
     }
 
     /// Write a Kernel checkpoint once at least `min_commits` commits follow the
@@ -2598,7 +2620,7 @@ impl DeltaTable {
             version,
             ..MaintenanceReport::default()
         };
-        let due = match self.hinted_checkpoint_version()? {
+        let due = match self.hinted_checkpoint_version(false)? {
             Some(hinted) => version.saturating_sub(hinted) >= min_commits,
             None => version.saturating_add(1) >= min_commits,
         };
@@ -4064,7 +4086,7 @@ impl DeltaTable {
                 Some(LogObject::Crc(_)) | None => false,
             };
         }
-        let (Some(hint), Some(progress)) = (self.hinted_checkpoint_version()?, self.vacuum_lite_progress()?) else {
+        let (Some(hint), Some(progress)) = (self.hinted_checkpoint_version(true)?, self.vacuum_lite_progress()?) else {
             return if target.is_some() {
                 stale("checkpoint hint or VACUUM LITE progress record disappeared")
             } else {
@@ -4087,6 +4109,15 @@ impl DeltaTable {
             floor => floor.map(|floor| floor.checkpoint_version),
         };
         let upper = hint.min(progress.version).min(head);
+        // A delayed older checkpoint may legally rewrite `_last_checkpoint` below
+        // the durable floor; nothing at or below the floor is re-provable then.
+        if floor.is_some_and(|floor| floor > upper) {
+            return if target.is_some() {
+                stale("checkpoint hint, VACUUM progress or head is below the durable log floor")
+            } else {
+                Ok(None)
+            };
+        }
         if let Some(version) = other.range(..=upper).next() {
             return Err(unsupported(format!(
                 "unsupported log object at version {version} (multi-part, V2 or compacted); refusing to prune"

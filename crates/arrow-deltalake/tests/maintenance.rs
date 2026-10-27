@@ -1875,6 +1875,61 @@ fn modified_ms(path: &Path) -> Result<i64> {
     )?)
 }
 
+/// Scenario: a durable floor at C, a second proven plan at C2, then a delayed older
+/// checkpoint rewrites `_last_checkpoint` below the floor (or it is corrupted).
+/// Guarantees: planning and the pending apply neither panic nor delete; the floor is
+/// unchanged; a malformed hint is an explicit error for pruning while checkpointing
+/// still repairs it, after which pruning resumes.
+#[test]
+fn prune_log_hint_below_floor_is_refused_without_deletion() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let (table, maintenance) = prunable_history(root.path())?;
+    let floor = vacuum_and_checkpoint(&maintenance)?;
+    let config = short_prune(now_ms()? + 1_000);
+    let plan = maintenance.plan_prune_log(&config)?;
+    maintenance.apply_prune_log(&plan, &config, &control())?;
+    assert_eq!(maintenance.log_floor()?.context("floor")?.checkpoint_version, floor);
+    for index in 10..12 {
+        append(&table, index, index * 10..index * 10 + 2)?;
+    }
+    let second = vacuum_and_checkpoint(&maintenance)?;
+    let config = short_prune(now_ms()? + 1_000);
+    let pending = maintenance.plan_prune_log(&config)?;
+    assert_eq!(pending.checkpoint_version, Some(second));
+
+    let hint = root.path().join("_delta_log").join("_last_checkpoint");
+    let restore = fs::read(&hint)?;
+    fs::write(&hint, format!("{{\"version\":{},\"size\":1}}", floor - 1))?;
+    let before = log_files(root.path())?;
+    assert!(!before.is_empty());
+    let plan = maintenance.plan_prune_log(&config)?;
+    assert_eq!((plan.checkpoint_version, plan.report().outcome), (None, Outcome::Noop));
+    assert_eq!(
+        kind(maintenance.apply_prune_log(&pending, &config, &control())),
+        Some(MaintenanceErrorKind::StalePlan)
+    );
+    assert_eq!(log_files(root.path())?, before, "no deletion below the floor");
+    assert_eq!(maintenance.log_floor()?.context("floor")?.checkpoint_version, floor);
+
+    fs::write(&hint, b"{not json")?;
+    assert_eq!(
+        kind(maintenance.plan_prune_log(&config)),
+        Some(MaintenanceErrorKind::Unsupported)
+    );
+    assert_eq!(
+        kind(maintenance.apply_prune_log(&pending, &config, &control())),
+        Some(MaintenanceErrorKind::Unsupported)
+    );
+    assert_eq!(log_files(root.path())?, before);
+    assert_eq!(maintenance.checkpoint_if_due(1, false)?.outcome, Outcome::Planned);
+
+    fs::write(&hint, restore)?;
+    let report = maintenance.apply_prune_log(&pending, &config, &control())?;
+    assert_eq!((report.outcome, report.version), (Outcome::Pruned, second));
+    assert_eq!(maintenance.log_floor()?.context("floor")?.checkpoint_version, second);
+    Ok(())
+}
+
 /// Scenario: a bounded short-retention prune leaves JSON at or below the floor, then
 /// the log retention grows so the newest leftover is young again.
 /// Guarantees: resuming at the floor applies the fresh-proof age check to every
