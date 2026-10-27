@@ -57,6 +57,15 @@ async fn real_kernel_and_publication_events_reach_meter_provider() -> Result<()>
     ] {
         assert!(names.contains(expected), "missing {expected}: {names:?}");
     }
+    let version = metrics
+        .iter()
+        .find(|metric| metric.name() == "delta.kernel.version")
+        .context("kernel version gauge")?;
+    assert_eq!(
+        version.unit(),
+        "",
+        "unit \"1\" gauges export to Prometheus as delta_kernel_version_ratio"
+    );
     let events = metrics
         .iter()
         .find(|metric| metric.name() == "delta.publication.events")
