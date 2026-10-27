@@ -137,10 +137,12 @@ validates both Delta roots. The second E2E phase enables Quiver and kills and
 restarts both collectors during traffic to exercise durable replay.
 
 The current runner retains output beneath `onelake/benchmark/latest/` and prints
-its exact output directory. A fresh local start replaces the previous scoped
-loadtest and its data; copy required evidence before another run. Follow the
-[loadtest lifecycle guide](projects/loadtest/README.md) to stop retained services
-before deleting output. Focused collector live E2Es retain their own evidence
+its exact output directory. A new start may reset only a sealed, validated local
+attempt after verifying its private corpus and evidence archive. Failed,
+interrupted, nonvalidated, Azure, or unmarked legacy attempts block reset and
+preserve their original corpus. See the [loadtest lifecycle and evidence
+guide](projects/loadtest/README.md#per-attempt-evidence-custody) for the reset
+preconditions. Focused collector live E2Es retain their own evidence
 under `projects/arrowcol-rust/.diagnostics/<run-id>/` and
 `projects/arrowcol-dataflow-rust/.diagnostics/<run-id>/`.
 
