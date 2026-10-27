@@ -846,6 +846,9 @@ def publisher_registry(metadata):
                 raise ValueError("invalid state")
         except (ValueError, TypeError, AttributeError) as exc:
             raise Failure("Publisher registry contains an invalid publisher entry.") from exc
+    # Same as Rust Registry::parse: only canonical compact sorted JSON is valid wire.
+    if json.dumps(registry, separators=(",", ":"), sort_keys=True) != raw:
+        raise Failure("Publisher registry is not canonical compact JSON.")
     return registry
 
 

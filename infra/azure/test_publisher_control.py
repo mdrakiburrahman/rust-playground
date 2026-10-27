@@ -357,3 +357,81 @@ class PublisherControlTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class RustWireCompatibilityTests(unittest.TestCase):
+    """Mirrors arrow-deltalake schema_rejects_invalid_authority (core 29cbe505).
+
+    Both implementations must reject exactly these authorities and produce
+    byte-identical canonical compact `publishers` values.
+    """
+    GENERATION = "00000000-0000-4000-8000-000000000001"
+    ROTATED = "00000000-0000-4000-8000-000000000002"
+    MEMBER = "00000000-0000-4000-8000-000000000009"
+
+    def member(self, generation, state="active"):
+        return ('{"%s":{"generation":"%s","state":"%s"}}' % (self.MEMBER, generation, state))
+
+    def authority(self, metadata):
+        azure = Authority()
+        azure.metadata = {"sandboxid": azure.c.sandbox, "resetstate": READY,
+                          "resetgeneration": self.GENERATION, "publisherregistryversion": "1",
+                          "publishers": self.member(self.GENERATION), "occupancy": "released",
+                          **metadata}
+        azure.metadata = {k: v for k, v in azure.metadata.items() if v is not None}
+        return azure
+
+    def test_rust_rejection_matrix_and_valid_parse(self):
+        _, registry, _ = PublisherControl(self.authority({})).read()
+        self.assertEqual(list(registry), [self.MEMBER])
+        entry = '"%s":{"generation":"%s","state":"active"}' % (self.MEMBER, self.GENERATION)
+        full = "{" + ",".join('"%s":{"generation":"%s","state":"active"}'
+                              % (uuid.UUID(int=i + 1), self.GENERATION) for i in range(17)) + "}"
+        cases = {
+            "legacy ready": {"resetstate": "ready"},
+            "legacy fenced": {"resetstate": "fenced"},
+            "sandbox": {"sandboxid": "ffffffffffff"},
+            "version": {"publisherregistryversion": "2"},
+            "missing version": {"publisherregistryversion": None},
+            "missing registry": {"publishers": None},
+            "missing occupancy": {"occupancy": None},
+            "unknown occupancy": {"occupancy": "idle"},
+            "testing without owner": {"occupancy": "testing"},
+            "uppercase generation": {"publishers": "{}",
+                                     "resetgeneration": "ABCDEF00-0000-4000-8000-000000000001"},
+            "noncompact": {"publishers": "{ }"},
+            "noncompact member": {"publishers": "{" + entry.replace(":", ": ", 1) + "}"},
+            "unsorted member fields": {"publishers": '{"%s":{"state":"active","generation":"%s"}}'
+                                       % (self.MEMBER, self.GENERATION)},
+            "array": {"publishers": "[]"},
+            "duplicate": {"publishers": "{" + entry + "," + entry + "}"},
+            "unknown field": {"publishers": '{"%s":{"generation":"%s","lease":1,"state":"active"}}'
+                              % (self.MEMBER, self.GENERATION)},
+            "unknown state": {"publishers": self.member(self.GENERATION, "gone")},
+            "noncanonical member": {"publishers": self.member(self.GENERATION).replace(
+                self.MEMBER, self.MEMBER.replace("-", ""))},
+            "generation mismatch": {"publishers": self.member(self.ROTATED)},
+            "slots": {"publishers": full},
+            "bytes": {"publishers": "{" + " " * 4096 + "}"},
+            "metadata budget": {"padding": "x" * 8192},
+        }
+        for name, change in cases.items():
+            with self.subTest(name), self.assertRaises(Failure):
+                PublisherControl(self.authority(change)).read()
+        _, registry, _ = PublisherControl(self.authority(
+            {"occupancy": "stopping", "occupancyid": self.ROTATED})).read()
+
+    def test_canonical_encoding_is_byte_identical_to_rust(self):
+        azure = self.authority({"publishers": self.member(self.GENERATION, "uncertain")})
+        control = PublisherControl(azure)
+        publisher = "00000000-0000-4000-8000-000000000003"
+        control.admit(publisher, self.GENERATION)
+        self.assertEqual(azure.metadata["publishers"],
+                         '{"00000000-0000-4000-8000-000000000003":{"generation":"%s","state":"active"},'
+                         '"00000000-0000-4000-8000-000000000009":{"generation":"%s","state":"uncertain"}}'
+                         % (self.GENERATION, self.GENERATION))
+        control.clean_release(publisher, self.GENERATION, definitively_drained=True)
+        # Rust clean_drain_deregisters_only_self golden: other member bytes preserved.
+        self.assertEqual(azure.metadata["publishers"], self.member(self.GENERATION, "uncertain"))
+
+    def test_released_ignores_stale_occupancy_owner_like_rust(self):
+        PublisherControl(self.authority({"occupancyid": "not-a-uuid"})).read()
