@@ -346,6 +346,14 @@ def deploy(azure):
         raise Failure("Existing checkpoint container has no valid reset authority.")
     if control.get("occupancy") == "testing":
         raise Failure("Cloud tests own the sandbox; provisioning requires their explicit release.")
+    if container:
+        # Fence with a data-plane compare/exchange before ARM work. Otherwise a
+        # test can acquire occupancy between the preliminary read and deployment.
+        metadata, etag = azure.control()
+        require_released(metadata)
+        metadata.update(resetstate="fenced", resetgeneration=str(uuid.uuid4()))
+        azure.set_control(metadata, etag)
+        control = metadata
     params = {
         "location": c.location, "resourceGroupName": c.group,
         "sandboxId": c.sandbox, "storageAccountName": c.account,
@@ -593,6 +601,7 @@ def main(argv=None):
             write_private(args.output, c.generated())
             if not args.infra_only:
                 metadata, etag = azure.control()
+                require_released(metadata)
                 metadata.update(resetstate="fenced", resetgeneration=str(uuid.uuid4()))
                 azure.set_control(metadata, etag)
                 metadata, etag = azure.control()
