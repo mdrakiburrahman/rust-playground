@@ -51,13 +51,16 @@ class FakeAzure:
         return self.databases if path.endswith("/databases") else self.containers
 
     def blobs(self, container):
-        return list(self.items[container])
+        return [{"etag": f'"{item["name"]}"', **item} for item in self.items[container]]
 
     def paths(self, container):
-        return [{"name": name, "isDirectory": True} for name in self.directories[container]]
+        return [{"name": name, "isDirectory": True, "etag": f'"{name}"'}
+                for name in self.directories[container]]
 
-    def delete_directory(self, container, name):
+    def delete_directory(self, container, name, etag=None):
         self.events.append(("DELETE_DIRECTORY", name))
+        if etag != f'"{name}"':
+            raise b.HttpFailure(412, "HTTP 412: condition not met")
         self.directories[container].remove(name)
 
     def control(self):
@@ -81,6 +84,10 @@ class FakeAzure:
     def blob(self, method, container, name, **kwargs):
         self.events.append((method, name))
         if method == "DELETE":
+            current = [item for item in self.blobs(container) if item["name"] == name]
+            expected = (kwargs.get("headers") or {}).get("If-Match")
+            if current and expected is not None and current[0]["etag"] != expected:
+                raise b.HttpFailure(412, "HTTP 412: condition not met")
             self.items[container] = [item for item in self.items[container] if item["name"] != name]
 
 
@@ -597,11 +604,169 @@ class ResetTests(unittest.TestCase):
             {operator: {"generation": other, "state": "active"}}, separators=(",", ":")))
         with self.assertRaisesRegex(b.Failure, "neither"):
             b._unqualified_reset_resume(self.azure)
+        self.record.unlink()
         b.write_reset_record(self.record, {**record, "sandbox": "another"})
         with self.assertRaisesRegex(b.Failure, "another sandbox"):
             b._unqualified_reset_resume(self.azure)
         self.assertEqual(self.azure.events, [])
         self.assertTrue(self.record.exists())
+
+    # --- local custody record: exclusive, create-if-absent, durable --------------------
+
+    def claim_hook(self, during_claim):
+        original = self.azure.set_control
+        def set_control(metadata, etag):
+            if metadata["resetstate"] == "cleaning-v1" and not getattr(self, "hooked", False):
+                self.hooked = True
+                during_claim()
+            return original(metadata, etag)
+        return patch.object(self.azure, "set_control", side_effect=set_control)
+
+    @patch.object(b.time, "sleep")
+    @patch.object(b, "run_tree")
+    def test_second_reset_process_is_excluded_by_lock_between_publish_and_claim(self, run, sleep):
+        self.start_reset(run)
+        seen = {}
+        def competitor():
+            seen["bytes"] = self.record.read_bytes()
+            with self.assertRaisesRegex(b.Failure, "custody lock"):
+                b._unqualified_reset_sequence(self.azure, ["stop"])
+            with self.assertRaisesRegex(b.Failure, "custody lock"):
+                b._unqualified_reset_resume(self.azure)
+            self.assertEqual(self.record.read_bytes(), seen["bytes"])
+        with self.claim_hook(competitor):
+            b._unqualified_reset_sequence(self.azure, ["stop"])
+        self.assertIn("bytes", seen)
+        self.assert_clean_finish(json.loads(seen["bytes"]))
+
+    @patch.object(b.time, "sleep")
+    @patch.object(b, "run_tree")
+    def test_toctou_loser_never_overwrites_or_unlinks_winner_record(self, run, sleep):
+        """Even with the lock bypassed, link() create-if-absent keeps the winner's record."""
+        self.start_reset(run)
+        seen = {}
+        def competitor():  # read-before-publish raced: it saw no record
+            seen["bytes"] = self.record.read_bytes()
+            with patch.object(b, "read_reset_record", return_value=None):
+                with self.assertRaisesRegex(b.Failure, "never overwriting"):
+                    b._unqualified_reset_sequence(self.azure, ["stop"])
+            self.assertEqual(self.record.read_bytes(), seen["bytes"])
+            self.assertEqual([p.name for p in self.record.parent.iterdir()
+                              if p.name.startswith(".env.azure.reset.") and not p.name.endswith(".lock")
+                              and p != self.record], [])
+        with patch.object(b, "reset_lock", lambda path: contextlib.nullcontext()), \
+                self.claim_hook(competitor):
+            b._unqualified_reset_sequence(self.azure, ["stop"])
+        self.assert_clean_finish(json.loads(seen["bytes"]))
+
+    @patch.object(b.time, "sleep")
+    @patch.object(b, "run_tree")
+    def test_definite_claim_loser_never_removes_record_it_does_not_own(self, run, sleep):
+        self.start_reset(run)
+        foreign = {"sandbox": self.azure.c.sandbox, "operator": str(uuid.uuid4()),
+                   "generation": self.azure.metadata["resetgeneration"], "next": str(uuid.uuid4())}
+        def replaced_then_refused(operator, generation):
+            self.record.unlink()
+            b.write_reset_record(self.record, foreign)
+            raise b.Failure("definitely refused")
+        with patch("publisher_control.PublisherControl.claim_cleanup", side_effect=replaced_then_refused):
+            with self.assertRaisesRegex(b.Failure, "never removing"):
+                b._unqualified_reset_sequence(self.azure, ["stop"])
+        self.assertEqual(self.record.read_bytes(), b.record_bytes(foreign))
+        with self.assertRaisesRegex(b.Failure, "never removing"):
+            b.remove_reset_record(self.record, {**foreign, "operator": str(uuid.uuid4())})
+        self.assertEqual(self.record.read_bytes(), b.record_bytes(foreign))
+
+    @patch.object(b.time, "sleep")
+    @patch.object(b, "run_tree")
+    def test_parent_fsync_failure_propagates_before_claim_and_resume_repairs(self, run, sleep):
+        self.start_reset(run)
+        real = b.fsync_directory
+        failing = b.Failure("Cleanup custody record directory could not be made durable")
+        with patch.object(b, "fsync_directory", side_effect=failing):
+            with self.assertRaisesRegex(b.Failure, "made durable"):
+                b._unqualified_reset_sequence(self.azure, ["stop"])
+            self.assertNotIn(("control", "cleaning-v1"), self.azure.events)
+            self.assertEqual(self.azure.metadata["resetstate"], "fenced-v1")
+            with self.assertRaisesRegex(b.Failure, "made durable"):
+                b._unqualified_reset_resume(self.azure)
+            self.assertNotIn(("control", "cleaning-v1"), self.azure.events)
+        record = b.read_reset_record(self.record)
+        with patch.object(b, "fsync_directory", wraps=real) as fsync:
+            b._unqualified_reset_resume(self.azure)
+        self.assertEqual(fsync.call_args_list[0].args, (self.record.parent,))  # repair first
+        self.assertGreaterEqual(fsync.call_count, 2)  # and after the durable removal
+        self.assert_clean_finish(record)
+
+    def test_record_publish_fsyncs_file_then_parent_and_is_canonical(self):
+        record = {"sandbox": self.azure.c.sandbox, "operator": str(uuid.uuid4()),
+                  "generation": str(uuid.uuid4()), "next": str(uuid.uuid4())}
+        order = []
+        real_fsync = os.fsync
+        with patch.object(b.os, "fsync", side_effect=lambda fd: (order.append(fd), real_fsync(fd))), \
+                patch.object(b.os, "link", wraps=os.link) as link:
+            b.write_reset_record(self.record, record)
+        self.assertEqual(len(order), 2)  # temp file, then parent directory after link
+        link.assert_called_once()
+        self.assertEqual(self.record.read_bytes(), b.record_bytes(record))
+        self.assertEqual(self.record.stat().st_mode & 0o777, 0o600)
+        with self.assertRaisesRegex(b.Failure, "never overwriting"):
+            b.write_reset_record(self.record, {**record, "operator": str(uuid.uuid4())})
+        self.assertEqual(self.record.read_bytes(), b.record_bytes(record))
+        with patch.object(b.os, "fsync", side_effect=OSError("EIO")):
+            with self.assertRaisesRegex(b.Failure, "made durable"):
+                b.remove_reset_record(self.record, record)
+
+    # --- ambiguous DELETE: physical reconciliation, conditional on exact object -------
+
+    @patch.object(b.time, "sleep")
+    @patch.object(b, "run_tree")
+    def test_timed_out_unapplied_delete_is_reissued_only_for_same_object(self, run, sleep):
+        self.start_reset(run)
+        original, lost = self.azure.blob, []
+        def timeout(method, container, name, **kwargs):
+            if method == "DELETE" and not lost:
+                lost.append((container, name, kwargs))
+                self.azure.events.append((method, name))
+                raise b.Failure("timed out; outcome unknown")
+            return original(method, container, name, **kwargs)
+        with patch.object(self.azure, "blob", side_effect=timeout):
+            with self.assertRaisesRegex(b.Failure, "outcome unknown"):
+                b._unqualified_reset_sequence(self.azure, ["stop"])
+        self.assertEqual(lost[0][2]["headers"]["If-Match"], '"table/data.parquet"')
+        record = b.read_reset_record(self.record)
+        b._unqualified_reset_resume(self.azure)
+        self.assertEqual(self.azure.events.count(("DELETE", "table/data.parquet")), 2)
+        self.assert_clean_finish(record)
+        # The stale in-flight request lands after rotation and a successor write at the path.
+        container, name, kwargs = lost[0]
+        self.azure.items[container].append({"name": name, "etag": '"successor"', "snapshot": None,
+                                            "version": None, "deleted": False})
+        with self.assertRaises(b.HttpFailure) as stale:
+            self.azure.blob("DELETE", container, name, **kwargs)
+        self.assertEqual(stale.exception.code, 412)
+        self.assertEqual([item["etag"] for item in self.azure.items[container]], ['"successor"'])
+
+    @patch.object(b.time, "sleep")
+    @patch.object(b, "run_tree")
+    def test_object_without_etag_is_never_deleted_unconditionally(self, run, sleep):
+        self.start_reset(run)
+        self.azure.items[self.azure.c.data][0]["etag"] = None
+        with self.assertRaisesRegex(b.Failure, "no ETag"):
+            b._unqualified_reset_sequence(self.azure, ["stop"])
+        self.assert_no_deletion()
+        self.assertEqual(self.azure.metadata["resetstate"], "cleaning-v1")
+        self.assertTrue(self.record.exists())
+
+    def test_real_listing_captures_blob_etag(self):
+        azure = REAL_AZURE(b.Config({"AZURE_SUBSCRIPTION_ID": SUB}))
+        listing = (b"<EnumerationResults><Blobs><Blob><Name>t/x</Name>"
+                   b"<Properties><Etag>0x8D1</Etag></Properties></Blob></Blobs></EnumerationResults>")
+        with patch.object(azure, "blob", return_value=(listing, {})):
+            self.assertEqual(azure.blobs("c")[0]["etag"], "0x8D1")
+        with patch.object(azure, "request") as request:
+            azure.delete_directory("c", "t", '"e"')
+        self.assertEqual(request.call_args.kwargs["headers"]["If-Match"], '"e"')
 
 
 class OccupancyTests(unittest.TestCase):

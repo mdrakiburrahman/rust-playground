@@ -3,7 +3,9 @@
 
 import argparse
 import base64
+import contextlib
 from email.utils import formatdate
+import fcntl
 import hashlib
 import json
 import os
@@ -272,6 +274,7 @@ class Azure:
                     "name": entry.findtext("Name"),
                     "snapshot": entry.findtext("Snapshot"),
                     "version": entry.findtext("VersionId"),
+                    "etag": entry.findtext("Properties/Etag"),
                     "deleted": entry.findtext("Deleted") == "true",
                 })
             marker = tree.findtext("NextMarker")
@@ -294,11 +297,11 @@ class Azure:
             if not continuation:
                 return paths
 
-    def delete_directory(self, container, name):
+    def delete_directory(self, container, name, etag):
         path = urllib.parse.quote(name, safe="/")
         self.request(
             "DELETE", f"https://{self.c.account}.dfs.core.windows.net/{container}/{path}?recursive=false",
-            "https://storage.azure.com/", headers={"x-ms-version": "2023-11-03"},
+            "https://storage.azure.com/", headers={"x-ms-version": "2023-11-03", "If-Match": etag},
             missing_ok=True,
         )
 
@@ -707,9 +710,10 @@ def reset_inventory(azure):
             directory = str(path.get("isDirectory", False)).lower() == "true"
             if entry is not None:
                 entry["directory"] = directory
+                entry["etag"] = entry.get("etag") or path.get("etag")
             else:
                 inventory[name].append({
-                    "name": path["name"], "directory": directory,
+                    "name": path["name"], "directory": directory, "etag": path.get("etag"),
                     "deleted": False, "version": None, "snapshot": None,
                 })
     if any(blob["deleted"] for blobs in inventory.values() for blob in blobs):
@@ -764,20 +768,71 @@ def read_reset_record(path):
     return record
 
 
+def record_bytes(record):
+    return json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
+
+
+def fsync_directory(directory):
+    try:
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        raise Failure("Cleanup custody record directory could not be made durable; "
+                      "no claim or deletion attempted.") from exc
+
+
+@contextlib.contextmanager
+def reset_lock(path):
+    """Exclusive local ownership across record read -> publish -> claim -> cleanup."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path.with_name(path.name + ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise Failure("Another reset process holds the local custody lock; refusing.") from exc
+        yield
+    finally:
+        os.close(fd)  # closing the descriptor releases the flock
+
+
 def write_reset_record(path, record):
-    """Durably persist custody identity BEFORE the claim CAS (0600, fsync, atomic)."""
+    """Create-if-absent, durably (file and parent fsync) BEFORE the claim CAS.
+
+    Never overwrites: a link() onto an existing record fails. A durability
+    failure propagates before any CAS; resume re-fsyncs before acting.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".env.azure.reset.")
     try:
-        with os.fdopen(fd, "w") as stream:
-            json.dump(record, stream, sort_keys=True)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(record_bytes(record))
             stream.flush()
             os.fsync(stream.fileno())
         os.chmod(temporary, 0o600)
-        os.replace(temporary, path)
+        try:
+            os.link(temporary, path)
+        except FileExistsError as exc:
+            raise Failure("A cleanup custody record already exists; never overwriting it.") from exc
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+    fsync_directory(path.parent)
+
+
+def remove_reset_record(path, record):
+    """Remove only this operator's byte-identical record, durably."""
+    try:
+        current = path.read_bytes()
+    except OSError as exc:
+        raise Failure("Cleanup custody record is unreadable; not removing it.") from exc
+    if current != record_bytes(record):
+        raise Failure("Cleanup custody record is not this operator's; never removing it.")
+    path.unlink()
+    fsync_directory(path.parent)
 
 
 def verified_stop_receipt(stdout, generation):
@@ -795,8 +850,13 @@ def verified_stop_receipt(stdout, generation):
 
 def _unqualified_reset_sequence(azure, stop_command, record_path=None):
     """Gated v1 operator sequence. NOT dispatched: public reset --execute stays blocked."""
-    from publisher_control import READY, PublisherControl, UnknownTransition
     record_path = record_path or RESET_RECORD
+    with reset_lock(record_path):
+        _locked_reset_sequence(azure, stop_command, record_path)
+
+
+def _locked_reset_sequence(azure, stop_command, record_path):
+    from publisher_control import READY, PublisherControl, UnknownTransition
     c = azure.c
     if read_reset_record(record_path) is not None:
         raise Failure("A cleanup custody record exists; resume it instead of a fresh claim.")
@@ -833,7 +893,7 @@ def _unqualified_reset_sequence(azure, stop_command, record_path=None):
     except UnknownTransition:
         raise Failure("Cleanup claim outcome unknown; custody record kept for read-only resume.")
     except Failure as exc:
-        record_path.unlink()  # Definitely refused before any CAS: no custody exists.
+        remove_reset_record(record_path, record)  # Definite refusal: no custody exists.
         raise Failure("Reset authority changed during quiescence or publishers remain; "
                       "refusing data deletion.") from exc
     running_or_abort(azure, control, record, record_path)
@@ -851,7 +911,7 @@ def running_or_abort(azure, control, record, record_path):
         require_running(azure)
     except Failure:
         control.abort_cleanup(record["operator"], record["generation"], nothing_deleted=True)
-        record_path.unlink()
+        remove_reset_record(record_path, record)
         raise Failure("Cluster is not Running after the cleanup claim (a stop won); "
                       "custody aborted before any deletion. Start via provision, then retry.")
 
@@ -863,19 +923,28 @@ def _unqualified_reset_resume(azure, record_path=None):
     generation. Never takes over or clears a foreign or uncertain member, and
     never starts or stops the cluster.
     """
-    from publisher_control import CLEANING, FENCED, PublisherControl, UnknownTransition
     record_path = record_path or RESET_RECORD
+    with reset_lock(record_path):
+        _locked_reset_resume(azure, record_path)
+
+
+def _locked_reset_resume(azure, record_path):
+    from publisher_control import CLEANING, FENCED, PublisherControl, UnknownTransition
     record = read_reset_record(record_path)
     if record is None:
         raise Failure("No cleanup custody record; nothing to resume.")
+    if record_path.read_bytes() != record_bytes(record):
+        raise Failure("Cleanup custody record is not in canonical form; refusing.")
     if record["sandbox"] != azure.c.sandbox:
         raise Failure("Cleanup custody record belongs to another sandbox; refusing.")
+    # Durability repair: a crash may have preceded the parent fsync.
+    fsync_directory(record_path.parent)
     control = PublisherControl(azure)
     metadata, registry, _ = control.read()
     operator, generation = record["operator"], record["generation"]
     if metadata["resetgeneration"] == record["next"]:
         # Only this record knows the fresh successor: the finish CAS applied earlier.
-        record_path.unlink()
+        remove_reset_record(record_path, record)
         print("Earlier cleanup already finished and rotated authority; record cleared.")
         return
     if metadata["resetgeneration"] != generation:
@@ -914,30 +983,38 @@ def cleanup_with_custody(azure, control, record, record_path):
     control.cleanup_operator(operator, generation)
     require_running(azure)
     databases, inventory = reset_inventory(azure)
+    if any(not (blob["version"] or blob["snapshot"] or blob.get("etag"))
+           for blobs in inventory.values() for blob in blobs):
+        raise Failure("Inventoried object has no ETag; refusing an unconditional delete.")
     if databases:
         control.cleanup_operator(operator, generation)
         delete_owned_database(azure, databases[0])
     for container, blobs in inventory.items():
         control.cleanup_operator(operator, generation)
         for blob in sorted(blobs, key=lambda item: item["name"].count("/"), reverse=True):
-            if blob.get("directory"):
-                azure.delete_directory(container, blob["name"])
-                continue
             query = {}
             if blob["version"]:
                 query["versionid"] = blob["version"]
             elif blob["snapshot"]:
                 query["snapshot"] = blob["snapshot"]
-            azure.blob("DELETE", container, blob["name"], query=query,
-                       headers={} if query else {"x-ms-delete-snapshots": "include"},
-                       missing_ok=True)
+            if query:  # immutable snapshot/version identity cannot name a successor object
+                azure.blob("DELETE", container, blob["name"], query=query, missing_ok=True)
+                continue
+            # Base blobs and HNS paths: delete only the exact inventoried object, so an
+            # unknown in-flight request landing late cannot remove a successor at the path.
+            if blob.get("directory"):
+                azure.delete_directory(container, blob["name"], blob["etag"])
+            else:
+                azure.blob("DELETE", container, blob["name"],
+                           headers={"x-ms-delete-snapshots": "include", "If-Match": blob["etag"]},
+                           missing_ok=True)
     remaining = [b for name in (c.data, c.checkpoints) for b in azure.blobs(name)]
     remaining.extend(path for name in (c.data, c.checkpoints) for path in azure.paths(name))
     if remaining:
         raise Failure("Reset left workload state behind; cleanup authority retained.")
     retry_ready(lambda: no_databases(azure), "Database deletion")
     control.finish_cleanup(operator, generation, record["next"], definitively_cleaned=True)
-    record_path.unlink()
+    remove_reset_record(record_path, record)
     print("Reset verified: zero databases and zero blobs, versions or snapshots; "
           "authority is fenced-v1 at a fresh generation.")
 
