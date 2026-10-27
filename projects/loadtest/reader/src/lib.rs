@@ -328,15 +328,96 @@ pub fn sample_rows(directory: &Path, identity: &str, summary: &TableSummary) -> 
 pub fn sample_corpus(directory: &Path, identity: &str, summary: &TableSummary) -> Result<ValidationCorpus> {
     let root = table_root(directory, identity)?;
     let mut builder = CorpusBuilder::new(summary)?;
-    for file in &summary.files {
-        let path = local_active_file(&root, root.join(&file.path).to_str().context("non-UTF8 data path")?)?;
-        let reader = SerializedFileReader::new(File::open(path)?)?;
-        for row in reader.get_row_iter(None)? {
-            let value = with_partitions(row_value(&row?), &summary.schema, &file.partition_values)?;
-            builder.add(value, &file.partition_values)?;
+    // Batches bound decoded rows held in memory; rows still reach the builder in file order.
+    for batch in summary.files.chunks(decode_workers().saturating_mul(2)) {
+        let decoded = decode_in_order(batch, |file| -> Result<Vec<(Value, String, String)>> {
+            let path = local_active_file(&root, root.join(&file.path).to_str().context("non-UTF8 data path")?)?;
+            let reader = SerializedFileReader::new(File::open(path)?)?;
+            let mut rows = Vec::new();
+            for row in reader.get_row_iter(None)? {
+                let value = with_partitions(row_value(&row?), &summary.schema, &file.partition_values)?;
+                let (encoded, digest) = corpus::encode_row(&value)?;
+                rows.push((value, encoded, digest));
+            }
+            Ok(rows)
+        });
+        for (file, rows) in batch.iter().zip(decoded) {
+            for (value, encoded, digest) in rows? {
+                builder.add_encoded(value, encoded, digest, &file.partition_values)?;
+            }
         }
     }
     builder.finish(summary)
+}
+
+struct FileDecode {
+    bytes: u64,
+    rows: u64,
+    row_hashes: BTreeMap<String, u64>,
+    payload_row_hashes: BTreeMap<String, u64>,
+}
+
+fn summarize_file(
+    path: &Path,
+    schema: &Value,
+    partition_values: &PartitionValues,
+    partition_columns: &[String],
+) -> Result<FileDecode> {
+    let bytes = fs::metadata(path)?.len();
+    let reader =
+        SerializedFileReader::new(File::open(path)?).with_context(|| format!("open Parquet {}", path.display()))?;
+    let rows = u64::try_from(reader.metadata().file_metadata().num_rows())
+        .context("negative or overflowing Parquet row count")?;
+    let mut row_hashes = BTreeMap::<String, u64>::new();
+    let mut payload_row_hashes = BTreeMap::<String, u64>::new();
+    for row in reader.get_row_iter(None)? {
+        let value = with_partitions(row_value(&row?), schema, partition_values)?;
+        *row_hashes.entry(row_digest(&value)?).or_default() += 1;
+        *payload_row_hashes
+            .entry(payload_digest(value, partition_columns)?)
+            .or_default() += 1;
+    }
+    Ok(FileDecode {
+        bytes,
+        rows,
+        row_hashes,
+        payload_row_hashes,
+    })
+}
+
+fn decode_workers() -> usize {
+    std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+}
+
+/// Decodes independent active files on every available core and returns results in input order,
+/// so merged multisets and the first reported error match a serial pass exactly.
+fn decode_in_order<T: Sync, R: Send>(items: &[T], decode: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let workers = decode_workers().min(items.len());
+    if workers <= 1 {
+        return items.iter().map(decode).collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut results = std::thread::scope(|scope| {
+        let handles = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(item) = items.get(index) else { break };
+                        done.push((index, decode(item)));
+                    }
+                    done
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
+            .collect::<Vec<_>>()
+    });
+    results.sort_unstable_by_key(|(index, _)| *index);
+    results.into_iter().map(|(_, result)| result).collect()
 }
 
 fn table_root(directory: &Path, identity: &str) -> Result<PathBuf> {
@@ -494,11 +575,7 @@ async fn summarize_roots(directory: &Path, roots: Vec<PathBuf>) -> Result<Snapsh
         let partition_columns = snapshot.metadata().partition_columns().to_vec();
         let schema = serde_json::to_value(snapshot.schema())?;
         let uris = delta.get_file_uris_by_partitions(&[]).await?;
-        let mut files = Vec::with_capacity(uris.len());
-        let mut rows = 0_u64;
-        let mut bytes = 0_u64;
-        let mut row_hashes = BTreeMap::<String, u64>::new();
-        let mut payload_row_hashes = BTreeMap::<String, u64>::new();
+        let mut active = Vec::with_capacity(uris.len());
         for uri in uris {
             let path = local_active_file(&root, &uri)?;
             let relative = path
@@ -509,32 +586,34 @@ async fn summarize_roots(directory: &Path, roots: Vec<PathBuf>) -> Result<Snapsh
             let partition_values = partitions
                 .get(&relative)
                 .context("active file lacks committed partition values")?;
-            let size = fs::metadata(&path)?.len();
-            let reader = SerializedFileReader::new(File::open(&path)?)
-                .with_context(|| format!("open Parquet {}", path.display()))?;
-            let file_rows = u64::try_from(reader.metadata().file_metadata().num_rows())
-                .context("negative or overflowing Parquet row count")?;
-            for row in reader.get_row_iter(None)? {
-                let value = with_partitions(row_value(&row?), &schema, partition_values)?;
-                *payload_row_hashes
-                    .entry(payload_digest(value.clone(), &partition_columns)?)
-                    .or_default() += 1;
-                let digest = format!("sha256:{}", hex::encode(Sha256::digest(serde_json::to_vec(&value)?)));
-                *row_hashes.entry(digest).or_default() += 1;
+            active.push((path, relative, partition_values));
+        }
+        let decoded = decode_in_order(&active, |(path, _, partition_values)| {
+            summarize_file(path, &schema, partition_values, &partition_columns)
+        });
+        let mut files = Vec::with_capacity(active.len());
+        let mut rows = 0_u64;
+        let mut bytes = 0_u64;
+        let mut row_hashes = BTreeMap::<String, u64>::new();
+        let mut payload_row_hashes = BTreeMap::<String, u64>::new();
+        for ((_, relative, partition_values), decoded) in active.into_iter().zip(decoded) {
+            let decoded = decoded?;
+            for (digest, count) in decoded.row_hashes {
+                *row_hashes.entry(digest).or_default() += count;
             }
-            let relative = path
-                .strip_prefix(&root)?
-                .to_str()
-                .context("non-UTF8 data path")?
-                .to_owned();
+            for (digest, count) in decoded.payload_row_hashes {
+                *payload_row_hashes.entry(digest).or_default() += count;
+            }
             files.push(FileSummary {
                 path: relative,
-                bytes: size,
-                rows: file_rows,
+                bytes: decoded.bytes,
+                rows: decoded.rows,
                 partition_values: partition_values.clone(),
             });
-            rows = rows.checked_add(file_rows).context("snapshot row count overflow")?;
-            bytes = bytes.checked_add(size).context("snapshot byte count overflow")?;
+            rows = rows.checked_add(decoded.rows).context("snapshot row count overflow")?;
+            bytes = bytes
+                .checked_add(decoded.bytes)
+                .context("snapshot byte count overflow")?;
         }
         files.sort_by(|left, right| left.path.cmp(&right.path));
         let minimum_file_bytes = files.iter().map(|file| file.bytes).min().unwrap_or(0);
@@ -756,6 +835,120 @@ mod tests {
                 "{invalid:?}"
             );
         }
+        Ok(())
+    }
+
+    /// Scenario: parallel decode finishes items out of order and some items fail.
+    /// Guarantees: results (including the first error) come back in input order, like a serial map.
+    #[test]
+    fn parallel_decode_preserves_input_order_and_errors() {
+        let items = (0..997_u64).collect::<Vec<_>>();
+        let decode = |item: &u64| -> Result<u64> {
+            if item % 97 == 13 {
+                bail!("item {item} failed");
+            }
+            std::thread::sleep(std::time::Duration::from_micros((item * 7919) % 50));
+            Ok(item * 3)
+        };
+        let parallel = decode_in_order(&items, decode)
+            .into_iter()
+            .map(|result| result.map_err(|error| error.to_string()))
+            .collect::<Vec<_>>();
+        let serial = items
+            .iter()
+            .map(|item| decode(item).map_err(|error| error.to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(parallel, serial);
+        assert_eq!(
+            parallel
+                .iter()
+                .find_map(|result| result.as_ref().err())
+                .map(String::as_str),
+            Some("item 13 failed")
+        );
+        assert!(decode_in_order(&[] as &[u64], decode).is_empty());
+    }
+
+    /// Scenario: a partitioned table has more active files than one parallel batch, with rows
+    /// duplicated within and across files and partitions.
+    /// Guarantees: summaries and the chunked corpus keep the exact serial row multiset, and a corrupt
+    /// active file still fails both paths.
+    #[tokio::test]
+    async fn parallel_file_decode_keeps_exact_multisets_across_many_files() -> Result<()> {
+        use arrow::{
+            array::{Int32Array, RecordBatch},
+            datatypes::{DataType, Field, Schema},
+        };
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+        let directory = TestDirectory::new("parallel-files")?;
+        let root = directory.path().join("telemetry/sqlserver/many");
+        fs::create_dir_all(root.join("_delta_log"))?;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let delta_schema = json!({"type":"struct","fields":[
+            {"name":"id","type":"integer","nullable":false,"metadata":{}},
+            {"name":"__arrowcol_ingestion","type":"string","nullable":false,"metadata":{}}
+        ]});
+        let mut actions = vec![
+            json!({"protocol":{"minReaderVersion":1,"minWriterVersion":2}}),
+            json!({"metaData":{"id":"fixture-many","format":{"provider":"parquet","options":{}},
+                "schemaString":delta_schema.to_string(),"partitionColumns":["__arrowcol_ingestion"],"configuration":{}}}),
+        ];
+        let mut expected_rows = BTreeMap::<String, u64>::new();
+        let mut expected_payload = BTreeMap::<String, u64>::new();
+        let files = decode_workers().saturating_mul(2) + 6;
+        for index in 0..files {
+            let partition = format!("2026-10-27-{:02}", index % 5);
+            let ids = (0..(index % 7 + 1))
+                .map(|offset| i32::try_from((index + offset) % 11))
+                .collect::<Result<Vec<_>, _>>()?;
+            for id in &ids {
+                *expected_rows
+                    .entry(json!({"id":id,"__arrowcol_ingestion":partition}).to_string())
+                    .or_default() += 1;
+                *expected_payload.entry(row_digest(&json!({"id":id}))?).or_default() += 1;
+            }
+            let relative = format!("part-{index:03}.parquet");
+            let data = root.join(&relative);
+            let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int32Array::from(ids))])?;
+            let mut writer = ArrowWriter::try_new(File::create(&data)?, Arc::clone(&schema), None)?;
+            writer.write(&batch)?;
+            writer.close()?;
+            actions.push(
+                json!({"add":{"path":relative,"partitionValues":{"__arrowcol_ingestion":partition},
+                "size":fs::metadata(&data)?.len(),"modificationTime":1,"dataChange":true}}),
+            );
+        }
+        fs::write(
+            root.join("_delta_log/00000000000000000000.json"),
+            actions.iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n",
+        )?;
+
+        let snapshot = summarize(directory.path()).await?;
+        let summary = &snapshot.tables["telemetry.sqlserver.many"];
+        let expected_hashes = expected_rows
+            .iter()
+            .map(|(row, count)| Ok((row_digest(&serde_json::from_str(row)?)?, *count)))
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        assert_eq!(summary.active_files, files);
+        assert_eq!(summary.rows, expected_rows.values().sum::<u64>());
+        assert_eq!(summary.row_hashes, expected_hashes);
+        assert_eq!(summary.payload_row_hashes, expected_payload);
+        assert!(summary.files.windows(2).all(|pair| pair[0].path < pair[1].path));
+
+        let corpus = sample_corpus(directory.path(), "telemetry.sqlserver.many", summary)?;
+        let mut chunked = BTreeMap::<String, u64>::new();
+        for chunk in &corpus.chunks {
+            for (row, count) in &chunk.rows {
+                *chunked.entry(row.to_string()).or_default() += count;
+            }
+        }
+        assert_eq!(chunked, expected_rows);
+        assert_eq!(corpus.expected_rows, summary.rows);
+
+        fs::write(root.join("part-007.parquet"), b"not parquet")?;
+        assert!(summarize(directory.path()).await.is_err());
+        assert!(sample_corpus(directory.path(), "telemetry.sqlserver.many", summary).is_err());
         Ok(())
     }
 
