@@ -205,6 +205,8 @@ impl BatchAdmission for DfeAdmission {
             .await
             .map_err(|_| RuntimeError::draining())?;
         let envelope = ArrowcolBatchEnvelope {
+            publication_id: None,
+            ingested_at_ms: None,
             table: context.metadata().table().clone(),
             source_schema_version: context.registered_schema().version(),
             target_schema_version: context.current_schema().version(),
@@ -348,7 +350,10 @@ impl StreamLifecycle for DfeStreamLifecycle {
         let rows = u64::try_from(batch.num_rows()).unwrap_or(u64::MAX);
         let bytes = arrow_deltalake::record_batch_logical_bytes(&batch).map_err(|_| RuntimeError::internal())?;
         self.metrics.batch_received(rows, bytes);
-        let records = encode_record_batch(self.envelope.clone(), batch).map_err(|_| RuntimeError::internal())?;
+        let mut envelope = self.envelope.clone();
+        envelope.publication_id = Some(arrowcol_protocol::ReceiptId::new());
+        envelope.ingested_at_ms = Some(now_unix_millis().map_err(|_| RuntimeError::internal())?);
+        let records = encode_record_batch(envelope, batch).map_err(|_| RuntimeError::internal())?;
         let correlation_id = self
             .pending
             .insert_for_stream(
@@ -968,6 +973,8 @@ mod tests {
 
     fn envelope() -> ArrowcolBatchEnvelope {
         ArrowcolBatchEnvelope {
+            publication_id: Some(arrowcol_protocol::ReceiptId::new()),
+            ingested_at_ms: Some(arrowcol_protocol::UnixMillis::new(1_700_000_012_345).expect("stamp")),
             table: arrowcol_protocol::TableIdentity::new(
                 CatalogName::new("demo").expect("catalog"),
                 SchemaName::new("generated").expect("schema"),
@@ -1449,6 +1456,26 @@ mod tests {
         lifecycle.push_batch(batch()).await.expect("second batch");
         let ids = sent_ids(&sender);
         assert_eq!(ids.len(), 2);
+        let envelopes = sender
+            .sent
+            .lock()
+            .expect("capture lock")
+            .drain(..)
+            .map(|(_, pdata)| {
+                let (_, payload) = pdata.into_parts();
+                let otel_arrow_dfe_pdata::PayloadData::PdataArrowRecords(records) = payload.into_data() else {
+                    panic!("expected pluggable Arrow records");
+                };
+                crate::decode_record_set(*records)
+                    .expect("decode")
+                    .pop()
+                    .expect("one batch")
+                    .envelope
+            })
+            .collect::<Vec<_>>();
+        assert!(envelopes.iter().all(|envelope| envelope.ingested_at_ms.is_some()));
+        assert!(envelopes.iter().all(|envelope| envelope.publication_id.is_some()));
+        assert_ne!(envelopes[0].publication_id, envelopes[1].publication_id);
         {
             let mut completion = lifecycle.complete(summary());
             assert!((&mut completion).now_or_never().is_none());

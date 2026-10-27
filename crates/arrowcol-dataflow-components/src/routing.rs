@@ -541,6 +541,8 @@ mod tests {
             ..draining.clone()
         };
         let current = ArrowcolBatchEnvelope {
+            publication_id: Some(arrowcol_protocol::ReceiptId::new()),
+            ingested_at_ms: Some(time(1_000)),
             table: table(),
             source_schema_version: arrowcol_catalog::SchemaVersion::FIRST,
             target_schema_version: arrowcol_catalog::SchemaVersion::FIRST,
