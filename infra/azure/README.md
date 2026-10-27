@@ -87,6 +87,18 @@ or uncertain publishers must leave blocking registrations, with no TTL or
 force-unregister shortcut. A local stop receipt, checkbox, or 60-second delay
 cannot substitute for that distributed authority.
 
+Registry metadata alone cannot activate a new protocol safely: older
+reset-aware binaries ignore unknown registry fields while accepting
+`resetstate=ready`. Activation must version an authority state those binaries
+already enforce, so incompatible binaries fail closed rather than publish
+without registering. Arbitrary OAuth clients and binaries predating reset
+fencing are outside the cooperative protocol and must be stopped before cleanup.
+An uncertain server write remains an uncertain registration even if a later
+transaction lookup proves logical commit success. Opaque SDK write retries must
+be disabled or tracked through definitive completion; logical reconciliation is
+not proof that no delayed request can still mutate storage. None of these
+activation conditions enables the currently disabled reset command.
+
 The test runner acquires shared occupancy before live tests and releases it only
 after its owned writers/consumers stop successfully:
 
