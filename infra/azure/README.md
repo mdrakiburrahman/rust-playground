@@ -323,8 +323,17 @@ The following describes the operator sequence behind the still-disabled public
   is workspace-local evidence. Registry closure remains the drain proof.
 - **Custody record.** Before the claim CAS, the operator UUID, the captured
   generation, the precomputed successor generation and the sandbox are
-  written atomically to the gitignored, mode-`0600` `.env.azure.reset.json`.
-  A fresh sequence refuses while that record exists.
+  written to the gitignored, mode-`0600` `.env.azure.reset.json`.
+  - An exclusive `flock` on `.env.azure.reset.json.lock` is held from the
+    record read through publish, claim and cleanup. A second reset or resume
+    process is refused.
+  - The record is published create-if-absent with `link()`, never `replace()`.
+    The file is fsynced, then the parent directory. A durability failure
+    propagates before the claim CAS.
+  - Removal requires byte-identical canonical content and fsyncs the parent.
+    A loser never overwrites or removes a record it does not own.
+  - A fresh sequence refuses while that record exists. Resume first re-fsyncs
+    the parent directory (durability repair) before any CAS.
   - Resume first re-reads the authority.
   - If the successor generation is already present, the earlier finish
     applied, and resume only removes the record.
@@ -335,10 +344,21 @@ The following describes the operator sequence behind the still-disabled public
   - Foreign, uncertain, extra or other-generation members are refused, never
     taken over or cleared.
   - An unknown claim, delete or finish keeps the record and custody.
-- **Observe-first deletion.** Every step re-inventories. An applied blob DELETE
-  whose response was lost is not replayed. A database already `Deleting` is
-  not resubmitted, and a pending database delete fails rather than reporting
-  clean. Unknown stop/start outcomes are never replayed by reset.
+- **Observe-first deletion.** Every step re-inventories the physical state. An
+  applied blob DELETE whose response was lost is absent and is not reissued.
+  An unapplied one is reissued for the same object.
+  - Base blobs and HNS paths are deleted only with `If-Match` on the
+    inventoried ETag. A stale in-flight request that lands late therefore
+    gets `412` against any successor object at that path.
+  - Snapshots and versions are addressed by immutable identity.
+  - Objects without an ETag are refused before any deletion.
+  - A database already `Deleting` is not resubmitted. A pending database
+    delete fails rather than reporting clean.
+  - Unknown stop/start outcomes are never replayed by reset.
+  - **Open predicate:** the ARM database DELETE has no precondition. An
+    unknown submission that lands after rotation and reprovisioning could
+    remove the successor database. Live qualification must bound or observe
+    that before enablement.
 
 ### Writer inventory (enablement gate input)
 
