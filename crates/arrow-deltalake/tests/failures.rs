@@ -161,7 +161,8 @@ async fn uncertain_published_commit_is_not_replayed() -> Result<()> {
 }
 
 /// Scenario: storage publishes a stable transaction but loses its success response.
-/// Guarantees: replay discovers that identity and never submits a duplicate log version.
+/// Guarantees: replay discovers that identity, never submits a duplicate log version,
+/// and retains the submitted staged path.
 #[tokio::test]
 async fn identified_unknown_success_reconciles_before_retry() -> Result<()> {
     identified_unknown_success(Fault::Uncertain, true).await
@@ -195,6 +196,10 @@ async fn identified_unknown_success(fault: Fault, succeeds: bool) -> Result<()> 
     file.write(&input).await?;
     let result = file.finish().await;
     assert_eq!(result.is_ok(), succeeds, "{result:?}");
+    if let Ok(append) = &result {
+        // The published path may be the one named by the uncertain log entry.
+        assert!(append.file.path.exists(), "unknown-success stage must be retained");
+    }
     assert_eq!(store.attempts.load(Ordering::SeqCst), 1);
     assert!(!directory.path().join("_delta_log/00000000000000000002.json").exists());
     let published = std::fs::read_to_string(directory.path().join("_delta_log/00000000000000000001.json"))?;

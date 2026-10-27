@@ -209,6 +209,11 @@ fn publications() -> &'static PublicationMetrics {
     })
 }
 
+/// Count a publication-side event outside a timed publication attempt.
+pub(crate) fn publication_event(outcome: &'static str) {
+    publications().events.add(1, &[KeyValue::new("outcome", outcome)]);
+}
+
 pub(crate) struct PublicationObservation {
     started: Instant,
     outcome: &'static str,
