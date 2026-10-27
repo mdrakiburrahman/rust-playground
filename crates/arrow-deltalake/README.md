@@ -153,7 +153,17 @@ commit or hint fsync failure can follow a visible publication, so it fails the
 acknowledgment and the retry/reconciliation path (same publication txn) must
 re-establish durability rather than roll back.
 Exhaustion and semantic/schema conflicts remain visible errors; orphan files
-remain for inspection. The 10-second
+remain for inspection.
+A deduplicated publication reclaims only this table's staged files that no commit
+attempt ever carried (an atomic fresh/submitted/reclaimed claim per stage, through
+the guarded publication cleanup); a reclaimed stage is refused by later commits,
+and the deduplicated `AppendResult.file` may no longer exist. Files offered to any
+attempt (unknown success, collision retries, concurrent borrows) are conservatively
+retained even if the call then deduplicates, and log-only VACUUM LITE cannot
+reclaim them. A cleanup failure keeps the file, never fails the publication, and is
+reported only as the `orphan_reclaimed`/`orphan_cleanup_failed` publication
+outcomes plus a warning carrying a fixed failure class (no path or error text).
+Disk use is therefore not proven to plateau. The 10-second
 collection window is not a visibility bound: dependency waves add latency.
 
 ## Publication fencing
@@ -247,8 +257,8 @@ transaction prepare/committer/total timings and file counts/bytes, domain and
 transaction lookup/cache results, CRC, JSON/Parquet reads, scan selection and
 predicate/dedup/transform work, and storage listing/reading/copying. The match is
 exhaustive for pinned Kernel 0.29. Publication outcomes include `attempt`,
-`conflict`, `retryable_io`, `committed`, `deduplicated`, `reconciled`, `exhausted`
-and `failure`; the duration records one terminal observation per publication.
+`conflict`, `retryable_io`, `committed`, `deduplicated`, `reconciled`, `exhausted`,
+`failure`, `orphan_reclaimed` and `orphan_cleanup_failed`; the duration records one terminal observation per publication.
 No table URI, account, application UUID or correlation ID is a metric label.
 Prometheus/OTLP exporters may normalize dots and append unit/type suffixes.
 

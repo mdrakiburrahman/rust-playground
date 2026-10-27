@@ -1,5 +1,6 @@
 //! Process-level concurrency proof: a separate blind-append writer process runs
 //! while the standalone service binary applies OPTIMIZE, PURGE and VACUUM LITE.
+#![cfg(unix)]
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use arrow::array::{Int64Array, RecordBatch, StringArray};
@@ -74,25 +75,122 @@ impl OwnedChild {
                 return Ok(status);
             }
             if Instant::now() >= deadline {
-                self.kill_and_reap();
-                bail!("{what} (pid {}) exceeded its deadline and was killed", self.child.id());
+                let pid = self.child.id();
+                let cleanup = self.kill_and_reap();
+                bail!("{what} (pid {pid}) exceeded its deadline; kill and reap: {cleanup:?}");
             }
             std::thread::sleep(Duration::from_millis(10));
         }
     }
 
-    fn kill_and_reap(&mut self) {
-        if !self.reaped {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-            self.reaped = true;
+    /// Kill and reap this exact child. Cleanup counts as confirmed only once `wait`
+    /// returns its exit status; a kill error alone is reported, not assumed fatal.
+    fn kill_and_reap(&mut self) -> Result<()> {
+        if self.reaped {
+            return Ok(());
         }
+        let killed = self.child.kill();
+        self.child
+            .wait()
+            .with_context(|| format!("reap pid {} after kill {killed:?}", self.child.id()))?;
+        self.reaped = true;
+        Ok(())
     }
 }
 
 impl Drop for OwnedChild {
     fn drop(&mut self) {
-        self.kill_and_reap();
+        if let Err(error) = self.kill_and_reap() {
+            eprintln!("child cleanup unconfirmed: {error:#}");
+        }
+    }
+}
+
+/// The outer test process's custody of a driver and every descendant: the driver
+/// leads its own process group (inherited by writer/service children), and this
+/// process is a child subreaper, so descendants orphaned by a killed driver are
+/// reparented here and reaped. Cleanup is confirmed only when the group is empty.
+struct ProcessTree {
+    driver: Child,
+    group: rustix::process::Pid,
+    settled: bool,
+}
+
+impl ProcessTree {
+    fn spawn(command: &mut Command) -> Result<Self> {
+        use std::os::unix::process::CommandExt;
+        rustix::process::set_child_subreaper(Some(rustix::process::getpid()))?;
+        let driver = command.process_group(0).spawn()?;
+        let group = rustix::process::Pid::from_child(&driver);
+        Ok(Self {
+            driver,
+            group,
+            settled: false,
+        })
+    }
+
+    /// Wait for the driver until `deadline`, then sweep its whole group. On timeout
+    /// the group is killed first and the call fails.
+    fn wait_until(&mut self, deadline: Instant) -> Result<ExitStatus> {
+        loop {
+            if let Some(status) = self.driver.try_wait()? {
+                self.sweep()?;
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                let killed = self.kill_group();
+                let reaped = self.driver.wait().map(|_| ());
+                let swept = self.sweep();
+                bail!(
+                    "driver group {} exceeded its deadline; kill {killed:?} reap {reaped:?} sweep {swept:?}",
+                    self.group.as_raw_nonzero()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn kill_group(&self) -> Result<()> {
+        match rustix::process::kill_process_group(self.group, rustix::process::Signal::KILL) {
+            Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+            Err(error) => Err(anyhow!("kill process group: {error}")),
+        }
+    }
+
+    /// Kill any surviving member, reap every reparented member, and confirm that no
+    /// process remains in the group.
+    fn sweep(&mut self) -> Result<()> {
+        self.kill_group()?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match rustix::process::waitpgid(self.group, rustix::process::WaitOptions::NOHANG) {
+                Ok(Some(_)) => continue,
+                Ok(None) | Err(rustix::io::Errno::CHILD) => {}
+                Err(error) => bail!("reap process group: {error}"),
+            }
+            match rustix::process::test_kill_process_group(self.group) {
+                Err(rustix::io::Errno::SRCH) => {
+                    self.settled = true;
+                    return Ok(());
+                }
+                Ok(()) | Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                other => bail!("process group still present after kill: {other:?}"),
+            }
+        }
+    }
+}
+
+impl Drop for ProcessTree {
+    fn drop(&mut self) {
+        if !self.settled {
+            let killed = self.kill_group();
+            let reaped = self.driver.wait().map(|_| ());
+            if let Err(error) = self.sweep() {
+                eprintln!("driver group cleanup unconfirmed: kill {killed:?} reap {reaped:?}: {error:#}");
+            }
+        }
     }
 }
 
@@ -320,8 +418,8 @@ fn driver(root: &Path) -> Result<()> {
     let start_deadline = (started + Duration::from_secs(120)).min(deadline);
     while !root.join("writer-started").exists() {
         if Instant::now() >= start_deadline || !child.running()? {
-            child.kill_and_reap();
-            bail!("writer never started");
+            let cleanup = child.kill_and_reap();
+            bail!("writer never started; kill and reap: {cleanup:?}");
         }
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -471,15 +569,78 @@ fn separate_writer_process_with_service_optimize_purge_vacuum() -> Result<()> {
         Ok("driver") => driver(&PathBuf::from(std::env::var(ROOT)?)),
         _ => {
             let root = tempfile::tempdir()?;
-            let mut driver = OwnedChild::spawn(
+            let mut driver = ProcessTree::spawn(
                 Command::new(std::env::current_exe()?)
                     .args([TEST, "--exact", "--nocapture", "--test-threads=1"])
                     .env(ROLE, "driver")
                     .env(ROOT, root.path())
                     .env("ARROWCOL_PARTITION_GRANULARITY", "minute"),
             )?;
-            let status = driver.wait_until(Instant::now() + OUTER_DEADLINE, "driver")?;
+            let status = driver.wait_until(Instant::now() + OUTER_DEADLINE)?;
             ensure!(status.success(), "driver failed");
+            Ok(())
+        }
+    }
+}
+
+const CUSTODY_TEST: &str = "outer_custody_kills_and_reaps_hung_driver_descendants";
+
+/// Scenario (fault injection): the driver spawns a grandchild that sleeps, then hangs
+/// itself past a short outer deadline; the outer kills the driver with SIGKILL, so
+/// the driver's own child guards never run.
+/// Guarantees: the outer deadline fails the run, and the grandchild is killed and
+/// reaped through the driver's process group, not left running after the driver.
+#[test]
+fn outer_custody_kills_and_reaps_hung_driver_descendants() -> Result<()> {
+    let sleep = || std::thread::sleep(Duration::from_secs(600));
+    match std::env::var(ROLE).as_deref() {
+        Ok("sleeper") => {
+            sleep();
+            Ok(())
+        }
+        Ok("hang") => {
+            let root = PathBuf::from(std::env::var(ROOT)?);
+            let grandchild = Command::new(std::env::current_exe()?)
+                .args([CUSTODY_TEST, "--exact", "--test-threads=1"])
+                .env(ROLE, "sleeper")
+                .spawn()?;
+            fs::write(root.join("grandchild.pid"), grandchild.id().to_string())?;
+            // Deliberately never waits: only the outer custody can reclaim it.
+            std::mem::forget(grandchild);
+            sleep();
+            Ok(())
+        }
+        _ => {
+            let root = tempfile::tempdir()?;
+            let mut tree = ProcessTree::spawn(
+                Command::new(std::env::current_exe()?)
+                    .args([CUSTODY_TEST, "--exact", "--test-threads=1"])
+                    .env(ROLE, "hang")
+                    .env(ROOT, root.path()),
+            )?;
+            let pid_file = root.path().join("grandchild.pid");
+            let spawned = Instant::now() + Duration::from_secs(60);
+            while !pid_file.exists() {
+                ensure!(Instant::now() < spawned, "grandchild never started");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let raw: i32 = fs::read_to_string(&pid_file)?.trim().parse()?;
+            let grandchild = rustix::process::Pid::from_raw(raw).context("grandchild pid")?;
+            ensure!(
+                rustix::process::test_kill_process(grandchild).is_ok(),
+                "grandchild not running"
+            );
+            let error = tree
+                .wait_until(Instant::now() + Duration::from_secs(2))
+                .err()
+                .context("hung driver must exceed its deadline")?;
+            let message = format!("{error:#}");
+            ensure!(message.contains("sweep Ok(())"), "{message}");
+            ensure!(
+                rustix::process::test_kill_process(grandchild) == Err(rustix::io::Errno::SRCH),
+                "grandchild {raw} survived the killed driver"
+            );
+            println!("custody proof: {message}; grandchild {raw} reaped");
             Ok(())
         }
     }

@@ -1877,6 +1877,20 @@ fn prune_log_refuses_checkpoint_with_changed_configuration() -> Result<()> {
     })
 }
 
+/// The planner's age stamp for a commit: the later of its `commitInfo.timestamp`
+/// and its mtime. A coarse filesystem clock can record an mtime a tick earlier than
+/// the commit timestamp, so mtime alone can place a cutoff on a still-young commit.
+fn age_stamp_ms(path: &Path) -> Result<i64> {
+    let committed = fs::read_to_string(path)?
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .filter_map(|action| action.ok()?["commitInfo"]["timestamp"].as_i64())
+        .max();
+    Ok(committed.map_or(modified_ms(path)?, |stamp| {
+        stamp.max(modified_ms(path).unwrap_or(stamp))
+    }))
+}
+
 fn modified_ms(path: &Path) -> Result<i64> {
     Ok(i64::try_from(
         fs::metadata(path)?
@@ -2085,7 +2099,7 @@ fn prune_log_resume_respects_increased_retention() -> Result<()> {
     let leftovers: Vec<PathBuf> = all_files.iter().filter(|path| **path != retained).cloned().collect();
     let newest = leftovers
         .iter()
-        .map(|path| modified_ms(path))
+        .map(|path| age_stamp_ms(path))
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .max()

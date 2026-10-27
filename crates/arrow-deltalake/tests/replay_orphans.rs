@@ -186,6 +186,38 @@ fn reclaimed_stage_cannot_be_committed_later() -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Default)]
+struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl Logs {
+    fn text(&self) -> Result<String> {
+        let bytes = self.0.lock().map_err(|_| anyhow::anyhow!("log buffer poisoned"))?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+}
+
+impl Write for Logs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .map_err(|_| std::io::Error::other("log buffer poisoned"))?
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
 struct PauseFence {
     armed: AtomicBool,
     entered: Barrier,
@@ -285,6 +317,30 @@ fn collision_retry_retains_submitted_stage() -> Result<()> {
     Ok(())
 }
 
+/// Scenario: a call whose outer identity is already committed carries a fresh stage
+/// of a different table nested under this table's root.
+/// Guarantees: the dedupe does not reclaim the foreign stage, which keeps its file
+/// and state and then commits normally to its own table.
+#[test]
+fn deduplicated_call_never_reclaims_foreign_nested_stage() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let outer = DeltaTable::open(root.path())?;
+    seed(&outer)?;
+    assert_eq!(outer.commit_files_with_transaction(&[], "outer", 0)?, 2);
+    let nested_root = root.path().join("nested");
+    fs::create_dir(&nested_root)?;
+    let nested = DeltaTable::open(&nested_root)?;
+    let foreign = stage(&nested, 5, None)?;
+    assert_eq!(
+        outer.commit_files_with_transaction(std::slice::from_ref(&foreign), "outer", 0)?,
+        2
+    );
+    assert_eq!(parquet_files(&nested_root)?, 1, "foreign stage must survive");
+    assert_eq!(nested.commit_files_with_transaction(&[foreign], "nested", 0)?, 1);
+    assert_eq!(adds_in(&nested_root, 1)?, 1);
+    Ok(())
+}
+
 /// Scenario: a deduplicated replay's stage cannot be deleted (read-only directory).
 /// Guarantees: the publication result is still success, the file stays on disk, and
 /// the failure is counted as `orphan_cleanup_failed`.
@@ -298,9 +354,33 @@ fn reclaim_failure_is_visible_and_never_fails_publication() -> Result<()> {
     seed(&table)?;
     assert_eq!(table.commit_files_with_transaction(&[], "outer", 0)?, 2);
     let replay = stage(&table, 1, None)?;
+    let staged: Vec<String> = fs::read_dir(root.path())?
+        .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+        .collect::<Result<_>>()?;
+    let logs = Logs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        // Scope the canary to this crate's events; Kernel's own spans are not ours.
+        .with_env_filter(tracing_subscriber::EnvFilter::new("arrow_deltalake=trace"))
+        .with_ansi(false)
+        .finish();
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o555))?;
-    let result = table.commit_files_with_transaction(&[replay], "outer", 0);
+    let result = {
+        let _guard = tracing_subscriber::util::SubscriberInitExt::set_default(subscriber);
+        table.commit_files_with_transaction(&[replay], "outer", 0)
+    };
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755))?;
+    let text = logs.text()?;
+    assert!(
+        text.contains("cleanup failed") && text.contains("io_permission_denied"),
+        "{text}"
+    );
+    // Privacy canary: no path component of the table or a staged file is exported.
+    let dir_name = root.path().file_name().and_then(|name| name.to_str()).context("dir")?;
+    assert!(!text.contains(dir_name), "{text}");
+    for name in staged.iter().filter(|name| name.ends_with(".parquet")) {
+        assert!(!text.contains(name.as_str()), "{text}");
+    }
     assert_eq!(result?, 2);
     assert_eq!(parquet_files(root.path())?, 2);
     assert!(publication_events("orphan_cleanup_failed")? >= 1);
