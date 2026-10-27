@@ -6,7 +6,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { chromium, type Browser, type Page } from 'playwright';
 
 import { safeKustoError } from './kusto.js';
-import { metricRangeEvidence, panelFrameEvidence } from './metrics-gate.js';
+import { metricRangeEvidence, panelDiagnostics, panelFrameEvidence } from './metrics-gate.js';
 import { requiredMetrics } from './metric-contract.js';
 
 export const kustoExplorerStartArguments = [
@@ -349,6 +349,7 @@ export async function runGrafanaGate(options: UiGateOptions): Promise<void> {
     };
     const panelIds = scope === 'source-sdk' ? [1, 2, 6, 10, 11] : [1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15];
     for (const id of panelIds) {
+      evidence.active_panel = { id, status: 'pending' };
       const panel = dashboard.panels.find(panel => panel.id === id);
       if (!panel || panel.type !== 'timeseries' || panel.datasource?.uid !== 'prometheus' || !panel.targets.length) {
         throw new Error(`Missing required Grafana operation panel ${id} with the qualified datasource`);
@@ -369,8 +370,13 @@ export async function runGrafanaGate(options: UiGateOptions): Promise<void> {
         page.goto(`http://lgtm:3000/d-solo/arrowcol-delta-operations?from=${start * 1000}&to=${end * 1000}&panelId=${id}`,
           { timeout: 60_000 }),
       ]);
+      evidence.active_panel = { id, http_status: response.status() };
       if (!response.ok()) throw new Error(`Grafana panel ${id} datasource HTTP ${response.status()}`);
-      const delivered = panelFrameEvidence(await response.json());
+      const responseDocument: unknown = await response.json();
+      evidence.active_panel = {
+        id, http_status: response.status(), ...panelDiagnostics(responseDocument, response.request().postDataJSON()),
+      };
+      const delivered = panelFrameEvidence(responseDocument);
       await page.getByText(panel.title, { exact: true }).waitFor({ state: 'visible', timeout: 30_000 });
       await page.waitForFunction(() => [...document.querySelectorAll('canvas')].some(canvas => canvas.width > 100 && canvas.height > 100),
         null, { timeout: 30_000 });
@@ -378,6 +384,7 @@ export async function runGrafanaGate(options: UiGateOptions): Promise<void> {
       const screenshot = `grafana-delta-panel-${id}.png`;
       await page.screenshot({ path: path.join(options.results, screenshot), fullPage: true });
       (evidence.panels as unknown[]).push({ id, title: panel.title, samples, delivered, screenshot });
+      delete evidence.active_panel;
     }
     await page.goto(`http://lgtm:3000/d/arrowcol-delta-operations?from=${start * 1000}&to=${end * 1000}`, { timeout: 60_000 });
     await page.screenshot({ path: path.join(options.results, 'grafana-delta-operations.png'), fullPage: true });
