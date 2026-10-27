@@ -69,13 +69,18 @@ export function parseMetrics(text: string): Record<string, number> {
 }
 
 // Static commands only; never read container environment or print Docker error output.
-const resourceScript = [
-  ['status', '/proc/1/status'],
+export const resourceScript = [
+  'pid=1',
+  'case "$(cat /proc/1/comm)" in docker-init|tini) set -- $(cat /proc/1/task/1/children); ' +
+    'if [ "$#" -ne 1 ]; then printf "__READ_ERROR__\\n"; exit 1; fi; pid="$1";; esac',
+  'printf "\\n__status__\\n"; cat "/proc/$pid/status" 2>/dev/null || printf "__READ_ERROR__\\n"',
+  ...[
   ['current', '/sys/fs/cgroup/memory.current'],
   ['stat', '/sys/fs/cgroup/memory.stat'],
   ['cpu', '/sys/fs/cgroup/cpu.stat'],
-].map(([name, file]) =>
-  `printf '\\n__${name}__\\n'; cat ${file} 2>/dev/null || printf '__READ_ERROR__\\n'`).join('; ');
+  ].map(([name, file]) =>
+    `printf '\\n__${name}__\\n'; cat ${file} 2>/dev/null || printf '__READ_ERROR__\\n'`),
+].join('; ');
 
 export function parseResources(text: string): Record<string, unknown> {
   const sections = (name: string): string => {
