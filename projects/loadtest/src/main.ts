@@ -428,16 +428,16 @@ export function localLoadgenEnvironment(
 
 async function runLocalLoadgen(
   context: Pick<BenchmarkContext, 'directory' | 'env' | 'network' | 'options'>,
-  command: 'run' | 'validate',
+  command: 'run' | 'drain' | 'validate',
   results: string,
   controller: BenchmarkController,
 ): Promise<void> {
   await runInteractive(
     path.join(cargoTargetDirectory(), 'debug/arrowcol-loadgen'),
     [command],
-    localLoadgenEnvironment(context, results),
+    { ...localLoadgenEnvironment(context, results), LOADTEST_COLLECTORS_DRAINED: String(command === 'validate') },
     controller,
-    command === 'validate' ? 3_600_000 : context.options.measureSeconds === undefined ? undefined : (context.options.warmupSeconds + context.options.measureSeconds + 600) * 1000,
+    command !== 'run' ? 600_000 : context.options.measureSeconds === undefined ? undefined : (context.options.warmupSeconds + context.options.measureSeconds + 600) * 1000,
   );
 }
 
@@ -645,6 +645,26 @@ async function benchmark(
     }
     if (crash) step(`Quiver crash recovery evidence: ${resultsDirectory}/${QUIVER_RECOVERY_FILE}`);
     if (options.validate) {
+      phase = 'publication-drain';
+      step('Draining publication while collector admin endpoints remain available');
+      await runLocalLoadgen(context, 'drain', path.join(directory, 'results'), controller);
+      phase = 'live-grafana-validation';
+      await runGrafanaGate({
+        workspace, results: path.join(directory, 'results'), browserEndpoint: `ws://${network.playwright}:3000/`,
+        metricScope: 'source-sdk', bridgeEnabled: Boolean(env.LOADTEST_KUSTO_BRIDGE_ENDPOINT),
+        compose: (args, timeout) => compose(project, env, args, timeout), log: step,
+      });
+      phase = 'mutator-drain';
+      step('Cleanly stopping all source, maintenance and tenant mutators before immutable snapshot capture');
+      const cleanServices = await stopBenchmark(workspace, args => run('docker', args, process.env, 360_000), {
+        requireCleanMutators: true, mutatorsOnly: true,
+      });
+      const metadata: unknown = JSON.parse(readFileSync(path.join(directory, 'results/run-metadata.json'), 'utf8'));
+      assert(metadata && typeof metadata === 'object' && 'run_id' in metadata && typeof metadata.run_id === 'string',
+        'Cannot bind stopped-mutator evidence without the run identity');
+      writeFileSync(path.join(directory, 'results/mutator-drain.json'), `${JSON.stringify({
+        run_id: metadata.run_id, clean: true, services: cleanServices, finished_at: new Date().toISOString(),
+      }, null, 2)}\n`);
       phase = 'output-validation';
       step('Validating Delta and native Kusto output');
       controller.checkRunning();
@@ -662,11 +682,6 @@ async function benchmark(
         log: step,
       });
       step(`kusto-explorer UI gate passed: ${gate.tables} tables and ${gate.rows} rows matched through the UI`);
-      phase = 'grafana-validation';
-      await runGrafanaGate({
-        workspace, results: path.join(directory, 'results'), browserEndpoint: `ws://${network.playwright}:3000/`,
-        compose: (args, timeout) => compose(project, env, args, timeout), log: step,
-      });
       }
     }
   } catch (error) {

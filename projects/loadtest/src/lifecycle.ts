@@ -241,8 +241,9 @@ function resources(docker: Docker, kind: 'container' | 'network' | 'volume'): Re
 
 /** Stops only verified resources owned by this workspace, retaining data for inspection. */
 export async function stopBenchmark(
-  workspace: string, docker: Docker, options: { requireCleanMutators?: boolean } = {},
-): Promise<void> {
+  workspace: string, docker: Docker, options: { requireCleanMutators?: boolean; mutatorsOnly?: boolean } = {},
+): Promise<string[]> {
+  if (options.mutatorsOnly && !options.requireCleanMutators) throw new Error('Final validation requires clean mutator drain verification');
   const directories = benchmarkDirectories(workspace);
   const projects = new Set([BENCHMARK_PROJECT, ...directories.map(directory => `rust-playground-loadtest-${path.basename(directory)}`)]);
   const containers = resources(docker, 'container').filter(resource => {
@@ -251,10 +252,16 @@ export async function stopBenchmark(
       .includes(path.join(workspace, 'projects/loadtest/compose.yaml'))) {
       throw new Error('Refusing to stop a Docker project owned by another workspace');
     }
-    return true;
+    return !options.mutatorsOnly ||
+      ['direct-1', 'dataflow-1', 'tenant-stream', 'delta-maintenance'].includes(resource.labels['com.docker.compose.service']);
   });
+  if (options.mutatorsOnly && ['direct-1', 'dataflow-1'].some(service =>
+    !containers.some(container => container.labels['com.docker.compose.service'] === service))) {
+    throw new Error('Cannot freeze validation without both positively identified collectors');
+  }
   await stopBenchmarkProcesses(workspace, directories);
   if (containers.length) docker(['stop', '--time', options.requireCleanMutators ? '300' : '30', ...containers.map(container => container.id)]);
+  const cleanMutators: string[] = [];
   if (options.requireCleanMutators) {
     for (const container of containers) {
       const service = container.labels['com.docker.compose.service'];
@@ -265,8 +272,10 @@ export async function stopBenchmark(
           !('ExitCode' in state) || state.ExitCode !== 0 || !('OOMKilled' in state) || state.OOMKilled !== false) {
         throw new Error(`Cloud mutator ${service} did not exit cleanly; retain occupancy and publisher registration`);
       }
+      cleanMutators.push(service);
     }
   }
+  return cleanMutators;
 }
 
 export async function resetBenchmark(workspace: string, docker: Docker): Promise<string> {

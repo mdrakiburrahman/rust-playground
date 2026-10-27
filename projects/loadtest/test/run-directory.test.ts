@@ -131,6 +131,31 @@ test('cloud release prerequisite drains all mutators and rejects forced, OOM or 
   }
 });
 
+test('final capture stops every mutator but keeps Kusto and live-evidence services available', async t => {
+  const workspace = fixture(t);
+  const services = ['direct-1', 'dataflow-1', 'tenant-stream', 'delta-maintenance', 'kusto', 'lgtm'];
+  const commands: string[][] = [];
+  const docker = (args: string[]): string => {
+    commands.push(args);
+    if (args[0] === 'ps') return services.join('\n');
+    if (args[0] === 'stop') return '';
+    assert.equal(args[0], 'inspect');
+    if (args.includes('{{json .State}}')) return JSON.stringify({ Running: false, ExitCode: 0, OOMKilled: false });
+    const service = args.at(-1);
+    assert(service && services.includes(service));
+    return JSON.stringify({ id: service, name: service, labels: {
+      'com.docker.compose.project': BENCHMARK_PROJECT,
+      'com.docker.compose.service': service,
+      'com.docker.compose.project.config_files': path.join(workspace, 'projects/loadtest/compose.yaml'),
+    } });
+  };
+  assert.deepEqual(await stopBenchmark(workspace, docker, { mutatorsOnly: true, requireCleanMutators: true }), services.slice(0, 4));
+  assert.deepEqual(commands.find(args => args[0] === 'stop'), ['stop', '--time', '300', ...services.slice(0, 4)]);
+  const partial = mockDocker(workspace);
+  await assert.rejects(stopBenchmark(workspace, partial.docker, { mutatorsOnly: true, requireCleanMutators: true }), /both positively identified/u);
+  assert(partial.commands.every(args => args[0] !== 'stop'));
+});
+
 test('starting again removes old output and owned SQL, Hive and Kusto resources without an identity flag', async t => {
   const workspace = fixture(t);
   const latest = path.join(workspace, 'onelake/benchmark/latest');

@@ -18,6 +18,48 @@ use crate::{
     },
 };
 
+/// Wait for real publication queues while their admin endpoints are still alive.
+///
+/// # Errors
+/// Rejects missing run metadata, unreachable collectors, and undrained publication.
+pub async fn drain(arguments: ValidateArgs) -> Result<()> {
+    let metadata: Value = read_json(&arguments.results.join("run-metadata.json")).await?;
+    let run_id = metadata["run_id"].as_str().context("missing drain run identity")?;
+    crate::kusto::settle_dataflow(
+        &arguments.dataflow_admin_endpoints,
+        arguments.timeout.get(),
+        arguments.quiver,
+    )
+    .await?;
+    fs::write(
+        arguments.results.join("publication-drain.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({"run_id": run_id, "dataflow_settled": true}))?,
+    )
+    .await?;
+    Ok(())
+}
+
+fn check_drain_receipts(metadata: &Value, publication: &Value, mutators: &Value) -> Result<()> {
+    let run_id = metadata["run_id"].as_str().context("missing validation run identity")?;
+    anyhow::ensure!(
+        publication["run_id"].as_str() == Some(run_id)
+            && publication["dataflow_settled"].as_bool() == Some(true)
+            && mutators["run_id"].as_str() == Some(run_id)
+            && mutators["clean"].as_bool() == Some(true),
+        "publication and mutator drain evidence must match the captured run"
+    );
+    let services = mutators["services"]
+        .as_array()
+        .context("missing clean mutator identities")?;
+    anyhow::ensure!(
+        ["direct-1", "dataflow-1"]
+            .iter()
+            .all(|required| services.iter().any(|service| service.as_str() == Some(*required))),
+        "both source collectors must have clean stopped evidence"
+    );
+    Ok(())
+}
+
 /// Independently validates manifests, direct/dataflow Delta snapshots, routing,
 /// delivery guarantees, and paired logical parity.
 ///
@@ -32,7 +74,13 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
     let capabilities: Value = read_json(&arguments.results.join(CAPABILITY_EVIDENCE_FILE)).await?;
 
     let mut failures = Vec::new();
-    let kusto_settle = if arguments.kusto_endpoint.is_some() {
+    let kusto_settle = if arguments.collectors_drained {
+        let metadata = read_json(&arguments.results.join("run-metadata.json")).await?;
+        let publication = read_json(&arguments.results.join("publication-drain.json")).await?;
+        let mutators = read_json(&arguments.results.join("mutator-drain.json")).await?;
+        check_drain_receipts(&metadata, &publication, &mutators)?;
+        None
+    } else if arguments.kusto_endpoint.is_some() {
         crate::kusto::settle_dataflow(
             &arguments.dataflow_admin_endpoints,
             arguments.timeout.get(),
@@ -753,6 +801,32 @@ struct ValidationReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stopped_validation_rejects_missing_stale_and_partial_drain_receipts() -> Result<()> {
+        let metadata = serde_json::json!({"run_id": "current"});
+        let publication = serde_json::json!({"run_id": "current", "dataflow_settled": true});
+        let mutators = serde_json::json!({"run_id": "current", "clean": true, "services": ["direct-1", "dataflow-1"]});
+        check_drain_receipts(&metadata, &publication, &mutators)?;
+        for invalid in [
+            Value::Null,
+            serde_json::json!({"run_id": "old", "clean": true, "services": ["direct-1", "dataflow-1"]}),
+            serde_json::json!({"run_id": "current", "clean": false, "services": ["direct-1", "dataflow-1"]}),
+            serde_json::json!({"run_id": "current", "clean": true, "services": ["direct-1"]}),
+        ] {
+            assert!(check_drain_receipts(&metadata, &publication, &invalid).is_err());
+        }
+        assert!(check_drain_receipts(&metadata, &Value::Null, &mutators).is_err());
+        assert!(
+            check_drain_receipts(
+                &metadata,
+                &serde_json::json!({"run_id": "old", "dataflow_settled": true}),
+                &mutators
+            )
+            .is_err()
+        );
+        Ok(())
+    }
 
     fn collector(instance_id: &str, terminated: bool) -> RoutingCollectorEvidence {
         RoutingCollectorEvidence {

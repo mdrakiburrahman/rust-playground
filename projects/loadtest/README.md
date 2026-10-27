@@ -323,6 +323,24 @@ all 26 tables, and the per-table row counts exported from the UI match
 and fails on any browser console error. In ordinary runs, a kusto-explorer
 startup failure is only a warning.
 
+Validation first drains publication and collects live Grafana health/plot
+evidence while mutators remain running. It then cleanly stops **all** source,
+maintenance and tenant mutators, records run-bound drain receipts, and only then
+captures immutable Delta versions and runs the cached/fallback correctness gate.
+The read-only validator, Kusto and Explorer remain available; their lifetime
+does not authorize occupancy release. Ordinary non-validation runs retain the
+live stack. Stopped-mutator receipts are not distributed registry-close proof.
+
+The baseline Grafana gate is explicitly scoped to `source-sdk`: every one of
+the seven Kernel/publication families must have actual samples from **each**
+collector's OTLP resource, plus healthy live scrapes and individual source
+counter/byte/duration panel screenshots paired with their exact datasource
+queries. A baseline pass is not full service telemetry qualification.
+`service-qualification` additionally requires real maintenance removals and
+physical deletion, tenant skipping/checkpoint metrics and native QAP per pool;
+bridge metrics are required only when enabled. Measured zero backlog/retries are
+valid, but missing metrics never become manufactured zeroes.
+
 Run the focused verification suite with:
 
 ```bash

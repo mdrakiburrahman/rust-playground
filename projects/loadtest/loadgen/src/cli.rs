@@ -21,6 +21,8 @@ pub enum Command {
     Run(Box<RunArgs>),
     /// Validate benchmark manifests and independent Delta snapshots.
     Validate(ValidateArgs),
+    /// Drain publication while collectors are still running, without capturing snapshots.
+    Drain(ValidateArgs),
     /// Initialize both Azure pools from the canonical schemas while reset is fenced.
     InitializeAzure(InitializeAzureArgs),
     /// Write the canonical Azure table manifest without accessing or mutating storage.
@@ -327,6 +329,10 @@ pub struct ValidateArgs {
     /// Both collectors persisted to native Quiver: every acknowledged dataflow row must be published.
     #[arg(long, env = "LOADTEST_QUIVER", default_value_t = false)]
     pub quiver: bool,
+
+    /// The runner has recorded clean stopped mutators for this exact run.
+    #[arg(long, env = "LOADTEST_COLLECTORS_DRAINED", default_value_t = false)]
+    pub collectors_drained: bool,
 }
 
 #[cfg(test)]
