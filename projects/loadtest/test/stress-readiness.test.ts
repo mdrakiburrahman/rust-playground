@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { test, type TestContext } from 'node:test';
 import { pathToFileURL } from 'node:url';
@@ -13,21 +13,29 @@ const fixtureLayout = { batchRows: 4, rowGroupRows: 2, pageRows: 1 };
 const partition = (offset: number): string => new Date(Math.floor(Date.now() / 60_000) * 60_000 + offset * 60_000)
   .toISOString().slice(0, 16).replace('T', '-').replace(':', '-');
 
-function fixture(t: TestContext) {
-  const directory = mkdtempSync(path.resolve('projects/loadtest/test/.fixture-stress-ready-'));
-  t.after(() => rmSync(directory, { recursive: true, force: true }));
+function fixture(t: TestContext, privateInsideResults = false) {
+  const owned = mkdtempSync(path.resolve('projects/loadtest/test/.fixture-stress-ready-'));
+  t.after(() => rmSync(owned, { recursive: true, force: true }));
+  const directory = path.join(owned, 'benchmark');
   const results = path.join(directory, 'results');
-  mkdirSync(results);
-  const reader = path.join(directory, 'reader');
-  const calls = path.join(directory, 'calls.jsonl');
+  mkdirSync(results, { recursive: true });
+  const reader = path.join(owned, 'reader');
+  const calls = path.join(owned, 'calls.jsonl');
+  const privateScratch = path.join(privateInsideResults ? results : owned, 'private');
+  const canary = 'password=PRIVATE_READER_SENTINEL /private/canary-source.parquet';
   writeFileSync(reader, `#!${process.execPath}
 import {appendFileSync,readFileSync} from 'node:fs';
 appendFileSync(${JSON.stringify(calls)},JSON.stringify(process.argv.slice(2))+'\\n');
 const [command,input]=process.argv.slice(2);
 const file=command==='summarize' ? input+'/fixture.json' : input+'.layout.json';
 const value=JSON.parse(readFileSync(file,'utf8'));
-if(value.fail) { console.error('fixture reader failure'); process.exit(7); }
-console.log(JSON.stringify(value));
+if(value.fail) {
+ process.stderr.write(value.flood ? 'x'.repeat(131072) : '', () => {
+  console.error('fixture reader failure '+${JSON.stringify(canary)});
+  process.exitCode=7;
+  if(value.hang) setInterval(() => {}, 1000);
+ });
+} else console.log(JSON.stringify(value));
 `, { mode: 0o755 });
   const startedAt = Date.now() - 10;
   const progress = (remaining = 29_000) => {
@@ -59,9 +67,24 @@ console.log(JSON.stringify(value));
     workspace: process.cwd(), directory, project: 'fixture-ready', composeFiles: [],
     env: process.env, reader, directAdmin: '', dataflowAdmin: '', quiver: false, physicalRoots: {},
     fixture: fixtureLayout, windowSeconds: 9, sampleTimeoutSeconds: 1, measureSeconds: 30,
+    privateScratch,
     loadEnded: new AbortController().signal, checkRunning: () => {},
   });
-  return { runtime, directory, results, reader, calls, install, progress, startedAt };
+  return { runtime, directory, results, reader, calls, install, progress, startedAt, privateScratch, canary };
+}
+
+function assertPublicTreeIsClean(directory: string, canary: string, privateScratch: string): void {
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    assert(!entry.name.endsWith('.private.log'));
+    const file = path.join(directory, entry.name);
+    if (entry.isDirectory()) assertPublicTreeIsClean(file, canary, privateScratch);
+    else {
+      const value = readFileSync(file, 'utf8');
+      assert(!value.includes(canary) && !value.includes('PRIVATE_READER_SENTINEL'),
+        'the recursive public upload tree must never contain raw stderr');
+      assert(!value.includes(privateScratch), 'private diagnostic locations are not exported');
+    }
+  }
 }
 
 test('v0 missing then actual BOTH-pool compactable fixtures publishes a bound readiness receipt', async t => {
@@ -160,7 +183,63 @@ test('nonretryable reader failure is preserved privately and is not polled until
   writeFileSync(path.join(f.directory, 'direct/fixture.json'), '{"fail":true}');
   await assert.rejects(f.runtime.waitForInput(Date.now() + 5000), /did not complete cleanly/u);
   assert.equal(readFileSync(f.calls, 'utf8').trim().split('\n').length, 1);
-  assert.match(readFileSync(path.join(f.results, 'stress-readiness-direct.json.stderr.private.log'), 'utf8'), /fixture reader failure/u);
+  const directories = readdirSync(f.privateScratch);
+  assert.equal(directories.length, 1);
+  const privateDirectory = path.join(f.privateScratch, directories[0]);
+  assert.equal(statSync(privateDirectory).mode & 0o777, 0o700);
+  const privateLog = path.join(privateDirectory, 'reader-stderr.private.log');
+  assert.equal(statSync(privateLog).mode & 0o777, 0o600);
+  assert.match(readFileSync(privateLog, 'utf8'), /PRIVATE_READER_SENTINEL/u);
+  assertPublicTreeIsClean(f.results, f.canary, f.privateScratch);
+  assertPublicTreeIsClean(f.directory, f.canary, f.privateScratch);
+});
+
+test('raw reader stderr retains only a bounded private tail outside public artifacts', async t => {
+  const f = fixture(t);
+  f.install('direct'); f.install('dataflow');
+  writeFileSync(path.join(f.directory, 'direct/fixture.json'), '{"fail":true,"flood":true}');
+  await assert.rejects(f.runtime.waitForInput(Date.now() + 5000), /did not complete cleanly/u);
+  const [name] = readdirSync(f.privateScratch);
+  const log = path.join(f.privateScratch, name, 'reader-stderr.private.log');
+  assert.equal(statSync(log).size, 65_536);
+  assert.match(readFileSync(log, 'utf8'), /PRIVATE_READER_SENTINEL/u);
+  assertPublicTreeIsClean(f.directory, f.canary, f.privateScratch);
+});
+
+test('large complete reader JSON is retained independently of the private stderr bound', async t => {
+  const f = fixture(t);
+  f.install('direct'); f.install('dataflow');
+  const input = path.join(f.directory, 'direct/fixture.json');
+  const complete = { ...JSON.parse(readFileSync(input, 'utf8')), large_json: 'O'.repeat(131072) };
+  writeFileSync(input, JSON.stringify(complete));
+  await f.runtime.waitForInput(Date.now() + 5000);
+  assert.deepEqual(JSON.parse(readFileSync(path.join(f.results, 'stress-readiness-direct.json'), 'utf8')), complete);
+  const [name] = readdirSync(f.privateScratch);
+  assert.deepEqual(readdirSync(path.join(f.privateScratch, name)), ['reader-stderr.private.log']);
+  assertPublicTreeIsClean(f.results, f.canary, f.privateScratch);
+});
+
+test('a timed-out reader preserves even a short private stderr cause before EOF', async t => {
+  const f = fixture(t);
+  f.install('direct'); f.install('dataflow');
+  writeFileSync(path.join(f.directory, 'direct/fixture.json'), '{"fail":true,"hang":true}');
+  await assert.rejects(f.runtime.waitForInput(Date.now() + 1000), /did not complete cleanly/u);
+  const [name] = readdirSync(f.privateScratch);
+  const log = path.join(f.privateScratch, name, 'reader-stderr.private.log');
+  assert.match(readFileSync(log, 'utf8'), /PRIVATE_READER_SENTINEL/u);
+  assertPublicTreeIsClean(f.directory, f.canary, f.privateScratch);
+});
+
+test('private diagnostic storage cannot be configured inside the public artifact tree', t => {
+  assert.throws(() => fixture(t, true), /outside the public results tree/u);
+});
+
+test('a symlink cannot redirect private reader stderr into public artifacts', async t => {
+  const f = fixture(t);
+  f.install('direct'); f.install('dataflow');
+  symlinkSync(f.results, f.privateScratch, 'dir');
+  await assert.rejects(f.runtime.waitForInput(Date.now() + 5000), /outside the public results tree/u);
+  assert(!existsSync(f.calls), 'reject before invoking any reader or writing raw stderr');
 });
 
 test('malformed committed partition metadata fails immediately without retry', async t => {
