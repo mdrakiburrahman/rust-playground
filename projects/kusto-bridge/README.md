@@ -1,13 +1,14 @@
 # kusto-bridge
 
-Sidecar for the local Kusto emulator that keeps one Kusto table per Delta table equal to the
-table's latest committed snapshot. It exists because the emulator accepts query acceleration
-policies over local Delta external tables, but its accelerated cache did not refresh after
-appends, `OPTIMIZE` rewrites, or removals in local probes. Plain (non-accelerated) Delta external
-tables stayed correct and are kept as the correctness baseline.
+Experimental, non-default sidecar for the local Kusto emulator. It is **not** used by the loadtest
+and is not needed: the emulator's native query acceleration over local Delta external tables
+converged to the committed snapshot (appends, `OPTIMIZE`, partitioned purge deletes, `VACUUM`)
+with `MaxAge=00:01:00` in local probes, so native external `kind=delta` tables with that policy
+are the default (see `projects/loadtest/loadgen/src/kusto.rs`).
 
-> Status: service skeleton. The HTTP surface, configuration, metrics, and container healthcheck
-> are in place; the Delta snapshot reconciler lands in the next slice.
+> Status: service skeleton only (HTTP surface, configuration, metrics, healthcheck). It performs
+> no Delta reconciliation and must not be relied on for correctness. It is kept so a sidecar can
+> be revisited if native acceleration regresses.
 
 ## Configuration
 
