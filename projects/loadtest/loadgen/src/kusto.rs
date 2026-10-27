@@ -1126,17 +1126,11 @@ impl ReplayQuiescence {
 
 /// Kusto's answer for an external table whose definition or Delta log does not exist yet.
 fn not_yet_readable(error: &anyhow::Error) -> bool {
+    // Only a listed table whose Delta log is not committed yet is pending. Kusto reports that as a
+    // storage blob-not-found partial failure; generic bad requests (syntax, schema, credentials)
+    // and every other failure must surface as degraded.
     let message = format!("{error:#}");
-    message.contains("Kusto HTTP 400")
-        && [
-            "EntityNotFound",
-            "not found",
-            "does not exist",
-            "_delta_log",
-            "General_BadRequest",
-        ]
-        .iter()
-        .any(|marker| message.contains(marker))
+    message.contains("E_XSTORE_BLOB_NOT_FOUND") && message.contains("Delta table does not exist")
 }
 
 /// Azure oracle roots are credential-free `abfss://` URLs read by the independent cloud reader.
@@ -1444,6 +1438,12 @@ async fn converge(client: &KustoClient, checks: &[TableCheck], timeout: Duration
 /// creates or alters tables, policies, or databases and makes no correctness claim: `Fresh` is
 /// `null` because no captured source generation is referenced. Missing measurements stay `null`;
 /// absent or not-yet-provisioned tables are reported per table as unavailable.
+///
+/// # Errors
+///
+/// Returns an error when the endpoint or table names are invalid, the deadline elapses, or
+/// authentication or the capacity/table listing requests fail. Per-table query failures are
+/// reported inside the returned JSON instead of failing the whole observation.
 #[allow(dead_code, reason = "exported for the runner's live LGTM observation CLI")]
 pub async fn observe_qap(
     endpoint: &str,
@@ -2196,18 +2196,26 @@ mod tests {
 
     #[test]
     fn only_recognized_absence_is_pending_during_azure_startup() {
-        assert!(not_yet_readable(&anyhow::anyhow!(
-            "Kusto HTTP 400 Bad Request: {{\"error\":{{\"code\":\"General_BadRequest\"}}}}"
-        )));
+        // Emulator-observed shape for an external table whose run root has no committed Delta log.
         assert!(not_yet_readable(
-            &anyhow::anyhow!("Kusto HTTP 400 Bad Request: _delta_log was not found").context("live observation")
+            &anyhow::anyhow!(
+                "Kusto partial/progressive query failure: {{\"OneApiErrors\":[{{\"error\":{{\"code\":\"LimitsExceeded\",\
+                 \"message\":\"Partial query failure: The requested blob was not found (E_XSTORE_BLOB_NOT_FOUND). \
+                 (message: 'Delta table does not exist: ')\"}}}}]}}"
+            )
+            .context("live observation")
         ));
         for surfaced in [
+            "Kusto HTTP 400 Bad Request: {\"error\":{\"code\":\"General_BadRequest\"}}",
+            "Kusto HTTP 400 Bad Request: {\"error\":{\"code\":\"General_BadRequest\",\"message\":\"Syntax error\"}}",
+            "Kusto HTTP 400 Bad Request: General_BadRequest: invalid schema; column not found",
+            "Kusto HTTP 400 Bad Request: General_BadRequest: external table credentials are forbidden",
+            "Kusto HTTP 400 Bad Request: EntityNotFound: _delta_log does not exist",
             "Kusto HTTP 401 Unauthorized: {}",
-            "Kusto HTTP 403 Forbidden: EntityNotFound",
+            "Kusto HTTP 403 Forbidden: E_XSTORE_BLOB_NOT_FOUND",
             "Kusto HTTP 500 Internal Server Error: {}",
             "Kusto HTTP request failed: timed out",
-            "Kusto query reported errors: PartialQueryFailure",
+            "Kusto partial/progressive query failure: E_XSTORE_BLOB_NOT_FOUND (message: 'Access denied')",
             "Kusto count missing",
         ] {
             assert!(!not_yet_readable(&anyhow::anyhow!("{surfaced}")), "{surfaced}");
