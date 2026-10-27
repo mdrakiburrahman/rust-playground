@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFile, spawn, spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { randomBytes, randomUUID } from 'node:crypto';
 import {
   chmodSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, writeFileSync,
@@ -7,7 +7,6 @@ import {
 import { hostname } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { promisify } from 'node:util';
 
 import {
   benchmarkUsage,
@@ -18,6 +17,7 @@ import {
 import { startResourceSampler } from './resource-sampler.js';
 import { writeProvenance } from './provenance.js';
 import { runQuiverCrash, QUIVER_RECOVERY_FILE } from './quiver-crash.js';
+import { runOwnedProcess } from './owned-process.js';
 import {
   benchmarkComposeFiles, benchmarkQuiver, buildBenchmarkComposeOverride, buildBenchmarkRuntimeConfigs, dataflowConfigFile,
 } from './runtime-config.js';
@@ -477,16 +477,23 @@ async function reconcileAzure(context: BenchmarkContext, occupancyId: string): P
   const manifest = path.join(context.directory, 'router-state/azure-tables.json');
   run(path.join(cargoTargetDirectory(), 'debug/arrowcol-loadgen'), ['azure-manifest', '--manifest', manifest], context.env);
   // The helper waits only for absent logs; auth, ownership and malformed logs fail immediately.
-  await promisify(execFile)('python3', [
+  await runOwnedProcess('python3', [
     'infra/azure/bootstrap.py', 'reconcile', '--tables', manifest,
     '--occupancy-id', occupancyId, '--wait-seconds', '120',
   ], { cwd: workspace, env: { ...context.env, AZURE_CONFIG_DIR: path.join(context.directory, 'azure-cli/infra') },
-    encoding: 'utf8', timeout: 180_000, maxBuffer: 8 * 1024 * 1024 });
+    timeoutMs: 180_000 });
+}
+
+interface CloudRun {
+  environment: NodeJS.ProcessEnv;
+  occupancyId: string;
+  reconciliationFailed: boolean;
 }
 
 async function benchmark(
-  options: BenchmarkOptions, controller: BenchmarkController, privateEnv: NodeJS.ProcessEnv, occupancyId: string,
+  options: BenchmarkOptions, controller: BenchmarkController, cloud: CloudRun,
 ): Promise<BenchmarkContext> {
+  const privateEnv = cloud.environment;
   const azure = options.mode === 'azure'
     ? azureTargets(privateEnv, `run-${Date.now()}-${randomBytes(4).toString('hex')}`)
     : undefined;
@@ -619,7 +626,10 @@ async function benchmark(
     });
     const load = runLocalLoadgen(context, 'run', path.join(directory, 'results'), controller)
       .finally(() => loadEnded.abort());
-    const reconciliation = azure ? reconcileAzure({ ...context, project }, occupancyId) : undefined;
+    const reconciliation = azure ? reconcileAzure({ ...context, project }, cloud.occupancyId).catch(error => {
+      cloud.reconciliationFailed = true;
+      throw error;
+    }) : undefined;
     const [loadOutcome, crashOutcome, reconcileOutcome] = await Promise.allSettled([load, crash, reconciliation]);
     if (reconcileOutcome.status === 'rejected') {
       phase = 'azure-external-reconcile';
@@ -718,6 +728,7 @@ async function main(): Promise<void> {
   const privateEnv = modeEnvironment(workspace, options.mode, process.env);
   const controller = await acquireBenchmarkController(workspace);
   const occupancyId = randomUUID();
+  const cloud: CloudRun = { environment: privateEnv, occupancyId, reconciliationFailed: false };
   let occupied = false;
   let failure: unknown;
   try {
@@ -725,16 +736,18 @@ async function main(): Promise<void> {
       azureTargets(privateEnv, 'preflight');
       run('python3', ['infra/azure/bootstrap.py', 'occupy', '--occupancy-id', occupancyId], privateEnv);
       occupied = true;
+      cloud.environment = modeEnvironment(workspace, options.mode, process.env);
     }
     // Occupy exports the exact ready storage generation; never substitute a run UUID.
-    await benchmark(options, controller, modeEnvironment(workspace, options.mode, process.env), occupancyId);
+    await benchmark(options, controller, cloud);
   } catch (error) {
     failure = error;
   } finally {
     try {
       if (occupied) {
         await stopBenchmark(workspace, args => run('docker', args, process.env, 360_000), { requireCleanMutators: true });
-        run('python3', ['infra/azure/bootstrap.py', 'release', '--occupancy-id', occupancyId], privateEnv);
+        if (cloud.reconciliationFailed) throw new Error('Azure reconciliation failed; retain occupancy pending authoritative reconciliation');
+        run('python3', ['infra/azure/bootstrap.py', 'release', '--occupancy-id', occupancyId], cloud.environment);
       }
     } catch (error) {
       failure = failure ? new AggregateError([failure, error], 'Benchmark and cloud drain/release failed; occupancy is not force-cleared') : error;

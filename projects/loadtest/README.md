@@ -129,6 +129,11 @@ and refuses occupancy release after a forced, OOM or unverifiable mutator exit.
 This exit check is not proof of registry closure: the infrastructure release
 must independently require an empty same-generation publisher registry. Unknown
 drains retain occupancy and registrations; no force-clear is attempted.
+The same captured post-occupancy environment is used for both benchmark and
+release, even if a private env file changes later. Reconciliation owns a Linux
+process group, so its bounded deadline/interrupt also drains Azure CLI wrapper
+descendants. Any failed reconciliation retains occupancy for authoritative
+reconciliation; process exit alone is not proof of mutation completion.
 
 The optional `tenant` and `maintenance` Compose profiles use the real
 `arrow-tenant-stream` and `delta-maintenance` images, both included in
@@ -271,6 +276,9 @@ Tables may be pending until their first Delta commit; readiness of the cluster
 does not establish cache eligibility. Native QAP uses `MaxAge=00:01:00`;
 validation waits within its declared timeout for actual eligible cache statistics
 and checks both the cached query and the one-second fallback against the oracle.
+The native cached gate keeps a fixed five-minute deadline; the benchmark's
+overall validation budget is eight minutes. The separate clean-mutator stop
+budget remains five minutes and is not extended by cache convergence.
 The optional bridge is not the default and is not accelerated-cache evidence.
 Timestamp `__unix_nanos` companion columns retain the original
 integer nanoseconds; Kusto `datetime` alone is not nanosecond-exact.

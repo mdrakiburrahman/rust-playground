@@ -304,7 +304,7 @@ pub struct ValidateArgs {
     pub dataflow_root: PathBuf,
 
     /// Maximum time to wait for independently visible Delta snapshots.
-    #[arg(long, env = "LOADTEST_DRAIN_TIMEOUT", default_value = "2m")]
+    #[arg(long, env = "LOADTEST_DRAIN_TIMEOUT", default_value = "8m")]
     pub timeout: DurationArg,
 
     /// Require every collector in each implementation pool to own a table.
