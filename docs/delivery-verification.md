@@ -57,8 +57,120 @@ The preserved live LGTM data showed `delta_kernel_version_ratio` for both
 collector service names, but no `delta_kernel_version`. The version gauge's
 dimensionless unit `"1"` caused the Prometheus translation suffix. The focused
 emitter correction removes that unit rather than weakening the required live
-query. Its actual rebuilt end-to-end qualification remains separate from the
-publication recovery above.
+query. The subsequent independently source-built
+`69b157416916d6abcc22b46c5510558a67406caf` run published all 1,656 Direct receipts
+and passed that unchanged SDK gate: both collector service names supplied 112
+plain-name version-gauge samples. This is actual focused emitter evidence,
+separate from an overall pipeline or maintenance qualification.
+
+That run's fixed-window driver failed before either pool's physical CPU fixture
+was ready and completed zero maintenance cycles. Final all-13/native validation
+was subsequently terminated at its 600-second outer command deadline. No final
+independent oracle, native, UI, or overall pass is claimed. Readiness must be
+established within the existing startup deadline before the immutable window;
+validator-cost diagnosis must preserve the native global five-minute deadline.
+
+### Current acceptance gaps
+
+The separate-process append/maintenance exercise exposed 24 unlogged Parquet
+files from newly staged replays of already published identities. VACUUM LITE
+cannot reclaim files that were never logged as an Add or Remove. The focused
+correction scopes reclamation to fresh, never-submitted stages of the same
+table, preserves uncertain submissions, and reports cleanup failures using fixed
+classes rather than paths or raw errors. Its process harness owns a Linux process
+group and subreaper with checked bounded cleanup.
+
+Actual reconciled candidate `ab38407754cd9d5904e1b81b34319219a9ba93e1`
+passed all eight replay tests and the hung-child cleanup regression, but the
+separate writer/maintenance process exercise **still failed**, reporting 24
+unreferenced Parquet files. Both crates were compiled from that candidate, with
+no concurrent target writer. Subsequent read-only source/blob and binary checks
+found that the process binary lacked the reclaim code, although the replay test
+binary contained it. Reusing one Cargo target across checkouts had retained a
+stale default-feature dependency. The failed receipt is not retroactively a
+pass: a source-bound, initially empty dedicated target, binary hashes and
+expected-code checks, and an actual process pass are required. Future candidate,
+helper, and image qualification must isolate build targets by source revision.
+Neither replay-orphan freedom nor a whole-storage byte plateau is qualified by
+the stale-artifact result.
+
+CI run `40459829984` at
+`ef0a14d33fc1025af0bda401fc15d893231ad455` finished with 44 successful jobs and
+two failed jobs. Its actual `loadtest:e2e` failed the first Grafana panel's
+three-numeric-sample proof after all 15 required metric-range checks passed,
+including the unsuffixed version gauge for both collector services. The final
+verification job merely reflected that failed prerequisite. The failing frame
+and request resolution were not retained, so their exact cause is unknown.
+Bounded, allowlisted frame-shape diagnostics preserve the unchanged per-frame
+threshold; a read-only query on an older preserved dataset is not a CI
+reproduction or a fix.
+
+The local aggregate `npx --no-install nx run rust:verify --outputStyle=static`
+at the same source also failed, with return code 130. The underlying failed
+target was `loadtest:test`: the actual reader CLI evidence-chunks regression
+reported `Parquet error: Required field schema is missing`. Thirty subsequent
+isolated iterations of the same reader tests passed; the aggregate failure's
+cause remains unproven. This is not a settled-final-head verification pass.
+
+The external GitGuardian check on integration source
+`ef0a14d33fc1025af0bda401fc15d893231ad455` reported two occurrences of one
+synthetic JWT-shaped redaction-test canary. Independent source inspection found
+only a `canary` claim and an undersized, invalid HS256 signature; it is not an
+authenticating credential. The check remains blocked pending classification by
+an authenticated owner in the [GitGuardian dashboard](https://dashboard.gitguardian.com).
+No check is suppressed or disabled, and no history is rewritten. This
+classification does not establish that the overall integration CI is green.
+
+### Actual collector source reads and tenant snapshot/restart
+
+The ignored, private-fixture test at original source
+`b21d95253a4ecb04385967977fefd6702656ee9a` read pristine collector-produced
+CPU tables from both pools of frozen collector source
+`69b157416916d6abcc22b46c5510558a67406caf`, SDK child
+`e008d64e806ebccb5df1c8ab598c3de453d34fab`:
+
+```bash
+ARROWCOL_SOURCE_READ_FIXTURE='<private-fixture-root>' \
+  cargo test --locked -p arrow-tenant-stream --test collector_source_skipping \
+  actual_collector_cpu_sources_skip_bytes_and_row_groups_in_both_pools \
+  -- --ignored --exact --nocapture
+```
+
+Independent execution passed in 45.84 seconds. Each pool had 127 files,
+130,048 rows, and 254 row groups. The selected customer's 8,128 complete rows
+matched both a full scan and an identically reinterleaved unsorted control.
+Actual DataFusion bytes read were 51,816 for the sorted filtered scan, 107,696
+for its full scan, and 216,154 for the unsorted filtered scan. The sorted scan
+visited 127 row groups and pruned 127, versus 254 visited and zero pruned.
+Page pruning reported 381 pages and 48,768 rows pruned.
+
+All 127 files were opened: **no file-pruning improvement is claimed**. The
+requested 128-row page setting is not a measured physical page-size result.
+Whole-artifact/per-file hashes, pristine Add/Txn history with no Removes, and
+the unchanged manifest bound this proof to original collector output.
+
+That source also exposed a real tenant service failure: already canonical
+timestamp fields and nanosecond companions were normalized a second time.
+Original core correction `632b72e5af721d88959ec2bab9ea0b7fddbd00ac` provides an
+explicit typed canonical write path; tenant wiring
+`724ad75cb8ab6cb6a92d5eca5ddd94874698f044` uses it without dropping columns,
+metadata, null masks, or timestamp precision. Raw reserved-name rejection stays
+unchanged.
+
+The corresponding ignored service test uses the same private-fixture variable
+and test target, selecting
+`actual_service_forks_frozen_collector_sources_and_restarts_idle_in_both_pools`.
+Independent exact-source execution passed in 12.72 seconds with fixed binary
+SHA-256 `3716ddaa6d616fa6ee33bf7cde26d8ac53ef011718d24bf268f055f1ff15a698`.
+Both pools copied exactly 8,128 full rows into five partition files at sink
+version one, with complete schema/multiset/partition, Spark checkpoint,
+stable query transaction, and idle-restart checks. All 417 source file
+hashes, sizes, and inventory entries remained unchanged.
+
+These are explicit artifact-backed executions, **not ordinary CI execution of
+the ignored fixtures**. They qualify frozen-source reads and tenant
+snapshot/idle restart, not live append tail, combined PURGE/prune/recovery,
+the failed fixed window, native timeout, all-schema service execution, or Azure.
 
 ### Checkpoint/prune interoperability proof
 
