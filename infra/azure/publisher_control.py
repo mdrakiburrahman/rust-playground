@@ -200,6 +200,19 @@ class PublisherControl:
             raise Failure("Caller does not hold exclusive definite cleanup authority.")
         return operator, metadata, etag
 
+    def abort_cleanup(self, operator, generation, *, nothing_deleted):
+        """Return the caller's own UNUSED cleanup custody to fenced-v1+empty, same generation.
+
+        Valid only when this custody performed no deletion I/O, so the result is
+        exactly the pre-claim authority. After any deletion, only finish_cleanup
+        (which rotates the generation) may leave cleaning-v1.
+        """
+        operator, metadata, etag = self.cleanup_operator(operator, generation)
+        if nothing_deleted is not True:
+            raise Failure("Cleanup abort is permitted only before any deletion I/O.")
+        metadata["resetstate"] = FENCED
+        return self.cas(metadata, {}, etag)
+
     def finish_cleanup(self, operator, generation, new_generation, *, definitively_cleaned):
         """Release cleanup and rotate to fenced-v1+empty in one CAS; enables bootstrap."""
         canonical_uuid(new_generation)

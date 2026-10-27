@@ -736,10 +736,70 @@ def reset_preview(azure):
     print("Preserve cluster, account, containers and managed identity.")
 
 
-def _unqualified_reset_sequence(azure, stop_command):
+RESET_RECORD = ROOT / ".env.azure.reset.json"
+RECEIPT_FIELDS = {"stopped": True, "scope": "workspace-owned-loadtest", "dataPreserved": True}
+
+
+def require_running(azure):
+    """Reset never starts or stops the cluster; it refuses unless Running."""
+    cluster = azure.arm("GET", azure.c.cluster_id)
+    owned(cluster, azure.c)
+    if cluster["properties"].get("state") != "Running":
+        raise Failure("Reset requires the owned cluster to be Running; refused without "
+                      "starting it (no reset-owned start/stop).")
+
+
+def read_reset_record(path):
+    from publisher_control import canonical_uuid
+    try:
+        record = json.loads(path.read_text())
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise Failure("Cleanup custody record is unreadable; refusing.") from exc
+    if not isinstance(record, dict) or set(record) != {"sandbox", "operator", "generation", "next"}:
+        raise Failure("Cleanup custody record is malformed; refusing.")
+    for key in ("operator", "generation", "next"):
+        canonical_uuid(record[key])
+    return record
+
+
+def write_reset_record(path, record):
+    """Durably persist custody identity BEFORE the claim CAS (0600, fsync, atomic)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".env.azure.reset.")
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(record, stream, sort_keys=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def verified_stop_receipt(stdout, generation):
+    for line in stdout.splitlines():
+        try:
+            receipt = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (isinstance(receipt, dict) and
+                all(receipt.get(key) == value for key, value in RECEIPT_FIELDS.items()) and
+                receipt.get("resetGeneration") == generation):
+            return True
+    return False
+
+
+def _unqualified_reset_sequence(azure, stop_command, record_path=None):
     """Gated v1 operator sequence. NOT dispatched: public reset --execute stays blocked."""
-    from publisher_control import READY, PublisherControl
+    from publisher_control import READY, PublisherControl, UnknownTransition
+    record_path = record_path or RESET_RECORD
     c = azure.c
+    if read_reset_record(record_path) is not None:
+        raise Failure("A cleanup custody record exists; resume it instead of a fresh claim.")
     control = PublisherControl(azure)
     databases, inventory = reset_inventory(azure)
     count = sum(len(items) for items in inventory.values())
@@ -747,40 +807,116 @@ def _unqualified_reset_sequence(azure, stop_command):
     print("Preserve cluster, account, containers and managed identity.")
     if not stop_command:
         raise Failure("Execution requires the runner's --stop-command to stop local writers/consumers.")
+    require_running(azure)
     metadata, _, _ = control.read()
     require_released(metadata)
     generation = metadata["resetgeneration"]
     if metadata["resetstate"] == READY:
         control.fence(generation)
-    result = run_tree(stop_command, 180, cwd=ROOT)
+    result = run_tree(stop_command, 180, cwd=ROOT,
+                      env={**os.environ, "ARROWCOL_RESET_GENERATION": generation})
     if result.returncode:
         raise Failure("Writer/consumer stop failed; reset fence retained, no workload data deleted. " +
                       c.redact(str(result.stderr)))
-    receipts = []
-    for line in result.stdout.splitlines():
-        try:
-            receipts.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    if not any(isinstance(receipt, dict) and receipt.get("stopped") is True and
-               receipt.get("scope") == "workspace-owned-loadtest" and
-               receipt.get("dataPreserved") is True for receipt in receipts):
-        raise Failure("Runner did not verify workspace-owned services stopped; reset fence retained.")
+    if not verified_stop_receipt(result.stdout, generation):
+        raise Failure("Runner did not verify workspace-owned services stopped for this reset "
+                      "generation; reset fence retained.")
     print("Distributed reset fence active; waiting 60s for bounded in-flight publications.")
     time.sleep(60)
-    # Persistent exclusive cleanup authority: fenced-v1 + same generation + empty
-    # registry + released, claimed in one leased CAS before any inventory or delete.
-    operator = str(uuid.uuid4())
+    # Persist operator, captured generation and the fresh successor generation
+    # before the claim CAS so any later outcome is attributable without adoption.
+    record = {"sandbox": c.sandbox, "operator": str(uuid.uuid4()),
+              "generation": generation, "next": str(uuid.uuid4())}
+    write_reset_record(record_path, record)
     try:
-        control.claim_cleanup(operator, generation)
+        control.claim_cleanup(record["operator"], generation)
+    except UnknownTransition:
+        raise Failure("Cleanup claim outcome unknown; custody record kept for read-only resume.")
     except Failure as exc:
+        record_path.unlink()  # Definitely refused before any CAS: no custody exists.
         raise Failure("Reset authority changed during quiescence or publishers remain; "
                       "refusing data deletion.") from exc
+    running_or_abort(azure, control, record, record_path)
+    cleanup_with_custody(azure, control, record, record_path)
+
+
+def running_or_abort(azure, control, record, record_path):
+    """After a fresh claim (no deletion yet): a stop that won during quiescence aborts.
+
+    Stop may claim its hold from fenced-v1+empty before the cleanup claim and leave
+    the cluster Stopped; cleaning-v1 then blocks every start path. The unused
+    custody returns to the identical pre-claim authority instead of deleting.
+    """
+    try:
+        require_running(azure)
+    except Failure:
+        control.abort_cleanup(record["operator"], record["generation"], nothing_deleted=True)
+        record_path.unlink()
+        raise Failure("Cluster is not Running after the cleanup claim (a stop won); "
+                      "custody aborted before any deletion. Start via provision, then retry.")
+
+
+def _unqualified_reset_resume(azure, record_path=None):
+    """Gated recovery after an interrupted or ambiguous cleanup. NOT dispatched.
+
+    Re-reads authority and continues only with this record's exact operator and
+    generation. Never takes over or clears a foreign or uncertain member, and
+    never starts or stops the cluster.
+    """
+    from publisher_control import CLEANING, FENCED, PublisherControl, UnknownTransition
+    record_path = record_path or RESET_RECORD
+    record = read_reset_record(record_path)
+    if record is None:
+        raise Failure("No cleanup custody record; nothing to resume.")
+    if record["sandbox"] != azure.c.sandbox:
+        raise Failure("Cleanup custody record belongs to another sandbox; refusing.")
+    control = PublisherControl(azure)
+    metadata, registry, _ = control.read()
+    operator, generation = record["operator"], record["generation"]
+    if metadata["resetgeneration"] == record["next"]:
+        # Only this record knows the fresh successor: the finish CAS applied earlier.
+        record_path.unlink()
+        print("Earlier cleanup already finished and rotated authority; record cleared.")
+        return
+    if metadata["resetgeneration"] != generation:
+        raise Failure("Authority generation is neither this record's nor its successor; refusing.")
+    if metadata["resetstate"] == FENCED and not registry:
+        # The claim never applied (leaving cleaning-v1 always rotates generation).
+        require_running(azure)
+        try:
+            control.claim_cleanup(operator, generation)
+        except UnknownTransition:
+            raise Failure("Cleanup claim outcome unknown again; custody record kept.")
+        running_or_abort(azure, control, record, record_path)
+    elif not (metadata["resetstate"] == CLEANING and
+              registry == {operator: {"generation": generation, "state": "active"}}):
+        raise Failure("Authority does not show this record's exact active cleanup custody; "
+                      "never taking over or clearing another or uncertain member.")
+    cleanup_with_custody(azure, control, record, record_path)
+
+
+def delete_owned_database(azure, database):
+    # Observe first: an earlier (possibly unknown) submission may be in flight.
+    if database.get("properties", {}).get("provisioningState") == "Deleting":
+        return
+    azure.cli("rest", "--method", "delete", "--url", "https://management.azure.com" +
+              azure.c.cluster_id + "/databases/" + azure.c.database + "?api-version=" + API)
+
+
+def cleanup_with_custody(azure, control, record, record_path):
+    """Idempotent deletion under exclusive cleaning-v1 custody, then rotate.
+
+    Every step re-reads current state, so applied-but-unacknowledged deletes are
+    simply absent. Any failure keeps cleaning-v1 and the record for resume.
+    """
+    c = azure.c
+    operator, generation = record["operator"], record["generation"]
+    control.cleanup_operator(operator, generation)
+    require_running(azure)
     databases, inventory = reset_inventory(azure)
     if databases:
         control.cleanup_operator(operator, generation)
-        azure.cli("rest", "--method", "delete", "--url", "https://management.azure.com" +
-                  c.cluster_id + "/databases/" + c.database + "?api-version=" + API)
+        delete_owned_database(azure, databases[0])
     for container, blobs in inventory.items():
         control.cleanup_operator(operator, generation)
         for blob in sorted(blobs, key=lambda item: item["name"].count("/"), reverse=True):
@@ -800,14 +936,15 @@ def _unqualified_reset_sequence(azure, stop_command):
     if remaining:
         raise Failure("Reset left workload state behind; cleanup authority retained.")
     retry_ready(lambda: no_databases(azure), "Database deletion")
-    control.finish_cleanup(operator, generation, str(uuid.uuid4()), definitively_cleaned=True)
+    control.finish_cleanup(operator, generation, record["next"], definitively_cleaned=True)
+    record_path.unlink()
     print("Reset verified: zero databases and zero blobs, versions or snapshots; "
           "authority is fenced-v1 at a fresh generation.")
+
 
 def no_databases(azure):
     if azure.collection(azure.c.cluster_id + "/databases"):
         raise Failure("Database deletion is still in progress.")
-
 
 def require_released(metadata):
     # v1 occupancy is mandatory; absence is never treated as released.
