@@ -9,7 +9,10 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
 mod cloud;
-pub use cloud::{cloud_sample_rows, summarize_cloud};
+mod corpus;
+pub use cloud::{cloud_sample_corpus, cloud_sample_rows, summarize_cloud};
+use corpus::CorpusBuilder;
+pub use corpus::{MAX_CHUNK_DISTINCT_ROWS, MAX_CORPUS_DISTINCT_ROWS, ValidationChunk, ValidationCorpus};
 
 type PartitionValues = BTreeMap<String, Option<String>>;
 
@@ -269,17 +272,7 @@ pub struct TableInventory {
 ///
 /// Rejects unsafe paths, missing/corrupt data, and empty snapshots.
 pub fn sample_row(directory: &Path, identity: &str, summary: &TableSummary) -> Result<Value> {
-    if identity
-        .split('.')
-        .any(|part| part.is_empty() || part.contains(['/', '\\']))
-    {
-        bail!("invalid table identity");
-    }
-    let directory = fs::canonicalize(directory)?;
-    let root = fs::canonicalize(directory.join(identity.replace('.', "/")))?;
-    if !root.starts_with(&directory) {
-        bail!("table escapes Delta root");
-    }
+    let root = table_root(directory, identity)?;
     let file = summary.files.first().context("snapshot has no data files")?;
     let path = local_active_file(&root, root.join(&file.path).to_str().context("non-UTF8 data path")?)?;
     let reader = SerializedFileReader::new(File::open(path)?)?;
@@ -297,17 +290,7 @@ pub fn sample_row(directory: &Path, identity: &str, summary: &TableSummary) -> R
 /// Rejects unsafe paths, changed row counts/hashes, and more than 256 distinct
 /// rows. This is a validation oracle for the synthetic corpus, not a bulk API.
 pub fn sample_rows(directory: &Path, identity: &str, summary: &TableSummary) -> Result<Vec<(Value, u64)>> {
-    if identity
-        .split('.')
-        .any(|part| part.is_empty() || part.contains(['/', '\\']))
-    {
-        bail!("invalid table identity");
-    }
-    let directory = fs::canonicalize(directory)?;
-    let root = fs::canonicalize(directory.join(identity.replace('.', "/")))?;
-    if !root.starts_with(&directory) {
-        bail!("table escapes Delta root");
-    }
+    let root = table_root(directory, identity)?;
     let mut distinct = BTreeMap::<String, (Value, u64)>::new();
     let mut hashes = BTreeMap::<String, u64>::new();
     let mut rows = 0_u64;
@@ -331,6 +314,44 @@ pub fn sample_rows(directory: &Path, identity: &str, summary: &TableSummary) -> 
         bail!("captured validation corpus changed");
     }
     Ok(distinct.into_values().collect())
+}
+
+/// Reads the complete exact row multiset of the captured active files as disjoint chunks of whole
+/// partitions, each with at most [`MAX_CHUNK_DISTINCT_ROWS`] distinct rows. Nothing is sampled or
+/// truncated.
+///
+/// # Errors
+///
+/// Rejects unsafe paths, changed row counts/hashes, more than one or a non-string partition
+/// column, null partition values, a partition with more than 256 distinct rows, and corpora beyond
+/// [`MAX_CORPUS_DISTINCT_ROWS`].
+pub fn sample_corpus(directory: &Path, identity: &str, summary: &TableSummary) -> Result<ValidationCorpus> {
+    let root = table_root(directory, identity)?;
+    let mut builder = CorpusBuilder::new(summary)?;
+    for file in &summary.files {
+        let path = local_active_file(&root, root.join(&file.path).to_str().context("non-UTF8 data path")?)?;
+        let reader = SerializedFileReader::new(File::open(path)?)?;
+        for row in reader.get_row_iter(None)? {
+            let value = with_partitions(row_value(&row?), &summary.schema, &file.partition_values)?;
+            builder.add(value, &file.partition_values)?;
+        }
+    }
+    builder.finish(summary)
+}
+
+fn table_root(directory: &Path, identity: &str) -> Result<PathBuf> {
+    if identity
+        .split('.')
+        .any(|part| part.is_empty() || part.contains(['/', '\\']))
+    {
+        bail!("invalid table identity");
+    }
+    let directory = fs::canonicalize(directory)?;
+    let root = fs::canonicalize(directory.join(identity.replace('.', "/")))?;
+    if !root.starts_with(&directory) {
+        bail!("table escapes Delta root");
+    }
+    Ok(root)
 }
 
 /// Lists only committed, local active files. An empty root is pending, not a
@@ -596,6 +617,16 @@ mod tests {
                 (json!({"id":2,"__arrowcol_ingestion":"2026-10-27-02-00"}), 1),
             ]
         );
+        let chunked = sample_corpus(directory.path(), "telemetry.sqlserver.partitioned", summary)?;
+        assert_eq!(chunked.partition_column.as_deref(), Some("__arrowcol_ingestion"));
+        assert_eq!(chunked.expected_rows, 3);
+        assert_eq!(
+            chunked.partition_rows,
+            BTreeMap::from([("2026-10-27-02-00".to_owned(), 3)])
+        );
+        assert_eq!(chunked.chunks.len(), 1);
+        assert_eq!(chunked.chunks[0].partition_values, ["2026-10-27-02-00"]);
+        assert_eq!(chunked.chunks[0].rows, corpus);
         assert_eq!(
             inventory(directory.path()).await?.tables["telemetry.sqlserver.partitioned"].files,
             ["opaque/file.parquet"]
