@@ -88,8 +88,14 @@ class Config:
             raise Failure("Require 2 <= cluster minimum <= maximum <= 8 and QAP days 1..365.")
         self.operator = get("AZURE_OPERATOR_OBJECT_ID")
         self.operator_type = get("AZURE_OPERATOR_TYPE", "User")
+        self.operator_application = get("AZURE_OPERATOR_APPLICATION_ID")
         if self.operator_type not in ("User", "App"):
             raise Failure("AZURE_OPERATOR_TYPE must be User or App.")
+        if self.operator_type == "App":
+            try:
+                self.operator_application = str(uuid.UUID(self.operator_application))
+            except ValueError as exc:
+                raise Failure("App operators require an explicit AZURE_OPERATOR_APPLICATION_ID.") from exc
         self.base = f"/subscriptions/{self.subscription}/resourceGroups/{self.group}"
         self.storage_id = self.base + "/providers/Microsoft.Storage/storageAccounts/" + self.account
         self.cluster_id = self.base + "/providers/Microsoft.Kusto/clusters/" + self.cluster
@@ -98,7 +104,7 @@ class Config:
 
     def redact(self, text):
         for value in (self.subscription, self.sandbox, self.account, self.cluster,
-                      self.identity, self.uri):
+                      self.identity, self.uri, self.database, self.data, self.checkpoints):
             text = text.replace(value, "[private]")
         text = re.sub(r"https?://[^\s\"'<>]+", "[endpoint]", text)
         text = re.sub(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]+\b", "[principal]", text)
@@ -346,6 +352,7 @@ def deploy(azure):
         "clusterName": c.cluster, "identityName": c.identity,
         "databaseName": c.database, "dataContainer": c.data,
         "checkpointContainer": c.checkpoints, "operatorObjectId": c.operator,
+        "operatorKustoPrincipalId": c.operator_application if c.operator_type == "App" else c.operator,
         "controlMetadata": control,
         "checkpointExists": container is not None,
         "operatorType": c.operator_type, "clusterSku": c.sku,
@@ -478,7 +485,8 @@ def reset(azure, execute, stop_command):
     result = subprocess.run(stop_command, cwd=ROOT, timeout=180, check=False,
                             capture_output=True, text=True)
     if result.returncode:
-        raise Failure("Writer/consumer stop failed; reset fence retained, no workload data deleted.")
+        raise Failure("Writer/consumer stop failed; reset fence retained, no workload data deleted. " +
+                      c.redact(str(result.stderr)))
     receipts = []
     for line in result.stdout.splitlines():
         try:
@@ -598,7 +606,8 @@ def main(argv=None):
                                         check=False,
                                         capture_output=True, text=True)
                 if result.returncode:
-                    raise Failure("Delta initialization failed; KQL reconciliation was not attempted.")
+                    raise Failure("Delta initialization failed; KQL reconciliation was not attempted. " +
+                                  c.redact(result.stderr))
                 reconcile(azure, args.tables)
                 metadata["resetstate"] = "ready"
                 azure.set_control(metadata, etag)

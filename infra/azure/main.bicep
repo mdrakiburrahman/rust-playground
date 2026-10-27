@@ -12,6 +12,7 @@ param checkpointContainer string = 'checkpoints'
 param controlMetadata object
 param checkpointExists bool = false
 param operatorObjectId string
+param operatorKustoPrincipalId string
 @allowed(['User', 'App'])
 param operatorType string = 'User'
 param clusterSku string = 'Standard_E4ads_v5'
@@ -48,6 +49,7 @@ module sandbox './sandbox.bicep' = {
     controlMetadata: controlMetadata
     checkpointExists: checkpointExists
     operatorObjectId: operatorObjectId
+    operatorKustoPrincipalId: operatorKustoPrincipalId
     operatorType: operatorType
     clusterSku: clusterSku
     minimumInstances: minimumInstances
