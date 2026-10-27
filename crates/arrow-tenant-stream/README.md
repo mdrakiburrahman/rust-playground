@@ -12,6 +12,12 @@ column. Hive partition values come from Delta Add actions, not event timestamps
 or directory guessing. Output files belong to the target, so source VACUUM
 cannot invalidate successfully copied rows.
 
+The target uses the explicit canonical Delta schema/write path, not raw Arrow
+normalization a second time. Timestamp microseconds and their adjacent
+`__unix_nanos` companions retain their schema, nullability, metadata, and exact
+nanoseconds. Each written batch must have consistent timestamp/companion values;
+raw-input APIs continue to reject reserved companion names.
+
 ## Semantics and failure boundaries
 
 The bootstrap manifest is frozen before processing. A restart does not replace

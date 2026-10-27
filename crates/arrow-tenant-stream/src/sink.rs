@@ -6,12 +6,14 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use arrow_deltalake::delta::{DeltaTable, StagedAppend};
 use arrow_deltalake::layout::{FileSortBuffer, LayoutPolicy};
+use arrow_deltalake::normalize::CanonicalSchema;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub struct DeltaSink {
     table: Arc<DeltaTable>,
     schema: SchemaRef,
+    canonical: CanonicalSchema,
     policy: LayoutPolicy,
     partitions: Option<BTreeMap<String, Option<String>>>,
     current: Option<FileSortBuffer>,
@@ -26,9 +28,11 @@ impl DeltaSink {
     /// Returns layout validation errors.
     pub fn new(table: Arc<DeltaTable>, schema: SchemaRef, policy: LayoutPolicy) -> Result<Self> {
         policy.validate(&schema)?;
+        let canonical = CanonicalSchema::try_new(Arc::clone(&schema))?;
         Ok(Self {
             table,
             schema,
+            canonical,
             policy,
             partitions: None,
             current: None,
@@ -67,8 +71,8 @@ impl DeltaSink {
                 self.staged.len() < 4_096,
                 "microbatch exceeds 4096 staged-file budget; reduce source file sizes"
             );
-            let mut writer = self.table.new_file_partitioned_with_properties(
-                Arc::clone(&self.schema),
+            let mut writer = self.table.new_canonical_file_partitioned_with_properties(
+                &self.canonical,
                 values.clone(),
                 properties,
             )?;
