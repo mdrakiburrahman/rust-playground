@@ -1664,7 +1664,7 @@ mod tests {
         for canary in [
             "CANARYSIG",
             "acct.dfs",
-            "11111111-2222",
+            "11111111-1111",
             "99999999-aaaa",
             "eyJhbGciOi",
             "/delta/private",
