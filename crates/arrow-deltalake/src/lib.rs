@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "delta")]
 mod azure_cli;
 #[cfg(feature = "delta")]
+pub use azure_cli::AzureCliTokenProvider;
+#[cfg(feature = "delta")]
 mod azure_fence;
 #[cfg(feature = "delta")]
 pub mod commit;
@@ -192,8 +194,101 @@ pub fn record_batch_logical_bytes(batch: &RecordBatch) -> Result<u64> {
 
 #[cfg(feature = "delta")]
 pub(crate) fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(test)]
+    sync_hook::observe(path)?;
     File::open(path)
         .with_context(|| format!("open directory {}", path.display()))?
-        .sync_all()?;
+        .sync_all()
+        .with_context(|| format!("fsync directory {}", path.display()))?;
     Ok(())
+}
+
+#[cfg(feature = "delta")]
+pub(crate) fn sync_file(path: &Path) -> Result<()> {
+    #[cfg(test)]
+    sync_hook::observe(path)?;
+    File::open(path)
+        .with_context(|| format!("open file {}", path.display()))?
+        .sync_all()
+        .with_context(|| format!("fsync file {}", path.display()))?;
+    Ok(())
+}
+
+/// Synchronize `leaf` and every directory above it up to and including `root`, so
+/// each newly created (possibly multi-level Hive) directory entry is durable.
+#[cfg(feature = "delta")]
+pub(crate) fn sync_directory_chain(leaf: &Path, root: &Path) -> Result<()> {
+    anyhow::ensure!(
+        leaf.starts_with(root),
+        "{} is outside table root {}",
+        leaf.display(),
+        root.display()
+    );
+    for directory in leaf.ancestors() {
+        sync_directory(directory)?;
+        if directory == root {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Synchronize a canonical directory and all of its ancestors, making a newly
+/// created nested table root durable even when existing entries were not yet synced.
+#[cfg(feature = "delta")]
+pub(crate) fn sync_ancestors(path: &Path) -> Result<()> {
+    path.ancestors().try_for_each(sync_directory)
+}
+
+/// Test-only fsync observation and fault injection, keyed by exact path so parallel
+/// tests using distinct temporary directories never interfere.
+#[cfg(all(test, feature = "delta"))]
+pub(crate) mod sync_hook {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, PoisonError};
+
+    static FAIL: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+    static SYNCED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    pub(crate) fn fail_on(path: &Path) {
+        FAIL.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(path.to_owned());
+    }
+
+    pub(crate) fn reset(under: &Path) {
+        FAIL.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|path| !path.starts_with(under));
+        SYNCED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|path| !path.starts_with(under));
+    }
+
+    pub(crate) fn synced_under(under: &Path) -> Vec<PathBuf> {
+        SYNCED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|path| path.starts_with(under))
+            .cloned()
+            .collect()
+    }
+
+    pub(super) fn observe(path: &Path) -> anyhow::Result<()> {
+        if FAIL
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|failing| failing == path)
+        {
+            anyhow::bail!("injected fsync failure: {}", path.display());
+        }
+        SYNCED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(path.to_owned());
+        Ok(())
+    }
 }

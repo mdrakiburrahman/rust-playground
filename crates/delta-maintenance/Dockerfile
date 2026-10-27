@@ -30,7 +30,7 @@ RUN sh /tmp/install-azure-cli.sh && rm -f /tmp/install-azure-cli.sh
 # The Azure CLI config dir is created EMPTY and outside any data directory;
 # runners mount an isolated runtime directory over it. No auth is baked in.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates tini \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 app \
     && useradd --uid 10001 --gid app --no-create-home --no-log-init --home-dir /nonexistent --shell /usr/sbin/nologin app \
@@ -40,5 +40,13 @@ USER 10001:10001
 ENV AZURE_CONFIG_DIR=/var/lib/delta-maintenance-azure
 STOPSIGNAL SIGTERM
 EXPOSE 9467
-ENTRYPOINT ["/usr/local/bin/delta-maintenance"]
+# Health is the real scheduled-mode Prometheus listener (default 127.0.0.1:9467);
+# one-shot runs serve no listener and are never reported healthy. Override the
+# URL when the service runs with a different --listen.
+ENV DELTA_MAINTENANCE_HEALTH_URL=http://127.0.0.1:9467/metrics
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl --fail --silent --show-error --noproxy '*' --max-time 3 --max-filesize 1048576 \
+        --output /dev/null "$DELTA_MAINTENANCE_HEALTH_URL" || exit 1
+# tini is PID 1 so orphaned az/Python descendants are reaped.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/delta-maintenance"]
 CMD ["--help"]
