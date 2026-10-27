@@ -92,6 +92,7 @@
     "reader-build": {
       "executor": "nx:run-commands",
       "cache": false,
+      "dependsOn": ["lint", "test"],
       "options": {
         "command": "projects/loadtest/scripts/build-reader-bundle.sh"
       }
