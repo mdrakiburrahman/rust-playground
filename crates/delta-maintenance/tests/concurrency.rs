@@ -657,8 +657,8 @@ fn driver(root: &Path) -> Result<()> {
 /// new version. Every child process is owned, waited with a finite deadline, and
 /// killed and reaped on failure. The root lives under Cargo's per-target temporary
 /// directory (the driver tree's `TMPDIR`, so the service still sees a marked root
-/// under its temp directory); on any writer, driver or deadline failure it is kept
-/// and its path printed.
+/// under its temp directory); on any failure after the root exists (driver spawn,
+/// writer, driver or deadline) it is kept and its path printed.
 #[test]
 fn separate_writer_process_with_service_optimize_purge_vacuum() -> Result<()> {
     match std::env::var(ROLE).as_deref() {
@@ -667,33 +667,86 @@ fn separate_writer_process_with_service_optimize_purge_vacuum() -> Result<()> {
             writer(&root, std::env::var(BASE)?.parse()?)
         }
         Ok("driver") => driver(&PathBuf::from(std::env::var(ROOT)?)),
-        _ => {
-            let temp = Path::new(env!("CARGO_TARGET_TMPDIR"));
-            fs::create_dir_all(temp)?;
-            let temp = fs::canonicalize(temp)?;
-            let root = tempfile::Builder::new()
-                .prefix("delta-maintenance-concurrency-")
-                .tempdir_in(&temp)?;
-            let mut driver = ProcessTree::spawn(
-                Command::new(std::env::current_exe()?)
-                    .args([TEST, "--exact", "--nocapture", "--test-threads=1"])
-                    .env(ROLE, "driver")
-                    .env(ROOT, root.path())
-                    .env("TMPDIR", &temp)
-                    .env("ARROWCOL_PARTITION_GRANULARITY", "minute"),
-            )?;
-            let outcome = driver.wait_until(Instant::now() + OUTER_DEADLINE);
-            if matches!(&outcome, Ok(status) if status.success()) {
-                return Ok(());
-            }
-            drop(driver);
-            let kept = root.keep();
-            eprintln!("concurrency failure root retained: {}", kept.display());
-            let status =
-                outcome.with_context(|| format!("driver custody failed; root retained at {}", kept.display()))?;
-            bail!("driver failed ({status}); root retained at {}", kept.display())
-        }
+        _ => run_driver(&target_tmp()?, &std::env::current_exe()?),
     }
+}
+
+const ROOT_PREFIX: &str = "delta-maintenance-concurrency-";
+
+/// Cargo's per-target temporary directory, created and canonicalized.
+fn target_tmp() -> Result<PathBuf> {
+    let temp = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    fs::create_dir_all(temp)?;
+    Ok(fs::canonicalize(temp)?)
+}
+
+/// Create the run root under `temp`, run `exe` as the driver tree with `TMPDIR=temp`
+/// and wait for it with the outer deadline. Every failure after the root exists
+/// (spawn, custody/deadline, or an unsuccessful driver) drops the driver tree first,
+/// so its process group is killed and reaped, then keeps the root and prints its path.
+fn run_driver(temp: &Path, exe: &Path) -> Result<()> {
+    let root = tempfile::Builder::new().prefix(ROOT_PREFIX).tempdir_in(temp)?;
+    let outcome = (|| -> Result<()> {
+        let mut driver = ProcessTree::spawn(
+            Command::new(exe)
+                .args([TEST, "--exact", "--nocapture", "--test-threads=1"])
+                .env(ROLE, "driver")
+                .env(ROOT, root.path())
+                .env("TMPDIR", temp)
+                .env("ARROWCOL_PARTITION_GRANULARITY", "minute"),
+        )
+        .context("spawn driver")?;
+        let status = driver
+            .wait_until(Instant::now() + OUTER_DEADLINE)
+            .context("driver custody failed")?;
+        ensure!(status.success(), "driver failed ({status})");
+        Ok(())
+    })();
+    outcome.map_err(|error| {
+        let kept = root.keep();
+        eprintln!("concurrency failure root retained: {}", kept.display());
+        error.context(format!("root retained at {}", kept.display()))
+    })
+}
+
+/// Scenario (fault injection): the outer harness cannot start the driver because its
+/// executable does not exist, after the run root was created.
+/// Guarantees: the failure is reported, no child exists, and the root is kept (not
+/// removed by `TempDir`) with its path in the error.
+#[test]
+fn outer_failure_before_driver_start_retains_root() -> Result<()> {
+    let parent = tempfile::Builder::new()
+        .prefix("delta-maintenance-custody-")
+        .tempdir_in(target_tmp()?)?;
+    let Err(error) = run_driver(parent.path(), &parent.path().join("missing-test-binary")) else {
+        bail!("a missing driver executable must fail");
+    };
+    let message = format!("{error:#}");
+    ensure!(
+        error.chain().any(|cause| cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)),
+        "spawn must fail before any child exists: {message}"
+    );
+    let roots = fs::read_dir(parent.path())?
+        .map(|entry| Ok(entry?.path()))
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(roots.len() == 1, "exactly one run root: {roots:?}");
+    let kept = &roots[0];
+    ensure!(
+        kept.is_dir()
+            && kept
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(ROOT_PREFIX)),
+        "kept run root: {}",
+        kept.display()
+    );
+    ensure!(
+        message.contains(&kept.display().to_string()),
+        "error names the kept root: {message}"
+    );
+    Ok(())
 }
 
 const CUSTODY_TEST: &str = "outer_custody_kills_and_reaps_hung_driver_descendants";
