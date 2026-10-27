@@ -159,7 +159,7 @@ resource reader 'Microsoft.Kusto/clusters/databases/principalAssignments@2024-04
   parent: database
   name: 'sandbox-query-identity'
   properties: {
-    principalId: identity.properties.principalId
+    principalId: identity.properties.clientId
     principalType: 'App'
     role: 'Viewer'
     tenantId: tenant().tenantId

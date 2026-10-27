@@ -14,8 +14,6 @@ SAS tokens, or credential files are required.
 Copy the root `.env.example` into repo-bootstrapper's private
 `sync/rust-playground/.env`, fill in the authorized subscription, and let
 repo-bootstrapper distribute it. Never commit or print the filled file.
-On the controller the private source is
-`C:\Users\mdrrahman\repo-bootstrapper\sync\rust-playground\.env`.
 
 Run all following commands inside the repository Linux devcontainer:
 
@@ -55,6 +53,17 @@ Kusto access and storage RBAC, fences publication, runs the foundation's
 `initialize-delta.sh`, and checks every declared root has a valid version-zero
 Delta protocol and metadata before creating external tables. The initializer
 must create only absent roots, never overwrite a live table.
+
+The thin hook calls `arrowcol-loadgen initialize-azure --manifest` with the
+private output path supplied as `ARROWCOL_AZURE_TABLE_MANIFEST`. The loadgen owns
+the canonical schemas and initializes both Direct and Dataflow pools (26 roots).
+The generated manifest contains `{name, relative_path}` bindings beneath the
+configured data container, not credentials or account URLs. Kusto infers the
+normalized schema, timestamp companions and ingestion partitions from Delta.
+Isolated cloud runs can reconcile their own bindings with
+`reconcile --tables <manifest> --occupancy-id <current-owner-UUID>` without
+destroying another run's data. Absolute paths, traversal and connection-string
+injection in manifests are rejected.
 
 KQL reconciliation enables exactly `ExternalTable,AutomatedFlows` managed-identity
 usages, creates or alters inferred-schema Delta external tables, and enables QAP
@@ -99,7 +108,8 @@ checkpoints. It refuses preexisting soft-deleted objects rather than claiming
 hidden retained data is gone. Unknown resources cause failure, not deletion.
 
 Cluster, identity, account and both containers survive. Verification requires
-zero databases and literally zero blobs in both containers. Container control
+zero databases and literally zero blobs and HNS paths (including empty
+directories) in both containers. Container control
 metadata remains fenced without leaving a marker blob. A subsequent full
 `provision` recreates the declared Delta/Kusto baseline and returns it to ready.
 The foundation's explicit empty-root initializer is the only bootstrap path that
@@ -133,6 +143,11 @@ KQL, CLI token responses, generated configuration, or subscription details.
 If the supplied subscription is absent from the existing identity, bootstrap
 fails without trying another subscription; restore access to that authorized
 subscription before repeating live qualification.
+
+The initializer is a cross-workstream contract, not an independent schema
+implementation in this directory. The integrated loadgen/core revision must be
+qualified before claiming full bootstrap. A missing/failed initializer never
+produces a ready sandbox.
 
 Public protocol references:
 
