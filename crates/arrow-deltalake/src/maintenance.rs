@@ -8,7 +8,7 @@
 use crate::delta::{DeltaTable, INGESTION_PARTITION, PURGE_WATERMARK, collision_backoff, object_store_for_url};
 use crate::delta_io::shared_executor;
 use crate::layout::{FileSortBuffer, LayoutPolicy};
-use crate::{sync_directory, sync_file};
+use crate::{sync_directory, sync_directory_chain, sync_file};
 use anyhow::{Context, Result};
 use arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, RecordBatch, RecordBatchOptions, make_array, new_null_array,
@@ -2356,12 +2356,162 @@ pub struct VacuumPlan {
 #[derive(Default)]
 struct LogReplay {
     active: BTreeSet<String>,
+    /// Recovery-relevant state of each active add, keyed like `active`.
+    adds: BTreeMap<String, AddState>,
     tombstones: BTreeMap<String, (String, Option<i64>)>,
     /// Latest version per application transaction id.
     txns: BTreeMap<String, i64>,
     /// Set when a later txn action carried a lower version than an earlier one.
     txn_regressed: bool,
     table_id: Option<String>,
+    /// Last `protocol` action replayed.
+    protocol: Option<ProtocolState>,
+    /// Last `metaData` action replayed.
+    metadata: Option<MetadataState>,
+}
+
+/// Recovery-relevant fields of an active add. Statistics are deliberately not
+/// compared: they are advisory and checkpoint writers may re-encode them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AddState {
+    size: i64,
+    partition_values: BTreeMap<String, Option<String>>,
+}
+
+/// Normalized `protocol` action: feature lists compare as sets.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProtocolState {
+    min_reader_version: i64,
+    min_writer_version: i64,
+    reader_features: Option<BTreeSet<String>>,
+    writer_features: Option<BTreeSet<String>>,
+}
+
+/// Normalized `metaData` action: the schema is compared as parsed JSON (object
+/// keys order-insensitive) and an absent configuration equals an empty one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MetadataState {
+    id: String,
+    schema: serde_json::Value,
+    partition_columns: Vec<String>,
+    configuration: BTreeMap<String, String>,
+}
+
+impl MetadataState {
+    fn new(
+        id: String,
+        schema_string: &str,
+        partition_columns: Vec<String>,
+        configuration: BTreeMap<String, String>,
+    ) -> Result<Self> {
+        let schema = serde_json::from_str(schema_string).map_err(|error| {
+            fail(
+                MaintenanceErrorKind::Unsupported,
+                format!("metaData.schemaString is not valid JSON: {error}"),
+            )
+        })?;
+        Ok(Self {
+            id,
+            schema,
+            partition_columns,
+            configuration,
+        })
+    }
+}
+
+fn json_string_set(value: Option<&serde_json::Value>, what: &str) -> Result<Option<BTreeSet<String>>> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| fail(MaintenanceErrorKind::Unsupported, format!("{what} must hold strings")))
+            })
+            .collect::<Result<BTreeSet<_>>>()
+            .map(Some),
+        Some(_) => Err(fail(
+            MaintenanceErrorKind::Unsupported,
+            format!("{what} must be an array"),
+        )),
+    }
+}
+
+fn json_protocol(protocol: &serde_json::Value) -> Result<ProtocolState> {
+    let version = |field: &str| {
+        protocol.get(field).and_then(serde_json::Value::as_i64).ok_or_else(|| {
+            fail(
+                MaintenanceErrorKind::Unsupported,
+                format!("protocol.{field} is missing"),
+            )
+        })
+    };
+    Ok(ProtocolState {
+        min_reader_version: version("minReaderVersion")?,
+        min_writer_version: version("minWriterVersion")?,
+        reader_features: json_string_set(protocol.get("readerFeatures"), "protocol.readerFeatures")?,
+        writer_features: json_string_set(protocol.get("writerFeatures"), "protocol.writerFeatures")?,
+    })
+}
+
+fn json_metadata(metadata: &serde_json::Value) -> Result<MetadataState> {
+    let unsupported = |message: &str| fail(MaintenanceErrorKind::Unsupported, message.to_owned());
+    let id = metadata
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| unsupported("metaData.id is missing"))?;
+    let schema = metadata
+        .get("schemaString")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| unsupported("metaData.schemaString is missing"))?;
+    let partition_columns = metadata
+        .get("partitionColumns")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| unsupported("metaData.partitionColumns is missing"))?
+        .iter()
+        .map(|column| {
+            column
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| unsupported("metaData.partitionColumns must hold strings"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let configuration = match metadata.get("configuration") {
+        None | Some(serde_json::Value::Null) => BTreeMap::new(),
+        Some(serde_json::Value::Object(entries)) => entries
+            .iter()
+            .map(|(key, value)| {
+                value
+                    .as_str()
+                    .map(|value| (key.clone(), value.to_owned()))
+                    .ok_or_else(|| unsupported("metaData.configuration values must be strings"))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?,
+        Some(_) => return Err(unsupported("metaData.configuration must be an object")),
+    };
+    MetadataState::new(id.to_owned(), schema, partition_columns, configuration)
+}
+
+fn json_add(add: &serde_json::Value) -> Result<AddState> {
+    let unsupported = |message: &str| fail(MaintenanceErrorKind::Unsupported, message.to_owned());
+    let size = add
+        .get("size")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| unsupported("add.size is missing"))?;
+    let partition_values = match add.get("partitionValues") {
+        None | Some(serde_json::Value::Null) => BTreeMap::new(),
+        Some(serde_json::Value::Object(entries)) => entries
+            .iter()
+            .map(|(key, value)| match value {
+                serde_json::Value::Null => Ok((key.clone(), None)),
+                serde_json::Value::String(value) => Ok((key.clone(), Some(value.clone()))),
+                _ => Err(unsupported("add.partitionValues values must be strings or null")),
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?,
+        Some(_) => return Err(unsupported("add.partitionValues must be an object")),
+    };
+    Ok(AddState { size, partition_values })
 }
 
 /// Facts about one replayed JSON commit used by the log-pruning proof.
@@ -2542,6 +2692,7 @@ impl DeltaTable {
                 }
                 let key = self.log_key(raw)?;
                 replay.tombstones.remove(&key);
+                replay.adds.insert(key.clone(), json_add(add)?);
                 replay.active.insert(key);
             } else if let Some(remove) = action.get("remove") {
                 let raw = remove
@@ -2553,6 +2704,7 @@ impl DeltaTable {
                 }
                 let key = self.log_key(raw)?;
                 replay.active.remove(&key);
+                replay.adds.remove(&key);
                 let stamp = remove.get("deletionTimestamp").and_then(serde_json::Value::as_i64);
                 facts.remove_stamps.push(stamp);
                 replay.tombstones.insert(key, (raw.to_owned(), stamp));
@@ -2571,10 +2723,11 @@ impl DeltaTable {
                 }
                 *latest = version;
             } else if let Some(metadata) = action.get("metaData") {
-                replay.table_id = metadata
-                    .get("id")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned);
+                let metadata = json_metadata(metadata)?;
+                replay.table_id = Some(metadata.id.clone());
+                replay.metadata = Some(metadata);
+            } else if let Some(protocol) = action.get("protocol") {
+                replay.protocol = Some(json_protocol(protocol)?);
             } else if let Some(info) = action.get("commitInfo") {
                 for field in ["timestamp", "inCommitTimestamp"] {
                     if let Some(stamp) = info.get(field).and_then(serde_json::Value::as_i64) {
@@ -2613,8 +2766,9 @@ impl DeltaTable {
             checkpoint_rows(object.bytes().await?)
         })?;
         let mut replay = LogReplay::default();
-        for raw in rows.adds {
-            if !replay.active.insert(self.log_key(&raw)?) {
+        for (raw, add) in rows.adds {
+            let key = self.log_key(&raw)?;
+            if !replay.active.insert(key.clone()) || replay.adds.insert(key, add).is_some() {
                 return Err(unsupported(format!("{name} adds {raw} twice")));
             }
         }
@@ -2629,11 +2783,17 @@ impl DeltaTable {
                 return Err(unsupported(format!("{name} repeats txn {app_id}")));
             }
         }
-        let ids: BTreeSet<String> = rows.table_ids.into_iter().collect();
-        if ids.len() != 1 {
-            return Err(unsupported(format!("{name} must carry exactly one table id")));
-        }
-        replay.table_id = ids.into_iter().next();
+        let (Ok([protocol]), Ok([metadata])) = (
+            <[ProtocolState; 1]>::try_from(rows.protocols),
+            <[MetadataState; 1]>::try_from(rows.metadata),
+        ) else {
+            return Err(unsupported(format!(
+                "{name} must carry exactly one protocol and one metaData action"
+            )));
+        };
+        replay.table_id = Some(metadata.id.clone());
+        replay.protocol = Some(protocol);
+        replay.metadata = Some(metadata);
         Ok(replay)
     }
 
@@ -2902,9 +3062,40 @@ impl DeltaTable {
         }
         report.files_removed = report.files_deleted + report.files_already_absent;
         report.outcome = Outcome::Deleted;
+        self.sync_vacuumed_parents(&plan.candidates).map_err(|error| {
+            fail_with(
+                MaintenanceErrorKind::Uncertain,
+                format!("deleted files' directories are not durable; progress not recorded: {error:#}"),
+                &report,
+            )
+        })?;
         self.record_vacuum_progress(plan, effective, config)
             .map_err(|error| progress_failure(&error, &report))?;
         Ok(report)
+    }
+
+    /// On local roots, fsync the parent directory of every candidate (deleted or
+    /// already absent; the nearest existing ancestor when it is gone) up to the
+    /// table root, so unlinks are durable before progress lets pruning drop the
+    /// tombstones that describe them. Repeats re-fsync, repairing earlier failures.
+    fn sync_vacuumed_parents(&self, candidates: &[VacuumCandidate]) -> Result<()> {
+        if self.url.scheme() != "file" {
+            return Ok(());
+        }
+        let mut leaves = BTreeSet::new();
+        for candidate in candidates {
+            self.safe_object_path(&candidate.path)?;
+            let local = self.root.join(percent_decode(&candidate.path)?);
+            let mut directory = local.parent().context("data file without a parent directory")?;
+            while !directory.is_dir() && directory != self.root {
+                directory = directory.parent().context("data file outside the table root")?;
+            }
+            leaves.insert(directory.to_path_buf());
+        }
+        for leaf in &leaves {
+            sync_directory_chain(leaf, &self.root)?;
+        }
+        Ok(())
     }
 
     /// Record durable VACUUM LITE progress after a complete, uninterrupted apply.
@@ -3039,10 +3230,109 @@ async fn fetch_record(
 /// Rows of a classic checkpoint relevant to the pruning proof.
 #[derive(Default)]
 struct CheckpointRows {
-    adds: Vec<String>,
+    adds: Vec<(String, AddState)>,
     removes: Vec<(String, Option<i64>)>,
     txns: Vec<(String, i64)>,
-    table_ids: Vec<String>,
+    protocols: Vec<ProtocolState>,
+    metadata: Vec<MetadataState>,
+}
+
+fn checkpoint_shape(what: &str) -> anyhow::Error {
+    fail(
+        MaintenanceErrorKind::Unsupported,
+        format!("checkpoint {what} has an unexpected shape"),
+    )
+}
+
+/// A `map<string, string>` child at `row`; `None` when absent or null.
+fn child_map(
+    parent: &arrow::array::StructArray,
+    field: &str,
+    row: usize,
+) -> Result<Option<BTreeMap<String, Option<String>>>> {
+    let Some(column) = parent.column_by_name(field).filter(|column| column.is_valid(row)) else {
+        return Ok(None);
+    };
+    let entries = column.as_map_opt().ok_or_else(|| checkpoint_shape(field))?.value(row);
+    if entries.num_columns() != 2 {
+        return Err(checkpoint_shape(field));
+    }
+    let keys = arrow::compute::cast(entries.column(0), &DataType::Utf8)?;
+    let keys = keys.as_string::<i32>();
+    let values = arrow::compute::cast(entries.column(1), &DataType::Utf8)?;
+    let values = values.as_string::<i32>();
+    let mut map = BTreeMap::new();
+    for entry in 0..entries.len() {
+        if keys.is_null(entry) {
+            return Err(checkpoint_shape(field));
+        }
+        let value = values.is_valid(entry).then(|| values.value(entry).to_owned());
+        if map.insert(keys.value(entry).to_owned(), value).is_some() {
+            return Err(checkpoint_shape(field));
+        }
+    }
+    Ok(Some(map))
+}
+
+/// A `list<string>` child at `row`; `None` when absent or null.
+fn child_string_list(parent: &arrow::array::StructArray, field: &str, row: usize) -> Result<Option<Vec<String>>> {
+    let Some(column) = parent.column_by_name(field).filter(|column| column.is_valid(row)) else {
+        return Ok(None);
+    };
+    let items = column
+        .as_list_opt::<i32>()
+        .ok_or_else(|| checkpoint_shape(field))?
+        .value(row);
+    let items = arrow::compute::cast(&items, &DataType::Utf8)?;
+    let items = items.as_string::<i32>();
+    (0..items.len())
+        .map(|item| {
+            items
+                .is_valid(item)
+                .then(|| items.value(item).to_owned())
+                .ok_or_else(|| checkpoint_shape(field))
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
+fn checkpoint_protocol(protocol: &arrow::array::StructArray, row: usize) -> Result<ProtocolState> {
+    let version = |field: &str| -> Result<i64> {
+        child_i64(protocol, field)?
+            .filter(|values| values.is_valid(row))
+            .map(|values| values.value(row))
+            .ok_or_else(|| checkpoint_shape(field))
+    };
+    let features = |field: &str| -> Result<Option<BTreeSet<String>>> {
+        Ok(child_string_list(protocol, field, row)?.map(|features| features.into_iter().collect()))
+    };
+    Ok(ProtocolState {
+        min_reader_version: version("minReaderVersion")?,
+        min_writer_version: version("minWriterVersion")?,
+        reader_features: features("readerFeatures")?,
+        writer_features: features("writerFeatures")?,
+    })
+}
+
+fn checkpoint_metadata(metadata: &arrow::array::StructArray, row: usize) -> Result<MetadataState> {
+    let id = required_string(child_strings(metadata, "id")?.as_ref(), row, "metaData.id")?;
+    let schema = required_string(
+        child_strings(metadata, "schemaString")?.as_ref(),
+        row,
+        "metaData.schemaString",
+    )?;
+    let partition_columns =
+        child_string_list(metadata, "partitionColumns", row)?.ok_or_else(|| checkpoint_shape("partitionColumns"))?;
+    let configuration = child_map(metadata, "configuration", row)?
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(key, value)| {
+            value
+                .map(|value| (key, value))
+                .ok_or_else(|| checkpoint_shape("configuration"))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    MetadataState::new(id, &schema, partition_columns, configuration)
 }
 
 fn struct_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<Option<&'a arrow::array::StructArray>> {
@@ -3115,12 +3405,24 @@ fn checkpoint_rows<R: parquet::file::reader::ChunkReader + 'static>(reader: R) -
         }
         if let Some(add) = struct_column(&batch, "add")? {
             let paths = child_strings(add, "path")?;
+            let sizes = child_i64(add, "size")?;
             for row in 0..add.len() {
                 if add.is_valid(row) {
                     if child_valid(add, "deletionVector", row) {
                         return Err(unsupported("deletion vectors are unsupported"));
                     }
-                    rows.adds.push(required_string(paths.as_ref(), row, "add.path")?);
+                    let size = sizes
+                        .as_ref()
+                        .filter(|sizes| sizes.is_valid(row))
+                        .map(|sizes| sizes.value(row))
+                        .ok_or_else(|| unsupported("checkpoint add.size is missing"))?;
+                    rows.adds.push((
+                        required_string(paths.as_ref(), row, "add.path")?,
+                        AddState {
+                            size,
+                            partition_values: child_map(add, "partitionValues", row)?.unwrap_or_default(),
+                        },
+                    ));
                 }
             }
         }
@@ -3156,10 +3458,16 @@ fn checkpoint_rows<R: parquet::file::reader::ChunkReader + 'static>(reader: R) -
             }
         }
         if let Some(metadata) = struct_column(&batch, "metaData")? {
-            let ids = child_strings(metadata, "id")?;
             for row in 0..metadata.len() {
                 if metadata.is_valid(row) {
-                    rows.table_ids.push(required_string(ids.as_ref(), row, "metaData.id")?);
+                    rows.metadata.push(checkpoint_metadata(metadata, row)?);
+                }
+            }
+        }
+        if let Some(protocol) = struct_column(&batch, "protocol")? {
+            for row in 0..protocol.len() {
+                if protocol.is_valid(row) {
+                    rows.protocols.push(checkpoint_protocol(protocol, row)?);
                 }
             }
         }
@@ -3192,6 +3500,52 @@ fn proof_mismatch(
         .keys()
         .find(|app_id| !expected_txns.contains_key(*app_id))
         .map(|app_id| format!("{source} has txn {app_id} absent from the JSON replay"))
+}
+
+/// First difference in recovery-relevant state (per-add partition values and
+/// size, protocol and metadata) between an independent JSON replay and a
+/// checkpoint view. Statistics are not compared.
+fn state_mismatch(
+    source: &str,
+    expected: &LogReplay,
+    adds: &BTreeMap<String, AddState>,
+    protocol: Option<&ProtocolState>,
+    metadata: Option<&MetadataState>,
+) -> Option<String> {
+    if let Some(path) = expected
+        .adds
+        .keys()
+        .chain(adds.keys())
+        .find(|path| expected.adds.get(*path) != adds.get(*path))
+    {
+        return Some(format!(
+            "{source} add {path} differs from the JSON replay: {:?} vs {:?}",
+            adds.get(path),
+            expected.adds.get(path)
+        ));
+    }
+    if expected.protocol.is_none() || expected.protocol.as_ref() != protocol {
+        return Some(format!(
+            "{source} protocol {protocol:?} differs from the JSON replay {:?}",
+            expected.protocol
+        ));
+    }
+    match (expected.metadata.as_ref(), metadata) {
+        (Some(expected), Some(actual)) if expected == actual => None,
+        (Some(expected), Some(actual)) => {
+            let field = if expected.id != actual.id {
+                "id"
+            } else if expected.schema != actual.schema {
+                "schemaString"
+            } else if expected.partition_columns != actual.partition_columns {
+                "partitionColumns"
+            } else {
+                "configuration"
+            };
+            Some(format!("{source} metaData.{field} differs from the JSON replay"))
+        }
+        _ => Some(format!("{source} lacks metaData or the JSON replay does")),
+    }
 }
 
 /// Parse a Delta interval such as `interval 30 days`; `None` when unrecognized.
@@ -3329,6 +3683,15 @@ impl PrunePlan {
     }
 }
 
+/// Kernel's snapshot view used to cross-check a checkpoint.
+struct KernelView {
+    protocol: ProtocolState,
+    metadata: MetadataState,
+    active: BTreeSet<String>,
+    adds: BTreeMap<String, AddState>,
+    txns: BTreeMap<String, i64>,
+}
+
 /// A checkpoint `C` proven equivalent to the history it replaces.
 struct PruneProof {
     checkpoint_version: u64,
@@ -3369,8 +3732,10 @@ impl DeltaTable {
     }
 
     /// Durably replace a maintenance record with `merge(current)` when it returns
-    /// `Some`. Local roots serialize writers with an exclusive lock and publish by
-    /// fsynced rename; object stores use create-if-absent or etag-conditional puts.
+    /// `Some`. Local roots serialize writers with an exclusive lock, publish by
+    /// fsynced rename, and fsync the visible record, its directory and the root
+    /// on every return (no-op merges included); object stores use
+    /// create-if-absent or etag-conditional puts.
     fn update_record<T>(&self, name: &str, merge: impl Fn(Option<&T>) -> Result<Option<T>>) -> Result<()>
     where
         T: Serialize + serde::de::DeserializeOwned,
@@ -3385,10 +3750,10 @@ impl DeltaTable {
         };
         if self.url.scheme() == "file" {
             let directory = self.root.join(MAINTENANCE_DIR);
-            if !directory.is_dir() {
-                fs::create_dir_all(&directory)?;
-                sync_directory(&self.root)?;
-            }
+            // Always repair durability of the directory entry: an earlier create
+            // may have become visible while its root fsync failed.
+            fs::create_dir_all(&directory)?;
+            sync_directory(&self.root)?;
             let lock = fs::OpenOptions::new()
                 .create(true)
                 .truncate(false)
@@ -3401,14 +3766,19 @@ impl DeltaTable {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                 Err(error) => return Err(error.into()),
             };
-            let Some(next) = merge(current.as_ref())? else {
-                return Ok(());
-            };
-            let staged = directory.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()));
-            fs::write(&staged, serde_json::to_vec(&next)?)?;
-            sync_file(&staged)?;
-            fs::rename(&staged, &target)?;
-            sync_file(&target)?;
+            if let Some(next) = merge(current.as_ref())? {
+                let staged = directory.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()));
+                fs::write(&staged, serde_json::to_vec(&next)?)?;
+                sync_file(&staged)?;
+                fs::rename(&staged, &target)?;
+            }
+            // Every path, including a no-op merge, makes the visible record durable
+            // before returning: a prior rename may be visible while its fsyncs failed.
+            match fs::metadata(&target) {
+                Ok(_) => sync_file(&target)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
             sync_directory(&directory)?;
             sync_directory(&self.root)?;
             fs2::FileExt::unlock(&lock)?;
@@ -3471,14 +3841,9 @@ impl DeltaTable {
         Ok(requested)
     }
 
-    /// Kernel's view of version `version`: table id, active add keys and the
-    /// requested application transactions.
-    fn kernel_view_at(
-        &self,
-        version: u64,
-        app_ids: &BTreeSet<String>,
-        max_active: usize,
-    ) -> Result<(String, BTreeSet<String>, BTreeMap<String, i64>)> {
+    /// Kernel's view of version `version`: protocol and metadata, active adds
+    /// and the requested application transactions.
+    fn kernel_view_at(&self, version: u64, app_ids: &BTreeSet<String>, max_active: usize) -> Result<KernelView> {
         let unsupported = |message: String| fail(MaintenanceErrorKind::Unsupported, message);
         let snapshot = Snapshot::builder_for(self.url.as_str())
             .at_version(version)
@@ -3500,17 +3865,21 @@ impl DeltaTable {
             ));
         }
         let scan = Arc::clone(&snapshot).scan_builder().build()?;
-        let mut active = BTreeSet::new();
+        let mut adds = BTreeMap::new();
         for metadata in scan.scan_metadata(&self.engine)? {
             let batch = metadata?.scan_files.apply_selection_vector()?.try_into_record_batch()?;
             for file in parse_scan_rows(&batch, &fingerprint.partition_columns)? {
-                if active.len() >= max_active {
+                if adds.len() >= max_active {
                     return Err(fail(
                         MaintenanceErrorKind::ResourceLimit,
                         format!("active file count exceeds {max_active}"),
                     ));
                 }
-                if !active.insert(self.log_key(&file.path)?) {
+                let state = AddState {
+                    size: i64::try_from(file.size)?,
+                    partition_values: file.partition_values,
+                };
+                if adds.insert(self.log_key(&file.path)?, state).is_some() {
                     return Err(unsupported(format!("duplicate active path {}", file.path)));
                 }
             }
@@ -3521,11 +3890,31 @@ impl DeltaTable {
                 txns.insert(app_id.clone(), txn_version);
             }
         }
-        Ok((fingerprint.table_id, active, txns))
+        let features = |features: Option<Vec<String>>| features.map(|features| features.into_iter().collect());
+        Ok(KernelView {
+            protocol: ProtocolState {
+                min_reader_version: i64::from(fingerprint.min_reader_version),
+                min_writer_version: i64::from(fingerprint.min_writer_version),
+                reader_features: features(fingerprint.reader_features),
+                writer_features: features(fingerprint.writer_features),
+            },
+            metadata: MetadataState::new(
+                fingerprint.table_id,
+                &fingerprint.schema_string,
+                fingerprint.partition_columns,
+                fingerprint.configuration,
+            )?,
+            active: adds.keys().cloned().collect(),
+            adds,
+            txns,
+        })
     }
 
     /// Compare an independent replay with checkpoint `version`, both through a
-    /// direct Parquet read of the checkpoint file and through Kernel loading it.
+    /// direct Parquet read of the checkpoint file and through Kernel loading it:
+    /// the active add set with each add's partition values and size, every
+    /// application transaction, the last protocol and the last metaData (id,
+    /// schema, partition columns and configuration). Statistics are not compared.
     fn verify_checkpoint(
         &self,
         version: u64,
@@ -3548,31 +3937,45 @@ impl DeltaTable {
                 "checkpoint {version} belongs to a different table id"
             )));
         }
+        let source = format!("checkpoint {version} Parquet");
         if let Some(mismatch) = proof_mismatch(
-            &format!("checkpoint {version} Parquet"),
+            &source,
             &expected.active,
             &expected.txns,
             &parquet.active,
             &parquet.txns,
-        ) {
+        )
+        .or_else(|| {
+            state_mismatch(
+                &source,
+                expected,
+                &parquet.adds,
+                parquet.protocol.as_ref(),
+                parquet.metadata.as_ref(),
+            )
+        }) {
             return Err(unsupported(mismatch));
         }
         let mut app_ids: BTreeSet<String> = expected.txns.keys().cloned().collect();
         app_ids.insert(PURGE_WATERMARK.to_owned());
-        let (kernel_table, kernel_active, kernel_txns) =
-            self.kernel_view_at(version, &app_ids, config.max_active_files)?;
-        if kernel_table != table_id {
+        let kernel = self.kernel_view_at(version, &app_ids, config.max_active_files)?;
+        if kernel.metadata.id != table_id {
             return Err(unsupported(format!(
                 "Kernel version {version} has a different table id"
             )));
         }
-        if let Some(mismatch) = proof_mismatch(
-            &format!("Kernel snapshot {version}"),
-            &expected.active,
-            &expected.txns,
-            &kernel_active,
-            &kernel_txns,
-        ) {
+        let source = format!("Kernel snapshot {version}");
+        if let Some(mismatch) = proof_mismatch(&source, &expected.active, &expected.txns, &kernel.active, &kernel.txns)
+            .or_else(|| {
+                state_mismatch(
+                    &source,
+                    expected,
+                    &kernel.adds,
+                    Some(&kernel.protocol),
+                    Some(&kernel.metadata),
+                )
+            })
+        {
             return Err(unsupported(mismatch));
         }
         Ok(())
@@ -3595,6 +3998,48 @@ impl DeltaTable {
             }
         }
         Ok(())
+    }
+
+    /// Whether every log object left at or below `floor` (JSON `<= floor`,
+    /// checkpoints `< floor`) is eligible: commit timestamp (when present) and
+    /// object modification time older than `log_cutoff_ms`, and every remove
+    /// older than the progress cutoff, with progress covering the floor.
+    #[allow(clippy::too_many_arguments)]
+    fn leftovers_eligible(
+        &self,
+        floor: u64,
+        json: &BTreeSet<u64>,
+        checkpoints: &BTreeSet<u64>,
+        names: &BTreeMap<String, ObjectMeta>,
+        progress: &VacuumLiteProgress,
+        log_cutoff_ms: i64,
+        config: &PruneConfig,
+    ) -> Result<bool> {
+        if progress.version < floor {
+            return Ok(false);
+        }
+        let modified = |name: String| names.get(&name).map(|meta| meta.last_modified.timestamp_millis());
+        let old = |stamp: Option<i64>| stamp.is_some_and(|stamp| stamp < log_cutoff_ms);
+        for version in json.range(..=floor) {
+            let bytes = self.read_commit(*version, config.max_log_file_bytes)?;
+            let facts = self.replay_commit(&mut LogReplay::default(), &bytes)?;
+            let stamp = [facts.timestamp, modified(format!("{version:020}.json"))]
+                .into_iter()
+                .flatten()
+                .max();
+            if !old(stamp)
+                || !old(modified(format!("{version:020}.json")))
+                || !facts
+                    .remove_stamps
+                    .iter()
+                    .all(|stamp| stamp.is_some_and(|stamp| stamp < progress.cutoff_ms))
+            {
+                return Ok(false);
+            }
+        }
+        Ok(checkpoints
+            .range(..floor)
+            .all(|version| old(modified(format!("{version:020}.checkpoint.parquet")))))
     }
 
     /// Find (or, with `target`, re-prove) the newest checkpoint `C` whose
@@ -3699,6 +4144,17 @@ impl DeltaTable {
                 .iter()
                 .copied()
                 .find(|candidate| above_floor(*candidate) && through.is_some_and(|through| *candidate <= through));
+        }
+        // History left at or below the floor by an interrupted prune must satisfy
+        // the same eligibility as a fresh proof under the effective cutoff.
+        if let Some(floor) = floor
+            && !self.leftovers_eligible(floor, &json, &checkpoints, &names, &progress, log_cutoff_ms, config)?
+        {
+            return if target.is_some() {
+                stale("history left below the log floor is not eligible for pruning under the current policy")
+            } else {
+                Ok(None)
+            };
         }
         let checkpoint = match (chosen, floor) {
             (Some(checkpoint), _) => {
@@ -3871,6 +4327,15 @@ impl DeltaTable {
                 &report,
             ));
         }
+        // The proof relied on the progress record; make it durable before acting on it.
+        self.update_record::<VacuumLiteProgress>(VACUUM_PROGRESS_RECORD, |_| Ok(None))
+            .map_err(|error| {
+                fail_with(
+                    error_kind(&error).unwrap_or(MaintenanceErrorKind::Uncertain),
+                    format!("VACUUM LITE progress record is not durable; nothing deleted: {error:#}"),
+                    &report,
+                )
+            })?;
         let floor = LogFloor {
             table_id,
             checkpoint_version: checkpoint,
@@ -4138,6 +4603,72 @@ mod prune_tests {
     }
 
     #[test]
+    fn state_mismatch_compares_recovery_state_semantically() -> Result<()> {
+        let add = |value: &str, size| AddState {
+            size,
+            partition_values: BTreeMap::from([("p".to_owned(), Some(value.to_owned()))]),
+        };
+        let protocol = ProtocolState {
+            min_reader_version: 3,
+            min_writer_version: 7,
+            reader_features: Some(set(&["a", "b"])),
+            writer_features: Some(set(&["c"])),
+        };
+        let configuration = BTreeMap::from([("k".to_owned(), "v".to_owned())]);
+        let metadata = MetadataState::new(
+            "t".into(),
+            r#"{"type":"struct","fields":[]}"#,
+            vec!["p".into()],
+            configuration.clone(),
+        )?;
+        let expected = LogReplay {
+            adds: BTreeMap::from([("x".to_owned(), add("1", 10))]),
+            protocol: Some(protocol.clone()),
+            metadata: Some(metadata.clone()),
+            ..LogReplay::default()
+        };
+        let check = |adds: &BTreeMap<String, AddState>, protocol: &ProtocolState, metadata: &MetadataState| {
+            state_mismatch("x", &expected, adds, Some(protocol), Some(metadata))
+        };
+        // Key order inside the schema JSON is not significant.
+        let reordered = MetadataState::new(
+            "t".into(),
+            r#"{"fields":[],"type":"struct"}"#,
+            vec!["p".into()],
+            configuration.clone(),
+        )?;
+        assert_eq!(check(&expected.adds, &protocol, &reordered), None);
+        let changed = BTreeMap::from([("x".to_owned(), add("2", 10))]);
+        assert!(check(&changed, &protocol, &metadata).is_some());
+        let resized = BTreeMap::from([("x".to_owned(), add("1", 11))]);
+        assert!(check(&resized, &protocol, &metadata).is_some());
+        let features = ProtocolState {
+            writer_features: Some(set(&["c", "d"])),
+            ..protocol.clone()
+        };
+        assert!(check(&expected.adds, &features, &metadata).is_some());
+        let schema = MetadataState::new(
+            "t".into(),
+            r#"{"type":"struct","fields":[{"name":"y"}]}"#,
+            vec!["p".into()],
+            configuration,
+        )?;
+        assert!(check(&expected.adds, &protocol, &schema).is_some_and(|message| message.contains("schemaString")));
+        let config = MetadataState {
+            configuration: BTreeMap::new(),
+            ..metadata.clone()
+        };
+        assert!(check(&expected.adds, &protocol, &config).is_some_and(|message| message.contains("configuration")));
+        let partitioned = MetadataState {
+            partition_columns: Vec::new(),
+            ..metadata
+        };
+        assert!(check(&expected.adds, &protocol, &partitioned).is_some());
+        assert!(state_mismatch("x", &expected, &expected.adds, None, None).is_some());
+        Ok(())
+    }
+
+    #[test]
     fn log_names_intervals_and_deletion_keys_parse_strictly() {
         assert_eq!(parse_interval_ms("interval 30 days"), Some(DEFAULT_LOG_RETENTION_MS));
         assert_eq!(parse_interval_ms("INTERVAL 1 hour"), Some(3_600_000));
@@ -4163,5 +4694,200 @@ mod prune_tests {
         assert!(deletion_key("_delta_log/00000000000000000003.checkpoint.parquet", 3).is_err());
         assert!(deletion_key("_delta_log/_last_checkpoint", 3).is_err());
         assert!(deletion_key("part-0.parquet", 3).is_err());
+    }
+}
+
+#[cfg(test)]
+mod record_durability_tests {
+    use super::*;
+    use crate::delta::INGESTION_PARTITION;
+    use crate::sync_hook;
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::Field;
+
+    const BASE: i64 = 1_704_067_200_000;
+
+    fn control() -> MaintenanceControl {
+        MaintenanceControl::new(Arc::new(AtomicBool::new(false)), None)
+    }
+
+    fn short_vacuum() -> Result<VacuumConfig> {
+        let mut config = VacuumConfig::new(0, now_ms()? + 1_000);
+        config.unsafe_allow_short_retention_for_tests = true;
+        Ok(config)
+    }
+
+    fn short_prune() -> Result<PruneConfig> {
+        Ok(PruneConfig {
+            log_retention_ms: Some(0),
+            unsafe_allow_short_retention_for_tests: true,
+            ..PruneConfig::new(now_ms()? + 1_000)
+        })
+    }
+
+    fn json_count(root: &std::path::Path) -> Result<usize> {
+        Ok(fs::read_dir(root.join("_delta_log"))?
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .is_ok_and(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+            })
+            .count())
+    }
+
+    fn kind_of<T>(result: &Result<T>) -> Option<MaintenanceErrorKind> {
+        result.as_ref().err().and_then(error_kind)
+    }
+
+    /// A marked disposable root holding OPTIMIZE tombstones.
+    fn tombstoned_table() -> Result<(tempfile::TempDir, PathBuf, Arc<DeltaTable>)> {
+        let directory = tempfile::tempdir()?;
+        let root = fs::canonicalize(directory.path())?;
+        let url = Url::from_directory_path(&root).map_err(|()| anyhow::anyhow!("URL"))?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(INGESTION_PARTITION, DataType::Utf8, false),
+        ]));
+        let table = DeltaTable::open_url(url.clone(), Arc::clone(&schema), vec![INGESTION_PARTITION.into()])?;
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        for chunk in 0..6_i64 {
+            let minute = chunk / 2;
+            let partition = format!("2024-01-01-00-{minute:02}");
+            runtime.block_on(async {
+                let mut file = table
+                    .new_file_partitioned(
+                        Arc::clone(&schema),
+                        BTreeMap::from([(INGESTION_PARTITION.to_owned(), Some(partition.clone()))]),
+                    )?
+                    .with_ingestion_time(BASE + minute * 60_000 + 1)?;
+                file.write(&RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int64Array::from_iter_values(chunk * 10..chunk * 10 + 5)),
+                        Arc::new(StringArray::from(vec![partition.as_str(); 5])),
+                    ],
+                )?)
+                .await?;
+                file.finish().await.map(|_| ())
+            })?;
+        }
+        drop(table);
+        let maintenance = DeltaTable::open_for_maintenance(&url)?;
+        let config = OptimizeConfig {
+            granularity: Some(Granularity::Minute),
+            now_ms: Some(BASE + 60 * 60_000),
+            ..OptimizeConfig::default()
+        };
+        let plan = maintenance.plan_optimize(&config)?;
+        assert!(!plan.bins.is_empty());
+        maintenance.apply_optimize(&plan, &config, &control())?;
+        fs::write(root.join(DISPOSABLE_TEST_MARKER), b"")?;
+        Ok((directory, root, maintenance))
+    }
+
+    /// Scenario: the log floor rename becomes visible but its file fsync, then
+    /// the maintenance-directory fsync, fail.
+    /// Guarantees: apply_prune_log deletes nothing while the floor is not
+    /// durable, a repeat (whose merge is a no-op) still fsyncs and fails, and
+    /// after repair the repeat prunes having fsynced the floor, directory and root.
+    #[test]
+    fn prune_never_deletes_behind_a_non_durable_floor() -> Result<()> {
+        let (_directory, root, maintenance) = tombstoned_table()?;
+        let vacuum = short_vacuum()?;
+        maintenance.apply_vacuum(&maintenance.plan_vacuum(&vacuum)?, &vacuum, &control())?;
+        maintenance.checkpoint_if_due(1, true)?;
+        let config = short_prune()?;
+        let plan = maintenance.plan_prune_log(&config)?;
+        let checkpoint = plan.checkpoint_version.context("provable checkpoint")?;
+        let before = json_count(&root)?;
+        assert_eq!(plan.deletions.len(), before);
+        let records = root.join(MAINTENANCE_DIR);
+        let floor = records.join(LOG_FLOOR_RECORD);
+
+        sync_hook::fail_on(&floor);
+        let first = maintenance.apply_prune_log(&plan, &config, &control());
+        assert_eq!(kind_of(&first), Some(MaintenanceErrorKind::Uncertain));
+        assert!(floor.is_file(), "the floor rename is visible");
+        assert_eq!(json_count(&root)?, before, "nothing deleted behind a non-durable floor");
+        let repeat = maintenance.apply_prune_log(&plan, &config, &control());
+        assert_eq!(kind_of(&repeat), Some(MaintenanceErrorKind::Uncertain));
+        assert_eq!(json_count(&root)?, before, "a no-op merge still requires durability");
+
+        sync_hook::reset(&root);
+        sync_hook::fail_on(&records);
+        let directory_fault = maintenance.apply_prune_log(&plan, &config, &control());
+        assert_eq!(kind_of(&directory_fault), Some(MaintenanceErrorKind::Uncertain));
+        assert_eq!(json_count(&root)?, before);
+
+        sync_hook::reset(&root);
+        let report = maintenance.apply_prune_log(&plan, &config, &control())?;
+        assert_eq!(report.outcome, Outcome::Pruned);
+        assert_eq!(json_count(&root)?, 0);
+        assert_eq!(
+            maintenance.log_floor()?.map(|floor| floor.checkpoint_version),
+            Some(checkpoint)
+        );
+        let synced = sync_hook::synced_under(&root);
+        for path in [&floor, &records, &root] {
+            assert!(synced.contains(path), "{} fsynced", path.display());
+        }
+        sync_hook::reset(&root);
+        Ok(())
+    }
+
+    /// Scenario: VACUUM LITE unlinks files but a partition-directory fsync fails,
+    /// then the progress record's directory fsync fails.
+    /// Guarantees: no progress is recorded while unlinks are not durable, so
+    /// pruning waits; repeats (all files already absent) re-fsync and still
+    /// fail; a visible but non-durable progress record is fsynced again on
+    /// repeat; after repair progress is recorded and pruning is allowed.
+    #[test]
+    fn vacuum_progress_waits_for_durable_unlinks_and_record() -> Result<()> {
+        let (_directory, root, maintenance) = tombstoned_table()?;
+        let vacuum = short_vacuum()?;
+        let plan = maintenance.plan_vacuum(&vacuum)?;
+        let candidate = plan.candidates.first().context("vacuum candidate")?;
+        let partition = root
+            .join(percent_decode(&candidate.path)?)
+            .parent()
+            .context("partition")?
+            .to_path_buf();
+        assert!(partition != root);
+
+        sync_hook::fail_on(&partition);
+        let first = maintenance.apply_vacuum(&plan, &vacuum, &control());
+        assert_eq!(kind_of(&first), Some(MaintenanceErrorKind::Uncertain));
+        assert!(!root.join(&candidate.path).exists(), "unlinked");
+        assert_eq!(maintenance.vacuum_lite_progress()?, None, "progress not advanced");
+        maintenance.checkpoint_if_due(1, true)?;
+        let config = short_prune()?;
+        assert_eq!(maintenance.plan_prune_log(&config)?.report().outcome, Outcome::Noop);
+        let repeat = maintenance.apply_vacuum(&plan, &vacuum, &control());
+        assert_eq!(kind_of(&repeat), Some(MaintenanceErrorKind::Uncertain));
+        assert_eq!(maintenance.vacuum_lite_progress()?, None);
+
+        sync_hook::reset(&root);
+        let records = root.join(MAINTENANCE_DIR);
+        sync_hook::fail_on(&records);
+        let record_fault = maintenance.apply_vacuum(&plan, &vacuum, &control());
+        assert_eq!(kind_of(&record_fault), Some(MaintenanceErrorKind::Uncertain));
+        assert!(records.join(VACUUM_PROGRESS_RECORD).is_file(), "visible, not durable");
+        let again = maintenance.apply_vacuum(&plan, &vacuum, &control());
+        assert_eq!(kind_of(&again), Some(MaintenanceErrorKind::Uncertain));
+
+        sync_hook::reset(&root);
+        let report = maintenance.apply_vacuum(&plan, &vacuum, &control())?;
+        assert_eq!(report.outcome, Outcome::Deleted);
+        assert_eq!(report.files_deleted, 0, "repeat finds every file already absent");
+        let progress = maintenance.vacuum_lite_progress()?.context("progress")?;
+        assert_eq!(progress.version, plan.header.read_version);
+        let synced = sync_hook::synced_under(&root);
+        for path in [&partition, &records.join(VACUUM_PROGRESS_RECORD), &records, &root] {
+            assert!(synced.contains(path), "{} fsynced", path.display());
+        }
+        let prune = maintenance.plan_prune_log(&short_prune()?)?;
+        assert_eq!(prune.report().outcome, Outcome::Planned);
+        sync_hook::reset(&root);
+        Ok(())
     }
 }
