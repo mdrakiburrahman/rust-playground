@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail, ensure};
-use arrow_deltalake::delta::{DeltaTable, StorageAuthority, object_store_for_url};
+use arrow_deltalake::delta::DeltaTable;
 use arrow_deltalake::layout::LayoutPolicy;
+use arrow_deltalake::publisher::PublisherSession;
 use arrow_tenant_stream::checkpoint::Checkpoint;
 use arrow_tenant_stream::metrics::{StreamMetrics, serve};
 use arrow_tenant_stream::reader::TenantQuery;
@@ -97,6 +98,23 @@ async fn main() -> Result<()> {
         !checkpoint_url.as_str().starts_with(target_url.as_str()),
         "checkpoint must not be stored inside the vacuumable target root"
     );
+    let session = PublisherSession::shared_for_url_async(&target_url).await?;
+    let run_result = run(&options, source_url, target_url, checkpoint_url, Arc::clone(&session)).await;
+    let close_result = session.close_after_drain_async().await;
+    match (run_result, close_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(run), Err(close)) => bail!("tenant stream failed: {run:#}; publisher registration retained: {close:#}"),
+    }
+}
+
+async fn run(
+    options: &Options,
+    source_url: Url,
+    target_url: Url,
+    checkpoint_url: Url,
+    session: Arc<PublisherSession>,
+) -> Result<()> {
     let source = DeltaSource::open(source_url)?;
     let checkpoint = if checkpoint_url.scheme() == "file" {
         ensure!(
@@ -111,9 +129,9 @@ async fn main() -> Result<()> {
         .await?
     } else {
         let (_, prefix) = object_store::ObjectStoreScheme::parse(&checkpoint_url)?;
-        let store = object_store_for_url(&checkpoint_url)?;
+        let store = session.store_for_url(&checkpoint_url)?;
         let authority: Arc<dyn arrow_tenant_stream::checkpoint::StoreAuthority> =
-            Arc::new(StorageAuthority::open(&checkpoint_url)?);
+            Arc::<PublisherSession>::clone(&session);
         if options.recover_stale_checkpoint_lock {
             Checkpoint::clear_store_lock_with_authority(Arc::clone(&store), prefix.clone(), Arc::clone(&authority))
                 .await?;
@@ -134,7 +152,7 @@ async fn main() -> Result<()> {
         Arc::clone(&metrics),
     )
     .await?;
-    let run_result = drive(&mut stream, &options, target_url, &query, metrics).await;
+    let run_result = drive(&mut stream, options, target_url, &query, metrics, session).await;
     let close_result = stream.close().await;
     match (run_result, close_result) {
         (Ok(()), Ok(())) => Ok(()),
@@ -149,6 +167,7 @@ async fn drive(
     target_url: Url,
     query: &TenantQuery,
     metrics: Arc<StreamMetrics>,
+    session: Arc<PublisherSession>,
 ) -> Result<()> {
     let source_schema = stream.manifest().schema()?;
     let columns = query.columns(stream.manifest())?;
@@ -170,7 +189,7 @@ async fn drive(
     if schema.field_with_name("sample_time_utc").is_ok() {
         policy.sort_columns.push("sample_time_utc".into());
     }
-    let table = DeltaTable::open_url(target_url.clone(), Arc::clone(&schema), partition_columns)?;
+    let table = DeltaTable::open_url_with_session(target_url.clone(), Arc::clone(&schema), partition_columns, session)?;
     ensure!(
         DeltaSource::open(target_url)?.capture()?.table_id != stream.manifest().table_id,
         "source and target resolve to the same Delta table identity"

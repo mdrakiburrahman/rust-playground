@@ -52,14 +52,19 @@ updates. After a cloud process crashes, an operator must stop/fence every old
 writer before explicitly clearing that lock. A timeout is not evidence that
 the old process stopped. Cloud storage must support atomic create; unsupported
 stores fail closed. Object-store durability is not described as local `fsync`.
-Azure checkpoint mutations use the shared storage provider and check the
-captured owned, ready reset generation immediately before and after each
-mutation. A failed authority check permanently fences that handle; it must
+Azure target and checkpoint mutations share one process-cached
+`PublisherSession` and guarded stores, with transport retries disabled.
+Checkpoint operations check the session authority immediately before and after
+each mutation; target commits check it before publication. A failed checkpoint
+authority check permanently fences that handle; it must
 not release a lock through a stale generation. Bounded-auth and live reset
 qualification remain required; pre/post checks alone do not prove that a
 blocked credential provider cannot publish a late write.
-Destructive cloud reset must stay disabled until target and checkpoint
-mutators share the once-per-process publication admission/drain protocol.
+The session is explicitly drained only after the active microbatch, target
+writers, and checkpoint lock release finish. An uncertain guarded mutation
+retains its registration and makes shutdown fail; no `Drop` cleanup unregisters
+it. Destructive cloud reset must stay disabled until all other mutating
+processes are enrolled and distributed quiescence has been qualified.
 Neither a local container stop nor a fixed grace period proves distributed
 quiescence; crashed, suspended, or uncertain mutators must block reset.
 
@@ -134,7 +139,8 @@ pushes the namespaced branch and immutable SHA tags, and stamps `VCS_REF`;
 `publish:main` additionally updates `latest`. Build manifests use
 `target/images/arrow-tenant-stream-{load,publish}.txt`.
 
-The service image builds from the workspace root, runs as UID 10001,
+The service image builds from the workspace root, uses `tini` for standalone
+signal forwarding and child reaping, runs as UID 10001,
 uses `/var/lib/tenant-stream`, and exposes port 9094. `/metrics` publishes
 snapshot/tail batches, prepared offsets, sink/checkpoint commits, transaction
 replay, transaction-only progress, idle/failure counts, bootstrap file backlog,

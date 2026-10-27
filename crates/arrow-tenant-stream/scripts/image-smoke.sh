@@ -24,3 +24,6 @@ healthcheck="$(docker image inspect --format '{{json .Config.Healthcheck.Test}}'
 grep -F '/metrics' <<<"$healthcheck" >/dev/null
 grep -F '9094' <<<"$healthcheck" >/dev/null
 test "$(docker image inspect --format '{{.Config.StopSignal}}' "$image")" = SIGTERM
+entrypoint="$(docker image inspect --format '{{json .Config.Entrypoint}}' "$image")"
+grep -F '/usr/bin/tini' <<<"$entrypoint" >/dev/null
+grep -F '/usr/local/bin/arrow-tenant-stream' <<<"$entrypoint" >/dev/null

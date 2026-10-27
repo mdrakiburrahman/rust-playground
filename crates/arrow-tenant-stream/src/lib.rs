@@ -33,6 +33,20 @@ mod publisher_tests {
     #[tokio::test]
     async fn checkpoint_releases_before_clean_process_session_close() -> Result<()> {
         let session = PublisherSession::local();
+        let target_root = tempfile::tempdir()?;
+        let target_url =
+            Url::from_directory_path(target_root.path()).map_err(|()| anyhow::anyhow!("invalid target URL"))?;
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
+            "customer_id",
+            arrow::datatypes::DataType::Utf8,
+            false,
+        )]));
+        let target = arrow_deltalake::delta::DeltaTable::open_url_with_session(
+            target_url.clone(),
+            Arc::clone(&schema),
+            Vec::new(),
+            Arc::clone(&session),
+        )?;
         let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let url = Url::parse("file:///checkpoint-session/")?;
         let store = session.bind_store(&url, inner, MutationRetries::Disabled)?;
@@ -40,13 +54,20 @@ mod publisher_tests {
         let mut checkpoint = Checkpoint::open_store_with_authority(store, Path::from("checkpoint"), authority).await?;
         checkpoint.recover().await?;
         checkpoint.prepare(0, &serde_json::json!({"next": 1}), 123).await?;
+        target.commit_files_with_transaction(&[], "test-tenant-query", 0)?;
         checkpoint.commit(0).await?;
         checkpoint.close().await?;
+        drop(target);
         assert_eq!(session.status().inflight, 0);
         assert!(session.status().uncertain.is_none());
         session.close_after_drain_async().await?;
         assert_eq!(session.status().phase, Phase::Closed);
         assert!(session.check_async().await.is_err());
+        assert!(
+            arrow_deltalake::delta::DeltaTable::open_url_with_session(target_url, schema, Vec::new(), session,)
+                .is_err(),
+            "closed process session must not admit a reopened target"
+        );
         Ok(())
     }
 
