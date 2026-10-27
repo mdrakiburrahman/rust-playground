@@ -1118,7 +1118,33 @@ async fn actual_service_live_append_optimize_purge_prune_and_restart_on_disposab
         barrier.close().await?;
         let mut vacuum = VacuumConfig::new(0, now_ms()? + 1_000);
         vacuum.unsafe_allow_short_retention_for_tests = true;
-        m.apply_vacuum(&m.plan_vacuum(&vacuum)?, &vacuum, &control)?;
+        let vacuum_plan = m.plan_vacuum(&vacuum)?;
+        ensure!(
+            !vacuum_plan.candidates.is_empty(),
+            "physical VACUUM requires eligible old files"
+        );
+        let vacuum_report = m.apply_vacuum(&vacuum_plan, &vacuum, &control)?;
+        ensure!(
+            vacuum_report.outcome == Outcome::Deleted && vacuum_report.files_deleted > 0,
+            "physical VACUUM must actually delete obsolete source files"
+        );
+        for candidate in &vacuum_plan.candidates {
+            let path = source
+                .file_url(&candidate.path)?
+                .to_file_path()
+                .map_err(|()| anyhow::anyhow!("local VACUUM candidate"))?;
+            ensure!(
+                !path.exists(),
+                "every planned obsolete source file must be physically absent"
+            );
+        }
+        for file in &retained.files {
+            let path = source
+                .file_url(&file.path)?
+                .to_file_path()
+                .map_err(|()| anyhow::anyhow!("local retained source file"))?;
+            ensure!(path.is_file(), "VACUUM must preserve every retained active source file");
+        }
         let checkpointed = m.checkpoint_if_due(1, true)?;
         ensure!(
             checkpointed.outcome == Outcome::Checkpointed,
