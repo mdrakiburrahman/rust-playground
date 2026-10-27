@@ -141,6 +141,9 @@ Data files are synced before publication. Safe CAS collisions retry with jitter,
 up to eight attempts and a ten-second retry-admission window. Stable transaction
 identities reconcile uncertain success before any resubmission; an unreadable
 outcome fails closed, and unidentified uncertain appends are never replayed.
+Local reconciliation/deduplication synchronizes retained replay logs/checkpoints
+and their directories before acknowledging: read-back visibility alone does not
+repair a failed local durability operation.
 Exhaustion and semantic/schema conflicts remain visible errors; orphan files
 remain for inspection. The 10-second
 collection window is not a visibility bound: dependency waves add latency.
@@ -174,10 +177,16 @@ readers/checkpoint clients without opening a writer. Azure runtimes require `az`
 `AZURE_CONFIG_DIR` pointing at it. A token cache alone is not sufficient.
 The provider invokes `az account get-access-token` with the Storage scope;
 no credentials are embedded in jobs or table metadata. Child execution/output
-has a five-second deadline, cancellation kills the child, concurrent credential
+has a five-second deadline, cancellation kills its dedicated Unix process group
+(including the packaged shell wrapper's Python descendants), concurrent credential
 admission is bounded to six seconds, and output is limited to 64 KiB.
 Cached tokens expire at the earlier of 60 seconds or their expiry minus 30 seconds.
 CLI stderr and token responses are never included in errors.
+Explicit timeout reaps the direct child; outer-future cancellation retains Tokio's
+child reaper. Container runtimes must supply an init/subreaper for orphaned
+descendants. The provider never signals the caller's process group. Regression
+tests cover both deadline expiry and outer cancellation with delayed descendant
+work, not only delayed work in a wrapper shell.
 
 Normal Azure open/upload/commit requires owned, ready checkpoint-container
 metadata and the same captured reset generation. Bootstrap-only
