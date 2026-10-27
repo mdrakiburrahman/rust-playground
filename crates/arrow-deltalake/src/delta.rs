@@ -13,10 +13,13 @@ use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::schema::StructType;
 use delta_kernel::transaction::{BoundWriteContext, CommitResult};
 use delta_kernel::{DeltaResult, DeltaResultIterator, Engine, FileMeta, FilteredEngineData, Snapshot, SnapshotRef};
+use delta_kernel_default_engine::executor::TaskExecutor;
 use delta_kernel_default_engine::parquet::DataFileMetadata;
 use delta_kernel_default_engine::stats::FileStatsAccumulator;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder, build_add_file_metadata};
 use fs2::FileExt;
+use object_store::{ObjectStore, PutMode};
+use parquet::file::properties::WriterProperties;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -25,9 +28,42 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant};
 use url::Url;
 
 type LocalEngine = DefaultEngine<SharedExecutor>;
+
+/// Retained transaction fence preventing expired ingestion replay after PURGE.
+pub const PURGE_WATERMARK: &str = "arrowcol.purge.before-ms";
+/// UTC ingestion-time Hive partition, independent of the event timestamp.
+pub const INGESTION_PARTITION: &str = "__arrowcol_ingestion";
+
+/// Format an ingestion stamp in the explicitly configured UTC partition granularity.
+///
+/// # Errors
+/// Rejects invalid timestamps and unknown granularity settings.
+pub fn ingestion_partition_value(stamp: i64) -> Result<String> {
+    let timestamp = chrono::DateTime::from_timestamp_millis(stamp).context("invalid ingestion stamp")?;
+    let format = match std::env::var("ARROWCOL_PARTITION_GRANULARITY").as_deref() {
+        Ok("minute") => "%Y-%m-%d-%H-%M",
+        Ok("hour") => "%Y-%m-%d-%H",
+        Ok("day") => "%Y-%m-%d",
+        other => bail!("partition granularity must be minute, hour or day, got {other:?}"),
+    };
+    Ok(timestamp.format(format).to_string())
+}
+
+fn validate_transaction_id(app_id: &str, version: i64) -> Result<()> {
+    if app_id.is_empty() || app_id.len() > 256 || app_id.starts_with("arrowcol.purge") || version < 0 {
+        bail!("invalid or reserved publication transaction identity");
+    }
+    Ok(())
+}
+
+pub(crate) fn collision_backoff(attempt: u32) {
+    let jitter = u64::from(uuid::Uuid::new_v4().as_bytes()[0]) % 17;
+    std::thread::sleep(Duration::from_millis((5_u64 << attempt.min(6)) + jitter));
+}
 
 /// Initialize the process-wide Delta I/O runtime before applying thread affinity.
 ///
@@ -62,7 +98,7 @@ mod io_tests {
     fn writer_lock_is_released_before_inherited_descriptor_closes() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let table = DeltaTable::open(directory.path())?;
-        let inherited = table._lock.0.try_clone()?;
+        let inherited = table._lock.as_ref().context("missing writer lock")?.0.try_clone()?;
         let shared = Arc::clone(&table);
         drop(table);
         assert!(DeltaTable::open(directory.path()).is_err());
@@ -593,11 +629,13 @@ pub trait PublicationFence: Send + Sync + 'static {
 
 /// Local table ownership and Kernel engine. Hold one instance per table.
 pub struct DeltaTable {
-    root: PathBuf,
-    url: Url,
-    engine: LocalEngine,
-    _lock: WriterLock,
-    commit_lock: Mutex<()>,
+    pub(crate) root: PathBuf,
+    pub(crate) url: Url,
+    pub(crate) engine: LocalEngine,
+    _lock: Option<WriterLock>,
+    pub(crate) commit_lock: Mutex<()>,
+    pub(crate) store: Arc<dyn ObjectStore>,
+    partition_columns: Vec<String>,
     snapshot_cache: Mutex<Option<CachedSnapshot>>,
     reuse_snapshots: bool,
     publication_fence: Option<Arc<dyn PublicationFence>>,
@@ -629,7 +667,7 @@ struct LogFingerprint {
     identity: (u64, u64, i64, i64),
 }
 
-struct DurableCommitter;
+pub(crate) struct DurableCommitter;
 
 impl Committer for DurableCommitter {
     fn commit(
@@ -640,6 +678,9 @@ impl Committer for DurableCommitter {
     ) -> DeltaResult<CommitResponse> {
         let response = FileSystemCommitter::new().commit(engine, actions, metadata)?;
         if let CommitResponse::Committed { file_meta } = &response {
+            if file_meta.location.scheme() != "file" {
+                return Ok(response);
+            }
             let path = file_meta
                 .location
                 .to_file_path()
@@ -679,6 +720,113 @@ fn committed<S>(result: CommitResult<S>) -> Result<u64> {
 }
 
 impl DeltaTable {
+    /// Open a local or ADLS table without taking the collector's lifetime ownership lock.
+    /// Atomic log creation coordinates independent processes; callers own their WAL fencing.
+    ///
+    /// # Errors
+    /// Rejects unsupported URLs, credentials, incompatible partitions or table metadata.
+    pub fn open_url(mut url: Url, schema: SchemaRef, partition_columns: Vec<String>) -> Result<Arc<Self>> {
+        if !url.path().ends_with('/') {
+            url.set_path(&format!("{}/", url.path()));
+        }
+        let store: Arc<dyn ObjectStore> = match url.scheme() {
+            "file" => Arc::new(object_store::local::LocalFileSystem::new()),
+            "abfs" | "abfss" | "az" => Arc::new(
+                object_store::azure::MicrosoftAzureBuilder::from_env()
+                    .with_url(url.as_str())
+                    .with_use_azure_cli(true)
+                    .with_retry(object_store::RetryConfig {
+                        max_retries: 2,
+                        retry_timeout: Duration::from_secs(10),
+                        ..Default::default()
+                    })
+                    .with_client_options(object_store::ClientOptions::new().with_timeout(Duration::from_secs(10)))
+                    .build()?,
+            ),
+            _ => bail!("only file and ADLS URLs are supported"),
+        };
+        let root = if url.scheme() == "file" {
+            let path = url
+                .to_file_path()
+                .map_err(|()| anyhow::anyhow!("invalid local table URL"))?;
+            fs::create_dir_all(&path)?;
+            fs::canonicalize(path)?
+        } else {
+            // Staging is intentionally retained after ambiguous failures, never
+            // automatically removed on drop. VACUUM LITE cannot see these files.
+            let path = std::env::temp_dir().join(format!("arrowcol-stage-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&path)?;
+            path
+        };
+        let engine = DefaultEngineBuilder::new(Arc::clone(&store))
+            .with_task_executor(shared_executor()?)
+            .with_buffer_size(NonZeroUsize::new(READ_AHEAD).context("invalid read ahead")?)
+            .with_batch_size(NonZeroUsize::new(BATCH_ROWS).context("invalid batch size")?)
+            .build();
+        let table = Arc::new(Self {
+            root,
+            url,
+            engine,
+            store,
+            partition_columns,
+            _lock: None,
+            commit_lock: Mutex::new(()),
+            snapshot_cache: Mutex::new(None),
+            reuse_snapshots: false,
+            publication_fence: None,
+        });
+        table.ensure_schema(normalize::schema(&schema)?)?;
+        Ok(table)
+    }
+
+    /// Resolve an application transaction from Kernel replay, including checkpoints.
+    ///
+    /// # Errors
+    /// Returns history, retention or metadata errors.
+    pub fn lookup_txn(&self, app_id: &str) -> Result<Option<i64>> {
+        let snapshot = self.snapshot()?;
+        Self::validate_retention(&snapshot)?;
+        Ok(snapshot.get_app_id_version(app_id, &self.engine)?)
+    }
+
+    fn validate_retention(snapshot: &SnapshotRef) -> Result<()> {
+        if snapshot
+            .metadata_configuration()
+            .contains_key("delta.setTransactionRetentionDuration")
+        {
+            bail!("transaction retention must remain unset to preserve durable replay and fences");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn object_path(&self, relative: &str) -> Result<object_store::path::Path> {
+        if relative.starts_with('/') || relative.split('/').any(|part| part == ".." || part == ".") {
+            bail!("unsafe relative Delta path");
+        }
+        Ok(object_store::path::Path::from_url_path(
+            self.url.join(relative)?.path(),
+        )?)
+    }
+
+    fn upload_file(&self, file: &CompletedFile) -> Result<()> {
+        if self.url.scheme() == "file" {
+            return Ok(());
+        }
+        if file.bytes > 512 * 1024 * 1024 {
+            bail!("staged file exceeds bounded upload size");
+        }
+        let relative = file
+            .path
+            .strip_prefix(&self.root)?
+            .to_str()
+            .context("invalid staged path")?;
+        let path = self.object_path(relative)?;
+        let bytes = fs::read(&file.path)?;
+        let store = Arc::clone(&self.store);
+        shared_executor()?
+            .block_on(async move { store.put_opts(&path, bytes.into(), PutMode::Create.into()).await })?;
+        Ok(())
+    }
     /// Acquire exclusive local writer ownership, creating the directory if needed.
     ///
     /// # Errors
@@ -747,7 +895,7 @@ impl DeltaTable {
             .with_context(|| format!("Delta table already has a writer: {}", root.display()))?;
         let lock = WriterLock(lock);
         let url = Url::from_directory_path(&root).map_err(|()| anyhow::anyhow!("invalid table path"))?;
-        let engine = DefaultEngineBuilder::new(store)
+        let engine = DefaultEngineBuilder::new(Arc::clone(&store))
             .with_task_executor(shared_executor()?)
             .with_buffer_size(NonZeroUsize::new(READ_AHEAD).context("invalid Delta read-ahead")?)
             .with_batch_size(NonZeroUsize::new(BATCH_ROWS).context("invalid Delta batch size")?)
@@ -756,7 +904,13 @@ impl DeltaTable {
             root,
             url,
             engine,
-            _lock: lock,
+            _lock: Some(lock),
+            store,
+            partition_columns: if std::env::var_os("ARROWCOL_PARTITION_GRANULARITY").is_some() {
+                vec![INGESTION_PARTITION.to_owned()]
+            } else {
+                Vec::new()
+            },
             commit_lock: Mutex::new(()),
             snapshot_cache: Mutex::new(None),
             reuse_snapshots,
@@ -764,7 +918,7 @@ impl DeltaTable {
         }))
     }
 
-    fn snapshot(&self) -> Result<SnapshotRef> {
+    pub(crate) fn snapshot(&self) -> Result<SnapshotRef> {
         let full_build = || {
             Snapshot::builder_for(self.url.as_str())
                 .build(&self.engine)
@@ -864,7 +1018,18 @@ impl DeltaTable {
             .commit_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("Delta commit lock poisoned"))?;
-        if !self.root.join("_delta_log").exists() {
+        let exists = if self.url.scheme() == "file" {
+            self.root.join("_delta_log").exists()
+        } else {
+            let store = Arc::clone(&self.store);
+            let prefix = self.object_path("_delta_log/")?;
+            shared_executor()?.block_on(async move {
+                use futures::StreamExt;
+                let mut entries = store.list(Some(&prefix));
+                entries.next().await.transpose().map(|entry| entry.is_some())
+            })?
+        };
+        if !exists {
             for entry in fs::read_dir(&self.root)? {
                 let entry = entry?;
                 if entry.file_name() != WRITER_LOCK {
@@ -872,12 +1037,31 @@ impl DeltaTable {
                 }
             }
             let schema = Arc::new(StructType::try_from_arrow(Arc::clone(&incoming))?);
-            let transaction =
-                delta_kernel::transaction::create_table::create_table(self.url.as_str(), schema, "arrow-deltalake")
-                    .build(&self.engine, Box::new(DurableCommitter))?;
-            committed(transaction.commit(&self.engine)?)?;
+            let mut builder =
+                delta_kernel::transaction::create_table::create_table(self.url.as_str(), schema, "arrow-deltalake");
+            if !self.partition_columns.is_empty() {
+                builder = builder.with_data_layout(delta_kernel::transaction::data_layout::DataLayout::partitioned(
+                    self.partition_columns.clone(),
+                ));
+            }
+            let transaction = builder.build(&self.engine, Box::new(DurableCommitter))?;
+            match transaction.commit(&self.engine)? {
+                CommitResult::Committed(_) | CommitResult::Conflicted(_) => {}
+                CommitResult::Retryable(retry) => {
+                    // A concurrently created table or unknown-success creation
+                    // must be loaded and validated, not blindly recreated.
+                    self.snapshot()
+                        .with_context(|| format!("uncertain table creation: {}", retry.error))?;
+                }
+            }
         }
         let snapshot = self.snapshot()?;
+        Self::validate_retention(&snapshot)?;
+        if !self.partition_columns.is_empty()
+            && snapshot.table_configuration().metadata().partition_columns() != &self.partition_columns
+        {
+            bail!("incompatible table partition columns");
+        }
         let existing: arrow::datatypes::Schema = snapshot.schema().as_ref().try_into_arrow()?;
         for field in existing.fields() {
             if !field.is_nullable() && incoming.fields().find(field.name()).is_none() {
@@ -921,13 +1105,100 @@ impl DeltaTable {
     /// # Errors
     /// Returns ownership, schema, Kernel, and file creation errors.
     pub fn new_file(self: &Arc<Self>, input: SchemaRef) -> Result<DeltaFileWriter> {
+        self.new_file_partitioned_inner(input, BTreeMap::new(), None)
+    }
+
+    /// Create a replayable publication file with an immutable admission timestamp.
+    ///
+    /// # Errors
+    /// Returns schema, identity, partition or file creation errors.
+    pub fn new_file_with_publication(
+        self: &Arc<Self>,
+        input: SchemaRef,
+        app_id: String,
+        version: i64,
+        stamp: i64,
+    ) -> Result<DeltaFileWriter> {
+        let mut values = BTreeMap::new();
+        let input = if self.partition_columns == [INGESTION_PARTITION] {
+            values.insert(INGESTION_PARTITION.to_owned(), Some(ingestion_partition_value(stamp)?));
+            let mut fields = input.fields().to_vec();
+            if input.field_with_name(INGESTION_PARTITION).is_err() {
+                fields.push(Arc::new(arrow::datatypes::Field::new(
+                    INGESTION_PARTITION,
+                    arrow::datatypes::DataType::Utf8,
+                    false,
+                )));
+            }
+            Arc::new(arrow::datatypes::Schema::new(fields))
+        } else {
+            input
+        };
+        self.new_file_partitioned_inner(input, values, None)?
+            .with_transaction(app_id, version)?
+            .with_ingestion_time(stamp)
+    }
+
+    /// Bind one file to explicit string-valued Hive partitions.
+    ///
+    /// # Errors
+    /// Rejects incomplete partition values or incompatible schemas.
+    pub fn new_file_partitioned(
+        self: &Arc<Self>,
+        input: SchemaRef,
+        values: BTreeMap<String, Option<String>>,
+    ) -> Result<DeltaFileWriter> {
+        self.new_file_partitioned_inner(input, values, None)
+    }
+
+    /// Bind one file with caller-selected Parquet encoding controls.
+    ///
+    /// # Errors
+    /// Rejects invalid partitions, schemas or encoding controls.
+    pub fn new_file_partitioned_with_properties(
+        self: &Arc<Self>,
+        input: SchemaRef,
+        values: BTreeMap<String, Option<String>>,
+        properties: WriterProperties,
+    ) -> Result<DeltaFileWriter> {
+        self.new_file_partitioned_inner(input, values, Some(properties))
+    }
+
+    fn new_file_partitioned_inner(
+        self: &Arc<Self>,
+        input: SchemaRef,
+        values: BTreeMap<String, Option<String>>,
+        properties: Option<WriterProperties>,
+    ) -> Result<DeltaFileWriter> {
         let snapshot = self.ensure_schema(normalize::schema(&input)?)?;
         let schema = Arc::new(snapshot.schema().as_ref().try_into_arrow()?);
         let transaction = snapshot.transaction(Box::new(DurableCommitter), &self.engine)?;
-        let context = transaction.write_state()?.write_context_builder().build()?;
-        let path = self.root.join(format!("part-{}.parquet", uuid::Uuid::new_v4()));
+        let state = transaction.write_state()?;
+        let mut builder = state.write_context_builder();
+        if !values.is_empty() {
+            let mut typed = std::collections::HashMap::new();
+            for (name, value) in &values {
+                let scalar = value.clone().map_or_else(
+                    || delta_kernel::expressions::Scalar::Null(delta_kernel::schema::DataType::STRING),
+                    delta_kernel::expressions::Scalar::String,
+                );
+                typed.insert(name.clone(), scalar);
+            }
+            builder = builder.with_partition_values(typed);
+        }
+        let context = builder.build()?;
+        let mut directory = self.root.clone();
+        for (name, value) in &values {
+            let value = value.as_deref().unwrap_or("__HIVE_DEFAULT_PARTITION__");
+            if name.contains(['/', '\\', '=']) || value.contains(['/', '\\']) || value == "." || value == ".." {
+                bail!("unsafe Hive partition component");
+            }
+            directory.push(format!("{name}={value}"));
+        }
+        fs::create_dir_all(&directory)?;
+        let path = directory.join(format!("part-{}.parquet", uuid::Uuid::new_v4()));
         let physical = Arc::new(context.physical_data_schema().as_ref().try_into_arrow()?);
-        let parquet = ParquetFileWriter::create(path, physical)?;
+        let parquet = ParquetFileWriter::create_with_properties(path, physical, properties)?;
         let stats = FileStatsAccumulator::new(context.stats_columns(), context.physical_data_schema());
         Ok(DeltaFileWriter {
             table: Arc::clone(self),
@@ -936,6 +1207,8 @@ impl DeltaTable {
             parquet,
             stats,
             failed: false,
+            publication: None,
+            ingested_at_ms: None,
         })
     }
 
@@ -951,58 +1224,146 @@ impl DeltaTable {
         if files.is_empty() {
             bail!("cannot publish an empty Delta data commit");
         }
+        self.commit_files_inner(files, None)
+    }
+
+    /// Publish a batch under one stable application transaction, including empty progress batches.
+    ///
+    /// # Errors
+    /// Rejects stale/fenced identities, changed schemas and exhausted collision budgets.
+    pub fn commit_files_with_transaction(&self, files: &[StagedAppend], app_id: &str, version: i64) -> Result<u64> {
+        validate_transaction_id(app_id, version)?;
+        self.commit_files_inner(files, Some((app_id, version)))
+    }
+
+    fn commit_files_inner(&self, files: &[StagedAppend], identity: Option<(&str, i64)>) -> Result<u64> {
         let _guard = self
             .commit_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("Delta commit lock poisoned"))?;
-        let snapshot = self.snapshot()?;
-        let read_version = snapshot.version();
-        let proposed_version = read_version.checked_add(1).context("Delta version overflow")?;
-        let canonical: arrow::datatypes::Schema = snapshot.schema().as_ref().try_into_arrow()?;
-        let mut transaction = snapshot
-            .transaction(Box::new(DurableCommitter), &self.engine)?
-            .with_operation("INSERT".into())
-            .with_engine_info("arrow-deltalake")
-            .with_data_change(true)
-            .with_blind_append();
-        for append in files {
-            if append.table.root != self.root || canonical != *append.schema {
-                bail!("table or schema changed while file was open; file remains uncommitted");
+        let started = Instant::now();
+        for attempt in 0..8 {
+            let snapshot = self.snapshot()?;
+            Self::validate_retention(&snapshot)?;
+            if let Some((app_id, version)) = identity
+                && let Some(previous) = snapshot.get_app_id_version(app_id, &self.engine)?
+            {
+                if previous > version {
+                    bail!("publication transaction fenced by newer application version");
+                }
+                if previous == version {
+                    return Ok(snapshot.version());
+                }
             }
-            let url = Url::from_file_path(&append.file.path).map_err(|()| anyhow::anyhow!("invalid data file path"))?;
-            let modified = i64::try_from(
-                fs::metadata(&append.file.path)?
-                    .modified()?
-                    .duration_since(UNIX_EPOCH)?
-                    .as_millis(),
-            )?;
-            let metadata = DataFileMetadata::new(FileMeta::new(url, modified, append.file.bytes), append.stats.clone());
-            transaction.add_files(build_add_file_metadata(metadata, &append.context)?);
+            let mut pending = Vec::new();
+            let mut identities = std::collections::HashSet::new();
+            let purge_before = snapshot.get_app_id_version(PURGE_WATERMARK, &self.engine)?;
+            for append in files {
+                if let Some((app_id, version)) = &append.publication {
+                    if !identities.insert(app_id.as_str()) {
+                        bail!("duplicate application identity in commit");
+                    }
+                    if let Some(previous) = snapshot.get_app_id_version(app_id, &self.engine)? {
+                        if previous > *version {
+                            bail!("publication transaction fenced by newer application version");
+                        }
+                        if previous == *version {
+                            continue;
+                        }
+                    }
+                }
+                if let (Some(stamp), Some(cutoff)) = (append.ingested_at_ms, purge_before)
+                    && stamp < cutoff
+                {
+                    bail!("publication ingestion stamp is beyond the retained recovery horizon (purge fence)");
+                }
+                pending.push(append);
+            }
+            if pending.is_empty() && identity.is_none() {
+                return Ok(snapshot.version());
+            }
+            let read_version = snapshot.version();
+            let proposed_version = read_version.checked_add(1).context("Delta version overflow")?;
+            let canonical: arrow::datatypes::Schema = snapshot.schema().as_ref().try_into_arrow()?;
+            let mut transaction = snapshot
+                .transaction(Box::new(DurableCommitter), &self.engine)?
+                .with_operation("INSERT".into())
+                .with_engine_info("arrow-deltalake")
+                .with_data_change(true);
+            if !pending.is_empty() {
+                transaction = transaction.with_blind_append();
+            }
+            for append in &pending {
+                if append.table.url != self.url || canonical != *append.schema {
+                    bail!("table or schema changed while file was open; file remains uncommitted");
+                }
+                let relative = append
+                    .file
+                    .path
+                    .strip_prefix(&self.root)?
+                    .to_str()
+                    .context("invalid data file path")?;
+                let url = self.url.join(relative)?;
+                let modified = i64::try_from(
+                    fs::metadata(&append.file.path)?
+                        .modified()?
+                        .duration_since(UNIX_EPOCH)?
+                        .as_millis(),
+                )?;
+                let metadata =
+                    DataFileMetadata::new(FileMeta::new(url, modified, append.file.bytes), append.stats.clone());
+                transaction.add_files(build_add_file_metadata(metadata, &append.context)?);
+                if let Some((app_id, version)) = &append.publication {
+                    transaction = transaction.with_transaction_id(app_id.clone(), *version);
+                }
+            }
+            if let Some((app_id, version)) = identity {
+                transaction = transaction.with_transaction_id(app_id.to_owned(), version);
+            }
+            if let Some(publication_fence) = &self.publication_fence {
+                publication_fence
+                    .check_before_commit(&PublicationFenceContext {
+                        table_path: &self.root,
+                        read_version,
+                        proposed_version,
+                        file_count: files.len(),
+                    })
+                    .map_err(anyhow::Error::new)?;
+            }
+            match transaction.commit(&self.engine) {
+                Ok(CommitResult::Committed(commit)) => {
+                    sync_directory(&self.root)?;
+                    return Ok(commit.commit_version());
+                }
+                Ok(CommitResult::Conflicted(_)) => {}
+                Ok(CommitResult::Retryable(retry)) => {
+                    // Refresh/check every stable identity on the next iteration BEFORE
+                    // resubmission. If refresh fails, the uncertain outcome stays an error.
+                    if identity.is_none() && pending.iter().any(|append| append.publication.is_none()) {
+                        bail!("uncertain publication without retry identity: {}", retry.error);
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+            if started.elapsed() > Duration::from_secs(10) {
+                break;
+            }
+            collision_backoff(attempt);
         }
-        if let Some(publication_fence) = &self.publication_fence {
-            publication_fence
-                .check_before_commit(&PublicationFenceContext {
-                    table_path: &self.root,
-                    read_version,
-                    proposed_version,
-                    file_count: files.len(),
-                })
-                .map_err(anyhow::Error::new)?;
-        }
-        let version = committed(transaction.commit(&self.engine)?)?;
-        sync_directory(&self.root)?;
-        Ok(version)
+        bail!("Delta publication collision/retry budget exhausted (8 attempts / 10 seconds)")
     }
 }
 
 /// Streaming Delta data file. `finish` closes, syncs, and commits it.
 pub struct DeltaFileWriter {
     table: Arc<DeltaTable>,
-    schema: SchemaRef,
-    context: BoundWriteContext,
+    pub(crate) schema: SchemaRef,
+    pub(crate) context: BoundWriteContext,
     parquet: ParquetFileWriter,
     stats: FileStatsAccumulator,
     failed: bool,
+    publication: Option<(String, i64)>,
+    ingested_at_ms: Option<i64>,
 }
 
 /// Completed append, including the table version.
@@ -1018,7 +1379,9 @@ pub struct StagedAppend {
     schema: SchemaRef,
     context: BoundWriteContext,
     pub(crate) file: CompletedFile,
-    stats: StructArray,
+    pub(crate) stats: StructArray,
+    pub(crate) publication: Option<(String, i64)>,
+    pub(crate) ingested_at_ms: Option<i64>,
 }
 
 impl StagedAppend {
@@ -1030,6 +1393,27 @@ impl StagedAppend {
 }
 
 impl DeltaFileWriter {
+    /// Assign a stable identity; retries of this publication must reuse it.
+    ///
+    /// # Errors
+    /// Rejects reserved or invalid application identities and versions.
+    pub fn with_transaction(mut self, app_id: String, version: i64) -> Result<Self> {
+        validate_transaction_id(&app_id, version)?;
+        self.publication = Some((app_id, version));
+        Ok(self)
+    }
+
+    /// Preserve an admission-time stamp through durable replay.
+    ///
+    /// # Errors
+    /// Rejects timestamps before the Unix epoch.
+    pub fn with_ingestion_time(mut self, ingested_at_ms: i64) -> Result<Self> {
+        if ingested_at_ms < 0 {
+            bail!("ingestion stamp is before Unix epoch");
+        }
+        self.ingested_at_ms = Some(ingested_at_ms);
+        Ok(self)
+    }
     /// Normalize and append a raw Arrow batch.
     ///
     /// # Errors
@@ -1059,7 +1443,35 @@ impl DeltaFileWriter {
 
     async fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         let input_bytes = record_batch_logical_bytes(batch)?;
-        let normalized = normalize::align(&normalize::batch(batch)?, Arc::clone(&self.schema))?;
+        let mut batch = normalize::batch(batch)?;
+        if self.schema.field_with_name(INGESTION_PARTITION).is_ok()
+            && batch.schema().field_with_name(INGESTION_PARTITION).is_err()
+        {
+            let stamp = self
+                .ingested_at_ms
+                .context("partitioned publication requires stable ingestion stamp")?;
+            let value = ingestion_partition_value(stamp)?;
+            let mut fields = batch.schema().fields().to_vec();
+            fields.push(Arc::new(arrow::datatypes::Field::new(
+                INGESTION_PARTITION,
+                arrow::datatypes::DataType::Utf8,
+                false,
+            )));
+            let mut columns = batch.columns().to_vec();
+            columns.push(Arc::new(arrow::array::StringArray::from(vec![
+                value.as_str();
+                batch.num_rows()
+            ])));
+            batch = RecordBatch::try_new(Arc::new(arrow::datatypes::Schema::new(fields)), columns)?;
+        }
+        let normalized = normalize::align(&batch, Arc::clone(&self.schema))?;
+        let data_schema: arrow::datatypes::Schema = self.context.logical_data_schema().as_ref().try_into_arrow()?;
+        let projection = data_schema
+            .fields()
+            .iter()
+            .map(|field| normalized.schema().index_of(field.name()))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let normalized = normalized.project(&projection)?;
         let data = ArrowEngineData::new(normalized);
         let evaluator = self.table.engine.evaluation_handler().new_expression_evaluator(
             Arc::clone(self.context.logical_data_schema()),
@@ -1083,12 +1495,15 @@ impl DeltaFileWriter {
         }
         let file = self.parquet.finish().await?;
         let stats = self.stats.finish()?.context("cannot commit an empty Delta file")?;
+        self.table.upload_file(&file)?;
         Ok(StagedAppend {
             table: self.table,
             schema: self.schema,
             context: self.context,
             file,
             stats,
+            publication: self.publication,
+            ingested_at_ms: self.ingested_at_ms,
         })
     }
 
