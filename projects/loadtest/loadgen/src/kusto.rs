@@ -1129,9 +1129,18 @@ fn not_yet_readable(error: &anyhow::Error) -> bool {
     // Only a listed table whose Delta log is not committed yet is pending. Kusto reports that as a
     // storage blob-not-found partial failure; generic bad requests (syntax, schema, credentials)
     // and every other failure must surface as degraded.
-    let message = format!("{error:#}");
-    message.contains("E_XSTORE_BLOB_NOT_FOUND") && message.contains("Delta table does not exist")
+    // The origin must be the HTTP 200 partial-failure body decoded by `decode_response`; HTTP
+    // error statuses carrying the same text are never treated as absence.
+    let origin = error.root_cause().to_string();
+    PARTIAL_FAILURE_PREFIXES.iter().any(|prefix| origin.starts_with(prefix))
+        && origin.contains("E_XSTORE_BLOB_NOT_FOUND")
+        && origin.contains("Delta table does not exist")
 }
+
+const PARTIAL_FAILURE_PREFIXES: [&str; 2] = [
+    "Kusto partial query failure: ",
+    "Kusto partial/progressive query failure: ",
+];
 
 /// Azure oracle roots are credential-free `abfss://` URLs read by the independent cloud reader.
 fn cloud_root(root: &Path) -> Option<&str> {
@@ -2207,6 +2216,13 @@ mod tests {
         ));
         for surfaced in [
             "Kusto HTTP 400 Bad Request: {\"error\":{\"code\":\"General_BadRequest\"}}",
+            "Kusto HTTP 400 Bad Request: E_XSTORE_BLOB_NOT_FOUND (message: 'Delta table does not exist: ')",
+            "Kusto HTTP 401 Unauthorized: E_XSTORE_BLOB_NOT_FOUND (message: 'Delta table does not exist: ')",
+            "Kusto HTTP 403 Forbidden: E_XSTORE_BLOB_NOT_FOUND (message: 'Delta table does not exist: ')",
+            "Kusto HTTP 500 Internal Server Error: E_XSTORE_BLOB_NOT_FOUND (message: 'Delta table does not exist: ')",
+            "Kusto command failed: E_XSTORE_BLOB_NOT_FOUND (message: 'Delta table does not exist: ')",
+            "Kusto HTTP request failed: E_XSTORE_BLOB_NOT_FOUND (message: 'Delta table does not exist: ')",
+            "unclassified failure mentioning Kusto partial query failure: x: E_XSTORE_BLOB_NOT_FOUND (message: 'Delta table does not exist: ')",
             "Kusto HTTP 400 Bad Request: {\"error\":{\"code\":\"General_BadRequest\",\"message\":\"Syntax error\"}}",
             "Kusto HTTP 400 Bad Request: General_BadRequest: invalid schema; column not found",
             "Kusto HTTP 400 Bad Request: General_BadRequest: external table credentials are forbidden",
@@ -2220,6 +2236,16 @@ mod tests {
         ] {
             assert!(!not_yet_readable(&anyhow::anyhow!("{surfaced}")), "{surfaced}");
         }
+        assert!(not_yet_readable(&anyhow::anyhow!(
+            "Kusto partial query failure: [{{\"Message\":\"E_XSTORE_BLOB_NOT_FOUND (message: 'Delta table does not exist: ')\"}}]"
+        )));
+        // Context wording cannot promote a non-partial origin to pending.
+        assert!(!not_yet_readable(
+            &anyhow::anyhow!(
+                "Kusto HTTP 403 Forbidden: E_XSTORE_BLOB_NOT_FOUND (message: 'Delta table does not exist: ')"
+            )
+            .context("Kusto partial query failure: E_XSTORE_BLOB_NOT_FOUND (message: 'Delta table does not exist: ')")
+        ));
     }
 
     /// Real-emulator check of every native validation step against a pool root mounted at
