@@ -40,8 +40,10 @@ own status and does not change what a Direct `published` receipt means.
 
 Maintenance and streaming run outside the collectors. OPTIMIZE rewrites active
 files without creating new logical rows. A historical tenant fork skips those
-rewrites and owns its sink files, while the local Kusto bridge reconciles the
-active snapshot, including replacements and removals. See
+rewrites and owns its sink files, while native Kusto follows the active snapshot,
+including replacements and removals, after asynchronous cache refresh. Cache
+statistics are not a substitute for comparing actual cached query results with
+the independent oracle and uncached fallback. See
 [storage boundaries](storage.md) and the
 [root loadtest diagram](../../../loadtest-architecture.html).
 

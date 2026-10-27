@@ -38,18 +38,28 @@ comes from `ARROWCOL_MODE`, falling back to `local`.
 | Surface | Local mode | Azure mode |
 | --- | --- | --- |
 | Source Delta | Local disk, separate pool roots | ADLS Gen2, separate pool roots |
-| Kusto | Emulator: qualified native external Delta/QAP, or an explicit active-snapshot bridge | External Delta tables with native Query Acceleration Policy |
+| Kusto | Pinned emulator: native external Delta with Query Acceleration Policy | External Delta tables with native Query Acceleration Policy |
 | Storage identity | Scoped local mounts | Existing Azure CLI writer identity; dedicated Kusto storage-read UAMI |
 | Evidence | Functional integration, active-file visibility, recovery | Real QAP state, capacity, lag, correctness, and reacceleration |
 
-The emulator is not a performance benchmark or proof of Azure cache internals.
-Native external-Delta/QAP support must be qualified against the pinned emulator
-and bounded refresh/recovery checks, not inferred from management-command
-acceptance alone. When the explicit bridge is selected, it tracks the current
-active snapshot, including OPTIMIZE replacements and partition removals.
-A tenant fork has intentionally different
-semantics: capture a snapshot, tail logical appends, ignore OPTIMIZE, and retain
-already-copied rows after source purge.
+The emulator is a functional integration surface, not an Azure performance
+benchmark. Native external Delta/QAP is the default; an experimental bridge is
+not an automatic fallback. The local policy uses `MaxAge=1min`, with a bounded
+five-minute convergence gate after append, OPTIMIZE, delete, partition PURGE,
+and VACUUM. Longer `MaxAge` can retain stale cached rows.
+
+Cache statistics alone do not establish freshness: a reported 100% acceleration,
+zero pending files, and recent update time can coexist with stale query results.
+Require current `details.TableVersion`, healthy `details.IsHealthy`, expected
+`details.AcceleratedRows`, and actual cached row-multiset equality with both the
+independent oracle and uncached fallback. Record observed convergence separately
+from the bounded deadline; focused native-probe acceptance does not prove the
+integrated 13-schema workload or Explorer/stress acceptance.
+
+Native Kusto follows the current active snapshot after asynchronous refresh,
+including OPTIMIZE replacements and partition removals. A tenant fork has
+intentionally different semantics: capture a snapshot, tail logical appends,
+ignore OPTIMIZE, and retain already-copied rows after source purge.
 
 Standalone maintenance plans and revalidates work before applying it. OPTIMIZE
 rewrites real files with `dataChange=false`; PURGE removes existing expired
@@ -78,7 +88,7 @@ reader, committed snapshot-selected files, manifest hashes, row multisets,
 partition metadata, routing ownership, and recovery evidence. The delta-rs
 reader is a validation oracle, not the production transaction writer.
 
-Metrics, logs, and traces feed LGTM/Grafana. Maintenance, stream/checkpoint, bridge,
+Metrics, logs, and traces feed LGTM/Grafana. Maintenance, stream/checkpoint, native QAP,
 and publication signals must be observed live, not inferred from dashboard JSON.
 Keep the optional OTEL baseline separate from Arrow Flight panels.
 
@@ -86,9 +96,12 @@ Azure configuration remains in a gitignored private `.env`; do not commit
 subscription/resource values or credentials into diagrams, screenshots, logs,
 or public evidence. Cloud checks are explicit and credential-gated: a skipped
 check is not a pass. Bind measurements to the integrated source SHA and record
-limitations. Stop the Azure cluster after live tests. Reset is preview-first,
-requires explicit execution, removes only verified owned data, and preserves
-the account, containers, cluster, and managed identity.
+limitations. Stop the Azure cluster after live tests. Reset is preview-first;
+public execution remains unconditionally disabled until distributed publisher
+admission, uncertain-operation retention, fencing, and definitive drain are
+enforced across every mutator. The intended explicit-execution path removes only
+verified owned data and preserves the account, containers, cluster, and managed
+identity. Preview or offline control-plane tests do not establish live reset safety.
 
 See [storage contracts](../arrowcol-platform/storage.md),
 [delivery guarantees](../arrowcol-platform/delivery-guarantees.md), and

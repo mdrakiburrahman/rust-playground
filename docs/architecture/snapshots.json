@@ -8,8 +8,8 @@
       "png": "loadtest-architecture.png",
       "title": "ArrowCol lakehouse loadtest architecture",
       "viewportWidth": 1500,
-      "sourceSha256": "09228a698a16ae3e2d691ff314b7c3a3d92b5e533c0c753cf523e0677afa7d25",
-      "pngSha256": "39e4a37c927aea7a629d77a5529f8a0c845e7de5f45a545c6cfb5ea49c75c1ac"
+      "sourceSha256": "34b8b36e6243179e302f1022c9a8000a85ef0a629e68ab98189f4990f3b1b072",
+      "pngSha256": "e7eb6f4216a08753337e8ab76ab8f00840a99c493ac59ebc15d610972c63fa68"
     },
     {
       "source": "docs/architecture/loadtest/arrow-load-generator.html",

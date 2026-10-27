@@ -17,7 +17,7 @@ state. Receipt IDs and lease UUIDs are **not** metric labels.
 | Delta publication | Version collisions, safe retries, exhaustion, publication outcomes, and file/row/byte changes |
 | Standalone maintenance | Plans, applies, no-ops, stale plans, retention decisions, and rewritten/deleted files |
 | Tenant stream | Source cursor, lag/backlog, checkpoint and sink commits, replay, and scan/skipping observations |
-| Local Kusto bridge | Committed source version, active generation, refresh status, visibility lag, and explicit degradation |
+| Native local Kusto/QAP | Committed source version, cached table version, health, accelerated rows, query correctness, convergence lag, and explicit degradation |
 | Azure QAP evidence | Policy/state, accelerated bytes, capacity, query correctness, and touched-file reacceleration |
 
 DFE advertises
@@ -45,7 +45,13 @@ against the tested source revision. Keep tenant IDs, file paths, receipt IDs,
 publication IDs, and checkpoint UUIDs out of metric labels.
 
 Local Kusto is a functional integration surface, not a performance benchmark.
-Its bridge status is separate from Direct receipt publication. Azure QAP stress
+Its asynchronous cache visibility is separate from Direct receipt publication.
+With local `MaxAge=1min`, bound convergence checks to five minutes and require
+current `details.TableVersion`, healthy `details.IsHealthy`, expected
+`details.AcceleratedRows`, and cached row-multiset equality with both the
+independent oracle and uncached fallback. A 100% acceleration statistic, zero
+pending files, or a fresh update timestamp alone can report success while
+cached queries remain stale. Azure QAP stress
 must preserve sanitized policy/state/query observations and distinguish expected
 reacceleration of rewritten files from an unhealthy catalog, full reset, or
 uncached fallback. A skipped credential-gated cloud check is not a cloud pass.
