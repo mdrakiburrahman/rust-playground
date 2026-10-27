@@ -15,6 +15,13 @@ use sha2::{Digest, Sha256};
 
 use crate::{PartitionValues, TableSummary};
 
+/// Canonical JSON encoding of a row and its `sha256:` digest, shared by every oracle path.
+pub(crate) fn encode_row(value: &Value) -> Result<(String, String)> {
+    let encoded = serde_json::to_string(value)?;
+    let digest = format!("sha256:{}", hex::encode(Sha256::digest(encoded.as_bytes())));
+    Ok((encoded, digest))
+}
+
 /// Distinct complete rows checked by one bounded multiset query.
 pub const MAX_CHUNK_DISTINCT_ROWS: usize = 256;
 /// Global in-memory guard for one table's corpus; exceeding it fails instead of truncating.
@@ -180,6 +187,19 @@ impl CorpusBuilder {
     }
 
     pub(crate) fn add(&mut self, value: Value, partitions: &PartitionValues) -> Result<()> {
+        let (encoded, digest) = encode_row(&value)?;
+        self.add_encoded(value, encoded, digest, partitions)
+    }
+
+    /// Adds a row whose canonical encoding and digest were computed by [`encode_row`], letting
+    /// callers hash rows in parallel while still adding them in a deterministic order.
+    pub(crate) fn add_encoded(
+        &mut self,
+        value: Value,
+        encoded: String,
+        digest: String,
+        partitions: &PartitionValues,
+    ) -> Result<()> {
         let partition = match &self.partition_column {
             None => String::new(),
             Some(column) => partitions
@@ -189,11 +209,7 @@ impl CorpusBuilder {
                 .filter(|value| !value.is_empty())
                 .context("exact chunked oracle does not support null or empty partition values")?,
         };
-        let encoded = serde_json::to_string(&value)?;
-        *self
-            .hashes
-            .entry(format!("sha256:{}", hex::encode(Sha256::digest(encoded.as_bytes()))))
-            .or_default() += 1;
+        *self.hashes.entry(digest).or_default() += 1;
         let rows = self.partitions.entry(partition).or_default();
         let before = rows.len();
         let entry = rows.entry(encoded).or_insert((value, 0));
