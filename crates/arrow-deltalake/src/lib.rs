@@ -12,6 +12,8 @@ use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "delta")]
+mod azure_fence;
+#[cfg(feature = "delta")]
 pub mod commit;
 #[cfg(feature = "delta")]
 pub mod delta;

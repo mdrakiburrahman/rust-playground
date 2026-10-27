@@ -74,3 +74,48 @@ async fn shared_table_can_coexist_with_collector_owner() -> Result<()> {
     assert_eq!(right.finish().await?.version, 2);
     Ok(())
 }
+
+/// Scenario: a caller binds p=a but supplies rows from p=b.
+/// Guarantees: physical partition elision never silently changes logical rows.
+#[tokio::test]
+async fn partition_literal_mismatch_is_rejected() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let input = batch()?;
+    let table = DeltaTable::open_url(
+        Url::from_directory_path(root.path()).map_err(|()| anyhow::anyhow!("URL"))?,
+        input.schema(),
+        vec!["p".into()],
+    )?;
+    let mut file = table.new_file_partitioned(input.schema(), BTreeMap::from([("p".into(), Some("b".into()))]))?;
+    assert!(file.write(&input).await.is_err());
+    assert_eq!(table.version()?, 0);
+    assert!(file.stage().await.is_err());
+    Ok(())
+}
+
+/// Scenario: a crash replay resumes after transaction JSON history has been removed.
+/// Guarantees: checkpoints retain publication identities and higher-version fencing.
+#[tokio::test]
+async fn transaction_fences_survive_checkpoint_and_log_cleanup() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let input = batch()?;
+    let table = DeltaTable::open_url(
+        Url::from_directory_path(root.path()).map_err(|()| anyhow::anyhow!("URL"))?,
+        input.schema(),
+        vec!["p".into()],
+    )?;
+    let mut file = table.new_file_partitioned(input.schema(), BTreeMap::from([("p".into(), Some("a".into()))]))?;
+    file.write(&input).await?;
+    let staged = file.stage().await?;
+    assert_eq!(table.commit_files_with_transaction(&[staged], "stable", 0)?, 1);
+    assert_eq!(table.commit_files_with_transaction(&[], "fenced", 4)?, 2);
+    assert_eq!(table.checkpoint()?, 2);
+    for version in 0..=2 {
+        std::fs::remove_file(root.path().join(format!("_delta_log/{version:020}.json")))?;
+    }
+    assert_eq!(table.lookup_txn("stable")?, Some(0));
+    assert_eq!(table.lookup_txn("fenced")?, Some(4));
+    assert_eq!(table.commit_files_with_transaction(&[], "stable", 0)?, 2);
+    assert!(table.commit_files_with_transaction(&[], "fenced", 3).is_err());
+    Ok(())
+}
