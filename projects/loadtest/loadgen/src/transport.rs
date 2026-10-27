@@ -632,7 +632,6 @@ fn redact_receipt_message(message: &str, mut private_values: Vec<String>) -> Str
             message = message.replace(&value, "[REDACTED]");
         }
     }
-    let message = crate::kusto::redact_text(&message);
     let mut redact_next = false;
     let source = message.split_whitespace().collect::<Vec<_>>();
     let mut tokens = Vec::new();
@@ -670,16 +669,24 @@ fn redact_receipt_message(message: &str, mut private_values: Vec<String>) -> Str
             if token.contains(quote) {
                 quoted = None;
             }
-        } else if credential {
+        } else if credential || redact_next {
             quoted = ['\'', '"']
                 .into_iter()
                 .find(|quote| token.chars().filter(|ch| ch == quote).count() % 2 == 1);
         }
-        redact_next = credential && (token.ends_with([':', '=']) || separate_assignment || lower == "bearer")
-            || redact_next && (lower == "bearer" || matches!(lower.as_str(), "=" | ":"));
+        let attached_auth_scheme = [
+            "authorization:bearer",
+            "authorization:basic",
+            "authorization=bearer",
+            "authorization=basic",
+        ]
+        .iter()
+        .any(|suffix| lower.ends_with(suffix));
+        redact_next = credential
+            && (token.ends_with([':', '=']) || separate_assignment || lower == "bearer" || attached_auth_scheme)
+            || redact_next && (matches!(lower.as_str(), "bearer" | "basic" | "=" | ":"));
     }
-    tokens
-        .join(" ")
+    crate::kusto::redact_text(&tokens.join(" "))
         .chars()
         .filter(|ch| !ch.is_control())
         .take(1_024)
@@ -734,7 +741,9 @@ mod receipt_diagnostics_tests {
              /private/table 12345678-1234-1234-1234-123456789abc \
              Server=hidden;Password=opaque-secret \
              {\"client_secret\":\"another-secret\"} authorization: Bearer opaque-token \
-             AccountKey = spaced-secret key = second-secret Password=\"three word credential\"",
+             AccountKey = spaced-secret key = second-secret Password=\"three word credential\" \
+             Password = \"combined private credential\" AccountKey : 'joined private words' \
+             Authorization:Basic opaque-basic-token Password = \"https://private.example quoted url-secret\"",
             vec!["private-account".to_owned()],
         );
         assert!(message.contains("unsupported UInt8 statistic"));
@@ -753,6 +762,12 @@ mod receipt_diagnostics_tests {
             "three",
             "word",
             "credential",
+            "combined",
+            "private words",
+            "joined",
+            "opaque-basic-token",
+            "url-secret",
+            "quoted",
         ] {
             assert!(!message.contains(secret), "leaked {secret}: {message}");
         }
@@ -782,7 +797,9 @@ mod receipt_diagnostics_tests {
         let cause = "unsupported UInt8 statistic https://private.example/path?sig=credential C:\\Users\\private\\table \
                  /private/table 12345678-1234-1234-1234-123456789abc Password=opaque-secret \
                  Authorization: Bearer opaque-token AccountKey = spaced-secret key = second-secret \
-                 abfss://private@account.dfs.core.windows.net/root Password=\"three word credential\"";
+                 abfss://private@account.dfs.core.windows.net/root Password=\"three word credential\" \
+                 Password = \"combined private credential\" AccountKey : 'joined private words' \
+                 Authorization:Basic opaque-basic-token Password = \"https://private.example quoted url-secret\"";
         let status = ReceiptStatus::accepted(receipt_id, table, ImplementationPool::Direct, UnixMillis::new(1)?)
             .transition_to(
                 ReceiptState::Failed,
@@ -856,6 +873,12 @@ mod receipt_diagnostics_tests {
             "second-secret",
             "private@account",
             "three word",
+            "combined",
+            "joined",
+            "private words",
+            "opaque-basic-token",
+            "url-secret",
+            "quoted",
         ] {
             assert!(!jsonl.contains(secret), "leaked canary: {secret}");
         }
@@ -878,6 +901,12 @@ mod receipt_diagnostics_tests {
             "second-secret",
             "private@account",
             "three word",
+            "combined",
+            "joined",
+            "private words",
+            "opaque-basic-token",
+            "url-secret",
+            "quoted",
         ] {
             assert!(!sent_jsonl.contains(secret), "leaked admission canary: {secret}");
         }
