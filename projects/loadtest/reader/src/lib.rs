@@ -10,7 +10,10 @@ use std::path::{Path, PathBuf};
 
 mod cloud;
 mod corpus;
-pub use cloud::{cloud_sample_corpus, cloud_sample_rows, summarize_cloud};
+pub mod scheduler;
+pub use cloud::{
+    cloud_sample_corpus, cloud_sample_corpus_timed, cloud_sample_rows, summarize_cloud, summarize_cloud_timed,
+};
 use corpus::CorpusBuilder;
 pub use corpus::{MAX_CHUNK_DISTINCT_ROWS, MAX_CORPUS_DISTINCT_ROWS, ValidationChunk, ValidationCorpus};
 
@@ -186,6 +189,7 @@ pub async fn inspect(directory: &Path) -> Result<Value> {
                 .with_context(|| format!("open Parquet {}", path.display()))?;
             let mut namespaces = BTreeSet::new();
             for row in reader.get_row_iter(None)? {
+                scheduler::check_deadline()?;
                 let mut value = with_partitions(row_value(&row?), &schema_json, partition_values)?;
                 let fields = value.as_object_mut().context("expected object row")?;
                 if let Some(namespace) = fields.get("_otel_join_namespace").and_then(Value::as_str) {
@@ -298,6 +302,7 @@ pub fn sample_rows(directory: &Path, identity: &str, summary: &TableSummary) -> 
         let path = local_active_file(&root, root.join(&file.path).to_str().context("non-UTF8 data path")?)?;
         let reader = SerializedFileReader::new(File::open(path)?)?;
         for row in reader.get_row_iter(None)? {
+            scheduler::check_deadline()?;
             let value = with_partitions(row_value(&row?), &summary.schema, &file.partition_values)?;
             let encoded = serde_json::to_string(&value)?;
             let digest = format!("sha256:{}", hex::encode(Sha256::digest(encoded.as_bytes())));
@@ -373,6 +378,7 @@ fn aggregate_corpus_file(path: &Path, schema: &Value, partition_values: &Partiti
         failure: None,
     };
     for row in reader.get_row_iter(None)? {
+        scheduler::check_deadline()?;
         let decoded = row
             .map_err(anyhow::Error::from)
             .and_then(|row| with_partitions(row_value(&row), schema, partition_values))
@@ -425,6 +431,7 @@ fn summarize_file(
     let mut row_hashes = BTreeMap::<String, u64>::new();
     let mut payload_row_hashes = BTreeMap::<String, u64>::new();
     for row in reader.get_row_iter(None)? {
+        scheduler::check_deadline()?;
         let value = with_partitions(row_value(&row?), schema, partition_values)?;
         *row_hashes.entry(row_digest(&value)?).or_default() += 1;
         *payload_row_hashes
@@ -440,6 +447,9 @@ fn summarize_file(
 }
 
 fn decode_workers() -> usize {
+    if scheduler::scheduled() {
+        return 1;
+    }
     std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
 }
 
@@ -632,73 +642,132 @@ pub async fn summarize_selected(directory: &Path, identities: &[String]) -> Resu
 }
 
 async fn summarize_roots(directory: &Path, roots: Vec<PathBuf>) -> Result<SnapshotSummary> {
-    let mut tables = BTreeMap::new();
-    let mut total_files = 0_usize;
+    summarize_roots_timed(directory, roots, None, scheduler::OracleTimings::default()).await
+}
+
+/// Independent snapshot decoding across tables under the process-wide CPU cap.
+///
+/// # Errors
+/// Rejects invalid snapshots, decode errors, worker failures and expired deadlines.
+pub async fn summarize_timed(
+    directory: &Path,
+    deadline: Option<std::time::Instant>,
+    timings: scheduler::OracleTimings,
+) -> Result<SnapshotSummary> {
+    let directory = fs::canonicalize(directory)?;
+    let roots = find_delta_roots(&directory)?;
+    anyhow::ensure!(!roots.is_empty(), "no Delta tables found");
+    summarize_roots_timed(&directory, roots, deadline, timings).await
+}
+
+async fn summarize_roots_timed(
+    directory: &Path,
+    roots: Vec<PathBuf>,
+    deadline: Option<std::time::Instant>,
+    timings: scheduler::OracleTimings,
+) -> Result<SnapshotSummary> {
+    let mut pending = tokio::task::JoinSet::new();
     for root in roots {
-        let identity = table_identity(directory, &root)?;
-        let url = url::Url::from_directory_path(&root).map_err(|()| anyhow::anyhow!("invalid table path"))?;
-        let delta = deltalake_core::open_table(url)
-            .await
-            .with_context(|| format!("open Delta table {identity}"))?;
-        let snapshot = delta.snapshot()?;
-        let partitions = snapshot_partitions(&delta)?;
-        let partition_columns = snapshot.metadata().partition_columns().to_vec();
-        let schema = serde_json::to_value(snapshot.schema())?;
-        let uris = delta.get_file_uris_by_partitions(&[]).await?;
-        let mut active = Vec::with_capacity(uris.len());
-        for uri in uris {
-            let path = local_active_file(&root, &uri)?;
-            let relative = path
-                .strip_prefix(&root)?
-                .to_str()
-                .context("non-UTF8 data path")?
-                .to_owned();
-            let partition_values = partitions
-                .get(&relative)
-                .context("active file lacks committed partition values")?;
-            active.push((path, relative, partition_values));
-        }
-        let mut files = Vec::with_capacity(active.len());
-        let mut rows = 0_u64;
-        let mut bytes = 0_u64;
-        let mut row_hashes = BTreeMap::<String, u64>::new();
-        let mut payload_row_hashes = BTreeMap::<String, u64>::new();
-        decode_batches(
-            &active,
-            |(path, _, partition_values)| summarize_file(path, &schema, partition_values, &partition_columns),
-            |(_, relative, partition_values), decoded| {
-                let decoded = decoded?;
-                for (digest, count) in decoded.row_hashes {
-                    let total = row_hashes.entry(digest).or_default();
-                    *total = total.checked_add(count).context("row multiplicity overflow")?;
-                }
-                for (digest, count) in decoded.payload_row_hashes {
-                    let total = payload_row_hashes.entry(digest).or_default();
-                    *total = total.checked_add(count).context("row multiplicity overflow")?;
-                }
-                files.push(FileSummary {
-                    path: relative.clone(),
-                    bytes: decoded.bytes,
-                    rows: decoded.rows,
-                    partition_values: (*partition_values).clone(),
-                });
-                rows = rows.checked_add(decoded.rows).context("snapshot row count overflow")?;
-                bytes = bytes
-                    .checked_add(decoded.bytes)
-                    .context("snapshot byte count overflow")?;
-                Ok(())
-            },
-        )?;
-        files.sort_by(|left, right| left.path.cmp(&right.path));
-        let minimum_file_bytes = files.iter().map(|file| file.bytes).min().unwrap_or(0);
-        let maximum_file_bytes = files.iter().map(|file| file.bytes).max().unwrap_or(0);
-        total_files += files.len();
-        if tables
-            .insert(
-                identity.clone(),
+        let directory = directory.to_owned();
+        let timings = timings.clone();
+        pending.spawn(async move {
+            let identity = table_identity(&directory, &root)?;
+            let timer = timings.measure(format!(
+                "snapshot/{}/{identity}",
+                directory.file_name().unwrap_or_default().to_string_lossy()
+            ));
+            let result = summarize_root(directory, root, deadline).await;
+            timer.finish(result.is_ok());
+            result
+        });
+    }
+    let mut tables = BTreeMap::new();
+    while let Some(result) = pending.join_next().await {
+        let (identity, summary) = result.context("snapshot table task failed")??;
+        anyhow::ensure!(
+            tables.insert(identity.clone(), summary).is_none(),
+            "duplicate Delta table identity {identity}"
+        );
+    }
+    Ok(SnapshotSummary {
+        files: tables.values().map(|table| table.active_files).sum(),
+        tables,
+    })
+}
+
+async fn summarize_root(
+    directory: PathBuf,
+    root: PathBuf,
+    deadline: Option<std::time::Instant>,
+) -> Result<(String, TableSummary)> {
+    let identity = table_identity(&directory, &root)?;
+    let url = url::Url::from_directory_path(&root).map_err(|()| anyhow::anyhow!("invalid table path"))?;
+    let delta = deltalake_core::open_table(url)
+        .await
+        .with_context(|| format!("open Delta table {identity}"))?;
+    let snapshot = delta.snapshot()?;
+    let partitions = snapshot_partitions(&delta)?;
+    let partition_columns = snapshot.metadata().partition_columns().to_vec();
+    let schema = serde_json::to_value(snapshot.schema())?;
+    let uris = delta.get_file_uris_by_partitions(&[]).await?;
+    let mut active = Vec::with_capacity(uris.len());
+    for uri in uris {
+        let path = local_active_file(&root, &uri)?;
+        let relative = path
+            .strip_prefix(&root)?
+            .to_str()
+            .context("non-UTF8 data path")?
+            .to_owned();
+        let partition_values = partitions
+            .get(&relative)
+            .context("active file lacks committed partition values")?
+            .clone();
+        active.push((path, relative, partition_values));
+    }
+
+    let version = snapshot.version();
+    scheduler::oracle_scheduler()
+        .run(deadline, move || {
+            let mut files = Vec::with_capacity(active.len());
+            let mut rows = 0_u64;
+            let mut bytes = 0_u64;
+            let mut row_hashes = BTreeMap::<String, u64>::new();
+            let mut payload_row_hashes = BTreeMap::<String, u64>::new();
+            decode_batches(
+                &active,
+                |(path, _, partition_values)| summarize_file(path, &schema, partition_values, &partition_columns),
+                |(_, relative, partition_values), decoded| {
+                    let decoded = decoded?;
+                    for (digest, count) in decoded.row_hashes {
+                        let total = row_hashes.entry(digest).or_default();
+                        *total = total.checked_add(count).context("row multiplicity overflow")?;
+                    }
+                    for (digest, count) in decoded.payload_row_hashes {
+                        let total = payload_row_hashes.entry(digest).or_default();
+                        *total = total.checked_add(count).context("row multiplicity overflow")?;
+                    }
+                    files.push(FileSummary {
+                        path: relative.clone(),
+                        bytes: decoded.bytes,
+                        rows: decoded.rows,
+                        partition_values: partition_values.clone(),
+                    });
+                    rows = rows.checked_add(decoded.rows).context("snapshot row count overflow")?;
+                    bytes = bytes
+                        .checked_add(decoded.bytes)
+                        .context("snapshot byte count overflow")?;
+                    Ok(())
+                },
+            )?;
+            files.sort_by(|left, right| left.path.cmp(&right.path));
+            let minimum_file_bytes = files.iter().map(|file| file.bytes).min().unwrap_or(0);
+            let maximum_file_bytes = files.iter().map(|file| file.bytes).max().unwrap_or(0);
+
+            Ok((
+                identity,
                 TableSummary {
                     schema,
-                    version: snapshot.version(),
+                    version,
                     active_files: files.len(),
                     rows,
                     bytes,
@@ -709,16 +778,9 @@ async fn summarize_roots(directory: &Path, roots: Vec<PathBuf>) -> Result<Snapsh
                     files,
                     partition_columns,
                 },
-            )
-            .is_some()
-        {
-            bail!("duplicate Delta table identity {identity}");
-        }
-    }
-    Ok(SnapshotSummary {
-        files: total_files,
-        tables,
-    })
+            ))
+        })
+        .await
 }
 
 fn find_delta_roots(directory: &Path) -> Result<Vec<PathBuf>> {

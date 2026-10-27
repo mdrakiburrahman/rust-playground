@@ -198,6 +198,18 @@ impl KustoClient {
         Ok(())
     }
 
+    async fn require_database(&self) -> Result<()> {
+        if self.mode == Mode::Local {
+            let rows = self.execute(".show databases", true, "bootstrap").await?;
+            ensure!(
+                rows.iter()
+                    .any(|row| row.get("DatabaseName").and_then(Value::as_str) == Some(DATABASE)),
+                "validation requires the existing loadtest database"
+            );
+        }
+        Ok(())
+    }
+
     /// Defines (or redefines, picking up the current Delta schema) one accelerated external table.
     async fn expose(&self, name: &str, location: &str) -> Result<()> {
         ensure!(
@@ -1281,14 +1293,6 @@ async fn frozen(root: &Path, snapshot: &SnapshotSummary) -> Result<bool> {
     Ok(current == captured_inventory(snapshot))
 }
 
-async fn corpus(root: &Path, table: &str, summary: &TableSummary) -> Result<ValidationCorpus> {
-    if let Some(cloud) = cloud_root(root) {
-        delta_inspect::cloud_sample_corpus(cloud, table, summary).await
-    } else {
-        delta_inspect::sample_corpus(root, table, summary)
-    }
-}
-
 fn captured_inventory(snapshot: &SnapshotSummary) -> SnapshotInventory {
     SnapshotInventory {
         tables: snapshot
@@ -1370,11 +1374,13 @@ pub(crate) struct KustoProgress {
     table: Option<String>,
     /// Latest cache observation per external table while converging.
     last_qap: BTreeMap<String, Value>,
+    pub(crate) timings: BTreeMap<String, delta_inspect::scheduler::OracleTiming>,
 }
 
 /// The caller's absolute ceiling and the partial state it can still read after cancelling validation.
 #[derive(Debug, Default)]
 pub(crate) struct KustoBound {
+    pub(crate) timings: delta_inspect::scheduler::OracleTimings,
     pub(crate) ceiling: Option<Instant>,
     pub(crate) progress: Mutex<KustoProgress>,
 }
@@ -1385,9 +1391,12 @@ impl KustoBound {
     }
 
     pub(crate) fn into_progress(self) -> KustoProgress {
-        self.progress
+        let mut progress = self
+            .progress
             .into_inner()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        progress.timings = self.timings.evidence();
+        progress
     }
 }
 
@@ -1406,58 +1415,106 @@ pub(crate) async fn validate(
         metadata["run_id"].as_str() == Some(&status.run_id),
         "Kusto evidence belongs to another run"
     );
+    let bootstrap_timer = bound.timings.measure("phase/Bootstrap");
     bound.update(|progress| progress.phase = KustoPhase::Bootstrap);
     let client = KustoClient::new(endpoint, results)?;
-    client.bootstrap().await?;
+    client.require_database().await?;
+    bootstrap_timer.finish(true);
+    let oracle_timer = bound.timings.measure("phase/TableOracle");
     bound.update(|progress| progress.phase = KustoPhase::TableOracle);
-    let mut checks = Vec::new();
+    let mut inputs = Vec::new();
     for (pool, root, snapshot) in [("direct", direct_root, direct), ("dataflow", dataflow_root, dataflow)] {
         ensure!(
             snapshot.tables.len() == TABLES_PER_POOL,
             "{pool} Kusto validation requires all {TABLES_PER_POOL} tables"
         );
+        let timer = bound.timings.measure(format!("frozen/{pool}"));
         ensure!(
             frozen(root, snapshot).await?,
             "{pool} changed after the validation snapshot was captured"
         );
-        for (table, summary) in &snapshot.tables {
-            let name = external_name(pool, table)?;
-            bound.update(|progress| progress.table = Some(name.clone()));
-            ensure!(summary.rows > 0, "expected a nonempty Delta snapshot for {name}");
-            ensure!(
-                client.schema(&name).await? == columns(&summary.schema)?,
-                "Kusto external table schema differs from Delta for {name}"
-            );
-            let corpus = corpus(root, table, summary).await?;
-            ensure!(
-                corpus.expected_rows == summary.rows,
-                "validation corpus differs from the captured snapshot for {name}"
-            );
-            let fallback = client
-                .corpus_multiset(&fallback_source(&name)?, &summary.schema, &corpus)
-                .await?;
-            fallback
-                .check(&corpus)
-                .with_context(|| format!("non-accelerated fallback differs from Delta for {name}"))?;
-            let (policy, max_age) = client.max_age(&name).await?;
-            checks.push(TableCheck {
-                name,
-                table: table.clone(),
-                pool,
-                summary: summary.clone(),
-                corpus,
-                commit_ms: commit_millis(root, table, summary.version),
-                max_age,
-                policy,
-                fallback,
-            });
-        }
+        timer.finish(true);
+        inputs.extend(
+            snapshot
+                .tables
+                .iter()
+                .map(|(table, summary)| (pool, root, table, summary)),
+        );
     }
+    let mut pending = stream::iter(inputs)
+        .map(|(pool, root, table, summary)| {
+            let client = &client;
+            async move {
+                let name = external_name(pool, table)?;
+                let timer = bound.timings.measure(format!("table/{name}"));
+                bound.update(|progress| progress.table = Some(name.clone()));
+                let prepare = async {
+                    ensure!(summary.rows > 0, "expected a nonempty Delta snapshot for {name}");
+                    let schema_timer = bound.timings.measure(format!("schema/{name}"));
+                    ensure!(
+                        client.schema(&name).await? == columns(&summary.schema)?,
+                        "Kusto external table schema differs from Delta for {name}"
+                    );
+                    schema_timer.finish(true);
+                    let corpus_timer = bound.timings.measure(format!("corpus/{name}"));
+                    let corpus = if let Some(cloud) = cloud_root(root) {
+                        delta_inspect::cloud_sample_corpus_timed(cloud, table, summary, bound.ceiling).await?
+                    } else {
+                        let (root, table, summary) = (root.to_owned(), table.clone(), summary.clone());
+                        delta_inspect::scheduler::oracle_scheduler()
+                            .run(bound.ceiling, move || {
+                                delta_inspect::sample_corpus(&root, &table, &summary)
+                            })
+                            .await?
+                    };
+                    corpus_timer.finish(true);
+                    ensure!(
+                        corpus.expected_rows == summary.rows,
+                        "validation corpus differs from the captured snapshot for {name}"
+                    );
+                    let fallback_timer = bound.timings.measure(format!("fallback/{name}"));
+                    let fallback = client
+                        .corpus_multiset(&fallback_source(&name)?, &summary.schema, &corpus)
+                        .await?;
+                    fallback
+                        .check(&corpus)
+                        .with_context(|| format!("non-accelerated fallback differs from Delta for {name}"))?;
+                    fallback_timer.finish(true);
+                    let policy_timer = bound.timings.measure(format!("policy/{name}"));
+                    let (policy, max_age) = client.max_age(&name).await?;
+                    policy_timer.finish(true);
+                    Ok::<_, anyhow::Error>(TableCheck {
+                        name: name.clone(),
+                        table: table.clone(),
+                        pool,
+                        summary: summary.clone(),
+                        corpus,
+                        commit_ms: commit_millis(root, table, summary.version),
+                        max_age,
+                        policy,
+                        fallback,
+                    })
+                }
+                .await;
+                timer.finish(prepare.is_ok());
+                prepare
+            }
+        })
+        .buffer_unordered(delta_inspect::scheduler::oracle_scheduler().workers());
+    let mut checks = Vec::new();
+    while let Some(check) = pending.next().await {
+        checks.push(check?);
+    }
+    checks.sort_by(|left, right| left.name.cmp(&right.name));
+    oracle_timer.finish(true);
     bound.update(|progress| {
         progress.phase = KustoPhase::Converge;
         progress.table = None;
     });
+    let converge_timer = bound.timings.measure("phase/Converge");
     let cached = converge(&client, &checks, cache_timeout()?, bound).await?;
+    converge_timer.finish(true);
+    let evidence_timer = bound.timings.measure("phase/Evidence");
     bound.update(|progress| progress.phase = KustoPhase::Evidence);
     let mut evidence = BTreeMap::new();
     for check in &checks {
@@ -1494,7 +1551,10 @@ pub(crate) async fn validate(
     status.backend = BACKEND.to_owned();
     status.error = None;
     write_json(&results.join(STATUS), &status)?;
+    evidence_timer.finish(true);
     Ok(json!({
+        "timings": bound.timings.evidence(),
+        "oracle_workers": delta_inspect::scheduler::oracle_scheduler().workers(),
         "passed": true, "run_id": status.run_id, "backend": BACKEND, "mode": client.mode,
         "live_observed": true, "capacity": client.capacity().await, "tables": evidence
     }))
@@ -1724,6 +1784,8 @@ pub(crate) fn validation_failure(results: &Path, error: &anyhow::Error, progress
     let report = json!({
         "passed": false, "backend": BACKEND, "error": short_error(error),
         "phase": progress.phase, "table": progress.table, "last_qap": progress.last_qap,
+        "timings": progress.timings,
+        "oracle_workers": delta_inspect::scheduler::oracle_scheduler().workers(),
     });
     write_json(&results.join("kusto-validation.json"), &report)?;
     Ok(report)
@@ -2316,6 +2378,7 @@ mod tests {
                     vec![json!([10, "2026-10-27T00:00:00Z", 0, 0, 100.0, 1, 1])],
                 )));
             }
+
             if command.ends_with(" details") {
                 return Ok(Some(response(
                     &["QueryAccelerationState"],
@@ -2331,6 +2394,27 @@ mod tests {
             thread::sleep(Duration::from_millis(delay.load(Ordering::Relaxed)));
             Ok(Some(response(&["Sample", "Rows", "Hash"], vec![json!([1, 1, 5])])))
         })
+    }
+
+    #[tokio::test]
+    async fn validation_bootstrap_never_creates_or_attaches_a_missing_database() -> Result<()> {
+        for exists in [false, true] {
+            let requests = Arc::new(AtomicU64::new(0));
+            let count = Arc::clone(&requests);
+            let server = Server::start(move |request| {
+                ensure!(request["csl"] == ".show databases", "validation attempted a mutation");
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(response(
+                    &["DatabaseName"],
+                    if exists { vec![json!([DATABASE])] } else { vec![] },
+                )))
+            })?;
+            let directory = Directory::new()?;
+            let client = KustoClient::with_mode(&server.endpoint, &directory.0, Mode::Local, DATABASE)?;
+            assert_eq!(client.require_database().await.is_ok(), exists);
+            assert_eq!(requests.load(Ordering::SeqCst), 1);
+        }
+        Ok(())
     }
 
     const EARLY: &str = "2026-10-27-02-00";

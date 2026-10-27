@@ -58,8 +58,9 @@ enum ValidatePhase {
 
 /// One absolute bound for the whole validate command. The runner's wall-clock deadline is
 /// converted to a monotonic instant once, so later wall-clock changes cannot extend it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Budget {
+    timings: delta_inspect::scheduler::OracleTimings,
     deadline: Option<Instant>,
     deadline_unix_ms: Option<u64>,
 }
@@ -68,6 +69,7 @@ impl Budget {
     fn new(deadline_unix_ms: Option<u64>, now_unix: Duration, now: Instant) -> Result<Self> {
         let Some(deadline_unix_ms) = deadline_unix_ms else {
             return Ok(Self {
+                timings: delta_inspect::scheduler::OracleTimings::default(),
                 deadline: None,
                 deadline_unix_ms: None,
             });
@@ -80,6 +82,7 @@ impl Budget {
             "validate deadline is more than {MAX_VALIDATE_BUDGET:?} away"
         );
         Ok(Self {
+            timings: delta_inspect::scheduler::OracleTimings::default(),
             deadline: Some(now.checked_add(remaining).context("validate deadline overflow")?),
             deadline_unix_ms: Some(deadline_unix_ms),
         })
@@ -112,21 +115,27 @@ impl Budget {
     /// completes at or after the bound is rejected rather than accepted late. Without a bound the
     /// phase runs exactly as before.
     async fn within<T>(&self, phase: ValidatePhase, work: impl Future<Output = Result<T>>) -> Result<T> {
-        let Some(deadline) = self.deadline else {
-            return work.await;
-        };
-        ensure!(
-            Instant::now() < deadline,
-            "validate deadline elapsed before phase {phase:?} started"
-        );
-        let value = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), work)
-            .await
-            .map_err(|_| anyhow::anyhow!("phase {phase:?} reached the validate deadline"))??;
-        ensure!(
-            Instant::now() < deadline,
-            "phase {phase:?} completed only after the validate deadline"
-        );
-        Ok(value)
+        let timer = self.timings.measure(format!("phase/{phase:?}"));
+        let result = async {
+            let Some(deadline) = self.deadline else {
+                return work.await;
+            };
+            ensure!(
+                Instant::now() < deadline,
+                "validate deadline elapsed before phase {phase:?} started"
+            );
+            let value = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), work)
+                .await
+                .map_err(|_| anyhow::anyhow!("phase {phase:?} reached the validate deadline"))??;
+            ensure!(
+                Instant::now() < deadline,
+                "phase {phase:?} completed only after the validate deadline"
+            );
+            Ok(value)
+        }
+        .await;
+        timer.finish(result.is_ok());
+        result
     }
 
     fn evidence(&self) -> Option<Value> {
@@ -187,6 +196,7 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
         Err(error) => return fail_early(&arguments, Some(&budget), ValidatePhase::Inputs, error).await,
     };
 
+    let accounting_timer = budget.timings.measure("phase/Accounting");
     let mut failures = Vec::new();
     let mut failed_phase = None;
     if budget.expired_at(Instant::now()) {
@@ -413,33 +423,45 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
         );
     }
 
+    accounting_timer.finish(true);
     let mut snapshots = BTreeMap::new();
-    for (pool, root, phase) in [
-        ("direct", &arguments.direct_root, ValidatePhase::SnapshotDirect),
-        ("dataflow", &arguments.dataflow_root, ValidatePhase::SnapshotDataflow),
-    ] {
-        if !expected_tables.contains_key(pool) {
-            continue;
+    let snapshot_for = |pool: &'static str, root: &Path, phase| {
+        let expected = required_rows.get(pool);
+        let required = expected_tables.contains_key(pool);
+        let timings = budget.timings.clone();
+        let budget = &budget;
+        let root = root.to_owned();
+        let timeout = arguments.timeout.get();
+        async move {
+            if !required {
+                return (pool, phase, None);
+            }
+            let result = budget
+                .within(phase, async {
+                    let expected = expected.with_context(|| format!("{pool} row expectations missing"))?;
+                    wait_for_snapshot(&root, expected, budget.clamp(timeout), budget.deadline, timings).await
+                })
+                .await;
+            (pool, phase, Some(result))
         }
-        let expected = required_rows
-            .get(pool)
-            .with_context(|| format!("{pool} row expectations missing"))?;
-        match budget
-            .within(
-                phase,
-                wait_for_snapshot(root, expected, budget.clamp(arguments.timeout.get())),
-            )
-            .await
-        {
-            Ok(snapshot) => {
+    };
+    let (direct_snapshot, dataflow_snapshot) = tokio::join!(
+        snapshot_for("direct", &arguments.direct_root, ValidatePhase::SnapshotDirect),
+        snapshot_for("dataflow", &arguments.dataflow_root, ValidatePhase::SnapshotDataflow),
+    );
+    for (pool, phase, result) in [direct_snapshot, dataflow_snapshot] {
+        match result {
+            Some(Ok(snapshot)) => {
                 snapshots.insert(pool, snapshot);
             }
-            Err(error) => {
+            Some(Err(error)) => {
                 failures.push(format!("{pool} Delta snapshot did not become visible: {error:#}"));
                 failed_phase.get_or_insert(phase);
             }
+            None => {}
         }
     }
+    let checks_timer = budget.timings.measure("phase/LocalChecks");
     let direct = snapshots.remove("direct");
     let dataflow = snapshots.remove("dataflow");
     if let Some(snapshot) = &direct {
@@ -456,17 +478,21 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
         root: &Path,
         expected: &BTreeMap<String, u64>,
         timeout: Duration,
+        ceiling: Option<Instant>,
+        timings: delta_inspect::scheduler::OracleTimings,
     ) -> Result<SnapshotSummary> {
         let deadline = Instant::now() + timeout;
         loop {
             let snapshot = if root.to_str().is_some_and(|root| root.starts_with("abfss://")) {
-                delta_inspect::summarize_cloud(
+                delta_inspect::summarize_cloud_timed(
                     root.to_str().context("non-UTF8 cloud root")?,
                     &expected.keys().cloned().collect::<Vec<_>>(),
+                    ceiling,
+                    timings.clone(),
                 )
                 .await
             } else {
-                delta_inspect::summarize(root).await
+                delta_inspect::summarize_timed(root, ceiling, timings.clone()).await
             };
             let error = match snapshot {
                 Ok(snapshot)
@@ -524,9 +550,11 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
     );
     validate_capabilities(&capabilities, arguments.quiver, &mut failures);
 
+    checks_timer.finish(true);
     let mut diagnostics = Vec::new();
     let kusto = if let Some(endpoint) = &arguments.kusto_endpoint {
         let bound = crate::kusto::KustoBound {
+            timings: budget.timings.clone(),
             ceiling: budget.deadline,
             ..crate::kusto::KustoBound::default()
         };
@@ -558,7 +586,8 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
             ))
         };
         match validation {
-            Ok(report) => {
+            Ok(mut report) => {
+                report["timings"] = serde_json::json!(budget.timings.evidence());
                 crate::kusto::write_validation(&arguments.results, &report)?;
                 Some(report)
             }
@@ -572,6 +601,8 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
         None
     };
     let report = ValidationReport {
+        timings: budget.timings.evidence(),
+        oracle_workers: delta_inspect::scheduler::oracle_scheduler().workers(),
         passed: failures.is_empty(),
         failures,
         failed_phase,
@@ -920,14 +951,10 @@ async fn fail_early(
     error: anyhow::Error,
 ) -> Result<()> {
     let mut diagnostics = Vec::new();
+    let mut progress = crate::kusto::KustoProgress::default();
+    progress.timings = budget.map(|budget| budget.timings.evidence()).unwrap_or_default();
     let kusto = if arguments.kusto_endpoint.is_some() {
-        record_kusto_failure(
-            &arguments.results,
-            &error,
-            &crate::kusto::KustoProgress::default(),
-            &mut diagnostics,
-        )
-        .await
+        record_kusto_failure(&arguments.results, &error, &progress, &mut diagnostics).await
     } else {
         None
     };
@@ -936,6 +963,7 @@ async fn fail_early(
         "failures": [format!("validation stopped in phase {phase:?}: {error:#}")],
         "failed_phase": phase,
         "deadline": budget.and_then(Budget::evidence),
+        "timings": budget.map(|budget| budget.timings.evidence()),
         "admitted_rows": {}, "required_rows": {},
         "direct": null, "dataflow": null, "routing": null,
         "kusto": kusto,
@@ -1012,6 +1040,8 @@ struct RoutingLeaseEvidence {
 
 #[derive(Serialize)]
 struct ValidationReport {
+    timings: BTreeMap<String, delta_inspect::scheduler::OracleTiming>,
+    oracle_workers: usize,
     passed: bool,
     failures: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1097,6 +1127,7 @@ mod tests {
         );
 
         let budget = Budget {
+            timings: delta_inspect::scheduler::OracleTimings::default(),
             deadline: Some(Instant::now() + Duration::from_millis(200)),
             deadline_unix_ms: Some(1),
         };
@@ -1116,6 +1147,7 @@ mod tests {
 
         // A synchronous stretch cannot be preempted; its late success is still rejected.
         let budget = Budget {
+            timings: delta_inspect::scheduler::OracleTimings::default(),
             deadline: Some(Instant::now() + Duration::from_millis(100)),
             deadline_unix_ms: Some(1),
         };

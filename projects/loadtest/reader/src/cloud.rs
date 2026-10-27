@@ -89,6 +89,19 @@ pub async fn cloud_sample_rows(
 /// Rejects a changed snapshot/corpus, unavailable captured files, unsupported partitioning, a
 /// partition with more than 256 distinct rows, and corpora beyond the global distinct-row guard.
 pub async fn cloud_sample_corpus(root: &str, identity: &str, summary: &TableSummary) -> Result<ValidationCorpus> {
+    cloud_sample_corpus_timed(root, identity, summary, None).await
+}
+
+/// Deadline-bound cloud second read under the shared oracle CPU cap.
+///
+/// # Errors
+/// Rejects the same invalid corpora as `cloud_sample_corpus`, plus late work.
+pub async fn cloud_sample_corpus_timed(
+    root: &str,
+    identity: &str,
+    summary: &TableSummary,
+    deadline: Option<std::time::Instant>,
+) -> Result<ValidationCorpus> {
     let delta = open_cloud_table(root, identity).await?;
     if delta.snapshot()?.version() != summary.version {
         bail!("cloud snapshot changed after capture");
@@ -98,11 +111,19 @@ pub async fn cloud_sample_corpus(root: &str, identity: &str, summary: &TableSumm
         validate_active_path(&file.path)?;
         let path = deltalake_core::Path::parse(&file.path)?;
         let data = delta.object_store().get(&path).await?.bytes().await?;
-        let reader = SerializedFileReader::new(data)?;
-        for row in reader.get_row_iter(None)? {
-            let value = with_partitions(row_value(&row?), &summary.schema, &file.partition_values)?;
-            builder.add(value, &file.partition_values)?;
-        }
+        let schema = summary.schema.clone();
+        let partitions = file.partition_values.clone();
+        builder = crate::scheduler::oracle_scheduler()
+            .run(deadline, move || {
+                let reader = SerializedFileReader::new(data)?;
+                for row in reader.get_row_iter(None)? {
+                    crate::scheduler::check_deadline()?;
+                    let value = with_partitions(row_value(&row?), &schema, &partitions)?;
+                    builder.add(value, &partitions)?;
+                }
+                Ok(builder)
+            })
+            .await?;
     }
     builder.finish(summary)
 }
@@ -115,6 +136,19 @@ pub async fn cloud_sample_corpus(root: &str, identity: &str, summary: &TableSumm
 /// Rejects invalid roots/identities, unavailable credentials, unsupported
 /// deletion vectors, unsafe active paths, and corrupt/missing committed files.
 pub async fn summarize_cloud(root: &str, identities: &[String]) -> Result<SnapshotSummary> {
+    summarize_cloud_timed(root, identities, None, crate::scheduler::OracleTimings::default()).await
+}
+
+/// Parallel cloud tables with deadline-bound CPU work and per-table timings.
+///
+/// # Errors
+/// Propagates snapshot, worker and deadline failures without omitting tables.
+pub async fn summarize_cloud_timed(
+    root: &str,
+    identities: &[String],
+    deadline: Option<std::time::Instant>,
+    timings: crate::scheduler::OracleTimings,
+) -> Result<SnapshotSummary> {
     let url = url::Url::parse(root)?;
     if url.scheme() != "abfss" || url.query().is_some() || url.fragment().is_some() || url.password().is_some() {
         bail!("cloud oracle requires a credential-free abfss root");
@@ -122,84 +156,122 @@ pub async fn summarize_cloud(root: &str, identities: &[String]) -> Result<Snapsh
     if identities.is_empty() || identities.iter().collect::<BTreeSet<_>>().len() != identities.len() {
         bail!("cloud oracle requires a nonempty unique explicit table allowlist");
     }
-    let mut tables = BTreeMap::new();
-    let mut total_files = 0;
+    let pool = url.path().trim_end_matches('/').rsplit('/').next().unwrap_or("cloud");
+    let mut pending = tokio::task::JoinSet::new();
     for identity in identities {
-        if identity
-            .split('.')
-            .any(|part| part.is_empty() || !part.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'))
-        {
-            bail!("invalid cloud table identity");
-        }
-        let delta = open_cloud_table(root, identity).await?;
-        let snapshot = delta.snapshot()?;
-        let schema = serde_json::to_value(snapshot.schema())?;
-        let partition_columns = snapshot.metadata().partition_columns().to_vec();
-        let mut files = Vec::new();
-        let mut rows = 0_u64;
-        let mut bytes = 0_u64;
-        let mut row_hashes = BTreeMap::<String, u64>::new();
-        let mut payload_row_hashes = BTreeMap::<String, u64>::new();
-        for file in snapshot.log_data().iter() {
-            if file.deletion_vector_descriptor().is_some() {
-                bail!("independent cloud oracle does not support deletion vectors");
-            }
-            let path = file.path().into_owned();
-            validate_active_path(&path)?;
-            let partition_values = file.partition_values_map().into_iter().collect();
-            validate_partition_columns(&partition_values, &partition_columns)?;
-            if file.size() > 1_073_741_824 {
-                bail!("cloud oracle file exceeds the QAP 1GB cache limit");
-            }
-            let data = delta
-                .object_store()
-                .get(&file.object_store_path())
-                .await?
-                .bytes()
-                .await?;
-            let file_bytes = u64::try_from(data.len()).context("file byte count overflow")?;
-            let reader = SerializedFileReader::new(data)?;
-            let file_rows =
-                u64::try_from(reader.metadata().file_metadata().num_rows()).context("negative row count")?;
-            for row in reader.get_row_iter(None)? {
-                let value = with_partitions(row_value(&row?), &schema, &partition_values)?;
-                *payload_row_hashes
-                    .entry(payload_digest(value.clone(), &partition_columns)?)
-                    .or_default() += 1;
-                let hash = format!("sha256:{}", hex::encode(Sha256::digest(serde_json::to_vec(&value)?)));
-                *row_hashes.entry(hash).or_default() += 1;
-            }
-            files.push(FileSummary {
-                path,
-                bytes: file_bytes,
-                rows: file_rows,
-                partition_values,
-            });
-            rows = rows.checked_add(file_rows).context("cloud row count overflow")?;
-            bytes = bytes.checked_add(file_bytes).context("cloud byte count overflow")?;
-        }
-        files.sort_by(|left, right| left.path.cmp(&right.path));
-        total_files += files.len();
-        tables.insert(
-            identity.clone(),
-            TableSummary {
-                schema,
-                version: snapshot.version(),
-                active_files: files.len(),
-                rows,
-                bytes,
-                minimum_file_bytes: files.iter().map(|file| file.bytes).min().unwrap_or(0),
-                maximum_file_bytes: files.iter().map(|file| file.bytes).max().unwrap_or(0),
-                row_hashes,
-                payload_row_hashes,
-                files,
-                partition_columns,
-            },
-        );
+        let pool = pool.to_owned();
+        let (root, identity, timings) = (root.to_owned(), identity.clone(), timings.clone());
+        pending.spawn(async move {
+            let timer = timings.measure(format!("snapshot/{pool}/{identity}"));
+            let result = summarize_cloud_table(&root, &identity, deadline).await;
+            timer.finish(result.is_ok());
+            result.map(|summary| (identity, summary))
+        });
+    }
+    let mut tables = BTreeMap::new();
+    while let Some(result) = pending.join_next().await {
+        let (identity, summary) = result.context("cloud snapshot table task failed")??;
+        tables.insert(identity, summary);
     }
     Ok(SnapshotSummary {
-        files: total_files,
+        files: tables.values().map(|table| table.active_files).sum(),
         tables,
+    })
+}
+
+async fn summarize_cloud_table(
+    root: &str,
+    identity: &str,
+    deadline: Option<std::time::Instant>,
+) -> Result<TableSummary> {
+    if identity
+        .split('.')
+        .any(|part| part.is_empty() || !part.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'))
+    {
+        bail!("invalid cloud table identity");
+    }
+    let delta = open_cloud_table(root, identity).await?;
+    let snapshot = delta.snapshot()?;
+    let schema = serde_json::to_value(snapshot.schema())?;
+    let partition_columns = snapshot.metadata().partition_columns().to_vec();
+    let mut files = Vec::new();
+    let mut rows = 0_u64;
+    let mut bytes = 0_u64;
+    let mut row_hashes = BTreeMap::<String, u64>::new();
+    let mut payload_row_hashes = BTreeMap::<String, u64>::new();
+    for file in snapshot.log_data().iter() {
+        if file.deletion_vector_descriptor().is_some() {
+            bail!("independent cloud oracle does not support deletion vectors");
+        }
+        let path = file.path().into_owned();
+        validate_active_path(&path)?;
+        let partition_values = file.partition_values_map().into_iter().collect();
+        validate_partition_columns(&partition_values, &partition_columns)?;
+        if file.size() > 1_073_741_824 {
+            bail!("cloud oracle file exceeds the QAP 1GB cache limit");
+        }
+        let data = delta
+            .object_store()
+            .get(&file.object_store_path())
+            .await?
+            .bytes()
+            .await?;
+        let file_bytes = u64::try_from(data.len()).context("file byte count overflow")?;
+        let decode_schema = schema.clone();
+        let decode_partitions = partition_values.clone();
+        let decode_columns = partition_columns.clone();
+        let (file_rows, decoded_hashes, decoded_payload) = crate::scheduler::oracle_scheduler()
+            .run(deadline, move || {
+                let schema = decode_schema;
+                let partition_values = decode_partitions;
+                let partition_columns = decode_columns;
+                let reader = SerializedFileReader::new(data)?;
+                let file_rows =
+                    u64::try_from(reader.metadata().file_metadata().num_rows()).context("negative row count")?;
+                let mut row_hashes = BTreeMap::<String, u64>::new();
+                let mut payload_row_hashes = BTreeMap::<String, u64>::new();
+                for row in reader.get_row_iter(None)? {
+                    crate::scheduler::check_deadline()?;
+                    let value = with_partitions(row_value(&row?), &schema, &partition_values)?;
+                    *payload_row_hashes
+                        .entry(payload_digest(value.clone(), &partition_columns)?)
+                        .or_default() += 1;
+                    let hash = format!("sha256:{}", hex::encode(Sha256::digest(serde_json::to_vec(&value)?)));
+                    *row_hashes.entry(hash).or_default() += 1;
+                }
+
+                Ok((file_rows, row_hashes, payload_row_hashes))
+            })
+            .await?;
+        for (hash, count) in decoded_hashes {
+            *row_hashes.entry(hash).or_default() += count;
+        }
+        for (hash, count) in decoded_payload {
+            *payload_row_hashes.entry(hash).or_default() += count;
+        }
+        files.push(FileSummary {
+            path,
+            bytes: file_bytes,
+            rows: file_rows,
+            partition_values,
+        });
+        rows = rows.checked_add(file_rows).context("cloud row count overflow")?;
+        bytes = bytes.checked_add(file_bytes).context("cloud byte count overflow")?;
+    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+
+    Ok(TableSummary {
+        schema,
+        version: snapshot.version(),
+        active_files: files.len(),
+        rows,
+        bytes,
+        minimum_file_bytes: files.iter().map(|file| file.bytes).min().unwrap_or(0),
+        maximum_file_bytes: files.iter().map(|file| file.bytes).max().unwrap_or(0),
+        row_hashes,
+        payload_row_hashes,
+        files,
+        partition_columns,
     })
 }
 

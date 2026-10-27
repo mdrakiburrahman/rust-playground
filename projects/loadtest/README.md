@@ -490,9 +490,26 @@ Tables may be pending until their first Delta commit; readiness of the cluster
 does not establish cache eligibility. Native QAP uses `MaxAge=00:01:00`;
 validation waits within its declared timeout for actual eligible cache statistics
 and checks both the cached query and the one-second fallback against the oracle.
-The native cached gate keeps a fixed five-minute deadline; the benchmark's
-overall validation budget is eight minutes. The separate clean-mutator stop
-budget remains five minutes and is not extended by cache convergence.
+The native cached gate keeps a fixed five-minute deadline, shortened to the
+remaining absolute validation budget. The runner retains its 600-second hard
+backstop and gives validation 570 seconds, reserving 30 seconds for a failed
+report. The existing eight-minute Kusto-command limit also remains in force.
+The separate clean-mutator stop budget remains five minutes and is not extended
+by cache convergence.
+
+Snapshot capture for both pools and table-oracle preparation run across tables.
+Blocking decode/hash jobs share one process-wide CPU cap sized from available
+CPUs; file-level decoders do not create nested workers inside those jobs.
+The independent reader still reads each captured file twice: the first pass
+builds the snapshot hashes, and the second constructs the exact bounded corpus
+and verifies those hashes. Snapshot hashes alone cannot replace decoded rows
+needed for Kusto's exact multiset predicates. Frozen inventory checks, all 26
+fallback and accelerated checks, and deadline rejection remain mandatory.
+`validation.json` and `kusto-validation.json` include `timings` with Unix start
+times, elapsed milliseconds and outcomes for phases, snapshot tables and Kusto
+schema/corpus/fallback/policy preparation. Cancelled work is not reported as
+passed. Validation only inspects an existing local Kusto database; it never
+creates or attaches one.
 The optional bridge is not the default and is not accelerated-cache evidence.
 Timestamp `__unix_nanos` companion columns retain the original
 integer nanoseconds; Kusto `datetime` alone is not nanosecond-exact.

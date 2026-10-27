@@ -126,3 +126,97 @@ fn actual_cli_fails_instead_of_truncating_or_omitting_requested_tables() -> Resu
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn compacted_multi_table_parallel_preparation_beats_serial_without_changing_oracles() -> Result<()> {
+    use std::time::Instant;
+    if std::thread::available_parallelism()?.get() < 2 {
+        eprintln!("parallel performance comparison requires at least two CPUs");
+        return Ok(());
+    }
+    let fixture = Fixture::new(2, 31)?;
+    let original = fixture.0.join("telemetry/sqlserver/fixture");
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    for partition in 0..2 {
+        let file = original.join(format!("part-{partition}.parquet"));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(
+                (0..50_000).map(|row| row % 32).collect::<Vec<_>>(),
+            ))],
+        )?;
+        let mut writer = ArrowWriter::try_new(fs::File::create(file)?, Arc::clone(&schema), None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+    }
+    let log = original.join("_delta_log/00000000000000000000.json");
+    let mut actions = fs::read_to_string(&log)?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for action in &mut actions {
+        if let Some(add) = action.get_mut("add") {
+            add["size"] = json!(fs::metadata(original.join(add["path"].as_str().context("path")?))?.len());
+            add["stats"] = json!(json!({"numRecords":50_000}).to_string());
+        }
+    }
+    fs::write(
+        &log,
+        actions.iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n",
+    )?;
+    let mut identities = vec!["telemetry.sqlserver.fixture".to_owned()];
+    for table in 0..15 {
+        let name = format!("table_{table:02}");
+        let root = fixture.0.join("telemetry/sqlserver").join(&name);
+        fs::create_dir_all(root.join("_delta_log"))?;
+        fs::copy(&log, root.join("_delta_log/00000000000000000000.json"))?;
+        for partition in 0..2 {
+            let file = format!("part-{partition}.parquet");
+            fs::copy(original.join(&file), root.join(file))?;
+        }
+        identities.push(format!("telemetry.sqlserver.{name}"));
+    }
+    let started = Instant::now();
+    let mut serial = std::collections::BTreeMap::new();
+    for identity in &identities {
+        let snapshot = delta_inspect::summarize_selected(&fixture.0, std::slice::from_ref(identity)).await?;
+        let summary = snapshot.tables.get(identity).context("serial table")?;
+        let root = fixture.0.clone();
+        let name = identity.clone();
+        let table = summary.clone();
+        let corpus = delta_inspect::scheduler::oracle_scheduler()
+            .run(None, move || delta_inspect::sample_corpus(&root, &name, &table))
+            .await?;
+        serial.insert(identity.clone(), (summary.clone(), serde_json::to_value(corpus)?));
+    }
+    let serial_elapsed = started.elapsed();
+    let started = Instant::now();
+    let snapshot = delta_inspect::summarize(&fixture.0).await?;
+    let mut pending = tokio::task::JoinSet::new();
+    for (identity, summary) in snapshot.tables {
+        let root = fixture.0.clone();
+        pending.spawn(async move {
+            delta_inspect::scheduler::oracle_scheduler()
+                .run(None, move || {
+                    let corpus = delta_inspect::sample_corpus(&root, &identity, &summary)?;
+                    Ok((identity, (summary, serde_json::to_value(corpus)?)))
+                })
+                .await
+        });
+    }
+    let mut parallel = std::collections::BTreeMap::new();
+    while let Some(result) = pending.join_next().await {
+        let (identity, result) = result??;
+        parallel.insert(identity, result);
+    }
+    let parallel_elapsed = started.elapsed();
+    assert_eq!(serial, parallel, "every hash and exact second-read multiset must agree");
+    eprintln!(
+        "compacted 16-table/32-file/1600000-row oracle prep: serial={serial_elapsed:?} parallel={parallel_elapsed:?}"
+    );
+    assert!(
+        parallel_elapsed < serial_elapsed,
+        "parallel scheduling must improve wall time"
+    );
+    Ok(())
+}
