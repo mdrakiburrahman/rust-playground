@@ -2124,7 +2124,7 @@ mod tests {
     async fn private_identifiers_never_reach_logs_status_or_reports() -> Result<()> {
         let directory = Directory::new()?;
         let message = "Partial query failure: abfss://private@acct.dfs.core.windows.net/x?sig=CANARYSIG \
-            on /subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg identity \
+            on /subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg identity \
             99999999-aaaa-bbbb-cccc-dddddddddddd bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.CANARY";
         let server = Server::start(move |_| {
             Ok(Some(json!([
