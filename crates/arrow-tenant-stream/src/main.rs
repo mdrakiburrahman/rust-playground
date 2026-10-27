@@ -189,7 +189,9 @@ async fn drive(
     if schema.field_with_name("sample_time_utc").is_ok() {
         policy.sort_columns.push("sample_time_utc".into());
     }
-    let table = DeltaTable::open_url_with_session(target_url.clone(), Arc::clone(&schema), partition_columns, session)?;
+    let canonical = arrow_deltalake::normalize::CanonicalSchema::try_new(Arc::clone(&schema))?;
+    let table =
+        DeltaTable::open_url_with_session_canonical(target_url.clone(), &canonical, partition_columns, session)?;
     ensure!(
         DeltaSource::open(target_url)?.capture()?.table_id != stream.manifest().table_id,
         "source and target resolve to the same Delta table identity"
