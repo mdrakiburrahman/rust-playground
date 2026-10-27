@@ -1,5 +1,6 @@
 //! Local, append-only Delta tables backed exclusively by Delta Kernel.
 
+pub use crate::delta_io::spawn_shared_io;
 use crate::delta_io::{BATCH_ROWS, READ_AHEAD, SharedExecutor, shared_executor};
 use crate::publisher::{PublisherSession, SessionMode};
 use crate::{
@@ -225,6 +226,123 @@ mod io_tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
     use std::collections::HashSet;
+
+    #[derive(Debug, Default)]
+    struct PausedStagePut {
+        inner: object_store::memory::InMemory,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl std::fmt::Display for PausedStagePut {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("paused stage put")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for PausedStagePut {
+        async fn put_opts(
+            &self,
+            path: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            options: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.entered.notify_one();
+            tokio::time::timeout(Duration::from_secs(2), self.release.notified())
+                .await
+                .map_err(|error| object_store::Error::Generic {
+                    store: "paused stage put",
+                    source: Box::new(error),
+                })?;
+            self.inner.put_opts(path, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            path: &object_store::path::Path,
+            options: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(path, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            path: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(path, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            paths: futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+            self.inner.delete_stream(paths)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+
+        async fn rename_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::RenameOptions,
+        ) -> object_store::Result<()> {
+            self.inner.rename_opts(from, to, options).await
+        }
+    }
+
+    /// Scenario: staging awaits a real, paused object-store put from a current-thread runtime.
+    /// Guarantees: another caller task progresses and releases the put before its independent deadline.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stage_upload_keeps_current_thread_runtime_responsive() -> Result<()> {
+        use futures::TryStreamExt;
+        let directory = tempfile::tempdir()?;
+        let table = DeltaTable::open(directory.path())?;
+        let input = input_batch()?;
+        let mut writer = table.new_file(input.schema())?;
+        writer.write(&input).await?;
+        drop(table);
+        let store = Arc::new(PausedStagePut::default());
+        let table = Arc::get_mut(&mut writer.table).context("unique stage table")?;
+        table.url = Url::parse("abfss://fixture@example.invalid/table/")?;
+        table.store = store.clone();
+        let staged = tokio::time::timeout(Duration::from_secs(5), async {
+            let progress = async {
+                store.entered.notified().await;
+                store.release.notify_one();
+            };
+            let (staged, ()) = tokio::join!(writer.stage(), progress);
+            staged
+        })
+        .await??;
+        assert!(staged.file.bytes > 0);
+        assert_eq!(store.inner.list(None).try_collect::<Vec<_>>().await?.len(), 1);
+        assert!(!directory.path().join("_delta_log/00000000000000000001.json").exists());
+        Ok(())
+    }
 
     /// Scenario: a new nested two-column Hive table publishes locally, with injected fsync faults.
     /// Guarantees: root ancestry, leaf/intermediate partitions and the checkpoint hint are fsynced
@@ -2419,7 +2537,16 @@ impl DeltaFileWriter {
         }
         let file = self.parquet.finish().await?;
         let stats = self.stats.finish()?.context("cannot commit an empty Delta file")?;
-        self.table.upload_file(&file)?;
+        let executor = shared_executor()?;
+        let table = Arc::clone(&self.table);
+        let (file, uploaded) = executor
+            .spawn_blocking(move || {
+                let uploaded = table.upload_file(&file);
+                (file, uploaded)
+            })
+            .await
+            .context("stage upload worker failed")?;
+        uploaded?;
         Ok(StagedAppend {
             table: self.table,
             schema: self.schema,
