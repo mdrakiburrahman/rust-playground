@@ -1653,7 +1653,7 @@ mod tests {
     fn native_client_canaries_and_diagnostic_contract_stay_aligned() {
         let message = concat!(
             "Partial query failure: abfss://private@acct.dfs.core.windows.net/x?sig=CANARYSIG ",
-            "on /subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg identity ",
+            "on /subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg identity ",
             "99999999-aaaa-bbbb-cccc-dddddddddddd ",
             "bearer eyJhbGciOiJIUzI1NiJ9.privateCanaryJwtPayload.privateCanarySignature ",
             "/delta/private/x C:\\privateCanaryWindows\\x;Password=privateCanaryPassword; ",
