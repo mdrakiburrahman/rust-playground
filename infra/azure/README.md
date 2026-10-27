@@ -77,6 +77,16 @@ for diagnosing infrastructure access, not an acceptance shortcut.
 
 ## Cloud occupancy and reset
 
+**Destructive reset is currently disabled in code.** `reset --execute` fails
+before contacting Azure, stopping services, fencing, or deleting data. Preview
+remains available. The sequencing described below is design/test coverage only,
+not an executable cleanup guarantee. Execution cannot be enabled until every
+mutating process participates in a persistent CAS-coordinated publisher registry
+and clean drain proves all requests definitively completed. Crashed, suspended,
+or uncertain publishers must leave blocking registrations, with no TTL or
+force-unregister shortcut. A local stop receipt, checkbox, or 60-second delay
+cannot substitute for that distributed authority.
+
 The test runner acquires shared occupancy before live tests and releases it only
 after its owned writers/consumers stop successfully:
 
@@ -95,7 +105,7 @@ commit attempt. A restarted writer must not bypass a fenced sandbox.
 ```bash
 # Preview only: no mutation.
 python3 infra/azure/bootstrap.py reset
-# Mutate only after the cloud test owner releases occupancy.
+# Fails closed until distributed publisher drain is implemented and verified.
 python3 infra/azure/bootstrap.py reset --execute
 ```
 

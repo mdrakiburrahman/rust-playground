@@ -22,6 +22,12 @@ import xml.etree.ElementTree as ET
 ROOT = Path(__file__).resolve().parents[2]
 API = "2024-04-13"
 TAGS = {"project": "rust-playground", "purpose": "disposable-arrowcol-sandbox"}
+RESET_EXECUTION_BLOCKER = (
+    "Destructive reset is disabled: complete distributed publisher registration and "
+    "definitive request drain are not implemented and verified on every mutation surface. "
+    "Local service stop, an assertion, and a timed grace period are not sufficient. "
+    "Preview remains available; no resources or data were modified."
+)
 
 
 class Failure(RuntimeError):
@@ -495,13 +501,25 @@ def reset_inventory(azure):
 
 
 def reset(azure, execute, stop_command):
+    if execute:
+        raise Failure(RESET_EXECUTION_BLOCKER)
+    return reset_preview(azure)
+
+
+def reset_preview(azure):
+    databases, inventory = reset_inventory(azure)
+    count = sum(len(items) for items in inventory.values())
+    print(f"Reset preview: owned databases={len(databases)}, containers=2, stored objects={count}")
+    print("Preserve cluster, account, containers and managed identity.")
+
+
+def _unqualified_reset_sequence(azure, stop_command):
+    """Non-dispatched sequence; not executable until distributed drain is qualified."""
     c = azure.c
     databases, inventory = reset_inventory(azure)
     count = sum(len(items) for items in inventory.values())
     print(f"Reset preview: owned databases={len(databases)}, containers=2, stored objects={count}")
     print("Preserve cluster, account, containers and managed identity.")
-    if not execute:
-        return
     if not stop_command:
         raise Failure("Execution requires the runner's --stop-command to stop local writers/consumers.")
     metadata, etag = azure.control()
@@ -562,6 +580,46 @@ def no_databases(azure):
 def require_released(metadata):
     if metadata.get("occupancy", "released") != "released":
         raise Failure("Cloud tests own the sandbox; wait for explicit occupancy release.")
+
+
+def publisher_registry(metadata):
+    """Validate shared wire format without inferring completion from missing data."""
+    if metadata.get("publisherregistryversion") != "1":
+        raise Failure("Publisher registry is missing or has an unsupported version.")
+    raw = metadata.get("publishers")
+    if not isinstance(raw, str) or len(raw.encode("utf-8")) > 4096:
+        raise Failure("Publisher registry exceeds its bounded metadata budget or is missing.")
+    def unique_pairs(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise Failure("Publisher registry contains duplicate JSON keys.")
+            result[key] = value
+        return result
+    try:
+        registry = json.loads(raw, object_pairs_hook=unique_pairs)
+    except json.JSONDecodeError as exc:
+        raise Failure("Publisher registry JSON is malformed.") from exc
+    if not isinstance(registry, dict) or len(registry) > 16:
+        raise Failure("Publisher registry must be a map with at most 16 slots.")
+    for publisher, entry in registry.items():
+        try:
+            if str(uuid.UUID(publisher)) != publisher:
+                raise ValueError("noncanonical publisher")
+            if not isinstance(entry, dict) or set(entry) != {"generation", "state"}:
+                raise ValueError("invalid entry")
+            if str(uuid.UUID(entry["generation"])) != entry["generation"]:
+                raise ValueError("noncanonical generation")
+            if entry["state"] not in ("active", "uncertain"):
+                raise ValueError("invalid state")
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise Failure("Publisher registry contains an invalid publisher entry.") from exc
+    return registry
+
+
+def require_drained_publishers(metadata):
+    if publisher_registry(metadata):
+        raise Failure("Registered active or uncertain publishers block destructive cleanup; no expiry or force-clear is permitted.")
 
 
 def require_released_or_owner(metadata, owner):

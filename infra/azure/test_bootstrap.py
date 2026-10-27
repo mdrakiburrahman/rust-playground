@@ -165,6 +165,15 @@ class ResetTests(unittest.TestCase):
             b.reset(self.azure, True, None)
         self.assertEqual(self.azure.events, [])
 
+    def test_public_execute_always_fails_closed_even_with_stop_receipt(self):
+        with patch.object(b.subprocess, "run") as run:
+            run.return_value.returncode = 0
+            run.return_value.stdout = '{"stopped":true,"scope":"workspace-owned-loadtest","dataPreserved":true}\n'
+            with self.assertRaisesRegex(b.Failure, "Destructive reset is disabled"):
+                b.reset(self.azure, True, ["stop"])
+            run.assert_not_called()
+        self.assertEqual(self.azure.events, [])
+
     def test_ownership_mismatch_fails_before_deletion(self):
         self.azure.tags["sandboxId"] = "another"
         with self.assertRaises(b.Failure):
@@ -216,7 +225,7 @@ class ResetTests(unittest.TestCase):
     def test_stop_failure_retains_fence_without_deleting_data(self, run):
         run.return_value.returncode = 1
         with self.assertRaises(b.Failure):
-            b.reset(self.azure, True, ["stop"])
+            b._unqualified_reset_sequence(self.azure, ["stop"])
         self.assertEqual(self.azure.events, [("control", "fenced")])
         self.assertEqual(self.azure.metadata["resetstate"], "fenced")
 
@@ -226,7 +235,7 @@ class ResetTests(unittest.TestCase):
         run.return_value.returncode = 0
         run.return_value.stdout = '{"stopped":true,"scope":"workspace-owned-loadtest","dataPreserved":true}\n'
         before = self.azure.metadata["resetgeneration"]
-        b.reset(self.azure, True, ["stop"])
+        b._unqualified_reset_sequence(self.azure, ["stop"])
         sleep.assert_called_once_with(60)
         self.assertEqual(self.azure.events[0], ("control", "fenced"))
         self.assertIn(("DELETE", "table/data.parquet"), self.azure.events)
@@ -244,7 +253,7 @@ class ResetTests(unittest.TestCase):
         run.return_value.stdout = '{"stopped":true,"scope":"workspace-owned-loadtest","dataPreserved":true}\n'
         with patch.object(self.azure, "blob"):
             with self.assertRaisesRegex(b.Failure, "left workload"):
-                b.reset(self.azure, True, ["stop"])
+                b._unqualified_reset_sequence(self.azure, ["stop"])
         self.assertEqual(self.azure.metadata["resetstate"], "fenced")
 
     @patch.object(b.subprocess, "run")
@@ -252,7 +261,7 @@ class ResetTests(unittest.TestCase):
         run.return_value.returncode = 0
         run.return_value.stdout = "not stopped"
         with self.assertRaisesRegex(b.Failure, "did not verify"):
-            b.reset(self.azure, True, ["stop"])
+            b._unqualified_reset_sequence(self.azure, ["stop"])
         self.assertEqual(self.azure.events, [("control", "fenced")])
 
     @patch.object(b.time, "sleep")
@@ -261,7 +270,7 @@ class ResetTests(unittest.TestCase):
         run.return_value.returncode = 0
         run.return_value.stdout = '{"stopped":true,"scope":"workspace-owned-loadtest","dataPreserved":true}\n'
         self.azure.directories[self.azure.c.data] = ["table", "table/empty", "table/empty/deeper"]
-        b.reset(self.azure, True, ["stop"])
+        b._unqualified_reset_sequence(self.azure, ["stop"])
         self.assertEqual(self.azure.directories[self.azure.c.data], [])
         directories = [event[1] for event in self.azure.events if event[0] == "DELETE_DIRECTORY"]
         self.assertEqual(directories, ["table/empty/deeper", "table/empty", "table"])
@@ -274,7 +283,7 @@ class ResetTests(unittest.TestCase):
         sleep.side_effect = lambda _: self.azure.items[self.azure.c.data].append({
             "name": "table/late.parquet", "version": None, "snapshot": None, "deleted": False,
         })
-        b.reset(self.azure, True, ["stop"])
+        b._unqualified_reset_sequence(self.azure, ["stop"])
         self.assertIn(("DELETE", "table/late.parquet"), self.azure.events)
 
     @patch.object(b.time, "sleep")
@@ -284,7 +293,7 @@ class ResetTests(unittest.TestCase):
         run.return_value.stdout = '{"stopped":true,"scope":"workspace-owned-loadtest","dataPreserved":true}\n'
         sleep.side_effect = lambda _: self.azure.metadata.update(resetgeneration=str(uuid.uuid4()))
         with self.assertRaisesRegex(b.Failure, "during quiescence"):
-            b.reset(self.azure, True, ["stop"])
+            b._unqualified_reset_sequence(self.azure, ["stop"])
         self.assertFalse(any(event[0] in ("DELETE", "DELETE_DIRECTORY", "cli") for event in self.azure.events))
 
 
@@ -551,6 +560,48 @@ class ProvisionCoordinationTests(unittest.TestCase):
                 b.deploy(azure)
             cli.assert_not_called()
         self.assertEqual(azure.events, [])
+
+
+class PublisherRegistryTests(unittest.TestCase):
+    def metadata(self, entries):
+        return {"publisherregistryversion": "1", "publishers": json.dumps(entries, separators=(",", ":"))}
+
+    def test_explicit_versioned_empty_registry_is_drained(self):
+        b.require_drained_publishers(self.metadata({}))
+
+    def test_missing_unknown_malformed_and_duplicate_registry_fail_closed(self):
+        for metadata in ({}, {"publisherregistryversion": "2", "publishers": "{}"},
+                         {"publisherregistryversion": "1", "publishers": "["},
+                         {"publisherregistryversion": "1", "publishers": '{"x":{},"x":{}}'},
+                         self.metadata([])):
+            with self.assertRaises(b.Failure):
+                b.require_drained_publishers(metadata)
+
+    def test_active_and_uncertain_never_expire_or_count_as_drained(self):
+        for state in ("active", "uncertain"):
+            metadata = self.metadata({str(uuid.uuid4()): {
+                "generation": str(uuid.uuid4()), "state": state,
+            }})
+            with self.assertRaisesRegex(b.Failure, "block destructive"):
+                b.require_drained_publishers(metadata)
+
+    def test_bounded_slots_and_bytes_fail_closed(self):
+        entries = {str(uuid.uuid4()): {"generation": str(uuid.uuid4()), "state": "active"}
+                   for _ in range(17)}
+        with self.assertRaises(b.Failure):
+            b.publisher_registry(self.metadata(entries))
+        with self.assertRaises(b.Failure):
+            b.publisher_registry({"publisherregistryversion": "1", "publishers": " " * 4097})
+
+    def test_unknown_state_extra_fields_and_invalid_ids_fail_closed(self):
+        for key, entry in (
+            ("invalid", {"generation": str(uuid.uuid4()), "state": "active"}),
+            (str(uuid.uuid4()), {"generation": "bad", "state": "active"}),
+            (str(uuid.uuid4()), {"generation": str(uuid.uuid4()), "state": "expired"}),
+            (str(uuid.uuid4()), {"generation": str(uuid.uuid4()), "state": "active", "ttl": 1}),
+        ):
+            with self.assertRaises(b.Failure):
+                b.publisher_registry(self.metadata({key: entry}))
 
 
 if __name__ == "__main__":
