@@ -46,24 +46,23 @@ class PublisherControl:
         self.azure = azure
 
     def read(self):
-        _, headers = self.azure.blob(
-            "HEAD", self.azure.c.checkpoints, query={"restype": "container"},
-        )
-        metadata = {key[10:]: value for key, value in headers.items()
-                    if key.startswith("x-ms-meta-")}
+        metadata, etag = self.azure.head_control()
         if metadata.get("sandboxid") != self.azure.c.sandbox:
             raise Failure("Publisher authority sandbox ownership mismatch.")
         if metadata.get("resetstate") not in STATES:
             raise Failure("Publisher authority requires a known versioned v1 state.")
         canonical_uuid(metadata.get("resetgeneration"))
+        # v1 requires explicit occupancy; absence never means released.
+        if metadata.get("occupancy") not in ("released", "testing", "stopping"):
+            raise Failure("Publisher authority requires explicit occupancy released/testing/stopping.")
+        if metadata["occupancy"] != "released":
+            canonical_uuid(metadata.get("occupancyid"))
         registry = publisher_registry(metadata)
         if any(entry["generation"] != metadata["resetgeneration"]
                for entry in registry.values()):
             raise Failure("Publisher registry contains a different authority generation.")
-        if not headers.get("etag"):
-            raise Failure("Publisher authority ETag is missing.")
         encode_registry(metadata, registry)
-        return metadata, registry, headers["etag"]
+        return metadata, registry, etag
 
     def cas(self, metadata, registry, etag):
         metadata = encode_registry(metadata, registry)

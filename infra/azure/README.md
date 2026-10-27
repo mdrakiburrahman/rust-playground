@@ -117,10 +117,12 @@ clients reject the new literals. Registry headers are
 `publisherregistryversion=1` and compact JSON `publishers`, a map of canonical
 publisher UUIDs to `{generation: <canonical UUID>, state: active|uncertain}`.
 Capacity is 16 members and 4096 UTF-8 bytes for the registry, also enforcing the
-8192-byte total metadata header budget.
+8192-byte total metadata header budget. `occupancy` is required explicitly as
+`released`, `testing` or `stopping`; `testing`/`stopping` also require a
+canonical `occupancyid`. Absence never means released under v1.
 
-Every transition reads and validates ownership, generation, registry, state and
-ETag, then performs one `If-Match` update preserving unrelated metadata.
+Every transition reads and validates ownership, generation, registry and state,
+then performs one lease-guarded compare-and-set preserving unrelated metadata.
 Normal admission requires `ready-v1`; admission failure or an unknown response
 never grants mutation permission or silently adopts a previous registration.
 Fencing preserves the generation and member set so existing members can clean
@@ -148,6 +150,28 @@ An uncertain member or operator cannot release even if logical transactions
 reconcile. Unknown CAS responses return `UnknownTransition`; retain the
 identity and reconcile authority read-only rather than claim success or adopt a
 possibly applied registration.
+
+#### Lease-guarded metadata compare-and-set
+
+Set Container Metadata accepts only `If-Modified-Since` as a condition, so an
+`If-Match` ETag is not a compare-and-set. Every protocol writer, Python and
+Rust, uses this exact sequence instead:
+
+1. Acquire a ``-second container lease with a fresh proposed lease
+   ID. `409` or an ambiguous acquire is busy and writes nothing.
+2. Read authority metadata under the lease and compare its content with the
+   caller's earlier read. A mismatch releases and writes nothing.
+3. Write ALL metadata with `x-ms-lease-id`. Success is applied; `412` is
+   definitely not applied; any other failure is an unknown outcome.
+4. Release the lease best-effort; expiry bounds an unreleased lease.
+
+A container lease does not reject metadata writes that omit a lease ID, so the
+proof covers only cooperating writers. All Python lifecycle writes (provision
+fence, occupancy, stop and publisher transitions) use this path. Existing
+checkpoint containers are never rewritten by Bicep, and arbitrary older tools
+remain outside the proof and must be stopped. The lease serializes only the
+short read-modify-write; it never expires or releases publisher membership.
+
 These are usable control-plane helpers and deterministic race/unknown-response
 tests, not activation of all Rust mutation surfaces. Existing checkpoint
 containers are excluded from Bicep metadata writes on redeployment. The public
@@ -164,10 +188,16 @@ python3 infra/azure/bootstrap.py occupy --occupancy-id "$RUN_UUID"
 python3 infra/azure/bootstrap.py release --occupancy-id "$RUN_UUID"
 ```
 
-Only the exact UUID owner can release. Provision/reset/stop reject active
-occupancy. Lifecycle authority is metadata on the preserved checkpoint
+Only the exact UUID owner can release a `testing` occupancy. Provision and
+reset reject any non-released occupancy. `stop --execute` first moves
+`released` to `stopping` with a fresh hold UUID in one lease-guarded
+compare-and-set, before any ARM call. A competing `occupy` either wins first,
+so stop fails without calling ARM, or is rejected while the hold exists. The
+hold is released only after the cluster is observed `Stopped`; an unknown
+compare-and-set or ARM outcome leaves it held, and rerunning `stop --execute`
+resumes the same hold. Lifecycle authority is metadata on the preserved checkpoint
 container, not a blob: `sandboxid`, `resetstate`, `resetgeneration`, `occupancy`,
-and `occupancyid`. Updates use `If-Match` ETags. Writers fail closed unless
+and `occupancyid`. Updates use the lease-guarded compare-and-set above. Writers fail closed unless
 ownership matches and `resetstate=ready`, checking before open, upload and each
 commit attempt. A restarted writer must not bypass a fenced sandbox.
 
