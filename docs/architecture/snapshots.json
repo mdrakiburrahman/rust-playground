@@ -16,8 +16,8 @@
       "png": "docs/architecture/loadtest/arrow-load-generator.png",
       "title": "Arrow load generator | One batch. Two collector paths.",
       "viewportWidth": 1360,
-      "sourceSha256": "096d784773fb0e252e9518d3dc25fc8dff6d80c60bcfe5eabc3e41bae5194a99",
-      "pngSha256": "204701987f8eb73b48e3d55d907b7251259863e47b24a6f85f0fd6a4e609ac0c"
+      "sourceSha256": "db8753a133ac6bc7152d2ca0b8275c5b6fdbb343427dcf38448591eefcca6000",
+      "pngSha256": "e9b8d2281c6d49ccc3f481f50b331cc924564ab5caca1dcac809a10814f624fa"
     },
     {
       "source": "docs/architecture/arrowcol-platform/diagrams/platform.html",

@@ -56,7 +56,7 @@
   <div class="canvas" tabindex="0" role="region" aria-label="Load generator architecture diagram; scroll horizontally on small screens">
     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 710" role="img" aria-labelledby="diagram-title diagram-description">
       <title id="diagram-title">Arrow load generator architecture</title>
-      <desc id="diagram-description">Flight SQL registers thirteen schemas through SQL Server and Apache Hive. The SDK generator exports immutable descriptors and generated Rust and TypeScript SDKs. Arrowcol loadgen creates record batches and sends the same logical batches through arrowcol-router-rust to three arrowcol-rust replicas and three arrowcol-dataflow-rust replicas. Arrowcol-rust receipts are polled until Delta Lake publication, while arrowcol-dataflow-rust reports best-effort admission. Independent Delta Lake roots are compared by a validator, and platform metrics flow to LGTM.</desc>
+      <desc id="diagram-description">Flight SQL registers thirteen multi-customer schemas through SQL Server and Apache Hive. Immutable descriptors generate Rust and TypeScript SDKs. The generator sends the same logical batches through the router to independent Direct and Dataflow pools. Direct receipts are polled until Delta publication; Dataflow reports best-effort admission or durable admission with optional Quiver. Independent sorted, ingestion-time-partitioned Delta roots are compared by a validator, and platform signals flow to LGTM. Pool icons are schematic; runtime configuration determines the replica count.</desc>
       <defs>
         <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse">
           <circle cx="1" cy="1" r=".7" fill="#23354c"/>
@@ -181,38 +181,26 @@
       <text x="785" y="240" class="label">arrowcol-rust</text>
       <text x="785" y="264" class="small">SQL receipts + bounded Arrow buffers</text>
       <g fill="#1a2e40" stroke="#628b82">
-        <rect x="672" y="286" width="68" height="72" rx="11"/>
-        <rect x="751" y="286" width="68" height="72" rx="11"/>
-        <rect x="830" y="286" width="68" height="72" rx="11"/>
+        <rect x="735" y="282" width="100" height="80" rx="11"/>
       </g>
       <g fill="none" stroke="#80e2b6" stroke-width="2">
-        <use href="#collector-icon" x="684" y="297" width="44" height="44"/>
-        <use href="#collector-icon" x="763" y="297" width="44" height="44"/>
-        <use href="#collector-icon" x="842" y="297" width="44" height="44"/>
+        <use href="#collector-icon" x="755" y="292" width="60" height="60"/>
       </g>
-      <text x="706" y="382" class="tiny">replica 1</text>
-      <text x="785" y="382" class="tiny">replica 2</text>
-      <text x="864" y="382" class="tiny">replica 3</text>
+      <text x="785" y="388" class="small">Direct collector pool</text>
 
       <!-- arrowcol-dataflow-rust. -->
       <path d="M570 440H606V553H650" fill="none" stroke="#f3bd75" stroke-width="3" marker-end="url(#orange)"/>
       <text x="606" y="500" class="flow" fill="#f3bd75">DoPut</text>
       <rect x="650" y="470" width="270" height="205" rx="18" fill="#3a3025" stroke="#f3bd75" stroke-width="2"/>
       <text x="785" y="500" class="label" style="font-size:18px">arrowcol-dataflow-rust</text>
-      <text x="785" y="524" class="small">bounded DFE channels + best-effort admission</text>
+      <text x="785" y="524" class="small">bounded channel + optional Quiver</text>
       <g fill="#1a2e40" stroke="#8c714a">
-        <rect x="672" y="548" width="68" height="72" rx="11"/>
-        <rect x="751" y="548" width="68" height="72" rx="11"/>
-        <rect x="830" y="548" width="68" height="72" rx="11"/>
+        <rect x="735" y="544" width="100" height="80" rx="11"/>
       </g>
       <g fill="none" stroke="#f3bd75" stroke-width="2">
-        <use href="#collector-icon" x="684" y="559" width="44" height="44"/>
-        <use href="#collector-icon" x="763" y="559" width="44" height="44"/>
-        <use href="#collector-icon" x="842" y="559" width="44" height="44"/>
+        <use href="#collector-icon" x="755" y="554" width="60" height="60"/>
       </g>
-      <text x="706" y="644" class="tiny">replica 1</text>
-      <text x="785" y="644" class="tiny">replica 2</text>
-      <text x="864" y="644" class="tiny">replica 3</text>
+      <text x="785" y="650" class="small">Dataflow collector pool</text>
 
       <!-- Delta roots and validator. -->
       <path d="M920 312H980" stroke="#80e2b6" stroke-width="3" marker-end="url(#green)"/>
@@ -247,10 +235,10 @@
 
   <div class="note">
     <strong>Paired mode sends the same logical batch to <code>arrowcol-rust</code> and <code>arrowcol-dataflow-rust</code>.</strong>
-    <span class="warning"><code>arrowcol-rust</code> waits for <code>published</code>; <code>arrowcol-dataflow-rust</code> records <code>best_effort_admission</code>.</span>
+    <span class="warning">Direct polls <code>published</code>; Dataflow reports best-effort admission, or durable admission with Quiver.</span>
   </div>
   <footer>
-    <span>Source: <code>projects/loadtest</code> &middot; production load qualification &middot; October 12, 2026</span>
+    <span>Source: <code>projects/loadtest</code> &middot; <a href="../../../loadtest-architecture.html">maintenance, tenant forks, Kusto, and mode boundaries</a></span>
     <span>
       <a href="README.md">Runbook</a>
       &middot; <a href="../../../projects/loadtest/README.md">Loadtest guide</a>

@@ -68,7 +68,7 @@ generated clients
       v
 Pingora router -- one fenced owner per implementation pool and table
       |                                      |
-      +--> 3 direct collectors               +--> 3 DFE collectors
+      +--> Direct collector pool             +--> DFE collector pool
       |      SQL receipts                         best-effort admission
       |      bounded Arrow buffers                bounded DFE channels
       |                                      |
@@ -124,21 +124,22 @@ npx --no-install nx run arrowcol-infra:down
 # Verify deterministic catalog artifact and Rust/TypeScript SDK generation.
 npx --no-install nx run arrowcol-sdk-gen:verify
 
-# Run OTEL acceptance, then the finite Arrow platform and chaos qualification.
+# Run finite paired Arrow and Quiver crash/recovery qualification.
 npx --no-install nx run loadtest:e2e
 ```
 
 The Arrow phase registers
 [`projects/loadtest/schemas/sqlserver.sql`](projects/loadtest/schemas/sqlserver.sql)
 through Flight SQL, exports the immutable catalog artifacts, generates and
-checks both SDK packages, starts the router with three direct and three DFE
-collectors, and validates both Delta roots. It also exercises schema rejection,
-duplicate direct deliveries, lease expiry, owner restart, stale fencing,
-graceful drain, and SQL interruption/recovery.
+checks both SDK packages, starts the router and both collector pools, and
+validates both Delta roots. The second E2E phase enables Quiver and kills and
+restarts both collectors during traffic to exercise durable replay.
 
-Finite runs stop their scoped Compose stack and retain diagnostics beneath
-`onelake/e2e/` and `onelake/benchmark/<run-id>/results/`. The run prints its
-exact output directory. Focused collector live E2Es retain their own evidence
+The current runner retains output beneath `onelake/benchmark/latest/` and prints
+its exact output directory. A fresh local start replaces the previous scoped
+loadtest and its data; copy required evidence before another run. Follow the
+[loadtest lifecycle guide](projects/loadtest/README.md) to stop retained services
+before deleting output. Focused collector live E2Es retain their own evidence
 under `projects/arrowcol-rust/.diagnostics/<run-id>/` and
 `projects/arrowcol-dataflow-rust/.diagnostics/<run-id>/`.
 
@@ -146,20 +147,14 @@ under `projects/arrowcol-rust/.diagnostics/<run-id>/` and
 
 ```bash
 npx --no-install nx run loadtest:run -- \
-  --run-id live --warmup 2m --continuous --keep-stack
+  --warmup 2m --concurrency 8 --batch-rows 1024
 ```
 
-The retained stack exposes Grafana at `http://127.0.0.1:3000` and Prometheus
-at `http://127.0.0.1:9090`. Grafana provisions separate **Arrow Flight** and
-**OTEL Collector Baseline** folders; the OTEL dashboard is intentionally
-separate and has data only when `--otel-baseline` is requested.
-
-Stop and remove the retained stack before deleting its output:
-
-```bash
-npx --no-install tsx projects/loadtest/src/main.ts benchmark-down --run-id live
-npx --no-install nx run loadtest:clean
-```
+Omitting `--measure` runs generation until interrupted. The retained local stack
+exposes Grafana at `http://127.0.0.1:3000` and Prometheus at
+`http://127.0.0.1:9090`. Arrow Flight and optional OTEL baseline signals remain
+separate. Use the canonical loadtest guide for current lifecycle and mode
+options rather than the removed `benchmark-down`/`--run-id` interface.
 
 See the [loadtest guide](projects/loadtest/README.md) for diagnostics and the
 [load generator diagram and runbook](docs/architecture/loadtest/README.md) for
