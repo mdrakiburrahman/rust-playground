@@ -8,6 +8,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Run(arguments) => runner::run(*arguments).await,
         Command::Validate(arguments) => validation::validate(arguments).await,
+        Command::Drain(arguments) => validation::drain(arguments).await,
         Command::InitializeAzure(arguments) => arrowcol_loadgen::initialize::initialize(arguments).await,
         Command::AzureManifest(arguments) => arrowcol_loadgen::initialize::write_manifest(arguments).await,
         Command::PrintSchemas => {

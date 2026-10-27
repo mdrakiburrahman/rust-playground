@@ -6,7 +6,8 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { chromium, type Browser, type Page } from 'playwright';
 
 import { safeKustoError } from './kusto.js';
-import { metricRangeEvidence } from './metrics-gate.js';
+import { metricRangeEvidence, panelFrameEvidence } from './metrics-gate.js';
+import { requiredMetrics } from './metric-contract.js';
 
 export const kustoExplorerStartArguments = [
   '--profile', 'benchmark', 'up', '--detach', '--no-build', '--no-deps', '--wait', '--wait-timeout', '120', 'kusto-explorer',
@@ -40,6 +41,8 @@ export interface UiGateOptions {
   browserEndpoint: string;
   compose: (args: string[], timeout?: number) => string;
   log: (message: string) => void;
+  metricScope?: 'source-sdk' | 'service-qualification';
+  bridgeEnabled?: boolean;
 }
 
 export interface UiGateResult {
@@ -305,7 +308,12 @@ export async function runUiGate(options: UiGateOptions): Promise<UiGateResult> {
 /** Checks actual Grafana datasource samples and rendered plots on the same dashboard. */
 export async function runGrafanaGate(options: UiGateOptions): Promise<void> {
   const started = Date.now();
-  const evidence: Record<string, unknown> = { passed: false, started_at: new Date(started).toISOString(), metrics: {} };
+  const scope = options.metricScope ?? 'source-sdk';
+  const end = Math.floor(started / 1000);
+  const start = end - 300;
+  const evidence: Record<string, unknown> = {
+    passed: false, scope, started_at: new Date(started).toISOString(), start, end, metrics: {}, panels: [],
+  };
   let browser: Browser | undefined;
   try {
     browser = await startBrowser(options);
@@ -319,24 +327,59 @@ export async function runGrafanaGate(options: UiGateOptions): Promise<void> {
       await page.getByRole('button', { name: /log in|sign in/iu }).click();
     }
     await page.getByText('Delta SDK and service operation counters', { exact: true }).waitFor({ timeout: 60_000 });
-    const queries = {
-      delta: 'sum({__name__=~".*delta.*_total|.*delta.*_count"})',
-      collector_scrapes: 'count(up{job=~"direct|dataflow"} == 1) == bool 2',
-    };
-    for (const [family, query] of Object.entries(queries)) {
-      const end = Math.floor(Date.now() / 1000);
-      const result = await page.evaluate(async ({ query, end }) => {
-        const parameters = new URLSearchParams({ query, start: String(end - 300), end: String(end), step: '2' });
+    const queryRange = async (query: string): Promise<unknown> =>
+      page.evaluate(async ({ query, start, end }) => {
+        const parameters = new URLSearchParams({ query, start: String(start), end: String(end), step: '2' });
         const response = await fetch(`/api/datasources/proxy/uid/prometheus/api/v1/query_range?${parameters}`);
         if (!response.ok) throw new Error(`Grafana datasource HTTP ${response.status}`);
         return response.json() as Promise<unknown>;
-      }, { query, end });
-      (evidence.metrics as Record<string, unknown>)[family] = { query, ...metricRangeEvidence(result) };
+      }, { query, start, end });
+    for (const metric of requiredMetrics(scope, options.bridgeEnabled ?? false)) {
+      const result = await queryRange(metric.query);
+      const measurement: Record<string, unknown> = { query: metric.query, allow_zero: metric.allowZero };
+      (evidence.metrics as Record<string, unknown>)[metric.name] = measurement;
+      try {
+        Object.assign(measurement, metricRangeEvidence(result, 3, metric.allowZero));
+      } catch (error) {
+        throw new Error(`Missing or invalid required live metric ${metric.name}`, { cause: error });
+      }
     }
-    await page.waitForFunction(() => [...document.querySelectorAll('canvas')].some(canvas => canvas.width > 100 && canvas.height > 100),
-      null, { timeout: 30_000 });
-    await page.getByText(/delta_(kernel|publication)_events(?:_total)?/u).first()
-      .waitFor({ state: 'visible', timeout: 30_000 });
+    const dashboard = JSON.parse(readFileSync(path.join(options.workspace, 'projects/loadtest/observability/delta-operations.json'), 'utf8')) as {
+      panels: Array<{ id: number; title: string; type: string; datasource: { uid: string }; targets: Array<{ expr: string }> }>;
+    };
+    const panelIds = scope === 'source-sdk' ? [1, 2, 6] : [1, 2, 3, 4, 5, 6, 7, 8];
+    for (const id of panelIds) {
+      const panel = dashboard.panels.find(panel => panel.id === id);
+      if (!panel || panel.type !== 'timeseries' || panel.datasource?.uid !== 'prometheus' || !panel.targets.length) {
+        throw new Error(`Missing required Grafana operation panel ${id} with the qualified datasource`);
+      }
+      const samples = [];
+      for (const target of panel.targets) {
+        if (typeof target.expr !== 'string' || !target.expr) throw new Error(`Missing panel ${id} datasource query`);
+        samples.push({ query: target.expr, ...metricRangeEvidence(await queryRange(target.expr), 3, true) });
+      }
+      const [response] = await Promise.all([
+        page.waitForResponse(response => {
+          if (!response.url().includes('/api/ds/query') || response.request().method() !== 'POST') return false;
+          const request: unknown = response.request().postDataJSON();
+          return Boolean(request && typeof request === 'object' && 'queries' in request && Array.isArray(request.queries) &&
+            request.queries.some((query: unknown) => query && typeof query === 'object' && 'expr' in query &&
+              panel.targets.some(target => target.expr === query.expr)));
+        }, { timeout: 30_000 }),
+        page.goto(`http://lgtm:3000/d-solo/arrowcol-delta-operations?from=${start * 1000}&to=${end * 1000}&panelId=${id}`,
+          { timeout: 60_000 }),
+      ]);
+      if (!response.ok()) throw new Error(`Grafana panel ${id} datasource HTTP ${response.status()}`);
+      const delivered = panelFrameEvidence(await response.json());
+      await page.getByText(panel.title, { exact: true }).waitFor({ state: 'visible', timeout: 30_000 });
+      await page.waitForFunction(() => [...document.querySelectorAll('canvas')].some(canvas => canvas.width > 100 && canvas.height > 100),
+        null, { timeout: 30_000 });
+      if (await page.getByText('No data', { exact: true }).isVisible()) throw new Error(`Grafana panel ${id} rendered no data`);
+      const screenshot = `grafana-delta-panel-${id}.png`;
+      await page.screenshot({ path: path.join(options.results, screenshot), fullPage: true });
+      (evidence.panels as unknown[]).push({ id, title: panel.title, samples, delivered, screenshot });
+    }
+    await page.goto(`http://lgtm:3000/d/arrowcol-delta-operations?from=${start * 1000}&to=${end * 1000}`, { timeout: 60_000 });
     await page.screenshot({ path: path.join(options.results, 'grafana-delta-operations.png'), fullPage: true });
     evidence.screenshot = 'grafana-delta-operations.png';
     evidence.passed = true;
