@@ -294,6 +294,25 @@ pub enum CasOutcome {
     Unknown(String),
 }
 
+/// Test-only replacements for the Azure control container and blob endpoint
+/// used by `DeltaTable::initialize_url_for_bootstrap_with_control`. Exists only
+/// with the non-default `test-control` feature; production bootstrap always
+/// derives these from the URL, Azure CLI credential and subscription.
+#[cfg(feature = "test-control")]
+#[derive(Debug)]
+pub struct TestBootstrapControl {
+    /// Serialized sandbox metadata (stands in for container metadata).
+    pub metadata: Arc<dyn ControlMetadata>,
+    /// Sandbox id the metadata must carry.
+    pub sandbox_id: String,
+    /// Storage account the table URL must name.
+    pub account: String,
+    /// Operator-captured expected reset generation.
+    pub expected_generation: String,
+    /// Inner data transport; always wrapped by the session guard.
+    pub data: Arc<dyn ObjectStore>,
+}
+
 /// Serialized container-metadata transaction backend.
 #[async_trait]
 pub trait ControlMetadata: Send + Sync + fmt::Debug {
@@ -896,6 +915,28 @@ impl PublisherSession {
     /// registry and occupancy exactly `released`.
     pub async fn open_bootstrap_async(url: &Url, expected_generation: &str) -> Result<Arc<Self>> {
         Self::open_url(url, SessionMode::Bootstrap, Some(expected_generation)).await
+    }
+
+    /// Test-only synchronous bootstrap registration through injected control
+    /// metadata; see [`TestBootstrapControl`].
+    ///
+    /// # Errors
+    /// See [`Self::open_bootstrap_async`].
+    #[cfg(feature = "test-control")]
+    pub fn open_bootstrap_with_control(
+        control: Arc<dyn ControlMetadata>,
+        sandbox_id: &str,
+        account: &str,
+        expected_generation: &str,
+    ) -> Result<Arc<Self>> {
+        let (sandbox_id, account, expected) = (
+            sandbox_id.to_owned(),
+            account.to_owned(),
+            expected_generation.to_owned(),
+        );
+        block_on_shared(async move {
+            Self::open_with_control(control, &sandbox_id, &account, SessionMode::Bootstrap, Some(&expected)).await
+        })
     }
 
     async fn open_url(url: &Url, mode: SessionMode, expected_generation: Option<&str>) -> Result<Arc<Self>> {
