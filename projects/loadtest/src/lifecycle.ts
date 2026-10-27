@@ -239,6 +239,22 @@ function resources(docker: Docker, kind: 'container' | 'network' | 'volume'): Re
   });
 }
 
+/** Stops only verified resources owned by this workspace, retaining data for inspection. */
+export async function stopBenchmark(workspace: string, docker: Docker): Promise<void> {
+  const directories = benchmarkDirectories(workspace);
+  const projects = new Set([BENCHMARK_PROJECT, ...directories.map(directory => `rust-playground-loadtest-${path.basename(directory)}`)]);
+  const containers = resources(docker, 'container').filter(resource => {
+    if (!projects.has(resource.labels['com.docker.compose.project'])) return false;
+    if (!resource.labels['com.docker.compose.project.config_files']?.split(',')
+      .includes(path.join(workspace, 'projects/loadtest/compose.yaml'))) {
+      throw new Error('Refusing to stop a Docker project owned by another workspace');
+    }
+    return true;
+  });
+  await stopBenchmarkProcesses(workspace, directories);
+  if (containers.length) docker(['stop', '--time', '30', ...containers.map(container => container.id)]);
+}
+
 export async function resetBenchmark(workspace: string, docker: Docker): Promise<string> {
   const directories = benchmarkDirectories(workspace);
   const scratchDirectories = [...new Set(['latest', ...directories.map(directory => path.basename(directory))])]
@@ -256,9 +272,9 @@ export async function resetBenchmark(workspace: string, docker: Docker): Promise
   const volumes = resources(docker, 'volume').filter(resource => {
     const project = resource.labels['com.docker.compose.project'];
     const volume = resource.labels['com.docker.compose.volume'];
-    if (!projects.has(project) || !['sqlserver-data', 'hive-warehouse', 'kusto-data'].includes(volume)
+    if (!projects.has(project) || !['sqlserver-data', 'hive-warehouse', 'kusto-data', 'kusto-bridge-state'].includes(volume)
         || resource.name !== `${project}_${volume}`) return false;
-    if (volume === 'kusto-data' && resource.labels['io.arrowcol.loadtest.workspace'] !== workspace) {
+    if (['kusto-data', 'kusto-bridge-state'].includes(volume) && resource.labels['io.arrowcol.loadtest.workspace'] !== workspace) {
       throw new Error('Refusing to reset Kusto storage owned by another or unverifiable workspace');
     }
     return true;
