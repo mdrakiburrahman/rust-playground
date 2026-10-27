@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Functional native Delta/QAP check against the pinned local Kusto emulator.
 #
-# usage: kusto-qap-it.sh all|start|init|mutate|vacuum|check [expose]|stop
+# usage: kusto-qap-it.sh all|schemas|start|init|mutate|vacuum|schemas-write|check [expose]|stop
 #   all     start, init, check expose, mutate, check, vacuum, check, stop
+#   schemas start, all 13 canonical sqlserver.sql tables with boundary values, check expose, stop
 #   init    two partitioned Delta tables, two appends each
 #   mutate  dataChange=true partition PURGE + append (sessions); row delete + dataChange=false
 #           OPTIMIZE (availability groups)
@@ -26,8 +27,10 @@ SELF=$(hostname)
 
 write() {
   docker run --rm -v "$IT/direct:/d" -v "$REPO/projects/loadtest/loadgen/scripts/kusto_qap_fixture.py:/w.py:ro" \
+    -v "$REPO/projects/loadtest/schemas/sqlserver.sql:/sqlserver.sql:ro" \
     -v kusto-qap-it-pip:/root/.cache/pip "$WRITER" \
-    sh -c "pip install -q --disable-pip-version-check --root-user-action=ignore $PACKAGES >/dev/null && python /w.py /d $1"
+    sh -c "pip install -q --disable-pip-version-check --root-user-action=ignore $PACKAGES >/dev/null && python /w.py /d $1 /sqlserver.sql" ||
+    return 1
   docker run --rm -v "$IT:/t" alpine chmod -R a+rwX /t
 }
 
@@ -67,12 +70,17 @@ all)
   write mutate && check
   write vacuum && check
   ;;
+schemas)
+  trap stop EXIT
+  start
+  write schemas && check expose
+  ;;
 start) start ;;
-init | mutate | vacuum) write "$1" ;;
+init | mutate | vacuum | schemas-write) write "${1%-write}" ;;
 check) check "${2:-}" ;;
 stop) stop ;;
 *)
-sed -n '2,15p' "$0"
+sed -n '2,16p' "$0"
   exit 2
   ;;
 esac
