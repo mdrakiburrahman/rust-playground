@@ -107,7 +107,7 @@ fn adds_in(root: &Path, version: u64) -> Result<usize> {
 
 /// Scenario: a publication is committed, then the same identity arrives again as a new
 /// delivery with its own freshly staged file.
-/// Guarantees: the replay returns the original version, its never-submitted stage is
+/// Guarantees: the replay returns the observed snapshot version, its never-submitted stage is
 /// deleted, and only the published file remains on disk.
 #[test]
 fn new_delivery_replay_reclaims_unsubmitted_stage() -> Result<()> {
@@ -133,6 +133,33 @@ fn new_delivery_replay_reclaims_unsubmitted_stage() -> Result<()> {
     assert_eq!(parquet_files(root.path())?, 1);
     assert_eq!(table.version()?, 1);
     assert!(publication_events("orphan_reclaimed")? >= 1);
+    Ok(())
+}
+
+/// Scenario: a publication is committed, another publication commits after it, then the
+/// first identity is replayed as a new delivery.
+/// Guarantees: the replay reports the reconciled snapshot version (not the original commit
+/// version), creates no commit, and reclaims its stage.
+#[test]
+fn replay_reports_observed_snapshot_version_not_original_commit() -> Result<()> {
+    metrics();
+    let root = tempfile::tempdir()?;
+    let table = DeltaTable::open(root.path())?;
+    let deliver = |app_id: &str, id: i32| {
+        runtime()?.block_on(async {
+            let input = batch(id)?;
+            let mut file = table.new_file(input.schema())?.with_transaction(app_id.into(), 0)?;
+            file.write(&input).await?;
+            file.finish().await
+        })
+    };
+    let first = deliver("first", 1)?;
+    let second = deliver("second", 2)?;
+    let replay = deliver("first", 1)?;
+    assert_eq!((first.version, second.version, replay.version), (1, 2, 2));
+    assert_eq!(table.version()?, 2);
+    assert!(!replay.file.path.exists());
+    assert_eq!(parquet_files(root.path())?, 2);
     Ok(())
 }
 
