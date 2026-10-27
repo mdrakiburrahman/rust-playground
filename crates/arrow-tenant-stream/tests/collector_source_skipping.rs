@@ -716,3 +716,507 @@ async fn actual_service_forks_frozen_collector_sources_and_restarts_idle_in_both
     }
     Ok(())
 }
+
+fn copy_disposable_tree(source: &std::path::Path, target: &std::path::Path) -> Result<()> {
+    std::fs::create_dir(target)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        ensure!(!kind.is_symlink(), "disposable fixture copy cannot follow symlinks");
+        if kind.is_dir() {
+            copy_disposable_tree(&entry.path(), &target.join(entry.file_name()))?;
+        } else {
+            ensure!(kind.is_file(), "fixture contains a non-file");
+            std::fs::copy(entry.path(), target.join(entry.file_name()))?;
+        }
+    }
+    Ok(())
+}
+
+fn local_source(root: &std::path::Path) -> Result<DeltaSource> {
+    DeltaSource::open(url::Url::from_directory_path(root).map_err(|()| anyhow::anyhow!("local source URL"))?)
+}
+
+fn fixtures() -> Result<Vec<Fixture>> {
+    let path = std::env::var_os("ARROWCOL_SOURCE_READ_FIXTURE").context("private fixture manifest required")?;
+    Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+}
+
+fn replace_partition(batch: &RecordBatch, partition: &str) -> Result<RecordBatch> {
+    let mut columns = batch.columns().to_vec();
+    columns[batch.schema().index_of("__arrowcol_ingestion")?] =
+        Arc::new(StringArray::from(vec![partition; batch.num_rows()]));
+    Ok(RecordBatch::try_new(batch.schema(), columns)?)
+}
+
+async fn template_batch(fixture: &Fixture) -> Result<RecordBatch> {
+    let source = local_source(&fixture.root)?;
+    let mut one = fixture.frozen.clone();
+    one.files.truncate(1);
+    let batches = full_logical_scan(&source, &one).await?;
+    let batch = concat_batches(&one.schema()?, &batches)?;
+    ensure!(
+        batch.num_rows() == 1_024,
+        "append must retain the actual 1024-row collector batch"
+    );
+    Ok(batch)
+}
+
+#[tokio::test]
+#[ignore = "owned child entrypoint for the disposable-source lifecycle test"]
+async fn lifecycle_source_append_child() -> Result<()> {
+    use arrow_deltalake::normalize::CanonicalSchema;
+    let input: serde_json::Value = serde_json::from_str(&std::env::var("ARROWCOL_LIFECYCLE_APPEND")?)?;
+    let fixture = fixtures()?
+        .into_iter()
+        .find(|fixture| input["pool"] == fixture.pool)
+        .context("append pool")?;
+    let root = PathBuf::from(input["root"].as_str().context("disposable root")?);
+    ensure!(
+        root.join(arrow_deltalake::maintenance::DISPOSABLE_TEST_MARKER)
+            .is_file(),
+        "append may mutate only the marked disposable copy"
+    );
+    let partition = input["partition"].as_str().context("append partition")?;
+    let app = input["app"].as_str().context("append publication")?;
+    let data = replace_partition(&template_batch(&fixture).await?, partition)?;
+    let canonical = CanonicalSchema::try_new(data.schema())?;
+    let table = arrow_deltalake::delta::DeltaTable::open_url_canonical(
+        local_source(&root)?.url,
+        &canonical,
+        fixture.frozen.partition_columns()?,
+    )?;
+    let properties = LayoutPolicy {
+        row_group_rows: 512,
+        page_rows: 128,
+        ..LayoutPolicy::default()
+    }
+    .writer_properties(&data.schema())?;
+    let mut writer = table
+        .new_canonical_file_partitioned_with_properties(
+            &canonical,
+            BTreeMap::from([("__arrowcol_ingestion".into(), Some(partition.into()))]),
+            properties,
+        )?
+        .with_transaction(app.into(), 0)?
+        .with_ingestion_time(input["stamp"].as_i64().context("admission stamp")?)?;
+    writer.write(&data).await?;
+    writer.finish().await?;
+    ensure!(
+        table.lookup_txn(app)? == Some(0),
+        "source append publication transaction"
+    );
+    Ok(())
+}
+
+fn append_owned(root: &std::path::Path, pool: &str, partition: &str, stamp: i64, app: &str) -> Result<()> {
+    use std::process::{Command, Stdio};
+    let log = tempfile::NamedTempFile::new()?;
+    let mut process = Process {
+        child: Command::new(std::env::current_exe()?)
+            .args(["--exact", "lifecycle_source_append_child", "--ignored", "--nocapture"])
+            .env(
+                "ARROWCOL_LIFECYCLE_APPEND",
+                serde_json::to_string(&json!({
+                    "root":root,"pool":pool,"partition":partition,"stamp":stamp,"app":app,
+                }))?,
+            )
+            .stdout(Stdio::from(log.as_file().try_clone()?))
+            .stderr(Stdio::from(log.as_file().try_clone()?))
+            .spawn()?,
+        reaped: false,
+    };
+    let status = process.finish(std::time::Duration::from_secs(120))?;
+    ensure!(
+        status.success(),
+        "owned append child failed: {}",
+        std::fs::read_to_string(log.path())?
+    );
+    Ok(())
+}
+
+fn metric(endpoint: &str, name: &str) -> Result<u64> {
+    use std::io::{Read, Write};
+    let mut socket = std::net::TcpStream::connect_timeout(&endpoint.parse()?, std::time::Duration::from_secs(2))?;
+    socket.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+    socket.set_write_timeout(Some(std::time::Duration::from_secs(2)))?;
+    socket.write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")?;
+    let mut response = String::new();
+    socket.read_to_string(&mut response)?;
+    ensure!(response.starts_with("HTTP/1.1 200 OK"), "metrics status");
+    Ok(response
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{name} ")))
+        .context("required service metric")?
+        .parse()?)
+}
+
+fn wait_processed(process: &mut Process, endpoint: &str, version: u64) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        ensure!(
+            process.child.try_wait()?.is_none(),
+            "live service stopped before phase completed"
+        );
+        if metric(endpoint, "tenant_stream_bootstrap_files_remaining")? == 0
+            && metric(endpoint, "tenant_stream_processed_version")? >= version
+            && metric(endpoint, "tenant_stream_noop_polls_total")? > 0
+        {
+            return Ok(());
+        }
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "service phase exceeded predeclared 120 seconds"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+fn start_live(
+    source: &std::path::Path,
+    target: &std::path::Path,
+    checkpoint: &std::path::Path,
+) -> Result<(Process, tempfile::NamedTempFile, String)> {
+    use std::process::{Command, Stdio};
+    let log = tempfile::NamedTempFile::new()?;
+    let mut process = Process {
+        child: Command::new(env!("CARGO_BIN_EXE_arrow-tenant-stream"))
+            .arg("--source")
+            .arg(source)
+            .arg("--target")
+            .arg(target)
+            .arg("--checkpoint")
+            .arg(checkpoint)
+            .args([
+                "--customer-id",
+                "customer-0003",
+                "--max-actions",
+                "128",
+                "--poll-ms",
+                "20",
+                "--row-group-rows",
+                "512",
+                "--metrics-listen",
+                "127.0.0.1:0",
+            ])
+            .stdout(Stdio::from(log.as_file().try_clone()?))
+            .stderr(Stdio::from(log.as_file().try_clone()?))
+            .spawn()?,
+        reaped: false,
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let text = std::fs::read_to_string(log.path())?;
+        if let Some(endpoint) = text
+            .lines()
+            .find_map(|line| line.strip_prefix("tenant stream metrics listening on "))
+        {
+            return Ok((process, log, endpoint.to_owned()));
+        }
+        ensure!(process.child.try_wait()?.is_none(), "service startup failed: {text}");
+        ensure!(std::time::Instant::now() < deadline, "service startup deadline");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+async fn expected_customer(fixture: &Fixture) -> Result<Vec<RecordBatch>> {
+    let all = full_logical_scan(&local_source(&fixture.root)?, &fixture.frozen).await?;
+    let mut result = Vec::new();
+    for batch in all {
+        let keys = batch
+            .column_by_name("customer_id")
+            .context("customer")?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .context("customer type")?;
+        let mask = arrow::array::BooleanArray::from_iter(keys.iter().map(|value| Some(value == Some("customer-0003"))));
+        result.push(filter_record_batch(&batch, &mask)?);
+    }
+    Ok(result)
+}
+
+async fn assert_historical_target(
+    root: &std::path::Path,
+    expected: &[RecordBatch],
+    rows: usize,
+    original: &BootstrapManifest,
+) -> Result<BootstrapManifest> {
+    let source = local_source(root)?;
+    let frozen = source.capture()?;
+    ensure!(
+        frozen.schema()? == original.schema()?,
+        "complete canonical schema retained"
+    );
+    ensure!(
+        frozen.partition_columns()? == original.partition_columns()?,
+        "partition schema retained"
+    );
+    let actual = full_logical_scan(&source, &frozen).await?;
+    ensure!(
+        actual.iter().map(RecordBatch::num_rows).sum::<usize>() == rows,
+        "historical target row count"
+    );
+    ensure!(
+        multiset(&actual)? == multiset(expected)?,
+        "historical all-column multiset must be exact"
+    );
+    Ok(frozen)
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+#[ignore = "bounded actual CLI lifecycle using disposable copies of both frozen collector sources"]
+async fn actual_service_live_append_optimize_purge_prune_and_restart_on_disposable_copies() -> Result<()> {
+    use arrow_deltalake::delta::DeltaTable;
+    use arrow_deltalake::maintenance::{
+        DISPOSABLE_TEST_MARKER, Granularity, MaintenanceControl, OptimizeConfig, Outcome, PruneConfig, PurgeConfig,
+        VacuumConfig, now_ms,
+    };
+    use arrow_tenant_stream::checkpoint::Checkpoint;
+    let fixtures = fixtures()?;
+    ensure!(
+        fixtures
+            .iter()
+            .map(|fixture| fixture.pool.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            == std::collections::BTreeSet::from(["dfe", "direct"])
+            && fixtures.len() == 2,
+        "actual lifecycle requires exactly both collector pools"
+    );
+    for fixture in fixtures {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("source");
+        copy_disposable_tree(&fixture.root, &root)?;
+        std::fs::write(root.join(DISPOSABLE_TEST_MARKER), b"")?;
+        let target = temporary.path().join("target");
+        let checkpoint = temporary.path().join("checkpoint");
+        let mut expected = expected_customer(&fixture).await?;
+        let (mut service, _log, endpoint) = start_live(&root, &target, &checkpoint)?;
+        wait_processed(&mut service, &endpoint, fixture.frozen.version)?;
+        assert_historical_target(&target, &expected, 8_128, &fixture.frozen).await?;
+        let template = template_batch(&fixture).await?;
+        let stamp = now_ms()?;
+        let partition = arrow_deltalake::delta::ingestion_partition_value(stamp)?;
+        let appended = replace_partition(&template, &partition)?;
+        let keys = appended
+            .column_by_name("customer_id")
+            .context("append customer")?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .context("append customer type")?;
+        let selected = filter_record_batch(
+            &appended,
+            &arrow::array::BooleanArray::from_iter(keys.iter().map(|key| Some(key == Some("customer-0003")))),
+        )?;
+        ensure!(
+            selected.num_rows() == 64,
+            "one actual batch contributes exactly64 customer rows"
+        );
+        append_owned(
+            &root,
+            &fixture.pool,
+            &partition,
+            stamp,
+            "arrowcol.publication.lifecycle-first",
+        )?;
+        expected.push(selected.clone());
+        let source = local_source(&root)?;
+        wait_processed(&mut service, &endpoint, source.capture()?.version)?;
+        ensure!(
+            metric(&endpoint, "tenant_stream_tail_batches_total")? > 0,
+            "must observe live append tail"
+        );
+        assert_historical_target(&target, &expected, 8_192, &fixture.frozen).await?;
+        let m = DeltaTable::open_for_maintenance(&source.url)?;
+        let control = MaintenanceControl::new(
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(120)),
+        );
+        let optimize = OptimizeConfig {
+            granularity: Some(Granularity::Minute),
+            now_ms: Some(stamp),
+            layout: Some(LayoutPolicy {
+                row_group_rows: 512,
+                page_rows: 128,
+                ..LayoutPolicy::default()
+            }),
+            ..OptimizeConfig::default()
+        };
+        let before_optimize = source.capture()?.files.len();
+        let report = m.apply_optimize(&m.plan_optimize(&optimize)?, &optimize, &control)?;
+        ensure!(
+            report.outcome == Outcome::Committed,
+            "actual optimize must rewrite files"
+        );
+        ensure!(
+            source.capture()?.files.len() < before_optimize,
+            "OPTIMIZE must reduce actual source file count"
+        );
+        let optimized = std::fs::read_to_string(root.join(format!("_delta_log/{:020}.json", report.version)))?;
+        for line in optimized.lines() {
+            let action: serde_json::Value = serde_json::from_str(line)?;
+            for name in ["add", "remove"] {
+                if let Some(value) = action.get(name) {
+                    ensure!(
+                        value["dataChange"] == false,
+                        "OPTIMIZE rewrites must be dataChange=false"
+                    );
+                }
+            }
+        }
+        wait_processed(&mut service, &endpoint, report.version)?;
+        assert_historical_target(&target, &expected, 8_192, &fixture.frozen).await?;
+        let purge = PurgeConfig::new(1, stamp, Granularity::Minute);
+        let purge_plan = m.plan_purge(&purge)?;
+        ensure!(
+            purge_plan.partitions.iter().all(|value| value.value != partition),
+            "PURGE may select only expired sealed partitions, not the current admission minute"
+        );
+        let report = m.apply_purge(&purge_plan, &purge, &control)?;
+        ensure!(
+            report.outcome == Outcome::Committed,
+            "actual expired-partition purge required"
+        );
+        let consumed_version = report.version;
+        wait_processed(&mut service, &endpoint, report.version)?;
+        let retained = source.capture()?;
+        ensure!(
+            retained.files.len() == 1
+                && retained.files[0].partition_values["__arrowcol_ingestion"] == Some(partition.clone()),
+            "PURGE must retain the protected new admission-minute source file"
+        );
+        let noop = m.apply_purge(&m.plan_purge(&purge)?, &purge, &control)?;
+        ensure!(
+            noop.outcome == Outcome::Noop && source.capture()?.version == consumed_version,
+            "repeat PURGE noop must not commit a new source version"
+        );
+        assert_historical_target(&target, &expected, 8_192, &fixture.frozen).await?;
+        ensure!(
+            std::process::Command::new("kill")
+                .args(["-TERM", &service.child.id().to_string()])
+                .status()?
+                .success(),
+            "owned service SIGTERM"
+        );
+        ensure!(
+            service.finish(std::time::Duration::from_secs(120))?.success(),
+            "graceful service shutdown"
+        );
+        let mut barrier = Checkpoint::open_local(&checkpoint).await?;
+        let recovered = barrier.recover().await?;
+        let offset = recovered
+            .previous_offset
+            .context("committed pre-vacuum source cursor")?;
+        ensure!(
+            recovered.pending_offset.is_none()
+                && offset["cursor"]["phase"] == "tail"
+                && offset["cursor"]["version"]
+                    .as_u64()
+                    .is_some_and(|version| version > consumed_version),
+            "durable next-unread cursor must be beyond every append/OPTIMIZE/PURGE commit before physical cleanup"
+        );
+        barrier.close().await?;
+        let mut vacuum = VacuumConfig::new(0, now_ms()? + 1_000);
+        vacuum.unsafe_allow_short_retention_for_tests = true;
+        m.apply_vacuum(&m.plan_vacuum(&vacuum)?, &vacuum, &control)?;
+        let checkpointed = m.checkpoint_if_due(1, true)?;
+        ensure!(
+            checkpointed.outcome == Outcome::Checkpointed,
+            "real Kernel checkpoint required"
+        );
+        let floor = checkpointed.version;
+        let prune = PruneConfig {
+            log_retention_ms: Some(0),
+            unsafe_allow_short_retention_for_tests: true,
+            ..PruneConfig::new(now_ms()? + 1_000)
+        };
+        let report = m.apply_prune_log(&m.plan_prune_log(&prune)?, &prune, &control)?;
+        ensure!(
+            report.outcome == Outcome::Pruned && report.files_deleted > 0,
+            "real retained-C log pruning required"
+        );
+        for version in 0..floor {
+            ensure!(
+                !root.join(format!("_delta_log/{version:020}.json")).exists(),
+                "old JSON must be pruned"
+            );
+        }
+        ensure!(
+            root.join(format!("_delta_log/{floor:020}.json")).is_file(),
+            "floor JSON retained"
+        );
+        let last_checkpoint: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("_delta_log/_last_checkpoint"))?)?;
+        ensure!(
+            last_checkpoint["version"] == floor,
+            "retained Kernel checkpoint pointer"
+        );
+        ensure!(
+            root.join(format!("_delta_log/{floor:020}.checkpoint.parquet"))
+                .is_file(),
+            "retained Kernel checkpoint artifact"
+        );
+        let before = assert_historical_target(&target, &expected, 8_192, &fixture.frozen).await?;
+        ensure!(
+            !run_service(&root, &target, &checkpoint)?.contains("batch="),
+            "post-prune same-checkpoint restart idle"
+        );
+        ensure!(
+            local_source(&target)?.capture()? == before,
+            "no target commit after prune restart"
+        );
+        let next_stamp = now_ms()?;
+        let next_partition = arrow_deltalake::delta::ingestion_partition_value(next_stamp)?;
+        append_owned(
+            &root,
+            &fixture.pool,
+            &next_partition,
+            next_stamp,
+            "arrowcol.publication.lifecycle-after-floor",
+        )?;
+        expected.push(replace_partition(&selected, &next_partition)?);
+        ensure!(
+            run_service(&root, &target, &checkpoint)?.contains("batch="),
+            "new append after floor must tail"
+        );
+        let after = assert_historical_target(&target, &expected, 8_256, &fixture.frozen).await?;
+        ensure!(
+            !run_service(&root, &target, &checkpoint)?.contains("batch="),
+            "final restart idle"
+        );
+        ensure!(
+            local_source(&target)?.capture()? == after,
+            "final restart no extra target version or files"
+        );
+        let mut state = Checkpoint::open_local(&checkpoint).await?;
+        let recovered = state.recover().await?;
+        ensure!(recovered.pending_offset.is_none(), "all lifecycle offsets committed");
+        let query = state.query_id().to_owned();
+        let batch = recovered.batch_id - 1;
+        state.close().await?;
+        let sink = DeltaTable::open_for_maintenance(&local_source(&target)?.url)?;
+        ensure!(
+            sink.lookup_txn(&query)? == Some(batch),
+            "stable query/batch transaction after lifecycle"
+        );
+        ensure!(
+            std::fs::read(checkpoint.join(format!("commits/{batch}")))? == b"v1\n{\"nextBatchWatermarkMs\":0}",
+            "Spark stateless commit remains exact"
+        );
+        ensure!(
+            local_source(&fixture.root)?.capture()? == fixture.frozen,
+            "original frozen source must remain unchanged"
+        );
+        println!(
+            "COLLECTOR_SOURCE_LIFECYCLE {}",
+            serde_json::to_string(&json!({
+                "pool":fixture.pool,"bootstrapRows":8128,"afterLiveAppendRows":8192,"finalRows":8256,
+                "optimizePurgeDoNotReemit":true,"retainedCheckpointFloor":floor,
+                "postPruneRestartIdle":true,"postFloorAppendExactlyOnce":true,
+                "allColumnMultisetEqual":true,"actualServiceProcessesReaped":true,
+                "disposableCopyOnly":true,"phaseDeadlineSeconds":120,
+            }))?
+        );
+    }
+    Ok(())
+}
