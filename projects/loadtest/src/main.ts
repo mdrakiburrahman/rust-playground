@@ -18,10 +18,11 @@ import { startResourceSampler } from './resource-sampler.js';
 import { writeProvenance } from './provenance.js';
 import { runQuiverCrash, QUIVER_RECOVERY_FILE } from './quiver-crash.js';
 import { runOwnedProcess } from './owned-process.js';
+import { startQapObserver } from './qap-observer.js';
 import {
   benchmarkComposeFiles, benchmarkQuiver, buildBenchmarkComposeOverride, buildBenchmarkRuntimeConfigs, dataflowConfigFile,
 } from './runtime-config.js';
-import { acquireBenchmarkController, resetBenchmark, stopBenchmark, type BenchmarkController } from './lifecycle.js';
+import { acquireBenchmarkController, resetBenchmark, stopBenchmark, stopReceipt, type BenchmarkController } from './lifecycle.js';
 import { azureTargets, modeEnvironment, stageAzureCliConfig, type AzureTargets } from './mode.js';
 import { kustoComposeStartArguments, kustoStatusSummary, readKustoStatus, requireHealthyKusto, safeKustoError, startKusto } from './kusto.js';
 import { kustoExplorerStartArguments, runGrafanaGate, runUiGate } from './ui-gate.js';
@@ -488,6 +489,7 @@ interface CloudRun {
   environment: NodeJS.ProcessEnv;
   occupancyId: string;
   reconciliationFailed: boolean;
+  qapObservationFailed: boolean;
 }
 
 async function benchmark(
@@ -533,6 +535,7 @@ async function benchmark(
   let failure: unknown;
   let phase = 'compose-validation';
   let stopSampler: (() => Promise<void>) | undefined;
+  let stopQapObserver: (() => Promise<void>) | undefined;
   const resultsDirectory = path.relative(workspace, path.join(directory, 'results'));
   try {
     step('Validating Compose configuration');
@@ -586,6 +589,16 @@ async function benchmark(
       directAdmin: `http://${network.direct}:8081`,
       dataflowAdmin: `http://${network.dataflow}:32011`,
     });
+    if (options.validate) {
+      const endpoint = azure ? env.AZURE_KUSTO_URI : `http://${network.kusto}:8080`;
+      if (!endpoint) throw new Error('Azure QAP observation requires the captured Kusto endpoint');
+      stopQapObserver = startQapObserver({
+        binary: path.join(cargoTargetDirectory(), 'debug/arrowcol-loadgen'), cwd: workspace,
+        env: { ...env, ...(azure ? { AZURE_CONFIG_DIR: path.join(directory, 'azure-cli/qap-observer') } : {}) },
+        results: path.join(directory, 'results'),
+        endpoint, otlpEndpoint: `http://${env.LOADTEST_LGTM_IP}:4318`,
+      });
+    }
     step(
       `Grafana: http://localhost:${process.env.GRAFANA_PORT ?? 3000} (admin/admin); ` +
       `logs: docker logs -f ${project}-dataflow-1-1`,
@@ -688,6 +701,12 @@ async function benchmark(
     failure = error;
   } finally {
     try {
+      await stopQapObserver?.();
+    } catch (error) {
+      cloud.qapObservationFailed = true;
+      failure = failure ? new AggregateError([failure, error], 'Benchmark and QAP observation failed') : error;
+    }
+    try {
       await stopSampler?.();
     } catch (error) {
       failure ??= error;
@@ -730,10 +749,11 @@ async function main(): Promise<void> {
     return;
   }
   if (userArguments.length === 1 && userArguments[0] === '--stop') {
+    const receipt = stopReceipt(process.env.ARROWCOL_RESET_GENERATION);
     const controller = await acquireBenchmarkController(workspace);
     try {
       await stopBenchmark(workspace, args => run('docker', args));
-      console.log(JSON.stringify({ stopped: true, scope: 'workspace-owned-loadtest', dataPreserved: true }));
+      console.log(JSON.stringify(receipt));
     } finally {
       controller.close();
     }
@@ -743,7 +763,7 @@ async function main(): Promise<void> {
   const privateEnv = modeEnvironment(workspace, options.mode, process.env);
   const controller = await acquireBenchmarkController(workspace);
   const occupancyId = randomUUID();
-  const cloud: CloudRun = { environment: privateEnv, occupancyId, reconciliationFailed: false };
+  const cloud: CloudRun = { environment: privateEnv, occupancyId, reconciliationFailed: false, qapObservationFailed: false };
   let occupied = false;
   let failure: unknown;
   try {
@@ -762,6 +782,7 @@ async function main(): Promise<void> {
       if (occupied) {
         await stopBenchmark(workspace, args => run('docker', args, process.env, 360_000), { requireCleanMutators: true });
         if (cloud.reconciliationFailed) throw new Error('Azure reconciliation failed; retain occupancy pending authoritative reconciliation');
+        if (cloud.qapObservationFailed) throw new Error('QAP helper failed; retain occupancy pending helper/evidence inspection');
         run('python3', ['infra/azure/bootstrap.py', 'release', '--occupancy-id', occupancyId], cloud.environment);
       }
     } catch (error) {

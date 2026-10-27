@@ -421,6 +421,10 @@ services:
       - sqlserver_cpu_utilization
       - --operation
       - optimize
+      - --operation
+      - checkpoint
+      - --checkpoint-every-commits
+      - "${LOADTEST_CHECKPOINT_EVERY_COMMITS:-100}"
       - --apply
       - --interval-secs
       - "30"

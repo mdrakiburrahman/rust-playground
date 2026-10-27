@@ -36,7 +36,7 @@ export function stageAzureCliConfig(directory: string, env: NodeJS.ProcessEnv): 
   };
   const root = path.join(directory, 'azure-cli');
   mkdirSync(root, { mode: 0o700 });
-  for (const service of ['direct-1', 'dataflow-1', 'loadgen', 'infra', 'tenant-stream', 'delta-maintenance']) {
+  for (const service of ['direct-1', 'dataflow-1', 'loadgen', 'infra', 'tenant-stream', 'delta-maintenance', 'qap-observer']) {
     const target = path.join(root, service);
     cpSync(source, target, { recursive: true, errorOnExist: true, force: false });
     protect(target);

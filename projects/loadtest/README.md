@@ -334,12 +334,37 @@ live stack. Stopped-mutator receipts are not distributed registry-close proof.
 The baseline Grafana gate is explicitly scoped to `source-sdk`: every one of
 the seven Kernel/publication families must have actual samples from **each**
 collector's OTLP resource, plus healthy live scrapes and individual source
-counter/byte/duration panel screenshots paired with their exact datasource
+counter/byte/duration/value/version panel screenshots paired with their exact datasource
 queries. A baseline pass is not full service telemetry qualification.
 `service-qualification` additionally requires real maintenance removals and
 physical deletion, tenant skipping/checkpoint metrics and native QAP per pool;
 bridge metrics are required only when enabled. Measured zero backlog/retries are
 valid, but missing metrics never become manufactured zeroes.
+
+Validation runs a read-only native QAP observer every ten seconds, with one
+30-second authentication/query deadline and a separate 40-second owned-process
+budget. Sanitized all-26-table observations and export receipts are retained in
+`results/qap-observations/` and `results/qap-observer.jsonl`. It sends per-pool
+completion, pending files, cached bytes, unhealthy catalogs and last-update age
+to LGTM through OTLP. Missing measurements suppress their aggregate, not become
+zeroes; qualification filters incomplete observations and observations older
+than 45 seconds. These are state/lag observations, **not correctness or reset
+proof**. Azure observation uses a seventh isolated writable private CLI cache.
+The observer finishes before cleanup/release; observation/export failure fails
+qualification and conservatively retains Azure occupancy for inspection.
+
+The optional maintenance profile also requests checkpoints every 100 commits
+(`LOADTEST_CHECKPOINT_EVERY_COMMITS` overrides this). Checkpoints bound replay
+work, **not physical history**: they do not delete commit JSON or old
+checkpoints. Until a separately verified retention/pruning implementation and
+real fixed-window whole-tree measurements exist, no physical-size plateau or
+production steady-state qualification is claimed.
+
+`--stop` binds its stdout receipt's `resetGeneration` to the canonical lowercase
+`ARROWCOL_RESET_GENERATION` supplied by its caller, without rereading private
+environment files. Without a generation, ordinary local stop retains its
+original receipt and cannot satisfy an infra reset request. A stop receipt is
+not distributed registry-drain proof and does not enable reset.
 
 Run the focused verification suite with:
 

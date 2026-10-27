@@ -23,12 +23,37 @@ pub enum Command {
     Validate(ValidateArgs),
     /// Drain publication while collectors are still running, without capturing snapshots.
     Drain(ValidateArgs),
+    /// Record bounded read-only QAP observations without changing tables or policies.
+    ObserveQap(ObserveQapArgs),
     /// Initialize both Azure pools from the canonical schemas while reset is fenced.
     InitializeAzure(InitializeAzureArgs),
     /// Write the canonical Azure table manifest without accessing or mutating storage.
     AzureManifest(InitializeAzureArgs),
     /// Print the exact public Flight SQL schema fixture.
     PrintSchemas,
+}
+
+/// Sanitized live QAP observation inputs.
+#[derive(Clone, Debug, Args)]
+pub struct ObserveQapArgs {
+    /// Query endpoint; Azure credentials are obtained by the shared token provider.
+    #[arg(long, env = "LOADTEST_KUSTO_ENDPOINT", default_value = "http://kusto:8080")]
+    pub endpoint: String,
+    /// Sanitized query provenance directory.
+    #[arg(long, env = "LOADTEST_RESULTS", default_value = "/results")]
+    pub results: PathBuf,
+    /// New output artifact, never an overwritten successful observation.
+    #[arg(long)]
+    pub output: PathBuf,
+    /// Optional explicit database.
+    #[arg(long)]
+    pub database: Option<String>,
+    /// External table names; omit for all 26 canonical source tables.
+    #[arg(long = "table")]
+    pub tables: Vec<String>,
+    /// One deadline for authentication and every management request.
+    #[arg(long, default_value = "30s")]
+    pub timeout: DurationArg,
 }
 
 /// Owned sandbox bootstrap inputs. Credentials are supplied only by the environment.
@@ -340,6 +365,28 @@ mod tests {
     use anyhow::{Context, Result, bail};
 
     use super::*;
+
+    #[test]
+    fn observation_requires_new_output_and_uses_a_separate_bounded_readonly_command() -> Result<()> {
+        assert!(Cli::try_parse_from(["arrowcol-loadgen", "observe-qap"]).is_err());
+        let cli = Cli::try_parse_from([
+            "arrowcol-loadgen",
+            "observe-qap",
+            "--output",
+            "observation.json",
+            "--endpoint",
+            "http://kusto:8080",
+            "--table",
+            "direct_sqlserver_cpu_utilization",
+        ])?;
+        let Command::ObserveQap(arguments) = cli.command else {
+            bail!("expected observe-qap command");
+        };
+        assert_eq!(arguments.timeout.get(), Duration::from_secs(30));
+        assert_eq!(arguments.tables, ["direct_sqlserver_cpu_utilization"]);
+        assert_eq!(arguments.output, PathBuf::from("observation.json"));
+        Ok(())
+    }
 
     #[test]
     fn durations_accept_documented_units_and_reject_fractional_or_overflow_values() {

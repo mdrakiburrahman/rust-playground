@@ -347,7 +347,7 @@ export async function runGrafanaGate(options: UiGateOptions): Promise<void> {
     const dashboard = JSON.parse(readFileSync(path.join(options.workspace, 'projects/loadtest/observability/delta-operations.json'), 'utf8')) as {
       panels: Array<{ id: number; title: string; type: string; datasource: { uid: string }; targets: Array<{ expr: string }> }>;
     };
-    const panelIds = scope === 'source-sdk' ? [1, 2, 6] : [1, 2, 3, 4, 5, 6, 7, 8];
+    const panelIds = scope === 'source-sdk' ? [1, 2, 6, 10, 11] : [1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15];
     for (const id of panelIds) {
       const panel = dashboard.panels.find(panel => panel.id === id);
       if (!panel || panel.type !== 'timeseries' || panel.datasource?.uid !== 'prometheus' || !panel.targets.length) {

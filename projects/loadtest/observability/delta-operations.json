@@ -48,16 +48,60 @@
       "targets": [{ "refId": "A", "expr": "sum by (__name__, operation) ({__name__=~\".*(delta|maintenance).*(retention|cap_hit|sealed|prefetch|starvation|cancel).*\"})", "legendFormat": "{{__name__}} {{operation}}" }]
     },
     {
-      "id": 8, "type": "timeseries", "title": "Azure QAP: cached bytes, pending artifacts and health",
+      "id": 8, "type": "timeseries", "title": "Native QAP: minimum completion per pool",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "x": 12, "y": 24, "w": 12, "h": 8 },
-      "targets": [{ "refId": "A", "expr": "sum by (__name__, pool) ({__name__=~\"qap_.*\"})", "legendFormat": "{{__name__}} {{pool}}" }]
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100 }, "overrides": [] },
+      "targets": [{ "refId": "A", "expr": "qap_completion_percent and on(pool) (qap_observation_complete == 1) and on(pool) (time() - qap_observation_unix_seconds < 45)", "legendFormat": "{{pool}}" }]
+    },
+    {
+      "id": 10, "type": "timeseries", "title": "Delta SDK measured values: observations and sums",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 32, "w": 12, "h": 8 },
+      "targets": [
+        { "refId": "A", "expr": "sum by (service_name) (delta_kernel_values_count)", "legendFormat": "{{service_name}} observations" },
+        { "refId": "B", "expr": "sum by (service_name) (delta_kernel_values_sum)", "legendFormat": "{{service_name}} measured values" }
+      ]
+    },
+    {
+      "id": 11, "type": "timeseries", "title": "Delta SDK observed table versions",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 12, "y": 32, "w": 12, "h": 8 },
+      "targets": [{ "refId": "A", "expr": "max by (service_name) (delta_kernel_version)", "legendFormat": "{{service_name}}" }]
+    },
+    {
+      "id": 12, "type": "timeseries", "title": "Native QAP: accelerated bytes",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 40, "w": 12, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "bytes" }, "overrides": [] },
+      "targets": [{ "refId": "A", "expr": "qap_cached_bytes and on(pool) (qap_observation_complete == 1) and on(pool) (time() - qap_observation_unix_seconds < 45)", "legendFormat": "{{pool}}" }]
+    },
+    {
+      "id": 13, "type": "timeseries", "title": "Native QAP: pending files and unhealthy catalogs",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 12, "y": 40, "w": 12, "h": 8 },
+      "targets": [{ "refId": "A", "expr": "sum by (__name__, pool) ({__name__=~\"qap_pending_artifacts|qap_unhealthy_catalogs\"} and on(pool) (qap_observation_complete == 1) and on(pool) (time() - qap_observation_unix_seconds < 45))", "legendFormat": "{{__name__}} {{pool}}" }]
+    },
+    {
+      "id": 14, "type": "timeseries", "title": "Native QAP: age of last accelerator update",
+      "description": "Metadata update age, not query-correctness or ingestion-lag proof. Missing or future timestamps remain unmeasured.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 48, "w": 12, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [{ "refId": "A", "expr": "qap_lag_seconds and on(pool) (qap_observation_complete == 1) and on(pool) (time() - qap_observation_unix_seconds < 45)", "legendFormat": "{{pool}}" }]
+    },
+    {
+      "id": 15, "type": "timeseries", "title": "Native QAP: observation completeness and readable tables",
+      "description": "Complete is one only when all 13 tables in the pool supply every plotted measurement; it does not assert cached correctness.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 12, "y": 48, "w": 12, "h": 8 },
+      "targets": [{ "refId": "A", "expr": "sum by (__name__, pool) ({__name__=~\"qap_observation_complete|qap_observed_tables\"})", "legendFormat": "{{__name__}} {{pool}}" }]
     },
     {
       "id": 9, "type": "table", "title": "All exposed Delta / maintenance / stream / bridge series",
       "description": "Absent series are absent evidence, never manufactured zeroes. Labels must not contain tenant, file, storage-root or run identities.",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "x": 0, "y": 32, "w": 24, "h": 10 },
+      "gridPos": { "x": 0, "y": 56, "w": 24, "h": 10 },
       "targets": [{ "refId": "A", "expr": "{__name__=~\".*delta.*|.*maintenance.*|tenant_stream_.*|kusto_bridge_.*|qap_.*\"}", "instant": true, "format": "table" }]
     }
   ]

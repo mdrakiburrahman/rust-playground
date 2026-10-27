@@ -11,6 +11,17 @@ import { BENCHMARK_PROJECT } from './cli.js';
 
 type Docker = (args: string[]) => string;
 
+export function stopReceipt(resetGeneration?: string): {
+  stopped: true; scope: 'workspace-owned-loadtest'; dataPreserved: true; resetGeneration?: string;
+} {
+  if (resetGeneration !== undefined && (resetGeneration.length !== 36 ||
+      !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/u.test(resetGeneration))) {
+    throw new Error('Stop receipt requires canonical lowercase ARROWCOL_RESET_GENERATION when provided');
+  }
+  return { stopped: true, scope: 'workspace-owned-loadtest', dataPreserved: true,
+    ...(resetGeneration === undefined ? {} : { resetGeneration }) };
+}
+
 interface ProcessIdentity {
   pid: number;
   parent: number;
