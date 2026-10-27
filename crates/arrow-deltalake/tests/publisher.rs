@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use arrow_deltalake::publisher::{
     CasOutcome, ControlMetadata, MAX_METADATA_BYTES, MAX_PUBLISHERS, MetadataSnapshot, MutationRetries, Occupancy,
-    Phase, PublisherSession, Registry, SessionMode, UnknownTransition,
+    Phase, PublisherSession, RESET_GENERATION_ENV, Registry, SessionMode, UnknownTransition,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -46,6 +46,10 @@ struct State {
     /// Runs once between a caller's read and its serialized write.
     race: Option<Hook>,
     writes: usize,
+    /// Every compare-and-set call, whatever its outcome.
+    cas_calls: usize,
+    /// One-shot: an applied write then waits here before responding.
+    gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 /// In-memory serialized metadata backend with the lease protocol's outcomes.
@@ -93,29 +97,36 @@ impl ControlMetadata for Memory {
     }
 
     async fn compare_and_set(&self, expected: &MetadataSnapshot, metadata: &BTreeMap<String, String>) -> CasOutcome {
-        let mut state = self.state();
-        if let Some(race) = state.race.take() {
-            race(&mut state.metadata);
-            state.etag += 1;
-        }
-        match state.faults.pop_front() {
-            Some(Fault::Conflict) => return CasOutcome::Conflict,
-            Some(Fault::Rejected) => return CasOutcome::Rejected("forbidden".into()),
-            Some(Fault::Unknown { applied }) => {
-                if applied {
-                    state.metadata = metadata.clone();
-                    state.etag += 1;
-                }
-                return CasOutcome::Unknown("connection reset".into());
+        let gate = {
+            let mut state = self.state();
+            state.cas_calls += 1;
+            if let Some(race) = state.race.take() {
+                race(&mut state.metadata);
+                state.etag += 1;
             }
-            None => {}
+            match state.faults.pop_front() {
+                Some(Fault::Conflict) => return CasOutcome::Conflict,
+                Some(Fault::Rejected) => return CasOutcome::Rejected("forbidden".into()),
+                Some(Fault::Unknown { applied }) => {
+                    if applied {
+                        state.metadata = metadata.clone();
+                        state.etag += 1;
+                    }
+                    return CasOutcome::Unknown("connection reset".into());
+                }
+                None => {}
+            }
+            if state.metadata != expected.metadata {
+                return CasOutcome::Conflict;
+            }
+            state.metadata = metadata.clone();
+            state.etag += 1;
+            state.writes += 1;
+            state.gate.take()
+        };
+        if let Some(gate) = gate {
+            drop(gate.acquire().await);
         }
-        if state.metadata != expected.metadata {
-            return CasOutcome::Conflict;
-        }
-        state.metadata = metadata.clone();
-        state.etag += 1;
-        state.writes += 1;
         CasOutcome::Applied
     }
 }
@@ -830,5 +841,132 @@ fn local_shared_session_is_process_wide() -> Result<()> {
     assert!(root.path().join("z").exists() && !root.path().join("y").exists());
     first.close_after_drain()?;
     assert!(futures::executor::block_on(store.put(&path, payload())).is_err());
+    Ok(())
+}
+
+async fn shared(control: &Arc<Memory>, key: &str) -> Result<Arc<PublisherSession>> {
+    PublisherSession::shared_with_control(
+        key,
+        Arc::clone(control) as Arc<dyn ControlMetadata>,
+        SANDBOX,
+        "acct",
+        GENERATION,
+    )
+    .await
+}
+
+/// Guarantees: normal admission pinned to the captured generation G against a
+/// ready authority at G2 writes no member and yields no session (so no table
+/// store can be handed out); the definite failure is not cached.
+#[tokio::test]
+async fn stale_configured_generation_registers_nothing() -> Result<()> {
+    let control = Memory::new(authority("ready-v1", "{}"));
+    control.set("resetgeneration", ROTATED);
+    let pinned = PublisherSession::open_with_control(
+        Arc::clone(&control) as Arc<dyn ControlMetadata>,
+        SANDBOX,
+        "acct",
+        SessionMode::Publisher,
+        Some(GENERATION),
+    )
+    .await;
+    assert!(format!("{:#}", pinned.err().context("stale admitted")?).contains("does not match expected"));
+    for _ in 0..2 {
+        let error = shared(&control, "stale").await.err().context("stale shared admitted")?;
+        assert!(format!("{error:#}").contains("does not match expected"));
+    }
+    assert!(control.members()?.is_empty());
+    assert_eq!(control.state().cas_calls, 0, "compared before any write");
+    Ok(())
+}
+
+/// Guarantees: Azure normal admission without the runner's configured
+/// generation fails closed before any control-plane access.
+#[tokio::test]
+async fn azure_admission_requires_configured_generation() -> Result<()> {
+    if std::env::var_os(RESET_GENERATION_ENV).is_some() {
+        return Ok(());
+    }
+    let url = table_url("tables")?;
+    for error in [
+        PublisherSession::open_async(&url)
+            .await
+            .err()
+            .context("open admitted")?,
+        PublisherSession::shared_for_url_async(&url)
+            .await
+            .err()
+            .context("shared admitted")?,
+    ] {
+        assert!(format!("{error:#}").contains(RESET_GENERATION_ENV), "{error:#}");
+    }
+    Ok(())
+}
+
+/// Guarantees: a persisted WAL generation must equal the admitted generation;
+/// mismatches and noncanonical values are refused, never relabeled.
+#[tokio::test]
+async fn persisted_generation_must_match_admission() -> Result<()> {
+    let control = Memory::new(authority("ready-v1", "{}"));
+    let session = open(&control, SessionMode::Publisher).await?;
+    session.require_generation(GENERATION)?;
+    assert!(session.require_generation(ROTATED).is_err());
+    assert!(session.require_generation("not-a-uuid").is_err());
+    assert!(session.require_generation(&format!("{{{GENERATION}}}")).is_err());
+    assert_eq!(session.generation(), Some(GENERATION));
+    session.close_after_drain_async().await?;
+    let local = PublisherSession::local();
+    local.require_generation(ROTATED)?;
+    assert!(local.require_generation("x").is_err());
+    Ok(())
+}
+
+/// Guarantees: a caller cancelled after its registration CAS applied leaves
+/// the key in progress; process close reports an error, and later shared
+/// opens join the same admission with no additional registration CAS.
+#[tokio::test]
+async fn cancelled_shared_caller_never_reenrolls() -> Result<()> {
+    let control = Memory::new(authority("ready-v1", "{}"));
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    control.state().gate = Some(Arc::clone(&gate));
+    let cancelled = tokio::time::timeout(Duration::from_secs(2), shared(&control, "cancel")).await;
+    assert!(
+        cancelled.is_err(),
+        "caller should be cancelled while the CAS response is held"
+    );
+    assert_eq!(control.state().writes, 1, "registration applied");
+    assert_eq!(control.members()?.len(), 1);
+    let error = PublisherSession::close_shared_async()
+        .await
+        .err()
+        .context("clean while pending")?;
+    assert!(format!("{error:#}").contains("in progress"), "{error:#}");
+    let waiting = tokio::time::timeout(Duration::from_millis(200), shared(&control, "cancel")).await;
+    assert!(waiting.is_err(), "joins the pending admission");
+    assert_eq!(control.state().cas_calls, 1);
+    gate.add_permits(1);
+    let session = tokio::time::timeout(Duration::from_secs(10), shared(&control, "cancel")).await??;
+    let again = shared(&control, "cancel").await?;
+    assert!(Arc::ptr_eq(&session, &again));
+    assert_eq!(control.state().cas_calls, 1, "no second enrollment");
+    let publisher = session.publisher_id().context("registered")?;
+    assert!(control.members()?.contains_key(&publisher.to_string()));
+    session.close_after_drain_async().await?;
+    assert!(control.members()?.is_empty());
+    Ok(())
+}
+
+/// Guarantees: an unknown shared admission is cached as a permanent error;
+/// later shared opens issue no registration CAS.
+#[tokio::test]
+async fn unknown_shared_admission_is_permanent() -> Result<()> {
+    let control = Memory::new(authority("ready-v1", "{}"));
+    control.state().faults.push_back(Fault::Unknown { applied: true });
+    for _ in 0..3 {
+        let error = shared(&control, "unknown").await.err().context("unknown admitted")?;
+        assert!(format!("{error:#}").contains("outcome unknown"), "{error:#}");
+    }
+    assert_eq!(control.state().cas_calls, 1);
+    assert_eq!(control.members()?.len(), 1, "orphan retained as a blocker");
     Ok(())
 }
