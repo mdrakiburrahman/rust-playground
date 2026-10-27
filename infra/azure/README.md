@@ -102,6 +102,14 @@ and `occupancyid`. Updates use `If-Match` ETags. Writers fail closed unless
 ownership matches and `resetstate=ready`, checking before open, upload and each
 commit attempt. A restarted writer must not bypass a fenced sandbox.
 
+Successful full provision and `occupy` export the exact ready container
+`resetgeneration` as `ARROWCOL_RESET_GENERATION` in private mode-`0600`
+`.env.azure`. `occupy` re-reads authority after its CAS before writing this
+admission value. The runner must reload the file after occupancy and pass the
+value to both collector pools; it must never derive it from a run/occupancy UUID.
+`config` alone cannot export an authoritative generation because it performs no
+Azure reads.
+
 ```bash
 # Preview only: no mutation.
 python3 infra/azure/bootstrap.py reset
