@@ -358,8 +358,35 @@ class ReconcileTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             manifest = Path(directory) / "tables.json"
             manifest.write_text('["Telemetry"]')
-            with self.assertRaisesRegex(b.Failure, "root is missing"):
+            with self.assertRaises(b.NotReady):
                 b.reconcile(azure, manifest)
+
+    def test_waits_only_for_absent_logs_not_authentication_failure(self):
+        azure = FakeAzure()
+        azure.blob = unittest.mock.Mock(side_effect=b.Failure("HTTP 403: denied"))
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "tables.json"
+            manifest.write_text('["Telemetry"]')
+            with patch.object(b.time, "sleep") as sleep:
+                with self.assertRaisesRegex(b.Failure, "HTTP 403"):
+                    b.reconcile(azure, manifest, 30)
+                sleep.assert_not_called()
+        self.assertEqual(azure.blob.call_count, 1)
+
+    def test_missing_log_becomes_ready_within_bounded_wait(self):
+        azure = FakeAzure()
+        azure.blob = unittest.mock.Mock(side_effect=[
+            (None, {}), (b'{"protocol":{}}\n{"metaData":{}}', {}),
+        ])
+        azure.arm = lambda *args, **kwargs: {"properties": {"principalId": SUB}}
+        azure.kql = unittest.mock.Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "tables.json"
+            manifest.write_text('["Telemetry"]')
+            with patch.object(b.time, "sleep") as sleep, contextlib.redirect_stdout(io.StringIO()):
+                b.reconcile(azure, manifest, 10)
+            sleep.assert_called_once()
+        self.assertEqual(azure.kql.call_count, 3)
 
     def test_unsafe_table_name_is_rejected(self):
         azure = FakeAzure()
