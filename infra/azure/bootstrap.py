@@ -525,6 +525,32 @@ def held(control, publisher, generation, work):
         raise
 
 
+def exclusive(control, generation, steps):
+    """Run steps under exclusive operator custody claimed atomically from ready-v1.
+
+    Each step is preceded by an ownership re-read. Success, or NotReady (raised
+    only before KQL after definite steps), returns to ready-v1 through
+    complete_bootstrap. Any other outcome marks the operator uncertain, leaving
+    the sandbox fenced and blocking for explicit reconciliation.
+    """
+    operator = str(uuid.uuid4())
+    control.claim_exclusive(operator, generation)
+    try:
+        for step in steps:
+            control.bootstrap_owner(operator, generation)
+            step()
+    except NotReady:
+        control.complete_bootstrap(operator, generation, definitively_drained=True)
+        raise
+    except BaseException:
+        try:
+            control.uncertain(operator, generation)
+        except Exception:
+            pass
+        raise
+    control.complete_bootstrap(operator, generation, definitively_drained=True)
+
+
 def provision(azure, tables, wait_seconds, output, infra_only, values):
     from publisher_control import FENCED, READY, PublisherControl
     c = azure.c
@@ -546,16 +572,12 @@ def provision(azure, tables, wait_seconds, output, infra_only, values):
         generation = metadata["resetgeneration"]
         member = str(uuid.uuid4())
         if metadata["resetstate"] == READY:
-            control.admit(member, generation)
-            def ready_work():
-                deploy(azure)
-                ensure_running(azure)
-                if not infra_only:
-                    reconcile(azure, tables, wait_seconds)
-            held(control, member, generation, ready_work)
-            control.clean_release(member, generation, definitively_drained=True)
+            steps = [lambda: deploy(azure), lambda: ensure_running(azure)]
+            if not infra_only:
+                steps.append(lambda: reconcile(azure, tables, wait_seconds))
+            exclusive(control, generation, steps)
             write_private(output, {**c.generated(), "ARROWCOL_RESET_GENERATION": generation})
-            print("Ready sandbox reconciled under a registered member; authority preserved.")
+            print("Ready sandbox reconciled under exclusive operator custody; authority preserved.")
             return
         if metadata["resetstate"] != FENCED or registry:
             raise Failure("Authority is cleanup-owned or has registered publishers; provisioning refused.")
@@ -854,10 +876,17 @@ def reconcile_command(azure, tables, owner, wait_seconds=0, expected=None):
     if metadata["occupancy"] == "testing" and not expected:
         raise Failure("Reconcile under test occupancy requires the captured "
                       "ARROWCOL_RESET_GENERATION (or --reset-generation).")
-    if expected and expected != metadata["resetgeneration"]:
+    generation = expected or metadata["resetgeneration"]
+    if generation != metadata["resetgeneration"]:
         raise Failure("Reset generation changed since occupancy; reconcile refused before I/O.")
-    generation, member = metadata["resetgeneration"], str(uuid.uuid4())
-    control.admit(member, generation)
+    if metadata["occupancy"] == "released":
+        # Released: exclusive custody, so a later occupy cannot start under this KQL.
+        exclusive(control, generation, [lambda: ensure_running(azure),
+                                        lambda: reconcile(azure, tables, wait_seconds)])
+        return
+    # Testing: the owner/generation predicate is re-checked inside the admit CAS.
+    member = str(uuid.uuid4())
+    control.admit(member, generation, occupant=owner)
     def work():
         ensure_running(azure)
         reconcile(azure, tables, wait_seconds)

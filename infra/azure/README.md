@@ -202,11 +202,17 @@ Legacy or unversioned metadata (`resetstate=ready`/`fenced`, or no
   4. `complete_bootstrap` atomically removes the member and publishes `ready-v1`.
   5. Provision exports `ARROWCOL_RESET_GENERATION` only after it re-reads
      `ready-v1` at the same generation.
-- **Ready redeploy and standalone `reconcile`:** these register a normal member
-  around deploy, cluster start and KQL.
-  Under test occupancy, `reconcile` also requires the exact occupancy owner and
-  the captured generation (`--reset-generation` or `ARROWCOL_RESET_GENERATION`).
-  It does not require an empty registry, because live collectors stay registered.
+- **Ready redeploy and released `reconcile`:** one leased transition claims
+  exclusive operator custody, moving `ready-v1`, released occupancy and an empty
+  registry to `fenced-v1` with exactly one operator member. Deploy, cluster start
+  and KQL run under it. While it holds, `occupy` (needs `ready-v1`), admission,
+  cleanup and stop all fail closed. `complete_bootstrap` returns to `ready-v1`.
+  If `occupy` wins first, the claim fails before any I/O.
+- **`reconcile` under test occupancy:** requires the captured generation
+  (`--reset-generation` or `ARROWCOL_RESET_GENERATION`). It admits a normal member
+  whose exact occupancy owner and generation are checked inside the admission
+  transition, so a release/re-occupy by another owner fails it before I/O. The
+  member then blocks that owner's release. Live collectors stay registered.
 - **Failure handling:** `NotReady` (exit 3) cleanly releases the member. Any
   other failure, or an unknown start or admin outcome, marks the member uncertain.
   An uncertain member keeps blocking stop and cleanup until an operator reconciles it.
