@@ -33,6 +33,41 @@ use url::Url;
 
 type LocalEngine = DefaultEngine<SharedExecutor>;
 
+fn configured_publication_layout(schema: &SchemaRef) -> Result<Option<crate::layout::LayoutPolicy>> {
+    let columns = |name| -> Result<Option<Vec<String>>> {
+        match std::env::var(name) {
+            Ok(value) => Ok(Some(value.split(',').map(str::trim).map(str::to_owned).collect())),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    };
+    let sort_columns = columns("ARROWCOL_LAYOUT_SORT_COLUMNS")?;
+    if schema.field_with_name("customer_id").is_err() && sort_columns.is_none() {
+        return Ok(None);
+    }
+    let mut policy = crate::layout::LayoutPolicy::default();
+    if let Some(columns) = sort_columns {
+        policy.sort_columns = columns;
+    }
+    if let Some(columns) = columns("ARROWCOL_LAYOUT_BLOOM_COLUMNS")? {
+        policy.bloom_columns = columns;
+    }
+    for (name, value) in [
+        ("ARROWCOL_LAYOUT_MAX_ROWS", &mut policy.max_rows),
+        ("ARROWCOL_LAYOUT_MAX_INPUT_BYTES", &mut policy.max_input_bytes),
+        ("ARROWCOL_LAYOUT_ROW_GROUP_ROWS", &mut policy.row_group_rows),
+        ("ARROWCOL_LAYOUT_PAGE_ROWS", &mut policy.page_rows),
+    ] {
+        match std::env::var(name) {
+            Ok(setting) => *value = setting.parse().with_context(|| format!("invalid {name}"))?,
+            Err(std::env::VarError::NotPresent) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    policy.validate(schema)?;
+    Ok(Some(policy))
+}
+
 fn azure_store(url: &Url) -> Result<object_store::azure::MicrosoftAzure> {
     Ok(object_store::azure::MicrosoftAzureBuilder::from_env()
         .with_url(url.as_str())
@@ -72,6 +107,13 @@ pub struct StorageAuthority {
 }
 
 impl StorageAuthority {
+    /// Captured cloud reset epoch, to bind durable routing before receipt admission.
+    /// Local storage has no cloud reset epoch.
+    #[must_use]
+    pub fn generation(&self) -> Option<&str> {
+        self.fence.as_ref().map(|fence| fence.generation())
+    }
+
     /// Capture the current owned, ready reset generation.
     ///
     /// # Errors
@@ -1442,6 +1484,23 @@ impl DeltaTable {
         version: i64,
         stamp: i64,
     ) -> Result<DeltaFileWriter> {
+        let layout = configured_publication_layout(&normalize::schema(&input)?)?;
+        self.new_file_with_publication_and_layout(input, app_id, version, stamp, layout)
+    }
+
+    /// Create a replayable publication with explicit whole-file sorting controls.
+    /// `None` retains streaming encoding; a policy bounds the entire publication.
+    ///
+    /// # Errors
+    /// Rejects invalid identities, partitions, layout policies and file creation failures.
+    pub fn new_file_with_publication_and_layout(
+        self: &Arc<Self>,
+        input: SchemaRef,
+        app_id: String,
+        version: i64,
+        stamp: i64,
+        layout: Option<crate::layout::LayoutPolicy>,
+    ) -> Result<DeltaFileWriter> {
         let mut values = BTreeMap::new();
         let input = if self.partition_columns == [INGESTION_PARTITION] {
             values.insert(INGESTION_PARTITION.to_owned(), Some(ingestion_partition_value(stamp)?));
@@ -1457,9 +1516,16 @@ impl DeltaTable {
         } else {
             input
         };
-        self.new_file_partitioned_inner(input, values, None)?
-            .with_transaction(app_id, version)?
-            .with_ingestion_time(stamp)
+        let properties = layout
+            .as_ref()
+            .map(|policy| policy.writer_properties(&normalize::schema(&input)?))
+            .transpose()?;
+        let mut writer = self.new_file_partitioned_inner(input, values, properties)?;
+        if let Some(policy) = layout {
+            let physical = Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?);
+            writer.sorter = Some(crate::layout::FileSortBuffer::new(physical, policy)?);
+        }
+        writer.with_transaction(app_id, version)?.with_ingestion_time(stamp)
     }
 
     /// Bind one file to explicit string-valued Hive partitions.
@@ -1533,6 +1599,9 @@ impl DeltaTable {
             publication: None,
             ingested_at_ms: None,
             partition_values: values,
+            sorter: None,
+            accepted_rows: 0,
+            accepted_input_bytes: 0,
         })
     }
 
@@ -1733,6 +1802,9 @@ pub struct DeltaFileWriter {
     publication: Option<(String, i64)>,
     ingested_at_ms: Option<i64>,
     partition_values: BTreeMap<String, Option<String>>,
+    sorter: Option<crate::layout::FileSortBuffer>,
+    accepted_rows: usize,
+    accepted_input_bytes: u64,
 }
 
 /// Completed append, including the table version.
@@ -1801,13 +1873,13 @@ impl DeltaFileWriter {
     /// Rows accepted by successful writes to the current file.
     #[must_use]
     pub const fn rows_written(&self) -> usize {
-        self.parquet.rows_written()
+        self.accepted_rows
     }
 
     /// Logical bytes from caller-provided Arrow batches accepted by this file.
     #[must_use]
     pub const fn input_bytes_written(&self) -> u64 {
-        self.parquet.input_bytes_written()
+        self.accepted_input_bytes
     }
 
     async fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
@@ -1880,19 +1952,44 @@ impl DeltaFileWriter {
             Arc::clone(self.context.physical_data_schema()).into(),
         )?;
         let physical = evaluator.evaluate(&data)?.try_into_record_batch()?;
+        let rows = self
+            .accepted_rows
+            .checked_add(batch.num_rows())
+            .context("file row count overflow")?;
+        let bytes = self
+            .accepted_input_bytes
+            .checked_add(input_bytes)
+            .context("file input byte count overflow")?;
         self.stats.merge(&physical)?;
-        self.parquet
-            .write_accounted(&physical, batch.num_rows(), input_bytes)
-            .await
+        if let Some(sorter) = &mut self.sorter {
+            if !sorter.try_push(&physical)? {
+                bail!(
+                    "publication exceeds sorted-file budget; split upstream into independently identified publications"
+                );
+            }
+        } else {
+            self.parquet
+                .write_accounted(&physical, batch.num_rows(), input_bytes)
+                .await?;
+        }
+        self.accepted_rows = rows;
+        self.accepted_input_bytes = bytes;
+        Ok(())
     }
 
     /// Finalize and synchronize Parquet without publishing it.
     ///
     /// # Errors
     /// Returns close, synchronization, or statistics errors.
-    pub async fn stage(self) -> Result<StagedAppend> {
+    pub async fn stage(mut self) -> Result<StagedAppend> {
         if self.failed {
             bail!("Delta file previously failed; refusing to commit its partial data");
+        }
+        if let Some(sorter) = self.sorter.take() {
+            let sorted = sorter.finish()?;
+            self.parquet
+                .write_accounted(&sorted, self.accepted_rows, self.accepted_input_bytes)
+                .await?;
         }
         let file = self.parquet.finish().await?;
         let stats = self.stats.finish()?.context("cannot commit an empty Delta file")?;
