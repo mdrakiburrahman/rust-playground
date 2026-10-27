@@ -6,6 +6,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { chromium, type Browser, type Page } from 'playwright';
 
 import { safeKustoError } from './kusto.js';
+import { metricRangeEvidence } from './metrics-gate.js';
 
 export const kustoExplorerStartArguments = [
   '--profile', 'benchmark', 'up', '--detach', '--no-build', '--no-deps', '--wait', '--wait-timeout', '120', 'kusto-explorer',
@@ -249,6 +250,7 @@ export async function runUiGate(options: UiGateOptions): Promise<UiGateResult> {
   for (const stale of ['kusto-explorer-failure.png', 'kusto-explorer-browser.log']) {
     rmSync(path.join(options.results, stale), { force: true });
   }
+
   let browser: Browser | undefined;
   let page: Page | undefined;
   try {
@@ -289,5 +291,52 @@ export async function runUiGate(options: UiGateOptions): Promise<UiGateResult> {
     } catch (error) {
       options.log(`Unable to remove the Playwright browser container: ${safeKustoError(error)}`);
     }
+  }
+}
+
+/** Checks actual Grafana datasource samples and rendered plots on the same dashboard. */
+export async function runGrafanaGate(options: UiGateOptions): Promise<void> {
+  const started = Date.now();
+  const evidence: Record<string, unknown> = { passed: false, started_at: new Date(started).toISOString(), metrics: {} };
+  let browser: Browser | undefined;
+  try {
+    browser = await startBrowser(options);
+    const context = await browser.newContext({ viewport, colorScheme: 'dark' });
+    const page = await context.newPage();
+    await page.goto('http://lgtm:3000/d/arrowcol-delta-operations?from=now-15m&to=now&refresh=5s', { timeout: 60_000 });
+    const login = page.locator('input[name="user"]');
+    if (await login.isVisible()) {
+      await login.fill('admin');
+      await page.locator('input[name="password"]').fill('admin');
+      await page.getByRole('button', { name: /log in|sign in/iu }).click();
+    }
+    await page.getByText('Delta SDK and service operation counters', { exact: true }).waitFor({ timeout: 60_000 });
+    const queries = {
+      delta: 'sum({__name__=~".*delta.*_total|.*delta.*_count"})',
+      collector_scrapes: 'count(up{job=~"direct|dataflow"} == 1) == bool 2',
+    };
+    for (const [family, query] of Object.entries(queries)) {
+      const end = Math.floor(Date.now() / 1000);
+      const result = await page.evaluate(async ({ query, end }) => {
+        const parameters = new URLSearchParams({ query, start: String(end - 300), end: String(end), step: '2' });
+        const response = await fetch(`/api/datasources/proxy/uid/prometheus/api/v1/query_range?${parameters}`);
+        if (!response.ok) throw new Error(`Grafana datasource HTTP ${response.status}`);
+        return response.json() as Promise<unknown>;
+      }, { query, end });
+      (evidence.metrics as Record<string, unknown>)[family] = { query, ...metricRangeEvidence(result) };
+    }
+    await page.waitForFunction(() => [...document.querySelectorAll('canvas')].some(canvas => canvas.width > 100 && canvas.height > 100),
+      null, { timeout: 30_000 });
+    await page.screenshot({ path: path.join(options.results, 'grafana-delta-operations.png'), fullPage: true });
+    evidence.screenshot = 'grafana-delta-operations.png';
+    evidence.passed = true;
+  } catch (error) {
+    evidence.error = safeKustoError(error);
+    throw new Error(`Grafana live telemetry gate failed: ${evidence.error}`);
+  } finally {
+    evidence.finished_at = new Date().toISOString();
+    writeFileSync(path.join(options.results, 'grafana-validation.json'), `${JSON.stringify(evidence, null, 2)}\n`);
+    await browser?.close();
+    options.compose([...browserProfile, 'rm', '--force', '--stop', 'playwright']);
   }
 }

@@ -1,6 +1,21 @@
 # loadtest
 
-![Architecture](.imgs/loadtest-architecture.png)
+Every synthetic table has a required `customer_id VARCHAR` first column. The
+deterministic input interleaves 16 customers (`customer-0000` through
+`customer-0015`) rather than pre-sorting the input. Direct and Dataflow receive
+the same immutable encoded batches, including retries. The independent reader
+can return a bounded complete row multiset with multiplicities for Kusto
+validation; it rejects a changed snapshot or more than 256 distinct rows rather
+than silently sampling away differences.
+
+[![Architecture](../../loadtest-architecture.png)](../../loadtest-architecture.html)
+
+The independent delta-rs oracle reconstructs partition columns from committed
+`Add.partitionValues`, not directory names, and excludes uncommitted Parquet
+files. `delta-inspect evidence <root> --table catalog.schema.table` returns a
+captured snapshot plus its bounded row multiset. Local roots and explicit-table
+`abfss://` roots are supported; cloud reads use the existing Azure CLI identity
+and fail visibly without credentials. Deletion vectors are explicitly rejected.
 
 ```bash
 npx nx run loadtest:run -- --warmup 2m --concurrency 8 --batch-rows 1024
@@ -20,10 +35,35 @@ test yourself.
 The test runs until **Ctrl+C**. Stopping the generator leaves the stack running
 so you can inspect the charts and output; the next start resets it.
 
+## Fenced Azure schema bootstrap
+
+Infrastructure provisioning invokes:
+
+```bash
+cargo run --locked --quiet --package arrowcol-loadgen -- initialize-azure \
+  --manifest "$ARROWCOL_AZURE_TABLE_MANIFEST"
+```
+
+Private environment inputs are `ARROWCOL_AZURE_TABLE_ROOT`,
+`AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_CONTAINER`, and
+`AZURE_STORAGE_CHECKPOINT_CONTAINER`. The root must be a credential-free
+`abfss://` URL inside that account/container. The storage authority must remain
+owned and **fenced** during initialization; this command cannot acquire a data
+writer or bypass the reset fence.
+
+The canonical registry initializes both pools/all 13 schemas with required
+`__arrowcol_ingestion STRING` partitions. Core normalization runs exactly once,
+including timestamp companions. Existing compatible roots are preserved.
+Only after all 26 roots succeed is the `{name, relative_path}` JSON manifest
+written; paths such as `direct/telemetry/sqlserver/sqlserver_active_sessions`
+are relative to `ARROWCOL_AZURE_TABLE_ROOT`, including any private isolated-run
+prefix. Initialization does not insert data or prove Azure/QAP readiness.
+
 ## Options
 
 | Option | Meaning | Default |
 | --- | --- | --- |
+| `--mode` | Select `local` disk/emulator or `azure` ADLS/Azure Kusto together | `ARROWCOL_MODE`, otherwise `local` |
 | `--warmup` | Warmup before measurement | `30s` |
 | `--concurrency` | Concurrent sending lanes | `4` |
 | `--batch-rows` | Rows per Arrow batch | `8192` |
@@ -31,6 +71,36 @@ so you can inspect the charts and output; the next start resets it.
 | `--validate` | Check Delta snapshots and native Kusto data after the generator finishes | Off |
 | `--quiver` | Both collectors persist every batch to [Quiver](#disk-persistence-with-quiver) on local disk before acknowledging it, then publish to Delta from disk | Off |
 | `--crash-after` | With `--quiver`, `kill -9` both collectors this long after they start persisting, restart them, and require replay from disk | Off |
+
+Azure mode reads private `.env`, then `.env.azure`, with explicit inherited
+environment taking precedence. It requires the configured owned ADLS root,
+account, data/checkpoint containers, Kusto URI and database; it never falls back
+to another subscription or to the emulator. Each run uses isolated roots below
+the configured private prefix. The runner acquires occupancy before cloud work
+and stops its owned writers before releasing it. Missing authorization is a
+failure, not successful skipped qualification. Real Azure QAP qualification is
+separate from local emulator functionality and remains unverified until a live
+authorized run produces the required observations.
+
+Azure collector images must include the shared pinned CLI installer from
+`infra/docker/install-azure-cli.sh`. At runtime the runner makes a separate
+writable Azure CLI config copy for each collector, below the ignored
+`onelake/benchmark/latest/azure-cli/` directory. Directories are mode `0700`,
+files `0600`; collectors use the invoking UID/GID. The host cache is never
+mounted into a collector, and config/credentials never enter an image or its
+build context. Copying config is not proof of valid cloud authorization:
+token refresh and owned storage access must still succeed.
+
+To stop only this workspace's loadtest without deleting its data:
+
+```bash
+npx --no-install tsx projects/loadtest/src/main.ts --stop
+```
+
+Successful stop emits one JSON receipt with `stopped:true`,
+`scope:"workspace-owned-loadtest"` and `dataPreserved:true`. This local stop is
+not a distributed fencing guarantee: Azure reset must also enforce the owned
+checkpoint-container metadata fence and occupancy CAS.
 
 Both collectors use two CPUs and matching buffer limits: 128 MiB overall,
 32 MiB per table, and 32 MiB per flush. SQL Server defaults to a 16 GiB memory
@@ -83,9 +153,10 @@ replay batches from disk.
 
 With `--quiver`, `--validate` requires **every acknowledged row** in Delta for
 both pools. Without it, Dataflow admission is best effort, so validation only
-requires a published batch per Dataflow table. Recovery is at least once:
-a batch whose publication landed just before the kill can be published again,
-so row counts are lower bounds.
+requires a published batch per Dataflow table. Independent source-client submissions may duplicate under the at-least-once
+request contract. Replaying the **same publication identity** must instead be
+idempotent. Exact snapshot row multisets and stable publication IDs, rather than
+ACK counts alone, are the correctness evidence.
 
 ## Watch and inspect
 

@@ -43,7 +43,7 @@ test('both local helper commands always receive the allocated internal Kusto end
   const network: BenchmarkNetwork = {
     subnet: '10.89.42.0/24', sql: '10.89.42.2', hive: '10.89.42.3', router: '10.89.42.10',
     direct: '10.89.42.21', dataflow: '10.89.42.31', kusto: '10.89.42.50',
-    kustoExplorer: '10.89.42.51', playwright: '10.89.42.52',
+    kustoExplorer: '10.89.42.51', playwright: '10.89.42.52', kustoBridge: '10.89.42.53',
   };
   const env = localLoadgenEnvironment({
     directory: '/workspace/onelake/benchmark/latest', network, options: parseBenchmarkOptions([]),

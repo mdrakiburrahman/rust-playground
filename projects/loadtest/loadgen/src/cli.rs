@@ -21,8 +21,18 @@ pub enum Command {
     Run(Box<RunArgs>),
     /// Validate benchmark manifests and independent Delta snapshots.
     Validate(ValidateArgs),
+    /// Initialize both Azure pools from the canonical schemas while reset is fenced.
+    InitializeAzure(InitializeAzureArgs),
     /// Print the exact public Flight SQL schema fixture.
     PrintSchemas,
+}
+
+/// Owned sandbox bootstrap inputs. Credentials are supplied only by the environment.
+#[derive(Clone, Debug, Args)]
+pub struct InitializeAzureArgs {
+    /// Output manifest used by infrastructure reconciliation.
+    #[arg(long, env = "ARROWCOL_AZURE_TABLE_MANIFEST")]
+    pub manifest: PathBuf,
 }
 
 /// Benchmark scenario.
@@ -258,6 +268,10 @@ pub struct RunArgs {
     /// Optional local Kusto emulator HTTP endpoint for live committed-file ingestion.
     #[arg(long, env = "LOADTEST_KUSTO_ENDPOINT")]
     pub kusto_endpoint: Option<String>,
+
+    /// Local active-snapshot bridge; never used as evidence of Azure QAP.
+    #[arg(long, env = "LOADTEST_KUSTO_BRIDGE_ENDPOINT")]
+    pub kusto_bridge_endpoint: Option<String>,
 }
 
 impl RunArgs {
@@ -426,6 +440,7 @@ mod tests {
             direct_admin_endpoints: Vec::new(),
             dataflow_admin_endpoints: Vec::new(),
             kusto_endpoint: None,
+            kusto_bridge_endpoint: None,
         };
         assert_eq!(arguments.effective_scenarios(), vec![Scenario::Paired]);
     }

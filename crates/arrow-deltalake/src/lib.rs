@@ -7,9 +7,12 @@ use anyhow::{Context, Result};
 use arrow::array::{Array, RecordBatch};
 use arrow::datatypes::SchemaRef;
 use parquet::arrow::AsyncArrowWriter;
+use parquet::file::properties::WriterProperties;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "delta")]
+mod azure_fence;
 #[cfg(feature = "delta")]
 pub mod commit;
 #[cfg(feature = "delta")]
@@ -73,6 +76,18 @@ impl ParquetFileWriter {
     /// # Errors
     /// Returns file creation or Parquet schema errors.
     pub fn create(path: impl AsRef<Path>, schema: SchemaRef) -> Result<Self> {
+        Self::create_with_properties(path, schema, None)
+    }
+
+    /// Create a unique file with explicit row-group, page and encoding controls.
+    ///
+    /// # Errors
+    /// Returns file creation or Parquet schema errors.
+    pub fn create_with_properties(
+        path: impl AsRef<Path>,
+        schema: SchemaRef,
+        properties: Option<WriterProperties>,
+    ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let durable_handle = OpenOptions::new()
             .write(true)
@@ -80,7 +95,7 @@ impl ParquetFileWriter {
             .open(&path)
             .with_context(|| format!("create Parquet {}", path.display()))?;
         let output = tokio::fs::File::from_std(durable_handle.try_clone()?);
-        let writer = AsyncArrowWriter::try_new(output, schema, None)?;
+        let writer = AsyncArrowWriter::try_new(output, schema, properties)?;
         Ok(Self {
             writer,
             durable_handle,

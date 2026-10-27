@@ -1,0 +1,64 @@
+{
+  "uid": "arrowcol-delta-operations",
+  "title": "ArrowCol: Delta, maintenance, streams and QAP",
+  "schemaVersion": 39,
+  "refresh": "5s",
+  "time": { "from": "now-30m", "to": "now" },
+  "panels": [
+    {
+      "id": 1, "type": "timeseries", "title": "Delta SDK and service operation counters",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "targets": [{ "refId": "A", "expr": "sum by (__name__, operation, outcome) ({__name__=~\".*delta.*_total|tenant_stream_.*_total|kusto_bridge_.*_total\"})", "legendFormat": "{{__name__}} {{operation}} {{outcome}}" }]
+    },
+    {
+      "id": 2, "type": "timeseries", "title": "Delta file, byte and row changes",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "targets": [{ "refId": "A", "expr": "sum by (__name__, operation) ({__name__=~\".*delta.*(files|bytes|rows).*|.*maintenance.*(files|bytes|rows).*\"})", "legendFormat": "{{__name__}} {{operation}}" }]
+    },
+    {
+      "id": 3, "type": "timeseries", "title": "Transaction collision, retry, exhausted and reconciliation",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "targets": [{ "refId": "A", "expr": "sum by (__name__, outcome) ({__name__=~\".*(delta|maintenance).*(collision|retr|exhaust|reconcil).*\"})", "legendFormat": "{{__name__}} {{outcome}}" }]
+    },
+    {
+      "id": 4, "type": "timeseries", "title": "Visibility and stream lag / backlog",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "targets": [{ "refId": "A", "expr": "sum by (__name__, pool) ({__name__=~\"tenant_stream_.*(lag|backlog)|kusto_bridge_.*(lag_seconds|lag_versions|pending_files|degraded_tables)\"})", "legendFormat": "{{__name__}} {{pool}}" }]
+    },
+    {
+      "id": 5, "type": "timeseries", "title": "Actual DataFusion skipping and bytes scanned",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 16, "w": 12, "h": 8 },
+      "targets": [{ "refId": "A", "expr": "sum by (__name__) (tenant_stream_datafusion_bytes_scanned_total or {__name__=~\"tenant_stream_datafusion_.*(pruned|matched).*_total\"})", "legendFormat": "{{__name__}}" }]
+    },
+    {
+      "id": 6, "type": "timeseries", "title": "Phase / refresh / commit duration distributions",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 12, "y": 16, "w": 12, "h": 8 },
+      "targets": [{ "refId": "A", "expr": "histogram_quantile(0.95, sum by (metric, le, operation) (rate(label_replace({__name__=~\".*(delta|maintenance|tenant_stream|kusto_bridge).*_seconds_bucket\"}, \"metric\", \"$1\", \"__name__\", \"(.+)\")[1m:2s])))", "legendFormat": "{{metric}} {{operation}} p95" }]
+    },
+    {
+      "id": 7, "type": "timeseries", "title": "Retention, cap hits, sealed backlog and prefetch",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 24, "w": 12, "h": 8 },
+      "targets": [{ "refId": "A", "expr": "sum by (__name__, operation) ({__name__=~\".*(delta|maintenance).*(retention|cap_hit|sealed|prefetch|starvation|cancel).*\"})", "legendFormat": "{{__name__}} {{operation}}" }]
+    },
+    {
+      "id": 8, "type": "timeseries", "title": "Azure QAP: cached bytes, pending artifacts and health",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 12, "y": 24, "w": 12, "h": 8 },
+      "targets": [{ "refId": "A", "expr": "sum by (__name__, pool) ({__name__=~\"qap_.*\"})", "legendFormat": "{{__name__}} {{pool}}" }]
+    },
+    {
+      "id": 9, "type": "table", "title": "All exposed Delta / maintenance / stream / bridge series",
+      "description": "Absent series are absent evidence, never manufactured zeroes. Labels must not contain tenant, file, storage-root or run identities.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 32, "w": 24, "h": 10 },
+      "targets": [{ "refId": "A", "expr": "{__name__=~\".*delta.*|.*maintenance.*|tenant_stream_.*|kusto_bridge_.*|qap_.*\"}", "instant": true, "format": "table" }]
+    }
+  ]
+}

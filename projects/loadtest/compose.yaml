@@ -139,8 +139,10 @@ services:
     command: ["--config", "/state/direct.yaml"]
     environment:
       TOKIO_WORKER_THREADS: "${LOADTEST_CPUS:-2}"
+      ARROWCOL_PARTITION_GRANULARITY: ${ARROWCOL_PARTITION_GRANULARITY:-minute}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${LOADTEST_TRACES_ENDPOINT:-http://lgtm:4318}
       OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_METRIC_EXPORT_INTERVAL: "2000"
     secrets:
       - source: arrowcol_app_password
         target: arrowcol-app-password
@@ -177,12 +179,14 @@ services:
     environment:
       ARROWCOL_INSTANCE_KEY: loadtest-dataflow-1
       ARROWCOL_ADVERTISED_FLIGHT_ENDPOINT: ${LOADTEST_DATAFLOW_1_IP:-10.89.0.31}:32010
-      ARROWCOL_DELTA_ROOT: /delta/dataflow
+      ARROWCOL_DELTA_ROOT: ${LOADTEST_DATAFLOW_DELTA_ROOT:-/delta/dataflow}
+      ARROWCOL_PARTITION_GRANULARITY: ${ARROWCOL_PARTITION_GRANULARITY:-minute}
       ARROWCOL_SQL_HOST: sqlserver
       ARROWCOL_HIVE_HOST: hive-metastore
       ARROWCOL_MAX_MESSAGE_BYTES: "33554432"
       OTEL_EXPORTER_OTLP_ENDPOINT: ${LOADTEST_TRACES_ENDPOINT:-http://lgtm:4318}
       OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_METRIC_EXPORT_INTERVAL: "2000"
     secrets:
       - source: arrowcol_app_password
         target: arrowcol-app-password
@@ -229,6 +233,45 @@ services:
         ipv4_address: ${LOADTEST_KUSTO_IP:-10.89.0.50}
     stop_grace_period: ${STACK_STOP_SECONDS:-30}s
 
+  kusto-bridge:
+    profiles: ["benchmark"]
+    image: ghcr.io/mdrakiburrahman/rust-playground/kusto-bridge:dev
+    pull_policy: never
+    environment:
+      KUSTO_BRIDGE_KUSTO_ENDPOINT: http://${LOADTEST_KUSTO_IP:-10.89.0.50}:8080
+      KUSTO_BRIDGE_DATABASE: loadtest
+      KUSTO_BRIDGE_SOURCES: direct=/delta/direct,dataflow=/delta/dataflow
+      KUSTO_BRIDGE_STATE_DIR: /state
+      KUSTO_BRIDGE_POLL_INTERVAL: ${KUSTO_BRIDGE_POLL_INTERVAL:-2s}
+      KUSTO_BRIDGE_LISTEN: 0.0.0.0:9464
+      RUST_LOG: info
+    volumes:
+      - kusto-bridge-state:/state
+      - type: bind
+        source: ${ONELAKE_HOST_PATH:?Run through Nx}/direct
+        target: /delta/direct
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${ONELAKE_HOST_PATH:?Run through Nx}/dataflow
+        target: /delta/dataflow
+        read_only: true
+        bind:
+          create_host_path: false
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/kusto-bridge", "healthcheck", "--url", "http://127.0.0.1:9464/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+    networks:
+      default:
+        ipv4_address: ${LOADTEST_KUSTO_BRIDGE_IP:-10.89.0.53}
+    stop_grace_period: ${STACK_STOP_SECONDS:-30}s
+
   # Browser UI for the Kusto emulator. The server reaches Kusto by its Compose service name on this
   # network; browsers only talk to kusto-explorer itself (same-origin /api), never to Kusto.
   kusto-explorer:
@@ -268,13 +311,14 @@ services:
     image: grafana/otel-lgtm@sha256:57c04cbd8e7022f32bb84c4ac005d79baf8b08e2c5be44facf11f5f1f9944ba2
     networks:
       default:
-        ipv4_address: 10.89.0.40
+        ipv4_address: ${LOADTEST_LGTM_IP:-10.89.0.40}
     ports:
       - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
     volumes:
       - ./observability/prometheus.yaml:/otel-lgtm/prometheus.yaml:ro
       - ./observability/dashboards.yaml:/otel-lgtm/grafana/conf/provisioning/dashboards/arrowcol.yaml:ro
       - ./observability/arrowcol.json:/otel-lgtm/grafana/conf/provisioning/dashboards/arrowcol/arrowcol.json:ro
+      - ./observability/delta-operations.json:/otel-lgtm/grafana/conf/provisioning/dashboards/arrowcol/delta-operations.json:ro
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:3000/api/health"]
       interval: 5s
@@ -301,7 +345,7 @@ services:
       - /var/lib/cadvisor:size=64m,mode=0755
     networks:
       default:
-        ipv4_address: 10.89.0.105
+        ipv4_address: ${LOADTEST_CADVISOR_IP:-10.89.0.105}
 
   # Docker UI (logs, stats, shells). tmpfs /data re-seeds the admin from the SA password on every start.
   portainer:
@@ -324,7 +368,7 @@ services:
       - /data:size=128m,mode=0700
     networks:
       default:
-        ipv4_address: 10.89.0.106
+        ipv4_address: ${LOADTEST_PORTAINER_IP:-10.89.0.106}
 
   router:
     profiles: ["benchmark"]
@@ -373,6 +417,7 @@ services:
       LOADTEST_DRAIN_TIMEOUT: ${LOADTEST_DRAIN_TIMEOUT:-2m}
       LOADTEST_REQUIRE_ALL_COLLECTORS: ${LOADTEST_REQUIRE_ALL_COLLECTORS:-true}
       LOADTEST_KUSTO_ENDPOINT: http://${LOADTEST_KUSTO_IP:-10.89.0.50}:8080
+      LOADTEST_KUSTO_BRIDGE_ENDPOINT: http://${LOADTEST_KUSTO_BRIDGE_IP:-10.89.0.53}:9464
     volumes:
       - type: bind
         source: ${ONELAKE_HOST_PATH:?Run through Nx}/results
@@ -416,6 +461,9 @@ volumes:
   sqlserver-data:
   hive-warehouse:
   kusto-data:
+    labels:
+      io.arrowcol.loadtest.workspace: ${LOADTEST_WORKSPACE:?Run through Nx}
+  kusto-bridge-state:
     labels:
       io.arrowcol.loadtest.workspace: ${LOADTEST_WORKSPACE:?Run through Nx}
 
