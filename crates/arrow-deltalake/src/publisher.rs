@@ -56,6 +56,28 @@ pub const MAX_METADATA_BYTES: usize = 8192;
 pub const CAS_ATTEMPTS: u32 = 8;
 /// Reset generation the bootstrap operator captured before launching the initializer.
 pub const EXPECTED_GENERATION_ENV: &str = "ARROWCOL_EXPECTED_RESET_GENERATION";
+/// Reset generation the runner captured for this process. Normal Azure
+/// admission is pinned to it; it is never used for bootstrap.
+pub const RESET_GENERATION_ENV: &str = "ARROWCOL_RESET_GENERATION";
+
+/// Canonical configured generation from [`RESET_GENERATION_ENV`] for normal
+/// publisher admission.
+///
+/// # Errors
+/// Fails closed when the variable is missing, not Unicode or not a canonical
+/// UUID. The error never echoes the value.
+pub fn reset_generation_from_env() -> Result<String> {
+    let Ok(generation) = std::env::var(RESET_GENERATION_ENV) else {
+        bail!(
+            "{RESET_GENERATION_ENV} is required for Azure publisher admission (the runner's captured reset \
+             generation); nothing registered"
+        );
+    };
+    if canonical_uuid(&generation).is_err() {
+        bail!("{RESET_GENERATION_ENV} is not a canonical lowercase UUID; nothing registered");
+    }
+    Ok(generation)
+}
 
 /// Canonical expected generation from [`EXPECTED_GENERATION_ENV`].
 ///
@@ -554,8 +576,73 @@ impl fmt::Debug for PublisherSession {
     }
 }
 
-type SessionCache = tokio::sync::Mutex<HashMap<String, std::result::Result<Arc<PublisherSession>, String>>>;
+type Settled = Option<std::result::Result<Arc<PublisherSession>, String>>;
+
+/// Per-key shared admission state. A key is recorded as `Admitting` before
+/// any registration I/O, so a dropped caller can never cause a second
+/// enrollment for the same key.
+enum Slot {
+    /// An owned admission task is running; it always settles the slot.
+    Admitting(tokio::sync::watch::Receiver<Settled>),
+    Ready(Arc<PublisherSession>),
+    /// Unknown or abandoned admission: permanent, never re-enrolled.
+    Poisoned(String),
+}
+
+type SessionCache = Mutex<HashMap<String, Slot>>;
 static SESSIONS: OnceLock<SessionCache> = OnceLock::new();
+
+fn sessions() -> MutexGuard<'static, HashMap<String, Slot>> {
+    SESSIONS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Settles one `Admitting` slot exactly once, even if the admission task is
+/// dropped (for example by runtime shutdown) before a definite outcome.
+struct Admission {
+    key: String,
+    sender: tokio::sync::watch::Sender<Settled>,
+    settled: bool,
+}
+
+impl Admission {
+    fn finish(mut self, result: Result<Arc<PublisherSession>>) {
+        self.settled = true;
+        let mut cache = sessions();
+        let settled = match result {
+            Ok(session) => {
+                cache.insert(self.key.clone(), Slot::Ready(Arc::clone(&session)));
+                Ok(session)
+            }
+            Err(error) => {
+                let message = format!("{error:#}");
+                if is_unknown(&error) {
+                    cache.insert(self.key.clone(), Slot::Poisoned(message.clone()));
+                } else {
+                    // Definite failure: nothing was written, so nothing is cached.
+                    cache.remove(&self.key);
+                }
+                Err(message)
+            }
+        };
+        self.sender.send_replace(Some(settled));
+    }
+}
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        let message = "shared publisher admission was abandoned before a definite outcome; any registration is \
+                       retained as a reset blocker and never re-enrolled"
+            .to_owned();
+        sessions().insert(self.key.clone(), Slot::Poisoned(message.clone()));
+        self.sender.send_replace(Some(Err(message)));
+    }
+}
 
 pub(crate) fn azure_account(url: &Url) -> Result<String> {
     if url.scheme() == "az" {
@@ -616,32 +703,96 @@ impl PublisherSession {
     /// account and control container, one for all local tables. The cache
     /// holds strong references and is never evicted, so tables may open,
     /// close and reopen under one registration until explicit process close;
-    /// a cached session is returned without network access. An unknown
-    /// registration outcome is cached as a permanent error: no adoption and no
-    /// re-enrollment. Definite failures wrote nothing and are not cached.
+    /// a cached session is returned without network access.
+    ///
+    /// The key is recorded as in progress before any registration I/O and the
+    /// admission runs as one owned task on the shared Delta I/O runtime that
+    /// always settles the key. A dropped or timed-out caller therefore never
+    /// causes a second enrollment: later callers join the same admission. An
+    /// unknown or abandoned outcome is cached as a permanent error: no
+    /// adoption and no re-enrollment. Definite failures wrote nothing and are
+    /// not cached. Azure admission is pinned to [`RESET_GENERATION_ENV`].
     ///
     /// # Errors
     /// Returns admission, authority, authentication or unknown-outcome failures.
     pub async fn shared_for_url_async(url: &Url) -> Result<Arc<Self>> {
         let key = cache_key(url)?;
-        let mut sessions = SESSIONS
-            .get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
-            .lock()
-            .await;
-        if let Some(cached) = sessions.get(&key) {
-            return cached.clone().map_err(|error| anyhow::anyhow!("{error}"));
-        }
-        match Self::open_url(url, SessionMode::Publisher, None).await {
-            Ok(session) => {
-                sessions.insert(key, Ok(Arc::clone(&session)));
-                Ok(session)
-            }
-            Err(error) => {
-                if is_unknown(&error) {
-                    sessions.insert(key, Err(format!("{error:#}")));
+        let url = url.clone();
+        Self::shared_admission(
+            key,
+            async move { Self::open_url(&url, SessionMode::Publisher, None).await },
+        )
+        .await
+    }
+
+    /// [`Self::shared_for_url_async`] cache semantics over an injected
+    /// metadata backend, for protocol tests. `key` lives in its own namespace
+    /// and never aliases a URL-derived key. Admission is pinned to
+    /// `expected_generation`, as normal Azure admission is.
+    ///
+    /// # Errors
+    /// See [`Self::shared_for_url_async`].
+    pub async fn shared_with_control(
+        key: &str,
+        control: Arc<dyn ControlMetadata>,
+        sandbox_id: &str,
+        account: &str,
+        expected_generation: &str,
+    ) -> Result<Arc<Self>> {
+        let sandbox_id = sandbox_id.to_owned();
+        let account = account.to_owned();
+        let expected = expected_generation.to_owned();
+        Self::shared_admission(format!("control:{key}"), async move {
+            Self::register(
+                control,
+                sandbox_id,
+                account,
+                None,
+                SessionMode::Publisher,
+                Some(&expected),
+            )
+            .await
+        })
+        .await
+    }
+
+    async fn shared_admission<F>(key: String, admit: F) -> Result<Arc<Self>>
+    where
+        F: Future<Output = Result<Arc<Self>>> + Send + 'static,
+    {
+        let mut receiver = {
+            let mut cache = sessions();
+            match cache.get(&key) {
+                Some(Slot::Ready(session)) => return Ok(Arc::clone(session)),
+                Some(Slot::Poisoned(error)) => bail!("{error}"),
+                Some(Slot::Admitting(receiver)) => receiver.clone(),
+                None => {
+                    let executor = shared_executor()?;
+                    let (sender, receiver) = tokio::sync::watch::channel(None);
+                    cache.insert(key.clone(), Slot::Admitting(receiver.clone()));
+                    let admission = Admission {
+                        key,
+                        sender,
+                        settled: false,
+                    };
+                    let _runtime = executor.enter();
+                    drop(tokio::spawn(async move {
+                        let result = admit.await;
+                        admission.finish(result);
+                    }));
+                    receiver
                 }
-                Err(error)
             }
+        };
+        let settled = receiver
+            .wait_for(Option::is_some)
+            .await
+            .map(|settled| settled.clone())
+            .map_err(|_| anyhow::anyhow!("shared publisher admission ended without an outcome"))?;
+        match settled {
+            Some(Ok(session)) => Ok(session),
+            Some(Err(error)) => bail!("{error}"),
+            None => bail!("shared publisher admission ended without an outcome"),
         }
     }
 
@@ -654,28 +805,55 @@ impl PublisherSession {
     }
 
     /// Process shutdown: close every cached shared session after its guarded
-    /// mutations drain. Never registers anything. Each session is attempted;
-    /// the first failure is returned and that member stays registered.
+    /// mutations drain. Never registers anything. Refuses without side effects
+    /// while any shared admission is still in progress. Otherwise each ready
+    /// session is attempted; a failed one stays registered. Any unknown or
+    /// abandoned admission makes the result an error: the process is never
+    /// reported clean while a possible member is unaccounted for.
     ///
     /// # Errors
-    /// Returns the first close refusal, revocation or unknown-outcome failure.
+    /// Returns in-progress, unknown-admission, close refusal, revocation or
+    /// unknown-outcome failures.
     pub async fn close_shared_async() -> Result<()> {
-        let sessions: Vec<_> = match SESSIONS.get() {
-            Some(cache) => cache
-                .lock()
-                .await
-                .values()
-                .filter_map(|entry| entry.clone().ok())
-                .collect(),
-            None => return Ok(()),
+        let (ready, poisoned) = {
+            let Some(cache) = SESSIONS.get() else {
+                return Ok(());
+            };
+            let cache = cache.lock().unwrap_or_else(PoisonError::into_inner);
+            let pending = cache.values().filter(|slot| matches!(slot, Slot::Admitting(_))).count();
+            if pending > 0 {
+                bail!(
+                    "{pending} shared publisher admissions still in progress with no definite outcome; process is \
+                     not clean, close again after they settle"
+                );
+            }
+            let mut ready = Vec::new();
+            let mut poisoned = Vec::new();
+            for slot in cache.values() {
+                match slot {
+                    Slot::Ready(session) => ready.push(Arc::clone(session)),
+                    Slot::Poisoned(error) => poisoned.push(error.clone()),
+                    Slot::Admitting(_) => {}
+                }
+            }
+            (ready, poisoned)
         };
         let mut first = None;
-        for session in sessions {
+        for session in ready {
             if let Err(error) = session.close_after_drain_async().await {
                 first.get_or_insert(error);
             }
         }
-        first.map_or(Ok(()), Err)
+        if let Some(error) = first {
+            return Err(error);
+        }
+        if let Some(error) = poisoned.first() {
+            bail!(
+                "{} shared publisher admissions have unknown outcomes; process is not clean: {error}",
+                poisoned.len()
+            );
+        }
+        Ok(())
     }
 
     /// Synchronous [`Self::open_async`].
@@ -687,10 +865,13 @@ impl PublisherSession {
         block_on_shared(async move { Self::open_async(&url).await })
     }
 
-    /// Register a fresh publisher in `ready-v1` (uncached).
+    /// Register a fresh publisher in `ready-v1` (uncached). Azure admission is
+    /// pinned to [`RESET_GENERATION_ENV`] inside the leased transition.
     ///
     /// # Errors
-    /// Returns admission, authority, authentication or unknown-outcome failures.
+    /// Returns admission, authority, authentication or unknown-outcome
+    /// failures; fails closed when the configured generation is absent,
+    /// invalid or differs from the authority.
     pub async fn open_async(url: &Url) -> Result<Arc<Self>> {
         Self::open_url(url, SessionMode::Publisher, None).await
     }
@@ -726,6 +907,17 @@ impl PublisherSession {
         if !is_azure(url) {
             bail!("only file and ADLS URLs are supported");
         }
+        let configured;
+        let expected_generation = match (mode, expected_generation) {
+            (_, Some(expected)) => expected,
+            (SessionMode::Publisher, None) => {
+                configured = reset_generation_from_env()?;
+                configured.as_str()
+            }
+            (SessionMode::Bootstrap, None) => {
+                bail!("bootstrap requires the operator's captured expected reset generation")
+            }
+        };
         let account = azure_account(url)?;
         let credentials: AzureCredentialProvider = Arc::new(crate::azure_cli::BoundedAzureCli::default());
         let control = Arc::new(AzureControlContainer::new(&account, Arc::clone(&credentials))?);
@@ -736,7 +928,7 @@ impl PublisherSession {
             account,
             Some(credentials),
             mode,
-            expected_generation,
+            Some(expected_generation),
         )
         .await
     }
@@ -759,7 +951,8 @@ impl PublisherSession {
     }
 
     /// Register through an injected metadata backend (uncached). Bootstrap
-    /// requires `expected_generation`; a publisher may pin one too.
+    /// requires `expected_generation`; a publisher may pin one too (the
+    /// production Azure paths always do).
     ///
     /// # Errors
     /// Returns admission, authority or unknown-outcome failures.
@@ -859,6 +1052,29 @@ impl PublisherSession {
         self.registration
             .as_ref()
             .map(|registration| registration.generation.as_str())
+    }
+
+    /// Require that a persisted WAL epoch/generation equals the generation
+    /// this session was admitted under. Never relabels: a mismatch must not
+    /// be replayed into this sandbox. An unregistered local session has no
+    /// reset authority and accepts any canonical generation.
+    ///
+    /// # Errors
+    /// Rejects a noncanonical `persisted` value or any mismatch.
+    pub fn require_generation(&self, persisted: &str) -> Result<()> {
+        if canonical_uuid(persisted).is_err() {
+            bail!("persisted WAL generation is not a canonical UUID; refusing replay");
+        }
+        if let Some(registration) = &self.registration
+            && registration.generation != persisted
+        {
+            bail!(
+                "persisted WAL generation {persisted} does not match admitted publisher generation {}; refusing \
+                 replay or relabeling",
+                registration.generation
+            );
+        }
+        Ok(())
     }
 
     #[must_use]
