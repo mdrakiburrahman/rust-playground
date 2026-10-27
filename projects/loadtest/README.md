@@ -601,7 +601,12 @@ produces `passed=false`, `run_id=null` and an explicit error. If the budget
 expires while preparing publication, failure evidence is published without
 reapplying that expired deadline; completed commit reports are retained.
 The receipt file is synchronized on every platform; parent-directory fsync is
-Unix-only and skipped on non-Unix platforms. Its per-pool
+Unix-only and skipped on non-Unix platforms. Each receipt has a unique
+`publication_id`. Post-link cleanup or directory-sync errors atomically replace
+that invocation's receipt with `passed=false`, after verifying its publication
+identity, without retrying maintenance or rechecking the deadline. Replacement
+failure reports both errors and does not overwrite another invocation's receipt.
+Its per-pool
 `pools.<pool>.validation_inventory` is exactly the validation inventory shape:
 `{tables: {<dotted identity>: {schema, version, files}}}` with decoded sorted
 relative paths. The validation owner must bind that inventory to its captured

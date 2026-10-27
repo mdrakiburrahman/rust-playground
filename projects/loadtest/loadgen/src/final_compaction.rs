@@ -630,6 +630,7 @@ struct ValidationInventory {
 
 #[derive(Serialize)]
 struct Receipt {
+    publication_id: String,
     run_id: Option<String>,
     passed: bool,
     skipped: bool,
@@ -649,7 +650,58 @@ fn write_receipt(file: &mut File, receipt: &Receipt) -> Result<()> {
     Ok(())
 }
 
-fn atomic_receipt(results: &Path, receipt: &mut Receipt, deadline: Instant, mut operation: Result<()>) -> Result<()> {
+fn sync_results(results: &Path) -> Result<()> {
+    #[cfg(unix)]
+    File::open(results)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = results;
+    Ok(())
+}
+
+fn replace_own_receipt(results: &Path, receipt: &Receipt) -> Result<()> {
+    let destination = results.join(ARTIFACT);
+    let temporary = results.join(format!(".final-compaction-recovery-{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new().write(true).create_new(true).open(&temporary)?;
+        write_receipt(&mut file, receipt)?;
+        drop(file);
+        #[derive(Deserialize)]
+        struct PublicationIdentity {
+            publication_id: String,
+        }
+        let published: PublicationIdentity = serde_json::from_reader(File::open(&destination)?)?;
+        ensure!(
+            published.publication_id == receipt.publication_id,
+            "refuse to replace another invocation's final-compaction receipt"
+        );
+        fs::rename(&temporary, &destination)?;
+        sync_results(results)?;
+        Ok(())
+    })();
+    if temporary.exists()
+        && let Err(error) = fs::remove_file(&temporary)
+    {
+        return Err(error).context(format!(
+            "recovery temporary cleanup failed; replacement result: {result:?}"
+        ));
+    }
+    result
+}
+
+fn atomic_receipt(results: &Path, receipt: &mut Receipt, deadline: Instant, operation: Result<()>) -> Result<()> {
+    atomic_receipt_with(results, receipt, deadline, operation, |temporary, results| {
+        fs::remove_file(temporary).context("remove published receipt temporary")?;
+        sync_results(results).context("sync published receipt directory")
+    })
+}
+
+fn atomic_receipt_with(
+    results: &Path,
+    receipt: &mut Receipt,
+    deadline: Instant,
+    mut operation: Result<()>,
+    post_link: impl FnOnce(&Path, &Path) -> Result<()>,
+) -> Result<()> {
     if let Err(error) = &operation {
         receipt.passed = false;
         receipt.error = Some(format!("{error:#}"));
@@ -675,13 +727,28 @@ fn atomic_receipt(results: &Path, receipt: &mut Receipt, deadline: Instant, mut 
         }
         // A hard link atomically publishes without replacing any pre-existing receipt.
         fs::hard_link(&temporary, &destination)?;
-        fs::remove_file(&temporary)?;
-        #[cfg(unix)]
-        File::open(results)?.sync_all()?;
+        drop(file);
+        if let Err(error) = post_link(&temporary, results) {
+            receipt.passed = false;
+            receipt.skipped = false;
+            let publication_error = format!("post-link receipt publication failed: {error:#}");
+            receipt.error = Some(match receipt.error.take() {
+                Some(previous) => format!("{previous}; {publication_error}"),
+                None => publication_error.clone(),
+            });
+            // Never retry maintenance or reapply the deadline while correcting evidence.
+            if let Err(replacement) = replace_own_receipt(results, receipt) {
+                anyhow::bail!("{publication_error}; failure receipt replacement failed: {replacement:#}");
+            }
+            anyhow::bail!("{publication_error}");
+        }
         Ok(())
     })();
-    if result.is_err() && temporary.exists() {
-        fs::remove_file(&temporary).context("clean failed receipt temporary file")?;
+    if result.is_err()
+        && temporary.exists()
+        && let Err(cleanup) = fs::remove_file(&temporary)
+    {
+        anyhow::bail!("receipt publication failed: {result:?}; temporary cleanup failed: {cleanup}");
     }
     result?;
     operation
@@ -701,6 +768,7 @@ pub async fn run(args: FinalCompactionArgs) -> Result<()> {
 
 fn run_sync(args: &FinalCompactionArgs, deadline: Instant) -> Result<()> {
     let mut receipt = Receipt {
+        publication_id: uuid::Uuid::new_v4().to_string(),
         run_id: None,
         passed: false,
         skipped: false,
@@ -1046,6 +1114,7 @@ mod tests {
         let root = tempfile::tempdir()?;
         let mut fixture = Fixture::new(&[1, 0]);
         let mut receipt = Receipt {
+            publication_id: uuid::Uuid::new_v4().to_string(),
             run_id: Some("run-1".into()),
             passed: true,
             skipped: false,
@@ -1070,6 +1139,87 @@ mod tests {
                 .context("error")?
                 .contains("budget exhausted")
         );
+        assert_eq!(fs::read_dir(root.path())?.count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn post_link_cleanup_and_directory_sync_failures_replace_own_success_with_failure() -> Result<()> {
+        for cleanup_failure in [true, false] {
+            let root = tempfile::tempdir()?;
+            let mut fixture = Fixture::new(&[1, 0]);
+            let mut receipt = Receipt {
+                publication_id: uuid::Uuid::new_v4().to_string(),
+                run_id: Some("run-1".into()),
+                passed: true,
+                skipped: false,
+                error: None,
+                budget_secs: BUDGET.as_secs(),
+                max_progress_passes: MAX_PASSES,
+                passes: execute(&mut fixture)?,
+                pools: BTreeMap::new(),
+            };
+            let expected = serde_json::to_value(&receipt.passes)?;
+            let failure = if cleanup_failure {
+                "injected remove failure"
+            } else {
+                "injected directory fsync failure"
+            };
+            let result = atomic_receipt_with(
+                root.path(),
+                &mut receipt,
+                Instant::now() + BUDGET,
+                Ok(()),
+                |temporary, _| {
+                    if !cleanup_failure {
+                        fs::remove_file(temporary)?;
+                    }
+                    bail!("{failure}")
+                },
+            );
+            assert!(result.err().context("must fail")?.to_string().contains(failure));
+            let evidence = failure_receipt(root.path())?;
+            assert_eq!(evidence["publication_id"], receipt.publication_id);
+            assert_eq!(evidence["passes"], expected);
+            assert!(evidence["error"].as_str().context("error")?.contains(failure));
+            assert_eq!(fixture.applies, 1, "no maintenance retry");
+            assert_eq!(fs::read_dir(root.path())?.count(), 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn post_link_recovery_preserves_other_invocations_receipt_and_reports_both_errors() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut receipt = Receipt {
+            publication_id: uuid::Uuid::new_v4().to_string(),
+            run_id: Some("run-1".into()),
+            passed: true,
+            skipped: false,
+            error: None,
+            budget_secs: BUDGET.as_secs(),
+            max_progress_passes: MAX_PASSES,
+            passes: Vec::new(),
+            pools: BTreeMap::new(),
+        };
+        let other = br#"{"publication_id":"another-invocation","passed":true}"#;
+        let result = atomic_receipt_with(
+            root.path(),
+            &mut receipt,
+            Instant::now() + BUDGET,
+            Ok(()),
+            |_, results| {
+                let destination = results.join(ARTIFACT);
+                fs::remove_file(&destination)?;
+                fs::write(destination, other)?;
+                bail!("injected publication failure")
+            },
+        );
+        let error = format!("{:#}", result.err().context("must fail")?);
+        assert!(error.contains("injected publication failure"));
+        assert!(error.contains("replacement failed"));
+        assert!(error.contains("another invocation"));
+        assert_eq!(fs::read(root.path().join(ARTIFACT))?, other);
         assert_eq!(fs::read_dir(root.path())?.count(), 1);
         Ok(())
     }
