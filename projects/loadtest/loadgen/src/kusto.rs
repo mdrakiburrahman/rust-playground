@@ -20,7 +20,7 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use arrow_deltalake::AzureCliTokenProvider;
-use delta_inspect::{SnapshotInventory, SnapshotSummary, TableInventory, TableSummary};
+use delta_inspect::{SnapshotInventory, SnapshotSummary, TableInventory, TableSummary, ValidationCorpus};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -344,6 +344,57 @@ impl KustoClient {
             );
         }
         Ok(Multiset { buckets })
+    }
+
+    /// Exact chunked multiset: exact per-partition row counts over the whole source plus one bounded
+    /// multiset query per oracle chunk, filtered to exactly that chunk's disjoint partitions.
+    async fn corpus_multiset(&self, source: &str, schema: &Value, corpus: &ValidationCorpus) -> Result<CorpusResult> {
+        let partitions = match &corpus.partition_column {
+            None => None,
+            Some(column) => {
+                let rows = self
+                    .execute(
+                        &format!(
+                            "{source} | summarize Rows = count() by Partition = tostring({})",
+                            identifier(column)?
+                        ),
+                        false,
+                        "validation",
+                    )
+                    .await?;
+                let mut partitions = BTreeMap::new();
+                for row in rows {
+                    let partition = row
+                        .get("Partition")
+                        .and_then(Value::as_str)
+                        .context("partition count missing its partition")?
+                        .to_owned();
+                    let count = row.get("Rows").and_then(number).context("partition count missing")?;
+                    ensure!(
+                        partitions.insert(partition, count).is_none(),
+                        "duplicate partition count"
+                    );
+                }
+                Some(partitions)
+            }
+        };
+        let mut chunks = Vec::with_capacity(corpus.chunks.len());
+        for chunk in &corpus.chunks {
+            let filtered = match &corpus.partition_column {
+                None => source.to_owned(),
+                Some(column) => {
+                    ensure!(!chunk.partition_values.is_empty(), "oracle chunk covers no partitions");
+                    let values = chunk
+                        .partition_values
+                        .iter()
+                        .map(|value| literal(value))
+                        .collect::<Result<Vec<_>>>()?;
+                    format!("{source} | where {} in ({})", identifier(column)?, values.join(", "))
+                }
+            };
+            chunks.push(self.multiset(&filtered, schema, &chunk.rows).await?);
+        }
+        Ok(CorpusResult { partitions, chunks })
     }
 }
 
@@ -834,9 +885,78 @@ impl Multiset {
         }
         Ok(())
     }
+}
+
+/// Exact result of one source against a chunked oracle: per-partition counts over the whole source
+/// (partitioned tables) and one bounded multiset per oracle chunk.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct CorpusResult {
+    partitions: Option<BTreeMap<String, u64>>,
+    chunks: Vec<Multiset>,
+}
+
+impl CorpusResult {
+    fn rows(&self) -> u64 {
+        self.partitions.as_ref().map_or_else(
+            || self.chunks.iter().map(Multiset::rows).sum(),
+            |partitions| partitions.values().sum(),
+        )
+    }
+
+    fn unmatched(&self) -> u64 {
+        self.chunks.iter().map(Multiset::unmatched).sum()
+    }
+
+    /// Exact comparison: every partition count (unknown and missing partitions fail), every chunk's
+    /// bucket counts with no unmatched rows, and the total row count.
+    fn check(&self, corpus: &ValidationCorpus) -> Result<()> {
+        corpus.verify()?;
+        ensure!(
+            self.chunks.len() == corpus.chunks.len(),
+            "Kusto returned {} chunk results for {} oracle chunks",
+            self.chunks.len(),
+            corpus.chunks.len()
+        );
+        if corpus.partition_column.is_some() {
+            let observed = self.partitions.as_ref().context("Kusto partition counts missing")?;
+            if let Some(unknown) = observed
+                .keys()
+                .find(|partition| !corpus.partition_rows.contains_key(*partition))
+            {
+                bail!("Kusto returned rows in partition {unknown:?} absent from the Delta snapshot");
+            }
+            for (partition, expected) in &corpus.partition_rows {
+                let actual = observed.get(partition).copied().unwrap_or(0);
+                ensure!(
+                    actual == *expected,
+                    "partition {partition:?} has {actual} Kusto rows, Delta snapshot has {expected}"
+                );
+            }
+        }
+        for (index, (result, chunk)) in self.chunks.iter().zip(&corpus.chunks).enumerate() {
+            let expected = chunk.rows.iter().map(|(_, rows)| rows).sum::<u64>();
+            result
+                .check(expected, &chunk.rows)
+                .with_context(|| format!("oracle chunk {index} of {}", corpus.chunks.len()))?;
+        }
+        ensure!(
+            self.rows() == corpus.expected_rows,
+            "Kusto returned {} rows, Delta snapshot has {}",
+            self.rows(),
+            corpus.expected_rows
+        );
+        Ok(())
+    }
 
     fn evidence(&self) -> Value {
-        json!({"rows": self.rows(), "unmatched": self.unmatched(), "multiset_hash": self.hash()})
+        let hash = self
+            .chunks
+            .iter()
+            .fold(0_i64, |total, chunk| total.wrapping_add(chunk.hash()));
+        json!({
+            "rows": self.rows(), "unmatched": self.unmatched(), "multiset_hash": hash,
+            "chunks": self.chunks.len(), "partitions": self.partitions.as_ref().map(BTreeMap::len),
+        })
     }
 }
 
@@ -1157,11 +1277,11 @@ async fn frozen(root: &Path, snapshot: &SnapshotSummary) -> Result<bool> {
     Ok(current == captured_inventory(snapshot))
 }
 
-async fn corpus(root: &Path, table: &str, summary: &TableSummary) -> Result<Vec<(Value, u64)>> {
+async fn corpus(root: &Path, table: &str, summary: &TableSummary) -> Result<ValidationCorpus> {
     if let Some(cloud) = cloud_root(root) {
-        delta_inspect::cloud_sample_rows(cloud, table, summary).await
+        delta_inspect::cloud_sample_corpus(cloud, table, summary).await
     } else {
-        delta_inspect::sample_rows(root, table, summary)
+        delta_inspect::sample_corpus(root, table, summary)
     }
 }
 
@@ -1220,11 +1340,11 @@ struct TableCheck {
     table: String,
     pool: &'static str,
     summary: TableSummary,
-    samples: Vec<(Value, u64)>,
+    corpus: ValidationCorpus,
     commit_ms: Option<u64>,
     max_age: String,
     policy: Value,
-    fallback: Multiset,
+    fallback: CorpusResult,
 }
 
 pub(crate) async fn validate(
@@ -1260,12 +1380,16 @@ pub(crate) async fn validate(
                 client.schema(&name).await? == columns(&summary.schema)?,
                 "Kusto external table schema differs from Delta for {name}"
             );
-            let samples = corpus(root, table, summary).await?;
+            let corpus = corpus(root, table, summary).await?;
+            ensure!(
+                corpus.expected_rows == summary.rows,
+                "validation corpus differs from the captured snapshot for {name}"
+            );
             let fallback = client
-                .multiset(&fallback_source(&name)?, &summary.schema, &samples)
+                .corpus_multiset(&fallback_source(&name)?, &summary.schema, &corpus)
                 .await?;
             fallback
-                .check(summary.rows, &samples)
+                .check(&corpus)
                 .with_context(|| format!("non-accelerated fallback differs from Delta for {name}"))?;
             let (policy, max_age) = client.max_age(&name).await?;
             checks.push(TableCheck {
@@ -1273,7 +1397,7 @@ pub(crate) async fn validate(
                 table: table.clone(),
                 pool,
                 summary: summary.clone(),
-                samples,
+                corpus,
                 commit_ms: commit_millis(root, table, summary.version),
                 max_age,
                 policy,
@@ -1294,7 +1418,8 @@ pub(crate) async fn validate(
                 "delta_version": check.summary.version, "active_files": check.summary.active_files,
                 "partition_columns": check.summary.partition_columns,
                 "commit_unix_ms": check.commit_ms,
-                "expected_rows": check.summary.rows, "distinct_rows": check.samples.len(),
+                "expected_rows": check.summary.rows, "distinct_rows": check.corpus.distinct_rows(),
+                "oracle_chunks": check.corpus.chunks.len(), "oracle_partitions": check.corpus.partition_rows.len(),
                 "actual": {"Rows": check.fallback.rows(), "Invalid": check.fallback.unmatched()},
                 "fallback": {"query": fallback_source(&check.name)?, "result": check.fallback.evidence()},
                 "cached": cached[&check.name],
@@ -1365,13 +1490,13 @@ async fn converge(client: &KustoClient, checks: &[TableCheck], timeout: Duration
                     continue;
                 }
                 let result = client
-                    .multiset(&external_source(&check.name)?, &check.summary.schema, &check.samples)
+                    .corpus_multiset(&external_source(&check.name)?, &check.summary.schema, &check.corpus)
                     .await?;
                 let after = client
                     .acceleration(&check.name, &check.max_age, check.commit_ms)
                     .await?;
                 // A stale-but-ready-looking cache is retried until it converges or the deadline elapses.
-                let verdict = result.check(check.summary.rows, &check.samples).and_then(|()| {
+                let verdict = result.check(&check.corpus).and_then(|()| {
                     ensure!(result == check.fallback, "cached multiset differs from fallback");
                     ensure!(after.ready(), "cache left ready state during the query: {after:?}");
                     ensure!(
@@ -1529,6 +1654,7 @@ pub(crate) fn write_validation(results: &Path, report: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use delta_inspect::ValidationChunk;
     use std::{
         io::Read,
         net::{TcpListener, TcpStream},
@@ -2054,12 +2180,23 @@ mod tests {
                 files: Vec::new(),
                 partition_columns: Vec::new(),
             },
-            samples: vec![(json!({"id":1}), 1)],
+            corpus: ValidationCorpus {
+                partition_column: None,
+                expected_rows: 1,
+                partition_rows: BTreeMap::new(),
+                chunks: vec![ValidationChunk {
+                    partition_values: Vec::new(),
+                    rows: vec![(json!({"id":1}), 1)],
+                }],
+            },
             commit_ms: None,
             max_age: "00:01:00".to_owned(),
             policy: Value::Null,
-            fallback: Multiset {
-                buckets: BTreeMap::from([(1, (1, 5))]),
+            fallback: CorpusResult {
+                partitions: None,
+                chunks: vec![Multiset {
+                    buckets: BTreeMap::from([(1, (1, 5))]),
+                }],
             },
         }
     }
@@ -2096,6 +2233,171 @@ mod tests {
             thread::sleep(Duration::from_millis(delay.load(Ordering::Relaxed)));
             Ok(Some(response(&["Sample", "Rows", "Hash"], vec![json!([1, 1, 5])])))
         })
+    }
+
+    const EARLY: &str = "2026-10-27-02-00";
+    const LATE: &str = "2026-10-27-02-01";
+
+    /// Two partitions split into two oracle chunks: `id 1` twice in EARLY, `id 2` once in LATE.
+    fn chunked_corpus() -> ValidationCorpus {
+        ValidationCorpus {
+            partition_column: Some("__arrowcol_ingestion".to_owned()),
+            expected_rows: 3,
+            partition_rows: BTreeMap::from([(EARLY.to_owned(), 2), (LATE.to_owned(), 1)]),
+            chunks: vec![
+                ValidationChunk {
+                    partition_values: vec![EARLY.to_owned()],
+                    rows: vec![(json!({"id":1, "__arrowcol_ingestion": EARLY}), 2)],
+                },
+                ValidationChunk {
+                    partition_values: vec![LATE.to_owned()],
+                    rows: vec![(json!({"id":2, "__arrowcol_ingestion": LATE}), 1)],
+                },
+            ],
+        }
+    }
+
+    fn chunked_result(early: u64, late: u64, extra: Option<(&str, u64)>) -> CorpusResult {
+        let mut partitions = BTreeMap::from([(EARLY.to_owned(), early), (LATE.to_owned(), late)]);
+        if let Some((partition, rows)) = extra {
+            partitions.insert(partition.to_owned(), rows);
+        }
+        CorpusResult {
+            partitions: Some(partitions),
+            chunks: vec![
+                Multiset {
+                    buckets: BTreeMap::from([(1, (early, 5))]),
+                },
+                Multiset {
+                    buckets: BTreeMap::from([(1, (late, 7))]),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn chunked_oracle_requires_exact_partitions_chunks_and_multiplicities() -> Result<()> {
+        let corpus = chunked_corpus();
+        chunked_result(2, 1, None).check(&corpus)?;
+        assert!(
+            chunked_result(2, 1, Some(("2026-10-27-03-00", 1)))
+                .check(&corpus)
+                .is_err(),
+            "rows in a partition no chunk covers must fail"
+        );
+        let mut missing = chunked_result(2, 1, None);
+        missing.partitions.as_mut().context("partitions")?.remove(LATE);
+        assert!(missing.check(&corpus).is_err(), "a removed partition must fail");
+        assert!(
+            chunked_result(3, 1, None).check(&corpus).is_err(),
+            "reingested duplicates must fail"
+        );
+        let mut stale = chunked_result(2, 1, None);
+        stale.chunks[0].buckets.insert(0, (1, 9));
+        assert!(
+            stale.check(&corpus).is_err(),
+            "an unmatched row inside a chunk must fail"
+        );
+        let mut duplicate_bucket = chunked_result(2, 1, None);
+        duplicate_bucket.chunks[1].buckets.insert(1, (2, 7));
+        assert!(duplicate_bucket.check(&corpus).is_err());
+        let mut dropped = chunked_result(2, 1, None);
+        dropped.chunks.pop();
+        assert!(dropped.check(&corpus).is_err(), "a missing chunk result must fail");
+        let mut uncovered = corpus.clone();
+        uncovered.chunks.pop();
+        assert!(chunked_result(2, 1, None).check(&uncovered).is_err());
+        let mut unpartitioned = chunked_result(2, 1, None);
+        unpartitioned.partitions = None;
+        assert!(unpartitioned.check(&corpus).is_err(), "partition counts are mandatory");
+        let mut oversized = corpus;
+        oversized.chunks[0].rows = (0..=delta_inspect::MAX_CHUNK_DISTINCT_ROWS)
+            .map(|id| (json!({"id": id, "__arrowcol_ingestion": EARLY}), 1))
+            .collect();
+        assert!(chunked_result(2, 1, None).check(&oversized).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn every_chunk_of_every_table_must_finish_before_the_fixed_deadline() -> Result<()> {
+        let directory = Directory::new()?;
+        let delay = Arc::new(AtomicU64::new(0));
+        let commands = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let server = {
+            let delay = Arc::clone(&delay);
+            let commands = Arc::clone(&commands);
+            Server::start(move |request| {
+                let command = request["csl"].as_str().context("command missing")?.to_owned();
+                commands
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("poisoned"))?
+                    .push(command.clone());
+                if command.contains("query_acceleration statistics") {
+                    return Ok(Some(response(
+                        &[
+                            "HotSize",
+                            "LastUpdatedDateTime",
+                            "PendingFiles",
+                            "PendingBytes",
+                            "Complete",
+                            "Eligible",
+                            "Fresh",
+                        ],
+                        vec![json!([10, "2026-10-27T00:00:00Z", 0, 0, 100.0, 1, 1])],
+                    )));
+                }
+                if command.ends_with(" details") {
+                    return Ok(Some(response(
+                        &["QueryAccelerationState"],
+                        vec![json!([
+                            "{\"TableVersion\":4,\"IsHealthy\":true,\"RowCount\":3,\"AcceleratedRowCount\":3}"
+                        ])],
+                    )));
+                }
+                if command.contains("summarize Rows = count() by Partition") {
+                    return Ok(Some(response(
+                        &["Partition", "Rows"],
+                        vec![json!([EARLY, 2]), json!([LATE, 1])],
+                    )));
+                }
+                if command.contains(&format!("in (\"{EARLY}\")")) {
+                    return Ok(Some(response(&["Sample", "Rows", "Hash"], vec![json!([1, 2, 5])])));
+                }
+                ensure!(command.contains(&format!("in (\"{LATE}\")")), "unexpected {command}");
+                thread::sleep(Duration::from_millis(delay.load(Ordering::Relaxed)));
+                Ok(Some(response(&["Sample", "Rows", "Hash"], vec![json!([1, 1, 7])])))
+            })?
+        };
+        let client = KustoClient::with_mode(&server.endpoint, &directory.0, Mode::Local, DATABASE)?;
+        let mut check = deadline_check();
+        check.summary.rows = 3;
+        check.summary.partition_columns = vec!["__arrowcol_ingestion".to_owned()];
+        check.corpus = chunked_corpus();
+        check.fallback = chunked_result(2, 1, None);
+        let checks = [check];
+        let converged = converge(&client, &checks, Duration::from_secs(10)).await?;
+        assert_eq!(converged["direct_x"]["result"]["chunks"], 2);
+        assert_eq!(converged["direct_x"]["result"]["rows"], 3);
+        {
+            let commands = commands.lock().map_err(|_| anyhow::anyhow!("poisoned"))?;
+            let source = "external_table(\"direct_x\")";
+            assert!(commands.iter().any(|command| command
+                == &format!("{source} | summarize Rows = count() by Partition = tostring(['__arrowcol_ingestion'])")));
+            assert!(
+                commands.iter().any(|command| command.starts_with(&format!(
+                    "{source} | where ['__arrowcol_ingestion'] in (\"{EARLY}\") | extend Sample"
+                ))),
+                "each chunk query is filtered to exactly its partitions"
+            );
+        }
+        // Every partition count and the first chunk are ready; only the final chunk is late.
+        delay.store(1_500, Ordering::Relaxed);
+        let started = Instant::now();
+        let late = converge(&client, &checks, Duration::from_millis(500)).await;
+        assert!(late.is_err(), "a late final chunk must fail the fixed deadline");
+        assert!(started.elapsed() < Duration::from_millis(1_400));
+        delay.store(0, Ordering::Relaxed);
+        Ok(())
     }
 
     #[tokio::test]
@@ -2267,11 +2569,30 @@ mod tests {
                 client.expose(&name, &table_location("direct", table)?).await?;
             }
             assert_eq!(client.schema(&name).await?, columns(&table_summary.schema)?);
-            let samples = delta_inspect::sample_rows(&root, table, table_summary)?;
+            // One chunk per partition exercises the partition-filtered chunk queries on the emulator.
+            let mut corpus = delta_inspect::sample_corpus(&root, table, table_summary)?;
+            if let Some(column) = corpus.partition_column.clone() {
+                corpus.chunks = corpus
+                    .chunks
+                    .iter()
+                    .flat_map(|chunk| {
+                        chunk.partition_values.iter().map(|partition| ValidationChunk {
+                            partition_values: vec![partition.clone()],
+                            rows: chunk
+                                .rows
+                                .iter()
+                                .filter(|(row, _)| row[&column].as_str() == Some(partition))
+                                .cloned()
+                                .collect(),
+                        })
+                    })
+                    .collect();
+            }
+            corpus.verify()?;
             let fallback = client
-                .multiset(&fallback_source(&name)?, &table_summary.schema, &samples)
+                .corpus_multiset(&fallback_source(&name)?, &table_summary.schema, &corpus)
                 .await?;
-            fallback.check(table_summary.rows, &samples)?;
+            fallback.check(&corpus)?;
             let (_, max_age) = client.max_age(&name).await?;
             let commit_ms = commit_millis(&root, table, table_summary.version);
             let started = Instant::now();
@@ -2280,13 +2601,14 @@ mod tests {
                 let state = CacheState::from_details(&client.details(&name).await);
                 if before.ready() && state.current(table_summary.version, table_summary.rows) {
                     let cached = client
-                        .multiset(&external_source(&name)?, &table_summary.schema, &samples)
+                        .corpus_multiset(&external_source(&name)?, &table_summary.schema, &corpus)
                         .await?;
-                    let verdict = cached.check(table_summary.rows, &samples);
+                    let verdict = cached.check(&corpus);
                     eprintln!(
-                        "{name} v{} rows {} +{}s ready {before:?} {state:?} cached={verdict:?} equal={}",
+                        "{name} v{} rows {} chunks {} +{}s ready {before:?} {state:?} cached={verdict:?} equal={}",
                         table_summary.version,
                         table_summary.rows,
+                        corpus.chunks.len(),
                         started.elapsed().as_secs(),
                         cached == fallback
                     );
