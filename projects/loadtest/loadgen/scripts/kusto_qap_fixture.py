@@ -8,8 +8,8 @@ layout (microsecond timestamp followed by its `__unix_nanos` companion, partitio
 `__arrowcol_ingestion`) with boundary values for every declared type.
 
 `prune-assert-N` checks the `_delta_log` that delta-maintenance VACUUM/checkpoint/prune-log left
-after cycle N: the floor equals the newest checkpoint and head, no JSON or older checkpoint
-survives at or below it, and the checkpoint keeps the table id, every application transaction
+after cycle N: the floor equals the newest checkpoint and head, its own JSON commit is kept while
+every older JSON commit and checkpoint is gone, and the checkpoint keeps the table id, every application transaction
 (receipts and the purge watermark) and the tombstones, whose files are physically gone.
 """
 import json
@@ -124,7 +124,8 @@ def prune_assert(cycle):
         entries = sorted(os.listdir(log))
         commits = [int(entry[:20]) for entry in entries if re.fullmatch(r"\d{20}\.json", entry)]
         checkpoints = [entry for entry in entries if ".checkpoint." in entry]
-        assert commits == [], f"{name}: JSON commits survive at or below floor {floor_version}: {commits}"
+        # Standard Delta metadata cleanup keeps the checkpoint version's own commit and drops all below it.
+        assert commits == [floor_version], f"{name}: expected only JSON {floor_version} at the floor: {commits}"
         assert checkpoints == [f"{floor_version:020}.checkpoint.parquet"], f"{name}: {checkpoints}"
         checkpoint = pq.read_table(f"{log}/{checkpoints[0]}").to_pylist()
         metadata = [row["metaData"] for row in checkpoint if row.get("metaData")]
