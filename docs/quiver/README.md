@@ -1,8 +1,12 @@
 # Quiver on disk
 
-`quiver-cli` writes real SQL Server telemetry to
+`quiver-cli` writes captured SQL Server telemetry with synthetic customer labels
+using the Direct collector's
 [Quiver](../../submodules/otel-arrow/rust/otap-dataflow/crates/quiver/README.md)
-exactly as the Direct collector does, then shows what each file holds.
+bundle and WAL format, then shows what each file holds. Its `consume` command
+demonstrates subscriber acknowledgements; it does not publish to Delta.
+Production clients may purge only after a `published` receipt explicitly grants
+`purge_allowed`, not after the earlier durable-admission acknowledgement.
 
 ![Life of a bundle, and the quiver-cli command that shows each step](diagrams/lifecycle.png)
 
@@ -104,7 +108,7 @@ write-ahead log of onelake/quiver-demo: 1 file(s), 28 entries
 
 ```bash
 npx nx run quiver-cli:run -- segments
-npx nx run quiver-cli:run -- show --columns wait_type,wait_category,wait_time_ms,waiting_tasks_count
+npx nx run quiver-cli:run -- show --columns customer_id,wait_type,wait_category,wait_time_ms,waiting_tasks_count
 ```
 
 ```text
@@ -147,7 +151,9 @@ first 5 of 128 rows (slot 0, decoded from Arrow IPC)
 | `manifest` | What a restarted collector publishes from, without SQL |
 | The rows | The CSV rows, decoded back from Arrow IPC |
 
-Receipt, lease, and owner IDs are synthetic and change on every run.
+Receipt, lease, and owner IDs are synthetic and change on every run. Production
+replay retains the original publication identity and ingestion-time UTC stamp;
+this is not deduplication of independent client requests.
 
 ## 5. Consume
 
@@ -191,7 +197,7 @@ onelake/quiver-demo  (834.3 KiB in Quiver files)
 ```bash
 npx nx run quiver-cli:run -- crash --bundles 5
 npx nx run quiver-cli:run -- wal --last 7
-npx nx run quiver-cli:run -- show --wal 32 --rows 3 --columns wait_type,wait_time_ms,waiting_tasks_count
+npx nx run quiver-cli:run -- show --wal 32 --rows 3 --columns customer_id,wait_type,wait_time_ms,waiting_tasks_count
 ```
 
 ```text
@@ -289,7 +295,9 @@ opened onelake/quiver-demo like a restarted collector
 ## 8. The benchmark's directories
 
 Run the load test with Quiver, then point the read-only commands at its
-directories.
+directories. The live directory transcripts in this section are historical
+examples, not qualification of the current source images. Byte positions, file
+sizes, and outstanding bundles depend on the run.
 
 ```bash
 npx nx run loadtest:run -- --quiver --measure 2m
@@ -367,7 +375,10 @@ onelake/benchmark/latest/dataflow-state-1/quiver/core_1  (48.4 MiB in Quiver fil
 holds 30 snapshots of `sys.dm_os_wait_stats`, 5 s apart, from the load test's
 SQL Server 2022 during a `loadtest:run`. Columns follow
 [`sqlserver.sql`](../../projects/loadtest/schemas/sqlserver.sql); wait types
-map to Query Store wait categories. Recapture during a load test:
+map to Query Store wait categories. A leading `customer_id` cycles through 16
+synthetic labels independently of the captured SQL statistics, matching the
+loadtest's required customer column. The capture script supplies these labels
+without changing the original telemetry values. Recapture during a load test:
 
 ```bash
 bin/quiver-cli/data/capture-wait-stats.sh 30 5 > bin/quiver-cli/data/sqlserver_wait_stats.csv

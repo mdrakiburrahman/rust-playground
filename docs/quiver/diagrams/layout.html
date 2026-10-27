@@ -225,10 +225,10 @@
 
   <div class="note">
     <strong>WAL first, segments second.</strong>
-    <span>Bundle = one Arrow batch + its JSON manifest &middot; the WAL keeps the bytes until a segment does.</span>
+    <span>Bundle = Arrow batch + manifest &middot; production replay retains its publication ID and ingestion-time UTC stamp.</span>
   </div>
   <footer>
-    <span>Real <code>sys.dm_os_wait_stats</code> rows &middot; same bundle format as the Direct collector</span>
+    <span>Real wait statistics + synthetic customer labels &middot; the demo does not perform Delta publication</span>
     <span>
       <a href="../../../bin/quiver-cli/src/generate.rs">Generator</a>
       &middot; <a href="../../../crates/arrowcol-buffer/src/quiver.rs">Direct collector stage</a>

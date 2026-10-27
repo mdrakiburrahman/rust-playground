@@ -194,6 +194,22 @@ test('Kernel consumer lint caches include their library dependencies', () => {
   }
 });
 
+test('Azure writer images install the shared CLI and reap orphan descendants', () => {
+  for (const project of ['arrowcol-rust', 'arrowcol-dataflow-rust', 'delta-maintenance', 'arrow-tenant-stream']) {
+    const dockerfile = readFileSync(
+      join(workspace, projectPath(project).replace(/project\.json$/u, 'Dockerfile')),
+      'utf8',
+    );
+    assert.match(dockerfile, /sh \/tmp\/install-azure-cli\.sh/u, project);
+    assert.match(
+      dockerfile,
+      /COPY(?: --chmod=\d+)? infra\/docker\/install-azure-cli\.sh \/tmp\/install-azure-cli\.sh/u,
+      project,
+    );
+    assert.match(dockerfile, /ENTRYPOINT \[\s*"\/usr\/bin\/tini"/u, project);
+  }
+});
+
 test('shared CLI helper installs TLS prerequisites through a signed pinned repository', () => {
   const helper = readFileSync(join(workspace, 'infra/docker/install-azure-cli.sh'), 'utf8');
   assert.match(helper, /apt-get install -y --no-install-recommends ca-certificates curl gpg/u);

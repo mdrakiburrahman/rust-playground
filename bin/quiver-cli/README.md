@@ -38,7 +38,11 @@ marker that `generate` leaves, so they never touch a collector's directory.
 The default data is [`sqlserver_wait_stats.csv`](data/sqlserver_wait_stats.csv),
 3,546 real `sys.dm_os_wait_stats` rows captured with
 [`capture-wait-stats.sh`](data/capture-wait-stats.sh). Its schema comes from
-the load test DDL in `projects/loadtest/schemas/sqlserver.sql`.
+the load test DDL in `projects/loadtest/schemas/sqlserver.sql`. The leading
+`customer_id` cycles through 16 synthetic labels (`customer-0000` through
+`customer-0015`); the original wait-statistic values are unchanged. The capture
+script adds the same labels when refreshing the fixture. Custom CSV input must
+include this required first column as well.
 
 The guided tour is [Quiver on disk](../../docs/quiver/README.md). Its
 walkthrough also runs as an integration test:

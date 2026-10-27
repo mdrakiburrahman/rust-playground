@@ -726,7 +726,11 @@ dependencies = [
  "arrowcol-protocol",
  "arrowcol-receipts",
  "async-trait",
+ "delta_kernel",
  "futures",
+ "opentelemetry 0.31.0",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk 0.31.0",
  "otel-arrow-dfe-quiver",
  "serde",
  "serde_json",
@@ -734,6 +738,8 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "tracing-subscriber",
+ "url",
  "uuid",
 ]
 
@@ -773,6 +779,7 @@ dependencies = [
  "arrow-deltalake",
  "arrow-flight",
  "arrow-schema 58.4.0",
+ "arrowcol-buffer",
  "arrowcol-catalog",
  "arrowcol-flight",
  "arrowcol-protocol",
@@ -804,8 +811,13 @@ dependencies = [
 name = "arrowcol-dataflow-rust"
 version = "0.1.0"
 dependencies = [
+ "arrow-deltalake",
+ "arrowcol-buffer",
  "arrowcol-dataflow-components",
+ "delta_kernel",
  "otel-arrow-dfe",
+ "otel-arrow-dfe-telemetry",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -979,6 +991,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "clap",
+ "delta_kernel",
  "futures",
  "hmac",
  "http",
