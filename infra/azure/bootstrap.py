@@ -840,17 +840,27 @@ def require_released_or_owner(metadata, owner):
         raise Failure("Only the active cloud test owner may reconcile isolated table bindings.")
 
 
-def reconcile_command(azure, tables, owner):
-    """Public reconcile: registered normal member around cluster start and all KQL."""
+def reconcile_command(azure, tables, owner, wait_seconds=0, expected=None):
+    """Public reconcile: registered normal member around cluster start and all KQL.
+
+    Under test occupancy the caller's captured generation is mandatory; the
+    member is admitted only at that generation (admit re-checks it in the
+    leased transition), so a rotated sandbox fails before any ARM/KQL I/O.
+    """
     from publisher_control import PublisherControl
     control = PublisherControl(azure)
     metadata, _, _ = control.read()
     require_released_or_owner(metadata, owner)
+    if metadata["occupancy"] == "testing" and not expected:
+        raise Failure("Reconcile under test occupancy requires the captured "
+                      "ARROWCOL_RESET_GENERATION (or --reset-generation).")
+    if expected and expected != metadata["resetgeneration"]:
+        raise Failure("Reset generation changed since occupancy; reconcile refused before I/O.")
     generation, member = metadata["resetgeneration"], str(uuid.uuid4())
     control.admit(member, generation)
     def work():
         ensure_running(azure)
-        reconcile(azure, tables)
+        reconcile(azure, tables, wait_seconds)
     held(control, member, generation, work)
     control.clean_release(member, generation, definitively_drained=True)
 
@@ -924,7 +934,8 @@ def main(argv=None):
             preflight(azure)
             provision(azure, args.tables, args.wait_seconds, args.output, args.infra_only, values)
         elif args.command == "reconcile":
-            reconcile_command(azure, args.tables, args.occupancy_id)
+            reconcile_command(azure, args.tables, args.occupancy_id, args.wait_seconds,
+                              args.reset_generation or values.get("ARROWCOL_RESET_GENERATION"))
         elif args.command == "reset":
             reset(azure, args.execute, args.stop_command or [
                 "npx", "--no-install", "tsx", "projects/loadtest/src/main.ts", "--stop",

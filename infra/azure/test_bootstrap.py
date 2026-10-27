@@ -1035,6 +1035,21 @@ class ProvisionCoordinationTests(unittest.TestCase):
         self.assertTrue(all(len(item[2]) == 1 for item in self.observed))
         self.assertEqual(self.registry(), {})
 
+    def test_occupied_reconcile_requires_captured_generation_and_forwards_wait(self):
+        owner, generation = str(uuid.uuid4()), self.azure.metadata["resetgeneration"]
+        b.occupancy(self.azure, "occupy", owner)
+        for expected in (None, str(uuid.uuid4())):
+            with self.assertRaisesRegex(b.Failure, "generation"):
+                b.reconcile_command(self.azure, self.tables, owner, 120, expected)
+        self.assertEqual(self.observed, [])
+        self.assertEqual(self.registry(), {})
+        waits = []
+        with patch.object(b, "reconcile", side_effect=lambda a, t, w=0: waits.append(w)):
+            b.reconcile_command(self.azure, self.tables, owner, 120, generation)
+        self.assertEqual(waits, [120])
+        self.assertEqual(self.registry(), {})
+        self.assertEqual(self.azure.metadata["occupancy"], "testing")
+
     def test_unknown_arm_start_keeps_member_blocking_and_stop_refused(self):
         self.azure.cluster_state = "Stopped"
         def unknown(*args):
