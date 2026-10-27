@@ -5,8 +5,8 @@
 use anyhow::{Context, Result, bail};
 use arrow_deltalake::delta::DeltaTable;
 use arrow_deltalake::maintenance::{
-    Granularity, MaintenanceControl, MaintenanceErrorKind, MaintenancePlan, MaintenanceReport, OptimizeConfig, Outcome,
-    PruneConfig, PurgeConfig, VacuumConfig, error_details, now_ms,
+    Granularity, MaintenanceControl, MaintenanceErrorKind, MaintenancePlan, MaintenanceReport, OptimizeConfig,
+    OptimizePlan, Outcome, PruneConfig, PurgeConfig, VacuumConfig, error_details, now_ms,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, VecDeque};
@@ -90,6 +90,11 @@ impl Settings {
     /// # Errors
     /// Returns a description of the first invalid setting.
     pub fn validate(&self) -> Result<()> {
+        if self.optimize.sealed_final
+            && (self.interval.is_some() || self.max_cycles.is_some() || self.operations != [Operation::Optimize])
+        {
+            bail!("--sealed-final requires one-shot optimize only, without --interval-secs or --max-cycles");
+        }
         if !matches!(self.root.scheme(), "file" | "abfss" | "az" | "azure" | "https") {
             bail!("unsupported root URL scheme {}", self.root.scheme());
         }
@@ -158,10 +163,53 @@ pub struct OperationResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub report: Option<MaintenanceReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub optimize: Option<OptimizeEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error_kind: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub duration_ms: u64,
+}
+
+/// Exact planner inputs and effective bounds, retained even if applying fails.
+#[derive(Clone, Debug, Serialize)]
+pub struct OptimizeEvidence {
+    pub config: serde_json::Value,
+    pub plan: OptimizePlan,
+}
+
+impl OptimizeEvidence {
+    fn new(config: &OptimizeConfig, plan: OptimizePlan) -> Self {
+        Self {
+            config: serde_json::json!({
+                "sealed_final": config.sealed_final,
+                "granularity": config.granularity,
+                "now_ms": config.now_ms,
+                "latest_partitions": config.latest_partitions,
+                "target_file_bytes": config.target_file_bytes,
+                "small_file_bytes": config.small_file_bytes,
+                "max_files_per_bin": config.max_files_per_bin,
+                "max_bins_per_commit": config.max_bins_per_commit,
+                "max_actions_per_commit": config.max_actions_per_commit,
+                "max_plan_bytes": config.max_plan_bytes,
+                "max_decoded_bytes_per_bin": config.max_decoded_bytes_per_bin,
+                "max_row_group_bytes": config.max_row_group_bytes,
+                "max_batch_bytes": config.max_batch_bytes,
+                "batch_rows": config.batch_rows,
+                "max_output_file_bytes": config.max_output_file_bytes,
+                "max_active_files": config.max_active_files,
+                "layout": config.layout.as_ref().map(|layout| serde_json::json!({
+                    "sort_columns": layout.sort_columns,
+                    "max_rows": layout.max_rows,
+                    "max_input_bytes": layout.max_input_bytes,
+                    "row_group_rows": layout.row_group_rows,
+                    "page_rows": layout.page_rows,
+                    "bloom_columns": layout.bloom_columns,
+                })),
+            }),
+            plan,
+        }
+    }
 }
 
 impl OperationResult {
@@ -406,6 +454,7 @@ fn run_operation(
     table: &DeltaTable,
     operation: Operation,
     control: &MaintenanceControl,
+    optimize: &mut Option<OptimizeEvidence>,
 ) -> Result<MaintenanceReport> {
     let anchor = match settings.anchor_ms {
         Some(anchor) => anchor,
@@ -435,6 +484,7 @@ fn run_operation(
                 ..settings.optimize.clone()
             };
             let plan = table.plan_optimize(&config)?;
+            *optimize = Some(OptimizeEvidence::new(&config, plan.clone()));
             if settings.apply {
                 return table.apply_optimize(&plan, &config, control);
             }
@@ -484,8 +534,9 @@ fn maintain_table(
         }
         let started = Instant::now();
         let control = MaintenanceControl::new(Arc::clone(cancel), Some(started + settings.operation_timeout));
+        let mut optimize = None;
         let outcome = match &table {
-            Ok(table) => run_operation(settings, table, operation, &control),
+            Ok(table) => run_operation(settings, table, operation, &control, &mut optimize),
             Err(error) => Err(anyhow::anyhow!("open failed: {error:#}")),
         };
         let mut result = OperationResult {
@@ -493,6 +544,7 @@ fn maintain_table(
             operation,
             applied: settings.apply,
             report: None,
+            optimize,
             error_kind: None,
             error: None,
             duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),

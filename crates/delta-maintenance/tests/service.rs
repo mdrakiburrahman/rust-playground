@@ -86,6 +86,110 @@ fn service(root: &Path) -> Result<Command> {
     Ok(command)
 }
 
+/// One-shot final compaction uses the identical planner in dry-run and apply.
+/// Fresh empty-plan evidence, not zero output counters alone, establishes no-op.
+#[test]
+fn sealed_final_dry_run_apply_and_fresh_noop_evidence() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("events");
+    table(&path)?;
+    let before = version(&path)?;
+    let args = ["--operation", "optimize", "--sealed-final"];
+    let dry = service(root.path())?.args(args).output()?;
+    assert!(dry.status.success(), "{}", String::from_utf8_lossy(&dry.stderr));
+    let dry = lines(&dry.stdout)?;
+    assert_eq!(dry.len(), 1);
+    let evidence = &dry[0];
+    assert_eq!(evidence["applied"], false);
+    assert_eq!(evidence["optimize"]["config"]["sealed_final"], true);
+    assert_eq!(evidence["optimize"]["config"]["max_files_per_bin"], 64);
+    assert_eq!(evidence["optimize"]["config"]["granularity"], "minute");
+    assert_eq!(evidence["optimize"]["plan"]["bins"].as_array().map(Vec::len), Some(4));
+    assert_eq!(evidence["optimize"]["plan"]["protected_partitions"], 0);
+    assert_eq!(evidence["report"]["files_removed"], 8);
+    assert_eq!(
+        evidence["report"]["files_added"], 0,
+        "outputs do not exist before rewrite"
+    );
+    assert_eq!(version(&path)?, before, "dry run changes no Delta version");
+
+    let apply = service(root.path())?.args(args).arg("--apply").output()?;
+    assert!(apply.status.success(), "{}", String::from_utf8_lossy(&apply.stderr));
+    let apply = lines(&apply.stdout)?;
+    assert_eq!(apply.len(), 1);
+    assert_eq!(apply[0]["report"]["outcome"], "committed");
+    assert_eq!(apply[0]["report"]["files_removed"], 8);
+    assert_eq!(apply[0]["report"]["files_added"], 4);
+    assert_eq!(apply[0]["report"]["outputs"].as_array().map(Vec::len), Some(4));
+    assert_eq!(apply[0]["optimize"]["plan"]["bins"].as_array().map(Vec::len), Some(4));
+    assert_eq!(version(&path)?, before + 1);
+    for apply in [false, true] {
+        let mut command = service(root.path())?;
+        command.args(args);
+        if apply {
+            command.arg("--apply");
+        }
+        let output = command.output()?;
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let reports = lines(&output.stdout)?;
+        assert_eq!(reports.len(), 1);
+        let report = &reports[0];
+        assert_eq!(report["table"], "events");
+        assert_eq!(report["operation"], "optimize");
+        assert!(report.get("error").is_none());
+        assert!(report.get("error_kind").is_none());
+        assert_eq!(report["report"]["outcome"], if apply { "noop" } else { "planned" });
+        assert_eq!(report["optimize"]["plan"]["bins"], serde_json::json!([]));
+        assert_eq!(report["optimize"]["plan"]["backlog_files"], 0);
+        assert_eq!(report["optimize"]["plan"]["protected_partitions"], 0);
+        assert_eq!(report["optimize"]["plan"]["skipped_partitions"], 0);
+        assert_eq!(report["report"]["files_removed"], 0);
+        assert_eq!(report["report"]["files_added"], 0);
+        assert_eq!(report["report"]["read_version"], report["report"]["version"]);
+        assert_eq!(
+            report["report"]["read_version"],
+            report["optimize"]["plan"]["header"]["read_version"]
+        );
+        assert_eq!(version(&path)?, before + 1);
+    }
+    Ok(())
+}
+
+/// Invalid final-compaction combinations fail configuration before table
+/// discovery, publisher/store setup or metrics startup, in dry-run and apply.
+#[test]
+fn sealed_final_rejects_schedules_and_other_operations_before_effects() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let nonexistent = root.path().join("must-not-exist");
+    let invalid = [
+        vec!["--operation", "optimize", "--interval-secs", "1"],
+        vec!["--operation", "optimize", "--max-cycles", "1"],
+        vec!["--operation", "purge"],
+        vec!["--operation", "vacuum"],
+        vec!["--operation", "checkpoint"],
+        vec!["--operation", "prune-log"],
+        vec!["--operation", "optimize", "--operation", "purge"],
+        vec!["--operation", "optimize", "--operation", "vacuum"],
+        vec!["--operation", "optimize", "--operation", "checkpoint"],
+        vec!["--operation", "optimize", "--operation", "prune-log"],
+    ];
+    for apply in [false, true] {
+        for args in &invalid {
+            let mut command = service(&nonexistent)?;
+            command.args(args).arg("--sealed-final");
+            if apply {
+                command.arg("--apply");
+            }
+            let output = command.output()?;
+            assert_eq!(output.status.code(), Some(2), "{args:?}");
+            assert!(output.stdout.is_empty(), "invalid configuration must not run tables");
+            assert!(String::from_utf8_lossy(&output.stderr).contains("--sealed-final requires one-shot optimize only"));
+            assert!(!nonexistent.exists(), "no table/root discovery or filesystem effects");
+        }
+    }
+    Ok(())
+}
+
 /// Scenario: one-shot dry run, then `--apply`, then a repeat.
 /// Guarantees: dry runs never change the table, apply compacts and purges with
 /// JSON reports, and a repeated apply is a no-op without new commits.

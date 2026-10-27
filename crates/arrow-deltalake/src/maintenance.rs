@@ -1131,6 +1131,10 @@ pub struct OptimizeConfig {
     pub max_plan_bytes: usize,
     /// Only the newest N eligible (unprotected) partitions; `None` means all.
     pub latest_partitions: Option<usize>,
+    /// Opt-in final-compaction policy: include newest and open ingestion partitions.
+    /// This bypasses only churn protection, not retention or publication authority.
+    /// The caller must establish any required writer-release/lifecycle proof.
+    pub sealed_final: bool,
     /// Required for `__arrowcol_ingestion` tables.
     pub granularity: Option<Granularity>,
     /// Wall-clock anchor for open-partition protection (defaults to now).
@@ -1158,6 +1162,7 @@ impl Default for OptimizeConfig {
             max_actions_per_commit: 2048,
             max_plan_bytes: 1024 * 1024,
             latest_partitions: None,
+            sealed_final: false,
             granularity: None,
             now_ms: None,
             max_decoded_bytes_per_bin: 1024 * 1024 * 1024,
@@ -1308,7 +1313,7 @@ impl DeltaTable {
             }
             valid.sort_by_key(|entry| std::cmp::Reverse(entry.0));
             for (index, (start, key, files)) in valid.into_iter().enumerate() {
-                if index == 0 || start.saturating_add(granularity.width_ms()) > now {
+                if !config.sealed_final && (index == 0 || start.saturating_add(granularity.width_ms()) > now) {
                     protected += 1;
                 } else {
                     ordered.push((key, files));

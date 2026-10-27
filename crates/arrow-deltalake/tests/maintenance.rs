@@ -192,6 +192,114 @@ fn files_in(root: &Path, partition: &str) -> Result<usize> {
     Ok(active_files(root)?.values().filter(|value| *value == partition).count())
 }
 
+/// Final-compaction policy bypasses only frontier churn protection, preserving
+/// exact rows, schema, partitions, publication transactions and no-op semantics.
+#[test]
+fn sealed_final_optimize_preserves_frontier_data_and_publication_txns() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = create(root.path())?;
+    for (index, app_id) in PUBLICATIONS.iter().enumerate() {
+        let index = i64::try_from(index)?;
+        append_published(&table, index, index * 10..index * 10 + 3, app_id)?;
+        append(&table, index, index * 10 + 3..index * 10 + 6)?;
+    }
+    append(&table, 2, 20..23)?;
+    append(&table, 2, 23..26)?;
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let before_rows = rows(root.path())?;
+    let before_txns = txn_versions(&maintenance)?;
+    let closed = maintenance.plan_optimize(&optimize_config())?;
+    assert!(!OptimizeConfig::default().sealed_final);
+    assert_eq!(closed.protected_partitions, 1, "newest is protected even when closed");
+    let default = OptimizeConfig {
+        now_ms: Some(BASE + 30_000),
+        ..optimize_config()
+    };
+    let protected = maintenance.plan_optimize(&default)?;
+    assert_eq!(protected.protected_partitions, 3, "all open partitions stay protected");
+    assert!(protected.bins.is_empty());
+
+    let config = OptimizeConfig {
+        sealed_final: true,
+        ..default
+    };
+    let plan = maintenance.plan_optimize(&config)?;
+    assert_eq!(plan.protected_partitions, 0);
+    assert_eq!(plan.bins.len(), 3);
+    let before = maintenance.version()?;
+    let report = maintenance.apply_optimize(&plan, &config, &control())?;
+    assert_eq!(report.outcome, Outcome::Committed);
+    assert_eq!(report.version, before + 1);
+    assert_eq!((report.files_removed, report.files_added), (6, 3));
+    assert_eq!(rows(root.path())?, before_rows);
+    assert_eq!(txn_versions(&maintenance)?, before_txns);
+    for index in 0..3 {
+        assert_eq!(files_in(root.path(), &minute(index))?, 1);
+    }
+    let actions = commit_actions(root.path(), report.version)?;
+    let changes: Vec<_> = actions
+        .iter()
+        .filter_map(|action| action.get("add").or_else(|| action.get("remove")))
+        .collect();
+    assert_eq!(changes.len(), 9);
+    assert!(changes.iter().all(|change| change["dataChange"] == false));
+    assert_eq!(
+        actions.iter().filter(|action| action.get("txn").is_some()).count(),
+        1,
+        "only the existing maintenance plan-id transaction is added"
+    );
+    let noop = maintenance.plan_optimize(&config)?;
+    assert_eq!(
+        noop.header.fingerprint, plan.header.fingerprint,
+        "schema and metadata unchanged"
+    );
+    assert!(noop.bins.is_empty());
+    assert_eq!(
+        maintenance.apply_optimize(&noop, &config, &control())?.outcome,
+        Outcome::Noop
+    );
+    assert_eq!(maintenance.version()?, report.version);
+    assert_eq!(txn_versions(&maintenance)?, before_txns);
+    Ok(())
+}
+
+/// Within existing byte/row bounds, 65 tiny files need two real passes because
+/// a bin admits at most 64 inputs. A third fresh plan is empty.
+#[test]
+fn sealed_final_optimize_two_passes_with_more_than_64_small_files() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = create(root.path())?;
+    for id in 0..65 {
+        append(&table, 0, id..id + 1)?;
+    }
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let config = OptimizeConfig {
+        sealed_final: true,
+        ..optimize_config()
+    };
+    let before_rows = rows(root.path())?;
+    let before = maintenance.version()?;
+    for (pass, expected_files) in [(1, 2), (2, 1)] {
+        let plan = maintenance.plan_optimize(&config)?;
+        assert_eq!(plan.bins.len(), 1);
+        assert!(plan.bins[0].files.len() <= config.max_files_per_bin);
+        let report = maintenance.apply_optimize(&plan, &config, &control())?;
+        assert_eq!(report.outcome, Outcome::Committed);
+        assert_eq!(report.version, before + pass);
+        assert_eq!(files_in(root.path(), &minute(0))?, expected_files);
+        assert_eq!(rows(root.path())?, before_rows);
+    }
+    let noop = maintenance.plan_optimize(&config)?;
+    assert!(noop.bins.is_empty());
+    assert_eq!(noop.backlog_files, 0);
+    assert_eq!(
+        maintenance.apply_optimize(&noop, &config, &control())?.outcome,
+        Outcome::Noop
+    );
+    assert_eq!(maintenance.version()?, before + 2);
+    Ok(())
+}
+
 /// Scenario: four minute partitions of two small files each, latest-2 OPTIMIZE.
 /// Guarantees: the newest partition is protected, only the latest two closed partitions
 /// are rewritten from real Parquet with identical rows/schema in one dataChange=false
@@ -446,17 +554,79 @@ fn purge_rejects_concurrent_adds_into_expired_partitions() -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
 struct BarrierFence {
     reached: Mutex<Option<Sender<()>>>,
     release: Mutex<Option<Receiver<()>>>,
     calls: AtomicUsize,
 }
 
-impl PublicationFence for BarrierFence {
-    fn check_before_commit(
-        &self,
-        _context: &PublicationFenceContext<'_>,
-    ) -> std::result::Result<(), PublicationFenceError> {
+/// An actual blind append commits while sealed OPTIMIZE is inside apply, paused
+/// at its input read. Revalidation preserves that unrelated active file.
+#[test]
+fn sealed_final_optimize_revalidates_inputs_after_concurrent_append() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = create(root.path())?;
+    append(&table, 0, 0..3)?;
+    append(&table, 0, 3..6)?;
+    drop(table);
+    let (reached_tx, reached_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let barrier = Arc::new(BarrierFence {
+        reached: Mutex::new(Some(reached_tx)),
+        release: Mutex::new(Some(release_rx)),
+        calls: AtomicUsize::new(0),
+    });
+    let store = Arc::new(UncertainStore {
+        inner: LocalFileSystem::new(),
+        target: "no-uncertain-commit-in-this-test".to_owned(),
+        unreadable: AtomicBool::new(false),
+        attempts: AtomicUsize::new(0),
+        read_barrier: Some(barrier),
+    });
+    let table = DeltaTable::open_with_store(root.path(), store)?;
+    let config = OptimizeConfig {
+        sealed_final: true,
+        ..optimize_config()
+    };
+    let plan = table.plan_optimize(&config)?;
+    assert_eq!(plan.bins.len(), 1);
+    let planned: BTreeSet<_> = plan.bins[0].files.iter().map(|file| file.path.clone()).collect();
+    let report = std::thread::scope(|scope| -> Result<_> {
+        let apply = scope.spawn(|| table.apply_optimize(&plan, &config, &control()));
+        let appended = (|| -> Result<_> {
+            reached_rx.recv_timeout(Duration::from_secs(60))?;
+            let version = append(&table, 0, 100..103)?;
+            let paths = active_files(root.path())?
+                .into_keys()
+                .filter(|path| !planned.contains(path))
+                .collect::<Vec<_>>();
+            Ok((version, paths))
+        })();
+        let released = release_tx.send(());
+        let applied = apply.join().map_err(|_| anyhow!("OPTIMIZE thread panicked"))?;
+        let (version, paths) = appended?;
+        released?;
+        let report = applied?;
+        assert_eq!(report.version, version + 1);
+        let active = active_files(root.path())?;
+        assert_eq!(paths.len(), 1);
+        assert!(
+            active.contains_key(&paths[0]),
+            "concurrent append is not a planned removal"
+        );
+        Ok(report)
+    })?;
+    assert_eq!(report.outcome, Outcome::Committed);
+    assert_eq!((report.files_removed, report.files_added), (2, 1));
+    let mut all = expected(0..6, &minute(0));
+    all.extend(expected(100..103, &minute(0)));
+    assert_eq!(rows(root.path())?, sorted(all));
+    Ok(())
+}
+
+impl BarrierFence {
+    fn wait(&self) -> std::result::Result<(), PublicationFenceError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let reached = self.reached.lock().ok().and_then(|mut slot| slot.take());
         if let Some(reached) = reached {
@@ -471,6 +641,15 @@ impl PublicationFence for BarrierFence {
             }
         }
         Ok(())
+    }
+}
+
+impl PublicationFence for BarrierFence {
+    fn check_before_commit(
+        &self,
+        _context: &PublicationFenceContext<'_>,
+    ) -> std::result::Result<(), PublicationFenceError> {
+        self.wait()
     }
 }
 
@@ -1051,6 +1230,7 @@ struct UncertainStore {
     target: String,
     unreadable: AtomicBool,
     attempts: AtomicUsize,
+    read_barrier: Option<Arc<BarrierFence>>,
 }
 
 impl std::fmt::Display for UncertainStore {
@@ -1087,6 +1267,14 @@ impl ObjectStore for UncertainStore {
     }
 
     async fn get_opts(&self, path: &object_store::path::Path, options: GetOptions) -> object_store::Result<GetResult> {
+        if path.as_ref().ends_with(".parquet")
+            && let Some(barrier) = &self.read_barrier
+        {
+            barrier.wait().map_err(|error| object_store::Error::Generic {
+                store: "input_read_barrier",
+                source: Box::new(error),
+            })?;
+        }
         if self.unreadable.load(Ordering::SeqCst)
             && self.attempts.load(Ordering::SeqCst) != 0
             && path.as_ref().ends_with(&self.target)
@@ -1155,6 +1343,7 @@ fn optimize_uncertain_commit_never_discards_outputs() -> Result<()> {
             target,
             unreadable: AtomicBool::new(unreadable),
             attempts: AtomicUsize::new(0),
+            read_barrier: None,
         });
         let maintenance = DeltaTable::open_with_store(root.path(), Arc::clone(&store) as Arc<dyn ObjectStore>)?;
         let plan = maintenance.plan_optimize(&optimize_config())?;

@@ -68,6 +68,10 @@ struct Cli {
     target_file_mib: u64,
     #[arg(long)]
     latest_partitions: Option<usize>,
+    /// Include newest/open OPTIMIZE partitions; caller supplies lifecycle proof.
+    /// One-shot optimize only, in either dry-run or apply mode.
+    #[arg(long)]
+    sealed_final: bool,
     /// `checkpoint` writes once this many commits follow the hinted checkpoint.
     #[arg(long, default_value_t = 100)]
     checkpoint_every_commits: u64,
@@ -113,6 +117,7 @@ fn settings(cli: Cli) -> Result<Settings> {
             target_file_bytes: target,
             small_file_bytes: (target / 2).max(1),
             latest_partitions: cli.latest_partitions,
+            sealed_final: cli.sealed_final,
             ..defaults
         },
     };

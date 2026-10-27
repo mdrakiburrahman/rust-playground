@@ -19,7 +19,7 @@ It is a separate process, not a collector task. It opens tables with `DeltaTable
 - **Dry run by default.** The service plans and prints JSON reports and changes nothing unless you pass `--apply`.
 - **Applying revalidates first.** Before applying a plan the service rechecks the table id, metadata, protocol and the exact readset. Stale plans fail with `stale_plan` or `metadata_changed`.
 - **Commit retries are bounded.** Commit collisions retry at most 8 times within 10 seconds, with jitter.
-- **Newest partition is protected.** The newest, still-open ingestion partition is never optimized or purged.
+- **Default frontier protection.** OPTIMIZE protects the newest ingestion partition and every still-open partition. Only the explicit one-shot `--sealed-final` OPTIMIZE policy bypasses this churn protection. PURGE protection is unchanged.
 - **Bad partitions are never deleted.** Malformed or null partition values fail closed.
 - **No empty commits.** No-op runs and repeated runs leave the table version unchanged. The watermark is never committed on its own.
 - **VACUUM retention has a 7-day floor.** Shorter retention needs `--unsafe-short-vacuum-for-tests` and a marked disposable temp root.
@@ -78,6 +78,59 @@ delta-maintenance --root abfss://c@acct.dfs.core.windows.net/delta/ --table even
 - Each operation is limited by `--operation-timeout-secs`.
 - A heartbeat line goes to stderr every cycle.
 - SIGINT and SIGTERM stop the service between bounded steps.
+
+### Final-compaction policy and evidence
+
+`--sealed-final` is an opt-in **OPTIMIZE churn policy**, not a verified seal,
+publisher-release receipt, reader lease, or retention override. Its default is
+false. It includes valid newest and still-open ingestion partitions in the same
+small-file planner. Null/malformed partitions remain skipped. Every existing
+byte, row, bin, action and decoding bound still applies; one file per partition
+is not guaranteed. Unrelated blind appends remain compatible: apply revalidates
+each planned input and preserves files appended after planning.
+
+The CLI accepts this flag only for one-shot `--operation optimize`, both dry-run
+and apply. It rejects `--interval-secs`, `--max-cycles`, and any mixed or other
+operation before opening tables or starting telemetry/metrics. It changes no
+VACUUM, PURGE, log-cleanup, publication-transaction or retention safety rule.
+Compaction adds its existing maintenance-plan transaction; existing publication
+transactions remain intact.
+
+```bash
+# Inspect the real final-compaction plan; no files or commits are changed.
+delta-maintenance --root file:///data/delta/ --table events --operation optimize \
+  --granularity minute --sealed-final
+# Apply one bounded plan; repeat planning explicitly if work remains.
+delta-maintenance --root file:///data/delta/ --table events --operation optimize \
+  --granularity minute --sealed-final --apply
+```
+
+Each OPTIMIZE JSON line includes `optimize.config` (the effective policy and
+limits, including its resolved `now_ms`) and `optimize.plan` (the actual typed
+plan, with `header.read_version`, partition-valued input `bins`, `backlog_files`,
+`protected_partitions`, and `skipped_partitions`). A null config `layout` means
+the existing schema-derived default layout is used. Outputs cannot be known
+until real Parquet rewriting: `report.outputs` and `report.files_added` describe
+actual apply results, not estimated dry-run outputs. `report.read_version` is
+the plan version; `report.version` is the observed/apply result version.
+Evidence is retained on an apply error when planning succeeded.
+
+A fresh **dry-run** empty plan still has `report.outcome = "planned"`, not
+`"noop"`. An empty-plan **apply** has `report.outcome = "noop"` and makes no
+commit. Zero `report.files_added` alone proves neither emptiness nor success.
+Callers must require a successful exit, exactly one error-free OPTIMIZE result
+for every expected table, and real `optimize.plan.bins = []` with no backlog.
+For a complete final-compaction gate they must also reject skipped/protected
+partitions and verify the expected policy/config, table/root/run bindings and
+the current versions. Missing reports or operation failures are not no-ops.
+
+Lifecycle orchestration must independently establish positive writer release,
+clean mutator-drain evidence and run/root/table/SDK bindings before final
+compaction, and join all maintenance processes before capturing immutable reader
+snapshots. This CLI neither verifies those receipts nor orchestrates repeated
+passes. OPTIMIZE preserves exact rows, schema, partition values and history
+using `dataChange=false`; it does not promise a particular external cache
+convergence time or discard historical acceleration work.
 
 ### Exit codes
 
