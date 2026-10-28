@@ -937,6 +937,18 @@ impl ReceiptStore for FakeReceipts {
         }
         Ok(report)
     }
+
+    async fn fail_unbuffered_predecessor_receipts(
+        &self,
+        _successor: CollectorInstanceId,
+        _failed_at: UnixMillis,
+        _limit: usize,
+    ) -> ReceiptResult<ReconciliationReport> {
+        Ok(ReconciliationReport {
+            reconciled: Vec::new(),
+            limit_reached: false,
+        })
+    }
 }
 
 #[derive(Default)]

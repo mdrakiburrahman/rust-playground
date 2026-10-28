@@ -838,7 +838,10 @@ impl AuthConfig {
 pub struct ShutdownConfig {
     /// Time for Flight streams to complete before forced cancellation.
     pub stream_drain_timeout_ms: u64,
-    /// Time for buffer, Delta, and receipt completion.
+    /// Total time for the Quiver drain, buffer, Delta, and receipt completion.
+    ///
+    /// Stream plus publication drain must stay below the supervisor's stop
+    /// budget so a bounded drain failure is recorded instead of killed.
     pub publication_drain_timeout_ms: u64,
 }
 

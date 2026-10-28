@@ -316,6 +316,19 @@ impl ReceiptStore for SqlServerReceiptStore {
     async fn adopt_receipts(&self, request: &ReceiptAdoption) -> ReceiptResult<ReceiptAdoptionReport> {
         retry_deadlock(|| self.inner.adopt_receipts(request)).await
     }
+
+    async fn fail_unbuffered_predecessor_receipts(
+        &self,
+        successor: CollectorInstanceId,
+        failed_at: UnixMillis,
+        limit: usize,
+    ) -> ReceiptResult<ReconciliationReport> {
+        retry_deadlock(|| {
+            self.inner
+                .fail_unbuffered_predecessor_receipts(successor, failed_at, limit)
+        })
+        .await
+    }
 }
 
 #[derive(Clone)]
@@ -1609,6 +1622,112 @@ impl ReceiptStore for RawSqlReceiptStore {
         if let Err(error) = client.finish().await {
             tracing::warn!(
                 operation = "adopt_receipts",
+                error = %error,
+                "SQL Server session cleanup failed after confirmed success; discarding connection"
+            );
+        }
+        Ok(value)
+    }
+
+    async fn fail_unbuffered_predecessor_receipts(
+        &self,
+        successor: CollectorInstanceId,
+        failed_at: UnixMillis,
+        limit: usize,
+    ) -> ReceiptResult<ReconciliationReport> {
+        if limit == 0 || limit > self.config.max_batch_size {
+            return Err(ReceiptError::new(
+                ReceiptErrorKind::RequestTooLarge,
+                format!("unbuffered receipt limit must be in 1..={}", self.config.max_batch_size),
+            ));
+        }
+        let limit_i32 = i32::try_from(limit).map_err(|_| {
+            ReceiptError::new(
+                ReceiptErrorKind::InvalidConfiguration,
+                "unbuffered receipt limit exceeds SQL int",
+            )
+        })?;
+        let failed = datetime(failed_at)?;
+        let successor = successor.as_uuid();
+        let mut client = self.connect().await?;
+        let result: ReceiptResult<_> = async {
+            client
+                .begin_transaction_with_isolation(IsolationLevel::ReadCommitted)
+                .await
+                .map_err(|cause| database_error("begin unbuffered receipt failure", cause))?;
+            let result = async {
+                let rows = client
+                    .query(
+                        "SELECT TOP (@P1) r.receipt_id, r.owner_instance_id, r.revision \
+                     FROM arrowcol.delivery_receipts AS r WITH (UPDLOCK, READPAST, ROWLOCK) \
+                     INNER JOIN arrowcol.collector_instances AS predecessor \
+                       ON predecessor.instance_id = r.owner_instance_id \
+                     INNER JOIN arrowcol.collector_instances AS successor ON successor.instance_id = @P2 \
+                     WHERE r.state = 'accepted' \
+                       AND successor.state IN ('active', 'draining') AND successor.stopped_at_utc IS NULL \
+                       AND predecessor.instance_key = successor.instance_key \
+                       AND predecessor.generation < successor.generation \
+                       AND (predecessor.state = 'failed' OR predecessor.stopped_at_utc IS NOT NULL) \
+                     ORDER BY r.receipt_id;",
+                        &[&limit_i32, &successor],
+                    )
+                    .await
+                    .map_err(|cause| database_error("select unbuffered predecessor receipts", cause))?
+                    .into_first_result()
+                    .await
+                    .map_err(|cause| database_error("read unbuffered predecessor receipts", cause))?;
+                let mut ids = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let id = required_uuid(&row, "receipt_id")?;
+                    let owner = required_uuid(&row, "owner_instance_id")?;
+                    let revision = required_i64(&row, "revision")?;
+                    let updated = client
+                        .query(
+                            "UPDATE arrowcol.delivery_receipts \
+                         SET state = 'retryable_failure', revision = revision + 1, updated_at_utc = @P4, \
+                             heartbeat_at_utc = @P4, failure_disposition = 'retryable', \
+                             error_code = 'publication_failed', \
+                             error_message = 'collector stopped before the batch was durably buffered', \
+                             retry_after_ms = NULL \
+                         OUTPUT INSERTED.receipt_id \
+                         WHERE receipt_id = @P1 AND owner_instance_id = @P2 AND revision = @P3 \
+                           AND state = 'accepted';",
+                            &[&id, &owner, &revision, &failed],
+                        )
+                        .await
+                        .map_err(|cause| database_error("fail unbuffered predecessor receipt", cause))?
+                        .into_row()
+                        .await
+                        .map_err(|cause| database_error("read failed unbuffered receipt", cause))?;
+                    if updated.is_some() {
+                        insert_event(
+                            &mut client,
+                            id,
+                            revision + 1,
+                            Some("accepted"),
+                            "retryable_failure",
+                            successor,
+                            Some("retryable"),
+                            Some("predecessor stopped before durably buffering the batch; successor drained every persisted bundle"),
+                        )
+                        .await?;
+                        ids.push(receipt_id(id)?);
+                    }
+                }
+                let reconciled = receipts_with_client(&mut client, &ids).await?;
+                Ok(ReconciliationReport {
+                    limit_reached: reconciled.len() == limit,
+                    reconciled,
+                })
+            }
+            .await;
+            finish_transaction(&mut client, result, "fail unbuffered predecessor receipts").await
+        }
+        .await;
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(
+                operation = "fail_unbuffered_predecessor_receipts",
                 error = %error,
                 "SQL Server session cleanup failed after confirmed success; discarding connection"
             );

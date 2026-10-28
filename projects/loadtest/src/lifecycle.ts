@@ -251,6 +251,9 @@ function resources(docker: Docker, kind: 'container' | 'network' | 'volume'): Re
   });
 }
 
+/** Seconds a cloud mutator gets to drain before Docker kills it; collector drain budgets must fit inside. */
+export const MUTATOR_STOP_SECONDS = 300;
+
 /** Stops only verified resources owned by this workspace, retaining data for inspection. */
 export async function stopBenchmark(
   workspace: string, docker: Docker, options: { requireCleanMutators?: boolean; mutatorsOnly?: boolean } = {},
@@ -272,7 +275,7 @@ export async function stopBenchmark(
     throw new Error('Cannot freeze validation without both positively identified collectors');
   }
   await stopBenchmarkProcesses(workspace, directories);
-  if (containers.length) docker(['stop', '--time', options.requireCleanMutators ? '300' : '30', ...containers.map(container => container.id)]);
+  if (containers.length) docker(['stop', '--time', options.requireCleanMutators ? String(MUTATOR_STOP_SECONDS) : '30', ...containers.map(container => container.id)]);
   const cleanMutators: string[] = [];
   if (options.requireCleanMutators) {
     for (const container of containers) {

@@ -118,4 +118,23 @@ pub trait ReceiptStore: Send + Sync {
     /// current record so the caller can drop, retry, or replay it. Adopting
     /// flushing work does not resolve its publication uncertainty.
     async fn adopt_receipts(&self, request: &ReceiptAdoption) -> ReceiptResult<ReceiptAdoptionReport>;
+
+    /// Fails accepted receipts that a crashed predecessor never durably buffered.
+    ///
+    /// A durable-buffer collector creates an `accepted` receipt before it
+    /// persists the batch locally and only acknowledges the client after the
+    /// batch is persisted. A predecessor that crashed in between leaves an
+    /// `accepted` receipt with no persisted bundle, so no recovery can adopt
+    /// or publish it. Call this only after the successor has drained every
+    /// persisted bundle: any predecessor receipt that still is `accepted` then
+    /// had no bundle. It atomically records at most `limit` such receipts of
+    /// failed or stopped predecessors that share the successor's instance key
+    /// and have a lower generation as retryable failures, with a receipt
+    /// event. Buffered and flushing receipts are never touched.
+    async fn fail_unbuffered_predecessor_receipts(
+        &self,
+        successor: CollectorInstanceId,
+        failed_at: UnixMillis,
+        limit: usize,
+    ) -> ReceiptResult<ReconciliationReport>;
 }
