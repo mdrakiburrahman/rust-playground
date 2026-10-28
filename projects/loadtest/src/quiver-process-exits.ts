@@ -57,13 +57,14 @@ function processIdentity(workspace: string, pool: Pool, endpoint: string, docker
   return { id: value.Id, startedAt, finishedAt, running: value.State.Running, exitCode: value.State.ExitCode };
 }
 
-async function pressureIdentity(endpoint: string): Promise<string> {
+async function pressureIdentity(endpoint: string, pool: Pool): Promise<string> {
   const response = await fetch(`${endpoint}/v1/pressure`, { signal: AbortSignal.timeout(5_000), redirect: 'error' });
   assert(response.ok, `Crash pressure identity HTTP ${response.status}`);
-  const value = await response.json() as { instance_id?: unknown };
-  assert(typeof value.instance_id === 'string'
-    && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/iu.test(value.instance_id), 'Missing crash collector UUID');
-  return value.instance_id.toLowerCase();
+  const value = await response.json() as { instance_id?: unknown; rich?: { instance_id?: unknown } };
+  const instance = pool === 'direct' ? value.instance_id : value.rich?.instance_id;
+  assert(typeof instance === 'string'
+    && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/iu.test(instance), 'Missing crash collector UUID');
+  return instance.toLowerCase();
 }
 
 export async function killQuiverPublishers(options: {
@@ -73,7 +74,7 @@ export async function killQuiverPublishers(options: {
   const before = await Promise.all((['direct', 'dataflow'] as const).map(async pool => {
     const process = processIdentity(options.workspace, pool, options.endpoints[pool], options.docker);
     assert(process.running, 'Collector already stopped before controlled crash');
-    const instance = await pressureIdentity(options.endpoints[pool]);
+    const instance = await pressureIdentity(options.endpoints[pool], pool);
     assert.deepEqual(processIdentity(options.workspace, pool, options.endpoints[pool], options.docker), process,
       'Collector process changed during crash identity capture');
     return { pool, process, instance };
@@ -104,7 +105,7 @@ export async function recordQuiverSuccessors(options: {
     const process = processIdentity(options.workspace, pool, options.endpoints[pool], options.docker);
     assert(process.running && process.startedAt >= publisher.finished_at_unix_ms,
       'Restart did not create a new live process generation');
-    const instance = await pressureIdentity(options.endpoints[pool]);
+    const instance = await pressureIdentity(options.endpoints[pool], pool);
     assert.notEqual(instance, publisher.instance_id, 'Restart reused the killed collector UUID');
     assert.deepEqual(processIdentity(options.workspace, pool, options.endpoints[pool], options.docker), process,
       'Successor process changed during identity capture');

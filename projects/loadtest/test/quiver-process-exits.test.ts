@@ -12,13 +12,15 @@ import { killQuiverPublishers, recordQuiverSuccessors, QUIVER_PROCESS_EXITS_FILE
 async function fixture() {
   const results = mkdtempSync(path.join(tmpdir(), 'quiver-process-exits-'));
   writeFileSync(path.join(results, 'run-metadata.json'), JSON.stringify({ run_id: 'run-1' }));
-  const state = { phase: 'running', wrongOwner: false, wrongIp: false, oom: false, exitCode: 137, reusedUuid: false };
+  const state = { phase: 'running', wrongOwner: false, wrongIp: false, wrongShape: false,
+    oom: false, exitCode: 137, reusedUuid: false };
   const instance = (pool: string, successor: boolean): string =>
     `${pool === 'direct' ? '1' : '2'}${successor ? '2222222' : '1111111'}-1111-4111-8111-111111111111`;
   const server = createServer((request, response) => {
     response.setHeader('content-type', 'application/json');
-    response.end(JSON.stringify({ instance_id: instance(request.url?.startsWith('/direct') ? 'direct' : 'dataflow',
-      state.phase === 'restarted' && !state.reusedUuid) }));
+    const pool = request.url?.startsWith('/direct') ? 'direct' : 'dataflow';
+    const pressure = { instance_id: instance(pool, state.phase === 'restarted' && !state.reusedUuid) };
+    response.end(JSON.stringify(pool === 'direct' || state.wrongShape ? pressure : { rich: pressure }));
   });
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
@@ -78,6 +80,9 @@ test('refuses foreign ownership or an exit that was not the controlled SIGKILL',
     f.state.wrongIp = true;
     await assert.rejects(killQuiverPublishers(f.options), /Pressure endpoint is not the owned/u);
     f.state.wrongIp = false;
+    f.state.wrongShape = true;
+    await assert.rejects(killQuiverPublishers(f.options), /Missing crash collector UUID/u);
+    f.state.wrongShape = false;
     f.state.oom = true;
     await assert.rejects(killQuiverPublishers(f.options), /OOM termination/u);
     f.state.oom = false;
