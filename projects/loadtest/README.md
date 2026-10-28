@@ -546,6 +546,15 @@ times, elapsed milliseconds and outcomes for phases, snapshot tables and Kusto
 schema/corpus/fallback/policy preparation. Cancelled work is not reported as
 passed. Validation only inspects an existing local Kusto database; it never
 creates or attaches one.
+The emulator sizes its query-acceleration workers from visible cores
+(cores x 0.5: 2 on a 4-CPU CI runner, 16 on a 32-CPU devbox). Final compaction
+rewrites every table shortly before the fixed cache deadline, so local
+bootstrap pins the pool with `.alter-merge cluster policy capacity` to 16
+workers (`ClusterMaximumConcurrentOperations=16`,
+`CoreUtilizationCoefficient=16`) regardless of host cores. Validation reads
+`.show capacity` and fails with the named `local_qap_capacity` guard unless
+`QueryAcceleration` reports exactly 16; it never alters the policy itself.
+Azure capacity is never altered.
 The optional bridge is not the default and is not accelerated-cache evidence.
 Timestamp `__unix_nanos` companion columns retain the original
 integer nanoseconds; Kusto `datetime` alone is not nanosecond-exact.

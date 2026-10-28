@@ -25,7 +25,10 @@ use futures::{StreamExt, stream};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::{sync::Semaphore, task::JoinHandle};
+use tokio::{
+    sync::{OnceCell, Semaphore},
+    task::JoinHandle,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{cli::RunArgs, transport::now_unix_millis};
@@ -41,6 +44,10 @@ const TOKEN_TIMEOUT: Duration = Duration::from_secs(60);
 /// Shortest policy the service accepts; bounds cache staleness after each Delta commit.
 const LOCAL_MAX_AGE: &str = "00:01:00";
 const LOCAL_HOT_WINDOW: &str = "1.00:00:00";
+/// The emulator sizes its query-acceleration workers as visible cores x 0.5: 2 on a 4-CPU CI runner, 16 on
+/// a 32-CPU devbox. Final compaction rewrites every table just before the fixed cache deadline, so the
+/// local emulator pins the devbox-proven worker count instead of inheriting the runner's core count.
+const LOCAL_QAP_WORKERS: u64 = 16;
 const TABLES_PER_POOL: usize = 13;
 // Query-engine memory is independent of the validator host's CPU count.
 const QUERY_CONCURRENCY: usize = 2;
@@ -75,6 +82,8 @@ struct KustoClient {
     queries_completed: Arc<AtomicU64>,
     query_permits: Arc<Semaphore>,
     heavy_query_permits: Arc<Semaphore>,
+    /// Local emulator query-acceleration workers, pinned once per client family.
+    pinned_capacity: Arc<OnceCell<u64>>,
 }
 
 impl KustoClient {
@@ -138,6 +147,7 @@ impl KustoClient {
             queries_completed: Arc::new(AtomicU64::new(0)),
             query_permits: Arc::new(Semaphore::new(QUERY_CONCURRENCY)),
             heavy_query_permits: Arc::new(Semaphore::new(HEAVY_QUERY_CONCURRENCY)),
+            pinned_capacity: Arc::new(OnceCell::new()),
         })
     }
 
@@ -227,6 +237,12 @@ impl KustoClient {
         if self.mode == Mode::Azure {
             return Ok(());
         }
+        self.pinned_capacity
+            .get_or_try_init(|| async {
+                self.execute(&local_capacity_command(), true, "bootstrap").await?;
+                self.local_capacity().await
+            })
+            .await?;
         let rows = self.execute(".show databases", true, "bootstrap").await?;
         if rows
             .iter()
@@ -253,8 +269,26 @@ impl KustoClient {
                     .any(|row| row.get("DatabaseName").and_then(Value::as_str) == Some(DATABASE)),
                 "validation requires the existing loadtest database"
             );
+            // Read-only: validation never alters the cluster, it only refuses an unpinned emulator.
+            self.local_capacity().await?;
         }
         Ok(())
+    }
+
+    /// Reads the emulator's effective query-acceleration worker count and requires the pinned value.
+    async fn local_capacity(&self) -> Result<u64> {
+        let rows = self.execute(".show capacity", true, "bootstrap").await?;
+        let total = rows
+            .iter()
+            .find(|row| row.get("Resource").and_then(Value::as_str) == Some("QueryAcceleration"))
+            .and_then(|row| row.get("Total"))
+            .and_then(number)
+            .context("local_qap_capacity guard: emulator reports no QueryAcceleration capacity")?;
+        ensure!(
+            total == LOCAL_QAP_WORKERS,
+            "local_qap_capacity guard: emulator QueryAcceleration capacity is {total}, expected pinned {LOCAL_QAP_WORKERS}"
+        );
+        Ok(total)
     }
 
     /// Defines (or redefines, picking up the current Delta schema) one accelerated external table.
@@ -1035,6 +1069,15 @@ impl CorpusResult {
 
 fn local_policy() -> Value {
     json!({"IsEnabled": true, "Hot": LOCAL_HOT_WINDOW, "MaxAge": LOCAL_MAX_AGE})
+}
+
+/// Cluster maximum caps the pool and a per-core coefficient of the same value reaches it from one core.
+fn local_capacity_command() -> String {
+    let policy = json!({"QueryAccelerationCapacity": {
+        "ClusterMaximumConcurrentOperations": LOCAL_QAP_WORKERS,
+        "CoreUtilizationCoefficient": LOCAL_QAP_WORKERS,
+    }});
+    format!(".alter-merge cluster policy capacity @'{policy}'")
 }
 
 fn acceleration_command(name: &str, max_age: &str, commit_ms: Option<u64>) -> Result<String> {
@@ -2620,23 +2663,116 @@ mod tests {
         })
     }
 
+    fn capacity_rows(total: u64) -> Value {
+        response(
+            &["Resource", "Total", "Consumed", "Remaining"],
+            vec![
+                json!(["Queries", 40, 0, 40]),
+                json!(["QueryAcceleration", total, 0, total]),
+            ],
+        )
+    }
+
     #[tokio::test]
     async fn validation_bootstrap_never_creates_or_attaches_a_missing_database() -> Result<()> {
-        for exists in [false, true] {
-            let requests = Arc::new(AtomicU64::new(0));
-            let count = Arc::clone(&requests);
+        for (exists, capacity) in [(false, LOCAL_QAP_WORKERS), (true, LOCAL_QAP_WORKERS), (true, 2)] {
+            let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = Arc::clone(&commands);
             let server = Server::start(move |request| {
-                ensure!(request["csl"] == ".show databases", "validation attempted a mutation");
-                count.fetch_add(1, Ordering::SeqCst);
-                Ok(Some(response(
-                    &["DatabaseName"],
-                    if exists { vec![json!([DATABASE])] } else { vec![] },
-                )))
+                let command = request["csl"].as_str().unwrap_or_default().to_owned();
+                seen.lock()
+                    .map_err(|_| anyhow::anyhow!("poisoned"))?
+                    .push(command.clone());
+                match command.as_str() {
+                    ".show databases" => Ok(Some(response(
+                        &["DatabaseName"],
+                        if exists { vec![json!([DATABASE])] } else { vec![] },
+                    ))),
+                    ".show capacity" => Ok(Some(capacity_rows(capacity))),
+                    _ => bail!("validation attempted a mutation: {command}"),
+                }
             })?;
             let directory = Directory::new()?;
             let client = KustoClient::with_mode(&server.endpoint, &directory.0, Mode::Local, DATABASE)?;
-            assert_eq!(client.require_database().await.is_ok(), exists);
-            assert_eq!(requests.load(Ordering::SeqCst), 1);
+            let result = client.require_database().await;
+            assert_eq!(result.is_ok(), exists && capacity == LOCAL_QAP_WORKERS);
+            if exists && capacity != LOCAL_QAP_WORKERS {
+                let Err(error) = result else {
+                    bail!("unpinned capacity was accepted")
+                };
+                assert!(format!("{error:#}").contains("local_qap_capacity guard"));
+            }
+            let expected: &[&str] = if exists {
+                &[".show databases", ".show capacity"]
+            } else {
+                &[".show databases"]
+            };
+            assert_eq!(*commands.lock().map_err(|_| anyhow::anyhow!("poisoned"))?, expected);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_bootstrap_pins_qap_workers_once_and_fails_visibly_when_unpinned() -> Result<()> {
+        let command = local_capacity_command();
+        let policy: Value = serde_json::from_str(
+            command
+                .strip_prefix(".alter-merge cluster policy capacity @'")
+                .and_then(|rest| rest.strip_suffix('\''))
+                .context("capacity command shape")?,
+        )?;
+        assert_eq!(
+            policy,
+            json!({"QueryAccelerationCapacity": {
+                "ClusterMaximumConcurrentOperations": 16, "CoreUtilizationCoefficient": 16}})
+        );
+        for honoured in [true, false] {
+            let commands = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let seen = Arc::clone(&commands);
+            let pinned = Arc::new(AtomicBool::new(false));
+            let server = Server::start(move |request| {
+                let command = request["csl"].as_str().unwrap_or_default().to_owned();
+                seen.lock()
+                    .map_err(|_| anyhow::anyhow!("poisoned"))?
+                    .push(command.clone());
+                Ok(Some(match command.as_str() {
+                    ".show capacity" => capacity_rows(if pinned.load(Ordering::SeqCst) {
+                        LOCAL_QAP_WORKERS
+                    } else {
+                        2
+                    }),
+                    ".show databases" => response(&["DatabaseName"], vec![json!([DATABASE])]),
+                    other if other == local_capacity_command() => {
+                        pinned.store(honoured, Ordering::SeqCst);
+                        response(&["PolicyName"], vec![json!(["CapacityPolicy"])])
+                    }
+                    other => bail!("unexpected command {other}"),
+                }))
+            })?;
+            let directory = Directory::new()?;
+            let client = KustoClient::with_mode(&server.endpoint, &directory.0, Mode::Local, DATABASE)?;
+            if honoured {
+                client.bootstrap().await?;
+                client.clone().bootstrap().await?;
+                assert_eq!(
+                    *commands.lock().map_err(|_| anyhow::anyhow!("poisoned"))?,
+                    [
+                        local_capacity_command().as_str(),
+                        ".show capacity",
+                        ".show databases",
+                        ".show databases"
+                    ]
+                );
+            } else {
+                let Err(error) = client.bootstrap().await else {
+                    bail!("unpinned capacity was accepted")
+                };
+                assert!(format!("{error:#}").contains("capacity is 2, expected pinned 16"));
+                assert_eq!(
+                    *commands.lock().map_err(|_| anyhow::anyhow!("poisoned"))?,
+                    [local_capacity_command().as_str(), ".show capacity"]
+                );
+            }
         }
         Ok(())
     }

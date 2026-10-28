@@ -47,6 +47,9 @@ benchmark. Native external Delta/QAP is the default; an experimental bridge is
 not an automatic fallback. The local policy uses `MaxAge=1min`, with a bounded
 five-minute convergence gate after append, OPTIMIZE, delete, partition PURGE,
 and VACUUM. Longer `MaxAge` can retain stale cached rows.
+The local emulator's acceleration worker pool is pinned to 16, independent of
+host cores, so cache convergence after final compaction does not depend on
+the runner size.
 
 Cache statistics alone do not establish freshness: a reported 100% acceleration,
 zero pending files, and recent update time can coexist with stale query results.
