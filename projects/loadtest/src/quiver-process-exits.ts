@@ -41,8 +41,10 @@ function processIdentity(workspace: string, pool: Pool, endpoint: string, docker
   assert.equal(values.length, 1);
   const [value] = values;
   assert(value && /^[a-f0-9]{64}$/u.test(value.Id), 'Missing crash container identity');
-  assert.equal(value.Config.Labels['com.docker.compose.project'], BENCHMARK_PROJECT);
-  assert.equal(value.Config.Labels['com.docker.compose.service'], service);
+  assert.equal(value.Config.Labels['com.docker.compose.project'], BENCHMARK_PROJECT,
+    'Crash container project ownership changed');
+  assert.equal(value.Config.Labels['com.docker.compose.service'], service,
+    'Crash container service ownership changed');
   assert(value.Config.Labels['com.docker.compose.project.config_files']?.split(',')
     .includes(path.join(workspace, 'projects/loadtest/compose.yaml')), 'Crash container ownership changed');
   const address = new URL(endpoint);

@@ -75,7 +75,12 @@ test('refuses foreign ownership or an exit that was not the controlled SIGKILL',
   const f = await fixture();
   try {
     f.state.wrongOwner = true;
-    await assert.rejects(killQuiverPublishers(f.options), /foreign/u);
+    await assert.rejects(killQuiverPublishers(f.options), {
+      code: 'ERR_ASSERTION',
+      message: /^Crash container project ownership changed(?:\n|$)/u,
+      actual: 'foreign',
+      expected: BENCHMARK_PROJECT,
+    });
     f.state.wrongOwner = false;
     f.state.wrongIp = true;
     await assert.rejects(killQuiverPublishers(f.options), /Pressure endpoint is not the owned/u);
