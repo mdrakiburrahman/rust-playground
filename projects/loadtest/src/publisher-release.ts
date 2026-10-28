@@ -47,12 +47,18 @@ export async function admitPublisherRelease(options: {
   assert.deepEqual(executableIdentity(options.sdk), sdk, 'SDK changed since stack startup');
   const services = await options.stop();
   const stopped = stoppedAttemptMutators(workspace, docker, services);
-  const mutators = { run_id: metadata.run_id, clean: true, services, containers: stopped, finished_at: new Date().toISOString() };
+  const stoppedGenerations = () => stoppedAttemptMutators(workspace, docker, services).map(container => {
+    const started = Date.parse(docker(['inspect', '--format', '{{.State.StartedAt}}', container.id]).trim());
+    assert(Number.isSafeInteger(started) && started > 0, 'Stopped writer process start is unknown');
+    return { ...container, started_at_unix_ms: started };
+  });
+  const generations = stoppedGenerations();
+  const mutators = { run_id: metadata.run_id, clean: true, services, containers: generations, finished_at: new Date().toISOString() };
   atomicJson(path.join(results, 'mutator-drain.json'), mutators);
   assert.deepEqual(sqlIdentity(workspace, docker), options.sql, 'SQL Server generation changed since stack start');
   await options.release();
   assert.deepEqual(sqlIdentity(workspace, docker), options.sql, 'SQL Server generation changed during SQL release read');
-  assert.deepEqual(stoppedAttemptMutators(workspace, docker, services), stopped, 'Writer generation changed during release');
+  assert.deepEqual(stoppedGenerations(), generations, 'Writer generation changed during release');
   assert.deepEqual(executableIdentity(options.sdk), sdk, 'SDK changed during release proof');
   const bytes = readFileSync(path.join(results, 'publisher-release.json'));
   const proof = JSON.parse(bytes.toString('utf8')) as {
@@ -70,7 +76,7 @@ export async function admitPublisherRelease(options: {
   if (options.compact) {
     await options.compact();
     assert.deepEqual(sqlIdentity(workspace, docker), options.sql, 'SQL Server generation changed during final compaction');
-    assert.deepEqual(stoppedAttemptMutators(workspace, docker, services), stopped, 'Writer generation changed during final compaction');
+    assert.deepEqual(stoppedGenerations(), generations, 'Writer generation changed during final compaction');
     assert.deepEqual(executableIdentity(options.sdk), sdk, 'SDK changed during final compaction');
   }
   return stopped;

@@ -617,6 +617,14 @@ registry or reader-lease claim. The run's `routing.json` now includes its run ID
 Release requires exactly one same-run publisher ID/key in each pool, each
 durably stopped in `routing_collectors`, with no other ready/draining generation,
 even if its heartbeat expired. Historical stopped/failed rows are allowed.
+For the controlled Quiver crash only, `quiver-process-exits.json` supplies
+positive historical process-death evidence: each UUID is read from the owned
+collector's pressure endpoint, bound to its unchanged Docker process start,
+and observed stopped with SIGKILL exit 137 before restart. A distinct successor
+UUID and later process start must match the same-run publisher and the container
+subsequently proved cleanly stopped. Missing, partial, cross-run or mismatched
+proof fails closed; expired heartbeats alone remain insufficient. This does not
+permit historical lease holders, active receipts, or an unclean current publisher.
 Routing leases have only active/draining states and no clean-stop release path:
 they may remain unexpired, but every holder must be a same-run stopped publisher.
 Expiry is recorded as evidence, not used as release proof. The direct publisher

@@ -18,6 +18,7 @@ import { startResourceSampler } from './resource-sampler.js';
 import { beginAttemptEvidence, sealAttemptEvidence, stoppedAttemptMutators, type StoppedMutator } from './attempt-evidence.js';
 import { writeProvenance } from './provenance.js';
 import { runQuiverCrash, QUIVER_RECOVERY_FILE } from './quiver-crash.js';
+import { killQuiverPublishers, recordQuiverSuccessors, type KilledPublishers } from './quiver-process-exits.js';
 import { runOwnedProcess } from './owned-process.js';
 import { admitPublisherRelease, sqlIdentity, type SqlIdentity } from './publisher-release.js';
 import { startQapObserver } from './qap-observer.js';
@@ -658,13 +659,21 @@ async function benchmark(
     phase = 'load-generation';
     step('Running load generator (Ctrl+C to stop; stack is kept)');
     const loadEnded = new AbortController();
+    const crashEndpoints = { direct: `http://${network.direct}:8081`, dataflow: `http://${network.dataflow}:32011` };
+    let killedPublishers: KilledPublishers | undefined;
     const crash = options.crashAfterSeconds === undefined ? undefined : runQuiverCrash({
       crashAfterSeconds: options.crashAfterSeconds,
       directAdmin: `http://${network.direct}:8081`,
       dataflowAdmin: `http://${network.dataflow}:32011`,
       results: path.join(directory, 'results'),
       kill: async () => {
-        await composeAsync(project, env, ['--profile', 'benchmark', 'kill', '--signal', 'SIGKILL', 'direct-1', 'dataflow-1']);
+        killedPublishers = await killQuiverPublishers({
+          workspace, results: path.join(directory, 'results'), endpoints: crashEndpoints,
+          docker: args => run('docker', args, env),
+          kill: async () => {
+            await composeAsync(project, env, ['--profile', 'benchmark', 'kill', '--signal', 'SIGKILL', 'direct-1', 'dataflow-1']);
+          },
+        });
       },
       restart: async () => {
         // A restarted Direct process is a new receipt-owner generation that adopts its predecessor's receipts.
@@ -673,6 +682,11 @@ async function benchmark(
           '--profile', 'benchmark', 'up', '--detach', '--no-build', '--no-deps', '--wait', '--wait-timeout', '300',
           'direct-1', 'dataflow-1',
         ], 360_000);
+        assert(killedPublishers, 'Missing exact killed collector identities');
+        await recordQuiverSuccessors({
+          workspace, results: path.join(directory, 'results'), endpoints: crashEndpoints,
+          docker: args => run('docker', args, env), killed: killedPublishers,
+        });
       },
       log: step,
       loadEnded: loadEnded.signal,

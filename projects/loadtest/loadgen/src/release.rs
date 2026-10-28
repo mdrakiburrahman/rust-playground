@@ -6,7 +6,8 @@
 //!
 //! - every publisher this run routed to (exactly one live direct and one live dataflow generation in
 //!   the run's `routing.json`) is durably `stopped` in routing under the same id, key, and pool;
-//! - every collector generation has an explicit stopped/failed state; heartbeat expiry is not enough;
+//! - every collector generation has an explicit stopped/failed state or same-run owned SIGKILL and
+//!   successor process proof; heartbeat expiry alone is not enough;
 //!   each routing lease belongs to a same-run stopped publisher in the matching pool;
 //! - the direct receipt owner finished its owner drain (`stopped` with a stop time and no work), no
 //!   receipt owner is still starting, active, or draining, and no table lease or unowned delivery
@@ -39,6 +40,8 @@ pub const PUBLISHER_RELEASE_FILE: &str = "publisher-release.json";
 pub const PUBLICATION_DRAIN_FILE: &str = "publication-drain.json";
 /// Clean stopped-mutator receipt written by the runner after the containers exited.
 pub const MUTATOR_DRAIN_FILE: &str = "mutator-drain.json";
+/// Exact owned process exits captured around the controlled Quiver crash.
+pub const QUIVER_PROCESS_EXITS_FILE: &str = "quiver-process-exits.json";
 
 /// Source publisher pools and the mutator service that hosts each one.
 const PUBLISHERS: [(&str, &str); 2] = [("direct", "direct-1"), ("dataflow", "dataflow-1")];
@@ -120,6 +123,44 @@ pub struct DrainEvidence {
     pub metadata: Value,
     pub publication: Value,
     pub mutators: Value,
+    /// Optional positive process proof, never inferred from heartbeat expiry.
+    pub crashes: Option<CrashEvidence>,
+}
+
+/// Same-run SIGKILL observations bound to restarted publisher generations.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CrashEvidence {
+    /// Exact load-generation run identity.
+    pub run_id: String,
+    /// One observed exit and restart per source pool.
+    pub publishers: Vec<CrashedPublisher>,
+}
+
+/// Controller-observed Docker process exit and successor identity.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CrashedPublisher {
+    /// Killed collector's pool.
+    pub implementation_pool: String,
+    /// Stable source service key.
+    pub instance_key: String,
+    /// UUID read from the killed process's pressure endpoint.
+    pub instance_id: String,
+    /// Owned container observed before and after SIGKILL.
+    pub container_id: String,
+    /// Original Docker process start time.
+    pub started_at_unix_ms: u64,
+    /// Docker's observed process finish time.
+    pub finished_at_unix_ms: u64,
+    /// Must be 137 for the requested SIGKILL, not a clean stop or unknown exit.
+    pub exit_code: u16,
+    /// New UUID read from the healthy successor's pressure endpoint.
+    pub successor_instance_id: String,
+    /// Container later positively proved cleanly stopped.
+    pub successor_container_id: String,
+    /// New Docker process start time after the observed exit.
+    pub successor_started_at_unix_ms: u64,
 }
 
 /// Public proof report; `passed` is true only when `errors` is empty.
@@ -190,6 +231,11 @@ async fn prove(arguments: &PublisherReleaseArgs, checked_at: u64) -> Result<Rele
         metadata: read_json(&results.join(RUN_METADATA_FILE)).await?,
         publication: read_json(&results.join(PUBLICATION_DRAIN_FILE)).await?,
         mutators: read_json(&results.join(MUTATOR_DRAIN_FILE)).await?,
+        crashes: match fs::read(results.join(QUIVER_PROCESS_EXITS_FILE)).await {
+            Ok(bytes) => Some(serde_json::from_slice(&bytes).context("parse Quiver process-exit proof")?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error).context("read Quiver process-exit proof"),
+        },
     };
     let routed = canonical_routing(read_json(&results.join(ROUTING_EVIDENCE_FILE)).await?)?;
     let mut admission_errors = Vec::new();
@@ -370,7 +416,15 @@ pub fn release_report(
     let run_id = check_drain(drain, &mut errors);
     check_run_binding(run_id.as_deref(), routed, &mut errors);
     let publishers = bind_publishers(routed, &mut errors);
-    check_routing(&publishers, &after, &mut errors);
+    let killed = check_crashes(
+        drain,
+        run_id.as_deref(),
+        &publishers,
+        &after,
+        checked_at_unix_ms,
+        &mut errors,
+    );
+    check_routing(&publishers, &after, &killed, &mut errors);
     let historical_active_receipts = check_receipts(&publishers, &receipts, &mut errors);
     ReleaseReport {
         passed: errors.is_empty(),
@@ -476,7 +530,83 @@ fn bind_publishers(routed: &RoutingState, errors: &mut Vec<String>) -> Vec<Route
     publishers
 }
 
-fn check_routing(publishers: &[RoutedCollector], after: &RoutingState, errors: &mut Vec<String>) {
+fn check_crashes(
+    drain: &DrainEvidence,
+    run_id: Option<&str>,
+    publishers: &[RoutedCollector],
+    after: &RoutingState,
+    checked_at: u64,
+    errors: &mut Vec<String>,
+) -> BTreeSet<String> {
+    let Some(crashes) = &drain.crashes else {
+        return BTreeSet::new();
+    };
+    let mut killed = BTreeSet::new();
+    let mut pools = BTreeSet::new();
+    if Some(crashes.run_id.as_str()) != run_id || crashes.publishers.len() != PUBLISHERS.len() {
+        errors.push("Quiver process exits are not a complete same-run crash proof".to_owned());
+    }
+    for crash in &crashes.publishers {
+        let valid_id = |id: &str| canonical_id(id).is_ok_and(|canonical| canonical == id);
+        let valid_container = |id: &str| {
+            id.len() == 64
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        };
+        let successor = publishers.iter().find(|publisher| {
+            publisher.instance_id == crash.successor_instance_id
+                && publisher.instance_key == crash.instance_key
+                && publisher.implementation_pool == crash.implementation_pool
+        });
+        let historical = after.collectors.iter().find(|collector| {
+            collector.instance_id == crash.instance_id
+                && collector.instance_key == crash.instance_key
+                && collector.implementation_pool == crash.implementation_pool
+                && collector.terminated
+        });
+        let clean_successor = drain.mutators["containers"].as_array().is_some_and(|containers| {
+            containers
+                .iter()
+                .filter(|container| {
+                    container["id"].as_str() == Some(crash.successor_container_id.as_str())
+                        && container["started_at_unix_ms"].as_u64() == Some(crash.successor_started_at_unix_ms)
+                        && container["service"].as_str() == Some(format!("{}-1", crash.implementation_pool).as_str())
+                })
+                .count()
+                == 1
+        });
+        let valid = valid_id(&crash.instance_id)
+            && valid_id(&crash.successor_instance_id)
+            && crash.instance_id != crash.successor_instance_id
+            && valid_container(&crash.container_id)
+            && valid_container(&crash.successor_container_id)
+            && crash.exit_code == 137
+            && crash.started_at_unix_ms > 0
+            && crash.started_at_unix_ms <= crash.finished_at_unix_ms
+            && crash.finished_at_unix_ms <= crash.successor_started_at_unix_ms
+            && crash.successor_started_at_unix_ms <= checked_at
+            && PUBLISHERS.iter().any(|(pool, service)| {
+                crash.implementation_pool == *pool && crash.instance_key == format!("loadtest-{service}")
+            })
+            && successor.is_some()
+            && historical.is_some()
+            && clean_successor
+            && pools.insert(crash.implementation_pool.clone())
+            && killed.insert(crash.instance_id.clone());
+        if !valid {
+            errors.push(format!("invalid Quiver process-exit proof for {}", crash.instance_key));
+        }
+    }
+    killed
+}
+
+fn check_routing(
+    publishers: &[RoutedCollector],
+    after: &RoutingState,
+    killed: &BTreeSet<String>,
+    errors: &mut Vec<String>,
+) {
     check_unique_ids(
         after.collectors.iter().map(|collector| collector.instance_id.as_str()),
         "post-drain routing state",
@@ -506,7 +636,7 @@ fn check_routing(publishers: &[RoutedCollector], after: &RoutingState, errors: &
         }
     }
     for collector in &after.collectors {
-        if !matches!(collector.state.as_str(), "stopped" | "failed") {
+        if !matches!(collector.state.as_str(), "stopped" | "failed") && !killed.contains(&collector.instance_id) {
             errors.push(format!(
                 "collector {} generation is still live after the drain",
                 collector.instance_key
@@ -666,6 +796,7 @@ mod tests {
                 publication: json!({"run_id": "run-1", "dataflow_settled": true}),
                 mutators: json!({"run_id": "run-1", "clean": true,
                     "services": ["direct-1", "dataflow-1", "tenant-stream", "delta-maintenance"]}),
+                crashes: None,
             },
             routed: RoutingState {
                 run_id: Some("run-1".to_owned()),
@@ -729,6 +860,104 @@ mod tests {
             [DIRECT, DATAFLOW]
         );
         assert_eq!(report.historical_active_receipts, 0);
+    }
+
+    fn observed_crash() -> Case {
+        let mut case = released();
+        let historical_dataflow = "44444444-4444-4444-8444-444444444444";
+        case.after.collectors[0].state = "ready".to_owned();
+        case.after.collectors.push(collector(
+            historical_dataflow,
+            "loadtest-dataflow-1",
+            "dataflow",
+            "ready",
+            true,
+        ));
+        case.drain.mutators["containers"] = json!([
+            {"id": "a".repeat(64), "service": "direct-1", "started_at_unix_ms": 3},
+            {"id": "b".repeat(64), "service": "dataflow-1", "started_at_unix_ms": 3}
+        ]);
+        case.drain.crashes = Some(CrashEvidence {
+            run_id: "run-1".to_owned(),
+            publishers: [
+                ("direct", HISTORICAL, DIRECT, 'a'),
+                ("dataflow", historical_dataflow, DATAFLOW, 'b'),
+            ]
+            .into_iter()
+            .map(|(pool, instance, successor, container)| CrashedPublisher {
+                implementation_pool: pool.to_owned(),
+                instance_key: format!("loadtest-{pool}-1"),
+                instance_id: instance.to_owned(),
+                container_id: container.to_string().repeat(64),
+                started_at_unix_ms: 1,
+                finished_at_unix_ms: 2,
+                exit_code: 137,
+                successor_instance_id: successor.to_owned(),
+                successor_container_id: container.to_string().repeat(64),
+                successor_started_at_unix_ms: 3,
+            })
+            .collect(),
+        });
+        case
+    }
+
+    #[test]
+    fn observed_sigkill_with_exact_clean_successors_proves_historical_process_exit() {
+        let report = decide(observed_crash());
+        assert!(report.passed, "{:?}", report.errors);
+    }
+
+    #[test]
+    fn crash_proof_cannot_substitute_for_current_publisher_or_receipt_release() {
+        let mut case = observed_crash();
+        case.after.collectors[1].state = "ready".to_owned();
+        assert!(!decide(case).passed, "current publisher must still be SQL stopped");
+        let mut case = observed_crash();
+        case.after.leases = vec![lease(HISTORICAL)];
+        assert!(
+            !decide(case).passed,
+            "historical routing leases are never released by process proof"
+        );
+        let mut case = observed_crash();
+        case.receipts.owners[0].active_receipts = 1;
+        case.receipts.active_receipts = 1;
+        assert!(!decide(case).passed, "historical active receipts remain unresolved");
+    }
+
+    #[test]
+    fn malformed_partial_or_cross_run_crash_proof_fails_closed() {
+        let mutations: [fn(&mut CrashEvidence); 12] = [
+            |proof| proof.run_id = "other".to_owned(),
+            |proof| {
+                proof.publishers.pop();
+            },
+            |proof| proof.publishers[0].exit_code = 0,
+            |proof| proof.publishers[0].instance_id = DIRECT.to_owned(),
+            |proof| proof.publishers[0].successor_instance_id = HISTORICAL.to_owned(),
+            |proof| proof.publishers[0].container_id = "bad".to_owned(),
+            |proof| proof.publishers[0].successor_container_id = "c".repeat(64),
+            |proof| proof.publishers[0].started_at_unix_ms = 0,
+            |proof| proof.publishers[0].finished_at_unix_ms = 4,
+            |proof| proof.publishers[0].successor_started_at_unix_ms = 4,
+            |proof| proof.publishers[0].instance_key = "loadtest-direct-2".to_owned(),
+            |proof| proof.publishers[1] = proof.publishers[0].clone(),
+        ];
+        for mutate in mutations {
+            let mut case = observed_crash();
+            if let Some(proof) = &mut case.drain.crashes {
+                mutate(proof);
+            }
+            assert!(!decide(case).passed);
+        }
+        let mut case = observed_crash();
+        case.after.collectors[0].terminated = false;
+        assert!(!decide(case).passed, "a live historical registration is never release");
+        let mut case = observed_crash();
+        case.drain.mutators["containers"] = json!([]);
+        assert!(
+            !decide(case).passed,
+            "successor container must have positive clean-stop evidence"
+        );
     }
 
     #[test]

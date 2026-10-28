@@ -25,12 +25,14 @@ function fixture(t: TestContext) {
   const events: string[] = [];
   let generation = 'first';
   let stopped = false;
+  let writerStartedAt = '2026-01-01T00:00:00Z';
   const labels = (service: string) => ({
     'com.docker.compose.project': BENCHMARK_PROJECT,
     'com.docker.compose.service': service,
     'com.docker.compose.project.config_files': path.join(workspace, 'projects/loadtest/compose.yaml'),
   });
   const docker = (args: string[]): string => {
+    if (args[0] === 'inspect' && args[2] === '{{.State.StartedAt}}') return writerStartedAt;
     if (args[0] === 'ps') return args.includes('--filter') ? 'sql-id' : 'direct-id\ndataflow-id';
     if (args[0] === 'inspect' && args[1] !== '--format') return JSON.stringify([{
       Id: 'a'.repeat(64), Image: 'sha256:sql', Config: { Labels: labels('sqlserver') },
@@ -50,7 +52,8 @@ function fixture(t: TestContext) {
   };
   const compact = async () => { events.push('final-compaction'); };
   return { workspace, directory, results, sdk, docker, stop, release, compact, events,
-    sql: sqlIdentity(workspace, docker), drift: () => { generation = 'replacement'; } };
+    sql: sqlIdentity(workspace, docker), drift: () => { generation = 'replacement'; },
+    restartWriter: () => { writerStartedAt = '2026-01-01T00:00:01Z'; } };
 }
 
 test('release reads SQL only after every writer exits and persists a same-run protocol binding', async t => {
@@ -133,4 +136,13 @@ test('SDK changes since startup or during SQL read fail admission', async t => {
     } }), /SDK changed/u);
     assert(!f.events.includes('final-compaction'));
   }
+});
+
+test('same-container process restart during release is not a clean successor generation', async t => {
+  const f = fixture(t);
+  await assert.rejects(admitPublisherRelease({ ...f, release: async () => {
+    await f.release();
+    f.restartWriter();
+  } }), /Writer generation changed during release/u);
+  assert(!f.events.includes('final-compaction'));
 });
