@@ -484,7 +484,7 @@ impl ReceiptStore for RawSqlReceiptStore {
                     "UPDATE arrowcol.collector_instances \
                  SET heartbeat_at_utc = SYSUTCDATETIME(), lease_expires_at_utc = @P2 \
                  OUTPUT INSERTED.instance_id \
-                 WHERE instance_id = @P1 AND state = 'active' \
+                 WHERE instance_id = @P1 AND state IN ('active', 'draining') \
                    AND stopped_at_utc IS NULL AND @P2 > SYSUTCDATETIME();",
                     &[&owner, &deadline],
                 )
@@ -496,7 +496,7 @@ impl ReceiptStore for RawSqlReceiptStore {
             if row.is_none() {
                 return Err(ReceiptError::new(
                     ReceiptErrorKind::Fenced,
-                    "owner is not active or the requested deadline has expired",
+                    "owner is not active or draining, or the requested deadline has expired",
                 ));
             }
             Ok(())

@@ -342,6 +342,7 @@ pub async fn run(mut config: CollectorConfig) -> Result<RunOutcome> {
         quiver.as_ref(),
         &leases,
         &metrics,
+        &cancellation,
     )
     .await;
     cancellation.cancel();
@@ -383,6 +384,7 @@ async fn shutdown(
     quiver: Option<&Arc<QuiverStage>>,
     leases: &Arc<TableLeaseManager>,
     metrics: &CollectorMetrics,
+    control_loops: &CancellationToken,
 ) -> Result<RunOutcome> {
     info!("stopping new Flight admission");
     drain.begin_drain();
@@ -461,6 +463,10 @@ async fn shutdown(
         warn!(%error, "one or more table leases could not be released");
         incomplete = incomplete.saturating_add(1);
     }
+    // The owner and routing heartbeats keep both leases alive through drain.
+    // Stop them before the terminal writes, so a tick after `stopped` cannot
+    // be fenced and fail the already-finished collector closed.
+    control_loops.cancel();
     if incomplete == 0
         && let Err(error) = finish_owner_drain(receipts.as_ref(), instance_id).await
     {

@@ -389,6 +389,135 @@ async fn live_sql_hands_crashed_holder_lease_to_same_key_restart() -> anyhow::Re
     .await
 }
 
+/// Scenario: SQL Server sees the dataflow multi-core shutdown race: several
+/// same-instance writers refresh registration and heartbeat with later
+/// timestamps while others record `draining` with earlier ones, then shutdown
+/// records `stopped` and stale writers arrive.
+/// Guarantees: every drain succeeds and the row stays `draining` (no
+/// resurrection to `ready`, heartbeat and lease never move backwards); after
+/// `stopped`, drains, other terminal states, refreshes and heartbeats are
+/// fenced, and a repeated stop is idempotent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the live arrowcol-infra SQL Server"]
+async fn live_sql_collector_state_is_monotone_across_same_instance_writers() -> anyhow::Result<()> {
+    if std::env::var("ARROWCOL_SQLSERVER_TEST").as_deref() != Ok("1") {
+        return Ok(());
+    }
+    let _isolation = LIVE_ROUTING_CASE.lock().await;
+    let store = Arc::new(SqlServerRoutingStore::new(sql_config()?));
+    let collector = CollectorInstanceId::new();
+    let key = format!("live-monotone-{}", Uuid::new_v4().simple());
+    let started = now()?;
+    store
+        .register_collector(&live_registration(
+            collector,
+            key.clone(),
+            51_101,
+            started,
+            add(started, 60_000)?,
+        )?)
+        .await?;
+    let late = add(started, 5_000)?;
+    let late_lease = add(started, 90_000)?;
+    let mut writers = tokio::task::JoinSet::new();
+    for core in 0..8_u64 {
+        let store = Arc::clone(&store);
+        let mut refresh = live_registration(collector, key.clone(), 51_101, started, late_lease)?;
+        refresh.heartbeat_at_unix_ms = late;
+        writers.spawn(async move {
+            if core % 2 == 0 {
+                store
+                    .set_collector_state(collector, CollectorState::Draining, add(started, 100 + core)?)
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .map(|()| true)
+            } else {
+                // A refresh may land before or after a drain; afterwards it is fenced.
+                match store.register_collector(&refresh).await {
+                    Ok(()) => Ok(false),
+                    Err(error) if error.kind() == RoutingErrorKind::Conflict => Ok(false),
+                    Err(error) => Err(error.into()),
+                }
+            }
+        });
+    }
+    let mut drains = 0;
+    while let Some(result) = writers.join_next().await {
+        if result?? {
+            drains += 1;
+        }
+    }
+    assert_eq!(drains, 4, "every same-instance drain must succeed");
+    store
+        .heartbeat_collector(collector, add(started, 1)?, add(started, 30_000)?)
+        .await?;
+    let refresh = store
+        .register_collector(&live_registration(collector, key.clone(), 51_101, started, late_lease)?)
+        .await;
+    assert_eq!(
+        refresh.err().map(|error| error.kind()),
+        Some(RoutingErrorKind::Conflict)
+    );
+    let (state, heartbeat, lease) = live_collector_row(collector).await?;
+    assert_eq!(state, "draining");
+    assert!(heartbeat >= started.get(), "heartbeat moved backwards");
+    assert!(lease >= add(started, 60_000)?.get(), "lease moved backwards");
+
+    store
+        .set_collector_state(collector, CollectorState::Stopped, add(started, 200)?)
+        .await?;
+    for late_state in [CollectorState::Ready, CollectorState::Draining, CollectorState::Failed] {
+        let regressed = store
+            .set_collector_state(collector, late_state, add(started, 10_000)?)
+            .await;
+        assert_eq!(
+            regressed.err().map(|error| error.kind()),
+            Some(RoutingErrorKind::Conflict),
+            "stopped must not change to {late_state:?}"
+        );
+    }
+    let heartbeat = store
+        .heartbeat_collector(collector, add(started, 10_000)?, add(started, 70_000)?)
+        .await;
+    assert_eq!(
+        heartbeat.err().map(|error| error.kind()),
+        Some(RoutingErrorKind::Conflict)
+    );
+    store
+        .set_collector_state(collector, CollectorState::Stopped, add(started, 300)?)
+        .await?;
+    assert_eq!(live_collector_row(collector).await?.0, "stopped");
+    Ok(())
+}
+
+/// Returns a routing collector's state, heartbeat and lease expiry (Unix ms).
+async fn live_collector_row(instance_id: CollectorInstanceId) -> anyhow::Result<(String, u64, u64)> {
+    let mut connection = SqlConnection::connect(&sql_connection_config()?).await?;
+    let row = connection
+        .query(
+            "SELECT state, \
+                    DATEDIFF_BIG(millisecond, '1970-01-01', heartbeat_at_utc) AS heartbeat_ms, \
+                    DATEDIFF_BIG(millisecond, '1970-01-01', lease_expires_at_utc) AS lease_ms \
+             FROM arrowcol.routing_collectors WHERE instance_id = @P1;",
+            &[&instance_id.as_uuid()],
+        )
+        .await?
+        .into_row()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("routing collector row is missing"))?;
+    let state = row
+        .try_get::<&str, _>("state")?
+        .ok_or_else(|| anyhow::anyhow!("state was NULL"))?
+        .to_owned();
+    let heartbeat = row
+        .try_get::<i64, _>("heartbeat_ms")?
+        .ok_or_else(|| anyhow::anyhow!("heartbeat was NULL"))?;
+    let lease = row
+        .try_get::<i64, _>("lease_ms")?
+        .ok_or_else(|| anyhow::anyhow!("lease was NULL"))?;
+    Ok((state, u64::try_from(heartbeat)?, u64::try_from(lease)?))
+}
+
 fn live_registration(
     instance_id: CollectorInstanceId,
     instance_key: String,

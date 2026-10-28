@@ -421,6 +421,48 @@ async fn live_recovery_window_expiry_restores_reconciliation() -> anyhow::Result
     Ok(())
 }
 
+/// Scenario: an owner enters drain, keeps heartbeating while it flushes, then
+/// finishes drain.
+/// Guarantees: a draining owner renews its lease (its receipts and leases stay
+/// owned, so a successor cannot adopt them mid-drain); an expired deadline is
+/// still fenced while draining; a stopped owner is fenced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the live arrowcol-infra SQL Server"]
+async fn live_draining_owner_heartbeats_until_stopped() -> anyhow::Result<()> {
+    if std::env::var("ARROWCOL_SQLSERVER_TEST").as_deref() != Ok("1") {
+        return Ok(());
+    }
+    let _isolation = LIVE_RECEIPT_CASE.lock().await;
+    let store = SqlServerReceiptStore::new(sql_config()?);
+    let owner = CollectorInstanceId::new();
+    let instance_key = format!("live-drain-heartbeat-{}", Uuid::new_v4().simple());
+    register_live_owner(&store, owner, &instance_key, 1, 30_000, None).await?;
+    store.heartbeat_owner(owner, plus(now()?, 30_000)?).await?;
+
+    store.start_owner_drain(owner).await?;
+    assert_eq!(owner_row(owner).await?.0, "draining");
+    store.heartbeat_owner(owner, plus(now()?, 30_000)?).await?;
+    let expired = store
+        .heartbeat_owner(owner, minus(now()?, 1_000)?)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("an expired deadline must stay fenced while draining"))?;
+    assert_eq!(expired.kind(), ReceiptErrorKind::Fenced);
+    assert_eq!(owner_row(owner).await?.0, "draining");
+
+    store.finish_owner_drain(owner, now()?).await?;
+    let (state, stopped, _) = owner_row(owner).await?;
+    assert_eq!(state, "stopped");
+    assert!(stopped);
+    let stopped_heartbeat = store
+        .heartbeat_owner(owner, plus(now()?, 30_000)?)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("a stopped owner must be fenced"))?;
+    assert_eq!(stopped_heartbeat.kind(), ReceiptErrorKind::Fenced);
+    Ok(())
+}
+
 async fn live_receipts_case(pooled: bool) -> anyhow::Result<()> {
     if std::env::var("ARROWCOL_SQLSERVER_TEST").as_deref() != Ok("1") {
         return Ok(());
@@ -1106,6 +1148,15 @@ async fn sleep_until(instant: UnixMillis) -> anyhow::Result<()> {
 fn now() -> anyhow::Result<UnixMillis> {
     let millis = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
     Ok(UnixMillis::new(u64::try_from(millis)?)?)
+}
+
+fn minus(value: UnixMillis, millis: u64) -> anyhow::Result<UnixMillis> {
+    Ok(UnixMillis::new(
+        value
+            .get()
+            .checked_sub(millis)
+            .ok_or_else(|| anyhow::anyhow!("timestamp underflow"))?,
+    )?)
 }
 
 fn plus(value: UnixMillis, millis: u64) -> anyhow::Result<UnixMillis> {
