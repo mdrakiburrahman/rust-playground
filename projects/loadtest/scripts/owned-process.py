@@ -19,6 +19,23 @@ def has_children():
             return True
 
 
+def surviving_children():
+    """Command names (never arguments) of live processes reparented to this subreaper."""
+    names = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as handle:
+                stat = handle.read()
+        except OSError:
+            continue
+        fields = stat[stat.rfind(")") + 2:].split()
+        if fields and fields[1] == str(os.getpid()) and fields[0] != "Z":
+            names.append(stat[stat.find("(") + 1:stat.rfind(")")])
+    return sorted(names)
+
+
 def cleanup(group):
     for sig in (signal.SIGTERM, signal.SIGKILL):
         try:
@@ -66,6 +83,9 @@ def main():
             time.sleep(0.025)
         status = child.poll()
         descendants = has_children() if status is not None else True
+        if descendants and stderr_path:
+            with open(stderr_path, "a") as handle:
+                handle.write("owned-process: surviving descendants: %s\n" % ",".join(surviving_children()))
         timed_out = status is None and not interrupted and time.monotonic() >= deadline
     finally:
         cleanup(child.pid)

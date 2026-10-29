@@ -19,7 +19,7 @@ import { beginAttemptEvidence, sealAttemptEvidence, stoppedAttemptMutators, type
 import { writeProvenance } from './provenance.js';
 import { runQuiverCrash, QUIVER_RECOVERY_FILE } from './quiver-crash.js';
 import { killQuiverPublishers, recordQuiverSuccessors, type KilledPublishers } from './quiver-process-exits.js';
-import { runOwnedProcess } from './owned-process.js';
+import { OwnedProcessError, runOwnedProcess } from './owned-process.js';
 import { admitPublisherRelease, sqlIdentity, type SqlIdentity } from './publisher-release.js';
 import { startQapObserver } from './qap-observer.js';
 import { readStressPlan, runStressDriver, stressInputBudget } from './stress-driver.js';
@@ -521,6 +521,9 @@ async function reconcileAzure(context: BenchmarkContext, occupancyId: string): P
     // bootstrap.py redacts private values in its own error lines.
     const detail = existsSync(stderrFile) ? readFileSync(stderrFile, 'utf8').trim().split('\n').slice(-5).join('\n') : '';
     if (detail) console.error(`[loadtest] Azure reconcile stderr (${stderrFile}):\n${detail}`);
+    if (error instanceof OwnedProcessError) {
+      console.error(`[loadtest] Azure reconcile outcome: ${JSON.stringify(error.outcome)} supervisor_timed_out=${error.supervisor_timed_out}`);
+    }
     throw error;
   }
 }
