@@ -688,6 +688,18 @@ def provision(azure, tables, wait_seconds, output, infra_only, values):
     write_private(output, {**c.generated(), "ARROWCOL_RESET_GENERATION": generation})
     print("Full bootstrap ready-v1 at the captured generation.")
 
+def external_locations(azure):
+    """Existing external tables in the database mapped to their connection strings."""
+    result = azure.kql(".show external tables | project TableName, ConnectionStrings")
+    rows = (result or {}).get("Tables", [{}])[0].get("Rows", []) if isinstance(result, dict) else []
+    locations = {}
+    for name, connections in rows:
+        if isinstance(connections, str):
+            connections = json.loads(connections)
+        locations[name] = list(connections or [])
+    return locations
+
+
 def reconcile(azure, manifest, wait_seconds=0):
     c = azure.c
     tables = json.loads(manifest.read_text())
@@ -734,9 +746,14 @@ def reconcile(azure, manifest, wait_seconds=0):
     policy = json.dumps([{"ObjectId": identity, "AllowedUsages": "ExternalTable,AutomatedFlows"}])
     azure.kql(f".alter-merge database ['{c.database}'] policy managed_identity '{policy}'")
     qap = json.dumps({"IsEnabled": True, "Hot": f"{c.hot}.00:00:00", "ManagedIdentity": identity})
+    existing = external_locations(azure)
     for table in tables:
         connection = (f"abfss://{c.data}@{c.account}.dfs.core.windows.net/{table['storage_path']}"
                       f";managed_identity={identity}")
+        if table["name"] in existing and existing[table["name"]] != [connection]:
+            # Kusto rejects re-pointing an accelerated external table (persistent 400), so the
+            # policy is removed first and re-applied below. Same-location reconciles keep it.
+            azure.kql(f".delete external table ['{table['name']}'] policy query_acceleration")
         retry_ready(lambda: azure.kql(
             f".create-or-alter external table ['{table['name']}'] kind=delta (h@'{connection}')"
         ), "External Delta table")

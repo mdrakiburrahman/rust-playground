@@ -1236,7 +1236,7 @@ class ReconcileTests(unittest.TestCase):
             with patch.object(b.time, "sleep") as sleep, contextlib.redirect_stdout(io.StringIO()):
                 b.reconcile(azure, manifest, 10)
             sleep.assert_called_once()
-        self.assertEqual(azure.kql.call_count, 3)
+        self.assertEqual(azure.kql.call_count, 4)
 
     def test_unsafe_table_name_is_rejected(self):
         azure = FakeAzure()
@@ -1268,9 +1268,36 @@ class ReconcileTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 b.reconcile(azure, manifest)
         self.assertIn("ExternalTable,AutomatedFlows", commands[0])
-        self.assertIn(".create-or-alter external table", commands[1])
-        self.assertIn("policy query_acceleration", commands[2])
-        self.assertIn('"ManagedIdentity"', commands[2])
+        self.assertIn(".show external tables", commands[1])
+        self.assertIn(".create-or-alter external table", commands[2])
+        self.assertIn("policy query_acceleration", commands[3])
+        self.assertIn('"ManagedIdentity"', commands[3])
+
+    def test_repointing_accelerated_table_drops_policy_first_and_same_location_keeps_it(self):
+        azure = FakeAzure()
+        azure.blob = lambda *args, **kwargs: (b'{"protocol":{}}\n{"metaData":{}}', {})
+        azure.arm = lambda *args, **kwargs: {"properties": {"principalId": SUB}}
+        connection = lambda path: (f"abfss://{azure.c.data}@{azure.c.account}.dfs.core.windows.net/"
+                                   f"{path};managed_identity={SUB}")
+        for current, expect_delete in ((connection("old/Telemetry"), True),
+                                       (connection("Telemetry"), False)):
+            commands = []
+            def kql(command, current=current):
+                commands.append(command)
+                if command.startswith(".show external tables"):
+                    return {"Tables": [{"Rows": [["Telemetry", json.dumps([current])]]}]}
+            azure.kql = kql
+            with tempfile.TemporaryDirectory() as directory:
+                manifest = Path(directory) / "tables.json"
+                manifest.write_text('["Telemetry"]')
+                with contextlib.redirect_stdout(io.StringIO()):
+                    b.reconcile(azure, manifest)
+            deletes = [i for i, command in enumerate(commands) if command.startswith(".delete external table")]
+            alter = next(i for i, command in enumerate(commands) if ".create-or-alter" in command)
+            self.assertEqual(bool(deletes), expect_delete)
+            if deletes:
+                self.assertLess(deletes[0], alter)
+            self.assertIn("policy query_acceleration", commands[-1])
 
     def test_both_pools_use_inferred_normalized_schema_at_catalog_paths(self):
         azure = FakeAzure()
@@ -1288,10 +1315,10 @@ class ReconcileTests(unittest.TestCase):
             manifest.write_text(json.dumps(bindings))
             with contextlib.redirect_stdout(io.StringIO()):
                 b.reconcile(azure, manifest)
-        self.assertEqual(len(commands), 5)
+        self.assertEqual(len(commands), 6)
         self.assertTrue(all("/telemetry/sqlserver/table/_delta_log/" in root for root in roots))
-        self.assertIn("['direct_table'] kind=delta", commands[1])
-        self.assertIn("['dataflow_table'] kind=delta", commands[3])
+        self.assertIn("['direct_table'] kind=delta", commands[2])
+        self.assertIn("['dataflow_table'] kind=delta", commands[4])
 
     def test_isolated_root_prefix_is_used_for_log_validation_and_kql(self):
         azure = FakeAzure()
@@ -1309,7 +1336,7 @@ class ReconcileTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 b.reconcile(azure, manifest)
         self.assertTrue(roots[0].startswith("loadtest/run-example/direct/"))
-        self.assertIn("/loadtest/run-example/direct/catalog/schema/table;", commands[1])
+        self.assertIn("/loadtest/run-example/direct/catalog/schema/table;", commands[2])
 
 
 class StorageApiTests(unittest.TestCase):
