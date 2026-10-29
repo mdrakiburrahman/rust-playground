@@ -914,12 +914,16 @@ def database_intent_path(record_path):
 
 
 PROVIDER_STATUSES = {name.lower(): name for name in ("Succeeded", "Failed", "Canceled", "InProgress")}
+# Non-terminal ARM provider states observed on Microsoft.Kusto (e.g. database DELETE reports Running).
+PROVIDER_STATUSES.update({name: "InProgress" for name in ("running", "accepted", "deleting")})
 OPERATION_SAFE = re.compile(r"^[A-Za-z0-9/._~%=&?:+,;@!$'()*-]*$")
+# ARM signs async-operation URLs (t/c/s/h query parameters); Kusto's exceed 3 KB.
+MAX_OPERATION_URL = 8192
 
 
 def operation_url(url):
     """Strictly validate a persisted ARM async-operation URL before any authenticated use."""
-    if not isinstance(url, str) or len(url) > 2048 or not OPERATION_SAFE.match(url):
+    if not isinstance(url, str) or len(url) > MAX_OPERATION_URL or not OPERATION_SAFE.match(url):
         raise Failure("Database delete operation URL is malformed; retaining custody.")
     parts = urllib.parse.urlsplit(url)
     if (parts.scheme != "https" or parts.netloc != "management.azure.com" or

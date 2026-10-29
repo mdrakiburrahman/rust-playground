@@ -767,7 +767,8 @@ class ResetTests(unittest.TestCase):
                 ((b'{"status":{"value":"Succeeded"}}', {":status": "200"}), "Unknown"),
                 ((b'{"status":null}', {":status": "200"}), "Unknown"),
                 ((b'{"status":"Queued"}', {":status": "200"}), "Unknown"),
-                ((b'{"status":"Running"}', {":status": "200"}), "Unknown"),
+                ((b'{"status":"Running"}', {":status": "200"}), "InProgress"),
+                ((b'{"status":"Deleting"}', {":status": "200"}), "InProgress"),
                 ((b'{"status":"Succeeded"}', {":status": "202"}), "Unknown"),
                 ((b"", {":status": "204"}), "Unknown")):
             with self.subTest(response=response), patch.object(azure, "request", return_value=response):
@@ -780,7 +781,7 @@ class ResetTests(unittest.TestCase):
                "https://evil.example/op", "https://management.azure.com/op#frag",
                "https://management.azure.com/a/../op", "https://management.azure.com/op x",
                "https://management.azure.com/op\nX", "https://management.azure.com\\@evil/op",
-               "https://MANAGEMENT.azure.com/op", None, 7, "https://management.azure.com/" + "a" * 2100]
+               "https://MANAGEMENT.azure.com/op", None, 7, "https://management.azure.com/" + "a" * 8200]
         with patch.object(azure, "token", side_effect=AssertionError("token fetched")), \
                 patch.object(azure, "cli", side_effect=AssertionError("cli used")):
             for url in bad:
@@ -788,6 +789,9 @@ class ResetTests(unittest.TestCase):
                     azure.provider_operation(url)
         self.assertEqual(b.operation_url(self.OPERATION + "?api-version=2024-04-13"),
                          self.OPERATION + "?api-version=2024-04-13")
+        # Real Kusto DELETE receipts carry ARM-signed t/c/s/h parameters (~3.2 KB).
+        signed = self.OPERATION + "?api-version=2024-04-13&t=1&c=" + "A" * 2592 + "&s=" + "b" * 342 + "&h=x"
+        self.assertEqual(b.operation_url(signed), signed)
 
     @patch.object(b.time, "sleep")
     @patch.object(b, "run_tree")
