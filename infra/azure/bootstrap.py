@@ -52,6 +52,10 @@ class NotReady(Failure):
     """Only an absent declared Delta log, never an auth or ownership failure."""
 
 
+class DeploymentFailed(Failure):
+    """ARM reported a terminal Failed deployment: definite, with no data-plane I/O."""
+
+
 def load_env(path):
     values = {}
     if not path.is_file():
@@ -526,10 +530,17 @@ def deploy(azure, fresh=None):
         with os.fdopen(fd, "w") as stream:
             json.dump({"parameters": {k: {"value": v} for k, v in params.items()}}, stream)
         os.chmod(name, 0o600)
-        azure.cli("deployment", "sub", "create", "--subscription", c.subscription,
-                  "--location", c.location, "--name", "arrowcol-sandbox",
-                  "--template-file", str(Path(__file__).with_name("main.bicep")),
-                  "--parameters", "@" + name)
+        try:
+            azure.cli("deployment", "sub", "create", "--subscription", c.subscription,
+                      "--location", c.location, "--name", "arrowcol-sandbox",
+                      "--template-file", str(Path(__file__).with_name("main.bicep")),
+                      "--parameters", "@" + name)
+        except Failure as exc:
+            # `az deployment create` waits for a terminal state; a reported Failed
+            # deployment is definite and performed no data-plane I/O.
+            if "DeploymentFailed" in str(exc):
+                raise DeploymentFailed(str(exc)) from exc
+            raise
     finally:
         os.unlink(name)
     cluster = azure.arm("GET", c.cluster_id)
@@ -564,7 +575,7 @@ def held(control, publisher, generation, work):
     """
     try:
         return work()
-    except NotReady:
+    except (NotReady, DeploymentFailed):
         control.clean_release(publisher, generation, definitively_drained=True)
         raise
     except BaseException:
@@ -589,7 +600,7 @@ def exclusive(control, generation, steps):
         for step in steps:
             control.bootstrap_owner(operator, generation)
             step()
-    except NotReady:
+    except (NotReady, DeploymentFailed):
         control.complete_bootstrap(operator, generation, definitively_drained=True)
         raise
     except BaseException:

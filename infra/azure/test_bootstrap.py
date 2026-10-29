@@ -1688,6 +1688,31 @@ class ProvisionCoordinationTests(unittest.TestCase):
         self.assertNotIn("generation", self.child)  # no rotation or re-initialization
         self.assertEqual(b.load_env(self.output)["ARROWCOL_RESET_GENERATION"], before["resetgeneration"])
 
+    def test_terminal_deployment_failure_releases_custody_instead_of_stranding(self):
+        def failed(*args):
+            if args[:3] == ("deployment", "sub", "create"):
+                raise b.Failure('ERROR: {"status":"Failed","error":{"code":"DeploymentFailed"}}')
+            return self.fake_cli(*args)
+        for state in ("ready-v1", "fenced-v1"):
+            with self.subTest(state=state):
+                self.azure.metadata.update(resetstate=state, publishers="{}")
+                generation = self.azure.metadata["resetgeneration"]
+                with patch.object(self.azure, "cli", side_effect=failed):
+                    with self.assertRaises(b.DeploymentFailed):
+                        self.provision()
+                self.assertEqual(self.registry(), {})
+                self.assertEqual((self.azure.metadata["resetstate"], self.azure.metadata["resetgeneration"]),
+                                 (state, generation))
+
+    def test_unknown_deployment_failure_still_marks_member_uncertain(self):
+        def unknown(*args):
+            raise b.Failure("az: connection reset")
+        self.azure.metadata["resetstate"] = "fenced-v1"
+        with patch.object(self.azure, "cli", side_effect=unknown):
+            with self.assertRaises(b.Failure):
+                self.provision()
+        self.assertEqual([entry["state"] for entry in self.registry().values()], ["uncertain"])
+
     def test_legacy_or_unversioned_authority_is_refused_without_migration(self):
         for legacy in ({"resetstate": "ready"}, {"resetstate": "fenced"}):
             azure = FakeAzure()
