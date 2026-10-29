@@ -246,6 +246,22 @@ class Azure:
             return self.tokens[resource][1]
 
     def request(self, method, url, resource, body=None, headers=None, missing_ok=False):
+        # Reads are safe to repeat, so ride out transient gateway/throttling errors; writes stay
+        # single-shot because their callers own ambiguity through durable intents.
+        attempts = READ_ATTEMPTS if method in ("GET", "HEAD") else 1
+        for attempt in range(attempts):
+            try:
+                return self._request_once(method, url, resource, body, headers, missing_ok)
+            except HttpFailure as exc:
+                if attempt + 1 == attempts or exc.code not in TRANSIENT_HTTP:
+                    raise
+            except Failure:
+                if attempt + 1 == attempts:
+                    raise
+            time.sleep(min(2 ** attempt, 15))
+        raise AssertionError("unreachable")
+
+    def _request_once(self, method, url, resource, body, headers, missing_ok):
         encoded = body.encode() if isinstance(body, str) else body
         request = urllib.request.Request(url, encoded, method=method, headers={
             "Authorization": "Bearer " + self.token(resource),
@@ -1238,6 +1254,8 @@ def cleanup_with_custody(azure, control, record, record_path):
 
 
 DELETE_PARALLELISM = 32
+READ_ATTEMPTS = 5
+TRANSIENT_HTTP = frozenset({408, 429, 500, 502, 503, 504})
 
 
 def parallel_each(action, items):

@@ -1055,6 +1055,33 @@ class ResetTests(unittest.TestCase):
         self.assertEqual(request.call_args.kwargs["headers"]["If-Match"], '"e"')
 
 
+class TransientReadRetryTests(unittest.TestCase):
+    def setUp(self):
+        self.azure = REAL_AZURE(b.Config({"AZURE_SUBSCRIPTION_ID": SUB}))
+
+    @patch.object(b.time, "sleep")
+    def test_get_retries_gateway_timeout_then_succeeds(self, sleep):
+        with patch.object(self.azure, "_request_once",
+                          side_effect=[b.HttpFailure(504, "x"), b.HttpFailure(429, "x"), (b"{}", {})]) as once:
+            self.assertEqual(self.azure.request("GET", "https://h/p", "r")[0], b"{}")
+        self.assertEqual(once.call_count, 3)
+
+    @patch.object(b.time, "sleep")
+    def test_mutations_and_non_transient_reads_are_single_shot(self, sleep):
+        for method, code in (("DELETE", 504), ("PUT", 503), ("GET", 403)):
+            with patch.object(self.azure, "_request_once", side_effect=b.HttpFailure(code, "x")) as once:
+                with self.assertRaises(b.HttpFailure):
+                    self.azure.request(method, "https://h/p", "r")
+            self.assertEqual(once.call_count, 1, method)
+
+    @patch.object(b.time, "sleep")
+    def test_read_retries_are_bounded(self, sleep):
+        with patch.object(self.azure, "_request_once", side_effect=b.HttpFailure(504, "x")) as once:
+            with self.assertRaises(b.HttpFailure):
+                self.azure.request("GET", "https://h/p", "r")
+        self.assertEqual(once.call_count, b.READ_ATTEMPTS)
+
+
 class ParallelDeleteTests(unittest.TestCase):
     def test_files_then_directories_deepest_first(self):
         calls = []
