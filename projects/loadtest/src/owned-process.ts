@@ -74,7 +74,10 @@ export async function runOwnedProcess(
   const supervisor = fileURLToPath(new URL('../scripts/owned-process.py', import.meta.url));
   const child = spawn('python3', [supervisor, String(options.timeoutMs), command, ...args], {
     cwd: options.cwd, detached: true,
-    env: { ...options.env, OWNED_PROCESS_STDERR_FILE: options.stderrFile ?? '' }, stdio: ['ignore', 'pipe', 'ignore'],
+    // Azure CLI forks a detached telemetry uploader that outlives the command and would be
+    // (correctly) reported as a surviving descendant of the owned group.
+    env: { ...options.env, AZURE_CORE_COLLECT_TELEMETRY: 'false', OWNED_PROCESS_STDERR_FILE: options.stderrFile ?? '' },
+    stdio: ['ignore', 'pipe', 'ignore'],
   });
   let commandGroup: number | undefined;
   let receipt = '';

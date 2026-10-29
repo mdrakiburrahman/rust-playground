@@ -39,6 +39,13 @@ test('owned process accepts clean completion, rejects failure and validates dead
   await assert.rejects(runOwnedProcess('/definitely-absent-loadtest-binary', [], options), /retain occupancy/u);
 });
 
+test('owned Azure CLI children run without the detached telemetry uploader that outlives them', async () => {
+  // A surviving `az` telemetry uploader made every Azure reconcile report descendants=true.
+  await runOwnedProcess(process.execPath, ['-e', 'process.exit(process.env.AZURE_CORE_COLLECT_TELEMETRY === "false" ? 0 : 7)'], {
+    cwd: process.cwd(), env: { ...process.env, AZURE_CORE_COLLECT_TELEMETRY: 'true' }, timeoutMs: 2000,
+  });
+});
+
 test('a completed process is not failed by a backstop timer starved behind a blocked event loop', async () => {
   // Mirrors run 8568: the CLI finished, then synchronous gate work blocked Node past the backstop.
   const started = Date.now();
