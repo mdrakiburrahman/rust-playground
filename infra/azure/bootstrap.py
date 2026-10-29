@@ -453,6 +453,8 @@ def retry_ready(action, label, timeout=600):
             return action()
         except Failure as exc:
             last = exc
+            # Failures are redacted at construction; keep a bounded retry trail on stderr.
+            print(f"{label} not ready; retrying: {str(exc)[:400]}", file=sys.stderr, flush=True)
         if time.monotonic() >= deadline:
             raise Failure(f"{label} readiness timed out: {last}") from last
         time.sleep(10)
