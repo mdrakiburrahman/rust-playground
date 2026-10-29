@@ -50,6 +50,12 @@ missing_errors_doc = "warn"
 unwrap_used = "warn"
 
 # The browser UI ships as WebAssembly, so it is optimized for size rather than speed.
+# Dependencies (Arrow, Parquet, compression) run several times faster with basic optimization,
+# which keeps the local loadtest's debug-built final compaction inside its 300s budget while
+# workspace crates stay fully debuggable.
+[profile.dev.package."*"]
+opt-level = 1
+
 [profile.release.package.kusto-explorer-ui]
 opt-level = "z"
 codegen-units = 1
