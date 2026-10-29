@@ -60,6 +60,16 @@ impl Default for MemoryRoutingStore {
 }
 
 impl MemoryRoutingStore {
+    pub(crate) fn from_view(view: RoutingView) -> Self {
+        let store = Self::default();
+        Self {
+            state: Arc::new(Mutex::new(MemoryState {
+                collectors: view.collectors,
+                leases: view.leases,
+            })),
+            ..store
+        }
+    }
     /// Enables or disables the in-memory persistence service.
     ///
     /// This is intended for deterministic SQL-outage tests.

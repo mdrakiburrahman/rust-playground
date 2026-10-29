@@ -517,6 +517,8 @@ async fn claim_live_route(owner: CollectorInstanceId, table: &TableIdentity, rou
 fn ready_pressure(owner: CollectorInstanceId, now: UnixMillis) -> Result<RichPressureSnapshot> {
     let zero = gauge(0, 64)?;
     Ok(RichPressureSnapshot {
+        container_memory: None,
+        effective_cpu_millicores: None,
         instance_id: owner,
         observed_at_unix_ms: now,
         cpu_utilization_bps: BasisPoints::new(0)?,

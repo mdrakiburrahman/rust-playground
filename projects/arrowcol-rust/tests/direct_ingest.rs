@@ -47,6 +47,51 @@ use tonic::Request;
 use uuid::Uuid;
 
 #[tokio::test]
+async fn draining_source_can_renew_exact_admitted_fence_but_cached_handle_cannot_admit_new_rpc() -> Result<()> {
+    let identity = TableIdentity::new(
+        CatalogName::new("telemetry")?,
+        SchemaName::new("prod")?,
+        TableName::new("events")?,
+    );
+    let owner = CollectorInstanceId::new();
+    let routing = Arc::new(FakeRouting::owned(owner, identity.clone())?);
+    let receipts = Arc::new(FakeReceipts::default());
+    let routing_store: Arc<dyn RoutingStore> = Arc::<FakeRouting>::clone(&routing);
+    let receipt_store: Arc<dyn ReceiptStore> = Arc::<FakeReceipts>::clone(&receipts);
+    let leases = TableLeaseManager::new(receipt_store, routing_store, owner, Duration::from_secs(60));
+    let handle = leases.lease_for(Uuid::new_v4(), &identity).await?;
+    let original = handle.current()?;
+    let key = LeaseKey::new(ImplementationPool::Direct, identity.clone());
+    {
+        let mut view = routing.view.lock().map_err(|_| anyhow!("routing fixture poisoned"))?;
+        let route = view.leases.get_mut(&key).context("missing route")?;
+        route.state = LeaseState::Draining;
+        route.drain_started_at_unix_ms = Some(now()?);
+        route.renewed_at_unix_ms = now()?;
+    }
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    leases.renew_all().await?;
+    assert_eq!(handle.current()?.lease_id(), original.lease_id());
+    assert_eq!(handle.current()?.fencing_token(), original.fencing_token());
+    assert!(handle.current()?.expires_at_unix_ms() > original.expires_at_unix_ms());
+    assert!(
+        leases.lease_for(handle.table_id(), &identity).await.is_err(),
+        "cached handle must not bypass authoritative admission"
+    );
+    {
+        let mut view = routing.view.lock().map_err(|_| anyhow!("routing fixture poisoned"))?;
+        let route = view.leases.get_mut(&key).context("missing route")?;
+        route.fencing_epoch = FencingToken::new(route.fencing_epoch.get() + 1)?;
+    }
+    assert!(
+        leases.renew_all().await.is_err(),
+        "greater routing epoch fences even an admitted source"
+    );
+    assert!(handle.current().is_err());
+    Ok(())
+}
+
+#[tokio::test]
 async fn malicious_schema_is_rejected_before_any_receipt() -> Result<()> {
     let fixture = Fixture::new(8).await?;
     let malicious = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));

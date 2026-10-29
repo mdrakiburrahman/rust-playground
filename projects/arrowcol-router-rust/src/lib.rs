@@ -4,6 +4,7 @@
 
 mod auth;
 mod config;
+pub mod delta;
 mod metrics;
 mod router;
 

@@ -657,6 +657,8 @@ impl RuntimeMetrics {
             )
         };
         let rich = RichPressureSnapshot {
+            container_memory: None,
+            effective_cpu_millicores: None,
             instance_id: self.instance_id,
             observed_at_unix_ms: now,
             cpu_utilization_bps: BasisPoints::new(0).map_err(|error| error.to_string())?,

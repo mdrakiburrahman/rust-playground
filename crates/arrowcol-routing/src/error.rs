@@ -1,7 +1,8 @@
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Stable category for routing-control failures.
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, Error, PartialEq)]
 #[non_exhaustive]
 pub enum RoutingErrorKind {
     /// Configuration or caller data violated a bound.
@@ -31,7 +32,7 @@ pub enum RoutingErrorKind {
 }
 
 /// Structured routing failure with safe operator detail.
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, Error, PartialEq)]
 #[error("{kind}: {message}")]
 pub struct RoutingError {
     kind: RoutingErrorKind,

@@ -1,5 +1,6 @@
 use arrowcol_protocol::{CollectorInstanceId, UnixMillis};
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     CollectorRegistration, CollectorState, LeaseKey, RichPressureSnapshot, RoutingError, RoutingErrorKind,
@@ -7,7 +8,7 @@ use crate::{
 };
 
 /// Request to create or observe an active lease.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct LeaseClaim {
     /// Ownership key.
     pub key: LeaseKey,
@@ -22,7 +23,7 @@ pub struct LeaseClaim {
 }
 
 /// Compare-and-set request to begin drain.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct LeaseCas {
     /// Ownership key.
     pub key: LeaseKey,
@@ -33,7 +34,7 @@ pub struct LeaseCas {
 }
 
 /// Compare-and-set request to transfer a fully drained lease.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct LeaseTransfer {
     /// Ownership key.
     pub key: LeaseKey,
@@ -54,7 +55,7 @@ pub struct LeaseTransfer {
 ///
 /// No drain proof is required: the successor owns the predecessor's durable
 /// buffer volume and replays its persisted backlog.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct LeaseSuccession {
     /// Ownership key.
     pub key: LeaseKey,
@@ -99,6 +100,41 @@ impl LeaseSuccession {
 /// Persistence contract shared by router replicas.
 #[async_trait]
 pub trait RoutingStore: Send + Sync {
+    /// Whether transport failures may be retried while independent SQL fencing remains enforced.
+    fn is_remote_authority(&self) -> bool {
+        false
+    }
+
+    /// Returns explicit controlled moves relevant to a process lifetime.
+    async fn migration_work(&self, _instance_id: CollectorInstanceId) -> RoutingResult<Vec<crate::TableMigration>> {
+        Ok(Vec::new())
+    }
+
+    /// Records a participant's idempotent, exact-operation acknowledgement.
+    async fn acknowledge_migration(
+        &self,
+        _migration: &crate::TableMigration,
+        _instance_id: CollectorInstanceId,
+        _ack: crate::MigrationAck,
+    ) -> RoutingResult<()> {
+        Err(RoutingError::new(
+            RoutingErrorKind::InvalidConfiguration,
+            "migration acknowledgements unsupported",
+        ))
+    }
+
+    /// Requests a controller-selected explicit move.
+    async fn request_migration(
+        &self,
+        _key: &LeaseKey,
+        _reason: &str,
+        _force_scale_in: bool,
+    ) -> RoutingResult<crate::TableMigration> {
+        Err(RoutingError::new(
+            RoutingErrorKind::InvalidConfiguration,
+            "controlled migration unsupported",
+        ))
+    }
     /// Registers or refreshes one collector process lifetime.
     async fn register_collector(&self, registration: &CollectorRegistration) -> RoutingResult<()>;
 

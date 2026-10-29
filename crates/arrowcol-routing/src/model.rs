@@ -41,7 +41,7 @@ pub enum SubsystemState {
 }
 
 /// Registration for one collector process lifetime.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct CollectorRegistration {
     /// Process-lifetime identifier.
     pub instance_id: CollectorInstanceId,
@@ -130,9 +130,25 @@ impl TablePressure {
 }
 
 /// Rich bounded collector pressure document.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerMemory {
+    /// Unclamped cgroup memory.current.
+    pub current_bytes: Measurement,
+    /// Finite cgroup memory.max.
+    pub limit_bytes: PositiveMeasurement,
+}
+
+/// Rich bounded collector pressure document.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RichPressureSnapshot {
+    /// Actual container usage/limit when a finite cgroup limit is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_memory: Option<ContainerMemory>,
+    /// Effective affinity/cgroup CPU capacity, in thousandths of one core.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_cpu_millicores: Option<PositiveMeasurement>,
     /// Collector process lifetime.
     pub instance_id: CollectorInstanceId,
     /// Observation timestamp.
@@ -243,6 +259,9 @@ impl RichPressureSnapshot {
         let rss = ratio_bps(self.rss_bytes.get(), self.rss_limit_bytes.get());
         let permit_pressure = BasisPoints::FULL_SCALE.saturating_sub(self.available_permits.utilization().get());
         [
+            self.container_memory.map_or(0, |memory| {
+                ratio_bps(memory.current_bytes.get(), memory.limit_bytes.get())
+            }),
             self.cpu_utilization_bps.get(),
             rss,
             self.active_streams.utilization().get(),
@@ -300,7 +319,7 @@ impl RichPressureSnapshot {
 }
 
 /// Current collector registration and pressure.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct CollectorRecord {
     /// Registration document.
     pub registration: CollectorRegistration,
@@ -324,7 +343,7 @@ impl CollectorRecord {
 }
 
 /// Unique routing ownership key.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct LeaseKey {
     /// Implementation pool.
     pub implementation_pool: ImplementationPool,
@@ -344,7 +363,7 @@ impl LeaseKey {
 }
 
 /// Routing lease state.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum LeaseState {
     /// New streams may use the holder.
     Active,
@@ -353,7 +372,7 @@ pub enum LeaseState {
 }
 
 /// Fenced ownership for one implementation-pool/table pair.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct RoutingLease {
     /// Lease key.
     pub key: LeaseKey,

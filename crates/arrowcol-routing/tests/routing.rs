@@ -10,6 +10,358 @@ use arrowcol_routing::{
     MemoryRoutingStore, RebalanceReport, RichPressureSnapshot, RouteSource, RoutingEngine, RoutingErrorKind,
     RoutingLease, RoutingPolicy, RoutingStore, SubsystemState, TablePressure, rank_collectors,
 };
+use arrowcol_routing::{DiskRoutingStore, MigrationAck, MigrationPhase, PlacementPolicy};
+
+struct LocalAuthorityDirectory(std::path::PathBuf);
+
+impl LocalAuthorityDirectory {
+    fn new() -> Self {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/routing-authority-tests")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&path).unwrap_or_else(|error| panic!("create isolated authority fixture: {error}"));
+        Self(path)
+    }
+}
+
+impl Drop for LocalAuthorityDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn disk(directory: &LocalAuthorityDirectory) -> DiskRoutingStore {
+    DiskRoutingStore::open(&directory.0, RoutingPolicy::default(), PlacementPolicy::LeastPressure)
+        .unwrap_or_else(|error| panic!("open isolated authority: {error}"))
+}
+
+fn new_claim(key: LeaseKey, candidate: CollectorInstanceId, now: u64) -> LeaseClaim {
+    LeaseClaim {
+        key,
+        candidate_instance_id: candidate,
+        now_unix_ms: millis(now),
+        expires_at_unix_ms: millis(now + 100_000),
+        minimum_snapshot_at_unix_ms: millis(now.saturating_sub(3_000)),
+    }
+}
+
+#[tokio::test]
+async fn disk_authority_serializes_cold_claims_and_preserves_sticky_lineage() -> anyhow::Result<()> {
+    let directory = LocalAuthorityDirectory::new();
+    let store = Arc::new(disk(&directory));
+    let low = CollectorInstanceId::new();
+    let high = CollectorInstanceId::new();
+    for (id, port, cpu) in [(low, 5501, 100), (high, 5502, 8_000)] {
+        store.register_collector(&registration(id, port, 1)).await?;
+        store.publish_pressure(&drained_snapshot(id, 100_000, cpu)).await?;
+    }
+    let claim = new_claim(LeaseKey::new(ImplementationPool::Direct, table()), high, 100_001);
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..16 {
+        let store = Arc::clone(&store);
+        let claim = claim.clone();
+        tasks.spawn(async move { store.claim_lease(&claim).await });
+    }
+    let first = store.claim_lease(&claim).await?;
+    assert_eq!(
+        first.holder_instance_id, low,
+        "authority must ignore caller's chosen owner"
+    );
+    while let Some(task) = tasks.join_next().await {
+        assert_eq!(task??, first, "one lineage per table under concurrent claims");
+    }
+    store.publish_pressure(&drained_snapshot(low, 100_002, 9_000)).await?;
+    assert_eq!(
+        store.claim_lease(&claim).await?,
+        first,
+        "fresh existing owner remains sticky"
+    );
+    drop(tasks);
+    drop(store);
+    let reopened = disk(&directory);
+    let view = reopened.load_view(millis(100_003)).await?;
+    assert!(view.collectors.is_empty(), "telemetry must never be restored as fresh");
+    assert_eq!(view.leases.get(&claim.key), Some(&first));
+    Ok(())
+}
+
+#[tokio::test]
+async fn disk_authority_rejects_second_writer_corruption_and_missing_snapshot() -> anyhow::Result<()> {
+    let directory = LocalAuthorityDirectory::new();
+    let store = disk(&directory);
+    assert!(DiskRoutingStore::open(&directory.0, RoutingPolicy::default(), PlacementPolicy::LeastPressure).is_err());
+    drop(store);
+    let snapshot_path = directory.0.join("routing.json");
+    let original = std::fs::read(&snapshot_path)?;
+    let mut snapshot: serde_json::Value = serde_json::from_slice(&original)?;
+    snapshot["version"] = serde_json::json!(u32::MAX);
+    std::fs::write(&snapshot_path, serde_json::to_vec(&snapshot)?)?;
+    assert!(DiskRoutingStore::open(&directory.0, RoutingPolicy::default(), PlacementPolicy::LeastPressure).is_err());
+    snapshot["version"] = serde_json::json!(1);
+    snapshot["checksum"] = serde_json::json!("corrupt");
+    std::fs::write(&snapshot_path, serde_json::to_vec(&snapshot)?)?;
+    assert!(DiskRoutingStore::open(&directory.0, RoutingPolicy::default(), PlacementPolicy::LeastPressure).is_err());
+    std::fs::remove_file(&snapshot_path)?;
+    assert!(
+        DiskRoutingStore::open(&directory.0, RoutingPolicy::default(), PlacementPolicy::LeastPressure).is_err(),
+        "missing initialized snapshot must not reset epochs"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn disk_authority_fails_closed_after_uncertain_write_without_acknowledging_claim() -> anyhow::Result<()> {
+    let directory = LocalAuthorityDirectory::new();
+    let store = disk(&directory);
+    let id = CollectorInstanceId::new();
+    store.register_collector(&registration(id, 5501, 1)).await?;
+    store.publish_pressure(&drained_snapshot(id, 100_000, 100)).await?;
+    std::fs::create_dir(directory.0.join("routing.pending"))?;
+    let claim = new_claim(LeaseKey::new(ImplementationPool::Direct, table()), id, 100_001);
+    assert!(store.claim_lease(&claim).await.is_err());
+    assert!(
+        store.load_view(millis(100_002)).await.is_err(),
+        "uncertain in-memory authority must not serve"
+    );
+    drop(store);
+    std::fs::remove_dir(directory.0.join("routing.pending"))?;
+    assert!(disk(&directory).load_view(millis(100_003)).await?.leases.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn disk_authority_rejects_atomic_replace_failure_and_discards_uncommitted_pending_owner() -> anyhow::Result<()> {
+    let directory = LocalAuthorityDirectory::new();
+    let store = disk(&directory);
+    let id = CollectorInstanceId::new();
+    store.register_collector(&registration(id, 5501, 1)).await?;
+    store.publish_pressure(&drained_snapshot(id, 100_000, 100)).await?;
+    let snapshot = directory.0.join("routing.json");
+    let previous = directory.0.join("previous-acknowledged.json");
+    std::fs::rename(&snapshot, &previous)?;
+    std::fs::create_dir(&snapshot)?;
+    let claim = new_claim(LeaseKey::new(ImplementationPool::Direct, table()), id, 100_001);
+    assert!(store.claim_lease(&claim).await.is_err());
+    assert!(store.load_view(millis(100_002)).await.is_err());
+    assert!(directory.0.join("routing.pending").is_file());
+    drop(store);
+    std::fs::remove_dir(&snapshot)?;
+    std::fs::rename(previous, snapshot)?;
+    assert!(
+        disk(&directory).load_view(millis(100_003)).await?.leases.is_empty(),
+        "a fully written but uncommitted pending file must never become ownership"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn central_reservations_spread_equal_pressure_cold_tables() -> anyhow::Result<()> {
+    let directory = LocalAuthorityDirectory::new();
+    let store = disk(&directory);
+    let ids = [
+        CollectorInstanceId::new(),
+        CollectorInstanceId::new(),
+        CollectorInstanceId::new(),
+    ];
+    for (index, id) in ids.iter().enumerate() {
+        store
+            .register_collector(&registration(*id, 5501 + index as u16, 1))
+            .await?;
+        store.publish_pressure(&drained_snapshot(*id, 100_000, 100)).await?;
+    }
+
+    let mut assigned = std::collections::BTreeMap::new();
+    for ordinal in 0..12 {
+        let identity = TableIdentity::new(
+            table().catalog().clone(),
+            table().schema().clone(),
+            TableName::new(format!("cold_{ordinal}"))?,
+        );
+        let lease = store
+            .claim_lease(&new_claim(
+                LeaseKey::new(ImplementationPool::Direct, identity),
+                ids[0],
+                100_001,
+            ))
+            .await?;
+        *assigned.entry(lease.holder_instance_id).or_insert(0) += 1;
+    }
+    assert_eq!(assigned.len(), 3);
+    assert!(
+        assigned.values().all(|count| *count == 4),
+        "bounded cold reservations prevent one-owner stampede"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn migration_requires_source_drain_proof_and_durable_greater_epoch_before_activation() -> anyhow::Result<()> {
+    let directory = LocalAuthorityDirectory::new();
+    let store = disk(&directory);
+    let now = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis(),
+    )?;
+    let source = CollectorInstanceId::new();
+    let target = CollectorInstanceId::new();
+    for (id, port, cpu) in [(source, 5501, 100), (target, 5502, 2_000)] {
+        let mut record = registration(id, port, now - 1);
+        record.heartbeat_at_unix_ms = millis(now);
+        record.lease_expires_at_unix_ms = millis(now + 60_000);
+        store.register_collector(&record).await?;
+        store.publish_pressure(&drained_snapshot(id, now - 1, cpu)).await?;
+    }
+    let key = LeaseKey::new(ImplementationPool::Direct, table());
+    let original = store.claim_lease(&new_claim(key.clone(), source, now)).await?;
+    store.publish_pressure(&snapshot(source, now, 8_000, 1)).await?;
+    let operation = store.request_migration(&key, "focused controlled move", false).await?;
+    assert_eq!(operation.target, target);
+    store
+        .acknowledge_migration(&operation, target, MigrationAck::Prepared)
+        .await?;
+    let draining = store.migration_work(source).await?.remove(0);
+    assert_eq!(draining.phase, MigrationPhase::Draining);
+    assert!(
+        store
+            .acknowledge_migration(&draining, source, MigrationAck::SourceReleased)
+            .await
+            .is_err()
+    );
+    let proof_at = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis(),
+    )?;
+    store
+        .publish_pressure(&drained_snapshot(source, proof_at, 8_000))
+        .await?;
+    store
+        .acknowledge_migration(&draining, source, MigrationAck::SourceReleased)
+        .await?;
+    let transferred = store.load_view(millis(proof_at)).await?.leases[&key].clone();
+    assert_eq!(transferred.holder_instance_id, target);
+    assert!(transferred.fencing_epoch > original.fencing_epoch);
+    assert_eq!(
+        transferred.state,
+        LeaseState::Draining,
+        "new RPCs fenced until target SQL activation"
+    );
+    let activating = store.migration_work(target).await?.remove(0);
+    store
+        .acknowledge_migration(&activating, target, MigrationAck::TargetActive)
+        .await?;
+    store
+        .acknowledge_migration(&activating, target, MigrationAck::TargetActive)
+        .await?;
+    assert_eq!(
+        store.load_view(millis(proof_at)).await?.leases[&key].state,
+        LeaseState::Active
+    );
+    assert_eq!(
+        store.migration_work(target).await?[0].phase,
+        MigrationPhase::Complete,
+        "completed target ACK stays reconcilable after a lost HTTP response"
+    );
+    drop(store);
+    let reopened = disk(&directory);
+    assert_eq!(
+        reopened.load_view(millis(proof_at)).await?.leases[&key].fencing_epoch,
+        transferred.fencing_epoch
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(5_010)).await;
+    let later = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis(),
+    )?;
+    for (id, cpu) in [(source, 8_000), (target, 2_000)] {
+        let mut record = registration(id, if id == source { 5501 } else { 5502 }, later - 1);
+        record.heartbeat_at_unix_ms = millis(later);
+        record.lease_expires_at_unix_ms = millis(later + 60_000);
+        reopened.register_collector(&record).await?;
+        reopened.publish_pressure(&drained_snapshot(id, later, cpu)).await?;
+    }
+    let other = LeaseKey::new(
+        ImplementationPool::Direct,
+        TableIdentity::new(
+            table().catalog().clone(),
+            table().schema().clone(),
+            TableName::new("another_move")?,
+        ),
+    );
+    let second = reopened.claim_lease(&new_claim(other.clone(), target, later)).await?;
+    assert_eq!(second.holder_instance_id, target);
+    reopened
+        .publish_pressure(&drained_snapshot(target, later + 1, 8_500))
+        .await?;
+    reopened
+        .request_migration(&other, "independent controlled move", false)
+        .await?;
+    assert!(
+        reopened
+            .migration_work(target)
+            .await?
+            .iter()
+            .any(|record| record.key == key && record.phase == MigrationPhase::Complete),
+        "another table's move must not erase lost activation-ACK reconciliation"
+    );
+    reopened
+        .acknowledge_migration(&activating, target, MigrationAck::TargetActive)
+        .await?;
+    drop(reopened);
+    assert_eq!(disk(&directory).migration_work(target).await?.len(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn controller_restart_requires_fresh_registration_and_preserves_retirement_intent() -> anyhow::Result<()> {
+    let directory = LocalAuthorityDirectory::new();
+    let store = disk(&directory);
+    let id = CollectorInstanceId::new();
+    let registered = registration(id, 5501, 1);
+    store.register_collector(&registered).await?;
+    store
+        .set_collector_state(id, CollectorState::Draining, millis(100_000))
+        .await?;
+    drop(store);
+    let reopened = disk(&directory);
+    assert!(reopened.load_view(millis(100_001)).await?.collectors.is_empty());
+    reopened.register_collector(&registered).await?;
+    let view = reopened.load_view(millis(100_001)).await?;
+    assert_eq!(view.collectors[&id].state, CollectorState::Draining);
+    assert!(view.collectors[&id].pressure.is_none());
+    assert!(
+        reopened
+            .set_collector_state(id, CollectorState::Ready, millis(100_002))
+            .await
+            .is_err()
+    );
+    assert!(
+        reopened
+            .claim_lease(&new_claim(
+                LeaseKey::new(ImplementationPool::Direct, table()),
+                id,
+                100_002
+            ))
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn actual_container_memory_is_not_clamped_and_excludes_over_limit_placement() -> anyhow::Result<()> {
+    let mut pressure = drained_snapshot(CollectorInstanceId::new(), 100_000, 100);
+    pressure.container_memory = Some(arrowcol_routing::ContainerMemory {
+        current_bytes: measurement(2_000),
+        limit_bytes: positive(1_000),
+    });
+    assert_eq!(pressure.container_memory.map(|m| m.current_bytes.get()), Some(2_000));
+    assert_eq!(pressure.maximum_pressure_bps(), 10_000);
+    pressure.validate_at(millis(100_001), &RoutingPolicy::default().pressure)?;
+    Ok(())
+}
 
 fn millis(value: u64) -> UnixMillis {
     UnixMillis::new(value).unwrap_or_else(|error| panic!("invalid test timestamp: {error}"))
@@ -122,6 +474,8 @@ fn snapshot_with_work(
 ) -> RichPressureSnapshot {
     let oldest_age = u64::from(work.buffered_batches > 0);
     RichPressureSnapshot {
+        container_memory: None,
+        effective_cpu_millicores: None,
         instance_id,
         observed_at_unix_ms: millis(observed_at),
         cpu_utilization_bps: BasisPoints::new(cpu_bps).unwrap_or_else(|error| panic!("invalid CPU pressure: {error}")),
@@ -566,6 +920,37 @@ async fn stale_snapshots_and_expired_leases_fail_closed() {
         panic!("expired lease and stale pressure must fail closed");
     };
     assert_eq!(stale.kind(), RoutingErrorKind::PoolUnavailable);
+}
+
+#[tokio::test]
+async fn stale_control_cache_rejects_valid_owner_and_lease_free_catalog_routing() -> anyhow::Result<()> {
+    let (store, _, _) = seeded_store().await;
+    let engine = RoutingEngine::new(
+        Arc::<MemoryRoutingStore>::clone(&store),
+        RoutingPolicy {
+            readiness_max_staleness_ms: 10,
+            ..RoutingPolicy::default()
+        },
+    )?;
+    engine.refresh(millis(100_000)).await?;
+    let control = arrowcol_routing::ControlRoute {
+        implementation_pool: ImplementationPool::Direct,
+        operation: arrowcol_routing::ControlOperation::CatalogRead,
+        routing_key: "catalog-discovery".to_owned(),
+    };
+    assert!(engine.route_control(&control, millis(100_001)).await.is_ok());
+    assert!(engine.route_ingest(&metadata(), millis(100_001)).await?.lease.is_some());
+    store.set_available(false);
+    let Err(ingest) = engine.route_ingest(&metadata(), millis(100_011)).await else {
+        panic!("stale cached owner must not admit ingest");
+    };
+    let Err(catalog) = engine.route_control(&control, millis(100_011)).await else {
+        panic!("stale cached discovery must not select a collector");
+    };
+    assert_eq!(ingest.kind(), RoutingErrorKind::PoolUnavailable);
+    assert_eq!(catalog.kind(), RoutingErrorKind::PoolUnavailable);
+    assert!(!engine.is_ready_at(millis(100_011)).await);
+    Ok(())
 }
 
 #[tokio::test]

@@ -24,6 +24,8 @@ pub struct TableLeaseHandle {
     fence: Arc<LeasePublicationFence>,
     valid: AtomicBool,
     delta_table: Mutex<Option<Arc<BatchedTable>>>,
+    routing_lease_id: arrowcol_protocol::LeaseId,
+    routing_epoch: arrowcol_protocol::FencingToken,
 }
 
 impl TableLeaseHandle {
@@ -112,6 +114,7 @@ pub struct TableLeaseManager {
     entries: AsyncRwLock<HashMap<TableIdentity, Arc<TableLeaseHandle>>>,
     acquisition_gates: Mutex<HashMap<TableIdentity, Arc<Mutex<()>>>>,
     draining: AtomicBool,
+    released_tables: AsyncRwLock<HashMap<TableIdentity, Uuid>>,
 }
 
 impl TableLeaseManager {
@@ -131,6 +134,7 @@ impl TableLeaseManager {
             entries: AsyncRwLock::new(HashMap::new()),
             acquisition_gates: Mutex::new(HashMap::new()),
             draining: AtomicBool::new(false),
+            released_tables: AsyncRwLock::new(HashMap::new()),
         }
     }
 
@@ -141,12 +145,31 @@ impl TableLeaseManager {
     /// Fails closed when routing ownership is absent, stale, draining, or held
     /// by another collector, or when SQL lease acquisition fails.
     pub async fn lease_for(&self, table_id: Uuid, table: &TableIdentity) -> Result<Arc<TableLeaseHandle>> {
+        self.acquire(table_id, table, false).await
+    }
+
+    /// Acquires target publication authority while new-RPC admission remains fenced.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for stale routing authority, invalid cached lineage,
+    /// collector drain, or failed SQL lease acquisition.
+    pub async fn activate_table(&self, table_id: Uuid, table: &TableIdentity) -> Result<()> {
+        self.acquire(table_id, table, true).await?;
+        Ok(())
+    }
+
+    async fn acquire(&self, table_id: Uuid, table: &TableIdentity, activating: bool) -> Result<Arc<TableLeaseHandle>> {
         if self.draining.load(Ordering::Acquire) {
             bail!("collector is draining");
         }
+        let route = self.verify_routing_owner(table, activating).await?;
         if let Some(handle) = self.entries.read().await.get(table).cloned()
             && handle.current().is_ok()
         {
+            if handle.routing_lease_id != route.lease_id || handle.routing_epoch != route.fencing_epoch {
+                bail!("cached publication handle belongs to a stale routing epoch");
+            }
             return Ok(handle);
         }
         let gate = {
@@ -154,12 +177,15 @@ impl TableLeaseManager {
             Arc::clone(gates.entry(table.clone()).or_insert_with(|| Arc::new(Mutex::new(()))))
         };
         let _guard = gate.lock().await;
+        let route = self.verify_routing_owner(table, activating).await?;
         if let Some(handle) = self.entries.read().await.get(table).cloned()
             && handle.current().is_ok()
         {
+            if handle.routing_lease_id != route.lease_id || handle.routing_epoch != route.fencing_epoch {
+                bail!("cached publication handle belongs to a stale routing epoch");
+            }
             return Ok(handle);
         }
-        self.verify_routing_owner(table).await?;
         let issued_at = now_unix_millis()?;
         let expires_at = add_duration(issued_at, self.lease_ttl)?;
         let lease = self
@@ -180,8 +206,11 @@ impl TableLeaseManager {
             lease: RwLock::new(lease),
             valid: AtomicBool::new(true),
             delta_table: Mutex::new(None),
+            routing_lease_id: route.lease_id,
+            routing_epoch: route.fencing_epoch,
         });
         self.entries.write().await.insert(table.clone(), Arc::clone(&handle));
+        self.released_tables.write().await.remove(table);
         Ok(handle)
     }
 
@@ -231,11 +260,27 @@ impl TableLeaseManager {
             .map(|(table, handle)| (table.clone(), Arc::clone(handle)))
             .collect();
         for (table, handle) in handles {
+            let gate = {
+                let mut gates = self.acquisition_gates.lock().await;
+                Arc::clone(gates.entry(table.clone()).or_insert_with(|| Arc::new(Mutex::new(()))))
+            };
+            let _guard = gate.lock().await;
+            if !self
+                .entries
+                .read()
+                .await
+                .get(&table)
+                .is_some_and(|current| Arc::ptr_eq(current, &handle))
+            {
+                continue;
+            }
             let key = LeaseKey::new(ImplementationPool::Direct, table.clone());
             let owned = routing.leases.get(&key).is_some_and(|lease| {
-                lease.state == LeaseState::Active
+                matches!(lease.state, LeaseState::Active | LeaseState::Draining)
                     && lease.holder_instance_id == self.instance_id
-                    && lease.is_routable_at(now)
+                    && lease.lease_id == handle.routing_lease_id
+                    && lease.fencing_epoch == handle.routing_epoch
+                    && lease.is_valid_at(now)
             });
             if !owned {
                 handle.invalidate("routing ownership was lost before publication");
@@ -313,15 +358,70 @@ impl TableLeaseManager {
 
     /// Returns table identities and deterministic IDs for pressure reporting.
     pub async fn known_tables(&self) -> Vec<(Uuid, TableIdentity)> {
-        self.entries
+        let mut known: Vec<_> = self
+            .entries
             .read()
             .await
             .iter()
             .map(|(table, handle)| (handle.table_id(), table.clone()))
-            .collect()
+            .collect();
+        known.extend(
+            self.released_tables
+                .read()
+                .await
+                .iter()
+                .map(|(table, id)| (*id, table.clone())),
+        );
+        known
     }
 
-    async fn verify_routing_owner(&self, table: &TableIdentity) -> Result<()> {
+    /// Releases one exact source SQL fence only after its admission/backlog barrier.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the source handle is missing/invalid or SQL release
+    /// cannot be confirmed. Unknown release outcomes remain fenced.
+    pub async fn release_table(&self, table: &TableIdentity) -> Result<()> {
+        let gate = {
+            let mut gates = self.acquisition_gates.lock().await;
+            Arc::clone(gates.entry(table.clone()).or_insert_with(|| Arc::new(Mutex::new(()))))
+        };
+        let _guard = gate.lock().await;
+        if self.released_tables.read().await.contains_key(table) {
+            return Ok(());
+        }
+        let handle = self
+            .entries
+            .read()
+            .await
+            .get(table)
+            .cloned()
+            .context("source has no known publication handle; cannot prove release")?;
+        let lease = handle.current()?;
+        self.receipts
+            .release_table_lease(&lease, now_unix_millis()?)
+            .await
+            .context("release source SQL publication fence")?;
+        handle.invalidate("source publication authority released for controlled migration");
+        self.released_tables
+            .write()
+            .await
+            .insert(table.clone(), handle.table_id);
+        self.entries.write().await.remove(table);
+        Ok(())
+    }
+
+    pub async fn start_table_draining(&self, table: &TableIdentity) {
+        if let Some(handle) = self.entries.read().await.get(table).cloned() {
+            handle.start_delta_draining().await;
+        }
+    }
+
+    async fn verify_routing_owner(
+        &self,
+        table: &TableIdentity,
+        activating: bool,
+    ) -> Result<arrowcol_routing::RoutingLease> {
         let now = now_unix_millis()?;
         let view = self
             .routing
@@ -333,13 +433,13 @@ impl TableLeaseManager {
             .leases
             .get(&key)
             .ok_or_else(|| anyhow!("routing lease for {table} is missing"))?;
-        if route.state != LeaseState::Active
+        if (!activating && route.state != LeaseState::Active)
             || route.holder_instance_id != self.instance_id
-            || !route.is_routable_at(now)
+            || !route.is_valid_at(now)
         {
             bail!("routing lease for {table} is not active on this collector");
         }
-        Ok(())
+        Ok(route.clone())
     }
 }
 
@@ -385,10 +485,15 @@ pub fn add_duration(value: UnixMillis, duration: Duration) -> Result<UnixMillis>
 #[async_trait]
 impl StageLeases for TableLeaseManager {
     async fn current_lease(&self, table_id: Uuid, table: &TableIdentity) -> Result<TableLease, String> {
-        let handle = self
-            .lease_for(table_id, table)
-            .await
-            .map_err(|error| format!("acquire table lease: {error:#}"))?;
+        // Persisted work already admitted under this exact handle must finish during drain.
+        // This path does not create a new RPC or acquire a different owner.
+        let handle = match self.entries.read().await.get(table).cloned() {
+            Some(handle) => handle,
+            None => self
+                .lease_for(table_id, table)
+                .await
+                .map_err(|error| format!("acquire table lease: {error:#}"))?,
+        };
         let lease = handle
             .current()
             .map_err(|error| format!("load table lease: {error:#}"))?;
