@@ -80,7 +80,11 @@ fn azure_store(url: &Url) -> Result<object_store::azure::MicrosoftAzure> {
             retry_timeout: Duration::from_secs(10),
             ..Default::default()
         })
-        .with_client_options(object_store::ClientOptions::new().with_timeout(Duration::from_secs(10)))
+        .with_client_options(
+            object_store::ClientOptions::new()
+                .with_timeout(Duration::from_secs(10))
+                .with_connect_timeout(Duration::from_secs(10)),
+        )
         .build()?)
 }
 

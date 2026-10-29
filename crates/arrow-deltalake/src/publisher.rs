@@ -562,8 +562,25 @@ fn classify<T>(result: &object_store::Result<T>, retries: MutationRetries) -> Op
             | E::NotImplemented { .. }
             | E::UnknownConfigurationKey { .. },
         ) => None,
+        Err(error) if never_sent(error) => None,
         Err(error) => Some(format!("ambiguous mutation failure: {error}")),
     }
+}
+
+/// A connector failure (DNS, TCP or TLS) happens before any request byte is written, so the
+/// mutation definitely did not reach storage even when the transport also labels it a timeout.
+fn never_sent(error: &object_store::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = source {
+        if current
+            .downcast_ref::<object_store_reqwest::Error>()
+            .is_some_and(object_store_reqwest::Error::is_connect)
+        {
+            return true;
+        }
+        source = current.source();
+    }
+    false
 }
 struct Registration {
     control: Arc<dyn ControlMetadata>,
@@ -1175,7 +1192,11 @@ impl PublisherSession {
                         retry_timeout: Duration::from_secs(10),
                         backoff: object_store::BackoffConfig::default(),
                     })
-                    .with_client_options(object_store::ClientOptions::new().with_timeout(Duration::from_secs(10)))
+                    .with_client_options(
+                        object_store::ClientOptions::new()
+                            .with_timeout(Duration::from_secs(10))
+                            .with_connect_timeout(Duration::from_secs(10)),
+                    )
                     .build()?,
             )
         };
@@ -1565,5 +1586,55 @@ impl MultipartUpload for GuardedUpload {
         let result = self.inner.abort().await;
         permit.finish(&result, self.retries);
         result
+    }
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::*;
+
+    fn generic(source: Box<dyn std::error::Error + Send + Sync>) -> object_store::Error {
+        object_store::Error::Generic {
+            store: "MicrosoftAzure",
+            source,
+        }
+    }
+
+    #[tokio::test]
+    async fn connector_failures_are_definite_but_sent_request_failures_stay_ambiguous() -> Result<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        drop(listener);
+        let connect = object_store_reqwest::Client::new()
+            .put(format!("http://127.0.0.1:{port}/probe"))
+            .send()
+            .await
+            .err()
+            .context("closed port refuses the connection")?;
+        assert!(connect.is_connect());
+        let refused: object_store::Result<()> = Err(generic(Box::new(connect)));
+        assert_eq!(classify(&refused, MutationRetries::Disabled), None);
+        assert!(classify(&refused, MutationRetries::Opaque).is_some());
+
+        // The observed Azure failure: the connector gives up before a socket exists (timeout or
+        // unreachable), which reqwest also reports as a timeout; it must stay definite.
+        let timeout = object_store_reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(200))
+            .build()?
+            .put("http://192.0.2.1:9/probe")
+            .send()
+            .await
+            .err()
+            .context("TEST-NET-1 is not routable")?;
+        assert!(timeout.is_connect(), "{timeout:?}");
+        let timed_out: object_store::Result<()> = Err(generic(Box::new(timeout)));
+        assert_eq!(classify(&timed_out, MutationRetries::Disabled), None);
+
+        let sent: object_store::Result<()> = Err(generic(Box::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "response timed out after the request was written",
+        ))));
+        assert!(classify(&sent, MutationRetries::Disabled).is_some_and(|reason| reason.starts_with("ambiguous")));
+        Ok(())
     }
 }
