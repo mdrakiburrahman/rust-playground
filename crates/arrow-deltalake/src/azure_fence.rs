@@ -129,7 +129,8 @@ impl AzureControlContainer {
             request = request.header(name.as_str(), value.as_str());
         }
         if method == Method::PUT {
-            request = request.body(Vec::new());
+            // Azure Blob rejects body-less PUTs (lease, metadata) with 411 unless explicit.
+            request = request.header(reqwest::header::CONTENT_LENGTH, "0").body(Vec::new());
         }
         match request.send().await {
             Ok(response) => Exchange::Response(response),
@@ -488,6 +489,8 @@ mod tests {
             .find(|request| request.query.contains("comp=metadata"))
             .context("write")?;
         assert_eq!(write.headers.get("x-ms-lease-id"), Some(&lease));
+        assert_eq!(write.headers.get("content-length").map(String::as_str), Some("0"));
+        assert_eq!(acquire.headers.get("content-length").map(String::as_str), Some("0"));
         assert!(!write.headers.contains_key("if-match"));
         assert_eq!(
             write.headers.get("authorization").map(String::as_str),
