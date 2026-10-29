@@ -217,7 +217,27 @@ Legacy or unversioned metadata (`resetstate=ready`/`fenced`, or no
   An uncertain member keeps blocking stop and cleanup until an operator reconciles it.
 
 Arbitrary lease-less or old tools and concurrent first provisioning remain
-outside the proof. The gated reset operator path exists but is not dispatched.
+outside the proof.
+
+**Recovering a stranded sandbox.** Publisher UUIDs are per process, so a crashed
+or killed run can leave `occupancy=testing` and active/uncertain members that no
+live process will ever clean-release; `release`, `provision` and `reset` then
+refuse. The explicit operator escape hatch is:
+
+```bash
+python3 infra/azure/bootstrap.py recover            # preview
+python3 infra/azure/bootstrap.py recover --execute  # stop local writers, fence, rotate
+python3 infra/azure/bootstrap.py reset --execute    # data written by the failed run is untrusted
+python3 infra/azure/bootstrap.py provision          # back to ready-v1
+```
+
+`recover --execute` requires the generation-bound local stop receipt, waits the
+60-second quiescence interval, then in one leased CAS sets `fenced-v1`, rotates
+`resetgeneration`, clears the registry and releases occupancy. Rotation means a
+zombie writer's membership and generation no longer match, so it is rejected
+rather than silently readmitted. It refuses `cleaning-v1` (use
+`reset --resume`) and a cluster `stopping` hold, before stopping anything. Stop
+writers on every other devbox sharing the sandbox first.
 
 The test runner acquires shared occupancy before live tests and releases it only
 after its owned writers/consumers stop successfully:

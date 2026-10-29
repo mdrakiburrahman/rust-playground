@@ -31,6 +31,7 @@ API = "2024-04-13"
 # Short exclusive lease serializing authority metadata read-modify-write only.
 LEASE_SECONDS = 15
 TAGS = {"project": "rust-playground", "purpose": "disposable-arrowcol-sandbox"}
+DEFAULT_STOP_COMMAND = ["npx", "--no-install", "tsx", "projects/loadtest/src/main.ts", "--stop"]
 
 
 class Failure(RuntimeError):
@@ -1336,9 +1337,38 @@ def occupancy(azure, action, owner, output=None, generation=None):
         write_private(output, values)
     print("Cloud test occupancy: " + ("TESTING" if action == "occupy" else "RELEASED"))
 
+def recover(azure, execute, stop_command):
+    """Unstick a sandbox stranded by a crashed run (orphaned publishers/occupancy)."""
+    from publisher_control import PublisherControl, UnknownTransition
+    control = PublisherControl(azure)
+    metadata, registry, _ = control.read()
+    print(f"Recover preview: state={metadata['resetstate']}, occupancy={metadata['occupancy']}, "
+          f"registered publishers={len(registry)}")
+    if not execute:
+        print("Recover --execute stops local writers, fences, rotates the generation, clears the "
+              "registry and releases occupancy. Then run reset --execute and provision.")
+        return
+    generation = metadata["resetgeneration"]
+    if metadata["resetstate"] not in ("ready-v1", "fenced-v1") or metadata["occupancy"] == "stopping":
+        raise Failure("Cleanup or a cluster stop owns authority; recovery refused before any stop.")
+    result = run_tree(stop_command, 180, cwd=ROOT,
+                      env={**os.environ, "ARROWCOL_RESET_GENERATION": generation})
+    if result.returncode or not verified_stop_receipt(result.stdout, generation):
+        raise Failure("Runner did not verify workspace-owned services stopped; nothing recovered. " +
+                      azure.c.redact(str(result.stderr)))
+    print("Local writers stopped; waiting 60s for bounded in-flight publications.")
+    time.sleep(60)
+    try:
+        control.abandon(generation, str(uuid.uuid4()), writers_stopped=True)
+    except UnknownTransition:
+        raise Failure("Recovery CAS outcome unknown; re-read authority with recover (preview).")
+    print("Recovered: fenced-v1, released, empty registry, fresh generation. "
+          "Next: reset --execute, then provision.")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("config", "preflight", "provision", "reconcile", "reset", "status", "stop", "occupy", "release"))
+    parser.add_argument("command", choices=("config", "preflight", "provision", "reconcile", "reset", "recover", "status", "stop", "occupy", "release"))
     parser.add_argument("--env-file", type=Path, default=ROOT / ".env")
     parser.add_argument("--output", type=Path, default=ROOT / ".env.azure")
     parser.add_argument("--tables", type=Path, default=ROOT / ".env.azure.tables.json")
@@ -1370,9 +1400,9 @@ def main(argv=None):
             reconcile_command(azure, args.tables, args.occupancy_id, args.wait_seconds,
                               args.reset_generation or values.get("ARROWCOL_RESET_GENERATION"))
         elif args.command == "reset":
-            reset(azure, args.execute, args.stop_command or [
-                "npx", "--no-install", "tsx", "projects/loadtest/src/main.ts", "--stop",
-            ], resume=args.resume)
+            reset(azure, args.execute, args.stop_command or DEFAULT_STOP_COMMAND, resume=args.resume)
+        elif args.command == "recover":
+            recover(azure, args.execute, args.stop_command or DEFAULT_STOP_COMMAND)
         elif args.command == "status":
             reset_inventory(azure)
             azure.kql(".show capacity")

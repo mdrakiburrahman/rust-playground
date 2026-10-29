@@ -246,6 +246,47 @@ class ResetTests(unittest.TestCase):
             run.assert_not_called()
         self.assertEqual(self.azure.events, [])
 
+    def test_recover_preview_has_no_mutations(self):
+        self.azure.metadata.update(occupancy="testing", occupancyid=str(uuid.uuid4()))
+        with patch.object(b, "run_tree") as run:
+            b.recover(self.azure, False, ["stop"])
+            run.assert_not_called()
+        self.assertEqual(self.azure.events, [])
+
+    @patch.object(b.time, "sleep")
+    def test_recover_abandons_orphans_and_rotates_generation_after_stop(self, sleep):
+        generation = self.azure.metadata["resetgeneration"]
+        orphan = str(uuid.uuid4())
+        self.azure.metadata.update(occupancy="testing", occupancyid=str(uuid.uuid4()), publishers=json.dumps(
+            {orphan: {"generation": generation, "state": "uncertain"}}, separators=(",", ":")))
+        with patch.object(b, "run_tree") as run:
+            run.return_value.returncode = 0
+            run.return_value.stdout = self.receipt(generation)
+            b.recover(self.azure, True, ["stop"])
+        sleep.assert_called_once_with(60)
+        metadata = self.azure.metadata
+        self.assertEqual((metadata["resetstate"], metadata["occupancy"]), ("fenced-v1", "released"))
+        self.assertNotEqual(metadata["resetgeneration"], generation)
+        self.assertNotIn(orphan, metadata.get("publishers", "{}"))
+        self.assertNotIn("occupancyid", metadata)
+
+    def test_recover_keeps_authority_when_stop_is_unproven(self):
+        self.azure.metadata.update(occupancy="testing", occupancyid=str(uuid.uuid4()))
+        before = dict(self.azure.metadata)
+        with patch.object(b, "run_tree") as run:
+            run.return_value.returncode = 0
+            run.return_value.stdout = self.receipt(str(uuid.uuid4()))
+            with self.assertRaises(b.Failure):
+                b.recover(self.azure, True, ["stop"])
+        self.assertEqual(self.azure.metadata, before)
+
+    def test_recover_refuses_cleanup_custody_before_stopping(self):
+        self.azure.metadata["resetstate"] = "cleaning-v1"
+        with patch.object(b, "run_tree") as run:
+            with self.assertRaises(b.Failure):
+                b.recover(self.azure, True, ["stop"])
+            run.assert_not_called()
+
     def test_ownership_mismatch_fails_before_deletion(self):
         self.azure.tags["sandboxId"] = "another"
         with self.assertRaises(b.Failure):
@@ -1927,7 +1968,7 @@ class ProvisionCoordinationTests(unittest.TestCase):
                     ["reconcile", "--occupancy-id", owner, "--reset-generation", generation],
                     ["stop", "--execute"], ["occupy", "--occupancy-id", owner],
                     ["release", "--occupancy-id", owner, "--reset-generation", generation],
-                    ["reset", "--execute"])
+                    ["reset", "--execute"], ["recover", "--execute"])
         with patch.object(b, "Azure", return_value=self.azure), patch.object(b, "preflight"), \
                 patch.object(b, "RESET_RECORD", Path(self.directory.name) / "reset.json"), \
                 contextlib.redirect_stderr(io.StringIO()):

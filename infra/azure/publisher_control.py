@@ -225,6 +225,34 @@ class PublisherControl:
         metadata["resetstate"] = FENCED
         return self.cas(metadata, {}, etag)
 
+    def abandon(self, generation, new_generation, *, writers_stopped):
+        """Operator recovery for a stranded disposable sandbox, in one CAS.
+
+        A crashed run leaves per-process publisher UUIDs and test occupancy that no
+        live process can clean-release. After the operator proves its writers are
+        stopped, this fences, rotates the generation (so any zombie writer's
+        membership and generation no longer match), clears the registry and
+        releases test occupancy. The data is not trusted afterwards: run
+        reset --execute and provision before the next load.
+        """
+        generation, new_generation = canonical_uuid(generation), canonical_uuid(new_generation)
+        metadata, registry, etag = self.read()
+        if writers_stopped is not True:
+            raise Failure("Recovery requires proof that the workspace writers are stopped.")
+        if metadata["resetgeneration"] != generation:
+            raise Failure("Recovery generation changed; nothing abandoned.")
+        if metadata["resetstate"] not in (READY, FENCED):
+            raise Failure("Cleanup owns authority; use reset --resume instead.")
+        if metadata["occupancy"] == "stopping":
+            raise Failure("A cluster stop holds the sandbox; recovery refused.")
+        if new_generation == generation:
+            raise Failure("Generation rotation requires a fresh UUID.")
+        metadata["resetstate"] = FENCED
+        metadata["resetgeneration"] = new_generation
+        metadata["occupancy"] = "released"
+        metadata.pop("occupancyid", None)
+        return self.cas(metadata, {}, etag)
+
     def bootstrap_owner(self, publisher, generation):
         """Re-verify exclusive bootstrap ownership before each parent KQL/ARM step."""
         publisher, metadata, registry, etag = self.member(publisher, generation)
