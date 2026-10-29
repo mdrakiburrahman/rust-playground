@@ -139,7 +139,7 @@ export function startQapObserver(options: {
       phase = 'helper';
       await runOwnedProcess(options.binary, ['observe-qap', '--endpoint', options.endpoint,
         '--results', provenance, '--output', output, '--timeout', '30s'],
-      { cwd: options.cwd, env: options.env, timeoutMs: 40_000 });
+      { cwd: options.cwd, env: options.env, timeoutMs: 40_000, forwardInterrupts: false });
       phase = 'output';
       const observation = qapPoints(JSON.parse(await readFile(output, 'utf8')) as unknown);
       phase = 'export';

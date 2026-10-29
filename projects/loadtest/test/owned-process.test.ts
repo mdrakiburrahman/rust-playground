@@ -85,3 +85,17 @@ for (const mode of ['deadline', 'parent-exit', 'interrupt']) {
       error instanceof Error && 'code' in error && error.code === 'ESRCH');
   });
 }
+
+test('operator interrupts reach owned mutations but let read-only helpers finish their bounded deadline', async () => {
+  const options = { cwd: process.cwd(), env: process.env, timeoutMs: 10_000 };
+  const script = 'setTimeout(() => process.exit(0), 750)';
+  const interrupted = assert.rejects(runOwnedProcess(process.execPath, ['-e', script], options),
+    (error: unknown) => error instanceof OwnedProcessError && error.outcome?.interrupted === true);
+  await new Promise(resolve => setTimeout(resolve, 300));
+  process.emit('SIGINT');
+  await interrupted;
+  const helper = runOwnedProcess(process.execPath, ['-e', script], { ...options, forwardInterrupts: false });
+  await new Promise(resolve => setTimeout(resolve, 300));
+  assert.equal(process.listenerCount('SIGINT'), 0);
+  await helper;
+});

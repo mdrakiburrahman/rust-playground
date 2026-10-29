@@ -66,7 +66,7 @@ function supervisorExited(pid: number | undefined): boolean {
 /** Owns the entire Linux process group, including Azure CLI wrapper descendants. */
 export async function runOwnedProcess(
   command: string, args: string[],
-  options: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number; stderrFile?: string },
+  options: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number; stderrFile?: string; forwardInterrupts?: boolean },
 ): Promise<void> {
   if (process.platform !== 'linux' || !Number.isSafeInteger(options.timeoutMs) || options.timeoutMs <= 0) {
     throw new Error('Owned process groups require Linux and a finite positive deadline');
@@ -101,9 +101,13 @@ export async function runOwnedProcess(
     };
     timer = setTimeout(() => expire(true), options.timeoutMs + 6000);
   });
+  // Read-only helpers with their own bounded deadline opt out so an operator Ctrl+C that stops
+  // a continuous run lets them finish instead of turning a clean stop into a helper failure.
   const interrupt = (): void => { child.kill('SIGTERM'); };
-  process.once('SIGINT', interrupt);
-  process.once('SIGTERM', interrupt);
+  if (options.forwardInterrupts !== false) {
+    process.once('SIGINT', interrupt);
+    process.once('SIGTERM', interrupt);
+  }
   try {
     const completion = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
       child.once('error', reject);
