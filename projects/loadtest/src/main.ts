@@ -516,7 +516,9 @@ async function reconcileAzure(context: BenchmarkContext, occupancyId: string): P
       'infra/azure/bootstrap.py', 'reconcile', '--tables', manifest,
       '--occupancy-id', occupancyId, '--wait-seconds', '120',
     ], { cwd: workspace, env: { ...context.env, AZURE_CONFIG_DIR: path.join(context.directory, 'azure-cli/infra') },
-      timeoutMs: 180_000, stderrFile });
+      // Budget: up to 120s waiting for Delta logs, then ~3 sequential management commands per table
+      // against a cluster that is serving the live load.
+      timeoutMs: 600_000, stderrFile });
   } catch (error) {
     // bootstrap.py redacts private values in its own error lines.
     const detail = existsSync(stderrFile) ? readFileSync(stderrFile, 'utf8').trim().split('\n').slice(-5).join('\n') : '';
