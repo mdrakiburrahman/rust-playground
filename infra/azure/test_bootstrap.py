@@ -1055,6 +1055,36 @@ class ResetTests(unittest.TestCase):
         self.assertEqual(request.call_args.kwargs["headers"]["If-Match"], '"e"')
 
 
+class ParallelDeleteTests(unittest.TestCase):
+    def test_files_then_directories_deepest_first(self):
+        calls = []
+
+        class Recorder:
+            def blob(self, method, container, name, **kwargs):
+                calls.append(("blob", name))
+
+            def delete_directory(self, container, name, etag):
+                calls.append(("dir", name))
+
+        azure = Recorder()
+        blobs = [{"name": n, "directory": d, "etag": '"e"', "version": None, "snapshot": None}
+                 for n, d in [("a", True), ("a/b", True), ("a/b/f", False), ("a/g", False)]]
+        files = [x for x in blobs if not x["directory"]]
+        b.parallel_each(lambda x: b.delete_inventoried(azure, "c", x), files)
+        for depth in (1, 0):
+            b.parallel_each(lambda x: b.delete_inventoried(azure, "c", x),
+                            [x for x in blobs if x["directory"] and x["name"].count("/") == depth])
+        self.assertEqual({c[1] for c in calls[:2]}, {"a/b/f", "a/g"})
+        self.assertEqual(calls[2:], [("dir", "a/b"), ("dir", "a")])
+
+    def test_failure_propagates(self):
+        def fail(item):
+            if item == 3:
+                raise b.Failure("boom")
+        with self.assertRaisesRegex(b.Failure, "boom"):
+            b.parallel_each(fail, list(range(10)))
+
+
 class OccupancyTests(unittest.TestCase):
     def test_occupy_exports_exact_authority_generation_privately_not_run_uuid(self):
         azure = FakeAzure()

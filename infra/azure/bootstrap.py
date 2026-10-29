@@ -3,6 +3,7 @@
 
 import argparse
 import base64
+import concurrent.futures
 import contextlib
 from email.utils import formatdate
 import fcntl
@@ -15,6 +16,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -225,6 +227,7 @@ class Azure:
     def __init__(self, config):
         self.c = config
         self.tokens = {}
+        self.token_lock = threading.Lock()
         self.snapshots = {}
 
     def cli(self, *args):
@@ -234,12 +237,13 @@ class Azure:
         return json.loads(result.stdout) if result.stdout.strip() else None
 
     def token(self, resource):
-        cached = self.tokens.get(resource)
-        if not cached or time.monotonic() - cached[0] > 240:
-            token = self.cli("account", "get-access-token", "--subscription",
-                             self.c.subscription, "--resource", resource)["accessToken"]
-            self.tokens[resource] = (time.monotonic(), token)
-        return self.tokens[resource][1]
+        with self.token_lock:  # parallel deletes share one refresh
+            cached = self.tokens.get(resource)
+            if not cached or time.monotonic() - cached[0] > 240:
+                token = self.cli("account", "get-access-token", "--subscription",
+                                 self.c.subscription, "--resource", resource)["accessToken"]
+                self.tokens[resource] = (time.monotonic(), token)
+            return self.tokens[resource][1]
 
     def request(self, method, url, resource, body=None, headers=None, missing_ok=False):
         encoded = body.encode() if isinstance(body, str) else body
@@ -1206,23 +1210,16 @@ def cleanup_with_custody(azure, control, record, record_path):
     settle_database(azure, record, record_path, databases)
     for container, blobs in inventory.items():
         control.cleanup_operator(operator, generation)
-        for blob in sorted(blobs, key=lambda item: item["name"].count("/"), reverse=True):
-            query = {}
-            if blob["version"]:
-                query["versionid"] = blob["version"]
-            elif blob["snapshot"]:
-                query["snapshot"] = blob["snapshot"]
-            if query:  # immutable snapshot/version identity cannot name a successor object
-                azure.blob("DELETE", container, blob["name"], query=query, missing_ok=True)
-                continue
-            # Base blobs and HNS paths: delete only the exact inventoried object, so an
-            # unknown in-flight request landing late cannot remove a successor at the path.
-            if blob.get("directory"):
-                azure.delete_directory(container, blob["name"], blob["etag"])
-            else:
-                azure.blob("DELETE", container, blob["name"],
-                           headers={"x-ms-delete-snapshots": "include", "If-Match": blob["etag"]},
-                           missing_ok=True)
+        # Objects first, then HNS directories deepest level first (a non-recursive directory
+        # DELETE needs its children gone); each wave runs in parallel and stops on a failure.
+        files = [blob for blob in blobs if not blob.get("directory")]
+        directories = [blob for blob in blobs if blob.get("directory")]
+        waves = [files] + [[blob for blob in directories if blob["name"].count("/") == depth]
+                           for depth in sorted({blob["name"].count("/") for blob in directories},
+                                               reverse=True)]
+        for wave in waves:
+            parallel_each(lambda blob, container=container: delete_inventoried(azure, container, blob),
+                          wave)
     remaining = [b for name in (c.data, c.checkpoints) for b in azure.blobs(name)]
     remaining.extend(path for name in (c.data, c.checkpoints) for path in azure.paths(name))
     if remaining:
@@ -1238,6 +1235,43 @@ def cleanup_with_custody(azure, control, record, record_path):
     remove_reset_record(record_path, record)
     print("Reset verified: zero databases and zero blobs, versions or snapshots; "
           "authority is fenced-v1 at a fresh generation.")
+
+
+DELETE_PARALLELISM = 32
+
+
+def parallel_each(action, items):
+    """Run action over items on a bounded pool; the first failure cancels unstarted work."""
+    if not items:
+        return
+    with concurrent.futures.ThreadPoolExecutor(min(DELETE_PARALLELISM, len(items))) as pool:
+        futures = [pool.submit(action, item) for item in items]
+        try:
+            for future in concurrent.futures.as_completed(futures):
+                future.result()
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            raise
+
+
+def delete_inventoried(azure, container, blob):
+    query = {}
+    if blob["version"]:
+        query["versionid"] = blob["version"]
+    elif blob["snapshot"]:
+        query["snapshot"] = blob["snapshot"]
+    if query:  # immutable snapshot/version identity cannot name a successor object
+        azure.blob("DELETE", container, blob["name"], query=query, missing_ok=True)
+        return
+    # Base blobs and HNS paths: delete only the exact inventoried object, so an
+    # unknown in-flight request landing late cannot remove a successor at the path.
+    if blob.get("directory"):
+        azure.delete_directory(container, blob["name"], blob["etag"])
+    else:
+        azure.blob("DELETE", container, blob["name"],
+                   headers={"x-ms-delete-snapshots": "include", "If-Match": blob["etag"]},
+                   missing_ok=True)
 
 
 def no_databases(azure):
