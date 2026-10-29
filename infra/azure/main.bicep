@@ -21,6 +21,8 @@ param minimumInstances int = 2
 @minValue(2)
 @maxValue(8)
 param maximumInstances int = 4
+@description('Extra tags for the Kusto cluster only, e.g. tenant policy classification tags.')
+param clusterTags object = {}
 
 var ownership = {
   project: 'rust-playground'
@@ -54,5 +56,6 @@ module sandbox './sandbox.bicep' = {
     clusterSku: clusterSku
     minimumInstances: minimumInstances
     maximumInstances: maximumInstances
+    clusterTags: clusterTags
   }
 }

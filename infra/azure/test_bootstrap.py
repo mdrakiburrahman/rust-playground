@@ -124,6 +124,25 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaises(b.Failure):
                 b.Config({"AZURE_SUBSCRIPTION_ID": SUB, **values})
 
+    def test_optional_cluster_policy_tags_never_override_ownership(self):
+        self.assertEqual(b.Config({"AZURE_SUBSCRIPTION_ID": SUB}).cluster_tags, {})
+        tag = {"NRMS.KustoPlatform.Classification.1P": "Corp"}
+        c = b.Config({"AZURE_SUBSCRIPTION_ID": SUB, "AZURE_KUSTO_CLUSTER_TAGS": json.dumps(tag)})
+        self.assertEqual(c.cluster_tags, tag)
+        for raw in ("[]", "not-json", '{"sandboxId": "x"}', '{"Project": "x"}', '{"k": 1}'):
+            with self.assertRaises(b.Failure):
+                b.Config({"AZURE_SUBSCRIPTION_ID": SUB, "AZURE_KUSTO_CLUSTER_TAGS": raw})
+
+    def test_ownership_tolerates_policy_tags_but_requires_exact_owner(self):
+        c = b.Config({"AZURE_SUBSCRIPTION_ID": SUB})
+        mine = {**b.TAGS, "sandboxId": c.sandbox}
+        b.owned({"tags": {**mine, "NRMS.KustoPlatform.Classification.1P": "Corp"}}, c)
+        for tags in ({**mine, "sandboxId": "other"}, {"project": "rust-playground"}, {}):
+            with self.assertRaises(b.Failure):
+                b.owned({"tags": tags}, c)
+        with self.assertRaises(b.Failure):
+            b.owned({}, c)
+
     def test_rejects_same_container(self):
         with self.assertRaises(b.Failure):
             b.Config({"AZURE_SUBSCRIPTION_ID": SUB, "AZURE_STORAGE_CHECKPOINT_CONTAINER": "arrowcol"})

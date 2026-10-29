@@ -14,6 +14,7 @@ param operatorType string
 param clusterSku string
 param minimumInstances int
 param maximumInstances int
+param clusterTags object
 
 resource identity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: identityName
@@ -107,7 +108,7 @@ resource writeData 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
 resource cluster 'Microsoft.Kusto/clusters@2024-04-13' = {
   name: clusterName
   location: location
-  tags: ownership
+  tags: union(clusterTags, ownership)
   identity: {
     type: 'UserAssigned'
     userAssignedIdentities: {

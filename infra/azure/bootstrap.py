@@ -81,6 +81,24 @@ def load_env(path):
     return values
 
 
+RESERVED_TAGS = {key.lower() for key in (*TAGS, "sandboxId")}
+
+
+def cluster_tags(raw):
+    """Optional extra Kusto cluster tags required by tenant policy; never ownership keys."""
+    try:
+        tags = json.loads(raw)
+    except ValueError as exc:
+        raise Failure("AZURE_KUSTO_CLUSTER_TAGS must be a JSON object of string tags.") from exc
+    if (not isinstance(tags, dict) or len(tags) > 15 or
+            any(not isinstance(key, str) or not isinstance(value, str) or
+                not 0 < len(key) <= 512 or len(value) > 256 or key.lower() in RESERVED_TAGS
+                for key, value in tags.items())):
+        raise Failure("AZURE_KUSTO_CLUSTER_TAGS must be at most 15 string tags that do not "
+                      "override sandbox ownership tags.")
+    return tags
+
+
 class Config:
     def __init__(self, values):
         def get(key, default=""):
@@ -116,6 +134,7 @@ class Config:
         self.hot = int(get("AZURE_KUSTO_QAP_HOT_DAYS", "7"))
         if not 2 <= self.minimum <= self.maximum <= 8 or not 1 <= self.hot <= 365:
             raise Failure("Require 2 <= cluster minimum <= maximum <= 8 and QAP days 1..365.")
+        self.cluster_tags = cluster_tags(get("AZURE_KUSTO_CLUSTER_TAGS", "{}"))
         self.operator = get("AZURE_OPERATOR_OBJECT_ID")
         self.operator_type = get("AZURE_OPERATOR_TYPE", "User")
         self.operator_application = get("AZURE_OPERATOR_APPLICATION_ID")
@@ -421,7 +440,10 @@ class Azure:
 
 
 def owned(resource, config):
-    if not resource or resource.get("tags", {}) != {**TAGS, "sandboxId": config.sandbox}:
+    # Exact ownership tags are required; additional tenant-policy tags are tolerated.
+    tags = (resource or {}).get("tags") or {}
+    if not resource or any(tags.get(key) != value
+                           for key, value in {**TAGS, "sandboxId": config.sandbox}.items()):
         raise Failure("Exact sandbox ownership tags do not match; refusing adoption/mutation.")
 
 
@@ -502,6 +524,7 @@ def deploy(azure, fresh=None):
         "checkpointExists": fresh is None,
         "operatorType": c.operator_type, "clusterSku": c.sku,
         "minimumInstances": c.minimum, "maximumInstances": c.maximum,
+        "clusterTags": c.cluster_tags,
     }
     fd, name = tempfile.mkstemp(prefix=".env.azure.parameters.", dir=ROOT)
     try:
