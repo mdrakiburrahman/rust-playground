@@ -302,7 +302,15 @@ export async function stopBenchmark(
 }
 
 export function requirePreviousAttemptEvidence(workspace: string): void {
-  for (const directory of benchmarkDirectories(workspace)) requireSealedAttemptEvidence(workspace, directory);
+  for (const directory of benchmarkDirectories(workspace)) {
+    try {
+      requireSealedAttemptEvidence(workspace, directory);
+    } catch (error) {
+      throw new Error(`${error instanceof Error ? error.message : String(error)}. The previous attempt is unsealed `
+        + '(failed, interrupted, nonvalidated or Azure); inspect it, then quarantine it with '
+        + '`npx --no-install tsx projects/loadtest/src/main.ts --discard-unsealed`', { cause: error });
+    }
+  }
 }
 
 /**
