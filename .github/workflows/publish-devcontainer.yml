@@ -2,8 +2,10 @@ name: Publish devcontainer
 
 on:
   push:
+    # Every branch publishes its content-hashed image and branch alias so a branch
+    # devcontainer bootstraps without a manual dispatch; only main moves main/latest.
     branches:
-      - main
+      - "**"
     paths:
       - .dockerignore
       - .devcontainer/**

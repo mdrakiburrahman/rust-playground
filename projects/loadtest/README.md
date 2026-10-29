@@ -247,6 +247,15 @@ failure, not successful skipped qualification. Real Azure QAP qualification is
 separate from local emulator functionality and remains unverified until a live
 authorized run produces the required observations.
 
+For `--mode azure --validate`, pass a bounded window such as `--measure 2m`.
+Each run rebinds the 26 Azure external tables to its isolated root after the
+collectors start (about 40s), so measurement must outlast that rebind for every
+table to be observed live; and validation (frozen snapshots plus native QAP
+table oracles) shares one fixed 10-minute phase budget, so a long continuous run
+produces more data than Azure Kusto can verify in time. Ctrl+C still stops a
+continuous Azure run cleanly; the read-only QAP helper finishes its own bounded
+probe rather than being interrupted.
+
 Azure collector images must include the shared pinned CLI installer from
 `infra/docker/install-azure-cli.sh`. At runtime the runner makes a separate
 writable Azure CLI config copy for each collector, loadgen, infra helper, tenant
