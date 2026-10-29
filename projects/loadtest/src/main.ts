@@ -510,11 +510,19 @@ async function reconcileAzure(context: BenchmarkContext, occupancyId: string): P
   const manifest = path.join(context.directory, 'router-state/azure-tables.json');
   run(path.join(cargoTargetDirectory(), 'debug/arrowcol-loadgen'), ['azure-manifest', '--manifest', manifest], context.env);
   // The helper waits only for absent logs; auth, ownership and malformed logs fail immediately.
-  await runOwnedProcess('python3', [
-    'infra/azure/bootstrap.py', 'reconcile', '--tables', manifest,
-    '--occupancy-id', occupancyId, '--wait-seconds', '120',
-  ], { cwd: workspace, env: { ...context.env, AZURE_CONFIG_DIR: path.join(context.directory, 'azure-cli/infra') },
-    timeoutMs: 180_000 });
+  const stderrFile = path.join(context.directory, 'results/azure-reconcile.stderr.log');
+  try {
+    await runOwnedProcess('python3', [
+      'infra/azure/bootstrap.py', 'reconcile', '--tables', manifest,
+      '--occupancy-id', occupancyId, '--wait-seconds', '120',
+    ], { cwd: workspace, env: { ...context.env, AZURE_CONFIG_DIR: path.join(context.directory, 'azure-cli/infra') },
+      timeoutMs: 180_000, stderrFile });
+  } catch (error) {
+    // bootstrap.py redacts private values in its own error lines.
+    const detail = existsSync(stderrFile) ? readFileSync(stderrFile, 'utf8').trim().split('\n').slice(-5).join('\n') : '';
+    if (detail) console.error(`[loadtest] Azure reconcile stderr (${stderrFile}):\n${detail}`);
+    throw error;
+  }
 }
 
 interface CloudRun {

@@ -48,10 +48,17 @@ def main():
     timeout = int(sys.argv[1]) / 1000
     if timeout <= 0:
         raise ValueError("A positive deadline is required")
-    child = subprocess.Popen(
-        sys.argv[2:], start_new_session=True,
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
+    # Opt-in private diagnostics: the command's stderr goes to a caller-owned file.
+    stderr_path = os.environ.pop("OWNED_PROCESS_STDERR_FILE", "")
+    stderr = open(stderr_path, "ab") if stderr_path else subprocess.DEVNULL
+    try:
+        child = subprocess.Popen(
+            sys.argv[2:], start_new_session=True,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=stderr,
+        )
+    finally:
+        if stderr is not subprocess.DEVNULL:
+            stderr.close()
     print(child.pid, flush=True)
     try:
         deadline = time.monotonic() + timeout

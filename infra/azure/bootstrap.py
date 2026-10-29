@@ -31,12 +31,6 @@ API = "2024-04-13"
 # Short exclusive lease serializing authority metadata read-modify-write only.
 LEASE_SECONDS = 15
 TAGS = {"project": "rust-playground", "purpose": "disposable-arrowcol-sandbox"}
-RESET_EXECUTION_BLOCKER = (
-    "Destructive reset is disabled: complete distributed publisher registration and "
-    "definitive request drain are not implemented and verified on every mutation surface. "
-    "Local service stop, an assertion, and a timed grace period are not sufficient. "
-    "Preview remains available; no resources or data were modified."
-)
 
 
 class Failure(RuntimeError):
@@ -757,8 +751,13 @@ def reset_inventory(azure):
                                   api="2023-05-01")
     if {item["name"].split("/")[-1] for item in containers} != {c.data, c.checkpoints}:
         raise Failure("Unexpected or missing container; refusing shared-resource reset.")
-    for container in containers:
-        if container["properties"].get("metadata", {}).get("sandboxid") != c.sandbox:
+    for name in (c.data, c.checkpoints):
+        # ARM list omits container metadata, and Blob metadata names are case-preserving.
+        container = azure.arm("GET", c.storage_id + "/blobServices/default/containers/" + name,
+                              api="2023-05-01")
+        metadata = {key.lower(): value for key, value in
+                    container["properties"].get("metadata", {}).items()}
+        if metadata.get("sandboxid") != c.sandbox:
             raise Failure("Container ownership metadata mismatch.")
     inventory = {name: azure.blobs(name) for name in (c.data, c.checkpoints)}
     for name in (c.data, c.checkpoints):
@@ -785,9 +784,12 @@ def reset_inventory(azure):
     return databases, inventory
 
 
-def reset(azure, execute, stop_command):
+def reset(azure, execute, stop_command, resume=False):
+    """Data-plane teardown: preview by default; --execute deletes, --resume continues custody."""
+    if resume:
+        return _unqualified_reset_resume(azure)
     if execute:
-        raise Failure(RESET_EXECUTION_BLOCKER)
+        return _unqualified_reset_sequence(azure, stop_command)
     return reset_preview(azure)
 
 
@@ -1026,14 +1028,14 @@ def verified_stop_receipt(stdout, generation):
 
 
 def _unqualified_reset_sequence(azure, stop_command, record_path=None):
-    """Gated v1 operator sequence. NOT dispatched: public reset --execute stays blocked."""
+    """v1 operator sequence behind public reset --execute (user-owned disposable sandbox)."""
     record_path = record_path or RESET_RECORD
     with reset_lock(record_path):
         _locked_reset_sequence(azure, stop_command, record_path)
 
 
 def _locked_reset_sequence(azure, stop_command, record_path):
-    from publisher_control import READY, PublisherControl, UnknownTransition
+    from publisher_control import FENCED, READY, PublisherControl, UnknownTransition
     c = azure.c
     if read_reset_record(record_path) is not None or database_intent_path(record_path).exists():
         raise Failure("A cleanup custody record exists; resume it instead of a fresh claim.")
@@ -1047,6 +1049,9 @@ def _locked_reset_sequence(azure, stop_command, record_path):
     require_running(azure)
     metadata, _, _ = control.read()
     require_released(metadata)
+    if metadata["resetstate"] not in (READY, FENCED):
+        raise Failure("Authority is not ready-v1 or fenced-v1; use reset --resume for existing "
+                      "cleanup custody. Nothing was stopped or deleted.")
     generation = metadata["resetgeneration"]
     if metadata["resetstate"] == READY:
         control.fence(generation)
@@ -1094,7 +1099,7 @@ def running_or_abort(azure, control, record, record_path):
 
 
 def _unqualified_reset_resume(azure, record_path=None):
-    """Gated recovery after an interrupted or ambiguous cleanup. NOT dispatched.
+    """Recovery after an interrupted or ambiguous cleanup (public reset --resume).
 
     Re-reads authority and continues only with this record's exact operator and
     generation. Never takes over or clears a foreign or uncertain member, and
@@ -1339,6 +1344,7 @@ def main(argv=None):
     parser.add_argument("--tables", type=Path, default=ROOT / ".env.azure.tables.json")
     parser.add_argument("--infra-only", action="store_true")
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--resume", action="store_true")
     parser.add_argument("--occupancy-id", default="")
     parser.add_argument("--reset-generation", default="")
     parser.add_argument("--wait-seconds", type=int, default=0)
@@ -1366,7 +1372,7 @@ def main(argv=None):
         elif args.command == "reset":
             reset(azure, args.execute, args.stop_command or [
                 "npx", "--no-install", "tsx", "projects/loadtest/src/main.ts", "--stop",
-            ])
+            ], resume=args.resume)
         elif args.command == "status":
             reset_inventory(azure)
             azure.kql(".show capacity")

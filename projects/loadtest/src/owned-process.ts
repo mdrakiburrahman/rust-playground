@@ -65,14 +65,16 @@ function supervisorExited(pid: number | undefined): boolean {
 
 /** Owns the entire Linux process group, including Azure CLI wrapper descendants. */
 export async function runOwnedProcess(
-  command: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number },
+  command: string, args: string[],
+  options: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number; stderrFile?: string },
 ): Promise<void> {
   if (process.platform !== 'linux' || !Number.isSafeInteger(options.timeoutMs) || options.timeoutMs <= 0) {
     throw new Error('Owned process groups require Linux and a finite positive deadline');
   }
   const supervisor = fileURLToPath(new URL('../scripts/owned-process.py', import.meta.url));
   const child = spawn('python3', [supervisor, String(options.timeoutMs), command, ...args], {
-    cwd: options.cwd, env: options.env, detached: true, stdio: ['ignore', 'pipe', 'ignore'],
+    cwd: options.cwd, detached: true,
+    env: { ...options.env, OWNED_PROCESS_STDERR_FILE: options.stderrFile ?? '' }, stdio: ['ignore', 'pipe', 'ignore'],
   });
   let commandGroup: number | undefined;
   let receipt = '';

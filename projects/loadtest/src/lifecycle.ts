@@ -253,6 +253,7 @@ function resources(docker: Docker, kind: 'container' | 'network' | 'volume'): Re
 
 /** Seconds a cloud mutator gets to drain before Docker kills it; collector drain budgets must fit inside. */
 export const MUTATOR_STOP_SECONDS = 300;
+const MUTATOR_SERVICES = ['direct-1', 'dataflow-1', 'tenant-stream', 'delta-maintenance'];
 
 /** Stops only verified resources owned by this workspace, retaining data for inspection. */
 export async function stopBenchmark(
@@ -275,7 +276,14 @@ export async function stopBenchmark(
     throw new Error('Cannot freeze validation without both positively identified collectors');
   }
   await stopBenchmarkProcesses(workspace, directories);
-  if (containers.length) docker(['stop', '--time', options.requireCleanMutators ? String(MUTATOR_STOP_SECONDS) : '30', ...containers.map(container => container.id)]);
+  // Mutators drain through SQL Server and the router, so they stop first and alone.
+  const isMutator = (container: { labels: Record<string, string> }): boolean =>
+    MUTATOR_SERVICES.includes(container.labels['com.docker.compose.service'] ?? '');
+  const mutators = containers.filter(isMutator);
+  const others = containers.filter(container => !isMutator(container));
+  const timeout = options.requireCleanMutators ? String(MUTATOR_STOP_SECONDS) : '30';
+  if (mutators.length) docker(['stop', '--time', timeout, ...mutators.map(container => container.id)]);
+  if (others.length) docker(['stop', '--time', timeout, ...others.map(container => container.id)]);
   const cleanMutators: string[] = [];
   if (options.requireCleanMutators) {
     for (const container of containers) {

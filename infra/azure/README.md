@@ -85,15 +85,15 @@ for diagnosing infrastructure access, not an acceptance shortcut.
 
 ## Cloud occupancy and reset
 
-**Destructive reset is currently disabled in code.** `reset --execute` fails
-before contacting Azure, stopping services, fencing, or deleting data. Preview
-remains available. The sequencing described below is design/test coverage only,
-not an executable cleanup guarantee. Execution cannot be enabled until every
-mutating process participates in a persistent CAS-coordinated publisher registry
-and clean drain proves all requests definitively completed. Crashed, suspended,
-or uncertain publishers must leave blocking registrations, with no TTL or
-force-unregister shortcut. A local stop receipt, checkbox, or 60-second delay
-cannot substitute for that distributed authority.
+**Data-plane reset is enabled for this disposable, single-operator sandbox.**
+`reset` previews; `reset --execute` runs the fenced custody sequence below;
+`reset --resume` continues an interrupted cleanup from its custody record.
+It refuses unless occupancy is released, the publisher registry is empty and
+authority is `ready-v1`/`fenced-v1`. Known limitation: safety relies on every
+mutating process participating in the publisher registry; processes outside the
+cooperative protocol (arbitrary OAuth clients, other devboxes' runners) must be
+stopped by the operator first. Crashed, suspended, or uncertain publishers
+leave blocking registrations, with no TTL or force-unregister shortcut.
 
 Registry metadata alone cannot activate a new protocol safely: older
 reset-aware binaries ignore unknown registry fields while accepting
@@ -104,8 +104,7 @@ fencing are outside the cooperative protocol and must be stopped before cleanup.
 An uncertain server write remains an uncertain registration even if a later
 transaction lookup proves logical commit success. Opaque SDK write retries must
 be disabled or tracked through definitive completion; logical reconciliation is
-not proof that no delayed request can still mutate storage. None of these
-activation conditions enables the currently disabled reset command.
+not proof that no delayed request can still mutate storage.
 
 ### Versioned control-plane implementation
 
@@ -269,8 +268,12 @@ Azure reads.
 ```bash
 # Preview only: no mutation.
 python3 infra/azure/bootstrap.py reset
-# Fails closed until distributed publisher drain is implemented and verified.
+# Fence, stop the local loadtest, quiesce 60s, delete databases and all blobs.
 python3 infra/azure/bootstrap.py reset --execute
+# Continue an interrupted cleanup from .env.azure.reset.json.
+python3 infra/azure/bootstrap.py reset --resume
+# Restore the declared baseline (ready-v1).
+python3 infra/azure/bootstrap.py provision
 ```
 
 Execution verifies exact ownership, HNS, disabled retention, the exact database
@@ -305,10 +308,10 @@ metadata remains fenced without leaving a marker blob. A subsequent full
 The foundation's explicit empty-root initializer is the only bootstrap path that
 can create schema roots while fenced; normal publishers have no bypass.
 
-### Gated operator path (not dispatched)
+### Operator path
 
-The following describes the operator sequence behind the still-disabled public
-`reset --execute`. Nothing below is reachable from the CLI.
+The following describes the operator sequence behind `reset --execute` and
+`reset --resume`.
 
 - **Running gate.** Reset never starts or stops the cluster. It refuses a
   non-`Running` cluster before fencing. If a released `stop` wins during

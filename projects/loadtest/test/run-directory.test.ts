@@ -161,6 +161,29 @@ test('final capture stops every mutator but keeps Kusto and live-evidence servic
   assert(partial.commands.every(args => args[0] !== 'stop'));
 });
 
+test('full stop drains mutators before SQL Server and other infrastructure', async t => {
+  const workspace = fixture(t);
+  const services = ['sqlserver', 'dataflow-1', 'router', 'direct-1'];
+  const commands: string[][] = [];
+  const docker = (args: string[]): string => {
+    commands.push(args);
+    if (args[0] === 'ps') return services.join('\n');
+    if (args[0] === 'stop') return '';
+    if (args.includes('{{json .State}}')) return JSON.stringify({ Running: false, ExitCode: 0, OOMKilled: false });
+    const service = args.at(-1);
+    return JSON.stringify({ id: service, name: service, labels: {
+      'com.docker.compose.project': BENCHMARK_PROJECT,
+      'com.docker.compose.service': service,
+      'com.docker.compose.project.config_files': path.join(workspace, 'projects/loadtest/compose.yaml'),
+    } });
+  };
+  await stopBenchmark(workspace, docker);
+  assert.deepEqual(commands.filter(args => args[0] === 'stop'), [
+    ['stop', '--time', '30', 'dataflow-1', 'direct-1'],
+    ['stop', '--time', '30', 'sqlserver', 'router'],
+  ]);
+});
+
 test('starting again removes only already sealed output and owned SQL, Hive and Kusto resources', async t => {
   const workspace = fixture(t);
   const latest = path.join(workspace, 'onelake/benchmark/latest');

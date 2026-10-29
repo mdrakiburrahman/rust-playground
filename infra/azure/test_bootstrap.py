@@ -22,8 +22,9 @@ class FakeAzure:
         c = self.c
         self.tags = {**b.TAGS, "sandboxId": c.sandbox}
         self.databases = [{"name": c.database}]
-        self.containers = [{"name": name, "properties": {"metadata": {"sandboxid": c.sandbox}}}
-                           for name in (c.data, c.checkpoints)]
+        # Like ARM: list omits metadata; per-container GET returns it.
+        self.containers = [{"name": name, "properties": {}} for name in (c.data, c.checkpoints)]
+        self.data_metadata = {"sandboxid": c.sandbox}
         self.settings = {}
         self.items = {c.data: [{"name": "table/data.parquet", "snapshot": None,
                                 "version": None, "deleted": False}], c.checkpoints: []}
@@ -41,6 +42,8 @@ class FakeAzure:
             return {"properties": self.settings}
         if path.endswith("/containers/" + self.c.checkpoints):
             return {"properties": {"metadata": dict(self.metadata)}} if self.checkpoint_exists else None
+        if path.endswith("/containers/" + self.c.data):
+            return {"properties": {"metadata": dict(self.data_metadata)}}
         return {"tags": dict(self.tags), "properties": {
             "isHnsEnabled": True, "uri": "https://cluster.example", "state": self.cluster_state}}
 
@@ -224,11 +227,21 @@ class ResetTests(unittest.TestCase):
             b.reset(self.azure, True, None)
         self.assertEqual(self.azure.events, [])
 
-    def test_public_execute_always_fails_closed_even_with_stop_receipt(self):
+    @patch.object(b.time, "sleep")
+    def test_public_execute_dispatches_the_fenced_custody_sequence(self, sleep):
         with patch.object(b, "run_tree") as run:
             run.return_value.returncode = 0
             run.return_value.stdout = self.receipt()
-            with self.assertRaisesRegex(b.Failure, "Destructive reset is disabled"):
+            b.reset(self.azure, True, ["stop"])
+            run.assert_called_once()
+        self.assertEqual(self.azure.events[0], ("control", "fenced-v1"))
+        self.assertEqual(sum(len(items) for items in self.azure.items.values()), 0)
+        self.assertEqual(self.azure.metadata["resetstate"], "fenced-v1")
+
+    def test_execute_refuses_existing_cleanup_custody_before_stop(self):
+        self.azure.metadata["resetstate"] = "cleaning-v1"
+        with patch.object(b, "run_tree") as run:
+            with self.assertRaisesRegex(b.Failure, "reset --resume"):
                 b.reset(self.azure, True, ["stop"])
             run.assert_not_called()
         self.assertEqual(self.azure.events, [])
@@ -250,9 +263,16 @@ class ResetTests(unittest.TestCase):
             b.reset_inventory(self.azure)
 
     def test_refuses_foreign_container_metadata(self):
-        self.azure.containers[0]["properties"]["metadata"]["sandboxid"] = "wrong"
+        self.azure.data_metadata["sandboxid"] = "wrong"
         with self.assertRaises(b.Failure):
             b.reset_inventory(self.azure)
+
+    def test_container_metadata_names_are_case_insensitive(self):
+        # Blob metadata names are case-preserving; Python writers may store "Sandboxid".
+        self.azure.data_metadata = {"Sandboxid": self.azure.c.sandbox}
+        self.azure.metadata = {("S" + k[1:] if k == "sandboxid" else k): v
+                               for k, v in self.azure.metadata.items()}
+        b.reset_inventory(self.azure)
 
     def test_refuses_retained_copies(self):
         for setting in ({"isVersioningEnabled": True},
@@ -1909,6 +1929,7 @@ class ProvisionCoordinationTests(unittest.TestCase):
                     ["release", "--occupancy-id", owner, "--reset-generation", generation],
                     ["reset", "--execute"])
         with patch.object(b, "Azure", return_value=self.azure), patch.object(b, "preflight"), \
+                patch.object(b, "RESET_RECORD", Path(self.directory.name) / "reset.json"), \
                 contextlib.redirect_stderr(io.StringIO()):
             for command in commands:
                 with self.subTest(command=command):
