@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use arrowcol_buffer::{BufferManager, BufferPressureSnapshot, QuiverStage};
@@ -32,7 +32,13 @@ use crate::metrics::CollectorMetrics;
 /// Exact active Flight stream counts keyed by table identity.
 #[derive(Default)]
 pub struct TableActivity {
-    active: Mutex<HashMap<TableIdentity, u64>>,
+    active: Mutex<ActivityState>,
+}
+
+#[derive(Default)]
+struct ActivityState {
+    streams: HashMap<TableIdentity, u64>,
+    blocked: BTreeSet<TableIdentity>,
 }
 
 impl TableActivity {
@@ -40,14 +46,17 @@ impl TableActivity {
     ///
     /// # Errors
     ///
-    /// Returns an error if the activity lock was poisoned or the counter
-    /// overflowed.
+    /// Returns an error if table admission is draining, the activity lock was
+    /// poisoned, or the counter overflowed.
     pub fn enter(self: &Arc<Self>, table: TableIdentity) -> Result<ActiveTableStream> {
         let mut active = self
             .active
             .lock()
             .map_err(|_| anyhow!("table activity lock poisoned"))?;
-        let count = active.entry(table.clone()).or_default();
+        if active.blocked.contains(&table) {
+            return Err(anyhow!("table admission is draining"));
+        }
+        let count = active.streams.entry(table.clone()).or_default();
         *count = count.checked_add(1).context("table activity counter overflow")?;
         Ok(ActiveTableStream {
             activity: Arc::clone(self),
@@ -58,8 +67,36 @@ impl TableActivity {
     fn snapshot(&self) -> Result<HashMap<TableIdentity, u64>> {
         self.active
             .lock()
-            .map(|active| active.clone())
+            .map(|active| active.streams.clone())
             .map_err(|_| anyhow!("table activity lock poisoned"))
+    }
+
+    /// Serializes the per-table admission barrier with stream entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the activity lock was poisoned.
+    pub fn block(&self, table: &TableIdentity) -> Result<u64> {
+        let mut active = self
+            .active
+            .lock()
+            .map_err(|_| anyhow!("table activity lock poisoned"))?;
+        active.blocked.insert(table.clone());
+        Ok(active.streams.get(table).copied().unwrap_or(0))
+    }
+
+    /// Opens admission after authoritative target activation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the activity lock was poisoned.
+    pub fn unblock(&self, table: &TableIdentity) -> Result<()> {
+        self.active
+            .lock()
+            .map_err(|_| anyhow!("table activity lock poisoned"))?
+            .blocked
+            .remove(table);
+        Ok(())
     }
 }
 
@@ -74,10 +111,10 @@ impl Drop for ActiveTableStream {
         let Ok(mut active) = self.activity.active.lock() else {
             return;
         };
-        if let Some(count) = active.get_mut(&self.table) {
+        if let Some(count) = active.streams.get_mut(&self.table) {
             *count = count.saturating_sub(1);
             if *count == 0 {
-                active.remove(&self.table);
+                active.streams.remove(&self.table);
             }
         }
     }
@@ -98,6 +135,7 @@ pub struct CollectorStatus {
     max_pending_publications: u64,
     routing: RoutingConfig,
     flags: RwLock<StatusFlags>,
+    resources: Mutex<ResourceSampler>,
 }
 
 #[derive(Clone, Debug)]
@@ -150,6 +188,7 @@ impl CollectorStatus {
                 lease_loop_ready: false,
                 delta_writable: false,
             }),
+            resources: Mutex::new(ResourceSampler::new()?),
         })
     }
 
@@ -264,6 +303,19 @@ impl CollectorStatus {
                 });
             }
         }
+        for table in known.values() {
+            if seen.insert(table.clone()) {
+                tables.push(TablePressure {
+                    table: table.clone(),
+                    active_streams: Measurement::ZERO,
+                    buffered_bytes: Measurement::ZERO,
+                    buffered_rows: Measurement::ZERO,
+                    buffered_batches: Measurement::ZERO,
+                    oldest_buffer_age_ms: Measurement::ZERO,
+                    pending_commits: Measurement::ZERO,
+                });
+            }
+        }
         tables.sort_by(|left, right| left.table.cmp(&right.table));
         tables.truncate(self.routing.max_table_entries);
 
@@ -283,7 +335,24 @@ impl CollectorStatus {
         let pending_commits = gauge(active_flushes, self.max_pending_publications)?;
         let available = self.max_concurrent_streams.get().saturating_sub(active.current().get());
         let available_permits = gauge(available, self.max_concurrent_streams.get())?;
-        let rss = read_rss_bytes().unwrap_or(0).min(self.routing.rss_limit_bytes);
+        let resources = self
+            .resources
+            .lock()
+            .map_err(|_| anyhow!("resource sampler lock poisoned"))?
+            .sample()?;
+        let rss = resources.rss_bytes;
+        let rss_limit = resources
+            .memory_limit
+            .unwrap_or(self.routing.rss_limit_bytes)
+            .min(self.routing.rss_limit_bytes);
+        tracing::debug!(
+            cpu_bps = resources.cpu_bps,
+            rss_bytes = rss,
+            container_memory_bytes = resources.memory_bytes,
+            container_memory_limit = resources.memory_limit,
+            effective_cpu_cores = resources.cores,
+            "measured collector resources"
+        );
         let delta_pressure = pending_commits.utilization();
         let buffer_pressure = [
             buffered_bytes.utilization().get(),
@@ -299,11 +368,19 @@ impl CollectorStatus {
             None => buffer_pressure,
         };
         Ok(RichPressureSnapshot {
+            container_memory: match (resources.memory_bytes, resources.memory_limit) {
+                (Some(current), Some(limit)) => Some(arrowcol_routing::ContainerMemory {
+                    current_bytes: Measurement::new(current)?,
+                    limit_bytes: PositiveMeasurement::new(limit)?,
+                }),
+                _ => None,
+            },
+            effective_cpu_millicores: Some(PositiveMeasurement::new((resources.cores * 1000.0).ceil() as u64)?),
             instance_id: self.instance_id,
             observed_at_unix_ms: now,
-            cpu_utilization_bps: BasisPoints::new(0)?,
+            cpu_utilization_bps: BasisPoints::new(resources.cpu_bps)?,
             rss_bytes: Measurement::new(rss)?,
-            rss_limit_bytes: PositiveMeasurement::new(self.routing.rss_limit_bytes)?,
+            rss_limit_bytes: PositiveMeasurement::new(rss_limit)?,
             active_streams: active,
             received_bytes: Measurement::new(self.metrics.received_bytes())?,
             received_rows: Measurement::new(self.metrics.received_rows())?,
@@ -493,7 +570,7 @@ pub async fn start_control_loops(
             config.routing.registration_heartbeat_ms,
             config.routing.registration_ttl_ms,
             config.routing.pressure_interval_ms,
-            instance_id,
+            registration,
             Arc::clone(&routing),
             Arc::clone(&status),
             Arc::clone(&leases),
@@ -504,6 +581,7 @@ pub async fn start_control_loops(
         )),
         tokio::spawn(lease_loop(
             config.receipts.table_lease_renew_ms,
+            routing.is_remote_authority(),
             Arc::clone(&leases),
             Arc::clone(&status),
             drain.clone(),
@@ -514,14 +592,89 @@ pub async fn start_control_loops(
         tokio::spawn(dependency_loop(
             config.routing.dependency_probe_interval_ms,
             config.delta.root.clone(),
-            catalog,
+            Arc::clone(&catalog),
             metastore,
-            status,
+            Arc::clone(&status),
             metrics,
+            cancellation.clone(),
+        )),
+        tokio::spawn(migration_loop(
+            instance_id,
+            routing,
+            catalog,
+            leases,
+            status,
             cancellation,
         )),
     ];
     Ok(ControlLoops { tasks, fatal })
+}
+
+async fn migration_loop(
+    instance_id: CollectorInstanceId,
+    routing: Arc<dyn RoutingStore>,
+    catalog: Arc<dyn CatalogStore>,
+    leases: Arc<TableLeaseManager>,
+    status: Arc<CollectorStatus>,
+    cancellation: CancellationToken,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = cancellation.cancelled() => return,
+            _ = interval.tick() => {
+                let result = async {
+                    for operation in routing.migration_work(instance_id).await? {
+                        use arrowcol_routing::{MigrationAck, MigrationPhase};
+                        match operation.phase {
+                            MigrationPhase::Preparing if operation.target == instance_id => {
+                                catalog.current_schema(&operation.key.table).await?
+                                    .context("migration target schema is not registered")?;
+                                if !status.is_ready() { anyhow::bail!("migration target dependencies not ready"); }
+                                routing.acknowledge_migration(&operation, instance_id, MigrationAck::Prepared).await?;
+                            }
+                            MigrationPhase::Draining if operation.source == instance_id => {
+                                // The barrier and stream entry share one mutex, so a zero count
+                                // cannot race a new locally admitted RPC after this point.
+                                let active = status.activity.block(&operation.key.table)?;
+                                leases.start_table_draining(&operation.key.table).await;
+                                let pressure = status.rich_pressure().await?;
+                                if active != 0 || pressure.table_is_drained(&operation.key.table) != Some(true)
+                                    || status.quiver.as_ref().is_some_and(|stage| stage.snapshot().backlog_bundles != 0) { continue; }
+                                routing.publish_pressure(&pressure).await?;
+                                leases.release_table(&operation.key.table).await?;
+                                routing.acknowledge_migration(&operation, instance_id, MigrationAck::SourceReleased).await?;
+                            }
+                            MigrationPhase::Activating if operation.target == instance_id => {
+                                let schema = catalog.current_schema(&operation.key.table).await?
+                                    .context("target schema disappeared before activation")?;
+                                leases.activate_table(schema.table_id(), &operation.key.table).await?;
+                                routing.acknowledge_migration(&operation, instance_id, MigrationAck::TargetActive).await?;
+                                status.activity.unblock(&operation.key.table)?;
+                            }
+                            MigrationPhase::Complete if operation.target == instance_id => {
+                                let view = routing.load_view(now_unix_millis()?).await?;
+                                let key = &operation.key;
+                                if view.leases.get(key).is_some_and(|lease|
+                                    lease.state == arrowcol_routing::LeaseState::Active
+                                    && lease.holder_instance_id == instance_id
+                                    && lease.fencing_epoch > operation.source_epoch) {
+                                    status.activity.unblock(&operation.key.table)?;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok::<_, anyhow::Error>(())
+                }.await;
+                if let Err(error) = result {
+                    // Lost acknowledgements/SQL uncertainty leave the move blocked; no forced transfer.
+                    warn!(%error, "controlled migration pending; retrying exact operation");
+                }
+            }
+        }
+    }
 }
 
 /// Registers the receipt owner, waiting for a crashed predecessor with the
@@ -627,7 +780,7 @@ async fn routing_loop(
     heartbeat_ms: u64,
     ttl_ms: u64,
     pressure_ms: u64,
-    instance_id: CollectorInstanceId,
+    mut registration: CollectorRegistration,
     routing: Arc<dyn RoutingStore>,
     status: Arc<CollectorStatus>,
     leases: Arc<TableLeaseManager>,
@@ -636,6 +789,7 @@ async fn routing_loop(
     cancellation: CancellationToken,
     fatal: mpsc::UnboundedSender<anyhow::Error>,
 ) {
+    let instance_id = registration.instance_id;
     let mut heartbeat = tokio::time::interval(Duration::from_millis(heartbeat_ms));
     let mut pressure = tokio::time::interval(Duration::from_millis(pressure_ms));
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -655,6 +809,27 @@ async fn routing_loop(
                 }.await;
                 match result {
                     Ok(()) => status.set_registration_ready(true),
+                    Err(error) if routing.is_remote_authority() => {
+                        status.set_registration_ready(false);
+                        metrics.control_failure("routing_registration");
+                        warn!(%error, "controller unavailable; admission remains unready");
+                        // Recover only this still-running, authenticated process. The
+                        // authority retains leases/retirement intent, never old health.
+                        let recovery = async {
+                            let now = now_unix_millis()?;
+                            let view = routing.load_view(now).await?;
+                            if !view.collectors.contains_key(&instance_id) {
+                                registration.heartbeat_at_unix_ms = now;
+                                registration.lease_expires_at_unix_ms =
+                                    add_duration(now, Duration::from_millis(ttl_ms))?;
+                                routing.register_collector(&registration).await?;
+                            }
+                            Ok::<(), anyhow::Error>(())
+                        }.await;
+                        if let Err(error) = recovery {
+                            warn!(%error, "controller registration recovery remains blocked");
+                        }
+                    }
                     Err(error) => {
                         fail_closed("routing_registration", error, &status, &leases, &drain, &metrics, &fatal).await;
                         return;
@@ -686,6 +861,7 @@ async fn routing_loop(
 #[allow(clippy::too_many_arguments)]
 async fn lease_loop(
     renew_ms: u64,
+    remote_authority: bool,
     leases: Arc<TableLeaseManager>,
     status: Arc<CollectorStatus>,
     drain: DrainController,
@@ -702,6 +878,13 @@ async fn lease_loop(
             _ = interval.tick() => {
                 match leases.renew_all().await {
                     Ok(()) => status.set_lease_loop_ready(true),
+                    Err(error) if remote_authority => {
+                        status.set_lease_loop_ready(false);
+                        metrics.control_failure("table_lease");
+                        // SQL lease expiry/fencing and invalidated handles remain
+                        // authoritative. A routing transport outage grants nothing.
+                        warn!(%error, "publication lease unavailable; admission remains unready");
+                    }
                     Err(error) => {
                         status.set_lease_loop_ready(false);
                         fail_closed("table_lease", error, &status, &leases, &drain, &metrics, &fatal).await;
@@ -834,6 +1017,119 @@ fn read_rss_bytes() -> Option<u64> {
     kib.checked_mul(1_024)
 }
 
+struct ResourceSample {
+    cpu_bps: u16,
+    cores: f64,
+    rss_bytes: u64,
+    memory_bytes: Option<u64>,
+    memory_limit: Option<u64>,
+}
+
+struct ResourceSampler {
+    sampled_at: Instant,
+    runtime_ticks: u64,
+    ticks_per_second: f64,
+    cgroup_cpu_micros: Option<u64>,
+}
+
+impl ResourceSampler {
+    fn runtime_ticks() -> Result<u64> {
+        let stat = std::fs::read_to_string("/proc/self/stat")?;
+        let (_, fields) = stat.rsplit_once(')').context("invalid process stat")?;
+        let values = fields.split_whitespace().collect::<Vec<_>>();
+        let user = values.get(11).context("missing process user time")?.parse::<u64>()?;
+        let system = values.get(12).context("missing process system time")?.parse::<u64>()?;
+        user.checked_add(system).context("CPU time overflow")
+    }
+
+    fn new() -> Result<Self> {
+        let output = std::process::Command::new("getconf").arg("CLK_TCK").output()?;
+        ensure_resource(output.status.success(), "getconf CLK_TCK failed")?;
+        let ticks_per_second = std::str::from_utf8(&output.stdout)?.trim().parse::<f64>()?;
+        ensure_resource(
+            ticks_per_second.is_finite() && ticks_per_second > 0.0,
+            "invalid clock tick frequency",
+        )?;
+        Ok(Self {
+            sampled_at: Instant::now(),
+            runtime_ticks: Self::runtime_ticks()?,
+            ticks_per_second,
+            cgroup_cpu_micros: read_cgroup_cpu_micros()?,
+        })
+    }
+
+    fn sample(&mut self) -> Result<ResourceSample> {
+        // Process utime/stime include exited worker threads, unlike summing live schedstat files.
+        let runtime_ticks = Self::runtime_ticks()?;
+        let cgroup_cpu_micros = read_cgroup_cpu_micros()?;
+        let now = Instant::now();
+        let mut cores = std::thread::available_parallelism()?.get() as f64;
+        if std::path::Path::new("/sys/fs/cgroup/cpu.max").exists() {
+            let quota = std::fs::read_to_string("/sys/fs/cgroup/cpu.max")?;
+            let parts = quota.split_whitespace().collect::<Vec<_>>();
+            ensure_resource(parts.len() == 2, "invalid cgroup CPU quota")?;
+            if parts[0] != "max" {
+                let quota = parts[0].parse::<f64>()?;
+                let period = parts[1].parse::<f64>()?;
+                ensure_resource(quota > 0.0 && period > 0.0, "invalid CPU quota")?;
+                cores = cores.min(quota / period);
+            }
+        }
+        let elapsed = now.duration_since(self.sampled_at).as_secs_f64();
+        ensure_resource(elapsed > 0.0, "CPU sample interval is empty")?;
+        let cpu_ticks = runtime_ticks
+            .checked_sub(self.runtime_ticks)
+            .context("process CPU counter regressed")?;
+        let mut utilization = cpu_ticks as f64 / self.ticks_per_second / elapsed / cores;
+        if let (Some(current), Some(previous)) = (cgroup_cpu_micros, self.cgroup_cpu_micros) {
+            let used = current.checked_sub(previous).context("cgroup CPU counter regressed")?;
+            utilization = utilization.max(used as f64 / 1_000_000.0 / elapsed / cores);
+        }
+        self.runtime_ticks = runtime_ticks;
+        self.cgroup_cpu_micros = cgroup_cpu_micros;
+        self.sampled_at = now;
+        let memory_bytes = read_cgroup_number("memory.current")?;
+        let memory_limit = read_cgroup_number("memory.max")?;
+        Ok(ResourceSample {
+            cpu_bps: (utilization * 10_000.0).ceil().clamp(0.0, 10_000.0) as u16,
+            cores,
+            rss_bytes: read_rss_bytes().context("actual RSS measurement unavailable")?,
+            memory_bytes,
+            memory_limit,
+        })
+    }
+}
+
+fn ensure_resource(valid: bool, message: &str) -> Result<()> {
+    if valid { Ok(()) } else { Err(anyhow!("{message}")) }
+}
+
+fn read_cgroup_number(name: &str) -> Result<Option<u64>> {
+    let path = std::path::Path::new("/sys/fs/cgroup").join(name);
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let value = std::fs::read_to_string(path)?;
+    if value.trim() == "max" {
+        return Ok(None);
+    }
+    Ok(Some(value.trim().parse()?))
+}
+
+fn read_cgroup_cpu_micros() -> Result<Option<u64>> {
+    let path = std::path::Path::new("/sys/fs/cgroup/cpu.stat");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let value = std::fs::read_to_string(path)?;
+    let usage = value
+        .lines()
+        .find_map(|line| line.strip_prefix("usage_usec "))
+        .context("cgroup CPU usage is unavailable")?;
+    Ok(Some(usage.trim().parse()?))
+}
+
 /// Marks the routing registration as draining or terminal.
 ///
 /// # Errors
@@ -888,6 +1184,45 @@ mod tests {
     #![allow(clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn admission_barrier_drains_existing_streams_and_rejects_new_streams() -> Result<()> {
+        let activity = Arc::new(TableActivity::default());
+        let table = health_probe_table()?;
+        let existing = activity.enter(table.clone())?;
+        assert_eq!(activity.block(&table)?, 1);
+        assert!(activity.enter(table.clone()).is_err());
+        drop(existing);
+        assert_eq!(activity.block(&table)?, 0);
+        assert!(activity.enter(table.clone()).is_err());
+        activity.unblock(&table)?;
+        assert!(activity.enter(table).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn process_cpu_includes_finished_native_worker_and_counter_failure_is_not_idle() -> Result<()> {
+        let mut sampler = ResourceSampler::new()?;
+        std::thread::spawn(|| {
+            let started = Instant::now();
+            let mut value = 1_u64;
+            while started.elapsed() < Duration::from_millis(200) {
+                value = std::hint::black_box(value.wrapping_mul(17).wrapping_add(3));
+            }
+            value
+        })
+        .join()
+        .map_err(|_| anyhow!("CPU worker panicked"))?;
+        let measured = sampler.sample()?;
+        assert!(
+            measured.cpu_bps > 0,
+            "CPU from exited native threads must not disappear"
+        );
+        assert!(measured.rss_bytes > 0);
+        sampler.runtime_ticks = u64::MAX;
+        assert!(sampler.sample().is_err(), "failed measurement must not become zero");
+        Ok(())
+    }
 
     /// Scenario: Every bounded file-writing slot is doing useful work.
     /// Guarantees: Normal worker utilization does not become hard publication-queue pressure.

@@ -17,6 +17,8 @@ pub struct Cli {
 /// Supported load-generator operations.
 #[derive(Clone, Debug, Subcommand)]
 pub enum Command {
+    /// Register schemas and export canonical SDKs without sending ingest work.
+    Prepare(Box<RunArgs>),
     /// Register schemas, generate SDK artifacts, and run bounded load.
     Run(Box<RunArgs>),
     /// Validate benchmark manifests and independent Delta snapshots.

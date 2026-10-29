@@ -1,5 +1,9 @@
 # loadtest
 
+For the separate state-preserving controller/Direct-collector routing milestone,
+see [finite Pingora routing benchmarks](routing-benchmark/README.md). Its lifecycle
+does not use this page's reset-on-start command.
+
 ![Architecture](.imgs/loadtest-architecture.png)
 
 ```bash

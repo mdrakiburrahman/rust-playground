@@ -6,6 +6,7 @@ use clap::Parser;
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Command::Prepare(arguments) => runner::prepare(*arguments).await,
         Command::Run(arguments) => runner::run(*arguments).await,
         Command::Validate(arguments) => validation::validate(arguments).await,
         Command::PrintSchemas => {

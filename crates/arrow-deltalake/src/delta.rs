@@ -859,7 +859,14 @@ impl DeltaTable {
         Ok(Some(files))
     }
 
-    fn ensure_schema(&self, incoming: SchemaRef) -> Result<SnapshotRef> {
+    /// Initialize or evolve the schema using a native Kernel transaction.
+    ///
+    /// This publishes metadata immediately. Mediated publishers must call it
+    /// only on their private preparation table, never on the reader-visible table.
+    ///
+    /// # Errors
+    /// Returns incompatible schema, ownership, storage, or Kernel errors.
+    pub fn ensure_schema(&self, incoming: SchemaRef) -> Result<SnapshotRef> {
         let _guard = self
             .commit_lock
             .lock()

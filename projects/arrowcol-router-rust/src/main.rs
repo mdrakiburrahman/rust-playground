@@ -7,12 +7,18 @@ use arrowcol_router_rust::{
     AllowAllAuthenticator, Authenticator, Cli, EdgeVerifier, InternalIdentitySigner, ProductionRouter, RouterConfig,
     RouterControlLoop, RouterMetrics, build_server,
 };
-use arrowcol_routing::{RoutingEngine, RoutingStore, SqlServerRoutingConfig, SqlServerRoutingStore};
+use arrowcol_routing::{
+    ControlCredential, DiskRoutingStore, PlacementPolicy, RemoteRoutingStore, RoutingEngine, RoutingStore,
+    SqlServerRoutingConfig, SqlServerRoutingStore, serve_control,
+};
 use clap::Parser;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<()> {
+    if let Ok(config) = std::env::var("ARROWCOL_DELTA_CONFIG") {
+        return arrowcol_router_rust::delta::run(&config);
+    }
     let cli = Cli::parse();
     let config = RouterConfig::load(&cli.config)?;
     initialize_tracing(&config)?;
@@ -49,7 +55,83 @@ fn main() -> Result<()> {
     )
     .with_batch_limits(256, config.receipts.max_batch_size)?;
 
-    let routing_store: Arc<dyn RoutingStore> = Arc::new(SqlServerRoutingStore::new(routing_sql));
+    let mode = std::env::var("ARROWCOL_ROUTING_MODE").unwrap_or_else(|_| "sql".to_owned());
+    let routing_store: Arc<dyn RoutingStore> = match mode.as_str() {
+        "sql" => Arc::new(SqlServerRoutingStore::new(routing_sql)),
+        "controller" => {
+            let directory = std::env::var("ARROWCOL_ROUTING_DIRECTORY")
+                .context("controller requires ARROWCOL_ROUTING_DIRECTORY")?;
+            let placement = match std::env::var("ARROWCOL_PLACEMENT_POLICY")
+                .as_deref()
+                .unwrap_or("least_pressure")
+            {
+                "least_pressure" => PlacementPolicy::LeastPressure,
+                "weighted_rendezvous" => PlacementPolicy::WeightedRendezvous,
+                _ => anyhow::bail!("unsupported placement policy"),
+            };
+            let store: Arc<dyn RoutingStore> =
+                Arc::new(DiskRoutingStore::open(directory, config.routing.policy()?, placement)?);
+            let listen = std::env::var("ARROWCOL_CONTROL_LISTEN")
+                .context("controller requires private ARROWCOL_CONTROL_LISTEN")?
+                .parse()?;
+            let credentials_file =
+                std::env::var("ARROWCOL_CONTROL_CREDENTIALS_FILE").context("controller requires credentials file")?;
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct CredentialFile {
+                role: String,
+                instance_key: Option<String>,
+                token_file: std::path::PathBuf,
+            }
+            let entries: Vec<CredentialFile> = serde_json::from_slice(&std::fs::read(credentials_file)?)?;
+            let credentials = entries
+                .into_iter()
+                .map(|entry| {
+                    Ok(ControlCredential {
+                        token: String::from_utf8(read_secret(&entry.token_file)?)?,
+                        role: entry.role,
+                        instance_key: entry.instance_key,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let authority = Arc::clone(&store);
+            // This listener is independent of ingestion readiness and starts before Pingora.
+            std::thread::Builder::new()
+                .name("routing-controller".to_owned())
+                .spawn(move || {
+                    let result = tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(2)
+                        .enable_all()
+                        .build()
+                        .map_err(anyhow::Error::from)
+                        .and_then(|runtime| {
+                            runtime
+                                .block_on(serve_control(listen, authority, credentials))
+                                .map_err(anyhow::Error::from)
+                        });
+                    if let Err(error) = result {
+                        tracing::error!(%error, "private routing controller stopped");
+                        std::process::exit(1);
+                    }
+                })?;
+            store
+        }
+        "data_only" => {
+            ensure!(
+                std::env::var_os("ARROWCOL_ROUTING_DIRECTORY").is_none(),
+                "data-only router must not configure a disk directory"
+            );
+            let endpoint = std::env::var("ARROWCOL_CONTROLLER_ENDPOINT")
+                .context("data-only router requires controller endpoint")?;
+            let token_file =
+                std::env::var("ARROWCOL_CONTROL_TOKEN_FILE").context("data-only router requires control token file")?;
+            Arc::new(RemoteRoutingStore::new(
+                &endpoint,
+                String::from_utf8(read_secret(std::path::Path::new(&token_file))?)?,
+            )?)
+        }
+        _ => anyhow::bail!("ARROWCOL_ROUTING_MODE must be sql, controller or data_only"),
+    };
     let receipt_store: Arc<dyn ReceiptStore> = Arc::new(SqlServerReceiptStore::new(receipt_sql));
     let routing = Arc::new(RoutingEngine::new(routing_store, config.routing.policy()?)?);
     let metrics = RouterMetrics::new()?;
@@ -73,7 +155,8 @@ fn main() -> Result<()> {
         routing,
         metrics,
         Duration::from_millis(config.routing.refresh_interval_ms),
-    );
+    )
+    .with_refresh_only(mode != "sql");
     let server = build_server(&config, router, control_loop)?;
     info!(listen = %config.server.listen, "starting Arrowcol production router behind external TLS termination");
     server.run_forever();

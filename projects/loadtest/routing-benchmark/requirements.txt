@@ -1,0 +1,4 @@
+locust>=2.40,<3
+pyarrow>=21,<25
+PyYAML>=6,<7
+deltalake>=1,<2

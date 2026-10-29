@@ -26,6 +26,39 @@ use crate::{
     },
 };
 
+/// Exports existing canonical schema artifacts for native Flight interoperability.
+///
+/// # Errors
+///
+/// Returns catalog registration, SDK generation, or manifest errors.
+pub async fn prepare(arguments: RunArgs) -> Result<()> {
+    let run_id = format!("prepare-{}-{}", now_unix_millis(), Uuid::new_v4().simple());
+    let manifests = ManifestWriter::create(&arguments.results).await?;
+    let transport = FlightTransport::connect(
+        &arguments.router_endpoint,
+        &arguments.catalog_endpoint,
+        &arguments.receipt_endpoint,
+        &arguments.edge_secret_file,
+        &arguments.internal_secret_file,
+        &arguments.direct_admin_endpoints,
+        arguments.request_timeout.get(),
+    )
+    .await?;
+    let tables = prepare_tables(&arguments, &run_id, &transport, &manifests).await?;
+    let exports = tables
+        .iter()
+        .map(|table| {
+            serde_json::json!({
+                "identity": table.identity.to_string(),
+                "sdk_root": table.generated_root,
+                "fingerprint": table.fingerprint,
+            })
+        })
+        .collect::<Vec<_>>();
+    manifests.write_json("prepared-tables.json", &exports).await?;
+    Ok(())
+}
+
 /// Executes a production finite or continuous benchmark run.
 ///
 /// # Errors
@@ -63,9 +96,26 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
         bail!("requested load table filter contains an unknown table");
     }
 
+    let scenarios = arguments.effective_scenarios();
+    let direct_endpoints = if scenarios
+        .iter()
+        .any(|scenario| matches!(scenario, Scenario::Direct | Scenario::Paired))
+    {
+        arguments.direct_admin_endpoints.as_slice()
+    } else {
+        &[]
+    };
+    let dataflow_endpoints = if scenarios
+        .iter()
+        .any(|scenario| matches!(scenario, Scenario::Dataflow | Scenario::Paired))
+    {
+        arguments.dataflow_admin_endpoints.as_slice()
+    } else {
+        &[]
+    };
     let capabilities = serde_json::json!({
-        "direct": transport.capability_evidence(&arguments.direct_admin_endpoints).await?,
-        "dataflow": transport.capability_evidence(&arguments.dataflow_admin_endpoints).await?,
+        "direct": transport.capability_evidence(direct_endpoints).await?,
+        "dataflow": transport.capability_evidence(dataflow_endpoints).await?,
     });
     manifests.write_json(CAPABILITY_EVIDENCE_FILE, &capabilities).await?;
 
@@ -98,7 +148,7 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
     let kusto_sync = crate::kusto::LiveSync::start(&arguments, &run_id);
 
     let mut run_error = None;
-    for scenario in arguments.effective_scenarios() {
+    for scenario in scenarios {
         if cancellation.is_cancelled() {
             break;
         }

@@ -1,0 +1,582 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Architecture, implementation contracts and measured local results for disk-backed Pingora routing of native Arrow Flight ingestion.">
+  <title>Pingora + Arrow Flight — Routing Architecture &amp; Benchmark Report</title>
+  <style>
+    :root { color-scheme: light; --ink:#182c40; --muted:#455b6d; --line:#bdcbd5; --paper:#fff; --ground:#eef3f6; --blue:#164f82; --teal:#09655c; --warn:#79420c; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--ground); color:var(--ink); font:1rem/1.65 system-ui,-apple-system,"Segoe UI",sans-serif; }
+    a { color:var(--blue); text-underline-offset:.18em; overflow-wrap:anywhere; }
+    a:hover { text-decoration-thickness:2px; }
+    a:focus-visible, [tabindex]:focus-visible { outline:3px solid #a14304; outline-offset:4px; }
+    .skip { position:absolute; top:-5rem; left:1rem; padding:.6rem 1rem; background:white; z-index:10; }
+    .skip:focus { top:1rem; }
+    header { background:#142f49; color:white; border-bottom:6px solid #47b5a7; padding:3.5rem max(1.25rem,calc((100% - 1160px)/2)); }
+    header p { max-width:78ch; color:#dce9f2; }
+    .eyebrow { font-size:.8rem; font-weight:750; text-transform:uppercase; letter-spacing:.12em; }
+    h1 { font-size:clamp(2rem,4vw,3.2rem); max-width:25ch; line-height:1.15; margin:.6rem 0 1rem; }
+    h2 { font-size:1.8rem; line-height:1.25; margin:0 0 1.1rem; }
+    h3 { font-size:1.2rem; line-height:1.4; margin:1.6rem 0 .6rem; }
+    p { margin:.65rem 0 1rem; }
+    nav { max-width:1200px; margin:auto; padding:1.1rem 1.25rem; }
+    nav ul { display:flex; gap:.6rem 1.4rem; flex-wrap:wrap; padding:0; margin:0; list-style:none; }
+    main { max-width:1200px; margin:auto; padding:0 1.25rem 2rem; }
+    section { background:var(--paper); border:1px solid var(--line); border-radius:10px; padding:clamp(1.15rem,3vw,2.3rem); margin:1rem 0 1.5rem; scroll-margin-top:1rem; }
+    .lead { font-size:1.12rem; max-width:87ch; }
+    .grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:1rem; margin:1.3rem 0; }
+    .card { border:1px solid var(--line); border-top:4px solid var(--teal); padding:1rem; border-radius:5px; }
+    .card strong { display:block; font-size:1.6rem; line-height:1.3; }
+    .card p { margin:.35rem 0 0; }
+    .note { background:#edf6fa; border-left:4px solid var(--blue); padding:.8rem 1.1rem; margin:1rem 0; }
+    .warning { background:#fff5e8; border-color:var(--warn); }
+    .small, figcaption { font-size:.9rem; color:var(--muted); }
+    header .small { color:#dce9f2; }
+    code { font: .88em/1.5 ui-monospace,SFMono-Regular,Consolas,monospace; overflow-wrap:anywhere; }
+    pre { padding:1rem; background:#132a3d; color:#f3f8fc; border-radius:5px; overflow-x:auto; line-height:1.55; }
+    pre code { overflow-wrap:normal; }
+    ul, ol { padding-left:1.4rem; }
+    li { margin:.4rem 0; }
+    .table-scroll { overflow-x:auto; margin:1rem 0; border:1px solid var(--line); border-radius:5px; }
+    table { width:100%; border-collapse:collapse; font-size:.9rem; font-variant-numeric:tabular-nums; }
+    caption { text-align:left; font-weight:750; padding:.8rem; background:#e8f0f5; color:var(--ink); }
+    th, td { padding:.6rem .75rem; text-align:left; border-bottom:1px solid #d9e2e8; vertical-align:top; }
+    thead th { background:#f2f6f9; white-space:nowrap; }
+    tbody th { font-weight:650; }
+    tbody tr:nth-child(even) { background:#f7f9fb; }
+    .metrics td:not(:first-child), .metrics th:not(:first-child) { white-space:nowrap; }
+    .num { text-align:right; }
+    figure { margin:1.3rem 0; }
+    svg { display:block; width:100%; height:auto; border:1px solid var(--line); border-radius:6px; background:#f8fbfd; }
+    svg text { font-family:system-ui,-apple-system,"Segoe UI",sans-serif; fill:#182c40; }
+    figcaption { padding:.65rem .1rem; }
+    .steps { counter-reset:step; list-style:none; padding:0; display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:.7rem; }
+    .steps li { background:#f1f6fa; border:1px solid var(--line); padding:.9rem; }
+    .steps strong { display:block; color:var(--blue); }
+    footer { max-width:1200px; margin:auto; padding:0 1.25rem 2.5rem; color:var(--muted); }
+    @media (max-width:720px) { .grid,.steps { grid-template-columns:1fr; } header { padding:2rem 1.25rem; } section { border-radius:5px; } th,td { padding:.5rem; } }
+    @media print {
+      @page { size:landscape; margin:14mm; }
+      body { background:white; font-size:10pt; color:#111; }
+      header { background:white; color:#111; padding:0 0 1rem; border-bottom:2px solid #333; }
+      header p, header .small { color:#333; } h1 { font-size:25pt; max-width:none; }
+      nav,.skip { display:none; } main,footer { max-width:none; padding:0; }
+      section { padding:1rem 0; border:0; border-radius:0; margin:0; }
+      h2,h3,caption { break-after:avoid; } tr,figure,.card,.steps li { break-inside:avoid; }
+      .table-scroll { overflow:visible; border:0; } table { font-size:8pt; }
+      th,td { padding:.35rem; } thead { display:table-header-group; }
+      a { color:#111; } pre { white-space:pre-wrap; background:#f3f3f3; color:#111; }
+      svg { max-height:150mm; } .note { border:1px solid #777; }
+    }
+  </style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to report</a>
+<header>
+  <div class="eyebrow">Engineering review · Local finite benchmark · 24 October 2026</div>
+  <h1>Disk-backed Pingora routing for native Arrow Flight</h1>
+  <p class="lead">One table owner, one durable placement authority, multiple streaming ingress processes.
+    Architecture, measured policy comparisons, controlled migration and the limits of the evidence.</p>
+  <p class="small">Evidence snapshot: <time datetime="2026-10-24T01:05:33.285076Z">2026-10-24 01:05:33 UTC</time>.
+    Offline document: inline styling and diagrams; no scripts, fonts, telemetry or network assets.</p>
+</header>
+<nav aria-label="Report sections"><ul>
+  <li><a href="#summary">Summary</a></li><li><a href="#architecture">Architecture</a></li>
+  <li><a href="#contracts">Routing contracts</a></li><li><a href="#technology">Technology</a></li>
+  <li><a href="#method">Method</a></li><li><a href="#policies">Policy results</a></li>
+  <li><a href="#resources">Resources</a></li><li><a href="#migration">Migration &amp; scaling</a></li>
+  <li><a href="#limits">Limits &amp; failures</a></li><li><a href="#reproduce">Reproduce</a></li>
+  <li><a href="#references">Sources</a></li>
+</ul></nav>
+<main id="main">
+<section id="summary" aria-labelledby="summary-title">
+  <h2 id="summary-title">1. What this milestone demonstrates</h2>
+  <p class="lead">The local harness exercised authenticated native Flight ingestion through a real Rust/Pingora
+    router, sticky disk-backed placement, collector publication into Delta, and independent output reconciliation.
+    It also exercised controlled ownership transfer and actual process scale-out/scale-in.</p>
+  <div class="grid">
+    <div class="card"><strong>145 / 145 streams</strong><p>Full least-pressure scenario: 10,944 generated and reconciled rows; 342 published receipts.</p></div>
+    <div class="card"><strong>66 / 66 streams</strong><p>Weighted-rendezvous five-phase scenario: 4,224 generated and reconciled rows; 132 published receipts.</p></div>
+    <div class="card"><strong>3 → 4 → 3 / 1 → 2 → 1</strong><p>Actual collector / router process counts, with inbound table migration, evacuation and admitted-stream drain.</p></div>
+  </div>
+  <aside class="note warning"><strong>Not a full-run performance comparison.</strong> The 145-stream scenario includes
+    migration, scaling and restart; the 66-stream scenario does not. Only the five matched phases in
+    <a href="#policies">Section 6</a> are comparable inputs. Even those short, sequential, same-host trials
+    do not establish statistically significant policy superiority, production capacity or added physical capacity.</aside>
+  <p>This is a separate <strong>generic Arrow Flight / Direct collector</strong> experiment using Docker Compose.
+    It is not the earlier Kubernetes Envoy/OTAP DFE proof of concept. There is no current Kubernetes deployment,
+    YARP/Envoy performance comparison, Dicer framework dependency, million-client or PB/day validation,
+    or comparison of multiple database stores.</p>
+</section>
+
+<section id="architecture" aria-labelledby="architecture-title">
+  <h2 id="architecture-title">2. Architecture: separate routing authority from publication authority</h2>
+  <figure>
+    <svg viewBox="0 0 1060 600" role="img" aria-labelledby="arch-title arch-desc">
+      <title id="arch-title">Native Flight data plane, single routing controller and retained publication services</title>
+      <desc id="arch-desc">Bounded Python or Rust clients send signed Flight streams to router 1 or optional router 2.
+        Router 1 contains Pingora, the placement controller and private API and is the only disk routing writer.
+        Router 2 polls router 1 and has no disk writer. Collectors register and check admission with router 1.
+        Both routers stream to the selected collector. Collectors use the catalog, SQL publication fences
+        and receipts, Hive and Delta storage; the client separately checks publication and scans output.</desc>
+      <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8Z" fill="#164f82"/></marker>
+        <marker id="control-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8Z" fill="#09655c"/></marker></defs>
+      <rect x="20" y="25" width="260" height="100" rx="7" fill="#e3eef7" stroke="#164f82"/>
+      <text x="40" y="52" font-size="18" font-weight="700">Finite native Flight clients</text>
+      <text x="40" y="78" font-size="15">PyArrow + Locust OS workers</text>
+      <text x="40" y="102" font-size="15">Separate Rust interoperability smoke</text>
+      <rect x="335" y="25" width="390" height="195" rx="7" fill="#e6f4ef" stroke="#09655c" stroke-width="2"/>
+      <text x="355" y="54" font-size="20" font-weight="700">Router 1: fixed authority + ingress</text>
+      <text x="355" y="84" font-size="16">Pingora HTTP/2 streaming data plane</text>
+      <text x="355" y="113" font-size="16">Placement controller + private control API</text>
+      <text x="355" y="142" font-size="16">RoutingStore → sole DiskRoutingStore writer</text>
+      <rect x="355" y="158" width="350" height="44" rx="4" fill="white" stroke="#09655c"/>
+      <text x="368" y="185" font-size="15">Locked / checksummed / versioned snapshot</text>
+      <rect x="335" y="265" width="390" height="100" rx="7" fill="#e3eef7" stroke="#164f82"/>
+      <text x="355" y="294" font-size="19" font-weight="700">Router 2: optional data-only ingress</text>
+      <text x="355" y="320" font-size="15">Bounded-fresh cache; remote claims to router 1</text>
+      <text x="355" y="344" font-size="15">No disk writer, election or failover</text>
+      <rect x="790" y="25" width="245" height="340" rx="7" fill="#fff" stroke="#164f82"/>
+      <text x="810" y="56" font-size="20" font-weight="700">Direct collectors</text>
+      <text x="810" y="85" font-size="15">3 → 4 → 3 Rust processes</text>
+      <text x="810" y="115" font-size="15">Register / heartbeat / pressure</text>
+      <text x="810" y="145" font-size="15">Authoritative new-RPC check</text>
+      <text x="810" y="175" font-size="15">One owner per table</text>
+      <text x="810" y="205" font-size="15">Local admission drain barrier</text>
+      <text x="810" y="235" font-size="15">Durable batch admission</text>
+      <text x="810" y="265" font-size="15">Buffer / Quiver → publication</text>
+      <text x="810" y="295" font-size="15">Exact-holder SQL fence</text>
+      <text x="810" y="325" font-size="15">No transparent DoPut replay</text>
+      <path d="M280 75H330" stroke="#164f82" stroke-width="3" marker-end="url(#arrow)"/>
+      <path d="M150 125V315H330" stroke="#164f82" stroke-width="3" fill="none" marker-end="url(#arrow)"/>
+      <text x="30" y="176" font-size="15">Edge HMAC</text><text x="30" y="199" font-size="15">required on ingress</text>
+      <path d="M725 80H785M725 312H785" stroke="#164f82" stroke-width="3" marker-end="url(#arrow)"/>
+      <path d="M725 140H782" stroke="#09655c" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#control-arrow)"/>
+      <path d="M530 265V225" stroke="#09655c" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#control-arrow)"/>
+      <text x="546" y="247" font-size="14">private control</text>
+      <rect x="20" y="425" width="330" height="130" rx="7" fill="#f1f3f8" stroke="#576984"/>
+      <text x="40" y="455" font-size="18" font-weight="700">SQL Server + existing catalog</text>
+      <text x="40" y="484" font-size="15">Schemas / receipts / publication leases</text>
+      <text x="40" y="510" font-size="15">Disk ownership does not replace SQL fencing</text>
+      <text x="40" y="536" font-size="15">Hive metastore retained (SQL-backed)</text>
+      <rect x="400" y="425" width="310" height="130" rx="7" fill="#f1f3f8" stroke="#576984"/>
+      <text x="420" y="455" font-size="18" font-weight="700">Delta + Parquet output</text>
+      <text x="420" y="484" font-size="15">Shared local bind-mounted data</text>
+      <text x="420" y="510" font-size="15">Independent run-marker multiset scan</text>
+      <text x="420" y="536" font-size="15">Publication ≠ terminal RPC success</text>
+      <path d="M912 365V394H185V420M912 394H555V420" stroke="#164f82" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+      <text x="790" y="457" font-size="15">Solid blue: data / publication</text>
+      <text x="790" y="485" font-size="15">Dashed green: control</text>
+      <text x="790" y="525" font-size="15">One host, isolated private network</text>
+      <text x="790" y="549" font-size="15">No additional physical capacity</text>
+    </svg>
+    <figcaption>Logical responsibilities, not a packet-by-packet sequence. Collector control is bidirectional;
+      router-issued internal identity accompanies upstream RPCs. The authority API and collector ports are not host-published.</figcaption>
+  </figure>
+  <h3>Why two authorities?</h3>
+  <p><strong>Routing authority</strong> answers which collector process owns a typed table and at what routing epoch.
+    <strong>SQL publication authority</strong> fences who may publish buffered data and records receipt status.
+    A disk ownership transfer alone must not authorize a second publisher. SQL Server, catalog migrations,
+    Hive metastore and Delta publication are retained, not replaced with a disk-only database.</p>
+  <p>Router 1 combines ingress, placement and an authenticated private API in one process. Router 2 has its own
+    Pingora ingress but calls router 1 through <code>RemoteRoutingStore</code>; it does not open the disk directory
+    or choose a competing owner. This separates data-router scaling from placement, <strong>not controller availability</strong>.</p>
+</section>
+
+<section id="contracts" aria-labelledby="contracts-title">
+  <h2 id="contracts-title">3. Ownership, pressure and failure semantics</h2>
+  <h3>Sticky table ownership, not per-batch balancing</h3>
+  <ul>
+    <li>The routing key is <code>(implementation_pool, catalog, schema, table)</code>. The schema fingerprint is a
+      separate validated identity, not another table-owner key. This benchmark uses the <code>direct</code> pool.</li>
+    <li>One owner receives all new admitted RPCs for that table. Initial cold placement uses
+      <code>least_pressure</code> or the matched <code>weighted_rendezvous</code> policy.
+      Warm requests retain ownership; adding a collector does not rebalance existing tables automatically.</li>
+    <li>Least-pressure ranks eligible collectors by maximum observed pressure plus pending-reservation pressure:
+      <code>max_pressure_bps + pending × 10000 / max_concurrent_streams</code>, with process-ID tie-breaking.
+      Reservations are centrally bounded (4,096 entries) and expire; they reduce concurrent cold-claim pile-up.</li>
+    <li>Weighted rendezvous orders a hash of table key and <em>process UUID</em>, weighted by stream capacity,
+      remaining pressure headroom and warm-up. Stable instance keys match across runs, but process UUIDs do not;
+      identical owner maps are neither required nor established.</li>
+    <li>Freshness, readiness, pool identity, accepting-deliveries state, subsystem health and hard-pressure eligibility
+      apply before selection. Missing/stale health is not presumed healthy. CPU, RSS, cgroup memory, active streams,
+      buffer bytes/rows/batches, available permits, pending commits and subsystem pressure contribute conservatively
+      through their maximum normalized value, not an average that hides a saturated subsystem.</li>
+  </ul>
+  <p>The harness configures 1-second router refresh/collector heartbeat, a 3-second routing/pressure freshness bound
+    and 30-second routing lease TTL. A cached view is a bounded optimization, <strong>not permission to accept stale
+    ownership</strong>: collectors perform authoritative new-RPC owner/epoch/admission checks. Existing admitted work
+    has a distinct drain lifecycle. No per-batch redistribution, automatic rebalance or transparent DoPut replay is implemented.</p>
+  <h3>Durability is serialized; uncertainty fails closed</h3>
+  <p><code>DiskRoutingStore</code> implements the pluggable <code>RoutingStore</code> interface. It holds an exclusive
+    writer lock and serializes compare-and-swap mutations through persistence: bounded version-1 JSON payload,
+    SHA-256 checksum, pending-file write, file sync, atomic rename and parent-directory sync. Acknowledgement follows
+    durable publication. Corruption, unsupported versions and missing previously established state are rejected
+    rather than resetting epochs. Telemetry is not restored after restart; fresh registrations/pressure are required.</p>
+  <p>During an uncertain commit the authority blocks operations until restart and snapshot inspection. This is
+    deliberate fail-closed behavior, not automatic outage recovery. The retained incident in
+    <a href="#limits">Section 9</a> matters to availability claims.</p>
+  <h3>Authentication remains on the real path</h3>
+  <p>Native clients sign the existing edge-HMAC contract (method/path, timestamp, nonce and signed routing metadata).
+    Pingora verifies it and issues the existing internal signed identity for collectors; wire schema/fingerprint
+    validation and ownership checks remain enforced. The private bearer API uses separately provisioned roles:
+    operator for moves/drains, data router for claims, and collector credentials bound to instance keys and current
+    process identities for registration, telemetry and migration acknowledgements. The local transport is private-network
+    cleartext, not a demonstrated Internet TLS deployment. No authentication-bypass claim is made.</p>
+  <aside class="note warning"><strong>Hot-table and availability limits.</strong> One hot table is still bounded by
+    its one collector's admission/publication capacity. More routers or collectors do not shard that table.
+    Router 1 remains a fixed single-controller dependency: no election, replicated store, automatic failover or HA.</aside>
+</section>
+
+<section id="technology" aria-labelledby="technology-title">
+  <h2 id="technology-title">4. Technology and execution environment</h2>
+  <div class="table-scroll" role="region" aria-label="Technology stack table" tabindex="0"><table>
+    <caption>Implemented stack, not alternative-system comparisons</caption>
+    <thead><tr><th scope="col">Layer</th><th scope="col">Technology / recorded version</th><th scope="col">Responsibility</th></tr></thead>
+    <tbody>
+      <tr><th scope="row">Ingress</th><td>Rust; Pingora 0.9.0; Tokio 1.53.2</td><td>Streaming HTTP/2 proxy, metadata/authentication, owner selection, metrics and graceful drain.</td></tr>
+      <tr><th scope="row">Wire / native server</th><td>Arrow IPC / Arrow Flight gRPC; arrow-flight 58.4.0; Tonic 0.14.6</td><td>Real native DoPut into Direct Rust collectors, not an HTTP mock or OTAP pipeline.</td></tr>
+      <tr><th scope="row">Control / persistence</th><td>Rust routing library; Axum 0.8.9; local JSON snapshots</td><td>Authenticated private API, serialized claims/CAS, disk lineage and explicit migration records.</td></tr>
+      <tr><th scope="row">Load and output verification</th><td>Python 3; PyArrow 24.0.0; Locust 2.46.0; Python deltalake 1.6.6</td><td>Bounded native OS workers, real Flight clients and independent Delta scans. Python interpreter patch version was not recorded in the summary.</td></tr>
+      <tr><th scope="row">Publication dependencies</th><td>SQL Server 2022 CU27 image recipe; Hive 4.0.1 SQL-backed recipe; existing catalog, Quiver, Delta / Parquet</td><td>Catalog schemas, durable receipts, publication leases/fencing, local buffered admission and output metadata/data. Image recipe versions are not live server-version queries.</td></tr>
+      <tr><th scope="row">Runtime packaging</th><td>Docker server 29.9.2; Compose 5.6.1; Debian bookworm-slim runtime image</td><td>Task-owned private network and bind mounts; stripped debug-built Rust binaries plus existing SDK rustfmt toolchain.</td></tr>
+      <tr><th scope="row">Compiler / build</th><td>rustc 1.96.1 (31fca3adb, 2026-06-26); cargo 1.96.1 (356927216, 2026-06-26)</td><td>Locked builds, two Cargo build jobs. These are not optimized release-build capacity measurements.</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>Host:</strong> 16 logical CPUs; 75,060,592,640 free disk bytes recorded in the implementation summary.
+    Host CPU model, physical core count, total RAM and host OS version are not supplied there; the Debian runtime
+    image is not evidence of the host OS. All data processes share this one host.</p>
+  <p><strong>Configured limits, not reservations:</strong> SQL Server 3 GiB / 2 CPUs (SQL internal memory target 2,048 MB);
+    Hive 1 GiB / 1 CPU; each router and collector 1 GiB / 1 CPU. Router and collector runtimes use two configured
+    worker threads. Collector global buffer bounds are 128 MiB / 4,000,000 rows / 2,048 batches; per-table bounds
+    are 32 MiB / 1,000,000 rows / 512 batches. These limits do not imply dedicated cores or measured safe capacity.</p>
+  <p class="small">Version sources: Cargo.lock, Compose/Dockerfile recipes and recorded software inventory.
+    Image IDs differ; audited router, collector and SDK-generator executable SHA-256 values match. The provenance
+    record also distinguishes the earlier full least-pressure image's loadgen from the later matching images:
+    a selected-scenario capability-probe fix changed that binary after the full run; native wire/data handling
+    was unchanged, and the matched policy phases use Python Flight workers.</p>
+</section>
+
+<section id="method" aria-labelledby="method-title">
+  <h2 id="method-title">5. Methodology: reconcile output, not just completed requests</h2>
+  <ol>
+    <li><strong>Fresh, separate state for each policy.</strong> Prepare a unique task project/network, start three
+      Direct collectors and router 1, then generate canonical schemas/SDK descriptors through the existing native
+      Rust catalog flow. Reusing owned tables would test sticky warm routing, not initial placement.</li>
+    <li><strong>Cold, three warm repetitions, new-table pressure.</strong> Each policy runs the same five phase inputs.
+      The pressure scenario runs a bounded approximately 75%-duty CPU worker inside collector 1's cgroup;
+      it measures real telemetry rather than injecting fictitious store pressure.</li>
+    <li><strong>Finite real Flight workload.</strong> Three native OS workers; 32 rows/batch; two batches/stream;
+      12 streams per cold/warm phase and 18 streams for pressure. Bounds: 1,048,576 Arrow bytes/batch,
+      15 seconds/stream generation, 30-second RPC timeout, 30-second scenario generation bound and
+      a shared 60-second publication deadline. Maximum outstanding Arrow byte budget: 3,145,728.
+      Fixed-length random run markers preserve exact generated-byte matching.</li>
+    <li><strong>Locust does scheduling, native workers do blocking I/O.</strong> With
+      <code>LOCUST_SKIP_MONKEY_PATCH=1</code>, a bounded gevent native thread pool performs blocking PyArrow Flight.
+      Users cannot exceed the worker bound. Flight, publication polling and native scanning must not block the
+      gevent hub. The standalone worker uses the same native adapter; connection/stream rotation is finite.</li>
+    <li><strong>Four distinct outcomes.</strong> Generated/attempted/write-completed batches are separate from
+      terminal RPC success, durable admission receipts, and published output. Receipts require
+      <code>published</code> plus <code>purge_allowed</code>. Independently scanned Delta rows must match the exact
+      run/stream/batch/row marker multiset, including duplicate/missing checks. Aggregate Delta commits may cover
+      several receipts; aggregate commit rows are not treated as per-receipt row counts.</li>
+    <li><strong>Retain ambiguity.</strong> Unknown RPC outcomes, pending/failed publication, worker exit failures
+      and unconfirmed output remain visible. No DoPut replay is used to turn a failure into success.
+      This is bounded reconciliation evidence, <em>not an exactly-once guarantee</em>.</li>
+  </ol>
+  <p>The raw settings, streams JSONL, report JSON, Locust files, authority snapshots, placement decisions and
+    controller logs are retained under each evidence directory. All ten matched phase reports were cross-checked
+    against the comparison summary for generation, latency, elapsed duration, generator resources and reconciled throughput.</p>
+  <div class="note"><strong>Metric definitions.</strong> Terminal latency measures the native upload operation through
+    terminal completion, not asynchronous publication. Elapsed rows/s divides reconciled rows by the report's
+    elapsed seconds, which include receipt publication and independent output scanning (and Locust scheduling
+    overhead). CPU seconds and peak RSS are load-generator <em>process-lifetime</em> counters. They are not
+    per-request CPU or container memory. No metric here is isolated proxy throughput.</div>
+  <p class="small">Observed UTC phase coverage (first cold stream → pressure reconciliation):
+    weighted-rendezvous 2026-10-24 00:45:07.002 → 00:47:41.576;
+    least-pressure 2026-10-24 00:56:33.408 → 00:59:04.492. The trials were sequential, not simultaneous;
+    later full-run operations extend beyond these comparison windows.</p>
+</section>
+
+<section id="policies" aria-labelledby="policies-title">
+  <h2 id="policies-title">6. Matched policy results</h2>
+  <p>LP = least-pressure; WR = weighted rendezvous. The comparison artifact verifies matched settings, schema
+    fingerprints and exact generated Arrow bytes for every phase. Process UUIDs, scheduling, cache state and
+    host contention differ. Both policies reconcile 4,224 rows / 132 receipts across these five phases;
+    all 66 streams per policy end successfully, with no not-started streams.</p>
+  <div class="table-scroll" role="region" aria-label="Matched workload sizes" tabindex="0"><table class="metrics">
+    <caption>Matched workload per policy (bytes are generated Arrow batch bytes, not network bytes)</caption>
+    <thead><tr><th scope="col">Phase</th><th scope="col">Streams</th><th scope="col">Rows</th><th scope="col">Receipts</th><th scope="col">Arrow bytes</th></tr></thead>
+    <tbody>
+      <tr><th scope="row">cold</th><td>12</td><td>768</td><td>24</td><td>129,712</td></tr>
+      <tr><th scope="row">warm-locust-1</th><td>12</td><td>768</td><td>24</td><td>136,624</td></tr>
+      <tr><th scope="row">warm-locust-2</th><td>12</td><td>768</td><td>24</td><td>136,624</td></tr>
+      <tr><th scope="row">warm-locust-3</th><td>12</td><td>768</td><td>24</td><td>136,624</td></tr>
+      <tr><th scope="row">new-table-pressure</th><td>18</td><td>1,152</td><td>36</td><td>215,576</td></tr>
+    </tbody>
+  </table></div>
+  <div class="table-scroll" role="region" aria-label="Matched measured latency and throughput" tabindex="0"><table class="metrics" id="phase-metrics">
+    <caption>Actual measured phase comparison — decimal measurements rounded to six places</caption>
+    <thead><tr><th scope="col">Phase</th><th scope="col">Policy</th><th scope="col">Elapsed (s)</th><th scope="col">Terminal p50 (ms)</th><th scope="col">Terminal p95 (ms)</th><th scope="col">Terminal p99 (ms)</th><th scope="col">Reconciled rows/s</th></tr></thead>
+    <tbody>
+      <tr><th scope="row">cold</th><td>LP</td><td>6.883627</td><td>182.528501</td><td>723.081931</td><td>723.081931</td><td>111.569095</td></tr>
+      <tr><th scope="row">cold</th><td>WR</td><td>6.952848</td><td>206.935164</td><td>800.527605</td><td>800.527605</td><td>110.458341</td></tr>
+      <tr><th scope="row">warm-locust-1</th><td>LP</td><td>18.724647</td><td>183.153466</td><td>444.248970</td><td>444.248970</td><td>41.015460</td></tr>
+      <tr><th scope="row">warm-locust-1</th><td>WR</td><td>14.233272</td><td>244.264888</td><td>548.184479</td><td>548.184479</td><td>53.958077</td></tr>
+      <tr><th scope="row">warm-locust-2</th><td>LP</td><td>17.667149</td><td>148.292668</td><td>390.219144</td><td>390.219144</td><td>43.470512</td></tr>
+      <tr><th scope="row">warm-locust-2</th><td>WR</td><td>18.898638</td><td>188.675666</td><td>539.832556</td><td>539.832556</td><td>40.637849</td></tr>
+      <tr><th scope="row">warm-locust-3</th><td>LP</td><td>21.319891</td><td>135.783723</td><td>408.142925</td><td>408.142925</td><td>36.022698</td></tr>
+      <tr><th scope="row">warm-locust-3</th><td>WR</td><td>21.295173</td><td>159.077349</td><td>428.561491</td><td>428.561491</td><td>36.064511</td></tr>
+      <tr><th scope="row">new-table-pressure</th><td>LP</td><td>6.838371</td><td>198.304641</td><td>436.320932</td><td>436.320932</td><td>168.461173</td></tr>
+      <tr><th scope="row">new-table-pressure</th><td>WR</td><td>7.062081</td><td>183.813437</td><td>417.038165</td><td>417.038165</td><td>163.124726</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small">Full precision remains in local JSON. Generated rows/s equals reconciled rows/s in these successful
+    phases. With only 12 or 18 terminal samples per phase, the reported p95 and p99 coincide; these are not
+    stable estimates of rare-tail behavior.</p>
+  <div class="table-scroll" role="region" aria-label="Measured generator CPU and RSS by matched phase" tabindex="0"><table class="metrics" id="generator-metrics">
+    <caption>Measured load-generator process-lifetime resources — CPU seconds / peak RSS KiB (1 KiB = 1,024 bytes)</caption>
+    <thead><tr><th scope="col">Phase</th><th scope="col">LP CPU (s)</th><th scope="col">WR CPU (s)</th><th scope="col">LP peak RSS (KiB)</th><th scope="col">WR peak RSS (KiB)</th></tr></thead>
+    <tbody>
+      <tr><th scope="row">cold</th><td>2.512023</td><td>2.592592</td><td>166,160</td><td>165,928</td></tr>
+      <tr><th scope="row">warm-locust-1</th><td>3.120910</td><td>3.238594</td><td>191,400</td><td>191,120</td></tr>
+      <tr><th scope="row">warm-locust-2</th><td>3.348599</td><td>3.514817</td><td>192,264</td><td>192,764</td></tr>
+      <tr><th scope="row">warm-locust-3</th><td>3.423408</td><td>3.430347</td><td>193,468</td><td>193,376</td></tr>
+      <tr><th scope="row">new-table-pressure</th><td>2.600829</td><td>2.530161</td><td>167,504</td><td>167,772</td></tr>
+    </tbody>
+  </table></div>
+  <h3>Observed placement decisions under real pressure</h3>
+  <p>In the six new-table decisions, LP assigned <strong>zero</strong> tables to collector 1 while its measured CPU
+    pressure was 7,621 basis points (76.21%). Collector 2 received four and collector 3 received two.
+    WR assigned one table to collector 1 (77.05% measured CPU at that decision), four to collector 2 and one to
+    collector 3. That is consistent with weighted hashing retaining a nonzero chance for an eligible pressured
+    collector; it is not an authentication or ownership failure. These are six decisions per policy,
+    not a statistically representative distribution.</p>
+  <h3>Interpretation</h3>
+  <p>LP's terminal p50 is lower in cold and all three warm observations; WR's is lower in the pressure phase.
+    Yet WR warm-1 has higher elapsed rows/s despite higher terminal latency, because the elapsed measurement
+    includes scheduling, publication and scanning. Warm-3 throughput is almost equal. The useful result is
+    <strong>verified semantics and explicit pressure-dependent initial placement</strong>, not a blanket policy-speed ranking.</p>
+</section>
+
+<section id="resources" aria-labelledby="resources-title">
+  <h2 id="resources-title">7. Controller and container measurements</h2>
+  <div class="table-scroll" role="region" aria-label="Matched controller execution timing" tabindex="0"><table class="metrics">
+    <caption>Controller execution in matched phase windows — microseconds (µs)</caption>
+    <thead><tr><th scope="col">Operation</th><th scope="col">LP samples</th><th scope="col">LP p50 / p95 / max</th><th scope="col">WR samples</th><th scope="col">WR p50 / p95 / max</th></tr></thead>
+    <tbody>
+      <tr><th scope="row">view</th><td>216</td><td>191 / 310 / 34,976</td><td>216</td><td>196 / 357 / 35,287</td></tr>
+      <tr><th scope="row">heartbeat</th><td>218</td><td>243 / 1,153 / 7,724</td><td>206</td><td>245 / 1,526 / 25,405</td></tr>
+      <tr><th scope="row">pressure</th><td>217</td><td>160 / 270 / 702</td><td>204</td><td>205 / 352 / 1,389</td></tr>
+      <tr><th scope="row">migration_work polling</th><td>217</td><td>218 / 741 / 8,164</td><td>205</td><td>203 / 1,219 / 18,073</td></tr>
+      <tr><th scope="row">snapshot commit</th><td>15</td><td>6,017 / 22,370 / 22,370</td><td>15</td><td>8,457 / 24,254 / 24,254</td></tr>
+    </tbody>
+  </table></div>
+  <p>Control execution includes authority locking and applicable persistence, <strong>excluding HTTP decoding,
+    encoding and network time</strong>. Snapshot commit timing includes write/sync/replace/parent sync;
+    it is a distinct instrumentation scope, not an additional independent client latency to sum.
+    Snapshot sizes: p50 1,604 bytes, p95/max 4,473 bytes for both policies (15 commits each).
+    These summary windows do not report a separate cold-claim latency distribution.</p>
+  <div class="table-scroll" role="region" aria-label="Docker sampled resource observations" tabindex="0"><table class="metrics">
+    <caption>Docker initial-topology interval observations — CPU % of one core / maximum sampled memory MiB</caption>
+    <thead><tr><th scope="col">Container role</th><th scope="col">LP CPU p95 / max (%)</th><th scope="col">WR CPU p95 / max (%)</th><th scope="col">LP max MiB</th><th scope="col">WR max MiB</th></tr></thead>
+    <tbody>
+      <tr><th scope="row">Router 1 + controller</th><td>28.49 / 32.96</td><td>29.00 / 32.98</td><td>18.61</td><td>59.94</td></tr>
+      <tr><th scope="row">Collector 1</th><td>75.94 / 81.96</td><td>76.33 / 83.76</td><td>18.79</td><td>18.43</td></tr>
+      <tr><th scope="row">Collector 2</th><td>15.41 / 49.69</td><td>14.46 / 46.92</td><td>24.13</td><td>22.60</td></tr>
+      <tr><th scope="row">Collector 3</th><td>77.86 / 87.19</td><td>12.25 / 38.64</td><td>19.69</td><td>22.37</td></tr>
+      <tr><th scope="row">SQL Server</th><td>75.71 / 104.27</td><td>81.58 / 116.06</td><td>905.50</td><td>921.90</td></tr>
+      <tr><th scope="row">Hive metastore</th><td>9.58 / 20.03</td><td>9.85 / 30.94</td><td>484.70</td><td>569.40</td></tr>
+    </tbody>
+  </table></div>
+  <aside class="note warning"><strong>Do not interpret these as matched per-phase resource measurements.</strong>
+    LP has 397 samples per container; WR has 321. The named <code>initial-resource-samples.jsonl</code> intervals
+    have no per-record wall-clock timestamp, and LP's interval extends into later full-scenario work before
+    topology changes. CPU is Docker's one-core percentage (SQL can exceed 100% under its two-CPU limit);
+    memory is Docker's reported usage parsed into bytes, <em>not process RSS</em>. MiB values are converted
+    and rounded to two decimals. Neither sampled maxima nor low observed router CPU establish safe production headroom.</aside>
+  <p>Routing telemetry's actual process RSS and cgroup memory are separate from Docker usage.
+    For example, the first LP placement records collector 2 at 52,453,376 RSS bytes, 15,106,048 cgroup-memory bytes,
+    and 1,000 effective CPU millicores. These fields intentionally remain distinct; they are not interchangeable
+    measures of resident allocation or host capacity.</p>
+</section>
+
+<section id="migration" aria-labelledby="migration-title">
+  <h2 id="migration-title">8. Migration and process scaling</h2>
+  <ol class="steps">
+    <li><strong>1 · Preparing</strong>Operator requests a move. Controller selects an eligible target; target confirms schema and dependencies.</li>
+    <li><strong>2 · Draining</strong>Source barrier blocks new RPCs. Already admitted streams finish and buffered work publishes under the exact source lineage.</li>
+    <li><strong>3 · Activating</strong>After confirmed SQL release, target receives a greater routing epoch but remains fenced until its SQL publication lease activates.</li>
+    <li><strong>4 · Complete</strong>Target acknowledgement makes the route Active; new work can publish on the new owner. Ambiguous release never forces transfer.</li>
+  </ol>
+  <p>The drain barrier and local stream entry share one mutex, preventing a new local admission racing a zero-active
+    check. Source completion requires table work and conservative buffer/Quiver backlog to drain. Admitted-work
+    publication and renewal of the <strong>separate SQL fence</strong> survive routing Draining only for the exact
+    holder/epoch. The source releases SQL before acknowledging release; the target acquires SQL before acknowledging
+    activation. Retry/observation uses the acknowledged migration record, not a second requested move.</p>
+  <div class="table-scroll" role="region" aria-label="Observed lifecycle outcomes" tabindex="0"><table>
+    <caption>Lifecycle observations from retained successful runs (not latency guarantees)</caption>
+    <thead><tr><th scope="col">Exercise</th><th scope="col">Measured result</th><th scope="col">Meaning / boundary</th></tr></thead>
+    <tbody>
+      <tr><th scope="row">Controlled full-run table move</th><td><code>sqlserver_active_sessions</code>, routing epoch 1 → 2; activation observer 6.842701947 s.</td><td>Active target lease plus subsequent successful target work proves completion. Initial Preparing ACK alone does not.</td></tr>
+      <tr><th scope="row">Collector 4 becomes useful</th><td>Registration-observed → first receipt 3,609 ms; process start → first receipt 9,177 ms.</td><td>Observation intervals, not exact server registration latency. New table assignments actually reached the fourth collector.</td></tr>
+      <tr><th scope="row">Inbound existing-table migration</th><td><code>sqlserver_availability_group_states</code> into collector 4, epoch 1 → 2; 3.077763141 s.</td><td>Controlled move under bounded pressure on the old pool; capacity addition alone did not rebalance it.</td></tr>
+      <tr><th scope="row">Collector 4 evacuation / removal</th><td>Four owned tables evacuated; observed activations 2.998166584, 3.035765754, 1.840815362 and 3.145646448 s.</td><td>Tables: availability-group states, common/detailed performance counters, storage I/O. Removal waits for zero ownership and fresh zero aggregate work; topology returned to three.</td></tr>
+      <tr><th scope="row">Two data routers</th><td>12 successful streams through each ingress (24 total); same owners/epochs. Added router's active-stream gauge reached 1.</td><td>Actual 1 → 2 process scale-out; extra ingress did not create a second placement authority or shard a table.</td></tr>
+      <tr><th scope="row">Router 2 admitted-stream drain</th><td>1 stream, 768 rows, 24 completed batches; terminal 6,205.847313 ms; elapsed/reconciliation 11.044331 s.</td><td>Published and reconciled, worker exited successfully; actual router count returned to one. Not a maximum supported stream lifetime.</td></tr>
+      <tr><th scope="row">Controller-only restart</th><td>Fresh collector telemetry, unchanged established ownership and successful existing-table publication.</td><td>Collectors remained alive; this does not show arbitrary all-process recovery with expired SQL lineage.</td></tr>
+      <tr><th scope="row">Live bounded-drain check (separate run)</th><td>Short observer timed out while source remained admitted; new RPC rejected with no receipt; admitted stream published 48 receipts / 1,536 rows; target later Active at epoch 4.</td><td>Router draining-failure counter 0 → 1 independently corroborated rejection. No forced source removal, reassignment or upload replay.</td></tr>
+      <tr><th scope="row">Rust-native interoperability (separate run)</th><td>11 logical batches, 88 rows / 11 published receipts; Delta row count 7,044 → 7,132 with other writers quiescent.</td><td>Confirms the existing Rust native wire path; legacy SQL routing export is not proof of disk ownership.</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small">Activation durations include observer polling and workflow progress; they do not isolate the exact
+    new-admission interruption window. Migration requires fresh telemetry, target improvement and cooldown except
+    deliberate retirement/evacuation. A blocked or timed-out observer is not permission to stop the source,
+    delete routing state or advance an epoch manually.</p>
+</section>
+
+<section id="limits" aria-labelledby="limits-title">
+  <h2 id="limits-title">9. Validation, retained failures and open limits</h2>
+  <h3>Checks already recorded by the implementation run</h3>
+  <p><strong>168 Rust tests passed, 0 failed; 8 opt-in Rust tests ignored.</strong> Separately, the latest
+    four-package run recorded 84 passed / 7 ignored. Python default discovery recorded 10 passed with
+    5 live checks skipped; explicit live-root discovery subsequently passed all 5 real-stack checks:
+    valid publication, bad edge HMAC, unsupported protocol, wrong wire schema, and bounded draining/new-RPC
+    rejection. Locked build, strict Clippy (<code>-D warnings</code>), formatting and whitespace checks passed.
+    The ignored Rust checks did not become passes merely because the Python live checks ran.</p>
+  <h3>Retained incidents are part of the result</h3>
+  <aside class="note warning"><strong>Uncertain authority commit: unresolved original cause.</strong>
+    An earlier project entered uncertain commit state and failed closed. Disk reopen preserved lineage, but the
+    prolonged outage invalidated SQL handles. That project remained safely unavailable after SQL handles expired;
+    it did <strong>not</strong> automatically recover. Successful fresh projects do not prove automatic recovery of
+    this incident. The original cause remains unproven.</aside>
+  <ul>
+    <li><strong>Admitted stream interrupted by the original one-second Pingora grace.</strong> That attempt had
+      terminal failure and is not counted as a successful pilot. The corrected harness gives requests 65 seconds
+      of grace before runtime teardown, with a 95-second scoped stop. Fresh admitted-stream drain passed;
+      an overlong stream may still fail honestly.</li>
+    <li><strong>Native worker shutdown was not inferred from report contents.</strong> An earlier worker aborted
+      after a successful-looking report. Zero fragment readahead then stalled a scan. The corrected scan disables
+      threaded scanning/batch prefetch, retains at most one current fragment and explicitly releases native objects.
+      Fresh successful workers exited zero; the failed attempts remain retained.</li>
+    <li><strong>Earlier live-check assertions failed.</strong> Native early rejection can be a stream reset rather
+      than descriptive Flight text; corrected checks use reason counters and no-admission evidence. An earlier
+      admitted source had no saved receipt ledger, so no full client accounting claim is made for that source.</li>
+    <li><strong>Rust smoke initially probed an unselected Dataflow service.</strong> The capability probes were
+      scoped to selected scenarios; the corrected native smoke reconciled 88 rows. No Dataflow deployment was
+      needed or established by that fix.</li>
+  </ul>
+  <h3>What remains unestablished</h3>
+  <ul>
+    <li>No production SLO, maximum throughput, safe concurrency ceiling, long-duration stability or rare-tail
+      distribution. These small synthetic, sequential samples have no confidence intervals or randomized trial order.</li>
+    <li>No additional physical capacity from same-host containers; SQL, Hive, disk, generator and independent scans
+      all contend for resources. No isolated proxy-only speed or comparison with another proxy.</li>
+    <li>No HA/election, automatic rebalance, transparent replay, arbitrary process-restart recovery or exactly-once guarantee.</li>
+    <li>No forced host power loss or forced fsync-error experiment. Focused checks cover write/rename/uncertainty
+      handling and acknowledged restart lineage, not every storage failure mode.</li>
+    <li>No claim that stale health is safe to reuse or that target SQL activation can be skipped after a disk transfer.
+      Single-controller availability and single-owner hot tables remain architectural constraints.</li>
+  </ul>
+</section>
+
+<section id="reproduce" aria-labelledby="reproduce-title">
+  <h2 id="reproduce-title">10. Reproduce without destroying retained state</h2>
+  <p>Commands below are documentation, not actions executed to create this report. Run from the repository root,
+    with the pinned submodules, Docker and existing Python dependencies available. Follow the
+    <a href="README.md">benchmark README</a> for binary staging/stripping and SDK rustfmt shared-library staging
+    before <code>stack.py up</code>. Do not substitute <code>nx run loadtest:run</code>: its lifecycle is destructive
+    and different. Unique project names and unused private /24 networks are required.</p>
+  <pre><code>git submodule update --init --recursive
+CARGO_BUILD_JOBS=2 cargo build --locked \
+  -p arrowcol-rust -p arrowcol-router-rust -p arrowcol-loadgen -p arrowcol-sdk-gen
+# Stage the binaries and SDK toolchain exactly as described in README.md.
+
+python3 projects/loadtest/routing-benchmark/stack.py prepare \
+  --project pingora-bench-report-lp --subnet 10.198.61.0/24 --policy least_pressure
+ROOT=target/routing-benchmark/pingora-bench-report-lp
+python3 projects/loadtest/routing-benchmark/stack.py up --root "$ROOT"
+python3 projects/loadtest/routing-benchmark/stack.py schemas --root "$ROOT"
+python3 projects/loadtest/routing-benchmark/experiment.py --root "$ROOT" --scenario all
+python3 projects/loadtest/routing-benchmark/stack.py stop --root "$ROOT"
+
+# A DIFFERENT fresh project/dataset for the five matched phases:
+python3 projects/loadtest/routing-benchmark/stack.py prepare \
+  --project pingora-bench-report-wr --subnet 10.198.62.0/24 --policy weighted_rendezvous
+ROOT=target/routing-benchmark/pingora-bench-report-wr
+python3 projects/loadtest/routing-benchmark/stack.py up --root "$ROOT"
+python3 projects/loadtest/routing-benchmark/stack.py schemas --root "$ROOT"
+python3 projects/loadtest/routing-benchmark/experiment.py \
+  --root "$ROOT" --scenario cold-warm-pressure
+python3 projects/loadtest/routing-benchmark/stack.py stop --root "$ROOT"</code></pre>
+  <p>Example names/networks above are new-run placeholders, not the recorded projects. The actual retained runs are
+    <code>pingora-bench-least-complete/evidence/all-7cc1ccf2</code> and
+    <code>pingora-bench-weighted-final/evidence/cold-warm-pressure-1ef2b45a</code>. Do not rerun cold placement
+    on them or overwrite them. State preservation is not automatic collector-process recovery.</p>
+  <pre><code># Existing focused checks, not throughput samples:
+python3 -m unittest discover -s projects/loadtest/routing-benchmark -p 'test_*.py' -v
+CARGO_BUILD_JOBS=2 cargo test --locked \
+  -p arrowcol-routing -p arrowcol-rust -p arrowcol-router-rust -p arrowcol-loadgen
+# On a prepared RUNNING stack, after cold-placement timing:
+ARROWCOL_BENCHMARK_LIVE_ROOT="$ROOT" python3 -m unittest discover \
+  -s projects/loadtest/routing-benchmark -p 'test_live.py' -v
+python3 projects/loadtest/routing-benchmark/stack.py rust-smoke --root "$ROOT"</code></pre>
+  <p>Live checks/smoke need a running stack; do them before its documented stop, and quiesce other writers for
+    the Rust count-delta check. <code>stop</code> includes scale profiles but preserves state, secrets, results and
+    volumes. There is no implicit reset/global cleanup. <code>configure</code> preserves secrets/snapshots and must
+    not run concurrently with a workload; adding a process uses <code>--no-deps</code> to avoid recreating router 1.</p>
+</section>
+
+<section id="references" aria-labelledby="references-title">
+  <h2 id="references-title">11. Source and evidence index</h2>
+  <p>The measured summary is embedded above so this report remains readable without runtime artifacts.
+    Relative source links refer to this worktree's implementation snapshot, which was not committed when the
+    evidence was produced (baseline <code>07e166dba6d88426746ed971ade25f1b1631c66c</code>).
+    <strong>Target evidence is local-only, ignored output, not checked-in report dependencies.</strong>
+    It may be absent in another checkout; its links are explicitly marked below. Do not publish task secrets,
+    signed headers or unreviewed raw configuration alongside the report.</p>
+  <div class="table-scroll" role="region" aria-label="Source and evidence references" tabindex="0"><table>
+    <caption>Concise traceability map</caption>
+    <thead><tr><th scope="col">Topic</th><th scope="col">References relative to this report</th></tr></thead>
+    <tbody>
+      <tr><th scope="row">Commands / harness</th><td><a href="README.md">README</a>,
+        <a href="stack.py">stack.py</a>, <a href="experiment.py">experiment.py</a>,
+        <a href="Dockerfile">runtime Dockerfile</a>, <a href="../compose.yaml">base Compose services</a></td></tr>
+      <tr><th scope="row">Client / measurement</th><td><a href="native.py">native Flight + reconciliation</a>,
+        <a href="workload.py">finite worker reports</a>, <a href="locustfile.py">Locust native-thread scheduling</a>,
+        <a href="test_live.py">live contracts</a></td></tr>
+      <tr><th scope="row">Authority / selection</th><td><a href="../../../crates/arrowcol-routing/src/disk.rs">disk.rs</a>,
+        <a href="../../../crates/arrowcol-routing/src/control.rs">control API</a>,
+        <a href="../../../crates/arrowcol-routing/src/selection.rs">selection.rs</a>,
+        <a href="../../../crates/arrowcol-routing/src/model.rs">pressure / lease model</a>,
+        <a href="../../../crates/arrowcol-routing/src/migration.rs">migration states</a></td></tr>
+      <tr><th scope="row">Router / collector</th><td><a href="../../arrowcol-router-rust/src/main.rs">router startup roles</a>,
+        <a href="../../arrowcol-router-rust/src/router.rs">Pingora data plane</a>,
+        <a href="../../arrowcol-rust/src/control.rs">collector drain/migration</a>,
+        <a href="../../arrowcol-rust/src/lease.rs">SQL publication lease handling</a>,
+        <a href="../../arrowcol-rust/src/auth.rs">collector identity/admission</a>,
+        <a href="../../../Cargo.lock">locked dependency versions</a></td></tr>
+      <tr><th scope="row">Local-only evidence summaries</th><td>
+        <a data-local-evidence href="../../../target/routing-benchmark/final-implementation-evidence.json">Implementation manifest / checks / retained failures</a>;
+        <a data-local-evidence href="../../../target/routing-benchmark/final-matched-policy-evidence.json">matched five-phase measurements</a>;
+        <a data-local-evidence href="../../../target/routing-benchmark/final-image-binary-provenance.json">image / binary provenance</a></td></tr>
+      <tr><th scope="row">Local-only raw successful runs</th><td>
+        <a data-local-evidence href="../../../target/routing-benchmark/pingora-bench-least-complete/evidence/all-7cc1ccf2/">LP full run</a>;
+        <a data-local-evidence href="../../../target/routing-benchmark/pingora-bench-weighted-final/evidence/cold-warm-pressure-1ef2b45a/">WR matched run</a>.
+        Each contains per-phase <code>report.json</code>, <code>streams.jsonl</code>, settings, authority snapshots,
+        controller logs and named resource intervals.</td></tr>
+      <tr><th scope="row">Local-only separate checks / incident</th><td>
+        <a data-local-evidence href="../../../target/routing-benchmark/pingora-bench-least-final/evidence/live-admission-0f2890f4/">passing live checks</a>;
+        <a data-local-evidence href="../../../target/routing-benchmark/pingora-bench-least-final/prepared/rust-native-smoke-d407f469/">Rust interoperability</a>;
+        <a data-local-evidence href="../../../target/routing-benchmark/pingora-bench-validation/evidence/blocked-after-uncertain-authority.json">retained uncertain-authority incident</a>.
+        Earlier failed drain/worker/check attempts remain indexed by the implementation manifest.</td></tr>
+    </tbody>
+  </table></div>
+</section>
+</main>
+<footer>Prepared for technical architecture review · Evidence date: 24 October 2026 UTC ·
+  Measured observations, not performance guarantees · <a href="#main">Back to report</a></footer>
+</body>
+</html>

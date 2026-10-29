@@ -14,7 +14,9 @@ use arrowcol_flight::{
 };
 use arrowcol_protocol::CollectorInstanceId;
 use arrowcol_receipts::{ReceiptStore, SqlServerReceiptConfig, SqlServerReceiptStore};
-use arrowcol_routing::{CollectorState, RoutingStore, SqlServerRoutingConfig, SqlServerRoutingStore};
+use arrowcol_routing::{
+    CollectorState, RemoteRoutingStore, RoutingStore, SqlServerRoutingConfig, SqlServerRoutingStore,
+};
 use arrowcol_sql_server::{ConnectionConfig, PoolConfig, SqlPool};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -141,20 +143,27 @@ pub async fn run(config: CollectorConfig) -> Result<RunOutcome> {
         )
         .with_pool(receipt_pool.clone())?,
     );
-    let routing_store: Arc<dyn RoutingStore> = Arc::new(
-        SqlServerRoutingStore::new(
-            SqlServerRoutingConfig::new(
-                &config.sql_server.host,
-                config.sql_server.port,
-                &config.sql_server.database,
-                &config.sql_server.username,
-                password,
+    let routing_store: Arc<dyn RoutingStore> = if let Ok(endpoint) = std::env::var("ARROWCOL_CONTROLLER_ENDPOINT") {
+        let token_file =
+            std::env::var("ARROWCOL_CONTROL_TOKEN_FILE").context("controller endpoint requires control token file")?;
+        let token = std::fs::read_to_string(token_file).context("read collector private control token")?;
+        Arc::new(RemoteRoutingStore::new(&endpoint, token)?)
+    } else {
+        Arc::new(
+            SqlServerRoutingStore::new(
+                SqlServerRoutingConfig::new(
+                    &config.sql_server.host,
+                    config.sql_server.port,
+                    &config.sql_server.database,
+                    &config.sql_server.username,
+                    password,
+                )
+                .trust_server_certificate(config.sql_server.trust_server_certificate)
+                .with_timeouts(sql_connect, sql_command),
             )
-            .trust_server_certificate(config.sql_server.trust_server_certificate)
-            .with_timeouts(sql_connect, sql_command),
+            .with_pool(routing_pool.clone())?,
         )
-        .with_pool(routing_pool.clone())?,
-    );
+    };
 
     let drain = DrainController::new();
     let metrics = CollectorMetrics::new()?;

@@ -1046,6 +1046,8 @@ mod tests {
         let zero = PressureGauge::new(Measurement::ZERO, PositiveMeasurement::new(2)?)?;
         store
             .publish_pressure(&RichPressureSnapshot {
+                container_memory: None,
+                effective_cpu_millicores: None,
                 instance_id,
                 observed_at_unix_ms: now,
                 cpu_utilization_bps: BasisPoints::new(0)?,

@@ -1133,6 +1133,8 @@ fn pressure_from_row(
         )
     })?;
     Ok(RichPressureSnapshot {
+        container_memory: None,
+        effective_cpu_millicores: None,
         instance_id,
         observed_at_unix_ms: unix_millis(observed)?,
         cpu_utilization_bps: basis_points(required_i16(row, "cpu_utilization_bps")?)?,

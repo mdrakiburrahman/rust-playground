@@ -578,6 +578,7 @@ pub struct RouterControlLoop {
     routing: Arc<RoutingEngine>,
     metrics: RouterMetrics,
     interval: Duration,
+    refresh_only: bool,
 }
 
 impl RouterControlLoop {
@@ -588,7 +589,15 @@ impl RouterControlLoop {
             routing,
             metrics,
             interval,
+            refresh_only: false,
         }
+    }
+
+    /// Disables autonomous movement for controller-owned local benchmarks.
+    #[must_use]
+    pub const fn with_refresh_only(mut self, enabled: bool) -> Self {
+        self.refresh_only = enabled;
+        self
     }
 }
 
@@ -597,7 +606,14 @@ impl BackgroundService for RouterControlLoop {
     async fn start(&self, mut shutdown: ShutdownWatch) {
         loop {
             match now_unix_millis() {
-                Ok(now) => match self.routing.rebalance(now).await {
+                Ok(now) => match if self.refresh_only {
+                    self.routing
+                        .refresh(now)
+                        .await
+                        .map(|_| arrowcol_routing::RebalanceReport::default())
+                } else {
+                    self.routing.rebalance(now).await
+                } {
                     Ok(report) => {
                         self.metrics.refresh(true);
                         self.metrics.lease_event("drain_started", report.drains_started);

@@ -1,0 +1,36 @@
+[package]
+name = "arrowcol-authority"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Explicit same-host no-WAL Flight/etcd manifest publication experiment"
+
+[dependencies]
+anyhow.workspace = true
+arrow = { version = "58.3", default-features = false, features = ["ipc"] }
+arrow-flight = { version = "58.3", default-features = false }
+arrowcol-protocol = { path = "../arrowcol-protocol" }
+arrowcol-sql-server = { path = "../arrowcol-sql-server" }
+arrow-deltalake = { path = "../arrow-deltalake" }
+async-trait = "0.1"
+axum = "0.8"
+base64 = "0.22"
+bytes = "1"
+clap = { workspace = true, features = ["derive", "env"] }
+futures = "0.3"
+hmac = "0.12"
+libc = "0.2"
+parquet = { version = "58.3", default-features = false, features = ["arrow", "snap"] }
+prost = "0.14"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = "0.1"
+tonic = "0.14"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[lints]
+workspace = true

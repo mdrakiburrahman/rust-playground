@@ -96,11 +96,15 @@ impl BatchAdmission for DirectAdmission {
             .activity
             .enter(context.metadata().table().clone())
             .map_err(|_| RuntimeError::internal())?;
+        let handle = self
+            .leases
+            .lease_for(validation.registered().table_id(), context.metadata().table())
+            .await
+            .map_err(|_| lease_runtime_error())?;
         Ok(Box::new(DirectStream {
             receipts: Arc::clone(&self.receipts),
             buffer: Arc::clone(&self.buffer),
             quiver: self.quiver.clone(),
-            leases: Arc::clone(&self.leases),
             owner: self.owner,
             validation,
             receipt_lease_duration: self.receipt_lease_duration,
@@ -109,6 +113,7 @@ impl BatchAdmission for DirectAdmission {
             emitted_receipts: 0,
             pending_receipt: None,
             _activity: activity,
+            publication_handle: handle,
         }))
     }
 }
@@ -117,7 +122,6 @@ struct DirectStream {
     receipts: Arc<dyn ReceiptStore>,
     buffer: Arc<BufferManager>,
     quiver: Option<Arc<QuiverStage>>,
-    leases: Arc<TableLeaseManager>,
     owner: CollectorInstanceId,
     validation: ValidatedIncomingSchema,
     receipt_lease_duration: Duration,
@@ -126,6 +130,7 @@ struct DirectStream {
     emitted_receipts: u64,
     pending_receipt: Option<ReceiptVersion>,
     _activity: ActiveTableStream,
+    publication_handle: Arc<crate::lease::TableLeaseHandle>,
 }
 
 #[async_trait]
@@ -150,11 +155,7 @@ impl StreamLifecycle for DirectStream {
                 .check_admissible(delivery.table_id(), rows, bytes, 1)
                 .map_err(|error| buffer_runtime_error(&error))?;
         }
-        let handle = self
-            .leases
-            .lease_for(delivery.table_id(), delivery.table())
-            .await
-            .map_err(|_| lease_runtime_error())?;
+        let handle = &self.publication_handle;
         let lease = handle.current().map_err(|_| lease_runtime_error())?;
         if lease.holder_instance_id() != self.owner {
             return Err(lease_runtime_error());

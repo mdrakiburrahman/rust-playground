@@ -12,6 +12,7 @@ publish = false
 
 [dependencies]
 anyhow.workspace = true
+arrowcol-authority = { path = "../../crates/arrowcol-authority" }
 arrowcol-protocol = { path = "../../crates/arrowcol-protocol" }
 arrowcol-receipts = { path = "../../crates/arrowcol-receipts" }
 arrowcol-routing = { path = "../../crates/arrowcol-routing" }

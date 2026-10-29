@@ -218,7 +218,8 @@ impl CollectorAuthenticator {
             || lease.lease_id != lease_id
             || lease.fencing_epoch != fencing_epoch
             || lease.lease_version != lease_version
-            || lease.expires_at_unix_ms != expires_at
+            || expires_at > lease.expires_at_unix_ms
+            || expires_at <= now
         {
             return Err(lease_fenced("routing lease no longer belongs to this collector"));
         }

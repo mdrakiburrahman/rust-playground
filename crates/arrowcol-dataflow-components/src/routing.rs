@@ -435,6 +435,8 @@ mod tests {
             PressureGauge::new(Measurement::ZERO, PositiveMeasurement::new(4).expect("positive")).expect("gauge");
         store
             .publish_pressure(&RichPressureSnapshot {
+                container_memory: None,
+                effective_cpu_millicores: None,
                 instance_id: holder,
                 observed_at_unix_ms: time(1),
                 cpu_utilization_bps: BasisPoints::new(0).expect("bps"),

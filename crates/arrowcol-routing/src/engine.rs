@@ -142,6 +142,12 @@ impl RoutingEngine {
                 "routing cache has not completed an initial load",
             )
         })?;
+        if now.get().saturating_sub(view.loaded_at_unix_ms.get()) > self.policy.readiness_max_staleness_ms {
+            return Err(RoutingError::new(
+                RoutingErrorKind::PoolUnavailable,
+                "routing cache is stale",
+            ));
+        }
 
         if let Some(lease) = view.leases.get(&key) {
             if lease.is_routable_at(now) {
@@ -199,6 +205,12 @@ impl RoutingEngine {
                 "routing cache has not completed an initial load",
             )
         })?;
+        if now.get().saturating_sub(view.loaded_at_unix_ms.get()) > self.policy.readiness_max_staleness_ms {
+            return Err(RoutingError::new(
+                RoutingErrorKind::PoolUnavailable,
+                "routing cache is stale",
+            ));
+        }
         let instance_id = rank_collectors(&view, &key, now, &self.policy, true)
             .into_iter()
             .next()

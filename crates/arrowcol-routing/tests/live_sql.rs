@@ -549,6 +549,8 @@ fn snapshot(
     let buffered_batches = if drained { 0 } else { 1 };
     let oldest_buffer_age_ms = if drained { 0 } else { 10 };
     Ok(RichPressureSnapshot {
+        container_memory: None,
+        effective_cpu_millicores: None,
         instance_id,
         observed_at_unix_ms: observed_at,
         cpu_utilization_bps: BasisPoints::new(cpu_bps)?,

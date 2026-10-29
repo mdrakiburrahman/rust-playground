@@ -700,6 +700,8 @@ fn upstream_config() -> UpstreamConfig {
 
 fn snapshot(instance_id: CollectorInstanceId, observed_at: UnixMillis) -> anyhow::Result<RichPressureSnapshot> {
     Ok(RichPressureSnapshot {
+        container_memory: None,
+        effective_cpu_millicores: None,
         instance_id,
         observed_at_unix_ms: observed_at,
         cpu_utilization_bps: BasisPoints::new(100)?,
