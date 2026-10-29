@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 
 import { BENCHMARK_PROJECT } from '../src/cli.js';
 import { deltaTableLocations } from '../src/main.js';
-import { acquireBenchmarkController, benchmarkDirectories, checkedBenchmarkPath, resetBenchmark, stopBenchmark } from '../src/lifecycle.js';
+import { acquireBenchmarkController, benchmarkDirectories, checkedBenchmarkPath, discardUnsealedAttempts, resetBenchmark, stopBenchmark } from '../src/lifecycle.js';
 import { attemptFixture } from './attempt-fixture.js';
 import { fixtureDirectory } from './fixture-directory.js';
 
@@ -206,6 +206,25 @@ test('starting again removes only already sealed output and owned SQL, Hive and 
   await attemptFixture(workspace).seal();
   assert.equal(await resetBenchmark(workspace, docker), latest);
   assert(!existsSync(path.join(latest, 'second.json')));
+});
+
+test('discard quarantines only unsealed attempts intact, after which start may reset', async t => {
+  const workspace = fixture(t);
+  const latest = path.join(workspace, 'onelake/benchmark/latest');
+  const unsealed = path.join(workspace, 'onelake/benchmark/azure-run');
+  mkdirSync(path.join(unsealed, 'results'), { recursive: true });
+  writeFileSync(path.join(unsealed, 'results/provenance.json'), '{"evidence":true}');
+  await attemptFixture(workspace).seal();
+  const { docker } = mockDocker(workspace);
+  await assert.rejects(resetBenchmark(workspace, docker), /incomplete or unsafe/u);
+  const moved = discardUnsealedAttempts(workspace, new Date('2026-01-02T03:04:05.678Z'));
+  const quarantine = path.join(workspace, '.temp/loadtest-discarded/2026-01-02T03-04-05-678Z');
+  assert.deepEqual(moved, [path.join(quarantine, 'azure-run')]);
+  assert.equal(readFileSync(path.join(quarantine, 'azure-run/results/provenance.json'), 'utf8'), '{"evidence":true}');
+  assert(!existsSync(unsealed));
+  assert(existsSync(latest));
+  assert.deepEqual(discardUnsealedAttempts(workspace), []);
+  assert.equal(await resetBenchmark(workspace, docker), latest);
 });
 
 for (const owner of [undefined, '/another-workspace']) {

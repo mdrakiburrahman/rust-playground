@@ -186,6 +186,19 @@ The test runs until **Ctrl+C**. Stopping the generator leaves the stack running
 so you can inspect the charts and output; that unsealed attempt blocks the next
 start rather than allowing its evidence to be silently reset.
 
+To start again after such an attempt (including every Azure run), acknowledge
+the discard explicitly:
+
+```bash
+npx --no-install tsx projects/loadtest/src/main.ts --discard-unsealed
+```
+
+It stops this workspace's stack, then moves each unsealed attempt root intact
+to `.temp/loadtest-discarded/<timestamp>/` (nothing is deleted; sealed attempts
+stay in place). The next start then resets the Docker volumes as usual. It does
+not touch Azure: if an Azure attempt left occupancy or publisher registrations,
+use `infra/azure/bootstrap.py recover` as described in `infra/azure/README.md`.
+
 ## Fenced Azure schema bootstrap
 
 Infrastructure provisioning invokes:

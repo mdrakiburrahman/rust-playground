@@ -27,7 +27,7 @@ import { LocalStressRuntime } from './stress-runtime.js';
 import {
   benchmarkComposeFiles, benchmarkQuiver, buildBenchmarkComposeOverride, buildBenchmarkRuntimeConfigs, dataflowConfigFile,
 } from './runtime-config.js';
-import { acquireBenchmarkController, requirePreviousAttemptEvidence, resetBenchmark, stopBenchmark, stopReceipt, type BenchmarkController } from './lifecycle.js';
+import { acquireBenchmarkController, discardUnsealedAttempts, requirePreviousAttemptEvidence, resetBenchmark, stopBenchmark, stopReceipt, type BenchmarkController } from './lifecycle.js';
 import { azureTargets, modeEnvironment, stageAzureCliConfig, type AzureTargets } from './mode.js';
 import { kustoComposeStartArguments, kustoStatusSummary, readKustoStatus, requireHealthyKusto, safeKustoError, startKusto } from './kusto.js';
 import { kustoExplorerStartArguments, runGrafanaGate, runUiGate } from './ui-gate.js';
@@ -870,7 +870,19 @@ async function benchmark(
 async function main(): Promise<void> {
   const userArguments = process.argv.slice(2);
   if (userArguments.some((argument) => argument === '--help' || argument === '-h')) {
-    console.log(`${benchmarkUsage}\n--stop (stop this workspace's owned services and generator; preserve data)`);
+    console.log(`${benchmarkUsage}\n--stop (stop this workspace's owned services and generator; preserve data)` +
+      `\n--discard-unsealed (stop, then move failed/interrupted/Azure attempts to .temp/loadtest-discarded so the next start can reset)`);
+    return;
+  }
+  if (userArguments.length === 1 && userArguments[0] === '--discard-unsealed') {
+    const controller = await acquireBenchmarkController(workspace);
+    try {
+      await stopBenchmark(workspace, args => run('docker', args));
+      const moved = discardUnsealedAttempts(workspace);
+      console.log(JSON.stringify({ discarded: moved.length, quarantine: moved, dataDeleted: false }));
+    } finally {
+      controller.close();
+    }
     return;
   }
   if (userArguments.length === 1 && userArguments[0] === '--stop') {

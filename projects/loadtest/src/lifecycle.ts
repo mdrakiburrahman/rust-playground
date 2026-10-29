@@ -1,7 +1,7 @@
 import { type ChildProcess } from 'node:child_process';
 import {
   closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readlinkSync,
-  readdirSync, rmSync, statSync, unlinkSync, writeFileSync,
+  readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { hostname } from 'node:os';
 import path from 'node:path';
@@ -303,6 +303,31 @@ export async function stopBenchmark(
 
 export function requirePreviousAttemptEvidence(workspace: string): void {
   for (const directory of benchmarkDirectories(workspace)) requireSealedAttemptEvidence(workspace, directory);
+}
+
+/**
+ * Operator-acknowledged escape hatch for unsealed (failed, interrupted, Azure or nonvalidated)
+ * attempts: moves each unsealed root intact into a private quarantine. Nothing is deleted, and
+ * sealed roots stay in place for the normal reset. The caller stops the stack first.
+ */
+export function discardUnsealedAttempts(workspace: string, now: Date = new Date()): string[] {
+  const quarantine = checkedBenchmarkPath(workspace, path.join(workspace, '.temp/loadtest-discarded',
+    now.toISOString().replace(/[:.]/gu, '-')));
+  const moved: string[] = [];
+  for (const directory of benchmarkDirectories(workspace)) {
+    try {
+      requireSealedAttemptEvidence(workspace, directory);
+      continue;
+    } catch {
+      // Unsealed: quarantine below.
+    }
+    mkdirSync(quarantine, { recursive: true, mode: 0o700 });
+    const target = checkedBenchmarkPath(workspace, path.join(quarantine, path.basename(directory)));
+    if (existsSync(target)) throw new Error(`Refusing to overwrite quarantined attempt ${target}`);
+    renameSync(directory, target);
+    moved.push(target);
+  }
+  return moved;
 }
 
 export async function resetBenchmark(workspace: string, docker: Docker): Promise<string> {
