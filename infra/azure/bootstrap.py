@@ -1419,7 +1419,11 @@ def main(argv=None):
         elif args.command == "recover":
             recover(azure, args.execute, args.stop_command or DEFAULT_STOP_COMMAND)
         elif args.command == "status":
-            reset_inventory(azure)
+            databases, _ = reset_inventory(azure)
+            if not databases:
+                print("Owned infrastructure: present; Kusto database absent (data plane reset). "
+                      "Run provision to recreate it.")
+                return 0
             azure.kql(".show capacity")
             print("Owned infrastructure and Kusto capacity: responsive")
         elif args.command == "stop":

@@ -1984,6 +1984,20 @@ class ProvisionCoordinationTests(unittest.TestCase):
         self.assertEqual(self.azure.metadata["occupancy"], "released")
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_status_reports_reset_data_plane_without_querying_absent_database(self):
+        env = Path(self.directory.name) / ".env"
+        env.write_text(f"AZURE_SUBSCRIPTION_ID={SUB}\n")
+        for databases, expected, queried in (([], "database absent", False),
+                                             ([{"name": "x"}], "responsive", True)):
+            stdout = io.StringIO()
+            with patch.object(b, "Azure", return_value=self.azure), \
+                    patch.object(b, "reset_inventory", return_value=(databases, {})), \
+                    patch.object(self.azure, "kql", create=True) as kql, contextlib.redirect_stdout(stdout):
+                self.assertEqual(b.main(["status", "--env-file", str(env)]), 0)
+            self.assertIn(expected, stdout.getvalue())
+            self.assertEqual(kql.called, queried)
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_dispatched_entrypoints_have_no_effect_while_cleanup_owns_authority(self):
         """Gap 4: cleaning-v1 excludes every public mutator before ARM/KQL/blob I/O."""
         env = Path(self.directory.name) / ".env"
