@@ -14,3 +14,14 @@
 - When changing a script's language or entry point, update every caller, Nx target,
   CI check, fixture and documented command, and preserve its safety invariants and
   regression coverage. Run the relevant tests and TypeScript type checks.
+
+## Documentation
+
+- Keep READMEs succinct and table-first: purpose, setup, commands and expected
+  results. Prefer compact reference tables over long prose or repeated warnings.
+- Move detailed design, safety proofs, limitations and troubleshooting to a
+  focused `docs/<logical-topic>/TOPIC_BEING_DISCUSSED.md` file and link it from the README.
+- Keep essential destructive-operation warnings next to the command. Do not
+  bury prerequisites or safety-critical behavior in a separate document.
+- Reuse existing topic docs, avoid duplicated explanations, and update links
+  and documentation validation when moving content.
