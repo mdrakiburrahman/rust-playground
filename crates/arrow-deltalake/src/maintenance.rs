@@ -47,7 +47,7 @@ pub const MAX_ANCHOR_SKEW_MS: i64 = 5 * 60_000;
 pub const PLAN_APP_PREFIX: &str = "arrowcol.purge.plan.";
 /// Marker that must exist in a disposable test root before short-retention VACUUM.
 pub const DISPOSABLE_TEST_MARKER: &str = ".arrowcol-disposable-test-root";
-/// Minimum VACUUM LITE tombstone retention without the unsafe test override.
+/// Minimum VACUUM LITE tombstone retention without explicit acknowledgement or a test override.
 pub const MIN_VACUUM_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 /// Exclusive upper bound for OPTIMIZE target and output file sizes.
 pub const MAX_TARGET_FILE_BYTES: u64 = 1024 * 1024 * 1024;
@@ -2293,13 +2293,16 @@ impl DeltaTable {
     }
 }
 
-/// VACUUM LITE bounds. Retention below seven days requires the unsafe test
-/// override plus a disposable local root under the system temp directory.
+/// VACUUM LITE bounds. Retention below seven days requires explicit production
+/// acknowledgement, or the test override plus a marked disposable local temp root.
 #[derive(Clone, Debug)]
 pub struct VacuumConfig {
     pub retention_ms: i64,
     /// Explicit wall-clock UTC anchor for the tombstone cutoff.
     pub now_ms: i64,
+    /// Acknowledge that short retention can break old snapshot/QAP readers on
+    /// ordinary local or Azure roots. Does not authorize shorter log retention.
+    pub allow_short_vacuum_retention: bool,
     pub unsafe_allow_short_retention_for_tests: bool,
     pub max_log_files: usize,
     pub max_log_file_bytes: u64,
@@ -2318,6 +2321,7 @@ impl VacuumConfig {
         Self {
             retention_ms,
             now_ms,
+            allow_short_vacuum_retention: false,
             unsafe_allow_short_retention_for_tests: false,
             max_log_files: 100_000,
             max_log_file_bytes: 64 * 1024 * 1024,
@@ -2527,16 +2531,19 @@ struct CommitFacts {
 }
 
 impl DeltaTable {
-    fn check_vacuum_retention(&self, retention_ms: i64, unsafe_override: bool) -> Result<()> {
+    fn check_vacuum_retention(&self, retention_ms: i64, config: &VacuumConfig) -> Result<()> {
         let unsafe_request = |message: &str| Err(fail(MaintenanceErrorKind::UnsafeRequest, message.to_owned()));
         if retention_ms < 0 {
             return unsafe_request("negative retention");
         }
-        if retention_ms >= MIN_VACUUM_RETENTION_MS {
+        if retention_ms >= MIN_VACUUM_RETENTION_MS || config.allow_short_vacuum_retention {
             return Ok(());
         }
-        if !unsafe_override {
-            return unsafe_request("VACUUM retention below 7 days requires the unsafe test override");
+        if !config.unsafe_allow_short_retention_for_tests {
+            return unsafe_request(
+                "VACUUM retention below 7 days requires allow_short_vacuum_retention acknowledgement \
+                 (old snapshot/QAP readers can break), or the disposable-root test override",
+            );
         }
         self.check_disposable_test_root("VACUUM retention")
     }
@@ -2916,7 +2923,7 @@ impl DeltaTable {
     /// # Errors
     /// Rejects unsafe retention, incomplete history, unsupported tables and bounds.
     pub fn plan_vacuum(&self, config: &VacuumConfig) -> Result<VacuumPlan> {
-        self.check_vacuum_retention(config.retention_ms, config.unsafe_allow_short_retention_for_tests)?;
+        self.check_vacuum_retention(config.retention_ms, config)?;
         if config.max_deletes == 0 || config.delete_chunk == 0 {
             return Err(fail(
                 MaintenanceErrorKind::InvalidPlan,
@@ -2985,8 +2992,8 @@ impl DeltaTable {
         control: &MaintenanceControl,
     ) -> Result<MaintenanceReport> {
         plan.header.validate(self)?;
-        self.check_vacuum_retention(plan.retention_ms, config.unsafe_allow_short_retention_for_tests)?;
-        self.check_vacuum_retention(config.retention_ms, config.unsafe_allow_short_retention_for_tests)?;
+        self.check_vacuum_retention(plan.retention_ms, config)?;
+        self.check_vacuum_retention(config.retention_ms, config)?;
         if plan.candidates.len() > config.max_deletes || config.delete_chunk == 0 {
             return Err(fail(MaintenanceErrorKind::InvalidPlan, "plan exceeds the delete bound"));
         }
@@ -4857,6 +4864,101 @@ mod record_durability_tests {
         maintenance.apply_optimize(&plan, &config, &control())?;
         fs::write(root.join(DISPOSABLE_TEST_MARKER), b"")?;
         Ok((directory, root, maintenance))
+    }
+
+    /// Exercise Azure URL resolution and the real VACUUM delete path with an
+    /// injected in-memory object store, without Azure credentials or transport.
+    #[test]
+    fn acknowledged_short_vacuum_on_azure_url_deletes_only_tombstones() -> Result<()> {
+        let (_directory, root, mut table) = tombstoned_table()?;
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let mut pending = vec![root.clone()];
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(directory)? {
+                let path = entry?.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    let key = object_store::path::Path::from_absolute_path(&path)?;
+                    let bytes = fs::read(path)?;
+                    let store = Arc::clone(&store);
+                    shared_executor()?.block_on(async move { store.put(&key, bytes.into()).await })?;
+                }
+            }
+        }
+        let table = Arc::get_mut(&mut table).context("unique maintenance handle")?;
+        let mut url = Url::parse("abfss://data@fixture.dfs.core.windows.net/")?;
+        url.set_path(&format!("{}/", root.display()));
+        table.url = url;
+        table.store = Arc::clone(&store);
+        table.engine = DefaultEngineBuilder::new(Arc::clone(&store))
+            .with_task_executor(shared_executor()?)
+            .build();
+        let now = now_ms()? + 1_000;
+        let mut config = VacuumConfig::new(0, now);
+        assert_eq!(
+            kind_of(&table.plan_vacuum(&config)),
+            Some(MaintenanceErrorKind::UnsafeRequest)
+        );
+        config.unsafe_allow_short_retention_for_tests = true;
+        assert_eq!(
+            kind_of(&table.plan_vacuum(&config)),
+            Some(MaintenanceErrorKind::UnsafeRequest),
+            "the legacy override must not authorize Azure even with a local marker"
+        );
+        config.unsafe_allow_short_retention_for_tests = false;
+        config.allow_short_vacuum_retention = true;
+        for retention_ms in [0, 1, MIN_VACUUM_RETENTION_MS - 1] {
+            let policy = VacuumConfig {
+                retention_ms,
+                ..config.clone()
+            };
+            table.plan_vacuum(&policy)?;
+        }
+        let negative = VacuumConfig {
+            retention_ms: -1,
+            ..config.clone()
+        };
+        assert_eq!(
+            kind_of(&table.plan_vacuum(&negative)),
+            Some(MaintenanceErrorKind::UnsafeRequest)
+        );
+        let active = table.active_state(config.max_active_files)?;
+        assert!(!active.files.is_empty());
+        let plan = table.plan_vacuum(&config)?;
+        assert!(!plan.candidates.is_empty());
+        let unacknowledged = VacuumConfig::new(0, now);
+        assert_eq!(
+            kind_of(&table.apply_vacuum(&plan, &unacknowledged, &control())),
+            Some(MaintenanceErrorKind::UnsafeRequest)
+        );
+        let cancelled = table.apply_vacuum(
+            &plan,
+            &config,
+            &MaintenanceControl::new(Arc::new(AtomicBool::new(true)), None),
+        )?;
+        assert_eq!((cancelled.outcome, cancelled.files_deleted), (Outcome::Partial, 0));
+        let report = table.apply_vacuum(&plan, &config, &control())?;
+        assert_eq!(report.files_deleted, u64::try_from(plan.candidates.len())?);
+        for candidate in &plan.candidates {
+            let key = table.safe_object_path(&candidate.path)?;
+            let store = Arc::clone(&store);
+            assert!(matches!(
+                shared_executor()?.block_on(async move { store.head(&key).await }),
+                Err(object_store::Error::NotFound { .. })
+            ));
+        }
+        for file in &active.files {
+            let key = table.safe_object_path(&file.path)?;
+            let store = Arc::clone(&store);
+            shared_executor()?.block_on(async move { store.head(&key).await })?;
+        }
+        let repeat = table.apply_vacuum(&plan, &config, &control())?;
+        // InMemory::delete returns Ok even when absent; either store response
+        // must preserve idempotent physical effects.
+        assert_eq!(repeat.files_deleted + repeat.files_already_absent, report.files_deleted);
+        assert_eq!(repeat.outcome, Outcome::Deleted);
+        Ok(())
     }
 
     /// Scenario: the log floor rename becomes visible but its file fsync, then

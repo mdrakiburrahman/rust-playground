@@ -73,6 +73,8 @@ pub struct Settings {
     pub purge_retention_ms: Option<i64>,
     pub anchor_ms: Option<i64>,
     pub vacuum_retention_ms: i64,
+    /// Explicit acknowledgement of old snapshot/QAP reader risk; VACUUM only.
+    pub allow_short_vacuum_retention: bool,
     pub unsafe_short_vacuum_for_tests: bool,
     pub optimize: OptimizeConfig,
     /// Minimum commits after the hinted checkpoint before `checkpoint` writes one.
@@ -139,8 +141,11 @@ impl Settings {
         {
             bail!("purge requires --granularity and --purge-retention-secs");
         }
-        if self.purge_retention_ms.is_some_and(|retention| retention <= 0) || self.vacuum_retention_ms < 0 {
-            bail!("retention must be positive");
+        if self.purge_retention_ms.is_some_and(|retention| retention <= 0) {
+            bail!("purge retention must be positive");
+        }
+        if self.vacuum_retention_ms < 0 {
+            bail!("VACUUM retention must not be negative");
         }
         self.optimize.validate()
     }
@@ -165,10 +170,20 @@ pub struct OperationResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub optimize: Option<OptimizeEvidence>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub vacuum: Option<VacuumEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error_kind: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub duration_ms: u64,
+}
+
+/// Effective VACUUM retention and the caller's per-invocation acknowledgements.
+#[derive(Clone, Debug, Serialize)]
+pub struct VacuumEvidence {
+    pub retention_ms: i64,
+    pub allow_short_vacuum_retention: bool,
+    pub unsafe_short_vacuum_for_tests: bool,
 }
 
 /// Exact planner inputs and effective bounds, retained even if applying fails.
@@ -502,6 +517,7 @@ fn run_operation(
         }
         Operation::Vacuum => {
             let mut config = VacuumConfig::new(settings.vacuum_retention_ms, anchor);
+            config.allow_short_vacuum_retention = settings.allow_short_vacuum_retention;
             config.unsafe_allow_short_retention_for_tests = settings.unsafe_short_vacuum_for_tests;
             let plan = table.plan_vacuum(&config)?;
             if settings.apply {
@@ -545,6 +561,11 @@ fn maintain_table(
             applied: settings.apply,
             report: None,
             optimize,
+            vacuum: (operation == Operation::Vacuum).then_some(VacuumEvidence {
+                retention_ms: settings.vacuum_retention_ms,
+                allow_short_vacuum_retention: settings.allow_short_vacuum_retention,
+                unsafe_short_vacuum_for_tests: settings.unsafe_short_vacuum_for_tests,
+            }),
             error_kind: None,
             error: None,
             duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),

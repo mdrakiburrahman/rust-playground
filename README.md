@@ -109,6 +109,15 @@ requests. Local functional results are not Azure QAP performance evidence.
 See the [loadtest guide](projects/loadtest/README.md) for the current CLI,
 credential boundaries, lifecycle commands, and qualification artifacts.
 
+### Experiments
+
+Experiments isolate a behavior with small deterministic fixtures, independent
+oracles and durable evidence; they do not run the lakehouse loadtest.
+
+The [Azure QAP experiment](experiments/azure-qap/README.md) examines whether
+append, OPTIMIZE, old-partition DELETE and physical VACUUM reload unchanged data.
+See the [Azure findings and diagnostic limits](docs/experiments/AZURE_QAP.md).
+
 ### Finite qualification quick start
 
 Run from the repository root in the source devcontainer:

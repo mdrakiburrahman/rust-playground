@@ -19,6 +19,7 @@ export const DOCUMENTS = [
   'docs/operations/TENANT_STREAM.md',
   'docs/operations/DELTA_MAINTENANCE.md',
   'docs/operations/KUSTO_BRIDGE.md',
+  'docs/experiments/AZURE_QAP.md',
   'docs/delivery-verification.md',
   'docs/quiver/README.md',
   'docs/containers/publishing.md',
@@ -30,6 +31,8 @@ export const DOCUMENTS = [
   'projects/kusto-bridge/README.md',
   'projects/otelcol-rust/README.md',
   'bin/quiver-cli/README.md',
+  'bin/arrowcol-experiment/README.md',
+  'experiments/azure-qap/README.md',
   'crates/arrow-deltalake/README.md',
   'crates/arrow-tenant-stream/README.md',
   'crates/delta-maintenance/README.md',
@@ -43,13 +46,14 @@ export const DOCUMENTS = [
   'crates/arrowcol-sdk-gen/README.md',
   'crates/otel-deltalake-exporter/README.md',
   'tools/libs/arrowcol-sdk-gen/README.md',
+  'tools/libs/experiment-kit/README.md',
 ];
 const RUNTIME_ROOTS = [
   'onelake/', 'target/', '.temp/', 'crates/arrowcol-sdk-gen/.temp/',
   'tools/libs/arrowcol-sdk-gen/.temp/', 'projects/loadtest/.temp/',
   'projects/arrowcol-rust/.data/',
 ];
-const PATH_PREFIXES = ['.devcontainer/', '.github/', 'bin/', 'crates/', 'docs/', 'projects/', 'submodules/', 'tools/'];
+const PATH_PREFIXES = ['.devcontainer/', '.github/', 'bin/', 'crates/', 'docs/', 'experiments/', 'projects/', 'submodules/', 'tools/'];
 const EXCLUDED = new Set(['node_modules', 'target', 'submodules', 'onelake', '.temp', '.git']);
 const PROHIBITED: Record<string, RegExp> = {
   'absolute workspace path': new RegExp('/' + 'workspaces' + '/'),

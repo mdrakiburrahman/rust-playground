@@ -86,6 +86,95 @@ fn service(root: &Path) -> Result<Command> {
     Ok(command)
 }
 
+#[test]
+fn ordinary_short_vacuum_requires_explicit_acknowledgement_and_does_not_authorize_pruning() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("events");
+    table(&path)?;
+    let optimized = service(root.path())?
+        .args(["--operation", "optimize", "--sealed-final", "--apply"])
+        .output()?;
+    assert!(
+        optimized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&optimized.stderr)
+    );
+    let anchor = (arrow_deltalake::maintenance::now_ms()? + 1_000).to_string();
+    let vacuum = |extra: &[&str]| -> Result<std::process::Output> {
+        let mut command = Command::cargo_bin("delta-maintenance")?;
+        Ok(command
+            .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
+            .args([
+                "--root",
+                Url::from_directory_path(root.path())
+                    .map_err(|()| anyhow!("URL"))?
+                    .as_str(),
+                "--table",
+                "events",
+                "--operation",
+                "vacuum",
+                "--anchor-ms",
+                &anchor,
+            ])
+            .args(extra)
+            .output()?)
+    };
+    let default = vacuum(&[])?;
+    assert!(default.status.success());
+    let reports = lines(&default.stdout)?;
+    assert_eq!(reports[0]["vacuum"]["retention_ms"], 604_800_000);
+    assert_eq!(reports[0]["vacuum"]["allow_short_vacuum_retention"], false);
+    assert_eq!(reports[0]["report"]["files_deleted"], 0);
+    let unchanged_default = vacuum(&["--allow-short-vacuum-retention"])?;
+    assert!(unchanged_default.status.success());
+    assert_eq!(
+        lines(&unchanged_default.stdout)?[0]["vacuum"]["retention_ms"],
+        604_800_000
+    );
+    for extra in [
+        vec!["--vacuum-retention-secs", "0"],
+        vec!["--vacuum-retention-secs", "0", "--unsafe-short-vacuum-for-tests"],
+    ] {
+        let output = vacuum(&extra)?;
+        assert!(!output.status.success());
+        assert_eq!(lines(&output.stdout)?[0]["error_kind"], "unsafe_request");
+    }
+    let negative = vacuum(&["--vacuum-retention-secs=-1", "--allow-short-vacuum-retention"])?;
+    assert_eq!(negative.status.code(), Some(2), "negative durations fail CLI parsing");
+    let acknowledged = vacuum(&[
+        "--vacuum-retention-secs",
+        "0",
+        "--allow-short-vacuum-retention",
+        "--apply",
+    ])?;
+    assert!(
+        acknowledged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&acknowledged.stderr)
+    );
+    let reports = lines(&acknowledged.stdout)?;
+    assert_eq!(reports[0]["vacuum"]["retention_ms"], 0);
+    assert_eq!(reports[0]["vacuum"]["allow_short_vacuum_retention"], true);
+    assert_eq!(reports[0]["vacuum"]["unsafe_short_vacuum_for_tests"], false);
+    assert_eq!(reports[0]["report"]["files_deleted"], 8);
+    let prune = service(root.path())?
+        .args([
+            "--operation",
+            "prune-log",
+            "--log-retention-secs",
+            "0",
+            "--allow-short-vacuum-retention",
+            "--apply",
+        ])
+        .output()?;
+    assert!(
+        !prune.status.success(),
+        "VACUUM acknowledgement cannot lower log retention"
+    );
+    assert_eq!(lines(&prune.stdout)?[0]["error_kind"], "unsafe_request");
+    Ok(())
+}
+
 /// One-shot final compaction uses the identical planner in dry-run and apply.
 /// Fresh empty-plan evidence, not zero output counters alone, establishes no-op.
 #[test]

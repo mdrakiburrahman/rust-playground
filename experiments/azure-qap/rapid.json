@@ -1,0 +1,12 @@
+{
+  "format": 1,
+  "rowsPerFile": 256,
+  "filesPerPartition": 4,
+  "partitions": 4,
+  "appendBatches": 16,
+  "appendIntervalMs": 1000,
+  "observeSeconds": 10,
+  "sampleIntervalMs": 1000,
+  "qapWaitSeconds": 600,
+  "vacuumRetentionSeconds": 0
+}

@@ -60,6 +60,11 @@ struct Cli {
     anchor_ms: Option<i64>,
     #[arg(long, default_value_t = 7 * 24 * 3600)]
     vacuum_retention_secs: u64,
+    /// DANGER: acknowledge that VACUUM below 7 days (including zero) can break old
+    /// snapshot/QAP readers on ordinary local or Azure roots. Does NOT lower
+    /// log retention or bypass active-file/publication safety checks.
+    #[arg(long)]
+    allow_short_vacuum_retention: bool,
     /// Allow VACUUM retention below 7 days, and log retention below the table's
     /// `delta.logRetentionDuration`, on a marked disposable temp root only.
     #[arg(long)]
@@ -109,6 +114,7 @@ fn settings(cli: Cli) -> Result<Settings> {
         purge_retention_ms: cli.purge_retention_secs.map(millis).transpose()?,
         anchor_ms: cli.anchor_ms,
         vacuum_retention_ms: millis(cli.vacuum_retention_secs)?,
+        allow_short_vacuum_retention: cli.allow_short_vacuum_retention,
         unsafe_short_vacuum_for_tests: cli.unsafe_short_vacuum_for_tests,
         checkpoint_every_commits: cli.checkpoint_every_commits,
         log_retention_ms: cli.log_retention_secs.map(millis).transpose()?,

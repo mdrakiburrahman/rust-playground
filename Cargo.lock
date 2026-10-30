@@ -824,6 +824,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrowcol-experiment"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow 58.4.0",
+ "arrow-deltalake",
+ "arrowcol-buffer",
+ "arrowcol-catalog",
+ "arrowcol-protocol",
+ "arrowcol-receipts",
+ "assert_cmd",
+ "async-trait",
+ "clap",
+ "delta_kernel",
+ "delta_kernel_default_engine",
+ "futures",
+ "object_store",
+ "parquet 58.4.0",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "arrowcol-flight"
 version = "0.1.0"
 dependencies = [

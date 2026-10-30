@@ -1,0 +1,37 @@
+{
+  "name": "experiment-kit",
+  "$schema": "../../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "library",
+  "sourceRoot": "tools/libs/experiment-kit/src",
+  "tags": ["scope:tools", "type:automation"],
+  "targets": {
+    "lint": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "npx --no-install tsc --project tools/libs/experiment-kit/tsconfig.json --noEmit --noUnusedLocals --noUnusedParameters",
+        "cwd": "{workspaceRoot}"
+      }
+    },
+    "typecheck": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "npx --no-install tsc --project tools/libs/experiment-kit/tsconfig.json --noEmit",
+        "cwd": "{workspaceRoot}"
+      }
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "npx --no-install tsx --test tools/libs/experiment-kit/src/*.test.ts",
+        "cwd": "{workspaceRoot}"
+      }
+    },
+    "verify": {
+      "executor": "nx:run-commands",
+      "dependsOn": ["lint", "typecheck", "test"],
+      "options": {
+        "commands": []
+      }
+    }
+  }
+}

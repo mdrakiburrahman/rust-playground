@@ -762,7 +762,8 @@ fn optimize_concurrent_with_separate_process_appends() -> Result<()> {
 }
 
 /// Scenario: tombstones from OPTIMIZE and PURGE, an orphan file and repeated VACUUM LITE.
-/// Guarantees: the 7-day floor and disposable-root proof are enforced, only expired
+/// Guarantees: the default 7-day floor, production acknowledgement and test-root
+/// proof are enforced; zero retention works without a disposable marker, only expired
 /// tombstones absent from the active set are deleted, unpublished files survive,
 /// no Delta commit is written, and repeats treat NotFound as already absent.
 #[test]
@@ -813,7 +814,38 @@ fn vacuum_lite_deletes_only_expired_tombstones() -> Result<()> {
         "marker required"
     );
     fs::write(root.path().join(DISPOSABLE_TEST_MARKER), b"")?;
+    assert_eq!(maintenance.plan_vacuum(&short)?.candidates.len(), 6);
+    fs::remove_file(root.path().join(DISPOSABLE_TEST_MARKER))?;
+    short.unsafe_allow_short_retention_for_tests = false;
+    short.allow_short_vacuum_retention = true;
+    let negative = VacuumConfig {
+        retention_ms: -1,
+        ..short.clone()
+    };
+    assert_eq!(
+        kind(maintenance.plan_vacuum(&negative)),
+        Some(MaintenanceErrorKind::UnsafeRequest)
+    );
     let plan = maintenance.plan_vacuum(&short)?;
+    let unacknowledged = VacuumConfig::new(0, now);
+    assert_eq!(
+        kind(maintenance.apply_vacuum(&plan, &unacknowledged, &control())),
+        Some(MaintenanceErrorKind::UnsafeRequest),
+        "acknowledgement is required again when applying"
+    );
+    assert_eq!(
+        kind(maintenance.apply_vacuum(&plan, &negative, &control())),
+        Some(MaintenanceErrorKind::UnsafeRequest)
+    );
+    let cancelled = maintenance.apply_vacuum(
+        &plan,
+        &short,
+        &MaintenanceControl::new(Arc::new(AtomicBool::new(true)), None),
+    )?;
+    assert_eq!((cancelled.outcome, cancelled.files_deleted), (Outcome::Partial, 0));
+    for path in &tombstoned {
+        assert!(data_path(root.path(), path)?.exists(), "cancelled before delete");
+    }
     let candidates: BTreeSet<_> = plan.candidates.iter().map(|candidate| candidate.path.clone()).collect();
     assert_eq!(candidates, tombstoned);
     let serialized = serde_json::to_string(&MaintenancePlan::Vacuum(plan.clone()))?;
