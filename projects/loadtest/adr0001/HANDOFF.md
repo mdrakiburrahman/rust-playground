@@ -827,3 +827,140 @@ Shared bounded executor integration, actual guarded HTTP workload/fault
 dispatch/reconciliation and corresponding browser effect gates remain
 unfinished. Frontend mutationGate stays false. Frozen measured source/binaries,
 cohort, canonical contracts and frontend packages were untouched.
+
+### User-directed benchmark priority; bridge checkpoint paused
+
+The integrated policy/workload/fault admission source passed 182 full Python
+tests. Its separately frozen workload-v5 prerequisite passed 117 native bridge
+tests and actual four units/65,548 Delta rows, independent bridge/supervisor
+SIGKILL rollback and exact stopped cleanup. All seven binary bindings now
+verify; v4's incomplete five-binary activation binding remains retained.
+Fresh direct policy-v6 passed four native policies/ACKs and nine Delta rows.
+
+Guarded HTTP effects are not fully qualified. HTTP-effects1 completed its four
+policy/restart checks then failed a driver status expectation: unsupported is
+HTTP 503, not 409. HTTP-effects2 corrected that expectation and completed actual
+small/elephant workloads, but its collector fault later reached an explicit
+pre-dispatch `rejected/stale` result. The driver had inspected an earlier
+nonterminal operation record; this is not proof of native fault application.
+Both separate attempts are retained. Latest exact cleanup verified all eight
+containers stopped and port 18780 closed. No runtime/bridge job remains owned
+or active; unqualified browser effects stay disabled.
+
+The user then explicitly prioritized local PoC benchmark numbers for Proposed
+ADR0001 over further bridge/game work. That work is paused, not completed.
+Read-only extraction of the frozen `eec969a5-q20261030b` inputs confirms two
+actually written/visible TableKeys (`main`, `cas`) in all six runs; the third
+configured key `dictionary` was unused. The elephant phase's one written key
+also changes batch size/history and is not a table-count sweep. There is no
+increasing-table-count series or isolated network-throughput/one-way latency
+result in this delivered cohort.
+
+The sanitized handoff is session `files/adr-local-poc-results.md`, with exact
+per-run derived values in `files/adr-rough-measurements.json` (SHA256
+`b6bbcedadf9e569c32b1e3a229b33ed507f318b1dccbd868b8a86196c4f3f90f`).
+It separates finite end-to-end rows/s, censored RPC latency, eventual completion
+and local inclusive service spans, preserves the 53,222 drops/cleanup caveat,
+and proposes a bounded 1/2/8-table sweep without pretending a table-count CLI
+already exists. Parent owns the ADR section update. Frozen benchmark evidence,
+native binaries, canonical contracts and frontend packages remain unchanged.
+
+### Narrow actual-TableKey sweep driver
+
+The user subsequently authorized the proposed minimal measurement.
+`table_count_sweep.py` now exists as a standalone driver; it imports only an
+explicitly selected frozen native harness, not the later bridge modules.
+It verifies the original manifest, four native harness source identities and
+all seven frozen/host binary identities before execution. Six serial cases
+use actual allowlisted TableKeys at cardinalities 1, 2 and 8, alternating arm
+order. Each fresh deployment uses the same nonnullable int64 schema, 8 warm-up
+requests then 24 timed requests, 4,096 rows/request, concurrency 2, three
+collectors and one gateway. No topology changes or fault cases are included.
+Tracing stays on; cgroup sampling is off in both arms. Generated native role
+configurations retain their original file modes after prestart allowlist
+replacement. No native source or executable is changed.
+
+The first separate `eec-ts1` setup hit PermissionError on the generated
+read-only collector configuration; both created resources stopped. Its failed
+artifacts remain. The surgical owner-write/restore repair has a regression;
+all four targeted driver tests pass. The newly frozen `table-sweep-v2` driver
+SHA256 is `1a5aa2398ebf7443cd55fbfaeba2aad66977f93a3fae32dc9acb8f0679ae2d49`.
+Its actual invocation is:
+
+```sh
+timeout --signal=TERM --kill-after=60s 1200 \
+  "$POC_PYTHON" -B "$SWEEP_DRIVER" \
+  --repo "$FROZEN_NATIVE_ROOT" --cohort eec-ts2 \
+  --frozen-cohort eec969a5-q20261030b --subnet-start 207
+```
+
+`POC_PYTHON` is the existing qualified Python environment; `SWEEP_DRIVER` is
+the separately frozen new script, not a file copied over the measured harness.
+`FROZEN_NATIVE_ROOT` contains the exact retained dirty source/binaries and
+original cohort. Reuse requires a new cohort and verified-unused subnet range,
+not replay of the immutable `eec-ts2` directory. Current CLI help lists the
+bounded options; there is no arbitrary payload, endpoint, credential or shell
+input. Actual endpoints are loopback-exposed gRPC with a fresh client/channel
+per request and an isolated Docker upstream.
+
+Every case retains raw attempts privately, verifies exact per-unit SQL
+receipt table/version/digest and ordinary Delta row multisets for every key,
+and bounds preparation attempts at 64/128. Rows/s and logical payload MiB/s
+include completion polling and standard-reader scans. Successful RPC elapsed,
+physical-final-receipt observation, and post-completion reader observation
+stay separate, with nonfinal RPC counts preserved. Gateway stage intervals
+are local inclusive observations, never isolated network measurements.
+Spreading a fixed number of inputs across more tables also shortens per-table
+commit histories; this experiment cannot isolate that effect from routing.
+
+The parent grants each case 180 seconds plus bounded termination cleanup;
+the outer invocation has a 1,200-second deadline. Cleanup targets saved exact
+IDs/start times/images/owner labels, stops only this case's resources, and
+independently verifies stopped state before another case. Failed cases stop
+the series rather than being silently replayed. JSON/CSV outputs are under
+`target/table-count-sweep/COHORT`; private method argv/logs and deployment
+directories must not be blindly published. Final sanitized results are a
+separate handoff, not a relabeling of the nine-phase frozen cohort.
+
+The `eec-ts2` sweep subsequently completed all six cases, overall exit 0.
+Each case verified 32 data receipts plus one schema receipt per actual key
+and 131,072 exact ordinary-reader rows; each of its 64 preparation attempts
+remained below the unchanged 128 bound. All 45 exact saved container IDs
+were independently verified stopped, with the seven native binaries still
+byte-identical. Timed throughput and successful RPC / physical receipt P50s:
+
+| Tables | Arm | Rows/s | Logical MiB/s | RPC P50 ms (n) | Physical receipt observed P50 ms (n) |
+|---|---|---:|---:|---:|---:|
+| 1 | Pingora | 1087.13 | 0.008294 | 6502.13 (20) | 6990.22 (24) |
+| 1 | Flight ADR | 1089.15 | 0.008310 | 5851.87 (18) | 6943.35 (24) |
+| 2 | Pingora | 2288.65 | 0.017461 | 3548.08 (24) | 3379.73 (24) |
+| 2 | Flight ADR | 2352.81 | 0.017950 | 3640.31 (24) | 3432.68 (24) |
+| 8 | Pingora | 3877.21 | 0.029581 | 2090.67 (24) | 1842.11 (24) |
+| 8 | Flight ADR | 3962.83 | 0.030234 | 1862.45 (24) | 1640.82 (24) |
+
+Four Pingora and six ADR one-table RPCs were nonfinal but all completed by
+separate exact-unit receipt resolution, without payload replay. Unresolved
+requests were zero; the censored RPC samples remain distinct from all-unit
+receipt observations. All other timed cases had 24 streaming-final RPCs.
+The fixed total uploads produce per-table Delta versions 32/16/4 at 1/2/8
+tables, so accepted-prefix history and writer/SQL work confound throughput
+scaling; this is not isolated network capacity.
+
+Flight timed local assignment-resolve P50s were 0.03096/0.03521/0.03455 ms
+(24 spans each), and upstream-connect 1.6667/1.7358/1.8219 ms (24 each).
+Pingora assignment spans only cache-miss control resolution while Flight
+wraps its resolve including cached lookup, so these differently bounded
+spans cannot establish a direct transport-speed ratio. No one-way latency,
+wire throughput, exclusive CPU or complete trace coverage is claimed.
+
+The sanitized package is session `files/table-sweep-eec-ts2/`, with concise
+method/results in `README.md`. `results.csv` (1,012 bytes) SHA256 is
+`95c18bc33c210b1ff58dbbfc89bf1a8fc04fc26a28fbacc4e0c8a152cadc6015`;
+`results.json` (159,904 bytes) is
+`f760af74eea9906bfaab63b193e8438e3305789d18284064979d8f7e7630d239`;
+`method.json` (18,705 bytes) is
+`d40a11a1e6fe39e495dafa395baed7bfe708672cd371aec8bce42c03105ce95c`.
+The included driver retains SHA256
+`1a5aa2398ebf7443cd55fbfaeba2aad66977f93a3fae32dc9acb8f0679ae2d49`.
+Parent owns Proposed ADR results integration. Bridge work remains paused,
+frontend mutations false, old PR branch and original frozen cohorts untouched.
