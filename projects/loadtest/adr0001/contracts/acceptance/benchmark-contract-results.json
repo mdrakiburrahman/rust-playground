@@ -1,0 +1,104 @@
+{
+  "passed": true,
+  "inputs_unchanged": true,
+  "sha256": {
+    "exchange.py": "12316899cc51e310dace680c06636a23aef81716af2800703efafe903cc157c8",
+    "benchmark-v1.fixture.json": "1d62d035a5bf2bc8cdea65794697d757b93a4ce61beceba091864f4549f2d7bf",
+    "benchmark-v1.schema.json": "4e0384720d8e2ea7ef5dec9cc719aedbe3be782e83670476fa236234d3333c65"
+  },
+  "cases": [
+    {
+      "case": "canonical-fixture",
+      "passed": true
+    },
+    {
+      "case": "unsupported-version",
+      "passed": true,
+      "rejection_type": "ValidationError"
+    },
+    {
+      "case": "sensitive-unknown-field",
+      "passed": true,
+      "rejection_type": "ValidationError"
+    },
+    {
+      "case": "duplicate-record-id",
+      "passed": true,
+      "rejection_type": "ValueError"
+    },
+    {
+      "case": "duplicate-run-id",
+      "passed": true,
+      "rejection_type": "ValueError"
+    },
+    {
+      "case": "unknown-record-run",
+      "passed": true,
+      "rejection_type": "ValueError"
+    },
+    {
+      "case": "unknown-link-target",
+      "passed": true,
+      "rejection_type": "ValueError"
+    },
+    {
+      "case": "unknown-trace",
+      "passed": true,
+      "rejection_type": "ValueError"
+    },
+    {
+      "case": "negative-duration",
+      "passed": true,
+      "rejection_type": "ValidationError"
+    },
+    {
+      "case": "false-completeness",
+      "passed": true,
+      "rejection_type": "ValueError"
+    },
+    {
+      "case": "cross-run-trace-root",
+      "passed": true,
+      "rejection_type": "ValueError"
+    },
+    {
+      "case": "non-root-trace-target",
+      "passed": true,
+      "rejection_type": "ValueError"
+    },
+    {
+      "case": "cross-clock-parent",
+      "passed": true,
+      "rejection_type": "ValueError"
+    },
+    {
+      "case": "child-outlives-parent",
+      "passed": true,
+      "rejection_type": "ValueError"
+    },
+    {
+      "case": "cyclic-parentage",
+      "passed": true,
+      "rejection_type": "ValueError"
+    },
+    {
+      "case": "derived-without-source",
+      "passed": true,
+      "rejection_type": "ValueError"
+    },
+    {
+      "case": "asynchronous-outliving-work",
+      "passed": true
+    },
+    {
+      "case": "duplicate-json-key",
+      "passed": true,
+      "rejection_type": "ValueError"
+    },
+    {
+      "case": "oversized-file",
+      "passed": true,
+      "rejection_type": "ValueError"
+    }
+  ]
+}

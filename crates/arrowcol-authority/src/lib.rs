@@ -7,8 +7,10 @@ pub mod etcd;
 pub mod flight;
 pub mod local;
 pub mod observation;
+pub mod placement;
 pub mod sql_publication;
 pub mod storage;
+pub mod timing;
 
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -170,6 +172,45 @@ pub struct Manifest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Operation {
+    CatalogPolicy {
+        key: String,
+        revision: i64,
+        fingerprints: Vec<String>,
+        demand: placement::Demand,
+    },
+    Policy {
+        collector: String,
+        writer: Writer,
+        revision: i64,
+        operation: String,
+        excluded: bool,
+        block_streams: bool,
+        retiring: bool,
+    },
+    Observe {
+        writer: Writer,
+        observation: placement::Observation,
+        applied_revision: i64,
+    },
+    OpenStream {
+        key: String,
+        writer: Writer,
+        epoch: u64,
+        stream: String,
+        fingerprint: String,
+    },
+    CloseStream {
+        key: String,
+        writer: Writer,
+        stream: String,
+    },
+    AdmitStream {
+        key: String,
+        writer: Writer,
+        epoch: u64,
+        stream: String,
+        unit: String,
+    },
     PublishDelta {
         key: String,
         writer: Writer,
@@ -250,17 +291,27 @@ impl Client {
     /// # Errors
     /// Returns transport, authorization, schema or authoritative-operation failures.
     pub async fn call(&self, operation: &Operation) -> Result<serde_json::Value> {
-        let response = self
-            .http
-            .post(format!("{}/v1/authority", self.endpoint))
-            .bearer_auth(&self.token)
-            .json(operation)
-            .send()
-            .await
-            .map_err(|error| anyhow::anyhow!("authority unavailable: {error}"))?;
-        let status = response.status();
-        let value: serde_json::Value = response.json().await?;
-        ensure!(status.is_success(), "authority {}: {}", status, value);
-        Ok(value)
+        timing::measure("authority-roundtrip", "downstream_wait", async {
+            let mut request = self
+                .http
+                .post(format!("{}/v1/authority", self.endpoint))
+                .bearer_auth(&self.token)
+                .json(operation);
+            if let Some(context) = timing::current() {
+                request = request.header("x-adr-trace", context.trace);
+                if let Some(parent) = context.parent {
+                    request = request.header("x-adr-parent", parent);
+                }
+            }
+            let response = request
+                .send()
+                .await
+                .map_err(|error| anyhow::anyhow!("authority unavailable: {error}"))?;
+            let status = response.status();
+            let value: serde_json::Value = response.json().await?;
+            ensure!(status.is_success(), "authority {}: {}", status, value);
+            Ok(value)
+        })
+        .await
     }
 }

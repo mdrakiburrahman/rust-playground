@@ -40,8 +40,48 @@ fn setup() -> Result<(Snapshot, Controller, Writer, Writer)> {
             &clock(1),
         )?;
     }
+    for id in ["a", "b", "c"] {
+        let writer = state.members[id].member.writer.clone();
+        apply(
+            &mut state,
+            &Command::Observe {
+                writer,
+                applied_revision: 0,
+                observation: placement::Observation {
+                    demand: placement::Demand {
+                        cpu: 0.1,
+                        memory: 0.1,
+                        throughput: 0.1,
+                    },
+                    capacity: placement::Demand {
+                        cpu: 1.0,
+                        memory: 1.0,
+                        throughput: 1.0,
+                    },
+                    sequence: 1,
+                    allocation_revision: 0,
+                    tables: BTreeMap::new(),
+                    fingerprints: ["fp".to_owned()].into(),
+                },
+            },
+            &clock(1),
+        )?;
+    }
     let a = state.members["a"].member.writer.clone();
     let b = state.members["b"].member.writer.clone();
+    apply(
+        &mut state,
+        &Command::Catalog {
+            controller: c.clone(),
+            key: "table".into(),
+            policy: placement::TablePolicy {
+                revision: 1,
+                fingerprints: vec!["fp".into()],
+                demand: placement::Demand::default(),
+            },
+        },
+        &clock(1),
+    )?;
     apply(
         &mut state,
         &Command::Claim {
@@ -52,16 +92,49 @@ fn setup() -> Result<(Snapshot, Controller, Writer, Writer)> {
         },
         &clock(1),
     )?;
+    assert_eq!(state.tables["table"].record.lifecycle, Lifecycle::Recovering);
+    let identity = state.tables["table"].identity.clone();
+    apply(
+        &mut state,
+        &Command::Activate {
+            table: "table".into(),
+            identity,
+            version: -1,
+        },
+        &clock(1),
+    )?;
     Ok((state, c, a, b))
 }
 fn admit(state: &mut Snapshot, writer: &Writer, unit: &str) -> Result<()> {
+    let epoch = state.tables["table"].record.epoch;
     apply(
         state,
-        &Command::Admit {
+        &Command::OpenStream {
             key: "table".into(),
             writer: writer.clone(),
-            epoch: state.tables["table"].record.epoch,
+            epoch,
+            stream: unit.into(),
+            fingerprint: "fp".into(),
+        },
+        &clock(2),
+    )?;
+    apply(
+        state,
+        &Command::AdmitStream {
+            key: "table".into(),
+            writer: writer.clone(),
+            epoch,
+            stream: unit.into(),
             unit: unit.into(),
+        },
+        &clock(2),
+    )?;
+    apply(
+        state,
+        &Command::CloseStream {
+            key: "table".into(),
+            writer: writer.clone(),
+            stream: unit.into(),
         },
         &clock(2),
     )
@@ -77,6 +150,331 @@ fn proposal(state: &Snapshot, unit: &str) -> Proposal {
         actions: "{\"commitInfo\":{}}\n".into(),
         data: vec![],
     }
+}
+
+#[test]
+fn cold_claim_requires_recovery_and_fresh_capacity() -> Result<()> {
+    let (state, c, a, _) = setup()?;
+    let command = Command::Claim {
+        controller: c,
+        key: "cold".into(),
+        target: a.clone(),
+        operation: "cold".into(),
+    };
+    assert!(apply(&mut state.clone(), &command, &clock(4000)).is_err());
+    let mut next = state.clone();
+    apply(&mut next, &command, &clock(2))?;
+    assert_eq!(next.tables["cold"].record.lifecycle, Lifecycle::Recovering);
+    assert!(
+        apply(
+            &mut next.clone(),
+            &Command::Admit {
+                key: "cold".into(),
+                writer: a,
+                epoch: 1,
+                unit: "unit".into()
+            },
+            &clock(2)
+        )
+        .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn exclusion_and_admission_block_are_distinct_and_revisioned() -> Result<()> {
+    let (mut state, c, a, _) = setup()?;
+    apply(
+        &mut state,
+        &Command::Catalog {
+            controller: c.clone(),
+            key: "table".into(),
+            policy: placement::TablePolicy {
+                revision: 1,
+                fingerprints: vec!["fp".into()],
+                demand: placement::Demand::default(),
+            },
+        },
+        &clock(2),
+    )?;
+    let open = |stream: &str| Command::OpenStream {
+        key: "table".into(),
+        writer: a.clone(),
+        epoch: 1,
+        stream: stream.into(),
+        fingerprint: "fp".into(),
+    };
+    apply(&mut state, &open("existing"), &clock(2))?;
+    let policy = Command::Policy {
+        controller: c.clone(),
+        collector: "a".into(),
+        writer: a.clone(),
+        revision: 0,
+        operation: "exclude".into(),
+        excluded: true,
+        block_streams: false,
+        retiring: false,
+    };
+    apply(&mut state, &policy, &clock(2))?;
+    apply(&mut state, &policy, &clock(2))?;
+    apply(&mut state, &open("after-exclusion"), &clock(2))?;
+    assert!(state.eligible("a", "new-table").is_err());
+    apply(
+        &mut state,
+        &Command::Policy {
+            controller: c.clone(),
+            collector: "a".into(),
+            writer: a.clone(),
+            revision: 1,
+            operation: "block".into(),
+            excluded: true,
+            block_streams: true,
+            retiring: false,
+        },
+        &clock(2),
+    )?;
+    assert!(apply(&mut state.clone(), &open("after-block"), &clock(2)).is_err());
+    apply(
+        &mut state,
+        &Command::AdmitStream {
+            key: "table".into(),
+            writer: a.clone(),
+            epoch: 1,
+            stream: "existing".into(),
+            unit: "one".into(),
+        },
+        &clock(2),
+    )?;
+    assert!(apply(&mut state.clone(), &policy, &clock(2)).is_err());
+    assert!(
+        apply(
+            &mut state,
+            &Command::ApproveRetirement {
+                controller: c,
+                collector: "a".into()
+            },
+            &clock(2)
+        )
+        .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn recovering_reservations_remain_charged_until_activation() -> Result<()> {
+    let (mut state, c, a, b) = setup()?;
+    apply(
+        &mut state,
+        &Command::Reserve {
+            controller: c.clone(),
+            key: "table".into(),
+            target: b.clone(),
+            operation: "move".into(),
+        },
+        &clock(2),
+    )?;
+    assert!(state.tables["table"].reservation.is_some());
+    assert!(state.projected("a", "table")?.cpu > 0.1);
+    assert!(state.projected("b", "table")?.cpu > 0.1);
+    apply(
+        &mut state,
+        &Command::Transfer {
+            controller: c,
+            key: "table".into(),
+            operation: "move".into(),
+            force: false,
+        },
+        &clock(2),
+    )?;
+    assert!(state.tables["table"].reservation.is_some());
+    assert!(admit(&mut state, &a, "late").is_err());
+    let identity = state.tables["table"].identity.clone();
+    apply(
+        &mut state,
+        &Command::Activate {
+            table: "table".into(),
+            identity,
+            version: -1,
+        },
+        &clock(2),
+    )?;
+    assert!(state.tables["table"].reservation.is_none());
+    assert_eq!(state.tables["table"].record.writer, b);
+    Ok(())
+}
+
+#[test]
+fn retirement_waits_for_recovery_even_when_first_successor_fails() -> Result<()> {
+    let (mut state, controller, a, b) = setup()?;
+    apply(
+        &mut state,
+        &Command::Policy {
+            controller: controller.clone(),
+            collector: "a".into(),
+            writer: a.clone(),
+            revision: 0,
+            operation: "retire".into(),
+            excluded: true,
+            block_streams: false,
+            retiring: true,
+        },
+        &clock(2),
+    )?;
+    let mut observation = state.observations["a"].clone();
+    observation.sequence = 2;
+    apply(
+        &mut state,
+        &Command::Observe {
+            writer: a,
+            observation,
+            applied_revision: 1,
+        },
+        &clock(2),
+    )?;
+    apply(
+        &mut state,
+        &Command::Reserve {
+            controller: controller.clone(),
+            key: "table".into(),
+            target: b,
+            operation: "move-b".into(),
+        },
+        &clock(2),
+    )?;
+    apply(
+        &mut state,
+        &Command::Transfer {
+            controller: controller.clone(),
+            key: "table".into(),
+            operation: "move-b".into(),
+            force: false,
+        },
+        &clock(2),
+    )?;
+    let approve = Command::ApproveRetirement {
+        controller: controller.clone(),
+        collector: "a".into(),
+    };
+    assert!(apply(&mut state.clone(), &approve, &clock(2)).is_err());
+    apply(
+        &mut state,
+        &Command::Revoke {
+            controller: controller.clone(),
+            collector: "b".into(),
+        },
+        &clock(2),
+    )?;
+    let target = state.members["c"].member.writer.clone();
+    apply(
+        &mut state,
+        &Command::Reserve {
+            controller: controller.clone(),
+            key: "table".into(),
+            target,
+            operation: "move-c".into(),
+        },
+        &clock(2),
+    )?;
+    apply(
+        &mut state,
+        &Command::Transfer {
+            controller,
+            key: "table".into(),
+            operation: "move-c".into(),
+            force: true,
+        },
+        &clock(2),
+    )?;
+    assert_eq!(state.tables["table"].record.epoch, 3);
+    assert!(apply(&mut state.clone(), &approve, &clock(2)).is_err());
+    let identity = state.tables["table"].identity.clone();
+    apply(
+        &mut state,
+        &Command::Activate {
+            table: "table".into(),
+            identity,
+            version: -1,
+        },
+        &clock(2),
+    )?;
+    apply(&mut state, &approve, &clock(2))?;
+    assert!(state.policies["a"].approved);
+    Ok(())
+}
+
+#[test]
+fn measurement_watermark_does_not_double_charge_active_allocation() -> Result<()> {
+    let (mut state, _, a, _) = setup()?;
+    let reserved = state.projected("a", "table")?;
+    let mut observation = state.observations["a"].clone();
+    observation.sequence = 2;
+    observation.tables.insert("table".into(), placement::Demand::default());
+    observation.allocation_revision = state.tables["table"].activation_revision - 1;
+    apply(
+        &mut state,
+        &Command::Observe {
+            writer: a.clone(),
+            observation: observation.clone(),
+            applied_revision: 0,
+        },
+        &clock(2),
+    )?;
+    assert_eq!(state.projected("a", "table")?, reserved);
+    observation.sequence = 3;
+    observation.allocation_revision = state.tables["table"].activation_revision;
+    apply(
+        &mut state,
+        &Command::Observe {
+            writer: a,
+            observation,
+            applied_revision: 0,
+        },
+        &clock(2),
+    )?;
+    assert_eq!(state.projected("a", "table")?.cpu, 0.1);
+    Ok(())
+}
+
+#[test]
+fn publication_cannot_bypass_revisioned_schema_admission() -> Result<()> {
+    let (mut state, controller, a, _) = setup()?;
+    apply(
+        &mut state,
+        &Command::Admit {
+            key: "table".into(),
+            writer: a.clone(),
+            epoch: 1,
+            unit: "unrevisioned".into(),
+        },
+        &clock(2),
+    )?;
+    let unrevisioned = proposal(&state, "unrevisioned");
+    assert!(apply(&mut state.clone(), &Command::Accept(unrevisioned), &clock(2)).is_err());
+    admit(&mut state, &a, "valid")?;
+    let valid = proposal(&state, "valid");
+    let mut removed = state.clone();
+    removed
+        .tables
+        .get_mut("table")
+        .context("table")?
+        .input_policy
+        .remove("valid");
+    assert!(apply(&mut removed, &Command::Accept(valid.clone()), &clock(2)).is_err());
+    apply(
+        &mut state,
+        &Command::Catalog {
+            controller,
+            key: "table".into(),
+            policy: placement::TablePolicy {
+                revision: 2,
+                fingerprints: vec!["different".into()],
+                demand: placement::Demand::default(),
+            },
+        },
+        &clock(2),
+    )?;
+    assert!(apply(&mut state, &Command::Accept(valid), &clock(2)).is_err());
+    Ok(())
 }
 #[test]
 fn expired_controller_process_and_local_generation_cannot_publish() -> Result<()> {
@@ -333,5 +731,70 @@ fn legacy_configuration_defaults_to_manifest_and_etcd() -> Result<()> {
         "etcd":[],"etcd_user":"","etcd_password":""});
     let config: Config = serde_json::from_value(config)?;
     assert!(config.delta.is_none());
+    Ok(())
+}
+
+#[test]
+fn overload_is_recorded_and_backpressures_new_placement() -> Result<()> {
+    let (mut state, _, a, _) = setup()?;
+    let mut observation = state.observations["a"].clone();
+    observation.sequence += 1;
+    observation.demand.cpu = 1.25;
+    apply(
+        &mut state,
+        &Command::Observe {
+            writer: a,
+            observation,
+            applied_revision: 0,
+        },
+        &clock(2),
+    )?;
+    assert_eq!(state.observations["a"].demand.cpu, 1.25);
+    assert!(state.eligible("a", "new").is_err());
+    Ok(())
+}
+
+#[test]
+fn activation_rechecks_current_schema_capabilities_and_is_idempotent() -> Result<()> {
+    let (mut state, controller, _, b) = setup()?;
+    apply(
+        &mut state,
+        &Command::Reserve {
+            controller: controller.clone(),
+            key: "table".into(),
+            target: b,
+            operation: "move".into(),
+        },
+        &clock(2),
+    )?;
+    apply(
+        &mut state,
+        &Command::Transfer {
+            controller,
+            key: "table".into(),
+            operation: "move".into(),
+            force: false,
+        },
+        &clock(2),
+    )?;
+    let activate = Command::Activate {
+        table: "table".into(),
+        identity: state.tables["table"].identity.clone(),
+        version: -1,
+    };
+    let mut incompatible = state.clone();
+    incompatible
+        .observations
+        .get_mut("b")
+        .context("observation")?
+        .fingerprints
+        .clear();
+    assert!(apply(&mut incompatible, &activate, &clock(2)).is_err());
+    assert!(apply(&mut state.clone(), &activate, &clock(4000)).is_err());
+    apply(&mut state, &activate, &clock(2))?;
+    let activation_revision = state.tables["table"].activation_revision;
+    apply(&mut state, &activate, &clock(3))?;
+    assert_eq!(state.tables["table"].activation_revision, activation_revision);
+    assert_eq!(state.tables["table"].activated_at, 2);
     Ok(())
 }

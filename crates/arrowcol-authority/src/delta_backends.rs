@@ -91,6 +91,9 @@ impl Store for SqlStore {
             &[]).await?.into_row().await?.context("missing authority schema")?;
         let mut state: Snapshot = serde_json::from_str(row.get::<&str, _>(0).context("state payload")?)?;
         let now = row.get::<i64, _>(1).context("DB time")?;
+        state
+            .observations
+            .retain(|id, _| state.observed_at.get(id).is_some_and(|at| now - at <= 3000));
         for m in state.members.values_mut() {
             if m.expires <= now {
                 m.member.eligible = false;
@@ -102,44 +105,52 @@ impl Store for SqlStore {
     }
 
     async fn execute(&self, command: Command) -> Result<Snapshot> {
-        let mut sql = SqlConnection::connect(&self.connection).await?;
-        sql.simple_query("SET XACT_ABORT ON; BEGIN TRAN;")
-            .await?
-            .into_results()
-            .await?;
-        // SQL's row lock serializes controller/member changes, transfer AND
-        // decision authorization. Revision increments are commit-ordered here,
-        // unlike IDENTITY/sequence allocation outside the serialization lock.
-        let row = sql
-            .query(
-                "SELECT payload,DATEDIFF_BIG(millisecond,'19700101',SYSUTCDATETIME())
+        let mut sql = crate::timing::measure(
+            "sql-connect",
+            "downstream_wait",
+            SqlConnection::connect(&self.connection),
+        )
+        .await?;
+        crate::timing::measure("sql-transaction", "downstream_wait", async {
+            sql.simple_query("SET XACT_ABORT ON; BEGIN TRAN;")
+                .await?
+                .into_results()
+                .await?;
+            // SQL's row lock serializes controller/member changes, transfer AND
+            // decision authorization. Revision increments are commit-ordered here,
+            // unlike IDENTITY/sequence allocation outside the serialization lock.
+            let row = sql
+                .query(
+                    "SELECT payload,DATEDIFF_BIG(millisecond,'19700101',SYSUTCDATETIME())
              FROM delta_authority.state WITH(UPDLOCK,HOLDLOCK) WHERE id=1",
-                &[],
-            )
-            .await?
-            .into_row()
-            .await?
-            .context("missing authority state")?;
-        let mut state: Snapshot = serde_json::from_str(row.get::<&str, _>(0).context("payload")?)?;
-        apply(
-            &mut state,
-            &command,
-            &Clock {
-                now: row.get::<i64, _>(1).context("DB time")?,
-                live: None,
-                new_lease: 0,
-            },
-        )?;
-        let payload = serde_json::to_string(&state)?;
-        sql.query("UPDATE delta_authority.state SET payload=@P1 WHERE id=1;", &[&payload])
-            .await?
-            .into_results()
-            .await?;
-        sql.simple_query("COMMIT;").await?.into_results().await?;
-        // An unknown COMMIT outcome is returned as an error. Operations carry
-        // identities and callers reconcile; never blind-retry unknown commits.
-        sql.finish().await?;
-        Ok(state)
+                    &[],
+                )
+                .await?
+                .into_row()
+                .await?
+                .context("missing authority state")?;
+            let mut state: Snapshot = serde_json::from_str(row.get::<&str, _>(0).context("payload")?)?;
+            apply(
+                &mut state,
+                &command,
+                &Clock {
+                    now: row.get::<i64, _>(1).context("DB time")?,
+                    live: None,
+                    new_lease: 0,
+                },
+            )?;
+            let payload = serde_json::to_string(&state)?;
+            sql.query("UPDATE delta_authority.state SET payload=@P1 WHERE id=1;", &[&payload])
+                .await?
+                .into_results()
+                .await?;
+            sql.simple_query("COMMIT;").await?.into_results().await?;
+            // An unknown COMMIT outcome is returned as an error. Operations carry
+            // identities and callers reconcile; never blind-retry unknown commits.
+            sql.finish().await?;
+            Ok::<_, anyhow::Error>(state)
+        })
+        .await
     }
 }
 
@@ -166,6 +177,12 @@ impl Store for EtcdStore {
             .map(|k| serde_json::from_str(&k.value))
             .transpose()?
             .unwrap_or_default();
+        state.observations.retain(|id, _| {
+            state
+                .observed_at
+                .get(id)
+                .is_some_and(|at| crate::now_ms() as i64 - at <= 3000)
+        });
         for (id, m) in &mut state.members {
             if !kvs.iter().any(|k| k.key == member_key(id)) {
                 m.member.eligible = false;
@@ -194,7 +211,7 @@ impl Store for EtcdStore {
                 &mut state.clone(),
                 &command,
                 &Clock {
-                    now: 0,
+                    now: crate::now_ms() as i64,
                     live: Some(live.clone()),
                     new_lease: 0,
                 },
@@ -247,7 +264,7 @@ impl Store for EtcdStore {
                 &mut state,
                 &command,
                 &Clock {
-                    now: 0,
+                    now: crate::now_ms() as i64,
                     live: Some(live),
                     new_lease,
                 },

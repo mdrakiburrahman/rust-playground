@@ -40,6 +40,16 @@ pub struct TableState {
     pub reservation: Option<Reservation>,
     #[serde(default)]
     pub inputs: BTreeMap<String, String>,
+    #[serde(default)]
+    pub streams: BTreeMap<String, crate::placement::Stream>,
+    #[serde(default)]
+    pub activated_at: i64,
+    #[serde(default)]
+    pub input_policy: BTreeMap<String, (i64, String)>,
+    #[serde(default)]
+    pub claim_operation: String,
+    #[serde(default)]
+    pub activation_revision: i64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -51,6 +61,16 @@ pub struct Snapshot {
     pub members: BTreeMap<String, Session>,
     pub retired: BTreeSet<String>,
     pub tables: BTreeMap<String, TableState>,
+    #[serde(default)]
+    pub policies: BTreeMap<String, crate::placement::Policy>,
+    #[serde(default)]
+    pub observations: BTreeMap<String, crate::placement::Observation>,
+    #[serde(default)]
+    pub observed_at: BTreeMap<String, i64>,
+    #[serde(default)]
+    pub table_policies: BTreeMap<String, crate::placement::TablePolicy>,
+    #[serde(default)]
+    pub optimization: crate::placement::Optimization,
 }
 
 impl Snapshot {
@@ -78,6 +98,52 @@ impl Snapshot {
 
 #[derive(Clone, Debug)]
 pub enum Command {
+    Optimize {
+        controller: Controller,
+    },
+    Catalog {
+        controller: Controller,
+        key: String,
+        policy: crate::placement::TablePolicy,
+    },
+    Policy {
+        controller: Controller,
+        collector: String,
+        writer: Writer,
+        revision: i64,
+        operation: String,
+        excluded: bool,
+        block_streams: bool,
+        retiring: bool,
+    },
+    Observe {
+        writer: Writer,
+        observation: crate::placement::Observation,
+        applied_revision: i64,
+    },
+    OpenStream {
+        key: String,
+        writer: Writer,
+        epoch: u64,
+        stream: String,
+        fingerprint: String,
+    },
+    CloseStream {
+        key: String,
+        writer: Writer,
+        stream: String,
+    },
+    AdmitStream {
+        key: String,
+        writer: Writer,
+        epoch: u64,
+        stream: String,
+        unit: String,
+    },
+    ApproveRetirement {
+        controller: Controller,
+        collector: String,
+    },
     Start {
         id: String,
     },
@@ -208,6 +274,277 @@ fn authorize(state: &Snapshot, table: &str, proposed: &Identity, clock: &Clock) 
 pub fn apply(state: &mut Snapshot, command: &Command, clock: &Clock) -> Result<()> {
     let expires = clock.now + TTL_SECONDS as i64 * 1000;
     match command {
+        Command::Optimize { controller } => {
+            control(state, controller, clock)?;
+            if clock.now - state.optimization.sampled_at < 30_000 {
+                return Ok(());
+            }
+            state.optimization.sampled_at = clock.now;
+            if state
+                .members
+                .iter()
+                .any(|(id, m)| m.expires > 0 && !state.observed_at.get(id).is_some_and(|at| clock.now - at <= 3000))
+            {
+                state.optimization.sustained = 0;
+                state.optimization.constraint = "stale-capacity".into();
+                return Ok(());
+            }
+            let pressures = state
+                .members
+                .keys()
+                .filter_map(|id| state.projected(id, "").ok().map(|p| p.pressure()))
+                .collect::<Vec<_>>();
+            let max = pressures.iter().copied().fold(0.0, f64::max);
+            let min = pressures.iter().copied().fold(1.0, f64::min);
+            if max <= 0.70 && max - min <= 0.15 {
+                state.optimization.sustained = 0;
+            } else if max > 0.80 || max - min > 0.25 {
+                state.optimization.sustained += 1;
+            } else {
+                state.optimization.sustained = 0;
+            }
+            if state.optimization.sustained >= 3 {
+                state.optimization.constraint = "no-beneficial-safe-move".into();
+                for _ in 0..2 {
+                    let Some((key, target)) = crate::placement::optimization_candidate(state, clock.now) else {
+                        break;
+                    };
+                    apply(
+                        state,
+                        &Command::Reserve {
+                            controller: controller.clone(),
+                            key,
+                            target,
+                            operation: uuid::Uuid::new_v4().to_string(),
+                        },
+                        clock,
+                    )?;
+                    state.optimization.constraint = "reserved".into();
+                }
+            }
+        }
+        Command::Catalog {
+            controller,
+            key,
+            policy,
+        } => {
+            control(state, controller, clock)?;
+            policy.demand.validate()?;
+            ensure!(
+                !policy.fingerprints.is_empty() && policy.fingerprints.len() <= 32,
+                "schema policy bound"
+            );
+            ensure!(
+                state.table_policies.len() < 32 || state.table_policies.contains_key(key),
+                "catalog bound"
+            );
+            if let Some(old) = state.table_policies.get(key) {
+                ensure!(
+                    policy.revision > old.revision
+                        || (policy.revision == old.revision
+                            && policy.fingerprints == old.fingerprints
+                            && policy.demand == old.demand),
+                    "stale schema policy"
+                );
+            }
+            state.table_policies.insert(key.clone(), policy.clone());
+        }
+        Command::Policy {
+            controller,
+            collector,
+            writer,
+            revision,
+            operation,
+            excluded,
+            block_streams,
+            retiring,
+        } => {
+            control(state, controller, clock)?;
+            member(state, writer, clock)?;
+            ensure!(
+                writer.collector == *collector && crate::safe_id(operation),
+                "policy identity"
+            );
+            let old = state.policies.get(collector).cloned().unwrap_or_default();
+            if old.operation == *operation {
+                ensure!(
+                    old.incarnation.as_ref() == Some(writer)
+                        && old.excluded == (*excluded || *retiring)
+                        && old.block_streams == *block_streams
+                        && old.retiring == *retiring,
+                    "policy operation collision"
+                );
+                return Ok(());
+            }
+            ensure!(
+                old.revision == *revision && !old.approved && (!old.retiring || *retiring),
+                "policy revision/retirement conflict"
+            );
+            state.policies.insert(
+                collector.clone(),
+                crate::placement::Policy {
+                    revision: revision + 1,
+                    excluded: *excluded || *retiring,
+                    block_streams: *block_streams,
+                    retiring: *retiring,
+                    approved: false,
+                    applied_revision: old.applied_revision,
+                    incarnation: Some(writer.clone()),
+                    operation: operation.clone(),
+                    recovery_obligations: if *retiring {
+                        old.recovery_obligations
+                            .into_iter()
+                            .chain(
+                                state
+                                    .tables
+                                    .iter()
+                                    .filter(|(_, t)| t.record.writer == *writer)
+                                    .map(|(key, _)| key.clone()),
+                            )
+                            .collect()
+                    } else {
+                        BTreeSet::new()
+                    },
+                },
+            );
+        }
+        Command::Observe {
+            writer,
+            observation,
+            applied_revision,
+        } => {
+            member(state, writer, clock)?;
+            observation.demand.validate()?;
+            observation.capacity.validate()?;
+            ensure!(
+                observation.allocation_revision >= 0 && observation.allocation_revision <= state.revision,
+                "invalid allocation watermark"
+            );
+            ensure!(observation.tables.len() <= 32, "table observation bound");
+            ensure!(
+                observation.fingerprints.len() <= 128 && observation.fingerprints.iter().all(|f| f.len() <= 128),
+                "capability bound"
+            );
+            for (key, demand) in &observation.tables {
+                demand.validate()?;
+                ensure!(
+                    state.tables.get(key).is_some_and(|t| t.record.writer == *writer),
+                    "foreign table observation"
+                );
+            }
+            ensure!(
+                state
+                    .observations
+                    .get(&writer.collector)
+                    .is_none_or(|o| observation.sequence > o.sequence),
+                "stale observation"
+            );
+            if let Some(policy) = state.policies.get_mut(&writer.collector) {
+                ensure!(*applied_revision == policy.revision, "policy not applied");
+                policy.applied_revision = *applied_revision;
+            }
+            state.observations.insert(writer.collector.clone(), observation.clone());
+            state.observed_at.insert(writer.collector.clone(), clock.now);
+        }
+        Command::OpenStream {
+            key,
+            writer,
+            epoch,
+            stream,
+            fingerprint,
+        } => {
+            let i = state.identity(key, writer, *epoch)?;
+            authorize(state, key, &i, clock)?;
+            ensure!(crate::safe_id(stream), "invalid stream");
+            let p = state.policies.get(&writer.collector).cloned().unwrap_or_default();
+            ensure!(
+                !p.block_streams && !p.retiring && !p.approved,
+                "new stream admission blocked"
+            );
+            let schema = state.table_policies.get(key).context("missing schema policy")?;
+            ensure!(schema.fingerprints.contains(fingerprint), "schema policy rejected");
+            ensure!(
+                state
+                    .observations
+                    .get(&writer.collector)
+                    .is_some_and(|o| o.fingerprints.contains(fingerprint)),
+                "writer lacks schema capability"
+            );
+            let t = state.tables.get_mut(key).context("table")?;
+            if let Some(existing) = t.streams.get(stream) {
+                ensure!(existing.writer == *writer && existing.epoch == *epoch
+                    && existing.fingerprint == *fingerprint && existing.policy_revision == schema.revision,
+                    "stream identity collision");
+                return Ok(());
+            }
+            ensure!(
+                t.record.lifecycle == Lifecycle::Active && t.streams.len() < 16,
+                "stream backpressure/not active"
+            );
+            t.streams.insert(
+                stream.clone(),
+                crate::placement::Stream {
+                    writer: writer.clone(),
+                    epoch: *epoch,
+                    fingerprint: fingerprint.clone(),
+                    policy_revision: schema.revision,
+                },
+            );
+        }
+        Command::CloseStream { key, writer, stream } => {
+            if let Some(t) = state.tables.get_mut(key) {
+                if t.streams.get(stream).is_some_and(|s| s.writer == *writer) {
+                    t.streams.remove(stream);
+                }
+            }
+        }
+        Command::AdmitStream {
+            key,
+            writer,
+            epoch,
+            stream,
+            unit,
+        } => {
+            let t = state.tables.get(key).context("table")?;
+            let s = t.streams.get(stream).context("stream not admitted")?;
+            ensure!(s.writer == *writer && s.epoch == *epoch, "stream lineage");
+            let p = state.table_policies.get(key).context("schema policy")?;
+            ensure!(
+                p.revision == s.policy_revision && p.fingerprints.contains(&s.fingerprint),
+                "schema policy changed"
+            );
+            let policy = (p.revision, s.fingerprint.clone());
+            apply(
+                state,
+                &Command::Admit {
+                    key: key.clone(),
+                    writer: writer.clone(),
+                    epoch: *epoch,
+                    unit: unit.clone(),
+                },
+                clock,
+            )?;
+            state
+                .tables
+                .get_mut(key)
+                .context("table")?
+                .input_policy
+                .insert(unit.clone(), policy);
+        }
+        Command::ApproveRetirement { controller, collector } => {
+            control(state, controller, clock)?;
+            ensure!(
+                !state.tables.values().any(|t| t.record.writer.collector == *collector
+                    || t.reservation.as_ref().is_some_and(|r| r.target.collector == *collector)),
+                "retirement still owns work"
+            );
+            let p = state.policies.get_mut(collector).context("retirement missing")?;
+            ensure!(
+                p.retiring && p.applied_revision == p.revision && p.recovery_obligations.is_empty(),
+                "retirement awaits applied policy/recovered successors"
+            );
+            p.approved = true;
+        }
         Command::Start { id } => {
             if let Some(c) = &state.controller {
                 if c.id == *id && live(clock, &controller_key(), state.controller_expires) {
@@ -227,6 +564,7 @@ pub fn apply(state: &mut Snapshot, command: &Command, clock: &Clock) -> Result<(
                 t.identity = identity(&c, &t.record.writer, t.record.epoch)?;
                 t.record.lifecycle = Lifecycle::Recovering;
                 t.record.pending.clear();
+                t.streams.clear();
             }
             state.controller = Some(c);
             state.controller_expires = expires;
@@ -264,6 +602,8 @@ pub fn apply(state: &mut Snapshot, command: &Command, clock: &Clock) -> Result<(
                     );
                 }
                 old => {
+                    state.observations.remove(&id);
+                    state.observed_at.remove(&id);
                     ensure!(
                         requested.writer.generation.is_empty() && !state.retired.contains(&process),
                         "expired incarnation cannot revive"
@@ -295,6 +635,7 @@ pub fn apply(state: &mut Snapshot, command: &Command, clock: &Clock) -> Result<(
                 t.record.epoch += 1;
                 t.record.lifecycle = Lifecycle::Recovering;
                 t.record.pending.clear();
+                t.streams.clear();
                 t.identity = identity(controller, &successor, t.record.epoch)?;
             }
         }
@@ -308,11 +649,19 @@ pub fn apply(state: &mut Snapshot, command: &Command, clock: &Clock) -> Result<(
             member(state, target, clock)?;
             if let Some(t) = state.tables.get(key) {
                 ensure!(
-                    t.record.writer == *target && t.reservation.as_ref().is_some_and(|r| r.operation == *operation),
+                    t.record.writer == *target && t.claim_operation == *operation,
                     "claim conflict"
                 );
                 return Ok(());
             }
+            ensure!(
+                state
+                    .observed_at
+                    .get(&target.collector)
+                    .is_some_and(|at| clock.now - at <= 3000),
+                "stale capacity"
+            );
+            state.eligible(&target.collector, key)?;
             ensure!(state.tables.len() < 32, "table bound");
             let endpoint = state.members[&target.collector].member.endpoint.clone();
             state.tables.insert(
@@ -323,7 +672,7 @@ pub fn apply(state: &mut Snapshot, command: &Command, clock: &Clock) -> Result<(
                         epoch: 1,
                         writer: target.clone(),
                         endpoint,
-                        lifecycle: Lifecycle::Active,
+                        lifecycle: Lifecycle::Recovering,
                         head: None,
                         pending: vec![],
                         migration: None,
@@ -336,6 +685,11 @@ pub fn apply(state: &mut Snapshot, command: &Command, clock: &Clock) -> Result<(
                         target: target.clone(),
                     }),
                     inputs: BTreeMap::new(),
+                    streams: BTreeMap::new(),
+                    activated_at: 0,
+                    input_policy: BTreeMap::new(),
+                    claim_operation: operation.clone(),
+                    activation_revision: 0,
                 },
             );
         }
@@ -347,10 +701,18 @@ pub fn apply(state: &mut Snapshot, command: &Command, clock: &Clock) -> Result<(
         } => {
             control(state, controller, clock)?;
             member(state, target, clock)?;
+            ensure!(
+                state
+                    .observed_at
+                    .get(&target.collector)
+                    .is_some_and(|at| clock.now - at <= 3000),
+                "stale capacity"
+            );
+            state.eligible(&target.collector, key)?;
             let reservations = state
                 .tables
                 .iter()
-                .filter(|(k, t)| *k != key && t.record.lifecycle == Lifecycle::Draining)
+                .filter(|(k, t)| *k != key && t.reservation.is_some())
                 .map(|(_, t)| t)
                 .collect::<Vec<_>>();
             ensure!(
@@ -376,7 +738,11 @@ pub fn apply(state: &mut Snapshot, command: &Command, clock: &Clock) -> Result<(
                 t.record.lifecycle != Lifecycle::Draining
                     || t.reservation
                         .as_ref()
-                        .is_some_and(|r| member(state, &r.target, clock).is_err()),
+                        .is_some_and(|r| member(state, &r.target, clock).is_err()
+                            || state
+                                .policies
+                                .get(&r.target.collector)
+                                .is_some_and(|p| p.excluded || p.retiring)),
                 "migration already reserved"
             );
             let t = state.tables.get_mut(key).context("unknown table")?;
@@ -398,6 +764,7 @@ pub fn apply(state: &mut Snapshot, command: &Command, clock: &Clock) -> Result<(
             let reservation = t.reservation.as_ref().context("missing reservation")?.clone();
             ensure!(reservation.operation == *operation, "migration operation mismatch");
             member(state, &reservation.target, clock)?;
+            state.eligible(&reservation.target.collector, key)?;
             if t.record.writer == reservation.target && t.record.lifecycle != Lifecycle::Draining {
                 return Ok(());
             }
@@ -412,6 +779,7 @@ pub fn apply(state: &mut Snapshot, command: &Command, clock: &Clock) -> Result<(
             t.record.epoch += 1;
             t.record.lifecycle = Lifecycle::Recovering;
             t.record.pending.clear();
+            t.streams.clear();
             t.identity = identity(controller, &t.record.writer, t.record.epoch)?;
         }
         Command::Admit {
@@ -464,6 +832,18 @@ pub fn apply(state: &mut Snapshot, command: &Command, clock: &Clock) -> Result<(
                 .operation
                 .strip_suffix("-schema")
                 .unwrap_or(&proposal.operation);
+            let (revision, fingerprint) = t
+                .input_policy
+                .get(unit)
+                .context("publication requires revisioned stream admission")?;
+            let policy = state
+                .table_policies
+                .get(&proposal.table)
+                .context("publication schema policy")?;
+            ensure!(
+                policy.revision == *revision && policy.fingerprints.contains(fingerprint),
+                "publication policy changed"
+            );
             ensure!(t.record.pending.iter().any(|u| u == unit), "operation not admitted");
             ensure!(
                 proposal.version == t.decisions.len() as i64
@@ -494,12 +874,53 @@ pub fn apply(state: &mut Snapshot, command: &Command, clock: &Clock) -> Result<(
             version,
         } => {
             authorize(state, table, identity, clock)?;
-            let t = state.tables.get_mut(table).context("table")?;
+            let t = state.tables.get(table).context("table")?;
             ensure!(
                 *version == t.decisions.len() as i64 - 1 && t.published == *version,
                 "recovery prefix/receipt barrier"
             );
+            if t.record.lifecycle == Lifecycle::Active {
+                return Ok(());
+            }
+            ensure!(
+                t.record.lifecycle == Lifecycle::Recovering,
+                "activation requires recovery"
+            );
+            let collector = &t.record.writer.collector;
+            ensure!(
+                state
+                    .observed_at
+                    .get(collector)
+                    .is_some_and(|at| clock.now - at <= 3000),
+                "recovery requires fresh capability observation"
+            );
+            let schema = state
+                .table_policies
+                .get(table)
+                .context("recovery schema policy missing")?;
+            let observation = state
+                .observations
+                .get(collector)
+                .context("recovery capabilities missing")?;
+            ensure!(
+                schema
+                    .fingerprints
+                    .iter()
+                    .all(|fp| observation.fingerprints.contains(fp)),
+                "recovery schema capability unavailable"
+            );
+            ensure!(
+                !state.policies.get(collector).is_some_and(|p| p.retiring || p.approved),
+                "retiring successor cannot activate"
+            );
+            let t = state.tables.get_mut(table).context("table")?;
             t.record.lifecycle = Lifecycle::Active;
+            t.reservation = None;
+            t.activated_at = clock.now;
+            t.activation_revision = state.revision + 1;
+            for policy in state.policies.values_mut() {
+                policy.recovery_obligations.remove(table);
+            }
         }
         Command::Revoke { controller, collector } => {
             control(state, controller, clock)?;

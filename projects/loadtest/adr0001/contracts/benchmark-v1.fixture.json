@@ -1,0 +1,27 @@
+{
+  "format": "arrowcol-benchmark",
+  "schema_version": 1,
+  "dataset_id": "fixture-v1",
+  "provenance": {
+    "source_revision": "0000000000000000000000000000000000000000",
+    "synthetic": true,
+    "description": "canonical-fixture"
+  },
+  "runs": [{"id": "run-1", "arm": "simulation", "scenario": "cold", "repetition": 0, "seed": 42}],
+  "records": [
+    {"id": "request-1", "run_id": "run-1", "kind": "request", "evidence": "estimated", "method": "seeded-model", "assumption": "illustrative-not-calibrated", "rows": 64},
+    {"id": "attempt-1", "run_id": "run-1", "kind": "attempt", "evidence": "estimated", "method": "seeded-model", "assumption": "illustrative-not-calibrated", "status": "completed"},
+    {"id": "span-1", "run_id": "run-1", "kind": "span", "evidence": "estimated", "method": "seeded-model", "assumption": "illustrative-not-calibrated", "role": "collector", "process_id": "collector-1", "clock_id": "clock-1", "trace_id": "attempt-1", "stage": "mailbox", "category": "queue", "offset_ns": "1000", "duration_ns": "2000", "status": "completed"},
+    {"id": "batch-1", "run_id": "run-1", "kind": "batch", "evidence": "estimated", "method": "seeded-model", "assumption": "illustrative-not-calibrated", "rows": 64},
+    {"id": "commit-1", "run_id": "run-1", "kind": "commit", "evidence": "estimated", "method": "seeded-model", "assumption": "illustrative-not-calibrated", "version": 0, "epoch": 1},
+    {"id": "receipt-1", "run_id": "run-1", "kind": "receipt", "evidence": "estimated", "method": "seeded-model", "assumption": "illustrative-not-calibrated", "status": "completed"}
+  ],
+  "links": [
+    {"from": "request-1", "to": "attempt-1", "relation": "attempt"},
+    {"from": "attempt-1", "to": "span-1", "relation": "contains"},
+    {"from": "attempt-1", "to": "batch-1", "relation": "contains", "rows": 64},
+    {"from": "batch-1", "to": "commit-1", "relation": "publishes"},
+    {"from": "commit-1", "to": "receipt-1", "relation": "receipt"}
+  ],
+  "coverage": {"dropped_events": 0, "incomplete_attempts": 0, "complete": true}
+}

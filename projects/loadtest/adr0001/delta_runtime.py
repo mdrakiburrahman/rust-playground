@@ -16,6 +16,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
+import uuid
 
 import pyarrow as pa
 import pyarrow.flight as flight
@@ -67,6 +68,7 @@ class Runtime(Gate):
                    "--network", self.project, "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
                    "--user", f"{21001 if stage else os.getuid()}:{21001 if stage else os.getgid()}",
                    "--cpus", "1", "--memory", "1g", "--pids-limit", "256",
+                   "-e", "ARROWCOL_TRACE=1",
                    "--mount", f"type=bind,src={self.root/'bin'},dst=/native,readonly",
                    "--mount", f"type=bind,src={self.root/'config'/f'{role}.json'},dst=/config.json,readonly"]
         for alias in aliases:
@@ -221,6 +223,8 @@ ALTER ROLE db_owner ADD MEMBER delta_runtime;
             self.start_role("gateway", "adr-flight", ["--config", "/config.json"], ports=[50051])
         self.gateway_port = self.port_of("gateway", 50051)
         self.wait(lambda: len(self.post({"op": "view"})["members"]) == 3)
+        if not self.legacy:
+            self.wait(lambda: len(self.post({"op": "view"}).get("observations", {})) == 3)
         self.mark("authenticated runtime ready", arm=self.arm, authority=self.backend,
                   collector_binary=hashlib.sha256((self.root / "bin/adr-flight").read_bytes()).hexdigest())
 
@@ -256,6 +260,53 @@ ALTER ROLE db_owner ADD MEMBER delta_runtime;
 
     def assignment(self, key="main"):
         return self.post({"op": "resolve", "key": key}, "gateway")
+
+    def proof_alignment(self):
+        assert not self.legacy
+        first = self.assignment()
+        assert first["record"]["lifecycle"] == "Recovering", first
+        active = self.wait(lambda: (a if (a := self.assignment())["record"]["lifecycle"] == "Active" else None))
+        owner = active["record"]["writer"]
+        self.upload(2000000, half_close=True)
+        self.upload(2000010, schema_index=1, half_close=True)
+        assert self.assignment()["record"]["writer"] == owner
+        self.upload(2000020, key="cas", half_close=True)
+        assert self.assignment("cas")["record"]["key"] != self.assignment()["record"]["key"]
+        self.mark("cold recovery, schema evolution and independent same-schema table use real native Delta")
+
+        def policy(excluded, blocked, retiring=False):
+            state = self.post({"op": "view"})
+            previous = state.get("policies", {}).get(owner["collector"], {})
+            result = self.post({"op": "policy", "collector": owner["collector"], "writer": owner,
+                               "revision": previous.get("revision", 0), "operation": str(uuid.uuid4()),
+                               "excluded": excluded, "block_streams": blocked, "retiring": retiring})
+            self.wait(lambda: self.post({"op": "view"})["policies"][owner["collector"]]["applied_revision"] == result["revision"])
+            return result
+
+        policy(True, False)
+        self.upload(2000030, schema_index=1, half_close=True)
+        assert self.assignment()["record"]["writer"] == owner
+        policy(True, True)
+        rejected = self.upload(2000040, schema_index=1, half_close=True, expect=False)
+        assert rejected["terminal"] != "final" and not any(r["kind"] == "DELTA_COMMITTED" for r in rejected["receipts"])
+        assert self.assignment()["record"]["writer"] == owner
+        policy(False, False)
+        self.upload(2000050, schema_index=1, half_close=True)
+        self.mark("placement exclusion preserves owner streams; separately applied block rejects new native streams")
+
+        retiring = policy(True, False, True)
+        approval = self.wait(lambda: (p if (p := self.post({"op": "view"})["policies"][owner["collector"]])["approved"] else None))
+        assert approval["incarnation"] == owner and approval["operation"] == retiring["operation"]
+        assert not approval["recovery_obligations"]
+        state = self.post({"op": "view"})
+        assert all(a["record"]["writer"] != owner and a["record"]["lifecycle"] == "Active"
+                   for a in state["assignments"])
+        self.run(["docker", "stop", "-t", "1", self.names[owner["collector"]]])
+        self.upload(2000060, schema_index=1, half_close=True)
+        assert self.assignment()["record"]["epoch"] > active["record"]["epoch"]
+        assert self.scan_runtime()["rows"] == sorted(self.expected["main"])
+        assert self.scan_runtime("cas")["rows"] == sorted(self.expected["cas"])
+        self.mark("exact-incarnation retirement waits for recovered successors before teardown and preserves Delta rows")
 
     def upload(self, first, schema_index=0, extra_headers=None, expect=True, *,
                count=3, port=None, key=None, half_close=False):
@@ -670,12 +721,15 @@ def main():
     parser.add_argument("--legacy", action="store_true")
     parser.add_argument("--streaming-repro", action="store_true")
     parser.add_argument("--gateway-repair", action="store_true")
+    parser.add_argument("--adr-alignment", action="store_true")
     args = parser.parse_args()
     assert not args.legacy or (args.arm == "adr" and args.backend == "etcd")
     runtime = Runtime(args.project, args.subnet, args.arm, args.backend, args.legacy)
     try:
         runtime.setup_runtime()
-        if args.streaming_repro or args.gateway_repair:
+        if args.adr_alignment:
+            runtime.proof_alignment()
+        elif args.streaming_repro or args.gateway_repair:
             runtime.proof_gateway_streams(args.streaming_repro)
         else:
             runtime.proof_runtime()

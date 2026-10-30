@@ -554,13 +554,16 @@ impl Publisher {
     /// # Errors
     /// Rejects absent decisions, conflicting/partial logs, bad data and SQL errors.
     pub async fn materialize(&self, table: &str, hooks: &dyn PublicationHooks) -> Result<()> {
+        crate::timing::measure("materialize-accepted-prefix", "lifecycle", async {
         let history = self.decisions(table).await?;
         ensure!(!history.is_empty(), "no accepted decisions");
         let root = self.table(table)?;
         mkdir(&root)?;
         mkdir(&root.join("_delta_log"))?;
         for proposal in &history {
+            crate::timing::measure("accepted-version-materialize", "lifecycle", async {
             self.verify_data(proposal)?;
+            crate::timing::measure("delta-log-install", "downstream_wait", async {
             install(
                 &root.join(log_name(proposal.version)),
                 proposal.actions.as_bytes(),
@@ -568,15 +571,16 @@ impl Publisher {
                 &|| hooks.at(&format!("during-log:{}", proposal.version)),
                 &|| hooks.at(&format!("before-log:{}", proposal.version)),
             )?;
+            Ok::<_, anyhow::Error>(())
+            }).await?;
             hooks.at(&format!("after-log:{}", proposal.version))?;
             hooks.at(&format!("before-receipt:{}", proposal.version))?;
             let digest = proposal.digest()?;
             if let Some(store) = &self.authority {
-                crate::delta_backends::SqlStore {
+                crate::timing::measure("sql-final-receipt", "downstream_wait", crate::delta_backends::SqlStore {
                     connection: self.sql.clone(),
                 }
-                .final_receipt(proposal)
-                .await?;
+                .final_receipt(proposal)).await?;
                 store
                     .execute(crate::delta_store::Command::Final {
                         table: table.into(),
@@ -585,7 +589,7 @@ impl Publisher {
                     })
                     .await?;
                 hooks.at(&format!("after-receipt:{}", proposal.version))?;
-                continue;
+                return Ok(());
             }
             let mut sql = self.connect().await?;
             sql.query(
@@ -603,8 +607,11 @@ impl Publisher {
             ).await?.into_results().await?;
             sql.finish().await?;
             hooks.at(&format!("after-receipt:{}", proposal.version))?;
+            Ok::<_, anyhow::Error>(())
+            }).await?;
         }
         self.verify_prefix(table, &history)
+        }).await
     }
 
     /// Activate only after standard native snapshot reconstruction and final

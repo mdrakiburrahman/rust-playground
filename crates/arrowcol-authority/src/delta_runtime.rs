@@ -92,43 +92,36 @@ impl PrivateConfig {
     }
 }
 
-pub type Select = fn(&Snapshot, Option<&str>) -> Result<Writer>;
+pub type Select = fn(&Snapshot, &str, Option<&str>) -> Result<Writer>;
 
-/// ADR assignment-count-aware pressure selection. Pingora supplies its own policy.
+/// Both primary gateways use the same whole-operation deadline and retry cadence.
+///
+/// # Errors
+/// Preserves resolution failures and returns a bounded recovery deadline error.
+pub async fn resolve_active<F, Fut>(mut resolve: F) -> Result<Assignment>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Assignment>>,
+{
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let assignment = resolve().await?;
+            if assignment.record.lifecycle == Lifecycle::Active {
+                return Ok(assignment);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .context("owner recovery/drain deadline")?
+}
+
+/// Shared resource-normalized policy; the two arms differ in hosting, not policy.
 ///
 /// # Errors
 /// Rejects absent fresh capacity.
-pub fn adr_select(state: &Snapshot, excluded: Option<&str>) -> Result<Writer> {
-    let mut candidates = state
-        .members
-        .values()
-        .filter(|m| {
-            m.member.eligible
-                && m.expires > 0
-                && Some(m.member.writer.collector.as_str()) != excluded
-                && m.member.pressure < 0.95
-        })
-        .collect::<Vec<_>>();
-    let score = |m: &Session| {
-        m.member.pressure
-            + 0.05
-                * state
-                    .tables
-                    .values()
-                    .filter(|t| t.record.writer.collector == m.member.writer.collector)
-                    .count() as f64
-    };
-    candidates.sort_by(|a, b| {
-        score(a)
-            .total_cmp(&score(b))
-            .then(a.member.writer.collector.cmp(&b.member.writer.collector))
-    });
-    Ok(candidates
-        .first()
-        .context("no fresh eligible capacity")?
-        .member
-        .writer
-        .clone())
+pub fn adr_select(state: &Snapshot, key: &str, excluded: Option<&str>) -> Result<Writer> {
+    crate::placement::select(state, key, excluded)
 }
 
 pub struct Control {
@@ -147,10 +140,27 @@ impl Control {
         ensure!(config.delta.is_some(), "Delta control requires explicit sink mode");
         let id = uuid::Uuid::new_v4().to_string();
         let snapshot = store.execute(Command::Start { id }).await?;
+        let controller = snapshot.controller.context("controller")?;
+        for table in &config.tables {
+            if snapshot.table_policies.contains_key(&table.key) {
+                continue;
+            }
+            store
+                .execute(Command::Catalog {
+                    controller: controller.clone(),
+                    key: table.key.clone(),
+                    policy: placement::TablePolicy {
+                        revision: 1,
+                        fingerprints: table.fingerprints.clone(),
+                        demand: placement::Demand::default(),
+                    },
+                })
+                .await?;
+        }
         Ok(Arc::new(Self {
             config,
             store,
-            controller: snapshot.controller.context("controller")?,
+            controller,
             select,
             serial: Mutex::new(()),
             slots: Semaphore::new(64),
@@ -160,9 +170,134 @@ impl Control {
     /// # Errors
     /// Returns authentication-independent domain operation failures.
     pub async fn apply(&self, principal: &str, operation: Operation) -> Result<Value> {
+        let context = timing::current().unwrap_or_else(|| timing::Context::new("", "authority"));
+        context.scope(self.apply_inner(principal, operation)).await
+    }
+
+    async fn apply_inner(&self, principal: &str, operation: Operation) -> Result<Value> {
         let _slot = self.slots.try_acquire().context("control capacity")?;
+        let mut queue = timing::Span::new("control-queue", "queue");
         let _serial = self.serial.lock().await;
+        queue.completed();
+        drop(queue);
         match operation {
+            Operation::CatalogPolicy {
+                key,
+                revision,
+                fingerprints,
+                demand,
+            } => {
+                ensure!(principal == "operator", "catalog policy forbidden");
+                let allowed = self.config.table(&key)?;
+                ensure!(
+                    fingerprints.iter().all(|f| allowed.fingerprints.contains(f)),
+                    "schema not registered"
+                );
+                let current = self.store.snapshot().await?;
+                ensure!(
+                    current.table_policies.get(&key).is_some_and(|p| p.revision == revision),
+                    "catalog policy revision conflict"
+                );
+                self.store
+                    .execute(Command::Catalog {
+                        controller: self.controller.clone(),
+                        key,
+                        policy: placement::TablePolicy {
+                            revision: revision + 1,
+                            fingerprints,
+                            demand,
+                        },
+                    })
+                    .await?;
+                Ok(json!({"applied_revision":revision+1}))
+            }
+            Operation::Policy {
+                collector,
+                writer,
+                revision,
+                operation,
+                excluded,
+                block_streams,
+                retiring,
+            } => {
+                ensure!(principal == "operator", "policy forbidden");
+                let state = self
+                    .store
+                    .execute(Command::Policy {
+                        controller: self.controller.clone(),
+                        collector: collector.clone(),
+                        writer,
+                        revision,
+                        operation,
+                        excluded,
+                        block_streams,
+                        retiring,
+                    })
+                    .await?;
+                Ok(serde_json::to_value(&state.policies[&collector])?)
+            }
+            Operation::Observe {
+                writer,
+                observation,
+                applied_revision,
+            } => {
+                ensure!(principal == writer.collector, "observation impersonation");
+                self.store
+                    .execute(Command::Observe {
+                        writer,
+                        observation,
+                        applied_revision,
+                    })
+                    .await?;
+                Ok(json!({"observed":true}))
+            }
+            Operation::OpenStream {
+                key,
+                writer,
+                epoch,
+                stream,
+                fingerprint,
+            } => {
+                ensure!(principal == writer.collector, "stream impersonation");
+                self.store
+                    .execute(Command::OpenStream {
+                        key,
+                        writer,
+                        epoch,
+                        stream,
+                        fingerprint,
+                    })
+                    .await?;
+                Ok(json!({"admitted":true}))
+            }
+            Operation::CloseStream { key, writer, stream } => {
+                ensure!(principal == writer.collector, "stream impersonation");
+                self.store.execute(Command::CloseStream { key, writer, stream }).await?;
+                Ok(json!({"closed":true}))
+            }
+            Operation::AdmitStream {
+                key,
+                writer,
+                epoch,
+                stream,
+                unit,
+            } => {
+                ensure!(principal == writer.collector, "admission impersonation");
+                let state = self
+                    .store
+                    .execute(Command::AdmitStream {
+                        key: key.clone(),
+                        writer,
+                        epoch,
+                        stream,
+                        unit,
+                    })
+                    .await?;
+                Ok(serde_json::to_value(Assignment {
+                    revision: state.revision,
+                    record: state.tables[&key].record.clone(),
+                })?)
+            }
             Operation::View | Operation::Watch { .. } => {
                 let state = self.store.snapshot().await?;
                 // Every delivery is a complete consistent revisioned snapshot.
@@ -170,6 +305,8 @@ impl Control {
                 Ok(
                     json!({"revision":state.revision,"snapshot":true,"assignments":state.assignments(),
                     "members":state.members.values().map(|m| &m.member).collect::<Vec<_>>(),
+                    "policies":state.policies,"table_policies":state.table_policies,"optimization":state.optimization,
+                    "observations":state.observations,
                     "operations":state.tables.iter().map(|(key,t)|(key,&t.reservation)).collect::<BTreeMap<_,_>>()}),
                 )
             }
@@ -207,7 +344,10 @@ impl Control {
                 self.config.table(&key)?;
                 let mut state = self.store.snapshot().await?;
                 if !state.tables.contains_key(&key) {
-                    let target = (self.select)(&state, None)?;
+                    let mut span = timing::Span::new("placement-select", "processing");
+                    let target = (self.select)(&state, &key, None)?;
+                    span.completed();
+                    drop(span);
                     state = self
                         .store
                         .execute(Command::Claim {
@@ -271,7 +411,7 @@ impl Control {
         self.config.table(key)?;
         let state = self.store.snapshot().await?;
         let source = &state.tables.get(key).context("unplaced")?.record.writer;
-        let target = (self.select)(&state, Some(&source.collector))?;
+        let target = (self.select)(&state, key, Some(&source.collector))?;
         self.store
             .execute(Command::Reserve {
                 controller: self.controller.clone(),
@@ -290,6 +430,11 @@ impl Control {
                 controller: self.controller.clone(),
             })
             .await?;
+        self.store
+            .execute(Command::Optimize {
+                controller: self.controller.clone(),
+            })
+            .await?;
         let state = self.store.snapshot().await?;
         for (key, t) in &state.tables {
             let result: Result<()> = async {
@@ -299,6 +444,10 @@ impl Control {
                             .members
                             .get(&r.target.collector)
                             .is_none_or(|m| m.expires == 0 || m.member.writer != r.target)
+                            || state
+                                .policies
+                                .get(&r.target.collector)
+                                .is_some_and(|p| p.excluded || p.retiring)
                     }) {
                         return self.migrate(key).await;
                     }
@@ -310,6 +459,19 @@ impl Control {
                             force: true,
                         })
                         .await?;
+                } else if state
+                    .policies
+                    .get(&t.record.writer.collector)
+                    .is_some_and(|p| p.retiring)
+                {
+                    self.migrate(key).await?;
+                } else if state.table_policies.get(key).is_some_and(|policy| {
+                    state
+                        .observations
+                        .get(&t.record.writer.collector)
+                        .is_some_and(|o| policy.fingerprints.iter().any(|f| !o.fingerprints.contains(f)))
+                }) {
+                    self.migrate(key).await?;
                 } else if state
                     .members
                     .get(&t.record.writer.collector)
@@ -323,6 +485,25 @@ impl Control {
             if let Err(error) = result {
                 // One draining table must not block independent failover.
                 eprintln!("Delta table reconciliation {key}: {error}");
+            }
+        }
+        let state = self.store.snapshot().await?;
+        for (collector, policy) in &state.policies {
+            if policy.retiring
+                && !policy.approved
+                && policy.applied_revision == policy.revision
+                && policy.recovery_obligations.is_empty()
+                && !state.tables.values().any(|t| {
+                    t.record.writer.collector == *collector
+                        || t.reservation.as_ref().is_some_and(|r| r.target.collector == *collector)
+                })
+            {
+                self.store
+                    .execute(Command::ApproveRetirement {
+                        controller: self.controller.clone(),
+                        collector: collector.clone(),
+                    })
+                    .await?;
             }
         }
         Ok(())
@@ -362,7 +543,15 @@ async fn control_request(
     headers: HeaderMap,
     Json(op): Json<Operation>,
 ) -> (StatusCode, Json<Value>) {
-    response(async { control.apply(principal(&control.config, &headers)?, op).await }.await)
+    let trace = headers.get("x-adr-trace").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let parent = headers.get("x-adr-parent").and_then(|v| v.to_str().ok()).unwrap_or("");
+    response(
+        timing::Context::from_parent(trace, "authority", parent)
+            .scope(timing::measure("control-request", "lifecycle", async {
+                control.apply(principal(&control.config, &headers)?, op).await
+            }))
+            .await,
+    )
 }
 
 /// # Errors
@@ -440,11 +629,19 @@ impl Publication {
         };
         ensure!(principal == writer.collector, "publication impersonation");
         self.config.table(key)?;
+        let mut wait = timing::Span::new("publisher-mailbox", "queue");
         let _mailbox = self.mailboxes.get(key).context("unknown table")?.lock().await;
+        wait.completed();
+        drop(wait);
         let state = self.store.snapshot().await?;
         let identity = state.identity(key, writer, epoch)?;
         if !self.publisher.decisions(key).await?.is_empty() {
-            self.publisher.materialize(key, &NoHooks).await?;
+            timing::measure(
+                "prefix-materialize",
+                "lifecycle",
+                self.publisher.materialize(key, &NoHooks),
+            )
+            .await?;
         }
         match &op {
             Operation::RecoverDelta { .. } => {
@@ -480,6 +677,15 @@ impl Publication {
                 let builder =
                     parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))?;
                 let schema = Arc::clone(builder.schema());
+                let expected = state
+                    .tables
+                    .get(key)
+                    .and_then(|t| t.input_policy.get(unit))
+                    .context("publication requires schema-bound admission")?;
+                ensure!(
+                    arrowcol_protocol::fingerprint_schema(schema.as_ref()).to_string() == expected.1,
+                    "staged schema differs from admitted schema"
+                );
                 let schema_operation = format!("{unit}-schema");
                 match self
                     .publisher
@@ -499,12 +705,25 @@ impl Publication {
                     Err(e) if e.to_string() == "schema proposal must change exactly one version" => {}
                     Err(e) => return Err(e),
                 }
-                let proposal = self
-                    .publisher
-                    .prepare(key, unit, identity, schema, Some((&stage, sha256)))
-                    .await?;
-                self.publisher.accept(&proposal, &RuntimeHooks, false).await?;
-                self.publisher.materialize(key, &RuntimeHooks).await?;
+                let proposal = timing::measure(
+                    "data-prepare",
+                    "lifecycle",
+                    self.publisher
+                        .prepare(key, unit, identity, schema, Some((&stage, sha256))),
+                )
+                .await?;
+                timing::measure(
+                    "data-accept",
+                    "downstream_wait",
+                    self.publisher.accept(&proposal, &RuntimeHooks, false),
+                )
+                .await?;
+                timing::measure(
+                    "data-materialize",
+                    "lifecycle",
+                    self.publisher.materialize(key, &RuntimeHooks),
+                )
+                .await?;
                 Ok(
                     json!({"kind":"DELTA_COMMITTED","operation":unit,"version":proposal.version,"digest":proposal.digest()?}),
                 )
@@ -522,9 +741,19 @@ async fn publication_request(
     response(
         async {
             let principal = principal(&p.config, &headers)?.to_owned();
+            let context = timing::Context::from_parent(
+                headers.get("x-adr-trace").and_then(|v| v.to_str().ok()).unwrap_or(""),
+                "publisher",
+                headers.get("x-adr-parent").and_then(|v| v.to_str().ok()).unwrap_or(""),
+            );
             // A collector's HTTP deadline is not an abort of a submitted
             // publication. Bounded trusted work must outlive that connection.
-            tokio::spawn(async move { p.apply(&principal, op).await }).await?
+            tokio::spawn(
+                context.scope(async move {
+                    timing::measure("publisher-request", "lifecycle", p.apply(&principal, op)).await
+                }),
+            )
+            .await?
         }
         .await,
     )
@@ -587,13 +816,99 @@ mod tests {
         }
     }
 
+        fn test_config() -> Result<Config> {
+            Ok(serde_json::from_value(json!({
+                "delta":{"publisher":"http://publisher"},"tenant":"t","catalog_id":"c",
+                "tables":[{"key":"table","path":["c","s","table"],"fingerprints":["fp"]}],
+                "storage":".","controller":"http://control","operator_token":"o","gateway_token":"g",
+                "edge_secret":"e","internal_secret":"i","collectors":{},"etcd":[],"etcd_user":"","etcd_password":""
+            }))?)
+        }
+
+        #[tokio::test]
+        async fn restart_preserves_updated_catalog_policy() -> Result<()> {
+            let store = Arc::new(MemoryStore(Mutex::new(Snapshot::default())));
+            let control = Control::start(test_config()?, Arc::<MemoryStore>::clone(&store), adr_select).await?;
+            store
+                .execute(Command::Catalog {
+                    controller: control.controller.clone(),
+                    key: "table".into(),
+                    policy: placement::TablePolicy {
+                        revision: 2,
+                        fingerprints: vec!["fp".into()],
+                        demand: placement::Demand::default(),
+                    },
+                })
+                .await?;
+            store.0.lock().await.controller_expires = 0;
+            let _successor = Control::start(test_config()?, Arc::<MemoryStore>::clone(&store), adr_select).await?;
+            assert_eq!(store.snapshot().await?.table_policies["table"].revision, 2);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn unassigned_collector_can_retire_without_a_table_loop() -> Result<()> {
+            let store = Arc::new(MemoryStore(Mutex::new(Snapshot::default())));
+            let control = Control::start(test_config()?, Arc::<MemoryStore>::clone(&store), adr_select).await?;
+            let state = store
+                .execute(Command::Register {
+                    controller: control.controller.clone(),
+                    member: Member {
+                        writer: Writer {
+                            collector: "a".into(),
+                            process: "process-a".into(),
+                            generation: String::new(),
+                        },
+                        endpoint: "http://a:50051".into(),
+                        pressure: 0.1,
+                        rss_bytes: 1024,
+                        active: 0,
+                        eligible: true,
+                    },
+                })
+                .await?;
+            let writer = state.members["a"].member.writer.clone();
+            store
+                .execute(Command::Policy {
+                    controller: control.controller.clone(),
+                    collector: "a".into(),
+                    writer: writer.clone(),
+                    revision: 0,
+                    operation: "retire-a".into(),
+                    excluded: true,
+                    block_streams: false,
+                    retiring: true,
+                })
+                .await?;
+            store
+                .execute(Command::Observe {
+                    writer,
+                    applied_revision: 1,
+                    observation: placement::Observation {
+                        demand: placement::Demand::default(),
+                        capacity: placement::Demand {
+                            cpu: 1.0,
+                            memory: 1.0,
+                            throughput: 1.0,
+                        },
+                        sequence: 1,
+                        allocation_revision: 0,
+                        tables: BTreeMap::new(),
+                        fingerprints: ["fp".to_owned()].into(),
+                    },
+                })
+                .await?;
+            control.reconcile().await?;
+            assert!(store.snapshot().await?.policies["a"].approved);
+            Ok(())
+        }
     #[tokio::test]
     async fn blocked_drain_does_not_starve_an_independent_failed_source() -> Result<()> {
         let store = Arc::new(MemoryStore(Mutex::new(Snapshot::default())));
         let config = serde_json::from_value(json!({
             "delta":{"publisher":"http://publisher"},"tenant":"t","catalog_id":"c",
-            "tables":[{"key":"blocked","path":["c","s","blocked"],"fingerprints":[]},
-                      {"key":"recover","path":["c","s","recover"],"fingerprints":[]}],
+            "tables":[{"key":"blocked","path":["c","s","blocked"],"fingerprints":["fingerprint"]},
+                      {"key":"recover","path":["c","s","recover"],"fingerprints":["fingerprint"]}],
             "storage":".","controller":"http://control","operator_token":"o","gateway_token":"g",
             "edge_secret":"e","internal_secret":"i","collectors":{},"etcd":[],"etcd_user":"","etcd_password":""
         }))?;
@@ -616,6 +931,25 @@ mod tests {
                     },
                 })
                 .await?;
+            let state = store.snapshot().await?;
+            store
+                .execute(Command::Observe {
+                    writer: state.members[collector].member.writer.clone(),
+                    applied_revision: 0,
+                    observation: placement::Observation {
+                        demand: placement::Demand::default(),
+                        capacity: placement::Demand {
+                            cpu: 1.0,
+                            memory: 1.0,
+                            throughput: 1.0,
+                        },
+                        sequence: 1,
+                        allocation_revision: 0,
+                        tables: BTreeMap::new(),
+                        fingerprints: ["fingerprint".to_owned()].into(),
+                    },
+                })
+                .await?;
         }
         let state = store.snapshot().await?;
         let a = state.members["a"].member.writer.clone();
@@ -627,6 +961,14 @@ mod tests {
                     key: key.into(),
                     target,
                     operation: format!("claim-{key}"),
+                })
+                .await?;
+            let state = store.snapshot().await?;
+            store
+                .execute(Command::Activate {
+                    table: key.into(),
+                    identity: state.tables[key].identity.clone(),
+                    version: -1,
                 })
                 .await?;
         }

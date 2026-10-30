@@ -16,41 +16,8 @@ use std::{
 };
 use tokio::sync::Mutex;
 
-fn select(state: &Snapshot, excluded: Option<&str>) -> Result<Writer> {
-    let mut candidates = state
-        .members
-        .values()
-        .filter(|m| {
-            m.member.eligible
-                && m.expires > 0
-                && m.member.pressure < 0.95
-                && Some(m.member.writer.collector.as_str()) != excluded
-        })
-        .collect::<Vec<_>>();
-    let score = |m: &arrowcol_authority::delta_store::Session| {
-        let reservations = state
-            .tables
-            .values()
-            .filter(|t| {
-                t.record.lifecycle != Lifecycle::Active
-                    && t.reservation
-                        .as_ref()
-                        .is_some_and(|r| r.target.collector == m.member.writer.collector)
-            })
-            .count();
-        arrowcol_routing::delta::reserved_pressure(m.member.pressure, reservations, 16)
-    };
-    candidates.sort_by(|a, b| {
-        score(a)
-            .total_cmp(&score(b))
-            .then(a.member.writer.collector.cmp(&b.member.writer.collector))
-    });
-    Ok(candidates
-        .first()
-        .context("no fresh eligible capacity")?
-        .member
-        .writer
-        .clone())
+fn select(state: &Snapshot, key: &str, excluded: Option<&str>) -> Result<Writer> {
+    arrowcol_authority::placement::select(state, key, excluded)
 }
 
 struct DeltaRouter {
@@ -104,6 +71,9 @@ fn validate_data_only(config: &Config, private: bool, listener: bool) -> Result<
 struct ContextData {
     endpoint: String,
     headers: Vec<(&'static str, String)>,
+    trace: Option<timing::Context>,
+    lifetime: Option<timing::Span>,
+    rejected: bool,
 }
 
 fn error(e: impl std::fmt::Display) -> Box<Error> {
@@ -118,73 +88,99 @@ impl ProxyHttp for DeltaRouter {
     }
 
     async fn request_filter(&self, session: &mut Session, context: &mut Self::CTX) -> pingora::Result<bool> {
-        let result: Result<()> = async {
-            let request = session.req_header();
-            ensure!(
-                request.method == http::Method::POST
-                    && request.uri.path() == "/arrow.flight.protocol.FlightService/DoPut",
-                "only native DoPut"
-            );
-            for h in ["x-adr-route", "x-adr-assertion", "x-adr-signature"] {
-                ensure!(!request.headers.contains_key(h), "external route assertion");
-            }
-            self.edge
-                .verify(
-                    &request.method,
-                    request.uri.path(),
-                    &request.headers,
-                    arrowcol_protocol::UnixMillis::new(now_ms())?,
-                )
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let header = |key| request.headers.get(key).and_then(|v| v.to_str().ok()).unwrap_or("");
-            let table = self
-                .config
-                .tables
-                .iter()
-                .find(|t| {
-                    t.path
-                        .iter()
-                        .zip(["x-arrowcol-catalog", "x-arrowcol-schema", "x-arrowcol-table"])
-                        .all(|(value, key)| value == header(key))
-                })
-                .context("table unauthorized")?;
-            let mut cache = self.cache.lock().await;
-            let mut cache_hit = false;
-            let assignment = if let Some((at, a)) = cache.get(&table.key)
-                && at.elapsed() < Duration::from_millis(300)
-                && a.record.lifecycle == Lifecycle::Active
-            {
-                cache_hit = true;
-                a.clone()
-            } else {
-                let a = self.control.resolve(table.key.clone()).await?;
-                cache.insert(table.key.clone(), (Instant::now(), a.clone()));
-                a
-            };
-            ensure!(assignment.record.lifecycle == Lifecycle::Active, "owner recovering");
-            eprintln!(
-                "{}",
-                serde_json::json!({
-                    "event":"delta_route","observed_ms":now_ms(),"key":table.key,
-                    "cache_hit":cache_hit,"epoch":assignment.record.epoch,
-                    "data_only":matches!(self.control, ControlPlane::Remote(_))
-                })
-            );
-            let route = STANDARD.encode(serde_json::to_vec(&assignment)?);
-            let assertion = format!("{}\n{}\n{}", now_ms(), header("x-arrowcol-edge-signature"), route);
-            context.headers = vec![
-                ("x-adr-route", route),
-                ("x-adr-assertion", STANDARD.encode(&assertion)),
-                (
-                    "x-adr-signature",
-                    flight::sign(&self.config.internal_secret, &assertion)?,
-                ),
-            ];
-            context.endpoint = assignment.record.endpoint;
-            Ok(())
-        }
-        .await;
+        let trace = session
+            .req_header()
+            .headers
+            .get("x-adr-trace")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let trace = timing::Context::new(trace, "gateway");
+        context.trace = Some(trace.clone());
+        let result: Result<()> = trace
+            .scope(timing::measure("gateway-filter", "lifecycle", async {
+                context.lifetime = Some(timing::Span::new("gateway-stream", "transport_observation"));
+                if let Some(parent) = context.lifetime.as_ref().and_then(timing::Span::id) {
+                    context.trace.as_mut().context("trace scope")?.parent = Some(parent.to_owned());
+                }
+                let request = session.req_header();
+                ensure!(
+                    request.method == http::Method::POST
+                        && request.uri.path() == "/arrow.flight.protocol.FlightService/DoPut",
+                    "only native DoPut"
+                );
+                for h in ["x-adr-route", "x-adr-assertion", "x-adr-signature"] {
+                    ensure!(!request.headers.contains_key(h), "external route assertion");
+                }
+                self.edge
+                    .verify(
+                        &request.method,
+                        request.uri.path(),
+                        &request.headers,
+                        arrowcol_protocol::UnixMillis::new(now_ms())?,
+                    )
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let header = |key| request.headers.get(key).and_then(|v| v.to_str().ok()).unwrap_or("");
+                let table = self
+                    .config
+                    .tables
+                    .iter()
+                    .find(|t| {
+                        t.path
+                            .iter()
+                            .zip(["x-arrowcol-catalog", "x-arrowcol-schema", "x-arrowcol-table"])
+                            .all(|(value, key)| value == header(key))
+                    })
+                    .context("table unauthorized")?;
+                let mut cache = self.cache.lock().await;
+                let mut cache_hit = false;
+                let assignment = if let Some((at, a)) = cache.get(&table.key)
+                    && at.elapsed() < Duration::from_millis(300)
+                    && a.record.lifecycle == Lifecycle::Active
+                {
+                    cache_hit = true;
+                    a.clone()
+                } else {
+                    let a = timing::measure(
+                        "assignment-resolve",
+                        "downstream_wait",
+                        arrowcol_authority::delta_runtime::resolve_active(|| self.control.resolve(table.key.clone())),
+                    )
+                    .await?;
+                    cache.insert(table.key.clone(), (Instant::now(), a.clone()));
+                    a
+                };
+                ensure!(assignment.record.lifecycle == Lifecycle::Active, "owner recovering");
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "event":"delta_route","observed_ms":now_ms(),"key":table.key,
+                        "cache_hit":cache_hit,"epoch":assignment.record.epoch,
+                        "data_only":matches!(self.control, ControlPlane::Remote(_))
+                    })
+                );
+                let route = STANDARD.encode(serde_json::to_vec(&assignment)?);
+                let assertion = format!("{}\n{}\n{}", now_ms(), header("x-arrowcol-edge-signature"), route);
+                context.headers = vec![
+                    (
+                        "x-adr-trace",
+                        context.trace.as_ref().context("trace scope")?.trace.clone(),
+                    ),
+                    ("x-adr-route", route),
+                    ("x-adr-assertion", STANDARD.encode(&assertion)),
+                    (
+                        "x-adr-signature",
+                        flight::sign(&self.config.internal_secret, &assertion)?,
+                    ),
+                ];
+                if let Some(parent) = &context.trace.as_ref().context("trace scope")?.parent {
+                    context.headers.push(("x-adr-parent", parent.clone()));
+                }
+                context.endpoint = assignment.record.endpoint;
+                Ok(())
+            }))
+            .await;
         if let Err(e) = result {
+            context.rejected = true;
             let mut response = ResponseHeader::build(200, Some(3))?;
             response.insert_header("content-type", "application/grpc")?;
             response.insert_header("grpc-status", "14")?;
@@ -229,6 +225,15 @@ impl ProxyHttp for DeltaRouter {
     fn fail_to_connect(&self, _: &mut Session, _: &HttpPeer, _: &mut Self::CTX, mut e: Box<Error>) -> Box<Error> {
         e.set_retry(false);
         e
+    }
+    async fn logging(&self, _: &mut Session, error: Option<&Error>, context: &mut Self::CTX) {
+        if let Some(mut span) = context.lifetime.take() {
+            if error.is_some() || context.rejected {
+                span.failed();
+            } else {
+                span.completed();
+            }
+        }
     }
     fn error_while_proxy(
         &self,

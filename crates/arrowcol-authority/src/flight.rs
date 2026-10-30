@@ -1,6 +1,6 @@
 //! Native Flight forwarding and a deliberately explicit manifest collector adapter.
 use crate::*;
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo, HandshakeRequest, HandshakeResponse,
     PollInfo, PutResult, SchemaResult, Ticket,
@@ -313,16 +313,25 @@ impl Service {
         {
             return Ok(assignment.clone());
         }
-        let deadline = Instant::now() + Duration::from_secs(5);
         directory.lookup_refreshes = directory.lookup_refreshes.saturating_add(1);
-        let assignment = loop {
-            let value = self.client.call(&Operation::Resolve { key: key.to_owned() }).await?;
-            let assignment: Assignment = serde_json::from_value(value)?;
-            if assignment.record.lifecycle == Lifecycle::Active {
-                break assignment;
+        let assignment = if self.config.delta.is_some() {
+            crate::delta_runtime::resolve_active(|| async {
+                Ok(serde_json::from_value(
+                    self.client.call(&Operation::Resolve { key: key.to_owned() }).await?,
+                )?)
+            })
+            .await?
+        } else {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let value = self.client.call(&Operation::Resolve { key: key.to_owned() }).await?;
+                let assignment: Assignment = serde_json::from_value(value)?;
+                if assignment.record.lifecycle == Lifecycle::Active {
+                    break assignment;
+                }
+                ensure!(Instant::now() < deadline, "owner recovery/drain deadline");
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            ensure!(Instant::now() < deadline, "owner recovery/drain deadline");
-            tokio::time::sleep(Duration::from_millis(50)).await;
         };
         if directory
             .entries
@@ -338,11 +347,13 @@ impl Service {
     pub async fn background(&self) {
         let mut snapshotted = false;
         let mut cpu_previous: Option<(Instant, u64)> = None;
+        let mut bytes_previous: Option<(Instant, u64)> = None;
         loop {
             let Ok(_runtime) = self.runtime.enter().await else {
                 return;
             };
             let result: Result<()> = async {
+                let mut observed_demand = None;
                 if matches!(self.role, Role::Gateway) && snapshotted {
                     let after = self.directory.lock().await.revision;
                     let value = self.client.call(&Operation::Watch { after }).await?;
@@ -377,16 +388,41 @@ impl Service {
                     let active = self.active.load(Ordering::Relaxed);
                     let cpu = std::fs::read_to_string("/sys/fs/cgroup/cpu.stat")
                         .ok()
-                        .and_then(|raw| {
-                            raw.lines()
+                        .and_then(|text| {
+                            text.lines()
                                 .find_map(|line| line.strip_prefix("usage_usec ").and_then(|n| n.parse::<u64>().ok()))
-                        })
-                        .unwrap_or(0);
+                        });
+                    if self.config.delta.is_some() {
+                        ensure!(cpu.is_some(), "CPU observation unavailable");
+                    }
+                    let cpu = cpu.unwrap_or(0);
                     let sampled = Instant::now();
                     let cpu_pressure = cpu_previous.map_or(0.0, |(at, previous)| {
                         cpu.saturating_sub(previous) as f64 / (sampled.duration_since(at).as_secs_f64() * 1_000_000.)
                     });
+                    let received = self.observations.received_bytes.load(Ordering::Relaxed);
+                    if self.config.delta.is_some() {
+                        if let (Some((_, previous)), Some((at, previous_bytes))) = (cpu_previous, bytes_previous) {
+                            ensure!(cpu >= previous && received >= previous_bytes, "resource counter reset");
+                            let quota = std::fs::read_to_string("/sys/fs/cgroup/cpu.max")?;
+                            let values = quota.split_whitespace().collect::<Vec<_>>();
+                            ensure!(values.len() == 2 && values[0] != "max", "finite CPU quota required");
+                            let cores = values[0].parse::<f64>()? / values[1].parse::<f64>()?;
+                            let limit = std::fs::read_to_string("/sys/fs/cgroup/memory.max")?
+                                .trim()
+                                .parse::<f64>()?;
+                            ensure!(cores > 0.0 && limit > 0.0, "invalid resource capacity");
+                            observed_demand = Some(placement::Demand {
+                                cpu: cpu_pressure / cores,
+                                memory: rss as f64 / limit,
+                                throughput: (received - previous_bytes) as f64
+                                    / sampled.duration_since(at).as_secs_f64()
+                                    / (64.0 * 1024.0 * 1024.0),
+                            });
+                        }
+                    }
                     cpu_previous = Some((sampled, cpu));
+                    bytes_previous = Some((sampled, received));
                     let registration = self
                         .client
                         .call(&Operation::Register {
@@ -408,6 +444,52 @@ impl Service {
                 let assignments: Vec<Assignment> = serde_json::from_value(view["assignments"].clone())?;
                 if let Role::Collector(writer) = &self.role {
                     let writer = writer.lock().await.clone();
+                    if self.config.delta.is_some()
+                        && let Some(demand) = observed_demand
+                    {
+                        let revision = view["policies"][&writer.collector]["revision"].as_i64().unwrap_or(0);
+                        let directory = self.directory.lock().await;
+                        let allocation_revision = directory.revision;
+                        let tables = directory
+                            .entries
+                            .iter()
+                            .filter(|(_, a)| {
+                                a.record.writer == writer
+                                    && a.record.lifecycle == Lifecycle::Active
+                                    && assignments.iter().any(|current| {
+                                        current.record.key == a.record.key
+                                            && current.record.writer == writer
+                                            && current.record.epoch == a.record.epoch
+                                            && current.record.lifecycle == Lifecycle::Active
+                                    })
+                            })
+                            .map(|(key, _)| (key.clone(), placement::Demand::default()))
+                            .collect();
+                        drop(directory);
+                        self.client
+                            .call(&Operation::Observe {
+                                writer: writer.clone(),
+                                observation: placement::Observation {
+                                    demand,
+                                    capacity: placement::Demand {
+                                        cpu: 1.0,
+                                        memory: 1.0,
+                                        throughput: 1.0,
+                                    },
+                                    sequence: now_ms(),
+                                    allocation_revision,
+                                    tables,
+                                    fingerprints: self
+                                        .config
+                                        .tables
+                                        .iter()
+                                        .flat_map(|t| t.fingerprints.clone())
+                                        .collect(),
+                                },
+                                applied_revision: revision,
+                            })
+                            .await?;
+                    }
                     for assignment in &assignments {
                         let record = &assignment.record;
                         if record.writer == writer && record.lifecycle == Lifecycle::Recovering {
@@ -514,7 +596,9 @@ impl Service {
                 if !metadata(&headers, "x-adr-route").is_empty() {
                     return Err(Status::unauthenticated("external internal-route assertion"));
                 }
-                let assignment = self.resolve(&table.key).await.map_err(status)?;
+                let assignment = timing::measure("assignment-resolve", "downstream_wait", self.resolve(&table.key))
+                    .await
+                    .map_err(status)?;
                 let route = STANDARD.encode(serde_json::to_vec(&assignment).map_err(status)?);
                 let assertion = format!(
                     "{}\n{}\n{}",
@@ -528,8 +612,7 @@ impl Service {
                     .connect_timeout(Duration::from_secs(2))
                     .timeout(Duration::from_secs(30));
                 let mut client = FlightServiceClient::new(
-                    endpoint
-                        .connect()
+                    timing::measure("upstream-connect", "transport_observation", endpoint.connect())
                         .await
                         .map_err(|e| Status::unavailable(e.to_string()))?,
                 )
@@ -538,12 +621,16 @@ impl Service {
                 let (tx, rx) = mpsc::channel(4);
                 tx.send((first, first_held)).await.map_err(status)?;
                 let input_bytes = self.observations.gateway_input_bytes.clone();
+                let input_context = timing::current().ok_or_else(|| status("missing trace context"))?;
                 let (input_error_tx, mut input_error_rx) = tokio::sync::oneshot::channel();
-                let forward = tokio::spawn(async move {
+                let forward = tokio::spawn(input_context.scope(async move {
                     let result = async {
                         while let Some(message) = inbound.message().await? {
                             let held = input_bytes.hold(message.encoded_len());
-                            if tx.send((message, held)).await.is_err() {
+                            if timing::measure("gateway-input-queue", "queue", tx.send((message, held)))
+                                .await
+                                .is_err()
+                            {
                                 return Ok::<(), Status>(());
                             }
                         }
@@ -554,9 +641,19 @@ impl Service {
                     if let Err(error) = result {
                         let _ = input_error_tx.send(error);
                     }
-                });
+                }));
                 let mut outgoing = Request::new(ReceiverStream::new(rx).map(|(message, _held)| message));
                 *outgoing.metadata_mut() = headers;
+                if let Some(context) = timing::current() {
+                    outgoing
+                        .metadata_mut()
+                        .insert("x-adr-trace", context.trace.parse().map_err(status)?);
+                    if let Some(parent) = context.parent {
+                        outgoing
+                            .metadata_mut()
+                            .insert("x-adr-parent", parent.parse().map_err(status)?);
+                    }
+                }
                 outgoing
                     .metadata_mut()
                     .insert("x-adr-route", route.parse().map_err(status)?);
@@ -580,7 +677,8 @@ impl Service {
                 let cache = Arc::clone(&self.directory);
                 let key = table.key;
                 let result_bytes = self.observations.gateway_result_bytes.clone();
-                tokio::spawn(async move {
+                let output_context = timing::current().ok_or_else(|| status("missing trace context"))?;
+                tokio::spawn(output_context.scope(async move {
                     let _permit = permit;
                     let deadline = tokio::time::sleep(Duration::from_secs(30));
                     tokio::pin!(deadline);
@@ -589,11 +687,11 @@ impl Service {
                             _=tx.closed()=>break,
                             _=&mut deadline=>{let _=tx.send((Err(Status::deadline_exceeded("gateway stream lifetime")),None)).await;break;},
                             result=&mut input_error_rx, if !input_error_rx.is_terminated()=>{if let Ok(error)=result {let _=tx.send((Err(error),None)).await;break;}},
-                            item=response.message()=>{
+                            item=timing::measure("gateway-receive","transport_observation",response.message())=>{
                                 match item {
                                     Ok(Some(value))=>{
                                         let held=result_bytes.hold(value.encoded_len());
-                                        if tx.send((Ok(value),Some(held))).await.is_err(){break;}
+                                        if timing::measure("gateway-output-queue","queue",tx.send((Ok(value),Some(held)))).await.is_err(){break;}
                                     },
                                     Ok(None)=>break,
                                     Err(error)=>{cache.lock().await.invalidate(&key,&error);let _=tx.send((Err(error),None)).await;break;}
@@ -602,7 +700,7 @@ impl Service {
                         }
                     }
                     forward.abort();
-                });
+                }));
                 Ok(Response::from_parts(
                     parts,
                     Box::pin(ReceiverStream::new(rx).map(|(value, _held)| value)),
@@ -641,10 +739,25 @@ impl Service {
                 let service = self.clone();
                 let expected_fingerprint = metadata(&headers, "x-arrowcol-schema-fingerprint").to_owned();
                 let descriptor = first.flight_descriptor.clone();
+                let stream_id = uuid::Uuid::new_v4().to_string();
+                if self.config.delta.is_some() {
+                    self.client
+                        .call(&Operation::OpenStream {
+                            key: table.key.clone(),
+                            writer: writer.clone(),
+                            epoch: assignment.record.epoch,
+                            stream: stream_id.clone(),
+                            fingerprint: expected_fingerprint.clone(),
+                        })
+                        .await
+                        .map_err(status)?;
+                }
                 let (tx, rx) = mpsc::channel(4);
                 self.active.fetch_add(1, Ordering::Relaxed);
-                tokio::spawn(async move {
+                let context = timing::current().ok_or_else(|| status("missing trace context"))?;
+                tokio::spawn(context.scope(async move {
                     let _permit = permit;
+                    let mut lifetime = timing::Span::new("collector-stream", "lifecycle");
                     let result = tokio::time::timeout(Duration::from_secs(30), async {
                         let _legacy_mailbox = if service.config.delta.is_none() {
                             let waiting = service.observations.mailbox_waiters.hold(1);
@@ -668,13 +781,21 @@ impl Service {
                         let input = input.map_err(arrow_flight::error::FlightError::from);
                         let mut batches = FlightRecordBatchStream::new_from_flight_data(input);
                         let mut total = 0usize;
-                        while let Some(batch) = batches.try_next().await.map_err(status)? {
+                        while let Some(batch) =
+                            timing::measure("receive-decode", "transport_observation", batches.try_next())
+                                .await
+                                .map_err(status)?
+                        {
                             let fingerprint =
                                 arrowcol_protocol::fingerprint_schema(batch.schema().as_ref()).to_string();
                             if fingerprint != expected_fingerprint || !table.fingerprints.contains(&fingerprint) {
                                 return Err(status("decoded schema not registered"));
                             }
                             let bytes = batch.get_array_memory_size();
+                            service
+                                .observations
+                                .received_bytes
+                                .fetch_add(bytes as u64, Ordering::Relaxed);
                             total = total.saturating_add(bytes);
                             if bytes > MAX_MESSAGE || total > 8 * 1024 * 1024 {
                                 return Err(Status::resource_exhausted("unit/stream retained memory bound"));
@@ -685,7 +806,10 @@ impl Service {
                             // the shared H2 connection window and deadlock its active writer.
                             let _delta_mailbox = if service.config.delta.is_some() {
                                 let waiting = service.observations.mailbox_waiters.hold(1);
+                                let mut span = timing::Span::new("collector-mailbox", "queue");
                                 let guard = Arc::clone(&mailbox).lock_owned().await;
+                                span.completed();
+                                drop(span);
                                 drop(waiting);
                                 Some((guard, service.observations.writer_streams.hold(1)))
                             } else {
@@ -695,16 +819,24 @@ impl Service {
                                 return Err(Status::cancelled("client disconnected"));
                             }
                             let unit = uuid::Uuid::new_v4().to_string();
-                            let admitted = service
-                                .client
-                                .call(&Operation::Admit {
+                            timing::unit(&unit);
+                            let admission = if service.config.delta.is_some() {
+                                Operation::AdmitStream {
+                                    key: table.key.clone(),
+                                    writer: writer.clone(),
+                                    epoch: assignment.record.epoch,
+                                    stream: stream_id.clone(),
+                                    unit: unit.clone(),
+                                }
+                            } else {
+                                Operation::Admit {
                                     key: table.key.clone(),
                                     writer: writer.clone(),
                                     epoch: assignment.record.epoch,
                                     unit: unit.clone(),
-                                })
-                                .await
-                                .map_err(status)?;
+                                }
+                            };
+                            let admitted = service.client.call(&admission).await.map_err(status)?;
                             let admitted: Assignment = serde_json::from_value(admitted).map_err(status)?;
                             if service.config.delta.is_some() {
                                 tx.send(Ok(PutResult {
@@ -717,9 +849,13 @@ impl Service {
                                 .await
                                 .map_err(|_| Status::cancelled("operation identity client closed"))?;
                                 let path = service.config.storage.join(format!("{unit}.parquet"));
-                                let sha256 = crate::sql_publication::stage_batch(&path, &batch)
-                                    .await
-                                    .map_err(status)?;
+                                let sha256 = timing::measure(
+                                    "encode-stage",
+                                    "processing",
+                                    crate::sql_publication::stage_batch(&path, &batch),
+                                )
+                                .await
+                                .map_err(status)?;
                                 drop(held_batch);
                                 let receipt = service
                                     .publisher()
@@ -784,11 +920,29 @@ impl Service {
                     })
                     .await
                     .unwrap_or_else(|_| Err(Status::deadline_exceeded("collector lifetime")));
+                    if result.is_ok() {
+                        lifetime.completed();
+                    } else {
+                        lifetime.failed();
+                    }
                     if let Err(error) = result {
                         let _ = tx.send(Err(error)).await;
                     }
+                    if service.config.delta.is_some() {
+                        if let Err(error) = service
+                            .client
+                            .call(&Operation::CloseStream {
+                                key: table.key.clone(),
+                                writer: writer.clone(),
+                                stream: stream_id,
+                            })
+                            .await
+                        {
+                            eprintln!("stream close reconciliation required: {error}");
+                        }
+                    }
                     service.active.fetch_sub(1, Ordering::Relaxed);
-                });
+                }));
                 Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
             }
         }
@@ -831,7 +985,14 @@ impl FlightService for Service {
         &self,
         request: Request<tonic::Streaming<FlightData>>,
     ) -> std::result::Result<Response<Self::DoPutStream>, Status> {
-        self.put(request).await
+        let trace = metadata(request.metadata(), "x-adr-trace");
+        let role = match self.role {
+            Role::Gateway => "gateway",
+            Role::Collector(_) => "collector",
+        };
+        timing::Context::from_parent(trace, role, metadata(request.metadata(), "x-adr-parent"))
+            .scope(timing::measure("flight-admission", "lifecycle", self.put(request)))
+            .await
     }
     async fn do_exchange(
         &self,

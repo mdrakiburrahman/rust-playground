@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:arrowcol:benchmark:1",
+  "title": "Arrowcol bounded benchmark exchange",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "schema_version", "dataset_id", "provenance", "runs", "records", "links", "coverage"],
+  "properties": {
+    "format": {"const": "arrowcol-benchmark"},
+    "schema_version": {"const": 1},
+    "dataset_id": {"$ref": "#/$defs/id"},
+    "provenance": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source_revision", "synthetic", "description"],
+      "properties": {
+        "source_revision": {"type": "string", "pattern": "^[a-f0-9]{40}$"},
+        "synthetic": {"type": "boolean"},
+        "description": {"enum": ["canonical-fixture", "finite-local-comparison", "simulation"]},
+        "artifact_sha256": {"type": "array", "maxItems": 64, "items": {"type": "string", "pattern": "^[a-f0-9]{64}$"}}
+      }
+    },
+    "runs": {
+      "type": "array", "minItems": 1, "maxItems": 64,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["id", "arm", "scenario", "repetition", "seed"],
+        "properties": {
+          "id": {"$ref": "#/$defs/id"},
+          "arm": {"enum": ["adr", "pingora", "simulation"]},
+          "scenario": {"$ref": "#/$defs/id"},
+          "repetition": {"type": "integer", "minimum": 0, "maximum": 100},
+          "seed": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+          "cpu_limit": {"type": "number", "exclusiveMinimum": 0, "maximum": 256},
+          "memory_limit_bytes": {"type": "integer", "minimum": 1, "maximum": 1099511627776}
+        }
+      }
+    },
+    "records": {"type": "array", "maxItems": 100000, "items": {"$ref": "#/$defs/record"}},
+    "links": {
+      "type": "array", "maxItems": 200000,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["from", "to", "relation"],
+        "properties": {
+          "from": {"$ref": "#/$defs/id"}, "to": {"$ref": "#/$defs/id"},
+          "relation": {"enum": ["parent", "attempt", "retry", "contains", "publishes", "receipt", "async", "queue", "derived-from", "assigned-to"]},
+          "rows": {"type": "integer", "minimum": 0, "maximum": 1000000000},
+          "bytes": {"type": "integer", "minimum": 0, "maximum": 1099511627776}
+        }
+      }
+    },
+    "coverage": {
+      "type": "object", "additionalProperties": false,
+      "required": ["dropped_events", "incomplete_attempts", "complete"],
+      "properties": {
+        "dropped_events": {"type": "integer", "minimum": 0},
+        "incomplete_attempts": {"type": "integer", "minimum": 0},
+        "complete": {"type": "boolean"},
+        "unobserved_stages": {"type": "array", "maxItems": 128, "uniqueItems": true, "items": {"$ref": "#/$defs/id"}}
+      }
+    }
+  },
+  "$defs": {
+    "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"},
+    "ns": {"type": "string", "pattern": "^(0|[1-9][0-9]{0,19})$"},
+    "record": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "run_id", "kind", "evidence"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"}, "run_id": {"$ref": "#/$defs/id"},
+        "kind": {"enum": ["request", "attempt", "unit", "batch", "commit", "receipt", "span", "resource", "event", "replica", "table", "aggregate"]},
+        "evidence": {"enum": ["measured", "derived", "estimated", "unavailable"]},
+        "role": {"enum": ["client", "gateway", "placement", "authority", "collector", "publisher", "storage", "registry"]},
+        "process_id": {"$ref": "#/$defs/id"}, "clock_id": {"$ref": "#/$defs/id"},
+        "table_id": {"$ref": "#/$defs/id"}, "trace_id": {"$ref": "#/$defs/id"},
+        "stage": {"$ref": "#/$defs/id"},
+        "category": {"enum": ["queue", "processing", "downstream_wait", "transport_observation", "lifecycle"]},
+        "offset_ns": {"$ref": "#/$defs/ns"}, "duration_ns": {"$ref": "#/$defs/ns"},
+        "status": {"enum": ["requested", "pending", "applied", "completed", "failed", "unknown", "cancelled", "timeout", "rejected", "recovering", "active", "draining", "retired"]},
+        "error_code": {"$ref": "#/$defs/id"},
+        "rows": {"type": "integer", "minimum": 0, "maximum": 1000000000},
+        "bytes": {"type": "integer", "minimum": 0, "maximum": 1099511627776},
+        "epoch": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "version": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "cache_hit": {"type": "boolean"},
+        "metric": {"enum": ["cpu", "memory", "io", "throughput", "queue_depth", "queue_age", "latency"]},
+        "value": {"type": ["number", "null"], "minimum": 0},
+        "unit": {"enum": ["ns", "bytes", "rows", "bytes_per_second", "rows_per_second", "count", "fraction"]},
+        "method": {"enum": ["local-monotonic", "process-counter", "union-of-intervals", "client-milestones", "seeded-model", "not-observed"]},
+        "assumption": {"enum": ["illustrative-not-calibrated", "same-clock-only", "process-not-request", "shared-work-not-allocated"]},
+        "digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+      },
+      "allOf": [
+        {"if": {"properties": {"kind": {"const": "resource"}}}, "then": {"required": ["metric", "unit", "value", "process_id", "clock_id", "offset_ns", "duration_ns", "method"]}},
+        {"if": {"properties": {"kind": {"const": "span"}}}, "then": {"required": ["role", "process_id", "clock_id", "trace_id", "stage", "category", "offset_ns", "duration_ns", "status"]}},
+        {"if": {"properties": {"evidence": {"const": "estimated"}}}, "then": {"required": ["method", "assumption"]}},
+        {"if": {"properties": {"evidence": {"const": "derived"}}}, "then": {"required": ["method"]}},
+        {"if": {"properties": {"evidence": {"const": "unavailable"}}}, "then": {"required": ["method"], "properties": {"method": {"const": "not-observed"}, "value": {"type": "null"}}}}
+      ]
+    }
+  }
+}

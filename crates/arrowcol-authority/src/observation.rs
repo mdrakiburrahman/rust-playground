@@ -2,7 +2,7 @@
 use serde::Serialize;
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
 #[derive(Clone, Debug, Default)]
@@ -45,6 +45,7 @@ impl Drop for Held {
 }
 #[derive(Default)]
 pub struct Counters {
+    pub received_bytes: AtomicU64,
     pub gateway_input_bytes: Gauge,
     pub gateway_result_bytes: Gauge,
     pub mailbox_waiters: Gauge,

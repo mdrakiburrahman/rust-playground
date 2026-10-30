@@ -184,7 +184,15 @@ impl Authority {
         // Serializes placement reservations/admission barriers, not data encoding or forwarding.
         let _guard = self.serial.lock().await;
         match op {
-            Operation::PublishDelta { .. } | Operation::RecoverDelta { .. } | Operation::DeltaReceipt { .. } => {
+            Operation::PublishDelta { .. }
+            | Operation::RecoverDelta { .. }
+            | Operation::DeltaReceipt { .. }
+            | Operation::Policy { .. }
+            | Operation::Observe { .. }
+            | Operation::OpenStream { .. }
+            | Operation::CloseStream { .. }
+            | Operation::AdmitStream { .. }
+            | Operation::CatalogPolicy { .. } => {
                 bail!("Delta operation requires explicit Delta runtime")
             }
             Operation::Watch { .. } => bail!("watch must use nonblocking directory handler"),

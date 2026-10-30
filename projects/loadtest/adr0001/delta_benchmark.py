@@ -18,13 +18,14 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 
 import pyarrow as pa
 import pyarrow.flight as flight
 
 from delta_runtime import Runtime, native
 from publication_gate import REPO
-from observation import Observer
+from observation import Observer, read_ns
 
 
 PHASES = [
@@ -101,6 +102,7 @@ class Benchmark(Runtime):
             original_sample()
             raw = self.observer.engine.get(f"/containers/{self.sql_name}/stats?stream=false&one-shot=true")
             self.sql_samples.append({"time_ns": time.time_ns(), "phase": self.observer.current,
+                "engine_read_ns": read_ns(raw["read"]),
                 "cpu_total_usage_ns": raw["cpu_stats"]["cpu_usage"]["total_usage"],
                 "memory_usage_bytes": raw.get("memory_stats", {}).get("usage"),
                 "memory_anon_bytes": raw.get("memory_stats", {}).get("stats", {}).get("anon"),
@@ -116,6 +118,7 @@ class Benchmark(Runtime):
                   "table": key, "phase": phase, "gateway_port": port,
                   "started_ns": time.time_ns(), "receipts": [], "terminal": "unknown",
                   "payload_retries": 0, "reader_visibility_ms": None}
+        record["trace_id"] = str(uuid.uuid4())
         schema = self.schemas[0]
         batch = pa.RecordBatch.from_arrays([pa.array(range(first, first + count), type=pa.int64())], schema=schema)
         headers = native.signed_headers(self.config["edge_secret"].encode(), "POST", native.PUT_PATH, {
@@ -123,6 +126,7 @@ class Benchmark(Runtime):
             "x-arrowcol-implementation-pool": "direct", "x-arrowcol-catalog": "telemetry",
             "x-arrowcol-schema": "runtime", "x-arrowcol-table": key,
             "x-arrowcol-schema-fingerprint": self.fingerprints[0]})
+        headers["x-adr-trace"] = record["trace_id"]
         client = flight.FlightClient(f"grpc://127.0.0.1:{port}")
         writer = None
         try:
@@ -213,7 +217,26 @@ class Benchmark(Runtime):
                             aliases=["collector4"], stage=True)
             self.wait(lambda: sum(m["eligible"] for m in self.post({"op": "view"})["members"]) == 4)
         elif phase == "collectors-three":
-            self.run(["docker", "stop", "-t", "1", self.names["collector4"]])
+            state = self.post({"op": "view"})
+            member = next(m for m in state["members"] if m["writer"]["collector"] == "collector4")
+            revision = state.get("policies", {}).get("collector4", {}).get("revision", 0)
+            operation = str(uuid.uuid4())
+            container = json.loads(self.run(["docker", "inspect", self.names["collector4"]]).stdout)[0]
+            assert container["Config"]["Labels"].get("delta-runtime") == self.project
+            container_id = container["Id"]
+            self.post({"op": "policy", "collector": "collector4", "writer": member["writer"],
+                       "revision": revision, "operation": operation, "excluded": True,
+                       "block_streams": False, "retiring": True})
+            def retirement_approved():
+                policy = self.post({"op": "view"}).get("policies", {}).get("collector4", {})
+                return policy if (policy.get("approved") and policy.get("incarnation") == member["writer"]
+                    and policy.get("revision") == revision + 1 and policy.get("operation") == operation
+                    and not policy.get("recovery_obligations")) else None
+            approval = self.wait(retirement_approved)
+            event["retirement_policy"] = approval
+            current = json.loads(self.run(["docker", "inspect", self.names["collector4"]]).stdout)[0]
+            assert current["Id"] == container_id, "collector container identity changed during retirement"
+            self.run(["docker", "stop", "-t", "1", container_id])
             self.wait(lambda: sum(m["eligible"] for m in self.post({"op": "view"})["members"]) == 3)
             for key in ("main", "cas"):
                 self.wait(lambda key=key: self.assignment(key)["record"]["lifecycle"] == "Active")
@@ -377,6 +400,10 @@ def main():
         execute_remaining(args, directory, frozen, attempts)
         return
     directory.mkdir(parents=True, exist_ok=False)
+    revision = {"commit": subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(),
+        "dirty": bool(subprocess.check_output(
+            ["git", "status", "--porcelain", "--untracked-files=normal"], cwd=REPO, text=True).strip())}
     frozen = directory / "bin"
     frozen.mkdir()
     for binary in BINARIES:
@@ -398,11 +425,16 @@ def main():
         shutil.copy2(history / (prefix + name), directory / ("historical-" + name))
     source_paths = [REPO / "Cargo.lock", REPO / "Cargo.toml"]
     for base in ("crates/arrowcol-authority", "crates/arrowcol-routing", "crates/arrow-deltalake",
-                 "crates/arrowcol-sql-server", "projects/arrowcol-router-rust", "projects/loadtest/adr0001"):
-        source_paths += [p for p in (REPO / base).rglob("*") if p.is_file() and p.suffix in (".rs", ".toml", ".sql", ".py", ".md")]
+                 "crates/arrowcol-sql-server", "crates/arrowcol-protocol", "crates/arrowcol-receipts",
+                 "projects/arrowcol-router-rust", "projects/loadtest/adr0001"):
+        source_paths += [p for p in (REPO / base).rglob("*") if p.is_file()
+                         and p.suffix in (".rs", ".toml", ".sql", ".py", ".md", ".json")
+                         and "__pycache__" not in p.parts]
     save(directory / "source-binary-sha256.json", {
         **{str(p.relative_to(REPO)): digest(p) for p in source_paths},
         **{str((frozen / n).relative_to(REPO)): digest(frozen / n) for n in BINARIES}})
+    revision["source_binary_manifest_sha256"] = digest(directory / "source-binary-sha256.json")
+    save(directory / "revision.json", revision)
     for source in source_paths:
         destination = directory / "measured-source" / source.relative_to(REPO)
         destination.parent.mkdir(parents=True, exist_ok=True)

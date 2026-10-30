@@ -1,5 +1,38 @@
 # Explicit ADR 0001 same-host experiment
 
+## ADR alignment and stage tracing
+
+The in-progress SQL/Delta update targets ADR PR #9 revision
+`1ba1e53577ba3acf3db94626bce8bb7af819a7d8` for both primary arms; historical
+manifest/legacy modes remain regression surfaces, not feature-parity targets.
+The cohorts documented below predate this update and do not qualify it.
+
+The shared placement model uses fresh collector observations, conditional
+reservations and conservative new-table resource estimates. CPU and memory are
+normalized to the collector cgroup's configured limits. Throughput is normalized
+to a configured 64 MiB/s experiment envelope, **not measured sustainable
+capacity**; per-table cold costs are estimates, not allocated CPU measurements.
+Unknown/stale capacity backpressures placement. Excluding future placement,
+blocking new streams, and retiring a collector are distinct revisioned policies.
+Retirement must retain successor-recovery obligations until recovered ACTIVE,
+including replacement of a failed RECOVERING successor.
+
+`ARROWCOL_TRACE=1` enables bounded per-service monotonic spans. Disabled spans
+skip clock/context capture, UUID and JSON construction; trace-header propagation
+remains part of both arms. An on/off comparison measures enabled span tracing
+over that common baseline, not the cost of removing all instrumentation code.
+Stages are inclusive elapsed observations, not exclusive CPU work. In
+particular, outer request/materialization spans contain downstream waits.
+Neither SQL engine CPU nor cross-clock one-way latency is inferred.
+
+The closed-field [benchmark exchange v1](contracts/README.md) is shared with the
+standalone factory visualization. Validate/import data without granting any
+runtime control. `export_traces.py --cohort COHORT` projects allowlisted aliases,
+request/attempt/unit/commit/receipt links, service spans and container resource
+intervals; its stage report lists missing coverage. Overflow markers make the
+dataset incomplete; their count is a lower bound on suppressed events.
+Fresh qualification and rerun evidence for this update is not yet available.
+
 ## Current comparison: shared SQL / Delta
 
 The fresh main report is **adapted Pingora/router-hosted placement versus ADR

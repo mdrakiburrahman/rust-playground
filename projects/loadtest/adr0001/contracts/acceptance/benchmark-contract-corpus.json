@@ -1,0 +1,2189 @@
+{
+  "format": "arrowcol-contract-acceptance",
+  "schema_sha256": "4e0384720d8e2ea7ef5dec9cc719aedbe3be782e83670476fa236234d3333c65",
+  "fixture_sha256": "1d62d035a5bf2bc8cdea65794697d757b93a4ce61beceba091864f4549f2d7bf",
+  "cases": [
+    {
+      "name": "canonical-fixture",
+      "accept": true,
+      "document": {
+        "format": "arrowcol-benchmark",
+        "schema_version": 1,
+        "dataset_id": "fixture-v1",
+        "provenance": {
+          "source_revision": "0000000000000000000000000000000000000000",
+          "synthetic": true,
+          "description": "canonical-fixture"
+        },
+        "runs": [
+          {
+            "id": "run-1",
+            "arm": "simulation",
+            "scenario": "cold",
+            "repetition": 0,
+            "seed": 42
+          }
+        ],
+        "records": [
+          {
+            "id": "request-1",
+            "run_id": "run-1",
+            "kind": "request",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "rows": 64
+          },
+          {
+            "id": "attempt-1",
+            "run_id": "run-1",
+            "kind": "attempt",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "status": "completed"
+          },
+          {
+            "id": "span-1",
+            "run_id": "run-1",
+            "kind": "span",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "role": "collector",
+            "process_id": "collector-1",
+            "clock_id": "clock-1",
+            "trace_id": "attempt-1",
+            "stage": "mailbox",
+            "category": "queue",
+            "offset_ns": "1000",
+            "duration_ns": "2000",
+            "status": "completed"
+          },
+          {
+            "id": "batch-1",
+            "run_id": "run-1",
+            "kind": "batch",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "rows": 64
+          },
+          {
+            "id": "commit-1",
+            "run_id": "run-1",
+            "kind": "commit",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "version": 0,
+            "epoch": 1
+          },
+          {
+            "id": "receipt-1",
+            "run_id": "run-1",
+            "kind": "receipt",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "status": "completed"
+          }
+        ],
+        "links": [
+          {
+            "from": "request-1",
+            "to": "attempt-1",
+            "relation": "attempt"
+          },
+          {
+            "from": "attempt-1",
+            "to": "span-1",
+            "relation": "contains"
+          },
+          {
+            "from": "attempt-1",
+            "to": "batch-1",
+            "relation": "contains",
+            "rows": 64
+          },
+          {
+            "from": "batch-1",
+            "to": "commit-1",
+            "relation": "publishes"
+          },
+          {
+            "from": "commit-1",
+            "to": "receipt-1",
+            "relation": "receipt"
+          }
+        ],
+        "coverage": {
+          "dropped_events": 0,
+          "incomplete_attempts": 0,
+          "complete": true
+        }
+      }
+    },
+    {
+      "name": "unsupported-version",
+      "accept": false,
+      "document": {
+        "format": "arrowcol-benchmark",
+        "schema_version": 999,
+        "dataset_id": "fixture-v1",
+        "provenance": {
+          "source_revision": "0000000000000000000000000000000000000000",
+          "synthetic": true,
+          "description": "canonical-fixture"
+        },
+        "runs": [
+          {
+            "id": "run-1",
+            "arm": "simulation",
+            "scenario": "cold",
+            "repetition": 0,
+            "seed": 42
+          }
+        ],
+        "records": [
+          {
+            "id": "request-1",
+            "run_id": "run-1",
+            "kind": "request",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "rows": 64
+          },
+          {
+            "id": "attempt-1",
+            "run_id": "run-1",
+            "kind": "attempt",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "status": "completed"
+          },
+          {
+            "id": "span-1",
+            "run_id": "run-1",
+            "kind": "span",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "role": "collector",
+            "process_id": "collector-1",
+            "clock_id": "clock-1",
+            "trace_id": "attempt-1",
+            "stage": "mailbox",
+            "category": "queue",
+            "offset_ns": "1000",
+            "duration_ns": "2000",
+            "status": "completed"
+          },
+          {
+            "id": "batch-1",
+            "run_id": "run-1",
+            "kind": "batch",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "rows": 64
+          },
+          {
+            "id": "commit-1",
+            "run_id": "run-1",
+            "kind": "commit",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "version": 0,
+            "epoch": 1
+          },
+          {
+            "id": "receipt-1",
+            "run_id": "run-1",
+            "kind": "receipt",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "status": "completed"
+          }
+        ],
+        "links": [
+          {
+            "from": "request-1",
+            "to": "attempt-1",
+            "relation": "attempt"
+          },
+          {
+            "from": "attempt-1",
+            "to": "span-1",
+            "relation": "contains"
+          },
+          {
+            "from": "attempt-1",
+            "to": "batch-1",
+            "relation": "contains",
+            "rows": 64
+          },
+          {
+            "from": "batch-1",
+            "to": "commit-1",
+            "relation": "publishes"
+          },
+          {
+            "from": "commit-1",
+            "to": "receipt-1",
+            "relation": "receipt"
+          }
+        ],
+        "coverage": {
+          "dropped_events": 0,
+          "incomplete_attempts": 0,
+          "complete": true
+        }
+      }
+    },
+    {
+      "name": "sensitive-unknown-field",
+      "accept": false,
+      "document": {
+        "format": "arrowcol-benchmark",
+        "schema_version": 1,
+        "dataset_id": "fixture-v1",
+        "provenance": {
+          "source_revision": "0000000000000000000000000000000000000000",
+          "synthetic": true,
+          "description": "canonical-fixture"
+        },
+        "runs": [
+          {
+            "id": "run-1",
+            "arm": "simulation",
+            "scenario": "cold",
+            "repetition": 0,
+            "seed": 42
+          }
+        ],
+        "records": [
+          {
+            "id": "request-1",
+            "run_id": "run-1",
+            "kind": "request",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "rows": 64
+          },
+          {
+            "id": "attempt-1",
+            "run_id": "run-1",
+            "kind": "attempt",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "status": "completed"
+          },
+          {
+            "id": "span-1",
+            "run_id": "run-1",
+            "kind": "span",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "role": "collector",
+            "process_id": "collector-1",
+            "clock_id": "clock-1",
+            "trace_id": "attempt-1",
+            "stage": "mailbox",
+            "category": "queue",
+            "offset_ns": "1000",
+            "duration_ns": "2000",
+            "status": "completed"
+          },
+          {
+            "id": "batch-1",
+            "run_id": "run-1",
+            "kind": "batch",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "rows": 64
+          },
+          {
+            "id": "commit-1",
+            "run_id": "run-1",
+            "kind": "commit",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "version": 0,
+            "epoch": 1
+          },
+          {
+            "id": "receipt-1",
+            "run_id": "run-1",
+            "kind": "receipt",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "status": "completed"
+          }
+        ],
+        "links": [
+          {
+            "from": "request-1",
+            "to": "attempt-1",
+            "relation": "attempt"
+          },
+          {
+            "from": "attempt-1",
+            "to": "span-1",
+            "relation": "contains"
+          },
+          {
+            "from": "attempt-1",
+            "to": "batch-1",
+            "relation": "contains",
+            "rows": 64
+          },
+          {
+            "from": "batch-1",
+            "to": "commit-1",
+            "relation": "publishes"
+          },
+          {
+            "from": "commit-1",
+            "to": "receipt-1",
+            "relation": "receipt"
+          }
+        ],
+        "coverage": {
+          "dropped_events": 0,
+          "incomplete_attempts": 0,
+          "complete": true
+        },
+        "authorization": "test-only"
+      }
+    },
+    {
+      "name": "duplicate-record-id",
+      "accept": false,
+      "document": {
+        "format": "arrowcol-benchmark",
+        "schema_version": 1,
+        "dataset_id": "fixture-v1",
+        "provenance": {
+          "source_revision": "0000000000000000000000000000000000000000",
+          "synthetic": true,
+          "description": "canonical-fixture"
+        },
+        "runs": [
+          {
+            "id": "run-1",
+            "arm": "simulation",
+            "scenario": "cold",
+            "repetition": 0,
+            "seed": 42
+          }
+        ],
+        "records": [
+          {
+            "id": "request-1",
+            "run_id": "run-1",
+            "kind": "request",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "rows": 64
+          },
+          {
+            "id": "attempt-1",
+            "run_id": "run-1",
+            "kind": "attempt",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "status": "completed"
+          },
+          {
+            "id": "span-1",
+            "run_id": "run-1",
+            "kind": "span",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "role": "collector",
+            "process_id": "collector-1",
+            "clock_id": "clock-1",
+            "trace_id": "attempt-1",
+            "stage": "mailbox",
+            "category": "queue",
+            "offset_ns": "1000",
+            "duration_ns": "2000",
+            "status": "completed"
+          },
+          {
+            "id": "batch-1",
+            "run_id": "run-1",
+            "kind": "batch",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "rows": 64
+          },
+          {
+            "id": "commit-1",
+            "run_id": "run-1",
+            "kind": "commit",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "version": 0,
+            "epoch": 1
+          },
+          {
+            "id": "receipt-1",
+            "run_id": "run-1",
+            "kind": "receipt",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "status": "completed"
+          },
+          {
+            "id": "request-1",
+            "run_id": "run-1",
+            "kind": "request",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "rows": 64
+          }
+        ],
+        "links": [
+          {
+            "from": "request-1",
+            "to": "attempt-1",
+            "relation": "attempt"
+          },
+          {
+            "from": "attempt-1",
+            "to": "span-1",
+            "relation": "contains"
+          },
+          {
+            "from": "attempt-1",
+            "to": "batch-1",
+            "relation": "contains",
+            "rows": 64
+          },
+          {
+            "from": "batch-1",
+            "to": "commit-1",
+            "relation": "publishes"
+          },
+          {
+            "from": "commit-1",
+            "to": "receipt-1",
+            "relation": "receipt"
+          }
+        ],
+        "coverage": {
+          "dropped_events": 0,
+          "incomplete_attempts": 0,
+          "complete": true
+        }
+      }
+    },
+    {
+      "name": "duplicate-run-id",
+      "accept": false,
+      "document": {
+        "format": "arrowcol-benchmark",
+        "schema_version": 1,
+        "dataset_id": "fixture-v1",
+        "provenance": {
+          "source_revision": "0000000000000000000000000000000000000000",
+          "synthetic": true,
+          "description": "canonical-fixture"
+        },
+        "runs": [
+          {
+            "id": "run-1",
+            "arm": "simulation",
+            "scenario": "cold",
+            "repetition": 0,
+            "seed": 42
+          },
+          {
+            "id": "run-1",
+            "arm": "simulation",
+            "scenario": "cold",
+            "repetition": 0,
+            "seed": 42
+          }
+        ],
+        "records": [
+          {
+            "id": "request-1",
+            "run_id": "run-1",
+            "kind": "request",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "rows": 64
+          },
+          {
+            "id": "attempt-1",
+            "run_id": "run-1",
+            "kind": "attempt",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "status": "completed"
+          },
+          {
+            "id": "span-1",
+            "run_id": "run-1",
+            "kind": "span",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "role": "collector",
+            "process_id": "collector-1",
+            "clock_id": "clock-1",
+            "trace_id": "attempt-1",
+            "stage": "mailbox",
+            "category": "queue",
+            "offset_ns": "1000",
+            "duration_ns": "2000",
+            "status": "completed"
+          },
+          {
+            "id": "batch-1",
+            "run_id": "run-1",
+            "kind": "batch",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "rows": 64
+          },
+          {
+            "id": "commit-1",
+            "run_id": "run-1",
+            "kind": "commit",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "version": 0,
+            "epoch": 1
+          },
+          {
+            "id": "receipt-1",
+            "run_id": "run-1",
+            "kind": "receipt",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "status": "completed"
+          }
+        ],
+        "links": [
+          {
+            "from": "request-1",
+            "to": "attempt-1",
+            "relation": "attempt"
+          },
+          {
+            "from": "attempt-1",
+            "to": "span-1",
+            "relation": "contains"
+          },
+          {
+            "from": "attempt-1",
+            "to": "batch-1",
+            "relation": "contains",
+            "rows": 64
+          },
+          {
+            "from": "batch-1",
+            "to": "commit-1",
+            "relation": "publishes"
+          },
+          {
+            "from": "commit-1",
+            "to": "receipt-1",
+            "relation": "receipt"
+          }
+        ],
+        "coverage": {
+          "dropped_events": 0,
+          "incomplete_attempts": 0,
+          "complete": true
+        }
+      }
+    },
+    {
+      "name": "unknown-record-run",
+      "accept": false,
+      "document": {
+        "format": "arrowcol-benchmark",
+        "schema_version": 1,
+        "dataset_id": "fixture-v1",
+        "provenance": {
+          "source_revision": "0000000000000000000000000000000000000000",
+          "synthetic": true,
+          "description": "canonical-fixture"
+        },
+        "runs": [
+          {
+            "id": "run-1",
+            "arm": "simulation",
+            "scenario": "cold",
+            "repetition": 0,
+            "seed": 42
+          }
+        ],
+        "records": [
+          {
+            "id": "request-1",
+            "run_id": "absent-run",
+            "kind": "request",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "rows": 64
+          },
+          {
+            "id": "attempt-1",
+            "run_id": "run-1",
+            "kind": "attempt",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "status": "completed"
+          },
+          {
+            "id": "span-1",
+            "run_id": "run-1",
+            "kind": "span",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "role": "collector",
+            "process_id": "collector-1",
+            "clock_id": "clock-1",
+            "trace_id": "attempt-1",
+            "stage": "mailbox",
+            "category": "queue",
+            "offset_ns": "1000",
+            "duration_ns": "2000",
+            "status": "completed"
+          },
+          {
+            "id": "batch-1",
+            "run_id": "run-1",
+            "kind": "batch",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "rows": 64
+          },
+          {
+            "id": "commit-1",
+            "run_id": "run-1",
+            "kind": "commit",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "version": 0,
+            "epoch": 1
+          },
+          {
+            "id": "receipt-1",
+            "run_id": "run-1",
+            "kind": "receipt",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "status": "completed"
+          }
+        ],
+        "links": [
+          {
+            "from": "request-1",
+            "to": "attempt-1",
+            "relation": "attempt"
+          },
+          {
+            "from": "attempt-1",
+            "to": "span-1",
+            "relation": "contains"
+          },
+          {
+            "from": "attempt-1",
+            "to": "batch-1",
+            "relation": "contains",
+            "rows": 64
+          },
+          {
+            "from": "batch-1",
+            "to": "commit-1",
+            "relation": "publishes"
+          },
+          {
+            "from": "commit-1",
+            "to": "receipt-1",
+            "relation": "receipt"
+          }
+        ],
+        "coverage": {
+          "dropped_events": 0,
+          "incomplete_attempts": 0,
+          "complete": true
+        }
+      }
+    },
+    {
+      "name": "unknown-link-target",
+      "accept": false,
+      "document": {
+        "format": "arrowcol-benchmark",
+        "schema_version": 1,
+        "dataset_id": "fixture-v1",
+        "provenance": {
+          "source_revision": "0000000000000000000000000000000000000000",
+          "synthetic": true,
+          "description": "canonical-fixture"
+        },
+        "runs": [
+          {
+            "id": "run-1",
+            "arm": "simulation",
+            "scenario": "cold",
+            "repetition": 0,
+            "seed": 42
+          }
+        ],
+        "records": [
+          {
+            "id": "request-1",
+            "run_id": "run-1",
+            "kind": "request",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "rows": 64
+          },
+          {
+            "id": "attempt-1",
+            "run_id": "run-1",
+            "kind": "attempt",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "status": "completed"
+          },
+          {
+            "id": "span-1",
+            "run_id": "run-1",
+            "kind": "span",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "role": "collector",
+            "process_id": "collector-1",
+            "clock_id": "clock-1",
+            "trace_id": "attempt-1",
+            "stage": "mailbox",
+            "category": "queue",
+            "offset_ns": "1000",
+            "duration_ns": "2000",
+            "status": "completed"
+          },
+          {
+            "id": "batch-1",
+            "run_id": "run-1",
+            "kind": "batch",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "rows": 64
+          },
+          {
+            "id": "commit-1",
+            "run_id": "run-1",
+            "kind": "commit",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "version": 0,
+            "epoch": 1
+          },
+          {
+            "id": "receipt-1",
+            "run_id": "run-1",
+            "kind": "receipt",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "status": "completed"
+          }
+        ],
+        "links": [
+          {
+            "from": "request-1",
+            "to": "absent-record",
+            "relation": "attempt"
+          },
+          {
+            "from": "attempt-1",
+            "to": "span-1",
+            "relation": "contains"
+          },
+          {
+            "from": "attempt-1",
+            "to": "batch-1",
+            "relation": "contains",
+            "rows": 64
+          },
+          {
+            "from": "batch-1",
+            "to": "commit-1",
+            "relation": "publishes"
+          },
+          {
+            "from": "commit-1",
+            "to": "receipt-1",
+            "relation": "receipt"
+          }
+        ],
+        "coverage": {
+          "dropped_events": 0,
+          "incomplete_attempts": 0,
+          "complete": true
+        }
+      }
+    },
+    {
+      "name": "unknown-trace",
+      "accept": false,
+      "document": {
+        "format": "arrowcol-benchmark",
+        "schema_version": 1,
+        "dataset_id": "fixture-v1",
+        "provenance": {
+          "source_revision": "0000000000000000000000000000000000000000",
+          "synthetic": true,
+          "description": "canonical-fixture"
+        },
+        "runs": [
+          {
+            "id": "run-1",
+            "arm": "simulation",
+            "scenario": "cold",
+            "repetition": 0,
+            "seed": 42
+          }
+        ],
+        "records": [
+          {
+            "id": "request-1",
+            "run_id": "run-1",
+            "kind": "request",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "rows": 64
+          },
+          {
+            "id": "attempt-1",
+            "run_id": "run-1",
+            "kind": "attempt",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "status": "completed"
+          },
+          {
+            "id": "span-1",
+            "run_id": "run-1",
+            "kind": "span",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "role": "collector",
+            "process_id": "collector-1",
+            "clock_id": "clock-1",
+            "trace_id": "absent-trace",
+            "stage": "mailbox",
+            "category": "queue",
+            "offset_ns": "1000",
+            "duration_ns": "2000",
+            "status": "completed"
+          },
+          {
+            "id": "batch-1",
+            "run_id": "run-1",
+            "kind": "batch",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "rows": 64
+          },
+          {
+            "id": "commit-1",
+            "run_id": "run-1",
+            "kind": "commit",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "version": 0,
+            "epoch": 1
+          },
+          {
+            "id": "receipt-1",
+            "run_id": "run-1",
+            "kind": "receipt",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "status": "completed"
+          }
+        ],
+        "links": [
+          {
+            "from": "request-1",
+            "to": "attempt-1",
+            "relation": "attempt"
+          },
+          {
+            "from": "attempt-1",
+            "to": "span-1",
+            "relation": "contains"
+          },
+          {
+            "from": "attempt-1",
+            "to": "batch-1",
+            "relation": "contains",
+            "rows": 64
+          },
+          {
+            "from": "batch-1",
+            "to": "commit-1",
+            "relation": "publishes"
+          },
+          {
+            "from": "commit-1",
+            "to": "receipt-1",
+            "relation": "receipt"
+          }
+        ],
+        "coverage": {
+          "dropped_events": 0,
+          "incomplete_attempts": 0,
+          "complete": true
+        }
+      }
+    },
+    {
+      "name": "negative-duration",
+      "accept": false,
+      "document": {
+        "format": "arrowcol-benchmark",
+        "schema_version": 1,
+        "dataset_id": "fixture-v1",
+        "provenance": {
+          "source_revision": "0000000000000000000000000000000000000000",
+          "synthetic": true,
+          "description": "canonical-fixture"
+        },
+        "runs": [
+          {
+            "id": "run-1",
+            "arm": "simulation",
+            "scenario": "cold",
+            "repetition": 0,
+            "seed": 42
+          }
+        ],
+        "records": [
+          {
+            "id": "request-1",
+            "run_id": "run-1",
+            "kind": "request",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "rows": 64
+          },
+          {
+            "id": "attempt-1",
+            "run_id": "run-1",
+            "kind": "attempt",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "status": "completed"
+          },
+          {
+            "id": "span-1",
+            "run_id": "run-1",
+            "kind": "span",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "role": "collector",
+            "process_id": "collector-1",
+            "clock_id": "clock-1",
+            "trace_id": "attempt-1",
+            "stage": "mailbox",
+            "category": "queue",
+            "offset_ns": "1000",
+            "duration_ns": "-1",
+            "status": "completed"
+          },
+          {
+            "id": "batch-1",
+            "run_id": "run-1",
+            "kind": "batch",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "rows": 64
+          },
+          {
+            "id": "commit-1",
+            "run_id": "run-1",
+            "kind": "commit",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "version": 0,
+            "epoch": 1
+          },
+          {
+            "id": "receipt-1",
+            "run_id": "run-1",
+            "kind": "receipt",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "status": "completed"
+          }
+        ],
+        "links": [
+          {
+            "from": "request-1",
+            "to": "attempt-1",
+            "relation": "attempt"
+          },
+          {
+            "from": "attempt-1",
+            "to": "span-1",
+            "relation": "contains"
+          },
+          {
+            "from": "attempt-1",
+            "to": "batch-1",
+            "relation": "contains",
+            "rows": 64
+          },
+          {
+            "from": "batch-1",
+            "to": "commit-1",
+            "relation": "publishes"
+          },
+          {
+            "from": "commit-1",
+            "to": "receipt-1",
+            "relation": "receipt"
+          }
+        ],
+        "coverage": {
+          "dropped_events": 0,
+          "incomplete_attempts": 0,
+          "complete": true
+        }
+      }
+    },
+    {
+      "name": "false-completeness",
+      "accept": false,
+      "document": {
+        "format": "arrowcol-benchmark",
+        "schema_version": 1,
+        "dataset_id": "fixture-v1",
+        "provenance": {
+          "source_revision": "0000000000000000000000000000000000000000",
+          "synthetic": true,
+          "description": "canonical-fixture"
+        },
+        "runs": [
+          {
+            "id": "run-1",
+            "arm": "simulation",
+            "scenario": "cold",
+            "repetition": 0,
+            "seed": 42
+          }
+        ],
+        "records": [
+          {
+            "id": "request-1",
+            "run_id": "run-1",
+            "kind": "request",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "rows": 64
+          },
+          {
+            "id": "attempt-1",
+            "run_id": "run-1",
+            "kind": "attempt",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "status": "completed"
+          },
+          {
+            "id": "span-1",
+            "run_id": "run-1",
+            "kind": "span",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "role": "collector",
+            "process_id": "collector-1",
+            "clock_id": "clock-1",
+            "trace_id": "attempt-1",
+            "stage": "mailbox",
+            "category": "queue",
+            "offset_ns": "1000",
+            "duration_ns": "2000",
+            "status": "completed"
+          },
+          {
+            "id": "batch-1",
+            "run_id": "run-1",
+            "kind": "batch",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "rows": 64
+          },
+          {
+            "id": "commit-1",
+            "run_id": "run-1",
+            "kind": "commit",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "version": 0,
+            "epoch": 1
+          },
+          {
+            "id": "receipt-1",
+            "run_id": "run-1",
+            "kind": "receipt",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "status": "completed"
+          }
+        ],
+        "links": [
+          {
+            "from": "request-1",
+            "to": "attempt-1",
+            "relation": "attempt"
+          },
+          {
+            "from": "attempt-1",
+            "to": "span-1",
+            "relation": "contains"
+          },
+          {
+            "from": "attempt-1",
+            "to": "batch-1",
+            "relation": "contains",
+            "rows": 64
+          },
+          {
+            "from": "batch-1",
+            "to": "commit-1",
+            "relation": "publishes"
+          },
+          {
+            "from": "commit-1",
+            "to": "receipt-1",
+            "relation": "receipt"
+          }
+        ],
+        "coverage": {
+          "dropped_events": 1,
+          "incomplete_attempts": 0,
+          "complete": true
+        }
+      }
+    },
+    {
+      "name": "cross-run-trace-root",
+      "accept": false,
+      "document": {
+        "format": "arrowcol-benchmark",
+        "schema_version": 1,
+        "dataset_id": "fixture-v1",
+        "provenance": {
+          "source_revision": "0000000000000000000000000000000000000000",
+          "synthetic": true,
+          "description": "canonical-fixture"
+        },
+        "runs": [
+          {
+            "id": "run-1",
+            "arm": "simulation",
+            "scenario": "cold",
+            "repetition": 0,
+            "seed": 42
+          },
+          {
+            "id": "acceptance-other-run",
+            "arm": "simulation",
+            "scenario": "cold",
+            "repetition": 0,
+            "seed": 42
+          }
+        ],
+        "records": [
+          {
+            "id": "request-1",
+            "run_id": "run-1",
+            "kind": "request",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "rows": 64
+          },
+          {
+            "id": "attempt-1",
+            "run_id": "run-1",
+            "kind": "attempt",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "status": "completed"
+          },
+          {
+            "id": "span-1",
+            "run_id": "run-1",
+            "kind": "span",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "role": "collector",
+            "process_id": "collector-1",
+            "clock_id": "clock-1",
+            "trace_id": "acceptance-other-attempt",
+            "stage": "mailbox",
+            "category": "queue",
+            "offset_ns": "1000",
+            "duration_ns": "2000",
+            "status": "completed"
+          },
+          {
+            "id": "batch-1",
+            "run_id": "run-1",
+            "kind": "batch",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "rows": 64
+          },
+          {
+            "id": "commit-1",
+            "run_id": "run-1",
+            "kind": "commit",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "version": 0,
+            "epoch": 1
+          },
+          {
+            "id": "receipt-1",
+            "run_id": "run-1",
+            "kind": "receipt",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "status": "completed"
+          },
+          {
+            "id": "acceptance-other-attempt",
+            "run_id": "acceptance-other-run",
+            "kind": "attempt",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "status": "completed"
+          }
+        ],
+        "links": [
+          {
+            "from": "request-1",
+            "to": "attempt-1",
+            "relation": "attempt"
+          },
+          {
+            "from": "attempt-1",
+            "to": "span-1",
+            "relation": "contains"
+          },
+          {
+            "from": "attempt-1",
+            "to": "batch-1",
+            "relation": "contains",
+            "rows": 64
+          },
+          {
+            "from": "batch-1",
+            "to": "commit-1",
+            "relation": "publishes"
+          },
+          {
+            "from": "commit-1",
+            "to": "receipt-1",
+            "relation": "receipt"
+          }
+        ],
+        "coverage": {
+          "dropped_events": 0,
+          "incomplete_attempts": 0,
+          "complete": true
+        }
+      }
+    },
+    {
+      "name": "non-root-trace-target",
+      "accept": false,
+      "document": {
+        "format": "arrowcol-benchmark",
+        "schema_version": 1,
+        "dataset_id": "fixture-v1",
+        "provenance": {
+          "source_revision": "0000000000000000000000000000000000000000",
+          "synthetic": true,
+          "description": "canonical-fixture"
+        },
+        "runs": [
+          {
+            "id": "run-1",
+            "arm": "simulation",
+            "scenario": "cold",
+            "repetition": 0,
+            "seed": 42
+          }
+        ],
+        "records": [
+          {
+            "id": "request-1",
+            "run_id": "run-1",
+            "kind": "request",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "rows": 64
+          },
+          {
+            "id": "attempt-1",
+            "run_id": "run-1",
+            "kind": "attempt",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "status": "completed"
+          },
+          {
+            "id": "span-1",
+            "run_id": "run-1",
+            "kind": "span",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "role": "collector",
+            "process_id": "collector-1",
+            "clock_id": "clock-1",
+            "trace_id": "batch-1",
+            "stage": "mailbox",
+            "category": "queue",
+            "offset_ns": "1000",
+            "duration_ns": "2000",
+            "status": "completed"
+          },
+          {
+            "id": "batch-1",
+            "run_id": "run-1",
+            "kind": "batch",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "rows": 64
+          },
+          {
+            "id": "commit-1",
+            "run_id": "run-1",
+            "kind": "commit",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "version": 0,
+            "epoch": 1
+          },
+          {
+            "id": "receipt-1",
+            "run_id": "run-1",
+            "kind": "receipt",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "status": "completed"
+          }
+        ],
+        "links": [
+          {
+            "from": "request-1",
+            "to": "attempt-1",
+            "relation": "attempt"
+          },
+          {
+            "from": "attempt-1",
+            "to": "span-1",
+            "relation": "contains"
+          },
+          {
+            "from": "attempt-1",
+            "to": "batch-1",
+            "relation": "contains",
+            "rows": 64
+          },
+          {
+            "from": "batch-1",
+            "to": "commit-1",
+            "relation": "publishes"
+          },
+          {
+            "from": "commit-1",
+            "to": "receipt-1",
+            "relation": "receipt"
+          }
+        ],
+        "coverage": {
+          "dropped_events": 0,
+          "incomplete_attempts": 0,
+          "complete": true
+        }
+      }
+    },
+    {
+      "name": "cross-clock-parent",
+      "accept": false,
+      "document": {
+        "format": "arrowcol-benchmark",
+        "schema_version": 1,
+        "dataset_id": "fixture-v1",
+        "provenance": {
+          "source_revision": "0000000000000000000000000000000000000000",
+          "synthetic": true,
+          "description": "canonical-fixture"
+        },
+        "runs": [
+          {
+            "id": "run-1",
+            "arm": "simulation",
+            "scenario": "cold",
+            "repetition": 0,
+            "seed": 42
+          }
+        ],
+        "records": [
+          {
+            "id": "request-1",
+            "run_id": "run-1",
+            "kind": "request",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "rows": 64
+          },
+          {
+            "id": "attempt-1",
+            "run_id": "run-1",
+            "kind": "attempt",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "status": "completed"
+          },
+          {
+            "id": "span-1",
+            "run_id": "run-1",
+            "kind": "span",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "role": "collector",
+            "process_id": "collector-1",
+            "clock_id": "clock-1",
+            "trace_id": "attempt-1",
+            "stage": "mailbox",
+            "category": "queue",
+            "offset_ns": "1000",
+            "duration_ns": "2000",
+            "status": "completed"
+          },
+          {
+            "id": "batch-1",
+            "run_id": "run-1",
+            "kind": "batch",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "rows": 64
+          },
+          {
+            "id": "commit-1",
+            "run_id": "run-1",
+            "kind": "commit",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "version": 0,
+            "epoch": 1
+          },
+          {
+            "id": "receipt-1",
+            "run_id": "run-1",
+            "kind": "receipt",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "status": "completed"
+          },
+          {
+            "id": "acceptance-child",
+            "run_id": "run-1",
+            "kind": "span",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "role": "collector",
+            "process_id": "collector-1",
+            "clock_id": "other-clock",
+            "trace_id": "attempt-1",
+            "stage": "mailbox",
+            "category": "queue",
+            "offset_ns": "1000",
+            "duration_ns": "2000",
+            "status": "completed"
+          }
+        ],
+        "links": [
+          {
+            "from": "request-1",
+            "to": "attempt-1",
+            "relation": "attempt"
+          },
+          {
+            "from": "attempt-1",
+            "to": "span-1",
+            "relation": "contains"
+          },
+          {
+            "from": "attempt-1",
+            "to": "batch-1",
+            "relation": "contains",
+            "rows": 64
+          },
+          {
+            "from": "batch-1",
+            "to": "commit-1",
+            "relation": "publishes"
+          },
+          {
+            "from": "commit-1",
+            "to": "receipt-1",
+            "relation": "receipt"
+          },
+          {
+            "from": "span-1",
+            "to": "acceptance-child",
+            "relation": "parent"
+          }
+        ],
+        "coverage": {
+          "dropped_events": 0,
+          "incomplete_attempts": 0,
+          "complete": true
+        }
+      }
+    },
+    {
+      "name": "child-outlives-parent",
+      "accept": false,
+      "document": {
+        "format": "arrowcol-benchmark",
+        "schema_version": 1,
+        "dataset_id": "fixture-v1",
+        "provenance": {
+          "source_revision": "0000000000000000000000000000000000000000",
+          "synthetic": true,
+          "description": "canonical-fixture"
+        },
+        "runs": [
+          {
+            "id": "run-1",
+            "arm": "simulation",
+            "scenario": "cold",
+            "repetition": 0,
+            "seed": 42
+          }
+        ],
+        "records": [
+          {
+            "id": "request-1",
+            "run_id": "run-1",
+            "kind": "request",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "rows": 64
+          },
+          {
+            "id": "attempt-1",
+            "run_id": "run-1",
+            "kind": "attempt",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "status": "completed"
+          },
+          {
+            "id": "span-1",
+            "run_id": "run-1",
+            "kind": "span",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "role": "collector",
+            "process_id": "collector-1",
+            "clock_id": "clock-1",
+            "trace_id": "attempt-1",
+            "stage": "mailbox",
+            "category": "queue",
+            "offset_ns": "1000",
+            "duration_ns": "2000",
+            "status": "completed"
+          },
+          {
+            "id": "batch-1",
+            "run_id": "run-1",
+            "kind": "batch",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "rows": 64
+          },
+          {
+            "id": "commit-1",
+            "run_id": "run-1",
+            "kind": "commit",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "version": 0,
+            "epoch": 1
+          },
+          {
+            "id": "receipt-1",
+            "run_id": "run-1",
+            "kind": "receipt",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "status": "completed"
+          },
+          {
+            "id": "acceptance-child",
+            "run_id": "run-1",
+            "kind": "span",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "role": "collector",
+            "process_id": "collector-1",
+            "clock_id": "clock-1",
+            "trace_id": "attempt-1",
+            "stage": "mailbox",
+            "category": "queue",
+            "offset_ns": "1000",
+            "duration_ns": "2001",
+            "status": "completed"
+          }
+        ],
+        "links": [
+          {
+            "from": "request-1",
+            "to": "attempt-1",
+            "relation": "attempt"
+          },
+          {
+            "from": "attempt-1",
+            "to": "span-1",
+            "relation": "contains"
+          },
+          {
+            "from": "attempt-1",
+            "to": "batch-1",
+            "relation": "contains",
+            "rows": 64
+          },
+          {
+            "from": "batch-1",
+            "to": "commit-1",
+            "relation": "publishes"
+          },
+          {
+            "from": "commit-1",
+            "to": "receipt-1",
+            "relation": "receipt"
+          },
+          {
+            "from": "span-1",
+            "to": "acceptance-child",
+            "relation": "parent"
+          }
+        ],
+        "coverage": {
+          "dropped_events": 0,
+          "incomplete_attempts": 0,
+          "complete": true
+        }
+      }
+    },
+    {
+      "name": "cyclic-parentage",
+      "accept": false,
+      "document": {
+        "format": "arrowcol-benchmark",
+        "schema_version": 1,
+        "dataset_id": "fixture-v1",
+        "provenance": {
+          "source_revision": "0000000000000000000000000000000000000000",
+          "synthetic": true,
+          "description": "canonical-fixture"
+        },
+        "runs": [
+          {
+            "id": "run-1",
+            "arm": "simulation",
+            "scenario": "cold",
+            "repetition": 0,
+            "seed": 42
+          }
+        ],
+        "records": [
+          {
+            "id": "request-1",
+            "run_id": "run-1",
+            "kind": "request",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "rows": 64
+          },
+          {
+            "id": "attempt-1",
+            "run_id": "run-1",
+            "kind": "attempt",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "status": "completed"
+          },
+          {
+            "id": "span-1",
+            "run_id": "run-1",
+            "kind": "span",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "role": "collector",
+            "process_id": "collector-1",
+            "clock_id": "clock-1",
+            "trace_id": "attempt-1",
+            "stage": "mailbox",
+            "category": "queue",
+            "offset_ns": "1000",
+            "duration_ns": "2000",
+            "status": "completed"
+          },
+          {
+            "id": "batch-1",
+            "run_id": "run-1",
+            "kind": "batch",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "rows": 64
+          },
+          {
+            "id": "commit-1",
+            "run_id": "run-1",
+            "kind": "commit",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "version": 0,
+            "epoch": 1
+          },
+          {
+            "id": "receipt-1",
+            "run_id": "run-1",
+            "kind": "receipt",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "status": "completed"
+          },
+          {
+            "id": "acceptance-child",
+            "run_id": "run-1",
+            "kind": "span",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "role": "collector",
+            "process_id": "collector-1",
+            "clock_id": "clock-1",
+            "trace_id": "attempt-1",
+            "stage": "mailbox",
+            "category": "queue",
+            "offset_ns": "1000",
+            "duration_ns": "2000",
+            "status": "completed"
+          }
+        ],
+        "links": [
+          {
+            "from": "request-1",
+            "to": "attempt-1",
+            "relation": "attempt"
+          },
+          {
+            "from": "attempt-1",
+            "to": "span-1",
+            "relation": "contains"
+          },
+          {
+            "from": "attempt-1",
+            "to": "batch-1",
+            "relation": "contains",
+            "rows": 64
+          },
+          {
+            "from": "batch-1",
+            "to": "commit-1",
+            "relation": "publishes"
+          },
+          {
+            "from": "commit-1",
+            "to": "receipt-1",
+            "relation": "receipt"
+          },
+          {
+            "from": "span-1",
+            "to": "acceptance-child",
+            "relation": "parent"
+          },
+          {
+            "from": "acceptance-child",
+            "to": "span-1",
+            "relation": "parent"
+          }
+        ],
+        "coverage": {
+          "dropped_events": 0,
+          "incomplete_attempts": 0,
+          "complete": true
+        }
+      }
+    },
+    {
+      "name": "derived-without-source",
+      "accept": false,
+      "document": {
+        "format": "arrowcol-benchmark",
+        "schema_version": 1,
+        "dataset_id": "fixture-v1",
+        "provenance": {
+          "source_revision": "0000000000000000000000000000000000000000",
+          "synthetic": true,
+          "description": "canonical-fixture"
+        },
+        "runs": [
+          {
+            "id": "run-1",
+            "arm": "simulation",
+            "scenario": "cold",
+            "repetition": 0,
+            "seed": 42
+          }
+        ],
+        "records": [
+          {
+            "id": "request-1",
+            "run_id": "run-1",
+            "kind": "request",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "rows": 64
+          },
+          {
+            "id": "attempt-1",
+            "run_id": "run-1",
+            "kind": "attempt",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "status": "completed"
+          },
+          {
+            "id": "span-1",
+            "run_id": "run-1",
+            "kind": "span",
+            "evidence": "derived",
+            "method": "union-of-intervals",
+            "role": "collector",
+            "process_id": "collector-1",
+            "clock_id": "clock-1",
+            "trace_id": "attempt-1",
+            "stage": "mailbox",
+            "category": "queue",
+            "offset_ns": "1000",
+            "duration_ns": "2000",
+            "status": "completed"
+          },
+          {
+            "id": "batch-1",
+            "run_id": "run-1",
+            "kind": "batch",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "rows": 64
+          },
+          {
+            "id": "commit-1",
+            "run_id": "run-1",
+            "kind": "commit",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "version": 0,
+            "epoch": 1
+          },
+          {
+            "id": "receipt-1",
+            "run_id": "run-1",
+            "kind": "receipt",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "status": "completed"
+          }
+        ],
+        "links": [
+          {
+            "from": "request-1",
+            "to": "attempt-1",
+            "relation": "attempt"
+          },
+          {
+            "from": "attempt-1",
+            "to": "span-1",
+            "relation": "contains"
+          },
+          {
+            "from": "attempt-1",
+            "to": "batch-1",
+            "relation": "contains",
+            "rows": 64
+          },
+          {
+            "from": "batch-1",
+            "to": "commit-1",
+            "relation": "publishes"
+          },
+          {
+            "from": "commit-1",
+            "to": "receipt-1",
+            "relation": "receipt"
+          }
+        ],
+        "coverage": {
+          "dropped_events": 0,
+          "incomplete_attempts": 0,
+          "complete": true
+        }
+      }
+    },
+    {
+      "name": "asynchronous-outliving-work",
+      "accept": true,
+      "document": {
+        "format": "arrowcol-benchmark",
+        "schema_version": 1,
+        "dataset_id": "fixture-v1",
+        "provenance": {
+          "source_revision": "0000000000000000000000000000000000000000",
+          "synthetic": true,
+          "description": "canonical-fixture"
+        },
+        "runs": [
+          {
+            "id": "run-1",
+            "arm": "simulation",
+            "scenario": "cold",
+            "repetition": 0,
+            "seed": 42
+          }
+        ],
+        "records": [
+          {
+            "id": "request-1",
+            "run_id": "run-1",
+            "kind": "request",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "rows": 64
+          },
+          {
+            "id": "attempt-1",
+            "run_id": "run-1",
+            "kind": "attempt",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "status": "completed"
+          },
+          {
+            "id": "span-1",
+            "run_id": "run-1",
+            "kind": "span",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "role": "collector",
+            "process_id": "collector-1",
+            "clock_id": "clock-1",
+            "trace_id": "attempt-1",
+            "stage": "mailbox",
+            "category": "queue",
+            "offset_ns": "1000",
+            "duration_ns": "2000",
+            "status": "completed"
+          },
+          {
+            "id": "batch-1",
+            "run_id": "run-1",
+            "kind": "batch",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "rows": 64
+          },
+          {
+            "id": "commit-1",
+            "run_id": "run-1",
+            "kind": "commit",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "version": 0,
+            "epoch": 1
+          },
+          {
+            "id": "receipt-1",
+            "run_id": "run-1",
+            "kind": "receipt",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "status": "completed"
+          },
+          {
+            "id": "acceptance-child",
+            "run_id": "run-1",
+            "kind": "span",
+            "evidence": "estimated",
+            "method": "seeded-model",
+            "assumption": "illustrative-not-calibrated",
+            "role": "collector",
+            "process_id": "other-process",
+            "clock_id": "other-clock",
+            "trace_id": "attempt-1",
+            "stage": "mailbox",
+            "category": "queue",
+            "offset_ns": "1100",
+            "duration_ns": "2100",
+            "status": "completed"
+          }
+        ],
+        "links": [
+          {
+            "from": "request-1",
+            "to": "attempt-1",
+            "relation": "attempt"
+          },
+          {
+            "from": "attempt-1",
+            "to": "span-1",
+            "relation": "contains"
+          },
+          {
+            "from": "attempt-1",
+            "to": "batch-1",
+            "relation": "contains",
+            "rows": 64
+          },
+          {
+            "from": "batch-1",
+            "to": "commit-1",
+            "relation": "publishes"
+          },
+          {
+            "from": "commit-1",
+            "to": "receipt-1",
+            "relation": "receipt"
+          },
+          {
+            "from": "span-1",
+            "to": "acceptance-child",
+            "relation": "async"
+          }
+        ],
+        "coverage": {
+          "dropped_events": 0,
+          "incomplete_attempts": 0,
+          "complete": true
+        }
+      }
+    }
+  ]
+}
