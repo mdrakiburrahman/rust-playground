@@ -379,6 +379,57 @@ test('foreign network endpoints are rejected before stopping containers', async 
   assert(commands.every(args => args[0] !== 'stop' && !args.includes('rm')));
 });
 
+test('recovery stops an owned orphan without inspecting container init', async t => {
+  const workspace = fixture(t);
+  const results = path.join(workspace, 'onelake/benchmark/latest/results');
+  mkdirSync(results, { recursive: true });
+  writeFileSync(path.join(workspace, 'run'), 'console.log("ready"); setInterval(() => {}, 1000)');
+  const executable = path.join(workspace, 'target/debug/arrowcol-loadgen');
+  const child = spawn(process.execPath, ['run'], {
+    cwd: workspace, argv0: executable, env: { ...process.env, LOADTEST_RESULTS: results },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const exited = new Promise<number | null>(resolve => child.once('exit', resolve));
+  t.after(async () => {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
+    await exited;
+  });
+  await new Promise<void>((resolve, reject) => {
+    child.once('error', reject);
+    child.stdout.once('data', () => resolve());
+    child.once('exit', code => reject(new Error(`Orphan fixture exited ${code} before readiness`)));
+  });
+  const originalRead = fs.readFileSync;
+  const originalLink = fs.readlinkSync;
+  const readMock = t.mock.method(fs, 'readFileSync', (...args: Parameters<typeof fs.readFileSync>) => {
+    const value = originalRead(...args);
+    if (args[0] !== `/proc/${child.pid}/stat`) return value;
+    const stat = value.toString();
+    const end = stat.lastIndexOf(')') + 2;
+    const fields = stat.slice(end).split(' ');
+    fields[1] = '1';
+    const orphan = stat.slice(0, end) + fields.join(' ');
+    return typeof value === 'string' ? orphan : Buffer.from(orphan);
+  });
+  const linkMock = t.mock.method(fs, 'readlinkSync', (...args: Parameters<typeof fs.readlinkSync>) => {
+    if (args[0] === '/proc/1/exe') throw Object.assign(new Error('Protected init'), { code: 'EACCES' });
+    if (args[0] === `/proc/${child.pid}/exe`) return executable;
+    return originalLink(...args);
+  });
+  syncBuiltinESMExports();
+  try {
+    const { docker, commands } = mockDocker(workspace);
+    await stopBenchmark(workspace, docker);
+    await exited;
+    assert.equal(child.signalCode, 'SIGINT');
+    assert(commands.some(args => args[0] === 'stop'));
+  } finally {
+    readMock.mock.restore();
+    linkMock.mock.restore();
+    syncBuiltinESMExports();
+  }
+});
+
 for (const candidate of [false, true]) test(candidate
   ? 'unverifiable benchmark candidates prevent cleanup'
   : 'unrelated protected processes do not prevent a fresh start', async t => {

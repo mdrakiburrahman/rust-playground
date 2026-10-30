@@ -207,7 +207,8 @@ async function stopBenchmarkProcesses(workspace: string, directories: string[]):
       const results = environment.get('LOADTEST_RESULTS');
       if (!results || !directories.some(directory => contained(path.resolve(identity.cwd, results), directory))) continue;
       generators.push(identity);
-      const parent = processIdentity(identity.parent);
+      // An orphan is adopted by container init, which is not a benchmark owner.
+      const parent = identity.parent > 1 ? processIdentity(identity.parent) : undefined;
       if (parent?.arguments.some(arg => path.resolve(parent.cwd, arg) === main)) owners.set(parent.pid, parent);
       const record = path.join(results, 'continuation.json');
       if (parent && existsSync(record)) {
