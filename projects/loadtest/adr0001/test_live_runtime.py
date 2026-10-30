@@ -60,6 +60,23 @@ class RuntimeProjectionTests(unittest.TestCase):
         self.assertEqual(len(self.observer.engine.get.call_args_list), 1)
         self.assertTrue(self.observer.engine.get.call_args.args[0].endswith("/json"))
 
+    def test_receipt_component_failure_keeps_prior_identities_but_marks_unknown(self):
+        receipt = {"id": "receipt-1", "table_id": "main", "operation_id": "unit-1",
+                   "version": "0", "completion": "completed", "digest": "a" * 64}
+        self.observer.receipt_probe = Mock(side_effect=[
+            ([receipt], [], 0), RuntimeError("private-diagnostic"), ([receipt], [], 0)])
+        self.observer.sample()
+        self.assertNotIn("receipts", self.packet()["coverage"]["missing"])
+        self.assertEqual(self.packet()["receipts"][0]["completion"], "completed")
+        self.observer.sample()
+        self.assertEqual(self.packet()["receipts"][0]["operation_id"], "unit-1")
+        self.assertEqual(self.packet()["receipts"][0]["completion"], "unknown")
+        self.assertIn("receipts", self.packet()["coverage"]["missing"])
+        self.assertIn("receipt-observation-error", self.packet()["coverage"]["missing"])
+        self.assertEqual(self.packet()["coverage"]["dropped"], 1)
+        self.observer.sample()
+        self.assertEqual(self.packet()["receipts"][0]["completion"], "completed")
+
     def test_counters_and_missing_receipts_are_explicit_and_bounded(self):
         self.observer.sample()
         packet = self.packet()

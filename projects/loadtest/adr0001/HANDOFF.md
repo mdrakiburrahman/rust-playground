@@ -682,3 +682,49 @@ rollback/repair remain unfinished. Replica, retirement and migration are also
 unsupported; the native migration API still lacks the required atomic browser
 expected-epoch fence. Keep frontend `mutationGate=false` until corresponding
 server and real browser gates pass. No bridge/runtime is currently running.
+
+### Actual live receipt and physical Delta feeds
+
+The next separate source snapshot adds a fixed read-only SQL acceptance/final
+receipt projection and bounded physical verification. Proposal digests, exact
+action logs, Parquet byte lengths/hashes and contiguous prefixes must agree with
+an ordinary Delta reader's version/file set before reporting completed. SQL
+acceptance or merely reader-visible bytes without a final SQL receipt stays
+accepted. The observer retains unknown receipt identities and coverage/drop
+provenance on component failure; independent CPU/memory data is not replaced
+with invented values. At most 128 receipts are exported, with explicit balanced
+window truncation, and physical hashing is bounded to 32 MiB per probe.
+
+The source suite passed **150 tests**; the separate receipt stage passed
+**85 native bridge tests**. Real `live-receipts1` failed because `sqlcmd` forbids
+combining `-h` and `-y 0`. Its default read-only observer correctly reported
+unavailable receipts, not completion; all eight resources stopped. An isolated
+network-none 128 MiB SQL-client probe confirmed the flag incompatibility without
+credentials or starting a SQL service. Both failed artifacts remain retained.
+The fixed query follows the existing benchmark's SQL JSON chunk handling.
+
+`publication-gate-eec969a5-live-receipts2`, separately frozen under
+`bridge-eec969a5-receipts-v2`, then passed actual authenticated observation:
+two initial schema/data receipts completed; a new accepted input held before
+log version 2 remained accepted with no physical log; another input held after
+log version 3 installation but before its final SQL receipt also remained
+accepted. Releasing each bounded qualification-only barrier produced the real
+final input receipt and completed observation. Four receipt identities/digests,
+bounded revisioned feeds and nine exact ordinary Delta marker rows reconciled.
+Those barriers are not an enabled frontend fault operation or independent
+rollback qualification.
+
+The actual read-only server exited **0**, all eight exact owned containers
+stopped and loopback port 18771 closed. Effect capabilities remained unsupported
+throughout this proof, frontend mutationGate stayed false and other missing
+IO/queue/throughput coverage remained incomplete. No benchmark binary/source,
+cohort, contract or frontend package changed.
+
+Sanitized artifacts are `files/live-receipts2-qualification.json`, physical
+SHA-256 `bf668e32ca2fba42897cd0d1baa5f9cf1187955fc52c4ce1e190837f1eb058e9`,
+and `files/live-receipts2-source-sha256.json`, physical SHA-256
+`a23600984b429b20ed953626f672cf43a1671783b3307b44aa95b31734d16905`.
+Executed proof scripts `qualify-live-receipts-v1.py` and
+`qualify-live-receipts-v2.py` remain separate. Workload presets, independent
+bounded fault rollback/repair and corresponding browser effect gates are still
+unfinished; unqualified operations remain disabled.

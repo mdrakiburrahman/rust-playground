@@ -175,8 +175,8 @@ coverage; valid memory gauges remain available. Failed observation attempts are
 counted in the next successful snapshot while the old snapshot ages stale.
 Approved retirement is still draining while its exact container is running;
 approval alone is not teardown completion.
-Receipts, IO, queue and throughput observations remain explicitly missing in
-this first read-only projection. A router-hosted authority is represented once
+IO, queue and throughput observations remain explicitly missing.
+A router-hosted authority is represented once
 as its gateway resource, not duplicated into two CPU charges.
 
 Without an explicit matching `--policy-proof`, all HTTP action capabilities and
@@ -236,5 +236,38 @@ closes the observer/executor/ledger and stops only the exact owned deployment.
 `--retain-runtime-on-stop` is an explicit bounded restart facility, not the
 default and not a fault rollback supervisor. Faults, repair, workload, replica
 changes, retirement and migration remain unsupported. Independent bounded fault
-rollback and live receipt/physical Delta observation remain unfinished; neither
+rollback remain unfinished; neither
 HTTP policy acceptance nor full-process restart qualifies those surfaces.
+
+## Live acceptance and physical completion
+
+`live_receipts.py` now projects the dedicated SQL authority's bounded accepted
+prefix and final receipt rows using a fixed read-only query against the exact
+owned SQL container. SQL credentials stay in private files/stdin; neither the
+query nor a database/container identifier is supplied by the frontend. SQL
+acceptance alone emits `completion:accepted`, even if the Delta log is already
+visible but its final SQL receipt is not yet durable.
+
+`completed` additionally requires exact proposal/final-receipt digest and
+version agreement, immutable action-log bytes, data-file lengths/SHA-256 and
+contiguous verified prefixes, plus an ordinary Delta reader reconstructing that
+version with the exact accepted file set. The ordinary reader checks snapshot
+metadata, not a full row multiset on every poll; real qualification separately
+scans the exact marker multiset. Native unit IDs are preserved in
+`receipt.operation_id`; they are not invented browser-command IDs.
+
+Physical verification caches are reused only while device/inode/size/mtime/ctime
+and expected content identities remain unchanged. A probe hashes at most
+32 MiB, uses bounded SQL/reader processes and exposes at most 128 receipts in a
+balanced per-table window. Omitted history retains explicit missing/drop
+coverage. Reader errors, missing/corrupt physical evidence, budget exhaustion
+and SQL failures never become completed or zero: unknowns and coverage gaps are
+preserved. When the receipt component fails, prior receipt identities remain
+visible as unknown while independent CPU/memory observation continues.
+
+Real authenticated read-only qualification held publication before log install
+and before final receipt persistence. Both phases remained accepted, not
+completed. After release, four receipts, bounded live feeds and nine exact
+ordinary Delta rows reconciled; the server exited 0 and all eight owned
+containers stopped. This does not enable workload/fault controls or qualify
+browser mutation acceptance.

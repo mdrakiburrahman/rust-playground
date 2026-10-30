@@ -1,5 +1,6 @@
 """Explicit single-deployment host; read-only unless matching policy proof is supplied."""
 import argparse
+import copy
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import http.client
@@ -23,6 +24,7 @@ from live_contract import Denial, RESPONSE_BYTES
 from live_deployment import AttachedRuntime, DeploymentLease, deployment_root, save_deployment
 from live_executor import PolicyExecutor
 from live_ledger import OperationLedger
+from live_receipts import ReceiptObserver
 from live_server import BoundedHTTPServer, Bridge
 from observation import Engine
 from publication_gate import REPO, RUNTIME_IMAGE, SQL_IMAGE
@@ -80,7 +82,7 @@ def writer_alias(writer):
 
 
 class RuntimeObserver:
-    def __init__(self, runtime, bridge, engine=None):
+    def __init__(self, runtime, bridge, engine=None, receipt_probe=None):
         self.runtime = runtime
         self.bridge = bridge
         self.engine = engine or Engine()
@@ -91,6 +93,8 @@ class RuntimeObserver:
         self.dropped = 0
         self.pool = ThreadPoolExecutor(max_workers=4)
         self.thread = None
+        self.receipt_probe = receipt_probe
+        self.last_receipts = []
 
     def authority(self):
         request = urllib.request.Request(
@@ -215,7 +219,20 @@ class RuntimeObserver:
                 "recovery_obligations": ["obligation-" + collector for collector, policy in policies.items()
                                          if key in policy.get("recovery_obligations", {})],
             })
-        self.bridge.publish(replicas, tables, [], metrics, list(missing), observed_ns=started, dropped=dropped)
+        receipts = []
+        if self.receipt_probe is not None:
+            try:
+                receipts, receipt_missing, receipt_dropped = self.receipt_probe()
+                missing.discard("receipts")
+                missing.update(receipt_missing)
+                dropped = min(dropped + receipt_dropped, 2147483647)
+                self.last_receipts = copy.deepcopy(receipts)
+            except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.TimeoutExpired) as error:
+                print("live bridge receipt observation unavailable: " + type(error).__name__, flush=True)
+                missing.add("receipt-observation-error")
+                dropped = min(dropped + 1, 2147483647)
+                receipts = [{**receipt, "completion": "unknown"} for receipt in self.last_receipts]
+        self.bridge.publish(replicas, tables, receipts, metrics, list(missing), observed_ns=started, dropped=dropped)
         self.dropped = 0
 
     def start(self):
@@ -296,7 +313,7 @@ def main():
         bridge = Bridge(f"http://127.0.0.1:{args.port}", deployment, args.frontend_root, ledger)
         if not args.resume:
             save_deployment(runtime, deployment, policy_proof)
-        observer = RuntimeObserver(runtime, bridge)
+        observer = RuntimeObserver(runtime, bridge, receipt_probe=ReceiptObserver(runtime).sample)
         if args.policy_proof is not None:
             def resource(collector):
                 if collector not in runtime.config["collectors"] or collector not in runtime.names:
