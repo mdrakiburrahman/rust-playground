@@ -298,3 +298,32 @@ Delta rows survived, eight exact containers stopped and all workers exited.
 This does not qualify HTTP dispatch, browser effects, in-flight workload
 completion, or measured maximum physical pause duration. Those checks remain
 required before advertising fault support.
+
+## Server-owned workload helper qualification
+
+`live_workload.py` supplies fixed `main`/baseline presets, not an arbitrary
+schema/table/endpoint API. Small uses three rows/request, at most eight requests
+and 10 seconds; elephant uses 65,536 rows/request, at most two requests and
+15 seconds. Both have one stream. The nonnullable baseline schema, native
+fingerprint and exact loopback gateway/container are checked before dispatch.
+Credentials and native headers remain server-side.
+
+Private workload records share the FULL-synchronous operation ledger and retain
+logical request/attempt IDs, single-send decisions, native unit IDs, RPC outcomes
+and final-receipt identities. A native unit is recorded as soon as received.
+Existing jobs are never uploaded again; missing unit identity stays unknown.
+Partial unsent work is cancelled rather than silently resumed. RPC final/SQL
+acceptance is not job completion: all requested units need fresh matching
+physically verified receipt observations. RPC timeout/error and eventual
+completion remain separate facts in the private record.
+
+Separate actual helper qualification completed both presets and an in-flight
+request during real publisher pause, reconciled the reopened journal without
+replay, and matched 65,548 ordinary Delta marker rows. It measured three
+inclusive fault lifecycles on the same Linux-boot CLOCK_MONOTONIC, from
+pre-pause dispatch through observed rollback: 0.681 s and 0.697 s for 500 ms
+requested faults, and 2.235 s for the 2,000 ms publisher fault. All were below
+the explicit requested-duration-plus-five-seconds qualification bound. These
+are control lifecycles, not CPU or cross-process latency estimates. HTTP
+workload/fault capabilities remain unsupported pending shared-executor and
+guarded HTTP qualification; frontend mutation authority remains disabled.

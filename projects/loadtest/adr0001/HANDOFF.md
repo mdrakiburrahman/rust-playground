@@ -770,3 +770,60 @@ mutationGate remains false. Shared contracts, measured sources/binaries/cohort
 and frontend packages were untouched. Next integrate the helpers with the
 shared bounded executor, qualify actual guarded dispatch/reconciliation,
 measure rollback timing and retain in-flight receipt/Delta outcomes.
+
+### Real finite preset workloads and measured direct fault lifecycles
+
+`live_workload.py` now fixes two server-owned, single-stream `main`/baseline
+presets: small is 3 rows/request, at most 8 requests and 10 seconds; elephant
+is 65,536 rows/request, at most 2 requests and 15 seconds. Exact saved gateway
+container/start/image, loopback binding, nonnullable schema and native
+fingerprint are checked before upload. Browser table/schema/headers/endpoints
+are not accepted. The existing FULL-synchronous operation ledger holds bounded
+private jobs, logical request/attempt IDs, non-overlapping marker allocations,
+single-send decisions, native unit identities, RPC/final/close outcomes.
+Reopening or retrying a stored ID never sends payload again. Missing native
+identity remains unknown; unsent partial work is cancelled. Only fresh matching
+physically verified receipt observations can complete all requested units.
+RPC errors/timeouts remain independently recorded even after completion.
+
+The first separate `live-workload1` attempt failed its HTTP driver assertion
+during 50 ms capability polling. The status/body were not retained, so its
+precise error is unavailable; that polling can exceed the server's unchanged
+12 requests/second/session limit. The second explicitly paced driver reached
+real native preflight and exposed a genuine helper bug: its schema comparison
+had assumed nullable `id`, whereas the qualified baseline is nonnullable.
+Both unique failed stages/deployments remain retained, all eight exact
+resources stopped, and no RPC was sent by the failing preflight. Added exact
+native-schema/port/fingerprint regression fixtures; neither server bounds nor
+native schemas were weakened.
+
+The final source passed **171 full Python tests** and its independent frozen
+`bridge-eec969a5-workload-v3` stage passed **106 native bridge tests**.
+`publication-gate-eec969a5-live-workload3` then completed two small requests,
+one elephant request and another small request during a real 2-second publisher
+pause. All four native unit identities and physical receipts reconciled;
+same-ID calls and a reopened journal caused no replay. Ordinary Delta scanning
+matched the exact **65,548-row multiset**.
+
+Fault compensation records now retain the observed repair timestamp and Linux
+boot identity. Inclusive pre-pause-dispatch-through-observed-rollback intervals
+were 680,887,020 ns (collector, requested 500 ms), 697,101,693 ns (SQL authority,
+requested 500 ms), and 2,235,467,065 ns (publisher, requested 2,000 ms). These
+same-kernel CLOCK_MONOTONIC control lifecycles each passed the explicitly tested
+requested-duration-plus-five-seconds bound. They are not CPU measurements,
+one-way transport estimates or wall-clock latency subtraction.
+
+The default read-only bridge kept every effect capability unsupported. It
+exited **0**, all eight exact containers stopped, the bounded supervisors exited
+and port 18775 closed. This proof uses a trusted native helper channel, not
+guarded HTTP dispatch, and does not replace the independently retained
+SIGKILL/emergency-repair proof. Sanitized
+`files/live-workload3-qualification.json` has physical SHA-256
+`55e927e9c7fdfcf5fc1e5d91ac5cd394b6347fadd764d4f30ca1d234e4b8000f`;
+`files/live-workload3-source-sha256.json` has physical SHA-256
+`75f6f54cb0fc6ef1b2a8b345bbb25027acfaa61680fd49ec98e50ab780b565b2`.
+
+Shared bounded executor integration, actual guarded HTTP workload/fault
+dispatch/reconciliation and corresponding browser effect gates remain
+unfinished. Frontend mutationGate stays false. Frozen measured source/binaries,
+cohort, canonical contracts and frontend packages were untouched.

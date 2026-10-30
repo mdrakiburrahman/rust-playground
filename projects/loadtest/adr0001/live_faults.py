@@ -70,6 +70,7 @@ class FaultJournal:
                     "operation_id": operation_id, "intent": intent, "native": resource, "phase": "requested",
                     "boot": boot_identity(), "start_by_ns": time.monotonic_ns() + 5_000_000_000,
                     "deadline_ns": None, "applied": False, "repair": False, "error_code": None,
+                    "repair_boot": None, "repaired_ns": None,
                 }
                 self.connection.execute("INSERT INTO faults VALUES (?,?,?)", (operation_id, digest, json.dumps(record)))
                 self.connection.execute("COMMIT")
@@ -86,7 +87,7 @@ class FaultJournal:
         return json.loads(row[0])
 
     def update(self, operation_id, **changes):
-        if not set(changes) <= {"phase", "deadline_ns", "applied", "repair", "error_code"}:
+        if not set(changes) <= {"phase", "deadline_ns", "applied", "repair", "error_code", "repair_boot", "repaired_ns"}:
             raise ValueError("invalid private fault journal update")
         with self.lock:
             self.connection.execute("BEGIN IMMEDIATE")
@@ -181,7 +182,8 @@ def supervise(runtime, journal, operation_id, repair_only=False, effect=docker_e
                     state = exact_state(runtime, record)
                     if not state["Running"] or state.get("Paused"):
                         raise RuntimeError("bounded rollback was not observed")
-                    journal.update(operation_id, phase="repaired")
+                    journal.update(operation_id, phase="repaired",
+                                   repair_boot=boot_identity(), repaired_ns=time.monotonic_ns())
                 except (OSError, ValueError, RuntimeError, KeyError, TypeError, Denial, subprocess.TimeoutExpired) as error:
                     print("local fault repair required: " + type(error).__name__, flush=True)
                     journal.update(operation_id, phase="repair-required", error_code="unknown")
