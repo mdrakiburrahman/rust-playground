@@ -271,3 +271,30 @@ completed. After release, four receipts, bounded live feeds and nine exact
 ordinary Delta rows reconciled; the server exited 0 and all eight owned
 containers stopped. This does not enable workload/fault controls or qualify
 browser mutation acceptance.
+
+## Independent fault-supervisor qualification
+
+`live_faults.py` adds a private, separately journaled Linux supervisor. It is
+**not wired to HTTP capabilities yet**. Its closed mapping permits only collector
+or gateway pause, publisher pause as `publisher-interrupt`, and dedicated SQL
+pause as `authority-loss`. Requested duration is bounded to 3,000 ms; this is
+the fault deadline, not a claim that Docker rollback has zero latency or always
+works when Docker itself is unavailable. Each native control call is bounded;
+failed compensation remains `repair-required`, never successful recovery.
+
+Intent is durable before dispatch. The child checks the exact saved container,
+start identity, image and deployment ownership. Only after preflight does its
+live parent send a one-use authorization byte; a dead/disarmed parent before
+that handshake cannot start a fault. After admission the separate process owns
+the monotonic deadline and compensates without the HTTP process. Reopening an
+uncertain record only repairs; it never repeats pause. Preexisting pauses and
+replaced incarnations are not adopted. The owner-only journal and exclusive
+worker lease also support narrowly scoped local `--repair-only` recovery.
+
+Real isolated direct-supervisor qualification exercised all three fault kinds,
+actual bridge SIGKILL followed by independent rollback, and actual supervisor
+SIGKILL followed by exact-resource emergency repair. Three existing ordinary
+Delta rows survived, eight exact containers stopped and all workers exited.
+This does not qualify HTTP dispatch, browser effects, in-flight workload
+completion, or measured maximum physical pause duration. Those checks remain
+required before advertising fault support.

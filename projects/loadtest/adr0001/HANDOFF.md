@@ -728,3 +728,45 @@ Executed proof scripts `qualify-live-receipts-v1.py` and
 `qualify-live-receipts-v2.py` remain separate. Workload presets, independent
 bounded fault rollback/repair and corresponding browser effect gates are still
 unfinished; unqualified operations remain disabled.
+
+### Independent native fault rollback, not HTTP fault support
+
+The separate `live_faults.py` source adds a private SQLite FULL-synchronous
+fault journal, exclusive worker lease and independent child process. The closed
+role mapping permits collector/gateway pause, publisher pause/interruption and
+dedicated SQL pause/authority loss. It accepts at most one unresolved fault and
+256 durable IDs, with a 3,000 ms requested-duration bound. Final authorization
+uses a one-use pipe handshake after child preflight: parent death/disarm before
+authorization prevents pause; after admission, deadline rollback no longer
+depends on the HTTP process. Resource ID/start/image/ownership are checked,
+preexisting pauses are rejected, uncertain records only compensate, and failed
+compensation remains explicitly repair-required. No browser credentials are
+stored in the journal or sent to the child.
+
+The full source suite passed **161 tests** and the separately frozen
+`bridge-eec969a5-faults-v1` stage passed **96 native bridge tests**.
+`publication-gate-eec969a5-live-faults1` then passed real direct-supervisor
+qualification for collector pause, publisher interruption and SQL authority
+loss; all three rolled back. It killed the actual supervisor process while
+paused and repaired the same exact resource with `--repair-only`, then killed
+the actual bridge parent and observed independent deadline rollback. Its
+private qualification channel is not production HTTP authorization. Requested
+duration is bounded; physical maximum pause time was not measured by this
+first proof and is not claimed. In-flight workload/receipt behavior also still
+requires combined qualification.
+
+All three original ordinary Delta marker rows survived. The bridge SIGKILL
+exit remains **-9**, not graceful exit; after rollback, exact cleanup stopped
+all eight containers, port 18772 closed and zero exact fault workers remained.
+Sanitized `files/live-faults1-qualification.json` has physical SHA-256
+`f970ade0c0cc16e731dfee7d5645e6836cbeb71579139a5784f7afd02c8a4b32`;
+`files/live-faults1-source-sha256.json` has physical SHA-256
+`e23c775a9b0ac629d6f085bdcb6dcfd949e23a9389eb95b17ac1326e50b74106`.
+The fixed proof's `max_pause_ms` denotes the configured requested-duration
+limit, not a measured physical-duration result.
+
+HTTP fault/repair/workload controls remain unsupported and frontend
+mutationGate remains false. Shared contracts, measured sources/binaries/cohort
+and frontend packages were untouched. Next integrate the helpers with the
+shared bounded executor, qualify actual guarded dispatch/reconciliation,
+measure rollback timing and retain in-flight receipt/Delta outcomes.
