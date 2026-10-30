@@ -85,7 +85,7 @@ async function main(): Promise<number> {
     await delay(0);
     throw spawnError ?? new Error('Cannot spawn owned CLI');
   }
-  console.log(child.pid);
+  process.stdout.write(`${child.pid}\n`);
   let descendants = true;
   let timedOut = false;
   try {

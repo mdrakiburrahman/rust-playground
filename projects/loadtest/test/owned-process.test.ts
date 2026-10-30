@@ -46,6 +46,13 @@ test('owned Azure CLI children run without the detached telemetry uploader that 
   });
 });
 
+test('owned process receipts remain machine-readable when Nx forces terminal colors', async () => {
+  const options = { cwd: process.cwd(), env: { ...process.env, FORCE_COLOR: '1' }, timeoutMs: 2000 };
+  await runOwnedProcess(process.execPath, ['-e', 'process.exit(0)'], options);
+  await assert.rejects(runOwnedProcess(process.execPath, ['-e', 'process.exit(3)'], options),
+    (error: unknown) => error instanceof OwnedProcessError && error.outcome?.exit_code === 3);
+});
+
 test('a completed process is not failed by a backstop timer starved behind a blocked event loop', async () => {
   // Mirrors run 8568: the CLI finished, then synchronous gate work blocked Node past the backstop.
   const started = Date.now();
