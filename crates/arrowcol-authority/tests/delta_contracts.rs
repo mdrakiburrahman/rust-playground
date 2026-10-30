@@ -152,6 +152,329 @@ fn proposal(state: &Snapshot, unit: &str) -> Proposal {
     }
 }
 
+fn replace_incarnation(
+    state: &mut Snapshot,
+    controller: &Controller,
+    writer: &Writer,
+    register: bool,
+) -> Result<Writer> {
+    if register {
+        apply(
+            state,
+            &Command::Revoke {
+                controller: controller.clone(),
+                collector: writer.collector.clone(),
+            },
+            &clock(3),
+        )?;
+        let mut member = state.members[&writer.collector].member.clone();
+        member.writer.process = format!("{}-replacement", writer.process);
+        member.writer.generation.clear();
+        apply(
+            state,
+            &Command::Register {
+                controller: controller.clone(),
+                member,
+            },
+            &clock(3),
+        )?;
+    } else {
+        apply(
+            state,
+            &Command::Replace {
+                controller: controller.clone(),
+                writer: writer.clone(),
+            },
+            &clock(3),
+        )?;
+    }
+    Ok(state.members[&writer.collector].member.writer.clone())
+}
+
+#[test]
+fn replacement_preserves_desired_policy_but_not_acknowledgements_or_telemetry() -> Result<()> {
+    for register in [false, true] {
+        let (mut state, controller, a, _) = setup()?;
+        let observation = state.observations["a"].clone();
+        let policy = Command::Policy {
+            controller: controller.clone(),
+            collector: "a".into(),
+            writer: a.clone(),
+            revision: 0,
+            operation: "block-a".into(),
+            excluded: true,
+            block_streams: true,
+            retiring: false,
+        };
+        apply(&mut state, &policy, &clock(2))?;
+        let successor = replace_incarnation(&mut state, &controller, &a, register)?;
+        assert_ne!(successor, a);
+        assert!(state.policy_for(&a).is_none());
+        let current = state.policy_for(&successor).context("rebound policy")?;
+        assert_eq!(current.revision, 2);
+        assert_eq!(current.applied_revision, 0);
+        assert!(current.excluded && current.block_streams);
+        assert!(!state.observations.contains_key("a"));
+        assert!(!state.observed_at.contains_key("a"));
+        assert!(state.eligible("a", "cold").is_err());
+        assert!(apply(&mut state.clone(), &policy, &clock(3)).is_err());
+        for (writer, applied_revision) in [(a, 2), (successor.clone(), 1), (successor.clone(), 0)] {
+            assert!(
+                apply(
+                    &mut state.clone(),
+                    &Command::Observe {
+                        writer,
+                        observation: observation.clone(),
+                        applied_revision,
+                    },
+                    &clock(3),
+                )
+                .is_err()
+            );
+        }
+        apply(
+            &mut state,
+            &Command::Observe {
+                writer: successor.clone(),
+                observation,
+                applied_revision: 2,
+            },
+            &clock(3),
+        )?;
+        assert_eq!(state.policies["a"].applied_revision, 2);
+        if !register {
+            let identity = state.tables["table"].identity.clone();
+            apply(
+                &mut state,
+                &Command::Activate {
+                    table: "table".into(),
+                    identity,
+                    version: -1,
+                },
+                &clock(3),
+            )?;
+            assert!(admit(&mut state.clone(), &successor, "still-blocked").is_err());
+        }
+        apply(
+            &mut state,
+            &Command::Policy {
+                controller,
+                collector: "a".into(),
+                writer: successor.clone(),
+                revision: 2,
+                operation: "unblock-a".into(),
+                excluded: false,
+                block_streams: false,
+                retiring: false,
+            },
+            &clock(3),
+        )?;
+        assert_eq!(state.policies["a"].revision, 3);
+        state.eligible("a", "cold")?;
+        if !register {
+            admit(&mut state, &successor, "explicitly-unblocked")?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn retirement_approval_is_bound_to_incarnation_revision_and_operation() -> Result<()> {
+    let (mut state, controller, _, b) = setup()?;
+    apply(
+        &mut state,
+        &Command::Policy {
+            controller: controller.clone(),
+            collector: "b".into(),
+            writer: b.clone(),
+            revision: 0,
+            operation: "retire-b".into(),
+            excluded: true,
+            block_streams: false,
+            retiring: true,
+        },
+        &clock(2),
+    )?;
+    let observation = state.observations["b"].clone();
+    let successor = replace_incarnation(&mut state, &controller, &b, false)?;
+    assert!(state.policy_for(&successor).context("policy")?.retiring);
+    apply(
+        &mut state,
+        &Command::Observe {
+            writer: successor.clone(),
+            observation,
+            applied_revision: 2,
+        },
+        &clock(3),
+    )?;
+    for (writer, revision, operation) in [
+        (b, 1, "retire-b"),
+        (successor.clone(), 1, "retire-b"),
+        (successor.clone(), 2, "wrong-operation"),
+    ] {
+        assert!(
+            apply(
+                &mut state.clone(),
+                &Command::ApproveRetirement {
+                    controller: controller.clone(),
+                    writer,
+                    revision,
+                    operation: operation.into(),
+                },
+                &clock(3),
+            )
+            .is_err()
+        );
+    }
+    apply(
+        &mut state,
+        &Command::ApproveRetirement {
+            controller: controller.clone(),
+            writer: successor.clone(),
+            revision: 2,
+            operation: "retire-b".into(),
+        },
+        &clock(3),
+    )?;
+    assert!(state.policies["b"].approved);
+    for register in [false, true] {
+        assert!(replace_incarnation(&mut state.clone(), &controller, &successor, register).is_err());
+    }
+    assert!(
+        apply(
+            &mut state,
+            &Command::Policy {
+                controller,
+                collector: "b".into(),
+                writer: successor,
+                revision: 2,
+                operation: "cancel-approved-retirement".into(),
+                excluded: false,
+                block_streams: false,
+                retiring: false,
+            },
+            &clock(3),
+        )
+        .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn a_foreign_incarnation_cannot_acknowledge_a_persisted_policy() -> Result<()> {
+    let (mut state, _, a, b) = setup()?;
+    let mut observation = state.observations["b"].clone();
+    observation.sequence += 1;
+    state.policies.insert(
+        "b".into(),
+        placement::Policy {
+            revision: 7,
+            incarnation: Some(a),
+            ..placement::Policy::default()
+        },
+    );
+    assert!(
+        apply(
+            &mut state.clone(),
+            &Command::Observe {
+                writer: b.clone(),
+                observation: observation.clone(),
+                applied_revision: 7,
+            },
+            &clock(2),
+        )
+        .is_err()
+    );
+    apply(
+        &mut state,
+        &Command::Observe {
+            writer: b,
+            observation,
+            applied_revision: 0,
+        },
+        &clock(2),
+    )?;
+    assert_eq!(state.policies["b"].applied_revision, 0);
+    Ok(())
+}
+
+#[test]
+fn replacement_during_retirement_retains_successor_recovery_obligations() -> Result<()> {
+    let (mut state, controller, a, b) = setup()?;
+    let observation = state.observations["a"].clone();
+    apply(
+        &mut state,
+        &Command::Policy {
+            controller: controller.clone(),
+            collector: "a".into(),
+            writer: a.clone(),
+            revision: 0,
+            operation: "retire-a".into(),
+            excluded: true,
+            block_streams: false,
+            retiring: true,
+        },
+        &clock(2),
+    )?;
+    let successor = replace_incarnation(&mut state, &controller, &a, false)?;
+    assert!(state.policies["a"].recovery_obligations.contains("table"));
+    apply(
+        &mut state,
+        &Command::Observe {
+            writer: successor.clone(),
+            observation,
+            applied_revision: 2,
+        },
+        &clock(3),
+    )?;
+    let activation = Command::Activate {
+        table: "table".into(),
+        identity: state.tables["table"].identity.clone(),
+        version: -1,
+    };
+    assert!(apply(&mut state.clone(), &activation, &clock(3)).is_err());
+    apply(
+        &mut state,
+        &Command::Reserve {
+            controller: controller.clone(),
+            key: "table".into(),
+            target: b,
+            operation: "evacuate-replacement".into(),
+        },
+        &clock(3),
+    )?;
+    apply(
+        &mut state,
+        &Command::Transfer {
+            controller: controller.clone(),
+            key: "table".into(),
+            operation: "evacuate-replacement".into(),
+            force: false,
+        },
+        &clock(3),
+    )?;
+    let approve = Command::ApproveRetirement {
+        controller,
+        writer: successor,
+        revision: 2,
+        operation: "retire-a".into(),
+    };
+    assert!(apply(&mut state.clone(), &approve, &clock(3)).is_err());
+    let identity = state.tables["table"].identity.clone();
+    apply(
+        &mut state,
+        &Command::Activate {
+            table: "table".into(),
+            identity,
+            version: -1,
+        },
+        &clock(3),
+    )?;
+    apply(&mut state, &approve, &clock(3))?;
+    assert!(state.policies["a"].approved);
+    Ok(())
+}
+
 #[test]
 fn cold_claim_requires_recovery_and_fresh_capacity() -> Result<()> {
     let (state, c, a, _) = setup()?;
@@ -251,7 +574,9 @@ fn exclusion_and_admission_block_are_distinct_and_revisioned() -> Result<()> {
             &mut state,
             &Command::ApproveRetirement {
                 controller: c,
-                collector: "a".into()
+                writer: a,
+                revision: 2,
+                operation: "block".into(),
             },
             &clock(2)
         )
@@ -325,7 +650,7 @@ fn retirement_waits_for_recovery_even_when_first_successor_fails() -> Result<()>
     apply(
         &mut state,
         &Command::Observe {
-            writer: a,
+            writer: a.clone(),
             observation,
             applied_revision: 1,
         },
@@ -353,7 +678,9 @@ fn retirement_waits_for_recovery_even_when_first_successor_fails() -> Result<()>
     )?;
     let approve = Command::ApproveRetirement {
         controller: controller.clone(),
-        collector: "a".into(),
+        writer: a,
+        revision: 1,
+        operation: "retire".into(),
     };
     assert!(apply(&mut state.clone(), &approve, &clock(2)).is_err());
     apply(

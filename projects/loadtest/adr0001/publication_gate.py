@@ -19,8 +19,8 @@ import time
 
 REPO = Path(__file__).resolve().parents[3]
 BINARY = REPO / "target/debug/publication-gate"
-SQL_IMAGE = "pingora-bench-adrobs20261026final2/sqlserver:local"
-RUNTIME_IMAGE = "pingora-bench-adrobs20261026final2/runtime:local"
+SQL_IMAGE = os.environ.get("ARROWCOL_SQL_IMAGE", "pingora-bench-adrobs20261026final2/sqlserver:local")
+RUNTIME_IMAGE = os.environ.get("ARROWCOL_RUNTIME_IMAGE", "pingora-bench-adrobs20261026final2/runtime:local")
 
 
 class Gate:
@@ -28,10 +28,12 @@ class Gate:
         self.project = project
         self.subnet = ipaddress.ip_network(subnet)
         assert project.startswith("publication-gate-") and project.replace("-", "").isalnum()
+        assert len(project + "-sql") <= 63, "SQL DNS label exceeds 63 characters"
         assert self.subnet.is_private and self.subnet.prefixlen == 24
         self.root = REPO / "target/publication-gate" / project
         self.root.mkdir(parents=True, exist_ok=False)
         self.containers = []
+        self.container_ids = {}
         self.children = []
         self.events = []
         self.passed = []
@@ -63,7 +65,9 @@ class Gate:
 
     def run(self, command, ok=True, timeout=90):
         command = [str(c) for c in command]
+        command = self.fence_container_command(command)
         started = time.time()
+        elapsed_start = time.monotonic()
         result = subprocess.run(command, cwd=REPO, text=True, capture_output=True, timeout=timeout)
         self.serial += 1
         name = f"{self.serial:04d}"
@@ -71,7 +75,7 @@ class Gate:
         (self.root / "logs" / f"{name}.stderr").write_text(result.stderr)
         self.events.append({
             "id": name, "command": command, "started": started,
-            "seconds": time.time() - started, "returncode": result.returncode,
+            "seconds": time.monotonic() - elapsed_start, "returncode": result.returncode,
         })
         self.save()
         if ok:
@@ -79,6 +83,52 @@ class Gate:
         else:
             assert result.returncode != 0, ("unexpected success", command, result.stdout)
         return result
+
+    def owned_container(self, name):
+        if name in self.container_ids:
+            return self.container_ids[name]
+        assert name in self.container_ids.values(), ("unowned container", name)
+        return name
+
+    def fence_container_command(self, command):
+        if command[:1] != ["docker"] or len(command) < 3:
+            return command
+        command = list(command)
+        if command[1] in {"stop", "start", "restart", "kill", "pause", "unpause"}:
+            command[-1] = self.owned_container(command[-1])
+        elif command[1] == "exec":
+            index = 2
+            while command[index] in {"-i", "-t", "-it"}:
+                index += 1
+            command[index] = self.owned_container(command[index])
+        return command
+
+    def create_container(self, command):
+        name = command[command.index("--name") + 1]
+        assert name.startswith(self.project + "-"), ("unowned container name", name)
+        assert any(
+            command[index:index + 2] == ["--label", f"{label}={self.project}"]
+            for index in range(len(command) - 1) for label in ("publication-gate", "delta-runtime")
+        ), ("missing container owner label", name)
+        assert name not in self.container_ids, ("container already registered", name)
+        identity = self.run(command).stdout.strip()
+        assert len(identity) == 64 and all(c in "0123456789abcdef" for c in identity), identity
+        state = json.loads(self.run(["docker", "inspect", identity]).stdout)[0]
+        labels = state["Config"].get("Labels") or {}
+        assert state["Id"] == identity and (
+            labels.get("publication-gate") == self.project or labels.get("delta-runtime") == self.project
+        ), ("container ownership mismatch", name)
+        self.container_ids[name] = identity
+        self.containers.append(identity)
+        return identity
+
+    def create_volume(self, name):
+        assert name.startswith(self.project + "-"), ("unowned volume name", name)
+        existing = self.run(["docker", "volume", "ls", "-q"]).stdout.split()
+        assert name not in existing, ("volume name already owned", name)
+        self.run(["docker", "volume", "create", "--label", f"publication-gate={self.project}", name])
+        volume = json.loads(self.run(["docker", "volume", "inspect", name]).stdout)[0]
+        assert volume["Name"] == name and (volume.get("Labels") or {}).get("publication-gate") == self.project
 
     def save(self):
         (self.root / "events.json").write_text(json.dumps(self.events, indent=2))
@@ -156,10 +206,11 @@ class Gate:
         assert not {self.project + "-sql", self.project + "-collector"}.intersection(containers)
         volumes = self.run(["docker", "volume", "ls", "-q"]).stdout.split()
         assert self.project + "-sql" not in volumes, "volume name already owned"
-        self.run(["docker", "network", "create", "--subnet", str(self.subnet), self.project])
-        self.run(["docker", "volume", "create", self.project + "-sql"])
+        self.run(["docker", "network", "create", "--label", f"publication-gate={self.project}",
+                  "--subnet", str(self.subnet), self.project])
+        self.create_volume(self.project + "-sql")
         self.sql_name = self.project + "-sql"
-        self.run([
+        self.create_container([
             "docker", "run", "-d", "--name", self.sql_name,
             "--label", f"publication-gate={self.project}", "--network", self.project,
             "--cpus", "2", "--memory", "3g", "--pids-limit", "512",
@@ -170,11 +221,10 @@ class Gate:
             "--mount", f"type=volume,src={self.project}-sql,dst=/var/opt/mssql",
             SQL_IMAGE,
         ])
-        self.containers.append(self.sql_name)
         self.port = self.run(["docker", "port", self.sql_name, "1433/tcp"]).stdout.strip().split(":")[-1]
         self.wait_sql()
         self.collector = self.project + "-collector"
-        self.run([
+        self.create_container([
             "docker", "run", "-d", "--name", self.collector,
             "--label", f"publication-gate={self.project}",
             "--network", "none", "--read-only", "--cap-drop=ALL",
@@ -185,7 +235,6 @@ class Gate:
             "--mount", f"type=bind,src={self.root / 'private/tables'},dst=/destination,readonly",
             RUNTIME_IMAGE, "sleep", "1800",
         ])
-        self.containers.append(self.collector)
         self.run(["docker", "exec", self.collector, "/publication-gate", "--help"])
         self.call("bootstrap", self.table, self.a)
         self.mark("isolated SQL and collector ready", loopback_port=self.port, subnet=str(self.subnet))
@@ -194,7 +243,7 @@ class Gate:
         until = time.monotonic() + 180
         while True:
             check = subprocess.run(
-                ["docker", "exec", self.sql_name, "/usr/local/bin/sqlserver-healthcheck"],
+                ["docker", "exec", self.owned_container(self.sql_name), "/usr/local/bin/sqlserver-healthcheck"],
                 capture_output=True, text=True,
             )
             if check.returncode == 0:

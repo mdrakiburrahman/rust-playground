@@ -41,6 +41,21 @@ const HEADERS: [&str; 8] = [
     "x-arrowcol-control-operation",
     "content-type",
 ];
+fn resident_bytes(status: &str, strict: bool) -> Result<u64> {
+    let kib = status
+        .lines()
+        .find(|line| line.starts_with("VmRSS:"))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u64>().ok());
+    let kib = if strict {
+        kib.context("RSS observation unavailable")?
+    } else {
+        kib.unwrap_or(1)
+    };
+    ensure!(!strict || kib > 0, "RSS observation unavailable");
+    kib.checked_mul(1024).context("RSS observation overflow")
+}
+
 fn metadata<'a>(map: &'a MetadataMap, key: &str) -> &'a str {
     map.get(key).and_then(|v| v.to_str().ok()).unwrap_or("")
 }
@@ -378,13 +393,10 @@ impl Service {
                 if let Role::Collector(writer) = &self.role {
                     let mut writer_guard = writer.lock().await;
                     let writer = writer_guard.clone();
-                    let rss = std::fs::read_to_string("/proc/self/status")?
-                        .lines()
-                        .find(|line| line.starts_with("VmRSS:"))
-                        .and_then(|line| line.split_whitespace().nth(1))
-                        .and_then(|n| n.parse::<u64>().ok())
-                        .unwrap_or(1)
-                        * 1024;
+                    let rss = resident_bytes(
+                        &std::fs::read_to_string("/proc/self/status")?,
+                        self.config.delta.is_some(),
+                    )?;
                     let active = self.active.load(Ordering::Relaxed);
                     let cpu = std::fs::read_to_string("/sys/fs/cgroup/cpu.stat")
                         .ok()
@@ -447,7 +459,13 @@ impl Service {
                     if self.config.delta.is_some()
                         && let Some(demand) = observed_demand
                     {
-                        let revision = view["policies"][&writer.collector]["revision"].as_i64().unwrap_or(0);
+                        let policy = view["policies"]
+                            .get(&writer.collector)
+                            .map(|value| serde_json::from_value::<placement::Policy>(value.clone()))
+                            .transpose()?;
+                        let revision = policy
+                            .filter(|p| p.incarnation.as_ref() == Some(&writer))
+                            .map_or(0, |p| p.revision);
                         let directory = self.directory.lock().await;
                         let allocation_revision = directory.revision;
                         let tables = directory
@@ -1023,4 +1041,18 @@ pub async fn serve(service: Service, listen: &str) -> Result<()> {
         .serve(listen.parse()?)
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod telemetry_tests {
+    use super::resident_bytes;
+
+    #[test]
+    fn delta_rss_is_unknown_not_a_tiny_capacity_estimate() {
+        assert_eq!(resident_bytes("VmRSS:\t128 kB\n", true).ok(), Some(128 * 1024));
+        for status in ["", "VmRSS: unknown kB", "VmRSS: 0 kB", "VmRSS: 18446744073709551615 kB"] {
+            assert!(resident_bytes(status, true).is_err());
+        }
+        assert_eq!(resident_bytes("", false).ok(), Some(1024));
+    }
 }

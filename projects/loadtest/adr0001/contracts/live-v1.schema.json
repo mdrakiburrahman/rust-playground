@@ -1,0 +1,289 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:arrowcol:live:1",
+  "title": "Bounded dedicated local PoC bridge packets",
+  "oneOf": [
+    {"$ref": "#/$defs/capabilities"}, {"$ref": "#/$defs/snapshot"},
+    {"$ref": "#/$defs/feed"}, {"$ref": "#/$defs/select"},
+    {"$ref": "#/$defs/selection"}, {"$ref": "#/$defs/arm"},
+    {"$ref": "#/$defs/armed"}, {"$ref": "#/$defs/disarm"},
+    {"$ref": "#/$defs/command"}, {"$ref": "#/$defs/operation"},
+    {"$ref": "#/$defs/error"}
+  ],
+  "$defs": {
+    "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"},
+    "counter": {"type": "string", "pattern": "^(0|[1-9][0-9]{0,19})$"},
+    "identity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "incarnation"],
+      "properties": {"id": {"$ref": "#/$defs/id"}, "incarnation": {"$ref": "#/$defs/id"}}
+    },
+    "writer": {
+      "type": "object", "additionalProperties": false,
+      "required": ["collector", "process", "generation"],
+      "properties": {
+        "collector": {"$ref": "#/$defs/id"}, "process": {"$ref": "#/$defs/id"},
+        "generation": {"$ref": "#/$defs/id"}
+      }
+    },
+    "target": {
+      "type": "object", "additionalProperties": false,
+      "required": ["resource", "writer", "policy_revision"],
+      "properties": {
+        "resource": {"$ref": "#/$defs/identity"}, "writer": {"$ref": "#/$defs/writer"},
+        "policy_revision": {"$ref": "#/$defs/counter"}
+      }
+    },
+    "operation_kind": {
+      "enum": ["replicas", "retirement", "migration", "exclusion", "admission", "workload", "fault", "repair"]
+    },
+    "capability": {
+      "type": "object", "additionalProperties": false,
+      "required": ["operation", "supported", "reason", "maximum"],
+      "properties": {
+        "operation": {"$ref": "#/$defs/operation_kind"}, "supported": {"type": "boolean"},
+        "reason": {"enum": ["qualified", "unqualified", "disconnected", "unsupported"]},
+        "maximum": {"type": ["integer", "null"], "minimum": 0, "maximum": 4096}
+      }
+    },
+    "capabilities": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "schema_version", "bridge", "connected", "qualified", "deployments", "operations", "workload_presets", "limits"],
+      "properties": {
+        "kind": {"const": "capabilities"}, "schema_version": {"const": 1},
+        "bridge": {"$ref": "#/$defs/identity"}, "connected": {"type": "boolean"},
+        "qualified": {"type": "boolean"},
+        "deployments": {"type": "array", "maxItems": 1, "items": {"$ref": "#/$defs/identity"}},
+        "operations": {"type": "array", "maxItems": 8, "items": {"$ref": "#/$defs/capability"}},
+        "workload_presets": {"type": "array", "maxItems": 2, "items": {"$ref": "#/$defs/workload_preset"}},
+        "limits": {
+          "type": "object", "additionalProperties": false,
+          "required": ["request_bytes", "response_bytes", "feed_items", "arm_ttl_ms", "snapshot_max_age_ms"],
+          "properties": {
+            "request_bytes": {"const": 32768}, "response_bytes": {"const": 1048576},
+            "feed_items": {"const": 64}, "arm_ttl_ms": {"const": 30000},
+            "snapshot_max_age_ms": {"const": 5000}
+          }
+        }
+      }
+    },
+    "workload_preset": {
+      "type": "object", "additionalProperties": false,
+      "required": ["profile", "table_id", "schema", "streams", "rows_per_request", "maximum_requests", "maximum_duration_ms"],
+      "properties": {
+        "profile": {"enum": ["small", "elephant"]}, "table_id": {"$ref": "#/$defs/id"},
+        "schema": {"enum": ["baseline", "evolved", "dictionary"]},
+        "streams": {"type": "integer", "minimum": 1, "maximum": 4},
+        "rows_per_request": {"type": "integer", "minimum": 1, "maximum": 65536},
+        "maximum_requests": {"type": "integer", "minimum": 1, "maximum": 256},
+        "maximum_duration_ms": {"type": "integer", "minimum": 1, "maximum": 30000}
+      }
+    },
+    "metric": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "resource", "process_id", "clock_id", "offset_ns", "duration_ns", "metric", "value", "unit", "evidence", "method"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"}, "resource": {"$ref": "#/$defs/identity"},
+        "process_id": {"$ref": "#/$defs/id"}, "clock_id": {"$ref": "#/$defs/id"},
+        "offset_ns": {"$ref": "#/$defs/counter"}, "duration_ns": {"$ref": "#/$defs/counter"},
+        "metric": {"enum": ["cpu", "memory", "io-read", "io-write", "throughput", "queue-depth", "queue-age"]},
+        "value": {"type": ["string", "null"], "pattern": "^(0|[1-9][0-9]{0,19})(\\.[0-9]{1,9})?$"},
+        "unit": {"enum": ["ns", "bytes", "rows_per_second", "count"]},
+        "evidence": {"enum": ["measured", "derived", "unavailable"]},
+        "method": {"enum": ["process-counter", "local-monotonic", "not-observed"]}
+      },
+      "allOf": [
+        {"if": {"properties": {"evidence": {"const": "unavailable"}}},
+         "then": {"properties": {"value": {"type": "null"}, "method": {"const": "not-observed"}}},
+         "else": {"properties": {"value": {"type": "string"}, "method": {"enum": ["process-counter", "local-monotonic"]}}}},
+        {"if": {"properties": {"metric": {"enum": ["cpu", "queue-age"]}}}, "then": {"properties": {"unit": {"const": "ns"}}}},
+        {"if": {"properties": {"metric": {"enum": ["memory", "io-read", "io-write"]}}}, "then": {"properties": {"unit": {"const": "bytes"}}}},
+        {"if": {"properties": {"metric": {"const": "throughput"}}}, "then": {"properties": {"unit": {"const": "rows_per_second"}}}},
+        {"if": {"properties": {"metric": {"const": "queue-depth"}}}, "then": {"properties": {"unit": {"const": "count"}}}}
+      ]
+    },
+    "replica": {
+      "type": "object", "additionalProperties": false,
+      "required": ["resource", "role", "status", "writer", "policy_revision", "applied_policy_revision", "excluded", "block_streams", "retiring"],
+      "properties": {
+        "resource": {"$ref": "#/$defs/identity"},
+        "role": {"enum": ["gateway", "collector", "authority", "publisher", "storage"]},
+        "status": {"enum": ["active", "recovering", "draining", "retired", "unknown", "failed"]},
+        "writer": {"oneOf": [{"$ref": "#/$defs/writer"}, {"type": "null"}]},
+        "policy_revision": {"oneOf": [{"$ref": "#/$defs/counter"}, {"type": "null"}]},
+        "applied_policy_revision": {"oneOf": [{"$ref": "#/$defs/counter"}, {"type": "null"}]},
+        "excluded": {"type": ["boolean", "null"]}, "block_streams": {"type": ["boolean", "null"]},
+        "retiring": {"type": ["boolean", "null"]}
+      }
+    },
+    "table": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "epoch", "lifecycle", "writer", "recovery_obligations"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"}, "epoch": {"$ref": "#/$defs/counter"},
+        "lifecycle": {"enum": ["recovering", "active", "draining", "unknown"]},
+        "writer": {"oneOf": [{"$ref": "#/$defs/writer"}, {"type": "null"}]},
+        "recovery_obligations": {"type": "array", "maxItems": 32, "items": {"$ref": "#/$defs/id"}}
+      }
+    },
+    "receipt": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "table_id", "operation_id", "version", "completion", "digest"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"}, "table_id": {"$ref": "#/$defs/id"},
+        "operation_id": {"$ref": "#/$defs/id"}, "version": {"$ref": "#/$defs/counter"},
+        "completion": {"enum": ["accepted", "pending", "completed", "failed", "unknown"]},
+        "digest": {"type": ["string", "null"], "pattern": "^[a-f0-9]{64}$"}
+      }
+    },
+    "snapshot": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "schema_version", "bridge", "deployment", "revision", "freshness", "replicas", "tables", "receipts", "metrics", "coverage"],
+      "properties": {
+        "kind": {"const": "snapshot"}, "schema_version": {"const": 1},
+        "bridge": {"$ref": "#/$defs/identity"}, "deployment": {"$ref": "#/$defs/identity"},
+        "revision": {"$ref": "#/$defs/counter"},
+        "freshness": {
+          "type": "object", "additionalProperties": false,
+          "required": ["status", "age_ns", "maximum_age_ns"],
+          "properties": {
+            "status": {"enum": ["fresh", "stale", "unknown"]},
+            "age_ns": {"oneOf": [{"$ref": "#/$defs/counter"}, {"type": "null"}]},
+            "maximum_age_ns": {"const": "5000000000"}
+          }
+        },
+        "replicas": {"type": "array", "maxItems": 16, "items": {"$ref": "#/$defs/replica"}},
+        "tables": {"type": "array", "maxItems": 32, "items": {"$ref": "#/$defs/table"}},
+        "receipts": {"type": "array", "maxItems": 128, "items": {"$ref": "#/$defs/receipt"}},
+        "metrics": {"type": "array", "maxItems": 256, "items": {"$ref": "#/$defs/metric"}},
+        "coverage": {
+          "type": "object", "additionalProperties": false,
+          "required": ["complete", "missing", "dropped"],
+          "properties": {
+            "complete": {"type": "boolean"},
+            "missing": {"type": "array", "maxItems": 32, "uniqueItems": true, "items": {"$ref": "#/$defs/id"}},
+            "dropped": {"type": "integer", "minimum": 0, "maximum": 2147483647}
+          }
+        }
+      }
+    },
+    "feed": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "schema_version", "bridge", "deployment", "after", "next", "gap", "resnapshot", "items"],
+      "properties": {
+        "kind": {"const": "feed"}, "schema_version": {"const": 1},
+        "bridge": {"$ref": "#/$defs/identity"}, "deployment": {"$ref": "#/$defs/identity"},
+        "after": {"$ref": "#/$defs/counter"}, "next": {"$ref": "#/$defs/counter"},
+        "gap": {"type": "boolean"}, "resnapshot": {"type": "boolean"},
+        "items": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/snapshot"}}
+      }
+    },
+    "select": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "schema_version", "deployment", "revision"],
+      "properties": {
+        "kind": {"const": "select"}, "schema_version": {"const": 1},
+        "deployment": {"$ref": "#/$defs/identity"}, "revision": {"$ref": "#/$defs/counter"}
+      }
+    },
+    "selection": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "schema_version", "selection_id", "deployment", "revision", "armed"],
+      "properties": {
+        "kind": {"const": "selection"}, "schema_version": {"const": 1},
+        "selection_id": {"$ref": "#/$defs/id"}, "deployment": {"$ref": "#/$defs/identity"},
+        "revision": {"$ref": "#/$defs/counter"}, "armed": {"const": false}
+      }
+    },
+    "arm": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "schema_version", "selection_id", "deployment", "revision", "confirm"],
+      "properties": {
+        "kind": {"const": "arm"}, "schema_version": {"const": 1},
+        "selection_id": {"$ref": "#/$defs/id"}, "deployment": {"$ref": "#/$defs/identity"},
+        "revision": {"$ref": "#/$defs/counter"}, "confirm": {"const": "dedicated-local-poc"}
+      }
+    },
+    "armed": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "schema_version", "selection_id", "arm_id", "deployment", "revision", "ttl_ms"],
+      "properties": {
+        "kind": {"const": "armed"}, "schema_version": {"const": 1},
+        "selection_id": {"$ref": "#/$defs/id"}, "arm_id": {"$ref": "#/$defs/id"},
+        "deployment": {"$ref": "#/$defs/identity"}, "revision": {"$ref": "#/$defs/counter"},
+        "ttl_ms": {"const": 30000}
+      }
+    },
+    "disarm": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "schema_version", "selection_id"],
+      "properties": {
+        "kind": {"const": "disarm"}, "schema_version": {"const": 1},
+        "selection_id": {"$ref": "#/$defs/id"}
+      }
+    },
+    "action": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false, "required": ["operation", "role", "desired"],
+          "properties": {"operation": {"const": "replicas"}, "role": {"enum": ["collector", "gateway"]}, "desired": {"type": "integer", "minimum": 1, "maximum": 4}}
+        },
+        {
+          "type": "object", "additionalProperties": false, "required": ["operation", "target"],
+          "properties": {"operation": {"const": "retirement"}, "target": {"$ref": "#/$defs/target"}}
+        },
+        {
+          "type": "object", "additionalProperties": false, "required": ["operation", "table_id", "expected_epoch"],
+          "properties": {"operation": {"const": "migration"}, "table_id": {"$ref": "#/$defs/id"}, "expected_epoch": {"$ref": "#/$defs/counter"}}
+        },
+        {
+          "type": "object", "additionalProperties": false, "required": ["operation", "target", "enabled"],
+          "properties": {"operation": {"enum": ["exclusion", "admission"]}, "target": {"$ref": "#/$defs/target"}, "enabled": {"type": "boolean"}}
+        },
+        {
+          "type": "object", "additionalProperties": false, "required": ["operation", "profile", "requests", "duration_ms"],
+          "properties": {"operation": {"const": "workload"}, "profile": {"enum": ["small", "elephant"]}, "requests": {"type": "integer", "minimum": 1, "maximum": 256}, "duration_ms": {"type": "integer", "minimum": 1, "maximum": 30000}}
+        },
+        {
+          "type": "object", "additionalProperties": false, "required": ["operation", "resource", "fault", "duration_ms"],
+          "properties": {"operation": {"const": "fault"}, "resource": {"$ref": "#/$defs/identity"}, "fault": {"enum": ["pause", "publisher-interrupt", "authority-loss"]}, "duration_ms": {"type": "integer", "minimum": 1, "maximum": 15000}}
+        },
+        {
+          "type": "object", "additionalProperties": false, "required": ["operation", "resource", "repair"],
+          "properties": {"operation": {"const": "repair"}, "resource": {"$ref": "#/$defs/identity"}, "repair": {"enum": ["reconcile", "restart"]}}
+        }
+      ]
+    },
+    "command": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "schema_version", "operation_id", "selection_id", "arm_id", "deployment", "revision", "action"],
+      "properties": {
+        "kind": {"const": "command"}, "schema_version": {"const": 1},
+        "operation_id": {"$ref": "#/$defs/id"}, "selection_id": {"$ref": "#/$defs/id"},
+        "arm_id": {"$ref": "#/$defs/id"}, "deployment": {"$ref": "#/$defs/identity"},
+        "revision": {"$ref": "#/$defs/counter"}, "action": {"$ref": "#/$defs/action"}
+      }
+    },
+    "operation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "schema_version", "operation_id", "deployment", "requested_revision", "applied_revision", "status", "error_code"],
+      "properties": {
+        "kind": {"const": "operation"}, "schema_version": {"const": 1},
+        "operation_id": {"$ref": "#/$defs/id"}, "deployment": {"$ref": "#/$defs/identity"},
+        "requested_revision": {"$ref": "#/$defs/counter"},
+        "applied_revision": {"oneOf": [{"$ref": "#/$defs/counter"}, {"type": "null"}]},
+        "status": {"enum": ["requested", "pending", "applied", "completed", "failed", "unknown", "cancelled", "timeout", "rejected"]},
+        "error_code": {"type": ["string", "null"], "enum": [null, "disarmed", "stale", "wrong-target", "unsupported", "unqualified", "disconnected", "conflict", "timeout", "failed", "unknown"]}
+      }
+    },
+    "error": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "schema_version", "code", "resnapshot"],
+      "properties": {
+        "kind": {"const": "error"}, "schema_version": {"const": 1},
+        "code": {"enum": ["unauthenticated", "origin", "csrf", "invalid", "disarmed", "stale", "wrong-target", "unsupported", "unqualified", "disconnected", "conflict", "unknown-operation", "limit"]},
+        "resnapshot": {"type": "boolean"}
+      }
+    }
+  }
+}

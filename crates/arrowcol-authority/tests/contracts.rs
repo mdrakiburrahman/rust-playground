@@ -181,7 +181,7 @@ fn directory_rejects_old_events_and_requires_resnapshot_on_revision_regression()
 #[test]
 fn immutable_manifest_chain_rejects_overwrite_path_escape_and_corruption() -> anyhow::Result<()> {
     let root = std::env::current_dir()?
-        .join("target")
+        .join(std::env::var_os("CARGO_TARGET_DIR").unwrap_or_else(|| "target".into()))
         .join(format!("contract-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&root)?;
     let schema = Arc::new(Schema::new(vec![

@@ -10,6 +10,7 @@ import subprocess
 import threading
 import time
 import urllib.parse
+import uuid
 
 
 class ClientAccounting:
@@ -114,10 +115,12 @@ def read_ns(value):
 def cpu_interval(previous, current):
     if previous is None:
         return None
-    elapsed = current["engine_read_ns"] - previous["engine_read_ns"]
+    if current["observer_clock_id"] != previous["observer_clock_id"]:
+        raise ValueError("CPU interval crosses observer clocks")
+    elapsed = current["observed_monotonic_ns"] - previous["observed_monotonic_ns"]
     used = current["cpu_total_usage_ns"] - previous["cpu_total_usage_ns"]
     if elapsed <= 0 or used < 0:
-        return None
+        raise ValueError("invalid CPU counter/clock interval")
     return {"elapsed_ns": elapsed, "cpu_usage_ns": used, "one_core_percent": 100 * used / elapsed}
 
 
@@ -135,6 +138,8 @@ class Observer:
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=False)
         self.engine = Engine()
+        self.clock_id = "observer-" + uuid.uuid4().hex
+        self.clock_origin_ns = time.monotonic_ns()
         self.cadence = cadence
         self.probe = probe
         self.last_probe_ns = 0
@@ -177,6 +182,8 @@ class Observer:
                     row["Names"][0].lstrip("/").removeprefix(self.project + "-")), "image_id": row["ImageID"],
                 "engine_read_utc": raw["read"],
                 "engine_read_ns": read_ns(raw["read"]),
+                "observer_clock_id": self.clock_id, "observer_origin_ns": self.clock_origin_ns,
+                "observed_monotonic_ns": time.monotonic_ns(),
                 "cpu_total_usage_ns": raw["cpu_stats"]["cpu_usage"]["total_usage"],
                 "memory_usage_bytes": memory.get("usage"), "memory_limit_bytes": memory.get("limit"),
                 "cgroup_rss_or_anon_bytes": details.get("rss", details.get("anon")),
@@ -184,6 +191,7 @@ class Observer:
 
     def sample(self):
         started = time.time_ns()
+        started_monotonic = time.monotonic_ns()
         with self.lock:
             phase = self.current
             client = self.client.sample() if self.client else None
@@ -196,24 +204,36 @@ class Observer:
                 raise ValueError("observation topology bound")
             components = list(self.executor.map(self._container, topology))
             for component in components:
-                component["cpu_interval"] = cpu_interval(self.previous.get(component["id"]), component)
-                self.previous[component["id"]] = component
+                try:
+                    component["cpu_interval"] = cpu_interval(self.previous.get(component["id"]), component)
+                except ValueError:
+                    component["cpu_interval"] = None
+                    component["cpu_interval_error"] = "invalid-counter-interval"
+                    self.previous.pop(component["id"], None)
+                    self.errors += 1
+                    record["sampling_errors"] = record.get("sampling_errors", 0) + 1
+                    record["error"] = "invalid CPU counter/clock interval; interval unavailable"
+                else:
+                    self.previous[component["id"]] = component
             live_ids = {c["id"] for c in components}
             self.previous = {k: v for k, v in self.previous.items() if k in live_ids}
             record["containers"] = components
-            if self.probe is not None and started - self.last_probe_ns >= 1_000_000_000:
+            if self.probe is not None and started_monotonic - self.last_probe_ns >= 1_000_000_000:
                 record["control_observation"] = self.probe()
-                self.last_probe_ns = started
+                self.last_probe_ns = started_monotonic
         except Exception as error:
             self.errors += 1
             record["error"] = type(error).__name__ + ": " + str(error)[:300]
         record["ended_ns"] = time.time_ns()
+        record["started_monotonic_ns"] = started_monotonic
+        record["ended_monotonic_ns"] = time.monotonic_ns()
         self.output.write(json.dumps(record) + "\n")
         self.output.flush()
         self.samples += 1
 
     def start(self):
         self.started_ns = time.time_ns()
+        self.started_monotonic_ns = time.monotonic_ns()
         self.sample()
         if self.errors:
             self.executor.shutdown(wait=True)
@@ -221,7 +241,7 @@ class Observer:
             raise RuntimeError("initial observation failed; sample evidence preserved")
         def loop():
             while not self.stop_event.wait(self.cadence):
-                if self.samples >= 1800 or time.time_ns() - self.started_ns >= 900_000_000_000:
+                if self.samples >= 1800 or time.monotonic_ns() - self.started_monotonic_ns >= 900_000_000_000:
                     self.errors += 1
                     return
                 self.sample()
@@ -229,7 +249,7 @@ class Observer:
         self.thread.start()
         return self
 
-    def stop(self):
+    def stop(self, strict=True):
         self.stop_event.set()
         self.thread.join(timeout=30)
         if self.thread.is_alive():
@@ -240,8 +260,9 @@ class Observer:
         summary = {"project": self.project, "started_ns": self.started_ns, "ended_ns": time.time_ns(),
                    "cadence_seconds": self.cadence, "max_samples": 1800, "max_seconds": 900,
                    "samples": self.samples, "sampling_errors": self.errors, "intervals": self.intervals,
-                   "semantics": "Point cgroup memory samples and CPU counter deltas over recorded engine-read intervals; "
+                   "semantics": "Point cgroup memory samples and CPU counter deltas over observer-local monotonic receive intervals; "
                      "not continuous maxima, process RSS, exact consensus-event latency or a capacity estimate."}
         (self.directory / "intervals.json").write_text(json.dumps(summary, indent=2))
-        if self.errors:
+        if self.errors and strict:
             raise RuntimeError("observation sampling errors retained in samples.jsonl")
+        return summary

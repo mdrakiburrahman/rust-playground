@@ -44,6 +44,30 @@ role design and production identity/mTLS are not qualified by this PoC.
 Its password is independently generated; runtime roles do not receive the
 administrative bootstrap password.
 
+### Collector policy across replacement
+
+Collector policy retains its desired exclusion, new-stream block, retirement
+operation and successor-recovery obligations across process or local-generation
+replacement. Registration/replacement atomically binds that policy to the new
+full writer identity, increments its revision and clears the applied
+acknowledgement. Previous-incarnation telemetry is discarded. The replacement
+must acknowledge the new revision; an old writer or old revision cannot
+acknowledge it. Restart does not implicitly remove an admission block.
+
+Retirement approval binds the exact writer, policy revision and retirement
+operation. It still requires evacuation of all collector assignments and
+reservations and recovered ACTIVE successors. An approved execution resource
+cannot be registered/replaced or have retirement canceled while deletion can
+still occur. This finite PoC has no confirmed-removal/resource-reuse operation:
+use a fresh collector identity rather than clearing an approved tombstone.
+These source changes require Rust and real SQL/Delta qualification; Python
+exchange acceptance alone does not qualify them.
+
+Delta collectors reject missing, malformed, zero or overflowing RSS observations
+instead of reporting a fabricated 1 KiB working set. Observation failures retain
+the existing explicit error path; they are not fresh placement evidence. Legacy
+manifest mode retains its original missing-RSS fallback.
+
 ## Ownership and placement responsibilities
 
 `delta_store` is a narrow typed state machine, not an etcd JSON API emulator.
@@ -180,6 +204,13 @@ not performance. `--arm adr --backend etcd --legacy` omits the Delta option and
 checks original manifest behavior. Each run verifies project/subnet isolation,
 uses dynamic loopback ports and retained named resources, records hashes and
 logs, then stops only its own containers. It never deletes networks or volumes.
+Created resources carry deployment ownership labels. Control, exec and cleanup
+resolve only recorded created container IDs, not recyclable names; retirement
+additionally checks the running start identity. Existing SQL/etcd volume names
+are rejected, never adopted or relabelled.
+`ARROWCOL_SQL_IMAGE` and `ARROWCOL_RUNTIME_IMAGE` may select restored images;
+record their actual immutable identities with the run. Defaults retain the
+historical local tags for compatibility and are not evidence of fresh builds.
 
 The fault barriers are inert unless `ARROWCOL_DELTA_FAULTS` is explicitly set
 for the task publisher. They operate in the actual authenticated publication
@@ -208,3 +239,20 @@ finalization of the accepted prefix can still exceed the unchanged five-second
 publisher HTTP deadline; such a status-14 RPC is not relabeled as a native final.
 This is a bounded correctness workload, not qualification of arbitrary prefix
 lengths or concurrency.
+
+The continuation's actual SQL qualification passed for both arms: the default
+fault scenario, `--gateway-repair`, and extended `--adr-alignment` (including
+desired-policy reload after real process restart and stale-incarnation denial).
+The standalone native publication gate also passed. Exact retained deployment
+names and outcomes are recorded in `HANDOFF.md`; earlier stack-overflow attempts
+remain failures, not benchmark evidence.
+
+`delta_benchmark.py --cohort <new-id> --revision-file <checkout-json>` supports
+an explicitly copied native source snapshot without inventing Git metadata.
+The JSON contains only the original checkout's `commit` and boolean `dirty`.
+Exact source/frozen-binary manifests, checked before and after each run, identify
+what actually executed. Four separate six-input tracing calibrations precede
+three full alternating-order pairs. They retain the same binaries and bounded
+cold/warm workload with tracing on/off; wrapper/header overhead remains when
+tracing is disabled. None is a sustained-capacity or statistical-significance
+claim.

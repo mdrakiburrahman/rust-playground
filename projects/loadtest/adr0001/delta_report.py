@@ -1,13 +1,16 @@
 """Offline shared-path report, derived from all retained paired-run values."""
-from collections import defaultdict
+from collections import Counter, defaultdict
 from html.parser import HTMLParser
+from importlib.metadata import version
 import json
 import math
 from pathlib import Path
+import platform
 import re
 from statistics import fmean
 
-from delta_benchmark import PHASES, digest, distribution, save
+from delta_benchmark import BINARIES, CALIBRATION_PHASES, PHASES, digest, distribution, save
+from export_traces import client_input_span_seconds, require_completed_measurement
 from publication_gate import REPO
 from coverage import shared_delta
 
@@ -34,11 +37,55 @@ def latency_breakdown(records):
             **{name: {**distribution(values), "mean": fmean(values) if values else None}
                for name, values in stages.items()}}
 
+def observed_resources(samples):
+    roles = defaultdict(lambda: {"cpu_seconds": None, "memory_peak_bytes": None,
+                                 "samples": 0, "cpu_interval_samples": 0, "memory_samples": 0})
+    for sample in samples:
+        for component in sample.get("containers", []):
+            role = roles[component["service"]]
+            role["samples"] += 1
+            memory = component.get("memory_usage_bytes")
+            if memory is not None:
+                assert isinstance(memory, int) and not isinstance(memory, bool) and memory >= 0
+                previous = role["memory_peak_bytes"]
+                role["memory_peak_bytes"] = memory if previous is None else max(previous, memory)
+                role["memory_samples"] += 1
+            interval = component.get("cpu_interval")
+            if interval is not None:
+                cpu = interval["cpu_usage_ns"]
+                assert isinstance(cpu, int) and not isinstance(cpu, bool) and cpu >= 0
+                role["cpu_seconds"] = (role["cpu_seconds"] or 0) + cpu / 1e9
+                role["cpu_interval_samples"] += 1
+    return dict(roles)
+
+
+def known_sum(values):
+    values = list(values)
+    return sum(values) if values and all(value is not None for value in values) else None
+
+def observed_control_peaks(samples):
+    pending_values, active_values = [], []
+    for sample in samples:
+        view = sample.get("control_observation", {})
+        members = view.get("members")
+        if members is not None and all(m.get("active") is not None for m in members):
+            active_values.append(sum(m["active"] for m in members))
+        assignments = view.get("assignments")
+        if assignments is not None:
+            assignments = assignments.values() if isinstance(assignments, dict) else assignments
+            records = [a.get("record", a) for a in assignments]
+            if all("pending" in record for record in records):
+                pending_values.append(sum(len(record["pending"]) for record in records))
+    return (max(pending_values) if pending_values else None,
+            max(active_values) if active_values else None)
+
 
 def analyze(cohort):
     directory = REPO / "target/delta-benchmark" / cohort
     attempts = load(directory / "attempts.json")
-    assert len(attempts) == 6 and all(a["status"] == "completed-accounted-phases" for a in attempts)
+    assert len(attempts) == 6
+    for attempt in attempts:
+        require_completed_measurement(directory, attempt)
     runs = []
     for attempt in attempts:
         root = REPO / attempt["evidence"]
@@ -67,27 +114,25 @@ def analyze(cohort):
             assert (sql["table_id"], sql["version"], sql["digest"]) == (
                 record["table"], final["version"], final["digest"])
         samples = [json.loads(line) for line in (root / "observations/samples.jsonl").read_text().splitlines()]
-        assert all("error" not in s for s in samples)
+        observation_errors = sum("error" in sample for sample in samples)
         last_input_ns = max(r["ended_ns"] for r in raw)
         samples = [s for s in samples if s["ended_ns"] <= last_input_ns]
-        roles = defaultdict(lambda: {"cpu_seconds": 0, "memory_peak_bytes": 0, "samples": 0})
-        pending = active = 0
-        for sample in samples:
-            for component in sample["containers"]:
-                role = roles[component["service"]]
-                role["samples"] += 1
-                role["memory_peak_bytes"] = max(role["memory_peak_bytes"], component["memory_usage_bytes"] or 0)
-                if component["cpu_interval"]:
-                    role["cpu_seconds"] += component["cpu_interval"]["cpu_usage_ns"] / 1e9
-            view = sample.get("control_observation", {})
-            active = max(active, sum(m.get("active", 0) for m in view.get("members", [])))
-            assignments = view.get("assignments", {})
-            assignments = assignments.values() if isinstance(assignments, dict) else assignments
-            pending = max(pending, sum(len(a.get("record", a).get("pending", [])) for a in assignments))
+        roles = observed_resources(samples)
+        pending, active = observed_control_peaks(samples)
         sql_samples = [s for s in load(root / "sql-cgroup.json") if s["time_ns"] <= last_input_ns]
-        roles["sql"] = {"cpu_seconds": (sql_samples[-1]["cpu_total_usage_ns"] - sql_samples[0]["cpu_total_usage_ns"]) / 1e9,
-                        "memory_peak_bytes": max(s["memory_usage_bytes"] for s in sql_samples),
-                        "samples": len(sql_samples)}
+        if sql_samples:
+            cpu = [s.get("cpu_total_usage_ns") for s in sql_samples]
+            cpu_known = len(cpu) >= 2 and all(value is not None for value in cpu)
+            if cpu_known:
+                assert all(after >= before for before, after in zip(cpu, cpu[1:])), "SQL CPU counter reset"
+            memory = [s["memory_usage_bytes"] for s in sql_samples if s.get("memory_usage_bytes") is not None]
+            roles["sql"] = {"cpu_seconds": (cpu[-1] - cpu[0]) / 1e9 if cpu_known else None,
+                            "memory_peak_bytes": max(memory) if memory else None,
+                            "samples": len(sql_samples), "cpu_interval_samples": len(cpu) - 1 if cpu_known else 0,
+                            "memory_samples": len(memory)}
+        else:
+            roles["sql"] = {"cpu_seconds": None, "memory_peak_bytes": None,
+                            "samples": 0, "cpu_interval_samples": 0, "memory_samples": 0}
         native_observations, routing_observations = {}, {}
         first_input_ms = min(r["started_ns"] for r in raw) // 1_000_000
         for log in (root / "logs").glob("*.log"):
@@ -111,24 +156,27 @@ def analyze(cohort):
                 gauges = ("decoded_batch_bytes", "gateway_input_bytes", "gateway_result_bytes", "mailbox_waiters", "writer_streams")
                 native_observations[log.stem] = {
                     "samples": len(observations),
-                    "high_water": {g: max(o.get(g, {}).get("lifetime_high_water", 0) for o in observations) for g in gauges},
+                    "high_water": {g: max((o[g]["lifetime_high_water"] for o in observations
+                                          if o.get(g, {}).get("lifetime_high_water") is not None), default=None)
+                                   for g in gauges},
                     "last_cache": observations[-1].get("cache"),
                 }
         cost = load(root / "substrate-costs.json")
-        substrate_cpu = sum(v["cpu_seconds"] for k, v in roles.items() if k.startswith("collector") or k in ("sql", "publisher"))
+        substrate_cpu = known_sum(v["cpu_seconds"] for k, v in roles.items() if k.startswith("collector") or k in ("sql", "publisher"))
         workload_seconds = sum(p["seconds"] for p in phases)
         completed_rows = sum(p["completed_rows"] for p in phases)
         runs.append({**attempt, "phases": phases, "rows": sum(p["completed_rows"] for p in phases),
             "workload_seconds": workload_seconds,
             "workload_rows_per_second": completed_rows / workload_seconds,
-            "input_span_seconds": (last_input_ns - min(r["started_ns"] for r in raw)) / 1e9,
+            "input_span_seconds": client_input_span_seconds(raw),
             "matched_rows": sum(p["completed_rows"] for p in phases if p["comparable"]),
             "matched_offered_rows": sum(p["offered_rows"] for p in phases if p["comparable"]),
             "nonfinal_inputs": len(raw) - len(completed),
             "nonfinal_rpcs": sum(r["terminal"] != "final" for r in raw),
             "missing_submitted_rows": sum(reconciliation[key]["missing_submitted_rows"] for key in ("main", "cas")),
             "reconciliation": reconciliation, "roles": dict(roles), "substrate": cost,
-            "substrate_cpu_seconds": substrate_cpu, "total_role_cpu_seconds": sum(v["cpu_seconds"] for v in roles.values()),
+            "substrate_cpu_seconds": substrate_cpu, "total_role_cpu_seconds": known_sum(v["cpu_seconds"] for v in roles.values()),
+            "observation_errors": observation_errors,
             "observed_pending_peak": pending, "observed_active_streams_peak": active,
             "native_observations": native_observations,
             "routing_observations": routing_observations,
@@ -155,6 +203,170 @@ def analyze(cohort):
             assert comparable[0] == comparable[1], "asymmetric comparison exclusion"
     save(directory / "analysis.json", runs)
     return directory, runs
+
+
+def calibration_summary(entry, binaries):
+    root = REPO / entry["evidence"]
+    assert root.resolve().is_relative_to((REPO / "target/publication-gate").resolve())
+    assert entry["status"] == "completed-accounted-phases"
+    records = load(root / "benchmark-inputs.json")
+    phases = load(root / "phases.json")
+    assert len(records) == sum(phase[1] for phase in CALIBRATION_PHASES)
+    assert [(p["phase"], p["jobs"], p["concurrency"], p["rows_per_job"]) for p in phases] == CALIBRATION_PHASES
+    for phase in phases:
+        selected = [record for record in records if record["phase"] == phase["phase"]]
+        assert len(selected) == phase["jobs"] and all(record["rows"] == phase["rows_per_job"] for record in selected)
+        assert phase["terminal"] == distribution([record["terminal_ms"] for record in selected if record["terminal"] == "final"])
+    assert load(root / "measured-binaries.json") == binaries
+    assert all(record["payload_retries"] == 0 for record in records)
+    reconciliation = load(root / "independent-reconciliation.json")
+    for key in {record["table"] for record in records}:
+        assert reconciliation[key]["missing"] == reconciliation[key]["extra_or_duplicate"] == 0
+        expected = sum(record["rows"] for record in records if record["table"] == key and record["completion"] != "unresolved")
+        assert reconciliation[key]["expected_rows"] == reconciliation[key]["actual_rows"] == expected
+    receipts = load(root / "sql-final-receipts.json")
+    actual = {(receipt["table_id"], receipt["operation_id"]): receipt for receipt in receipts}
+    completed = [record for record in records if record["completion"] != "unresolved"]
+    assert len(receipts) == len(completed) + 2
+    for record in completed:
+        final = record["receipts"][-1]
+        receipt = actual[(record["table"], final["operation"])]
+        assert (receipt["version"], receipt["digest"]) == (final["version"], final["digest"])
+    samples = [json.loads(line) for line in (root / "observations/samples.jsonl").read_text().splitlines()]
+    return {
+        "arm": entry["arm"], "tracing": entry["tracing"], "inputs": len(records),
+        "completed_inputs": len(completed), "rpc_outcomes": dict(Counter(record["terminal"] for record in records)),
+        "terminal_elapsed_ms_all_outcomes": distribution([record["terminal_ms"] for record in records]),
+        "warm_rpc_final_ms": next(phase["terminal"] for phase in phases if phase["phase"] == "warm"),
+        "sampling_errors": sum(sample.get("sampling_errors", 1) for sample in samples if "error" in sample),
+        "resources": observed_resources(samples),
+        "resource_scope": "Observed native-role cgroup intervals/gauges; SQL calibration resources are not projected here.",
+        "ordinary_delta_missing_rows": sum(reconciliation[key]["missing"] for key in {r["table"] for r in records}),
+        "ordinary_delta_extra_rows": sum(reconciliation[key]["extra_or_duplicate"] for key in {r["table"] for r in records}),
+    }
+
+
+def generate_fresh(cohort):
+    """New sanitized report; never inherits historical qualification/editorial claims."""
+    from report import EDITORIAL_CSS, esc, table
+    from exchange import load as load_exchange
+    directory, runs = analyze(cohort)
+    revision = load(directory / "revision.json")
+    assert revision["measurement"] == "real-sql-delta" and revision["synthetic_workload"] is True
+    assert digest(directory / "source-binary-sha256.json") == revision["source_binary_manifest_sha256"]
+    assert [(run["repetition"], run["arm"]) for run in runs] == [
+        (1, "pingora"), (1, "adr"), (2, "adr"), (2, "pingora"), (3, "pingora"), (3, "adr")]
+    binaries = {name: digest(directory / "bin" / name) for name in BINARIES}
+    frozen_manifest = load(directory / "source-binary-sha256.json")
+    assert all(frozen_manifest[str((directory / "bin" / name).relative_to(REPO))] == value
+               for name, value in binaries.items())
+    calibration = load(directory / "calibration.json")
+    assert [(entry["arm"], entry["tracing"]) for entry in calibration] == [
+        ("pingora", False), ("pingora", True), ("adr", True), ("adr", False)]
+    calibrated = [calibration_summary(entry, binaries) for entry in calibration]
+    limits = []
+    for index, entry in enumerate([*calibration, *runs]):
+        root = REPO / entry["evidence"]
+        assert load(root / "measured-binaries.json") == binaries
+        inventory = load(root / "stopped-containers.json")
+        for component in inventory:
+            config = component["HostConfig"]
+            role = component["Name"].lstrip("/").removeprefix(entry["project"] + "-")
+            assert re.fullmatch(r"[a-z0-9-]{1,32}", role)
+            assert not component["State"]["Running"] and not config["Privileged"]
+            bootstrap_fixture = role == "collector"
+            assert config["NetworkMode"] == ("none" if bootstrap_fixture else entry["project"])
+            assert 0 < config["NanoCpus"] <= (2 if role == "sql" else 1) * 10**9
+            assert 0 < config["Memory"] <= (3 if role == "sql" else 1) * 1024**3
+            assert 0 < config["PidsLimit"] <= 512
+            limits.append({
+                "run": f"cal-{index}" if index < 4 else f"r{index - 4}",
+                "role": role, "image_config_sha256": component["Image"].removeprefix("sha256:"),
+                "scope": "stopped-bootstrap-fixture" if bootstrap_fixture else "runtime",
+                "cpu_limit": config["NanoCpus"] / 10**9, "memory_limit_bytes": config["Memory"],
+                "memory_swap_limit_bytes": config["MemorySwap"], "pids_limit": config["PidsLimit"],
+                "read_only_root": config["ReadonlyRootfs"], "privileged": False, "host_network": False,
+            })
+    bundle_path = directory / "benchmark-v1.json"
+    bundle = load_exchange(bundle_path)
+    assert bundle["provenance"]["synthetic"] is False
+    assert bundle["dataset_id"] == cohort and len(bundle["runs"]) == 6
+    manifest = {
+        "cohort": cohort, "source_revision": revision["commit"], "dirty": revision["dirty"],
+        "measurement": "real-sql-delta", "workload": "synthetic-int64-markers",
+        "bundle_sha256": digest(bundle_path), "source_binary_manifest_sha256": revision["source_binary_manifest_sha256"],
+        "shared_binaries": binaries,
+        "report_postprocessor_sha256": digest(Path(__file__)),
+        "export_postprocessor_sha256": digest(Path(__file__).with_name("export_traces.py")),
+        "postprocessor_environment": {
+            "python": platform.python_version(),
+            "packages": {name: version(name) for name in ("pyarrow", "PyYAML", "deltalake", "jsonschema")},
+        },
+        "coverage": bundle["coverage"], "calibration": calibrated, "container_limits": limits,
+        "calibration_scope": "Six inputs per mode/arm, same frozen harness and binaries; exploratory, not statistical significance.",
+        "tracing_off_scope": "Context/header and tracing-wrapper allocation overhead retained.",
+        "clock_scope": "Local monotonic service/client intervals; CPU cgroup counters, not per-request CPU; no cross-clock subtraction.",
+    }
+    audit_path = directory / "measurement-audit.json"
+    if audit_path.is_file():
+        audit = load(audit_path)
+        manifest["driver_exit_code"] = audit["driver_exit_code"]
+        manifest["driver_outcome"] = audit["driver_outcome"]
+        manifest["measurement_audit_sha256"] = digest(audit_path)
+        manifest["run_driver_statuses"] = [run["status"] for run in runs]
+    phase_rows = [
+        (f"R{run['repetition']} {run['arm']}", phase["phase"], phase["jobs"], phase["completed_rows"],
+         f"{phase['rows_per_second']:.1f}", phase["terminal"]["n"], phase["terminal"]["p50"],
+         phase["resolved_receipt"]["n"], phase["resolved_receipt"]["p50"])
+        for run in runs for phase in run["phases"]]
+    content = f"<h1>Fresh finite SQL / Delta comparison</h1><p>Cohort: {esc(cohort)}. Three alternating-order pairs, nine phases each.</p>"
+    content += "<p>Real measurements of synthetic marker workloads; not production capacity or exactly-once delivery. "
+    content += "Fault/correctness runs are separate. Earlier blocked DNS and observer/cleanup cohorts are excluded, never relabeled.</p>"
+    if audit_path.is_file():
+        content += "<p><strong>The bounded driver exited 124 during the last deployment's final container cleanup. "
+        content += "Its blocked-cleanup status is unchanged.</strong> Exact-ID cleanup was recovered independently; all six "
+        content += "post-stop ordinary Delta rescans, SQL receipt artifacts, 54 phases and frozen hashes were verified. "
+        content += "This qualifies the retained measurements, not a clean automated lifecycle pass. Audit identity and "
+        content += "driver failure remain in the provenance summary and exchange coverage.</p>"
+    content += "<h2>Finite measurements</h2>" + table(
+        ("Run", "Phase", "Inputs", "Completed rows", "Rows/s", "Final RPC n", "Final RPC P50 ms",
+         "Resolved n", "Resolved P50 ms"), phase_rows)
+    content += "<p>RPC outcomes and eventual identity-resolved completion remain separate. Successful-only latency is censored "
+    content += "when RPCs fail or time out. Ordinary Delta marker multisets and exact SQL receipt versions/digests reconcile. "
+    content += "P95 requires 100 observations and P99 1000; these finite per-phase samples do not meet those thresholds.</p>"
+    content += "<p>Cold means fresh deployment/table/assignment, not an OS-cache flush. Phase throughput includes client "
+    content += "construction, completion polling and ordinary-reader scans, but excludes between-phase transitions and teardown. "
+    content += "Histories grow; failed inputs can change later history sizes and confound later latency comparisons.</p>"
+    content += "<h2>Fresh tracing calibration</h2>" + table(
+        ("Arm", "Tracing", "Inputs", "Completed", "RPC outcomes", "Warm final P50 ms", "Sampling errors"),
+        [(c["arm"], c["tracing"], c["inputs"], c["completed_inputs"],
+          json.dumps(c["rpc_outcomes"], sort_keys=True), c["warm_rpc_final_ms"]["p50"], c["sampling_errors"])
+         for c in calibrated])
+    content += "<p>Same frozen harness/binaries; six inputs per mode/arm, exploratory only. Disabled tracing retains "
+    content += "context/header and wrapper allocation overhead. No overhead significance or exclusive CPU claim.</p>"
+    content += "<h2>Timing and resource coverage</h2><p>Service spans are inclusive local monotonic intervals; nested/concurrent "
+    content += "work overlaps and must not be added. Gateway lifetime includes writer wait. SQL round trips are not engine CPU. "
+    content += "Cgroup CPU is not per-request allocation; memory is a point gauge, not a continuous maximum. Counter-reset "
+    content += "intervals are unavailable, never zero; gaps and other errors remain in the exchange coverage.</p>"
+    content += "<pre>" + esc(json.dumps(bundle["coverage"], indent=2)) + "</pre>"
+    content += "<p>Physical hashes, all four fresh calibrations, exact shared binaries, postprocessor identities and actual "
+    content += "container CPU/memory/PID bounds are in provenance-calibration.json. No credentials, raw errors or private paths "
+    content += "are copied. The frozen manifest and measured source remain distinct from later report postprocessing.</p>"
+    document = '<!doctype html><html lang="en"><meta charset="utf-8"><title>Fresh SQL / Delta measurements</title>'
+    document += "<style>" + EDITORIAL_CSS + "</style><main>" + content + "</main></html>"
+    encoded_manifest = json.dumps(manifest, indent=2, allow_nan=False).encode()
+    public = directory / "public"
+    public.mkdir(exist_ok=False)
+    for name, data in (
+        ("benchmark-v1.json", bundle_path.read_bytes()),
+        ("measurement-report.html", document.encode()),
+        ("stage-report.html", (directory / "stage-report.html").read_bytes()),
+        ("provenance-calibration.json", encoded_manifest),
+        ("frozen-source-binary-sha256.json", (directory / "source-binary-sha256.json").read_bytes()),
+    ):
+        with (public / name).open("xb") as stream:
+            stream.write(data)
+    return public
 
 
 def generate(cohort):
@@ -341,8 +553,10 @@ separate native fault qualification, not injected faults in these six performanc
 <p class="note"><strong>Workload rows/s = total completed rows ÷ sum of the nine phase timers</strong>, not the average
 of phase rates and not rows divided by per-request latency. Timers include concurrent uploads, completion/reconciliation
 and per-input standard Delta reader scans; they exclude topology transitions, setup and final audit/teardown.
-The last column uses recorded first-input/last-scan timestamps and includes intervening transitions/control gaps,
-but still excludes setup and final audit/teardown. Complete lifecycle wall time was not separately measured.</p>
+The last column uses first-input/last-scan timestamps from one local monotonic client clock and includes
+intervening transitions/control gaps, but still excludes setup and final audit/teardown. It is unavailable for
+older evidence without that clock metadata; wall-clock subtraction is never a latency fallback.
+Complete lifecycle elapsed time was not separately measured.</p>
 <p><strong>{workload_total / 60:.1f} minutes of workload time across six sequential runs.</strong>
 Each run completed {runs[0]["rows"]:,} rows; warm-only rates appear below.
 These mixed-phase, same-host rates are observed achieved throughput, not sustainable service capacity.</p></section>
@@ -417,7 +631,10 @@ the requirement; these finite timings alone do not justify a proxy winner.</p></
                 f'{fmt(phase["resolved_receipt"]["p50"])} ({phase["resolved_receipt"]["n"]})',
                 f'{fmt(phase["reader_visibility_observed"]["p50"])} ({phase["reader_visibility_observed"]["n"]})'))
         for role, costs in run["roles"].items():
-            resource_rows.append((name, role, fmt(costs["cpu_seconds"]), fmt(costs["memory_peak_bytes"] / 1048576), costs["samples"]))
+            memory = costs["memory_peak_bytes"]
+            resource_rows.append((name, role, fmt(costs["cpu_seconds"]),
+                                  fmt(memory / 1048576 if memory is not None else None),
+                                  f'{costs["samples"]}; CPU intervals {costs["cpu_interval_samples"]}; memory {costs["memory_samples"]}'))
         for transition in run["transitions"]:
             transitions.append((name, transition["phase"], transition["status"], fmt(transition["seconds"]),
                                 transition.get("reason", "membership/assignment observed; quiescent transition")))
@@ -470,10 +687,13 @@ the requirement; these finite timings alone do not justify a proxy winner.</p></
     appendix += 'Workload throughput includes client construction, post-terminal standard-reader work, and observer contention.</p></section>'
     appendix += '<section><h2>Role cgroup costs and finite bounds</h2>'
     appendix += table(("Run", "Role", "CPU seconds", "Sampled peak MiB", "Samples"), resource_rows)
+    appendix += '<p>Resource totals cover observed intervals only, not request CPU. Missing counters/gauges are N/A, not zero; '
+    appendix += 'per-role interval/gauge counts expose partial sampling. Retained sampling errors per run: '
+    appendix += esc(", ".join(f'R{r["repetition"]} {r["arm"]}: {r["observation_errors"]}' for r in runs)) + '.</p>'
     appendix += table(("Run", "Shared substrate CPU s", "All roles CPU s", "Pending sampled peak", "Active sampled peak",
                        "Preparation attempts", "SQL state UTF16 bytes", "Delta commits", "Parquet bytes"),
         [(f'R{r["repetition"]} {r["arm"]}', fmt(r["substrate_cpu_seconds"]), fmt(r["total_role_cpu_seconds"]),
-          r["observed_pending_peak"], r["observed_active_streams_peak"], r["substrate"]["preparation_attempts"],
+          fmt(r["observed_pending_peak"]), fmt(r["observed_active_streams_peak"]), r["substrate"]["preparation_attempts"],
           r["substrate"]["sql_state_utf16_bytes"], r["substrate"]["delta_log_commits"], r["substrate"]["delta_parquet_bytes"]) for r in runs])
     appendix += '<p>CPU counter deltas span observation lifecycle through the last sample before final input completion, '
     appendix += 'including transitions/client scans but excluding startup and post-run audit. '
@@ -489,7 +709,7 @@ the requirement; these finite timings alone do not justify a proxy winner.</p></
           r["nonfinal_inputs"], r["missing_submitted_rows"]) for r in runs])
     appendix += table(("Run", "Role", "Decoded bytes high-water", "Gateway input bytes high-water",
                        "Gateway result bytes high-water", "Mailbox waiters high-water", "Writer streams high-water"),
-        [(f'R{r["repetition"]} {r["arm"]}', role, *[v["high_water"][g] for g in
+        [(f'R{r["repetition"]} {r["arm"]}', role, *[fmt(v["high_water"][g]) for g in
           ("decoded_batch_bytes", "gateway_input_bytes", "gateway_result_bytes", "mailbox_waiters", "writer_streams")])
          for r in runs for role, v in r["native_observations"].items()])
     appendix += '<p>These native lifetime high-water counters include startup/transitions and are not phase-local. '

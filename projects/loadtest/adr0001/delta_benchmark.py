@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import resource
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -39,8 +40,11 @@ PHASES = [
     ("gateways-two", 6, 2, 4096),
     ("gateways-one", 4, 2, 4096),
 ]
+CALIBRATION_PHASES = [("cold", 2, 1, 4096), ("warm", 4, 2, 4096)]
 BINARIES = ("adr-controller", "adr-flight", "adr-publisher", "arrowcol-router-rust",
             "delta-contract", "adr-fingerprint", "publication-gate")
+CLIENT_CLOCK_ID = str(uuid.uuid4())
+CLIENT_ORIGIN_NS = time.monotonic_ns()
 
 
 def digest(path):
@@ -65,8 +69,8 @@ def distribution(values):
 
 
 class Benchmark(Runtime):
-    def __init__(self, project, subnet, arm, repetition, frozen):
-        super().__init__(project, subnet, arm, "sql")
+    def __init__(self, project, subnet, arm, repetition, frozen, trace_enabled=True, calibration=False):
+        super().__init__(project, subnet, arm, "sql", trace_enabled=trace_enabled)
         self.repetition = repetition
         self.frozen = frozen
         self.records = []
@@ -75,6 +79,7 @@ class Benchmark(Runtime):
         self.observer = None
         self.gateway_ports = []
         self.next_marker = 0
+        self.phase_specs = CALIBRATION_PHASES if calibration else PHASES
         shutil.copy2(Path(__file__), self.root / "measured-benchmark.py")
 
     def start_role(self, role, binary, *args, **kwargs):
@@ -103,6 +108,8 @@ class Benchmark(Runtime):
             raw = self.observer.engine.get(f"/containers/{self.sql_name}/stats?stream=false&one-shot=true")
             self.sql_samples.append({"time_ns": time.time_ns(), "phase": self.observer.current,
                 "engine_read_ns": read_ns(raw["read"]),
+                "observer_clock_id": self.observer.clock_id, "observer_origin_ns": self.observer.clock_origin_ns,
+                "observed_monotonic_ns": time.monotonic_ns(),
                 "cpu_total_usage_ns": raw["cpu_stats"]["cpu_usage"]["total_usage"],
                 "memory_usage_bytes": raw.get("memory_stats", {}).get("usage"),
                 "memory_anon_bytes": raw.get("memory_stats", {}).get("stats", {}).get("anon"),
@@ -117,7 +124,9 @@ class Benchmark(Runtime):
         record = {"first": first, "rows": count, "logical_arrow_bytes": count * 8,
                   "table": key, "phase": phase, "gateway_port": port,
                   "started_ns": time.time_ns(), "receipts": [], "terminal": "unknown",
-                  "payload_retries": 0, "reader_visibility_ms": None}
+                  "payload_retries": 0, "reader_visibility_ms": None,
+                  "client_clock_id": CLIENT_CLOCK_ID, "client_process_id": CLIENT_CLOCK_ID,
+                  "client_offset_ns": str(start - CLIENT_ORIGIN_NS), "started_monotonic_ns": start}
         record["trace_id"] = str(uuid.uuid4())
         schema = self.schemas[0]
         batch = pa.RecordBatch.from_arrays([pa.array(range(first, first + count), type=pa.int64())], schema=schema)
@@ -153,6 +162,9 @@ class Benchmark(Runtime):
             record["terminal"] = "final"
             record["terminal_ms"] = (time.monotonic_ns() - start) / 1e6
         except Exception as error:
+            record["terminal"] = ("timeout" if isinstance(error, (flight.FlightTimedOutError, TimeoutError))
+                                  else "cancelled" if isinstance(error, flight.FlightCancelledError)
+                                  else "failed")
             record["error"] = str(error)[:1500]
             record["terminal_ms"] = (time.monotonic_ns() - start) / 1e6
         finally:
@@ -189,10 +201,11 @@ class Benchmark(Runtime):
             record["reader_scan_ms"] = (time.monotonic_ns() - scan_start) / 1e6
             record["reader_version"] = table.version()
         record["ended_ns"] = time.time_ns()
+        record["ended_monotonic_ns"] = time.monotonic_ns()
         return record
 
     def sql_query(self, query):
-        result = subprocess.run(["docker", "exec", "-i", self.sql_name, "bash", "-c",
+        result = subprocess.run(["docker", "exec", "-i", self.owned_container(self.sql_name), "bash", "-c",
             "IFS= read -r SQLCMDPASSWORD; export SQLCMDPASSWORD; "
             "exec /opt/mssql-tools18/bin/sqlcmd -S localhost -U delta_runtime "
             "-d delta_runtime -C -b -w 65535 -y 0 -Q " + "'" + query.replace("'", "'\\''") + "'"],
@@ -221,9 +234,7 @@ class Benchmark(Runtime):
             member = next(m for m in state["members"] if m["writer"]["collector"] == "collector4")
             revision = state.get("policies", {}).get("collector4", {}).get("revision", 0)
             operation = str(uuid.uuid4())
-            container = json.loads(self.run(["docker", "inspect", self.names["collector4"]]).stdout)[0]
-            assert container["Config"]["Labels"].get("delta-runtime") == self.project
-            container_id = container["Id"]
+            resource = self.collector_resource("collector4")
             self.post({"op": "policy", "collector": "collector4", "writer": member["writer"],
                        "revision": revision, "operation": operation, "excluded": True,
                        "block_streams": False, "retiring": True})
@@ -234,9 +245,7 @@ class Benchmark(Runtime):
                     and not policy.get("recovery_obligations")) else None
             approval = self.wait(retirement_approved)
             event["retirement_policy"] = approval
-            current = json.loads(self.run(["docker", "inspect", self.names["collector4"]]).stdout)[0]
-            assert current["Id"] == container_id, "collector container identity changed during retirement"
-            self.run(["docker", "stop", "-t", "1", container_id])
+            self.stop_retired_resource("collector4", resource)
             self.wait(lambda: sum(m["eligible"] for m in self.post({"op": "view"})["members"]) == 3)
             for key in ("main", "cas"):
                 self.wait(lambda key=key: self.assignment(key)["record"]["lifecycle"] == "Active")
@@ -272,7 +281,7 @@ class Benchmark(Runtime):
         save(self.root / "transitions.json", self.transitions)
 
     def measure(self):
-        for phase, jobs, concurrency, rows in PHASES:
+        for phase, jobs, concurrency, rows in self.phase_specs:
             self.change_topology(phase)
             assignment_before = self.post({"op": "view"})
             cpu_before = resource.getrusage(resource.RUSAGE_SELF)
@@ -346,13 +355,19 @@ class Benchmark(Runtime):
         save(self.root / "substrate-costs.json", usage)
 
     def finish_benchmark(self):
-        if self.observer is not None and hasattr(self.observer, "thread"):
-            self.observer.stop()
-        for role, name in self.names.items():
-            result = self.run(["docker", "logs", name])
-            (self.root / "logs" / (role + ".log")).write_text(result.stdout + result.stderr)
-        self.executor.shutdown(wait=True)
-        self.finish()
+        try:
+            if self.observer is not None and hasattr(self.observer, "thread"):
+                observation = self.observer.stop(strict=False)
+                if observation["sampling_errors"]:
+                    print("Observation incomplete; retained sampling errors and unavailable intervals", flush=True)
+            for role, name in self.names.items():
+                result = self.run(["docker", "logs", self.owned_container(name)])
+                (self.root / "logs" / (role + ".log")).write_text(result.stdout + result.stderr)
+        finally:
+            try:
+                self.executor.shutdown(wait=True)
+            finally:
+                self.finish()
 
 
 def independent_scan(root):
@@ -382,11 +397,17 @@ def main():
     parser.add_argument("--scan", type=Path)
     parser.add_argument("--subnet-start", type=int, default=70)
     parser.add_argument("--resume", action="store_true", help="continue only after retained runs have reconciled")
+    parser.add_argument("--revision-file", type=Path,
+                        help="original checkout commit/dirty JSON for an explicitly copied native source snapshot")
     args = parser.parse_args()
     if args.scan:
         independent_scan(args.scan)
         return
+    def interrupt_job(signum, _):
+        raise InterruptedError(f"bounded benchmark interrupted by signal {signum}")
+    signal.signal(signal.SIGTERM, interrupt_job)
     assert args.cohort and args.cohort.replace("-", "").isalnum()
+    assert len(args.cohort) <= 25, "cohort exceeds bounded deployment DNS label"
     assert sum(p[1] for p in PHASES) * 2 < 128
     directory = REPO / "target/delta-benchmark" / args.cohort
     if args.resume:
@@ -400,10 +421,20 @@ def main():
         execute_remaining(args, directory, frozen, attempts)
         return
     directory.mkdir(parents=True, exist_ok=False)
-    revision = {"commit": subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(),
-        "dirty": bool(subprocess.check_output(
-            ["git", "status", "--porcelain", "--untracked-files=normal"], cwd=REPO, text=True).strip())}
+    if args.revision_file:
+        revision = json.loads(args.revision_file.read_text())
+        assert set(revision) == {"commit", "dirty"}
+        assert isinstance(revision["dirty"], bool)
+        assert isinstance(revision["commit"], str) and len(revision["commit"]) == 40
+        assert all(c in "0123456789abcdef" for c in revision["commit"])
+        revision["source_checkout"] = "copied-native-snapshot"
+    else:
+        revision = {"commit": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(),
+            "dirty": bool(subprocess.check_output(
+                ["git", "status", "--porcelain", "--untracked-files=normal"], cwd=REPO, text=True).strip())}
+        revision["source_checkout"] = "git-worktree"
+    revision.update(measurement="real-sql-delta", synthetic_workload=True)
     frozen = directory / "bin"
     frozen.mkdir()
     for binary in BINARIES:
@@ -424,9 +455,7 @@ def main():
     for name in ("report.html", "report.py"):
         shutil.copy2(history / (prefix + name), directory / ("historical-" + name))
     source_paths = [REPO / "Cargo.lock", REPO / "Cargo.toml"]
-    for base in ("crates/arrowcol-authority", "crates/arrowcol-routing", "crates/arrow-deltalake",
-                 "crates/arrowcol-sql-server", "crates/arrowcol-protocol", "crates/arrowcol-receipts",
-                 "projects/arrowcol-router-rust", "projects/loadtest/adr0001"):
+    for base in ("crates", "submodules", "projects/arrowcol-router-rust", "projects/loadtest/adr0001"):
         source_paths += [p for p in (REPO / base).rglob("*") if p.is_file()
                          and p.suffix in (".rs", ".toml", ".sql", ".py", ".md", ".json")
                          and "__pycache__" not in p.parts]
@@ -450,14 +479,64 @@ def main():
          "no_payload_replay": True, "finite_preparations_including_noop": 112,
          "input_lifetime": "half-close immediately after the single bounded batch in both arms; wait for final then terminal",
          "identity_resolution": "after nonfinal RPC, poll exact operation at 200ms for <=45s; no payload replay"})
+    execute_calibration(args, directory, frozen)
     execute_remaining(args, directory, frozen, [])
 
 
+def verify_frozen_sources(directory):
+    revision = json.loads((directory / "revision.json").read_text())
+    manifest = directory / "source-binary-sha256.json"
+    assert digest(manifest) == revision["source_binary_manifest_sha256"], "frozen manifest changed"
+    for name, expected in json.loads(manifest.read_text()).items():
+        path = REPO / name
+        assert path.is_file() and digest(path) == expected, ("frozen source/binary changed", name)
+
+
+def execute_calibration(args, directory, frozen):
+    results = []
+    save(directory / "calibration-methodology.json", {
+        "phases": CALIBRATION_PHASES, "arm_order": ["pingora", "adr"],
+        "trace_order": {"pingora": [False, True], "adr": [True, False]},
+        "scope": "bounded inclusive latency and process/container resources, not per-request CPU",
+        "sample_limit": "six inputs per mode/arm; exploratory, not a significance or sustained-capacity claim",
+        "disabled": "ARROWCOL_TRACE=0; shared binaries, context/header and wrapper allocation overhead retained",
+    })
+    for arm, modes in (("pingora", (False, True)), ("adr", (True, False))):
+        for enabled in modes:
+            verify_frozen_sources(directory)
+            project = f"publication-gate-cal-{args.cohort}-{arm}-{int(enabled)}"
+            subnet = f"10.234.{args.subnet_start + len(results)}.0/24"
+            runtime = Benchmark(project, subnet, arm, 0, frozen, trace_enabled=enabled, calibration=True)
+            result = {"arm": arm, "tracing": enabled, "project": project,
+                      "evidence": str(runtime.root.relative_to(REPO)), "status": "running"}
+            results.append(result)
+            save(directory / "calibration.json", results)
+            try:
+                runtime.setup_benchmark()
+                runtime.measure()
+                verify_frozen_sources(directory)
+                result.update(status="completed-accounted-phases", phases=runtime.phases)
+            except Exception as error:
+                result.update(status="blocked", error=str(error)[:2500])
+                raise
+            finally:
+                try:
+                    runtime.finish_benchmark()
+                except Exception as error:
+                    result.update(status="blocked-cleanup", error=type(error).__name__)
+                    raise
+                finally:
+                    save(directory / "calibration.json", results)
+
+
 def execute_remaining(args, directory, frozen, attempts):
+    calibration = json.loads((directory / "calibration.json").read_text())
+    assert len(calibration) == 4 and all(c["status"] == "completed-accounted-phases" for c in calibration)
     for repetition, order in enumerate((("pingora", "adr"), ("adr", "pingora"), ("pingora", "adr")), 1):
         for arm in order:
             if any(a["repetition"] == repetition and a["arm"] == arm for a in attempts):
                 continue
+            verify_frozen_sources(directory)
             subnet = str(ipaddress.ip_network(f"10.233.{args.subnet_start + len(attempts)}.0/24"))
             project = f"publication-gate-bench-{args.cohort}-r{repetition}-{arm}"
             runtime = Benchmark(project, subnet, arm, repetition, frozen)
@@ -468,6 +547,7 @@ def execute_remaining(args, directory, frozen, attempts):
             try:
                 runtime.setup_benchmark()
                 runtime.measure()
+                verify_frozen_sources(directory)
                 attempt["status"] = "completed-accounted-phases"
             except Exception as error:
                 attempt.update(status="blocked", error=str(error)[:2500])
@@ -475,6 +555,9 @@ def execute_remaining(args, directory, frozen, attempts):
             finally:
                 try:
                     runtime.finish_benchmark()
+                except Exception as error:
+                    attempt.update(status="blocked-cleanup", error=type(error).__name__)
+                    raise
                 finally:
                     save(directory / "attempts.json", attempts)
     print("COHORT COMPLETE " + str(directory), flush=True)

@@ -43,8 +43,8 @@ impl Context {
         }
         context
     }
-    pub async fn scope<F: Future>(self, future: F) -> F::Output {
-        CONTEXT.scope(self, future).await
+    pub fn scope<F: Future>(self, future: F) -> impl Future<Output = F::Output> {
+        CONTEXT.scope(self, Box::pin(future))
     }
 }
 
@@ -138,21 +138,25 @@ impl Drop for Span {
 
 /// # Errors
 /// Preserves the wrapped operation's error without changing its outcome.
-pub async fn measure<T, E, F: Future<Output = Result<T, E>>>(
+pub fn measure<T, E, F: Future<Output = Result<T, E>>>(
     stage: &'static str,
     category: &'static str,
     future: F,
-) -> Result<T, E> {
-    let mut span = Span::new(stage, category);
-    let result = if let Some(capture) = &span.capture {
-        let mut child_context = capture.context.clone();
-        child_context.parent = Some(capture.id.clone());
-        child_context.scope(future).await
-    } else {
-        future.await
-    };
-    span.status = if result.is_ok() { "completed" } else { "failed" };
-    result
+) -> impl Future<Output = Result<T, E>> {
+    // Box before constructing the async state, including its initial arguments.
+    let mut future = Box::pin(future);
+    async move {
+        let mut span = Span::new(stage, category);
+        let result = if let Some(capture) = &span.capture {
+            let mut child_context = capture.context.clone();
+            child_context.parent = Some(capture.id.clone());
+            CONTEXT.scope(child_context, future.as_mut()).await
+        } else {
+            future.as_mut().await
+        };
+        span.status = if result.is_ok() { "completed" } else { "failed" };
+        result
+    }
 }
 
 pub fn unit(unit: &str) {
@@ -167,6 +171,30 @@ pub fn unit(unit: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trace_wrappers_do_not_multiply_wrapped_future_storage() {
+        struct LargeFuture([u8; 65_536]);
+        impl Future for LargeFuture {
+            type Output = Result<u8, ()>;
+
+            fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+                std::task::Poll::Ready(Ok(self.0[0]))
+            }
+        }
+
+        let scope = Context::new("storage-check", "collector").scope(LargeFuture([0; 65_536]));
+        let measured = measure("storage-check", "processing", LargeFuture([0; 65_536]));
+        let nested = measure("outer", "lifecycle", measured);
+        let limit = std::mem::size_of::<LargeFuture>() + 4_096;
+        assert!(std::mem::size_of_val(&scope) <= limit);
+        assert!(
+            std::mem::size_of_val(&nested) <= limit,
+            "nested trace future uses {} bytes, limit {limit}",
+            std::mem::size_of_val(&nested),
+        );
+    }
+
     #[tokio::test]
     async fn context_is_explicit_and_task_local() {
         let a = Context::new("attempt-a", "collector");
@@ -181,15 +209,32 @@ mod tests {
 
     #[tokio::test]
     async fn returned_errors_and_dropped_futures_have_distinct_outcomes() {
-        TEST_OUTCOMES.scope(std::cell::RefCell::new(Vec::new()), async {
-            assert_eq!(measure("success", "lifecycle", async { Ok::<_, ()>(1) }).await, Ok(1));
-            assert_eq!(measure("rejected", "downstream_wait", async { Err::<(), _>("domain-error") }).await, Err("domain-error"));
-            let cancelled = tokio::time::timeout(std::time::Duration::from_millis(1),
-                measure("cancelled", "lifecycle", std::future::pending::<Result<(), ()>>())).await;
-            assert!(cancelled.is_err());
-            TEST_OUTCOMES.with(|outcomes| assert_eq!(*outcomes.borrow(), [
-                ("success", "completed"), ("rejected", "failed"), ("cancelled", "cancelled"),
-            ]));
-        }).await;
+        TEST_OUTCOMES
+            .scope(std::cell::RefCell::new(Vec::new()), async {
+                drop(measure("unpolled", "lifecycle", async { Ok::<_, ()>(1) }));
+                TEST_OUTCOMES.with(|outcomes| assert!(outcomes.borrow().is_empty()));
+                assert_eq!(measure("success", "lifecycle", async { Ok::<_, ()>(1) }).await, Ok(1));
+                assert_eq!(
+                    measure("rejected", "downstream_wait", async { Err::<(), _>("domain-error") }).await,
+                    Err("domain-error")
+                );
+                let cancelled = tokio::time::timeout(
+                    std::time::Duration::from_millis(1),
+                    measure("cancelled", "lifecycle", std::future::pending::<Result<(), ()>>()),
+                )
+                .await;
+                assert!(cancelled.is_err());
+                TEST_OUTCOMES.with(|outcomes| {
+                    assert_eq!(
+                        *outcomes.borrow(),
+                        [
+                            ("success", "completed"),
+                            ("rejected", "failed"),
+                            ("cancelled", "cancelled"),
+                        ]
+                    )
+                });
+            })
+            .await;
     }
 }

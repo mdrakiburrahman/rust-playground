@@ -1,0 +1,4 @@
+benchmark-v1.schema.json -text whitespace=cr-at-eol
+benchmark-v1.fixture.json -text whitespace=cr-at-eol
+acceptance/benchmark-contract-corpus.json -text whitespace=cr-at-eol
+live-v1.schema.json -text whitespace=cr-at-eol

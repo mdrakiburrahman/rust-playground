@@ -31,11 +31,34 @@ runtime control. `export_traces.py --cohort COHORT` projects allowlisted aliases
 request/attempt/unit/commit/receipt links, service spans and container resource
 intervals; its stage report lists missing coverage. Overflow markers make the
 dataset incomplete; their count is a lower bound on suppressed events.
-Fresh qualification and rerun evidence for this update is not yet available.
+The continuation passed 42 Rust tests, rebuilt seven shared binaries and
+qualified the exercised SQL/Delta boundary in both arms; exact retained runs and
+earlier failures are in [HANDOFF.md](HANDOFF.md). Fresh matched measurements are
+still pending. Earlier report/cohort values below do not qualify the new source.
 
-## Current comparison: shared SQL / Delta
+### Fresh measured export and separate report
 
-The fresh main report is **adapted Pingora/router-hosted placement versus ADR
+After all four fresh tracing calibrations and six nine-phase runs complete,
+export with `export_traces.py --cohort COHORT`, then call
+`delta_report.generate_fresh("COHORT")` from this directory using the existing
+Python environment. The fresh-report path verifies the alternating arm order,
+calibration workload/order, shared binary hashes, ordinary Delta and SQL receipt
+reconciliation, stopped resources and actual Docker CPU/memory/PID bounds.
+It creates a new `target/delta-benchmark/COHORT/public` directory containing the
+sanitized exchange, fresh report, stage report, calibration/provenance summary
+and exact frozen source/binary manifest. It never overwrites the historical
+main report or inherits its historical qualification claims.
+
+Preserve the measured native tree while a cohort runs. Later postprocessor
+fixes must be separately identified; the public summary records the actual
+report/export postprocessor hashes in addition to the frozen measurement
+manifest. Preserve blocked attempts and their original metadata; do not combine
+pre-fix calibration with post-fix measurements. CPU counter-reset intervals are
+unavailable with retained error/coverage counts, not zero or complete coverage.
+
+## Historical comparison: shared SQL / Delta
+
+The retained historical report compares **adapted Pingora/router-hosted placement versus ADR
 gateway/separate controller**, using the identical qualified `adr-flight`
 collector and `adr-publisher` binaries. SQL controls ownership and accepted
 publication decisions in both arms; disk/cache is not a competing write

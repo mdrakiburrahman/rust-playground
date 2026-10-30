@@ -97,10 +97,12 @@ pub fn optimization_candidate(state: &Snapshot, now: i64) -> Option<(String, Wri
     let pressures = state
         .members
         .iter()
-        .filter(|(id, member)| {
+        .filter(|(_, member)| {
             member.expires > now
                 && member.member.eligible
-                && !state.policies.get(*id).is_some_and(|p| p.retiring || p.approved)
+                && !state
+                    .policy_for(&member.member.writer)
+                    .is_some_and(|p| p.retiring || p.approved)
         })
         .filter_map(|(id, _)| state.projected(id, "").ok().map(|p| (id.clone(), p)))
         .collect::<BTreeMap<_, _>>();
@@ -165,6 +167,16 @@ pub fn optimization_candidate(state: &Snapshot, now: i64) -> Option<(String, Wri
 }
 
 impl Snapshot {
+    pub fn teardown_pending(&self, collector: &str) -> bool {
+        self.policies.get(collector).is_some_and(|policy| policy.approved)
+    }
+
+    pub fn policy_for(&self, writer: &Writer) -> Option<&Policy> {
+        self.policies
+            .get(&writer.collector)
+            .filter(|policy| policy.incarnation.as_ref() == Some(writer))
+    }
+
     /// # Errors
     /// Rejects missing observations or unknown capacity.
     pub fn projected(&self, collector: &str, key: &str) -> Result<Demand> {
@@ -220,10 +232,10 @@ impl Snapshot {
         ensure!(member.expires > 0 && member.member.eligible, "member unavailable");
         ensure!(member.member.active < 16, "writer stream slots exhausted");
         ensure!(
-            !self
-                .policies
-                .get(collector)
-                .is_some_and(|p| p.excluded || p.retiring || p.approved),
+            !self.teardown_pending(collector)
+                && !self
+                    .policy_for(&member.member.writer)
+                    .is_some_and(|p| p.excluded || p.retiring || p.approved),
             "placement excluded"
         );
         if let Some(policy) = self.table_policies.get(key) {

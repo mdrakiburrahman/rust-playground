@@ -337,9 +337,9 @@ impl Publisher {
                 "schema changes require separate acceptance"
             );
             for batch in builder.with_batch_size(256).build()? {
-                writer.write(&batch?).await?;
+                Box::pin(writer.write(&batch?)).await?;
             }
-            let result = writer.finish().await?;
+            let result = Box::pin(writer.finish()).await?;
             ensure!(result.version as i64 == predecessor + 1, "unexpected native version");
             let name = result
                 .file
@@ -713,8 +713,8 @@ pub async fn stage_batch(path: &Path, batch: &arrow::array::RecordBatch) -> Resu
         "stage logical byte bound"
     );
     let mut writer = arrow_deltalake::ParquetFileWriter::create(path, batch.schema())?;
-    writer.write(batch).await?;
-    let file = writer.finish().await?;
+    Box::pin(writer.write(batch)).await?;
+    let file = Box::pin(writer.finish()).await?;
     if file.bytes > MAX_DATA {
         bail!("stage encoded byte bound");
     }
@@ -727,8 +727,54 @@ pub async fn stage_batch(path: &Path, batch: &arrow::array::RecordBatch) -> Resu
 mod tests {
     use super::*;
 
+    #[test]
+    fn preparation_future_has_bounded_stack_storage() {
+        fn size<F: std::future::Future>(_: impl FnOnce() -> F) -> usize {
+            std::mem::size_of::<F>()
+        }
+        let publisher: Option<&Publisher> = None;
+        let identity: Option<Identity> = None;
+        let schema: Option<SchemaRef> = None;
+        let bytes = size(|| {
+            publisher
+                .unwrap()
+                .prepare("table", "operation", identity.unwrap(), schema.unwrap(), None)
+        });
+        assert!(bytes <= 64 * 1024, "preparation future requires {bytes} bytes");
+    }
+
+    #[test]
+    fn recovery_futures_have_bounded_stack_storage() {
+        fn size<F: std::future::Future>(_: impl FnOnce() -> F) -> usize {
+            std::mem::size_of::<F>()
+        }
+        let publisher: Option<&Publisher> = None;
+        let identity: Option<&Identity> = None;
+        let materialize = size(|| publisher.unwrap().materialize("table", &NoHooks));
+        let activate = size(|| publisher.unwrap().activate("table", identity.unwrap()));
+        assert!(
+            materialize <= 64 * 1024,
+            "materialization future requires {materialize} bytes"
+        );
+        assert!(activate <= 64 * 1024, "activation future requires {activate} bytes");
+    }
+
+    #[test]
+    fn collector_staging_future_has_bounded_stack_storage() {
+        fn size<F: std::future::Future>(_: impl FnOnce() -> F) -> usize {
+            std::mem::size_of::<F>()
+        }
+        let path: Option<&Path> = None;
+        let batch: Option<&arrow::array::RecordBatch> = None;
+        let bytes = size(|| stage_batch(path.unwrap(), batch.unwrap()));
+        assert!(bytes <= 64 * 1024, "collector staging future requires {bytes} bytes");
+    }
+
     fn fixture() -> Result<PathBuf> {
-        let root = PathBuf::from("target/publication-unit").join(uuid::Uuid::new_v4().to_string());
+        let root = std::env::var_os("CARGO_TARGET_DIR")
+            .map_or_else(|| PathBuf::from("target"), PathBuf::from)
+            .join("publication-unit")
+            .join(uuid::Uuid::new_v4().to_string());
         mkdir(&root)?;
         Ok(root)
     }

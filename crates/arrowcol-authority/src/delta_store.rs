@@ -142,7 +142,9 @@ pub enum Command {
     },
     ApproveRetirement {
         controller: Controller,
-        collector: String,
+        writer: Writer,
+        revision: i64,
+        operation: String,
     },
     Start {
         id: String,
@@ -241,6 +243,16 @@ fn member(state: &Snapshot, writer: &Writer, clock: &Clock) -> Result<()> {
         m.member.writer == *writer && live(clock, &member_key(&writer.collector), m.expires),
         "NOT_OWNER expired process/local generation"
     );
+    Ok(())
+}
+
+fn rebind_policy(state: &mut Snapshot, writer: &Writer) -> Result<()> {
+    if let Some(policy) = state.policies.get_mut(&writer.collector) {
+        ensure!(!policy.approved, "execution resource awaits confirmed removal");
+        policy.revision = policy.revision.checked_add(1).context("policy revision exhausted")?;
+        policy.incarnation = Some(writer.clone());
+        policy.applied_revision = 0;
+    }
     Ok(())
 }
 
@@ -377,7 +389,9 @@ pub fn apply(state: &mut Snapshot, command: &Command, clock: &Clock) -> Result<(
                 return Ok(());
             }
             ensure!(
-                old.revision == *revision && !old.approved && (!old.retiring || *retiring),
+                old.revision == *revision
+                    && !old.approved
+                    && (old.incarnation.as_ref() != Some(writer) || !old.retiring || *retiring),
                 "policy revision/retirement conflict"
             );
             state.policies.insert(
@@ -388,7 +402,11 @@ pub fn apply(state: &mut Snapshot, command: &Command, clock: &Clock) -> Result<(
                     block_streams: *block_streams,
                     retiring: *retiring,
                     approved: false,
-                    applied_revision: old.applied_revision,
+                    applied_revision: if old.incarnation.as_ref() == Some(writer) {
+                        old.applied_revision
+                    } else {
+                        0
+                    },
                     incarnation: Some(writer.clone()),
                     operation: operation.clone(),
                     recovery_obligations: if *retiring {
@@ -439,9 +457,15 @@ pub fn apply(state: &mut Snapshot, command: &Command, clock: &Clock) -> Result<(
                     .is_none_or(|o| observation.sequence > o.sequence),
                 "stale observation"
             );
-            if let Some(policy) = state.policies.get_mut(&writer.collector) {
+            if let Some(policy) = state
+                .policies
+                .get_mut(&writer.collector)
+                .filter(|p| p.incarnation.as_ref() == Some(writer))
+            {
                 ensure!(*applied_revision == policy.revision, "policy not applied");
                 policy.applied_revision = *applied_revision;
+            } else {
+                ensure!(*applied_revision == 0, "foreign policy acknowledgement");
             }
             state.observations.insert(writer.collector.clone(), observation.clone());
             state.observed_at.insert(writer.collector.clone(), clock.now);
@@ -456,9 +480,9 @@ pub fn apply(state: &mut Snapshot, command: &Command, clock: &Clock) -> Result<(
             let i = state.identity(key, writer, *epoch)?;
             authorize(state, key, &i, clock)?;
             ensure!(crate::safe_id(stream), "invalid stream");
-            let p = state.policies.get(&writer.collector).cloned().unwrap_or_default();
+            let p = state.policy_for(writer).cloned().unwrap_or_default();
             ensure!(
-                !p.block_streams && !p.retiring && !p.approved,
+                !state.teardown_pending(&writer.collector) && !p.block_streams && !p.retiring,
                 "new stream admission blocked"
             );
             let schema = state.table_policies.get(key).context("missing schema policy")?;
@@ -472,9 +496,13 @@ pub fn apply(state: &mut Snapshot, command: &Command, clock: &Clock) -> Result<(
             );
             let t = state.tables.get_mut(key).context("table")?;
             if let Some(existing) = t.streams.get(stream) {
-                ensure!(existing.writer == *writer && existing.epoch == *epoch
-                    && existing.fingerprint == *fingerprint && existing.policy_revision == schema.revision,
-                    "stream identity collision");
+                ensure!(
+                    existing.writer == *writer
+                        && existing.epoch == *epoch
+                        && existing.fingerprint == *fingerprint
+                        && existing.policy_revision == schema.revision,
+                    "stream identity collision"
+                );
                 return Ok(());
             }
             ensure!(
@@ -531,8 +559,18 @@ pub fn apply(state: &mut Snapshot, command: &Command, clock: &Clock) -> Result<(
                 .input_policy
                 .insert(unit.clone(), policy);
         }
-        Command::ApproveRetirement { controller, collector } => {
+        Command::ApproveRetirement {
+            controller,
+            writer,
+            revision,
+            operation,
+        } => {
             control(state, controller, clock)?;
+            let collector = &writer.collector;
+            ensure!(
+                state.members.get(collector).is_some_and(|m| m.member.writer == *writer),
+                "retirement incarnation changed"
+            );
             ensure!(
                 !state.tables.values().any(|t| t.record.writer.collector == *collector
                     || t.reservation.as_ref().is_some_and(|r| r.target.collector == *collector)),
@@ -540,7 +578,12 @@ pub fn apply(state: &mut Snapshot, command: &Command, clock: &Clock) -> Result<(
             );
             let p = state.policies.get_mut(collector).context("retirement missing")?;
             ensure!(
-                p.retiring && p.applied_revision == p.revision && p.recovery_obligations.is_empty(),
+                p.incarnation.as_ref() == Some(writer)
+                    && p.revision == *revision
+                    && p.operation == *operation
+                    && p.retiring
+                    && p.applied_revision == p.revision
+                    && p.recovery_obligations.is_empty(),
                 "retirement awaits applied policy/recovered successors"
             );
             p.approved = true;
@@ -602,6 +645,10 @@ pub fn apply(state: &mut Snapshot, command: &Command, clock: &Clock) -> Result<(
                     );
                 }
                 old => {
+                    ensure!(
+                        !state.teardown_pending(&id),
+                        "execution resource awaits confirmed removal"
+                    );
                     state.observations.remove(&id);
                     state.observed_at.remove(&id);
                     ensure!(
@@ -612,6 +659,7 @@ pub fn apply(state: &mut Snapshot, command: &Command, clock: &Clock) -> Result<(
                     requested.writer.generation = old
                         .map_or(1, |m| m.member.writer.generation.parse::<i64>().unwrap_or(0) + 1)
                         .to_string();
+                    rebind_policy(state, &requested.writer)?;
                     state.retired.insert(process);
                     state.members.insert(
                         id,
@@ -627,9 +675,16 @@ pub fn apply(state: &mut Snapshot, command: &Command, clock: &Clock) -> Result<(
         Command::Replace { controller, writer } => {
             control(state, controller, clock)?;
             member(state, writer, clock)?;
+            ensure!(
+                !state.teardown_pending(&writer.collector),
+                "execution resource awaits confirmed removal"
+            );
             let m = state.members.get_mut(&writer.collector).context("member")?;
             m.member.writer.generation = (writer.generation.parse::<i64>()? + 1).to_string();
             let successor = m.member.writer.clone();
+            rebind_policy(state, &successor)?;
+            state.observations.remove(&writer.collector);
+            state.observed_at.remove(&writer.collector);
             for t in state.tables.values_mut().filter(|t| t.record.writer == *writer) {
                 t.record.writer = successor.clone();
                 t.record.epoch += 1;
@@ -739,10 +794,7 @@ pub fn apply(state: &mut Snapshot, command: &Command, clock: &Clock) -> Result<(
                     || t.reservation
                         .as_ref()
                         .is_some_and(|r| member(state, &r.target, clock).is_err()
-                            || state
-                                .policies
-                                .get(&r.target.collector)
-                                .is_some_and(|p| p.excluded || p.retiring)),
+                            || state.policy_for(&r.target).is_some_and(|p| p.excluded || p.retiring)),
                 "migration already reserved"
             );
             let t = state.tables.get_mut(key).context("unknown table")?;
@@ -910,7 +962,7 @@ pub fn apply(state: &mut Snapshot, command: &Command, clock: &Clock) -> Result<(
                 "recovery schema capability unavailable"
             );
             ensure!(
-                !state.policies.get(collector).is_some_and(|p| p.retiring || p.approved),
+                !state.teardown_pending(collector) && !state.policy_for(&t.record.writer).is_some_and(|p| p.retiring),
                 "retiring successor cannot activate"
             );
             let t = state.tables.get_mut(table).context("table")?;

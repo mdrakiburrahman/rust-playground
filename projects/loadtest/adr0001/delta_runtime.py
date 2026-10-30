@@ -27,10 +27,11 @@ import native
 
 
 class Runtime(Gate):
-    def __init__(self, project, subnet, arm, backend, legacy=False):
+    def __init__(self, project, subnet, arm, backend, legacy=False, trace_enabled=True):
         super().__init__(project, subnet)
         self.arm, self.backend = arm, backend
         self.legacy = legacy
+        self.trace_enabled = trace_enabled
         self.names = {}
         self.expected = {"main": [], "dictionary": []}
         self.uploads = []
@@ -68,7 +69,7 @@ class Runtime(Gate):
                    "--network", self.project, "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
                    "--user", f"{21001 if stage else os.getuid()}:{21001 if stage else os.getgid()}",
                    "--cpus", "1", "--memory", "1g", "--pids-limit", "256",
-                   "-e", "ARROWCOL_TRACE=1",
+                   "-e", f"ARROWCOL_TRACE={int(self.trace_enabled)}",
                    "--mount", f"type=bind,src={self.root/'bin'},dst=/native,readonly",
                    "--mount", f"type=bind,src={self.root/'config'/f'{role}.json'},dst=/config.json,readonly"]
         for alias in aliases:
@@ -98,9 +99,8 @@ class Runtime(Gate):
             state.mkdir(exist_ok=True)
             command += ["--mount", f"type=bind,src={state},dst=/runtime"]
         command += [RUNTIME_IMAGE, "/native/" + binary, *extra]
-        self.run(command)
+        self.create_container(command)
         self.names[role] = name
-        self.containers.append(name)
 
     def port_of(self, role, port):
         return self.run(["docker", "port", self.names[role], f"{port}/tcp"]).stdout.strip().split(":")[-1]
@@ -123,12 +123,12 @@ CREATE USER delta_runtime FOR LOGIN delta_runtime;
 ALTER ROLE db_owner ADD MEMBER delta_runtime;
 """
         statement = statement.replace("RUNTIME_PASSWORD", self.runtime_password.read_text().strip())
-        result = subprocess.run(["docker", "exec", "-i", self.sql_name, "bash", "-c",
+        result = subprocess.run(["docker", "exec", "-i", self.owned_container(self.sql_name), "bash", "-c",
             'export SQLCMDPASSWORD="$(cat /run/secrets/sqlserver_sa_password)"; '
             'exec /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -C -b'],
             input=statement, text=True, capture_output=True)
         assert result.returncode == 0, result.stderr
-        probe = subprocess.run(["docker", "exec", "-i", self.sql_name, "bash", "-c",
+        probe = subprocess.run(["docker", "exec", "-i", self.owned_container(self.sql_name), "bash", "-c",
             "IFS= read -r SQLCMDPASSWORD; export SQLCMDPASSWORD; "
             "exec /opt/mssql-tools18/bin/sqlcmd -S localhost -U delta_runtime -d delta_runtime -C -b -h-1 -W "
             """-Q "SET NOCOUNT ON; SELECT ORIGINAL_LOGIN(),IS_SRVROLEMEMBER('sysadmin'),DB_NAME()" """],
@@ -179,14 +179,14 @@ ALTER ROLE db_owner ADD MEMBER delta_runtime;
             path.chmod(0o444 if role.startswith("collector") else 0o600)
         if self.backend == "etcd":
             name = self.project + "-etcd"
-            self.run(["docker", "volume", "create", name])
-            self.run(["docker", "run", "-d", "--name", name, "--network", self.project,
+            self.create_volume(name)
+            self.create_container(["docker", "run", "-d", "--name", name,
+                      "--label", f"delta-runtime={self.project}", "--network", self.project,
                       "--network-alias", "etcd", "--cpus", "1", "--memory", "512m",
                       "--mount", f"type=volume,src={name},dst=/data",
                       "registry.k8s.io/etcd:3.6.4-0", "/usr/local/bin/etcd",
                       "--data-dir=/data", "--listen-client-urls=http://0.0.0.0:2379",
                       "--advertise-client-urls=http://etcd:2379"])
-            self.containers.append(name)
             self.names["etcd"] = name
             time.sleep(2)
             for args in [
@@ -199,7 +199,7 @@ ALTER ROLE db_owner ADD MEMBER delta_runtime;
                 ["auth", "enable"],
             ]:
                 # Bootstrap credentials never enter retained argv logs.
-                r = subprocess.run(["docker", "exec", name, "/usr/local/bin/etcdctl", *args],
+                r = subprocess.run(["docker", "exec", self.owned_container(name), "/usr/local/bin/etcdctl", *args],
                                    text=True, capture_output=True)
                 assert r.returncode == 0, r.stderr
         args = ["--config", "/config.json", "--private", "/private.json"]
@@ -261,6 +261,18 @@ ALTER ROLE db_owner ADD MEMBER delta_runtime;
     def assignment(self, key="main"):
         return self.post({"op": "resolve", "key": key}, "gateway")
 
+    def collector_resource(self, collector):
+        assert collector in self.config["collectors"] and collector in self.names
+        container = json.loads(self.run(["docker", "inspect", self.names[collector]]).stdout)[0]
+        assert container["Id"] == self.owned_container(self.names[collector]), "collector resource replaced"
+        assert container["Config"]["Labels"].get("delta-runtime") == self.project
+        assert container["State"]["Running"], "retirement collector is not running"
+        return {"id": container["Id"], "started_at": container["State"]["StartedAt"]}
+
+    def stop_retired_resource(self, collector, resource):
+        assert self.collector_resource(collector) == resource, "collector execution resource changed during retirement"
+        self.run(["docker", "stop", "-t", "1", resource["id"]])
+
     def proof_alignment(self):
         assert not self.legacy
         first = self.assignment()
@@ -294,19 +306,65 @@ ALTER ROLE db_owner ADD MEMBER delta_runtime;
         self.upload(2000050, schema_index=1, half_close=True)
         self.mark("placement exclusion preserves owner streams; separately applied block rejects new native streams")
 
+        resource = self.collector_resource(owner["collector"])
         retiring = policy(True, False, True)
-        approval = self.wait(lambda: (p if (p := self.post({"op": "view"})["policies"][owner["collector"]])["approved"] else None))
-        assert approval["incarnation"] == owner and approval["operation"] == retiring["operation"]
-        assert not approval["recovery_obligations"]
+
+        def retirement_approved():
+            policy = self.post({"op": "view"})["policies"][owner["collector"]]
+            return policy if (policy["approved"] and policy["incarnation"] == owner
+                and policy["operation"] == retiring["operation"] and policy["revision"] == retiring["revision"]
+                and not policy["recovery_obligations"]) else None
+
+        self.wait(retirement_approved)
         state = self.post({"op": "view"})
         assert all(a["record"]["writer"] != owner and a["record"]["lifecycle"] == "Active"
                    for a in state["assignments"])
-        self.run(["docker", "stop", "-t", "1", self.names[owner["collector"]]])
+        self.post({"op": "policy", "collector": owner["collector"], "writer": owner,
+                   "revision": retiring["revision"], "operation": str(uuid.uuid4()),
+                   "excluded": False, "block_streams": False, "retiring": False}, ok=False)
+        self.stop_retired_resource(owner["collector"], resource)
         self.upload(2000060, schema_index=1, half_close=True)
         assert self.assignment()["record"]["epoch"] > active["record"]["epoch"]
         assert self.scan_runtime()["rows"] == sorted(self.expected["main"])
         assert self.scan_runtime("cas")["rows"] == sorted(self.expected["cas"])
         self.mark("exact-incarnation retirement waits for recovered successors before teardown and preserves Delta rows")
+
+        old = self.assignment()["record"]
+        collector = old["writer"]["collector"]
+        state = self.post({"op": "view"})
+        revision = state.get("policies", {}).get(collector, {}).get("revision", 0)
+        desired = self.post({"op": "policy", "collector": collector, "writer": old["writer"],
+                             "revision": revision, "operation": str(uuid.uuid4()),
+                             "excluded": True, "block_streams": True, "retiring": False})
+        self.wait(lambda: self.post({"op": "view"})["policies"][collector]["applied_revision"] == desired["revision"])
+        observation = self.post({"op": "view"})["observations"][collector]
+        self.run(["docker", "restart", "-t", "1", self.names[collector]])
+
+        def reloaded_policy():
+            state = self.post({"op": "view"})
+            current = state["policies"][collector]
+            return current if (current["incarnation"] != old["writer"]
+                and current["revision"] > desired["revision"]
+                and current["applied_revision"] == current["revision"]) else None
+
+        reloaded = self.wait(reloaded_policy)
+        assert reloaded["excluded"] and reloaded["block_streams"] and not reloaded["approved"]
+        self.post({"op": "observe", "writer": old["writer"], "observation": observation,
+                   "applied_revision": desired["revision"]}, principal=collector, ok=False)
+        self.post({"op": "policy", "collector": collector, "writer": old["writer"],
+                   "revision": reloaded["revision"], "operation": str(uuid.uuid4()),
+                   "excluded": False, "block_streams": False, "retiring": False}, ok=False)
+        self.post({"op": "admit", "key": "main", "writer": old["writer"],
+                   "epoch": old["epoch"], "unit": "stale-policy-incarnation"}, principal=collector, ok=False)
+        after = self.post({"op": "view"})["policies"][collector]
+        assert after["revision"] == reloaded["revision"] and after["incarnation"] == reloaded["incarnation"]
+        self.post({"op": "policy", "collector": collector, "writer": reloaded["incarnation"],
+                   "revision": reloaded["revision"], "operation": str(uuid.uuid4()),
+                   "excluded": False, "block_streams": False, "retiring": False})
+        self.wait(lambda: self.assignment()["record"]["lifecycle"] == "Active")
+        self.upload(2000070, schema_index=1, half_close=True)
+        assert self.scan_runtime()["rows"] == sorted(self.expected["main"])
+        self.mark("real collector restart reloads desired controls with fresh-incarnation ACK and rejects stale policy/telemetry")
 
     def upload(self, first, schema_index=0, extra_headers=None, expect=True, *,
                count=3, port=None, key=None, half_close=False):
@@ -698,7 +756,7 @@ ALTER ROLE db_owner ADD MEMBER delta_runtime;
     def finish_runtime(self):
         self.executor.shutdown(wait=True, cancel_futures=True)
         for role, name in self.names.items():
-            result = subprocess.run(["docker", "logs", name], capture_output=True, text=True)
+            result = subprocess.run(["docker", "logs", self.owned_container(name)], capture_output=True, text=True)
             (self.root / "logs" / f"runtime-{role}.log").write_text(result.stdout + result.stderr)
         for name in reversed(self.containers):
             self.run(["docker", "stop", "-t", "1", name])

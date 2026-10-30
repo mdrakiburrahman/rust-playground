@@ -444,10 +444,7 @@ impl Control {
                             .members
                             .get(&r.target.collector)
                             .is_none_or(|m| m.expires == 0 || m.member.writer != r.target)
-                            || state
-                                .policies
-                                .get(&r.target.collector)
-                                .is_some_and(|p| p.excluded || p.retiring)
+                            || state.policy_for(&r.target).is_some_and(|p| p.excluded || p.retiring)
                     }) {
                         return self.migrate(key).await;
                     }
@@ -459,11 +456,7 @@ impl Control {
                             force: true,
                         })
                         .await?;
-                } else if state
-                    .policies
-                    .get(&t.record.writer.collector)
-                    .is_some_and(|p| p.retiring)
-                {
+                } else if state.policy_for(&t.record.writer).is_some_and(|p| p.retiring) {
                     self.migrate(key).await?;
                 } else if state.table_policies.get(key).is_some_and(|policy| {
                     state
@@ -489,7 +482,11 @@ impl Control {
         }
         let state = self.store.snapshot().await?;
         for (collector, policy) in &state.policies {
-            if policy.retiring
+            let Some(writer) = policy.incarnation.as_ref() else {
+                continue;
+            };
+            if state.members.get(collector).is_some_and(|m| m.member.writer == *writer)
+                && policy.retiring
                 && !policy.approved
                 && policy.applied_revision == policy.revision
                 && policy.recovery_obligations.is_empty()
@@ -501,7 +498,9 @@ impl Control {
                 self.store
                     .execute(Command::ApproveRetirement {
                         controller: self.controller.clone(),
-                        collector: collector.clone(),
+                        writer: writer.clone(),
+                        revision: policy.revision,
+                        operation: policy.operation.clone(),
                     })
                     .await?;
             }
@@ -584,6 +583,22 @@ pub struct Publication {
 }
 
 impl Publication {
+    async fn recover_accepted_prefix(&self) -> Result<()> {
+        let state = self.store.snapshot().await?;
+        for (key, table) in state.tables {
+            if table.published < table.decisions.len() as i64 - 1 {
+                let Some(mailbox) = self.mailboxes.get(&key) else {
+                    continue;
+                };
+                let Ok(_guard) = mailbox.try_lock() else { continue };
+                if let Err(error) = Box::pin(self.publisher.materialize(&key, &NoHooks)).await {
+                    eprintln!("Delta accepted-prefix recovery {key}: {error}");
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// # Errors
     /// Returns runtime authority/storage initialization errors.
     pub async fn new(config: Config, private: PrivateConfig) -> Result<Arc<Self>> {
@@ -639,13 +654,13 @@ impl Publication {
             timing::measure(
                 "prefix-materialize",
                 "lifecycle",
-                self.publisher.materialize(key, &NoHooks),
+                Box::pin(self.publisher.materialize(key, &NoHooks)),
             )
             .await?;
         }
         match &op {
             Operation::RecoverDelta { .. } => {
-                self.publisher.activate(key, &identity).await?;
+                Box::pin(self.publisher.activate(key, &identity)).await?;
                 Ok(json!({"activated":true}))
             }
             Operation::PublishDelta { unit, sha256, .. } => {
@@ -687,20 +702,20 @@ impl Publication {
                     "staged schema differs from admitted schema"
                 );
                 let schema_operation = format!("{unit}-schema");
-                match self
-                    .publisher
-                    .prepare(
-                        key,
-                        &schema_operation,
-                        identity.clone(),
-                        arrow_deltalake::normalize::schema(&schema)?,
-                        None,
-                    )
-                    .await
+                // Native Delta preparation has a large async state; keep it off
+                // the worker's bounded stack rather than nesting it in dispatch.
+                match Box::pin(self.publisher.prepare(
+                    key,
+                    &schema_operation,
+                    identity.clone(),
+                    arrow_deltalake::normalize::schema(&schema)?,
+                    None,
+                ))
+                .await
                 {
                     Ok(p) => {
-                        self.publisher.accept(&p, &NoHooks, false).await?;
-                        self.publisher.materialize(key, &NoHooks).await?;
+                        Box::pin(self.publisher.accept(&p, &NoHooks, false)).await?;
+                        Box::pin(self.publisher.materialize(key, &NoHooks)).await?;
                     }
                     Err(e) if e.to_string() == "schema proposal must change exactly one version" => {}
                     Err(e) => return Err(e),
@@ -708,20 +723,22 @@ impl Publication {
                 let proposal = timing::measure(
                     "data-prepare",
                     "lifecycle",
-                    self.publisher
-                        .prepare(key, unit, identity, schema, Some((&stage, sha256))),
+                    Box::pin(
+                        self.publisher
+                            .prepare(key, unit, identity, schema, Some((&stage, sha256))),
+                    ),
                 )
                 .await?;
                 timing::measure(
                     "data-accept",
                     "downstream_wait",
-                    self.publisher.accept(&proposal, &RuntimeHooks, false),
+                    Box::pin(self.publisher.accept(&proposal, &RuntimeHooks, false)),
                 )
                 .await?;
                 timing::measure(
                     "data-materialize",
                     "lifecycle",
-                    self.publisher.materialize(key, &RuntimeHooks),
+                    Box::pin(self.publisher.materialize(key, &RuntimeHooks)),
                 )
                 .await?;
                 Ok(
@@ -765,18 +782,8 @@ pub async fn serve_publication(p: Arc<Publication>, listen: &str) -> Result<()> 
     let recovery = Arc::clone(&p);
     tokio::spawn(async move {
         loop {
-            if let Ok(state) = recovery.store.snapshot().await {
-                for (key, t) in state.tables {
-                    if t.published < t.decisions.len() as i64 - 1 {
-                        let Some(mailbox) = recovery.mailboxes.get(&key) else {
-                            continue;
-                        };
-                        let Ok(_guard) = mailbox.try_lock() else { continue };
-                        if let Err(e) = recovery.publisher.materialize(&key, &NoHooks).await {
-                            eprintln!("Delta accepted-prefix recovery {key}: {e}");
-                        }
-                    }
-                }
+            if let Err(error) = recovery.recover_accepted_prefix().await {
+                eprintln!("Delta accepted-prefix snapshot: {error}");
             }
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
@@ -792,6 +799,21 @@ pub async fn serve_publication(p: Arc<Publication>, listen: &str) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publication_dispatch_future_has_bounded_stack_storage() {
+        fn size<F: std::future::Future>(_: impl FnOnce() -> F) -> usize {
+            std::mem::size_of::<F>()
+        }
+        let publication: Option<&Publication> = None;
+        let bytes = size(|| publication.unwrap().apply("collector1", Operation::View));
+        assert!(bytes <= 64 * 1024, "publication future requires {bytes} bytes");
+        let recovery_bytes = size(|| publication.unwrap().recover_accepted_prefix());
+        assert!(
+            recovery_bytes <= 64 * 1024,
+            "background recovery future requires {recovery_bytes} bytes"
+        );
+    }
 
     struct MemoryStore(Mutex<Snapshot>);
     #[async_trait::async_trait]
@@ -816,92 +838,92 @@ mod tests {
         }
     }
 
-        fn test_config() -> Result<Config> {
-            Ok(serde_json::from_value(json!({
-                "delta":{"publisher":"http://publisher"},"tenant":"t","catalog_id":"c",
-                "tables":[{"key":"table","path":["c","s","table"],"fingerprints":["fp"]}],
-                "storage":".","controller":"http://control","operator_token":"o","gateway_token":"g",
-                "edge_secret":"e","internal_secret":"i","collectors":{},"etcd":[],"etcd_user":"","etcd_password":""
-            }))?)
-        }
+    fn test_config() -> Result<Config> {
+        Ok(serde_json::from_value(json!({
+            "delta":{"publisher":"http://publisher"},"tenant":"t","catalog_id":"c",
+            "tables":[{"key":"table","path":["c","s","table"],"fingerprints":["fp"]}],
+            "storage":".","controller":"http://control","operator_token":"o","gateway_token":"g",
+            "edge_secret":"e","internal_secret":"i","collectors":{},"etcd":[],"etcd_user":"","etcd_password":""
+        }))?)
+    }
 
-        #[tokio::test]
-        async fn restart_preserves_updated_catalog_policy() -> Result<()> {
-            let store = Arc::new(MemoryStore(Mutex::new(Snapshot::default())));
-            let control = Control::start(test_config()?, Arc::<MemoryStore>::clone(&store), adr_select).await?;
-            store
-                .execute(Command::Catalog {
-                    controller: control.controller.clone(),
-                    key: "table".into(),
-                    policy: placement::TablePolicy {
-                        revision: 2,
-                        fingerprints: vec!["fp".into()],
-                        demand: placement::Demand::default(),
-                    },
-                })
-                .await?;
-            store.0.lock().await.controller_expires = 0;
-            let _successor = Control::start(test_config()?, Arc::<MemoryStore>::clone(&store), adr_select).await?;
-            assert_eq!(store.snapshot().await?.table_policies["table"].revision, 2);
-            Ok(())
-        }
+    #[tokio::test]
+    async fn restart_preserves_updated_catalog_policy() -> Result<()> {
+        let store = Arc::new(MemoryStore(Mutex::new(Snapshot::default())));
+        let control = Control::start(test_config()?, Arc::<MemoryStore>::clone(&store), adr_select).await?;
+        store
+            .execute(Command::Catalog {
+                controller: control.controller.clone(),
+                key: "table".into(),
+                policy: placement::TablePolicy {
+                    revision: 2,
+                    fingerprints: vec!["fp".into()],
+                    demand: placement::Demand::default(),
+                },
+            })
+            .await?;
+        store.0.lock().await.controller_expires = 0;
+        let _successor = Control::start(test_config()?, Arc::<MemoryStore>::clone(&store), adr_select).await?;
+        assert_eq!(store.snapshot().await?.table_policies["table"].revision, 2);
+        Ok(())
+    }
 
-        #[tokio::test]
-        async fn unassigned_collector_can_retire_without_a_table_loop() -> Result<()> {
-            let store = Arc::new(MemoryStore(Mutex::new(Snapshot::default())));
-            let control = Control::start(test_config()?, Arc::<MemoryStore>::clone(&store), adr_select).await?;
-            let state = store
-                .execute(Command::Register {
-                    controller: control.controller.clone(),
-                    member: Member {
-                        writer: Writer {
-                            collector: "a".into(),
-                            process: "process-a".into(),
-                            generation: String::new(),
-                        },
-                        endpoint: "http://a:50051".into(),
-                        pressure: 0.1,
-                        rss_bytes: 1024,
-                        active: 0,
-                        eligible: true,
+    #[tokio::test]
+    async fn unassigned_collector_can_retire_without_a_table_loop() -> Result<()> {
+        let store = Arc::new(MemoryStore(Mutex::new(Snapshot::default())));
+        let control = Control::start(test_config()?, Arc::<MemoryStore>::clone(&store), adr_select).await?;
+        let state = store
+            .execute(Command::Register {
+                controller: control.controller.clone(),
+                member: Member {
+                    writer: Writer {
+                        collector: "a".into(),
+                        process: "process-a".into(),
+                        generation: String::new(),
                     },
-                })
-                .await?;
-            let writer = state.members["a"].member.writer.clone();
-            store
-                .execute(Command::Policy {
-                    controller: control.controller.clone(),
-                    collector: "a".into(),
-                    writer: writer.clone(),
-                    revision: 0,
-                    operation: "retire-a".into(),
-                    excluded: true,
-                    block_streams: false,
-                    retiring: true,
-                })
-                .await?;
-            store
-                .execute(Command::Observe {
-                    writer,
-                    applied_revision: 1,
-                    observation: placement::Observation {
-                        demand: placement::Demand::default(),
-                        capacity: placement::Demand {
-                            cpu: 1.0,
-                            memory: 1.0,
-                            throughput: 1.0,
-                        },
-                        sequence: 1,
-                        allocation_revision: 0,
-                        tables: BTreeMap::new(),
-                        fingerprints: ["fp".to_owned()].into(),
+                    endpoint: "http://a:50051".into(),
+                    pressure: 0.1,
+                    rss_bytes: 1024,
+                    active: 0,
+                    eligible: true,
+                },
+            })
+            .await?;
+        let writer = state.members["a"].member.writer.clone();
+        store
+            .execute(Command::Policy {
+                controller: control.controller.clone(),
+                collector: "a".into(),
+                writer: writer.clone(),
+                revision: 0,
+                operation: "retire-a".into(),
+                excluded: true,
+                block_streams: false,
+                retiring: true,
+            })
+            .await?;
+        store
+            .execute(Command::Observe {
+                writer,
+                applied_revision: 1,
+                observation: placement::Observation {
+                    demand: placement::Demand::default(),
+                    capacity: placement::Demand {
+                        cpu: 1.0,
+                        memory: 1.0,
+                        throughput: 1.0,
                     },
-                })
-                .await?;
-            control.reconcile().await?;
-            assert!(store.snapshot().await?.policies["a"].approved);
-            Ok(())
-        }
+                    sequence: 1,
+                    allocation_revision: 0,
+                    tables: BTreeMap::new(),
+                    fingerprints: ["fp".to_owned()].into(),
+                },
+            })
+            .await?;
+        control.reconcile().await?;
+        assert!(store.snapshot().await?.policies["a"].approved);
+        Ok(())
+    }
     #[tokio::test]
     async fn blocked_drain_does_not_starve_an_independent_failed_source() -> Result<()> {
         let store = Arc::new(MemoryStore(Mutex::new(Snapshot::default())));
