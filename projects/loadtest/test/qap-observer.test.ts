@@ -12,23 +12,25 @@ for (const mode of ['child-failure', 'invalid-output', 'invalid-diagnostic', 'ar
   test(`observer reports fixed privacy-safe phases for actual ${mode}`, async t => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'qap-diagnostic-'));
     t.after(() => rm(root, { force: true, recursive: true }));
-    const binary = path.join(root, 'helper');
-    await writeFile(binary, `#!/usr/bin/env python3
-import json,pathlib,sys
-args=sys.argv
-root=pathlib.Path(args[args.index('--results')+1])
-output=pathlib.Path(args[args.index('--output')+1])
-mode=${JSON.stringify(mode)}
-print('https://secret.invalid/password',file=sys.stderr)
-if mode=='child-failure':
- (root/'observation-diagnostic.json').write_text(json.dumps({'code':'deadline_exceeded','elapsed_ms':30000,'queries_completed':64}))
- sys.exit(3)
-if mode=='invalid-diagnostic':
- (root/'observation-diagnostic.json').write_text('{"code":"https://secret.invalid/password"}')
-if mode in ('array-code','nested-array-code'):
- code=['completed'] if mode=='array-code' else [['completed']]
- (root/'observation-diagnostic.json').write_text(json.dumps({'code':code,'elapsed_ms':1,'queries_completed':0}))
-output.write_text('https://secret.invalid/password')
+    const binary = path.join(root, 'helper.mjs');
+    await writeFile(binary, `#!${process.execPath}
+import fs from 'node:fs';
+import path from 'node:path';
+const args = process.argv;
+const root = args[args.indexOf('--results') + 1];
+const output = args[args.indexOf('--output') + 1];
+const mode = ${JSON.stringify(mode)};
+const diagnostic = value => fs.writeFileSync(path.join(root, 'observation-diagnostic.json'), JSON.stringify(value));
+console.error('https://secret.invalid/password');
+if (mode === 'child-failure') {
+  diagnostic({code:'deadline_exceeded',elapsed_ms:30000,queries_completed:64});
+  process.exit(3);
+}
+if (mode === 'invalid-diagnostic') diagnostic({code:'https://secret.invalid/password'});
+if (mode === 'array-code' || mode === 'nested-array-code') {
+  diagnostic({code:mode === 'array-code' ? ['completed'] : [['completed']],elapsed_ms:1,queries_completed:0});
+}
+fs.writeFileSync(output, 'https://secret.invalid/password');
 `);
     await chmod(binary, 0o700);
     const server = createServer((request, response) => {

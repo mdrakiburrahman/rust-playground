@@ -512,15 +512,15 @@ async function reconcileAzure(context: BenchmarkContext, occupancyId: string): P
   // The helper waits only for absent logs; auth, ownership and malformed logs fail immediately.
   const stderrFile = path.join(context.directory, 'results/azure-reconcile.stderr.log');
   try {
-    await runOwnedProcess('python3', [
-      'infra/azure/bootstrap.py', 'reconcile', '--tables', manifest,
+    await runOwnedProcess(process.execPath, [
+      '--import', import.meta.resolve('tsx'), 'infra/azure/bootstrap.ts', 'reconcile', '--tables', manifest,
       '--occupancy-id', occupancyId, '--wait-seconds', '120',
     ], { cwd: workspace, env: { ...context.env, AZURE_CONFIG_DIR: path.join(context.directory, 'azure-cli/infra') },
       // Budget: up to 120s waiting for Delta logs, then ~3 sequential management commands per table
       // against a cluster that is serving the live load.
       timeoutMs: 600_000, stderrFile });
   } catch (error) {
-    // bootstrap.py redacts private values in its own error lines.
+    // bootstrap.ts redacts private values in its own error lines.
     const detail = existsSync(stderrFile) ? readFileSync(stderrFile, 'utf8').trim().split('\n').slice(-5).join('\n') : '';
     if (detail) console.error(`[loadtest] Azure reconcile stderr (${stderrFile}):\n${detail}`);
     if (error instanceof OwnedProcessError) {
@@ -921,7 +921,7 @@ async function main(): Promise<void> {
   try {
     if (options.mode === 'azure') {
       azureTargets(privateEnv, 'preflight');
-      run('python3', ['infra/azure/bootstrap.py', 'occupy', '--occupancy-id', occupancyId], privateEnv);
+      run(process.execPath, ['--import', import.meta.resolve('tsx'), 'infra/azure/bootstrap.ts', 'occupy', '--occupancy-id', occupancyId], privateEnv);
       occupied = true;
       cloud.environment = modeEnvironment(workspace, options.mode, process.env);
     }
@@ -935,7 +935,7 @@ async function main(): Promise<void> {
         await stopBenchmark(workspace, args => run('docker', args, process.env, 360_000), { requireCleanMutators: true });
         if (cloud.reconciliationFailed) throw new Error('Azure reconciliation failed; retain occupancy pending authoritative reconciliation');
         if (cloud.qapObservationFailed) throw new Error('QAP helper failed; retain occupancy pending helper/evidence inspection');
-        run('python3', ['infra/azure/bootstrap.py', 'release', '--occupancy-id', occupancyId], cloud.environment);
+        run(process.execPath, ['--import', import.meta.resolve('tsx'), 'infra/azure/bootstrap.ts', 'release', '--occupancy-id', occupancyId], cloud.environment);
       }
     } catch (error) {
       failure = failure ? new AggregateError([failure, error], 'Benchmark and cloud drain/release failed; occupancy is not force-cleared') : error;

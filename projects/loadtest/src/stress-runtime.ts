@@ -11,25 +11,6 @@ import type { WaveSample } from './stress-criteria.js';
 
 const execute = promisify(execFile);
 const target = 'telemetry.sqlserver.sqlserver_cpu_utilization';
-const captureScript = `import os,subprocess,sys
-with open(sys.argv[4],"wb") as out, os.fdopen(os.open(sys.argv[5],os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600),"wb") as err:
- try:
-  child=subprocess.Popen([sys.argv[1],sys.argv[2],sys.argv[3],*sys.argv[6:]],stdout=out,stderr=subprocess.PIPE)
- except OSError as error:
-  err.write(str(error).encode("utf-8")[-65536:])
-  raise
- tail=b""
- while block:=child.stderr.read1(8192):
-  tail=(tail+block)[-65536:]
-  err.seek(0)
-  err.write(tail)
-  err.truncate()
-  err.flush()
- child.stderr.close()
- code=child.wait()
- if code:
-  raise SystemExit(code if code>0 else 1)
-`;
 const privateLocationFailure = 'Private reader diagnostics must be outside the public results tree and onelake artifact roots';
 const targetFileMiB = 128;
 const latestPartitions = 1;
@@ -198,8 +179,9 @@ export class LocalStressRuntime {
       }
     }
     const privateLog = path.join(this.diagnosticDirectory, 'reader-stderr.private.log');
-    await runOwnedProcess('python3', [
-      '-c', captureScript, this.options.reader, command, input, output, privateLog, ...extra,
+    await runOwnedProcess(process.execPath, [
+      path.join(this.options.workspace, 'projects/loadtest/scripts/capture-reader.ts'),
+      this.options.reader, command, input, output, privateLog, ...extra,
     ], { cwd: this.options.workspace, env: this.options.env, timeoutMs: remaining });
     this.check();
     if (Date.now() >= deadline) throw new Error('Actual fixture capture exceeded its absolute deadline');

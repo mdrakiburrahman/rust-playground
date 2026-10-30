@@ -18,21 +18,22 @@ test('real helper processes isolate provenance from the concurrently appending l
       `${pool}_sqlserver_fixture_${index}`, { available: false, error: 'fixture unavailable' },
     ]))),
   }));
-  const binary = path.join(root, 'observer.py');
-  await writeFile(binary, `#!/usr/bin/env python3
-import json, os, pathlib, sys, time
-args = sys.argv[1:]
-results = pathlib.Path(args[args.index('--results') + 1])
-output = pathlib.Path(args[args.index('--output') + 1])
-(results / 'arguments.json').write_text(json.dumps(args))
-with (results / 'kusto-queries.jsonl').open('a') as log:
-    for i in range(10):
-        for char in json.dumps({'source': 'observer', 'index': i}) + '\\n':
-            log.write(char)
-            log.flush()
-            time.sleep(0.0001)
-with output.open('x') as out:
-    out.write(pathlib.Path(os.environ['QAP_TEST_FIXTURE']).read_text())
+  const binary = path.join(root, 'observer.mjs');
+  await writeFile(binary, `#!${process.execPath}
+import fs from 'node:fs';
+import path from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
+const args = process.argv.slice(2);
+const results = args[args.indexOf('--results') + 1];
+const output = args[args.indexOf('--output') + 1];
+fs.writeFileSync(path.join(results, 'arguments.json'), JSON.stringify(args));
+for (let i = 0; i < 10; i++) {
+  for (const char of JSON.stringify({source:'observer',index:i}) + '\\n') {
+    fs.appendFileSync(path.join(results, 'kusto-queries.jsonl'), char);
+    await delay(1);
+  }
+}
+fs.writeFileSync(output, fs.readFileSync(process.env.QAP_TEST_FIXTURE), {flag:'wx'});
 `);
   await chmod(binary, 0o700);
   const writer = spawn(process.execPath, ['-e', `

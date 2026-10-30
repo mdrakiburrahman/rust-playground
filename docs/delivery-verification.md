@@ -331,7 +331,7 @@ local and gitignored.
 | `npx --no-install nx run loadtest:test` | Passed: 6 Delta inspection tests, 7 Arrow load-generator tests, and 21 TypeScript tests. |
 | `npx --no-install nx run loadtest:compose-check` | Passed. |
 | `npx --no-install nx run-many -t image-smoke --projects=otelcol-rust,arrowcol-rust,arrowcol-dataflow-rust,arrowcol-router-rust --parallel=2` | Passed in 49.7 seconds: all four local `:dev` images built and all four smoke targets passed; no registry login or push occurred. |
-| `python3 docs/validate.py` | Passed: 22 Markdown files, 21 local links/anchors, 111 Nx target references, 18 Cargo package references, 45 documented paths, and prohibited public-reference checks. |
+| `npx --no-install tsx docs/validate.ts` | Passed: 22 Markdown files, 21 local links/anchors, 111 Nx target references, 18 Cargo package references, 45 documented paths, and prohibited public-reference checks. |
 | `git diff --check` | Passed. |
 
 ## Historical baseline limitations

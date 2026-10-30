@@ -26,17 +26,14 @@ set -euo pipefail
 REPO=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
 IT="$REPO/.temp/kusto-qap-it"
 IMAGE=mcr.microsoft.com/azuredataexplorer/kustainer-linux@sha256:51e2250da2faf292de903f871a073eb37d3f2641cf63381b183879d21ebb1013
-WRITER=python:3.12-slim
-PACKAGES="deltalake==1.6.6 pyarrow==26.0.0 pandas==3.1.0 numpy==2.5.4"
 NET=kusto-qap-it
 KUSTO=kusto-qap-it
 SELF=$(hostname)
 
 write() {
-  docker run --rm -v "$IT/direct:/d" -v "$REPO/projects/loadtest/loadgen/scripts/kusto_qap_fixture.py:/w.py:ro" \
-    -v "$REPO/projects/loadtest/schemas/sqlserver.sql:/sqlserver.sql:ro" \
-    -v kusto-qap-it-pip:/root/.cache/pip "$WRITER" \
-    sh -c "pip install -q --disable-pip-version-check --root-user-action=ignore $PACKAGES >/dev/null && python /w.py /d $1 /sqlserver.sql" ||
+  (cd "$REPO" && npx --no-install tsx \
+    projects/loadtest/loadgen/scripts/kusto_qap_fixture.ts "$IT/direct" "$1" \
+    projects/loadtest/schemas/sqlserver.sql) ||
     return 1
   docker run --rm -v "$IT:/t" alpine chmod -R a+rwX /t
 }

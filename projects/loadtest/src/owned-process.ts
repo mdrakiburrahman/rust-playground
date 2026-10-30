@@ -71,8 +71,10 @@ export async function runOwnedProcess(
   if (process.platform !== 'linux' || !Number.isSafeInteger(options.timeoutMs) || options.timeoutMs <= 0) {
     throw new Error('Owned process groups require Linux and a finite positive deadline');
   }
-  const supervisor = fileURLToPath(new URL('../scripts/owned-process.py', import.meta.url));
-  const child = spawn('python3', [supervisor, String(options.timeoutMs), command, ...args], {
+  const supervisor = fileURLToPath(new URL('../scripts/owned-process.ts', import.meta.url));
+  // Node 24 strips this helper's erasable TS directly. A tsx compiler service would itself
+  // become a live child of the subreaper and make a cold-cache invocation fail custody checks.
+  const child = spawn(process.execPath, [supervisor, String(options.timeoutMs), command, ...args], {
     cwd: options.cwd, detached: true,
     // Azure CLI forks a detached telemetry uploader that outlives the command and would be
     // (correctly) reported as a surviving descendant of the owned group.

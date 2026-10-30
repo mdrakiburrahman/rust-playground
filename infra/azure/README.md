@@ -18,10 +18,17 @@ repo-bootstrapper distribute it. Never commit or print the filled file.
 Run all following commands inside the repository Linux devcontainer:
 
 ```bash
-python3 infra/azure/bootstrap.py config
-python3 infra/azure/bootstrap.py preflight
-python3 infra/azure/bootstrap.py provision
+npx --no-install tsx infra/azure/bootstrap.ts config
+npx --no-install tsx infra/azure/bootstrap.ts preflight
+npx --no-install tsx infra/azure/bootstrap.ts provision
 ```
+
+The orchestration and offline tests are native TypeScript on the repository's
+Node.js runtime, with no Python runtime dependency. `npm ci` installs the pinned
+`tsx` runner; `npx --no-install` never downloads an unpinned execution tool.
+Local reset custody uses Linux `flock` (provided by the devcontainer's
+`util-linux`) on an inherited descriptor held by Node until cleanup exits, so
+process death releases the lock without treating a stale PID file as ownership.
 
 `.env.azure` is generated privately with mode `0600`; it contains deterministic
 names, Kusto endpoint and canonical `abfss://` data/checkpoint roots. The runner
@@ -108,7 +115,7 @@ not proof that no delayed request can still mutate storage.
 
 ### Versioned control-plane implementation
 
-`publisher_control.PublisherControl` implements the internal Python transitions;
+`publisher_control.ts` exports `PublisherControl`, the native TypeScript transitions;
 it is deliberately not exposed as reset execution or protocol activation.
 The exact enforced states are `ready-v1`, `fenced-v1` and `cleaning-v1`. Legacy literal
 `ready`/`fenced` states are rejected by this implementation; old reset-aware
@@ -144,7 +151,7 @@ Bootstrap custody belongs to the single Rust child initializer that
 `fenced-v1`, released occupancy and an empty registry; its registration makes
 the registry non-empty, so a later cleanup claim fails. Cleanup and bootstrap
 claims therefore serialize through one container ETag and cannot both mutate.
-The Python parent never adopts the child's UUID. The child removes itself only
+The TypeScript parent never adopts the child's UUID. The child removes itself only
 after definitive physical drain; on failure or unknown drain it stays registered
 or uncertain and blocks the parent. The child never sets `ready-v1`. After a
 clean child exit the parent admits its own fresh UUID through the same bootstrap
@@ -163,7 +170,7 @@ possibly applied registration.
 #### Lease-guarded metadata compare-and-set
 
 Set Container Metadata accepts only `If-Modified-Since` as a condition, so an
-`If-Match` ETag is not a compare-and-set. Every protocol writer, Python and
+`If-Match` ETag is not a compare-and-set. Every protocol writer, TypeScript and
 Rust, uses this exact sequence instead:
 
 1. Acquire a 15-second container lease with a fresh proposed lease
@@ -175,7 +182,7 @@ Rust, uses this exact sequence instead:
 4. Release the lease best-effort; expiry bounds an unreleased lease.
 
 A container lease does not reject metadata writes that omit a lease ID, so the
-proof covers only cooperating writers. All Python lifecycle writes (provision
+proof covers only cooperating writers. All TypeScript lifecycle writes (provision
 fence, occupancy, stop and publisher transitions) use this path. Existing
 checkpoint containers are never rewritten by Bicep, and arbitrary older tools
 remain outside the proof and must be stopped. The lease serializes only the
@@ -225,10 +232,10 @@ live process will ever clean-release; `release`, `provision` and `reset` then
 refuse. The explicit operator escape hatch is:
 
 ```bash
-python3 infra/azure/bootstrap.py recover            # preview
-python3 infra/azure/bootstrap.py recover --execute  # stop local writers, fence, rotate
-python3 infra/azure/bootstrap.py reset --execute    # data written by the failed run is untrusted
-python3 infra/azure/bootstrap.py provision          # back to ready-v1
+npx --no-install tsx infra/azure/bootstrap.ts recover            # preview
+npx --no-install tsx infra/azure/bootstrap.ts recover --execute  # stop local writers, fence, rotate
+npx --no-install tsx infra/azure/bootstrap.ts reset --execute    # data written by the failed run is untrusted
+npx --no-install tsx infra/azure/bootstrap.ts provision          # back to ready-v1
 ```
 
 `recover --execute` requires the generation-bound local stop receipt, waits the
@@ -243,8 +250,8 @@ The test runner acquires shared occupancy before live tests and releases it only
 after its owned writers/consumers stop successfully:
 
 ```bash
-python3 infra/azure/bootstrap.py occupy --occupancy-id "$RUN_UUID"
-python3 infra/azure/bootstrap.py release --occupancy-id "$RUN_UUID" \
+npx --no-install tsx infra/azure/bootstrap.ts occupy --occupancy-id "$RUN_UUID"
+npx --no-install tsx infra/azure/bootstrap.ts release --occupancy-id "$RUN_UUID" \
   --reset-generation "$ARROWCOL_RESET_GENERATION"
 ```
 
@@ -287,13 +294,13 @@ Azure reads.
 
 ```bash
 # Preview only: no mutation.
-python3 infra/azure/bootstrap.py reset
+npx --no-install tsx infra/azure/bootstrap.ts reset
 # Fence, stop the local loadtest, quiesce 60s, delete databases and all blobs.
-python3 infra/azure/bootstrap.py reset --execute
+npx --no-install tsx infra/azure/bootstrap.ts reset --execute
 # Continue an interrupted cleanup from .env.azure.reset.json.
-python3 infra/azure/bootstrap.py reset --resume
+npx --no-install tsx infra/azure/bootstrap.ts reset --resume
 # Restore the declared baseline (ready-v1).
-python3 infra/azure/bootstrap.py provision
+npx --no-install tsx infra/azure/bootstrap.ts provision
 ```
 
 Execution verifies exact ownership, HNS, disabled retention, the exact database
@@ -412,8 +419,8 @@ The following describes the operator sequence behind `reset --execute` and
 | Tenant stream (sink and checkpoint) | `5dd2c85` | Shared admission across sink and checkpoint | Offline pass |
 | Azure copy/rename | `7307a94` | `azure_server_side_copy_is_unreachable` | Unsupported before I/O |
 | Collector replay | `8b82339`, `590a329` | Replay epoch fencing | Actual WAL drain **pending** |
-| Loadgen `initialize-azure` child | `89d3eee`, `9c01c6d`, `d618bb7` | `initialize_azure_dispatch` (6 missing/non-canonical expected-generation cases rejected before any I/O); debug-only `initialize_control` over the core `test-control` seam: shared 26-table body with stale-G/cleaning/ready/stopping/live-member refusal before any blob, drain before manifest, unknown write retains member; parent child-env, `initialize-delta.sh` argv, CLI parse and Python manifest/log validation composed (no Kusto) | Component offline pass; the release child process, its Azure control/data wire and `run_tree` handling remain **unverified until live Azure qualification** |
-| Python parent (bootstrap/reconcile/release/stop) | this directory | `test_bootstrap`, `test_publisher_control` | Offline pass |
+| Loadgen `initialize-azure` child | `89d3eee`, `9c01c6d`, `d618bb7` | `initialize_azure_dispatch` (6 missing/non-canonical expected-generation cases rejected before any I/O); debug-only `initialize_control` over the core `test-control` seam: shared 26-table body with stale-G/cleaning/ready/stopping/live-member refusal before any blob, drain before manifest, unknown write retains member; parent child-env, `initialize-delta.sh` argv, CLI parse and TypeScript manifest/log validation composed (no Kusto) | Component offline pass; the release child process, its Azure control/data wire and `run_tree` handling remain **unverified until live Azure qualification** |
+| TypeScript parent (bootstrap/reconcile/release/stop) | this directory | `bootstrap.test.ts`, `publisher_control.test.ts` | Offline pass |
 
 Offline passes are orchestration evidence only. Public enablement still
 requires the pending rows plus live qualification.
@@ -422,8 +429,8 @@ After live tests release occupancy, the lifecycle owner stops (never deletes)
 the cluster:
 
 ```bash
-python3 infra/azure/bootstrap.py stop
-python3 infra/azure/bootstrap.py stop --execute
+npx --no-install tsx infra/azure/bootstrap.ts stop
+npx --no-install tsx infra/azure/bootstrap.ts stop --execute
 ```
 
 The executing command waits until ARM reports `Stopped`. Reprovisioning starts a
@@ -435,7 +442,7 @@ stopped cluster under a registered member and waits for real Kusto readiness.
 npx nx run azure-infra:verify
 ```
 
-This runs offline Python safety tests and compiles Bicep with Azure CLI. It
+This runs strict TypeScript typechecking, native Node safety tests and compiles Bicep with Azure CLI. It
 needs no Azure identity and does not deploy. Live qualification is separate:
 provision twice, inspect all external-table/QAP policies, exercise reset and full
 rebootstrap, hand the ready sandbox to the cloud test owner, then stop after

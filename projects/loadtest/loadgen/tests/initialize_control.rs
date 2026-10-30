@@ -548,11 +548,12 @@ fn run_bounded(mut command: std::process::Command, dir: &Path, deadline: Duratio
     }
 }
 
-/// Runs the test-only Python driver of the real `bootstrap.py` parent and parses its JSON.
+/// Runs the test-only TypeScript driver of the real `bootstrap.ts` parent and parses its JSON.
 fn parent(dir: &Path, arguments: &[&std::ffi::OsStr]) -> Result<serde_json::Value> {
-    let mut command = std::process::Command::new("python3");
+    let mut command = std::process::Command::new("npx");
     command
-        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/parent_chain.py"))
+        .args(["--no-install", "tsx"])
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/parent_chain.ts"))
         .args(arguments)
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default());

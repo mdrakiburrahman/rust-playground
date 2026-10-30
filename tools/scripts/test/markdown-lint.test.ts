@@ -97,8 +97,9 @@ test('root lint retains Clippy dependencies and adds uncached Markdown checks', 
   assert.equal(scripts.targets['markdown-lint']?.cache, false);
   assert.equal(scripts.targets['markdown-lint-fix']?.cache, false);
   assert.deepEqual(scripts.targets['markdown-lint']?.options?.commands, [
-    'python3 -B -m unittest discover -s docs -p test_validate.py',
-    'python3 docs/validate.py',
+    'npx --no-install tsc --project docs/tsconfig.json',
+    'npx --no-install tsx --test docs/validate.test.ts',
+    'npx --no-install tsx docs/validate.ts',
     'npx --no-install markdownlint-cli2',
   ]);
   assert.equal(scripts.targets['markdown-lint']?.options?.parallel, false);

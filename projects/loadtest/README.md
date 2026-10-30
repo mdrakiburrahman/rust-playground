@@ -197,7 +197,7 @@ It stops this workspace's stack, then moves each unsealed attempt root intact
 to `.temp/loadtest-discarded/<timestamp>/` (nothing is deleted; sealed attempts
 stay in place). The next start then resets the Docker volumes as usual. It does
 not touch Azure: if an Azure attempt left occupancy or publisher registrations,
-use `infra/azure/bootstrap.py recover` as described in `infra/azure/README.md`.
+use `npx --no-install tsx infra/azure/bootstrap.ts recover` as described in `infra/azure/README.md`.
 
 ## Fenced Azure schema bootstrap
 
