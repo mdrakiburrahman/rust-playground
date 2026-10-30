@@ -1396,6 +1396,34 @@ struct GuardedStore {
     server_copy: bool,
 }
 
+async fn retry_read<T, F, Fut>(mut read: F) -> object_store::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = object_store::Result<T>>,
+{
+    for attempt in 0..3 {
+        match read().await {
+            Err(error) if attempt < 2 && transient_read(&error) => {
+                tracing::warn!(attempt = attempt + 1, "Retrying transient object-store read failure");
+                tokio::time::sleep(Duration::from_millis(100 << attempt)).await;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("bounded read loop returns its final result")
+}
+
+fn transient_read(error: &object_store::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(error) = source {
+        if let Some(error) = error.downcast_ref::<object_store_reqwest::Error>() {
+            return error.is_connect() || error.is_timeout() || error.is_request() || error.is_body();
+        }
+        source = error.source();
+    }
+    false
+}
+
 impl GuardedStore {
     fn require_server_copy(&self, operation: &str) -> object_store::Result<()> {
         if self.server_copy {
@@ -1454,7 +1482,8 @@ impl ObjectStore for GuardedStore {
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> object_store::Result<GetResult> {
-        self.inner.get_opts(location, options).await
+        // Retry only reads: replaying a mutation can leave an earlier attempt outstanding.
+        retry_read(|| self.inner.get_opts(location, options.clone())).await
     }
 
     /// One admission covers the whole stream; dropping it early is uncertain.
@@ -1598,6 +1627,70 @@ mod classify_tests {
             store: "MicrosoftAzure",
             source,
         }
+    }
+
+    #[tokio::test]
+    async fn transient_reads_retry_but_auth_failures_and_exhaustion_propagate() -> Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        drop(listener);
+        let client = object_store_reqwest::Client::new();
+        let calls = AtomicUsize::new(0);
+        let value = retry_read(|| {
+            let attempt = calls.fetch_add(1, Ordering::SeqCst);
+            let client = &client;
+            async move {
+                if attempt >= 2 {
+                    return Ok(42);
+                }
+                let error = client
+                    .get(format!("http://127.0.0.1:{port}/probe"))
+                    .send()
+                    .await
+                    .err()
+                    .context("closed port must refuse connection")
+                    .map_err(|error| generic(error.into()))?;
+                Err(generic(Box::new(error)))
+            }
+        })
+        .await?;
+        assert_eq!(value, 42);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        calls.store(0, Ordering::SeqCst);
+        let denied: object_store::Result<()> = retry_read(|| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async {
+                Err(object_store::Error::PermissionDenied {
+                    path: "private".into(),
+                    source: "authorization refused".into(),
+                })
+            }
+        })
+        .await;
+        assert!(matches!(denied, Err(object_store::Error::PermissionDenied { .. })));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        calls.store(0, Ordering::SeqCst);
+        let exhausted: object_store::Result<()> = retry_read(|| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let client = &client;
+            async move {
+                let error = client
+                    .get(format!("http://127.0.0.1:{port}/probe"))
+                    .send()
+                    .await
+                    .err()
+                    .context("closed port must refuse connection")
+                    .map_err(|error| generic(error.into()))?;
+                Err(generic(Box::new(error)))
+            }
+        })
+        .await;
+        assert!(exhausted.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        Ok(())
     }
 
     #[tokio::test]
