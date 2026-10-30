@@ -2,7 +2,7 @@
 
 `live-v1.schema.json` is the unchanged closed packet contract. `live_contract.py`
 validates it and supplies server-owned command-fence checks. `live_server.py`
-implements the bounded authenticated read-only HTTP transport; `live_runtime.py`
+implements the bounded authenticated HTTP transport, read-only by default; `live_runtime.py`
 projects an explicitly configured dedicated Linux/Docker runtime into it.
 These sources are not permission to connect live mutations. Transport tests use
 real HTTP with synthetic observations; observer source tests use a fake Engine.
@@ -179,13 +179,14 @@ Receipts, IO, queue and throughput observations remain explicitly missing in
 this first read-only projection. A router-hosted authority is represented once
 as its gateway resource, not duplicated into two CPU charges.
 
-All HTTP action capabilities and arming remain unsupported, `qualified:false`,
-even after the independent backend SQL/Delta gate passes: that gate does not
-qualify this bridge's executor. The frontend client must keep its independent
-mutation gate false until the corresponding real bridge/end-to-end acceptance.
+Without an explicit matching `--policy-proof`, all HTTP action capabilities and
+arming remain unsupported, `qualified:false`. The independent backend SQL/Delta
+gate alone never enables effects. The frontend client must keep its independent
+mutation gate false until the corresponding real bridge/browser acceptance.
 
 `live_executor.py` now supplies a serialized policy-effect core for exclusion
-and admission only; it is not wired to HTTP capabilities. It durably reserves
+and admission only. An explicitly qualified instance enables only those HTTP
+capabilities. It durably reserves
 normalized intent before mutation, rechecks freshness/arming after preflight,
 checks the exact execution resource and full writer, and uses the authority's
 atomic expected policy revision. Other desired policy fields are preserved;
@@ -196,9 +197,44 @@ public snapshot, not an unrelated native policy counter; completion additionally
 requires the exact-incarnation collector ACK. This is policy completion, not a
 claim about receipt/Delta completion.
 
-Separate direct real SQL/collector qualifications verified both policy controls,
-lost-response/ledger-reopen reconciliation, new-stream admission denial,
-exclusion/admission separation and exact ordinary Delta marker rows. Those
-proofs do not qualify authenticated HTTP effects, full bridge-process restart,
-other operations or independent bounded fault rollback. Those surfaces remain
-pending and disabled.
+Dispatch has one global effect slot and one worker; another operation is rejected
+before reservation, not silently queued. An authorized duplicate of the same
+intent can read its existing record while that slot is occupied. HTTP submission
+returns the durable state without waiting for SQL or ACKs. Reconciliation GET
+schedules bounded reads only. Unexpected worker failure remains unknown and
+disables new effects. The final effect check uses the current server session and
+snapshot, not a copied arm: logout, disarm, expiry, replacement, gaps and reload
+during preflight can prevent the effect. Resource identity checks do not wait
+for optional CPU/memory telemetry. An observation revision may legitimately
+advance between reads and selection/arm/command; a typed stale pre-effect denial
+requires a fresh snapshot, not relaxed fencing or replay of uncertain work.
+
+Separate direct real SQL/collector qualification binds the exact executor,
+ledger, guard/schema sources, seven native binaries and immutable local images.
+Actual HTTP qualification subsequently verified all four policy mutations and
+collector ACKs, admission denial before receipt, exclusion preserving owned-table
+streams and nine exact ordinary Delta rows. It deliberately discarded an HTTP
+response, interrupted the native response after SQL mutation, killed the actual
+bridge process and reconciled the original durable ID after process restart,
+without a second policy mutation. That is API acceptance, not browser mutation
+acceptance or receipt-feed qualification.
+
+`live_deployment.py` saves an owner-only, no-overwrite, fsynced ownership manifest
+and acquires an exclusive process lease. Explicit `--resume` requires the same
+deployment/subnet/arm, exact created container IDs/start identities/images,
+unchanged qualified local binaries, authority binding and matching policy proof
+when effects are requested. It never discovers or adopts similarly named
+containers. Credentials remain in the private role configuration. Deployment
+identity survives restart; bridge identity, grants, sessions, selection and arm
+do not. The durable ledger persists snapshot revision watermarks, including
+compare-and-set publication, so applied/requested revisions do not regress after
+restart. Fresh observation is still required before support or arming.
+
+The Linux launcher requires `umask 022` or equivalent native bind-directory
+permissions; the evidence root itself remains owner-only. Normal shutdown
+closes the observer/executor/ledger and stops only the exact owned deployment.
+`--retain-runtime-on-stop` is an explicit bounded restart facility, not the
+default and not a fault rollback supervisor. Faults, repair, workload, replica
+changes, retirement and migration remain unsupported. Independent bounded fault
+rollback and live receipt/physical Delta observation remain unfinished; neither
+HTTP policy acceptance nor full-process restart qualifies those surfaces.

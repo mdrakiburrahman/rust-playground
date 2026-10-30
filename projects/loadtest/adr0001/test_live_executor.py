@@ -2,6 +2,7 @@
 import copy
 from pathlib import Path
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -39,6 +40,7 @@ class PolicyExecutorTests(unittest.TestCase):
         self.executor = PolicyExecutor(self.ledger, self.post, lambda _: self.current_resource, self.snapshot)
 
     def tearDown(self):
+        self.executor.close()
         self.ledger.close()
         self.directory.cleanup()
 
@@ -90,6 +92,7 @@ class PolicyExecutorTests(unittest.TestCase):
     def test_lost_response_and_ledger_reopen_never_replay_effect(self):
         self.lose_response = True
         self.assertEqual(self.apply()["status"], "unknown")
+        self.executor.close()
         self.ledger.close()
         self.ledger = OperationLedger(self.path)
         self.executor = PolicyExecutor(self.ledger, self.post, lambda _: self.current_resource, self.snapshot)
@@ -147,6 +150,58 @@ class PolicyExecutorTests(unittest.TestCase):
         self.assertEqual(guard.call_count, 2)
         self.assertEqual((result["status"], result["error_code"]), ("rejected", "disarmed"))
         self.assertEqual(self.policy_calls, [])
+
+    def test_async_submission_has_one_slot_and_never_queues_extra_effects(self):
+        entered, release = threading.Event(), threading.Event()
+        original = self.post
+        def held(operation):
+            if operation["op"] == "view" and not entered.is_set():
+                entered.set()
+                if not release.wait(2):
+                    raise TimeoutError("synthetic blocked preflight")
+            return original(operation)
+        self.executor.post = held
+        result = self.executor.submit(self.command, self.fence, self.session, self.session.allowed_origin)
+        self.assertIn(result["status"], ("requested", "pending"))
+        self.assertTrue(entered.wait(2))
+        extra = copy.deepcopy(self.command)
+        extra["operation_id"] = "operation-2"
+        try:
+            replay = self.executor.submit(self.command, self.fence, self.session, self.session.allowed_origin)
+            self.assertEqual(replay["operation_id"], self.command["operation_id"])
+            different = copy.deepcopy(self.command)
+            different["action"]["enabled"] = False
+            with self.assertRaisesRegex(Denial, "conflict"):
+                self.apply(different)
+            with self.assertRaisesRegex(Denial, "limit"):
+                self.apply(extra)
+        finally:
+            release.set()
+        self.assertTrue(self.executor.lock.acquire(timeout=2))
+        self.executor.lock.release()
+        self.assertEqual(len(self.policy_calls), 1)
+        with self.assertRaisesRegex(Denial, "unknown-operation"):
+            self.ledger.get("operation-2", self.deployment)
+
+    def test_unexpected_worker_failure_is_visible_unknown_and_disables_new_effects(self):
+        def failed(_):
+            raise AssertionError("private-synthetic-diagnostic")
+        self.executor.post = failed
+        with patch("builtins.print") as output:
+            self.executor.submit(self.command, self.fence, self.session, self.session.allowed_origin)
+            self.executor.pool.shutdown(wait=True)
+            result = self.ledger.get("operation-1", self.deployment)
+        self.assertTrue(self.executor.failed.is_set())
+        self.assertEqual((result["status"], result["error_code"]), ("unknown", "failed"))
+        self.assertNotIn("private-synthetic-diagnostic", str(output.call_args_list))
+        with self.assertRaisesRegex(Denial, "disconnected"):
+            self.apply()
+
+    def test_native_revision_bound_denies_before_durable_reservation(self):
+        self.target["policy_revision"] = str(2**63 - 1)
+        with self.assertRaisesRegex(Denial, "limit"):
+            self.apply()
+        self.assertEqual(self.ledger.unresolved(), [])
 
 
 if __name__ == "__main__":

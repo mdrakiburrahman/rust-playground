@@ -95,6 +95,26 @@ class OperationLedgerTests(unittest.TestCase):
         with self.assertRaisesRegex(Denial, "invalid"):
             self.ledger.advance("operation-1", self.deployment, "completed")
 
+    def test_snapshot_revision_survives_reopen_and_rejects_competing_publishers(self):
+        self.assertEqual(self.ledger.bind_deployment(self.deployment), 0)
+        self.ledger.publish_revision(self.deployment, 0, 1)
+        self.ledger.close()
+        self.ledger = OperationLedger(self.path)
+        self.assertEqual(self.ledger.bind_deployment(self.deployment), 1)
+        with self.assertRaisesRegex(Denial, "conflict"):
+            self.ledger.publish_revision(self.deployment, 0, 1)
+        with self.assertRaisesRegex(Denial, "wrong-target"):
+            self.ledger.bind_deployment({**self.deployment, "incarnation": "replacement"})
+        self.ledger.publish_revision(self.deployment, 1, 2)
+
+    def test_existing_operations_seed_revision_watermark_without_replaying(self):
+        self.ledger.reserve(self.command)
+        self.ledger.advance("operation-1", self.deployment, "pending")
+        self.ledger.advance("operation-1", self.deployment, "applied", "9")
+        self.assertEqual(self.ledger.bind_deployment(self.deployment), 9)
+        self.ledger.publish_revision(self.deployment, 9, 10)
+        self.assertEqual(self.ledger.get("operation-1", self.deployment)["status"], "applied")
+
 
 if __name__ == "__main__":
     unittest.main()

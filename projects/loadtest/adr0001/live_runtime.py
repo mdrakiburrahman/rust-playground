@@ -1,4 +1,4 @@
-"""Explicit single-deployment Linux/Docker observation host; no browser effects."""
+"""Explicit single-deployment host; read-only unless matching policy proof is supplied."""
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
@@ -18,11 +18,14 @@ import urllib.request
 from jsonschema.exceptions import ValidationError
 
 from delta_runtime import Runtime
+from delta_benchmark import BINARIES
 from live_contract import Denial, RESPONSE_BYTES
+from live_deployment import AttachedRuntime, DeploymentLease, deployment_root, save_deployment
+from live_executor import PolicyExecutor
 from live_ledger import OperationLedger
 from live_server import BoundedHTTPServer, Bridge
 from observation import Engine
-from publication_gate import RUNTIME_IMAGE, SQL_IMAGE
+from publication_gate import REPO, RUNTIME_IMAGE, SQL_IMAGE
 
 
 def require_local_images():
@@ -34,6 +37,42 @@ def require_local_images():
         if (result.returncode != 0 or not re.fullmatch(r"sha256:[a-f0-9]{64}", result.stdout.strip())
                 or image.startswith("sha256:") and result.stdout.strip() != image):
             raise ValueError("qualified local image unavailable; bridge never pulls images")
+
+
+def verify_policy_proof(path):
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("policy qualification must be a regular local artifact")
+    with path.open("rb") as stream:
+        raw = stream.read(262145)
+    if len(raw) > 262144:
+        raise ValueError("policy qualification artifact exceeds bound")
+    proof = json.loads(raw)
+    if not isinstance(proof, dict) or not all(
+        type(proof.get(name)) is int for name in (
+            "server_exit_code", "exact_owned_containers_stopped", "native_policy_mutations",
+            "ordinary_delta_exact_marker_rows")
+    ) or not isinstance(proof.get("source_sha256"), dict) or not isinstance(
+        proof.get("shared_binaries"), dict
+    ) or not (
+        proof.get("server_exit_code") == 0 and proof.get("exact_owned_containers_stopped") == 8
+        and proof.get("native_policy_mutations") == 4 and proof.get("ordinary_delta_exact_marker_rows") == 9
+        and all(proof.get(name) is True for name in (
+            "lost_response_reconciled_without_replay", "ledger_reopen",
+            "admission_rejected_new_stream_before_receipt", "exclusion_did_not_block_owned_table_streams",
+            "stale_policy_and_wrong_resource_denied"))
+        and proof.get("sql_image") == SQL_IMAGE and proof.get("runtime_image") == RUNTIME_IMAGE
+    ):
+        raise ValueError("policy qualification evidence is incomplete")
+    for name in ("live_executor.py", "live_ledger.py", "live_contract.py", "contracts/live-v1.schema.json"):
+        expected = proof.get("source_sha256", {}).get(name)
+        if expected != hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest():
+            raise ValueError("policy qualification source mismatch")
+    for name in BINARIES:
+        if proof.get("shared_binaries", {}).get(name) != hashlib.sha256(
+            (REPO / "target/debug" / name).read_bytes()
+        ).hexdigest():
+            raise ValueError("policy qualification binary mismatch")
+    return hashlib.sha256(raw).hexdigest()
 
 
 def writer_alias(writer):
@@ -66,7 +105,7 @@ class RuntimeObserver:
                 raise ValueError("authority observation exceeds bound")
             return json.loads(data)
 
-    def component(self, item):
+    def component(self, item, with_stats=True):
         role, name = item
         identity = self.runtime.owned_container(name)
         state = self.engine.get(f"/containers/{identity}/json")
@@ -78,7 +117,7 @@ class RuntimeObserver:
         resource = {"id": "resource-" + role,
                     "incarnation": hashlib.sha256((identity + state["State"]["StartedAt"]).encode()).hexdigest()}
         stats = None
-        if state["State"]["Running"]:
+        if state["State"]["Running"] and with_stats:
             stats = self.engine.get(f"/containers/{identity}/stats?stream=false&one-shot=true")
         return role, resource, state["State"]["Running"], stats, time.monotonic_ns()
 
@@ -211,6 +250,11 @@ def main():
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--frontend-root", type=Path, required=True)
     parser.add_argument("--bootstrap-file", type=Path, required=True)
+    parser.add_argument("--policy-proof", type=Path,
+                        help="explicit matching direct-policy qualification; omitted means read-only")
+    parser.add_argument("--resume", action="store_true", help="attach only the saved exact owned deployment")
+    parser.add_argument("--retain-runtime-on-stop", action="store_true",
+                        help="leave the verified owned runtime running after a normal bridge stop for bounded restart")
     args = parser.parse_args()
     if not 1024 <= args.port <= 65535:
         raise ValueError("loopback port bound")
@@ -220,8 +264,11 @@ def main():
     if args.bootstrap_file.resolve().is_relative_to(frontend):
         raise ValueError("bootstrap material must remain outside static files")
     require_local_images()
-    runtime = Runtime(args.project, args.subnet, args.arm, "sql")
-    ledger, observer, server = None, None, None
+    policy_proof = verify_policy_proof(args.policy_proof) if args.policy_proof is not None else None
+    deployment_root(args.project)
+    runtime = lease = None
+    ledger, observer, server, executor = None, None, None, None
+    served = False
     def stop(*_):
         if server is None:
             raise InterruptedError("live bridge startup interrupted")
@@ -229,15 +276,36 @@ def main():
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     try:
-        runtime.root.chmod(0o700)
-        runtime.setup_runtime()
+        if args.resume:
+            lease = DeploymentLease(deployment_root(args.project))
+            runtime = AttachedRuntime(args.project, args.subnet, args.arm, policy_proof)
+        else:
+            mask = os.umask(0)
+            os.umask(mask)
+            if mask & 0o055:
+                raise ValueError("dedicated native bind directories require umask 022 or equivalent")
+            runtime = Runtime(args.project, args.subnet, args.arm, "sql")
+            runtime.root.chmod(0o700)
+            lease = DeploymentLease(runtime.root)
+            runtime.setup_runtime()
         if runtime.root.resolve().is_relative_to(frontend):
             raise ValueError("runtime secrets must remain outside static files")
         ledger = OperationLedger(runtime.root / "bridge-operations.sqlite")
-        deployment = {"id": args.project, "incarnation": secrets.token_hex(16)}
+        deployment = (runtime.deployment if args.resume else
+                      {"id": args.project, "incarnation": secrets.token_hex(16)})
         bridge = Bridge(f"http://127.0.0.1:{args.port}", deployment, args.frontend_root, ledger)
-        server = BoundedHTTPServer(("127.0.0.1", args.port), bridge)
+        if not args.resume:
+            save_deployment(runtime, deployment, policy_proof)
         observer = RuntimeObserver(runtime, bridge)
+        if args.policy_proof is not None:
+            def resource(collector):
+                if collector not in runtime.config["collectors"] or collector not in runtime.names:
+                    raise Denial("wrong-target")
+                _, identity, running, _, _ = observer.component((collector, runtime.names[collector]), with_stats=False)
+                return identity if running else None
+            executor = PolicyExecutor(ledger, runtime.post, resource, bridge.snapshot)
+            bridge.executor = executor
+        server = BoundedHTTPServer(("127.0.0.1", args.port), bridge)
         observer.start()
         descriptor = os.open(args.bootstrap_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
         try:
@@ -246,8 +314,10 @@ def main():
         finally:
             os.close(descriptor)
 
-        print("authenticated read-only local bridge ready; private bootstrap file written", flush=True)
+        print("authenticated local bridge ready; private bootstrap file written; policy effects "
+              + ("explicitly configured" if executor is not None else "disabled"), flush=True)
         server.serve_forever(poll_interval=0.25)
+        served = True
     finally:
         if server is not None:
             server.server_close()
@@ -256,10 +326,23 @@ def main():
                 observer.close()
         finally:
             try:
-                if ledger is not None:
-                    ledger.close()
+                if executor is not None:
+                    executor.close()
             finally:
-                runtime.finish_runtime()
+                try:
+                    if ledger is not None:
+                        ledger.close()
+                finally:
+                    try:
+                        if runtime is not None:
+                            if served and args.retain_runtime_on_stop:
+                                if not args.resume:
+                                    runtime.executor.shutdown(wait=True, cancel_futures=True)
+                            else:
+                                runtime.finish_runtime()
+                    finally:
+                        if lease is not None:
+                            lease.close()
 
 
 if __name__ == "__main__":

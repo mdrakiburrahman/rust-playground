@@ -1,5 +1,7 @@
 """Source observer projection tests; fake Engine transport, not real qualification."""
 import copy
+import hashlib
+import json
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -48,6 +50,15 @@ class RuntimeProjectionTests(unittest.TestCase):
             "coverage": {"complete": False, "missing": missing,
                          "dropped": self.bridge.publish.call_args.kwargs.get("dropped", 0)},
         })
+
+    def test_effect_identity_probe_does_not_wait_for_telemetry(self):
+        original = self.observer.engine.get
+        self.observer.engine.get = Mock(side_effect=original)
+        _, _, running, stats, _ = self.observer.component(("collector1", "collector1"), with_stats=False)
+        self.assertTrue(running)
+        self.assertIsNone(stats)
+        self.assertEqual(len(self.observer.engine.get.call_args_list), 1)
+        self.assertTrue(self.observer.engine.get.call_args.args[0].endswith("/json"))
 
     def test_counters_and_missing_receipts_are_explicit_and_bounded(self):
         self.observer.sample()
@@ -165,10 +176,26 @@ class RuntimeProjectionTests(unittest.TestCase):
                          "--bootstrap-file", str(root / "private-bootstrap")]
             with patch.object(live_runtime, "Runtime", return_value=runtime), \
                     patch.object(live_runtime, "require_local_images"), \
+                    patch.object(live_runtime.os, "umask", return_value=0o022), \
                     patch.object(live_runtime.signal, "signal"), patch("sys.argv", arguments), \
                     self.assertRaisesRegex(RuntimeError, "bounded startup failure"):
                 live_runtime.main()
             runtime.finish_runtime.assert_called_once_with()
+
+    def test_restrictive_umask_is_rejected_before_native_runtime_creation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "index.html").write_text("test")
+            arguments = ["live_runtime", "--project", "publication-gate-test", "--subnet", "10.235.180.0/24",
+                         "--arm", "adr", "--port", "18765", "--frontend-root", str(root),
+                         "--bootstrap-file", str(root.parent / (root.name + "-bootstrap"))]
+            with patch.object(live_runtime, "Runtime") as runtime, \
+                    patch.object(live_runtime, "require_local_images"), \
+                    patch.object(live_runtime.os, "umask", return_value=0o077), \
+                    patch.object(live_runtime.signal, "signal"), patch("sys.argv", arguments), \
+                    self.assertRaisesRegex(ValueError, "umask 022"):
+                live_runtime.main()
+            runtime.assert_not_called()
 
     def test_explicit_local_image_pins_prevent_implicit_legacy_image_pulls(self):
         sql = "sha256:" + "a" * 64
@@ -187,6 +214,40 @@ class RuntimeProjectionTests(unittest.TestCase):
                 run.return_value = SimpleNamespace(returncode=0, stdout=sql + "\n")
                 live_runtime.require_local_images()
             self.assertTrue(all(call.args[0][:3] == ["docker", "image", "inspect"] for call in run.call_args_list))
+
+    def test_policy_enablement_requires_matching_bounded_real_proof_identities(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "target/debug").mkdir(parents=True)
+            binary = root / "target/debug/qualified-binary"
+            binary.write_bytes(b"synthetic qualified binary")
+            sources = Path(live_runtime.__file__).parent
+            proof = {
+                "server_exit_code": 0, "exact_owned_containers_stopped": 8, "native_policy_mutations": 4,
+                "ordinary_delta_exact_marker_rows": 9, "lost_response_reconciled_without_replay": True,
+                "ledger_reopen": True, "admission_rejected_new_stream_before_receipt": True,
+                "exclusion_did_not_block_owned_table_streams": True, "stale_policy_and_wrong_resource_denied": True,
+                "sql_image": live_runtime.SQL_IMAGE, "runtime_image": live_runtime.RUNTIME_IMAGE,
+                "source_sha256": {name: hashlib.sha256((sources / name).read_bytes()).hexdigest()
+                                  for name in ("live_executor.py", "live_ledger.py", "live_contract.py",
+                                               "contracts/live-v1.schema.json")},
+                "shared_binaries": {"qualified-binary": hashlib.sha256(binary.read_bytes()).hexdigest()},
+            }
+            path = root / "proof.json"
+            with patch.object(live_runtime, "REPO", root), patch.object(live_runtime, "BINARIES", ("qualified-binary",)):
+                path.write_text(json.dumps(proof))
+                self.assertEqual(live_runtime.verify_policy_proof(path), hashlib.sha256(path.read_bytes()).hexdigest())
+                for field, invalid in (("server_exit_code", False), ("native_policy_mutations", 0),
+                                       ("ledger_reopen", False), ("sql_image", "foreign"),
+                                       ("source_sha256", {}), ("shared_binaries", {})):
+                    changed = copy.deepcopy(proof)
+                    changed[field] = invalid
+                    path.write_text(json.dumps(changed))
+                    with self.subTest(field=field), self.assertRaises(ValueError):
+                        live_runtime.verify_policy_proof(path)
+                path.write_bytes(b"x" * 262145)
+                with self.assertRaisesRegex(ValueError, "exceeds bound"):
+                    live_runtime.verify_policy_proof(path)
 
 
 if __name__ == "__main__":

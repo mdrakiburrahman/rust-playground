@@ -596,3 +596,89 @@ list, passed **107 tests** in 4.550 seconds. No bridge or native workload is lef
 running. The source remains an unfinished checkpoint: HTTP policy dispatch,
 durable full-process restart and independent fault supervision must be qualified
 before enabling the corresponding controls.
+
+### Guarded HTTP policies and actual bridge-process restart
+
+The policy executor now has a single bounded asynchronous slot, same-ID intent
+inspection while busy, read-only reconciliation and explicit unknown/fail-stop
+outcomes. The final pre-effect check consults the live server session, not a
+copied arm; a disarm during blocked preflight prevents native mutation. Default
+startup is still read-only. Only an explicit bounded direct qualification proof
+matching the current core/schema, seven binaries and immutable images enables
+admission/exclusion. All other operations remain unsupported.
+
+New private deployment ownership manifests use exclusive hard-link publication,
+file/directory fsync and an exclusive process lease. Explicit resume checks exact
+container IDs, start identities, images, binary bytes and authority binding,
+without recreating/adopting containers. Deployment identity and the ledger's
+snapshot revision watermark persist; bridge identity and browser authority do
+not. Rebinding after a crash permits TIME_WAIT reuse but never a second active
+listener. The ordinary launcher stops exact owned resources; retaining them for
+a bounded restart requires an explicit option.
+
+The expanded source suite passed **139 tests** with:
+`python -B -m unittest discover -p "test_*.py"`, including the Flight client
+tests. Their old CPU fixture was updated to the already-qualified observer-local
+monotonic clock contract: reset/duplicate/cross-clock intervals explicitly
+raise, never return fabricated zero/complete coverage. No measured observer
+source, cohort, canonical contract bytes or native binaries changed.
+
+Historical attempts remain distinct:
+
+- Direct `live-policy3` startup failed because an inherited private umask made
+  the native bind directory untraversable by collector UID 21001; every created
+  resource was verified nonrunning. The regular launcher now rejects that
+  umask before runtime creation. A unit run under that umask also failed its
+  then-unadapted startup fixture; it was not a runtime correctness result.
+- `live-policy4` passed against its own earlier source snapshot. It is not the
+  final core proof after the in-flight duplicate/revision-watermark changes.
+- Frozen `bridge-eec969a5-policy-v5` passed 71 native-boundary tests and direct
+  `live-policy5` passed four real policy mutations/ACKs, deliberate response
+  loss and ledger reopen, admission/exclusion separation, exact nine Delta rows
+  and all eight owned containers stopped. Its proof SHA-256 is
+  `e8131f7d1f7f170cc2dddc0f9e10b9e4544edc096505f6460a2c06a4afc52fe3`.
+- HTTP `live-http1` reached real SQL mutation and process crash but failed
+  immediate listener rebinding; all eight resources stopped. HTTP `live-http2`
+  failed the qualification driver's incorrect assumption that selection cannot
+  receive a typed stale response during real observation; all eight stopped.
+  Neither is relabeled as an end-to-end pass.
+
+`bridge-eec969a5-http-v3` preserves the final sources separately from measurement.
+The same HTTP source passed 74 native bridge tests. Its actual
+`publication-gate-eec969a5-live-http3` qualification exited **0**:
+
+- Actual authenticated HTTP enabled exactly admission/exclusion and rejected
+  wrong-resource and CSRF requests before effects.
+- The client discarded the command response. After the real SQL policy write,
+  a qualification-only response interruption held the worker; exact-PID SIGKILL
+  produced exit **-9**. The admission block rejected a real new Flight input
+  before any receipt.
+- A new real bridge process attached the same exact running deployment, issued
+  new browser authority, rejected the old session and preserved a strictly
+  advancing snapshot watermark. GET of the original operation completed without
+  replay: native revision remained exactly 1.
+- Three further HTTP policies completed with real collector ACKs. Existing
+  owned-table ingestion remained possible during exclusion. Four total native
+  mutations and nine exact ordinary Delta marker rows were independently read.
+- Two genuine pre-effect stale outcomes (selection and arm) are retained in the
+  proof; bounded resnapshot handling did not relax a fence or replay uncertain
+  work.
+- Final graceful bridge exit was **0**; all eight exact owned containers stopped
+  and loopback port 18769 closed. No grants/credentials were exported and no
+  frontend mutation gate changed.
+
+Sanitized session artifacts are `files/live-http3-qualification.json`, physical
+SHA-256 `6142f2770a9947ba2a0e87ea008a4607b265ce825d1ff477114d52c402b72d09`,
+and `files/live-http3-source-sha256.json`, physical SHA-256
+`ade16eb4f51d56eaf99a027d6df75f4274fed661b391286ae26708226a01389c`.
+The executed scripts are separately preserved as
+`qualify-policy-executor-v5.py`, `qualify-http-policy-v3.py` and
+`qualify-http-policy-child-v1.py`. Each real job used an outer 600-second
+timeout and a new isolated deployment; the frozen benchmark remained untouched.
+
+This is not full Phase2. Actual browser mutation acceptance, bounded live
+receipt/physical-Delta feeds, workload presets and independent bounded fault
+rollback/repair remain unfinished. Replica, retirement and migration are also
+unsupported; the native migration API still lacks the required atomic browser
+expected-epoch fence. Keep frontend `mutationGate=false` until corresponding
+server and real browser gates pass. No bridge/runtime is currently running.

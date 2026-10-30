@@ -38,6 +38,10 @@ class OperationLedger:
             "CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, digest TEXT NOT NULL, "
             "intent TEXT NOT NULL, result TEXT NOT NULL)"
         )
+        self.connection.execute(
+            "CREATE TABLE IF NOT EXISTS bridge_state (id INTEGER PRIMARY KEY CHECK(id=1), "
+            "deployment TEXT NOT NULL, revision TEXT NOT NULL)"
+        )
         directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
             os.fsync(directory)
@@ -47,6 +51,43 @@ class OperationLedger:
     def close(self):
         with self.lock:
             self.connection.close()
+
+    def bind_deployment(self, deployment):
+        serialized = json.dumps(deployment, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        with self.lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self.connection.execute("SELECT deployment,revision FROM bridge_state WHERE id=1").fetchone()
+                if row is not None:
+                    if row[0] != serialized:
+                        raise Denial("wrong-target")
+                    revision = int(row[1])
+                else:
+                    revision = 0
+                    for stored, in self.connection.execute("SELECT result FROM operations LIMIT 256").fetchall():
+                        result = json.loads(stored)
+                        if result["deployment"] != deployment:
+                            raise Denial("wrong-target")
+                        revision = max(revision, int(result["requested_revision"]),
+                                       int(result["applied_revision"] or "0"))
+                    self.connection.execute("INSERT INTO bridge_state VALUES (1,?,?)", (serialized, str(revision)))
+                self.connection.execute("COMMIT")
+                return revision
+            except BaseException:
+                self.connection.execute("ROLLBACK")
+                raise
+
+    def publish_revision(self, deployment, previous, revision):
+        if revision != previous + 1 or revision >= 10**20:
+            raise Denial("limit")
+        serialized = json.dumps(deployment, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        with self.lock:
+            updated = self.connection.execute(
+                "UPDATE bridge_state SET revision=? WHERE id=1 AND deployment=? AND revision=?",
+                (str(revision), serialized, str(previous)),
+            )
+            if updated.rowcount != 1:
+                raise Denial("conflict")
 
     def reserve(self, command):
         """Caller must authenticate/fence new work before reserving; no effects here."""

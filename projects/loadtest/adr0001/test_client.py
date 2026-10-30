@@ -132,12 +132,18 @@ class Retention(unittest.TestCase):
                          read_ns("2026-10-26T16:47:01.263397965+00:00"), 1)
         self.assertEqual(read_ns("2026-10-26T16:47:01.263Z") -
                          read_ns("2026-10-26T16:47:01Z"), 263_000_000)
-        previous = {"engine_read_ns": 1_000_000_000, "cpu_total_usage_ns": 700}
-        current = {"engine_read_ns": 2_000_000_000, "cpu_total_usage_ns": 500_000_700}
+        previous = {"observed_monotonic_ns": 1_000_000_000, "observer_clock_id": "observer-test",
+                    "cpu_total_usage_ns": 700}
+        current = {"observed_monotonic_ns": 2_000_000_000, "observer_clock_id": "observer-test",
+                   "cpu_total_usage_ns": 500_000_700}
         self.assertEqual(cpu_interval(previous, current)["one_core_percent"], 50)
         self.assertIsNone(cpu_interval(None, current))
-        self.assertIsNone(cpu_interval(current, current))
-        self.assertIsNone(cpu_interval(current, {"engine_read_ns": 3_000_000_000, "cpu_total_usage_ns": 0}))
+        with self.assertRaisesRegex(ValueError, "counter/clock"):
+            cpu_interval(current, current)
+        with self.assertRaisesRegex(ValueError, "counter/clock"):
+            cpu_interval(current, {**current, "observed_monotonic_ns": 3_000_000_000, "cpu_total_usage_ns": 0})
+        with self.assertRaisesRegex(ValueError, "crosses observer clocks"):
+            cpu_interval(previous, {**current, "observer_clock_id": "foreign-observer"})
 
 
 if __name__ == "__main__":

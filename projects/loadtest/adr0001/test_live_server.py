@@ -1,5 +1,6 @@
 """Real bounded HTTP transport with synthetic observations, not live Docker acceptance."""
 import http.client
+import copy
 import json
 from pathlib import Path
 import tempfile
@@ -11,6 +12,7 @@ from unittest.mock import patch
 from jsonschema.exceptions import ValidationError
 
 from live_contract import Denial, validate_packet
+from live_executor import PolicyExecutor
 from live_ledger import OperationLedger
 from live_server import BoundedHTTPServer, Bridge
 
@@ -37,6 +39,8 @@ class LiveHTTPTests(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=3)
+        if self.bridge.executor is not None:
+            self.bridge.executor.close()
         self.ledger.close()
         self.directory.cleanup()
 
@@ -99,6 +103,174 @@ class LiveHTTPTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertFalse(packet["armed"])
         return packet
+
+    def enable_policy(self):
+        self.writer = {"collector": "collector1", "process": "process-1", "generation": "generation-1"}
+        self.replica = {
+            "resource": {"id": "resource-collector1", "incarnation": "resource-1"},
+            "writer": self.writer, "role": "collector", "status": "active",
+            "policy_revision": "0", "applied_policy_revision": "0",
+            "excluded": False, "block_streams": False, "retiring": False,
+        }
+        state = {"members": [{"writer": self.writer}], "policies": {}}
+        self.policy_calls = []
+        def post(operation):
+            if operation["op"] == "view":
+                return copy.deepcopy(state)
+            self.policy_calls.append(copy.deepcopy(operation))
+            revision = operation["revision"] + 1
+            state["policies"]["collector1"] = {
+                "revision": revision, "applied_revision": revision, "incarnation": self.writer,
+                "operation": operation["operation"], "approved": False,
+                **{name: operation[name] for name in ("excluded", "block_streams", "retiring")},
+            }
+            self.replica.update(policy_revision=str(revision), applied_policy_revision=str(revision),
+                                **{name: operation[name] for name in ("excluded", "block_streams", "retiring")})
+            self.bridge.publish([copy.deepcopy(self.replica)], [], [], [], ["synthetic-observation"])
+            return {}
+        self.bridge.publish([copy.deepcopy(self.replica)], [], [], [], ["synthetic-observation"])
+        self.bridge.executor = PolicyExecutor(
+            self.ledger, post, lambda _: self.replica["resource"], self.bridge.snapshot)
+
+    def arm_policy(self):
+        selection = self.selection()
+        status, packet, _ = self.request("POST", "/api/live/v1/arm", {
+            "kind": "arm", "schema_version": 1, "selection_id": selection["selection_id"],
+            "deployment": self.deployment, "revision": str(self.bridge.revision), "confirm": "dedicated-local-poc",
+        })
+        self.assertEqual(status, 200)
+        return packet
+
+    def policy_command(self, armed):
+        return {
+            "kind": "command", "schema_version": 1, "operation_id": "policy-operation",
+            "selection_id": armed["selection_id"], "arm_id": armed["arm_id"],
+            "deployment": self.deployment, "revision": str(self.bridge.revision),
+            "action": {"operation": "admission", "enabled": True, "target": {
+                "resource": copy.deepcopy(self.replica["resource"]), "writer": self.writer,
+                "policy_revision": self.replica["policy_revision"],
+            }},
+        }
+
+    def test_guarded_policy_http_is_individually_supported_and_reconciles(self):
+        self.enable_policy()
+        self.bootstrap()
+        _, caps, _ = self.request("GET", "/api/live/v1/capabilities")
+        validate_packet(caps)
+        self.assertEqual({item["operation"] for item in caps["operations"] if item["supported"]},
+                         {"admission", "exclusion"})
+        armed = self.arm_policy()
+        command = self.policy_command(armed)
+        status, result, _ = self.request("POST", "/api/live/v1/commands", command)
+        self.assertEqual(status, 200)
+        validate_packet(result)
+        for _ in range(4):
+            time.sleep(0.1)
+            status, result, _ = self.request("GET", "/api/live/v1/operations/policy-operation")
+            self.assertEqual(status, 200)
+            if result["status"] == "completed":
+                break
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(len(self.policy_calls), 1)
+        self.assertNotEqual(result["requested_revision"], result["applied_revision"])
+        self.request("POST", "/api/live/v1/disarm",
+                     {"kind": "disarm", "schema_version": 1, "selection_id": armed["selection_id"]})
+        _, original, _ = self.request("GET", "/api/live/v1/operations/policy-operation")
+        self.assertEqual(original, result)
+
+    def test_guarded_policy_http_checks_csrf_and_arm_deadline_before_reservation(self):
+        self.enable_policy()
+        self.bootstrap()
+        armed = self.arm_policy()
+        command = self.policy_command(armed)
+        status, packet, _ = self.request("POST", "/api/live/v1/commands", command,
+                                         {"X-Arrowcol-CSRF": "invalid"})
+        self.assertEqual((status, packet["code"]), (403, "csrf"))
+        for session in self.bridge.sessions.values():
+            session.arm_deadline_ns = 0
+        status, packet, _ = self.request("POST", "/api/live/v1/commands", command)
+        self.assertEqual((status, packet["code"]), (403, "disarmed"))
+        self.assertEqual(self.ledger.unresolved(), [])
+        self.assertEqual(self.policy_calls, [])
+
+    def test_session_resume_and_unobserved_gap_clear_server_arm(self):
+        self.enable_policy()
+        self.bootstrap()
+        self.arm_policy()
+        self.request("GET", "/api/live/v1/session")
+        self.assertTrue(all(session.arm_id is None and session.selection is None
+                            for session in self.bridge.sessions.values()))
+        self.arm_policy()
+        entry = self.bridge.history[-1]
+        self.bridge.history[-1] = (entry[0], time.monotonic_ns() - 6_000_000_000, True)
+        self.bridge.publish([copy.deepcopy(self.replica)], [], [], [], ["synthetic-observation"])
+        self.assertTrue(all(session.arm_id is None and session.selection is None
+                            for session in self.bridge.sessions.values()))
+
+    def test_wrong_resource_policy_is_denied_even_with_fresh_arm(self):
+        self.enable_policy()
+        self.bootstrap()
+        armed = self.arm_policy()
+        command = self.policy_command(armed)
+        command["action"]["target"]["resource"]["incarnation"] = "foreign-resource"
+        status, packet, _ = self.request("POST", "/api/live/v1/commands", command)
+        self.assertEqual((status, packet["code"]), (409, "wrong-target"))
+        self.assertEqual(self.ledger.unresolved(), [])
+
+    def test_disarm_during_blocked_preflight_prevents_async_native_effect(self):
+        self.enable_policy()
+        self.bootstrap()
+        armed = self.arm_policy()
+        entered, release = threading.Event(), threading.Event()
+        original = self.bridge.executor.post
+        def held(operation):
+            if operation["op"] == "view":
+                entered.set()
+                if not release.wait(2):
+                    raise TimeoutError("synthetic blocked preflight")
+            return original(operation)
+        self.bridge.executor.post = held
+        try:
+            status, _, _ = self.request("POST", "/api/live/v1/commands", self.policy_command(armed))
+            self.assertEqual(status, 200)
+            self.assertTrue(entered.wait(2))
+            status, _, _ = self.request("POST", "/api/live/v1/disarm",
+                {"kind": "disarm", "schema_version": 1, "selection_id": armed["selection_id"]})
+            self.assertEqual(status, 200)
+        finally:
+            release.set()
+        self.assertTrue(self.bridge.executor.lock.acquire(timeout=2))
+        self.bridge.executor.lock.release()
+        result = self.ledger.get("policy-operation", self.deployment)
+        self.assertEqual((result["status"], result["error_code"]), ("rejected", "disarmed"))
+        self.assertEqual(self.policy_calls, [])
+
+    def test_bridge_restart_changes_session_authority_but_preserves_revision_watermark(self):
+        self.bootstrap()
+        self.selection()
+        revision = self.bridge.revision
+        identity = self.bridge.identity
+        replacement = Bridge(self.bridge.origin, self.deployment, self.bridge.static_root, self.ledger)
+        replacement.publish([], [], [], [], ["synthetic-observation"])
+        self.assertEqual(replacement.revision, revision + 1)
+        self.assertNotEqual(replacement.identity, identity)
+        self.server.bridge = replacement
+        status, packet, _ = self.request("GET", "/api/live/v1/session")
+        self.assertEqual((status, packet["code"]), (401, "unauthenticated"))
+
+    def test_listener_restarts_immediately_without_allowing_a_second_active_listener(self):
+        self.bootstrap()
+        with self.assertRaises(OSError):
+            BoundedHTTPServer(("127.0.0.1", self.port), self.bridge)
+        self.request("GET", "/api/live/v1/capabilities")
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=3)
+        self.server = BoundedHTTPServer(("127.0.0.1", self.port), self.bridge)
+        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01})
+        self.thread.start()
+        status, _, _ = self.request("GET", "/api/live/v1/capabilities")
+        self.assertEqual(status, 200)
 
     def test_reload_resumes_csrf_but_invalidates_selection(self):
         self.bootstrap()

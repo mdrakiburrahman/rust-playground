@@ -1,4 +1,4 @@
-"""Loopback, authenticated read-only bridge. Runtime effects remain unavailable."""
+"""Bounded loopback bridge; effects require an explicitly configured qualified executor."""
 from collections import deque
 import copy
 from dataclasses import dataclass, field
@@ -20,8 +20,8 @@ from jsonschema.exceptions import ValidationError
 
 from exchange import unique_object
 from live_contract import (
-    Denial, REQUEST_BYTES, RESPONSE_BYTES, SNAPSHOT_AGE_NS, decode_request,
-    require_origin, validate_packet,
+    ARM_TTL_NS, Denial, DeploymentFence, REQUEST_BYTES, RESPONSE_BYTES,
+    SNAPSHOT_AGE_NS, SessionFence, authorize_command, decode_request, require_origin, validate_packet,
 )
 
 
@@ -38,12 +38,14 @@ class Session:
     selection: dict | None = None
     requests: deque = field(default_factory=deque)
     last_feed_ns: int = 0
+    arm_id: str | None = None
+    arm_deadline_ns: int = 0
 
 
 class Bridge:
     """Owns volatile browser authority; the observer supplies no authorizing data."""
 
-    def __init__(self, origin, deployment, static_root, ledger):
+    def __init__(self, origin, deployment, static_root, ledger, executor=None):
         self.origin = require_origin(origin)
         self.host = urlsplit(origin).netloc
         self.identity = {"id": "local-bridge", "incarnation": secrets.token_hex(16)}
@@ -52,13 +54,20 @@ class Bridge:
         if not (self.static_root / "index.html").is_file():
             raise ValueError("production frontend index is required")
         self.ledger = ledger
+        self.executor = executor
         self.lock = threading.RLock()
         self.sessions = {}
         self.grant = secrets.token_urlsafe(32)
         self.grant_deadline = time.monotonic_ns() + 300_000_000_000
         self.history = deque(maxlen=64)
-        self.revision = 0
+        self.revision = self.ledger.bind_deployment(deployment)
         self.last_resources = None
+
+    @staticmethod
+    def invalidate(session):
+        session.selection = None
+        session.arm_id = None
+        session.arm_deadline_ns = 0
 
     def boundary(self, headers, method):
         if headers.get("Host") != self.host:
@@ -133,9 +142,11 @@ class Bridge:
                              "missing": sorted(set(missing)), "dropped": dropped},
             }
             validate_packet(snapshot)
-            if self.last_resources is not None and resources != self.last_resources:
+            self.ledger.publish_revision(self.deployment, self.revision, revision)
+            gap = self.history and now - self.history[-1][1] > SNAPSHOT_AGE_NS
+            if not connected or gap or self.last_resources is not None and resources != self.last_resources:
                 for session in self.sessions.values():
-                    session.selection = None
+                    self.invalidate(session)
             self.last_resources = copy.deepcopy(resources)
             self.revision = revision
             self.history.append((copy.deepcopy(snapshot), observed_ns, connected))
@@ -144,7 +155,11 @@ class Bridge:
         with self.lock:
             if not self.history:
                 raise Denial("disconnected")
-            return self._aged(self.history[-1])
+            result = self._aged(self.history[-1])
+            if result["freshness"]["status"] != "fresh":
+                for session in self.sessions.values():
+                    self.invalidate(session)
+            return result
 
     def _aged(self, entry):
         value, observed, connected = entry
@@ -159,11 +174,14 @@ class Bridge:
     def capabilities(self):
         with self.lock:
             connected = bool(self.history and self.snapshot()["freshness"]["status"] == "fresh")
+            qualified = self.executor is not None and not self.executor.failed.is_set()
+        supported = self.executor.operations if qualified else frozenset()
         return {
             "kind": "capabilities", "schema_version": 1, "bridge": self.identity,
-            "connected": connected, "qualified": False, "deployments": [self.deployment],
-            "operations": [{"operation": operation, "supported": False,
-                            "reason": "unsupported" if connected else "disconnected", "maximum": None}
+            "connected": connected, "qualified": qualified, "deployments": [self.deployment],
+            "operations": [{"operation": operation, "supported": connected and operation in supported,
+                            "reason": ("qualified" if operation in supported else "unsupported") if connected else "disconnected",
+                            "maximum": 1 if operation in supported else None}
                            for operation in OPERATIONS],
             "workload_presets": [],
             "limits": {"request_bytes": REQUEST_BYTES, "response_bytes": RESPONSE_BYTES, "feed_items": 64,
@@ -197,11 +215,12 @@ class Bridge:
                     result = candidate
             if gap:
                 for session in self.sessions.values():
-                    session.selection = None
+                    self.invalidate(session)
             return result
 
     def select(self, packet, session):
         with self.lock:
+            self.invalidate(session)
             snapshot = self.snapshot()
             if packet["deployment"] != self.deployment:
                 raise Denial("wrong-target")
@@ -212,6 +231,69 @@ class Bridge:
                 "deployment": self.deployment, "revision": packet["revision"], "armed": False,
             }
             return copy.deepcopy(session.selection)
+
+    def arm(self, packet, session):
+        with self.lock:
+            if self.executor is None:
+                raise Denial("unsupported")
+            snapshot = self.snapshot()
+            if not self.capabilities()["qualified"]:
+                raise Denial("unqualified")
+            if packet["deployment"] != self.deployment:
+                raise Denial("wrong-target")
+            if (session.selection is None
+                    or packet["selection_id"] != session.selection["selection_id"]):
+                raise Denial("disarmed")
+            if snapshot["freshness"]["status"] != "fresh" or packet["revision"] != snapshot["revision"]:
+                raise Denial("stale")
+            session.arm_id = secrets.token_hex(16)
+            session.arm_deadline_ns = time.monotonic_ns() + ARM_TTL_NS
+            return {"kind": "armed", "schema_version": 1,
+                    "selection_id": session.selection["selection_id"], "arm_id": session.arm_id,
+                    "deployment": self.deployment, "revision": packet["revision"], "ttl_ms": 30000}
+
+    def command(self, packet, session):
+        with self.lock:
+            if self.executor is None:
+                raise Denial("unsupported")
+            deployment, fence = self.command_fences(session)
+            return self.executor.submit(packet, deployment, fence, self.origin,
+                                        recheck=lambda: self.authorize_effect(packet, session))
+
+    def authorize_effect(self, packet, session):
+        with self.lock:
+            if (session.deadline <= time.monotonic_ns()
+                    or not any(current is session for current in self.sessions.values())):
+                raise Denial("disarmed")
+            deployment, fence = self.command_fences(session)
+            authorize_command(packet, deployment, fence, self.origin)
+
+    def command_fences(self, session):
+        with self.lock:
+            snapshot = self.snapshot()
+            capabilities = self.capabilities()
+            now = time.monotonic_ns()
+            age = snapshot["freshness"]["age_ns"]
+            targets = {
+                replica["resource"]["id"]: {
+                    "resource": replica["resource"], "writer": replica["writer"],
+                    "policy_revision": replica["policy_revision"],
+                }
+                for replica in snapshot["replicas"]
+                if replica["role"] == "collector" and replica["writer"] is not None
+                and replica["policy_revision"] is not None and replica["status"] not in ("failed", "retired")
+            }
+            deployment = DeploymentFence(
+                self.deployment, snapshot["revision"], None if age is None else now - int(age),
+                capabilities["connected"], capabilities["qualified"],
+                frozenset(item["operation"] for item in capabilities["operations"] if item["supported"]), targets,
+            )
+            fence = SessionFence(
+                self.origin, True, True, "live", self.deployment,
+                session.selection["selection_id"] if session.selection else None,
+                session.arm_id, session.arm_deadline_ns,
+            )
+            return deployment, fence
 
     def dispatch(self, method, path, headers, body=None):
         self.boundary(headers, method)
@@ -227,7 +309,7 @@ class Bridge:
         if method == "GET":
             if route == "/api/live/v1/session" and not parsed.query:
                 with self.lock:
-                    session.selection = None
+                    self.invalidate(session)
                 return {"csrf": session.csrf}, None
             if route == "/api/live/v1/capabilities" and not parsed.query:
                 return self.capabilities(), None
@@ -245,6 +327,8 @@ class Bridge:
                 return self.feed(query["after"][0]), None
             operation = re.fullmatch(r"/api/live/v1/operations/([A-Za-z0-9][A-Za-z0-9_.:-]{0,127})", route)
             if operation and not parsed.query:
+                if self.executor is not None:
+                    return self.executor.refresh(operation[1], self.deployment), None
                 return self.ledger.get(operation[1], self.deployment), None
             raise Denial("unsupported")
         if parsed.query:
@@ -266,17 +350,22 @@ class Bridge:
             return self.select(packet, session), None
         if expected == "disarm":
             with self.lock:
+                session.arm_id = None
+                session.arm_deadline_ns = 0
                 if session.selection is None or packet["selection_id"] != session.selection["selection_id"]:
                     raise Denial("disarmed")
                 return copy.deepcopy(session.selection), None
-        # This transport's read-only qualification does not qualify an executor.
+        if expected == "arm":
+            return self.arm(packet, session), None
+        if expected == "command":
+            return self.command(packet, session), None
         raise Denial("unsupported")
 
 
 class BoundedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
     request_queue_size = 8
-    allow_reuse_address = False
+    allow_reuse_address = True
 
     def __init__(self, address, bridge):
         if address[0] != "127.0.0.1":
