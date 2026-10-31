@@ -1239,3 +1239,73 @@ main `053369f527156a533ae02af8970bce88d1a6802980b97b10064c3be708d28fc7`.
 Parent coverage/mutation/pending-ID gates remain unchanged until its separate
 candidate real-browser acceptance. The intentional playable simulation4175
 was untouched throughout.
+
+### Normal candidate browser: terminal pre-effect rejection and exact closeout
+
+Normal1 and retained normal2 started through the genuine current-source gate,
+without the qualifier's initial evidence-admission substitution. The opt-in
+parent candidate ZIP SHA256 is
+`dcbd90429a6ce2a6c0218ed91ed225b4844c5308b5e512a5e74eaab948f4259d`;
+its served main SHA256 is
+`015045c4b3779ffc09c93fff61c2f668bee18e2bdcff3926b99cd7e34f2d3869`.
+It used the unchanged `ddb3f534...` schema and capacity5 actor/proof bytes.
+Static index/asset readiness, expected unauthenticated session HTTP401 and
+no-Origin POST HTTP403 were checked without consuming a bootstrap grant.
+Frozen frontend archives were unchanged; only a dedicated serving copy was used.
+
+The first browser stopped before commands without captured denial codes. The
+second stopped at fixture response capture before arm; it is not measured stale.
+The third captured pre-arm HTTP409 stale, fresh selection/arm success and one
+command, but not that command's initial response. Its same-ID reconciliation
+found no operation; private inspection found no durable admission or dispatch.
+None of those failures was relabeled as acceptance or replayed.
+
+The final browser captured selection200/arm200 at revision737, then exactly
+one POST for `op-a058b8ac-0b68-43d4-9fc3-e45747204972`, revision737.
+HTTP200 returned an operation in `requested`; two same-ID queries observed
+durable `rejected`, `error_code=stale`, `applied_revision=null`.
+Requested is durable reservation, not effect admission or successful creation.
+Private inspection independently found one creation intent, one preflight
+cancellation, zero dispatches, zero workload jobs, no live creation inventory
+entries/uncertainty, eight birth resources/seven running, three native collectors
+and zero assignments. No collector4 or payload was dispatched.
+
+Source ordering narrows the failing boundary:
+`PolicyExecutor._reserve` authorizes and durably reserves the request;
+`CollectorCapacity.run` reserves the creation intent, executes `prepare`, then
+calls final `authorize` inside its cancellation region. `prepare` checks
+inventory, native membership/eligibility/assignments, three parallel exact Docker
+probes, scoped config and nonce-bound hard-link/no-overwrite/fsync files.
+Its own explicit denials are not stale. The recorded cancellation plus stale
+therefore identifies final `Bridge.authorize_effect` / `authorize_command`
+after prepare and before `begin_creation`, pending admission or Docker create.
+The final stale guard combines exact current revision equality and maximum
+observation age5s. Actual subphase monotonic spans, final observed revision and
+age were not recorded, so neither a particular costly step nor revision mismatch
+versus aged observation can honestly be claimed as measured. `Bridge.publish`
+increments the revision on every successful sample, even unchanged safety facts;
+crossing a diagnostic sample is a source-established race, not a measured
+subphase duration. Full source/binary verification is startup work, not a
+seven-binary rehash inside this creator prepare.
+
+On the user's final closeout instruction, the uniquely verified normal2 owner
+received pidfd SIGTERM and exited0. Retention preserved the runtime until
+`AttachedRuntime.finish_runtime` stopped all eight exact owned resources;
+their stopped state and closed18793 endpoint were verified. Normal1 had already
+stopped all eight resources/exited0/closed18792. No further restart or mutation
+cycle is authorized. Simulation4175 was untouched.
+
+Private final inspection/cleanup artifacts remain in normal2's root; separate
+sanitized closeout evidence is in session `files/normal2-browser-closeout/`.
+Parent final browser proof SHA256 is
+`3c714d99e2dfb9133b4978c5056369701fbd4685d7352833b1d85f2db3ff4031`.
+The capacity-native bundle and all earlier failures/proofs remain unchanged.
+No actor, schema, native binary or qualification dependency changed for this
+closeout. Browser mutation acceptance failed and the consumer gate remains
+closed; native capacity5 is not normal browser acceptance.
+
+The review-only proposal in LIVE_API separates safety revision from diagnostic
+feed sequence rather than claiming faster preparation removes an asynchronous
+equality race. No revision/freshness/arming relaxation, lease implementation,
+replay, new command identity or runtime experiment is approved before coordinated
+contract/test review.

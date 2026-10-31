@@ -494,3 +494,141 @@ authority replacement, failed or racing receipt observation, lost response and
 bridge death with no replay, requested/sent/completed/cancelled accounting, and
 the actual advertised request/stream bounds. These scenarios are proposed;
 no passing evidence for the lease is claimed.
+
+## Normal browser blocker and review-only revision proposal
+
+The source-gated opt-in capacity candidate has **not** passed live browser
+mutation acceptance. Final actual selection/arm succeeded at revision737;
+one command received HTTP200 `requested`, then same-ID reconciliation returned
+durable `rejected/stale` with null applied revision. Native/private inspection
+found one creation intent and one preflight cancellation, no dispatch/workload
+and only the original three collectors. All eight exact normal2 resources were
+subsequently stopped and its bridge exited0/endpoint closed. See HANDOFF for
+separate proof identities; this does not supersede native capacity5 evidence.
+
+The recorded cancellation locates rejection at the creator's final authorization
+after required prepare, before one-use dispatch/effect admission. Current
+`authorize_command` reports stale for either revision mismatch or observation
+age beyond5s. Actual per-step monotonic durations, final revision and age were
+not captured; assigning the delay to Docker, native view, file fsync or full
+binary verification would be unsupported. Full source/binary checks are already
+startup checks. Successful observation publishes advance the revision even
+when only diagnostic values change. Reducing prepare cost can reduce that race,
+but cannot eliminate it for submissions arbitrarily near a publish boundary.
+
+The two source-only options have different guarantees:
+
+| Option | Preparation and immediate fences | Limitation / review boundary |
+| --- | --- | --- |
+| A: move non-authorizing expensive preparation before fresh arm | Startup-verify immutable source/binary/config templates and bounded owned staging before a fresh selection/arm; keep exact native membership/eligibility/assignment and resource identity/running/paused checks immediately before effect, plus durable nonce/config binding and final authorization | No Docker creation, inventory slot admission or authorization grant from preparation; cached templates must reject changed ownership/content/config. Reduces critical-path cost, but final equality can still lose to an arbitrary diagnostic publish. Reusing private helper evidence must not remove live checks or fsync ordering |
+| B: distinct safety revision and feed sequence | Keep preparation and exact immediate checks, but reject a changed safety footprint rather than an unchanged-safety diagnostic tick; independently enforce retained request observation age and current observation freshness | Requires an explicit new shared wire/schema contract, complete server-owned safety fields, unknown/ABA/continuity handling and source-proof invalidation. Neither inferred authority nor an old-revision fallback is allowed |
+
+Option A may remain wire-compatible if limited to startup preparation; any
+new preparation endpoint/token requires separate review. A preparation token
+would not be a command, arm, inventory reservation or writer grant. Do not
+prestage a new operation ID and later substitute/replay it. Nonce-specific
+durable records still belong to the originally admitted command.
+
+**Proposal only; not current wire semantics or authorization.** Prefer explicit
+separate safety revision and diagnostic feed sequence, reviewed with the parent
+before any implementation. The existing snapshot/feed sequence must continue
+to advance, expose gaps/drops and drive bounded resnapshot. A safety revision
+would be server-owned, scoped to an exact deployment/bridge incarnation and
+persistently advanced whenever an agreed critical authorization fact changes,
+becomes unknown or loses observation continuity. Unknown/unclassified changes
+must invalidate it, not default to diagnostic-only.
+
+The critical footprint must explicitly enumerate source qualification,
+authority/writer/process/generation/epoch, exact resource identity and running/
+paused/readiness, policy revision/admission/retirement, inventory slot/reservation
+and relevant receipt-health dependencies. Action-specific relevance needs
+agreement; this proposal does not silently exempt any current critical guard.
+Diagnostic-only value changes may leave that safety revision stable only when
+all critical facts remain freshly and independently known. A critical
+known-to-unknown-to-known transition must advance it even if the final value
+matches the original, preventing ABA. Restart, gap or observation failure must
+disarm/invalidate; persisted numbers alone never establish continuity.
+
+Proposed minimum exact footprint, to be approved before implementation:
+
+| Surface | Server-owned fields / transitions that invalidate |
+| --- | --- |
+| Source and capability | Qualified actor/schema/proof/binary digests and scope; connected/qualified flags; supported operation/preset/bounds changes. A false or unknown qualification is denial, never a diagnostic change |
+| Ownership and continuity | Exact `bridge.{id,incarnation}`, `deployment.{id,incarnation}`; owner/boot continuity; observation failure, staleness, transport/history gaps and unclassified drops. Missing critical labels and any previously unknown label deny |
+| Resources and policies | Exact selected `resource.{id,incarnation}`, role/status, `identity_verified`, `running`, `paused`; writer `{collector,process,generation}`; `policy_revision`, `applied_policy_revision`, `excluded`, `block_streams`, `retiring`. Relevant additions/removals/replacements or known/null changes invalidate |
+| Native authority / table safety | Independently verified authority incarnation/epoch/eligibility and exact native membership; immutable TableKey/schema binding, table `epoch`, `lifecycle`, full writer identity and `recovery_obligations`. Missing native authority fields cannot be reconstructed from CPU, role labels or container liveness; new producer-owned fields require explicit qualification |
+| Finite capacity | Exact inventory deployment/baseline/revision and selected slot state, reservation, cancellation, dispatch, binding and uncertainty; scoped config identity/digest. The command's own permitted intent/dispatch transition requires an explicitly specified expected transition, not blanket revision suppression |
+| Receipt safety | For workload, current `receipt_observation_known` must remain true; unknown/failure invalidates. Receipt count/presence, throughput and an accepted SQL row are not authority or writer grants. Receipt/digest/ordinary-reader completion remains independently reconciled, not inferred from safety revision |
+
+The only diagnostic missing-label exemptions remain the existing exact eight
+labels, not new broad category matching. CPU/memory/IO/queue/throughput values,
+receipt presence/count and heartbeat timestamp changes cannot themselves grant
+authority. A newly unclassified change or missing critical producer field denies.
+Action-specific footprint narrowing and expected self-transitions are unresolved
+review decisions, not permissions implemented by this table.
+
+Selection, arm, initial reservation and final pre-effect authorization would
+require the caller's exact latest safety revision, current explicit arm/session,
+unchanged qualified sources and exact deployment/resource/policy identities.
+Independent authoritative preflights and monotonic observation age5s/arm TTL30s
+remain mandatory. A diagnostic tick cannot extend expiry, hide a gap, authorize
+a new resource or renew a lease. Requested/applied safety revisions and observed
+feed sequence need explicit wire fields and matching frontend/schema fixtures;
+overloading today's `revision` or accepting missing fields as old semantics is
+not proposed. Until the new contract is agreed and qualified, exact equality
+against today's snapshot revision remains enforced and the consumer gate closed.
+
+The submitted request must reference a retained server observation
+`(bridge boot, feed sequence, safety revision, observed monotonic time)`.
+Its original observation age stays at most5s through final pre-effect checks;
+new diagnostic samples, selection/arm retries, reconciliation or a repeated
+same-ID lookup cannot reset that deadline. Current critical observations must
+also be fresh independently. Missing/evicted history or another boot denies.
+Session TTL and explicit arm TTL30s remain separate, with disarm/logout/expiry
+effective before any dispatch. This does not hold publication locks to hide
+intervening observations or postpone invalidation.
+
+Required review/qualification cases: diagnostic publish during each creator
+preflight phase; resource/policy/authority or inventory change in the same
+positions; critical unknown and ABA; aged observation without a sequence change;
+gap/drop/observer failure/restart; disarm/expiry between reserve and dispatch;
+old or missing revision fields; same-ID lost response and terminal cancellation
+without replay; exactly one creation dispatch followed by actual registration/
+ACTIVE/resource observation, then one-request physical Delta/receipt completion.
+Add bounded local monotonic guard/phase evidence with requested/current safety
+revision, feed sequence and observation age, preserving errors and unknowns.
+Offline synthetic schedules must exercise boundary races before a separately
+authorized single bounded runtime/browser checkpoint. No fresh runtime or
+fence change is authorized by this proposal.
+
+Private instrumentation proposal: at most64 operations and64KiB total retained
+allowlisted evidence per bounded checkpoint, with explicit overflow/dropped
+counts and no success claim from missing spans. Record original operation ID,
+local process/clock identity and monotonic start/end for reservation, inventory
+intent, native view, each of the three parallel exact resource probes, config/
+hard-link/fsync preparation, final guard and dispatch boundary. Record private
+stale subreason flags for revision mismatch versus original/current observation
+age expiry, requested/current revisions, retained observation sequence/age,
+arm/request remaining budget and each step's outcome. Preserve simultaneous
+causes rather than choosing whichever guard executes first. No tokens, cookies,
+CSRF, configs/credentials or arbitrary request bodies; no cross-clock wall-time
+subtraction and no summing overlapping resource-probe spans as elapsed time.
+Evidence collection is not permission to perform a Docker effect.
+
+Deterministic unit regressions must separately assert age expiry with unchanged
+revision, revision change while age remains fresh, both causes, unknown age,
+future/foreign-clock observation and exact5s boundary. Synthetic phase barriers
+should publish diagnostic versus critical changes between native view/resource
+checks/config/final guard, exercise source/capability/scope and policy/epoch
+changes, observer gaps and known-null-known ABA, and check no dispatch after
+denial. For option B, a diagnostic publish must not reset original request age;
+a request older than5s must fail even when the latest feed is fresh. Assertions
+must distinguish initial HTTP denial, durable requested then preflight rejection,
+pending/unknown effects and same-ID reconciliation. No unit/native pass for
+these proposed cases is claimed.
+
+Optimizing immutable startup-verified preparation can be reviewed independently,
+but must preserve exact live authority/resource/config checks and durable
+hard-link/no-overwrite/fsync intent/dispatch ordering. It is not proof of usable
+human-paced authorization. This revision proposal does not implement or qualify
+the separate multi-request/concurrent-client admitted-workload lease above.
