@@ -363,3 +363,29 @@ without replay. Eight exact containers stopped and the endpoint closed. Current
 parent-loss regressions pass in source tests, but this failed HTTP attempt did
 not reach the actual parent/worker-kill checks or final combined Delta audit.
 It produced no complete current-source effects proof or browser qualification.
+
+The subsequent source-identical HTTP-effects5 attempt completed the publisher
+overlap and real preflight-parent-loss rejection, then failed a private fixture
+PID lookup: Linux records child processes under their spawning executor thread,
+not necessarily the main thread. HTTP-effects6 corrected only that lookup,
+deduplicated the known bridge's task children, required a unique exact worker
+script/project/operation argv match and used pidfd-bound signaling.
+
+HTTP-effects6 passed four native policies and lost-response/crash reconciliation,
+all three fault variants, preflight parent death without application, worker
+SIGKILL/emergency repair, post-application owner SIGKILL/independent rollback,
+same-ID no replay, four physical workload units and the exact 65,554-row ordinary
+Delta multiset. Its five local monotonic fault lifecycles passed the unchanged
+requested-duration-plus-five-seconds bound. Final bridge exit was 0; eight exact
+containers stopped and the endpoint closed. The private bootstrap qualifier is
+explicitly distinct from normal source-gated startup.
+
+Normal `live_runtime.py` then accepted that current eleven-file/seven-binary
+artifact without any evidence-gate override, completed a real authenticated
+small workload and collector fault, and verified three exact ordinary Delta
+rows plus reload/logout. The normal smoke's final retention assertion failed:
+the baseline has seven running roles and an intentionally stopped eighth legacy
+collector fixture, not eight running roles. Its failure and safe stopped cleanup
+remain separate; normal source-gated effect success is not browser availability
+or full live-game qualification. Preserve the exact baseline running-state map
+for bridge-only restart, never start/adopt that stopped fixture.

@@ -1020,3 +1020,67 @@ approved next bounded checkpoint is the corrected shared HTTP barrier and
 actual preflight-parent loss, post-application parent loss, worker kill/repair,
 same-ID reconciliation and final Delta audit. Do not start a broad helper cohort
 or advertise pending staff/migration/repair/concurrency capabilities.
+
+### Guarded HTTP-effects6 passed; normal source-gated effects observed
+
+The next source-identical HTTP-effects5 attempt passed the corrected native
+pause barrier, publisher-overlap completion and actual preflight-parent death
+without application. Its fixture then looked for the fault child under only
+the bridge's main-thread `/proc` task, although the executor thread spawned it.
+No worker kill or post-application owner-kill pass was claimed for that attempt.
+It exited 1; eight exact containers stopped and port 18783 closed. Its preserved
+sanitized partial JSON SHA256 is
+`56c778fc2823d8b7e760fd0513e9c73e2b3c327cd814c50c747bdd7cd775f7b7`.
+
+HTTP-effects6 changed only the private worker-PID lookup: deduplicated children
+from the known bridge's tasks, required one exact current script/project/op-ID
+argv match, and used pidfd-bound SIGKILL with a second exact argv check. The
+eleven source/schema bindings remain identical to effects5 and source checkpoint
+`53a2010`; no Rust rebuild, contract, cadence, duration or retry changes occurred.
+Its one bounded deployment on subnet 216 / port 18784 passed:
+
+- Four native policies, interrupted HTTP/native response, actual bridge SIGKILL,
+  exact restart, old-session rejection and durable same-ID reconciliation.
+- Small two inputs, elephant one, and small one during publisher pause: four
+  physical native units and the exact ordinary Delta **65,554-row multiset**.
+- Collector pause, SQL authority loss and publisher interruption; actual parent
+  death before grant prevented application; worker SIGKILL/exact emergency
+  repair and parent SIGKILL after application independently rolled back.
+- Same-ID queries never replayed payload; all five applied faults repaired on
+  the same Linux boot within requested duration plus five seconds.
+
+Inclusive dispatch-through-observed-repair intervals were 975.456 ms and
+1,118.094 ms for the 500 ms collector/SQL faults, 3,562.329 ms for a 3,000 ms
+publisher fault, 840.398 ms for early worker-kill/emergency repair, and
+3,547.640 ms for a 3,000 ms owner-kill/deadline rollback. These are local
+monotonic control lifecycles, not one-way transport, CPU or benchmark results.
+Final bridge exit was 0; eight exact IDs stopped and port 18784 closed.
+The raw private whole-source/seven-binary artifact SHA256 is
+`34655447338e3fc2e23edbcc890629ed6ead0c6ca78992ad17456ae1c3048dd4`.
+Its allowlisted `files/live-http-effects6-qualification.json` export SHA256 is
+`a3ca173339d892b433f98e4c22a7aab0be971913ee3ce3a1015c860c835a75af`.
+Private operator bootstrap admission is explicit; no production bypass was added.
+
+Normal startup on new subnet 217 / port 18785 used **unmodified
+`live_runtime.py`**, matching policy-v6 and the new HTTP-effects6 artifact,
+without qualification override. It completed an authenticated small workload
+and collector fault, same-ID no replay, exact three-row ordinary Delta audit,
+reload/logout and graceful bridge exit 0. The enclosing smoke fixture then
+failed an incorrect all-eight-running retention assertion: the qualified PoC
+has seven running observed roles plus an intentionally stopped legacy collector
+fixture. Its final cleanup independently stopped all eight and closed the port.
+Normal source-gated effects did pass; whole smoke exit remains 1, not 0.
+`files/live-normal7-partial.json` SHA256 is
+`c20988219cfe6dabbaf98ad2f384ba20832059eead3a5fa04eef507419f483eb`.
+The corrected private fixture captures and compares the exact baseline running
+map; it never starts or adopts the stopped collector fixture.
+
+At this boundary the parent holds the heavy token for a user-reported touchpad
+camera fix/browser check. No backend process is running. The parent's playable
+simulation preview at port 4175 is unrelated and must not be stopped. Latest
+separately pinned observation-only frontend `fd83efb` ZIP/main hashes were
+verified and staged privately without rebuild, but actual bridge-browser
+availability remains pending the corrected normal restart and camera package.
+Staff/retirement, bounded streams, atomic migration and HTTP repair remain
+original pending requirements; full Phase2 is not complete. Missing live
+IO/queue/throughput metrics remain unknown and frontend mutationGate is false.
