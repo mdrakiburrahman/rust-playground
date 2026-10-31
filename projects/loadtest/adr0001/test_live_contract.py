@@ -132,6 +132,7 @@ class LiveContractTests(unittest.TestCase):
                 "resource": self.target["resource"], "role": "collector", "status": "active",
                 "writer": self.target["writer"], "policy_revision": "3", "applied_policy_revision": "3",
                 "excluded": False, "block_streams": False, "retiring": False,
+                "identity_verified": True, "running": True, "paused": False,
             }],
             "tables": [], "receipts": [], "metrics": [{
                 "id": "cpu-sample-1", "resource": self.target["resource"],
@@ -140,6 +141,7 @@ class LiveContractTests(unittest.TestCase):
                 "evidence": "measured", "method": "process-counter",
             }],
             "coverage": {"complete": False, "missing": ["service-timing"], "dropped": 0},
+            "receipt_observation_known": True,
         }
 
     def test_metrics_require_closed_units_exact_resources_and_explicit_unknowns(self):
@@ -158,6 +160,24 @@ class LiveContractTests(unittest.TestCase):
         packet["metrics"][0]["resource"] = {"id": "collector1", "incarnation": "replaced"}
         with self.assertRaisesRegex(Denial, "invalid"):
             validate_packet(packet)
+
+    def test_authoritative_observation_gate_only_allows_named_diagnostics(self):
+        from live_contract import DIAGNOSTIC_MISSING, require_observations
+        packet = self.snapshot()
+        action = {"operation": "admission", "target": self.target, "enabled": True}
+        packet["coverage"] = {"complete": False, "missing": sorted(DIAGNOSTIC_MISSING), "dropped": 1}
+        require_observations(packet, action)
+        for label in ("receipts", "observation-gap", "unrecognized-fact"):
+            packet["coverage"]["missing"].append(label)
+            with self.subTest(label=label), self.assertRaises(Denial):
+                require_observations(packet, action)
+            packet["coverage"]["missing"].remove(label)
+        for field in ("identity_verified", "running", "paused", "writer", "policy_revision"):
+            prior = packet["replicas"][0][field]
+            packet["replicas"][0][field] = None
+            with self.subTest(field=field), self.assertRaises(Denial):
+                require_observations(packet, action)
+            packet["replicas"][0][field] = prior
 
     def test_feed_revisions_are_consecutive_and_empty_next_matches_after(self):
         packet = {

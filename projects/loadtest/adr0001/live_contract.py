@@ -16,6 +16,10 @@ REQUEST_BYTES = 32768
 RESPONSE_BYTES = 1048576
 SNAPSHOT_AGE_NS = 5_000_000_000
 ARM_TTL_NS = 30_000_000_000
+DIAGNOSTIC_MISSING = frozenset({
+    "cpu", "memory", "cpu-counter-gap", "io-read", "io-write",
+    "queue-depth", "queue-age", "throughput",
+})
 SCHEMA = json.loads((Path(__file__).parent / "contracts/live-v1.schema.json").read_text())
 Draft202012Validator.check_schema(SCHEMA)
 VALIDATOR = Draft202012Validator(SCHEMA)
@@ -105,6 +109,43 @@ def require_origin(origin):
             or parsed.path or parsed.query or parsed.fragment or parsed.port is None):
         raise Denial("origin")
     return origin
+
+
+def require_observations(snapshot, action=None):
+    """Only current producer facts, never declarations from a command."""
+    validate_packet(snapshot)
+    coverage = snapshot["coverage"]
+    missing = set(coverage["missing"])
+    if missing - DIAGNOSTIC_MISSING or coverage["dropped"] and "cpu-counter-gap" not in missing:
+        raise Denial("disconnected")
+    if action is None:
+        return
+    operation = action["operation"]
+    replicas = snapshot["replicas"]
+    if operation == "workload":
+        selected = [row for row in replicas if row["role"] == "gateway"]
+        if snapshot["receipt_observation_known"] is not True:
+            raise Denial("disconnected")
+    elif operation == "replicas":
+        selected = [row for row in replicas if row["role"] == action["role"]]
+    else:
+        resource = (action["target"]["resource"] if operation in ("admission", "exclusion", "retirement")
+                    else action.get("resource"))
+        selected = [row for row in replicas if row["resource"] == resource]
+        if operation in ("admission", "exclusion", "retirement") and any(
+                row["role"] != "collector" for row in selected):
+            raise Denial("wrong-target")
+    if not selected or any(row["identity_verified"] is not True or row["running"] is not True
+                           or row["paused"] is not False for row in selected):
+        raise Denial("wrong-target")
+    policy_rows = ([row for row in selected if row["role"] == "collector"]
+                   if operation == "replicas" else selected)
+    if operation in ("admission", "exclusion", "retirement", "replicas") and any(
+        row["writer"] is None or row["policy_revision"] is None
+        or any(row[field] is None for field in ("excluded", "block_streams", "retiring"))
+        or row["retiring"] is not False for row in policy_rows
+    ):
+        raise Denial("wrong-target")
 
 
 @dataclass(frozen=True)

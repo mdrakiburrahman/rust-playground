@@ -1167,3 +1167,75 @@ the current collector1..4 credential pool permits only a bounded initial
 identity must remain explicit until a fresh-identity/config-registration path
 is qualified. Atomic migration, HTTP repair, missing telemetry and full game
 mutation acceptance remain unfinished original requirements.
+
+### Implemented safety producer and finite actual capacity checkpoint
+
+This supersedes the preceding foundation-only status, not its historical
+evidence. The repository producer now uses the parent's exact
+`ddb3f534b8dab2507d0293c9cd035a2c017bf38a1c124a9cdd8b01346c4c3cf3`
+schema. Required nullable safety and receipt facts, diagnostic-only action
+coverage guards, caller streams, receipt-before-workload admission and the
+inventory overlay are wired. Attachment, observer, exact cleanup and selected
+fault attachment use durable exact inventory identities; independent repair
+can still use its durable resource journal without a surviving parent/UI.
+The qualification dependency set now includes thirteen actor/schema files,
+including inventory, capacity and receipts. Old eleven-file proofs cannot
+activate this changed source.
+
+One bounded execution at a time, separate roots/stages and retained failures:
+
+| Checkpoint | Actual result | Exact cleanup |
+| --- | --- | --- |
+| capacity1 | Failed before creation: empty SQL projection omitted required receipts; graceful retain also exposed obsolete AttachedRuntime executor access | 8 stopped; bridge exit1; 18787 closed |
+| capacity2 | Isolated actual response keys `state`, missing `receipts`; admission stayed denied | 8 stopped; exit0; 18788 closed |
+| capacity3 | Real lost-response collector4 creation/registration/ACTIVE/isolation passed; requested two-attempt workload sent one, second unsent after original revision became stale, operation cancelled | 9 stopped; exit0; 18789 closed |
+| capacity4 | Consistent receipt producer, actual collector add, two freshly armed singleton jobs/six exact Delta rows, denials and same-ID restart passed | 9 stopped; exit0; 18790 closed |
+| capacity5 | Same audit with advertised/enforced maximum_requests=1 and requests2 denial; current-source proof verifier passed | 9 stopped; exit0; 18791 closed |
+
+The producer now emits an explicit receipt array, with empty array only after
+a current SQL existence probe establishes empty. State read, existence,
+array projection and commit share a bounded SERIALIZABLE/XACT_ABORT observation
+transaction; lock/query deadlines were not relaxed. Missing/changed fields,
+orphan receipt races, physical/reader errors and staleness remain unknown.
+Regressions reproduce the actual omitted field and assert health stays null,
+including a receipt appearing outside observed state. Normalized fresh-runtime
+graceful retention no longer accesses a nonexistent AttachedRuntime executor.
+
+Latest exact staged source command, with existing image pins and frozen helper
+imports: `python -B -m unittest discover -s bridge-eec969a5-capacity-v5
+-p 'test_live*.py' -q`: **147 passed, 9.881 seconds**. Existing seven native
+binaries match the later frozen `eec969a5-q20261030b` cohort manifest; the older
+stack-repair binary manifest is deliberately different. No compile/install,
+benchmark rerun or previous evidence/package rewrite occurred.
+
+Current scoped proof SHA256:
+`7590ab550237c405580d6c3dc580eca70354907a87760f57ede04752ae236204`.
+Capacity4 proof remains separately preserved at
+`c83b6a069a8a49d6e05cb1d70849b1160af47257719f6e64f17478827394157e`;
+the later request-bound source change intentionally invalidated its activation.
+The actual audit has one create despite injected lost Docker response, current
+native registration/ACTIVE/resource isolation, six exact ordinary-reader rows
+with final receipts/digests, unsupported streams2/requests2, unknown-receipt
+admission denial and bridge restart with same IDs/no recreation. The receipt
+error injection is an observer read error with healthy authority, not a SQL
+fault qualification. Private fixture startup substitutes only initial evidence
+admission; normal production source-gated startup/browser remains the next
+distinct checkpoint.
+
+Default remains read-only. Explicit current `--creation-proof` grants only
+collector role/desired4 initial increase and small requests1/streams1 workload.
+After collector4 binds, further replica changes are unsupported/exhausted.
+Decrease/retirement, other roles, policy/fault/repair/migration and elephant
+workloads remain disabled in this proof scope. Singleton audits are **not**
+multi-request/concurrent-client qualification; preserve capacity3's cancelled
+second attempt. The proposed durable admitted-workload lease in LIVE_API is
+pending coordinated agreement and has no implementation or freshness change.
+Repeatable fresh identity/config registration and the full staff/load request
+remain unfinished.
+
+The exact matching frozen frontend is `8f354ef`'s safety/streams package:
+ZIP `7db56de0a4baed9f0e2494b049cb648ba20babc55d9f1fb665af175798476f8f`,
+main `053369f527156a533ae02af8970bce88d1a6802980b97b10064c3be708d28fc7`.
+Parent coverage/mutation/pending-ID gates remain unchanged until its separate
+candidate real-browser acceptance. The intentional playable simulation4175
+was untouched throughout.

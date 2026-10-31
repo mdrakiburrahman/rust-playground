@@ -401,21 +401,96 @@ no arm/commands or credential storage. Graceful exact-process teardown exited
 failed assertion separately; read-only browser success is not mutation acceptance.
 See HANDOFF.md for separate evidence identities and the retained observer error.
 
-The coordinated draft schema `ddb3f534b8dab2507d0293c9cd035a2c017bf38a1c124a9cdd8b01346c4c3cf3`
+The implemented schema `ddb3f534b8dab2507d0293c9cd035a2c017bf38a1c124a9cdd8b01346c4c3cf3`
 and semantics/46 synthetic fixtures are in session
 `files/live-safety-streams-draft/`. They require nullable exact-probe replica
 safety facts, nullable current receipt-probe health and caller workload streams
 bounded by each preset's qualified maximum. They preserve common authority
 fences, explicit diagnostic-only missing labels, unknown completion and
-independent rollback. They are **not advertised or implemented by this backend**;
-the current schema remains `5923cc7e1fe59a91d344b7f9786de048947b4905a2d6a91558a259f548e32e20`.
-The parent's newly typed draft consumer cannot connect to that older schema.
+independent rollback. Older `5923cc7e...` packages and qualification artifacts
+remain frozen historical evidence, not compatible consumers or authorization
+for this source.
 
-`live_inventory.py` is currently unused private durable creation bookkeeping.
-Its transaction/nonce/identity tests do not qualify an HTTP replica action,
-current readiness, resource isolation, or retirement. The stopped legacy fixture
-is birth evidence only, never managed staff. An approved collector tombstone
+`live_inventory.py` now overlays the immutable birth manifest for observation,
+attachment, selected fault attachment and exact cleanup. Creation intents,
+one-use dispatch, nonce/config binding and lost-response reconciliation are
+durable; unknown creation is never retried under a new identity. Binding alone
+does not mean readiness. The stopped legacy fixture is birth evidence only,
+never managed staff. An approved collector tombstone
 cannot be silently reset or reused: initial 3-to-4-to-3 must be labeled finite,
 with exhausted fresh identity explicit until a new identity/config path exists.
 Gateway removal still needs authoritative admission stop and observed drain.
-No replica/retirement/repair/migration capability is enabled by this slice.
+The current exact-source `collector-add-small` qualification enables only the
+initial ADR collector increase from three to four and single-request small
+workloads. It requires explicit `--creation-proof`; default startup is read-only.
+It is mutually exclusive with policy/effects qualification. `replicas` accepts
+exactly `role=collector, desired=4`: decrease, other roles and other desired
+counts remain unsupported even though the generic packet schema admits them.
+After slot4 is bound, replica availability becomes unsupported/exhausted; this
+is not repeatable staff capacity or permission to reset credentials/tombstones.
+Retirement, migration, repair, faults, admission/exclusion and elephant workload
+are not granted by this proof.
+
+Both the advertised workload operation maximum and its preset
+`maximum_requests` are **1** in this scope. Server validation rejects
+`requests>1` and `streams>1` before admission; values are never clamped.
+The two singleton jobs in capacity qualification are not qualification of a
+multi-request job or concurrent clients. The retained capacity3 case requested
+two attempts, sent one, then left the second unsent after its original revision
+became stale; the operation reconciled as cancelled. The multi-request workload
+and eventual fresh collector identity/configuration path remain unfinished.
+
+Required replica `identity_verified`, `running` and `paused` are nullable facts
+from exact current private probes. Public resource aliases never establish
+identity. Snapshot `receipt_observation_known` is true only after a successful
+current receipt observation; healthy empty is explicit, not a missing-field
+default. SQL state, current receipt existence and explicit JSON receipt array
+share one bounded SERIALIZABLE observation transaction. Missing/changed fields,
+orphan receipts, reader failures and stale probes keep health/completion
+unknown and deny workload admission. Accepted SQL or RPC final alone is not
+physical completion.
+
+Common auth, Origin/CSRF, selected deployment/incarnation, exact latest revision,
+arming, gaps and source gates still apply. Required safety/policy/writer facts
+must be known. Only `cpu`, `memory`, `cpu-counter-gap`, `io-read`, `io-write`,
+`queue-depth`, `queue-age` and `throughput` are diagnostic-only missing labels;
+all remain visible. Any other missing fact denies. Workload additionally
+requires receipt health exactly true and every advertised gateway verified,
+running and unpaused; the server independently preflights its exact gateway.
+Selected fault initial application still requires the live parent handshake;
+durably exact deadline/emergency compensation does not require parent, bridge,
+inventory or a surviving UI revision. The dynamic fault path is source-tested,
+not a fault grant from the creation proof.
+
+## Proposed admitted-workload lease: not implemented
+
+This is a separate contract proposal, not a change to revision freshness,
+authorization or the single-request capability above. Agreement and dedicated
+regressions/native qualification must precede implementation.
+
+Admission would require the exact latest revision, explicit current arming,
+source/deployment/resource identities and authoritative preflights. A durable
+bounded job lease would retain operation/request/attempt identities, the
+qualified request/stream/time bounds, immutable TableKey/schema, gateway and
+authority bindings, policy dependencies, and a versioned safety footprint.
+Pure diagnostic samples/feed sequence advances would not themselves revoke
+that already admitted lease. Safety changes, missing critical observations,
+authority/incarnation/policy mismatch, explicit disarm/logout/expiry, bridge
+loss and reconciliation gaps would forbid further sends. Each new attempt
+would still recheck authoritative dependencies and current receipt health.
+Already accepted attempts would reconcile exact receipts without replay;
+unsent, cancelled and unknown attempts would remain distinct.
+
+Cold assignment binding and permitted writer transitions need explicit
+agreement: no inferred writer grant, silent resource replacement or implicit
+lease renewal. A restarted bridge would reconcile durable attempts, not resume
+unsent payloads automatically. Concurrent streams/clients require a separately
+qualified bounded scheduler and durable inventory, not a larger advertised
+maximum.
+
+Required regression scenarios include diagnostic-only advancement during a
+cold first RPC, explicit disarm and expiry between attempts, pause/policy/writer/
+authority replacement, failed or racing receipt observation, lost response and
+bridge death with no replay, requested/sent/completed/cancelled accounting, and
+the actual advertised request/stream bounds. These scenarios are proposed;
+no passing evidence for the lease is claimed.

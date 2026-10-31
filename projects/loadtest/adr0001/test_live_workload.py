@@ -20,7 +20,7 @@ class WorkloadTests(unittest.TestCase):
         self.packet = {
             "kind": "command", "schema_version": 1, "operation_id": "workload-1",
             "selection_id": "selection-1", "arm_id": "arm-1", "deployment": self.deployment, "revision": "7",
-            "action": {"operation": "workload", "profile": "small", "requests": 1, "duration_ms": 1000},
+            "action": {"operation": "workload", "profile": "small", "requests": 1, "duration_ms": 1000, "streams": 1},
         }
         self.snapshot = {
             "kind": "snapshot", "schema_version": 1,
@@ -29,6 +29,7 @@ class WorkloadTests(unittest.TestCase):
             "replicas": [], "tables": [{"id": "main", "epoch": "0", "lifecycle": "unknown",
                                        "writer": None, "recovery_obligations": []}], "receipts": [], "metrics": [],
             "coverage": {"complete": False, "missing": ["cpu"], "dropped": 0},
+            "receipt_observation_known": True,
         }
         self.sent = []
         self.unit = "11111111-1111-4111-8111-111111111111"
@@ -135,6 +136,14 @@ class WorkloadTests(unittest.TestCase):
         self.assertEqual(self.sent, [])
         self.assertFalse(self.runner.journal.get("workload-1", self.deployment)["attempts"][0]["sent"])
 
+    def test_unknown_receipt_health_denies_before_prepare_or_send(self):
+        self.snapshot["receipt_observation_known"] = None
+        with self.assertRaisesRegex(Denial, "disconnected"):
+            self.run_job()
+        self.assertEqual(self.prepare_count, 0)
+        self.assertEqual(self.sent, [])
+        self.assertFalse(self.runner.journal.get("workload-1", self.deployment)["attempts"][0]["sent"])
+
     def test_stopping_prevents_remaining_requests_and_preserves_partial_outcomes(self):
         self.packet["action"]["requests"] = 2
         self.assertEqual(self.run_job(stopping=lambda: bool(self.sent)), ("cancelled", None))
@@ -147,7 +156,8 @@ class WorkloadTests(unittest.TestCase):
     def test_server_owned_presets_are_closed_and_bounds_are_not_boolean_coercions(self):
         action = self.packet["action"]
         for change in ({"profile": "arbitrary"}, {"requests": True}, {"requests": 9}, {"duration_ms": 10001},
-                       {"schema": "untrusted"}, {"profile": "elephant", "requests": 3}):
+                       {"schema": "untrusted"}, {"profile": "elephant", "requests": 3}, {"streams": True},
+                       {"streams": 0}, {"streams": 2}, {"streams": 5}):
             with self.subTest(change=change), self.assertRaises(Denial):
                 preset_for({**action, **change})
         preset = preset_for(action)

@@ -111,6 +111,7 @@ class LiveHTTPTests(unittest.TestCase):
             "writer": self.writer, "role": "collector", "status": "active",
             "policy_revision": "0", "applied_policy_revision": "0",
             "excluded": False, "block_streams": False, "retiring": False,
+            "identity_verified": True, "running": True, "paused": False,
         }
         state = {"members": [{"writer": self.writer}], "policies": {}}
         self.policy_calls = []
@@ -126,9 +127,9 @@ class LiveHTTPTests(unittest.TestCase):
             }
             self.replica.update(policy_revision=str(revision), applied_policy_revision=str(revision),
                                 **{name: operation[name] for name in ("excluded", "block_streams", "retiring")})
-            self.bridge.publish([copy.deepcopy(self.replica)], [], [], [], ["synthetic-observation"])
+            self.bridge.publish([copy.deepcopy(self.replica)], [], [], [], ["cpu"])
             return {}
-        self.bridge.publish([copy.deepcopy(self.replica)], [], [], [], ["synthetic-observation"])
+        self.bridge.publish([copy.deepcopy(self.replica)], [], [], [], ["cpu"])
         self.bridge.executor = PolicyExecutor(
             self.ledger, post, lambda _: self.replica["resource"], self.bridge.snapshot)
 
@@ -203,7 +204,7 @@ class LiveHTTPTests(unittest.TestCase):
         self.arm_policy()
         entry = self.bridge.history[-1]
         self.bridge.history[-1] = (entry[0], time.monotonic_ns() - 6_000_000_000, True)
-        self.bridge.publish([copy.deepcopy(self.replica)], [], [], [], ["synthetic-observation"])
+        self.bridge.publish([copy.deepcopy(self.replica)], [], [], [], ["cpu"])
         self.assertTrue(all(session.arm_id is None and session.selection is None
                             for session in self.bridge.sessions.values()))
 
@@ -360,6 +361,7 @@ class LiveHTTPTests(unittest.TestCase):
             "role": "gateway", "status": "unknown", "writer": None,
             "policy_revision": None, "applied_policy_revision": None,
             "excluded": None, "block_streams": None, "retiring": None,
+            "identity_verified": None, "running": None, "paused": None,
         }
         self.bridge.publish([resource], [], [], [], ["synthetic-observation"])
         self.assertTrue(all(session.selection is None for session in self.bridge.sessions.values()))

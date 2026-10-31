@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from live_receipts import ReceiptObserver, proposal_digest, sql_projection
+from live_receipts import QUERY, ReceiptObserver, proposal_digest, sql_projection
 
 
 class LiveReceiptTests(unittest.TestCase):
@@ -24,6 +24,41 @@ class LiveReceiptTests(unittest.TestCase):
 
     def tearDown(self):
         self.directory.cleanup()
+
+    def test_actual_empty_projection_missing_receipts_is_not_known_empty(self):
+        # capacity2's actual SQL response contained state but omitted receipts.
+        self.observation = {"state": {"tables": {}}}
+        with self.assertRaisesRegex(ValueError, "explicit state, tables and receipts"):
+            self.observer.sample()
+        self.observation["receipts"] = []
+        self.assertEqual(self.observer.sample(), ([], [], 0))
+        self.reader.assert_not_called()
+
+    def test_changed_required_projection_fields_never_default_to_empty(self):
+        for value in (
+            {"state": {"tables": {}}, "receipt": []},
+            {"state": {}, "receipts": []},
+            {"state": {"tables": {}}, "receipts": None},
+            {"state": {"tables": []}, "receipts": []},
+        ):
+            with self.subTest(value=value):
+                self.observation = value
+                with self.assertRaisesRegex(ValueError, "explicit state, tables and receipts"):
+                    self.observer.sample()
+
+    def test_sql_producer_emits_empty_only_after_current_empty_receipt_probe(self):
+        self.assertIn("IF EXISTS(SELECT 1 FROM delta_authority.receipts)", QUERY)
+        self.assertIn("ELSE SET @receipts=N'[]'", QUERY)
+        self.assertIn("IF @receipts IS NULL OR ISJSON(@receipts)<>1 THROW", QUERY)
+        self.assertNotIn("WITHOUT_ARRAY_WRAPPER", QUERY)
+        self.assertIn("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; BEGIN TRANSACTION", QUERY)
+        self.assertLess(QUERY.index("BEGIN TRANSACTION"), QUERY.index("SELECT @state=payload"))
+        self.assertLess(QUERY.index("IF EXISTS"), QUERY.index("COMMIT TRANSACTION"))
+
+    def test_receipt_appearing_outside_observed_state_is_unknown_not_healthy_empty(self):
+        self.observation["state"]["tables"] = {}
+        with self.assertRaisesRegex(ValueError, "no accepted decision"):
+            self.observer.sample()
 
     def table(self, name, count, data=False):
         root = self.root / "delta-private/tables" / name

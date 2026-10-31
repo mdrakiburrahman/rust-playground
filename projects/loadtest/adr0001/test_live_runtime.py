@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from live_contract import validate_packet
+from live_contract import Denial, validate_packet
 import live_runtime
 from live_runtime import RuntimeObserver
 
@@ -16,8 +16,9 @@ from live_runtime import RuntimeObserver
 class RuntimeProjectionTests(unittest.TestCase):
     def setUp(self):
         self.state = {
-            "Id": "owned-id", "Config": {"Labels": {"delta-runtime": "test-project"}},
-            "State": {"Running": True, "StartedAt": "test-start"},
+            "Id": "owned-id", "Name": "/collector1", "Image": "test-image",
+            "Config": {"Labels": {"delta-runtime": "test-project"}},
+            "State": {"Running": True, "Paused": False, "StartedAt": "test-start"},
         }
         self.stats = {"cpu_stats": {"cpu_usage": {"total_usage": 10}},
                       "memory_stats": {"usage": 4096}}
@@ -28,11 +29,21 @@ class RuntimeProjectionTests(unittest.TestCase):
         }
         runtime = SimpleNamespace(
             project="test-project", names={"collector1": "collector1"}, sql_name="sql",
-            owned_container=lambda _: "owned-id", config={"tables": [{"key": "main"}]}, control_role="controller",
+            owned_container=lambda name: "sql-id" if name == "sql" else "owned-id",
+            config={"tables": [{"key": "main"}]}, control_role="controller",
+            records={"collector1": {"id": "owned-id", "started_at": "test-start", "image": "test-image"},
+                     "sql": {"id": "sql-id", "started_at": "test-start", "image": "test-image"}},
+            refresh_inventory=lambda: None, inventory_uncertain=False,
         )
-        engine = SimpleNamespace(get=lambda path: copy.deepcopy(
-            self.state if path.endswith("/json") else self.stats))
-        self.bridge = SimpleNamespace(publish=Mock())
+        def get(path):
+            if not path.endswith("/json"):
+                return copy.deepcopy(self.stats)
+            value = copy.deepcopy(self.state)
+            if "/sql-id/" in path:
+                value.update(Id="sql-id", Name="/sql")
+            return value
+        engine = SimpleNamespace(get=get)
+        self.bridge = SimpleNamespace(publish=Mock(), observation_failed=Mock())
         self.observer = RuntimeObserver(runtime, self.bridge, engine)
         self.observer.authority = lambda: copy.deepcopy(self.authority)
 
@@ -47,6 +58,7 @@ class RuntimeProjectionTests(unittest.TestCase):
             "deployment": {"id": "test-project", "incarnation": "test-deployment"},
             "revision": "1", "freshness": {"status": "fresh", "age_ns": "0", "maximum_age_ns": "5000000000"},
             "replicas": replicas, "tables": tables, "receipts": receipts, "metrics": metrics,
+            "receipt_observation_known": self.bridge.publish.call_args.kwargs["receipt_observation_known"],
             "coverage": {"complete": False, "missing": missing,
                          "dropped": self.bridge.publish.call_args.kwargs.get("dropped", 0)},
         })
@@ -54,8 +66,9 @@ class RuntimeProjectionTests(unittest.TestCase):
     def test_effect_identity_probe_does_not_wait_for_telemetry(self):
         original = self.observer.engine.get
         self.observer.engine.get = Mock(side_effect=original)
-        _, _, running, stats, _ = self.observer.component(("collector1", "collector1"), with_stats=False)
+        _, _, running, stats, _, paused = self.observer.component(("collector1", "collector1"), with_stats=False)
         self.assertTrue(running)
+        self.assertFalse(paused)
         self.assertIsNone(stats)
         self.assertEqual(len(self.observer.engine.get.call_args_list), 1)
         self.assertTrue(self.observer.engine.get.call_args.args[0].endswith("/json"))
@@ -67,12 +80,14 @@ class RuntimeProjectionTests(unittest.TestCase):
             ([receipt], [], 0), RuntimeError("private-diagnostic"), ([receipt], [], 0)])
         self.observer.sample()
         self.assertNotIn("receipts", self.packet()["coverage"]["missing"])
+        self.assertIs(self.packet()["receipt_observation_known"], True)
         self.assertEqual(self.packet()["receipts"][0]["completion"], "completed")
         self.observer.sample()
         self.assertEqual(self.packet()["receipts"][0]["operation_id"], "unit-1")
         self.assertEqual(self.packet()["receipts"][0]["completion"], "unknown")
         self.assertIn("receipts", self.packet()["coverage"]["missing"])
         self.assertIn("receipt-observation-error", self.packet()["coverage"]["missing"])
+        self.assertIsNone(self.packet()["receipt_observation_known"])
         self.assertEqual(self.packet()["coverage"]["dropped"], 1)
         self.observer.sample()
         self.assertEqual(self.packet()["receipts"][0]["completion"], "completed")
@@ -92,19 +107,18 @@ class RuntimeProjectionTests(unittest.TestCase):
         self.assertGreater(int(cpu["duration_ns"]), 0)
         self.assertNotIn("owned-id", str(packet))
 
-    def test_restart_changes_resource_incarnation_and_resets_counter_interval(self):
+    def test_unapproved_restart_is_not_projected_as_a_verified_new_incarnation(self):
         self.observer.sample()
         before = self.packet()["replicas"][0]["resource"]
         self.state["State"]["StartedAt"] = "replacement-process"
         self.stats["cpu_stats"]["cpu_usage"]["total_usage"] = 1
-        self.observer.sample()
-        packet = self.packet()
-        self.assertNotEqual(before, packet["replicas"][0]["resource"])
-        self.assertIsNone(next(metric["value"] for metric in packet["metrics"] if metric["metric"] == "cpu"))
+        with self.assertRaisesRegex(Denial, "wrong-target"):
+            self.observer.sample()
+        self.assertEqual(before, self.packet()["replicas"][0]["resource"])
 
     def test_foreign_resource_and_foreign_policy_are_rejected(self):
         self.state["Config"]["Labels"]["delta-runtime"] = "foreign"
-        with self.assertRaisesRegex(ValueError, "identity"):
+        with self.assertRaisesRegex(Denial, "wrong-target"):
             self.observer.sample()
         self.state["Config"]["Labels"]["delta-runtime"] = "test-project"
         self.authority["policies"]["collector1"] = {"incarnation": {**self.writer, "process": "foreign"}}
@@ -118,6 +132,33 @@ class RuntimeProjectionTests(unittest.TestCase):
         memory = next(metric for metric in packet["metrics"] if metric["metric"] == "memory")
         self.assertIsNone(memory["value"])
         self.assertEqual(memory["method"], "not-observed")
+
+    def test_healthy_empty_receipt_probe_is_known_without_inventing_completion(self):
+        self.observer.receipt_probe = lambda: ([], [], 0)
+        self.observer.sample()
+        self.assertIs(self.packet()["receipt_observation_known"], True)
+        self.assertEqual(self.packet()["receipts"], [])
+        self.assertTrue(all(row["identity_verified"] is True for row in self.packet()["replicas"]))
+
+    def test_actual_missing_receipts_projection_keeps_health_null_until_explicit_empty(self):
+        from live_receipts import ReceiptObserver
+        projection = {"state": {"tables": {}}}
+        receipts = ReceiptObserver(self.observer.runtime, sql=lambda: projection)
+        self.observer.receipt_probe = receipts.sample
+        self.observer.sample()
+        self.assertIsNone(self.packet()["receipt_observation_known"])
+        self.assertIn("receipt-observation-error", self.packet()["coverage"]["missing"])
+        self.assertEqual(self.packet()["receipts"], [])
+        projection["receipts"] = []
+        self.observer.sample()
+        self.assertIs(self.packet()["receipt_observation_known"], True)
+        self.assertNotIn("receipt-observation-error", self.packet()["coverage"]["missing"])
+        projection["receipts"].append({
+            "table_id": "main", "operation_id": "concurrent-unit", "version": 0, "digest": "a" * 64,
+        })
+        self.observer.sample()
+        self.assertIsNone(self.packet()["receipt_observation_known"])
+        self.assertIn("receipt-observation-error", self.packet()["coverage"]["missing"])
 
     def test_malformed_first_cpu_counter_is_not_saved_for_later_intervals(self):
         self.stats["cpu_stats"]["cpu_usage"]["total_usage"] = True
@@ -246,8 +287,7 @@ class RuntimeProjectionTests(unittest.TestCase):
                 "exclusion_did_not_block_owned_table_streams": True, "stale_policy_and_wrong_resource_denied": True,
                 "sql_image": live_runtime.SQL_IMAGE, "runtime_image": live_runtime.RUNTIME_IMAGE,
                 "source_sha256": {name: hashlib.sha256((sources / name).read_bytes()).hexdigest()
-                                  for name in ("live_executor.py", "live_ledger.py", "live_contract.py",
-                                               "contracts/live-v1.schema.json")},
+                                  for name in live_runtime.QUALIFICATION_SOURCES},
                 "shared_binaries": {"qualified-binary": hashlib.sha256(binary.read_bytes()).hexdigest()},
             }
             path = root / "proof.json"
@@ -273,9 +313,7 @@ class RuntimeProjectionTests(unittest.TestCase):
             binary = root / "target/debug/qualified-binary"
             binary.write_bytes(b"synthetic qualified binary")
             sources = Path(live_runtime.__file__).parent
-            names = ("live_effects.py", "live_executor.py", "live_faults.py", "live_workload.py", "live_ledger.py",
-                     "live_server.py", "live_runtime.py", "live_deployment.py", "live_contract.py", "live_receipts.py",
-                     "contracts/live-v1.schema.json")
+            names = live_runtime.QUALIFICATION_SOURCES
             proof = {
                 "server_exit_code": 0, "exact_owned_containers_stopped": 8,
                 "ordinary_delta_exact_marker_rows": 65548, "bounded_single_attempts": 4, "arm": "adr",
@@ -301,6 +339,7 @@ class RuntimeProjectionTests(unittest.TestCase):
                     path.write_text(json.dumps(changed))
                     with self.subTest(field=field), self.assertRaises(ValueError):
                         live_runtime.verify_effects_proof(path)
+
                 http = {**proof, "proof_kind": "guarded-http-effects",
                         "physical_workload_units": 4, "combined_ordinary_delta_exact_marker_rows": 65554,
                         "native_policy_mutations": 4, "frontend_mutations": False,
@@ -336,6 +375,43 @@ class RuntimeProjectionTests(unittest.TestCase):
                 path.write_bytes(b"x" * 262145)
                 with self.assertRaisesRegex(ValueError, "exceeds bound"):
                     live_runtime.verify_effects_proof(path)
+
+    def test_collector_add_proof_requires_current_inventory_capacity_and_receipt_sources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "target/debug").mkdir(parents=True)
+            binary = root / "target/debug/qualified-binary"
+            binary.write_bytes(b"synthetic qualified binary")
+            sources = Path(live_runtime.__file__).parent
+            proof = {
+                "proof_kind": "collector-add-small", "arm": "adr", "frontend_mutations": False,
+                "server_exit_code": 0, "exact_owned_containers_stopped": 9,
+                "ordinary_delta_exact_marker_rows": 6, "collector_create_calls": 1,
+                "sql_image": live_runtime.SQL_IMAGE, "runtime_image": live_runtime.RUNTIME_IMAGE,
+                "source_sha256": {name: hashlib.sha256((sources / name).read_bytes()).hexdigest()
+                                  for name in live_runtime.QUALIFICATION_SOURCES},
+                "shared_binaries": {"qualified-binary": hashlib.sha256(binary.read_bytes()).hexdigest()},
+            }
+            for field in (
+                "actual_http_collector_add", "lost_creation_response_same_id_no_replay",
+                "native_collector4_registered_active", "exact_new_resource_isolation_verified",
+                "current_safety_and_receipt_observations", "unknown_receipt_admission_denied",
+                "small_streams_one_exact_receipts", "streams_above_qualified_max_denied",
+                "single_request_scope_advertised", "multiple_requests_denied",
+                "bridge_restart_same_id_no_recreation", "removal_disabled", "endpoint_closed",
+            ):
+                proof[field] = True
+            path = root / "creation-proof.json"
+            with patch.object(live_runtime, "REPO", root), patch.object(live_runtime, "BINARIES", ("qualified-binary",)):
+                path.write_text(json.dumps(proof))
+                self.assertEqual(live_runtime.verify_creation_proof(path), hashlib.sha256(path.read_bytes()).hexdigest())
+                for name in ("live_inventory.py", "live_capacity.py", "live_receipts.py",
+                             "contracts/live-v1.schema.json"):
+                    changed = copy.deepcopy(proof)
+                    changed["source_sha256"].pop(name)
+                    path.write_text(json.dumps(changed))
+                    with self.subTest(name=name), self.assertRaises(ValueError):
+                        live_runtime.verify_creation_proof(path)
 
 
 if __name__ == "__main__":

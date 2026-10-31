@@ -117,6 +117,11 @@ class FleetInventory:
                 "CREATE TABLE IF NOT EXISTS fleet_creations "
                 "(operation_id TEXT PRIMARY KEY, role TEXT NOT NULL, slot INTEGER NOT NULL, "
                 "nonce TEXT NOT NULL UNIQUE, name TEXT NOT NULL UNIQUE, image TEXT NOT NULL, record TEXT)")
+            self.connection.execute(
+                "CREATE TABLE IF NOT EXISTS fleet_dispatches "
+                "(operation_id TEXT PRIMARY KEY, config TEXT NOT NULL)")
+            self.connection.execute(
+                "CREATE TABLE IF NOT EXISTS fleet_cancellations (operation_id TEXT PRIMARY KEY)")
             manifest_hash = hashlib.sha256((self.root / MANIFEST).read_bytes()).hexdigest()
             self.connection.execute("BEGIN IMMEDIATE")
             try:
@@ -156,6 +161,7 @@ class FleetInventory:
         expected = [(*row, None) for row in baseline_slots]
         records = [json.loads(row[3]) for row in baseline_slots]
         creations = self.connection.execute("SELECT * FROM fleet_creations").fetchall()
+        cancelled = {row[0] for row in self.connection.execute("SELECT operation_id FROM fleet_cancellations")}
         for operation, role, slot, nonce, name, image, value in creations:
             if (not isinstance(operation, str)
                     or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", operation)
@@ -170,13 +176,16 @@ class FleetInventory:
                 if record["image"] != image:
                     raise ValueError("persisted fleet image changed")
                 records.append(record)
-            expected.append((role, slot, name, value, operation))
+            if operation not in cancelled:
+                expected.append((role, slot, name, value, operation))
+            elif value is not None:
+                raise ValueError("bound fleet creation cannot be cancelled")
         actual = self.connection.execute("SELECT * FROM fleet_slots").fetchall()
         revision = self.connection.execute("SELECT revision FROM fleet_state WHERE id=1").fetchone()[0]
         if (sorted(actual) != sorted(expected)
                 or len({record["id"] for record in records}) != len(records)
                 or type(revision) is not int
-                or revision != len(creations) + sum(row[-1] is not None for row in creations)):
+                or revision != len(creations) + sum(row[-1] is not None for row in creations) + len(cancelled)):
             raise ValueError("inconsistent persisted fleet inventory")
 
     def snapshot(self):
@@ -210,6 +219,60 @@ class FleetInventory:
         ).rowcount != 1:
             raise Denial("stale")
 
+    def begin_creation(self, operation_id, revision, config):
+        """Durable one-use dispatch marker, separate from slot/binding revision."""
+        with self.lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self.connection.execute(
+                    "SELECT record FROM fleet_creations WHERE operation_id=?", (operation_id,)).fetchone()
+                if row is None:
+                    raise Denial("unknown-operation")
+                if self.connection.execute(
+                        "SELECT 1 FROM fleet_cancellations WHERE operation_id=?", (operation_id,)).fetchone():
+                    raise Denial("conflict")
+                prior = self.connection.execute(
+                    "SELECT config FROM fleet_dispatches WHERE operation_id=?", (operation_id,)).fetchone()
+                value = serialized(config)
+                if prior is not None:
+                    if prior[0] != value:
+                        raise Denial("conflict")
+                    self.connection.execute("COMMIT")
+                    return False
+                if row[0] is not None:
+                    raise Denial("conflict")
+                current = self.connection.execute("SELECT revision FROM fleet_state WHERE id=1").fetchone()[0]
+                if type(revision) is not int or revision != current:
+                    raise Denial("stale")
+                self.connection.execute("INSERT INTO fleet_dispatches VALUES (?,?)", (operation_id, value))
+                self.connection.execute("COMMIT")
+                return True
+            except BaseException:
+                self.connection.execute("ROLLBACK")
+                raise
+
+    def cancel_preflight(self, operation_id):
+        """Release only a definitively rejected, never-dispatched slot; retain its intent."""
+        with self.lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                if self.connection.execute(
+                        "SELECT 1 FROM fleet_dispatches WHERE operation_id=?", (operation_id,)).fetchone():
+                    raise Denial("conflict")
+                slot = self.connection.execute(
+                    "SELECT role,slot,record FROM fleet_slots WHERE operation_id=?", (operation_id,)).fetchone()
+                if slot is not None:
+                    if slot[2] is not None:
+                        raise Denial("conflict")
+                    revision = self.connection.execute("SELECT revision FROM fleet_state WHERE id=1").fetchone()[0]
+                    self._advance(revision)
+                    self.connection.execute("DELETE FROM fleet_slots WHERE operation_id=?", (operation_id,))
+                    self.connection.execute("INSERT INTO fleet_cancellations VALUES (?)", (operation_id,))
+                self.connection.execute("COMMIT")
+            except BaseException:
+                self.connection.execute("ROLLBACK")
+                raise
+
     def reserve_creation(self, operation_id, role, slot, revision):
         if (not isinstance(operation_id, str)
                 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", operation_id)
@@ -222,7 +285,8 @@ class FleetInventory:
                 prior = self.connection.execute(
                     "SELECT role,slot FROM fleet_creations WHERE operation_id=?", (operation_id,)).fetchone()
                 if prior is not None:
-                    if prior != (role, slot):
+                    if prior != (role, slot) or self.connection.execute(
+                            "SELECT 1 FROM fleet_cancellations WHERE operation_id=?", (operation_id,)).fetchone():
                         raise Denial("conflict")
                     self.connection.execute("COMMIT")
                     return False
@@ -303,3 +367,95 @@ class FleetInventory:
                 self.connection.execute("ROLLBACK")
                 raise
         return record
+
+
+def read_inventory(root, deployment):
+    """Bounded private read-only overlay; children never acquire the writer lease."""
+    root = Path(root)
+    private_root(root)
+    path = root / "bridge-fleet.sqlite"
+    if path.is_symlink():
+        raise ValueError("invalid fleet database symlink")
+    if not path.exists():
+        return []
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(descriptor)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_mode & 0o077 or info.st_nlink != 1):
+            raise ValueError("invalid fleet overlay database")
+        connection = sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True, timeout=2)
+        try:
+            connection.execute("BEGIN")
+            state = connection.execute("SELECT deployment,manifest,baseline FROM fleet_state WHERE id=1").fetchone()
+            manifest = read_private(root / MANIFEST)
+            if state != (serialized(deployment), hashlib.sha256((root / MANIFEST).read_bytes()).hexdigest(),
+                         serialized(manifest["containers"])):
+                raise Denial("wrong-target")
+            rows = connection.execute(
+                "SELECT operation_id,role,slot,nonce,name,image,record FROM fleet_creations LIMIT 65").fetchall()
+            if len(rows) > 64:
+                raise Denial("limit")
+            dispatch_table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='fleet_dispatches'").fetchone()
+            dispatches = dict(connection.execute("SELECT operation_id,config FROM fleet_dispatches LIMIT 65")) \
+                if dispatch_table else {}
+            cancellation_table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='fleet_cancellations'").fetchone()
+            cancelled = {row[0] for row in connection.execute("SELECT operation_id FROM fleet_cancellations LIMIT 65")} \
+                if cancellation_table else set()
+            connection.execute("COMMIT")
+        finally:
+            connection.close()
+    finally:
+        os.close(descriptor)
+    result = []
+    for operation, role, slot, nonce, name, image, value in rows:
+        if operation in cancelled:
+            if value is not None or operation in dispatches:
+                raise ValueError("invalid cancelled fleet overlay")
+            continue
+        if (role not in ("collector", "gateway") or type(slot) is not int or not 1 <= slot <= 4
+                or not isinstance(nonce, str) or not re.fullmatch(r"[a-f0-9]{64}", nonce)
+                or name != f"{deployment['id']}-{role}{slot}-fleet-{nonce[:16]}"
+                or image not in {record["image"] for name, record in manifest["containers"].items()
+                                 if managed_slot(deployment["id"], name)
+                                 and managed_slot(deployment["id"], name)[0] == role}):
+            raise ValueError("invalid private inventory overlay")
+        record = record_identity(json.loads(value)) if value is not None else None
+        if record is not None and record["image"] != image:
+            raise Denial("wrong-target")
+        result.append({"operation_id": operation, "role": role, "slot": slot, "nonce": nonce,
+                       "name": name, "image": image, "record": record,
+                       "dispatch": json.loads(dispatches[operation]) if operation in dispatches else None})
+    return result
+
+
+def creation_labels(deployment, nonce):
+    return {"delta-runtime": deployment["id"], "bridge-deployment-incarnation": deployment["incarnation"],
+            "bridge-creation-nonce": nonce}
+
+
+def creation_state(engine, deployment, item, require_running=False):
+    labels = creation_labels(deployment, item["nonce"])
+    if item["record"] is None:
+        filters = quote(serialized({"label": [f"{key}={value}" for key, value in labels.items()]}), safe="")
+        candidates = engine.get("/containers/json?all=1&limit=2&filters=" + filters)
+        if candidates == []:
+            return None
+        if not isinstance(candidates, list) or len(candidates) != 1:
+            raise Denial("conflict")
+        identity = candidates[0]["Id"]
+    else:
+        identity = item["record"]["id"]
+    if not isinstance(identity, str) or not re.fullmatch(r"[a-f0-9]{64}", identity):
+        raise Denial("wrong-target")
+    state = engine.get(f"/containers/{identity}/json")
+    record = record_identity({"id": identity, "started_at": state["State"]["StartedAt"], "image": state["Image"]})
+    if (state["Id"] != identity or state["Name"] != "/" + item["name"] or state["Image"] != item["image"]
+            or any((state["Config"].get("Labels") or {}).get(key) != value for key, value in labels.items())
+            or item["record"] is not None and item["record"] != record
+            or require_running and (state["State"].get("Running") is not True
+                                    or state["State"].get("Paused") is not False)):
+        raise Denial("wrong-target")
+    return state

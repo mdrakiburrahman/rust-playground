@@ -73,7 +73,8 @@
       "properties": {
         "profile": {"enum": ["small", "elephant"]}, "table_id": {"$ref": "#/$defs/id"},
         "schema": {"enum": ["baseline", "evolved", "dictionary"]},
-        "streams": {"type": "integer", "minimum": 1, "maximum": 4},
+        "streams": {"type": "integer", "minimum": 1, "maximum": 4,
+                    "description": "Qualified maximum concurrent RPC streams for this preset; requests must not exceed it."},
         "rows_per_request": {"type": "integer", "minimum": 1, "maximum": 65536},
         "maximum_requests": {"type": "integer", "minimum": 1, "maximum": 256},
         "maximum_duration_ms": {"type": "integer", "minimum": 1, "maximum": 30000}
@@ -104,7 +105,7 @@
     },
     "replica": {
       "type": "object", "additionalProperties": false,
-      "required": ["resource", "role", "status", "writer", "policy_revision", "applied_policy_revision", "excluded", "block_streams", "retiring"],
+      "required": ["resource", "role", "status", "writer", "policy_revision", "applied_policy_revision", "excluded", "block_streams", "retiring", "identity_verified", "running", "paused"],
       "properties": {
         "resource": {"$ref": "#/$defs/identity"},
         "role": {"enum": ["gateway", "collector", "authority", "publisher", "storage"]},
@@ -113,7 +114,13 @@
         "policy_revision": {"oneOf": [{"$ref": "#/$defs/counter"}, {"type": "null"}]},
         "applied_policy_revision": {"oneOf": [{"$ref": "#/$defs/counter"}, {"type": "null"}]},
         "excluded": {"type": ["boolean", "null"]}, "block_streams": {"type": ["boolean", "null"]},
-        "retiring": {"type": ["boolean", "null"]}
+        "retiring": {"type": ["boolean", "null"]},
+        "identity_verified": {"type": ["boolean", "null"],
+                              "description": "Current server probe matched the private owned resource ID/start/image/name/deployment labels. Never inferred from public resource ID or status."},
+        "running": {"type": ["boolean", "null"],
+                    "description": "Current verified resource probe running state; null if identity is not verified or the probe is unavailable."},
+        "paused": {"type": ["boolean", "null"],
+                   "description": "Current verified resource probe paused state; null if identity is not verified or the probe is unavailable."}
       }
     },
     "table": {
@@ -138,7 +145,7 @@
     },
     "snapshot": {
       "type": "object", "additionalProperties": false,
-      "required": ["kind", "schema_version", "bridge", "deployment", "revision", "freshness", "replicas", "tables", "receipts", "metrics", "coverage"],
+      "required": ["kind", "schema_version", "bridge", "deployment", "revision", "freshness", "replicas", "tables", "receipts", "metrics", "coverage", "receipt_observation_known"],
       "properties": {
         "kind": {"const": "snapshot"}, "schema_version": {"const": 1},
         "bridge": {"$ref": "#/$defs/identity"}, "deployment": {"$ref": "#/$defs/identity"},
@@ -155,6 +162,8 @@
         "replicas": {"type": "array", "maxItems": 16, "items": {"$ref": "#/$defs/replica"}},
         "tables": {"type": "array", "maxItems": 32, "items": {"$ref": "#/$defs/table"}},
         "receipts": {"type": "array", "maxItems": 128, "items": {"$ref": "#/$defs/receipt"}},
+        "receipt_observation_known": {"type": ["boolean", "null"],
+                                      "description": "True only for a successful fresh server receipt probe, including a healthy empty result. Stale, failed or unavailable probes are null; receipt presence/RPC final is not evidence."},
         "metrics": {"type": "array", "maxItems": 256, "items": {"$ref": "#/$defs/metric"}},
         "coverage": {
           "type": "object", "additionalProperties": false,
@@ -241,8 +250,10 @@
           "properties": {"operation": {"enum": ["exclusion", "admission"]}, "target": {"$ref": "#/$defs/target"}, "enabled": {"type": "boolean"}}
         },
         {
-          "type": "object", "additionalProperties": false, "required": ["operation", "profile", "requests", "duration_ms"],
-          "properties": {"operation": {"const": "workload"}, "profile": {"enum": ["small", "elephant"]}, "requests": {"type": "integer", "minimum": 1, "maximum": 256}, "duration_ms": {"type": "integer", "minimum": 1, "maximum": 30000}}
+          "type": "object", "additionalProperties": false, "required": ["operation", "profile", "requests", "duration_ms", "streams"],
+          "properties": {"operation": {"const": "workload"}, "profile": {"enum": ["small", "elephant"]}, "requests": {"type": "integer", "minimum": 1, "maximum": 256}, "duration_ms": {"type": "integer", "minimum": 1, "maximum": 30000},
+                         "streams": {"type": "integer", "minimum": 1, "maximum": 4,
+                                     "description": "Requested bounded concurrency; must not exceed the selected server preset's qualified maximum. No silent ignoring or clamping."}}
         },
         {
           "type": "object", "additionalProperties": false, "required": ["operation", "resource", "fault", "duration_ms"],

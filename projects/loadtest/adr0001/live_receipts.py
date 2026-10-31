@@ -18,12 +18,17 @@ MAX_ACTIONS = 256 * 1024
 IDENTIFIER = re.compile(r"[A-Za-z0-9_-]{1,100}")
 DIGEST = re.compile(r"[a-f0-9]{64}")
 QUERY = (
-    "SET NOCOUNT ON; SET LOCK_TIMEOUT 1000; "
+    "SET NOCOUNT ON; SET LOCK_TIMEOUT 1000; SET XACT_ABORT ON; "
+    "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; BEGIN TRANSACTION; "
     "DECLARE @state nvarchar(max); SELECT @state=payload FROM delta_authority.state WHERE id=1; "
     "IF @state IS NULL OR DATALENGTH(@state)>1572864 THROW 51000,'bounded state unavailable',1; "
-    "SELECT JSON_QUERY(@state) AS state,JSON_QUERY((SELECT TOP(385) table_id,operation_id,version,digest "
-    "FROM delta_authority.receipts ORDER BY table_id,version FOR JSON PATH)) AS receipts "
-    "FOR JSON PATH,WITHOUT_ARRAY_WRAPPER;"
+    "DECLARE @receipts nvarchar(max); "
+    "IF EXISTS(SELECT 1 FROM delta_authority.receipts) "
+    "SELECT @receipts=(SELECT TOP(385) table_id,operation_id,version,digest "
+    "FROM delta_authority.receipts ORDER BY table_id,version FOR JSON PATH); "
+    "ELSE SET @receipts=N'[]'; "
+    "IF @receipts IS NULL OR ISJSON(@receipts)<>1 THROW 51000,'receipt projection unavailable',1; "
+    "SELECT N'{\"state\":'+@state+N',\"receipts\":'+@receipts+N'}'; COMMIT TRANSACTION;"
 )
 READER = (
     "import json,sys;from deltalake import DeltaTable;"
@@ -131,6 +136,11 @@ class ReceiptObserver:
 
     def sample(self):
         observation = self.sql()
+        if (not isinstance(observation, dict) or set(observation) != {"state", "receipts"}
+                or not isinstance(observation["state"], dict)
+                or not isinstance(observation["state"].get("tables"), dict)
+                or not isinstance(observation["receipts"], list)):
+            raise ValueError("SQL receipt projection requires explicit state, tables and receipts")
         tables = observation["state"]["tables"]
         allowed = {table["key"] for table in self.runtime.config["tables"]}
         if (not set(tables) <= allowed or len(tables) > 3 or len(observation["receipts"]) > 384

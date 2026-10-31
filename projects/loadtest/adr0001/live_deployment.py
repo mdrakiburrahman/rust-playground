@@ -85,6 +85,19 @@ def describe(engine, name, identity, project):
     return {"id": identity, "started_at": state["State"]["StartedAt"], "image": state["Image"]}
 
 
+def verified_state(runtime, name, engine=None):
+    engine = engine or runtime.engine
+    identity = runtime.owned_container(name)
+    state = engine.get(f"/containers/{identity}/json")
+    record = {"id": state["Id"], "started_at": state["State"]["StartedAt"], "image": state["Image"]}
+    labels = state["Config"].get("Labels") or {}
+    if (record != runtime.records[name] or state["Name"] != "/" + name
+            or not (labels.get("delta-runtime") == runtime.project
+                    or labels.get("publication-gate") == runtime.project)
+            or any(labels.get(key) != value for key, value in getattr(runtime, "creation_bindings", {}).get(name, {}).items())):
+        raise Denial("wrong-target")
+    return state
+
 def qualified_binary(root, name, digest):
     if not re.fullmatch(r"(?:adr-[a-z-]+|arrowcol-router-rust|delta-contract|publication-gate)", name):
         raise ValueError("invalid deployment binary name")
@@ -165,6 +178,34 @@ class AttachedRuntime:
         self.config = read_private(self.root / "config" / (self.control_role + ".json"))
         if not isinstance(self.config, dict) or not self.config.get("operator_token"):
             raise ValueError("deployment authority configuration unavailable")
+        self.birth_names = dict(self.names)
+        self.birth_records = dict(self.records)
+        self.creation_bindings = {}
+        self.refresh_inventory()
+
+    def refresh_inventory(self, cleanup=False):
+        from live_inventory import creation_labels, creation_state, read_inventory
+        names, records, bindings = dict(self.birth_names), dict(self.birth_records), {}
+        self.inventory_uncertain = False
+        for item in read_inventory(self.root, self.deployment):
+            record = item["record"]
+            if record is None:
+                self.inventory_uncertain = self.inventory_uncertain or item["dispatch"] is not None
+                if not cleanup or item["dispatch"] is None:
+                    continue
+                state = creation_state(self.engine, self.deployment, item)
+                if state is None:
+                    continue
+                record = {"id": state["Id"], "started_at": state["State"]["StartedAt"], "image": state["Image"]}
+            else:
+                role = item["role"] + (str(item["slot"]) if item["role"] == "collector" or item["slot"] > 1 else "")
+                if role in names or record["id"] in {value["id"] for value in records.values()}:
+                    raise Denial("conflict")
+                names[role] = item["name"]
+            records[item["name"]] = record
+            bindings[item["name"]] = creation_labels(self.deployment, item["nonce"])
+        self.names, self.records, self.creation_bindings = names, records, bindings
+        self.container_ids = {name: record["id"] for name, record in records.items()}
 
     def owned_container(self, name):
         if name not in self.container_ids:
@@ -184,10 +225,13 @@ class AttachedRuntime:
             return json.loads(raw, object_pairs_hook=unique_object)
 
     def finish_runtime(self):
+        self.refresh_inventory(cleanup=True)
         stopped = []
         for name, record in reversed(list(self.records.items())):
-            if describe(self.engine, name, record["id"], self.project) != record:
-                raise ValueError("refusing teardown of changed deployment incarnation")
+            try:
+                verified_state(self, name)
+            except Denial as error:
+                raise ValueError("refusing teardown of changed deployment incarnation") from error
             result = subprocess.run(["docker", "stop", "-t", "1", record["id"]],
                                     capture_output=True, timeout=20)
             if result.returncode != 0:

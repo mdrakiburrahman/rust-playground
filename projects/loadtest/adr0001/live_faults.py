@@ -15,7 +15,8 @@ import time
 
 from live_contract import Denial
 from live_deployment import (MANIFEST, RUNTIME_IMAGE, SQL_IMAGE, deployment_root, describe,
-                             private_root, read_private)
+                             private_root, read_private, verified_state)
+from live_inventory import creation_labels, read_inventory
 from observation import Engine
 
 
@@ -31,7 +32,7 @@ ALLOWED = {
 class FaultResource:
     """A worker can control one saved container, never execute native binaries."""
 
-    def __init__(self, project, subnet, arm, record, engine=None):
+    def __init__(self, project, subnet, arm, record, engine=None, repair_only=False):
         self.root = deployment_root(project)
         private_root(self.root)
         manifest = read_private(self.root / MANIFEST)
@@ -51,8 +52,26 @@ class FaultResource:
                 or type(action["duration_ms"]) is not int or not 1 <= action["duration_ms"] <= MAX_DURATION_MS):
             raise Denial("unsupported")
         name = project + "-" + role
-        if (native["name"] != name or role != "sql" and manifest["names"].get(role) != name
-                or manifest["containers"].get(name) != {k: native[k] for k in ("id", "started_at", "image")}
+        saved = manifest["containers"].get(name)
+        self.creation_bindings = {}
+        if native.get("creation_labels") is not None:
+            labels = native["creation_labels"]
+            nonce = labels.get("bridge-creation-nonce", "")
+            if (not re.fullmatch(r"[a-f0-9]{64}", nonce)
+                    or labels != creation_labels(deployment, nonce)
+                    or native["name"] != f"{project}-{role}-fleet-{nonce[:16]}"):
+                raise Denial("wrong-target")
+            name = native["name"]
+            saved = {key: native[key] for key in ("id", "started_at", "image")}
+            if not repair_only:
+                item = next((item for item in read_inventory(self.root, deployment)
+                             if item["name"] == name and item["record"] == saved), None)
+                if item is None or creation_labels(deployment, item["nonce"]) != labels:
+                    raise Denial("wrong-target")
+            self.creation_bindings[name] = labels
+        if (native["name"] != name or (role != "sql" and manifest["names"].get(role) != name
+                                     and not self.creation_bindings)
+                or saved != {k: native[k] for k in ("id", "started_at", "image")}
                 or not re.fullmatch(r"[a-f0-9]{64}", native["id"])
                 or not re.fullmatch(r"sha256:[a-f0-9]{64}", native["image"])
                 or role == "sql" and native["image"] != SQL_IMAGE
@@ -63,8 +82,8 @@ class FaultResource:
         self.engine = engine or Engine()
         self.project, self.subnet, self.arm, self.deployment = project, subnet, arm, deployment
         self.container_ids = {name: native["id"]}
-        if describe(self.engine, name, native["id"], project) != manifest["containers"][name]:
-            raise Denial("wrong-target")
+        self.records = {name: saved}
+        verified_state(self, name)
 
     def owned_container(self, name):
         if name not in self.container_ids:
@@ -162,7 +181,11 @@ def exact_state(runtime, record):
         key: native[key] for key in ("id", "started_at", "image")
     }:
         raise Denial("wrong-target")
-    return runtime.engine.get(f"/containers/{native['id']}/json")["State"]
+    state = runtime.engine.get(f"/containers/{native['id']}/json")
+    if any((state["Config"].get("Labels") or {}).get(key) != value
+           for key, value in native.get("creation_labels", {}).items()):
+        raise Denial("wrong-target")
+    return state["State"]
 
 
 def docker_effect(operation, identity):
@@ -274,13 +297,16 @@ class FaultSupervisor:
             raise Denial("wrong-target")
         identity = self.runtime.owned_container(name)
         native = describe(self.runtime.engine, name, identity, self.runtime.project)
+        verified_state(self.runtime, name)
         if action["resource"] != {
             "id": "resource-" + role,
             "incarnation": hashlib.sha256((identity + native["started_at"]).encode()).hexdigest(),
         }:
             raise Denial("wrong-target")
         record, fresh = self.journal.reserve(
-            operation_id, intent, {**native, "name": name})
+            operation_id, intent, {**native, "name": name, **(
+                {"creation_labels": self.runtime.creation_bindings[name]}
+                if name in getattr(self.runtime, "creation_bindings", {}) else {})})
         if not fresh:
             return record
         log_path = self.runtime.root / ("fault-worker-" + hashlib.sha256(operation_id.encode()).hexdigest() + ".log")
@@ -358,7 +384,8 @@ def main():
             raise Denial("disarmed")
     journal = FaultJournal(deployment_root(args.project))
     try:
-        runtime = FaultResource(args.project, args.subnet, args.arm, journal.get(args.operation_id))
+        runtime = FaultResource(args.project, args.subnet, args.arm, journal.get(args.operation_id),
+                                repair_only=args.repair_only)
         result = supervise(runtime, journal, args.operation_id, args.repair_only,
                            authorize=None if args.repair_only else authorize)
         if result["phase"] not in FINISHED:

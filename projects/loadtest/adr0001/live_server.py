@@ -21,7 +21,7 @@ from jsonschema.exceptions import ValidationError
 from exchange import unique_object
 from live_contract import (
     ARM_TTL_NS, Denial, DeploymentFence, REQUEST_BYTES, RESPONSE_BYTES,
-    SNAPSHOT_AGE_NS, SessionFence, authorize_command, decode_request, require_origin, validate_packet,
+    SNAPSHOT_AGE_NS, SessionFence, authorize_command, decode_request, require_observations, require_origin, validate_packet,
 )
 
 
@@ -62,6 +62,7 @@ class Bridge:
         self.history = deque(maxlen=64)
         self.revision = self.ledger.bind_deployment(deployment)
         self.last_resources = None
+        self.observation_unavailable = False
 
     @staticmethod
     def invalidate(session):
@@ -123,7 +124,8 @@ class Bridge:
             self.sessions[token] = Session(csrf, now + SESSION_TTL_NS)
         return {"csrf": csrf}, token
 
-    def publish(self, replicas, tables, receipts, metrics, missing, connected=True, observed_ns=None, dropped=0):
+    def publish(self, replicas, tables, receipts, metrics, missing, connected=True, observed_ns=None, dropped=0,
+                receipt_observation_known=None):
         with self.lock:
             now = time.monotonic_ns()
             observed_ns = now if observed_ns is None else observed_ns
@@ -138,6 +140,7 @@ class Bridge:
                 "freshness": {"status": ("fresh" if age <= SNAPSHOT_AGE_NS else "stale") if connected else "unknown",
                               "age_ns": str(age) if connected else None, "maximum_age_ns": str(SNAPSHOT_AGE_NS)},
                 "replicas": replicas, "tables": tables, "receipts": receipts, "metrics": metrics,
+                "receipt_observation_known": receipt_observation_known,
                 "coverage": {"complete": not missing and not dropped,
                              "missing": sorted(set(missing)), "dropped": dropped},
             }
@@ -148,8 +151,15 @@ class Bridge:
                 for session in self.sessions.values():
                     self.invalidate(session)
             self.last_resources = copy.deepcopy(resources)
+            self.observation_unavailable = False
             self.revision = revision
             self.history.append((copy.deepcopy(snapshot), observed_ns, connected))
+
+    def observation_failed(self):
+        with self.lock:
+            self.observation_unavailable = True
+            for session in self.sessions.values():
+                self.invalidate(session)
 
     def snapshot(self):
         with self.lock:
@@ -165,10 +175,19 @@ class Bridge:
         value, observed, connected = entry
         result = copy.deepcopy(value)
         age = time.monotonic_ns() - observed
+        connected = connected and not self.observation_unavailable
         result["freshness"].update(
             status=("fresh" if age <= SNAPSHOT_AGE_NS else "stale") if connected else "unknown",
             age_ns=str(age) if connected else None,
         )
+        if result["freshness"]["status"] != "fresh":
+            result["receipt_observation_known"] = None
+            result["receipts"] = [{**receipt, "completion": "unknown"} for receipt in result["receipts"]]
+            for replica in result["replicas"]:
+                replica.update(identity_verified=None, running=None, paused=None)
+        if self.observation_unavailable:
+            result["coverage"].update(
+                complete=False, missing=sorted(set(result["coverage"]["missing"]) | {"observation-gap"}))
         return result
 
     def capabilities(self):
@@ -176,6 +195,9 @@ class Bridge:
             connected = bool(self.history and self.snapshot()["freshness"]["status"] == "fresh")
             qualified = self.executor is not None and not self.executor.failed.is_set()
         supported = self.executor.operations if qualified else frozenset()
+        capacity = getattr(self.executor, "capacity", None)
+        if capacity is not None and not capacity.available():
+            supported = supported - {"replicas"}
         return {
             "kind": "capabilities", "schema_version": 1, "bridge": self.identity,
             "connected": connected, "qualified": qualified, "deployments": [self.deployment],
@@ -247,6 +269,7 @@ class Bridge:
                 raise Denial("disarmed")
             if snapshot["freshness"]["status"] != "fresh" or packet["revision"] != snapshot["revision"]:
                 raise Denial("stale")
+            require_observations(snapshot)
             session.arm_id = secrets.token_hex(16)
             session.arm_deadline_ns = time.monotonic_ns() + ARM_TTL_NS
             return {"kind": "armed", "schema_version": 1,
@@ -258,6 +281,7 @@ class Bridge:
             if self.executor is None:
                 raise Denial("unsupported")
             deployment, fence = self.command_fences(session)
+            require_observations(self.snapshot(), packet["action"])
             return self.executor.submit(packet, deployment, fence, self.origin,
                                         recheck=lambda: self.authorize_effect(packet, session))
 
@@ -268,6 +292,7 @@ class Bridge:
                 raise Denial("disarmed")
             deployment, fence = self.command_fences(session)
             authorize_command(packet, deployment, fence, self.origin)
+            require_observations(self.snapshot(), packet["action"])
 
     def command_fences(self, session):
         with self.lock:

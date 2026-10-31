@@ -21,8 +21,10 @@ from jsonschema.exceptions import ValidationError
 from delta_runtime import Runtime
 from delta_benchmark import BINARIES
 from live_contract import Denial, RESPONSE_BYTES
-from live_deployment import AttachedRuntime, DeploymentLease, deployment_root, save_deployment
+from live_deployment import AttachedRuntime, DeploymentLease, deployment_root, save_deployment, verified_state
 from live_effects import EffectExecutor
+from live_capacity import CollectorCapacity
+from live_inventory import FleetInventory
 from live_executor import PolicyExecutor
 from live_faults import FaultSupervisor
 from live_ledger import OperationLedger
@@ -31,6 +33,23 @@ from live_server import BoundedHTTPServer, Bridge
 from live_workload import NativeWorkload, WorkloadRunner
 from observation import Engine
 from publication_gate import REPO, RUNTIME_IMAGE, SQL_IMAGE
+
+
+QUALIFICATION_SOURCES = (
+    "live_effects.py", "live_executor.py", "live_faults.py", "live_workload.py", "live_ledger.py",
+    "live_server.py", "live_runtime.py", "live_deployment.py", "live_contract.py", "live_receipts.py",
+    "live_inventory.py", "live_capacity.py", "contracts/live-v1.schema.json",
+)
+
+
+def verify_source_dependencies(proof):
+    if not isinstance(proof.get("source_sha256"), dict):
+        raise ValueError("qualification source identities unavailable")
+    for name in QUALIFICATION_SOURCES:
+        if proof.get("source_sha256", {}).get(name) != hashlib.sha256(
+            (Path(__file__).parent / name).read_bytes()
+        ).hexdigest():
+            raise ValueError("qualification source mismatch")
 
 
 def require_local_images():
@@ -68,10 +87,7 @@ def verify_policy_proof(path):
         and proof.get("sql_image") == SQL_IMAGE and proof.get("runtime_image") == RUNTIME_IMAGE
     ):
         raise ValueError("policy qualification evidence is incomplete")
-    for name in ("live_executor.py", "live_ledger.py", "live_contract.py", "contracts/live-v1.schema.json"):
-        expected = proof.get("source_sha256", {}).get(name)
-        if expected != hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest():
-            raise ValueError("policy qualification source mismatch")
+    verify_source_dependencies(proof)
     for name in BINARIES:
         if proof.get("shared_binaries", {}).get(name) != hashlib.sha256(
             (REPO / "target/debug" / name).read_bytes()
@@ -139,14 +155,44 @@ def verify_effects_proof(path):
     binaries = proof.get("shared_binaries")
     if not isinstance(sources, dict) or not isinstance(binaries, dict):
         raise ValueError("effects qualification identities unavailable")
-    for name in ("live_effects.py", "live_executor.py", "live_faults.py", "live_workload.py", "live_ledger.py",
-                 "live_server.py", "live_runtime.py", "live_deployment.py", "live_contract.py", "live_receipts.py",
-                 "contracts/live-v1.schema.json"):
-        if sources.get(name) != hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest():
-            raise ValueError("effects qualification source mismatch")
+    verify_source_dependencies(proof)
     for name in BINARIES:
         if binaries.get(name) != hashlib.sha256((REPO / "target/debug" / name).read_bytes()).hexdigest():
             raise ValueError("effects qualification binary mismatch")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def verify_creation_proof(path):
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("collector-add qualification must be a regular local artifact")
+    with path.open("rb") as stream:
+        raw = stream.read(262145)
+    if len(raw) > 262144:
+        raise ValueError("collector-add qualification exceeds bound")
+    proof = json.loads(raw)
+    if (not isinstance(proof, dict) or proof.get("proof_kind") != "collector-add-small"
+            or proof.get("arm") != "adr" or proof.get("frontend_mutations") is not False
+            or type(proof.get("server_exit_code")) is not int or proof["server_exit_code"] != 0
+            or type(proof.get("exact_owned_containers_stopped")) is not int
+            or proof["exact_owned_containers_stopped"] != 9
+            or type(proof.get("ordinary_delta_exact_marker_rows")) is not int
+            or proof["ordinary_delta_exact_marker_rows"] != 6
+            or type(proof.get("collector_create_calls")) is not int or proof["collector_create_calls"] != 1
+            or proof.get("sql_image") != SQL_IMAGE or proof.get("runtime_image") != RUNTIME_IMAGE
+            or not all(proof.get(name) is True for name in (
+                "actual_http_collector_add", "lost_creation_response_same_id_no_replay",
+                "native_collector4_registered_active", "exact_new_resource_isolation_verified",
+                "current_safety_and_receipt_observations", "unknown_receipt_admission_denied",
+                "small_streams_one_exact_receipts", "streams_above_qualified_max_denied",
+                "single_request_scope_advertised", "multiple_requests_denied",
+                "bridge_restart_same_id_no_recreation", "removal_disabled", "endpoint_closed"))):
+        raise ValueError("collector-add qualification evidence is incomplete")
+    verify_source_dependencies(proof)
+    for name in BINARIES:
+        if proof.get("shared_binaries", {}).get(name) != hashlib.sha256(
+            (REPO / "target/debug" / name).read_bytes()
+        ).hexdigest():
+            raise ValueError("collector-add qualification binary mismatch")
     return hashlib.sha256(raw).hexdigest()
 
 
@@ -185,21 +231,23 @@ class RuntimeObserver:
     def component(self, item, with_stats=True):
         role, name = item
         identity = self.runtime.owned_container(name)
-        state = self.engine.get(f"/containers/{identity}/json")
-        labels = state["Config"].get("Labels") or {}
-        if state["Id"] != identity or not (
-            labels.get("delta-runtime") == self.runtime.project or labels.get("publication-gate") == self.runtime.project
-        ):
-            raise ValueError("deployment resource identity mismatch")
+        state = verified_state(self.runtime, name, self.engine)
+        running, paused = state["State"].get("Running"), state["State"].get("Paused")
+        if type(running) is not bool or type(paused) is not bool:
+            raise ValueError("resource safety state unavailable")
         resource = {"id": "resource-" + role,
                     "incarnation": hashlib.sha256((identity + state["State"]["StartedAt"]).encode()).hexdigest()}
         stats = None
         if state["State"]["Running"] and with_stats:
-            stats = self.engine.get(f"/containers/{identity}/stats?stream=false&one-shot=true")
-        return role, resource, state["State"]["Running"], stats, time.monotonic_ns()
+            try:
+                stats = self.engine.get(f"/containers/{identity}/stats?stream=false&one-shot=true")
+            except (OSError, RuntimeError, http.client.HTTPException) as error:
+                print("live resource statistics unavailable: " + type(error).__name__, flush=True)
+        return role, resource, running, stats, time.monotonic_ns(), paused
 
     def sample(self):
         started = time.monotonic_ns()
+        self.runtime.refresh_inventory()
         state = self.authority()
         members = {member["writer"]["collector"]: member for member in state["members"]}
         policies = state["policies"]
@@ -212,7 +260,9 @@ class RuntimeObserver:
         missing = {"receipts", "queue-depth", "queue-age", "throughput", "io-read", "io-write"}
         if dropped:
             missing.add("observation-gap")
-        for role, resource, running, stats, observed in results:
+        if self.runtime.inventory_uncertain:
+            missing.add("creation-reconciliation-required")
+        for role, resource, running, stats, observed, paused in results:
             member = members.get(role)
             writer = writer_alias(member["writer"]) if member else None
             policy = policies.get(role)
@@ -241,6 +291,7 @@ class RuntimeObserver:
                 "excluded": policy["excluded"] if policy else (False if member else None),
                 "block_streams": policy["block_streams"] if policy else (False if member else None),
                 "retiring": policy["retiring"] if policy else (False if member else None),
+                "identity_verified": True, "running": running, "paused": paused,
             })
             previous = self.previous.get(role)
             current_cpu = (stats or {}).get("cpu_stats", {}).get("cpu_usage", {}).get("total_usage")
@@ -293,6 +344,7 @@ class RuntimeObserver:
                                          if key in policy.get("recovery_obligations", {})],
             })
         receipts = []
+        receipt_known = None
         if self.receipt_probe is not None:
             try:
                 receipts, receipt_missing, receipt_dropped = self.receipt_probe()
@@ -300,12 +352,20 @@ class RuntimeObserver:
                 missing.update(receipt_missing)
                 dropped = min(dropped + receipt_dropped, 2147483647)
                 self.last_receipts = copy.deepcopy(receipts)
+                if not receipt_missing and not receipt_dropped:
+                    receipt_known = True
             except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.TimeoutExpired) as error:
                 print("live bridge receipt observation unavailable: " + type(error).__name__, flush=True)
                 missing.add("receipt-observation-error")
                 dropped = min(dropped + 1, 2147483647)
                 receipts = [{**receipt, "completion": "unknown"} for receipt in self.last_receipts]
-        self.bridge.publish(replicas, tables, receipts, metrics, list(missing), observed_ns=started, dropped=dropped)
+        if time.monotonic_ns() - started > 5_000_000_000:
+            receipt_known = None
+        if receipt_known is None:
+            missing.add("receipts")
+            receipts = [{**receipt, "completion": "unknown"} for receipt in receipts]
+        self.bridge.publish(replicas, tables, receipts, metrics, list(missing), observed_ns=started, dropped=dropped,
+                            receipt_observation_known=receipt_known)
         self.dropped = 0
 
     def start(self):
@@ -318,6 +378,7 @@ class RuntimeObserver:
                         http.client.HTTPException, Denial, ValidationError, urllib.error.URLError) as error:
                     # Preserve the last observation as stale; never fabricate successful telemetry.
                     self.dropped = min(self.dropped + 1, 2147483647)
+                    self.bridge.observation_failed()
                     print("live bridge observation unavailable: " + type(error).__name__, flush=True)
                 self.stop.wait(max(0, 1 - (time.monotonic() - started)))
         self.thread = threading.Thread(target=observe, name="local-poc-observer", daemon=True)
@@ -344,6 +405,8 @@ def main():
                         help="explicit matching direct-policy qualification; omitted means read-only")
     parser.add_argument("--effects-proof", type=Path,
                         help="additional exact-source preset/fault proof; also requires --policy-proof")
+    parser.add_argument("--creation-proof", type=Path,
+                        help="scoped exact-source collector3-to-4/small-stream1 proof; no removal/policy/fault grant")
     parser.add_argument("--resume", action="store_true", help="attach only the saved exact owned deployment")
     parser.add_argument("--retain-runtime-on-stop", action="store_true",
                         help="leave the verified owned runtime running after a normal bridge stop for bounded restart")
@@ -361,9 +424,13 @@ def main():
         if policy_proof is None or args.arm != "adr":
             raise ValueError("additional effects require matching policy qualification and the selected ADR PoC")
         verify_effects_proof(args.effects_proof)
+    if args.creation_proof is not None:
+        if args.arm != "adr" or args.policy_proof is not None or args.effects_proof is not None:
+            raise ValueError("collector-add scope requires the dedicated ADR-only qualification")
+        verify_creation_proof(args.creation_proof)
     deployment_root(args.project)
     runtime = lease = None
-    ledger, observer, server, executor, faults = None, None, None, None, None
+    ledger, observer, server, executor, faults, inventory = None, None, None, None, None, None
     served = False
     def stop(*_):
         if server is None:
@@ -392,6 +459,11 @@ def main():
         bridge = Bridge(f"http://127.0.0.1:{args.port}", deployment, args.frontend_root, ledger)
         if not args.resume:
             save_deployment(runtime, deployment, policy_proof)
+            native = runtime
+            runtime = AttachedRuntime(args.project, args.subnet, args.arm, policy_proof)
+            native.executor.shutdown(wait=True, cancel_futures=True)
+        inventory = FleetInventory(runtime.root, deployment)
+        runtime.refresh_inventory()
         attached = None
         if args.effects_proof is not None or (runtime.root / "bridge-faults.sqlite").exists():
             attached = AttachedRuntime(args.project, args.subnet, args.arm, policy_proof)
@@ -404,13 +476,20 @@ def main():
             def resource(collector):
                 if collector not in runtime.config["collectors"] or collector not in runtime.names:
                     raise Denial("wrong-target")
-                _, identity, running, _, _ = observer.component((collector, runtime.names[collector]), with_stats=False)
-                return identity if running else None
+                _, identity, running, _, _, paused = observer.component(
+                    (collector, runtime.names[collector]), with_stats=False)
+                return identity if running and not paused else None
             if args.effects_proof is None:
                 executor = PolicyExecutor(ledger, runtime.post, resource, bridge.snapshot)
             else:
                 workload = WorkloadRunner(ledger, NativeWorkload(attached), bridge.snapshot)
                 executor = EffectExecutor(ledger, runtime.post, resource, bridge.snapshot, faults, workload)
+            bridge.executor = executor
+        elif args.creation_proof is not None:
+            workload = WorkloadRunner(ledger, NativeWorkload(runtime), bridge.snapshot)
+            capacity = CollectorCapacity(runtime, inventory, bridge.snapshot)
+            executor = EffectExecutor(ledger, runtime.post, lambda _: None, bridge.snapshot,
+                                      workload=workload, capacity=capacity, policy_enabled=False, profiles={"small"})
             bridge.executor = executor
         server = BoundedHTTPServer(("127.0.0.1", args.port), bridge)
         observer.start()
@@ -446,12 +525,11 @@ def main():
                 finally:
                     try:
                         if runtime is not None:
-                            if served and args.retain_runtime_on_stop:
-                                if not args.resume:
-                                    runtime.executor.shutdown(wait=True, cancel_futures=True)
-                            else:
+                            if not (served and args.retain_runtime_on_stop):
                                 runtime.finish_runtime()
                     finally:
+                        if inventory is not None:
+                            inventory.close()
                         if lease is not None:
                             lease.close()
 

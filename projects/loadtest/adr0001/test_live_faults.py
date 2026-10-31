@@ -32,6 +32,8 @@ class FaultSupervisorTests(unittest.TestCase):
             deployment={"id": self.project, "incarnation": "c" * 32}, names={"collector1": self.name},
             sql_name=self.project + "-sql", owned_container=lambda _: self.identity,
             engine=SimpleNamespace(get=lambda _: copy.deepcopy(self.state)),
+            records={self.name: {"id": self.identity, "started_at": "synthetic-start",
+                                 "image": self.state["Image"]}},
         )
         self.supervisor = FaultSupervisor(self.runtime)
         self.journal = self.supervisor.journal

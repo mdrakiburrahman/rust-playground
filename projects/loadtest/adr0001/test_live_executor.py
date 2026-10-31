@@ -68,9 +68,11 @@ class PolicyExecutorTests(unittest.TestCase):
                 "resource": self.current_resource, "writer": self.writer, "role": "collector", "status": "active",
                 "policy_revision": str(policy["revision"]), "applied_policy_revision": str(policy["applied_revision"]),
                 "excluded": policy["excluded"], "block_streams": policy["block_streams"], "retiring": policy["retiring"],
+                "identity_verified": True, "running": True, "paused": False,
             }],
             "tables": [], "receipts": [], "metrics": [],
             "coverage": {"complete": False, "missing": ["receipts"], "dropped": 0},
+            "receipt_observation_known": None,
         }
 
     def apply(self, command=None):

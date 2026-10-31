@@ -13,14 +13,21 @@ EFFECT_UNCERTAIN = (*UNCERTAIN, subprocess.TimeoutExpired)
 
 
 class EffectExecutor(PolicyExecutor):
-    def __init__(self, ledger, post, resource, snapshot, faults=None, workload=None):
+    def __init__(self, ledger, post, resource, snapshot, faults=None, workload=None, capacity=None,
+                 policy_enabled=True, profiles=None):
         super().__init__(ledger, post, resource, snapshot)
-        self.faults, self.workload = faults, workload
-        self.operations = frozenset({"exclusion", "admission"}
+        self.faults, self.workload, self.capacity = faults, workload, capacity
+        self.operations = frozenset(({"exclusion", "admission"} if policy_enabled else set())
                                     | ({"fault"} if faults is not None else set())
-                                    | ({"workload"} if workload is not None else set()))
-        self.maximums = {"exclusion": 1, "admission": 1, "fault": MAX_DURATION_MS, "workload": 8}
-        self.presets = [dict(preset) for preset in PRESETS] if workload is not None else []
+                                    | ({"workload"} if workload is not None else set())
+                                    | ({"replicas"} if capacity is not None else set()))
+        self.maximums = {"exclusion": 1, "admission": 1, "fault": MAX_DURATION_MS, "workload": 8, "replicas": 4}
+        self.presets = [dict(preset) for preset in PRESETS if profiles is None or preset["profile"] in profiles] \
+            if workload is not None else []
+        if capacity is not None:
+            self.maximums["workload"] = 1
+            for preset in self.presets:
+                preset["maximum_requests"] = 1
 
     def validate_action(self, action):
         operation = action["operation"]
@@ -30,6 +37,11 @@ class EffectExecutor(PolicyExecutor):
             return super().validate_action(action)
         if operation == "workload":
             preset_for(action)
+            preset = next((preset for preset in self.presets if preset["profile"] == action["profile"]), None)
+            if preset is None or action["requests"] > preset["maximum_requests"]:
+                raise Denial("unsupported")
+        elif operation == "replicas":
+            self.capacity.validate_action(action)
         elif (action["fault"] not in ALLOWED or not 1 <= action["duration_ms"] <= MAX_DURATION_MS
               or action["resource"]["id"].removeprefix("resource-") not in ALLOWED[action["fault"]]):
             raise Denial("unsupported")
@@ -56,6 +68,8 @@ class EffectExecutor(PolicyExecutor):
                 self.faults.launch(operation_id, packet["action"], authorize_fault)
             elif operation == "workload":
                 self.workload.run(operation_id, identity, authorize, admitted, self.failed.is_set)
+            elif operation == "replicas":
+                self.capacity.run(operation_id, packet["action"], authorize, admitted)
             else:
                 raise Denial("unsupported")
             return self._reconcile(operation_id, identity)
@@ -84,6 +98,10 @@ class EffectExecutor(PolicyExecutor):
                 return self._fault_outcome(operation_id, deployment, intent)
             if operation == "workload" and self.workload is not None:
                 status, revision = self.workload.outcome(operation_id, deployment)
+                return self.ledger.advance(operation_id, deployment, status, revision,
+                                           error_code="unknown" if status == "unknown" else None)
+            if operation == "replicas" and self.capacity is not None:
+                status, revision = self.capacity.outcome(operation_id)
                 return self.ledger.advance(operation_id, deployment, status, revision,
                                            error_code="unknown" if status == "unknown" else None)
             raise Denial("unsupported")

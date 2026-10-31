@@ -50,6 +50,22 @@ class SharedEffectTests(unittest.TestCase):
         self.ledger.close()
         self.directory.cleanup()
 
+    def test_capacity_scope_advertises_and_admits_only_one_request(self):
+        executor = EffectExecutor(self.ledger, lambda _: {}, lambda _: self.resource, self.snapshot,
+                                  workload=self.workload, capacity=SimpleNamespace(),
+                                  policy_enabled=False, profiles={"small"})
+        try:
+            self.assertEqual(executor.maximums["workload"], 1)
+            self.assertEqual([preset["maximum_requests"] for preset in executor.presets], [1])
+            action = {"operation": "workload", "profile": "small", "requests": 1,
+                      "duration_ms": 10000, "streams": 1}
+            executor.validate_action(action)
+            with self.assertRaisesRegex(Denial, "unsupported"):
+                executor.validate_action({**action, "requests": 2})
+            self.assertEqual(self.workload_calls, 0)
+        finally:
+            executor.close()
+
     def snapshot(self):
         return {
             "kind": "snapshot", "schema_version": 1,
@@ -59,8 +75,10 @@ class SharedEffectTests(unittest.TestCase):
                 "resource": self.resource, "writer": self.writer, "role": "collector", "status": self.status,
                 "policy_revision": "0", "applied_policy_revision": "0",
                 "excluded": False, "block_streams": False, "retiring": False,
+                "identity_verified": True, "running": True, "paused": False,
             }], "tables": [], "receipts": [], "metrics": [],
             "coverage": {"complete": False, "missing": ["cpu"], "dropped": 0},
+            "receipt_observation_known": True,
         }
 
     def launch(self, operation_id, action, authorize):
@@ -143,7 +161,7 @@ class SharedEffectTests(unittest.TestCase):
                 self.packet, self.fence, self.session, self.session.allowed_origin)["status"], "requested")
             other = copy.deepcopy(self.packet)
             other.update(operation_id="workload-1", action={
-                "operation": "workload", "profile": "small", "requests": 1, "duration_ms": 1000})
+                "operation": "workload", "profile": "small", "requests": 1, "duration_ms": 1000, "streams": 1})
             with self.assertRaises(Denial):
                 self.executor.submit(other, self.fence, self.session, self.session.allowed_origin)
             with self.assertRaises(Denial):
@@ -153,7 +171,7 @@ class SharedEffectTests(unittest.TestCase):
 
     def test_workload_observation_not_dispatch_advances_completion(self):
         self.packet.update(operation_id="workload-1", action={
-            "operation": "workload", "profile": "small", "requests": 1, "duration_ms": 1000})
+            "operation": "workload", "profile": "small", "requests": 1, "duration_ms": 1000, "streams": 1})
         self.assertEqual(self.apply()["status"], "unknown")
         self.workload_status = ("completed", "8")
         done = self.executor.reconcile("workload-1", self.deployment)

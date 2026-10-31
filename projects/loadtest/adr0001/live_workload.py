@@ -21,13 +21,14 @@ PRESETS = (
 
 
 def preset_for(action):
-    if not isinstance(action, dict) or set(action) != {"operation", "profile", "requests", "duration_ms"}:
+    if not isinstance(action, dict) or set(action) != {"operation", "profile", "requests", "duration_ms", "streams"}:
         raise Denial("unsupported")
     preset = next((item for item in PRESETS if item["profile"] == action["profile"]), None)
     if (action["operation"] != "workload" or preset is None
             or type(action["requests"]) is not int or not 1 <= action["requests"] <= preset["maximum_requests"]
             or type(action["duration_ms"]) is not int
-            or not 1 <= action["duration_ms"] <= preset["maximum_duration_ms"]):
+            or not 1 <= action["duration_ms"] <= preset["maximum_duration_ms"]
+            or type(action["streams"]) is not int or not 1 <= action["streams"] <= preset["streams"]):
         raise Denial("unsupported")
     return copy.deepcopy(preset)
 
@@ -57,7 +58,7 @@ class WorkloadJournal:
                 base = 1_000_000_000 + count * 1_048_576
                 alias = hashlib.sha256((deployment["incarnation"] + "\0" + operation_id).encode()).hexdigest()[:32]
                 job = {
-                    "deployment": deployment, "phase": "prepared", "preset": preset,
+                    "deployment": deployment, "phase": "prepared", "preset": preset, "streams": action["streams"],
                     "attempts": [{
                         "request_id": "workload-" + alias + "-" + str(index),
                         "attempt_id": "workload-" + alias + "-" + str(index) + "-attempt-0",
@@ -231,8 +232,9 @@ class WorkloadRunner:
         job, fresh = self.journal.create(operation_id, deployment)
         if not fresh:
             return self.outcome(operation_id, deployment)
+        self.receipt_health(deployment)
         self.native.prepare()
-        authorize()
+        self.receipt_health(deployment)
         admitted()
         self.journal.update(operation_id, deployment, phase="running")
         action = self.journal.ledger.intent(operation_id, deployment)["action"]
@@ -241,6 +243,11 @@ class WorkloadRunner:
             remaining = deadline - time.monotonic()
             if stopping() or remaining <= 0:
                 break
+            # Current qualified presets admit exactly one concurrent stream.
+            if job["streams"] != 1:
+                raise Denial("unqualified")
+            authorize()
+            self.receipt_health(deployment)
             self.journal.update(operation_id, deployment, index, sent=True, rpc_status="pending")
             def remember(**changes):
                 self.journal.update(operation_id, deployment, index, **changes)
@@ -259,13 +266,23 @@ class WorkloadRunner:
         self.journal.update(operation_id, deployment, phase="finished")
         return self.outcome(operation_id, deployment)
 
+    def receipt_health(self, deployment):
+        snapshot = validate_packet(self.snapshot())
+        freshness = snapshot["freshness"]
+        if (snapshot["deployment"] != deployment or freshness["status"] != "fresh"
+                or freshness["age_ns"] is None or int(freshness["age_ns"]) > SNAPSHOT_AGE_NS):
+            raise Denial("stale")
+        if snapshot["receipt_observation_known"] is not True:
+            raise Denial("disconnected")
+        return snapshot
+
     def outcome(self, operation_id, deployment):
         job = self.journal.get(operation_id, deployment)
         if any(attempt["sent"] and attempt["unit"] is None for attempt in job["attempts"]):
             return "unknown", None
         if any(not attempt["sent"] for attempt in job["attempts"]):
             return "cancelled", None
-        snapshot = validate_packet(self.snapshot())
+        snapshot = self.receipt_health(deployment)
         freshness = snapshot["freshness"]
         if (snapshot["deployment"] != deployment or freshness["status"] != "fresh"
                 or freshness["age_ns"] is None or int(freshness["age_ns"]) > SNAPSHOT_AGE_NS):
