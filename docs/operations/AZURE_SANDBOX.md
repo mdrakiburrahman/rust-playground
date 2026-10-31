@@ -328,6 +328,12 @@ the `arrowcol`, `checkpoints` and `experimentqap` containers, including
 Delta/service checkpoints. It refuses preexisting soft-deleted objects rather than claiming
 hidden retained data is gone. Unknown resources cause failure, not deletion.
 
+Transient network errors and HTTP 408, 429 and 5xx responses are retried a bounded number of times, but only for
+reads and for cleanup calls that are safe to repeat: Kusto `.show` commands, `.drop ... ifexists`, and blob or path
+deletes pinned to a version, snapshot or `If-Match` ETag. A repeat after a success is an accepted 404; a changed
+object fails with 412 and is never retried. The ARM database delete, publisher-control compare-and-set updates and
+every other write stay single-shot. Each retry is logged to stderr with the method, service and socket error code.
+
 **The 60-second interval is not independently a fencing proof.** Safe destructive
 reset additionally requires every integrated publisher to have a verified
 whole-publication bound covering credential acquisition (including the Azure CLI

@@ -22,6 +22,10 @@ export const DEFAULT_STOP_COMMAND = ['npx', '--no-install', 'tsx', 'projects/loa
 export const DELETE_PARALLELISM = 32;
 export const READ_ATTEMPTS = 5;
 export const TRANSIENT_HTTP = new Set([408, 429, 500, 502, 503, 504]);
+export const SERVICE_NAMES: Record<string, string> = {
+  'https://management.azure.com/': 'ARM', 'https://storage.azure.com/': 'Storage', 'https://kusto.kusto.windows.net': 'Kusto',
+};
+export const service_name = (resource: string): string => SERVICE_NAMES[resource] ?? 'Azure';
 export const runtime = {
   sleep: (seconds: number) => new Promise<void>(resolve => setTimeout(resolve, seconds * 1000)),
   now: () => performance.now() / 1000,
@@ -218,13 +222,16 @@ export class Azure {
     try { return await refresh; } finally { this.token_pending.delete(resource); }
   }
   async request(method: string, url: string, resource: string, body?: string | Buffer | null,
-    headers: Headers = {}, missing_ok = false): Promise<[Buffer | null, Headers]> {
-    const attempts = ['GET', 'HEAD'].includes(method) ? READ_ATTEMPTS : 1;
+    headers: Headers = {}, missing_ok = false, idempotent = false): Promise<[Buffer | null, Headers]> {
+    // Writes stay single-shot unless the caller proves a repeat is harmless (read-only, ifexists or conditional).
+    const attempts = idempotent || ['GET', 'HEAD'].includes(method) ? READ_ATTEMPTS : 1;
     for (let attempt = 0; attempt < attempts; attempt++) {
       try { return await this._request_once(method, url, resource, body, headers, missing_ok); }
       catch (error) {
         if (!(error instanceof Failure) || attempt + 1 === attempts ||
             (error instanceof HttpFailure && !TRANSIENT_HTTP.has(error.code))) throw error;
+        console.error(`Transient ${method} ${service_name(resource)} failure; retry ${attempt + 1}/${attempts - 1}: ` +
+          error.message.slice(0, 200));
       }
       await runtime.sleep(Math.min(2 ** attempt, 15));
     }
@@ -245,7 +252,9 @@ export class Azure {
       return [bytes, { ...Object.fromEntries(response.headers.entries()), ':status': String(response.status) }];
     } catch (error) {
       if (error instanceof HttpFailure) throw error;
-      throw new Failure(this.c.redact(String(error)), { cause: error });
+      const code = (error as { cause?: { code?: unknown } } | null)?.cause?.code;
+      throw new Failure(this.c.redact(`${method} ${service_name(resource)} request failed: ${String(error)}` +
+        (typeof code === 'string' ? ` (${code})` : '')), { cause: error });
     }
   }
   async arm(method: string, resourcePath: string, body?: any, missing_ok = false, api = API): Promise<any> {
@@ -269,11 +278,12 @@ export class Azure {
     } catch { return 'Unknown'; }
   }
   async blob(method: string, container: string, name = '', query?: Record<string, string>,
-    body?: string | Buffer | null, headers: Headers = {}, missing_ok = false): Promise<[Buffer | null, Headers]> {
+    body?: string | Buffer | null, headers: Headers = {}, missing_ok = false, idempotent = false): Promise<[Buffer | null, Headers]> {
     let url = `https://${this.c.account}.blob.core.windows.net/${container}`;
     if (name) url += '/' + name.split('/').map(encodeURIComponent).join('/');
     if (query && Object.keys(query).length) url += '?' + new URLSearchParams(query);
-    return this.request(method, url, 'https://storage.azure.com/', body, { 'x-ms-version': '2023-11-03', ...headers }, missing_ok);
+    return this.request(method, url, 'https://storage.azure.com/', body, { 'x-ms-version': '2023-11-03', ...headers },
+      missing_ok, idempotent);
   }
   async blobs(container: string): Promise<BlobEntry[]> {
     const entries: BlobEntry[] = [];
@@ -310,11 +320,11 @@ export class Azure {
   async delete_directory(container: string, name: string, etag: string): Promise<void> {
     const encoded = name.split('/').map(encodeURIComponent).join('/');
     await this.request('DELETE', `https://${this.c.account}.dfs.core.windows.net/${container}/${encoded}?recursive=false`,
-      'https://storage.azure.com/', undefined, { 'x-ms-version': '2023-11-03', 'If-Match': etag }, true);
+      'https://storage.azure.com/', undefined, { 'x-ms-version': '2023-11-03', 'If-Match': etag }, true, true);
   }
-  async kql(command: string, database?: string): Promise<any> {
+  async kql(command: string, database?: string, idempotent = /^\.show\s/.test(command)): Promise<any> {
     const [data] = await this.request('POST', this.c.uri + '/v1/rest/mgmt', 'https://kusto.kusto.windows.net',
-      JSON.stringify({ db: database || this.c.database, csl: command }), { 'Content-Type': 'application/json' });
+      JSON.stringify({ db: database || this.c.database, csl: command }), { 'Content-Type': 'application/json' }, false, idempotent);
     const value = JSON.parse(data!.toString());
     if (value.error || value.HasErrors || (Array.isArray(value.Exceptions) ? value.Exceptions.length : value.Exceptions))
       throw new Failure(this.c.redact(JSON.stringify(value)));
@@ -989,7 +999,7 @@ export async function experiment_objects(azure: Azure): Promise<[string, string]
 }
 export async function clear_experiment_database(azure: Azure): Promise<void> {
   for (const [drop, name] of await experiment_objects(azure))
-    await azure.kql(`${drop} ['${name}'] ifexists`, azure.c.experimentDatabase);
+    await azure.kql(`${drop} ['${name}'] ifexists`, azure.c.experimentDatabase, true);
   if ((await experiment_objects(azure)).length)
     throw new Failure('Experiment database still has objects after cleanup; cleanup authority retained.');
 }
@@ -1008,10 +1018,11 @@ export async function delete_inventoried(azure: Azure, container: string, blob: 
   const query: Record<string, string> = {};
   if (blob.version) query.versionid = blob.version;
   else if (blob.snapshot) query.snapshot = blob.snapshot;
-  if (Object.keys(query).length) { await azure.blob('DELETE', container, blob.name, query, undefined, {}, true); return; }
+  // Repeating a version/snapshot or If-Match delete is harmless: success becomes 404 and a changed object fails 412.
+  if (Object.keys(query).length) { await azure.blob('DELETE', container, blob.name, query, undefined, {}, true, true); return; }
   if (blob.directory) await azure.delete_directory(container, blob.name, blob.etag!);
   else await azure.blob('DELETE', container, blob.name, undefined, undefined,
-    { 'x-ms-delete-snapshots': 'include', 'If-Match': blob.etag! }, true);
+    { 'x-ms-delete-snapshots': 'include', 'If-Match': blob.etag! }, true, true);
 }
 export async function no_databases(azure: Azure): Promise<void> {
   if ((await azure.collection(azure.c.cluster_id + '/databases'))

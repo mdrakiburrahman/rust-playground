@@ -752,6 +752,66 @@ test('read retries gateway timeout then succeeds and network retry trail stays b
   calls = 0; real._request_once = async () => { calls++; throw new b.Failure('network'); };
   await failure(() => real.request('GET', 'unused', 'resource')); assert.equal(calls, b.READ_ATTEMPTS);
 });
+test('idempotent writes opt in to the same bounded transient retry; default writes stay single-shot', async () => {
+  const errors: [() => Error, boolean][] = [[() => new b.HttpFailure(503, 'busy'), true],
+    [() => new b.HttpFailure(412, 'changed'), false], [() => new b.Failure('TypeError: fetch failed (ECONNRESET)'), true]];
+  for (const method of ['DELETE', 'POST']) for (const [error, transient] of errors) for (const idempotent of [false, true]) {
+    const real = new b.Azure(azure.c); let calls = 0;
+    real._request_once = async () => { calls++; throw error(); };
+    await failure(() => real.request(method, 'https://unused', 'resource', undefined, {}, false, idempotent));
+    assert.equal(calls, idempotent && transient ? b.READ_ATTEMPTS : 1);
+  }
+});
+test('Kusto .show and declared-idempotent drops retry; other management commands stay single-shot', async () => {
+  const real = new b.Azure(azure.c); const seen: string[] = []; let fail = 0;
+  real._request_once = async (_method, _url, _resource, body) => {
+    seen.push(JSON.parse(String(body)).csl);
+    if (fail-- > 0) throw new b.Failure('POST Kusto request failed: TypeError: fetch failed (UND_ERR_SOCKET)');
+    return [Buffer.from(JSON.stringify({ Tables: [{ Rows: [] }] })), {}];
+  };
+  fail = 2; await real.kql('.show tables | project TableName'); assert.equal(seen.length, 3);
+  seen.length = 0; fail = 2; await real.kql(".drop table ['t'] ifexists", 'db', true); assert.equal(seen.length, 3);
+  for (const command of [".create-or-alter external table ['t'] kind=delta (h@'x')",
+    ".alter-merge database ['d'] policy managed_identity '[]'", ".drop table ['t'] ifexists", '.showx']) {
+    seen.length = 0; fail = 1; await failure(() => real.kql(command)); assert.equal(seen.length, 1);
+  }
+});
+test('reset cleanup deletes survive a dropped connection; a repeated success is an accepted 404', async () => {
+  const real = new b.Azure(azure.c); const seen: string[] = [];
+  real._request_once = async (method, url, _resource, _body, headers = {}, missing_ok = false) => {
+    seen.push(`${method} ${url} ${headers['If-Match'] ?? ''}`); assert.equal(missing_ok, true);
+    if (seen.length % 2) throw new b.Failure('DELETE Storage request failed: TypeError: fetch failed (ECONNRESET)');
+    return [null, {}];
+  };
+  const blobs: b.BlobEntry[] = [
+    { name: 'a/v', version: 'v1', snapshot: null, etag: '"e1"', deleted: false },
+    { name: 'a/s', version: null, snapshot: 's1', etag: '"e2"', deleted: false },
+    { name: 'a/f', version: null, snapshot: null, etag: '"e3"', deleted: false },
+    { name: 'a', version: null, snapshot: null, etag: '"e4"', deleted: false, directory: true }];
+  for (const blob of blobs) await b.delete_inventoried(real, azure.c.data, blob);
+  assert.equal(seen.length, 8);
+  for (let index = 0; index < 8; index += 2) assert.equal(seen[index], seen[index + 1]);
+  assert.match(seen[5], /blob\.core.* "e3"$/); assert.match(seen[7], /dfs\.core.*recursive=false "e4"$/);
+  seen.length = 0;
+  real._request_once = async method => { seen.push(method); throw new b.HttpFailure(412, 'ConditionNotMet'); };
+  await failure(() => b.delete_inventoried(real, azure.c.data, blobs[2])); assert.equal(seen.length, 1);
+});
+test('database DELETE submission stays single-shot so custody records an unknown outcome', async () => {
+  const real = new b.Azure(azure.c); let calls = 0;
+  real._request_once = async () => { calls++; throw new b.Failure('DELETE ARM request failed: TypeError: fetch failed'); };
+  await failure(() => real.delete_database()); assert.equal(calls, 1);
+});
+test('network failures name the method, service and socket code', async () => {
+  const real = new b.Azure(azure.c); real.token = async () => 'token';
+  mock.method(globalThis, 'fetch', async () => {
+    throw new TypeError('fetch failed', { cause: Object.assign(new Error('socket'), { code: 'ECONNRESET' }) });
+  });
+  await assert.rejects(() => real._request_once('DELETE', 'https://unused.invalid/x', 'https://storage.azure.com/'),
+    (error: Error) => error instanceof b.Failure &&
+      error.message === 'DELETE Storage request failed: TypeError: fetch failed (ECONNRESET)');
+  await assert.rejects(() => real._request_once('POST', 'https://unused.invalid/x', 'https://kusto.kusto.windows.net'),
+    (error: Error) => error.message.startsWith('POST Kusto request failed: TypeError: fetch failed'));
+});
 test('real DELETE captures status and only Azure-AsyncOperation provider receipt', async () => {
   const real = new b.Azure(azure.c);
   real.request = async () => [Buffer.alloc(0), { ':status': '202', 'azure-asyncoperation': 'https://management.azure.com/operations/one' }];
