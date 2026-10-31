@@ -38,14 +38,6 @@
         "command": "npx --no-install tsx experiments/azure-qap/src/main.ts",
         "forwardAllArgs": true
       }
-    },
-    "cleanup": {
-      "executor": "nx:run-commands",
-      "cache": false,
-      "options": {
-        "command": "npx --no-install tsx experiments/azure-qap/src/main.ts cleanup",
-        "forwardAllArgs": true
-      }
     }
   }
 }

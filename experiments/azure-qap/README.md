@@ -1,39 +1,87 @@
-# Azure QAP experiment
+# Azure QAP demo
 
-| Purpose | Contract |
-| --- | --- |
-| Question | Does maintenance accelerate only new/replacement files, or reingest unchanged data? |
-| Prerequisites | Devcontainer, private `.env`, Azure sign-in and the [provisioned Azure sandbox](../../docs/operations/AZURE_SANDBOX.md) |
-| Execution | Small deterministic fixtures; no loadtest, router, UI or throughput run |
-| Writer | Production `BufferManager -> DeltaPublicationSink -> BatchedTable`, driven in-process rather than through a Flight deployment |
-| Isolation | Run-owned database, data/checkpoint containers and reader assignment; shared cluster/account/identity are preserved |
-| Evidence | Fsynced JSONL observations, exact Delta oracle, JSON and Markdown reports under `.temp/experiments/azure-qap/` |
-| Interpretation | [Measured findings and limits](../../docs/experiments/AZURE_QAP.md); correctness is not proof of no reingestion |
+A quick, tunable demo of how Kusto Query Acceleration (QAP) reacts to Delta
+maintenance on an external table, and how to get the evidence out of Kusto and
+Azure Storage logs yourself.
 
-```bash
-npx nx run azure-qap-experiment:run -- --config experiments/azure-qap/rapid.json --allow-immediate-vacuum
-```
+For each operation the run seeds a tiny Hive-partitioned Delta table, accelerates
+it with QAP, runs the real maintenance (or a known reload), watches QAP state, and
+then counts which **unchanged** Parquet files Kusto's managed identity read again
+(`StorageBlobLogs`). Every phase prints, in plain English, what it is doing and the
+exact KQL it runs, so you can copy the queries and explore while it runs.
 
-**The rapid profile really VACUUMs fresh tombstones with zero retention.**
-It intentionally tests QAP/old-snapshot reader failures, only on experiment
-resources. Ordinary maintenance retains its seven-day default.
+Background, findings and how to read the output:
+[docs/experiments/azure-qap/README.md](../../docs/experiments/azure-qap/README.md).
 
-The runner automatically cleans its manifest-owned resources after settled
-work. Interrupted or uncertain publishers block deletion. To retry cleanup,
-use the ownership manifest printed with the report; preview first:
+## Run
+
+Requires the devcontainer, a private `.env`, Azure sign-in and the provisioned
+sandbox (`npx nx run azure-infra:provision`). The run never deploys or deletes
+Azure resources: it uses the sandbox's `experimentqap` container, Kusto database
+and Log Analytics workspace.
 
 ```bash
-npx nx run azure-qap-experiment:cleanup -- --manifest <report-directory>/ownership.json
-npx nx run azure-qap-experiment:cleanup -- --manifest <report-directory>/ownership.json --execute
+npx nx run azure-qap-experiment:run                # quick default: ~5 min + bounded log wait
+npx nx run azure-qap-experiment:run -- --help
+npx nx run azure-qap-experiment:run -- --operations optimize,reload --tail 90s
+npx nx run azure-qap-experiment:run -- --files 16 --file-mib 32 --repetitions 2 --tail 10m --budget 1h
 ```
 
-| Direct runner exit code | Meaning |
-| --- | --- |
-| `0` | Passed with sufficient calibrated evidence |
-| `1` | Execution or exact-result failure |
-| `2` | Inconclusive: required evidence is unavailable |
-| `3` | Behavioral finding |
-| `130` | Interrupted |
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--operations <list>` | `optimize,purge,vacuum,reload` | Trials to run; `reload` drops and recreates the table (positive control) |
+| `--files <n>` | `2` | Files per multi-file partition role (2-128) |
+| `--file-mib <n>` | `1` | MiB per seeded file (1-32) |
+| `--repetitions <n>` | `1` | Trials per operation (1-10) |
+| `--parallel <n>` | `4` | Concurrent trials (1-8) |
+| `--tail <dur>` | `2m` | Watch window after the mutation once QAP is caught up; restarts if QAP regresses |
+| `--log-wait <dur>` | `5m` | Max wait for `StorageBlobLogs`; `0` skips it (not allowed with `reload`) |
+| `--budget <dur>` | `15m` | Hard cap for all trials; must cover `ceil(trials / parallel) x tail` |
+| `--env <file>` | `.env` | Private env file |
+| `--out <dir>` | `.temp/experiments/azure-qap/<runId>` | Report directory |
 
-Nx normalizes nonzero runner exits to `1`. Read `report.status` and individual
-stages: an overall `inconclusive` report can still contain explicit findings.
+Defaults live in [`scenario.json`](scenario.json); flags override them.
+Durations accept `90s`, `2m`, `1h`, `1h30m` or bare seconds.
+
+## What a trial does
+
+1. **Seed**: `arrowcol-experiment seed-scale` writes the table under
+   `experimentqap/runs/<runId>/<trial>/` using server-side blob copies of one
+   seed Parquet file. The VACUUM trial is seeded with tombstones already in its
+   Delta history, so VACUUM only deletes files that were unreferenced before QAP
+   was enabled.
+2. **Accelerate**: creates external table `qap_<runId>_<trial>` in the
+   `experimentqap` database, enables QAP and waits until it is caught up.
+3. **Mutate**: runs the real `delta-maintenance` OPTIMIZE, PURGE or VACUUM, or
+   drops and recreates the table for `reload`.
+4. **Tail**: watches QAP state and extents; if QAP looks caught up and then
+   regresses, the window restarts (bounded by `--budget`).
+5. **Log wait**: polls Log Analytics for reads by the Kusto managed identity under
+   the trial's prefix until late logs settle (bounded by `--log-wait`).
+6. **Report**: prints a table per trial and writes `report.md`, `report.json`,
+   `evidence.jsonl` and `queries/*.kql` under `--out`, plus the queries to
+   re-check late logs.
+
+A trial ends as `complete`, `late-logs-pending`, `budget-exceeded` or `failed`.
+
+## Cleanup and exit codes
+
+Cleanup always runs, including on failure and Ctrl+C: the run's Kusto tables are
+dropped and its fixture directory `runs/<runId>/` is deleted. If cleanup itself
+fails, the run prints the commands to finish it by hand.
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | Report written; pending late logs alone are not a failure |
+| `1` | Error, failed trial, Delta/oracle mismatch, failed cleanup, or an included `reload` that was not seen re-reading every unchanged file (for any reason, including pending logs or budget) |
+| `2` | Invalid flags or `scenario.json` |
+| `130` | Interrupted (cleanup still ran) |
+
+Nx reports any nonzero exit as `1`; read `report.json` for the details.
+
+## Develop
+
+```bash
+npx nx run azure-qap-experiment:lint
+npx nx run azure-qap-experiment:test
+```

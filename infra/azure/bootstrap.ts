@@ -13,6 +13,9 @@ export * from './authority.js';
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 export const API = '2024-04-13';
+export const LOG_ANALYTICS_API = '2023-09-01';
+export const DIAGNOSTIC_API = '2021-05-01-preview';
+export const STORAGE_READS_SETTING = 'arrowcol-storage-reads';
 export const LEASE_SECONDS = 15;
 export const TAGS = { project: 'rust-playground', purpose: 'disposable-arrowcol-sandbox' };
 export const DEFAULT_STOP_COMMAND = ['npx', '--no-install', 'tsx', 'projects/loadtest/src/main.ts', '--stop'];
@@ -64,9 +67,11 @@ function normalized_uuid(value: string): string {
 export class Config {
   subscription: string; group: string; sandbox: string; location: string; account: string;
   cluster: string; identity: string; database: string; data: string; checkpoints: string;
+  experimentContainer: string; experimentDatabase: string; logAnalyticsWorkspace: string;
   sku: string; minimum: number; maximum: number; hot: number; cluster_tags: Record<string, string>;
   operator: string; operator_type: string; operator_application: string; base: string;
-  storage_id: string; cluster_id: string; identity_id: string; uri: string; table_root: string; table_prefix: string;
+  storage_id: string; cluster_id: string; identity_id: string; workspace_id: string;
+  uri: string; table_root: string; table_prefix: string;
   constructor(values: Record<string, string | undefined>) {
     const get = (key: string, fallback = '') => values[key] || fallback;
     try { this.subscription = normalized_uuid(get('AZURE_SUBSCRIPTION_ID')); }
@@ -81,10 +86,20 @@ export class Config {
     this.database = get('AZURE_KUSTO_DATABASE', 'arrowcol');
     this.data = get('AZURE_STORAGE_CONTAINER', 'arrowcol');
     this.checkpoints = get('AZURE_STORAGE_CHECKPOINT_CONTAINER', 'checkpoints');
-    for (const value of [this.location, this.identity, this.cluster, this.database, this.data, this.checkpoints])
+    this.experimentContainer = get('AZURE_STORAGE_EXPERIMENT_CONTAINER', 'experimentqap');
+    this.experimentDatabase = get('AZURE_KUSTO_EXPERIMENT_DATABASE', 'experimentqap');
+    this.logAnalyticsWorkspace = get('AZURE_LOG_ANALYTICS_WORKSPACE', 'arrowcol-' + this.sandbox);
+    for (const value of [this.location, this.identity, this.cluster, this.database, this.data, this.checkpoints,
+      this.experimentContainer, this.experimentDatabase, this.logAnalyticsWorkspace])
       if (!/^[a-z][a-z0-9-]{1,62}$/.test(value)) throw new Failure('Resource names must be lowercase alphanumeric sandbox names.');
     if (!/^[a-z0-9]{3,24}$/.test(this.account)) throw new Failure('Invalid storage account name.');
-    if (this.data === this.checkpoints) throw new Failure('Data and checkpoint containers must be distinct.');
+    if (new Set([this.data, this.checkpoints, this.experimentContainer]).size !== 3)
+      throw new Failure('Data, checkpoint and experiment containers must be distinct.');
+    if (!/^[a-z0-9-]{2,62}[a-z0-9]$/.test(this.experimentContainer) || this.experimentContainer.includes('--'))
+      throw new Failure('Invalid experiment container name.');
+    if (this.experimentDatabase === this.database) throw new Failure('Experiment and sandbox databases must be distinct.');
+    if (!/^[a-z][a-z0-9-]{2,61}[a-z0-9]$/.test(this.logAnalyticsWorkspace))
+      throw new Failure('Invalid Log Analytics workspace name.');
     this.sku = get('AZURE_KUSTO_SKU', 'Standard_E4ads_v5');
     const integer = (key: string, fallback: string) => {
       const raw = get(key, fallback);
@@ -109,6 +124,7 @@ export class Config {
     this.storage_id = this.base + '/providers/Microsoft.Storage/storageAccounts/' + this.account;
     this.cluster_id = this.base + '/providers/Microsoft.Kusto/clusters/' + this.cluster;
     this.identity_id = this.base + '/providers/Microsoft.ManagedIdentity/userAssignedIdentities/' + this.identity;
+    this.workspace_id = this.base + '/providers/Microsoft.OperationalInsights/workspaces/' + this.logAnalyticsWorkspace;
     this.uri = `https://${this.cluster}.${this.location}.kusto.windows.net`;
     const root = get('ARROWCOL_AZURE_TABLE_ROOT', `abfss://${this.data}@${this.account}.dfs.core.windows.net/`);
     // Validate raw authority/path rather than URL's normalized path (which erases traversal).
@@ -122,7 +138,8 @@ export class Config {
   }
   redact(text: string): string {
     for (const value of [this.subscription, this.sandbox, this.account, this.cluster, this.identity,
-      this.uri, this.database, this.data, this.checkpoints]) text = text.replaceAll(value, '[private]');
+      this.uri, this.database, this.data, this.checkpoints, this.experimentContainer, this.experimentDatabase,
+      this.logAnalyticsWorkspace]) text = text.replaceAll(value, '[private]');
     return text.replace(/https?:\/\/[^\s"'<>]+/g, '[endpoint]')
       .replace(/\b[\w.+-]+@[\w.-]+\.[A-Za-z]+\b/g, '[principal]')
       .replace(/\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b/gi, '[identifier]')
@@ -133,7 +150,10 @@ export class Config {
       AZURE_STORAGE_CHECKPOINT_CONTAINER: this.checkpoints, AZURE_KUSTO_CLUSTER: this.cluster,
       AZURE_KUSTO_DATABASE: this.database, AZURE_KUSTO_IDENTITY_NAME: this.identity, AZURE_KUSTO_URI: this.uri,
       ARROWCOL_AZURE_TABLE_ROOT: this.table_root,
-      ARROWCOL_AZURE_CHECKPOINT_ROOT: `abfss://${this.checkpoints}@${this.account}.dfs.core.windows.net/` };
+      ARROWCOL_AZURE_CHECKPOINT_ROOT: `abfss://${this.checkpoints}@${this.account}.dfs.core.windows.net/`,
+      AZURE_STORAGE_EXPERIMENT_CONTAINER: this.experimentContainer,
+      AZURE_KUSTO_EXPERIMENT_DATABASE: this.experimentDatabase,
+      AZURE_LOG_ANALYTICS_WORKSPACE: this.logAnalyticsWorkspace };
   }
 }
 function private_file(filename: string, bytes: string | Buffer): string {
@@ -432,7 +452,8 @@ export async function preflight(azure: Azure): Promise<void> {
   const c = azure.c;
   const account = await azure.cli('account', 'show', '--subscription', c.subscription);
   if (account.id.toLowerCase() !== c.subscription) throw new Failure('CLI subscription mismatch; no default-subscription fallback is permitted.');
-  for (const provider of ['Microsoft.Kusto', 'Microsoft.Storage', 'Microsoft.ManagedIdentity']) {
+  for (const provider of ['Microsoft.Kusto', 'Microsoft.Storage', 'Microsoft.ManagedIdentity',
+    'Microsoft.OperationalInsights', 'Microsoft.Insights']) {
     const state = (await azure.cli('provider', 'show', '--namespace', provider, '--subscription', c.subscription)).registrationState;
     if (state !== 'Registered') await azure.cli('provider', 'register', '--namespace', provider, '--subscription', c.subscription, '--wait');
   }
@@ -444,10 +465,10 @@ export async function preflight(azure: Azure): Promise<void> {
 }
 export async function guard_existing(azure: Azure): Promise<void> {
   const c = azure.c;
-  for (const resourcePath of [c.base, c.storage_id, c.cluster_id, c.identity_id]) {
+  for (const resourcePath of [c.base, c.storage_id, c.cluster_id, c.identity_id, c.workspace_id]) {
     const resource = await azure.arm('GET', resourcePath, undefined, true,
       resourcePath === c.base ? '2022-09-01' : resourcePath === c.storage_id ? '2023-05-01' :
-        resourcePath === c.identity_id ? '2023-01-31' : API);
+        resourcePath === c.identity_id ? '2023-01-31' : resourcePath === c.workspace_id ? LOG_ANALYTICS_API : API);
     if (resource) owned(resource, c);
   }
 }
@@ -462,6 +483,8 @@ export async function deploy(azure: Azure, fresh?: Metadata): Promise<void> {
   await guard_existing(azure);
   const params = { location: c.location, resourceGroupName: c.group, sandboxId: c.sandbox, storageAccountName: c.account,
     clusterName: c.cluster, identityName: c.identity, databaseName: c.database, dataContainer: c.data, checkpointContainer: c.checkpoints,
+    experimentContainer: c.experimentContainer, experimentDatabase: c.experimentDatabase,
+    logAnalyticsWorkspaceName: c.logAnalyticsWorkspace,
     operatorObjectId: c.operator, operatorKustoPrincipalId: c.operator_type === 'App' ? c.operator_application : c.operator,
     controlMetadata: fresh ?? {}, checkpointExists: fresh === undefined, operatorType: c.operator_type,
     clusterSku: c.sku, minimumInstances: c.minimum, maximumInstances: c.maximum, clusterTags: c.cluster_tags };
@@ -517,6 +540,11 @@ export async function provision(azure: Azure, tables: string, wait_seconds: numb
   const c = azure.c, control = new PublisherControl(azure);
   await guard_existing(azure);
   let generation: string;
+  const member = uuid();
+  const experiment = async () => {
+    await control.bootstrap_owner(member, generation); await ensure_running(azure);
+    await control.bootstrap_owner(member, generation); await experiment_policy(azure);
+  };
   if (await checkpoint_container(azure) === null) {
     const fresh = fresh_authority();
     await deploy(azure, fresh);
@@ -525,12 +553,16 @@ export async function provision(azure: Azure, tables: string, wait_seconds: numb
         Object.keys(registry).length || metadata.occupancy !== 'released')
       throw new Failure('New checkpoint authority does not match its initialized generation; concurrent first provisioning is unsupported.');
     generation = fresh.resetgeneration;
+    await control.admit(member, generation, true);
+    await held(control, member, generation, experiment);
+    await control.clean_release(member, generation, true);
   } else {
     const [metadata, registry] = await control.read();
     require_released(metadata); generation = metadata.resetgeneration;
-    const member = uuid();
     if (metadata.resetstate === READY) {
-      const steps: (() => Promise<unknown>)[] = [() => deploy(azure), () => ensure_running(azure)];
+      if (!infra_only && !fs.existsSync(tables))
+        throw new Failure('Table manifest is missing; run provision --infra-only, or reset --execute then a full provision.');
+      const steps: (() => Promise<unknown>)[] = [() => deploy(azure), () => ensure_running(azure), () => experiment_policy(azure)];
       if (!infra_only) steps.push(() => reconcile(azure, tables, wait_seconds));
       await exclusive(control, generation, steps);
       write_private(output, { ...c.generated(), ARROWCOL_RESET_GENERATION: generation });
@@ -540,7 +572,7 @@ export async function provision(azure: Azure, tables: string, wait_seconds: numb
     if (metadata.resetstate !== FENCED || Object.keys(registry).length)
       throw new Failure('Authority is cleanup-owned or has registered publishers; provisioning refused.');
     await control.admit(member, generation, true);
-    await held(control, member, generation, () => deploy(azure));
+    await held(control, member, generation, async () => { await deploy(azure); await experiment(); });
     await control.clean_release(member, generation, true);
   }
   write_private(output, c.generated());
@@ -567,6 +599,18 @@ export async function external_locations(azure: Azure): Promise<Record<string, s
   const result = await azure.kql('.show external tables | project TableName, ConnectionStrings');
   return Object.fromEntries((result?.Tables?.[0]?.Rows ?? []).map(([name, connections]: [string, unknown]) =>
     [name, typeof connections === 'string' ? JSON.parse(connections) : connections ?? []]));
+}
+export async function identity_principal(azure: Azure): Promise<string> {
+  return (await azure.arm('GET', azure.c.identity_id, undefined, false, '2023-01-31')).properties.principalId;
+}
+export function managed_identity_policy(identity: string): string {
+  return JSON.stringify([{ ObjectId: identity, AllowedUsages: 'ExternalTable,AutomatedFlows' }]);
+}
+export async function experiment_policy(azure: Azure): Promise<void> {
+  const c = azure.c, policy = managed_identity_policy(await identity_principal(azure));
+  await retry_ready(() => azure.kql(`.alter-merge database ['${c.experimentDatabase}'] policy managed_identity '${policy}'`,
+    c.experimentDatabase), 'Experiment database');
+  console.log('Experiment database managed identity policy: ready');
 }
 export async function reconcile(azure: Azure, manifest: string, wait_seconds = 0): Promise<void> {
   const c = azure.c;
@@ -599,9 +643,8 @@ export async function reconcile(azure: Azure, manifest: string, wait_seconds = 0
     if (runtime.now() >= deadline) throw new NotReady(`Declared Delta logs are absent: ${missing}; no KQL was attempted.`);
     await runtime.sleep(Math.min(1, Math.max(0, deadline - runtime.now())));
   }
-  const identity = (await azure.arm('GET', c.identity_id, undefined, false, '2023-01-31')).properties.principalId;
-  const policy = JSON.stringify([{ ObjectId: identity, AllowedUsages: 'ExternalTable,AutomatedFlows' }]);
-  await azure.kql(`.alter-merge database ['${c.database}'] policy managed_identity '${policy}'`);
+  const identity = await identity_principal(azure);
+  await azure.kql(`.alter-merge database ['${c.database}'] policy managed_identity '${managed_identity_policy(identity)}'`);
   const qap = JSON.stringify({ IsEnabled: true, Hot: `${c.hot}.00:00:00`, ManagedIdentity: identity });
   const existing = await external_locations(azure);
   for (const table of tables) {
@@ -614,7 +657,7 @@ export async function reconcile(azure: Azure, manifest: string, wait_seconds = 0
   console.log(`External Delta tables and QAP reconciled: ${tables.length}`);
 }
 
-export async function reset_inventory(azure: Azure): Promise<[any[], Record<string, BlobEntry[]>]> {
+export async function reset_inventory(azure: Azure): Promise<[any[], Record<string, BlobEntry[]>, boolean]> {
   const c = azure.c;
   await guard_existing(azure);
   owned(await azure.arm('GET', c.cluster_id), c);
@@ -624,19 +667,23 @@ export async function reset_inventory(azure: Azure): Promise<[any[], Record<stri
   const service = (await azure.arm('GET', c.storage_id + '/blobServices/default', undefined, false, '2023-05-01')).properties;
   if (service.isVersioningEnabled || service.deleteRetentionPolicy?.enabled || service.containerDeleteRetentionPolicy?.enabled || service.restorePolicy?.enabled)
     throw new Failure('Retained copies are enabled; refusing a reset that cannot guarantee deletion.');
+  const leaf = (item: any): string => item.name.split('/').at(-1);
   const databases = await azure.collection(c.cluster_id + '/databases');
-  if (databases.some(item => item.name.split('/').at(-1) !== c.database))
+  if (databases.some(item => ![c.database, c.experimentDatabase].includes(leaf(item))))
     throw new Failure('Unexpected Kusto database present; refusing shared-resource reset.');
-  const containers = await azure.collection(c.storage_id + '/blobServices/default/containers', '2023-05-01');
-  if (canonical_json(containers.map(item => item.name.split('/').at(-1)).sort()) !== canonical_json([c.data, c.checkpoints].sort()))
+  const experiment = databases.some(item => leaf(item) === c.experimentDatabase);
+  const containers = (await azure.collection(c.storage_id + '/blobServices/default/containers', '2023-05-01')).map(leaf);
+  if (!containers.includes(c.data) || !containers.includes(c.checkpoints) ||
+      containers.some(name => ![c.data, c.checkpoints, c.experimentContainer].includes(name)))
     throw new Failure('Unexpected or missing container; refusing shared-resource reset.');
-  for (const name of [c.data, c.checkpoints]) {
+  const owned_containers = [c.data, c.checkpoints, ...containers.includes(c.experimentContainer) ? [c.experimentContainer] : []];
+  for (const name of owned_containers) {
     const container = await azure.arm('GET', c.storage_id + '/blobServices/default/containers/' + name, undefined, false, '2023-05-01');
     const metadata = Object.fromEntries(Object.entries(container.properties.metadata ?? {}).map(([k, v]) => [k.toLowerCase(), v]));
     if (metadata.sandboxid !== c.sandbox) throw new Failure('Container ownership metadata mismatch.');
   }
   const inventory: Record<string, BlobEntry[]> = {};
-  for (const name of [c.data, c.checkpoints]) {
+  for (const name of owned_containers) {
     inventory[name] = await azure.blobs(name);
     const byName = new Map(inventory[name].map(item => [item.name, item]));
     for (const item of await azure.paths(name)) {
@@ -652,12 +699,13 @@ export async function reset_inventory(azure: Azure): Promise<[any[], Record<stri
         entry.name.split('/').some(part => ['.', '..'].includes(part)))
       throw new Failure('Storage inventory contains a malformed or unscoped path.');
   }
-  return [databases, inventory];
+  return [databases.filter(item => leaf(item) === c.database), inventory, experiment];
 }
 export async function reset_preview(azure: Azure): Promise<void> {
-  const [databases, inventory] = await reset_inventory(azure);
-  console.log(`Reset preview: owned databases=${databases.length}, containers=2, stored objects=${Object.values(inventory).reduce((n, items) => n + items.length, 0)}`);
-  console.log('Preserve cluster, account, containers and managed identity.');
+  const [databases, inventory, experiment] = await reset_inventory(azure);
+  console.log(`Reset preview: owned databases=${databases.length}, experiment database=${experiment ? 'present (objects dropped)' : 'absent'}, ` +
+    `containers=${Object.keys(inventory).length}, stored objects=${Object.values(inventory).reduce((n, items) => n + items.length, 0)}`);
+  console.log('Preserve cluster, account, containers, experiment database, Log Analytics workspace and managed identity.');
 }
 export const RESET_RECORD = path.join(ROOT, '.env.azure.reset.json');
 export const RECEIPT_FIELDS = { stopped: true, scope: 'workspace-owned-loadtest', dataPreserved: true };
@@ -893,13 +941,14 @@ export async function _locked_reset_resume(azure: Azure, filename: string): Prom
   await cleanup_with_custody(azure, control, record, filename);
 }
 export async function cleanup_with_custody(azure: Azure, control: PublisherControl, record: ResetRecord, filename: string): Promise<void> {
-  const c = azure.c, { operator, generation } = record;
+  const { operator, generation } = record;
   await control.cleanup_operator(operator, generation); await require_running(azure);
-  const [databases, inventory] = await reset_inventory(azure);
+  const [databases, inventory, experiment] = await reset_inventory(azure);
   if (Object.values(inventory).flat().some(blob => !(blob.version || blob.snapshot || blob.etag)))
     throw new Failure('Inventoried object has no ETag; refusing an unconditional delete.');
   await control.cleanup_operator(operator, generation);
   await settle_database(azure, record, filename, databases);
+  if (experiment) { await control.cleanup_operator(operator, generation); await clear_experiment_database(azure); }
   for (const [container, blobs] of Object.entries(inventory)) {
     await control.cleanup_operator(operator, generation);
     const files = blobs.filter(blob => !blob.directory), directories = blobs.filter(blob => blob.directory);
@@ -909,7 +958,7 @@ export async function cleanup_with_custody(azure: Azure, control: PublisherContr
     for (const wave of waves) await parallel_each(blob => delete_inventoried(azure, container, blob), wave);
   }
   const remaining = [];
-  for (const name of [c.data, c.checkpoints]) remaining.push(...await azure.blobs(name), ...await azure.paths(name));
+  for (const name of Object.keys(inventory)) remaining.push(...await azure.blobs(name), ...await azure.paths(name));
   if (remaining.length) throw new Failure('Reset left workload state behind; cleanup authority retained.');
   await settle_database(azure, record, filename, []);
   const intent = read_database_intent(filename, record);
@@ -918,7 +967,31 @@ export async function cleanup_with_custody(azure: Azure, control: PublisherContr
   await control.finish_cleanup(operator, generation, record.next, true);
   if (intent) remove_custody_file(database_intent_path(filename), intent);
   remove_reset_record(filename, record);
-  console.log('Reset verified: zero databases and zero blobs, versions or snapshots; authority is fenced-v1 at a fresh generation.');
+  console.log('Reset verified: sandbox database deleted, experiment database emptied, zero blobs, versions or snapshots; authority is fenced-v1 at a fresh generation.');
+}
+export const EXPERIMENT_OBJECTS: [string, string][] = [
+  ['.show materialized-views | project Name', '.drop materialized-view'],
+  ['.show functions | project Name', '.drop function'],
+  ['.show external tables | project TableName', '.drop external table'],
+  ['.show tables | project TableName', '.drop table'],
+];
+export async function experiment_objects(azure: Azure): Promise<[string, string][]> {
+  const objects: [string, string][] = [];
+  for (const [show, drop] of EXPERIMENT_OBJECTS) {
+    const result = await azure.kql(show, azure.c.experimentDatabase);
+    for (const [name] of result?.Tables?.[0]?.Rows ?? []) {
+      if (typeof name !== 'string' || !/^[A-Za-z0-9_ .-]{1,1024}$/.test(name))
+        throw new Failure('Experiment database contains an unsafe entity name; refusing cleanup.');
+      objects.push([drop, name]);
+    }
+  }
+  return objects;
+}
+export async function clear_experiment_database(azure: Azure): Promise<void> {
+  for (const [drop, name] of await experiment_objects(azure))
+    await azure.kql(`${drop} ['${name}'] ifexists`, azure.c.experimentDatabase);
+  if ((await experiment_objects(azure)).length)
+    throw new Failure('Experiment database still has objects after cleanup; cleanup authority retained.');
 }
 export async function parallel_each<T>(action: (item: T) => Promise<unknown>, items: T[]): Promise<void> {
   let index = 0, failed = false, first: unknown;
@@ -941,7 +1014,9 @@ export async function delete_inventoried(azure: Azure, container: string, blob: 
     { 'x-ms-delete-snapshots': 'include', 'If-Match': blob.etag! }, true);
 }
 export async function no_databases(azure: Azure): Promise<void> {
-  if ((await azure.collection(azure.c.cluster_id + '/databases')).length) throw new Failure('Database deletion is still in progress.');
+  if ((await azure.collection(azure.c.cluster_id + '/databases'))
+    .some(item => item.name.split('/').at(-1) !== azure.c.experimentDatabase))
+    throw new Failure('Database deletion is still in progress.');
 }
 export function require_released_or_owner(metadata: Metadata, owner: string): void {
   if (metadata.occupancy === 'released') return;
@@ -1027,6 +1102,18 @@ export async function stop_cluster(azure: Azure): Promise<void> {
 export async function stopped(azure: Azure): Promise<void> {
   if ((await azure.arm('GET', azure.c.cluster_id)).properties.state !== 'Stopped') throw new Failure('Cluster is still stopping.');
 }
+export async function experiment_status(azure: Azure, inventory: Record<string, BlobEntry[]>, experiment: boolean): Promise<void> {
+  const c = azure.c, objects = inventory[c.experimentContainer];
+  console.log(`Experiment container ${c.experimentContainer}: ${objects ? `present (${objects.length} stored objects)` : 'absent'}`);
+  console.log(`Experiment database ${c.experimentDatabase}: ${experiment ? 'present' : 'absent'}`);
+  const workspace = await azure.arm('GET', c.workspace_id, undefined, true, LOG_ANALYTICS_API);
+  console.log(`Log Analytics workspace ${c.logAnalyticsWorkspace}: ${workspace ? `present (customer ID ${workspace.properties?.customerId}, ` +
+    `retention ${workspace.properties?.retentionInDays} days)` : 'absent'}`);
+  const setting = await azure.arm('GET', c.storage_id + '/blobServices/default/providers/Microsoft.Insights/diagnosticSettings/' +
+    STORAGE_READS_SETTING, undefined, true, DIAGNOSTIC_API);
+  const reads = setting?.properties?.logs?.some((log: any) => log.category === 'StorageRead' && log.enabled);
+  console.log(`Diagnostic setting ${STORAGE_READS_SETTING} (StorageRead to Log Analytics): ${reads ? 'present' : 'absent'}`);
+}
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   let c: Config | undefined;
   try {
@@ -1058,9 +1145,10 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       case 'reset': await reset(azure, args.execute!, stopCommand, args.resume!); break;
       case 'recover': await recover(azure, args.execute!, stopCommand); break;
       case 'status': {
-        const [databases] = await reset_inventory(azure);
+        const [databases, inventory, experiment] = await reset_inventory(azure);
         if (!databases.length) console.log('Owned infrastructure: present; Kusto database absent (data plane reset). Run provision to recreate it.');
         else { await azure.kql('.show capacity'); console.log('Owned infrastructure and Kusto capacity: responsive'); }
+        await experiment_status(azure, inventory, experiment);
         break;
       }
       case 'stop':

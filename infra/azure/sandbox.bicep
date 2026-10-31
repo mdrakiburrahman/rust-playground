@@ -6,6 +6,9 @@ param identityName string
 param databaseName string
 param dataContainer string
 param checkpointContainer string
+param experimentContainer string
+param experimentDatabase string
+param logAnalyticsWorkspaceName string
 param controlMetadata object
 param checkpointExists bool
 param operatorObjectId string
@@ -85,9 +88,32 @@ resource checkpoints 'Microsoft.Storage/storageAccounts/blobServices/containers@
   }
 }
 
+// Experiment fixtures live under runs/<runId>/<operation>/ and are wiped by reset.
+resource experiment 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
+  parent: blobs
+  name: experimentContainer
+  properties: {
+    publicAccess: 'None'
+    metadata: {
+      sandboxid: ownership.sandboxId
+      project: 'rust-playground'
+    }
+  }
+}
+
 resource readData 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(data.id, identity.id, 'blob-reader')
   scope: data
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1')
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource readExperiment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(experiment.id, identity.id, 'blob-reader')
+  scope: experiment
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1')
     principalId: identity.properties.principalId
@@ -167,3 +193,72 @@ resource reader 'Microsoft.Kusto/clusters/databases/principalAssignments@2024-04
     tenantId: tenant().tenantId
   }
 }
+
+// Kusto rejects concurrent control operations on one cluster, so experiment objects follow the main database.
+resource experimentDb 'Microsoft.Kusto/clusters/databases@2024-04-13' = {
+  parent: cluster
+  name: experimentDatabase
+  location: location
+  kind: 'ReadWrite'
+  properties: {
+    softDeletePeriod: 'P7D'
+    hotCachePeriod: 'P1D'
+  }
+  dependsOn: [
+    reader
+  ]
+}
+
+resource experimentReader 'Microsoft.Kusto/clusters/databases/principalAssignments@2024-04-13' = {
+  parent: experimentDb
+  name: 'sandbox-query-identity'
+  properties: {
+    principalId: identity.properties.clientId
+    principalType: 'App'
+    role: 'Viewer'
+    tenantId: tenant().tenantId
+  }
+}
+
+resource workspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
+  name: logAnalyticsWorkspaceName
+  location: location
+  tags: ownership
+  properties: {
+    sku: {
+      name: 'PerGB2018'
+    }
+    retentionInDays: 30
+  }
+}
+
+// Blob reads only; the experiment filters StorageBlobLogs by run path and the Kusto identity.
+resource storageReads 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = {
+  name: 'arrowcol-storage-reads'
+  scope: blobs
+  properties: {
+    workspaceId: workspace.id
+    logAnalyticsDestinationType: 'Dedicated'
+    logs: [
+      {
+        category: 'StorageRead'
+        enabled: true
+      }
+    ]
+  }
+}
+
+resource readLogs 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(workspace.id, operatorObjectId, 'log-analytics-reader')
+  scope: workspace
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '73c42c96-874c-492b-b04d-ab87d138a893')
+    principalId: operatorObjectId
+    principalType: operatorType == 'User' ? 'User' : 'ServicePrincipal'
+  }
+}
+
+output experimentContainer string = experiment.name
+output experimentDatabase string = experimentDb.name
+output logAnalyticsWorkspaceId string = workspace.id
+output logAnalyticsCustomerId string = workspace.properties.customerId

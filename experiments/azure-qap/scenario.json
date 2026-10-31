@@ -1,0 +1,13 @@
+{
+  "operations": ["optimize", "purge", "vacuum", "reload"],
+  "files": 2,
+  "fileMib": 1,
+  "repetitions": 1,
+  "parallel": 4,
+  "tail": "2m",
+  "logWait": "5m",
+  "budget": "15m",
+  "settle": "30s",
+  "poll": "10s",
+  "logPoll": "30s"
+}

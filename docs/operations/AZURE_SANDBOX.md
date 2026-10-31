@@ -90,6 +90,20 @@ Failure is visible and leaves the sandbox fenced, not falsely ready.
 output explicitly says that full bootstrap was **not verified**. It is useful
 for diagnosing infrastructure access, not an acceptance shortcut.
 
+### QAP experiment resources
+
+The same deployment also hosts the
+[Azure QAP experiment](../experiments/azure-qap/README.md#azure-setup): blob
+container `experimentqap` in the existing account, Kusto database
+`experimentqap`, a blob-service diagnostic setting that sends only `StorageRead`
+logs, and Log Analytics workspace `arrowcol-<sandboxId>`. The Kusto identity
+gets Blob Data Reader on that container and Viewer on that database; the
+operator gets Log Analytics Reader on the workspace. The experiment no longer
+deploys its own storage account or workspace per run. Reset empties the
+`experimentqap` container and drops every object in the `experimentqap`
+database, but keeps that database and its managed identity policy; logs already
+in the workspace stay until its retention expires.
+
 ## Cloud occupancy and reset
 
 **Data-plane reset is enabled for this disposable, single-operator sandbox.**
@@ -295,7 +309,8 @@ Azure reads.
 ```bash
 # Preview only: no mutation.
 npx --no-install tsx infra/azure/bootstrap.ts reset
-# Fence, stop the local loadtest, quiesce 60s, delete databases and all blobs.
+# Fence, stop the local loadtest, quiesce 60s, delete the sandbox database,
+# empty the experiment database and delete all blobs in the three containers.
 npx --no-install tsx infra/azure/bootstrap.ts reset --execute
 # Continue an interrupted cleanup from .env.azure.reset.json.
 npx --no-install tsx infra/azure/bootstrap.ts reset --resume
@@ -306,9 +321,11 @@ npx --no-install tsx infra/azure/bootstrap.ts provision
 Execution verifies exact ownership, HNS, disabled retention, the exact database
 allowlist, and the complete container allowlist/ownership. It persistently fences
 remote writers, stops the local workspace-owned loadtest, waits a 60-second
-quiescence interval, inventories again, drops the owned database, and
-deletes every owned blob, snapshot and version, including Delta/service
-checkpoints. It refuses preexisting soft-deleted objects rather than claiming
+quiescence interval, inventories again, drops the sandbox database (`arrowcol`),
+drops every table, external table, function and materialized view in the
+`experimentqap` database, and deletes every owned blob, snapshot and version in
+the `arrowcol`, `checkpoints` and `experimentqap` containers, including
+Delta/service checkpoints. It refuses preexisting soft-deleted objects rather than claiming
 hidden retained data is gone. Unknown resources cause failure, not deletion.
 
 **The 60-second interval is not independently a fencing proof.** Safe destructive
@@ -327,9 +344,12 @@ devboxes. The 60-second delay cannot replace that distributed lifecycle evidence
 Offline reset tests establish orchestration ordering, not that cross-process
 publication deadline or live Azure safety.
 
-Cluster, identity, account and both containers survive. Verification requires
-zero databases and literally zero blobs and HNS paths (including empty
-directories) in both containers. Container control
+Cluster, identity, account, Log Analytics workspace and all three containers
+survive. The `experimentqap` database also survives, with its managed identity
+policy, but empty; only the sandbox database is deleted. Verification requires
+the sandbox database to be gone, the experiment database to hold no tables,
+external tables, functions or materialized views, and literally zero blobs and
+HNS paths (including empty directories) in all three containers. Container control
 metadata remains fenced without leaving a marker blob. A subsequent full
 `provision` recreates the declared Delta/Kusto baseline and returns it to ready.
 The foundation's explicit empty-root initializer is the only bootstrap path that

@@ -116,7 +116,7 @@ oracles and durable evidence; they do not run the lakehouse loadtest.
 
 The [Azure QAP experiment](experiments/azure-qap/README.md) examines whether
 append, OPTIMIZE, old-partition DELETE and physical VACUUM reload unchanged data.
-See the [Azure findings and diagnostic limits](docs/experiments/AZURE_QAP.md).
+See the [lessons learned, with diagrams](docs/experiments/azure-qap/README.md).
 
 ### Finite qualification quick start
 

@@ -79,8 +79,7 @@ impl Fixture {
     }
 
     fn table_url(&self) -> Result<Url> {
-        Url::from_directory_path(self.root.join("experiment/fixtures/experiment_test"))
-            .map_err(|()| anyhow::anyhow!("invalid test URL"))
+        Url::from_directory_path(self.root.join("experiment_test")).map_err(|()| anyhow::anyhow!("invalid test URL"))
     }
 }
 

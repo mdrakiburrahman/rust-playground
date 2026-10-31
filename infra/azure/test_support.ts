@@ -1,10 +1,19 @@
 import { Config, Azure, TAGS, ControlConflict, HttpFailure, canonical_json, uuid,
   type BlobEntry, type Metadata } from './bootstrap.js';
 export const SUB = '00000000-0000-0000-0000-000000000001';
+export const WORKSPACE_CUSTOMER = '00000000-0000-0000-0000-00000000c0de';
+export type ExperimentObjects = { views: string[]; functions: string[]; external: string[]; tables: string[] };
+const EXPERIMENT_KQL: [string, string, keyof ExperimentObjects][] = [
+  ['.show materialized-views', '.drop materialized-view', 'views'], ['.show functions', '.drop function', 'functions'],
+  ['.show external tables', '.drop external table', 'external'], ['.show tables', '.drop table', 'tables'],
+];
 export class FakeAzure extends Azure {
   tags: Record<string, string>;
   databases: any[]; containers: any[];
   data_metadata: Metadata;
+  experiment_metadata: Metadata;
+  experiment_objects: ExperimentObjects = { views: [], functions: [], external: [], tables: [] };
+  diagnostic = true;
   settings: Record<string, any> = {};
   items: Record<string, BlobEntry[]>;
   directories: Record<string, string[]>;
@@ -21,20 +30,43 @@ export class FakeAzure extends Azure {
     this.databases = [{ name: c.database }];
     this.containers = [c.data, c.checkpoints].map(name => ({ name, properties: {} }));
     this.data_metadata = { sandboxid: c.sandbox };
+    this.experiment_metadata = { sandboxid: c.sandbox };
     this.items = { [c.data]: [{ name: 'table/data.parquet', snapshot: null, version: null, deleted: false }], [c.checkpoints]: [] };
     this.directories = { [c.data]: [], [c.checkpoints]: [] };
     this.metadata = { sandboxid: c.sandbox, resetstate: 'ready-v1', resetgeneration: uuid(),
       occupancy: 'released', publisherregistryversion: '1', publishers: '{}', custom: 'preserved' };
   }
+  with_experiment(objects: Partial<ExperimentObjects> = {}): this {
+    const c = this.c;
+    this.databases.push({ name: c.experimentDatabase });
+    this.containers.push({ name: c.experimentContainer, properties: {} });
+    this.items[c.experimentContainer] = [{ name: 'runs/run-1/optimize/_delta_log/00000000000000000000.json', snapshot: null, version: null, deleted: false }];
+    this.directories[c.experimentContainer] = ['runs', 'runs/run-1', 'runs/run-1/optimize', 'runs/run-1/optimize/_delta_log'];
+    this.experiment_objects = { ...this.experiment_objects, ...objects };
+    return this;
+  }
   override async arm(method: string, resourcePath: string, ..._args: any[]): Promise<any> {
+    if (resourcePath.includes('/diagnosticSettings/'))
+      return this.diagnostic ? { properties: { logs: [{ category: 'StorageRead', enabled: true }] } } : null;
     if (resourcePath.endsWith('/blobServices/default')) return { properties: this.settings };
     if (resourcePath.endsWith('/containers/' + this.c.checkpoints))
       return this.checkpoint_exists ? { properties: { metadata: { ...this.metadata } } } : null;
     if (resourcePath.endsWith('/containers/' + this.c.data)) return { properties: { metadata: { ...this.data_metadata } } };
+    if (resourcePath.endsWith('/containers/' + this.c.experimentContainer))
+      return { properties: { metadata: { ...this.experiment_metadata } } };
     return { tags: { ...this.tags }, properties: { isHnsEnabled: true, uri: 'https://cluster.example',
-      principalId: SUB, state: this.cluster_state } };
+      principalId: SUB, state: this.cluster_state, customerId: WORKSPACE_CUSTOMER, retentionInDays: 30 } };
   }
-  override async kql(command: string): Promise<any> { this.events.push(['kql', command]); return {}; }
+  override async kql(command: string, database?: string): Promise<any> {
+    this.events.push(['kql', command, ...database ? [database] : []]);
+    if (database !== this.c.experimentDatabase) return {};
+    for (const [show, drop, kind] of EXPERIMENT_KQL) {
+      if (command.startsWith(show)) return { Tables: [{ Rows: this.experiment_objects[kind].map(name => [name]) }] };
+      const match = command.startsWith(drop + ' ') && /\['([^']+)'\] ifexists$/.exec(command);
+      if (match) this.experiment_objects[kind] = this.experiment_objects[kind].filter(name => name !== match[1]);
+    }
+    return {};
+  }
   override async collection(resourcePath: string): Promise<any[]> {
     return resourcePath.endsWith('/databases') ? this.databases : this.containers;
   }
@@ -63,7 +95,7 @@ export class FakeAzure extends Azure {
     return {};
   }
   override async delete_database(): Promise<[number, string | undefined]> {
-    this.events.push(['arm-delete-db']); this.databases = []; return [200, undefined];
+    this.events.push(['arm-delete-db']); this.databases = this.databases.filter(item => item.name !== this.c.database); return [200, undefined];
   }
   override async provider_operation(_url: string): Promise<string> {
     this.events.push(['arm-operation']); return 'Succeeded';

@@ -20,6 +20,7 @@ export const DOCUMENTS = [
   'docs/operations/DELTA_MAINTENANCE.md',
   'docs/operations/KUSTO_BRIDGE.md',
   'docs/experiments/AZURE_QAP.md',
+  'docs/experiments/azure-qap/README.md',
   'docs/delivery-verification.md',
   'docs/quiver/README.md',
   'docs/containers/publishing.md',

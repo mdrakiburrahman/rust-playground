@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import * as path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import * as b from './bootstrap.js';
-import { FakeAzure, SUB } from './test_support.js';
+import { FakeAzure, SUB, WORKSPACE_CUSTOMER } from './test_support.js';
 import { PublisherControl, READY, FENCED, CLEANING, UnknownTransition } from './publisher_control.js';
 
 let azure: FakeAzure, directory: string, recordPath: string, manifest: string, output: string, generation: string;
@@ -57,8 +57,27 @@ for (const values of [
   { AZURE_KUSTO_QAP_HOT_DAYS: '0' }, { AZURE_KUSTO_QAP_HOT_DAYS: '1.5' }, { AZURE_KUSTO_MAX_INSTANCES: 'NaN' },
   { AZURE_STORAGE_CHECKPOINT_CONTAINER: 'arrowcol' }, { AZURE_OPERATOR_TYPE: 'App' },
   { AZURE_OPERATOR_TYPE: 'Other' }, { AZURE_STORAGE_ACCOUNT: 'Bad_Account' }, { AZURE_KUSTO_DATABASE: 'bad;escape' },
+  { AZURE_STORAGE_EXPERIMENT_CONTAINER: 'arrowcol' }, { AZURE_STORAGE_EXPERIMENT_CONTAINER: 'checkpoints' },
+  { AZURE_STORAGE_EXPERIMENT_CONTAINER: 'qap-' }, { AZURE_STORAGE_EXPERIMENT_CONTAINER: 'qap--runs' },
+  { AZURE_KUSTO_EXPERIMENT_DATABASE: 'arrowcol' }, { AZURE_KUSTO_EXPERIMENT_DATABASE: "bad'];escape" },
+  { AZURE_LOG_ANALYTICS_WORKSPACE: 'a-' }, { AZURE_LOG_ANALYTICS_WORKSPACE: 'Bad_Workspace' },
 ]) test(`configuration rejects ${JSON.stringify(values)}`, () => {
   assert.throws(() => new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, ...values }), b.Failure);
+});
+test('experiment configuration has homogeneous defaults, env overrides and private generated keys', () => {
+  const c = azure.c;
+  assert.deepEqual([c.experimentContainer, c.experimentDatabase, c.logAnalyticsWorkspace],
+    ['experimentqap', 'experimentqap', 'arrowcol-' + c.sandbox]);
+  assert.equal(c.logAnalyticsWorkspace, c.cluster);
+  assert.ok(c.workspace_id.endsWith('/providers/Microsoft.OperationalInsights/workspaces/' + c.logAnalyticsWorkspace));
+  const custom = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_STORAGE_EXPERIMENT_CONTAINER: 'qap-runs',
+    AZURE_KUSTO_EXPERIMENT_DATABASE: 'qapruns', AZURE_LOG_ANALYTICS_WORKSPACE: 'qap-logs' });
+  assert.deepEqual([custom.experimentContainer, custom.experimentDatabase, custom.logAnalyticsWorkspace], ['qap-runs', 'qapruns', 'qap-logs']);
+  const generated = custom.generated();
+  assert.deepEqual([generated.AZURE_STORAGE_EXPERIMENT_CONTAINER, generated.AZURE_KUSTO_EXPERIMENT_DATABASE,
+    generated.AZURE_LOG_ANALYTICS_WORKSPACE], ['qap-runs', 'qapruns', 'qap-logs']);
+  const text = custom.redact('qap-runs qapruns qap-logs');
+  for (const name of ['qap-runs', 'qapruns', 'qap-logs']) assert.ok(!text.includes(name));
 });
 test('App operator has distinct explicit application identity', () => {
   assert.equal(new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_OPERATOR_TYPE: 'App', AZURE_OPERATOR_APPLICATION_ID: SUB }).operator_application, SUB);
@@ -117,6 +136,30 @@ test('execution fences, quiesces then deletes objects/database preserving infras
   assert.deepEqual(azure.registry(), {}); assert.equal(fs.existsSync(recordPath), false);
   assert.equal(fs.existsSync(b.database_intent_path(recordPath)), false);
 });
+test('execution empties experiment container and database but keeps both, the workspace and every ARM resource', async () => {
+  const c = azure.c;
+  azure.with_experiment({ views: ['qap_view'], functions: ['qap_function'], external: ['qap_run1_optimize', 'qap_run1_purge'],
+    tables: ['qap_samples'] });
+  await execute();
+  assert.deepEqual(azure.databases, [{ name: c.experimentDatabase }]);
+  assert.deepEqual(azure.containers.map(item => item.name), [c.data, c.checkpoints, c.experimentContainer]);
+  assert.deepEqual(azure.items[c.experimentContainer], []); assert.deepEqual(azure.directories[c.experimentContainer], []);
+  assert.deepEqual(azure.experiment_objects, { views: [], functions: [], external: [], tables: [] });
+  const drops = azure.events.filter(event => event[0] === 'kql' && event[1].startsWith('.drop'));
+  assert.deepEqual(drops.map(event => event[1]), [
+    ".drop materialized-view ['qap_view'] ifexists", ".drop function ['qap_function'] ifexists",
+    ".drop external table ['qap_run1_optimize'] ifexists", ".drop external table ['qap_run1_purge'] ifexists",
+    ".drop table ['qap_samples'] ifexists"]);
+  assert.ok(drops.every(event => event[2] === c.experimentDatabase));
+  assert.equal(azure.events.filter(event => event[0] === 'arm-delete-db').length, 1);
+  assert.ok(!azure.events.some(event => event[0] === 'cli' && event.some((arg: string) => /delete/i.test(arg))));
+  assert.equal(azure.metadata.resetstate, FENCED); assert.equal(fs.existsSync(recordPath), false);
+});
+test('experiment cleanup fails closed on unsafe entity names before dropping anything', async () => {
+  azure.with_experiment({ tables: ['safe_table', "bad'] .drop database x"] });
+  await failure(() => b.clear_experiment_database(azure));
+  assert.ok(!azure.events.some(event => event[0] === 'kql' && event[1].startsWith('.drop')));
+});
 test('existing cleanup authority and custody files refuse fresh execution before stop', async () => {
   azure.metadata.resetstate = CLEANING;
   await assert.rejects(execute, /reset --resume/); assert.deepEqual(azure.events, []);
@@ -152,9 +195,21 @@ for (const [label, change] of [
   ['unexpected container', (a: FakeAzure) => { a.containers.push({ name: 'foreign' }); }],
   ['missing container', (a: FakeAzure) => { a.containers.pop(); }],
   ['container ownership', (a: FakeAzure) => { a.data_metadata.sandboxid = 'foreign'; }],
+  ['experiment container ownership', (a: FakeAzure) => { a.with_experiment().experiment_metadata.sandboxid = 'foreign'; }],
+  ['database beside the experiment database', (a: FakeAzure) => { a.with_experiment().databases.push({ name: 'foreign' }); }],
   ['soft-deleted objects', (a: FakeAzure) => { a.items[a.c.data][0].deleted = true; }],
 ] as const) test(`inventory rejects ${label} without mutation`, async () => {
   change(azure); await failure(() => b.reset_inventory(azure)); assert.deepEqual(azure.events, []);
+});
+test('inventory accepts the optional experiment database and container beside sandbox state', async () => {
+  const c = azure.c;
+  let [databases, inventory, experiment] = await b.reset_inventory(azure);
+  assert.equal(experiment, false); assert.deepEqual(Object.keys(inventory), [c.data, c.checkpoints]);
+  azure.with_experiment();
+  [databases, inventory, experiment] = await b.reset_inventory(azure);
+  assert.equal(experiment, true); assert.deepEqual(databases.map(item => item.name), [c.database]);
+  assert.deepEqual(Object.keys(inventory), [c.data, c.checkpoints, c.experimentContainer]);
+  assert.equal(inventory[c.experimentContainer].length, 5); assert.deepEqual(azure.events, []);
 });
 for (const settings of [{ isVersioningEnabled: true }, { deleteRetentionPolicy: { enabled: true } },
   { containerDeleteRetentionPolicy: { enabled: true } }, { restorePolicy: { enabled: true } }])
@@ -774,6 +829,32 @@ test('Bicep separates Kusto client application identity from storage object prin
   assert.match(source.split('resource readData ')[1].split('resource writeData ')[0], /principalId: identity\.properties\.principalId/);
   assert.match(source.split('resource checkpoints ')[1].split('resource readData ')[0], /if \(!checkpointExists\)/);
 });
+test('Bicep adds experiment container, database, workspace and StorageRead diagnostics with least-privilege RBAC', () => {
+  const source = fs.readFileSync(path.join(b.ROOT, 'infra/azure/sandbox.bicep'), 'utf8');
+  const main = fs.readFileSync(path.join(b.ROOT, 'infra/azure/main.bicep'), 'utf8');
+  const section = (name: string) => source.split(`resource ${name} `)[1].split('\nresource ')[0].split('\noutput ')[0];
+  assert.match(section('experiment'), /parent: blobs[\s\S]*name: experimentContainer[\s\S]*sandboxid: ownership\.sandboxId/);
+  assert.doesNotMatch(source, /Microsoft\.Storage\/storageAccounts@[^\n]*=[\s\S]*Microsoft\.Storage\/storageAccounts@/);
+  assert.match(section('readExperiment'), /scope: experiment\n/);
+  assert.match(section('readExperiment'), /2a2b9908-6ea1-4ae2-8e65-a410df84e7d1[\s\S]*principalId: identity\.properties\.principalId/);
+  assert.match(section('experimentDb'), /name: experimentDatabase[\s\S]*softDeletePeriod: 'P7D'[\s\S]*hotCachePeriod: 'P1D'/);
+  assert.match(section('experimentReader'), /parent: experimentDb[\s\S]*principalId: identity\.properties\.clientId[\s\S]*role: 'Viewer'/);
+  assert.match(section('workspace'), /name: logAnalyticsWorkspaceName[\s\S]*tags: ownership[\s\S]*'PerGB2018'[\s\S]*retentionInDays: 30/);
+  const reads = section('storageReads');
+  assert.match(reads, /name: 'arrowcol-storage-reads'[\s\S]*scope: blobs[\s\S]*workspaceId: workspace\.id/);
+  assert.match(reads, /logAnalyticsDestinationType: 'Dedicated'/); assert.match(reads, /category: 'StorageRead'/);
+  assert.doesNotMatch(reads, /StorageWrite|StorageDelete|metrics/);
+  assert.match(section('readLogs'), /scope: workspace[\s\S]*73c42c96-874c-492b-b04d-ab87d138a893[\s\S]*principalId: operatorObjectId/);
+  assert.match(section('readLogs'), /principalType: operatorType == 'User' \? 'User' : 'ServicePrincipal'/);
+  for (const output of ['experimentContainer', 'experimentDatabase', 'logAnalyticsWorkspaceId', 'logAnalyticsCustomerId']) {
+    assert.match(source, new RegExp(`\\noutput ${output} string = `));
+    assert.match(main, new RegExp(`\\noutput ${output} string = sandbox\\.outputs\\.${output}\\n`));
+  }
+  assert.match(source, /output logAnalyticsCustomerId string = workspace\.properties\.customerId/);
+  assert.match(main, /param experimentContainer string = 'experimentqap'/);
+  assert.match(main, /param experimentDatabase string = 'experimentqap'/);
+  assert.match(main, /param logAnalyticsWorkspaceName string = 'arrowcol-\$\{sandboxId\}'/);
+});
 function coordinateProvision() {
   const deployed: any[] = [], observed: any[] = [], child: { generation?: string; id?: string; then?: () => Promise<void> } = {};
   const originalCli = azure.cli.bind(azure), originalKql = azure.kql.bind(azure);
@@ -791,8 +872,8 @@ function coordinateProvision() {
     observed.push([args.some(arg => arg.includes('/start?')) ? 'start' : 'stop', azure.metadata.resetstate, azure.registry()]);
     return originalCli(...args);
   };
-  azure.kql = async command => {
-    observed.push(['kql', azure.metadata.resetstate, azure.registry()]); return originalKql(command);
+  azure.kql = async (command, database) => {
+    observed.push(['kql', azure.metadata.resetstate, azure.registry()]); return originalKql(command, database);
   };
   mock.method(b.runtime, 'run_tree', async (_command: string[], _timeout: number, _cwd?: string, env?: NodeJS.ProcessEnv) => {
     const control = new PublisherControl(azure), member = b.uuid(), gen = env!.ARROWCOL_EXPECTED_RESET_GENERATION!;
@@ -826,10 +907,35 @@ test('ready redeploy preserves all authority metadata while exclusive member own
   assert.equal(b.load_env(output).ARROWCOL_RESET_GENERATION, generation);
 });
 test('infra-only deliberately omits initializer/QAP and does not declare fresh fenced authority ready', async () => {
-  azure.metadata.resetstate = FENCED; const { child } = coordinateProvision();
+  azure.metadata.resetstate = FENCED; const { child, observed } = coordinateProvision();
   await b.provision(azure, manifest, 0, output, true, {});
   assert.equal(child.id, undefined); assert.equal(azure.metadata.resetstate, FENCED);
   assert.equal(b.load_env(output).ARROWCOL_RESET_GENERATION, undefined);
+  assert.deepEqual(azure.events.filter(event => event[0] === 'kql').map(event => event[2]), [undefined, azure.c.experimentDatabase]);
+  for (const [, state, registry] of observed) { assert.equal(state, FENCED); assert.equal(Object.keys(registry).length, 1); }
+  assert.deepEqual(azure.registry(), {});
+});
+test('ready infra-only provision passes experiment parameters and applies the experiment managed identity policy', async () => {
+  const c = azure.c, before = { ...azure.metadata }, { deployed, observed } = coordinateProvision();
+  await b.provision(azure, manifest, 0, output, true, {});
+  const params = deployed[0][3];
+  assert.deepEqual([params.experimentContainer.value, params.experimentDatabase.value, params.logAnalyticsWorkspaceName.value],
+    ['experimentqap', 'experimentqap', 'arrowcol-' + c.sandbox]);
+  const policies = azure.events.filter(event => event[0] === 'kql' && event[1].includes('policy managed_identity'));
+  assert.equal(policies.length, 1);
+  assert.equal(policies[0][1], `.alter-merge database ['${c.experimentDatabase}'] policy managed_identity ` +
+    `'${JSON.stringify([{ ObjectId: SUB, AllowedUsages: 'ExternalTable,AutomatedFlows' }])}'`);
+  assert.equal(policies[0][2], c.experimentDatabase);
+  for (const [, state, registry] of observed) { assert.equal(state, FENCED); assert.equal(Object.keys(registry).length, 1); }
+  assert.deepEqual(azure.metadata, before);
+  const generated = b.load_env(output);
+  assert.deepEqual([generated.AZURE_STORAGE_EXPERIMENT_CONTAINER, generated.AZURE_KUSTO_EXPERIMENT_DATABASE,
+    generated.AZURE_LOG_ANALYTICS_WORKSPACE], ['experimentqap', 'experimentqap', 'arrowcol-' + c.sandbox]);
+});
+test('ready full provision without a table manifest fails before custody or Azure mutation', async () => {
+  fs.rmSync(manifest); const before = { ...azure.metadata };
+  await assert.rejects(() => b.provision(azure, manifest, 0, output, false, {}), /Table manifest is missing/);
+  assert.deepEqual(azure.events, []); assert.deepEqual(azure.metadata, before);
 });
 for (const state of [READY, FENCED]) test(`terminal deployment failure releases ${state} custody`, async () => {
   azure.metadata.resetstate = state;
@@ -865,9 +971,10 @@ test('stop hold first blocks bootstrap before hosted I/O and bootstrap first blo
 });
 test('stop between child drain and parent admission prevents parent KQL', async () => {
   azure.metadata.resetstate = FENCED; const { child } = coordinateProvision();
-  child.then = async () => { azure.metadata.occupancy = 'stopping'; azure.metadata.occupancyid = b.uuid(); };
+  let stopped = -1;
+  child.then = async () => { stopped = azure.events.length; azure.metadata.occupancy = 'stopping'; azure.metadata.occupancyid = b.uuid(); };
   await failure(() => b.provision(azure, manifest, 0, output, false, {}));
-  assert.ok(!azure.events.some(event => event[0] === 'kql'));
+  assert.ok(stopped >= 0); assert.ok(!azure.events.slice(stopped).some(event => event[0] === 'kql'));
 });
 test('occupy wins before ready provision/released reconcile custody: both fail before I/O', async () => {
   await b.occupancy(azure, 'occupy', b.uuid()); const before = azure.events.length;
@@ -967,6 +1074,23 @@ test('main status reports reset database absence without querying Kusto', async 
     mock.method(b.Azure.prototype, name, azure[name].bind(azure));
   assert.equal(await b.main(['status', '--env-file', env]), 0);
   assert.ok(!azure.events.some(event => event[0] === 'kql'));
+});
+test('main status reports experiment container, database, workspace and StorageRead diagnostics without IDs', async () => {
+  const env = path.join(directory, '.env'); fs.writeFileSync(env, `AZURE_SUBSCRIPTION_ID=${SUB}\n`);
+  for (const name of ['arm', 'collection', 'blobs', 'paths', 'head_control', 'set_control', 'kql', 'cli'] as const)
+    mock.method(b.Azure.prototype, name, azure[name].bind(azure));
+  const lines: string[] = [];
+  mock.method(console, 'log', (line: string) => { lines.push(line); });
+  assert.equal(await b.main(['status', '--env-file', env]), 0);
+  assert.deepEqual(lines.slice(-4), ['Experiment container experimentqap: absent', 'Experiment database experimentqap: absent',
+    `Log Analytics workspace arrowcol-${azure.c.sandbox}: present (customer ID ${WORKSPACE_CUSTOMER}, retention 30 days)`,
+    'Diagnostic setting arrowcol-storage-reads (StorageRead to Log Analytics): present']);
+  azure.with_experiment(); azure.diagnostic = false; lines.length = 0;
+  assert.equal(await b.main(['status', '--env-file', env]), 0);
+  assert.deepEqual(lines.slice(-4, -2), ['Experiment container experimentqap: present (5 stored objects)',
+    'Experiment database experimentqap: present']);
+  assert.equal(lines.at(-1), 'Diagnostic setting arrowcol-storage-reads (StorageRead to Log Analytics): absent');
+  assert.ok(!lines.join('\n').includes(SUB) && !lines.join('\n').includes('/subscriptions/'));
 });
 test('main dispatches versioned mutation paths but cleanup-owned authority blocks every entrypoint', async () => {
   const env = path.join(directory, '.env'); fs.writeFileSync(env, `AZURE_SUBSCRIPTION_ID=${SUB}\n`);

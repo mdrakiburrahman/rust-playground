@@ -32,6 +32,14 @@
         "cwd": "{workspaceRoot}",
         "forwardAllArgs": true
       }
+    },
+    "status": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "npx --no-install tsx infra/azure/bootstrap.ts status",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": true
+      }
     }
   }
 }

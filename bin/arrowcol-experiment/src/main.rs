@@ -1,5 +1,7 @@
+mod bulk;
 mod oracle;
 mod receipts;
+mod scale_oracle;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -40,6 +42,7 @@ use url::Url;
 #[derive(Parser)]
 #[command(about = "Bounded production ArrowCol fixture publisher (JSON stdout)")]
 struct Cli {
+    /// Parent directory of the fixture table; the table is written to <root>/<table>/.
     #[arg(long)]
     root: String,
     /// Explicit table allowlist; must equal --table.
@@ -56,6 +59,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Action {
+    /// Bounded QAP fixture; copies are native synchronous Azure server-side puts.
+    SeedScale(bulk::SeedOptions),
+    /// Project only keys, not copied payload, to build bounded expected groups.
+    InspectScale,
     Seed {
         #[arg(long)]
         anchor_ms: i64,
@@ -102,13 +109,13 @@ impl Cli {
     fn table_url(&self) -> Result<Url> {
         ensure!(self.allow_table == self.table, "table is not allowlisted");
         ensure!(
-            self.table.starts_with("experiment_")
-                && self.table.len() <= 63
+            self.table.len() <= 63
+                && self.table.starts_with(|first: char| first.is_ascii_lowercase())
                 && self
                     .table
                     .bytes()
                     .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'),
-            "table must be a lowercase experiment_ identifier"
+            "table must be a lowercase identifier"
         );
         ensure!(
             std::env::var("ARROWCOL_PARTITION_GRANULARITY").as_deref() == Ok("minute"),
@@ -141,12 +148,13 @@ impl Cli {
         if !url.path().ends_with('/') {
             url.set_path(&format!("{}/", url.path()));
         }
-        Ok(url.join(&format!("experiment/fixtures/{}/", self.table))?)
+        // Same layout as delta-maintenance: the table lives directly at <root>/<table>/.
+        Ok(url.join(&format!("{}/", self.table))?)
     }
 
     fn plan(&self) -> Result<Option<Plan>> {
         let plan = match self.action {
-            Action::Inspect => return Ok(None),
+            Action::Inspect | Action::InspectScale | Action::SeedScale(_) => return Ok(None),
             Action::Seed {
                 anchor_ms,
                 start_id,
@@ -462,6 +470,15 @@ async fn mutate(cli: &Cli, url: &Url, plan: Plan, stop: &Stop) -> Result<Value> 
 
 async fn run(cli: &Cli, stop: &Stop) -> Result<Value> {
     let url = cli.table_url().context("validate_configuration")?;
+    match &cli.action {
+        Action::SeedScale(options) => return bulk::seed(cli, url, options, stop).await.context("scale_fixture"),
+        Action::InspectScale => {
+            return scale_oracle::inspect(url, cli.table.clone())
+                .await
+                .context("scale_oracle");
+        }
+        _ => {}
+    }
     if let Some(plan) = cli.plan().context("validate_configuration")? {
         mutate(cli, &url, plan, stop).await
     } else {
@@ -531,10 +548,15 @@ async fn main() {
 
         Err(error) => {
             // Error chains may contain signed URLs, credentials or private storage endpoints.
-            println!(
-                "{}",
-                json!({"ok":false,"error":"experiment_action_failed","stage":failure_stage(&error),"publisherClosed":false})
-            );
+            let mut output = json!({"ok":false,"error":"experiment_action_failed","stage":failure_stage(&error),"publisherClosed":false});
+            // Opt-in local diagnosis only; callers that persist evidence must leave this unset.
+            if std::env::var_os("ARROWCOL_EXPERIMENT_DEBUG_ERRORS").is_some() {
+                eprintln!("{error:?}");
+            }
+            if let Some(partial) = error.downcast_ref::<bulk::PartialFailure>() {
+                output["orphanInventory"] = partial.inventory.clone();
+            }
+            println!("{output}");
             std::process::exit(1);
         }
     }
@@ -565,6 +587,8 @@ fn failure_stage(error: &anyhow::Error) -> &'static str {
             "drain",
             "publish",
             "close_publisher",
+            "scale_fixture",
+            "scale_oracle",
         ] {
             if message == stage {
                 return stage;
