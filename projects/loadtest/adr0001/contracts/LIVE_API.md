@@ -389,3 +389,33 @@ collector fixture, not eight running roles. Its failure and safe stopped cleanup
 remain separate; normal source-gated effect success is not browser availability
 or full live-game qualification. Preserve the exact baseline running-state map
 for bridge-only restart, never start/adopt that stopped fixture.
+
+## Corrected browser closeout and unadvertised next contract
+
+The corrected normal8 smoke retained the exact seven-running/one-stopped
+baseline and passed without a production evidence-gate override. The parent's
+subsequent actual browser acceptance was observation-only: seven real stations,
+exact selection, live CPU/memory and consecutive feeds, session/reload/logout,
+no arm/commands or credential storage. Graceful exact-process teardown exited
+0, all eight owned resources stopped and port 18786 closed. Preserve normal7's
+failed assertion separately; read-only browser success is not mutation acceptance.
+See HANDOFF.md for separate evidence identities and the retained observer error.
+
+The coordinated draft schema `ddb3f534b8dab2507d0293c9cd035a2c017bf38a1c124a9cdd8b01346c4c3cf3`
+and semantics/46 synthetic fixtures are in session
+`files/live-safety-streams-draft/`. They require nullable exact-probe replica
+safety facts, nullable current receipt-probe health and caller workload streams
+bounded by each preset's qualified maximum. They preserve common authority
+fences, explicit diagnostic-only missing labels, unknown completion and
+independent rollback. They are **not advertised or implemented by this backend**;
+the current schema remains `5923cc7e1fe59a91d344b7f9786de048947b4905a2d6a91558a259f548e32e20`.
+The parent's newly typed draft consumer cannot connect to that older schema.
+
+`live_inventory.py` is currently unused private durable creation bookkeeping.
+Its transaction/nonce/identity tests do not qualify an HTTP replica action,
+current readiness, resource isolation, or retirement. The stopped legacy fixture
+is birth evidence only, never managed staff. An approved collector tombstone
+cannot be silently reset or reused: initial 3-to-4-to-3 must be labeled finite,
+with exhausted fresh identity explicit until a new identity/config path exists.
+Gateway removal still needs authoritative admission stop and observed drain.
+No replica/retirement/repair/migration capability is enabled by this slice.

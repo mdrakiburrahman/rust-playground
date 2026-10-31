@@ -1084,3 +1084,86 @@ availability remains pending the corrected normal restart and camera package.
 Staff/retirement, bounded streams, atomic migration and HTTP repair remain
 original pending requirements; full Phase2 is not complete. Missing live
 IO/queue/throughput metrics remain unknown and frontend mutationGate is false.
+
+### Normal8 browser closeout and coordinated fleet foundation
+
+The corrected normal8 fixture used the same unmodified source-gated launcher
+and seven frozen binaries on subnet 218 / port 18786. It compared the exact
+seven-running/one-stopped birth map, completed actual authenticated workload and
+collector fault, same-ID reconciliation, ordinary three-row Delta audit and
+reload/logout, then exited 0. Its separate sanitized artifact
+`files/live-normal8-qualification.json` SHA256 is
+`99df5644a8ae1eb39fcd1624e3b82b7d2988a7c645aed3bd680eece895c3c5a2`.
+Normal7's incorrect retention assertion and exit 1 remain preserved.
+
+The parent subsequently passed the actual read-only browser against normal8
+and the separately frozen `bf77762` touchpad package, main SHA256
+`77379a2bfd36f2c959dec05b8148756acfc8fe02182d2e49526535cb624ed448`:
+seven observed stations, exact read-only resource selection, real CPU/memory,
+consecutive feeds, session/reload/logout, no stored secret, arm or command, and
+no page errors. Parent-owned `normal8-readonly-acceptance.json`/screenshots are
+browser evidence, not a mutation qualification.
+
+After that browser closed, the backend matched its private owner-lease inode
+to one exact PID/start-ticks/argv identity and sent pidfd SIGTERM. The bridge
+exited 0; all eight exact saved containers were independently stopped and port
+18786 closed. `files/live-normal8-cleanup.json` SHA256 is
+`91a08cc54da5277b54f87439e8e77ba7d0074acf386a377fe97bedcac3791cda`.
+One observer TimeoutError diagnostic is retained. No backend runtime remains;
+the parent's intentionally playable simulation at 4175 is untouched.
+
+The shared **unadvertised** contract draft lives in session
+`files/live-safety-streams-draft/` with exact copies, `canonical.patch`,
+reproducible fixture builder and `sha256.json`:
+
+| Draft file | SHA256 |
+| --- | --- |
+| `live-v1.schema.json` | `ddb3f534b8dab2507d0293c9cd035a2c017bf38a1c124a9cdd8b01346c4c3cf3` |
+| `LIVE_API.md` | `f29b909f705da35a7874405c47bb35bbce72043b9a6605eff87898ecd61ad5b7` |
+| `live-v1.contract-fixtures.json` | `9886fd92ed7ee2def65d3f773e009399b6f06be1d394db1786d59dc2d54f67bf` |
+
+Its 46 cases are synthetic structural/field-guard cases, not native authority.
+Required nullable replica `identity_verified/running/paused` must come from
+fresh exact private probes; snapshot `receipt_observation_known` is true for
+a healthy empty probe and null after stale/failed/unavailable probes. Workload
+requires receipt health exactly true before admission. Only the eight explicit
+CPU/memory/IO/queue/throughput diagnostic labels can remain missing without
+authorizing a safety bypass; critical/unrecognized missing facts still deny.
+Required caller `streams` is 1..4 and cannot exceed a preset's qualified maximum.
+Common auth/revision/arm/gap/source fences and independent rollback are unchanged.
+Without a public gateway-binding descriptor the client conservatively checks
+all advertised gateways, not "any healthy gateway".
+
+The parent adopted that exact draft in frontend `8f354ef`, but retained global
+coverage/mutation/pending-ID gates. Its new draft-only package must not be served
+against the old backend contract. Repository/runtime schema remains unchanged
+at `5923cc7e1fe59a91d344b7f9786de048947b4905a2d6a91558a259f548e32e20`.
+Do not adopt/advertise the new fields until same-contract server implementation
+and fresh source-bound qualifications are delivered.
+
+`live_inventory.py` now implements a **private creation-intent foundation only**:
+exclusive lease, bounded FULL-sync SQLite transactions, inventory-revision CAS,
+same-ID collision/reopen protection, immutable birth manifest, separate managed
+slots excluding the stopped legacy fixture, and unique deployment/creation-nonce
+plus exact ID/name/image/StartedAt reconciliation. Missing/ambiguous/changed
+resources never cause another create or adoption by name. Bindings are not
+ACTIVE/readiness evidence; this module creates/stops nothing and grants no
+retirement permission. It is not yet imported by the bridge, so existing
+eleven-file native proof bytes remain unchanged.
+
+Existing WSL venv, pinned image environment, `python -B` unittest selectors
+`test_live_inventory test_live_deployment test_live_ledger`: 28 passed in
+2.360 seconds, including 12 new synthetic inventory cases, transaction
+interruption/concurrent CAS and actual fixture-child exit 37 after durable
+intent. No Docker/native binary was invoked. These are source/persistence tests,
+not a live scale-out/retirement proof.
+
+Next remain authoritative creation/isolation/config/readiness adapters,
+collector approval/ACK/ACTIVE-successor/obligation/capacity checks and exact
+teardown, gateway admission/drain, safety/streams implementation and fresh
+qualification. Approved native collector tombstones cannot be canceled/reused;
+the current collector1..4 credential pool permits only a bounded initial
+3-to-4-to-3 cycle, not generally repeatable staff scaling. Exhausted fresh
+identity must remain explicit until a fresh-identity/config-registration path
+is qualified. Atomic migration, HTTP repair, missing telemetry and full game
+mutation acceptance remain unfinished original requirements.
