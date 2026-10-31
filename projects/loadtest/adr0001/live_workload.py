@@ -212,7 +212,7 @@ class NativeWorkload:
                 if writer is not None:
                     try:
                         writer.close()
-                    except (pa.ArrowException, OSError, RuntimeError) as error:
+                    except (pa.ArrowException, flight.FlightError, OSError, RuntimeError) as error:
                         print("live workload close unavailable: " + type(error).__name__, flush=True)
                         remember(close_error=type(error).__name__)
             finally:
@@ -227,6 +227,7 @@ class WorkloadRunner:
 
     def run(self, operation_id, deployment, authorize, admitted, stopping):
         import pyarrow as pa
+        import pyarrow.flight as flight
         job, fresh = self.journal.create(operation_id, deployment)
         if not fresh:
             return self.outcome(operation_id, deployment)
@@ -245,10 +246,11 @@ class WorkloadRunner:
                 self.journal.update(operation_id, deployment, index, **changes)
             try:
                 self.native.send(attempt, remaining, remember)
-            except (pa.ArrowException, OSError, ValueError, RuntimeError, KeyError, TypeError) as error:
+            except (pa.ArrowException, flight.FlightError, OSError, ValueError, RuntimeError, KeyError, TypeError) as error:
                 print("live workload response unavailable: " + type(error).__name__, flush=True)
-                remember(rpc_status="timeout" if isinstance(error, TimeoutError) else "unknown",
-                         error_code="timeout" if isinstance(error, TimeoutError) else "unknown")
+                timed_out = isinstance(error, (TimeoutError, flight.FlightTimedOutError))
+                remember(rpc_status="timeout" if timed_out else "unknown",
+                         error_code="timeout" if timed_out else "unknown")
                 break
         job = self.journal.get(operation_id, deployment)
         for index, attempt in enumerate(job["attempts"]):

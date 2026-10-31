@@ -181,9 +181,10 @@ class Bridge:
             "connected": connected, "qualified": qualified, "deployments": [self.deployment],
             "operations": [{"operation": operation, "supported": connected and operation in supported,
                             "reason": ("qualified" if operation in supported else "unsupported") if connected else "disconnected",
-                            "maximum": 1 if operation in supported else None}
+                            "maximum": getattr(self.executor, "maximums", {}).get(operation, 1)
+                            if operation in supported else None}
                            for operation in OPERATIONS],
-            "workload_presets": [],
+            "workload_presets": copy.deepcopy(getattr(self.executor, "presets", [])) if qualified and connected else [],
             "limits": {"request_bytes": REQUEST_BYTES, "response_bytes": RESPONSE_BYTES, "feed_items": 64,
                        "arm_ttl_ms": 30000, "snapshot_max_age_ms": 5000},
         }
@@ -280,8 +281,7 @@ class Bridge:
                     "policy_revision": replica["policy_revision"],
                 }
                 for replica in snapshot["replicas"]
-                if replica["role"] == "collector" and replica["writer"] is not None
-                and replica["policy_revision"] is not None and replica["status"] not in ("failed", "retired")
+                if replica["status"] not in ("failed", "retired")
             }
             deployment = DeploymentFence(
                 self.deployment, snapshot["revision"], None if age is None else now - int(age),

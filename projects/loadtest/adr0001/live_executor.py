@@ -68,14 +68,17 @@ class PolicyExecutor:
         flags["excluded" if action["operation"] == "exclusion" else "block_streams"] = action["enabled"]
         return flags
 
+    def validate_action(self, action):
+        if action["operation"] not in self.operations:
+            raise Denial("unsupported")
+        if int(action["target"]["policy_revision"]) >= 2**63 - 1:
+            raise Denial("limit")
+
     def _reserve(self, packet, deployment, session, origin):
         authorize_command(packet, deployment, session, origin)
         if self.failed.is_set():
             raise Denial("disconnected")
-        if packet["action"]["operation"] not in self.operations:
-            raise Denial("unsupported")
-        if int(packet["action"]["target"]["policy_revision"]) >= 2**63 - 1:
-            raise Denial("limit")
+        self.validate_action(packet["action"])
         if not self.lock.acquire(blocking=False):
             try:
                 intent = self.ledger.intent(packet["operation_id"], packet["deployment"])

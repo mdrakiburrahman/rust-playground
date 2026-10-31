@@ -14,7 +14,9 @@ import threading
 import time
 
 from live_contract import Denial
-from live_deployment import AttachedRuntime, deployment_root, describe, private_root
+from live_deployment import (MANIFEST, RUNTIME_IMAGE, SQL_IMAGE, deployment_root, describe,
+                             private_root, read_private)
+from observation import Engine
 
 
 MAX_DURATION_MS = 3000
@@ -24,6 +26,50 @@ ALLOWED = {
     "publisher-interrupt": frozenset({"publisher"}),
     "authority-loss": frozenset({"sql"}),
 }
+
+
+class FaultResource:
+    """A worker can control one saved container, never execute native binaries."""
+
+    def __init__(self, project, subnet, arm, record, engine=None):
+        self.root = deployment_root(project)
+        private_root(self.root)
+        manifest = read_private(self.root / MANIFEST)
+        if (manifest.get("version") != 1 or manifest.get("project") != project
+                or manifest.get("subnet") != subnet or manifest.get("arm") != arm
+                or manifest.get("sql_image") != SQL_IMAGE or manifest.get("runtime_image") != RUNTIME_IMAGE
+                or record["intent"]["deployment"] != manifest.get("deployment")):
+            raise Denial("wrong-target")
+        deployment = manifest["deployment"]
+        if (set(deployment) != {"id", "incarnation"} or deployment["id"] != project
+                or not re.fullmatch(r"[a-f0-9]{32}", deployment["incarnation"])):
+            raise Denial("wrong-target")
+        action, native = record["intent"]["action"], record["native"]
+        role = action["resource"]["id"].removeprefix("resource-")
+        if (set(action) != {"operation", "resource", "fault", "duration_ms"}
+                or action["operation"] != "fault" or role not in ALLOWED.get(action["fault"], ())
+                or type(action["duration_ms"]) is not int or not 1 <= action["duration_ms"] <= MAX_DURATION_MS):
+            raise Denial("unsupported")
+        name = project + "-" + role
+        if (native["name"] != name or role != "sql" and manifest["names"].get(role) != name
+                or manifest["containers"].get(name) != {k: native[k] for k in ("id", "started_at", "image")}
+                or not re.fullmatch(r"[a-f0-9]{64}", native["id"])
+                or not re.fullmatch(r"sha256:[a-f0-9]{64}", native["image"])
+                or role == "sql" and native["image"] != SQL_IMAGE
+                or action["resource"] != {"id": "resource-" + role,
+                                         "incarnation": hashlib.sha256(
+                                             (native["id"] + native["started_at"]).encode()).hexdigest()}):
+            raise Denial("wrong-target")
+        self.engine = engine or Engine()
+        self.project, self.subnet, self.arm, self.deployment = project, subnet, arm, deployment
+        self.container_ids = {name: native["id"]}
+        if describe(self.engine, name, native["id"], project) != manifest["containers"][name]:
+            raise Denial("wrong-target")
+
+    def owned_container(self, name):
+        if name not in self.container_ids:
+            raise Denial("wrong-target")
+        return self.container_ids[name]
 
 
 def boot_identity():
@@ -272,7 +318,14 @@ class FaultSupervisor:
         self.journal.update(operation_id, repair=True)
         if operation_id in self.children:
             self.children[operation_id].wait(timeout=12)
-        return supervise(self.runtime, self.journal, operation_id, repair_only=True)
+        deadline = time.monotonic() + 12
+        while True:
+            try:
+                return supervise(self.runtime, self.journal, operation_id, repair_only=True)
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("independent fault owner did not release within repair bound") from None
+                time.sleep(0.05)
 
     def close(self):
         for record in self.journal.unresolved():
@@ -280,7 +333,7 @@ class FaultSupervisor:
         for child in self.children.values():
             child.wait(timeout=12)
         for record in self.journal.unresolved():
-            result = supervise(self.runtime, self.journal, record["operation_id"], repair_only=True)
+            result = self.repair(record["operation_id"])
             if result["phase"] not in FINISHED:
                 raise RuntimeError("exact-resource fault repair remains unresolved")
         self.journal.close()
@@ -303,9 +356,9 @@ def main():
         descriptor = sys.stdin.fileno()
         if not select.select([descriptor], [], [], 5)[0] or os.read(descriptor, 1) != b"G":
             raise Denial("disarmed")
-    runtime = AttachedRuntime(args.project, args.subnet, args.arm, None)
     journal = FaultJournal(deployment_root(args.project))
     try:
+        runtime = FaultResource(args.project, args.subnet, args.arm, journal.get(args.operation_id))
         result = supervise(runtime, journal, args.operation_id, args.repair_only,
                            authorize=None if args.repair_only else authorize)
         if result["phase"] not in FINISHED:

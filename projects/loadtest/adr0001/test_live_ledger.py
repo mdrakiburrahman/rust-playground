@@ -89,6 +89,20 @@ class OperationLedgerTests(unittest.TestCase):
         _, fresh = self.ledger.reserve(self.command)
         self.assertFalse(fresh)
 
+    def test_new_unknown_observation_updates_reason_without_rewriting_applied_identity(self):
+        self.ledger.reserve(self.command)
+        self.ledger.advance("operation-1", self.deployment, "pending")
+        self.ledger.advance("operation-1", self.deployment, "applied", "8")
+        self.ledger.advance("operation-1", self.deployment, "unknown", error_code="disconnected")
+        current = self.ledger.advance("operation-1", self.deployment, "unknown", error_code="stale")
+        self.assertEqual((current["status"], current["error_code"]), ("unknown", "stale"))
+        self.assertEqual((current["requested_revision"], current["applied_revision"]), ("7", "8"))
+        with self.assertRaisesRegex(Denial, "conflict"):
+            self.ledger.advance("operation-1", self.deployment, "unknown", "9", error_code="unknown")
+        self.ledger.advance("operation-1", self.deployment, "completed", "10")
+        with self.assertRaisesRegex(Denial, "conflict"):
+            self.ledger.advance("operation-1", self.deployment, "completed", error_code="unknown")
+
     def test_cannot_invent_completion_without_applied_revision(self):
         self.ledger.reserve(self.command)
         self.ledger.advance("operation-1", self.deployment, "pending")

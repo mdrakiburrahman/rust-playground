@@ -22,10 +22,13 @@ from delta_runtime import Runtime
 from delta_benchmark import BINARIES
 from live_contract import Denial, RESPONSE_BYTES
 from live_deployment import AttachedRuntime, DeploymentLease, deployment_root, save_deployment
+from live_effects import EffectExecutor
 from live_executor import PolicyExecutor
+from live_faults import FaultSupervisor
 from live_ledger import OperationLedger
 from live_receipts import ReceiptObserver
 from live_server import BoundedHTTPServer, Bridge
+from live_workload import NativeWorkload, WorkloadRunner
 from observation import Engine
 from publication_gate import REPO, RUNTIME_IMAGE, SQL_IMAGE
 
@@ -74,6 +77,76 @@ def verify_policy_proof(path):
             (REPO / "target/debug" / name).read_bytes()
         ).hexdigest():
             raise ValueError("policy qualification binary mismatch")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def verify_effects_proof(path):
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("effects qualification must be a regular local artifact")
+    with path.open("rb") as stream:
+        raw = stream.read(262145)
+    if len(raw) > 262144:
+        raise ValueError("effects qualification artifact exceeds bound")
+    proof = json.loads(raw)
+    http_proof = isinstance(proof, dict) and proof.get("proof_kind") == "guarded-http-effects"
+    native_evidence = (
+        type(proof.get("ordinary_delta_exact_marker_rows")) is int
+        and proof["ordinary_delta_exact_marker_rows"] == 65548
+        and type(proof.get("bounded_single_attempts")) is int and proof["bounded_single_attempts"] == 4
+        and all(proof.get(name) is True for name in (
+            "server_owned_small_and_elephant_profiles", "same_id_no_replay_and_journal_reopen",
+            "publisher_inflight_completion", "completion_requires_public_physical_receipt_observation",
+            "measured_fault_lifecycle_below_requested_plus_5s", "actual_bridge_sigkill_independent_rollback",
+            "actual_worker_sigkill_then_emergency_repair"))
+    ) if isinstance(proof, dict) else False
+    if http_proof:
+        native_evidence = (
+            type(proof.get("physical_workload_units")) is int and proof["physical_workload_units"] == 4
+            and type(proof.get("combined_ordinary_delta_exact_marker_rows")) is int
+            and proof["combined_ordinary_delta_exact_marker_rows"] == 65554
+            and type(proof.get("native_policy_mutations")) is int and proof["native_policy_mutations"] == 4
+            and proof.get("frontend_mutations") is False and proof.get("arm") == "adr"
+            and all(proof.get(name) is True for name in (
+                "durable_same_id_reconciled_without_replay", "stable_deployment_new_bridge_incarnation",
+                "snapshot_revision_watermark_preserved", "old_session_denied", "wrong_resource_and_csrf_denied",
+                "independent_rollback_before_restart", "fault_and_workload_overlap",
+                "workload_lost_http_response_no_replay", "actual_worker_sigkill_then_emergency_repair",
+                "measured_fault_lifecycle_below_requested_plus_5s", "endpoint_closed",
+                "actual_parent_death_during_preflight_no_application"))
+            and isinstance(proof.get("fault_cases"), list) and len(proof["fault_cases"]) == 5
+            and all(isinstance(item, dict) and item.get("phase") == "repaired" and item.get("applied") is True
+                    and item.get("fault") in {"pause", "authority-loss", "publisher-interrupt"}
+                    and type(item.get("duration_ms")) is int and 1 <= item["duration_ms"] <= 3000
+                    and type(item.get("elapsed_ns")) is int
+                    and 0 <= item["elapsed_ns"] < (item["duration_ms"] + 5000) * 1_000_000
+                    for item in proof["fault_cases"])
+            and {item["fault"] for item in proof["fault_cases"]} == {"pause", "authority-loss", "publisher-interrupt"}
+            and isinstance(proof.get("effects"), list) and len(proof["effects"]) == 8
+            and all(isinstance(item, dict) and item.get("status") == "completed"
+                    and item.get("operation") in {"fault", "workload"} for item in proof["effects"])
+            and sum(item["operation"] == "fault" for item in proof["effects"]) == 5
+            and proof.get("fault_owner_sigkill_exit") == -9 and proof.get("crashed_process_exit") == -9
+        )
+    if (not isinstance(proof, dict) or type(proof.get("server_exit_code")) is not int
+            or proof["server_exit_code"] != 0
+            or type(proof.get("exact_owned_containers_stopped")) is not int
+            or proof["exact_owned_containers_stopped"] != 8
+            or not native_evidence
+            or proof.get("arm") != "adr"
+            or proof.get("sql_image") != SQL_IMAGE or proof.get("runtime_image") != RUNTIME_IMAGE):
+        raise ValueError("effects qualification evidence is incomplete")
+    sources = proof.get("source_sha256")
+    binaries = proof.get("shared_binaries")
+    if not isinstance(sources, dict) or not isinstance(binaries, dict):
+        raise ValueError("effects qualification identities unavailable")
+    for name in ("live_effects.py", "live_executor.py", "live_faults.py", "live_workload.py", "live_ledger.py",
+                 "live_server.py", "live_runtime.py", "live_deployment.py", "live_contract.py", "live_receipts.py",
+                 "contracts/live-v1.schema.json"):
+        if sources.get(name) != hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest():
+            raise ValueError("effects qualification source mismatch")
+    for name in BINARIES:
+        if binaries.get(name) != hashlib.sha256((REPO / "target/debug" / name).read_bytes()).hexdigest():
+            raise ValueError("effects qualification binary mismatch")
     return hashlib.sha256(raw).hexdigest()
 
 
@@ -269,6 +342,8 @@ def main():
     parser.add_argument("--bootstrap-file", type=Path, required=True)
     parser.add_argument("--policy-proof", type=Path,
                         help="explicit matching direct-policy qualification; omitted means read-only")
+    parser.add_argument("--effects-proof", type=Path,
+                        help="additional exact-source preset/fault proof; also requires --policy-proof")
     parser.add_argument("--resume", action="store_true", help="attach only the saved exact owned deployment")
     parser.add_argument("--retain-runtime-on-stop", action="store_true",
                         help="leave the verified owned runtime running after a normal bridge stop for bounded restart")
@@ -282,9 +357,13 @@ def main():
         raise ValueError("bootstrap material must remain outside static files")
     require_local_images()
     policy_proof = verify_policy_proof(args.policy_proof) if args.policy_proof is not None else None
+    if args.effects_proof is not None:
+        if policy_proof is None or args.arm != "adr":
+            raise ValueError("additional effects require matching policy qualification and the selected ADR PoC")
+        verify_effects_proof(args.effects_proof)
     deployment_root(args.project)
     runtime = lease = None
-    ledger, observer, server, executor = None, None, None, None
+    ledger, observer, server, executor, faults = None, None, None, None, None
     served = False
     def stop(*_):
         if server is None:
@@ -313,6 +392,13 @@ def main():
         bridge = Bridge(f"http://127.0.0.1:{args.port}", deployment, args.frontend_root, ledger)
         if not args.resume:
             save_deployment(runtime, deployment, policy_proof)
+        attached = None
+        if args.effects_proof is not None or (runtime.root / "bridge-faults.sqlite").exists():
+            attached = AttachedRuntime(args.project, args.subnet, args.arm, policy_proof)
+            faults = FaultSupervisor(attached)
+            for record in faults.journal.unresolved():
+                if faults.repair(record["operation_id"])["phase"] not in ("repaired", "rejected"):
+                    raise RuntimeError("saved exact-resource fault still requires repair")
         observer = RuntimeObserver(runtime, bridge, receipt_probe=ReceiptObserver(runtime).sample)
         if args.policy_proof is not None:
             def resource(collector):
@@ -320,7 +406,11 @@ def main():
                     raise Denial("wrong-target")
                 _, identity, running, _, _ = observer.component((collector, runtime.names[collector]), with_stats=False)
                 return identity if running else None
-            executor = PolicyExecutor(ledger, runtime.post, resource, bridge.snapshot)
+            if args.effects_proof is None:
+                executor = PolicyExecutor(ledger, runtime.post, resource, bridge.snapshot)
+            else:
+                workload = WorkloadRunner(ledger, NativeWorkload(attached), bridge.snapshot)
+                executor = EffectExecutor(ledger, runtime.post, resource, bridge.snapshot, faults, workload)
             bridge.executor = executor
         server = BoundedHTTPServer(("127.0.0.1", args.port), bridge)
         observer.start()
@@ -347,8 +437,12 @@ def main():
                     executor.close()
             finally:
                 try:
-                    if ledger is not None:
-                        ledger.close()
+                    try:
+                        if faults is not None:
+                            faults.close()
+                    finally:
+                        if ledger is not None:
+                            ledger.close()
                 finally:
                     try:
                         if runtime is not None:

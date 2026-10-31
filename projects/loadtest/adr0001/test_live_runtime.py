@@ -266,6 +266,77 @@ class RuntimeProjectionTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "exceeds bound"):
                     live_runtime.verify_policy_proof(path)
 
+    def test_additional_effects_require_complete_matching_source_binary_and_native_proof(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "target/debug").mkdir(parents=True)
+            binary = root / "target/debug/qualified-binary"
+            binary.write_bytes(b"synthetic qualified binary")
+            sources = Path(live_runtime.__file__).parent
+            names = ("live_effects.py", "live_executor.py", "live_faults.py", "live_workload.py", "live_ledger.py",
+                     "live_server.py", "live_runtime.py", "live_deployment.py", "live_contract.py", "live_receipts.py",
+                     "contracts/live-v1.schema.json")
+            proof = {
+                "server_exit_code": 0, "exact_owned_containers_stopped": 8,
+                "ordinary_delta_exact_marker_rows": 65548, "bounded_single_attempts": 4, "arm": "adr",
+                "server_owned_small_and_elephant_profiles": True, "same_id_no_replay_and_journal_reopen": True,
+                "publisher_inflight_completion": True, "completion_requires_public_physical_receipt_observation": True,
+                "measured_fault_lifecycle_below_requested_plus_5s": True,
+                "actual_bridge_sigkill_independent_rollback": True, "actual_worker_sigkill_then_emergency_repair": True,
+                "sql_image": live_runtime.SQL_IMAGE, "runtime_image": live_runtime.RUNTIME_IMAGE,
+                "source_sha256": {name: hashlib.sha256((sources / name).read_bytes()).hexdigest() for name in names},
+                "shared_binaries": {"qualified-binary": hashlib.sha256(binary.read_bytes()).hexdigest()},
+            }
+            path = root / "effects-proof.json"
+            with patch.object(live_runtime, "REPO", root), patch.object(live_runtime, "BINARIES", ("qualified-binary",)):
+                path.write_text(json.dumps(proof))
+                self.assertEqual(live_runtime.verify_effects_proof(path), hashlib.sha256(path.read_bytes()).hexdigest())
+                for field, invalid in (
+                    ("ordinary_delta_exact_marker_rows", True), ("actual_bridge_sigkill_independent_rollback", False),
+                    ("bounded_single_attempts", 0), ("source_sha256", {}), ("shared_binaries", {}),
+                    ("runtime_image", "foreign"), ("arm", "pingora"),
+                ):
+                    changed = copy.deepcopy(proof)
+                    changed[field] = invalid
+                    path.write_text(json.dumps(changed))
+                    with self.subTest(field=field), self.assertRaises(ValueError):
+                        live_runtime.verify_effects_proof(path)
+                http = {**proof, "proof_kind": "guarded-http-effects",
+                        "physical_workload_units": 4, "combined_ordinary_delta_exact_marker_rows": 65554,
+                        "native_policy_mutations": 4, "frontend_mutations": False,
+                        "fault_owner_sigkill_exit": -9, "crashed_process_exit": -9,
+                        "effects": [{"operation": operation, "status": "completed"}
+                                    for operation in ["fault"] * 5 + ["workload"] * 3],
+                        "fault_cases": [{"fault": variant, "phase": "repaired", "applied": True,
+                                         "duration_ms": 500, "elapsed_ns": 600_000_000}
+                                        for variant in ("pause", "authority-loss", "publisher-interrupt",
+                                                        "pause", "pause")]}
+                for name in (
+                    "durable_same_id_reconciled_without_replay", "stable_deployment_new_bridge_incarnation",
+                    "snapshot_revision_watermark_preserved", "old_session_denied", "wrong_resource_and_csrf_denied",
+                    "independent_rollback_before_restart", "fault_and_workload_overlap",
+                    "workload_lost_http_response_no_replay", "endpoint_closed",
+                    "actual_parent_death_during_preflight_no_application",
+                ):
+                    http[name] = True
+                path.write_text(json.dumps(http))
+                self.assertEqual(live_runtime.verify_effects_proof(path), hashlib.sha256(path.read_bytes()).hexdigest())
+                for field, invalid in (
+                    ("physical_workload_units", True), ("fault_cases", []), ("effects", [None]),
+                    ("combined_ordinary_delta_exact_marker_rows", 9), ("native_policy_mutations", False),
+                    ("actual_parent_death_during_preflight_no_application", False),
+                    ("actual_worker_sigkill_then_emergency_repair", False), ("source_sha256", {}),
+                    ("endpoint_closed", False), ("fault_owner_sigkill_exit", 0),
+                ):
+                    changed = copy.deepcopy(http)
+                    changed[field] = invalid
+                    path.write_text(json.dumps(changed))
+                    with self.subTest(http_field=field), self.assertRaises(ValueError):
+                        live_runtime.verify_effects_proof(path)
+                path.write_bytes(b"x" * 262145)
+                with self.assertRaisesRegex(ValueError, "exceeds bound"):
+                    live_runtime.verify_effects_proof(path)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -45,15 +45,20 @@ class WorkloadTests(unittest.TestCase):
         self.prepare_count += 1
 
     def send(self, attempt, remaining, remember):
+        import pyarrow.flight as flight
         self.assertGreater(remaining, 0)
         self.assertLessEqual(remaining, 1)
         self.assertTrue(self.runner.journal.get("workload-1", self.deployment)["attempts"][0]["sent"])
         self.sent.append(copy.deepcopy(attempt))
         if self.mode == "missing":
             raise TimeoutError("synthetic response lost before unit identity")
+        if self.mode == "flight-missing":
+            raise flight.FlightUnavailableError("synthetic unavailable before unit identity")
         remember(unit=self.unit)
         if self.mode == "timeout":
             raise TimeoutError("synthetic response lost after unit identity")
+        if self.mode == "flight-timeout":
+            raise flight.FlightTimedOutError("synthetic native flight timeout after unit identity")
         remember(final={"version": "2", "digest": "a" * 64}, rpc_status="final")
 
     def receipt(self, completion="completed"):
@@ -103,6 +108,24 @@ class WorkloadTests(unittest.TestCase):
         self.assertEqual(len(self.sent), 1)
         with self.assertRaises(ValueError):
             self.runner.journal.update("workload-1", self.deployment, 0, sent=False)
+
+    def test_native_flight_error_hierarchy_is_preserved_and_can_complete_later(self):
+        self.mode = "flight-timeout"
+        self.assertEqual(self.run_job(), ("unknown", None))
+        attempt = self.runner.journal.get("workload-1", self.deployment)["attempts"][0]
+        self.assertEqual((attempt["rpc_status"], attempt["error_code"]), ("timeout", "timeout"))
+        self.receipt()
+        self.assertEqual(self.run_job(), ("completed", "8"))
+        self.assertEqual(len(self.sent), 1)
+
+    def test_native_flight_unavailable_without_unit_never_invents_completion(self):
+        self.mode = "flight-missing"
+        self.assertEqual(self.run_job(), ("unknown", None))
+        self.receipt()
+        self.assertEqual(self.run_job(), ("unknown", None))
+        attempt = self.runner.journal.get("workload-1", self.deployment)["attempts"][0]
+        self.assertEqual((attempt["rpc_status"], attempt["error_code"]), ("unknown", "unknown"))
+        self.assertEqual(len(self.sent), 1)
 
     def test_disarm_after_prepare_prevents_native_dispatch(self):
         def disarmed():

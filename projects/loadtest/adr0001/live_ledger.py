@@ -155,7 +155,9 @@ class OperationLedger:
                         and result["error_code"] == error_code):
                     self.connection.execute("COMMIT")
                     return result
-                if previous in TERMINAL or status not in TRANSITIONS.get(previous, frozenset()):
+                same_state_observation = previous == status and result["applied_revision"] == applied_revision
+                if (previous in TERMINAL
+                        or not same_state_observation and status not in TRANSITIONS.get(previous, frozenset())):
                     raise Denial("conflict")
                 result.update(status=status, applied_revision=applied_revision, error_code=error_code)
                 validate_packet(result)

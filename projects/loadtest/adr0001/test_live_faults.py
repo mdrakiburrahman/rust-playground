@@ -10,7 +10,8 @@ import unittest
 from unittest.mock import patch
 
 from live_contract import Denial
-from live_faults import FaultJournal, FaultSupervisor, boot_identity, supervise
+from live_faults import FaultJournal, FaultResource, FaultSupervisor, boot_identity, supervise
+from live_deployment import MANIFEST, RUNTIME_IMAGE, SQL_IMAGE, write_private_new
 
 
 class FaultSupervisorTests(unittest.TestCase):
@@ -76,6 +77,48 @@ class FaultSupervisorTests(unittest.TestCase):
         finally:
             reopened.close()
         self.assertEqual(os.stat(self.root / "bridge-faults.sqlite").st_mode & 0o777, 0o600)
+
+    def test_worker_binds_only_selected_saved_resource_without_binary_or_credentials(self):
+        record, _ = self.reserve()
+        manifest = {"version": 1, "project": self.project, "subnet": self.runtime.subnet, "arm": "adr",
+                    "deployment": self.runtime.deployment, "sql_image": SQL_IMAGE, "runtime_image": RUNTIME_IMAGE,
+                    "names": {"collector1": self.name},
+                    "containers": {self.name: {k: record["native"][k] for k in ("id", "started_at", "image")}}}
+        write_private_new(self.root / MANIFEST, manifest)
+        with patch("live_faults.deployment_root", return_value=self.root):
+            attached = FaultResource(self.project, self.runtime.subnet, "adr", record, self.runtime.engine)
+            self.assertEqual(attached.owned_container(self.name), self.identity)
+            with self.assertRaises(Denial):
+                attached.owned_container(self.project + "-collector2")
+            self.state["State"]["StartedAt"] = "replacement"
+            with self.assertRaises(Denial):
+                FaultResource(self.project, self.runtime.subnet, "adr", record, self.runtime.engine)
+
+    def test_dead_parent_before_authorization_never_pauses(self):
+        self.reserve()
+        def dead_parent():
+            raise Denial("disarmed")
+        result = supervise(self.runtime, self.journal, "synthetic-fault", effect=self.effect,
+                           authorize=dead_parent)
+        self.assertEqual(result["phase"], "rejected")
+        self.assertFalse(result["applied"])
+        self.assertEqual(self.calls, [])
+
+    def test_parent_death_after_pause_does_not_reauthorize_or_prevent_rollback(self):
+        self.reserve()
+        parent_alive, authorizations = [True], []
+        def authorize():
+            self.assertTrue(parent_alive[0])
+            authorizations.append(True)
+        def effect(operation, identity):
+            self.effect(operation, identity)
+            if operation == "pause":
+                parent_alive[0] = False
+        result = supervise(self.runtime, self.journal, "synthetic-fault", effect=effect, authorize=authorize)
+        self.assertEqual(result["phase"], "repaired")
+        self.assertTrue(result["applied"])
+        self.assertEqual(self.calls, ["pause", "unpause"])
+        self.assertEqual(authorizations, [True])
 
     def test_same_id_has_one_reservation_and_conflicting_or_concurrent_work_is_denied(self):
         first, fresh = self.reserve()

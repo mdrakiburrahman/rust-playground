@@ -964,3 +964,59 @@ The included driver retains SHA256
 `1a5aa2398ebf7443cd55fbfaeba2aad66977f93a3fae32dc9acb8f0679ae2d49`.
 Parent owns Proposed ADR results integration. Bridge work remains paused,
 frontend mutations false, old PR branch and original frozen cohorts untouched.
+
+### User-directed live bridge resumption and selected fault preflight
+
+After the completed table sweep, the user explicitly resumed the original live
+game requirements. Safe staff capacity/retirement, bounded client concurrency,
+fault/repair controls and truthful component observations remain pending
+implementation/qualification, not permanently out of scope. Frontend owns the
+scene/forms and its mutation gate remains false. The approved work reuses the
+existing executor and seven frozen binaries; benchmark bytes are not relabeled.
+
+HTTP-effects3 completed the four policy/restart checks and fixed small/elephant
+workloads but rejected all four collector fault intents `stale` before native
+application. Read-only diagnosis measured fresh-child import 0.428 s plus
+full attachment/binary checks 1.617 s, total 2.045 s, against the unchanged
+one-second snapshot revision cadence. All eight exact resources stopped.
+
+`FaultResource` now binds only the selected saved resource for the independent
+pause/unpause worker. The immutable manifest, deployment incarnation,
+allowlisted role/fault/duration, exact ID/start/image/owner and journal intent
+must match; other resource names are denied. Native executables/credentials
+are unnecessary in this child. Full parent attachment and final live freshness,
+session/policy/resource identity checks remain unchanged. Before application a
+dead parent cannot issue the one-use grant; after application deadline rollback
+and emergency repair do not require the parent or UI authority. Source
+regressions cover both parent-loss boundaries; all 120 live-bridge tests passed
+on the current separately staged sources and unchanged native harness.
+Selected-resource read-only startup measured 0.252 s in one diagnostic probe.
+
+One bounded HTTP-effects4 deployment on subnet 214 / port 18782 then completed
+all four policies/restart, two small inputs plus one elephant input (three
+physically completed native units / 65,542 workload rows), and both collector
+pause and SQL authority loss on their first intents. The publisher pause also
+applied and rolled back, but the driver asserted native `paused` immediately
+after HTTP `pending`, before native pause observation. Its HTTP record remains
+pending; no publisher completion, overlap/crash qualification or final combined
+Delta multiset is claimed. The corrected private fixture only polls the same
+saved intent to observed `paused`, with a two-second bound; no replay,
+freshness/retry relaxation or additional capability was introduced.
+This attempted fixture exited 1; all eight exact containers were independently
+verified stopped and port 18782 closed. No complete HTTP-effects proof exists.
+
+Current-source startup cannot reuse the old whole-file workload-v5 proof. The
+new verifier supports a separately scoped guarded-HTTP proof with unchanged
+source/seven-binary binding and explicit native/HTTP/cleanup checks. Private
+operator qualification fixtures explicitly substitute the evidence admission
+gate, never the actual HTTP/session/arming/freshness/identity/effect code. That
+bootstrap is not normal production activation or browser acceptance. A complete
+fresh artifact and subsequent normal nonfixture gated startup are still needed.
+All historical helper proofs and failed stages stay immutable and separate.
+
+At this boundary no backend job is running. The parent temporarily owns the
+heavy token for observation-only frontend browser checks; after return, the
+approved next bounded checkpoint is the corrected shared HTTP barrier and
+actual preflight-parent loss, post-application parent loss, worker kill/repair,
+same-ID reconciliation and final Delta audit. Do not start a broad helper cohort
+or advertise pending staff/migration/repair/concurrency capabilities.

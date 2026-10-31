@@ -327,3 +327,39 @@ the explicit requested-duration-plus-five-seconds qualification bound. These
 are control lifecycles, not CPU or cross-process latency estimates. HTTP
 workload/fault capabilities remain unsupported pending shared-executor and
 guarded HTTP qualification; frontend mutation authority remains disabled.
+
+## Shared HTTP executor checkpoint (not full qualification)
+
+The shared `EffectExecutor` preserves bounded admission, durable operation IDs,
+single-send workloads and separate requested/pending/completed outcomes. Normal
+startup requires both a matching policy proof and an additional exact-source,
+seven-binary effects proof; omitting it leaves faults/workloads unsupported.
+The effects verifier accepts the existing native-helper proof shape or a
+separately identified guarded-HTTP proof with five applied/repaired fault cases,
+actual parent/worker loss checks, four physically completed workload units,
+ordinary Delta reconciliation and exact stopped cleanup. Old proof hashes
+cannot activate changed sources. There is no production qualification bypass.
+
+Fault workers now attach only the selected resource saved in the immutable
+manifest and private journal: deployment incarnation, closed role/fault mapping,
+container ID/start/image/ownership and bounded intent must match. They never
+execute native binaries or load endpoint credentials. The parent retains its
+full deployment/source/binary verification and final live session, snapshot,
+policy and resource fences. A one-use live-parent handshake is required before
+initial pause only. Deadline rollback and `--repair-only` need the durable exact
+resource identity, not a surviving parent, current UI revision or armed session.
+No freshness window, observer cadence, duration cap or retry budget was relaxed.
+
+HTTP-effects3 rejected four collector faults stale before application: measured
+read-only full child attachment took 2.045 seconds against one-second snapshot
+updates. Selected-resource startup subsequently measured 0.252 seconds in one
+read-only probe; this is diagnostic startup cost, not a performance benchmark
+or a maximum. HTTP-effects4 completed collector and SQL faults on their first
+intents, plus the existing policies and fixed small/elephant workloads. Its
+publisher pause applied and rolled back, but the fixture incorrectly treated
+HTTP `pending` as already observed native `paused`; that operation remained
+pending, not completed. The corrected fixture waits on the same journal intent
+without replay. Eight exact containers stopped and the endpoint closed. Current
+parent-loss regressions pass in source tests, but this failed HTTP attempt did
+not reach the actual parent/worker-kill checks or final combined Delta audit.
+It produced no complete current-source effects proof or browser qualification.
