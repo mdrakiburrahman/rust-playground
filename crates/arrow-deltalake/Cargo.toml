@@ -31,9 +31,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 futures = "0.3"
+# Must stay on object_store's reqwest line: transport errors are classified by downcasting to it.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
-# object_store's own transport error type, used only to recognise connector failures.
-object-store-reqwest = { package = "reqwest", version = "0.13", default-features = false }
 sha2 = "0.10"
 async-trait = "0.1"
 tracing.workspace = true

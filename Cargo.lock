@@ -434,7 +434,6 @@ dependencies = [
  "opentelemetry_sdk 0.31.0",
  "parquet 58.4.0",
  "reqwest 0.12.28",
- "reqwest 0.13.5",
  "rustix",
  "serde",
  "serde_json",

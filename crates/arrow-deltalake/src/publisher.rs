@@ -570,17 +570,22 @@ fn classify<T>(result: &object_store::Result<T>, retries: MutationRetries) -> Op
 /// A connector failure (DNS, TCP or TLS) happens before any request byte is written, so the
 /// mutation definitely did not reach storage even when the transport also labels it a timeout.
 fn never_sent(error: &object_store::Error) -> bool {
-    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
-    while let Some(current) = source {
-        if current
-            .downcast_ref::<object_store_reqwest::Error>()
-            .is_some_and(object_store_reqwest::Error::is_connect)
-        {
-            return true;
-        }
-        source = current.source();
-    }
-    false
+    causes(error).any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_connect)
+            || cause
+                .downcast_ref::<object_store::client::HttpError>()
+                .is_some_and(|http| http.kind() == object_store::client::HttpErrorKind::Connect)
+    })
+}
+
+/// object_store reports transport failures as `HttpError` wrapping its own reqwest (0.12)
+/// error, so classification must use those types; another reqwest version never matches.
+fn causes<'a>(error: &'a object_store::Error) -> impl Iterator<Item = &'a (dyn std::error::Error + 'static)> {
+    std::iter::successors(Some(error as &(dyn std::error::Error + 'static)), |cause| {
+        cause.source()
+    })
 }
 struct Registration {
     control: Arc<dyn ControlMetadata>,
@@ -1396,7 +1401,8 @@ struct GuardedStore {
     server_copy: bool,
 }
 
-async fn retry_read<T, F, Fut>(mut read: F) -> object_store::Result<T>
+/// Bounded retry for idempotent reads; mutations are never replayed.
+pub(crate) async fn retry_read<T, F, Fut>(mut read: F) -> object_store::Result<T>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = object_store::Result<T>>,
@@ -1414,14 +1420,85 @@ where
 }
 
 fn transient_read(error: &object_store::Error) -> bool {
-    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
-    while let Some(error) = source {
-        if let Some(error) = error.downcast_ref::<object_store_reqwest::Error>() {
-            return error.is_connect() || error.is_timeout() || error.is_request() || error.is_body();
-        }
-        source = error.source();
+    use object_store::client::{HttpError, HttpErrorKind};
+    causes(error).any(|cause| {
+        cause.downcast_ref::<HttpError>().is_some_and(|http| {
+            matches!(
+                http.kind(),
+                HttpErrorKind::Connect | HttpErrorKind::Request | HttpErrorKind::Timeout | HttpErrorKind::Interrupted
+            )
+        }) || cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|error| error.is_connect() || error.is_timeout() || error.is_request() || error.is_body())
+    })
+}
+
+/// Forwards everything to `inner`, retrying only transient read and list failures.
+/// Used for unguarded remote readers; mutations still go out exactly once.
+#[derive(Debug)]
+pub(crate) struct ReadRetryStore {
+    pub(crate) inner: Arc<dyn ObjectStore>,
+}
+
+impl fmt::Display for ReadRetryStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "ReadRetry({})", self.inner)
     }
-    false
+}
+
+#[async_trait]
+impl ObjectStore for ReadRetryStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> object_store::Result<GetResult> {
+        retry_read(|| self.inner.get_opts(location, options.clone())).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        retry_read(|| self.inner.list_with_delimiter(prefix)).await
+    }
+
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+
+    async fn rename_opts(&self, from: &Path, to: &Path, options: RenameOptions) -> object_store::Result<()> {
+        self.inner.rename_opts(from, to, options).await
+    }
 }
 
 impl GuardedStore {
@@ -1516,7 +1593,7 @@ impl ObjectStore for GuardedStore {
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
-        self.inner.list_with_delimiter(prefix).await
+        retry_read(|| self.inner.list_with_delimiter(prefix)).await
     }
 
     async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> object_store::Result<()> {
@@ -1635,7 +1712,7 @@ mod classify_tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
         drop(listener);
-        let client = object_store_reqwest::Client::new();
+        let client = reqwest::Client::new();
         let calls = AtomicUsize::new(0);
         let value = retry_read(|| {
             let attempt = calls.fetch_add(1, Ordering::SeqCst);
@@ -1693,12 +1770,100 @@ mod classify_tests {
         Ok(())
     }
 
+    /// Regression: production errors are object_store's `HttpError` over its own reqwest, built
+    /// here through a real Azure store rather than by hand. A transient Azure GET went
+    /// unretried and failed a table closed while classification targeted another reqwest version.
+    #[tokio::test]
+    async fn real_azure_transport_errors_retry_reads_and_keep_mutations_definite() -> Result<()> {
+        use object_store::ObjectStoreExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        drop(listener);
+        let azure: Arc<dyn ObjectStore> = Arc::new(
+            object_store::azure::MicrosoftAzureBuilder::new()
+                .with_account("devstoreaccount1")
+                .with_container_name("probe")
+                .with_endpoint(format!("http://127.0.0.1:{port}/devstoreaccount1"))
+                .with_allow_http(true)
+                .with_access_key("ZmFrZS1rZXktZm9yLWEtY2xvc2VkLXBvcnQ=")
+                .with_retry(object_store::RetryConfig {
+                    max_retries: 0,
+                    retry_timeout: Duration::from_secs(5),
+                    backoff: object_store::BackoffConfig::default(),
+                })
+                .build()?,
+        );
+        let log = Path::from("_delta_log/00000000000000000004.json");
+
+        let read = azure.get(&log).await.err().context("closed port must fail the read")?;
+        assert!(transient_read(&read), "{read:?}");
+        let listed = azure
+            .list_with_delimiter(None)
+            .await
+            .err()
+            .context("closed port must fail the list")?;
+        assert!(transient_read(&listed), "{listed:?}");
+
+        let write = azure.put(&log, PutPayload::from_static(b"{}")).await;
+        assert!(write.is_err());
+        assert_eq!(classify(&write, MutationRetries::Disabled), None, "{write:?}");
+
+        // The reader wrapper retries the same read before surfacing it.
+        let calls = Arc::new(AtomicUsize::new(0));
+        #[derive(Debug)]
+        struct Counting(Arc<dyn ObjectStore>, Arc<AtomicUsize>);
+        impl fmt::Display for Counting {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(formatter, "Counting")
+            }
+        }
+        #[async_trait]
+        impl ObjectStore for Counting {
+            async fn put_opts(&self, l: &Path, p: PutPayload, o: PutOptions) -> object_store::Result<PutResult> {
+                self.0.put_opts(l, p, o).await
+            }
+            async fn put_multipart_opts(
+                &self,
+                l: &Path,
+                o: PutMultipartOptions,
+            ) -> object_store::Result<Box<dyn MultipartUpload>> {
+                self.0.put_multipart_opts(l, o).await
+            }
+            async fn get_opts(&self, l: &Path, o: GetOptions) -> object_store::Result<GetResult> {
+                self.1.fetch_add(1, Ordering::SeqCst);
+                self.0.get_opts(l, o).await
+            }
+            fn delete_stream(
+                &self,
+                l: BoxStream<'static, object_store::Result<Path>>,
+            ) -> BoxStream<'static, object_store::Result<Path>> {
+                self.0.delete_stream(l)
+            }
+            fn list(&self, p: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+                self.0.list(p)
+            }
+            async fn list_with_delimiter(&self, p: Option<&Path>) -> object_store::Result<ListResult> {
+                self.0.list_with_delimiter(p).await
+            }
+            async fn copy_opts(&self, f: &Path, t: &Path, o: CopyOptions) -> object_store::Result<()> {
+                self.0.copy_opts(f, t, o).await
+            }
+        }
+        let reader = ReadRetryStore {
+            inner: Arc::new(Counting(azure, Arc::clone(&calls))),
+        };
+        assert!(reader.get(&log).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn connector_failures_are_definite_but_sent_request_failures_stay_ambiguous() -> Result<()> {
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
         drop(listener);
-        let connect = object_store_reqwest::Client::new()
+        let connect = reqwest::Client::new()
             .put(format!("http://127.0.0.1:{port}/probe"))
             .send()
             .await
@@ -1711,7 +1876,7 @@ mod classify_tests {
 
         // The observed Azure failure: the connector gives up before a socket exists (timeout or
         // unreachable), which reqwest also reports as a timeout; it must stay definite.
-        let timeout = object_store_reqwest::Client::builder()
+        let timeout = reqwest::Client::builder()
             .connect_timeout(Duration::from_millis(200))
             .build()?
             .put("http://192.0.2.1:9/probe")

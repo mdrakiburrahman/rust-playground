@@ -96,7 +96,9 @@ fn azure_store(url: &Url) -> Result<object_store::azure::MicrosoftAzure> {
 pub fn object_store_for_url(url: &Url) -> Result<Arc<dyn ObjectStore>> {
     let store: Arc<dyn ObjectStore> = match url.scheme() {
         "file" => Arc::new(object_store::local::LocalFileSystem::new()),
-        "abfs" | "abfss" | "az" => Arc::new(azure_store(url)?),
+        "abfs" | "abfss" | "az" => Arc::new(crate::publisher::ReadRetryStore {
+            inner: Arc::new(azure_store(url)?),
+        }),
         _ => bail!("only file and ADLS URLs are supported"),
     };
     Ok(store)
