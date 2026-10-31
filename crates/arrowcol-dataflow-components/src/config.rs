@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use arrowcol_catalog::{
@@ -11,6 +11,28 @@ use arrowcol_flight::{RuntimeLimits, RuntimeResult};
 use arrowcol_protocol::{PositiveMeasurement, UnixMillis};
 use arrowcol_routing::{MemoryRoutingStore, RoutingStore, SqlServerRoutingConfig, SqlServerRoutingStore};
 use serde::Deserialize;
+
+static CLOUD_GENERATION: OnceLock<String> = OnceLock::new();
+
+/// Freezes the embedding collector's validated cloud epoch before DFE admission.
+///
+/// # Errors
+/// Rejects an attempted process-epoch change or conflicting initialization.
+pub fn configure_cloud_generation(generation: &str) -> Result<(), String> {
+    if let Some(existing) = CLOUD_GENERATION.get() {
+        if existing != generation {
+            return Err("DFE process cloud generation cannot change".to_owned());
+        }
+        return Ok(());
+    }
+    CLOUD_GENERATION
+        .set(generation.to_owned())
+        .map_err(|_| "DFE process cloud generation concurrently initialized".to_owned())
+}
+
+pub(crate) fn process_cloud_generation() -> Option<&'static str> {
+    CLOUD_GENERATION.get().map(String::as_str)
+}
 
 fn default_connect_timeout() -> Duration {
     Duration::from_secs(15)
@@ -478,7 +500,7 @@ impl CommitConfig {
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct DeltaExporterConfig {
-    /// Absolute local root for logical Arrowcol tables.
+    /// Absolute local root or abfss URI for logical Arrowcol tables.
     pub base_path: PathBuf,
     /// Authoritative routing lease store.
     pub routing: RoutingStoreConfig,
@@ -495,8 +517,8 @@ pub struct DeltaExporterConfig {
 
 impl DeltaExporterConfig {
     pub(crate) fn validate(&self) -> Result<(), String> {
-        if !self.base_path.is_absolute() {
-            return Err("Delta base_path must be absolute".to_owned());
+        if !self.base_path.is_absolute() && !self.base_path.to_string_lossy().starts_with("abfss://") {
+            return Err("Delta base_path must be absolute or an abfss URI".to_owned());
         }
         if self.authority_timeout.is_zero() {
             return Err("Delta authority_timeout must be positive".to_owned());

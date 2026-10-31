@@ -421,6 +421,182 @@ async fn live_recovery_window_expiry_restores_reconciliation() -> anyhow::Result
     Ok(())
 }
 
+/// Scenario: an owner enters drain, keeps heartbeating while it flushes, then
+/// finishes drain.
+/// Guarantees: a draining owner renews its lease (its receipts and leases stay
+/// owned, so a successor cannot adopt them mid-drain); an expired deadline is
+/// still fenced while draining; a stopped owner is fenced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the live arrowcol-infra SQL Server"]
+async fn live_draining_owner_heartbeats_until_stopped() -> anyhow::Result<()> {
+    if std::env::var("ARROWCOL_SQLSERVER_TEST").as_deref() != Ok("1") {
+        return Ok(());
+    }
+    let _isolation = LIVE_RECEIPT_CASE.lock().await;
+    let store = SqlServerReceiptStore::new(sql_config()?);
+    let owner = CollectorInstanceId::new();
+    let instance_key = format!("live-drain-heartbeat-{}", Uuid::new_v4().simple());
+    register_live_owner(&store, owner, &instance_key, 1, 30_000, None).await?;
+    store.heartbeat_owner(owner, plus(now()?, 30_000)?).await?;
+
+    store.start_owner_drain(owner).await?;
+    assert_eq!(owner_row(owner).await?.0, "draining");
+    store.heartbeat_owner(owner, plus(now()?, 30_000)?).await?;
+    let expired = store
+        .heartbeat_owner(owner, minus(now()?, 1_000)?)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("an expired deadline must stay fenced while draining"))?;
+    assert_eq!(expired.kind(), ReceiptErrorKind::Fenced);
+    assert_eq!(owner_row(owner).await?.0, "draining");
+
+    store.finish_owner_drain(owner, now()?).await?;
+    let (state, stopped, _) = owner_row(owner).await?;
+    assert_eq!(state, "stopped");
+    assert!(stopped);
+    let stopped_heartbeat = store
+        .heartbeat_owner(owner, plus(now()?, 30_000)?)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("a stopped owner must be fenced"))?;
+    assert_eq!(stopped_heartbeat.kind(), ReceiptErrorKind::Fenced);
+    Ok(())
+}
+
+/// Scenario: a durable predecessor crashes after creating accepted receipts
+/// that never reached its local buffer, alongside buffered work; a successor
+/// of the same instance key drains its persisted backlog.
+/// Guarantees: only the predecessor's accepted receipts become retryable
+/// failures with an event; buffered work, the successor's own receipts and
+/// another instance key's receipts are untouched; a repeat sweep is a no-op.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the live arrowcol-infra SQL Server"]
+async fn live_successor_fails_unbuffered_predecessor_receipts() -> anyhow::Result<()> {
+    if std::env::var("ARROWCOL_SQLSERVER_TEST").as_deref() != Ok("1") {
+        return Ok(());
+    }
+    let _isolation = LIVE_RECEIPT_CASE.lock().await;
+    let local = fixture().await?;
+    seed_catalog(&local).await?;
+    let store = SqlServerReceiptStore::new(sql_config()?);
+    let delivery = ValidatedDelivery::new(&local.validation, 3, 1, 24)?;
+    let instance_key = format!("live-unbuffered-{}", Uuid::new_v4().simple());
+
+    let predecessor = CollectorInstanceId::new();
+    let predecessor_expiry = register_live_owner(
+        &store,
+        predecessor,
+        &instance_key,
+        1,
+        1_500,
+        Some(LONG_RECOVERY_WINDOW_MS),
+    )
+    .await?;
+    let predecessor_lease = acquire_live_lease(&store, &local, predecessor, predecessor_expiry).await?;
+    let created = store
+        .create_flight_batch(
+            predecessor,
+            &predecessor_lease,
+            plus(now()?, 500)?,
+            &[delivery.clone(), delivery.clone(), delivery.clone()],
+        )
+        .await?;
+    let buffered = store
+        .mark_buffered(predecessor, &versions(&created[2..]), plus(now()?, 500)?)
+        .await?;
+
+    let foreign = CollectorInstanceId::new();
+    let foreign_expiry =
+        register_live_owner(&store, foreign, &format!("{instance_key}-foreign"), 1, 120_000, None).await?;
+    let foreign_fixture = fixture().await?;
+    seed_catalog(&foreign_fixture).await?;
+    let foreign_delivery = ValidatedDelivery::new(&foreign_fixture.validation, 3, 1, 24)?;
+    let foreign_lease = acquire_live_lease(&store, &foreign_fixture, foreign, foreign_expiry).await?;
+    let foreign_accepted = store
+        .create_flight_batch(
+            foreign,
+            &foreign_lease,
+            plus(now()?, 30_000)?,
+            std::slice::from_ref(&foreign_delivery),
+        )
+        .await?;
+
+    sleep_until(plus(predecessor_expiry, 100)?).await?;
+    let successor = CollectorInstanceId::new();
+    let successor_expiry = register_live_owner(
+        &store,
+        successor,
+        &instance_key,
+        2,
+        120_000,
+        Some(LONG_RECOVERY_WINDOW_MS),
+    )
+    .await?;
+    assert_eq!(owner_row(predecessor).await?.0, "failed");
+    let successor_lease = acquire_live_lease(&store, &local, successor, successor_expiry).await?;
+    let own_accepted = store
+        .create_flight_batch(
+            successor,
+            &successor_lease,
+            plus(now()?, 30_000)?,
+            std::slice::from_ref(&delivery),
+        )
+        .await?;
+    store.start_owner_drain(successor).await?;
+
+    let report = store
+        .fail_unbuffered_predecessor_receipts(successor, now()?, 256)
+        .await?;
+    assert!(!report.limit_reached);
+    let mut failed: Vec<_> = report.reconciled.iter().map(|record| record.receipt_id).collect();
+    failed.sort();
+    let mut expected: Vec<_> = created[..2].iter().map(|record| record.receipt_id).collect();
+    expected.sort();
+    assert_eq!(failed, expected);
+    for record in &report.reconciled {
+        assert_eq!(record.state, ReceiptState::Failed);
+        assert_eq!(record.revision, 1);
+        assert_eq!(record.owner_instance_id, predecessor);
+    }
+    let untouched = store
+        .receipts(&[
+            buffered[0].receipt_id,
+            foreign_accepted[0].receipt_id,
+            own_accepted[0].receipt_id,
+        ])
+        .await?;
+    assert_eq!(
+        untouched,
+        vec![
+            Some(buffered[0].clone()),
+            Some(foreign_accepted[0].clone()),
+            Some(own_accepted[0].clone())
+        ]
+    );
+    let mut client = connect().await?;
+    for receipt in &expected {
+        let row = client
+            .query(
+                "SELECT from_state, to_state, actor_instance_id FROM arrowcol.receipt_events \
+                 WHERE receipt_id = @P1 AND revision = 1;",
+                &[&receipt.as_uuid()],
+            )
+            .await?
+            .into_row()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("missing failure event"))?;
+        assert_eq!(required_text(&row, "from_state")?, "accepted");
+        assert_eq!(required_text(&row, "to_state")?, "retryable_failure");
+        assert_eq!(required_uuid(&row, "actor_instance_id")?, successor.as_uuid());
+    }
+
+    let repeat = store
+        .fail_unbuffered_predecessor_receipts(successor, now()?, 256)
+        .await?;
+    assert!(repeat.reconciled.is_empty() && !repeat.limit_reached);
+    Ok(())
+}
+
 async fn live_receipts_case(pooled: bool) -> anyhow::Result<()> {
     if std::env::var("ARROWCOL_SQLSERVER_TEST").as_deref() != Ok("1") {
         return Ok(());
@@ -1106,6 +1282,15 @@ async fn sleep_until(instant: UnixMillis) -> anyhow::Result<()> {
 fn now() -> anyhow::Result<UnixMillis> {
     let millis = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
     Ok(UnixMillis::new(u64::try_from(millis)?)?)
+}
+
+fn minus(value: UnixMillis, millis: u64) -> anyhow::Result<UnixMillis> {
+    Ok(UnixMillis::new(
+        value
+            .get()
+            .checked_sub(millis)
+            .ok_or_else(|| anyhow::anyhow!("timestamp underflow"))?,
+    )?)
 }
 
 fn plus(value: UnixMillis, millis: u64) -> anyhow::Result<UnixMillis> {

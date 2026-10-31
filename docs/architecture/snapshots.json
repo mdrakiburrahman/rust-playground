@@ -1,0 +1,55 @@
+{
+  "renderer": "Playwright Chromium",
+  "browserVersion": "156.0.8078.4",
+  "deviceScaleFactor": 1,
+  "snapshots": [
+    {
+      "source": "loadtest-architecture.html",
+      "png": "loadtest-architecture.png",
+      "title": "ArrowCol lakehouse loadtest architecture",
+      "viewportWidth": 1500,
+      "sourceSha256": "fe29ef813ddc69d895a5176ebaee625af851dca3e9b0e0156f3c4206edc71efd",
+      "pngSha256": "1ff93d218ac02f7b6d7a92bfb014d2c270383b723434e8a1c4e5b5719f467579"
+    },
+    {
+      "source": "docs/architecture/loadtest/arrow-load-generator.html",
+      "png": "docs/architecture/loadtest/arrow-load-generator.png",
+      "title": "Arrow load generator | One batch. Two collector paths.",
+      "viewportWidth": 1360,
+      "sourceSha256": "db8753a133ac6bc7152d2ca0b8275c5b6fdbb343427dcf38448591eefcca6000",
+      "pngSha256": "e9b8d2281c6d49ccc3f481f50b331cc924564ab5caca1dcac809a10814f624fa"
+    },
+    {
+      "source": "docs/architecture/arrowcol-platform/diagrams/platform.html",
+      "png": "docs/architecture/arrowcol-platform/diagrams/platform.png",
+      "title": "Arrowcol | Shared control. Two delivery paths.",
+      "viewportWidth": 1360,
+      "sourceSha256": "7547b6921645c7e50dff04085d9c55e1350b4860218401a45c76059232fb5c09",
+      "pngSha256": "d96fd0e0088542e85691626f065aa3e680aba75f0cb69568ccaa791c99ce7ab8"
+    },
+    {
+      "source": "docs/architecture/arrowcol-platform/diagrams/delivery.html",
+      "png": "docs/architecture/arrowcol-platform/diagrams/delivery.png",
+      "title": "Arrowcol | Receipt first. Purge after publication.",
+      "viewportWidth": 1360,
+      "sourceSha256": "6c04a3099a20bc69dc6d7bc9a1a53a691ec50f3167e8372761bcd3b1974c8fad",
+      "pngSha256": "dc2e91857c8eecb269fc20087909174ddb0b30a27e92ca271c0d0ab74762b450"
+    },
+    {
+      "source": "docs/quiver/diagrams/lifecycle.html",
+      "png": "docs/quiver/diagrams/lifecycle.png",
+      "title": "Quiver | Life of a bundle",
+      "viewportWidth": 1360,
+      "sourceSha256": "08f43d499bab419bdefb6b2187d5607186ea46bba269c3b3d4a7c0f3d7416781",
+      "pngSha256": "4ce711766cac0182f409b1cfa7a3b0202897b273a0c57e870e9e8fcbf57cfef5"
+    },
+    {
+      "source": "docs/quiver/diagrams/layout.html",
+      "png": "docs/quiver/diagrams/layout.png",
+      "title": "Quiver | What is on disk",
+      "viewportWidth": 1360,
+      "sourceSha256": "c37786d64e90956cd3f59684f54e5c3a77ac3914f12996e853730ff33b5ae707",
+      "pngSha256": "df67219dc91ca4ff4f7136bef50ea1a0aca8c66c84b3b28a838345cf6401f79f"
+    }
+  ]
+}

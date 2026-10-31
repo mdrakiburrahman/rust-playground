@@ -1,0 +1,62 @@
+{
+  "name": "arrowcol-experiment",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "application",
+  "sourceRoot": "bin/arrowcol-experiment/src",
+  "implicitDependencies": [
+    "arrowcol-buffer",
+    "arrowcol-catalog",
+    "arrowcol-protocol",
+    "arrowcol-receipts",
+    "arrow-deltalake"
+  ],
+  "namedInputs": {
+    "default": [
+      "{projectRoot}/**/*",
+      "{workspaceRoot}/Cargo.toml",
+      "{workspaceRoot}/Cargo.lock",
+      "{workspaceRoot}/rust-toolchain.toml",
+      "{workspaceRoot}/rustfmt.toml"
+    ]
+  },
+  "targets": {
+    "format": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "cargo fmt --package arrowcol-experiment"
+      }
+    },
+    "format-check": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "cargo fmt --package arrowcol-experiment -- --check"
+      }
+    },
+    "lint": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "cargo clippy --locked --package arrowcol-experiment --all-targets -j 2 -- -D warnings"
+      }
+    },
+    "build": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "cargo build --locked --package arrowcol-experiment -j 2"
+      }
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "cargo test --locked --package arrowcol-experiment -j 2"
+      }
+    },
+    "verify": {
+      "executor": "nx:run-commands",
+      "dependsOn": ["format-check", "lint", "test"],
+      "options": {
+        "commands": []
+      }
+    }
+  },
+  "tags": ["scope:rust", "type:app"]
+}

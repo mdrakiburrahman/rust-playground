@@ -5,6 +5,30 @@ bounded zero-copy Arrow buffers in memory, fenced append-only Delta tables out.
 
 ## Data and control path
 
+Cloud startup requires `ARROWCOL_RESET_GENERATION` matching the ready storage
+authority for `ARROWCOL_DELTA_ROOT`. The validated epoch binds the existing
+deployment key and an immutable marker in the Quiver directory before recovery
+or admission. A G1 spool cannot be opened under G2, even at the same URI; old
+unbound cloud backlog needs explicit operator reconciliation. Same-generation
+crash replay retains its original receipt UUID and ingestion timestamp.
+`DeliveryManifest` has no per-receipt generation field: the original cloud epoch
+is persisted in the fsynced `.arrowcol-cloud-generation.json` spool marker and
+durable instance key. Before Quiver recovery the marker's original epoch is
+checked with `PublisherSession::require_generation`; missing/unbound legacy
+backlog is refused, never assigned the current environment's epoch.
+
+Both collectors install a global OTel meter provider before Delta initialization.
+OTLP metrics use standard `OTEL_EXPORTER_OTLP_ENDPOINT` and
+`OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`; `OTEL_METRIC_EXPORT_INTERVAL`
+defaults to 2000 ms. Kernel instrumentation is independent of logging filters.
+Default `service.name` is `arrowcol-rust` (direct) or `arrowcol-dataflow-rust`
+(DFE), overridden by `OTEL_SERVICE_NAME`; `OTEL_RESOURCE_ATTRIBUTES` adds resource
+labels. Both include `telemetry.sdk.name=opentelemetry`,
+`telemetry.sdk.language=rust`, and `telemetry.sdk.version=0.31.0`.
+Graceful normal/error exits flush and shut down the provider. Runtime images
+use Tini and an empty UID10001-owned0700 `/var/lib/arrowcol-azure` as
+`AZURE_CONFIG_DIR`; authentication state is supplied only at runtime.
+
 ```text
 router / direct authenticated client
         |
@@ -27,11 +51,11 @@ arrowcol-buffer
         |
         v
 arrow-deltalake
-  stream one Parquet file, fence immediately before Delta commit
+  stream one Parquet file per receipt, fence immediately before Delta commit
         |
         v
 arrowcol-receipts
-  atomically publish every grouped receipt after durable Delta visibility
+  publish each receipt after durable Delta visibility
 ```
 
 Every decoded non-empty `RecordBatch` receives a fresh server-generated receipt,
@@ -43,6 +67,15 @@ instead means the batch was fsynced to the local Quiver write-ahead log. Either
 way it is not purge permission. Source data may be purged only
 when `GET /v1/receipts/{id}` returns `"state": "published"` and
 `"purge_allowed": true`, after the fenced Delta commit is durable.
+
+Internal retries and Quiver replay reuse `arrowcol.publication.<receipt UUID>`
+version `0`; they do not reuse payload hashes or create fresh flush identities.
+Independent client resubmissions still receive independent receipts and rows.
+The original admission UTC milliseconds travel with each publication and its
+Quiver manifest. Set `ARROWCOL_PARTITION_GRANULARITY=minute`, `hour`, or `day`
+to stamp the core `__arrowcol_ingestion` partition from admission time, not
+event time; leave it unset for backward-compatible unpartitioned tables.
+Replay never refreshes this timestamp.
 
 Unknown, malicious, or breaking Arrow schemas are rejected before receipt
 creation. Existing Arrow arrays are not concatenated or deep-copied. Historical
@@ -75,6 +108,19 @@ The document covers:
 - router-HMAC, static-bearer, or explicit development allow-all auth;
 - graceful stream/publication drain ceilings; and
 - optional [native Quiver](#native-quiver) disk persistence.
+
+`ARROWCOL_DELTA_ROOT` overrides `delta.root` when loading a configuration file.
+Use a local filesystem root or an
+ADLS root of the form
+`abfss://container@account.dfs.core.windows.net/prefix`. Cloud roots require an
+object-store-backed writable-root probe and fenced commit coordinator; they
+must never be treated as local directories.
+Both collector runtime images install Azure CLI from Microsoft's signed
+Bookworm repository and enforce version 2.54 or later (`expires_on`/`--scope`)
+for ambient Azure CLI
+credentials. Mount its authenticated configuration with suitable UID 10001
+permissions and set `AZURE_CONFIG_DIR` to that location; do not put credentials
+in YAML, images, or source.
 
 Direct reuses separate bounded SQL Server connection pools for receipts,
 routing, and catalog operations. `sql_server.pool` defaults to
@@ -128,9 +174,18 @@ and a greater `identity.generation` waits for the crashed owner's lease to
 expire, registers, replays every unacknowledged batch from disk, adopts the
 predecessor's receipts onto its own table lease, and publishes them under the
 original receipt IDs. Replayed batches whose receipts were already published
-are acknowledged without republishing. Receipts adopted while `flushing` are
-published again, so rows committed just before the crash can be duplicated.
+are acknowledged without republishing. Receipts adopted while `flushing`
+reuse their stable publication transaction and original ingestion stamp, so
+rows committed just before the crash are not duplicated by replay.
 Graceful shutdown drains the Quiver backlog to Delta before releasing leases.
+After a clean drain returns and table handles are dropped, the process closes
+its shared publisher sessions once. Close failure is logged and exits nonzero,
+leaving the failed registry member registered; it is never retried or silently
+unregistered. An incomplete drain does not close publisher sessions.
+Both images forward runtime `ARROWCOL_DELTA_ROOT` and
+`ARROWCOL_RESET_GENERATION` unchanged through Tini; no generation is baked in.
+Their build smoke runs `az version` and the real collector `--help` as UID10001,
+then empties the writable0700 CLI config directory before the final layer.
 
 Validate without opening sockets or dependencies:
 
@@ -221,7 +276,7 @@ Graceful shutdown:
 2. allow active streams to finish, then force-cancel at the configured ceiling;
 3. persist receipt-owner drain state;
 4. bypass Delta collection windows and flush every buffer;
-5. await Delta visibility and grouped SQL receipt completion;
+5. await Delta visibility and per-publication SQL receipt completion;
 6. release table leases and finish the receipt owner; and
 7. mark routing state stopped.
 

@@ -252,19 +252,27 @@ impl RoutingStore for RawSqlStore {
         let expiry = datetime(registration.lease_expires_at_unix_ms)?;
         let mut client = self.connect().await?;
         let result: RoutingResult<_> = async {
-            client
-                .execute(
+            // A registration refresh never resurrects a draining or terminal
+            // row, and never moves its heartbeat or lease backwards: other
+            // writers for the same instance may already have stamped later.
+            let row = client
+                .query(
                     "MERGE arrowcol.routing_collectors WITH (HOLDLOCK) AS target \
                  USING (SELECT @P1 AS instance_id) AS source \
                  ON target.instance_id = source.instance_id \
-                 WHEN MATCHED THEN UPDATE SET \
+                 WHEN MATCHED AND target.state = 'ready' THEN UPDATE SET \
                     instance_key = @P2, implementation_pool = @P3, flight_endpoint = @P4, \
-                    catalog_capable = @P5, max_concurrent_streams = @P6, state = 'ready', \
-                    started_at_utc = @P7, heartbeat_at_utc = @P8, lease_expires_at_utc = @P9 \
+                    catalog_capable = @P5, max_concurrent_streams = @P6, \
+                    started_at_utc = @P7, \
+                    heartbeat_at_utc = CASE WHEN target.heartbeat_at_utc > @P8 \
+                        THEN target.heartbeat_at_utc ELSE @P8 END, \
+                    lease_expires_at_utc = CASE WHEN target.lease_expires_at_utc > @P9 \
+                        THEN target.lease_expires_at_utc ELSE @P9 END \
                  WHEN NOT MATCHED THEN INSERT ( \
                     instance_id, instance_key, implementation_pool, flight_endpoint, catalog_capable, \
                     max_concurrent_streams, state, started_at_utc, heartbeat_at_utc, lease_expires_at_utc \
-                 ) VALUES (@P1, @P2, @P3, @P4, @P5, @P6, 'ready', @P7, @P8, @P9);",
+                 ) VALUES (@P1, @P2, @P3, @P4, @P5, @P6, 'ready', @P7, @P8, @P9) \
+                 OUTPUT $action AS merge_action;",
                     &[
                         &instance_id,
                         &registration.instance_key,
@@ -278,7 +286,16 @@ impl RoutingStore for RawSqlStore {
                     ],
                 )
                 .await
-                .map_err(|cause| database_error("register routing collector", cause))?;
+                .map_err(|cause| database_error("register routing collector", cause))?
+                .into_row()
+                .await
+                .map_err(|cause| database_error("read routing registration result", cause))?;
+            if row.is_none() {
+                return Err(RoutingError::new(
+                    RoutingErrorKind::Conflict,
+                    "collector registration was fenced: the instance already left the ready state",
+                ));
+            }
             Ok(())
         }
         .await;
@@ -313,10 +330,12 @@ impl RoutingStore for RawSqlStore {
             let row = client
                 .query(
                     "UPDATE arrowcol.routing_collectors \
-                 SET heartbeat_at_utc = @P2, lease_expires_at_utc = @P3 \
+                 SET heartbeat_at_utc = CASE WHEN heartbeat_at_utc > @P2 \
+                        THEN heartbeat_at_utc ELSE @P2 END, \
+                     lease_expires_at_utc = CASE WHEN lease_expires_at_utc > @P3 \
+                        THEN lease_expires_at_utc ELSE @P3 END \
                  OUTPUT INSERTED.instance_id \
-                 WHERE instance_id = @P1 AND state IN ('ready', 'draining') \
-                   AND heartbeat_at_utc <= @P2 AND @P3 > @P2;",
+                 WHERE instance_id = @P1 AND state IN ('ready', 'draining') AND @P3 > @P2;",
                     &[&id, &heartbeat, &expiry],
                 )
                 .await
@@ -327,7 +346,7 @@ impl RoutingStore for RawSqlStore {
             if row.is_none() {
                 return Err(RoutingError::new(
                     RoutingErrorKind::Conflict,
-                    "collector heartbeat was fenced or regressed",
+                    "collector heartbeat was fenced: the instance is missing or terminal",
                 ));
             }
             Ok(())
@@ -357,10 +376,16 @@ impl RoutingStore for RawSqlStore {
         let result: RoutingResult<_> = async {
             let row = client
                 .query(
+                    // Mirrors `CollectorState::may_transition_to`: the
+                    // instance's own concurrent writers cannot lose on clock
+                    // order, and nothing regresses or leaves a terminal state.
                     "UPDATE arrowcol.routing_collectors \
-                 SET state = @P2, heartbeat_at_utc = @P3 \
+                 SET state = @P2, heartbeat_at_utc = CASE WHEN heartbeat_at_utc > @P3 \
+                        THEN heartbeat_at_utc ELSE @P3 END \
                  OUTPUT INSERTED.instance_id \
-                 WHERE instance_id = @P1 AND heartbeat_at_utc <= @P3;",
+                 WHERE instance_id = @P1 \
+                   AND (state = @P2 OR state = 'ready' \
+                        OR (state = 'draining' AND @P2 IN ('stopped', 'failed')));",
                     &[&id, &state, &changed],
                 )
                 .await
@@ -371,7 +396,7 @@ impl RoutingStore for RawSqlStore {
             if row.is_none() {
                 return Err(RoutingError::new(
                     RoutingErrorKind::Conflict,
-                    "collector state change was fenced or regressed",
+                    "collector state change was fenced: the instance is missing or the transition would regress",
                 ));
             }
             Ok(())

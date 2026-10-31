@@ -1,0 +1,113 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="626" viewBox="0 0 960 626" role="img" aria-labelledby="timeline-title timeline-desc" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif">
+<title id="timeline-title">The caught-up-then-regresses trap</title>
+<desc id="timeline-desc">Timeline of one PURGE trial on a 16-file table. QAP reports caught up, then 61 seconds later reports 18 files pending and rereads 577.5 MiB. A naive watcher that stops at the first caught-up reports zero rereads. Our watcher restarts its quiet tail on every regression and then waits for late storage logs.</desc>
+<defs>
+<marker id="timeline-ar-ink" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto-start-reverse"><path d="M0,0 L12,6 L0,12 z" fill="#526278"/></marker>
+<marker id="timeline-ar-red" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto-start-reverse"><path d="M0,0 L12,6 L0,12 z" fill="#c8283c"/></marker>
+<marker id="timeline-ar-blue" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto-start-reverse"><path d="M0,0 L12,6 L0,12 z" fill="#185abd"/></marker>
+<marker id="timeline-ar-green" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto-start-reverse"><path d="M0,0 L12,6 L0,12 z" fill="#1f7a45"/></marker>
+<marker id="timeline-ar-amber" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto-start-reverse"><path d="M0,0 L12,6 L0,12 z" fill="#b78919"/></marker>
+<marker id="timeline-ar-purple" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto-start-reverse"><path d="M0,0 L12,6 L0,12 z" fill="#6b3fb5"/></marker>
+</defs>
+<rect x="1" y="1" width="958" height="624" rx="16" fill="#ffffff" stroke="#d5dfea" stroke-width="1.5"/>
+<text x="28" y="46" font-size="25" font-weight="700" fill="#18263a">The trap: “caught up”, then a regression</text>
+<text x="28" y="74" font-size="15" fill="#526278">QAP can say it is done, then start over. A watcher that stops at the first “caught up” misses the rereads.</text>
+<rect x="20" y="124" width="920" height="60" rx="6" fill="#f7f9fc" stroke="none" stroke-width="0"/>
+<text x="30" y="150" font-size="14" font-weight="700" fill="#18263a">Delta log</text>
+<text x="30" y="168" font-size="11.5" fill="#526278">one commit</text>
+<text x="30" y="210" font-size="14" font-weight="700" fill="#18263a">QAP status</text>
+<text x="30" y="228" font-size="11.5" fill="#526278">.show … statistics</text>
+<rect x="20" y="244" width="920" height="60" rx="6" fill="#f7f9fc" stroke="none" stroke-width="0"/>
+<text x="30" y="270" font-size="14" font-weight="700" fill="#18263a">Naive watcher</text>
+<text x="30" y="288" font-size="11.5" fill="#526278">stops at caught up</text>
+<text x="30" y="330" font-size="14" font-weight="700" fill="#18263a">Our watcher</text>
+<text x="30" y="348" font-size="11.5" fill="#526278">restart on regress</text>
+<rect x="20" y="364" width="920" height="60" rx="6" fill="#f7f9fc" stroke="none" stroke-width="0"/>
+<text x="30" y="390" font-size="14" font-weight="700" fill="#18263a">Storage reads</text>
+<text x="30" y="408" font-size="11.5" fill="#526278">what really happened</text>
+<text x="30" y="450" font-size="14" font-weight="700" fill="#18263a">StorageBlobLogs</text>
+<text x="30" y="468" font-size="11.5" fill="#526278">what Log Analytics shows</text>
+<path d="M210,122 V484" fill="none" stroke="#b8c4d3" stroke-width="1.2" stroke-dasharray="4 4" stroke-linejoin="round"/>
+<text x="210" y="116" font-size="12" font-weight="600" fill="#526278" text-anchor="middle">commit</text>
+<path d="M320,122 V484" fill="none" stroke="#b8c4d3" stroke-width="1.2" stroke-dasharray="4 4" stroke-linejoin="round"/>
+<text x="320" y="116" font-size="12" font-weight="600" fill="#526278" text-anchor="middle">caught up</text>
+<path d="M430,122 V484" fill="none" stroke="#b8c4d3" stroke-width="1.2" stroke-dasharray="4 4" stroke-linejoin="round"/>
+<text x="430" y="116" font-size="12" font-weight="600" fill="#526278" text-anchor="middle">+61 s: regressed</text>
+<path d="M630,122 V484" fill="none" stroke="#b8c4d3" stroke-width="1.2" stroke-dasharray="4 4" stroke-linejoin="round"/>
+<text x="630" y="116" font-size="12" font-weight="600" fill="#526278" text-anchor="middle">caught up again</text>
+<path d="M850,122 V484" fill="none" stroke="#b8c4d3" stroke-width="1.2" stroke-dasharray="4 4" stroke-linejoin="round"/>
+<text x="850" y="116" font-size="12" font-weight="600" fill="#526278" text-anchor="middle">tail ends</text>
+<path d="M202,144 h11 l6,6 v15 h-17 z" fill="#ffffff" stroke="#b78919" stroke-width="1.4" stroke-linejoin="round"/>
+<path d="M213,144 v6 h6" fill="none" stroke="#b78919" stroke-width="1.2" stroke-linejoin="round"/>
+<text x="210.5" y="160.5" font-size="7.5" font-weight="700" fill="#b78919" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">{}</text>
+<text x="226" y="160" font-size="12.5" font-weight="600" fill="#9a6f0c" stroke="#f7f9fc" stroke-width="5" stroke-linejoin="round" paint-order="stroke">commit 1: PURGE removes the expired partition</text>
+<rect x="210" y="202" width="110" height="28" rx="6" fill="#fff1cc" stroke="#b78919" stroke-width="1.8"/>
+<text x="265" y="221" font-size="12" font-weight="700" fill="#9a6f0c" text-anchor="middle">pending</text>
+<rect x="320" y="202" width="110" height="28" rx="6" fill="#dff4e5" stroke="#25834b" stroke-width="1.8"/>
+<text x="375" y="221" font-size="12" font-weight="700" fill="#1f7a45" text-anchor="middle">caught up</text>
+<rect x="430" y="202" width="200" height="28" rx="6" fill="#ffe2e6" stroke="#bf3448" stroke-width="1.8"/>
+<text x="530" y="221" font-size="12" font-weight="700" fill="#bf3448" text-anchor="middle">regressed: 18 files pending</text>
+<rect x="630" y="202" width="302" height="28" rx="6" fill="#dff4e5" stroke="#25834b" stroke-width="1.8"/>
+<text x="781" y="221" font-size="12" font-weight="700" fill="#1f7a45" text-anchor="middle">caught up</text>
+<rect x="210" y="262" width="110" height="28" rx="6" fill="#eef0f3" stroke="#9aa5b3" stroke-width="1.8"/>
+<text x="265" y="281" font-size="12" font-weight="700" fill="#6b778a" text-anchor="middle">watch</text>
+<path d="M326,268 l14,14 m0,-14 l-14,14" fill="none" stroke="#c8283c" stroke-width="2.6" stroke-linejoin="round" stroke-linecap="round"/>
+<text x="350" y="281" font-size="12.5" font-weight="700" fill="#c8283c" stroke="#f7f9fc" stroke-width="5" stroke-linejoin="round" paint-order="stroke">stops here and reports 0 rereads (wrong)</text>
+<rect x="210" y="322" width="110" height="28" rx="6" fill="#e9eff9" stroke="#185abd" stroke-width="1.8"/>
+<text x="265" y="341" font-size="12" font-weight="700" fill="#185abd" text-anchor="middle">wait</text>
+<rect x="320" y="322" width="110" height="28" rx="6" fill="#e9eff9" stroke="#185abd" stroke-width="1.8"/>
+<text x="375" y="341" font-size="12" font-weight="700" fill="#185abd" text-anchor="middle">tail</text>
+<rect x="430" y="322" width="200" height="28" rx="6" fill="#e9eff9" stroke="#c8283c" stroke-width="1.8"/>
+<text x="530" y="341" font-size="12" font-weight="700" fill="#c8283c" text-anchor="middle">regressed: restart</text>
+<rect x="630" y="322" width="220" height="28" rx="6" fill="#e9eff9" stroke="#185abd" stroke-width="1.8"/>
+<text x="740" y="341" font-size="12" font-weight="700" fill="#185abd" text-anchor="middle">fresh quiet tail, e.g. 10 min</text>
+<rect x="850" y="322" width="82" height="28" rx="6" fill="#fff1cc" stroke="#b78919" stroke-width="1.8"/>
+<text x="891" y="341" font-size="12" font-weight="700" fill="#9a6f0c" text-anchor="middle">log wait</text>
+<path d="M442,384 V408" fill="none" stroke="#c8283c" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M452.5,384 V408" fill="none" stroke="#c8283c" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M463,384 V408" fill="none" stroke="#c8283c" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M473.5,384 V408" fill="none" stroke="#c8283c" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M484,384 V408" fill="none" stroke="#c8283c" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M494.5,384 V408" fill="none" stroke="#c8283c" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M505,384 V408" fill="none" stroke="#c8283c" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M515.5,384 V408" fill="none" stroke="#c8283c" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M526,384 V408" fill="none" stroke="#c8283c" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M536.5,384 V408" fill="none" stroke="#c8283c" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M547,384 V408" fill="none" stroke="#c8283c" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M557.5,384 V408" fill="none" stroke="#c8283c" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M568,384 V408" fill="none" stroke="#c8283c" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M578.5,384 V408" fill="none" stroke="#c8283c" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M589,384 V408" fill="none" stroke="#c8283c" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M599.5,384 V408" fill="none" stroke="#c8283c" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M610,384 V408" fill="none" stroke="#c8283c" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M620.5,384 V408" fill="none" stroke="#c8283c" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+<text x="642" y="401" font-size="12.5" font-weight="700" fill="#c8283c" stroke="#f7f9fc" stroke-width="5" stroke-linejoin="round" paint-order="stroke">18 unchanged files reread, 577.5 MiB</text>
+<rect x="850" y="438" width="82" height="36" rx="6" fill="#fff1cc" stroke="#b78919" stroke-width="1.5" stroke-dasharray="4 3"/>
+<path d="M540,444 V468" fill="none" stroke="#c8283c" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" opacity="0.75"/>
+<path d="M554,444 V468" fill="none" stroke="#c8283c" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" opacity="0.75"/>
+<path d="M568,444 V468" fill="none" stroke="#c8283c" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" opacity="0.75"/>
+<path d="M582,444 V468" fill="none" stroke="#c8283c" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" opacity="0.75"/>
+<path d="M596,444 V468" fill="none" stroke="#c8283c" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" opacity="0.75"/>
+<path d="M610,444 V468" fill="none" stroke="#c8283c" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" opacity="0.75"/>
+<path d="M624,444 V468" fill="none" stroke="#c8283c" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" opacity="0.75"/>
+<path d="M638,444 V468" fill="none" stroke="#c8283c" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" opacity="0.75"/>
+<path d="M652,444 V468" fill="none" stroke="#c8283c" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" opacity="0.75"/>
+<path d="M666,444 V468" fill="none" stroke="#c8283c" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" opacity="0.75"/>
+<path d="M680,444 V468" fill="none" stroke="#c8283c" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" opacity="0.75"/>
+<path d="M694,444 V468" fill="none" stroke="#c8283c" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" opacity="0.75"/>
+<path d="M708,444 V468" fill="none" stroke="#c8283c" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" opacity="0.75"/>
+<path d="M722,444 V468" fill="none" stroke="#c8283c" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" opacity="0.75"/>
+<path d="M736,444 V468" fill="none" stroke="#c8283c" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" opacity="0.75"/>
+<path d="M750,444 V468" fill="none" stroke="#c8283c" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" opacity="0.75"/>
+<path d="M764,444 V468" fill="none" stroke="#c8283c" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" opacity="0.75"/>
+<path d="M778,444 V468" fill="none" stroke="#c8283c" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" opacity="0.75"/>
+<text x="891" y="461" font-size="12" font-weight="700" fill="#9a6f0c" text-anchor="middle">log wait</text>
+<text x="328" y="461" font-size="12.5" font-weight="700" fill="#c8283c">same reads,</text>
+<text x="328" y="477" font-size="12.5" font-weight="700" fill="#c8283c">2–10 min later →</text>
+<path d="M200,498 H936" fill="none" stroke="#526278" stroke-width="1.8" stroke-linejoin="round" marker-end="url(#timeline-ar-ink)"/>
+<text x="936" y="518" font-size="12" fill="#526278" text-anchor="end">time (not to scale)</text>
+<text x="30" y="518" font-size="12" fill="#526278">Based on run 5 (PURGE, 16-file table): caught up with 9,216 of 9,216 rows accelerated; 61 s later, 18 files pending and 0 rows.</text>
+<rect x="24" y="538" width="912" height="66" rx="10" fill="#fff8e6" stroke="#b78919" stroke-width="1.5"/>
+<text x="40" y="564" font-size="13" fill="#18263a"><tspan font-weight="700">Run 4 hit the other half of the trap: </tspan><tspan>its window saw 0 rereads, then Log Analytics showed 17 files (609 MiB) read about 3 min after it closed.</tspan></text>
+<text x="40" y="586" font-size="13" fill="#18263a"><tspan font-weight="700">Fix: </tspan><tspan>restart the quiet tail on every regression, then wait for late logs before you call anything 0.</tspan></text>
+</svg>

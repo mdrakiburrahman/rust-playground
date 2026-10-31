@@ -48,7 +48,13 @@
       "executor": "nx:run-commands",
       "cache": false,
       "options": {
-        "command": "npx --no-install markdownlint-cli2",
+        "commands": [
+          "npx --no-install tsc --project docs/tsconfig.json",
+          "npx --no-install tsx --test docs/validate.test.ts",
+          "npx --no-install tsx docs/validate.ts",
+          "npx --no-install markdownlint-cli2"
+        ],
+        "parallel": false,
         "cwd": "{workspaceRoot}",
         "forwardAllArgs": false
       }

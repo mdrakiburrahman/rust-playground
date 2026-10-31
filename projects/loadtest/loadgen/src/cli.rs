@@ -21,8 +21,104 @@ pub enum Command {
     Run(Box<RunArgs>),
     /// Validate benchmark manifests and independent Delta snapshots.
     Validate(ValidateArgs),
+    /// Drain publication while collectors are still running, without capturing snapshots.
+    Drain(ValidateArgs),
+    /// After the clean mutator drain, prove from actual SQL state that every routed publisher released.
+    PublisherRelease(PublisherReleaseArgs),
+    /// Compact all local source tables after positive publisher release.
+    FinalCompaction(FinalCompactionArgs),
+    /// Record bounded read-only QAP observations without changing tables or policies.
+    ObserveQap(ObserveQapArgs),
+    /// Initialize both Azure pools from the canonical schemas while reset is fenced.
+    InitializeAzure(InitializeAzureArgs),
+    /// Write the canonical Azure table manifest without accessing or mutating storage.
+    AzureManifest(InitializeAzureArgs),
     /// Print the exact public Flight SQL schema fixture.
     PrintSchemas,
+}
+
+/// One bounded final-compaction phase, local by default and unsupported on Azure.
+#[derive(Clone, Debug, Args)]
+pub struct FinalCompactionArgs {
+    #[arg(long, env = "LOADTEST_RESULTS", default_value = "/results")]
+    pub results: PathBuf,
+    #[arg(long, env = "LOADTEST_DIRECT_ROOT", default_value = "/delta/direct")]
+    pub direct_root: PathBuf,
+    #[arg(long, env = "LOADTEST_DATAFLOW_ROOT", default_value = "/delta/dataflow")]
+    pub dataflow_root: PathBuf,
+    /// Explicit request (Azure rejects it); local compaction is already on by default.
+    #[arg(long, conflicts_with = "skip_final_compaction")]
+    pub final_compaction: bool,
+    /// Record intentional opt-out without opening or mutating any Delta table.
+    #[arg(long)]
+    pub skip_final_compaction: bool,
+}
+
+/// Sanitized live QAP observation inputs.
+#[derive(Clone, Debug, Args)]
+pub struct ObserveQapArgs {
+    /// Query endpoint; Azure credentials are obtained by the shared token provider.
+    #[arg(long, env = "LOADTEST_KUSTO_ENDPOINT", default_value = "http://kusto:8080")]
+    pub endpoint: String,
+    /// Sanitized query provenance directory.
+    #[arg(long, env = "LOADTEST_RESULTS", default_value = "/results")]
+    pub results: PathBuf,
+    /// New output artifact, never an overwritten successful observation.
+    #[arg(long)]
+    pub output: PathBuf,
+    /// Optional explicit database.
+    #[arg(long)]
+    pub database: Option<String>,
+    /// External table names; omit for all 26 canonical source tables.
+    #[arg(long = "table")]
+    pub tables: Vec<String>,
+    /// One deadline for authentication and every management request.
+    #[arg(long, default_value = "30s")]
+    pub timeout: DurationArg,
+}
+
+/// Read-only post-drain publisher-release proof inputs.
+#[derive(Clone, Debug, Args)]
+pub struct PublisherReleaseArgs {
+    /// Benchmark result directory holding this run's routing and drain evidence.
+    #[arg(long, env = "LOADTEST_RESULTS", default_value = "/results")]
+    pub results: PathBuf,
+
+    /// SQL Server host that held the run's routing and receipt state.
+    #[arg(long, env = "ARROWCOL_SQL_HOST", default_value = "sqlserver")]
+    pub sql_host: String,
+
+    /// SQL Server port.
+    #[arg(long, env = "ARROWCOL_SQL_PORT", default_value_t = 1_433)]
+    pub sql_port: u16,
+
+    /// Arrowcol application database.
+    #[arg(long, env = "ARROWCOL_SQL_DATABASE", default_value = "arrowcol")]
+    pub sql_database: String,
+
+    /// Arrowcol runtime principal.
+    #[arg(long, env = "ARROWCOL_SQL_USERNAME", default_value = "arrowcol_app")]
+    pub sql_username: String,
+
+    /// File containing the runtime principal password.
+    #[arg(
+        long,
+        env = "ARROWCOL_SQL_PASSWORD_FILE",
+        default_value = "/run/secrets/arrowcol-app-password"
+    )]
+    pub sql_password_file: PathBuf,
+
+    /// Connection and per-read bound for the SQL state reads.
+    #[arg(long, default_value = "30s")]
+    pub timeout: DurationArg,
+}
+
+/// Owned sandbox bootstrap inputs. Credentials are supplied only by the environment.
+#[derive(Clone, Debug, Args)]
+pub struct InitializeAzureArgs {
+    /// Output manifest used by infrastructure reconciliation.
+    #[arg(long, env = "ARROWCOL_AZURE_TABLE_MANIFEST")]
+    pub manifest: PathBuf,
 }
 
 /// Benchmark scenario.
@@ -258,6 +354,10 @@ pub struct RunArgs {
     /// Optional local Kusto emulator HTTP endpoint for live committed-file ingestion.
     #[arg(long, env = "LOADTEST_KUSTO_ENDPOINT")]
     pub kusto_endpoint: Option<String>,
+
+    /// Local active-snapshot bridge; never used as evidence of Azure QAP.
+    #[arg(long, env = "LOADTEST_KUSTO_BRIDGE_ENDPOINT")]
+    pub kusto_bridge_endpoint: Option<String>,
 }
 
 impl RunArgs {
@@ -288,7 +388,7 @@ pub struct ValidateArgs {
     pub dataflow_root: PathBuf,
 
     /// Maximum time to wait for independently visible Delta snapshots.
-    #[arg(long, env = "LOADTEST_DRAIN_TIMEOUT", default_value = "2m")]
+    #[arg(long, env = "LOADTEST_DRAIN_TIMEOUT", default_value = "8m")]
     pub timeout: DurationArg,
 
     /// Require every collector in each implementation pool to own a table.
@@ -311,6 +411,20 @@ pub struct ValidateArgs {
     /// Both collectors persisted to native Quiver: every acknowledged dataflow row must be published.
     #[arg(long, env = "LOADTEST_QUIVER", default_value_t = false)]
     pub quiver: bool,
+
+    /// The runner has recorded clean stopped mutators for this exact run.
+    #[arg(long, env = "LOADTEST_COLLECTORS_DRAINED", default_value_t = false)]
+    pub collectors_drained: bool,
+
+    /// Absolute Unix-millisecond bound for this whole command, set privately by the runner. Inner
+    /// waits are clamped to it and cancelled at their next await, and a failed report is written;
+    /// synchronous reader work cannot be preempted, so only the runner's hard kill is a hard bound.
+    #[arg(
+        long,
+        env = "LOADTEST_VALIDATE_DEADLINE_UNIX_MS",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub validate_deadline_unix_ms: Option<u64>,
 }
 
 #[cfg(test)]
@@ -318,6 +432,28 @@ mod tests {
     use anyhow::{Context, Result, bail};
 
     use super::*;
+
+    #[test]
+    fn observation_requires_new_output_and_uses_a_separate_bounded_readonly_command() -> Result<()> {
+        assert!(Cli::try_parse_from(["arrowcol-loadgen", "observe-qap"]).is_err());
+        let cli = Cli::try_parse_from([
+            "arrowcol-loadgen",
+            "observe-qap",
+            "--output",
+            "observation.json",
+            "--endpoint",
+            "http://kusto:8080",
+            "--table",
+            "direct_sqlserver_cpu_utilization",
+        ])?;
+        let Command::ObserveQap(arguments) = cli.command else {
+            bail!("expected observe-qap command");
+        };
+        assert_eq!(arguments.timeout.get(), Duration::from_secs(30));
+        assert_eq!(arguments.tables, ["direct_sqlserver_cpu_utilization"]);
+        assert_eq!(arguments.output, PathBuf::from("observation.json"));
+        Ok(())
+    }
 
     #[test]
     fn durations_accept_documented_units_and_reject_fractional_or_overflow_values() {
@@ -426,7 +562,32 @@ mod tests {
             direct_admin_endpoints: Vec::new(),
             dataflow_admin_endpoints: Vec::new(),
             kusto_endpoint: None,
+            kusto_bridge_endpoint: None,
         };
         assert_eq!(arguments.effective_scenarios(), vec![Scenario::Paired]);
+    }
+
+    #[test]
+    fn validate_deadline_is_optional_and_strictly_parsed() -> Result<()> {
+        let parse = |extra: &[&str]| {
+            Cli::try_parse_from(["arrowcol-loadgen", "validate"].iter().chain(extra)).map(|cli| match cli.command {
+                Command::Validate(arguments) => Some(arguments.validate_deadline_unix_ms),
+                _ => None,
+            })
+        };
+        if std::env::var_os("LOADTEST_VALIDATE_DEADLINE_UNIX_MS").is_none() {
+            assert_eq!(parse(&[])?, Some(None), "standalone validation keeps its own budgets");
+        }
+        assert_eq!(
+            parse(&["--validate-deadline-unix-ms", "1800000000000"])?,
+            Some(Some(1_800_000_000_000))
+        );
+        for invalid in ["0", "-1", "1.5", "", "17e11", "18446744073709551616", " 1800000000000"] {
+            assert!(
+                parse(&["--validate-deadline-unix-ms", invalid]).is_err(),
+                "{invalid:?} must be rejected"
+            );
+        }
+        Ok(())
     }
 }

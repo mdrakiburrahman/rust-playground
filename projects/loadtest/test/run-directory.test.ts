@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -9,10 +9,12 @@ import { fileURLToPath } from 'node:url';
 
 import { BENCHMARK_PROJECT } from '../src/cli.js';
 import { deltaTableLocations } from '../src/main.js';
-import { acquireBenchmarkController, benchmarkDirectories, checkedBenchmarkPath, resetBenchmark } from '../src/lifecycle.js';
+import { acquireBenchmarkController, benchmarkDirectories, checkedBenchmarkPath, discardUnsealedAttempts, resetBenchmark, stopBenchmark } from '../src/lifecycle.js';
+import { attemptFixture } from './attempt-fixture.js';
+import { fixtureDirectory } from './fixture-directory.js';
 
 function fixture(t: { after: (callback: () => void) => void }): string {
-  const workspace = mkdtempSync(path.resolve('projects/loadtest/test/.fixture-reset-'));
+  const workspace = fixtureDirectory('reset-');
   t.after(() => rmSync(workspace, { recursive: true, force: true }));
   return workspace;
 }
@@ -29,13 +31,14 @@ function mockDocker(workspace: string): { commands: string[][]; docker: (args: s
   const labelled = (project: string): Record<string, string> => ({
     'com.docker.compose.project': project,
     'com.docker.compose.project.config_files': path.join(workspace, 'projects/loadtest/compose.yaml'),
+    'com.docker.compose.service': 'direct-1',
   });
   const containers: Resource[] = [
     { id: 'collector', name: 'collector', labels: labelled(BENCHMARK_PROJECT) },
     { id: 'unrelated', name: 'unrelated', labels: labelled('another-project') },
   ];
   const volumes: Resource[] = [
-    ...['sqlserver-data', 'hive-warehouse', 'kusto-data'].map(volume => ({
+    ...['sqlserver-data', 'hive-warehouse', 'kusto-data', 'kusto-bridge-state'].map(volume => ({
       id: `${BENCHMARK_PROJECT}_${volume}`, name: `${BENCHMARK_PROJECT}_${volume}`,
       labels: { ...labelled(BENCHMARK_PROJECT), 'com.docker.compose.volume': volume,
         'io.arrowcol.loadtest.workspace': workspace },
@@ -62,6 +65,9 @@ function mockDocker(workspace: string): { commands: string[][]; docker: (args: s
     if (args.includes('inspect')) {
       const resource = [...containers, ...volumes, ...networks].find(resource => resource.id === args.at(-1));
       assert(resource);
+      if (args.some(arg => arg.includes('"mounts"'))) {
+        return JSON.stringify({ ...resource, state: { Running: false, ExitCode: 0, OOMKilled: false }, mounts: [] });
+      }
       return JSON.stringify(resource);
     }
     if (args[0] === 'stop') return '';
@@ -85,15 +91,109 @@ test('Delta output has one fixed location', () => {
   ].join('\n'));
 });
 
-test('starting again removes old output and owned SQL, Hive and Kusto resources without an identity flag', async t => {
+test('stop halts only verified workspace services and preserves every file and volume', async t => {
+  const workspace = fixture(t);
+  const latest = path.join(workspace, 'onelake/benchmark/latest');
+  mkdirSync(latest, { recursive: true });
+  writeFileSync(path.join(latest, 'keep.txt'), 'durable');
+  const { docker, commands } = mockDocker(workspace);
+  await stopBenchmark(workspace, docker);
+  assert(commands.some(args => args.join(' ') === 'stop --time 30 collector'));
+  assert(commands.every(args => !args.includes('rm')));
+  assert.equal(readFileSync(path.join(latest, 'keep.txt'), 'utf8'), 'durable');
+  const foreign = mockDocker('/foreign');
+  await assert.rejects(stopBenchmark(workspace, foreign.docker), /another workspace/u);
+  assert(foreign.commands.every(args => args[0] !== 'stop' && !args.includes('rm')));
+});
+
+test('cloud release prerequisite drains all mutators and rejects forced, OOM or unknown exits', async t => {
+  const workspace = fixture(t);
+  for (const service of ['direct-1', 'dataflow-1', 'tenant-stream', 'delta-maintenance']) {
+    for (const state of [
+      { Running: false, ExitCode: 0, OOMKilled: false },
+      { Running: false, ExitCode: 137, OOMKilled: false },
+      { Running: false, ExitCode: 0, OOMKilled: true },
+      { Running: true, ExitCode: 0, OOMKilled: false },
+      {},
+    ]) {
+      const { docker, commands } = mockDocker(workspace);
+      const strict = (args: string[]): string => {
+        if (args.includes('{{json .State}}')) return JSON.stringify(state);
+        const output = docker(args);
+        if (args[0] === 'inspect') {
+          const resource = JSON.parse(output);
+          resource.labels['com.docker.compose.service'] = service;
+          return JSON.stringify(resource);
+        }
+        return output;
+      };
+      const pending = stopBenchmark(workspace, strict, { requireCleanMutators: true });
+      if ('ExitCode' in state && state.ExitCode === 0 && state.OOMKilled === false && state.Running === false) await pending;
+      else await assert.rejects(pending, /retain occupancy and publisher registration/u);
+      assert(commands.some(args => args.join(' ') === 'stop --time 300 collector'));
+      assert(commands.every(args => !args.includes('rm')));
+    }
+  }
+});
+
+test('final capture stops every mutator but keeps Kusto and live-evidence services available', async t => {
+  const workspace = fixture(t);
+  const services = ['direct-1', 'dataflow-1', 'tenant-stream', 'delta-maintenance', 'kusto', 'lgtm'];
+  const commands: string[][] = [];
+  const docker = (args: string[]): string => {
+    commands.push(args);
+    if (args[0] === 'ps') return services.join('\n');
+    if (args[0] === 'stop') return '';
+    assert.equal(args[0], 'inspect');
+    if (args.includes('{{json .State}}')) return JSON.stringify({ Running: false, ExitCode: 0, OOMKilled: false });
+    const service = args.at(-1);
+    assert(service && services.includes(service));
+    return JSON.stringify({ id: service, name: service, labels: {
+      'com.docker.compose.project': BENCHMARK_PROJECT,
+      'com.docker.compose.service': service,
+      'com.docker.compose.project.config_files': path.join(workspace, 'projects/loadtest/compose.yaml'),
+    } });
+  };
+  assert.deepEqual(await stopBenchmark(workspace, docker, { mutatorsOnly: true, requireCleanMutators: true }), services.slice(0, 4));
+  assert.deepEqual(commands.find(args => args[0] === 'stop'), ['stop', '--time', '300', ...services.slice(0, 4)]);
+  const partial = mockDocker(workspace);
+  await assert.rejects(stopBenchmark(workspace, partial.docker, { mutatorsOnly: true, requireCleanMutators: true }), /both positively identified/u);
+  assert(partial.commands.every(args => args[0] !== 'stop'));
+});
+
+test('full stop drains mutators before SQL Server and other infrastructure', async t => {
+  const workspace = fixture(t);
+  const services = ['sqlserver', 'dataflow-1', 'router', 'direct-1'];
+  const commands: string[][] = [];
+  const docker = (args: string[]): string => {
+    commands.push(args);
+    if (args[0] === 'ps') return services.join('\n');
+    if (args[0] === 'stop') return '';
+    if (args.includes('{{json .State}}')) return JSON.stringify({ Running: false, ExitCode: 0, OOMKilled: false });
+    const service = args.at(-1);
+    return JSON.stringify({ id: service, name: service, labels: {
+      'com.docker.compose.project': BENCHMARK_PROJECT,
+      'com.docker.compose.service': service,
+      'com.docker.compose.project.config_files': path.join(workspace, 'projects/loadtest/compose.yaml'),
+    } });
+  };
+  await stopBenchmark(workspace, docker);
+  assert.deepEqual(commands.filter(args => args[0] === 'stop'), [
+    ['stop', '--time', '30', 'dataflow-1', 'direct-1'],
+    ['stop', '--time', '30', 'sqlserver', 'router'],
+  ]);
+});
+
+test('starting again removes only already sealed output and owned SQL, Hive and Kusto resources', async t => {
   const workspace = fixture(t);
   const latest = path.join(workspace, 'onelake/benchmark/latest');
   mkdirSync(latest, { recursive: true });
   writeFileSync(path.join(latest, 'old.json'), '{}');
+  await attemptFixture(workspace).seal();
   const { docker, commands } = mockDocker(workspace);
   assert.equal(await resetBenchmark(workspace, docker), latest);
   assert(!existsSync(path.join(latest, 'old.json')));
-  for (const volume of ['sqlserver-data', 'hive-warehouse', 'kusto-data']) {
+  for (const volume of ['sqlserver-data', 'hive-warehouse', 'kusto-data', 'kusto-bridge-state']) {
     assert(commands.some(args => args.join(' ') === `volume rm ${BENCHMARK_PROJECT}_${volume}`));
   }
   assert(commands.some(args => args.join(' ') === 'rm collector'));
@@ -103,8 +203,28 @@ test('starting again removes old output and owned SQL, Hive and Kusto resources 
     assert(commands.every(args => !args.includes(volume) || args.includes('inspect')));
   }
   writeFileSync(path.join(latest, 'second.json'), '{}');
+  await attemptFixture(workspace).seal();
   assert.equal(await resetBenchmark(workspace, docker), latest);
   assert(!existsSync(path.join(latest, 'second.json')));
+});
+
+test('discard quarantines only unsealed attempts intact, after which start may reset', async t => {
+  const workspace = fixture(t);
+  const latest = path.join(workspace, 'onelake/benchmark/latest');
+  const unsealed = path.join(workspace, 'onelake/benchmark/azure-run');
+  mkdirSync(path.join(unsealed, 'results'), { recursive: true });
+  writeFileSync(path.join(unsealed, 'results/provenance.json'), '{"evidence":true}');
+  await attemptFixture(workspace).seal();
+  const { docker } = mockDocker(workspace);
+  await assert.rejects(resetBenchmark(workspace, docker), /incomplete or unsafe/u);
+  const moved = discardUnsealedAttempts(workspace, new Date('2026-01-02T03:04:05.678Z'));
+  const quarantine = path.join(workspace, '.temp/loadtest-discarded/2026-01-02T03-04-05-678Z');
+  assert.deepEqual(moved, [path.join(quarantine, 'azure-run')]);
+  assert.equal(readFileSync(path.join(quarantine, 'azure-run/results/provenance.json'), 'utf8'), '{"evidence":true}');
+  assert(!existsSync(unsealed));
+  assert(existsSync(latest));
+  assert.deepEqual(discardUnsealedAttempts(workspace), []);
+  assert.equal(await resetBenchmark(workspace, docker), latest);
 });
 
 for (const owner of [undefined, '/another-workspace']) {
@@ -113,6 +233,7 @@ for (const owner of [undefined, '/another-workspace']) {
     const latest = path.join(workspace, 'onelake/benchmark/latest');
     mkdirSync(latest, { recursive: true });
     writeFileSync(path.join(latest, 'keep.txt'), 'keep');
+    await attemptFixture(workspace).seal();
     const { docker, commands } = mockDocker(workspace);
     await assert.rejects(resetBenchmark(workspace, args => {
       if (args[0] === 'ps') return '';
@@ -130,7 +251,7 @@ for (const owner of [undefined, '/another-workspace']) {
   });
 }
 
-test('legacy benchmark data is reset but unrelated directories survive', async t => {
+test('legacy benchmark data without an evidence marker blocks reset and unrelated directories survive', async t => {
   const workspace = fixture(t);
   const legacy = path.join(workspace, 'onelake/benchmark/previous');
   mkdirSync(path.join(legacy, 'router-state'), { recursive: true });
@@ -139,9 +260,10 @@ test('legacy benchmark data is reset but unrelated directories survive', async t
   mkdirSync(unrelated);
   writeFileSync(path.join(unrelated, 'keep.txt'), 'keep');
   assert.deepEqual(benchmarkDirectories(workspace), [legacy]);
-  const { docker } = mockDocker(workspace);
-  await resetBenchmark(workspace, docker);
-  assert(!existsSync(legacy));
+  const { docker, commands } = mockDocker(workspace);
+  await assert.rejects(resetBenchmark(workspace, docker), /reset refused/u);
+  assert(existsSync(legacy));
+  assert.deepEqual(commands, []);
   assert.equal(readFileSync(path.join(unrelated, 'keep.txt'), 'utf8'), 'keep');
 });
 
@@ -165,6 +287,7 @@ test('another workspace ownership and cleanup failures cannot silently start a n
   const latest = path.join(workspace, 'onelake/benchmark/latest');
   mkdirSync(latest, { recursive: true });
   writeFileSync(path.join(latest, 'keep.txt'), 'keep');
+  await attemptFixture(workspace).seal();
   const { docker, commands } = mockDocker('/another-workspace');
   await assert.rejects(resetBenchmark(workspace, docker), /another workspace/u);
   assert(commands.every(args => !args.includes('rm') && args[0] !== 'stop'));
@@ -254,6 +377,57 @@ test('foreign network endpoints are rejected before stopping containers', async 
     return text;
   }), /Another container/u);
   assert(commands.every(args => args[0] !== 'stop' && !args.includes('rm')));
+});
+
+test('recovery stops an owned orphan without inspecting container init', async t => {
+  const workspace = fixture(t);
+  const results = path.join(workspace, 'onelake/benchmark/latest/results');
+  mkdirSync(results, { recursive: true });
+  writeFileSync(path.join(workspace, 'run'), 'console.log("ready"); setInterval(() => {}, 1000)');
+  const executable = path.join(workspace, 'target/debug/arrowcol-loadgen');
+  const child = spawn(process.execPath, ['run'], {
+    cwd: workspace, argv0: executable, env: { ...process.env, LOADTEST_RESULTS: results },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const exited = new Promise<number | null>(resolve => child.once('exit', resolve));
+  t.after(async () => {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
+    await exited;
+  });
+  await new Promise<void>((resolve, reject) => {
+    child.once('error', reject);
+    child.stdout.once('data', () => resolve());
+    child.once('exit', code => reject(new Error(`Orphan fixture exited ${code} before readiness`)));
+  });
+  const originalRead = fs.readFileSync;
+  const originalLink = fs.readlinkSync;
+  const readMock = t.mock.method(fs, 'readFileSync', (...args: Parameters<typeof fs.readFileSync>) => {
+    const value = originalRead(...args);
+    if (args[0] !== `/proc/${child.pid}/stat`) return value;
+    const stat = value.toString();
+    const end = stat.lastIndexOf(')') + 2;
+    const fields = stat.slice(end).split(' ');
+    fields[1] = '1';
+    const orphan = stat.slice(0, end) + fields.join(' ');
+    return typeof value === 'string' ? orphan : Buffer.from(orphan);
+  });
+  const linkMock = t.mock.method(fs, 'readlinkSync', (...args: Parameters<typeof fs.readlinkSync>) => {
+    if (args[0] === '/proc/1/exe') throw Object.assign(new Error('Protected init'), { code: 'EACCES' });
+    if (args[0] === `/proc/${child.pid}/exe`) return executable;
+    return originalLink(...args);
+  });
+  syncBuiltinESMExports();
+  try {
+    const { docker, commands } = mockDocker(workspace);
+    await stopBenchmark(workspace, docker);
+    await exited;
+    assert.equal(child.signalCode, 'SIGINT');
+    assert(commands.some(args => args[0] === 'stop'));
+  } finally {
+    readMock.mock.restore();
+    linkMock.mock.restore();
+    syncBuiltinESMExports();
+  }
 });
 
 for (const candidate of [false, true]) test(candidate

@@ -1,6 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -88,12 +91,16 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
         }
     });
 
+    let receipt_failures = Arc::new(AtomicU64::new(0));
+    let receipt_stop = CancellationToken::new();
     let (receipt_sender, receipt_task) = ReceiptTracker::start(
         transport.clone(),
         manifests.clone(),
         run_id.clone(),
         arguments.drain_timeout.get(),
         arguments.lanes.saturating_mul(16).max(32),
+        Arc::clone(&receipt_failures),
+        receipt_stop.clone(),
     );
     let kusto_sync = crate::kusto::LiveSync::start(&arguments, &run_id);
 
@@ -116,6 +123,7 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
                 receipt_sender.clone(),
                 cancellation.clone(),
                 scheduled_table_count,
+                Arc::clone(&receipt_failures),
             )
             .await
         {
@@ -141,6 +149,7 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
             receipt_sender.clone(),
             cancellation.clone(),
             scheduled_table_count,
+            Arc::clone(&receipt_failures),
         )
         .await
         {
@@ -153,10 +162,40 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
         sync.finish_generation();
     }
     drop(receipt_sender);
+    if let Some(error) = run_error {
+        eprintln!("FAIL collector generation: {error:#}");
+        if let Err(evidence_error) = manifests
+            .write_json(
+                "run-error.json",
+                &serde_json::json!({"run_id": run_id, "error": format!("{error:#}")}),
+            )
+            .await
+        {
+            eprintln!("could not retain generation failure evidence: {evidence_error:#}");
+        }
+        receipt_stop.cancel();
+        if let Err(cleanup_error) = receipt_task
+            .await
+            .context("receipt tracker task failed")
+            .and_then(|report| report)
+        {
+            eprintln!("receipt tracker cleanup failed: {cleanup_error:#}");
+        }
+        if let Some(sync) = kusto_sync
+            && let Err(cleanup_error) = sync.abort().await
+        {
+            eprintln!("Kusto cleanup failed after generation error: {cleanup_error:#}");
+        }
+        if let Err(flush_error) = manifests.flush().await {
+            eprintln!("failure evidence flush failed: {flush_error:#}");
+        }
+        return Err(error);
+    }
     let receipt_report = receipt_task
         .await
         .context("receipt tracker task failed")
         .and_then(|report| report);
+    manifests.flush().await?;
     if let Some(sync) = kusto_sync
         && let Err(error) = sync.stop().await
     {
@@ -164,13 +203,10 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
         crate::kusto::degraded(&arguments.results, &run_id, &error)?;
     }
     let receipt_report = receipt_report?;
-    let routing = capture_routing(&arguments).await?;
+    let routing = capture_routing(&arguments, &run_id).await?;
     manifests.write_json(ROUTING_EVIDENCE_FILE, &routing).await?;
     manifests.flush().await?;
 
-    if let Some(error) = run_error {
-        return Err(error);
-    }
     if receipt_report.failures > 0 || receipt_report.timeouts > 0 {
         bail!(
             "direct receipt drain completed with {} explicit failures and {} timeouts; see {RECEIPT_MANIFEST_FILE}",
@@ -224,11 +260,18 @@ async fn run_phase(
     receipt_sender: mpsc::Sender<PendingReceipt>,
     cancellation: CancellationToken,
     table_count: usize,
+    receipt_failures: Arc<AtomicU64>,
 ) -> Result<()> {
+    let phase_started_at = now_unix_millis();
+    let phase_duration_ms = duration
+        .map(|duration| u64::try_from(duration.as_millis()))
+        .transpose()
+        .context("driver phase duration exceeds the evidence bound")?;
     let deadline = duration.map(|duration| Instant::now() + duration);
     let first_ordinal = scheduler.scheduled();
     let mut lanes = JoinSet::new();
     let batches = Arc::new(batches.clone());
+    let send_policy_failures = Arc::new(AtomicU64::new(0));
     for lane in 0..arguments.lanes {
         let scheduler = Arc::clone(&scheduler);
         let batches = Arc::clone(&batches);
@@ -240,6 +283,7 @@ async fn run_phase(
         let phase = phase.to_owned();
         let request_timeout = arguments.request_timeout.get();
         let retry = RetryPolicy::from_arguments(arguments);
+        let send_policy_failures = Arc::clone(&send_policy_failures);
         lanes.spawn(async move {
             loop {
                 if cancellation.is_cancelled() {
@@ -254,83 +298,90 @@ async fn run_phase(
                     .get(&scheduled.table.identity.to_string())
                     .context("scheduled table has no generated batch")?;
                 let logical_batch_id = format!("{}:{}:{}:{}", run_id, scenario.as_str(), phase, scheduled.ordinal);
-                match scenario {
-                    Scenario::Direct => {
-                        send_pool_with_retry(
-                            &run_id,
-                            scenario,
-                            &phase,
-                            &logical_batch_id,
-                            scheduled.ordinal,
-                            scheduled.table_batch_ordinal,
-                            lane,
-                            ImplementationPool::Direct,
-                            Arc::clone(batch),
-                            &transport,
-                            &manifests,
-                            &receipt_sender,
-                            request_timeout,
-                            retry,
-                        )
-                        .await?;
+                let sent = async {
+                    match scenario {
+                        Scenario::Direct => {
+                            send_pool_with_retry(
+                                &run_id,
+                                scenario,
+                                &phase,
+                                &logical_batch_id,
+                                scheduled.ordinal,
+                                scheduled.table_batch_ordinal,
+                                lane,
+                                ImplementationPool::Direct,
+                                Arc::clone(batch),
+                                &transport,
+                                &manifests,
+                                &receipt_sender,
+                                request_timeout,
+                                retry,
+                            )
+                            .await?;
+                        }
+                        Scenario::Dataflow => {
+                            send_pool_with_retry(
+                                &run_id,
+                                scenario,
+                                &phase,
+                                &logical_batch_id,
+                                scheduled.ordinal,
+                                scheduled.table_batch_ordinal,
+                                lane,
+                                ImplementationPool::Dataflow,
+                                Arc::clone(batch),
+                                &transport,
+                                &manifests,
+                                &receipt_sender,
+                                request_timeout,
+                                retry,
+                            )
+                            .await?;
+                        }
+                        Scenario::Paired => {
+                            let direct = send_pool_with_retry(
+                                &run_id,
+                                scenario,
+                                &phase,
+                                &logical_batch_id,
+                                scheduled.ordinal,
+                                scheduled.table_batch_ordinal,
+                                lane,
+                                ImplementationPool::Direct,
+                                Arc::clone(batch),
+                                &transport,
+                                &manifests,
+                                &receipt_sender,
+                                request_timeout,
+                                retry,
+                            );
+                            let dataflow = send_pool_with_retry(
+                                &run_id,
+                                scenario,
+                                &phase,
+                                &logical_batch_id,
+                                scheduled.ordinal,
+                                scheduled.table_batch_ordinal,
+                                lane,
+                                ImplementationPool::Dataflow,
+                                Arc::clone(batch),
+                                &transport,
+                                &manifests,
+                                &receipt_sender,
+                                request_timeout,
+                                retry,
+                            );
+                            let (direct, dataflow) = tokio::join!(direct, dataflow);
+                            direct?;
+                            dataflow?;
+                        }
                     }
-                    Scenario::Dataflow => {
-                        send_pool_with_retry(
-                            &run_id,
-                            scenario,
-                            &phase,
-                            &logical_batch_id,
-                            scheduled.ordinal,
-                            scheduled.table_batch_ordinal,
-                            lane,
-                            ImplementationPool::Dataflow,
-                            Arc::clone(batch),
-                            &transport,
-                            &manifests,
-                            &receipt_sender,
-                            request_timeout,
-                            retry,
-                        )
-                        .await?;
-                    }
-                    Scenario::Paired => {
-                        let direct = send_pool_with_retry(
-                            &run_id,
-                            scenario,
-                            &phase,
-                            &logical_batch_id,
-                            scheduled.ordinal,
-                            scheduled.table_batch_ordinal,
-                            lane,
-                            ImplementationPool::Direct,
-                            Arc::clone(batch),
-                            &transport,
-                            &manifests,
-                            &receipt_sender,
-                            request_timeout,
-                            retry,
-                        );
-                        let dataflow = send_pool_with_retry(
-                            &run_id,
-                            scenario,
-                            &phase,
-                            &logical_batch_id,
-                            scheduled.ordinal,
-                            scheduled.table_batch_ordinal,
-                            lane,
-                            ImplementationPool::Dataflow,
-                            Arc::clone(batch),
-                            &transport,
-                            &manifests,
-                            &receipt_sender,
-                            request_timeout,
-                            retry,
-                        );
-                        let (direct, dataflow) = tokio::join!(direct, dataflow);
-                        direct?;
-                        dataflow?;
-                    }
+                    Ok::<(), anyhow::Error>(())
                 }
+                .await;
+                sent.inspect_err(|_| {
+                    send_policy_failures.fetch_add(1, Ordering::Relaxed);
+                })?;
             }
             Ok::<(), anyhow::Error>(())
         });
@@ -342,20 +393,56 @@ async fn run_phase(
         arguments.lanes,
         arguments.batch_rows
     );
+    let stop_progress = CancellationToken::new();
     let progress = {
         let scheduler = Arc::clone(&scheduler);
         let phase = phase.to_owned();
+        let run_id = run_id.to_owned();
+        let manifests = manifests.clone();
+        let stop = stop_progress.clone();
+        let cancellation = cancellation.clone();
+        let batch_rows = u64::try_from(arguments.batch_rows)?;
         let started = Instant::now();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(10));
-            tick.tick().await;
+            let mut sequence = 0_u64;
             loop {
-                tick.tick().await;
-                println!(
-                    "[loadgen] {phase} {:>4}s: {} batches sent",
-                    started.elapsed().as_secs(),
-                    scheduler.scheduled().saturating_sub(first_ordinal)
-                );
+                let scheduled = scheduler.scheduled().saturating_sub(first_ordinal);
+                let Some(rows) = scheduled.checked_mul(batch_rows) else {
+                    cancellation.cancel();
+                    bail!("driver scheduled-row count overflow");
+                };
+                let observed_at = now_unix_millis();
+                let phase_remaining_ms = deadline
+                    .map(|deadline| u64::try_from(deadline.saturating_duration_since(Instant::now()).as_millis()))
+                    .transpose()
+                    .context("remaining driver phase duration exceeds the evidence bound")?;
+                let frame = serde_json::json!({
+                    "run_id": run_id, "phase": phase, "scenario": scenario.as_str(),
+                    "phase_started_at": phase_started_at, "phase_duration_ms": phase_duration_ms,
+                    "phase_remaining_ms": phase_remaining_ms,
+                    "timestamp": observed_at, "scheduled_rows": rows,
+                    "send_policy_failures": send_policy_failures.load(Ordering::Relaxed),
+                    "receipt_failures": receipt_failures.load(Ordering::Relaxed),
+                });
+                if let Err(error) = manifests.write_json("driver-progress.json", &frame).await {
+                    cancellation.cancel();
+                    return Err(error);
+                }
+                if stop.is_cancelled() {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                if sequence.is_multiple_of(10) {
+                    println!(
+                        "[loadgen] {phase} {:>4}s: {} batches sent",
+                        started.elapsed().as_secs(),
+                        scheduled
+                    );
+                }
+                sequence += 1;
+                tokio::select! {
+                    () = stop.cancelled() => {}
+                    () = tokio::time::sleep(Duration::from_secs(1)) => {}
+                }
             }
         })
     };
@@ -366,12 +453,18 @@ async fn run_phase(
             break;
         }
     }
-    progress.abort();
+    lanes.abort_all();
+    while lanes.join_next().await.is_some() {}
+    stop_progress.cancel();
+    let progress_outcome = progress
+        .await
+        .context("driver progress task failed")
+        .and_then(|result| result);
     println!(
         "[loadgen] {phase} finished: {} batches sent",
         scheduler.scheduled().saturating_sub(first_ordinal)
     );
-    outcome
+    outcome.and(progress_outcome)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -548,6 +641,8 @@ impl ReceiptTracker {
         run_id: String,
         drain_timeout: Duration,
         capacity: usize,
+        failures: Arc<AtomicU64>,
+        stop: CancellationToken,
     ) -> (
         mpsc::Sender<PendingReceipt>,
         tokio::task::JoinHandle<Result<ReceiptReport>>,
@@ -561,6 +656,12 @@ impl ReceiptTracker {
             let mut deadline = None;
             let mut report = ReceiptReport::default();
             loop {
+                if stop.is_cancelled() {
+                    let aborted = Self::abort_pending(&manifests, &run_id, pending, &mut receiver).await?;
+                    report.failures += aborted;
+                    failures.fetch_add(u64::try_from(aborted)?, Ordering::Relaxed);
+                    break;
+                }
                 if channel_closed && pending.is_empty() {
                     break;
                 }
@@ -579,13 +680,16 @@ impl ReceiptTracker {
                                 rows_published: None,
                                 bytes_published: None,
                                 error_code: Some("receipt_poll_timeout".to_owned()),
+                                error_message: None,
                             })
                             .await?;
                         report.timeouts += 1;
+                        failures.fetch_add(1, Ordering::Relaxed);
                     }
                     break;
                 }
                 tokio::select! {
+                    () = stop.cancelled() => {}
                     received = receiver.recv(), if !channel_closed => {
                         match received {
                             Some(receipt) => {
@@ -605,7 +709,11 @@ impl ReceiptTracker {
                         }
                         let ids = pending.keys().copied().collect::<Vec<_>>();
                         for chunk in ids.chunks(256) {
-                            let responses = match transport.poll_receipts(chunk).await {
+                            let response = tokio::select! {
+                                () = stop.cancelled() => break,
+                                response = transport.poll_receipts(chunk) => response,
+                            };
+                            let responses = match response {
                                 Ok(responses) => responses,
                                 Err(_) => continue,
                             };
@@ -640,12 +748,14 @@ impl ReceiptTracker {
                                         rows_published: facts.rows_published,
                                         bytes_published: facts.bytes_published,
                                         error_code: facts.error_code,
+                                        error_message: facts.error_message,
                                     })
                                     .await?;
                                 if facts.state == "published" && response.purge_allowed {
                                     report.published += 1;
                                 } else {
                                     report.failures += 1;
+                                    failures.fetch_add(1, Ordering::Relaxed);
                                 }
                             }
                         }
@@ -656,9 +766,45 @@ impl ReceiptTracker {
         });
         (sender, task)
     }
+
+    async fn abort_pending(
+        manifests: &ManifestWriter,
+        run_id: &str,
+        mut pending: BTreeMap<ReceiptId, PendingReceipt>,
+        receiver: &mut mpsc::Receiver<PendingReceipt>,
+    ) -> Result<usize> {
+        receiver.close();
+        while let Some(receipt) = receiver.recv().await {
+            if pending.insert(receipt.receipt_id, receipt).is_some() {
+                bail!("duplicate server receipt identifier entered the poller");
+            }
+        }
+        let count = pending.len();
+        for receipt in pending.into_values() {
+            manifests
+                .write_receipt(&ReceiptManifestEntry {
+                    run_id: run_id.to_owned(),
+                    logical_batch_id: receipt.logical_batch_id,
+                    table: receipt.table,
+                    receipt_id: receipt.receipt_id,
+                    state: "aborted".to_owned(),
+                    purge_allowed: false,
+                    terminal_at_unix_ms: now_unix_millis(),
+                    delta_version: None,
+                    rows_published: None,
+                    bytes_published: None,
+                    error_code: Some("generation_failed".to_owned()),
+                    error_message: Some(
+                        "polling stopped after generation failed; publication outcome remains unresolved".to_owned(),
+                    ),
+                })
+                .await?;
+        }
+        Ok(count)
+    }
 }
 
-async fn capture_routing(arguments: &RunArgs) -> Result<RoutingEvidence> {
+async fn capture_routing(arguments: &RunArgs, run_id: &str) -> Result<RoutingEvidence> {
     let config = SqlServerRoutingConfig::with_password_file(
         &arguments.sql_host,
         arguments.sql_port,
@@ -701,6 +847,7 @@ async fn capture_routing(arguments: &RunArgs) -> Result<RoutingEvidence> {
         })
         .collect();
     Ok(RoutingEvidence {
+        run_id: run_id.to_owned(),
         loaded_at_unix_ms: view.loaded_at_unix_ms.get(),
         collectors,
         leases,
@@ -709,6 +856,7 @@ async fn capture_routing(arguments: &RunArgs) -> Result<RoutingEvidence> {
 
 #[derive(Serialize)]
 struct RoutingEvidence {
+    run_id: String,
     loaded_at_unix_ms: u64,
     collectors: Vec<RoutingCollectorEvidence>,
     leases: Vec<RoutingLeaseEvidence>,
@@ -741,6 +889,48 @@ struct RoutingLeaseEvidence {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_generation_aborts_pending_and_queued_receipts_without_a_drain_wait() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let manifests = ManifestWriter::create(directory.path()).await?;
+        let (sender, mut receiver) = mpsc::channel(4);
+        let mut pending = BTreeMap::new();
+        let first = PendingReceipt {
+            logical_batch_id: "first".to_owned(),
+            table: "telemetry.sqlserver.cpu".to_owned(),
+            receipt_id: ReceiptId::new(),
+        };
+        pending.insert(first.receipt_id, first);
+        sender
+            .send(PendingReceipt {
+                logical_batch_id: "queued".to_owned(),
+                table: "telemetry.sqlserver.cpu".to_owned(),
+                receipt_id: ReceiptId::new(),
+            })
+            .await?;
+        // The channel is deliberately still open. Cancellation must not wait
+        // for its normal close-plus-480-second drain deadline.
+        let count = tokio::time::timeout(
+            Duration::from_secs(1),
+            ReceiptTracker::abort_pending(&manifests, "failed-run", pending, &mut receiver),
+        )
+        .await??;
+        assert_eq!(count, 2);
+        assert!(sender.is_closed());
+        manifests.flush().await?;
+        let evidence = tokio::fs::read_to_string(directory.path().join(RECEIPT_MANIFEST_FILE)).await?;
+        let rows = evidence
+            .lines()
+            .map(serde_json::from_str::<ReceiptManifestEntry>)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.state == "aborted"
+            && !row.purge_allowed
+            && row.delta_version.is_none()
+            && row.error_code.as_deref() == Some("generation_failed")));
+        Ok(())
+    }
 
     #[test]
     fn retry_policy_honors_attempts_without_a_window() {

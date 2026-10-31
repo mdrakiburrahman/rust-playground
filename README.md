@@ -68,7 +68,7 @@ generated clients
       v
 Pingora router -- one fenced owner per implementation pool and table
       |                                      |
-      +--> 3 direct collectors               +--> 3 DFE collectors
+      +--> Direct collector pool             +--> DFE collector pool
       |      SQL receipts                         best-effort admission
       |      bounded Arrow buffers                bounded DFE channels
       |                                      |
@@ -89,6 +89,35 @@ walks through those files with `quiver-cli`. See the
 [platform architecture](docs/architecture/arrowcol-platform/README.md) for the full
 catalog, router, receipt, fencing, buffering, and capability contracts.
 
+### Lakehouse loadtest architecture
+
+[![ArrowCol lakehouse loadtest: two pools, maintenance, tenant forks, Kusto, and LGTM](loadtest-architecture.png)](loadtest-architecture.html)
+
+The [interactive architecture source](loadtest-architecture.html) follows
+13 multi-customer schemas through both collector pools into independent Delta
+roots, ingestion-time partitions, standalone maintenance, historical tenant
+forks, and Kusto. Local mode pairs disk with the Kusto emulator. Native external
+Delta/QAP is the default validation target; the optional compatibility bridge is
+functional-only and never counts as native QAP evidence. Azure mode uses ADLS
+Gen2 and native external-Delta query acceleration with a dedicated managed
+identity. Independent validation and LGTM observe the same run.
+
+The tenant fork preserves copied history after source purge; the local bridge
+instead reconciles the current active snapshot. Stable publication identities
+protect retries of the same publication, not duplicate independent client
+requests. Local functional results are not Azure QAP performance evidence.
+See the [loadtest guide](projects/loadtest/README.md) for the current CLI,
+credential boundaries, lifecycle commands, and qualification artifacts.
+
+### Experiments
+
+Experiments isolate a behavior with small deterministic fixtures, independent
+oracles and durable evidence; they do not run the lakehouse loadtest.
+
+The [Azure QAP experiment](experiments/azure-qap/README.md) examines whether
+append, OPTIMIZE, old-partition DELETE and physical VACUUM reload unchanged data.
+See the [lessons learned, with diagrams](docs/experiments/azure-qap/README.md).
+
 ### Finite qualification quick start
 
 Run from the repository root in the source devcontainer:
@@ -105,21 +134,24 @@ npx --no-install nx run arrowcol-infra:down
 # Verify deterministic catalog artifact and Rust/TypeScript SDK generation.
 npx --no-install nx run arrowcol-sdk-gen:verify
 
-# Run OTEL acceptance, then the finite Arrow platform and chaos qualification.
+# Run finite paired Arrow and Quiver crash/recovery qualification.
 npx --no-install nx run loadtest:e2e
 ```
 
 The Arrow phase registers
 [`projects/loadtest/schemas/sqlserver.sql`](projects/loadtest/schemas/sqlserver.sql)
 through Flight SQL, exports the immutable catalog artifacts, generates and
-checks both SDK packages, starts the router with three direct and three DFE
-collectors, and validates both Delta roots. It also exercises schema rejection,
-duplicate direct deliveries, lease expiry, owner restart, stale fencing,
-graceful drain, and SQL interruption/recovery.
+checks both SDK packages, starts the router and both collector pools, and
+validates both Delta roots. The second E2E phase enables Quiver and kills and
+restarts both collectors during traffic to exercise durable replay.
 
-Finite runs stop their scoped Compose stack and retain diagnostics beneath
-`onelake/e2e/` and `onelake/benchmark/<run-id>/results/`. The run prints its
-exact output directory. Focused collector live E2Es retain their own evidence
+The current runner retains output beneath `onelake/benchmark/latest/` and prints
+its exact output directory. A new start may reset only a sealed, validated local
+attempt after verifying its private corpus and evidence archive. Failed,
+interrupted, nonvalidated, Azure, or unmarked legacy attempts block reset and
+preserve their original corpus. See the [loadtest lifecycle and evidence
+guide](projects/loadtest/README.md#per-attempt-evidence-custody) for the reset
+preconditions. Focused collector live E2Es retain their own evidence
 under `projects/arrowcol-rust/.diagnostics/<run-id>/` and
 `projects/arrowcol-dataflow-rust/.diagnostics/<run-id>/`.
 
@@ -127,20 +159,14 @@ under `projects/arrowcol-rust/.diagnostics/<run-id>/` and
 
 ```bash
 npx --no-install nx run loadtest:run -- \
-  --run-id live --warmup 2m --continuous --keep-stack
+  --warmup 2m --concurrency 8 --batch-rows 1024
 ```
 
-The retained stack exposes Grafana at `http://127.0.0.1:3000` and Prometheus
-at `http://127.0.0.1:9090`. Grafana provisions separate **Arrow Flight** and
-**OTEL Collector Baseline** folders; the OTEL dashboard is intentionally
-separate and has data only when `--otel-baseline` is requested.
-
-Stop and remove the retained stack before deleting its output:
-
-```bash
-npx --no-install tsx projects/loadtest/src/main.ts benchmark-down --run-id live
-npx --no-install nx run loadtest:clean
-```
+Omitting `--measure` runs generation until interrupted. The retained local stack
+exposes Grafana at `http://127.0.0.1:3000` and Prometheus at
+`http://127.0.0.1:9090`. Arrow Flight and optional OTEL baseline signals remain
+separate. Use the canonical loadtest guide for current lifecycle and mode
+options rather than the removed `benchmark-down`/`--run-id` interface.
 
 See the [loadtest guide](projects/loadtest/README.md) for diagnostics and the
 [load generator diagram and runbook](docs/architecture/loadtest/README.md) for

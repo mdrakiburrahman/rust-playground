@@ -3,9 +3,11 @@ import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
-import { chromium, type Browser, type Page } from 'playwright';
+import { chromium, type Browser, type Locator, type Page } from 'playwright';
 
 import { safeKustoError } from './kusto.js';
+import { metricRangeEvidence, panelDiagnostics, panelFrameEvidence, quantileQuery } from './metrics-gate.js';
+import { requiredMetrics } from './metric-contract.js';
 
 export const kustoExplorerStartArguments = [
   '--profile', 'benchmark', 'up', '--detach', '--no-build', '--no-deps', '--wait', '--wait-timeout', '120', 'kusto-explorer',
@@ -15,11 +17,18 @@ export const kustoExplorerStartArguments = [
 export const kustoExplorerUrl = 'http://kusto-explorer:8080/';
 export const kustoExplorerClusterUri = 'http://kusto:8080';
 
-export const tableSummaryQuery = [
-  'union withsource=TableName direct_*, dataflow_*',
-  '| summarize Rows=count() by TableName',
-  '| order by TableName asc',
-].join('\n');
+export function tableSummaryQuery(names: Iterable<string>): string {
+  const tables = [...names].sort();
+  if (tables.length === 0 || tables.some(name => !/^[A-Za-z_][A-Za-z0-9_]*$/u.test(name))) {
+    throw new Error('External-table summary requires safe validated table names');
+  }
+  return [
+    `union ${tables.map(name =>
+      `(external_table('${name}') | summarize Rows=count() | extend TableName='${name}')`).join(',\n')}`,
+    '| project TableName, Rows',
+    '| order by TableName asc',
+  ].join('\n');
+}
 
 const browserProfile = ['--profile', 'ui-gate'];
 const viewport = { width: 1600, height: 960 };
@@ -32,6 +41,8 @@ export interface UiGateOptions {
   browserEndpoint: string;
   compose: (args: string[], timeout?: number) => string;
   log: (message: string) => void;
+  metricScope?: 'source-sdk' | 'service-qualification';
+  bridgeEnabled?: boolean;
 }
 
 export interface UiGateResult {
@@ -153,7 +164,15 @@ function count(text: string): number {
   return Number(text.replace(/[^0-9]/gu, ''));
 }
 
-async function exercise(page: Page, expected: ReadonlyMap<string, number>, options: UiGateOptions, evidence: Evidence): Promise<UiGateResult> {
+export async function expandExternalTableFolder(folder: Pick<Locator, 'waitFor' | 'getAttribute' | 'click'>): Promise<void> {
+  await folder.waitFor({ state: 'visible', timeout: 60_000 });
+  const expanded = await folder.getAttribute('aria-expanded');
+  if (expanded === 'false') await folder.click();
+  else if (expanded !== 'true') throw new Error('External tables folder has no expansion state');
+}
+
+/** Browser-only checks, also usable against an existing stack without changing its lifecycle. */
+export async function exerciseExplorer(page: Page, expected: ReadonlyMap<string, number>, options: Pick<UiGateOptions, 'results'>, evidence: Evidence): Promise<UiGateResult> {
   const screenshot = async (name: string): Promise<void> => {
     await page.screenshot({ path: path.join(options.results, name) });
     evidence.screenshots.push(name);
@@ -173,18 +192,20 @@ async function exercise(page: Page, expected: ReadonlyMap<string, number>, optio
   if (config.ready.ready !== true) throw new Error('kusto-explorer /readyz reports Kusto as unreachable');
 
   await page.locator('[data-testid=status-connection][data-state=connected]').waitFor({ timeout: 60_000 });
+  await expandExternalTableFolder(page.locator('[data-testid=tree-node][data-kind=folder][data-name="External tables"]'));
   await page.waitForFunction(
-    (minimum) => document.querySelectorAll('[data-testid=tree-node][data-kind=table]').length >= minimum,
+    (minimum) => document.querySelectorAll('[data-testid=tree-node][data-kind=external-table]').length >= minimum,
     expected.size,
     { timeout: 60_000 },
   );
-  const treeTables = await page.locator('[data-testid=tree-node][data-kind=table]')
+  const treeTables = await page.locator('[data-testid=tree-node][data-kind=external-table]')
     .evaluateAll((nodes) => nodes.map((node) => node.getAttribute('data-name') ?? ''));
   const missing = [...expected.keys()].filter((name) => !treeTables.includes(name));
   evidence.checks.connection_tree = { tables: treeTables.length, missing };
   if (missing.length > 0) throw new Error(`The connection tree is missing ${missing.join(', ')}`);
 
-  await runQuery(page, tableSummaryQuery);
+  const summaryQuery = tableSummaryQuery(expected.keys());
+  await runQuery(page, summaryQuery);
   const statusRows = count(await page.locator('[data-testid=status-rows]').innerText());
   if (statusRows !== expected.size) throw new Error(`The status bar shows ${statusRows} result rows, expected ${expected.size}`);
   await screenshot('kusto-explorer-results-dark.png');
@@ -199,12 +220,12 @@ async function exercise(page: Page, expected: ReadonlyMap<string, number>, optio
   const exported = JSON.parse(readFileSync(exportFile, 'utf8')) as unknown;
   const mismatches = tableRowMismatches(expected, exported);
   const rows = [...expected.values()].reduce((total, value) => total + value, 0);
-  evidence.checks.table_rows = { query: tableSummaryQuery, status_bar_rows: statusRows, tables: expected.size, rows, mismatches };
+  evidence.checks.table_rows = { query: summaryQuery, status_bar_rows: statusRows, tables: expected.size, rows, mismatches };
   if (mismatches.length > 0) throw new Error(`UI results differ from kusto-validation.json: ${mismatches.join('; ')}`);
   for (const toast of await page.locator('[data-testid=toast] button[aria-label=Dismiss]').all()) await toast.click();
   await page.locator('[data-testid=toast]').first().waitFor({ state: 'detached', timeout: 10_000 });
 
-  const management = '.show tables | count';
+  const management = '.show external tables | count';
   await runQuery(page, management);
   const tableCount = count(await page.locator('[data-testid=grid-row] .kx-grid-cell').first().innerText());
   evidence.checks.management_command = { query: management, count: tableCount };
@@ -212,7 +233,7 @@ async function exercise(page: Page, expected: ReadonlyMap<string, number>, optio
     throw new Error(`${management} returned ${tableCount}, but the connection tree lists ${treeTables.length} tables`);
   }
 
-  const chart = `${tableSummaryQuery}\n| render columnchart`;
+  const chart = `${summaryQuery}\n| render columnchart`;
   await runQuery(page, chart);
   await page.locator('[data-testid=chart] rect.kx-bar').first().waitFor({ timeout: 30_000 });
   const bars = await page.locator('[data-testid=chart] rect.kx-bar').count();
@@ -249,6 +270,7 @@ export async function runUiGate(options: UiGateOptions): Promise<UiGateResult> {
   for (const stale of ['kusto-explorer-failure.png', 'kusto-explorer-browser.log']) {
     rmSync(path.join(options.results, stale), { force: true });
   }
+
   let browser: Browser | undefined;
   let page: Page | undefined;
   try {
@@ -261,7 +283,7 @@ export async function runUiGate(options: UiGateOptions): Promise<UiGateResult> {
       if (message.type() === 'error') evidence.console_errors.push(message.text().slice(0, 500));
     });
     page.on('pageerror', (error) => evidence.console_errors.push(`page error: ${error.message}`.slice(0, 500)));
-    const result = await exercise(page, expected, options, evidence);
+    const result = await exerciseExplorer(page, expected, options, evidence);
     if (evidence.console_errors.length > 0) {
       throw new Error(`The page logged errors: ${evidence.console_errors.join(' | ')}`);
     }
@@ -289,5 +311,104 @@ export async function runUiGate(options: UiGateOptions): Promise<UiGateResult> {
     } catch (error) {
       options.log(`Unable to remove the Playwright browser container: ${safeKustoError(error)}`);
     }
+  }
+}
+
+/** Checks actual Grafana datasource samples and rendered plots on the same dashboard. */
+export async function runGrafanaGate(options: UiGateOptions): Promise<void> {
+  const started = Date.now();
+  const scope = options.metricScope ?? 'source-sdk';
+  const end = Math.floor(started / 1000);
+  const start = end - 300;
+  const evidence: Record<string, unknown> = {
+    passed: false, scope, started_at: new Date(started).toISOString(), start, end, metrics: {}, panels: [],
+  };
+  let browser: Browser | undefined;
+  try {
+    browser = await startBrowser(options);
+    const context = await browser.newContext({ viewport, colorScheme: 'dark' });
+    const page = await context.newPage();
+    await page.goto('http://lgtm:3000/d/arrowcol-delta-operations?from=now-15m&to=now&refresh=5s', { timeout: 60_000 });
+    const login = page.locator('input[name="user"]');
+    if (await login.isVisible()) {
+      await login.fill('admin');
+      await page.locator('input[name="password"]').fill('admin');
+      await page.getByRole('button', { name: /log in|sign in/iu }).click();
+    }
+    await page.getByText('Delta SDK and service operation counters', { exact: true }).waitFor({ timeout: 60_000 });
+    const queryRange = async (query: string): Promise<unknown> =>
+      page.evaluate(async ({ query, start, end }) => {
+        const parameters = new URLSearchParams({ query, start: String(start), end: String(end), step: '2' });
+        const response = await fetch(`/api/datasources/proxy/uid/prometheus/api/v1/query_range?${parameters}`);
+        if (!response.ok) throw new Error(`Grafana datasource HTTP ${response.status}`);
+        return response.json() as Promise<unknown>;
+      }, { query, start, end });
+    for (const metric of requiredMetrics(scope, options.bridgeEnabled ?? false)) {
+      const result = await queryRange(metric.query);
+      const measurement: Record<string, unknown> = { query: metric.query, allow_zero: metric.allowZero };
+      (evidence.metrics as Record<string, unknown>)[metric.name] = measurement;
+      try {
+        Object.assign(measurement, metricRangeEvidence(result, 3, metric.allowZero));
+      } catch (error) {
+        throw new Error(`Missing or invalid required live metric ${metric.name}`, { cause: error });
+      }
+    }
+    const dashboard = JSON.parse(readFileSync(path.join(options.workspace, 'projects/loadtest/observability/delta-operations.json'), 'utf8')) as {
+      panels: Array<{ id: number; title: string; type: string; datasource: { uid: string }; targets: Array<{ expr: string }> }>;
+    };
+    const panelIds = scope === 'source-sdk' ? [1, 2, 6, 10, 11] : [1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15];
+    for (const id of panelIds) {
+      evidence.active_panel = { id, status: 'pending' };
+      const panel = dashboard.panels.find(panel => panel.id === id);
+      if (!panel || panel.type !== 'timeseries' || panel.datasource?.uid !== 'prometheus' || !panel.targets.length) {
+        throw new Error(`Missing required Grafana operation panel ${id} with the qualified datasource`);
+      }
+      const samples = [];
+      for (const target of panel.targets) {
+        if (typeof target.expr !== 'string' || !target.expr) throw new Error(`Missing panel ${id} datasource query`);
+        samples.push({
+          query: target.expr,
+          ...metricRangeEvidence(await queryRange(target.expr), 3, true, quantileQuery(target.expr)),
+        });
+      }
+      const [response] = await Promise.all([
+        page.waitForResponse(response => {
+          if (!response.url().includes('/api/ds/query') || response.request().method() !== 'POST') return false;
+          const request: unknown = response.request().postDataJSON();
+          return Boolean(request && typeof request === 'object' && 'queries' in request && Array.isArray(request.queries) &&
+            request.queries.some((query: unknown) => query && typeof query === 'object' && 'expr' in query &&
+              panel.targets.some(target => target.expr === query.expr)));
+        }, { timeout: 30_000 }),
+        page.goto(`http://lgtm:3000/d-solo/arrowcol-delta-operations?from=${start * 1000}&to=${end * 1000}&panelId=${id}`,
+          { timeout: 60_000 }),
+      ]);
+      evidence.active_panel = { id, http_status: response.status() };
+      if (!response.ok()) throw new Error(`Grafana panel ${id} datasource HTTP ${response.status()}`);
+      const responseDocument: unknown = await response.json();
+      evidence.active_panel = {
+        id, http_status: response.status(), ...panelDiagnostics(responseDocument, response.request().postDataJSON()),
+      };
+      const delivered = panelFrameEvidence(responseDocument, panel.targets.every(target => quantileQuery(target.expr)));
+      await page.getByText(panel.title, { exact: true }).waitFor({ state: 'visible', timeout: 30_000 });
+      await page.waitForFunction(() => [...document.querySelectorAll('canvas')].some(canvas => canvas.width > 100 && canvas.height > 100),
+        null, { timeout: 30_000 });
+      if (await page.getByText('No data', { exact: true }).isVisible()) throw new Error(`Grafana panel ${id} rendered no data`);
+      const screenshot = `grafana-delta-panel-${id}.png`;
+      await page.screenshot({ path: path.join(options.results, screenshot), fullPage: true });
+      (evidence.panels as unknown[]).push({ id, title: panel.title, samples, delivered, screenshot });
+      delete evidence.active_panel;
+    }
+    await page.goto(`http://lgtm:3000/d/arrowcol-delta-operations?from=${start * 1000}&to=${end * 1000}`, { timeout: 60_000 });
+    await page.screenshot({ path: path.join(options.results, 'grafana-delta-operations.png'), fullPage: true });
+    evidence.screenshot = 'grafana-delta-operations.png';
+    evidence.passed = true;
+  } catch (error) {
+    evidence.error = safeKustoError(error);
+    throw new Error(`Grafana live telemetry gate failed: ${evidence.error}`);
+  } finally {
+    evidence.finished_at = new Date().toISOString();
+    writeFileSync(path.join(options.results, 'grafana-validation.json'), `${JSON.stringify(evidence, null, 2)}\n`);
+    await browser?.close();
+    options.compose([...browserProfile, 'rm', '--force', '--stop', 'playwright']);
   }
 }

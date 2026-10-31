@@ -1,15 +1,27 @@
 import { type ChildProcess } from 'node:child_process';
 import {
   closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readlinkSync,
-  readdirSync, rmSync, statSync, unlinkSync, writeFileSync,
+  readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { hostname } from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import { BENCHMARK_PROJECT } from './cli.js';
+import { requireNoLiveAttemptWriters, requireSealedAttemptEvidence } from './attempt-evidence.js';
 
 type Docker = (args: string[]) => string;
+
+export function stopReceipt(resetGeneration?: string): {
+  stopped: true; scope: 'workspace-owned-loadtest'; dataPreserved: true; resetGeneration?: string;
+} {
+  if (resetGeneration !== undefined && (resetGeneration.length !== 36 ||
+      !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/u.test(resetGeneration))) {
+    throw new Error('Stop receipt requires canonical lowercase ARROWCOL_RESET_GENERATION when provided');
+  }
+  return { stopped: true, scope: 'workspace-owned-loadtest', dataPreserved: true,
+    ...(resetGeneration === undefined ? {} : { resetGeneration }) };
+}
 
 interface ProcessIdentity {
   pid: number;
@@ -195,7 +207,8 @@ async function stopBenchmarkProcesses(workspace: string, directories: string[]):
       const results = environment.get('LOADTEST_RESULTS');
       if (!results || !directories.some(directory => contained(path.resolve(identity.cwd, results), directory))) continue;
       generators.push(identity);
-      const parent = processIdentity(identity.parent);
+      // An orphan is adopted by container init, which is not a benchmark owner.
+      const parent = identity.parent > 1 ? processIdentity(identity.parent) : undefined;
       if (parent?.arguments.some(arg => path.resolve(parent.cwd, arg) === main)) owners.set(parent.pid, parent);
       const record = path.join(results, 'continuation.json');
       if (parent && existsSync(record)) {
@@ -239,8 +252,96 @@ function resources(docker: Docker, kind: 'container' | 'network' | 'volume'): Re
   });
 }
 
+/** Seconds a cloud mutator gets to drain before Docker kills it; collector drain budgets must fit inside. */
+export const MUTATOR_STOP_SECONDS = 300;
+const MUTATOR_SERVICES = ['direct-1', 'dataflow-1', 'tenant-stream', 'delta-maintenance'];
+
+/** Stops only verified resources owned by this workspace, retaining data for inspection. */
+export async function stopBenchmark(
+  workspace: string, docker: Docker, options: { requireCleanMutators?: boolean; mutatorsOnly?: boolean } = {},
+): Promise<string[]> {
+  if (options.mutatorsOnly && !options.requireCleanMutators) throw new Error('Final validation requires clean mutator drain verification');
+  const directories = benchmarkDirectories(workspace);
+  const projects = new Set([BENCHMARK_PROJECT, ...directories.map(directory => `rust-playground-loadtest-${path.basename(directory)}`)]);
+  const containers = resources(docker, 'container').filter(resource => {
+    if (!projects.has(resource.labels['com.docker.compose.project'])) return false;
+    if (!resource.labels['com.docker.compose.project.config_files']?.split(',')
+      .includes(path.join(workspace, 'projects/loadtest/compose.yaml'))) {
+      throw new Error('Refusing to stop a Docker project owned by another workspace');
+    }
+    return !options.mutatorsOnly ||
+      ['direct-1', 'dataflow-1', 'tenant-stream', 'delta-maintenance'].includes(resource.labels['com.docker.compose.service']);
+  });
+  if (options.mutatorsOnly && ['direct-1', 'dataflow-1'].some(service =>
+    !containers.some(container => container.labels['com.docker.compose.service'] === service))) {
+    throw new Error('Cannot freeze validation without both positively identified collectors');
+  }
+  await stopBenchmarkProcesses(workspace, directories);
+  // Mutators drain through SQL Server and the router, so they stop first and alone.
+  const isMutator = (container: { labels: Record<string, string> }): boolean =>
+    MUTATOR_SERVICES.includes(container.labels['com.docker.compose.service'] ?? '');
+  const mutators = containers.filter(isMutator);
+  const others = containers.filter(container => !isMutator(container));
+  const timeout = options.requireCleanMutators ? String(MUTATOR_STOP_SECONDS) : '30';
+  if (mutators.length) docker(['stop', '--time', timeout, ...mutators.map(container => container.id)]);
+  if (others.length) docker(['stop', '--time', timeout, ...others.map(container => container.id)]);
+  const cleanMutators: string[] = [];
+  if (options.requireCleanMutators) {
+    for (const container of containers) {
+      const service = container.labels['com.docker.compose.service'];
+      if (!service) throw new Error('Cannot verify cloud drain without Compose service identity; retain occupancy');
+      if (!['direct-1', 'dataflow-1', 'tenant-stream', 'delta-maintenance'].includes(service)) continue;
+      const state: unknown = JSON.parse(docker(['inspect', '--format', '{{json .State}}', container.id]));
+      if (!state || typeof state !== 'object' || !('Running' in state) || state.Running !== false ||
+          !('ExitCode' in state) || state.ExitCode !== 0 || !('OOMKilled' in state) || state.OOMKilled !== false) {
+        throw new Error(`Cloud mutator ${service} did not exit cleanly; retain occupancy and publisher registration`);
+      }
+      cleanMutators.push(service);
+    }
+  }
+  return cleanMutators;
+}
+
+export function requirePreviousAttemptEvidence(workspace: string): void {
+  for (const directory of benchmarkDirectories(workspace)) {
+    try {
+      requireSealedAttemptEvidence(workspace, directory);
+    } catch (error) {
+      throw new Error(`${error instanceof Error ? error.message : String(error)}. The previous attempt is unsealed `
+        + '(failed, interrupted, nonvalidated or Azure); inspect it, then quarantine it with '
+        + '`npx --no-install tsx projects/loadtest/src/main.ts --discard-unsealed`', { cause: error });
+    }
+  }
+}
+
+/**
+ * Operator-acknowledged escape hatch for unsealed (failed, interrupted, Azure or nonvalidated)
+ * attempts: moves each unsealed root intact into a private quarantine. Nothing is deleted, and
+ * sealed roots stay in place for the normal reset. The caller stops the stack first.
+ */
+export function discardUnsealedAttempts(workspace: string, now: Date = new Date()): string[] {
+  const quarantine = checkedBenchmarkPath(workspace, path.join(workspace, '.temp/loadtest-discarded',
+    now.toISOString().replace(/[:.]/gu, '-')));
+  const moved: string[] = [];
+  for (const directory of benchmarkDirectories(workspace)) {
+    try {
+      requireSealedAttemptEvidence(workspace, directory);
+      continue;
+    } catch {
+      // Unsealed: quarantine below.
+    }
+    mkdirSync(quarantine, { recursive: true, mode: 0o700 });
+    const target = checkedBenchmarkPath(workspace, path.join(quarantine, path.basename(directory)));
+    if (existsSync(target)) throw new Error(`Refusing to overwrite quarantined attempt ${target}`);
+    renameSync(directory, target);
+    moved.push(target);
+  }
+  return moved;
+}
+
 export async function resetBenchmark(workspace: string, docker: Docker): Promise<string> {
   const directories = benchmarkDirectories(workspace);
+  for (const directory of directories) requireSealedAttemptEvidence(workspace, directory);
   const scratchDirectories = [...new Set(['latest', ...directories.map(directory => path.basename(directory))])]
     .flatMap(name => ['secrets', 'bin', 'loadgen'].map(folder => checkedBenchmarkPath(workspace,
       path.join(workspace, 'projects/loadtest/.temp', folder, name))));
@@ -256,9 +357,9 @@ export async function resetBenchmark(workspace: string, docker: Docker): Promise
   const volumes = resources(docker, 'volume').filter(resource => {
     const project = resource.labels['com.docker.compose.project'];
     const volume = resource.labels['com.docker.compose.volume'];
-    if (!projects.has(project) || !['sqlserver-data', 'hive-warehouse', 'kusto-data'].includes(volume)
+    if (!projects.has(project) || !['sqlserver-data', 'hive-warehouse', 'kusto-data', 'kusto-bridge-state'].includes(volume)
         || resource.name !== `${project}_${volume}`) return false;
-    if (volume === 'kusto-data' && resource.labels['io.arrowcol.loadtest.workspace'] !== workspace) {
+    if (['kusto-data', 'kusto-bridge-state'].includes(volume) && resource.labels['io.arrowcol.loadtest.workspace'] !== workspace) {
       throw new Error('Refusing to reset Kusto storage owned by another or unverifiable workspace');
     }
     return true;
@@ -274,6 +375,7 @@ export async function resetBenchmark(workspace: string, docker: Docker): Promise
       }
     }
   }
+  for (const directory of directories) requireNoLiveAttemptWriters(workspace, directory, docker);
   await stopBenchmarkProcesses(workspace, directories);
   if (containers.length) {
     docker(['stop', '--time', '30', ...containers.map(container => container.id)]);

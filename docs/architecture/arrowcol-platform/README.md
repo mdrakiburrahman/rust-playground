@@ -14,6 +14,7 @@ write independent Delta roots; they do **not** offer the same delivery guarantee
 | [Catalog](catalog.md) | Supported DDL, SQL/Hive saga, exact schema admission |
 | [Storage](storage.md) | Bounded buffers, Parquet/Delta controls, persistence limits |
 | [Observability](observability.md) | Metrics and separate Arrow/OTEL dashboards |
+| [Lakehouse loadtest](../../../loadtest-architecture.html) | Both pools, local/Azure storage, maintenance, tenant forks, Kusto, and validation |
 
 ## System boundary
 
@@ -31,6 +32,20 @@ DFE completion means best-effort admission only. With
 pools fsync each batch to local disk before acknowledging it and replay it after
 a crash, so DFE completion means durable admission. Neither pool provides payload
 deduplication or exactly-once delivery.
+
+Delta publication retry identity is narrower than client delivery identity:
+replaying one publication must not append its rows again, but two independent
+client submissions remain two deliveries. Downstream Kusto visibility has its
+own status and does not change what a Direct `published` receipt means.
+
+Maintenance and streaming run outside the collectors. OPTIMIZE rewrites active
+files without creating new logical rows. A historical tenant fork skips those
+rewrites and owns its sink files, while native Kusto follows the active snapshot,
+including replacements and removals, after asynchronous cache refresh. Cache
+statistics are not a substitute for comparing actual cached query results with
+the independent oracle and uncached fallback. See
+[storage boundaries](storage.md) and the
+[root loadtest diagram](../../../loadtest-architecture.html).
 
 Start with the [root quick start](../../../README.md#arrow-collector-platform)
 or the [load generator guide](../loadtest/README.md). The HTML diagrams are

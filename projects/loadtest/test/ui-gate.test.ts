@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import {
-  expectedTableRows, kustoExplorerClusterUri, kustoExplorerStartArguments, kustoExplorerUrl, tableRowMismatches,
+  expandExternalTableFolder, expectedTableRows, kustoExplorerClusterUri, kustoExplorerStartArguments, kustoExplorerUrl, tableRowMismatches, tableSummaryQuery,
 } from '../src/ui-gate.js';
 
 const validation = {
@@ -14,12 +14,49 @@ const validation = {
   },
 };
 
+test('external-table discovery expands a collapsed folder without collapsing an open one', async () => {
+  for (const expanded of ['false', 'true', null]) {
+    const calls: string[] = [];
+    const result = expandExternalTableFolder({
+      waitFor: async () => { calls.push('visible'); },
+      getAttribute: async (name) => { assert.equal(name, 'aria-expanded'); return expanded; },
+      click: async () => { calls.push('click'); },
+    });
+    if (expanded === null) await assert.rejects(result, /no expansion state/u);
+    else await result;
+    assert.deepEqual(calls, expanded === 'false' ? ['visible', 'click'] : ['visible']);
+  }
+});
+
+test('external-table folder failures propagate instead of silently skipping discovery', async () => {
+  await assert.rejects(expandExternalTableFolder({
+    waitFor: async () => { throw new Error('folder missing'); },
+    getAttribute: async () => 'false',
+    click: async () => { throw new Error('must not click'); },
+  }), /folder missing/u);
+  await assert.rejects(expandExternalTableFolder({
+    waitFor: async () => {},
+    getAttribute: async () => 'false',
+    click: async () => { throw new Error('click failed'); },
+  }), /click failed/u);
+});
+
 test('kusto-explorer starts alone, waits for its health check and is addressed through Compose DNS', () => {
   assert.deepEqual(kustoExplorerStartArguments, [
     '--profile', 'benchmark', 'up', '--detach', '--no-build', '--no-deps', '--wait', '--wait-timeout', '120', 'kusto-explorer',
   ]);
   assert.equal(kustoExplorerUrl, 'http://kusto-explorer:8080/');
   assert.equal(kustoExplorerClusterUri, 'http://kusto:8080');
+});
+
+test('native QAP UI queries enumerate external tables rather than a native-table wildcard', () => {
+  const query = tableSummaryQuery(['direct_x', 'dataflow_y']);
+  assert(query.includes("external_table('direct_x')"));
+  assert(query.includes("external_table('dataflow_y')"));
+  assert(query.includes('| summarize Rows=count()'));
+  assert(!query.includes('direct_*'));
+  assert.throws(() => tableSummaryQuery([]), /safe validated/u);
+  assert.throws(() => tableSummaryQuery(["x'); drop"]), /safe validated/u);
 });
 
 test('expected table rows come from a passing Kusto validation with bracket-quoted names', () => {

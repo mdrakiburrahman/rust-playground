@@ -8,7 +8,10 @@
     "arrowcol-router-rust",
     "arrowcol-infra",
     "arrowcol-sdk-gen",
-    "kusto-explorer"
+    "kusto-explorer",
+    "kusto-bridge",
+    "arrow-tenant-stream",
+    "delta-maintenance"
   ],
   "targets": {
     "format": {
@@ -62,7 +65,10 @@
             "arrowcol-rust",
             "arrowcol-dataflow-rust",
             "arrowcol-router-rust",
-            "kusto-explorer"
+            "kusto-explorer",
+            "kusto-bridge",
+            "arrow-tenant-stream",
+            "delta-maintenance"
           ],
           "target": "image"
         }
@@ -86,6 +92,15 @@
     "reader-build": {
       "executor": "nx:run-commands",
       "cache": false,
+      "dependsOn": [
+        "lint",
+        "test",
+        {"projects": ["arrowcol-sdk-gen"], "target": "lint"},
+        {"projects": ["arrowcol-sdk-gen"], "target": "build"},
+        {"projects": ["arrowcol-sdk-gen"], "target": "test"},
+        {"projects": ["arrowcol-sdk-gen"], "target": "compatibility"},
+        {"projects": ["arrowcol-sdk-gen"], "target": "package-artifact"}
+      ],
       "options": {
         "command": "projects/loadtest/scripts/build-reader-bundle.sh"
       }

@@ -112,7 +112,7 @@
       <rect x="1022" y="264" width="186" height="116" rx="16" fill="#173a35" stroke="#80e2b6"/>
       <image href="../../loadtest/assets/delta-lake.svg" x="1039" y="287" width="152" height="33"/>
       <text x="1115" y="347" class="small">direct/</text>
-      <text x="1115" y="368" class="tiny">Fenced publication</text>
+      <text x="1115" y="368" class="tiny">Partitioned / local or ADLS</text>
 
       <path d="M714 389H699V520H127V482" fill="none" stroke="#80e2b6" stroke-width="2.5" stroke-dasharray="6 5" marker-end="url(#green)"/>
       <rect x="254" y="505" width="402" height="28" rx="6" fill="#101b2c"/>
@@ -128,15 +128,15 @@
       <rect x="1022" y="514" width="186" height="116" rx="16" fill="#3a3025" stroke="#f3bd75"/>
       <image href="../../loadtest/assets/delta-lake.svg" x="1039" y="537" width="152" height="33"/>
       <text x="1115" y="597" class="small">dataflow/</text>
-      <text x="1115" y="618" class="tiny">Independent output</text>
+      <text x="1115" y="618" class="tiny">Sorted / independent output</text>
       <rect x="254" y="584" width="402" height="76" rx="12" fill="#14263b" stroke="#415d7d"/>
       <text x="455" y="612" class="small">SQL holds identities, versions, leases, and receipts.</text>
       <text x="455" y="637" class="small">Ingest Arrow payloads never go into SQL.</text>
-      <text x="620" y="696" class="tiny">Solid: payload / publication &middot; Dashed: schema / control / polling &middot; No exactly-once in either pool; native Quiver is opt-in</text>
+      <text x="620" y="696" class="tiny">Solid: payload / publication &middot; Dashed: schema / control / polling &middot; No client-payload deduplication; native Quiver is opt-in</text>
     </svg>
   </div>
   <div class="note"><strong>Direct receipt ACK is not purge permission.</strong><span class="warning">Without native Quiver, DFE completion is best-effort admission, not a durability guarantee.</span></div>
-  <footer><span>Arrowcol architecture &middot; locally rendered SVG + product assets</span><span><a href="../README.md">Index</a> &middot; <a href="../routing.md">Routing</a> &middot; <a href="../delivery-guarantees.md">Delivery contract</a> &middot; <a href="../../loadtest/assets/README.md">Icon sources</a></span></footer>
+  <footer><span>Maintenance, historical tenant forks, active-snapshot Kusto, and LGTM: <a href="../../../../loadtest-architecture.html">full lakehouse view</a></span><span><a href="../README.md">Index</a> &middot; <a href="../routing.md">Routing</a> &middot; <a href="../delivery-guarantees.md">Delivery contract</a> &middot; <a href="../../loadtest/assets/README.md">Icon sources</a></span></footer>
 </main>
 </body>
 </html>

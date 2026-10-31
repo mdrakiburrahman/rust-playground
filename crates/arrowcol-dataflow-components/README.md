@@ -1,5 +1,46 @@
 # Arrowcol DFE components
 
+Cloud collectors require `ARROWCOL_RESET_GENERATION` and `ARROWCOL_DELTA_ROOT`.
+Startup validates the configured UUID against ready storage authority before
+starting DFE. The epoch binds the existing persisted `instance_key`, not the
+publication app ID. A stale key is a retryable reconciliation diagnostic before
+any current-lease fast path or lease rebinding; Quiver retains it, never ACKs or
+relabels it under the new epoch. Reset execution remains separately disabled
+until all publisher/reader barriers are proven.
+The native WAL persists its original generation in the envelope's
+`instance_key` suffix. Each cloud replay calls
+`PublisherSession::require_generation` on that original suffix before lease
+adoption or writer creation; missing or mismatched epochs receive a transient
+NACK without relabeling or dropping the payload.
+
+The collector installs SDK0.31 OTLP metrics before Delta initialization. The DFE
+embedding hooks preserve an unfiltered Kernel layer on every global/thread-local
+subscriber (including Noop logging), and flush/shutdown metrics before DFE exits.
+Standard OTLP endpoint/protocol variables and millisecond metric interval are
+honored; the default interval is 2000 ms.
+Its default `service.name` is `arrowcol-dataflow-rust`; `OTEL_SERVICE_NAME`
+overrides it and `OTEL_RESOURCE_ATTRIBUTES` adds labels. SDK resource attributes
+are `telemetry.sdk.name=opentelemetry`, `telemetry.sdk.language=rust`, and
+`telemetry.sdk.version=0.31.0`.
+
+Only a clean controller shutdown closes shared publisher sessions, once the
+controller and its drained table owners have been dropped. Closure runs on the
+main thread before metric flush. A refused close is logged, leaves its registry
+member registered, and exits nonzero without retrying unregister. Startup or
+controller errors retain the publisher registry for reconciliation.
+The receiver records `draining` during `DrainIngress`; it does not mark the
+process stopped while downstream exporters can still publish. After the
+controller and publisher close finish, the embedding main-thread hook persists
+`stopped` for every registered routing identity only on a clean drain and close.
+An unclean drain, unpublished identity, retired worker, or refused close instead persists `failed`;
+terminal-write errors are reported and make the process exit nonzero. Routing
+lease rows remain retained and are safe only with an explicitly stopped owner.
+An earlier transient NACK may recover only when the same stable publication ID
+later publishes successfully and its current worker is healthy. A different
+client resubmission ID does not prove recovery of the original publication.
+An interrupted or failed DFE send with no proven publication remains incomplete;
+the send-error abstraction does not prove that no downstream delivery occurred.
+
 `arrowcol-dataflow-components` links two external OTAP Dataflow Engine (DFE)
 nodes:
 
@@ -24,6 +65,39 @@ export. The generic Delta exporter accepts only this pluggable representation
 and sends the original arbitrary batch to `arrow-deltalake`; it does not invoke
 OTAP schema preparation.
 
+Each admitted batch also carries a fresh server UUID (`publication_id`) and
+original UTC ingestion milliseconds in this persisted envelope. The exporter
+keeps grouped scheduling but writes one file per publication with transaction
+`arrowcol.publication.<UUID>` version `0`. Quiver replay preserves that identity
+and timestamp even if flush grouping changes; independent equal payloads have
+different UUIDs and remain independent. Legacy durable envelopes missing these
+fields are refused transiently for operator reconciliation, never silently
+relabeled or acknowledged.
+
+The correctness tradeoff is more, smaller Parquet files: one file per admitted
+publication, not one file per grouped flush. The exporter stages the whole
+group, submits unforced files, and forces only the final file of each bounded
+worker-capacity wave, then joins all commit receipts before acknowledging any
+batch. Independent transaction IDs can therefore share one Delta log commit
+without coupling their replay identity. File-count metrics count those files,
+not the number of flush groups.
+
+For legacy pdata with either field absent, `stage` returns a transient error
+before opening a table or writing a file. The exporter sends a retryable NACK
+with the unchanged pdata and a diagnostic requesting operator reconciliation;
+it sends neither an ACK nor a permanent/refused NACK. A durable buffer retains
+and retries it according to its configured retention policy. Operators must
+not enable destructive `drop_oldest`/expiry policies if retention is required.
+
+`base_path` accepts an absolute local path or an
+`abfss://container@account.dfs.core.windows.net/prefix` root. Set
+`ARROWCOL_PARTITION_GRANULARITY=minute`, `hour`, or `day` to partition on core
+`__arrowcol_ingestion` from the saved admission timestamp, not event time; the
+unset default remains unpartitioned. Runtime collector images install Azure
+CLI >=2.54 from Microsoft's signed Bookworm repository; mount authenticated
+configuration for UID 10001 and point
+`AZURE_CONFIG_DIR` at it instead of embedding credentials.
+
 ## Delivery semantics
 
 `native_quiver` on `receiver:arrow_flight` selects the Flight completion mode.
@@ -41,7 +115,8 @@ The wait is bounded by `limits.admission_timeout`. Any rejection or the
 timeout fails the stream with a retryable `UNAVAILABLE` error
 (`capacity_exhausted` or `backpressure_timeout`); later batches of a rejected
 stream fail fast. Acknowledged data survives a crash and is replayed, so
-delivery is at-least-once and duplicates are possible.
+delivery remains at-least-once, while retries of the same stable publication
+are transaction-deduplicated. Independent client resubmissions remain separate.
 
 In both modes:
 

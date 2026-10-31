@@ -5,6 +5,7 @@ import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import YAML from 'yaml';
+import { MUTATOR_STOP_SECONDS } from '../src/lifecycle.js';
 import {
   benchmarkComposeFiles, buildBenchmarkComposeOverride, buildBenchmarkRuntimeConfigs, dataflowConfigFile,
 } from '../src/runtime-config.js';
@@ -157,4 +158,12 @@ test('--quiver persists both collectors to Quiver with fsync before acknowledgem
   assert.throws(() => buildBenchmarkRuntimeConfigs(directSource, baselineSource, identity, { quiver: true }),
     /requires the Dataflow native Quiver topology/u);
   assert.throws(() => buildBenchmarkRuntimeConfigs(directSource, quiverSource, identity), /requires --quiver/u);
+});
+
+test('direct collector drain budgets finish inside the mutator stop budget', () => {
+  const { stream_drain_timeout_ms: stream, publication_drain_timeout_ms: publication } = direct.shutdown;
+  assert(stream > 0 && publication > 0);
+  // Leave headroom for lease release and terminal owner/routing writes.
+  assert(stream + publication <= (MUTATOR_STOP_SECONDS - 30) * 1000,
+    `drain budget ${stream + publication} ms must leave headroom before Docker kills at ${MUTATOR_STOP_SECONDS} s`);
 });

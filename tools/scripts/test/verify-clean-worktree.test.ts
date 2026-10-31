@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
 import {
   existsSync,
+  copyFileSync,
   mkdirSync,
   mkdtempSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -62,6 +64,49 @@ const success = (stdout = ''): CommandResult => ({
   exitCode: 0,
   stderr: '',
   stdout,
+});
+
+test('repository ignores dependency and target aliases without hiding source', () => {
+  const workspace = fileURLToPath(new URL('../../../', import.meta.url));
+  const scratch = join(workspace, '.nx', 'worktree-verification-tests');
+  mkdirSync(scratch, { recursive: true });
+  const repository = mkdtempSync(join(scratch, 'alias-ignore-'));
+  const runner = new SpawnCommandRunner();
+  const git = (args: readonly string[]) => runChecked(
+    runner, 'git', ['-C', repository, ...args],
+    { stdout: 'capture', stderr: 'capture' },
+  );
+  try {
+    git(['init', '--quiet']);
+    copyFileSync(join(workspace, '.gitignore'), join(repository, '.gitignore'));
+    for (const prefix of ['', 'nested/']) {
+      mkdirSync(join(repository, prefix), { recursive: true });
+      for (const name of ['node_modules', 'target']) {
+        const relative = `${prefix}${name}`;
+        const fixture = join(repository, relative);
+        for (const kind of ['directory', 'symlink', 'file']) {
+          if (kind === 'directory') mkdirSync(fixture);
+          else if (kind === 'symlink') symlinkSync(repository, fixture, 'junction');
+          else writeFileSync(fixture, 'generated output\n');
+          assert.equal(git(['check-ignore', '--', relative]).stdout.trim(), relative, kind);
+          rmSync(fixture, { recursive: kind === 'directory' });
+        }
+      }
+    }
+    for (const relative of ['source.rs', 'nested/source.rs', 'target-source.rs', 'node_modules-source.ts']) {
+      writeFileSync(join(repository, relative), 'source remains visible\n');
+      const result = runner.run('git', ['-C', repository, 'check-ignore', '--', relative], {
+        stdout: 'capture', stderr: 'capture',
+      });
+      assert.equal(result.exitCode, 1, relative);
+      assert.equal(result.stdout, '');
+    }
+    const status = git(['status', '--porcelain=v1', '--untracked-files=all']).stdout;
+    assert.match(status, /\?\? source\.rs/u);
+    assert.match(status, /\?\? nested\/source\.rs/u);
+  } finally {
+    rmSync(repository, { recursive: true, force: true });
+  }
 });
 
 test('accepts a clean worktree', () => {

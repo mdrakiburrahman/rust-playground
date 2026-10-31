@@ -1,0 +1,45 @@
+{
+  "name": "azure-infra",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "application",
+  "targets": {
+    "test": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "npx --no-install tsc --project infra/azure/tsconfig.json && npx --no-install tsx --test infra/azure/*.test.ts",
+        "cwd": "{workspaceRoot}"
+      }
+    },
+    "verify": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "bash infra/azure/verify.sh",
+        "cwd": "{workspaceRoot}"
+      }
+    },
+    "provision": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "npx --no-install tsx infra/azure/bootstrap.ts provision",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": true
+      }
+    },
+    "reset": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "npx --no-install tsx infra/azure/bootstrap.ts reset",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": true
+      }
+    },
+    "status": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "npx --no-install tsx infra/azure/bootstrap.ts status",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": true
+      }
+    }
+  }
+}

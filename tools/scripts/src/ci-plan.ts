@@ -129,13 +129,19 @@ export function createVerificationPlan(graph: VerificationGraph): VerificationPl
     });
   if (images.length === 0) throw new Error('CI has no source-built runtime images.');
 
-  const special = new Set([readerTask, integrationTask, ...images.map(({ task }) => task)]);
-  if (closure(readerTask).size !== 1) {
-    throw new Error('The reader build needs an explicit prerequisite handoff.');
+  const readerDependencies = closure(readerTask);
+  const expectedReaderDependencies = new Set([
+    readerTask, 'loadtest:lint', 'loadtest:test',
+    ...['lint', 'build', 'test', 'generate', 'check', 'compatibility', 'generated-test', 'package-artifact']
+      .map((target) => `arrowcol-sdk-gen:${target}`),
+  ]);
+  if (!sameSet(readerDependencies, expectedReaderDependencies)) {
+    throw new Error('The reader build prerequisites must be exactly the loadtest and SDK writer checks.');
   }
+  const special = new Set([...readerDependencies, integrationTask, ...images.map(({ task }) => task)]);
   const integrationDependencies = closure(integrationTask);
   integrationDependencies.delete(integrationTask);
-  const expectedDependencies = new Set([readerTask, ...images.map(({ task }) => task)]);
+  const expectedDependencies = new Set([...readerDependencies, ...images.map(({ task }) => task)]);
   if (!sameSet(integrationDependencies, expectedDependencies)) {
     throw new Error('E2E prerequisites must be exactly the reader and source image artifacts.');
   }
@@ -148,7 +154,7 @@ export function createVerificationPlan(graph: VerificationGraph): VerificationPl
     }
   }
   const roots = remaining.filter((id) => !prerequisites.has(id)).sort();
-  const claimed = new Map([...special].map((id) => [id, id]));
+  const claimed = new Map([...special].map((id) => [id, readerDependencies.has(id) ? readerTask : id]));
   const nodeRoots: VerificationShard[] = [];
   const rustRoots: VerificationShard[] = [];
   const rootUsesCargo = new Map<string, boolean>();

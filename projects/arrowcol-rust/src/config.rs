@@ -92,7 +92,12 @@ impl CollectorConfig {
             path: path.to_path_buf(),
             source,
         })?;
-        Self::from_yaml(&bytes)
+        let mut config: Self = serde_yaml::from_slice(&bytes)?;
+        config
+            .delta
+            .override_root(std::env::var_os("ARROWCOL_DELTA_ROOT").map(PathBuf::from));
+        config.validate()?;
+        Ok(config)
     }
 
     /// Parses and validates strict YAML bytes.
@@ -403,6 +408,12 @@ pub struct DeltaConfig {
 }
 
 impl DeltaConfig {
+    fn override_root(&mut self, root: Option<PathBuf>) {
+        if let Some(root) = root {
+            self.root = root;
+        }
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         nonempty_path(&self.root, "delta.root")?;
         let options = self.commit_options()?;
@@ -827,7 +838,10 @@ impl AuthConfig {
 pub struct ShutdownConfig {
     /// Time for Flight streams to complete before forced cancellation.
     pub stream_drain_timeout_ms: u64,
-    /// Time for buffer, Delta, and receipt completion.
+    /// Total time for the Quiver drain, buffer, Delta, and receipt completion.
+    ///
+    /// Stream plus publication drain must stay below the supervisor's stop
+    /// budget so a bounded drain failure is recorded instead of killed.
     pub publication_drain_timeout_ms: u64,
 }
 
@@ -892,4 +906,24 @@ fn required_path(value: &Option<PathBuf>, name: &str) -> Result<(), ConfigError>
 fn duration_ms(value: u64, name: &str) -> Result<Duration, ConfigError> {
     positive(value, name)?;
     Ok(Duration::from_millis(value))
+}
+
+#[cfg(test)]
+mod delta_root_tests {
+    use super::*;
+
+    #[test]
+    fn root_override_preserves_local_default_and_adls_uri() -> Result<(), ConfigError> {
+        let mut config = CollectorConfig::from_yaml(include_bytes!("../config.yaml"))?;
+        let default = config.delta.root.clone();
+        config.delta.override_root(None);
+        assert_eq!(config.delta.root, default);
+        let uri = "abfss://container@account.dfs.core.windows.net/prefix";
+        config.delta.override_root(Some(PathBuf::from(uri)));
+        assert_eq!(config.delta.root.to_string_lossy(), uri);
+        config.delta.validate()?;
+        config.delta.override_root(Some(PathBuf::new()));
+        assert!(config.delta.validate().is_err());
+        Ok(())
+    }
 }

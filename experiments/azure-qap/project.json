@@ -1,0 +1,43 @@
+{
+  "name": "azure-qap-experiment",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "application",
+  "implicitDependencies": ["experiment-kit", "arrowcol-experiment", "delta-maintenance"],
+  "targets": {
+    "lint": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "npx --no-install tsc --project experiments/azure-qap/tsconfig.json"
+      }
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "npx --no-install tsx --test experiments/azure-qap/src/*.test.ts"
+      }
+    },
+    "build": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "cargo build --locked --release --package arrowcol-experiment --package delta-maintenance"
+      }
+    },
+    "verify": {
+      "executor": "nx:run-commands",
+      "dependsOn": ["lint", "test"],
+      "options": {
+        "commands": []
+      }
+    },
+    "run": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["build"],
+      "options": {
+        "command": "npx --no-install tsx experiments/azure-qap/src/main.ts",
+        "forwardAllArgs": true
+      }
+    }
+  }
+}

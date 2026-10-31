@@ -38,7 +38,7 @@ fn tutorial_walkthrough() -> Result {
     let generated = run(&["generate"], &dir)?;
     for fact in [
         "telemetry.sqlserver.sqlserver_wait_stats",
-        "sha256:fcf62ed7",
+        "sha256:a349410a",
         "arrowcol.direct@1",
         "3,546       28          28         4",
     ] {
@@ -70,8 +70,8 @@ fn tutorial_walkthrough() -> Result {
     let segments = run(&["segments"], &dir)?;
     assert!(segments.contains("4 finalized segments"), "{segments}");
     assert!(segments.contains("(28 bundles, 3,546 rows)"), "{segments}");
-    assert!(segments.contains("slot 0, schema sha256:fcf62ed7"), "{segments}");
-    let shown = run(&["show", "--columns", "wait_type,wait_time_ms"], &dir)?;
+    assert!(segments.contains("slot 0, schema sha256:a349410a"), "{segments}");
+    let shown = run(&["show", "--columns", "customer_id,wait_type,wait_time_ms"], &dir)?;
     assert!(
         shown.contains("segment 0000000000000000.qseg, bundle 0: 128 rows"),
         "{shown}"
@@ -80,7 +80,9 @@ fn tutorial_walkthrough() -> Result {
         shown.contains("table id 30bbde33-b0e2-5244-9260-b9a10c36c872"),
         "{shown}"
     );
-    assert!(shown.contains("| wait_type"), "{shown}");
+    for fact in ["| customer_id", "customer-0000", "customer-0004", "ASYNC_IO_COMPLETION"] {
+        assert!(shown.contains(fact), "show output lacks {fact:?}:\n{shown}");
+    }
     assert!(!shown.contains("machine_name"), "--columns selects columns:\n{shown}");
 
     // 5. Consume: the fully acknowledged segment is deleted.

@@ -19,6 +19,7 @@ test('the normal command has no execution naming or generic fault modes', () => 
   const defaults = parseBenchmarkOptions([]);
   assert.equal(defaults.quiver, false);
   assert.equal(defaults.crashAfterSeconds, undefined);
+  assert.equal(defaults.drainTimeoutSeconds, 480, 'the fixed five-minute cached gate needs its own bounded outer validation budget');
 });
 
 test('--quiver enables disk persistence and --crash-after requires it', () => {
@@ -45,4 +46,15 @@ test('defaults and overrides', () => {
   assert.deepEqual([options.warmupSeconds, options.concurrency, options.batchRows], [120, 8, 64]);
   assert.throws(() => parseBenchmarkOptions(['--unknown', '1']), /Unknown/u);
   assert.throws(() => parseBenchmarkOptions(['--concurrency']), /requires a value/u);
+});
+
+test('final compaction defaults on only locally; explicit Azure requests fail before effects', () => {
+  assert.equal(parseBenchmarkOptions(['--validate'], {}).finalCompaction, true);
+  assert.equal(parseBenchmarkOptions(['--validate', '--no-final-compaction'], {}).finalCompaction, false);
+  assert.equal(parseBenchmarkOptions(['--validate', '--mode', 'azure'], {}).finalCompaction, false);
+  assert.equal(parseBenchmarkOptions(['--validate', '--no-final-compaction'], { ARROWCOL_MODE: 'azure' }).finalCompaction, false);
+  assert.throws(() => parseBenchmarkOptions(['--validate', '--mode', 'azure', '--final-compaction'], {}), /unsupported in Azure/u);
+  assert.throws(() => parseBenchmarkOptions(['--validate', '--final-compaction'], { ARROWCOL_MODE: 'azure' }), /unsupported in Azure/u);
+  assert.throws(() => parseBenchmarkOptions(['--final-compaction'], {}), /requires --validate/u);
+  assert.throws(() => parseBenchmarkOptions(['--no-final-compaction', '--final-compaction'], {}), /only once/u);
 });

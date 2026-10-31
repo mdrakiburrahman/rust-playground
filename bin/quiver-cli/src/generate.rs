@@ -127,6 +127,11 @@ pub(crate) fn delivery_bundle(
         format: DELIVERY_MANIFEST_FORMAT.to_owned(),
         version: DELIVERY_MANIFEST_VERSION,
         receipt_id: ReceiptId::new(),
+        ingested_at_ms: Some(arrowcol_protocol::UnixMillis::new(u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis(),
+        )?)?),
         receipt_revision: 0,
         owner_instance_id: owner,
         lease_id: lease,

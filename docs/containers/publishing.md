@@ -210,12 +210,14 @@ publicly available.
 
 `.github/workflows/publish-devcontainer.yml` runs on:
 
-- a push to `main` that changes the devcontainer, its publishing workflow,
-  root Node/Nx inputs, the Rust toolchain pin, or registry tooling;
+- a push to any branch that changes the devcontainer, its publishing workflow,
+  root Node/Nx inputs, the Rust toolchain pin, or registry tooling, so a
+  branch's content-hashed image exists before anyone bootstraps that branch;
 - manual `workflow_dispatch`.
 
-It logs in with the GitHub Actions token, runs `devcontainer:publish`, and
-checks the `main` and `latest` manifests.
+It logs in with the GitHub Actions token and runs `devcontainer:publish`, which
+skips an image hash that already exists and updates only that branch's alias.
+On `main` it also checks the `main` and `latest` manifests.
 
 `.github/workflows/publish-images.yml` runs on:
 

@@ -1,0 +1,35 @@
+[package]
+name = "arrowcol-experiment"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Bounded production ArrowCol fixture publisher and exact Delta oracle"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+arrow = { version = "58.3", default-features = false }
+arrow-deltalake = { path = "../../crates/arrow-deltalake" }
+arrowcol-buffer = { path = "../../crates/arrowcol-buffer" }
+arrowcol-catalog = { path = "../../crates/arrowcol-catalog" }
+arrowcol-protocol = { path = "../../crates/arrowcol-protocol" }
+arrowcol-receipts = { path = "../../crates/arrowcol-receipts" }
+async-trait = "0.1"
+clap.workspace = true
+delta_kernel = { version = "=0.29.0", default-features = false }
+delta_kernel_default_engine = { version = "=0.29.0", default-features = false, features = ["arrow-58"] }
+futures = "0.3"
+object_store = { version = "0.13.2", features = ["azure"] }
+parquet = { version = "58.3", default-features = false, features = ["arrow"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+url = "2"
+
+[dev-dependencies]
+assert_cmd.workspace = true
+
+[lints]
+workspace = true

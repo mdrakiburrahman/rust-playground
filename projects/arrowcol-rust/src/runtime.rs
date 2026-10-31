@@ -32,7 +32,7 @@ use crate::control::{
 };
 use crate::delta_sink::{ProductionDeltaSink, verify_writable_root};
 use crate::ingest::DirectAdmission;
-use crate::lease::TableLeaseManager;
+use crate::lease::{TableLeaseManager, now_unix_millis};
 use crate::metrics::CollectorMetrics;
 
 /// Final graceful-shutdown result.
@@ -52,8 +52,21 @@ pub enum RunOutcome {
 /// # Errors
 ///
 /// Returns startup, listener, control-loop, or graceful-shutdown failures.
-pub async fn run(config: CollectorConfig) -> Result<RunOutcome> {
+pub async fn run(mut config: CollectorConfig) -> Result<RunOutcome> {
     config.validate()?;
+    let root = config.delta.root.to_string_lossy().into_owned();
+    let generation = tokio::task::spawn_blocking(move || arrowcol_buffer::CloudGeneration::capture(&root))
+        .await
+        .context("validate cloud generation task")??;
+    if let Some(generation) = &generation {
+        config.identity.instance_key = generation.bind_instance_key(&config.identity.instance_key);
+        config.validate()?;
+        if let Some(stage) = config.buffer.native_quiver.stage_config()? {
+            generation.bind_durable_directory(&stage.directory)?;
+            let persisted = generation.persisted_directory_generation(&stage.directory)?;
+            generation.require_persisted_generation(&persisted).await?;
+        }
+    }
     let instance_id = config.instance_id();
     let password = String::from_utf8(read_secret(&config.sql_server.password_file)?)
         .context("SQL Server password secret is not UTF-8")?;
@@ -329,6 +342,7 @@ pub async fn run(config: CollectorConfig) -> Result<RunOutcome> {
         quiver.as_ref(),
         &leases,
         &metrics,
+        &cancellation,
     )
     .await;
     cancellation.cancel();
@@ -370,6 +384,7 @@ async fn shutdown(
     quiver: Option<&Arc<QuiverStage>>,
     leases: &Arc<TableLeaseManager>,
     metrics: &CollectorMetrics,
+    control_loops: &CancellationToken,
 ) -> Result<RunOutcome> {
     info!("stopping new Flight admission");
     drain.begin_drain();
@@ -404,22 +419,19 @@ async fn shutdown(
     }
 
     leases.start_delta_draining().await;
-    if let Some(stage) = quiver
-        && !drain_quiver(
-            stage,
-            buffer,
-            Duration::from_millis(config.shutdown.publication_drain_timeout_ms),
-        )
-        .await
-    {
-        error!("Quiver backlog did not drain; persisted batches remain on disk for the next generation");
-        incomplete = incomplete.saturating_add(1);
+    // One publication budget covers the Quiver drain and the buffer shutdown,
+    // so a bounded failure is recorded before the supervisor's stop deadline.
+    let publication_deadline =
+        tokio::time::Instant::now() + Duration::from_millis(config.shutdown.publication_drain_timeout_ms);
+    let mut quiver_drained = false;
+    if let Some(stage) = quiver {
+        quiver_drained = drain_quiver(stage, buffer, publication_deadline).await;
+        if !quiver_drained {
+            error!("Quiver backlog did not drain; persisted batches remain on disk for the next generation");
+            incomplete = incomplete.saturating_add(1);
+        }
     }
-    let buffer_report = tokio::time::timeout(
-        Duration::from_millis(config.shutdown.publication_drain_timeout_ms),
-        buffer.shutdown(),
-    )
-    .await;
+    let buffer_report = tokio::time::timeout_at(publication_deadline, buffer.shutdown()).await;
     match buffer_report {
         Ok(Ok(report)) => {
             incomplete = incomplete.saturating_add(report.incomplete.len());
@@ -444,10 +456,19 @@ async fn shutdown(
         }
     }
 
+    if quiver_drained && let Err(error) = fail_unbuffered_predecessor_receipts(receipts.as_ref(), instance_id).await {
+        warn!(%error, "could not fail predecessor receipts that were never durably buffered");
+        incomplete = incomplete.saturating_add(1);
+    }
+
     if let Err(error) = leases.release_all().await {
         warn!(%error, "one or more table leases could not be released");
         incomplete = incomplete.saturating_add(1);
     }
+    // The owner and routing heartbeats keep both leases alive through drain.
+    // Stop them before the terminal writes, so a tick after `stopped` cannot
+    // be fenced and fail the already-finished collector closed.
+    control_loops.cancel();
     if incomplete == 0
         && let Err(error) = finish_owner_drain(receipts.as_ref(), instance_id).await
     {
@@ -471,11 +492,41 @@ async fn shutdown(
     }
 }
 
+/// Bound on sweeps of predecessor receipts per shutdown, at the store's batch limit.
+const UNBUFFERED_RECEIPT_SWEEPS: usize = 64;
+const UNBUFFERED_RECEIPT_BATCH: usize = 256;
+
+/// Fails `accepted` receipts a crashed predecessor created but never persisted
+/// to Quiver. The predecessor never acknowledged them, and once this
+/// generation has drained every persisted bundle no recovery can publish
+/// them, so they would otherwise stay active forever.
+async fn fail_unbuffered_predecessor_receipts(
+    receipts: &dyn ReceiptStore,
+    instance_id: CollectorInstanceId,
+) -> Result<()> {
+    for _ in 0..UNBUFFERED_RECEIPT_SWEEPS {
+        let report = receipts
+            .fail_unbuffered_predecessor_receipts(instance_id, now_unix_millis()?, UNBUFFERED_RECEIPT_BATCH)
+            .await
+            .context("fail unbuffered predecessor receipts")?;
+        for record in &report.reconciled {
+            warn!(
+                receipt_id = %record.receipt_id,
+                table = %record.table,
+                "failed a predecessor receipt that was never durably buffered or acknowledged"
+            );
+        }
+        if !report.limit_reached {
+            return Ok(());
+        }
+    }
+    anyhow::bail!("unbuffered predecessor receipts remain after {UNBUFFERED_RECEIPT_SWEEPS} bounded sweeps")
+}
+
 /// Publishes every persisted batch before the buffer stops, flushing buffered
 /// groups immediately instead of waiting for their age trigger. Returns whether
-/// the Quiver backlog drained before the timeout; the stage is stopped either way.
-async fn drain_quiver(stage: &Arc<QuiverStage>, buffer: &Arc<BufferManager>, timeout: Duration) -> bool {
-    let deadline = tokio::time::Instant::now() + timeout;
+/// the Quiver backlog drained before the deadline; the stage is stopped either way.
+async fn drain_quiver(stage: &Arc<QuiverStage>, buffer: &Arc<BufferManager>, deadline: tokio::time::Instant) -> bool {
     let drained = loop {
         if let Err(error) = buffer.drain().await {
             warn!(%error, "explicit buffer drain failed while draining Quiver");
