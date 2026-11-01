@@ -17,12 +17,13 @@ mod exporter;
 mod metrics;
 mod receiver;
 mod routing;
+mod shutdown;
 
 pub use arrow_deltalake::delta::initialize_shared_io;
 pub use config::{
     AdaptiveFileConfig, BatchCapacity, CatalogConfig, CommitConfig, DeltaExporterConfig, FileBatchConfig,
     FlightReceiverConfig, HiveMetastoreConnectionConfig, RegistrationConfig, RoutingStoreConfig, RuntimeLimitsConfig,
-    SqlServerConnectionConfig,
+    SqlServerConnectionConfig, configure_cloud_generation,
 };
 pub use envelope::{
     ARROWCOL_FLIGHT_REPRESENTATION_ID, ARROWCOL_FLIGHT_REPRESENTATION_VERSION, ArrowcolBatchEnvelope,
@@ -35,3 +36,4 @@ pub use metrics::{
 };
 pub use receiver::{ARROW_FLIGHT_RECEIVER, ARROW_FLIGHT_RECEIVER_URN, DfeAdmission, PdataSendError, PdataSender};
 pub use routing::{LeaseResolver, StoreLeaseResolver};
+pub use shutdown::{RoutingShutdown, finish_routing_shutdown};

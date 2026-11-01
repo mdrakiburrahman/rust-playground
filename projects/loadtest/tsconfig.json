@@ -1,5 +1,5 @@
 {
   "extends": "../../tsconfig.json",
-  "compilerOptions": {"noEmit": true, "rootDir": "."},
-  "include": ["src/**/*.ts", "test/**/*.ts"]
+  "compilerOptions": {"noEmit": true, "rootDir": "../.."},
+  "include": ["src/**/*.ts", "test/**/*.ts", "scripts/**/*.ts", "loadgen/scripts/**/*.ts", "loadgen/tests/support/**/*.ts"]
 }

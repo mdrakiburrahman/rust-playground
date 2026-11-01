@@ -4,6 +4,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
+import type { ProjectConfiguration } from '@nx/devkit';
 import YAML from 'yaml';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -28,9 +29,98 @@ const compose = YAML.parse(readFileSync(path.join(root, 'projects/loadtest/compo
     read_only?: boolean;
     cap_drop?: string[];
     user?: string;
+    init?: boolean;
   }>;
   volumes: Record<string, { labels?: Record<string, string> } | null>;
 };
+
+test('lint and tests finish before static helper installation for every loadtest build entry point', () => {
+  const project = JSON.parse(readFileSync(path.join(root, 'projects/loadtest/project.json'), 'utf8')) as ProjectConfiguration;
+  const targets = project.targets;
+  assert.ok(targets);
+  const sdkWriters = ['lint', 'build', 'test', 'compatibility', 'package-artifact'];
+  assert.deepEqual(targets['reader-build'].dependsOn, [
+    'lint', 'test', ...sdkWriters.map(target => ({ projects: ['arrowcol-sdk-gen'], target })),
+  ]);
+  assert.deepEqual(targets.lint.dependsOn ?? [], []);
+  assert.deepEqual(targets.test.dependsOn ?? [], []);
+  assert.equal(targets['reader-build'].options?.command, 'projects/loadtest/scripts/build-reader-bundle.sh');
+  assert.deepEqual(targets.verify.dependsOn, ['lint', 'test', 'e2e']);
+  assert.deepEqual(targets.e2e.dependsOn, ['build']);
+  assert.equal(targets.build.dependsOn?.[0], 'reader-build');
+  assert.deepEqual(targets.e2e.options?.commands, [
+    'npx --no-install tsx projects/loadtest/src/main.ts --warmup 5s --measure 30s --batch-rows 1024 --validate',
+    'npx --no-install tsx projects/loadtest/src/main.ts --warmup 5s --measure 60s --batch-rows 1024 --validate --quiver --crash-after 15s',
+  ]);
+  assert.equal(targets.e2e.options?.parallel, false);
+  const sdk = JSON.parse(readFileSync(path.join(root, 'crates/arrowcol-sdk-gen/project.json'), 'utf8')) as ProjectConfiguration;
+  assert.ok(sdk.targets);
+  for (const writer of ['lint', 'build', 'test']) assert.deepEqual(sdk.targets[writer].dependsOn ?? [], []);
+  assert.deepEqual(sdk.targets.compatibility.dependsOn, ['generate']);
+  assert.deepEqual(sdk.targets['package-artifact'].dependsOn, ['generated-test']);
+  assert.deepEqual(sdk.targets['generated-test'].dependsOn, ['check']);
+  assert.deepEqual(sdk.targets.check.dependsOn, ['generate']);
+  assert.deepEqual(sdk.targets.generate.dependsOn ?? [], []);
+  const ordered: string[] = [];
+  const active = new Set<string>();
+  const visit = (name: string): void => {
+    assert.ok(!active.has(name), `cycle at ${name}`);
+    if (ordered.includes(name)) return;
+    active.add(name);
+    for (const dependency of targets[name].dependsOn ?? []) {
+      if (typeof dependency === 'string') visit(dependency);
+    }
+    active.delete(name);
+    ordered.push(name);
+  };
+  for (const entry of ['reader-build', 'build', 'e2e', 'verify']) {
+    ordered.length = 0;
+    visit(entry);
+    for (const writer of ['lint', 'test']) {
+      assert.ok(ordered.indexOf(writer) < ordered.indexOf('reader-build'), `${entry}: ${writer} must precede static installation`);
+    }
+  }
+  const shared = JSON.parse(readFileSync(path.join(root, 'project.json'), 'utf8')) as ProjectConfiguration;
+  assert.ok(shared.targets?.build.dependsOn?.some(dependency =>
+    typeof dependency === 'object' && dependency.target === 'reader-build'
+      && Array.isArray(dependency.projects) && dependency.projects.length === 1 && dependency.projects[0] === 'loadtest'));
+  const script = readFileSync(path.join(root, 'projects/loadtest/scripts/build-reader-bundle.sh'), 'utf8');
+  assert.ok(script.indexOf('cargo build --locked --package delta-inspect') < script.indexOf('install -m 0755'));
+  assert.ok(script.indexOf('--package arrowcol-sdk-gen') < script.indexOf('install -m 0755'));
+  assert.match(script, /static_root="\$target_root\/loadtest-static"/u);
+  assert.match(script, /"\$static_root\/x86_64-unknown-linux-gnu\/debug\/\$binary"/u);
+});
+
+test('real publisher services use an init and source layout overrides reach both collectors', () => {
+  for (const service of ['direct-1', 'dataflow-1', 'tenant-stream', 'delta-maintenance']) {
+    assert.equal(compose.services[service].init, true, `${service} must reap Azure CLI descendants`);
+  }
+  for (const service of ['direct-1', 'dataflow-1']) {
+    assert.equal(compose.services[service].environment?.ARROWCOL_LAYOUT_ROW_GROUP_ROWS, '${ARROWCOL_LAYOUT_ROW_GROUP_ROWS:-16384}');
+    assert.equal(compose.services[service].environment?.ARROWCOL_LAYOUT_PAGE_ROWS, '${ARROWCOL_LAYOUT_PAGE_ROWS:-2048}');
+  }
+});
+
+test('real maintenance and tenant images are optional, build-covered, and use isolated writable roots', () => {
+  const project = JSON.parse(readFileSync(path.join(root, 'projects/loadtest/project.json'), 'utf8'));
+  const images = project.targets.build.dependsOn.find((dependency: unknown) =>
+    typeof dependency === 'object' && dependency !== null && 'target' in dependency && dependency.target === 'image').projects;
+  for (const [service, profile, image] of [
+    ['tenant-stream', 'tenant', 'arrow-tenant-stream'],
+    ['delta-maintenance', 'maintenance', 'delta-maintenance'],
+  ]) {
+    assert.deepEqual(compose.services[service].profiles, [profile]);
+    assert.equal(compose.services[service].image, `ghcr.io/mdrakiburrahman/rust-playground/${image}:dev`);
+    assert(images.includes(image));
+    assert(project.implicitDependencies.includes(image));
+  }
+  const tenant = compose.services['tenant-stream'];
+  assert(tenant.volumes?.some(volume => typeof volume === 'object' && volume.target === '/delta/direct' && volume.read_only));
+  assert(tenant.volumes?.some(volume => typeof volume === 'object' && volume.target === '/checkpoints' && !volume.read_only));
+  const maintenance = compose.services['delta-maintenance'];
+  assert(maintenance.volumes?.some(volume => typeof volume === 'object' && volume.target === '/tmp/arrowcol-stress/direct'));
+  assert(!maintenance.command?.includes('--unsafe-short-vacuum-for-tests'));
+});
 
 test('stack includes SQL, Hive, router, one collector per pool, Kusto, monitoring and validator', () => {
   const names = Object.keys(compose.services);
@@ -46,7 +136,7 @@ test('stack includes SQL, Hive, router, one collector per pool, Kusto, monitorin
 test('Kusto is pinned, memory-bounded, loopback-only and keeps its documented default startup', () => {
   const kusto = compose.services.kusto;
   assert.match(kusto.image ?? '', /^mcr\.microsoft\.com\/azuredataexplorer\/kustainer-linux@sha256:[0-9a-f]{64}$/u);
-  assert.equal(kusto.mem_limit, '${KUSTO_MEMORY_LIMIT:-4g}');
+  assert.equal(kusto.mem_limit, '${KUSTO_MEMORY_LIMIT:-6g}');
   assert.deepEqual(kusto.environment, { ACCEPT_EULA: 'Y' });
   assert.deepEqual(kusto.ports, ['127.0.0.1:${KUSTO_PORT:-8080}:8080']);
   assert.equal(kusto.entrypoint, undefined);

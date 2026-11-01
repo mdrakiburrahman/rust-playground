@@ -17,6 +17,9 @@ import {
 const workspace = fileURLToPath(new URL('../../../', import.meta.url));
 
 function projectPath(project: string): string {
+  if (project === 'delta-maintenance' || project === 'arrow-tenant-stream') {
+    return `crates/${project}/project.json`;
+  }
   return project === 'hello-world'
     ? 'bin/hello-world/project.json'
     : `projects/${project}/project.json`;
@@ -38,12 +41,15 @@ function workspaceProjects(): Record<string, ProjectConfiguration> {
   return projects;
 }
 
-test('discovers the five production images and retains the sample publication', () => {
+test('discovers production images and retains the sample publication', () => {
   assert.deepEqual(PRODUCTION_RUNTIME_IMAGE_PROJECTS, [
     'otelcol-rust',
     'arrowcol-rust',
     'arrowcol-dataflow-rust',
     'arrowcol-router-rust',
+    'kusto-bridge',
+    'delta-maintenance',
+    'arrow-tenant-stream',
     'kusto-explorer',
   ]);
   assert.deepEqual(RETAINED_RUNTIME_IMAGE_PROJECTS, ['hello-world']);
@@ -89,6 +95,40 @@ test('fails closed when a source-built publication is missing or unexpected', ()
   );
 });
 
+test('all seven loadtest images retain local build behavior with clean Git revision metadata', () => {
+  const expected = [
+    'arrowcol-rust', 'arrowcol-dataflow-rust', 'arrowcol-router-rust',
+    'kusto-explorer', 'kusto-bridge', 'arrow-tenant-stream', 'delta-maintenance',
+  ];
+  const loadtest = JSON.parse(readFileSync(join(workspace, 'projects/loadtest/project.json'), 'utf8')) as ProjectConfiguration;
+  const images = loadtest.targets?.build?.dependsOn?.filter(
+    dependency => typeof dependency === 'object' && dependency.target === 'image',
+  );
+  assert.deepEqual(images, [{ projects: expected, target: 'image' }]);
+  const projects = workspaceProjects();
+  for (const project of expected) {
+    const target = projects[project].targets?.image;
+    assert.equal(target?.executor, 'rust-playground-build:docker-build', project);
+    assert.equal(target?.cache, false, project);
+    const options = target?.options;
+    assert.equal(options?.file, '{absProjectRoot}/Dockerfile', project);
+    assert.equal(options?.context, '{absWorkspaceRoot}', project);
+    assert.equal(options?.image, `ghcr.io/mdrakiburrahman/rust-playground/${project}`, project);
+    assert.deepEqual(options?.tags, ['dev'], project);
+    assert.deepEqual(options?.platforms, ['linux/amd64'], project);
+    assert.equal(options?.output, 'load', project);
+    assert.equal(options?.manifestFile, `{absWorkspaceRoot}/target/images/${project}-load.txt`, project);
+    assert.deepEqual(options?.buildArgs, ['VCS_REF={gitSha}'], project);
+    assert.equal(options?.requireCleanWorktree, true, project);
+    const ci = target?.configurations?.['ci-verify'];
+    assert.equal(ci?.buildArgs, undefined, project);
+    assert.equal(ci?.requireCleanWorktree, undefined, project);
+    const dockerfile = readFileSync(join(workspace, projectPath(project).replace(/project\.json$/u, 'Dockerfile')), 'utf8');
+    assert.match(dockerfile, /^ARG VCS_REF=local$/mu, project);
+    assert.match(dockerfile, /org\.opencontainers\.image\.revision="\$\{VCS_REF\}"/u, project);
+  }
+});
+
 // Collector images compile the otel-arrow protobuf crates and bake read-only configuration files.
 const COLLECTOR_IMAGE_PROJECTS = [
   'otelcol-rust',
@@ -98,10 +138,11 @@ const COLLECTOR_IMAGE_PROJECTS = [
 ];
 // Web images compile a wasm UI and serve read-only static assets instead of configuration files.
 const WEB_IMAGE_PROJECTS = ['kusto-explorer'];
+const SERVICE_IMAGE_PROJECTS = ['kusto-bridge', 'delta-maintenance', 'arrow-tenant-stream'];
 
 test('every production runtime image is classified for Dockerfile policy', () => {
   assert.deepEqual(
-    [...COLLECTOR_IMAGE_PROJECTS, ...WEB_IMAGE_PROJECTS].sort(),
+    [...COLLECTOR_IMAGE_PROJECTS, ...WEB_IMAGE_PROJECTS, ...SERVICE_IMAGE_PROJECTS].sort(),
     [...PRODUCTION_RUNTIME_IMAGE_PROJECTS].sort(),
   );
 });
@@ -109,7 +150,7 @@ test('every production runtime image is classified for Dockerfile policy', () =>
 test('runtime Dockerfiles pin build and runtime bases and enforce production boundaries', () => {
   for (const project of PRODUCTION_RUNTIME_IMAGE_PROJECTS) {
     const dockerfile = readFileSync(
-      join(workspace, `projects/${project}/Dockerfile`),
+      join(workspace, projectPath(project).replace(/project\.json$/u, 'Dockerfile')),
       'utf8',
     );
     assert.match(
@@ -131,7 +172,18 @@ test('runtime Dockerfiles pin build and runtime bases and enforce production bou
       project,
     );
     assert.match(dockerfile, /COPY submodules\/otel-arrow/u, project);
-    assert.match(dockerfile, /ca-certificates curl/u, project);
+    if (dockerfile.includes('sh /tmp/install-azure-cli.sh')) {
+      assert.match(
+        dockerfile,
+        /COPY(?: --chmod=\d+)? infra\/docker\/install-azure-cli\.sh \/tmp\/install-azure-cli\.sh/u,
+        project,
+      );
+    } else {
+      assert.match(dockerfile, /ca-certificates/u, project);
+      if (!SERVICE_IMAGE_PROJECTS.includes(project)) {
+        assert.match(dockerfile, /ca-certificates curl/u, project);
+      }
+    }
     assert.match(
       dockerfile,
       /org\.opencontainers\.image\.source/u,
@@ -149,7 +201,7 @@ test('runtime Dockerfiles pin build and runtime bases and enforce production bou
     if (COLLECTOR_IMAGE_PROJECTS.includes(project)) {
       assert.match(dockerfile, /cmake protobuf-compiler/u, project);
       assert.match(dockerfile, /COPY --chmod=0444/u, project);
-    } else {
+    } else if (WEB_IMAGE_PROJECTS.includes(project)) {
       assert.match(dockerfile, /rustup target add wasm32-unknown-unknown/u, project);
       assert.match(
         dockerfile,
@@ -159,8 +211,55 @@ test('runtime Dockerfiles pin build and runtime bases and enforce production bou
       assert.match(dockerfile, /find \/out\/www -type d -exec chmod 0555/u, project);
       assert.match(dockerfile, /find \/out\/www -type f -exec chmod 0444/u, project);
       assert.match(dockerfile, /COPY --from=builder --chmod=0555/u, project);
+    } else {
+      assert.match(dockerfile, /(?:install (?:-D )?--mode=0555|COPY --from=builder --chmod=0555)/u, project);
+      assert.match(dockerfile, /COPY --from=builder/u, project);
     }
   }
+});
+
+test('Kernel consumer lint caches include their library dependencies', () => {
+  const projects = workspaceProjects();
+  for (const project of ['delta-maintenance', 'arrow-tenant-stream']) {
+    const config = projects[project];
+    assert(config, project);
+    assert(config.implicitDependencies?.includes('arrow-deltalake'), project);
+    assert.deepEqual(config.targets?.lint?.inputs, ['default', '^default'], project);
+  }
+});
+
+test('Azure writer images install the shared CLI and reap orphan descendants', () => {
+  for (const project of ['arrowcol-rust', 'arrowcol-dataflow-rust', 'delta-maintenance', 'arrow-tenant-stream']) {
+    const dockerfile = readFileSync(
+      join(workspace, projectPath(project).replace(/project\.json$/u, 'Dockerfile')),
+      'utf8',
+    );
+    assert.match(dockerfile, /sh \/tmp\/install-azure-cli\.sh/u, project);
+    assert.match(
+      dockerfile,
+      /COPY(?: --chmod=\d+)? infra\/docker\/install-azure-cli\.sh \/tmp\/install-azure-cli\.sh/u,
+      project,
+    );
+    assert.match(dockerfile, /ENTRYPOINT \[\s*"\/usr\/bin\/tini"/u, project);
+  }
+});
+
+test('shared CLI helper installs TLS prerequisites through a signed pinned repository', () => {
+  const helper = readFileSync(join(workspace, 'infra/docker/install-azure-cli.sh'), 'utf8');
+  assert.match(helper, /apt-get install -y --no-install-recommends ca-certificates curl gpg/u);
+  assert.match(helper, /sha256sum --check --strict -/u);
+  assert.match(helper, /signed-by=\/usr\/share\/keyrings\/arrowcol-azure-cli\.gpg/u);
+  assert.match(helper, /apt-get install -y --no-install-recommends azure-cli=\d+\.\d+\.\d+-1~bookworm/u);
+});
+
+test('Explorer context override retains root exclusions before browser-only exclusions', () => {
+  const patterns = (file: string): string[] => readFileSync(join(workspace, file), 'utf8')
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith('#'));
+  const root = patterns('.dockerignore');
+  const explorer = patterns('projects/kusto-explorer/Dockerfile.dockerignore');
+  assert.deepEqual(explorer.slice(0, root.length), root);
 });
 
 interface PublishWorkflow {
@@ -223,10 +322,14 @@ test('publish workflow discovers, smokes, publishes, and verifies the matrix wit
 
   const paths = new Set(workflow.on.push.paths);
   for (const project of PRODUCTION_RUNTIME_IMAGE_PROJECTS) {
-    assert(paths.has(`projects/${project}/**`), project);
+    const source = projectPath(project).startsWith('crates/')
+      ? 'crates/**'
+      : `projects/${project}/**`;
+    assert(paths.has(source), project);
   }
   assert(paths.has('bin/hello-world/**'));
   assert(paths.has('crates/**'));
+  assert(paths.has('infra/docker/**'));
   assert(paths.has('submodules/otel-arrow'));
   assert(paths.has('submodules/otel-arrow/**'));
   assert(paths.has('tools/libs/rust-playground-build/**'));

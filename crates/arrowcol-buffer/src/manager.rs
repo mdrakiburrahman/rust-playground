@@ -13,8 +13,8 @@ use arrowcol_protocol::{
     fingerprint_schema,
 };
 use arrowcol_receipts::{
-    FailureDisposition, PublicationBatch, ReceiptFailure, ReceiptRecord, ReceiptStore, ReceiptVersion,
-    ValidatedDelivery,
+    FailureDisposition, PublicationBatch, ReceiptErrorKind, ReceiptFailure, ReceiptRecord, ReceiptStore,
+    ReceiptVersion, ValidatedDelivery,
 };
 use tokio::sync::{Notify, Semaphore, oneshot};
 use tokio::time::Instant;
@@ -72,7 +72,7 @@ pub enum TrackedState {
     /// The receipt is already `buffered` by the admitting owner.
     Buffered,
     /// The receipt is already `flushing`; its earlier publication outcome is
-    /// unknown, so the delivery is published again (at least once).
+    /// unknown, so publication is retried with the same stable transaction.
     Flushing,
 }
 
@@ -214,6 +214,7 @@ struct QueueContext {
 
 struct QueuedDelivery {
     receipt: ReceiptVersion,
+    ingested_at_ms: UnixMillis,
     batches: Vec<RecordBatch>,
     already_flushing: bool,
     completion: Option<oneshot::Sender<DeliveryOutcome>>,
@@ -328,7 +329,8 @@ impl BufferManager {
     ///
     /// Returns validation, capacity, receipt-store, poison, or shutdown errors.
     pub async fn admit(self: &Arc<Self>, admission: Admission) -> BufferResult<ReceiptRecord> {
-        self.admit_inner(admission, TrackedState::Accepted, None).await
+        self.admit_inner(admission, TrackedState::Accepted, None, now_unix_millis()?)
+            .await
     }
 
     /// Admits one delivery from a local durable stage and returns a completion
@@ -339,6 +341,10 @@ impl BufferManager {
     /// deliveries can be published by their (adopting) owner. The returned
     /// record is the receipt as admitted.
     ///
+    /// The caller must retain its durable payload on `Unknown` and reconcile
+    /// the receipt before retrying. A transient SQL error before publication
+    /// returns that outcome without permanently poisoning the table.
+    ///
     /// # Errors
     ///
     /// Returns validation, capacity, receipt-store, poison, or shutdown errors.
@@ -347,8 +353,25 @@ impl BufferManager {
         admission: Admission,
         state: TrackedState,
     ) -> BufferResult<(ReceiptVersion, DeliveryCompletion)> {
+        self.admit_tracked_at(admission, state, now_unix_millis()?).await
+    }
+
+    /// Admits durable work with its original UTC admission timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation, capacity, receipt, and lifecycle errors as
+    /// [`Self::admit_tracked`].
+    pub async fn admit_tracked_at(
+        self: &Arc<Self>,
+        admission: Admission,
+        state: TrackedState,
+        ingested_at_ms: UnixMillis,
+    ) -> BufferResult<(ReceiptVersion, DeliveryCompletion)> {
         let (sender, receiver) = oneshot::channel();
-        let receipt = self.admit_tracked_inner(admission, state, sender).await?;
+        let receipt = self
+            .admit_tracked_inner(admission, state, sender, ingested_at_ms)
+            .await?;
         Ok((receipt, DeliveryCompletion { receiver }))
     }
 
@@ -387,14 +410,17 @@ impl BufferManager {
         admission: Admission,
         timeout: Duration,
     ) -> BufferResult<ReceiptRecord> {
-        tokio::time::timeout(timeout, self.admit_inner(admission, TrackedState::Accepted, None))
-            .await
-            .map_err(|_| {
-                BufferError::new(
-                    BufferErrorKind::BackpressureTimeout,
-                    "timed out waiting for bounded buffer capacity",
-                )
-            })?
+        tokio::time::timeout(
+            timeout,
+            self.admit_inner(admission, TrackedState::Accepted, None, now_unix_millis()?),
+        )
+        .await
+        .map_err(|_| {
+            BufferError::new(
+                BufferErrorKind::BackpressureTimeout,
+                "timed out waiting for bounded buffer capacity",
+            )
+        })?
     }
 
     /// Flushes every currently queued table/schema group without closing admission.
@@ -453,9 +479,12 @@ impl BufferManager {
         admission: Admission,
         state: TrackedState,
         completion: oneshot::Sender<DeliveryOutcome>,
+        ingested_at_ms: UnixMillis,
     ) -> BufferResult<ReceiptVersion> {
         if state == TrackedState::Accepted {
-            let record = self.admit_inner(admission, state, Some(completion)).await?;
+            let record = self
+                .admit_inner(admission, state, Some(completion), ingested_at_ms)
+                .await?;
             return Ok(ReceiptVersion::new(record.receipt_id, record.revision));
         }
         let _admission_guard = self.start_admission()?;
@@ -466,6 +495,7 @@ impl BufferManager {
             context,
             QueuedDelivery {
                 receipt: admission.receipt,
+                ingested_at_ms,
                 batches: admission.batches,
                 already_flushing: state == TrackedState::Flushing,
                 completion: Some(completion),
@@ -482,6 +512,7 @@ impl BufferManager {
         admission: Admission,
         state: TrackedState,
         completion: Option<oneshot::Sender<DeliveryOutcome>>,
+        ingested_at_ms: UnixMillis,
     ) -> BufferResult<ReceiptRecord> {
         debug_assert_eq!(state, TrackedState::Accepted);
         let _admission_guard = self.start_admission()?;
@@ -533,6 +564,7 @@ impl BufferManager {
             context,
             QueuedDelivery {
                 receipt: buffered_version,
+                ingested_at_ms,
                 batches: admission.batches,
                 already_flushing: false,
                 completion,
@@ -751,12 +783,27 @@ impl BufferManager {
             {
                 Ok(flushing) => flushing,
                 Err(error) => {
-                    return incomplete_job(
-                        job,
-                        &format!("could not persist flushing transition: {error}"),
-                        None,
-                        Some("receipt store failed before publication".to_owned()),
-                    );
+                    if matches!(error.kind(), ReceiptErrorKind::Database | ReceiptErrorKind::Conflict)
+                        && job.entries.iter().all(|entry| entry.completion.is_some())
+                    {
+                        // Delta has not been called. The durable owner can
+                        // re-read SQL even if the transition committed but its
+                        // response was lost, then replay the same receipt ID.
+                        tracing::warn!(
+                            table = %job.context.table,
+                            %error,
+                            kind = ?error.kind(),
+                            "durable publication awaiting receipt reconciliation before retry"
+                        );
+                        return JobResult {
+                            observation: None,
+                            incomplete: None,
+                            poison: None,
+                            outcome: DeliveryOutcome::Unknown,
+                        };
+                    }
+                    let reason = format!("could not persist flushing transition: {error}");
+                    return incomplete_job(job, &reason, None, Some(reason.clone()));
                 }
             }
         };
@@ -820,9 +867,16 @@ impl BufferManager {
     }
 
     async fn publish_job(&self, job: &FlushJob) -> Result<PublicationOutcome, SinkError> {
+        let entry = job
+            .entries
+            .first()
+            .ok_or_else(|| SinkError::retryable("empty publication job"))?;
+        debug_assert_eq!(job.entries.len(), 1);
         let mut session = self
             .sink
             .begin(PublicationContext {
+                receipt_id: entry.receipt.receipt_id,
+                ingested_at_ms: entry.ingested_at_ms,
                 table: job.context.table.clone(),
                 schema_version: job.context.schema_version,
                 schema_fingerprint: job.context.schema_fingerprint,
@@ -846,6 +900,16 @@ impl BufferManager {
         sink_error: &SinkError,
     ) -> (Option<IncompleteWork>, Option<IncompleteWork>) {
         let message = safe_error_message(sink_error.message());
+        for entry in &job.entries {
+            tracing::warn!(
+                table = %job.context.table,
+                receipt_id = %entry.receipt.receipt_id,
+                sink_kind = ?sink_error.kind(),
+                sink_code = ?sink_error.code(),
+                error_message = %message,
+                "Delta publication failed"
+            );
+        }
         let error = match ErrorStatus::new(sink_error.code(), message) {
             Ok(error) => error,
             Err(cause) => {
@@ -922,6 +986,7 @@ impl BufferManager {
                 table.poisoned = Some(format!("adaptive estimator rejected durable observation: {error}"));
             }
             if let Some(reason) = result.poison.or_else(|| table.poisoned.clone()) {
+                tracing::error!(table = %table.identity, %reason, "table publication failed closed");
                 table.poisoned = Some(reason.clone());
                 if let Some(queue) = table.queue.take() {
                     drained_incomplete.push(incomplete_from_entries(
@@ -1280,11 +1345,15 @@ fn detach_queue(table: &mut TableState, reason: FlushReason) {
     if let Some(queue) = table.queue.take()
         && !queue.entries.is_empty()
     {
-        table.pending.push_back(FlushJob {
-            context: queue.context,
-            entries: queue.entries,
-            reason,
-        });
+        // Replay can regroup receipts differently. Each file and completion
+        // must therefore retain one publication identity, not a flush identity.
+        for entry in queue.entries {
+            table.pending.push_back(FlushJob {
+                context: queue.context.clone(),
+                entries: vec![entry],
+                reason,
+            });
+        }
     }
 }
 
@@ -1403,9 +1472,73 @@ fn receipt_error(error: arrowcol_receipts::ReceiptError) -> BufferError {
     BufferError::new(BufferErrorKind::ReceiptStore, error.to_string())
 }
 
-fn safe_error_message(message: &str) -> String {
-    let mut safe = String::with_capacity(message.len().min(1_024));
-    for character in message.chars() {
+/// Redacts credentials, URIs, absolute paths and private identifiers from sink diagnostics.
+///
+/// Preserves causal text, replaces sensitive values with `[REDACTED]`, removes
+/// control characters and bounds the result to 1,024 UTF-8 bytes. Redaction runs
+/// before truncation, so a partially truncated credential cannot escape.
+#[must_use]
+pub fn safe_error_message(message: &str) -> String {
+    use std::borrow::Cow;
+    use std::sync::LazyLock;
+
+    use regex::Regex;
+
+    // Match loadgen kusto::redact_text (34b899) URI/path/GUID/UPN/JWT canaries
+    // and auth-automation's named-secret/Bearer replacement convention.
+    static REDACTIONS: LazyLock<Result<Vec<(Regex, &'static str)>, regex::Error>> = LazyLock::new(|| {
+        [
+            (
+                r#"(?i)\b(?:authorization|proxy-authorization)\s*[:=]\s*(?:"[^"]*"|'[^']*'|(?:bearer|basic)\s+[^\s,;]+|[^\s,;]+)"#,
+                "[REDACTED]",
+            ),
+            (r"(?i)\bbearer\s+[a-z0-9._~+/\-=]+", "[REDACTED]"),
+            (
+                r#"(?i)["']?\b(?:password|pwd|account_?key|key|accountname|sharedaccesssignature|sharedaccesskey|access[_-]?token|refresh[_-]?token|client[_-]?secret|sig|se|sv|sp)["']?\s*[:=]\s*(?:"[^"]*"|'[^']*'|\{(?:[^}]|}})*\}|[^\s;,&"'<>]+)"#,
+                "[REDACTED]",
+            ),
+            (
+                r#"(?i)(?:"[a-z][a-z0-9+.-]*://[^"]*"|'[a-z][a-z0-9+.-]*://[^']*')"#,
+                "[REDACTED]",
+            ),
+            (
+                r#"(?i)\b[a-z][a-z0-9+.-]*://[^\s"'<>)\]}]+"#,
+                "[REDACTED]",
+            ),
+            (
+                r"\b[a-zA-Z0-9_-]{8,}\.[a-zA-Z0-9_-]{8,}\.[a-zA-Z0-9_-]{8,}\b",
+                "[REDACTED]",
+            ),
+            (
+                r"(?i)\beyj[a-z0-9._-]{29,}",
+                "[REDACTED]",
+            ),
+            (
+                r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+                "[REDACTED]",
+            ),
+            (
+                r#"[^\s"'`()\[\]{},;<>:@]+@[^\s"'`()\[\]{},;<>:@]+\.[^\s"'`()\[\]{},;<>:@]+"#,
+                "[REDACTED]",
+            ),
+            (r#"["'](?:/|[a-zA-Z]:[\\/]|\\\\)[^"']*["']"#, "[REDACTED]"),
+            (r#"\b[a-zA-Z]:[\\/][^\s"'<>),;\]}]+"#, "[REDACTED]"),
+            (r#"\\\\[^\s"'<>),;\]}]+"#, "[REDACTED]"),
+            (r#"(^|[\s"'(=,:])[/\\][^\s"'<>),;:\]}]+"#, " [REDACTED]"),
+        ]
+        .into_iter()
+        .map(|(pattern, replacement)| Regex::new(pattern).map(|regex| (regex, replacement)))
+        .collect()
+    });
+    let Ok(redactions) = REDACTIONS.as_ref() else {
+        return "publication failed (diagnostic redaction unavailable)".to_owned();
+    };
+    let mut redacted = Cow::Borrowed(message);
+    for (pattern, replacement) in redactions {
+        redacted = Cow::Owned(pattern.replace_all(&redacted, *replacement).into_owned());
+    }
+    let mut safe = String::with_capacity(redacted.len().min(1_024));
+    for character in redacted.chars() {
         if safe.len() >= 1_024 {
             break;
         }
@@ -1419,5 +1552,164 @@ fn safe_error_message(message: &str) -> String {
         "publication failed".to_owned()
     } else {
         safe
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_error_message;
+
+    const CANARY_ERROR: &str = concat!(
+        "transient publication failed: Int16 vs UInt8; ",
+        "https://canary-user:canary-url-password@canary-host.invalid/canary-url-path?sig=canary-url-sig&se=canary-expiry; ",
+        "sv=canary-sv&sp=canary-sp&sig=canary-sas; ",
+        "Authorization: Bearer canary-auth-token; Bearer canary-bearer-token; ",
+        "abfss://canary-container@canary-account.dfs.core.windows.net/canary-storage-path; ",
+        "https://canary-blob.blob.core.windows.net/canary-blob-container/canary-blob-path; ",
+        "private tenant 01234567-89ab-cdef-0123-456789abcdef; ",
+        "Password=canary-password;AccountKey=canary-account-key;SharedAccessSignature=canary-connection-sas; ",
+        "file:///canary-file/path; /canary-local/path; C:\\canary-windows\\path; \\\\canary-server\\share; ",
+        "eyJhbGciOiJIUzI1NiJ9.eyJjYW5hcnkiOiJwcml2YXRlIn0.canaryJWTsignature"
+    );
+
+    #[test]
+    fn runner_jsonl_spaced_quoted_secrets_and_basic_auth_are_redacted() -> anyhow::Result<()> {
+        let cause = "unsupported UInt8 statistic https://private.example/path?sig=credential C:\\Users\\private\\table \
+                 /private/table 12345678-1234-1234-1234-123456789abc Password=opaque-secret \
+                 Authorization: Bearer opaque-token AccountKey = spaced-secret key = second-secret \
+                 abfss://private@account.dfs.core.windows.net/root Password=\"three word credential\" \
+                 Password = \"combined private credential\" AccountKey : 'joined private words' \
+                 Authorization:Basic opaque-basic-token Password = \"https://private.example quoted url-secret\"";
+        let safe = safe_error_message(cause);
+        let mut receipt_jsonl = serde_json::to_string(&serde_json::json!({ "error_message": safe }))?;
+        receipt_jsonl.push('\n');
+        let mut admission_jsonl = serde_json::to_string(&serde_json::json!({ "error": safe }))?;
+        admission_jsonl.push('\n');
+        for jsonl in [&receipt_jsonl, &admission_jsonl] {
+            assert!(jsonl.contains("unsupported UInt8 statistic"));
+            for canary in [
+                "private.example",
+                "credential",
+                "C:\\",
+                "/private",
+                "opaque-secret",
+                "opaque-token",
+                "spaced-secret",
+                "second-secret",
+                "private@account",
+                "three word",
+                "combined",
+                "joined",
+                "private words",
+                "opaque-basic-token",
+                "url-secret",
+                "quoted",
+            ] {
+                assert!(!jsonl.contains(canary), "leaked runner JSONL canary: {canary}");
+            }
+        }
+        for message in [
+            r#"schema Int16 vs UInt8: password = "two words here""#,
+            "schema Int16 vs UInt8: client_secret : 'a b c'",
+            "schema Int16 vs UInt8: Authorization: Basic opaque-basic-token",
+            r#"schema Int16 vs UInt8: "https://private.example/path?sig=credential quoted url-secret""#,
+            "schema Int16 vs UInt8: 'https://private.example/path?sig=credential quoted url-secret'",
+        ] {
+            let safe = safe_error_message(message);
+            assert!(safe.contains("schema Int16 vs UInt8"));
+            for canary in [
+                "two words",
+                "a b c",
+                "opaque-basic-token",
+                "private.example",
+                "credential",
+                "quoted",
+                "url-secret",
+            ] {
+                assert!(!safe.contains(canary), "leaked quoted-secret canary: {canary}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn direct_warn_and_receipt_diagnostics_redact_canaries_but_keep_schema_cause() -> anyhow::Result<()> {
+        let error = crate::SinkError::retryable(CANARY_ERROR);
+        let message = safe_error_message(error.message());
+        let receipt_error = arrowcol_protocol::ErrorStatus::new(error.code(), message.clone())?;
+        assert_eq!(receipt_error.message(), message);
+        assert!(!message.contains("canary"), "{message}");
+        assert!(!message.contains("01234567-89ab-cdef-0123-456789abcdef"));
+        assert!(!message.contains("eyJ"));
+        assert!(message.contains("transient publication failed: Int16 vs UInt8"));
+        assert!(message.contains("[REDACTED]"));
+        Ok(())
+    }
+
+    #[test]
+    fn sensitive_values_are_redacted_before_byte_truncation() {
+        for value in [
+            "Authorization=Basic canary-basic-token",
+            r#"password="canary password with spaces""#,
+            "Pwd={canary password;with semicolon}",
+            r#"{"client_secret":"canary-secret","access_token":"canary-token"}"#,
+            r#""/canary folder/private file""#,
+            r#""C:\canary folder\private file""#,
+        ] {
+            assert!(!safe_error_message(value).contains("canary"));
+        }
+        let message = format!(
+            "{} https://canary-user:canary-password@canary-host.invalid",
+            "x".repeat(1_000)
+        );
+        assert!(!safe_error_message(&message).contains("canary"));
+        assert_eq!(
+            safe_error_message("schema Int16/UInt8: permanent mismatch"),
+            "schema Int16/UInt8: permanent mismatch"
+        );
+    }
+
+    #[test]
+    fn native_client_canaries_and_diagnostic_contract_stay_aligned() {
+        let message = concat!(
+            "Partial query failure: abfss://private@acct.dfs.core.windows.net/x?sig=CANARYSIG ",
+            "on /subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg identity ",
+            "99999999-aaaa-bbbb-cccc-dddddddddddd ",
+            "bearer eyJhbGciOiJIUzI1NiJ9.privateCanaryJwtPayload.privateCanarySignature ",
+            "/delta/private/x C:\\privateCanaryWindows\\x;Password=privateCanaryPassword; ",
+            r#"{"client_secret":"privateCanarySecret"} authorization: Bearer privateCanaryOpaqueToken "#,
+            "privateCanaryUser@example.invalid: schema Int16 vs UInt8"
+        );
+        let safe = safe_error_message(message);
+        for canary in [
+            "CANARYSIG",
+            "acct.dfs",
+            "11111111-1111",
+            "99999999-aaaa",
+            "eyJhbGciOi",
+            "/delta/private",
+            "privateCanary",
+        ] {
+            assert!(!safe.contains(canary), "{canary} leaked: {safe}");
+        }
+        assert!(safe.contains("Partial query failure"));
+        assert!(safe.contains("schema Int16 vs UInt8"));
+        assert_eq!(
+            safe_error_message("TableVersion 4 at 2026-10-27T03:41:46Z"),
+            "TableVersion 4 at 2026-10-27T03:41:46Z"
+        );
+        let bounded = safe_error_message(&format!("{}\n", "界".repeat(1_100)));
+        assert!(bounded.chars().count() <= 1_024);
+        assert!(bounded.len() <= 1_024);
+        assert!(!bounded.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn sink_diagnostics_are_bounded_control_free_and_utf8_safe() {
+        assert_eq!(safe_error_message(""), "publication failed");
+        assert_eq!(safe_error_message("outer:\ninner\tcause\u{1b}"), "outer: inner cause ");
+        assert_eq!(safe_error_message(&"é".repeat(600)), "é".repeat(512));
+        assert_eq!(safe_error_message(&"x".repeat(1_025)).len(), 1_024);
+        assert_eq!(safe_error_message("safe error chain"), "safe error chain");
     }
 }

@@ -26,6 +26,25 @@ pub enum CollectorState {
     Failed,
 }
 
+impl CollectorState {
+    /// Returns whether a recorded state may change to `next`.
+    ///
+    /// One collector process can have several writers for its routing row
+    /// (per-core receivers, heartbeat loops, shutdown). State therefore only
+    /// advances `Ready -> Draining -> Stopped | Failed`; repeating the current
+    /// state is an idempotent no-op, and a terminal state never changes.
+    #[must_use]
+    pub const fn may_transition_to(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (Self::Ready, _)
+                | (Self::Draining, Self::Draining | Self::Stopped | Self::Failed)
+                | (Self::Stopped, Self::Stopped)
+                | (Self::Failed, Self::Failed)
+        )
+    }
+}
+
 /// Readiness state for a collector subsystem.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]

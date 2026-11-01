@@ -81,6 +81,13 @@ enum Request {
         SchemaRef,
         oneshot::Sender<std::result::Result<DeltaFileWriter, CommitReceiptError>>,
     ),
+    NewPublication(
+        SchemaRef,
+        String,
+        i64,
+        i64,
+        oneshot::Sender<std::result::Result<DeltaFileWriter, CommitReceiptError>>,
+    ),
     Publish(Box<Publication>),
 }
 
@@ -174,14 +181,30 @@ impl BatchedTable {
         Self::open_inner(root, options, Some(publication_fence)).await
     }
 
+    /// Share a fenced publication coordinator for a local path or canonical ADLS URI.
+    ///
+    /// # Errors
+    /// Rejects inconsistent options, invalid authority or worker startup failures.
+    pub async fn open_uri_with_fence(
+        root: &str,
+        options: CommitOptions,
+        publication_fence: Arc<dyn PublicationFence>,
+    ) -> Result<Arc<Self>> {
+        Self::open_inner(Path::new(root), options, Some(publication_fence)).await
+    }
+
     async fn open_inner(
         root: impl AsRef<Path>,
         options: CommitOptions,
         publication_fence: Option<Arc<dyn PublicationFence>>,
     ) -> Result<Arc<Self>> {
         options.validate()?;
-        tokio::fs::create_dir_all(root.as_ref()).await?;
-        let root = tokio::fs::canonicalize(root).await?;
+        let root = if root.as_ref().to_str().is_some_and(|root| root.contains("://")) {
+            root.as_ref().to_path_buf()
+        } else {
+            tokio::fs::create_dir_all(root.as_ref()).await?;
+            tokio::fs::canonicalize(root).await?
+        };
         loop {
             let (owner, mut stopped) = {
                 let mut registry = TABLES.lock().map_err(|_| anyhow::anyhow!("Delta registry poisoned"))?;
@@ -278,6 +301,28 @@ impl BatchedTable {
             .map_err(anyhow::Error::new)
     }
 
+    /// Create a file carrying the stable identity and stamp of one admitted publication.
+    ///
+    /// # Errors
+    /// Returns schema, fencing, partition or worker failures.
+    pub async fn new_file_with_publication(
+        &self,
+        schema: SchemaRef,
+        app_id: String,
+        version: i64,
+        ingested_at_ms: i64,
+    ) -> Result<DeltaFileWriter> {
+        let (reply, receive) = oneshot::channel();
+        self.sender
+            .send(Request::NewPublication(schema, app_id, version, ingested_at_ms, reply))
+            .await
+            .context("Delta worker stopped")?;
+        receive
+            .await
+            .context("Delta worker stopped during publication preparation")?
+            .map_err(anyhow::Error::new)
+    }
+
     /// Admit one eligible durable file, waiting asynchronously when capacity is full.
     ///
     /// # Errors
@@ -329,7 +374,11 @@ fn run_worker(
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build();
     let table = publication_fence.map_or_else(
         || DeltaTable::open(root),
-        |publication_fence| DeltaTable::open_with_fence(root, publication_fence),
+        |publication_fence| {
+            root.to_str()
+                .context("invalid table URI")
+                .and_then(|root| DeltaTable::open_uri_with_fence(root, publication_fence))
+        },
     );
     let mut failure = table
         .as_ref()
@@ -409,6 +458,17 @@ fn run_worker(
                         }
                         let _ = reply.send(result);
                     }
+                    Some(Request::NewPublication(schema, app_id, version, stamp, reply)) => {
+                        let result = match (&table, &failure) {
+                            (Ok(table), None) => table
+                                .new_file_with_publication(schema, app_id, version, stamp)
+                                .map_err(CommitReceiptError::from_anyhow),
+                            _ => Err(failure.clone().unwrap_or_else(|| {
+                                CommitReceiptError::commit_failed("Delta table initialization failed")
+                            })),
+                        };
+                        let _ = reply.send(result);
+                    }
                     Some(Request::Publish(publication)) => {
                         if let Some(error) = &failure {
                             let _ = publication.reply.send(Err(error.clone()));
@@ -438,7 +498,7 @@ fn run_worker(
                     Request::Ready(reply) => {
                         let _ = reply.send(Err(message.clone()));
                     }
-                    Request::NewFile(_, reply) => {
+                    Request::NewFile(_, reply) | Request::NewPublication(_, _, _, _, reply) => {
                         let _ = reply.send(Err(message.clone()));
                     }
                     Request::Publish(publication) => {

@@ -8,17 +8,21 @@ use arrow_deltalake::commit::{BatchedTable, CommitReceiptError};
 use arrow_deltalake::delta::{DeltaFileWriter, PublicationFenceErrorKind};
 use arrowcol_catalog::SchemaVersion;
 use arrowcol_protocol::{
-    DeltaPublicationResult, ErrorCode, Measurement, PublicationFence, SchemaFingerprint, TableIdentity, TableLease,
-    UnixMillis,
+    DeltaPublicationResult, ErrorCode, Measurement, PublicationFence, ReceiptId, SchemaFingerprint, TableIdentity,
+    TableLease, UnixMillis,
 };
 use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::manager::FlushReason;
 
-/// Immutable metadata for one table/schema/fence flush group.
+/// Immutable metadata for one receipt's table/schema/fence publication.
 #[derive(Clone)]
 pub struct PublicationContext {
+    /// Stable server-generated identity of this independent publication.
+    pub receipt_id: ReceiptId,
+    /// UTC admission time, preserved unchanged through durable replay.
+    pub ingested_at_ms: UnixMillis,
     /// Portable table identity.
     pub table: TableIdentity,
     /// Exact registered incoming schema version.
@@ -201,7 +205,13 @@ impl PublicationSink for DeltaPublicationSink {
         }
         let writer = self
             .table
-            .new_file(context.arrow_schema)
+            .new_file_with_publication(
+                context.arrow_schema,
+                format!("arrowcol.publication.{}", context.receipt_id),
+                0,
+                i64::try_from(context.ingested_at_ms.get())
+                    .map_err(|_| SinkError::retryable("ingestion timestamp exceeds Delta range"))?,
+            )
             .await
             .map_err(|cause| SinkError::retryable(format!("create Delta data file: {cause:#}")))?;
         Ok(Box::new(DeltaSession {

@@ -9,6 +9,11 @@ repository.workspace = true
 description = "DFE-based arbitrary Arrow Flight collector"
 
 [dependencies]
+arrowcol-buffer = { path = "../../crates/arrowcol-buffer" }
+arrow-deltalake = { path = "../../crates/arrow-deltalake" }
+delta_kernel = { version = "=0.29.0", default-features = false }
+otel-arrow-dfe-telemetry = { path = "../../submodules/otel-arrow/rust/otap-dataflow/crates/telemetry" }
+tracing-subscriber = { workspace = true, features = ["registry"] }
 arrowcol-dataflow-components = { path = "../../crates/arrowcol-dataflow-components" }
 otel-arrow-dfe = { path = "../../submodules/otel-arrow/rust/otap-dataflow", default-features = false, features = ["durable-buffer", "crypto-ring"] }
 

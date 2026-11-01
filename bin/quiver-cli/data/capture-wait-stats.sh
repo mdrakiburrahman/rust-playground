@@ -76,11 +76,11 @@ WHERE waiting_tasks_count > 0
 ORDER BY wait_type;
 SQL
 
-echo "sample_time_utc,sql_server_instance_name,machine_name,wait_type,wait_time_ms,resource_wait_time_ms,signal_wait_time_ms,max_wait_time_ms,waiting_tasks_count,wait_category"
+echo "customer_id,sample_time_utc,sql_server_instance_name,machine_name,wait_type,wait_time_ms,resource_wait_time_ms,signal_wait_time_ms,max_wait_time_ms,waiting_tasks_count,wait_category"
 for snapshot in $(seq 1 "$snapshots"); do
   docker exec -e SQLCMDPASSWORD="$password" "$container" /opt/mssql-tools18/bin/sqlcmd \
     -S localhost -U sa -C -b -h -1 -W -s ',' -Q "$query"
   if [ "$snapshot" -lt "$snapshots" ]; then
     sleep "$interval"
   fi
-done
+done | awk 'NF { printf "customer-%04d,%s\n", row++ % 16, $0 }'

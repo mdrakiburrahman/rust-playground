@@ -97,10 +97,25 @@ impl RoutingStore for MemoryRoutingStore {
         self.ensure_available()?;
         registration.validate()?;
         let mut state = self.state.lock().await;
+        let mut registration = registration.clone();
+        if let Some(existing) = state.collectors.get(&registration.instance_id) {
+            if existing.state != CollectorState::Ready {
+                return Err(RoutingError::new(
+                    RoutingErrorKind::Conflict,
+                    "collector registration was fenced: the instance already left the ready state",
+                ));
+            }
+            registration.heartbeat_at_unix_ms = registration
+                .heartbeat_at_unix_ms
+                .max(existing.registration.heartbeat_at_unix_ms);
+            registration.lease_expires_at_unix_ms = registration
+                .lease_expires_at_unix_ms
+                .max(existing.registration.lease_expires_at_unix_ms);
+        }
         state.collectors.insert(
             registration.instance_id,
             CollectorRecord {
-                registration: registration.clone(),
+                registration,
                 state: CollectorState::Ready,
                 pressure: None,
             },
@@ -122,14 +137,21 @@ impl RoutingStore for MemoryRoutingStore {
                 "collector registration was not found",
             )
         })?;
-        if heartbeat_at < collector.registration.heartbeat_at_unix_ms || lease_expires_at <= heartbeat_at {
+        if lease_expires_at <= heartbeat_at {
             return Err(RoutingError::new(
                 RoutingErrorKind::InvalidConfiguration,
                 "collector heartbeat timestamps are invalid",
             ));
         }
-        collector.registration.heartbeat_at_unix_ms = heartbeat_at;
-        collector.registration.lease_expires_at_unix_ms = lease_expires_at;
+        if !matches!(collector.state, CollectorState::Ready | CollectorState::Draining) {
+            return Err(RoutingError::new(
+                RoutingErrorKind::Conflict,
+                "collector heartbeat was fenced: the instance is missing or terminal",
+            ));
+        }
+        collector.registration.heartbeat_at_unix_ms = collector.registration.heartbeat_at_unix_ms.max(heartbeat_at);
+        collector.registration.lease_expires_at_unix_ms =
+            collector.registration.lease_expires_at_unix_ms.max(lease_expires_at);
         Ok(())
     }
 
@@ -147,14 +169,14 @@ impl RoutingStore for MemoryRoutingStore {
                 "collector registration was not found",
             )
         })?;
-        if changed_at < collector.registration.heartbeat_at_unix_ms {
+        if !collector.state.may_transition_to(new_state) {
             return Err(RoutingError::new(
-                RoutingErrorKind::InvalidConfiguration,
-                "collector state timestamp regressed",
+                RoutingErrorKind::Conflict,
+                "collector state change was fenced: the instance is missing or the transition would regress",
             ));
         }
         collector.state = new_state;
-        collector.registration.heartbeat_at_unix_ms = changed_at;
+        collector.registration.heartbeat_at_unix_ms = collector.registration.heartbeat_at_unix_ms.max(changed_at);
         Ok(())
     }
 

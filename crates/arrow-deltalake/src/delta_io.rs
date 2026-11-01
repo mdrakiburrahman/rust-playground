@@ -12,6 +12,7 @@ pub(crate) const READ_AHEAD: usize = 8;
 pub(crate) const BATCH_ROWS: usize = 256;
 const WORKERS: usize = 2;
 const BLOCKING_WORKERS: usize = 32;
+const UPLOAD_LIMIT: usize = 32;
 const TASK_LIMIT: usize = 64;
 
 static EXECUTOR: OnceLock<std::result::Result<Arc<SharedExecutor>, String>> = OnceLock::new();
@@ -29,11 +30,29 @@ pub(crate) fn shared_executor() -> Result<Arc<SharedExecutor>> {
     }
 }
 
+/// Spawn a process-lifetime asynchronous owner, independent of the caller's runtime.
+///
+/// Tasks must not block or call synchronous `DeltaTable` APIs on the I/O workers.
+/// Use the bounded executor's `spawn_blocking` for synchronous work, or an existing
+/// asynchronous API. File encoding and sorting must retain their batch/sort budgets.
+/// This does not acquire Kernel task admission; callers must bound owner counts.
+///
+/// # Errors
+/// Returns failure to initialize the process-wide I/O runtime.
+pub fn spawn_shared_io<F, T>(future: F) -> Result<tokio::task::JoinHandle<T>>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    Ok(shared_executor()?.runtime.spawn(future))
+}
+
 #[derive(Debug)]
 pub(crate) struct SharedExecutor {
     runtime: Runtime,
     admission: Arc<Admission>,
     blocking_admission: Arc<tokio::sync::Semaphore>,
+    upload_admission: Arc<tokio::sync::Semaphore>,
     background_failure: Arc<Mutex<Option<String>>>,
 }
 
@@ -87,8 +106,21 @@ impl SharedExecutor {
             runtime,
             admission: Arc::new(Admission::default()),
             blocking_admission: Arc::new(tokio::sync::Semaphore::new(BLOCKING_WORKERS)),
+            upload_admission: Arc::new(tokio::sync::Semaphore::new(UPLOAD_LIMIT)),
             background_failure: Arc::new(Mutex::new(None)),
         })
+    }
+
+    pub(crate) async fn upload_slot(&self) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.upload_admission)
+            .acquire_owned()
+            .await
+            .context("Delta upload admission failed")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn available_upload_slots(&self) -> usize {
+        self.upload_admission.available_permits()
     }
 
     fn check_background_failure(&self) {
@@ -201,6 +233,48 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn spawned_owner_survives_caller_runtime_drop() -> Result<()> {
+        let caller = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        let (release, task) = caller.block_on(async {
+            let (release, wait) = tokio::sync::oneshot::channel();
+            let task = spawn_shared_io(async move {
+                wait.await?;
+                Ok::<_, anyhow::Error>(42)
+            })?;
+            Ok::<_, anyhow::Error>((release, task))
+        })?;
+        drop(caller);
+        let remaining = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        remaining.block_on(async {
+            release
+                .send(())
+                .map_err(|()| anyhow::anyhow!("owner stopped with caller runtime"))?;
+            assert_eq!(tokio::time::timeout(Duration::from_secs(5), task).await???, 42);
+            Ok(())
+        })
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawned_owner_offloads_sync_delta_calls() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let task = spawn_shared_io(async move {
+            let executor = shared_executor()?;
+            executor
+                .spawn_blocking(move || {
+                    use arrow::datatypes::{DataType, Field, Schema};
+                    let table = crate::delta::DeltaTable::open(directory.path())?;
+                    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+                    let _file = table.new_file(schema)?;
+                    assert_eq!(table.lookup_txn("shared-owner-regression")?, None);
+                    Ok::<(), anyhow::Error>(())
+                })
+                .await?
+        })?;
+        tokio::time::timeout(Duration::from_secs(5), task).await???;
+        Ok(())
+    }
 
     /// Scenario: a synchronous caller has no Tokio runtime.
     /// Guarantees: the shared runtime executes timers and survives table-independent use.

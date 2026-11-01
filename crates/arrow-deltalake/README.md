@@ -1,6 +1,6 @@
 # arrow-deltalake
 
-Streaming Arrow `RecordBatch` -> Parquet / Delta. Local Linux, append-only.
+Streaming Arrow `RecordBatch` -> Parquet / Delta. Local Linux and ADLS Gen2.
 No OTEL or Flight dependency. Writes use pinned Delta Kernel 0.29.0;
 delta-rs is only the independent loadtest reader.
 
@@ -125,7 +125,7 @@ ownership is released.
   stage != commit       queue admission != durable delivery
   drop before submit -> no commit
   drop after submit  -> may still commit; cancellation is not rollback
-  commit error       -> fail waiters + poison coordinator; no blind retry
+  terminal error     -> fail waiters + poison coordinator; no blind retry
 
   OTEL adapter's dependency gate (not a cross-table transaction):
 
@@ -137,8 +137,33 @@ ownership is released.
   start_draining() -> bypass delay for every remaining dependency wave
 ```
 
-Data files are synced before publication. Conflicts and uncertain outcomes
-are explicit errors; orphan files remain for inspection. The 10-second
+Data files are synced before publication. Safe CAS collisions retry with jitter,
+up to eight attempts and a ten-second retry-admission window. Stable transaction
+identities reconcile uncertain success before any resubmission; an unreadable
+outcome fails closed, and unidentified uncertain appends are never replayed.
+Local reconciliation/deduplication synchronizes retained replay logs/checkpoints
+and their directories before acknowledging: read-back visibility alone does not
+repair a failed local durability operation.
+Local tables fsync the canonical table root and every ancestor on open/reopen,
+every partition directory from a staged file's leaf up to the table root before
+its Add can commit (multi-column Hive paths included), and the
+`_last_checkpoint` hint file after checkpoint finalization. Every fsync failure
+is returned. A failure before the commit file is created publishes nothing; a
+commit or hint fsync failure can follow a visible publication, so it fails the
+acknowledgment and the retry/reconciliation path (same publication txn) must
+re-establish durability rather than roll back.
+Exhaustion and semantic/schema conflicts remain visible errors; orphan files
+remain for inspection.
+A deduplicated publication reclaims only this table's staged files that no commit
+attempt ever carried (an atomic fresh/submitted/reclaimed claim per stage, through
+the guarded publication cleanup); a reclaimed stage is refused by later commits,
+and the deduplicated `AppendResult.file` may no longer exist. Files offered to any
+attempt (unknown success, collision retries, concurrent borrows) are conservatively
+retained even if the call then deduplicates, and log-only VACUUM LITE cannot
+reclaim them. A cleanup failure keeps the file, never fails the publication, and is
+reported only as the `orphan_reclaimed`/`orphan_cleanup_failed` publication
+outcomes plus a warning carrying a fixed failure class (no path or error text).
+Disk use is therefore not proven to plateau. The 10-second
 collection window is not a visibility bound: dependency waves add latency.
 
 ## Publication fencing
@@ -155,6 +180,127 @@ transaction receives `CommitReceiptError::PublicationFenced` through
 `wait_typed()`; the coordinator is then poisoned just like other uncertain or
 commit failures. Existing `wait()` remains available and wraps the typed error
 in `anyhow::Error`.
+
+## Shared tables, ADLS identity and reset fencing
+
+Legacy local `open` retains its lifetime writer lock. `open_url` and
+`open_uri_with_fence` permit independent maintenance/streaming processes while
+Delta's conditional-create log publication arbitrates each commit. Independent
+submissions remain independent; only the same application ID/version deduplicates.
+Transaction retention must remain unset. Checkpoints retain transaction fences.
+
+`object_store_for_url` supplies the same refreshable Azure CLI identity to
+readers/checkpoint clients without opening a writer. Azure runtimes require `az`
+2.54 or later, the authorized CLI configuration mounted privately, and
+`AZURE_CONFIG_DIR` pointing at it. A token cache alone is not sufficient.
+The provider invokes `az account get-access-token` with the Storage scope;
+no credentials are embedded in jobs or table metadata. Child execution/output
+has a five-second deadline, cancellation kills its dedicated Unix process group
+(including the packaged shell wrapper's Python descendants), concurrent credential
+admission is bounded to six seconds, and output is limited to 64 KiB.
+Cached tokens expire at the earlier of 60 seconds or their expiry minus 30 seconds.
+CLI stderr and token responses are never included in errors.
+Explicit timeout reaps the direct child; outer-future cancellation retains Tokio's
+child reaper. Container runtimes must supply an init/subreaper for orphaned
+descendants. The provider never signals the caller's process group. Regression
+tests cover both deadline expiry and outer cancellation with delayed descendant
+work, not only delayed work in a wrapper shell.
+`AzureCliTokenProvider::new(scope, deadline)` exposes the same bounded
+acquisition for another exact `https://<host>/.default` scope (for example a
+Kusto cluster); `token().await` returns only the bearer string.
+
+Normal Azure open/upload/commit requires owned, ready checkpoint-container
+metadata and the same captured reset generation. Bootstrap-only
+`initialize_url_for_bootstrap` instead requires the owned, fenced generation,
+normalizes its raw input schema, validates existing roots, and returns no writer.
+`StorageAuthority::open/check` lets checkpoint services enforce the same authority
+immediately before and after each mutation; failed authority forbids cleanup.
+Core repeats authority after slow local staging/checkpoint preparation, and the
+committer materializes at most 8 MiB of action arrays before its final check.
+
+Azure HTTP attempts time out after ten seconds and opaque transport retries are
+disabled, including for raw stores shared with checkpoint clients. Delta CAS
+collisions still use their separate eight-attempt classified outer policy.
+One credential acquisition plus one HTTP attempt allows at most 16 seconds of
+configured asynchronous waiting after request preparation.
+A metadata authority request adds up to six seconds of credential admission
+and ten seconds of HTTP waiting. These are **not a hard whole-operation or
+server-completion deadline**: CPU scheduling, runtime suspension, serialization,
+and already-sent server requests are outside these client bounds. Reset grace
+alone is not proof of fencing. Stop/quiesce services before destructive reset;
+the stalled-auth tests specifically prove a cancelled CLI cannot later resume a
+data/log publication. Real ADLS/reset qualification still requires authorized
+subscription access.
+
+## Telemetry
+
+Install the process's global OpenTelemetry meter provider before any Delta work,
+then attach `telemetry::kernel_metrics_reporter()` with Kernel's
+`WithMetricsReporterLayer` to the global tracing subscriber. Apply log filters
+only to the logging layer, not the Kernel reporting layer. The crate does not
+install another subscriber/exporter or create placeholder observations.
+
+The `arrow-deltalake` meter exports these actual instruments:
+
+| Instrument | Unit | Bounded attributes |
+| --- | --- | --- |
+| `delta.kernel.events` | counter | `event`, `outcome` |
+| `delta.kernel.duration` | s, histogram | `event`, `phase` |
+| `delta.kernel.values` | 1, histogram | `event`, `field` |
+| `delta.kernel.bytes` | By, histogram | `event`, `field` |
+| `delta.kernel.version` | 1, gauge | `event` |
+| `delta.publication.events` | counter | `outcome` |
+| `delta.publication.duration` | s, histogram | `outcome` |
+
+Kernel event coverage includes log-segment and protocol loading, snapshot,
+transaction prepare/committer/total timings and file counts/bytes, domain and
+transaction lookup/cache results, CRC, JSON/Parquet reads, scan selection and
+predicate/dedup/transform work, and storage listing/reading/copying. The match is
+exhaustive for pinned Kernel 0.29. Publication outcomes include `attempt`,
+`conflict`, `retryable_io`, `committed`, `deduplicated`, `reconciled`, `exhausted`,
+`failure`, `orphan_reclaimed` and `orphan_cleanup_failed`; the duration records one terminal observation per publication.
+No table URI, account, application UUID or correlation ID is a metric label.
+Prometheus/OTLP exporters may normalize dots and append unit/type suffixes.
+
+## Publication file layout
+
+Collector `new_file_with_publication` files containing `customer_id` use the
+shared whole-file sort buffer, not isolated per-batch sorting. All rows from one
+receipt are sorted together before Parquet encoding; its stable transaction,
+ingestion partition, normalized schema, row count and original logical input-byte
+accounting are preserved. Legacy `new_file` stays streaming and unchanged.
+Schemas without `customer_id` keep streaming unless sort columns are explicit.
+
+After normalization and Kernel physical projection, shared IPC or sliced buffers
+are compacted into owned physical arrays only when Arrow's memory charge exceeds
+twice their logical bytes. Compaction happens before charging the retained sort
+buffer; original logical input-byte observation counters remain unchanged. This
+avoids charging one shared IPC allocation repeatedly through its columns without
+increasing batch sizes or the configured bounds. A genuinely oversized
+publication still fails rather than committing a partial receipt.
+
+| Environment option | Default |
+| --- | --- |
+| `ARROWCOL_LAYOUT_SORT_COLUMNS` | `customer_id` (comma-separated, ordered keys) |
+| `ARROWCOL_LAYOUT_BLOOM_COLUMNS` | `customer_id` |
+| `ARROWCOL_LAYOUT_MAX_ROWS` | 262144 |
+| `ARROWCOL_LAYOUT_MAX_INPUT_BYTES` | 67108864 |
+| `ARROWCOL_LAYOUT_ROW_GROUP_ROWS` | 16384 |
+| `ARROWCOL_LAYOUT_PAGE_ROWS` | 2048 |
+
+Policies enable row-group/page statistics, offset indexes and selected Bloom
+filters. Qualification may explicitly set row groups to 512 and pages to 128
+for an 8192-row/16-customer source; production defaults are not changed. The
+regression exercises multiple interleaved batches through a real publication:
+sorted output selects one of 16 groups by customer bounds, while an unsorted
+control with identical encoding controls selects all 16.
+
+Bounds apply to retained physical Arrow arrays; sorting/concatenation requires
+additional proportional workspace. An oversized publication fails visibly before
+commit and must be split upstream into independently identified publications;
+it never silently commits a partial receipt. Explicit
+`new_file_with_publication_and_layout` supports per-caller policies or `None`
+for streaming without changing process environment.
 
 ## Arrow representation
 
@@ -183,6 +329,19 @@ Timestamp scaling overflow and reserved companion names fail. Bare timestamp
 list/map elements need a named struct field. Container logical types live on
 the enclosing field because Delta has no element/key/value field metadata.
 Schema evolution is separate: a failed append may leave a new nullable column.
+
+Data that is already in this representation (for example rows read back with a
+table's Kernel schema, `DeltaTable::arrow_schema`) must not be normalized again,
+because its companions would collide with the reserved names. Validate the schema
+with `normalize::CanonicalSchema::try_new`, then use `DeltaTable::open_url_canonical`
+(or `open_url_with_session_canonical`) and
+`new_canonical_file_partitioned_with_properties`. A canonical schema is accepted
+only when normalization would leave it unchanged: every `Timestamp(us, UTC)` is
+immediately followed by its `<field>__unix_nanos` Int64 companion with the same
+nullability, at every nesting level, and no raw type remains. Each written batch must
+match that shape, and every companion must agree with its timestamp row by row (same
+nulls, `micros == floor(nanos / 1000)`). Companion nanos are kept exactly as given.
+The raw APIs still reject reserved companion names.
 
 ## Local table layout
 

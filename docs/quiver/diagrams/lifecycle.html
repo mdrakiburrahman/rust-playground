@@ -57,7 +57,7 @@
   <div class="canvas" tabindex="0" role="region" aria-label="Lifecycle diagram; scroll horizontally on small screens">
     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 560" role="img" aria-labelledby="diagram-title diagram-description">
       <title id="diagram-title">Life of a Quiver bundle</title>
-      <desc id="diagram-description">CSV rows become a bundle of 128 rows with a manifest, shown by quiver-cli generate and show. The bundle is appended to the WAL and fsynced, and only then acknowledged to the sender; quiver-cli wal shows it. Eight entries are sealed into a segment file and the WAL cursor moves past them; quiver-cli segments shows it. The Delta publisher reads the segment, commits to Delta, and acknowledges each bundle; quiver-cli consume does this. A segment whose bundles are all acknowledged is deleted; quiver-cli tree shows it. If the process is killed before a seal, shown by quiver-cli crash, the fsynced WAL entries survive while the open in-memory segment is lost. On restart, shown by quiver-cli recover, entries after the cursor are replayed into a new segment.</desc>
+      <desc id="diagram-description">SQL wait-statistic CSV rows have explicit synthetic customer identifiers and become bundles of 128 rows with manifests, shown by quiver-cli generate and show. The bundle is appended to the WAL and fsynced before acknowledging durable admission, not Delta publication. Eight entries are sealed into a segment and the WAL cursor moves past them. In production the Delta publisher commits before acknowledging each bundle; quiver-cli consume only demonstrates subscriber acknowledgements and does not publish to Delta. Fully acknowledged segments are deleted. After a crash, fsynced WAL entries survive and entries after the cursor replay into a new segment. Production replay preserves publication identity and ingestion-time partition stamps; independent client requests are not deduplicated.</desc>
       <defs>
         <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse">
           <circle cx="1" cy="1" r=".7" fill="#23354c"/>
@@ -124,7 +124,7 @@
       <rect x="30" y="110" width="150" height="170" rx="16" fill="#1b2d45" stroke="#567393" stroke-width="1.8"/>
       <use href="#csv-icon" x="81" y="126" width="48" height="48" fill="none" stroke="#b5d9ff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
       <text x="105" y="206" class="label">CSV rows</text>
-      <text x="105" y="228" class="small">real wait stats</text>
+      <text x="105" y="228" class="small">stats + customer_id</text>
       <rect x="53" y="244" width="104" height="24" rx="12" fill="#0b1220" stroke="#35465f"/>
       <text x="105" y="260.5" class="chip">generate</text>
       <rect x="236" y="110" width="150" height="170" rx="16" fill="#1b2d45" stroke="#567393" stroke-width="1.8"/>
@@ -148,7 +148,7 @@
       <rect x="854" y="110" width="150" height="170" rx="16" fill="#211d3a" stroke="#c5b6fb" stroke-width="1.8"/>
       <use href="#delta-icon" x="905" y="126" width="48" height="48" fill="none" stroke="#c5b6fb" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
       <text x="929" y="206" class="label">Delta commit</text>
-      <text x="929" y="228" class="small">then ack bundle</text>
+      <text x="929" y="228" class="small">demo: ack only</text>
       <rect x="877" y="244" width="104" height="24" rx="12" fill="#0b1220" stroke="#35465f"/>
       <text x="929" y="260.5" class="chip">consume</text>
       <rect x="1060" y="110" width="150" height="170" rx="16" fill="#1b2d45" stroke="#7b97ba" stroke-width="1.8" stroke-dasharray="6 4"/>
@@ -218,11 +218,11 @@
   </div>
 
   <div class="note">
-    <strong>ACK = fsynced WAL entry.</strong>
-    <span class="warning">A segment is deleted only after every bundle in it is acknowledged.</span>
+    <strong>WAL ACK is not publication or client purge permission.</strong>
+    <span class="warning">Production replay keeps the publication ID and UTC stamp; the consume demo only acknowledges bundles.</span>
   </div>
   <footer>
-    <span>Real <code>sys.dm_os_wait_stats</code> rows &middot; same bundle format as the Direct collector</span>
+    <span>Real wait statistics + synthetic customer labels &middot; same bundle format as the Direct collector</span>
     <span>
       <a href="../../../bin/quiver-cli/src/lifecycle.rs">consume / crash / recover</a>
       &middot; <a href="../../../submodules/otel-arrow/rust/otap-dataflow/crates/quiver/src/inspect.rs">WAL inspection</a>

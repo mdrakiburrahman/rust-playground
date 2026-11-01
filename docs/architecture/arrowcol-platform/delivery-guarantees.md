@@ -5,7 +5,8 @@
 [Architecture index](README.md)
 
 **Direct has a client-managed at-least-once path. By default DFE does not.**
-Retain the source until verified publication; tolerate duplicate rows.
+Retain the source until verified publication; tolerate duplicate rows from
+independently admitted client deliveries.
 The diagram shows the default in-memory paths. With
 [native Quiver](#native-quiver-disk-persistence), both collectors fsync each
 batch to local disk before acknowledging it and replay it after a crash.
@@ -20,6 +21,7 @@ batch to local disk before acknowledging it and replay it after a crash.
 | Native Quiver payload persistence | Optional: batch fsynced before the receipt; replayed under the original receipt | Optional: `durable_buffer` fsync before completion; replayed after restart |
 | Downstream outcome | SQL receipt/publication state | Later internal Ack/Nack, pressure, metrics |
 | Routing / commit fencing | Yes | Yes |
+| Same-publication retry / Quiver replay identity | Stable receipt UUID | Stable server publication UUID in the envelope |
 | Exactly-once / payload deduplication | No | No |
 
 ## Direct happy path
@@ -29,9 +31,9 @@ Validate metadata, identity, lease, exact received schema
   -> SQL accepted receipt
   -> reserve bounded capacity; SQL buffered + Arrow arrays in memory
   -> Flight PutResult with receipt ID (NOT purge permission)
-  -> grouped flush: SQL publishing
+  -> receipt flush: SQL publishing
   -> close/sync Parquet; check fence; durable Delta log commit
-  -> SQL atomically records publication and marks grouped receipts published
+  -> SQL records publication and marks the receipt published
   -> client HTTP polls, verifies published + purge_allowed, then purges source
 ```
 
@@ -39,6 +41,8 @@ Validate metadata, identity, lease, exact received schema
 payloads are durable only with native Quiver, which adds the
 `durable_payload_storage` capability. A completed Flight stream is not publication.
 The client owns source retention and retry until publication is confirmed.
+Each receipt currently retains an independent publication file and flush job;
+Direct does not coalesce independent receipt jobs into one shared publication.
 
 ## Direct sad paths
 
@@ -129,7 +133,8 @@ assuming these endpoint envelopes are identical.
 Flight schema/identity/lease validation
   -> Arrowcol envelope + bounded pdata send
   -> stream completes: best_effort_admission (no receipt)
-  -> independent exporter groups batches; writes Parquet; fenced Delta commit
+  -> exporter groups scheduling, retaining independent publication files/IDs
+  -> writes Parquet; fenced Delta commit
   -> internal Ack on success / Nack on failure
   -> receiver resolves correlation tracker; updates pressure/metrics
 ```
@@ -177,10 +182,21 @@ After `kill -9`, the restarted process reopens the same Quiver directory:
   If the lease is not yet held, the batch is NACKed transiently and stays on
   disk.
 
-Recovery is at least once. A batch whose Delta commit landed just before the
-crash can be published again. Delta `txn` markers are not used yet. Clients still
-purge only on `published` + `purge_allowed`. The loadtest's
-`--quiver --crash-after` run demonstrates and validates this path.
+New admissions preserve a server publication UUID and an immutable admission
+timestamp through Quiver. Direct uses its receipt UUID; DFE carries its own
+publication UUID in the durable envelope. Kernel commits include the
+`arrowcol.publication.<UUID>` transaction identity at version `0`. A retry or
+replay of that same publication reconciles an already committed identity instead
+of appending its rows again. An uncertain outcome whose identity cannot be read
+is not permission for a blind retry.
+
+Minute partitions use the stable UTC ingestion timestamp, not event time or the
+time a replay happens. These internal identities do **not** deduplicate client
+requests: an independently admitted resend receives a fresh identity, even for
+identical bytes. The external contract therefore remains at least once, not
+exactly once. Direct clients still purge only on `published` + `purge_allowed`;
+DFE still has no client receipt or purge signal. The loadtest's
+`--quiver --crash-after` path exercises durable recovery.
 
 Sources: [direct ingest](../../../projects/arrowcol-rust/src/ingest.rs),
 [receipt reconciliation](../../../crates/arrowcol-receipts/src/sql_server.rs),

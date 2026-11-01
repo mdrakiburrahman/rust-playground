@@ -8,7 +8,7 @@ const workspace = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..
 for (const quiver of [false, true]) {
   const state = path.join(workspace, 'projects/loadtest/.temp', quiver ? 'compose-check-quiver' : 'compose-check');
   for (const directory of [
-    'direct', 'dataflow', 'results', 'router-state', 'direct-state-1', 'dataflow-state-1',
+    'direct', 'dataflow', 'tenant', 'tenant-checkpoints', 'results', 'router-state', 'direct-state-1', 'dataflow-state-1',
     ...(quiver ? [benchmarkQuiver.directHostDirectory, benchmarkQuiver.dataflowHostDirectory] : []),
   ]) {
     mkdirSync(path.join(state, directory), { recursive: true });
@@ -33,7 +33,7 @@ function checkCompose(state: string, overrideFile: string): void {
     '--file', path.join(workspace, 'projects/loadtest/compose.yaml'),
     '--file', overrideFile,
   ];
-  args.push('--profile', 'benchmark', '--profile', 'ui-gate', 'config', '--quiet');
+  args.push('--profile', 'benchmark', '--profile', 'ui-gate', '--profile', 'tenant', '--profile', 'maintenance', 'config', '--quiet');
   const result = spawnSync('docker', args, {
     cwd: workspace,
     env: {

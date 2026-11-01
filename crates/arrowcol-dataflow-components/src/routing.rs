@@ -149,6 +149,12 @@ pub(crate) fn lease_binding(
     process: ExportingProcess<'_>,
     now: UnixMillis,
 ) -> LeaseBinding {
+    if process
+        .instance_key
+        .is_some_and(|key| key.contains("|cloud=") && key != envelope.instance_key)
+    {
+        return LeaseBinding::Defer("stale cloud-generation instance key; durable replay cannot be rebound");
+    }
     let Some(lease) = current else {
         return LeaseBinding::Defer("authoritative routing lease is absent; retrying until this collector holds it");
     };
@@ -541,6 +547,8 @@ mod tests {
             ..draining.clone()
         };
         let current = ArrowcolBatchEnvelope {
+            publication_id: Some(arrowcol_protocol::ReceiptId::new()),
+            ingested_at_ms: Some(time(1_000)),
             table: table(),
             source_schema_version: arrowcol_catalog::SchemaVersion::FIRST,
             target_schema_version: arrowcol_catalog::SchemaVersion::FIRST,
@@ -549,6 +557,34 @@ mod tests {
             fencing_token: draining.fencing_epoch,
             instance_key: "collector".to_owned(),
         };
+        let g1 = ArrowcolBatchEnvelope {
+            instance_key: "collector|cloud=g1".to_owned(),
+            ..current.clone()
+        };
+        assert!(matches!(
+            lease_binding(
+                &g1,
+                Some(&active),
+                ExportingProcess {
+                    instance_id: process,
+                    instance_key: Some("collector|cloud=g2"),
+                },
+                time(6_000),
+            ),
+            LeaseBinding::Defer(message) if message.contains("stale cloud-generation")
+        ));
+        assert_eq!(
+            lease_binding(
+                &g1,
+                Some(&active),
+                ExportingProcess {
+                    instance_id: process,
+                    instance_key: Some("collector|cloud=g1"),
+                },
+                time(6_000),
+            ),
+            LeaseBinding::Current
+        );
         let older = ArrowcolBatchEnvelope {
             lease_id: LeaseId::new(),
             fencing_token: FencingToken::new(2).expect("fence"),

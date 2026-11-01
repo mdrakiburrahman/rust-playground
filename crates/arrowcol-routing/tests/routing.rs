@@ -1195,3 +1195,79 @@ async fn rebalance_never_moves_crashed_lease_to_different_key_without_drain_proo
     assert_eq!(lease.holder_instance_id, crashed);
     assert_eq!(lease.state, LeaseState::Draining);
 }
+
+/// Scenario: one collector process has several writers for its routing row.
+/// One core records `draining` while another core's heartbeat or registration
+/// refresh is stamped later or lands afterwards; then shutdown records
+/// `stopped`, and stale writers arrive late.
+/// Guarantees: the drain never loses to the instance's own later heartbeat;
+/// repeated drains are idempotent; a registration refresh cannot resurrect
+/// `ready`; heartbeats never move the lease backwards; a terminal state never
+/// regresses or changes.
+#[tokio::test]
+async fn collector_state_is_monotone_across_same_instance_writers() {
+    let store = MemoryRoutingStore::default();
+    let collector = CollectorInstanceId::new();
+    store
+        .register_collector(&registration(collector, 5101, 90_000))
+        .await
+        .unwrap_or_else(|error| panic!("register collector: {error}"));
+    store
+        .heartbeat_collector(collector, millis(100_050), millis(200_050))
+        .await
+        .unwrap_or_else(|error| panic!("later heartbeat: {error}"));
+    store
+        .set_collector_state(collector, CollectorState::Draining, millis(100_010))
+        .await
+        .unwrap_or_else(|error| panic!("drain stamped before the latest heartbeat: {error}"));
+    store
+        .set_collector_state(collector, CollectorState::Draining, millis(100_005))
+        .await
+        .unwrap_or_else(|error| panic!("second core repeats drain: {error}"));
+    store
+        .heartbeat_collector(collector, millis(100_001), millis(150_000))
+        .await
+        .unwrap_or_else(|error| panic!("stale heartbeat while draining: {error}"));
+    let refresh = store.register_collector(&registration(collector, 5101, 90_000)).await;
+    assert_eq!(
+        refresh.err().map(|error| error.kind()),
+        Some(RoutingErrorKind::Conflict)
+    );
+    let view = store
+        .load_view(millis(100_060))
+        .await
+        .unwrap_or_else(|error| panic!("load view: {error}"));
+    let record = &view.collectors[&collector];
+    assert_eq!(record.state, CollectorState::Draining);
+    assert_eq!(record.registration.heartbeat_at_unix_ms, millis(100_050));
+    assert_eq!(record.registration.lease_expires_at_unix_ms, millis(200_050));
+
+    store
+        .set_collector_state(collector, CollectorState::Stopped, millis(100_020))
+        .await
+        .unwrap_or_else(|error| panic!("stop: {error}"));
+    for late in [CollectorState::Ready, CollectorState::Draining, CollectorState::Failed] {
+        let regressed = store.set_collector_state(collector, late, millis(100_100)).await;
+        assert_eq!(
+            regressed.err().map(|error| error.kind()),
+            Some(RoutingErrorKind::Conflict),
+            "stopped must not change to {late:?}"
+        );
+    }
+    let heartbeat = store
+        .heartbeat_collector(collector, millis(100_100), millis(200_100))
+        .await;
+    assert_eq!(
+        heartbeat.err().map(|error| error.kind()),
+        Some(RoutingErrorKind::Conflict)
+    );
+    store
+        .set_collector_state(collector, CollectorState::Stopped, millis(100_200))
+        .await
+        .unwrap_or_else(|error| panic!("repeated stop is idempotent: {error}"));
+    let view = store
+        .load_view(millis(100_060))
+        .await
+        .unwrap_or_else(|error| panic!("load view: {error}"));
+    assert_eq!(view.collectors[&collector].state, CollectorState::Stopped);
+}

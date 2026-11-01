@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import {
   chmodSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, writeFileSync,
 } from 'node:fs';
@@ -15,14 +15,22 @@ import {
   type BenchmarkOptions,
 } from './cli.js';
 import { startResourceSampler } from './resource-sampler.js';
+import { beginAttemptEvidence, sealAttemptEvidence, stoppedAttemptMutators, type StoppedMutator } from './attempt-evidence.js';
 import { writeProvenance } from './provenance.js';
 import { runQuiverCrash, QUIVER_RECOVERY_FILE } from './quiver-crash.js';
+import { killQuiverPublishers, recordQuiverSuccessors, type KilledPublishers } from './quiver-process-exits.js';
+import { OwnedProcessError, runOwnedProcess } from './owned-process.js';
+import { admitPublisherRelease, sqlIdentity, type SqlIdentity } from './publisher-release.js';
+import { startQapObserver } from './qap-observer.js';
+import { readStressPlan, runStressDriver, stressInputBudget } from './stress-driver.js';
+import { LocalStressRuntime } from './stress-runtime.js';
 import {
   benchmarkComposeFiles, benchmarkQuiver, buildBenchmarkComposeOverride, buildBenchmarkRuntimeConfigs, dataflowConfigFile,
 } from './runtime-config.js';
-import { acquireBenchmarkController, resetBenchmark, type BenchmarkController } from './lifecycle.js';
+import { acquireBenchmarkController, discardUnsealedAttempts, requirePreviousAttemptEvidence, resetBenchmark, stopBenchmark, stopReceipt, type BenchmarkController } from './lifecycle.js';
+import { azureTargets, modeEnvironment, stageAzureCliConfig, type AzureTargets } from './mode.js';
 import { kustoComposeStartArguments, kustoStatusSummary, readKustoStatus, requireHealthyKusto, safeKustoError, startKusto } from './kusto.js';
-import { kustoExplorerStartArguments, runUiGate } from './ui-gate.js';
+import { kustoExplorerStartArguments, runGrafanaGate, runUiGate } from './ui-gate.js';
 
 const workspace = realpathSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..'));
 const composeFile = path.join(workspace, 'projects/loadtest/compose.yaml');
@@ -195,7 +203,7 @@ function stageHelperBinaries(): string {
   return destination;
 }
 
-function writeDirectConfig(directory: string, service: string, network: BenchmarkNetwork, quiver: boolean): void {
+function writeDirectConfig(directory: string, service: string, network: BenchmarkNetwork, quiver: boolean, azure?: AzureTargets, privateEnv?: NodeJS.ProcessEnv): void {
   const state = path.join(directory, `direct-state-${service.split('-')[1]}`);
   mkdirSync(state, { recursive: true });
   const generationFile = path.join(state, 'generation');
@@ -210,18 +218,21 @@ function writeDirectConfig(directory: string, service: string, network: Benchmar
   const template = readFileSync(path.join(workspace, 'projects/loadtest/config/direct.yaml.tmpl'), 'utf8');
   const runtime = buildBenchmarkRuntimeConfigs(template,
     readFileSync(path.join(workspace, dataflowConfigFile(quiver)), 'utf8'),
-    { instanceKey: `loadtest-${service}`, advertisedEndpoint: `${address}:50051`, generation }, { quiver });
+    { instanceKey: `loadtest-${service}`, advertisedEndpoint: `${address}:50051`, generation },
+    { quiver, mode: azure ? 'azure' : 'local', azure });
   writeFileSync(path.join(state, 'direct.yaml'), runtime.directYaml);
   const dataflowState = path.join(directory, 'dataflow-state-1');
   mkdirSync(dataflowState, { recursive: true });
   writeFileSync(path.join(dataflowState, 'dataflow.yaml'), runtime.dataflowYaml);
   writeFileSync(path.join(directory, 'router-state/compose-runtime.json'),
-    `${buildBenchmarkComposeOverride(hostPath(directory), { quiver })}\n`);
+    `${buildBenchmarkComposeOverride(hostPath(directory), { quiver, ...(azure ? {
+      mode: 'azure', azure, azureConfigHostDirectory: hostPath(path.join(directory, 'azure-cli')), azureEnvironment: privateEnv,
+    } : {}) })}\n`);
   writeFileSync(generationFile, `${generation}\n`);
 }
 
-function writeRuntimeConfigs(directory: string, network: BenchmarkNetwork, quiver: boolean): void {
-  writeDirectConfig(directory, 'direct-1', network, quiver);
+function writeRuntimeConfigs(directory: string, network: BenchmarkNetwork, quiver: boolean, azure?: AzureTargets, privateEnv?: NodeJS.ProcessEnv): void {
+  writeDirectConfig(directory, 'direct-1', network, quiver, azure, privateEnv);
   writeRouterConfig(directory, 500);
 }
 
@@ -239,11 +250,28 @@ function benchmarkEnvironment(
   options: BenchmarkOptions,
   network: BenchmarkNetwork,
   binaryDirectory: string,
+  privateEnv: NodeJS.ProcessEnv,
+  azure?: AzureTargets,
 ): NodeJS.ProcessEnv {
   const secrets = writeBenchmarkSecrets();
   const infra = path.join(workspace, 'projects/arrowcol-infra/secrets');
   return {
     ...environment(directory),
+    ...privateEnv,
+    ARROWCOL_MODE: options.mode,
+    ARROWCOL_PARTITION_GRANULARITY: 'minute',
+    LOADTEST_DIRECT_DELTA_ROOT: azure?.directRoot ?? '/delta/direct',
+    LOADTEST_DATAFLOW_DELTA_ROOT: azure?.dataflowRoot ?? '/delta/dataflow',
+    ...(azure ? {
+      ARROWCOL_AZURE_TABLE_ROOT: azure.root,
+      LOADTEST_DIRECT_ROOT: azure.directRoot,
+      LOADTEST_DATAFLOW_ROOT: azure.dataflowRoot,
+      LOADTEST_MAINTENANCE_ROOT: `${azure.directRoot}/telemetry/sqlserver/`,
+      LOADTEST_TENANT_SOURCE: `${azure.directRoot}/telemetry/sqlserver/sqlserver_cpu_utilization`,
+      LOADTEST_TENANT_TARGET: `${azure.tenantRoot}/sqlserver_cpu_utilization`,
+      LOADTEST_TENANT_CHECKPOINT: `${azure.checkpointRoot}/tenant-cpu`,
+      AZURE_USE_AZURE_CLI: 'true',
+    } : {}),
     LOADTEST_COMPOSE_OVERRIDE_FILE: path.join(directory, 'router-state/compose-runtime.json'),
     LOADTEST_WARMUP: `${options.warmupSeconds}s`,
     ...(options.measureSeconds === undefined ? {} : { LOADTEST_MEASURE: `${options.measureSeconds}s` }),
@@ -271,7 +299,11 @@ function benchmarkEnvironment(
     LOADTEST_DATAFLOW_1_IP: network.dataflow,
     LOADTEST_KUSTO_IP: network.kusto,
     LOADTEST_KUSTO_EXPLORER_IP: network.kustoExplorer,
+    LOADTEST_KUSTO_BRIDGE_IP: network.kustoBridge,
     LOADTEST_PLAYWRIGHT_IP: network.playwright,
+    LOADTEST_LGTM_IP: network.sql.replace(/\.2$/u, '.40'),
+    LOADTEST_CADVISOR_IP: network.sql.replace(/\.2$/u, '.105'),
+    LOADTEST_PORTAINER_IP: network.sql.replace(/\.2$/u, '.106'),
     SQLSERVER_SA_PASSWORD_FILE: hostPath(path.join(infra, 'sqlserver-sa-password.txt')),
     ARROWCOL_APP_PASSWORD_FILE: hostPath(path.join(infra, 'arrowcol-app-password.txt')),
     ARROWCOL_MIGRATOR_PASSWORD_FILE: hostPath(path.join(infra, 'arrowcol-migrator-password.txt')),
@@ -298,6 +330,7 @@ export interface BenchmarkNetwork {
   dataflow: string;
   kusto: string;
   kustoExplorer: string;
+  kustoBridge: string;
   playwright: string;
 }
 
@@ -337,7 +370,7 @@ function selectBenchmarkNetwork(): BenchmarkNetwork {
     return {
       subnet, sql: `${base}.2`, hive: `${base}.3`, router: `${base}.10`,
       direct: `${base}.21`, dataflow: `${base}.31`,
-      kusto: `${base}.50`, kustoExplorer: `${base}.51`, playwright: `${base}.52`,
+      kusto: `${base}.50`, kustoExplorer: `${base}.51`, playwright: `${base}.52`, kustoBridge: `${base}.53`,
     };
   }
   throw new Error('No available benchmark subnet in 10.89.0.0/16');
@@ -379,9 +412,10 @@ export function localLoadgenEnvironment(
   const infra = path.join(workspace, 'projects/arrowcol-infra/secrets');
   return {
     ...context.env,
+    ...(context.options.mode === 'azure' ? { AZURE_CONFIG_DIR: path.join(context.directory, 'azure-cli/loadgen') } : {}),
     LOADTEST_RESULTS: results,
-    LOADTEST_DIRECT_ROOT: path.join(context.directory, 'direct'),
-    LOADTEST_DATAFLOW_ROOT: path.join(context.directory, 'dataflow'),
+    LOADTEST_DIRECT_ROOT: context.options.mode === 'azure' ? context.env.LOADTEST_DIRECT_ROOT : path.join(context.directory, 'direct'),
+    LOADTEST_DATAFLOW_ROOT: context.options.mode === 'azure' ? context.env.LOADTEST_DATAFLOW_ROOT : path.join(context.directory, 'dataflow'),
     LOADTEST_ROUTER_ENDPOINT: `http://${context.network.router}:50050`,
     LOADTEST_CATALOG_ENDPOINT: `http://${context.network.direct}:50051`,
     LOADTEST_RECEIPT_ENDPOINT: `http://${context.network.router}:50050`,
@@ -390,25 +424,53 @@ export function localLoadgenEnvironment(
     LOADTEST_SCRATCH_ROOT: 'projects/loadtest/.temp/loadgen/latest',
     LOADTEST_DIRECT_ADMIN_ENDPOINTS: `http://${context.network.direct}:8081`,
     LOADTEST_DATAFLOW_ADMIN_ENDPOINTS: `http://${context.network.dataflow}:32011`,
-    LOADTEST_KUSTO_ENDPOINT: `http://${context.network.kusto}:8080`,
+    LOADTEST_KUSTO_ENDPOINT: context.options.mode === 'azure' ? context.env.AZURE_KUSTO_URI : `http://${context.network.kusto}:8080`,
+    LOADTEST_KUSTO_BRIDGE_ENDPOINT: context.options.mode === 'azure' ? undefined : context.env.LOADTEST_KUSTO_BRIDGE_ENDPOINT,
     ARROWCOL_SQL_HOST: context.network.sql,
     ARROWCOL_SQL_PASSWORD_FILE: path.join(infra, 'arrowcol-app-password.txt'),
     ARROWCOL_SDK_GEN: path.join(cargoTargetDirectory(), 'debug/arrowcol-sdk-gen'),
   };
 }
 
+/** Hard backstop for one non-load loadgen command; the runner kills the command after it. */
+export const LOADGEN_PHASE_TIMEOUT_MS = 600_000;
+/** Part of the backstop left for validate's fail-closed report; unpreemptible reader work can consume it. */
+export const VALIDATE_RESERVE_MS = 30_000;
+
+/**
+ * Timeout and private environment for one loadgen command. Validate alone receives an absolute
+ * deadline inside the unchanged backstop; its inner waits stop cooperatively at that deadline and
+ * write a failed report, while the backstop remains the only hard bound. An inherited deadline
+ * never bounds run or drain.
+ */
+export function loadgenSpawnPlan(
+  command: 'run' | 'drain' | 'validate' | 'publisher-release' | 'final-compaction',
+  options: Pick<BenchmarkContext['options'], 'measureSeconds' | 'warmupSeconds'>,
+  environment: NodeJS.ProcessEnv,
+  nowMs: number,
+): { timeout: number | undefined; env: NodeJS.ProcessEnv } {
+  const env: NodeJS.ProcessEnv = { ...environment, LOADTEST_COLLECTORS_DRAINED: String(command === 'validate') };
+  delete env.LOADTEST_VALIDATE_DEADLINE_UNIX_MS;
+  if (command === 'validate') env.LOADTEST_VALIDATE_DEADLINE_UNIX_MS = String(nowMs + LOADGEN_PHASE_TIMEOUT_MS - VALIDATE_RESERVE_MS);
+  const timeout = command !== 'run'
+    ? LOADGEN_PHASE_TIMEOUT_MS
+    : options.measureSeconds === undefined ? undefined : (options.warmupSeconds + options.measureSeconds + 600) * 1000;
+  return { timeout, env };
+}
+
 async function runLocalLoadgen(
   context: Pick<BenchmarkContext, 'directory' | 'env' | 'network' | 'options'>,
-  command: 'run' | 'validate',
+  command: 'run' | 'drain' | 'validate' | 'publisher-release' | 'final-compaction',
   results: string,
   controller: BenchmarkController,
 ): Promise<void> {
+  const plan = loadgenSpawnPlan(command, context.options, localLoadgenEnvironment(context, results), Date.now());
   await runInteractive(
     path.join(cargoTargetDirectory(), 'debug/arrowcol-loadgen'),
-    [command],
-    localLoadgenEnvironment(context, results),
+    [command, ...(command === 'final-compaction' && context.options.finalCompaction === false ? ['--skip-final-compaction'] : [])],
+    plan.env,
     controller,
-    command === 'validate' ? 3_600_000 : context.options.measureSeconds === undefined ? undefined : (context.options.warmupSeconds + context.options.measureSeconds + 600) * 1000,
+    plan.timeout,
   );
 }
 
@@ -444,31 +506,76 @@ export function deltaTableLocations(directory: string): string {
   ].join('\n');
 }
 
-async function benchmark(options: BenchmarkOptions, controller: BenchmarkController): Promise<BenchmarkContext> {
+async function reconcileAzure(context: BenchmarkContext, occupancyId: string): Promise<void> {
+  const manifest = path.join(context.directory, 'router-state/azure-tables.json');
+  run(path.join(cargoTargetDirectory(), 'debug/arrowcol-loadgen'), ['azure-manifest', '--manifest', manifest], context.env);
+  // The helper waits only for absent logs; auth, ownership and malformed logs fail immediately.
+  const stderrFile = path.join(context.directory, 'results/azure-reconcile.stderr.log');
+  try {
+    await runOwnedProcess(process.execPath, [
+      '--import', import.meta.resolve('tsx'), 'infra/azure/bootstrap.ts', 'reconcile', '--tables', manifest,
+      '--occupancy-id', occupancyId, '--wait-seconds', '120',
+    ], { cwd: workspace, env: { ...context.env, AZURE_CONFIG_DIR: path.join(context.directory, 'azure-cli/infra') },
+      // Budget: up to 120s waiting for Delta logs, then ~3 sequential management commands per table
+      // against a cluster that is serving the live load.
+      timeoutMs: 600_000, stderrFile });
+  } catch (error) {
+    // bootstrap.ts redacts private values in its own error lines.
+    const detail = existsSync(stderrFile) ? readFileSync(stderrFile, 'utf8').trim().split('\n').slice(-5).join('\n') : '';
+    if (detail) console.error(`[loadtest] Azure reconcile stderr (${stderrFile}):\n${detail}`);
+    if (error instanceof OwnedProcessError) {
+      console.error(`[loadtest] Azure reconcile outcome: ${JSON.stringify(error.outcome)} supervisor_timed_out=${error.supervisor_timed_out}`);
+    }
+    throw error;
+  }
+}
+
+interface CloudRun {
+  environment: NodeJS.ProcessEnv;
+  occupancyId: string;
+  reconciliationFailed: boolean;
+  qapObservationFailed: boolean;
+}
+
+async function benchmark(
+  options: BenchmarkOptions, controller: BenchmarkController, cloud: CloudRun,
+): Promise<BenchmarkContext> {
+  const stressPlan = options.stressConfiguration;
+  const privateEnv: NodeJS.ProcessEnv = stressPlan
+    ? { ...cloud.environment, ARROWCOL_LAYOUT_ROW_GROUP_ROWS: String(stressPlan.fixture.rowGroupRows),
+      ARROWCOL_LAYOUT_PAGE_ROWS: String(stressPlan.fixture.pageRows) }
+    : cloud.environment;
+  const azure = options.mode === 'azure'
+    ? azureTargets(privateEnv, `run-${Date.now()}-${randomBytes(4).toString('hex')}`)
+    : undefined;
   step(`Load test: warmup ${options.warmupSeconds}s, concurrency ${options.concurrency}, batch rows ${options.batchRows}` +
     (options.quiver ? ', native Quiver disk persistence' : '') +
     (options.crashAfterSeconds === undefined ? '' : `, kill -9 both collectors ${options.crashAfterSeconds}s into load`));
   step('Starting fresh: removing previous loadtest containers, volumes, and generated data');
   const project = BENCHMARK_PROJECT;
   const directory = await resetBenchmark(workspace, args => run('docker', args));
+  beginAttemptEvidence(workspace, directory);
   controller.checkRunning();
   step('Bootstrapping secrets and preparing benchmark');
   for (const child of [
-    'direct', 'dataflow', 'otel', 'results', 'router-state',
+    'direct', 'dataflow', 'tenant', 'tenant-checkpoints', 'otel', 'results', 'router-state',
     'direct-state-1',
     ...(options.quiver ? [benchmarkQuiver.directHostDirectory, benchmarkQuiver.dataflowHostDirectory] : []),
   ]) {
     mkdirSync(path.join(directory, child), { recursive: true });
   }
+  if (stressPlan) writeFileSync(path.join(directory, 'results/stress-input-budget.json'),
+    `${JSON.stringify(stressInputBudget(stressPlan, options), null, 2)}\n`, { flag: 'wx' });
   let network: BenchmarkNetwork;
   let env: NodeJS.ProcessEnv;
   try {
     run(path.join(workspace, 'projects/arrowcol-infra/scripts/bootstrap-secrets.sh'), []);
     mkdirSync(path.join(workspace, 'projects/loadtest/.temp'), { recursive: true });
     network = selectBenchmarkNetwork();
-    writeRuntimeConfigs(directory, network, options.quiver);
+    if (azure) stageAzureCliConfig(directory, privateEnv);
+    writeRuntimeConfigs(directory, network, options.quiver, azure, privateEnv);
     writeFileSync(path.join(directory, 'router-state/network.json'), `${JSON.stringify(network, null, 2)}\n`);
-    env = benchmarkEnvironment(directory, options, network, stageHelperBinaries());
+    env = benchmarkEnvironment(directory, options, network, stageHelperBinaries(), privateEnv, azure);
   } catch (error) {
     writeFileSync(path.join(directory, 'results/runner-failure.json'), `${JSON.stringify({
       timestamp: new Date().toISOString(), phase: 'preparation', kind: error instanceof Error ? error.name : 'Error',
@@ -480,10 +587,13 @@ async function benchmark(options: BenchmarkOptions, controller: BenchmarkControl
   let failure: unknown;
   let phase = 'compose-validation';
   let stopSampler: (() => Promise<void>) | undefined;
+  let stopQapObserver: (() => Promise<void>) | undefined;
+  let stoppedMutators: StoppedMutator[] | undefined;
+  let stackSql: SqlIdentity | undefined;
   const resultsDirectory = path.relative(workspace, path.join(directory, 'results'));
   try {
     step('Validating Compose configuration');
-    writeProvenance(workspace, directory, project, options, env);
+    writeProvenance(workspace, directory, project, options, env, path.join(cargoTargetDirectory(), 'debug'));
     compose(project, env, ['--profile', 'benchmark', 'config', '--quiet']);
     phase = 'image-build';
     step('Building sqlserver and hive-metastore images (can take several minutes on first run)');
@@ -498,6 +608,8 @@ async function benchmark(options: BenchmarkOptions, controller: BenchmarkControl
     ], 3_600_000);
     controller.checkRunning();
     workspaceConnection = connectWorkspaceContainer(project, env);
+    if (!azure && options.validate) stackSql = sqlIdentity(workspace, args => run('docker', args));
+    if (!azure) {
     phase = 'kusto-startup';
     step('Starting optional Kusto inspection target separately from the collectors');
     const kustoStartup = await startKusto({
@@ -509,6 +621,9 @@ async function benchmark(options: BenchmarkOptions, controller: BenchmarkControl
     if (kustoStartup.state === 'degraded') {
       step(`Kusto startup DEGRADED: ${kustoStartup.error}. Load generation will continue; see results/kusto-startup.json`);
     }
+    if (kustoStartup.state !== 'degraded' && privateEnv.LOADTEST_KUSTO_BRIDGE_ENDPOINT) {
+      compose(project, env, ['--profile', 'benchmark', 'up', '--detach', '--no-build', '--wait', '--wait-timeout', '300', 'kusto-bridge'], 360_000);
+    }
     controller.checkRunning();
     phase = 'kusto-explorer-startup';
     step('Starting kusto-explorer (connects to Kusto over the Compose network)');
@@ -519,15 +634,26 @@ async function benchmark(options: BenchmarkOptions, controller: BenchmarkControl
       if (options.validate) throw error;
       step(`kusto-explorer startup DEGRADED: ${safeKustoError(error)}. Load generation will continue`);
     }
+    }
     controller.checkRunning();
     phase = 'startup-provenance';
-    writeProvenance(workspace, directory, project, options, env, true);
+    writeProvenance(workspace, directory, project, options, env, path.join(cargoTargetDirectory(), 'debug'), true);
     phase = 'sampler-start';
     stopSampler = await startResourceSampler({
       project, results: path.join(directory, 'results'),
       directAdmin: `http://${network.direct}:8081`,
       dataflowAdmin: `http://${network.dataflow}:32011`,
     });
+    if (options.validate) {
+      const endpoint = azure ? env.AZURE_KUSTO_URI : `http://${network.kusto}:8080`;
+      if (!endpoint) throw new Error('Azure QAP observation requires the captured Kusto endpoint');
+      stopQapObserver = startQapObserver({
+        binary: path.join(cargoTargetDirectory(), 'debug/arrowcol-loadgen'), cwd: workspace,
+        env: { ...env, ...(azure ? { AZURE_CONFIG_DIR: path.join(directory, 'azure-cli/qap-observer') } : {}) },
+        results: path.join(directory, 'results'),
+        endpoint, otlpEndpoint: `http://${env.LOADTEST_LGTM_IP}:4318`,
+      });
+    }
     step(
       `Grafana: http://localhost:${process.env.GRAFANA_PORT ?? 3000} (admin/admin); ` +
       `logs: docker logs -f ${project}-dataflow-1-1`,
@@ -540,27 +666,40 @@ async function benchmark(options: BenchmarkOptions, controller: BenchmarkControl
       process.env.SQLSERVER_PORT ?? '14333',
       path.join(workspace, 'projects/arrowcol-infra/secrets/sqlserver-sa-password.txt'),
     ));
-    step(deltaTableLocations(directory));
+    step(azure ? 'Delta storage: isolated ADLS run roots (locations retained only in private runtime configuration)' : deltaTableLocations(directory));
     if (options.quiver) step(quiverLocations(directory));
     const context = { directory, env, network, options };
     phase = 'load-generation';
     step('Running load generator (Ctrl+C to stop; stack is kept)');
     const loadEnded = new AbortController();
+    const crashEndpoints = { direct: `http://${network.direct}:8081`, dataflow: `http://${network.dataflow}:32011` };
+    let killedPublishers: KilledPublishers | undefined;
     const crash = options.crashAfterSeconds === undefined ? undefined : runQuiverCrash({
       crashAfterSeconds: options.crashAfterSeconds,
       directAdmin: `http://${network.direct}:8081`,
       dataflowAdmin: `http://${network.dataflow}:32011`,
       results: path.join(directory, 'results'),
       kill: async () => {
-        await composeAsync(project, env, ['--profile', 'benchmark', 'kill', '--signal', 'SIGKILL', 'direct-1', 'dataflow-1']);
+        killedPublishers = await killQuiverPublishers({
+          workspace, results: path.join(directory, 'results'), endpoints: crashEndpoints,
+          docker: args => run('docker', args, env),
+          kill: async () => {
+            await composeAsync(project, env, ['--profile', 'benchmark', 'kill', '--signal', 'SIGKILL', 'direct-1', 'dataflow-1']);
+          },
+        });
       },
       restart: async () => {
         // A restarted Direct process is a new receipt-owner generation that adopts its predecessor's receipts.
-        writeDirectConfig(directory, 'direct-1', network, true);
+        writeDirectConfig(directory, 'direct-1', network, true, azure, privateEnv);
         await composeAsync(project, env, [
           '--profile', 'benchmark', 'up', '--detach', '--no-build', '--no-deps', '--wait', '--wait-timeout', '300',
           'direct-1', 'dataflow-1',
         ], 360_000);
+        assert(killedPublishers, 'Missing exact killed collector identities');
+        await recordQuiverSuccessors({
+          workspace, results: path.join(directory, 'results'), endpoints: crashEndpoints,
+          docker: args => run('docker', args, env), killed: killedPublishers,
+        });
       },
       log: step,
       loadEnded: loadEnded.signal,
@@ -568,7 +707,39 @@ async function benchmark(options: BenchmarkOptions, controller: BenchmarkControl
     });
     const load = runLocalLoadgen(context, 'run', path.join(directory, 'results'), controller)
       .finally(() => loadEnded.abort());
-    const [loadOutcome, crashOutcome] = await Promise.allSettled([load, crash]);
+    const stressRuntime = stressPlan ? new LocalStressRuntime({
+      workspace, directory, project, env, composeFiles: benchmarkComposeFiles(composeFile, env),
+      reader: path.join(cargoTargetDirectory(), 'debug/delta-inspect'),
+      directAdmin: `http://${network.direct}:8081`, dataflowAdmin: `http://${network.dataflow}:32011`,
+      quiver: options.quiver, loadEnded: loadEnded.signal, checkRunning: () => controller.checkRunning(),
+      fixture: stressPlan.fixture, windowSeconds: stressPlan.durationSeconds,
+      sampleTimeoutSeconds: stressPlan.sampleTimeoutSeconds, measureSeconds: options.measureSeconds,
+      privateScratch: path.join(workspace, 'projects/loadtest/.temp/loadgen/latest/diagnostics'),
+      physicalRoots: Object.fromEntries([
+        'direct', 'dataflow', 'tenant', 'tenant-checkpoints', 'direct-state-1', 'dataflow-state-1', 'router-state',
+      ].map(name => [name, path.join(directory, name)]).concat([
+        ['loadgen-staging', path.join(workspace, 'projects/loadtest/.temp/loadgen/latest')],
+      ])),
+    }) : undefined;
+    const stress = stressPlan && stressRuntime ? runStressDriver({
+      plan: stressPlan, results: path.join(directory, 'results'), loadEnded: loadEnded.signal,
+      checkRunning: () => controller.checkRunning(),
+      waitForInput: deadline => stressRuntime.waitForInput(deadline),
+      operate: (wave, deadline) => stressRuntime.operate(wave, deadline),
+      sample: (wave, runId, deadline) => stressRuntime.sample(wave, runId, deadline),
+    }) : undefined;
+    const reconciliation = azure ? reconcileAzure({ ...context, project }, cloud.occupancyId).catch(error => {
+      cloud.reconciliationFailed = true;
+      throw error;
+    }) : undefined;
+    const [loadOutcome, crashOutcome, reconcileOutcome, stressOutcome] = await Promise.allSettled([load, crash, reconciliation, stress]);
+    if (reconcileOutcome.status === 'rejected') {
+      phase = 'azure-external-reconcile';
+      if (loadOutcome.status === 'rejected') {
+        throw new AggregateError([reconcileOutcome.reason, loadOutcome.reason], 'Azure reconciliation and load generation failed');
+      }
+      throw reconcileOutcome.reason;
+    }
     if (loadOutcome.status === 'rejected') throw loadOutcome.reason;
     if (crashOutcome.status === 'rejected') {
       phase = 'quiver-recovery';
@@ -576,10 +747,51 @@ async function benchmark(options: BenchmarkOptions, controller: BenchmarkControl
     }
     if (crash) step(`Quiver crash recovery evidence: ${resultsDirectory}/${QUIVER_RECOVERY_FILE}`);
     if (options.validate) {
+      phase = 'publication-drain';
+      step('Draining publication while collector admin endpoints remain available');
+      await runLocalLoadgen(context, 'drain', path.join(directory, 'results'), controller);
+      phase = 'live-grafana-validation';
+      await runGrafanaGate({
+        workspace, results: path.join(directory, 'results'), browserEndpoint: `ws://${network.playwright}:3000/`,
+        metricScope: 'source-sdk', bridgeEnabled: Boolean(env.LOADTEST_KUSTO_BRIDGE_ENDPOINT),
+        compose: (args, timeout) => compose(project, env, args, timeout), log: step,
+      });
+      phase = 'mutator-drain';
+      step('Cleanly stopping all source, maintenance and tenant mutators before immutable snapshot capture');
+      if (!azure) {
+        assert(stackSql, 'Missing stack-start SQL generation');
+        stoppedMutators = await admitPublisherRelease({
+          workspace, directory, sql: stackSql, docker: args => run('docker', args),
+          sdk: path.join(cargoTargetDirectory(), 'debug/arrowcol-sdk-gen'),
+          stop: () => stopBenchmark(workspace, args => run('docker', args, process.env, 360_000), {
+            requireCleanMutators: true, mutatorsOnly: true,
+          }),
+          release: async () => {
+            phase = 'publisher-release';
+            await runLocalLoadgen(context, 'publisher-release', path.join(directory, 'results'), controller);
+          },
+          compact: async () => {
+            phase = 'final-compaction';
+            await runLocalLoadgen(context, 'final-compaction', path.join(directory, 'results'), controller);
+          },
+        });
+      } else {
+      const cleanServices = await stopBenchmark(workspace, args => run('docker', args, process.env, 360_000), {
+        requireCleanMutators: true, mutatorsOnly: true,
+      });
+      stoppedMutators = stoppedAttemptMutators(workspace, args => run('docker', args), cleanServices);
+      const metadata: unknown = JSON.parse(readFileSync(path.join(directory, 'results/run-metadata.json'), 'utf8'));
+      assert(metadata && typeof metadata === 'object' && 'run_id' in metadata && typeof metadata.run_id === 'string',
+        'Cannot bind stopped-mutator evidence without the run identity');
+      writeFileSync(path.join(directory, 'results/mutator-drain.json'), `${JSON.stringify({
+        run_id: metadata.run_id, clean: true, services: cleanServices, finished_at: new Date().toISOString(),
+      }, null, 2)}\n`);
+      }
       phase = 'output-validation';
       step('Validating Delta and native Kusto output');
       controller.checkRunning();
       await runLocalLoadgen(context, 'validate', path.join(directory, 'results'), controller);
+      if (!azure) {
       requireHealthyKusto(readKustoStatus(path.join(directory, 'results')));
       phase = 'ui-validation';
       step('Validating that the loadtest data is queryable through kusto-explorer (Playwright)');
@@ -592,10 +804,21 @@ async function benchmark(options: BenchmarkOptions, controller: BenchmarkControl
         log: step,
       });
       step(`kusto-explorer UI gate passed: ${gate.tables} tables and ${gate.rows} rows matched through the UI`);
+      }
+    }
+    if (stressOutcome.status === 'rejected') {
+      phase = 'fixed-window-stress';
+      throw stressOutcome.reason;
     }
   } catch (error) {
     failure = error;
   } finally {
+    try {
+      await stopQapObserver?.();
+    } catch (error) {
+      cloud.qapObservationFailed = true;
+      failure = failure ? new AggregateError([failure, error], 'Benchmark and QAP observation failed') : error;
+    }
     try {
       await stopSampler?.();
     } catch (error) {
@@ -619,8 +842,25 @@ async function benchmark(options: BenchmarkOptions, controller: BenchmarkControl
     step(`FAILED. Diagnostics: ${resultsDirectory}/compose.log`);
     throw failure;
   }
-  step(`Load generation finished. ${kustoStatusSummary(readKustoStatus(path.join(directory, 'results')))}. ` +
-    `Results: ${resultsDirectory}. Stack kept for inspection; the next start resets it.`);
+  if (options.validate && !azure) {
+    if (!stoppedMutators) throw new Error('Attempt evidence requires positively verified stopped mutators');
+    try {
+      await sealAttemptEvidence(workspace, directory, path.join(cargoTargetDirectory(), 'debug'),
+        (args, timeout) => run('docker', args, process.env, timeout), stoppedMutators, env.ONELAKE_HOST_PATH,
+        undefined, () => controller.checkRunning());
+    } catch (error) {
+      writeFileSync(path.join(directory, 'results/runner-failure.json'), `${JSON.stringify({
+        timestamp: new Date().toISOString(), phase: 'attempt-evidence', kind: 'Error',
+      })}\n`);
+      throw error;
+    }
+    step('Validated attempt evidence sealed privately; owned router stopped after qualification');
+  } else {
+    step('Attempt remains unsealed; a subsequent reset is blocked to preserve its original data');
+  }
+  step(`Load generation finished. ${azure ? 'Azure mode; QAP evidence is a separate required live gate' : kustoStatusSummary(readKustoStatus(path.join(directory, 'results')))}. ` +
+    `Results: ${resultsDirectory}. Stack retained for inspection; ` +
+    (options.validate && !azure ? 'the next start verifies the private seal before reset.' : 'reset is blocked for this unsealed attempt.'));
   return {
     directory,
     env,
@@ -635,16 +875,75 @@ async function benchmark(options: BenchmarkOptions, controller: BenchmarkControl
 async function main(): Promise<void> {
   const userArguments = process.argv.slice(2);
   if (userArguments.some((argument) => argument === '--help' || argument === '-h')) {
-    console.log(benchmarkUsage);
+    console.log(`${benchmarkUsage}\n--stop (stop this workspace's owned services and generator; preserve data)` +
+      `\n--discard-unsealed (stop, then move failed/interrupted/Azure attempts to .temp/loadtest-discarded so the next start can reset)`);
+    return;
+  }
+  if (userArguments.length === 1 && userArguments[0] === '--discard-unsealed') {
+    const controller = await acquireBenchmarkController(workspace);
+    try {
+      await stopBenchmark(workspace, args => run('docker', args));
+      const moved = discardUnsealedAttempts(workspace);
+      console.log(JSON.stringify({ discarded: moved.length, quarantine: moved, dataDeleted: false }));
+    } finally {
+      controller.close();
+    }
+    return;
+  }
+  if (userArguments.length === 1 && userArguments[0] === '--stop') {
+    const receipt = stopReceipt(process.env.ARROWCOL_RESET_GENERATION);
+    const controller = await acquireBenchmarkController(workspace);
+    try {
+      await stopBenchmark(workspace, args => run('docker', args));
+      console.log(JSON.stringify(receipt));
+    } finally {
+      controller.close();
+    }
     return;
   }
   const options = parseBenchmarkOptions(userArguments);
-  const controller = await acquireBenchmarkController(workspace);
-  try {
-    await benchmark(options, controller);
-  } finally {
-    controller.close();
+  if (options.stressPlan) {
+    if (options.mode !== 'local') {
+      throw new Error('Azure stress requires a complete ADLS physical inventory adapter; local functional evidence cannot qualify Azure');
+    }
+    const plan = readStressPlan(options.stressPlan);
+    options.stressConfiguration = plan;
+    if (options.batchRows !== plan.fixture.batchRows) throw new Error('--batch-rows must equal the predeclared stress fixture batchRows');
+    options.measureSeconds = stressInputBudget(plan, options).measureSeconds;
   }
+  const privateEnv = modeEnvironment(workspace, options.mode, process.env);
+  requirePreviousAttemptEvidence(workspace);
+  const controller = await acquireBenchmarkController(workspace);
+  const occupancyId = randomUUID();
+  const cloud: CloudRun = { environment: privateEnv, occupancyId, reconciliationFailed: false, qapObservationFailed: false };
+  let occupied = false;
+  let failure: unknown;
+  try {
+    if (options.mode === 'azure') {
+      azureTargets(privateEnv, 'preflight');
+      run(process.execPath, ['--import', import.meta.resolve('tsx'), 'infra/azure/bootstrap.ts', 'occupy', '--occupancy-id', occupancyId], privateEnv);
+      occupied = true;
+      cloud.environment = modeEnvironment(workspace, options.mode, process.env);
+    }
+    // Occupy exports the exact ready storage generation; never substitute a run UUID.
+    await benchmark(options, controller, cloud);
+  } catch (error) {
+    failure = error;
+  } finally {
+    try {
+      if (occupied) {
+        await stopBenchmark(workspace, args => run('docker', args, process.env, 360_000), { requireCleanMutators: true });
+        if (cloud.reconciliationFailed) throw new Error('Azure reconciliation failed; retain occupancy pending authoritative reconciliation');
+        if (cloud.qapObservationFailed) throw new Error('QAP helper failed; retain occupancy pending helper/evidence inspection');
+        run(process.execPath, ['--import', import.meta.resolve('tsx'), 'infra/azure/bootstrap.ts', 'release', '--occupancy-id', occupancyId], cloud.environment);
+      }
+    } catch (error) {
+      failure = failure ? new AggregateError([failure, error], 'Benchmark and cloud drain/release failed; occupancy is not force-cleared') : error;
+    } finally {
+      controller.close();
+    }
+  }
+  if (failure) throw failure;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

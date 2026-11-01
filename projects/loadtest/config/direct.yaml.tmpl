@@ -115,8 +115,9 @@ auth:
   allow_all_subject: null
 
 shutdown:
-  stream_drain_timeout_ms: 120000
-  publication_drain_timeout_ms: 300000
+  # Stream plus publication drain stays well inside the 300 s supervisor stop budget.
+  stream_drain_timeout_ms: 60000
+  publication_drain_timeout_ms: 180000
 
 telemetry:
   log_filter: info,arrowcol_rust=debug

@@ -86,17 +86,47 @@ pub(crate) fn read_csv(table: &BenchmarkTable, csv: Option<&Path>, batch_rows: u
 
 #[cfg(test)]
 mod tests {
+    use arrow::array::StringArray;
+    use arrow::datatypes::{DataType, Field};
+
     use super::*;
 
     #[test]
     fn builtin_csv_matches_the_benchmark_schema() -> Result<()> {
         let table = BenchmarkTable::load(DEFAULT_TABLE)?;
         assert_eq!(table.schema.identity().to_string(), DEFAULT_TABLE);
-        assert_eq!(table.arrow.fields().len(), 10);
+        assert_eq!(table.arrow.fields().len(), 11);
+        assert_eq!(table.arrow.field(0), &Field::new("customer_id", DataType::Utf8, false));
+        let header = std::str::from_utf8(BUILTIN_CSV)?
+            .lines()
+            .next()
+            .context("built-in CSV header is missing")?;
+        assert_eq!(
+            table
+                .arrow
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            header.split(',').collect::<Vec<_>>(),
+        );
         let batches = read_csv(&table, None, 128)?;
         assert!(batches.len() > 1);
         assert!(batches.iter().all(|batch| batch.num_rows() <= 128));
         assert!(batches.iter().all(|batch| batch.schema() == table.arrow));
+        let mut row = 0;
+        for batch in &batches {
+            let customers = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .context("customer_id is not a string array")?;
+            for customer in customers.iter() {
+                assert_eq!(customer, Some(format!("customer-{:04}", row % 16).as_str()));
+                row += 1;
+            }
+        }
+        assert_eq!(row, 3_546);
         Ok(())
     }
 

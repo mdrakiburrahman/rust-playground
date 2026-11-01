@@ -69,13 +69,24 @@ export function parseMetrics(text: string): Record<string, number> {
 }
 
 // Static commands only; never read container environment or print Docker error output.
-const resourceScript = [
-  ['status', '/proc/1/status'],
+export const resourceScript = [
+  'pid=1',
+  'depth=0',
+  'while [ "$depth" -lt 8 ]; do ' +
+    'case "$(cat "/proc/$pid/comm")" in docker-init|tini) set -- $(cat "/proc/$pid/task/$pid/children"); ' +
+    'if [ "$#" -ne 1 ]; then printf "__READ_ERROR__\\n"; exit 1; fi; pid="$1"; depth=$((depth+1));; *) break;; esac; done',
+  'if [ "$depth" -ge 8 ]; then printf "__READ_ERROR__\\n"; exit 1; fi',
+  'case "$(readlink "/proc/$pid/exe")" in */arrowcol-rust|*/arrowcol-dataflow-rust) ;; ' +
+    '*) printf "__READ_ERROR__\\n"; exit 1;; esac',
+  'printf "\\n__status__\\n"; cat "/proc/$pid/status" 2>/dev/null || printf "__READ_ERROR__\\n"',
+  ...[
   ['current', '/sys/fs/cgroup/memory.current'],
   ['stat', '/sys/fs/cgroup/memory.stat'],
   ['cpu', '/sys/fs/cgroup/cpu.stat'],
-].map(([name, file]) =>
-  `printf '\\n__${name}__\\n'; cat ${file} 2>/dev/null || printf '__READ_ERROR__\\n'`).join('; ');
+  ['events', '/sys/fs/cgroup/memory.events'],
+  ].map(([name, file]) =>
+    `printf '\\n__${name}__\\n'; cat ${file} 2>/dev/null || printf '__READ_ERROR__\\n'`),
+].join('; ');
 
 export function parseResources(text: string): Record<string, unknown> {
   const sections = (name: string): string => {
@@ -101,6 +112,7 @@ export function parseResources(text: string): Record<string, unknown> {
     return { currentBytes, workingSetBytes: Math.max(0, currentBytes - stat.inactive_file), stat };
   });
   read('cpu', () => parseCounters(sections('cpu')));
+  read('events', () => parseCounters(sections('events')));
   return parsed;
 }
 
@@ -122,7 +134,7 @@ async function adminSample(endpoint: string): Promise<Record<string, unknown>> {
   return { metrics, readiness };
 }
 
-async function collectorSample(project: string, service: string, endpoint: string): Promise<Record<string, unknown>> {
+export async function collectorSample(project: string, service: string, endpoint: string): Promise<Record<string, unknown>> {
   const timestamp = new Date().toISOString();
   const identity = await capture(async () => {
     const ids = (await docker([

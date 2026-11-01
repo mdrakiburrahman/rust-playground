@@ -20,5 +20,12 @@ onelake
 **/coverage
 **/secrets
 **/target
+.env
+.env.*
+**/.env
+**/.env.*
+sync
+!**/.env.example
+!**/.env.*.example
 **/node_modules
 **/dist

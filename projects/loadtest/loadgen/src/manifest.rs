@@ -81,6 +81,8 @@ pub struct ReceiptManifestEntry {
     pub bytes_published: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
 }
 
 /// Ordered generated-schema contract retained with the run.
@@ -158,9 +160,13 @@ impl ManifestWriter {
     pub async fn write_json<T: Serialize>(&self, name: &str, value: &T) -> Result<()> {
         let mut bytes = serde_json::to_vec_pretty(value)?;
         bytes.push(b'\n');
-        fs::write(self.root.join(name), bytes)
+        let next = self.root.join(format!("{name}.next"));
+        fs::write(&next, bytes)
             .await
-            .with_context(|| format!("write result artifact {name}"))
+            .with_context(|| format!("write result artifact {name}"))?;
+        fs::rename(next, self.root.join(name))
+            .await
+            .with_context(|| format!("publish result artifact {name}"))
     }
 
     /// Flushes append-only manifest buffers.
@@ -229,6 +235,42 @@ mod tests {
 
     use super::*;
     use crate::cli::Scenario;
+
+    #[tokio::test]
+    async fn progress_replacement_never_exposes_partial_json() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("loadgen-atomic-progress-{}", uuid::Uuid::new_v4()));
+        let writer = ManifestWriter::create(&root).await?;
+        writer
+            .write_json(
+                "driver-progress.json",
+                &serde_json::json!({"sequence":0,"body":"x".repeat(8192)}),
+            )
+            .await?;
+        let updating = writer.clone();
+        let task = tokio::spawn(async move {
+            for sequence in 1..=100 {
+                updating
+                    .write_json(
+                        "driver-progress.json",
+                        &serde_json::json!({"sequence":sequence,"body":"x".repeat(8192)}),
+                    )
+                    .await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+        let mut observations = 0;
+        while !task.is_finished() {
+            let value: serde_json::Value = serde_json::from_slice(&fs::read(root.join("driver-progress.json")).await?)?;
+            assert!(value["sequence"].as_u64().is_some_and(|sequence| sequence <= 100));
+            assert_eq!(value["body"].as_str().map(str::len), Some(8192));
+            observations += 1;
+        }
+        task.await??;
+        assert!(observations > 0);
+        drop(writer);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn append_only_manifests_round_trip_without_partial_lines() -> Result<()> {

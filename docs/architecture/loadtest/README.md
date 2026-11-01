@@ -1,196 +1,141 @@
-# Arrow load generator
+# ArrowCol lakehouse loadtest
 
-[![Arrow load generator architecture](arrow-load-generator.png)](arrow-load-generator.html)
+[![Complete local and Azure lakehouse loadtest](../../../loadtest-architecture.png)](../../../loadtest-architecture.html)
 
-The load generator registers 13 table schemas through Flight SQL, exports the
-immutable catalog artifacts, generates Rust and TypeScript SDKs, and builds
-every `RecordBatch` from the generated schema. A deterministic scheduler sends
-logical batches through the Pingora router to three direct collectors and three
-DFE collectors.
+The [root architecture diagram](../../../loadtest-architecture.html) follows
+the complete workload from catalog registration to independent validation.
+The [collector-path detail](arrow-load-generator.html) and its
+[PNG snapshot](arrow-load-generator.png) focus on generated Arrow and paired
+publication. HTML sources and PNGs are kept together; PNGs are rendered with
+a real browser, not exported from a different diagram.
+The [snapshot receipt](../snapshots.json) records the browser version,
+viewport widths, and source/PNG SHA-256 digests.
 
-In paired mode, both collector pools receive the same logical batch:
+## Generated workload and publication
 
-- the direct path polls each SQL-backed receipt until `published` or a
-  structured terminal failure; and
-- the DFE path records only `best_effort_admission`, or `durable_admission`
-  when `--quiver` persists both pools to Quiver on local disk.
+The generator registers 13 table schemas through Flight SQL, exports immutable
+catalog artifacts, generates Rust and TypeScript SDKs, and constructs every
+`RecordBatch` from the generated schema. Every schema includes explicit
+`customer_id`; deterministic interleaved customers exercise tenant predicates
+and sorted Parquet row groups.
 
-The two pools write separate Delta roots. The independent validator compares
-schemas, rows, logical batch manifests, paired payload hashes, routing leases,
-collector participation, and snapshot-selected Delta files.
+The paired workload sends the same logical batch through the Pingora router
+to separate Direct and Dataflow pools. Each pool owns independent Delta roots.
+Direct polls SQL-backed receipts until publication or a structured terminal
+failure. Dataflow reports best-effort admission by default, or durable admission
+with native Quiver. Neither path deduplicates independent client submissions.
 
-## Prerequisites
+Delta Kernel publication writes data before atomically publishing the log.
+Stable publication transaction identity protects the retry of that publication,
+not two separate requests with identical content. Ingestion-time UTC partition
+stamps survive retry and Quiver replay; loadtests use minute partitions.
 
-Run from the repository root in the source devcontainer:
+## Modes and downstream semantics
 
-```bash
-git submodule update --init --recursive
-npm ci
-```
+`--mode local|azure` selects the storage and Kusto pair together; the default
+comes from `ARROWCOL_MODE`, falling back to `local`.
 
-The benchmark bootstraps its local SQL Server/Hive secrets automatically. It
-uses source-built `:dev` images and does not pull the published GHCR images.
+| Surface | Local mode | Azure mode |
+| --- | --- | --- |
+| Source Delta | Local disk, separate pool roots | ADLS Gen2, separate pool roots |
+| Kusto | Pinned emulator: native external Delta with Query Acceleration Policy | External Delta tables with native Query Acceleration Policy |
+| Storage identity | Scoped local mounts | Existing Azure CLI writer identity; dedicated Kusto storage-read UAMI |
+| Evidence | Functional integration, active-file visibility, recovery | Real QAP state, capacity, lag, correctness, and reacceleration |
 
-## Finite benchmark
+The emulator is a functional integration surface, not an Azure performance
+benchmark. Native external Delta/QAP is the default; an experimental bridge is
+not an automatic fallback. The local policy uses `MaxAge=1min`, with a bounded
+five-minute convergence gate after append, OPTIMIZE, delete, partition PURGE,
+and VACUUM. Longer `MaxAge` can retain stale cached rows.
+The local emulator's acceleration worker pool is pinned to 16, independent of
+host cores, so cache convergence after final compaction does not depend on
+the runner size.
 
-Run direct, DFE, and paired phases, then validate and remove the scoped stack:
+Cache statistics alone do not establish freshness: a reported 100% acceleration,
+zero pending files, and recent update time can coexist with stale query results.
+Require current `TableVersion`, healthy `IsHealthy`, and expected
+`AcceleratedRowCount` from `QueryAccelerationState`, plus actual cached
+row-multiset equality with both the
+independent oracle and uncached fallback. Record observed convergence separately
+from the bounded deadline; focused native-probe acceptance does not prove the
+integrated 13-schema workload or Explorer/stress acceptance.
 
-```bash
-npx --no-install nx run loadtest:run -- \
-  --warmup 2m \
-  --measure 1m
-```
+The exact corpus is packed into disjoint whole-partition chunks: at most 256
+distinct complete rows per chunk and 65,536 per captured table. A single
+oversized partition, an unsupported partition shape, or a changing capture
+fails explicitly; the oracle never samples or truncates rows to pass. Exact
+partition and total counts include duplicate multiplicities and reject
+unexpected rows. The cached phase has one global five-minute deadline across
+all tables and chunks; fallback validation is a separate phase. The focused
+all-13 native type harness uses sequential per-table waits, so its completion
+time is not proof of that production global budget.
 
-Results are retained at:
+Native Kusto follows the current active snapshot after asynchronous refresh,
+including OPTIMIZE replacements and partition removals. A tenant fork has
+intentionally different semantics: capture a snapshot, tail logical appends,
+ignore OPTIMIZE, and retain already-copied rows after source purge.
 
-```text
-onelake/benchmark/bench-1/results/
-```
+Standalone maintenance plans and revalidates work before applying it. OPTIMIZE
+rewrites real files with `dataChange=false`; PURGE removes existing expired
+partitions; VACUUM LITE uses retained tombstones and keeps the ordinary seven-day
+safety floor. Physical retention bounds recovery: missing required source history
+or files must fail visibly rather than advancing a consumer checkpoint.
+Kernel checkpoints preserve active state and publication/query transaction IDs.
+Optional log pruning additionally requires a proven checkpoint, durable vacuum
+progress, eligible retained history and a durable floor; it does not make
+expired source history available to a lagging consumer. No whole-storage byte
+plateau follows merely from configuring checkpoint cadence.
 
-Useful files include:
+Azure mutators capture `ARROWCOL_RESET_GENERATION` before leased publisher
+admission and owned data, log or checkpoint I/O. Original WAL generations remain bound across restart;
+the tenant sink and checkpoint share one process session. Explicit close follows
+drain, and uncertain physical outcomes retain their blocking registration.
+Bootstrap has its separate `ARROWCOL_EXPECTED_RESET_GENERATION` precondition.
 
-- `sent-batches.jsonl`: logical batch IDs, table, schema, rows, Arrow bytes,
-  attempts, and outcomes;
-- `receipts.jsonl`: direct receipt state and publication results;
-- `routing.json`: collector registration and table ownership;
-- `schema-contracts.json`: normalized generated schema evidence;
-- `validation.json`: final Delta and parity result; and
-- `compose.log` / `compose-ps.json`: retained diagnostics.
+## Operations and qualification
 
-## Continuous comparison with Grafana
+Use the [loadtest CLI guide](../../../projects/loadtest/README.md) as the
+canonical source for current commands, flags, prerequisites, lifecycle,
+diagnostics, and evidence locations. Keeping operational examples there avoids
+the obsolete duplicated CLI that previously lived in this architecture guide.
 
-Run the requested live paired comparison:
-
-```bash
-npx --no-install nx run loadtest:run -- \
-  --run-id live \
-  --warmup 2m \
-  --continuous \
-  --keep-stack
-```
-
-Continuous mode:
-
-- selects paired Arrow traffic;
-- ignores `--measure`;
-- runs until `Ctrl+C`;
-- drains direct receipts before the client exits; and
-- retains the stack because `--keep-stack` is set.
-
-Open:
-
-- Grafana: `http://127.0.0.1:3000`
-- Prometheus: `http://127.0.0.1:9090`
-- SQL Server: `127.0.0.1,14333` (`sa` / password printed by the run;
-  `SQLSERVER_PORT` overrides the host port, mapped to container port `1433`;
-  `sqlserver-data` is mounted at `/var/opt/mssql`)
-- Portainer: `https://127.0.0.1:9444` (`admin` / SQL Server SA password, printed
-  by the run; `PORTAINER_PORT` overrides the port)
-
-Connect to SSMS via:
-
-![SSMS](assets/ssms.png)
-
-Grafana provisions separate **Arrow Flight** and **OTEL Collector Baseline**
-folders. Add `--otel-baseline` if you also want the OTEL workload and its
-separate dashboard.
-
-Stop the retained stack:
-
-```bash
-npx --no-install tsx projects/loadtest/src/main.ts \
-  benchmark-down --run-id live
-```
-
-Remove retained loadtest output only after stopping the stack:
+Run the repository checks inside the Linux devcontainer:
 
 ```bash
-npx --no-install nx run loadtest:clean
+npx nx run rust:verify
+npx nx run loadtest:verify
+npx nx run-many -t verify --all --parallel=1
+npx nx run hello-world:image-smoke
 ```
 
-## Focus a scenario
+Qualification compares both pools across all schemas with an independent Delta
+reader, committed snapshot-selected files, manifest hashes, row multisets,
+partition metadata, routing ownership, and recovery evidence. The delta-rs
+reader is a validation oracle, not the production transaction writer.
 
-```bash
-# Durable direct collector only.
-npx --no-install nx run loadtest:run -- \
-  --run-id direct-only \
-  --warmup 30s \
-  --measure 2m \
-  --scenarios direct
+Metrics, logs, and traces feed LGTM/Grafana. Maintenance, stream/checkpoint, native QAP,
+and publication signals must be observed live, not inferred from dashboard JSON.
+Keep the optional OTEL baseline separate from Arrow Flight panels.
+The lifecycle drains publications while admin endpoints are alive, captures
+actual panel query ranges, returned frames and screenshots, then cleanly stops
+the source, tenant and maintenance mutators before immutable Delta/native
+validation. Kusto, LGTM and Explorer remain available. Run- and
+generation-bound receipts are evidence, not proof that an unknown operation
+has completed. The source-SDK baseline scope is distinct from full-service
+qualification of maintenance, tenant effects and native QAP.
 
-# DFE collector only.
-npx --no-install nx run loadtest:run -- \
-  --run-id dfe-only \
-  --warmup 30s \
-  --measure 2m \
-  --scenarios dataflow
+Azure configuration remains in a gitignored private `.env`; do not commit
+subscription/resource values or credentials into diagrams, screenshots, logs,
+or public evidence. Cloud checks are explicit and credential-gated: a skipped
+check is not a pass. Bind measurements to the integrated source SHA and record
+limitations. Stop the Azure cluster after live tests. Reset is preview-first;
+public execution remains unconditionally disabled until distributed publisher
+admission, uncertain-operation retention, fencing, and definitive drain are
+enforced across every mutator. The intended explicit-execution path removes only
+verified owned data and preserves the account, containers, cluster, and managed
+identity. Preview or offline control-plane tests do not establish live reset safety.
 
-# Identical logical batches sent concurrently to both pools.
-npx --no-install nx run loadtest:run -- \
-  --run-id paired \
-  --warmup 30s \
-  --measure 2m \
-  --scenarios paired
-```
-
-## Tune load
-
-```bash
-npx --no-install nx run loadtest:run -- \
-  --run-id tuned \
-  --warmup 1m \
-  --measure 5m \
-  --lanes 8 \
-  --batch-rows 16384 \
-  --seed 20260923
-```
-
-Supported flags:
-
-| Flag | Purpose |
-| --- | --- |
-| `--run-id` | Stable run, Compose project, output, and dashboard identity. |
-| `--warmup` | Warmup duration; accepts seconds or `30s`, `2m`, `1h`. |
-| `--measure` | Finite measurement duration. |
-| `--capture-settle` | Delay before final capture/validation. |
-| `--drain-timeout` | Bound for receipt and shutdown drain. |
-| `--request-timeout` | Bound for each client operation. |
-| `--continuous` | Run paired traffic until interrupted. |
-| `--keep-stack` | Retain Compose and LGTM after the client stops. |
-| `--lanes` | Concurrent scheduling lanes. |
-| `--batch-rows` | Rows in each generated `RecordBatch`. |
-| `--seed` | Deterministic table order and synthetic values. |
-| `--scenarios` | Comma-separated `direct`, `dataflow`, and/or `paired`. |
-| `--otel-baseline` | Start the separate OTEL workload and dashboard. |
-
-CLI values override `LOADTEST_*` environment values, which override built-in
-defaults.
-
-## Full acceptance and chaos
-
-Run the complete OTEL plus Arrow qualification:
-
-```bash
-npx --no-install nx run loadtest:e2e
-```
-
-It runs the baseline, then `--quiver --crash-after 15s`. The second run sends
-`SIGKILL` to both collectors mid-load, restarts them on their Quiver
-directories, and requires every acknowledged row in Delta.
-
-Run the Arrow failure/recovery sequence directly:
-
-```bash
-npx --no-install nx run loadtest:chaos -- \
-  --run-id chaos-1 \
-  --warmup 0 \
-  --measure 3s \
-  --batch-rows 64
-```
-
-The chaos sequence covers owner kill, lease expiry, resend, stale publication
-fencing, greater-generation restart, graceful collector drain, bounded SQL
-outage, and SQL recovery.
-
-For implementation and fixture details, see
-[`projects/loadtest/README.md`](../../../projects/loadtest/README.md).
+See [storage contracts](../arrowcol-platform/storage.md),
+[delivery guarantees](../arrowcol-platform/delivery-guarantees.md), and
+[observability](../arrowcol-platform/observability.md) for the corresponding
+platform boundaries.

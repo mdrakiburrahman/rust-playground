@@ -56,6 +56,14 @@ pub fn schema_statements() -> Result<Vec<SchemaStatement>> {
         if create.fields().iter().any(|field| field.is_nullable()) {
             bail!("synthetic SQL Server fields must all be required");
         }
+        let customer = create
+            .fields()
+            .first()
+            .context("synthetic table has no fields")?
+            .to_arrow()?;
+        if customer.name() != "customer_id" || customer.data_type() != &arrow::datatypes::DataType::Utf8 {
+            bail!("every synthetic table must start with required customer_id VARCHAR");
+        }
         statements.push(SchemaStatement {
             ddl: ddl.to_owned(),
             identity: create.identity().clone(),
@@ -106,24 +114,24 @@ mod tests {
         assert_eq!(
             summary,
             vec![
-                ("sqlserver_active_sessions".to_owned(), 8),
-                ("sqlserver_availability_group_states".to_owned(), 12),
-                ("sqlserver_availability_replica_states".to_owned(), 21),
-                ("sqlserver_client_connections".to_owned(), 13),
-                ("sqlserver_cpu_utilization".to_owned(), 7),
-                ("sqlserver_database_properties".to_owned(), 43),
-                ("sqlserver_database_replica_states".to_owned(), 36),
-                ("sqlserver_database_storage_utilization".to_owned(), 15),
-                ("sqlserver_memory_utilization".to_owned(), 7),
-                ("sqlserver_performance_counters_common".to_owned(), 10),
-                ("sqlserver_performance_counters_detailed".to_owned(), 10),
-                ("sqlserver_storage_io".to_owned(), 18),
-                ("sqlserver_wait_stats".to_owned(), 10),
+                ("sqlserver_active_sessions".to_owned(), 9),
+                ("sqlserver_availability_group_states".to_owned(), 13),
+                ("sqlserver_availability_replica_states".to_owned(), 22),
+                ("sqlserver_client_connections".to_owned(), 14),
+                ("sqlserver_cpu_utilization".to_owned(), 8),
+                ("sqlserver_database_properties".to_owned(), 44),
+                ("sqlserver_database_replica_states".to_owned(), 37),
+                ("sqlserver_database_storage_utilization".to_owned(), 16),
+                ("sqlserver_memory_utilization".to_owned(), 8),
+                ("sqlserver_performance_counters_common".to_owned(), 11),
+                ("sqlserver_performance_counters_detailed".to_owned(), 11),
+                ("sqlserver_storage_io".to_owned(), 19),
+                ("sqlserver_wait_stats".to_owned(), 11),
             ]
         );
         assert_eq!(
             format!("sha256:{}", hex::encode(Sha256::digest(schema_ddl().as_bytes()))),
-            "sha256:bfa143356231a69cc9fc44a04c32f3dd89923a15c1ff065635e6510466057777"
+            "sha256:83ea68f2a9ba1c34d907f6364b0a1b1b75b2a33676ebab857de446ab677f9e6e"
         );
         Ok(())
     }

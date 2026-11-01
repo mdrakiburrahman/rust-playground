@@ -1,7 +1,10 @@
 //! Explicit, lossless Arrow-to-Delta representation rules.
 
 use anyhow::{Context, Result, bail};
-use arrow::array::{Array, ArrayRef, Int64Array, ListArray, MapArray, RecordBatch, StructArray, new_null_array};
+use arrow::array::{
+    Array, ArrayRef, Int64Array, ListArray, MapArray, RecordBatch, StructArray, TimestampMicrosecondArray,
+    new_null_array,
+};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit};
 use std::sync::Arc;
@@ -281,4 +284,165 @@ pub fn align(batch: &RecordBatch, target: SchemaRef) -> Result<RecordBatch> {
         }
     }
     Ok(RecordBatch::try_new(target, columns)?)
+}
+
+/// A schema already in this module's canonical Delta representation, such as the
+/// Arrow schema Delta Kernel reports for a table this crate wrote.
+///
+/// Raw inputs go through [`schema`] and [`batch`], which keep rejecting the reserved
+/// [`NANOS_SUFFIX`] names. A canonical schema instead carries each companion
+/// immediately after its `Timestamp(Microsecond, "UTC")` field, and is accepted only
+/// when normalization would leave it unchanged.
+#[derive(Debug)]
+pub struct CanonicalSchema(SchemaRef);
+
+impl CanonicalSchema {
+    /// Validate that `schema` is a fixed point of normalization.
+    ///
+    /// # Errors
+    /// Rejects raw types (dictionaries, unsigned, non-UTC or non-microsecond timestamps,
+    /// large or view containers), timestamps without their exact companion, and
+    /// companion names without their timestamp.
+    pub fn try_new(schema: SchemaRef) -> Result<Self> {
+        check_canonical_fields(schema.fields()).context("schema is not in canonical Delta representation")?;
+        Ok(Self(schema))
+    }
+
+    #[must_use]
+    pub const fn schema(&self) -> &SchemaRef {
+        &self.0
+    }
+}
+
+fn is_companion(base: &Field, companion: &Field) -> bool {
+    *companion.name() == format!("{}{NANOS_SUFFIX}", base.name())
+        && companion.data_type() == &DataType::Int64
+        && companion.is_nullable() == base.is_nullable()
+}
+
+fn check_canonical_fields(fields: &Fields) -> Result<()> {
+    let mut index = 0;
+    while let Some(field) = fields.get(index) {
+        if field.name().ends_with(NANOS_SUFFIX) {
+            bail!(
+                "reserved timestamp companion name {} without its timestamp",
+                field.name()
+            );
+        }
+        check_canonical_type(field.data_type()).with_context(|| format!("field {}", field.name()))?;
+        if timestamp_unit(field.data_type()).is_some() {
+            if !fields
+                .get(index + 1)
+                .is_some_and(|companion| is_companion(field, companion))
+            {
+                bail!("timestamp {} lacks its exact {NANOS_SUFFIX} companion", field.name());
+            }
+            index += 1;
+        }
+        index += 1;
+    }
+    Ok(())
+}
+
+fn check_canonical_type(ty: &DataType) -> Result<()> {
+    match ty {
+        DataType::Timestamp(TimeUnit::Microsecond, Some(zone)) if zone.as_ref() == "UTC" => Ok(()),
+        DataType::Struct(fields) => check_canonical_fields(fields),
+        DataType::List(element) => {
+            if timestamp_unit(element.data_type()).is_some() {
+                bail!("timestamp list elements require an explicit struct with a timestamp field");
+            }
+            check_canonical_type(element.data_type())
+        }
+        DataType::Map(entries, false) => {
+            let DataType::Struct(fields) = entries.data_type() else {
+                bail!("map entries must be a struct");
+            };
+            if fields.len() != 2 || fields.iter().any(|field| timestamp_unit(field.data_type()).is_some()) {
+                bail!("map needs two key/value fields; bare timestamps require an explicit struct");
+            }
+            fields
+                .iter()
+                .try_for_each(|field| check_canonical_type(field.data_type()))
+        }
+        DataType::Timestamp(_, _)
+        | DataType::Dictionary(_, _)
+        | DataType::Map(_, true)
+        | DataType::LargeList(_)
+        | DataType::FixedSizeList(_, _) => bail!("{ty} is not canonical"),
+        other if target_type(other)? == *other => Ok(()),
+        other => bail!("{other} is not canonical"),
+    }
+}
+
+/// Validate a batch that is already in canonical representation and return it unchanged.
+///
+/// Each companion keeps its exact epoch nanoseconds; it must agree with its timestamp
+/// row by row (same nulls, `micros == nanos.div_euclid(1000)`), including inside
+/// structs, lists and maps.
+///
+/// # Errors
+/// Rejects non-canonical schemas and inconsistent companion values.
+pub fn canonical_batch(batch: &RecordBatch) -> Result<RecordBatch> {
+    check_canonical_fields(batch.schema_ref().fields()).context("batch is not in canonical Delta representation")?;
+    check_companions(batch.schema_ref().fields(), batch.columns())?;
+    Ok(batch.clone())
+}
+
+fn check_companions(fields: &Fields, columns: &[ArrayRef]) -> Result<()> {
+    let mut index = 0;
+    while let (Some(field), Some(column)) = (fields.get(index), columns.get(index)) {
+        if timestamp_unit(field.data_type()).is_some() {
+            let micros = column
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .context("canonical timestamp column")?;
+            let nanos = columns
+                .get(index + 1)
+                .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+                .context("canonical timestamp companion column")?;
+            if micros.len() != nanos.len() {
+                bail!("timestamp {} companion length differs", field.name());
+            }
+            for row in 0..micros.len() {
+                let consistent = match (micros.is_valid(row), nanos.is_valid(row)) {
+                    (true, true) => micros.value(row) == nanos.value(row).div_euclid(1_000),
+                    (false, false) => true,
+                    _ => false,
+                };
+                if !consistent {
+                    bail!("timestamp {} disagrees with its {NANOS_SUFFIX} companion", field.name());
+                }
+            }
+            index += 1;
+        } else {
+            check_nested_companions(column)?;
+        }
+        index += 1;
+    }
+    Ok(())
+}
+
+fn check_nested_companions(column: &ArrayRef) -> Result<()> {
+    match column.data_type() {
+        DataType::Struct(_) => {
+            let value = column
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .context("expected struct")?;
+            check_companions(value.fields(), value.columns())
+        }
+        DataType::List(_) => check_nested_companions(
+            column
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .context("expected list")?
+                .values(),
+        ),
+        DataType::Map(_, _) => {
+            let map = column.as_any().downcast_ref::<MapArray>().context("expected map")?;
+            check_companions(map.entries().fields(), map.entries().columns())
+        }
+        _ => Ok(()),
+    }
 }

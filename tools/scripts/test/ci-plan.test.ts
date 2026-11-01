@@ -28,7 +28,20 @@ function fixture(): VerificationGraph {
   addTask(graph, 'scripts:typecheck', 'tsc --noEmit');
   addTask(graph, 'scripts:test', 'tsx --test test.ts');
   addTask(graph, 'scripts:verify', undefined, ['scripts:typecheck', 'scripts:test']);
-  addTask(graph, 'loadtest:reader-build', 'cargo build --locked --package delta-inspect');
+  addTask(graph, 'loadtest:lint', 'cargo clippy --locked --package arrowcol-loadgen');
+  addTask(graph, 'loadtest:test', 'cargo test --locked --package arrowcol-loadgen');
+  for (const target of ['lint', 'build', 'test']) {
+    addTask(graph, `arrowcol-sdk-gen:${target}`, `cargo ${target} --locked --package arrowcol-sdk-gen`);
+  }
+  addTask(graph, 'arrowcol-sdk-gen:generate', 'tsx sdk.ts generate');
+  addTask(graph, 'arrowcol-sdk-gen:check', 'tsx sdk.ts check', ['arrowcol-sdk-gen:generate']);
+  addTask(graph, 'arrowcol-sdk-gen:compatibility', 'tsx sdk.ts compatibility', ['arrowcol-sdk-gen:generate']);
+  addTask(graph, 'arrowcol-sdk-gen:generated-test', 'tsx sdk.ts test', ['arrowcol-sdk-gen:check']);
+  addTask(graph, 'arrowcol-sdk-gen:package-artifact', 'tsx sdk.ts package-artifact', ['arrowcol-sdk-gen:generated-test']);
+  addTask(graph, 'loadtest:reader-build', 'cargo build --locked --package delta-inspect', [
+    'loadtest:lint', 'loadtest:test',
+    ...['lint', 'build', 'test', 'compatibility', 'package-artifact'].map(target => `arrowcol-sdk-gen:${target}`),
+  ]);
   for (const project of ['collector', 'sample']) {
     addTask(graph, `${project}:image`, undefined, [], {
       executor: 'rust-playground-build:docker-build',
@@ -83,10 +96,42 @@ test('fans out independent material checks, preserving prerequisite closures and
   assert.deepEqual(plan.images[0]?.image_refs, ['ghcr.io/example/collector:dev']);
   assert.equal(plan.reader, 'loadtest:reader-build');
   assert.equal(plan.integration, 'loadtest:e2e');
-  assert.equal(plan.materialTasks.length, 11);
+  assert.equal(plan.materialTasks.length, 21);
   assert.equal(plan.rust.some(({ task }) => task === 'collector:build'), false);
   assert.equal(plan.rust.length, 2);
   assert.equal(plan.node.some(({ task }) => task === 'scripts:verify'), false);
+});
+
+test('the reader shard exclusively owns its complete writer closure before exporting helpers', () => {
+  const plan = createVerificationPlan(fixture());
+  const independent = [...plan.node, ...plan.rust].flatMap(({ tasks }) => tasks);
+  const owned = [
+    'loadtest:reader-build', 'loadtest:lint', 'loadtest:test',
+    ...['lint', 'build', 'test', 'generate', 'check', 'compatibility', 'generated-test', 'package-artifact']
+      .map(target => `arrowcol-sdk-gen:${target}`),
+  ];
+  assert.ok(owned.every(task => plan.materialTasks.includes(task)));
+  assert.ok(owned.every(task => !independent.includes(task)));
+  assert.deepEqual(
+    [...new Set([...independent, ...owned, ...plan.images.map(({ task }) => task), 'loadtest:e2e', 'collector:build'])].sort(),
+    plan.materialTasks,
+  );
+});
+
+test('missing or unexpected reader writer prerequisites and cross-shard claims fail closed', () => {
+  const missing = fixture();
+  missing.tasks.dependencies['loadtest:reader-build'] = missing.tasks.dependencies['loadtest:reader-build']
+    ?.filter(task => task !== 'arrowcol-sdk-gen:lint');
+  assert.throws(() => createVerificationPlan(missing), /reader build prerequisites must be exactly/u);
+  const unexpected = fixture();
+  unexpected.tasks.dependencies['loadtest:reader-build']?.push('sdk:test');
+  assert.throws(() => createVerificationPlan(unexpected), /reader build prerequisites must be exactly/u);
+  const shared = fixture();
+  addTask(shared, 'other:check', 'cargo check --package other', ['arrowcol-sdk-gen:test']);
+  assert.throws(() => createVerificationPlan(shared), /shared by loadtest:reader-build and other:check/u);
+  const sameProject = fixture();
+  addTask(sameProject, 'loadtest:other-check', 'cargo check --package arrowcol-loadgen', ['loadtest:test']);
+  assert.throws(() => createVerificationPlan(sameProject), /shared by loadtest:reader-build and loadtest:other-check/u);
 });
 
 test('new projects are discovered without editing a hard-coded CI project list', () => {
@@ -221,6 +266,18 @@ interface Workflow {
 function workflow(name: string): Workflow {
   return parse(readFileSync(fileURLToPath(new URL(`../../../.github/workflows/${name}`, import.meta.url)), 'utf8')) as Workflow;
 }
+
+test('failed integration diagnostics exclude private raw logs at the actual uploader', () => {
+  const uploader = workflow('ci.yml').jobs.e2e?.steps?.find(step => step.with?.name === 'telemetry-e2e-diagnostics');
+  assert.ok(uploader);
+  assert.ok(uploader.uses?.startsWith('actions/upload-artifact@'));
+  const path = uploader.with?.path;
+  assert.ok(typeof path === 'string');
+  const patterns = path.split(/\r?\n/u).map(line => line.trim()).filter(Boolean);
+  assert.ok(patterns.includes('onelake/e2e/'));
+  assert.ok(patterns.includes('onelake/benchmark/latest/results/'));
+  assert.ok(patterns.includes('!**/*.private.log'), 'The real uploader must exclude private raw logs, not merely name them private');
+});
 
 test('workflow starts environment, Node checks, and image builds without unrelated barriers or concurrency caps', () => {
   const jobs = workflow('ci.yml').jobs;

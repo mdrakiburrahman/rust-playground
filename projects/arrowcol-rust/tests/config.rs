@@ -1,5 +1,34 @@
 use arrowcol_rust::{CollectorConfig, ConfigError};
 
+/// Scenario: Cloud startup omits its epoch or supplies a malformed UUID.
+/// Guarantees: The actual entrypoint refuses before reading SQL credentials or opening WAL/writers.
+#[test]
+fn cloud_entrypoint_refuses_missing_and_malformed_generation() {
+    for generation in [None, Some("not-a-generation-uuid")] {
+        let mut command = assert_cmd::Command::new(env!("CARGO_BIN_EXE_arrowcol-rust"));
+        command
+            .arg("--config")
+            .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.docker.yaml"))
+            .env(
+                "ARROWCOL_DELTA_ROOT",
+                "abfss://container@account.dfs.core.windows.net/root",
+            )
+            .env_remove("ARROWCOL_RESET_GENERATION")
+            .env_remove("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")
+            .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:9")
+            .env("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf")
+            .env("OTEL_METRIC_EXPORT_INTERVAL", "60000")
+            .timeout(std::time::Duration::from_secs(15));
+        if let Some(generation) = generation {
+            command.env("ARROWCOL_RESET_GENERATION", generation);
+        }
+        command
+            .assert()
+            .failure()
+            .stderr(predicates::str::contains("ARROWCOL_RESET_GENERATION"));
+    }
+}
+
 #[test]
 fn checked_in_configs_are_strict_and_valid() -> Result<(), ConfigError> {
     CollectorConfig::from_yaml(include_bytes!("../config.yaml"))?;

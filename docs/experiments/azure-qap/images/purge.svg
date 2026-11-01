@@ -1,0 +1,163 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="973" viewBox="0 0 960 973" role="img" aria-labelledby="purge-title purge-desc" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif">
+<title id="purge-title">PURGE: retention delete</title>
+<desc id="purge-desc">Before: Delta version 0 with files A to F. delta-maintenance purge writes commit 1 that removes A and B, the expired partition. Afterwards there is nothing new to read, but Kusto often rereads unchanged files C, D, E and F.</desc>
+<defs>
+<marker id="purge-ar-ink" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto-start-reverse"><path d="M0,0 L12,6 L0,12 z" fill="#526278"/></marker>
+<marker id="purge-ar-red" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto-start-reverse"><path d="M0,0 L12,6 L0,12 z" fill="#c8283c"/></marker>
+<marker id="purge-ar-blue" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto-start-reverse"><path d="M0,0 L12,6 L0,12 z" fill="#185abd"/></marker>
+<marker id="purge-ar-green" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto-start-reverse"><path d="M0,0 L12,6 L0,12 z" fill="#1f7a45"/></marker>
+<marker id="purge-ar-amber" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto-start-reverse"><path d="M0,0 L12,6 L0,12 z" fill="#b78919"/></marker>
+<marker id="purge-ar-purple" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto-start-reverse"><path d="M0,0 L12,6 L0,12 z" fill="#6b3fb5"/></marker>
+<symbol id="purge-pq" viewBox="0 0 64 64"><image width="64" height="64" href="data:image/png;base64,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"/></symbol>
+</defs>
+<rect x="1" y="1" width="958" height="971" rx="16" fill="#ffffff" stroke="#d5dfea" stroke-width="1.5"/>
+<text x="28" y="46" font-size="25" font-weight="700" fill="#18263a">PURGE: retention delete</text>
+<text x="28" y="74" font-size="15" fill="#526278">One commit drops the expired partition. Nothing new needs reading,</text>
+<text x="28" y="94" font-size="15" fill="#526278">yet Kusto often reads every file that is left.</text>
+<rect x="24" y="116" width="912" height="246" rx="14" fill="#f7f9fc" stroke="#d5dfea" stroke-width="1.5"/>
+<rect x="40" y="130" width="77.6" height="24" rx="12" fill="#526278" stroke="#526278" stroke-width="1.5"/>
+<text x="78.8" y="147" font-size="12.5" font-weight="700" fill="#ffffff" text-anchor="middle">BEFORE</text>
+<text x="129.6" y="147" font-size="14.5" font-weight="600" fill="#18263a">Delta version 0</text>
+<text x="920" y="147" font-size="12" fill="#526278" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">experimentqap/runs/&lt;runId&gt;/purge/</text>
+<path d="M40,175 h6 l2,2.5 h10 v11.5 h-18 z" fill="#fff1cc" stroke="#b78919" stroke-width="1.3" stroke-linejoin="round"/>
+<text x="64" y="186" font-size="13" font-weight="700" fill="#18263a" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">_delta_log/</text>
+<path d="M44,198 h11 l6,6 v15 h-17 z" fill="#ffffff" stroke="#526278" stroke-width="1.4" stroke-linejoin="round"/>
+<path d="M55,198 v6 h6" fill="none" stroke="#526278" stroke-width="1.2" stroke-linejoin="round"/>
+<text x="52.5" y="214.5" font-size="7.5" font-weight="700" fill="#526278" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">{}</text>
+<text x="70" y="213" font-size="12" fill="#18263a" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">00000000000000000000.json</text>
+<text x="258" y="213" font-size="12.5" font-weight="700" fill="#526278">seed</text>
+<text x="74" y="234" font-size="12" fill="#526278" font-style="italic">adds A, B, C, D, E, F</text>
+<text x="384" y="186" font-size="12" fill="#526278"><tspan font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">__arrowcol_ingestion=&lt;minute&gt;/</tspan><tspan>   Hive partitions</tspan></text>
+<path d="M384,202 h6 l2,2.5 h10 v11.5 h-18 z" fill="#fff1cc" stroke="#b78919" stroke-width="1.3" stroke-linejoin="round"/>
+<text x="408" y="214" font-size="13.5" font-weight="700" fill="#18263a">expired/</text>
+<text x="384" y="232" font-size="11.5" fill="#526278">older than retention</text>
+<rect x="384" y="242" width="126" height="48" rx="8" fill="#dff4e5" stroke="#25834b" stroke-width="2"/>
+<use href="#purge-pq" x="391" y="251" width="30" height="30"/>
+<text x="427" y="263" font-size="13.5" font-weight="700" fill="#18263a">A.parquet</text>
+<text x="427" y="280" font-size="11.5" font-weight="600" fill="#1f7a45">32 MiB</text>
+<rect x="384" y="298" width="126" height="48" rx="8" fill="#dff4e5" stroke="#25834b" stroke-width="2"/>
+<use href="#purge-pq" x="391" y="307" width="30" height="30"/>
+<text x="427" y="319" font-size="13.5" font-weight="700" fill="#18263a">B.parquet</text>
+<text x="427" y="336" font-size="11.5" font-weight="600" fill="#1f7a45">32 MiB</text>
+<path d="M520,202 h6 l2,2.5 h10 v11.5 h-18 z" fill="#fff1cc" stroke="#b78919" stroke-width="1.3" stroke-linejoin="round"/>
+<text x="544" y="214" font-size="13.5" font-weight="700" fill="#18263a">compact/</text>
+<text x="520" y="232" font-size="11.5" fill="#526278">many small files</text>
+<rect x="520" y="242" width="126" height="48" rx="8" fill="#dff4e5" stroke="#25834b" stroke-width="2"/>
+<use href="#purge-pq" x="527" y="251" width="30" height="30"/>
+<text x="563" y="263" font-size="13.5" font-weight="700" fill="#18263a">C.parquet</text>
+<text x="563" y="280" font-size="11.5" font-weight="600" fill="#1f7a45">32 MiB</text>
+<rect x="520" y="298" width="126" height="48" rx="8" fill="#dff4e5" stroke="#25834b" stroke-width="2"/>
+<use href="#purge-pq" x="527" y="307" width="30" height="30"/>
+<text x="563" y="319" font-size="13.5" font-weight="700" fill="#18263a">D.parquet</text>
+<text x="563" y="336" font-size="11.5" font-weight="600" fill="#1f7a45">32 MiB</text>
+<path d="M656,202 h6 l2,2.5 h10 v11.5 h-18 z" fill="#fff1cc" stroke="#b78919" stroke-width="1.3" stroke-linejoin="round"/>
+<text x="680" y="214" font-size="13.5" font-weight="700" fill="#18263a">control/</text>
+<text x="656" y="232" font-size="11.5" fill="#526278">never touched</text>
+<rect x="656" y="242" width="126" height="48" rx="8" fill="#dff4e5" stroke="#25834b" stroke-width="2"/>
+<use href="#purge-pq" x="663" y="251" width="30" height="30"/>
+<text x="699" y="263" font-size="13.5" font-weight="700" fill="#18263a">E.parquet</text>
+<text x="699" y="280" font-size="11.5" font-weight="600" fill="#1f7a45">32 MiB</text>
+<path d="M792,202 h6 l2,2.5 h10 v11.5 h-18 z" fill="#fff1cc" stroke="#b78919" stroke-width="1.3" stroke-linejoin="round"/>
+<text x="816" y="214" font-size="13.5" font-weight="700" fill="#18263a">live/</text>
+<text x="792" y="232" font-size="11.5" fill="#526278">newest data</text>
+<rect x="792" y="242" width="126" height="48" rx="8" fill="#dff4e5" stroke="#25834b" stroke-width="2"/>
+<use href="#purge-pq" x="799" y="251" width="30" height="30"/>
+<text x="835" y="263" font-size="13.5" font-weight="700" fill="#18263a">F.parquet</text>
+<text x="835" y="280" font-size="11.5" font-weight="600" fill="#1f7a45">32 MiB</text>
+<path d="M480,362 V438" fill="none" stroke="#b78919" stroke-width="2.5" stroke-linejoin="round" marker-end="url(#purge-ar-amber)"/>
+<rect x="150" y="376" width="660" height="48" rx="24" fill="#fff1cc" stroke="#b78919" stroke-width="2"/>
+<text x="480" y="406" font-size="14" fill="#18263a" text-anchor="middle"><tspan font-weight="700">delta-maintenance  </tspan><tspan font-weight="700" fill="#9a6f0c" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">purge</tspan><tspan>   →  writes commit 1 (drops the expired partition)</tspan></text>
+<rect x="24" y="438" width="912" height="246" rx="14" fill="#f7f9fc" stroke="#d5dfea" stroke-width="1.5"/>
+<rect x="40" y="452" width="69" height="24" rx="12" fill="#b78919" stroke="#b78919" stroke-width="1.5"/>
+<text x="74.5" y="469" font-size="12.5" font-weight="700" fill="#ffffff" text-anchor="middle">AFTER</text>
+<text x="121" y="469" font-size="14.5" font-weight="600" fill="#18263a">Delta version 1</text>
+<text x="920" y="469" font-size="12" fill="#526278" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">experimentqap/runs/&lt;runId&gt;/purge/</text>
+<path d="M40,497 h6 l2,2.5 h10 v11.5 h-18 z" fill="#fff1cc" stroke="#b78919" stroke-width="1.3" stroke-linejoin="round"/>
+<text x="64" y="508" font-size="13" font-weight="700" fill="#18263a" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">_delta_log/</text>
+<path d="M44,520 h11 l6,6 v15 h-17 z" fill="#ffffff" stroke="#526278" stroke-width="1.4" stroke-linejoin="round"/>
+<path d="M55,520 v6 h6" fill="none" stroke="#526278" stroke-width="1.2" stroke-linejoin="round"/>
+<text x="52.5" y="536.5" font-size="7.5" font-weight="700" fill="#526278" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">{}</text>
+<text x="70" y="535" font-size="12" fill="#18263a" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">00000000000000000000.json</text>
+<text x="258" y="535" font-size="12.5" font-weight="700" fill="#526278">seed</text>
+<text x="74" y="556" font-size="12" fill="#526278" font-style="italic">adds A, B, C, D, E, F</text>
+<path d="M44,570 h11 l6,6 v15 h-17 z" fill="#ffffff" stroke="#b78919" stroke-width="1.4" stroke-linejoin="round"/>
+<path d="M55,570 v6 h6" fill="none" stroke="#b78919" stroke-width="1.2" stroke-linejoin="round"/>
+<text x="52.5" y="586.5" font-size="7.5" font-weight="700" fill="#b78919" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">{}</text>
+<text x="70" y="585" font-size="12" font-weight="700" fill="#18263a" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">00000000000000000001.json</text>
+<text x="258" y="585" font-size="12.5" font-weight="700" fill="#9a6f0c">PURGE</text>
+<text x="74" y="606" font-size="11.5" fill="#c8283c" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">{&quot;remove&quot;:{&quot;path&quot;:&quot;…/A.parquet&quot;}}</text>
+<text x="74" y="625" font-size="11.5" fill="#c8283c" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">{&quot;remove&quot;:{&quot;path&quot;:&quot;…/B.parquet&quot;}}</text>
+<text x="384" y="508" font-size="12" fill="#526278"><tspan font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">__arrowcol_ingestion=&lt;minute&gt;/</tspan><tspan>   Hive partitions</tspan></text>
+<path d="M384,524 h6 l2,2.5 h10 v11.5 h-18 z" fill="#fff1cc" stroke="#b78919" stroke-width="1.3" stroke-linejoin="round"/>
+<text x="408" y="536" font-size="13.5" font-weight="700" fill="#18263a">expired/</text>
+<text x="384" y="554" font-size="11.5" fill="#526278">older than retention</text>
+<rect x="384" y="564" width="126" height="48" rx="8" fill="#ffe2e6" stroke="#bf3448" stroke-width="2" stroke-dasharray="6 4"/>
+<use href="#purge-pq" x="391" y="573" width="30" height="30"/>
+<text x="427" y="585" font-size="13.5" font-weight="700" fill="#18263a">A.parquet</text>
+<text x="427" y="602" font-size="11.5" font-weight="600" fill="#bf3448">tombstoned</text>
+<rect x="384" y="620" width="126" height="48" rx="8" fill="#ffe2e6" stroke="#bf3448" stroke-width="2" stroke-dasharray="6 4"/>
+<use href="#purge-pq" x="391" y="629" width="30" height="30"/>
+<text x="427" y="641" font-size="13.5" font-weight="700" fill="#18263a">B.parquet</text>
+<text x="427" y="658" font-size="11.5" font-weight="600" fill="#bf3448">tombstoned</text>
+<path d="M520,524 h6 l2,2.5 h10 v11.5 h-18 z" fill="#fff1cc" stroke="#b78919" stroke-width="1.3" stroke-linejoin="round"/>
+<text x="544" y="536" font-size="13.5" font-weight="700" fill="#18263a">compact/</text>
+<text x="520" y="554" font-size="11.5" fill="#526278">many small files</text>
+<rect x="520" y="564" width="126" height="48" rx="8" fill="#dff4e5" stroke="#25834b" stroke-width="2"/>
+<use href="#purge-pq" x="527" y="573" width="30" height="30"/>
+<text x="563" y="585" font-size="13.5" font-weight="700" fill="#18263a">C.parquet</text>
+<text x="563" y="602" font-size="11.5" font-weight="600" fill="#1f7a45">32 MiB</text>
+<rect x="520" y="620" width="126" height="48" rx="8" fill="#dff4e5" stroke="#25834b" stroke-width="2"/>
+<use href="#purge-pq" x="527" y="629" width="30" height="30"/>
+<text x="563" y="641" font-size="13.5" font-weight="700" fill="#18263a">D.parquet</text>
+<text x="563" y="658" font-size="11.5" font-weight="600" fill="#1f7a45">32 MiB</text>
+<path d="M656,524 h6 l2,2.5 h10 v11.5 h-18 z" fill="#fff1cc" stroke="#b78919" stroke-width="1.3" stroke-linejoin="round"/>
+<text x="680" y="536" font-size="13.5" font-weight="700" fill="#18263a">control/</text>
+<text x="656" y="554" font-size="11.5" fill="#526278">never touched</text>
+<rect x="656" y="564" width="126" height="48" rx="8" fill="#dff4e5" stroke="#25834b" stroke-width="2"/>
+<use href="#purge-pq" x="663" y="573" width="30" height="30"/>
+<text x="699" y="585" font-size="13.5" font-weight="700" fill="#18263a">E.parquet</text>
+<text x="699" y="602" font-size="11.5" font-weight="600" fill="#1f7a45">32 MiB</text>
+<path d="M792,524 h6 l2,2.5 h10 v11.5 h-18 z" fill="#fff1cc" stroke="#b78919" stroke-width="1.3" stroke-linejoin="round"/>
+<text x="816" y="536" font-size="13.5" font-weight="700" fill="#18263a">live/</text>
+<text x="792" y="554" font-size="11.5" fill="#526278">newest data</text>
+<rect x="792" y="564" width="126" height="48" rx="8" fill="#dff4e5" stroke="#25834b" stroke-width="2"/>
+<use href="#purge-pq" x="799" y="573" width="30" height="30"/>
+<text x="835" y="585" font-size="13.5" font-weight="700" fill="#18263a">F.parquet</text>
+<text x="835" y="602" font-size="11.5" font-weight="600" fill="#1f7a45">32 MiB</text>
+<rect x="24" y="700" width="912" height="199" rx="14" fill="#f4effc" stroke="#6b3fb5" stroke-width="2"/>
+<rect x="42" y="718" width="40" height="40" rx="9" fill="#6b3fb5" stroke="#6b3fb5" stroke-width="1.5"/>
+<rect x="49.4" y="740" width="5.7" height="10.8" rx="1.5" fill="#ffffff" stroke="none" stroke-width="0"/>
+<rect x="59.1" y="730" width="5.7" height="20.8" rx="1.5" fill="#ffffff" stroke="none" stroke-width="0"/>
+<rect x="68.9" y="734.8" width="5.7" height="16" rx="1.5" fill="#ffffff" stroke="none" stroke-width="0"/>
+<text x="94" y="736" font-size="16" font-weight="700" fill="#6b3fb5">Azure Kusto + QAP</text>
+<text x="94" y="754" font-size="12.5" fill="#526278">what it reads afterwards</text>
+<text x="42" y="784" font-size="12" fill="#18263a" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">qap_&lt;runId&gt;_purge</text>
+<text x="284" y="731" font-size="14" font-weight="700" fill="#185abd">Expected read</text>
+<text x="284" y="748" font-size="12" fill="#526278">nothing was added</text>
+<text x="476" y="738" font-size="13" fill="#526278" font-style="italic">none</text>
+<text x="284" y="777" font-size="14" font-weight="700" fill="#c8283c">Extra rereads</text>
+<text x="284" y="794" font-size="12" fill="#526278">seen in 4 of 6 16-file trials</text>
+<rect x="476" y="762" width="66" height="34" rx="8" fill="#ffe2e6" stroke="#c8283c" stroke-width="2"/>
+<use href="#purge-pq" x="483" y="768" width="22" height="22"/>
+<text x="511" y="785" font-size="14.5" font-weight="700" fill="#18263a">C</text>
+<rect x="550" y="762" width="66" height="34" rx="8" fill="#ffe2e6" stroke="#c8283c" stroke-width="2"/>
+<use href="#purge-pq" x="557" y="768" width="22" height="22"/>
+<text x="585" y="785" font-size="14.5" font-weight="700" fill="#18263a">D</text>
+<rect x="624" y="762" width="66" height="34" rx="8" fill="#ffe2e6" stroke="#c8283c" stroke-width="2"/>
+<use href="#purge-pq" x="631" y="768" width="22" height="22"/>
+<text x="659" y="785" font-size="14.5" font-weight="700" fill="#18263a">E</text>
+<rect x="698" y="762" width="66" height="34" rx="8" fill="#ffe2e6" stroke="#c8283c" stroke-width="2"/>
+<use href="#purge-pq" x="705" y="768" width="22" height="22"/>
+<text x="733" y="785" font-size="14.5" font-weight="700" fill="#18263a">F</text>
+<path d="M42,812 H918" fill="none" stroke="#d9cdf2" stroke-width="1.2" stroke-linejoin="round"/>
+<text x="42" y="836" font-size="14.5" font-weight="700" fill="#c8283c">16-file tables (34 files): all 18 unchanged files reread (577.5 MiB) in 4 of 6 trials.</text>
+<text x="42" y="857" font-size="13" fill="#18263a">Of the other 2, one showed 8 files only in late logs (run 4) and one read 0 of 18 (run 6b).</text>
+<text x="42" y="878" font-size="13" fill="#18263a">The 2-file table drawn here: 4 of 4 reread in 1 of 6 trials, 0 of 4 in the other 5.</text>
+<rect x="28" y="917" width="22" height="16" rx="4" fill="#dff4e5" stroke="#25834b" stroke-width="2"/>
+<text x="58" y="930" font-size="12.5" fill="#18263a">active file</text>
+<rect x="153.3" y="917" width="22" height="16" rx="4" fill="#ffe2e6" stroke="#bf3448" stroke-width="2" stroke-dasharray="6 4"/>
+<text x="183.3" y="930" font-size="12.5" fill="#18263a">tombstoned (gone from the log, still on disk)</text>
+<rect x="492.8" y="917" width="22" height="16" rx="4" fill="#ffe2e6" stroke="#c8283c" stroke-width="2"/>
+<text x="522.8" y="930" font-size="12.5" fill="#18263a">reread by Kusto</text>
+<text x="936" y="955" font-size="11" fill="#526278" text-anchor="end">Apache Parquet logo © The Apache Software Foundation, Apache License 2.0</text>
+</svg>

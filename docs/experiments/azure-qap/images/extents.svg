@@ -1,0 +1,133 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="696" viewBox="0 0 960 696" role="img" aria-labelledby="extents-title extents-desc" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif">
+<title id="extents-title">Shared extents: why unchanged files get reread</title>
+<desc id="extents-desc">Our model of Kusto extents. Panel 1: six files packed into two extents, each spanning two or three partitions. Panel 2: removing file C rebuilds extent 1, so A and B are read again. Panel 3: appending file H only adds extent 3, and nothing old is read again.</desc>
+<defs>
+<marker id="extents-ar-ink" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto-start-reverse"><path d="M0,0 L12,6 L0,12 z" fill="#526278"/></marker>
+<marker id="extents-ar-red" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto-start-reverse"><path d="M0,0 L12,6 L0,12 z" fill="#c8283c"/></marker>
+<marker id="extents-ar-blue" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto-start-reverse"><path d="M0,0 L12,6 L0,12 z" fill="#185abd"/></marker>
+<marker id="extents-ar-green" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto-start-reverse"><path d="M0,0 L12,6 L0,12 z" fill="#1f7a45"/></marker>
+<marker id="extents-ar-amber" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto-start-reverse"><path d="M0,0 L12,6 L0,12 z" fill="#b78919"/></marker>
+<marker id="extents-ar-purple" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto-start-reverse"><path d="M0,0 L12,6 L0,12 z" fill="#6b3fb5"/></marker>
+<symbol id="extents-pq" viewBox="0 0 64 64"><image width="64" height="64" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAA90SURBVHhe7VoLcFzVeXYDNY8mxHQIDUNoaQkTSBoYpkk700ISJs20TcO00r7uYx9aSZYs/LYxARx3gVBIMLRV3AIKFBELe3fvveecu0/Z4LI0BhMMNmBjbEm29ZZ2ta+7d1ev1ePv/Ge9jlHbaQKG2FTfjMbWvf899/zn///v/865WrJkEYtYxCIWsYhFLGIRi/hY8a7iW+ql2RZvKNsSj8cvWnj/E406Nfl3Tpp/TegEkPYAeFima3PgwDcW2n3i4NYHvuEI5UP20CzYOwEcuwAkLWN61ZFHH/Pvusarj1hX0MG/WfjceQ9XdORGiaSfs1NzjjsdB5BYEeq1VEdrR+IL67T9fyTQoiLFyiCGS+Ch+dA69ejXFo5z3qE50nW1RHKPO0jRRMet6HgcwKONvbpBOXarT1E+bWO5LRbdLOH12lAZxBcAPDQ7uEk9ctvqju7L7iN9Vy0c95zH95UTn3XTzL0izY9KuwEssVkQdgM4texQs9Zf19265CI3HbULJN8j7gKw6RNg7QSw67lJLx34B1CWLG1mPd8SqXFEYuMpNxl+4M5o7+cXvuecQyLhu1CmY/VWYnSJWOPRMuC/kpaZXK4OPMLa25etUI/c4mDmC0IcwBEugy00BVIngFvLvrxBPXJLazx+mUSyTwi0BPboDCBfuF8BcKsjexO+b1648J3nDOq1EYtAjVfRMSEyDY7YPMh6Cbw0qTyoHbzeR3ZfKdOxf7UTY94RB7DQAidBN8lkV6p9K3EMj9Z7g5Nkcs49eH8cLPoEyPEZ8JB0ZH2w54sbdvVc4wwZjzaSpAyw5LcWzuE3Ao+a/LbE8p1iuAxCdBaskUq6u2hyf9OOE3c8Htx3iZulvu9ghSxG2srGwRYtgzM6DY0kSZ4inVdt2JG4opEN3+ZjiWUN2sg/ijQ3Ib8IINL81HJ1cD2+p14fvV1ixklcHGdkCtwsvbeRDouKolywcE4fC7zk5M0Cy/lFUgQhBmANTYGMDE9yo010aEXV7p4d/ZfLavKo8yW0mQaBRz3Vu54cr8H7cijttOpmSgxP4oI854v2fn6D2ntLs57/ybqdB3gn8JDs/bbQ+LwtNgcWtQA2fRo8LwN4lSGG9z/WbGj2914rqcltVmqOozO1oQmQ4vMg0tx0PRnaxtr/edlj4cQVAs08Ler5+PrA4ZtBsV3gJcltcmR8rF4d3PZmW9Ola8Inft/DsiExDmALT4GFlMD1nwAeZWS4nSWW4bvW+o9eKxLjJd5BWAlqtSzYojMg0sK8Nzi0GW2Wk2Nfd+n51+qUTMcPaNeNC+d71uANHvycW8n57MRIO3YDWPVpECMzIESmwKOm6abg/i+hnYtlNwrMzGI24AIJ+vhUgza6Cu91dMQvq9hkVjv0QoEvIDHBSkxw8uzJHGsK9vw12ni04QaBFnKoFmtJAWo0E3CxJJpLtQS670AbNxmxCsw0sJNgeYk0b7rY2BNrWe+175/9h0BbuO3SOm10lZ3k+/BFdn0KasNTIHfOg4uk3lnhf+97aNfABr/roLmDEra1cBks1AQkRCcrlJv8JzehjRwc+bKgF3bzDhGaglqtwG3l6DQs1/o7Bh63XrI+uO8SiWQ7hNgsWDEzFIMTIi5QvZZ8fbP/jetwrDqa9NlDU2APTYNFy4GFGCC9AOAkmYk71a4/QxvFZvvg/ACw5FNOPeOWSf6QfGrCVjrOoypSI9WgDq5Bu2Z//lqJ5jQpXgZHbBYsqgG2SBnkGICXpGMPb098Ee08NHWPnZklTGeMei1yRyeArGVTK7TjEtpIWt9fyCx/VETtQAtQoxY4b4ixMjQEB58B25ILWltbL3LRjJ/rBzYOtZoBNaTA5yUx4701O4/dVBkr3eQOFQ56yZAXlvwaHLE63n2Rh7c081UxNgf26DSvP4yaQLJzXmXwSV/7W8uCweAlEhl7RKDFEr7cyoqc4XFiTpIeWqX2OXE8l2p8TWLmPt4BcBHVPFgi2N5mwU2S4Yc63uBKT2aZLQIZn7HF58FCs2DRCuCIzmPKT64IdregzZ3qka+IrHAAx7IQk0fdSguAYstJRl+576nKWE515C5RHwcHapDIHNhp4ef1bMTiS/RevMDd/47lgdHbpc457ohFLYIQmQFneBKZO7Jh5/5b0Kae9AoCy/Rhu7PqRR4FRxwna0K9OtSmP/Pjz6CdRDKPOtj4DJYC2uAPboJkmiutUk/w9rba332doOf2oFM2NgG1Wo5nB2adi2R7Nux4+1a0a2D9dwismLPHAaw4FsmDlZZ453FrQ3pbW9ulaOelya1ydO50dmC24Tw9sTIsD5785vu9/R/gU5SlbiX1IGpz125UYMbh5p1J3rKcZPBmgRhxrFl7ZAZqtTxYdeQDXnsHVwd6bkc7j5r+tkhKhzAyNn0crGoBanWc7Dy4tdy+VeTwzWjnCqZcqA8wu3hEccLsFL9oI9HH2nZcwe20kY0ONj4rRMrceSsxoDY0DlLnLNSrw09V5+4Kj7S7MNNQRBEDLFoeLGwcHNFp8PiH71EU+NU5weNPbvGqIw9jj70n2n+5TDJPOGhpBiNo0bCGDZ5iMs1Nrgr2PoDP+JTEp51a/imBTQDv2RglYoI9PgcSNeZagn2PcLv2xMUCNZ4RYyh1ZypEp+XBHimDpJuwXOl9kNu9+ealIs1vF+OzYGeT3HErKYA9PA1ieALcSp8P7doTiYudLBPCrMX3YRbVEAPsbALk2By4A/33LnDvV0e9NrZW1sczfPCQCTWawZnbFZsHJ0nuXhPY/8do56VDdpEaA+LuebDRSc7wFlbk9ekiY++0BA/y9PPSE7cKtHAEryO3YHZYqy2O5NMN/q5atNsYPPaHkpY+7kQ7WoQaaoIVFyk6CyIrlht3nGxCu5bo3ssFmtuDxIk21Uyy4btj81C/s7JIHwgYfRfJdMgvY92ZUENLnBtELZdao/TzCTxE+q5ysZwiRGfAGp6Bv+e1bvKJSqFxqNMGn9y+fevvoG2dmn3AHiqUhdg8WLUi1FKMaIkvkptlDty988hXqu/GHWWdOkbl6CzYsa1qBuBzAstnG/3dvPU2Bweulljudaxxm1bkmYl2FlYCR3wOXMHB+89w54Oh7c2233aT0Z/i0ZUYmYD6wEDH1u2vXon3vOHUSokW09j7LdSAWqx1UgT83aMlB1sCPTa0a44MXC1p+f0YTUtoghOTTTXAEpoCZ2wGmtTB56sk5mJjW+RwUdmkHb8ef29RUm5ccNdLAC4tc7Jxx9E/weurtGM3yNQ8hK2UO80jn+dZJcfmwRXs/+H7PfkQwD7qIX0PNytdbvx9rf7Ol5x6Ls6ZOzzNCQfVGvZsOT4NHjJKHm2Pnt6/N4WPXSGrozFkbE5Qah6sPJXN8ppAz0a08YWHL3Wx3E5cPPFFLIdsenkwzfXBXfTwdU2hzNY129/m5VZHjn1d0M1eLBuLil2jUkYWOgFifB7qAic513wkkMnwfY6QWcItbS0tclbGBUBCdJK8uTLQtxrtkOhEkn9SVlOnI1GvJh+WomWQ9yAvpIdWBru/g9dXxo5/VWYmV5E4JvKHNTwNcmwWJGXsOd8S36eqYzSy4b8SmZkVYmUuumpInhOyjU2CtGseXIHeH1Vtzzp8icSFspYmmI68F6OUDU2CgG2LZvbc+9whrsKalNStLmq8LWEkO3k5qNgh8F6jemJlk54L/vCUpG2ig7ViKJ/FtmshhUr74gKnBPi8rAxGfG3DvDwatAFJ1EsT9sgc1GCL07DkUCqbvBV7/AP/tGDKZx+t3fGLRDK2Ax3DLJBYbqpJG/hB9X6jnnrQQUtlRwwlb463JZ7Weu4tr9795TPH8tLkZiGEfXqGtzgb792oGaZ49L3BoW3gW8Kj71FH10isOOcIzVZqHX8w9WlFUruDJ35y5tgfKfDoy0mT0TqWeXeD/+Cf47W1nZwXErzO9akKIxMDamj+lF4wppcHuv4SbfEw1MUyz2PK2vRJ7gySGGYV9njsHg2BE6d7t4uk7pciZU6glZLDTDErzuMeINh7Wgx9bEDWbu1o5dvbBjrkkUkug5FAMrLy1EQdUJGqTprbj2eBaHu3//CNbpLfh1mBDmAUa2kBrKoBmNp23Zz2Bo57q+9xsuy/oDS3IXni2Bj1U5Hn+47A6E9/rc3O2UYj7V/hfanSDVB7W0mRR94exsPOGahTh9u3bt3OdYCLjX1XpEYSF8qGRHfKGZtmgBjDXWY227Lzvb9FW+Xdd5dKLNPBN1GnyPa0PeoRFFjBkWd/o84jNrCea5xk7EU+URVlaB7sMS59p+qDx9dW7bxs9G5BL87aYmXuPEa9otdNTpROYnSt+9nr/AjMF//FZbKejuE3gsqCVhcLCa+iMyR19GfwYfb7ZxM/1l/5jKxm/gMPLeyVk53elsARXu+PB+cvcdN0uxSf4a2Kt6xTNYykx3dzytgvNj7z6h+gvW/321c6WH4v5xJ+WnRGppza+grq6HZFOUecr+JHL775WaeW2VunJl/e/Oyua/Dapsjx62VmvFJxBvs7kl0l8jZa5M671FTYx97iZ4Crafd1EjMO8vOFM0qELwQ1+VcjmYwEEj7fufl9AI/PFMW3FP9fFxr+jhzKDOMJELY2ztq83nELfWq/r44+jR0F7VvUEzcJzOxG53+Z8vgclovJIy8rSbK6tfvc/5Teop60SbFpsEbxzABlaoXAULNbQxMgR6egQfmlYqtj/bcJzBxFIjzT+Wr05d0ADjUVbW9P/N8nOucC1vp7b5S0zAGu7njrqqg2exj1vzG/InBsXdW2UR36nqSbBgonrgDfF/2K87KSjPvCYa4Gzxus2bnn95xa5gD26lq1yA9IZFIorQh0CVWbBrXf42ClKUdk9vRhR/UHdYQT1aaafqEqo887rCbvfEEk+UPul/E8P5tq9vd8q3qvTk3dJURL4AhNnyY87ArVyGOrE7Rswtda+ZZw3mKTNni9N5p9ftWOd/+0es1N0g/hrtDKJrgCrNY97xCaWVGPwfRe39P7fvf9o53nwGNpJx37Nxm5QUdpe4a6OyPykjr22up///nnFj5/3kMmyS34/Y87rVWEUGUBKsfX6LyDjL1xZ3vi3P9jiA+CFWrvLSLJduE2+kyhg5HH/i9r6YPNz7119cLnPlFo3nHkegc1uqXO+dMlwNMeT46f3c8V5CceLf7DNwrUOImZgB9FZJI5utb/2tn7ons+oEE9dpPIjJTEcoOrtEM3LLz//wIrn3/jq2v9Bz66P2pYxCIWsYhFLGIRi1jEIv5X/BemhHlHPZFsGgAAAABJRU5ErkJggg=="/></symbol>
+</defs>
+<rect x="1" y="1" width="958" height="694" rx="16" fill="#ffffff" stroke="#d5dfea" stroke-width="1.5"/>
+<text x="28" y="46" font-size="25" font-weight="700" fill="#18263a">Why unchanged files get reread: shared extents</text>
+<text x="28" y="74" font-size="15" fill="#526278">Our best model. Kusto packs rows from many files, even from different partitions, into one extent.</text>
+<text x="28" y="94" font-size="15" fill="#526278">When one of those files leaves the table, the whole extent is rebuilt from the files that are left.</text>
+<rect x="24" y="122" width="288" height="372" rx="14" fill="#f7f9fc" stroke="#d5dfea" stroke-width="1.5"/>
+<text x="40" y="152" font-size="15" font-weight="700" fill="#18263a">1. Steady state</text>
+<text x="28" y="520" font-size="13" fill="#18263a">6 files, 2 extents. Each extent mixes</text>
+<text x="28" y="539" font-size="13" fill="#18263a">files from 2 or 3 partitions.</text>
+<rect x="336" y="122" width="288" height="372" rx="14" fill="#f7f9fc" stroke="#d5dfea" stroke-width="1.5"/>
+<text x="352" y="152" font-size="15" font-weight="700" fill="#18263a">2. A commit removes C</text>
+<text x="340" y="520" font-size="13" fill="#18263a">OPTIMIZE or PURGE removes C. Kusto</text>
+<text x="340" y="539" font-size="13" fill="#18263a">rebuilds extent 1, so it reads A and B</text>
+<text x="340" y="558" font-size="13" fill="#18263a">again, though they did not change.</text>
+<rect x="648" y="122" width="288" height="372" rx="14" fill="#f7f9fc" stroke="#d5dfea" stroke-width="1.5"/>
+<text x="664" y="152" font-size="15" font-weight="700" fill="#18263a">3. Append H</text>
+<text x="652" y="520" font-size="13" fill="#18263a">Appends only add an extent.</text>
+<text x="652" y="539" font-size="13" fill="#18263a">Nothing old is read again.</text>
+<rect x="38" y="170" width="260" height="98" rx="10" fill="#ffffff" stroke="#c9b8ec" stroke-width="2"/>
+<text x="52" y="192" font-size="13" font-weight="700" fill="#6b3fb5">extent 1</text>
+<text x="286" y="192" font-size="11.5" fill="#526278" text-anchor="end">2 partitions</text>
+<rect x="50" y="204" width="70" height="34" rx="8" fill="#dff4e5" stroke="#25834b" stroke-width="2"/>
+<use href="#extents-pq" x="57" y="210" width="22" height="22"/>
+<text x="85" y="227" font-size="14.5" font-weight="700" fill="#18263a">A</text>
+<text x="85" y="256" font-size="11" fill="#526278" text-anchor="middle">expired</text>
+<rect x="132" y="204" width="70" height="34" rx="8" fill="#dff4e5" stroke="#25834b" stroke-width="2"/>
+<use href="#extents-pq" x="139" y="210" width="22" height="22"/>
+<text x="167" y="227" font-size="14.5" font-weight="700" fill="#18263a">B</text>
+<text x="167" y="256" font-size="11" fill="#526278" text-anchor="middle">expired</text>
+<rect x="214" y="204" width="70" height="34" rx="8" fill="#dff4e5" stroke="#25834b" stroke-width="2"/>
+<use href="#extents-pq" x="221" y="210" width="22" height="22"/>
+<text x="249" y="227" font-size="14.5" font-weight="700" fill="#18263a">C</text>
+<text x="249" y="256" font-size="11" fill="#526278" text-anchor="middle">compact</text>
+<rect x="38" y="280" width="260" height="98" rx="10" fill="#ffffff" stroke="#c9b8ec" stroke-width="2"/>
+<text x="52" y="302" font-size="13" font-weight="700" fill="#6b3fb5">extent 2</text>
+<text x="286" y="302" font-size="11.5" fill="#526278" text-anchor="end">3 partitions</text>
+<rect x="50" y="314" width="70" height="34" rx="8" fill="#dff4e5" stroke="#25834b" stroke-width="2"/>
+<use href="#extents-pq" x="57" y="320" width="22" height="22"/>
+<text x="85" y="337" font-size="14.5" font-weight="700" fill="#18263a">D</text>
+<text x="85" y="366" font-size="11" fill="#526278" text-anchor="middle">compact</text>
+<rect x="132" y="314" width="70" height="34" rx="8" fill="#dff4e5" stroke="#25834b" stroke-width="2"/>
+<use href="#extents-pq" x="139" y="320" width="22" height="22"/>
+<text x="167" y="337" font-size="14.5" font-weight="700" fill="#18263a">E</text>
+<text x="167" y="366" font-size="11" fill="#526278" text-anchor="middle">control</text>
+<rect x="214" y="314" width="70" height="34" rx="8" fill="#dff4e5" stroke="#25834b" stroke-width="2"/>
+<use href="#extents-pq" x="221" y="320" width="22" height="22"/>
+<text x="249" y="337" font-size="14.5" font-weight="700" fill="#18263a">F</text>
+<text x="249" y="366" font-size="11" fill="#526278" text-anchor="middle">live</text>
+<rect x="350" y="170" width="260" height="98" rx="10" fill="#fff5f6" stroke="#c8283c" stroke-width="2"/>
+<text x="364" y="192" font-size="13" font-weight="700" fill="#c8283c">extent 1</text>
+<text x="598" y="192" font-size="11.5" font-weight="700" fill="#c8283c" text-anchor="end">rebuilt</text>
+<rect x="362" y="204" width="70" height="34" rx="8" fill="#ffe2e6" stroke="#c8283c" stroke-width="2"/>
+<use href="#extents-pq" x="369" y="210" width="22" height="22"/>
+<text x="397" y="227" font-size="14.5" font-weight="700" fill="#18263a">A</text>
+<text x="397" y="256" font-size="11" fill="#526278" text-anchor="middle">expired</text>
+<rect x="444" y="204" width="70" height="34" rx="8" fill="#ffe2e6" stroke="#c8283c" stroke-width="2"/>
+<use href="#extents-pq" x="451" y="210" width="22" height="22"/>
+<text x="479" y="227" font-size="14.5" font-weight="700" fill="#18263a">B</text>
+<text x="479" y="256" font-size="11" fill="#526278" text-anchor="middle">expired</text>
+<rect x="526" y="204" width="70" height="34" rx="8" fill="#ffe2e6" stroke="#bf3448" stroke-width="2" stroke-dasharray="6 4"/>
+<use href="#extents-pq" x="533" y="210" width="22" height="22"/>
+<text x="561" y="227" font-size="14.5" font-weight="700" fill="#18263a">C</text>
+<text x="561" y="256" font-size="11" fill="#526278" text-anchor="middle">compact</text>
+<rect x="350" y="280" width="260" height="98" rx="10" fill="#ffffff" stroke="#c9b8ec" stroke-width="2"/>
+<text x="364" y="302" font-size="13" font-weight="700" fill="#6b3fb5">extent 2</text>
+<text x="598" y="302" font-size="11.5" font-weight="700" fill="#1f7a45" text-anchor="end">untouched</text>
+<rect x="362" y="314" width="70" height="34" rx="8" fill="#dff4e5" stroke="#25834b" stroke-width="2"/>
+<use href="#extents-pq" x="369" y="320" width="22" height="22"/>
+<text x="397" y="337" font-size="14.5" font-weight="700" fill="#18263a">D</text>
+<text x="397" y="366" font-size="11" fill="#526278" text-anchor="middle">compact</text>
+<rect x="444" y="314" width="70" height="34" rx="8" fill="#dff4e5" stroke="#25834b" stroke-width="2"/>
+<use href="#extents-pq" x="451" y="320" width="22" height="22"/>
+<text x="479" y="337" font-size="14.5" font-weight="700" fill="#18263a">E</text>
+<text x="479" y="366" font-size="11" fill="#526278" text-anchor="middle">control</text>
+<rect x="526" y="314" width="70" height="34" rx="8" fill="#dff4e5" stroke="#25834b" stroke-width="2"/>
+<use href="#extents-pq" x="533" y="320" width="22" height="22"/>
+<text x="561" y="337" font-size="14.5" font-weight="700" fill="#18263a">F</text>
+<text x="561" y="366" font-size="11" fill="#526278" text-anchor="middle">live</text>
+<rect x="662" y="170" width="260" height="98" rx="10" fill="#ffffff" stroke="#c9b8ec" stroke-width="2"/>
+<text x="676" y="192" font-size="13" font-weight="700" fill="#6b3fb5">extent 1</text>
+<text x="910" y="192" font-size="11.5" font-weight="700" fill="#1f7a45" text-anchor="end">untouched</text>
+<rect x="674" y="204" width="70" height="34" rx="8" fill="#dff4e5" stroke="#25834b" stroke-width="2"/>
+<use href="#extents-pq" x="681" y="210" width="22" height="22"/>
+<text x="709" y="227" font-size="14.5" font-weight="700" fill="#18263a">A</text>
+<text x="709" y="256" font-size="11" fill="#526278" text-anchor="middle">expired</text>
+<rect x="756" y="204" width="70" height="34" rx="8" fill="#dff4e5" stroke="#25834b" stroke-width="2"/>
+<use href="#extents-pq" x="763" y="210" width="22" height="22"/>
+<text x="791" y="227" font-size="14.5" font-weight="700" fill="#18263a">B</text>
+<text x="791" y="256" font-size="11" fill="#526278" text-anchor="middle">expired</text>
+<rect x="838" y="204" width="70" height="34" rx="8" fill="#dff4e5" stroke="#25834b" stroke-width="2"/>
+<use href="#extents-pq" x="845" y="210" width="22" height="22"/>
+<text x="873" y="227" font-size="14.5" font-weight="700" fill="#18263a">C</text>
+<text x="873" y="256" font-size="11" fill="#526278" text-anchor="middle">compact</text>
+<rect x="662" y="280" width="260" height="98" rx="10" fill="#ffffff" stroke="#c9b8ec" stroke-width="2"/>
+<text x="676" y="302" font-size="13" font-weight="700" fill="#6b3fb5">extent 2</text>
+<text x="910" y="302" font-size="11.5" font-weight="700" fill="#1f7a45" text-anchor="end">untouched</text>
+<rect x="674" y="314" width="70" height="34" rx="8" fill="#dff4e5" stroke="#25834b" stroke-width="2"/>
+<use href="#extents-pq" x="681" y="320" width="22" height="22"/>
+<text x="709" y="337" font-size="14.5" font-weight="700" fill="#18263a">D</text>
+<text x="709" y="366" font-size="11" fill="#526278" text-anchor="middle">compact</text>
+<rect x="756" y="314" width="70" height="34" rx="8" fill="#dff4e5" stroke="#25834b" stroke-width="2"/>
+<use href="#extents-pq" x="763" y="320" width="22" height="22"/>
+<text x="791" y="337" font-size="14.5" font-weight="700" fill="#18263a">E</text>
+<text x="791" y="366" font-size="11" fill="#526278" text-anchor="middle">control</text>
+<rect x="838" y="314" width="70" height="34" rx="8" fill="#dff4e5" stroke="#25834b" stroke-width="2"/>
+<use href="#extents-pq" x="845" y="320" width="22" height="22"/>
+<text x="873" y="337" font-size="14.5" font-weight="700" fill="#18263a">F</text>
+<text x="873" y="366" font-size="11" fill="#526278" text-anchor="middle">live</text>
+<rect x="662" y="390" width="260" height="98" rx="10" fill="#ffffff" stroke="#185abd" stroke-width="2"/>
+<text x="676" y="412" font-size="13" font-weight="700" fill="#185abd">extent 3 (new)</text>
+<text x="910" y="412" font-size="11.5" font-weight="700" fill="#185abd" text-anchor="end">only H is read</text>
+<rect x="674" y="424" width="70" height="34" rx="8" fill="#e9eff9" stroke="#185abd" stroke-width="2"/>
+<use href="#extents-pq" x="681" y="430" width="22" height="22"/>
+<text x="709" y="447" font-size="14.5" font-weight="700" fill="#18263a">H</text>
+<text x="709" y="476" font-size="11" fill="#526278" text-anchor="middle">live</text>
+<text x="480" y="422" font-size="14" font-weight="700" fill="#c8283c" text-anchor="middle">reread: A, B</text>
+<text x="480" y="444" font-size="12.5" fill="#526278" text-anchor="middle">expected: only new files, if any</text>
+<rect x="24" y="584" width="912" height="70" rx="10" fill="#f4effc" stroke="#6b3fb5" stroke-width="1.5"/>
+<text x="40" y="612" font-size="13.5" fill="#18263a"><tspan font-weight="700">Blast radius depends on the packing, and Kusto picks it. </tspan><tspan>A few big extents over many files: one change rereads most</tspan></text>
+<text x="40" y="634" font-size="13.5" fill="#18263a">of the table (16-file runs). Small extents over few files: little or nothing is reread (most 2-file runs).</text>
+<text x="936" y="680" font-size="11" fill="#526278" text-anchor="end">Apache Parquet logo © The Apache Software Foundation, Apache License 2.0</text>
+</svg>

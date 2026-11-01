@@ -6,12 +6,12 @@
 /projects/arrowcol-router-rust/secrets/
 
 # Node / Nx
-node_modules/
+node_modules
 .nx/
 
 # Rust
 debug/
-target/
+target
 **/*.rs.bk
 *.pdb
 **/mutants.out*/

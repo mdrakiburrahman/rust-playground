@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use arrow_array::RecordBatch;
 use arrowcol_catalog::FlightSqlDdlHandler;
 use arrowcol_flight::{
-    AllowAllAuthenticator, ArrowColFlightService, BatchAdmission, DrainController, PutResultEmitter, RuntimeError,
-    RuntimeResult, StreamAbortReason, StreamCompletion, StreamContext, StreamLifecycle, StreamSummary,
+    AllowAllAuthenticator, ArrowColFlightService, BatchAdmission, DrainController, DrainOutcome, PutResultEmitter,
+    RuntimeError, RuntimeResult, StreamAbortReason, StreamCompletion, StreamContext, StreamLifecycle, StreamSummary,
 };
 use arrowcol_protocol::{
     AuthContext, AuthMethod, AuthenticatedPrincipal, CollectorInstanceId, ErrorCode, ImplementationPool,
@@ -205,6 +205,8 @@ impl BatchAdmission for DfeAdmission {
             .await
             .map_err(|_| RuntimeError::draining())?;
         let envelope = ArrowcolBatchEnvelope {
+            publication_id: None,
+            ingested_at_ms: None,
             table: context.metadata().table().clone(),
             source_schema_version: context.registered_schema().version(),
             target_schema_version: context.current_schema().version(),
@@ -348,7 +350,11 @@ impl StreamLifecycle for DfeStreamLifecycle {
         let rows = u64::try_from(batch.num_rows()).unwrap_or(u64::MAX);
         let bytes = arrow_deltalake::record_batch_logical_bytes(&batch).map_err(|_| RuntimeError::internal())?;
         self.metrics.batch_received(rows, bytes);
-        let records = encode_record_batch(self.envelope.clone(), batch).map_err(|_| RuntimeError::internal())?;
+        let mut envelope = self.envelope.clone();
+        let publication_id = arrowcol_protocol::ReceiptId::new();
+        envelope.publication_id = Some(publication_id);
+        envelope.ingested_at_ms = Some(now_unix_millis().map_err(|_| RuntimeError::internal())?);
+        let records = encode_record_batch(envelope, batch).map_err(|_| RuntimeError::internal())?;
         let correlation_id = self
             .pending
             .insert_for_stream(
@@ -362,6 +368,9 @@ impl StreamLifecycle for DfeStreamLifecycle {
             .map_err(|_| RuntimeError::internal())?;
         let mut pending_send = PendingSendGuard::new(Arc::clone(&self.pending), correlation_id);
         let pdata = OtapPdata::new_todo_context(OtapPayload::from_pdata_arrow(records));
+        crate::shutdown::PROCESS_ROUTING_SHUTDOWN
+            .publication_finished(publication_id, false)
+            .map_err(|_| RuntimeError::internal())?;
         match self.sender.send(correlation_id, pdata).await {
             Ok(()) => {
                 pending_send.disarm();
@@ -416,7 +425,10 @@ fn create_receiver(
     receiver_config: &ReceiverConfig,
     _capabilities: &otel_arrow_dfe_engine::capability::registry::Capabilities,
 ) -> Result<ReceiverWrapper<OtapPdata>, otel_arrow_dfe_config::error::Error> {
-    let config: FlightReceiverConfig = parse_config(&node_config.config)?;
+    let mut config: FlightReceiverConfig = parse_config(&node_config.config)?;
+    if let Some(generation) = crate::config::process_cloud_generation() {
+        config.registration.instance_key = format!("{}|cloud={generation}", config.registration.instance_key);
+    }
     config.validate().map_err(config_error)?;
     let routing = config.routing.build().map_err(config_error)?;
     let metrics = global_metrics();
@@ -584,7 +596,7 @@ impl receiver::Receiver<OtapPdata> for ArrowFlightReceiver {
                             finalize_registration(
                                 &self.routing,
                                 instance_id,
-                                CollectorState::Stopped,
+                                CollectorState::Draining,
                                 &self.metrics,
                             ).await;
                             await_tasks(flight, admin, registration, remaining).await;
@@ -640,7 +652,10 @@ async fn drain_streams(
     tokio::pin!(stop);
     loop {
         tokio::select! {
-            _ = &mut stop => return,
+            outcome = &mut stop => {
+                record_drain_outcome(outcome);
+                return;
+            },
             message = control.recv() => match message {
                 Ok(NodeControlMsg::Ack(ack)) => {
                     if let Some(id) = correlation_id(&ack.unwind.route.calldata) {
@@ -654,11 +669,18 @@ async fn drain_streams(
                 }
                 Ok(_) => {}
                 Err(_) => {
-                    let _ = (&mut stop).await;
+                    record_drain_outcome((&mut stop).await);
                     return;
                 }
             },
         }
+    }
+}
+
+fn record_drain_outcome(outcome: DrainOutcome) {
+    if !matches!(outcome, DrainOutcome::Drained) {
+        crate::shutdown::PROCESS_ROUTING_SHUTDOWN.record_failure();
+        tracing::error!(?outcome, "dataflow ingress did not drain cleanly");
     }
 }
 
@@ -706,11 +728,17 @@ async fn await_tasks(
     timeout: Duration,
 ) {
     let wait = async {
-        let _ = (&mut flight).await;
-        let _ = (&mut admin).await;
-        let _ = (&mut registration).await;
+        let flight = (&mut flight).await;
+        let admin = (&mut admin).await;
+        let registration = (&mut registration).await;
+        if !matches!(flight, Ok(Ok(()))) || !matches!(admin, Ok(Ok(()))) || registration.is_err() {
+            crate::shutdown::PROCESS_ROUTING_SHUTDOWN.record_failure();
+            tracing::error!("dataflow receiver shutdown task failed");
+        }
     };
     if tokio::time::timeout(timeout, wait).await.is_err() {
+        crate::shutdown::PROCESS_ROUTING_SHUTDOWN.record_failure();
+        tracing::error!("dataflow receiver shutdown tasks timed out");
         flight.abort();
         admin.abort();
         registration.abort();
@@ -742,6 +770,9 @@ async fn register_collector(
             lease_expires_at_unix_ms: expiry,
         })
         .await
+        .map_err(|error| error.to_string())?;
+    crate::shutdown::PROCESS_ROUTING_SHUTDOWN
+        .register(Arc::clone(store), instance_id)
         .map_err(|error| error.to_string())?;
     metrics.publish_pressure(store.as_ref()).await?;
     metrics.set_registered(true);
@@ -818,10 +849,17 @@ async fn finalize_registration(
     state: CollectorState,
     metrics: &Arc<RuntimeMetrics>,
 ) {
-    let Ok(now) = now_unix_millis() else {
-        return;
+    let result = match now_unix_millis() {
+        Ok(now) => store
+            .set_collector_state(instance_id, state, now)
+            .await
+            .map_err(|error| error.to_string()),
+        Err(error) => Err(error),
     };
-    let _ = store.set_collector_state(instance_id, state, now).await;
+    if let Err(error) = result {
+        crate::shutdown::PROCESS_ROUTING_SHUTDOWN.record_failure();
+        tracing::error!(%error, "dataflow could not persist ingress drain state");
+    }
     if metrics.publish_pressure(store.as_ref()).await.is_err() {
         metrics.set_registered(false);
     }
@@ -968,6 +1006,8 @@ mod tests {
 
     fn envelope() -> ArrowcolBatchEnvelope {
         ArrowcolBatchEnvelope {
+            publication_id: Some(arrowcol_protocol::ReceiptId::new()),
+            ingested_at_ms: Some(arrowcol_protocol::UnixMillis::new(1_700_000_012_345).expect("stamp")),
             table: arrowcol_protocol::TableIdentity::new(
                 CatalogName::new("demo").expect("catalog"),
                 SchemaName::new("generated").expect("schema"),
@@ -1449,6 +1489,26 @@ mod tests {
         lifecycle.push_batch(batch()).await.expect("second batch");
         let ids = sent_ids(&sender);
         assert_eq!(ids.len(), 2);
+        let envelopes = sender
+            .sent
+            .lock()
+            .expect("capture lock")
+            .drain(..)
+            .map(|(_, pdata)| {
+                let (_, payload) = pdata.into_parts();
+                let otel_arrow_dfe_pdata::PayloadData::PdataArrowRecords(records) = payload.into_data() else {
+                    panic!("expected pluggable Arrow records");
+                };
+                crate::decode_record_set(*records)
+                    .expect("decode")
+                    .pop()
+                    .expect("one batch")
+                    .envelope
+            })
+            .collect::<Vec<_>>();
+        assert!(envelopes.iter().all(|envelope| envelope.ingested_at_ms.is_some()));
+        assert!(envelopes.iter().all(|envelope| envelope.publication_id.is_some()));
+        assert_ne!(envelopes[0].publication_id, envelopes[1].publication_id);
         {
             let mut completion = lifecycle.complete(summary());
             assert!((&mut completion).now_or_never().is_none());

@@ -13,6 +13,8 @@ on:
       - projects/arrowcol-dataflow-rust/**
       - projects/arrowcol-router-rust/**
       - projects/kusto-explorer/**
+      - projects/kusto-bridge/**
+      - infra/docker/**
       - projects/arrowcol-infra/migrations/**
       - submodules/otel-arrow
       - submodules/otel-arrow/**

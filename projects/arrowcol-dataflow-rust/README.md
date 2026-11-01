@@ -36,6 +36,14 @@ wiring contracts when it would receive Arrowcol pluggable Arrow pdata.
 durable (`config.smoke-quiver.yaml`) topologies, verifies every admin endpoint
 and capability claim, sends `SIGTERM`, and requires bounded graceful shutdown.
 Both scripts use `$CARGO_TARGET_DIR` when it is set.
+After ingress enters `draining`, the main-thread shutdown hook waits for the
+controller's final publication and shared publisher close before writing the
+terminal routing state. Only a clean drain and close with no unpublished identity or retired worker
+becomes `stopped`; otherwise it becomes `failed`. A refused close or failed
+terminal write is logged and exits nonzero. A startup or validation error
+(for example `IncompatiblePdataWiring`) still records `failed` but is returned
+unchanged as the process error instead of being replaced by the hook. The receiver never declares the
+process stopped while its exporters are still draining.
 
 ## Local infrastructure
 

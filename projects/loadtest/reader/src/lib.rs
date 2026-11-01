@@ -8,6 +8,92 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
+mod cloud;
+mod corpus;
+pub mod scheduler;
+pub use cloud::{
+    cloud_sample_corpus, cloud_sample_corpus_timed, cloud_sample_rows, summarize_cloud, summarize_cloud_timed,
+};
+use corpus::CorpusBuilder;
+pub use corpus::{MAX_CHUNK_DISTINCT_ROWS, MAX_CORPUS_DISTINCT_ROWS, ValidationChunk, ValidationCorpus};
+
+type PartitionValues = BTreeMap<String, Option<String>>;
+
+fn row_digest(value: &Value) -> Result<String> {
+    Ok(format!(
+        "sha256:{}",
+        hex::encode(Sha256::digest(serde_json::to_vec(value)?))
+    ))
+}
+
+fn payload_digest(mut value: Value, partition_columns: &[String]) -> Result<String> {
+    let fields = value.as_object_mut().context("expected object row")?;
+    for column in partition_columns {
+        fields.remove(column);
+    }
+    row_digest(&value)
+}
+
+fn snapshot_partitions(delta: &deltalake_core::DeltaTable) -> Result<BTreeMap<String, PartitionValues>> {
+    let mut files = BTreeMap::new();
+    let snapshot = delta.snapshot()?;
+    for file in snapshot.log_data().iter() {
+        if file.deletion_vector_descriptor().is_some() {
+            bail!("independent Parquet oracle does not support deletion vectors");
+        }
+        let partitions: PartitionValues = file.partition_values_map().into_iter().collect();
+        validate_partition_columns(&partitions, snapshot.metadata().partition_columns())?;
+        files.insert(file.path().into_owned(), partitions);
+    }
+    Ok(files)
+}
+
+fn validate_partition_columns(partitions: &PartitionValues, expected: &[String]) -> Result<()> {
+    if partitions.len() != expected.len() || expected.iter().any(|column| !partitions.contains_key(column)) {
+        bail!("committed Add partition values do not match Delta metadata");
+    }
+    Ok(())
+}
+
+fn with_partitions(mut row: Value, schema: &Value, partitions: &PartitionValues) -> Result<Value> {
+    let fields = row.as_object_mut().context("expected object row")?;
+    for (name, raw) in partitions {
+        let definition = schema["fields"]
+            .as_array()
+            .context("missing Delta fields")?
+            .iter()
+            .find(|field| field["name"].as_str() == Some(name))
+            .context("partition column absent from schema")?;
+        let value = match raw {
+            None => Value::Null,
+            Some(raw) => match definition["type"].as_str() {
+                Some("string" | "date") => json!(raw),
+                Some("boolean") => json!(raw.parse::<bool>()?),
+                Some("byte" | "short" | "integer" | "long") => {
+                    let number = raw.parse::<i64>()?;
+                    if number.unsigned_abs() > 9_007_199_254_740_991 {
+                        json!(raw)
+                    } else {
+                        json!(number)
+                    }
+                }
+                other => bail!("unsupported independent oracle partition type {other:?}"),
+            },
+        };
+        if value.is_null() && definition["nullable"] == false {
+            bail!("required partition column is null");
+        }
+        if let Some(physical) = fields.get(name) {
+            if physical != &value {
+                bail!("physical partition value differs from committed Add action");
+            }
+        } else {
+            fields.insert(name.clone(), value);
+        }
+    }
+    Ok(row)
+}
+
 fn field_value(field: &Field) -> Value {
     match field {
         Field::Group(row) => row_value(row),
@@ -72,11 +158,9 @@ pub async fn inspect(directory: &Path) -> Result<Value> {
             .await
             .with_context(|| format!("open Delta table {table}"))?;
         let snapshot = delta.snapshot()?;
-        if !snapshot.metadata().partition_columns().is_empty() {
-            bail!("partitioned inspection is not supported");
-        }
-
         let schema = snapshot.schema();
+        let schema_json = serde_json::to_value(&schema)?;
+        let partitions = snapshot_partitions(&delta)?;
         schemas.insert(table.clone(), serde_json::to_value(&schema)?);
         versions.insert(table.clone(), json!(snapshot.version()));
         let uris = delta.get_file_uris_by_partitions(&[]).await?;
@@ -97,11 +181,16 @@ pub async fn inspect(directory: &Path) -> Result<Value> {
             if !path.starts_with(&root) {
                 bail!("data file escapes table root");
             }
+            let relative = path.strip_prefix(&root)?.to_str().context("non-UTF8 data path")?;
+            let partition_values = partitions
+                .get(relative)
+                .context("active file lacks committed partition values")?;
             let reader = SerializedFileReader::new(File::open(&path)?)
                 .with_context(|| format!("open Parquet {}", path.display()))?;
             let mut namespaces = BTreeSet::new();
             for row in reader.get_row_iter(None)? {
-                let mut value = row_value(&row?);
+                scheduler::check_deadline()?;
+                let mut value = with_partitions(row_value(&row?), &schema_json, partition_values)?;
                 let fields = value.as_object_mut().context("expected object row")?;
                 if let Some(namespace) = fields.get("_otel_join_namespace").and_then(Value::as_str) {
                     namespaces.insert(namespace.to_string());
@@ -150,7 +239,11 @@ pub struct TableSummary {
     pub minimum_file_bytes: u64,
     pub maximum_file_bytes: u64,
     pub row_hashes: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub payload_row_hashes: BTreeMap<String, u64>,
     pub files: Vec<FileSummary>,
+    #[serde(default)]
+    pub partition_columns: Vec<String>,
 }
 
 /// One active Delta data file.
@@ -159,6 +252,8 @@ pub struct FileSummary {
     pub path: String,
     pub bytes: u64,
     pub rows: u64,
+    #[serde(default)]
+    pub partition_values: PartitionValues,
 }
 
 /// Committed file names and schemas without reading or hashing Parquet rows.
@@ -181,6 +276,231 @@ pub struct TableInventory {
 ///
 /// Rejects unsafe paths, missing/corrupt data, and empty snapshots.
 pub fn sample_row(directory: &Path, identity: &str, summary: &TableSummary) -> Result<Value> {
+    let root = table_root(directory, identity)?;
+    let file = summary.files.first().context("snapshot has no data files")?;
+    let path = local_active_file(&root, root.join(&file.path).to_str().context("non-UTF8 data path")?)?;
+    let reader = SerializedFileReader::new(File::open(path)?)?;
+    let row = reader
+        .get_row_iter(None)?
+        .next()
+        .context("snapshot file has no rows")??;
+    with_partitions(row_value(&row), &summary.schema, &file.partition_values)
+}
+
+/// Reads the complete bounded row multiset from the captured active files.
+///
+/// # Errors
+///
+/// Rejects unsafe paths, changed row counts/hashes, and more than 256 distinct
+/// rows. This is a validation oracle for the synthetic corpus, not a bulk API.
+pub fn sample_rows(directory: &Path, identity: &str, summary: &TableSummary) -> Result<Vec<(Value, u64)>> {
+    let root = table_root(directory, identity)?;
+    let mut distinct = BTreeMap::<String, (Value, u64)>::new();
+    let mut hashes = BTreeMap::<String, u64>::new();
+    let mut rows = 0_u64;
+    for file in &summary.files {
+        let path = local_active_file(&root, root.join(&file.path).to_str().context("non-UTF8 data path")?)?;
+        let reader = SerializedFileReader::new(File::open(path)?)?;
+        for row in reader.get_row_iter(None)? {
+            scheduler::check_deadline()?;
+            let value = with_partitions(row_value(&row?), &summary.schema, &file.partition_values)?;
+            let encoded = serde_json::to_string(&value)?;
+            let digest = format!("sha256:{}", hex::encode(Sha256::digest(encoded.as_bytes())));
+            *hashes.entry(digest).or_default() += 1;
+            let entry = distinct.entry(encoded).or_insert((value, 0));
+            entry.1 = entry.1.checked_add(1).context("row multiplicity overflow")?;
+            rows = rows.checked_add(1).context("row count overflow")?;
+            if distinct.len() > 256 {
+                bail!("validation corpus exceeds 256 distinct rows");
+            }
+        }
+    }
+    if rows != summary.rows || hashes != summary.row_hashes {
+        bail!("captured validation corpus changed");
+    }
+    Ok(distinct.into_values().collect())
+}
+
+/// Reads the complete exact row multiset of the captured active files as disjoint chunks of whole
+/// partitions, each with at most [`MAX_CHUNK_DISTINCT_ROWS`] distinct rows. Nothing is sampled or
+/// truncated.
+///
+/// # Errors
+///
+/// Rejects unsafe paths, changed row counts/hashes, more than one or a non-string partition
+/// column, null partition values, a partition with more than 256 distinct rows, and corpora beyond
+/// [`MAX_CORPUS_DISTINCT_ROWS`].
+pub fn sample_corpus(directory: &Path, identity: &str, summary: &TableSummary) -> Result<ValidationCorpus> {
+    let root = table_root(directory, identity)?;
+    let mut builder = CorpusBuilder::new(summary)?;
+    decode_batches(
+        &summary.files,
+        |file| {
+            local_active_file(&root, root.join(&file.path).to_str().context("non-UTF8 data path")?)
+                .and_then(|path| aggregate_corpus_file(&path, &summary.schema, &file.partition_values))
+        },
+        |file, aggregate| {
+            let aggregate = aggregate?;
+            for row in aggregate.distinct {
+                builder.add_counted(row.value, row.encoded, row.digest, row.count, &file.partition_values)?;
+            }
+            aggregate.failure.map_or(Ok(()), Err)
+        },
+    )?;
+    builder.finish(summary)
+}
+
+struct CorpusRow {
+    value: Value,
+    encoded: String,
+    digest: String,
+    count: u64,
+}
+
+/// One file's distinct rows in first-occurrence order with exact multiplicities, plus the row error
+/// that ended decoding early, reported only after the preceding rows are merged.
+struct FileCorpus {
+    distinct: Vec<CorpusRow>,
+    rows_read: u64,
+    failure: Option<anyhow::Error>,
+}
+
+/// Collapses duplicates while decoding so retained memory is bounded by distinct rows, not file
+/// rows. A file holds one partition, so more than [`MAX_CHUNK_DISTINCT_ROWS`] distinct rows always
+/// fails the builder's partition guard: decoding stops at that row instead of materializing the rest.
+/// Merging rows in first-occurrence order makes every builder guard fire as in a serial row pass.
+fn aggregate_corpus_file(path: &Path, schema: &Value, partition_values: &PartitionValues) -> Result<FileCorpus> {
+    let reader = SerializedFileReader::new(File::open(path)?)?;
+    let mut index = std::collections::HashMap::<String, usize>::new();
+    let mut aggregate = FileCorpus {
+        distinct: Vec::new(),
+        rows_read: 0,
+        failure: None,
+    };
+    for row in reader.get_row_iter(None)? {
+        scheduler::check_deadline()?;
+        let decoded = row
+            .map_err(anyhow::Error::from)
+            .and_then(|row| with_partitions(row_value(&row), schema, partition_values))
+            .and_then(|value| corpus::encode_row(&value).map(|(encoded, digest)| (value, encoded, digest)));
+        let (value, encoded, digest) = match decoded {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                aggregate.failure = Some(error);
+                break;
+            }
+        };
+        aggregate.rows_read = aggregate.rows_read.checked_add(1).context("row count overflow")?;
+        if let Some(&position) = index.get(&encoded) {
+            let row = &mut aggregate.distinct[position];
+            row.count = row.count.checked_add(1).context("row multiplicity overflow")?;
+            continue;
+        }
+        index.insert(encoded.clone(), aggregate.distinct.len());
+        aggregate.distinct.push(CorpusRow {
+            value,
+            encoded,
+            digest,
+            count: 1,
+        });
+        if aggregate.distinct.len() > MAX_CHUNK_DISTINCT_ROWS {
+            break;
+        }
+    }
+    Ok(aggregate)
+}
+
+struct FileDecode {
+    bytes: u64,
+    rows: u64,
+    row_hashes: BTreeMap<String, u64>,
+    payload_row_hashes: BTreeMap<String, u64>,
+}
+
+fn summarize_file(
+    path: &Path,
+    schema: &Value,
+    partition_values: &PartitionValues,
+    partition_columns: &[String],
+) -> Result<FileDecode> {
+    let bytes = fs::metadata(path)?.len();
+    let reader =
+        SerializedFileReader::new(File::open(path)?).with_context(|| format!("open Parquet {}", path.display()))?;
+    let rows = u64::try_from(reader.metadata().file_metadata().num_rows())
+        .context("negative or overflowing Parquet row count")?;
+    let mut row_hashes = BTreeMap::<String, u64>::new();
+    let mut payload_row_hashes = BTreeMap::<String, u64>::new();
+    for row in reader.get_row_iter(None)? {
+        scheduler::check_deadline()?;
+        let value = with_partitions(row_value(&row?), schema, partition_values)?;
+        *row_hashes.entry(row_digest(&value)?).or_default() += 1;
+        *payload_row_hashes
+            .entry(payload_digest(value, partition_columns)?)
+            .or_default() += 1;
+    }
+    Ok(FileDecode {
+        bytes,
+        rows,
+        row_hashes,
+        payload_row_hashes,
+    })
+}
+
+fn decode_workers() -> usize {
+    if scheduler::scheduled() {
+        return 1;
+    }
+    std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+}
+
+/// Decodes files in parallel batches of at most twice the worker count and hands each result to
+/// `consume` in input order before the next batch starts, so at most one batch of per-file results
+/// is retained and the first error is the one a serial pass reports.
+fn decode_batches<T: Sync, R: Send>(
+    items: &[T],
+    decode: impl Fn(&T) -> R + Sync,
+    mut consume: impl FnMut(&T, R) -> Result<()>,
+) -> Result<()> {
+    for batch in items.chunks(decode_workers().saturating_mul(2)) {
+        for (item, result) in batch.iter().zip(decode_in_order(batch, &decode)) {
+            consume(item, result)?;
+        }
+    }
+    Ok(())
+}
+
+/// Decodes independent active files on every available core and returns results in input order,
+/// so merged multisets and the first reported error match a serial pass exactly.
+fn decode_in_order<T: Sync, R: Send>(items: &[T], decode: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let workers = decode_workers().min(items.len());
+    if workers <= 1 {
+        return items.iter().map(decode).collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut results = std::thread::scope(|scope| {
+        let handles = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(item) = items.get(index) else { break };
+                        done.push((index, decode(item)));
+                    }
+                    done
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
+            .collect::<Vec<_>>()
+    });
+    results.sort_unstable_by_key(|(index, _)| *index);
+    results.into_iter().map(|(_, result)| result).collect()
+}
+
+fn table_root(directory: &Path, identity: &str) -> Result<PathBuf> {
     if identity
         .split('.')
         .any(|part| part.is_empty() || part.contains(['/', '\\']))
@@ -192,14 +512,7 @@ pub fn sample_row(directory: &Path, identity: &str, summary: &TableSummary) -> R
     if !root.starts_with(&directory) {
         bail!("table escapes Delta root");
     }
-    let file = summary.files.first().context("snapshot has no data files")?;
-    let path = local_active_file(&root, root.join(&file.path).to_str().context("non-UTF8 data path")?)?;
-    let reader = SerializedFileReader::new(File::open(path)?)?;
-    let row = reader
-        .get_row_iter(None)?
-        .next()
-        .context("snapshot file has no rows")??;
-    Ok(row_value(&row))
+    Ok(root)
 }
 
 /// Lists only committed, local active files. An empty root is pending, not a
@@ -219,9 +532,7 @@ pub async fn inventory(directory: &Path) -> Result<SnapshotInventory> {
             .await
             .with_context(|| format!("open Delta table {identity}"))?;
         let snapshot = delta.snapshot()?;
-        if !snapshot.metadata().partition_columns().is_empty() {
-            bail!("partitioned inspection is not supported");
-        }
+        snapshot_partitions(&delta)?;
         let mut files = Vec::new();
         for uri in delta.get_file_uris_by_partitions(&[]).await? {
             let file = local_active_file(&root, &uri)?;
@@ -277,77 +588,199 @@ pub async fn summarize(directory: &Path) -> Result<SnapshotSummary> {
     if roots.is_empty() {
         bail!("no Delta tables found in {}", directory.display());
     }
-    let mut tables = BTreeMap::new();
-    let mut total_files = 0_usize;
-    for root in roots {
-        let identity = table_identity(&directory, &root)?;
-        let url = url::Url::from_directory_path(&root).map_err(|()| anyhow::anyhow!("invalid table path"))?;
-        let delta = deltalake_core::open_table(url)
-            .await
-            .with_context(|| format!("open Delta table {identity}"))?;
-        let snapshot = delta.snapshot()?;
-        if !snapshot.metadata().partition_columns().is_empty() {
-            bail!("partitioned inspection is not supported");
+    summarize_roots(&directory, roots).await
+}
+
+/// Summarizes only the explicitly named tables (dot-separated identities relative to the root),
+/// decoding nothing else; an empty list summarizes every table like [`summarize`].
+///
+/// # Errors
+///
+/// Rejects duplicate, empty, traversing, symlinked, or missing identities, identities that are
+/// not Delta table roots (or are nested below one), and everything [`summarize`] rejects.
+pub async fn summarize_selected(directory: &Path, identities: &[String]) -> Result<SnapshotSummary> {
+    if identities.is_empty() {
+        return summarize(directory).await;
+    }
+    if identities.iter().collect::<std::collections::BTreeSet<_>>().len() != identities.len() {
+        bail!("selected Delta table identities must be unique");
+    }
+    let directory =
+        fs::canonicalize(directory).with_context(|| format!("canonicalize Delta root {}", directory.display()))?;
+    let mut roots = Vec::with_capacity(identities.len());
+    for identity in identities {
+        if identity
+            .split('.')
+            .any(|part| part.is_empty() || part == ".." || part.contains(['/', '\\']))
+        {
+            bail!("invalid table identity {identity:?}");
         }
-        let schema = serde_json::to_value(snapshot.schema())?;
-        let uris = delta.get_file_uris_by_partitions(&[]).await?;
-        let mut files = Vec::with_capacity(uris.len());
-        let mut rows = 0_u64;
-        let mut bytes = 0_u64;
-        let mut row_hashes = BTreeMap::<String, u64>::new();
-        for uri in uris {
-            let path = local_active_file(&root, &uri)?;
-            let size = fs::metadata(&path)?.len();
-            let reader = SerializedFileReader::new(File::open(&path)?)
-                .with_context(|| format!("open Parquet {}", path.display()))?;
-            let file_rows = u64::try_from(reader.metadata().file_metadata().num_rows())
-                .context("negative or overflowing Parquet row count")?;
-            for row in reader.get_row_iter(None)? {
-                let value = row_value(&row?);
-                let digest = format!("sha256:{}", hex::encode(Sha256::digest(serde_json::to_vec(&value)?)));
-                *row_hashes.entry(digest).or_default() += 1;
+        let mut root = directory.clone();
+        for part in identity.split('.') {
+            if root.join("_delta_log").exists() {
+                bail!("table identity {identity:?} is nested below a Delta table");
             }
-            let relative = path
-                .strip_prefix(&root)?
-                .to_str()
-                .context("non-UTF8 data path")?
-                .to_owned();
-            files.push(FileSummary {
-                path: relative,
-                bytes: size,
-                rows: file_rows,
-            });
-            rows = rows.checked_add(file_rows).context("snapshot row count overflow")?;
-            bytes = bytes.checked_add(size).context("snapshot byte count overflow")?;
+            root.push(part);
+            let metadata =
+                fs::symlink_metadata(&root).with_context(|| format!("selected Delta table {identity:?} is missing"))?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                bail!("selected Delta table {identity:?} is a symlink or not a directory");
+            }
         }
-        files.sort_by(|left, right| left.path.cmp(&right.path));
-        let minimum_file_bytes = files.iter().map(|file| file.bytes).min().unwrap_or(0);
-        let maximum_file_bytes = files.iter().map(|file| file.bytes).max().unwrap_or(0);
-        total_files += files.len();
-        if tables
-            .insert(
-                identity.clone(),
+        let log = fs::symlink_metadata(root.join("_delta_log"))
+            .with_context(|| format!("selected path {identity:?} is not a Delta table"))?;
+        if log.file_type().is_symlink() || !log.is_dir() {
+            bail!("selected path {identity:?} is not a Delta table");
+        }
+        if table_identity(&directory, &root)? != *identity {
+            bail!("selected Delta table {identity:?} does not resolve to its own identity");
+        }
+        roots.push(root);
+    }
+    roots.sort();
+    summarize_roots(&directory, roots).await
+}
+
+async fn summarize_roots(directory: &Path, roots: Vec<PathBuf>) -> Result<SnapshotSummary> {
+    summarize_roots_timed(directory, roots, None, scheduler::OracleTimings::default()).await
+}
+
+/// Independent snapshot decoding across tables under the process-wide CPU cap.
+///
+/// # Errors
+/// Rejects invalid snapshots, decode errors, worker failures and expired deadlines.
+pub async fn summarize_timed(
+    directory: &Path,
+    deadline: Option<std::time::Instant>,
+    timings: scheduler::OracleTimings,
+) -> Result<SnapshotSummary> {
+    let directory = fs::canonicalize(directory)?;
+    let roots = find_delta_roots(&directory)?;
+    anyhow::ensure!(!roots.is_empty(), "no Delta tables found");
+    summarize_roots_timed(&directory, roots, deadline, timings).await
+}
+
+async fn summarize_roots_timed(
+    directory: &Path,
+    roots: Vec<PathBuf>,
+    deadline: Option<std::time::Instant>,
+    timings: scheduler::OracleTimings,
+) -> Result<SnapshotSummary> {
+    let mut pending = tokio::task::JoinSet::new();
+    for root in roots {
+        let directory = directory.to_owned();
+        let timings = timings.clone();
+        pending.spawn(async move {
+            let identity = table_identity(&directory, &root)?;
+            let timer = timings.measure(format!(
+                "snapshot/{}/{identity}",
+                directory.file_name().unwrap_or_default().to_string_lossy()
+            ));
+            let result = summarize_root(directory, root, deadline).await;
+            timer.finish(result.is_ok());
+            result
+        });
+    }
+    let mut tables = BTreeMap::new();
+    while let Some(result) = pending.join_next().await {
+        let (identity, summary) = result.context("snapshot table task failed")??;
+        anyhow::ensure!(
+            tables.insert(identity.clone(), summary).is_none(),
+            "duplicate Delta table identity {identity}"
+        );
+    }
+    Ok(SnapshotSummary {
+        files: tables.values().map(|table| table.active_files).sum(),
+        tables,
+    })
+}
+
+async fn summarize_root(
+    directory: PathBuf,
+    root: PathBuf,
+    deadline: Option<std::time::Instant>,
+) -> Result<(String, TableSummary)> {
+    let identity = table_identity(&directory, &root)?;
+    let url = url::Url::from_directory_path(&root).map_err(|()| anyhow::anyhow!("invalid table path"))?;
+    let delta = deltalake_core::open_table(url)
+        .await
+        .with_context(|| format!("open Delta table {identity}"))?;
+    let snapshot = delta.snapshot()?;
+    let partitions = snapshot_partitions(&delta)?;
+    let partition_columns = snapshot.metadata().partition_columns().to_vec();
+    let schema = serde_json::to_value(snapshot.schema())?;
+    let uris = delta.get_file_uris_by_partitions(&[]).await?;
+    let mut active = Vec::with_capacity(uris.len());
+    for uri in uris {
+        let path = local_active_file(&root, &uri)?;
+        let relative = path
+            .strip_prefix(&root)?
+            .to_str()
+            .context("non-UTF8 data path")?
+            .to_owned();
+        let partition_values = partitions
+            .get(&relative)
+            .context("active file lacks committed partition values")?
+            .clone();
+        active.push((path, relative, partition_values));
+    }
+
+    let version = snapshot.version();
+    scheduler::oracle_scheduler()
+        .run(deadline, move || {
+            let mut files = Vec::with_capacity(active.len());
+            let mut rows = 0_u64;
+            let mut bytes = 0_u64;
+            let mut row_hashes = BTreeMap::<String, u64>::new();
+            let mut payload_row_hashes = BTreeMap::<String, u64>::new();
+            decode_batches(
+                &active,
+                |(path, _, partition_values)| summarize_file(path, &schema, partition_values, &partition_columns),
+                |(_, relative, partition_values), decoded| {
+                    let decoded = decoded?;
+                    for (digest, count) in decoded.row_hashes {
+                        let total = row_hashes.entry(digest).or_default();
+                        *total = total.checked_add(count).context("row multiplicity overflow")?;
+                    }
+                    for (digest, count) in decoded.payload_row_hashes {
+                        let total = payload_row_hashes.entry(digest).or_default();
+                        *total = total.checked_add(count).context("row multiplicity overflow")?;
+                    }
+                    files.push(FileSummary {
+                        path: relative.clone(),
+                        bytes: decoded.bytes,
+                        rows: decoded.rows,
+                        partition_values: partition_values.clone(),
+                    });
+                    rows = rows.checked_add(decoded.rows).context("snapshot row count overflow")?;
+                    bytes = bytes
+                        .checked_add(decoded.bytes)
+                        .context("snapshot byte count overflow")?;
+                    Ok(())
+                },
+            )?;
+            files.sort_by(|left, right| left.path.cmp(&right.path));
+            let minimum_file_bytes = files.iter().map(|file| file.bytes).min().unwrap_or(0);
+            let maximum_file_bytes = files.iter().map(|file| file.bytes).max().unwrap_or(0);
+
+            Ok((
+                identity,
                 TableSummary {
                     schema,
-                    version: snapshot.version(),
+                    version,
                     active_files: files.len(),
                     rows,
                     bytes,
                     minimum_file_bytes,
                     maximum_file_bytes,
                     row_hashes,
+                    payload_row_hashes,
                     files,
+                    partition_columns,
                 },
-            )
-            .is_some()
-        {
-            bail!("duplicate Delta table identity {identity}");
-        }
-    }
-    Ok(SnapshotSummary {
-        files: total_files,
-        tables,
-    })
+            ))
+        })
+        .await
 }
 
 fn find_delta_roots(directory: &Path) -> Result<Vec<PathBuf>> {
@@ -404,6 +837,371 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    #[tokio::test]
+    async fn partition_values_come_from_committed_actions_not_directory_names() -> Result<()> {
+        use arrow::{
+            array::{Int32Array, RecordBatch},
+            datatypes::{DataType, Field, Schema},
+        };
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+        let directory = TestDirectory::new("partition-actions")?;
+        let root = directory.path().join("telemetry/sqlserver/partitioned");
+        fs::create_dir_all(root.join("_delta_log"))?;
+        fs::create_dir_all(root.join("opaque"))?;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int32Array::from(vec![1, 1, 2]))])?;
+        let data = root.join("opaque/file.parquet");
+        let mut writer = ArrowWriter::try_new(File::create(&data)?, schema, None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+        fs::copy(&data, root.join("orphan.parquet"))?;
+        let delta_schema = json!({"type":"struct","fields":[
+            {"name":"id","type":"integer","nullable":false,"metadata":{}},
+            {"name":"__arrowcol_ingestion","type":"string","nullable":false,"metadata":{}}
+        ]});
+        let actions = [
+            json!({"protocol":{"minReaderVersion":1,"minWriterVersion":2}}),
+            json!({"metaData":{"id":"fixture-partition","format":{"provider":"parquet","options":{}},
+                "schemaString":delta_schema.to_string(),"partitionColumns":["__arrowcol_ingestion"],"configuration":{}}}),
+            json!({"add":{"path":"opaque/file.parquet","partitionValues":{"__arrowcol_ingestion":"2026-10-27-02-00"},
+                "size":fs::metadata(&data)?.len(),"modificationTime":1,"dataChange":true,
+                "stats":json!({"numRecords":3}).to_string()}}),
+        ];
+        fs::write(
+            root.join("_delta_log/00000000000000000000.json"),
+            actions.iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n",
+        )?;
+        let snapshot = summarize(directory.path()).await?;
+        let summary = &snapshot.tables["telemetry.sqlserver.partitioned"];
+        assert_eq!(summary.rows, 3);
+        assert_eq!(summary.active_files, 1);
+        assert_eq!(summary.partition_columns, ["__arrowcol_ingestion"]);
+        let corpus = sample_rows(directory.path(), "telemetry.sqlserver.partitioned", summary)?;
+        assert_eq!(
+            corpus,
+            vec![
+                (json!({"id":1,"__arrowcol_ingestion":"2026-10-27-02-00"}), 2),
+                (json!({"id":2,"__arrowcol_ingestion":"2026-10-27-02-00"}), 1),
+            ]
+        );
+        let chunked = sample_corpus(directory.path(), "telemetry.sqlserver.partitioned", summary)?;
+        assert_eq!(chunked.partition_column.as_deref(), Some("__arrowcol_ingestion"));
+        assert_eq!(chunked.expected_rows, 3);
+        assert_eq!(
+            chunked.partition_rows,
+            BTreeMap::from([("2026-10-27-02-00".to_owned(), 3)])
+        );
+        assert_eq!(chunked.chunks.len(), 1);
+        assert_eq!(chunked.chunks[0].partition_values, ["2026-10-27-02-00"]);
+        assert_eq!(chunked.chunks[0].rows, corpus);
+        assert_eq!(
+            inventory(directory.path()).await?.tables["telemetry.sqlserver.partitioned"].files,
+            ["opaque/file.parquet"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn selected_summaries_decode_only_named_tables_and_reject_unsafe_identities() -> Result<()> {
+        let directory = TestDirectory::new("selected")?;
+        let base = directory.path().join("telemetry/sqlserver");
+        let schema = json!({"type":"struct","fields":[{"name":"id","type":"integer","nullable":false,"metadata":{}}]});
+        let commit = |root: &Path, id: &str| -> Result<()> {
+            fs::create_dir_all(root.join("_delta_log"))?;
+            let actions = [
+                json!({"protocol":{"minReaderVersion":1,"minWriterVersion":2}}),
+                json!({"metaData":{"id":id,"format":{"provider":"parquet","options":{}},
+                    "schemaString":schema.to_string(),"partitionColumns":[],"configuration":{}}}),
+            ];
+            fs::write(
+                root.join("_delta_log/00000000000000000000.json"),
+                actions.iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n",
+            )?;
+            Ok(())
+        };
+        commit(&base.join("target"), "target")?;
+        commit(&base.join("control"), "control")?;
+        // A corrupt sibling proves unselected tables are never opened or decoded.
+        fs::create_dir_all(base.join("corrupt/_delta_log"))?;
+        fs::write(base.join("corrupt/_delta_log/00000000000000000000.json"), "not json\n")?;
+        assert!(summarize(directory.path()).await.is_err());
+
+        let selected = summarize_selected(directory.path(), &["telemetry.sqlserver.target".to_owned()]).await?;
+        assert_eq!(
+            selected.tables.keys().collect::<Vec<_>>(),
+            ["telemetry.sqlserver.target"]
+        );
+        assert_eq!(selected.files, 0);
+        let both = [
+            "telemetry.sqlserver.target".to_owned(),
+            "telemetry.sqlserver.control".to_owned(),
+        ];
+        assert_eq!(
+            summarize_selected(directory.path(), &both)
+                .await?
+                .tables
+                .keys()
+                .collect::<Vec<_>>(),
+            ["telemetry.sqlserver.control", "telemetry.sqlserver.target"]
+        );
+        assert!(
+            summarize_selected(directory.path(), &[]).await.is_err(),
+            "empty list summarizes everything"
+        );
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(fs::canonicalize(base.join("target"))?, base.join("alias"))?;
+        for invalid in [
+            vec!["telemetry.sqlserver.missing".to_owned()],
+            vec!["telemetry.sqlserver".to_owned()],
+            vec!["telemetry.sqlserver.target._delta_log".to_owned()],
+            vec!["telemetry..target".to_owned()],
+            vec!["telemetry/sqlserver/target".to_owned()],
+            vec!["telemetry.sqlserver.corrupt".to_owned()],
+            vec!["telemetry.sqlserver.alias".to_owned()],
+            vec![
+                "telemetry.sqlserver.target".to_owned(),
+                "telemetry.sqlserver.target".to_owned(),
+            ],
+        ] {
+            assert!(
+                summarize_selected(directory.path(), &invalid).await.is_err(),
+                "{invalid:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Scenario: parallel decode finishes items out of order and some items fail.
+    /// Guarantees: results (including the first error) come back in input order, like a serial map.
+    #[test]
+    fn parallel_decode_preserves_input_order_and_errors() {
+        let items = (0..997_u64).collect::<Vec<_>>();
+        let decode = |item: &u64| -> Result<u64> {
+            if item % 97 == 13 {
+                bail!("item {item} failed");
+            }
+            std::thread::sleep(std::time::Duration::from_micros((item * 7919) % 50));
+            Ok(item * 3)
+        };
+        let parallel = decode_in_order(&items, decode)
+            .into_iter()
+            .map(|result| result.map_err(|error| error.to_string()))
+            .collect::<Vec<_>>();
+        let serial = items
+            .iter()
+            .map(|item| decode(item).map_err(|error| error.to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(parallel, serial);
+        assert_eq!(
+            parallel
+                .iter()
+                .find_map(|result| result.as_ref().err())
+                .map(String::as_str),
+            Some("item 13 failed")
+        );
+        assert!(decode_in_order(&[] as &[u64], decode).is_empty());
+    }
+
+    /// Scenario: a partitioned table has more active files than one parallel batch, with rows
+    /// duplicated within and across files and partitions.
+    /// Guarantees: summaries and the chunked corpus keep the exact serial row multiset, and a corrupt
+    /// active file still fails both paths.
+    #[tokio::test]
+    async fn parallel_file_decode_keeps_exact_multisets_across_many_files() -> Result<()> {
+        use arrow::{
+            array::{Int32Array, RecordBatch},
+            datatypes::{DataType, Field, Schema},
+        };
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+        let directory = TestDirectory::new("parallel-files")?;
+        let root = directory.path().join("telemetry/sqlserver/many");
+        fs::create_dir_all(root.join("_delta_log"))?;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let delta_schema = json!({"type":"struct","fields":[
+            {"name":"id","type":"integer","nullable":false,"metadata":{}},
+            {"name":"__arrowcol_ingestion","type":"string","nullable":false,"metadata":{}}
+        ]});
+        let mut actions = vec![
+            json!({"protocol":{"minReaderVersion":1,"minWriterVersion":2}}),
+            json!({"metaData":{"id":"fixture-many","format":{"provider":"parquet","options":{}},
+                "schemaString":delta_schema.to_string(),"partitionColumns":["__arrowcol_ingestion"],"configuration":{}}}),
+        ];
+        let mut expected_rows = BTreeMap::<String, u64>::new();
+        let mut expected_payload = BTreeMap::<String, u64>::new();
+        let files = decode_workers().saturating_mul(2) + 6;
+        for index in 0..files {
+            let partition = format!("2026-10-27-{:02}", index % 5);
+            let ids = (0..(index % 7 + 1))
+                .map(|offset| i32::try_from((index + offset) % 11))
+                .collect::<Result<Vec<_>, _>>()?;
+            for id in &ids {
+                *expected_rows
+                    .entry(json!({"id":id,"__arrowcol_ingestion":partition}).to_string())
+                    .or_default() += 1;
+                *expected_payload.entry(row_digest(&json!({"id":id}))?).or_default() += 1;
+            }
+            let relative = format!("part-{index:03}.parquet");
+            let data = root.join(&relative);
+            let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int32Array::from(ids))])?;
+            let mut writer = ArrowWriter::try_new(File::create(&data)?, Arc::clone(&schema), None)?;
+            writer.write(&batch)?;
+            writer.close()?;
+            actions.push(
+                json!({"add":{"path":relative,"partitionValues":{"__arrowcol_ingestion":partition},
+                "size":fs::metadata(&data)?.len(),"modificationTime":1,"dataChange":true}}),
+            );
+        }
+        fs::write(
+            root.join("_delta_log/00000000000000000000.json"),
+            actions.iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n",
+        )?;
+
+        let snapshot = summarize(directory.path()).await?;
+        let summary = &snapshot.tables["telemetry.sqlserver.many"];
+        let expected_hashes = expected_rows
+            .iter()
+            .map(|(row, count)| Ok((row_digest(&serde_json::from_str(row)?)?, *count)))
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        assert_eq!(summary.active_files, files);
+        assert_eq!(summary.rows, expected_rows.values().sum::<u64>());
+        assert_eq!(summary.row_hashes, expected_hashes);
+        assert_eq!(summary.payload_row_hashes, expected_payload);
+        assert!(summary.files.windows(2).all(|pair| pair[0].path < pair[1].path));
+
+        let corpus = sample_corpus(directory.path(), "telemetry.sqlserver.many", summary)?;
+        let mut chunked = BTreeMap::<String, u64>::new();
+        for chunk in &corpus.chunks {
+            for (row, count) in &chunk.rows {
+                *chunked.entry(row.to_string()).or_default() += count;
+            }
+        }
+        assert_eq!(chunked, expected_rows);
+        assert_eq!(corpus.expected_rows, summary.rows);
+
+        fs::write(root.join("part-007.parquet"), b"not parquet")?;
+        assert!(summarize(directory.path()).await.is_err());
+        assert!(sample_corpus(directory.path(), "telemetry.sqlserver.many", summary).is_err());
+        Ok(())
+    }
+
+    fn write_single_file_table(root: &Path, partition: &str, ids: Vec<i32>) -> Result<PathBuf> {
+        use arrow::{
+            array::{Int32Array, RecordBatch},
+            datatypes::{DataType, Field, Schema},
+        };
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+        fs::create_dir_all(root.join("_delta_log"))?;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let data = root.join("part.parquet");
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int32Array::from(ids))])?;
+        let mut writer = ArrowWriter::try_new(File::create(&data)?, schema, None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+        let delta_schema = json!({"type":"struct","fields":[
+            {"name":"id","type":"integer","nullable":false,"metadata":{}},
+            {"name":"__arrowcol_ingestion","type":"string","nullable":false,"metadata":{}}
+        ]});
+        let actions = [
+            json!({"protocol":{"minReaderVersion":1,"minWriterVersion":2}}),
+            json!({"metaData":{"id":"fixture-single","format":{"provider":"parquet","options":{}},
+                "schemaString":delta_schema.to_string(),"partitionColumns":["__arrowcol_ingestion"],"configuration":{}}}),
+            json!({"add":{"path":"part.parquet","partitionValues":{"__arrowcol_ingestion":partition},
+                "size":fs::metadata(&data)?.len(),"modificationTime":1,"dataChange":true}}),
+        ];
+        fs::write(
+            root.join("_delta_log/00000000000000000000.json"),
+            actions.iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n",
+        )?;
+        Ok(data)
+    }
+
+    /// Scenario: one active file holds tens of thousands of duplicate rows, and another adds a
+    /// 257th distinct row in its partition followed by many more rows.
+    /// Guarantees: corpus decoding retains only distinct rows with exact multiplicities, stops at the
+    /// first excess distinct row instead of materializing the file, and still fails the existing guard.
+    #[tokio::test]
+    async fn corpus_file_aggregation_bounds_retained_rows_and_fails_at_first_excess_distinct() -> Result<()> {
+        let directory = TestDirectory::new("corpus-bounded")?;
+        let partition = "2026-10-27-03-00";
+        let partitions = BTreeMap::from([("__arrowcol_ingestion".to_owned(), Some(partition.to_owned()))]);
+
+        let valid_root = directory.path().join("telemetry/sqlserver/valid");
+        let ids = [vec![7; 30_000], vec![8; 10_000], vec![7; 5]].concat();
+        let valid_file = write_single_file_table(&valid_root, partition, ids)?;
+        let snapshot = summarize(directory.path()).await?;
+        let summary = &snapshot.tables["telemetry.sqlserver.valid"];
+        let aggregate = aggregate_corpus_file(&valid_file, &summary.schema, &partitions)?;
+        assert!(aggregate.failure.is_none());
+        assert_eq!(aggregate.rows_read, 40_005);
+        assert_eq!(
+            aggregate
+                .distinct
+                .iter()
+                .map(|row| (row.value.clone(), row.count))
+                .collect::<Vec<_>>(),
+            [
+                (json!({"id":7,"__arrowcol_ingestion":partition}), 30_005),
+                (json!({"id":8,"__arrowcol_ingestion":partition}), 10_000),
+            ]
+        );
+        let corpus = sample_corpus(directory.path(), "telemetry.sqlserver.valid", summary)?;
+        assert_eq!(corpus.expected_rows, 40_005);
+        assert_eq!(
+            corpus
+                .chunks
+                .iter()
+                .flat_map(|chunk| chunk.rows.clone())
+                .collect::<Vec<_>>(),
+            [
+                (json!({"id":7,"__arrowcol_ingestion":partition}), 30_005),
+                (json!({"id":8,"__arrowcol_ingestion":partition}), 10_000),
+            ]
+        );
+
+        let excess_root = directory.path().join("telemetry/sqlserver/excess");
+        let ids = [vec![0; 20_000], (1..=300).collect(), vec![1; 20_000]].concat();
+        let excess_file = write_single_file_table(&excess_root, partition, ids)?;
+        let snapshot = summarize(directory.path()).await?;
+        let summary = &snapshot.tables["telemetry.sqlserver.excess"];
+        assert_eq!(summary.rows, 40_300);
+        let aggregate = aggregate_corpus_file(&excess_file, &summary.schema, &partitions)?;
+        assert!(aggregate.failure.is_none());
+        assert_eq!(aggregate.distinct.len(), MAX_CHUNK_DISTINCT_ROWS + 1);
+        assert_eq!(
+            aggregate.rows_read,
+            20_000 + 256,
+            "decoding stops at the 257th distinct row"
+        );
+        assert_eq!(aggregate.distinct[0].count, 20_000);
+        let error = sample_corpus(directory.path(), "telemetry.sqlserver.excess", summary)
+            .err()
+            .context("257 distinct rows in one partition must fail")?;
+        assert!(
+            error
+                .to_string()
+                .contains("a single partition exceeds 256 distinct rows"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn partition_decoder_rejects_mismatches_and_preserves_large_integers() -> Result<()> {
+        let schema = json!({"fields":[{"name":"p","type":"long","nullable":false}]});
+        let partitions = BTreeMap::from([("p".to_owned(), Some("9223372036854775807".to_owned()))]);
+        assert_eq!(
+            with_partitions(json!({}), &schema, &partitions)?,
+            json!({"p":"9223372036854775807"})
+        );
+        assert!(with_partitions(json!({"p":1}), &schema, &partitions).is_err());
+        assert!(with_partitions(json!({}), &schema, &BTreeMap::from([("p".to_owned(), None)])).is_err());
+        Ok(())
+    }
 
     struct TestDirectory(PathBuf);
 
@@ -522,6 +1320,13 @@ mod tests {
                 .any(|file| file == "orphan.parquet")
         );
         assert_eq!(selected, inventory(directory.path()).await?);
+        let corpus = sample_rows(directory.path(), "generic", &summary.tables["generic"])?;
+        assert_eq!(corpus.len(), 3);
+        assert_eq!(corpus.iter().map(|(_, count)| count).sum::<u64>(), 3);
+        let mut stale = summary.tables["generic"].clone();
+        stale.rows += 1;
+        assert!(sample_rows(directory.path(), "generic", &stale).is_err());
+        assert!(sample_rows(directory.path(), "../generic", &stale).is_err());
         Ok(())
     }
 
@@ -543,12 +1348,35 @@ mod tests {
         writer.close().await?;
         let second = inventory(directory.path()).await?;
         let table = "telemetry.sqlserver.example";
+        let summary = summarize(directory.path()).await?;
+        assert_eq!(
+            sample_rows(directory.path(), table, &summary.tables[table])?,
+            vec![(json!({"id": 1}), 2)]
+        );
         assert_eq!(first.tables[table].files.len(), 1);
         assert_eq!(second.tables[table].files.len(), 2);
         assert!(second.tables[table].version > first.tables[table].version);
         assert!(second.tables[table].files.contains(&first.tables[table].files[0]));
         fs::write(root.join("_delta_log/00000000000000000003.json"), b"invalid")?;
         assert!(inventory(directory.path()).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn validation_corpus_is_bounded_without_truncating_successfully() -> Result<()> {
+        use arrow::array::{Int32Array, RecordBatch};
+        use arrow_deltalake::delta::DeltaTableWriter;
+        use std::sync::Arc;
+        let directory = TestDirectory::new("bounded-corpus")?;
+        let mut writer = DeltaTableWriter::open(directory.path().join("example"))?;
+        let batch = RecordBatch::try_from_iter(vec![("id", Arc::new(Int32Array::from_iter_values(0..257)) as _)])?;
+        writer.write(&batch).await?;
+        writer.close().await?;
+        let snapshot = summarize(directory.path()).await?;
+        let error = sample_rows(directory.path(), "example", &snapshot.tables["example"])
+            .err()
+            .context("expected corpus bound error")?;
+        assert!(error.to_string().contains("exceeds 256"));
         Ok(())
     }
 

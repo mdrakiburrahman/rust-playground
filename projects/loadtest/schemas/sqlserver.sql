@@ -2,6 +2,7 @@
 -- Fields are ordered and required; schema registration is performed through Flight SQL.
 
 CREATE TABLE telemetry.sqlserver.sqlserver_active_sessions (
+    customer_id VARCHAR NOT NULL,
     sample_time_utc TIMESTAMP(9) WITH TIME ZONE NOT NULL,
     sql_server_instance_name VARCHAR NOT NULL,
     machine_name VARCHAR NOT NULL,
@@ -13,6 +14,7 @@ CREATE TABLE telemetry.sqlserver.sqlserver_active_sessions (
 );
 
 CREATE TABLE telemetry.sqlserver.sqlserver_availability_group_states (
+    customer_id VARCHAR NOT NULL,
     sample_time_utc TIMESTAMP(9) WITH TIME ZONE NOT NULL,
     sql_server_instance_name VARCHAR NOT NULL,
     machine_name VARCHAR NOT NULL,
@@ -28,6 +30,7 @@ CREATE TABLE telemetry.sqlserver.sqlserver_availability_group_states (
 );
 
 CREATE TABLE telemetry.sqlserver.sqlserver_availability_replica_states (
+    customer_id VARCHAR NOT NULL,
     sample_time_utc TIMESTAMP(9) WITH TIME ZONE NOT NULL,
     sql_server_instance_name VARCHAR NOT NULL,
     machine_name VARCHAR NOT NULL,
@@ -52,6 +55,7 @@ CREATE TABLE telemetry.sqlserver.sqlserver_availability_replica_states (
 );
 
 CREATE TABLE telemetry.sqlserver.sqlserver_client_connections (
+    customer_id VARCHAR NOT NULL,
     sample_time_utc TIMESTAMP(9) WITH TIME ZONE NOT NULL,
     sql_server_instance_name VARCHAR NOT NULL,
     machine_name VARCHAR NOT NULL,
@@ -68,6 +72,7 @@ CREATE TABLE telemetry.sqlserver.sqlserver_client_connections (
 );
 
 CREATE TABLE telemetry.sqlserver.sqlserver_cpu_utilization (
+    customer_id VARCHAR NOT NULL,
     sample_time_utc TIMESTAMP(9) WITH TIME ZONE NOT NULL,
     process_sample_time_utc TIMESTAMP(9) WITH TIME ZONE NOT NULL,
     sql_server_instance_name VARCHAR NOT NULL,
@@ -78,6 +83,7 @@ CREATE TABLE telemetry.sqlserver.sqlserver_cpu_utilization (
 );
 
 CREATE TABLE telemetry.sqlserver.sqlserver_database_properties (
+    customer_id VARCHAR NOT NULL,
     sample_time_utc TIMESTAMP(9) WITH TIME ZONE NOT NULL,
     collection_time_utc TIMESTAMP(9) WITH TIME ZONE NOT NULL,
     sql_server_instance_name VARCHAR NOT NULL,
@@ -124,6 +130,7 @@ CREATE TABLE telemetry.sqlserver.sqlserver_database_properties (
 );
 
 CREATE TABLE telemetry.sqlserver.sqlserver_database_replica_states (
+    customer_id VARCHAR NOT NULL,
     sample_time_utc TIMESTAMP(9) WITH TIME ZONE NOT NULL,
     sql_server_instance_name VARCHAR NOT NULL,
     machine_name VARCHAR NOT NULL,
@@ -163,6 +170,7 @@ CREATE TABLE telemetry.sqlserver.sqlserver_database_replica_states (
 );
 
 CREATE TABLE telemetry.sqlserver.sqlserver_database_storage_utilization (
+    customer_id VARCHAR NOT NULL,
     sample_time_utc TIMESTAMP(9) WITH TIME ZONE NOT NULL,
     collection_time_utc TIMESTAMP(9) WITH TIME ZONE NOT NULL,
     sql_server_instance_name VARCHAR NOT NULL,
@@ -181,6 +189,7 @@ CREATE TABLE telemetry.sqlserver.sqlserver_database_storage_utilization (
 );
 
 CREATE TABLE telemetry.sqlserver.sqlserver_memory_utilization (
+    customer_id VARCHAR NOT NULL,
     sample_time_utc TIMESTAMP(9) WITH TIME ZONE NOT NULL,
     sql_server_instance_name VARCHAR NOT NULL,
     machine_name VARCHAR NOT NULL,
@@ -191,6 +200,7 @@ CREATE TABLE telemetry.sqlserver.sqlserver_memory_utilization (
 );
 
 CREATE TABLE telemetry.sqlserver.sqlserver_performance_counters_common (
+    customer_id VARCHAR NOT NULL,
     sample_time_utc TIMESTAMP(9) WITH TIME ZONE NOT NULL,
     sql_server_instance_name VARCHAR NOT NULL,
     machine_name VARCHAR NOT NULL,
@@ -204,6 +214,7 @@ CREATE TABLE telemetry.sqlserver.sqlserver_performance_counters_common (
 );
 
 CREATE TABLE telemetry.sqlserver.sqlserver_performance_counters_detailed (
+    customer_id VARCHAR NOT NULL,
     sample_time_utc TIMESTAMP(9) WITH TIME ZONE NOT NULL,
     sql_server_instance_name VARCHAR NOT NULL,
     machine_name VARCHAR NOT NULL,
@@ -217,6 +228,7 @@ CREATE TABLE telemetry.sqlserver.sqlserver_performance_counters_detailed (
 );
 
 CREATE TABLE telemetry.sqlserver.sqlserver_storage_io (
+    customer_id VARCHAR NOT NULL,
     sample_time_utc TIMESTAMP(9) WITH TIME ZONE NOT NULL,
     sql_server_instance_name VARCHAR NOT NULL,
     machine_name VARCHAR NOT NULL,
@@ -238,6 +250,7 @@ CREATE TABLE telemetry.sqlserver.sqlserver_storage_io (
 );
 
 CREATE TABLE telemetry.sqlserver.sqlserver_wait_stats (
+    customer_id VARCHAR NOT NULL,
     sample_time_utc TIMESTAMP(9) WITH TIME ZONE NOT NULL,
     sql_server_instance_name VARCHAR NOT NULL,
     machine_name VARCHAR NOT NULL,
