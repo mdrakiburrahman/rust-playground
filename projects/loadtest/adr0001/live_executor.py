@@ -86,7 +86,8 @@ class PolicyExecutor:
                 if error.code != "unknown-operation":
                     raise
                 raise Denial("limit") from None
-            if intent != {name: packet[name] for name in ("deployment", "revision", "action")}:
+            if intent != {name: packet[name] for name in
+                          ("bridge", "deployment", "revision", "safety_revision", "action")}:
                 raise Denial("conflict")
             return self.ledger.get(packet["operation_id"], packet["deployment"])
         try:

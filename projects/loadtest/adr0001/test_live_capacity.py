@@ -4,6 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -11,6 +12,7 @@ from unittest.mock import patch
 import live_deployment
 from live_capacity import CollectorCapacity
 from live_contract import Denial
+from live_effects import EffectExecutor
 from live_deployment import AttachedRuntime, MANIFEST, save_deployment
 from live_faults import FaultResource
 from live_inventory import FleetInventory, read_inventory
@@ -124,6 +126,147 @@ class CapacityIntegrationTests(unittest.TestCase):
     def dispatch(self):
         return self.capacity.run("add-four", {"operation": "replicas", "role": "collector", "desired": 4},
                                  lambda: None, lambda: None)
+
+    def guarded_command(self):
+        self.executor = EffectExecutor(self.ledger, self.runtime.post, lambda _: None,
+                                       self.bridge.snapshot, capacity=self.capacity, policy_enabled=False)
+        self.bridge.executor = self.executor
+        self.capacity.evidence = self.bridge.evidence
+        self.observer.sample()
+        _, token = self.bridge.bootstrap({"grant": self.bridge.grant})
+        session = self.bridge.sessions[token]
+        snapshot = self.bridge.snapshot()
+        reference = {name: snapshot[name] for name in ("bridge", "deployment", "revision", "safety_revision")}
+        selection = self.bridge.select({"kind": "select", "schema_version": 1, **reference}, session)
+        armed = self.bridge.arm({"kind": "arm", "schema_version": 1, **reference,
+                                "selection_id": selection["selection_id"], "confirm": "dedicated-local-poc"}, session)
+        return {
+            "kind": "command", "schema_version": 1, "operation_id": "guarded-add",
+            **reference, "selection_id": selection["selection_id"], "arm_id": armed["arm_id"],
+            "action": {"operation": "replicas", "role": "collector", "desired": 4},
+        }, session
+
+    def guarded_result(self, packet, session):
+        try:
+            self.bridge.command(packet, session)
+            self.assertTrue(self.executor.lock.acquire(timeout=3))
+            self.executor.lock.release()
+            return self.ledger.get(packet["operation_id"], self.deployment)
+        finally:
+            self.executor.close()
+
+    def test_diagnostic_sample_after_own_inventory_intent_does_not_cancel_creator(self):
+        packet, session = self.guarded_command()
+        original = self.capacity.prepare
+        def prepare(operation_id):
+            command = original(operation_id)
+            # The observer sees the durable unbound intent, but cannot fabricate a resource.
+            self.observer.sample()
+            return command
+        self.capacity.prepare = prepare
+        creates = []
+        self.capacity.create = lambda command: creates.append(command)
+        result = self.guarded_result(packet, session)
+        self.assertEqual(len(creates), 1)
+        self.assertEqual(result["status"], "unknown")  # No simulated container or receipt was fabricated.
+        self.assertIsNotNone(read_inventory(self.root, self.deployment)[0]["dispatch"])
+        self.assertEqual(result["requested_safety_revision"], packet["safety_revision"])
+        evidence = self.bridge.evidence.snapshot()
+        self.assertTrue(any(row["phase"] == "final-guard" and row["outcome"] == "allowed"
+                            for row in evidence["records"]))
+        self.assertTrue(any(row["phase"] == "dispatch-marker" for row in evidence["records"]))
+
+    def test_policy_change_during_creator_preflight_cancels_without_dispatch(self):
+        packet, session = self.guarded_command()
+        original = self.capacity.prepare
+        def prepare(operation_id):
+            command = original(operation_id)
+            self.view["policies"]["collector1"] = {
+                "incarnation": self.view["members"][0]["writer"], "revision": 1, "applied_revision": 0,
+                "excluded": True, "block_streams": False, "retiring": False,
+            }
+            self.observer.sample()
+            return command
+        self.capacity.prepare = prepare
+        result = self.guarded_result(packet, session)
+        self.assertEqual((result["status"], result["error_code"]), ("rejected", "stale"))
+        self.assertEqual(self.creates, 0)
+        self.assertEqual(read_inventory(self.root, self.deployment), [])
+        self.assertEqual(self.inventory.connection.execute("SELECT COUNT(*) FROM fleet_cancellations").fetchone()[0], 1)
+        self.assertEqual(self.inventory.connection.execute("SELECT COUNT(*) FROM fleet_dispatches").fetchone()[0], 0)
+
+    def test_original_observation_age_expires_during_creator_prepare_without_renewal(self):
+        packet, session = self.guarded_command()
+        original = self.capacity.prepare
+        def prepare(operation_id):
+            command = original(operation_id)
+            self.observer.sample()
+            for index, entry in enumerate(self.bridge.history):
+                if entry[0]["revision"] == packet["revision"]:
+                    self.bridge.history[index] = (entry[0], time.monotonic_ns() - 6_000_000_000, True)
+            return command
+        self.capacity.prepare = prepare
+        result = self.guarded_result(packet, session)
+        self.assertEqual((result["status"], result["error_code"]), ("rejected", "stale"))
+        guard = next(row for row in self.bridge.evidence.snapshot()["records"] if row["phase"] == "final-guard")
+        self.assertEqual(guard["reasons"], ["request-observation-age"])
+        self.assertEqual(self.creates, 0)
+        self.assertEqual(read_inventory(self.root, self.deployment), [])
+
+    def test_inventory_change_between_admission_and_reservation_cannot_use_new_baseline(self):
+        packet, session = self.guarded_command()
+        self.inventory.reserve_creation("foreign-preflight", "collector", 4, self.inventory.snapshot()["revision"])
+        try:
+            with self.assertRaisesRegex(Denial, "stale"):
+                self.bridge.command(packet, session)
+            with self.assertRaisesRegex(Denial, "unknown-operation"):
+                self.ledger.get(packet["operation_id"], self.deployment)
+        finally:
+            self.executor.close()
+        self.assertEqual(self.creates, 0)
+
+    def assert_prepare_phase_schedule(self, phase, critical=False):
+        packet, session = self.guarded_command()
+        original = self.capacity.evidence.measure
+        injected = []
+        def measure(operation_id, current_phase, function, *args, **kwargs):
+            result = original(operation_id, current_phase, function, *args, **kwargs)
+            if current_phase == phase and not injected:
+                injected.append(phase)
+                if critical:
+                    self.view["unclassified_safety_change"] = True
+                self.observer.sample()
+            return result
+        self.capacity.evidence.measure = measure
+        dispatched = []
+        self.capacity.create = lambda command: dispatched.append(command)
+        result = self.guarded_result(packet, session)
+        self.assertEqual(injected, [phase])
+        if critical:
+            self.assertEqual((result["status"], result["error_code"]), ("rejected", "stale"))
+            self.assertEqual(dispatched, [])
+            self.assertEqual(read_inventory(self.root, self.deployment), [])
+        else:
+            self.assertEqual(len(dispatched), 1)
+            self.assertEqual(result["status"], "unknown")
+
+    def test_diagnostic_publish_between_native_view_and_resource_checks_allows_original_dispatch(self):
+        self.assert_prepare_phase_schedule("native-view")
+
+    def test_diagnostic_publish_during_parallel_resource_checks_allows_original_dispatch(self):
+        self.assert_prepare_phase_schedule("exact-resource-collector2")
+
+    def test_diagnostic_publish_after_config_fsync_allows_original_dispatch(self):
+        self.assert_prepare_phase_schedule("config-hardlink-fsync")
+
+    def test_unknown_native_change_after_native_view_denies_dispatch(self):
+        self.assert_prepare_phase_schedule("native-view", critical=True)
+
+    def test_unknown_native_change_during_resource_checks_denies_dispatch(self):
+        self.assert_prepare_phase_schedule("exact-resource-collector2", critical=True)
+
+    def test_unknown_native_change_after_config_fsync_denies_dispatch(self):
+        self.assert_prepare_phase_schedule("config-hardlink-fsync", critical=True)
 
     def ready(self):
         self.view["members"].append({"writer": {"collector": "collector4", "process": "process4", "generation": 1},

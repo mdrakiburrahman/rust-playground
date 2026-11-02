@@ -26,9 +26,10 @@ VALIDATOR = Draft202012Validator(SCHEMA)
 
 
 class Denial(ValueError):
-    def __init__(self, code):
+    def __init__(self, code, reasons=()):
         super().__init__(code)
         self.code = code
+        self.reasons = tuple(reasons)
 
     def packet(self):
         return {"kind": "error", "schema_version": 1, "code": self.code,
@@ -158,6 +159,11 @@ class DeploymentFence:
     supported: frozenset[str] = frozenset()
     targets: Mapping[str, dict] = field(default_factory=dict)
     table_epochs: Mapping[str, str] = field(default_factory=dict)
+    bridge: dict | None = None
+    safety_revision: str | None = None
+    request_revision: str | None = None
+    request_observed_ns: int | None = None
+    inventory_revision: int | None = None
 
 
 @dataclass(frozen=True)
@@ -191,9 +197,20 @@ def authorize_command(packet, deployment, session, origin, now_ns=None):
     now = time.monotonic_ns() if now_ns is None else now_ns
     if (packet["deployment"] != deployment.identity or session.deployment != deployment.identity):
         raise Denial("wrong-target")
-    if (deployment.observed_ns is None or not 0 <= now - deployment.observed_ns <= SNAPSHOT_AGE_NS
-            or packet["revision"] != deployment.revision):
-        raise Denial("stale")
+    if packet["bridge"] != deployment.bridge:
+        raise Denial("wrong-target")
+    reasons = []
+    if deployment.observed_ns is None or not 0 <= now - deployment.observed_ns <= SNAPSHOT_AGE_NS:
+        reasons.append("current-observation-age")
+    if (deployment.request_observed_ns is None
+            or not 0 <= now - deployment.request_observed_ns <= SNAPSHOT_AGE_NS):
+        reasons.append("request-observation-age")
+    if packet["revision"] != deployment.request_revision:
+        reasons.append("observation-not-retained")
+    if packet["safety_revision"] != deployment.safety_revision:
+        reasons.append("safety-revision")
+    if reasons:
+        raise Denial("stale", reasons)
     if (packet["selection_id"] != session.selection_id or packet["arm_id"] != session.arm_id
             or not 0 < session.arm_deadline_ns - now <= ARM_TTL_NS):
         raise Denial("disarmed")

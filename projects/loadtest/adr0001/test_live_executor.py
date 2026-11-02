@@ -25,11 +25,14 @@ class PolicyExecutorTests(unittest.TestCase):
             "kind": "command", "schema_version": 1, "operation_id": "operation-1",
             "selection_id": "selection-1", "arm_id": "arm-1", "deployment": self.deployment,
             "revision": "7", "action": {"operation": "admission", "target": self.target, "enabled": True},
+            "bridge": {"id": "bridge", "incarnation": "bridge-1"}, "safety_revision": "3",
         }
         now = time.monotonic_ns()
         self.fence = DeploymentFence(
             self.deployment, "7", now, True, True, frozenset({"admission", "exclusion"}),
             {self.target["resource"]["id"]: self.target},
+            bridge=self.command["bridge"], safety_revision="3",
+            request_revision="7", request_observed_ns=now,
         )
         self.session = SessionFence("http://127.0.0.1:18765", True, True, "live",
                                     self.deployment, "selection-1", "arm-1", now + 20_000_000_000)
@@ -64,6 +67,7 @@ class PolicyExecutorTests(unittest.TestCase):
             "kind": "snapshot", "schema_version": 1,
             "bridge": {"id": "bridge", "incarnation": "bridge-1"}, "deployment": self.deployment,
             "revision": "8", "freshness": {"status": "fresh", "age_ns": "0", "maximum_age_ns": "5000000000"},
+            "safety_revision": "4",
             "replicas": [{
                 "resource": self.current_resource, "writer": self.writer, "role": "collector", "status": "active",
                 "policy_revision": str(policy["revision"]), "applied_policy_revision": str(policy["applied_revision"]),
@@ -103,7 +107,7 @@ class PolicyExecutorTests(unittest.TestCase):
         self.assertEqual(done["status"], "completed")
         self.assertEqual(len(self.policy_calls), 1)
         intent = self.ledger.intent("operation-1", self.deployment)
-        self.assertEqual(set(intent), {"deployment", "revision", "action"})
+        self.assertEqual(set(intent), {"bridge", "deployment", "revision", "safety_revision", "action"})
         self.assertNotIn(b"arm-1", self.path.read_bytes())
 
     def test_changed_resource_is_rejected_before_effect(self):

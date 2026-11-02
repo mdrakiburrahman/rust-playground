@@ -23,11 +23,14 @@ class LiveContractTests(unittest.TestCase):
             "kind": "command", "schema_version": 1, "operation_id": "operation-1",
             "selection_id": "selection-1", "arm_id": "arm-1", "deployment": self.identity,
             "revision": "7", "action": {"operation": "exclusion", "target": self.target, "enabled": True},
+            "bridge": {"id": "bridge", "incarnation": "bridge-1"}, "safety_revision": "3",
         }
         self.now = 100_000_000_000
         self.deployment = DeploymentFence(
             self.identity, "7", self.now, True, True, frozenset({"exclusion"}),
             {"collector1": self.target},
+            bridge=self.packet["bridge"], safety_revision="3",
+            request_revision="7", request_observed_ns=self.now,
         )
         self.session = SessionFence(
             "http://127.0.0.1:8080", True, True, "live", self.identity,
@@ -66,9 +69,42 @@ class LiveContractTests(unittest.TestCase):
 
     def test_unknown_stale_future_or_wrong_revision_snapshot_is_denied(self):
         for updates in ({"observed_ns": None}, {"observed_ns": self.now - SNAPSHOT_AGE_NS - 1},
-                        {"observed_ns": self.now + 1}, {"revision": "8"}):
+                        {"observed_ns": self.now + 1}, {"safety_revision": "8"}):
             with self.subTest(updates=updates), self.assertRaisesRegex(Denial, "stale"):
                 self.authorize(deployment=replace(self.deployment, **updates))
+
+    def test_diagnostic_feed_revision_does_not_replace_exact_safety_or_request_fence(self):
+        self.authorize(deployment=replace(self.deployment, revision="99"))
+        with self.assertRaisesRegex(Denial, "stale"):
+            self.authorize(deployment=replace(self.deployment, request_revision=None))
+        with self.assertRaisesRegex(Denial, "wrong-target"):
+            self.authorize(deployment=replace(self.deployment, bridge={**self.packet["bridge"], "incarnation": "new"}))
+
+    def test_stale_private_reasons_distinguish_age_revision_and_simultaneous_causes(self):
+        for updates, expected in (
+            ({"request_observed_ns": self.now - SNAPSHOT_AGE_NS - 1}, {"request-observation-age"}),
+            ({"observed_ns": self.now - SNAPSHOT_AGE_NS - 1}, {"current-observation-age"}),
+            ({"safety_revision": "4"}, {"safety-revision"}),
+            ({"request_observed_ns": None, "safety_revision": "4"},
+             {"request-observation-age", "safety-revision"}),
+            ({"request_observed_ns": self.now + 1}, {"request-observation-age"}),
+            ({"request_observed_ns": None, "request_revision": None},
+             {"request-observation-age", "observation-not-retained"}),
+        ):
+            with self.subTest(updates=updates), self.assertRaises(Denial) as raised:
+                self.authorize(deployment=replace(self.deployment, **updates))
+            self.assertEqual(set(raised.exception.reasons), expected)
+            self.assertNotIn("reasons", raised.exception.packet())
+        self.authorize(deployment=replace(
+            self.deployment, observed_ns=self.now - SNAPSHOT_AGE_NS,
+            request_observed_ns=self.now - SNAPSHOT_AGE_NS))
+
+    def test_old_commands_cannot_fallback_to_feed_revision_or_another_bridge(self):
+        for field in ("safety_revision", "bridge"):
+            packet = copy.deepcopy(self.packet)
+            del packet[field]
+            with self.subTest(field=field), self.assertRaises(ValidationError):
+                decode_request(json.dumps(packet).encode())
 
     def test_expired_wrong_or_excessive_arm_is_denied(self):
         for updates in ({"arm_deadline_ns": self.now}, {"arm_deadline_ns": self.now + ARM_TTL_NS + 1},
@@ -127,6 +163,7 @@ class LiveContractTests(unittest.TestCase):
         return {
             "kind": "snapshot", "schema_version": 1,
             "bridge": {"id": "bridge", "incarnation": "bridge-1"}, "deployment": self.identity, "revision": "8",
+            "safety_revision": "3",
             "freshness": {"status": "fresh", "age_ns": "0", "maximum_age_ns": "5000000000"},
             "replicas": [{
                 "resource": self.target["resource"], "role": "collector", "status": "active",

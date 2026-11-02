@@ -1,0 +1,83 @@
+{
+  "evidence": "synthetic contract fixtures; never deployment selection, qualification or command authority",
+  "authorization": "safety-revision-v1",
+  "semantics": {
+    "revision": "Retained diagnostic/feed observation sequence; not required to equal the latest sequence.",
+    "safety_revision": "Must equal the current server safety watermark and the retained observation's watermark.",
+    "bridge": "Exact current boot identity; foreign boots cannot reference retained observations.",
+    "request_age": "Original referenced observation and current observations must each remain at most 5000000000 local monotonic ns old through final authorization.",
+    "old_packets": "Missing bridge/safety_revision is invalid, never a fallback to revision.",
+    "operations": "Requested and applied feed/safety revisions are distinct; historical unavailable safety revisions are null, never grants."
+  },
+  "packets": [
+    {
+      "kind": "capabilities", "schema_version": 1, "authorization": "safety-revision-v1",
+      "bridge": {"id": "local-bridge", "incarnation": "synthetic-boot"},
+      "connected": true, "qualified": false,
+      "deployments": [{"id": "synthetic-poc", "incarnation": "synthetic-deployment"}],
+      "operations": [], "workload_presets": [],
+      "limits": {"request_bytes": 32768, "response_bytes": 1048576, "feed_items": 64,
+                 "arm_ttl_ms": 30000, "snapshot_max_age_ms": 5000}
+    },
+    {
+      "kind": "snapshot", "schema_version": 1,
+      "bridge": {"id": "local-bridge", "incarnation": "synthetic-boot"},
+      "deployment": {"id": "synthetic-poc", "incarnation": "synthetic-deployment"},
+      "revision": "10", "safety_revision": "4",
+      "freshness": {"status": "fresh", "age_ns": "1000", "maximum_age_ns": "5000000000"},
+      "replicas": [], "tables": [], "receipts": [], "metrics": [],
+      "coverage": {"complete": false, "missing": ["cpu"], "dropped": 0},
+      "receipt_observation_known": true
+    },
+    {
+      "kind": "snapshot", "schema_version": 1,
+      "bridge": {"id": "local-bridge", "incarnation": "synthetic-boot"},
+      "deployment": {"id": "synthetic-poc", "incarnation": "synthetic-deployment"},
+      "revision": "11", "safety_revision": "4",
+      "freshness": {"status": "fresh", "age_ns": "1000", "maximum_age_ns": "5000000000"},
+      "replicas": [], "tables": [], "receipts": [], "metrics": [],
+      "coverage": {"complete": false, "missing": ["memory"], "dropped": 0},
+      "receipt_observation_known": true
+    },
+    {
+      "kind": "select", "schema_version": 1,
+      "bridge": {"id": "local-bridge", "incarnation": "synthetic-boot"},
+      "deployment": {"id": "synthetic-poc", "incarnation": "synthetic-deployment"},
+      "revision": "10", "safety_revision": "4"
+    },
+    {
+      "kind": "selection", "schema_version": 1, "selection_id": "synthetic-selection",
+      "bridge": {"id": "local-bridge", "incarnation": "synthetic-boot"},
+      "deployment": {"id": "synthetic-poc", "incarnation": "synthetic-deployment"},
+      "revision": "10", "safety_revision": "4", "armed": false
+    },
+    {
+      "kind": "arm", "schema_version": 1, "selection_id": "synthetic-selection",
+      "bridge": {"id": "local-bridge", "incarnation": "synthetic-boot"},
+      "deployment": {"id": "synthetic-poc", "incarnation": "synthetic-deployment"},
+      "revision": "10", "safety_revision": "4", "confirm": "dedicated-local-poc"
+    },
+    {
+      "kind": "armed", "schema_version": 1, "selection_id": "synthetic-selection",
+      "arm_id": "synthetic-arm",
+      "bridge": {"id": "local-bridge", "incarnation": "synthetic-boot"},
+      "deployment": {"id": "synthetic-poc", "incarnation": "synthetic-deployment"},
+      "revision": "10", "safety_revision": "4", "ttl_ms": 30000
+    },
+    {
+      "kind": "command", "schema_version": 1, "operation_id": "synthetic-original-operation",
+      "selection_id": "synthetic-selection", "arm_id": "synthetic-arm",
+      "bridge": {"id": "local-bridge", "incarnation": "synthetic-boot"},
+      "deployment": {"id": "synthetic-poc", "incarnation": "synthetic-deployment"},
+      "revision": "10", "safety_revision": "4",
+      "action": {"operation": "workload", "profile": "small", "streams": 1, "requests": 1, "duration_ms": 1000}
+    },
+    {
+      "kind": "operation", "schema_version": 1, "operation_id": "synthetic-original-operation",
+      "deployment": {"id": "synthetic-poc", "incarnation": "synthetic-deployment"},
+      "requested_revision": "10", "requested_safety_revision": "4",
+      "applied_revision": null, "applied_safety_revision": null,
+      "status": "rejected", "error_code": "stale"
+    }
+  ]
+}

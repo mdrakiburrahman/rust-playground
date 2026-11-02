@@ -1,4 +1,5 @@
 import copy
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -16,6 +17,7 @@ class OperationLedgerTests(unittest.TestCase):
             "kind": "command", "schema_version": 1, "operation_id": "operation-1",
             "selection_id": "selection-1", "arm_id": "arm-1", "deployment": self.deployment,
             "revision": "7", "action": {"operation": "replicas", "role": "collector", "desired": 3},
+            "bridge": {"id": "bridge", "incarnation": "bridge-1"}, "safety_revision": "3",
         }
         self.ledger = OperationLedger(self.path)
 
@@ -128,6 +130,55 @@ class OperationLedgerTests(unittest.TestCase):
         self.assertEqual(self.ledger.bind_deployment(self.deployment), 9)
         self.ledger.publish_revision(self.deployment, 9, 10)
         self.assertEqual(self.ledger.get("operation-1", self.deployment)["status"], "applied")
+
+    def test_safety_watermark_survives_restart_and_applied_observation_is_separate(self):
+        self.ledger.bind_deployment(self.deployment)
+        safety = self.ledger.next_safety_revision()
+        self.ledger.publish_revision(self.deployment, 0, 1, safety)
+        self.ledger.reserve(self.command)
+        self.ledger.advance("operation-1", self.deployment, "pending")
+        done = self.ledger.advance("operation-1", self.deployment, "completed", "1")
+        self.assertEqual(done["requested_safety_revision"], "3")
+        self.assertEqual(done["applied_safety_revision"], str(safety))
+        self.ledger.close()
+        self.ledger = OperationLedger(self.path)
+        self.assertGreater(self.ledger.next_safety_revision(), safety)
+        self.assertEqual(self.ledger.get("operation-1", self.deployment), done)
+
+    def test_bridge_boot_and_safety_revision_are_part_of_same_id_immutable_intent(self):
+        self.ledger.reserve(self.command)
+        for field in ("safety_revision", "bridge"):
+            changed = copy.deepcopy(self.command)
+            if field == "bridge":
+                changed[field]["incarnation"] = "new-boot"
+            else:
+                changed[field] = "4"
+            with self.subTest(field=field), self.assertRaisesRegex(Denial, "conflict"):
+                self.ledger.reserve(changed)
+
+    def test_old_ledger_results_are_explicitly_unknown_safety_not_reauthorized(self):
+        self.ledger.reserve(self.command)
+        old = self.ledger.get("operation-1", self.deployment)
+        del old["requested_safety_revision"], old["applied_safety_revision"]
+        self.ledger.connection.execute("UPDATE operations SET result=?", (json.dumps(old),))
+        self.ledger.connection.execute("PRAGMA user_version=0")
+        self.ledger.close()
+        self.ledger = OperationLedger(self.path)
+        migrated = self.ledger.get("operation-1", self.deployment)
+        self.assertIsNone(migrated["requested_safety_revision"])
+        self.assertIsNone(migrated["applied_safety_revision"])
+        self.assertEqual(migrated["status"], "requested")
+
+    def test_feed_and_safety_observation_mapping_are_bounded_and_atomic(self):
+        self.ledger.bind_deployment(self.deployment)
+        safety = self.ledger.next_safety_revision()
+        for revision in range(1, 70):
+            self.ledger.publish_revision(self.deployment, revision - 1, revision, safety)
+        self.assertEqual(self.ledger.connection.execute(
+            "SELECT COUNT(*) FROM bridge_observations").fetchone()[0], 64)
+        with self.assertRaisesRegex(Denial, "conflict"):
+            self.ledger.publish_revision(self.deployment, 68, 69, safety)
+        self.assertEqual(self.ledger.bind_deployment(self.deployment), 69)
 
 
 if __name__ == "__main__":

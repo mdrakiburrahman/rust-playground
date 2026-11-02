@@ -48,9 +48,10 @@
     },
     "capabilities": {
       "type": "object", "additionalProperties": false,
-      "required": ["kind", "schema_version", "bridge", "connected", "qualified", "deployments", "operations", "workload_presets", "limits"],
+      "required": ["kind", "schema_version", "authorization", "bridge", "connected", "qualified", "deployments", "operations", "workload_presets", "limits"],
       "properties": {
         "kind": {"const": "capabilities"}, "schema_version": {"const": 1},
+        "authorization": {"const": "safety-revision-v1"},
         "bridge": {"$ref": "#/$defs/identity"}, "connected": {"type": "boolean"},
         "qualified": {"type": "boolean"},
         "deployments": {"type": "array", "maxItems": 1, "items": {"$ref": "#/$defs/identity"}},
@@ -145,11 +146,12 @@
     },
     "snapshot": {
       "type": "object", "additionalProperties": false,
-      "required": ["kind", "schema_version", "bridge", "deployment", "revision", "freshness", "replicas", "tables", "receipts", "metrics", "coverage", "receipt_observation_known"],
+      "required": ["kind", "schema_version", "bridge", "deployment", "revision", "safety_revision", "freshness", "replicas", "tables", "receipts", "metrics", "coverage", "receipt_observation_known"],
       "properties": {
         "kind": {"const": "snapshot"}, "schema_version": {"const": 1},
         "bridge": {"$ref": "#/$defs/identity"}, "deployment": {"$ref": "#/$defs/identity"},
         "revision": {"$ref": "#/$defs/counter"},
+        "safety_revision": {"$ref": "#/$defs/counter", "description": "Server-owned durable safety watermark, distinct from the diagnostic/feed revision. Never inferred from an old packet."},
         "freshness": {
           "type": "object", "additionalProperties": false,
           "required": ["status", "age_ns", "maximum_age_ns"],
@@ -189,38 +191,42 @@
     },
     "select": {
       "type": "object", "additionalProperties": false,
-      "required": ["kind", "schema_version", "deployment", "revision"],
+      "required": ["kind", "schema_version", "bridge", "deployment", "revision", "safety_revision"],
       "properties": {
         "kind": {"const": "select"}, "schema_version": {"const": 1},
-        "deployment": {"$ref": "#/$defs/identity"}, "revision": {"$ref": "#/$defs/counter"}
+        "deployment": {"$ref": "#/$defs/identity"}, "revision": {"$ref": "#/$defs/counter"},
+        "bridge": {"$ref": "#/$defs/identity"}, "safety_revision": {"$ref": "#/$defs/counter"}
       }
     },
     "selection": {
       "type": "object", "additionalProperties": false,
-      "required": ["kind", "schema_version", "selection_id", "deployment", "revision", "armed"],
+      "required": ["kind", "schema_version", "selection_id", "bridge", "deployment", "revision", "safety_revision", "armed"],
       "properties": {
         "kind": {"const": "selection"}, "schema_version": {"const": 1},
         "selection_id": {"$ref": "#/$defs/id"}, "deployment": {"$ref": "#/$defs/identity"},
-        "revision": {"$ref": "#/$defs/counter"}, "armed": {"const": false}
+        "revision": {"$ref": "#/$defs/counter"}, "armed": {"const": false},
+        "bridge": {"$ref": "#/$defs/identity"}, "safety_revision": {"$ref": "#/$defs/counter"}
       }
     },
     "arm": {
       "type": "object", "additionalProperties": false,
-      "required": ["kind", "schema_version", "selection_id", "deployment", "revision", "confirm"],
+      "required": ["kind", "schema_version", "selection_id", "bridge", "deployment", "revision", "safety_revision", "confirm"],
       "properties": {
         "kind": {"const": "arm"}, "schema_version": {"const": 1},
         "selection_id": {"$ref": "#/$defs/id"}, "deployment": {"$ref": "#/$defs/identity"},
-        "revision": {"$ref": "#/$defs/counter"}, "confirm": {"const": "dedicated-local-poc"}
+        "revision": {"$ref": "#/$defs/counter"}, "confirm": {"const": "dedicated-local-poc"},
+        "bridge": {"$ref": "#/$defs/identity"}, "safety_revision": {"$ref": "#/$defs/counter"}
       }
     },
     "armed": {
       "type": "object", "additionalProperties": false,
-      "required": ["kind", "schema_version", "selection_id", "arm_id", "deployment", "revision", "ttl_ms"],
+      "required": ["kind", "schema_version", "selection_id", "arm_id", "bridge", "deployment", "revision", "safety_revision", "ttl_ms"],
       "properties": {
         "kind": {"const": "armed"}, "schema_version": {"const": 1},
         "selection_id": {"$ref": "#/$defs/id"}, "arm_id": {"$ref": "#/$defs/id"},
         "deployment": {"$ref": "#/$defs/identity"}, "revision": {"$ref": "#/$defs/counter"},
-        "ttl_ms": {"const": 30000}
+        "ttl_ms": {"const": 30000},
+        "bridge": {"$ref": "#/$defs/identity"}, "safety_revision": {"$ref": "#/$defs/counter"}
       }
     },
     "disarm": {
@@ -267,22 +273,26 @@
     },
     "command": {
       "type": "object", "additionalProperties": false,
-      "required": ["kind", "schema_version", "operation_id", "selection_id", "arm_id", "deployment", "revision", "action"],
+      "required": ["kind", "schema_version", "operation_id", "selection_id", "arm_id", "bridge", "deployment", "revision", "safety_revision", "action"],
       "properties": {
         "kind": {"const": "command"}, "schema_version": {"const": 1},
         "operation_id": {"$ref": "#/$defs/id"}, "selection_id": {"$ref": "#/$defs/id"},
         "arm_id": {"$ref": "#/$defs/id"}, "deployment": {"$ref": "#/$defs/identity"},
-        "revision": {"$ref": "#/$defs/counter"}, "action": {"$ref": "#/$defs/action"}
+        "revision": {"$ref": "#/$defs/counter"}, "action": {"$ref": "#/$defs/action"},
+        "bridge": {"$ref": "#/$defs/identity"}, "safety_revision": {"$ref": "#/$defs/counter"}
       }
     },
     "operation": {
       "type": "object", "additionalProperties": false,
-      "required": ["kind", "schema_version", "operation_id", "deployment", "requested_revision", "applied_revision", "status", "error_code"],
+      "required": ["kind", "schema_version", "operation_id", "deployment", "requested_revision", "applied_revision", "requested_safety_revision", "applied_safety_revision", "status", "error_code"],
       "properties": {
         "kind": {"const": "operation"}, "schema_version": {"const": 1},
         "operation_id": {"$ref": "#/$defs/id"}, "deployment": {"$ref": "#/$defs/identity"},
         "requested_revision": {"$ref": "#/$defs/counter"},
         "applied_revision": {"oneOf": [{"$ref": "#/$defs/counter"}, {"type": "null"}]},
+        "requested_safety_revision": {"oneOf": [{"$ref": "#/$defs/counter"}, {"type": "null"}],
+                                      "description": "Null only for a migrated historical pre-safety-fence operation; never authorizes new work."},
+        "applied_safety_revision": {"oneOf": [{"$ref": "#/$defs/counter"}, {"type": "null"}]},
         "status": {"enum": ["requested", "pending", "applied", "completed", "failed", "unknown", "cancelled", "timeout", "rejected"]},
         "error_code": {"type": ["string", "null"], "enum": [null, "disarmed", "stale", "wrong-target", "unsupported", "unqualified", "disconnected", "conflict", "timeout", "failed", "unknown"]}
       }

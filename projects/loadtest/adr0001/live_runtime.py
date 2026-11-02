@@ -21,7 +21,9 @@ from jsonschema.exceptions import ValidationError
 from delta_runtime import Runtime
 from delta_benchmark import BINARIES
 from live_contract import Denial, RESPONSE_BYTES
-from live_deployment import AttachedRuntime, DeploymentLease, deployment_root, save_deployment, verified_state
+from live_deployment import (
+    AttachedRuntime, DeploymentLease, deployment_root, save_deployment, verified_state, write_private_new,
+)
 from live_effects import EffectExecutor
 from live_capacity import CollectorCapacity
 from live_inventory import FleetInventory
@@ -30,6 +32,7 @@ from live_faults import FaultSupervisor
 from live_ledger import OperationLedger
 from live_receipts import ReceiptObserver
 from live_server import BoundedHTTPServer, Bridge
+from live_safety import digest, native_safety
 from live_workload import NativeWorkload, WorkloadRunner
 from observation import Engine
 from publication_gate import REPO, RUNTIME_IMAGE, SQL_IMAGE
@@ -38,7 +41,7 @@ from publication_gate import REPO, RUNTIME_IMAGE, SQL_IMAGE
 QUALIFICATION_SOURCES = (
     "live_effects.py", "live_executor.py", "live_faults.py", "live_workload.py", "live_ledger.py",
     "live_server.py", "live_runtime.py", "live_deployment.py", "live_contract.py", "live_receipts.py",
-    "live_inventory.py", "live_capacity.py", "contracts/live-v1.schema.json",
+    "live_inventory.py", "live_capacity.py", "live_safety.py", "contracts/live-v1.schema.json",
 )
 
 
@@ -214,6 +217,9 @@ class RuntimeObserver:
         self.thread = None
         self.receipt_probe = receipt_probe
         self.last_receipts = []
+        self.source_identity = {name: hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
+                                for name in QUALIFICATION_SOURCES}
+        self.configuration_identity = digest(runtime.config)
 
     def authority(self):
         request = urllib.request.Request(
@@ -364,8 +370,16 @@ class RuntimeObserver:
         if receipt_known is None:
             missing.add("receipts")
             receipts = [{**receipt, "completion": "unknown"} for receipt in receipts]
-        self.bridge.publish(replicas, tables, receipts, metrics, list(missing), observed_ns=started, dropped=dropped,
-                            receipt_observation_known=receipt_known)
+        capacity = getattr(getattr(self.bridge, "executor", None), "capacity", None)
+        inventory_revision = capacity.inventory.snapshot()["revision"] if capacity is not None else None
+        self.bridge.publish(
+            replicas, tables, receipts, metrics, list(missing), observed_ns=started, dropped=dropped,
+            receipt_observation_known=receipt_known,
+            safety_context={"source": self.source_identity, "configuration": self.configuration_identity,
+                            "authority": native_safety(state),
+                            "inventory_records": digest(self.runtime.records),
+                            "inventory_uncertain": self.runtime.inventory_uncertain,
+                            "inventory_revision": inventory_revision})
         self.dropped = 0
 
     def start(self):
@@ -430,7 +444,7 @@ def main():
         verify_creation_proof(args.creation_proof)
     deployment_root(args.project)
     runtime = lease = None
-    ledger, observer, server, executor, faults, inventory = None, None, None, None, None, None
+    ledger, observer, server, executor, faults, inventory, bridge = None, None, None, None, None, None, None
     served = False
     def stop(*_):
         if server is None:
@@ -491,6 +505,8 @@ def main():
             executor = EffectExecutor(ledger, runtime.post, lambda _: None, bridge.snapshot,
                                       workload=workload, capacity=capacity, policy_enabled=False, profiles={"small"})
             bridge.executor = executor
+        if executor is not None and getattr(executor, "capacity", None) is not None:
+            executor.capacity.evidence = bridge.evidence
         server = BoundedHTTPServer(("127.0.0.1", args.port), bridge)
         observer.start()
         descriptor = os.open(args.bootstrap_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
@@ -524,14 +540,20 @@ def main():
                             ledger.close()
                 finally:
                     try:
-                        if runtime is not None:
-                            if not (served and args.retain_runtime_on_stop):
-                                runtime.finish_runtime()
+                        if runtime is not None and bridge is not None:
+                            write_private_new(
+                                runtime.root / ("bridge-guard-" + bridge.identity["incarnation"] + ".json"),
+                                bridge.evidence.snapshot())
                     finally:
-                        if inventory is not None:
-                            inventory.close()
-                        if lease is not None:
-                            lease.close()
+                        try:
+                            if runtime is not None:
+                                if not (served and args.retain_runtime_on_stop):
+                                    runtime.finish_runtime()
+                        finally:
+                            if inventory is not None:
+                                inventory.close()
+                            if lease is not None:
+                                lease.close()
 
 
 if __name__ == "__main__":

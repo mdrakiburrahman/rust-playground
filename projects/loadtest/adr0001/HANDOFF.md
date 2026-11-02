@@ -1309,3 +1309,63 @@ feed sequence rather than claiming faster preparation removes an asynchronous
 equality race. No revision/freshness/arming relaxation, lease implementation,
 replay, new command identity or runtime experiment is approved before coordinated
 contract/test review.
+
+### Approved option B implemented in source (2026-11-02)
+
+The user approved "Let's do B then": explicit safety revision separate from the
+diagnostic/feed revision. Backend source now implements that contract, without
+starting Docker, native effects, a live-runtime bridge, benchmark or browser. The historical
+normal2 stale result remains unresolved age-versus-revision evidence; synthetic
+regressions reproduce both causes separately without relabeling the old attempt.
+
+`live_safety.py` is a new qualification dependency (fourteen total actor/schema
+files). Every successful observation still advances feed `revision`, but only
+critical footprint/continuity changes advance durable `safety_revision`.
+Commands/selection/arm require explicit bridge boot and safety revision alongside
+the original retained observation sequence. The original observation and current
+sample each must remain at most5s old through final authorization; ticks cannot
+renew the deadline. Critical changes/unknown/ABA, capabilities, source context,
+policy/writer/epoch, gaps/disarm/expiry/restart still deny. Exact native/resource
+preflights are unchanged. The creator's sole expected inventory reservation is
+pinned through baseline and baseline+1 CAS, not an ignored foreign revision.
+
+Schema and matching synthetic consumer fixtures are canonical:
+`contracts/live-v1.schema.json` and
+`contracts/live-safety-revision-fixtures.json`. Capabilities explicitly identify
+`authorization:safety-revision-v1`; missing new fields never fall back to the old
+revision. Operations retain requested/applied feed and safety revisions separately.
+Historical ledger migration labels unavailable safety as null without replay.
+Private64-operation/64KiB local-clock evidence distinguishes age, revision and
+unretained-history causes and records bounded preflight/final/dispatch spans,
+without credentials or cross-clock latency claims.
+
+Existing pinned WSL venv/frozen non-live helpers, isolated
+`files/safety-revision-source` actor/test copies:
+`python -B -m unittest discover -s safety-revision-source -p 'test_live*.py' -q`
+passed **177 tests in21.462s**, exit0. This includes the real local HTTP transport
+with synthetic observations and fake Engine/creator schedules, not native
+effects. New cases publish diagnostic versus critical changes during native
+view, parallel exact probes and config hard-link/fsync; verify original
+observation expiry despite a fresh latest feed, inclusive5s/unknown/future
+boundaries and simultaneous private stale subreasons; exercise unknown/ABA,
+source/capability/table/policy/epoch changes, history eviction/restart/disarm,
+inventory self-transition/foreign change, durable safety migration/reconciliation
+and bounded failure-preserving evidence.
+
+The representative native view test includes the real global revision copied
+into each assignment's delivery cursor, plus advancing member/observation/
+optimization diagnostics. These do not change safety when assignment records,
+policy and identities remain unchanged. Actual record epoch changes still do.
+This avoids reintroducing a native-heartbeat race behind the public feed split.
+The preserved literal capacity5 proof was independently rejected by the current
+verifier with `qualification source mismatch`, before binary/runtime work.
+`git diff --check` passed. No dependencies were installed or binaries rebuilt.
+
+See LIVE_API's implemented option B section for the exact footprint and wire
+semantics; the preceding proposal is historical. Historical capacity5 proofs,
+schema/package archives and native binaries remain unchanged and cannot activate
+the changed source. Matching frontend integration and fresh explicitly authorized
+native/browser qualification remain separate. No enabled frontend deliverable or
+usable live-effects claim is made. Repeatable staff, multiple-load/concurrent
+clients, fault/removal/repair controls and the separate admitted-workload lease
+remain unfinished.

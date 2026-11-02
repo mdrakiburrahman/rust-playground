@@ -25,13 +25,16 @@ class SharedEffectTests(unittest.TestCase):
         now = time.monotonic_ns()
         self.fence = DeploymentFence(self.deployment, "7", now, True, True,
                                      frozenset({"admission", "exclusion", "fault", "workload"}),
-                                     {self.resource["id"]: self.target})
+                                     {self.resource["id"]: self.target},
+                                     bridge={"id": "bridge", "incarnation": "bridge-1"},
+                                     safety_revision="3", request_revision="7", request_observed_ns=now)
         self.session = SessionFence("http://127.0.0.1:18765", True, True, "live",
                                     self.deployment, "selection-1", "arm-1", now + 20_000_000_000)
         self.packet = {
             "kind": "command", "schema_version": 1, "operation_id": "fault-1",
             "selection_id": "selection-1", "arm_id": "arm-1", "deployment": self.deployment, "revision": "7",
             "action": {"operation": "fault", "resource": self.resource, "fault": "pause", "duration_ms": 500},
+            "bridge": {"id": "bridge", "incarnation": "bridge-1"}, "safety_revision": "3",
         }
         self.records = {}
         self.fault_calls, self.workload_calls = 0, 0
@@ -71,6 +74,7 @@ class SharedEffectTests(unittest.TestCase):
             "kind": "snapshot", "schema_version": 1,
             "bridge": {"id": "bridge", "incarnation": "bridge-1"}, "deployment": self.deployment,
             "revision": "8", "freshness": {"status": "fresh", "age_ns": self.age, "maximum_age_ns": "5000000000"},
+            "safety_revision": "4",
             "replicas": [{
                 "resource": self.resource, "writer": self.writer, "role": "collector", "status": self.status,
                 "policy_revision": "0", "applied_policy_revision": "0",

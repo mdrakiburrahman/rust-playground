@@ -8,12 +8,14 @@ import subprocess
 from live_contract import Denial, SNAPSHOT_AGE_NS, validate_packet
 from live_deployment import read_private, verified_state, write_private_new
 from live_inventory import creation_labels, creation_state, read_inventory, serialized
+from live_safety import GuardEvidence
 from publication_gate import RUNTIME_IMAGE
 
 
 class CollectorCapacity:
     def __init__(self, runtime, inventory, snapshot):
         self.runtime, self.inventory, self.snapshot = runtime, inventory, snapshot
+        self.evidence = GuardEvidence()
 
     @staticmethod
     def validate_action(action):
@@ -33,12 +35,12 @@ class CollectorCapacity:
 
     def prepare(self, operation_id):
         runtime = self.runtime
-        runtime.refresh_inventory()
+        self.evidence.measure(operation_id, "inventory-refresh", runtime.refresh_inventory)
         if runtime.arm != "adr" or set(name for name in runtime.names if name.startswith("collector")) != {
             "collector1", "collector2", "collector3"
         }:
             raise Denial("unsupported")
-        native = runtime.post({"op": "view"})
+        native = self.evidence.measure(operation_id, "native-view", runtime.post, {"op": "view"})
         members = {member["writer"]["collector"]: member for member in native["members"]}
         if set(members) != {"collector1", "collector2", "collector3"} or any(
             member["eligible"] is not True for member in members.values()
@@ -49,11 +51,14 @@ class CollectorCapacity:
         if any(record["record"]["lifecycle"] != "Active" for record in native["assignments"]):
             raise Denial("disconnected")
         with ThreadPoolExecutor(max_workers=3) as pool:
-            states = list(pool.map(lambda role: verified_state(runtime, runtime.names[role]), members))
+            states = list(pool.map(
+                lambda role: self.evidence.measure(operation_id, "exact-resource-" + role,
+                                                   verified_state, runtime, runtime.names[role]), members))
         for state in states:
             if state["State"].get("Running") is not True or state["State"].get("Paused") is not False:
                 raise Denial("disconnected")
-        config = read_private(runtime.root / "config" / "collector4.json")
+        config = self.evidence.measure(operation_id, "config-read", read_private,
+                                       runtime.root / "config" / "collector4.json")
         if (config.get("operator_token") or config.get("gateway_token") or config.get("etcd")
                 or config.get("etcd_password") or config.get("storage") != "/stage"
                 or config.get("collectors") != {"collector4": runtime.config["collectors"]["collector4"]}
@@ -63,11 +68,11 @@ class CollectorCapacity:
         item = self.item(operation_id)
         pinned = runtime.root / "config" / ("bridge-collector4-" + item["nonce"] + ".json")
         if not pinned.exists():
-            write_private_new(pinned, config)
+            self.evidence.measure(operation_id, "config-hardlink-fsync", write_private_new, pinned, config)
             pinned.chmod(0o444)
             descriptor = os.open(pinned, os.O_RDONLY | os.O_NOFOLLOW)
             try:
-                os.fsync(descriptor)
+                self.evidence.measure(operation_id, "config-final-fsync", os.fsync, descriptor)
             finally:
                 os.close(descriptor)
         if read_private(pinned) != config:
@@ -99,19 +104,25 @@ class CollectorCapacity:
         if result.returncode != 0 or not re.fullmatch(rb"[a-f0-9]{64}\s*", result.stdout):
             raise RuntimeError("collector creation outcome unknown; reconcile same identity")
 
-    def run(self, operation_id, action, authorize, admitted):
+    def run(self, operation_id, action, authorize, admitted, expected_inventory_revision=None):
         self.validate_action(action)
         revision = self.inventory.snapshot()["revision"]
-        fresh = self.inventory.reserve_creation(operation_id, "collector", 4, revision)
+        if expected_inventory_revision is not None and revision != expected_inventory_revision:
+            raise Denial("stale", ("inventory-revision",))
+        fresh = self.evidence.measure(operation_id, "inventory-intent", self.inventory.reserve_creation,
+                                      operation_id, "collector", 4, revision)
         if not fresh:
             return self.outcome(operation_id)
         try:
-            command, config = self.prepare(operation_id)
+            command, config = self.evidence.measure(operation_id, "creator-prepare", self.prepare, operation_id)
+            if self.inventory.snapshot()["revision"] != revision + 1:
+                raise Denial("stale", ("inventory-revision",))
             authorize()
         except Denial:
             self.inventory.cancel_preflight(operation_id)
             raise
-        if self.inventory.begin_creation(operation_id, self.inventory.snapshot()["revision"], config):
+        if self.evidence.measure(operation_id, "dispatch-marker", self.inventory.begin_creation,
+                                 operation_id, revision + 1, config):
             admitted()
             self.create(command)
         return self.outcome(operation_id)

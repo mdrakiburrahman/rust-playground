@@ -69,7 +69,10 @@ class EffectExecutor(PolicyExecutor):
             elif operation == "workload":
                 self.workload.run(operation_id, identity, authorize, admitted, self.failed.is_set)
             elif operation == "replicas":
-                self.capacity.run(operation_id, packet["action"], authorize, admitted)
+                if deployment.inventory_revision is None:
+                    raise Denial("stale", ("inventory-revision",))
+                self.capacity.run(operation_id, packet["action"], authorize, admitted,
+                                  expected_inventory_revision=deployment.inventory_revision)
             else:
                 raise Denial("unsupported")
             return self._reconcile(operation_id, identity)

@@ -23,6 +23,7 @@ from live_contract import (
     ARM_TTL_NS, Denial, DeploymentFence, REQUEST_BYTES, RESPONSE_BYTES,
     SNAPSHOT_AGE_NS, SessionFence, authorize_command, decode_request, require_observations, require_origin, validate_packet,
 )
+from live_safety import GuardEvidence, footprint
 
 
 OPERATIONS = ("replicas", "retirement", "migration", "exclusion", "admission", "workload", "fault", "repair")
@@ -60,7 +61,12 @@ class Bridge:
         self.grant = secrets.token_urlsafe(32)
         self.grant_deadline = time.monotonic_ns() + 300_000_000_000
         self.history = deque(maxlen=64)
+        self.observation_contexts = {}
         self.revision = self.ledger.bind_deployment(deployment)
+        self.safety_revision = self.ledger.next_safety_revision()
+        self.safety_footprint = None
+        self.safety_context = None
+        self.evidence = GuardEvidence()
         self.last_resources = None
         self.observation_unavailable = False
 
@@ -125,7 +131,7 @@ class Bridge:
         return {"csrf": csrf}, token
 
     def publish(self, replicas, tables, receipts, metrics, missing, connected=True, observed_ns=None, dropped=0,
-                receipt_observation_known=None):
+                receipt_observation_known=None, safety_context=None):
         with self.lock:
             now = time.monotonic_ns()
             observed_ns = now if observed_ns is None else observed_ns
@@ -137,6 +143,7 @@ class Bridge:
             snapshot = {
                 "kind": "snapshot", "schema_version": 1, "bridge": self.identity,
                 "deployment": self.deployment, "revision": str(revision),
+                "safety_revision": str(self.safety_revision),
                 "freshness": {"status": ("fresh" if age <= SNAPSHOT_AGE_NS else "stale") if connected else "unknown",
                               "age_ns": str(age) if connected else None, "maximum_age_ns": str(SNAPSHOT_AGE_NS)},
                 "replicas": replicas, "tables": tables, "receipts": receipts, "metrics": metrics,
@@ -145,18 +152,28 @@ class Bridge:
                              "missing": sorted(set(missing)), "dropped": dropped},
             }
             validate_packet(snapshot)
-            self.ledger.publish_revision(self.deployment, self.revision, revision)
             gap = self.history and now - self.history[-1][1] > SNAPSHOT_AGE_NS
             if not connected or gap or self.last_resources is not None and resources != self.last_resources:
                 for session in self.sessions.values():
                     self.invalidate(session)
             self.last_resources = copy.deepcopy(resources)
+            self.safety_context = copy.deepcopy(safety_context)
+            self.update_safety(snapshot, discontinuity=bool(gap or self.observation_unavailable))
+            snapshot["safety_revision"] = str(self.safety_revision)
+            self.ledger.publish_revision(self.deployment, self.revision, revision, self.safety_revision)
             self.observation_unavailable = False
             self.revision = revision
             self.history.append((copy.deepcopy(snapshot), observed_ns, connected))
+            self.observation_contexts[str(revision)] = copy.deepcopy(safety_context)
+            retained = {entry[0]["revision"] for entry in self.history}
+            self.observation_contexts = {key: value for key, value in self.observation_contexts.items()
+                                         if key in retained}
 
     def observation_failed(self):
         with self.lock:
+            if not self.observation_unavailable:
+                self.safety_revision = self.ledger.next_safety_revision()
+                self.safety_footprint = None
             self.observation_unavailable = True
             for session in self.sessions.values():
                 self.invalidate(session)
@@ -166,10 +183,42 @@ class Bridge:
             if not self.history:
                 raise Denial("disconnected")
             result = self._aged(self.history[-1])
+            self.update_safety(result)
             if result["freshness"]["status"] != "fresh":
                 for session in self.sessions.values():
                     self.invalidate(session)
             return result
+
+    def update_safety(self, snapshot, discontinuity=False):
+        executor = self.executor
+        capacity = getattr(executor, "capacity", None)
+        capabilities = {
+            "qualified": executor is not None and not executor.failed.is_set(),
+            "operations": sorted(executor.operations) if executor is not None else [],
+            "maximums": getattr(executor, "maximums", {}),
+            "presets": getattr(executor, "presets", []),
+            "capacity_available": capacity.available() if capacity is not None else None,
+        }
+        current = footprint(snapshot, capabilities, self.safety_context)
+        if discontinuity or self.safety_footprint != current:
+            self.safety_revision = self.ledger.next_safety_revision()
+            self.safety_footprint = current
+            for session in self.sessions.values():
+                self.invalidate(session)
+
+    def observation(self, packet):
+        if packet["deployment"] != self.deployment or packet["bridge"] != self.identity:
+            raise Denial("wrong-target")
+        snapshot = self.snapshot()
+        if (snapshot["freshness"]["status"] != "fresh"
+                or packet["safety_revision"] != str(self.safety_revision)):
+            raise Denial("stale")
+        entry = next((entry for entry in self.history
+                      if entry[0]["revision"] == packet["revision"]
+                      and entry[0]["safety_revision"] == packet["safety_revision"]), None)
+        if entry is None or not 0 <= time.monotonic_ns() - entry[1] <= SNAPSHOT_AGE_NS:
+            raise Denial("stale")
+        return entry
 
     def _aged(self, entry):
         value, observed, connected = entry
@@ -200,6 +249,7 @@ class Bridge:
             supported = supported - {"replicas"}
         return {
             "kind": "capabilities", "schema_version": 1, "bridge": self.identity,
+            "authorization": "safety-revision-v1",
             "connected": connected, "qualified": qualified, "deployments": [self.deployment],
             "operations": [{"operation": operation, "supported": connected and operation in supported,
                             "reason": ("qualified" if operation in supported else "unsupported") if connected else "disconnected",
@@ -244,14 +294,11 @@ class Bridge:
     def select(self, packet, session):
         with self.lock:
             self.invalidate(session)
-            snapshot = self.snapshot()
-            if packet["deployment"] != self.deployment:
-                raise Denial("wrong-target")
-            if packet["revision"] != snapshot["revision"] or snapshot["freshness"]["status"] != "fresh":
-                raise Denial("stale")
+            self.observation(packet)
             session.selection = {
                 "kind": "selection", "schema_version": 1, "selection_id": secrets.token_hex(16),
                 "deployment": self.deployment, "revision": packet["revision"], "armed": False,
+                "bridge": self.identity, "safety_revision": packet["safety_revision"],
             }
             return copy.deepcopy(session.selection)
 
@@ -262,44 +309,81 @@ class Bridge:
             snapshot = self.snapshot()
             if not self.capabilities()["qualified"]:
                 raise Denial("unqualified")
-            if packet["deployment"] != self.deployment:
-                raise Denial("wrong-target")
+            self.observation(packet)
             if (session.selection is None
                     or packet["selection_id"] != session.selection["selection_id"]):
                 raise Denial("disarmed")
-            if snapshot["freshness"]["status"] != "fresh" or packet["revision"] != snapshot["revision"]:
+            if packet["safety_revision"] != session.selection["safety_revision"]:
                 raise Denial("stale")
             require_observations(snapshot)
             session.arm_id = secrets.token_hex(16)
             session.arm_deadline_ns = time.monotonic_ns() + ARM_TTL_NS
             return {"kind": "armed", "schema_version": 1,
                     "selection_id": session.selection["selection_id"], "arm_id": session.arm_id,
-                    "deployment": self.deployment, "revision": packet["revision"], "ttl_ms": 30000}
+                    "deployment": self.deployment, "revision": packet["revision"], "ttl_ms": 30000,
+                    "bridge": self.identity, "safety_revision": packet["safety_revision"]}
 
     def command(self, packet, session):
         with self.lock:
-            if self.executor is None:
-                raise Denial("unsupported")
-            deployment, fence = self.command_fences(session)
-            require_observations(self.snapshot(), packet["action"])
-            return self.executor.submit(packet, deployment, fence, self.origin,
-                                        recheck=lambda: self.authorize_effect(packet, session))
+            started = time.monotonic_ns()
+            outcome, reasons = "requested", ()
+            try:
+                if self.executor is None:
+                    raise Denial("unsupported")
+                deployment, fence = self.command_fences(session, packet)
+                require_observations(self.snapshot(), packet["action"])
+                if packet["action"]["operation"] == "replicas":
+                    capacity = getattr(self.executor, "capacity", None)
+                    context = self.observation_contexts.get(packet["revision"])
+                    if (capacity is None or context is None
+                            or context.get("inventory_revision") != capacity.inventory.snapshot()["revision"]):
+                        raise Denial("stale", ("inventory-revision",))
+                return self.executor.submit(packet, deployment, fence, self.origin,
+                                            recheck=lambda: self.authorize_effect(packet, session))
+            except Denial as error:
+                outcome, reasons = error.code, error.reasons
+                raise
+            finally:
+                self.evidence.record(
+                    packet["operation_id"], "reservation", started, outcome, reasons=list(reasons),
+                    requested_revision=packet["revision"], requested_safety_revision=packet["safety_revision"],
+                    current_revision=str(self.revision), current_safety_revision=str(self.safety_revision))
 
     def authorize_effect(self, packet, session):
         with self.lock:
-            if (session.deadline <= time.monotonic_ns()
-                    or not any(current is session for current in self.sessions.values())):
-                raise Denial("disarmed")
-            deployment, fence = self.command_fences(session)
-            authorize_command(packet, deployment, fence, self.origin)
-            require_observations(self.snapshot(), packet["action"])
+            started = time.monotonic_ns()
+            outcome, reasons = "allowed", ()
+            deployment = None
+            try:
+                if (session.deadline <= time.monotonic_ns()
+                        or not any(current is session for current in self.sessions.values())):
+                    raise Denial("disarmed")
+                deployment, fence = self.command_fences(session, packet)
+                authorize_command(packet, deployment, fence, self.origin)
+                require_observations(self.snapshot(), packet["action"])
+            except Denial as error:
+                outcome, reasons = error.code, error.reasons
+                raise
+            finally:
+                self.evidence.record(
+                    packet["operation_id"], "final-guard", started, outcome,
+                    reasons=list(reasons), requested_revision=packet["revision"],
+                    requested_safety_revision=packet["safety_revision"],
+                    current_revision=str(self.revision), current_safety_revision=str(self.safety_revision),
+                    request_age_ns=(None if deployment is None or deployment.request_observed_ns is None
+                                    else str(time.monotonic_ns() - deployment.request_observed_ns)),
+                    current_age_ns=(None if deployment is None or deployment.observed_ns is None
+                                    else str(time.monotonic_ns() - deployment.observed_ns)))
 
-    def command_fences(self, session):
+    def command_fences(self, session, packet):
         with self.lock:
             snapshot = self.snapshot()
             capabilities = self.capabilities()
-            now = time.monotonic_ns()
             age = snapshot["freshness"]["age_ns"]
+            if self.safety_context is None:
+                raise Denial("disconnected")
+            retained = next((entry for entry in self.history if entry[0]["revision"] == packet["revision"]
+                             and entry[0]["safety_revision"] == packet["safety_revision"]), None)
             targets = {
                 replica["resource"]["id"]: {
                     "resource": replica["resource"], "writer": replica["writer"],
@@ -309,9 +393,14 @@ class Bridge:
                 if replica["status"] not in ("failed", "retired")
             }
             deployment = DeploymentFence(
-                self.deployment, snapshot["revision"], None if age is None else now - int(age),
+                self.deployment, snapshot["revision"], None if age is None else self.history[-1][1],
                 capabilities["connected"], capabilities["qualified"],
                 frozenset(item["operation"] for item in capabilities["operations"] if item["supported"]), targets,
+                bridge=self.identity, safety_revision=str(self.safety_revision),
+                request_revision=None if retained is None else retained[0]["revision"],
+                request_observed_ns=None if retained is None else retained[1],
+                inventory_revision=(self.observation_contexts.get(packet["revision"]) or {}).get(
+                    "inventory_revision"),
             )
             fence = SessionFence(
                 self.origin, True, True, "live", self.deployment,

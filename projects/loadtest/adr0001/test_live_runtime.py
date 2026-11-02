@@ -57,6 +57,7 @@ class RuntimeProjectionTests(unittest.TestCase):
             "bridge": {"id": "test-bridge", "incarnation": "test-incarnation"},
             "deployment": {"id": "test-project", "incarnation": "test-deployment"},
             "revision": "1", "freshness": {"status": "fresh", "age_ns": "0", "maximum_age_ns": "5000000000"},
+            "safety_revision": "3",
             "replicas": replicas, "tables": tables, "receipts": receipts, "metrics": metrics,
             "receipt_observation_known": self.bridge.publish.call_args.kwargs["receipt_observation_known"],
             "coverage": {"complete": False, "missing": missing,
@@ -405,7 +406,7 @@ class RuntimeProjectionTests(unittest.TestCase):
             with patch.object(live_runtime, "REPO", root), patch.object(live_runtime, "BINARIES", ("qualified-binary",)):
                 path.write_text(json.dumps(proof))
                 self.assertEqual(live_runtime.verify_creation_proof(path), hashlib.sha256(path.read_bytes()).hexdigest())
-                for name in ("live_inventory.py", "live_capacity.py", "live_receipts.py",
+                for name in ("live_inventory.py", "live_capacity.py", "live_receipts.py", "live_safety.py",
                              "contracts/live-v1.schema.json"):
                     changed = copy.deepcopy(proof)
                     changed["source_sha256"].pop(name)

@@ -96,9 +96,11 @@ class LiveHTTPTests(unittest.TestCase):
         self.assertFalse(any(operation["supported"] for operation in capabilities["operations"]))
 
     def selection(self):
+        snapshot = self.bridge.snapshot()
         status, packet, _ = self.request("POST", "/api/live/v1/selection", {
             "kind": "select", "schema_version": 1, "deployment": self.deployment,
-            "revision": str(self.bridge.revision),
+            "revision": snapshot["revision"], "safety_revision": snapshot["safety_revision"],
+            "bridge": self.bridge.identity,
         })
         self.assertEqual(status, 200)
         self.assertFalse(packet["armed"])
@@ -127,17 +129,18 @@ class LiveHTTPTests(unittest.TestCase):
             }
             self.replica.update(policy_revision=str(revision), applied_policy_revision=str(revision),
                                 **{name: operation[name] for name in ("excluded", "block_streams", "retiring")})
-            self.bridge.publish([copy.deepcopy(self.replica)], [], [], [], ["cpu"])
+            self.bridge.publish([copy.deepcopy(self.replica)], [], [], [], ["cpu"], safety_context={})
             return {}
-        self.bridge.publish([copy.deepcopy(self.replica)], [], [], [], ["cpu"])
         self.bridge.executor = PolicyExecutor(
             self.ledger, post, lambda _: self.replica["resource"], self.bridge.snapshot)
+        self.bridge.publish([copy.deepcopy(self.replica)], [], [], [], ["cpu"], safety_context={})
 
     def arm_policy(self):
         selection = self.selection()
         status, packet, _ = self.request("POST", "/api/live/v1/arm", {
             "kind": "arm", "schema_version": 1, "selection_id": selection["selection_id"],
             "deployment": self.deployment, "revision": str(self.bridge.revision), "confirm": "dedicated-local-poc",
+            "bridge": self.bridge.identity, "safety_revision": selection["safety_revision"],
         })
         self.assertEqual(status, 200)
         return packet
@@ -147,11 +150,159 @@ class LiveHTTPTests(unittest.TestCase):
             "kind": "command", "schema_version": 1, "operation_id": "policy-operation",
             "selection_id": armed["selection_id"], "arm_id": armed["arm_id"],
             "deployment": self.deployment, "revision": str(self.bridge.revision),
+            "bridge": self.bridge.identity, "safety_revision": armed["safety_revision"],
             "action": {"operation": "admission", "enabled": True, "target": {
                 "resource": copy.deepcopy(self.replica["resource"]), "writer": self.writer,
                 "policy_revision": self.replica["policy_revision"],
             }},
         }
+
+    def diagnostic_publish(self):
+        self.bridge.publish([copy.deepcopy(self.replica)], [], [], [], ["memory"], safety_context={})
+
+    def wait_effect(self):
+        self.assertTrue(self.bridge.executor.lock.acquire(timeout=2))
+        self.bridge.executor.lock.release()
+        return self.ledger.get("policy-operation", self.deployment)
+
+    def test_human_paced_select_arm_and_submit_survive_diagnostic_feed_advances(self):
+        self.enable_policy()
+        self.bootstrap()
+        selection = self.selection()
+        self.diagnostic_publish()
+        status, armed, _ = self.request("POST", "/api/live/v1/arm", {
+            "kind": "arm", "schema_version": 1, "selection_id": selection["selection_id"],
+            "bridge": self.bridge.identity, "deployment": self.deployment,
+            "revision": selection["revision"], "safety_revision": selection["safety_revision"],
+            "confirm": "dedicated-local-poc",
+        })
+        self.assertEqual(status, 200)
+        command = self.policy_command(armed)
+        command["revision"] = selection["revision"]
+        self.diagnostic_publish()
+        status, result, _ = self.request("POST", "/api/live/v1/commands", command)
+        self.assertEqual(status, 200)
+        self.assertEqual(self.wait_effect()["status"], "completed")
+        self.assertEqual(len(self.policy_calls), 1)
+        self.assertEqual(result["requested_safety_revision"], selection["safety_revision"])
+
+    def test_diagnostic_publish_during_required_native_preflight_preserves_original_command(self):
+        self.enable_policy()
+        self.bootstrap()
+        armed = self.arm_policy()
+        command = self.policy_command(armed)
+        original = self.bridge.executor.post
+        entered, release = threading.Event(), threading.Event()
+        def held(operation):
+            if operation["op"] == "view" and not entered.is_set():
+                entered.set()
+                if not release.wait(2):
+                    raise TimeoutError("synthetic blocked preflight")
+            return original(operation)
+        self.bridge.executor.post = held
+        try:
+            status, _, _ = self.request("POST", "/api/live/v1/commands", command)
+            self.assertEqual(status, 200)
+            self.assertTrue(entered.wait(2))
+            safety = self.bridge.safety_revision
+            self.diagnostic_publish()
+            self.assertEqual(self.bridge.safety_revision, safety)
+        finally:
+            release.set()
+        result = self.wait_effect()
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(len(self.policy_calls), 1)
+        self.assertEqual(result["requested_safety_revision"], command["safety_revision"])
+        self.assertIsNotNone(result["applied_safety_revision"])
+        self.assertNotEqual(result["requested_safety_revision"], result["applied_safety_revision"])
+        evidence = self.bridge.evidence.snapshot()
+        self.assertEqual(evidence["records"][-1]["outcome"], "allowed")
+
+    def test_original_request_observation_expires_even_when_new_feed_is_fresh(self):
+        self.enable_policy()
+        self.bootstrap()
+        armed = self.arm_policy()
+        command = self.policy_command(armed)
+        self.diagnostic_publish()
+        with self.bridge.lock:
+            for index, entry in enumerate(self.bridge.history):
+                if entry[0]["revision"] == command["revision"]:
+                    self.bridge.history[index] = (entry[0], time.monotonic_ns() - 6_000_000_000, True)
+        status, packet, _ = self.request("POST", "/api/live/v1/commands", command)
+        self.assertEqual((status, packet["code"]), (409, "stale"))
+        self.assertEqual(self.ledger.unresolved(), [])
+        self.assertEqual(self.policy_calls, [])
+
+    def test_critical_unknown_and_aba_changes_advance_safety_and_never_renew_arm(self):
+        self.enable_policy()
+        self.bootstrap()
+        armed = self.arm_policy()
+        command = self.policy_command(armed)
+        first = self.bridge.safety_revision
+        self.replica["paused"] = None
+        self.diagnostic_publish()
+        unknown = self.bridge.safety_revision
+        self.replica["paused"] = False
+        self.diagnostic_publish()
+        self.assertGreater(unknown, first)
+        self.assertGreater(self.bridge.safety_revision, unknown)
+        status, result, _ = self.request("POST", "/api/live/v1/commands", command)
+        self.assertEqual((status, result["code"]), (409, "stale"))
+        self.assertEqual(self.policy_calls, [])
+
+    def test_private_context_capability_and_unclassified_missing_changes_fail_closed(self):
+        self.enable_policy()
+        self.bootstrap()
+        for context, missing in (({"source": "changed"}, ["cpu"]), ({}, ["unclassified"])):
+            armed = self.arm_policy()
+            command = self.policy_command(armed)
+            self.bridge.publish([copy.deepcopy(self.replica)], [], [], [], missing, safety_context=context)
+            with self.assertRaises(Denial):
+                self.bridge.command(command, next(iter(self.bridge.sessions.values())))
+            self.diagnostic_publish()
+        armed = self.arm_policy()
+        command = self.policy_command(armed)
+        self.bridge.executor.operations = frozenset()
+        with self.assertRaises(Denial):
+            self.bridge.command(command, next(reversed(self.bridge.sessions.values())))
+        self.assertEqual(self.policy_calls, [])
+
+    def test_observer_failure_and_recovery_cannot_reuse_previous_safety_revision(self):
+        self.enable_policy()
+        before = self.bridge.safety_revision
+        self.bridge.observation_failed()
+        failed = self.bridge.safety_revision
+        self.diagnostic_publish()
+        self.assertGreater(failed, before)
+        self.assertGreater(self.bridge.safety_revision, failed)
+
+    def test_evicted_observation_cannot_be_replaced_with_freshest_sample(self):
+        self.enable_policy()
+        self.bootstrap()
+        armed = self.arm_policy()
+        command = self.policy_command(armed)
+        for _ in range(65):
+            self.diagnostic_publish()
+        status, result, _ = self.request("POST", "/api/live/v1/commands", command)
+        self.assertEqual((status, result["code"]), (409, "stale"))
+        self.assertEqual(self.policy_calls, [])
+        self.assertEqual(self.ledger.unresolved(), [])
+
+    def test_receipt_presence_is_not_authority_but_health_transition_changes_safety(self):
+        self.enable_policy()
+        table = {"id": "main", "epoch": "0", "lifecycle": "unknown", "writer": None,
+                 "recovery_obligations": []}
+        self.bridge.publish([self.replica], [table], [], [], ["cpu"], safety_context={},
+                            receipt_observation_known=True)
+        before = self.bridge.safety_revision
+        receipt = {"id": "receipt-1", "table_id": "main", "operation_id": "unit-1",
+                   "version": "0", "completion": "accepted", "digest": None}
+        self.bridge.publish([self.replica], [table], [receipt], [], ["cpu"], safety_context={},
+                            receipt_observation_known=True)
+        self.assertEqual(self.bridge.safety_revision, before)
+        self.bridge.publish([self.replica], [table], [receipt], [], ["cpu"], safety_context={},
+                            receipt_observation_known=None)
+        self.assertGreater(self.bridge.safety_revision, before)
 
     def test_guarded_policy_http_is_individually_supported_and_reconciles(self):
         self.enable_policy()
@@ -302,6 +453,7 @@ class LiveHTTPTests(unittest.TestCase):
         ):
             status, packet, _ = self.request("POST", "/api/live/v1/selection", {
                 "kind": "select", "schema_version": 1, "deployment": deployment, "revision": revision,
+                "bridge": self.bridge.identity, "safety_revision": str(self.bridge.safety_revision),
             })
             self.assertEqual((status, packet["code"]), (409, code))
         status, packet, _ = self.request("GET", "/api/live/v1/operations/unknown")
@@ -313,6 +465,7 @@ class LiveHTTPTests(unittest.TestCase):
         status, packet, _ = self.request("POST", "/api/live/v1/arm", {
             "kind": "arm", "schema_version": 1, "selection_id": selection["selection_id"],
             "deployment": self.deployment, "revision": str(self.bridge.revision), "confirm": "dedicated-local-poc",
+            "bridge": self.bridge.identity, "safety_revision": selection["safety_revision"],
         })
         self.assertEqual((status, packet["code"]), (503, "unsupported"))
         self.assertEqual(self.ledger.unresolved(), [])

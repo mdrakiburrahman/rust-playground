@@ -1,6 +1,10 @@
 # Dedicated local PoC bridge v1
 
-`live-v1.schema.json` is the unchanged closed packet contract. `live_contract.py`
+`live-v1.schema.json` is the closed packet contract. The approved safety-revision
+update adds mandatory fields and is not wire-compatible with the historical
+`ddb3f534...` consumer. Capabilities identify `authorization:safety-revision-v1`;
+there is no fallback for missing safety fences. The implemented source-only
+contract and qualification boundary are detailed below. `live_contract.py`
 validates it and supplies server-owned command-fence checks. `live_server.py`
 implements the bounded authenticated HTTP transport, read-only by default; `live_runtime.py`
 projects an explicitly configured dedicated Linux/Docker runtime into it.
@@ -89,11 +93,15 @@ any dataset cannot select a deployment or arm a session.
 
 Capabilities default to disconnected, unqualified and all operations unsupported.
 The server operator registers only one dedicated deployment; the UI still must
-explicitly select its exact ID/incarnation/current revision. Selection alone is
+explicitly select its exact ID/incarnation/bridge boot and current safety revision,
+referencing a retained fresh feed observation. Selection alone is
 read-only. Arming requires a fresh snapshot, correctness qualification, selected
 identity and explicit `confirm:"dedicated-local-poc"`; its maximum TTL is 30s.
-Commands carry the server-issued selection/arm IDs, exact deployment and snapshot
-revision. Targeted policy commands additionally carry exact resource incarnation,
+Commands carry the server-issued selection/arm IDs, exact deployment/bridge,
+retained feed `revision` and exact current `safety_revision`. Diagnostic feed
+advancement does not replace the safety fence or renew the original observation's
+maximum five-second age through final pre-effect authorization.
+Targeted policy commands additionally carry exact resource incarnation,
 collector/process/generation and policy revision. New policy ACKs are not
 inferred from requested revisions.
 
@@ -135,9 +143,10 @@ allocation of full shared work to every request is permitted. Empty telemetry
 never means zero. Clock restart creates a new clock identity.
 
 The client creates one operation ID before submitting. The server durably records
-the normalized deployment/action and requested revision before any effect.
-Same ID/same action returns the original ledger record even if response was lost;
-same ID/different action returns conflict. Reconciliation GET is read-only and
+the normalized bridge/deployment/action and requested feed/safety revisions before
+any effect. Same ID/exact same intent can return the original ledger record after
+current authorization; changing its action, bridge or either revision conflicts,
+never replaces its original request-age fence. Reconciliation GET is read-only and
 does not require a live arm. After a timeout, query the same ID; never invent a
 new operation or replay effects. Unknown operations return `unknown-operation`,
 not success. Requested/pending/applied/completed/failed/unknown remain distinct;
@@ -450,7 +459,7 @@ orphan receipts, reader failures and stale probes keep health/completion
 unknown and deny workload admission. Accepted SQL or RPC final alone is not
 physical completion.
 
-Common auth, Origin/CSRF, selected deployment/incarnation, exact latest revision,
+Common auth, Origin/CSRF, selected deployment/incarnation, exact latest safety revision,
 arming, gaps and source gates still apply. Required safety/policy/writer facts
 must be known. Only `cpu`, `memory`, `cpu-counter-gap`, `io-read`, `io-write`,
 `queue-depth`, `queue-age` and `throughput` are diagnostic-only missing labels;
@@ -495,7 +504,11 @@ bridge death with no replay, requested/sent/completed/cancelled accounting, and
 the actual advertised request/stream bounds. These scenarios are proposed;
 no passing evidence for the lease is claimed.
 
-## Normal browser blocker and review-only revision proposal
+## Historical normal browser blocker and review proposal
+
+This section records the pre-approval investigation/proposal. The implemented
+option B section below supersedes its statements that implementation is pending;
+the failed browser and unavailable historical timing evidence remain unchanged.
 
 The source-gated opt-in capacity candidate has **not** passed live browser
 mutation acceptance. Final actual selection/arm succeeded at revision737;
@@ -632,3 +645,97 @@ but must preserve exact live authority/resource/config checks and durable
 hard-link/no-overwrite/fsync intent/dispatch ordering. It is not proof of usable
 human-paced authorization. This revision proposal does not implement or qualify
 the separate multi-request/concurrent-client admitted-workload lease above.
+
+## Implemented option B: source-only safety revision fence (2026-11-02)
+
+The user approved option B, not another runtime/browser cycle. The backend now
+separates the diagnostic/feed sequence from a durable safety watermark:
+
+| Packet | Required fields / meaning |
+| --- | --- |
+| `capabilities` | `authorization:"safety-revision-v1"` explicitly identifies the new fence protocol |
+| `snapshot` | `revision` still advances on every successful sample; required `safety_revision` changes on critical facts/continuity, not diagnostic ticks |
+| `select`, `arm`, `command` | Required exact `bridge` identity and `safety_revision`, plus `revision` identifying the original retained server observation |
+| `selection`, `armed` | Echo the requested bridge, safety revision and retained observation sequence; they do not extend observation age |
+| `operation` | Preserve `requested_revision`/`applied_revision` as feed sequences, with separate `requested_safety_revision`/`applied_safety_revision` |
+
+Canonical schema: `contracts/live-v1.schema.json`. Canonical synthetic consumer
+fixtures: `contracts/live-safety-revision-fixtures.json`. Consumers must copy the
+same bytes and explicitly implement the new fields; older packets missing them
+are invalid. The new schema does not authorize an old frontend ZIP or proof.
+
+The server looks up the command's exact `(bridge boot, revision, safety_revision)`
+in its bounded64-sample local history. That original observed monotonic time
+is rechecked at admission and final authorization, independently of the current
+sample's age. Each must be within inclusive `[0,5000000000]` ns. Missing/evicted,
+future/foreign-boot or unknown observations deny; later diagnostic samples
+cannot renew the original deadline. Arm TTL30s/session TTL, auth, Origin/CSRF,
+explicit disarm, source qualification and exact native/resource/policy checks
+are unchanged. A safety change invalidates selection/arm. Observation failure,
+gap, stale continuity or restart cannot restore an old arm, even if facts later
+return to their original values.
+
+`live_safety.py` fingerprints every public replica/table safety field, current
+receipt-probe health, critical missing/unclassified-drop state, connected state,
+executor qualification/operation bounds/presets/finite capacity availability,
+and private producer context. That context binds the startup source digests,
+configuration digest, materialized exact resource records/uncertainty and native
+authority view. Native policy/schema/assignment/writer/eligibility and all
+unclassified fields remain critical. Explicit diagnostic exclusions are native
+heartbeat `revision` and its `assignments[].revision` delivery-cursor copy;
+member `pressure/rss_bytes/active`; observation `sequence/demand/capacity/tables`;
+and optimization hint `sampled_at/sustained/constraint`. The observation's
+`allocation_revision` is a directory-sample cursor, not a writer grant: changing
+its numeric value does not change safety, but known versus missing/invalid cursor
+does. Fingerprints, observation presence/absence, exact assignment records and
+all unclassified native/optimization fields remain critical. Native placement
+still performs its authoritative capacity/reservation checks; filtering these
+diagnostic values does not authorize migration or infer available capacity.
+Public metric values, receipt count/presence/completion progress and the existing
+eight diagnostic missing labels do not grant authority or independently change
+the safety watermark. Receipt-health known/unknown transitions do change it.
+No new native epoch is invented: exact owned authority incarnation and the native
+assignment epoch/writer/policy facts are retained, and immediate native preflight
+remains mandatory.
+
+Unbound inventory intent is an explicitly fenced expected self-transition, not
+a wildcard exemption. At admission, the retained private inventory revision must
+match the exact current revision. The executor carries that baseline into the
+creator; reservation must use it, and final preflight plus atomic dispatch CAS
+must observe exactly baseline+1 from that one reservation. Any other inventory
+advance denies. The observer may see that own unbound intent without declaring
+a new resource or invalidating the command on a diagnostic sample. Binding,
+materialized records, uncertainty and exhausted capacity still change safety.
+Cancellation/intent/one-use dispatch and no-replay semantics remain durable.
+
+`OperationLedger` persists the safety watermark across restarts and atomically
+records bounded feed-to-safety mappings with feed publication. New owners advance
+the watermark and always start with new sessions/empty local history. Durable
+intent includes bridge, deployment, both requested revisions and action, never
+selection/arm secrets. A versioned one-time migration marks historical operation
+safety revisions null; it does not infer them from old feed revisions or authorize
+replay. Reconciliation can leave applied safety null when its observation mapping
+is unavailable; that is explicit missing evidence, not an applied safety grant.
+
+Private guard/creator evidence is bounded to64 distinct operation IDs and64KiB
+including serialization overhead, with explicit dropped counts. It records local
+clock identity, monotonic phase spans and outcomes for reservation, native view,
+three parallel exact probes, config/hard-link/fsync, creator preparation, final
+guard and dispatch marker. Stale guard reasons distinguish original/current age,
+unretained observation and safety mismatch, including simultaneous causes.
+Observation ages recorded with a guard result are post-check diagnostic readings,
+not independent authorization timestamps. Evidence contains no transport secrets,
+raw config or arbitrary exception messages and is not public API data. Graceful
+shutdown writes a private nonce-named `bridge-guard-<boot>.json` with exclusive
+hard-link/fsync semantics; failure to save evidence does not skip exact cleanup.
+Overlapping spans are not summed or called CPU time.
+
+Whole-source proof invalidation is explicit: `live_safety.py` joins the other
+thirteen actor/schema dependencies. Historical capacity5/native and browser
+artifacts remain frozen; no existing qualification proof activates this changed
+source. Default remains read-only. Source regression success is not native,
+normal-browser or end-to-end frontend acceptance. Matching frontend integration,
+fresh separately authorized qualification and actual browser/Delta evidence are
+still required before a consumer gate can open. Repeatable staff changes,
+multi-request/concurrent-client workloads, the proposed workload lease and broader
+fault/removal/repair controls are not implemented or granted by option B.

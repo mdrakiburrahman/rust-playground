@@ -42,6 +42,29 @@ class OperationLedger:
             "CREATE TABLE IF NOT EXISTS bridge_state (id INTEGER PRIMARY KEY CHECK(id=1), "
             "deployment TEXT NOT NULL, revision TEXT NOT NULL)"
         )
+        self.connection.execute(
+            "CREATE TABLE IF NOT EXISTS bridge_safety (id INTEGER PRIMARY KEY CHECK(id=1), revision TEXT NOT NULL)"
+        )
+        self.connection.execute(
+            "CREATE TABLE IF NOT EXISTS bridge_observations (revision TEXT PRIMARY KEY, safety_revision TEXT NOT NULL)"
+        )
+        version = self.connection.execute("PRAGMA user_version").fetchone()[0]
+        if version not in (0, 1):
+            raise ValueError("unsupported operation ledger version")
+        if version == 0:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                for operation_id, raw in self.connection.execute("SELECT id,result FROM operations").fetchall():
+                    result = json.loads(raw)
+                    result.update(requested_safety_revision=None, applied_safety_revision=None)
+                    validate_packet(result)
+                    self.connection.execute("UPDATE operations SET result=? WHERE id=?",
+                                            (json.dumps(result, sort_keys=True), operation_id))
+                self.connection.execute("PRAGMA user_version=1")
+                self.connection.execute("COMMIT")
+            except BaseException:
+                self.connection.execute("ROLLBACK")
+                raise
         directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
             os.fsync(directory)
@@ -77,30 +100,59 @@ class OperationLedger:
                 self.connection.execute("ROLLBACK")
                 raise
 
-    def publish_revision(self, deployment, previous, revision):
+    def publish_revision(self, deployment, previous, revision, safety_revision=None):
         if revision != previous + 1 or revision >= 10**20:
             raise Denial("limit")
         serialized = json.dumps(deployment, sort_keys=True, separators=(",", ":"), allow_nan=False)
         with self.lock:
-            updated = self.connection.execute(
-                "UPDATE bridge_state SET revision=? WHERE id=1 AND deployment=? AND revision=?",
-                (str(revision), serialized, str(previous)),
-            )
-            if updated.rowcount != 1:
-                raise Denial("conflict")
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                updated = self.connection.execute(
+                    "UPDATE bridge_state SET revision=? WHERE id=1 AND deployment=? AND revision=?",
+                    (str(revision), serialized, str(previous)),
+                )
+                if updated.rowcount != 1:
+                    raise Denial("conflict")
+                if safety_revision is not None:
+                    self.connection.execute("INSERT INTO bridge_observations VALUES (?,?)",
+                                            (str(revision), str(safety_revision)))
+                    self.connection.execute(
+                        "DELETE FROM bridge_observations WHERE rowid NOT IN "
+                        "(SELECT rowid FROM bridge_observations ORDER BY rowid DESC LIMIT 64)")
+                self.connection.execute("COMMIT")
+            except BaseException:
+                self.connection.execute("ROLLBACK")
+                raise
+
+    def next_safety_revision(self):
+        """A new owner or a critical transition advances a durable, never reused watermark."""
+        with self.lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self.connection.execute("SELECT revision FROM bridge_safety WHERE id=1").fetchone()
+                revision = int(row[0]) + 1 if row else 1
+                if revision >= 10**20:
+                    raise Denial("limit")
+                self.connection.execute("INSERT OR REPLACE INTO bridge_safety VALUES (1,?)", (str(revision),))
+                self.connection.execute("COMMIT")
+                return revision
+            except BaseException:
+                self.connection.execute("ROLLBACK")
+                raise
 
     def reserve(self, command):
         """Caller must authenticate/fence new work before reserving; no effects here."""
         validate_packet(command)
         if command["kind"] != "command":
             raise Denial("invalid")
-        intent = {name: command[name] for name in ("deployment", "revision", "action")}
+        intent = {name: command[name] for name in ("bridge", "deployment", "revision", "safety_revision", "action")}
         serialized = json.dumps(intent, sort_keys=True, separators=(",", ":"), allow_nan=False)
         digest = hashlib.sha256(serialized.encode()).hexdigest()
         result = {
             "kind": "operation", "schema_version": 1, "operation_id": command["operation_id"],
             "deployment": command["deployment"], "requested_revision": command["revision"],
             "applied_revision": None, "status": "requested", "error_code": None,
+            "requested_safety_revision": command["safety_revision"], "applied_safety_revision": None,
         }
         with self.lock:
             self.connection.execute("BEGIN IMMEDIATE")
@@ -148,6 +200,7 @@ class OperationLedger:
                 if result["deployment"] != deployment:
                     raise Denial("wrong-target")
                 previous = result["status"]
+                new_observation = applied_revision is not None
                 applied_revision = result["applied_revision"] if applied_revision is None else applied_revision
                 if status in ("applied", "completed") and applied_revision is None:
                     raise Denial("invalid")
@@ -160,6 +213,11 @@ class OperationLedger:
                         or not same_state_observation and status not in TRANSITIONS.get(previous, frozenset())):
                     raise Denial("conflict")
                 result.update(status=status, applied_revision=applied_revision, error_code=error_code)
+                if new_observation:
+                    observation = self.connection.execute(
+                        "SELECT safety_revision FROM bridge_observations WHERE revision=?",
+                        (applied_revision,)).fetchone()
+                    result["applied_safety_revision"] = observation[0] if observation else None
                 validate_packet(result)
                 self.connection.execute(
                     "UPDATE operations SET result=? WHERE id=?", (json.dumps(result, sort_keys=True), operation_id)

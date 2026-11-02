@@ -21,11 +21,13 @@ class WorkloadTests(unittest.TestCase):
             "kind": "command", "schema_version": 1, "operation_id": "workload-1",
             "selection_id": "selection-1", "arm_id": "arm-1", "deployment": self.deployment, "revision": "7",
             "action": {"operation": "workload", "profile": "small", "requests": 1, "duration_ms": 1000, "streams": 1},
+            "bridge": {"id": "bridge", "incarnation": "bridge-1"}, "safety_revision": "3",
         }
         self.snapshot = {
             "kind": "snapshot", "schema_version": 1,
             "bridge": {"id": "bridge", "incarnation": "bridge-1"}, "deployment": self.deployment,
             "revision": "8", "freshness": {"status": "fresh", "age_ns": "0", "maximum_age_ns": "5000000000"},
+            "safety_revision": "4",
             "replicas": [], "tables": [{"id": "main", "epoch": "0", "lifecycle": "unknown",
                                        "writer": None, "recovery_obligations": []}], "receipts": [], "metrics": [],
             "coverage": {"complete": False, "missing": ["cpu"], "dropped": 0},
