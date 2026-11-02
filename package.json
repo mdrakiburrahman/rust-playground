@@ -9,7 +9,7 @@
   "overrides": {
     "axios": "1.20.0",
     "brace-expansion": "5.0.12",
-    "smol-toml": "1.9.0"
+    "smol-toml": "1.9.1"
   },
   "devDependencies": {
     "@devcontainers/cli": "0.89.0",
@@ -22,7 +22,7 @@
     "nx": "23.3.0",
     "parquet-wasm": "0.9.0",
     "playwright": "1.64.1",
-    "smol-toml": "1.9.0",
+    "smol-toml": "1.9.1",
     "tsx": "4.23.15",
     "typescript": "7.0.2",
     "yaml": "2.9.1"
