@@ -12,7 +12,7 @@
     "smol-toml": "1.9.0"
   },
   "devDependencies": {
-    "@devcontainers/cli": "0.89.0",
+    "@devcontainers/cli": "0.90.0",
     "@nx/devkit": "23.3.0",
     "@types/node": "26.6.5",
     "apache-arrow": "21.2.0",
