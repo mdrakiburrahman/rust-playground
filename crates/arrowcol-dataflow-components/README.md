@@ -41,11 +41,12 @@ client resubmission ID does not prove recovery of the original publication.
 An interrupted or failed DFE send with no proven publication remains incomplete;
 the send-error abstraction does not prove that no downstream delivery occurred.
 
-`arrowcol-dataflow-components` links two external OTAP Dataflow Engine (DFE)
+`arrowcol-dataflow-components` links three external OTAP Dataflow Engine (DFE)
 nodes:
 
 - `receiver:arrow_flight`
 - `exporter:arrow_deltalake`
+- `exporter:arrow_flight` (see [Collector chaining](#collector-chaining))
 
 The receiver uses `arrowcol-flight` for Arrow Flight transport, strict catalog
 validation, nullable-append alignment, bounded decoding, Flight SQL DDL, and
@@ -184,6 +185,28 @@ utilizations. `dfe_state`, `dfe_pressure_bps`, and `oldest_buffer_age_ms`
 keep describing in-memory DFE work only. Batches evicted by a Quiver
 `drop_oldest` or `max_age` policy are not subtracted, so durable deployments
 should use `size_cap_policy: backpressure` without `max_age`.
+
+## Collector chaining
+
+`exporter:arrow_flight` forwards admitted batches to another collector's
+`receiver:arrow_flight`, so a middle collector can feed a batching gateway.
+The [collector-chain experiment](../../experiments/collector-chain/README.md)
+runs three middles into one gateway.
+
+| Config | Meaning |
+| --- | --- |
+| `endpoint` | Downstream `http://host:port` Flight endpoint. |
+| `timeout` | Per-RPC deadline for DDL replay and each DoPut (default 30s). |
+
+| Behavior | Contract |
+| --- | --- |
+| Schema | Before the first batch of a table version, replays that table's local catalog history through Flight SQL DDL and requires every downstream fingerprint to match. |
+| Completion | ACKs only after the downstream DoPut returns exactly one admission; the downstream receiver's delivery mode decides whether that is best-effort or durable. |
+| Failures | `InvalidArgument`, `PermissionDenied`, `Unauthenticated`, `Unimplemented` and schema divergence NACK permanently; everything else NACKs transiently and forces DDL replay on the next batch. |
+
+`routing: { type: standalone }` on the receiver and Delta exporter makes a
+collector claim its own table leases in memory, without a router or control
+plane. Use it only for a single collector that owns every table it receives.
 
 ## Public integration APIs
 

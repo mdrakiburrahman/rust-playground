@@ -118,6 +118,11 @@ The [Azure QAP experiment](experiments/azure-qap/README.md) examines whether
 append, OPTIMIZE, old-partition DELETE and physical VACUUM reload unchanged data.
 See the [lessons learned, with diagrams](docs/experiments/azure-qap/README.md).
 
+The [collector-chain experiment](experiments/collector-chain/README.md) chains
+3 clients through middle ArrowCol and OTAPCol collectors into one batching
+gateway each, then asserts every client ID in Kustainer over the local Delta
+output. See the [write-up and diagram](docs/experiments/collector-chain/README.md).
+
 ### Finite qualification quick start
 
 Run from the repository root in the source devcontainer:

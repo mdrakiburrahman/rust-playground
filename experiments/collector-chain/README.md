@@ -3,7 +3,7 @@
 Local-only proof of collector-to-collector chaining. Every client sends DMV Arrow and OTEL
 logs, metrics and traces through a middle collector into one batching gateway per chain.
 Each gateway writes Delta Lake to local disk, and Kustainer reads the Delta tables natively.
-Design and diagram: [docs/experiments/COLLECTOR_CHAIN.md](../../docs/experiments/COLLECTOR_CHAIN.md).
+Design and diagram: [docs/experiments/collector-chain](../../docs/experiments/collector-chain/README.md).
 
 ```bash
 npx nx run collector-chain-experiment:run
