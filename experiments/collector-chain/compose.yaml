@@ -42,18 +42,6 @@ x-otapcol-middle: &otapcol-middle
     otapcol-gateway:
       condition: service_healthy
 
-x-client: &client
-  image: ghcr.io/mdrakiburrahman/rust-playground/arrowcol-dataflow-rust:dev
-  pull_policy: never
-  profiles: ["tools"]
-  user: "${CHAIN_UID:?Run through Nx}:${CHAIN_GID:?Run through Nx}"
-  entrypoint: ["/usr/local/bin/collector-chain"]
-  volumes:
-    - type: bind
-      source: ${CHAIN_BIN_HOST_PATH:?Run through Nx}/collector-chain
-      target: /usr/local/bin/collector-chain
-      read_only: true
-
 services:
   arrowcol-gateway:
     <<: *arrowcol
@@ -95,5 +83,3 @@ services:
         source: ${CHAIN_DELTA_HOST_PATH:?Run through Nx}
         target: /delta
         read_only: true
-
-  client: *client

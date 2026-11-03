@@ -9,6 +9,7 @@ groups:
             type: receiver:otap
             config:
               listening_addr: "0.0.0.0:4317"
+              compression_method: zstd
               response_stream_channel_size: 256
           batch:
             type: processor:batch

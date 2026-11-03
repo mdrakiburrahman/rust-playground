@@ -1,0 +1,56 @@
+{
+  "name": "collector-chain",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "application",
+  "sourceRoot": "bin/collector-chain/src",
+  "implicitDependencies": ["arrowcol-catalog", "arrowcol-flight", "arrowcol-protocol"],
+  "namedInputs": {
+    "default": [
+      "{projectRoot}/**/*",
+      "{workspaceRoot}/Cargo.toml",
+      "{workspaceRoot}/Cargo.lock",
+      "{workspaceRoot}/rust-toolchain.toml",
+      "{workspaceRoot}/rustfmt.toml"
+    ]
+  },
+  "targets": {
+    "format": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "cargo fmt --package collector-chain"
+      }
+    },
+    "format-check": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "cargo fmt --package collector-chain -- --check"
+      }
+    },
+    "lint": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "cargo clippy --locked --package collector-chain --all-targets -j 2 -- -D warnings"
+      }
+    },
+    "build": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "cargo build --locked --package collector-chain -j 2"
+      }
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "cargo test --locked --package collector-chain -j 2"
+      }
+    },
+    "verify": {
+      "executor": "nx:run-commands",
+      "dependsOn": ["format-check", "lint", "test"],
+      "options": {
+        "commands": []
+      }
+    }
+  },
+  "tags": ["scope:rust", "type:app"]
+}
