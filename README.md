@@ -97,9 +97,8 @@ The [interactive architecture source](loadtest-architecture.html) follows
 13 multi-customer schemas through both collector pools into independent Delta
 roots, ingestion-time partitions, standalone maintenance, historical tenant
 forks, and Kusto. Local mode pairs disk with the Kusto emulator. Native external
-Delta/QAP is the default validation target. Azure mode uses ADLS
-Gen2 and native external-Delta query acceleration with a dedicated managed
-identity. Independent validation and LGTM observe the same run.
+Delta/QAP is the default validation target. Azure mode uses ADLS Gen2 and
+native external-Delta query acceleration with a dedicated managed identity. Independent validation and LGTM observe the same run.
 
 The tenant fork preserves copied history after source purge; native external
 tables instead read the current active snapshot. Stable publication identities
