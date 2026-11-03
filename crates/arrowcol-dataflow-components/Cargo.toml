@@ -14,6 +14,7 @@ arrowcol-buffer = { path = "../arrowcol-buffer" }
 anyhow.workspace = true
 arrow-array = { version = "58.3", default-features = false }
 arrow-schema = { version = "58.3", default-features = false }
+arrow-flight = { version = "58.3", default-features = false, features = ["flight-sql"] }
 arrow-deltalake = { path = "../arrow-deltalake", features = ["delta"] }
 arrowcol-catalog = { path = "../arrowcol-catalog" }
 arrowcol-flight = { path = "../arrowcol-flight" }
@@ -30,6 +31,7 @@ otel-arrow-dfe-channel = { path = "../../submodules/otel-arrow/rust/otap-dataflo
 otel-arrow-dfe-engine = { path = "../../submodules/otel-arrow/rust/otap-dataflow/crates/engine" }
 otel-arrow-dfe-otap = { path = "../../submodules/otel-arrow/rust/otap-dataflow/crates/otap", default-features = false, features = ["crypto-ring"] }
 otel-arrow-dfe-pdata = { path = "../../submodules/otel-arrow/rust/otap-dataflow/crates/pdata" }
+prost = "0.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror.workspace = true
@@ -40,7 +42,6 @@ tonic = "0.14"
 tracing.workspace = true
 
 [dev-dependencies]
-arrow-flight = { version = "58.3", default-features = false, features = ["flight-sql"] }
 parquet = { version = "58.3", default-features = false, features = ["arrow"] }
 tempfile = "3"
 uuid = { version = "1", features = ["v5"] }

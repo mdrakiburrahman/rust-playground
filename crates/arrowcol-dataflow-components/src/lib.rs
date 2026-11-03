@@ -7,13 +7,17 @@
 //! admission once every batch was persisted. The exporter consumes only that
 //! representation, preserves its table/schema/lease envelope, rebinds
 //! durable-buffer replays to the lease this process currently holds, and
-//! writes the original batch through `arrow-deltalake`.
+//! writes the original batch through `arrow-deltalake`. The Flight exporter
+//! instead forwards each batch, after replaying its catalog DDL, to a
+//! downstream Arrowcol Flight receiver for collector-to-collector chaining.
 
 #![deny(unsafe_code)]
 
+mod catalogs;
 mod config;
 mod envelope;
 mod exporter;
+mod flight_exporter;
 mod metrics;
 mod receiver;
 mod routing;
@@ -30,6 +34,9 @@ pub use envelope::{
     DecodedArrowBatch, EnvelopeError, arrowcol_flight_representation, decode_record_set, encode_record_batch,
 };
 pub use exporter::{ARROW_DELTALAKE_EXPORTER, ARROW_DELTALAKE_EXPORTER_URN, GenericDeltaExporter};
+pub use flight_exporter::{
+    ARROW_FLIGHT_EXPORTER, ARROW_FLIGHT_EXPORTER_URN, ArrowFlightExporter, FlightExporterConfig,
+};
 pub use metrics::{
     DashboardCapabilities, DashboardPressure, NativeQuiverCapability, RuntimeMetrics, TableVersionStatus,
     global_metrics, process_instance_id, process_instance_key,

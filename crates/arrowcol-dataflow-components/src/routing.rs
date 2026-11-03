@@ -8,7 +8,7 @@ use arrowcol_flight::{RuntimeError, RuntimeResult};
 use arrowcol_protocol::{
     CollectorInstanceId, ErrorCode, FencingToken, ImplementationPool, LeaseId, TableIdentity, UnixMillis,
 };
-use arrowcol_routing::{LeaseKey, LeaseState, RoutingLease, RoutingStore};
+use arrowcol_routing::{LeaseClaim, LeaseKey, LeaseState, RoutingLease, RoutingStore};
 use async_trait::async_trait;
 use tonic::Code;
 
@@ -30,49 +30,87 @@ pub trait LeaseResolver: Send + Sync {
 pub struct StoreLeaseResolver {
     store: Arc<dyn RoutingStore>,
     instance_id: CollectorInstanceId,
+    claim_ttl: Option<Duration>,
 }
 
 impl StoreLeaseResolver {
     /// Creates a resolver for one collector process lifetime.
     #[must_use]
     pub fn new(store: Arc<dyn RoutingStore>, instance_id: CollectorInstanceId) -> Self {
-        Self { store, instance_id }
+        Self {
+            store,
+            instance_id,
+            claim_ttl: None,
+        }
     }
+
+    /// Claims an absent or expired table lease for this collector instead of
+    /// rejecting the stream, as a standalone collector owns all of its tables.
+    #[must_use]
+    pub fn claiming(mut self, ttl: Duration) -> Self {
+        self.claim_ttl = Some(ttl);
+        self
+    }
+
+    fn owns(&self, lease: &RoutingLease, now: UnixMillis) -> bool {
+        lease.holder_instance_id == self.instance_id && lease.state == LeaseState::Active && lease.is_routable_at(now)
+    }
+
+    async fn claim(&self, key: LeaseKey, ttl: Duration, now: UnixMillis) -> RuntimeResult<RoutingLease> {
+        let ttl = u64::try_from(ttl.as_millis()).map_err(|_| RuntimeError::internal())?;
+        let expires = now
+            .get()
+            .checked_add(ttl)
+            .and_then(|expires| UnixMillis::new(expires).ok())
+            .ok_or_else(RuntimeError::internal)?;
+        let lease = self
+            .store
+            .claim_lease(&LeaseClaim {
+                key,
+                candidate_instance_id: self.instance_id,
+                now_unix_ms: now,
+                expires_at_unix_ms: expires,
+                minimum_snapshot_at_unix_ms: UnixMillis::new(0).map_err(|_| RuntimeError::internal())?,
+            })
+            .await
+            .map_err(|_| unverified())?;
+        if self.owns(&lease, now) {
+            Ok(lease)
+        } else {
+            Err(fenced())
+        }
+    }
+}
+
+fn unverified() -> RuntimeError {
+    RuntimeError::new(
+        ErrorCode::PoolUnavailable,
+        Code::Unavailable,
+        "routing lease could not be verified",
+    )
+}
+
+fn fenced() -> RuntimeError {
+    RuntimeError::new(
+        ErrorCode::LeaseFenced,
+        Code::FailedPrecondition,
+        "collector does not own an active table lease",
+    )
 }
 
 #[async_trait]
 impl LeaseResolver for StoreLeaseResolver {
     async fn resolve(&self, table: &TableIdentity) -> RuntimeResult<RoutingLease> {
         let now = now_unix_millis().map_err(|_| RuntimeError::internal())?;
-        let view = self.store.load_view(now).await.map_err(|_| {
-            RuntimeError::new(
-                ErrorCode::PoolUnavailable,
-                Code::Unavailable,
-                "routing lease could not be verified",
-            )
-        })?;
+        let view = self.store.load_view(now).await.map_err(|_| unverified())?;
         let key = LeaseKey::new(ImplementationPool::Dataflow, table.clone());
-        let lease = view.leases.get(&key).cloned().ok_or_else(|| {
-            RuntimeError::new(
-                ErrorCode::LeaseFenced,
-                Code::FailedPrecondition,
-                "collector does not own an active table lease",
-            )
-        })?;
-        if lease.holder_instance_id != self.instance_id
-            || lease.state != LeaseState::Active
-            || !lease.is_routable_at(now)
-        {
-            return Err(RuntimeError::new(
-                ErrorCode::LeaseFenced,
-                Code::FailedPrecondition,
-                "collector does not own an active table lease",
-            ));
+        match (view.leases.get(&key), self.claim_ttl) {
+            (Some(lease), _) if self.owns(lease, now) => Ok(lease.clone()),
+            (_, Some(ttl)) => self.claim(key, ttl, now).await,
+            _ => Err(fenced()),
         }
-        Ok(lease)
     }
 }
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LeaseEvidence {
     table: TableIdentity,

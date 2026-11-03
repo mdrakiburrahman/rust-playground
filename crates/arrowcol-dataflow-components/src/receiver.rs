@@ -272,6 +272,8 @@ impl DurableAdmission {
 }
 
 const DURABLE_DEADLINE_MARGIN: Duration = Duration::from_millis(100);
+/// Expired standalone leases are re-claimed with a new fencing epoch on the next admission.
+const STANDALONE_LEASE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 fn durable_rejection_error() -> RuntimeError {
     RuntimeError::new(
@@ -490,8 +492,14 @@ impl receiver::Receiver<OtapPdata> for ArrowFlightReceiver {
             .start()
             .await
             .map_err(|error| receiver_error(&effect_handler, ReceiverErrorKind::Connect, error.to_string()))?;
+        crate::catalogs::register(Arc::clone(&catalog))
+            .map_err(|error| receiver_error(&effect_handler, ReceiverErrorKind::Configuration, error))?;
         self.metrics.set_catalog_ready(true);
-        let leases: Arc<dyn LeaseResolver> = Arc::new(StoreLeaseResolver::new(Arc::clone(&self.routing), instance_id));
+        let mut resolver = StoreLeaseResolver::new(Arc::clone(&self.routing), instance_id);
+        if self.config.routing.claims_leases() {
+            resolver = resolver.claiming(STANDALONE_LEASE_TTL);
+        }
+        let leases: Arc<dyn LeaseResolver> = Arc::new(resolver);
         let mut admission = DfeAdmission::with_permits(
             Arc::new(EnginePdataSender {
                 effect_handler: effect_handler.clone(),
@@ -684,7 +692,7 @@ fn record_drain_outcome(outcome: DrainOutcome) {
     }
 }
 
-fn allow_all_authenticator() -> Result<AllowAllAuthenticator, String> {
+pub(crate) fn allow_all_authenticator() -> Result<AllowAllAuthenticator, String> {
     let principal = AuthenticatedPrincipal::new(
         PrincipalId::new("local-development").map_err(|error| error.to_string())?,
         PrincipalIssuer::new("arrowcol-dataflow").map_err(|error| error.to_string())?,
@@ -943,7 +951,7 @@ async fn admin_metrics(State(state): State<AdminState>) -> Response {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(clippy::expect_used)]
 
     use std::sync::Mutex;
@@ -973,9 +981,9 @@ mod tests {
 
     use super::*;
 
-    struct CaptureSender {
-        sent: Mutex<Vec<(u64, OtapPdata)>>,
-        gate: Option<Arc<Semaphore>>,
+    pub(crate) struct CaptureSender {
+        pub(crate) sent: Mutex<Vec<(u64, OtapPdata)>>,
+        pub(crate) gate: Option<Arc<Semaphore>>,
     }
 
     #[async_trait]
@@ -1069,6 +1077,23 @@ mod tests {
         instance_id: CollectorInstanceId,
         table: &arrowcol_protocol::TableIdentity,
     ) -> Result<()> {
+        let now = ready_collector(store, instance_id).await?;
+        store
+            .claim_lease(&LeaseClaim {
+                key: LeaseKey::new(ImplementationPool::Dataflow, table.clone()),
+                candidate_instance_id: instance_id,
+                now_unix_ms: now,
+                expires_at_unix_ms: UnixMillis::new(now.get() + 60_000)?,
+                minimum_snapshot_at_unix_ms: now,
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn ready_collector(
+        store: &Arc<MemoryRoutingStore>,
+        instance_id: CollectorInstanceId,
+    ) -> Result<UnixMillis> {
         let now = now_unix_millis().map_err(anyhow::Error::msg)?;
         store
             .register_collector(&CollectorRegistration {
@@ -1111,16 +1136,7 @@ mod tests {
                 tables: Vec::new(),
             })
             .await?;
-        store
-            .claim_lease(&LeaseClaim {
-                key: LeaseKey::new(ImplementationPool::Dataflow, table.clone()),
-                candidate_instance_id: instance_id,
-                now_unix_ms: now,
-                expires_at_unix_ms: UnixMillis::new(now.get() + 60_000)?,
-                minimum_snapshot_at_unix_ms: now,
-            })
-            .await?;
-        Ok(())
+        Ok(now)
     }
 
     /// Scenario: A bounded DFE sender is saturated.

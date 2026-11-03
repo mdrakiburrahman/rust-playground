@@ -797,6 +797,7 @@ dependencies = [
  "otel-arrow-dfe-otap",
  "otel-arrow-dfe-pdata",
  "parquet 58.4.0",
+ "prost 0.14.4",
  "serde",
  "serde_json",
  "tempfile",

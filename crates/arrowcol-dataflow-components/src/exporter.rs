@@ -878,7 +878,7 @@ impl Drop for PendingOwner {
 }
 
 #[derive(Debug, thiserror::Error)]
-enum ExportFailure {
+pub(crate) enum ExportFailure {
     #[error("{0}")]
     Permanent(String),
     #[error("{0}")]
@@ -888,7 +888,7 @@ enum ExportFailure {
 }
 
 impl ExportFailure {
-    fn permanent(&self) -> bool {
+    pub(crate) fn permanent(&self) -> bool {
         matches!(self, Self::Permanent(_) | Self::Envelope(_))
     }
 
@@ -1004,7 +1004,7 @@ impl exporter::Exporter<OtapPdata> for GenericDeltaExporter {
     }
 }
 
-async fn complete_publication(
+pub(crate) async fn complete_publication(
     effect_handler: &exporter::EffectHandler<OtapPdata>,
     pdata: OtapPdata,
     result: Result<(), ExportFailure>,
