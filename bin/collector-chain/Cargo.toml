@@ -1,0 +1,33 @@
+[package]
+name = "collector-chain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Collector-chain experiment client sending DMV Arrow and OTLP signals with a unique client ID"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+arrow-array = { version = "58.3", default-features = false }
+arrow-flight = { version = "58.3", default-features = false, features = ["flight-sql"] }
+arrow-schema = { version = "58.3", default-features = false }
+arrowcol-catalog = { path = "../../crates/arrowcol-catalog" }
+arrowcol-flight = { path = "../../crates/arrowcol-flight" }
+arrowcol-protocol = { path = "../../crates/arrowcol-protocol" }
+clap.workspace = true
+futures = "0.3"
+opentelemetry.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry_sdk.workspace = true
+prost = "0.14"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tonic = "0.14"
+uuid = { version = "1", features = ["v4"] }
+
+[lints]
+workspace = true

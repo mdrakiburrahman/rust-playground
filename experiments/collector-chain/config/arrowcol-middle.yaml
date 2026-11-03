@@ -1,0 +1,40 @@
+version: otel_dataflow/v1
+engine: {}
+policies:
+  resources:
+    core_allocation:
+      type: core_count
+      count: 1
+groups:
+  arrowcol:
+    pipelines:
+      ingest:
+        nodes:
+          flight:
+            type: receiver:arrow_flight
+            config:
+              listening_addr: "0.0.0.0:32310"
+              admin_listening_addr: "0.0.0.0:32311"
+              catalog:
+                type: memory
+              routing:
+                type: standalone
+              registration:
+                instance_key: arrowcol-middle
+                flight_endpoint: "0.0.0.0:32310"
+                max_concurrent_streams: 16
+                heartbeat_interval: 1s
+                pressure_interval: 1s
+                registration_ttl: 5s
+                rss_limit_bytes: 2147483648
+                buffered_bytes_limit: 268435456
+                buffered_rows_limit: 1000000
+                buffered_batches_limit: 1024
+          forward:
+            type: exporter:arrow_flight
+            config:
+              endpoint: "http://arrowcol-gateway:32310"
+              timeout: 30s
+        connections:
+          - from: flight
+            to: forward
