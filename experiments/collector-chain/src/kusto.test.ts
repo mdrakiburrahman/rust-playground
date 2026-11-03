@@ -12,4 +12,6 @@ test('generated KQL rejects unsafe names and locations', () => {
   assert.equal(kql.externalTable('otap_logs', '/delta/otap/logs'), ".create-or-alter external table ['otap_logs'] kind=delta (h@'/delta/otap/logs')");
   assert.throws(() => kql.externalTable("x']", '/delta'), /identifier/);
   assert.throws(() => kql.externalTable('x', "/delta')"), /location/);
+  assert.equal(kql.dmvClients('dmv_t'), "external_table('dmv_t') | summarize rows=count() by client=customer_id");
+  assert.throws(() => kql.otapClients("x')"), /identifier/);
 });

@@ -31,9 +31,17 @@ export function commandRows(body: string): Row[] {
   return rows(table.Columns, table.Rows);
 }
 
-export function identifier(name: string): string {
+function safeName(name: string): string {
   if (!/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(name)) throw new Error(`Unsafe Kusto identifier: ${name}`);
-  return `['${name}']`;
+  return name;
+}
+
+export function identifier(name: string): string {
+  return `['${safeName(name)}']`;
+}
+
+function tableRef(name: string): string {
+  return `external_table('${safeName(name)}')`;
 }
 
 /** The exact KQL the experiment runs, so readers can paste it into Kusto themselves. */
@@ -43,13 +51,13 @@ export const kql = {
     return `.create-or-alter external table ${identifier(name)} kind=delta (h@'${location}')`;
   },
   dmvClients(table: string): string {
-    return `external_table(${identifier(table)}) | summarize rows=count() by client=customer_id`;
+    return `${tableRef(table)} | summarize rows=count() by client=customer_id`;
   },
   otapClients(prefix: string): string {
     const signal = (name: string, table: string) =>
-      `(external_table(${identifier(`${prefix}${table}`)}) | project signal='${name}', rid=tolong(resource.id), ns=_otel_join_namespace)`;
+      `(${tableRef(`${prefix}${table}`)} | project signal='${name}', rid=tolong(resource.id), ns=_otel_join_namespace)`;
     return [
-      `let clients = external_table(${identifier(`${prefix}resource_attrs`)})`,
+      `let clients = ${tableRef(`${prefix}resource_attrs`)}`,
       `| where key == 'client.id' | project rid=parent_id, ns=_otel_join_namespace, client=str;`,
       `union ${signal('logs', 'logs')}, ${signal('spans', 'spans')}, ${signal('metrics', 'univariate_metrics')}`,
       '| join kind=inner clients on rid, ns',
