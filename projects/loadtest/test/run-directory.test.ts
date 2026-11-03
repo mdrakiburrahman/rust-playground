@@ -38,7 +38,7 @@ function mockDocker(workspace: string): { commands: string[][]; docker: (args: s
     { id: 'unrelated', name: 'unrelated', labels: labelled('another-project') },
   ];
   const volumes: Resource[] = [
-    ...['sqlserver-data', 'hive-warehouse', 'kusto-data', 'kusto-bridge-state'].map(volume => ({
+    ...['sqlserver-data', 'hive-warehouse', 'kusto-data'].map(volume => ({
       id: `${BENCHMARK_PROJECT}_${volume}`, name: `${BENCHMARK_PROJECT}_${volume}`,
       labels: { ...labelled(BENCHMARK_PROJECT), 'com.docker.compose.volume': volume,
         'io.arrowcol.loadtest.workspace': workspace },
@@ -193,7 +193,7 @@ test('starting again removes only already sealed output and owned SQL, Hive and 
   const { docker, commands } = mockDocker(workspace);
   assert.equal(await resetBenchmark(workspace, docker), latest);
   assert(!existsSync(path.join(latest, 'old.json')));
-  for (const volume of ['sqlserver-data', 'hive-warehouse', 'kusto-data', 'kusto-bridge-state']) {
+  for (const volume of ['sqlserver-data', 'hive-warehouse', 'kusto-data']) {
     assert(commands.some(args => args.join(' ') === `volume rm ${BENCHMARK_PROJECT}_${volume}`));
   }
   assert(commands.some(args => args.join(' ') === 'rm collector'));

@@ -47,7 +47,6 @@ test('discovers production images and retains the sample publication', () => {
     'arrowcol-rust',
     'arrowcol-dataflow-rust',
     'arrowcol-router-rust',
-    'kusto-bridge',
     'delta-maintenance',
     'arrow-tenant-stream',
     'kusto-explorer',
@@ -95,10 +94,10 @@ test('fails closed when a source-built publication is missing or unexpected', ()
   );
 });
 
-test('all seven loadtest images retain local build behavior with clean Git revision metadata', () => {
+test('all six loadtest images retain local build behavior with clean Git revision metadata', () => {
   const expected = [
     'arrowcol-rust', 'arrowcol-dataflow-rust', 'arrowcol-router-rust',
-    'kusto-explorer', 'kusto-bridge', 'arrow-tenant-stream', 'delta-maintenance',
+    'kusto-explorer', 'arrow-tenant-stream', 'delta-maintenance',
   ];
   const loadtest = JSON.parse(readFileSync(join(workspace, 'projects/loadtest/project.json'), 'utf8')) as ProjectConfiguration;
   const images = loadtest.targets?.build?.dependsOn?.filter(
@@ -138,7 +137,7 @@ const COLLECTOR_IMAGE_PROJECTS = [
 ];
 // Web images compile a wasm UI and serve read-only static assets instead of configuration files.
 const WEB_IMAGE_PROJECTS = ['kusto-explorer'];
-const SERVICE_IMAGE_PROJECTS = ['kusto-bridge', 'delta-maintenance', 'arrow-tenant-stream'];
+const SERVICE_IMAGE_PROJECTS = ['delta-maintenance', 'arrow-tenant-stream'];
 
 test('every production runtime image is classified for Dockerfile policy', () => {
   assert.deepEqual(

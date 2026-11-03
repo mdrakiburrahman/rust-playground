@@ -15,7 +15,7 @@ export const sdkMetricFamilies = [
   'delta_publication_duration_seconds_count',
 ] as const;
 
-export function requiredMetrics(scope: 'source-sdk' | 'service-qualification', bridgeEnabled: boolean): RequiredMetric[] {
+export function requiredMetrics(scope: 'source-sdk' | 'service-qualification'): RequiredMetric[] {
   const metrics: RequiredMetric[] = [];
   for (const [pool, service] of [['direct', 'arrowcol-rust'], ['dataflow', 'arrowcol-dataflow-rust']]) {
     for (const name of sdkMetricFamilies) {
@@ -62,12 +62,6 @@ export function requiredMetrics(scope: 'source-sdk' | 'service-qualification', b
     for (const job of ['delta-maintenance', 'tenant-stream']) {
       metrics.push({ name: `${job}:scrape`, query: `min(up{job="${job}"})`, allowZero: false });
     }
-  }
-  if (bridgeEnabled) {
-    for (const name of ['pending_files', 'lag_versions', 'lag_seconds', 'degraded_tables']) {
-      metrics.push({ name: `kusto_bridge_${name}`, query: `sum(kusto_bridge_${name})`, allowZero: true });
-    }
-    metrics.push({ name: 'bridge_scrape', query: 'min(up{job="kusto-bridge"})', allowZero: false });
   }
   return metrics;
 }

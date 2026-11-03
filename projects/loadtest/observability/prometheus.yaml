@@ -27,10 +27,6 @@ scrape_configs:
     static_configs:
       - targets: ["cadvisor:8080"]
 
-  - job_name: kusto-bridge
-    static_configs:
-      - targets: ["kusto-bridge:9464"]
-
   - job_name: delta-maintenance
     static_configs:
       - targets: ["delta-maintenance:9467"]
