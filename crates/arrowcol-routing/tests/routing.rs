@@ -1271,3 +1271,29 @@ async fn collector_state_is_monotone_across_same_instance_writers() {
         .unwrap_or_else(|error| panic!("load view: {error}"));
     assert_eq!(view.collectors[&collector].state, CollectorState::Stopped);
 }
+
+#[tokio::test]
+async fn registration_refresh_keeps_published_pressure_for_new_claims() {
+    let (store, _, _) = seeded_store().await;
+    let view = store
+        .load_view(millis(100_000))
+        .await
+        .unwrap_or_else(|error| panic!("load view: {error}"));
+    for (instance_id, record) in &view.collectors {
+        let port = record.registration.flight_endpoint.port();
+        store
+            .register_collector(&registration(*instance_id, port, 20_000))
+            .await
+            .unwrap_or_else(|error| panic!("refresh registration: {error}"));
+    }
+    let engine = long_lease_engine(&store);
+    engine
+        .refresh(millis(100_000))
+        .await
+        .unwrap_or_else(|error| panic!("refresh: {error}"));
+    let route = engine
+        .route_ingest(&metadata(), millis(100_001))
+        .await
+        .unwrap_or_else(|error| panic!("claim after registration refresh: {error}"));
+    assert_eq!(route.source, RouteSource::LeaseClaim);
+}

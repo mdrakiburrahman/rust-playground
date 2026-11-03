@@ -23,7 +23,7 @@ groups:
             config:
               storage:
                 file:
-                  base_uri: /onelake/otap
+                  base_uri: /data/otap
               writer_options:
                 target_rows_per_file: 100000
                 flush_when_older_than: 5s

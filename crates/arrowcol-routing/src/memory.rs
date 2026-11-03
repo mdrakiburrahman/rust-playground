@@ -98,6 +98,7 @@ impl RoutingStore for MemoryRoutingStore {
         registration.validate()?;
         let mut state = self.state.lock().await;
         let mut registration = registration.clone();
+        let mut pressure = None;
         if let Some(existing) = state.collectors.get(&registration.instance_id) {
             if existing.state != CollectorState::Ready {
                 return Err(RoutingError::new(
@@ -111,13 +112,14 @@ impl RoutingStore for MemoryRoutingStore {
             registration.lease_expires_at_unix_ms = registration
                 .lease_expires_at_unix_ms
                 .max(existing.registration.lease_expires_at_unix_ms);
+            pressure = existing.pressure.clone();
         }
         state.collectors.insert(
             registration.instance_id,
             CollectorRecord {
                 registration,
                 state: CollectorState::Ready,
-                pressure: None,
+                pressure,
             },
         );
         Ok(())

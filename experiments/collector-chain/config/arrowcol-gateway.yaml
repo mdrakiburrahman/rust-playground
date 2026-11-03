@@ -33,7 +33,7 @@ groups:
           delta:
             type: exporter:arrow_deltalake
             config:
-              base_path: /onelake/arrowcol
+              base_path: /data/arrowcol
               routing:
                 type: standalone
               commit:

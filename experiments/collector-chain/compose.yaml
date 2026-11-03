@@ -62,7 +62,7 @@ services:
       - *config
       - type: bind
         source: ${CHAIN_DELTA_HOST_PATH:?Run through Nx}/arrowcol
-        target: /onelake/arrowcol
+        target: /data/arrowcol
         bind:
           create_host_path: false
 
@@ -77,7 +77,7 @@ services:
       - *config
       - type: bind
         source: ${CHAIN_DELTA_HOST_PATH:?Run through Nx}/otap
-        target: /onelake/otap
+        target: /data/otap
         bind:
           create_host_path: false
 
