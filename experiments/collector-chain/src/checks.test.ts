@@ -7,8 +7,12 @@ const expect = { clients: 2, dmvTables: 1, rows: 5, signals: 3 };
 const log = (rows: number, commits: TableLog['commits'] = []): TableLog => ({ commits, activeFiles: commits.length, rows });
 
 test('parseOptions applies defaults and rejects out-of-range values', () => {
-  assert.deepEqual(parseOptions([]), { clients: 3, rows: 100, signals: 10, keep: false, help: false });
+  assert.deepEqual(parseOptions([]),
+    { clients: 3, rows: 100, signals: 10, keep: false, stream: false, interval: 10, kustoPort: 8080, help: false });
+  assert.deepEqual(parseOptions(['--stream', '--interval', '5']),
+    { clients: 3, rows: 100, signals: 10, keep: true, stream: true, interval: 5, kustoPort: 8080, help: false });
   assert.throws(() => parseOptions(['--clients', '0']), /--clients/);
+  assert.throws(() => parseOptions(['--interval', '5']), /needs --stream/);
   assert.throws(() => parseOptions(['--bogus']));
 });
 

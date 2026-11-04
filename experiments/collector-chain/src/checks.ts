@@ -12,6 +12,9 @@ export interface Options {
   readonly signals: number;
   readonly out?: string;
   readonly keep: boolean;
+  readonly stream: boolean;
+  readonly interval: number;
+  readonly kustoPort: number;
   readonly help: boolean;
 }
 
@@ -25,11 +28,14 @@ export interface Row {
 
 export const HELP = `Usage: npx nx run collector-chain-experiment:run -- [flags]
 
-  --clients <n>  Concurrent clients, spread over ${MIDDLES} middles per chain (default 3, 1-12)
-  --rows <n>     Rows per DMV table per client (default 100, 1-100000)
-  --signals <n>  Logs, spans and counter adds per client (default 10, 1-10000)
-  --out <dir>    Report and Delta directory (default .temp/experiments/collector-chain/<runId>)
-  --keep         Leave the stack running for exploration`;
+  --clients <n>     Concurrent clients, spread over ${MIDDLES} middles per chain (default 3, 1-12)
+  --rows <n>        Rows per DMV table per client (default 100, 1-100000)
+  --signals <n>     Logs, spans and counter adds per client (default 10, 1-10000)
+  --out <dir>       Report and Delta directory (default .temp/experiments/collector-chain/<runId>)
+  --keep            Leave the stack running and publish Kusto on 127.0.0.1:<kusto-port>
+  --stream          --keep, and keep the same clients sending a round every --interval seconds
+  --interval <s>    Seconds between streaming rounds (default 10, 1-3600)
+  --kusto-port <n>  Host port for Kusto with --keep or --stream (default 8080)`;
 
 function bounded(name: string, value: string | undefined, fallback: number, max: number): number {
   if (value === undefined) return fallback;
@@ -45,14 +51,19 @@ export function parseOptions(argv: readonly string[]): Options {
     options: {
       clients: { type: 'string' }, rows: { type: 'string' }, signals: { type: 'string' },
       out: { type: 'string' }, keep: { type: 'boolean', default: false }, help: { type: 'boolean', default: false },
+      stream: { type: 'boolean', default: false }, interval: { type: 'string' }, 'kusto-port': { type: 'string' },
     },
   });
+  if (values.interval !== undefined && !values.stream) throw new Error('--interval needs --stream');
   return {
     clients: bounded('clients', values.clients, 3, 12),
     rows: bounded('rows', values.rows, 100, 100_000),
     signals: bounded('signals', values.signals, 10, 10_000),
     ...(values.out ? { out: values.out } : {}),
-    keep: values.keep,
+    keep: values.keep || values.stream,
+    stream: values.stream,
+    interval: bounded('interval', values.interval, 10, 3600),
+    kustoPort: bounded('kusto-port', values['kusto-port'], 8080, 65_535),
     help: values.help,
   };
 }

@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import { hostname } from 'node:os';
@@ -40,7 +41,10 @@ function inContainer(): boolean {
 interface Run {
   readonly options: Options;
   readonly project: string;
+  readonly out: string;
   readonly delta: string;
+  readonly files: string[];
+  readonly pids: string;
   env?: NodeJS.ProcessEnv;
   network?: string;
   ips: Record<string, string>;
@@ -50,7 +54,21 @@ interface Run {
 }
 
 function compose(state: Run, args: string[], signal: AbortSignal): Promise<string> {
-  return run('docker', ['compose', '--file', 'compose.yaml', '--project-name', state.project, ...args], signal, state.env);
+  const files = state.files.flatMap(file => ['--file', file]);
+  return run('docker', ['compose', ...files, '--project-name', state.project, ...args], signal, state.env);
+}
+
+async function hostPath(local: string, signal: AbortSignal): Promise<string> {
+  return inContainer()
+    ? mapHostPath(local, JSON.parse(await run('docker', ['inspect', '--format', '{{json .Mounts}}', hostname()], signal)))
+    : local;
+}
+
+/** `--keep` publishes Kusto on loopback so Kusto Explorer on the Docker host can connect. */
+function publishKusto(state: Run): void {
+  const file = path.join(state.out, 'compose.keep.yaml');
+  fs.writeFileSync(file, `services:\n  kusto:\n    ports: ["127.0.0.1:${state.options.kustoPort}:8080"]\n`);
+  state.files.push(file);
 }
 
 async function ip(state: Run, service: string, signal: AbortSignal): Promise<string> {
@@ -73,17 +91,15 @@ function logs(root: string): Map<string, TableLog> {
 async function stack(state: Run, ctx: StageContext): Promise<StageResult<Row>> {
   if (process.getuid?.() === 0) throw new Error('Run as a non-root user so the Delta output stays readable');
   for (const chain of ['arrowcol', 'otap']) fs.mkdirSync(path.join(state.delta, chain), { recursive: true });
-  const hostPath = async (local: string) => inContainer()
-    ? mapHostPath(local, JSON.parse(await run('docker', ['inspect', '--format', '{{json .Mounts}}', hostname()], ctx.signal)))
-    : local;
   state.env = {
     ...process.env,
     CHAIN_PROJECT: state.project,
     CHAIN_UID: String(process.getuid?.() ?? 1000),
     CHAIN_GID: String(process.getgid?.() ?? 1000),
-    CHAIN_CONFIG_HOST_PATH: await hostPath(path.join(EXPERIMENT, 'config')),
-    CHAIN_DELTA_HOST_PATH: await hostPath(state.delta),
+    CHAIN_CONFIG_HOST_PATH: await hostPath(path.join(EXPERIMENT, 'config'), ctx.signal),
+    CHAIN_DELTA_HOST_PATH: await hostPath(state.delta, ctx.signal),
   };
+  if (state.options.keep) publishKusto(state);
   say(`Starting ${state.project}: ${MIDDLES} middles and a gateway per chain, plus Kustainer.`);
   await compose(state, ['up', '--detach', '--wait', '--wait-timeout', '480'], ctx.signal);
   if (inContainer()) {
@@ -177,12 +193,56 @@ async function batched(state: Run): Promise<StageResult<Row>> {
   };
 }
 
+/** Restarts the verified clients, same IDs, as detached processes that keep sending after this process exits. */
+async function stream(state: Run, ctx: StageContext): Promise<StageResult<Row>> {
+  const { rows, signals, interval } = state.options;
+  say(`Restarting the ${state.clientIds.length} clients with the same IDs; each sends a round every ${interval}s.`);
+  const pids = state.clientIds.map((clientId, index) => {
+    const middle = index % MIDDLES + 1;
+    const log = fs.openSync(path.join(state.out, `client-${index + 1}.log`), 'a');
+    try {
+      const child = spawn(CLIENT, [
+        '--arrow-endpoint', `http://${state.ips[`arrowcol-middle-${middle}`]}:32310`,
+        '--otlp-endpoint', `http://${state.ips[`otapcol-middle-${middle}`]}:4318`,
+        '--rows', String(rows), '--signals', String(signals), '--client-id', clientId, '--interval', String(interval),
+      ], { detached: true, stdio: ['ignore', log, log] });
+      child.unref();
+      if (child.pid === undefined) throw new Error(`could not start client ${clientId}`);
+      return child.pid;
+    } finally {
+      fs.closeSync(log);
+    }
+  });
+  fs.writeFileSync(state.pids, `${pids.join('\n')}\n`);
+  const next = { ...expectation(state), rows: 2 * rows, signals: 2 * signals };
+  for (;;) {
+    const pending = pendingFlush(logs(path.join(state.delta, 'arrowcol')), logs(path.join(state.delta, 'otap')), next);
+    if (pending.length === 0)
+      return { status: 'passed', summary: `every client sent a second round through both chains and keeps sending every ${interval}s` };
+    if (Date.now() + 2000 >= ctx.deadline) return { status: 'failed', summary: `no second round yet: ${pending.slice(0, 5).join('; ')}` };
+    await sleep(2000, undefined, { signal: ctx.signal });
+  }
+}
+
 async function teardown(state: Run, signal: AbortSignal): Promise<void> {
   if (!state.env) return;
   if (state.options.keep) {
-    say(`Left ${state.project} running (Kusto at http://${state.ips.kusto ?? '?'}:8080). Remove it with:\n` +
-      `  ${state.network ? `docker network disconnect ${state.network} $(hostname) && ` : ''}` +
-      `docker compose -p ${state.project} down -v`);
+    const { interval, kustoPort } = state.options;
+    const streaming = fs.existsSync(state.pids);
+    const stop = [
+      ...(streaming ? [`kill $(cat ${state.pids})`] : []),
+      ...(state.network ? [`docker network disconnect ${state.network} $(hostname)`] : []),
+      `docker compose -p ${state.project} down -v --remove-orphans`,
+    ];
+    say([
+      `Left ${state.project} running.`,
+      `  Kusto:     http://localhost:${kustoPort} on the Docker host, http://${state.ips.kusto ?? '?'}:8080 from this devcontainer`,
+      '             database NetDefaultDB, external tables dmv_* and otap_*',
+      streaming
+        ? `  Clients:   ${state.clientIds.join(', ')} send a round every ${interval}s; logs in ${path.join(state.out, 'client-*.log')}`
+        : `  Clients:   ${state.clientIds.join(', ')} sent one round; rerun with --stream to keep data flowing`,
+      `  Tear down: ${stop.join('; ')}`,
+    ].join('\n'));
     return;
   }
   if (state.network) await run('docker', ['network', 'disconnect', '--force', state.network, hostname()], signal).catch(() => undefined);
@@ -195,7 +255,8 @@ export async function main(argv: readonly string[]): Promise<number> {
   const runId = `${new Date().toISOString().replace(/[-:]/g, '').slice(0, 15).toLowerCase()}-${randomBytes(2).toString('hex')}`;
   const out = path.resolve(options.out ?? path.join(WORKSPACE, '.temp/experiments/collector-chain', runId));
   const state: Run = {
-    options, project: `collector-chain-${runId}`, delta: path.join(out, 'delta'), ips: {}, clientIds: [], dmvTables: 0,
+    options, project: `collector-chain-${runId}`, out, delta: path.join(out, 'delta'), files: [path.join(EXPERIMENT, 'compose.yaml')],
+    pids: path.join(out, 'clients.pid'), ips: {}, clientIds: [], dmvTables: 0,
   };
   const interrupt = new AbortController();
   const stop = () => interrupt.abort(new Error('interrupted'));
@@ -218,6 +279,7 @@ export async function main(argv: readonly string[]): Promise<number> {
         { name: 'flush', timeoutMs: 3 * 60_000, run: ctx => flush(state, ctx) },
         { name: 'kusto', timeoutMs: 5 * 60_000, run: ctx => kusto(state, ctx) },
         { name: 'batching', timeoutMs: 60_000, run: () => batched(state) },
+        ...(options.stream ? [{ name: 'stream', timeoutMs: 3 * 60_000 + options.interval * 1000, run: (ctx: StageContext) => stream(state, ctx) }] : []),
       ],
       cleanup: ctx => teardown(state, ctx.signal),
     }, { outDir: out, timeoutMs: 30 * 60_000, signal: interrupt.signal, cleanupTimeoutMs: 2 * 60_000, output: markdown => console.log(markdown) });
