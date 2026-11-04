@@ -7,10 +7,15 @@ const expect = { clients: 2, dmvTables: 1, rows: 5, signals: 3 };
 const log = (rows: number, commits: TableLog['commits'] = []): TableLog => ({ commits, activeFiles: commits.length, rows });
 
 test('parseOptions applies defaults and rejects out-of-range values', () => {
-  assert.deepEqual(parseOptions([]),
-    { clients: 3, rows: 100, signals: 10, keep: false, stream: false, interval: 10, kustoPort: 8080, uiPort: 8090, help: false });
-  assert.deepEqual(parseOptions(['--stream', '--interval', '5']),
-    { clients: 3, rows: 100, signals: 10, keep: true, stream: true, interval: 5, kustoPort: 8080, uiPort: 8090, help: false });
+  assert.deepEqual(parseOptions([]), {
+    clients: 3, rows: 100, signals: 10, keep: false, stream: false, interval: 10, kustoPort: 8080, uiPort: 8090, down: false, help: false,
+  });
+  assert.deepEqual(parseOptions(['--stream', '--interval', '5']), {
+    clients: 3, rows: 100, signals: 10, keep: true, stream: true, interval: 5, kustoPort: 8080, uiPort: 8090, down: false, help: false,
+  });
+  assert.equal(parseOptions(['--down']).down, true);
+  assert.throws(() => parseOptions(['--down', '--stream']), /--down takes no other flags/);
+  assert.throws(() => parseOptions(['--down', '--clients', '4']), /--down takes no other flags/);
   assert.throws(() => parseOptions(['--clients', '0']), /--clients/);
   assert.throws(() => parseOptions(['--interval', '5']), /needs --stream/);
   assert.throws(() => parseOptions(['--keep', '--ui-port', '8080']), /must differ/);

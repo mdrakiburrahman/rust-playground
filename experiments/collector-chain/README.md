@@ -9,6 +9,7 @@ Design and diagram: [docs/experiments/collector-chain](../../docs/experiments/co
 npx nx run collector-chain-experiment:run
 npx nx run collector-chain-experiment:run -- --clients 6 --keep
 npx nx run collector-chain-experiment:run -- --stream
+npx nx run collector-chain-experiment:down
 ```
 
 | Flag | Default | Meaning |
@@ -17,11 +18,12 @@ npx nx run collector-chain-experiment:run -- --stream
 | `--rows <n>` | 100 | Rows per DMV table per client. |
 | `--signals <n>` | 10 | Logs, spans and counter adds per client. |
 | `--out <dir>` | `.temp/experiments/collector-chain/<runId>` | Report, client output and Delta tables. |
-| `--keep` | off | Leave the stack running, publish Kusto and the kusto-explorer browser UI on `127.0.0.1`, and print the teardown command. |
+| `--keep` | off | Leave the stack running, publish Kusto and the kusto-explorer browser UI on `127.0.0.1`, and print the teardown command. Replaces an earlier run that publishes the same ports. |
 | `--stream` | off | `--keep`, and keep the same clients sending a round every `--interval` seconds. |
 | `--interval <s>` | 10 | Seconds between streaming rounds (1-3600). Needs `--stream`. |
 | `--kusto-port <n>` | 8080 | Host port for Kusto with `--keep` or `--stream`. |
 | `--ui-port <n>` | 8090 | Host port for kusto-explorer with `--keep` or `--stream`. |
+| `--down` | off | Stop the clients and remove every stack that `--keep` or `--stream` left behind, then exit. Takes no other flag; the `down` target runs it without the image and cargo builds. |
 
 | Stage | Pass condition |
 | --- | --- |
@@ -58,5 +60,9 @@ External tables read the Delta log at query time, so streamed rounds show up on 
 external_table('otap_logs') | summarize count()
 ```
 
-The run prints the exact teardown command. It stops the streaming clients and removes the stack.
+The run prints the teardown command, `npx nx run collector-chain-experiment:down`. It stops the
+streaming clients and removes every stack that `--keep` or `--stream` left behind. To restart, just
+run `--stream` again: it replaces the earlier stack that holds the same host ports, and stops that
+stack's clients first. A container that is not part of this experiment is never touched; if it holds
+a port, the run stops with its name, and `--kusto-port` and `--ui-port` choose other ports.
 A long stream writes many small Delta commits with no compaction, so queries slow down after hours.

@@ -16,6 +16,7 @@ export interface Options {
   readonly interval: number;
   readonly kustoPort: number;
   readonly uiPort: number;
+  readonly down: boolean;
   readonly help: boolean;
 }
 
@@ -37,7 +38,11 @@ export const HELP = `Usage: npx nx run collector-chain-experiment:run -- [flags]
   --stream          --keep, and keep the same clients sending a round every --interval seconds
   --interval <s>    Seconds between streaming rounds (default 10, 1-3600)
   --kusto-port <n>  Host port for Kusto with --keep or --stream (default 8080)
-  --ui-port <n>     Host port for kusto-explorer with --keep or --stream (default 8090)`;
+  --ui-port <n>     Host port for kusto-explorer with --keep or --stream (default 8090)
+  --down            Stop the clients and remove every stack that --keep or --stream left behind, then exit.
+                    Run it as 'npx nx run collector-chain-experiment:down' to skip the image and cargo builds.
+
+A new --keep or --stream run replaces an earlier one that publishes the same host ports.`;
 
 function bounded(name: string, value: string | undefined, fallback: number, max: number): number {
   if (value === undefined) return fallback;
@@ -54,9 +59,11 @@ export function parseOptions(argv: readonly string[]): Options {
       clients: { type: 'string' }, rows: { type: 'string' }, signals: { type: 'string' },
       out: { type: 'string' }, keep: { type: 'boolean', default: false }, help: { type: 'boolean', default: false },
       stream: { type: 'boolean', default: false }, interval: { type: 'string' }, 'kusto-port': { type: 'string' },
-      'ui-port': { type: 'string' },
+      'ui-port': { type: 'string' }, down: { type: 'boolean', default: false },
     },
   });
+  if (values.down && Object.entries(values).some(([name, value]) => name !== 'down' && name !== 'help' && value !== false))
+    throw new Error('--down takes no other flags');
   if (values.interval !== undefined && !values.stream) throw new Error('--interval needs --stream');
   const kustoPort = bounded('kusto-port', values['kusto-port'], 8080, 65_535);
   const uiPort = bounded('ui-port', values['ui-port'], 8090, 65_535);
@@ -71,6 +78,7 @@ export function parseOptions(argv: readonly string[]): Options {
     interval: bounded('interval', values.interval, 10, 3600),
     kustoPort,
     uiPort,
+    down: values.down,
     help: values.help,
   };
 }

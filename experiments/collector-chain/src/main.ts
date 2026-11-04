@@ -14,6 +14,7 @@ import {
 } from './checks.js';
 import { deltaTables, readLog, type TableLog } from './delta.js';
 import { Kusto, kql, type Row as KustoRow } from './kusto.js';
+import { PROJECT, clientPids, networkAddresses, parseContainers, portConflicts, type Container } from './stacks.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const EXPERIMENT = path.resolve(HERE, '..');
@@ -31,13 +32,60 @@ function say(message: string): void {
 
 async function run(command: string, args: string[], signal: AbortSignal, env?: NodeJS.ProcessEnv): Promise<string> {
   const result = await runProcess(command, args, { signal, cwd: EXPERIMENT, ...(env ? { env } : {}) });
-  if (result.exitCode !== 0)
-    throw new Error(`${command} ${args.join(' ')} exited ${result.exitCode ?? result.signal}:\n${result.stderr || result.stdout}`);
+  if (result.exitCode !== 0) {
+    const detail = (result.stderr || result.stdout).trimEnd().split('\n').slice(-20).join('\n');
+    throw new Error(`${command} ${args.join(' ')} exited ${result.exitCode ?? result.signal}:\n${detail}`);
+  }
   return result.stdout;
 }
 
 function inContainer(): boolean {
   return fs.existsSync('/.dockerenv') || Boolean(process.env.REMOTE_CONTAINERS_IPC);
+}
+
+/** Runs `command` where every process of this container is visible, even when this harness runs in a PID namespace of its own. */
+function fromRoot(command: string, args: string[], signal: AbortSignal): Promise<string> {
+  return inContainer() ? run('docker', ['exec', hostname(), command, ...args], signal) : run(command, args, signal);
+}
+
+async function containers(signal: AbortSignal): Promise<Container[]> {
+  return parseContainers(await run('docker', [
+    'ps', '--all', '--format', '{{.Names}}\t{{.Label "com.docker.compose.project"}}\t{{.Ports}}',
+  ], signal));
+}
+
+/** Stops the clients that send to `project`'s containers. A pid file only works in the PID namespace that wrote it, so match by address. */
+async function stopClients(project: string, signal: AbortSignal): Promise<void> {
+  const network = `${project}_default`;
+  if ((await run('docker', ['network', 'ls', '--filter', `name=^${network}$`, '--format', '{{.Name}}'], signal)).trim() === '') return;
+  const addresses = networkAddresses(await run('docker', [
+    'network', 'inspect', network, '--format', '{{range .Containers}}{{.IPv4Address}}{{"\\n"}}{{end}}',
+  ], signal));
+  for (let attempt = 0; ; attempt++) {
+    const pids = clientPids(await fromRoot('ps', ['-ww', '-eo', 'pid=,args='], signal), path.basename(CLIENT), addresses);
+    if (pids.length === 0) return;
+    if (attempt === 5) throw new Error(`Could not stop the clients of ${project}: pids ${pids.join(', ')}`);
+    await fromRoot('kill', [attempt < 3 ? '-TERM' : '-KILL', ...pids.map(String)], signal).catch(() => undefined);
+    await sleep(1000, undefined, { signal });
+  }
+}
+
+async function release(project: string, signal: AbortSignal): Promise<void> {
+  await stopClients(project, signal);
+  if (inContainer()) await run('docker', ['network', 'disconnect', '--force', `${project}_default`, hostname()], signal).catch(() => undefined);
+  await run('docker', ['compose', '--project-name', project, 'down', '--volumes', '--remove-orphans', '--timeout', '10'], signal);
+}
+
+/** `--keep` publishes fixed host ports, so an earlier run's stack has to go first. A container that is not ours is never touched. */
+async function replaceEarlier({ kustoPort, uiPort }: Options, signal: AbortSignal): Promise<void> {
+  const { earlier, foreign } = portConflicts(await containers(signal), [kustoPort, uiPort]);
+  if (foreign.length > 0)
+    throw new Error(`${foreign.map(({ name, port }) => `Host port ${port} is published by ${name}`).join('; ')}. ` +
+      'Stop it, or pick other ports with --kusto-port and --ui-port.');
+  for (const [project, ports] of earlier) {
+    say(`Replacing ${project}, which publishes port ${ports.join(' and ')}.`);
+    await release(project, signal);
+  }
 }
 
 interface Run {
@@ -49,6 +97,8 @@ interface Run {
   readonly pids: string;
   env?: NodeJS.ProcessEnv;
   network?: string;
+  /** Set once `stack` has passed: only then does `--keep` leave the stack behind. */
+  up: boolean;
   ips: Record<string, string>;
   kusto?: Kusto;
   clientIds: string[];
@@ -86,6 +136,7 @@ function logs(root: string): Map<string, TableLog> {
 
 async function stack(state: Run, ctx: StageContext): Promise<StageResult<Row>> {
   if (process.getuid?.() === 0) throw new Error('Run as a non-root user so the Delta output stays readable');
+  if (state.options.keep) await replaceEarlier(state.options, ctx.signal);
   for (const chain of ['arrowcol', 'otap']) fs.mkdirSync(path.join(state.delta, chain), { recursive: true });
   state.env = {
     ...process.env,
@@ -113,6 +164,7 @@ async function stack(state: Run, ctx: StageContext): Promise<StageResult<Row>> {
     try { await state.kusto.command('.show databases', ctx.signal); break; }
     catch (error) { if (ctx.signal.aborted) throw error; await sleep(2000, undefined, { signal: ctx.signal }); }
   }
+  state.up = true;
   return { status: 'passed', summary: `${2 * (MIDDLES + 1)} collectors and Kustainer are healthy` };
 }
 
@@ -266,14 +318,9 @@ async function stream(state: Run, ctx: StageContext): Promise<StageResult<Row>> 
 
 async function teardown(state: Run, signal: AbortSignal): Promise<void> {
   if (!state.env) return;
-  if (state.options.keep) {
+  if (state.options.keep && state.up) {
     const { interval, kustoPort, uiPort } = state.options;
     const streaming = fs.existsSync(state.pids);
-    const stop = [
-      ...(streaming ? [`kill $(cat ${state.pids})`] : []),
-      ...(state.network ? [`docker network disconnect ${state.network} $(hostname)`] : []),
-      `docker compose -p ${state.project} down -v --remove-orphans`,
-    ];
     say([
       `Left ${state.project} running.`,
       `  Browser:   http://localhost:${uiPort} on the Docker host, http://${state.ips['kusto-explorer'] ?? '?'}:8080 from this devcontainer`,
@@ -282,12 +329,22 @@ async function teardown(state: Run, signal: AbortSignal): Promise<void> {
       streaming
         ? `  Clients:   ${state.clientIds.join(', ')} send a round every ${interval}s; logs in ${path.join(state.out, 'client-*.log')}`
         : `  Clients:   ${state.clientIds.join(', ')} sent one round; rerun with --stream to keep data flowing`,
-      `  Tear down: ${stop.join('; ')}`,
+      '  Tear down: npx nx run collector-chain-experiment:down',
     ].join('\n'));
     return;
   }
   if (state.network) await run('docker', ['network', 'disconnect', '--force', state.network, hostname()], signal).catch(() => undefined);
   await compose(state, ['down', '--volumes', '--remove-orphans', '--timeout', '10'], signal);
+}
+
+async function down(signal: AbortSignal): Promise<number> {
+  const projects = new Set((await containers(signal)).map(({ project }) => project).filter(project => PROJECT.test(project)));
+  if (projects.size === 0) say('No collector-chain stacks are running.');
+  for (const project of projects) {
+    say(`Removing ${project}: its clients, containers and network.`);
+    await release(project, signal);
+  }
+  return 0;
 }
 
 export async function main(argv: readonly string[]): Promise<number> {
@@ -297,13 +354,14 @@ export async function main(argv: readonly string[]): Promise<number> {
   const out = path.resolve(options.out ?? path.join(WORKSPACE, '.temp/experiments/collector-chain', runId));
   const state: Run = {
     options, project: `collector-chain-${runId}`, out, delta: path.join(out, 'delta'), files: [path.join(EXPERIMENT, 'compose.yaml')],
-    pids: path.join(out, 'clients.pid'), ips: {}, clientIds: [], dmvTables: 0, externalTables: [],
+    pids: path.join(out, 'clients.pid'), up: false, ips: {}, clientIds: [], dmvTables: 0, externalTables: [],
   };
   const interrupt = new AbortController();
   const stop = () => interrupt.abort(new Error('interrupted'));
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);
   try {
+    if (options.down) return await down(interrupt.signal);
     const outcome = await runExperiment<Row>({
       id: 'collector-chain',
       title: 'Collector chaining: clients to middle collectors to one batching gateway per chain',
