@@ -39,10 +39,12 @@ npx nx run collector-chain-experiment:run -- --stream
 
 ## Explore in Kusto Explorer
 
-With `--keep` or `--stream`, connect Kusto Explorer or the Azure Data Explorer web UI to
-`http://localhost:8080` on the Docker host (for WSL Docker, from Windows), database `NetDefaultDB`.
-From inside the devcontainer, use the Kusto container IP that the run prints. External tables
-read the Delta log at query time, so streamed rounds show up on the next query.
+With `--keep` or `--stream`, connect to `http://localhost:8080` on the Docker host (for WSL Docker,
+from Windows), database `NetDefaultDB`. From inside the devcontainer, use the Kusto container IP
+that the run prints. Kustainer has no HTTPS or Entra auth: in Kusto Explorer, enable
+**Tools > Options > Connections > Allow unsafe connections**, then remove `AAD Federated Security=True`
+from the connection string ([Microsoft docs](https://learn.microsoft.com/azure/data-explorer/kusto-emulator-install#connect-to-the-emulator)).
+External tables read the Delta log at query time, so streamed rounds show up on the next query.
 
 ```kusto
 .show external tables
