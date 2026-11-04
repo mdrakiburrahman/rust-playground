@@ -15,6 +15,7 @@ export interface Options {
   readonly stream: boolean;
   readonly interval: number;
   readonly kustoPort: number;
+  readonly uiPort: number;
   readonly help: boolean;
 }
 
@@ -32,10 +33,11 @@ export const HELP = `Usage: npx nx run collector-chain-experiment:run -- [flags]
   --rows <n>        Rows per DMV table per client (default 100, 1-100000)
   --signals <n>     Logs, spans and counter adds per client (default 10, 1-10000)
   --out <dir>       Report and Delta directory (default .temp/experiments/collector-chain/<runId>)
-  --keep            Leave the stack running and publish Kusto on 127.0.0.1:<kusto-port>
+  --keep            Leave the stack running; publish Kusto and its kusto-explorer browser UI on 127.0.0.1
   --stream          --keep, and keep the same clients sending a round every --interval seconds
   --interval <s>    Seconds between streaming rounds (default 10, 1-3600)
-  --kusto-port <n>  Host port for Kusto with --keep or --stream (default 8080)`;
+  --kusto-port <n>  Host port for Kusto with --keep or --stream (default 8080)
+  --ui-port <n>     Host port for kusto-explorer with --keep or --stream (default 8090)`;
 
 function bounded(name: string, value: string | undefined, fallback: number, max: number): number {
   if (value === undefined) return fallback;
@@ -52,9 +54,13 @@ export function parseOptions(argv: readonly string[]): Options {
       clients: { type: 'string' }, rows: { type: 'string' }, signals: { type: 'string' },
       out: { type: 'string' }, keep: { type: 'boolean', default: false }, help: { type: 'boolean', default: false },
       stream: { type: 'boolean', default: false }, interval: { type: 'string' }, 'kusto-port': { type: 'string' },
+      'ui-port': { type: 'string' },
     },
   });
   if (values.interval !== undefined && !values.stream) throw new Error('--interval needs --stream');
+  const kustoPort = bounded('kusto-port', values['kusto-port'], 8080, 65_535);
+  const uiPort = bounded('ui-port', values['ui-port'], 8090, 65_535);
+  if (kustoPort === uiPort) throw new Error('--kusto-port and --ui-port must differ');
   return {
     clients: bounded('clients', values.clients, 3, 12),
     rows: bounded('rows', values.rows, 100, 100_000),
@@ -63,7 +69,8 @@ export function parseOptions(argv: readonly string[]): Options {
     keep: values.keep || values.stream,
     stream: values.stream,
     interval: bounded('interval', values.interval, 10, 3600),
-    kustoPort: bounded('kusto-port', values['kusto-port'], 8080, 65_535),
+    kustoPort,
+    uiPort,
     help: values.help,
   };
 }

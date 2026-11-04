@@ -20,6 +20,8 @@ const EXPERIMENT = path.resolve(HERE, '..');
 const WORKSPACE = path.resolve(EXPERIMENT, '../..');
 const CLIENT = path.join(WORKSPACE, 'target/release/collector-chain');
 const OTAP_TABLES = ['logs', 'spans', 'univariate_metrics', 'resource_attrs'];
+/** kusto-explorer's ID for the `Collector chain` connection in `compose.keep.yaml`. */
+const UI_CONNECTION = 'collector-chain';
 const started = Date.now();
 
 function say(message: string): void {
@@ -51,6 +53,7 @@ interface Run {
   kusto?: Kusto;
   clientIds: string[];
   dmvTables: number;
+  externalTables: string[];
 }
 
 function compose(state: Run, args: string[], signal: AbortSignal): Promise<string> {
@@ -62,13 +65,6 @@ async function hostPath(local: string, signal: AbortSignal): Promise<string> {
   return inContainer()
     ? mapHostPath(local, JSON.parse(await run('docker', ['inspect', '--format', '{{json .Mounts}}', hostname()], signal)))
     : local;
-}
-
-/** `--keep` publishes Kusto on loopback so Kusto Explorer on the Docker host can connect. */
-function publishKusto(state: Run): void {
-  const file = path.join(state.out, 'compose.keep.yaml');
-  fs.writeFileSync(file, `services:\n  kusto:\n    ports: ["127.0.0.1:${state.options.kustoPort}:8080"]\n`);
-  state.files.push(file);
 }
 
 async function ip(state: Run, service: string, signal: AbortSignal): Promise<string> {
@@ -98,16 +94,20 @@ async function stack(state: Run, ctx: StageContext): Promise<StageResult<Row>> {
     CHAIN_GID: String(process.getgid?.() ?? 1000),
     CHAIN_CONFIG_HOST_PATH: await hostPath(path.join(EXPERIMENT, 'config'), ctx.signal),
     CHAIN_DELTA_HOST_PATH: await hostPath(state.delta, ctx.signal),
+    CHAIN_KUSTO_PORT: String(state.options.kustoPort),
+    CHAIN_UI_PORT: String(state.options.uiPort),
   };
-  if (state.options.keep) publishKusto(state);
-  say(`Starting ${state.project}: ${MIDDLES} middles and a gateway per chain, plus Kustainer.`);
+  if (state.options.keep) state.files.push(path.join(EXPERIMENT, 'compose.keep.yaml'));
+  say(`Starting ${state.project}: ${MIDDLES} middles and a gateway per chain, plus Kustainer${state.options.keep ? ' and kusto-explorer' : ''}.`);
   await compose(state, ['up', '--detach', '--wait', '--wait-timeout', '480'], ctx.signal);
   if (inContainer()) {
     state.network = `${state.project}_default`;
     await run('docker', ['network', 'connect', state.network, hostname()], ctx.signal);
   }
-  for (const service of ['kusto', ...Array.from({ length: MIDDLES }, (_, i) => [`arrowcol-middle-${i + 1}`, `otapcol-middle-${i + 1}`]).flat()])
-    state.ips[service] = await ip(state, service, ctx.signal);
+  for (const service of [
+    'kusto', ...(state.options.keep ? ['kusto-explorer'] : []),
+    ...Array.from({ length: MIDDLES }, (_, i) => [`arrowcol-middle-${i + 1}`, `otapcol-middle-${i + 1}`]).flat(),
+  ]) state.ips[service] = await ip(state, service, ctx.signal);
   state.kusto = new Kusto(`http://${state.ips.kusto}:8080`);
   for (;;) {
     try { await state.kusto.command('.show databases', ctx.signal); break; }
@@ -166,6 +166,7 @@ async function kusto(state: Run, ctx: StageContext): Promise<StageResult<Row>> {
     dmv.set(name, await execute(kql.dmvClients(name), false));
   }
   for (const table of OTAP_TABLES) await execute(kql.externalTable(`otap_${table}`, `/delta/otap/${table}`), true);
+  state.externalTables = [...dmv.keys(), ...OTAP_TABLES.map(table => `otap_${table}`)];
   const otap = await execute(kql.otapClients('otap_'), false);
   const rows = clientCoverage(state.clientIds, dmv, otap, expectation(state));
   const missing = rows.filter(row => !row.ok).length;
@@ -189,6 +190,45 @@ async function batched(state: Run): Promise<StageResult<Row>> {
     status: unbatched === 0 ? 'passed' : 'failed',
     summary: unbatched === 0 ? `every gateway table holds ${clients} clients in fewer than ${clients} Delta commits`
       : `${unbatched} gateway tables committed once per client or more`,
+    rows,
+  };
+}
+
+/** The browser UI that `--keep` leaves behind answers through Kusto and lists every external table the kusto stage created. */
+async function explorer(state: Run, ctx: StageContext): Promise<StageResult<Row>> {
+  const base = `http://${state.ips['kusto-explorer']}:8080`;
+  say(`Checking kusto-explorer at ${base}: Kusto readiness and the external tables in its schema tree.`);
+  const get = async (route: string) => {
+    const response = await fetch(`${base}${route}`, { signal: ctx.signal });
+    return { status: response.status, type: response.headers.get('content-type') ?? '', body: await response.text() };
+  };
+  let ready = await get('/readyz');
+  while (ready.status !== 200 && Date.now() + 2000 < ctx.deadline) {
+    await sleep(2000, undefined, { signal: ctx.signal });
+    ready = await get('/readyz');
+  }
+  const page = await get('/');
+  const schema = await get(`/api/connections/${UI_CONNECTION}/databases/NetDefaultDB/schema`);
+  const listed = new Set(schema.status === 200
+    ? (JSON.parse(schema.body) as { externalTables: { name: string }[] }).externalTables.map(table => table.name) : []);
+  const missing = state.externalTables.filter(table => !listed.has(table));
+  const rows: Row[] = [
+    {
+      check: 'kusto-explorer ready', subject: 'GET / and /readyz', expected: 'HTML page; 200 once Kusto answers',
+      observed: `${page.status} ${page.type.split(';')[0]}; readyz ${ready.status}`,
+      ok: page.status === 200 && page.type.startsWith('text/html') && ready.status === 200,
+    },
+    {
+      check: 'kusto-explorer schema', subject: 'NetDefaultDB', expected: `${state.externalTables.length} external tables listed`,
+      observed: schema.status !== 200 ? `HTTP ${schema.status}` : missing.length === 0 ? `${listed.size} listed` : `missing ${missing.join(', ')}`,
+      ok: schema.status === 200 && missing.length === 0,
+    },
+  ];
+  const failed = rows.filter(row => !row.ok).length;
+  return {
+    status: failed === 0 ? 'passed' : 'failed',
+    summary: failed === 0 ? `kusto-explorer reaches Kusto and lists all ${state.externalTables.length} external tables`
+      : `${failed} kusto-explorer checks failed`,
     rows,
   };
 }
@@ -227,7 +267,7 @@ async function stream(state: Run, ctx: StageContext): Promise<StageResult<Row>> 
 async function teardown(state: Run, signal: AbortSignal): Promise<void> {
   if (!state.env) return;
   if (state.options.keep) {
-    const { interval, kustoPort } = state.options;
+    const { interval, kustoPort, uiPort } = state.options;
     const streaming = fs.existsSync(state.pids);
     const stop = [
       ...(streaming ? [`kill $(cat ${state.pids})`] : []),
@@ -236,6 +276,7 @@ async function teardown(state: Run, signal: AbortSignal): Promise<void> {
     ];
     say([
       `Left ${state.project} running.`,
+      `  Browser:   http://localhost:${uiPort} on the Docker host, http://${state.ips['kusto-explorer'] ?? '?'}:8080 from this devcontainer`,
       `  Kusto:     http://localhost:${kustoPort} on the Docker host, http://${state.ips.kusto ?? '?'}:8080 from this devcontainer`,
       '             database NetDefaultDB, external tables dmv_* and otap_*',
       streaming
@@ -256,7 +297,7 @@ export async function main(argv: readonly string[]): Promise<number> {
   const out = path.resolve(options.out ?? path.join(WORKSPACE, '.temp/experiments/collector-chain', runId));
   const state: Run = {
     options, project: `collector-chain-${runId}`, out, delta: path.join(out, 'delta'), files: [path.join(EXPERIMENT, 'compose.yaml')],
-    pids: path.join(out, 'clients.pid'), ips: {}, clientIds: [], dmvTables: 0,
+    pids: path.join(out, 'clients.pid'), ips: {}, clientIds: [], dmvTables: 0, externalTables: [],
   };
   const interrupt = new AbortController();
   const stop = () => interrupt.abort(new Error('interrupted'));
@@ -279,6 +320,7 @@ export async function main(argv: readonly string[]): Promise<number> {
         { name: 'flush', timeoutMs: 3 * 60_000, run: ctx => flush(state, ctx) },
         { name: 'kusto', timeoutMs: 5 * 60_000, run: ctx => kusto(state, ctx) },
         { name: 'batching', timeoutMs: 60_000, run: () => batched(state) },
+        ...(options.keep ? [{ name: 'explorer', timeoutMs: 2 * 60_000, run: (ctx: StageContext) => explorer(state, ctx) }] : []),
         ...(options.stream ? [{ name: 'stream', timeoutMs: 3 * 60_000 + options.interval * 1000, run: (ctx: StageContext) => stream(state, ctx) }] : []),
       ],
       cleanup: ctx => teardown(state, ctx.signal),

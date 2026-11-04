@@ -17,10 +17,11 @@ npx nx run collector-chain-experiment:run -- --stream
 | `--rows <n>` | 100 | Rows per DMV table per client. |
 | `--signals <n>` | 10 | Logs, spans and counter adds per client. |
 | `--out <dir>` | `.temp/experiments/collector-chain/<runId>` | Report, client output and Delta tables. |
-| `--keep` | off | Leave the stack running, publish Kusto on `127.0.0.1:<kusto-port>` and print the teardown command. |
+| `--keep` | off | Leave the stack running, publish Kusto and the kusto-explorer browser UI on `127.0.0.1`, and print the teardown command. |
 | `--stream` | off | `--keep`, and keep the same clients sending a round every `--interval` seconds. |
 | `--interval <s>` | 10 | Seconds between streaming rounds (1-3600). Needs `--stream`. |
 | `--kusto-port <n>` | 8080 | Host port for Kusto with `--keep` or `--stream`. |
+| `--ui-port <n>` | 8090 | Host port for kusto-explorer with `--keep` or `--stream`. |
 
 | Stage | Pass condition |
 | --- | --- |
@@ -29,6 +30,7 @@ npx nx run collector-chain-experiment:run -- --stream
 | `flush` | Every DMV table and every OTAP signal table has a Delta commit with the expected rows. |
 | `kusto` | `kind=delta` external tables over the gateway output return the expected rows for every client ID, and no unknown IDs. |
 | `batching` | Each gateway table holds every client's data in fewer Delta commits than there are clients. |
+| `explorer` | With `--keep` or `--stream` only: kusto-explorer serves its page, reaches Kusto, and lists every external table the `kusto` stage created. |
 | `stream` | With `--stream` only: the clients restart with the same IDs as detached processes, and a second round reaches both gateways' Delta tables. |
 
 | Exit code | Meaning |
@@ -37,13 +39,18 @@ npx nx run collector-chain-experiment:run -- --stream
 | 1 | A check failed; the report in the output directory shows which. |
 | 2 | The run errored (stack, client or timeout). |
 
-## Explore in Kusto Explorer
+## Explore the data
 
-With `--keep` or `--stream`, connect to `http://localhost:8080` on the Docker host (for WSL Docker,
-from Windows), database `NetDefaultDB`. From inside the devcontainer, use the Kusto container IP
-that the run prints. Kustainer has no HTTPS or Entra auth: in Kusto Explorer, enable
-**Tools > Options > Connections > Allow unsafe connections**, then remove `AAD Federated Security=True`
-from the connection string ([Microsoft docs](https://learn.microsoft.com/azure/data-explorer/kusto-emulator-install#connect-to-the-emulator)).
+With `--keep` or `--stream`, open `http://localhost:8090` in a browser on the Docker host (for WSL
+Docker, on Windows). This is the repo's [kusto-explorer](../../projects/kusto-explorer/README.md),
+with the `Collector chain` connection and the `NetDefaultDB` database preselected.
+`compose.keep.yaml` pins its published image, so `--keep` needs no local UI build. From inside the
+devcontainer, use the container IPs that the run prints.
+
+Kusto itself is on `http://localhost:8080` for Kusto Explorer and other clients. Kustainer has no
+HTTPS or Entra auth: in Kusto Explorer, enable **Tools > Options > Connections > Allow unsafe connections**,
+then remove `AAD Federated Security=True` from the connection string
+([Microsoft docs](https://learn.microsoft.com/azure/data-explorer/kusto-emulator-install#connect-to-the-emulator)).
 External tables read the Delta log at query time, so streamed rounds show up on the next query.
 
 ```kusto

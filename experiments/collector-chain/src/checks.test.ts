@@ -8,11 +8,12 @@ const log = (rows: number, commits: TableLog['commits'] = []): TableLog => ({ co
 
 test('parseOptions applies defaults and rejects out-of-range values', () => {
   assert.deepEqual(parseOptions([]),
-    { clients: 3, rows: 100, signals: 10, keep: false, stream: false, interval: 10, kustoPort: 8080, help: false });
+    { clients: 3, rows: 100, signals: 10, keep: false, stream: false, interval: 10, kustoPort: 8080, uiPort: 8090, help: false });
   assert.deepEqual(parseOptions(['--stream', '--interval', '5']),
-    { clients: 3, rows: 100, signals: 10, keep: true, stream: true, interval: 5, kustoPort: 8080, help: false });
+    { clients: 3, rows: 100, signals: 10, keep: true, stream: true, interval: 5, kustoPort: 8080, uiPort: 8090, help: false });
   assert.throws(() => parseOptions(['--clients', '0']), /--clients/);
   assert.throws(() => parseOptions(['--interval', '5']), /needs --stream/);
+  assert.throws(() => parseOptions(['--keep', '--ui-port', '8080']), /must differ/);
   assert.throws(() => parseOptions(['--bogus']));
 });
 
