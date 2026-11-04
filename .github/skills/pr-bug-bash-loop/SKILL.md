@@ -54,6 +54,11 @@ Capture command output and actual exit codes without masking pipeline failures.
 Check the requested behavior, data assertions, report and cleanup, not just
 process exit. Record what the user should see after each command.
 
+Rehearse what a person does next, not only the first run. When a step can leave
+state behind (a running stack, bound ports, background processes), document and
+run it a second time without cleaning up, then run the documented teardown and
+verify nothing is left. A runbook that only works on a pristine box is not verified.
+
 ### 3. Publish the first clean pass
 
 After the complete candidate instructions work without intervention, create one
