@@ -424,8 +424,8 @@ dependencies = [
  "anyhow",
  "arrow 58.4.0",
  "async-trait",
- "delta_kernel",
- "delta_kernel_default_engine",
+ "delta_kernel 0.29.0",
+ "delta_kernel_default_engine 0.29.0",
  "fs2",
  "futures",
  "parquet 58.4.0",
@@ -2757,6 +2757,8 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "delta_kernel 0.30.1",
+ "delta_kernel_default_engine 0.30.1",
  "deltalake-core",
  "futures",
  "hdrhistogram",
@@ -2800,12 +2802,45 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "crc",
- "delta_kernel_derive",
+ "delta_kernel_derive 0.29.0",
  "derive_more",
  "indexmap 2.14.2",
  "itertools 0.14.0",
  "object_store",
  "parquet 58.4.0",
+ "percent-encoding",
+ "rand 0.9.5",
+ "reqwest 0.13.5",
+ "roaring",
+ "rustc_version",
+ "serde",
+ "serde_json",
+ "strum 0.28.0",
+ "thiserror 2.0.21",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+ "z85",
+]
+
+[[package]]
+name = "delta_kernel"
+version = "0.30.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54126a2c4de6be3940069183355206f82bb0567fb54432dfdf54ecea9d9b8f0c"
+dependencies = [
+ "arrow 59.3.0",
+ "bytes",
+ "chrono",
+ "chrono-tz",
+ "crc",
+ "delta_kernel_derive 0.30.1",
+ "derive_more",
+ "indexmap 2.14.2",
+ "itertools 0.14.0",
+ "object_store",
+ "parquet 59.3.0",
  "percent-encoding",
  "rand 0.9.5",
  "reqwest 0.13.5",
@@ -2832,10 +2867,32 @@ dependencies = [
  "async-trait",
  "bytes",
  "chrono",
- "delta_kernel",
+ "delta_kernel 0.29.0",
  "futures",
  "itertools 0.14.0",
  "reqwest 0.13.5",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "delta_kernel_default_engine"
+version = "0.30.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e15ad6ff8c6f38d0dea9dc60afd1db822625b35e29d9df85a867e6b36f0b891f"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "bytes",
+ "chrono",
+ "delta_kernel 0.30.1",
+ "futures",
+ "itertools 0.14.0",
+ "reqwest 0.13.5",
+ "rustls-native-certs",
  "serde_json",
  "tokio",
  "tracing",
@@ -2848,6 +2905,17 @@ name = "delta_kernel_derive"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ded82d61b66b8d882eb187b9f01692892c7b77579a94f663245dfda5be091fe"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "delta_kernel_derive"
+version = "0.30.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5dfb679de985e2b329db00789c7ae99914e83d18b784d0f57e1035f4d210031b"
 dependencies = [
  "proc-macro2",
  "quote",

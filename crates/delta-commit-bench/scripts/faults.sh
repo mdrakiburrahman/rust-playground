@@ -47,9 +47,9 @@ scenario() { local name=$1; mkdir -p "$WORK/$name"; echo "$BASE/$RUN_ID-$name"; 
 # 1. Crash after the log write, before the loop records success; restart and replay.
 for idem in txn scan-log; do
   n=crash-after-log-$idem; T=$(scenario $n); D=$WORK/$n
-  "$DCB" run --table-url "$T" --create --app-id inst-a --wal-dir "$D/wal" --idempotency $idem $(common) \
+  "$DCB" run ${DCB_ARGS:-} --table-url "$T" --create --app-id inst-a --wal-dir "$D/wal" --idempotency $idem $(common) \
     --fault-crash-after-log-put 20 --out "$D/r1.jsonl" 2>"$D/r1.err"
-  "$DCB" run --table-url "$T" --app-id inst-a --wal-dir "$D/wal" --idempotency $idem --rate 1 --encoders 1 --duration 3 \
+  "$DCB" run ${DCB_ARGS:-} --table-url "$T" --app-id inst-a --wal-dir "$D/wal" --idempotency $idem --rate 1 --encoders 1 --duration 3 \
     --out "$D/r2.jsonl" 2>"$D/r2.err"
   check $n "$T" "$D/wal" -- "$D/r1.sent.jsonl" "$D/r2.sent.jsonl"
 done
@@ -58,7 +58,7 @@ done
 for idem in txn scan-log; do
   for kind in timeout conflict; do
     n=ambiguous-$kind-$idem; T=$(scenario $n); D=$WORK/$n
-    "$DCB" run --table-url "$T" --create --app-id inst-a --wal-dir "$D/wal" --idempotency $idem $(common) \
+    "$DCB" run ${DCB_ARGS:-} --table-url "$T" --create --app-id inst-a --wal-dir "$D/wal" --idempotency $idem $(common) \
       --fault-ambiguous-rate 0.2 --fault-ambiguous-kind $kind --out "$D/r1.jsonl" 2>"$D/r1.err"
     check $n "$T" "$D/wal" -- "$D/r1.sent.jsonl"
   done
@@ -66,12 +66,12 @@ done
 
 # 4. Injected 503s on log requests (after the Azure client's own retries are exhausted).
 n=errors-503-log; T=$(scenario $n); D=$WORK/$n
-"$DCB" run --table-url "$T" --create --app-id inst-a --wal-dir "$D/wal" $(common) \
+"$DCB" run ${DCB_ARGS:-} --table-url "$T" --create --app-id inst-a --wal-dir "$D/wal" $(common) \
   --fault-error-rate 0.1 --fault-scope log --out "$D/r1.jsonl" 2>"$D/r1.err"
 check $n "$T" "$D/wal" -- "$D/r1.sent.jsonl"
 
 n=throttle-200ms-log; T=$(scenario $n); D=$WORK/$n
-"$DCB" run --table-url "$T" --create --app-id inst-a --wal-dir "$D/wal" $(common) \
+"$DCB" run ${DCB_ARGS:-} --table-url "$T" --create --app-id inst-a --wal-dir "$D/wal" $(common) \
   --fault-delay-ms 200 --fault-scope log --out "$D/r1.jsonl" 2>"$D/r1.err"
 check $n "$T" "$D/wal" -- "$D/r1.sent.jsonl"
 
@@ -80,11 +80,11 @@ check $n "$T" "$D/wal" -- "$D/r1.sent.jsonl"
 for point in before after; do
   for mode in no-adopt adopt; do
     n=identity-change-$mode-crash-$point; T=$(scenario $n); D=$WORK/$n
-    "$DCB" run --table-url "$T" --create --app-id inst-a --wal-dir "$D/wal" $(common) \
+    "$DCB" run ${DCB_ARGS:-} --table-url "$T" --create --app-id inst-a --wal-dir "$D/wal" $(common) \
       --fault-crash-$point-log-put 20 --out "$D/r1.jsonl" 2>"$D/r1.err"
     extra=()
     [ $mode = adopt ] && extra=(--adopt-from inst-a)
-    "$DCB" run --table-url "$T" --app-id inst-b --wal-dir "$D/wal" "${extra[@]}" --rate 1 --encoders 1 --duration 3 \
+    "$DCB" run ${DCB_ARGS:-} --table-url "$T" --app-id inst-b --wal-dir "$D/wal" "${extra[@]}" --rate 1 --encoders 1 --duration 3 \
       --out "$D/r2.jsonl" 2>"$D/r2.err"
     check $n "$T" "$D/wal" -- "$D/r1.sent.jsonl" "$D/r2.sent.jsonl"
   done
@@ -92,9 +92,9 @@ done
 
 # Crash before the log write with the same identity: replay must commit the pending manifest.
 n=crash-before-log-txn; T=$(scenario $n); D=$WORK/$n
-"$DCB" run --table-url "$T" --create --app-id inst-a --wal-dir "$D/wal" $(common) \
+"$DCB" run ${DCB_ARGS:-} --table-url "$T" --create --app-id inst-a --wal-dir "$D/wal" $(common) \
   --fault-crash-before-log-put 20 --out "$D/r1.jsonl" 2>"$D/r1.err"
-"$DCB" run --table-url "$T" --app-id inst-a --wal-dir "$D/wal" --rate 1 --encoders 1 --duration 3 \
+"$DCB" run ${DCB_ARGS:-} --table-url "$T" --app-id inst-a --wal-dir "$D/wal" --rate 1 --encoders 1 --duration 3 \
   --out "$D/r2.jsonl" 2>"$D/r2.err"
 check $n "$T" "$D/wal" -- "$D/r1.sent.jsonl" "$D/r2.sent.jsonl"
 
@@ -104,15 +104,15 @@ check $n "$T" "$D/wal" -- "$D/r1.sent.jsonl" "$D/r2.sent.jsonl"
 n=zombie-fence; T=$(scenario $n); D=$WORK/$n
 # B adopts from its own copy of A's WAL (replicated or reattached disk), so A keeps running on resume.
 copy_a_wal() { mkdir -p "$D/wal-b"; cp -r "$D"/wal/inst-a_* "$D/wal-b/"; }
-"$DCB" run --table-url "$T" --create --app-id inst-a --wal-dir "$D/wal" $(common) \
+"$DCB" run ${DCB_ARGS:-} --table-url "$T" --create --app-id inst-a --wal-dir "$D/wal" $(common) \
   --fault-delay-ms 150 --fault-scope log --out "$D/r1.jsonl" 2>"$D/r1.err" &
 A=$!
 sleep 5; kill -STOP $A; copy_a_wal
-"$DCB" run --table-url "$T" --app-id inst-b --wal-dir "$D/wal-b" --adopt-from inst-a --rate 1 --encoders 1 --duration 3 \
+"$DCB" run ${DCB_ARGS:-} --table-url "$T" --app-id inst-b --wal-dir "$D/wal-b" --adopt-from inst-a --rate 1 --encoders 1 --duration 3 \
   --out "$D/r2.jsonl" 2>"$D/r2.err"
 kill -CONT $A; wait $A; echo "  zombie exit=$? ($(tail -c 300 "$D/r1.err" | tr '\n' ' '))"
 copy_a_wal
-"$DCB" run --table-url "$T" --app-id inst-b --wal-dir "$D/wal-b" --adopt-from inst-a --rate 1 --encoders 1 --duration 2 \
+"$DCB" run ${DCB_ARGS:-} --table-url "$T" --app-id inst-b --wal-dir "$D/wal-b" --adopt-from inst-a --rate 1 --encoders 1 --duration 2 \
   --out "$D/r3.jsonl" 2>"$D/r3.err"
 check $n "$T" "$D/wal-b" -- "$D/r1.sent.jsonl" "$D/r2.sent.jsonl" "$D/r3.sent.jsonl"
 python3 - "$T" "$D" <<'PY'
@@ -143,15 +143,15 @@ PY
 
 # Encoder killed mid-upload (process abort after the first multipart part). The partial blob must never be referenced.
 n=crash-mid-upload; T=$(scenario $n); D=$WORK/$n
-"$DCB" run --table-url "$T" --create --app-id inst-a --wal-dir "$D/wal" $(common) --multipart \
+"$DCB" run ${DCB_ARGS:-} --table-url "$T" --create --app-id inst-a --wal-dir "$D/wal" $(common) --multipart \
   --fault-crash-mid-upload 30 --out "$D/r1.jsonl" 2>"$D/r1.err"
-"$DCB" run --table-url "$T" --app-id inst-a --wal-dir "$D/wal" --rate 1 --encoders 1 --duration 3 \
+"$DCB" run ${DCB_ARGS:-} --table-url "$T" --app-id inst-a --wal-dir "$D/wal" --rate 1 --encoders 1 --duration 3 \
   --out "$D/r2.jsonl" 2>"$D/r2.err"
 check $n "$T" "$D/wal" -- "$D/r1.sent.jsonl" "$D/r2.sent.jsonl"
 
 # 5. Concurrent compaction-style commits while appends commit.
 n=concurrent-optimize; T=$(scenario $n); D=$WORK/$n
-"$DCB" run --table-url "$T" --create --app-id inst-a --wal-dir "$D/wal" $(common) --out "$D/r1.jsonl" 2>"$D/r1.err" &
+"$DCB" run ${DCB_ARGS:-} --table-url "$T" --create --app-id inst-a --wal-dir "$D/wal" $(common) --out "$D/r1.jsonl" 2>"$D/r1.err" &
 sleep 3
 "$DCB" optimize --table-url "$T" --files 5 --every-ms 500 --duration $((DUR - 4)) --out "$D/optimize.log" 2>"$D/opt.err"
 wait

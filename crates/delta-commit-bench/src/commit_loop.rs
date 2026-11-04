@@ -1,15 +1,13 @@
 //! The per-table commit loop under test.
 
+use crate::backend::{Backend, CommitReq, DataOpts};
 use crate::store::{CounterSnapshot, Counters};
-use crate::table::{BenchTable, now_millis};
+use crate::table::now_millis;
 use crate::wal::{FileReady, Manifest, Wal};
 use anyhow::{Context, Result};
-use deltalake_core::DeltaTable;
-use deltalake_core::kernel::transaction::{CommitBuilder, CommitProperties};
-use deltalake_core::kernel::{Action, Add, Transaction};
-use deltalake_core::protocol::{DeltaOperation, SaveMode};
 use serde::Serialize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
@@ -140,7 +138,14 @@ pub struct LoopConfig {
     pub fence_on: FenceOn,
     /// Only commit this identity's pending manifests, then stop.
     pub drain_only: bool,
+    /// Abort the process right before the Nth epoch claim commit attempt (process-wide count).
+    pub crash_before_claim: Option<u64>,
+    /// Abort the process right after the Nth successful epoch claim commit (process-wide count).
+    pub crash_after_claim: Option<u64>,
 }
+
+static CLAIM_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static CLAIMS_COMMITTED: AtomicU64 = AtomicU64::new(0);
 
 /// One JSONL record per commit attempt sequence.
 #[derive(Clone, Debug, Serialize)]
@@ -185,22 +190,6 @@ fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
 }
 
-fn add_action(file: &FileReady) -> Action {
-    Action::Add(Add {
-        path: file.path.clone(),
-        partition_values: Default::default(),
-        size: file.size,
-        modification_time: file.upload_done_ms,
-        data_change: true,
-        stats: Some(format!("{{\"numRecords\":{}}}", file.rows)),
-        tags: None,
-        deletion_vector: None,
-        base_row_id: None,
-        default_row_commit_version: None,
-        clustering_provider: None,
-    })
-}
-
 /// `txn` versions at or above this mark an appId as fenced. The fence stores the fenced
 /// owner's last committed version as `FENCE_OFFSET + last + 1` (`last` = -1 if none).
 pub const FENCE_OFFSET: i64 = 1 << 62;
@@ -228,7 +217,7 @@ enum Landed {
 
 /// The commit loop for one table.
 pub struct CommitLoop {
-    table: DeltaTable,
+    table: Backend,
     counters: Arc<Counters>,
     wal: Wal,
     cfg: LoopConfig,
@@ -244,7 +233,10 @@ pub struct CommitLoop {
     last_committed: Option<i64>,
     /// Snapshot version whose log has been checked for this loop's batches and fences. Every
     /// commit up to it is either this loop's own or passed the delta-rs conflict checker, which
-    /// rejects winning commits that carry this loop's appId. While the snapshot stays at this
+    /// rejects winning commits that carry this loop's appId. With kernel there is no checker,
+    /// but none is needed: a kernel commit only lands at exactly `snapshot + 1` (put-if-absent,
+    /// no rebase), so after a commit at `verified + 1` nothing sits between the verified
+    /// snapshot and this loop's own commit. While the snapshot stays at this
     /// version, the pre-commit landed check is skipped: the kernel's `txn` lookup replays the
     /// whole log since the last checkpoint, and the scan-log check reads up to `scan_window`
     /// commits one by one.
@@ -256,7 +248,8 @@ impl CommitLoop {
     /// Build the loop and replay any pending manifests. With `adopt`, fence the previous
     /// identity in the table log, then recommit its unlanded manifests under this loop's appId.
     pub async fn start(
-        bench: BenchTable,
+        table: Backend,
+        counters: Arc<Counters>,
         wal: Wal,
         cfg: LoopConfig,
         adopt: Option<Adopt>,
@@ -264,8 +257,8 @@ impl CommitLoop {
     ) -> Result<Self> {
         let app_id = cfg.app_id.clone();
         let mut this = Self {
-            table: bench.table,
-            counters: bench.counters,
+            table,
+            counters,
             wal,
             cfg,
             app_id,
@@ -347,31 +340,28 @@ impl CommitLoop {
     }
 
     /// Commit `txns` with no data, tagged with `kind`.
-    async fn commit_txns(&mut self, txns: Vec<Transaction>, kind: &str) -> Result<()> {
-        let props = CommitProperties::default()
-            .with_application_transactions(txns)
-            .with_metadata([(KIND_KEY.to_owned(), serde_json::Value::from(kind))]);
-        let state = self.table.snapshot()?;
-        let finalized = CommitBuilder::from(props)
-            .with_actions(Vec::new())
-            .build(
-                Some(state),
-                self.table.log_store(),
-                DeltaOperation::Write {
-                    mode: SaveMode::Append,
-                    partition_by: None,
-                    predicate: None,
-                },
-            )
-            .await?;
-        self.table.state = Some(finalized.snapshot());
-        Ok(())
+    async fn commit_txns(&mut self, txns: Vec<(String, i64)>, kind: &str) -> Result<()> {
+        self.table
+            .commit(CommitReq {
+                txns,
+                files: &[],
+                kind,
+                data: None,
+            })
+            .await
+            .map(|_| ())
     }
 
     /// Claim the next epoch appId for this identity. One commit fences the identity's previous
     /// appIds and advances its epoch counter, so concurrent claims (two holders of one WAL)
     /// conflict and serialize. Afterwards no earlier appId of this identity can commit, and
     /// `own_floor` is the highest version any of them committed.
+    ///
+    /// delta-rs serializes concurrent claims through its conflict checker (both write the
+    /// `#epoch` appId). Kernel serializes them more strictly: a claim built on snapshot `v` can
+    /// only land as version `v + 1`, so every landed claim read the counter and the fenced
+    /// appIds from the immediately preceding version. A loser gets `Conflicted`, and the next
+    /// attempt re-reads everything from a refreshed snapshot.
     async fn claim(&mut self, kind: &'static str) -> Result<()> {
         let started = Instant::now();
         let base = self.cfg.app_id.clone();
@@ -390,32 +380,33 @@ impl CommitLoop {
                     // An empty appId must still be fenced: another holder may have claimed it and
                     // be about to commit. Naming it here makes that commit and this claim conflict.
                     None if app != base || self.cfg.epochs == EpochMode::Drain => {
-                        txns.push(Transaction::new_with_last_update(
-                            &app,
-                            FENCE_OFFSET,
-                            Some(now_millis()),
-                        ));
+                        txns.push((app, FENCE_OFFSET));
                     }
                     None => {}
                     Some(v) if v >= FENCE_OFFSET => floor = floor.max(decode_fence(v).unwrap_or(-1)),
                     Some(v) => {
                         floor = floor.max(v);
-                        txns.push(Transaction::new_with_last_update(
-                            &app,
-                            FENCE_OFFSET + v + 1,
-                            Some(now_millis()),
-                        ));
+                        txns.push((app, FENCE_OFFSET + v + 1));
                     }
                 }
             }
             let epoch = last_epoch + 1;
-            txns.push(Transaction::new_with_last_update(
-                &counter,
-                encode_claim(epoch, floor),
-                Some(now_millis()),
-            ));
+            txns.push((counter.clone(), encode_claim(epoch, floor)));
+            let n = CLAIM_ATTEMPTS.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.cfg.crash_before_claim == Some(n) {
+                eprintln!("fault: aborting before claim commit {n} ({kind} epoch={epoch})");
+                std::process::abort();
+            }
             match self.commit_txns(txns, "claim").await {
                 Ok(()) => {
+                    let n = CLAIMS_COMMITTED.fetch_add(1, Ordering::SeqCst) + 1;
+                    if self.cfg.crash_after_claim == Some(n) {
+                        eprintln!(
+                            "fault: aborting after claim commit {n} ({kind} epoch={epoch} claim_version={:?})",
+                            self.table.version()
+                        );
+                        std::process::abort();
+                    }
                     self.app_id = epoch_app_id(&base, epoch);
                     self.own_floor = (floor >= 0).then_some(floor);
                     self.last_committed = None;
@@ -461,10 +452,9 @@ impl CommitLoop {
     async fn previous_owner(&self) -> Result<Option<String>> {
         let latest = self.table.version().unwrap_or(0);
         let from = latest.saturating_sub(self.cfg.scan_window);
-        let log_store = self.table.log_store();
         let mine = base_of(&self.cfg.app_id).to_owned();
         for version in (from..=latest).rev() {
-            let Some(bytes) = log_store.read_commit_entry(version).await? else {
+            let Some(bytes) = self.table.read_commit_entry(version).await? else {
                 continue;
             };
             let mut kind = None;
@@ -640,12 +630,7 @@ impl CommitLoop {
     }
 
     async fn txn_version_of(&self, app_id: &str) -> Result<Option<i64>> {
-        let Ok(state) = self.table.snapshot() else {
-            return Ok(None);
-        };
-        Ok(state
-            .transaction_version(self.table.log_store().as_ref(), app_id)
-            .await?)
+        self.table.txn_version_of(app_id).await
     }
 
     async fn committed_txn_version(&self) -> Result<Option<i64>> {
@@ -659,6 +644,14 @@ impl CommitLoop {
     /// checker rejects whichever of the two loses the race with ConcurrentTransaction. Every
     /// old-owner commit is therefore either below the fence (and counted in the returned
     /// version) or rejected.
+    ///
+    /// Kernel has no conflict checker; the same holds because every kernel commit is a
+    /// put-if-absent at exactly its snapshot's version + 1. If the fence lands first at `v`, an
+    /// old-owner commit built on a snapshot below `v` targets a version at or below `v` and gets
+    /// `Conflicted`; the old owner's `resolve()` then refreshes and its landed check sees the
+    /// fence (`Landed::Fenced`). An old-owner commit built on a snapshot at or above `v` sees the
+    /// fence in its pre-commit landed check. If the old-owner commit lands first, this fence gets
+    /// `Conflicted`, and the next attempt re-reads the appId's version from a refreshed snapshot.
     async fn fence(&mut self, old_app_id: &str) -> Result<Option<i64>> {
         let mut delay = Duration::from_millis(100);
         for attempt in 1..=30 {
@@ -668,33 +661,8 @@ impl CommitLoop {
                 return Ok(decode_fence(raw));
             }
             let marker = FENCE_OFFSET + raw.unwrap_or(-1) + 1;
-            let props = CommitProperties::default()
-                .with_application_transaction(Transaction::new_with_last_update(
-                    old_app_id,
-                    marker,
-                    Some(now_millis()),
-                ))
-                .with_metadata([(KIND_KEY.to_owned(), serde_json::Value::from("fence"))]);
-            let result = match self.table.snapshot() {
-                Ok(state) => {
-                    CommitBuilder::from(props)
-                        .with_actions(Vec::new())
-                        .build(
-                            Some(state),
-                            self.table.log_store(),
-                            DeltaOperation::Write {
-                                mode: SaveMode::Append,
-                                partition_by: None,
-                                predicate: None,
-                            },
-                        )
-                        .await
-                }
-                Err(error) => Err(error),
-            };
-            match result {
-                Ok(finalized) => {
-                    self.table.state = Some(finalized.snapshot());
+            match self.commit_txns(vec![(old_app_id.to_owned(), marker)], "fence").await {
+                Ok(()) => {
                     tracing::warn!(old_app_id, last = ?raw, fence_version = ?self.table.version(), "fenced old owner");
                 }
                 Err(error) => {
@@ -710,7 +678,7 @@ impl CommitLoop {
     async fn refresh(&mut self) -> Result<()> {
         let mut delay = Duration::from_millis(50);
         for _ in 0..20 {
-            match self.table.update_incremental(None).await {
+            match self.table.refresh().await {
                 Ok(()) => return Ok(()),
                 Err(error) => {
                     tracing::warn!(%error, "refresh failed");
@@ -719,19 +687,15 @@ impl CommitLoop {
                 }
             }
         }
-        self.table
-            .update_incremental(None)
-            .await
-            .context("refresh after retries")
+        self.table.refresh().await.context("refresh after retries")
     }
 
     async fn scan_log_for(&self, path: &str) -> Result<bool> {
         let latest = self.table.version().unwrap_or(0);
         let from = latest.saturating_sub(self.cfg.scan_window);
-        let log_store = self.table.log_store();
         let needle = format!("\"path\":\"{path}\"");
         for version in (from..=latest).rev() {
-            if let Some(bytes) = log_store.read_commit_entry(version).await?
+            if let Some(bytes) = self.table.read_commit_entry(version).await?
                 && bytes.windows(needle.len()).any(|w| w == needle.as_bytes())
             {
                 return Ok(true);
@@ -882,7 +846,10 @@ impl CommitLoop {
         while attempts < self.cfg.loop_max_attempts {
             attempts += 1;
             // The conflict checker only sees commits after our snapshot. A fence already inside
-            // the snapshot must be caught here, unless the snapshot is already verified.
+            // the snapshot must be caught here, unless the snapshot is already verified. With
+            // kernel this check is the only guard: the commit below lands at exactly
+            // `snapshot + 1` or fails with `Conflicted`, and every failure goes through
+            // `resolve()` (refresh + landed check) before the next attempt.
             let verified = self.verified_through.is_some() && self.verified_through == self.table.version();
             let pre_check = if verified {
                 Ok(Landed::No)
@@ -918,41 +885,28 @@ impl CommitLoop {
                     }
                 }
             }
-            let mut props = CommitProperties::default()
-                .with_create_checkpoint(self.cfg.inline_checkpoint)
-                .with_cleanup_expired_logs(self.cfg.cleanup_expired_logs)
-                .with_max_retries(self.cfg.library_max_retries);
-            if self.cfg.idempotency == Idempotency::Txn {
-                props = props.with_application_transaction(Transaction::new_with_last_update(
-                    &self.app_id,
-                    manifest.version,
-                    Some(now_millis()),
-                ));
-            }
-            let kind = if self.owner { "owner" } else { "drain" };
-            props = props.with_metadata([(KIND_KEY.to_owned(), serde_json::Value::from(kind))]);
-            let actions = manifest.files.iter().map(add_action).collect();
-            let result = match self.table.snapshot() {
-                Ok(state) => {
-                    CommitBuilder::from(props)
-                        .with_actions(actions)
-                        .build(
-                            Some(state),
-                            self.table.log_store(),
-                            DeltaOperation::Write {
-                                mode: SaveMode::Append,
-                                partition_by: None,
-                                predicate: None,
-                            },
-                        )
-                        .await
-                }
-                Err(error) => Err(error),
+            let txns = if self.cfg.idempotency == Idempotency::Txn {
+                vec![(self.app_id.clone(), manifest.version)]
+            } else {
+                Vec::new()
             };
+            let kind = if self.owner { "owner" } else { "drain" };
+            let result = self
+                .table
+                .commit(CommitReq {
+                    txns,
+                    files: &manifest.files,
+                    kind,
+                    data: Some(DataOpts {
+                        inline_checkpoint: self.cfg.inline_checkpoint,
+                        cleanup_expired_logs: self.cfg.cleanup_expired_logs,
+                        max_retries: self.cfg.library_max_retries,
+                    }),
+                })
+                .await;
             match result {
-                Ok(finalized) => {
-                    library_retries += finalized.metrics.num_retries;
-                    self.table.state = Some(finalized.snapshot());
+                Ok(retries) => {
+                    library_retries += retries;
                     self.verified_through = self.table.version();
                     outcome = if attempts == 1 { "ok" } else { "ok_after_loop_retry" };
                     break;
@@ -1022,23 +976,7 @@ impl CommitLoop {
     /// The checkpoint write, by [`CheckpointExec`]. Both build a fresh snapshot at `version` and
     /// write the checkpoint with the kernel, as `create_checkpoint` does.
     async fn write_checkpoint(&self, version: u64) -> Result<()> {
-        match self.cfg.checkpoint_exec {
-            CheckpointExec::Worker => Ok(deltalake_core::checkpoints::create_checkpoint(&self.table, None).await?),
-            CheckpointExec::Blocking => {
-                let log_store = self.table.log_store();
-                let engine = log_store.engine(None);
-                let root = log_store.transaction_url(None)?;
-                tokio::task::spawn_blocking(move || -> Result<()> {
-                    let snapshot = delta_kernel::Snapshot::builder_for(root)
-                        .at_version(version)
-                        .build(engine.as_ref())?;
-                    snapshot.checkpoint(engine.as_ref(), None)?;
-                    Ok(())
-                })
-                .await
-                .context("checkpoint task")?
-            }
-        }
+        self.table.write_checkpoint(version, self.cfg.checkpoint_exec).await
     }
 
     /// Returns (checkpoint write ms, snapshot reload ms, permit wait ms).
@@ -1060,12 +998,10 @@ impl CommitLoop {
                     return Some((write_ms, None, wait_ms));
                 }
                 let started = Instant::now();
-                let previous = self.table.state.take();
-                match self.table.update_incremental(Some(version)).await {
+                match self.table.reload_at(version).await {
                     Ok(()) => Some((write_ms, Some(ms(started.elapsed())), wait_ms)),
                     Err(error) => {
                         tracing::warn!(%error, "snapshot reload after checkpoint failed");
-                        self.table.state = previous;
                         Some((write_ms, None, wait_ms))
                     }
                 }

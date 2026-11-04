@@ -20,6 +20,10 @@ clap.workspace = true
 # Same kernel delta-rs uses; the bench calls its checkpoint directly (--checkpoint-exec blocking).
 delta_kernel = { package = "buoyant_kernel", version = "=0.28.1", default-features = false }
 deltalake-core = { version = "=1.1.1", default-features = false, features = ["rustls", "cloud"] }
+# Upstream kernel for `dcb run --lib kernel`; renamed because `delta_kernel` is buoyant_kernel above.
+# Arrow comes from its re-export (`kernel030::arrow`, arrow 59).
+kernel030 = { package = "delta_kernel", version = "=0.30.1", default-features = false, features = ["arrow-59"] }
+kernel030_engine = { package = "delta_kernel_default_engine", version = "=0.30.1", default-features = false, features = ["arrow-59", "rustls"] }
 futures = "0.3"
 hdrhistogram = "7"
 object_store = { version = "0.13.2", features = ["azure", "fs"] }

@@ -1,6 +1,7 @@
 //! `dcb`: benchmark of the ArrowCol Delta commit path.
 
 mod arrow_producer;
+mod backend;
 mod checker;
 mod commit_loop;
 mod producer;
@@ -183,6 +184,9 @@ struct RunArgs {
     /// Instance identity; the per-table appId is `<app-id>/<table>`.
     #[arg(long)]
     app_id: String,
+    /// Delta library for the commit loops. Table creation (`--create`) always uses delta-rs.
+    #[arg(long, value_enum, default_value_t = backend::Lib::Dl1)]
+    lib: backend::Lib,
     #[arg(long)]
     wal_dir: PathBuf,
     /// Take over another identity: fence `<adopt-from>/<table>` in the table log, then recommit
@@ -646,6 +650,8 @@ async fn run(args: RunArgs) -> Result<()> {
                 FenceOn::Explicit(args.fence_identity.clone())
             },
             drain_only: args.drain_only,
+            crash_before_claim: args.faults.fault_crash_before_claim,
+            crash_after_claim: args.faults.fault_crash_after_claim,
         };
         wal::Wal::open(&args.wal_dir, &app_id)?;
         let wal_dir = args.wal_dir.clone();
@@ -654,13 +660,22 @@ async fn run(args: RunArgs) -> Result<()> {
         let faults_c = Arc::clone(&faults);
         let record_tx = record_tx.clone();
         let adopt_app_id = adopt.take().map(|old| format!("{old}/{name}"));
+        let lib = args.lib;
         loops.push(commit_handle.spawn(async move {
             let mut delay = Duration::from_millis(100);
             let mut attempt = 0;
             let lp = loop {
                 attempt += 1;
                 let (permit, _) = commit_loop::acquire(cfg.limits.ops.as_ref()).await;
-                let bench = table::open_with_retry(&url_c, Arc::clone(&root_c), Arc::clone(&faults_c)).await?;
+                let (table, counters) = match lib {
+                    backend::Lib::Dl1 => {
+                        let bench = table::open_with_retry(&url_c, Arc::clone(&root_c), Arc::clone(&faults_c)).await?;
+                        (backend::Backend::Dl1(bench.table), bench.counters)
+                    }
+                    backend::Lib::Kernel => {
+                        backend::open_kernel_with_retry(&url_c, Arc::clone(&root_c), Arc::clone(&faults_c)).await?
+                    }
+                };
                 let wal = wal::Wal::open(&wal_dir, &cfg.app_id)?;
                 let old = adopt_app_id
                     .as_ref()
@@ -671,7 +686,7 @@ async fn run(args: RunArgs) -> Result<()> {
                         })
                     })
                     .transpose()?;
-                let started = CommitLoop::start(bench, wal, cfg.clone(), old, record_tx.clone()).await;
+                let started = CommitLoop::start(table, counters, wal, cfg.clone(), old, record_tx.clone()).await;
                 drop(permit);
                 match started {
                     Ok(lp) => break lp,

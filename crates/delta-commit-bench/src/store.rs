@@ -68,6 +68,12 @@ pub struct FaultPlan {
     /// Abort the process after the first part of the Nth multipart data upload.
     #[arg(long)]
     pub fault_crash_mid_upload: Option<u64>,
+    /// Abort the process right before the Nth epoch claim commit is attempted (commit loop).
+    #[arg(long)]
+    pub fault_crash_before_claim: Option<u64>,
+    /// Abort the process right after the Nth epoch claim commit lands (commit loop).
+    #[arg(long)]
+    pub fault_crash_after_claim: Option<u64>,
 }
 
 impl FaultPlan {

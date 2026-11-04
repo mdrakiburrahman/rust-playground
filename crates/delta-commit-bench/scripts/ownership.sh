@@ -33,7 +33,7 @@ dcb() {
     if [ "$XFENCE" = off ] && [ "$1" = --fence-identity ]; then shift 2; continue; fi
     a+=("$1"); shift
   done
-  x "$DCB" run --epochs "$EPOCHS" --checkpoint-every 50 --encoders 2 --route-file "$D/route" "${a[@]}"
+  x "$DCB" run ${DCB_ARGS:-} --epochs "$EPOCHS" --checkpoint-every 50 --encoders 2 --route-file "$D/route" "${a[@]}"
 }
 # A backlog builder: one file per commit with slowed log writes, so pending manifests pile up.
 backlog() { echo --rate 20 --max-files-per-commit 1 --fault-delay-ms 150 --fault-scope log; }
