@@ -42,7 +42,6 @@ export interface UiGateOptions {
   compose: (args: string[], timeout?: number) => string;
   log: (message: string) => void;
   metricScope?: 'source-sdk' | 'service-qualification';
-  bridgeEnabled?: boolean;
 }
 
 export interface UiGateResult {
@@ -343,7 +342,7 @@ export async function runGrafanaGate(options: UiGateOptions): Promise<void> {
         if (!response.ok) throw new Error(`Grafana datasource HTTP ${response.status}`);
         return response.json() as Promise<unknown>;
       }, { query, start, end });
-    for (const metric of requiredMetrics(scope, options.bridgeEnabled ?? false)) {
+    for (const metric of requiredMetrics(scope)) {
       const result = await queryRange(metric.query);
       const measurement: Record<string, unknown> = { query: metric.query, allow_zero: metric.allowZero };
       (evidence.metrics as Record<string, unknown>)[metric.name] = measurement;

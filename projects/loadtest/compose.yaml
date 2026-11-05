@@ -242,45 +242,6 @@ services:
         ipv4_address: ${LOADTEST_KUSTO_IP:-10.89.0.50}
     stop_grace_period: ${STACK_STOP_SECONDS:-30}s
 
-  kusto-bridge:
-    profiles: ["benchmark"]
-    image: ghcr.io/mdrakiburrahman/rust-playground/kusto-bridge:dev
-    pull_policy: never
-    environment:
-      KUSTO_BRIDGE_KUSTO_ENDPOINT: http://${LOADTEST_KUSTO_IP:-10.89.0.50}:8080
-      KUSTO_BRIDGE_DATABASE: loadtest
-      KUSTO_BRIDGE_SOURCES: direct=/delta/direct,dataflow=/delta/dataflow
-      KUSTO_BRIDGE_STATE_DIR: /state
-      KUSTO_BRIDGE_POLL_INTERVAL: ${KUSTO_BRIDGE_POLL_INTERVAL:-2s}
-      KUSTO_BRIDGE_LISTEN: 0.0.0.0:9464
-      RUST_LOG: info
-    volumes:
-      - kusto-bridge-state:/state
-      - type: bind
-        source: ${ONELAKE_HOST_PATH:?Run through Nx}/direct
-        target: /delta/direct
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${ONELAKE_HOST_PATH:?Run through Nx}/dataflow
-        target: /delta/dataflow
-        read_only: true
-        bind:
-          create_host_path: false
-    read_only: true
-    cap_drop: ["ALL"]
-    security_opt: ["no-new-privileges:true"]
-    healthcheck:
-      test: ["CMD", "/usr/local/bin/kusto-bridge", "healthcheck", "--url", "http://127.0.0.1:9464/healthz"]
-      interval: 5s
-      timeout: 5s
-      retries: 60
-    networks:
-      default:
-        ipv4_address: ${LOADTEST_KUSTO_BRIDGE_IP:-10.89.0.53}
-    stop_grace_period: ${STACK_STOP_SECONDS:-30}s
-
   # Browser UI for the Kusto emulator. The server reaches Kusto by its Compose service name on this
   # network; browsers only talk to kusto-explorer itself (same-origin /api), never to Kusto.
   kusto-explorer:
@@ -556,9 +517,6 @@ volumes:
   sqlserver-data:
   hive-warehouse:
   kusto-data:
-    labels:
-      io.arrowcol.loadtest.workspace: ${LOADTEST_WORKSPACE:?Run through Nx}
-  kusto-bridge-state:
     labels:
       io.arrowcol.loadtest.workspace: ${LOADTEST_WORKSPACE:?Run through Nx}
 

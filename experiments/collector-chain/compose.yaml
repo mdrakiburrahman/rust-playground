@@ -1,0 +1,85 @@
+name: ${CHAIN_PROJECT:-collector-chain}
+
+x-arrowcol: &arrowcol
+  image: ghcr.io/mdrakiburrahman/rust-playground/arrowcol-dataflow-rust:dev
+  pull_policy: never
+  user: "${CHAIN_UID:?Run through Nx}:${CHAIN_GID:?Run through Nx}"
+  healthcheck:
+    test: ["CMD", "curl", "--fail", "--silent", "--max-time", "2", "http://127.0.0.1:32311/readyz"]
+    interval: 2s
+    timeout: 3s
+    retries: 30
+
+x-otapcol: &otapcol
+  image: ghcr.io/mdrakiburrahman/rust-playground/otelcol-rust:dev
+  pull_policy: never
+  user: "${CHAIN_UID:?Run through Nx}:${CHAIN_GID:?Run through Nx}"
+  healthcheck:
+    test: ["CMD", "curl", "--fail", "--silent", "--max-time", "2", "http://127.0.0.1:8080/api/v1/groups/default/pipelines/main/readyz"]
+    interval: 2s
+    timeout: 3s
+    retries: 30
+
+x-config: &config
+  type: bind
+  source: ${CHAIN_CONFIG_HOST_PATH:?Run through Nx}
+  target: /etc/collector-chain
+  read_only: true
+
+x-arrowcol-middle: &arrowcol-middle
+  <<: *arrowcol
+  command: ["--num-cores", "1", "--config", "/etc/collector-chain/arrowcol-middle.yaml"]
+  volumes: [*config]
+  depends_on:
+    arrowcol-gateway:
+      condition: service_healthy
+
+x-otapcol-middle: &otapcol-middle
+  <<: *otapcol
+  command: ["--num-cores", "1", "--http-admin-bind", "0.0.0.0:8080", "--config", "/etc/collector-chain/otapcol-middle.yaml"]
+  volumes: [*config]
+  depends_on:
+    otapcol-gateway:
+      condition: service_healthy
+
+services:
+  arrowcol-gateway:
+    <<: *arrowcol
+    command: ["--num-cores", "1", "--config", "/etc/collector-chain/arrowcol-gateway.yaml"]
+    volumes:
+      - *config
+      - type: bind
+        source: ${CHAIN_DELTA_HOST_PATH:?Run through Nx}/arrowcol
+        target: /data/arrowcol
+        bind:
+          create_host_path: false
+
+  arrowcol-middle-1: *arrowcol-middle
+  arrowcol-middle-2: *arrowcol-middle
+  arrowcol-middle-3: *arrowcol-middle
+
+  otapcol-gateway:
+    <<: *otapcol
+    command: ["--num-cores", "1", "--http-admin-bind", "0.0.0.0:8080", "--config", "/etc/collector-chain/otapcol-gateway.yaml"]
+    volumes:
+      - *config
+      - type: bind
+        source: ${CHAIN_DELTA_HOST_PATH:?Run through Nx}/otap
+        target: /data/otap
+        bind:
+          create_host_path: false
+
+  otapcol-middle-1: *otapcol-middle
+  otapcol-middle-2: *otapcol-middle
+  otapcol-middle-3: *otapcol-middle
+
+  kusto:
+    image: mcr.microsoft.com/azuredataexplorer/kustainer-linux@sha256:51e2250da2faf292de903f871a073eb37d3f2641cf63381b183879d21ebb1013
+    mem_limit: ${KUSTO_MEMORY_LIMIT:-6g}
+    environment:
+      ACCEPT_EULA: "Y"
+    volumes:
+      - type: bind
+        source: ${CHAIN_DELTA_HOST_PATH:?Run through Nx}
+        target: /delta
+        read_only: true

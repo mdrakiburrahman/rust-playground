@@ -41,7 +41,7 @@ test('qualified success seals exact files, helpers and images privately before t
   const root = archive(f.workspace);
   const manifest = JSON.parse(readFileSync(path.join(root, 'manifest.json'), 'utf8'));
   assert.equal(manifest.nativeCachePreserved, false);
-  assert.equal(manifest.images.length, 7);
+  assert.equal(manifest.images.length, 6);
   assert.equal(statSync(root).mode & 0o777, 0o700);
   assert.equal(statSync(path.join(root, 'manifest.json')).mode & 0o777, 0o600);
   assert.equal(readFileSync(path.join(root, 'corpus/direct/table/data.parquet'), 'utf8'), 'actual-parquet-fixture');

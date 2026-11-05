@@ -45,7 +45,7 @@ test('both local helper commands always receive the allocated internal Kusto end
   const network: BenchmarkNetwork = {
     subnet: '10.89.42.0/24', sql: '10.89.42.2', hive: '10.89.42.3', router: '10.89.42.10',
     direct: '10.89.42.21', dataflow: '10.89.42.31', kusto: '10.89.42.50',
-    kustoExplorer: '10.89.42.51', playwright: '10.89.42.52', kustoBridge: '10.89.42.53',
+    kustoExplorer: '10.89.42.51', playwright: '10.89.42.52',
   };
   const env = localLoadgenEnvironment({
     directory: '/workspace/onelake/benchmark/latest', network, options: parseBenchmarkOptions([]),
@@ -54,15 +54,6 @@ test('both local helper commands always receive the allocated internal Kusto end
   assert.equal(env.LOADTEST_KUSTO_ENDPOINT, 'http://10.89.42.50:8080');
   assert.equal(env.LOADTEST_DIRECT_ROOT, '/workspace/onelake/benchmark/latest/direct');
   assert.equal(env.LOADTEST_DATAFLOW_ROOT, '/workspace/onelake/benchmark/latest/dataflow');
-  assert.equal(env.LOADTEST_KUSTO_BRIDGE_ENDPOINT, undefined);
-  for (const mode of ['local', 'azure']) {
-    const optional = localLoadgenEnvironment({
-      directory: '/workspace/onelake/benchmark/latest', network,
-      options: parseBenchmarkOptions(['--mode', mode], {}),
-      env: { LOADTEST_KUSTO_BRIDGE_ENDPOINT: 'http://explicit-bridge:9464' },
-    }, '/workspace/onelake/benchmark/latest/results');
-    assert.equal(optional.LOADTEST_KUSTO_BRIDGE_ENDPOINT, mode === 'local' ? 'http://explicit-bridge:9464' : undefined);
-  }
 });
 
 test('validate alone receives an absolute deadline inside the unchanged 600s backstop', () => {

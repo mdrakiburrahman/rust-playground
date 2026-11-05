@@ -1,0 +1,15 @@
+# Added with --keep or --stream: publishes Kusto and the repo's kusto-explorer browser UI on the
+# Docker host's loopback. kusto-explorer reaches Kusto by service name; browsers only talk to it.
+services:
+  kusto:
+    ports: ["127.0.0.1:${CHAIN_KUSTO_PORT:?Run through Nx}:8080"]
+
+  kusto-explorer:
+    image: ghcr.io/mdrakiburrahman/rust-playground/kusto-explorer@sha256:119969d895bc5232032f917bf6eb52557f61def5b17a65f3382b74fd7c69e4e4
+    environment:
+      KUSTO_EXPLORER_CONNECTIONS: "Collector chain=http://kusto:8080"
+      KUSTO_EXPLORER_DEFAULT_DATABASE: NetDefaultDB
+    ports: ["127.0.0.1:${CHAIN_UI_PORT:?Run through Nx}:8080"]
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]

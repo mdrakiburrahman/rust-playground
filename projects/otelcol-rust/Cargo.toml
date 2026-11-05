@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 otel-deltalake-exporter = { path = "../../crates/otel-deltalake-exporter" }
-otel-arrow-dfe = { path = "../../submodules/otel-arrow/rust/otap-dataflow", default-features = false, features = ["otlp", "parquet", "crypto-ring"] }
+otel-arrow-dfe = { path = "../../submodules/otel-arrow/rust/otap-dataflow", default-features = false, features = ["otlp", "otap", "parquet", "crypto-ring"] }
 
 [lints]
 workspace = true

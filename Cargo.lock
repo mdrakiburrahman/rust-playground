@@ -797,6 +797,7 @@ dependencies = [
  "otel-arrow-dfe-otap",
  "otel-arrow-dfe-pdata",
  "parquet 58.4.0",
+ "prost 0.14.4",
  "serde",
  "serde_json",
  "tempfile",
@@ -1790,6 +1791,29 @@ name = "collection_literals"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2550f75b8cfac212855f6b1885455df8eaee8fe8e246b647d69146142e016084"
+
+[[package]]
+name = "collector-chain"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow-array 58.4.0",
+ "arrow-flight",
+ "arrow-schema 58.4.0",
+ "arrowcol-catalog",
+ "arrowcol-flight",
+ "arrowcol-protocol",
+ "clap",
+ "futures",
+ "opentelemetry 0.31.0",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk 0.31.0",
+ "prost 0.14.4",
+ "serde_json",
+ "tokio",
+ "tonic",
+ "uuid",
+]
 
 [[package]]
 name = "colorchoice"
@@ -4342,28 +4366,6 @@ checksum = "07293a4e297ac234359b510362495713f75ea345d5307140414f20c69ffeb087"
 dependencies = [
  "bitflags 2.13.2",
  "libc",
-]
-
-[[package]]
-name = "kusto-bridge"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "clap",
- "delta_kernel",
- "delta_kernel_default_engine",
- "hex",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "url",
 ]
 
 [[package]]

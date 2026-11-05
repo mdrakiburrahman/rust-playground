@@ -172,8 +172,7 @@ This starts a fresh SQL Server, Hive, router, Direct collector, Dataflow
 collector, Kusto emulator, [kusto-explorer](../kusto-explorer/README.md) query
 UI, and monitoring stack, then sends the same Arrow batches to both collectors
 across all 13 tables. Kusto provides live functional inspection of committed
-output. Native Delta external-table/QAP validation is the default target;
-the compatibility bridge is optional and is never Azure QAP evidence.
+output. Native Delta external-table/QAP validation is the default target.
 
 **A start replaces only a previously sealed, validated local attempt.** Its
 corpus and evidence must be verified in the private per-attempt archive before
@@ -432,12 +431,12 @@ the actual Grafana, native validation and Explorer gates have finished, all
 generator/helpers have returned, observer/sampler shutdown and diagnostics have
 completed, and the original source/maintenance/tenant mutators are reverified
 as cleanly stopped. The router is not kept live after qualified success.
-Other live writable mounts into the corpus are refused; read-only Kusto/bridge
+Other live writable mounts into the corpus are refused; read-only Kusto
 source mounts are permitted. No measurement window, query or evidence threshold
 changes.
 
 Before that attempt can be reset, its corpus (including tenant/checkpoint/WAL
-state), results/receipts/Grafana evidence, source/lockfile provenance, seven
+state), results/receipts/Grafana evidence, source/lockfile provenance, six
 source-bound image identities and three selected helper executables are copied
 and content-verified under the workspace's private
 `.temp/loadtest-attempt-evidence/<attempt-uuid>/`. This path is outside **all**
@@ -447,7 +446,7 @@ credential files are never archived. The archive is private (0700 directories,
 0600 files), contains potentially sensitive diagnostics and must **not** be
 committed or uploaded wholesale as a public artifact.
 
-The seven local image targets now pass `VCS_REF={gitSha}` and require a clean
+The six local image targets now pass `VCS_REF={gitSha}` and require a clean
 Git worktree, matching the existing publication metadata policy. Tags, Dockerfile
 contents, build contexts and runtime behavior are unchanged. Archived OCI
 revision labels and inspected image/container IDs identify those builds, not a
@@ -577,7 +576,6 @@ workers (`ClusterMaximumConcurrentOperations=16`,
 `.show capacity` and fails with the named `local_qap_capacity` guard unless
 `QueryAcceleration` reports exactly 16; it never alters the policy itself.
 Azure capacity is never altered.
-The optional bridge is not the default and is not accelerated-cache evidence.
 Timestamp `__unix_nanos` companion columns retain the original
 integer nanoseconds; Kusto `datetime` alone is not nanosecond-exact.
 
@@ -754,8 +752,8 @@ but at least one series and one rendered frame must still carry three finite
 non-negative samples. Infinities, negatives, malformed values and timestamp
 disorder still fail, and required metrics never accept `NaN`.
 `service-qualification` additionally requires real maintenance removals and
-physical deletion, tenant skipping/checkpoint metrics and native QAP per pool;
-bridge metrics are required only when enabled. Measured zero backlog/retries are
+physical deletion, tenant skipping/checkpoint metrics and native QAP per pool.
+Measured zero backlog/retries are
 valid, but missing metrics never become manufactured zeroes.
 
 Validation runs a read-only native QAP observer every ten seconds, with one

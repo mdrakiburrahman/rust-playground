@@ -12,8 +12,11 @@ npx --no-install nx run otelcol-rust:image
 npx --no-install nx run otelcol-rust:image-smoke
 ```
 
-The upstream feature set remains `otlp,parquet,crypto-ring`, with defaults
-disabled. Parquet enables the shared OTAP preparation and file-backend hooks;
+The upstream feature set is `otlp,otap,parquet,crypto-ring`, with defaults
+disabled. OTAP adds `receiver:otap` and `exporter:otap` for collector-to-collector
+chaining; the [collector-chain experiment](../../experiments/collector-chain/README.md)
+runs OTLP middles into one batching OTAP gateway. Parquet enables the shared
+OTAP preparation and file-backend hooks;
 the external adapter registers `exporter:deltalake`. There is no duplicated
 collector startup or Go component-parity promise. Builds use the root
 workspace's toolchain and Cargo.lock and read local source, including

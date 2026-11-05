@@ -5,7 +5,7 @@ import { requiredMetrics, sdkMetricFamilies } from '../src/metric-contract.js';
 import { metricRangeEvidence, panelFrameEvidence } from '../src/metrics-gate.js';
 
 test('baseline requires each real SDK family from both source providers, not any delta metric', () => {
-  const metrics = requiredMetrics('source-sdk', false);
+  const metrics = requiredMetrics('source-sdk');
   assert.equal(metrics.length, 2 * sdkMetricFamilies.length + 1);
   for (const [pool, service] of [['direct', 'arrowcol-rust'], ['dataflow', 'arrowcol-dataflow-rust']]) {
     for (const family of sdkMetricFamilies) {
@@ -13,7 +13,7 @@ test('baseline requires each real SDK family from both source providers, not any
       assert.equal(metric?.query, `sum(${family}{service_name="${service}"})`);
     }
   }
-  assert(metrics.every(metric => !metric.query.includes('kusto_bridge_') && !metric.query.includes('qap_')));
+  assert(metrics.every(metric => !metric.query.includes('qap_')));
 });
 
 test('a panel canvas alone cannot qualify without actual numeric frames delivered to that panel', () => {
@@ -30,14 +30,12 @@ test('a panel canvas alone cannot qualify without actual numeric frames delivere
 });
 
 test('service qualification cannot pass without real maintenance effects, skipping and per-pool QAP', () => {
-  const metrics = requiredMetrics('service-qualification', false);
+  const metrics = requiredMetrics('service-qualification');
   for (const name of ['optimize:actual_removals', 'purge:actual_removals', 'delta_maintenance_files_deleted_total',
     'tenant_stream_datafusion_row_groups_pruned_statistics_total', 'direct:qap_completion_percent',
     'dataflow:qap_completion_percent']) {
     assert.equal(metrics.find(metric => metric.name === name)?.allowZero, false, name);
   }
-  assert(!metrics.some(metric => metric.name === 'bridge_scrape'));
-  assert(requiredMetrics('service-qualification', true).some(metric => metric.name === 'bridge_scrape'));
 });
 
 test('real zero backlog/retries are legal only for explicitly declared zero-valid families', () => {

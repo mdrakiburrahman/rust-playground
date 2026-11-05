@@ -9,7 +9,6 @@
     "arrowcol-infra",
     "arrowcol-sdk-gen",
     "kusto-explorer",
-    "kusto-bridge",
     "arrow-tenant-stream",
     "delta-maintenance"
   ],
@@ -66,7 +65,6 @@
             "arrowcol-dataflow-rust",
             "arrowcol-router-rust",
             "kusto-explorer",
-            "kusto-bridge",
             "arrow-tenant-stream",
             "delta-maintenance"
           ],

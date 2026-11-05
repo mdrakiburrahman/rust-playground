@@ -92,10 +92,6 @@ impl KustoClient {
         let database = match mode {
             Mode::Local => DATABASE.to_owned(),
             Mode::Azure => {
-                ensure!(
-                    !std::env::var("LOADTEST_KUSTO_BRIDGE_ENDPOINT").is_ok_and(|value| !value.trim().is_empty()),
-                    "the local Kusto bridge cannot be used in Azure mode"
-                );
                 std::env::var("AZURE_KUSTO_DATABASE").context("AZURE_KUSTO_DATABASE is required in Azure mode")?
             }
         };

@@ -299,7 +299,6 @@ function benchmarkEnvironment(
     LOADTEST_DATAFLOW_1_IP: network.dataflow,
     LOADTEST_KUSTO_IP: network.kusto,
     LOADTEST_KUSTO_EXPLORER_IP: network.kustoExplorer,
-    LOADTEST_KUSTO_BRIDGE_IP: network.kustoBridge,
     LOADTEST_PLAYWRIGHT_IP: network.playwright,
     LOADTEST_LGTM_IP: network.sql.replace(/\.2$/u, '.40'),
     LOADTEST_CADVISOR_IP: network.sql.replace(/\.2$/u, '.105'),
@@ -330,7 +329,6 @@ export interface BenchmarkNetwork {
   dataflow: string;
   kusto: string;
   kustoExplorer: string;
-  kustoBridge: string;
   playwright: string;
 }
 
@@ -370,7 +368,7 @@ function selectBenchmarkNetwork(): BenchmarkNetwork {
     return {
       subnet, sql: `${base}.2`, hive: `${base}.3`, router: `${base}.10`,
       direct: `${base}.21`, dataflow: `${base}.31`,
-      kusto: `${base}.50`, kustoExplorer: `${base}.51`, playwright: `${base}.52`, kustoBridge: `${base}.53`,
+      kusto: `${base}.50`, kustoExplorer: `${base}.51`, playwright: `${base}.52`,
     };
   }
   throw new Error('No available benchmark subnet in 10.89.0.0/16');
@@ -425,7 +423,6 @@ export function localLoadgenEnvironment(
     LOADTEST_DIRECT_ADMIN_ENDPOINTS: `http://${context.network.direct}:8081`,
     LOADTEST_DATAFLOW_ADMIN_ENDPOINTS: `http://${context.network.dataflow}:32011`,
     LOADTEST_KUSTO_ENDPOINT: context.options.mode === 'azure' ? context.env.AZURE_KUSTO_URI : `http://${context.network.kusto}:8080`,
-    LOADTEST_KUSTO_BRIDGE_ENDPOINT: context.options.mode === 'azure' ? undefined : context.env.LOADTEST_KUSTO_BRIDGE_ENDPOINT,
     ARROWCOL_SQL_HOST: context.network.sql,
     ARROWCOL_SQL_PASSWORD_FILE: path.join(infra, 'arrowcol-app-password.txt'),
     ARROWCOL_SDK_GEN: path.join(cargoTargetDirectory(), 'debug/arrowcol-sdk-gen'),
@@ -621,9 +618,6 @@ async function benchmark(
     if (kustoStartup.state === 'degraded') {
       step(`Kusto startup DEGRADED: ${kustoStartup.error}. Load generation will continue; see results/kusto-startup.json`);
     }
-    if (kustoStartup.state !== 'degraded' && privateEnv.LOADTEST_KUSTO_BRIDGE_ENDPOINT) {
-      compose(project, env, ['--profile', 'benchmark', 'up', '--detach', '--no-build', '--wait', '--wait-timeout', '300', 'kusto-bridge'], 360_000);
-    }
     controller.checkRunning();
     phase = 'kusto-explorer-startup';
     step('Starting kusto-explorer (connects to Kusto over the Compose network)');
@@ -753,7 +747,7 @@ async function benchmark(
       phase = 'live-grafana-validation';
       await runGrafanaGate({
         workspace, results: path.join(directory, 'results'), browserEndpoint: `ws://${network.playwright}:3000/`,
-        metricScope: 'source-sdk', bridgeEnabled: Boolean(env.LOADTEST_KUSTO_BRIDGE_ENDPOINT),
+        metricScope: 'source-sdk',
         compose: (args, timeout) => compose(project, env, args, timeout), log: step,
       });
       phase = 'mutator-drain';

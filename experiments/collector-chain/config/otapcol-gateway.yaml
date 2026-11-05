@@ -1,0 +1,39 @@
+version: otel_dataflow/v1
+engine: {}
+groups:
+  default:
+    pipelines:
+      main:
+        nodes:
+          otap:
+            type: receiver:otap
+            config:
+              listening_addr: "0.0.0.0:4317"
+              compression_method: zstd
+              response_stream_channel_size: 256
+          batch:
+            type: processor:batch
+            config:
+              otap:
+                min_size: 100000
+                sizer: items
+              format: preserve
+              max_batch_duration: 15s
+          deltalake:
+            type: exporter:deltalake
+            config:
+              storage:
+                file:
+                  base_uri: /data/otap
+              writer_options:
+                target_rows_per_file: 100000
+                flush_when_older_than: 5s
+              commit_options:
+                batch_window: 1s
+                max_files_per_commit: 64
+                max_pending_files: 256
+        connections:
+          - from: otap
+            to: batch
+          - from: batch
+            to: deltalake

@@ -1,0 +1,51 @@
+{
+  "name": "collector-chain-experiment",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "application",
+  "implicitDependencies": ["experiment-kit", "collector-chain", "arrowcol-dataflow-rust", "otelcol-rust"],
+  "targets": {
+    "lint": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "npx --no-install tsc --project experiments/collector-chain/tsconfig.json"
+      }
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "npx --no-install tsx --test experiments/collector-chain/src/*.test.ts"
+      }
+    },
+    "build": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": [{ "projects": ["arrowcol-dataflow-rust", "otelcol-rust"], "target": "image" }],
+      "options": {
+        "command": "cargo build --locked --release --package collector-chain"
+      }
+    },
+    "verify": {
+      "executor": "nx:run-commands",
+      "dependsOn": ["lint", "test"],
+      "options": {
+        "commands": []
+      }
+    },
+    "run": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["build"],
+      "options": {
+        "command": "npx --no-install tsx experiments/collector-chain/src/main.ts",
+        "forwardAllArgs": true
+      }
+    },
+    "down": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install tsx experiments/collector-chain/src/main.ts --down"
+      }
+    }
+  }
+}

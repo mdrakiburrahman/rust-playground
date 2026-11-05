@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 
 use arrowcol_catalog::{
@@ -258,12 +258,18 @@ impl CatalogConfig {
     }
 }
 
+static STANDALONE_ROUTING: LazyLock<Arc<MemoryRoutingStore>> = LazyLock::new(Arc::default);
+
 /// Routing-store implementation shared by admission, fencing, and registration.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RoutingStoreConfig {
     /// Empty process-local routing store, intended only for tests.
     Memory,
+    /// One routing store shared by every receiver and exporter in this
+    /// process, with table leases claimed on first admission. For a single
+    /// collector that owns all of its tables without a routing control plane.
+    Standalone,
     /// SQL Server routing control plane.
     SqlServer {
         /// SQL Server connection.
@@ -274,14 +280,19 @@ pub enum RoutingStoreConfig {
 impl RoutingStoreConfig {
     pub(crate) fn validate(&self) -> Result<(), String> {
         match self {
-            Self::Memory => Ok(()),
+            Self::Memory | Self::Standalone => Ok(()),
             Self::SqlServer { connection } => connection.validate(),
         }
+    }
+
+    pub(crate) const fn claims_leases(&self) -> bool {
+        matches!(self, Self::Standalone)
     }
 
     pub(crate) fn build(&self) -> Result<Arc<dyn RoutingStore>, String> {
         match self {
             Self::Memory => Ok(Arc::new(MemoryRoutingStore::default())),
+            Self::Standalone => Ok(Arc::clone(&*STANDALONE_ROUTING) as Arc<dyn RoutingStore>),
             Self::SqlServer { connection } => connection
                 .routing_config()
                 .map(|config| Arc::new(SqlServerRoutingStore::new(config)) as Arc<dyn RoutingStore>)

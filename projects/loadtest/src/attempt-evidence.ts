@@ -16,11 +16,11 @@ const markerName = '.attempt-evidence.json';
 const socketName = 'router-state/arrowcol-router-upgrade.sock';
 const helpers = ['arrowcol-loadgen', 'arrowcol-sdk-gen', 'delta-inspect'] as const;
 const imageNames = ['arrowcol-rust', 'arrowcol-dataflow-rust', 'arrowcol-router-rust',
-  'kusto-explorer', 'kusto-bridge', 'arrow-tenant-stream', 'delta-maintenance'];
+  'kusto-explorer', 'arrow-tenant-stream', 'delta-maintenance'];
 const serviceImages: Record<string, string> = {
   'direct-1': imageNames[0], 'dataflow-1': imageNames[1], router: imageNames[2],
-  'kusto-explorer': imageNames[3], 'kusto-bridge': imageNames[4], 'tenant-stream': imageNames[5],
-  'delta-maintenance': imageNames[6],
+  'kusto-explorer': imageNames[3], 'tenant-stream': imageNames[4],
+  'delta-maintenance': imageNames[5],
 };
 const mutators = ['direct-1', 'dataflow-1', 'tenant-stream', 'delta-maintenance'];
 const limits = { files: 100_000, bytes: 16 * 1024 ** 3, manifest: 256 * 1024 ** 2, milliseconds: 300_000 };

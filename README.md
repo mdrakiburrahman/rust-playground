@@ -97,13 +97,11 @@ The [interactive architecture source](loadtest-architecture.html) follows
 13 multi-customer schemas through both collector pools into independent Delta
 roots, ingestion-time partitions, standalone maintenance, historical tenant
 forks, and Kusto. Local mode pairs disk with the Kusto emulator. Native external
-Delta/QAP is the default validation target; the optional compatibility bridge is
-functional-only and never counts as native QAP evidence. Azure mode uses ADLS
-Gen2 and native external-Delta query acceleration with a dedicated managed
-identity. Independent validation and LGTM observe the same run.
+Delta/QAP is the default validation target. Azure mode uses ADLS Gen2 and
+native external-Delta query acceleration with a dedicated managed identity. Independent validation and LGTM observe the same run.
 
-The tenant fork preserves copied history after source purge; the local bridge
-instead reconciles the current active snapshot. Stable publication identities
+The tenant fork preserves copied history after source purge; native external
+tables instead read the current active snapshot. Stable publication identities
 protect retries of the same publication, not duplicate independent client
 requests. Local functional results are not Azure QAP performance evidence.
 See the [loadtest guide](projects/loadtest/README.md) for the current CLI,
@@ -117,6 +115,11 @@ oracles and durable evidence; they do not run the lakehouse loadtest.
 The [Azure QAP experiment](experiments/azure-qap/README.md) examines whether
 append, OPTIMIZE, old-partition DELETE and physical VACUUM reload unchanged data.
 See the [lessons learned, with diagrams](docs/experiments/azure-qap/README.md).
+
+The [collector-chain experiment](experiments/collector-chain/README.md) chains
+3 clients through middle ArrowCol and OTAPCol collectors into one batching
+gateway each, then asserts every client ID in Kustainer over the local Delta
+output. See the [write-up and diagram](docs/experiments/collector-chain/README.md).
 
 ### Finite qualification quick start
 

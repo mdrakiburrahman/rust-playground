@@ -9,7 +9,7 @@
       "id": 1, "type": "timeseries", "interval": "2s", "title": "Delta SDK and service operation counters",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
-      "targets": [{ "refId": "A", "expr": "sum by (__name__, operation, outcome) ({__name__=~\".*delta.*_total|tenant_stream_.*_total|kusto_bridge_.*_total\"})", "legendFormat": "{{__name__}} {{operation}} {{outcome}}" }]
+      "targets": [{ "refId": "A", "expr": "sum by (__name__, operation, outcome) ({__name__=~\".*delta.*_total|tenant_stream_.*_total\"})", "legendFormat": "{{__name__}} {{operation}} {{outcome}}" }]
     },
     {
       "id": 2, "type": "timeseries", "interval": "2s", "title": "Delta file, byte and row changes",
@@ -27,7 +27,7 @@
       "id": 4, "type": "timeseries", "interval": "2s", "title": "Visibility and stream lag / backlog",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
-      "targets": [{ "refId": "A", "expr": "sum by (__name__, pool) ({__name__=~\"tenant_stream_.*(lag|backlog)|kusto_bridge_.*(lag_seconds|lag_versions|pending_files|degraded_tables)\"})", "legendFormat": "{{__name__}} {{pool}}" }]
+      "targets": [{ "refId": "A", "expr": "sum by (__name__, pool) ({__name__=~\"tenant_stream_.*(lag|backlog)\"})", "legendFormat": "{{__name__}} {{pool}}" }]
     },
     {
       "id": 5, "type": "timeseries", "interval": "2s", "title": "Actual DataFusion skipping and bytes scanned",
@@ -39,7 +39,7 @@
       "id": 6, "type": "timeseries", "interval": "2s", "title": "Phase / refresh / commit duration distributions",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "x": 12, "y": 16, "w": 12, "h": 8 },
-      "targets": [{ "refId": "A", "expr": "histogram_quantile(0.95, sum by (metric, le, operation) (rate(label_replace({__name__=~\".*(delta|maintenance|tenant_stream|kusto_bridge).*_seconds_bucket\"}, \"metric\", \"$1\", \"__name__\", \"(.+)\")[1m:2s])))", "legendFormat": "{{metric}} {{operation}} p95" }]
+      "targets": [{ "refId": "A", "expr": "histogram_quantile(0.95, sum by (metric, le, operation) (rate(label_replace({__name__=~\".*(delta|maintenance|tenant_stream).*_seconds_bucket\"}, \"metric\", \"$1\", \"__name__\", \"(.+)\")[1m:2s])))", "legendFormat": "{{metric}} {{operation}} p95" }]
     },
     {
       "id": 7, "type": "timeseries", "interval": "2s", "title": "Retention, cap hits, sealed backlog and prefetch",
@@ -98,11 +98,11 @@
       "targets": [{ "refId": "A", "expr": "sum by (__name__, pool) ({__name__=~\"qap_observation_complete|qap_observed_tables\"})", "legendFormat": "{{__name__}} {{pool}}" }]
     },
     {
-      "id": 9, "type": "table", "title": "All exposed Delta / maintenance / stream / bridge series",
+      "id": 9, "type": "table", "title": "All exposed Delta / maintenance / stream series",
       "description": "Absent series are absent evidence, never manufactured zeroes. Labels must not contain tenant, file, storage-root or run identities.",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "x": 0, "y": 56, "w": 24, "h": 10 },
-      "targets": [{ "refId": "A", "expr": "{__name__=~\".*delta.*|.*maintenance.*|tenant_stream_.*|kusto_bridge_.*|qap_.*\"}", "instant": true, "format": "table" }]
+      "targets": [{ "refId": "A", "expr": "{__name__=~\".*delta.*|.*maintenance.*|tenant_stream_.*|qap_.*\"}", "instant": true, "format": "table" }]
     }
   ]
 }
