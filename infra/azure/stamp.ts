@@ -22,6 +22,8 @@ export interface StampConfig {
       vnetIpv4Cidr: string; vnetIpv6Cidr: string; nodeSubnetIpv4Cidr: string; nodeSubnetIpv6Cidr: string;
       apiServerSubnetIpv4Cidr: string; podIpv4Cidr: string; podIpv6Cidr: string;
       serviceIpv4Cidr: string; serviceIpv6Cidr: string; dnsServiceIp: string;
+      egressIpv4IpTags: Array<{ ipTagType: string; tag: string }>;
+      egressIpv6IpTags: Array<{ ipTagType: string; tag: string }>;
     };
   };
   publisherFederatedCredentials: Array<{ name: string; issuer: string; subject: string }>;
@@ -35,7 +37,7 @@ const DEFAULT_AKS: StampConfig['aks'] = {
   network: { vnetIpv4Cidr: '10.240.0.0/16', vnetIpv6Cidr: 'fd20:240::/48', nodeSubnetIpv4Cidr: '10.240.0.0/24',
     nodeSubnetIpv6Cidr: 'fd20:240:0:1::/64', apiServerSubnetIpv4Cidr: '10.240.1.0/28', podIpv4Cidr: '172.30.0.0/16',
     podIpv6Cidr: 'fd20:240:1::/64', serviceIpv4Cidr: '172.31.0.0/16', serviceIpv6Cidr: 'fd20:240:2::/108',
-    dnsServiceIp: '172.31.0.10' },
+    dnsServiceIp: '172.31.0.10', egressIpv4IpTags: [], egressIpv6IpTags: [] },
 };
 
 function object(value: unknown, name: string): Record<string, unknown> {
@@ -186,7 +188,22 @@ export function parseStampConfig(source: string): StampConfig {
   const networkRaw = object(aksRaw.network, 'aks.network');
   const networkKeys = ['vnetIpv4Cidr', 'vnetIpv6Cidr', 'nodeSubnetIpv4Cidr', 'nodeSubnetIpv6Cidr',
     'apiServerSubnetIpv4Cidr', 'podIpv4Cidr', 'podIpv6Cidr', 'serviceIpv4Cidr', 'serviceIpv6Cidr', 'dnsServiceIp'] as const;
-  keys(networkRaw, networkKeys, 'aks.network');
+  keys(networkRaw, [...networkKeys, 'egressIpv4IpTags', 'egressIpv6IpTags'], 'aks.network');
+  const ipTags = (value: unknown, name: string): Array<{ ipTagType: string; tag: string }> => {
+    if (value === undefined) return [];
+    if (!Array.isArray(value) || value.length > 10) throw new Failure(`${name} must be a list of at most 10 IP tags.`);
+    const result = value.map((entry, index) => {
+      const item = object(entry, `${name}[${index}]`);
+      keys(item, ['ipTagType', 'tag'], `${name}[${index}]`);
+      return {
+        ipTagType: text(item.ipTagType, `${name}[${index}].ipTagType`, /^[A-Za-z][A-Za-z0-9]*$/, 64),
+        tag: text(item.tag, `${name}[${index}].tag`, /^\/[A-Za-z0-9/_-]+$/, 128),
+      };
+    });
+    if (new Set(result.map(item => `${item.ipTagType}\0${item.tag}`)).size !== result.length)
+      throw new Failure(`${name} must not contain duplicate IP tags.`);
+    return result;
+  };
   const network = {
     vnetIpv4Cidr: cidr(networkRaw.vnetIpv4Cidr, 'aks.network.vnetIpv4Cidr', 4, 16, 24),
     vnetIpv6Cidr: cidr(networkRaw.vnetIpv6Cidr, 'aks.network.vnetIpv6Cidr', 6, 48, 64),
@@ -198,6 +215,8 @@ export function parseStampConfig(source: string): StampConfig {
     serviceIpv4Cidr: cidr(networkRaw.serviceIpv4Cidr, 'aks.network.serviceIpv4Cidr', 4, 16, 16),
     serviceIpv6Cidr: cidr(networkRaw.serviceIpv6Cidr, 'aks.network.serviceIpv6Cidr', 6, 108, 108),
     dnsServiceIp: text(networkRaw.dnsServiceIp, 'aks.network.dnsServiceIp', /^(?:\d{1,3}\.){3}\d{1,3}$/),
+    egressIpv4IpTags: ipTags(networkRaw.egressIpv4IpTags, 'aks.network.egressIpv4IpTags'),
+    egressIpv6IpTags: ipTags(networkRaw.egressIpv6IpTags, 'aks.network.egressIpv6IpTags'),
   };
   if (!contains(network.vnetIpv4Cidr, network.nodeSubnetIpv4Cidr) ||
       !contains(network.vnetIpv4Cidr, network.apiServerSubnetIpv4Cidr) ||

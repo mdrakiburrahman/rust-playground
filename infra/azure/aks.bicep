@@ -80,7 +80,7 @@ resource egressIpv4Prefix 'Microsoft.Network/publicIPPrefixes@2024-05-01' = {
   location: location
   tags: ownership
   sku: { name: 'Standard' }
-  properties: { prefixLength: 30, publicIPAddressVersion: 'IPv4' }
+  properties: { prefixLength: 30, publicIPAddressVersion: 'IPv4', ipTags: network.egressIpv4IpTags }
 }
 
 resource egressIpv6Prefix 'Microsoft.Network/publicIPPrefixes@2024-05-01' = {
@@ -88,7 +88,7 @@ resource egressIpv6Prefix 'Microsoft.Network/publicIPPrefixes@2024-05-01' = {
   location: location
   tags: ownership
   sku: { name: 'Standard' }
-  properties: { prefixLength: 126, publicIPAddressVersion: 'IPv6' }
+  properties: { prefixLength: 126, publicIPAddressVersion: 'IPv6', ipTags: network.egressIpv6IpTags }
 }
 
 resource registry 'Microsoft.ContainerRegistry/registries@2023-07-01' = {

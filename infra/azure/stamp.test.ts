@@ -29,6 +29,18 @@ test('requires explicit target defaults and rejects a different group or region'
   assert.throws(() => defaultStampConfig({ AZURE_RESOURCE_GROUP: 'rust-playground' }), /exact arrow-collector-rg/);
   assert.throws(() => defaultStampConfig({ AZURE_LOCATION: 'westus2' }), /qualified eastus2/);
 });
+test('validates independently configured IPv4 and IPv6 egress allocation tags', () => {
+  const configured = example.replace('egressIpv4IpTags: []',
+    'egressIpv4IpTags:\n      - ipTagType: FirstPartyUsage\n        tag: /TestAllocation');
+  const config = parseStampConfig(configured);
+  assert.deepEqual(config.aks.network.egressIpv4IpTags, [{ ipTagType: 'FirstPartyUsage', tag: '/TestAllocation' }]);
+  assert.deepEqual(config.aks.network.egressIpv6IpTags, []);
+  assert.throws(() => parseStampConfig(configured.replace('/TestAllocation', 'invalid tag')), /tag is invalid/);
+  assert.throws(() => parseStampConfig(configured.replace('ipTagType: FirstPartyUsage', 'ipTagType: FirstPartyUsage\n        bypass: true')), /unsupported key/);
+  assert.throws(() => parseStampConfig(configured.replace('tag: /TestAllocation',
+    'tag: /TestAllocation\n      - ipTagType: FirstPartyUsage\n        tag: /TestAllocation')), /duplicate IP tags/);
+  assert.deepEqual(parseStampConfig(example.replace('    egressIpv4IpTags: []\n', '')).aks.network.egressIpv4IpTags, []);
+});
 test('validates publisher federation and rejects IPv4 or IPv6 overlap with Azure networks', () => {
   const publisher = example.replace('publisherFederatedCredentials: []',
     'publisherFederatedCredentials:\n  - name: github-publish\n    issuer: https://token.actions.githubusercontent.com\n    subject: repo:org@123/project@456:environment:publish');

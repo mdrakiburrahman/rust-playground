@@ -92,6 +92,7 @@ assignments, registry publishers or FIC subjects remain unaccounted for.
 | Task | Entry point |
 | --- | --- |
 | Configure / qualify / provision | `infra/azure/stamp.example.yaml`; follow [AKS QAP operations](../../docs/operations/AKS_QAP.md) before provisioning. |
+| Egress IP allocation policy | Set `aks.network.egressIpv4IpTags` and `egressIpv6IpTags` in private stamp YAML only to allocation tags authorized for the target subscription. Empty lists request untagged prefixes; Azure policy may reject them. No policy exemption or skip tags are added. |
 | Kustomize Job config | Copy `infra/kubernetes/azure-qap.example.yaml` to ignored `azure-qap.yaml`; set a digest-pinned image and desired resources/node selector. |
 | Run on AKS | `npx nx run azure-qap-experiment:run -- --kubernetes --kubernetes-config infra/kubernetes/azure-qap.yaml` |
 | Preserve evidence | The runner collects logs, reports and KQL files before removing its unique Job; only shared-principal requests with a Kusto/ADX `UserAgentHeader` under the run prefix count. AKS requires the `reload` positive control. |

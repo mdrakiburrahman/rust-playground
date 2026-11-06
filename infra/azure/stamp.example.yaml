@@ -27,5 +27,8 @@ aks:
     serviceIpv4Cidr: 172.31.0.0/16
     serviceIpv6Cidr: fd20:240:2::/108
     dnsServiceIp: 172.31.0.10
+    # Set only IP allocation tags authorized for the target subscription.
+    egressIpv4IpTags: []
+    egressIpv6IpTags: []
 # Populate from the preserved current publisher FIC inventory before retiring old identities.
 publisherFederatedCredentials: []
