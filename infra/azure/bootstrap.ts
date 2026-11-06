@@ -199,7 +199,7 @@ type Headers = Record<string, string>;
 export type BlobEntry = { name: string; snapshot?: string | null; version?: string | null; etag?: string | null;
   deleted?: boolean; directory?: boolean };
 export class Azure {
-  tokens = new Map<string, { at: number; token: string }>();
+  tokens = new Map<string, { at: number; token: string; lifetime: number }>();
   token_pending = new Map<string, Promise<string>>();
   snapshots = new Map<string, Metadata>();
   constructor(public c: Config) {}
@@ -210,12 +210,24 @@ export class Azure {
   }
   async token(resource: string): Promise<string> {
     const cached = this.tokens.get(resource);
-    if (cached && runtime.now() - cached.at <= 240) return cached.token;
+    if (cached && runtime.now() - cached.at <= cached.lifetime) return cached.token;
     const pending = this.token_pending.get(resource);
     if (pending) return pending;
     const refresh = (async () => {
-      const token = (await this.cli('account', 'get-access-token', '--subscription', this.c.subscription, '--resource', resource)).accessToken;
-      this.tokens.set(resource, { at: runtime.now(), token });
+      const federated = ['AZURE_CLIENT_ID', 'AZURE_TENANT_ID', 'AZURE_FEDERATED_TOKEN_FILE']
+        .map(key => process.env[key] || '');
+      let token: string;
+      let lifetime = 240;
+      if (federated.some(Boolean)) {
+        if (federated.some(value => !value)) throw new Failure('Workload identity requires client ID, tenant ID and token file.');
+        const exchanged = await exchange_workload_identity_token(resource, federated[0]!, federated[1]!, federated[2]!);
+        token = exchanged.token;
+        lifetime = Math.min(lifetime, exchanged.expiresIn - 30);
+      } else {
+        token = (await this.cli('account', 'get-access-token', '--subscription', this.c.subscription,
+          '--resource', resource)).accessToken;
+      }
+      this.tokens.set(resource, { at: runtime.now(), token, lifetime });
       return token;
     })();
     this.token_pending.set(resource, refresh);
@@ -379,8 +391,44 @@ export class Azure {
     return items;
   }
 }
+export async function exchange_workload_identity_token(resource: string, clientId: string, tenantId: string,
+  tokenFile: string): Promise<{ token: string; expiresIn: number }> {
+  const assertion = fs.readFileSync(tokenFile, 'utf8').trim();
+  if (!assertion || assertion.length > 16_384) throw new Failure('Projected workload identity token is empty or too large.');
+  const scope = resource.replace(/\/+$/, '') + '/.default';
+  let response: Response;
+  try {
+    response = await fetch(`https://login.microsoftonline.com/${encodeURIComponent(tenantId)}/oauth2/v2.0/token`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ client_id: clientId, scope, grant_type: 'client_credentials',
+        client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer', client_assertion: assertion }),
+      signal: AbortSignal.timeout(15_000),
+      redirect: 'error',
+    });
+  } catch (error) {
+    throw new Failure('Workload identity token exchange request failed.', { cause: error });
+  }
+  if (!response.ok) throw new Failure(`Workload identity token exchange failed with HTTP ${response.status}.`);
+  let value: unknown;
+  try { value = await response.json(); }
+  catch (error) { throw new Failure('Workload identity token exchange returned invalid JSON.', { cause: error }); }
+  if (!value || typeof value !== 'object' || Array.isArray(value))
+    throw new Failure('Workload identity token exchange returned invalid metadata.');
+  const result = value as Record<string, unknown>;
+  const expiresIn = typeof result.expires_in === 'number' ? result.expires_in :
+    typeof result.expires_in === 'string' && /^\d+$/.test(result.expires_in) ? Number(result.expires_in) : 0;
+  if (typeof result.access_token !== 'string' || !result.access_token ||
+      typeof result.token_type !== 'string' || result.token_type.toLowerCase() !== 'bearer' ||
+      !Number.isSafeInteger(expiresIn) || expiresIn <= 30)
+    throw new Failure('Workload identity token exchange returned incomplete token metadata.');
+  return { token: result.access_token, expiresIn };
+}
+
 interface XmlNode { name: string; text: string; children: XmlNode[] }
 function xml_decode(value: string): string {
+
+
   return value.replace(/&([^;]*);|&/g, (entity, code: string | undefined) => {
     const named: Record<string, string> = { lt: '<', gt: '>', quot: '"', apos: "'", amp: '&' };
     if (code && Object.hasOwn(named, code)) return named[code];
