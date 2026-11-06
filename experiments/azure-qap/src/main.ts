@@ -10,6 +10,7 @@ import { lateLogHelp, positiveControl, profileSummary, resultsTable, writeReport
   type RunReport } from './report.js';
 import { Narrator, planTrials, runTrial, systemClock, type Trial, type TrialEnvironment, type TrialResult } from './scenario.js';
 import { logsQuery } from './storage-reads.js';
+import { runKubernetes } from './kubernetes.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CLEANUP_MS = 5 * 60_000;
@@ -81,6 +82,7 @@ export async function main(argv: readonly string[]): Promise<number> {
   const config = new Config(values);
   const azure = new Azure(config);
   const secrets = secretsFrom({ ...values, ARROWCOL_RESET_GENERATION: generation });
+  if (options.kubernetes) return runKubernetes({ options, argv, profile, azureConfig: config, generation, secrets });
   const redact = (text: string) => config.redact(text);
   fs.mkdirSync(out, { recursive: true });
   const evidence = new Evidence(path.join(out, 'evidence.jsonl'), secrets);

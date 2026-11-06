@@ -39,7 +39,8 @@ test('CLI flags override scenario.json without mutating the defaults', () => {
   assert.equal(options.env, 'other.env');
   assert.equal(options.out, 'out/dir');
   assert.deepEqual(defaults.operations, ['optimize', 'purge', 'vacuum', 'reload']);
-  assert.deepEqual(parseOptions([], defaults), { profile: defaults, env: '.env', out: undefined, help: false });
+  assert.deepEqual(parseOptions([], defaults), { profile: defaults, env: '.env', out: undefined, kubernetes: false,
+    kubernetesConfig: 'infra/kubernetes/azure-qap.yaml', help: false });
 });
 
 test('the documented long run needs --budget 1h because its tails alone exceed the 15m default', () => {
@@ -89,6 +90,15 @@ test('--help skips validation and documents every flag with its default', () => 
   assert.match(text, /positive control/);
   assert.match(text, /default 2m\)/);
   assert.match(text, /docs\/experiments\/azure-qap\/README\.md/);
+});
+
+test('Kubernetes mode accepts a config path and requires the mode flag', () => {
+  assert.deepEqual(parseOptions(['--kubernetes'], defaults), { profile: defaults, env: '.env', out: undefined,
+    kubernetes: true, kubernetesConfig: 'infra/kubernetes/azure-qap.yaml', help: false });
+  assert.equal(parseOptions(['--kubernetes', '--kubernetes-config', 'config/aks.yaml'], defaults).kubernetesConfig,
+    'config/aks.yaml');
+  assert.throws(() => parseOptions(['--kubernetes-config', 'config/aks.yaml'], defaults),
+    /--kubernetes-config requires --kubernetes/);
 });
 
 test('scenario.json must list exactly the known keys', () => {

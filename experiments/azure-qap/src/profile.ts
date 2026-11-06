@@ -35,6 +35,8 @@ export interface Options {
   profile: Profile;
   env: string;
   out?: string;
+  kubernetes: boolean;
+  kubernetesConfig: string;
   help: boolean;
 }
 
@@ -149,6 +151,8 @@ export function parseOptions(argv: readonly string[], defaults: Profile): Option
     budget: { type: 'string' },
     env: { type: 'string', default: '.env' },
     out: { type: 'string' },
+    kubernetes: { type: 'boolean', default: false },
+    'kubernetes-config': { type: 'string' },
     help: { type: 'boolean', short: 'h', default: false },
   } });
   const profile: Profile = { ...defaults, operations: [...defaults.operations] };
@@ -160,7 +164,11 @@ export function parseOptions(argv: readonly string[], defaults: Profile): Option
   if (values.tail !== undefined) profile.tailMs = parseDuration(values.tail, '--tail');
   if (values['log-wait'] !== undefined) profile.logWaitMs = parseDuration(values['log-wait'], '--log-wait');
   if (values.budget !== undefined) profile.budgetMs = parseDuration(values.budget, '--budget');
-  return { profile: values.help ? profile : validateProfile(profile), env: values.env, out: values.out, help: values.help };
+  if (!values.help && values['kubernetes-config'] !== undefined && !values.kubernetes)
+    throw new Error('--kubernetes-config requires --kubernetes.');
+  return { profile: values.help ? profile : validateProfile(profile), env: values.env, out: values.out,
+    kubernetes: values.kubernetes, kubernetesConfig: values['kubernetes-config'] ?? 'infra/kubernetes/azure-qap.yaml',
+    help: values.help };
 }
 
 export function helpText(defaults: Profile): string {
@@ -187,6 +195,8 @@ Options (defaults from experiments/azure-qap/scenario.json):
                        5m more. Must cover ceil(trials / parallel) x tail, so raise it for longer runs
   --env <file>         private env file (default .env; ARROWCOL_RESET_GENERATION may come from .env.azure)
   --out <dir>          report directory (default .temp/experiments/azure-qap/<runId>)
+  --kubernetes         run the full experiment as an AKS Job instead of in this devcontainer
+  --kubernetes-config <yaml>  Kustomize/Job settings (default infra/kubernetes/azure-qap.yaml)
   -h, --help           show this help
 
 Durations accept 90s, 2m, 1h, 1h30m or bare seconds.
