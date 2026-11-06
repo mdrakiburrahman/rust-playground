@@ -3,6 +3,15 @@
 This is original, public infrastructure code. Private reference implementations
 were used only to understand operational requirements, not copied.
 
+## Scope of this guide
+
+The existing loadtest sandbox described below is separate from the new AKS QAP
+stamp. Replacement AKS, ADX, storage, registry and logging resources are scoped
+to `arrow-collector-rg`; the separate `rust-playground` resource group is not a
+deployment or cleanup target. Follow [AKS QAP operations](AKS_QAP.md) for its
+stamp, shared identity, preflight gate and Kubernetes runtime. Do not use this
+legacy sandbox guide to delete or reset the AKS stamp.
+
 Local disk and local Kusto remain the loadtest default. `--mode azure` (or
 `ARROWCOL_MODE=azure`) switches storage and Kusto together. Azure writers and the
 bootstrap use the existing signed-in Azure CLI identity; Kusto reads Delta using

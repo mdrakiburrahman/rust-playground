@@ -3,6 +3,9 @@ param ownership object
 param storageAccountName string
 param clusterName string
 param identityName string
+param registryName string
+param aksConfig object
+param publisherFederatedCredentials array
 param databaseName string
 param dataContainer string
 param checkpointContainer string
@@ -23,6 +26,22 @@ resource identity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' 
   name: identityName
   location: location
   tags: ownership
+}
+
+module aks './aks.bicep' = {
+  name: 'arrowcol-aks'
+  params: {
+    location: location
+    ownership: ownership
+    clusterName: clusterName
+    registryName: registryName
+    sharedIdentityName: identityName
+    operatorObjectId: operatorObjectId
+    operatorType: operatorType
+    aksConfig: aksConfig
+    publisherFederatedCredentials: publisherFederatedCredentials
+  }
+  dependsOn: [identity]
 }
 
 resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
@@ -262,3 +281,8 @@ output experimentContainer string = experiment.name
 output experimentDatabase string = experimentDb.name
 output logAnalyticsWorkspaceId string = workspace.id
 output logAnalyticsCustomerId string = workspace.properties.customerId
+
+output aksClusterName string = aks.outputs.clusterName
+output aksOidcIssuer string = aks.outputs.oidcIssuer
+output identityClientId string = identity.properties.clientId
+output registryLoginServer string = aks.outputs.registryLoginServer

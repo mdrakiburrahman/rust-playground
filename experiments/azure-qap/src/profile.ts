@@ -166,6 +166,8 @@ export function parseOptions(argv: readonly string[], defaults: Profile): Option
   if (values.budget !== undefined) profile.budgetMs = parseDuration(values.budget, '--budget');
   if (!values.help && values['kubernetes-config'] !== undefined && !values.kubernetes)
     throw new Error('--kubernetes-config requires --kubernetes.');
+  if (!values.help && values.kubernetes && !profile.operations.includes('reload'))
+    throw new Error('AKS mode requires the reload positive control to verify ADX StorageBlobLogs attribution.');
   return { profile: values.help ? profile : validateProfile(profile), env: values.env, out: values.out,
     kubernetes: values.kubernetes, kubernetesConfig: values['kubernetes-config'] ?? 'infra/kubernetes/azure-qap.yaml',
     help: values.help };
@@ -204,8 +206,9 @@ Cleanup always runs, also on failure and Ctrl+C: the run's Kusto tables are drop
 its fixture directory runs/<runId>/ is deleted. Copy the printed KQL to explore while it runs.
 Exit code is nonzero on errors, failed trials, failed cleanup, or when an included reload
 (the positive control) was not seen re-reading every unchanged file, for whatever reason,
-including logs still pending or the budget running out. --log-wait 0 requires leaving
-reload out of --operations.
+including logs still pending or the budget running out. AKS mode requires reload to
+verify ADX StorageBlobLogs attribution. --log-wait 0 requires leaving reload out of
+--operations and is therefore unavailable in AKS mode.
 Requires the provisioned sandbox: npx nx run azure-infra:provision
 Docs: docs/experiments/azure-qap/README.md`;
 }

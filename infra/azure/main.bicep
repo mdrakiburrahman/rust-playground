@@ -1,17 +1,20 @@
 targetScope = 'subscription'
 
 param location string
-param resourceGroupName string = 'rust-playground'
+param resourceGroupName string = 'arrow-collector-rg'
 param sandboxId string
 param storageAccountName string
 param clusterName string
 param identityName string
+param registryName string
+param aksConfig object
+param publisherFederatedCredentials array
 param databaseName string = 'arrowcol'
 param dataContainer string = 'arrowcol'
 param checkpointContainer string = 'checkpoints'
 param experimentContainer string = 'experimentqap'
 param experimentDatabase string = 'experimentqap'
-param logAnalyticsWorkspaceName string = 'arrowcol-${sandboxId}'
+param logAnalyticsWorkspaceName string = 'arrow-collector-1'
 param controlMetadata object
 param checkpointExists bool = false
 param operatorObjectId string
@@ -48,6 +51,9 @@ module sandbox './sandbox.bicep' = {
     storageAccountName: storageAccountName
     clusterName: clusterName
     identityName: identityName
+    registryName: registryName
+    aksConfig: aksConfig
+    publisherFederatedCredentials: publisherFederatedCredentials
     databaseName: databaseName
     dataContainer: dataContainer
     checkpointContainer: checkpointContainer
@@ -70,3 +76,8 @@ output experimentContainer string = sandbox.outputs.experimentContainer
 output experimentDatabase string = sandbox.outputs.experimentDatabase
 output logAnalyticsWorkspaceId string = sandbox.outputs.logAnalyticsWorkspaceId
 output logAnalyticsCustomerId string = sandbox.outputs.logAnalyticsCustomerId
+
+output aksClusterName string = sandbox.outputs.aksClusterName
+output aksOidcIssuer string = sandbox.outputs.aksOidcIssuer
+output identityClientId string = sandbox.outputs.identityClientId
+output registryLoginServer string = sandbox.outputs.registryLoginServer

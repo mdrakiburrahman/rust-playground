@@ -99,6 +99,8 @@ test('Kubernetes mode accepts a config path and requires the mode flag', () => {
     'config/aks.yaml');
   assert.throws(() => parseOptions(['--kubernetes-config', 'config/aks.yaml'], defaults),
     /--kubernetes-config requires --kubernetes/);
+  assert.throws(() => parseOptions(['--kubernetes', '--operations', 'optimize'], defaults),
+    /AKS mode requires the reload positive control/);
 });
 
 test('scenario.json must list exactly the known keys', () => {

@@ -77,7 +77,9 @@ export async function main(argv: readonly string[]): Promise<number> {
   const runId = makeRunId(new Date(started));
   const out = path.resolve(ROOT, options.out ?? path.join('.temp/experiments/azure-qap', runId));
   const envFile = path.resolve(ROOT, options.env);
-  const values = { ...load_env(envFile), ...process.env } as Record<string, string>;
+  const generatedEnvFile = path.join(path.dirname(envFile), '.env.azure');
+  const generatedValues = fs.existsSync(generatedEnvFile) ? load_env(generatedEnvFile) : {};
+  const values = { ...load_env(envFile), ...generatedValues, ...process.env } as Record<string, string>;
   const generation = resetGeneration(values, envFile);
   const config = new Config(values);
   const azure = new Azure(config);
@@ -133,7 +135,7 @@ export async function main(argv: readonly string[]): Promise<number> {
     const [, container] = await azure.blob('HEAD', config.experimentContainer, '', { restype: 'container' }, undefined, {}, true);
     if (!Object.keys(container).length)
       throw new Error(`Storage container ${config.experimentContainer} is missing; run \`npx nx run azure-infra:provision\`.`);
-    say(`Kusto reads storage as managed identity ${principal} (StorageBlobLogs RequesterObjectId).`);
+    say(`StorageBlobLogs attribute ADX reads by shared principal ${principal} and the Kusto/ADX user-agent marker; runner reads are excluded.`);
     const capacity = await kusto.capacity(interrupt.signal).catch(() => undefined);
     say(`QAP capacity (\`.show capacity\`): ${capacity ? `total ${capacity.Total}, consumed ${capacity.Consumed}, ` +
       `remaining ${capacity.Remaining}` : 'not reported'}.`);
@@ -153,7 +155,7 @@ export async function main(argv: readonly string[]): Promise<number> {
     const root = `abfss://${config.experimentContainer}@${config.account}.dfs.core.windows.net/runs/${runId}/`;
     const fixtures = new Fixtures({ repo: ROOT, root, redact, env: childEnvironment(
       { ...process.env, ...values, ...config.generated(), ARROWCOL_RESET_GENERATION: generation },
-      root, path.join(ROOT, '.temp/qap-stage')) });
+      root, process.env.ARROWCOL_QAP_STAGE ?? path.join(ROOT, '.temp/qap-stage')) });
     const budget = AbortSignal.timeout(Math.max(1, started + profile.budgetMs - clock.now()));
     const source = (trial: Trial) => `${root}${trial.name};managed_identity=${principal}`;
     const environment: TrialEnvironment = { runId, profile, fixtures, kusto, source, principal, logs, clock, narrator,

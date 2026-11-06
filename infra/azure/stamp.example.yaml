@@ -1,0 +1,31 @@
+# Copy to infra/azure/stamp.yaml, set the subscription UUID, and verify address ranges against every connected network.
+subscription: 00000000-0000-0000-0000-000000000000
+stamp: 1
+resourceGroup: arrow-collector-rg
+location: eastus2
+aks:
+  version: 1.35.6
+  skuTier: Free
+  namespace: arrow-collector
+  serviceAccount: arrow-collector
+  systemPool:
+    name: systempool
+    vmSize: Standard_D8s_v6
+    initialCount: 3
+    minCount: 3
+    maxCount: 6
+    maxPods: 250
+    availabilityZones: ["1", "2", "3"]
+  network:
+    vnetIpv4Cidr: 10.240.0.0/16
+    vnetIpv6Cidr: fd20:240::/48
+    nodeSubnetIpv4Cidr: 10.240.0.0/24
+    nodeSubnetIpv6Cidr: fd20:240:0:1::/64
+    apiServerSubnetIpv4Cidr: 10.240.1.0/28
+    podIpv4Cidr: 172.30.0.0/16
+    podIpv6Cidr: fd20:240:1::/64
+    serviceIpv4Cidr: 172.31.0.0/16
+    serviceIpv6Cidr: fd20:240:2::/108
+    dnsServiceIp: 172.31.0.10
+# Populate from the preserved current publisher FIC inventory before retiring old identities.
+publisherFederatedCredentials: []

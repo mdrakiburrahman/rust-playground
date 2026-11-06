@@ -1,7 +1,4 @@
-namespace: arrow-collector
-serviceAccount: arrow-collector
-identityClientId: 00000000-0000-0000-0000-000000000000
-image: arrowcollector.azurecr.io/azure-qap@sha256:0000000000000000000000000000000000000000000000000000000000000000
+image: arrowcollector1.azurecr.io/azure-qap@sha256:0000000000000000000000000000000000000000000000000000000000000000
 resources:
   requests:
     cpu: "1"

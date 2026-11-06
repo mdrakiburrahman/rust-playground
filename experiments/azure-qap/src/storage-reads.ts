@@ -2,7 +2,7 @@ import { HttpFailure, Failure, type Azure } from '../../../infra/azure/bootstrap
 import { object, type Sleep } from './kusto.js';
 
 export type Phase = 'warm-up' | 'after-mutation' | 'late';
-/** One summarized StorageBlobLogs group: requests by the Kusto identity for one file, operation and status. */
+/** One summarized ADX-attributed StorageBlobLogs group for one file, operation and status. */
 export interface ReadGroup {
   phase: Phase;
   path: string;
@@ -11,6 +11,7 @@ export interface ReadGroup {
   requests: number;
   bytes: number;
   last: string;
+  userAgent: string;
 }
 export interface ReadScope {
   workspace: string;
@@ -41,6 +42,10 @@ function quote(value: string): string {
   return JSON.stringify(value);
 }
 
+export function isAdxUserAgent(value: string): boolean {
+  return /kusto|azure[ ._\/-]?data[ ._\/-]?explorer/i.test(value);
+}
+
 function iso(ms: number): string {
   return new Date(ms).toISOString();
 }
@@ -58,12 +63,14 @@ export function readsQuery(scope: ReadScope, window: ReadWindow): string {
 | where TimeGenerated >= datetime(${iso(window.from)})
 | where AccountName == ${quote(scope.account)} and Category == "StorageRead"
 | where RequesterObjectId =~ ${quote(scope.requester)}
+| where UserAgentHeader contains "Kusto" or UserAgentHeader contains "Azure-Data-Explorer" or UserAgentHeader contains "Azure Data Explorer" or UserAgentHeader contains "AzureDataExplorer"
 | where Uri contains ${quote(`/${scope.container}/${scope.prefix}`)}
-| distinct TimeGenerated, CorrelationId, OperationName, Uri, StatusCode, ResponseBodySize
-| extend Phase = case(TimeGenerated < datetime(${iso(window.mutationAt)}), "warm-up",
+| distinct TimeGenerated, CorrelationId, OperationName, Uri, StatusCode, ResponseBodySize, UserAgentHeader
+| extend UserAgent = tostring(UserAgentHeader),
+         Phase = case(TimeGenerated < datetime(${iso(window.mutationAt)}), "warm-up",
                       TimeGenerated < datetime(${iso(window.windowEnd)}), "after-mutation", "late"),
          Path = tostring(split(Uri, "?")[0])
-| summarize Requests = count(), Bytes = sum(ResponseBodySize), Last = max(TimeGenerated) by Phase, Path, OperationName, StatusCode
+| summarize Requests = count(), Bytes = sum(ResponseBodySize), Last = max(TimeGenerated) by Phase, Path, OperationName, StatusCode, UserAgent
 | order by Phase asc, Path asc`;
 }
 
@@ -73,7 +80,8 @@ export function rawQuery(scope: ReadScope, fromMs: number): string {
   return `StorageBlobLogs
 | where TimeGenerated >= datetime(${iso(fromMs)})
 | where RequesterObjectId =~ ${quote(scope.requester)} and Uri contains ${quote(`/${scope.container}/${scope.prefix}`)}
-| project TimeGenerated, OperationName, StatusCode, ResponseBodySize, Uri
+| where UserAgentHeader contains "Kusto" or UserAgentHeader contains "Azure-Data-Explorer" or UserAgentHeader contains "Azure Data Explorer" or UserAgentHeader contains "AzureDataExplorer"
+| project TimeGenerated, OperationName, StatusCode, ResponseBodySize, Uri, UserAgentHeader
 | order by TimeGenerated asc`;
 }
 
@@ -90,17 +98,18 @@ export function parseReads(response: unknown, scope: ReadScope): ReadGroup[] {
     return index;
   };
   const index = { phase: at('Phase'), path: at('Path'), operation: at('OperationName'), status: at('StatusCode'),
-    requests: at('Requests'), bytes: at('Bytes'), last: at('Last') };
+    requests: at('Requests'), bytes: at('Bytes'), last: at('Last'), userAgent: at('UserAgent') };
   const hosts = [`${scope.account}.blob.core.windows.net`, `${scope.account}.dfs.core.windows.net`];
   const root = `/${scope.container}/${scope.prefix}`;
   const groups: ReadGroup[] = [];
   for (const raw of table.rows) {
     if (!Array.isArray(raw) || raw.length !== columns.length) throw new Error('Malformed storage log row.');
     const phase = raw[index.phase];
+    const userAgent = String(raw[index.userAgent] ?? '');
     const url = new URL(String(raw[index.path]));
     const pathname = decodeURIComponent(url.pathname);
-    // Listing calls carry the prefix in their query string; only per-file requests are evidence.
-    if (!hosts.includes(url.hostname) || !pathname.startsWith(root)) continue;
+    // Listing calls carry the prefix in their query string; only ADX-attributed per-file requests are evidence.
+    if (!hosts.includes(url.hostname) || !pathname.startsWith(root) || !isAdxUserAgent(userAgent)) continue;
     const requests = raw[index.requests];
     const bytes = raw[index.bytes] ?? 0;
     const status = Number(raw[index.status]);
@@ -109,7 +118,7 @@ export function parseReads(response: unknown, scope: ReadScope): ReadGroup[] {
         typeof raw[index.last] !== 'string')
       throw new Error('Storage log group is malformed.');
     groups.push({ phase, path: pathname.slice(root.length), operation: raw[index.operation] as string, status, requests, bytes,
-      last: raw[index.last] as string });
+      last: raw[index.last] as string, userAgent });
   }
   return groups;
 }
@@ -152,8 +161,8 @@ export interface LogWaitOptions {
 }
 
 /**
- * StorageBlobLogs arrive minutes late and out of order. Logs count as complete only when the Kusto identity's own
- * later traffic (Delta-log polling) has arrived well past the watch window and the in-window picture stopped changing.
+ * StorageBlobLogs arrive minutes late and out of order. Logs count as complete only when ADX-marked
+ * Delta-log polling has arrived well past the watch window and the in-window picture stopped changing.
  */
 export async function waitForLogs(options: LogWaitOptions): Promise<LogWait> {
   const now = options.now ?? Date.now;

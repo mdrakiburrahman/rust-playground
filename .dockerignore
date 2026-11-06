@@ -24,3 +24,5 @@ onelake
 sync
 !**/.env.example
 !**/.env.*.example
+
+infra/kubernetes/azure-qap.yaml

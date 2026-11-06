@@ -120,7 +120,7 @@ export function lateLogHelp(report: RunReport, out: string): string {
     ...trials.map(trial => `  az monitor log-analytics query -w ${workspace} --analytics-query @${
       path.relative(process.cwd(), queryFile(out, trial))} -o table`),
     `Or paste a query file from ${path.relative(process.cwd(), path.join(out, 'queries'))}/ into the workspace's Logs blade.`,
-    'Rows with Phase == "after-mutation" and OperationName GetBlob/ReadFile on files the mutation did not touch are QAP re-reads;',
+    'Only rows with the shared principal and a Kusto/ADX UserAgentHeader are counted; after-mutation GetBlob/ReadFile events on untouched files are QAP re-reads;',
     'the *.raw.kql files list individual requests.',
   ].join('\n');
 }

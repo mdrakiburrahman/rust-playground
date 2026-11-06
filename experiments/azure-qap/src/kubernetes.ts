@@ -9,13 +9,8 @@ import type { Options, Profile } from './profile.js';
 
 const CLEANUP_SECONDS = 5 * 60;
 const JOB_START_SECONDS = 120;
-const RESOURCE_NAME = /^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$/;
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export interface KubernetesConfig {
-  namespace: string;
-  serviceAccount: string;
-  identityClientId: string;
   image: string;
   context?: string;
   resources: { requests: { cpu: string; memory: string }; limits: { cpu: string; memory: string } };
@@ -55,11 +50,7 @@ export function parseKubernetesConfig(text: string): KubernetesConfig {
   try { value = parseYaml(text); }
   catch (error) { throw new Error('Kubernetes configuration is not valid YAML.', { cause: error }); }
   const raw = record(value, 'Kubernetes configuration');
-  exactKeys(raw, ['namespace', 'serviceAccount', 'identityClientId', 'image', 'context', 'resources', 'nodeSelector'],
-    'Kubernetes configuration');
-  const namespace = stringValue(raw.namespace, 'namespace', RESOURCE_NAME, 63);
-  const serviceAccount = stringValue(raw.serviceAccount, 'serviceAccount', RESOURCE_NAME, 63);
-  const identityClientId = stringValue(raw.identityClientId, 'identityClientId', UUID);
+  exactKeys(raw, ['image', 'context', 'resources', 'nodeSelector'], 'Kubernetes configuration');
   const image = stringValue(raw.image, 'image', /^[a-z0-9][a-z0-9.-]*(?::\d+)?\/[a-z0-9][a-z0-9._/-]*@sha256:[a-f0-9]{64}$/);
   const context = raw.context === undefined ? undefined : stringValue(raw.context, 'context', /^[A-Za-z0-9_.:/-]+$/);
   const resources = record(raw.resources, 'resources');
@@ -84,7 +75,7 @@ export function parseKubernetesConfig(text: string): KubernetesConfig {
       quantityValue(requestCpu, false) > quantityValue(limitCpu, false) ||
       quantityValue(requestMemory, true) > quantityValue(limitMemory, true))
     throw new Error('Resource requests must be positive and no greater than their limits.');
-  return { namespace, serviceAccount, identityClientId, image, ...(context ? { context } : {}),
+  return { image, ...(context ? { context } : {}),
     resources: { requests: { cpu: requestCpu, memory: requestMemory },
       limits: { cpu: limitCpu, memory: limitMemory } }, nodeSelector };
 }
@@ -109,8 +100,8 @@ function jsonPatch(target: Record<string, string>, operations: Array<{ op: strin
   return { target, patch: stringify(operations) };
 }
 
-function writeKustomizeOverlay(config: KubernetesConfig, jobName: string, args: string[], environment: Record<string, string>,
-  generation: string, activeDeadlineSeconds: number): string {
+function writeKustomizeOverlay(config: KubernetesConfig, namespace: string, serviceAccount: string, identityClientId: string,
+  jobName: string, args: string[], environment: Record<string, string>, generation: string, activeDeadlineSeconds: number): string {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'azure-qap-kustomize-'));
   const baseSource = path.join(ROOT, 'infra/kubernetes/base');
   const overlaySource = path.join(ROOT, 'infra/kubernetes/overlays/azure-qap');
@@ -124,11 +115,11 @@ function writeKustomizeOverlay(config: KubernetesConfig, jobName: string, args: 
   const secretName = `${jobName}-secret`;
   const patches = [
     jsonPatch({ version: 'v1', kind: 'Namespace', name: 'azure-qap' }, [
-      { op: 'replace', path: '/metadata/name', value: config.namespace },
+      { op: 'replace', path: '/metadata/name', value: namespace },
     ]),
     jsonPatch({ version: 'v1', kind: 'ServiceAccount', name: 'azure-qap' }, [
-      { op: 'replace', path: '/metadata/name', value: config.serviceAccount },
-      { op: 'add', path: '/metadata/annotations/azure.workload.identity~1client-id', value: config.identityClientId },
+      { op: 'replace', path: '/metadata/name', value: serviceAccount },
+      { op: 'add', path: '/metadata/annotations/azure.workload.identity~1client-id', value: identityClientId },
     ]),
     jsonPatch({ version: 'v1', kind: 'ConfigMap', name: 'azure-qap-env' }, [
       { op: 'replace', path: '/metadata/name', value: envName },
@@ -143,7 +134,7 @@ function writeKustomizeOverlay(config: KubernetesConfig, jobName: string, args: 
       { op: 'add', path: '/metadata/labels/run', value: jobName },
       { op: 'add', path: '/spec/activeDeadlineSeconds', value: activeDeadlineSeconds },
       { op: 'add', path: '/spec/template/metadata/labels/run', value: jobName },
-      { op: 'replace', path: '/spec/template/spec/serviceAccountName', value: config.serviceAccount },
+      { op: 'replace', path: '/spec/template/spec/serviceAccountName', value: serviceAccount },
       { op: 'replace', path: '/spec/template/spec/containers/0/image', value: config.image },
       { op: 'replace', path: '/spec/template/spec/containers/0/args', value: args },
       { op: 'replace', path: '/spec/template/spec/containers/0/envFrom/0/configMapRef/name', value: envName },
@@ -152,7 +143,7 @@ function writeKustomizeOverlay(config: KubernetesConfig, jobName: string, args: 
       { op: 'add', path: '/spec/template/spec/nodeSelector', value: config.nodeSelector },
     ]),
   ];
-  kustomization.namespace = config.namespace;
+  kustomization.namespace = namespace;
   kustomization.patches = patches;
   fs.writeFileSync(kustomizationFile, stringify(kustomization), { mode: 0o600 });
   return tempRoot;
@@ -172,8 +163,8 @@ async function runKubectl(config: KubernetesConfig, azure: Config, args: string[
   return result.stdout.trim();
 }
 
-function streamLogs(config: KubernetesConfig, pod: string, redact: (text: string) => string): () => void {
-  const child = spawn('kubectl', kubectlArgs(config, ['logs', '--follow', '--container', 'experiment', '-n', config.namespace, pod]),
+function streamLogs(config: KubernetesConfig, namespace: string, pod: string, redact: (text: string) => string): () => void {
+  const child = spawn('kubectl', kubectlArgs(config, ['logs', '--follow', '--container', 'experiment', '-n', namespace, pod]),
     { detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
   const output = (chunk: Buffer) => process.stdout.write(redact(chunk.toString()));
   child.stdout.on('data', output);
@@ -191,13 +182,18 @@ export async function runKubernetes(input: { options: Options; argv: readonly st
   generation?: string; secrets: string[] }): Promise<number> {
   if (!input.generation) throw new Failure('ARROWCOL_RESET_GENERATION is required for the Kubernetes QAP Job.');
   const config = loadKubernetesConfig(input.options.kubernetesConfig);
+  const namespace = input.azureConfig.kubernetesNamespace;
+  const serviceAccount = input.azureConfig.kubernetesServiceAccount;
+  const identityClientId = input.azureConfig.identity_client_id;
+  if (!identityClientId) throw new Failure('Generated AZURE_UAMI_CLIENT_ID is missing; provision the stamped Azure infrastructure first.');
   const suffix = randomBytes(4).toString('hex');
   const jobName = `azure-qap-${new Date().toISOString().replace(/[-:TZ.]/g, '').slice(0, 14)}-${suffix}`;
   const args = kubernetesRuntimeArgs(input.argv);
   const activeDeadlineSeconds = Math.ceil((input.profile.budgetMs + CLEANUP_SECONDS * 1000 + JOB_START_SECONDS * 1000) / 1000);
   const environment = { ...input.azureConfig.generated(), AZURE_SUBSCRIPTION_ID: input.azureConfig.subscription,
     AZURE_RESOURCE_GROUP: input.azureConfig.group, ARROWCOL_QAP_STAGE: '/tmp/qap-stage' };
-  const tempRoot = writeKustomizeOverlay(config, jobName, args, environment, input.generation, activeDeadlineSeconds);
+  const tempRoot = writeKustomizeOverlay(config, namespace, serviceAccount, identityClientId, jobName, args, environment,
+    input.generation, activeDeadlineSeconds);
   const overlay = path.join(tempRoot, 'infra/kubernetes/overlays/azure-qap');
   const manifest = path.join(tempRoot, 'job.yaml');
   const output = path.resolve(ROOT, input.options.out ?? `.temp/experiments/azure-qap/kubernetes/${jobName}`);
@@ -219,17 +215,17 @@ export async function runKubernetes(input: { options: Options; argv: readonly st
       throw new Failure(`Refusing to overwrite non-empty Kubernetes evidence directory ${path.relative(ROOT, output)}.`);
     fs.mkdirSync(output, { recursive: true, mode: 0o700 });
     await runKubectl(config, input.azureConfig,
-      ['cp', '--container', 'experiment', '-n', config.namespace, `${pod}:/artifacts/.`, output], 120);
+      ['cp', '--container', 'experiment', '-n', namespace, `${pod}:/artifacts/.`, output], 120);
     artifactsCopied.value = true;
   };
   const waitForDone = async (timeoutSeconds: number, ignoreInterrupt = false): Promise<boolean> => {
     const deadline = Date.now() + timeoutSeconds * 1000;
     while ((ignoreInterrupt || !interrupted) && Date.now() < deadline) {
       const marker = await run_tree(['kubectl', ...kubectlArgs(config, [
-        'exec', '-n', config.namespace, pod!, '--', 'test', '-f', '/artifacts/done'])], 15);
+        'exec', '-n', namespace, pod!, '--', 'test', '-f', '/artifacts/done'])], 15);
       if (marker.returncode === 0) return true;
       const status = await runKubectl(config, input.azureConfig,
-        ['get', 'job', jobName, '-n', config.namespace, '-o', 'json'], 15).then(JSON.parse) as { status?: { failed?: number } };
+        ['get', 'job', jobName, '-n', namespace, '-o', 'json'], 15).then(JSON.parse) as { status?: { failed?: number } };
       if ((status.status?.failed ?? 0) > 0) return false;
       await sleep(5_000);
     }
@@ -243,20 +239,20 @@ export async function runKubernetes(input: { options: Options; argv: readonly st
     if (applied.returncode) throw commandFailure('kubectl apply', applied, input.azureConfig);
     jobApplied = true;
     await runKubectl(config, input.azureConfig,
-      ['wait', '--for=condition=Ready', 'pod', '--selector', `job-name=${jobName}`, '-n', config.namespace,
+      ['wait', '--for=condition=Ready', 'pod', '--selector', `job-name=${jobName}`, '-n', namespace,
         `--timeout=${JOB_START_SECONDS}s`], JOB_START_SECONDS + 15);
     const pods = JSON.parse(await runKubectl(config, input.azureConfig,
-      ['get', 'pods', '--selector', `job-name=${jobName}`, '-n', config.namespace, '-o', 'json'], 30)) as {
+      ['get', 'pods', '--selector', `job-name=${jobName}`, '-n', namespace, '-o', 'json'], 30)) as {
         items?: Array<{ metadata?: { name?: string } }> };
     pod = pods.items?.[0]?.metadata?.name;
     if (!pod) throw new Failure('Kubernetes Job became ready without an owned Pod.');
-    logsStop = streamLogs(config, pod, redact);
+    logsStop = streamLogs(config, namespace, pod, redact);
     const completed = await waitForDone(activeDeadlineSeconds);
     if (!completed) throw new Failure(interrupted ? 'Kubernetes QAP Job was interrupted before writing its completion marker.' :
       'Kubernetes QAP Job ended without writing its completion marker.');
     await copyArtifacts();
     const result = await runKubectl(config, input.azureConfig,
-      ['exec', '-n', config.namespace, pod, '--', 'cat', '/artifacts/exit-code'], 30);
+      ['exec', '-n', namespace, pod, '--', 'cat', '/artifacts/exit-code'], 30);
     if (!/^\d{1,3}$/.test(result) || Number(result) > 255) throw new Failure('Kubernetes QAP Job wrote an invalid exit code.');
     exitCode = Number(result);
   } catch (error) {
@@ -264,7 +260,7 @@ export async function runKubernetes(input: { options: Options; argv: readonly st
   }
   if (jobApplied && pod && !artifactsCopied.value) {
     try {
-      await runKubectl(config, input.azureConfig, ['exec', '-n', config.namespace, pod, '--', 'kill', '-TERM', '1'], 30);
+      await runKubectl(config, input.azureConfig, ['exec', '-n', namespace, pod, '--', 'kill', '-TERM', '1'], 30);
       if (await waitForDone(CLEANUP_SECONDS, true)) await copyArtifacts();
       else throw new Failure('Kubernetes QAP cancellation did not finish cleanup before the five-minute deadline.');
     } catch (error) {
@@ -273,7 +269,7 @@ export async function runKubernetes(input: { options: Options; argv: readonly st
   }
   if (jobApplied) {
     try { await runKubectl(config, input.azureConfig,
-      ['delete', 'job', jobName, '-n', config.namespace, '--grace-period=10', '--wait=true', '--timeout=30s'], 75); }
+      ['delete', 'job', jobName, '-n', namespace, '--grace-period=10', '--wait=true', '--timeout=30s'], 75); }
     catch (error) { primaryError ??= error; }
   }
   if (logsStop) {

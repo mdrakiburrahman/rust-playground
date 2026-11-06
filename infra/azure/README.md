@@ -1,5 +1,10 @@
 # Azure sandbox
 
+> The legacy loadtest sandbox below remains separate from the AKS QAP stamp.
+> Replacement AKS, ADX, storage, registry and logging resources are scoped to
+> `arrow-collector-rg`; the separate `rust-playground` resource group is not
+> a deployment or cleanup target. See [AKS QAP operations](../../docs/operations/AKS_QAP.md).
+
 Declarative Bicep infrastructure with TypeScript orchestration. Run from the repository root inside the Linux devcontainer.
 
 | Setup | Value |
@@ -74,3 +79,22 @@ Use `npx --no-install tsx infra/azure/bootstrap.ts <command>`:
 | Details | Reference |
 | --- | --- |
 | Configuration, custody, recovery and failure contracts | [Azure sandbox details](../../docs/operations/AZURE_SANDBOX.md) |
+
+## AKS QAP stamp
+
+The AKS runtime runs the existing QAP driver and Rust binaries in a Kubernetes
+Job; devcontainer mode remains the default. One `arrow-collector` UAMI is
+shared by ADX, AKS control plane and kubelet, the federated pod, and ACR image
+publishing/pull. Preflight qualifies Azure support, quota and networking, and
+blocks replacement while legacy Terraform state, Key Vault consumers, role
+assignments, registry publishers or FIC subjects remain unaccounted for.
+
+| Task | Entry point |
+| --- | --- |
+| Configure / qualify / provision | `infra/azure/stamp.example.yaml`; follow [AKS QAP operations](../../docs/operations/AKS_QAP.md) before provisioning. |
+| Kustomize Job config | Copy `infra/kubernetes/azure-qap.example.yaml` to ignored `azure-qap.yaml`; set a digest-pinned image and desired resources/node selector. |
+| Run on AKS | `npx nx run azure-qap-experiment:run -- --kubernetes --kubernetes-config infra/kubernetes/azure-qap.yaml` |
+| Preserve evidence | The runner collects logs, reports and KQL files before removing its unique Job; only shared-principal requests with a Kusto/ADX `UserAgentHeader` under the run prefix count. AKS requires the `reload` positive control. |
+
+Do not treat the legacy `reset` command as an AKS resource-group cleanup. No
+resource-group deletion is part of bootstrap or reset.

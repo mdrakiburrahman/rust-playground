@@ -37,11 +37,41 @@ npx nx run azure-qap-experiment:run -- --files 16 --file-mib 32 --repetitions 2 
 | `--tail <dur>` | `2m` | Watch window after the mutation once QAP is caught up; restarts if QAP regresses |
 | `--log-wait <dur>` | `5m` | Max wait for `StorageBlobLogs`; `0` skips it (not allowed with `reload`) |
 | `--budget <dur>` | `15m` | Hard cap for all trials; must cover `ceil(trials / parallel) x tail` |
+| `--kubernetes` | off | Run the full experiment as an AKS Job instead of in this devcontainer |
+| `--kubernetes-config <yaml>` | `infra/kubernetes/azure-qap.yaml` | Kustomize image digest, pod resources, node selector and optional context; requires `--kubernetes` |
 | `--env <file>` | `.env` | Private env file |
 | `--out <dir>` | `.temp/experiments/azure-qap/<runId>` | Report directory |
 
 Defaults live in [`scenario.json`](scenario.json); flags override them.
 Durations accept `90s`, `2m`, `1h`, `1h30m` or bare seconds.
+
+### Run on AKS
+
+The devcontainer remains the default. To run the same driver and Rust binaries
+inside a Kubernetes Job, publish a Linux image using the shared `arrow-collector`
+UAMI, copy the Kustomize sample, and set its image to the returned immutable
+`@sha256:` digest:
+
+```bash
+npx nx run azure-qap-experiment:image -- --registry <stamped-acr> \
+  --azure-env .env.azure --stamp-config infra/azure/stamp.yaml
+cp infra/kubernetes/azure-qap.example.yaml infra/kubernetes/azure-qap.yaml
+# Set image to <stamped-acr>.azurecr.io/azure-qap@sha256:<published-digest>.
+npx nx run azure-qap-experiment:run -- --kubernetes \
+  --kubernetes-config infra/kubernetes/azure-qap.yaml \
+  --operations optimize,purge,vacuum,reload
+```
+
+The YAML controls only the digest-pinned image, resource requests/limits, node
+selector and optional context. Namespace, ServiceAccount, UAMI and Azure
+resource settings come from validated stamp output. Commit the source first: the
+publisher rejects a dirty worktree so each image digest identifies a revision.
+AKS runs must include `reload`; evidence counts only the shared principal's
+StorageBlobLogs rows with a Kusto/ADX `UserAgentHeader`. The Job does not retry
+automatically; the runner streams logs and retrieves the report/evidence/query
+files before cleaning its uniquely named Job. See [Kubernetes runtime
+configuration](../../infra/kubernetes/README.md) and [AKS QAP
+operations](../../docs/operations/AKS_QAP.md).
 
 ## What a trial does
 
@@ -56,8 +86,9 @@ Durations accept `90s`, `2m`, `1h`, `1h30m` or bare seconds.
    drops and recreates the table for `reload`.
 4. **Tail**: watches QAP state and extents; if QAP looks caught up and then
    regresses, the window restarts (bounded by `--budget`).
-5. **Log wait**: polls Log Analytics for reads by the Kusto managed identity under
-   the trial's prefix until late logs settle (bounded by `--log-wait`).
+5. **Log wait**: polls Log Analytics for reads by the shared principal under the
+   trial's prefix and with a Kusto/ADX `UserAgentHeader`; runner/fixture reads do
+   not count. Late logs settle within `--log-wait`.
 6. **Report**: prints a table per trial and writes `report.md`, `report.json`,
    `evidence.jsonl` and `queries/*.kql` under `--out`, plus the queries to
    re-check late logs.

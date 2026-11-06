@@ -260,7 +260,17 @@ New role assignments:
 
 ## Run it
 
-Start in the devcontainer with the private `.env` and an Azure sign-in. This is
+The historical results and resource table above document the original
+sandbox-based, devcontainer runs. The current AKS stamp is a separate deployment
+in `arrow-collector-rg` with one shared `arrow-collector` UAMI. It can run the
+same scenario as a non-retrying Kubernetes Job; see [AKS QAP
+operations](../../operations/AKS_QAP.md) and the [runtime
+README](../../../experiments/azure-qap/README.md#run-on-aks). Do not interpret
+fixture/setup reads by that shared identity as proof of ADX table reads. AKS
+runs require `reload`; only shared-principal requests with a Kusto/ADX
+`UserAgentHeader` are evidence, and that live signature must be qualified.
+
+Start a devcontainer run with the private `.env` and an Azure sign-in. This is
 a scenario runner, not a loadtest.
 
 The defaults below were exercised against Azure on 2026-10-31. Use
@@ -460,6 +470,7 @@ StorageBlobLogs
 | where Category == "StorageRead"
 | where Uri contains "/experimentqap/runs/<runId>/"
 | where RequesterObjectId =~ "<kusto-identity-object-id>"
+| where UserAgentHeader contains "Kusto" or UserAgentHeader contains "Azure-Data-Explorer" or UserAgentHeader contains "Azure Data Explorer" or UserAgentHeader contains "AzureDataExplorer"
 | where OperationName in ("GetBlob", "ReadFile")
 | where toint(StatusCode) between (200 .. 299)
 | extend File = tostring(parse_url(Uri).Path)

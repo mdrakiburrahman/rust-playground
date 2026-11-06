@@ -1,0 +1,40 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import test from 'node:test';
+import { assertNoStampNetworkOverlap, defaultStampConfig, parseStampConfig } from './stamp.js';
+
+const example = fs.readFileSync(new URL('./stamp.example.yaml', import.meta.url), 'utf8');
+
+test('loads the approved resource group, stamp and AKS baseline from YAML', () => {
+  const config = parseStampConfig(example);
+  assert.equal(config.stamp, 1);
+  assert.equal(config.resourceGroup, 'arrow-collector-rg');
+  assert.equal(config.location, 'eastus2');
+  assert.equal(config.aks.version, '1.35.6');
+  assert.equal(config.aks.systemPool.vmSize, 'Standard_D8s_v6');
+  assert.equal(config.aks.network.dnsServiceIp, '172.31.0.10');
+});
+
+test('rejects invalid stamps, resource-group scope and network overlaps', () => {
+  assert.throws(() => parseStampConfig(example.replace('stamp: 1', 'stamp: 0')), /stamp must be an integer/);
+  assert.throws(() => parseStampConfig(example.replace('arrow-collector-rg', 'rust-playground')), /resourceGroup is invalid/);
+  assert.throws(() => parseStampConfig(example.replace('apiServerSubnetIpv4Cidr: 10.240.1.0/28',
+    'apiServerSubnetIpv4Cidr: 10.240.0.0/28')), /non-overlapping/);
+  assert.throws(() => parseStampConfig(example.replace('serviceIpv4Cidr: 172.31.0.0/16',
+    'serviceIpv4Cidr: 172.31.0.0/24')), /prefix 16\.\.16/);
+});
+
+test('requires explicit target defaults and rejects a different group or region', () => {
+  assert.equal(defaultStampConfig().stamp, 1);
+  assert.throws(() => defaultStampConfig({ AZURE_RESOURCE_GROUP: 'rust-playground' }), /exact arrow-collector-rg/);
+  assert.throws(() => defaultStampConfig({ AZURE_LOCATION: 'westus2' }), /qualified eastus2/);
+});
+test('validates publisher federation and rejects IPv4 or IPv6 overlap with Azure networks', () => {
+  const publisher = example.replace('publisherFederatedCredentials: []',
+    'publisherFederatedCredentials:\n  - name: github-publish\n    issuer: https://token.actions.githubusercontent.com\n    subject: repo:org@123/project@456:environment:publish');
+  const config = parseStampConfig(publisher);
+  assert.equal(config.publisherFederatedCredentials[0]?.subject, 'repo:org@123/project@456:environment:publish');
+  assert.throws(() => assertNoStampNetworkOverlap(config, ['10.240.64.0/18']), /overlaps an existing Azure VNet/);
+  assert.throws(() => assertNoStampNetworkOverlap(config, ['fd20:240:2::/64']), /overlaps an existing Azure VNet/);
+  assert.doesNotThrow(() => assertNoStampNetworkOverlap(config, ['10.0.0.0/16', 'fd00:0:0040::/56']));
+});
