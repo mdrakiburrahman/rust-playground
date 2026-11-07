@@ -1000,7 +1000,7 @@ impl CatalogSchemaVersion {
             .iter()
             .map(CatalogField::field_number)
             .max()
-            .map_or(Ok(1), |number| next_protobuf_field_number(number))
+            .map_or(Ok(1), next_protobuf_field_number)
     }
 }
 
