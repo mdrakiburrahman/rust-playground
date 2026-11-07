@@ -2384,7 +2384,11 @@ mod tests {
         assert!(KustoClient::with_mode("https://localhost:8080", &directory.0, Mode::Local, DATABASE).is_err());
         let client = KustoClient::with_mode("https://cluster.kusto.windows.net", &directory.0, Mode::Azure, "db")?;
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-        assert!(runtime.block_on(client.expose("dataflow_x", "/delta/dataflow/x")).is_err());
+        assert!(
+            runtime
+                .block_on(client.expose("dataflow_x", "/delta/dataflow/x"))
+                .is_err()
+        );
         assert!(runtime.block_on(client.bootstrap()).is_ok());
         Ok(())
     }

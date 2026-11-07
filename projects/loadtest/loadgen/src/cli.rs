@@ -256,7 +256,11 @@ pub struct RunArgs {
     pub router_endpoint: String,
 
     /// Schema Catalog service endpoint.
-    #[arg(long, env = "LOADTEST_CATALOG_ENDPOINT", default_value = "http://arrowcol-catalog:8817")]
+    #[arg(
+        long,
+        env = "LOADTEST_CATALOG_ENDPOINT",
+        default_value = "http://arrowcol-catalog:8817"
+    )]
     pub catalog_endpoint: String,
 
     /// Trusted-edge HMAC secret file.

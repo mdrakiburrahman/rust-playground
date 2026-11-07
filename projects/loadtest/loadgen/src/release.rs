@@ -624,7 +624,11 @@ mod tests {
         assert!(report.passed, "{:?}", report.errors);
         assert_eq!(report.run_id.as_deref(), Some("run-1"));
         assert_eq!(
-            report.publishers.iter().map(|publisher| publisher.instance_id.as_str()).collect::<Vec<_>>(),
+            report
+                .publishers
+                .iter()
+                .map(|publisher| publisher.instance_id.as_str())
+                .collect::<Vec<_>>(),
             [DATAFLOW]
         );
     }
@@ -632,12 +636,18 @@ mod tests {
     #[test]
     fn drain_evidence_must_be_clean_and_bound_to_the_run() {
         rejects(|case| case.drain.metadata = json!({}), "no run identity");
-        rejects(|case| case.routed.run_id = Some("old-run".to_owned()), "does not belong to this run");
+        rejects(
+            |case| case.routed.run_id = Some("old-run".to_owned()),
+            "does not belong to this run",
+        );
         rejects(
             |case| case.drain.publication["dataflow_settled"] = json!(false),
             "publication drain evidence is not settled",
         );
-        rejects(|case| case.drain.mutators["clean"] = json!(false), "mutator drain evidence is not clean");
+        rejects(
+            |case| case.drain.mutators["clean"] = json!(false),
+            "mutator drain evidence is not clean",
+        );
         rejects(
             |case| case.drain.mutators["services"] = json!(["tenant-stream"]),
             "publisher dataflow-1 has no clean stop evidence",
@@ -652,15 +662,27 @@ mod tests {
     fn routing_evidence_requires_exactly_one_dataflow_publisher() {
         rejects(|case| case.routed.collectors.clear(), "no live dataflow-1 publisher");
         rejects(
-            |case| case.routed.collectors.push(collector(HISTORICAL, "loadtest-dataflow-1", "dataflow", "ready", false)),
+            |case| {
+                case.routed
+                    .collectors
+                    .push(collector(HISTORICAL, "loadtest-dataflow-1", "dataflow", "ready", false))
+            },
             "2 live dataflow generations",
         );
         rejects(
-            |case| case.routed.collectors.push(collector(HISTORICAL, "other", "tenant", "ready", false)),
+            |case| {
+                case.routed
+                    .collectors
+                    .push(collector(HISTORICAL, "other", "tenant", "ready", false))
+            },
             "unknown pool tenant",
         );
         rejects(
-            |case| case.routed.collectors.push(collector(DATAFLOW, "duplicate", "dataflow", "ready", false)),
+            |case| {
+                case.routed
+                    .collectors
+                    .push(collector(DATAFLOW, "duplicate", "dataflow", "ready", false))
+            },
             "repeats collector instance",
         );
     }
@@ -673,7 +695,11 @@ mod tests {
             "is ready, not cleanly stopped",
         );
         rejects(
-            |case| case.after.collectors.push(collector(HISTORICAL, "another", "dataflow", "ready", false)),
+            |case| {
+                case.after
+                    .collectors
+                    .push(collector(HISTORICAL, "another", "dataflow", "ready", false))
+            },
             "still live after the drain",
         );
         rejects(|case| case.after.leases = vec![lease(HISTORICAL)], "outside this run");
@@ -682,13 +708,9 @@ mod tests {
 
     fn observed_crash() -> Case {
         let mut case = released();
-        case.after.collectors.push(collector(
-            HISTORICAL,
-            "loadtest-dataflow-1",
-            "dataflow",
-            "failed",
-            true,
-        ));
+        case.after
+            .collectors
+            .push(collector(HISTORICAL, "loadtest-dataflow-1", "dataflow", "failed", true));
         case.drain.mutators["containers"] = json!([
             {"id": "b".repeat(64), "service": "dataflow-1", "started_at_unix_ms": 3}
         ]);

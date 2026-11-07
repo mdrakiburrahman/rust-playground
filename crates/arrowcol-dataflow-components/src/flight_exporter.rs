@@ -381,10 +381,7 @@ mod tests {
 
     async fn upstream_table(ddl: &str) -> Result<(TableIdentity, Arc<arrow_schema::Schema>)> {
         let catalog = Arc::new(MemoryCatalogStore::new());
-        let control = CatalogControlPlane::new(
-            DdlParser::default(),
-            Arc::clone(&catalog) as Arc<dyn CatalogStore>,
-        );
+        let control = CatalogControlPlane::new(DdlParser::default(), Arc::clone(&catalog) as Arc<dyn CatalogStore>);
         let completion = control.execute_ddl(FlightSqlDdlRequest::new(ddl)).await?;
         let current = catalog
             .current_schema(completion.identity())

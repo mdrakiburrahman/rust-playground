@@ -253,7 +253,6 @@ impl SagaRecord {
             last_error: None,
         }
     }
-
 }
 
 /// New schema change to reserve atomically.
