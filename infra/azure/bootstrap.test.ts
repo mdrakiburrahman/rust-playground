@@ -617,17 +617,16 @@ for (const repoint of [true, false]) test(`${repoint ? 'repointed' : 'same-locat
   if (repoint) assert.ok(deletion < commands.findIndex(command => command.includes('.create-or-alter')));
   assert.match(commands.at(-1), /query_acceleration/);
 });
-test('both pools use catalog paths, inferred schema and isolated root prefix', async () => {
+test('Dataflow catalog paths retain inferred schema and isolated root prefix', async () => {
   azure.c.table_prefix = 'loadtest/run-example';
-  const bindings = ['direct', 'dataflow'].map(pool => ({ name: pool + '_table', relative_path: pool + '/telemetry/sqlserver/table' }));
+  const bindings = [{ name: 'dataflow_table', relative_path: 'dataflow/telemetry/sqlserver/table' }];
   fs.writeFileSync(manifest, JSON.stringify(bindings));
   for (const item of bindings) azure.logs.set(`loadtest/run-example/${item.relative_path}/_delta_log/00000000000000000000.json`,
     Buffer.from('{"protocol":{}}\n{"metaData":{}}'));
   await b.reconcile(azure, manifest);
   const commands = azure.events.filter(event => event[0] === 'kql').map(event => event[1]);
-  assert.equal(commands.length, 6);
-  assert.match(commands[2], /\['direct_table'\] kind=delta.*\/loadtest\/run-example\/direct\/telemetry\/sqlserver\/table;/);
-  assert.match(commands[4], /\['dataflow_table'\] kind=delta/);
+  assert.equal(commands.length, 4);
+  assert.match(commands[2], /\['dataflow_table'\] kind=delta.*\/loadtest\/run-example\/dataflow\/telemetry\/sqlserver\/table;/);
 });
 
 function leasedStorage() {

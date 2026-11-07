@@ -1,5 +1,5 @@
-//! Offline proof of the shared `initialize-azure` body (`initialize_tables_with`): all 26
-//! canonical tables go through the real bootstrap initializer over injected control metadata and a
+//! Offline proof of the shared `initialize-azure` body (`initialize_tables_with`): all 13
+//! Dataflow canonical tables go through the real bootstrap initializer over injected control metadata and a
 //! disposable local store, and the manifest is published only after every table drains. Uses the
 //! dev-only `arrow-deltalake/test-control` seam; no Azure endpoint, token or process environment.
 //! The parent-chain case composes the real Python parent's child environment, the
@@ -37,7 +37,7 @@ const CONTAINER: &str = "tables";
 const ROOT: &str = "abfss://tables@acct.dfs.core.windows.net/sandbox";
 const GENERATION: &str = "00000000-0000-4000-8000-000000000001";
 const ROTATED: &str = "00000000-0000-4000-8000-000000000002";
-const TABLES: usize = 26;
+const TABLES: usize = 13;
 
 #[derive(Default)]
 struct Memory(Mutex<(BTreeMap<String, String>, u64)>);
@@ -222,7 +222,7 @@ fn local(scratch: &Scratch) -> Result<Arc<dyn ObjectStore>> {
     Ok(Arc::new(LocalFileSystem::new_with_prefix(scratch.data())?))
 }
 
-/// Guarantees: every canonical table (both pools) is initialized under fenced-v1 by a bootstrap
+/// Guarantees: every Dataflow canonical table is initialized under fenced-v1 by a bootstrap
 /// member that drains and unregisters; the manifest lists exactly those tables and appears only
 /// after the last one; a rerun preserves every existing log byte-for-byte.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -277,7 +277,7 @@ async fn refused_admission_stops_at_first_table_with_no_blobs_or_manifest() -> R
             .err()
             .with_context(|| format!("{name} admitted"))?;
         assert!(
-            format!("{error:#}").contains("bootstrap canonical table direct_"),
+            format!("{error:#}").contains("bootstrap canonical table dataflow_"),
             "{name}: {error:#}"
         );
         assert_eq!(metadata.metadata(), initial, "{name}: metadata unchanged");
@@ -393,8 +393,8 @@ impl ObjectStore for DataflowPutsTimeOut {
 }
 
 /// Guarantees: an unknown-outcome write on the first dataflow table stops the run there; the
-/// already-drained direct tables persist, that table's bootstrap member stays registered as a
-/// reset blocker, the authority stays fenced-v1, and no manifest is published.
+/// the bootstrap member stays registered as a reset blocker, the authority stays fenced-v1, and no
+/// manifest is published.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unknown_write_mid_run_retains_member_and_withholds_manifest() -> Result<()> {
     let scratch = Scratch::new()?;
@@ -413,8 +413,10 @@ async fn unknown_write_mid_run_retains_member_and_withholds_manifest() -> Result
         Some("fenced-v1")
     );
     let written = logs(&scratch.data())?;
-    assert_eq!(written.len(), TABLES / 2);
-    assert!(written.keys().all(|dir| dir.starts_with("sandbox/direct/")));
+    assert!(
+        written.is_empty(),
+        "no table log is committed after the first uncertain write"
+    );
     assert!(!scratch.manifest().exists());
     Ok(())
 }
@@ -722,9 +724,9 @@ fn supervision_faults_always_kill_reap_and_propagate() -> Result<()> {
     Ok(())
 }
 
-/// Guarantees: the environment the real Python parent composes for the child satisfies every
+/// Guarantees: the environment the Azure bootstrap parent composes for the child satisfies every
 /// precondition of `initialize-delta.sh`; the script's exact argv parses through the real CLI;
-/// the shared env parser and 26-table body then initialize every table over the guarded store
+/// the shared env parser and 13-table body then initialize every table over the guarded store
 /// and drain; and the parent's real manifest/Delta-log validation accepts that manifest and
 /// those logs, reaching its first ARM call with no Kusto command. Removing one log makes the
 /// parent report NotReady without Kusto.
