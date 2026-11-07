@@ -405,6 +405,13 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       if (containerStarted) await attempt('kustainer', () => command('docker', ['rm', '--force', container], ctx));
       if (azure && !errors.length) await attempt('cloud-owner', async () => {
         const [metadata, registry] = await new PublisherControl(azure).read();
+        ctx.record('cloud-drain-observed', {
+          generationMatches: metadata.resetgeneration === values.ARROWCOL_RESET_GENERATION,
+          resetState: metadata.resetstate,
+          occupancy: metadata.occupancy,
+          occupancyOwnerMatches: metadata.occupancyid === owner,
+          publishers: Object.entries(registry).map(([id, entry]) => ({ id, state: entry.state })),
+        });
         if (metadata.resetgeneration !== values.ARROWCOL_RESET_GENERATION || Object.keys(registry).length)
           throw new Error('Cloud publishers or changed authority remain; retain run data and occupancy.');
         await deletePrefix(azure, config!.experimentContainer, `runs/${runId}`);
