@@ -65,8 +65,8 @@ function attribution(scope: ReadScope): string {
   if (!scope.owned)
     return '| where UserAgentHeader contains "Kusto" or UserAgentHeader contains "Azure-Data-Explorer" or UserAgentHeader contains "Azure Data Explorer" or UserAgentHeader contains "AzureDataExplorer"';
   return `| where UserAgentHeader != ${quote(scope.owned.marker)}
-| where CorrelationId !in (${scope.owned.requestIds.map(quote).join(', ')})
-| where ClientRequestId !in (${scope.owned.requestIds.map(quote).join(', ')})`;
+| where CorrelationId !in~ (${scope.owned.requestIds.map(quote).join(', ')})
+| where ClientRequestId !in~ (${scope.owned.requestIds.map(quote).join(', ')})`;
 }
 
 /** The Log Analytics query the demo runs (printed verbatim so it can be pasted into the portal). */
@@ -92,6 +92,7 @@ export function rawQuery(scope: ReadScope, fromMs: number): string {
   validateScope(scope);
   return `StorageBlobLogs
 | where TimeGenerated >= datetime(${iso(fromMs)})
+| where AccountName == ${quote(scope.account)} and Category == "StorageRead"
 | where RequesterObjectId =~ ${quote(scope.requester)} and Uri contains ${quote(`/${scope.container}/${scope.prefix}`)}
 ${attribution(scope)}
 | project TimeGenerated, OperationName, StatusCode, ResponseBodySize, Uri, UserAgentHeader

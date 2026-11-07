@@ -42,10 +42,13 @@ async function main(): Promise<void> {
   const { values } = parseArgs({ options: { query: { type: 'string' }, env: { type: 'string', default: '.env' } } });
   if (!values.query) throw new Error('Usage: read-logs.ts --query <saved-query.yaml> [--env <private-env-file>]');
   const query = parseStorageReadQuery(parseYaml(fs.readFileSync(path.resolve(values.query), 'utf8')));
-  const [, runId, trial] = query.scope.owned!.marker.split('/');
+  const owned = query.scope.owned;
+  if (!owned) throw new Error('Saved read query has no owned-request exclusions.');
+  const [, runId, trial] = owned.marker.split('/');
+  if (!runId || !trial) throw new Error('Saved read query has an invalid trial marker.');
   const report = path.dirname(path.dirname(path.resolve(values.query)));
-  const verified = ownedReads(path.join(report, 'http-traces', runId!, trial + '.jsonl'), query.scope.owned!.marker);
-  if (JSON.stringify(verified.requestIds) !== JSON.stringify([...query.scope.owned!.requestIds].sort()))
+  const verified = ownedReads(path.join(report, 'http-traces', runId, trial + '.jsonl'), owned.marker);
+  if (JSON.stringify(verified.requestIds) !== JSON.stringify([...owned.requestIds].sort()))
     throw new Error('Saved query exclusions do not match the preserved owned HTTP receipts.');
   const env = path.resolve(ROOT, values.env);
   const generated = path.join(path.dirname(env), '.env.azure');
