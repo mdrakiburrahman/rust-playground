@@ -412,7 +412,7 @@ pub fn now_unix_millis() -> u64 {
 pub fn status_fields(error: &anyhow::Error) -> (String, String) {
     for cause in error.chain() {
         if let Some(status) = cause.downcast_ref::<tonic::Status>() {
-            return (status.code().to_string(), bounded_error(status.message()));
+            return (format!("{:?}", status.code()), bounded_error(status.message()));
         }
     }
     ("client_error".to_owned(), bounded_error(&error.to_string()))

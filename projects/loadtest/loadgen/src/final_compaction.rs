@@ -1594,6 +1594,8 @@ mod tests {
         arguments.skip_final_compaction = true;
         assert!(!enabled(&arguments)?);
         arguments.skip_final_compaction = false;
+        assert!(enabled(&arguments)?);
+        arguments.dataflow_root = PathBuf::from("abfss://account/container");
         assert!(!enabled(&arguments)?);
         arguments.final_compaction = true;
         assert!(

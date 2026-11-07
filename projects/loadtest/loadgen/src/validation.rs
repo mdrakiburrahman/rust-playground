@@ -1193,7 +1193,7 @@ mod tests {
             }
             let error = validate(validate_arguments(&results.0, deadline, &arguments)?).await;
             assert!(error.is_err());
-            assert_kusto_diagnostics(&results.0, "publication-drain", corrupt_status).await?;
+            assert_kusto_diagnostics(&results.0, "drain-publication", corrupt_status).await?;
         }
         Ok(())
     }
