@@ -1,0 +1,25 @@
+{
+  "name": "schema-evolution-experiment",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "application",
+  "implicitDependencies": ["experiment-kit", "azure-infra"],
+  "targets": {
+    "lint": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "npx --no-install tsc --project experiments/schema-evolution/tsconfig.json"
+      }
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "npx --no-install tsx --test experiments/schema-evolution/src/*.test.ts"
+      }
+    },
+    "verify": {
+      "executor": "nx:run-commands",
+      "dependsOn": ["lint", "test"],
+      "options": { "commands": [] }
+    }
+  }
+}
