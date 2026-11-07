@@ -93,6 +93,9 @@ fn sandbox_identity(subscription: &str, group: Option<&str>) -> Result<String> {
     let subscription = subscription.strip_prefix('{').unwrap_or(subscription);
     let subscription = subscription.strip_suffix('}').unwrap_or(subscription);
     let raw = subscription.replace('-', "");
+    if raw.len() != 32 || !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("Azure sandbox ownership requires a subscription UUID");
+    }
     let subscription = uuid::Uuid::parse_str(&raw)
         .context("Azure sandbox ownership requires a subscription UUID")?
         .hyphenated()
@@ -378,7 +381,13 @@ mod tests {
             assert!(sandbox_identity(GENERATION, Some(group)).is_err(), "{group}");
         }
         assert!(sandbox_identity(GENERATION, Some(&format!("rust-playground-{}", "a".repeat(80)))).is_err());
-        for subscription in ["", "default", "not-a-uuid"] {
+        for subscription in [
+            "",
+            "default",
+            "not-a-uuid",
+            "{{00000000-0000-0000-0000-000000000001}}",
+            "{urn:uuid:00000000-0000-0000-0000-000000000001}",
+        ] {
             assert!(sandbox_identity(subscription, None).is_err());
         }
     }

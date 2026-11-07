@@ -69,6 +69,8 @@ test('named sandbox isolates resource identities and generated configuration pre
 });
 for (const values of [
   { AZURE_RESOURCE_GROUP: 'production' }, { AZURE_RESOURCE_GROUP: '' }, { AZURE_SUBSCRIPTION_ID: 'default' },
+  { AZURE_SUBSCRIPTION_ID: '{{00000000-0000-0000-0000-000000000001}}' },
+  { AZURE_SUBSCRIPTION_ID: '{urn:uuid:00000000-0000-0000-0000-000000000001}' },
   ...['rust-playground-', 'rust-playground--evo', 'rust-playground-../other', 'Rust-playground-evo',
     'rust-playground-evo.', 'rust-playground-' + 'a'.repeat(80)].map(AZURE_RESOURCE_GROUP => ({ AZURE_RESOURCE_GROUP })),
   { AZURE_KUSTO_MAX_INSTANCES: '9' }, { AZURE_KUSTO_MIN_INSTANCES: '5', AZURE_KUSTO_MAX_INSTANCES: '4' },
