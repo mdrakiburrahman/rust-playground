@@ -629,6 +629,11 @@ async fn run_batch_worker(
                 break;
             }
         }
+        if let Err(error) = publisher.refresh_estimator(&mut estimator).await {
+            tracing::warn!(table = %identity, error_message = %error.safe_message(), "Delta grouping policy refresh failed");
+            next.complete(&Err(error));
+            continue;
+        }
         rows += next.rows;
         bytes += next.bytes;
         group.push(next);
@@ -686,6 +691,19 @@ impl GroupPublisher<'_> {
         self.table.is_none()
     }
 
+    async fn refresh_estimator(&self, estimator: &mut AdaptiveFileSizeEstimator) -> Result<(), ExportFailure> {
+        let table = self.table.as_ref().ok_or_else(retired_owner_failure)?;
+        let config = table
+            .adaptive_file_config(self.adaptive_defaults)
+            .await
+            .map_err(|error| ExportFailure::Transient(format!("writer policy refresh failed: {error:#}")))?;
+        if estimator.config() != &config {
+            *estimator = AdaptiveFileSizeEstimator::new(config)
+                .map_err(|error| ExportFailure::Permanent(format!("invalid writer policy: {error}")))?;
+        }
+        Ok(())
+    }
+
     async fn publish(&mut self, group: &mut Vec<QueuedBatch>, estimator: &mut AdaptiveFileSizeEstimator) {
         if group.is_empty() {
             return;
@@ -709,6 +727,7 @@ impl GroupPublisher<'_> {
         let mut worker_failed = false;
         let mut published_files = 0;
         let result = async {
+            self.refresh_estimator(estimator).await?;
             let _slot = self
                 .flush_slots
                 .acquire()
@@ -741,23 +760,18 @@ impl GroupPublisher<'_> {
                         worker_failed = true;
                         ExportFailure::Transient(format!("{error:#}"))
                     })?;
-                let policy_error = files.iter().find_map(|(writer, _)| {
-                    match writer.adaptive_file_config(&self.adaptive_defaults) {
-                        Ok(config) if config == self.adaptive_defaults => None,
-                        Ok(_) => Some("table-specific adaptive file sizing is unsupported: durable publications are not splittable".to_owned()),
-                        Err(error) => Some(format!("invalid writer properties: {error:#}")),
-                    }
-                });
-                if let Some(error) = policy_error {
-                    for (writer, _) in files {
-                        writer.discard_empty().map_err(|cleanup| ExportFailure::Transient(format!("empty writer cleanup failed: {cleanup:#}")))?;
-                    }
-                    return Err(ExportFailure::Transient(error));
-                }
                 for (mut writer, partition_batch) in files {
-                    writer.write(&partition_batch).await.map_err(|error| ExportFailure::Permanent(format!("{error:#}")))?;
-                    let append = writer.stage().await.map_err(|error| ExportFailure::Transient(format!("{error:#}")))?;
-                    updated_estimator.observe(append.observation()).map_err(|error| ExportFailure::Permanent(format!("file sizing observation failed: {error}")))?;
+                    writer
+                        .write(&partition_batch)
+                        .await
+                        .map_err(|error| ExportFailure::Permanent(format!("{error:#}")))?;
+                    let append = writer
+                        .stage()
+                        .await
+                        .map_err(|error| ExportFailure::Transient(format!("{error:#}")))?;
+                    updated_estimator.observe(append.observation()).map_err(|error| {
+                        ExportFailure::Permanent(format!("file sizing observation failed: {error}"))
+                    })?;
                     staged.push(append);
                 }
             }
@@ -1282,7 +1296,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn exporter_refreshes_catalog_sizing_and_retries_rejected_publication() -> anyhow::Result<()> {
+    async fn exporter_refreshes_catalog_adaptive_grouping_without_changing_publication_identity() -> anyhow::Result<()>
+    {
         struct Fixture(PathBuf);
         impl Drop for Fixture {
             fn drop(&mut self) {
@@ -1297,20 +1312,38 @@ mod tests {
         let store = Arc::new(MemoryRoutingStore::default());
         let holder = CollectorInstanceId::new();
         let lease = lease(&store, holder).await;
-        let exporter = fast_exporter(&fixture.0, &store, &Arc::new(RuntimeMetrics::new(holder)));
+        let mut batching = FileBatchConfig {
+            max_age: std::time::Duration::from_secs(60),
+            ..Default::default()
+        };
+        batching.adaptive_file.min_input_bytes = 1;
+        batching.adaptive_file.max_input_bytes = 1;
+        let exporter = GenericDeltaExporter::with_batching(
+            fixture.0.clone(),
+            Arc::clone(&store) as Arc<dyn RoutingStore>,
+            arrow_deltalake::commit::CommitOptions::default(),
+            batching,
+            Arc::new(RuntimeMetrics::new(holder)),
+        )?;
         let first = exporter.stage(envelope_pdata(envelope_for(&lease))).await?;
-        first.wait().await?;
+        tokio::time::timeout(std::time::Duration::from_secs(3), first.wait()).await??;
         let path = fixture.0.join("demo/generated/events");
-        let alter = |target: Option<&str>| -> anyhow::Result<()> {
+        let alter = |input: &str| -> anyhow::Result<()> {
             let url = format!("file://{}/", path.display()).parse()?;
             let catalog = arrow_deltalake::delta::DeltaTable::open_catalog(url)?;
             let snapshot = catalog.catalog_snapshot()?.expect("catalog table");
             let mut props = snapshot.properties;
             props.insert("catalog.schemaHistory".into(), "[]".into());
-            if let Some(target) = target {
-                props.insert("arrowcol.writer.targetFileSize".into(), target.into());
-            } else {
-                props.remove("arrowcol.writer.targetFileSize");
+            for (key, value) in [
+                ("arrowcol.writer.targetFileSize", "262144"),
+                ("arrowcol.writer.minInputSize", input),
+                ("arrowcol.writer.maxInputSize", input),
+                ("arrowcol.writer.coldStartParquetRatio", "0.5"),
+                ("arrowcol.writer.ewmaWeight", "0.4"),
+                ("arrowcol.writer.minParquetRatio", "0.1"),
+                ("arrowcol.writer.maxParquetRatio", "2"),
+            ] {
+                props.insert(key.into(), value.into());
             }
             catalog.commit_catalog(
                 Some(snapshot.version),
@@ -1321,12 +1354,15 @@ mod tests {
             )?;
             Ok(())
         };
-        tokio::task::block_in_place(|| alter(Some("64")))?;
+        tokio::task::block_in_place(|| alter("1024"))?;
         let retry = envelope_for(&lease);
         let publication = exporter.stage(envelope_pdata(retry.clone())).await?;
-        let error = publication.wait().await.expect_err("unsupported sizing must reject");
+        let mut pending = Box::pin(publication.wait());
         assert!(
-            matches!(error, ExportFailure::Transient(ref message) if message.contains("table-specific adaptive file sizing is unsupported"))
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut pending)
+                .await
+                .is_err(),
+            "table policy must override the process's one-byte immediate flush"
         );
         let log = path.join("_delta_log");
         let additions = || -> anyhow::Result<usize> {
@@ -1344,10 +1380,25 @@ mod tests {
             Ok(count)
         };
         assert_eq!(additions()?, 1);
-        tokio::task::block_in_place(|| alter(None))?;
-        let publication = exporter.stage(envelope_pdata(retry)).await?;
-        publication.wait().await?;
-        assert_eq!(additions()?, 2);
+        tokio::task::block_in_place(|| alter("1"))?;
+        let next = exporter.stage(envelope_pdata(envelope_for(&lease))).await?;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            pending.await?;
+            next.wait().await
+        })
+        .await??;
+        assert_eq!(
+            additions()?,
+            3,
+            "same owner refreshed policy and committed two independent receipt files"
+        );
+        let replay = exporter.stage(envelope_pdata(retry)).await?;
+        tokio::time::timeout(std::time::Duration::from_secs(3), replay.wait()).await??;
+        assert_eq!(
+            additions()?,
+            3,
+            "policy change must not change publication replay identity"
+        );
         Ok(())
     }
 

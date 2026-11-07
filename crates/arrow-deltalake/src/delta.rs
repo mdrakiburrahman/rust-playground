@@ -64,6 +64,41 @@ fn process_writer_properties(schema: &SchemaRef) -> Result<BTreeMap<String, Stri
     Ok(process)
 }
 
+fn resolve_adaptive_file_config(
+    table: &BTreeMap<String, String>,
+    defaults: &crate::sizing::AdaptiveFileSizeConfig,
+) -> Result<crate::sizing::AdaptiveFileSizeConfig> {
+    let process = BTreeMap::from([
+        (
+            "arrowcol.writer.targetFileSize".into(),
+            defaults.target_parquet_bytes.to_string(),
+        ),
+        (
+            "arrowcol.writer.minInputSize".into(),
+            defaults.min_input_bytes.to_string(),
+        ),
+        (
+            "arrowcol.writer.maxInputSize".into(),
+            defaults.max_input_bytes.to_string(),
+        ),
+        (
+            "arrowcol.writer.coldStartParquetRatio".into(),
+            defaults.cold_start_parquet_ratio.to_string(),
+        ),
+        ("arrowcol.writer.ewmaWeight".into(), defaults.ewma_weight.to_string()),
+        (
+            "arrowcol.writer.minParquetRatio".into(),
+            defaults.min_parquet_ratio.to_string(),
+        ),
+        (
+            "arrowcol.writer.maxParquetRatio".into(),
+            defaults.max_parquet_ratio.to_string(),
+        ),
+    ]);
+    let props = arrowcol_props::resolve(table, &process)?;
+    crate::sizing::AdaptiveFileSizeConfig::from_properties(&props)
+}
+
 fn publication_layout(
     schema: &SchemaRef,
     properties: &arrowcol_props::ResolvedProps,
@@ -2441,6 +2476,26 @@ impl DeltaTable {
         Ok(snapshot)
     }
 
+    /// Resolve current table metadata for adaptive publication-group scheduling.
+    ///
+    /// # Errors
+    /// Returns metadata, property or estimator validation failures without creating a file.
+    pub fn adaptive_file_config(
+        &self,
+        defaults: &crate::sizing::AdaptiveFileSizeConfig,
+    ) -> Result<crate::sizing::AdaptiveFileSizeConfig> {
+        let properties = self.existing_snapshot()?.map_or_else(BTreeMap::new, |snapshot| {
+            snapshot
+                .table_configuration()
+                .metadata()
+                .configuration()
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        });
+        resolve_adaptive_file_config(&properties, defaults)
+    }
+
     /// Open a streaming file using a raw Arrow schema, evolving nullable top-level columns.
     ///
     /// # Errors
@@ -3207,35 +3262,7 @@ impl DeltaFileWriter {
         &self,
         defaults: &crate::sizing::AdaptiveFileSizeConfig,
     ) -> Result<crate::sizing::AdaptiveFileSizeConfig> {
-        let process = BTreeMap::from([
-            (
-                "arrowcol.writer.targetFileSize".into(),
-                defaults.target_parquet_bytes.to_string(),
-            ),
-            (
-                "arrowcol.writer.minInputSize".into(),
-                defaults.min_input_bytes.to_string(),
-            ),
-            (
-                "arrowcol.writer.maxInputSize".into(),
-                defaults.max_input_bytes.to_string(),
-            ),
-            (
-                "arrowcol.writer.coldStartParquetRatio".into(),
-                defaults.cold_start_parquet_ratio.to_string(),
-            ),
-            ("arrowcol.writer.ewmaWeight".into(), defaults.ewma_weight.to_string()),
-            (
-                "arrowcol.writer.minParquetRatio".into(),
-                defaults.min_parquet_ratio.to_string(),
-            ),
-            (
-                "arrowcol.writer.maxParquetRatio".into(),
-                defaults.max_parquet_ratio.to_string(),
-            ),
-        ]);
-        let props = arrowcol_props::resolve(&self.table_properties, &process)?;
-        crate::sizing::AdaptiveFileSizeConfig::from_properties(&props)
+        resolve_adaptive_file_config(&self.table_properties, defaults)
     }
 
     /// Assign a stable identity; retries of this publication must reuse it.
@@ -3247,7 +3274,6 @@ impl DeltaFileWriter {
         self.publication = Some((app_id, version));
         Ok(self)
     }
-
     /// Preserve an admission-time stamp through durable replay.
     ///
     /// # Errors

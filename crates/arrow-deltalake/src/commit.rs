@@ -78,6 +78,10 @@ struct Publication {
 
 enum Request {
     Ready(oneshot::Sender<std::result::Result<(), CommitReceiptError>>),
+    AdaptiveConfig(
+        crate::sizing::AdaptiveFileSizeConfig,
+        oneshot::Sender<std::result::Result<crate::sizing::AdaptiveFileSizeConfig, CommitReceiptError>>,
+    ),
     NewFile(
         SchemaRef,
         oneshot::Sender<std::result::Result<DeltaFileWriter, CommitReceiptError>>,
@@ -293,6 +297,25 @@ impl BatchedTable {
             .map_err(anyhow::Error::new)
     }
 
+    /// Read current adaptive scheduling policy on the table's IO worker.
+    ///
+    /// # Errors
+    /// Returns metadata, configuration or worker failures without preparing a publication.
+    pub async fn adaptive_file_config(
+        &self,
+        defaults: crate::sizing::AdaptiveFileSizeConfig,
+    ) -> Result<crate::sizing::AdaptiveFileSizeConfig> {
+        let (reply, receive) = oneshot::channel();
+        self.sender
+            .send(Request::AdaptiveConfig(defaults, reply))
+            .await
+            .context("Delta worker stopped")?;
+        receive
+            .await
+            .context("Delta worker stopped during policy refresh")?
+            .map_err(anyhow::Error::new)
+    }
+
     /// Obtain a file without doing synchronous Kernel work on a collector core.
     ///
     /// # Errors
@@ -473,6 +496,17 @@ fn run_worker(
                 match request {
                     Some(Request::Ready(reply)) => {
                         let _ = reply.send(failure.as_ref().map_or(Ok(()), |error| Err(error.clone())));
+                    }
+                    Some(Request::AdaptiveConfig(defaults, reply)) => {
+                        let result = match (&table, &failure) {
+                            (Ok(table), None) => table
+                                .adaptive_file_config(&defaults)
+                                .map_err(CommitReceiptError::from_anyhow),
+                            _ => Err(failure.clone().unwrap_or_else(|| {
+                                CommitReceiptError::commit_failed("Delta table initialization failed")
+                            })),
+                        };
+                        let _ = reply.send(result);
                     }
                     Some(Request::NewFile(schema, reply)) => {
                         let result = match (&table, &failure) {
