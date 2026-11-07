@@ -47,6 +47,24 @@ impl Default for AdaptiveFileSizeConfig {
 }
 
 impl AdaptiveFileSizeConfig {
+    /// Read adaptive sizing controls from validated catalog properties.
+    ///
+    /// # Errors
+    /// Returns property errors or invalid cross-property estimator bounds.
+    pub fn from_properties(props: &arrowcol_props::ResolvedProps) -> anyhow::Result<Self> {
+        let config = Self {
+            target_parquet_bytes: props.unsigned("arrowcol.writer.targetFileSize")?,
+            min_input_bytes: props.unsigned("arrowcol.writer.minInputSize")?,
+            max_input_bytes: props.unsigned("arrowcol.writer.maxInputSize")?,
+            cold_start_parquet_ratio: props.float("arrowcol.writer.coldStartParquetRatio")?,
+            ewma_weight: props.float("arrowcol.writer.ewmaWeight")?,
+            min_parquet_ratio: props.float("arrowcol.writer.minParquetRatio")?,
+            max_parquet_ratio: props.float("arrowcol.writer.maxParquetRatio")?,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
     /// Validate all bounds and floating-point inputs.
     ///
     /// # Errors

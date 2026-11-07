@@ -8,6 +8,7 @@ description = "Standalone OPTIMIZE, PURGE and VACUUM LITE service for arrow-delt
 
 [dependencies]
 anyhow.workspace = true
+arrowcol-props = { path = "../arrowcol-props" }
 arrow-deltalake = { path = "../arrow-deltalake" }
 clap.workspace = true
 ctrlc.workspace = true

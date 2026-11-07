@@ -39,6 +39,22 @@ impl Default for LayoutPolicy {
 }
 
 impl LayoutPolicy {
+    /// Construct layout from the shared catalog-property registry.
+    /// The caller still validates column names against the table schema.
+    ///
+    /// # Errors
+    /// Returns property type or platform-size conversion errors.
+    pub fn from_properties(props: &arrowcol_props::ResolvedProps) -> Result<Self> {
+        Ok(Self {
+            sort_columns: props.string_list("arrowcol.layout.sortColumns")?.to_vec(),
+            bloom_columns: props.string_list("arrowcol.layout.bloomColumns")?.to_vec(),
+            max_rows: usize::try_from(props.unsigned("arrowcol.layout.maxRows")?)?,
+            max_input_bytes: usize::try_from(props.unsigned("arrowcol.layout.maxInputSize")?)?,
+            row_group_rows: usize::try_from(props.unsigned("arrowcol.layout.rowGroupRows")?)?,
+            page_rows: usize::try_from(props.unsigned("arrowcol.layout.pageRows")?)?,
+        })
+    }
+
     /// Validate names and nonzero resource limits against the supplied schema.
     ///
     /// # Errors

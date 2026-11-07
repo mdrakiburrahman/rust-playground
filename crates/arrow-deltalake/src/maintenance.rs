@@ -599,23 +599,240 @@ impl DeltaTable {
             )
         })?;
         let partition_columns = snapshot.table_configuration().metadata().partition_columns().to_vec();
-        let canonical: Schema = snapshot.schema().as_ref().try_into_arrow()?;
-        // Normalization is not idempotent for timestamp companions; pass only the
-        // required columns so validation never evolves or recreates the table.
-        let required: Vec<_> = canonical
-            .fields()
-            .iter()
-            .filter(|field| !field.is_nullable() && !field.name().ends_with(COMPANION_SUFFIX))
-            .map(Arc::clone)
-            .collect();
-        let table = Self::open_url(url, Arc::new(Schema::new(required)), partition_columns)?;
-        if table.snapshot()?.table_configuration().metadata().id() != snapshot.table_configuration().metadata().id() {
+        let fingerprint = TableFingerprint::of(&snapshot);
+        fingerprint.validate_supported(false)?;
+        let table = Self::open_connection(url, partition_columns, None, None)?;
+        Ok(table)
+    }
+
+    /// Open only the guarded transport for read-only probes. Never initializes
+    /// a Delta log, evolves a schema or builds a Kernel snapshot.
+    ///
+    /// # Errors
+    /// Rejects absent local tables and storage/session authority failures.
+    pub fn open_for_maintenance_probe(url: &Url) -> Result<Arc<Self>> {
+        if url.scheme() == "file" {
+            let root = url.to_file_path().map_err(|()| anyhow::anyhow!("invalid table URL"))?;
+            if !root.join("_delta_log").is_dir() {
+                return Err(fail(MaintenanceErrorKind::Unsupported, "existing Delta table required"));
+            }
+        }
+        let table = Self::open_connection(url.clone(), Vec::new(), None, None)?;
+        table.probe_log_version(100_000)?;
+        Ok(table)
+    }
+
+    /// Latest physical log version without replay; no-work probes must fence it.
+    ///
+    /// # Errors
+    /// Rejects missing logs, malformed standard entries and bounded listing failures.
+    pub fn probe_log_version(&self, max_files: usize) -> Result<u64> {
+        probe_version(&self.list_log(max_files)?)
+    }
+
+    /// Read the latest metadata action, not the add/remove history. A pruned
+    /// metadata action falls back to Kernel's checkpoint-aware metadata reader.
+    /// Catalog discovery should supply these properties directly instead.
+    ///
+    /// # Errors
+    /// Rejects corrupt JSON, incomplete logs and concurrent metadata advancement.
+    pub fn maintenance_properties(&self) -> Result<BTreeMap<String, String>> {
+        let names = self.list_log(100_000)?;
+        let version = probe_version(&names)?;
+        for (name, _) in names.iter().rev() {
+            if !is_commit_name(name) {
+                continue;
+            }
+            let number = name[..20].parse::<u64>()?;
+            let bytes = self.read_commit(number, 64 * 1024 * 1024)?;
+            let mut configuration = None;
+            for line in bytes.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()) {
+                let action: serde_json::Value = serde_json::from_slice(line)?;
+                if let Some(metadata) = action.get("metaData") {
+                    configuration = Some(serde_json::from_value::<BTreeMap<String, String>>(
+                        metadata
+                            .get("configuration")
+                            .cloned()
+                            .context("metadata configuration absent")?,
+                    )?);
+                }
+            }
+            if let Some(configuration) = configuration {
+                self.require_probe_version(version, 100_000)?;
+                return Ok(configuration);
+            }
+        }
+        let snapshot = self.snapshot()?;
+        if snapshot.version() != version {
             return Err(fail(
-                MaintenanceErrorKind::MetadataChanged,
-                "table replaced while opening",
+                MaintenanceErrorKind::StalePlan,
+                "table advanced during property discovery",
             ));
         }
-        Ok(table)
+        let configuration = TableFingerprint::of(&snapshot).configuration;
+        self.require_probe_version(version, 100_000)?;
+        Ok(configuration)
+    }
+
+    fn require_probe_version(&self, version: u64, max_files: usize) -> Result<()> {
+        if self.probe_log_version(max_files)? != version {
+            return Err(fail(
+                MaintenanceErrorKind::StalePlan,
+                "table advanced during negative probe; retry",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Cheap, strictly negative admission proof. Physical stale files may force
+    /// replay, but an incomplete inventory or advancing log never reports noop.
+    /// A false result only requests the normal planner; it never authorizes a mutation.
+    ///
+    /// # Errors
+    /// Returns inventory, retention, malformed checkpoint, cancellation or stale-probe errors.
+    pub fn probe_no_work(
+        &self,
+        operation: ProbeOperation,
+        config: &NegativeProbeConfig,
+        control: &MaintenanceControl,
+    ) -> Result<Option<MaintenanceReport>> {
+        control.check()?;
+        validate_anchor("probe", config.now_ms)?;
+        if config.max_listed_files == 0 || config.checkpoint_interval == 0 || config.optimize_min_files < 2 {
+            return Err(fail(MaintenanceErrorKind::InvalidPlan, "invalid negative-probe bounds"));
+        }
+        let logs = self.list_log(config.max_listed_files)?;
+        let version = probe_version(&logs)?;
+        let checkpoint = self.hinted_checkpoint_version(false)?;
+        if let Some(checkpoint) = checkpoint {
+            if checkpoint > version || !logs.contains_key(&format!("{checkpoint:020}.checkpoint.parquet")) {
+                // Multipart/v2 checkpoint layouts require the full supported-layout path.
+                return Ok(None);
+            }
+        }
+        let debt = checkpoint.map_or(version.saturating_add(1), |hint| version.saturating_sub(hint));
+        let log_cutoff = config
+            .now_ms
+            .checked_sub(config.log_retention_ms)
+            .context("log retention exceeds probe anchor")?;
+        let old_logs = logs.iter().any(|(name, meta)| {
+            (is_commit_name(name) || name.contains(".checkpoint."))
+                && meta.last_modified.timestamp_millis() < log_cutoff
+        });
+        let no_work = match operation {
+            ProbeOperation::Checkpoint => debt < config.checkpoint_interval,
+            ProbeOperation::PruneLog => checkpoint.is_none() || !old_logs,
+            ProbeOperation::Optimize | ProbeOperation::Purge | ProbeOperation::Vacuum => {
+                let physical = self.probe_physical_files(config.max_listed_files, control)?;
+                match operation {
+                    ProbeOperation::Optimize => {
+                        let mut groups: BTreeMap<String, usize> = BTreeMap::new();
+                        for (relative, meta) in physical {
+                            let partition = relative.rsplit_once('/').map_or("", |(parent, _)| parent).to_owned();
+                            let count = groups.entry(partition).or_default();
+                            if meta.size < config.optimize_small_file_bytes {
+                                *count += 1;
+                            }
+                        }
+                        let newest = groups.keys().next_back();
+                        !groups.iter().any(|(partition, count)| {
+                            *count >= config.optimize_min_files
+                                && (!config.sealed_partitions_only || Some(partition) != newest || partition.is_empty())
+                        })
+                    }
+                    ProbeOperation::Purge => {
+                        let cutoff = purge_cutoff(config.granularity, config.now_ms, config.purge_retention_ms)?;
+                        let mut eligible = false;
+                        for (relative, _) in physical {
+                            let part = relative
+                                .split('/')
+                                .find_map(|segment| segment.strip_prefix("__arrowcol_ingestion="));
+                            let Some(part) = part else { return Ok(None) };
+                            let start = config.granularity.parse_partition(&percent_decode(part)?)?;
+                            eligible |= start.saturating_add(config.granularity.width_ms()) <= cutoff;
+                        }
+                        !eligible
+                    }
+                    ProbeOperation::Vacuum => {
+                        let cutoff = config
+                            .now_ms
+                            .checked_sub(config.vacuum_retention_ms)
+                            .context("VACUUM retention exceeds probe anchor")?;
+                        !old_logs
+                            && debt < config.checkpoint_interval
+                            && physical
+                                .iter()
+                                .all(|(_, meta)| meta.last_modified.timestamp_millis() >= cutoff)
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        };
+        if !no_work {
+            return Ok(None);
+        }
+        control.check()?;
+        let fresh_logs = self.list_log(config.max_listed_files)?;
+        // Compare object identity, not only max(version): a checkpoint rewrite
+        // or same-version table replacement also invalidates the negative proof.
+        let signature = |names: &BTreeMap<String, ObjectMeta>| {
+            names
+                .iter()
+                .map(|(name, meta)| {
+                    (
+                        name.clone(),
+                        meta.size,
+                        meta.last_modified,
+                        meta.e_tag.clone(),
+                        meta.version.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        if signature(&fresh_logs) != signature(&logs) {
+            return Err(fail(
+                MaintenanceErrorKind::StalePlan,
+                "log changed during negative probe; retry",
+            ));
+        }
+        Ok(Some(MaintenanceReport {
+            operation: operation.label().into(),
+            read_version: version,
+            version,
+            ..MaintenanceReport::default()
+        }))
+    }
+
+    fn probe_physical_files(&self, limit: usize, control: &MaintenanceControl) -> Result<Vec<(String, ObjectMeta)>> {
+        let prefix = self.object_path("")?;
+        shared_executor()?.block_on(async {
+            use futures::StreamExt;
+            let mut listing = self.store.list(Some(&prefix));
+            let mut files = Vec::new();
+            let mut seen = 0;
+            while let Some(entry) = listing.next().await {
+                control.check()?;
+                let entry = entry?;
+                seen += 1;
+                if seen > limit {
+                    return Err(fail(
+                        MaintenanceErrorKind::ResourceLimit,
+                        "negative-probe inventory exceeds its bound",
+                    ));
+                }
+                let relative = entry
+                    .location
+                    .prefix_match(&prefix)
+                    .context("inventory escaped table root")?
+                    .map(|part| part.as_ref().to_owned())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                if !matches!(relative.split('/').next(), Some("_delta_log" | "_arrowcol_maintenance")) {
+                    files.push((relative, entry));
+                }
+            }
+            Ok(files)
+        })
     }
 
     fn active_state(&self, max_files: usize) -> Result<ActiveState> {
@@ -662,7 +879,60 @@ impl DeltaTable {
         }
         Ok(state)
     }
+}
 
+fn is_commit_name(name: &str) -> bool {
+    name.len() == 25 && name.ends_with(".json") && name.as_bytes()[..20].iter().all(u8::is_ascii_digit)
+}
+
+fn probe_version(logs: &BTreeMap<String, ObjectMeta>) -> Result<u64> {
+    logs.keys()
+        .filter(|name| is_commit_name(name))
+        .map(|name| name[..20].parse::<u64>())
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .ok_or_else(|| fail(MaintenanceErrorKind::Unsupported, "no standard Delta commit log found"))
+}
+
+/// Operations supported by negative admission probes.
+#[derive(Clone, Copy, Debug)]
+pub enum ProbeOperation {
+    Purge,
+    Optimize,
+    Vacuum,
+    Checkpoint,
+    PruneLog,
+}
+
+impl ProbeOperation {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Purge => "purge",
+            Self::Optimize => "optimize",
+            Self::Vacuum => "vacuum",
+            Self::Checkpoint => "checkpoint",
+            Self::PruneLog => "prune-log",
+        }
+    }
+}
+
+/// Validated table policy required by the read-only probes.
+#[derive(Clone, Debug)]
+pub struct NegativeProbeConfig {
+    pub now_ms: i64,
+    pub granularity: Granularity,
+    pub purge_retention_ms: i64,
+    pub vacuum_retention_ms: i64,
+    pub log_retention_ms: i64,
+    pub checkpoint_interval: u64,
+    pub optimize_small_file_bytes: u64,
+    pub optimize_min_files: usize,
+    pub sealed_partitions_only: bool,
+    pub max_listed_files: usize,
+}
+
+impl DeltaTable {
     /// Validate a log-relative data path and map it to its object-store location.
     fn safe_object_path(&self, raw: &str) -> Result<object_store::path::Path> {
         let unsafe_path = |why: &str| {
@@ -3013,12 +3283,22 @@ impl DeltaTable {
         let state = self.active_state(config.max_active_files)?;
         plan.header.fingerprint.require_same(&state.fingerprint)?;
         report.version = state.snapshot.version();
+        let replay = self.replay_log(state.snapshot.version(), &state.fingerprint.table_id, config)?;
         if plan.candidates.is_empty() {
-            self.record_vacuum_progress(plan, effective, config)
+            let current = self.vacuum_lite_progress()?;
+            if current.as_ref().is_none_or(|progress| {
+                progress.table_id != plan.header.fingerprint.table_id || progress.version != plan.header.read_version
+            }) {
+                self.record_vacuum_progress(
+                    plan,
+                    effective,
+                    config,
+                    (state.snapshot.version() == plan.header.read_version).then_some(&replay),
+                )
                 .map_err(|error| progress_failure(&error, &report))?;
+            }
             return Ok(report);
         }
-        let replay = self.replay_log(state.snapshot.version(), &state.fingerprint.table_id, config)?;
         for candidate in &plan.candidates {
             let key = self.log_key(&candidate.path)?;
             match replay.tombstones.get(&key) {
@@ -3103,8 +3383,13 @@ impl DeltaTable {
                 &report,
             )
         })?;
-        self.record_vacuum_progress(plan, effective, config)
-            .map_err(|error| progress_failure(&error, &report))?;
+        self.record_vacuum_progress(
+            plan,
+            effective,
+            config,
+            (state.snapshot.version() == plan.header.read_version).then_some(&replay),
+        )
+        .map_err(|error| progress_failure(&error, &report))?;
         Ok(report)
     }
 
@@ -3138,12 +3423,25 @@ impl DeltaTable {
     /// and the claim is re-proven by replaying that version: every tombstone
     /// older than `cutoff_ms` must be one of the plan's (now deleted or absent)
     /// candidates. Plans with a backlog never record progress.
-    fn record_vacuum_progress(&self, plan: &VacuumPlan, cutoff_ms: i64, config: &VacuumConfig) -> Result<()> {
+    fn record_vacuum_progress(
+        &self,
+        plan: &VacuumPlan,
+        cutoff_ms: i64,
+        config: &VacuumConfig,
+        validated_replay: Option<&LogReplay>,
+    ) -> Result<()> {
         if plan.backlog_files != 0 {
             return Ok(());
         }
         let table_id = &plan.header.fingerprint.table_id;
-        let replay = self.replay_log(plan.header.read_version, table_id, config)?;
+        let historical;
+        let replay = match validated_replay {
+            Some(replay) => replay,
+            None => {
+                historical = self.replay_log(plan.header.read_version, table_id, config)?;
+                &historical
+            }
+        };
         let planned = plan
             .candidates
             .iter()
