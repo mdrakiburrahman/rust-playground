@@ -9,7 +9,7 @@ for (const quiver of [false, true]) {
   const state = path.join(workspace, 'projects/loadtest/.temp', quiver ? 'compose-check-quiver' : 'compose-check');
   for (const directory of [
     'dataflow', 'tenant', 'tenant-checkpoints', 'results', 'router-state', 'dataflow-state-1',
-    ...(quiver ? [benchmarkQuiver.directHostDirectory, benchmarkQuiver.dataflowHostDirectory] : []),
+    ...(quiver ? [benchmarkQuiver.dataflowHostDirectory] : []),
   ]) {
     mkdirSync(path.join(state, directory), { recursive: true });
   }

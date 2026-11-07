@@ -37,7 +37,6 @@ test('private config layering is explicit and local mode does not load it', (t) 
 
 test('Azure roots are isolated and require complete configuration without local fallback', () => {
   const targets = azureTargets(config, 'run-one');
-  assert.equal(targets.directRoot, 'abfss://arrowcol@publicfixture.dfs.core.windows.net/sandbox/loadtest/run-one/direct');
   assert.equal(targets.dataflowRoot, 'abfss://arrowcol@publicfixture.dfs.core.windows.net/sandbox/loadtest/run-one/dataflow');
   assert.equal(targets.kustoEndpoint, config.AZURE_KUSTO_URI);
   assert.equal(targets.tenantRoot, `${targets.root}/tenant`);
@@ -74,13 +73,9 @@ test('Azure runtime CLI caches are separate writable private copies, never the h
   mkdirSync(run);
   writeFileSync(path.join(source, 'msal_token_cache.json'), 'fixture-identity');
   stageAzureCliConfig(run, { AZURE_CONFIG_DIR: source });
-  const direct = path.join(run, 'azure-cli/direct-1/msal_token_cache.json');
   const dataflow = path.join(run, 'azure-cli/dataflow-1/msal_token_cache.json');
-  writeFileSync(direct, 'refreshed-fixture');
   assert.equal(readFileSync(path.join(source, 'msal_token_cache.json'), 'utf8'), 'fixture-identity');
   assert.equal(readFileSync(dataflow, 'utf8'), 'fixture-identity');
-  assert.equal(statSync(direct).mode & 0o777, 0o600);
-  assert.equal(statSync(path.dirname(direct)).mode & 0o777, 0o700);
   for (const service of ['loadgen', 'infra', 'tenant-stream', 'delta-maintenance', 'qap-observer']) {
     const copy = path.join(run, 'azure-cli', service, 'msal_token_cache.json');
     assert.equal(readFileSync(copy, 'utf8'), 'fixture-identity');
@@ -103,12 +98,12 @@ test('cloud Compose config passes only runtime ownership inputs and isolated CLI
     mode: 'azure', azure: azureTargets(config, 'test'), azureConfigHostDirectory: '/private/run/azure-cli', azureEnvironment: environment,
   });
   const override = JSON.parse(text);
-  for (const service of ['direct-1', 'dataflow-1']) {
+  for (const service of ['dataflow-1']) {
     const config = override.services[service];
     assert.equal(config.environment.AZURE_CONFIG_DIR, '/run/azure');
     assert.equal(config.environment.AZURE_SUBSCRIPTION_ID, environment.AZURE_SUBSCRIPTION_ID);
     assert.equal(config.environment.ARROWCOL_RESET_GENERATION, environment.ARROWCOL_RESET_GENERATION);
-    assert(config.environment.ARROWCOL_DELTA_ROOT.endsWith(service === 'direct-1' ? '/direct' : '/dataflow'));
+    assert(config.environment.ARROWCOL_DELTA_ROOT.endsWith('/dataflow'));
     const mount = config.volumes.find((volume: { target: string }) => volume.target === '/run/azure');
     assert.equal(mount.source, `/private/run/azure-cli/${service}`);
     assert.notEqual(mount.read_only, true);
@@ -119,7 +114,7 @@ test('cloud Compose config passes only runtime ownership inputs and isolated CLI
     const entry = override.services[service];
     assert.equal(entry.environment.ARROWCOL_RESET_GENERATION, environment.ARROWCOL_RESET_GENERATION);
     assert.equal(entry.environment.ARROWCOL_DELTA_ROOT, service === 'tenant-stream'
-      ? azureTargets(config, 'test').tenantRoot : azureTargets(config, 'test').directRoot);
+      ? azureTargets(config, 'test').tenantRoot : azureTargets(config, 'test').dataflowRoot);
     assert.equal(entry.volumes[0].source, `/private/run/azure-cli/${service}`);
     assert.equal(entry.volumes[0].bind.create_host_path, false);
   }

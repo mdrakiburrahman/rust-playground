@@ -7,7 +7,7 @@ import { atomicJson } from './publisher-release.js';
 
 export const QUIVER_PROCESS_EXITS_FILE = 'quiver-process-exits.json';
 type Docker = (args: string[]) => string;
-type Pool = 'direct' | 'dataflow';
+type Pool = 'dataflow';
 interface ProcessIdentity { id: string; startedAt: number; finishedAt: number; running: boolean; exitCode: number }
 export interface KilledPublisher {
   implementation_pool: Pool;
@@ -63,7 +63,7 @@ async function pressureIdentity(endpoint: string, pool: Pool): Promise<string> {
   const response = await fetch(`${endpoint}/v1/pressure`, { signal: AbortSignal.timeout(5_000), redirect: 'error' });
   assert(response.ok, `Crash pressure identity HTTP ${response.status}`);
   const value = await response.json() as { instance_id?: unknown; rich?: { instance_id?: unknown } };
-  const instance = pool === 'direct' ? value.instance_id : value.rich?.instance_id;
+  const instance = value.rich?.instance_id;
   assert(typeof instance === 'string'
     && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/iu.test(instance), 'Missing crash collector UUID');
   return instance.toLowerCase();
@@ -73,7 +73,7 @@ export async function killQuiverPublishers(options: {
   workspace: string; results: string; docker: Docker; endpoints: Record<Pool, string>; kill: () => Promise<void>;
 }): Promise<KilledPublishers> {
   const id = runId(options.results);
-  const before = await Promise.all((['direct', 'dataflow'] as const).map(async pool => {
+  const before = await Promise.all((['dataflow'] as const).map(async pool => {
     const process = processIdentity(options.workspace, pool, options.endpoints[pool], options.docker);
     assert(process.running, 'Collector already stopped before controlled crash');
     const instance = await pressureIdentity(options.endpoints[pool], pool);
