@@ -931,6 +931,16 @@ test('Bicep adds experiment container, database, workspace and StorageRead diagn
   assert.match(main, /param experimentDatabase string = 'experimentqap'/);
   assert.match(main, /param logAnalyticsWorkspaceName string = 'arrowcol-\$\{sandboxId\}'/);
 });
+for (const group of ['rust-playground', 'rust-playground-schema-evo'])
+  test(`deployment name is isolated for ${group}`, async () => {
+    azure.c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_RESOURCE_GROUP: group });
+    azure.tags = { ...b.TAGS, sandboxId: azure.c.sandbox };
+    await b.deploy(azure);
+    const invocation = azure.events.find(event => event[0] === 'cli' && event[1] === 'deployment');
+    assert.ok(invocation);
+    const expected = group === 'rust-playground' ? 'arrowcol-sandbox' : 'arrowcol-sandbox-' + azure.c.sandbox;
+    assert.equal(invocation[invocation.indexOf('--name') + 1], expected);
+  });
 function coordinateProvision() {
   const deployed: any[] = [], observed: any[] = [], child: { generation?: string; id?: string; then?: () => Promise<void> } = {};
   const originalCli = azure.cli.bind(azure), originalKql = azure.kql.bind(azure);

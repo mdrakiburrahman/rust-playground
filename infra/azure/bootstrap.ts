@@ -504,7 +504,8 @@ export async function deploy(azure: Azure, fresh?: Metadata): Promise<void> {
   try {
     try {
       await azure.cli('deployment', 'sub', 'create', '--subscription', c.subscription, '--location', c.location,
-        '--name', 'arrowcol-sandbox', '--template-file', path.join(ROOT, 'infra/azure/main.bicep'), '--parameters', '@' + filename);
+        '--name', c.group === 'rust-playground' ? 'arrowcol-sandbox' : 'arrowcol-sandbox-' + c.sandbox,
+        '--template-file', path.join(ROOT, 'infra/azure/main.bicep'), '--parameters', '@' + filename);
     } catch (error) {
       if (error instanceof Failure && error.message.includes('DeploymentFailed')) throw new DeploymentFailed(error.message, { cause: error });
       throw error;
