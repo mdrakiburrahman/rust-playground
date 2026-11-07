@@ -83,11 +83,17 @@ pub struct CatalogService {
     events: broadcast::Sender<rpc::ChangeEvent>,
     store: Arc<MemoryCatalogStore>,
     parser: DdlParser,
+    shutdown: tokio::sync::watch::Sender<bool>,
     #[cfg(test)]
     fail_after_commit: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl CatalogService {
+    /// Ends long-lived CES streams so tonic can drain in-flight DDL before publisher closure.
+    pub fn shutdown_watch_streams(&self) {
+        self.shutdown.send_replace(true);
+    }
+
     /// Rehydrates committed Delta metadata before applying missing SQL seeds.
     ///
     /// # Errors
@@ -120,6 +126,7 @@ impl CatalogService {
             events,
             store: Arc::new(MemoryCatalogStore::new()),
             parser: DdlParser::default(),
+            shutdown: tokio::sync::watch::channel(false).0,
             #[cfg(test)]
             fail_after_commit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
@@ -824,6 +831,10 @@ impl rpc::schema_catalog_server::SchemaCatalog for CatalogService {
     }
     async fn watch(&self, request: Request<rpc::EventsRequest>) -> Result<Response<Self::WatchStream>, Status> {
         let state = self.state.lock().await;
+        let mut shutdown = self.shutdown.subscribe();
+        if *shutdown.borrow() {
+            return Err(Status::unavailable("catalog is shutting down"));
+        }
         let from = checked_from(&state, request.into_inner().from)?;
         let replay: Vec<_> = state
             .events
@@ -854,9 +865,12 @@ impl rpc::schema_catalog_server::SchemaCatalog for CatalogService {
                 }
             }
         });
-        Ok(Response::new(Box::pin(tokio_stream::wrappers::ReceiverStream::new(
-            receiver,
-        ))))
+        let stream = tokio_stream::wrappers::ReceiverStream::new(receiver).take_until(async move {
+            if !*shutdown.borrow_and_update() {
+                let _ = shutdown.changed().await;
+            }
+        });
+        Ok(Response::new(Box::pin(stream)))
     }
     async fn get_table(&self, request: Request<rpc::TableRequest>) -> Result<Response<rpc::TableSnapshot>, Status> {
         let identity = identity_from_request(&request.into_inner())

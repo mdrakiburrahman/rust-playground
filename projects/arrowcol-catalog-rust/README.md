@@ -30,5 +30,10 @@ uses Azure CLI credentials and the existing sandbox publisher fencing.
 `complete_bootstrap`, before starting ordinary Azure catalog/DFE writers.
 Do not invent or overwrite `ARROWCOL_RESET_GENERATION`.
 
+On SIGTERM or Ctrl-C, the service ends CES watches, drains accepted Flight SQL
+requests, then closes its process-shared publisher sessions through the guarded
+shutdown protocol. A failed/uncertain drain or close is an error, not a clean
+shutdown; retained publisher membership must not be adopted or removed manually.
+
 See [catalog semantics and recovery](../../docs/architecture/arrowcol-platform/catalog.md)
 and [container publishing](../../docs/containers/publishing.md).

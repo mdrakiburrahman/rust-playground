@@ -34,6 +34,8 @@ async fn main() -> Result<()> {
         };
         return tokio::time::timeout(std::time::Duration::from_secs(3), check).await?;
     }
+    #[cfg(unix)]
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
@@ -45,6 +47,8 @@ async fn main() -> Result<()> {
     })
     .await?;
     tracing::info!(listen = %args.listen, "catalog Flight SQL and CES ready");
+    let shutdown_service = service.clone();
+    let (signal_sender, signal_receiver) = tokio::sync::oneshot::channel();
     tonic::transport::Server::builder()
         .add_service(
             FlightServiceServer::new(service.clone())
@@ -56,11 +60,21 @@ async fn main() -> Result<()> {
                 .max_decoding_message_size(8 * 1024 * 1024)
                 .max_encoding_message_size(8 * 1024 * 1024),
         )
-        .serve_with_shutdown(args.listen, async {
-            if let Err(error) = tokio::signal::ctrl_c().await {
-                tracing::error!(%error, "catalog shutdown signal failed");
-            }
+        .serve_with_shutdown(args.listen, async move {
+            #[cfg(unix)]
+            let signal = tokio::select! {
+                result = tokio::signal::ctrl_c() => result,
+                _ = terminate.recv() => Ok(()),
+            };
+            #[cfg(not(unix))]
+            let signal = tokio::signal::ctrl_c().await;
+            tracing::info!("catalog draining Flight SQL and CES");
+            shutdown_service.shutdown_watch_streams();
+            let _ = signal_sender.send(signal);
         })
         .await?;
+    signal_receiver.await??;
+    arrow_deltalake::publisher::PublisherSession::close_shared_async().await?;
+    tracing::info!("catalog publisher sessions drained and closed");
     Ok(())
 }
