@@ -693,5 +693,3 @@ struct CapabilitiesResponse {
     flight_sql_control_metadata: &'static str,
     identity_propagation: &'static str,
 }
-
-#[derive(Serialize)]
