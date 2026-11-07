@@ -191,7 +191,7 @@ export async function runKubernetes(input: { options: Options; argv: readonly st
   const args = kubernetesRuntimeArgs(input.argv);
   const activeDeadlineSeconds = Math.ceil((input.profile.budgetMs + CLEANUP_SECONDS * 1000 + JOB_START_SECONDS * 1000) / 1000);
   const environment = { ...input.azureConfig.generated(), AZURE_SUBSCRIPTION_ID: input.azureConfig.subscription,
-    AZURE_RESOURCE_GROUP: input.azureConfig.group, ARROWCOL_QAP_STAGE: '/tmp/qap-stage' };
+    AZURE_RESOURCE_GROUP: input.azureConfig.group, ARROWCOL_QAP_STAGE: '/app/.temp/qap-stage' };
   const tempRoot = writeKustomizeOverlay(config, namespace, serviceAccount, identityClientId, jobName, args, environment,
     input.generation, activeDeadlineSeconds);
   const overlay = path.join(tempRoot, 'infra/kubernetes/overlays/azure-qap');
@@ -269,7 +269,8 @@ export async function runKubernetes(input: { options: Options; argv: readonly st
   }
   if (jobApplied) {
     try { await runKubectl(config, input.azureConfig,
-      ['delete', 'job', jobName, '-n', namespace, '--grace-period=10', '--wait=true', '--timeout=30s'], 75); }
+      ['delete', `job/${jobName}`, `configmap/${jobName}-env`, `secret/${jobName}-secret`,
+        '-n', namespace, '--ignore-not-found=true', '--grace-period=10', '--wait=true', '--timeout=30s'], 75); }
     catch (error) { primaryError ??= error; }
   }
   if (logsStop) {

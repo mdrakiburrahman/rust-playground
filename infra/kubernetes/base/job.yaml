@@ -58,8 +58,12 @@ spec:
               mountPath: /artifacts
             - name: tmp
               mountPath: /tmp
+            - name: stage
+              mountPath: /app/.temp/qap-stage
       volumes:
         - name: artifacts
           emptyDir: {}
         - name: tmp
+          emptyDir: {}
+        - name: stage
           emptyDir: {}

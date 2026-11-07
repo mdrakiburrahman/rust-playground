@@ -267,10 +267,19 @@ impl CredentialProvider for BoundedAzureCli {
     }
 }
 
-/// Azure CLI bearer-token source for one OAuth scope, sharing the storage provider's
+/// Azure CLI or projected workload bearer-token source for one OAuth scope, sharing the storage provider's
 /// bounded acquisition: owned process-group kill on deadline or cancellation, 64 KiB
 /// output bound, no stdout/stderr text in errors and a short token cache.
 pub struct AzureCliTokenProvider(BoundedAzureCli);
+
+#[async_trait::async_trait]
+impl CredentialProvider for AzureCliTokenProvider {
+    type Credential = AzureCredential;
+
+    async fn get_credential(&self) -> Result<Arc<Self::Credential>> {
+        self.0.get_credential().await
+    }
+}
 
 impl std::fmt::Debug for AzureCliTokenProvider {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

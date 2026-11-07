@@ -57,6 +57,13 @@ QAP service-account federated credential automatically. The QAP pod receives
 only generated resource settings and the reset-generation secret; it does not
 mount the operator's Azure CLI cache or credentials.
 
+The read-only runtime mounts writable Parquet staging at `/app/.temp/qap-stage`,
+inside the workspace as required by the fixture safety check. Native fixture
+copies use the same bounded, renewing CLI-or-workload credential provider as
+the other Rust storage paths. Completed or failed Jobs remain alive until their
+artifacts are copied; cleanup then removes only that run's Job, ConfigMap and
+generation Secret.
+
 ## Image and run
 
 The image must be built for `linux/amd64`, pushed to the stamped ACR, and
