@@ -35,9 +35,9 @@ const DEFAULT_AKS: StampConfig['aks'] = {
   version: '1.35.6', skuTier: 'Free', namespace: 'arrow-collector', serviceAccount: 'arrow-collector',
   systemPool: { name: 'systempool', vmSize: 'Standard_D8s_v6', initialCount: 3, minCount: 3, maxCount: 6, maxPods: 250, availabilityZones: ['1', '2', '3'] },
   network: { vnetIpv4Cidr: '10.240.0.0/16', vnetIpv6Cidr: 'fd20:240::/48', nodeSubnetIpv4Cidr: '10.240.0.0/24',
-    nodeSubnetIpv6Cidr: 'fd20:240:0:1::/64', apiServerSubnetIpv4Cidr: '10.240.1.0/28', podIpv4Cidr: '172.30.0.0/16',
-    podIpv6Cidr: 'fd20:240:1::/64', serviceIpv4Cidr: '172.31.0.0/16', serviceIpv6Cidr: 'fd20:240:2::/108',
-    dnsServiceIp: '172.31.0.10', egressIpv4IpTags: [], egressIpv6IpTags: [] },
+    nodeSubnetIpv6Cidr: 'fd20:240:0:1::/64', apiServerSubnetIpv4Cidr: '10.240.1.0/28', podIpv4Cidr: '10.241.0.0/16',
+    podIpv6Cidr: 'fd20:240:1::/64', serviceIpv4Cidr: '10.242.0.0/16', serviceIpv6Cidr: 'fd20:240:2::/108',
+    dnsServiceIp: '10.242.0.10', egressIpv4IpTags: [], egressIpv6IpTags: [] },
 };
 
 function object(value: unknown, name: string): Record<string, unknown> {
@@ -224,6 +224,11 @@ export function parseStampConfig(source: string): StampConfig {
       overlaps(network.podIpv4Cidr, network.serviceIpv4Cidr))
     throw new Failure('AKS IPv4 VNet, subnet, pod and service CIDRs must be contained and non-overlapping.');
   const [serviceStart, serviceEnd] = ipv4Range(network.serviceIpv4Cidr);
+  const reserved = ['224.0.0.0/4', '169.254.0.0/16', '172.30.0.0/16', '172.31.0.0/16', '192.0.2.0/24'];
+  if (reserved.some(prefix => overlaps(network.serviceIpv4Cidr, prefix) || overlaps(network.podIpv4Cidr, prefix)))
+    throw new Failure('AKS pod and service CIDRs must not overlap platform-reserved IPv4 ranges.');
+  if (overlaps(network.vnetIpv4Cidr, network.serviceIpv4Cidr) || overlaps(network.vnetIpv4Cidr, network.podIpv4Cidr))
+    throw new Failure('AKS VNet, pod and service CIDRs must not overlap.');
   const dns = ipv4Number(network.dnsServiceIp);
   if (isIP(network.dnsServiceIp) !== 4 || dns < serviceStart || dns > serviceEnd) throw new Failure('aks.network.dnsServiceIp must be inside serviceIpv4Cidr.');
   const credentials = raw.publisherFederatedCredentials ?? [];

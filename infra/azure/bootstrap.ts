@@ -540,7 +540,7 @@ export async function retry_ready<T>(action: () => Promise<T>, label: string, ti
     await runtime.sleep(10);
   }
 }
-export async function existing_network_prefixes(azure: Pick<Azure, 'cli'>, subscription: string): Promise<string[]> {
+export async function existing_network_prefixes(azure: Pick<Azure, 'cli'>, subscription: string, stamp?: Config): Promise<string[]> {
   const vnets = await azure.cli('network', 'vnet', 'list', '--subscription', subscription);
   const prefixes = (network: any): string[] => {
     const values = network.addressSpace?.addressPrefixes;
@@ -562,7 +562,18 @@ export async function existing_network_prefixes(azure: Pick<Azure, 'cli'>, subsc
     if (!knownIds.has(id.toLowerCase())) remoteIds.set(id.toLowerCase(), id);
   }
   const remoteNetworks = await Promise.all([...remoteIds.values()].map(id => azure.cli('network', 'vnet', 'show', '--ids', id)));
-  return [...new Set([...vnets.flatMap(prefixes), ...remoteNetworks.flatMap(prefixes)])];
+  const externalNetworks = vnets.filter((network: any) => {
+    if (!stamp) return true;
+    const ownId = `${stamp.base}/providers/Microsoft.Network/virtualNetworks/${stamp.cluster}-vnet`;
+    if (network.id?.toLowerCase() !== ownId.toLowerCase()) return true;
+    owned(network, stamp);
+    const expected = new Set([stamp.stampConfig.aks.network.vnetIpv4Cidr, stamp.stampConfig.aks.network.vnetIpv6Cidr]);
+    const actual = prefixes(network);
+    if (actual.length !== expected.size || actual.some(prefix => !expected.has(prefix)))
+      throw new Failure('Existing owned AKS VNet address space differs from the configured stamp; refusing network mutation.');
+    return false;
+  });
+  return [...new Set([...externalNetworks.flatMap(prefixes), ...remoteNetworks.flatMap(prefixes)])];
 }
 export async function preflight(azure: Azure): Promise<void> {
   const c = azure.c, aksConfig = c.stampConfig.aks;
@@ -593,7 +604,7 @@ export async function preflight(azure: Azure): Promise<void> {
     '--name', 'EnableAPIServerVnetIntegrationPreview', '--subscription', c.subscription);
   if (apiServerFeature.properties?.state !== 'Registered')
     throw new Failure('AKS API-server VNet integration is not registered in the target subscription.');
-  const existingPrefixes = await existing_network_prefixes(azure, c.subscription);
+  const existingPrefixes = await existing_network_prefixes(azure, c.subscription, c);
   assertNoStampNetworkOverlap(c.stampConfig, existingPrefixes);
   if (!c.operator) {
     const token = await azure.token('https://management.azure.com/');

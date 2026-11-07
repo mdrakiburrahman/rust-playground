@@ -76,6 +76,22 @@ test('network preflight uses supported peering commands and includes remote addr
   assert.ok(calls.every(args => !args.includes('--expand')));
   assert.equal(calls.filter(args => args[0] === 'network' && args[2] === 'show').length, 1);
 });
+test('network preflight excludes only an exactly owned unchanged stamp VNet on rerun', async () => {
+  const c = azure.c;
+  const network = {
+    name: c.cluster + '-vnet', resourceGroup: c.group,
+    id: `${c.base}/providers/Microsoft.Network/virtualNetworks/${c.cluster}-vnet`,
+    tags: { ...azure.tags },
+    addressSpace: { addressPrefixes: [c.stampConfig.aks.network.vnetIpv4Cidr, c.stampConfig.aks.network.vnetIpv6Cidr] },
+  };
+  const client = { async cli(...args: string[]) { return args[2] === 'list' ? [network] : []; } };
+  assert.deepEqual(await b.existing_network_prefixes(client, SUB, c), []);
+  network.tags.sandboxId = 'foreign';
+  await assert.rejects(b.existing_network_prefixes(client, SUB, c), /ownership tags/);
+  network.tags = { ...azure.tags };
+  network.addressSpace.addressPrefixes = ['10.0.0.0/16'];
+  await assert.rejects(b.existing_network_prefixes(client, SUB, c), /address space differs/);
+});
 for (const values of [
   { AZURE_RESOURCE_GROUP: 'production' }, { AZURE_SUBSCRIPTION_ID: 'default' },
   { AZURE_KUSTO_MAX_INSTANCES: '9' }, { AZURE_KUSTO_MIN_INSTANCES: '5', AZURE_KUSTO_MAX_INSTANCES: '4' },

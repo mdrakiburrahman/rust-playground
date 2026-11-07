@@ -190,6 +190,7 @@ resource operatorClusterAdminRole 'Microsoft.Authorization/roleAssignments@2022-
 resource qapFederatedCredential 'Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials@2023-01-31' = {
   parent: sharedIdentity
   name: 'azure-qap'
+  dependsOn: [publisherFederatedCredentialsResource]
   properties: {
     audiences: ['api://AzureADTokenExchange']
     issuer: aks.properties.oidcIssuerProfile.issuerURL
@@ -197,6 +198,7 @@ resource qapFederatedCredential 'Microsoft.ManagedIdentity/userAssignedIdentitie
   }
 }
 
+@batchSize(1)
 resource publisherFederatedCredentialsResource 'Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials@2023-01-31' = [for fic in publisherFederatedCredentials: {
   parent: sharedIdentity
   name: fic.name

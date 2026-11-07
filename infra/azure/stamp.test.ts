@@ -12,7 +12,7 @@ test('loads the approved resource group, stamp and AKS baseline from YAML', () =
   assert.equal(config.location, 'eastus2');
   assert.equal(config.aks.version, '1.35.6');
   assert.equal(config.aks.systemPool.vmSize, 'Standard_D8s_v6');
-  assert.equal(config.aks.network.dnsServiceIp, '172.31.0.10');
+  assert.equal(config.aks.network.dnsServiceIp, '10.242.0.10');
 });
 
 test('rejects invalid stamps, resource-group scope and network overlaps', () => {
@@ -20,8 +20,14 @@ test('rejects invalid stamps, resource-group scope and network overlaps', () => 
   assert.throws(() => parseStampConfig(example.replace('arrow-collector-rg', 'rust-playground')), /resourceGroup is invalid/);
   assert.throws(() => parseStampConfig(example.replace('apiServerSubnetIpv4Cidr: 10.240.1.0/28',
     'apiServerSubnetIpv4Cidr: 10.240.0.0/28')), /non-overlapping/);
-  assert.throws(() => parseStampConfig(example.replace('serviceIpv4Cidr: 172.31.0.0/16',
-    'serviceIpv4Cidr: 172.31.0.0/24')), /prefix 16\.\.16/);
+  assert.throws(() => parseStampConfig(example.replace('serviceIpv4Cidr: 10.242.0.0/16',
+    'serviceIpv4Cidr: 10.242.0.0/24')), /prefix 16\.\.16/);
+  assert.throws(() => parseStampConfig(example.replace('serviceIpv4Cidr: 10.242.0.0/16',
+    'serviceIpv4Cidr: 172.31.0.0/16')), /platform-reserved/);
+  assert.throws(() => parseStampConfig(example.replace('podIpv4Cidr: 10.241.0.0/16',
+    'podIpv4Cidr: 172.30.0.0/16')), /platform-reserved/);
+  assert.throws(() => parseStampConfig(example.replace('podIpv4Cidr: 10.241.0.0/16',
+    'podIpv4Cidr: 10.240.0.0/16')), /must not overlap/);
 });
 
 test('requires explicit target defaults and rejects a different group or region', () => {

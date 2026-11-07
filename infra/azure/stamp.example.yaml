@@ -22,11 +22,11 @@ aks:
     nodeSubnetIpv4Cidr: 10.240.0.0/24
     nodeSubnetIpv6Cidr: fd20:240:0:1::/64
     apiServerSubnetIpv4Cidr: 10.240.1.0/28
-    podIpv4Cidr: 172.30.0.0/16
+    podIpv4Cidr: 10.241.0.0/16
     podIpv6Cidr: fd20:240:1::/64
-    serviceIpv4Cidr: 172.31.0.0/16
+    serviceIpv4Cidr: 10.242.0.0/16
     serviceIpv6Cidr: fd20:240:2::/108
-    dnsServiceIp: 172.31.0.10
+    dnsServiceIp: 10.242.0.10
     # Set only IP allocation tags authorized for the target subscription.
     egressIpv4IpTags: []
     egressIpv6IpTags: []
