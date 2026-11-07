@@ -31,8 +31,13 @@ interface Process {
   exit: Promise<void>;
 }
 
-function launch(binary: string, args: string[], env: NodeJS.ProcessEnv, log: string): Process {
+function launch(binary: string, args: string[], env: NodeJS.ProcessEnv, log: string,
+  ctx: StageContext, role: 'catalog' | 'dfe' | 'v1' | 'v2'): Process {
   const child = spawn(binary, args, { cwd: WORKSPACE, env, stdio: ['pipe', 'pipe', 'pipe'] });
+  if (!child.pid) throw new Error(`Owned ${role} process did not acquire a PID.`);
+  const identity = { role, pid: child.pid, pidNamespace: fs.readlinkSync('/proc/self/ns/pid'),
+    bootId: fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim() };
+  ctx.record('owned-runtime-start', identity);
   const output = fs.createWriteStream(log);
   child.stdout!.pipe(output, { end: false });
   child.stderr!.pipe(output, { end: false });
@@ -41,6 +46,7 @@ function launch(binary: string, args: string[], env: NodeJS.ProcessEnv, log: str
   child.on('error', error => { process.error = error; });
   process.exit = new Promise(resolve => child.on('close', () => {
     process.closed = true;
+    ctx.record('owned-runtime-close', { ...identity, exitCode: child.exitCode, signalCode: child.signalCode });
     output.end();
     resolve();
   }));
@@ -133,7 +139,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     ARROWCOL_FLIGHT_LISTEN: `127.0.0.1:${flightPort}`, ARROWCOL_ADMIN_LISTEN: `127.0.0.1:${adminPort}`,
     ARROWCOL_INSTANCE_KEY: runId });
   fs.mkdirSync(local ? root : mirror, { recursive: true });
-  let catalog: Process | undefined, dfe: Process | undefined, old: Process | undefined;
+  let catalog: Process | undefined, dfe: Process | undefined, old: Process | undefined, newClient: Process | undefined;
   let oldReceipt: Record<string, unknown> | undefined, v1Hash = '', oldHash = '';
   let proof = '', source = '', principal = '', kusto: Kusto | undefined;
   let baseline: Record<string, unknown> | undefined, occupied = false, externalCreated = false, containerStarted = false;
@@ -239,7 +245,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           });
         }
         catalog = launch(binary('arrowcol-catalog-rust'), ['--listen', `127.0.0.1:${catalogPort}`,
-          '--warehouse-root', root, '--state-dir', path.join(out, 'catalog-state')], env, path.join(out, 'catalog.log'));
+          '--warehouse-root', root, '--state-dir', path.join(out, 'catalog-state')], env, path.join(out, 'catalog.log'), ctx, 'catalog');
         await until(ctx, 'catalog-ready', async () => {
           if (catalog!.closed || catalog!.error) throw new Error('Catalog failed; inspect catalog.log.');
           const result = await runProcess(binary('arrowcol-catalog-rust'), ['--listen', `127.0.0.1:${catalogPort}`, '--healthcheck'],
@@ -264,7 +270,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         oldHash = digest(oldBinary);
         ctx.record('immutable-v1', { sdkManifestSha256: v1Hash, binarySha256: oldHash });
         dfe = launch(binary('arrowcol-dataflow-rust'), ['--num-cores', '1', '--config', 'experiments/schema-evolution/config.yaml'],
-          env, path.join(out, 'dfe.log'));
+          env, path.join(out, 'dfe.log'), ctx, 'dfe');
         await until(ctx, 'dfe-ready', async () => {
           if (dfe!.closed || dfe!.error) throw new Error('DFE failed; inspect dfe.log.');
           try {
@@ -280,7 +286,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
             return false;
           }
         });
-        old = launch(oldBinary, [flight, String(ROWS), 'write'], env, path.join(out, 'old.log'));
+        old = launch(oldBinary, [flight, String(ROWS), 'write'], env, path.join(out, 'old.log'), ctx, 'v1');
         oldReceipt = await event(old, ctx);
         if (oldReceipt.event !== 'accepted' || oldReceipt.phase !== 'before' || oldReceipt.version !== 1 ||
             oldReceipt.pid !== old.child.pid || oldReceipt.rows !== ROWS)
@@ -342,7 +348,12 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         await until(ctx, 'old-client-completed', async () => old!.closed);
         if (old.child.exitCode !== 0) throw new Error('Old client failed after ALTER.');
         ctx.record('old-after-same-process', continued);
-        const newReceipt = object(JSON.parse(await command(current, [flight, String(ROWS), 'write'], ctx, env)));
+        newClient = launch(current, [flight, String(ROWS), 'write'], env, path.join(out, 'new.log'), ctx, 'v2');
+        const writingClient = newClient;
+        const newReceipt = await event(writingClient, ctx);
+        await until(ctx, 'new-client-completed', async () => writingClient.closed);
+        if (writingClient.child.exitCode !== 0 || newReceipt.pid !== writingClient.child.pid)
+          throw new Error('New client did not close with its captured process identity.');
         ctx.record('new-after', newReceipt);
         if (newReceipt.event !== 'accepted' || newReceipt.client !== 'new' || newReceipt.version !== 2 || newReceipt.rows !== ROWS)
           throw new Error('New client did not actually write the independently generated v2 SDK.');
@@ -396,6 +407,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         catch (error) { errors.push(error); ctx.record('cleanup-failure', { label, message: String(error) }); }
       };
       await attempt('old-client', () => stop(old, ctx.signal, 'SIGTERM'));
+      await attempt('new-client', () => stop(newClient, ctx.signal, 'SIGTERM'));
       await attempt('dfe', async () => {
         await stop(dfe, ctx.signal, 'SIGTERM');
         if (dfe && dfe.child.exitCode !== 0) throw new Error('DFE did not shut down cleanly; preserve Azure data.');
