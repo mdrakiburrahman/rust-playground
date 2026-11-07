@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
 use arrow_schema::SchemaRef;
-use arrowcol_catalog::SchemaVersion;
+use arrowcol_catalog::{CatalogSchemaVersion, SchemaVersion, generate_descriptor_artifacts};
 use arrowcol_catalog_client::{CatalogClient, RemoteCatalogClient};
 use arrowcol_protocol::{CatalogName, SchemaName, TableIdentity, TableName};
 use serde::Deserialize;
@@ -103,11 +103,14 @@ pub async fn prepare_tables(
             );
         }
         let artifacts = current.snapshot;
+        let proto_source = proto_source_for(head, &artifacts.protobuf_descriptor)
+            .with_context(|| format!("derive proto source from catalog history for {}", statement.identity))?;
         let table_artifacts = artifact_root.join(statement.identity.table().as_str());
         replace_directory(&table_artifacts)?;
         fs::write(table_artifacts.join("manifest.json"), artifacts.manifest)?;
         fs::write(table_artifacts.join("schema.arrow"), artifacts.arrow_schema_ipc)?;
         fs::write(table_artifacts.join("descriptor.pb"), artifacts.protobuf_descriptor)?;
+        fs::write(table_artifacts.join("schema.proto"), proto_source)?;
 
         let table_generated = generated_root.join(statement.identity.table().as_str());
         invoke_generator(
@@ -172,6 +175,14 @@ fn safe_component(value: &str) -> Result<&str> {
         bail!("internal correlation ID must be 1..=128 ASCII letters, digits, '.', '_' or '-'");
     }
     Ok(value)
+}
+
+fn proto_source_for(schema: &CatalogSchemaVersion, descriptor: &[u8]) -> Result<Vec<u8>> {
+    let canonical = generate_descriptor_artifacts(schema)?;
+    if canonical.protobuf_descriptor() != descriptor {
+        bail!("catalog descriptor disagrees with immutable schema history for {}", schema.identity());
+    }
+    Ok(canonical.protobuf_source()?.into_bytes())
 }
 
 fn replace_directory(path: &Path) -> Result<()> {
@@ -320,4 +331,32 @@ struct RoutingManifest {
     schema: String,
     table: String,
     schema_fingerprint: String,
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrowcol_catalog::{DdlCommand, DdlParser, deterministic_table_id};
+
+    #[test]
+    fn proto_source_is_derived_from_catalog_history_and_bound_to_its_descriptor() -> Result<()> {
+        let DdlCommand::CreateTable(create) = DdlParser::default()
+            .parse("CREATE TABLE telemetry.prod.sdk_artifact_probe (id BIGINT NOT NULL) USING DELTA")?
+        else {
+            anyhow::bail!("expected CREATE TABLE");
+        };
+        let schema = CatalogSchemaVersion::new(
+            deterministic_table_id(create.identity()),
+            create.identity().clone(),
+            SchemaVersion::FIRST,
+            create.fields().to_vec(),
+            create.canonical_ddl(),
+        )?;
+        let artifacts = generate_descriptor_artifacts(&schema)?;
+        let source = proto_source_for(&schema, artifacts.protobuf_descriptor())?;
+        assert_eq!(source, artifacts.protobuf_source()?.into_bytes());
+        assert!(proto_source_for(&schema, b"different descriptor").is_err());
+        Ok(())
+    }
 }
