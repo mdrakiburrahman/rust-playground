@@ -6,6 +6,7 @@ import { parse as parseYaml, stringify } from 'yaml';
 import { Config, Failure, ROOT, run_tree } from '../../../infra/azure/bootstrap.js';
 import type { Options, Profile } from './profile.js';
 import { cleanupRetainedJob, validateOwnedMetadata, type RetainedJobReceipt } from './retained-job.js';
+import { runtimeSignalCommand } from './runtime-signal.js';
 export { cleanupRetainedJob };
 
 const CLEANUP_SECONDS = 5 * 60;
@@ -304,7 +305,8 @@ export async function runKubernetes(input: { options: Options; argv: readonly st
   }
   if (jobApplied && pod && (!artifactsCopied.value || primaryError)) {
     try {
-      await runKubectl(config, input.azureConfig, ['exec', '-n', namespace, pod, '--', 'kill', '-TERM', '1'], 30);
+      await runKubectl(config, input.azureConfig,
+        ['exec', '--container', 'experiment', '-n', namespace, pod, '--', ...runtimeSignalCommand('SIGTERM')], 30);
       if (await waitForDone(CLEANUP_SECONDS + 30, true)) await copyArtifacts(artifactsCopied.value);
       else throw new Failure('Kubernetes QAP cancellation did not finish cleanup before the five-minute deadline.');
     } catch (error) {
@@ -314,7 +316,7 @@ export async function runKubernetes(input: { options: Options; argv: readonly st
   if (jobApplied && !retained) {
     if (pod && artifactsCopied.value) {
       try { await runKubectl(config, input.azureConfig,
-        ['exec', '--container', 'experiment', '-n', namespace, pod, '--', 'kill', '-USR1', '1'], 15); }
+        ['exec', '--container', 'experiment', '-n', namespace, pod, '--', ...runtimeSignalCommand('SIGUSR1')], 15); }
       catch (error) { primaryError ??= error; }
     }
     try { await runKubectl(config, input.azureConfig,
