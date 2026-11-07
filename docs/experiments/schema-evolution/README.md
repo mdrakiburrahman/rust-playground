@@ -7,6 +7,7 @@
 | Genuine historical and evolved SDK clients compile independently | `schema-evolution-experiment:build-fixtures` compiles v1 without `bar` or a v2 dependency and v2 with nullable `bar`; remote catalog artifacts remain a live gate. |
 | Pinned Kustainer accepts native-refresh prerequisites | `schema-evolution-experiment:probe-kustainer` accepts create, QAP, then AutoUpdateSchema. Empty fixture means actual refresh remains inconclusive. |
 | Live catalog, SDK, Delta and Kusto evolution | Not yet qualified; component checks are not an end-to-end pass. |
+| First real partitioned v1 publication | At `420f039`, live catalog CREATE and genuine v1 SDK admission succeeded, but Delta rejected missing partition values. No data commit landed; fixture partitioning was not removed. |
 | Native Azure schema refresh | Must be observed without a post-ALTER manual external-table update. |
 | New stamp reaches supported write readiness | Full bootstrap at `937a465` completed initialization under custody, reconciled 26 Delta external tables/QAP, and exported ready-v1 in 138.4 seconds. This is not the final DFE-only topology rehearsal. |
 

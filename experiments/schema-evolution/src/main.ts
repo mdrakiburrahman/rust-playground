@@ -259,7 +259,12 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
             oldReceipt.pid !== old.child.pid || oldReceipt.rows !== ROWS)
           throw new Error('Old client did not actually write v1 before ALTER.');
         ctx.record('old-before', oldReceipt);
-        await until(ctx, 'old-before-published', async () => (await fetchSnapshot(ctx)).rows === ROWS);
+        await until({ ...ctx, deadline: Math.min(ctx.deadline, Date.now() + 120_000) }, 'old-before-published', async () => {
+          const state = await fetchSnapshot(ctx);
+          ctx.record('delta-before-observed', { version: state.version, rows: state.rows, activeFiles: state.files.length });
+          if (state.rows > ROWS) throw new Error('Unexpected duplicate or foreign rows before ALTER.');
+          return state.rows === ROWS;
+        });
         if (nullableBar((await fetchSnapshot(ctx)).schema)) throw new Error('bar exists before ALTER.');
         return { status: 'passed', summary: 'Genuinely generated v1 client is still alive after publishing its first cohort.' };
       } },
@@ -315,6 +320,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         let state: Snapshot | undefined;
         await until(ctx, 'all-cohorts-published', async () => {
           state = await fetchSnapshot(ctx);
+          ctx.record('delta-after-observed', { version: state.version, rows: state.rows, activeFiles: state.files.length });
+          if (state.rows > ROWS * 3) throw new Error('Unexpected duplicate or foreign rows after ALTER.');
           return state.rows === ROWS * 3;
         });
         if (!nullableBar(state!.schema)) throw new Error('Current Delta schema has no nullable bar.');
