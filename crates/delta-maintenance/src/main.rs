@@ -5,6 +5,7 @@ use arrow_deltalake::maintenance::{Granularity, OptimizeConfig};
 use clap::Parser;
 use delta_kernel::metrics::WithMetricsReporterLayer;
 use delta_maintenance::{Metrics, Operation, Settings, run, serve_metrics};
+use delta_maintenance::{catalog::CatalogDiscovery, run_with_discovery};
 use opentelemetry_otlp::{Protocol, WithExportConfig};
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use std::net::SocketAddr;
@@ -25,12 +26,15 @@ const MIB: u64 = 1024 * 1024;
 )]
 struct Cli {
     /// Root URL containing the allowlisted tables (file:///..., abfss://...).
+    #[arg(long, required_unless_present = "catalog_endpoint")]
+    root: Option<Url>,
+    /// Shared schema-catalog gRPC endpoint (for example http://catalog:8817).
     #[arg(long)]
-    root: Url,
+    catalog_endpoint: Option<String>,
     /// Allowlisted table directory names under the root (repeatable).
-    #[arg(long = "table", required = true)]
+    #[arg(long = "table")]
     tables: Vec<String>,
-    /// Operations to run per table, in optimize, purge, vacuum, checkpoint, prune-log order (repeatable).
+    /// Operations to run per table, in purge, optimize, vacuum, checkpoint, prune-log order (repeatable).
     #[arg(long = "operation", value_enum, required = true)]
     operations: Vec<Operation>,
     /// Mutate the tables. Without this flag only dry-run plans are reported.
@@ -98,10 +102,15 @@ fn millis(secs: u64) -> Result<i64> {
 }
 
 fn settings(cli: Cli) -> Result<Settings> {
+    let catalog = cli.catalog_endpoint.is_some();
     let target = cli.target_file_mib.checked_mul(MIB).context("target overflow")?;
     let defaults = OptimizeConfig::default();
     let settings = Settings {
-        root: cli.root,
+        root: match cli.root {
+            Some(root) => root,
+            None if catalog => Url::parse("file:///")?,
+            None => return Err(anyhow!("--root is required without --catalog-endpoint")),
+        },
         tables: cli.tables,
         operations: cli.operations,
         apply: cli.apply,
@@ -110,8 +119,17 @@ fn settings(cli: Cli) -> Result<Settings> {
         max_cycles: cli.max_cycles,
         max_concurrent_tables: cli.max_concurrent_tables,
         operation_timeout: Duration::from_secs(cli.operation_timeout_secs),
-        granularity: cli.granularity.as_deref().map(Granularity::parse_name).transpose()?,
-        purge_retention_ms: cli.purge_retention_secs.map(millis).transpose()?,
+        granularity: cli
+            .granularity
+            .as_deref()
+            .map(Granularity::parse_name)
+            .transpose()?
+            .or(catalog.then_some(Granularity::Hour)),
+        purge_retention_ms: cli
+            .purge_retention_secs
+            .map(millis)
+            .transpose()?
+            .or(catalog.then_some(30 * 24 * 60 * 60 * 1000)),
         anchor_ms: cli.anchor_ms,
         vacuum_retention_ms: millis(cli.vacuum_retention_secs)?,
         allow_short_vacuum_retention: cli.allow_short_vacuum_retention,
@@ -183,6 +201,7 @@ fn main() -> ExitCode {
 
 fn main_inner() -> Result<bool> {
     let cli = Cli::parse();
+    let catalog_endpoint = cli.catalog_endpoint.clone();
     let (listen, no_listener) = (cli.listen, cli.no_metrics_listener);
     let settings = settings(cli)?;
     let provider = telemetry()?;
@@ -195,7 +214,12 @@ fn main_inner() -> Result<bool> {
     } else {
         None
     };
-    let healthy = run(&settings, &metrics, &cancel);
+    let healthy = if let Some(endpoint) = catalog_endpoint {
+        let discovery = CatalogDiscovery::connect(&endpoint, settings.tables.clone())?;
+        run_with_discovery(&settings, &discovery, &metrics, &cancel)
+    } else {
+        run(&settings, &metrics, &cancel)
+    };
     cancel.store(true, Ordering::SeqCst);
     if let Some(listener) = listener {
         listener.join().map_err(|_| anyhow!("metrics listener panicked"))?;

@@ -2,6 +2,8 @@
 //! checkpointing and proven `_delta_log` pruning over an allowlist of tables,
 //! dry-run by default, with Prometheus metrics.
 
+pub mod catalog;
+
 use anyhow::{Context, Result, bail};
 use arrow_deltalake::delta::DeltaTable;
 use arrow_deltalake::maintenance::{
@@ -283,6 +285,10 @@ fn process_defaults(settings: &Settings) -> BTreeMap<String, String> {
             settings.operations.contains(&Operation::Vacuum).to_string(),
         ),
         (
+            "arrowcol.vacuum.allowShortRetention",
+            settings.allow_short_vacuum_retention.to_string(),
+        ),
+        (
             "arrowcol.optimize.targetFileSize",
             settings.optimize.target_file_bytes.to_string(),
         ),
@@ -378,6 +384,19 @@ fn process_defaults(settings: &Settings) -> BTreeMap<String, String> {
     if let Some(interval) = settings.interval {
         props.insert("arrowcol.maintenance.interval".into(), interval.as_millis().to_string());
     }
+    if let Some(layout) = &settings.optimize.layout {
+        for (key, value) in [
+            ("arrowcol.layout.enabled", "true".into()),
+            ("arrowcol.layout.sortColumns", layout.sort_columns.join(",")),
+            ("arrowcol.layout.bloomColumns", layout.bloom_columns.join(",")),
+            ("arrowcol.layout.maxRows", layout.max_rows.to_string()),
+            ("arrowcol.layout.maxInputSize", layout.max_input_bytes.to_string()),
+            ("arrowcol.layout.rowGroupRows", layout.row_group_rows.to_string()),
+            ("arrowcol.layout.pageRows", layout.page_rows.to_string()),
+        ] {
+            props.insert(key.into(), value);
+        }
+    }
     props
 }
 
@@ -410,6 +429,7 @@ fn effective_settings(settings: &Settings, properties: &BTreeMap<String, String>
         effective.log_retention_ms = Some(i64::try_from(props.unsigned("delta.logRetentionDuration")?)?);
     }
     effective.checkpoint_every_commits = props.unsigned("delta.checkpointInterval")?;
+    effective.allow_short_vacuum_retention = props.boolean("arrowcol.vacuum.allowShortRetention")?;
     effective.operation_timeout = Duration::from_millis(props.unsigned("arrowcol.maintenance.operationTimeout")?);
     effective.optimize.target_file_bytes = props.unsigned("arrowcol.optimize.targetFileSize")?;
     effective.optimize.small_file_bytes = props.unsigned("arrowcol.optimize.smallFileSize")?;
@@ -427,9 +447,11 @@ fn effective_settings(settings: &Settings, properties: &BTreeMap<String, String>
     let latest = usize::try_from(props.unsigned("arrowcol.optimize.latestPartitions")?)?;
     effective.optimize.latest_partitions = (latest > 0).then_some(latest);
     effective.optimize.sealed_final = !props.boolean("arrowcol.optimize.sealedPartitionsOnly")?;
-    if props.boolean("arrowcol.layout.enabled")? {
-        effective.optimize.layout = Some(arrow_deltalake::layout::LayoutPolicy::from_properties(&props)?);
-    }
+    effective.optimize.layout = if props.boolean("arrowcol.layout.enabled")? {
+        Some(arrow_deltalake::layout::LayoutPolicy::from_properties(&props)?)
+    } else {
+        None
+    };
     effective.optimize.validate()?;
     Ok((effective, props))
 }
@@ -798,24 +820,24 @@ fn run_operation(
                 now_ms: Some(anchor),
                 ..settings.optimize.clone()
             };
-            let mut plan = table.plan_optimize(&config)?;
+            let mut prepared = table.prepare_optimize(&config)?;
             let minimum = usize::try_from(props.unsigned("arrowcol.optimize.minFiles")?)?;
-            plan.bins.retain(|bin| bin.files.len() >= minimum);
-            *optimize = Some(OptimizeEvidence::new(&config, plan.clone()));
-            if settings.apply && !plan.bins.is_empty() {
-                return table.apply_optimize(&plan, &config, control);
+            prepared.plan.bins.retain(|bin| bin.files.len() >= minimum);
+            *optimize = Some(OptimizeEvidence::new(&config, prepared.plan.clone()));
+            if settings.apply && (!prepared.plan.bins.is_empty() || config.sealed_final) {
+                return table.apply_prepared_optimize(&prepared, &config, control);
             }
-            MaintenancePlan::Optimize(plan)
+            MaintenancePlan::Optimize(prepared.plan)
         }
         Operation::Purge => {
             let granularity = settings.granularity.context("purge granularity")?;
             let retention = settings.purge_retention_ms.context("purge retention")?;
             let config = PurgeConfig::new(retention, anchor, granularity);
-            let plan = table.plan_purge(&config)?;
+            let prepared = table.prepare_purge(&config)?;
             if settings.apply {
-                return table.apply_purge(&plan, &config, control);
+                return table.apply_prepared_purge(&prepared, &config, control);
             }
-            MaintenancePlan::Purge(plan)
+            MaintenancePlan::Purge(prepared.plan)
         }
         Operation::Vacuum => {
             let mut config = VacuumConfig::new(settings.vacuum_retention_ms, anchor);
@@ -827,6 +849,9 @@ fn run_operation(
     };
     let mut report = plan.report();
     report.version = report.read_version;
+    if settings.apply {
+        report.outcome = Outcome::Noop;
+    }
     Ok(report)
 }
 
@@ -925,7 +950,9 @@ fn maintain_table(
                     Operation::Checkpoint => ProbeOperation::Checkpoint,
                     Operation::PruneLog => ProbeOperation::PruneLog,
                 };
-                if let Some(report) = probe.probe_no_work(probe_operation, &config, &control)? {
+                if !(operation == Operation::Optimize && effective.optimize.sealed_final)
+                    && let Some(report) = probe.probe_no_work(probe_operation, &config, &control)?
+                {
                     negative_probe = true;
                     return Ok(report);
                 }

@@ -3,7 +3,7 @@
 | Surface | Contract |
 | --- | --- |
 | Policy | Catalog TBLPROPERTIES override CLI/process defaults, then the [central registry](../reference/TABLE_PROPERTIES.md). Unknown `arrowcol.*` keys fail DDL validation. |
-| Discovery | `TableDiscovery` supplies current table locations and properties. `FilesystemDiscovery` supports explicit local/cloud allowlists and bounded automatic local discovery. |
+| Discovery | `--catalog-endpoint http://catalog:8817` uses `arrowcol-catalog-client`'s generated GetSnapshot RPC: one atomic catalog snapshot per pass, shared by all workers. `FilesystemDiscovery` supports explicit local/cloud allowlists and bounded automatic local discovery. |
 | Ordering | PURGE -> OPTIMIZE -> VACUUM -> checkpoint -> PRUNE-LOG, serially for each table; bounded parallelism across tables. |
 | Coordination | Process-wide striped mutexes serialize passes for the same table URL, including overlapping service invocations. Delta commits and guarded storage still coordinate independent processes. |
 | Schedule | `arrowcol.maintenance.interval` applies independently to each table. An error is not an idle success and does not trigger idle exponential backoff. |
@@ -30,6 +30,35 @@ Metadata-only filesystem property caches are fenced by log-object identity token
 VACUUM plans and applies in one pass, reusing the independently validated history and active set only while the fresh Kernel snapshot version and metadata still match. Each deletion chunk rechecks current metadata, active references, cancellation and publication authority. Historical replay is repeated only when concurrent advancement requires it. Progress is written after durable deletions; an idle pass does not rewrite an existing same-version progress record. PRUNE-LOG retains its complete history/checkpoint proof before deleting any log.
 
 The sorted-file and adaptive writer helpers consume the same resolved properties through `LayoutPolicy::from_properties` and `AdaptiveFileSizeConfig::from_properties`. Column names are also validated against the actual schema, and adaptive ratio/input bounds are checked before use.
+
+## Retained history and pruning proof
+
+VACUUM requires contiguous JSON commits `0..=version`, or a durable log floor `F` with its checkpoint present and covered by the VACUUM progress record, followed by contiguous JSON `F+1..=version`. Any other gap fails explicitly. Traversal and external data paths are rejected. Cancellation mid-delete reports partial progress.
+
+The progress record `_arrowcol_maintenance/vacuum-lite.json` is `{table_id, version, cutoff_ms}`: every remove in the replayed history before that cutoff was physically deleted or confirmed absent. A partial, cancelled, dry-run or backlogged pass never writes this claim. The record is table-bound and monotonic; local writes use exclusive locking, a temporary file, fsync and rename, while cloud writes are create-if-absent or ETag-conditional.
+
+A PRUNE-LOG plan chooses a classic checkpoint `C` only when all of these conditions hold:
+
+1. The checkpoint exists, `_last_checkpoint` points to a version at least `C`, and no unsupported multipart, v2 or compacted log object exists at or below it.
+2. Independent JSON replay through `C` agrees with both a direct Parquet checkpoint read and Delta Kernel loading `C`: table id, every active path with partition values and size, protocol, schema, partition columns, configuration, and every application transaction. Advisory statistics and serialized byte encodings are not compared. Transaction-retention settings are refused.
+3. The progress record has the same table id and covers `C`; every remove through `C` has a deletion timestamp strictly before its progress cutoff. Checkpoints may drop expired tombstones, so this prevents pruning from hiding unvacuumed files.
+4. Every deleted JSON commit below `C` is older than log retention using the later of commit/in-commit time and object modification time. Every deleted older checkpoint also passes the modification-time cutoff. `C.json` is retained for append compatibility, though its removes still satisfy the previous rule.
+
+Apply re-proves the plan against fresh state, checks publication authority, and durably writes `_arrowcol_maintenance/log-floor.json` before deleting anything. The checkpoint, `C.json`, `_last_checkpoint` and newer objects are retained. Deletions are ordered and bounded by `--max-prune-files`; `NotFound` counts as already absent, and cancellation reports partial progress. A later pass can finish leftovers below an already-durable floor after re-verifying that floor with Kernel.
+
+Malformed checkpoint hints, record/checkpoint disagreement, unsupported history or missing remove timestamps fail closed. A hint below the durable floor produces a no-work plan rather than dropping more history. Shorter log retention requires the CLI-only marked disposable-test override; acknowledging short VACUUM reader risk does not authorize shorter log retention.
+
+**Log-size limitation:** pruning bounds historical JSON/checkpoint object count, not total log bytes. Checkpoints retain publication and maintenance application transactions forever; transaction retention is deliberately disallowed. The newest checkpoint can therefore grow with publication count. Only classic single-file checkpoints support pruning.
+
+## Final-compaction evidence and lifecycle
+
+The explicit one-shot `--sealed-final --operation optimize` policy bypasses only newest/open partition churn protection, not schema, retention, publication or byte/action/decoding limits. It is not a verified publisher-release receipt or reader lease. The CLI still rejects scheduled, mixed-operation or other-operation uses of this flag. A table's `arrowcol.optimize.sealedPartitionsOnly=false` is likewise an explicit churn policy, never a storage authority override.
+
+Final-compaction runs retain their full typed OPTIMIZE plan and effective configuration even for an empty result: the cheap negative shortcut is deliberately not used for that lifecycle gate. A dry-run empty final plan reports `planned`; an apply reports `noop` and writes no commit. Zero output files alone prove neither emptiness nor success.
+
+Lifecycle orchestration must require one successful, error-free result per expected table with `optimize.plan.bins=[]`, no backlog and no skipped/protected partitions, and verify the expected policy, table/root/run/SDK bindings and current versions. Missing reports and failures are not noops. Writer release and clean mutator-drain evidence must be established independently before compaction; maintenance processes must be joined before capturing immutable reader snapshots.
+
+OPTIMIZE uses `dataChange=false` and preserves exact rows, schema, partition values, publication identities and retained history. JSON `optimize.config` includes resolved policy and limits, `optimize.plan` contains the input bins/read version, and `report.outputs` describes actual outputs only after successful rewriting. Planned evidence is retained when apply fails. Neither one file per partition nor external cache-convergence time is guaranteed.
 
 ## Commands and expected results
 

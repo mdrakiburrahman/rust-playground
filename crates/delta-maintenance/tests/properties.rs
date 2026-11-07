@@ -215,3 +215,55 @@ fn physical_timestamp_retention_boundary_forces_replay_only_strictly_before_cuto
     }
     Ok(())
 }
+
+#[test]
+fn repeated_full_vacuum_noop_does_not_rewrite_existing_progress_record() -> Result<()> {
+    let (root, _, source) = fixture()?;
+    let table = DeltaTable::open_for_maintenance(&source.0.url)?;
+    let config = arrow_deltalake::maintenance::VacuumConfig::new(604_800_000, now_ms()?);
+    table.vacuum_once(&config, true, &MaintenanceControl::default())?;
+    assert!(
+        root.path()
+            .join("events/_arrowcol_maintenance/vacuum-lite.json")
+            .is_file()
+    );
+    let before = inventory(root.path())?;
+    let later = arrow_deltalake::maintenance::VacuumConfig {
+        now_ms: config.now_ms + 1,
+        ..config
+    };
+    let report = table.vacuum_once(&later, true, &MaintenanceControl::default())?;
+    assert_eq!(report.outcome, Outcome::Noop);
+    assert_eq!(before, inventory(root.path())?);
+    Ok(())
+}
+
+#[test]
+fn prepared_optimize_rejects_concurrent_schema_change_before_any_rewrite() -> Result<()> {
+    let (root, _, source) = fixture()?;
+    let table = DeltaTable::open_for_maintenance(&source.0.url)?;
+    let config = OptimizeConfig {
+        granularity: Some(Granularity::Minute),
+        now_ms: Some(BASE + 3 * 60_000),
+        ..Default::default()
+    };
+    let prepared = table.prepare_optimize(&config)?;
+    assert!(!prepared.plan.bins.is_empty());
+    let evolved = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(INGESTION_PARTITION, DataType::Utf8, false),
+        Field::new("extra", DataType::Utf8, true),
+    ]));
+    DeltaTable::open_url(source.0.url, evolved, vec![INGESTION_PARTITION.into()])?;
+    let before = inventory(root.path())?;
+    let error = match table.apply_prepared_optimize(&prepared, &config, &MaintenanceControl::default()) {
+        Err(error) => error,
+        Ok(_) => return Err(anyhow!("stale prepared state unexpectedly applied")),
+    };
+    assert_eq!(
+        arrow_deltalake::maintenance::error_kind(&error),
+        Some(arrow_deltalake::maintenance::MaintenanceErrorKind::MetadataChanged)
+    );
+    assert_eq!(before, inventory(root.path())?);
+    Ok(())
+}

@@ -413,6 +413,7 @@ pub struct DataFile {
 }
 
 /// Exact active read set of one snapshot, with the scan rows needed for removes.
+#[derive(Clone)]
 struct ActiveState {
     snapshot: SnapshotRef,
     fingerprint: TableFingerprint,
@@ -846,6 +847,21 @@ impl DeltaTable {
             }
             Ok(files)
         })
+    }
+
+    fn validated_active_state<'a>(
+        &self,
+        prepared: Option<&'a ActiveState>,
+        max_files: usize,
+    ) -> Result<std::borrow::Cow<'a, ActiveState>> {
+        if let Some(state) = prepared {
+            let snapshot = self.snapshot()?;
+            if snapshot.version() == state.snapshot.version() {
+                state.fingerprint.require_same(&TableFingerprint::of(&snapshot))?;
+                return Ok(std::borrow::Cow::Borrowed(state));
+            }
+        }
+        Ok(std::borrow::Cow::Owned(self.active_state(max_files)?))
     }
 
     fn active_state(&self, max_files: usize) -> Result<ActiveState> {
@@ -1532,6 +1548,12 @@ pub struct OptimizePlan {
     pub skipped_partitions: u64,
 }
 
+/// A typed plan with its already-scanned read state for same-pass application.
+pub struct PreparedOptimize {
+    pub plan: OptimizePlan,
+    state: ActiveState,
+}
+
 impl OptimizePlan {
     fn report(&self, outcome: Outcome) -> MaintenanceReport {
         let mut report = MaintenanceReport::new("optimize", &self.header);
@@ -1574,6 +1596,14 @@ impl DeltaTable {
     /// # Errors
     /// Returns unsupported-table, limit or snapshot errors.
     pub fn plan_optimize(&self, config: &OptimizeConfig) -> Result<OptimizePlan> {
+        Ok(self.prepare_optimize(config)?.plan)
+    }
+
+    /// Plan OPTIMIZE retaining its bounded scan for immediate application.
+    ///
+    /// # Errors
+    /// Returns the same validation and resource errors as `plan_optimize`.
+    pub fn prepare_optimize(&self, config: &OptimizeConfig) -> Result<PreparedOptimize> {
         config.validate()?;
         let state = self.active_state(config.max_active_files)?;
         state.fingerprint.validate_supported(false)?;
@@ -1690,7 +1720,7 @@ impl DeltaTable {
             };
             plan.backlog_files += bin.files.len() as u64;
         }
-        Ok(plan)
+        Ok(PreparedOptimize { plan, state })
     }
 
     fn check_optimize_plan(&self, plan: &OptimizePlan, config: &OptimizeConfig) -> Result<()> {
@@ -1737,10 +1767,33 @@ impl DeltaTable {
         config: &OptimizeConfig,
         control: &MaintenanceControl,
     ) -> Result<MaintenanceReport> {
+        self.apply_optimize_reusing(plan, config, control, None)
+    }
+
+    /// Apply a same-pass plan without rescanning an unchanged log version.
+    ///
+    /// # Errors
+    /// Returns the same stale-plan, metadata and publication errors as `apply_optimize`.
+    pub fn apply_prepared_optimize(
+        &self,
+        prepared: &PreparedOptimize,
+        config: &OptimizeConfig,
+        control: &MaintenanceControl,
+    ) -> Result<MaintenanceReport> {
+        self.apply_optimize_reusing(&prepared.plan, config, control, Some(&prepared.state))
+    }
+
+    fn apply_optimize_reusing(
+        &self,
+        plan: &OptimizePlan,
+        config: &OptimizeConfig,
+        control: &MaintenanceControl,
+        prepared: Option<&ActiveState>,
+    ) -> Result<MaintenanceReport> {
         config.validate()?;
         self.check_optimize_plan(plan, config)?;
         let mut report = plan.report(Outcome::Noop);
-        let state = self.active_state(config.max_active_files)?;
+        let state = self.validated_active_state(prepared, config.max_active_files)?;
         plan.header.fingerprint.require_same(&state.fingerprint)?;
         report.version = state.snapshot.version();
         if state
@@ -2343,6 +2396,12 @@ pub struct PurgePlan {
     pub skipped_partitions: u64,
 }
 
+/// A PURGE plan retaining its bounded scan for same-pass application.
+pub struct PreparedPurge {
+    pub plan: PurgePlan,
+    state: ActiveState,
+}
+
 impl PurgePlan {
     fn report(&self, outcome: Outcome) -> MaintenanceReport {
         let mut report = MaintenanceReport::new("purge", &self.header);
@@ -2406,6 +2465,14 @@ impl DeltaTable {
     /// # Errors
     /// Returns unsupported-table, limit or snapshot errors.
     pub fn plan_purge(&self, config: &PurgeConfig) -> Result<PurgePlan> {
+        Ok(self.prepare_purge(config)?.plan)
+    }
+
+    /// Plan PURGE retaining the scan for immediate application.
+    ///
+    /// # Errors
+    /// Returns the same schema, retention and limit errors as `plan_purge`.
+    pub fn prepare_purge(&self, config: &PurgeConfig) -> Result<PreparedPurge> {
         config.validate()?;
         let state = self.active_state(config.max_active_files)?;
         state.fingerprint.validate_supported(true)?;
@@ -2463,7 +2530,7 @@ impl DeltaTable {
                 "purge plan exceeds the payload bound",
             ));
         }
-        Ok(plan)
+        Ok(PreparedPurge { plan, state })
     }
 
     /// Remove exactly the planned expired partitions (`dataChange=true`) and
@@ -2477,6 +2544,29 @@ impl DeltaTable {
         plan: &PurgePlan,
         config: &PurgeConfig,
         control: &MaintenanceControl,
+    ) -> Result<MaintenanceReport> {
+        self.apply_purge_reusing(plan, config, control, None)
+    }
+
+    /// Apply PURGE reusing the scan only after checking current version and metadata.
+    ///
+    /// # Errors
+    /// Returns the same safety and publication errors as `apply_purge`.
+    pub fn apply_prepared_purge(
+        &self,
+        prepared: &PreparedPurge,
+        config: &PurgeConfig,
+        control: &MaintenanceControl,
+    ) -> Result<MaintenanceReport> {
+        self.apply_purge_reusing(&prepared.plan, config, control, Some(&prepared.state))
+    }
+
+    fn apply_purge_reusing(
+        &self,
+        plan: &PurgePlan,
+        config: &PurgeConfig,
+        control: &MaintenanceControl,
+        prepared: Option<&ActiveState>,
     ) -> Result<MaintenanceReport> {
         config.validate()?;
         plan.header.validate(self)?;
@@ -2525,7 +2615,7 @@ impl DeltaTable {
             return invalid("plan watermark exceeds its cutoff");
         }
         let mut report = plan.report(Outcome::Noop);
-        let state = self.active_state(config.max_active_files)?;
+        let state = self.validated_active_state(prepared, config.max_active_files)?;
         plan.header.fingerprint.require_same(&state.fingerprint)?;
         report.version = state.snapshot.version();
         if state
