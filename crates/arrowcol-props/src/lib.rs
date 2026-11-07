@@ -491,7 +491,11 @@ impl PropKey {
     /// # Errors
     /// Rejects invalid types, overflow, non-finite floats and validator failures.
     pub fn parse(&self, raw: &str) -> Result<PropValue, PropError> {
-        let raw = raw.trim();
+        let raw = if self.prop_type == PropType::Bool && self.name.starts_with("delta.") {
+            raw
+        } else {
+            raw.trim()
+        };
         let value = match self.prop_type {
             PropType::Bool => PropValue::Bool(match raw {
                 "true" => true,
@@ -807,7 +811,7 @@ mod tests {
         for value in ["true", "false"] {
             validate_table_properties(&map(&[("delta.appendOnly", value)]))?;
         }
-        for value in ["not-a-boolean", "TRUE", "1", ""] {
+        for value in ["not-a-boolean", "TRUE", "1", "", " true", "false ", "\ntrue\n"] {
             assert!(validate_table_properties(&map(&[("delta.appendOnly", value)])).is_err());
         }
         let passthrough = map(&[("delta.vendorExtension", "opaque"), ("vendor.tag", "x")]);
