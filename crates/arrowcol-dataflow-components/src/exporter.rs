@@ -1298,17 +1298,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn exporter_refreshes_catalog_adaptive_grouping_without_changing_publication_identity() -> anyhow::Result<()>
     {
-        struct Fixture(PathBuf);
-        impl Drop for Fixture {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target")
-            .join(format!("exporter-policy-{}", arrowcol_protocol::ReceiptId::new()));
-        std::fs::create_dir_all(&root)?;
-        let fixture = Fixture(std::fs::canonicalize(root)?);
+        let fixture = tempfile::tempdir()?;
         let store = Arc::new(MemoryRoutingStore::default());
         let holder = CollectorInstanceId::new();
         let lease = lease(&store, holder).await;
@@ -1319,7 +1309,7 @@ mod tests {
         batching.adaptive_file.min_input_bytes = 1;
         batching.adaptive_file.max_input_bytes = 1;
         let exporter = GenericDeltaExporter::with_batching(
-            fixture.0.clone(),
+            fixture.path().to_path_buf(),
             Arc::clone(&store) as Arc<dyn RoutingStore>,
             arrow_deltalake::commit::CommitOptions::default(),
             batching,
@@ -1328,7 +1318,7 @@ mod tests {
         .map_err(anyhow::Error::msg)?;
         let first = exporter.stage(envelope_pdata(envelope_for(&lease))).await?;
         tokio::time::timeout(std::time::Duration::from_secs(3), first.wait()).await??;
-        let path = fixture.0.join("demo/generated/events");
+        let path = fixture.path().join("demo/generated/events");
         let alter = |input: &str| -> anyhow::Result<()> {
             let url = format!("file://{}/", path.display()).parse()?;
             let catalog = arrow_deltalake::delta::DeltaTable::open_catalog(url)?;

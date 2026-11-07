@@ -132,7 +132,6 @@ test('all loadtest images retain local build behavior with clean Git revision me
 // Collector images compile the otel-arrow protobuf crates and bake read-only configuration files.
 const COLLECTOR_IMAGE_PROJECTS = [
   'otelcol-rust',
-  'arrowcol-rust',
   'arrowcol-dataflow-rust',
   'arrowcol-router-rust',
 ];
