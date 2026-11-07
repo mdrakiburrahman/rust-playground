@@ -656,7 +656,7 @@ export async function deploy(azure: Azure, fresh?: Metadata): Promise<void> {
     }
   } finally { fs.unlinkSync(filename); }
   c.uri = (await azure.arm('GET', c.cluster_id)).properties.uri.replace(/\/+$/, '');
-  const sharedIdentity = await azure.arm('GET', c.identity_id);
+  const sharedIdentity = await azure.arm('GET', c.identity_id, undefined, false, '2023-01-31');
   try { c.identity_client_id = normalized_uuid(sharedIdentity?.properties?.clientId); }
   catch { throw new Failure('Deployment did not return the single arrow-collector UAMI client ID.'); }
   await retry_ready(() => azure.blobs(c.data), 'Storage RBAC');
