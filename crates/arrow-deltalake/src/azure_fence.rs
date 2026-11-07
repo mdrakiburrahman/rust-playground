@@ -324,12 +324,12 @@ mod tests {
     const GENERATION: &str = "00000000-0000-4000-8000-000000000001";
 
     #[test]
-    fn stamped_ownership_matches_bootstrap_and_preserves_legacy_without_a_stamp() {
+    fn stamped_ownership_matches_bootstrap_and_preserves_legacy_without_a_stamp() -> Result<()> {
         let subscription = "00000000-0000-0000-0000-000000000001";
-        assert_eq!(sandbox_ownership(subscription, Some("1")).unwrap(), "stamp-1");
-        assert_eq!(sandbox_ownership(subscription, Some("01")).unwrap(), "stamp-1");
-        assert_eq!(sandbox_ownership(subscription, Some("999999")).unwrap(), "stamp-999999");
-        assert_eq!(sandbox_ownership(subscription, None).unwrap(), "07657369824b");
+        assert_eq!(sandbox_ownership(subscription, Some("1"))?, "stamp-1");
+        assert_eq!(sandbox_ownership(subscription, Some("01"))?, "stamp-1");
+        assert_eq!(sandbox_ownership(subscription, Some("999999"))?, "stamp-999999");
+        assert_eq!(sandbox_ownership(subscription, None)?, "07657369824b");
         for invalid in [
             "",
             "0",
@@ -345,6 +345,7 @@ mod tests {
         ] {
             assert!(sandbox_ownership(subscription, Some(invalid)).is_err(), "{invalid}");
         }
+        Ok(())
     }
 
     #[derive(Debug, Clone)]
