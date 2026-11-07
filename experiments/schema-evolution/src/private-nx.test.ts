@@ -6,9 +6,12 @@ const values = { AZURE_SUBSCRIPTION_ID: '00000000-0000-0000-0000-000000000001',
   AZURE_RESOURCE_GROUP: 'rust-playground-schema-evo' };
 
 test('private Nx environment removes shared Azure roots and generations while preserving approved subscription', () => {
-  const env = privateEnvironment(values, { PATH: 'tools', AZURE_RESOURCE_GROUP: 'rust-playground',
+  const env = privateEnvironment(values, { PATH: 'tools', AZURE_CONFIG_DIR: 'selected-cli-context',
+    AZURE_EXTENSION_DIR: 'selected-cli-extensions', AZURE_RESOURCE_GROUP: 'rust-playground',
     AZURE_STORAGE_ACCOUNT: 'shared', ARROWCOL_RESET_GENERATION: 'stale', ARROWCOL_AZURE_TABLE_ROOT: 'shared-root' });
   assert.equal(env.PATH, 'tools');
+  assert.equal(env.AZURE_CONFIG_DIR, 'selected-cli-context');
+  assert.equal(env.AZURE_EXTENSION_DIR, 'selected-cli-extensions');
   assert.equal(env.AZURE_SUBSCRIPTION_ID, values.AZURE_SUBSCRIPTION_ID);
   assert.equal(env.AZURE_RESOURCE_GROUP, values.AZURE_RESOURCE_GROUP);
   assert.equal(env.AZURE_STORAGE_ACCOUNT, 'arrowcol582e3df61d82');
