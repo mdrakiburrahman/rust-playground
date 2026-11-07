@@ -204,8 +204,6 @@ async fn flight_sql_and_warm_cache_count_actual_catalog_calls() -> Result<()> {
     shutdown
         .send(())
         .map_err(|()| anyhow::anyhow!("server already stopped"))?;
-    // Close CES before waiting for tonic's graceful streaming shutdown.
-    drop(client);
     server.abort();
     let _ = server.await;
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -219,6 +217,48 @@ async fn flight_sql_and_warm_cache_count_actual_catalog_calls() -> Result<()> {
             .await
             .is_err(),
         "catalog outage must not silently accept an expired cached schema"
+    );
+    let restarted = CatalogService::open(config(root.path())).await?;
+    restarted
+        .apply_sql("ALTER TABLE arrowcol.default.events ADD COLUMNS (while_disconnected STRING)")
+        .await?;
+    let listener = tokio::net::TcpListener::bind(
+        url::Url::parse(&endpoint)?
+            .socket_addrs(|| None)?
+            .first()
+            .context("endpoint address")?,
+    )
+    .await?;
+    let server_service = restarted.clone();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(FlightServiceServer::new(server_service.clone()))
+            .add_service(SchemaCatalogServer::new(server_service))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await
+    });
+    let outcome = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(table) = client.table(&identity).await
+                && table.position.epoch != evolved.position.epoch
+                && table.versions.last().is_some_and(|version| version.fields().len() == 4)
+            {
+                break table;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    server.abort();
+    let _ = server.await;
+    let recovered = outcome.context("same client did not reconcile missed ALTER after catalog restart")?;
+    assert!(
+        client.metrics().catalog_calls > baseline,
+        "reconnect must start real reconciliation RPCs"
+    );
+    assert_ne!(
+        recovered.position.epoch, evolved.position.epoch,
+        "restart must replace epoch"
     );
     Ok(())
 }
