@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
-use arrowcol_receipts::{ReceiptStore, SqlServerReceiptConfig, SqlServerReceiptStore};
 use arrowcol_router_rust::{
     AllowAllAuthenticator, Authenticator, Cli, EdgeVerifier, InternalIdentitySigner, ProductionRouter, RouterConfig,
     RouterControlLoop, RouterMetrics, build_server,
@@ -35,22 +34,7 @@ fn main() -> Result<()> {
         Duration::from_millis(config.sql_server.connect_timeout_ms),
         Duration::from_millis(config.sql_server.command_timeout_ms),
     );
-    let receipt_sql = SqlServerReceiptConfig::with_password_file(
-        &config.sql_server.host,
-        config.sql_server.port,
-        &config.sql_server.database,
-        &config.sql_server.username,
-        &config.sql_server.password_file,
-    )?
-    .trust_server_certificate(config.sql_server.trust_server_certificate)
-    .with_timeouts(
-        Duration::from_millis(config.sql_server.connect_timeout_ms),
-        Duration::from_millis(config.sql_server.command_timeout_ms),
-    )
-    .with_batch_limits(256, config.receipts.max_batch_size)?;
-
     let routing_store: Arc<dyn RoutingStore> = Arc::new(SqlServerRoutingStore::new(routing_sql));
-    let receipt_store: Arc<dyn ReceiptStore> = Arc::new(SqlServerReceiptStore::new(receipt_sql));
     let routing = Arc::new(RoutingEngine::new(routing_store, config.routing.policy()?)?);
     let metrics = RouterMetrics::new()?;
     let authenticator: Arc<dyn Authenticator> = Arc::new(AllowAllAuthenticator);
@@ -61,12 +45,10 @@ fn main() -> Result<()> {
     )?);
     let router = ProductionRouter::new(
         Arc::clone(&routing),
-        receipt_store,
         authenticator,
         edge_verifier,
         internal_signer,
         config.upstream.clone(),
-        config.receipts.clone(),
         metrics.clone(),
     );
     let control_loop = RouterControlLoop::new(
