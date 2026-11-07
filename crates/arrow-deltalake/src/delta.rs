@@ -1947,7 +1947,13 @@ impl DeltaTable {
                 },
                 Some(publication_fence),
                 None,
-            ),
+            )
+            .and_then(|mut table| {
+                Arc::get_mut(&mut table)
+                    .context("new Delta writer unexpectedly shared")?
+                    .import_committed_partition_layout()?;
+                Ok(table)
+            }),
             Ok(url) => Self::open_with_fence(
                 url.to_file_path().map_err(|()| anyhow::anyhow!("invalid local URI"))?,
                 publication_fence,
@@ -2273,13 +2279,18 @@ impl DeltaTable {
             session: None,
             bootstrap_only: false,
         };
-        if !table.partition_columns.is_empty()
-            && let Some(snapshot) = table.existing_snapshot()?
+        table.import_committed_partition_layout()?;
+        Ok(Arc::new(table))
+    }
+
+    fn import_committed_partition_layout(&mut self) -> Result<()> {
+        if !self.partition_columns.is_empty()
+            && let Some(snapshot) = self.existing_snapshot()?
         {
             // Process partition defaults apply only to new tables.
-            table.partition_columns = snapshot.table_configuration().metadata().partition_columns().to_vec();
+            self.partition_columns = snapshot.table_configuration().metadata().partition_columns().to_vec();
         }
-        Ok(Arc::new(table))
+        Ok(())
     }
 
     fn existing_snapshot(&self) -> Result<Option<SnapshotRef>> {
