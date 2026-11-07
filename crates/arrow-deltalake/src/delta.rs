@@ -952,8 +952,8 @@ mod io_tests {
         assert_eq!(
             files
                 .iter()
-                .map(|(writer, _)| writer.publication.clone().expect("transaction"))
-                .collect::<Vec<_>>(),
+                .map(|(writer, _)| writer.publication.clone().context("missing transaction"))
+                .collect::<Result<Vec<_>>>()?,
             ids
         );
         for (writer, _) in files {
