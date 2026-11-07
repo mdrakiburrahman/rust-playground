@@ -984,7 +984,7 @@ async fn validation(name: &str) -> anyhow::Result<ValidatedIncomingSchema> {
     );
     let completion = service
         .execute_ddl(FlightSqlDdlRequest::new(format!(
-            "CREATE TABLE telemetry.buffer.{name} (value BIGINT NOT NULL)"
+            "CREATE TABLE telemetry.buffer.{name} (value BIGINT NOT NULL) USING DELTA"
         )))
         .await?;
     let schema = store
@@ -1010,7 +1010,7 @@ async fn historical_and_current(name: &str) -> anyhow::Result<(ValidatedIncoming
     );
     let created = service
         .execute_ddl(FlightSqlDdlRequest::new(format!(
-            "CREATE TABLE telemetry.buffer.{name} (value BIGINT NOT NULL)"
+            "CREATE TABLE telemetry.buffer.{name} (value BIGINT NOT NULL) USING DELTA"
         )))
         .await?;
     let historical = store

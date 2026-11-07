@@ -255,7 +255,7 @@ async fn validation(table: &str) -> Result<ValidatedIncomingSchema> {
     );
     control
         .execute_ddl(FlightSqlDdlRequest::new(format!(
-            "CREATE TABLE experiment.fixtures.{table} (id BIGINT NOT NULL, value BIGINT NOT NULL)"
+            "CREATE TABLE experiment.fixtures.{table} (id BIGINT NOT NULL, value BIGINT NOT NULL) USING DELTA"
         )))
         .await?;
     let identity = TableIdentity::new(
