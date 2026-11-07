@@ -1,0 +1,80 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { parseArgs } from 'node:util';
+import { runProcess } from '../../../tools/libs/experiment-kit/src/experiment.js';
+import { object } from '../../azure-qap/src/kusto.ts';
+
+const WORKSPACE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
+const ROOT = path.join(WORKSPACE, '.temp/experiments/schema-evolution/clients');
+
+function safeParents(filename: string): void {
+  const relative = path.relative(WORKSPACE, filename);
+  if (relative.startsWith('..') || path.isAbsolute(relative)) throw new Error('Client path escaped the workspace.');
+  let parent = WORKSPACE;
+  for (const segment of relative.split(path.sep)) {
+    parent = path.join(parent, segment);
+    if (fs.existsSync(parent) && fs.lstatSync(parent).isSymbolicLink())
+      throw new Error('Client paths must not traverse symlinks.');
+  }
+}
+
+function packageName(directory: string, version: number): string {
+  safeParents(directory);
+  const manifest = object(JSON.parse(fs.readFileSync(path.join(directory, 'sdk-manifest.json'), 'utf8')));
+  const table = object(manifest.table), packages = object(manifest.packages), rust = object(packages.rust);
+  if (table.catalog !== 'schema_evolution' || table.schema !== 'public' || table.table !== 'foo' ||
+      table.version !== version || typeof table.fingerprint !== 'string' ||
+      !/^sha256:[a-f0-9]{64}$/.test(table.fingerprint) || typeof rust.name !== 'string' ||
+      !/^arrowcol-sdk-foo-[a-f0-9]{12}$/.test(rust.name) || rust.root !== 'rust')
+    throw new Error(`Expected immutable foo SDK version ${version}, not a regenerated or unrelated package.`);
+  return rust.name;
+}
+
+async function command(executable: string, args: string[], signal: AbortSignal): Promise<string> {
+  const result = await runProcess(executable, args, {
+    cwd: WORKSPACE, signal, env: { ...process.env, CARGO_TARGET_DIR: path.join(ROOT, 'target') },
+  });
+  if (result.exitCode !== 0)
+    throw new Error(`${executable} ${args.join(' ')} failed: ${result.stderr || result.stdout}`);
+  return result.stdout;
+}
+
+export async function buildClients(v1: string, v2: string, signal: AbortSignal): Promise<{ old: string; new: string }> {
+  const directories = [path.resolve(WORKSPACE, v1), path.resolve(WORKSPACE, v2)];
+  const names = directories.map((directory, index) => packageName(directory, index + 1));
+  if (names[0] === names[1]) throw new Error('Old and new client SDK fingerprints are not distinct.');
+  const binaries: string[] = [];
+  for (const [index, directory] of directories.entries()) {
+    const client = path.join(ROOT, `v${index + 1}`);
+    safeParents(client);
+    fs.mkdirSync(path.join(client, 'src'), { recursive: true });
+    fs.copyFileSync(path.join(WORKSPACE, 'experiments/schema-evolution/client.rs'), path.join(client, 'src/main.rs'));
+    const manifest = [
+      '[package]', `name = "schema-evolution-client-v${index + 1}"`, 'version = "0.1.0"', 'edition = "2024"',
+      '[workspace]', '[features]', 'v2 = []', `[dependencies.sdk]`, `package = ${JSON.stringify(names[index])}`,
+      `path = ${JSON.stringify(path.join(directory, 'rust'))}`, '[dependencies]',
+      'arrow-array = "=58.4.0"', 'arrow-schema = "=58.4.0"',
+      'arrow-flight = { version = "=58.4.0", default-features = false }', 'futures = "=0.3.34"',
+      'serde_json = "=1.0.154"', 'tonic = { version = "=0.14.6", features = ["transport"] }',
+      'tokio = { version = "=1.53.2", features = ["macros", "rt-multi-thread"] }', '',
+    ].join('\n');
+    fs.writeFileSync(path.join(client, 'Cargo.toml'), manifest);
+    const manifestArg = ['--manifest-path', path.join(client, 'Cargo.toml')];
+    await command('cargo', ['generate-lockfile', ...manifestArg], signal);
+    await command('cargo', ['build', '--locked', ...manifestArg, ...(index === 1 ? ['--features', 'v2'] : [])], signal);
+    const binary = path.join(ROOT, 'target/debug', `schema-evolution-client-v${index + 1}`);
+    const description = object(JSON.parse((await command(binary, ['describe'], signal)).trim()));
+    if (description.version !== index + 1 || description.client !== (index === 0 ? 'old' : 'new') ||
+        !Array.isArray(description.fields) || description.fields.includes('bar') !== (index === 1))
+      throw new Error('Compiled client does not preserve its historical generated SDK.');
+    binaries.push(binary);
+  }
+  return { old: binaries[0]!, new: binaries[1]! };
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const { values } = parseArgs({ options: { v1: { type: 'string' }, v2: { type: 'string' } } });
+  if (!values.v1 || !values.v2) throw new Error('build-clients requires --v1 and --v2 immutable generated SDK directories.');
+  console.log(JSON.stringify(await buildClients(values.v1, values.v2, AbortSignal.timeout(20 * 60_000))));
+}
