@@ -2,6 +2,7 @@
 
 use crate::delta::{AppendResult, DeltaFileWriter, DeltaTable, PublicationFence, PublicationFenceError, StagedAppend};
 use anyhow::{Context, Result, bail};
+use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use std::collections::HashMap;
 use std::error::Error;
@@ -87,6 +88,13 @@ enum Request {
         i64,
         i64,
         oneshot::Sender<std::result::Result<DeltaFileWriter, CommitReceiptError>>,
+    ),
+    NewPartitionedPublication(
+        RecordBatch,
+        String,
+        i64,
+        i64,
+        oneshot::Sender<std::result::Result<Vec<(DeltaFileWriter, RecordBatch)>, CommitReceiptError>>,
     ),
     Publish(Box<Publication>),
 }
@@ -323,6 +331,28 @@ impl BatchedTable {
             .map_err(anyhow::Error::new)
     }
 
+    /// Prepare separate replay-safe files for the batch's committed table partition keys.
+    ///
+    /// # Errors
+    /// Rejects invalid batch values and schema, ownership or worker failures.
+    pub async fn new_partitioned_publication_files(
+        &self,
+        batch: RecordBatch,
+        app_id: String,
+        version: i64,
+        stamp: i64,
+    ) -> Result<Vec<(DeltaFileWriter, RecordBatch)>> {
+        let (reply, receive) = oneshot::channel();
+        self.sender
+            .send(Request::NewPartitionedPublication(batch, app_id, version, stamp, reply))
+            .await
+            .context("Delta worker stopped")?;
+        receive
+            .await
+            .context("Delta worker stopped during partition preparation")?
+            .map_err(anyhow::Error::new)
+    }
+
     /// Admit one eligible durable file, waiting asynchronously when capacity is full.
     ///
     /// # Errors
@@ -469,6 +499,17 @@ fn run_worker(
                         };
                         let _ = reply.send(result);
                     }
+                    Some(Request::NewPartitionedPublication(batch, app_id, version, stamp, reply)) => {
+                        let result = match (&table, &failure) {
+                            (Ok(table), None) => table
+                                .new_partitioned_publication_files(batch, app_id, version, stamp)
+                                .map_err(CommitReceiptError::from_anyhow),
+                            _ => Err(failure.clone().unwrap_or_else(|| {
+                                CommitReceiptError::commit_failed("Delta table initialization failed")
+                            })),
+                        };
+                        let _ = reply.send(result);
+                    }
                     Some(Request::Publish(publication)) => {
                         if let Some(error) = &failure {
                             let _ = publication.reply.send(Err(error.clone()));
@@ -499,6 +540,9 @@ fn run_worker(
                         let _ = reply.send(Err(message.clone()));
                     }
                     Request::NewFile(_, reply) | Request::NewPublication(_, _, _, _, reply) => {
+                        let _ = reply.send(Err(message.clone()));
+                    }
+                    Request::NewPartitionedPublication(_, _, _, _, reply) => {
                         let _ = reply.send(Err(message.clone()));
                     }
                     Request::Publish(publication) => {

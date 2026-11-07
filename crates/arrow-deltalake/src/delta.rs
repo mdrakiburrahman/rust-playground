@@ -8,7 +8,9 @@ use crate::{
     sync_directory, sync_directory_chain, sync_file,
 };
 use anyhow::{Context, Result, bail};
-use arrow::array::{Array, RecordBatch, StructArray};
+#[cfg(test)]
+use arrow::array::Array;
+use arrow::array::{RecordBatch, StructArray};
 use arrow::datatypes::SchemaRef;
 use delta_kernel::committer::{CommitMetadata, CommitResponse, Committer, FileSystemCommitter, PublishMetadata};
 use delta_kernel::engine::arrow_conversion::{TryFromArrow, TryIntoArrow};
@@ -2135,6 +2137,48 @@ impl DeltaTable {
         writer.with_transaction(app_id, version)?.with_ingestion_time(stamp)
     }
 
+    /// Prepare one replay-safe file per actual committed table partition key.
+    ///
+    /// # Errors
+    /// Rejects missing or invalid partition values, unsupported schemas and writer failures.
+    pub fn new_partitioned_publication_files(
+        self: &Arc<Self>,
+        batch: RecordBatch,
+        app_id: String,
+        version: i64,
+        stamp: i64,
+    ) -> Result<Vec<(DeltaFileWriter, RecordBatch)>> {
+        let normalized = normalize::batch(&batch)?;
+        let snapshot = self.ensure_schema(normalized.schema())?;
+        let partitions = snapshot.table_configuration().metadata().partition_columns();
+        if partitions.is_empty() || self.partition_columns == [INGESTION_PARTITION] {
+            return Ok(vec![(
+                self.new_file_with_publication(batch.schema(), app_id, version, stamp)?,
+                batch,
+            )]);
+        }
+        let layout = configured_publication_layout(&normalized.schema())?;
+        crate::partition::split(&normalized, partitions)?
+            .into_iter()
+            .map(|(batch, values)| {
+                let partition_app_id = crate::partition::publication_id(&app_id, &values, batch.schema().as_ref())?;
+                let properties = layout
+                    .as_ref()
+                    .map(|policy| policy.writer_properties(&batch.schema()))
+                    .transpose()?;
+                let mut writer = self.new_file_bound(batch.schema(), values, properties, true)?;
+                if let Some(policy) = layout.clone() {
+                    let physical = Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?);
+                    writer.sorter = Some(crate::layout::FileSortBuffer::new(physical, policy)?);
+                }
+                writer = writer
+                    .with_transaction(partition_app_id, version)?
+                    .with_ingestion_time(stamp)?;
+                Ok((writer, batch))
+            })
+            .collect()
+    }
+
     /// Bind one file to explicit string-valued Hive partitions.
     ///
     /// # Errors
@@ -2194,16 +2238,22 @@ impl DeltaTable {
     ) -> Result<DeltaFileWriter> {
         let snapshot = self.ensure_schema(normalized)?;
         let schema = Arc::new(snapshot.schema().as_ref().try_into_arrow()?);
+        let kernel_schema = snapshot.schema();
         let transaction = snapshot.transaction(self.committer(), &self.engine)?;
         let state = transaction.write_state()?;
         let mut builder = state.write_context_builder();
         if !values.is_empty() {
             let mut typed = std::collections::HashMap::new();
             for (name, value) in &values {
-                let scalar = value.clone().map_or_else(
-                    || delta_kernel::expressions::Scalar::Null(delta_kernel::schema::DataType::STRING),
-                    delta_kernel::expressions::Scalar::String,
-                );
+                let field = kernel_schema.field(name).context("unknown partition column")?;
+                let delta_kernel::schema::DataType::Primitive(primitive) = field.data_type() else {
+                    bail!("partition columns must have primitive types");
+                };
+                let scalar = if let Some(value) = value {
+                    primitive.parse_scalar(value)?
+                } else {
+                    delta_kernel::expressions::Scalar::Null(field.data_type().clone())
+                };
                 typed.insert(name.clone(), scalar);
             }
             builder = builder.with_partition_values(typed);
@@ -2212,10 +2262,11 @@ impl DeltaTable {
         let mut directory = self.root.clone();
         for (name, value) in &values {
             let value = value.as_deref().unwrap_or("__HIVE_DEFAULT_PARTITION__");
-            if name.contains(['/', '\\', '=']) || value.contains(['/', '\\']) || value == "." || value == ".." {
-                bail!("unsafe Hive partition component");
-            }
-            directory.push(format!("{name}={value}"));
+            directory.push(format!(
+                "{}={}",
+                crate::partition::component(name),
+                crate::partition::component(value)
+            ));
         }
         fs::create_dir_all(&directory)?;
         let path = directory.join(format!("part-{}.parquet", uuid::Uuid::new_v4()));
@@ -2701,18 +2752,9 @@ impl DeltaFileWriter {
         };
         for (name, expected) in &self.partition_values {
             if let Ok(index) = batch.schema().index_of(name) {
-                let column = batch
-                    .column(index)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .context("partition columns must contain string literals")?;
                 for row in 0..batch.num_rows() {
-                    let actual = if column.is_null(row) {
-                        None
-                    } else {
-                        Some(column.value(row))
-                    };
-                    if actual != expected.as_deref() {
+                    let actual = crate::partition::value(batch.column(index).as_ref(), row)?;
+                    if actual != *expected {
                         bail!("batch partition value differs from bound write context");
                     }
                 }

@@ -727,9 +727,9 @@ impl GroupPublisher<'_> {
                 }
                 let stamp = i64::try_from(entry.ingested_at_ms.get())
                     .map_err(|error| ExportFailure::Transient(error.to_string()))?;
-                let mut writer = table
-                    .new_file_with_publication(
-                        entry.batch.schema(),
+                let files = table
+                    .new_partitioned_publication_files(
+                        entry.batch.clone(),
                         format!("arrowcol.publication.{}", entry.publication_id),
                         0,
                         stamp,
@@ -739,18 +739,20 @@ impl GroupPublisher<'_> {
                         worker_failed = true;
                         ExportFailure::Transient(format!("{error:#}"))
                     })?;
-                writer
-                    .write(&entry.batch)
-                    .await
-                    .map_err(|error| ExportFailure::Permanent(format!("{error:#}")))?;
-                let append = writer
-                    .stage()
-                    .await
-                    .map_err(|error| ExportFailure::Transient(format!("{error:#}")))?;
-                updated_estimator
-                    .observe(append.observation())
-                    .map_err(|error| ExportFailure::Permanent(format!("file sizing observation failed: {error}")))?;
-                staged.push(append);
+                for (mut writer, partition_batch) in files {
+                    writer
+                        .write(&partition_batch)
+                        .await
+                        .map_err(|error| ExportFailure::Permanent(format!("{error:#}")))?;
+                    let append = writer
+                        .stage()
+                        .await
+                        .map_err(|error| ExportFailure::Transient(format!("{error:#}")))?;
+                    updated_estimator.observe(append.observation()).map_err(|error| {
+                        ExportFailure::Permanent(format!("file sizing observation failed: {error}"))
+                    })?;
+                    staged.push(append);
+                }
             }
             let mut receipts = Vec::with_capacity(staged.len());
             let total = staged.len();
@@ -1403,6 +1405,167 @@ mod tests {
             matches!(result, Err(ExportFailure::Transient(message)) if message.contains("operator reconciliation"))
         );
         assert!(!directory.path().join("demo/generated/events/_delta_log").exists());
+    }
+
+    #[tokio::test]
+    async fn catalog_partitions_publish_all_rows_and_replay_across_commit_waves() {
+        let directory = tempfile::tempdir().expect("directory");
+        let root = directory.path().join("demo/generated/events");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("region", DataType::Utf8, true),
+            Field::new("bucket", DataType::Int32, false),
+        ]));
+        let table = arrow_deltalake::delta::DeltaTable::open_url(
+            format!("file://{}/", root.display()).parse().expect("url"),
+            Arc::clone(&schema),
+            vec!["region".to_owned(), "bucket".to_owned()],
+        )
+        .expect("partitioned table");
+        drop(table);
+        let store = Arc::new(MemoryRoutingStore::default());
+        let holder = CollectorInstanceId::new();
+        let lease = lease(&store, holder).await;
+        let metrics = Arc::new(RuntimeMetrics::new(holder));
+        let exporter = GenericDeltaExporter::with_store(
+            directory.path().to_path_buf(),
+            store as Arc<dyn RoutingStore>,
+            arrow_deltalake::commit::CommitOptions {
+                max_files_per_commit: 1,
+                max_pending_files: 2,
+                ..Default::default()
+            },
+            Arc::clone(&metrics),
+        )
+        .expect("exporter");
+        let batch = arrow_array::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("US/East"),
+                    None,
+                    Some("US/East"),
+                    Some("EU"),
+                    None,
+                    Some("EU"),
+                    Some("US/East"),
+                    None,
+                ])) as ArrayRef,
+                Arc::new(arrow_array::Int32Array::from(vec![1, 1, 2, 1, 1, 1, 1, 1])) as ArrayRef,
+            ],
+        )
+        .expect("batch");
+        let envelope = envelope_for(&lease);
+        let partial = arrow_deltalake::delta::DeltaTable::open(&root).expect("partial writer");
+        let mut files = partial
+            .new_partitioned_publication_files(
+                batch.clone(),
+                format!(
+                    "arrowcol.publication.{}",
+                    envelope.publication_id.expect("publication id")
+                ),
+                0,
+                i64::try_from(envelope.ingested_at_ms.expect("stamp").get()).expect("stamp"),
+            )
+            .expect("partitioned files")
+            .into_iter();
+        let (mut first, first_batch) = files.next().expect("first partition");
+        first.write(&first_batch).await.expect("partial write");
+        first.finish().await.expect("partial commit");
+        drop(files);
+        drop(partial);
+        let records = encode_record_batch(envelope, batch).expect("records");
+        let pdata = OtapPdata::new_todo_context(otel_arrow_dfe_pdata::OtapPayload::from_pdata_arrow(records));
+        exporter.export(pdata.clone()).await.expect("partition publication");
+        exporter.export(pdata).await.expect("replay");
+        let mut rows = 0;
+        let mut committed_ids = Vec::new();
+        let mut partitions = std::collections::BTreeMap::new();
+        let mut transaction_ids = std::collections::BTreeSet::new();
+        for log in std::fs::read_dir(root.join("_delta_log")).expect("logs") {
+            let path = log.expect("entry").path();
+            if path.extension().is_none_or(|extension| extension != "json") {
+                continue;
+            }
+            for line in std::fs::read_to_string(path).expect("log").lines() {
+                let action: serde_json::Value = serde_json::from_str(line).expect("action");
+                if let Some(txn) = action.get("txn") {
+                    transaction_ids.insert(txn["appId"].as_str().expect("app id").to_owned());
+                }
+                if let Some(add) = action.get("add") {
+                    let stats: serde_json::Value =
+                        serde_json::from_str(add["stats"].as_str().expect("stats")).expect("parsed stats");
+                    let count = stats["numRecords"].as_u64().expect("rows");
+                    rows += count;
+                    let values = &add["partitionValues"];
+                    let key = (
+                        values["region"].as_str().map(str::to_owned),
+                        values["bucket"].as_str().expect("bucket").to_owned(),
+                    );
+                    let region = key
+                        .0
+                        .as_deref()
+                        .unwrap_or("__HIVE_DEFAULT_PARTITION__")
+                        .replace('/', "%2F");
+                    let filename = add["path"]
+                        .as_str()
+                        .expect("path")
+                        .rsplit('/')
+                        .next()
+                        .expect("filename");
+                    let path = root.join(format!("bucket={}/region={region}/{filename}", key.1));
+                    let reader =
+                        ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path).expect("committed parquet"))
+                            .expect("reader")
+                            .build()
+                            .expect("build");
+                    for batch in reader {
+                        let batch = batch.expect("read committed data");
+                        assert_eq!(
+                            batch.num_columns(),
+                            1,
+                            "partition columns belong in Delta metadata, not the physical data"
+                        );
+                        committed_ids.extend_from_slice(
+                            batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<arrow_array::Int64Array>()
+                                .expect("ids")
+                                .values(),
+                        );
+                    }
+                    assert!(
+                        partitions.insert(key, count).is_none(),
+                        "replay duplicated a partition Add"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            rows, 8,
+            "admission alone is insufficient; every row must have a committed Add"
+        );
+        assert_eq!(partitions.len(), 4);
+        assert_eq!(partitions[&(None, "1".to_owned())], 3);
+        assert_eq!(partitions[&(Some("US/East".to_owned()), "1".to_owned())], 2);
+        assert_eq!(partitions[&(Some("US/East".to_owned()), "2".to_owned())], 1);
+        assert_eq!(partitions[&(Some("EU".to_owned()), "1".to_owned())], 2);
+        assert_eq!(
+            transaction_ids.len(),
+            4,
+            "each key must be independently replay-safe across commit waves"
+        );
+        committed_ids.sort_unstable();
+        assert_eq!(
+            committed_ids,
+            (0..8).collect::<Vec<i64>>(),
+            "partial commit and replay must neither lose nor duplicate row values"
+        );
+        assert!(root.join("bucket=1/region=US%2FEast").is_dir());
+        assert!(root.join("bucket=1/region=__HIVE_DEFAULT_PARTITION__").is_dir());
+        assert!(!root.join("bucket=1/region=US").exists());
     }
 
     /// Scenario: A generated non-OTAP Arrow schema reaches the generic Delta exporter.

@@ -36,6 +36,12 @@ Unrelated vendor properties remain intact in Delta `metadata.configuration`.
 | Concurrent DDL | Serialized catalog operations; a Delta version conflict requires fresh metadata and a rebuilt transaction |
 | External DROP | Durable catalog tombstone; never deletes Delta data or its transaction log |
 
+DFE publication groups actual batch values by the committed partition columns,
+including typed and null values, and writes each key with a separate replay-safe
+transaction identity. A partial commit followed by retry cannot skip remaining
+keys or duplicate already committed rows. Partition directory values are escaped;
+the Delta log retains their unescaped typed representations.
+
 `catalog.schemaHistory` and `catalog.dropped` are reserved, non-tunable internal
 configuration keys. CREATE/SET/UNSET attempts to overwrite them fail. Recovery
 checks persisted history against the committed Delta schema, partitions,

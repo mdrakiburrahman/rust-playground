@@ -31,6 +31,8 @@ pub mod maintenance;
 #[cfg(feature = "delta")]
 pub mod normalize;
 #[cfg(feature = "delta")]
+mod partition;
+#[cfg(feature = "delta")]
 pub mod publisher;
 pub mod sizing;
 #[cfg(feature = "delta")]
