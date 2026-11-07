@@ -26,14 +26,11 @@ export const DOCUMENTS = [
   'docs/quiver/README.md',
   'docs/containers/publishing.md',
   'projects/arrowcol-infra/README.md',
-  'projects/arrowcol-rust/README.md',
   'projects/arrowcol-router-rust/README.md',
   'projects/arrowcol-catalog-rust/README.md',
   'projects/arrowcol-dataflow-rust/README.md',
   'projects/loadtest/README.md',
   'projects/otelcol-rust/README.md',
-  'bin/quiver-cli/README.md',
-  'bin/arrowcol-experiment/README.md',
   'bin/collector-chain/README.md',
   'experiments/azure-qap/README.md',
   'experiments/collector-chain/README.md',
@@ -46,7 +43,6 @@ export const DOCUMENTS = [
   'crates/arrowcol-dataflow-components/README.md',
   'crates/arrowcol-flight/README.md',
   'crates/arrowcol-protocol/README.md',
-  'crates/arrowcol-receipts/README.md',
   'crates/arrowcol-routing/README.md',
   'crates/arrowcol-sdk-gen/README.md',
   'crates/otel-deltalake-exporter/README.md',
@@ -56,7 +52,6 @@ export const DOCUMENTS = [
 const RUNTIME_ROOTS = [
   'onelake/', 'target/', '.temp/', 'crates/arrowcol-sdk-gen/.temp/',
   'tools/libs/arrowcol-sdk-gen/.temp/', 'projects/loadtest/.temp/',
-  'projects/arrowcol-rust/.data/',
 ];
 const PATH_PREFIXES = ['.devcontainer/', '.github/', 'bin/', 'crates/', 'docs/', 'experiments/', 'projects/', 'submodules/', 'tools/'];
 const EXCLUDED = new Set(['node_modules', 'target', 'submodules', 'onelake', '.temp', '.git']);

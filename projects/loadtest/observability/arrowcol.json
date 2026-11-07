@@ -1,6 +1,6 @@
 {
   "uid": "arrowcol",
-  "title": "ArrowCol: direct vs dataflow",
+  "title": "ArrowCol: Dataflow collector",
   "schemaVersion": 39,
   "refresh": "5s",
   "time": {
@@ -31,11 +31,6 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "rate(arrowcol_direct_received_rows_total[30s])",
-          "legendFormat": "direct"
-        },
-        {
-          "refId": "B",
           "expr": "rate(arrowcol_received_rows_total[30s])",
           "legendFormat": "dataflow"
         }
@@ -64,11 +59,6 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "rate(arrowcol_direct_exported_rows_total[30s])",
-          "legendFormat": "direct"
-        },
-        {
-          "refId": "B",
           "expr": "rate(arrowcol_delta_rows_total[30s])",
           "legendFormat": "dataflow"
         }
@@ -97,11 +87,6 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(rate(container_cpu_usage_seconds_total{container_label_com_docker_compose_service=\"direct-1\"}[30s]))",
-          "legendFormat": "direct"
-        },
-        {
-          "refId": "B",
           "expr": "sum(rate(container_cpu_usage_seconds_total{container_label_com_docker_compose_service=\"dataflow-1\"}[30s]))",
           "legendFormat": "dataflow"
         }
@@ -130,11 +115,6 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "max(container_memory_working_set_bytes{container_label_com_docker_compose_service=\"direct-1\"})",
-          "legendFormat": "direct"
-        },
-        {
-          "refId": "B",
           "expr": "max(container_memory_working_set_bytes{container_label_com_docker_compose_service=\"dataflow-1\"})",
           "legendFormat": "dataflow"
         }
@@ -143,7 +123,7 @@
     {
       "id": 5,
       "type": "timeseries",
-      "title": "Quiver backlog (on disk, not yet in Delta; --quiver)",
+      "title": "Durable-buffer backlog (not yet in Delta; --quiver)",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -163,20 +143,15 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "arrowcol_direct_quiver_backlog_bundles",
-          "legendFormat": "direct batches"
-        },
-        {
-          "refId": "B",
           "expr": "arrowcol_dataflow_durable_backlog_batches",
-          "legendFormat": "dataflow batches"
+          "legendFormat": "batches"
         }
       ]
     },
     {
       "id": 6,
       "type": "timeseries",
-      "title": "Quiver disk (--quiver)",
+      "title": "Durable-buffer disk (--quiver)",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -196,20 +171,15 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "arrowcol_direct_quiver_disk_used_bytes",
-          "legendFormat": "direct WAL + segments"
-        },
-        {
-          "refId": "B",
           "expr": "arrowcol_dataflow_durable_backlog_bytes",
-          "legendFormat": "dataflow backlog"
+          "legendFormat": "backlog"
         }
       ]
     },
     {
       "id": 7,
       "type": "timeseries",
-      "title": "Quiver persisted vs drained to Delta / s (--quiver)",
+      "title": "Durable-buffer admission / release (--quiver)",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -229,30 +199,20 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "rate(arrowcol_direct_quiver_persisted_bundles_total[30s])",
-          "legendFormat": "direct persisted"
+          "expr": "rate(arrowcol_dataflow_durable_admitted_batches_total[30s])",
+          "legendFormat": "persisted"
         },
         {
           "refId": "B",
-          "expr": "rate(arrowcol_direct_quiver_published_bundles_total[30s])",
-          "legendFormat": "direct drained"
-        },
-        {
-          "refId": "C",
-          "expr": "rate(arrowcol_dataflow_durable_admitted_batches_total[30s])",
-          "legendFormat": "dataflow persisted"
-        },
-        {
-          "refId": "D",
           "expr": "rate(arrowcol_dataflow_durable_released_batches_total[30s])",
-          "legendFormat": "dataflow drained"
+          "legendFormat": "drained"
         }
       ]
     },
     {
       "id": 8,
       "type": "timeseries",
-      "title": "Replayed from Quiver after a crash (--crash-after)",
+      "title": "Replayed from durable buffer after crash (--crash-after)",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -272,23 +232,13 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "arrowcol_direct_quiver_recovered_bundles_total",
-          "legendFormat": "direct batches"
+          "expr": "arrowcol_dataflow_replayed_batches_total",
+          "legendFormat": "replay attempts"
         },
         {
           "refId": "B",
-          "expr": "arrowcol_direct_quiver_adopted_receipts_total",
-          "legendFormat": "direct receipts adopted"
-        },
-        {
-          "refId": "C",
-          "expr": "arrowcol_dataflow_replayed_batches_total",
-          "legendFormat": "dataflow replay attempts"
-        },
-        {
-          "refId": "D",
           "expr": "arrowcol_dataflow_rebound_batches_total",
-          "legendFormat": "dataflow lease rebinds"
+          "legendFormat": "lease rebinds"
         }
       ]
     }

@@ -1,6 +1,6 @@
 # Routing, trust, and ownership
 
-[Platform diagram](diagrams/platform.html) | [Architecture index](README.md)
+[Platform diagram](diagrams/platform.drawio) | [Architecture index](README.md)
 
 ## Flight metadata
 
@@ -9,7 +9,7 @@ Ingest uses gRPC `DoPut` over HTTP/2, not an HTTP JSON upload:
 | Initial metadata | Value |
 | --- | --- |
 | `x-arrowcol-protocol-version` | Canonical decimal `1` |
-| `x-arrowcol-implementation-pool` | `direct` or `dataflow` |
+| `x-arrowcol-implementation-pool` | `dataflow` |
 | `x-arrowcol-catalog` | Validated catalog component |
 | `x-arrowcol-schema` | Validated schema component |
 | `x-arrowcol-table` | Validated table component |
@@ -55,9 +55,8 @@ midstream. Bounded decoding and batch channels belong to collectors.
 
 ## Leases and pressure
 
-Ownership is unique for `(pool, catalog, schema, table)`: one direct owner and
-one independent DFE owner. More collectors scale across tables, not concurrent
-writers to one hot table within a pool.
+Ownership is unique for the Dataflow `(catalog, schema, table)` key. More DFE
+collectors scale across tables, not concurrent writers to one hot table.
 
 | Condition | Router behavior |
 | --- | --- |
@@ -66,7 +65,7 @@ writers to one hot table within a pool.
 | SQL refresh fails | Use an existing unexpired cached lease only; fail closed after expiry |
 | Pressure/staleness reassignment | Mark draining; reject new streams with retryable error; leave existing streams in place |
 | Safe transfer | Require fresh post-drain snapshot with zero active streams, buffered bytes/rows/batches, and pending commits; issue new lease ID and greater epoch/version |
-| Crash succession | A holder whose registration expired or that reported `stopped`/`failed` can never prove drain. If a live, eligible collector in the same pool shares its `instance_key` (a restarted process), move the active or draining lease directly to it with a new lease ID and greater epoch/version. No drain proof is needed because the restart owns and replays the predecessor's durable backlog; different-key collectors still require one |
+| Crash succession | A holder whose registration expired or that reported `stopped`/`failed` can never prove drain. If a live, eligible collector in the same pool shares its `instance_key` (a restarted process), move the active or draining lease directly to it with a new lease ID and greater epoch/version. A configured durable buffer can replay the predecessor's persisted backlog; without it, in-memory batches are not recoverable. Different-key collectors still require one |
 
 Pressure reports CPU basis points, RSS/limit, active streams, cumulative received
 bytes/rows/batches, buffered counts, permits, pending commits, oldest age,

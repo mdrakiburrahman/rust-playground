@@ -1,5 +1,14 @@
 # loadtest
 
+| Runtime contract | Current behavior |
+| --- | --- |
+| Collector | DFE Dataflow only; the Direct collector and Java Hive sidecar are retired |
+| Schemas | Remote Schema Catalog (`http://arrowcol-catalog:8817`, maximum cache age `10s`) |
+| SQL Server | Router routing/fencing only; no SQL catalog or delivery ledger |
+| Flight completion | Best-effort admission by default; with `durable_buffer`, buffer persistence only—not Delta publication |
+| Client delivery receipts | No durable receipt IDs, polling, or receipt purge APIs |
+| Operational receipts | Reset, stop, provider custody, publisher-release and validation evidence remain distinct and required |
+
 | Schema contract | Representation |
 | --- | --- |
 | DDL | Spark SQL `CREATE TABLE ... USING DELTA` |
@@ -8,15 +17,15 @@
 
 Every synthetic table has a required `customer_id STRING` first column. The
 deterministic input interleaves 16 customers (`customer-0000` through
-`customer-0015`) rather than pre-sorting the input. Direct and Dataflow receive
-the same immutable encoded batches, including retries. The independent reader
+`customer-0015`) rather than pre-sorting the input. Dataflow receives
+immutable encoded batches, including retries. The independent reader
 returns complete row multisets with multiplicities for Kusto validation, without
 sampling or truncation. Native validation packs disjoint whole ingestion
 partitions into chunks of at most 256 distinct complete rows. It fails on a
 changed snapshot, a single partition over 256 distinct rows, or more than 65,536
 distinct rows across a table.
 
-[![Architecture](../../loadtest-architecture.png)](../../loadtest-architecture.html)
+[![DFE-only platform architecture](../../docs/architecture/arrowcol-platform/diagrams/platform.png)](../../docs/architecture/arrowcol-platform/diagrams/platform.drawio)
 
 The independent delta-rs oracle reconstructs partition columns from committed
 `Add.partitionValues`, not directory names, and excludes uncommitted Parquet
@@ -35,12 +44,11 @@ chunk. The legacy `evidence` command keeps its original 256-distinct-row limit.
 Native cached and fallback validation checks every chunk and exact partition
 counts under the unchanged fixed five-minute cached deadline; timeout is failure.
 
-Terminal `receipts.jsonl` entries retain an optional sanitized `error_message`
-alongside `error_code`; missing legacy fields remain readable. Failed admissions
-in `sent-batches.jsonl` use the same client export boundary. Causal text is
-preserved while credentials, private URLs/paths/identifiers, known private
-environment values, and control characters are removed, with a 1,024-character
-Unicode-safe bound. These artifacts are written before stack cleanup.
+Failed admissions in `sent-batches.jsonl` retain sanitized client error
+evidence, not durable delivery receipt IDs. Credentials, private identifiers
+and control characters must not cross the client export boundary. Independent
+committed-Delta observations, not successful Flight completion, establish
+publication and row correctness.
 
 ## Test fixture isolation
 
@@ -65,15 +73,15 @@ files are ignored and both repository lockfiles remain reachable.
 ## Fixed-window local functional rehearsal
 
 `--validate --stress-plan <file>` runs real OPTIMIZE, checkpoint, and VACUUM LITE
-jobs against `sqlserver_cpu_utilization` in both pools while paired input runs.
-The other twelve tables in each pool are append-only controls. It retains the
+jobs against `sqlserver_cpu_utilization` in the Dataflow pool while input runs.
+The other twelve Dataflow tables are append-only controls. It retains the
 ordinary all-thirteen-table final source/native checks and Explorer assertions.
 This is a **local functional rehearsal**, not Azure stress/performance evidence.
 Azure rejects this option before occupancy or workspace reset until a complete
 ADLS physical-inventory adapter is available.
 
 The version-one plan requires every field below. The source batch must also
-match `--batch-rows`; layout overrides apply to both actual source collectors.
+match `--batch-rows`; layout overrides apply to the actual DFE source collector.
 The current deterministic generator repeats sixteen complete payload rows,
 so 8,192 physical rows do not imply 8,192 distinct oracle rows. The live reader
 still enforces the unchanged per-partition and whole-corpus guards.
@@ -101,7 +109,7 @@ still enforces the unchanged per-partition and whole-corpus guards.
 ```
 
 These are example limits, not demonstrated capacity or a successful run.
-The immutable window starts only after BOTH actual CPU tables have committed
+The immutable window starts only after the actual Dataflow CPU table has committed
 nonempty source files, a physically measured multi-rowgroup file, and at least
 two small files in the newest eligible closed partition. Readiness mirrors the
 service's minute-granularity OPTIMIZE rules: the newest partition is protected
@@ -115,12 +123,12 @@ input fails before a window is created. Neither deadline is extended.
 `driver-progress.json` is atomically replaced every
 second with run identity, phase start/duration/monotonic remaining milliseconds,
 actual scheduled logical rows, send-policy failures,
-and terminal receipt failures. Scheduled input is a pace counter, **not ACK
+and admission failures. Scheduled input is a pace counter, **not ACK
 accounting or a correctness oracle**. Per-wave source snapshots, structured
 operation reports, complete measured-root inventories, raw numeric resource
 evidence, samples, and the one verdict are retained in `results/stress-*`.
 Source Parquet footer captures must prove multiple row groups before the first
-wave. The first OPTIMIZE in each pool must actually reduce file count through
+wave. The first Dataflow OPTIMIZE must actually reduce file count through
 replacement; a no-op cannot qualify that fixture. Complete-row oracle limits
 remain 256 distinct rows per partition and 65,536 per table, with no truncation.
 
@@ -153,7 +161,7 @@ separate startup, window, and final-sample budgets. A long declared lifetime
 never substitutes for the actual remaining-input checks before window start.
 
 Provenance records sizes and SHA-256 identities for the selected host loadgen,
-SDK generator and reader, plus the two mounted helper copies. Mounted copies
+SDK generator and reader, plus the mounted helper copies. Mounted copies
 must match the selected host artifacts; the identities are checked again after
 stack startup. Helper filesystem paths are not exported. These hashes bind
 actual artifacts, not a claim that a build was fresh or source-correct; cold
@@ -164,7 +172,7 @@ checkpoint, WAL, router-state, and generator-staging roots: JSON history,
 checkpoints, uncommitted/orphan Parquet, and staging are not omitted. Logical
 file bytes and allocated blocks are separate; hard links are deduplicated.
 SQL/Kusto volumes and Docker layers are **not** included, and collector RSS
-covers only the two source processes. There is no whole-system physical plateau
+covers only the Dataflow source process. There is no whole-system physical plateau
 claim: checkpoint appId growth and retained JSON can legitimately fail the
 declared stability limits. Seven-day VACUUM may be a measured no-op on fresh
 data, not reclamation evidence. PURGE, short-retention/prune-log, tenant replay,
@@ -174,15 +182,15 @@ and their post-maintenance exact oracle gates remain separate pending scenarios.
 npx nx run loadtest:run -- --warmup 2m --concurrency 8 --batch-rows 1024
 ```
 
-This starts a fresh SQL Server, Hive, router, Direct collector, Dataflow
-collector, Kusto emulator, [kusto-explorer](../kusto-explorer/README.md) query
-UI, and monitoring stack, then sends the same Arrow batches to both collectors
+This starts a fresh routing SQL Server, remote Schema Catalog, router, DFE
+Dataflow collector, Kusto emulator, [kusto-explorer](../kusto-explorer/README.md) query
+UI, and monitoring stack, then sends Arrow batches to Dataflow
 across all 13 tables. Kusto provides live functional inspection of committed
 output. Native Delta external-table/QAP validation is the default target.
 
 **A start replaces only a previously sealed, validated local attempt.** Its
 corpus and evidence must be verified in the private per-attempt archive before
-SQL, Hive and Kusto volumes or ephemeral tables/results can be deleted.
+SQL and Kusto volumes or ephemeral tables/results can be deleted.
 Failed, interrupted, nonvalidated, Azure or unmarked legacy attempts block
 reset and retain their original data. Other Docker projects and workspace
 files are left alone.
@@ -214,17 +222,18 @@ cargo run --locked --quiet --package arrowcol-loadgen -- initialize-azure \
 ```
 
 Private environment inputs are `ARROWCOL_AZURE_TABLE_ROOT`,
-`AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_CONTAINER`, and
-`AZURE_STORAGE_CHECKPOINT_CONTAINER`. The root must be a credential-free
+`AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_CONTAINER`,
+`AZURE_STORAGE_CHECKPOINT_CONTAINER`, and the captured
+`ARROWCOL_EXPECTED_RESET_GENERATION`. The root must be a credential-free
 `abfss://` URL inside that account/container. The storage authority must remain
 owned and **fenced** during initialization; this command cannot acquire a data
 writer or bypass the reset fence.
 
-The canonical registry initializes both pools/all 13 schemas with required
+The canonical registry initializes the Dataflow pool/all 13 schemas with required
 `__arrowcol_ingestion STRING` partitions. Core normalization runs exactly once,
 including timestamp companions. Existing compatible roots are preserved.
-Only after all 26 roots succeed is the `{name, relative_path}` JSON manifest
-written; paths such as `direct/telemetry/sqlserver/sqlserver_active_sessions`
+Only after all 13 roots succeed is the `{name, relative_path}` JSON manifest
+written; paths such as `dataflow/telemetry/sqlserver/sqlserver_active_sessions`
 are relative to `ARROWCOL_AZURE_TABLE_ROOT`, including any private isolated-run
 prefix. Initialization does not insert data or prove Azure/QAP readiness.
 
@@ -239,8 +248,8 @@ prefix. Initialization does not insert data or prove Azure/QAP readiness.
 | `--measure` | Stop after a finite measurement, such as `5m` | Until Ctrl+C |
 | `--validate` | Check Delta snapshots and native Kusto data after the generator finishes | Off |
 | `--final-compaction` / `--no-final-compaction` | Enable or explicitly opt out of post-release local compaction; explicit Azure enablement fails before startup | On for validated local runs; unchanged/off for Azure |
-| `--quiver` | Both collectors persist every batch to [Quiver](#disk-persistence-with-quiver) on local disk before acknowledging it, then publish to Delta from disk | Off |
-| `--crash-after` | With `--quiver`, `kill -9` both collectors this long after they start persisting, restart them, and require replay from disk | Off |
+| `--quiver` | The DFE collector persists every batch to [Quiver](#disk-persistence-with-quiver) on local disk before acknowledging it, then publish to Delta from disk | Off |
+| `--crash-after` | With `--quiver`, `kill -9` the DFE collector this long after they start persisting, restart them, and require replay from disk | Off |
 
 Azure mode reads private `.env`, then `.env.azure`, with explicit inherited
 environment taking precedence. It requires the configured owned ADLS root,
@@ -253,8 +262,8 @@ separate from local emulator functionality and remains unverified until a live
 authorized run produces the required observations.
 
 For `--mode azure --validate`, pass a bounded window such as `--measure 2m`.
-Each run rebinds the 26 Azure external tables to its isolated root after the
-collectors start (about 40s), so measurement must outlast that rebind for every
+Each run rebinds the 13 Dataflow Azure external tables to its isolated root after the
+collector starts (about 40s), so measurement must outlast that rebind for every
 table to be observed live; and validation (frozen snapshots plus native QAP
 table oracles) shares one fixed 10-minute phase budget, so a long continuous run
 produces more data than Azure Kusto can verify in time. Ctrl+C still stops a
@@ -294,14 +303,14 @@ See the public [query acceleration policy](https://learn.microsoft.com/en-us/kus
 and [troubleshooting guide](https://learn.microsoft.com/en-us/kusto/management/query-acceleration-troubleshooting-guide)
 for supported table features, cache limits and unhealthy-catalog behavior.
 
-For isolated Azure runs, the runner writes the same canonical 26-table manifest
+For isolated Azure runs, the runner writes the same canonical 13-table Dataflow manifest
 without mutating storage (`arrowcol-loadgen azure-manifest --manifest PATH`),
 then reconciles external-table bindings while generation is active. The
 infrastructure helper has a fixed 120-second absent-log wait and distinguishes
 not-ready logs from authentication, ownership or malformed-log failures; there
 is no general retry-until-green loop. Occupancy exports the actual ready
 `ARROWCOL_RESET_GENERATION`, and the runner reloads that private environment
-before starting either collector. A run UUID is not a storage generation.
+before starting the DFE collector. A run UUID is not a storage generation.
 Cloud cleanup stops all owned services, permits a bounded five-minute drain,
 and refuses occupancy release after a forced, OOM or unverifiable mutator exit.
 This exit check is not proof of registry closure: the infrastructure release
@@ -315,7 +324,7 @@ reconciliation; process exit alone is not proof of mutation completion.
 
 The optional `tenant` and `maintenance` Compose profiles use the real
 `arrow-tenant-stream` and `delta-maintenance` images, both included in
-`loadtest:build` (and therefore the E2E image closure). Both collectors and both
+`loadtest:build` (and therefore the E2E image closure). The DFE collector and both
 services use `init: true` to reap CLI descendants. Tenant sources are read-only;
 its writable sink and checkpoint use separate directories. Azure replaces
 source, sink, checkpoint and maintenance roots and mounts a separate private
@@ -328,7 +337,7 @@ opt in. The profile defaults to real OPTIMIZE only. Normal and Azure VACUUM keep
 the seven-day retention floor; a fresh cloud run without aged tombstones cannot
 claim physical-cleanup or steady-state evidence. Source layout qualification
 sets `ARROWCOL_LAYOUT_ROW_GROUP_ROWS=512` and `ARROWCOL_LAYOUT_PAGE_ROWS=128`
-on the actual collectors; ordinary defaults remain 16384/2048.
+on the actual DFE collector; ordinary defaults remain 16384/2048.
 
 The fixed-window stress evaluator requires both operation cycles and export
 samples at the same declared maintenance-wave phase. It rejects missing
@@ -339,7 +348,7 @@ for OPTIMIZE, and actual physical reclamation without removing active files for
 VACUUM. These evaluators do not turn an unexecuted or timed-out scenario into a
 pass; local component tests do not establish Azure QAP behavior.
 
-Both collectors use two CPUs and matching buffer limits: 128 MiB overall,
+The DFE collector uses two CPUs and bounded buffer limits: 128 MiB overall,
 32 MiB per table, and 32 MiB per flush. SQL Server defaults to a 16 GiB memory
 budget. The Kusto container has a separate 6 GiB memory limit. Keep host memory
 available for the other services.
@@ -351,15 +360,15 @@ memory limit**; SQL Server's 16 GiB setting is an internal engine budget, not a
 container limit. There is therefore no finite aggregate Compose memory ceiling.
 The public-repository E2E job uses `ubuntu-24.04`, whose standard runner has
 [16 GB RAM](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
-Do not size it as though each unbounded service consumes zero. A preserved
+Do not size it as though each unbounded service consumes zero. A historical, pre-retirement
 functional development run reached 3.855 GiB of idle Kusto cgroup usage and
 nearly 4 GiB during serial validation. Its recorded simultaneous benchmark-project
 working-set peak was 7.811 GiB; adding 2 GiB for the 6 GiB Kusto ceiling gives
 9.811 GiB. CI has no development workspace container, so its 7.178 GiB residency
 is excluded from this workload sizing. This leaves approximately 6 GiB of the
 documented 16 GB runner RAM (5.09 GiB if interpreted as decimal GB) for the OS,
-Docker and host runner/validator. This measured sizing supports the 6 GiB
-default; it does not bound future growth in the other services or claim a
+Docker and host runner/validator. This historical sizing motivated the 6 GiB
+default; it is not a measurement of the current DFE/catalog-only topology and does not bound future growth in the other services or claim a
 qualification pass at the increased limit. `KUSTO_MEMORY_LIMIT` remains the
 explicit override.
 
@@ -375,51 +384,26 @@ SQLSERVER_MEMORY_LIMIT_MB=8192 npx nx run loadtest:run -- --warmup 2m --concurre
 npx nx run loadtest:run -- --quiver --measure 2m --crash-after 30s --validate
 ```
 
-`--quiver` puts [Quiver](https://github.com/mdrakiburrahman/otel-arrow/tree/main/rust/otap-dataflow/crates/quiver),
-the OpenTelemetry Arrow write-ahead log and segment store, in front of Delta in
-both collectors. A batch is written and fsynced to disk **before** the client
-gets its acknowledgement, and Delta publication reads it back from disk:
+| Mode | Flight completion means | Publication evidence |
+| --- | --- | --- |
+| Default | Best-effort bounded DFE admission | Independent committed Delta snapshot/row observations |
+| --quiver | durable_buffer appended and fsynced every batch | Still requires independent committed Delta observations |
 
-- **Direct** persists each batch with its receipt identity under
-  `direct-state-1/quiver/`. Its receipt is still the delivery contract. The
-  Quiver copy is released only after the receipt reaches `published`.
-- **Dataflow** routes batches through the DFE `durable_buffer` processor under
-  `dataflow-state-1/quiver/core_N/`. The Flight stream completes with
-  `durable_admission`, replacing `best_effort`, only after every batch is on
-  disk. Dataflow still has no SQL receipts.
+Quiver sits before the Delta exporter under dataflow-state-1/quiver/core_N/.
+Its acknowledgement confirms **buffer persistence, not Delta publication**.
+Clients receive no durable receipt IDs and cannot poll or purge delivery receipts.
+An fsync per acknowledgement costs throughput. Watch Grafana's Quiver panels
+for disk usage, backlog, persistence and drain rates.
 
-To look inside these directories, see [Quiver on disk](../../docs/quiver/README.md#8-the-benchmarks-directories).
-
-An fsync per acknowledgement costs throughput; that is the trade-off on show.
-Watch the **Quiver** panels in Grafana for disk usage, backlog, and persist and
-drain rates.
-
-`--crash-after` sends `SIGKILL` to both collectors mid-load, so no drain or
-flush runs. It then restarts them on the same disk.
-
-- The restarted Direct process is a new generation. It adopts its predecessor's
-  receipts and publishes the persisted batches under their original receipt IDs.
-- Dataflow replays its write-ahead log and rebinds the replayed batches to its
-  new table leases.
-
-The load generator keeps retrying through the outage for up to five minutes.
-If generation fails, it reports and retains the original error in `run-error.json`
-immediately instead of starting another receipt-drain timeout. Outstanding receipt
-observations are recorded as `aborted` with `generation_failed` and
-`purge_allowed:false`; these are unresolved outcomes, not successful delivery or
-server-side terminal states. Owned polling and live Kusto synchronization stop,
-without final catch-up, and the command fails. Successful generation still uses
-the full receipt-drain and correctness gates.
-`results/quiver-recovery.json` records the outage, the backlog on disk at the
-moment of the kill, and the replay counts. The run fails unless both collectors
-replay batches from disk.
-
-With `--quiver`, `--validate` requires **every acknowledged row** in Delta for
-both pools. Without it, Dataflow admission is best effort, so validation only
-requires a published batch per Dataflow table. Independent source-client submissions may duplicate under the at-least-once
-request contract. Replaying the **same publication identity** must instead be
-idempotent. Exact snapshot row multisets and stable publication IDs, rather than
-ACK counts alone, are the correctness evidence.
+--crash-after sends SIGKILL to the DFE collector without a drain, then restarts
+it with the same WAL and instance key. Replayed batches rebind to the successor's
+table leases. The generator retries through the outage; failed generation is
+retained in run-error.json and fails the run, not a receipt-drain loop.
+results/quiver-recovery.json records the outage, persisted backlog and replay
+counts. Recovery must be observed; acknowledged rows still require independent
+Delta validation. Default best-effort admission is not an all-rows guarantee.
+At-least-once submissions can duplicate; stable publication identities and exact
+committed row multisets, not ACK counts, are correctness evidence.
 
 ## Per-attempt evidence custody
 
@@ -442,7 +426,7 @@ source mounts are permitted. No measurement window, query or evidence threshold
 changes.
 
 Before that attempt can be reset, its corpus (including tenant/checkpoint/WAL
-state), results/receipts/Grafana evidence, source/lockfile provenance, six
+state), results/validation/Grafana evidence, source/lockfile provenance, selected
 source-bound image identities and three selected helper executables are copied
 and content-verified under the workspace's private
 `.temp/loadtest-attempt-evidence/<attempt-uuid>/`. This path is outside **all**
@@ -452,7 +436,7 @@ credential files are never archived. The archive is private (0700 directories,
 0600 files), contains potentially sensitive diagnostics and must **not** be
 committed or uploaded wholesale as a public artifact.
 
-The six local image targets now pass `VCS_REF={gitSha}` and require a clean
+The selected local image targets pass `VCS_REF={gitSha}` and require a clean
 Git worktree, matching the existing publication metadata policy. Tags, Dockerfile
 contents, build contexts and runtime behavior are unchanged. Archived OCI
 revision labels and inspected image/container IDs identify those builds, not a
@@ -497,7 +481,6 @@ attempt synchronously before the second can reset its ephemeral runtime.
   `loadtest` database preselected. Its server reaches Kusto at
   `http://kusto:8080` over the Compose network.
 - **Logs:** `docker logs -f rust-playground-loadtest-latest-dataflow-1-1`
-  (use `direct-1-1` for the Direct collector).
 
 Use `SQLSERVER_PORT`, `GRAFANA_PORT`, `PORTAINER_PORT`, `KUSTO_PORT`, or
 `KUSTO_EXPLORER_PORT` to override host ports. Published ports bind to host
@@ -509,10 +492,9 @@ Do not share startup logs containing local-development passwords.
 Output is always under `onelake/benchmark/latest/`:
 
 ```text
-direct/                   Direct Delta tables
-dataflow/                 Dataflow Delta tables
+dataflow/                 DFE Dataflow Delta tables
+catalog-state/            Remote Schema Catalog state
 results/                  Metrics, manifests, diagnostics, and validation output
-direct-state-1/quiver/    Direct Quiver WAL and segments (--quiver)
 dataflow-state-1/quiver/  Dataflow Quiver WAL and segments (--quiver)
 ```
 
@@ -529,12 +511,11 @@ startup command unchanged. It configures `ACCEPT_EULA=Y`; running this target
 therefore accepts the [Microsoft emulator license terms][emulator-install].
 The emulator supports HTTP only, without Microsoft Entra authentication.
 
-The database is `loadtest`. Each of the 13 SQL table names appears in both pools:
-`direct_<sqlserver_table>` and `dataflow_<sqlserver_table>`, for 26 native Delta external
-tables. For example:
+The database is `loadtest`. Each of the 13 fixture table names appears as
+`dataflow_<sqlserver_table>`, for 13 native Delta external tables. For example:
 
 ```kusto
-external_table('direct_sqlserver_wait_stats')
+external_table('dataflow_sqlserver_wait_stats')
 | take 5
 ```
 
@@ -550,7 +531,7 @@ report. The existing eight-minute Kusto-command limit also remains in force.
 The separate clean-mutator stop budget remains five minutes and is not extended
 by cache convergence.
 
-Snapshot capture for both pools and table-oracle preparation run across tables.
+Snapshot capture for Dataflow and table-oracle preparation run across tables.
 Blocking decode/hash jobs share one process-wide CPU cap sized from available
 CPUs; file-level decoders do not create nested workers inside those jobs.
 Kusto data queries have a separate two-request admission cap shared by client
@@ -566,7 +547,7 @@ cluster-wide guarantees against memory pressure from other processes.
 The independent reader still reads each captured file twice: the first pass
 builds the snapshot hashes, and the second constructs the exact bounded corpus
 and verifies those hashes. Snapshot hashes alone cannot replace decoded rows
-needed for Kusto's exact multiset predicates. Frozen inventory checks, all 26
+needed for Kusto's exact multiset predicates. Frozen inventory checks, all 13 Dataflow
 fallback and accelerated checks, and deadline rejection remain mandatory.
 `validation.json` and `kusto-validation.json` include `timings` with Unix start
 times, elapsed milliseconds and outcomes for phases, snapshot tables and Kusto
@@ -591,7 +572,7 @@ To inspect an external table from the Docker host:
 curl --fail-with-body --silent --show-error \
   "http://localhost:${KUSTO_PORT:-8080}/v2/rest/query" \
   -H 'Content-Type: application/json' \
-  -d '{"db":"loadtest","csl":"external_table(\"direct_sqlserver_wait_stats\") | count"}'
+  -d '{"db":"loadtest","csl":"external_table(\"dataflow_sqlserver_wait_stats\") | count"}'
 ```
 
 For an interactive view, open kusto-explorer at <http://localhost:8090>. It lists
@@ -602,7 +583,7 @@ subscription or cloud credentials are required.
 
 ### Failures, validation, and retained data
 
-Kusto starts and is probed separately from the mandatory SQL/Hive/collector
+Kusto starts and is probed separately from the mandatory routing-SQL/remote-catalog/DFE collector
 startup. The readiness probe is `POST /v1/rest/mgmt` with
 `{"csl":".show cluster"}`, without requiring the database to exist yet.
 An image, startup, readiness, or synchronization failure does **not** stop
@@ -611,7 +592,7 @@ ordinary collector load generation. The runner prints an explicit
 an ordinary run may still exit successfully.
 
 `--validate` and `loadtest:e2e` require real post-run KQL correctness assertions
-for all 26 tables and an in-run live-query observation. They fail if Kusto is
+for all 13 Dataflow tables and an in-run live-query observation. They fail if Kusto is
 unavailable, incomplete, inconsistent, or unverifiable. Counts are compared with
 each pool's captured Delta snapshot, not with acknowledgements or an assumption
 that the two pools have equal physical row multiplicities.
@@ -621,7 +602,7 @@ runner starts a Playwright browser container (Compose profile `ui-gate`) on the
 stack's network and drives `http://kusto-explorer:8080` like a user. The gate
 explicitly expands the External tables folder when collapsed, then
 checks the configured cluster is `http://kusto:8080`, the connections tree lists
-all 26 tables, and the per-table row counts exported from the UI match
+all 13 Dataflow tables, and the per-table row counts exported from the UI match
 `kusto-validation.json`. It also runs a management command and a column chart,
 and fails on any browser console error. In ordinary runs, a kusto-explorer
 startup failure is only a warning.
@@ -640,7 +621,7 @@ deadline promises preemption of synchronous work or a guaranteed diagnostics res
 
 `publisher-release.json` is actual post-exit SQL evidence, not a local publisher
 registry or reader-lease claim. The run's `routing.json` now includes its run ID.
-Release requires exactly one same-run publisher ID/key in each pool, each
+Release requires exactly one same-run Dataflow publisher ID/key, each
 durably stopped in `routing_collectors`, with no other ready/draining generation,
 even if its heartbeat expired. Historical stopped/failed rows are allowed.
 For the controlled Quiver crash only, `quiver-process-exits.json` supplies
@@ -650,15 +631,12 @@ and observed stopped with SIGKILL exit 137 before restart. A distinct successor
 UUID and later process start must match the same-run publisher and the container
 subsequently proved cleanly stopped. Missing, partial, cross-run or mismatched
 proof fails closed; expired heartbeats alone remain insufficient. This does not
-permit historical lease holders, active receipts, or an unclean current publisher.
+permit unrelated historical lease holders or an unclean current publisher.
 Routing leases have only active/draining states and no clean-stop release path:
 they may remain unexpired, but every holder must be a same-run stopped publisher.
-Expiry is recorded as evidence, not used as release proof. The direct publisher
-must additionally have a matching `collector_instances` receipt-owner row with
-state stopped and a nonnull stop timestamp, zero unreleased receipt table leases,
-and zero accepted/buffered/flushing receipts. Historical outstanding receipts
-also fail admission. Dataflow has no receipt-owner requirement: its proof is
-routing stopped plus owned clean exit zero. Missing required rows fail closed.
+Expiry is recorded as evidence, not used as release proof. The Dataflow proof
+is routing stopped plus owned clean exit zero. There is no delivery-receipt
+owner or receipt-state gate. Missing required routing rows fail closed.
 
 `publisher-admission.json` binds that SQL report to the stack-start SQL container
 ID/start time/image, same-run root, SDK binary digest and exact cleanly stopped
@@ -675,8 +653,8 @@ live stack. Stopped-mutator receipts are not distributed registry-close proof.
 
 The standalone `arrowcol-loadgen final-compaction` subcommand is intended between
 the positive publisher-release gate and final validation. Lifecycle invocation
-is runner-owned. It honors `LOADTEST_RESULTS`, `LOADTEST_DIRECT_ROOT` and
-`LOADTEST_DATAFLOW_ROOT` (or `--results`, `--direct-root`, `--dataflow-root`).
+is runner-owned. It honors `LOADTEST_RESULTS` and `LOADTEST_DATAFLOW_ROOT`
+(or `--results`, `--dataflow-root`).
 Local compaction is on by default; `--skip-final-compaction` records an explicit
 opt-out (`skipped=true`, **not** `passed=true`). Azure roots retain the existing
 skip default; explicitly requesting `--final-compaction` on Azure fails visibly.
@@ -686,7 +664,7 @@ drive paths and other non-Azure roots are treated as filesystem paths.
 Before opening tables it requires `publisher-release.json` with `passed=true`
 and the same nonnull `run_id` as `run-metadata.json`. It then uses Kernel active
 snapshots and the core's `sealed_final` OPTIMIZE policy on exactly 13 canonical
-`telemetry/sqlserver/<table>` directories in each pool. This flag only changes
+`telemetry/sqlserver/<table>` directories in the Dataflow pool. This flag only changes
 OPTIMIZE's newest/open-partition churn protection, not retention or authority.
 No VACUUM, PURGE, checkpoint, log pruning, cache-policy reset or delta-rs mutation
 is performed.
@@ -694,7 +672,7 @@ is performed.
 One cooperative **300-second** deadline covers preconditions, snapshots, exact
 row comparisons, planning and applying. Operations are joined; a timeout never
 abandons a mutator. Only the outer runner's process kill is a hard bound.
-Every progress pass starts with fresh dry-run plans for all 26 tables. At most
+Every progress pass starts with fresh dry-run plans for all 13 Dataflow tables. At most
 three progress passes are allowed, with no external retry on an operation error.
 Success requires a final independent all-table plan with no unproven work,
 zero backlog and zero skipped/protected partitions. A nonreducing/no-op commit
@@ -769,7 +747,7 @@ details remain serial within each table, and capacity is requested once after
 all tables. Both lanes are polled by one parent task so response-artifact appends
 cannot interleave; expiration drops all local request futures, but does not
 prove immediate server-side query cancellation. This is a concurrency bound,
-not a requests-per-second guarantee. Sanitized all-26-table observations and export receipts are retained in
+not a requests-per-second guarantee. Sanitized all-13-table observations and export receipts are retained in
 `results/qap-observations/` and `results/qap-observer.jsonl`. It sends per-pool
 completion, pending files, cached bytes, unhealthy catalogs and last-update age
 to LGTM through OTLP. Missing measurements suppress their aggregate, not become
@@ -808,7 +786,7 @@ npx nx run loadtest:verify
 ```
 
 Its functional E2E uses 1,024-row batches while retaining all 13 schemas and all
-26 external-table assertions. It runs twice in sequence: the baseline, then
+13 Dataflow external-table assertions. It runs twice in sequence: the baseline, then
 `--quiver --crash-after 15s`. The second run resets the first only after its
 validated corpus and evidence are privately sealed. The ephemeral `latest`
 results are from the Quiver crash run; both successful attempts have separate
@@ -834,8 +812,8 @@ healthy. Save evidence outside `onelake/benchmark/` before another run resets it
 
 The running emulator and native data remain available after finite runs and
 Ctrl+C. Its owned `kusto-data` volume is mounted at `/kustodata`; the persistent
-database uses `/kustodata/dbs/loadtest/{md,data}`. Only the Direct and Dataflow
-output roots are exposed at `/delta/direct` and `/delta/dataflow`, both read-only.
+database uses `/kustodata/dbs/loadtest/{md,data}`. Only the Dataflow
+output root is exposed at `/delta/dataflow`, read-only.
 The next loadtest start removes the owned volume only after checking its project,
 name, workspace identity and the previous attempt's verified artifact seal;
 it does not clean up other Docker projects. The seal is not a native volume backup.

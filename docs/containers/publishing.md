@@ -1,6 +1,6 @@
 # Container publishing
 
-The repository publishes the devcontainer, eight production Rust runtime
+The repository publishes the devcontainer, seven production Rust runtime
 images, and the retained `hello-world` sample image to GHCR through Nx targets.
 Run local publication from the source-built devcontainer so the pinned
 toolchain, Docker Buildx support, GitHub CLI state, and repository scripts match
@@ -19,7 +19,6 @@ manifests.
 | Project | GHCR image | Local non-publishing smoke |
 | --- | --- | --- |
 | `otelcol-rust` | `ghcr.io/mdrakiburrahman/rust-playground/otelcol-rust` | `npx --no-install nx run otelcol-rust:image-smoke` |
-| `arrowcol-rust` | `ghcr.io/mdrakiburrahman/rust-playground/arrowcol-rust` | `npx --no-install nx run arrowcol-rust:image-smoke` |
 | `arrowcol-dataflow-rust` | `ghcr.io/mdrakiburrahman/rust-playground/arrowcol-dataflow-rust` | `npx --no-install nx run arrowcol-dataflow-rust:image-smoke` |
 | `arrowcol-router-rust` | `ghcr.io/mdrakiburrahman/rust-playground/arrowcol-router-rust` | `npx --no-install nx run arrowcol-router-rust:image-smoke` |
 | `arrowcol-catalog-rust` | `ghcr.io/mdrakiburrahman/rust-playground/arrowcol-catalog-rust` | `npx --no-install nx run arrowcol-catalog-rust:image-smoke` |
@@ -114,7 +113,6 @@ npx --no-install devcontainer exec \
 The production runtime projects are:
 
 - `otelcol-rust`
-- `arrowcol-rust`
 - `arrowcol-dataflow-rust`
 - `arrowcol-router-rust`
 - `arrowcol-catalog-rust`

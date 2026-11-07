@@ -1,15 +1,8 @@
 # ArrowCol lakehouse loadtest
 
-[![Complete local and Azure lakehouse loadtest](../../../loadtest-architecture.png)](../../../loadtest-architecture.html)
+[![DFE-only platform architecture](../arrowcol-platform/diagrams/platform.png)](../arrowcol-platform/diagrams/platform.drawio)
 
-The [root architecture diagram](../../../loadtest-architecture.html) follows
-the complete workload from catalog registration to independent validation.
-The [collector-path detail](arrow-load-generator.html) and its
-[PNG snapshot](arrow-load-generator.png) focus on generated Arrow and paired
-publication. HTML sources and PNGs are kept together; PNGs are rendered with
-a real browser, not exported from a different diagram.
-The [snapshot receipt](../snapshots.json) records the browser version,
-viewport widths, and source/PNG SHA-256 digests.
+The [platform diagram](../arrowcol-platform/diagrams/platform.drawio) shows the current DFE-only collection path. This guide covers the complete workload, including catalog registration, independent validation, maintenance, and downstream query semantics. Draw.io sources and rendered PNGs are kept together; the [snapshot registry](../snapshots.json) records their renderer and SHA-256 digests.
 
 ## Generated workload and publication
 
@@ -19,11 +12,22 @@ catalog artifacts, generates Rust and TypeScript SDKs, and constructs every
 `customer_id`; deterministic interleaved customers exercise tenant predicates
 and sorted Parquet row groups.
 
-The paired workload sends the same logical batch through the Pingora router
-to separate Direct and Dataflow pools. Each pool owns independent Delta roots.
-Direct polls SQL-backed receipts until publication or a structured terminal
-failure. Dataflow reports best-effort admission by default, or durable admission
-with native Quiver. Neither path deduplicates independent client submissions.
+The workload sends generated Arrow batches through the Pingora router to the
+DFE-only Dataflow pool. SQL Server retains only routing registrations, pressure,
+and fenced leases; catalog registration uses the standalone CatalogService.
+
+| Boundary | Meaning |
+| --- | --- |
+| Default Flight completion | Best-effort admission; not buffer durability or Delta publication |
+| Native Quiver durable admission | Buffer persistence with WAL fsync before acknowledgement in the loadtest's zero-flush-interval configuration |
+| Delta publication | Independently observed committed snapshot and validated rows |
+| Client delivery receipts | No durable delivery receipt IDs, polling, or client receipt/purge API |
+| Operational custody receipts | Reset, stop, provider custody, publisher-release, and validation evidence remain distinct |
+
+DFE durable admission proves buffer persistence, not Delta publication. Replay
+does not deduplicate independent client submissions. See
+[Quiver durability and recovery](../../quiver/README.md) for the retained
+WAL/subscriber boundaries and loss conditions.
 
 Delta Kernel publication writes data before atomically publishing the log.
 Stable publication transaction identity protects the retry of that publication,
@@ -37,7 +41,7 @@ comes from `ARROWCOL_MODE`, falling back to `local`.
 
 | Surface | Local mode | Azure mode |
 | --- | --- | --- |
-| Source Delta | Local disk, separate pool roots | ADLS Gen2, separate pool roots |
+| Source Delta | Local disk, DFE Delta root | ADLS Gen2, DFE Delta root |
 | Kusto | Pinned emulator: native external Delta with Query Acceleration Policy | External Delta tables with native Query Acceleration Policy |
 | Storage identity | Scoped local mounts | Existing Azure CLI writer identity; dedicated Kusto storage-read UAMI |
 | Evidence | Functional integration, active-file visibility, recovery | Real QAP state, capacity, lag, correctness, and reacceleration |
@@ -107,7 +111,7 @@ npx nx run-many -t verify --all --parallel=1
 npx nx run hello-world:image-smoke
 ```
 
-Qualification compares both pools across all schemas with an independent Delta
+Qualification checks the DFE pool across all schemas with an independent Delta
 reader, committed snapshot-selected files, manifest hashes, row multisets,
 partition metadata, routing ownership, and recovery evidence. The delta-rs
 reader is a validation oracle, not the production transaction writer.

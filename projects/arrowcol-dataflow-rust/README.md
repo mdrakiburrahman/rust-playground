@@ -27,7 +27,7 @@ npx --no-install nx run arrowcol-dataflow-rust:image-smoke
 npx --no-install nx run arrowcol-dataflow-rust:verify
 ```
 
-`config-check` validates the Docker-ready SQL/Hive configurations
+`config-check` validates the Docker-ready remote-catalog/routing-SQL configurations
 (`config.yaml`, `config.quiver.yaml`) and both memory-backed smoke
 configurations, and proves that a STANDARD-only processor
 (`processor:batch` in `config.incompatible-otap.yaml`) is rejected by DFE
@@ -47,12 +47,20 @@ process stopped while its exporters are still draining.
 
 ## Local infrastructure
 
-Start the repository SQL Server and Hive Metastore:
+Start SQL Server for router routing/fencing, then the remote Schema Catalog
+(`arrowcol-catalog-rust`) separately:
 
 ```bash
 npx --no-install nx run arrowcol-infra:bootstrap
 npx --no-install nx run arrowcol-infra:up
+ARROWCOL_CATALOG_STATE_DIR="$PWD/onelake/catalog-state" \
+ARROWCOL_CATALOG_WAREHOUSE_ROOT="$PWD/onelake/arrowcol-dataflow" \
+npx --no-install nx run arrowcol-catalog-rust:run
 ```
+
+Keep the catalog process running in a separate terminal with writable catalog
+state. Compose uses `http://arrowcol-catalog:8817`; host runs use
+`http://127.0.0.1:8817`. Catalog cache age is bounded to `10s`.
 
 Then run the collector with host-facing settings:
 
@@ -60,8 +68,7 @@ Then run the collector with host-facing settings:
 ARROWCOL_SQL_HOST=127.0.0.1 \
 ARROWCOL_SQL_PORT=14333 \
 ARROWCOL_SQL_PASSWORD_FILE=projects/arrowcol-infra/secrets/arrowcol-app-password.txt \
-ARROWCOL_HIVE_HOST=127.0.0.1 \
-ARROWCOL_HIVE_PORT=9083 \
+ARROWCOL_CATALOG_ENDPOINT=http://127.0.0.1:8817 \
 ARROWCOL_DELTA_ROOT="$PWD/onelake/arrowcol-dataflow" \
 npx --no-install nx run arrowcol-dataflow-rust:run
 ```
@@ -73,22 +80,15 @@ ARROWCOL_QUIVER_PATH="$PWD/onelake/arrowcol-dataflow-quiver" \
 ARROWCOL_SQL_HOST=127.0.0.1 \
 ARROWCOL_SQL_PORT=14333 \
 ARROWCOL_SQL_PASSWORD_FILE=projects/arrowcol-infra/secrets/arrowcol-app-password.txt \
-ARROWCOL_HIVE_HOST=127.0.0.1 \
-ARROWCOL_HIVE_PORT=9083 \
+ARROWCOL_CATALOG_ENDPOINT=http://127.0.0.1:8817 \
 ARROWCOL_DELTA_ROOT="$PWD/onelake/arrowcol-dataflow" \
 npx --no-install nx run arrowcol-dataflow-rust:run-quiver
 ```
 
-The live SQL/Hive/Delta qualification is:
-
-```bash
-npx --no-install nx run arrowcol-dataflow-rust:live-e2e
-```
-
-The script owns one bounded Compose window, connects the workspace container
-to the infrastructure network when necessary, and always disconnects and
-stops the stack. Logs and Compose evidence are retained under ignored
-`.diagnostics/` run directories.
+The existing `live-e2e` helper still references the retired SQL/Hive fixture
+and is not qualification evidence for the remote-catalog topology. Use the
+loadtest workflow for DFE/catalog integration; live qualification must be
+rerun against the migrated services before claiming a pass.
 
 ## Endpoints
 
@@ -115,9 +115,12 @@ Admin HTTP listens on port `32011` by default.
 | `native_quiver` capability | `{"supported": true, "enabled": false}` | `{"supported": true, "enabled": true}` |
 
 Best-effort completion confirms bounded DFE admission, not Delta publication.
-Delta failures after admission are visible only through DFE Nacks, pressure,
-and metrics.
+Delta failures after admission are surfaced through DFE Nacks, pressure,
+and metrics. Clients receive no durable receipt IDs and have no receipt polling
+or purge APIs. Reset, stop, and provider custody receipts are separate
+operational evidence, not client delivery acknowledgements.
 
+Durable completion confirms buffer persistence only, **not Delta publication**.
 Durable admission waits, bounded by `limits.admission_timeout`, until the
 durable buffer acknowledged every batch of the stream. Its acknowledgement
 follows the write-ahead-log append, and `wal_flush_interval: 0s` makes it
@@ -129,7 +132,9 @@ at-least-once rather than exactly-once.
 
 ## Delta and schema behavior
 
-`arrowcol-catalog` performs exact schema lookup before the first batch. Current
+The DFE receiver uses `RemoteCatalogClient` against the remote Schema Catalog
+for exact schema lookup before the first batch. SQL Server supplies only routing
+and fencing state, not catalog schemas. Current
 schemas pass through unchanged; historical nullable-append schemas reuse
 source arrays and add only null arrays. The pdata envelope
 (`arrowcol.flight@1.1`) preserves logical table, source/target catalog schema
@@ -184,7 +189,7 @@ Predecessor replays are not part of the restarted process's backlog.
 
 - `/run/secrets/arrowcol-app-password`;
 - SQL Server DNS `sqlserver:1433`;
-- Hive Metastore DNS `hive-metastore:9083`;
+- remote Schema Catalog endpoint `http://arrowcol-catalog:8817`;
 - writable `/onelake`; and
 - for `config.quiver.yaml`, a writable `/var/lib/arrowcol/quiver` that is a
   persistent volume reattached to the restarted container.

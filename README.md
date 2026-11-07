@@ -51,61 +51,39 @@ npx nx run devcontainer:down -- --volumes
 
 ## Arrow collector platform
 
-The repository contains a complete local Arrow Flight collection platform:
+The repository provides a single Arrow Flight collection path through the remote Schema Catalog and DFE:
 
 ```text
-Flight SQL DDL
+Spark SQL DDL
       |
       v
-SQL Server application catalog + Apache Hive Metastore
+Remote Schema Catalog -- immutable manifest / schema.arrow / descriptor.pb
       |
-      +--> immutable manifest.json / schema.arrow / descriptor.pb
-      |         |
-      |         +--> generated Rust and TypeScript SDKs
-      |
-generated clients
-      |
-      v
-Pingora router -- one fenced owner per implementation pool and table
-      |                                      |
-      +--> Direct collector pool             +--> DFE collector pool
-      |      SQL receipts                         best-effort admission
-      |      bounded Arrow buffers                bounded DFE channels
-      |                                      |
-      +--> shared direct Delta root           +--> shared DFE Delta root
-                         |
-                         +--> independent validation and Grafana
+      +--> generated Rust and TypeScript clients
+                       |
+                       v
+              Pingora router -- one fenced Dataflow owner per table
+                       |
+                       v
+               DFE collector -- bounded Flight admission
+                       |          optional durable_buffer
+                       v
+              shared Dataflow Delta root --> Kusto validation and Grafana
+
+SQL Server stores router registrations, pressure, and routing/fencing leases only. It is not the schema catalog or a delivery ledger.
 ```
 
-The direct pool returns a server-generated receipt for each `RecordBatch`.
-That initial Flight result is **not purge permission**. A client may purge its
-source copy only after the receipt HTTP API reports `published` and
-`purge_allowed: true`, after the fenced Delta commit is durable. The DFE pool
-honestly reports only best-effort admission and has no receipt polling or
-at-least-once claim. With native Quiver (`loadtest:run -- --quiver`), both pools
-fsync every batch to local disk before acknowledging it and replay it after a
-crash, so DFE completion becomes durable admission. [Quiver on disk](docs/quiver/README.md)
-walks through those files with `quiver-cli`. See the
-[platform architecture](docs/architecture/arrowcol-platform/README.md) for the full
-catalog, router, receipt, fencing, buffering, and capability contracts.
+Clients receive no durable receipt IDs and there is no receipt-polling or purge API. DFE completion means best-effort admission unless `durable_buffer` is enabled; `durable_admission` confirms buffer persistence only, not a Delta commit or query visibility. Preserve source data and reconcile using the application’s destination-level checks before retrying ambiguous outcomes; retries can duplicate rows.
+
+See the [platform architecture](docs/architecture/arrowcol-platform/README.md) for catalog, routing, fencing, buffering, and delivery contracts.
 
 ### Lakehouse loadtest architecture
 
-[![ArrowCol lakehouse loadtest: two pools, maintenance, tenant forks, Kusto, and LGTM](loadtest-architecture.png)](loadtest-architecture.html)
+[![DFE-only platform architecture](docs/architecture/arrowcol-platform/diagrams/platform.png)](docs/architecture/arrowcol-platform/diagrams/platform.drawio)
 
-The [interactive architecture source](loadtest-architecture.html) follows
-13 multi-customer schemas through both collector pools into independent Delta
-roots, ingestion-time partitions, standalone maintenance, historical tenant
-forks, and Kusto. Local mode pairs disk with the Kusto emulator. Native external
-Delta/QAP is the default validation target. Azure mode uses ADLS Gen2 and
-native external-Delta query acceleration with a dedicated managed identity. Independent validation and LGTM observe the same run.
+The [platform diagram](docs/architecture/arrowcol-platform/diagrams/platform.drawio) shows the remote catalog, routing/fencing, and DFE-only collection path. The [loadtest guide](projects/loadtest/README.md) documents storage modes, maintenance, validation, Kusto, and qualification evidence.
 
-The tenant fork preserves copied history after source purge; native external
-tables instead read the current active snapshot. Stable publication identities
-protect retries of the same publication, not duplicate independent client
-requests. Local functional results are not Azure QAP performance evidence.
-See the [loadtest guide](projects/loadtest/README.md) for the current CLI,
-credential boundaries, lifecycle commands, and qualification artifacts.
+The tenant fork preserves copied history after source retention cleanup; native external tables instead read the current active snapshot. Stable publication identities protect retries of the same publication, not duplicate independent client requests. Local functional results are not Azure QAP performance evidence. See the [loadtest guide](projects/loadtest/README.md) for the current CLI, credential boundaries, lifecycle commands, and qualification artifacts.
 
 ### Experiments
 
@@ -144,9 +122,10 @@ npx --no-install nx run loadtest:e2e
 The Arrow phase registers
 [`projects/loadtest/schemas/sqlserver.sql`](projects/loadtest/schemas/sqlserver.sql)
 through Flight SQL, exports the immutable catalog artifacts, generates and
-checks both SDK packages, starts the router and both collector pools, and
-validates both Delta roots. The second E2E phase enables Quiver and kills and
-restarts both collectors during traffic to exercise durable replay.
+checks both SDK packages, starts the remote Schema Catalog, router, routing-only SQL Server, and DFE
+collector, then validates the Dataflow Delta root. The Quiver phase exercises
+the DFE durable buffer and restart replay; buffer acknowledgement does not prove
+Delta publication.
 
 The current runner retains output beneath `onelake/benchmark/latest/` and prints
 its exact output directory. A new start may reset only a sealed, validated local
@@ -154,8 +133,7 @@ attempt after verifying its private corpus and evidence archive. Failed,
 interrupted, nonvalidated, Azure, or unmarked legacy attempts block reset and
 preserve their original corpus. See the [loadtest lifecycle and evidence
 guide](projects/loadtest/README.md#per-attempt-evidence-custody) for the reset
-preconditions. Focused collector live E2Es retain their own evidence
-under `projects/arrowcol-rust/.diagnostics/<run-id>/` and
+preconditions. The DFE live E2E retains evidence under
 `projects/arrowcol-dataflow-rust/.diagnostics/<run-id>/`.
 
 ### Continuous comparison and dashboards
@@ -312,9 +290,6 @@ docker run --rm --platform linux/amd64 \
   in here. This is like `cmd` in the `go` project. Crates within this folder
   will often contain accessories to the corresponding source code like
   `Dockerfile`s.
-- `bin/quiver-cli/` - Writes real SQL Server rows to Quiver like the Direct
-  collector and inspects any Quiver directory; see
-  [Quiver on disk](docs/quiver/README.md).
 - `crates/` - For library crates. Library crates may depend on each other and
   binary crates may also depend on them. This is just like `pkg` in the `go`
   project.
@@ -361,8 +336,10 @@ available only after its manifest and public visibility have been verified:
 | --- | --- | --- |
 | `ghcr.io/mdrakiburrahman/rust-playground/devcontainer` | immutable content hash, branch alias, and `latest` from `main` | Development environment |
 | `ghcr.io/mdrakiburrahman/rust-playground/otelcol-rust` | `branch-<sanitized-branch>`, `sha-<full-git-sha>`, and `latest` from `main` | OTLP-to-Delta collector |
-| `ghcr.io/mdrakiburrahman/rust-playground/arrowcol-rust` | `branch-<sanitized-branch>`, `sha-<full-git-sha>`, and `latest` from `main` | Direct Arrow Flight collector |
-| `ghcr.io/mdrakiburrahman/rust-playground/arrowcol-dataflow-rust` | `branch-<sanitized-branch>`, `sha-<full-git-sha>`, and `latest` from `main` | DFE-native Arrow Flight collector |
+| `ghcr.io/mdrakiburrahman/rust-playground/arrowcol-dataflow-rust` | `branch-<sanitized-branch>`, `sha-<full-git-sha>`, and `latest` from `main` | DFE Arrow Flight collector |
+| `ghcr.io/mdrakiburrahman/rust-playground/arrowcol-catalog-rust` | `branch-<sanitized-branch>`, `sha-<full-git-sha>`, and `latest` from `main` | Remote Schema Catalog |
+| `ghcr.io/mdrakiburrahman/rust-playground/delta-maintenance` | `branch-<sanitized-branch>`, `sha-<full-git-sha>`, and `latest` from `main` | Delta maintenance |
+| `ghcr.io/mdrakiburrahman/rust-playground/arrow-tenant-stream` | `branch-<sanitized-branch>`, `sha-<full-git-sha>`, and `latest` from `main` | Tenant history stream |
 | `ghcr.io/mdrakiburrahman/rust-playground/arrowcol-router-rust` | `branch-<sanitized-branch>`, `sha-<full-git-sha>`, and `latest` from `main` | Pingora Arrow Flight router |
 | `ghcr.io/mdrakiburrahman/rust-playground/kusto-explorer` | `branch-<sanitized-branch>`, `sha-<full-git-sha>`, and `latest` from `main` | Browser KQL workbench for Kusto clusters |
 | `ghcr.io/mdrakiburrahman/rust-playground/hello-world` | `branch-<sanitized-branch>`, `sha-<full-git-sha>`, and `latest` from `main` | Retained sample runtime image |
@@ -371,9 +348,11 @@ Local image qualification uses `:dev` and does not publish:
 
 ```bash
 npx --no-install nx run otelcol-rust:image-smoke
-npx --no-install nx run arrowcol-rust:image-smoke
 npx --no-install nx run arrowcol-dataflow-rust:image-smoke
 npx --no-install nx run arrowcol-router-rust:image-smoke
+npx --no-install nx run arrowcol-catalog-rust:image-smoke
+npx --no-install nx run delta-maintenance:image-smoke
+npx --no-install nx run arrow-tenant-stream:image-smoke
 npx --no-install nx run kusto-explorer:image-smoke
 ```
 
