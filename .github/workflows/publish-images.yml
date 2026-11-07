@@ -10,7 +10,6 @@ on:
       - .github/workflows/publish-images.yml
       - bin/hello-world/**
       - projects/otelcol-rust/**
-      - projects/arrowcol-rust/**
       - projects/arrowcol-dataflow-rust/**
       - projects/arrowcol-router-rust/**
       - projects/arrowcol-catalog-rust/**

@@ -45,7 +45,6 @@ function workspaceProjects(): Record<string, ProjectConfiguration> {
 test('discovers production images and retains the sample publication', () => {
   assert.deepEqual(PRODUCTION_RUNTIME_IMAGE_PROJECTS, [
     'otelcol-rust',
-    'arrowcol-rust',
     'arrowcol-dataflow-rust',
     'arrowcol-router-rust',
     'arrowcol-catalog-rust',
@@ -98,7 +97,7 @@ test('fails closed when a source-built publication is missing or unexpected', ()
 
 test('all loadtest images retain local build behavior with clean Git revision metadata', () => {
   const expected = [
-    'arrowcol-rust', 'arrowcol-dataflow-rust', 'arrowcol-router-rust',
+    'arrowcol-dataflow-rust', 'arrowcol-router-rust',
     'arrowcol-catalog-rust', 'kusto-explorer', 'arrow-tenant-stream', 'delta-maintenance',
   ];
   const loadtest = JSON.parse(readFileSync(join(workspace, 'projects/loadtest/project.json'), 'utf8')) as ProjectConfiguration;
@@ -230,7 +229,7 @@ test('Kernel consumer lint caches include their library dependencies', () => {
 });
 
 test('Azure writer images install the shared CLI and reap orphan descendants', () => {
-  for (const project of ['arrowcol-rust', 'arrowcol-dataflow-rust', 'delta-maintenance', 'arrow-tenant-stream', 'arrowcol-catalog-rust']) {
+  for (const project of ['arrowcol-dataflow-rust', 'delta-maintenance', 'arrow-tenant-stream', 'arrowcol-catalog-rust']) {
     const dockerfile = readFileSync(
       join(workspace, projectPath(project).replace(/project\.json$/u, 'Dockerfile')),
       'utf8',
