@@ -422,7 +422,7 @@ pub fn status_fields(error: &anyhow::Error) -> (String, String) {
 }
 
 fn bounded_error(value: &str) -> String {
-    sanitize_error_message(value)
+    arrowcol_buffer::safe_error_message(value)
 }
 
 #[cfg(test)]
@@ -430,55 +430,13 @@ mod error_diagnostics_tests {
     use super::*;
 
     #[test]
-    fn receipt_cause_is_retained_without_private_credentials_or_paths() {
-        let message = redact_error_message(
-            "publication failed: unsupported UInt8 statistic; account private-account \
-             https://private.example/path?sig=credential C:\\Users\\private\\table \
-             /private/table 12345678-1234-1234-1234-123456789abc \
-             Server=hidden;Password=opaque-secret \
-             {\"client_secret\":\"another-secret\"} authorization: Bearer opaque-token \
-             AccountKey = spaced-secret key = second-secret Password=\"three word credential\" \
-             Password = \"combined private credential\" AccountKey : 'joined private words' \
-             Authorization:Basic opaque-basic-token Password = \"https://private.example quoted url-secret\" \
-             \"https://private.example?sig=CANARYSIG standalone private-url-secret\"",
-            vec!["private-account".to_owned()],
-        );
-        assert!(message.contains("unsupported UInt8 statistic"));
-        for secret in [
-            "private-account",
-            "private.example",
-            "credential",
-            "C:\\",
-            "/private",
-            "12345678-1234-1234-1234-123456789abc",
-            "opaque-secret",
-            "another-secret",
-            "opaque-token",
-            "spaced-secret",
-            "second-secret",
-            "three",
-            "word",
-            "credential",
-            "combined",
-            "private words",
-            "joined",
-            "opaque-basic-token",
-            "url-secret",
-            "quoted",
-            "standalone",
-            "private-url-secret",
-            "CANARYSIG",
-        ] {
-            assert!(!message.contains(secret), "leaked {secret}: {message}");
-        }
-    }
-
-    #[test]
-    fn receipt_cause_is_bounded_control_free_and_utf8_safe() {
-        let message = redact_error_message(&format!("原因 \u{1b} unsupported {}", "é".repeat(2_000)), Vec::new());
-        assert!(message.contains("unsupported"));
-        assert_eq!(message.chars().count(), 1_024);
-        assert!(!message.chars().any(char::is_control));
-        assert!(serde_json::to_string(&message).is_ok());
+    fn status_fields_keep_error_code_and_redact_private_values() {
+        let error: anyhow::Error =
+            tonic::Status::internal("publication failed for https://private.example/path?sig=CANARYSECRET").into();
+        let (code, message) = status_fields(&error);
+        assert_eq!(code, "Internal");
+        assert!(message.contains("publication failed"));
+        assert!(!message.contains("CANARYSECRET"));
+        assert!(!message.contains("private.example"));
     }
 }

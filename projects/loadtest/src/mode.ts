@@ -36,7 +36,7 @@ export function stageAzureCliConfig(directory: string, env: NodeJS.ProcessEnv): 
   };
   const root = path.join(directory, 'azure-cli');
   mkdirSync(root, { mode: 0o700 });
-  for (const service of ['direct-1', 'dataflow-1', 'loadgen', 'infra', 'tenant-stream', 'delta-maintenance', 'qap-observer']) {
+  for (const service of ['dataflow-1', 'loadgen', 'infra', 'tenant-stream', 'delta-maintenance', 'qap-observer']) {
     const target = path.join(root, service);
     cpSync(source, target, { recursive: true, errorOnExist: true, force: false });
     protect(target);
@@ -45,7 +45,6 @@ export function stageAzureCliConfig(directory: string, env: NodeJS.ProcessEnv): 
 
 export interface AzureTargets {
   root: string;
-  directRoot: string;
   dataflowRoot: string;
   tenantRoot: string;
   checkpointRoot: string;
@@ -94,7 +93,6 @@ export function azureTargets(env: NodeJS.ProcessEnv, run: string): AzureTargets 
   const root = `${base.href.replace(/\/+$/u, '')}/loadtest/${run}`;
   return {
     root,
-    directRoot: `${root}/direct`,
     dataflowRoot: `${root}/dataflow`,
     tenantRoot: `${root}/tenant`,
     checkpointRoot: `abfss://${env.AZURE_STORAGE_CHECKPOINT_CONTAINER}@${base.hostname}${new URL(root).pathname}/tenant-checkpoints`,

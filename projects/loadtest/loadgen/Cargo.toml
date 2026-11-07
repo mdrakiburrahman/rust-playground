@@ -10,6 +10,7 @@ description = "Deterministic many-table Arrow Flight benchmark and validator"
 publish = false
 
 [dependencies]
+arrowcol-buffer = { path = "../../../crates/arrowcol-buffer" }
 anyhow.workspace = true
 arrow = { version = "58.3", default-features = false, features = ["ipc"] }
 arrow-flight = { version = "58.3", default-features = false, features = ["flight-sql"] }
