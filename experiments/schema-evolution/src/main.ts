@@ -138,6 +138,11 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   let proof = '', source = '', principal = '', kusto: Kusto | undefined;
   let baseline: Record<string, unknown> | undefined, occupied = false, externalCreated = false, containerStarted = false;
   let requestSignal = new AbortController().signal;
+  let warningContext: Pick<StageContext, 'record'> | undefined;
+  const recordWarning = (warning: Record<string, unknown>) => {
+    if (!warningContext) throw new Error('Kusto warning has no active evidence context.');
+    warningContext.record('kusto-warning', warning);
+  };
   const container = `w6-${runId}`;
   const sdk = (version: number) => path.join(out, `sdk-v${version}`);
   const binary = (name: string) => path.join(WORKSPACE, 'target/debug', name);
@@ -186,6 +191,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     stages: [
       { name: 'runtime', timeoutMs: 5 * 60_000, run: async ctx => {
         requestSignal = ctx.signal;
+        warningContext = ctx;
         ctx.record('provenance', { sha: await command('git', ['rev-parse', 'HEAD'], ctx),
           harnessHash: digest(path.join(WORKSPACE, 'experiments/schema-evolution/src/main.ts')),
           runbookHash: digest(path.join(WORKSPACE, 'experiments/schema-evolution/README.md')),
@@ -194,7 +200,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           await occupancy(azure, 'occupy', owner, undefined, values.ARROWCOL_RESET_GENERATION);
           occupied = true;
           principal = await identity_principal(azure);
-          kusto = new Kusto(azure, config!.experimentDatabase, runId);
+          kusto = new Kusto(azure, config!.experimentDatabase, runId, undefined, 3, recordWarning);
           source = `${root}/${TABLE};managed_identity=${principal}`;
         } else {
           await command('docker', ['run', '-d', '--name', container, '--memory', '6g', '-e', 'ACCEPT_EULA=Y',
@@ -219,7 +225,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
             }
             return [data, Object.fromEntries(response.headers)];
           } };
-          kusto = new Kusto(transport, 'NetDefaultDB', runId);
+          kusto = new Kusto(transport, 'NetDefaultDB', runId, undefined, 3, recordWarning);
           source = `/delta/${TABLE}`;
           await until(ctx, 'kustainer-ready', async () => {
             try { await kusto!.management('.show databases', ctx.signal); return true; }
@@ -291,6 +297,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       } },
       { name: 'enable-native-refresh-before-alter', timeoutMs: 15 * 60_000, run: async ctx => {
         requestSignal = ctx.signal;
+        warningContext = ctx;
         const create = `.create external table ['${table}'] kind=delta (h@'${source}')`;
         await kusto!.management(create, ctx.signal);
         externalCreated = true;
@@ -361,6 +368,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       } },
       { name: 'native-kusto-schema-and-data-hydration', timeoutMs: 20 * 60_000, run: async ctx => {
         requestSignal = ctx.signal;
+        warningContext = ctx;
         const target = await fetchSnapshot(ctx);
         await until(ctx, 'evolved-qap-ready', async () => {
           const sample = await kusto!.sample(table, ctx.signal);
@@ -381,6 +389,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     ],
     cleanup: async ctx => {
       requestSignal = ctx.signal;
+      warningContext = ctx;
       const errors: unknown[] = [];
       const attempt = async (label: string, work: () => Promise<unknown>) => {
         try { await work(); }

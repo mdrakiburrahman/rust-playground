@@ -56,7 +56,9 @@ async fn wrong_schema(
         )])),
         vec![std::sync::Arc::new(arrow_array::Int64Array::from(vec![1]))],
     )?;
-    let encoded = sdk::encode_do_put(futures::stream::iter([Ok(batch)]))
+    let encoded = arrow_flight::encode::FlightDataEncoderBuilder::new()
+        .with_flight_descriptor(Some(sdk::flight_descriptor()))
+        .build(futures::stream::iter([Ok(batch)]))
         .try_collect::<Vec<_>>()
         .await?;
     let request = sdk::decorate_do_put_request(

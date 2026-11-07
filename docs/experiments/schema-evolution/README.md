@@ -60,6 +60,12 @@ old-client string representation using `isempty(bar)` and independently verify
 physical Delta nulls. New-client fixture values must be nonempty, making empty
 old values distinguishable without calling Kusto empty strings SQL NULL.
 
+Successful Kusto warning-only responses preserve their completion details in
+evidence; errors, partial results and ambiguous completion remain fatal.
+Fallback warnings never prove acceleration: initial and evolved QAP samples
+must match the actual Delta version, exact row count, zero pending files and
+healthy 100% completion before the native schema/data proof.
+
 | Verification KQL | Purpose |
 | --- | --- |
 | `external_table('foo') \| summarize total=count(), nulls=countif(isnull(bar)), filled=countif(isnotnull(bar)) by client` | Original requested observation; do not reinterpret Kusto string null semantics. |

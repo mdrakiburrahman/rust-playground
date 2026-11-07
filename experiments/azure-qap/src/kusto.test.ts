@@ -18,6 +18,46 @@ const v2 = (columns: string[], rows: unknown[][], status = 0) => [
   { FrameType: 'DataSetCompletion', HasErrors: false },
 ];
 
+const nativeWarning = () => [
+  { FrameType: 'DataSetHeader', IsProgressive: false, Version: 'v2.0', IsFragmented: false, ErrorReportingPlacement: 'InData' },
+  { FrameType: 'DataTable', TableKind: 'PrimaryResult', Columns: [{ ColumnName: 'ColumnName', ColumnType: 'string' }],
+    Rows: [['client'], ['phase'], ['value'], ['tenant']] },
+  { FrameType: 'DataTable', TableKind: 'QueryCompletionInformation',
+    Columns: ['Level', 'LevelName', 'StatusCode', 'StatusCodeName', 'Payload'].map(ColumnName => ({ ColumnName })),
+    Rows: [
+      [3, 'Warning', -2133196383,
+        'Query acceleration was not used and the query fell back to non-accelerated mode (E_QUERY_ACCELERATION_NOT_USED). (0x80da01a1)',
+        '{"Count":1,"Text":"Query acceleration was not applied for external table \'foo\' since catalog is uninitialized."}'],
+      [4, 'Info', 0, 'S_OK (0)', '{"Count":1,"Text":"Query completed successfully"}'],
+    ] },
+  { FrameType: 'DataSetCompletion', HasErrors: false, Cancelled: false },
+];
+
+test('real Kustainer warning-only success preserves warning details without accepting errors or ambiguous completion', () => {
+  const result = tables(nativeWarning());
+  assert.deepEqual(result[0]!.rows, [['client'], ['phase'], ['value'], ['tenant']]);
+  assert.match(String(result[1]!.rows[0]![3]), /E_QUERY_ACCELERATION_NOT_USED/);
+  const completion = (rows: unknown[][]) => [
+    nativeWarning()[0], nativeWarning()[1],
+    { FrameType: 'DataTable', TableKind: 'QueryCompletionInformation',
+      Columns: ['Level', 'LevelName', 'StatusCode'].map(ColumnName => ({ ColumnName })), Rows: rows },
+    nativeWarning()[3],
+  ];
+  for (const invalid of [
+    completion([[2, 'Error', 1], [4, 'Info', 0]]),
+    completion([[2, 'Error', 0], [4, 'Info', 0]]),
+    completion([[4, 'Info', 1], [4, 'Info', 0]]),
+    completion([[3, 'Info', -2133196383], [4, 'Info', 0]]),
+    completion([[3, 'Warning', -2133196383]]),
+    completion([[4, 'Info', '0']]),
+    [...nativeWarning().slice(0, -1), { FrameType: 'DataSetCompletion', HasErrors: true, Cancelled: false }],
+    [...nativeWarning().slice(0, -1), { FrameType: 'DataSetCompletion', HasErrors: false, Cancelled: true }],
+    [...nativeWarning().slice(0, -1), { FrameType: 'DataSetCompletion' }],
+    nativeWarning().slice(0, -1),
+    [...nativeWarning(), nativeWarning()[3]],
+  ]) assert.throws(() => tables(invalid), /error status|completion|partial|Malformed/);
+});
+
 const details = (state: Record<string, unknown>) => v1(['TableName', 'QueryAccelerationState'], [['t', JSON.stringify(state)]]);
 const statistics = (percent: number, pending: number) =>
   v1(['AccelerationCompletePercentage', 'AccelerationPendingDataFilesCount', 'AccelerationPendingDataFilesSize'], [[percent, pending, 0]]);
@@ -115,6 +155,17 @@ test('Kusto client retries transient failures and tags requests with the run', a
   assert.equal(denied.calls.length, 1);
   assert.equal(transientKusto(new HttpFailure(429, 'slow')), true);
   assert.equal(transientKusto(new Error('plain')), false);
+});
+
+test('successful warning details reach the Kusto observer rather than being silently discarded', async () => {
+  const { kusto } = fakeKusto(() => nativeWarning());
+  const warnings: Record<string, unknown>[] = [];
+  const observed = new Kusto(kusto.azure, 'experimentqap', 'warning-test', undefined, 1, row => warnings.push(row));
+  assert.deepEqual(await observed.query("external_table('foo') | getschema", signal),
+    [['client'], ['phase'], ['value'], ['tenant']]);
+  assert.equal(warnings.length, 1);
+  assert.equal(warnings[0]!.StatusCode, -2133196383);
+  assert.match(String(warnings[0]!.Payload), /catalog is uninitialized/);
 });
 
 test('create waits out 403s while the managed identity grant propagates', async () => {

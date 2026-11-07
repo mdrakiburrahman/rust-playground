@@ -17,6 +17,7 @@ export interface AccelerationSample {
 export interface Target { version: number; rows: number }
 export interface ExtentRecord { partition: string; extent: string; rows: number }
 export const UNACCELERATED_EXTENT = '00000000-0000-0000-0000-000000000000';
+const COMPLETION_LEVELS: Record<number, string> = { 3: 'Warning', 4: 'Info', 5: 'Verbose', 6: 'Stats' };
 
 export function object(value: unknown): Row {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Expected an object response.');
@@ -34,11 +35,17 @@ export function tables(value: unknown): Table[] {
     return response.Tables;
   })();
   const result: Table[] = [];
+  let completed = 0, succeeded = false, completionInformation = false;
   for (const raw of frames) {
     const frame = object(raw);
     if (frame.HasErrors || frame.Cancelled || frame.Error ||
         (Array.isArray(frame.OneApiErrors) ? frame.OneApiErrors.length > 0 : frame.OneApiErrors))
       throw new Error('Kusto returned a partial, cancelled or failed result.');
+    if (frame.FrameType === 'DataSetCompletion') {
+      if (frame.HasErrors !== false || (frame.Cancelled !== undefined && frame.Cancelled !== false))
+        throw new Error('Malformed or ambiguous Kusto completion state.');
+      completed++;
+    }
     if (frame.FrameType && frame.FrameType !== 'DataTable') continue;
     if (!Array.isArray(frame.Columns) || !Array.isArray(frame.Rows)) throw new Error('Malformed Kusto data table.');
     const columns = frame.Columns.map(column => {
@@ -46,17 +53,33 @@ export function tables(value: unknown): Table[] {
       if (typeof name !== 'string') throw new Error('Kusto column name is absent.');
       return name;
     });
+    if (new Set(columns).size !== columns.length) throw new Error('Duplicate Kusto result columns.');
     const rows = frame.Rows.map(row => {
       if (!Array.isArray(row) || row.length !== columns.length) throw new Error('Malformed Kusto result row.');
       return row;
     });
     const table = { kind: typeof frame.TableKind === 'string' ? frame.TableKind : 'PrimaryResult', columns, rows };
     if (table.kind === 'QueryCompletionInformation') {
-      const code = columns.indexOf('StatusCode');
-      if (code >= 0 && rows.some(row => row[code] !== 0)) throw new Error('Kusto query completed with an error status.');
+      completionInformation = true;
+      const code = columns.indexOf('StatusCode'), level = columns.indexOf('Level'), name = columns.indexOf('LevelName');
+      if (code < 0 || !rows.length) throw new Error('Malformed or ambiguous Kusto completion information.');
+      for (const row of rows) {
+        const status = row[code], severity = row[level], severityName = row[name];
+        if (typeof status !== 'number' || !Number.isInteger(status) || status < -2147483648 || status > 2147483647)
+          throw new Error('Malformed Kusto completion status.');
+        if ((level >= 0 || name >= 0) && (level < 0 || name < 0 ||
+            typeof severity !== 'number' || !Number.isInteger(severity) || severity < 3 || severity > 6 ||
+            severityName !== COMPLETION_LEVELS[severity]))
+          throw new Error('Kusto query completed with an error status or ambiguous severity.');
+        if (status !== 0 && !(severity === 3 && severityName === 'Warning'))
+          throw new Error('Kusto query completed with an error status.');
+        if (status === 0) succeeded = true;
+      }
     }
     result.push(table);
   }
+  if (Array.isArray(value) && (completed !== 1 || !completionInformation || !succeeded))
+    throw new Error('Malformed or ambiguous Kusto completion state.');
   return result;
 }
 
@@ -204,17 +227,26 @@ const defaultSleep: Sleep = (ms, signal) => new Promise((resolve, reject) => {
 
 export class Kusto {
   constructor(readonly azure: KustoClient, readonly database: string, readonly runId: string,
-    readonly sleep: Sleep = defaultSleep, readonly attempts = 3) {}
+    readonly sleep: Sleep = defaultSleep, readonly attempts = 3,
+    readonly onWarning: (warning: Row) => void = warning => console.warn('Kusto warning: ' + JSON.stringify(warning))) {}
+
+  private recordWarnings(response: unknown): void {
+    for (const table of tables(response)) {
+      if (table.kind !== 'QueryCompletionInformation') continue;
+      for (const row of tableRows(table)) if (row.Level === 3 && row.LevelName === 'Warning') this.onWarning(row);
+    }
+  }
 
   async management(command: string, signal: AbortSignal): Promise<unknown> {
     const response = await this.post('/v1/rest/mgmt', { db: this.database, csl: command }, signal);
-    tables(response);
+    this.recordWarnings(response);
     return response;
   }
 
   async query(csl: string, signal: AbortSignal): Promise<unknown[][]> {
     const response = await this.post('/v2/rest/query', { db: this.database, csl,
       properties: JSON.stringify({ Options: { query_results_cache_max_age: '00:00:00' } }) }, signal);
+    this.recordWarnings(response);
     return primary(response).rows;
   }
 
