@@ -14,7 +14,6 @@ arrow-ipc = { version = "58.3", default-features = false }
 arrow-schema = { version = "58.3", default-features = false }
 arrowcol-protocol = { path = "../arrowcol-protocol" }
 arrowcol-sparksql = { path = "../arrowcol-sparksql" }
-arrowcol-sql-server = { path = "../arrowcol-sql-server" }
 async-trait = "0.1"
 hex = "0.4"
 prost = "0.14"
@@ -25,10 +24,7 @@ sha2 = "0.10"
 sqlparser = "0.62"
 thiserror.workspace = true
 tracing.workspace = true
-thrift = { version = "0.17", features = ["server"] }
-tiberius = { version = "0.13", default-features = false, features = ["rustls", "tds73"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
-tokio-util = { version = "0.7", features = ["compat"] }
 uuid = { version = "1", features = ["serde", "v4", "v5"] }
 
 [dev-dependencies]

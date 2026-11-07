@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use arrowcol_catalog::{
     CatalogControlPlane, CatalogErrorCode, CatalogStore, DdlCompletionDisposition, DdlParser, FailurePoint,
-    FlightSqlDdlHandler, FlightSqlDdlRequest, MemoryCatalogStore, MemoryMetastore,
+    FlightSqlDdlHandler, FlightSqlDdlRequest, MemoryCatalogStore, SagaState, SagaStep,
 };
 
 fn create_ddl() -> FlightSqlDdlRequest {
@@ -12,12 +12,7 @@ fn create_ddl() -> FlightSqlDdlRequest {
 #[tokio::test]
 async fn create_append_and_retry_preserve_identity_and_numbers() -> anyhow::Result<()> {
     let store = Arc::new(MemoryCatalogStore::new());
-    let metastore = Arc::new(MemoryMetastore::new());
-    let service = CatalogControlPlane::new(
-        DdlParser::default(),
-        Arc::<MemoryCatalogStore>::clone(&store),
-        metastore,
-    );
+    let service = CatalogControlPlane::new(DdlParser::default(), Arc::<MemoryCatalogStore>::clone(&store));
 
     let created = service.execute_ddl(create_ddl()).await?;
     assert_eq!(created.disposition(), DdlCompletionDisposition::Created);
@@ -57,11 +52,9 @@ async fn create_append_and_retry_preserve_identity_and_numbers() -> anyhow::Resu
 #[tokio::test]
 async fn concurrent_same_ddl_coalesces_to_one_version() -> anyhow::Result<()> {
     let store = Arc::new(MemoryCatalogStore::new());
-    let metastore = Arc::new(MemoryMetastore::new());
     let service = Arc::new(CatalogControlPlane::new(
         DdlParser::default(),
         Arc::<MemoryCatalogStore>::clone(&store),
-        metastore,
     ));
 
     let (left, right) = tokio::join!(service.execute_ddl(create_ddl()), service.execute_ddl(create_ddl()));
@@ -76,30 +69,39 @@ async fn concurrent_same_ddl_coalesces_to_one_version() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn hive_failure_is_visible_and_reconciles() -> anyhow::Result<()> {
+async fn artifact_failure_is_visible_and_reconciles() -> anyhow::Result<()> {
     let store = Arc::new(MemoryCatalogStore::new());
-    let metastore = Arc::new(MemoryMetastore::new());
-    let service = CatalogControlPlane::new(
-        DdlParser::default(),
-        Arc::<MemoryCatalogStore>::clone(&store),
-        Arc::<MemoryMetastore>::clone(&metastore),
-    );
+    let service = CatalogControlPlane::new(DdlParser::default(), Arc::<MemoryCatalogStore>::clone(&store));
     service.execute_ddl(create_ddl()).await?;
 
-    metastore.fail_next(FailurePoint::HiveApply).await;
+    store.fail_next(FailurePoint::PersistArtifacts).await;
     let result = service
         .execute_ddl(FlightSqlDdlRequest::new(
             "ALTER TABLE telemetry.prod.events ADD COLUMNS (retryable STRING)",
         ))
         .await;
     let Err(error) = result else {
-        anyhow::bail!("injected Hive failure must be visible");
+        anyhow::bail!("injected artifact failure must be visible");
     };
-    assert_eq!(error.code(), CatalogErrorCode::HiveMetastore);
+    assert_eq!(error.code(), CatalogErrorCode::ApplicationDatabase);
     let incomplete = store.incomplete_sagas().await?;
     assert_eq!(incomplete.len(), 1);
     assert_eq!(incomplete[0].attempt_count(), 1);
     assert!(incomplete[0].last_error().is_some());
+    assert_eq!(incomplete[0].state(), SagaState::Failed);
+    assert_eq!(incomplete[0].step(), SagaStep::PersistArtifacts);
+    let identity = incomplete[0].target_schema().identity();
+    assert_eq!(store.current_schema(identity).await?.unwrap().version().get(), 1);
+    assert!(
+        store
+            .artifacts(identity, incomplete[0].target_schema().version())
+            .await?
+            .is_none()
+    );
+    assert_eq!(
+        store.finalize(incomplete[0].id()).await.unwrap_err().code(),
+        CatalogErrorCode::CorruptCatalogState
+    );
 
     let report = service.reconcile_incomplete().await?;
     assert_eq!(report.examined, 1);
@@ -114,26 +116,33 @@ async fn hive_failure_is_visible_and_reconciles() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn failure_after_hive_apply_reconciles_idempotently() -> anyhow::Result<()> {
+async fn failure_after_artifact_persistence_reconciles_idempotently() -> anyhow::Result<()> {
     let store = Arc::new(MemoryCatalogStore::new());
-    let metastore = Arc::new(MemoryMetastore::new());
-    let service = CatalogControlPlane::new(
-        DdlParser::default(),
-        Arc::<MemoryCatalogStore>::clone(&store),
-        metastore,
-    );
-    store.fail_next(FailurePoint::MarkHiveApplied).await;
+    let service = CatalogControlPlane::new(DdlParser::default(), Arc::<MemoryCatalogStore>::clone(&store));
+    store.fail_next(FailurePoint::Finalize).await;
     let result = service.execute_ddl(create_ddl()).await;
     let Err(error) = result else {
         anyhow::bail!("application-store failure must be visible");
     };
     assert_eq!(error.code(), CatalogErrorCode::ApplicationDatabase);
 
-    let report = service.reconcile_incomplete().await?;
+    let incomplete = store.incomplete_sagas().await?;
+    assert_eq!(incomplete.len(), 1);
+    assert_eq!(incomplete[0].step(), SagaStep::Finalize);
+    let identity = create_identity()?;
+    assert!(store.current_schema(&identity).await?.is_none());
+    assert!(
+        store
+            .artifacts(&identity, incomplete[0].target_schema().version())
+            .await?
+            .is_some()
+    );
+    let (restarted, report) =
+        CatalogControlPlane::start(DdlParser::default(), Arc::<MemoryCatalogStore>::clone(&store)).await?;
     assert_eq!(report.completed, 1);
     assert!(report.failures.is_empty());
-    let identity = create_identity()?;
     assert_eq!(store.schema_history(&identity).await?.len(), 1);
+    assert_eq!(restarted.reconcile_incomplete().await?.examined, 0);
     Ok(())
 }
 

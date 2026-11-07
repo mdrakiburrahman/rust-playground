@@ -88,8 +88,6 @@ impl FromStr for SagaId {
 pub enum SagaState {
     /// Application state and the pending target version are reserved.
     Reserved,
-    /// Hive Metastore reflects the target schema.
-    HiveApplied,
     /// Deterministic artifacts are persisted.
     ArtifactsPersisted,
     /// The new immutable version is the current head.
@@ -99,19 +97,18 @@ pub enum SagaState {
 }
 
 impl SagaState {
-    /// Stable SQL storage name.
+    /// Stable persisted storage name.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Reserved => "reserved",
-            Self::HiveApplied => "hive_applied",
             Self::ArtifactsPersisted => "artifacts_persisted",
             Self::Committed => "committed",
             Self::Failed => "failed",
         }
     }
 
-    /// Parses a SQL storage value.
+    /// Parses a persisted storage value.
     ///
     /// # Errors
     ///
@@ -119,7 +116,6 @@ impl SagaState {
     pub fn parse(value: &str) -> CatalogResult<Self> {
         match value {
             "reserved" => Ok(Self::Reserved),
-            "hive_applied" => Ok(Self::HiveApplied),
             "artifacts_persisted" => Ok(Self::ArtifactsPersisted),
             "committed" => Ok(Self::Committed),
             "failed" => Ok(Self::Failed),
@@ -135,8 +131,6 @@ impl SagaState {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SagaStep {
-    /// Apply or verify the target through Hive Metastore.
-    ApplyHive,
     /// Generate and persist deterministic descriptor artifacts.
     PersistArtifacts,
     /// Atomically activate the target application schema.
@@ -146,25 +140,23 @@ pub enum SagaStep {
 }
 
 impl SagaStep {
-    /// Stable SQL step number.
+    /// Stable persisted step number.
     #[must_use]
     pub const fn number(self) -> i16 {
         match self {
-            Self::ApplyHive => 0,
             Self::PersistArtifacts => 1,
             Self::Finalize => 2,
             Self::Complete => 3,
         }
     }
 
-    /// Parses a SQL step number.
+    /// Parses a persisted step number.
     ///
     /// # Errors
     ///
     /// Returns an error for an unknown persisted value.
     pub fn from_number(value: i16) -> CatalogResult<Self> {
         match value {
-            0 => Ok(Self::ApplyHive),
             1 => Ok(Self::PersistArtifacts),
             2 => Ok(Self::Finalize),
             3 => Ok(Self::Complete),
@@ -256,7 +248,7 @@ impl SagaRecord {
             from_schema,
             target_schema,
             state: SagaState::Reserved,
-            step: SagaStep::ApplyHive,
+            step: SagaStep::PersistArtifacts,
             attempt_count: 0,
             last_error: None,
         }
@@ -342,9 +334,6 @@ pub trait CatalogStore: Send + Sync {
 
     /// Loads a saga by identifier.
     async fn saga(&self, saga_id: SagaId) -> CatalogResult<Option<SagaRecord>>;
-
-    /// Marks the official Hive operation as applied.
-    async fn mark_hive_applied(&self, saga_id: SagaId) -> CatalogResult<SagaRecord>;
 
     /// Persists deterministic schema artifacts.
     async fn persist_artifacts(&self, saga_id: SagaId, artifacts: &DescriptorArtifacts) -> CatalogResult<SagaRecord>;

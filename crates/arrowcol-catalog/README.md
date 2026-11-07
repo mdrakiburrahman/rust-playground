@@ -42,12 +42,13 @@ time/duration unit names. Unsupported or lossy mappings fail closed.
 | [arrowcol-catalog-rust](../../projects/arrowcol-catalog-rust/README.md) | Authoritative Delta-backed catalog service and schema-event stream |
 | [arrowcol-catalog-client](../arrowcol-catalog-client/src/lib.rs) | Remote catalog access and bounded schema cache |
 | This crate | DDL parsing, immutable schema contracts, validation, and compatibility traits |
-| `MemoryCatalogStore` / `MemoryMetastore` | In-process compatibility fixtures; not production persistence |
+| `MemoryCatalogStore` | Transactional in-process schema store; not production persistence |
 
 SQL catalog persistence and the Java Hive/Thrift sidecar are retired. SQL Server
 remains only as the router's routing store. The schema-change compatibility
 control plane still reconciles recoverable reservations, descriptor artifacts,
-and activation through its store/metastore traits.
+and activation through its catalog-store trait. Reservations begin with artifact
+persistence; finalization atomically activates the immutable schema head.
 
 ## Validation
 

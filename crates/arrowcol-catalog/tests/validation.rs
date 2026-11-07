@@ -3,18 +3,14 @@ use std::sync::Arc;
 use arrow_schema::{DataType, Field, Schema};
 use arrowcol_catalog::{
     AlignmentAction, CatalogControlPlane, CatalogErrorCode, CatalogStore, DdlParser, FlightSqlDdlHandler,
-    FlightSqlDdlRequest, MemoryCatalogStore, MemoryMetastore, SchemaAlignmentPlan, SchemaValidator,
+    FlightSqlDdlRequest, MemoryCatalogStore, SchemaAlignmentPlan, SchemaValidator,
 };
 use arrowcol_protocol::{ClaimedSchemaFingerprint, fingerprint_schema};
 
 #[tokio::test]
 async fn exact_and_registered_historical_schemas_are_accepted() -> anyhow::Result<()> {
     let store = Arc::new(MemoryCatalogStore::new());
-    let service = CatalogControlPlane::new(
-        DdlParser::default(),
-        Arc::<MemoryCatalogStore>::clone(&store),
-        Arc::new(MemoryMetastore::new()),
-    );
+    let service = CatalogControlPlane::new(DdlParser::default(), Arc::<MemoryCatalogStore>::clone(&store));
     let created = service
         .execute_ddl(FlightSqlDdlRequest::new(
             "CREATE TABLE telemetry.prod.validate_me (id BIGINT NOT NULL, body STRING) USING DELTA",
@@ -76,11 +72,7 @@ async fn exact_and_registered_historical_schemas_are_accepted() -> anyhow::Resul
 #[tokio::test]
 async fn unknown_and_arbitrary_missing_schemas_are_rejected() -> anyhow::Result<()> {
     let store = Arc::new(MemoryCatalogStore::new());
-    let service = CatalogControlPlane::new(
-        DdlParser::default(),
-        Arc::<MemoryCatalogStore>::clone(&store),
-        Arc::new(MemoryMetastore::new()),
-    );
+    let service = CatalogControlPlane::new(DdlParser::default(), Arc::<MemoryCatalogStore>::clone(&store));
     let completion = service
         .execute_ddl(FlightSqlDdlRequest::new(
             "CREATE TABLE telemetry.prod.strict_schema \

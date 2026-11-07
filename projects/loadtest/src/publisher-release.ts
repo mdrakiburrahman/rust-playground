@@ -62,16 +62,16 @@ export async function admitPublisherRelease(options: {
   assert.deepEqual(executableIdentity(options.sdk), sdk, 'SDK changed during release proof');
   const bytes = readFileSync(path.join(results, 'publisher-release.json'));
   const proof = JSON.parse(bytes.toString('utf8')) as {
-    passed?: unknown; run_id?: unknown; errors?: unknown; routing?: unknown; receipts?: unknown;
+    passed?: unknown; run_id?: unknown; errors?: unknown; routing?: unknown;
   };
   assert(proof.passed === true && proof.run_id === metadata.run_id && Array.isArray(proof.errors)
-    && proof.errors.length === 0 && proof.routing && proof.receipts, 'SQL publisher release is not proven');
+    && proof.errors.length === 0 && proof.routing, 'routing publisher release is not proven');
   const sha256 = (bytes: Buffer): string => createHash('sha256').update(bytes).digest('hex');
   atomicJson(path.join(results, 'publisher-admission.json'), {
     passed: true, run_id: metadata.run_id, sql: options.sql, root: realpathSync(directory), mutators: stopped,
     sdk_sha256: sdk.sha256, release_sha256: sha256(bytes),
-    protocol: 'sql-terminal-state-and-owned-clean-exit',
-    dataflow_proof: 'routing-stopped-and-owned-clean-exit; no-receipts-owner',
+    protocol: 'routing-terminal-state-and-owned-clean-exit',
+    dataflow_proof: 'routing-stopped-and-owned-clean-exit; clients receive no durable receipt IDs',
   });
   if (options.compact) {
     await options.compact();

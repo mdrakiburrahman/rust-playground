@@ -15,7 +15,6 @@ storage:
 scrape_configs:
   - job_name: direct
     static_configs:
-      - targets: ["direct-1:8081"]
         labels: {arrowcol: direct}
 
   - job_name: dataflow

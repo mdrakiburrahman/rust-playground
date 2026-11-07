@@ -11,7 +11,6 @@
 mod artifacts;
 mod ddl;
 mod error;
-mod hive;
 mod ir;
 mod memory;
 mod saga;
@@ -22,13 +21,12 @@ pub use arrowcol_sparksql::{Statement as SparkStatement, TableMetadata};
 pub use artifacts::{ArtifactKind, DescriptorArtifacts, generate_descriptor_artifacts};
 pub use ddl::{DdlCommand, DdlParser, FieldBlueprint, ParsedAddColumns, ParsedCreateTable};
 pub use error::{CatalogError, CatalogErrorCode, CatalogResult};
-pub use hive::{HiveTableSnapshot, Metastore};
 pub use ir::{
     CatalogField, CatalogSchemaVersion, CatalogType, FieldPath, ListKind, PartitionMetadata, ProtobufType,
     SchemaVersion, TimeUnit, TypeMapping, deterministic_field_id, deterministic_table_id, next_protobuf_field_number,
     protobuf_field_number,
 };
-pub use memory::{FailurePoint, MemoryCatalogStore, MemoryMetastore};
+pub use memory::{FailurePoint, MemoryCatalogStore};
 pub use saga::{
     CatalogControlPlane, DdlCompletion, DdlCompletionDisposition, FlightSqlDdlHandler, FlightSqlDdlRequest,
     ReconciliationReport,
