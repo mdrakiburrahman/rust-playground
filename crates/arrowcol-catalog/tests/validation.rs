@@ -17,7 +17,7 @@ async fn exact_and_registered_historical_schemas_are_accepted() -> anyhow::Resul
     );
     let created = service
         .execute_ddl(FlightSqlDdlRequest::new(
-            "CREATE TABLE telemetry.prod.validate_me (id BIGINT NOT NULL, body VARCHAR)",
+            "CREATE TABLE telemetry.prod.validate_me (id BIGINT NOT NULL, body STRING) USING DELTA",
         ))
         .await?;
     let historical = store
@@ -27,7 +27,7 @@ async fn exact_and_registered_historical_schemas_are_accepted() -> anyhow::Resul
     service
         .execute_ddl(FlightSqlDdlRequest::new(
             "ALTER TABLE telemetry.prod.validate_me ADD COLUMNS \
-             (severity SMALLINT, attributes MAP(VARCHAR, VARCHAR))",
+             (severity SMALLINT, attributes MAP<STRING, STRING>)",
         ))
         .await?;
     let current = store
@@ -84,7 +84,7 @@ async fn unknown_and_arbitrary_missing_schemas_are_rejected() -> anyhow::Result<
     let completion = service
         .execute_ddl(FlightSqlDdlRequest::new(
             "CREATE TABLE telemetry.prod.strict_schema \
-             (id BIGINT NOT NULL, body VARCHAR, severity SMALLINT)",
+             (id BIGINT NOT NULL, body STRING, severity SMALLINT) USING DELTA",
         ))
         .await?;
     let validator = SchemaValidator::new(store);

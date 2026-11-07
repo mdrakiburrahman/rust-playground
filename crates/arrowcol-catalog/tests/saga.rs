@@ -6,7 +6,7 @@ use arrowcol_catalog::{
 };
 
 fn create_ddl() -> FlightSqlDdlRequest {
-    FlightSqlDdlRequest::new("CREATE TABLE telemetry.prod.events (id BIGINT NOT NULL, body VARCHAR)")
+    FlightSqlDdlRequest::new("CREATE TABLE telemetry.prod.events (id BIGINT NOT NULL, body STRING) USING DELTA")
 }
 
 #[tokio::test]
@@ -30,7 +30,7 @@ async fn create_append_and_retry_preserve_identity_and_numbers() -> anyhow::Resu
     let alter_request = || {
         FlightSqlDdlRequest::new(
             "ALTER TABLE telemetry.prod.events ADD COLUMNS \
-             (severity SMALLINT, attributes MAP(VARCHAR, VARCHAR))",
+             (severity SMALLINT, attributes MAP<STRING, STRING>)",
         )
     };
     let altered = service.execute_ddl(alter_request()).await?;
@@ -89,7 +89,7 @@ async fn hive_failure_is_visible_and_reconciles() -> anyhow::Result<()> {
     metastore.fail_next(FailurePoint::HiveApply).await;
     let result = service
         .execute_ddl(FlightSqlDdlRequest::new(
-            "ALTER TABLE telemetry.prod.events ADD COLUMNS (retryable VARCHAR)",
+            "ALTER TABLE telemetry.prod.events ADD COLUMNS (retryable STRING)",
         ))
         .await;
     let Err(error) = result else {
