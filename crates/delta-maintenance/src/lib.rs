@@ -161,7 +161,7 @@ pub struct DiscoveredTable {
     pub properties: BTreeMap<String, String>,
     /// Filesystem property reads are bound to a log version; catalog reads may
     /// carry their own stronger event-stream consistency contract instead.
-    pub log_version: Option<u64>,
+    pub log_token: Option<String>,
 }
 
 /// The catalog client implements this interface without filesystem discovery.
@@ -179,7 +179,7 @@ pub trait TableDiscovery: Sync {
     fn table(&self, name: &str) -> Result<DiscoveredTable>;
 }
 
-type PropertyCache = BTreeMap<String, (u64, BTreeMap<String, String>)>;
+type PropertyCache = BTreeMap<String, (String, BTreeMap<String, String>)>;
 
 /// Compatibility discovery for local roots and explicit cloud allowlists.
 /// Only metadata is cached, fenced by the current log version each pass.
@@ -239,22 +239,22 @@ impl TableDiscovery for FilesystemDiscovery {
     fn table(&self, name: &str) -> Result<DiscoveredTable> {
         let url = self.url(name)?;
         let probe = DeltaTable::open_for_maintenance_probe(&url)?;
-        let version = probe.probe_log_version(100_000)?;
+        let token = probe.probe_log_token(100_000)?;
         let mut cache = self
             .cache
             .lock()
             .map_err(|_| anyhow::anyhow!("property cache poisoned"))?;
         let properties = match cache.get(name) {
-            Some((cached_version, properties)) if *cached_version == version => properties.clone(),
+            Some((cached_token, properties)) if *cached_token == token => properties.clone(),
             _ => {
                 let properties = probe.maintenance_properties()?;
-                if probe.probe_log_version(100_000)? != version {
+                if probe.probe_log_token(100_000)? != token {
                     bail!("table advanced during property discovery; retry");
                 }
                 if cache.len() >= MAX_TABLES && !cache.contains_key(name) {
                     cache.clear();
                 }
-                cache.insert(name.into(), (version, properties.clone()));
+                cache.insert(name.into(), (token.clone(), properties.clone()));
                 properties
             }
         };
@@ -262,7 +262,7 @@ impl TableDiscovery for FilesystemDiscovery {
             name: name.into(),
             url,
             properties,
-            log_version: Some(version),
+            log_token: Some(token),
         })
     }
 }
@@ -524,7 +524,11 @@ impl OperationResult {
 
     fn did_work(&self) -> bool {
         self.report.as_ref().is_some_and(|report| {
-            report.files_removed > 0 || report.files_added > 0 || report.files_deleted > 0 || report.backlog_files > 0
+            report.files_removed > 0
+                || report.files_added > 0
+                || report.files_deleted > 0
+                || report.backlog_files > 0
+                || report.outcome == Outcome::Checkpointed
         })
     }
 }
@@ -602,6 +606,12 @@ impl Metrics {
         self.1
             .runs
             .add(1, &[op.clone(), opentelemetry::KeyValue::new("outcome", outcome)]);
+        if result.negative_probe {
+            self.1.totals.add(
+                1,
+                &[op.clone(), opentelemetry::KeyValue::new("outcome", "negative_probes")],
+            );
+        }
         if let Some(report) = result
             .report
             .as_ref()
@@ -621,6 +631,9 @@ impl Metrics {
         }
         self.with(|counters| {
             *counters.runs.entry((operation, outcome)).or_default() += 1;
+            if result.negative_probe {
+                *counters.totals.entry((operation, "negative_probes")).or_default() += 1;
+            }
             let report = result.report.as_ref();
             if let Some(report) = report {
                 for (name, value) in report_items(report) {
@@ -809,11 +822,7 @@ fn run_operation(
             config.allow_short_vacuum_retention = settings.allow_short_vacuum_retention;
             config.unsafe_allow_short_retention_for_tests = settings.unsafe_short_vacuum_for_tests;
             config.max_deletes = usize::try_from(props.unsigned("arrowcol.vacuum.maxDeletes")?)?;
-            let plan = table.plan_vacuum(&config)?;
-            if settings.apply {
-                return table.apply_vacuum(&plan, &config, control);
-            }
-            MaintenancePlan::Vacuum(plan)
+            return table.vacuum_once(&config, settings.apply, control);
         }
     };
     let mut report = plan.report();
@@ -852,11 +861,10 @@ fn maintain_table(
             );
         }
         let probe = DeltaTable::open_for_maintenance_probe(&discovered.url)?;
-        if let Some(version) = discovered.log_version {
-            if probe.probe_log_version(100_000)? != version {
-                bail!("table advanced after discovery; retry");
+        if let Some(token) = &discovered.log_token
+            && probe.probe_log_token(100_000)? != *token && probe.maintenance_properties()? != discovered.properties {
+                bail!("table properties changed after discovery; retry");
             }
-        }
         Ok(Some((discovered, effective, props, probe, gate)))
     })();
     if matches!(&setup, Ok(None)) {
@@ -867,6 +875,10 @@ fn maintain_table(
         _ => &settings.operations,
     };
     let mut table = None;
+    let mut observed_token = match &setup {
+        Ok(Some((discovered, _, _, _, _))) => discovered.log_token.clone(),
+        _ => None,
+    };
     for operation in Operation::ALL
         .into_iter()
         .filter(|operation| operations.contains(operation))
@@ -884,6 +896,13 @@ fn maintain_table(
         let control = MaintenanceControl::new(Arc::clone(cancel), Some(started + effective.operation_timeout));
         let outcome = match &setup {
             Ok(Some((discovered, effective, props, probe, _))) => (|| {
+                let token = probe.probe_log_token(100_000)?;
+                if observed_token.as_ref().is_some_and(|previous| *previous != token)
+                    && probe.maintenance_properties()? != discovered.properties
+                {
+                    bail!("table properties changed during the maintenance pass; retry discovery");
+                }
+                observed_token = Some(token);
                 let anchor = effective.anchor_ms.map_or_else(now_ms, Ok)?;
                 let config = NegativeProbeConfig {
                     now_ms: anchor,
@@ -972,6 +991,19 @@ pub fn run_cycle(settings: &Settings, metrics: &Metrics, cancel: &Arc<AtomicBool
             vec![result]
         }
     }
+}
+
+/// Run one bounded pass over the catalog discovery adapter.
+///
+/// # Errors
+/// Returns discovery-level failures; individual table failures are explicit results.
+pub fn run_cycle_with_discovery(
+    settings: &Settings,
+    discovery: &dyn TableDiscovery,
+    metrics: &Metrics,
+    cancel: &Arc<AtomicBool>,
+) -> Result<Vec<OperationResult>> {
+    cycle_with_discovery(settings, discovery, metrics, cancel, None)
 }
 
 fn discovery_failure(settings: &Settings, error: anyhow::Error) -> OperationResult {
@@ -1071,7 +1103,8 @@ pub fn run_with_discovery(
         if settings.max_cycles.is_some_and(|max| cycles >= max) || cancel.load(Ordering::SeqCst) {
             break;
         }
-        let idle = !results.iter().any(OperationResult::did_work);
+        let idle =
+            results.iter().all(|result| result.error_kind.is_none()) && !results.iter().any(OperationResult::did_work);
         let current = if idle { delay.unwrap_or(interval) } else { interval };
         eprintln!(
             "delta-maintenance heartbeat cycle={cycles} idle={idle} next_in_ms={}",

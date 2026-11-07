@@ -56,7 +56,6 @@ pub const MAX_COMMIT_ATTEMPTS: u32 = 8;
 /// Bounded wall-clock budget for collision retries.
 pub const COMMIT_BUDGET: Duration = Duration::from_secs(10);
 const ENGINE_INFO: &str = "arrow-deltalake-maintenance";
-const COMPANION_SUFFIX: &str = "__unix_nanos";
 const SUPPORTED_FEATURES: &[&str] = &[
     "appendOnly",
     "invariants",
@@ -630,6 +629,17 @@ impl DeltaTable {
         probe_version(&self.list_log(max_files)?)
     }
 
+    /// Identity token for cache freshness, including same-version replacement
+    /// and checkpoint changes rather than only the largest commit version.
+    ///
+    /// # Errors
+    /// Returns bounded inventory or malformed-log failures.
+    pub fn probe_log_token(&self, max_files: usize) -> Result<String> {
+        let logs = self.list_log(max_files)?;
+        probe_version(&logs)?;
+        log_token(&logs)
+    }
+
     /// Read the latest metadata action, not the add/remove history. A pruned
     /// metadata action falls back to Kernel's checkpoint-aware metadata reader.
     /// Catalog discovery should supply these properties directly instead.
@@ -639,6 +649,7 @@ impl DeltaTable {
     pub fn maintenance_properties(&self) -> Result<BTreeMap<String, String>> {
         let names = self.list_log(100_000)?;
         let version = probe_version(&names)?;
+        let token = log_token(&names)?;
         for (name, _) in names.iter().rev() {
             if !is_commit_name(name) {
                 continue;
@@ -658,7 +669,7 @@ impl DeltaTable {
                 }
             }
             if let Some(configuration) = configuration {
-                self.require_probe_version(version, 100_000)?;
+                self.require_probe_token(&token, 100_000)?;
                 return Ok(configuration);
             }
         }
@@ -670,12 +681,12 @@ impl DeltaTable {
             ));
         }
         let configuration = TableFingerprint::of(&snapshot).configuration;
-        self.require_probe_version(version, 100_000)?;
+        self.require_probe_token(&token, 100_000)?;
         Ok(configuration)
     }
 
-    fn require_probe_version(&self, version: u64, max_files: usize) -> Result<()> {
-        if self.probe_log_version(max_files)? != version {
+    fn require_probe_token(&self, token: &str, max_files: usize) -> Result<()> {
+        if self.probe_log_token(max_files)? != token {
             return Err(fail(
                 MaintenanceErrorKind::StalePlan,
                 "table advanced during negative probe; retry",
@@ -704,11 +715,11 @@ impl DeltaTable {
         let logs = self.list_log(config.max_listed_files)?;
         let version = probe_version(&logs)?;
         let checkpoint = self.hinted_checkpoint_version(false)?;
-        if let Some(checkpoint) = checkpoint {
-            if checkpoint > version || !logs.contains_key(&format!("{checkpoint:020}.checkpoint.parquet")) {
-                // Multipart/v2 checkpoint layouts require the full supported-layout path.
-                return Ok(None);
-            }
+        if let Some(checkpoint) = checkpoint
+            && (checkpoint > version || !logs.contains_key(&format!("{checkpoint:020}.checkpoint.parquet")))
+        {
+            // Multipart/v2 checkpoint layouts require the full supported-layout path.
+            return Ok(None);
         }
         let debt = checkpoint.map_or(version.saturating_add(1), |hint| version.saturating_sub(hint));
         let log_cutoff = config
@@ -805,9 +816,11 @@ impl DeltaTable {
 
     fn probe_physical_files(&self, limit: usize, control: &MaintenanceControl) -> Result<Vec<(String, ObjectMeta)>> {
         let prefix = self.object_path("")?;
-        shared_executor()?.block_on(async {
+        let store = Arc::clone(&self.store);
+        let control = control.clone();
+        shared_executor()?.block_on(async move {
             use futures::StreamExt;
-            let mut listing = self.store.list(Some(&prefix));
+            let mut listing = store.list(Some(&prefix));
             let mut files = Vec::new();
             let mut seen = 0;
             while let Some(entry) = listing.next().await {
@@ -885,7 +898,30 @@ fn is_commit_name(name: &str) -> bool {
     name.len() == 25 && name.ends_with(".json") && name.as_bytes()[..20].iter().all(u8::is_ascii_digit)
 }
 
+fn log_token(logs: &BTreeMap<String, ObjectMeta>) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let entries: Vec<_> = logs
+        .iter()
+        .map(|(name, meta)| {
+            (
+                name,
+                meta.size,
+                meta.last_modified.to_rfc3339(),
+                &meta.e_tag,
+                &meta.version,
+            )
+        })
+        .collect();
+    Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(&entries)?)))
+}
+
 fn probe_version(logs: &BTreeMap<String, ObjectMeta>) -> Result<u64> {
+    if logs.keys().any(|name| name.ends_with(".json") && !is_commit_name(name)) {
+        return Err(fail(
+            MaintenanceErrorKind::Unsupported,
+            "nonstandard JSON commit name in probe inventory",
+        ));
+    }
     logs.keys()
         .filter(|name| is_commit_name(name))
         .map(|name| name[..20].parse::<u64>())
@@ -3193,6 +3229,32 @@ impl DeltaTable {
     /// # Errors
     /// Rejects unsafe retention, incomplete history, unsupported tables and bounds.
     pub fn plan_vacuum(&self, config: &VacuumConfig) -> Result<VacuumPlan> {
+        let (state, replay) = self.prepare_vacuum(config)?;
+        self.build_vacuum_plan(&state, &replay, config)
+    }
+
+    /// Plan and optionally apply one VACUUM pass, reusing the validated replay
+    /// when the log version is unchanged. Destructive chunk freshness remains enforced.
+    ///
+    /// # Errors
+    /// Returns planning, retention, freshness, cancellation or deletion failures.
+    pub fn vacuum_once(
+        &self,
+        config: &VacuumConfig,
+        apply: bool,
+        control: &MaintenanceControl,
+    ) -> Result<MaintenanceReport> {
+        control.check()?;
+        let (state, replay) = self.prepare_vacuum(config)?;
+        let plan = self.build_vacuum_plan(&state, &replay, config)?;
+        if apply {
+            self.apply_vacuum_reusing(&plan, config, control, Some((&state, &replay)))
+        } else {
+            Ok(MaintenancePlan::Vacuum(plan).report())
+        }
+    }
+
+    fn prepare_vacuum(&self, config: &VacuumConfig) -> Result<(ActiveState, LogReplay)> {
         self.check_vacuum_retention(config.retention_ms, config)?;
         if config.max_deletes == 0 || config.delete_chunk == 0 {
             return Err(fail(
@@ -3209,6 +3271,10 @@ impl DeltaTable {
                 "log replay disagrees with Kernel's active file set",
             ));
         }
+        Ok((state, replay))
+    }
+
+    fn build_vacuum_plan(&self, state: &ActiveState, replay: &LogReplay, config: &VacuumConfig) -> Result<VacuumPlan> {
         let cutoff = config.cutoff()?;
         let mut candidates = Vec::new();
         let (mut undated, mut retained, mut backlog) = (0_u64, 0_u64, 0_u64);
@@ -3230,7 +3296,7 @@ impl DeltaTable {
             }
         }
         let plan = VacuumPlan {
-            header: PlanHeader::new(self, &state)?,
+            header: PlanHeader::new(self, state)?,
             retention_ms: config.retention_ms,
             now_ms: config.now_ms,
             cutoff_ms: cutoff,
@@ -3261,6 +3327,16 @@ impl DeltaTable {
         config: &VacuumConfig,
         control: &MaintenanceControl,
     ) -> Result<MaintenanceReport> {
+        self.apply_vacuum_reusing(plan, config, control, None)
+    }
+
+    fn apply_vacuum_reusing(
+        &self,
+        plan: &VacuumPlan,
+        config: &VacuumConfig,
+        control: &MaintenanceControl,
+        prepared: Option<(&ActiveState, &LogReplay)>,
+    ) -> Result<MaintenanceReport> {
         plan.header.validate(self)?;
         self.check_vacuum_retention(plan.retention_ms, config)?;
         self.check_vacuum_retention(config.retention_ms, config)?;
@@ -3280,10 +3356,26 @@ impl DeltaTable {
         let mut report = MaintenanceReport::new("vacuum", &plan.header);
         report.cutoff_ms = Some(effective);
         report.backlog_files = plan.backlog_files;
-        let state = self.active_state(config.max_active_files)?;
+        let snapshot = self.snapshot()?;
+        let reloaded;
+        let state = match prepared {
+            Some((state, _)) if state.snapshot.version() == snapshot.version() => state,
+            _ => {
+                reloaded = self.active_state(config.max_active_files)?;
+                &reloaded
+            }
+        };
         plan.header.fingerprint.require_same(&state.fingerprint)?;
+        plan.header.fingerprint.require_same(&TableFingerprint::of(&snapshot))?;
         report.version = state.snapshot.version();
-        let replay = self.replay_log(state.snapshot.version(), &state.fingerprint.table_id, config)?;
+        let replayed;
+        let replay = match prepared {
+            Some((prepared, replay)) if prepared.snapshot.version() == state.snapshot.version() => replay,
+            _ => {
+                replayed = self.replay_log(state.snapshot.version(), &state.fingerprint.table_id, config)?;
+                &replayed
+            }
+        };
         if plan.candidates.is_empty() {
             let current = self.vacuum_lite_progress()?;
             if current.as_ref().is_none_or(|progress| {
@@ -3293,7 +3385,7 @@ impl DeltaTable {
                     plan,
                     effective,
                     config,
-                    (state.snapshot.version() == plan.header.read_version).then_some(&replay),
+                    (state.snapshot.version() == plan.header.read_version).then_some(replay),
                 )
                 .map_err(|error| progress_failure(&error, &report))?;
             }
@@ -3326,13 +3418,23 @@ impl DeltaTable {
                 report.interrupted = true;
                 return Ok(report);
             }
-            let fresh = self.active_state(config.max_active_files).map_err(|error| {
+            let fresh_snapshot = self.snapshot().map_err(|error| {
                 fail_with(
                     MaintenanceErrorKind::StalePlan,
                     format!("fresh active-set check failed: {error}"),
                     &report,
                 )
             })?;
+            let rescanned;
+            let fresh = if fresh_snapshot.version() == state.snapshot.version() {
+                state
+            } else {
+                rescanned = self.active_state(config.max_active_files)?;
+                &rescanned
+            };
+            plan.header
+                .fingerprint
+                .require_same(&TableFingerprint::of(&fresh_snapshot))?;
             if let Err(error) = plan.header.fingerprint.require_same(&fresh.fingerprint) {
                 return Err(fail_with(
                     MaintenanceErrorKind::MetadataChanged,
@@ -3340,7 +3442,7 @@ impl DeltaTable {
                     &report,
                 ));
             }
-            let active = self.active_keys(&fresh)?;
+            let active = self.active_keys(fresh)?;
             for candidate in chunk {
                 if active.contains(&self.log_key(&candidate.path)?) {
                     return Err(fail_with(
@@ -3387,7 +3489,7 @@ impl DeltaTable {
             plan,
             effective,
             config,
-            (state.snapshot.version() == plan.header.read_version).then_some(&replay),
+            (state.snapshot.version() == plan.header.read_version).then_some(replay),
         )
         .map_err(|error| progress_failure(&error, &report))?;
         Ok(report)
