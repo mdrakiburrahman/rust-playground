@@ -751,7 +751,9 @@ mod io_tests {
             properties.clone(),
             None,
         )?;
-        let table = DeltaTable::open(&fixture.0)?;
+        let writer_url =
+            Url::from_directory_path(fs::canonicalize(&fixture.0)?).map_err(|()| anyhow::anyhow!("bad fixture URL"))?;
+        let table = DeltaTable::open_url(writer_url, Arc::clone(&schema), vec![INGESTION_PARTITION.into()])?;
         assert_eq!(table.version()?, created.version);
         properties.insert("delta.targetFileSize".into(), target);
         let initial = catalog.commit_catalog(
@@ -847,6 +849,187 @@ mod io_tests {
                 .to_string()
                 .contains("arrowcol.layout.rowGroupRows")
         );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn declared_partition_policy_refresh_preserves_identity_and_staged_files() -> Result<()> {
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("declared-policy-{}", uuid::Uuid::new_v4()));
+        let fixture = Fixture(root);
+        fs::create_dir_all(&fixture.0)?;
+        let url =
+            Url::from_directory_path(fs::canonicalize(&fixture.0)?).map_err(|()| anyhow::anyhow!("bad fixture URL"))?;
+        let catalog = DeltaTable::open_catalog(url)?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("region", DataType::Utf8, true),
+            Field::new("bucket", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::Int32Array::from(vec![4, 1, 3, 2, 6, 5])),
+                Arc::new(arrow::array::StringArray::from(vec![
+                    Some("x"),
+                    Some("x"),
+                    Some("x"),
+                    None,
+                    None,
+                    None,
+                ])),
+                Arc::new(arrow::array::Int32Array::from(vec![7, 7, 7, 8, 8, 8])),
+            ],
+        )?;
+        let mut props: BTreeMap<String, String> = [
+            ("catalog.schemaHistory", "[]"),
+            ("arrowcol.layout.enabled", "true"),
+            ("arrowcol.layout.sortColumns", "id"),
+            ("arrowcol.layout.bloomColumns", "id"),
+            ("arrowcol.layout.rowGroupRows", "2"),
+            ("arrowcol.layout.pageRows", "1"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect();
+        let partitions = vec!["region".to_owned(), "bucket".to_owned()];
+        let created = catalog.commit_catalog(None, Arc::clone(&schema), partitions.clone(), props.clone(), None)?;
+        let table = DeltaTable::open(&fixture.0)?;
+        let files = table.new_partitioned_publication_files(batch.clone(), "publication".into(), 0, 0)?;
+        assert_eq!(files.len(), 2);
+        let mut stages = Vec::new();
+        let mut ids = Vec::new();
+        for (mut writer, part) in files {
+            ids.push(writer.publication.clone().context("missing transaction")?);
+            writer.write(&part).await?;
+            let staged = writer.stage().await?;
+            let reader =
+                parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(File::open(&staged.file.path)?)?;
+            assert_eq!(reader.metadata().num_row_groups(), 2);
+            assert!(
+                reader
+                    .metadata()
+                    .row_groups()
+                    .iter()
+                    .all(|group| group.column(0).bloom_filter_offset().is_some())
+            );
+            let mut values = Vec::new();
+            for batch in reader.build()? {
+                let batch = batch?;
+                values.extend(
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int32Array>()
+                        .context("id column")?
+                        .values()
+                        .iter()
+                        .copied(),
+                );
+            }
+            assert!(values.windows(2).all(|pair| pair[0] <= pair[1]));
+            stages.push(staged);
+        }
+        props.insert("arrowcol.layout.enabled".into(), "false".into());
+        props.insert("catalog.schemaHistory".into(), "[1]".into());
+        let updated = catalog.commit_catalog(
+            Some(created.version),
+            Arc::clone(&schema),
+            partitions.clone(),
+            props.clone(),
+            None,
+        )?;
+        assert_eq!(table.commit_files(&stages)?, updated.version + 1);
+        assert_eq!(table.commit_files(&stages)?, updated.version + 1);
+        let files = table.new_partitioned_publication_files(batch.clone(), "publication".into(), 0, 0)?;
+        assert_eq!(
+            files
+                .iter()
+                .map(|(writer, _)| writer.publication.clone().expect("transaction"))
+                .collect::<Vec<_>>(),
+            ids
+        );
+        for (writer, _) in files {
+            assert!(writer.sorter.is_none());
+            writer.discard_empty()?;
+        }
+        props.insert("arrowcol.layout.enabled".into(), "true".into());
+        props.insert("arrowcol.layout.sortColumns".into(), "region".into());
+        catalog.commit_catalog(Some(updated.version + 1), schema, partitions, props, None)?;
+        assert!(
+            table
+                .new_partitioned_publication_files(batch, "next".into(), 0, 0)
+                .err()
+                .context("partition sort unexpectedly accepted")?
+                .to_string()
+                .contains("partition column")
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ingestion_partition_generation_requires_explicit_writer_configuration() -> Result<()> {
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("ingestion-policy-{}", uuid::Uuid::new_v4()));
+        let fixture = Fixture(root);
+        fs::create_dir_all(&fixture.0)?;
+        let url =
+            Url::from_directory_path(fs::canonicalize(&fixture.0)?).map_err(|()| anyhow::anyhow!("bad fixture URL"))?;
+        let catalog = DeltaTable::open_catalog(url.clone())?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(INGESTION_PARTITION, DataType::Utf8, false),
+        ]));
+        let props = BTreeMap::from([("arrowcol.partition.granularity".into(), "day".into())]);
+        let partitions = vec![INGESTION_PARTITION.to_owned()];
+        catalog.commit_catalog(None, Arc::clone(&schema), partitions.clone(), props, None)?;
+        let generated = DeltaTable::open_url(url, Arc::clone(&schema), partitions)?;
+        let input = input_batch()?;
+        let files = generated.new_partitioned_publication_files(input, "generated".into(), 0, 3_600_000)?;
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].0.partition_values[INGESTION_PARTITION].as_deref(),
+            Some("1970-01-01")
+        );
+        for (writer, _) in files {
+            writer.discard_empty()?;
+        }
+        let declared = DeltaTable::open(&fixture.0)?;
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::Int32Array::from(vec![1, 2])),
+                Arc::new(arrow::array::StringArray::from(vec!["first", "second"])),
+            ],
+        )?;
+        let files = declared.new_partitioned_publication_files(batch, "declared".into(), 0, 3_600_000)?;
+        assert_eq!(files.len(), 2);
+        let values = files
+            .iter()
+            .map(|(writer, _)| {
+                writer.partition_values[INGESTION_PARTITION]
+                    .clone()
+                    .context("missing value")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(values, ["first", "second"]);
+        for (writer, _) in files {
+            writer.discard_empty()?;
+        }
         Ok(())
     }
 
@@ -2290,11 +2473,7 @@ impl DeltaTable {
         });
         let properties = arrowcol_props::resolve(&table_properties, &process_writer_properties(&normalized)?)?;
         let layout = publication_layout(&normalized, &properties)?;
-        let partitioned = snapshot
-            .as_ref()
-            .map_or(self.partition_columns == [INGESTION_PARTITION], |snapshot| {
-                snapshot.table_configuration().metadata().partition_columns() == [INGESTION_PARTITION]
-            });
+        let partitioned = self.partition_columns == [INGESTION_PARTITION];
         let granularity = properties.text("arrowcol.partition.granularity")?;
         let writer =
             self.new_file_with_publication_policy(input, app_id, version, stamp, layout, partitioned, granularity)?;
@@ -2319,11 +2498,7 @@ impl DeltaTable {
         layout: Option<crate::layout::LayoutPolicy>,
     ) -> Result<DeltaFileWriter> {
         let snapshot = self.existing_snapshot()?;
-        let partitioned = snapshot
-            .as_ref()
-            .map_or(self.partition_columns == [INGESTION_PARTITION], |snapshot| {
-                snapshot.table_configuration().metadata().partition_columns() == [INGESTION_PARTITION]
-            });
+        let partitioned = self.partition_columns == [INGESTION_PARTITION];
         let normalized = normalize::schema(&input)?;
         let table_properties = snapshot.as_ref().map_or_else(BTreeMap::new, |snapshot| {
             snapshot
@@ -2403,35 +2578,88 @@ impl DeltaTable {
         version: i64,
         stamp: i64,
     ) -> Result<Vec<(DeltaFileWriter, RecordBatch)>> {
-        let normalized = normalize::batch(&batch)?;
-        let snapshot = self.ensure_schema(normalized.schema())?;
-        let partitions = snapshot.table_configuration().metadata().partition_columns();
-        if partitions.is_empty() || self.partition_columns == [INGESTION_PARTITION] {
+        validate_transaction_id(&app_id, version)?;
+        if stamp < 0 {
+            bail!("ingestion stamp is before Unix epoch");
+        }
+        if self.partition_columns == [INGESTION_PARTITION] {
             return Ok(vec![(
                 self.new_file_with_publication(batch.schema(), app_id, version, stamp)?,
                 batch,
             )]);
         }
-        let layout = configured_publication_layout(&normalized.schema())?;
-        crate::partition::split(&normalized, partitions)?
-            .into_iter()
-            .map(|(batch, values)| {
+        let normalized = normalize::batch(&batch)?;
+        let snapshot = match self.existing_snapshot()? {
+            Some(snapshot) => snapshot,
+            None => {
+                return Ok(vec![(
+                    self.new_file_with_publication(batch.schema(), app_id, version, stamp)?,
+                    batch,
+                )]);
+            }
+        };
+        let partitions = snapshot.table_configuration().metadata().partition_columns();
+        if partitions.is_empty() {
+            return Ok(vec![(
+                self.new_file_with_publication(batch.schema(), app_id, version, stamp)?,
+                batch,
+            )]);
+        }
+        let table_properties: BTreeMap<String, String> = snapshot
+            .table_configuration()
+            .metadata()
+            .configuration()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let resolved = arrowcol_props::resolve(&table_properties, &process_writer_properties(&normalized.schema())?)?;
+        let layout = publication_layout(&normalized.schema(), &resolved)?;
+        if let Some(policy) = &layout {
+            for name in policy.sort_columns.iter().chain(&policy.bloom_columns) {
+                if partitions.contains(name) {
+                    bail!("layout column {name} is a partition column and has no physical Parquet column");
+                }
+            }
+        }
+        let groups = crate::partition::split(&normalized, partitions)?;
+        let mut files: Vec<(DeltaFileWriter, RecordBatch)> = Vec::with_capacity(groups.len());
+        for (batch, values) in groups {
+            let result = (|| -> Result<DeltaFileWriter> {
                 let partition_app_id = crate::partition::publication_id(&app_id, &values, batch.schema().as_ref())?;
                 let properties = layout
                     .as_ref()
                     .map(|policy| policy.writer_properties(&batch.schema()))
                     .transpose()?;
                 let mut writer = self.new_file_bound(batch.schema(), values, properties, true)?;
+                if writer.table_properties != table_properties {
+                    writer.discard_empty()?;
+                    bail!("table properties changed while preparing publication; retry with refreshed policy");
+                }
                 if let Some(policy) = layout.clone() {
                     let physical = Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?);
-                    writer.sorter = Some(crate::layout::FileSortBuffer::new(physical, policy)?);
+                    match crate::layout::FileSortBuffer::new(physical, policy) {
+                        Ok(sorter) => writer.sorter = Some(sorter),
+                        Err(error) => {
+                            writer.discard_empty()?;
+                            return Err(error);
+                        }
+                    }
                 }
-                writer = writer
+                writer
                     .with_transaction(partition_app_id, version)?
-                    .with_ingestion_time(stamp)?;
-                Ok((writer, batch))
-            })
-            .collect()
+                    .with_ingestion_time(stamp)
+            })();
+            match result {
+                Ok(writer) => files.push((writer, batch)),
+                Err(error) => {
+                    for (writer, _) in files {
+                        writer.discard_empty()?;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(files)
     }
 
     /// Bind one file to explicit string-valued Hive partitions.
