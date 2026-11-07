@@ -5,11 +5,13 @@ use arrow_deltalake::delta::{DeltaTable, INGESTION_PARTITION};
 use arrow_deltalake::maintenance::{
     Granularity, MaintenanceControl, NegativeProbeConfig, OptimizeConfig, Outcome, ProbeOperation, now_ms,
 };
-use delta_maintenance::{DiscoveredTable, Metrics, Operation, Settings, TableDiscovery, run_cycle_with_discovery};
+use delta_maintenance::{
+    DiscoveredTable, Metrics, Operation, Settings, TableDiscovery, run_cycle_with_discovery, run_with_discovery,
+};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 
@@ -177,6 +179,80 @@ fn table_policy_overrides_process_minimum_and_only_compacts_sealed_pair() -> Res
     assert_eq!(results.len(), 1);
     assert!(results[0].error.is_none(), "{:?}", results[0].error);
     assert_eq!(results[0].report.as_ref().map(|r| r.files_removed), Some(2));
+    assert_eq!(
+        std::fs::read_dir(root.path().join("events").join("__arrowcol_ingestion=2024-01-01-00-01"))?.count(),
+        2
+    );
+    Ok(())
+}
+
+#[test]
+fn changed_policy_bypasses_old_schedule_without_repeating_an_unchanged_idle_pass() -> Result<()> {
+    struct UpdatingDiscovery(Mutex<(usize, CatalogTable, FileInventory, PathBuf)>);
+
+    impl TableDiscovery for UpdatingDiscovery {
+        fn tables(&self) -> Result<Vec<String>> {
+            let mut state = self.0.lock().map_err(|error| anyhow!("discovery poisoned: {error}"))?;
+            state.0 += 1;
+            if state.0 == 3 {
+                assert_eq!(state.2, inventory(&state.3)?);
+                state
+                    .1
+                    .0
+                    .properties
+                    .insert("arrowcol.optimize.minFiles".into(), "2".into());
+                persist_policy(&state.1)?;
+            }
+            state.1.tables()
+        }
+
+        fn table(&self, name: &str) -> Result<DiscoveredTable> {
+            self.0
+                .lock()
+                .map_err(|error| anyhow!("discovery poisoned: {error}"))?
+                .1
+                .table(name)
+        }
+    }
+
+    let (root, mut settings, mut source) = fixture()?;
+    settings.operations = vec![Operation::Optimize];
+    settings.interval = Some(Duration::from_millis(1));
+    settings.max_idle_backoff = Duration::from_millis(1);
+    settings.max_cycles = Some(3);
+    source
+        .0
+        .properties
+        .insert("arrowcol.maintenance.interval".into(), "60000".into());
+    persist_policy(&source)?;
+    let initial = DeltaTable::open_catalog(source.0.url.clone())?
+        .catalog_snapshot()?
+        .unwrap()
+        .version;
+    let discovery = UpdatingDiscovery(Mutex::new((0, source, inventory(root.path())?, root.path().into())));
+    assert!(run_with_discovery(
+        &settings,
+        &discovery,
+        &Metrics::new(),
+        &Arc::new(AtomicBool::new(false))
+    ));
+    let state = discovery
+        .0
+        .lock()
+        .map_err(|error| anyhow!("discovery poisoned: {error}"))?;
+    assert_eq!(state.0, 3);
+    let snapshot = DeltaTable::open_catalog(state.1.0.url.clone())?
+        .catalog_snapshot()?
+        .unwrap();
+    assert_eq!(
+        snapshot.version,
+        initial + 2,
+        "one metadata update and one OPTIMIZE, before the old 60s deadline"
+    );
+    assert_eq!(
+        std::fs::read_dir(root.path().join("events").join("__arrowcol_ingestion=2024-01-01-00-00"))?.count(),
+        3
+    );
     assert_eq!(
         std::fs::read_dir(root.path().join("events").join("__arrowcol_ingestion=2024-01-01-00-01"))?.count(),
         2
