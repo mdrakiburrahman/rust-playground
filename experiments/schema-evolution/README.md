@@ -44,3 +44,9 @@ all rows after 294006 ms without post-ALTER reconciliation. Keep
 `PARTITIONED BY (tenant)` and every data assertion unchanged. This run,
 component checks and the infrastructure bootstrap do not substitute for the
 two complete fresh-bootstrap rehearsals.
+
+The first isolated Azure rehearsal also proved all six data stages, including
+native QAP hydration after 292289 ms. Its overall result is **failed**:
+an active publisher remained after runtime shutdown, so the runner retained
+cloud data and test occupancy. Complete supported publisher drain/recovery
+before another Azure run or fresh-bootstrap qualification.

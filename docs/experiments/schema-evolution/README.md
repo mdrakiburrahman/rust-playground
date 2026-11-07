@@ -10,7 +10,8 @@
 | Physical appended-field compatibility | Eight old-after rows have true physical NULL `bar` values; eight new-after rows contain exact `bar-0` through `bar-7` sentinels. |
 | Native Kustainer schema and accelerated data hydration | Without post-ALTER reconciliation, QAP reached v4, 100%, 24 accelerated rows and zero pending files after 294006 ms; exact old/new values and multiplicities matched. |
 | First real partitioned v1 publication | At `420f039`, live catalog CREATE and genuine v1 SDK admission succeeded, but Delta rejected missing partition values. No data commit landed; fixture partitioning was not removed. |
-| Native Azure schema refresh | Must be observed without a post-ALTER manual external-table update. |
+| Native Azure schema and accelerated data hydration | Observed at `377b388`: v4, 100%, 24 accelerated rows, zero pending files after 292289 ms, with exact old/new values and no post-ALTER management reconciliation. |
+| Azure rehearsal cleanup | Failed: an active publisher remained after owned runtime shutdown despite an unchanged authority generation. Cloud run data and test occupancy were retained; this is not a qualifying pass. |
 | New stamp reaches supported write readiness | Full bootstrap at `937a465` completed initialization under custody, reconciled 26 Delta external tables/QAP, and exported ready-v1 in 138.4 seconds. This is not the final DFE-only topology rehearsal. |
 
 ![Schema evolution architecture](schema-evolution.drawio.png)
