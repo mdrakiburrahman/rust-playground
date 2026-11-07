@@ -1,7 +1,7 @@
 # Schema evolution experiment
 
 | Purpose | Command | Result |
-| --- | --- | --- |
+|---|---|---|
 | Verify exact data counts and bounded hydration polling | `npx nx run schema-evolution-experiment:verify` | Offline verifier checks; not an end-to-end qualification. |
 | Compile immutable v1/v2 SDK fixtures and independent Rust clients | `npx nx run schema-evolution-experiment:build-fixtures` | v1 binary has no v2 dependency; v2 includes nullable `bar`. Offline artifacts are not remote catalog proof. |
 | Run the real catalog, DFE, historical SDKs, Delta and pinned Kustainer | `npx nx run schema-evolution-experiment:run -- --target local` | Records real CES, same-process old writes, physical nulls and bounded native schema/data hydration. A failed native refresh is not a pass. |
@@ -58,7 +58,8 @@ console.log("Private input created; values withheld.");
 Stop if the approved synced subscription or sign-in is missing; never select
 another subscription. `write_private` creates mode-0600 output. The private Nx
 launcher reuses the Azure configuration/process helpers, removes ambient
-`AZURE_*`/`ARROWCOL_*`, overlays validated isolated names, and sets
+stamp `AZURE_*`/`ARROWCOL_*` overrides while preserving Azure CLI
+`AZURE_CONFIG_DIR` and `AZURE_EXTENSION_DIR`, overlays validated isolated names, and sets
 `NX_LOAD_DOT_ENV_FILES=false`. This is necessary because root dotenv loading
 can override a private `--env-file`. Both provision and scenario still run their
 public Nx targets; the launcher does not substitute direct scenario execution.
