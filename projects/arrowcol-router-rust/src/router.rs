@@ -1,10 +1,9 @@
 use std::os::fd::RawFd;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrowcol_protocol::{
-    CATALOG_METADATA_KEY, CLAIMED_SCHEMA_FINGERPRINT_METADATA_KEY, ErrorCode, ErrorStatus,
+    CATALOG_METADATA_KEY, CLAIMED_SCHEMA_FINGERPRINT_METADATA_KEY,
     IMPLEMENTATION_POOL_METADATA_KEY, ImplementationPool, IngestMetadata, PROTOCOL_VERSION_METADATA_KEY,
     RawGrpcMetadata, SCHEMA_METADATA_KEY, TABLE_METADATA_KEY, UnixMillis,
 };
@@ -626,92 +625,6 @@ fn ascii_header<'a>(headers: &'a http::HeaderMap, key: &str) -> Result<Option<&'
         .transpose()
 }
 
-async fn write_api_error(
-    session: &mut Session,
-    status: StatusCode,
-    code: ErrorCode,
-    message: &str,
-) -> pingora::Result<()> {
-    write_json(
-        session,
-        status,
-        &ApiErrorResponse {
-            error: public_error(code, message),
-        },
-    )
-    .await
-}
-
-fn public_error(code: ErrorCode, message: &str) -> ErrorStatus {
-    match ErrorStatus::new(code, sanitize_public_message(message)) {
-        Ok(error) => error,
-        Err(_) => match ErrorStatus::new(ErrorCode::Internal, "internal router error") {
-            Ok(error) => error,
-            Err(_) => unreachable!("static public error is valid"),
-        },
-    }
-}
-
-fn sanitize_public_message(message: &str) -> String {
-    let mut output: String = message
-        .chars()
-        .map(|character| if character.is_control() { ' ' } else { character })
-        .take(1_024)
-        .collect();
-    if output.is_empty() {
-        output.push_str("router request failed");
-    }
-    output
-}
-
-async fn write_grpc_error(session: &mut Session, grpc_status: u16, message: &str) -> pingora::Result<()> {
-    let mut response = ResponseHeader::build(200, Some(5))?;
-    response.insert_header("content-type", "application/grpc")?;
-    response.insert_header("grpc-status", grpc_status.to_string())?;
-    response.insert_header("grpc-message", grpc_message(message))?;
-    response.insert_header("cache-control", "no-store")?;
-    response.insert_header("x-content-type-options", "nosniff")?;
-    session.write_response_header(Box::new(response), true).await
-}
-
-async fn write_json<T: Serialize>(session: &mut Session, status: StatusCode, value: &T) -> pingora::Result<()> {
-    let body = serde_json::to_vec(value)
-        .map_err(|cause| Error::because(ErrorType::InternalError, "serialize JSON response", cause))?;
-    write_bytes(session, status, "application/json", body).await
-}
-
-async fn write_bytes(
-    session: &mut Session,
-    status: StatusCode,
-    content_type: &str,
-    body: Vec<u8>,
-) -> pingora::Result<()> {
-    let mut response = ResponseHeader::build(status.as_u16(), Some(5))?;
-    response.insert_header("content-type", content_type)?;
-    response.insert_header("content-length", body.len().to_string())?;
-    response.insert_header("cache-control", "no-store")?;
-    response.insert_header("x-content-type-options", "nosniff")?;
-    session
-        .write_response_header(Box::new(response), body.is_empty())
-        .await?;
-    if !body.is_empty() {
-        session.write_response_body(Some(Bytes::from(body)), true).await?;
-    }
-    Ok(())
-}
-
-fn grpc_message(message: &str) -> String {
-    let mut encoded = String::new();
-    for byte in sanitize_public_message(message).bytes() {
-        if matches!(byte, b' '..=b'~') && byte != b'%' {
-            encoded.push(char::from(byte));
-        } else {
-            encoded.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    encoded
-}
-
 fn routing_reason(kind: RoutingErrorKind) -> &'static str {
     match kind {
         RoutingErrorKind::InvalidConfiguration => "invalid_configuration",
@@ -757,25 +670,6 @@ fn auth_grpc_status(kind: AuthFailureKind) -> u16 {
     }
 }
 
-fn auth_http_status(kind: AuthFailureKind) -> StatusCode {
-    match kind {
-        AuthFailureKind::Forbidden => StatusCode::FORBIDDEN,
-        AuthFailureKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
-        AuthFailureKind::Missing | AuthFailureKind::Invalid | AuthFailureKind::ForgedInternalIdentity => {
-            StatusCode::UNAUTHORIZED
-        }
-    }
-}
-
-fn auth_error_code(kind: AuthFailureKind) -> ErrorCode {
-    match kind {
-        AuthFailureKind::Missing => ErrorCode::AuthenticationMissing,
-        AuthFailureKind::Forbidden => ErrorCode::AuthenticationForbidden,
-        AuthFailureKind::Invalid | AuthFailureKind::ForgedInternalIdentity => ErrorCode::AuthenticationInvalid,
-        AuthFailureKind::Internal => ErrorCode::Internal,
-    }
-}
-
 fn now_unix_millis() -> anyhow::Result<UnixMillis> {
     let millis = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
     Ok(UnixMillis::new(u64::try_from(millis)?)?)
@@ -796,13 +690,8 @@ struct ReadinessResponse {
 struct CapabilitiesResponse {
     protocol_version: u16,
     transparent_flight_data: bool,
-    receipt_status: bool,
-    bounded_receipt_batch: usize,
     flight_sql_control_metadata: &'static str,
     identity_propagation: &'static str,
 }
 
 #[derive(Serialize)]
-struct ApiErrorResponse {
-    error: ErrorStatus,
-}
