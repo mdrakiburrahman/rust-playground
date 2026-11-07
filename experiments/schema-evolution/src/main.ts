@@ -144,8 +144,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   const generate = async (version: number, ctx: StageContext) => {
     await command(binary('arrowcol-sdk-gen'), ['generate', '--catalog-endpoint', endpoint,
       '--ddl', `experiments/schema-evolution/fixtures/${version === 1 ? 'create' : 'alter'}.sql`,
-      '--table', 'schema_evolution.public.foo', '--out', sdk(version),
-      '--export-artifacts', path.join(out, `catalog-v${version}`)], ctx, env);
+      '--table', 'schema_evolution.public.foo', '--out', path.relative(WORKSPACE, sdk(version)),
+      '--export-artifacts', path.relative(WORKSPACE, path.join(out, `catalog-v${version}`))], ctx, env);
   };
   const fetchSnapshot = async (ctx: StageContext): Promise<Snapshot> => {
     if (azure) {
