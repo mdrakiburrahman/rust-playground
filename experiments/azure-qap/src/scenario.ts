@@ -1,4 +1,4 @@
-import { anchorMinute, checkMutation, trialName, type Fixtures, type SourceDelta } from './fixtures.js';
+import { anchorMinute, checkMutation, trialName, type Fixtures, type Snapshot, type SourceDelta } from './fixtures.js';
 import { describeSample, kql, ready, retainedExtentRows, unacceleratedRows, type AccelerationSample, type Kusto,
   type Target } from './kusto.js';
 import { formatDuration, MIB, type Operation, type Profile } from './profile.js';
@@ -17,8 +17,9 @@ export const systemClock: Clock = {
   now: () => Date.now(),
   sleep: (ms, signal) => new Promise((resolve, reject) => {
     signal.throwIfAborted();
-    const timer = setTimeout(resolve, ms);
-    signal.addEventListener('abort', () => { clearTimeout(timer); reject(signal.reason); }, { once: true });
+    const onAbort = () => { clearTimeout(timer); reject(signal.reason); };
+    const timer = setTimeout(() => { signal.removeEventListener('abort', onAbort); resolve(); }, ms);
+    signal.addEventListener('abort', onAbort, { once: true });
   }),
 };
 
@@ -166,6 +167,7 @@ export interface TrialEnvironment {
   record: (trial: string, kind: string, data: unknown) => void;
   /** Registers a Kusto table for cleanup before it is created. */
   created: (table: string) => void;
+  inspectionTarget?: (trial: Trial, after: Snapshot) => void;
 }
 
 function mib(bytes: number): string {
@@ -286,6 +288,7 @@ export async function runTrial(env: TrialEnvironment, trial: Trial): Promise<Tri
     const retained = retainedExtentRows(extentsBefore, extentsAfter, untouched);
     result.extents = { untouchedRows: retained.before, keptRows: retained.kept, unacceleratedRows: unacceleratedRows(extentsAfter) };
     await kusto.parity(trial.table, after.expectedGroups, signal);
+    env.inspectionTarget?.(trial, after);
     say(`QAP recovered ${formatDuration(result.recoveryMs)} after the mutation (${result.regressions} regression(s)). ` +
       `Untouched partitions kept ${retained.kept}/${retained.before} rows in their original extents; parity OK.`);
   } catch (error) {

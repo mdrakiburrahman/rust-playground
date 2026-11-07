@@ -40,7 +40,7 @@ test('CLI flags override scenario.json without mutating the defaults', () => {
   assert.equal(options.out, 'out/dir');
   assert.deepEqual(defaults.operations, ['optimize', 'purge', 'vacuum', 'reload']);
   assert.deepEqual(parseOptions([], defaults), { profile: defaults, env: '.env', out: undefined, kubernetes: false,
-    kubernetesConfig: 'infra/kubernetes/azure-qap.yaml', help: false });
+    kubernetesConfig: 'infra/kubernetes/azure-qap.yaml', keepRunning: false, inspectionMs: 3600_000, help: false });
 });
 
 test('the documented long run needs --budget 1h because its tails alone exceed the 15m default', () => {
@@ -83,9 +83,9 @@ test('--help skips validation and documents every flag with its default', () => 
   assert.equal(parseOptions(['-h'], defaults).help, true);
   const text = helpText(defaults);
   for (const flag of ['--operations', '--files', '--file-mib', '--repetitions', '--parallel', '--tail', '--log-wait', '--budget',
-    '--env', '--out', '--help'])
+    '--env', '--out', '--keep-running', '--inspection-duration', '--help'])
     assert.match(text, new RegExp(`${flag}\\b`));
-  assert.doesNotMatch(text, /--keep/);
+  assert.match(text, /actively read QAP health\/parity every 30s/);
   assert.match(text, /Cleanup always runs/);
   assert.match(text, /positive control/);
   assert.match(text, /default 2m\)/);
@@ -94,7 +94,7 @@ test('--help skips validation and documents every flag with its default', () => 
 
 test('Kubernetes mode accepts a config path and requires the mode flag', () => {
   assert.deepEqual(parseOptions(['--kubernetes'], defaults), { profile: defaults, env: '.env', out: undefined,
-    kubernetes: true, kubernetesConfig: 'infra/kubernetes/azure-qap.yaml', help: false });
+    kubernetes: true, kubernetesConfig: 'infra/kubernetes/azure-qap.yaml', keepRunning: false, inspectionMs: 3600_000, help: false });
   assert.equal(parseOptions(['--kubernetes', '--kubernetes-config', 'config/aks.yaml'], defaults).kubernetesConfig,
     'config/aks.yaml');
   assert.throws(() => parseOptions(['--kubernetes-config', 'config/aks.yaml'], defaults),

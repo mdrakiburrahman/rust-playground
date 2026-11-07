@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
+import { rehearsalAksArgs } from '../src/qap-rehearsal.js';
 
 const script = path.resolve('tools/scripts/src/qap-rehearsal.ts');
 const subscription = '11111111-2222-3333-4444-555555555555';
@@ -22,7 +23,8 @@ test('real CLI runs ordered rehearsal and rechecks both reports; failures stop i
   fs.writeFileSync(path.join(fixture, 'package.json'), '{"type":"commonjs"}');
   fs.writeFileSync(path.join(root, '.env'), 'private-test-value');
   fs.writeFileSync(path.join(root, 'infra/azure/stamp.yaml'), `subscription: ${subscription}\nstamp: 1\nresourceGroup: arrow-collector-rg\naks:\n  namespace: arrow-collector\n  systemPool:\n    vmSize: old\n`);
-  fs.writeFileSync(path.join(root, 'infra/kubernetes/azure-qap.example.yaml'), 'image: example\n');
+  fs.writeFileSync(path.join(root, 'infra/kubernetes/azure-qap.example.yaml'),
+    'image: example\nresources:\n  requests:\n    cpu: 1\n    memory: 2Gi\n  limits:\n    cpu: 2\n    memory: 4Gi\n');
   const fake = `#!/usr/bin/env node
 const fs = require('node:fs'), path = require('node:path');
 const cmd = path.basename(process.argv[1]), args = process.argv.slice(2);
@@ -45,12 +47,14 @@ if (cmd === 'npx' && args.includes('azure-qap-experiment:run')) {
   const warm={files:2,bytes:20,requests:2,paths:['a.parquet','b.parquet']};
   const after={files:2,bytes:20,requests:2,paths:['a.parquet','b.parquet']};
   const trials=['optimize','purge','vacuum','reload'].map(operation=>({trial:operation,operation,status:'complete',telemetry:'complete',files:{unchanged:2},reads:{warmUp:warm,afterMutation:after,unchanged:operation==='reload'?after:{files:0,bytes:0,requests:0,paths:[]}}}));
-  fs.writeFileSync(path.join(dir,'report.json'),JSON.stringify({runId:'20261107t123456_abcd',trials,control:{status:'detected'},cleanup:{status:'done',errors:[]},exitCode:0}));
+  const retained=args.includes('--keep-running');
+  const deadline='2026-11-07T20:00:00Z';
+  fs.writeFileSync(path.join(dir,'report.json'),JSON.stringify({runId:'20261107t123456_abcd',trials,control:{status:'detected'},cleanup:{status:retained?'retained':'done',errors:[]},exitCode:0,...(retained?{inspection:{mode:'read-only',deadline}}:{})}));
   fs.writeFileSync(path.join(dir,'report.md'),'report');
   fs.writeFileSync(path.join(dir,'evidence.jsonl'),'{}');
   for(const t of trials) fs.writeFileSync(path.join(dir,'queries',t.trial+'.yaml'),'query');
   fs.mkdirSync(path.join(dir,'http-traces'));
-  if(args.includes('--kubernetes')) fs.writeFileSync(path.join(dir,'kubernetes-job.json'),JSON.stringify({jobName:process.env.QAP_FAKE_JOB,namespace:'arrow-collector'}));
+  if(args.includes('--kubernetes')) fs.writeFileSync(path.join(dir,'kubernetes-job.json'),JSON.stringify({jobName:process.env.QAP_FAKE_JOB,namespace:'arrow-collector',...(retained?{version:1,mode:'read-only-inspection',context:null,pod:process.env.QAP_FAKE_JOB+'-abcde',podUid:process.env.QAP_FAKE_SUB,resources:Object.fromEntries(['job/'+process.env.QAP_FAKE_JOB,'configmap/'+process.env.QAP_FAKE_JOB+'-env','secret/'+process.env.QAP_FAKE_JOB+'-secret'].map(name=>[name,process.env.QAP_FAKE_SUB])),runId:'20261107t123456_abcd',inspectionDeadline:deadline}:{})}));
 }
 if (cmd === 'npx' && args.includes('experiments/azure-qap/src/read-logs.ts')) {
   const rows=['warm-up','after-mutation'].flatMap(phase=>['a.parquet','b.parquet'].map(path=>({phase,path,operation:'GetBlob',status:206,bytes:10,requests:1,last:'2026-01-01',userAgent:''})));
@@ -59,6 +63,9 @@ if (cmd === 'npx' && args.includes('experiments/azure-qap/src/read-logs.ts')) {
   console.log(JSON.stringify(rows));
 }
 if (cmd === 'kubectl' && args.includes('-o') && args.includes('json')) {
+  if(args[1].includes('/')) {
+    console.log(JSON.stringify({metadata:{name:args[1].split('/')[1],namespace:'arrow-collector',uid:process.env.QAP_FAKE_SUB,labels:{'app.kubernetes.io/name':'azure-qap',run:process.env.QAP_FAKE_JOB},ownerReferences:[{kind:'Job',uid:process.env.QAP_FAKE_SUB}]}})); return;
+  }
   const legacy=!args.includes('--selector');
   console.log(JSON.stringify({items:legacy && process.env.QAP_LEGACY_OBJECT && args.includes(process.env.QAP_LEGACY_OBJECT) ? [{metadata:{name:'azure-qap-unrelated-active'}}] : !legacy && process.env.QAP_POD ? [{}] : []}));
 }
@@ -203,7 +210,30 @@ if (cmd === 'kubectl' && args.includes('job/'+process.env.QAP_FAKE_JOB) && proce
     const failedCollect = cli(['collect', '--subscription', subscription, '--evidence-dir', `${output}-failed`]);
     assert.notEqual(failedCollect.status, 0);
     assert.notEqual(JSON.parse(fs.readFileSync(path.join(`${output}-failed`, 'receipt.json'), 'utf8')).stage, 'complete');
+    fs.rmSync(path.join(root, '.env.azure'));
+    fs.rmSync(path.join(root, '.temp'), { recursive: true });
+    fs.rmSync(log);
+    const retained = cli(['run', '--subscription', subscription, '--expected-sha', sha,
+      '--evidence-dir', `${output}-retained`, '--keep-running', '--inspection-duration', '10m']);
+    assert.equal(retained.status, 0, retained.stderr);
+    const retainedReceipt = JSON.parse(fs.readFileSync(path.join(`${output}-retained`, 'receipt.json'), 'utf8'));
+    assert.equal(retainedReceipt.evidence.cleanupVerification, 'retained-read-only-not-cleaned');
+    assert.equal(retainedReceipt.retention.cleanup, 'not-yet-verified');
+    assert.match(retainedReceipt.retention.cleanupCommand, /cleanup --receipt .*aks.*kubernetes-job.json/);
+    calls = fs.readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line) as string[]);
+    const retainedRuns = calls.filter(call => call.includes('azure-qap-experiment:run'));
+    assert.equal(retainedRuns[0].includes('--keep-running'), false);
+    assert.equal(retainedRuns[1].includes('--keep-running'), true);
+    assert.ok(retainedRuns[1].includes('10m'));
+    assert.equal(calls.some(call => call.includes('--ignore-not-found=true')), false);
+    assert.match(retained.stdout, /Cleanup verification intentionally skipped/);
   } finally {
     fs.rmSync(fixture, { recursive: true, force: true });
   }
+});
+
+test('rehearsal forwards inspection only to the AKS phase and leaves default arguments unchanged', () => {
+  const common = ['--operations', 'optimize,purge,vacuum,reload'];
+  assert.deepEqual(rehearsalAksArgs(common, false), common);
+  assert.deepEqual(rehearsalAksArgs(common, true, '10m'), [...common, '--keep-running', '--inspection-duration', '10m']);
 });

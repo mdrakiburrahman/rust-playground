@@ -37,6 +37,8 @@ export interface Options {
   out?: string;
   kubernetes: boolean;
   kubernetesConfig: string;
+  keepRunning: boolean;
+  inspectionMs: number;
   help: boolean;
 }
 
@@ -153,6 +155,8 @@ export function parseOptions(argv: readonly string[], defaults: Profile): Option
     out: { type: 'string' },
     kubernetes: { type: 'boolean', default: false },
     'kubernetes-config': { type: 'string' },
+    'keep-running': { type: 'boolean', default: false },
+    'inspection-duration': { type: 'string' },
     help: { type: 'boolean', short: 'h', default: false },
   } });
   const profile: Profile = { ...defaults, operations: [...defaults.operations] };
@@ -168,8 +172,16 @@ export function parseOptions(argv: readonly string[], defaults: Profile): Option
     throw new Error('--kubernetes-config requires --kubernetes.');
   if (!values.help && values.kubernetes && !profile.operations.includes('reload'))
     throw new Error('AKS mode requires the reload positive control to verify actual ADX read attribution.');
+  const inspectionMs = parseDuration(values['inspection-duration'] ?? '1h', '--inspection-duration');
+  if (!values.help && (inspectionMs < MINUTE || inspectionMs > HOUR))
+    throw new Error('--inspection-duration must be between 1m and 1h.');
+  if (!values.help && values['inspection-duration'] && !values['keep-running'])
+    throw new Error('--inspection-duration requires --keep-running.');
+  if (!values.help && values['keep-running'] && !profile.operations.includes('reload'))
+    throw new Error('--keep-running requires reload and complete read telemetry before inspection.');
   return { profile: values.help ? profile : validateProfile(profile), env: values.env, out: values.out,
     kubernetes: values.kubernetes, kubernetesConfig: values['kubernetes-config'] ?? 'infra/kubernetes/azure-qap.yaml',
+    keepRunning: values['keep-running'], inspectionMs,
     help: values.help };
 }
 
@@ -199,9 +211,15 @@ Options (defaults from experiments/azure-qap/scenario.json):
   --out <dir>          report directory (default .temp/experiments/azure-qap/<runId>)
   --kubernetes         run the full experiment as an AKS Job instead of in this devcontainer
   --kubernetes-config <yaml>  Kustomize/Job settings (default infra/kubernetes/azure-qap.yaml)
+  --keep-running      after successful trials, retain fixtures and actively read QAP health/parity every 30s
+  --inspection-duration <dur>  bounded read-only inspection, 1m..1h (default 1h); then scoped cleanup
   -h, --help           show this help
 
 Durations accept 90s, 2m, 1h, 1h30m or bare seconds.
+Without --keep-running, cleanup is immediate. With it, AKS returns an inspection-ready
+report and an owned kubernetes-job.json receipt; the Job continues real read-only
+observations until the printed deadline or receipt-scoped cleanup. Devcontainer mode
+stays attached for inspection. Trials never continue mutating during inspection.
 Cleanup always runs, also on failure and Ctrl+C: the run's Kusto tables are dropped and
 its fixture directory runs/<runId>/ is deleted. Copy the printed KQL to explore while it runs.
 Exit code is nonzero on errors, failed trials, failed cleanup, or when an included reload

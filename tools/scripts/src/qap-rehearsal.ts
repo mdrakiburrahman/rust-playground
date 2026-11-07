@@ -6,6 +6,10 @@ import { fileURLToPath } from 'node:url';
 import { parseDocument } from 'yaml';
 import { runStreamingTree } from './process.js';
 import { bodyReads, type ReadGroup, type ReadSummary } from '../../../experiments/azure-qap/src/storage-reads.js';
+import { Config, load_env } from '../../../infra/azure/bootstrap.js';
+import { parseKubernetesConfig } from '../../../experiments/azure-qap/src/kubernetes.js';
+import { cleanupRetainedJob, parseRetainedReceipt, validateOwnedMetadata } from '../../../experiments/azure-qap/src/retained-job.js';
+import { parseDuration } from '../../../experiments/azure-qap/src/profile.js';
 
 const GROUP = 'arrow-collector-rg';
 const OPERATIONS = ['optimize', 'purge', 'vacuum', 'reload'] as const;
@@ -34,7 +38,7 @@ interface Trial {
   operation: string;
   reads: { warmUp: ReadSummary; afterMutation: ReadSummary; unchanged: ReadSummary };
 }
-interface Report { runId: string; trials: Trial[] }
+interface Report { runId: string; trials: Trial[]; inspection?: { deadline: string } }
 function summary(value: unknown): ReadSummary {
   const raw = record(value, 'read summary');
   if (!Number.isSafeInteger(raw.files) || Number(raw.files) < 0 || !Number.isSafeInteger(raw.bytes) ||
@@ -98,14 +102,14 @@ function createEvidenceDir(value: string): string {
   return result;
 }
 
-function report(directory: string): Report {
+function report(directory: string, retained = false): Report {
   for (const filename of ['report.json', 'report.md', 'evidence.jsonl']) requireFile(path.join(directory, filename));
   const value = record(json(fs.readFileSync(path.join(directory, 'report.json'), 'utf8'), 'report'), 'report');
   const control = record(value.control, 'positive control');
   const cleanup = record(value.cleanup, 'cleanup');
   if (typeof value.runId !== 'string' || !/^[a-z0-9_-]+$/.test(value.runId) || value.exitCode !== 0 ||
       value.interrupted || value.error || control.status !== 'detected' ||
-      cleanup.status !== 'done' || !Array.isArray(cleanup.errors) || cleanup.errors.length ||
+      cleanup.status !== (retained ? 'retained' : 'done') || !Array.isArray(cleanup.errors) || cleanup.errors.length ||
       !Array.isArray(value.trials) || value.trials.length !== OPERATIONS.length)
     throw new Error(`Incomplete report or cleanup: ${directory}`);
   const trials: Trial[] = [];
@@ -129,6 +133,13 @@ function report(directory: string): Report {
     trials.push({ trial: operation, operation, reads: { unchanged, warmUp, afterMutation } });
   }
   if (!fs.statSync(path.join(directory, 'http-traces')).isDirectory()) throw new Error('Missing HTTP traces.');
+  if (retained) {
+    const inspection = record(value.inspection, 'read-only inspection');
+    if (inspection.mode !== 'read-only' || typeof inspection.deadline !== 'string' ||
+        !Number.isFinite(Date.parse(inspection.deadline)))
+      throw new Error('Retained report does not include a bounded read-only inspection deadline.');
+    return { runId: value.runId, trials, inspection: { deadline: inspection.deadline } };
+  }
   return { runId: value.runId, trials };
 }
 
@@ -149,7 +160,7 @@ function validateTree(source: string): void {
   if (stat.isDirectory()) for (const entry of fs.readdirSync(source)) validateTree(path.join(source, entry));
 }
 
-async function collect(subscription: string, destination: string, legacy: boolean, jobOverride?: string): Promise<{
+async function collect(subscription: string, destination: string, legacy: boolean, jobOverride?: string, retained = false): Promise<{
   devcontainerRunId: string; aksRunId: string; jobName?: string; cleanupVerification: string; namespace: string; archiveSha256: string;
 }> {
   const info = stamp(subscription);
@@ -158,7 +169,7 @@ async function collect(subscription: string, destination: string, legacy: boolea
     if (fs.realpathSync(directory) !== path.resolve(directory)) throw new Error('Report path contains a symlink.');
     for (const name of ['report.json', 'report.md', 'evidence.jsonl', 'queries', 'http-traces']) validateTree(path.join(directory, name));
   }
-  const reports = directories.map(report);
+  const reports = directories.map((directory, index) => report(directory, retained && index === 1));
   const sidecar = path.join(directories[1], 'kubernetes-job.json');
   if (legacy && fs.existsSync(sidecar)) throw new Error('Legacy cleanup inventory is only for reports without a Kubernetes job receipt.');
   let owned: Record<string, unknown> = {};
@@ -187,7 +198,27 @@ async function collect(subscription: string, destination: string, legacy: boolea
       fs.writeFileSync(path.join(rechecks, `${trial.trial}.json`), output, { mode: 0o600 });
     }
   }
-  if (legacy) {
+  if (retained) {
+    const config = parseKubernetesConfig(fs.readFileSync('infra/kubernetes/azure-qap.yaml', 'utf8'));
+    const receipt = parseRetainedReceipt(owned, info.namespace, config.context);
+    if (receipt.runId !== reports[1].runId || receipt.inspectionDeadline !== reports[1].inspection?.deadline)
+      throw new Error('Retained receipt does not match the successful inspection report.');
+    const context = config.context ? ['--context', config.context] : [];
+    for (const [name, uid] of Object.entries(receipt.resources)) {
+      const live = json(await command('kubectl', [...context, 'get', name, '-n', info.namespace, '-o', 'json'], 60_000), name);
+      validateOwnedMetadata(live, name.split('/')[1]!, info.namespace, receipt.jobName, uid);
+    }
+    const pod = record(json(await command('kubectl', [...context, 'get', `pod/${receipt.pod}`, '-n', info.namespace,
+      '-o', 'json'], 60_000), 'owned Pod'), 'owned Pod');
+    validateOwnedMetadata(pod, receipt.pod, info.namespace, receipt.jobName, receipt.podUid);
+    const owners = record(pod.metadata, 'Pod metadata').ownerReferences;
+    if (!Array.isArray(owners) || !owners.some(owner => record(owner, 'Pod owner').kind === 'Job' &&
+        record(owner, 'Pod owner').uid === receipt.resources[`job/${receipt.jobName}`]))
+      throw new Error('Retained Pod does not belong to the receipt Job.');
+    await command('kubectl', [...context, 'exec', '--container', 'experiment', '-n', info.namespace, receipt.pod,
+      '--', 'test', '-f', '/artifacts/inspection-ready'], 30_000);
+    console.log(`Cleanup verification intentionally skipped: retained read-only inspection until ${receipt.inspectionDeadline}.`);
+  } else if (legacy) {
     for (const resource of ['jobs', 'pods', 'configmaps', 'secrets']) {
       const inventory = record(json(await command('kubectl', ['get', resource, '-n', info.namespace, '-o', 'json'], 60_000),
         `Kubernetes ${resource}`), `Kubernetes ${resource}`);
@@ -226,7 +257,8 @@ async function collect(subscription: string, destination: string, legacy: boolea
   });
   fs.writeFileSync(path.join(destination, 'SHA256SUMS'), `${hash}  evidence.tar\n`, { mode: 0o600 });
   return { devcontainerRunId: reports[0].runId, aksRunId: reports[1].runId,
-    ...(job ? { jobName: job } : {}), cleanupVerification: legacy ? 'legacy-prefix-inventory' : 'exact-job',
+    ...(job ? { jobName: job } : {}), cleanupVerification: retained ? 'retained-read-only-not-cleaned' :
+      legacy ? 'legacy-prefix-inventory' : 'exact-job',
     namespace: info.namespace, archiveSha256: hash };
 }
 
@@ -234,18 +266,40 @@ async function main(): Promise<void> {
   const { positionals, values } = parseArgs({ allowPositionals: true, options: {
     subscription: { type: 'string' }, 'expected-sha': { type: 'string' },
     'evidence-dir': { type: 'string' }, 'job-name': { type: 'string' }, 'legacy-cleanup-inventory': { type: 'boolean' },
+    'keep-running': { type: 'boolean', default: false }, 'inspection-duration': { type: 'string' },
+    receipt: { type: 'string' },
   } });
   const mode = positionals[0];
+  if (mode === 'cleanup') {
+    if (positionals.length !== 1 || !values.receipt || values.subscription || values['expected-sha'] ||
+        values['evidence-dir'] || values['job-name'] || values['legacy-cleanup-inventory'] ||
+        values['keep-running'] || values['inspection-duration'])
+      throw new Error('Usage: qap-rehearsal.ts cleanup --receipt <owned-kubernetes-job.json>');
+    requireFile(values.receipt);
+    const receipt = json(fs.readFileSync(values.receipt, 'utf8'), 'retained Job receipt');
+    const config = parseKubernetesConfig(fs.readFileSync('infra/kubernetes/azure-qap.yaml', 'utf8'));
+    const env = { ...load_env('.env'), ...load_env('.env.azure'), ...process.env };
+    const azure = new Config(env as Record<string, string>);
+    const context = config.context ? ['--context', config.context] : [];
+    await cleanupRetainedJob({ receipt, namespace: azure.kubernetesNamespace, context: config.context,
+      output: path.join(path.dirname(path.resolve(values.receipt)), 'final'),
+      kubectl: (args, timeout = 120) => command('kubectl', [...context, ...args], timeout * 1000) });
+    return;
+  }
+  const inspectionMs = parseDuration(values['inspection-duration'] ?? '1h', '--inspection-duration');
   if (positionals.length !== 1 || (mode !== 'run' && mode !== 'collect') ||
       !values.subscription || !UUID.test(values.subscription) || !values['evidence-dir'] ||
       (mode === 'run' && (!values['expected-sha'] || !SHA.test(values['expected-sha']))) ||
       (mode === 'collect' && values['expected-sha']) || (mode === 'run' && (values['job-name'] || values['legacy-cleanup-inventory'])) ||
-      (values['job-name'] && values['legacy-cleanup-inventory']))
-    throw new Error('Usage: qap-rehearsal.ts run --subscription <UUID> --expected-sha <sha> --evidence-dir <absolute-new-dir> | collect --subscription <UUID> --evidence-dir <absolute-new-dir> [--job-name <owned-job> | --legacy-cleanup-inventory]');
+      (values['job-name'] && values['legacy-cleanup-inventory']) || values.receipt ||
+      (values['keep-running'] && (values['job-name'] || values['legacy-cleanup-inventory'])) ||
+      (values['inspection-duration'] && !values['keep-running']) || inspectionMs < 60_000 || inspectionMs > 3600_000)
+    throw new Error('Usage: qap-rehearsal.ts run --subscription <UUID> --expected-sha <sha> --evidence-dir <absolute-new-dir> [--keep-running --inspection-duration 1h] | collect --subscription <UUID> --evidence-dir <absolute-new-dir> [--keep-running | --job-name <owned-job> | --legacy-cleanup-inventory] | cleanup --receipt <owned-kubernetes-job.json>');
   if (process.platform === 'win32') throw new Error('Run and collect must execute in the Linux devcontainer.');
   const subscription = values.subscription;
   const destination = createEvidenceDir(values['evidence-dir']);
   const receipt: Record<string, unknown> = { mode, subscription, stage: 'preflight', startedAt: new Date().toISOString() };
+  if (values['keep-running']) receipt.retention = { mode: 'read-only-inspection', inspectionMs, cleanup: 'not-yet-verified' };
   const save = () => fs.writeFileSync(path.join(destination, 'receipt.json'), JSON.stringify(receipt, null, 2) + '\n', { mode: 0o600 });
   const stage = (name: string) => { receipt.stage = name; save(); console.log(`QAP rehearsal: ${name}`); };
   try {
@@ -297,7 +351,8 @@ async function main(): Promise<void> {
       await command('npx', ['nx', 'run', 'azure-qap-experiment:run', '--', ...common, '--out', `${OUTPUT}/devcontainer`], 60 * 60_000, false);
       stage('aks');
       await command('npx', ['nx', 'run', 'azure-qap-experiment:run', '--', '--kubernetes', '--kubernetes-config',
-        'infra/kubernetes/azure-qap.yaml', ...common, '--out', `${OUTPUT}/aks`], 60 * 60_000, false, line => {
+        'infra/kubernetes/azure-qap.yaml', ...rehearsalAksArgs(common, values['keep-running'],
+          values['inspection-duration'] ?? '1h'), '--out', `${OUTPUT}/aks`], 60 * 60_000, false, line => {
         const match = /Kubernetes job: (azure-qap-[0-9]{14}-[a-f0-9]{8}) namespace: ([a-z0-9-]+)/.exec(line);
         if (match && match[2] === info.namespace) {
           receipt.kubernetesJob = match[1]; save();
@@ -306,7 +361,14 @@ async function main(): Promise<void> {
       });
     }
     stage('collect');
-    receipt.evidence = await collect(subscription, destination, Boolean(values['legacy-cleanup-inventory']), values['job-name']);
+    receipt.evidence = await collect(subscription, destination, Boolean(values['legacy-cleanup-inventory']),
+      values['job-name'], values['keep-running']);
+    if (values['keep-running']) {
+      const owned = record(json(fs.readFileSync(`${OUTPUT}/aks/kubernetes-job.json`, 'utf8'), 'owned receipt'), 'owned receipt');
+      receipt.retention = { mode: 'read-only-inspection', deadline: owned.inspectionDeadline, cleanup: 'not-yet-verified',
+        cleanupCommand: `npx --no-install tsx tools/scripts/src/qap-rehearsal.ts cleanup --receipt ${path.join(destination, 'aks/kubernetes-job.json')}` };
+      console.log(`Read-only inspection deadline: ${owned.inspectionDeadline}. Cleanup: ${(receipt.retention as Record<string, unknown>).cleanupCommand}`);
+    }
     receipt.stage = 'complete';
     receipt.finishedAt = new Date().toISOString(); receipt.exitCode = 0; save();
     const receiptHash = createHash('sha256').update(fs.readFileSync(path.join(destination, 'receipt.json'))).digest('hex');
@@ -320,6 +382,10 @@ async function main(): Promise<void> {
     save();
     throw error;
   }
+}
+
+export function rehearsalAksArgs(common: readonly string[], keepRunning: boolean, duration = '1h'): string[] {
+  return [...common, ...(keepRunning ? ['--keep-running', '--inspection-duration', duration] : [])];
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

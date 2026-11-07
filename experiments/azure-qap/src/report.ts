@@ -48,7 +48,7 @@ export function positiveControl(trials: TrialResult[]): Control {
     `${trial.files!.unchanged} files`).join('; ') + ': Azure Monitor read logs capture QAP reads.' };
 }
 
-export type CleanupStatus = 'done' | 'failed' | 'nothing';
+export type CleanupStatus = 'done' | 'failed' | 'nothing' | 'retained';
 export interface Cleanup { status: CleanupStatus; errors: string[] }
 
 export interface RunReport {
@@ -62,6 +62,7 @@ export interface RunReport {
   trials: TrialResult[];
   control: Control;
   cleanup: Cleanup;
+  inspection?: { mode: 'read-only'; deadline: string; tables: string[] };
   interrupted: boolean;
   error?: string;
   exitCode: number;
@@ -181,6 +182,8 @@ export function renderMarkdown(report: RunReport, out: string): string {
     '- *Regressions*: times QAP looked caught up and then fell behind again.',
     '',
     `## Cleanup: ${report.cleanup.status}`,
+    ...(report.inspection ? [`Read-only inspection deadline: ${report.inspection.deadline}. ` +
+      'Retained is a handoff snapshot, not proof of cleanup; collect final artifacts with receipt-scoped cleanup.'] : []),
     '',
     ...report.cleanup.errors.map(error => `- ${error}`),
     '',

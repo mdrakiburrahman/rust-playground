@@ -341,9 +341,13 @@ also restarts a tail. The quick command needs no override.
 | `--budget <dur>` | `15m` | Hard cap for all trials, log wait included; cleanup gets up to 5 more minutes |
 | `--env <file>` | `.env` | Env file with the sandbox settings |
 | `--out <dir>` | `.temp/experiments/azure-qap/<runId>` | Where the report and saved queries go |
+| `--keep-running` | Off | After complete trials and detected reload telemetry, retain run fixtures for active read-only health/parity inspection; AKS returns a receipt instead of waiting |
+| `--inspection-duration <dur>` | `1h` (1m to 1h) | Inspection bound, separate from trial budget; requires `--keep-running`, then scoped cleanup runs |
 | `-h`, `--help` | | Print the flags and exit |
 
 Bad flags exit with code 2 before anything is created.
+See [Bounded inspection and bug-bash handoff](INSPECTION.md) for rehearsal flags,
+the retained-report contract and receipt-scoped teardown.
 
 ### Phases
 
@@ -373,6 +377,9 @@ repetitions (`purge`, `purge_2`). Run IDs look like `20250102t030405_ab12`.
    saved query per trial in `queries/` plus `http-traces/` to `--out`. Queries
    use `.kql` for Log Analytics and `.yaml` for diagnostic-storage export.
 
+Default cleanup is immediate. `--keep-running` inserts bounded, active read-only
+inspection after successful trials; its initial report says `cleanup: retained`,
+not `done`. Cleanup still runs on the deadline, an inspection failure or TERM.
 Cleanup always runs, even when a phase fails or you press Ctrl+C. It drops every
 `qap_<runId>_<trial>` table and deletes `experimentqap/runs/<runId>/`, with up
 to 5 minutes beyond the budget. It prints manual cleanup commands only if it
