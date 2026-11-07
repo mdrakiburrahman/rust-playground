@@ -80,9 +80,9 @@
       "dependsOn": ["image"],
       "options": {
         "commands": [
-          "docker run --rm --platform linux/amd64 ghcr.io/mdrakiburrahman/rust-playground/arrowcol-catalog-rust:dev --help",
-          "docker run --rm --platform linux/amd64 --entrypoint sh ghcr.io/mdrakiburrahman/rust-playground/arrowcol-catalog-rust:dev -c 'test \"$(id -u)\" = 10001 && test \"$(stat -c %a:%u \"$AZURE_CONFIG_DIR\")\" = 700:10001 && test -z \"$(ls -A \"$AZURE_CONFIG_DIR\")\" && az version >/dev/null && test -x /usr/bin/tini'",
-          "set -eu; container=$(docker run --detach --rm --platform linux/amd64 --stop-signal SIGINT --stop-timeout 10 ghcr.io/mdrakiburrahman/rust-playground/arrowcol-catalog-rust:dev); trap 'docker stop \"$container\" >/dev/null' EXIT; for attempt in $(seq 1 30); do if docker exec \"$container\" /usr/local/bin/arrowcol-catalog-rust --healthcheck; then exit 0; fi; sleep 1; done; docker logs \"$container\"; exit 1"
+          "docker run --rm --platform linux/amd64 \"${CATALOG_IMAGE:-ghcr.io/mdrakiburrahman/rust-playground/arrowcol-catalog-rust:dev}\" --help",
+          "docker run --rm --platform linux/amd64 --entrypoint sh \"${CATALOG_IMAGE:-ghcr.io/mdrakiburrahman/rust-playground/arrowcol-catalog-rust:dev}\" -c 'test \"$(id -u)\" = 10001 && test \"$(stat -c %a:%u \"$AZURE_CONFIG_DIR\")\" = 700:10001 && test -z \"$(ls -A \"$AZURE_CONFIG_DIR\")\" && az version >/dev/null && test -x /usr/bin/tini'",
+          "set -eu; container=$(docker run --detach --platform linux/amd64 --stop-timeout 10 \"${CATALOG_IMAGE:-ghcr.io/mdrakiburrahman/rust-playground/arrowcol-catalog-rust:dev}\"); trap 'docker rm --force \"$container\" >/dev/null' EXIT; healthy=false; for attempt in $(seq 1 30); do if docker exec \"$container\" /usr/local/bin/arrowcol-catalog-rust --healthcheck; then healthy=true; break; fi; sleep 1; done; if [ \"$healthy\" != true ]; then docker logs \"$container\"; exit 1; fi; docker stop --time 10 \"$container\" >/dev/null; exit_code=$(docker wait \"$container\"); docker logs \"$container\"; test \"$exit_code\" = 0; docker logs \"$container\" 2>&1 | grep -F 'catalog publisher sessions drained and closed'"
         ],
         "parallel": false,
         "cwd": "{workspaceRoot}"

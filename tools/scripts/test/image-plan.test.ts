@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
@@ -391,4 +392,42 @@ test('integration previews push only immutable SHA tags without release aliases 
   const metadata = byName('Resolve branch and immutable tags');
   assert.equal(metadata.env?.REGISTRY_PREVIEW, "${{ github.ref == 'refs/heads/mdrakiburrahman-schema-catalog' }}");
   assert.match(metadata.run ?? '', /if \(process\.env\.REGISTRY_PREVIEW === "true"\) \{\s+tags\.values = \[tags\.shaTag\];\s+writeFileSync/u);
+});
+
+
+test('catalog smoke requires default SIGTERM, exit zero and the publisher close marker', () => {
+  const config = workspaceProjects()['arrowcol-catalog-rust'];
+  const commands = config.targets?.['image-smoke']?.options?.commands as string[];
+  assert(commands.every(command => command.includes('CATALOG_IMAGE')));
+  const command = commands.find(command => command.includes('docker stop --time 10'));
+  assert(command);
+  assert.doesNotMatch(command, /--stop-signal|--rm/u);
+  assert(command.includes('docker wait'));
+  assert(command.includes('docker rm --force'));
+  const mock = [
+    'docker() {',
+    'case "$1" in',
+    'run) echo smoke-container ;;',
+    'exec) return 0 ;;',
+    'stop) return "$SMOKE_STOP_STATUS" ;;',
+    'wait) echo "$SMOKE_EXIT_CODE" ;;',
+    'logs) echo "$SMOKE_LOG" ;;',
+    'rm) return 0 ;;',
+    '*) return 99 ;;',
+    'esac',
+    '}',
+  ].join('\n');
+  for (const [name, env, success] of [
+    ['graceful close', {}, true],
+    ['forced termination', { SMOKE_EXIT_CODE: '137' }, false],
+    ['missing publisher marker', { SMOKE_LOG: 'listener stopped' }, false],
+    ['stop failure', { SMOKE_STOP_STATUS: '1' }, false],
+  ] as const) {
+    const result: SpawnSyncReturns<string> = spawnSync('bash', ['-c', mock + '\n' + command], {
+      encoding: 'utf8',
+      env: { ...process.env, SMOKE_STOP_STATUS: '0', SMOKE_EXIT_CODE: '0', SMOKE_LOG: 'catalog publisher sessions drained and closed', ...env, CATALOG_IMAGE: 'ghcr.io/example/catalog@sha256:' + 'a'.repeat(64) },
+      timeout: 5000,
+    });
+    assert.equal(result.status === 0, success, name + ': ' + result.stderr);
+  }
 });

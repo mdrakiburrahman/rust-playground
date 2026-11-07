@@ -41,6 +41,19 @@ The catalog application is Rust-only; Python is present only through Azure CLI.
 Ordinary `verify`
 checks do not build or smoke-test Docker images.
 
+To verify a published catalog digest without rebuilding, set its exact reference:
+
+```bash
+export CATALOG_IMAGE="ghcr.io/mdrakiburrahman/rust-playground/arrowcol-catalog-rust@sha256:<published-digest>"
+docker pull "$CATALOG_IMAGE"
+npx --no-install nx run arrowcol-catalog-rust:image-smoke --excludeTaskDependencies
+```
+
+The existing smoke starts the service, checks its health, sends default SIGTERM
+with a ten-second stop bound, requires exit code `0` and the publisher-drained
+log marker, then removes its container. It also checks the CLI and auth-directory
+boundaries. An older image without graceful publisher shutdown fails this contract.
+
 Published runtime tags are:
 
 - `branch-<sanitized-branch>` for the selected branch;
