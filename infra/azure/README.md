@@ -1,5 +1,10 @@
 # Azure sandbox
 
+> The legacy loadtest sandbox below remains separate from the AKS QAP stamp.
+> Replacement AKS, ADX, storage, registry and logging resources are scoped to
+> `arrow-collector-rg`; the separate `rust-playground` resource group is not
+> a deployment or cleanup target. See [AKS QAP operations](../../docs/operations/AKS_QAP.md).
+
 Declarative Bicep infrastructure with TypeScript orchestration. Run from the repository root inside the Linux devcontainer.
 
 | Setup | Value |
@@ -40,10 +45,11 @@ flowchart LR
 | Kusto database | `experimentqap` (`AZURE_KUSTO_EXPERIMENT_DATABASE`) | In the existing cluster, same 7-day retention and 1-day hot cache. The experiment creates `qap_<runId>_<operation>` external tables. |
 | Log Analytics workspace | `arrowcol-<sandboxId>` (`AZURE_LOG_ANALYTICS_WORKSPACE`) | `PerGB2018`, 30-day retention. |
 | Diagnostic setting | `arrowcol-storage-reads` | On `blobServices/default`: `StorageRead` only, into the resource-specific `StorageBlobLogs` table. |
+| Optional read-log storage | `arrowreadlogs<stamp>` | `storageReadLogDestination: storage` adds an independent Azure Monitor destination. Provision grants sink-scoped Blob Data Reader to the operator/UAMI and ARM Reader to the UAMI for readiness checks. Evidence survives fixture reset until RG deletion. |
 
 | Access | Grant |
 | --- | --- |
-| Managed identity | Storage Blob Data Reader on the `arrowcol` and `experimentqap` containers; Viewer on both Kusto databases; `provision` applies the `ExternalTable` managed identity policy to both databases. |
+| Managed identity | Blob reader on `arrowcol`, contributor on `experimentqap` and the checkpoint control container; Viewer on the sandbox database, Admin on the experiment database; Reader on the Kusto cluster and Log Analytics Reader on the workspace. `provision` applies the `ExternalTable` managed identity policy to both databases. |
 | Operator | Storage Blob Data Contributor on the account, AllDatabasesAdmin on the cluster (covers both databases), Log Analytics Reader on the workspace. |
 
 The storage account is shared with the loadtest, so `StorageBlobLogs` also holds loadtest reads. Filter by the `experimentqap/runs/<runId>/` path and the Kusto managed identity. Log ingestion is billed per GB and kept for 30 days. To pause it, run `az monitor diagnostic-settings delete --name arrowcol-storage-reads --resource <storage-account-id>/blobServices/default --subscription <subscription>`; the next `provision` recreates it.
@@ -74,3 +80,24 @@ Use `npx --no-install tsx infra/azure/bootstrap.ts <command>`:
 | Details | Reference |
 | --- | --- |
 | Configuration, custody, recovery and failure contracts | [Azure sandbox details](../../docs/operations/AZURE_SANDBOX.md) |
+
+## AKS QAP stamp
+
+The AKS runtime runs the existing QAP driver and Rust binaries in a Kubernetes
+Job; devcontainer mode remains the default. One `arrow-collector` UAMI is
+shared by ADX, AKS control plane and kubelet, the federated pod, and ACR image
+publishing/pull. Preflight qualifies Azure support, quota and networking, and
+blocks replacement while legacy Terraform state, Key Vault consumers, role
+assignments, registry publishers or FIC subjects remain unaccounted for.
+
+| Task | Entry point |
+| --- | --- |
+| Configure / qualify / provision | `infra/azure/stamp.example.yaml`; follow [AKS QAP operations](../../docs/operations/AKS_QAP.md) before provisioning. |
+| Fresh resource group | No manual group creation: subscription Bicep creates an absent `arrow-collector-rg`. Preflight still rejects metadata access failures, legacy resources and extra declared identities. |
+| Egress IP allocation policy | Set `aks.network.egressIpv4IpTags` and `egressIpv6IpTags` in private stamp YAML only to allocation tags authorized for the target subscription. Empty lists request untagged prefixes; Azure policy may reject them. No policy exemption or skip tags are added. |
+| Kustomize Job config | Copy `infra/kubernetes/azure-qap.example.yaml` to ignored `azure-qap.yaml`; set a digest-pinned image and desired resources/node selector. |
+| Run on AKS | `npx nx run azure-qap-experiment:run -- --kubernetes --kubernetes-config infra/kubernetes/azure-qap.yaml` |
+| Preserve evidence | The runner collects raw read evidence, reports, queries and owned HTTP receipts before removing its unique Job. Trial path + shared principal + complete owned-read exclusions identify ADX traffic; no Kusto-specific UA assumption. AKS requires `reload`. |
+
+Do not treat the legacy `reset` command as an AKS resource-group cleanup. No
+resource-group deletion is part of bootstrap or reset.

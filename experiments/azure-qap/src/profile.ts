@@ -21,7 +21,7 @@ export interface Profile {
   parallel: number;
   /** Quiet watch window after the mutation once QAP has caught up. */
   tailMs: number;
-  /** Longest wait for StorageBlobLogs to arrive after a trial's window closes. */
+  /** Longest wait for Azure Monitor read logs after a trial's window closes. */
   logWaitMs: number;
   /** Hard cap for all trials; cleanup gets a separate bounded allowance. */
   budgetMs: number;
@@ -35,6 +35,8 @@ export interface Options {
   profile: Profile;
   env: string;
   out?: string;
+  kubernetes: boolean;
+  kubernetesConfig: string;
   help: boolean;
 }
 
@@ -83,7 +85,7 @@ export function validateProfile(profile: Profile): Profile {
   if (trialBytes(profile) > MAX_TRIAL_BYTES)
     throw new Error(`One trial would seed ${trialBytes(profile) / MIB} MiB; lower --files or --file-mib (limit 2048 MiB).`);
   if (profile.operations.includes('reload') && profile.logWaitMs === 0)
-    throw new Error('reload is the positive control and needs StorageBlobLogs; with --log-wait 0 leave reload out of --operations.');
+    throw new Error('reload is the positive control and needs Azure Monitor read logs; with --log-wait 0 leave reload out of --operations.');
   if (tailFloorMs(profile) > profile.budgetMs)
     throw new Error(`${profile.operations.length * profile.repetitions} trials, ${profile.parallel} at a time, need at least ` +
       `${formatDuration(tailFloorMs(profile))} for their tails alone; raise --budget (e.g. --budget 1h) or --parallel, or shorten --tail.`);
@@ -149,6 +151,8 @@ export function parseOptions(argv: readonly string[], defaults: Profile): Option
     budget: { type: 'string' },
     env: { type: 'string', default: '.env' },
     out: { type: 'string' },
+    kubernetes: { type: 'boolean', default: false },
+    'kubernetes-config': { type: 'string' },
     help: { type: 'boolean', short: 'h', default: false },
   } });
   const profile: Profile = { ...defaults, operations: [...defaults.operations] };
@@ -160,7 +164,13 @@ export function parseOptions(argv: readonly string[], defaults: Profile): Option
   if (values.tail !== undefined) profile.tailMs = parseDuration(values.tail, '--tail');
   if (values['log-wait'] !== undefined) profile.logWaitMs = parseDuration(values['log-wait'], '--log-wait');
   if (values.budget !== undefined) profile.budgetMs = parseDuration(values.budget, '--budget');
-  return { profile: values.help ? profile : validateProfile(profile), env: values.env, out: values.out, help: values.help };
+  if (!values.help && values['kubernetes-config'] !== undefined && !values.kubernetes)
+    throw new Error('--kubernetes-config requires --kubernetes.');
+  if (!values.help && values.kubernetes && !profile.operations.includes('reload'))
+    throw new Error('AKS mode requires the reload positive control to verify actual ADX read attribution.');
+  return { profile: values.help ? profile : validateProfile(profile), env: values.env, out: values.out,
+    kubernetes: values.kubernetes, kubernetesConfig: values['kubernetes-config'] ?? 'infra/kubernetes/azure-qap.yaml',
+    help: values.help };
 }
 
 export function helpText(defaults: Profile): string {
@@ -169,7 +179,7 @@ export function helpText(defaults: Profile): string {
 
 For each operation it seeds a tiny Hive-partitioned Delta table, accelerates it with QAP,
 runs the real maintenance (or a known reload), watches QAP state, then counts which
-UNCHANGED Parquet files Kusto's managed identity read again (StorageBlobLogs).
+UNCHANGED Parquet files Kusto's managed identity read again (Azure Monitor read logs).
 
 Usage:
   npx nx run azure-qap-experiment:run                     # quick default (~5 min + log wait)
@@ -182,11 +192,13 @@ Options (defaults from experiments/azure-qap/scenario.json):
   --repetitions <n>    trials per operation, 1..10 (default ${d.repetitions})
   --parallel <n>       concurrent trials, 1..8 (default ${d.parallel})
   --tail <dur>         watch window after the mutation once QAP caught up (default ${formatDuration(d.tailMs)})
-  --log-wait <dur>     max wait for StorageBlobLogs, 0 = skip (default ${formatDuration(d.logWaitMs)})
+  --log-wait <dur>     max wait for Azure Monitor read logs, 0 = skip (default ${formatDuration(d.logWaitMs)})
   --budget <dur>       hard cap for all trials incl. log wait (default ${formatDuration(d.budgetMs)}); cleanup gets up to
                        5m more. Must cover ceil(trials / parallel) x tail, so raise it for longer runs
   --env <file>         private env file (default .env; ARROWCOL_RESET_GENERATION may come from .env.azure)
   --out <dir>          report directory (default .temp/experiments/azure-qap/<runId>)
+  --kubernetes         run the full experiment as an AKS Job instead of in this devcontainer
+  --kubernetes-config <yaml>  Kustomize/Job settings (default infra/kubernetes/azure-qap.yaml)
   -h, --help           show this help
 
 Durations accept 90s, 2m, 1h, 1h30m or bare seconds.
@@ -194,8 +206,9 @@ Cleanup always runs, also on failure and Ctrl+C: the run's Kusto tables are drop
 its fixture directory runs/<runId>/ is deleted. Copy the printed KQL to explore while it runs.
 Exit code is nonzero on errors, failed trials, failed cleanup, or when an included reload
 (the positive control) was not seen re-reading every unchanged file, for whatever reason,
-including logs still pending or the budget running out. --log-wait 0 requires leaving
-reload out of --operations.
+including logs still pending or the budget running out. AKS mode requires reload to
+verify actual ADX read attribution. --log-wait 0 requires leaving reload out of
+--operations and is therefore unavailable in AKS mode.
 Requires the provisioned sandbox: npx nx run azure-infra:provision
 Docs: docs/experiments/azure-qap/README.md`;
 }

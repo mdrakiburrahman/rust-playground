@@ -2,7 +2,7 @@
 //! canonical tables go through the real bootstrap initializer over injected control metadata and a
 //! disposable local store, and the manifest is published only after every table drains. Uses the
 //! dev-only `arrow-deltalake/test-control` seam; no Azure endpoint, token or process environment.
-//! The parent-chain case composes the real Python parent's child environment, the
+//! The parent-chain case composes the real TypeScript parent's child environment, the
 //! `initialize-delta.sh` contract, the real CLI parser and the parent's manifest validation; it does
 //! not execute the release binary, whose control transport is Azure-only by design.
 //! Compiled only in debug unix test builds, matching the seam gate in arrow-deltalake.
@@ -722,7 +722,7 @@ fn supervision_faults_always_kill_reap_and_propagate() -> Result<()> {
     Ok(())
 }
 
-/// Guarantees: the environment the real Python parent composes for the child satisfies every
+/// Guarantees: the environment the real TypeScript parent composes for the child satisfies every
 /// precondition of `initialize-delta.sh`; the script's exact argv parses through the real CLI;
 /// the shared env parser and 26-table body then initialize every table over the guarded store
 /// and drain; and the parent's real manifest/Delta-log validation accepts that manifest and
@@ -736,13 +736,16 @@ async fn parent_child_env_cli_body_and_parent_validation_compose() -> Result<()>
 
     let scratch = Scratch::new()?;
     let values = scratch.0.join("values.json");
+    let stamp_account = "arrowcollector1";
+    let stamp_root = format!("abfss://{CONTAINER}@{stamp_account}.dfs.core.windows.net/sandbox");
     std::fs::write(
         &values,
         serde_json::to_vec(&serde_json::json!({
             "AZURE_SUBSCRIPTION_ID": "11111111-2222-4333-8444-555555555555",
-            "AZURE_STORAGE_ACCOUNT": ACCOUNT,
+            "AZURE_STAMP": "1",
+            "AZURE_STORAGE_ACCOUNT": stamp_account,
             "AZURE_STORAGE_CONTAINER": CONTAINER,
-            "ARROWCOL_AZURE_TABLE_ROOT": ROOT,
+            "ARROWCOL_AZURE_TABLE_ROOT": stamp_root,
         }))?,
     )?;
     let child: BTreeMap<String, String> = serde_json::from_value(parent(
@@ -754,6 +757,7 @@ async fn parent_child_env_cli_body_and_parent_validation_compose() -> Result<()>
             GENERATION.as_ref(),
         ],
     )?)?;
+    assert_eq!(child.get("AZURE_STAMP").map(String::as_str), Some("1"));
 
     let script = std::fs::read_to_string(repository().join("infra/azure/initialize-delta.sh"))?;
     let required: Vec<&str> = script
