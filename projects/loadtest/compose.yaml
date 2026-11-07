@@ -120,6 +120,9 @@ services:
         target: /delta/dataflow
         bind:
           create_host_path: false
+    secrets:
+      - source: arrowcol_app_password
+        target: arrowcol-app-password
     depends_on:
       arrowcol-catalog:
         condition: service_healthy
@@ -262,6 +265,8 @@ services:
       OTEL_EXPORTER_OTLP_ENDPOINT: ${LOADTEST_TRACES_ENDPOINT:-http://lgtm:4318}
       OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
     secrets:
+      - source: arrowcol_app_password
+        target: arrowcol-app-password
       - source: edge_hmac
         target: edge-hmac
       - source: internal_hmac

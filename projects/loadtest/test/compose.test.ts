@@ -178,6 +178,15 @@ test('catalog and DFE share the same Delta root', () => {
   assert.equal(root('arrowcol-catalog'), root('dataflow-1'));
 });
 
+test('router and DFE receive the SQL routing credential at the configured path', () => {
+  for (const service of ['dataflow-1', 'router']) {
+    assert(compose.services[service].secrets?.some(secret =>
+      typeof secret !== 'string' && secret.source === 'arrowcol_app_password'
+        && secret.target === 'arrowcol-app-password'),
+    'service must mount /run/secrets/arrowcol-app-password');
+  }
+});
+
 test('SQL Server publishes an overridable loopback port and retains its data and secret mounts', () => {
   const sqlserver = compose.services.sqlserver;
   assert.deepEqual(sqlserver.ports, ['127.0.0.1:${SQLSERVER_PORT:-14333}:1433']);
