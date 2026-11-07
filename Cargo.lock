@@ -721,25 +721,13 @@ name = "arrowcol-buffer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "arrow 58.4.0",
  "arrow-deltalake",
- "arrowcol-catalog",
- "arrowcol-protocol",
- "arrowcol-receipts",
- "async-trait",
- "delta_kernel",
- "futures",
  "opentelemetry 0.31.0",
  "opentelemetry-otlp",
  "opentelemetry_sdk 0.31.0",
- "otel-arrow-dfe-quiver",
  "regex",
  "serde",
  "serde_json",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
  "tracing-subscriber",
  "url",
  "uuid",
@@ -875,32 +863,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "arrowcol-experiment"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arrow 58.4.0",
- "arrow-deltalake",
- "arrowcol-buffer",
- "arrowcol-catalog",
- "arrowcol-protocol",
- "arrowcol-receipts",
- "assert_cmd",
- "async-trait",
- "clap",
- "delta_kernel",
- "delta_kernel_default_engine",
- "futures",
- "object_store",
- "parquet 58.4.0",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tokio",
- "url",
-]
-
-[[package]]
 name = "arrowcol-flight"
 version = "0.1.0"
 dependencies = [
@@ -989,28 +951,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "arrowcol-receipts"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arrow-deltalake",
- "arrow-schema 58.4.0",
- "arrowcol-catalog",
- "arrowcol-protocol",
- "arrowcol-sql-server",
- "async-trait",
- "chrono",
- "futures",
- "serde_json",
- "thiserror 2.0.21",
- "tiberius",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "arrowcol-router-rust"
 version = "0.1.0"
 dependencies = [
@@ -1018,7 +958,6 @@ dependencies = [
  "arrow 58.4.0",
  "arrow-flight",
  "arrowcol-protocol",
- "arrowcol-receipts",
  "arrowcol-routing",
  "async-trait",
  "base64 0.22.1",
@@ -1059,51 +998,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "uuid",
-]
-
-[[package]]
-name = "arrowcol-rust"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arrow 58.4.0",
- "arrow-deltalake",
- "arrow-flight",
- "arrowcol-buffer",
- "arrowcol-catalog",
- "arrowcol-flight",
- "arrowcol-protocol",
- "arrowcol-receipts",
- "arrowcol-routing",
- "arrowcol-sql-server",
- "assert_cmd",
- "async-trait",
- "axum",
- "base64 0.22.1",
- "bytes",
- "clap",
- "delta_kernel",
- "futures",
- "hmac",
- "http",
- "parquet 58.4.0",
- "predicates",
- "prometheus",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2 0.10.9",
- "subtle",
- "tempfile",
- "thiserror 2.0.21",
- "tiberius",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tonic",
- "tracing",
- "tracing-subscriber",
  "uuid",
 ]
 
@@ -6779,26 +6673,6 @@ dependencies = [
  "socket2",
  "tracing",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "quiver-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arrow 58.4.0",
- "arrow-csv 58.4.0",
- "arrowcol-buffer",
- "arrowcol-catalog",
- "arrowcol-protocol",
- "assert_cmd",
- "clap",
- "otel-arrow-dfe-quiver",
- "predicates",
- "serde_json",
- "tempfile",
- "tokio",
- "uuid",
 ]
 
 [[package]]
