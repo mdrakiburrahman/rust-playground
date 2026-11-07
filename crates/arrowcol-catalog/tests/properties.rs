@@ -56,4 +56,13 @@ proptest! {
         )?.with_metadata(second.metadata().clone())?;
         prop_assert_eq!(schema, reparsed);
     }
+
+    #[test]
+    fn create_and_append_share_one_legal_monotonic_numbering_contract(position in 0_u32..1_000_000) {
+        let number = arrowcol_catalog::protobuf_field_number(position)?;
+        let next = arrowcol_catalog::protobuf_field_number(position + 1)?;
+        prop_assert!(number > 0 && !(19_000..=19_999).contains(&number));
+        prop_assert!(next > number);
+        prop_assert_eq!(arrowcol_catalog::next_protobuf_field_number(number)?, next);
+    }
 }

@@ -1014,6 +1014,12 @@ impl CatalogSchemaVersion {
 ///
 /// Returns a corrupt-state error when the protobuf field-number space is exhausted.
 pub fn next_protobuf_field_number(current: u32) -> CatalogResult<u32> {
+    if (19_000..=19_999).contains(&current) || current > 536_870_911 {
+        return Err(CatalogError::new(
+            CatalogErrorCode::CorruptCatalogState,
+            "current protobuf field number is invalid",
+        ));
+    }
     let next = current.checked_add(1).ok_or_else(field_counter_exhausted)?;
     let next = if (19_000..=19_999).contains(&next) {
         20_000
@@ -1078,6 +1084,15 @@ fn validate_sibling_fields(fields: &[CatalogField], allow_partition: bool) -> Ca
     let mut numbers = std::collections::BTreeSet::new();
     let mut partition_ordinals = std::collections::BTreeSet::new();
     for field in fields {
+        if field.field_number == 0
+            || (19_000..=19_999).contains(&field.field_number)
+            || field.field_number > 536_870_911
+        {
+            return Err(CatalogError::new(
+                CatalogErrorCode::CorruptCatalogState,
+                "persisted protobuf field number is invalid",
+            ));
+        }
         field.mapping.validate()?;
         if !names.insert(field.name.clone()) {
             return Err(CatalogError::new(

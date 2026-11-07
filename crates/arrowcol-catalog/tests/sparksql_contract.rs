@@ -79,6 +79,7 @@ fn protobuf_allocation_skips_reserved_numbers_and_rejects_exhaustion() -> anyhow
     assert_eq!(protobuf_field_number(19_000)?, 20_001);
     assert_eq!(next_protobuf_field_number(18_999)?, 20_000);
     assert_eq!(next_protobuf_field_number(20_000)?, 20_001);
+    assert!(next_protobuf_field_number(19_000).is_err());
     assert!(next_protobuf_field_number(536_870_911).is_err());
     assert!(protobuf_field_number(u32::MAX).is_err());
     for number in [0, 19_000, 19_999, 536_870_912] {
