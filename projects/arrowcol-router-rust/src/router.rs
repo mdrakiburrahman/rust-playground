@@ -625,6 +625,66 @@ fn ascii_header<'a>(headers: &'a http::HeaderMap, key: &str) -> Result<Option<&'
         .transpose()
 }
 
+fn sanitize_public_message(message: &str) -> String {
+    let mut output: String = message
+        .chars()
+        .map(|character| if character.is_control() { ' ' } else { character })
+        .take(1_024)
+        .collect();
+    if output.is_empty() {
+        output.push_str("router request failed");
+    }
+    output
+}
+
+async fn write_grpc_error(session: &mut Session, grpc_status: u16, message: &str) -> pingora::Result<()> {
+    let mut response = ResponseHeader::build(200, Some(5))?;
+    response.insert_header("content-type", "application/grpc")?;
+    response.insert_header("grpc-status", grpc_status.to_string())?;
+    response.insert_header("grpc-message", grpc_message(message))?;
+    response.insert_header("cache-control", "no-store")?;
+    response.insert_header("x-content-type-options", "nosniff")?;
+    session.write_response_header(Box::new(response), true).await
+}
+
+async fn write_json<T: Serialize>(session: &mut Session, status: StatusCode, value: &T) -> pingora::Result<()> {
+    let body = serde_json::to_vec(value)
+        .map_err(|cause| Error::because(ErrorType::InternalError, "serialize JSON response", cause))?;
+    write_bytes(session, status, "application/json", body).await
+}
+
+async fn write_bytes(
+    session: &mut Session,
+    status: StatusCode,
+    content_type: &str,
+    body: Vec<u8>,
+) -> pingora::Result<()> {
+    let mut response = ResponseHeader::build(status.as_u16(), Some(5))?;
+    response.insert_header("content-type", content_type)?;
+    response.insert_header("content-length", body.len().to_string())?;
+    response.insert_header("cache-control", "no-store")?;
+    response.insert_header("x-content-type-options", "nosniff")?;
+    session
+        .write_response_header(Box::new(response), body.is_empty())
+        .await?;
+    if !body.is_empty() {
+        session.write_response_body(Some(Bytes::from(body)), true).await?;
+    }
+    Ok(())
+}
+
+fn grpc_message(message: &str) -> String {
+    let mut encoded = String::new();
+    for byte in sanitize_public_message(message).bytes() {
+        if matches!(byte, b' '..=b'~') && byte != b'%' {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
 fn routing_reason(kind: RoutingErrorKind) -> &'static str {
     match kind {
         RoutingErrorKind::InvalidConfiguration => "invalid_configuration",
