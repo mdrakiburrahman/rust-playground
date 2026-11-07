@@ -16,7 +16,7 @@ import { secretsFrom } from '../../azure-qap/src/main.ts';
 import { Kusto, object, type KustoClient } from '../../azure-qap/src/kusto.ts';
 import { buildCatalogProof, buildClient } from './build-clients.ts';
 import { nullableBar, physicalCounts, snapshot, type Snapshot } from './delta.ts';
-import { observeHydration, requestedNullQuery, schemaQuery } from './hydration.ts';
+import { exactRowsQuery, observeHydration, requestedNullQuery, schemaQuery, verifyExactRows } from './hydration.ts';
 
 const WORKSPACE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const IMAGE = 'mcr.microsoft.com/azuredataexplorer/kustainer-linux@sha256:51e2250da2faf292de903f871a073eb37d3f2641cf63381b183879d21ebb1013';
@@ -334,6 +334,9 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       { name: 'native-kusto-schema-and-data-hydration', timeoutMs: 20 * 60_000, run: async ctx => {
         const counts = await observeHydration(kusto!, table, { deadline: ctx.deadline, signal: ctx.signal,
           rowsPerPhase: ROWS, record: observation => ctx.record('native-hydration', observation) });
+        const exactQuery = exactRowsQuery(table), exactRows = await kusto!.query(exactQuery, ctx.signal);
+        verifyExactRows(exactRows, ROWS);
+        ctx.record('native-exact-rows', { csl: exactQuery, rows: exactRows });
         const requested = requestedNullQuery(table), requestedRows = await kusto!.query(requested, ctx.signal);
         ctx.record('requested-isnull-query', { csl: requested, rows: requestedRows,
           caveat: 'Kusto STRING nulls normalize to empty strings. Physical Delta nulls are proved separately.' });

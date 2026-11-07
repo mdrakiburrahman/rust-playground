@@ -71,6 +71,7 @@ export function physicalCounts(value: unknown, rows: number): void {
   for (const raw of result.counts) {
     const count = object(raw), key = `${count.client}:${count.phase}`;
     if (!expected.delete(key) || count.total !== rows || count.badSentinel !== 0 ||
+        !Array.isArray(count.values) || count.values.length !== rows || count.values.some((value, index) => value !== index) ||
         count.nulls !== (count.client === 'old' ? rows : 0) ||
         count.filled !== (count.client === 'old' ? 0 : rows) ||
         (key === 'old:after' && count.missingColumn !== 0))

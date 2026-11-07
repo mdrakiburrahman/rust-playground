@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { complete, observeHydration, parseCounts, type Observation } from './hydration.ts';
+import { complete, observeHydration, parseCounts, verifyExactRows, type Observation } from './hydration.ts';
 
 const full = [['old', 'before', 10, 10, 0, 0], ['old', 'after', 10, 10, 0, 0], ['new', 'after', 10, 0, 10, 0]];
 const schema = [['client'], ['phase'], ['bar']];
@@ -65,4 +65,20 @@ test('authorization, partial-result and malformed-response failures are never sw
     await assert.rejects(() => observeHydration({ query: async () => { throw error; } }, 'foo', {
       deadline: Date.now() + 1000, rowsPerPhase: 10, signal: new AbortController().signal, record: () => {},
     }), error);
+});
+
+test('Kusto parity requires every known value exactly once, not merely aggregate counts and matching strings', () => {
+  const rows = [
+    ['old', 'before', 0, '', 1], ['old', 'before', 1, '', 1],
+    ['old', 'after', 0, '', 1], ['old', 'after', 1, '', 1],
+    ['new', 'after', 0, 'bar-0', 1], ['new', 'after', 1, 'bar-1', 1],
+  ];
+  verifyExactRows(rows, 2);
+  for (const corrupted of [
+    [...rows.slice(0, -1), ['new', 'after', 99, 'bar-99', 1]],
+    [...rows.slice(0, -1), ['new', 'after', 0, 'bar-0', 1]],
+    [...rows.slice(0, -1), ['new', 'after', 1, 'bar-1', 2]],
+    [...rows.slice(0, -1), ['new', 'after', 1, '', 1]],
+    [...rows.slice(0, -1), ['new', 'before', 1, 'bar-1', 1]],
+  ]) assert.throws(() => verifyExactRows(corrupted, 2), /exact/);
 });

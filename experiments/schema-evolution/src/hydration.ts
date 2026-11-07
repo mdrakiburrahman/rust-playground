@@ -65,6 +65,27 @@ export function schemaQuery(table: string): string {
   return `external_table('${table}') | getschema | project ColumnName`;
 }
 
+export function exactRowsQuery(table: string): string {
+  identifier(table);
+  return `external_table('${table}') | summarize multiplicity=count() by client, phase, value, bar`;
+}
+
+export function verifyExactRows(records: unknown[][], rows: number): void {
+  if (!Number.isSafeInteger(rows) || rows < 1 || records.length !== rows * 3)
+    throw new Error('Kusto exact fixture row groups are incomplete.');
+  const seen = new Set<string>();
+  for (const record of records) {
+    const [client, phase, value, bar, multiplicity] = record;
+    const key = `${client}:${phase}:${value}`;
+    if (record.length !== 5 || (client !== 'old' && client !== 'new') ||
+        (phase !== 'before' && phase !== 'after') || (client === 'new' && phase !== 'after') ||
+        typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0 || value >= rows ||
+        multiplicity !== 1 || bar !== (client === 'old' ? '' : `bar-${value}`) || seen.has(key))
+      throw new Error('Kusto exact old/new rows contain wrong values, duplicates or unexpected sentinels.');
+    seen.add(key);
+  }
+}
+
 export async function observeHydration(kusto: Pick<Kusto, 'query'>, table: string, options: PollOptions): Promise<Counts[]> {
   const now = options.now ?? Date.now;
   const wait = options.wait ?? ((ms, signal) => sleep(ms, undefined, { signal }));

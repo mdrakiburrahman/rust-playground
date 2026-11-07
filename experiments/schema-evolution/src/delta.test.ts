@@ -31,11 +31,12 @@ test('nullable STRING and physical old-after nulls cannot be replaced by absent 
   assert.equal(nullableBar({ fields: [{ name: 'bar', type: 'string', nullable: true }] }), true);
   assert.throws(() => nullableBar({ fields: [{ name: 'bar', type: 'string', nullable: false }] }), /nullable/);
   const counts = [
-    { client: 'old', phase: 'before', total: 8, nulls: 8, missingColumn: 8, filled: 0, badSentinel: 0 },
-    { client: 'old', phase: 'after', total: 8, nulls: 8, missingColumn: 0, filled: 0, badSentinel: 0 },
-    { client: 'new', phase: 'after', total: 8, nulls: 0, missingColumn: 0, filled: 8, badSentinel: 0 },
+    { client: 'old', phase: 'before', total: 8, nulls: 8, missingColumn: 8, filled: 0, badSentinel: 0, values: [0,1,2,3,4,5,6,7] },
+    { client: 'old', phase: 'after', total: 8, nulls: 8, missingColumn: 0, filled: 0, badSentinel: 0, values: [0,1,2,3,4,5,6,7] },
+    { client: 'new', phase: 'after', total: 8, nulls: 0, missingColumn: 0, filled: 8, badSentinel: 0, values: [0,1,2,3,4,5,6,7] },
   ];
   physicalCounts({ counts }, 8);
   assert.throws(() => physicalCounts({ counts: [counts[0], { ...counts[1], missingColumn: 8 }, counts[2]] }, 8), /proof failed/);
   assert.throws(() => physicalCounts({ counts: [counts[0], counts[1], { ...counts[2], badSentinel: 8 }] }, 8), /proof failed/);
+  assert.throws(() => physicalCounts({ counts: [counts[0], counts[1], { ...counts[2], values: [0,0,0,0,0,0,0,0] }] }, 8), /proof failed/);
 });

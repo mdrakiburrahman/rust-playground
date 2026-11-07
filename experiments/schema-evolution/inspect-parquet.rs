@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, fs::File};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::File,
+};
 
 use arrow_array::{Array, Int64Array, StringArray};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -11,6 +14,7 @@ struct Counts {
     missing: u64,
     filled: u64,
     bad_sentinel: u64,
+    values: BTreeSet<i64>,
 }
 
 fn inspect(files: &[String]) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
@@ -48,6 +52,10 @@ fn inspect(files: &[String]) -> Result<serde_json::Value, Box<dyn std::error::Er
                     return Err("unknown client or phase in Delta file".into());
                 }
                 let tally = counts.entry((client.to_owned(), phase.to_owned())).or_default();
+                let value = values.value(row);
+                if value < 0 || !tally.values.insert(value) {
+                    return Err("negative or duplicate fixture value in an active Delta cohort".into());
+                }
                 tally.rows += 1;
                 match bar {
                     None => {
@@ -57,7 +65,7 @@ fn inspect(files: &[String]) -> Result<serde_json::Value, Box<dyn std::error::Er
                     Some(column) if column.is_null(row) => tally.nulls += 1,
                     Some(column) => {
                         tally.filled += 1;
-                        if column.value(row) != format!("bar-{}", values.value(row)) {
+                        if column.value(row) != format!("bar-{value}") {
                             tally.bad_sentinel += 1;
                         }
                     }
@@ -69,7 +77,8 @@ fn inspect(files: &[String]) -> Result<serde_json::Value, Box<dyn std::error::Er
         "files": files,
         "counts": counts.iter().map(|((client, phase), counts)| json!({
             "client": client, "phase": phase, "total": counts.rows, "nulls": counts.nulls,
-            "missingColumn": counts.missing, "filled": counts.filled, "badSentinel": counts.bad_sentinel
+            "missingColumn": counts.missing, "filled": counts.filled, "badSentinel": counts.bad_sentinel,
+            "values": counts.values.iter().copied().collect::<Vec<_>>()
         })).collect::<Vec<_>>()
     }))
 }
@@ -117,12 +126,15 @@ mod tests {
         assert_eq!(
             result["counts"],
             json!([
-                {"client":"new","phase":"after","total":2,"nulls":0,"missingColumn":0,"filled":2,"badSentinel":0},
-                {"client":"old","phase":"after","total":2,"nulls":2,"missingColumn":0,"filled":0,"badSentinel":0},
-                {"client":"old","phase":"before","total":2,"nulls":2,"missingColumn":2,"filled":0,"badSentinel":0}
+                {"client":"new","phase":"after","total":2,"nulls":0,"missingColumn":0,"filled":2,"badSentinel":0,"values":[0,1]},
+                {"client":"old","phase":"after","total":2,"nulls":2,"missingColumn":0,"filled":0,"badSentinel":0,"values":[0,1]},
+                {"client":"old","phase":"before","total":2,"nulls":2,"missingColumn":2,"filled":0,"badSentinel":0,"values":[0,1]}
             ])
         );
         assert!(inspect(&[]).is_err());
+        let mut duplicate = files.clone();
+        duplicate.push(files[0].clone());
+        assert!(inspect(&duplicate).is_err());
         Ok(())
     }
 }
