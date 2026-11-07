@@ -10,6 +10,7 @@ opt-in with `--kubernetes`.
 | `base/` | Namespace, service account, empty environment/secret placeholders, and hardened Job. |
 | `overlays/azure-qap/` | Selects the base; the TypeScript runner injects validated namespace, UAMI client ID, per-run names, runtime environment and experiment arguments. |
 | `infra/azure/stamp.yaml` | Private subscription/stamp, AKS namespace and service account; never place credentials here or commit it. |
+| Scheduling | The bounded sandbox Job explicitly tolerates the baseline system pool's `CriticalAddonsOnly=true:NoSchedule` taint; no taint is removed from the nodes. |
 
 Copy the sample to the ignored `azure-qap.yaml` and replace the image with the
 digest returned by the image publisher. Do not use a mutable tag. Resource
