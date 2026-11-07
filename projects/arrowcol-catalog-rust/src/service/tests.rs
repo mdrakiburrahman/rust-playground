@@ -22,6 +22,25 @@ const CREATE: &str = "CREATE TABLE arrowcol.default.events (id BIGINT NOT NULL, 
 
 #[tokio::test]
 async fn committed_delta_restart_and_concurrent_evolution() -> Result<()> {
+    const CHILD: &str = "ARROWCOL_CATALOG_PUBLICATION_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "service::tests::committed_delta_restart_and_concurrent_evolution",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("ARROWCOL_PARTITION_GRANULARITY", "minute")
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "catalog CREATE-to-publication subprocess failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Ok(());
+    }
     let root = tempfile::tempdir()?;
     let service = CatalogService::open(config(root.path())).await?;
     service.apply_sql(CREATE).await?;
@@ -60,6 +79,43 @@ async fn committed_delta_restart_and_concurrent_evolution() -> Result<()> {
         validated.alignment(),
         SchemaAlignmentPlan::NullableAppend { .. }
     ));
+    restarted
+        .apply_sql("CREATE TABLE arrowcol.default.plain (id BIGINT NOT NULL) USING DELTA")
+        .await?;
+    let plain = name_identity(&["arrowcol".into(), "default".into(), "plain".into()])?;
+    let location = restarted.state.lock().await.tables[&plain].location.clone();
+    let path = PathBuf::from(location);
+    let batch = arrow_array::RecordBatch::try_new(
+        Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )])),
+        vec![Arc::new(arrow_array::Int64Array::from(vec![1, 2, 3]))],
+    )?;
+    let table = DeltaTable::open(path)?;
+    for _ in 0..2 {
+        let mut files = table.new_partitioned_publication_files(batch.clone(), "catalog-plain".into(), 0, 1)?;
+        assert_eq!(files.len(), 1);
+        let (mut writer, batch) = files.pop().context("publication file")?;
+        writer.write(&batch).await?;
+        let committed = writer.finish().await?;
+        assert_eq!(
+            committed.version, 1,
+            "CREATE and replay must not add implicit partitions or duplicate rows"
+        );
+        assert_eq!(committed.file.rows, 3);
+    }
+    assert!(
+        restarted
+            .store
+            .current_schema(&plain)
+            .await?
+            .context("plain schema")?
+            .metadata()
+            .partition_columns
+            .is_empty()
+    );
     Ok(())
 }
 

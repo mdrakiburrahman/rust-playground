@@ -117,3 +117,92 @@ async fn oversized_sorted_publication_fails_without_partial_commit() -> Result<(
     assert_eq!(table.version()?, 0);
     Ok(())
 }
+
+#[tokio::test]
+async fn committed_catalog_partitions_override_process_default_and_preserve_replay() -> Result<()> {
+    const CHILD: &str = "ARROW_DELTALAKE_CATALOG_LAYOUT_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "committed_catalog_partitions_override_process_default_and_preserve_replay",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("ARROWCOL_PARTITION_GRANULARITY", "minute")
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "catalog layout subprocess failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Ok(());
+    }
+    let root = tempfile::tempdir()?;
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("region", DataType::Utf8, true),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 1])),
+            Arc::new(StringArray::from(vec![Some("a"), None, Some("a")])),
+        ],
+    )?;
+    for partitions in [Vec::new(), vec!["region".to_owned()]] {
+        let directory = root
+            .path()
+            .join(if partitions.is_empty() { "plain" } else { "partitioned" });
+        std::fs::create_dir_all(&directory)?;
+        DeltaTable::initialize_url_for_bootstrap(
+            url::Url::from_directory_path(&directory).map_err(|()| anyhow::anyhow!("table URL"))?,
+            batch.schema(),
+            partitions.clone(),
+        )?;
+        let table = DeltaTable::open(&directory)?;
+        let expected_files = if partitions.is_empty() { 1 } else { 2 };
+        for _ in 0..2 {
+            let files = table.new_partitioned_publication_files(batch.clone(), "catalog-layout".into(), 0, 1)?;
+            assert_eq!(files.len(), expected_files);
+            for (mut writer, rows) in files {
+                writer.write(&rows).await?;
+                writer.finish().await?;
+            }
+        }
+        let mut ids = Vec::new();
+        let mut adds = 0;
+        for entry in std::fs::read_dir(directory.join("_delta_log"))? {
+            let path = entry?.path();
+            if path.extension().is_none_or(|extension| extension != "json") {
+                continue;
+            }
+            for action in std::fs::read_to_string(path)?.lines() {
+                let action: serde_json::Value = serde_json::from_str(action)?;
+                if let Some(metadata) = action.get("metaData") {
+                    assert_eq!(metadata["partitionColumns"], serde_json::json!(partitions));
+                    assert!(
+                        !metadata["schemaString"]
+                            .as_str()
+                            .context("schema")?
+                            .contains("_ingestion")
+                    );
+                }
+                if let Some(add) = action.get("add") {
+                    adds += 1;
+                    let file = directory.join(add["path"].as_str().context("add path")?);
+                    for rows in ParquetRecordBatchReaderBuilder::try_new(File::open(file)?)?.build()? {
+                        let rows = rows?;
+                        let column = rows.column_by_name("id").context("id")?;
+                        let values = column.as_any().downcast_ref::<Int32Array>().context("id type")?;
+                        ids.extend(values.values().iter().copied());
+                    }
+                }
+            }
+        }
+        ids.sort_unstable();
+        assert_eq!(ids, [1, 1, 2]);
+        assert_eq!(adds, expected_files, "replay cannot duplicate committed rows");
+    }
+    Ok(())
+}

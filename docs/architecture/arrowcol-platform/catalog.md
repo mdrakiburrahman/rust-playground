@@ -37,7 +37,9 @@ Unrelated vendor properties remain intact in Delta `metadata.configuration`.
 | External DROP | Durable catalog tombstone; never deletes Delta data or its transaction log |
 
 DFE publication groups actual batch values by the committed partition columns,
-including typed and null values, and writes each key with a separate replay-safe
+including typed and null values. An explicitly unpartitioned catalog table remains
+unpartitioned even when the process sets a legacy ingestion-partition default;
+defaults apply only to new uncataloged tables. Each key uses a separate replay-safe
 transaction identity. A partial commit followed by retry cannot skip remaining
 keys or duplicate already committed rows. Partition directory values are escaped;
 the Delta log retains their unescaped typed representations.

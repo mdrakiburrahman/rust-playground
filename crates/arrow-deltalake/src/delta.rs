@@ -2255,7 +2255,7 @@ impl DeltaTable {
             .with_buffer_size(NonZeroUsize::new(READ_AHEAD).context("invalid Delta read-ahead")?)
             .with_batch_size(NonZeroUsize::new(BATCH_ROWS).context("invalid Delta batch size")?)
             .build();
-        Ok(Arc::new(Self {
+        let mut table = Self {
             root,
             url,
             engine,
@@ -2272,7 +2272,14 @@ impl DeltaTable {
             publication_fence,
             session: None,
             bootstrap_only: false,
-        }))
+        };
+        if !table.partition_columns.is_empty()
+            && let Some(snapshot) = table.existing_snapshot()?
+        {
+            // Process partition defaults apply only to new tables.
+            table.partition_columns = snapshot.table_configuration().metadata().partition_columns().to_vec();
+        }
+        Ok(Arc::new(table))
     }
 
     fn existing_snapshot(&self) -> Result<Option<SnapshotRef>> {
