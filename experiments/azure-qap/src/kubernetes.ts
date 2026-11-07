@@ -188,6 +188,7 @@ export async function runKubernetes(input: { options: Options; argv: readonly st
   if (!identityClientId) throw new Failure('Generated AZURE_UAMI_CLIENT_ID is missing; provision the stamped Azure infrastructure first.');
   const suffix = randomBytes(4).toString('hex');
   const jobName = `azure-qap-${new Date().toISOString().replace(/[-:TZ.]/g, '').slice(0, 14)}-${suffix}`;
+  console.log(`Kubernetes job: ${jobName} namespace: ${namespace}`);
   const args = kubernetesRuntimeArgs(input.argv);
   const activeDeadlineSeconds = Math.ceil((input.profile.budgetMs + CLEANUP_SECONDS * 1000 + JOB_START_SECONDS * 1000) / 1000);
   const environment = { ...input.azureConfig.generated(), AZURE_SUBSCRIPTION_ID: input.azureConfig.subscription,
@@ -216,6 +217,7 @@ export async function runKubernetes(input: { options: Options; argv: readonly st
     fs.mkdirSync(output, { recursive: true, mode: 0o700 });
     await runKubectl(config, input.azureConfig,
       ['cp', '--container', 'experiment', '-n', namespace, `${pod}:/artifacts/.`, output], 120);
+    fs.writeFileSync(path.join(output, 'kubernetes-job.json'), JSON.stringify({ jobName, namespace }) + '\n', { mode: 0o600 });
     artifactsCopied.value = true;
   };
   const waitForDone = async (timeoutSeconds: number, ignoreInterrupt = false): Promise<boolean> => {

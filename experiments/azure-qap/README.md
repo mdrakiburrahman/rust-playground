@@ -74,6 +74,37 @@ files before cleaning its uniquely named Job. See [Kubernetes runtime
 configuration](../../infra/kubernetes/README.md) and [AKS QAP
 operations](../../docs/operations/AKS_QAP.md).
 
+## Clean AKS rehearsal
+
+**Destructive:** reset deletes the entire `arrow-collector-rg` sandbox in the
+explicit subscription. Stop writers and verify the subscription before running it.
+It never deletes other resource groups; it waits only for AKS-managed groups
+captured from that sandbox's inventory.
+
+| Step | Command or action |
+| --- | --- |
+| Reset | `npx --no-install tsx tools/scripts/src/qap-sandbox-reset.ts --subscription "$SUBSCRIPTION" --confirm-reset arrow-collector-rg --receipt "$RESET_RECEIPT"` |
+| Bootstrap | Preserve the reset receipt outside the reset boundary, release the old lease, obtain a new lease and Full-bootstrap the exact branch using the existing devbox helpers. Do not copy generated `.env.azure`; sync only the approved private `.env` and `infra/azure/stamp.yaml`. |
+| Run | `npx --no-install tsx tools/scripts/src/qap-rehearsal.ts run --subscription "$SUBSCRIPTION" --expected-sha "$COMMIT_SHA" --evidence-dir "$EVIDENCE_DIR"` |
+| Collect existing run | `npx --no-install tsx tools/scripts/src/qap-rehearsal.ts collect --subscription "$SUBSCRIPTION" --evidence-dir "$EVIDENCE_DIR"` |
+
+Use a new absolute receipt path and a new absolute evidence directory outside the
+checkout, backed by storage that survives Full bootstrap. If using a devbox-local
+path, download the reset receipt separately and verify `evidence.tar` and
+`receipt.json` against `SHA256SUMS` before reset, bootstrap or lease release. Do not include private sync files in
+the archive. The run requires a clean expected commit, private sync files and no
+preexisting generated `.env.azure` or report directories. It provisions twice,
+publishes the digest, runs both modes and collects; it never retries a failed
+stage. Child output is suppressed to avoid exposing credentials; the receipt
+records the failed stage and exit status. The collect command rechecks all eight
+saved queries, validates completed reports and RELOAD, checks the exact owned AKS
+objects are absent, and archives the evidence. For a pre-sidecar run, add `--legacy-cleanup-inventory`: it fails if any
+`azure-qap-*` Job, Pod, ConfigMap or Secret exists in the namespace, including
+objects from other runs. Alternatively use `--job-name <exact-owned-job>` from
+a trusted run record; never guess a Job name. Run and collect require Linux in
+the devcontainer; sandbox reset also supports the Windows host. Both commands also have `tools-scripts:qap-sandbox-reset`
+and `tools-scripts:qap-rehearsal` Nx targets.
+
 ## What a trial does
 
 1. **Seed**: `arrowcol-experiment seed-scale` writes the table under
