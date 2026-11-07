@@ -91,17 +91,21 @@ async fn artifact_failure_is_visible_and_reconciles() -> anyhow::Result<()> {
     assert_eq!(incomplete[0].state(), SagaState::Failed);
     assert_eq!(incomplete[0].step(), SagaStep::PersistArtifacts);
     let identity = incomplete[0].target_schema().identity();
-    assert_eq!(store.current_schema(identity).await?.unwrap().version().get(), 1);
+    let current = store
+        .current_schema(identity)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("missing current schema after artifact failure"))?;
+    assert_eq!(current.version().get(), 1);
     assert!(
         store
             .artifacts(identity, incomplete[0].target_schema().version())
             .await?
             .is_none()
     );
-    assert_eq!(
-        store.finalize(incomplete[0].id()).await.unwrap_err().code(),
-        CatalogErrorCode::CorruptCatalogState
-    );
+    let Err(error) = store.finalize(incomplete[0].id()).await else {
+        anyhow::bail!("finalization without persisted artifacts must fail");
+    };
+    assert_eq!(error.code(), CatalogErrorCode::CorruptCatalogState);
 
     let report = service.reconcile_incomplete().await?;
     assert_eq!(report.examined, 1);
