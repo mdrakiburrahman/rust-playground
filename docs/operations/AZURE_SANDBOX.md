@@ -9,6 +9,16 @@ bootstrap use the existing signed-in Azure CLI identity; Kusto reads Delta using
 the dedicated user-assigned managed identity. No account keys, client secrets,
 SAS tokens, or credential files are required.
 
+| Runtime component | Responsibility |
+| --- | --- |
+| DFE collector | Best-effort admission, or buffer persistence with durable_buffer; neither completion proves Delta publication |
+| Remote Schema Catalog | Authoritative schemas and schema events; replaces SQL catalog/Hive sidecar |
+| SQL Server | Router routing/fencing only |
+
+Clients no longer receive durable receipt IDs and have no receipt polling or
+purge API. The reset/stop/provider custody receipts below remain operational
+reset evidence and are not delivery receipts.
+
 ## Private configuration
 
 Copy the root `.env.example` into repo-bootstrapper's private
@@ -68,13 +78,14 @@ versioning, restore and change feed: do not use it for production data.
 The reconciler refuses to adopt existing untagged/foreign resources. It preserves
 checkpoint-container control metadata across Bicep redeployment. It waits for
 Kusto access and storage RBAC, fences publication, runs the foundation's
-`initialize-delta.sh`, and checks every declared root has a valid version-zero
-Delta protocol and metadata before creating external tables. The initializer
+`projects/arrowcol-infra/scripts/initialize-delta.sh`, and checks every declared
+root has a valid version-zero Delta protocol and metadata before creating external tables. The initializer
 must create only absent roots, never overwrite a live table.
 
 The thin hook calls `arrowcol-loadgen initialize-azure --manifest` with the
 private output path supplied as `ARROWCOL_AZURE_TABLE_MANIFEST`. The loadgen owns
-the canonical schemas and initializes both Direct and Dataflow pools (26 roots).
+the canonical schemas and initializes the Dataflow pool (13 roots). The remote
+Schema Catalog serves runtime schema lookup; SQL Server remains routing-only.
 The generated manifest contains `{name, relative_path}` bindings beneath the
 configured data container, not credentials or account URLs. Kusto infers the
 normalized schema, timestamp companions and ingestion partitions from Delta.
@@ -186,7 +197,7 @@ or rotated in the idle gap, that admission fails before any I/O. The parent
 re-verifies with `bootstrap_owner` before each step, holds its member through all
 hosted-state work, and `complete_bootstrap` removes that member and sets
 `ready-v1` in one CAS only after every request completed definitively. An unknown
-admin outcome keeps the member active or marks it uncertain, so it failsclosed. There is no destructor release, expiry, force clear, or automatic retry.
+admin outcome keeps the member active or marks it uncertain, so it fails closed. There is no destructor release, expiry, force clear, or automatic retry.
 An uncertain member or operator cannot release even if logical transactions
 reconcile. Unknown CAS responses return `UnknownTransition`; retain the
 identity and reconcile authority read-only rather than claim success or adopt a
@@ -313,7 +324,8 @@ Successful full provision and `occupy` export the exact ready container
 `resetgeneration` as `ARROWCOL_RESET_GENERATION` in private mode-`0600`
 `.env.azure`. `occupy` re-reads authority after its CAS before writing this
 admission value. The runner must reload the file after occupancy and pass the
-value to both collector pools; it must never derive it from a run/occupancy UUID.
+value to the DFE collector and participating cloud writers; it must never derive
+it from a run/occupancy UUID.
 `config` alone cannot export an authoritative generation because it performs no
 Azure reads.
 
@@ -452,14 +464,16 @@ The following describes the operator sequence behind `reset --execute` and
 | Writer | Published source | Reset-relevant tests | Status |
 | --- | --- | --- | --- |
 | Rust core publisher session | `7307a94` (`publisher.rs`, `delta.rs`) | `bootstrap_is_exclusive_and_generation_pinned`, `stopping_occupancy_blocks_all_admission`, `stale_generation_refuses_write_and_cleanup`, `uncertain_outcomes_retain_member`, `azure_admission_requires_configured_generation`, `unknown_shared_admission_is_permanent` | Offline pass |
-| `arrowcol-rust`, `arrowcol-dataflow-rust`, `delta-maintenance` binaries | `7307a94` (`close_shared` on exit) | Core `clean_drain_deregisters_only_self`, `inflight_upload_refuses_close_until_settled` | Offline pass |
+| `arrowcol-dataflow-rust`, `delta-maintenance` binaries | `7307a94` (`close_shared` on exit) | Core `clean_drain_deregisters_only_self`, `inflight_upload_refuses_close_until_settled` | Offline pass |
 | Tenant stream (sink and checkpoint) | `5dd2c85` | Shared admission across sink and checkpoint | Offline pass |
 | Azure copy/rename | `7307a94` | `azure_server_side_copy_is_unreachable` | Unsupported before I/O |
 | Collector replay | `8b82339`, `590a329` | Replay epoch fencing | Actual WAL drain **pending** |
-| Loadgen `initialize-azure` child | `89d3eee`, `9c01c6d`, `d618bb7` | `initialize_azure_dispatch` (6 missing/non-canonical expected-generation cases rejected before any I/O); debug-only `initialize_control` over the core `test-control` seam: shared 26-table body with stale-G/cleaning/ready/stopping/live-member refusal before any blob, drain before manifest, unknown write retains member; parent child-env, `initialize-delta.sh` argv, CLI parse and TypeScript manifest/log validation composed (no Kusto) | Component offline pass; the release child process, its Azure control/data wire and `run_tree` handling remain **unverified until live Azure qualification** |
+| Loadgen `initialize-azure` child | `89d3eee`, `9c01c6d`, `d618bb7` | `initialize_azure_dispatch` (6 missing/non-canonical expected-generation cases rejected before any I/O); debug-only `initialize_control` over the core `test-control` seam: shared canonical-table initialization body with stale-G/cleaning/ready/stopping/live-member refusal before any blob, drain before manifest, unknown write retains member; parent child-env, `initialize-delta.sh` argv, CLI parse and TypeScript manifest/log validation composed (no Kusto) | Component offline pass; the release child process, its Azure control/data wire and `run_tree` handling remain **unverified until live Azure qualification** |
 | TypeScript parent (bootstrap/reconcile/release/stop) | this directory | `bootstrap.test.ts`, `publisher_control.test.ts` | Offline pass |
 
-Offline passes are orchestration evidence only. Public enablement still
+The listed source revisions and offline passes are historical orchestration
+evidence, not a new qualification of the migrated DFE/catalog-only topology.
+Public enablement still
 requires the pending rows plus live qualification.
 
 After live tests release occupancy, the lifecycle owner stops (never deletes)
@@ -492,8 +506,8 @@ fails without trying another subscription; restore access to that authorized
 subscription before repeating live qualification.
 
 The initializer is a cross-workstream contract, not an independent schema
-implementation in this directory. The integrated loadgen/core revision must be
-qualified before claiming full bootstrap. A missing/failed initializer never
+implementation in this directory. The integrated loadgen/core and
+DFE/remote-catalog revisions must be qualified before claiming full bootstrap. A missing/failed initializer never
 produces a ready sandbox.
 
 Public protocol references:

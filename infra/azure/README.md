@@ -7,9 +7,10 @@ Declarative Bicep infrastructure with TypeScript orchestration. Run from the rep
 | Private configuration | Copy `.env.example` to repo-bootstrapper's `sync/rust-playground/.env`; fill in the authorized subscription and required tags. |
 | Authentication | `az login --use-device-code`; the identity needs deployment and role-assignment permissions. |
 | Runtime | Repository Node.js, `npm ci`, Azure CLI and Linux `flock`. |
-| Infrastructure | Resource group, ADX cluster/database, ADLS Gen2 containers, managed identity, RBAC, 26 external Delta tables and QAP. |
+| Infrastructure | Resource group, ADX cluster/database, ADLS Gen2 containers, managed identity, RBAC, 13 Dataflow external Delta tables and QAP. |
 | QAP experiment | `experimentqap` container and Kusto database, Log Analytics workspace `arrowcol-<sandboxId>` and a blob `StorageRead` diagnostic setting. |
-| Loadtest default | Local disk and Kusto; Azure is opt-in. |
+| Loadtest default | DFE collector, remote Schema Catalog, local disk and Kusto; Azure is opt-in. |
+| SQL Server | Router routing/fencing only; no SQL catalog or delivery-receipt store. |
 
 ```mermaid
 flowchart LR
@@ -68,6 +69,17 @@ Use `npx --no-install tsx infra/azure/bootstrap.ts <command>`:
 | Archive an unsealed prior attempt | `npx --no-install tsx projects/loadtest/src/main.ts --discard-unsealed` |
 | Recreate empty tables after reset | `npx --no-install tsx infra/azure/bootstrap.ts provision --wait-seconds 600` |
 | Offline checks | `npx nx run azure-infra:verify` |
+
+Full provision runs the fenced Rust initializer, then KQL reconciliation under
+PublisherControl custody. `complete_bootstrap` publishes readiness only after
+definitive completion; the parent exports the captured reset generation only
+after verifying same-generation `ready-v1`. `--infra-only` is not full readiness.
+
+DFE completion is best-effort admission unless `durable_buffer` is enabled,
+which confirms buffer persistence only—not Delta publication. Clients have no
+durable receipt IDs, receipt polling, or receipt purge APIs. Reset, stop, and
+provider custody receipts remain required operational evidence; they are not
+delivery receipts.
 
 **Reset deletes data, not Azure resources, except the sandbox Kusto database that `provision` recreates.** It keeps the cluster, storage account, all three containers, the experiment database, the Log Analytics workspace and the managed identity. Stop writers first; keep `.env*` private.
 
