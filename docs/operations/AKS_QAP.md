@@ -11,15 +11,34 @@ replace the devcontainer mode.
 | Azure target | The private stamp subscription, `arrow-collector-rg`, East US 2; never the separate `rust-playground` resource group. |
 | Stamp | Positive integer in ignored `infra/azure/stamp.yaml`; deployment names are derived from it. |
 | AKS baseline | 1.35.6; `Standard_D8s_v6` system pool with 3 initial/3 minimum/6 maximum nodes, 250 pods per node, zones 1/2/3, Azure Linux/FIPS, Entra/Azure RBAC, OIDC/workload identity, Azure CNI overlay dual stack and API-server VNet integration. |
-| Identity | Exactly one `arrow-collector` UAMI for control plane, kubelet, QAP ServiceAccount federation, ADX/storage and ACR. Add-ons that create identities are omitted. |
+| Declared identity | One `arrow-collector` UAMI for control plane, kubelet, QAP ServiceAccount federation, ADX/storage and ACR. Identity-creating optional add-ons are omitted; tenant-enforced add-ons require separate live qualification below. |
+| Publisher ownership | Generated `AZURE_STAMP` selects the same `stamp-<integer>` authority in TypeScript and Rust. Invalid stamps fail closed; an absent stamp retains the Rust legacy hashed-authority path only for older deployments. |
 | Networking | Explicit IPv4/IPv6 VNet, node, API, pod, service and DNS ranges; preflight checks subscription VNets and connected peering ranges before deployment. |
 | Legacy gate | Preflight blocks while old `project=arrow-collector` resources or additional UAMIs remain. Preserve Terraform state, Key Vault dependencies, role assignments, registry publishing consumers and every FIC subject before retiring the old stamp. |
 
 No destructive replacement is authorized outside `arrow-collector-rg`. The
-separate `rust-playground` resource group must remain untouched. Do not delete
-old resources or soft-deleted Key Vault content to bypass an incomplete
-inventory. The current preflight reaches the legacy-resource gate only after
-Azure version, SKU/quota, API-server feature and network checks succeed.
+separate `rust-playground` resource group must remain untouched. Retiring old
+resources requires either a completed dependency inventory or explicit
+authorization to discard the exact sandbox and its state. Purge protection
+cannot be bypassed; use fresh stamped names after an authorized reset.
+
+### Tenant-enforced identities
+
+The live target's mandatory Azure Policy and AzureSecurityLinuxAgent deployments
+create identities in the AKS-managed resource group even though the template
+omits identity-creating add-ons. This does **not** satisfy a literal one-UAMI
+requirement. Inventory both the main group and the cluster's returned
+`nodeResourceGroup`; successful template deployment is not proof of that count.
+
+[AKS managed-identity documentation](https://learn.microsoft.com/en-us/azure/aks/managed-identity-overview)
+lists bring-your-own identity for the Azure Policy add-on as unsupported. The
+generic extension schema's `aksAssignedIdentity` input is not proof that a
+particular security extension supports rebinding, and the provider rejects
+updates while an extension is `Creating`. Preserve required agents and their
+in-use identities. Do not disable add-ons, add policy exemptions or skip tags,
+or delete their identities to claim compliance. A supported provider binding
+or an explicitly approved platform-identity exception is required before
+declaring the one-UAMI requirement complete.
 
 Prepare the private stamp from `infra/azure/stamp.example.yaml`. Keep the
 subscription UUID, real non-overlapping network ranges and preserved publisher
