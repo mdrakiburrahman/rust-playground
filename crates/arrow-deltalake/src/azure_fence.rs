@@ -28,6 +28,20 @@ const API_VERSION: &str = "2023-11-03";
 const LEASE_SECONDS: &str = "15";
 const META_PREFIX: &str = "x-ms-meta-";
 
+fn sandbox_ownership(subscription: &str, stamp: Option<&str>) -> Result<String> {
+    if let Some(raw) = stamp {
+        let value = raw
+            .parse::<u64>()
+            .context("AZURE_STAMP must be a positive integer no greater than 99999999999")?;
+        if !raw.bytes().all(|byte| byte.is_ascii_digit()) || !(1..=99_999_999_999).contains(&value) {
+            bail!("AZURE_STAMP must be a positive integer no greater than 99999999999");
+        }
+        return Ok(format!("stamp-{value}"));
+    }
+    let legacy = format!("{:x}", Sha256::digest(format!("{subscription}:rust-playground")));
+    Ok(legacy[..12].to_owned())
+}
+
 /// Lease-serialized metadata transactions on the checkpoint control container.
 pub(crate) struct AzureControlContainer {
     credentials: AzureCredentialProvider,
@@ -82,10 +96,15 @@ impl AzureControlContainer {
         }
         let subscription =
             std::env::var("AZURE_SUBSCRIPTION_ID").context("Azure sandbox ownership configuration missing")?;
-        let sandbox_id = format!("{:x}", Sha256::digest(format!("{subscription}:rust-playground")));
+        let stamp = match std::env::var("AZURE_STAMP") {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(error) => return Err(error).context("AZURE_STAMP must be valid UTF-8"),
+        };
+        let sandbox_id = sandbox_ownership(&subscription, stamp.as_deref())?;
         Self::with_endpoint(
             format!("https://{account}.blob.core.windows.net/{container}"),
-            sandbox_id[..12].to_owned(),
+            sandbox_id,
             credentials,
         )
     }
@@ -303,6 +322,31 @@ mod tests {
 
     const SANDBOX: &str = "0123456789ab";
     const GENERATION: &str = "00000000-0000-4000-8000-000000000001";
+
+    #[test]
+    fn stamped_ownership_matches_bootstrap_and_preserves_legacy_without_a_stamp() {
+        let subscription = "00000000-0000-0000-0000-000000000001";
+        assert_eq!(sandbox_ownership(subscription, Some("1")).unwrap(), "stamp-1");
+        assert_eq!(sandbox_ownership(subscription, Some("01")).unwrap(), "stamp-1");
+        assert_eq!(
+            sandbox_ownership(subscription, Some("99999999999")).unwrap(),
+            "stamp-99999999999"
+        );
+        assert_eq!(sandbox_ownership(subscription, None).unwrap(), "07657369824b");
+        for invalid in [
+            "",
+            "0",
+            "-1",
+            "+1",
+            "1.5",
+            " 1",
+            "1 ",
+            "100000000000",
+            "18446744073709551616",
+        ] {
+            assert!(sandbox_ownership(subscription, Some(invalid)).is_err(), "{invalid}");
+        }
+    }
 
     #[derive(Debug, Clone)]
     struct Request {
