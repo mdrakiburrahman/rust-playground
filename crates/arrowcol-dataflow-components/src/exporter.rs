@@ -564,6 +564,7 @@ async fn run_batch_worker(
         metrics: &metrics,
         identity: &identity,
         max_pending_files,
+        adaptive_defaults: policy.adaptive_file.build(),
     };
     loop {
         let next = if closing {
@@ -677,6 +678,7 @@ struct GroupPublisher<'a> {
     metrics: &'a RuntimeMetrics,
     identity: &'a arrowcol_protocol::TableIdentity,
     max_pending_files: usize,
+    adaptive_defaults: arrow_deltalake::sizing::AdaptiveFileSizeConfig,
 }
 
 impl GroupPublisher<'_> {
@@ -739,18 +741,23 @@ impl GroupPublisher<'_> {
                         worker_failed = true;
                         ExportFailure::Transient(format!("{error:#}"))
                     })?;
+                let policy_error = files.iter().find_map(|(writer, _)| {
+                    match writer.adaptive_file_config(&self.adaptive_defaults) {
+                        Ok(config) if config == self.adaptive_defaults => None,
+                        Ok(_) => Some("table-specific adaptive file sizing is unsupported: durable publications are not splittable".to_owned()),
+                        Err(error) => Some(format!("invalid writer properties: {error:#}")),
+                    }
+                });
+                if let Some(error) = policy_error {
+                    for (writer, _) in files {
+                        writer.discard_empty().map_err(|cleanup| ExportFailure::Transient(format!("empty writer cleanup failed: {cleanup:#}")))?;
+                    }
+                    return Err(ExportFailure::Transient(error));
+                }
                 for (mut writer, partition_batch) in files {
-                    writer
-                        .write(&partition_batch)
-                        .await
-                        .map_err(|error| ExportFailure::Permanent(format!("{error:#}")))?;
-                    let append = writer
-                        .stage()
-                        .await
-                        .map_err(|error| ExportFailure::Transient(format!("{error:#}")))?;
-                    updated_estimator.observe(append.observation()).map_err(|error| {
-                        ExportFailure::Permanent(format!("file sizing observation failed: {error}"))
-                    })?;
+                    writer.write(&partition_batch).await.map_err(|error| ExportFailure::Permanent(format!("{error:#}")))?;
+                    let append = writer.stage().await.map_err(|error| ExportFailure::Transient(format!("{error:#}")))?;
+                    updated_estimator.observe(append.observation()).map_err(|error| ExportFailure::Permanent(format!("file sizing observation failed: {error}")))?;
                     staged.push(append);
                 }
             }

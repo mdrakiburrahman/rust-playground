@@ -38,39 +38,47 @@ use url::Url;
 
 type LocalEngine = DefaultEngine<SharedExecutor>;
 
-pub(crate) fn configured_publication_layout(schema: &SchemaRef) -> Result<Option<crate::layout::LayoutPolicy>> {
-    let columns = |name| -> Result<Option<Vec<String>>> {
-        match std::env::var(name) {
-            Ok(value) => Ok(Some(value.split(',').map(str::trim).map(str::to_owned).collect())),
-            Err(std::env::VarError::NotPresent) => Ok(None),
-            Err(error) => Err(error.into()),
-        }
-    };
-    let sort_columns = columns("ARROWCOL_LAYOUT_SORT_COLUMNS")?;
-    if schema.field_with_name("customer_id").is_err() && sort_columns.is_none() {
-        return Ok(None);
-    }
-    let mut policy = crate::layout::LayoutPolicy::default();
-    if let Some(columns) = sort_columns {
-        policy.sort_columns = columns;
-    }
-    if let Some(columns) = columns("ARROWCOL_LAYOUT_BLOOM_COLUMNS")? {
-        policy.bloom_columns = columns;
-    }
-    for (name, value) in [
-        ("ARROWCOL_LAYOUT_MAX_ROWS", &mut policy.max_rows),
-        ("ARROWCOL_LAYOUT_MAX_INPUT_BYTES", &mut policy.max_input_bytes),
-        ("ARROWCOL_LAYOUT_ROW_GROUP_ROWS", &mut policy.row_group_rows),
-        ("ARROWCOL_LAYOUT_PAGE_ROWS", &mut policy.page_rows),
+fn process_writer_properties(schema: &SchemaRef) -> Result<BTreeMap<String, String>> {
+    let mut process = BTreeMap::new();
+    for (environment, key) in [
+        ("ARROWCOL_LAYOUT_SORT_COLUMNS", "arrowcol.layout.sortColumns"),
+        ("ARROWCOL_LAYOUT_BLOOM_COLUMNS", "arrowcol.layout.bloomColumns"),
+        ("ARROWCOL_LAYOUT_MAX_ROWS", "arrowcol.layout.maxRows"),
+        ("ARROWCOL_LAYOUT_MAX_INPUT_BYTES", "arrowcol.layout.maxInputSize"),
+        ("ARROWCOL_LAYOUT_ROW_GROUP_ROWS", "arrowcol.layout.rowGroupRows"),
+        ("ARROWCOL_LAYOUT_PAGE_ROWS", "arrowcol.layout.pageRows"),
+        ("ARROWCOL_PARTITION_GRANULARITY", "arrowcol.partition.granularity"),
     ] {
-        match std::env::var(name) {
-            Ok(setting) => *value = setting.parse().with_context(|| format!("invalid {name}"))?,
+        match std::env::var(environment) {
+            Ok(value) => {
+                process.insert(key.to_owned(), value);
+            }
             Err(std::env::VarError::NotPresent) => {}
             Err(error) => return Err(error.into()),
         }
     }
+    // Preserve the legacy opt-in for customer_id and explicit sort columns.
+    if schema.field_with_name("customer_id").is_ok() || process.contains_key("arrowcol.layout.sortColumns") {
+        process.insert("arrowcol.layout.enabled".into(), "true".into());
+    }
+    Ok(process)
+}
+
+fn publication_layout(
+    schema: &SchemaRef,
+    properties: &arrowcol_props::ResolvedProps,
+) -> Result<Option<crate::layout::LayoutPolicy>> {
+    if !properties.boolean("arrowcol.layout.enabled")? {
+        return Ok(None);
+    }
+    let policy = crate::layout::LayoutPolicy::from_properties(properties)?;
     policy.validate(schema)?;
     Ok(Some(policy))
+}
+
+pub(crate) fn configured_publication_layout(schema: &SchemaRef) -> Result<Option<crate::layout::LayoutPolicy>> {
+    let properties = arrowcol_props::resolve(&BTreeMap::new(), &process_writer_properties(schema)?)?;
+    publication_layout(schema, &properties)
 }
 
 fn azure_store(url: &Url) -> Result<object_store::azure::MicrosoftAzure> {
@@ -169,11 +177,17 @@ pub const INGESTION_PARTITION: &str = "__arrowcol_ingestion";
 /// # Errors
 /// Rejects invalid timestamps and unknown granularity settings.
 pub fn ingestion_partition_value(stamp: i64) -> Result<String> {
+    let value =
+        std::env::var("ARROWCOL_PARTITION_GRANULARITY").context("ARROWCOL_PARTITION_GRANULARITY is required")?;
+    format_ingestion_partition(stamp, &value)
+}
+
+fn format_ingestion_partition(stamp: i64, granularity: &str) -> Result<String> {
     let timestamp = chrono::DateTime::from_timestamp_millis(stamp).context("invalid ingestion stamp")?;
-    let format = match std::env::var("ARROWCOL_PARTITION_GRANULARITY").as_deref() {
-        Ok("minute") => "%Y-%m-%d-%H-%M",
-        Ok("hour") => "%Y-%m-%d-%H",
-        Ok("day") => "%Y-%m-%d",
+    let format = match granularity {
+        "minute" => "%Y-%m-%d-%H-%M",
+        "hour" => "%Y-%m-%d-%H",
+        "day" => "%Y-%m-%d",
         other => bail!("partition granularity must be minute, hour or day, got {other:?}"),
     };
     Ok(timestamp.format(format).to_string())
@@ -682,6 +696,121 @@ mod io_tests {
         assert_eq!(table.checkpoint()?, committed);
         assert!(sync_hook::synced_under(&base_path).contains(&hint));
         sync_hook::reset(&base_path);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn publication_refreshes_delta_writer_properties() -> Result<()> {
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("writer-policy-{}", uuid::Uuid::new_v4()));
+        let fixture = Fixture(root);
+        fs::create_dir_all(&fixture.0)?;
+        let input = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            vec![Arc::new(arrow::array::Int32Array::from(vec![3, 1, 2]))],
+        )?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(INGESTION_PARTITION, DataType::Utf8, false),
+        ]));
+        let url = Url::from_directory_path(&fixture.0).map_err(|()| anyhow::anyhow!("bad fixture URL"))?;
+        let table = DeltaTable::open_url(url, schema, vec![INGESTION_PARTITION.into()])?;
+        let log = fixture.0.join("_delta_log");
+        let initial = fs::read_to_string(log.join("00000000000000000000.json"))?;
+        let mut metadata: serde_json::Value = initial
+            .lines()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .find(|value| value.get("metaData").is_some())
+            .context("metadata action missing")?;
+        metadata["metaData"]["configuration"] = serde_json::json!({
+            "arrowcol.layout.enabled": "true", "arrowcol.layout.sortColumns": "id",
+            "arrowcol.layout.bloomColumns": "id", "arrowcol.layout.rowGroupRows": "2",
+            "arrowcol.layout.pageRows": "1", "arrowcol.layout.maxRows": "3",
+            "arrowcol.partition.granularity": "day", "delta.targetFileSize": "80",
+            "arrowcol.writer.minInputSize": "10", "arrowcol.writer.maxInputSize": "500",
+            "arrowcol.writer.coldStartParquetRatio": "0.5", "arrowcol.writer.ewmaWeight": "0.4",
+            "arrowcol.writer.minParquetRatio": "0.1", "arrowcol.writer.maxParquetRatio": "2"
+        });
+        fs::write(log.join("00000000000000000001.json"), format!("{}\n", metadata))?;
+        let empty = table.new_file_with_publication(input.schema(), "empty".into(), 0, 3_600_000)?;
+        let empty_path = empty.parquet.path.clone();
+        assert!(empty_path.exists());
+        empty.discard_empty()?;
+        assert!(!empty_path.exists());
+        let mut writer = table.new_file_with_publication(input.schema(), "first".into(), 0, 3_600_000)?;
+        assert_eq!(
+            writer.partition_values[INGESTION_PARTITION].as_deref(),
+            Some("1970-01-01")
+        );
+        let defaults = crate::sizing::AdaptiveFileSizeConfig::default();
+        let config = writer.adaptive_file_config(&defaults)?;
+        assert_eq!(config.target_parquet_bytes, 80);
+        assert_eq!((config.min_input_bytes, config.max_input_bytes), (10, 500));
+        assert_eq!((config.cold_start_parquet_ratio, config.ewma_weight), (0.5, 0.4));
+        assert_eq!((config.min_parquet_ratio, config.max_parquet_ratio), (0.1, 2.0));
+        assert_eq!(
+            crate::sizing::AdaptiveFileSizeEstimator::new(config)?.input_bytes_target(),
+            160
+        );
+        writer.write(&input).await?;
+        let staged = writer.stage().await?;
+        let reader =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(File::open(&staged.file.path)?)?;
+        assert_eq!(reader.metadata().num_row_groups(), 2);
+        assert!(
+            reader
+                .metadata()
+                .row_groups()
+                .iter()
+                .all(|group| group.column(0).bloom_filter_offset().is_some())
+        );
+        let rows = reader.build()?.collect::<std::result::Result<Vec<_>, _>>()?;
+        let values = rows
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, [1, 2, 3]);
+        drop(staged);
+        metadata["metaData"]["configuration"]["arrowcol.partition.granularity"] = "minute".into();
+        metadata["metaData"]["configuration"]["arrowcol.layout.enabled"] = "false".into();
+        metadata["metaData"]["configuration"]["arrowcol.writer.targetFileSize"] = "64".into();
+        fs::write(log.join("00000000000000000002.json"), format!("{}\n", metadata))?;
+        let writer = table.new_file_with_publication(input.schema(), "second".into(), 0, 3_600_000)?;
+        assert_eq!(
+            writer.partition_values[INGESTION_PARTITION].as_deref(),
+            Some("1970-01-01-01-00")
+        );
+        assert!(writer.sorter.is_none());
+        assert_eq!(writer.adaptive_file_config(&defaults)?.target_parquet_bytes, 64);
+        drop(writer);
+        metadata["metaData"]["configuration"]["arrowcol.layout.rowGroupRows"] = "0".into();
+        fs::write(log.join("00000000000000000003.json"), format!("{}\n", metadata))?;
+        assert!(
+            table
+                .new_file_with_publication(input.schema(), "third".into(), 0, 0)
+                .err()
+                .context("invalid property was accepted")?
+                .to_string()
+                .contains("arrowcol.layout.rowGroupRows")
+        );
         Ok(())
     }
 
@@ -1892,6 +2021,25 @@ impl DeltaTable {
         }))
     }
 
+    fn existing_snapshot(&self) -> Result<Option<SnapshotRef>> {
+        let exists = if self.url.scheme() == "file" {
+            self.root.join("_delta_log").exists()
+        } else {
+            let store = Arc::clone(&self.store);
+            let prefix = self.object_path("_delta_log/")?;
+            shared_executor()?.block_on(async move {
+                use futures::StreamExt;
+                store
+                    .list(Some(&prefix))
+                    .next()
+                    .await
+                    .transpose()
+                    .map(|entry| entry.is_some())
+            })?
+        };
+        if exists { Ok(Some(self.snapshot()?)) } else { Ok(None) }
+    }
+
     pub(crate) fn snapshot(&self) -> Result<SnapshotRef> {
         let full_build = || {
             Snapshot::builder_for(self.url.as_str())
@@ -2093,8 +2241,32 @@ impl DeltaTable {
         version: i64,
         stamp: i64,
     ) -> Result<DeltaFileWriter> {
-        let layout = configured_publication_layout(&normalize::schema(&input)?)?;
-        self.new_file_with_publication_and_layout(input, app_id, version, stamp, layout)
+        let normalized = normalize::schema(&input)?;
+        let snapshot = self.existing_snapshot()?;
+        let table_properties = snapshot.as_ref().map_or_else(BTreeMap::new, |snapshot| {
+            snapshot
+                .table_configuration()
+                .metadata()
+                .configuration()
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        });
+        let properties = arrowcol_props::resolve(&table_properties, &process_writer_properties(&normalized)?)?;
+        let layout = publication_layout(&normalized, &properties)?;
+        let partitioned = snapshot
+            .as_ref()
+            .map_or(self.partition_columns == [INGESTION_PARTITION], |snapshot| {
+                snapshot.table_configuration().metadata().partition_columns() == [INGESTION_PARTITION]
+            });
+        let granularity = properties.text("arrowcol.partition.granularity")?;
+        let writer =
+            self.new_file_with_publication_policy(input, app_id, version, stamp, layout, partitioned, granularity)?;
+        if writer.table_properties != table_properties {
+            writer.discard_empty()?;
+            bail!("table properties changed while preparing publication; retry with refreshed policy");
+        }
+        Ok(writer)
     }
 
     /// Create a replayable publication with explicit whole-file sorting controls.
@@ -2110,9 +2282,56 @@ impl DeltaTable {
         stamp: i64,
         layout: Option<crate::layout::LayoutPolicy>,
     ) -> Result<DeltaFileWriter> {
+        let snapshot = self.existing_snapshot()?;
+        let partitioned = snapshot
+            .as_ref()
+            .map_or(self.partition_columns == [INGESTION_PARTITION], |snapshot| {
+                snapshot.table_configuration().metadata().partition_columns() == [INGESTION_PARTITION]
+            });
+        let normalized = normalize::schema(&input)?;
+        let table_properties = snapshot.as_ref().map_or_else(BTreeMap::new, |snapshot| {
+            snapshot
+                .table_configuration()
+                .metadata()
+                .configuration()
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        });
+        let properties = arrowcol_props::resolve(&table_properties, &process_writer_properties(&normalized)?)?;
+        let writer = self.new_file_with_publication_policy(
+            input,
+            app_id,
+            version,
+            stamp,
+            layout,
+            partitioned,
+            properties.text("arrowcol.partition.granularity")?,
+        )?;
+        if writer.table_properties != table_properties {
+            writer.discard_empty()?;
+            bail!("table properties changed while preparing publication; retry with refreshed policy");
+        }
+        Ok(writer)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_file_with_publication_policy(
+        self: &Arc<Self>,
+        input: SchemaRef,
+        app_id: String,
+        version: i64,
+        stamp: i64,
+        layout: Option<crate::layout::LayoutPolicy>,
+        partitioned: bool,
+        granularity: &str,
+    ) -> Result<DeltaFileWriter> {
         let mut values = BTreeMap::new();
-        let input = if self.partition_columns == [INGESTION_PARTITION] {
-            values.insert(INGESTION_PARTITION.to_owned(), Some(ingestion_partition_value(stamp)?));
+        let input = if partitioned {
+            values.insert(
+                INGESTION_PARTITION.to_owned(),
+                Some(format_ingestion_partition(stamp, granularity)?),
+            );
             let mut fields = input.fields().to_vec();
             if input.field_with_name(INGESTION_PARTITION).is_err() {
                 fields.push(Arc::new(arrow::datatypes::Field::new(
@@ -2239,7 +2458,7 @@ impl DeltaTable {
         let snapshot = self.ensure_schema(normalized)?;
         let schema = Arc::new(snapshot.schema().as_ref().try_into_arrow()?);
         let kernel_schema = snapshot.schema();
-        let transaction = snapshot.transaction(self.committer(), &self.engine)?;
+        let transaction = Arc::clone(&snapshot).transaction(self.committer(), &self.engine)?;
         let state = transaction.write_state()?;
         let mut builder = state.write_context_builder();
         if !values.is_empty() {
@@ -2287,6 +2506,13 @@ impl DeltaTable {
             accepted_rows: 0,
             accepted_input_bytes: 0,
             canonical_input,
+            table_properties: snapshot
+                .table_configuration()
+                .metadata()
+                .configuration()
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
         })
     }
 
@@ -2583,6 +2809,7 @@ pub struct DeltaFileWriter {
     accepted_input_bytes: u64,
     /// Batches are already canonical: validate instead of normalizing again.
     canonical_input: bool,
+    table_properties: BTreeMap<String, String>,
 }
 
 /// Fixed, non-identifying class of a staged-file cleanup failure.
@@ -2694,6 +2921,59 @@ impl StagedAppend {
 }
 
 impl DeltaFileWriter {
+    /// Remove an unpublished, empty file after policy admission fails.
+    ///
+    /// # Errors
+    /// Rejects a writer that has accepted rows or a failed local cleanup.
+    pub fn discard_empty(self) -> Result<()> {
+        if self.accepted_rows != 0 {
+            bail!("cannot discard a writer that accepted rows");
+        }
+        let path = self.parquet.path.clone();
+        drop(self);
+        fs::remove_file(&path).with_context(|| format!("remove empty publication {}", path.display()))?;
+        Ok(())
+    }
+
+    /// Resolve the file's metadata against the exporter's adaptive process defaults.
+    ///
+    /// # Errors
+    /// Rejects invalid table properties or adaptive sizing bounds.
+    pub fn adaptive_file_config(
+        &self,
+        defaults: &crate::sizing::AdaptiveFileSizeConfig,
+    ) -> Result<crate::sizing::AdaptiveFileSizeConfig> {
+        let process = BTreeMap::from([
+            (
+                "arrowcol.writer.targetFileSize".into(),
+                defaults.target_parquet_bytes.to_string(),
+            ),
+            (
+                "arrowcol.writer.minInputSize".into(),
+                defaults.min_input_bytes.to_string(),
+            ),
+            (
+                "arrowcol.writer.maxInputSize".into(),
+                defaults.max_input_bytes.to_string(),
+            ),
+            (
+                "arrowcol.writer.coldStartParquetRatio".into(),
+                defaults.cold_start_parquet_ratio.to_string(),
+            ),
+            ("arrowcol.writer.ewmaWeight".into(), defaults.ewma_weight.to_string()),
+            (
+                "arrowcol.writer.minParquetRatio".into(),
+                defaults.min_parquet_ratio.to_string(),
+            ),
+            (
+                "arrowcol.writer.maxParquetRatio".into(),
+                defaults.max_parquet_ratio.to_string(),
+            ),
+        ]);
+        let props = arrowcol_props::resolve(&self.table_properties, &process)?;
+        crate::sizing::AdaptiveFileSizeConfig::from_properties(&props)
+    }
+
     /// Assign a stable identity; retries of this publication must reuse it.
     ///
     /// # Errors
