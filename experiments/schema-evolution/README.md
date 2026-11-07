@@ -24,7 +24,7 @@ fresh-bootstrap live rehearsals remain required before final qualification.
 | --- | --- | --- |
 | Pin inputs | Record `git rev-parse HEAD` and `sha256sum experiments/schema-evolution/README.md` | Both rehearsals use the same final integration SHA and runbook hash. |
 | Fresh environment | Through the owning privy lease, run `Start-DevboxBootstrap -Repo rust-playground -Mode Full -Branch mdrakiburrahman-schema-catalog -LeaseId <lease>` and check out the recorded SHA remotely | New devcontainer; record devbox, lease ID and source SHA. No local builds. |
-| Local qualification | `npx nx run schema-evolution-experiment:run -- --target local` | All seven stages pass, actual old/new Delta cohorts and native Kustainer refresh recorded. |
+| Local qualification | `npx nx run schema-evolution-experiment:run -- --target local` | All six stages pass, actual old/new Delta cohorts and native Kustainer refresh recorded. |
 | Isolated Azure readiness | `AZURE_RESOURCE_GROUP=rust-playground-schema-evo npx nx run azure-infra:provision -- --env-file .env.schema-evo.private --tables .env.azure.schema-evo.tables.json --output .env.azure.schema-evo` | Supported DFE-only initializer topology; captured ready generation exported. Real Azure charges apply. Never select shared sandbox inputs. |
 | Azure qualification | `npx nx run schema-evolution-experiment:run -- --target azure --env-file .env.schema-evo.private --ready-env .env.azure.schema-evo` | Actual native schema and data hydration, elapsed observations and clean publisher shutdown. |
 | Repeat | Preserve evidence, then repeat the Full bootstrap and both qualifications at the same recorded SHA/runbook hash | Two independent reports with matching inputs, stamp identities and reproducible commands. |
@@ -37,8 +37,10 @@ already-ready stamp lacks its required table manifest, stop at the explicit
 bootstrap error and use the documented isolated sandbox recovery/reset flow;
 never weaken its custody check or operate on the shared stamp.
 
-The first real rehearsal is currently blocked on missing partition values in
-the generic Delta exporter. Keep `PARTITIONED BY (tenant)` and all data
-assertions unchanged. Component builds, admitted rows, manual external-table
-updates and the successful infrastructure bootstrap are not substitutes for
-these two complete rehearsals.
+The local run at `377b388` passed with Delta v4, three partitioned files and
+24 exact old/new rows. The old SDK process continued after ALTER with physical
+NULLs, the new SDK wrote exact sentinels, and native Kustainer QAP accelerated
+all rows after 294006 ms without post-ALTER reconciliation. Keep
+`PARTITIONED BY (tenant)` and every data assertion unchanged. This run,
+component checks and the infrastructure bootstrap do not substitute for the
+two complete fresh-bootstrap rehearsals.

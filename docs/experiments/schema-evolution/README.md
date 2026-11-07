@@ -4,9 +4,11 @@
 | --- | --- |
 | A separate disposable stamp does not alias the shared sandbox | Azure configuration tests verify distinct RG-derived account, cluster, ownership and deployment names. |
 | Hydration requires old-client writes both before and after ALTER, plus filled new-client rows | `schema-evolution-experiment:verify` checks exact per-client/per-phase counts and bounded observations. |
-| Genuine historical and evolved SDK clients compile independently | `schema-evolution-experiment:build-fixtures` compiles v1 without `bar` or a v2 dependency and v2 with nullable `bar`; remote catalog artifacts remain a live gate. |
+| Genuine historical and evolved SDK clients compile independently | Live run at `377b388` generated separate v1/v2 SDKs from the real catalog; immutable v1 PID 90453 continued after ALTER, distinct v2 PID 90835 wrote new values. |
 | Pinned Kustainer accepts native-refresh prerequisites | `schema-evolution-experiment:probe-kustainer` accepts create, QAP, then AutoUpdateSchema. Empty fixture means actual refresh remains inconclusive. |
-| Live catalog, SDK, Delta and Kusto evolution | Not yet qualified; component checks are not an end-to-end pass. |
+| Live local catalog, SDK, Delta and Kusto evolution | Passed at `377b388` in 335191 ms: Delta v4, 24 exact rows in three partitioned active files, server-side wrong-schema rejection and clean shutdown. |
+| Physical appended-field compatibility | Eight old-after rows have true physical NULL `bar` values; eight new-after rows contain exact `bar-0` through `bar-7` sentinels. |
+| Native Kustainer schema and accelerated data hydration | Without post-ALTER reconciliation, QAP reached v4, 100%, 24 accelerated rows and zero pending files after 294006 ms; exact old/new values and multiplicities matched. |
 | First real partitioned v1 publication | At `420f039`, live catalog CREATE and genuine v1 SDK admission succeeded, but Delta rejected missing partition values. No data commit landed; fixture partitioning was not removed. |
 | Native Azure schema refresh | Must be observed without a post-ALTER manual external-table update. |
 | New stamp reaches supported write readiness | Full bootstrap at `937a465` completed initialization under custody, reconciled 26 Delta external tables/QAP, and exported ready-v1 in 138.4 seconds. This is not the final DFE-only topology rehearsal. |
