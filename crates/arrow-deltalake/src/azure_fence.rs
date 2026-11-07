@@ -328,10 +328,7 @@ mod tests {
         let subscription = "00000000-0000-0000-0000-000000000001";
         assert_eq!(sandbox_ownership(subscription, Some("1")).unwrap(), "stamp-1");
         assert_eq!(sandbox_ownership(subscription, Some("01")).unwrap(), "stamp-1");
-        assert_eq!(
-            sandbox_ownership(subscription, Some("999999")).unwrap(),
-            "stamp-999999"
-        );
+        assert_eq!(sandbox_ownership(subscription, Some("999999")).unwrap(), "stamp-999999");
         assert_eq!(sandbox_ownership(subscription, None).unwrap(), "07657369824b");
         for invalid in [
             "",
