@@ -50,6 +50,8 @@ resource nodeSubnet 'Microsoft.Network/virtualNetworks/subnets@2024-05-01' = {
 resource apiServerSubnet 'Microsoft.Network/virtualNetworks/subnets@2024-05-01' = {
   parent: vnet
   name: 'apiserver-subnet'
+  // Subnet writes share the VNet lock; wait for the system pool subnet.
+  dependsOn: [nodeSubnet]
   properties: {
     addressPrefixes: [network.apiServerSubnetIpv4Cidr]
     delegations: [{ name: 'aks-api-server', properties: { serviceName: 'Microsoft.ContainerService/managedClusters' } }]

@@ -964,6 +964,14 @@ test('stop command timeout kills tree and leaves reset fenced with no deletion',
   await new Promise(resolve => setTimeout(resolve, 1000));
   assert.equal(fs.existsSync(marker), false); assert.equal(azure.metadata.resetstate, FENCED); assert.equal(azure.databases.length, 1);
 });
+test('Bicep serializes AKS subnet writes on the shared VNet', () => {
+  const source = fs.readFileSync(path.join(b.ROOT, 'infra/azure/aks.bicep'), 'utf8');
+  const section = (name: string) => source.split(`resource ${name} `)[1].split('\nresource ')[0];
+  assert.match(section('nodeSubnet'), /parent: vnet\s+name: pool\.name/);
+  assert.match(section('apiServerSubnet'), /parent: vnet\s+name: 'apiserver-subnet'/);
+  assert.match(section('apiServerSubnet'), /dependsOn:\s*\[\s*nodeSubnet\s*\]/);
+  assert.doesNotMatch(section('nodeSubnet'), /dependsOn:[\s\S]*apiServerSubnet/);
+});
 test('Bicep separates Kusto client application identity from storage object principal and preserves live authority', () => {
   const source = fs.readFileSync(path.join(b.ROOT, 'infra/azure/sandbox.bicep'), 'utf8');
   assert.match(source.split('resource reader ')[1], /principalId: identity\.properties\.clientId/);
