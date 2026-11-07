@@ -19,7 +19,6 @@ async fn admin_handlers_encode_health_readiness_capability_and_pressure() -> Res
         ImplementationPool::Dataflow,
         PositiveMeasurement::new(1_024)?,
         PositiveMeasurement::new(8)?,
-        PositiveMeasurement::new(32)?,
         BTreeSet::from([Capability::PressureReporting]),
     );
     let pressure = PressureSnapshot::new(
