@@ -16,10 +16,9 @@ use arrow_flight::{
 use arrowcol_protocol::{
     BasisPoints, CollectorInstanceId, ImplementationPool, Measurement, PositiveMeasurement, PressureGauge, UnixMillis,
 };
-use arrowcol_receipts::{ReceiptStore, SqlServerReceiptConfig, SqlServerReceiptStore};
 use arrowcol_router_rust::{
     AllowAllAuthenticator, AuthConfig, Authenticator, EdgeRequestSigner, EdgeVerifier, H2Config,
-    InternalIdentitySigner, ProductionRouter, ReceiptApiConfig, RouterConfig, RouterControlLoop, RouterMetrics,
+    InternalIdentitySigner, ProductionRouter, RouterConfig, RouterControlLoop, RouterMetrics,
     RoutingConfig, ServerConfig, SqlServerConfig, TelemetryConfig, UpstreamConfig, build_server,
     insert_edge_signature_headers,
 };
@@ -421,19 +420,14 @@ fn run_child() -> anyhow::Result<()> {
     runtime.block_on(routing.refresh(current))?;
     drop(runtime);
 
-    let receipt_config =
-        SqlServerReceiptConfig::new("127.0.0.1", 9, "unused", "unused", "unused").trust_server_certificate(true);
-    let receipts: Arc<dyn ReceiptStore> = Arc::new(SqlServerReceiptStore::new(receipt_config));
     let metrics = RouterMetrics::new()?;
     let authenticator: Arc<dyn Authenticator> = Arc::new(AllowAllAuthenticator);
     let router = ProductionRouter::new(
         Arc::clone(&routing),
-        receipts,
         authenticator,
         Arc::new(EdgeVerifier::new(vec![1_u8; 32], 30_000)?),
         Arc::new(InternalIdentitySigner::new(vec![2_u8; 32], 30_000)?),
         upstream_config(),
-        ReceiptApiConfig { max_batch_size: 16 },
         metrics.clone(),
     );
     let config = test_config(listen, state);
@@ -676,7 +670,6 @@ fn test_config(listen: SocketAddr, state_directory: String) -> RouterConfig {
             internal_identity_ttl_ms: 30_000,
         },
         upstream: upstream_config(),
-        receipts: ReceiptApiConfig { max_batch_size: 16 },
         telemetry: TelemetryConfig {
             log_filter: "info".to_owned(),
             json_logs: false,

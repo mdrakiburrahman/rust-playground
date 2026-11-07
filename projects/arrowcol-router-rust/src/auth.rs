@@ -104,7 +104,7 @@ pub struct AllowAllAuthenticator;
 impl Authenticator for AllowAllAuthenticator {
     async fn authenticate(&self, _request: &ExternalRequest, now: UnixMillis) -> Result<AuthContext, AuthFailure> {
         let mut scopes = BTreeSet::new();
-        for scope in ["arrowcol/ingest", "arrowcol/receipts", "arrowcol/catalog"] {
+        for scope in ["arrowcol/ingest", "arrowcol/catalog"] {
             scopes.insert(PrincipalScope::new(scope).map_err(principal_failure)?);
         }
         let principal = AuthenticatedPrincipal::new(

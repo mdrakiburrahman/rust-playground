@@ -13,7 +13,7 @@ fn request_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert("content-type", HeaderValue::from_static("application/grpc"));
     headers.insert("x-arrowcol-protocol-version", HeaderValue::from_static("1"));
-    headers.insert("x-arrowcol-implementation-pool", HeaderValue::from_static("direct"));
+    headers.insert("x-arrowcol-implementation-pool", HeaderValue::from_static("dataflow"));
     headers.insert("x-arrowcol-catalog", HeaderValue::from_static("telemetry"));
     headers.insert("x-arrowcol-schema", HeaderValue::from_static("prod"));
     headers.insert("x-arrowcol-table", HeaderValue::from_static("traces"));
@@ -83,7 +83,7 @@ async fn allow_all_identity_is_signed_with_a_bounded_expiry() {
         .authenticate(
             &ExternalRequest {
                 method: Method::GET,
-                path: "/v1/receipts/00000000-0000-0000-0000-000000000001".to_owned(),
+                path: "/arrow.flight.protocol.FlightService/DoPut".to_owned(),
             },
             now(200_000),
         )
