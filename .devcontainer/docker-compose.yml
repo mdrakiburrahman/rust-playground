@@ -1,6 +1,6 @@
 services:
   workspace:
-    image: ghcr.io/mdrakiburrahman/rust-playground/devcontainer:1bcefb77c6fd030e7e510682b02b4abdf6539dd3efc850fa2ae44ac98f77c4d7
+    image: ghcr.io/mdrakiburrahman/rust-playground/devcontainer:791a58138e7965087c9c428caa9a2b3f5de6b422283f90d6d36bb2b7e41ca545
     command: sleep infinity
     init: true
     extra_hosts:
