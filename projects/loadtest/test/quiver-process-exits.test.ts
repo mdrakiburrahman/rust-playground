@@ -14,29 +14,25 @@ async function fixture() {
   writeFileSync(path.join(results, 'run-metadata.json'), JSON.stringify({ run_id: 'run-1' }));
   const state = { phase: 'running', wrongOwner: false, wrongIp: false, wrongShape: false,
     oom: false, exitCode: 137, reusedUuid: false };
-  const instance = (pool: string, successor: boolean): string =>
-    `${pool === 'direct' ? '1' : '2'}${successor ? '2222222' : '1111111'}-1111-4111-8111-111111111111`;
+  const instance = (successor: boolean): string =>
+    `2${successor ? '2222222' : '1111111'}-1111-4111-8111-111111111111`;
   const server = createServer((request, response) => {
     response.setHeader('content-type', 'application/json');
-    const pool = request.url?.startsWith('/direct') ? 'direct' : 'dataflow';
-    const pressure = { instance_id: instance(pool, state.phase === 'restarted' && !state.reusedUuid) };
-    response.end(JSON.stringify(pool === 'direct' || state.wrongShape ? pressure : { rich: pressure }));
+    const pressure = { instance_id: instance(state.phase === 'restarted' && !state.reusedUuid) };
+    response.end(JSON.stringify(state.wrongShape ? pressure : { rich: pressure }));
   });
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   const address = server.address();
   assert(address && typeof address !== 'string');
-  const endpoints = { direct: `http://127.0.0.1:${address.port}/direct`, dataflow: `http://127.0.0.1:${address.port}/dataflow` };
+  const endpoints = { dataflow: `http://127.0.0.1:${address.port}/dataflow` };
   const docker = (args: string[]): string => {
-    const pool = args[0] === 'ps'
-      ? args.find(arg => arg.startsWith('label=com.docker.compose.service='))?.includes('direct') ? 'direct' : 'dataflow'
-      : args[1] === 'a'.repeat(64) ? 'direct' : 'dataflow';
-    const id = (pool === 'direct' ? 'a' : 'b').repeat(64);
+    const id = 'b'.repeat(64);
     if (args[0] === 'ps') return id;
     return JSON.stringify([{
       Id: id,
       Config: { Labels: { 'com.docker.compose.project': state.wrongOwner ? 'foreign' : BENCHMARK_PROJECT,
-        'com.docker.compose.service': `${pool}-1`,
+        'com.docker.compose.service': 'dataflow-1',
         'com.docker.compose.project.config_files': '/work/projects/loadtest/compose.yaml' } },
       NetworkSettings: { Networks: { owned: { IPAddress: state.phase === 'killed' ? '' : state.wrongIp ? '10.0.0.99' : '127.0.0.1' } } },
       State: { Running: state.phase !== 'killed', Restarting: false, OOMKilled: state.oom, Dead: false,
@@ -61,7 +57,7 @@ test('records same-run owned SIGKILL exits and distinct successor process UUIDs'
     await recordQuiverSuccessors({ ...f.options, killed });
     const proof = JSON.parse(readFileSync(path.join(f.results, QUIVER_PROCESS_EXITS_FILE), 'utf8'));
     assert.equal(proof.run_id, 'run-1');
-    assert.equal(proof.publishers.length, 2);
+    assert.equal(proof.publishers.length, 1);
     for (const publisher of proof.publishers) {
       assert.equal(publisher.exit_code, 137);
       assert.notEqual(publisher.instance_id, publisher.successor_instance_id);

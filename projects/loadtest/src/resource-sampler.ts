@@ -75,7 +75,7 @@ export const resourceScript = [
     'case "$(cat "/proc/$pid/comm")" in docker-init|tini) set -- $(cat "/proc/$pid/task/$pid/children"); ' +
     'if [ "$#" -ne 1 ]; then printf "__READ_ERROR__\\n"; exit 1; fi; pid="$1"; depth=$((depth+1));; *) break;; esac; done',
   'if [ "$depth" -ge 8 ]; then printf "__READ_ERROR__\\n"; exit 1; fi',
-  'case "$(readlink "/proc/$pid/exe")" in */arrowcol-rust|*/arrowcol-dataflow-rust) ;; ' +
+  'case "$(readlink "/proc/$pid/exe")" in */arrowcol-dataflow-rust) ;; ' +
     '*) printf "__READ_ERROR__\\n"; exit 1;; esac',
   'printf "\\n__status__\\n"; cat "/proc/$pid/status" 2>/dev/null || printf "__READ_ERROR__\\n"',
   ...[
@@ -260,7 +260,7 @@ export async function startResourceSampler(options: SamplerOptions, env: NodeJS.
 function parseSamplerOptions(args: string[]): SamplerOptions {
   const values = new Map<string, string>();
   for (let index = 0; index < args.length; index += 2) {
-    if (!['--project', '--results', '--direct-admin', '--dataflow-admin', '--owner-pid'].includes(args[index]) || !args[index + 1]) {
+    if (!['--project', '--results', '--dataflow-admin', '--owner-pid'].includes(args[index]) || !args[index + 1]) {
       throw new Error('Invalid sampler arguments');
     }
     values.set(args[index], args[index + 1]);

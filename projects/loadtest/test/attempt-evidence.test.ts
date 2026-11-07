@@ -33,8 +33,8 @@ function patch(t: { after: (callback: () => void) => void }, name: 'fsyncSync' |
 
 test('qualified success seals exact files, helpers and images privately before the next reset can destroy anything', async t => {
   const f = fixture(t);
-  mkdirSync(path.join(f.directory, 'direct/table'), { recursive: true });
-  writeFileSync(path.join(f.directory, 'direct/table/data.parquet'), 'actual-parquet-fixture');
+  mkdirSync(path.join(f.directory, 'dataflow/table'), { recursive: true });
+  writeFileSync(path.join(f.directory, 'dataflow/table/data.parquet'), 'actual-parquet-fixture');
   writeFileSync(path.join(f.directory, 'results/grafana-validation.json'), '{"passed":true}');
   await f.seal();
   requireSealedAttemptEvidence(f.workspace, f.directory);
@@ -44,7 +44,7 @@ test('qualified success seals exact files, helpers and images privately before t
   assert.equal(manifest.images.length, 6);
   assert.equal(statSync(root).mode & 0o777, 0o700);
   assert.equal(statSync(path.join(root, 'manifest.json')).mode & 0o777, 0o600);
-  assert.equal(readFileSync(path.join(root, 'corpus/direct/table/data.parquet'), 'utf8'), 'actual-parquet-fixture');
+  assert.equal(readFileSync(path.join(root, 'corpus/dataflow/table/data.parquet'), 'utf8'), 'actual-parquet-fixture');
   assert.equal(manifest.entries.filter((entry: { target: string }) => entry.target.startsWith('helpers/')).length, 3);
   assert.deepEqual(f.commands.filter(args => args[0] === 'stop'), [['stop', '--time', '300', 'router-id']]);
   // No real Docker invocation: this is the exact second-start reset with an empty stub daemon.
@@ -128,12 +128,12 @@ for (const target of ['..', 'seal.json', 'manifest.json', 'helpers', 'helpers/de
 for (const state of ['foreign', 'router-exit', 'router-oom', 'mutator-restarted', 'rw-mount', 'wrong-socket-config']) {
   test(`${state} cannot produce a seal or enable a destructive reset`, async t => {
     const f = fixture(t);
-    if (state === 'foreign') f.values[2].labels['com.docker.compose.project.config_files'] = '/foreign/compose.yaml';
-    if (state === 'router-exit') f.values[2].state.ExitCode = 137;
-    if (state === 'router-oom') f.values[2].state.OOMKilled = true;
+    if (state === 'foreign') f.values[1].labels['com.docker.compose.project.config_files'] = '/foreign/compose.yaml';
+    if (state === 'router-exit') f.values[1].state.ExitCode = 137;
+    if (state === 'router-oom') f.values[1].state.OOMKilled = true;
     if (state === 'mutator-restarted') f.values[0].state.Running = true;
     if (state === 'rw-mount') f.values.push({
-      ...f.values[2], id: 'foreign-running', labels: { ...f.values[2].labels, 'com.docker.compose.project': 'foreign' },
+      ...f.values[1], id: 'foreign-running', labels: { ...f.values[1].labels, 'com.docker.compose.project': 'foreign' },
       mounts: [{ Type: 'bind', Source: f.directory, Destination: '/other', RW: true }],
     });
     if (state === 'wrong-socket-config') writeFileSync(path.join(f.directory, 'router-state/config.yaml'), 'server:\n  state_directory: /other\n');
@@ -228,7 +228,7 @@ test('a writable mount appearing after a successful seal blocks the next reset b
   const f = fixture(t);
   await f.seal();
   const resetStart = f.commands.length;
-  f.values[2].state.Running = true;
+  f.values[1].state.Running = true;
   await assert.rejects(resetBenchmark(f.workspace, f.docker), /reset refused/u);
   assert.equal(f.commands.slice(resetStart).some(args => args.includes('rm') || args[0] === 'stop'), false);
   assert.ok(fs.existsSync(path.join(archive(f.workspace), 'seal.json')));
@@ -237,7 +237,7 @@ test('a writable mount appearing after a successful seal blocks the next reset b
 test('host-mapped corpus mounts and an unrelated unlabelled builder are handled without a workspace path guess', async t => {
   const f = fixture(t);
   const hostDirectory = '/owned-host/source/onelake/benchmark/latest';
-  f.values[2].mounts[0].Source = path.join(hostDirectory, 'router-state');
+  f.values[1].mounts[0].Source = path.join(hostDirectory, 'router-state');
   const docker = (args: string[]) => {
     if (args[0] === 'ps') return `${f.docker(args)}\nbuilder`;
     if (args.at(-1) === 'builder') return JSON.stringify({

@@ -618,7 +618,7 @@ async fn active_lease_count(table: &TableIdentity) -> anyhow::Result<i64> {
     let row = client
         .query(
             "SELECT COUNT_BIG(*) AS active_leases FROM arrowcol.routing_table_leases \
-             WHERE implementation_pool = 'direct' AND catalog_name = @P1 AND schema_name = @P2 \
+             WHERE implementation_pool = 'dataflow' AND catalog_name = @P1 AND schema_name = @P2 \
                AND table_name = @P3 AND state = 'active';",
             &[
                 &table.catalog().as_str(),
@@ -642,7 +642,7 @@ async fn delete_fixture_lease(table: &TableIdentity) -> anyhow::Result<()> {
     client
         .execute(
             "DELETE FROM arrowcol.routing_table_leases \
-             WHERE implementation_pool = 'direct' AND catalog_name = @P1 AND schema_name = @P2 \
+             WHERE implementation_pool = 'dataflow' AND catalog_name = @P1 AND schema_name = @P2 \
                AND table_name = @P3;",
             &[
                 &table.catalog().as_str(),

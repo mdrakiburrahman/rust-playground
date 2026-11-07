@@ -635,7 +635,7 @@ fn pressure_validation_rejects_duplicate_tables_and_future_observations() {
 }
 
 /// Instance key reused by a crashed collector and its restarted process.
-const RESTARTED_KEY: &str = "loadtest-direct-1";
+const RESTARTED_KEY: &str = "loadtest-dataflow-1";
 /// Production-like lease duration that outlives the crashed registration.
 const LONG_LEASE_TTL_MS: u64 = 86_400_000;
 
@@ -717,7 +717,7 @@ impl CrashedHolder {
         .await;
         register_with_pressure(
             &store,
-            keyed_registration(stranger, "loadtest-direct-2", 5002, 20_000, 400_000),
+            keyed_registration(stranger, "loadtest-dataflow-2", 5002, 20_000, 400_000),
             250_000,
         )
         .await;
@@ -1068,7 +1068,7 @@ async fn rebalance_hands_crashed_draining_lease_to_same_key_restart() {
     assert_eq!(assigned.instance_id, crashed);
     register_with_pressure(
         &store,
-        keyed_registration(stranger, "loadtest-direct-2", 5002, 20_000, 400_000),
+        keyed_registration(stranger, "loadtest-dataflow-2", 5002, 20_000, 400_000),
         100_002,
     )
     .await;
@@ -1155,7 +1155,7 @@ async fn rebalance_never_moves_crashed_lease_to_different_key_without_drain_proo
     assert_eq!(assigned.instance_id, crashed);
     register_with_pressure(
         &store,
-        keyed_registration(stranger, "loadtest-direct-2", 5002, 20_000, 400_000),
+        keyed_registration(stranger, "loadtest-dataflow-2", 5002, 20_000, 400_000),
         250_000,
     )
     .await;

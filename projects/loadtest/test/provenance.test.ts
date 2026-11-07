@@ -83,7 +83,7 @@ test('provenance whitelists nonsensitive effective resource settings and never s
       ports: [{ host_ip: '127.0.0.1', published: '8080', target: 8080, protocol: 'tcp', password: 'TOP_SECRET' }],
       volumes: [
         { type: 'volume', source: 'TOP_SECRET', target: '/kustodata' },
-        { type: 'bind', source: '/TOP_SECRET', target: '/delta/direct', read_only: true },
+        { type: 'bind', source: '/TOP_SECRET', target: '/delta/dataflow', read_only: true },
       ],
     },
   } });
@@ -96,7 +96,7 @@ test('provenance whitelists nonsensitive effective resource settings and never s
   assert.deepEqual(settings.kusto.environment, { ACCEPT_EULA: 'Y' });
   assert.deepEqual(settings.kusto.ports, [{ target: 8080, published: '8080', host_ip: '127.0.0.1', protocol: 'tcp' }]);
   assert.deepEqual(settings.kusto.mounts, [
-    { type: 'volume', target: '/kustodata' }, { type: 'bind', target: '/delta/direct', read_only: true },
+    { type: 'volume', target: '/kustodata' }, { type: 'bind', target: '/delta/dataflow', read_only: true },
   ]);
   assert.notEqual(sha256('before'), sha256('after'));
   assert.equal(sha256('before').length, 64);

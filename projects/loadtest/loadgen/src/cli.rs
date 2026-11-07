@@ -247,7 +247,7 @@ pub struct RunArgs {
     #[arg(long, env = "LOADTEST_RETRY_WINDOW")]
     pub retry_window: Option<DurationArg>,
 
-    /// Both collectors persist every batch to native Quiver before acknowledging it.
+    /// The Dataflow collector persists every batch to native Quiver before acknowledging it.
     #[arg(long, env = "LOADTEST_QUIVER", default_value_t = false)]
     pub quiver: bool,
 
@@ -377,7 +377,7 @@ pub struct ValidateArgs {
     )]
     pub dataflow_admin_endpoints: Vec<String>,
 
-    /// Both collectors persisted to native Quiver: every acknowledged dataflow row must be published.
+    /// Dataflow persisted to native Quiver: every acknowledged row must be published.
     #[arg(long, env = "LOADTEST_QUIVER", default_value_t = false)]
     pub quiver: bool,
 

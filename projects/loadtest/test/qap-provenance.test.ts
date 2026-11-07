@@ -14,7 +14,7 @@ test('real helper processes isolate provenance from the concurrently appending l
   const fixturePath = path.join(root, 'fixture.json');
   await writeFile(fixturePath, JSON.stringify({
     observed_unix_ms: 1_800_000_000_000, backend: 'native-qap', mode: 'local',
-    tables: Object.fromEntries(['direct', 'dataflow'].flatMap(pool => Array.from({ length: 13 }, (_, index) => [
+    tables: Object.fromEntries(['dataflow'].flatMap(pool => Array.from({ length: 13 }, (_, index) => [
       `${pool}_sqlserver_fixture_${index}`, { available: false, error: 'fixture unavailable' },
     ]))),
   }));

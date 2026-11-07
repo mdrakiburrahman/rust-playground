@@ -115,10 +115,10 @@ test('real maintenance and tenant images are optional, build-covered, and use is
     assert(project.implicitDependencies.includes(image));
   }
   const tenant = compose.services['tenant-stream'];
-  assert(tenant.volumes?.some(volume => typeof volume === 'object' && volume.target === '/delta/direct' && volume.read_only));
+  assert(tenant.volumes?.some(volume => typeof volume === 'object' && volume.target === '/delta/dataflow' && volume.read_only));
   assert(tenant.volumes?.some(volume => typeof volume === 'object' && volume.target === '/checkpoints' && !volume.read_only));
   const maintenance = compose.services['delta-maintenance'];
-  assert(maintenance.volumes?.some(volume => typeof volume === 'object' && volume.target === '/tmp/arrowcol-stress/direct'));
+  assert(maintenance.volumes?.some(volume => typeof volume === 'object' && volume.target === '/tmp/arrowcol-stress/dataflow'));
   assert(!maintenance.command?.includes('--unsafe-short-vacuum-for-tests'));
 });
 
@@ -128,7 +128,7 @@ test('stack includes SQL routing, catalog, router, DFE, Kusto, monitoring and va
     assert(names.includes(service), `missing ${service}`);
     assert.deepEqual(compose.services[service].profiles, ['benchmark']);
   }
-  for (const gone of ['direct-2', 'dataflow-2', 'otelcol-rust', 'hello-world', 'load-driver', 'prometheus']) {
+  for (const gone of ['direct-1', 'dataflow-2', 'otelcol-rust', 'hello-world', 'load-driver', 'prometheus']) {
     assert(!names.includes(gone), `unexpected ${gone}`);
   }
 });

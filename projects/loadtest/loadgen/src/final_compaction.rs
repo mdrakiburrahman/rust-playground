@@ -260,7 +260,7 @@ trait Backend {
 fn exact_keys<T>(values: &BTreeMap<String, T>, expected: &BTreeSet<String>) -> Result<()> {
     ensure!(
         values.keys().cloned().collect::<BTreeSet<_>>() == *expected,
-        "final-compaction table set must match all 26 expected tables"
+        "final-compaction table set must match the expected tables"
     );
     Ok(())
 }
@@ -1713,7 +1713,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_26_table_fixture_compacts_and_binds_independent_validation_inventory() -> Result<()> {
+    async fn local_13_table_fixture_compacts_and_binds_independent_validation_inventory() -> Result<()> {
         let root = tempfile::tempdir()?;
         let arguments = args(root.path());
         receipts(root.path(), serde_json::json!({"run_id":"run-1","passed":true}))?;
@@ -1758,7 +1758,7 @@ mod tests {
         assert_eq!(receipt["passes"].as_array().context("passes")?.len(), 2);
         assert_eq!(
             receipt["passes"][0]["reports"].as_object().context("reports")?.len(),
-            26
+            13
         );
         assert!(
             receipt["passes"][1]["reports"]

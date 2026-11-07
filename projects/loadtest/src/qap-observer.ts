@@ -4,7 +4,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 import { OwnedProcessError, runOwnedProcess } from './owned-process.js';
 
-type Pool = 'direct' | 'dataflow';
+type Pool = 'dataflow';
 interface Point { name: string; pool: Pool; value: number; unit?: string }
 type RecordValue = Record<string, unknown>;
 
@@ -49,7 +49,7 @@ export function qapPoints(value: unknown): { observed: number; points: Point[] }
     throw new Error('Malformed native QAP observation');
   }
   const points: Point[] = [];
-  for (const pool of ['direct', 'dataflow'] as const) {
+  for (const pool of ['dataflow'] as const) {
     const entries = Object.entries(tables).filter(([name]) => name.startsWith(`${pool}_sqlserver_`));
     if (entries.length !== 13) throw new Error(`QAP observation must cover all 13 ${pool} source tables`);
     const available = entries.map(([, table]) => record(table)).filter(table => table?.available === true);
@@ -80,7 +80,7 @@ export function qapPoints(value: unknown): { observed: number; points: Point[] }
       { name: 'qap_observed_tables', pool, value: available.length },
       { name: 'qap_observation_unix_seconds', pool, value: observed / 1000, unit: 's' });
   }
-  if (Object.keys(tables).length !== 26) throw new Error('Unexpected non-source table in QAP observation');
+  if (Object.keys(tables).length !== 13) throw new Error('Unexpected non-source table in QAP observation');
   return { observed, points };
 }
 
@@ -177,7 +177,7 @@ export function startQapObserver(options: {
       process: error instanceof OwnedProcessError ? error.outcome : null,
       supervisor_timed_out: error instanceof OwnedProcessError ? error.supervisor_timed_out : null,
     })}\n`);
-    await exportQapPoints(options.otlpEndpoint, observed, ['direct', 'dataflow'].map(pool => ({
+    await exportQapPoints(options.otlpEndpoint, observed, ['dataflow'].map(pool => ({
       name: 'qap_observation_complete', pool: pool as Pool, value: 0,
     })));
   }).catch(error => {
