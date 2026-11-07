@@ -12,6 +12,7 @@
 | First real partitioned v1 publication | At `420f039`, live catalog CREATE and genuine v1 SDK admission succeeded, but Delta rejected missing partition values. No data commit landed; fixture partitioning was not removed. |
 | Native Azure schema and accelerated data hydration | Observed at `377b388`: v4, 100%, 24 accelerated rows, zero pending files after 292289 ms, with exact old/new values and no post-ALTER management reconciliation. |
 | Azure rehearsal cleanup | Failed: an active publisher remained after owned runtime shutdown despite an unchanged authority generation. Cloud run data and test occupancy were retained; this is not a qualifying pass. |
+| Supported recovery after catalog shutdown repair | `3fa52f5` passed a genuine local regression with clean termination. Authorized isolated recovery used a genuine stop receipt and 61954 ms quiescence, producing fenced-v1, released occupancy and an empty registry without deleting data. Azure reset/full provision and both final rehearsals remain outstanding. |
 | New stamp reaches supported write readiness | Full bootstrap at `937a465` completed initialization under custody, reconciled 26 Delta external tables/QAP, and exported ready-v1 in 138.4 seconds. This is not the final DFE-only topology rehearsal. |
 
 ![Schema evolution architecture](schema-evolution.drawio.png)

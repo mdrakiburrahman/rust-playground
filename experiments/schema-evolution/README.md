@@ -50,3 +50,8 @@ native QAP hydration after 292289 ms. Its overall result is **failed**:
 an active publisher remained after runtime shutdown, so the runner retained
 cloud data and test occupancy. Complete supported publisher drain/recovery
 before another Azure run or fresh-bootstrap qualification.
+
+Supported isolated recovery has since completed with a genuine stop receipt
+and the 60-second safeguard; authority is fenced, occupancy released and the
+registry empty. The failed run remains failed. Reset and full provision must
+use the DFE-only initializer before either final fresh-bootstrap rehearsal.
