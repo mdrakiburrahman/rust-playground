@@ -302,12 +302,13 @@ fn dry_run_then_apply_then_noop() -> Result<()> {
         .output()?;
     assert!(applied.status.success(), "{}", String::from_utf8_lossy(&applied.stderr));
     let reports = lines(&applied.stdout)?;
-    assert_eq!(reports[0]["operation"], "optimize");
+    assert_eq!(reports[0]["operation"], "purge");
     assert_eq!(reports[0]["report"]["outcome"], "committed");
+    assert_eq!(reports[1]["operation"], "optimize");
     assert_eq!(reports[1]["report"]["outcome"], "committed");
     assert_eq!(
-        reports[1]["report"]["files_removed"], 2,
-        "minute 00 was compacted to one file"
+        reports[0]["report"]["files_removed"], 4,
+        "purge removes both expired pairs before optimize rewrites surviving files"
     );
     let after = version(&path)?;
     assert_eq!(after, before + 2);

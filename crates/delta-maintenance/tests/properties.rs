@@ -179,6 +179,14 @@ fn invalid_catalog_properties_and_inventory_errors_fail_without_mutation() -> Re
         assert_eq!(before, inventory(root.path())?);
         source.0.properties.remove(key);
     }
+    let hint = root.path().join("events/_delta_log/_last_checkpoint");
+    for content in ["not-json", "{\"version\":99999}"] {
+        std::fs::write(&hint, content)?;
+        let malformed = inventory(root.path())?;
+        let results = run_cycle_with_discovery(&settings, &source, &Metrics::new(), &Arc::new(AtomicBool::new(false)))?;
+        assert!(results.iter().all(|r| r.error.is_some() && !r.negative_probe));
+        assert_eq!(malformed, inventory(root.path())?);
+    }
     Ok(())
 }
 

@@ -710,12 +710,26 @@ impl DeltaTable {
     ) -> Result<Option<MaintenanceReport>> {
         control.check()?;
         validate_anchor("probe", config.now_ms)?;
+        if (operation == ProbeOperation::Vacuum && config.vacuum_retention_ms < MIN_VACUUM_RETENTION_MS)
+            || (operation == ProbeOperation::PruneLog && config.log_retention_ms < MIN_VACUUM_RETENTION_MS)
+        {
+            return Err(fail(
+                MaintenanceErrorKind::UnsafeRequest,
+                "short retention requires the full acknowledged planner",
+            ));
+        }
         if config.max_listed_files == 0 || config.checkpoint_interval == 0 || config.optimize_min_files < 2 {
             return Err(fail(MaintenanceErrorKind::InvalidPlan, "invalid negative-probe bounds"));
         }
         let logs = self.list_log(config.max_listed_files)?;
         let version = probe_version(&logs)?;
-        let checkpoint = self.hinted_checkpoint_version(false)?;
+        let checkpoint = self.hinted_checkpoint_version(true)?;
+        if checkpoint.is_some_and(|checkpoint| checkpoint > version) {
+            return Err(fail(
+                MaintenanceErrorKind::Unsupported,
+                "checkpoint hint is newer than the log",
+            ));
+        }
         if let Some(checkpoint) = checkpoint
             && (checkpoint > version || !logs.contains_key(&format!("{checkpoint:020}.checkpoint.parquet")))
         {
@@ -747,9 +761,12 @@ impl DeltaTable {
                             }
                         }
                         let newest = groups.keys().next_back();
+                        let ingestion = groups.keys().all(|partition| {
+                            partition.starts_with("__arrowcol_ingestion=") && !partition.contains('/')
+                        });
                         !groups.iter().any(|(partition, count)| {
                             *count >= config.optimize_min_files
-                                && (!config.sealed_partitions_only || Some(partition) != newest || partition.is_empty())
+                                && (!config.sealed_partitions_only || !ingestion || Some(partition) != newest)
                         })
                     }
                     ProbeOperation::Purge => {
@@ -948,7 +965,7 @@ fn probe_version(logs: &BTreeMap<String, ObjectMeta>) -> Result<u64> {
 }
 
 /// Operations supported by negative admission probes.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProbeOperation {
     Purge,
     Optimize,
@@ -3467,6 +3484,12 @@ impl DeltaTable {
             }
         };
         if plan.candidates.is_empty() {
+            if state.snapshot.version() != plan.header.read_version {
+                return Err(fail(
+                    MaintenanceErrorKind::StalePlan,
+                    "log advanced after an empty VACUUM plan; replan",
+                ));
+            }
             let current = self.vacuum_lite_progress()?;
             if current.as_ref().is_none_or(|progress| {
                 progress.table_id != plan.header.fingerprint.table_id || progress.version != plan.header.read_version

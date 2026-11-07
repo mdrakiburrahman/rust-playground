@@ -16,7 +16,7 @@ Probes open the guarded storage transport only: no schema initialization, Delta 
 | Phase | Cheap negative proof |
 | --- | --- |
 | PURGE | No physical ingestion partition ends at or before the retention cutoff. Malformed or non-ingestion partition layouts require the normal planner or return an error. |
-| OPTIMIZE | No eligible physical partition contains the configured minimum small files (at least two). The newest partition is excluded when `sealedPartitionsOnly` is true. Inactive physical files can force a full plan, but cannot authorize compaction. |
+| OPTIMIZE | No eligible physical partition contains the configured minimum small files (at least two). The newest ingestion partition is excluded when `sealedPartitionsOnly` is true; categorical/multi-column Hive partitions conservatively use the full planner. Inactive physical files can force a full plan, but cannot authorize compaction. |
 | VACUUM | Every physical data object is at or newer than the retention cutoff, no old log objects exist, and checkpoint debt is below the configured interval. This is a negative proof only; physical timestamps never authorize deletion. |
 | Checkpoint | Latest log version minus checkpoint version is below `delta.checkpointInterval`. Unsupported multipart/v2 layouts go through the full path. |
 | PRUNE-LOG | No checkpoint exists or no retained log object is older than log retention. Otherwise the existing checkpoint/history equivalence proof remains mandatory. |

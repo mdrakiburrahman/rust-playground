@@ -401,7 +401,15 @@ fn process_defaults(settings: &Settings) -> BTreeMap<String, String> {
 }
 
 fn effective_settings(settings: &Settings, properties: &BTreeMap<String, String>) -> Result<(Settings, ResolvedProps)> {
-    let props = resolve(properties, &process_defaults(settings))?;
+    let mut defaults = process_defaults(settings);
+    if (properties.contains_key("arrowcol.optimize.targetFileSize") || properties.contains_key("delta.targetFileSize"))
+        && !properties.contains_key("arrowcol.optimize.smallFileSize")
+    {
+        // The CLI small-file default is derived from its target, not an
+        // independently supplied policy. Re-derive it from a table target.
+        defaults.remove("arrowcol.optimize.smallFileSize");
+    }
+    let props = resolve(properties, &defaults)?;
     let mut effective = settings.clone();
     if !props.boolean("arrowcol.maintenance.enabled")? {
         effective.operations.clear();
@@ -425,7 +433,11 @@ fn effective_settings(settings: &Settings, properties: &BTreeMap<String, String>
     {
         effective.vacuum_retention_ms = i64::try_from(props.unsigned("arrowcol.vacuum.retention")?)?;
     }
-    if properties.contains_key("delta.logRetentionDuration") || !settings.unsafe_short_vacuum_for_tests {
+    if properties.contains_key("delta.logRetentionDuration")
+        || settings
+            .log_retention_ms
+            .is_none_or(|retention| retention >= arrow_deltalake::maintenance::MIN_VACUUM_RETENTION_MS)
+    {
         effective.log_retention_ms = Some(i64::try_from(props.unsigned("delta.logRetentionDuration")?)?);
     }
     effective.checkpoint_every_commits = props.unsigned("delta.checkpointInterval")?;
@@ -887,9 +899,11 @@ fn maintain_table(
         }
         let probe = DeltaTable::open_for_maintenance_probe(&discovered.url)?;
         if let Some(token) = &discovered.log_token
-            && probe.probe_log_token(100_000)? != *token && probe.maintenance_properties()? != discovered.properties {
-                bail!("table properties changed after discovery; retry");
-            }
+            && probe.probe_log_token(100_000)? != *token
+            && probe.maintenance_properties()? != discovered.properties
+        {
+            bail!("table properties changed after discovery; retry");
+        }
         Ok(Some((discovered, effective, props, probe, gate)))
     })();
     if matches!(&setup, Ok(None)) {
@@ -950,9 +964,14 @@ fn maintain_table(
                     Operation::Checkpoint => ProbeOperation::Checkpoint,
                     Operation::PruneLog => ProbeOperation::PruneLog,
                 };
-                if !(operation == Operation::Optimize && effective.optimize.sealed_final)
-                    && let Some(report) = probe.probe_no_work(probe_operation, &config, &control)?
-                {
+                let full_validation = (operation == Operation::Optimize && effective.optimize.sealed_final)
+                    || (operation == Operation::Vacuum
+                        && effective.vacuum_retention_ms < arrow_deltalake::maintenance::MIN_VACUUM_RETENTION_MS)
+                    || (operation == Operation::PruneLog
+                        && effective.log_retention_ms.is_some_and(|retention| {
+                            retention < arrow_deltalake::maintenance::MIN_VACUUM_RETENTION_MS
+                        }));
+                if !full_validation && let Some(report) = probe.probe_no_work(probe_operation, &config, &control)? {
                     negative_probe = true;
                     return Ok(report);
                 }
@@ -1058,6 +1077,12 @@ fn cycle_with_discovery(
     let names = discovery.tables()?;
     if names.len() > MAX_TABLES {
         bail!("catalog discovery exceeds {MAX_TABLES} tables");
+    }
+    if let Some(schedule) = schedule {
+        let mut schedule = schedule
+            .lock()
+            .map_err(|_| anyhow::anyhow!("maintenance schedule poisoned"))?;
+        schedule.retain(|name, _| names.contains(name));
     }
     let queue = Mutex::new(names.iter().cloned().collect::<VecDeque<_>>());
     let results = Mutex::new(Vec::new());
