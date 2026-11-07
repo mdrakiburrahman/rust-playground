@@ -13,7 +13,7 @@ import { PublisherControl } from '../../../infra/azure/publisher_control.ts';
 import { runExperiment, runProcess, type StageContext } from '../../../tools/libs/experiment-kit/src/experiment.js';
 import { deletePrefix } from '../../azure-qap/src/fixtures.ts';
 import { secretsFrom } from '../../azure-qap/src/main.ts';
-import { Kusto, object, type KustoClient } from '../../azure-qap/src/kusto.ts';
+import { Kusto, object, tables, type KustoClient } from '../../azure-qap/src/kusto.ts';
 import { buildCatalogProof, buildClient } from './build-clients.ts';
 import { nullableBar, physicalCounts, snapshot, type Snapshot } from './delta.ts';
 import { exactRowsQuery, observeHydration, requestedNullQuery, schemaQuery, verifyExactRows } from './hydration.ts';
@@ -212,6 +212,11 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
               signal: AbortSignal.any([requestSignal, AbortSignal.timeout(60_000)]) });
             const data = Buffer.from(await response.arrayBuffer());
             if (!response.ok) throw new Error(`Kustainer HTTP ${response.status}: ${data.toString().slice(0, 1000)}`);
+            try { tables(JSON.parse(data.toString())); }
+            catch (error) {
+              fs.writeFileSync(path.join(out, 'kustainer-error-response.json'), data);
+              throw error;
+            }
             return [data, Object.fromEntries(response.headers)];
           } };
           kusto = new Kusto(transport, 'NetDefaultDB', runId);
