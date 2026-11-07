@@ -36,6 +36,19 @@ historical clients before cleanup.
 
 Run inside the repository devcontainer.
 
+```bash
+cargo run --locked -p arrowcol-sdk-gen -- generate \
+  --catalog-endpoint http://127.0.0.1:8817 \
+  --ddl schemas/events.sql --table telemetry.prod.events \
+  --out .temp/sdk/events --export-artifacts .temp/catalog/events
+```
+
+`--ddl` is repeatable and ordered; each regular `.sql` file is one Spark DDL
+statement. The command connects to the running catalog, executes Flight SQL,
+then validates the catalog's committed history and artifacts. `--version 1`
+selects a historical contract without changing it to the current head.
+`--artifacts` remains available for offline generation from validated exports.
+
 | Command | Expected result |
 | --- | --- |
 | `npx --no-install nx run arrowcol-sdk-gen:generate` | Separate v1/v2 artifacts and Rust/TS SDKs |
@@ -44,11 +57,13 @@ Run inside the repository devcontainer.
 | `npx --no-install nx run arrowcol-sdk-gen:generated-test` | Generated Rust/Prost and TypeScript packages compile and execute |
 | `npx --no-install nx run arrowcol-sdk-gen:package-artifact` | Deterministic SDK archive |
 
-The fixtures hydrate CREATE followed by ALTER into distinct immutable versions;
+Offline fixtures materialize CREATE followed by ALTER into distinct immutable versions;
 v1 output is not regenerated as v2. CI compares their separate `schema.proto`
 files using the pinned npm Buf CLI and root `buf.yaml`. Rust compatibility checks
 remain stricter than protobuf: existing Arrow fields and partition roles cannot
 change, and additions must be nullable trailing columns.
+
+## Evolution and limits
 
 A historical SDK continues to send its exact registered old Arrow layout.
 The collector reuses existing arrays and null-fills only new trailing fields.

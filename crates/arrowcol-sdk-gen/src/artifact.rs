@@ -151,6 +151,20 @@ impl ArtifactBundle {
     ///
     /// Returns an error when catalog descriptor generation fails.
     pub fn from_schema(schema: CatalogSchemaVersion) -> SdkGenResult<Self> {
+        let rebuilt = CatalogSchemaVersion::new(
+            schema.table_id(),
+            schema.identity().clone(),
+            schema.version(),
+            schema.fields().to_vec(),
+            schema.canonical_ddl(),
+        )
+        .and_then(|rebuilt| rebuilt.with_metadata(schema.metadata().clone()))
+        .map_err(|error| SdkGenError::Artifact(error.to_string()))?;
+        if rebuilt != schema {
+            return Err(SdkGenError::Artifact(
+                "catalog schema fingerprint or invariants are inconsistent".to_owned(),
+            ));
+        }
         let generated =
             generate_descriptor_artifacts(&schema).map_err(|error| SdkGenError::Artifact(error.to_string()))?;
         let descriptors = FileDescriptorSet::decode(generated.protobuf_descriptor())?;

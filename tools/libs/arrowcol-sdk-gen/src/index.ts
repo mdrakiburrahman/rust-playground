@@ -21,6 +21,8 @@ export const generatedOutput =
   'crates/arrowcol-sdk-gen/.temp/generated';
 export const packageArchive =
   'crates/arrowcol-sdk-gen/.temp/arrowcol-sdk.tar.gz';
+export const evolvedPackageArchive =
+  'crates/arrowcol-sdk-gen/.temp/arrowcol-sdk-v2.tar.gz';
 export const validationRoot =
   'target/arrowcol-sdk-gen-validation';
 export const validationCargoTarget =
@@ -70,13 +72,12 @@ export class SdkGenerationTool {
     return { commands };
   }
 
-  generate(): WorkflowResult {
+  generate(args: readonly string[] = []): WorkflowResult {
     return {
       commands: [
         this.#generator([
           'generate',
-          '--artifacts',
-          fixtureArtifacts,
+          ...args,
           '--out',
           generatedOutput,
         ]),
@@ -93,6 +94,10 @@ export class SdkGenerationTool {
           fixtureArtifacts,
           '--out',
           generatedOutput,
+        ]),
+        this.#generator([
+          'check', '--artifacts', evolvedFixtureArtifacts,
+          '--out', evolvedGeneratedOutput,
         ]),
       ],
     };
@@ -119,25 +124,31 @@ export class SdkGenerationTool {
   }
 
   testGenerated(): WorkflowResult {
-    const validation = resolve(this.#workspace, validationRoot);
+    const previous = this.#testGenerated(generatedOutput, validationRoot);
+    const current = this.#testGenerated(evolvedGeneratedOutput, `${validationRoot}-v2`);
+    return { commands: [...previous.commands, ...current.commands] };
+  }
+
+  #testGenerated(source: string, root: string): WorkflowResult {
+    const validation = resolve(this.#workspace, root);
     rmSync(validation, { force: true, recursive: true });
     mkdirSync(validation, { recursive: true });
-    cpSync(resolve(this.#workspace, generatedOutput, 'rust'), resolve(validation, 'rust'), {
+    cpSync(resolve(this.#workspace, source, 'rust'), resolve(validation, 'rust'), {
       recursive: true,
     });
     cpSync(
-      resolve(this.#workspace, generatedOutput, 'typescript'),
+      resolve(this.#workspace, source, 'typescript'),
       resolve(validation, 'typescript'),
       { recursive: true },
     );
     cpSync(
-      resolve(this.#workspace, generatedOutput, 'descriptors'),
+      resolve(this.#workspace, source, 'descriptors'),
       resolve(validation, 'descriptors'),
       { recursive: true },
     );
 
-    const rustManifest = `${validationRoot}/rust/Cargo.toml`;
-    const typescriptConfig = `${validationRoot}/typescript/tsconfig.json`;
+    const rustManifest = `${root}/rust/Cargo.toml`;
+    const typescriptConfig = `${root}/typescript/tsconfig.json`;
     const environment = {
       ...process.env,
       CARGO_TARGET_DIR: resolve(this.#workspace, validationCargoTarget),
@@ -193,7 +204,7 @@ export class SdkGenerationTool {
         '--no-install',
         'tsx',
         '--test',
-        `${validationRoot}/typescript/test/generated.test.ts`,
+        `${root}/typescript/test/generated.test.ts`,
       ]),
     ];
     return { commands };
@@ -208,6 +219,10 @@ export class SdkGenerationTool {
           generatedOutput,
           '--out',
           packageArchive,
+        ]),
+        this.#generator([
+          'package-artifact', '--input', evolvedGeneratedOutput,
+          '--out', evolvedPackageArchive,
         ]),
       ],
     };

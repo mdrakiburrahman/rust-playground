@@ -60,10 +60,19 @@ test('check CLI delegates to deterministic check workflow', () => {
   const tool = new SdkGenerationTool(process.cwd(), runner);
   const commands = runCli(['check'], tool);
 
-  assert.equal(commands.length, 1);
+  assert.equal(commands.length, 2);
   assert.ok(runner.calls[0]?.args.includes('check'));
 });
 
+test('generate CLI hydrates SQL against a catalog rather than silently reading fixture artifacts', () => {
+  const runner = new RecordingRunner();
+  const tool = new SdkGenerationTool(process.cwd(), runner);
+  runCli(['generate', '--catalog-endpoint', 'http://localhost:8817',
+    '--table', 'telemetry.prod.sdk_events', '--ddl', 'schemas/events.sql'], tool);
+  assert.ok(runner.calls[0]?.args.includes('--catalog-endpoint'));
+  assert.ok(runner.calls[0]?.args.includes('schemas/events.sql'));
+  assert.ok(!runner.calls[0]?.args.includes('--artifacts'));
+});
 test('CLI rejects unknown workflows', () => {
   const runner = new RecordingRunner();
   const tool = new SdkGenerationTool(process.cwd(), runner);

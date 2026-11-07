@@ -3,9 +3,10 @@ use std::{fs, path::PathBuf};
 use arrowcol_catalog::{
     CatalogSchemaVersion, DdlCommand, DdlParser, SchemaVersion, deterministic_table_id, next_protobuf_field_number,
 };
+use arrowcol_protocol::{CatalogName, SchemaName, TableIdentity, TableName};
 use arrowcol_sdk_gen::{
-    ArtifactBundle, SafeOutputPath, check_generated_sdk, generate_sdk, package_generated_sdk, verify_compatibility,
-    write_artifact_bundle,
+    ArtifactBundle, SafeOutputPath, check_generated_sdk, generate_sdk, hydrate_catalog, package_generated_sdk,
+    verify_compatibility, write_artifact_bundle,
 };
 use clap::{Parser, Subcommand};
 use serde::Serialize;
@@ -25,8 +26,23 @@ enum Command {
     /// Generate and atomically replace both language SDKs.
     Generate {
         /// Directory containing manifest.json, schema.arrow, and descriptor.pb.
+        #[arg(long, conflicts_with_all = ["catalog_endpoint", "ddl", "table", "version", "export_artifacts"])]
+        artifacts: Option<PathBuf>,
+        /// Running catalog's Flight SQL and schema RPC endpoint.
+        #[arg(long, required_unless_present = "artifacts")]
+        catalog_endpoint: Option<String>,
+        /// Ordered Spark SQL files to hydrate before generation; repeat for each file.
         #[arg(long)]
-        artifacts: PathBuf,
+        ddl: Vec<PathBuf>,
+        /// Fully qualified catalog.schema.table identity.
+        #[arg(long, required_unless_present = "artifacts")]
+        table: Option<String>,
+        /// Registered historical version; default is the committed head.
+        #[arg(long)]
+        version: Option<u64>,
+        /// Also export the selected canonical artifacts for compatibility checks.
+        #[arg(long)]
+        export_artifacts: Option<PathBuf>,
         /// Workspace-relative output below .temp or target.
         #[arg(long)]
         out: PathBuf,
@@ -75,19 +91,50 @@ enum Command {
     },
 }
 
-fn main() {
-    if let Err(error) = run(Cli::parse()) {
+#[tokio::main]
+async fn main() {
+    if let Err(error) = run(Cli::parse()).await {
         eprintln!("arrowcol-sdk-gen: {error}");
         std::process::exit(1);
     }
 }
 
-fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let workspace = std::env::current_dir()?;
     match cli.command {
-        Command::Generate { artifacts, out } => {
-            let bundle = ArtifactBundle::load_directory(artifacts)?;
+        Command::Generate {
+            artifacts,
+            catalog_endpoint,
+            ddl,
+            table,
+            version,
+            export_artifacts,
+            out,
+        } => {
             let output = SafeOutputPath::new(&workspace, out)?;
+            let exported = export_artifacts
+                .map(|path| SafeOutputPath::new(&workspace, path))
+                .transpose()?;
+            let bundle = if let Some(artifacts) = artifacts {
+                ArtifactBundle::load_directory(artifacts)?
+            } else {
+                let endpoint = catalog_endpoint.ok_or("catalog endpoint is required")?;
+                let table = table.ok_or("catalog table is required")?;
+                let parts = table.split('.').collect::<Vec<_>>();
+                let [catalog, schema, table] = parts.as_slice() else {
+                    return Err("--table must be catalog.schema.table".into());
+                };
+                let identity = TableIdentity::new(
+                    CatalogName::new(*catalog)?,
+                    SchemaName::new(*schema)?,
+                    TableName::new(*table)?,
+                );
+                let version = version.map(SchemaVersion::new).transpose()?;
+                hydrate_catalog(&endpoint, &ddl, &identity, version).await?
+            };
+            if let Some(exported) = exported {
+                write_artifact_bundle(&bundle, &exported)?;
+            }
             print_json(&generate_sdk(&bundle, &output)?)?;
         }
         Command::Check { artifacts, out } => {

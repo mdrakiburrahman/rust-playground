@@ -1078,9 +1078,11 @@ dependencies = [
 name = "arrowcol-sdk-gen"
 version = "0.1.0"
 dependencies = [
+ "arrow-flight",
  "arrow-ipc 58.4.0",
  "arrow-schema 58.4.0",
  "arrowcol-catalog",
+ "arrowcol-catalog-client",
  "arrowcol-protocol",
  "clap",
  "flate2",
@@ -1095,6 +1097,8 @@ dependencies = [
  "syn 2.0.119",
  "tar",
  "thiserror 2.0.21",
+ "tokio",
+ "tonic",
 ]
 
 [[package]]
