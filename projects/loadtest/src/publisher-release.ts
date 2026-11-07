@@ -62,10 +62,11 @@ export async function admitPublisherRelease(options: {
   assert.deepEqual(executableIdentity(options.sdk), sdk, 'SDK changed during release proof');
   const bytes = readFileSync(path.join(results, 'publisher-release.json'));
   const proof = JSON.parse(bytes.toString('utf8')) as {
-    passed?: unknown; run_id?: unknown; errors?: unknown; routing?: unknown;
+    passed?: unknown; run_id?: unknown; errors?: unknown; routing?: unknown; publishers?: unknown;
   };
   assert(proof.passed === true && proof.run_id === metadata.run_id && Array.isArray(proof.errors)
-    && proof.errors.length === 0 && proof.routing, 'routing publisher release is not proven');
+    && proof.errors.length === 0 && hasRoutingProof(proof.routing, proof.publishers),
+  'routing publisher release is not proven');
   const sha256 = (bytes: Buffer): string => createHash('sha256').update(bytes).digest('hex');
   atomicJson(path.join(results, 'publisher-admission.json'), {
     passed: true, run_id: metadata.run_id, sql: options.sql, root: realpathSync(directory), mutators: stopped,
@@ -80,6 +81,30 @@ export async function admitPublisherRelease(options: {
     assert.deepEqual(executableIdentity(options.sdk), sdk, 'SDK changed during final compaction');
   }
   return stopped;
+}
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown> : undefined;
+}
+
+function hasRoutingProof(value: unknown, publishersValue: unknown): boolean {
+  const routing = record(value);
+  const publisher = Array.isArray(publishersValue) && publishersValue.length === 1
+    ? record(publishersValue[0]) : undefined;
+  if (!routing || !Number.isSafeInteger(routing.loaded_at_unix_ms) ||
+      !Array.isArray(routing.collectors) || !Array.isArray(routing.leases) ||
+      publisher?.implementation_pool !== 'dataflow' ||
+      publisher.instance_key !== 'loadtest-dataflow-1' ||
+      typeof publisher.instance_id !== 'string' || publisher.instance_id.length === 0 ||
+      typeof publisher.state !== 'string' || publisher.terminated !== false) return false;
+  return routing.collectors.some(value => {
+    const collector = record(value);
+    return collector !== undefined && collector.instance_id === publisher.instance_id &&
+      collector.instance_key === publisher.instance_key &&
+      collector.implementation_pool === publisher.implementation_pool &&
+      collector.state === 'stopped' && collector.terminated === true;
+  });
 }
 
 export function atomicJson(file: string, value: unknown): void {

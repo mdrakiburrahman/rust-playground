@@ -153,11 +153,17 @@ test('final capture stops every mutator but keeps Kusto and live-evidence servic
       'com.docker.compose.project.config_files': path.join(workspace, 'projects/loadtest/compose.yaml'),
     } });
   };
-  assert.deepEqual(await stopBenchmark(workspace, docker, { mutatorsOnly: true, requireCleanMutators: true }), services.slice(0, 4));
-  assert.deepEqual(commands.find(args => args[0] === 'stop'), ['stop', '--time', '300', ...services.slice(0, 4)]);
+  assert.deepEqual(await stopBenchmark(workspace, docker, { mutatorsOnly: true, requireCleanMutators: true }), services.slice(0, 3));
+  assert.deepEqual(commands.find(args => args[0] === 'stop'), ['stop', '--time', '300', ...services.slice(0, 3)]);
   const partial = mockDocker(workspace);
-  await assert.rejects(stopBenchmark(workspace, partial.docker, { mutatorsOnly: true, requireCleanMutators: true }), /both positively identified/u);
-  assert(partial.commands.every(args => args[0] !== 'stop'));
+  const partialCommands: string[][] = [];
+  const missingWriter = (args: string[]): string => {
+    partialCommands.push(args);
+    return args[0] === 'ps' ? 'unrelated' : partial.docker(args);
+  };
+  await assert.rejects(stopBenchmark(workspace, missingWriter, { mutatorsOnly: true, requireCleanMutators: true }),
+    /positively identified Dataflow writer/u);
+  assert(partialCommands.every(args => args[0] !== 'stop'));
 });
 
 test('full stop drains mutators before SQL Server and other infrastructure', async t => {

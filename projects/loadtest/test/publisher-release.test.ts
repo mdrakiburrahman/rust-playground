@@ -47,8 +47,13 @@ function fixture(t: TestContext) {
     assert(stopped);
     assert(existsSync(path.join(results, 'mutator-drain.json')));
     events.push('sql-release');
-    writeFileSync(path.join(results, 'publisher-release.json'),
-      JSON.stringify({ passed: true, run_id: 'run-1', errors: [], routing: {} }));
+    writeFileSync(path.join(results, 'publisher-release.json'), JSON.stringify({ passed: true, run_id: 'run-1',
+      checked_at_unix_ms: 2, publishers: [{ instance_id: '22222222-2222-4222-8222-222222222222',
+        instance_key: 'loadtest-dataflow-1', implementation_pool: 'dataflow', state: 'ready', terminated: false }],
+      errors: [], routing: { run_id: null, loaded_at_unix_ms: 3,
+        collectors: [{ instance_id: '22222222-2222-4222-8222-222222222222',
+          instance_key: 'loadtest-dataflow-1', implementation_pool: 'dataflow', state: 'stopped', terminated: true }],
+        leases: [] } }));
   };
   const compact = async () => { events.push('final-compaction'); };
   return { workspace, directory, results, sdk, docker, stop, release, compact, events,
