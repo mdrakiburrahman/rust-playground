@@ -19,6 +19,7 @@ test-control = ["delta"]
 anyhow.workspace = true
 opentelemetry = { workspace = true, optional = true }
 arrow = { version = "58.3", default-features = false }
+arrow-json = { version = "58.3", default-features = false }
 parquet = { version = "58.3", default-features = false, features = ["arrow", "async"] }
 tokio = { version = "1", features = ["fs", "io-util", "process", "rt-multi-thread", "sync", "time", "macros"] }
 uuid = { version = "1", features = ["v4"] }

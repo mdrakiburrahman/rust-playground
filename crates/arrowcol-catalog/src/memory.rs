@@ -103,6 +103,24 @@ impl MemoryCatalogStore {
         Ok(())
     }
 
+    /// Removes a table after its Delta tombstone has committed.
+    ///
+    /// # Errors
+    /// Rejects removal during an active schema change.
+    pub async fn remove_committed(&self, identity: &TableIdentity) -> CatalogResult<()> {
+        let mut state = self.state.lock().await;
+        if state.active.contains_key(identity) {
+            return Err(CatalogError::new(
+                CatalogErrorCode::SchemaChangeInProgress,
+                "cannot remove a table during an active schema change",
+            ));
+        }
+        state.current.remove(identity);
+        state.versions.remove(identity);
+        state.artifacts.retain(|(table, _), _| table != identity);
+        Ok(())
+    }
+
     /// Fails the next matching operation.
     pub async fn fail_next(&self, point: FailurePoint) {
         self.state.lock().await.failures.push_back(point);

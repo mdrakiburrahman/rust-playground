@@ -47,6 +47,7 @@ test('discovers production images and retains the sample publication', () => {
     'arrowcol-rust',
     'arrowcol-dataflow-rust',
     'arrowcol-router-rust',
+    'arrowcol-catalog-rust',
     'delta-maintenance',
     'arrow-tenant-stream',
     'kusto-explorer',
@@ -94,10 +95,10 @@ test('fails closed when a source-built publication is missing or unexpected', ()
   );
 });
 
-test('all six loadtest images retain local build behavior with clean Git revision metadata', () => {
+test('all loadtest images retain local build behavior with clean Git revision metadata', () => {
   const expected = [
     'arrowcol-rust', 'arrowcol-dataflow-rust', 'arrowcol-router-rust',
-    'kusto-explorer', 'arrow-tenant-stream', 'delta-maintenance',
+    'arrowcol-catalog-rust', 'kusto-explorer', 'arrow-tenant-stream', 'delta-maintenance',
   ];
   const loadtest = JSON.parse(readFileSync(join(workspace, 'projects/loadtest/project.json'), 'utf8')) as ProjectConfiguration;
   const images = loadtest.targets?.build?.dependsOn?.filter(
@@ -137,7 +138,7 @@ const COLLECTOR_IMAGE_PROJECTS = [
 ];
 // Web images compile a wasm UI and serve read-only static assets instead of configuration files.
 const WEB_IMAGE_PROJECTS = ['kusto-explorer'];
-const SERVICE_IMAGE_PROJECTS = ['delta-maintenance', 'arrow-tenant-stream'];
+const SERVICE_IMAGE_PROJECTS = ['delta-maintenance', 'arrow-tenant-stream', 'arrowcol-catalog-rust'];
 
 test('every production runtime image is classified for Dockerfile policy', () => {
   assert.deepEqual(
@@ -171,10 +172,10 @@ test('runtime Dockerfiles pin build and runtime bases and enforce production bou
       project,
     );
     assert.match(dockerfile, /COPY submodules\/otel-arrow/u, project);
-    if (dockerfile.includes('sh /tmp/install-azure-cli.sh')) {
+    if (dockerfile.includes('sh /tmp/install-azure-cli.sh') || dockerfile.includes('sh /usr/local/share/install-azure-cli.sh')) {
       assert.match(
         dockerfile,
-        /COPY(?: --chmod=\d+)? infra\/docker\/install-azure-cli\.sh \/tmp\/install-azure-cli\.sh/u,
+        /COPY(?: --chmod=\d+)? infra\/docker\/install-azure-cli\.sh \/(?:tmp|usr\/local\/share)\/install-azure-cli\.sh/u,
         project,
       );
     } else {
@@ -219,7 +220,7 @@ test('runtime Dockerfiles pin build and runtime bases and enforce production bou
 
 test('Kernel consumer lint caches include their library dependencies', () => {
   const projects = workspaceProjects();
-  for (const project of ['delta-maintenance', 'arrow-tenant-stream']) {
+  for (const project of ['delta-maintenance', 'arrow-tenant-stream', 'arrowcol-catalog-rust']) {
     const config = projects[project];
     assert(config, project);
     assert(config.implicitDependencies?.includes('arrow-deltalake'), project);
@@ -228,15 +229,15 @@ test('Kernel consumer lint caches include their library dependencies', () => {
 });
 
 test('Azure writer images install the shared CLI and reap orphan descendants', () => {
-  for (const project of ['arrowcol-rust', 'arrowcol-dataflow-rust', 'delta-maintenance', 'arrow-tenant-stream']) {
+  for (const project of ['arrowcol-rust', 'arrowcol-dataflow-rust', 'delta-maintenance', 'arrow-tenant-stream', 'arrowcol-catalog-rust']) {
     const dockerfile = readFileSync(
       join(workspace, projectPath(project).replace(/project\.json$/u, 'Dockerfile')),
       'utf8',
     );
-    assert.match(dockerfile, /sh \/tmp\/install-azure-cli\.sh/u, project);
+    assert.match(dockerfile, /sh \/(?:tmp|usr\/local\/share)\/install-azure-cli\.sh/u, project);
     assert.match(
       dockerfile,
-      /COPY(?: --chmod=\d+)? infra\/docker\/install-azure-cli\.sh \/tmp\/install-azure-cli\.sh/u,
+      /COPY(?: --chmod=\d+)? infra\/docker\/install-azure-cli\.sh \/(?:tmp|usr\/local\/share)\/install-azure-cli\.sh/u,
       project,
     );
     assert.match(dockerfile, /ENTRYPOINT \[\s*"\/usr\/bin\/tini"/u, project);
@@ -267,6 +268,7 @@ interface PublishWorkflow {
     group?: string;
   };
   jobs: Record<string, {
+    if?: string;
     needs?: string;
     permissions?: Record<string, string>;
     strategy?: {
@@ -274,12 +276,15 @@ interface PublishWorkflow {
       matrix?: string;
     };
     steps?: Array<{
+      if?: string;
+      env?: Record<string, string>;
       name?: string;
       run?: string;
     }>;
   }>;
   on: {
     push: {
+      branches: string[];
       paths: string[];
     };
   };
@@ -333,4 +338,57 @@ test('publish workflow discovers, smokes, publishes, and verifies the matrix wit
   assert(paths.has('submodules/otel-arrow/**'));
   assert(paths.has('tools/libs/rust-playground-build/**'));
   assert(paths.has('tools/scripts/**'));
+});
+
+test('catalog image stays Rust-only with an unprivileged healthchecked runtime', () => {
+  const config = workspaceProjects()['arrowcol-catalog-rust'];
+  assert(config.implicitDependencies?.includes('arrowcol-catalog'));
+  assert.deepEqual(config.targets?.verify?.dependsOn, ['format-check', 'lint', 'build', 'test']);
+  const dockerfile = readFileSync(join(workspace, 'projects/arrowcol-catalog-rust/Dockerfile'), 'utf8');
+  assert.match(dockerfile, /--package arrowcol-catalog-rust/u);
+  assert.match(dockerfile, /EXPOSE 8817/u);
+  assert(dockerfile.includes('CMD ["/usr/local/bin/arrowcol-catalog-rust", "--healthcheck"]'));
+  assert(dockerfile.includes('ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/arrowcol-catalog-rust"]'));
+  assert.doesNotMatch(dockerfile, /nodejs/u);
+  assert.match(dockerfile, /ENV AZURE_CONFIG_DIR=\/var\/lib\/arrowcol-catalog-azure/u);
+  assert.match(dockerfile, /install -d --owner app --group app --mode 0700 \/var\/lib\/arrowcol-catalog-azure \/data\/catalog \/data\/warehouse/u);
+  for (const target of ['image', 'publish']) {
+    assert(config.targets?.[target]?.inputs?.includes('{workspaceRoot}/infra/docker/install-azure-cli.sh'), target);
+  }
+  const smokeCommands = config.targets?.['image-smoke']?.options?.commands as string[];
+  assert(smokeCommands.some(command => command.includes('az version') && command.includes('test -z')));
+  assert(smokeCommands.some(command => command.includes('docker exec') && command.includes('--healthcheck')));
+  const root = JSON.parse(readFileSync(join(workspace, 'project.json'), 'utf8')) as ProjectConfiguration;
+  assert(root.implicitDependencies?.includes('arrowcol-catalog-rust'));
+  for (const target of ['clean', 'format', 'format-check', 'lint', 'build', 'test']) {
+    assert(root.targets?.[target]?.dependsOn?.some(dependency =>
+      typeof dependency === 'object' && dependency.target === target &&
+      Array.isArray(dependency.projects) && dependency.projects.includes('arrowcol-catalog-rust')
+    ), target);
+  }
+});
+
+test('integration previews push only immutable SHA tags without release aliases or PR credentials', () => {
+  const workflow = parse(readFileSync(join(workspace, '.github/workflows/publish-images.yml'), 'utf8')) as PublishWorkflow;
+  assert.deepEqual(workflow.on.push.branches, ['main', 'mdrakiburrahman-schema-catalog']);
+  assert(!('pull_request' in workflow.on));
+  assert(!('pull_request_target' in workflow.on));
+  assert.equal(workflow.jobs.publish?.if, "github.event_name == 'push' || github.event_name == 'workflow_dispatch'");
+  const steps = workflow.jobs.publish?.steps ?? [];
+  const byName = (name: string) => {
+    const step = steps.find(step => step.name === name);
+    assert(step, name);
+    return step;
+  };
+  const preview = byName('Publish immutable preview SHA only');
+  assert.equal(preview.if, "github.ref == 'refs/heads/mdrakiburrahman-schema-catalog'");
+  assert.equal(preview.run, 'npx --no-install nx run "$IMAGE_PROJECT:publish" --tags="sha-${REGISTRY_SHA}"');
+  assert.doesNotMatch(preview.run ?? '', /latest|stable|:main/u);
+  assert.equal(byName('Publish branch and SHA tags').if, "github.ref != 'refs/heads/main' && github.ref != 'refs/heads/mdrakiburrahman-schema-catalog'");
+  assert.equal(byName('Publish branch, SHA, and latest tags').if, "github.ref == 'refs/heads/main'");
+  assert.equal(byName('Verify latest manifest').if, "github.ref == 'refs/heads/main'");
+  assert.equal(byName('Verify branch manifest').if, "github.ref != 'refs/heads/mdrakiburrahman-schema-catalog'");
+  const metadata = byName('Resolve branch and immutable tags');
+  assert.equal(metadata.env?.REGISTRY_PREVIEW, "${{ github.ref == 'refs/heads/mdrakiburrahman-schema-catalog' }}");
+  assert.match(metadata.run ?? '', /if \(process\.env\.REGISTRY_PREVIEW === "true"\) \{\s+tags\.values = \[tags\.shaTag\];\s+writeFileSync/u);
 });

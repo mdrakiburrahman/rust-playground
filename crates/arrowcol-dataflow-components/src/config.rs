@@ -4,8 +4,8 @@ use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 
 use arrowcol_catalog::{
-    CatalogControlPlane, CatalogStore, DdlParser, HiveMetastore, HiveMetastoreConfig, MemoryCatalogStore,
-    MemoryMetastore, SqlServerCatalogStore, SqlServerConfig,
+    CatalogControlPlane, CatalogStore, DdlParser, FlightSqlDdlHandler, HiveMetastore, HiveMetastoreConfig,
+    MemoryCatalogStore, MemoryMetastore, SqlServerCatalogStore, SqlServerConfig,
 };
 use arrowcol_flight::{RuntimeLimits, RuntimeResult};
 use arrowcol_protocol::{PositiveMeasurement, UnixMillis};
@@ -190,6 +190,14 @@ impl HiveMetastoreConnectionConfig {
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CatalogConfig {
+    /// Standalone Flight SQL catalog with a bounded CES-backed schema cache.
+    Remote {
+        /// Flight SQL and CES endpoint, for example http://arrowcol-catalog:8817.
+        endpoint: String,
+        /// Maximum cache age without confirmed CES high-watermark reconciliation.
+        #[serde(default = "default_catalog_cache_age", with = "humantime_serde")]
+        maximum_cache_age: Duration,
+    },
     /// Empty in-memory catalog and metastore, intended for focused development.
     Memory,
     /// Production application database plus Hive Metastore.
@@ -208,9 +216,25 @@ fn default_timezone() -> String {
     "UTC".to_owned()
 }
 
+fn default_catalog_cache_age() -> Duration {
+    Duration::from_secs(30)
+}
+
 impl CatalogConfig {
     pub(crate) fn validate(&self) -> Result<(), String> {
         match self {
+            Self::Remote {
+                endpoint,
+                maximum_cache_age,
+            } => {
+                if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) || maximum_cache_age.is_zero()
+                {
+                    return Err(
+                        "remote catalog endpoint must be HTTP(S) and maximum_cache_age must be positive".to_owned(),
+                    );
+                }
+                Ok(())
+            }
             Self::Memory => Ok(()),
             Self::SqlHive {
                 application_database,
@@ -229,8 +253,19 @@ impl CatalogConfig {
 
     pub(crate) async fn start(
         &self,
-    ) -> arrowcol_catalog::CatalogResult<(Arc<dyn CatalogStore>, Arc<CatalogControlPlane>)> {
+    ) -> arrowcol_catalog::CatalogResult<(Arc<dyn CatalogStore>, Arc<dyn FlightSqlDdlHandler>)> {
         match self {
+            Self::Remote {
+                endpoint,
+                maximum_cache_age,
+            } => {
+                let client =
+                    arrowcol_catalog_client::RemoteCatalogClient::connect(endpoint, *maximum_cache_age).await?;
+                Ok((
+                    Arc::clone(&client) as Arc<dyn CatalogStore>,
+                    client as Arc<dyn FlightSqlDdlHandler>,
+                ))
+            }
             Self::Memory => {
                 let store: Arc<dyn CatalogStore> = Arc::new(MemoryCatalogStore::new());
                 let metastore = Arc::new(MemoryMetastore::new());

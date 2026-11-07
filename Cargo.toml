@@ -3,6 +3,7 @@ members = [
     "bin/*",
     "crates/*",
     "projects/arrowcol-rust",
+    "projects/arrowcol-catalog-rust",
     "projects/arrowcol-router-rust",
     "projects/arrowcol-dataflow-rust",
     "projects/kusto-explorer",
