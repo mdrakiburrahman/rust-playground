@@ -92,6 +92,46 @@ test('network preflight excludes only an exactly owned unchanged stamp VNet on r
   network.addressSpace.addressPrefixes = ['10.0.0.0/16'];
   await assert.rejects(b.existing_network_prefixes(client, SUB, c), /address space differs/);
 });
+for (const state of ['missing', 'empty', 'legacy', 'identity', 'denied'] as const)
+  test(`preflight preserves inventory safety for a ${state} resource group`, async () => {
+    const c = azure.c, aks = c.stampConfig.aks;
+    c.operator = SUB;
+    c.stampConfig.publisherFederatedCredentials.push({
+      name: 'publisher', issuer: 'https://token.actions.githubusercontent.com',
+      subject: 'repo:example/repo:environment:publish',
+    });
+    let inventories = 0;
+    mock.method(azure, 'arm', async (method: string, resourcePath: string, _body: unknown, missing: boolean, api: string) => {
+      assert.deepEqual([method, resourcePath, missing, api], ['GET', c.base, true, '2022-09-01']);
+      if (state === 'denied') throw new b.HttpFailure(403, 'Resource group metadata denied');
+      return state === 'missing' ? null : { tags: azure.tags };
+    });
+    mock.method(azure, 'cli', async (...args: string[]) => {
+      switch (args.slice(0, 2).join(' ')) {
+        case 'account show': return { id: c.subscription };
+        case 'provider show': return { registrationState: 'Registered' };
+        case 'aks get-versions': return {
+          values: [{ version: aks.version.split('.').slice(0, 2).join('.'), patchVersions: { [aks.version]: {} } }],
+        };
+        case 'vm list-skus': return [{
+          name: aks.systemPool.vmSize, family: 'testFamily', capabilities: [{ name: 'vCPUs', value: '1' }],
+        }];
+        case 'vm list-usage': return [{ name: { value: 'testFamily' }, currentValue: 0, limit: 100 }];
+        case 'feature show': return { properties: { state: 'Registered' } };
+        case 'network vnet': return [];
+        case 'resource list':
+          inventories++;
+          return state === 'legacy' ? [{ tags: { project: 'arrow-collector' } }]
+            : state === 'identity' ? [{ type: 'Microsoft.ManagedIdentity/userAssignedIdentities', name: 'other' }] : [];
+        default: assert.fail('Unexpected Azure mutation or CLI command: ' + args.join(' '));
+      }
+    });
+    if (state === 'denied') await assert.rejects(b.preflight(azure), b.HttpFailure);
+    else if (state === 'legacy' || state === 'identity')
+      await assert.rejects(b.preflight(azure), /Replacement is blocked/);
+    else await b.preflight(azure);
+    assert.equal(inventories, state === 'missing' || state === 'denied' ? 0 : 1);
+  });
 for (const values of [
   { AZURE_RESOURCE_GROUP: 'production' }, { AZURE_SUBSCRIPTION_ID: 'default' },
   { AZURE_KUSTO_MAX_INSTANCES: '9' }, { AZURE_KUSTO_MIN_INSTANCES: '5', AZURE_KUSTO_MAX_INSTANCES: '4' },

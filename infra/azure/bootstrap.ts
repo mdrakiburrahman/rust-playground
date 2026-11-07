@@ -610,7 +610,9 @@ export async function preflight(azure: Azure): Promise<void> {
     const token = await azure.token('https://management.azure.com/');
     c.operator = normalized_uuid(JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString()).oid);
   } else c.operator = normalized_uuid(c.operator);
-  const inventory = await azure.cli('resource', 'list', '--resource-group', c.group, '--subscription', c.subscription);
+  const group = await azure.arm('GET', c.base, undefined, true, '2022-09-01');
+  const inventory = group
+    ? await azure.cli('resource', 'list', '--resource-group', c.group, '--subscription', c.subscription) : [];
   const legacy = inventory.filter((resource: any) => resource.tags?.project === 'arrow-collector');
   const extraIdentities = inventory.filter((resource: any) => resource.type?.toLowerCase() ===
     'microsoft.managedidentity/userassignedidentities' && resource.name !== c.identity);
