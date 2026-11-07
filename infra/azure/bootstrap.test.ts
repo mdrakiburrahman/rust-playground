@@ -51,8 +51,24 @@ test('default configuration is deterministic and generated values contain no sub
   assert.ok(!('AZURE_SUBSCRIPTION_ID' in c.generated()));
   assert.equal(c.account, azure.c.account);
 });
+test('named sandbox isolates resource identities and generated configuration preserves its group', () => {
+  const values = { AZURE_SUBSCRIPTION_ID: SUB, AZURE_RESOURCE_GROUP: 'rust-playground-schema-evo' };
+  const c = new b.Config(values);
+  assert.equal(c.group, values.AZURE_RESOURCE_GROUP);
+  assert.equal(c.sandbox, new b.Config(values).sandbox);
+  assert.notEqual(c.sandbox, azure.c.sandbox);
+  assert.notEqual(c.account, azure.c.account);
+  assert.notEqual(c.cluster, azure.c.cluster);
+  assert.ok(c.storage_id.startsWith(c.base + '/'));
+  assert.equal(c.generated().AZURE_RESOURCE_GROUP, c.group);
+  assert.equal(new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, ...c.generated() }).table_root, c.table_root);
+  assert.throws(() => new b.Config({ ...values, ARROWCOL_AZURE_TABLE_ROOT: azure.c.table_root }), b.Failure);
+  assert.throws(() => b.owned({ tags: azure.tags }, c), b.Failure);
+});
 for (const values of [
   { AZURE_RESOURCE_GROUP: 'production' }, { AZURE_SUBSCRIPTION_ID: 'default' },
+  ...['rust-playground-', 'rust-playground--evo', 'rust-playground-../other', 'Rust-playground-evo',
+    'rust-playground-evo.', 'rust-playground-' + 'a'.repeat(80)].map(AZURE_RESOURCE_GROUP => ({ AZURE_RESOURCE_GROUP })),
   { AZURE_KUSTO_MAX_INSTANCES: '9' }, { AZURE_KUSTO_MIN_INSTANCES: '5', AZURE_KUSTO_MAX_INSTANCES: '4' },
   { AZURE_KUSTO_QAP_HOT_DAYS: '0' }, { AZURE_KUSTO_QAP_HOT_DAYS: '1.5' }, { AZURE_KUSTO_MAX_INSTANCES: 'NaN' },
   { AZURE_STORAGE_CHECKPOINT_CONTAINER: 'arrowcol' }, { AZURE_OPERATOR_TYPE: 'App' },

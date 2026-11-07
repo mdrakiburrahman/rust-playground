@@ -81,7 +81,8 @@ export class Config {
     try { this.subscription = normalized_uuid(get('AZURE_SUBSCRIPTION_ID')); }
     catch { throw new Failure('AZURE_SUBSCRIPTION_ID must be a private subscription UUID.'); }
     this.group = get('AZURE_RESOURCE_GROUP', 'rust-playground');
-    if (this.group !== 'rust-playground') throw new Failure('Only the exact rust-playground resource group is authorized.');
+    if (!/^rust-playground(?:-[a-z0-9]+(?:-[a-z0-9]+)*)?$/.test(this.group) || this.group.length > 90)
+      throw new Failure('Resource group must be rust-playground or a lowercase rust-playground- sandbox name.');
     this.sandbox = createHash('sha256').update(this.subscription + ':' + this.group).digest('hex').slice(0, 12);
     this.location = get('AZURE_LOCATION', 'eastus2');
     this.account = get('AZURE_STORAGE_ACCOUNT', 'arrowcol' + this.sandbox);
@@ -150,7 +151,7 @@ export class Config {
       .replace(/bearer\s+\S+/gi, '******').slice(0, 2000);
   }
   generated(): Record<string, string> {
-    return { AZURE_LOCATION: this.location, AZURE_STORAGE_ACCOUNT: this.account, AZURE_STORAGE_CONTAINER: this.data,
+    return { AZURE_RESOURCE_GROUP: this.group, AZURE_LOCATION: this.location, AZURE_STORAGE_ACCOUNT: this.account, AZURE_STORAGE_CONTAINER: this.data,
       AZURE_STORAGE_CHECKPOINT_CONTAINER: this.checkpoints, AZURE_KUSTO_CLUSTER: this.cluster,
       AZURE_KUSTO_DATABASE: this.database, AZURE_KUSTO_IDENTITY_NAME: this.identity, AZURE_KUSTO_URI: this.uri,
       ARROWCOL_AZURE_TABLE_ROOT: this.table_root,

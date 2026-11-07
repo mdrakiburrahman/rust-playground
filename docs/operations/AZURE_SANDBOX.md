@@ -33,9 +33,20 @@ process death releases the lock without treating a stale PID file as ownership.
 `.env.azure` is generated privately with mode `0600`; it contains deterministic
 names, Kusto endpoint and canonical `abfss://` data/checkpoint roots. The runner
 loads `.env`, then `.env.azure`, then explicit process-environment overrides.
-Names derive from the private subscription and exact `rust-playground` resource
-group, so independent devboxes agree without sharing resource identifiers in
+Names derive from the private subscription and configured resource
+group (`rust-playground` by default), so independent devboxes agree without sharing resource identifiers in
 commands or source. `config` does not contact Azure and is not deployment proof.
+
+| Stamp selection | Configuration | Safety boundary |
+|---|---|---|
+| Existing sandbox | `AZURE_RESOURCE_GROUP=rust-playground` | Existing behavior and names are unchanged. |
+| Separate disposable sandbox | `AZURE_RESOURCE_GROUP=rust-playground-schema-evo` | Lowercase `rust-playground-<suffix>` names only; ownership tags and account/container checks still apply. |
+
+For a separate stamp, keep account, cluster and workspace overrides blank and
+do not reuse the existing table/checkpoint roots. Use a separate `--output`
+file when provisioning; generated configuration preserves the selected group.
+**Reset and stop act on the selected stamp.** Check the resource group before
+using either destructive command.
 
 Optional private knobs include region, supported Standard Kusto SKU, QAP hot
 days, identity/database/container names, and autoscaling bounds. Defaults are
