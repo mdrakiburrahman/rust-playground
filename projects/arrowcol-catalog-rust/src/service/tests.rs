@@ -118,7 +118,7 @@ async fn flight_sql_and_warm_cache_count_actual_catalog_calls() -> Result<()> {
     let server_service = service.clone();
     let server = tokio::spawn(async move {
         tonic::transport::Server::builder()
-            .add_service(FlightServiceServer::new(server_service.clone()))
+            .add_service(FlightServiceServer::new(server_service.flight_service()))
             .add_service(SchemaCatalogServer::new(server_service))
             .serve_with_incoming_shutdown(tokio_stream::wrappers::TcpListenerStream::new(listener), async {
                 let _ = stopped.await;
@@ -128,6 +128,46 @@ async fn flight_sql_and_warm_cache_count_actual_catalog_calls() -> Result<()> {
     let channel = tonic::transport::Endpoint::from_shared(endpoint.clone())?
         .connect()
         .await?;
+    let mut flight = arrow_flight::flight_service_client::FlightServiceClient::new(channel.clone());
+    for disposition in ["created", "already_applied"] {
+        let command = CommandStatementUpdate {
+            query: CREATE.to_owned(),
+            transaction_id: None,
+        };
+        let response = flight
+            .do_put(futures::stream::iter([FlightData {
+                flight_descriptor: Some(FlightDescriptor {
+                    r#type: arrow_flight::flight_descriptor::DescriptorType::Cmd as i32,
+                    cmd: command.as_any().encode_to_vec().into(),
+                    path: Vec::new(),
+                }),
+                ..FlightData::default()
+            }]))
+            .await?;
+        let completion = arrowcol_flight::decode_ddl_completion_metadata(response.metadata())?;
+        assert_eq!(completion.catalog(), "arrowcol");
+        assert_eq!(completion.schema(), "default");
+        assert_eq!(completion.table(), "events");
+        assert_eq!(completion.schema_version().get(), 1);
+        assert_eq!(completion.disposition(), disposition);
+        let identity = name_identity(&["arrowcol".into(), "default".into(), "events".into()])?;
+        assert_eq!(
+            completion.schema_fingerprint(),
+            service
+                .store
+                .current_schema(&identity)
+                .await?
+                .context("committed schema")?
+                .fingerprint()
+        );
+        let mut results = response.into_inner();
+        let result = results.message().await?.context("DDL result")?;
+        assert_eq!(
+            arrow_flight::sql::DoPutUpdateResult::decode(result.app_metadata)?.record_count,
+            0
+        );
+        assert!(results.message().await?.is_none());
+    }
     let mut sql = FlightSqlServiceClient::new(channel);
     assert_eq!(sql.execute_update(CREATE.to_owned(), None).await?, 0);
     let prepared = sql.execute("SHOW TABLES IN arrowcol.default".to_owned(), None).await?;
@@ -232,7 +272,7 @@ async fn flight_sql_and_warm_cache_count_actual_catalog_calls() -> Result<()> {
     let server_service = restarted.clone();
     let server = tokio::spawn(async move {
         tonic::transport::Server::builder()
-            .add_service(FlightServiceServer::new(server_service.clone()))
+            .add_service(FlightServiceServer::new(server_service.flight_service()))
             .add_service(SchemaCatalogServer::new(server_service))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await

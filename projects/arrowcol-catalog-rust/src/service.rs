@@ -711,15 +711,15 @@ impl FlightSqlDdlHandler for CatalogService {
     }
 }
 
-#[async_trait]
-impl FlightSqlService for CatalogService {
-    type FlightService = Self;
-
-    async fn do_put_statement_update(
+impl CatalogService {
+    pub(crate) async fn apply_statement_update<S>(
         &self,
         query: CommandStatementUpdate,
-        request: Request<PeekableFlightDataStream>,
-    ) -> Result<i64, Status> {
+        request: Request<S>,
+    ) -> Result<Option<DdlCompletion>, Status>
+    where
+        S: Stream<Item = Result<FlightData, Status>> + Send + Unpin,
+    {
         if query.transaction_id.is_some() {
             return Err(Status::invalid_argument(
                 "catalog DDL does not support Flight SQL transactions",
@@ -744,7 +744,20 @@ impl FlightSqlService for CatalogService {
             .map_err(|_| Status::deadline_exceeded("catalog DDL input did not close"))??;
         self.apply_sql(&query.query)
             .await
-            .map_err(|error| Status::failed_precondition(format!("{error:#}")))?;
+            .map_err(|error| Status::failed_precondition(format!("{error:#}")))
+    }
+}
+
+#[async_trait]
+impl FlightSqlService for CatalogService {
+    type FlightService = Self;
+
+    async fn do_put_statement_update(
+        &self,
+        query: CommandStatementUpdate,
+        request: Request<PeekableFlightDataStream>,
+    ) -> Result<i64, Status> {
+        self.apply_statement_update(query, request).await?;
         Ok(0)
     }
 

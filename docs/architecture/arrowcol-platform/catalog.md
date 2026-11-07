@@ -4,7 +4,7 @@
 
 | Surface | Contract |
 | --- | --- |
-| Flight SQL `DoPut` | Spark SQL `CommandStatementUpdate`; CREATE, nullable ADD, SET/UNSET TBLPROPERTIES, external DROP and CREATE DATABASE |
+| Flight SQL `DoPut` | Spark SQL `CommandStatementUpdate`; CREATE, nullable ADD, SET/UNSET TBLPROPERTIES, external DROP and CREATE DATABASE; standard update result plus committed schema identity/version/fingerprint in `x-arrowcol-ddl-completion-bin` response headers for table-schema completions |
 | Flight SQL queries | SHOW TABLES, SHOW TBLPROPERTIES and DESCRIBE TABLE; prepared query watermarks reject catalog changes before retrieval |
 | gRPC metadata | `SchemaCatalog.GetTable` / atomic `GetSnapshot`; committed history, Arrow IPC, manifest and protobuf descriptors |
 | Change events | `GetCurrentEventId`, `GetEvents(from)` and `Watch(from)`; CREATE_TABLE, ALTER_TABLE, DROP_TABLE, SET_PROPS |

@@ -51,7 +51,7 @@ async fn main() -> Result<()> {
     let (signal_sender, signal_receiver) = tokio::sync::oneshot::channel();
     tonic::transport::Server::builder()
         .add_service(
-            FlightServiceServer::new(service.clone())
+            FlightServiceServer::new(service.flight_service())
                 .max_decoding_message_size(8 * 1024 * 1024)
                 .max_encoding_message_size(8 * 1024 * 1024),
         )

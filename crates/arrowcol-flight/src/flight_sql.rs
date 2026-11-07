@@ -157,7 +157,7 @@ impl FlightSqlDdlAdapter {
             .execute_ddl(FlightSqlDdlRequest::new(command))
             .await
             .map_err(|error| RuntimeError::from_catalog(&error))?;
-        build_response(&completion)
+        encode_ddl_completion_response(&completion)
     }
 }
 
@@ -193,7 +193,12 @@ pub fn decode_ddl_completion_metadata(metadata: &MetadataMap) -> RuntimeResult<D
     })
 }
 
-fn build_response(completion: &DdlCompletion) -> RuntimeResult<FlightSqlDdlResponse> {
+/// Encodes a committed DDL result with standard Flight SQL and Arrowcol response metadata.
+///
+/// # Errors
+///
+/// Returns an internal encoding error if the committed completion cannot be represented.
+pub fn encode_ddl_completion_response(completion: &DdlCompletion) -> RuntimeResult<FlightSqlDdlResponse> {
     let structured = DdlCompletionMetadata::from_completion(completion);
     let encoded = serde_json::to_vec(&structured).map_err(|_| RuntimeError::internal())?;
     let mut response_metadata = MetadataMap::new();

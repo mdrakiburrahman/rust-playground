@@ -17,6 +17,7 @@ arrow-deltalake = { path = "../../crates/arrow-deltalake" }
 arrowcol-catalog = { path = "../../crates/arrowcol-catalog" }
 arrowcol-catalog-client = { path = "../../crates/arrowcol-catalog-client" }
 arrowcol-protocol = { path = "../../crates/arrowcol-protocol" }
+arrowcol-flight = { path = "../../crates/arrowcol-flight" }
 arrowcol-props = { path = "../../crates/arrowcol-props" }
 arrowcol-sparksql = { path = "../../crates/arrowcol-sparksql" }
 async-trait = "0.1"

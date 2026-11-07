@@ -788,6 +788,7 @@ dependencies = [
  "arrow-schema 58.4.0",
  "arrowcol-catalog",
  "arrowcol-catalog-client",
+ "arrowcol-flight",
  "arrowcol-props",
  "arrowcol-protocol",
  "arrowcol-sparksql",
