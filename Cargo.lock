@@ -772,6 +772,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrowcol-catalog-client"
+version = "0.1.0"
+dependencies = [
+ "arrowcol-catalog",
+ "arrowcol-protocol",
+ "async-trait",
+ "futures",
+ "prost 0.14.4",
+ "serde_json",
+ "tokio",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tracing",
+]
+
+[[package]]
 name = "arrowcol-dataflow-components"
 version = "0.1.0"
 dependencies = [

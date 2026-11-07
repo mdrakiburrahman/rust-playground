@@ -1,0 +1,62 @@
+syntax = "proto3";
+package arrowcol.catalog.v1;
+
+// A new epoch on every service startup makes event_id restart unambiguous.
+message EventPosition {
+  string epoch = 1;
+  uint64 event_id = 2;
+}
+message Empty {}
+message EventsRequest {
+  EventPosition from = 1;
+}
+message TableRequest {
+  string catalog = 1;
+  string database = 2;
+  string table = 3;
+}
+enum EventType {
+  EVENT_TYPE_UNSPECIFIED = 0;
+  CREATE_TABLE = 1;
+  ALTER_TABLE = 2;
+  DROP_TABLE = 3;
+  SET_PROPS = 4;
+}
+message ChangeEvent {
+  EventPosition position = 1;
+  EventType event_type = 2;
+  TableRequest table = 3;
+  uint64 schema_version = 4;
+}
+message EventsResponse {
+  EventPosition position = 1;
+  repeated ChangeEvent events = 2;
+}
+message TableSnapshot {
+  TableRequest table = 1;
+  EventPosition position = 2;
+  // JSON `Vec<CatalogSchemaVersion>`; only Delta-committed immutable versions.
+  bytes schema_history_json = 3;
+  string provider = 4;
+  string location = 5;
+  repeated string partition_columns = 6;
+  map<string, string> properties = 7;
+  string comment = 8;
+  bytes arrow_schema_ipc = 9;
+  bytes manifest = 10;
+  bytes protobuf_descriptor = 11;
+}
+message CatalogSnapshot {
+  EventPosition position = 1;
+  repeated TableSnapshot tables = 2;
+}
+service SchemaCatalog {
+  rpc GetCurrentEventId(Empty) returns (EventPosition);
+  // Strictly greater than from.event_id. OUT_OF_RANGE on epoch/gap mismatch.
+  rpc GetEvents(EventsRequest) returns (EventsResponse);
+  // Replay and subscribe atomically. OUT_OF_RANGE on lag or epoch mismatch.
+  rpc Watch(EventsRequest) returns (stream ChangeEvent);
+  rpc GetTable(TableRequest) returns (TableSnapshot);
+  // Atomic catalog snapshot including its notification high watermark.
+  rpc GetSnapshot(Empty) returns (CatalogSnapshot);
+}

@@ -1,0 +1,27 @@
+[package]
+name = "arrowcol-catalog-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Resumable CES schema catalog client and bounded ingestion cache"
+
+[dependencies]
+arrowcol-catalog = { path = "../arrowcol-catalog" }
+arrowcol-protocol = { path = "../arrowcol-protocol" }
+async-trait = "0.1"
+futures = "0.3"
+prost = "0.14"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tonic = { version = "0.14", features = ["transport"] }
+tonic-prost = "0.14"
+tracing.workspace = true
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+
+[lints]
+workspace = true

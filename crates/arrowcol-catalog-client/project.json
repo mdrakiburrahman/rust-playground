@@ -1,0 +1,39 @@
+{
+  "name": "arrowcol-catalog-client",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "library",
+  "sourceRoot": "crates/arrowcol-catalog-client/src",
+  "implicitDependencies": ["arrowcol-catalog", "arrowcol-protocol"],
+  "targets": {
+    "format": {
+      "executor": "nx:run-commands",
+      "options": { "command": "cargo fmt --package arrowcol-catalog-client" }
+    },
+    "format-check": {
+      "executor": "nx:run-commands",
+      "options": { "command": "cargo fmt --package arrowcol-catalog-client -- --check" }
+    },
+    "lint": {
+      "executor": "nx:run-commands",
+      "options": { "command": "cargo clippy --locked --package arrowcol-catalog-client --all-targets -- -D warnings" }
+    },
+    "build": {
+      "executor": "nx:run-commands",
+      "options": { "command": "cargo build --locked --package arrowcol-catalog-client" }
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "options": { "command": "cargo test --locked --package arrowcol-catalog-client" }
+    },
+    "doc": {
+      "executor": "nx:run-commands",
+      "options": { "command": "RUSTDOCFLAGS='-D warnings' cargo doc --locked --package arrowcol-catalog-client --no-deps" }
+    },
+    "verify": {
+      "executor": "nx:run-commands",
+      "dependsOn": ["format-check", "lint", "build", "test", "doc"],
+      "options": { "commands": [] }
+    }
+  },
+  "tags": ["scope:rust", "type:library"]
+}
