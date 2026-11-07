@@ -1287,7 +1287,7 @@ pub(crate) mod tests {
         );
         let ddl = control
             .execute_ddl(arrowcol_catalog::FlightSqlDdlRequest::new(
-                "CREATE TABLE demo.generated.events (id BIGINT NOT NULL, body VARCHAR)",
+                "CREATE TABLE demo.generated.events (id BIGINT NOT NULL, body STRING) USING DELTA",
             ))
             .await?;
         let current = catalog
@@ -1362,7 +1362,7 @@ pub(crate) mod tests {
         );
         let ddl = control
             .execute_ddl(arrowcol_catalog::FlightSqlDdlRequest::new(
-                "CREATE TABLE demo.generated.events (id BIGINT NOT NULL)",
+                "CREATE TABLE demo.generated.events (id BIGINT NOT NULL) USING DELTA",
             ))
             .await?;
         let current = catalog
@@ -1754,7 +1754,7 @@ pub(crate) mod tests {
         );
         let ddl = control
             .execute_ddl(arrowcol_catalog::FlightSqlDdlRequest::new(
-                "CREATE TABLE demo.generated.events (id BIGINT NOT NULL)",
+                "CREATE TABLE demo.generated.events (id BIGINT NOT NULL) USING DELTA",
             ))
             .await?;
         let current = catalog

@@ -523,7 +523,7 @@ async fn flight_sql_ddl_returns_standard_and_structured_completion() -> Result<(
     )?
     .with_ddl_handler(Arc::new(control_plane) as Arc<dyn FlightSqlDdlHandler>);
     let command = CommandStatementUpdate {
-        query: "CREATE TABLE telemetry.prod.events (id BIGINT NOT NULL, body VARCHAR)".to_owned(),
+        query: "CREATE TABLE telemetry.prod.events (id BIGINT NOT NULL, body STRING) USING DELTA".to_owned(),
         transaction_id: None,
     };
     let descriptor = FlightDescriptor {

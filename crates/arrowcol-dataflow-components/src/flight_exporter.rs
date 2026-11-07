@@ -444,7 +444,7 @@ mod tests {
     #[tokio::test]
     async fn forwards_batches_with_replayed_ddl_to_downstream_collector() -> Result<()> {
         let (table, schema) =
-            upstream_table("CREATE TABLE chain.forward.events (id BIGINT NOT NULL, body VARCHAR)").await?;
+            upstream_table("CREATE TABLE chain.forward.events (id BIGINT NOT NULL, body STRING) USING DELTA").await?;
         let downstream = downstream().await?;
         let (mut exporter, mut client) = exporter(&downstream.endpoint)?;
 
@@ -491,7 +491,8 @@ mod tests {
     /// Guarantees: forwarding fails permanently instead of retrying forever.
     #[tokio::test]
     async fn unknown_local_table_is_a_permanent_failure() -> Result<()> {
-        let (_, schema) = upstream_table("CREATE TABLE chain.known.events (id BIGINT NOT NULL, body VARCHAR)").await?;
+        let (_, schema) =
+            upstream_table("CREATE TABLE chain.known.events (id BIGINT NOT NULL, body STRING) USING DELTA").await?;
         let unknown = TableIdentity::new(
             arrowcol_protocol::CatalogName::new("chain")?,
             arrowcol_protocol::SchemaName::new("unknown")?,

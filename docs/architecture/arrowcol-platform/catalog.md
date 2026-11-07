@@ -5,6 +5,7 @@
 | Surface | Contract |
 | --- | --- |
 | Flight SQL `DoPut` | Spark SQL `CommandStatementUpdate`; CREATE, nullable ADD, SET/UNSET TBLPROPERTIES, external DROP and CREATE DATABASE |
+| Flight SQL queries | SHOW TABLES, SHOW TBLPROPERTIES and DESCRIBE TABLE; prepared query watermarks reject catalog changes before retrieval |
 | gRPC metadata | `SchemaCatalog.GetTable` / atomic `GetSnapshot`; committed history, Arrow IPC, manifest and protobuf descriptors |
 | Change events | `GetCurrentEventId`, `GetEvents(from)` and `Watch(from)`; CREATE_TABLE, ALTER_TABLE, DROP_TABLE, SET_PROPS |
 | Table model | Catalog/database/table, provider, location, comment, partition columns and TBLPROPERTIES |
@@ -21,7 +22,7 @@ ALTER TABLE telemetry.prod.events ADD COLUMNS (source STRING);
 
 The Rust [Spark SQL parser](../../../crates/arrowcol-sparksql/README.md) rejects
 CTAS, arbitrary queries and breaking schema mutations. The catalog validates
-registered properties through the shared [property registry](../../../crates/arrowcol-props/README.md).
+registered properties through the shared [property registry](../../reference/TABLE_PROPERTIES.md).
 Unrelated vendor properties remain intact in Delta `metadata.configuration`.
 
 ## Commit and recovery
@@ -46,7 +47,7 @@ Committer extension augments generated metadata **before** the atomic write,
 then validates the final metadata/protocol pair. It preserves unrelated actions
 and optimistic concurrency; it never rewrites a committed log.
 
-## CES and schema admission
+## Schema admission
 
 | Incoming schema / cache state | Result |
 | --- | --- |

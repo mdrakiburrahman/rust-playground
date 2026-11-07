@@ -2364,7 +2364,7 @@ mod tests {
         }
         use crate::{CatalogConfig, HiveMetastoreConnectionConfig, RoutingStoreConfig, SqlServerConnectionConfig};
         use arrow_array::Int64Array;
-        use arrowcol_catalog::{FlightSqlDdlHandler, SchemaValidator};
+        use arrowcol_catalog::SchemaValidator;
         use arrowcol_protocol::{ClaimedSchemaFingerprint, fingerprint_schema};
 
         let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
