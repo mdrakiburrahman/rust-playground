@@ -344,7 +344,7 @@ function selectBenchmarkNetwork(): BenchmarkNetwork {
     const range = cidrRange(subnet)!;
     if (used.some(([start, end]) => range[0] <= end && start <= range[1])) continue;
     return {
-      subnet, sql: `${base}.2`, catalog: `${base}.15`, router: `${base}.10`,
+      subnet, sql: `${base}.2`, router: `${base}.10`,
       dataflow: `${base}.31`,
       kusto: `${base}.50`, kustoExplorer: `${base}.51`, playwright: `${base}.52`,
     };

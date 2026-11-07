@@ -44,7 +44,7 @@ else if (args[0] === 'stop') {
     const runtime = new LocalStressRuntime({
       workspace: process.cwd(), directory, project: 'fixture-stress', composeFiles: [],
       env: { ...process.env, PATH: `${directory}:${process.env.PATH}` }, reader,
-      directAdmin: 'http://127.0.0.1:1', dataflowAdmin: 'http://127.0.0.1:1',
+dataflowAdmin: 'http://127.0.0.1:1',
       quiver: false, physicalRoots: {}, loadEnded: new AbortController().signal, checkRunning: () => {},
       fixture: { batchRows: 2, rowGroupRows: 1, pageRows: 1 },
       windowSeconds: 9, sampleTimeoutSeconds: 1, measureSeconds: 30,

@@ -76,7 +76,7 @@ test('provenance whitelists nonsensitive effective resource settings and never s
     secrets: ['TOP_SECRET'],
   };
   const settings = safeComposeSettings({ services: {
-    'direct-1': service, 'dataflow-1': service, sqlserver: service,
+    'dataflow-1': service, sqlserver: service,
     kusto: {
       ...service, mem_limit: '4294967296', image: 'emulator@sha256:pinned',
       environment: { ACCEPT_EULA: 'Y', PASSWORD: 'TOP_SECRET' },
@@ -89,7 +89,6 @@ test('provenance whitelists nonsensitive effective resource settings and never s
   } });
   assert(!JSON.stringify(settings).includes('TOP_SECRET'));
   assert.equal(settings['dataflow-1'].numCores, '2');
-  assert.equal(settings['direct-1'].environment.TOKIO_WORKER_THREADS, '2');
   assert.equal(settings.sqlserver.environment.MSSQL_MEMORY_LIMIT_MB, '16384');
   assert.equal(settings.kusto.memoryLimit, '4294967296');
   assert.equal(settings.kusto.image, 'emulator@sha256:pinned');
@@ -105,32 +104,22 @@ test('provenance whitelists nonsensitive effective resource settings and never s
 
 test('policy provenance reports generated 128 MiB budgets rather than unchanged production defaults', () => {
   const runtime = buildBenchmarkRuntimeConfigs(
-    readFileSync(path.resolve('projects/loadtest/config/direct.yaml.tmpl'), 'utf8'),
     readFileSync(path.resolve('projects/arrowcol-dataflow-rust/config.yaml'), 'utf8'),
-    { instanceKey: 'loadtest-direct-1', advertisedEndpoint: '10.89.0.21:50051', generation: 1 },
   );
-  const policies = safeCollectorPolicies(YAML.parse(runtime.directYaml), YAML.parse(runtime.dataflowYaml));
-  assert.equal(policies.direct.buffer.global_capacity.bytes, 134217728);
+  const policies = safeCollectorPolicies(YAML.parse(runtime.dataflowYaml));
   assert.equal(policies.dataflow.batching.global_capacity.bytes, 134217728);
-  assert.equal(policies.direct.buffer.per_table_capacity.bytes, 33554432);
+  assert.equal(policies.dataflow.batching.per_table_capacity.bytes, 33554432);
   assert.equal(policies.dataflow.batching.max_arrow_memory_per_flush, 33554432);
   assert.equal(policies.dataflow.registration.buffered_bytes_limit, 134217728);
   assert.equal(policies.dataflow.registration.buffered_rows_limit, 4000000);
   assert.equal(policies.dataflow.registration.buffered_batches_limit, 2048);
 });
 
-test('collector policy provenance includes actual bounded flush/commit limits without auth or SQL secrets', () => {
-  const direct = YAML.parse(readFileSync(path.resolve('projects/loadtest/config/direct.yaml.tmpl'), 'utf8'));
+test('collector policy provenance includes DFE limits without secrets', () => {
   const dataflow = YAML.parse(readFileSync(path.resolve('projects/arrowcol-dataflow-rust/config.yaml'), 'utf8'));
-  direct.auth.password = 'TOP_SECRET';
-  direct.sql_server.password = 'TOP_SECRET';
   dataflow.groups.arrowcol.pipelines.ingest.nodes.flight.config.catalog.password = 'TOP_SECRET';
-  const policies = safeCollectorPolicies(direct, dataflow);
+  const policies = safeCollectorPolicies(dataflow);
   assert(!JSON.stringify(policies).includes('TOP_SECRET'));
-  assert.equal(policies.direct.buffer.max_arrow_memory_per_flush, 536870912);
+  assert.equal(policies.dataflow.batching.max_arrow_memory_per_flush, 536870912);
   assert.equal(policies.dataflow.commit.max_pending_files, 256);
-  assert.equal(policies.direct.receipts.receipt_lease_duration_ms, 20000);
-  assert.deepEqual(policies.direct.sql_pool, {
-    receipts_max_size: 16, routing_max_size: 4, catalog_max_size: 4, acquire_timeout_ms: 5000,
-  });
 });

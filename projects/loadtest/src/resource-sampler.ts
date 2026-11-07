@@ -14,7 +14,6 @@ const TIMEOUT_MS = 2500;
 export interface SamplerOptions {
   project: string;
   results: string;
-  directAdmin: string;
   dataflowAdmin: string;
   ownerPid?: number;
 }
@@ -194,7 +193,6 @@ export async function runResourceSampler(options: SamplerOptions): Promise<void>
       const timestamp = new Date().toISOString();
       const start = Date.now();
       const collectors = await Promise.all([
-        collectorSample(options.project, 'direct-1', options.directAdmin),
         collectorSample(options.project, 'dataflow-1', options.dataflowAdmin),
       ]);
       appendFileSync(samples, `${JSON.stringify({ timestamp, sequence: sequence++, collectors })}\n`);
@@ -219,7 +217,7 @@ export async function startResourceSampler(options: SamplerOptions, env: NodeJS.
   const child = spawn(process.execPath, [
     ...process.execArgv, fileURLToPath(import.meta.url),
     '--project', options.project, '--results', options.results,
-    '--direct-admin', options.directAdmin, '--dataflow-admin', options.dataflowAdmin,
+    '--dataflow-admin', options.dataflowAdmin,
     '--owner-pid', String(process.pid),
   ], { env, stdio: ['ignore', fd, fd] });
   closeSync(fd);
@@ -286,7 +284,7 @@ function parseSamplerOptions(args: string[]): SamplerOptions {
     throw new Error('Invalid sampler owner PID');
   }
   return {
-    project, results, directAdmin: endpoint('--direct-admin'), dataflowAdmin: endpoint('--dataflow-admin'),
+    project, results, dataflowAdmin: endpoint('--dataflow-admin'),
     ownerPid: owner === undefined ? undefined : Number(owner),
   };
 }

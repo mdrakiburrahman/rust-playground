@@ -92,7 +92,7 @@ else process.exit(1);
 `, { mode: 0o755 });
   const stop = await startResourceSampler({
     project: BENCHMARK_PROJECT, results,
-    directAdmin: 'http://127.0.0.1:1', dataflowAdmin: 'http://127.0.0.1:1',
+    dataflowAdmin: 'http://127.0.0.1:1',
   }, { ...process.env, PATH: `${results}:${process.env.PATH}` });
   try {
     const work = spawnSync(process.execPath, ['-e', 'Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 11200)']);
@@ -129,12 +129,12 @@ test('admin metrics and non-ready HTTP status are sampled without saving secret 
   const endpoint = `http://127.0.0.1:${address.port}`;
   const running = runResourceSampler({
     project: 'rust-playground-loadtest-no-such-fixture', results,
-    directAdmin: endpoint, dataflowAdmin: endpoint,
+dataflowAdmin: endpoint,
   });
   try {
     await assert.rejects(runResourceSampler({
       project: 'rust-playground-loadtest-no-such-fixture', results,
-      directAdmin: endpoint, dataflowAdmin: endpoint,
+dataflowAdmin: endpoint,
     }), { code: 'EEXIST' });
     const deadline = Date.now() + 8000;
     while (Date.now() < deadline) {
