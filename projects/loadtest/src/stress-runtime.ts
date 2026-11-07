@@ -59,7 +59,6 @@ export interface LocalStressOptions {
   composeFiles: string[];
   env: NodeJS.ProcessEnv;
   reader: string;
-  directAdmin: string;
   dataflowAdmin: string;
   quiver: boolean;
   physicalRoots: Record<string, string>;
@@ -257,7 +256,6 @@ export class LocalStressRuntime {
     this.check();
     const [collectors, physical] = await Promise.all([
       Promise.all([
-        collectorSample(this.options.project, 'direct-1', this.options.directAdmin),
         collectorSample(this.options.project, 'dataflow-1', this.options.dataflowAdmin),
       ]),
       physicalInventory(this.options.physicalRoots, deadline),

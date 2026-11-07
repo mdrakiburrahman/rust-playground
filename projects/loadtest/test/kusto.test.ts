@@ -43,8 +43,8 @@ test('Kusto starts independently without core --wait or required dependencies', 
 
 test('both local helper commands always receive the allocated internal Kusto endpoint', () => {
   const network: BenchmarkNetwork = {
-    subnet: '10.89.42.0/24', sql: '10.89.42.2', hive: '10.89.42.3', router: '10.89.42.10',
-    direct: '10.89.42.21', dataflow: '10.89.42.31', kusto: '10.89.42.50',
+    subnet: '10.89.42.0/24', sql: '10.89.42.2', router: '10.89.42.10',
+    dataflow: '10.89.42.31', kusto: '10.89.42.50',
     kustoExplorer: '10.89.42.51', playwright: '10.89.42.52',
   };
   const env = localLoadgenEnvironment({
@@ -52,7 +52,6 @@ test('both local helper commands always receive the allocated internal Kusto end
     env: { LOADTEST_KUSTO_ENDPOINT: 'http://wrong-endpoint:1', KUSTO_PORT: '18080' },
   }, '/workspace/onelake/benchmark/latest/results');
   assert.equal(env.LOADTEST_KUSTO_ENDPOINT, 'http://10.89.42.50:8080');
-  assert.equal(env.LOADTEST_DIRECT_ROOT, '/workspace/onelake/benchmark/latest/direct');
   assert.equal(env.LOADTEST_DATAFLOW_ROOT, '/workspace/onelake/benchmark/latest/dataflow');
 });
 

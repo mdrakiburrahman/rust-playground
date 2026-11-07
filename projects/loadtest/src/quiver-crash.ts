@@ -8,14 +8,6 @@ export const QUIVER_RECOVERY_FILE = 'quiver-recovery.json';
 
 /** Collector metrics that prove disk persistence and post-crash replay. */
 export const quiverRecoveryMetrics = Object.freeze({
-  direct: Object.freeze({
-    persisted: 'arrowcol_direct_quiver_persisted_bundles_total',
-    backlog: 'arrowcol_direct_quiver_backlog_bundles',
-    diskUsedBytes: 'arrowcol_direct_quiver_disk_used_bytes',
-    published: 'arrowcol_direct_quiver_published_bundles_total',
-    recovered: 'arrowcol_direct_quiver_recovered_bundles_total',
-    adoptedReceipts: 'arrowcol_direct_quiver_adopted_receipts_total',
-  }),
   dataflow: Object.freeze({
     persisted: 'arrowcol_dataflow_durable_admitted_batches_total',
     backlog: 'arrowcol_dataflow_durable_backlog_batches',
@@ -30,12 +22,11 @@ type PoolSample = Record<string, number>;
 
 export interface QuiverCrashOptions {
   crashAfterSeconds: number;
-  directAdmin: string;
   dataflowAdmin: string;
   results: string;
-  /** SIGKILLs both collectors; no graceful drain runs. */
+  /** SIGKILLs the Dataflow publisher; no graceful drain runs. */
   kill: () => Promise<void>;
-  /** Restarts both collectors on the same Quiver directories and waits for health. */
+  /** Restarts Dataflow on the same Quiver directory and waits for health. */
   restart: () => Promise<void>;
   log: (message: string) => void;
   /** Aborted when load generation ends; the crash must interrupt live load. */
@@ -68,9 +59,7 @@ export function selectQuiverMetrics(pool: Pool, metrics: Record<string, number>)
 
 /** A restarted collector must replay at least one batch it acknowledged before the crash. */
 export function quiverRecoveryFailures(afterRecovery: Record<Pool, PoolSample>): string[] {
-  return (['direct', 'dataflow'] as const)
-    .filter((pool) => !(afterRecovery[pool].recovered > 0))
-    .map((pool) => `${pool} collector did not replay any Quiver batch after the crash`);
+  return afterRecovery.dataflow.recovered > 0 ? [] : ['Dataflow did not replay any Quiver batch after the crash'];
 }
 
 async function defaultScrape(endpoint: string): Promise<string> {
@@ -84,9 +73,8 @@ export async function runQuiverCrash(options: QuiverCrashOptions): Promise<Quive
   const interval = options.pollIntervalMs ?? 1_000;
   const sample = async (): Promise<Record<Pool, PoolSample> | undefined> => {
     try {
-      const [direct, dataflow] = await Promise.all([options.directAdmin, options.dataflowAdmin]
-        .map(async (endpoint) => parseMetrics(await scrape(endpoint))));
-      return { direct: selectQuiverMetrics('direct', direct), dataflow: selectQuiverMetrics('dataflow', dataflow) };
+      const dataflow = parseMetrics(await scrape(options.dataflowAdmin));
+      return { dataflow: selectQuiverMetrics('dataflow', dataflow) };
     } catch {
       return undefined;
     }
@@ -111,8 +99,8 @@ export async function runQuiverCrash(options: QuiverCrashOptions): Promise<Quive
   };
 
   const persisting = await waitUntil(options.startTimeoutMs ?? 600_000,
-    (current) => current.direct.persisted > 0 && current.dataflow.persisted > 0, true);
-  if (!persisting) throw new Error('Collectors never persisted a batch to Quiver; cannot run the crash demo');
+    (current) => current.dataflow.persisted > 0, true);
+  if (!persisting) throw new Error('Dataflow never persisted a batch to Quiver; cannot run the crash demo');
   const persistenceObservedAt = new Date().toISOString();
   options.log(`Quiver crash demo armed: SIGKILL in ${options.crashAfterSeconds}s`);
   const crashAt = Date.now() + options.crashAfterSeconds * 1_000;
@@ -126,24 +114,17 @@ export async function runQuiverCrash(options: QuiverCrashOptions): Promise<Quive
   const beforeCrash = await sample();
   if (!beforeCrash) throw new Error('Collector metrics were unavailable immediately before the Quiver crash');
   options.log(
-    `SIGKILL direct-1 and dataflow-1 with ${beforeCrash.direct.backlog} direct and ` +
-    `${beforeCrash.dataflow.backlog} dataflow batches still on disk (not yet in Delta)`,
+    `SIGKILL dataflow-1 with ${beforeCrash.dataflow.backlog} batches still on disk (not yet in Delta)`,
   );
   const killed = Date.now();
   await options.kill();
-  options.log('Restarting both collectors on their Quiver directories (Direct waits out its predecessor owner lease)');
+  options.log('Restarting Dataflow on its Quiver directory');
   await options.restart();
   const restarted = Date.now();
-  options.log(`Collectors healthy again after ${Math.round((restarted - killed) / 1000)}s; waiting for Quiver replay`);
+  options.log(`Dataflow healthy again after ${Math.round((restarted - killed) / 1000)}s; waiting for Quiver replay`);
   const replayed = await waitUntil(options.recoveryTimeoutMs ?? 300_000,
     (current) => quiverRecoveryFailures(current).length === 0, false);
-  // Direct adopts its predecessor's receipts once routing hands it the table leases again.
-  const afterRecovery = (replayed && quiverRecoveryFailures(replayed).length === 0
-    ? await waitUntil(options.adoptionTimeoutMs ?? 120_000, (current) => current.direct.adoptedReceipts > 0, false)
-    : replayed) ?? {
-    direct: selectQuiverMetrics('direct', {}),
-    dataflow: selectQuiverMetrics('dataflow', {}),
-  };
+  const afterRecovery = replayed ?? { dataflow: selectQuiverMetrics('dataflow', {}) };
   const failures = quiverRecoveryFailures(afterRecovery);
   const evidence: QuiverRecoveryEvidence = {
     crashAfterSeconds: options.crashAfterSeconds,
@@ -154,14 +135,13 @@ export async function runQuiverCrash(options: QuiverCrashOptions): Promise<Quive
     outageMs: restarted - killed,
     beforeCrash,
     afterRecovery,
-    recovered: { direct: afterRecovery.direct.recovered > 0, dataflow: afterRecovery.dataflow.recovered > 0 },
+    recovered: { dataflow: afterRecovery.dataflow.recovered > 0 },
     passed: failures.length === 0,
   };
   writeFileSync(path.join(options.results, QUIVER_RECOVERY_FILE), `${JSON.stringify(evidence, null, 2)}\n`);
   if (failures.length > 0) throw new Error(`Quiver crash recovery failed: ${failures.join('; ')}`);
   options.log(
-    `Quiver replay after crash: direct replayed ${afterRecovery.direct.recovered} batches from disk and adopted ` +
-    `${afterRecovery.direct.adoptedReceipts} unpublished receipts; dataflow made ${afterRecovery.dataflow.recovered} ` +
+    `Quiver replay after crash: Dataflow made ${afterRecovery.dataflow.recovered} ` +
     `replay export attempts (${afterRecovery.dataflow.reboundBatches} rebound to its new leases)`,
   );
   return evidence;

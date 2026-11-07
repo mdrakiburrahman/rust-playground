@@ -66,7 +66,7 @@ if(value.fail) {
   };
   const runtime = new LocalStressRuntime({
     workspace: process.cwd(), directory, project: 'fixture-ready', composeFiles: [],
-    env: process.env, reader, directAdmin: '', dataflowAdmin: '', quiver: false, physicalRoots: {},
+    env: process.env, reader, dataflowAdmin: '', quiver: false, physicalRoots: {},
     fixture: fixtureLayout, windowSeconds: 9, sampleTimeoutSeconds: 1, measureSeconds: 30,
     privateScratch,
     loadEnded: new AbortController().signal, checkRunning: () => {},
