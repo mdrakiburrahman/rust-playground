@@ -29,7 +29,22 @@ Metadata-only filesystem property caches are fenced by log-object identity token
 
 VACUUM plans and applies in one pass, reusing the independently validated history and active set only while the fresh Kernel snapshot version and metadata still match. Each deletion chunk rechecks current metadata, active references, cancellation and publication authority. Historical replay is repeated only when concurrent advancement requires it. Progress is written after durable deletions; an idle pass does not rewrite an existing same-version progress record. PRUNE-LOG retains its complete history/checkpoint proof before deleting any log.
 
-The sorted-file and adaptive writer helpers consume the same resolved properties through `LayoutPolicy::from_properties` and `AdaptiveFileSizeConfig::from_properties`. Column names are also validated against the actual schema, and adaptive ratio/input bounds are checked before use.
+New writer publications resolve current Delta metadata through `LayoutPolicy::from_properties` and `AdaptiveFileSizeConfig::from_properties`. Table values override validated process defaults. Sort/Bloom column names must exist in the actual schema; generated ingestion granularity must not replace a catalog-declared partition specification.
+
+**Adaptive sizing limitation:** durable DFE publications do not yet support safely splitting an admitted publication using adaptive rotation. Non-default `arrowcol.writer.*` policy is explicitly rejected before publication rather than silently accepted as an unused setting. The error is retryable after correcting table policy. This does not change OPTIMIZE's independently supported target and bounds.
+
+Refresh applies to new publications. An already-staged publication retains its file plan and transaction identity during recovery; changing layout/granularity never changes a replay identity midway through a retry.
+
+| Property group | Runtime consumer / observable acceptance |
+| --- | --- |
+| `arrowcol.maintenance.enabled`, `.interval`, `.operationTimeout` | Effective operation selection, policy-aware per-table schedule and cancellation deadline. Changed policy is reconsidered before the old interval expires; errors are retryable, not idle. |
+| `arrowcol.optimize.enabled`, `.minFiles`, `.targetFileSize`, `.smallFileSize`, `.sealedPartitionsOnly`, `.latestPartitions` | Effective OPTIMIZE config and bin filtering. Real catalog `minFiles=3 -> 2` change switches from unchanged idle state to a two-file sealed-partition commit; newest ingestion partition remains untouched. |
+| `arrowcol.optimize.max*`, `.batchRows` | Existing planner/decoder/Parquet/action limits receive resolved values; effective JSON config exposes exact bounds and violations fail explicitly. |
+| `arrowcol.vacuum.enabled`, `.retention`, `.allowShortRetention`, `.maxDeletes`, `.maxListedFiles` | Full retention authorization and bounded delete/probe config. Retention equality is not expired; incomplete inventories fail with no mutation. Persisted policy cannot lower the seven-day floor. |
+| `arrowcol.purge.enabled`, `.retention`, `arrowcol.partition.granularity` | Logical ingestion cutoff and PURGE plan before compaction; generated writer partition formatting uses current metadata policy. Declared catalog partition keys remain authoritative. |
+| `arrowcol.layout.enabled`, `.sortColumns`, `.bloomColumns`, `.maxRows`, `.maxInputSize`, `.rowGroupRows`, `.pageRows` | Sorted writer/OPTIMIZE layout config; output sorting, Bloom metadata, row-group limits and bounded buffering are observable. Invalid columns or bounds fail before commit. |
+| `arrowcol.writer.targetFileSize`, `.minInputSize`, `.maxInputSize`, `.coldStartParquetRatio`, `.ewmaWeight`, `.minParquetRatio`, `.maxParquetRatio` | Shared adaptive-config validation; non-default DFE policy is explicitly rejected while durable adaptive splitting is unsupported. |
+| `delta.targetFileSize`, `.deletedFileRetentionDuration`, `.logRetentionDuration`, `.checkpointInterval`, `.appendOnly` | Target fallback, tombstone/log cutoffs, checkpoint debt and strict boolean syntax. Syntax validation does not authorize a protocol/feature change. |
 
 ## Retained history and pruning proof
 
