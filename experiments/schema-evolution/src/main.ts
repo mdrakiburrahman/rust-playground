@@ -137,6 +137,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   let oldReceipt: Record<string, unknown> | undefined, v1Hash = '', oldHash = '';
   let proof = '', source = '', principal = '', kusto: Kusto | undefined;
   let baseline: Record<string, unknown> | undefined, occupied = false, externalCreated = false, containerStarted = false;
+  let requestSignal = new AbortController().signal;
   const container = `w6-${runId}`;
   const sdk = (version: number) => path.join(out, `sdk-v${version}`);
   const binary = (name: string) => path.join(WORKSPACE, 'target/debug', name);
@@ -184,6 +185,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     columns: [{ header: 'Claim', value: row => row.claim }, { header: 'Evidence', value: row => row.evidence }],
     stages: [
       { name: 'runtime', timeoutMs: 5 * 60_000, run: async ctx => {
+        requestSignal = ctx.signal;
         ctx.record('provenance', { sha: await command('git', ['rev-parse', 'HEAD'], ctx),
           harnessHash: digest(path.join(WORKSPACE, 'experiments/schema-evolution/src/main.ts')),
           runbookHash: digest(path.join(WORKSPACE, 'experiments/schema-evolution/README.md')),
@@ -207,7 +209,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           if (!/^\d+\.\d+\.\d+\.\d+$/.test(ip)) throw new Error('Kustainer has no bridge IP.');
           const transport: KustoClient = { c: { uri: `http://${ip}:8080` }, request: async (method, url, _resource, body, headers) => {
             const response = await fetch(url, { method, headers, body: body ? body.toString() : undefined,
-              signal: AbortSignal.timeout(60_000) });
+              signal: AbortSignal.any([requestSignal, AbortSignal.timeout(60_000)]) });
             const data = Buffer.from(await response.arrayBuffer());
             if (!response.ok) throw new Error(`Kustainer HTTP ${response.status}: ${data.toString().slice(0, 1000)}`);
             return [data, Object.fromEntries(response.headers)];
@@ -216,7 +218,13 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           source = `/delta/${TABLE}`;
           await until(ctx, 'kustainer-ready', async () => {
             try { await kusto!.management('.show databases', ctx.signal); return true; }
-            catch (error) { ctx.record('startup-error', { message: String(error) }); return false; }
+            catch (error) {
+              ctx.signal.throwIfAborted();
+              if (!(error instanceof TypeError && error.message === 'fetch failed') &&
+                  !(error instanceof Error && /^Kustainer HTTP 503:/.test(error.message))) throw error;
+              ctx.record('startup-error', { message: String(error) });
+              return false;
+            }
           });
         }
         catalog = launch(binary('arrowcol-catalog-rust'), ['--listen', `127.0.0.1:${catalogPort}`,
@@ -230,6 +238,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         return { status: 'passed', summary: 'Actual catalog Flight SQL and CES endpoint is healthy.' };
       } },
       { name: 'create-and-old-client', timeoutMs: 20 * 60_000, run: async ctx => {
+        requestSignal = ctx.signal;
         proof = await buildCatalogProof(ctx.signal);
         await generate(1, ctx);
         baseline = object(JSON.parse(await command(proof, [endpoint], ctx, env)));
@@ -250,8 +259,15 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           try {
             const response = await fetch(`http://127.0.0.1:${adminPort}/readyz`,
               { signal: AbortSignal.any([ctx.signal, AbortSignal.timeout(2000)]) });
+            if (!response.ok && response.status !== 503) throw new Error(`DFE readiness HTTP ${response.status}`);
             return response.ok;
-          } catch (error) { ctx.signal.throwIfAborted(); ctx.record('dfe-startup', { message: String(error) }); return false; }
+          } catch (error) {
+            ctx.signal.throwIfAborted();
+            if (!(error instanceof TypeError && error.message === 'fetch failed') &&
+                !(error instanceof DOMException && error.name === 'TimeoutError')) throw error;
+            ctx.record('dfe-startup', { message: String(error) });
+            return false;
+          }
         });
         old = launch(oldBinary, [flight, String(ROWS), 'write'], env, path.join(out, 'old.log'));
         oldReceipt = await event(old, ctx);
@@ -269,6 +285,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         return { status: 'passed', summary: 'Genuinely generated v1 client is still alive after publishing its first cohort.' };
       } },
       { name: 'enable-native-refresh-before-alter', timeoutMs: 5 * 60_000, run: async ctx => {
+        requestSignal = ctx.signal;
         const create = `.create external table ['${table}'] kind=delta (h@'${source}')`;
         await kusto!.management(create, ctx.signal);
         externalCreated = true;
@@ -332,6 +349,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         return { status: 'passed', summary: 'Active Delta files prove true old-row nulls and exact nonempty new-client sentinels.' };
       } },
       { name: 'native-kusto-schema-and-data-hydration', timeoutMs: 20 * 60_000, run: async ctx => {
+        requestSignal = ctx.signal;
         const counts = await observeHydration(kusto!, table, { deadline: ctx.deadline, signal: ctx.signal,
           rowsPerPhase: ROWS, record: observation => ctx.record('native-hydration', observation) });
         const exactQuery = exactRowsQuery(table), exactRows = await kusto!.query(exactQuery, ctx.signal);
@@ -345,6 +363,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       } },
     ],
     cleanup: async ctx => {
+      requestSignal = ctx.signal;
       const errors: unknown[] = [];
       const attempt = async (label: string, work: () => Promise<unknown>) => {
         try { await work(); }
