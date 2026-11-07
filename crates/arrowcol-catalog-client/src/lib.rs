@@ -1,6 +1,9 @@
 //! Catalog RPC contract and CES-backed schema clients.
 #![forbid(unsafe_code)]
 
+mod remote;
+pub use remote::{CacheMetrics, RemoteCatalogClient, decode_table, identity_from_request, table_request};
+
 /// Generated catalog metadata and change-event RPC types.
 pub mod rpc {
     #![allow(missing_docs, clippy::missing_errors_doc, clippy::clone_on_ref_ptr)]

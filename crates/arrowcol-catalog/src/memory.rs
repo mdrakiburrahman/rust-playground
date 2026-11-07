@@ -55,6 +55,54 @@ impl MemoryCatalogStore {
         Self::default()
     }
 
+    /// Hydrates immutable versions read from already committed Delta metadata.
+    ///
+    /// # Errors
+    /// Rejects inconsistent identities, incompatible history or active schema changes.
+    pub async fn hydrate_committed(&self, history: Vec<CatalogSchemaVersion>) -> CatalogResult<()> {
+        let Some(head) = history.last() else {
+            return Err(CatalogError::new(
+                CatalogErrorCode::CorruptCatalogState,
+                "empty committed history",
+            ));
+        };
+        let identity = head.identity().clone();
+        for pair in history.windows(2) {
+            if pair[1].version() <= pair[0].version() || !pair[1].is_nullable_append_only_superset_of(&pair[0]) {
+                return Err(CatalogError::new(
+                    CatalogErrorCode::CorruptCatalogState,
+                    "Delta catalog history is not monotonic nullable append-only",
+                ));
+            }
+        }
+        let mut artifacts = Vec::with_capacity(history.len());
+        for schema in &history {
+            if schema.identity() != &identity {
+                return Err(CatalogError::new(
+                    CatalogErrorCode::CorruptCatalogState,
+                    "Delta catalog history contains mismatched identities",
+                ));
+            }
+            artifacts.push(crate::generate_descriptor_artifacts(schema)?);
+        }
+        let mut state = self.state.lock().await;
+        if state.active.contains_key(&identity) {
+            return Err(CatalogError::new(
+                CatalogErrorCode::SchemaChangeInProgress,
+                "cannot hydrate an active schema change",
+            ));
+        }
+        let version = head.version();
+        let mut versions = BTreeMap::new();
+        for (schema, artifacts) in history.into_iter().zip(artifacts) {
+            state.artifacts.insert((identity.clone(), schema.version()), artifacts);
+            versions.insert(schema.version(), schema);
+        }
+        state.versions.insert(identity.clone(), versions);
+        state.current.insert(identity, version);
+        Ok(())
+    }
+
     /// Fails the next matching operation.
     pub async fn fail_next(&self, point: FailurePoint) {
         self.state.lock().await.failures.push_back(point);
