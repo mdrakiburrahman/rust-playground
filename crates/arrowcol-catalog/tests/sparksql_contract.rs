@@ -1,8 +1,49 @@
 use arrowcol_catalog::{
-    CatalogField, CatalogSchemaVersion, CatalogType, DdlCommand, DdlParser, ListKind, SchemaVersion, TimeUnit,
-    TypeMapping, deterministic_table_id, next_protobuf_field_number, protobuf_field_number,
+    CatalogField, CatalogSchemaVersion, CatalogType, DdlCommand, DdlParser, ListKind, ProtobufType, SchemaVersion,
+    TimeUnit, TypeMapping, deterministic_table_id, generate_descriptor_artifacts, next_protobuf_field_number,
+    protobuf_field_number,
 };
+use prost::Message;
+use prost_types::{FileDescriptorSet, field_descriptor_proto::Type};
 use uuid::Uuid;
+
+#[test]
+fn every_spark_decimal_mapping_agrees_with_manifest_and_real_proto_contract() -> anyhow::Result<()> {
+    let columns = (1_u8..=38)
+        .flat_map(|precision| {
+            (0..=precision).map(move |scale| format!("f_{precision}_{scale} DECIMAL({precision},{scale})"))
+        })
+        .collect::<Vec<_>>();
+    let sql = format!("CREATE TABLE c.d.decimals ({}) USING DELTA", columns.join(", "));
+    let DdlCommand::CreateTable(create) = DdlParser::default().parse(&sql)? else {
+        anyhow::bail!("expected create");
+    };
+    let schema = CatalogSchemaVersion::new(
+        deterministic_table_id(create.identity()),
+        create.identity().clone(),
+        SchemaVersion::FIRST,
+        create.fields().to_vec(),
+        create.canonical_ddl(),
+    )?;
+    let artifacts = generate_descriptor_artifacts(&schema)?;
+    let descriptor = FileDescriptorSet::decode(artifacts.protobuf_descriptor())?;
+    let manifest: serde_json::Value = serde_json::from_slice(artifacts.manifest())?;
+    let source = artifacts.protobuf_source()?;
+    let fields = &descriptor.file[0].message_type[0].field;
+    assert_eq!(fields.len(), columns.len());
+    for (index, field) in schema.fields().iter().enumerate() {
+        assert_eq!(field.mapping().protobuf(), ProtobufType::String, "{}", field.name());
+        assert_eq!(fields[index].r#type(), Type::String, "{}", field.name());
+        assert_eq!(
+            manifest["schema"]["fields"][index]["mapping"]["protobuf"],
+            "string",
+            "{}",
+            field.name()
+        );
+        assert!(source.contains(&format!("optional string {} = ", field.name())));
+    }
+    Ok(())
+}
 
 #[test]
 fn registered_schema_round_trips_with_metadata_and_comments() -> anyhow::Result<()> {

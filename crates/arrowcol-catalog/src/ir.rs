@@ -552,12 +552,8 @@ impl CatalogType {
             Self::UInt64 => ProtobufType::Uint64,
             Self::Float32 => ProtobufType::Float,
             Self::Float64 => ProtobufType::Double,
-            Self::Utf8 | Self::LargeUtf8 | Self::Utf8View => ProtobufType::String,
-            Self::Binary
-            | Self::FixedSizeBinary { .. }
-            | Self::LargeBinary
-            | Self::BinaryView
-            | Self::Decimal128 { .. } => ProtobufType::Bytes,
+            Self::Utf8 | Self::LargeUtf8 | Self::Utf8View | Self::Decimal128 { .. } => ProtobufType::String,
+            Self::Binary | Self::FixedSizeBinary { .. } | Self::LargeBinary | Self::BinaryView => ProtobufType::Bytes,
             Self::Struct { .. } => ProtobufType::Message,
             Self::List { .. } | Self::Map { .. } => ProtobufType::Repeated,
             Self::Dictionary { value, .. } => value.protobuf_type(),
