@@ -42,3 +42,11 @@ See
 for exact lifecycle, capture, monitoring, cleanup, and regression commands.
 See [container publishing](../docs/containers/publishing.md) for GHCR tag and
 visibility behavior.
+
+The devcontainer includes checksum-verified, version-pinned `kubectl`, `k9s`,
+`kubelogin` and `kustomize`. A local build-time Feature installs pinned
+`aks-preview` system-wide after the locked Azure CLI Feature, so `vscode` can
+discover it without a per-user installation or a mounted Azure CLI cache. Verify
+the source configuration with `nx run devcontainer:test-source`; `nx run
+devcontainer:build` builds the Dockerfile image but does not by itself prove
+that the Dev Container Features were applied.

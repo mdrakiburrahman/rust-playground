@@ -3,12 +3,16 @@ param ownership object
 param storageAccountName string
 param clusterName string
 param identityName string
+param registryName string
+param aksConfig object
+param publisherFederatedCredentials array
 param databaseName string
 param dataContainer string
 param checkpointContainer string
 param experimentContainer string
 param experimentDatabase string
 param logAnalyticsWorkspaceName string
+param readLogStorageAccountName string
 param controlMetadata object
 param checkpointExists bool
 param operatorObjectId string
@@ -23,6 +27,22 @@ resource identity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' 
   name: identityName
   location: location
   tags: ownership
+}
+
+module aks './aks.bicep' = {
+  name: 'arrowcol-aks'
+  params: {
+    location: location
+    ownership: ownership
+    clusterName: clusterName
+    registryName: registryName
+    sharedIdentityName: identityName
+    operatorObjectId: operatorObjectId
+    operatorType: operatorType
+    aksConfig: aksConfig
+    publisherFederatedCredentials: publisherFederatedCredentials
+  }
+  dependsOn: [identity]
 }
 
 resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
@@ -40,6 +60,10 @@ resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
     minimumTlsVersion: 'TLS1_2'
     supportsHttpsTrafficOnly: true
     publicNetworkAccess: 'Enabled'
+    networkAcls: {
+      bypass: 'AzureServices'
+      defaultAction: 'Allow'
+    }
   }
 }
 
@@ -116,6 +140,26 @@ resource readExperiment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   scope: experiment
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1')
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource runtimeExperimentWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(experiment.id, identity.id, 'runtime-blob-contributor')
+  scope: experiment
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource runtimeControlWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(storage.id, checkpointContainer, identity.id, 'runtime-control-contributor')
+  scope: checkpoints!
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
     principalId: identity.properties.principalId
     principalType: 'ServicePrincipal'
   }
@@ -220,6 +264,28 @@ resource experimentReader 'Microsoft.Kusto/clusters/databases/principalAssignmen
   }
 }
 
+resource runtimeExperimentAdmin 'Microsoft.Kusto/clusters/databases/principalAssignments@2024-04-13' = {
+  parent: experimentDb
+  name: 'qap-runtime-identity'
+  properties: {
+    principalId: identity.properties.clientId
+    principalType: 'App'
+    role: 'Admin'
+    tenantId: tenant().tenantId
+  }
+  dependsOn: [experimentReader]
+}
+
+resource runtimeClusterReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(cluster.id, identity.id, 'runtime-cluster-reader')
+  scope: cluster
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'acdd72a7-3385-48ef-bd42-f606fba81ae7')
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
 resource workspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
   name: logAnalyticsWorkspaceName
   location: location
@@ -232,12 +298,62 @@ resource workspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
   }
 }
 
-// Blob reads only; the experiment filters StorageBlobLogs by run path and the Kusto identity.
+resource readLogStorage 'Microsoft.Storage/storageAccounts@2023-05-01' = if (!empty(readLogStorageAccountName)) {
+  name: readLogStorageAccountName
+  location: location
+  tags: ownership
+  kind: 'StorageV2'
+  sku: { name: 'Standard_LRS' }
+  properties: {
+    allowBlobPublicAccess: false
+    allowSharedKeyAccess: false
+    minimumTlsVersion: 'TLS1_2'
+    supportsHttpsTrafficOnly: true
+    publicNetworkAccess: 'Enabled'
+    networkAcls: {
+      bypass: 'AzureServices'
+      defaultAction: 'Allow'
+    }
+  }
+}
+
+resource operatorReadExport 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(readLogStorageAccountName)) {
+  name: guid(readLogStorage!.id, operatorObjectId, 'read-log-reader')
+  scope: readLogStorage
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1')
+    principalId: operatorObjectId
+    principalType: operatorType == 'User' ? 'User' : 'ServicePrincipal'
+  }
+}
+
+resource runtimeReadExport 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(readLogStorageAccountName)) {
+  name: guid(readLogStorage!.id, identity.id, 'runtime-read-log-reader')
+  scope: readLogStorage
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1')
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+// QAP validates sink readiness through ARM before reading the exported blobs.
+resource runtimeReadExportReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(readLogStorageAccountName)) {
+  name: guid(readLogStorage!.id, identity.id, 'runtime-read-log-arm-reader')
+  scope: readLogStorage
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'acdd72a7-3385-48ef-bd42-f606fba81ae7')
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
 resource storageReads 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = {
   name: 'arrowcol-storage-reads'
   scope: blobs
   properties: {
     workspaceId: workspace.id
+    storageAccountId: empty(readLogStorageAccountName) ? null : readLogStorage!.id
     logAnalyticsDestinationType: 'Dedicated'
     logs: [
       {
@@ -258,7 +374,23 @@ resource readLogs 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   }
 }
 
+resource runtimeReadLogs 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(workspace.id, identity.id, 'runtime-log-analytics-reader')
+  scope: workspace
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '73c42c96-874c-492b-b04d-ab87d138a893')
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
 output experimentContainer string = experiment.name
 output experimentDatabase string = experimentDb.name
 output logAnalyticsWorkspaceId string = workspace.id
 output logAnalyticsCustomerId string = workspace.properties.customerId
+output readLogStorageAccountName string = readLogStorageAccountName
+
+output aksClusterName string = aks.outputs.clusterName
+output aksOidcIssuer string = aks.outputs.oidcIssuer
+output identityClientId string = identity.properties.clientId
+output registryLoginServer string = aks.outputs.registryLoginServer

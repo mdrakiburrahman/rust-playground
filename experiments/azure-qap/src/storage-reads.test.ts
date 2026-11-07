@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { HttpFailure } from '../../../infra/azure/bootstrap.ts';
-import { bodyReads, LATE_MARGIN_MS, logsQuery, parseReads, rawQuery, readsQuery, transientLogFailure, waitForLogs,
+import { bodyReads, isAdxUserAgent, LATE_MARGIN_MS, logsQuery, parseReads, rawQuery, readsQuery, transientLogFailure, waitForLogs,
   type ReadScope } from './storage-reads.js';
 
 const PRINCIPAL = '00000000-0000-0000-0000-000000000001';
@@ -9,21 +9,26 @@ const SCOPE: ReadScope = { workspace: 'ws', account: 'acct', container: 'experim
   prefix: 'runs/r1/optimize/' };
 const WINDOW = { from: Date.UTC(2025, 0, 1, 10, 0), mutationAt: Date.UTC(2025, 0, 1, 10, 2), windowEnd: Date.UTC(2025, 0, 1, 10, 5) };
 const BLOB = 'https://acct.blob.core.windows.net/experimentqap/runs/r1/optimize/';
-const COLUMNS = ['Phase', 'Path', 'OperationName', 'StatusCode', 'Requests', 'Bytes', 'Last'].map(name => ({ name, type: 'string' }));
+const COLUMNS = ['Phase', 'Path', 'OperationName', 'StatusCode', 'Requests', 'Bytes', 'Last', 'UserAgent'].map(name => ({ name, type: 'string' }));
 
 const response = (rows: unknown[][]) => ({ tables: [{ name: 'PrimaryResult', columns: COLUMNS, rows }] });
-const row = (phase: string, path: string, operation = 'GetBlob', bytes = 100, last = '2025-01-01T10:01:00Z', status: unknown = '200') =>
-  [phase, path.startsWith('https://') ? path : BLOB + path, operation, status, 1, bytes, last];
+const row = (phase: string, path: string, operation = 'GetBlob', bytes = 100, last = '2025-01-01T10:01:00Z', status: unknown = '200',
+  userAgent = 'Kusto/1.0') => [phase, path.startsWith('https://') ? path : BLOB + path, operation, status, 1, bytes, last, userAgent];
 
-test('readsQuery is a copy-pasteable KQL scoped to the trial prefix and the Kusto identity', () => {
+test('readsQuery is scoped to the shared identity, trial prefix, and ADX user-agent marker', () => {
   const text = readsQuery(SCOPE, WINDOW);
   assert.match(text, /^StorageBlobLogs\n/);
   assert.match(text, /TimeGenerated >= datetime\(2025-01-01T10:00:00\.000Z\)/);
   assert.match(text, /RequesterObjectId =~ "00000000-0000-0000-0000-000000000001"/);
+  assert.match(text, /UserAgentHeader contains "Kusto"/);
   assert.match(text, /Uri contains "\/experimentqap\/runs\/r1\/optimize\/"/);
   assert.match(text, /TimeGenerated < datetime\(2025-01-01T10:02:00\.000Z\), "warm-up",/);
   assert.match(text, /TimeGenerated < datetime\(2025-01-01T10:05:00\.000Z\), "after-mutation", "late"/);
-  assert.match(rawQuery(SCOPE, WINDOW.from), /\| project TimeGenerated, OperationName, StatusCode, ResponseBodySize, Uri/);
+  assert.match(rawQuery(SCOPE, WINDOW.from), /UserAgentHeader contains "Kusto"/);
+  assert.match(rawQuery(SCOPE, WINDOW.from), /\| project TimeGenerated, OperationName, StatusCode, ResponseBodySize, Uri, UserAgentHeader/);
+  assert.equal(isAdxUserAgent('Kusto/1.0'), true);
+  assert.equal(isAdxUserAgent('Azure-Data-Explorer/1.0'), true);
+  assert.equal(isAdxUserAgent('azsdk-rust-storage-blob/1.0'), false);
   for (const bad of [{ prefix: 'runs/r1/' }, { prefix: 'runs/r1/../x/' }, { requester: 'x" or 1==1' }, { account: 'Acct' }])
     assert.throws(() => readsQuery({ ...SCOPE, ...bad }, WINDOW), /Invalid storage read scope/);
 });
@@ -36,12 +41,13 @@ test('parseReads keeps per-file requests under the prefix and decodes paths', ()
     row('warm-up', 'https://acct.dfs.core.windows.net/experimentqap?resource=filesystem&directory=runs/r1/optimize', 'ListFilesystemDir'),
     row('warm-up', 'https://other.blob.core.windows.net/experimentqap/runs/r1/optimize/x.parquet'),
     row('warm-up', 'https://acct.blob.core.windows.net/experimentqap/runs/r1/optimize_2/x.parquet'),
+    row('after-mutation', 'runner-read.parquet', 'GetBlob', 100, '2025-01-01T10:04:00Z', 200, 'azsdk-rust-storage-blob/1.0'),
   ]), SCOPE);
   assert.deepEqual(groups, [
     { phase: 'warm-up', path: 'ingestion=2025/part-0.parquet', operation: 'GetBlob', status: 200, requests: 1, bytes: 100,
-      last: '2025-01-01T10:01:00Z' },
+      last: '2025-01-01T10:01:00Z', userAgent: 'Kusto/1.0' },
     { phase: 'after-mutation', path: '_delta_log/00000000000000000001.json', operation: 'ReadFile', status: 200, requests: 1, bytes: 50,
-      last: '2025-01-01T10:03:00Z' },
+      last: '2025-01-01T10:03:00Z', userAgent: 'Kusto/1.0' },
   ]);
   assert.throws(() => parseReads({ tables: [] }, SCOPE), /failed, partial or ambiguous/);
   assert.throws(() => parseReads({ ...response([]), partialError: { code: 'x' } }, SCOPE), /failed, partial or ambiguous/);

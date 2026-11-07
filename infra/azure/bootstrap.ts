@@ -9,6 +9,7 @@ import { parseArgs } from 'node:util';
 import { Failure, HttpFailure, ControlConflict, NotReady, DeploymentFailed, canonical,
   canonical_json, publisher_registry, require_released, uuid, type Metadata } from './authority.js';
 import { PublisherControl, READY, FENCED, CLEANING, UnknownTransition } from './publisher_control.js';
+import { assertNoStampNetworkOverlap, defaultStampConfig, loadStampConfig, type StampConfig } from './stamp.js';
 export * from './authority.js';
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -69,30 +70,65 @@ function normalized_uuid(value: string): string {
   return `${raw.slice(0, 8)}-${raw.slice(8, 12)}-${raw.slice(12, 16)}-${raw.slice(16, 20)}-${raw.slice(20)}`;
 }
 export class Config {
-  subscription: string; group: string; sandbox: string; location: string; account: string;
-  cluster: string; identity: string; database: string; data: string; checkpoints: string;
+  subscription: string; group: string; stamp: number; sandbox: string; location: string; account: string; registry: string; registryLoginServer: string;
+  cluster: string; identity: string; identity_client_id: string; kubernetesNamespace: string; kubernetesServiceAccount: string;
+  stampConfig: StampConfig; database: string; data: string; checkpoints: string;
   experimentContainer: string; experimentDatabase: string; logAnalyticsWorkspace: string;
+  readLogDestination: 'log-analytics' | 'storage'; readLogAccount: string; readLogStorageId: string;
   sku: string; minimum: number; maximum: number; hot: number; cluster_tags: Record<string, string>;
   operator: string; operator_type: string; operator_application: string; base: string;
-  storage_id: string; cluster_id: string; identity_id: string; workspace_id: string;
+  storage_id: string; cluster_id: string; identity_id: string; workspace_id: string; registry_id: string;
   uri: string; table_root: string; table_prefix: string;
-  constructor(values: Record<string, string | undefined>) {
+  constructor(values: Record<string, string | undefined>, stampConfig: StampConfig = defaultStampConfig(values)) {
     const get = (key: string, fallback = '') => values[key] || fallback;
     try { this.subscription = normalized_uuid(get('AZURE_SUBSCRIPTION_ID')); }
     catch { throw new Failure('AZURE_SUBSCRIPTION_ID must be a private subscription UUID.'); }
-    this.group = get('AZURE_RESOURCE_GROUP', 'rust-playground');
-    if (this.group !== 'rust-playground') throw new Failure('Only the exact rust-playground resource group is authorized.');
-    this.sandbox = createHash('sha256').update(this.subscription + ':' + this.group).digest('hex').slice(0, 12);
-    this.location = get('AZURE_LOCATION', 'eastus2');
-    this.account = get('AZURE_STORAGE_ACCOUNT', 'arrowcol' + this.sandbox);
-    this.cluster = get('AZURE_KUSTO_CLUSTER', 'arrowcol-' + this.sandbox);
-    this.identity = get('AZURE_KUSTO_IDENTITY_NAME', 'arrowcol-kusto-reader');
+    if (stampConfig.subscription && this.subscription !== stampConfig.subscription)
+      throw new Failure('AZURE_SUBSCRIPTION_ID must match the validated AKS stamp configuration.');
+    this.stampConfig = stampConfig;
+    this.stamp = stampConfig.stamp;
+    this.group = stampConfig.resourceGroup;
+    if (values.AZURE_RESOURCE_GROUP && values.AZURE_RESOURCE_GROUP !== this.group)
+      throw new Failure('AZURE_RESOURCE_GROUP must match the validated AKS stamp configuration.');
+    this.sandbox = 'stamp-' + this.stamp;
+    this.location = stampConfig.location;
+    if (values.AZURE_LOCATION && values.AZURE_LOCATION !== this.location)
+      throw new Failure('AZURE_LOCATION must match the validated AKS stamp configuration.');
+    const expectedAccount = 'arrowcollector' + this.stamp;
+    const expectedCluster = 'arrow-collector-' + this.stamp;
+    const expectedRegistry = expectedAccount;
+    this.account = get('AZURE_STORAGE_ACCOUNT', expectedAccount);
+    this.cluster = get('AZURE_KUSTO_CLUSTER', expectedCluster);
+    this.identity = get('AZURE_KUSTO_IDENTITY_NAME', 'arrow-collector');
+    this.registry = get('AZURE_CONTAINER_REGISTRY_NAME', expectedRegistry);
+    this.registryLoginServer = get('AZURE_CONTAINER_REGISTRY_SERVER', this.registry + '.azurecr.io');
+    if (this.account !== expectedAccount || this.cluster !== expectedCluster || this.identity !== 'arrow-collector' || this.registry !== expectedRegistry)
+      throw new Failure('Resource names must match the positive integer stamp and the single arrow-collector identity.');
+    if (this.registryLoginServer !== this.registry + '.azurecr.io') throw new Failure('Container Registry login server must match the stamped registry.');
+    this.identity_client_id = get('AZURE_UAMI_CLIENT_ID');
+    if (this.identity_client_id) {
+      try { this.identity_client_id = normalized_uuid(this.identity_client_id); }
+      catch { throw new Failure('AZURE_UAMI_CLIENT_ID must be a UUID.'); }
+    }
+    this.kubernetesNamespace = stampConfig.aks.namespace;
+    this.kubernetesServiceAccount = stampConfig.aks.serviceAccount;
+    if ((values.AZURE_KUBERNETES_NAMESPACE && values.AZURE_KUBERNETES_NAMESPACE !== this.kubernetesNamespace) ||
+        (values.AZURE_KUBERNETES_SERVICE_ACCOUNT && values.AZURE_KUBERNETES_SERVICE_ACCOUNT !== this.kubernetesServiceAccount))
+      throw new Failure('Kubernetes namespace and service account must match the validated stamp configuration.');
     this.database = get('AZURE_KUSTO_DATABASE', 'arrowcol');
     this.data = get('AZURE_STORAGE_CONTAINER', 'arrowcol');
     this.checkpoints = get('AZURE_STORAGE_CHECKPOINT_CONTAINER', 'checkpoints');
     this.experimentContainer = get('AZURE_STORAGE_EXPERIMENT_CONTAINER', 'experimentqap');
     this.experimentDatabase = get('AZURE_KUSTO_EXPERIMENT_DATABASE', 'experimentqap');
-    this.logAnalyticsWorkspace = get('AZURE_LOG_ANALYTICS_WORKSPACE', 'arrowcol-' + this.sandbox);
+    this.logAnalyticsWorkspace = get('AZURE_LOG_ANALYTICS_WORKSPACE', this.cluster);
+    this.readLogDestination = stampConfig.storageReadLogDestination ?? 'log-analytics';
+    if (values.AZURE_STORAGE_READ_LOG_DESTINATION && values.AZURE_STORAGE_READ_LOG_DESTINATION !== this.readLogDestination)
+      throw new Failure('Storage read-log destination must match the validated stamp configuration.');
+    this.readLogAccount = this.readLogDestination === 'storage' ? 'arrowreadlogs' + this.stamp : '';
+    if (values.AZURE_STORAGE_READ_LOG_ACCOUNT && values.AZURE_STORAGE_READ_LOG_ACCOUNT !== this.readLogAccount)
+      throw new Failure('Diagnostic storage account must match the exact configured stamp.');
+    if (!/^[a-z][a-z0-9-]{2,61}[a-z0-9]$/.test(this.logAnalyticsWorkspace))
+      throw new Failure('Log Analytics workspace name is invalid.');
     for (const value of [this.location, this.identity, this.cluster, this.database, this.data, this.checkpoints,
       this.experimentContainer, this.experimentDatabase, this.logAnalyticsWorkspace])
       if (!/^[a-z][a-z0-9-]{1,62}$/.test(value)) throw new Failure('Resource names must be lowercase alphanumeric sandbox names.');
@@ -128,7 +164,9 @@ export class Config {
     this.storage_id = this.base + '/providers/Microsoft.Storage/storageAccounts/' + this.account;
     this.cluster_id = this.base + '/providers/Microsoft.Kusto/clusters/' + this.cluster;
     this.identity_id = this.base + '/providers/Microsoft.ManagedIdentity/userAssignedIdentities/' + this.identity;
+    this.registry_id = this.base + '/providers/Microsoft.ContainerRegistry/registries/' + this.registry;
     this.workspace_id = this.base + '/providers/Microsoft.OperationalInsights/workspaces/' + this.logAnalyticsWorkspace;
+    this.readLogStorageId = this.readLogAccount ? this.base + '/providers/Microsoft.Storage/storageAccounts/' + this.readLogAccount : '';
     this.uri = `https://${this.cluster}.${this.location}.kusto.windows.net`;
     const root = get('ARROWCOL_AZURE_TABLE_ROOT', `abfss://${this.data}@${this.account}.dfs.core.windows.net/`);
     // Validate raw authority/path rather than URL's normalized path (which erases traversal).
@@ -143,19 +181,24 @@ export class Config {
   redact(text: string): string {
     for (const value of [this.subscription, this.sandbox, this.account, this.cluster, this.identity,
       this.uri, this.database, this.data, this.checkpoints, this.experimentContainer, this.experimentDatabase,
-      this.logAnalyticsWorkspace]) text = text.replaceAll(value, '[private]');
+      this.logAnalyticsWorkspace, this.readLogAccount].filter(Boolean)) text = text.replaceAll(value, '[private]');
     return text.replace(/https?:\/\/[^\s"'<>]+/g, '[endpoint]')
       .replace(/\b[\w.+-]+@[\w.-]+\.[A-Za-z]+\b/g, '[principal]')
       .replace(/\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b/gi, '[identifier]')
       .replace(/bearer\s+\S+/gi, '******').slice(0, 2000);
   }
   generated(): Record<string, string> {
-    return { AZURE_LOCATION: this.location, AZURE_STORAGE_ACCOUNT: this.account, AZURE_STORAGE_CONTAINER: this.data,
+    return { AZURE_RESOURCE_GROUP: this.group, AZURE_STAMP: String(this.stamp), AZURE_LOCATION: this.location,
+      AZURE_CONTAINER_REGISTRY_NAME: this.registry, AZURE_CONTAINER_REGISTRY_SERVER: this.registryLoginServer,
+      AZURE_KUBERNETES_NAMESPACE: this.kubernetesNamespace, AZURE_KUBERNETES_SERVICE_ACCOUNT: this.kubernetesServiceAccount,
+      ...(this.identity_client_id ? { AZURE_UAMI_CLIENT_ID: this.identity_client_id } : {}),
+      AZURE_STORAGE_ACCOUNT: this.account, AZURE_STORAGE_CONTAINER: this.data,
       AZURE_STORAGE_CHECKPOINT_CONTAINER: this.checkpoints, AZURE_KUSTO_CLUSTER: this.cluster,
       AZURE_KUSTO_DATABASE: this.database, AZURE_KUSTO_IDENTITY_NAME: this.identity, AZURE_KUSTO_URI: this.uri,
       ARROWCOL_AZURE_TABLE_ROOT: this.table_root,
       ARROWCOL_AZURE_CHECKPOINT_ROOT: `abfss://${this.checkpoints}@${this.account}.dfs.core.windows.net/`,
       AZURE_STORAGE_EXPERIMENT_CONTAINER: this.experimentContainer,
+      AZURE_STORAGE_READ_LOG_DESTINATION: this.readLogDestination, AZURE_STORAGE_READ_LOG_ACCOUNT: this.readLogAccount,
       AZURE_KUSTO_EXPERIMENT_DATABASE: this.experimentDatabase,
       AZURE_LOG_ANALYTICS_WORKSPACE: this.logAnalyticsWorkspace };
   }
@@ -199,7 +242,7 @@ type Headers = Record<string, string>;
 export type BlobEntry = { name: string; snapshot?: string | null; version?: string | null; etag?: string | null;
   deleted?: boolean; directory?: boolean };
 export class Azure {
-  tokens = new Map<string, { at: number; token: string }>();
+  tokens = new Map<string, { at: number; token: string; lifetime: number }>();
   token_pending = new Map<string, Promise<string>>();
   snapshots = new Map<string, Metadata>();
   constructor(public c: Config) {}
@@ -210,12 +253,24 @@ export class Azure {
   }
   async token(resource: string): Promise<string> {
     const cached = this.tokens.get(resource);
-    if (cached && runtime.now() - cached.at <= 240) return cached.token;
+    if (cached && runtime.now() - cached.at <= cached.lifetime) return cached.token;
     const pending = this.token_pending.get(resource);
     if (pending) return pending;
     const refresh = (async () => {
-      const token = (await this.cli('account', 'get-access-token', '--subscription', this.c.subscription, '--resource', resource)).accessToken;
-      this.tokens.set(resource, { at: runtime.now(), token });
+      const federated = ['AZURE_CLIENT_ID', 'AZURE_TENANT_ID', 'AZURE_FEDERATED_TOKEN_FILE']
+        .map(key => process.env[key] || '');
+      let token: string;
+      let lifetime = 240;
+      if (federated.some(Boolean)) {
+        if (federated.some(value => !value)) throw new Failure('Workload identity requires client ID, tenant ID and token file.');
+        const exchanged = await exchange_workload_identity_token(resource, federated[0]!, federated[1]!, federated[2]!);
+        token = exchanged.token;
+        lifetime = Math.min(lifetime, exchanged.expiresIn - 30);
+      } else {
+        token = (await this.cli('account', 'get-access-token', '--subscription', this.c.subscription,
+          '--resource', resource)).accessToken;
+      }
+      this.tokens.set(resource, { at: runtime.now(), token, lifetime });
       return token;
     })();
     this.token_pending.set(resource, refresh);
@@ -379,8 +434,44 @@ export class Azure {
     return items;
   }
 }
+export async function exchange_workload_identity_token(resource: string, clientId: string, tenantId: string,
+  tokenFile: string): Promise<{ token: string; expiresIn: number }> {
+  const assertion = fs.readFileSync(tokenFile, 'utf8').trim();
+  if (!assertion || assertion.length > 16_384) throw new Failure('Projected workload identity token is empty or too large.');
+  const scope = resource.replace(/\/+$/, '') + '/.default';
+  let response: Response;
+  try {
+    response = await fetch(`https://login.microsoftonline.com/${encodeURIComponent(tenantId)}/oauth2/v2.0/token`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ client_id: clientId, scope, grant_type: 'client_credentials',
+        client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer', client_assertion: assertion }),
+      signal: AbortSignal.timeout(15_000),
+      redirect: 'error',
+    });
+  } catch (error) {
+    throw new Failure('Workload identity token exchange request failed.', { cause: error });
+  }
+  if (!response.ok) throw new Failure(`Workload identity token exchange failed with HTTP ${response.status}.`);
+  let value: unknown;
+  try { value = await response.json(); }
+  catch (error) { throw new Failure('Workload identity token exchange returned invalid JSON.', { cause: error }); }
+  if (!value || typeof value !== 'object' || Array.isArray(value))
+    throw new Failure('Workload identity token exchange returned invalid metadata.');
+  const result = value as Record<string, unknown>;
+  const expiresIn = typeof result.expires_in === 'number' ? result.expires_in :
+    typeof result.expires_in === 'string' && /^\d+$/.test(result.expires_in) ? Number(result.expires_in) : 0;
+  if (typeof result.access_token !== 'string' || !result.access_token ||
+      typeof result.token_type !== 'string' || result.token_type.toLowerCase() !== 'bearer' ||
+      !Number.isSafeInteger(expiresIn) || expiresIn <= 30)
+    throw new Failure('Workload identity token exchange returned incomplete token metadata.');
+  return { token: result.access_token, expiresIn };
+}
+
 interface XmlNode { name: string; text: string; children: XmlNode[] }
 function xml_decode(value: string): string {
+
+
   return value.replace(/&([^;]*);|&/g, (entity, code: string | undefined) => {
     const named: Record<string, string> = { lt: '<', gt: '>', quot: '"', apos: "'", amp: '&' };
     if (code && Object.hasOwn(named, code)) return named[code];
@@ -458,26 +549,92 @@ export async function retry_ready<T>(action: () => Promise<T>, label: string, ti
     await runtime.sleep(10);
   }
 }
+export async function existing_network_prefixes(azure: Pick<Azure, 'cli'>, subscription: string, stamp?: Config): Promise<string[]> {
+  const vnets = await azure.cli('network', 'vnet', 'list', '--subscription', subscription);
+  const prefixes = (network: any): string[] => {
+    const values = network.addressSpace?.addressPrefixes;
+    if (!Array.isArray(values) || !values.length || values.some((value: unknown) => typeof value !== 'string'))
+      throw new Failure('Azure returned a VNet without a valid address space; network overlap cannot be verified.');
+    return values;
+  };
+  const peerings = await Promise.all(vnets.map((vnet: any) => {
+    if (typeof vnet.name !== 'string' || typeof vnet.resourceGroup !== 'string')
+      throw new Failure('Azure returned an incomplete VNet record; network overlap cannot be verified.');
+    return azure.cli('network', 'vnet', 'peering', 'list', '--resource-group', vnet.resourceGroup,
+      '--vnet-name', vnet.name, '--subscription', subscription);
+  }));
+  const knownIds = new Set(vnets.map((vnet: any) => vnet.id?.toLowerCase()).filter(Boolean));
+  const remoteIds = new Map<string, string>();
+  for (const peering of peerings.flat().filter((entry: any) => entry.peeringState === 'Connected')) {
+    const id = peering.remoteVirtualNetwork?.id;
+    if (typeof id !== 'string' || !id) throw new Failure('Connected VNet peering has no remote VNet ID.');
+    if (!knownIds.has(id.toLowerCase())) remoteIds.set(id.toLowerCase(), id);
+  }
+  const remoteNetworks = await Promise.all([...remoteIds.values()].map(id => azure.cli('network', 'vnet', 'show', '--ids', id)));
+  const externalNetworks = vnets.filter((network: any) => {
+    if (!stamp) return true;
+    const ownId = `${stamp.base}/providers/Microsoft.Network/virtualNetworks/${stamp.cluster}-vnet`;
+    if (network.id?.toLowerCase() !== ownId.toLowerCase()) return true;
+    owned(network, stamp);
+    const expected = new Set([stamp.stampConfig.aks.network.vnetIpv4Cidr, stamp.stampConfig.aks.network.vnetIpv6Cidr]);
+    const actual = prefixes(network);
+    if (actual.length !== expected.size || actual.some(prefix => !expected.has(prefix)))
+      throw new Failure('Existing owned AKS VNet address space differs from the configured stamp; refusing network mutation.');
+    return false;
+  });
+  return [...new Set([...externalNetworks.flatMap(prefixes), ...remoteNetworks.flatMap(prefixes)])];
+}
 export async function preflight(azure: Azure): Promise<void> {
-  const c = azure.c;
+  const c = azure.c, aksConfig = c.stampConfig.aks;
   const account = await azure.cli('account', 'show', '--subscription', c.subscription);
   if (account.id.toLowerCase() !== c.subscription) throw new Failure('CLI subscription mismatch; no default-subscription fallback is permitted.');
-  for (const provider of ['Microsoft.Kusto', 'Microsoft.Storage', 'Microsoft.ManagedIdentity',
-    'Microsoft.OperationalInsights', 'Microsoft.Insights']) {
+  if (!c.stampConfig.publisherFederatedCredentials.length)
+    throw new Failure('The private stamp config must preserve the existing publisher federated credentials before provisioning.');
+  for (const provider of ['Microsoft.Kusto', 'Microsoft.Storage', 'Microsoft.ManagedIdentity', 'Microsoft.OperationalInsights',
+    'Microsoft.Insights', 'Microsoft.ContainerService', 'Microsoft.Network', 'Microsoft.ContainerRegistry', 'Microsoft.Authorization']) {
     const state = (await azure.cli('provider', 'show', '--namespace', provider, '--subscription', c.subscription)).registrationState;
     if (state !== 'Registered') await azure.cli('provider', 'register', '--namespace', provider, '--subscription', c.subscription, '--wait');
   }
+  const versions = await azure.cli('aks', 'get-versions', '--location', c.location, '--subscription', c.subscription);
+  const versionFamily = aksConfig.version.split('.').slice(0, 2).join('.');
+  if (!versions.values?.some((entry: any) => entry.version === versionFamily && Object.hasOwn(entry.patchVersions ?? {}, aksConfig.version)))
+    throw new Failure('Configured AKS Kubernetes version is not available in the target region.');
+  const skuResults = await azure.cli('vm', 'list-skus', '--location', c.location, '--size', aksConfig.systemPool.vmSize,
+    '--all', '--subscription', c.subscription);
+  const sku = skuResults.find((entry: any) => entry.name === aksConfig.systemPool.vmSize);
+  if (!sku || sku.restrictions?.length) throw new Failure('Configured AKS system-pool VM SKU is unavailable or restricted in the target region.');
+  const vcpus = Number(sku.capabilities?.find((capability: any) => capability.name === 'vCPUs')?.value);
+  if (!Number.isSafeInteger(vcpus) || vcpus < 1) throw new Failure('Azure did not report the configured AKS VM vCPU count.');
+  const usages = await azure.cli('vm', 'list-usage', '--location', c.location, '--subscription', c.subscription);
+  const quota = usages.find((entry: any) => entry.name?.value === sku.family);
+  if (!quota || Number(quota.limit) - Number(quota.currentValue) < vcpus * aksConfig.systemPool.initialCount)
+    throw new Failure('Azure VM-family quota is insufficient for the configured initial AKS system-pool size.');
+  const apiServerFeature = await azure.cli('feature', 'show', '--namespace', 'Microsoft.ContainerService',
+    '--name', 'EnableAPIServerVnetIntegrationPreview', '--subscription', c.subscription);
+  if (apiServerFeature.properties?.state !== 'Registered')
+    throw new Failure('AKS API-server VNet integration is not registered in the target subscription.');
+  const existingPrefixes = await existing_network_prefixes(azure, c.subscription, c);
+  assertNoStampNetworkOverlap(c.stampConfig, existingPrefixes);
   if (!c.operator) {
     const token = await azure.token('https://management.azure.com/');
     c.operator = normalized_uuid(JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString()).oid);
   } else c.operator = normalized_uuid(c.operator);
-  console.log('Azure subscription and signed-in provisioning identity: ready');
+  const group = await azure.arm('GET', c.base, undefined, true, '2022-09-01');
+  const inventory = group
+    ? await azure.cli('resource', 'list', '--resource-group', c.group, '--subscription', c.subscription) : [];
+  const legacy = inventory.filter((resource: any) => resource.tags?.project === 'arrow-collector');
+  const extraIdentities = inventory.filter((resource: any) => resource.type?.toLowerCase() ===
+    'microsoft.managedidentity/userassignedidentities' && resource.name !== c.identity);
+  if (legacy.length || extraIdentities.length)
+    throw new Failure('Replacement is blocked while legacy resources or additional UAMIs remain in arrow-collector-rg. Preserve Terraform state, Key Vault configuration, role assignments, and publisher FIC consumers before retiring them.');
+  console.log('Azure subscription, AKS version, VM quota, network ranges, and one-identity preflight: ready');
 }
 export async function guard_existing(azure: Azure): Promise<void> {
   const c = azure.c;
-  for (const resourcePath of [c.base, c.storage_id, c.cluster_id, c.identity_id, c.workspace_id]) {
+  for (const resourcePath of [c.base, c.storage_id, c.cluster_id, c.identity_id, c.workspace_id,
+    ...(c.readLogStorageId ? [c.readLogStorageId] : [])]) {
     const resource = await azure.arm('GET', resourcePath, undefined, true,
-      resourcePath === c.base ? '2022-09-01' : resourcePath === c.storage_id ? '2023-05-01' :
+      resourcePath === c.base ? '2022-09-01' : [c.storage_id, c.readLogStorageId].includes(resourcePath) ? '2023-05-01' :
         resourcePath === c.identity_id ? '2023-01-31' : resourcePath === c.workspace_id ? LOG_ANALYTICS_API : API);
     if (resource) owned(resource, c);
   }
@@ -492,9 +649,11 @@ export async function deploy(azure: Azure, fresh?: Metadata): Promise<void> {
   const c = azure.c;
   await guard_existing(azure);
   const params = { location: c.location, resourceGroupName: c.group, sandboxId: c.sandbox, storageAccountName: c.account,
-    clusterName: c.cluster, identityName: c.identity, databaseName: c.database, dataContainer: c.data, checkpointContainer: c.checkpoints,
+    clusterName: c.cluster, identityName: c.identity, registryName: c.registry, aksConfig: c.stampConfig.aks,
+    publisherFederatedCredentials: c.stampConfig.publisherFederatedCredentials, databaseName: c.database, dataContainer: c.data, checkpointContainer: c.checkpoints,
     experimentContainer: c.experimentContainer, experimentDatabase: c.experimentDatabase,
     logAnalyticsWorkspaceName: c.logAnalyticsWorkspace,
+    readLogStorageAccountName: c.readLogAccount,
     operatorObjectId: c.operator, operatorKustoPrincipalId: c.operator_type === 'App' ? c.operator_application : c.operator,
     controlMetadata: fresh ?? {}, checkpointExists: fresh === undefined, operatorType: c.operator_type,
     clusterSku: c.sku, minimumInstances: c.minimum, maximumInstances: c.maximum, clusterTags: c.cluster_tags };
@@ -510,6 +669,9 @@ export async function deploy(azure: Azure, fresh?: Metadata): Promise<void> {
     }
   } finally { fs.unlinkSync(filename); }
   c.uri = (await azure.arm('GET', c.cluster_id)).properties.uri.replace(/\/+$/, '');
+  const sharedIdentity = await azure.arm('GET', c.identity_id, undefined, false, '2023-01-31');
+  try { c.identity_client_id = normalized_uuid(sharedIdentity?.properties?.clientId); }
+  catch { throw new Failure('Deployment did not return the single arrow-collector UAMI client ID.'); }
   await retry_ready(() => azure.blobs(c.data), 'Storage RBAC');
   console.log('Declarative resources and storage access: ready');
 }
@@ -1132,18 +1294,18 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     const stopCommand = stopIndex < 0 || stopIndex === argv.length - 1 ? DEFAULT_STOP_COMMAND : argv.slice(stopIndex + 1);
     const { values: args, positionals } = parseArgs({ args: stopIndex < 0 ? argv : argv.slice(0, stopIndex),
       allowPositionals: true, options: {
-        'env-file': { type: 'string', default: path.join(ROOT, '.env') }, output: { type: 'string', default: path.join(ROOT, '.env.azure') },
+        'env-file': { type: 'string', default: path.join(ROOT, '.env') }, 'stamp-config': { type: 'string', default: path.join(ROOT, 'infra/azure/stamp.yaml') }, output: { type: 'string', default: path.join(ROOT, '.env.azure') },
         tables: { type: 'string', default: path.join(ROOT, '.env.azure.tables.json') }, 'infra-only': { type: 'boolean', default: false },
         execute: { type: 'boolean', default: false }, resume: { type: 'boolean', default: false },
         'occupancy-id': { type: 'string', default: '' }, 'reset-generation': { type: 'string', default: '' },
         'wait-seconds': { type: 'string', default: '0' }, help: { type: 'boolean', short: 'h' },
       } });
-    if (args.help) { console.log('Usage: bootstrap.ts <config|preflight|provision|reconcile|reset|recover|status|stop|occupy|release> [--env-file PATH] [--output PATH] [--tables PATH] [--infra-only] [--execute] [--resume] [--occupancy-id UUID] [--reset-generation UUID] [--wait-seconds 0..600] [--stop-command COMMAND ...]'); return 0; }
+    if (args.help) { console.log('Usage: bootstrap.ts <config|preflight|provision|reconcile|reset|recover|status|stop|occupy|release> [--env-file PATH] [--stamp-config YAML] [--output PATH] [--tables PATH] [--infra-only] [--execute] [--resume] [--occupancy-id UUID] [--reset-generation UUID] [--wait-seconds 0..600] [--stop-command COMMAND ...]'); return 0; }
     const command = positionals[0];
     if (positionals.length !== 1 || !['config', 'preflight', 'provision', 'reconcile', 'reset', 'recover', 'status', 'stop', 'occupy', 'release'].includes(command))
       throw new Failure('A valid Azure bootstrap command is required.');
     const values = { ...load_env(args['env-file']!), ...process.env } as Record<string, string>;
-    c = new Config(values);
+    c = new Config(values, loadStampConfig(args['stamp-config']!));
     const wait = Number(args['wait-seconds']);
     if (!/^\d+$/.test(args['wait-seconds']!) || !Number.isInteger(wait) || wait < 0 || wait > 600)
       throw new Failure('--wait-seconds must be in the range 0..600.');
