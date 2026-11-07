@@ -20,6 +20,20 @@
       "executor": "nx:run-commands",
       "dependsOn": ["lint", "test"],
       "options": { "commands": [] }
+    },
+    "probe-kustainer": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install tsx experiments/schema-evolution/src/probe-kustainer.ts"
+      }
+    },
+    "build-fixtures": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install tsx experiments/schema-evolution/src/build-clients.ts --fixtures"
+      }
     }
   }
 }

@@ -7,6 +7,7 @@ export interface Counts {
   total: number;
   empty: number;
   filled: number;
+  sentinelMismatches: number;
 }
 export interface Observation {
   elapsedMs: number;
@@ -26,7 +27,8 @@ export interface PollOptions {
 export function countQuery(table: string): string {
   identifier(table);
   return `external_table('${table}')\n` +
-    '| summarize total=count(), empty=countif(isempty(bar)), filled=countif(isnotempty(bar)) by client, phase\n' +
+    '| summarize total=count(), empty=countif(isempty(bar)), filled=countif(isnotempty(bar)),\n' +
+    "  sentinelMismatches=countif(client == 'new' and bar != strcat('bar-', tostring(value))) by client, phase\n" +
     '| order by client asc, phase asc';
 }
 
@@ -39,19 +41,20 @@ export function requestedNullQuery(table: string): string {
 export function parseCounts(rows: unknown[][]): Counts[] {
   const seen = new Set<string>();
   return rows.map(row => {
-    const [client, phase, total, empty, filled] = row;
-    if (row.length !== 5 || (client !== 'old' && client !== 'new') ||
+    const [client, phase, total, empty, filled, sentinelMismatches] = row;
+    if (row.length !== 6 || (client !== 'old' && client !== 'new') ||
         (phase !== 'before' && phase !== 'after') || seen.has(`${client}:${phase}`) ||
-        [total, empty, filled].some(value => typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) ||
-        typeof total !== 'number' || typeof empty !== 'number' || typeof filled !== 'number' || total !== empty + filled)
+        [total, empty, filled, sentinelMismatches].some(value => typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) ||
+        typeof total !== 'number' || typeof empty !== 'number' || typeof filled !== 'number' ||
+        typeof sentinelMismatches !== 'number' || sentinelMismatches > total || total !== empty + filled)
       throw new Error('Malformed, duplicate or inconsistent schema evolution counts.');
     seen.add(`${client}:${phase}`);
-    return { client, phase, total, empty, filled };
+    return { client, phase, total, empty, filled, sentinelMismatches };
   });
 }
 
 export function complete(counts: Counts[], rows: number): boolean {
-  return counts.length === 3 &&
+  return counts.length === 3 && counts.every(c => c.sentinelMismatches === 0) &&
     counts.some(c => c.client === 'old' && c.phase === 'before' && c.total === rows && c.empty === rows && c.filled === 0) &&
     counts.some(c => c.client === 'old' && c.phase === 'after' && c.total === rows && c.empty === rows && c.filled === 0) &&
     counts.some(c => c.client === 'new' && c.phase === 'after' && c.total === rows && c.empty === 0 && c.filled === rows);

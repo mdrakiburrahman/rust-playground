@@ -48,9 +48,14 @@ async fn append(
 async fn wrong_schema(
     client: &mut FlightServiceClient<tonic::transport::Channel>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let batch = arrow_array::RecordBatch::new_empty(std::sync::Arc::new(arrow_schema::Schema::new(vec![
-        arrow_schema::Field::new("wrong_column", arrow_schema::DataType::Int64, false),
-    ])));
+    let batch = arrow_array::RecordBatch::try_new(
+        std::sync::Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "wrong_column",
+            arrow_schema::DataType::Int64,
+            false,
+        )])),
+        vec![std::sync::Arc::new(arrow_array::Int64Array::from(vec![1]))],
+    )?;
     let encoded = sdk::encode_do_put(futures::stream::iter([Ok(batch)]))
         .try_collect::<Vec<_>>()
         .await?;
@@ -101,7 +106,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !(1..=10_000).contains(&count) {
         return Err("rows must be 1..10000".into());
     }
-    let mut client = FlightServiceClient::connect(args[0].clone()).await?;
+    let channel = tonic::transport::Endpoint::from_shared(args[0].clone())?
+        .connect()
+        .await?;
+    let mut client = FlightServiceClient::new(channel);
     match args[2].as_str() {
         "wrong-schema" => wrong_schema(&mut client).await?,
         "write" => {

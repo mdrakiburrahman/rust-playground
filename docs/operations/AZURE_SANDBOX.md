@@ -38,7 +38,7 @@ group (`rust-playground` by default), so independent devboxes agree without shar
 commands or source. `config` does not contact Azure and is not deployment proof.
 
 | Stamp selection | Configuration | Safety boundary |
-|---|---|---|
+| --- | --- | --- |
 | Existing sandbox | `AZURE_RESOURCE_GROUP=rust-playground` | Existing behavior and names are unchanged. |
 | Separate disposable sandbox | `AZURE_RESOURCE_GROUP=rust-playground-schema-evo` | Lowercase `rust-playground-<suffix>` names only; ownership tags and account/container checks still apply. |
 

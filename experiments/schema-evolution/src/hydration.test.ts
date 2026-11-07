@@ -2,21 +2,22 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { complete, observeHydration, parseCounts, type Observation } from './hydration.ts';
 
-const full = [['old', 'before', 10, 10, 0], ['old', 'after', 10, 10, 0], ['new', 'after', 10, 0, 10]];
+const full = [['old', 'before', 10, 10, 0, 0], ['old', 'after', 10, 10, 0, 0], ['new', 'after', 10, 0, 10, 0]];
 const schema = [['client'], ['phase'], ['bar']];
 const query = (rows: unknown[][]) => async (csl: string) => csl.includes('getschema') ? schema : rows;
 
 test('old before/after and new filled rows must each match exactly, not merely expose a column', () => {
   assert.equal(complete(parseCounts(full), 10), true);
-  for (const rows of [full.slice(1), [...full, ['new', 'before', 10, 0, 10]],
-    [full[0]!, ['old', 'after', 10, 9, 1], full[2]!],
-    [full[0]!, full[1]!, ['new', 'after', 20, 0, 20]]])
+  for (const rows of [full.slice(1), [...full, ['new', 'before', 10, 0, 10, 0]],
+    [full[0]!, ['old', 'after', 10, 9, 1, 0], full[2]!],
+    [full[0]!, full[1]!, ['new', 'after', 20, 0, 20, 0]],
+    [full[0]!, full[1]!, ['new', 'after', 10, 0, 10, 1]]])
     assert.equal(complete(parseCounts(rows), 10), false);
 });
 
 test('malformed and duplicate aggregates are fatal rather than polled as incomplete', () => {
-  for (const rows of [[full[0]!, full[0]!], [['old', 'after', 10, 0, 1]],
-    [['old', 'after', '10', 10, 0]], [['new', 'after', 1.5, 0, 1.5]], [['unknown', 'after', 10, 10, 0]]])
+  for (const rows of [[full[0]!, full[0]!], [['old', 'after', 10, 0, 1, 0]],
+    [['old', 'after', '10', 10, 0, 0]], [['new', 'after', 1.5, 0, 1.5, 0]], [['unknown', 'after', 10, 10, 0, 0]]])
     assert.throws(() => parseCounts(rows), /Malformed/);
 });
 

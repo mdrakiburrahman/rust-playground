@@ -73,8 +73,24 @@ export async function buildClients(v1: string, v2: string, signal: AbortSignal):
   return { old: binaries[0]!, new: binaries[1]! };
 }
 
+async function buildFixtures(signal: AbortSignal): Promise<{ old: string; new: string }> {
+  const base = '.temp/experiments/schema-evolution';
+  const generate = async (args: string[]) => command('cargo', ['run', '--locked', '--quiet', '-p', 'arrowcol-sdk-gen', '--', ...args], signal);
+  await generate(['fixture', '--ddl', 'experiments/schema-evolution/fixtures/create.sql', '--out', `${base}/catalog-v1`]);
+  await generate(['fixture', '--ddl', 'experiments/schema-evolution/fixtures/alter.sql',
+    '--previous', `${base}/catalog-v1`, '--out', `${base}/catalog-v2`]);
+  for (const version of [1, 2])
+    await generate(['generate', '--artifacts', `${base}/catalog-v${version}`, '--out', `${base}/sdk-v${version}`]);
+  return buildClients(`${base}/sdk-v1`, `${base}/sdk-v2`, signal);
+}
+
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const { values } = parseArgs({ options: { v1: { type: 'string' }, v2: { type: 'string' } } });
-  if (!values.v1 || !values.v2) throw new Error('build-clients requires --v1 and --v2 immutable generated SDK directories.');
-  console.log(JSON.stringify(await buildClients(values.v1, values.v2, AbortSignal.timeout(20 * 60_000))));
+  const { values } = parseArgs({ options: { v1: { type: 'string' }, v2: { type: 'string' }, fixtures: { type: 'boolean' } } });
+  if (values.fixtures && (values.v1 || values.v2)) throw new Error('--fixtures cannot be combined with catalog SDK directories.');
+  const signal = AbortSignal.timeout(20 * 60_000);
+  if (values.fixtures) console.log(JSON.stringify(await buildFixtures(signal)));
+  else {
+    if (!values.v1 || !values.v2) throw new Error('build-clients requires --v1 and --v2 immutable generated SDK directories.');
+    console.log(JSON.stringify(await buildClients(values.v1, values.v2, signal)));
+  }
 }
