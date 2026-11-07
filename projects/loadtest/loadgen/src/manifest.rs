@@ -4,7 +4,6 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use arrowcol_protocol::ReceiptId;
 use serde::{Deserialize, Serialize};
 use tokio::{
     fs::{self, File},
@@ -15,7 +14,6 @@ use tokio::{
 use crate::cli::{RunArgs, Scenario};
 
 pub const SEND_MANIFEST_FILE: &str = "sent-batches.jsonl";
-pub const RECEIPT_MANIFEST_FILE: &str = "receipts.jsonl";
 pub const RUN_METADATA_FILE: &str = "run-metadata.json";
 pub const SCHEMA_CONTRACT_FILE: &str = "schema-contracts.json";
 pub const ROUTING_EVIDENCE_FILE: &str = "routing.json";
@@ -26,7 +24,6 @@ pub const VALIDATION_FILE: &str = "validation.json";
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AckOutcome {
-    DurableReceipt,
     BestEffortAdmission,
     /// Dataflow persisted the batch to its Quiver durable buffer before completing.
     DurableAdmission,
@@ -56,33 +53,9 @@ pub struct SendManifestEntry {
     pub acknowledged_at_unix_ms: u64,
     pub outcome: AckOutcome,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub receipt_id: Option<ReceiptId>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-}
-
-/// Terminal receipt evidence emitted by the background direct poller.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ReceiptManifestEntry {
-    pub run_id: String,
-    pub logical_batch_id: String,
-    pub table: String,
-    pub receipt_id: ReceiptId,
-    pub state: String,
-    pub purge_allowed: bool,
-    pub terminal_at_unix_ms: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub delta_version: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rows_published: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bytes_published: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error_code: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error_message: Option<String>,
 }
 
 /// Ordered generated-schema contract retained with the run.
@@ -108,7 +81,6 @@ pub struct SchemaFieldContract {
 pub struct ManifestWriter {
     root: Arc<PathBuf>,
     sends: Arc<Mutex<BufWriter<File>>>,
-    receipts: Arc<Mutex<BufWriter<File>>>,
 }
 
 impl ManifestWriter {
@@ -121,11 +93,9 @@ impl ManifestWriter {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root).await?;
         let sends = BufWriter::new(File::create(root.join(SEND_MANIFEST_FILE)).await?);
-        let receipts = BufWriter::new(File::create(root.join(RECEIPT_MANIFEST_FILE)).await?);
         Ok(Self {
             root: Arc::new(root),
             sends: Arc::new(Mutex::new(sends)),
-            receipts: Arc::new(Mutex::new(receipts)),
         })
     }
 
@@ -141,15 +111,6 @@ impl ManifestWriter {
     /// Returns JSON serialization or file-write failures.
     pub async fn write_send(&self, entry: &SendManifestEntry) -> Result<()> {
         write_json_line(&self.sends, entry).await
-    }
-
-    /// Appends one terminal receipt observation.
-    ///
-    /// # Errors
-    ///
-    /// Returns JSON serialization or file-write failures.
-    pub async fn write_receipt(&self, entry: &ReceiptManifestEntry) -> Result<()> {
-        write_json_line(&self.receipts, entry).await
     }
 
     /// Atomically replaces one small JSON result artifact.
@@ -176,7 +137,6 @@ impl ManifestWriter {
     /// Returns file flush failures.
     pub async fn flush(&self) -> Result<()> {
         self.sends.lock().await.flush().await?;
-        self.receipts.lock().await.flush().await?;
         Ok(())
     }
 }
@@ -214,16 +174,10 @@ pub fn run_metadata(run_id: &str, arguments: &RunArgs, schema_contract_sha256: &
             "retry_window_seconds": arguments.retry_window.map(|window| window.get().as_secs()),
             "quiver": arguments.quiver,
             "scheduler": "single global atomic ordinal; seed-rotated equal round-robin across all 13 tables",
-            "paired_semantics": "one encoded logical RecordBatch is reused concurrently for direct and dataflow",
-            "direct_delivery": if arguments.quiver {
-                "server-generated receipt; batch persisted to Quiver before acknowledgement; receipt polled to a terminal state"
-            } else {
-                "server-generated receipt polled to a terminal state"
-            },
             "dataflow_delivery": if arguments.quiver {
-                "durable admission: Quiver WAL fsync before completion; replayed after a crash (at least once); no receipt"
+                "durable admission: Quiver WAL fsync before completion; replayed after a crash (at least once)"
             } else {
-                "best-effort admission; no durable receipt claim"
+                "best-effort admission; no durability claim"
             }
         }
     })
@@ -282,9 +236,9 @@ mod tests {
         writer
             .write_send(&SendManifestEntry {
                 run_id: "run".to_owned(),
-                scenario: Scenario::Paired,
+                scenario: Scenario::Dataflow,
                 phase: "measure".to_owned(),
-                logical_batch_id: "run:paired:measure:0".to_owned(),
+                logical_batch_id: "run:dataflow:measure:0".to_owned(),
                 ordinal: 0,
                 table_batch_ordinal: 0,
                 table: "telemetry.sqlserver.sqlserver_wait_stats".to_owned(),
@@ -301,7 +255,6 @@ mod tests {
                 sent_at_unix_ms: 1,
                 acknowledged_at_unix_ms: 2,
                 outcome: AckOutcome::BestEffortAdmission,
-                receipt_id: None,
                 error_code: None,
                 error: None,
             })
@@ -309,7 +262,7 @@ mod tests {
         writer.flush().await?;
         let text = fs::read_to_string(root.join(SEND_MANIFEST_FILE)).await?;
         let decoded: SendManifestEntry = serde_json::from_str(text.trim_end())?;
-        assert_eq!(decoded.logical_batch_id, "run:paired:measure:0");
+        assert_eq!(decoded.logical_batch_id, "run:dataflow:measure:0");
         assert_eq!(decoded.outcome, AckOutcome::BestEffortAdmission);
         std::fs::remove_dir_all(root)?;
         Ok(())
