@@ -1,7 +1,7 @@
 use arrow_array::RecordBatch;
 use arrowcol_catalog::SchemaVersion;
 use arrowcol_protocol::{
-    CollectorInstanceId, FencingToken, LeaseId, ReceiptId, SchemaFingerprint as ProtocolFingerprint, TableIdentity,
+    CollectorInstanceId, FencingToken, LeaseId, PublicationId, SchemaFingerprint as ProtocolFingerprint, TableIdentity,
     UnixMillis, fingerprint_schema,
 };
 use base64::Engine as _;
@@ -32,7 +32,7 @@ const MAX_INSTANCE_KEY_BYTES: usize = 200;
 pub struct ArrowcolBatchEnvelope {
     /// Stable server-generated publication identity; absent on legacy durable pdata.
     #[serde(default)]
-    pub publication_id: Option<ReceiptId>,
+    pub publication_id: Option<PublicationId>,
     /// Original admission UTC milliseconds, preserved in durable pdata.
     #[serde(default)]
     pub ingested_at_ms: Option<UnixMillis>,
@@ -237,7 +237,7 @@ mod tests {
 
     fn envelope() -> ArrowcolBatchEnvelope {
         ArrowcolBatchEnvelope {
-            publication_id: Some(ReceiptId::new()),
+            publication_id: Some(PublicationId::new()),
             ingested_at_ms: Some(UnixMillis::new(1_700_000_012_345).expect("stamp")),
             table: TableIdentity::new(
                 CatalogName::new("demo").expect("catalog"),
