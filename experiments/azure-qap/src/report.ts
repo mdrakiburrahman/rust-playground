@@ -111,15 +111,15 @@ export function queryFile(out: string, trial: TrialResult, raw = false): string 
 }
 
 /** How to re-run the StorageBlobLogs queries once late logs have arrived. */
-export function lateLogHelp(report: RunReport, out: string): string {
+export function lateLogHelp(report: RunReport, out: string, workingDirectory = process.cwd()): string {
   const trials = report.trials.filter(trial => trial.readsQuery);
   if (!trials.length) return '';
   const workspace = report.location.workspaceCustomerId ?? '<workspace customer id>';
   return [
     `StorageBlobLogs often land 2-10 minutes late. Re-check any trial later (workspace ${report.location.workspace}):`,
     ...trials.map(trial => `  az monitor log-analytics query -w ${workspace} --analytics-query @${
-      path.relative(process.cwd(), queryFile(out, trial))} -o table`),
-    `Or paste a query file from ${path.relative(process.cwd(), path.join(out, 'queries'))}/ into the workspace's Logs blade.`,
+      path.relative(workingDirectory, queryFile(out, trial))} -o table`),
+    `Or paste a query file from ${path.relative(workingDirectory, path.join(out, 'queries'))}/ into the workspace's Logs blade.`,
     'Only rows with the shared principal and a Kusto/ADX UserAgentHeader are counted; after-mutation GetBlob/ReadFile events on untouched files are QAP re-reads;',
     'the *.raw.kql files list individual requests.',
   ].join('\n');
@@ -129,7 +129,9 @@ function finding(trial: TrialResult): string | undefined {
   if (!trial.reads || !trial.files) return trial.error ? `- **${trial.trial}**: ${trial.status}: ${trial.error}` : undefined;
   const reread = trial.reads.unchanged;
   const verdict = trial.operation === 'reload' ? 'positive control'
-    : reread.files ? 'QAP re-read files the mutation did not change' : 'no unchanged file was re-read';
+    : reread.files ? 'QAP re-read files the mutation did not change'
+      : trial.telemetry === 'complete' ? 'no unchanged file was re-read'
+        : 'read telemetry is incomplete; absence of re-reads is not established';
   return `- **${trial.trial}** (${trial.telemetry === 'complete' ? 'logs complete' : 'logs still arriving'}): ` +
     `${reread.files}/${trial.files.unchanged} unchanged files (${mib(reread.bytes)} MiB) re-read after ${trial.operation}; ` +
     `${verdict}. Extents kept ${trial.extents?.keptRows ?? '?'}/${trial.extents?.untouchedRows ?? '?'} rows; ` +
@@ -172,8 +174,9 @@ export function renderMarkdown(report: RunReport, out: string): string {
     ...report.cleanup.errors.map(error => `- ${error}`),
     '',
   ];
-  const help = lateLogHelp(report, out);
-  if (help) lines.push('## Late logs', '', '```text', help, '```', '');
+  const help = lateLogHelp(report, out, out);
+  if (help) lines.push('## Late logs', '', 'Run these commands from the directory containing `report.md`.',
+    '', '```text', help, '```', '');
   return lines.join('\n');
 }
 

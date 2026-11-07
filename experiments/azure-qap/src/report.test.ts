@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { MIB } from './profile.js';
-import { Evidence, exitCode, positiveControl, resultsTable, writeReport, type RunReport } from './report.js';
+import { Evidence, exitCode, lateLogHelp, positiveControl, renderMarkdown, resultsTable, writeReport, type RunReport } from './report.js';
 import type { TrialResult } from './scenario.js';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -92,6 +92,18 @@ test('writeReport and Evidence write redacted JSON, Markdown and query files', a
     assert.match(markdown, /\*\*Positive control:\*\* detected/);
     assert.match(markdown, /## Cleanup: done/);
     assert.match(markdown, /az monitor log-analytics query -w 00000000-0000-0000-0000-000000000002/);
+    assert.match(markdown, /from the directory containing `report.md`/);
+    assert.match(markdown, /--analytics-query @queries\/reload.kql/);
+    assert.equal(renderMarkdown(report, '/artifacts'), renderMarkdown(report, out),
+      'copied reports must not retain pod-specific query paths');
+    assert.ok(lateLogHelp(report, out).includes(path.relative(process.cwd(), path.join(out, 'queries', 'reload.kql'))),
+      'terminal help still resolves queries from the invoking directory');
+    const pending = trial({ trial: 'optimize', operation: 'optimize', reread: 0, status: 'late-logs-pending', telemetry: 'pending' });
+    const pendingMarkdown = renderMarkdown({ ...report, trials: [pending] }, out);
+    assert.match(pendingMarkdown, /absence of re-reads is not established/);
+    assert.doesNotMatch(pendingMarkdown, /no unchanged file was re-read/);
+    assert.match(renderMarkdown({ ...report, trials: [{ ...pending, status: 'complete', telemetry: 'complete' }] }, out),
+      /no unchanged file was re-read/);
     assert.equal(fs.readFileSync(path.join(out, 'queries', 'reload.kql'), 'utf8'), 'StorageBlobLogs | take 1\n');
     assert.equal(fs.readFileSync(path.join(out, 'queries', 'reload.raw.kql'), 'utf8'), 'StorageBlobLogs | take 2\n');
   } finally {

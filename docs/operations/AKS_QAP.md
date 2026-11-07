@@ -105,6 +105,9 @@ Bootstrap readiness does not imply telemetry readiness. A cold-stamp run can
 recover QAP and pass row parity while correctly failing the RELOAD positive
 control because no read logs arrived. Preserve that failed result and its query
 files; qualify routing before a new run instead of weakening evidence checks.
+Copied reports use query paths relative to the directory containing `report.md`,
+so their late-log commands remain usable after retrieval from a pod. A pending
+zero-read count is not evidence that unchanged files were not re-read.
 
 `StorageBlobLogs` attribution must be scoped to the run's
 `experimentqap/runs/<runId>/` prefix, the shared principal, and a Kusto/ADX
