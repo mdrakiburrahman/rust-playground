@@ -1281,6 +1281,76 @@ mod tests {
         next
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exporter_refreshes_catalog_sizing_and_retries_rejected_publication() -> anyhow::Result<()> {
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("exporter-policy-{}", arrowcol_protocol::ReceiptId::new()));
+        std::fs::create_dir_all(&root)?;
+        let fixture = Fixture(std::fs::canonicalize(root)?);
+        let store = Arc::new(MemoryRoutingStore::default());
+        let holder = CollectorInstanceId::new();
+        let lease = lease(&store, holder).await;
+        let exporter = fast_exporter(&fixture.0, &store, &Arc::new(RuntimeMetrics::new(holder)));
+        let first = exporter.stage(envelope_pdata(envelope_for(&lease))).await?;
+        first.wait().await?;
+        let path = fixture.0.join("demo/generated/events");
+        let alter = |target: Option<&str>| -> anyhow::Result<()> {
+            let url = format!("file://{}/", path.display()).parse()?;
+            let catalog = arrow_deltalake::delta::DeltaTable::open_catalog(url)?;
+            let snapshot = catalog.catalog_snapshot()?.expect("catalog table");
+            let mut props = snapshot.properties;
+            props.insert("catalog.schemaHistory".into(), "[]".into());
+            if let Some(target) = target {
+                props.insert("arrowcol.writer.targetFileSize".into(), target.into());
+            } else {
+                props.remove("arrowcol.writer.targetFileSize");
+            }
+            catalog.commit_catalog(
+                Some(snapshot.version),
+                snapshot.schema,
+                snapshot.partition_columns,
+                props,
+                snapshot.comment,
+            )?;
+            Ok(())
+        };
+        tokio::task::block_in_place(|| alter(Some("64")))?;
+        let retry = envelope_for(&lease);
+        let publication = exporter.stage(envelope_pdata(retry.clone())).await?;
+        let error = publication.wait().await.expect_err("unsupported sizing must reject");
+        assert!(
+            matches!(error, ExportFailure::Transient(ref message) if message.contains("table-specific adaptive file sizing is unsupported"))
+        );
+        let log = path.join("_delta_log");
+        let additions = || -> anyhow::Result<usize> {
+            let mut count = 0;
+            for entry in std::fs::read_dir(&log)? {
+                let path = entry?.path();
+                if path.extension().is_some_and(|ext| ext == "json") {
+                    for line in std::fs::read_to_string(path)?.lines() {
+                        if serde_json::from_str::<serde_json::Value>(line)?.get("add").is_some() {
+                            count += 1;
+                        }
+                    }
+                }
+            }
+            Ok(count)
+        };
+        assert_eq!(additions()?, 1);
+        tokio::task::block_in_place(|| alter(None))?;
+        let publication = exporter.stage(envelope_pdata(retry)).await?;
+        publication.wait().await?;
+        assert_eq!(additions()?, 2);
+        Ok(())
+    }
+
     fn delta_version_exists(directory: &std::path::Path, version: u64) -> bool {
         directory
             .join(format!("demo/generated/events/_delta_log/{version:020}.json"))

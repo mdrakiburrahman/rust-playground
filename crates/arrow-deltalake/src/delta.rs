@@ -720,27 +720,47 @@ mod io_tests {
             Field::new("id", DataType::Int32, false),
             Field::new(INGESTION_PARTITION, DataType::Utf8, false),
         ]));
-        let url = Url::from_directory_path(&fixture.0).map_err(|()| anyhow::anyhow!("bad fixture URL"))?;
-        let table = DeltaTable::open_url(url, schema, vec![INGESTION_PARTITION.into()])?;
-        let log = fixture.0.join("_delta_log");
-        let initial = fs::read_to_string(log.join("00000000000000000000.json"))?;
-        let mut metadata: serde_json::Value = initial
-            .lines()
-            .map(serde_json::from_str::<serde_json::Value>)
-            .collect::<std::result::Result<Vec<_>, _>>()?
-            .into_iter()
-            .find(|value| value.get("metaData").is_some())
-            .context("metadata action missing")?;
-        metadata["metaData"]["configuration"] = serde_json::json!({
-            "arrowcol.layout.enabled": "true", "arrowcol.layout.sortColumns": "id",
-            "arrowcol.layout.bloomColumns": "id", "arrowcol.layout.rowGroupRows": "2",
-            "arrowcol.layout.pageRows": "1", "arrowcol.layout.maxRows": "3",
-            "arrowcol.partition.granularity": "day", "delta.targetFileSize": "80",
-            "arrowcol.writer.minInputSize": "10", "arrowcol.writer.maxInputSize": "500",
-            "arrowcol.writer.coldStartParquetRatio": "0.5", "arrowcol.writer.ewmaWeight": "0.4",
-            "arrowcol.writer.minParquetRatio": "0.1", "arrowcol.writer.maxParquetRatio": "2"
-        });
-        fs::write(log.join("00000000000000000001.json"), format!("{}\n", metadata))?;
+        let url =
+            Url::from_directory_path(fs::canonicalize(&fixture.0)?).map_err(|()| anyhow::anyhow!("bad fixture URL"))?;
+        let catalog = DeltaTable::open_catalog(url)?;
+        let mut properties: BTreeMap<String, String> = [
+            ("catalog.schemaHistory", "[]"),
+            ("arrowcol.layout.enabled", "true"),
+            ("arrowcol.layout.sortColumns", "id"),
+            ("arrowcol.layout.bloomColumns", "id"),
+            ("arrowcol.layout.rowGroupRows", "2"),
+            ("arrowcol.layout.pageRows", "1"),
+            ("arrowcol.layout.maxRows", "3"),
+            ("arrowcol.partition.granularity", "day"),
+            ("delta.targetFileSize", "80"),
+            ("arrowcol.writer.minInputSize", "10"),
+            ("arrowcol.writer.maxInputSize", "500"),
+            ("arrowcol.writer.coldStartParquetRatio", "0.5"),
+            ("arrowcol.writer.ewmaWeight", "0.4"),
+            ("arrowcol.writer.minParquetRatio", "0.1"),
+            ("arrowcol.writer.maxParquetRatio", "2"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect();
+        let target = properties.remove("delta.targetFileSize").context("missing target")?;
+        let created = catalog.commit_catalog(
+            None,
+            Arc::clone(&schema),
+            vec![INGESTION_PARTITION.into()],
+            properties.clone(),
+            None,
+        )?;
+        let table = DeltaTable::open(&fixture.0)?;
+        assert_eq!(table.version()?, created.version);
+        properties.insert("delta.targetFileSize".into(), target);
+        let initial = catalog.commit_catalog(
+            Some(created.version),
+            Arc::clone(&schema),
+            vec![INGESTION_PARTITION.into()],
+            properties.clone(),
+            None,
+        )?;
         let empty = table.new_file_with_publication(input.schema(), "empty".into(), 0, 3_600_000)?;
         let empty_path = empty.parquet.path.clone();
         assert!(empty_path.exists());
@@ -774,25 +794,35 @@ mod io_tests {
                 .all(|group| group.column(0).bloom_filter_offset().is_some())
         );
         let rows = reader.build()?.collect::<std::result::Result<Vec<_>, _>>()?;
-        let values = rows
-            .iter()
-            .flat_map(|batch| {
+        let mut values = Vec::new();
+        for batch in &rows {
+            values.extend(
                 batch
                     .column(0)
                     .as_any()
                     .downcast_ref::<arrow::array::Int32Array>()
-                    .unwrap()
+                    .context("expected integer id column")?
                     .values()
                     .iter()
-                    .copied()
-            })
-            .collect::<Vec<_>>();
+                    .copied(),
+            );
+        }
         assert_eq!(values, [1, 2, 3]);
-        drop(staged);
-        metadata["metaData"]["configuration"]["arrowcol.partition.granularity"] = "minute".into();
-        metadata["metaData"]["configuration"]["arrowcol.layout.enabled"] = "false".into();
-        metadata["metaData"]["configuration"]["arrowcol.writer.targetFileSize"] = "64".into();
-        fs::write(log.join("00000000000000000002.json"), format!("{}\n", metadata))?;
+        properties.insert("arrowcol.partition.granularity".into(), "minute".into());
+        properties.insert("arrowcol.layout.enabled".into(), "false".into());
+        properties.insert("arrowcol.writer.targetFileSize".into(), "64".into());
+        properties.insert("catalog.schemaHistory".into(), "[1]".into());
+        let updated = catalog.commit_catalog(
+            Some(initial.version),
+            Arc::clone(&schema),
+            vec![INGESTION_PARTITION.into()],
+            properties.clone(),
+            None,
+        )?;
+        assert_eq!(updated.properties["catalog.schemaHistory"], "[1]");
+        assert_eq!(table.commit_files(std::slice::from_ref(&staged))?, updated.version + 1);
+        assert_eq!(table.commit_files(std::slice::from_ref(&staged))?, updated.version + 1);
+        assert!(staged.file.path.to_string_lossy().contains("1970-01-01"));
         let writer = table.new_file_with_publication(input.schema(), "second".into(), 0, 3_600_000)?;
         assert_eq!(
             writer.partition_values[INGESTION_PARTITION].as_deref(),
@@ -801,8 +831,14 @@ mod io_tests {
         assert!(writer.sorter.is_none());
         assert_eq!(writer.adaptive_file_config(&defaults)?.target_parquet_bytes, 64);
         drop(writer);
-        metadata["metaData"]["configuration"]["arrowcol.layout.rowGroupRows"] = "0".into();
-        fs::write(log.join("00000000000000000003.json"), format!("{}\n", metadata))?;
+        properties.insert("arrowcol.layout.rowGroupRows".into(), "0".into());
+        catalog.commit_catalog(
+            Some(updated.version + 1),
+            schema,
+            vec![INGESTION_PARTITION.into()],
+            properties,
+            None,
+        )?;
         assert!(
             table
                 .new_file_with_publication(input.schema(), "third".into(), 0, 0)
