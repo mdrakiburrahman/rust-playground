@@ -57,7 +57,12 @@ fn selected_tables(snapshot: rpc::CatalogSnapshot, allowlist: &[String]) -> Resu
         let name = format!("{}.{}.{}", identity.catalog, identity.database, identity.table);
         let discovered = DiscoveredTable {
             name: name.clone(),
-            url: Url::parse(&table.location).context("catalog table location is not a URL")?,
+            url: if std::path::Path::new(&table.location).is_absolute() {
+                Url::from_directory_path(&table.location)
+                    .map_err(|()| anyhow::anyhow!("catalog table location is not an absolute directory"))?
+            } else {
+                Url::parse(&table.location).context("catalog table location is not a URL or absolute path")?
+            },
             properties: table.properties.into_iter().collect(),
             log_token: None,
         };

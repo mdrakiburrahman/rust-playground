@@ -40,30 +40,7 @@ fn fixture() -> Result<(tempfile::TempDir, Settings, CatalogTable)> {
         Field::new(INGESTION_PARTITION, DataType::Utf8, false),
     ]));
     let table = DeltaTable::open_url(url.clone(), Arc::clone(&schema), vec![INGESTION_PARTITION.into()])?;
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    for minute in 0..2 {
-        for id in 0..2 {
-            let stamp = format!("2024-01-01-00-{minute:02}");
-            let batch = RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(Int64Array::from(vec![id])),
-                    Arc::new(StringArray::from(vec![stamp.as_str()])),
-                ],
-            )?;
-            runtime.block_on(async {
-                let mut file = table
-                    .new_file_partitioned(
-                        Arc::clone(&schema),
-                        BTreeMap::from([(INGESTION_PARTITION.into(), Some(stamp.clone()))]),
-                    )?
-                    .with_ingestion_time(BASE + minute * 60_000)?;
-                file.write(&batch).await?;
-                file.finish().await?;
-                Ok::<_, anyhow::Error>(())
-            })?;
-        }
-    }
+    write_pairs(&table, schema)?;
     let settings = Settings {
         root: Url::from_directory_path(root.path()).map_err(|()| anyhow!("root URL"))?,
         tables: vec!["events".into()],
@@ -100,10 +77,52 @@ fn fixture() -> Result<(tempfile::TempDir, Settings, CatalogTable)> {
             ("delta.checkpointInterval".into(), "100".into()),
         ]),
     });
+    persist_policy(&source)?;
     Ok((root, settings, source))
 }
 
 type FileInventory = BTreeMap<PathBuf, (Vec<u8>, SystemTime)>;
+
+fn persist_policy(source: &CatalogTable) -> Result<()> {
+    let table = DeltaTable::open_catalog(source.0.url.clone())?;
+    let current = table.catalog_snapshot()?.ok_or_else(|| anyhow!("table metadata"))?;
+    table.commit_catalog(
+        Some(current.version),
+        current.schema,
+        current.partition_columns,
+        source.0.properties.clone(),
+        current.comment,
+    )?;
+    Ok(())
+}
+
+fn write_pairs(table: &Arc<DeltaTable>, schema: Arc<Schema>) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    for minute in 0..2 {
+        for id in 0..2 {
+            let stamp = format!("2024-01-01-00-{minute:02}");
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(vec![id])),
+                    Arc::new(StringArray::from(vec![stamp.as_str()])),
+                ],
+            )?;
+            runtime.block_on(async {
+                let mut file = table
+                    .new_file_partitioned(
+                        Arc::clone(&schema),
+                        BTreeMap::from([(INGESTION_PARTITION.into(), Some(stamp.clone()))]),
+                    )?
+                    .with_ingestion_time(BASE + minute * 60_000)?;
+                file.write(&batch).await?;
+                file.finish().await?;
+                Ok::<_, anyhow::Error>(())
+            })?;
+        }
+    }
+    Ok(())
+}
 
 fn inventory(root: &Path) -> Result<FileInventory> {
     fn walk(root: &Path, path: &Path, result: &mut FileInventory) -> Result<()> {
@@ -153,6 +172,7 @@ fn table_policy_overrides_process_minimum_and_only_compacts_sealed_pair() -> Res
         .0
         .properties
         .insert("arrowcol.optimize.minFiles".into(), "2".into());
+    persist_policy(&source)?;
     let results = run_cycle_with_discovery(&settings, &source, &Metrics::new(), &Arc::new(AtomicBool::new(false)))?;
     assert_eq!(results.len(), 1);
     assert!(results[0].error.is_none(), "{:?}", results[0].error);
@@ -174,11 +194,18 @@ fn invalid_catalog_properties_and_inventory_errors_fail_without_mutation() -> Re
         ("arrowcol.vacuum.maxListedFiles", "1"),
     ] {
         source.0.properties.insert(key.into(), value.into());
+        let before = if key == "arrowcol.vacuum.maxListedFiles" {
+            persist_policy(&source)?;
+            inventory(root.path())?
+        } else {
+            before.clone()
+        };
         let results = run_cycle_with_discovery(&settings, &source, &Metrics::new(), &Arc::new(AtomicBool::new(false)))?;
         assert!(results.iter().all(|r| r.error.is_some() && !r.negative_probe), "{key}");
         assert_eq!(before, inventory(root.path())?);
         source.0.properties.remove(key);
     }
+    persist_policy(&source)?;
     let hint = root.path().join("events/_delta_log/_last_checkpoint");
     for content in ["not-json", "{\"version\":99999}"] {
         std::fs::write(&hint, content)?;
@@ -187,6 +214,16 @@ fn invalid_catalog_properties_and_inventory_errors_fail_without_mutation() -> Re
         assert!(results.iter().all(|r| r.error.is_some() && !r.negative_probe));
         assert_eq!(malformed, inventory(root.path())?);
     }
+    std::fs::remove_file(hint)?;
+    std::fs::remove_file(root.path().join("events/_delta_log/00000000000000000001.json"))?;
+    let gap = inventory(root.path())?;
+    let results = run_cycle_with_discovery(&settings, &source, &Metrics::new(), &Arc::new(AtomicBool::new(false)))?;
+    assert!(
+        results
+            .iter()
+            .all(|r| !r.negative_probe && r.error.as_ref().is_some_and(|error| error.contains("log gap")))
+    );
+    assert_eq!(gap, inventory(root.path())?);
     Ok(())
 }
 
@@ -271,6 +308,126 @@ fn prepared_optimize_rejects_concurrent_schema_change_before_any_rewrite() -> Re
     assert_eq!(
         arrow_deltalake::maintenance::error_kind(&error),
         Some(arrow_deltalake::maintenance::MaintenanceErrorKind::MetadataChanged)
+    );
+    assert_eq!(before, inventory(root.path())?);
+    Ok(())
+}
+
+#[test]
+fn real_catalog_ddl_discovery_refreshes_policy_without_idle_writes() -> Result<()> {
+    use arrow_flight::{flight_service_server::FlightServiceServer, sql::client::FlightSqlServiceClient};
+    use arrowcol_catalog_client::rpc::schema_catalog_server::SchemaCatalogServer;
+    use arrowcol_catalog_rust::{CatalogConfig, CatalogService};
+    use delta_maintenance::catalog::CatalogDiscovery;
+
+    let (root, settings, _) = fixture()?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    let service = runtime.block_on(CatalogService::open(CatalogConfig {
+        warehouse_root: root.path().join("warehouse").to_string_lossy().into_owned(),
+        state_dir: root.path().join("catalog"),
+        ddl_dir: None,
+        retained_events: 16,
+    }))?;
+    let listener = runtime.block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))?;
+    let endpoint = format!("http://{}", listener.local_addr()?);
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    let server = runtime.spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(FlightServiceServer::new(service.clone()))
+            .add_service(SchemaCatalogServer::new(service))
+            .serve_with_incoming_shutdown(tokio_stream::wrappers::TcpListenerStream::new(listener), async {
+                let _ = stopped.await;
+            })
+            .await
+    });
+    let channel = runtime.block_on(tonic::transport::Endpoint::from_shared(endpoint.clone())?.connect())?;
+    let mut sql = FlightSqlServiceClient::new(channel);
+    runtime.block_on(sql.execute_update(
+        "CREATE TABLE arrowcol.default.events (id BIGINT NOT NULL, __arrowcol_ingestion STRING NOT NULL) USING DELTA PARTITIONED BY (__arrowcol_ingestion) TBLPROPERTIES ('arrowcol.optimize.minFiles'='3', 'arrowcol.partition.granularity'='minute', 'delta.checkpointInterval'='100')".into(),
+        None,
+    ))?;
+    let source = CatalogDiscovery::connect(&endpoint, Vec::new())?;
+    let names = source.tables()?;
+    assert_eq!(names, ["arrowcol.default.events"]);
+    let discovered = source.table(&names[0])?;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(INGESTION_PARTITION, DataType::Utf8, false),
+    ]));
+    let table = DeltaTable::open_url(
+        discovered.url.clone(),
+        Arc::clone(&schema),
+        vec![INGESTION_PARTITION.into()],
+    )?;
+    write_pairs(&table, schema)?;
+    let before = inventory(root.path())?;
+    let metrics = Metrics::new();
+    let cancel = Arc::new(AtomicBool::new(false));
+    for _ in 0..2 {
+        let results = run_cycle_with_discovery(&settings, &source, &metrics, &cancel)?;
+        assert!(results.iter().all(|r| r.error.is_none()), "{results:?}");
+        assert_eq!(results.len(), 4);
+        assert!(
+            results.iter().all(|r| r.error.is_none() && r.negative_probe),
+            "{results:?}"
+        );
+        assert_eq!(before, inventory(root.path())?);
+    }
+    runtime.block_on(sql.execute_update(
+        "ALTER TABLE arrowcol.default.events SET TBLPROPERTIES ('arrowcol.optimize.minFiles'='2')".into(),
+        None,
+    ))?;
+    let stale = CatalogTable(source.table(&names[0])?);
+    let after_ddl = inventory(root.path())?;
+    let rejected = run_cycle_with_discovery(&settings, &stale, &metrics, &cancel)?;
+    assert!(rejected.iter().all(|r| r.error.is_some() && !r.negative_probe));
+    assert_eq!(after_ddl, inventory(root.path())?);
+    let results = run_cycle_with_discovery(&settings, &source, &metrics, &cancel)?;
+    let optimize = results
+        .iter()
+        .find(|r| r.operation == Operation::Optimize)
+        .ok_or_else(|| anyhow!("optimize result"))?;
+    assert!(optimize.error.is_none(), "{:?}", optimize.error);
+    assert_eq!(optimize.report.as_ref().map(|r| r.files_removed), Some(2));
+    assert_eq!(source.table(&names[0])?.properties["arrowcol.optimize.minFiles"], "2");
+    let path = discovered
+        .url
+        .to_file_path()
+        .map_err(|()| anyhow!("managed table path"))?;
+    assert_eq!(
+        std::fs::read_dir(path.join("__arrowcol_ingestion=2024-01-01-00-01"))?.count(),
+        2
+    );
+    drop(source);
+    drop(sql);
+    shutdown
+        .send(())
+        .map_err(|()| anyhow!("catalog server stopped early"))?;
+    runtime.block_on(server)??;
+    Ok(())
+}
+
+#[test]
+fn empty_vacuum_plan_cannot_report_noop_after_a_concurrent_append() -> Result<()> {
+    let (root, _, source) = fixture()?;
+    let table = DeltaTable::open_for_maintenance(&source.0.url)?;
+    let config = arrow_deltalake::maintenance::VacuumConfig::new(604_800_000, now_ms()?);
+    let plan = table.plan_vacuum(&config)?;
+    assert!(plan.candidates.is_empty());
+    let metadata = table.catalog_snapshot()?.ok_or_else(|| anyhow!("table metadata"))?;
+    let writer = DeltaTable::open_url(source.0.url, Arc::clone(&metadata.schema), metadata.partition_columns)?;
+    write_pairs(&writer, metadata.schema)?;
+    let before = inventory(root.path())?;
+    let error = match table.apply_vacuum(&plan, &config, &MaintenanceControl::default()) {
+        Err(error) => error,
+        Ok(_) => return Err(anyhow!("stale empty VACUUM plan was accepted")),
+    };
+    assert_eq!(
+        arrow_deltalake::maintenance::error_kind(&error),
+        Some(arrow_deltalake::maintenance::MaintenanceErrorKind::StalePlan)
     );
     assert_eq!(before, inventory(root.path())?);
     Ok(())

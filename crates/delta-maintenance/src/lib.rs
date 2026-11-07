@@ -468,12 +468,33 @@ fn effective_settings(settings: &Settings, properties: &BTreeMap<String, String>
     Ok((effective, props))
 }
 
+fn policy_matches(settings: &Settings, actual: &BTreeMap<String, String>, expected: &ResolvedProps) -> Result<bool> {
+    let (_, actual) = effective_settings(settings, actual)?;
+    Ok(arrowcol_props::REGISTRY
+        .iter()
+        .all(|key| actual.get(key.name) == expected.get(key.name)))
+}
+
+type ScheduledTables = BTreeMap<String, (Instant, Vec<arrowcol_props::PropValue>)>;
+
+fn policy_values(props: &ResolvedProps) -> Result<Vec<arrowcol_props::PropValue>> {
+    arrowcol_props::REGISTRY
+        .iter()
+        .map(|key| {
+            props
+                .get(key.name)
+                .cloned()
+                .with_context(|| format!("resolved property missing: {}", key.name))
+        })
+        .collect()
+}
+
 fn table_gate(name: &str) -> &'static Mutex<()> {
     use std::hash::{Hash, Hasher};
     static GATES: OnceLock<[Mutex<()>; MAX_TABLES]> = OnceLock::new();
     let gates = GATES.get_or_init(|| std::array::from_fn(|_| Mutex::new(())));
     let mut hash = std::collections::hash_map::DefaultHasher::new();
-    name.hash(&mut hash);
+    name.trim_end_matches('/').hash(&mut hash);
     &gates[(hash.finish() % MAX_TABLES as u64) as usize]
 }
 
@@ -873,11 +894,11 @@ fn maintain_table(
     name: &str,
     cancel: &Arc<AtomicBool>,
     emit: &dyn Fn(&OperationResult),
-    schedule: Option<&Mutex<BTreeMap<String, Instant>>>,
+    schedule: Option<&Mutex<ScheduledTables>>,
 ) -> Vec<OperationResult> {
     let mut results = Vec::new();
     let setup = (|| -> Result<_> {
-        let discovered = discovery.table(name)?;
+        let mut discovered = discovery.table(name)?;
         let gate = table_gate(discovered.url.as_str())
             .lock()
             .map_err(|_| anyhow::anyhow!("per-table maintenance gate poisoned"))?;
@@ -887,23 +908,27 @@ fn maintain_table(
                 .lock()
                 .map_err(|_| anyhow::anyhow!("maintenance schedule poisoned"))?;
             let now = Instant::now();
-            if schedule.get(name).is_some_and(|due| *due > now) {
+            let delay = Duration::from_millis(props.unsigned("arrowcol.maintenance.interval")?);
+            let policy = policy_values(&props)?;
+            if let Some((last_run, previous)) = schedule.get(name)
+                && *previous == policy
+                && now
+                    .checked_duration_since(*last_run)
+                    .context("maintenance clock moved backwards")?
+                    < delay
+            {
                 return Ok(None);
             }
-            let delay = Duration::from_millis(props.unsigned("arrowcol.maintenance.interval")?);
-            schedule.insert(
-                name.into(),
-                now.checked_add(delay)
-                    .context("maintenance interval exceeds clock range")?,
-            );
+            schedule.insert(name.into(), (now, policy));
         }
         let probe = DeltaTable::open_for_maintenance_probe(&discovered.url)?;
-        if let Some(token) = &discovered.log_token
-            && probe.probe_log_token(100_000)? != *token
-            && probe.maintenance_properties()? != discovered.properties
+        let token = probe.probe_log_token(100_000)?;
+        if discovered.log_token.as_ref().is_none_or(|previous| *previous != token)
+            && !policy_matches(settings, &probe.maintenance_properties()?, &props)?
         {
             bail!("table properties changed after discovery; retry");
         }
+        discovered.log_token = Some(token);
         Ok(Some((discovered, effective, props, probe, gate)))
     })();
     if matches!(&setup, Ok(None)) {
@@ -937,7 +962,7 @@ fn maintain_table(
             Ok(Some((discovered, effective, props, probe, _))) => (|| {
                 let token = probe.probe_log_token(100_000)?;
                 if observed_token.as_ref().is_some_and(|previous| *previous != token)
-                    && probe.maintenance_properties()? != discovered.properties
+                    && !policy_matches(settings, &probe.maintenance_properties()?, props)?
                 {
                     bail!("table properties changed during the maintenance pass; retry discovery");
                 }
@@ -1022,6 +1047,16 @@ fn maintain_table(
             break;
         }
     }
+    if results.iter().any(|result| result.error.is_some())
+        && let Some(schedule) = schedule
+    {
+        match schedule.lock() {
+            Ok(mut schedule) => {
+                schedule.remove(name);
+            }
+            Err(error) => eprintln!("maintenance retry schedule poisoned for {name}: {error}"),
+        }
+    }
     results
 }
 
@@ -1072,7 +1107,7 @@ fn cycle_with_discovery(
     discovery: &dyn TableDiscovery,
     metrics: &Metrics,
     cancel: &Arc<AtomicBool>,
-    schedule: Option<&Mutex<BTreeMap<String, Instant>>>,
+    schedule: Option<&Mutex<ScheduledTables>>,
 ) -> Result<Vec<OperationResult>> {
     let names = discovery.tables()?;
     if names.len() > MAX_TABLES {

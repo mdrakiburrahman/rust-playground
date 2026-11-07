@@ -3,7 +3,7 @@
   "$schema": "../../node_modules/nx/schemas/project-schema.json",
   "projectType": "application",
   "sourceRoot": "crates/delta-maintenance/src",
-  "implicitDependencies": ["arrow-deltalake", "arrowcol-props", "arrowcol-catalog-client"],
+  "implicitDependencies": ["arrow-deltalake", "arrowcol-props", "arrowcol-catalog-client", "arrowcol-catalog-rust"],
   "namedInputs": {
     "default": [
       "{projectRoot}/**/*",

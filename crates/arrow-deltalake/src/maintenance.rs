@@ -736,6 +736,34 @@ impl DeltaTable {
             // Multipart/v2 checkpoint layouts require the full supported-layout path.
             return Ok(None);
         }
+        if version > i64::MAX as u64 {
+            return Err(fail(
+                MaintenanceErrorKind::Unsupported,
+                "log version exceeds the supported range",
+            ));
+        }
+        let first = checkpoint.map_or(0, |checkpoint| checkpoint + 1);
+        let mut expected = first;
+        for name in logs.keys().filter(|name| is_commit_name(name)) {
+            let number = name[..20].parse::<u64>()?;
+            if number < first {
+                continue;
+            }
+            if number != expected {
+                if (checkpoint.is_none() && logs.keys().any(|name| name.contains(".checkpoint.")))
+                    || self
+                        .log_floor()?
+                        .is_some_and(|floor| checkpoint.is_some_and(|hint| hint < floor.checkpoint_version))
+                {
+                    return Ok(None);
+                }
+                return Err(fail(
+                    MaintenanceErrorKind::Unsupported,
+                    format!("commit log gap at version {expected}"),
+                ));
+            }
+            expected += 1;
+        }
         let debt = checkpoint.map_or(version.saturating_add(1), |hint| version.saturating_sub(hint));
         let log_cutoff = config
             .now_ms
