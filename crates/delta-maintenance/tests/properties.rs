@@ -3,7 +3,8 @@ use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow_deltalake::delta::{DeltaTable, INGESTION_PARTITION};
 use arrow_deltalake::maintenance::{
-    Granularity, MaintenanceControl, NegativeProbeConfig, OptimizeConfig, Outcome, ProbeOperation, now_ms,
+    Granularity, MaintenanceControl, MaintenanceError, MaintenanceErrorKind, NegativeProbeConfig, OptimizeConfig,
+    Outcome, ProbeOperation, now_ms,
 };
 use delta_maintenance::{
     DiscoveredTable, Metrics, Operation, Settings, TableDiscovery, run_cycle_with_discovery, run_with_discovery,
@@ -84,6 +85,52 @@ fn fixture() -> Result<(tempfile::TempDir, Settings, CatalogTable)> {
 }
 
 type FileInventory = BTreeMap<PathBuf, (Vec<u8>, SystemTime)>;
+
+#[test]
+fn setup_errors_preserve_typed_stale_plan_without_classifying_plain_text() -> Result<()> {
+    struct FailedDiscovery(bool);
+    impl TableDiscovery for FailedDiscovery {
+        fn tables(&self) -> Result<Vec<String>> {
+            Ok(vec!["events".into()])
+        }
+        fn table(&self, _: &str) -> Result<DiscoveredTable> {
+            if self.0 {
+                Err(anyhow::Error::new(MaintenanceError {
+                    kind: MaintenanceErrorKind::StalePlan,
+                    message: "table advanced during negative probe; retry".into(),
+                    report: None,
+                })
+                .context("loading table properties"))
+            } else {
+                Err(anyhow!("stale_plan: table advanced during negative probe; retry"))
+            }
+        }
+    }
+
+    let (root, mut settings, _) = fixture()?;
+    settings.operations = vec![Operation::Purge];
+    let before = inventory(root.path())?;
+    for (typed, expected) in [(true, "stale_plan"), (false, "failure")] {
+        let results = run_cycle_with_discovery(
+            &settings,
+            &FailedDiscovery(typed),
+            &Metrics::new(),
+            &Arc::new(AtomicBool::new(false)),
+        )?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].error_kind, Some(expected));
+        assert!(!results[0].negative_probe);
+        assert!(results[0].report.is_none());
+        assert!(
+            results[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("table advanced during negative probe"))
+        );
+        assert_eq!(before, inventory(root.path())?);
+    }
+    Ok(())
+}
 
 fn persist_policy(source: &CatalogTable) -> Result<()> {
     let table = DeltaTable::open_catalog(source.0.url.clone())?;
