@@ -131,7 +131,7 @@ export function writeProvenance(
       const observedAt = new Date().toISOString();
       return { ...JSON.parse(execute('docker', [
         'inspect', '--format',
-        '{"id":{{json .Id}},"imageId":{{json .Image}},"service":{{json (index .Config.Labels "com.docker.compose.service")}},"nanoCpus":{{json .HostConfig.NanoCpus}},"memoryLimit":{{json .HostConfig.Memory}},"running":{{json .State.Running}},"healthStatus":{{if .State.Health}}{{json .State.Health.Status}}{{else}}null{{end}},"startedAt":{{json .State.StartedAt}}}',
+        '{"id":{{json .Id}},"imageId":{{json .Image}},"service":{{json (index .Config.Labels "com.docker.compose.service")}},"nanoCpus":{{json .HostConfig.NanoCpus}},"memoryLimit":{{json .HostConfig.Memory}},"running":{{json .State.Running}},"healthStatus":{{with (index .State "Health")}}{{json .Status}}{{else}}null{{end}},"startedAt":{{json .State.StartedAt}}}',
         id,
       ])), observedAt };
     });

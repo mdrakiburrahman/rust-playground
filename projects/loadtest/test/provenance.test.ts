@@ -60,7 +60,7 @@ if [ "$1" = ps ]; then
   printf 'catalog-id\\nrouter-id\\ndataflow-id\\nunused-id\\n'
 elif [ "$1" = inspect ]; then
   case "$3" in
-    *'.State.Running'*'.State.Health.Status'*'.State.StartedAt'*) ;;
+    *'.State.Running'*'index .State "Health"'*'.Status'*'.State.StartedAt'*) ;;
     *) exit 1 ;;
   esac
   case "$4" in
