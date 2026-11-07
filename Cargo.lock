@@ -6617,6 +6617,7 @@ dependencies = [
  "arrow-deltalake",
  "arrowcol-buffer",
  "assert_cmd",
+ "async-trait",
  "clap",
  "delta_kernel",
  "delta_kernel_default_engine",
