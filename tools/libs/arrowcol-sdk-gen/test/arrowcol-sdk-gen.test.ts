@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
   SdkGenerationTool,
   fixtureArtifacts,
+  evolvedFixtureArtifacts,
   generatedOutput,
   type CommandRunner,
 } from '../src/index.js';
@@ -21,22 +22,39 @@ class RecordingRunner implements CommandRunner {
   }
 }
 
-test('generate fixture runs artifact export then one shared generator', () => {
+test('generate fixture preserves separately generated v1 and v2 clients', () => {
   const runner = new RecordingRunner();
   const tool = new SdkGenerationTool(process.cwd(), runner);
   const result = tool.generateFixture();
 
-  assert.equal(result.commands.length, 2);
+  assert.equal(result.commands.length, 4);
   assert.deepEqual(
     runner.calls.map((call) => call.command),
-    ['cargo', 'cargo'],
+    ['cargo', 'cargo', 'cargo', 'cargo'],
   );
   assert.ok(runner.calls[0]?.args.includes('fixture'));
   assert.ok(runner.calls[1]?.args.includes('generate'));
   assert.ok(runner.calls[1]?.args.includes(fixtureArtifacts));
   assert.ok(runner.calls[1]?.args.includes(generatedOutput));
+  assert.ok(runner.calls[2]?.args.includes('--previous'));
+  assert.ok(runner.calls[2]?.args.includes(evolvedFixtureArtifacts));
+  assert.ok(runner.calls[3]?.args.includes(evolvedFixtureArtifacts));
 });
 
+test('compatibility compares consecutive versions and runs the real Buf WIRE_JSON CLI', () => {
+  const runner = new RecordingRunner();
+  new SdkGenerationTool(process.cwd(), runner).compatibility();
+  assert.deepEqual(runner.calls[0]?.args.slice(-4), [
+    '--previous', fixtureArtifacts, '--current', evolvedFixtureArtifacts,
+  ]);
+  assert.deepEqual(runner.calls[1], {
+    command: 'npx',
+    args: [
+      '--no-install', 'buf', 'breaking', `${evolvedFixtureArtifacts}/schema.proto`,
+      '--against', `${fixtureArtifacts}/schema.proto`, '--config', 'buf.yaml',
+    ],
+  });
+});
 test('check CLI delegates to deterministic check workflow', () => {
   const runner = new RecordingRunner();
   const tool = new SdkGenerationTool(process.cwd(), runner);

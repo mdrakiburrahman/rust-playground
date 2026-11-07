@@ -53,12 +53,11 @@ arrow-flight = {{ version = \"=58.4.0\", default-features = false }}\n\
 arrow-ipc = {{ version = \"=58.4.0\", default-features = false }}\n\
 arrow-schema = \"=58.4.0\"\n\
 futures = \"=0.3.34\"\n\
+prost = \"0.14\"\n\
 serde = {{ version = \"=1.0.229\", features = [\"derive\"] }}\n\
 serde_json = \"=1.0.154\"\n\
 thiserror = \"=2.0.21\"\n\
 tonic = {{ version = \"=0.14.6\", features = [\"transport\"] }}\n\
-url = \"=2.5.8\"\n\
-uuid = \"=1.28.0\"\n\n\
 [dev-dependencies]\n\
 tokio = {{ version = \"=1.53.2\", features = [\"macros\", \"rt-multi-thread\"] }}\n\n\
 [lints.rust]\n\
@@ -81,6 +80,7 @@ fn library(context: &RenderContext<'_>) -> SdkGenResult<String> {
     )
     .map_err(format_error)?;
     output.push_str(include_str!("templates/rust_imports.rs.txt"));
+    output.push_str("\n/// Prost-generated schema contract types. Arrow Flight remains the wire.\npub mod proto;\n");
     writeln!(
         output,
         "\npub const TABLE_CATALOG: &str = {:?};\n\
@@ -89,8 +89,7 @@ pub const TABLE_NAME: &str = {:?};\n\
 pub const TABLE_ID: &str = {:?};\n\
 pub const SCHEMA_VERSION: u64 = {};\n\
 pub const SCHEMA_FINGERPRINT: &str = {:?};\n\
-pub const DO_PUT_PATH: &str = \"/arrow.flight.protocol.FlightService/DoPut\";\n\
-pub const RECEIPT_STATUS_PATH_TEMPLATE: &str = \"/v1/receipts/{{receipt_id}}\";\n",
+pub const DO_PUT_PATH: &str = \"/arrow.flight.protocol.FlightService/DoPut\";\n",
         context.schema.identity().catalog().as_str(),
         context.schema.identity().schema().as_str(),
         context.schema.identity().table().as_str(),
@@ -560,10 +559,10 @@ use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;\n\
 use futures::StreamExt;\n\
 use {crate_name}::{{\n\
     ImplementationPool, SCHEMA_FINGERPRINT, SCHEMA_VERSION, TABLE_NAME, arrow_schema,\n\
-    do_put_request, parse_receipt_id, receipt_status_url, record_batch, routing_metadata,\n\
+    do_put_request, record_batch, routing_metadata,\n\
 {nested_imports}    {builder_name},\n\
 }};\n\
-use url::Url;\n\n\
+\n\
 #[tokio::test]\n\
 async fn generated_fixture_builds_exact_batch_and_client_surfaces() -> Result<(), Box<dyn Error>> {{\n\
     let row = {builder};\n\
@@ -575,14 +574,11 @@ async fn generated_fixture_builds_exact_batch_and_client_surfaces() -> Result<()
     assert_eq!(SCHEMA_VERSION, {version});\n\
     assert!(SCHEMA_FINGERPRINT.starts_with(\"sha256:\"));\n\
     assert_eq!(TABLE_NAME, {table:?});\n\n\
-    let metadata = routing_metadata(ImplementationPool::Direct)?;\n\
+    let metadata = routing_metadata(ImplementationPool::Dataflow)?;\n\
     assert_eq!(metadata.ascii_pairs().len(), 6);\n\
-    let request = do_put_request(vec![batch], ImplementationPool::Direct).await?;\n\
+    let request = do_put_request(vec![batch], ImplementationPool::Dataflow).await?;\n\
     assert_eq!(request.metadata().get(\"x-arrowcol-table\").and_then(|value| value.to_str().ok()), Some(TABLE_NAME));\n\
     assert!(request.into_inner().count().await > 0);\n\n\
-    let receipt = parse_receipt_id(br#\"{{\"receipt_id\":\"33333333-3333-4333-8333-333333333333\"}}\"#)?;\n\
-    let url = receipt_status_url(&Url::parse(\"https://collector.example/api/\")?, receipt)?;\n\
-    assert_eq!(url.as_str(), \"https://collector.example/api/v1/receipts/33333333-3333-4333-8333-333333333333\");\n\
     Ok(())\n\
 }}\n",
         crate_name = context.rust_package.replace('-', "_"),
@@ -689,7 +685,7 @@ use {}::{{{}Builder, ImplementationPool, do_put_request, record_batch}};\n\
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {{\n\
 let row = {}Builder::default();\n\
 // Set required fields, then call `build()` and `record_batch(&[row])`.\n\
-let _pool = ImplementationPool::Direct;\n\
+let _pool = ImplementationPool::Dataflow;\n\
 # Ok(())\n\
 # }}\n\
 ```\n\n\
@@ -709,7 +705,7 @@ fn format_error(_: std::fmt::Error) -> SdkGenError {
     SdkGenError::Artifact("generated Rust formatting failed".to_owned())
 }
 
-fn format_rust(source: &str) -> SdkGenResult<String> {
+pub(super) fn format_rust(source: &str) -> SdkGenResult<String> {
     let syntax = syn::parse_file(source)
         .map_err(|error| SdkGenError::Artifact(format!("generated Rust did not parse before formatting: {error}")))?;
     let source = prettyplease::unparse(&syntax);

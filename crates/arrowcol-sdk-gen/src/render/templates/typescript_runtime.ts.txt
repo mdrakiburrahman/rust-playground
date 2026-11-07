@@ -1,4 +1,4 @@
-export type ImplementationPool = 'direct' | 'dataflow';
+export type ImplementationPool = 'dataflow';
 
 export type RoutingHeaders = Readonly<Record<
   | 'x-arrowcol-protocol-version'
@@ -10,7 +10,7 @@ export type RoutingHeaders = Readonly<Record<
   string
 >>;
 
-export function routingMetadata(pool: ImplementationPool): RoutingHeaders {
+export function routingMetadata(pool: ImplementationPool = 'dataflow'): RoutingHeaders {
   const headers = Object.freeze({
     'x-arrowcol-protocol-version': '1',
     'x-arrowcol-implementation-pool': pool,
@@ -34,7 +34,7 @@ export interface DoPutPlan {
 
 export function createDoPutPlan(
   batch: RecordBatch,
-  pool: ImplementationPool,
+  pool: ImplementationPool = 'dataflow',
 ): DoPutPlan {
   if (!sameSchema(batch.schema, ARROW_SCHEMA)) {
     throw new Error('record batch schema does not match generated schema');
@@ -50,52 +50,6 @@ export function createDoPutPlan(
     headers: routingMetadata(pool),
     batch,
   });
-}
-
-export type ReceiptId = string & { readonly __receiptId: unique symbol };
-
-export function parseReceiptId(
-  applicationMetadata: Uint8Array | string,
-): ReceiptId {
-  const text =
-    typeof applicationMetadata === 'string'
-      ? applicationMetadata
-      : new TextDecoder('utf-8', { fatal: true }).decode(applicationMetadata);
-  const candidate = UUID_PATTERN.test(text)
-    ? text
-    : receiptIdFromJson(text);
-  if (!UUID_PATTERN.test(candidate)) {
-    throw new Error('receipt ID must be a canonical UUID');
-  }
-  return candidate.toLowerCase() as ReceiptId;
-}
-
-export function receiptStatusUrl(
-  baseUrl: URL | string,
-  receiptId: ReceiptId,
-): string {
-  const url = new URL(baseUrl);
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-    throw new Error('receipt base URL must use HTTP or HTTPS');
-  }
-  url.search = '';
-  url.hash = '';
-  const base = url.pathname.endsWith('/') ? url.pathname : `${url.pathname}/`;
-  url.pathname = `${base}v1/receipts/${receiptId}`;
-  return url.toString();
-}
-
-function receiptIdFromJson(text: string): string {
-  const value: unknown = JSON.parse(text);
-  if (
-    typeof value !== 'object' ||
-    value === null ||
-    !('receipt_id' in value) ||
-    typeof value.receipt_id !== 'string'
-  ) {
-    throw new Error('receipt metadata must contain a string receipt_id');
-  }
-  return value.receipt_id;
 }
 
 function validateMetadata(key: string, value: string): void {
@@ -535,8 +489,6 @@ function singleData(vector: Vector<DataType>): Data<DataType> {
   return vector.data[0];
 }
 
-const UUID_PATTERN =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const I64_MIN = -(1n << 63n);
 const I64_MAX = (1n << 63n) - 1n;
 const U64_MAX = (1n << 64n) - 1n;

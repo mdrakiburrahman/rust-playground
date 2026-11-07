@@ -1087,6 +1087,7 @@ dependencies = [
  "hex",
  "prettyplease 0.2.37",
  "prost 0.14.4",
+ "prost-build 0.14.4",
  "prost-types 0.14.4",
  "serde",
  "serde_json",

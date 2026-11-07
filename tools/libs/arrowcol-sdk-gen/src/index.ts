@@ -11,6 +11,12 @@ export const fixtureDdl =
   'crates/arrowcol-sdk-gen/fixtures/telemetry-events.sql';
 export const fixtureArtifacts =
   'crates/arrowcol-sdk-gen/.temp/catalog';
+export const evolvedFixtureDdl =
+  'crates/arrowcol-sdk-gen/fixtures/telemetry-events-v2.sql';
+export const evolvedFixtureArtifacts =
+  'crates/arrowcol-sdk-gen/.temp/catalog-v2';
+export const evolvedGeneratedOutput =
+  'crates/arrowcol-sdk-gen/.temp/generated-v2';
 export const generatedOutput =
   'crates/arrowcol-sdk-gen/.temp/generated';
 export const packageArchive =
@@ -52,6 +58,14 @@ export class SdkGenerationTool {
         '--out',
         generatedOutput,
       ]),
+      this.#generator([
+        'fixture', '--ddl', evolvedFixtureDdl,
+        '--previous', fixtureArtifacts, '--out', evolvedFixtureArtifacts,
+      ]),
+      this.#generator([
+        'generate', '--artifacts', evolvedFixtureArtifacts,
+        '--out', evolvedGeneratedOutput,
+      ]),
     ];
     return { commands };
   }
@@ -92,7 +106,13 @@ export class SdkGenerationTool {
           '--previous',
           fixtureArtifacts,
           '--current',
-          fixtureArtifacts,
+          evolvedFixtureArtifacts,
+        ]),
+        this.#command('npx', [
+          '--no-install', 'buf', 'breaking',
+          `${evolvedFixtureArtifacts}/schema.proto`,
+          '--against', `${fixtureArtifacts}/schema.proto`,
+          '--config', 'buf.yaml',
         ]),
       ],
     };

@@ -20,7 +20,7 @@ enum Cell {
     Map(Vec<(Cell, Option<Cell>)>),
 }
 
-/// Generated model, Arrow construction, metadata, Flight, or receipt failure.
+/// Generated model, Arrow construction, metadata, or Flight failure.
 #[derive(Debug, Error)]
 pub enum SdkError {
     #[error("required field {0} was not supplied")]
@@ -38,10 +38,6 @@ pub enum SdkError {
         key: &'static str,
         reason: String,
     },
-    #[error("invalid receipt metadata: {0}")]
-    InvalidReceipt(String),
-    #[error("receipt base URL cannot carry hierarchical path segments")]
-    InvalidReceiptBaseUrl,
     #[error(transparent)]
     Arrow(#[from] ArrowError),
     #[error(transparent)]
@@ -50,16 +46,12 @@ pub enum SdkError {
     Tonic(#[from] tonic::Status),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
-    #[error(transparent)]
-    Url(#[from] url::ParseError),
-    #[error(transparent)]
-    Uuid(#[from] uuid::Error),
 }
 
 /// Collector implementation pool encoded into validated routing metadata.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ImplementationPool {
-    Direct,
+    #[default]
     Dataflow,
 }
 
@@ -67,7 +59,6 @@ impl ImplementationPool {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Direct => "direct",
             Self::Dataflow => "dataflow",
         }
     }
@@ -208,73 +199,6 @@ where
 {
     let request = do_put_request(batches, pool).await?;
     client.do_put(request).await.map_err(SdkError::from)
-}
-
-/// Validated server-generated receipt identifier.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct ReceiptId(Uuid);
-
-impl ReceiptId {
-    #[must_use]
-    pub const fn as_uuid(self) -> Uuid {
-        self.0
-    }
-}
-
-impl std::fmt::Display for ReceiptId {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
-impl FromStr for ReceiptId {
-    type Err = uuid::Error;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Uuid::parse_str(value).map(Self)
-    }
-}
-
-/// Parses a raw UUID or JSON `{"receipt_id":"..."}` `PutResult` payload.
-///
-/// # Errors
-///
-/// Returns an error for non-UTF-8, malformed JSON, or a non-canonical UUID.
-pub fn parse_receipt_id(application_metadata: &[u8]) -> Result<ReceiptId, SdkError> {
-    let text = std::str::from_utf8(application_metadata)
-        .map_err(|error| SdkError::InvalidReceipt(error.to_string()))?;
-    if let Ok(receipt) = ReceiptId::from_str(text) {
-        return Ok(receipt);
-    }
-    #[derive(Deserialize)]
-    struct ReceiptWire {
-        receipt_id: String,
-    }
-    let wire: ReceiptWire = serde_json::from_str(text)?;
-    ReceiptId::from_str(&wire.receipt_id).map_err(SdkError::from)
-}
-
-/// Builds the canonical HTTP receipt status URL below an external service base URL.
-///
-/// # Errors
-///
-/// Returns an error for a non-HTTP(S) or non-hierarchical base URL.
-pub fn receipt_status_url(base: &Url, receipt_id: ReceiptId) -> Result<Url, SdkError> {
-    if !matches!(base.scheme(), "http" | "https") {
-        return Err(SdkError::InvalidReceiptBaseUrl);
-    }
-    let mut output = base.clone();
-    output.set_query(None);
-    output.set_fragment(None);
-    {
-        let mut segments = output
-            .path_segments_mut()
-            .map_err(|_| SdkError::InvalidReceiptBaseUrl)?;
-        let receipt = receipt_id.to_string();
-        segments.pop_if_empty();
-        segments.extend(["v1", "receipts", receipt.as_str()]);
-    }
-    Ok(output)
 }
 
 fn validate_metadata(key: &'static str, value: &str) -> Result<(), SdkError> {

@@ -1,6 +1,8 @@
 use std::{fs, path::PathBuf};
 
-use arrowcol_catalog::{CatalogSchemaVersion, DdlCommand, DdlParser, SchemaVersion, deterministic_table_id};
+use arrowcol_catalog::{
+    CatalogField, CatalogSchemaVersion, DdlCommand, DdlParser, SchemaVersion, deterministic_table_id,
+};
 use arrowcol_sdk_gen::{
     ArtifactBundle, SafeOutputPath, check_generated_sdk, generate_sdk, package_generated_sdk, verify_compatibility,
     write_artifact_bundle,
@@ -52,6 +54,9 @@ enum Command {
         /// UTF-8 file containing exactly one supported CREATE TABLE statement.
         #[arg(long)]
         ddl: PathBuf,
+        /// Previous immutable artifacts when the fixture is an ALTER TABLE.
+        #[arg(long)]
+        previous: Option<PathBuf>,
         /// Workspace-relative artifact output below .temp or target.
         #[arg(long)]
         out: PathBuf,
@@ -95,22 +100,63 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let current = ArtifactBundle::load_directory(current)?;
             print_json(&verify_compatibility(&previous, &current)?)?;
         }
-        Command::Fixture { ddl, out, timezone } => {
+        Command::Fixture {
+            ddl,
+            previous,
+            out,
+            timezone,
+        } => {
             let metadata = fs::symlink_metadata(&ddl)?;
             if metadata.file_type().is_symlink() || !metadata.is_file() {
                 return Err(format!("DDL fixture must be a regular non-symlink file: {}", ddl.display()).into());
             }
             let ddl_text = fs::read_to_string(&ddl)?;
-            let DdlCommand::CreateTable(create) = DdlParser::new(timezone).parse(&ddl_text)? else {
-                return Err("DDL fixture must contain CREATE TABLE".into());
+            let command = DdlParser::new(timezone).parse(&ddl_text)?;
+            let schema = match (command, previous) {
+                (DdlCommand::CreateTable(create), None) => CatalogSchemaVersion::new(
+                    deterministic_table_id(create.identity()),
+                    create.identity().clone(),
+                    SchemaVersion::FIRST,
+                    create.fields().to_vec(),
+                    create.canonical_ddl(),
+                )?,
+                (DdlCommand::AddColumns(add), Some(previous)) => {
+                    let previous = ArtifactBundle::load_directory(previous)?;
+                    let old = previous.schema();
+                    if add.identity() != old.identity() {
+                        return Err("ALTER fixture must address the previous table".into());
+                    }
+                    let mut fields = old.fields().to_vec();
+                    let mut position = old.next_position()?;
+                    let mut number = old.next_field_number()?;
+                    for blueprint in add.fields() {
+                        if (19_000..=19_999).contains(&number) {
+                            number = 20_000;
+                        }
+                        fields.push(CatalogField::new(
+                            blueprint.id(),
+                            blueprint.name(),
+                            position,
+                            number,
+                            blueprint.is_nullable(),
+                            None,
+                            blueprint.mapping().clone(),
+                        )?);
+                        position = position.checked_add(1).ok_or("column ordinal overflow")?;
+                        number = number.checked_add(1).ok_or("protobuf number overflow")?;
+                    }
+                    let candidate = CatalogSchemaVersion::new(
+                        old.table_id(),
+                        old.identity().clone(),
+                        old.version().next()?,
+                        fields,
+                        add.canonical_ddl(),
+                    )?;
+                    verify_compatibility(&previous, &ArtifactBundle::from_schema(candidate.clone())?)?;
+                    candidate
+                }
+                _ => return Err("fixture requires CREATE TABLE, or ALTER TABLE with --previous".into()),
             };
-            let schema = CatalogSchemaVersion::new(
-                deterministic_table_id(create.identity()),
-                create.identity().clone(),
-                SchemaVersion::FIRST,
-                create.fields().to_vec(),
-                create.canonical_ddl(),
-            )?;
             let bundle = ArtifactBundle::from_schema(schema)?;
             let output = SafeOutputPath::new(&workspace, out)?;
             write_artifact_bundle(&bundle, &output)?;

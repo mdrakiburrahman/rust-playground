@@ -49,6 +49,31 @@ pub(crate) fn render_sdk(bundle: &ArtifactBundle) -> SdkGenResult<RenderedSdk> {
     let mut files = BTreeMap::new();
     files.extend(rust::render(&context)?);
     files.extend(typescript::render(&context)?);
+    let requests = bundle
+        .descriptors()
+        .file
+        .iter()
+        .map(|file| {
+            (
+                prost_build::Module::from_protobuf_package_name(file.package()),
+                file.clone(),
+            )
+        })
+        .collect();
+    let generated = prost_build::Config::new()
+        .generate(requests)
+        .map_err(|error| SdkGenError::Artifact(format!("prost type generation failed: {error}")))?;
+    if generated.len() != 1 {
+        return Err(SdkGenError::Artifact(
+            "expected exactly one protobuf package per table".to_owned(),
+        ));
+    }
+    for source in generated.into_values() {
+        files.insert(
+            PathBuf::from("rust/src/proto.rs"),
+            rust::format_rust(&source)?.into_bytes(),
+        );
+    }
     files.insert(PathBuf::from("descriptors/manifest.json"), bundle.manifest().to_vec());
     files.insert(
         PathBuf::from("descriptors/schema.arrow"),
@@ -57,6 +82,10 @@ pub(crate) fn render_sdk(bundle: &ArtifactBundle) -> SdkGenResult<RenderedSdk> {
     files.insert(
         PathBuf::from("descriptors/descriptor.pb"),
         bundle.protobuf_descriptor().to_vec(),
+    );
+    files.insert(
+        PathBuf::from("descriptors/schema.proto"),
+        bundle.protobuf_source().to_vec(),
     );
     files.insert(PathBuf::from("README.md"), generated_root_readme(&context).into_bytes());
 
@@ -392,6 +421,10 @@ fn sdk_manifest<'a>(
                 path: "descriptors/descriptor.pb",
                 sha256: format!("sha256:{}", hex::encode(Sha256::digest(bundle.protobuf_descriptor()))),
             },
+            protobuf_source: ArtifactFile {
+                path: "descriptors/schema.proto",
+                sha256: format!("sha256:{}", hex::encode(Sha256::digest(bundle.protobuf_source()))),
+            },
         },
         packages: PackageManifest {
             rust: LanguagePackage {
@@ -413,13 +446,12 @@ fn sdk_manifest<'a>(
             ],
             routing_metadata: RoutingManifest {
                 protocol_version: "1",
-                implementation_pool_values: ["direct", "dataflow"],
+                implementation_pool_values: ["dataflow"],
                 catalog: context.schema.identity().catalog().as_str(),
                 schema: context.schema.identity().schema().as_str(),
                 table: context.schema.identity().table().as_str(),
                 schema_fingerprint: context.schema.fingerprint().to_string(),
             },
-            receipt_status_path_template: "/v1/receipts/{receipt_id}",
         },
         outputs,
     }
@@ -473,6 +505,7 @@ struct ArtifactManifest<'a> {
     catalog_manifest: &'a str,
     arrow_schema: ArtifactFile<'a>,
     protobuf_descriptor: ArtifactFile<'a>,
+    protobuf_source: ArtifactFile<'a>,
 }
 
 #[derive(Serialize)]
@@ -498,13 +531,12 @@ struct FlightManifest<'a> {
     do_put_path: &'a str,
     descriptor_path: Vec<String>,
     routing_metadata: RoutingManifest<'a>,
-    receipt_status_path_template: &'a str,
 }
 
 #[derive(Serialize)]
 struct RoutingManifest<'a> {
     protocol_version: &'a str,
-    implementation_pool_values: [&'a str; 2],
+    implementation_pool_values: [&'a str; 1],
     catalog: &'a str,
     schema: &'a str,
     table: &'a str,

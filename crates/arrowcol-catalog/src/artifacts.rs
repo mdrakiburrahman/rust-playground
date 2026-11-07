@@ -64,6 +64,59 @@ impl DescriptorArtifacts {
         &self.protobuf_descriptor
     }
 
+    /// Returns deterministic proto2 source reconstructed from the persisted descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns a descriptor error if persisted protobuf bytes are malformed.
+    pub fn protobuf_source(&self) -> CatalogResult<String> {
+        let descriptors = FileDescriptorSet::decode(self.protobuf_descriptor()).map_err(|error| {
+            CatalogError::new(
+                CatalogErrorCode::DescriptorGeneration,
+                format!("protobuf descriptor did not decode: {error}"),
+            )
+        })?;
+        let mut source = String::from(
+            "syntax = \"proto2\";\n\n// TIMESTAMP: UTC microseconds; DECIMAL: base-10 string. Arrow Flight remains the wire.\n",
+        );
+        for file in descriptors.file {
+            source.push_str(&format!("package {};\n\n", file.package.unwrap_or_default()));
+            for message in file.message_type {
+                source.push_str(&format!("message {} {{\n", message.name.unwrap_or_default()));
+                source.push_str("  // Protobuf implementation-reserved numbers 19000-19999 are never allocated.\n");
+                for field in message.field {
+                    let label = if field.label == Some(Label::Repeated as i32) {
+                        "repeated"
+                    } else {
+                        "optional"
+                    };
+                    let data_type = if let Some(type_name) = &field.type_name {
+                        type_name.clone()
+                    } else {
+                        field
+                            .r#type()
+                            .as_str_name()
+                            .trim_start_matches("TYPE_")
+                            .to_ascii_lowercase()
+                    };
+                    let json_name = serde_json::to_string(&field.json_name.unwrap_or_default()).map_err(|error| {
+                        CatalogError::new(
+                            CatalogErrorCode::DescriptorGeneration,
+                            format!("protobuf JSON name serialization failed: {error}"),
+                        )
+                    })?;
+                    source.push_str(&format!(
+                        "  {label} {data_type} {} = {} [json_name = {json_name}];\n",
+                        field.name.unwrap_or_default(),
+                        field.number.unwrap_or_default(),
+                    ));
+                }
+                source.push_str("}\n\n");
+            }
+        }
+        Ok(source)
+    }
+
     /// Returns the canonical JSON manifest.
     #[must_use]
     pub fn manifest(&self) -> &[u8] {
@@ -230,13 +283,7 @@ fn protobuf_field(
 ) -> CatalogResult<FieldDescriptorProto> {
     let (field_type, type_name, repeated) =
         protobuf_type_for_catalog(package, parent_message, field_name, field.mapping().arrow(), output)?;
-    let label = if repeated {
-        Label::Repeated
-    } else if field.is_nullable() {
-        Label::Optional
-    } else {
-        Label::Required
-    };
+    let label = if repeated { Label::Repeated } else { Label::Optional };
     Ok(FieldDescriptorProto {
         name: Some(field_name.to_owned()),
         number: Some(i32::try_from(field.field_number()).map_err(|_| {
@@ -317,6 +364,7 @@ fn protobuf_type_for_catalog(
         CatalogType::Dictionary { value, .. } => {
             protobuf_type_for_catalog(package, parent_message, field_name, value, output)
         }
+        CatalogType::Decimal128 { .. } => Ok((Type::String, None, false)),
         scalar => Ok((protobuf_scalar_type(scalar.protobuf_type()), None, false)),
     }
 }
@@ -325,7 +373,7 @@ const fn protobuf_scalar_type(data_type: ProtobufType) -> Type {
     match data_type {
         ProtobufType::Bool => Type::Bool,
         ProtobufType::Int32 => Type::Sint32,
-        ProtobufType::Int64 => Type::Sint64,
+        ProtobufType::Int64 => Type::Int64,
         ProtobufType::Uint32 => Type::Uint32,
         ProtobufType::Uint64 => Type::Uint64,
         ProtobufType::Float => Type::Float,

@@ -20,6 +20,8 @@ pub struct ArtifactPaths {
     pub arrow_schema: PathBuf,
     /// Encoded protobuf file descriptor set.
     pub protobuf_descriptor: PathBuf,
+    /// Proto2 schema contract source.
+    pub protobuf_source: PathBuf,
 }
 
 impl ArtifactPaths {
@@ -31,6 +33,7 @@ impl ArtifactPaths {
             manifest: directory.join("manifest.json"),
             arrow_schema: directory.join("schema.arrow"),
             protobuf_descriptor: directory.join("descriptor.pb"),
+            protobuf_source: directory.join("schema.proto"),
         }
     }
 }
@@ -42,6 +45,7 @@ pub struct ArtifactBundle {
     manifest: Vec<u8>,
     arrow_schema: Vec<u8>,
     protobuf_descriptor: Vec<u8>,
+    protobuf_source: Vec<u8>,
     descriptors: FileDescriptorSet,
 }
 
@@ -66,6 +70,7 @@ impl ArtifactBundle {
         let manifest = read_regular_file(&paths.manifest)?;
         let arrow_schema = read_regular_file(&paths.arrow_schema)?;
         let protobuf_descriptor = read_regular_file(&paths.protobuf_descriptor)?;
+        let protobuf_source = read_regular_file(&paths.protobuf_source)?;
         let decoded: ArtifactManifest = serde_json::from_slice(&manifest)?;
         if decoded.artifact_manifest_version != 1 {
             return Err(SdkGenError::Artifact(format!(
@@ -105,6 +110,16 @@ impl ArtifactBundle {
                 "protobuf descriptor bytes are not the canonical catalog artifact".to_owned(),
             ));
         }
+        if expected
+            .protobuf_source()
+            .map_err(|error| SdkGenError::Artifact(error.to_string()))?
+            .as_bytes()
+            != protobuf_source
+        {
+            return Err(SdkGenError::Artifact(
+                "protobuf source bytes are not the canonical catalog artifact".to_owned(),
+            ));
+        }
 
         let decoded_arrow = try_schema_from_flatbuffer_bytes(&arrow_schema)
             .map_err(|error| SdkGenError::Artifact(format!("Arrow schema artifact did not decode: {error}")))?;
@@ -124,6 +139,7 @@ impl ArtifactBundle {
             manifest,
             arrow_schema,
             protobuf_descriptor,
+            protobuf_source,
             descriptors,
         })
     }
@@ -142,6 +158,10 @@ impl ArtifactBundle {
             manifest: generated.manifest().to_vec(),
             arrow_schema: generated.arrow_schema().to_vec(),
             protobuf_descriptor: generated.protobuf_descriptor().to_vec(),
+            protobuf_source: generated
+                .protobuf_source()
+                .map_err(|error| SdkGenError::Artifact(error.to_string()))?
+                .into_bytes(),
             descriptors,
         })
     }
@@ -168,6 +188,12 @@ impl ArtifactBundle {
     #[must_use]
     pub fn protobuf_descriptor(&self) -> &[u8] {
         &self.protobuf_descriptor
+    }
+
+    /// Returns canonical proto2 schema contract source.
+    #[must_use]
+    pub fn protobuf_source(&self) -> &[u8] {
+        &self.protobuf_source
     }
 
     /// Returns the decoded protobuf descriptor set.
