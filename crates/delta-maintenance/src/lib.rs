@@ -7,9 +7,9 @@ pub mod catalog;
 use anyhow::{Context, Result, bail};
 use arrow_deltalake::delta::DeltaTable;
 use arrow_deltalake::maintenance::{
-    Granularity, MaintenanceControl, MaintenanceErrorKind, MaintenancePlan, MaintenanceReport, NegativeProbeConfig,
-    OptimizeConfig, OptimizePlan, Outcome, ProbeOperation, PruneConfig, PurgeConfig, VacuumConfig, error_details,
-    now_ms,
+    Granularity, MaintenanceControl, MaintenanceError, MaintenanceErrorKind, MaintenancePlan, MaintenanceReport,
+    NegativeProbeConfig, OptimizeConfig, OptimizePlan, Outcome, ProbeOperation, PruneConfig, PurgeConfig, VacuumConfig,
+    error_details, now_ms,
 };
 use arrowcol_props::{ResolvedProps, resolve};
 use serde::Serialize;
@@ -250,9 +250,7 @@ impl TableDiscovery for FilesystemDiscovery {
             Some((cached_token, properties)) if *cached_token == token => properties.clone(),
             _ => {
                 let properties = probe.maintenance_properties()?;
-                if probe.probe_log_token(100_000)? != token {
-                    bail!("table advanced during property discovery; retry");
-                }
+                ensure_property_token_unchanged(&token, &probe.probe_log_token(100_000)?)?;
                 if cache.len() >= MAX_TABLES && !cache.contains_key(name) {
                     cache.clear();
                 }
@@ -266,6 +264,36 @@ impl TableDiscovery for FilesystemDiscovery {
             properties,
             log_token: Some(token),
         })
+    }
+}
+
+fn ensure_property_token_unchanged(before: &str, after: &str) -> Result<()> {
+    if before != after {
+        return Err(MaintenanceError {
+            kind: MaintenanceErrorKind::StalePlan,
+            message: "table advanced during property discovery; retry".into(),
+            report: None,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod property_discovery_tests {
+    use super::*;
+
+    #[test]
+    fn token_change_is_stale_plan_not_a_successful_probe() -> Result<()> {
+        ensure_property_token_unchanged("version-1", "version-1")?;
+        let Err(error) = ensure_property_token_unchanged("version-1", "version-2") else {
+            bail!("changed log must require retry");
+        };
+        assert_eq!(
+            error_details(&error).map(|detail| detail.kind),
+            Some(MaintenanceErrorKind::StalePlan)
+        );
+        Ok(())
     }
 }
 
