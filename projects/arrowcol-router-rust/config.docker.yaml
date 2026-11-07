@@ -51,9 +51,6 @@ upstream:
   idle_timeout_seconds: 60
   ping_interval_seconds: 15
 
-receipts:
-  max_batch_size: 256
-
 telemetry:
   log_filter: info,arrowcol_router_rust=debug
   json_logs: true

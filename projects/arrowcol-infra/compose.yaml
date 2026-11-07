@@ -6,12 +6,6 @@ x-sqlserver-image: &sqlserver-image
     context: .
     dockerfile: docker/sqlserver/Dockerfile
 
-x-hive-image: &hive-image
-  image: arrowcol-infra/hive:4.0.1-mssql
-  build:
-    context: .
-    dockerfile: docker/hive/Dockerfile
-
 services:
   sqlserver:
     <<: *sqlserver-image
@@ -46,12 +40,10 @@ services:
       SQLSERVER_SA_PASSWORD_FILE: /run/secrets/sqlserver_sa_password
       ARROWCOL_APP_PASSWORD_FILE: /run/secrets/arrowcol_app_password
       ARROWCOL_MIGRATOR_PASSWORD_FILE: /run/secrets/arrowcol_migrator_password
-      HIVE_METASTORE_PASSWORD_FILE: /run/secrets/hive_metastore_password
     secrets:
       - sqlserver_sa_password
       - arrowcol_app_password
       - arrowcol_migrator_password
-      - hive_metastore_password
     depends_on:
       sqlserver:
         condition: service_healthy
@@ -72,56 +64,6 @@ services:
         condition: service_completed_successfully
     restart: "no"
 
-  hive-schema:
-    <<: *hive-image
-    command: ["schema-init"]
-    environment:
-      HIVE_DB_HOST: sqlserver
-      HIVE_DB_PORT: "1433"
-      HIVE_DB_NAME: hive_metastore
-      HIVE_DB_USER: hive_metastore
-      HIVE_DB_PASSWORD_FILE: /run/secrets/hive_metastore_password
-    secrets:
-      - hive_metastore_password
-    depends_on:
-      database-bootstrap:
-        condition: service_completed_successfully
-    restart: "no"
-
-  hive-metastore:
-    <<: *hive-image
-    command: ["service"]
-    environment:
-      SERVICE_NAME: metastore
-      IS_RESUME: "true"
-      DB_DRIVER: mssql
-      METASTORE_PORT: "9083"
-      HIVE_DB_HOST: sqlserver
-      HIVE_DB_PORT: "1433"
-      HIVE_DB_NAME: hive_metastore
-      HIVE_DB_USER: hive_metastore
-      HIVE_DB_PASSWORD_FILE: /run/secrets/hive_metastore_password
-    secrets:
-      - hive_metastore_password
-    ports:
-      - "127.0.0.1:${HIVE_METASTORE_PORT:-9083}:9083"
-    volumes:
-      - hive-warehouse:/opt/hive/data/warehouse
-    healthcheck:
-      test: ["CMD", "/usr/local/bin/hive-healthcheck"]
-      interval: 10s
-      timeout: 5s
-      retries: 30
-      start_period: 30s
-    depends_on:
-      arrowcol-migrate:
-        condition: service_completed_successfully
-      hive-schema:
-        condition: service_completed_successfully
-    init: true
-    restart: unless-stopped
-    stop_grace_period: ${STACK_STOP_SECONDS:-30}s
-
 secrets:
   sqlserver_sa_password:
     file: ${SQLSERVER_SA_PASSWORD_FILE:-./secrets/sqlserver-sa-password.txt}
@@ -129,13 +71,8 @@ secrets:
     file: ${ARROWCOL_APP_PASSWORD_FILE:-./secrets/arrowcol-app-password.txt}
   arrowcol_migrator_password:
     file: ${ARROWCOL_MIGRATOR_PASSWORD_FILE:-./secrets/arrowcol-migrator-password.txt}
-  hive_metastore_password:
-    file: ${HIVE_METASTORE_PASSWORD_FILE:-./secrets/hive-metastore-password.txt}
 
 volumes:
   sqlserver-data:
     labels:
       com.arrowcol.infrastructure: sqlserver-data
-  hive-warehouse:
-    labels:
-      com.arrowcol.infrastructure: hive-warehouse

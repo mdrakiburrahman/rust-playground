@@ -589,7 +589,7 @@ export async function provision(azure: Azure, tables: string, wait_seconds: numb
   }
   write_private(output, c.generated());
   if (infra_only) { console.log('INFRA-ONLY: Delta initialization and external-table/QAP reconciliation NOT verified.'); return; }
-  const initializer = path.join(ROOT, 'infra/azure/initialize-delta.sh');
+  const initializer = path.join(ROOT, 'projects/arrowcol-infra/scripts/initialize-delta.sh');
   if (!fs.existsSync(initializer)) throw new Failure('Delta initializer is unavailable; infra exists, full bootstrap is NOT complete.');
   const result = await runtime.run_tree(['bash', initializer], 1800, ROOT, initializer_env(values, c, tables, generation));
   if (result.returncode) throw new Failure('Delta initialization failed; KQL reconciliation was not attempted. ' + c.redact(result.stderr));

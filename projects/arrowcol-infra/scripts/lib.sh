@@ -34,8 +34,7 @@ required_secret_paths() {
   printf '%s\n' \
     "$(resolve_project_path "${SQLSERVER_SA_PASSWORD_FILE:-./secrets/sqlserver-sa-password.txt}")" \
     "$(resolve_project_path "${ARROWCOL_APP_PASSWORD_FILE:-./secrets/arrowcol-app-password.txt}")" \
-    "$(resolve_project_path "${ARROWCOL_MIGRATOR_PASSWORD_FILE:-./secrets/arrowcol-migrator-password.txt}")" \
-    "$(resolve_project_path "${HIVE_METASTORE_PASSWORD_FILE:-./secrets/hive-metastore-password.txt}")"
+    "$(resolve_project_path "${ARROWCOL_MIGRATOR_PASSWORD_FILE:-./secrets/arrowcol-migrator-password.txt}")"
 }
 
 require_runtime_configuration() {

@@ -11,7 +11,7 @@ clients put all routing fields in initial gRPC metadata:
 
 ```text
 x-arrowcol-protocol-version: 1
-x-arrowcol-implementation-pool: direct | dataflow
+x-arrowcol-implementation-pool: dataflow
 x-arrowcol-catalog: telemetry
 x-arrowcol-schema: prod
 x-arrowcol-table: traces
@@ -34,6 +34,8 @@ batch channels live in the selected backend.
 
 ## Routing ownership
 
+`SqlServerRoutingStore` stores only routing registrations, pressure, and fenced
+leases in the V0008 `routing_*` tables. It is not a receipt or catalog store.
 `arrowcol-routing` loads collector registrations, rich pressure snapshots, and
 fenced leases into an immutable cache. A valid cached lease performs no SQL.
 Missing/expired leases use serializable SQL compare-and-set. Router replicas
@@ -56,7 +58,7 @@ Flight service RPCs other than `DoPut` require:
 
 ```text
 x-arrowcol-control-operation: catalog_read | catalog_write | new_table
-x-arrowcol-implementation-pool: direct | dataflow
+x-arrowcol-implementation-pool: dataflow
 ```
 
 They route through deterministic cached selection to a fresh, healthy,
@@ -102,15 +104,8 @@ Public operational APIs:
 - `GET /v1/capabilities`
 - `GET /metrics`
 
-Authenticated receipt APIs backed by `arrowcol-receipts`:
-
-- `GET /v1/receipts/{receipt_uuid}`
-- `GET /v1/receipts?ids=<uuid>,<uuid>,...`
-
-The batch size is strictly bounded by `receipts.max_batch_size`. Responses carry
-structured protocol errors. `purge_allowed` is `true` only for a durable
-`published` receipt; accepted, buffered, publishing, failed, and uncertain
-receipts are never advertised as purgeable.
+Receipt lookup and status endpoints have been retired. A DFE durable-buffer
+acknowledgement indicates durable payload storage, not completed Delta publication.
 
 ## Configuration
 
@@ -153,7 +148,7 @@ The secrets directory is ignored by Git.
 
 ## Metrics
 
-Metrics deliberately have no receipt-ID or table-ID labels:
+Metrics deliberately have no table-ID labels and expose only the `dataflow` pool:
 
 - `arrowcol_router_decisions_total`
 - `arrowcol_router_failures_total`
@@ -179,7 +174,7 @@ npx nx run arrowcol-router-rust:pingora-integration
 # Verified spike regression: routing, trailers, connection reuse, drain, and RSS.
 npx nx run arrowcol-router-rust:rss-regression
 
-# Starts SQL/Hive infrastructure, exercises live multi-router SQL races, and
+# Starts SQL routing infrastructure, exercises live multi-router SQL races, and
 # stops the Compose project in a trap.
 npx nx run arrowcol-router-rust:live-integration
 ```

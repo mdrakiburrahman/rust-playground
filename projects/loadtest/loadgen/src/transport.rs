@@ -190,9 +190,6 @@ impl FlightTransport {
             };
             match PutResultMetadata::from_put_result(&result)? {
                 PutResultMetadata::Progress { .. } => {}
-                PutResultMetadata::Receipt { .. } => {
-                    bail!("router returned the retired durable-receipt response")
-                }
                 PutResultMetadata::BestEffortAdmission { delivery_guarantee, .. } => {
                     if pool != ImplementationPool::Dataflow
                         || delivery_guarantee != DeliveryGuarantee::BestEffort

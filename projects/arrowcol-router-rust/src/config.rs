@@ -24,7 +24,7 @@ pub struct Cli {
 pub struct RouterConfig {
     /// Listener and process lifecycle settings.
     pub server: ServerConfig,
-    /// SQL Server application database.
+    /// SQL Server database for routing registrations, pressure, and fenced leases.
     pub sql_server: SqlServerConfig,
     /// Routing and pressure policy.
     pub routing: RoutingConfig,

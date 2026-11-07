@@ -8,7 +8,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
 use arrow_schema::SchemaRef;
-use arrowcol_catalog::{CatalogStore, SchemaVersion, SqlServerCatalogStore, SqlServerConfig};
+use arrowcol_catalog::SchemaVersion;
+use arrowcol_catalog_client::{CatalogClient, RemoteCatalogClient};
 use arrowcol_protocol::{CatalogName, SchemaName, TableIdentity, TableName};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -75,16 +76,7 @@ pub async fn prepare_tables(
     fs::create_dir_all(&artifact_root)?;
     fs::create_dir_all(&generated_root)?;
 
-    let sql_config = SqlServerConfig::with_password_file(
-        &arguments.sql_host,
-        arguments.sql_port,
-        &arguments.sql_database,
-        &arguments.sql_username,
-        &arguments.sql_password_file,
-    )?
-    .trust_server_certificate(true)
-    .with_timeouts(arguments.request_timeout.get(), arguments.request_timeout.get());
-    let store = SqlServerCatalogStore::new(sql_config);
+    let store = RemoteCatalogClient::connect(&arguments.catalog_endpoint, Duration::from_secs(10)).await?;
 
     let mut tables = Vec::new();
     for statement in schema_statements()? {
@@ -99,25 +91,18 @@ pub async fn prepare_tables(
             bail!("Flight SQL completion identity disagrees with {}", statement.identity);
         }
         let version = completion.schema_version();
-        let current = store
-            .current_schema(&statement.identity)
-            .await?
-            .with_context(|| format!("catalog head missing after registration for {}", statement.identity))?;
-        if current.version() != version || current.fingerprint() != completion.schema_fingerprint() {
-            bail!(
-                "catalog head disagrees with Flight SQL completion for {}",
-                statement.identity
-            );
+        let current = store.table(&statement.identity).await?;
+        let head = current.versions.last()
+            .with_context(|| format!("catalog history missing after registration for {}", statement.identity))?;
+        if head.version() != version || head.fingerprint() != completion.schema_fingerprint() {
+            bail!("catalog head disagrees with Flight SQL completion for {}", statement.identity);
         }
-        let artifacts = store
-            .artifacts(&statement.identity, version)
-            .await?
-            .with_context(|| format!("catalog artifacts missing for {}", statement.identity))?;
+        let artifacts = current.snapshot;
         let table_artifacts = artifact_root.join(statement.identity.table().as_str());
         replace_directory(&table_artifacts)?;
-        fs::write(table_artifacts.join("manifest.json"), artifacts.manifest())?;
-        fs::write(table_artifacts.join("schema.arrow"), artifacts.arrow_schema())?;
-        fs::write(table_artifacts.join("descriptor.pb"), artifacts.protobuf_descriptor())?;
+        fs::write(table_artifacts.join("manifest.json"), artifacts.manifest)?;
+        fs::write(table_artifacts.join("schema.arrow"), artifacts.arrow_schema_ipc)?;
+        fs::write(table_artifacts.join("descriptor.pb"), artifacts.protobuf_descriptor)?;
 
         let table_generated = generated_root.join(statement.identity.table().as_str());
         invoke_generator(

@@ -129,12 +129,12 @@ pub struct ReleaseReport {
     pub checked_at_unix_ms: u64,
     /// The publishers bound from the run's routing evidence.
     pub publishers: Vec<RoutedCollector>,
-    /// Post-drain routing state read from SQL.
+    /// Post-drain routing state read from the routing store.
     pub routing: Option<RoutingState>,
     pub errors: Vec<String>,
 }
 
-/// Reads this run's drain receipts and the actual post-drain SQL state, then writes the proof.
+/// Reads this run's drain evidence and post-drain routing state, then writes the proof.
 ///
 /// # Errors
 ///
@@ -264,6 +264,13 @@ pub fn routing_state(view: &RoutingView) -> RoutingState {
             })
             .collect(),
     }
+}
+
+fn canonical_id(value: &str) -> Result<String> {
+    Ok(Uuid::parse_str(value)
+        .with_context(|| format!("malformed collector instance identity {value:?}"))?
+        .hyphenated()
+        .to_string())
 }
 
 fn canonical_routing(mut state: RoutingState) -> Result<RoutingState> {

@@ -2,9 +2,8 @@ use std::{collections::BTreeSet, error::Error};
 
 use arrowcol_protocol::{
     AuthContext, AuthMethod, AuthenticatedPrincipal, CatalogName, CollectorInstanceId, CollectorInstanceStatus,
-    ErrorCode, ErrorStatus, FencingToken, ImplementationPool, InstanceLifecycleState, LeaseId, Measurement,
-    PositiveMeasurement, PrincipalId, PrincipalIssuer, PrincipalScope, ReceiptId, ReceiptState, ReceiptStatus,
-    ReceiptTransitionError, SchemaFingerprint, SchemaName, TableIdentity, TableLease, TableLeaseSuccessorError,
+    ErrorCode, ErrorStatus, FencingToken, ImplementationPool, InstanceLifecycleState, LeaseId, PositiveMeasurement,
+    PrincipalId, PrincipalIssuer, PrincipalScope, SchemaName, TableIdentity, TableLease, TableLeaseSuccessorError,
     TableName, UnixMillis,
 };
 
@@ -25,82 +24,12 @@ fn lease_id() -> Result<LeaseId, Box<dyn Error>> {
 }
 
 #[test]
-fn receipt_transitions_require_state_specific_payloads() -> Result<(), Box<dyn Error>> {
-    let receipt_id: ReceiptId = "33333333-3333-4333-8333-333333333333".parse()?;
-    let accepted = ReceiptStatus::accepted(receipt_id, table()?, ImplementationPool::Direct, UnixMillis::new(100)?);
-    let buffered = accepted.transition_to(ReceiptState::Buffered, UnixMillis::new(110)?, None, None)?;
-    let publishing = buffered.transition_to(ReceiptState::Publishing, UnixMillis::new(120)?, None, None)?;
-
-    let lease = TableLease::new(
-        lease_id()?,
-        table()?,
-        instance_id()?,
-        ImplementationPool::Direct,
-        FencingToken::new(42)?,
-        UnixMillis::new(90)?,
-        UnixMillis::new(200)?,
-    )?;
-    let publication = arrowcol_protocol::DeltaPublicationResult::new(
-        Measurement::new(7)?,
-        Measurement::new(2)?,
-        Measurement::new(1_000)?,
-        Measurement::new(65_536)?,
-        SchemaFingerprint::from_bytes([7; 32]),
-        UnixMillis::new(130)?,
-        lease.publication_fence(),
-    );
-    let published =
-        publishing.transition_to(ReceiptState::Published, UnixMillis::new(130)?, Some(publication), None)?;
-    assert_eq!(published.state(), ReceiptState::Published);
-    assert_eq!(published.revision().get(), 3);
-    assert!(published.publication().is_some());
-
-    assert!(matches!(
-        accepted.transition_to(ReceiptState::Published, UnixMillis::new(120)?, None, None),
-        Err(ReceiptTransitionError::Invalid { .. })
-    ));
-    Ok(())
-}
-
-#[test]
-fn uncertain_publication_requires_reconciliation_code() -> Result<(), Box<dyn Error>> {
-    let accepted = ReceiptStatus::accepted(
-        ReceiptId::new(),
-        table()?,
-        ImplementationPool::Dataflow,
-        UnixMillis::new(100)?,
-    );
-    let publishing = accepted.transition_to(ReceiptState::Publishing, UnixMillis::new(101)?, None, None)?;
-    let unknown = ErrorStatus::new(
-        ErrorCode::PublicationOutcomeUnknown,
-        "commit response was lost; reconcile the Delta log",
-    )?
-    .with_receipt_id(publishing.receipt_id());
-    let status = publishing.transition_to(
-        ReceiptState::PublicationUnknown,
-        UnixMillis::new(102)?,
-        None,
-        Some(unknown),
-    )?;
-    assert_eq!(status.state(), ReceiptState::PublicationUnknown);
-    assert!(!status.error().ok_or("missing error")?.is_retryable());
-    Ok(())
-}
-
-#[test]
-fn duplicate_deliveries_receive_distinct_server_receipts() {
-    let first = ReceiptId::new();
-    let second = ReceiptId::new();
-    assert_ne!(first, second);
-}
-
-#[test]
 fn lease_renewal_and_replacement_enforce_fencing() -> Result<(), Box<dyn Error>> {
     let original = TableLease::new(
         lease_id()?,
         table()?,
         instance_id()?,
-        ImplementationPool::Direct,
+        ImplementationPool::Dataflow,
         FencingToken::new(8)?,
         UnixMillis::new(100)?,
         UnixMillis::new(200)?,
@@ -109,7 +38,7 @@ fn lease_renewal_and_replacement_enforce_fencing() -> Result<(), Box<dyn Error>>
         original.lease_id(),
         table()?,
         original.holder_instance_id(),
-        ImplementationPool::Direct,
+        ImplementationPool::Dataflow,
         original.fencing_token(),
         UnixMillis::new(150)?,
         UnixMillis::new(300)?,
@@ -136,7 +65,7 @@ fn lease_renewal_and_replacement_enforce_fencing() -> Result<(), Box<dyn Error>>
 fn lifecycle_and_auth_context_validate_transitions_and_expiry() -> Result<(), Box<dyn Error>> {
     let starting = CollectorInstanceStatus::new(
         instance_id()?,
-        ImplementationPool::Direct,
+        ImplementationPool::Dataflow,
         InstanceLifecycleState::Starting,
         UnixMillis::new(10)?,
         None,
@@ -149,10 +78,7 @@ fn lifecycle_and_auth_context_validate_transitions_and_expiry() -> Result<(), Bo
     )?;
     assert_eq!(draining.state(), InstanceLifecycleState::Draining);
 
-    let scopes = BTreeSet::from([
-        PrincipalScope::new("arrow.write")?,
-        PrincipalScope::new("receipt.read")?,
-    ]);
+    let scopes = BTreeSet::from([PrincipalScope::new("arrow.write")?]);
     let principal = AuthenticatedPrincipal::new(
         PrincipalId::new("client-1")?,
         PrincipalIssuer::new("https://identity.example.test")?,
@@ -176,7 +102,7 @@ fn retryability_is_explicit_and_does_not_imply_idempotency() -> Result<(), Box<d
     assert!(retryable.is_retryable());
     assert_eq!(retryable.retry_after_ms().map(PositiveMeasurement::get), Some(250));
 
-    let uncertain = ErrorStatus::new(ErrorCode::PublicationOutcomeUnknown, "reconcile receipt")?;
+    let uncertain = ErrorStatus::new(ErrorCode::PublicationOutcomeUnknown, "reconcile the Delta log")?;
     assert!(!uncertain.is_retryable());
     assert!(uncertain.with_retry_after(PositiveMeasurement::new(250)?).is_err());
     Ok(())

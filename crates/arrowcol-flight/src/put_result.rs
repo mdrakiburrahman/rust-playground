@@ -1,6 +1,6 @@
 use arrow_flight::PutResult;
 use arrowcol_catalog::SchemaVersion;
-use arrowcol_protocol::{ProtocolVersion, ReceiptId, SchemaFingerprint};
+use arrowcol_protocol::{ProtocolVersion, SchemaFingerprint};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
@@ -13,27 +13,23 @@ pub const PUT_RESULT_WIRE_VERSION: u32 = 1;
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryGuarantee {
-    /// A durable receipt was created and can be queried.
-    DurableReceipt,
     /// Every batch was persisted to local durable storage before completion;
-    /// the collector owns delivery from there, but no receipt can be queried.
+    /// the collector owns delivery from there without a client-queryable delivery receipt.
     DurableAdmission,
-    /// The runtime admitted the batches without promising a durable receipt.
+    /// The runtime admitted the batches without promising durable buffering.
     BestEffort,
 }
 
-/// Completion mode selected by a direct or dataflow admission implementation.
+/// Completion mode selected by a dataflow admission implementation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompletionMode {
-    /// Direct mode created a server-generated durable receipt.
-    DurableReceipt(ReceiptId),
     /// Dataflow mode admitted the stream on a clearly labeled best-effort basis.
     BestEffortAdmission,
     /// Dataflow mode persisted every batch to a local durable buffer before
     /// completing the stream.
     DurableAdmission,
-    /// The implementation emitted one or more durable receipt results while
-    /// incrementally admitting batches, so no synthetic final result is added.
+    /// The implementation emitted per-batch progress acknowledgements, so no
+    /// synthetic final result is added.
     ResultsAlreadyEmitted,
 }
 
@@ -44,14 +40,6 @@ pub struct StreamCompletion {
 }
 
 impl StreamCompletion {
-    /// Creates a durable-receipt completion.
-    #[must_use]
-    pub const fn receipt(receipt_id: ReceiptId) -> Self {
-        Self {
-            mode: CompletionMode::DurableReceipt(receipt_id),
-        }
-    }
-
     /// Creates a clearly labeled best-effort dataflow completion.
     #[must_use]
     pub const fn best_effort() -> Self {
@@ -69,7 +57,7 @@ impl StreamCompletion {
         }
     }
 
-    /// Completes a stream whose per-batch receipt results were already emitted.
+    /// Completes a stream whose per-batch progress acknowledgements were already emitted.
     #[must_use]
     pub const fn results_already_emitted() -> Self {
         Self {
@@ -85,10 +73,6 @@ impl StreamCompletion {
 }
 
 /// Stable application metadata carried by an Arrow Flight [`PutResult`].
-///
-/// Receipt completions keep `receipt_id` at the top level so the generated Rust
-/// and TypeScript SDKs can parse this richer JSON with their existing
-/// `parse_receipt_id` helpers.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PutResultMetadata {
@@ -106,25 +90,6 @@ pub enum PutResultMetadata {
         rows: u64,
         /// Approximate Arrow array bytes admitted so far.
         bytes: u64,
-    },
-    /// Durable direct-mode completion.
-    Receipt {
-        /// Stable application-metadata wire version.
-        wire_version: u32,
-        /// Arrowcol protocol version.
-        protocol_version: ProtocolVersion,
-        /// Server-generated durable receipt.
-        receipt_id: ReceiptId,
-        /// Explicit delivery guarantee.
-        delivery_guarantee: DeliveryGuarantee,
-        /// Registered schema version sent by the client.
-        source_schema_version: SchemaVersion,
-        /// Current authoritative target schema version.
-        target_schema_version: SchemaVersion,
-        /// Fingerprint computed from the received Arrow schema.
-        schema_fingerprint: SchemaFingerprint,
-        /// Final admitted stream summary.
-        summary: StreamSummary,
     },
     /// Best-effort dataflow completion.
     BestEffortAdmission {
@@ -144,7 +109,7 @@ pub enum PutResultMetadata {
         summary: StreamSummary,
     },
     /// Dataflow completion after every batch was persisted to a local durable
-    /// buffer. There is no receipt to poll.
+    /// buffer; the client receives no queryable delivery receipt.
     DurableAdmission {
         /// Stable application-metadata wire version.
         wire_version: u32,
@@ -187,16 +152,6 @@ impl PutResultMetadata {
         summary: StreamSummary,
     ) -> Option<Self> {
         match completion.mode {
-            CompletionMode::DurableReceipt(receipt_id) => Some(Self::Receipt {
-                wire_version: PUT_RESULT_WIRE_VERSION,
-                protocol_version: ProtocolVersion::CURRENT,
-                receipt_id,
-                delivery_guarantee: DeliveryGuarantee::DurableReceipt,
-                source_schema_version,
-                target_schema_version,
-                schema_fingerprint,
-                summary,
-            }),
             CompletionMode::BestEffortAdmission => Some(Self::BestEffortAdmission {
                 wire_version: PUT_RESULT_WIRE_VERSION,
                 protocol_version: ProtocolVersion::CURRENT,
@@ -252,15 +207,6 @@ impl PutResultMetadata {
         }
         let valid = match &metadata {
             Self::Progress { .. } => true,
-            Self::Receipt {
-                delivery_guarantee,
-                source_schema_version,
-                target_schema_version,
-                ..
-            } => {
-                *delivery_guarantee == DeliveryGuarantee::DurableReceipt
-                    && source_schema_version <= target_schema_version
-            }
             Self::BestEffortAdmission {
                 delivery_guarantee,
                 source_schema_version,
@@ -312,18 +258,8 @@ impl PutResultMetadata {
     pub const fn wire_version(&self) -> u32 {
         match self {
             Self::Progress { wire_version, .. }
-            | Self::Receipt { wire_version, .. }
             | Self::BestEffortAdmission { wire_version, .. }
             | Self::DurableAdmission { wire_version, .. } => *wire_version,
-        }
-    }
-
-    /// Returns a durable receipt identifier when this is a direct completion.
-    #[must_use]
-    pub const fn receipt_id(&self) -> Option<ReceiptId> {
-        match self {
-            Self::Receipt { receipt_id, .. } => Some(*receipt_id),
-            Self::Progress { .. } | Self::BestEffortAdmission { .. } | Self::DurableAdmission { .. } => None,
         }
     }
 
@@ -332,8 +268,7 @@ impl PutResultMetadata {
     pub const fn delivery_guarantee(&self) -> Option<DeliveryGuarantee> {
         match self {
             Self::Progress { .. } => None,
-            Self::Receipt { delivery_guarantee, .. }
-            | Self::BestEffortAdmission { delivery_guarantee, .. }
+            Self::BestEffortAdmission { delivery_guarantee, .. }
             | Self::DurableAdmission { delivery_guarantee, .. } => Some(*delivery_guarantee),
         }
     }
@@ -349,10 +284,10 @@ mod tests {
     use crate::StreamSummary;
 
     /// Scenario: A dataflow stream completes after durable-buffer persistence.
-    /// Guarantees: The final PutResult is labeled `durable_admission`, carries no
-    /// receipt, and survives an encode/decode round trip.
+    /// Guarantees: The final PutResult is labeled `durable_admission` and survives
+    /// an encode/decode round trip.
     #[test]
-    fn durable_admission_round_trips_without_receipt() -> Result<(), Box<dyn std::error::Error>> {
+    fn durable_admission_round_trips() -> Result<(), Box<dyn std::error::Error>> {
         let fingerprint: SchemaFingerprint = fingerprint_schema(&Schema::empty());
         let metadata = PutResultMetadata::completion(
             StreamCompletion::durable_admission(),
@@ -371,7 +306,6 @@ mod tests {
         let decoded = PutResultMetadata::decode(&encoded)?;
         assert_eq!(decoded, metadata);
         assert_eq!(decoded.delivery_guarantee(), Some(DeliveryGuarantee::DurableAdmission));
-        assert_eq!(decoded.receipt_id(), None);
         Ok(())
     }
 
@@ -396,7 +330,7 @@ mod tests {
     }
 
     #[test]
-    fn already_emitted_receipts_do_not_create_a_synthetic_result() {
+    fn already_emitted_progress_does_not_create_a_synthetic_result() {
         let fingerprint: SchemaFingerprint = fingerprint_schema(&Schema::empty());
         let metadata = PutResultMetadata::completion(
             StreamCompletion::results_already_emitted(),

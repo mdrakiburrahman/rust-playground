@@ -121,8 +121,6 @@ impl fmt::Display for TableIdentity {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImplementationPool {
-    /// The native direct Arrow-to-Delta collector.
-    Direct,
     /// The collector implemented with the OTAP dataflow engine.
     Dataflow,
 }
@@ -130,7 +128,6 @@ pub enum ImplementationPool {
 impl fmt::Display for ImplementationPool {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::Direct => "direct",
             Self::Dataflow => "dataflow",
         })
     }
@@ -141,7 +138,6 @@ impl FromStr for ImplementationPool {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
-            "direct" => Ok(Self::Direct),
             "dataflow" => Ok(Self::Dataflow),
             unsupported => Err(PoolParseError(unsupported.to_owned())),
         }

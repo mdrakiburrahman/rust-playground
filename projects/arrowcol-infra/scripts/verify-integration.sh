@@ -44,19 +44,13 @@ verify_sql_objects() {
 }
 
 assert_healthy sqlserver
-assert_healthy hive-metastore
-compose exec -T hive-metastore /usr/local/bin/hive-healthcheck
 verify_sql_objects
-compose run --rm --no-deps hive-schema schema-verify
 
 echo "Re-running every initialization path to prove idempotency"
 compose run --rm --no-deps database-bootstrap
 compose run --rm --no-deps arrowcol-migrate
-compose run --rm --no-deps hive-schema schema-init
 
 assert_healthy sqlserver
-assert_healthy hive-metastore
 verify_sql_objects
-compose run --rm --no-deps hive-schema schema-verify
 
-echo "Arrowcol SQL Server + Hive Metastore integration verification passed"
+echo "Arrowcol routing SQL Server integration verification passed"
