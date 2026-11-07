@@ -254,29 +254,6 @@ impl SagaRecord {
         }
     }
 
-    pub(crate) fn from_persisted(persisted: PersistedSagaRecord) -> Self {
-        Self {
-            id: persisted.id,
-            request_hash: persisted.request_hash,
-            from_schema: persisted.from_schema,
-            target_schema: persisted.target_schema,
-            state: persisted.state,
-            step: persisted.step,
-            attempt_count: persisted.attempt_count,
-            last_error: persisted.last_error,
-        }
-    }
-}
-
-pub(crate) struct PersistedSagaRecord {
-    pub(crate) id: SagaId,
-    pub(crate) request_hash: RequestHash,
-    pub(crate) from_schema: Option<CatalogSchemaVersion>,
-    pub(crate) target_schema: CatalogSchemaVersion,
-    pub(crate) state: SagaState,
-    pub(crate) step: SagaStep,
-    pub(crate) attempt_count: u32,
-    pub(crate) last_error: Option<CatalogError>,
 }
 
 /// New schema change to reserve atomically.

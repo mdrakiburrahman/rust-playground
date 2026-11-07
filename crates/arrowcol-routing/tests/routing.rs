@@ -39,7 +39,7 @@ fn table() -> TableIdentity {
 fn metadata() -> IngestMetadata {
     IngestMetadata::new(
         ProtocolVersion::CURRENT,
-        ImplementationPool::Direct,
+        ImplementationPool::Dataflow,
         table(),
         ClaimedSchemaFingerprint::new(SchemaFingerprint::from_bytes([7; 32])),
     )
@@ -49,7 +49,7 @@ fn registration(instance_id: CollectorInstanceId, port: u16, started_at: u64) ->
     CollectorRegistration {
         instance_id,
         instance_key: format!("collector-{port}"),
-        implementation_pool: ImplementationPool::Direct,
+        implementation_pool: ImplementationPool::Dataflow,
         flight_endpoint: format!("127.0.0.1:{port}")
             .parse()
             .unwrap_or_else(|error| panic!("invalid endpoint: {error}")),
@@ -250,7 +250,7 @@ async fn two_router_replicas_converge_on_one_sql_winner() {
 #[tokio::test]
 async fn valid_lease_winner_does_not_depend_on_a_losing_candidate() {
     let (store, first, second) = seeded_store().await;
-    let key = LeaseKey::new(ImplementationPool::Direct, table());
+    let key = LeaseKey::new(ImplementationPool::Dataflow, table());
     let winner = store
         .claim_lease(&LeaseClaim {
             key: key.clone(),
@@ -610,7 +610,7 @@ async fn weighted_rendezvous_is_deterministic_and_excludes_hard_pressure() {
         .load_view(millis(100_001))
         .await
         .unwrap_or_else(|error| panic!("load view: {error}"));
-    let key = LeaseKey::new(ImplementationPool::Direct, table());
+    let key = LeaseKey::new(ImplementationPool::Dataflow, table());
     let left = rank_collectors(&view, &key, millis(100_001), &RoutingPolicy::default(), false);
     let right = rank_collectors(&view, &key, millis(100_001), &RoutingPolicy::default(), false);
     assert_eq!(left, right);
@@ -701,7 +701,7 @@ impl CrashedHolder {
         .await;
         let lease = store
             .claim_lease(&LeaseClaim {
-                key: LeaseKey::new(ImplementationPool::Direct, table()),
+                key: LeaseKey::new(ImplementationPool::Dataflow, table()),
                 candidate_instance_id: crashed,
                 now_unix_ms: millis(100_001),
                 expires_at_unix_ms: millis(100_001 + lease_ttl_ms),
@@ -1190,7 +1190,7 @@ async fn rebalance_never_moves_crashed_lease_to_different_key_without_drain_proo
         .unwrap_or_else(|error| panic!("load view: {error}"));
     let lease = view
         .leases
-        .get(&LeaseKey::new(ImplementationPool::Direct, table()))
+        .get(&LeaseKey::new(ImplementationPool::Dataflow, table()))
         .unwrap_or_else(|| panic!("crashed holder lease disappeared"));
     assert_eq!(lease.holder_instance_id, crashed);
     assert_eq!(lease.state, LeaseState::Draining);

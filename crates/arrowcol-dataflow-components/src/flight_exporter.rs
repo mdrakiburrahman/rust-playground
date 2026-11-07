@@ -308,7 +308,6 @@ mod tests {
     use arrow_array::{ArrayRef, Int64Array, StringArray};
     use arrowcol_catalog::{
         CatalogControlPlane, CatalogStore, DdlParser, FlightSqlDdlHandler, FlightSqlDdlRequest, MemoryCatalogStore,
-        MemoryMetastore,
     };
     use arrowcol_flight::{ArrowColFlightService, BatchAdmission};
     use arrowcol_protocol::{CollectorInstanceId, FencingToken, LeaseId, ReceiptId};
@@ -336,7 +335,6 @@ mod tests {
         let control = Arc::new(CatalogControlPlane::new(
             DdlParser::default(),
             Arc::clone(&catalog) as Arc<dyn CatalogStore>,
-            Arc::new(MemoryMetastore::new()),
         ));
         let routing = Arc::new(MemoryRoutingStore::default());
         let instance_id = CollectorInstanceId::new();
@@ -386,7 +384,6 @@ mod tests {
         let control = CatalogControlPlane::new(
             DdlParser::default(),
             Arc::clone(&catalog) as Arc<dyn CatalogStore>,
-            Arc::new(MemoryMetastore::new()),
         );
         let completion = control.execute_ddl(FlightSqlDdlRequest::new(ddl)).await?;
         let current = catalog
