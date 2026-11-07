@@ -8,6 +8,7 @@ description = "Bounded Azure QAP seed-scale fixture and physical Delta oracle"
 publish = false
 
 [dependencies]
+async-trait = "0.1"
 anyhow.workspace = true
 arrow = { version = "58.3", default-features = false }
 arrow-deltalake = { path = "../../crates/arrow-deltalake" }
