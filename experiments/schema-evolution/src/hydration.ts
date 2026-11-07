@@ -10,8 +10,8 @@ export interface Counts {
 }
 export interface Observation {
   elapsedMs: number;
+  columns: string[];
   counts?: Counts[];
-  error?: string;
 }
 export interface PollOptions {
   deadline: number;
@@ -57,8 +57,9 @@ export function complete(counts: Counts[], rows: number): boolean {
     counts.some(c => c.client === 'new' && c.phase === 'after' && c.total === rows && c.empty === 0 && c.filled === rows);
 }
 
-function schemaNotVisible(error: unknown): error is Error {
-  return error instanceof Error && /(?:Failed to resolve|does not refer to any known).*\bbar\b/i.test(error.message);
+export function schemaQuery(table: string): string {
+  identifier(table);
+  return `external_table('${table}') | getschema | project ColumnName`;
 }
 
 export async function observeHydration(kusto: Pick<Kusto, 'query'>, table: string, options: PollOptions): Promise<Counts[]> {
@@ -72,15 +73,20 @@ export async function observeHydration(kusto: Pick<Kusto, 'query'>, table: strin
   let last: Observation | undefined;
   while (now() < options.deadline) {
     options.signal.throwIfAborted();
-    try {
+    const schema = await kusto.query(schemaQuery(table), options.signal);
+    if (schema.some(row => row.length !== 1 || typeof row[0] !== 'string') ||
+        new Set(schema.map(row => row[0])).size !== schema.length)
+      throw new Error('Malformed or duplicate Kusto schema columns.');
+    const columns = schema.map(row => String(row[0]));
+    if (columns.includes('bar')) {
       const counts = parseCounts(await kusto.query(countQuery(table), options.signal));
       options.signal.throwIfAborted();
-      last = { elapsedMs: now() - start, counts };
+      last = { elapsedMs: now() - start, columns, counts };
       options.record(last);
       if (now() < options.deadline && complete(counts, options.rowsPerPhase)) return counts;
-    } catch (error) {
-      if (!schemaNotVisible(error)) throw error;
-      last = { elapsedMs: now() - start, error: error.message };
+    } else {
+      options.signal.throwIfAborted();
+      last = { elapsedMs: now() - start, columns };
       options.record(last);
     }
     const remaining = options.deadline - now();
