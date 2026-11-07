@@ -319,7 +319,7 @@ resource readLogStorage 'Microsoft.Storage/storageAccounts@2023-05-01' = if (!em
 
 resource operatorReadExport 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(readLogStorageAccountName)) {
   name: guid(readLogStorage!.id, operatorObjectId, 'read-log-reader')
-  scope: readLogStorage!
+  scope: readLogStorage
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1')
     principalId: operatorObjectId
@@ -329,9 +329,20 @@ resource operatorReadExport 'Microsoft.Authorization/roleAssignments@2022-04-01'
 
 resource runtimeReadExport 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(readLogStorageAccountName)) {
   name: guid(readLogStorage!.id, identity.id, 'runtime-read-log-reader')
-  scope: readLogStorage!
+  scope: readLogStorage
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1')
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+// QAP validates sink readiness through ARM before reading the exported blobs.
+resource runtimeReadExportReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(readLogStorageAccountName)) {
+  name: guid(readLogStorage!.id, identity.id, 'runtime-read-log-arm-reader')
+  scope: readLogStorage
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'acdd72a7-3385-48ef-bd42-f606fba81ae7')
     principalId: identity.properties.principalId
     principalType: 'ServicePrincipal'
   }

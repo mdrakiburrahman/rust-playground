@@ -987,9 +987,23 @@ test('Bicep adds experiment container, database, workspace and StorageRead diagn
     ['storage', 'readLogStorage']);
   assert.match(section('readLogStorage'), /if \(!empty\(readLogStorageAccountName\)\)[\s\S]*name: readLogStorageAccountName[\s\S]*tags: ownership/);
   assert.match(section('readLogStorage'), /allowSharedKeyAccess: false/);
-  for (const name of ['operatorReadExport', 'runtimeReadExport']) {
-    assert.match(section(name), /scope: readLogStorage![\s\S]*2a2b9908-6ea1-4ae2-8e65-a410df84e7d1/);
-    assert.doesNotMatch(section(name), /ba92f5b4/);
+  const sinkRoles = [
+    ['operatorReadExport', 'operatorObjectId', 'read-log-reader', '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'],
+    ['runtimeReadExport', 'identity.id', 'runtime-read-log-reader', '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'],
+    ['runtimeReadExportReader', 'identity.id', 'runtime-read-log-arm-reader', 'acdd72a7-3385-48ef-bd42-f606fba81ae7'],
+  ];
+  assert.deepEqual([...source.matchAll(/resource (\w+) 'Microsoft\.Authorization\/roleAssignments@/g)]
+    .map(match => match[1]).filter(name => /scope: readLogStorage(?:!|\n)/.test(section(name))),
+  sinkRoles.map(([name]) => name));
+  for (const [name, principal, seed, role] of sinkRoles) {
+    const assignment = section(name);
+    assert.match(assignment, /if \(!empty\(readLogStorageAccountName\)\)/);
+    assert.ok(assignment.includes(`name: guid(readLogStorage!.id, ${principal}, '${seed}')`));
+    assert.match(assignment, /scope: readLogStorage\n/);
+    assert.deepEqual([...assignment.matchAll(/roleDefinitionId: subscriptionResourceId\('Microsoft.Authorization\/roleDefinitions', '([^']+)'\)/g)]
+      .map(match => match[1]), [role]);
+    assert.ok(assignment.includes(`principalId: ${principal === 'identity.id' ? 'identity.properties.principalId' : principal}\n`));
+    if (principal === 'identity.id') assert.match(assignment, /principalType: 'ServicePrincipal'/);
   }
   assert.match(section('readExperiment'), /scope: experiment\n/);
   assert.match(section('readExperiment'), /2a2b9908-6ea1-4ae2-8e65-a410df84e7d1[\s\S]*principalId: identity\.properties\.principalId/);
