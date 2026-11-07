@@ -18,6 +18,7 @@ var networkContributorRole = subscriptionResourceId('Microsoft.Authorization/rol
 var managedIdentityOperatorRole = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'f1a07417-d97a-45cb-824c-7a7467783830')
 var acrPullRole = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '7f951dda-4ed3-4680-a7ca-43fe172d538d')
 var acrPushRole = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '8311e382-0749-4cb8-b61a-304f252e45ec')
+var readerRole = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'acdd72a7-3385-48ef-bd42-f606fba81ae7')
 var aksClusterAdminRole = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'b1ff04bb-8a4e-4dc4-8eb5-8693973ce19b')
 
 resource nsg 'Microsoft.Network/networkSecurityGroups@2024-05-01' = {
@@ -109,6 +110,12 @@ resource registryPushRole 'Microsoft.Authorization/roleAssignments@2022-04-01' =
   name: guid(registry.id, sharedIdentity.id, 'acr-push')
   scope: registry
   properties: { roleDefinitionId: acrPushRole, principalId: sharedIdentity.properties.principalId, principalType: 'ServicePrincipal' }
+}
+
+resource registryReaderRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(registry.id, sharedIdentity.id, 'registry-reader')
+  scope: registry
+  properties: { roleDefinitionId: readerRole, principalId: sharedIdentity.properties.principalId, principalType: 'ServicePrincipal' }
 }
 
 resource aks 'Microsoft.ContainerService/managedClusters@2026-05-01' = {
