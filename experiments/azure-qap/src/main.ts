@@ -119,7 +119,7 @@ export async function main(argv: readonly string[]): Promise<number> {
     say(`Evidence and report: ${path.relative(process.cwd(), out)}`);
 
     // Preflight: everything here is read-only and comes from `npx nx run azure-infra:provision`.
-    for (const binary of ['arrowcol-experiment', 'delta-maintenance'])
+    for (const binary of ['qap-fixture', 'delta-maintenance'])
       if (!fs.existsSync(path.join(ROOT, 'target/release', binary)))
         throw new Error(`target/release/${binary} is missing; run \`npx nx run azure-qap-experiment:build\`.`);
     if (!generation) throw new Error('ARROWCOL_RESET_GENERATION is missing; run `npx nx run azure-infra:provision` first.');
