@@ -93,7 +93,13 @@ mod tests {
             "privateCanaryUser@example.invalid: schema Int16 vs UInt8"
         );
         let safe = safe_error_message(message);
-        for canary in ["CANARYSIG", "acct.dfs", "11111111-1111", "opaque-token", "privateCanary"] {
+        for canary in [
+            "CANARYSIG",
+            "acct.dfs",
+            "11111111-1111",
+            "opaque-token",
+            "privateCanary",
+        ] {
             assert!(!safe.contains(canary), "{canary} leaked: {safe}");
         }
         assert!(safe.contains("Partial query failure"));

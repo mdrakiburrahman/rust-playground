@@ -14,8 +14,8 @@ use tokio::fs;
 use crate::{
     cli::ValidateArgs,
     manifest::{
-        AckOutcome, CAPABILITY_EVIDENCE_FILE, RECEIPT_MANIFEST_FILE, ROUTING_EVIDENCE_FILE, ReceiptManifestEntry,
-        SCHEMA_CONTRACT_FILE, SEND_MANIFEST_FILE, SchemaContract, SendManifestEntry, VALIDATION_FILE,
+        AckOutcome, CAPABILITY_EVIDENCE_FILE, ROUTING_EVIDENCE_FILE, SCHEMA_CONTRACT_FILE, SEND_MANIFEST_FILE,
+        SchemaContract, SendManifestEntry, VALIDATION_FILE,
     },
 };
 
@@ -49,9 +49,8 @@ const MAX_VALIDATE_BUDGET: Duration = Duration::from_secs(24 * 60 * 60);
 enum ValidatePhase {
     Deadline,
     Inputs,
-    DrainReceipts,
+    DrainPublication,
     SettleDataflow,
-    SnapshotDirect,
     SnapshotDataflow,
     Kusto,
 }
@@ -148,7 +147,7 @@ impl Budget {
     }
 }
 
-fn check_drain_receipts(metadata: &Value, publication: &Value, mutators: &Value) -> Result<()> {
+fn check_drain_evidence(metadata: &Value, publication: &Value, mutators: &Value) -> Result<()> {
     let run_id = metadata["run_id"].as_str().context("missing validation run identity")?;
     anyhow::ensure!(
         publication["run_id"].as_str() == Some(run_id)
@@ -161,7 +160,7 @@ fn check_drain_receipts(metadata: &Value, publication: &Value, mutators: &Value)
         .as_array()
         .context("missing clean mutator identities")?;
     anyhow::ensure!(
-        ["direct-1", "dataflow-1"]
+        ["dataflow-1"]
             .iter()
             .all(|required| services.iter().any(|service| service.as_str() == Some(*required))),
         "both source collectors must have clean stopped evidence"
@@ -169,8 +168,8 @@ fn check_drain_receipts(metadata: &Value, publication: &Value, mutators: &Value)
     Ok(())
 }
 
-/// Independently validates manifests, direct/dataflow Delta snapshots, routing,
-/// delivery guarantees, and paired logical parity.
+/// Independently validates Dataflow manifests and Delta snapshots, routing,
+/// delivery guarantees, and Kusto visibility.
 ///
 /// # Errors
 ///
@@ -184,14 +183,13 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
         .within(ValidatePhase::Inputs, async {
             Ok::<_, anyhow::Error>((
                 read_json_lines::<SendManifestEntry>(&arguments.results.join(SEND_MANIFEST_FILE)).await?,
-                read_json_lines::<ReceiptManifestEntry>(&arguments.results.join(RECEIPT_MANIFEST_FILE)).await?,
                 read_json::<Vec<SchemaContract>>(&arguments.results.join(SCHEMA_CONTRACT_FILE)).await?,
                 read_json::<RoutingEvidence>(&arguments.results.join(ROUTING_EVIDENCE_FILE)).await?,
                 read_json::<Value>(&arguments.results.join(CAPABILITY_EVIDENCE_FILE)).await?,
             ))
         })
         .await;
-    let (sends, receipts, contracts, routing, capabilities) = match inputs {
+    let (sends, contracts, routing, capabilities) = match inputs {
         Ok(inputs) => inputs,
         Err(error) => return fail_early(&arguments, Some(&budget), ValidatePhase::Inputs, error).await,
     };
@@ -205,17 +203,17 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
     }
     let kusto_settle = if arguments.collectors_drained {
         let drained = budget
-            .within(ValidatePhase::DrainReceipts, async {
+            .within(ValidatePhase::DrainPublication, async {
                 let metadata = read_json(&arguments.results.join("run-metadata.json")).await?;
                 let publication = read_json(&arguments.results.join("publication-drain.json")).await?;
                 let mutators = read_json(&arguments.results.join("mutator-drain.json")).await?;
-                check_drain_receipts(&metadata, &publication, &mutators)
+                check_drain_evidence(&metadata, &publication, &mutators)
             })
             .await;
         drained.err().map(|error| {
-            failures.push(format!("drain receipts rejected: {error:#}"));
-            failed_phase.get_or_insert(ValidatePhase::DrainReceipts);
-            error.context("drain receipts rejected")
+            failures.push(format!("publication drain rejected: {error:#}"));
+            failed_phase.get_or_insert(ValidatePhase::DrainPublication);
+            error.context("publication drain rejected")
         })
     } else if arguments.kusto_endpoint.is_some() {
         let settled = budget
@@ -252,34 +250,21 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
         &mut failures,
     );
 
-    let receipt_map = receipts
-        .iter()
-        .map(|receipt| (receipt.receipt_id, receipt))
-        .collect::<BTreeMap<_, _>>();
-    check(
-        receipt_map.len() == receipts.len(),
-        "receipt manifest contains duplicate receipt identifiers",
-        &mut failures,
-    );
-
     let mut attempts = BTreeMap::<(String, String), Vec<&SendManifestEntry>>::new();
-    let mut paired = BTreeMap::<String, BTreeMap<String, &SendManifestEntry>>::new();
     for send in &sends {
+        check(
+            send.pool == "dataflow",
+            "send manifest contains a removed implementation pool",
+            &mut failures,
+        );
         check(
             contract_map.contains_key(&send.table),
             &format!("send manifest contains unknown table {}", send.table),
             &mut failures,
         );
-        if send.outcome == AckOutcome::DurableReceipt {
-            check(
-                send.pool == "direct" && send.receipt_id.is_some(),
-                "durable acknowledgement is not a direct receipt",
-                &mut failures,
-            );
-        }
         if send.outcome == AckOutcome::BestEffortAdmission {
             check(
-                send.pool == "dataflow" && send.receipt_id.is_none(),
+                send.pool == "dataflow",
                 "best-effort acknowledgement is not honest dataflow admission",
                 &mut failures,
             );
@@ -291,7 +276,7 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
         }
         if send.outcome == AckOutcome::DurableAdmission {
             check(
-                send.pool == "dataflow" && send.receipt_id.is_none() && arguments.quiver,
+                send.pool == "dataflow" && arguments.quiver,
                 "durable admission is not an honest Quiver-backed dataflow acknowledgement",
                 &mut failures,
             );
@@ -300,34 +285,6 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
             .entry((send.pool.clone(), send.logical_batch_id.clone()))
             .or_default()
             .push(send);
-        if send.scenario == crate::cli::Scenario::Paired && send.outcome != AckOutcome::Error {
-            paired
-                .entry(send.logical_batch_id.clone())
-                .or_default()
-                .entry(send.pool.clone())
-                .or_insert(send);
-        }
-    }
-
-    for (logical_id, pools) in &paired {
-        let direct = pools.get("direct");
-        let dataflow = pools.get("dataflow");
-        check(
-            direct.is_some() && dataflow.is_some(),
-            &format!("paired logical batch {logical_id} did not succeed in both pools"),
-            &mut failures,
-        );
-        if let (Some(direct), Some(dataflow)) = (direct, dataflow) {
-            check(
-                direct.table == dataflow.table
-                    && direct.rows == dataflow.rows
-                    && direct.schema_fingerprint == dataflow.schema_fingerprint
-                    && direct.payload_sha256 == dataflow.payload_sha256
-                    && direct.row_sha256 == dataflow.row_sha256,
-                &format!("paired logical batch {logical_id} changed between pools"),
-                &mut failures,
-            );
-        }
     }
 
     let mut admitted_rows = BTreeMap::<String, BTreeMap<String, u64>>::new();
@@ -358,37 +315,7 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
             &format!("{pool} logical batch {logical_id} changed across retries"),
             &mut failures,
         );
-        let delivered = if pool == "direct" {
-            let mut published = false;
-            for success in successes {
-                let Some(receipt_id) = success.receipt_id else {
-                    continue;
-                };
-                let terminal = receipt_map.get(&receipt_id);
-                check(
-                    terminal.is_some(),
-                    &format!("direct receipt {receipt_id} lacks a terminal poll result"),
-                    &mut failures,
-                );
-                if let Some(terminal) = terminal {
-                    check(
-                        matches!(terminal.state.as_str(), "published" | "failed" | "publication_unknown"),
-                        &format!("direct receipt {receipt_id} is not terminal"),
-                        &mut failures,
-                    );
-                    published |= terminal.state == "published" && terminal.purge_allowed;
-                }
-            }
-            check(
-                published,
-                &format!("direct logical batch {logical_id} has no published copy"),
-                &mut failures,
-            );
-            published
-        } else {
-            true
-        };
-        if delivered {
+        if pool == "dataflow" {
             let rows = u64::try_from(first.rows).unwrap_or(u64::MAX);
             *admitted_rows
                 .entry(pool.clone())
@@ -400,9 +327,9 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
                 .or_default()
                 .entry(first.table.clone())
                 .or_insert(0);
-            // Direct receipts and Quiver durable admission promise every acknowledged row;
-            // best-effort dataflow admission only promises that the table was published.
-            if pool == "direct" || arguments.quiver {
+            // Quiver-backed durable admission promises each acknowledged row; best-effort admission only
+            // guarantees that the table received a published copy.
+            if arguments.quiver {
                 *required += rows;
             } else if *required == 0 || rows < *required {
                 *required = rows;
@@ -445,11 +372,8 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
             (pool, phase, Some(result))
         }
     };
-    let (direct_snapshot, dataflow_snapshot) = tokio::join!(
-        snapshot_for("direct", &arguments.direct_root, ValidatePhase::SnapshotDirect),
-        snapshot_for("dataflow", &arguments.dataflow_root, ValidatePhase::SnapshotDataflow),
-    );
-    for (pool, phase, result) in [direct_snapshot, dataflow_snapshot] {
+    let dataflow_snapshot = snapshot_for("dataflow", &arguments.dataflow_root, ValidatePhase::SnapshotDataflow).await;
+    for (pool, phase, result) in [dataflow_snapshot] {
         match result {
             Some(Ok(snapshot)) => {
                 snapshots.insert(pool, snapshot);
@@ -462,18 +386,7 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
         }
     }
     let checks_timer = budget.timings.measure("phase/LocalChecks");
-    let direct = snapshots.remove("direct");
     let dataflow = snapshots.remove("dataflow");
-    if let Some(snapshot) = &direct {
-        validate_snapshot(
-            "direct",
-            snapshot,
-            &contract_map,
-            required_rows.get("direct"),
-            &mut failures,
-        );
-    }
-
     async fn wait_for_snapshot(
         root: &Path,
         expected: &BTreeMap<String, u64>,
@@ -524,23 +437,6 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
             &mut failures,
         );
     }
-    if let (Some(direct), Some(dataflow)) = (&direct, &dataflow) {
-        for table in &all_tables {
-            if let (Some(direct), Some(dataflow)) = (direct.tables.get(table), dataflow.tables.get(table)) {
-                check(
-                    direct.schema == dataflow.schema,
-                    &format!("{table} Delta schemas differ between pools"),
-                    &mut failures,
-                );
-                check(
-                    direct.payload_row_hashes.keys().eq(dataflow.payload_row_hashes.keys()),
-                    &format!("{table} deterministic row values differ between pools"),
-                    &mut failures,
-                );
-            }
-        }
-    }
-
     validate_routing(
         &routing,
         &all_tables,
@@ -560,7 +456,7 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
         };
         let validation = if let Some(error) = kusto_settle {
             Err(error)
-        } else if let (Some(direct), Some(dataflow)) = (&direct, &dataflow) {
+        } else if let Some(dataflow) = &dataflow {
             budget
                 .within(ValidatePhase::Kusto, async {
                     tokio::time::timeout(
@@ -568,9 +464,7 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
                         crate::kusto::validate(
                             endpoint,
                             &arguments.results,
-                            &arguments.direct_root,
                             &arguments.dataflow_root,
-                            direct,
                             dataflow,
                             &bound,
                         ),
@@ -582,7 +476,7 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
                 .await
         } else {
             Err(anyhow::anyhow!(
-                "Kusto validation requires both independent Delta snapshots"
+                "Kusto validation requires the independent Dataflow Delta snapshot"
             ))
         };
         match validation {
@@ -610,7 +504,6 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
         diagnostics,
         admitted_rows,
         required_rows,
-        direct,
         dataflow,
         routing,
         kusto,
@@ -626,9 +519,8 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
         );
     }
     println!(
-        "PASS: 13 schemas, complete rows, paired parity, receipts, routing, capabilities, and {} Delta files",
-        report.direct.as_ref().map_or(0, |snapshot| snapshot.files)
-            + report.dataflow.as_ref().map_or(0, |snapshot| snapshot.files)
+        "PASS: 13 schemas, Dataflow rows, routing, capabilities, and {} Delta files",
+        report.dataflow.as_ref().map_or(0, |snapshot| snapshot.files)
     );
     Ok(())
 }
@@ -847,60 +739,34 @@ fn validate_routing(
 }
 
 fn validate_capabilities(capabilities: &Value, quiver: bool, failures: &mut Vec<String>) {
-    let direct = capabilities
-        .get("direct")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
     let dataflow = capabilities
         .get("dataflow")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    check(!direct.is_empty(), "direct capability evidence is missing", failures);
     check(
         !dataflow.is_empty(),
         "dataflow capability evidence is missing",
         failures,
     );
-    for entry in direct {
-        let response = &entry["response"];
-        let values = response["capabilities"].as_array().cloned().unwrap_or_default();
-        check(
-            response["implementation_pool"] == "direct" && values.iter().any(|value| value == "receipt_status"),
-            "direct collector did not advertise durable receipt status",
-            failures,
-        );
-        check(
-            values.iter().any(|value| value == "durable_payload_storage") == quiver,
-            if quiver {
-                "direct collector did not advertise native Quiver payload storage"
-            } else {
-                "direct collector advertised native Quiver payload storage without --quiver"
-            },
-            failures,
-        );
-    }
     for entry in dataflow {
         let response = &entry["response"];
-        let values = response["capabilities"].as_array().cloned().unwrap_or_default();
-        let honest_gap = !values.iter().any(|value| value == "receipt_status");
         if quiver {
             check(
-                response["delivery_guarantee"] == "durable_admission"
+                response["implementation_pool"] == "dataflow"
+                    && response["delivery_guarantee"] == "durable_admission"
                     && response["completion_mode"] == "durable_admission"
                     && response["at_least_once"] == true
-                    && response["native_quiver"]["enabled"] == true
-                    && honest_gap,
+                    && response["native_quiver"]["enabled"] == true,
                 "dataflow collector did not report native Quiver durable admission",
                 failures,
             );
         } else {
             check(
-                response["delivery_guarantee"] == "best_effort"
-                    && response["completion_mode"] == "best_effort_admission"
-                    && honest_gap,
-                "dataflow collector capability gap was not reported honestly",
+                response["implementation_pool"] == "dataflow"
+                    && response["delivery_guarantee"] == "best_effort"
+                    && response["completion_mode"] == "best_effort_admission",
+                "dataflow collector delivery guarantee did not match best-effort admission",
                 failures,
             );
         }
@@ -965,7 +831,7 @@ async fn fail_early(
         "deadline": budget.and_then(Budget::evidence),
         "timings": budget.map(|budget| budget.timings.evidence()),
         "admitted_rows": {}, "required_rows": {},
-        "direct": null, "dataflow": null, "routing": null,
+        "dataflow": null, "routing": null,
         "kusto": kusto,
     });
     if !diagnostics.is_empty() {
@@ -1053,7 +919,6 @@ struct ValidationReport {
     diagnostics: Vec<String>,
     admitted_rows: BTreeMap<String, BTreeMap<String, u64>>,
     required_rows: BTreeMap<String, BTreeMap<String, u64>>,
-    direct: Option<SnapshotSummary>,
     dataflow: Option<SnapshotSummary>,
     routing: RoutingEvidence,
     kusto: Option<Value>,
@@ -1115,7 +980,7 @@ mod tests {
         let expired = Budget::new(Some(1), NOW_UNIX, started)?;
         let polled = std::sync::atomic::AtomicBool::new(false);
         let result = expired
-            .within(ValidatePhase::SnapshotDirect, async {
+            .within(ValidatePhase::SnapshotDataflow, async {
                 polled.store(true, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
             })
@@ -1313,7 +1178,7 @@ mod tests {
             let results = results_directory(test)?;
             for (file, contents) in [
                 (SEND_MANIFEST_FILE, ""),
-                (RECEIPT_MANIFEST_FILE, ""),
+                (""),
                 (SCHEMA_CONTRACT_FILE, "[]"),
                 (
                     ROUTING_EVIDENCE_FILE,
@@ -1329,28 +1194,28 @@ mod tests {
             }
             let error = validate(validate_arguments(&results.0, deadline, &arguments)?).await;
             assert!(error.is_err());
-            assert_kusto_diagnostics(&results.0, "drain-receipts", corrupt_status).await?;
+            assert_kusto_diagnostics(&results.0, "publication-drain", corrupt_status).await?;
         }
         Ok(())
     }
 
     #[test]
-    fn stopped_validation_rejects_missing_stale_and_partial_drain_receipts() -> Result<()> {
+    fn stopped_validation_rejects_missing_stale_and_partial_publication_drain_evidence() -> Result<()> {
         let metadata = serde_json::json!({"run_id": "current"});
         let publication = serde_json::json!({"run_id": "current", "dataflow_settled": true});
-        let mutators = serde_json::json!({"run_id": "current", "clean": true, "services": ["direct-1", "dataflow-1"]});
-        check_drain_receipts(&metadata, &publication, &mutators)?;
+        let mutators = serde_json::json!({"run_id": "current", "clean": true, "services": ["dataflow-1"]});
+        check_drain_evidence(&metadata, &publication, &mutators)?;
         for invalid in [
             Value::Null,
-            serde_json::json!({"run_id": "old", "clean": true, "services": ["direct-1", "dataflow-1"]}),
-            serde_json::json!({"run_id": "current", "clean": false, "services": ["direct-1", "dataflow-1"]}),
+            serde_json::json!({"run_id": "old", "clean": true, "services": ["dataflow-1"]}),
+            serde_json::json!({"run_id": "current", "clean": false, "services": ["dataflow-1"]}),
             serde_json::json!({"run_id": "current", "clean": true, "services": ["direct-1"]}),
         ] {
-            assert!(check_drain_receipts(&metadata, &publication, &invalid).is_err());
+            assert!(check_drain_evidence(&metadata, &publication, &invalid).is_err());
         }
-        assert!(check_drain_receipts(&metadata, &Value::Null, &mutators).is_err());
+        assert!(check_drain_evidence(&metadata, &Value::Null, &mutators).is_err());
         assert!(
-            check_drain_receipts(
+            check_drain_evidence(
                 &metadata,
                 &serde_json::json!({"run_id": "old", "dataflow_settled": true}),
                 &mutators
@@ -1363,8 +1228,8 @@ mod tests {
     fn collector(instance_id: &str, terminated: bool) -> RoutingCollectorEvidence {
         RoutingCollectorEvidence {
             instance_id: instance_id.to_owned(),
-            instance_key: "loadtest-direct-1".to_owned(),
-            implementation_pool: "direct".to_owned(),
+            instance_key: "loadtest-dataflow-1".to_owned(),
+            implementation_pool: "dataflow".to_owned(),
             endpoint: "10.89.0.21:50051".to_owned(),
             state: "ready".to_owned(),
             terminated,
@@ -1381,7 +1246,7 @@ mod tests {
             leases: tables
                 .iter()
                 .map(|table| RoutingLeaseEvidence {
-                    implementation_pool: "direct".to_owned(),
+                    implementation_pool: "dataflow".to_owned(),
                     table: table.clone(),
                     holder_instance_id: holder.to_owned(),
                     fencing_epoch: 2,
@@ -1390,7 +1255,7 @@ mod tests {
                 })
                 .collect(),
         };
-        let pools = BTreeMap::from([("direct".to_owned(), tables.clone())]);
+        let pools = BTreeMap::from([("dataflow".to_owned(), tables.clone())]);
         (evidence, tables, pools)
     }
 
@@ -1416,105 +1281,54 @@ mod tests {
     }
 
     fn ordinary_capabilities() -> Value {
-        serde_json::json!({
-            "direct": [{
-                "response": {
-                    "implementation_pool": "direct",
-                    "capabilities": ["receipt_status"]
-                }
-            }],
-            "dataflow": [{
-                "response": {
-                    "delivery_guarantee": "best_effort",
-                    "completion_mode": "best_effort_admission",
-                    "capabilities": []
-                }
-            }]
-        })
+        serde_json::json!({"dataflow": [{"response": {
+            "implementation_pool": "dataflow",
+            "delivery_guarantee": "best_effort",
+            "completion_mode": "best_effort_admission",
+            "capabilities": []
+        }}]})
     }
 
     #[test]
-    fn ordinary_collector_delivery_capabilities_are_valid() {
+    fn dataflow_delivery_capabilities_are_valid() {
         let mut failures = Vec::new();
         validate_capabilities(&ordinary_capabilities(), false, &mut failures);
         assert!(failures.is_empty(), "{failures:?}");
     }
 
     #[test]
-    fn capability_evidence_is_required_for_both_pools() {
+    fn capability_evidence_is_required_for_dataflow() {
         let mut failures = Vec::new();
         validate_capabilities(&serde_json::json!({}), false, &mut failures);
-        assert_eq!(
-            failures,
-            [
-                "direct capability evidence is missing",
-                "dataflow capability evidence is missing",
-            ]
-        );
+        assert_eq!(failures, ["dataflow capability evidence is missing"]);
     }
 
     #[test]
-    fn capability_validation_preserves_delivery_contracts() {
+    fn quiver_capabilities_require_durable_admission() {
         let mut capabilities = ordinary_capabilities();
-        capabilities["direct"][0]["response"]["capabilities"] = serde_json::json!([]);
-        capabilities["dataflow"][0]["response"]["capabilities"] = serde_json::json!(["receipt_status"]);
+        let response = &mut capabilities["dataflow"][0]["response"];
+        response["delivery_guarantee"] = serde_json::json!("durable_admission");
+        response["completion_mode"] = serde_json::json!("durable_admission");
+        response["at_least_once"] = serde_json::json!(true);
+        response["native_quiver"] = serde_json::json!({"enabled": true});
+        let mut failures = Vec::new();
+        validate_capabilities(&capabilities, true, &mut failures);
+        assert!(failures.is_empty(), "{failures:?}");
+
+        response["native_quiver"]["enabled"] = serde_json::json!(false);
+        validate_capabilities(&capabilities, true, &mut failures);
+        assert_eq!(failures.len(), 1);
+    }
+
+    #[test]
+    fn best_effort_mode_rejects_a_durable_admission_claim() {
+        let mut capabilities = ordinary_capabilities();
+        capabilities["dataflow"][0]["response"]["delivery_guarantee"] = serde_json::json!("durable_admission");
         let mut failures = Vec::new();
         validate_capabilities(&capabilities, false, &mut failures);
         assert_eq!(
             failures,
-            [
-                "direct collector did not advertise durable receipt status",
-                "dataflow collector capability gap was not reported honestly",
-            ]
-        );
-    }
-
-    fn quiver_capabilities() -> Value {
-        serde_json::json!({
-            "direct": [{
-                "response": {
-                    "implementation_pool": "direct",
-                    "capabilities": ["durable_payload_storage", "receipt_status"]
-                }
-            }],
-            "dataflow": [{
-                "response": {
-                    "delivery_guarantee": "durable_admission",
-                    "completion_mode": "durable_admission",
-                    "at_least_once": true,
-                    "native_quiver": {"supported": true, "enabled": true},
-                    "capabilities": []
-                }
-            }]
-        })
-    }
-
-    #[test]
-    fn quiver_collector_delivery_capabilities_are_valid() {
-        let mut failures = Vec::new();
-        validate_capabilities(&quiver_capabilities(), true, &mut failures);
-        assert!(failures.is_empty(), "{failures:?}");
-    }
-
-    #[test]
-    fn capability_validation_requires_the_requested_quiver_mode() {
-        let mut failures = Vec::new();
-        validate_capabilities(&ordinary_capabilities(), true, &mut failures);
-        assert_eq!(
-            failures,
-            [
-                "direct collector did not advertise native Quiver payload storage",
-                "dataflow collector did not report native Quiver durable admission",
-            ]
-        );
-        let mut failures = Vec::new();
-        validate_capabilities(&quiver_capabilities(), false, &mut failures);
-        assert_eq!(
-            failures,
-            [
-                "direct collector advertised native Quiver payload storage without --quiver",
-                "dataflow collector capability gap was not reported honestly",
-            ]
+            ["dataflow collector delivery guarantee did not match best-effort admission"]
         );
     }
 }

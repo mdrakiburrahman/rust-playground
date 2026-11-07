@@ -8,10 +8,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use arrowcol_protocol::{ImplementationPool, ReceiptId, UnixMillis};
+use arrowcol_protocol::{ImplementationPool, UnixMillis};
 use arrowcol_routing::{RoutingStore, SqlServerRoutingConfig, SqlServerRoutingStore};
 use serde::Serialize;
-use tokio::{sync::mpsc, task::JoinSet};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -19,14 +19,12 @@ use crate::{
     cli::{RunArgs, Scenario},
     generator::{LogicalBatch, Scheduler, build_logical_batch},
     manifest::{
-        AckOutcome, CAPABILITY_EVIDENCE_FILE, ManifestWriter, RECEIPT_MANIFEST_FILE, ROUTING_EVIDENCE_FILE,
-        RUN_METADATA_FILE, ReceiptManifestEntry, SendManifestEntry, run_metadata,
+        AckOutcome, CAPABILITY_EVIDENCE_FILE, ManifestWriter, ROUTING_EVIDENCE_FILE, RUN_METADATA_FILE,
+        SendManifestEntry, run_metadata,
     },
     schema::{TABLE_COUNT, schema_contract_sha256},
     sdk::prepare_tables,
-    transport::{
-        FlightAcknowledgement, FlightTransport, ReceiptFacts, now_unix_millis, receipt_poll_map, status_fields,
-    },
+    transport::{FlightAcknowledgement, FlightTransport, now_unix_millis, status_fields},
 };
 
 /// Executes a production finite or continuous benchmark run.
@@ -46,10 +44,8 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
     let transport = FlightTransport::connect(
         &arguments.router_endpoint,
         &arguments.catalog_endpoint,
-        &arguments.receipt_endpoint,
         &arguments.edge_secret_file,
         &arguments.internal_secret_file,
-        &arguments.direct_admin_endpoints,
         arguments.request_timeout.get(),
     )
     .await?;
@@ -67,7 +63,6 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
     }
 
     let capabilities = serde_json::json!({
-        "direct": transport.capability_evidence(&arguments.direct_admin_endpoints).await?,
         "dataflow": transport.capability_evidence(&arguments.dataflow_admin_endpoints).await?,
     });
     manifests.write_json(CAPABILITY_EVIDENCE_FILE, &capabilities).await?;
@@ -91,17 +86,6 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
         }
     });
 
-    let receipt_failures = Arc::new(AtomicU64::new(0));
-    let receipt_stop = CancellationToken::new();
-    let (receipt_sender, receipt_task) = ReceiptTracker::start(
-        transport.clone(),
-        manifests.clone(),
-        run_id.clone(),
-        arguments.drain_timeout.get(),
-        arguments.lanes.saturating_mul(16).max(32),
-        Arc::clone(&receipt_failures),
-        receipt_stop.clone(),
-    );
     let kusto_sync = crate::kusto::LiveSync::start(&arguments, &run_id);
 
     let mut run_error = None;
@@ -120,10 +104,8 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
                 &batches,
                 transport.clone(),
                 manifests.clone(),
-                receipt_sender.clone(),
                 cancellation.clone(),
                 scheduled_table_count,
-                Arc::clone(&receipt_failures),
             )
             .await
         {
@@ -146,10 +128,8 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
             &batches,
             transport.clone(),
             manifests.clone(),
-            receipt_sender.clone(),
             cancellation.clone(),
             scheduled_table_count,
-            Arc::clone(&receipt_failures),
         )
         .await
         {
@@ -161,7 +141,6 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
     if let Some(sync) = &kusto_sync {
         sync.finish_generation();
     }
-    drop(receipt_sender);
     if let Some(error) = run_error {
         eprintln!("FAIL collector generation: {error:#}");
         if let Err(evidence_error) = manifests
@@ -173,14 +152,6 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
         {
             eprintln!("could not retain generation failure evidence: {evidence_error:#}");
         }
-        receipt_stop.cancel();
-        if let Err(cleanup_error) = receipt_task
-            .await
-            .context("receipt tracker task failed")
-            .and_then(|report| report)
-        {
-            eprintln!("receipt tracker cleanup failed: {cleanup_error:#}");
-        }
         if let Some(sync) = kusto_sync
             && let Err(cleanup_error) = sync.abort().await
         {
@@ -191,10 +162,6 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
         }
         return Err(error);
     }
-    let receipt_report = receipt_task
-        .await
-        .context("receipt tracker task failed")
-        .and_then(|report| report);
     manifests.flush().await?;
     if let Some(sync) = kusto_sync
         && let Err(error) = sync.stop().await
@@ -202,24 +169,11 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
         eprintln!("Kusto DEGRADED (collector run retained): {error:#}");
         crate::kusto::degraded(&arguments.results, &run_id, &error)?;
     }
-    let receipt_report = receipt_report?;
     let routing = capture_routing(&arguments, &run_id).await?;
     manifests.write_json(ROUTING_EVIDENCE_FILE, &routing).await?;
     manifests.flush().await?;
 
-    if receipt_report.failures > 0 || receipt_report.timeouts > 0 {
-        bail!(
-            "direct receipt drain completed with {} explicit failures and {} timeouts; see {RECEIPT_MANIFEST_FILE}",
-            receipt_report.failures,
-            receipt_report.timeouts
-        );
-    }
-    println!(
-        "PASS collector run={} logical_batches={} receipts_published={}",
-        run_id,
-        scheduler.scheduled(),
-        receipt_report.published
-    );
+    println!("PASS dataflow run={} logical_batches={}", run_id, scheduler.scheduled());
     Ok(())
 }
 
@@ -230,11 +184,8 @@ fn validate_arguments(arguments: &RunArgs) -> Result<()> {
     if arguments.seed > i64::MAX as u64 {
         bail!("seed must not exceed {}", i64::MAX);
     }
-    if arguments.measure.get().is_zero()
-        || arguments.request_timeout.get().is_zero()
-        || arguments.drain_timeout.get().is_zero()
-    {
-        bail!("measure, request timeout, and drain timeout must be positive");
+    if arguments.measure.get().is_zero() || arguments.request_timeout.get().is_zero() {
+        bail!("measure and request timeout must be positive");
     }
     let scenarios = arguments.effective_scenarios();
     if scenarios.is_empty() {
@@ -257,10 +208,8 @@ async fn run_phase(
     batches: &BTreeMap<String, Arc<LogicalBatch>>,
     transport: FlightTransport,
     manifests: ManifestWriter,
-    receipt_sender: mpsc::Sender<PendingReceipt>,
     cancellation: CancellationToken,
     table_count: usize,
-    receipt_failures: Arc<AtomicU64>,
 ) -> Result<()> {
     let phase_started_at = now_unix_millis();
     let phase_duration_ms = duration
@@ -277,7 +226,6 @@ async fn run_phase(
         let batches = Arc::clone(&batches);
         let transport = transport.clone();
         let manifests = manifests.clone();
-        let receipt_sender = receipt_sender.clone();
         let cancellation = cancellation.clone();
         let run_id = run_id.to_owned();
         let phase = phase.to_owned();
@@ -298,86 +246,21 @@ async fn run_phase(
                     .get(&scheduled.table.identity.to_string())
                     .context("scheduled table has no generated batch")?;
                 let logical_batch_id = format!("{}:{}:{}:{}", run_id, scenario.as_str(), phase, scheduled.ordinal);
-                let sent = async {
-                    match scenario {
-                        Scenario::Direct => {
-                            send_pool_with_retry(
-                                &run_id,
-                                scenario,
-                                &phase,
-                                &logical_batch_id,
-                                scheduled.ordinal,
-                                scheduled.table_batch_ordinal,
-                                lane,
-                                ImplementationPool::Direct,
-                                Arc::clone(batch),
-                                &transport,
-                                &manifests,
-                                &receipt_sender,
-                                request_timeout,
-                                retry,
-                            )
-                            .await?;
-                        }
-                        Scenario::Dataflow => {
-                            send_pool_with_retry(
-                                &run_id,
-                                scenario,
-                                &phase,
-                                &logical_batch_id,
-                                scheduled.ordinal,
-                                scheduled.table_batch_ordinal,
-                                lane,
-                                ImplementationPool::Dataflow,
-                                Arc::clone(batch),
-                                &transport,
-                                &manifests,
-                                &receipt_sender,
-                                request_timeout,
-                                retry,
-                            )
-                            .await?;
-                        }
-                        Scenario::Paired => {
-                            let direct = send_pool_with_retry(
-                                &run_id,
-                                scenario,
-                                &phase,
-                                &logical_batch_id,
-                                scheduled.ordinal,
-                                scheduled.table_batch_ordinal,
-                                lane,
-                                ImplementationPool::Direct,
-                                Arc::clone(batch),
-                                &transport,
-                                &manifests,
-                                &receipt_sender,
-                                request_timeout,
-                                retry,
-                            );
-                            let dataflow = send_pool_with_retry(
-                                &run_id,
-                                scenario,
-                                &phase,
-                                &logical_batch_id,
-                                scheduled.ordinal,
-                                scheduled.table_batch_ordinal,
-                                lane,
-                                ImplementationPool::Dataflow,
-                                Arc::clone(batch),
-                                &transport,
-                                &manifests,
-                                &receipt_sender,
-                                request_timeout,
-                                retry,
-                            );
-                            let (direct, dataflow) = tokio::join!(direct, dataflow);
-                            direct?;
-                            dataflow?;
-                        }
-                    }
-                    Ok::<(), anyhow::Error>(())
-                }
+                let sent = send_pool_with_retry(
+                    &run_id,
+                    scenario,
+                    &phase,
+                    &logical_batch_id,
+                    scheduled.ordinal,
+                    scheduled.table_batch_ordinal,
+                    lane,
+                    ImplementationPool::Dataflow,
+                    Arc::clone(batch),
+                    &transport,
+                    &manifests,
+                    request_timeout,
+                    retry,
+                )
                 .await;
                 sent.inspect_err(|_| {
                     send_policy_failures.fetch_add(1, Ordering::Relaxed);
@@ -386,7 +269,6 @@ async fn run_phase(
             Ok::<(), anyhow::Error>(())
         });
     }
-    drop(receipt_sender);
     println!(
         "[loadgen] {phase} ({}) started: concurrency={}, rows/batch={}",
         scenario.as_str(),
@@ -422,7 +304,6 @@ async fn run_phase(
                     "phase_remaining_ms": phase_remaining_ms,
                     "timestamp": observed_at, "scheduled_rows": rows,
                     "send_policy_failures": send_policy_failures.load(Ordering::Relaxed),
-                    "receipt_failures": receipt_failures.load(Ordering::Relaxed),
                 });
                 if let Err(error) = manifests.write_json("driver-progress.json", &frame).await {
                     cancellation.cancel();
@@ -480,7 +361,6 @@ async fn send_pool_with_retry(
     batch: Arc<LogicalBatch>,
     transport: &FlightTransport,
     manifests: &ManifestWriter,
-    receipt_sender: &mpsc::Sender<PendingReceipt>,
     request_timeout: Duration,
     retry: RetryPolicy,
 ) -> Result<()> {
@@ -495,25 +375,9 @@ async fn send_pool_with_retry(
         {
             Ok(acknowledgement) => {
                 let acknowledged_at = now_unix_millis();
-                let (outcome, receipt_id) = match acknowledgement {
-                    FlightAcknowledgement::DurableReceipt(receipt) => {
-                        if pool != ImplementationPool::Direct {
-                            bail!("dataflow pool returned a durable receipt");
-                        }
-                        (AckOutcome::DurableReceipt, Some(receipt))
-                    }
-                    FlightAcknowledgement::BestEffortAdmission => {
-                        if pool != ImplementationPool::Dataflow {
-                            bail!("direct pool returned best-effort admission");
-                        }
-                        (AckOutcome::BestEffortAdmission, None)
-                    }
-                    FlightAcknowledgement::DurableAdmission => {
-                        if pool != ImplementationPool::Dataflow {
-                            bail!("direct pool returned durable admission");
-                        }
-                        (AckOutcome::DurableAdmission, None)
-                    }
+                let outcome = match acknowledgement {
+                    FlightAcknowledgement::BestEffortAdmission => AckOutcome::BestEffortAdmission,
+                    FlightAcknowledgement::DurableAdmission => AckOutcome::DurableAdmission,
                 };
                 manifests
                     .write_send(&SendManifestEntry {
@@ -536,21 +400,10 @@ async fn send_pool_with_retry(
                         sent_at_unix_ms: sent_at,
                         acknowledged_at_unix_ms: acknowledged_at,
                         outcome,
-                        receipt_id,
                         error_code: None,
                         error: None,
                     })
                     .await?;
-                if let Some(receipt_id) = receipt_id {
-                    receipt_sender
-                        .send(PendingReceipt {
-                            logical_batch_id: logical_batch_id.to_owned(),
-                            table: batch.table.identity.to_string(),
-                            receipt_id,
-                        })
-                        .await
-                        .context("receipt tracker stopped before admission completed")?;
-                }
                 return Ok(());
             }
             Err(error) => {
@@ -576,7 +429,6 @@ async fn send_pool_with_retry(
                         sent_at_unix_ms: sent_at,
                         acknowledged_at_unix_ms: now_unix_millis(),
                         outcome: AckOutcome::Error,
-                        receipt_id: None,
                         error_code: Some(error_code),
                         error: Some(message),
                     })
@@ -615,192 +467,6 @@ impl RetryPolicy {
     fn backoff(attempt: u32) -> Duration {
         let exponent = attempt.saturating_sub(1).min(5);
         Duration::from_millis(100_u64.saturating_mul(1_u64 << exponent).min(2_000))
-    }
-}
-
-#[derive(Clone)]
-struct PendingReceipt {
-    logical_batch_id: String,
-    table: String,
-    receipt_id: ReceiptId,
-}
-
-#[derive(Default)]
-struct ReceiptReport {
-    published: usize,
-    failures: usize,
-    timeouts: usize,
-}
-
-struct ReceiptTracker;
-
-impl ReceiptTracker {
-    fn start(
-        transport: FlightTransport,
-        manifests: ManifestWriter,
-        run_id: String,
-        drain_timeout: Duration,
-        capacity: usize,
-        failures: Arc<AtomicU64>,
-        stop: CancellationToken,
-    ) -> (
-        mpsc::Sender<PendingReceipt>,
-        tokio::task::JoinHandle<Result<ReceiptReport>>,
-    ) {
-        let (sender, mut receiver) = mpsc::channel::<PendingReceipt>(capacity);
-        let task = tokio::spawn(async move {
-            let mut pending = BTreeMap::<ReceiptId, PendingReceipt>::new();
-            let mut interval = tokio::time::interval(Duration::from_millis(250));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            let mut channel_closed = false;
-            let mut deadline = None;
-            let mut report = ReceiptReport::default();
-            loop {
-                if stop.is_cancelled() {
-                    let aborted = Self::abort_pending(&manifests, &run_id, pending, &mut receiver).await?;
-                    report.failures += aborted;
-                    failures.fetch_add(u64::try_from(aborted)?, Ordering::Relaxed);
-                    break;
-                }
-                if channel_closed && pending.is_empty() {
-                    break;
-                }
-                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                    for pending in pending.into_values() {
-                        manifests
-                            .write_receipt(&ReceiptManifestEntry {
-                                run_id: run_id.clone(),
-                                logical_batch_id: pending.logical_batch_id,
-                                table: pending.table,
-                                receipt_id: pending.receipt_id,
-                                state: "timeout".to_owned(),
-                                purge_allowed: false,
-                                terminal_at_unix_ms: now_unix_millis(),
-                                delta_version: None,
-                                rows_published: None,
-                                bytes_published: None,
-                                error_code: Some("receipt_poll_timeout".to_owned()),
-                                error_message: None,
-                            })
-                            .await?;
-                        report.timeouts += 1;
-                        failures.fetch_add(1, Ordering::Relaxed);
-                    }
-                    break;
-                }
-                tokio::select! {
-                    () = stop.cancelled() => {}
-                    received = receiver.recv(), if !channel_closed => {
-                        match received {
-                            Some(receipt) => {
-                                if pending.insert(receipt.receipt_id, receipt).is_some() {
-                                    bail!("duplicate server receipt identifier entered the poller");
-                                }
-                            }
-                            None => {
-                                channel_closed = true;
-                                deadline = Some(Instant::now() + drain_timeout);
-                            }
-                        }
-                    }
-                    _ = interval.tick() => {
-                        if pending.is_empty() {
-                            continue;
-                        }
-                        let ids = pending.keys().copied().collect::<Vec<_>>();
-                        for chunk in ids.chunks(256) {
-                            let response = tokio::select! {
-                                () = stop.cancelled() => break,
-                                response = transport.poll_receipts(chunk) => response,
-                            };
-                            let responses = match response {
-                                Ok(responses) => responses,
-                                Err(_) => continue,
-                            };
-                            let polled = receipt_poll_map(chunk, responses)?;
-                            for receipt_id in chunk {
-                                let Some(response) = polled.get(receipt_id) else {
-                                    continue;
-                                };
-                                if !response.found {
-                                    continue;
-                                }
-                                let Some(status) = response.status.as_ref() else {
-                                    continue;
-                                };
-                                let facts = ReceiptFacts::from_status(status);
-                                if !facts.terminal {
-                                    continue;
-                                }
-                                let tracked = pending
-                                    .remove(receipt_id)
-                                    .context("terminal receipt disappeared from tracker")?;
-                                manifests
-                                    .write_receipt(&ReceiptManifestEntry {
-                                        run_id: run_id.clone(),
-                                        logical_batch_id: tracked.logical_batch_id,
-                                        table: tracked.table,
-                                        receipt_id: tracked.receipt_id,
-                                        state: facts.state.clone(),
-                                        purge_allowed: response.purge_allowed,
-                                        terminal_at_unix_ms: now_unix_millis(),
-                                        delta_version: facts.delta_version,
-                                        rows_published: facts.rows_published,
-                                        bytes_published: facts.bytes_published,
-                                        error_code: facts.error_code,
-                                        error_message: facts.error_message,
-                                    })
-                                    .await?;
-                                if facts.state == "published" && response.purge_allowed {
-                                    report.published += 1;
-                                } else {
-                                    report.failures += 1;
-                                    failures.fetch_add(1, Ordering::Relaxed);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(report)
-        });
-        (sender, task)
-    }
-
-    async fn abort_pending(
-        manifests: &ManifestWriter,
-        run_id: &str,
-        mut pending: BTreeMap<ReceiptId, PendingReceipt>,
-        receiver: &mut mpsc::Receiver<PendingReceipt>,
-    ) -> Result<usize> {
-        receiver.close();
-        while let Some(receipt) = receiver.recv().await {
-            if pending.insert(receipt.receipt_id, receipt).is_some() {
-                bail!("duplicate server receipt identifier entered the poller");
-            }
-        }
-        let count = pending.len();
-        for receipt in pending.into_values() {
-            manifests
-                .write_receipt(&ReceiptManifestEntry {
-                    run_id: run_id.to_owned(),
-                    logical_batch_id: receipt.logical_batch_id,
-                    table: receipt.table,
-                    receipt_id: receipt.receipt_id,
-                    state: "aborted".to_owned(),
-                    purge_allowed: false,
-                    terminal_at_unix_ms: now_unix_millis(),
-                    delta_version: None,
-                    rows_published: None,
-                    bytes_published: None,
-                    error_code: Some("generation_failed".to_owned()),
-                    error_message: Some(
-                        "polling stopped after generation failed; publication outcome remains unresolved".to_owned(),
-                    ),
-                })
-                .await?;
-        }
-        Ok(count)
     }
 }
 
@@ -889,48 +555,6 @@ struct RoutingLeaseEvidence {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn failed_generation_aborts_pending_and_queued_receipts_without_a_drain_wait() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let manifests = ManifestWriter::create(directory.path()).await?;
-        let (sender, mut receiver) = mpsc::channel(4);
-        let mut pending = BTreeMap::new();
-        let first = PendingReceipt {
-            logical_batch_id: "first".to_owned(),
-            table: "telemetry.sqlserver.cpu".to_owned(),
-            receipt_id: ReceiptId::new(),
-        };
-        pending.insert(first.receipt_id, first);
-        sender
-            .send(PendingReceipt {
-                logical_batch_id: "queued".to_owned(),
-                table: "telemetry.sqlserver.cpu".to_owned(),
-                receipt_id: ReceiptId::new(),
-            })
-            .await?;
-        // The channel is deliberately still open. Cancellation must not wait
-        // for its normal close-plus-480-second drain deadline.
-        let count = tokio::time::timeout(
-            Duration::from_secs(1),
-            ReceiptTracker::abort_pending(&manifests, "failed-run", pending, &mut receiver),
-        )
-        .await??;
-        assert_eq!(count, 2);
-        assert!(sender.is_closed());
-        manifests.flush().await?;
-        let evidence = tokio::fs::read_to_string(directory.path().join(RECEIPT_MANIFEST_FILE)).await?;
-        let rows = evidence
-            .lines()
-            .map(serde_json::from_str::<ReceiptManifestEntry>)
-            .collect::<Result<Vec<_>, _>>()?;
-        assert_eq!(rows.len(), 2);
-        assert!(rows.iter().all(|row| row.state == "aborted"
-            && !row.purge_allowed
-            && row.delta_version.is_none()
-            && row.error_code.as_deref() == Some("generation_failed")));
-        Ok(())
-    }
 
     #[test]
     fn retry_policy_honors_attempts_without_a_window() {

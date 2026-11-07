@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     path::Path,
     str::FromStr,
     sync::{
@@ -18,7 +18,7 @@ use arrow_flight::{
 use arrowcol_flight::{DdlCompletionMetadata, DeliveryGuarantee, PutResultMetadata, decode_ddl_completion_metadata};
 use arrowcol_protocol::{
     AuthContext, AuthMethod, AuthenticatedPrincipal, ImplementationPool, PrincipalId, PrincipalIssuer, PrincipalScope,
-    ReceiptId, ReceiptState, ReceiptStatus, TableIdentity, UnixMillis,
+    TableIdentity, UnixMillis,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures::stream;
@@ -26,7 +26,7 @@ use hmac::{Hmac, Mac};
 use http::{HeaderMap, HeaderValue, Method};
 use prost::Message;
 use reqwest::{Client as HttpClient, Url};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::Sha256;
 use tonic::{
     Request,
@@ -50,19 +50,8 @@ type HmacSha256 = Hmac<Sha256>;
 /// Successful pool-specific Flight acknowledgement.
 #[derive(Clone, Debug)]
 pub enum FlightAcknowledgement {
-    DurableReceipt(ReceiptId),
     BestEffortAdmission,
     DurableAdmission,
-}
-
-/// One queried receipt status.
-#[derive(Clone, Debug)]
-pub struct ReceiptPoll {
-    pub receipt_id: ReceiptId,
-    pub found: bool,
-    pub purge_allowed: bool,
-    pub status: Option<ReceiptStatus>,
-    pub error: Option<String>,
 }
 
 /// Retained collector capability response.
@@ -78,8 +67,6 @@ pub struct FlightTransport {
     channel: Channel,
     catalog_channel: Channel,
     http: HttpClient,
-    receipt_base: Url,
-    direct_admin_bases: Vec<Url>,
     signer: EdgeSigner,
     internal_signer: InternalSigner,
 }
@@ -93,10 +80,8 @@ impl FlightTransport {
     pub async fn connect(
         flight_endpoint: &str,
         catalog_endpoint: &str,
-        receipt_endpoint: &str,
         edge_secret_file: &Path,
         internal_secret_file: &Path,
-        direct_admin_endpoints: &[String],
         timeout: Duration,
     ) -> Result<Self> {
         let endpoint = Endpoint::from_shared(flight_endpoint.to_owned())?
@@ -114,20 +99,10 @@ impl FlightTransport {
             .connect_timeout(timeout)
             .timeout(timeout)
             .build()?;
-        let receipt_base = Url::parse(receipt_endpoint)?;
-        if !matches!(receipt_base.scheme(), "http" | "https") {
-            bail!("receipt endpoint must use HTTP or HTTPS");
-        }
-        let direct_admin_bases = direct_admin_endpoints
-            .iter()
-            .map(|endpoint| Url::parse(endpoint))
-            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             channel,
             catalog_channel,
             http,
-            receipt_base,
-            direct_admin_bases,
             signer: EdgeSigner::from_file(edge_secret_file)?,
             internal_signer: InternalSigner::from_file(internal_secret_file)?,
         })
@@ -215,19 +190,8 @@ impl FlightTransport {
             };
             match PutResultMetadata::from_put_result(&result)? {
                 PutResultMetadata::Progress { .. } => {}
-                PutResultMetadata::Receipt {
-                    receipt_id,
-                    delivery_guarantee,
-                    ..
-                } => {
-                    if pool != ImplementationPool::Direct
-                        || delivery_guarantee != DeliveryGuarantee::DurableReceipt
-                        || acknowledgement
-                            .replace(FlightAcknowledgement::DurableReceipt(receipt_id))
-                            .is_some()
-                    {
-                        bail!("direct Flight acknowledgement contract was inconsistent");
-                    }
+                PutResultMetadata::Receipt { .. } => {
+                    bail!("router returned the retired durable-receipt response")
                 }
                 PutResultMetadata::BestEffortAdmission { delivery_guarantee, .. } => {
                     if pool != ImplementationPool::Dataflow
@@ -252,47 +216,6 @@ impl FlightTransport {
             }
         }
         acknowledgement.context("Flight DoPut completed without an acknowledgement")
-    }
-
-    /// Queries a bounded receipt batch through the authenticated router API.
-    ///
-    /// # Errors
-    ///
-    /// Returns signing, HTTP, status-code, or JSON errors.
-    pub async fn poll_receipts(&self, receipts: &[ReceiptId]) -> Result<Vec<ReceiptPoll>> {
-        if receipts.is_empty() || receipts.len() > 256 {
-            bail!("receipt poll batch must contain 1..=256 identifiers");
-        }
-        let mut url = self.receipt_base.join("/v1/receipts")?;
-        url.set_query(Some(&format!(
-            "ids={}",
-            receipts.iter().map(ToString::to_string).collect::<Vec<_>>().join(",")
-        )));
-        let mut headers = HeaderMap::new();
-        self.signer
-            .insert_signature(&mut headers, &Method::GET, "/v1/receipts")?;
-        let response = self.http.get(url).headers(headers).send().await?;
-        let status = response.status();
-        let bytes = response.bytes().await?;
-        if status.is_success() {
-            let response: ReceiptBatchResponse = serde_json::from_slice(&bytes)?;
-            return Ok(response
-                .receipts
-                .into_iter()
-                .map(|entry| ReceiptPoll {
-                    receipt_id: entry.receipt_id,
-                    found: entry.found,
-                    purge_allowed: entry.purge_allowed,
-                    status: entry.status,
-                    error: entry.error,
-                })
-                .collect());
-        }
-        let mut output = Vec::with_capacity(receipts.len());
-        for receipt in receipts {
-            output.push(self.poll_receipt(*receipt).await?);
-        }
-        Ok(output)
     }
 
     /// Fetches public collector capability endpoints without adding auth claims.
@@ -344,57 +267,6 @@ impl FlightTransport {
             request.metadata_mut().insert(key, MetadataValue::from_str(value)?);
         }
         Ok(())
-    }
-
-    async fn poll_receipt(&self, receipt_id: ReceiptId) -> Result<ReceiptPoll> {
-        let path = format!("/v1/receipts/{receipt_id}");
-        let url = self.receipt_base.join(&path)?;
-        let mut headers = HeaderMap::new();
-        self.signer.insert_signature(&mut headers, &Method::GET, &path)?;
-        let response = self.http.get(url).headers(headers).send().await?;
-        let status = response.status();
-        let bytes = response.bytes().await?;
-        if status == reqwest::StatusCode::NOT_FOUND {
-            return Ok(ReceiptPoll {
-                receipt_id,
-                found: false,
-                purge_allowed: false,
-                status: None,
-                error: Some("receipt was not found".to_owned()),
-            });
-        }
-        if !status.is_success() {
-            for base in &self.direct_admin_bases {
-                let response = self.http.get(base.join(&path)?).send().await?;
-                if response.status() == reqwest::StatusCode::NOT_FOUND {
-                    continue;
-                }
-                let status = response.status();
-                let bytes = response.bytes().await?;
-                if status.is_success() {
-                    let response: ReceiptResponse = serde_json::from_slice(&bytes)?;
-                    return Ok(ReceiptPoll {
-                        receipt_id: response.receipt_id,
-                        found: response.found,
-                        purge_allowed: response.purge_allowed,
-                        status: response.status,
-                        error: None,
-                    });
-                }
-            }
-            bail!(
-                "receipt query for {receipt_id} failed with {status}: {}",
-                String::from_utf8_lossy(&bytes)
-            );
-        }
-        let response: ReceiptResponse = serde_json::from_slice(&bytes)?;
-        Ok(ReceiptPoll {
-            receipt_id: response.receipt_id,
-            found: response.found,
-            purge_allowed: response.purge_allowed,
-            status: response.status,
-            error: None,
-        })
     }
 }
 
@@ -538,167 +410,6 @@ pub fn now_unix_millis() -> u64 {
     u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
-#[derive(Deserialize)]
-struct ReceiptBatchResponse {
-    receipts: Vec<ReceiptBatchEntry>,
-}
-
-#[derive(Deserialize)]
-struct ReceiptResponse {
-    receipt_id: ReceiptId,
-    found: bool,
-    purge_allowed: bool,
-    status: Option<ReceiptStatus>,
-}
-
-#[derive(Deserialize)]
-struct ReceiptBatchEntry {
-    receipt_id: ReceiptId,
-    found: bool,
-    purge_allowed: bool,
-    status: Option<ReceiptStatus>,
-    error: Option<String>,
-}
-
-/// Serializable receipt status facts used by the poller without exposing private fields.
-#[derive(Clone, Debug, Serialize)]
-pub struct ReceiptFacts {
-    pub state: String,
-    pub terminal: bool,
-    pub delta_version: Option<u64>,
-    pub rows_published: Option<u64>,
-    pub bytes_published: Option<u64>,
-    pub error_code: Option<String>,
-    pub error_message: Option<String>,
-}
-
-impl ReceiptFacts {
-    #[must_use]
-    pub fn from_status(status: &ReceiptStatus) -> Self {
-        let state = status.state();
-        let publication = status.publication();
-        Self {
-            state: match state {
-                ReceiptState::Accepted => "accepted",
-                ReceiptState::Buffered => "buffered",
-                ReceiptState::Publishing => "publishing",
-                ReceiptState::Published => "published",
-                ReceiptState::Failed => "failed",
-                ReceiptState::PublicationUnknown => "publication_unknown",
-            }
-            .to_owned(),
-            terminal: matches!(
-                state,
-                ReceiptState::Published | ReceiptState::Failed | ReceiptState::PublicationUnknown
-            ),
-            delta_version: publication.map(|value| value.delta_version().get()),
-            rows_published: publication.map(|value| value.rows_published().get()),
-            bytes_published: publication.map(|value| value.bytes_published().get()),
-            error_code: status.error().map(|value| format!("{:?}", value.code()).to_lowercase()),
-            error_message: status.error().map(|value| receipt_error_message(value.message())),
-        }
-    }
-}
-
-fn receipt_error_message(message: &str) -> String {
-    let private_values = std::env::vars().filter_map(|(name, value)| {
-        let name = name.to_ascii_uppercase();
-        (value.len() >= 8
-            && [
-                "SECRET",
-                "PASSWORD",
-                "TOKEN",
-                "CONNECTION_STRING",
-                "SUBSCRIPTION",
-                "TENANT_ID",
-                "CLIENT_ID",
-                "RESOURCE_GROUP",
-                "STORAGE_ACCOUNT",
-                "ACCOUNT_KEY",
-                "KUSTO_ENDPOINT",
-            ]
-            .iter()
-            .any(|part| name.contains(part)))
-        .then_some(value)
-    });
-    redact_receipt_message(message, private_values.collect())
-}
-
-fn redact_receipt_message(message: &str, mut private_values: Vec<String>) -> String {
-    private_values.sort_by_key(|value| std::cmp::Reverse(value.len()));
-    let mut message = message.to_owned();
-    for value in private_values {
-        if !value.is_empty() {
-            message = message.replace(&value, "[REDACTED]");
-        }
-    }
-    let mut redact_next = false;
-    let source = message.split_whitespace().collect::<Vec<_>>();
-    let mut tokens = Vec::new();
-    let mut quoted = None;
-    for (index, token) in source.iter().enumerate() {
-        let lower = token.to_ascii_lowercase().replace(['\'', '"'], "");
-        let names = [
-            "password",
-            "pwd",
-            "client_secret",
-            "accountkey",
-            "account_key",
-            "authorization",
-            "access_token",
-            "sharedaccesssignature",
-            "sas_token",
-            "api_key",
-            "apikey",
-            "signature",
-            "key",
-        ];
-        let assignment = names
-            .iter()
-            .any(|key| lower.contains(&format!("{key}=")) || lower.contains(&format!("{key}:")));
-        let separate_assignment = names
-            .contains(&lower.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_'))
-            && source.get(index + 1).is_some_and(|next| next.starts_with(['=', ':']));
-        let credential = assignment || separate_assignment || lower == "bearer";
-        let path = token.trim_start_matches(['\'', '"', '(', '[']);
-        let windows_path = path
-            .as_bytes()
-            .windows(3)
-            .any(|bytes| bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && matches!(bytes[2], b'\\' | b'/'));
-        let private_location = windows_path || path.contains('\\') || path.starts_with('/') || token.contains("://");
-        if quoted.is_some() || redact_next || credential || private_location {
-            tokens.push("[REDACTED]");
-        } else {
-            tokens.push(*token);
-        }
-        if let Some(quote) = quoted {
-            if token.contains(quote) {
-                quoted = None;
-            }
-        } else if credential || redact_next || private_location {
-            quoted = ['\'', '"']
-                .into_iter()
-                .find(|quote| token.chars().filter(|ch| ch == quote).count() % 2 == 1);
-        }
-        let attached_auth_scheme = [
-            "authorization:bearer",
-            "authorization:basic",
-            "authorization=bearer",
-            "authorization=basic",
-        ]
-        .iter()
-        .any(|suffix| lower.ends_with(suffix));
-        redact_next = credential
-            && (token.ends_with([':', '=']) || separate_assignment || lower == "bearer" || attached_auth_scheme)
-            || redact_next && (matches!(lower.as_str(), "bearer" | "basic" | "=" | ":"));
-    }
-    crate::kusto::redact_text(&tokens.join(" "))
-        .chars()
-        .filter(|ch| !ch.is_control())
-        .take(1_024)
-        .collect()
-}
-
 /// Converts a tonic status to stable bounded manifest fields.
 #[must_use]
 pub fn status_fields(error: &anyhow::Error) -> (String, String) {
@@ -711,37 +422,16 @@ pub fn status_fields(error: &anyhow::Error) -> (String, String) {
 }
 
 fn bounded_error(value: &str) -> String {
-    receipt_error_message(value)
-}
-
-/// Groups receipt polls by identifier and rejects duplicate/missing response entries.
-///
-/// # Errors
-///
-/// Returns an error when the API duplicates or omits a requested identifier.
-pub fn receipt_poll_map(
-    requested: &[ReceiptId],
-    responses: Vec<ReceiptPoll>,
-) -> Result<BTreeMap<ReceiptId, ReceiptPoll>> {
-    let mut output = BTreeMap::new();
-    for response in responses {
-        if output.insert(response.receipt_id, response).is_some() {
-            bail!("receipt API returned a duplicate identifier");
-        }
-    }
-    if requested.iter().any(|receipt| !output.contains_key(receipt)) {
-        bail!("receipt API omitted a requested identifier");
-    }
-    Ok(output)
+    sanitize_error_message(value)
 }
 
 #[cfg(test)]
-mod receipt_diagnostics_tests {
+mod error_diagnostics_tests {
     use super::*;
 
     #[test]
     fn receipt_cause_is_retained_without_private_credentials_or_paths() {
-        let message = redact_receipt_message(
+        let message = redact_error_message(
             "publication failed: unsupported UInt8 statistic; account private-account \
              https://private.example/path?sig=credential C:\\Users\\private\\table \
              /private/table 12345678-1234-1234-1234-123456789abc \
@@ -785,155 +475,10 @@ mod receipt_diagnostics_tests {
 
     #[test]
     fn receipt_cause_is_bounded_control_free_and_utf8_safe() {
-        let message = redact_receipt_message(&format!("原因 \u{1b} unsupported {}", "é".repeat(2_000)), Vec::new());
+        let message = redact_error_message(&format!("原因 \u{1b} unsupported {}", "é".repeat(2_000)), Vec::new());
         assert!(message.contains("unsupported"));
         assert_eq!(message.chars().count(), 1_024);
         assert!(!message.chars().any(char::is_control));
         assert!(serde_json::to_string(&message).is_ok());
-    }
-
-    #[tokio::test]
-    async fn terminal_status_cause_survives_actual_jsonl_and_legacy_entries() -> Result<()> {
-        use arrowcol_protocol::{ErrorCode, ErrorStatus};
-        struct TestRoot(std::path::PathBuf);
-        impl Drop for TestRoot {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-        let root = TestRoot(std::env::temp_dir().join(format!("receipt-canary-{}", uuid::Uuid::new_v4())));
-        let receipt_id: ReceiptId = "12345678-1234-1234-1234-123456789abc".parse()?;
-        let table = TableIdentity::new("telemetry".parse()?, "sqlserver".parse()?, "fixture".parse()?);
-        let cause = "unsupported UInt8 statistic https://private.example/path?sig=credential C:\\Users\\private\\table \
-                 /private/table 12345678-1234-1234-1234-123456789abc Password=opaque-secret \
-                 Authorization: Bearer opaque-token AccountKey = spaced-secret key = second-secret \
-                 abfss://private@account.dfs.core.windows.net/root Password=\"three word credential\" \
-                 Password = \"combined private credential\" AccountKey : 'joined private words' \
-                 Authorization:Basic opaque-basic-token Password = \"https://private.example quoted url-secret\" \
-                 \"https://private.example?sig=CANARYSIG standalone private-url-secret\"";
-        let status = ReceiptStatus::accepted(receipt_id, table, ImplementationPool::Direct, UnixMillis::new(1)?)
-            .transition_to(
-                ReceiptState::Failed,
-                UnixMillis::new(2)?,
-                None,
-                Some(ErrorStatus::new(ErrorCode::PublicationFailed, cause)?.with_receipt_id(receipt_id)),
-            )?;
-        let facts = ReceiptFacts::from_status(&status);
-        let manifest = crate::manifest::ReceiptManifestEntry {
-            run_id: "fixture".to_owned(),
-            logical_batch_id: "batch".to_owned(),
-            table: "fixture".to_owned(),
-            receipt_id,
-            state: facts.state,
-            purge_allowed: false,
-            terminal_at_unix_ms: 2,
-            delta_version: facts.delta_version,
-            rows_published: facts.rows_published,
-            bytes_published: facts.bytes_published,
-            error_code: facts.error_code,
-            error_message: facts.error_message,
-        };
-        let writer = crate::manifest::ManifestWriter::create(&root.0).await?;
-        writer.write_receipt(&manifest).await?;
-        let (code, message) = status_fields(&tonic::Status::internal(cause).into());
-        writer
-            .write_send(&crate::manifest::SendManifestEntry {
-                run_id: "fixture".to_owned(),
-                scenario: crate::cli::Scenario::Paired,
-                phase: "measure".to_owned(),
-                logical_batch_id: "batch".to_owned(),
-                ordinal: 0,
-                table_batch_ordinal: 0,
-                table: "fixture".to_owned(),
-                schema_version: 1,
-                schema_fingerprint: "fixture".to_owned(),
-                rows: 1,
-                arrow_bytes: 8,
-                payload_sha256: "fixture".to_owned(),
-                row_sha256: "fixture".to_owned(),
-                lane: 0,
-                pool: "direct".to_owned(),
-                attempt: 1,
-                sent_at_unix_ms: 1,
-                acknowledged_at_unix_ms: 2,
-                outcome: crate::manifest::AckOutcome::Error,
-                receipt_id: None,
-                error_code: Some(code),
-                error: Some(message),
-            })
-            .await?;
-        writer.flush().await?;
-        drop(writer);
-        let jsonl = std::fs::read_to_string(root.0.join(crate::manifest::RECEIPT_MANIFEST_FILE))?;
-        assert_eq!(jsonl.lines().count(), 1);
-        let decoded: crate::manifest::ReceiptManifestEntry = serde_json::from_str(jsonl.trim_end())?;
-        assert!(
-            decoded
-                .error_message
-                .as_deref()
-                .is_some_and(|message| message.contains("unsupported UInt8 statistic"))
-        );
-        for secret in [
-            "private.example",
-            "credential",
-            "C:\\",
-            "/private",
-            "opaque-secret",
-            "opaque-token",
-            "spaced-secret",
-            "second-secret",
-            "private@account",
-            "three word",
-            "combined",
-            "joined",
-            "private words",
-            "opaque-basic-token",
-            "url-secret",
-            "quoted",
-            "standalone",
-            "private-url-secret",
-            "CANARYSIG",
-        ] {
-            assert!(!jsonl.contains(secret), "leaked canary: {secret}");
-        }
-        let sent_jsonl = std::fs::read_to_string(root.0.join(crate::manifest::SEND_MANIFEST_FILE))?;
-        assert_eq!(sent_jsonl.lines().count(), 1);
-        let sent: crate::manifest::SendManifestEntry = serde_json::from_str(sent_jsonl.trim_end())?;
-        assert!(
-            sent.error
-                .as_deref()
-                .is_some_and(|message| message.contains("unsupported UInt8 statistic"))
-        );
-        for secret in [
-            "private.example",
-            "credential",
-            "C:\\",
-            "/private",
-            "opaque-secret",
-            "opaque-token",
-            "spaced-secret",
-            "second-secret",
-            "private@account",
-            "three word",
-            "combined",
-            "joined",
-            "private words",
-            "opaque-basic-token",
-            "url-secret",
-            "quoted",
-            "standalone",
-            "private-url-secret",
-            "CANARYSIG",
-        ] {
-            assert!(!sent_jsonl.contains(secret), "leaked admission canary: {secret}");
-        }
-        let mut legacy = serde_json::to_value(&decoded)?;
-        legacy
-            .as_object_mut()
-            .context("manifest object")?
-            .remove("error_message");
-        let legacy: crate::manifest::ReceiptManifestEntry = serde_json::from_value(legacy)?;
-        assert!(legacy.error_message.is_none());
-        Ok(())
     }
 }

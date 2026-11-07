@@ -18,9 +18,8 @@ use arrowcol_protocol::{
 };
 use arrowcol_router_rust::{
     AllowAllAuthenticator, AuthConfig, Authenticator, EdgeRequestSigner, EdgeVerifier, H2Config,
-    InternalIdentitySigner, ProductionRouter, RouterConfig, RouterControlLoop, RouterMetrics,
-    RoutingConfig, ServerConfig, SqlServerConfig, TelemetryConfig, UpstreamConfig, build_server,
-    insert_edge_signature_headers,
+    InternalIdentitySigner, ProductionRouter, RouterConfig, RouterControlLoop, RouterMetrics, RoutingConfig,
+    ServerConfig, SqlServerConfig, TelemetryConfig, UpstreamConfig, build_server, insert_edge_signature_headers,
 };
 use arrowcol_routing::{
     CollectorRegistration, MemoryRoutingStore, RichPressureSnapshot, RoutingEngine, RoutingPolicy, RoutingStore,
