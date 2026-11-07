@@ -44,15 +44,21 @@ export async function buildClients(v1: string, v2: string, signal: AbortSignal):
   const directories = [path.resolve(WORKSPACE, v1), path.resolve(WORKSPACE, v2)];
   const names = directories.map((directory, index) => packageName(directory, index + 1));
   if (names[0] === names[1]) throw new Error('Old and new client SDK fingerprints are not distinct.');
-  const binaries: string[] = [];
-  for (const [index, directory] of directories.entries()) {
-    const client = path.join(ROOT, `v${index + 1}`);
+  const old = await buildClient(v1, 1, signal);
+  const current = await buildClient(v2, 2, signal);
+  return { old, new: current };
+}
+
+export async function buildClient(generated: string, version: 1 | 2, signal: AbortSignal): Promise<string> {
+    const directory = path.resolve(WORKSPACE, generated);
+    const name = packageName(directory, version);
+    const client = path.join(ROOT, `v${version}`);
     safeParents(client);
     fs.mkdirSync(path.join(client, 'src'), { recursive: true });
     fs.copyFileSync(path.join(WORKSPACE, 'experiments/schema-evolution/client.rs'), path.join(client, 'src/main.rs'));
     const manifest = [
-      '[package]', `name = "schema-evolution-client-v${index + 1}"`, 'version = "0.1.0"', 'edition = "2024"',
-      '[workspace]', '[features]', 'v2 = []', `[dependencies.sdk]`, `package = ${JSON.stringify(names[index])}`,
+      '[package]', `name = "schema-evolution-client-v${version}"`, 'version = "0.1.0"', 'edition = "2024"',
+      '[workspace]', '[features]', 'v2 = []', `[dependencies.sdk]`, `package = ${JSON.stringify(name)}`,
       `path = ${JSON.stringify(path.join(directory, 'rust'))}`, '[dependencies]',
       'arrow-array = "=58.4.0"', 'arrow-schema = "=58.4.0"',
       'arrow-flight = { version = "=58.4.0", default-features = false }', 'futures = "=0.3.34"',
@@ -62,15 +68,30 @@ export async function buildClients(v1: string, v2: string, signal: AbortSignal):
     fs.writeFileSync(path.join(client, 'Cargo.toml'), manifest);
     const manifestArg = ['--manifest-path', path.join(client, 'Cargo.toml')];
     await command('cargo', ['generate-lockfile', ...manifestArg], signal);
-    await command('cargo', ['build', '--locked', ...manifestArg, ...(index === 1 ? ['--features', 'v2'] : [])], signal);
-    const binary = path.join(ROOT, 'target/debug', `schema-evolution-client-v${index + 1}`);
+    await command('cargo', ['build', '--locked', ...manifestArg, ...(version === 2 ? ['--features', 'v2'] : [])], signal);
+    const binary = path.join(ROOT, 'target/debug', `schema-evolution-client-v${version}`);
     const description = object(JSON.parse((await command(binary, ['describe'], signal)).trim()));
-    if (description.version !== index + 1 || description.client !== (index === 0 ? 'old' : 'new') ||
-        !Array.isArray(description.fields) || description.fields.includes('bar') !== (index === 1))
+    if (description.version !== version || description.client !== (version === 1 ? 'old' : 'new') ||
+        !Array.isArray(description.fields) || description.fields.includes('bar') !== (version === 2))
       throw new Error('Compiled client does not preserve its historical generated SDK.');
-    binaries.push(binary);
-  }
-  return { old: binaries[0]!, new: binaries[1]! };
+    return binary;
+}
+
+export async function buildCatalogProof(signal: AbortSignal): Promise<string> {
+  const client = path.join(ROOT, 'catalog-proof');
+  safeParents(client);
+  fs.mkdirSync(path.join(client, 'src'), { recursive: true });
+  fs.copyFileSync(path.join(WORKSPACE, 'experiments/schema-evolution/catalog-proof.rs'), path.join(client, 'src/main.rs'));
+  fs.writeFileSync(path.join(client, 'Cargo.toml'), [
+    '[package]', 'name = "schema-evolution-catalog-proof"', 'version = "0.1.0"', 'edition = "2024"',
+    '[workspace]', '[dependencies.arrowcol-catalog-client]',
+    `path = ${JSON.stringify(path.join(WORKSPACE, 'crates/arrowcol-catalog-client'))}`, '[dependencies]',
+    'serde_json = "=1.0.154"', 'tokio = { version = "=1.53.2", features = ["macros", "rt-multi-thread"] }', '',
+  ].join('\n'));
+  const manifestArg = ['--manifest-path', path.join(client, 'Cargo.toml')];
+  await command('cargo', ['generate-lockfile', ...manifestArg], signal);
+  await command('cargo', ['build', '--locked', ...manifestArg], signal);
+  return path.join(ROOT, 'target/debug/schema-evolution-catalog-proof');
 }
 
 async function buildFixtures(signal: AbortSignal): Promise<{ old: string; new: string }> {
@@ -81,7 +102,9 @@ async function buildFixtures(signal: AbortSignal): Promise<{ old: string; new: s
     '--previous', `${base}/catalog-v1`, '--out', `${base}/catalog-v2`]);
   for (const version of [1, 2])
     await generate(['generate', '--artifacts', `${base}/catalog-v${version}`, '--out', `${base}/sdk-v${version}`]);
-  return buildClients(`${base}/sdk-v1`, `${base}/sdk-v2`, signal);
+  const clients = await buildClients(`${base}/sdk-v1`, `${base}/sdk-v2`, signal);
+  await buildCatalogProof(signal);
+  return clients;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
