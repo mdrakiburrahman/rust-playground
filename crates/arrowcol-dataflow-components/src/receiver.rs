@@ -963,9 +963,7 @@ pub(crate) mod tests {
     use arrow_flight::flight_descriptor::DescriptorType;
     use arrow_flight::{FlightData, FlightDescriptor};
     use arrow_schema::{DataType, Field, Schema};
-    use arrowcol_catalog::{
-        CatalogControlPlane, CatalogStore, DdlParser, FlightSqlDdlHandler, MemoryCatalogStore,
-    };
+    use arrowcol_catalog::{CatalogControlPlane, CatalogStore, DdlParser, FlightSqlDdlHandler, MemoryCatalogStore};
     use arrowcol_flight::{DeliveryGuarantee, PutResultMetadata};
     use arrowcol_protocol::{
         BasisPoints, CatalogName, ClaimedSchemaFingerprint, IngestMetadata, Measurement, PressureGauge,
@@ -1279,10 +1277,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn exact_flight_ingest_returns_best_effort_pdata() -> Result<()> {
         let catalog = Arc::new(MemoryCatalogStore::new());
-        let control = CatalogControlPlane::new(
-            DdlParser::default(),
-            Arc::clone(&catalog) as Arc<dyn CatalogStore>,
-        );
+        let control = CatalogControlPlane::new(DdlParser::default(), Arc::clone(&catalog) as Arc<dyn CatalogStore>);
         let ddl = control
             .execute_ddl(arrowcol_catalog::FlightSqlDdlRequest::new(
                 "CREATE TABLE demo.generated.events (id BIGINT NOT NULL, body STRING) USING DELTA",
@@ -1351,10 +1346,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn breaking_flight_schema_is_rejected_before_dfe() -> Result<()> {
         let catalog = Arc::new(MemoryCatalogStore::new());
-        let control = CatalogControlPlane::new(
-            DdlParser::default(),
-            Arc::clone(&catalog) as Arc<dyn CatalogStore>,
-        );
+        let control = CatalogControlPlane::new(DdlParser::default(), Arc::clone(&catalog) as Arc<dyn CatalogStore>);
         let ddl = control
             .execute_ddl(arrowcol_catalog::FlightSqlDdlRequest::new(
                 "CREATE TABLE demo.generated.events (id BIGINT NOT NULL) USING DELTA",
@@ -1742,10 +1734,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn exact_flight_ingest_returns_durable_admission() -> Result<()> {
         let catalog = Arc::new(MemoryCatalogStore::new());
-        let control = CatalogControlPlane::new(
-            DdlParser::default(),
-            Arc::clone(&catalog) as Arc<dyn CatalogStore>,
-        );
+        let control = CatalogControlPlane::new(DdlParser::default(), Arc::clone(&catalog) as Arc<dyn CatalogStore>);
         let ddl = control
             .execute_ddl(arrowcol_catalog::FlightSqlDdlRequest::new(
                 "CREATE TABLE demo.generated.events (id BIGINT NOT NULL) USING DELTA",

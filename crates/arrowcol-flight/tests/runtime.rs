@@ -21,9 +21,9 @@ use arrow_flight::{
 use arrow_schema::{DataType, Field, Schema};
 use arrowcol_catalog::{
     CatalogControlPlane, CatalogError, CatalogField, CatalogResult, CatalogSchemaVersion, CatalogStore, CatalogType,
-    ChangeReservation, DdlParser, DescriptorArtifacts, FlightSqlDdlHandler, MemoryCatalogStore,
-    RequestHash, ReserveOutcome, SagaId, SagaRecord, SagaStep, SchemaValidator, SchemaVersion, TypeMapping,
-    deterministic_field_id, deterministic_table_id, generate_descriptor_artifacts,
+    ChangeReservation, DdlParser, DescriptorArtifacts, FlightSqlDdlHandler, MemoryCatalogStore, RequestHash,
+    ReserveOutcome, SagaId, SagaRecord, SagaStep, SchemaValidator, SchemaVersion, TypeMapping, deterministic_field_id,
+    deterministic_table_id, generate_descriptor_artifacts,
 };
 use arrowcol_flight::{
     ArrowColFlightService, AuthenticationRequest, Authenticator, BatchAdmission, DeliveryGuarantee, PressureEvent,
@@ -504,8 +504,7 @@ async fn durable_and_best_effort_dataflow_completions_are_distinct() -> Result<(
 #[tokio::test]
 async fn flight_sql_ddl_returns_standard_and_structured_completion() -> Result<()> {
     let catalog = MockCatalogStore::new();
-    let (control_plane, report) =
-        CatalogControlPlane::start(DdlParser::default(), Arc::new(catalog.clone())).await?;
+    let (control_plane, report) = CatalogControlPlane::start(DdlParser::default(), Arc::new(catalog.clone())).await?;
     assert!(report.failures.is_empty());
     let admission = MockAdmission::new(TestCompletion::BestEffort, None);
     let service = build_service(

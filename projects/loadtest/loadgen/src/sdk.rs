@@ -92,10 +92,15 @@ pub async fn prepare_tables(
         }
         let version = completion.schema_version();
         let current = store.table(&statement.identity).await?;
-        let head = current.versions.last()
+        let head = current
+            .versions
+            .last()
             .with_context(|| format!("catalog history missing after registration for {}", statement.identity))?;
         if head.version() != version || head.fingerprint() != completion.schema_fingerprint() {
-            bail!("catalog head disagrees with Flight SQL completion for {}", statement.identity);
+            bail!(
+                "catalog head disagrees with Flight SQL completion for {}",
+                statement.identity
+            );
         }
         let artifacts = current.snapshot;
         let table_artifacts = artifact_root.join(statement.identity.table().as_str());
