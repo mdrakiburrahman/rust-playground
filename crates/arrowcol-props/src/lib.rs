@@ -61,6 +61,13 @@ macro_rules! key {
 /// Centrally documented, typed tunables. Unknown `arrowcol.*` keys are errors.
 pub static REGISTRY: &[PropKey] = &[
     key!(
+        "delta.appendOnly",
+        Bool,
+        "false",
+        Validator::Any,
+        "Append-only table policy. Syntax validation does not authorize feature/protocol changes."
+    ),
+    key!(
         "delta.targetFileSize",
         Bytes,
         "128 MiB",
@@ -135,26 +142,26 @@ pub static REGISTRY: &[PropKey] = &[
         Bytes,
         "64 MiB",
         Validator::Positive,
-        "Files strictly below this size are small."
+        "Files strictly below this size are small. Defaults to half an explicitly configured target when unset."
     ),
     key!(
         "arrowcol.optimize.sealedPartitionsOnly",
         Bool,
         "true",
         Validator::Any,
-        "Exclude the newest partition from compaction."
+        "Exclude newest and open ingestion partitions from compaction."
     ),
     key!(
         "arrowcol.optimize.latestPartitions",
         Integer,
-        "2",
-        Validator::Positive,
-        "Number of newest partitions protected by the existing planner."
+        "0",
+        Validator::Any,
+        "Only the newest N eligible sealed partitions; zero means all."
     ),
     key!(
         "arrowcol.optimize.maxFilesPerBin",
         Integer,
-        "128",
+        "64",
         Validator::Minimum(2),
         "Maximum input files per compaction bin."
     ),
@@ -168,35 +175,35 @@ pub static REGISTRY: &[PropKey] = &[
     key!(
         "arrowcol.optimize.maxActionsPerCommit",
         Integer,
-        "4096",
+        "2048",
         Validator::Minimum(3),
         "Maximum add/remove actions in a commit."
     ),
     key!(
         "arrowcol.optimize.maxPlanSize",
         Bytes,
-        "8 MiB",
-        Validator::Positive,
+        "1 MiB",
+        Validator::Minimum(1024),
         "Maximum serialized plan size."
     ),
     key!(
         "arrowcol.optimize.maxDecodedSizePerBin",
         Bytes,
-        "512 MiB",
+        "1 GiB",
         Validator::Positive,
         "Maximum decoded input per bin."
     ),
     key!(
         "arrowcol.optimize.maxOutputFileSize",
         Bytes,
-        "256 MiB",
-        Validator::Positive,
+        "1023 MiB",
+        Validator::Range(1.0, 1_073_741_823.0),
         "Hard maximum encoded output size."
     ),
     key!(
         "arrowcol.optimize.maxActiveFiles",
         Integer,
-        "100000",
+        "1000000",
         Validator::Positive,
         "Maximum files admitted to an optimize plan."
     ),
@@ -212,7 +219,7 @@ pub static REGISTRY: &[PropKey] = &[
         Duration,
         "7 days",
         Validator::Minimum(604_800_000),
-        "VACUUM retention, never shorter than seven days or tombstone retention."
+        "VACUUM retention; at least seven days and no longer than tombstone retention."
     ),
     key!(
         "arrowcol.vacuum.allowShortRetention",
@@ -253,8 +260,29 @@ pub static REGISTRY: &[PropKey] = &[
         "arrowcol.partition.granularity",
         Enum,
         "hour",
-        Validator::OneOf(&["hour", "day", "month"]),
+        Validator::OneOf(&["minute", "hour", "day"]),
         "Time-partition granularity, replacing ARROWCOL_PARTITION_GRANULARITY."
+    ),
+    key!(
+        "arrowcol.optimize.maxRowGroupSize",
+        Bytes,
+        "128 MiB",
+        Validator::Positive,
+        "Maximum uncompressed Parquet input row-group size."
+    ),
+    key!(
+        "arrowcol.optimize.maxBatchSize",
+        Bytes,
+        "64 MiB",
+        Validator::Positive,
+        "Maximum decoded Arrow bytes per input batch."
+    ),
+    key!(
+        "arrowcol.optimize.batchRows",
+        Integer,
+        "8192",
+        Validator::Positive,
+        "Rows read per input batch."
     ),
     key!(
         "arrowcol.layout.enabled",
@@ -625,11 +653,27 @@ pub fn resolve(
             .map_or(key.default, String::as_str);
         values.insert(key.name.into(), key.parse(source)?);
     }
+    if !raw.contains_key("arrowcol.optimize.smallFileSize")
+        && (raw.contains_key("delta.targetFileSize") || raw.contains_key("arrowcol.optimize.targetFileSize"))
+    {
+        let target = match values.get("arrowcol.optimize.targetFileSize") {
+            Some(PropValue::Unsigned(value)) => *value,
+            _ => return Err(error("arrowcol.optimize.targetFileSize", "target resolution failed")),
+        };
+        values.insert(
+            "arrowcol.optimize.smallFileSize".into(),
+            PropValue::Unsigned((target / 2).max(1)),
+        );
+    }
     let result = ResolvedProps { values, raw };
     for (min, max) in [
         ("arrowcol.writer.minInputSize", "arrowcol.writer.maxInputSize"),
         ("arrowcol.vacuum.retention", "delta.deletedFileRetentionDuration"),
         ("arrowcol.optimize.smallFileSize", "arrowcol.optimize.targetFileSize"),
+        (
+            "arrowcol.optimize.targetFileSize",
+            "arrowcol.optimize.maxOutputFileSize",
+        ),
     ] {
         if result.unsigned(min)? > result.unsigned(max)? {
             return Err(error(min, format!("must not exceed {max}")));
@@ -638,11 +682,20 @@ pub fn resolve(
     let min = result.float("arrowcol.writer.minParquetRatio")?;
     let max = result.float("arrowcol.writer.maxParquetRatio")?;
     let cold = result.float("arrowcol.writer.coldStartParquetRatio")?;
+    if !(result.unsigned("arrowcol.writer.targetFileSize")? as f64 / min).is_finite() {
+        return Err(error(
+            "arrowcol.writer.minParquetRatio",
+            "target divided by minimum ratio must remain finite",
+        ));
+    }
     if min > max || cold < min || cold > max {
         return Err(error(
             "arrowcol.writer.coldStartParquetRatio",
             "requires minParquetRatio <= coldStartParquetRatio <= maxParquetRatio",
         ));
+    }
+    if result.unsigned("arrowcol.optimize.minFiles")? > result.unsigned("arrowcol.optimize.maxFilesPerBin")? {
+        return Err(error("arrowcol.optimize.minFiles", "must not exceed maxFilesPerBin"));
     }
     Ok(result)
 }
@@ -683,6 +736,8 @@ mod tests {
 
     #[test]
     fn table_overrides_process_and_delta_target_fallback() -> Result<(), PropError> {
+        let small = resolve(&map(&[("delta.targetFileSize", "32 MiB")]), &BTreeMap::new())?;
+        assert_eq!(small.unsigned("arrowcol.optimize.smallFileSize")?, 16 * 1024 * 1024);
         let props = resolve(
             &map(&[("delta.targetFileSize", "256 MiB")]),
             &map(&[("arrowcol.optimize.targetFileSize", "64 MiB")]),
@@ -744,5 +799,19 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn append_only_is_a_strict_boolean_without_restricting_unknown_delta_keys() -> Result<(), PropError> {
+        assert!(!resolve(&BTreeMap::new(), &BTreeMap::new())?.boolean("delta.appendOnly")?);
+        for value in ["true", "false"] {
+            validate_table_properties(&map(&[("delta.appendOnly", value)]))?;
+        }
+        for value in ["not-a-boolean", "TRUE", "1", ""] {
+            assert!(validate_table_properties(&map(&[("delta.appendOnly", value)])).is_err());
+        }
+        let passthrough = map(&[("delta.vendorExtension", "opaque"), ("vendor.tag", "x")]);
+        assert_eq!(resolve(&passthrough, &BTreeMap::new())?.raw, passthrough);
+        Ok(())
     }
 }

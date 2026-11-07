@@ -8,6 +8,7 @@ Table TBLPROPERTIES override process defaults, which override the defaults below
 
 | Property | Type | Default | Validator | Scope | Since | Purpose |
 | --- | --- | --- | --- | --- | --- | --- |
+| `delta.appendOnly` | Bool | `false` | `Any` | Table | 0.1 | Append-only table policy. Syntax validation does not authorize feature/protocol changes. |
 | `delta.targetFileSize` | Bytes | `128 MiB` | `Positive` | Table | 0.1 | Default compressed Parquet file target. |
 | `delta.deletedFileRetentionDuration` | Duration | `interval 7 days` | `Minimum(604800000)` | Table | 0.1 | Tombstone retention; at least seven days for reader safety. |
 | `delta.logRetentionDuration` | Duration | `interval 30 days` | `Minimum(604800000)` | Table | 0.1 | Retained transaction history; at least seven days. |
@@ -18,24 +19,27 @@ Table TBLPROPERTIES override process defaults, which override the defaults below
 | `arrowcol.optimize.enabled` | Bool | `true` | `Any` | Table | 0.1 | Enable small-file compaction. |
 | `arrowcol.optimize.minFiles` | Integer | `2` | `Minimum(2)` | Table | 0.1 | Minimum small files per eligible partition. |
 | `arrowcol.optimize.targetFileSize` | Bytes | `128 MiB` | `Positive` | Table | 0.1 | Compaction output target; explicit delta.targetFileSize is the fallback. |
-| `arrowcol.optimize.smallFileSize` | Bytes | `64 MiB` | `Positive` | Table | 0.1 | Files strictly below this size are small. |
-| `arrowcol.optimize.sealedPartitionsOnly` | Bool | `true` | `Any` | Table | 0.1 | Exclude the newest partition from compaction. |
-| `arrowcol.optimize.latestPartitions` | Integer | `2` | `Positive` | Table | 0.1 | Number of newest partitions protected by the existing planner. |
-| `arrowcol.optimize.maxFilesPerBin` | Integer | `128` | `Minimum(2)` | Table | 0.1 | Maximum input files per compaction bin. |
+| `arrowcol.optimize.smallFileSize` | Bytes | `64 MiB` | `Positive` | Table | 0.1 | Files strictly below this size are small. Defaults to half an explicitly configured target when unset. |
+| `arrowcol.optimize.sealedPartitionsOnly` | Bool | `true` | `Any` | Table | 0.1 | Exclude newest and open ingestion partitions from compaction. |
+| `arrowcol.optimize.latestPartitions` | Integer | `0` | `Any` | Table | 0.1 | Only the newest N eligible sealed partitions; zero means all. |
+| `arrowcol.optimize.maxFilesPerBin` | Integer | `64` | `Minimum(2)` | Table | 0.1 | Maximum input files per compaction bin. |
 | `arrowcol.optimize.maxBinsPerCommit` | Integer | `16` | `Positive` | Table | 0.1 | Maximum bins committed in one pass. |
-| `arrowcol.optimize.maxActionsPerCommit` | Integer | `4096` | `Minimum(3)` | Table | 0.1 | Maximum add/remove actions in a commit. |
-| `arrowcol.optimize.maxPlanSize` | Bytes | `8 MiB` | `Positive` | Table | 0.1 | Maximum serialized plan size. |
-| `arrowcol.optimize.maxDecodedSizePerBin` | Bytes | `512 MiB` | `Positive` | Table | 0.1 | Maximum decoded input per bin. |
-| `arrowcol.optimize.maxOutputFileSize` | Bytes | `256 MiB` | `Positive` | Table | 0.1 | Hard maximum encoded output size. |
-| `arrowcol.optimize.maxActiveFiles` | Integer | `100000` | `Positive` | Table | 0.1 | Maximum files admitted to an optimize plan. |
+| `arrowcol.optimize.maxActionsPerCommit` | Integer | `2048` | `Minimum(3)` | Table | 0.1 | Maximum add/remove actions in a commit. |
+| `arrowcol.optimize.maxPlanSize` | Bytes | `1 MiB` | `Minimum(1024)` | Table | 0.1 | Maximum serialized plan size. |
+| `arrowcol.optimize.maxDecodedSizePerBin` | Bytes | `1 GiB` | `Positive` | Table | 0.1 | Maximum decoded input per bin. |
+| `arrowcol.optimize.maxOutputFileSize` | Bytes | `1023 MiB` | `Range(1.0, 1073741823.0)` | Table | 0.1 | Hard maximum encoded output size. |
+| `arrowcol.optimize.maxActiveFiles` | Integer | `1000000` | `Positive` | Table | 0.1 | Maximum files admitted to an optimize plan. |
 | `arrowcol.vacuum.enabled` | Bool | `true` | `Any` | Table | 0.1 | Enable physical deletion of expired unreferenced files. |
-| `arrowcol.vacuum.retention` | Duration | `7 days` | `Minimum(604800000)` | Table | 0.1 | VACUUM retention, never shorter than seven days or tombstone retention. |
+| `arrowcol.vacuum.retention` | Duration | `7 days` | `Minimum(604800000)` | Table | 0.1 | VACUUM retention; at least seven days and no longer than tombstone retention. |
 | `arrowcol.vacuum.allowShortRetention` | Bool | `false` | `Any` | Table | 0.1 | Reader-risk acknowledgement only; does not bypass the seven-day property floor. |
 | `arrowcol.vacuum.maxDeletes` | Integer | `10000` | `Positive` | Table | 0.1 | Maximum physical files deleted per pass. |
 | `arrowcol.vacuum.maxListedFiles` | Integer | `100000` | `Positive` | Table | 0.1 | Maximum inventory entries admitted to a cheap probe. |
 | `arrowcol.purge.enabled` | Bool | `false` | `Any` | Table | 0.1 | Enable partition retention; deletes logical data before OPTIMIZE and VACUUM. |
 | `arrowcol.purge.retention` | Duration | `30 days` | `Positive` | Table | 0.1 | Logical partition retention window. |
-| `arrowcol.partition.granularity` | Enum | `hour` | `OneOf(["hour", "day", "month"])` | Table | 0.1 | Time-partition granularity, replacing ARROWCOL_PARTITION_GRANULARITY. |
+| `arrowcol.partition.granularity` | Enum | `hour` | `OneOf(["minute", "hour", "day"])` | Table | 0.1 | Time-partition granularity, replacing ARROWCOL_PARTITION_GRANULARITY. |
+| `arrowcol.optimize.maxRowGroupSize` | Bytes | `128 MiB` | `Positive` | Table | 0.1 | Maximum uncompressed Parquet input row-group size. |
+| `arrowcol.optimize.maxBatchSize` | Bytes | `64 MiB` | `Positive` | Table | 0.1 | Maximum decoded Arrow bytes per input batch. |
+| `arrowcol.optimize.batchRows` | Integer | `8192` | `Positive` | Table | 0.1 | Rows read per input batch. |
 | `arrowcol.layout.enabled` | Bool | `false` | `Any` | Table | 0.1 | Enable bounded sorted-file layout. |
 | `arrowcol.layout.sortColumns` | StringList | `customer_id` | `Positive` | Table | 0.1 | Comma-separated sort columns; names must exist in the table schema. |
 | `arrowcol.layout.bloomColumns` | StringList | `customer_id` | `Any` | Table | 0.1 | Comma-separated Bloom-filter columns; empty disables Bloom filters. |
