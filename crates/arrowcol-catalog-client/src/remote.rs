@@ -414,9 +414,6 @@ impl CatalogStore for RemoteCatalogClient {
     async fn saga(&self, _: SagaId) -> CatalogResult<Option<SagaRecord>> {
         Err(read_only())
     }
-    async fn mark_hive_applied(&self, _: SagaId) -> CatalogResult<SagaRecord> {
-        Err(read_only())
-    }
     async fn persist_artifacts(&self, _: SagaId, _: &DescriptorArtifacts) -> CatalogResult<SagaRecord> {
         Err(read_only())
     }

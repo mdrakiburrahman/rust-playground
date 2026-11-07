@@ -113,7 +113,6 @@ impl RuntimeError {
             | CatalogErrorCode::TableAlreadyExists => Code::InvalidArgument,
             CatalogErrorCode::CorruptCatalogState
             | CatalogErrorCode::ApplicationDatabase
-            | CatalogErrorCode::HiveMetastore
             | CatalogErrorCode::DescriptorGeneration
             | CatalogErrorCode::ReconciliationFailed => Code::Internal,
         };
@@ -136,7 +135,6 @@ impl RuntimeError {
             | CatalogErrorCode::TableAlreadyExists => "Flight SQL DDL request is not allowed",
             CatalogErrorCode::CorruptCatalogState
             | CatalogErrorCode::ApplicationDatabase
-            | CatalogErrorCode::HiveMetastore
             | CatalogErrorCode::DescriptorGeneration
             | CatalogErrorCode::ReconciliationFailed => "catalog operation failed",
         };

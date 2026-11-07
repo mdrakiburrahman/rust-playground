@@ -16,11 +16,11 @@ async fn admin_handlers_encode_health_readiness_capability_and_pressure() -> Res
     let instance_id = CollectorInstanceId::new();
     let capabilities = CollectorCapabilities::new(
         instance_id,
-        ImplementationPool::Direct,
+        ImplementationPool::Dataflow,
         PositiveMeasurement::new(1_024)?,
         PositiveMeasurement::new(8)?,
         PositiveMeasurement::new(32)?,
-        BTreeSet::from([Capability::ReceiptStatus, Capability::PressureReporting]),
+        BTreeSet::from([Capability::PressureReporting]),
     );
     let pressure = PressureSnapshot::new(
         instance_id,

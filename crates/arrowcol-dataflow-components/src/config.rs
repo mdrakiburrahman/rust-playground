@@ -4,7 +4,7 @@ use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 
 use arrowcol_catalog::{
-    CatalogControlPlane, CatalogStore, DdlParser, FlightSqlDdlHandler, MemoryCatalogStore, MemoryMetastore,
+    CatalogControlPlane, CatalogStore, DdlParser, FlightSqlDdlHandler, MemoryCatalogStore,
 };
 use arrowcol_flight::{RuntimeLimits, RuntimeResult};
 use arrowcol_protocol::{PositiveMeasurement, UnixMillis};
@@ -144,7 +144,7 @@ pub enum CatalogConfig {
         #[serde(default = "default_catalog_cache_age", with = "humantime_serde")]
         maximum_cache_age: Duration,
     },
-    /// Empty in-memory catalog and metastore, intended for focused development.
+    /// Empty in-memory catalog, intended for focused development.
     Memory,
 }
 
@@ -188,9 +188,7 @@ impl CatalogConfig {
             }
             Self::Memory => {
                 let store: Arc<dyn CatalogStore> = Arc::new(MemoryCatalogStore::new());
-                let metastore = Arc::new(MemoryMetastore::new());
-                let (control, _) =
-                    CatalogControlPlane::start(DdlParser::default(), Arc::clone(&store), metastore).await?;
+                let (control, _) = CatalogControlPlane::start(DdlParser::default(), Arc::clone(&store)).await?;
                 Ok((store, Arc::new(control)))
             }
         }

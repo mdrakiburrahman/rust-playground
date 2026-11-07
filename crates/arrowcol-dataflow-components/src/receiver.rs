@@ -964,7 +964,7 @@ pub(crate) mod tests {
     use arrow_flight::{FlightData, FlightDescriptor};
     use arrow_schema::{DataType, Field, Schema};
     use arrowcol_catalog::{
-        CatalogControlPlane, CatalogStore, DdlParser, FlightSqlDdlHandler, MemoryCatalogStore, MemoryMetastore,
+        CatalogControlPlane, CatalogStore, DdlParser, FlightSqlDdlHandler, MemoryCatalogStore,
     };
     use arrowcol_flight::{DeliveryGuarantee, PutResultMetadata};
     use arrowcol_protocol::{
@@ -1279,11 +1279,9 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn exact_flight_ingest_returns_best_effort_pdata() -> Result<()> {
         let catalog = Arc::new(MemoryCatalogStore::new());
-        let metastore = Arc::new(MemoryMetastore::new());
         let control = CatalogControlPlane::new(
             DdlParser::default(),
             Arc::clone(&catalog) as Arc<dyn CatalogStore>,
-            metastore,
         );
         let ddl = control
             .execute_ddl(arrowcol_catalog::FlightSqlDdlRequest::new(
@@ -1339,7 +1337,6 @@ pub(crate) mod tests {
         assert_eq!(results.len(), 1);
         let completion = PutResultMetadata::from_put_result(&results[0])?;
         assert_eq!(completion.delivery_guarantee(), Some(DeliveryGuarantee::BestEffort));
-        assert_eq!(completion.receipt_id(), None);
         let captured = sender.sent.lock().expect("capture lock");
         assert_eq!(captured.len(), 1);
         assert_eq!(
@@ -1354,11 +1351,9 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn breaking_flight_schema_is_rejected_before_dfe() -> Result<()> {
         let catalog = Arc::new(MemoryCatalogStore::new());
-        let metastore = Arc::new(MemoryMetastore::new());
         let control = CatalogControlPlane::new(
             DdlParser::default(),
             Arc::clone(&catalog) as Arc<dyn CatalogStore>,
-            metastore,
         );
         let ddl = control
             .execute_ddl(arrowcol_catalog::FlightSqlDdlRequest::new(
@@ -1750,7 +1745,6 @@ pub(crate) mod tests {
         let control = CatalogControlPlane::new(
             DdlParser::default(),
             Arc::clone(&catalog) as Arc<dyn CatalogStore>,
-            Arc::new(MemoryMetastore::new()),
         );
         let ddl = control
             .execute_ddl(arrowcol_catalog::FlightSqlDdlRequest::new(
@@ -1825,7 +1819,6 @@ pub(crate) mod tests {
             completion.delivery_guarantee(),
             Some(DeliveryGuarantee::DurableAdmission)
         );
-        assert_eq!(completion.receipt_id(), None);
         let sent = sender.sent.lock().expect("capture lock").clone();
         assert_eq!(sent.len(), 3);
         assert!(sent.iter().all(|envelope| envelope.instance_key == "dfe-flight-test"));

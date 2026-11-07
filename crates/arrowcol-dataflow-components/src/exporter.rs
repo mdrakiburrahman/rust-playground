@@ -2594,15 +2594,15 @@ mod tests {
         );
     }
 
-    /// Scenario: Repository SQL Server, Hive Metastore, routing leases, and local Delta are live.
+    /// Scenario: Remote Schema Catalog, SQL Server routing leases, and local Delta are live.
     /// Guarantees: Strict catalog validation and authoritative fencing precede generic Delta publication.
     #[tokio::test]
-    #[ignore = "requires projects/arrowcol-infra"]
-    async fn live_sql_hive_delta() {
+    #[ignore = "requires projects/arrowcol-infra and a running remote catalog service"]
+    async fn live_remote_catalog_delta() {
         if std::env::var("ARROWCOL_RUN_LIVE_TESTS").as_deref() != Ok("1") {
             return;
         }
-        use crate::{CatalogConfig, HiveMetastoreConnectionConfig, RoutingStoreConfig, SqlServerConnectionConfig};
+        use crate::{CatalogConfig, RoutingStoreConfig, SqlServerConnectionConfig};
         use arrow_array::Int64Array;
         use arrowcol_catalog::SchemaValidator;
         use arrowcol_protocol::{ClaimedSchemaFingerprint, fingerprint_schema};
@@ -2624,26 +2624,17 @@ mod tests {
             connect_timeout: std::time::Duration::from_secs(15),
             command_timeout: std::time::Duration::from_secs(30),
         };
-        let catalog_config = CatalogConfig::SqlHive {
-            application_database: Box::new(sql.clone()),
-            hive_metastore: Box::new(HiveMetastoreConnectionConfig {
-                host: std::env::var("ARROWCOL_HIVE_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
-                port: std::env::var("ARROWCOL_HIVE_PORT")
-                    .ok()
-                    .and_then(|value| value.parse().ok())
-                    .unwrap_or(9_083),
-                warehouse_root: "file:///opt/hive/data/warehouse".to_owned(),
-                owner: "arrowcol".to_owned(),
-                connect_timeout: std::time::Duration::from_secs(10),
-            }),
-            timestamp_timezone: "UTC".to_owned(),
+        let catalog_config = CatalogConfig::Remote {
+            endpoint: std::env::var("ARROWCOL_CATALOG_ENDPOINT")
+                .expect("ARROWCOL_CATALOG_ENDPOINT must point to the running catalog service"),
+            maximum_cache_age: std::time::Duration::from_secs(10),
         };
         let (catalog_store, control) = catalog_config.start().await.expect("start live catalog");
         let suffix = uuid::Uuid::new_v4().simple().to_string();
         let table_name = format!("dfe_events_{}", &suffix[..12]);
         let completion = control
             .execute_ddl(arrowcol_catalog::FlightSqlDdlRequest::new(format!(
-                "CREATE TABLE arrowcol.live.{table_name} (id BIGINT NOT NULL, label STRING)"
+                "CREATE TABLE arrowcol.live.{table_name} (id BIGINT NOT NULL, label STRING) USING DELTA"
             )))
             .await
             .expect("live DDL");
@@ -2725,7 +2716,7 @@ mod tests {
             .await
             .expect("live lease");
 
-        let output = repository_root.join("projects/arrowcol-dataflow-rust/.temp/live-sql-hive-delta");
+        let output = repository_root.join("projects/arrowcol-dataflow-rust/.temp/live-remote-catalog-delta");
         let _ = std::fs::remove_dir_all(&output);
         std::fs::create_dir_all(&output).expect("create output");
         let delta_log = output
