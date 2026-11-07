@@ -1034,7 +1034,10 @@ fn maintain_table(
         match outcome {
             Ok(report) => result.report = Some(report),
             Err(error) => {
-                let details = error_details(&error);
+                let details = match &setup {
+                    Err(setup_error) => error_details(setup_error),
+                    _ => error_details(&error),
+                };
                 result.error_kind = Some(details.map_or("failure", |details| details.kind.label()));
                 result.report = details.and_then(|details| details.report.as_deref().cloned());
                 result.error = Some(format!("{error:#}"));
