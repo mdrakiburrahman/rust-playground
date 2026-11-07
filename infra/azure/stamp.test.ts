@@ -13,6 +13,9 @@ test('loads the approved resource group, stamp and AKS baseline from YAML', () =
   assert.equal(config.aks.version, '1.35.6');
   assert.equal(config.aks.systemPool.vmSize, 'Standard_D8s_v6');
   assert.equal(config.aks.network.dnsServiceIp, '10.242.0.10');
+  assert.equal(config.storageReadLogDestination, 'storage');
+  assert.equal(defaultStampConfig().storageReadLogDestination, 'log-analytics');
+  assert.throws(() => parseStampConfig(example.replace('storageReadLogDestination: storage', 'storageReadLogDestination: metrics')), /invalid/);
 });
 
 test('rejects invalid stamps, resource-group scope and network overlaps', () => {

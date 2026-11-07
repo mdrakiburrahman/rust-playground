@@ -11,6 +11,7 @@ import { lateLogHelp, positiveControl, profileSummary, resultsTable, writeReport
 import { Narrator, planTrials, runTrial, systemClock, type Trial, type TrialEnvironment, type TrialResult } from './scenario.js';
 import { logsQuery } from './storage-reads.js';
 import { runKubernetes } from './kubernetes.js';
+import { storageExportQuery } from './storage-export.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CLEANUP_MS = 5 * 60_000;
@@ -135,7 +136,7 @@ export async function main(argv: readonly string[]): Promise<number> {
     const [, container] = await azure.blob('HEAD', config.experimentContainer, '', { restype: 'container' }, undefined, {}, true);
     if (!Object.keys(container).length)
       throw new Error(`Storage container ${config.experimentContainer} is missing; run \`npx nx run azure-infra:provision\`.`);
-    say(`StorageBlobLogs attribute ADX reads by shared principal ${principal} and the Kusto/ADX user-agent marker; runner reads are excluded.`);
+    say(`Read evidence requires shared principal ${principal}, this trial's path and complete receipts excluding every owned client read.`);
     const capacity = await kusto.capacity(interrupt.signal).catch(() => undefined);
     say(`QAP capacity (\`.show capacity\`): ${capacity ? `total ${capacity.Total}, consumed ${capacity.Consumed}, ` +
       `remaining ${capacity.Remaining}` : 'not reported'}.`);
@@ -149,13 +150,28 @@ export async function main(argv: readonly string[]): Promise<number> {
       location.workspaceCustomerId = customerId;
       logs = { query: logsQuery(azure, customerId), scope: { workspace: customerId, account: config.account,
         container: config.experimentContainer, requester: principal } };
-      say(`StorageBlobLogs come from workspace ${config.logAnalyticsWorkspace} (customer ID ${customerId}).`);
+      if (config.readLogDestination === 'storage') {
+        const sink = await azure.arm('GET', config.readLogStorageId, undefined, false, '2023-05-01');
+        if (sink?.properties?.provisioningState !== 'Succeeded')
+          throw new Error('Diagnostic storage is not ready; provision the configured stamp first.');
+        logs.query = storageExportQuery(azure, config.readLogAccount,
+          (scope, rows) => evidence.record(scope.prefix.split('/')[2]!, 'storage-export-raw', { account: config.readLogAccount, scope, rows }));
+        logs.storageAccount = config.readLogAccount;
+        location.readLogSource = 'storage';
+        location.readLogAccount = config.readLogAccount;
+        say(`Read evidence comes from Azure Monitor diagnostic storage ${config.readLogAccount}; Log Analytics remains configured but is not a fallback.`);
+      } else {
+        location.readLogSource = 'log-analytics';
+        say(`StorageBlobLogs come from workspace ${config.logAnalyticsWorkspace} (customer ID ${customerId}).`);
+      }
     }
 
     const root = `abfss://${config.experimentContainer}@${config.account}.dfs.core.windows.net/runs/${runId}/`;
-    const fixtures = new Fixtures({ repo: ROOT, root, redact, env: childEnvironment(
+    const fixtures = new Fixtures({ repo: ROOT, root, redact,
+      httpTraceDirectory: path.join(out, 'http-traces', runId), httpMarker: `arrowcol-qap/${runId}`, env: childEnvironment(
       { ...process.env, ...values, ...config.generated(), ARROWCOL_RESET_GENERATION: generation },
       root, process.env.ARROWCOL_QAP_STAGE ?? path.join(ROOT, '.temp/qap-stage')) });
+    if (logs) logs.ownedReads = trial => fixtures.ownedReads(trial);
     const budget = AbortSignal.timeout(Math.max(1, started + profile.budgetMs - clock.now()));
     const source = (trial: Trial) => `${root}${trial.name};managed_identity=${principal}`;
     const environment: TrialEnvironment = { runId, profile, fixtures, kusto, source, principal, logs, clock, narrator,

@@ -1,5 +1,6 @@
 import { HttpFailure, Failure, type Azure } from '../../../infra/azure/bootstrap.ts';
 import { object, type Sleep } from './kusto.js';
+import type { OwnedReads } from './owned-reads.js';
 
 export type Phase = 'warm-up' | 'after-mutation' | 'late';
 /** One summarized ADX-attributed StorageBlobLogs group for one file, operation and status. */
@@ -19,10 +20,11 @@ export interface ReadScope {
   container: string;
   requester: string;
   prefix: string;
+  owned?: OwnedReads;
 }
 export interface ReadWindow { from: number; mutationAt: number; windowEnd: number }
 export interface ReadSummary { files: number; bytes: number; requests: number; paths: string[] }
-export type LogsQuery = (query: string, signal: AbortSignal) => Promise<unknown>;
+export type LogsQuery = (query: string, signal: AbortSignal, context?: { scope: ReadScope; window: ReadWindow }) => Promise<unknown>;
 
 /** Late events must be this far past the watch window before an absence of window reads is trusted. */
 export const LATE_MARGIN_MS = 60_000;
@@ -54,6 +56,17 @@ export function validateScope(scope: ReadScope): void {
   if (!/^[a-z0-9]{3,24}$/.test(scope.account) || !/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/.test(scope.container) ||
       !/^[0-9a-f-]{36}$/i.test(scope.requester) || !/^runs\/[a-z0-9_]+\/[a-z0-9_]+\/$/.test(scope.prefix))
     throw new Error('Invalid storage read scope.');
+  if (scope.owned && (!/^arrowcol-qap\/[a-z0-9_]+\/[a-z0-9_]+$/.test(scope.owned.marker) ||
+      !scope.owned.requestIds.length || scope.owned.requestIds.some(id => !/^[0-9a-f-]{36}$/i.test(id))))
+    throw new Error('Invalid or incomplete owned-read exclusions.');
+}
+
+function attribution(scope: ReadScope): string {
+  if (!scope.owned)
+    return '| where UserAgentHeader contains "Kusto" or UserAgentHeader contains "Azure-Data-Explorer" or UserAgentHeader contains "Azure Data Explorer" or UserAgentHeader contains "AzureDataExplorer"';
+  return `| where UserAgentHeader != ${quote(scope.owned.marker)}
+| where CorrelationId !in (${scope.owned.requestIds.map(quote).join(', ')})
+| where ClientRequestId !in (${scope.owned.requestIds.map(quote).join(', ')})`;
 }
 
 /** The Log Analytics query the demo runs (printed verbatim so it can be pasted into the portal). */
@@ -63,7 +76,7 @@ export function readsQuery(scope: ReadScope, window: ReadWindow): string {
 | where TimeGenerated >= datetime(${iso(window.from)})
 | where AccountName == ${quote(scope.account)} and Category == "StorageRead"
 | where RequesterObjectId =~ ${quote(scope.requester)}
-| where UserAgentHeader contains "Kusto" or UserAgentHeader contains "Azure-Data-Explorer" or UserAgentHeader contains "Azure Data Explorer" or UserAgentHeader contains "AzureDataExplorer"
+${attribution(scope)}
 | where Uri contains ${quote(`/${scope.container}/${scope.prefix}`)}
 | distinct TimeGenerated, CorrelationId, OperationName, Uri, StatusCode, ResponseBodySize, UserAgentHeader
 | extend UserAgent = tostring(UserAgentHeader),
@@ -80,7 +93,7 @@ export function rawQuery(scope: ReadScope, fromMs: number): string {
   return `StorageBlobLogs
 | where TimeGenerated >= datetime(${iso(fromMs)})
 | where RequesterObjectId =~ ${quote(scope.requester)} and Uri contains ${quote(`/${scope.container}/${scope.prefix}`)}
-| where UserAgentHeader contains "Kusto" or UserAgentHeader contains "Azure-Data-Explorer" or UserAgentHeader contains "Azure Data Explorer" or UserAgentHeader contains "AzureDataExplorer"
+${attribution(scope)}
 | project TimeGenerated, OperationName, StatusCode, ResponseBodySize, Uri, UserAgentHeader
 | order by TimeGenerated asc`;
 }
@@ -109,7 +122,8 @@ export function parseReads(response: unknown, scope: ReadScope): ReadGroup[] {
     const url = new URL(String(raw[index.path]));
     const pathname = decodeURIComponent(url.pathname);
     // Listing calls carry the prefix in their query string; only ADX-attributed per-file requests are evidence.
-    if (!hosts.includes(url.hostname) || !pathname.startsWith(root) || !isAdxUserAgent(userAgent)) continue;
+    if (!hosts.includes(url.hostname) || !pathname.startsWith(root) ||
+        (scope.owned ? userAgent === scope.owned.marker : !isAdxUserAgent(userAgent))) continue;
     const requests = raw[index.requests];
     const bytes = raw[index.bytes] ?? 0;
     const status = Number(raw[index.status]);
@@ -183,7 +197,7 @@ export async function waitForLogs(options: LogWaitOptions): Promise<LogWait> {
       await options.nudge().catch(() => undefined);
     }
     try {
-      groups = parseReads(await options.query(text, options.signal), options.scope);
+      groups = parseReads(await options.query(text, options.signal, { scope: options.scope, window: options.window }), options.scope);
       lastError = undefined;
       const window = JSON.stringify(groups.filter(group => group.phase !== 'late')
         .map(group => [group.phase, group.path, group.operation, group.status, group.requests, group.bytes]).sort());

@@ -109,15 +109,31 @@ Copied reports use query paths relative to the directory containing `report.md`,
 so their late-log commands remain usable after retrieval from a pod. A pending
 zero-read count is not evidence that unchanged files were not re-read.
 
-`StorageBlobLogs` attribution must be scoped to the run's
-`experimentqap/runs/<runId>/` prefix, the shared principal, and a Kusto/ADX
-`UserAgentHeader`. The identity alone cannot distinguish pod storage traffic
-from ADX reads. The runtime excludes rows without that marker; AKS mode requires
-`RELOAD`, and the run fails if the positive control does not read every
-unchanged file. The exact ADX user-agent signature must be confirmed against
-live Azure logs before interpreting a run; an unknown signature fails closed.
-Preserve late-log waiting, query files and report output; never turn missing
-telemetry into a zero-reread claim.
+ADX does not guarantee a Kusto-specific user-agent: live QAP reads included
+empty headers and a generic .NET SDK header. Neither is an identity proof.
+Attribution uses the trial's `experimentqap/runs/<runId>/<trial>/` path and shared
+principal, excluding every owned fixture/maintenance request by its enforced
+run-specific marker and recorded client/server request IDs. Incomplete HTTP
+receipts fail attribution. The warm-up evidence window begins after synchronous
+fixture seeding, so native-copy source reads cannot contaminate it. Each trial
+has separate receipts and paths, including when operations run in parallel.
+
+| Stamp YAML setting | Evidence destination | Recheck |
+| --- | --- | --- |
+| `storageReadLogDestination: log-analytics` (omitted setting default) | `StorageBlobLogs` in the configured workspace | Saved `queries/*.kql`, including owned-request exclusions |
+| `storageReadLogDestination: storage` | Azure Monitor NDJSON in separate `arrowreadlogs<stamp>` storage | Saved `queries/*.yaml` through `experiments/azure-qap/src/read-logs.ts` |
+
+The storage destination is declarative, uses Entra-only read access for the
+operator and shared UAMI, and is not the fixture account. It preserves raw
+operation, time, principal, path, bytes and correlation IDs in `evidence.jsonl`;
+HTTP receipts survive pod retrieval under `http-traces/`. The chosen destination
+is explicit in the report: there is no silent fallback to another source.
+Fixture cleanup/reset does not remove diagnostic evidence; deleting the sandbox
+resource group does. Storage logs incur storage charges until deleted.
+
+AKS requires `RELOAD`; missing reads of any unchanged file fail its positive
+control. Preserve late-log waiting, query files and report output; never turn
+missing telemetry into a zero-reread claim.
 
 Offline verification: `npx nx run azure-infra:test`,
 `npx nx run azure-qap-experiment:verify`,

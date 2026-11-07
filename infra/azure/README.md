@@ -45,6 +45,7 @@ flowchart LR
 | Kusto database | `experimentqap` (`AZURE_KUSTO_EXPERIMENT_DATABASE`) | In the existing cluster, same 7-day retention and 1-day hot cache. The experiment creates `qap_<runId>_<operation>` external tables. |
 | Log Analytics workspace | `arrowcol-<sandboxId>` (`AZURE_LOG_ANALYTICS_WORKSPACE`) | `PerGB2018`, 30-day retention. |
 | Diagnostic setting | `arrowcol-storage-reads` | On `blobServices/default`: `StorageRead` only, into the resource-specific `StorageBlobLogs` table. |
+| Optional read-log storage | `arrowreadlogs<stamp>` | `storageReadLogDestination: storage` adds an independent Azure Monitor destination; Entra-only operator/UAMI readers. Evidence survives fixture reset until RG deletion. |
 
 | Access | Grant |
 | --- | --- |
@@ -96,7 +97,7 @@ assignments, registry publishers or FIC subjects remain unaccounted for.
 | Egress IP allocation policy | Set `aks.network.egressIpv4IpTags` and `egressIpv6IpTags` in private stamp YAML only to allocation tags authorized for the target subscription. Empty lists request untagged prefixes; Azure policy may reject them. No policy exemption or skip tags are added. |
 | Kustomize Job config | Copy `infra/kubernetes/azure-qap.example.yaml` to ignored `azure-qap.yaml`; set a digest-pinned image and desired resources/node selector. |
 | Run on AKS | `npx nx run azure-qap-experiment:run -- --kubernetes --kubernetes-config infra/kubernetes/azure-qap.yaml` |
-| Preserve evidence | The runner collects logs, reports and KQL files before removing its unique Job; only shared-principal requests with a Kusto/ADX `UserAgentHeader` under the run prefix count. AKS requires the `reload` positive control. |
+| Preserve evidence | The runner collects raw read evidence, reports, queries and owned HTTP receipts before removing its unique Job. Trial path + shared principal + complete owned-read exclusions identify ADX traffic; no Kusto-specific UA assumption. AKS requires `reload`. |
 
 Do not treat the legacy `reset` command as an AKS resource-group cleanup. No
 resource-group deletion is part of bootstrap or reset.

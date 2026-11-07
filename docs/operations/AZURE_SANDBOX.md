@@ -113,6 +113,13 @@ deploys its own storage account or workspace per run. Reset empties the
 database, but keeps that database and its managed identity policy; logs already
 in the workspace stay until its retention expires.
 
+With `storageReadLogDestination: storage` in the stamp YAML, deployment also
+creates separate `arrowreadlogs<stamp>` storage with read-only operator/shared
+identity roles for Azure Monitor diagnostic export. Reports name the selected
+evidence source and preserve raw events plus owned HTTP receipts; see
+[AKS QAP evidence](AKS_QAP.md). Reset leaves those logs intact; RG deletion
+removes them. Storage charges continue until deletion.
+
 ## Cloud occupancy and reset
 
 **Data-plane reset is enabled for this disposable, single-operator sandbox.**

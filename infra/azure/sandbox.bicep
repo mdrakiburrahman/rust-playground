@@ -12,6 +12,7 @@ param checkpointContainer string
 param experimentContainer string
 param experimentDatabase string
 param logAnalyticsWorkspaceName string
+param readLogStorageAccountName string
 param controlMetadata object
 param checkpointExists bool
 param operatorObjectId string
@@ -59,6 +60,10 @@ resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
     minimumTlsVersion: 'TLS1_2'
     supportsHttpsTrafficOnly: true
     publicNetworkAccess: 'Enabled'
+    networkAcls: {
+      bypass: 'AzureServices'
+      defaultAction: 'Allow'
+    }
   }
 }
 
@@ -293,12 +298,51 @@ resource workspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
   }
 }
 
-// Blob reads only; the experiment filters StorageBlobLogs by run path and the Kusto identity.
+resource readLogStorage 'Microsoft.Storage/storageAccounts@2023-05-01' = if (!empty(readLogStorageAccountName)) {
+  name: readLogStorageAccountName
+  location: location
+  tags: ownership
+  kind: 'StorageV2'
+  sku: { name: 'Standard_LRS' }
+  properties: {
+    allowBlobPublicAccess: false
+    allowSharedKeyAccess: false
+    minimumTlsVersion: 'TLS1_2'
+    supportsHttpsTrafficOnly: true
+    publicNetworkAccess: 'Enabled'
+    networkAcls: {
+      bypass: 'AzureServices'
+      defaultAction: 'Allow'
+    }
+  }
+}
+
+resource operatorReadExport 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(readLogStorageAccountName)) {
+  name: guid(readLogStorage!.id, operatorObjectId, 'read-log-reader')
+  scope: readLogStorage!
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1')
+    principalId: operatorObjectId
+    principalType: operatorType == 'User' ? 'User' : 'ServicePrincipal'
+  }
+}
+
+resource runtimeReadExport 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(readLogStorageAccountName)) {
+  name: guid(readLogStorage!.id, identity.id, 'runtime-read-log-reader')
+  scope: readLogStorage!
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1')
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
 resource storageReads 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = {
   name: 'arrowcol-storage-reads'
   scope: blobs
   properties: {
     workspaceId: workspace.id
+    storageAccountId: empty(readLogStorageAccountName) ? null : readLogStorage!.id
     logAnalyticsDestinationType: 'Dedicated'
     logs: [
       {
@@ -333,6 +377,7 @@ output experimentContainer string = experiment.name
 output experimentDatabase string = experimentDb.name
 output logAnalyticsWorkspaceId string = workspace.id
 output logAnalyticsCustomerId string = workspace.properties.customerId
+output readLogStorageAccountName string = readLogStorageAccountName
 
 output aksClusterName string = aks.outputs.clusterName
 output aksOidcIssuer string = aks.outputs.oidcIssuer

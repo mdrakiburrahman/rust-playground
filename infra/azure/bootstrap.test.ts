@@ -975,7 +975,14 @@ test('Bicep adds experiment container, database, workspace and StorageRead diagn
   const main = fs.readFileSync(path.join(b.ROOT, 'infra/azure/main.bicep'), 'utf8');
   const section = (name: string) => source.split(`resource ${name} `)[1].split('\nresource ')[0].split('\noutput ')[0];
   assert.match(section('experiment'), /parent: blobs[\s\S]*name: experimentContainer[\s\S]*sandboxid: ownership\.sandboxId/);
-  assert.doesNotMatch(source, /Microsoft\.Storage\/storageAccounts@[^\n]*=[\s\S]*Microsoft\.Storage\/storageAccounts@/);
+  assert.deepEqual([...source.matchAll(/resource (\w+) 'Microsoft\.Storage\/storageAccounts@/g)].map(match => match[1]),
+    ['storage', 'readLogStorage']);
+  assert.match(section('readLogStorage'), /if \(!empty\(readLogStorageAccountName\)\)[\s\S]*name: readLogStorageAccountName[\s\S]*tags: ownership/);
+  assert.match(section('readLogStorage'), /allowSharedKeyAccess: false/);
+  for (const name of ['operatorReadExport', 'runtimeReadExport']) {
+    assert.match(section(name), /scope: readLogStorage![\s\S]*2a2b9908-6ea1-4ae2-8e65-a410df84e7d1/);
+    assert.doesNotMatch(section(name), /ba92f5b4/);
+  }
   assert.match(section('readExperiment'), /scope: experiment\n/);
   assert.match(section('readExperiment'), /2a2b9908-6ea1-4ae2-8e65-a410df84e7d1[\s\S]*principalId: identity\.properties\.principalId/);
   assert.match(section('experimentDb'), /name: experimentDatabase[\s\S]*softDeletePeriod: 'P7D'[\s\S]*hotCachePeriod: 'P1D'/);
@@ -984,10 +991,11 @@ test('Bicep adds experiment container, database, workspace and StorageRead diagn
   const reads = section('storageReads');
   assert.match(reads, /name: 'arrowcol-storage-reads'[\s\S]*scope: blobs[\s\S]*workspaceId: workspace\.id/);
   assert.match(reads, /logAnalyticsDestinationType: 'Dedicated'/); assert.match(reads, /category: 'StorageRead'/);
+  assert.match(reads, /storageAccountId: empty\(readLogStorageAccountName\) \? null : readLogStorage!\.id/);
   assert.doesNotMatch(reads, /StorageWrite|StorageDelete|metrics/);
   assert.match(section('readLogs'), /scope: workspace[\s\S]*73c42c96-874c-492b-b04d-ab87d138a893[\s\S]*principalId: operatorObjectId/);
   assert.match(section('readLogs'), /principalType: operatorType == 'User' \? 'User' : 'ServicePrincipal'/);
-  for (const output of ['experimentContainer', 'experimentDatabase', 'logAnalyticsWorkspaceId', 'logAnalyticsCustomerId']) {
+  for (const output of ['experimentContainer', 'experimentDatabase', 'logAnalyticsWorkspaceId', 'logAnalyticsCustomerId', 'readLogStorageAccountName']) {
     assert.match(source, new RegExp(`\\noutput ${output} string = `));
     assert.match(main, new RegExp(`\\noutput ${output} string = sandbox\\.outputs\\.${output}\\n`));
   }

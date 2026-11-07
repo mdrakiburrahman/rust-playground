@@ -74,6 +74,7 @@ export class Config {
   cluster: string; identity: string; identity_client_id: string; kubernetesNamespace: string; kubernetesServiceAccount: string;
   stampConfig: StampConfig; database: string; data: string; checkpoints: string;
   experimentContainer: string; experimentDatabase: string; logAnalyticsWorkspace: string;
+  readLogDestination: 'log-analytics' | 'storage'; readLogAccount: string; readLogStorageId: string;
   sku: string; minimum: number; maximum: number; hot: number; cluster_tags: Record<string, string>;
   operator: string; operator_type: string; operator_application: string; base: string;
   storage_id: string; cluster_id: string; identity_id: string; workspace_id: string; registry_id: string;
@@ -120,6 +121,12 @@ export class Config {
     this.experimentContainer = get('AZURE_STORAGE_EXPERIMENT_CONTAINER', 'experimentqap');
     this.experimentDatabase = get('AZURE_KUSTO_EXPERIMENT_DATABASE', 'experimentqap');
     this.logAnalyticsWorkspace = get('AZURE_LOG_ANALYTICS_WORKSPACE', this.cluster);
+    this.readLogDestination = stampConfig.storageReadLogDestination ?? 'log-analytics';
+    if (values.AZURE_STORAGE_READ_LOG_DESTINATION && values.AZURE_STORAGE_READ_LOG_DESTINATION !== this.readLogDestination)
+      throw new Failure('Storage read-log destination must match the validated stamp configuration.');
+    this.readLogAccount = this.readLogDestination === 'storage' ? 'arrowreadlogs' + this.stamp : '';
+    if (values.AZURE_STORAGE_READ_LOG_ACCOUNT && values.AZURE_STORAGE_READ_LOG_ACCOUNT !== this.readLogAccount)
+      throw new Failure('Diagnostic storage account must match the exact configured stamp.');
     if (!/^[a-z][a-z0-9-]{2,61}[a-z0-9]$/.test(this.logAnalyticsWorkspace))
       throw new Failure('Log Analytics workspace name is invalid.');
     for (const value of [this.location, this.identity, this.cluster, this.database, this.data, this.checkpoints,
@@ -159,6 +166,7 @@ export class Config {
     this.identity_id = this.base + '/providers/Microsoft.ManagedIdentity/userAssignedIdentities/' + this.identity;
     this.registry_id = this.base + '/providers/Microsoft.ContainerRegistry/registries/' + this.registry;
     this.workspace_id = this.base + '/providers/Microsoft.OperationalInsights/workspaces/' + this.logAnalyticsWorkspace;
+    this.readLogStorageId = this.readLogAccount ? this.base + '/providers/Microsoft.Storage/storageAccounts/' + this.readLogAccount : '';
     this.uri = `https://${this.cluster}.${this.location}.kusto.windows.net`;
     const root = get('ARROWCOL_AZURE_TABLE_ROOT', `abfss://${this.data}@${this.account}.dfs.core.windows.net/`);
     // Validate raw authority/path rather than URL's normalized path (which erases traversal).
@@ -173,7 +181,7 @@ export class Config {
   redact(text: string): string {
     for (const value of [this.subscription, this.sandbox, this.account, this.cluster, this.identity,
       this.uri, this.database, this.data, this.checkpoints, this.experimentContainer, this.experimentDatabase,
-      this.logAnalyticsWorkspace]) text = text.replaceAll(value, '[private]');
+      this.logAnalyticsWorkspace, this.readLogAccount].filter(Boolean)) text = text.replaceAll(value, '[private]');
     return text.replace(/https?:\/\/[^\s"'<>]+/g, '[endpoint]')
       .replace(/\b[\w.+-]+@[\w.-]+\.[A-Za-z]+\b/g, '[principal]')
       .replace(/\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b/gi, '[identifier]')
@@ -190,6 +198,7 @@ export class Config {
       ARROWCOL_AZURE_TABLE_ROOT: this.table_root,
       ARROWCOL_AZURE_CHECKPOINT_ROOT: `abfss://${this.checkpoints}@${this.account}.dfs.core.windows.net/`,
       AZURE_STORAGE_EXPERIMENT_CONTAINER: this.experimentContainer,
+      AZURE_STORAGE_READ_LOG_DESTINATION: this.readLogDestination, AZURE_STORAGE_READ_LOG_ACCOUNT: this.readLogAccount,
       AZURE_KUSTO_EXPERIMENT_DATABASE: this.experimentDatabase,
       AZURE_LOG_ANALYTICS_WORKSPACE: this.logAnalyticsWorkspace };
   }
@@ -622,9 +631,10 @@ export async function preflight(azure: Azure): Promise<void> {
 }
 export async function guard_existing(azure: Azure): Promise<void> {
   const c = azure.c;
-  for (const resourcePath of [c.base, c.storage_id, c.cluster_id, c.identity_id, c.workspace_id]) {
+  for (const resourcePath of [c.base, c.storage_id, c.cluster_id, c.identity_id, c.workspace_id,
+    ...(c.readLogStorageId ? [c.readLogStorageId] : [])]) {
     const resource = await azure.arm('GET', resourcePath, undefined, true,
-      resourcePath === c.base ? '2022-09-01' : resourcePath === c.storage_id ? '2023-05-01' :
+      resourcePath === c.base ? '2022-09-01' : [c.storage_id, c.readLogStorageId].includes(resourcePath) ? '2023-05-01' :
         resourcePath === c.identity_id ? '2023-01-31' : resourcePath === c.workspace_id ? LOG_ANALYTICS_API : API);
     if (resource) owned(resource, c);
   }
@@ -643,6 +653,7 @@ export async function deploy(azure: Azure, fresh?: Metadata): Promise<void> {
     publisherFederatedCredentials: c.stampConfig.publisherFederatedCredentials, databaseName: c.database, dataContainer: c.data, checkpointContainer: c.checkpoints,
     experimentContainer: c.experimentContainer, experimentDatabase: c.experimentDatabase,
     logAnalyticsWorkspaceName: c.logAnalyticsWorkspace,
+    readLogStorageAccountName: c.readLogAccount,
     operatorObjectId: c.operator, operatorKustoPrincipalId: c.operator_type === 'App' ? c.operator_application : c.operator,
     controlMetadata: fresh ?? {}, checkpointExists: fresh === undefined, operatorType: c.operator_type,
     clusterSku: c.sku, minimumInstances: c.minimum, maximumInstances: c.maximum, clusterTags: c.cluster_tags };

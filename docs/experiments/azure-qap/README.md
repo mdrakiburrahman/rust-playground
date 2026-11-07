@@ -267,8 +267,10 @@ same scenario as a non-retrying Kubernetes Job; see [AKS QAP
 operations](../../operations/AKS_QAP.md) and the [runtime
 README](../../../experiments/azure-qap/README.md#run-on-aks). Do not interpret
 fixture/setup reads by that shared identity as proof of ADX table reads. AKS
-runs require `reload`; only shared-principal requests with a Kusto/ADX
-`UserAgentHeader` are evidence, and that live signature must be qualified.
+runs require `reload`. Attribution uses the shared principal and trial path
+with complete owned HTTP receipts, not a presumed ADX user-agent. The stamp's
+`storageReadLogDestination` selects Log Analytics or separate diagnostic
+storage; the report names the source and includes portable recheck commands.
 
 Start a devcontainer run with the private `.env` and an Azure sign-in. This is
 a scenario runner, not a loadtest.
@@ -364,10 +366,12 @@ repetitions (`purge`, `purge_2`). Run IDs look like `20250102t030405_ab12`.
    reload control.
 4. **Tail** watches QAP status only, and restarts on every regression, within
    the budget.
-5. **Log wait** reads `StorageBlobLogs` for the run path and the Kusto
-   identity.
+5. **Log wait** reads the configured Azure Monitor destination for the trial
+   path and shared identity, excluding all owned fixture/maintenance requests
+   by their markers and client/server request receipts.
 6. **Report** writes `report.md`, `report.json`, `evidence.jsonl` and one
-   saved Log Analytics query per trial in `queries/` to `--out`.
+   saved query per trial in `queries/` plus `http-traces/` to `--out`. Queries
+   use `.kql` for Log Analytics and `.yaml` for diagnostic-storage export.
 
 Cleanup always runs, even when a phase fails or you press Ctrl+C. It drops every
 `qap_<runId>_<trial>` table and deletes `experimentqap/runs/<runId>/`, with up
@@ -453,31 +457,13 @@ Cluster capacity for acceleration, and what recent queries read remotely:
 | project StartedOn, Text, External
 ```
 
-Which files Kusto read: run this in the Log Analytics workspace's **Logs**
-blade. The run saves this query for each trial, already filled in, as
-`queries/<trial>.kql` in its `--out` folder (see
-[Rerun the log queries after cleanup](#rerun-the-log-queries-after-cleanup)).
-To write it by hand, first get the identity's object ID:
-
-```bash
-az identity show -g rust-playground -n arrowcol-kusto-reader --query principalId -o tsv
-```
-
-```kusto
-StorageBlobLogs
-| where TimeGenerated > ago(3h)
-| where AccountName == "arrowcol<sandboxId>"
-| where Category == "StorageRead"
-| where Uri contains "/experimentqap/runs/<runId>/"
-| where RequesterObjectId =~ "<kusto-identity-object-id>"
-| where UserAgentHeader contains "Kusto" or UserAgentHeader contains "Azure-Data-Explorer" or UserAgentHeader contains "Azure Data Explorer" or UserAgentHeader contains "AzureDataExplorer"
-| where OperationName in ("GetBlob", "ReadFile")
-| where toint(StatusCode) between (200 .. 299)
-| extend File = tostring(parse_url(Uri).Path)
-| summarize Reads = count(), MiB = round(sum(ResponseBodySize) / 1048576.0, 1),
-            FirstRead = min(TimeGenerated), LastArrived = max(ingestion_time()) by File
-| order by FirstRead asc
-```
+Which files ADX read: use the run's generated `queries/<trial>.kql` in the
+workspace's **Logs** blade, or its `queries/<trial>.yaml` through the storage
+reader command printed in `report.md`. These queries include the trial path,
+shared principal and captured owned-request exclusions. A handwritten
+identity-only or generic SDK/user-agent filter cannot distinguish ADX from
+fixture traffic. See [Rerun the log queries after cleanup](#rerun-the-log-queries-after-cleanup)
+and [attribution controls](../../operations/AKS_QAP.md).
 
 How late the logs are:
 

@@ -29,10 +29,12 @@ The runner creates a unique Job with `backoffLimit: 0`, streams its logs, copies
 reports/evidence/query files to the requested local output directory, then
 removes only that run's Job and generated resources. It does not replay a failed
 Job. `RELOAD` is required in AKS mode as the positive control. Evidence is scoped to
-the shared principal and a Kusto/ADX `UserAgentHeader`; fixture/setup reads are
-excluded. The live service signature must be confirmed in Azure logs. An
-unrecognized signature cannot pass the positive control, so it cannot produce
-a false zero-reread success.
+the shared principal and trial path. Enforced HTTP markers and client/server
+request receipts exclude fixture/maintenance reads; incomplete receipts fail
+attribution. No generic SDK or empty user-agent is assumed to identify ADX.
+The explicit stamp setting selects Log Analytics or diagnostic-storage export.
+The report records that source and preserves raw evidence and HTTP receipts.
+Missing positive-control reads cannot produce a zero-reread success.
 
 See [AKS QAP operations](../../docs/operations/AKS_QAP.md) for provisioning,
 image publishing, safety gates and evidence attribution.

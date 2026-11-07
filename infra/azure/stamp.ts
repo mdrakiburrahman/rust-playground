@@ -13,6 +13,7 @@ export interface StampConfig {
   stamp: number;
   resourceGroup: 'arrow-collector-rg';
   location: 'eastus2';
+  storageReadLogDestination?: 'log-analytics' | 'storage';
   aks: {
     version: string;
     skuTier: 'Free' | 'Premium';
@@ -153,7 +154,10 @@ export function defaultStampConfig(values: Record<string, string | undefined> = 
   if (location !== 'eastus2') throw new Failure('Only the qualified eastus2 region is authorized.');
   const aks = { ...DEFAULT_AKS, namespace: values.AZURE_KUBERNETES_NAMESPACE ?? DEFAULT_AKS.namespace,
     serviceAccount: values.AZURE_KUBERNETES_SERVICE_ACCOUNT ?? DEFAULT_AKS.serviceAccount };
-  return { subscription: values.AZURE_SUBSCRIPTION_ID ?? '', stamp: Number(rawStamp), resourceGroup: group, location, aks, publisherFederatedCredentials: [] };
+  const destination = values.AZURE_STORAGE_READ_LOG_DESTINATION ?? 'log-analytics';
+  if (destination !== 'log-analytics' && destination !== 'storage') throw new Failure('Invalid storage read-log destination.');
+  return { subscription: values.AZURE_SUBSCRIPTION_ID ?? '', stamp: Number(rawStamp), resourceGroup: group, location, aks,
+    storageReadLogDestination: destination, publisherFederatedCredentials: [] };
 }
 
 export function parseStampConfig(source: string): StampConfig {
@@ -161,11 +165,13 @@ export function parseStampConfig(source: string): StampConfig {
   try { parsed = parseYaml(source); }
   catch (error) { throw new Failure('AKS stamp configuration is not valid YAML.', { cause: error }); }
   const raw = object(parsed, 'AKS stamp configuration');
-  keys(raw, ['subscription', 'stamp', 'resourceGroup', 'location', 'aks', 'publisherFederatedCredentials'], 'AKS stamp configuration');
+  keys(raw, ['subscription', 'stamp', 'resourceGroup', 'location', 'aks', 'publisherFederatedCredentials', 'storageReadLogDestination'], 'AKS stamp configuration');
   const subscription = text(raw.subscription, 'subscription', /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i).toLowerCase();
   const stamp = integer(raw.stamp, 'stamp', 1, MAX_STAMP);
   const resourceGroup = text(raw.resourceGroup, 'resourceGroup', /^arrow-collector-rg$/) as 'arrow-collector-rg';
   const location = text(raw.location, 'location', /^eastus2$/) as 'eastus2';
+  const storageReadLogDestination = text(raw.storageReadLogDestination ?? 'log-analytics', 'storageReadLogDestination',
+    /^(log-analytics|storage)$/) as 'log-analytics' | 'storage';
   const aksRaw = object(raw.aks, 'aks');
   keys(aksRaw, ['version', 'skuTier', 'namespace', 'serviceAccount', 'systemPool', 'network'], 'aks');
   const version = text(aksRaw.version, 'aks.version', /^\d+\.\d+\.\d+$/);
@@ -246,7 +252,7 @@ export function parseStampConfig(source: string): StampConfig {
       new Set(publisherFederatedCredentials.map(fic => `${fic.issuer}\0${fic.subject}`)).size !== publisherFederatedCredentials.length)
     throw new Failure('publisherFederatedCredentials must have unique names and issuer/subject pairs.');
   return { subscription, stamp, resourceGroup, location, aks: { version, skuTier, namespace, serviceAccount, systemPool, network },
-    publisherFederatedCredentials };
+    publisherFederatedCredentials, storageReadLogDestination };
 }
 
 export function loadStampConfig(filename: string): StampConfig {

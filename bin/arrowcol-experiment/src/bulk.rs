@@ -21,7 +21,7 @@ use delta_kernel_default_engine::parquet::DataFileMetadata;
 use delta_kernel_default_engine::{DefaultEngineBuilder, build_add_file_metadata};
 use futures::stream::{BoxStream, StreamExt};
 use object_store::azure::{AzureAuthorizer, AzureCredential, AzureCredentialProvider};
-use object_store::client::{HttpClient, HttpConnector, HttpRequest, HttpRequestBody, HttpResponse, ReqwestConnector};
+use object_store::client::{HttpClient, HttpConnector, HttpRequest, HttpRequestBody, HttpResponse};
 use object_store::path::Path;
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt,
@@ -790,7 +790,7 @@ impl NativeCopyStore {
         let mut source = endpoint.clone();
         source.set_path(&format!("{container}/{}", location(url, &manifest.source)?));
         Ok(Self {
-            http: ReqwestConnector::default().connect(
+            http: arrow_deltalake::qap_http::azure_http_connector()?.connect(
                 &object_store::ClientOptions::new()
                     .with_timeout(Duration::from_secs(60))
                     .with_connect_timeout(Duration::from_secs(10)),
@@ -966,6 +966,7 @@ copy_transport!(LocalCopyStore, self, location, {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use object_store::client::ReqwestConnector;
     use std::io::{Read, Write};
     use std::net::TcpListener;
 

@@ -30,6 +30,8 @@ pub mod maintenance;
 pub mod normalize;
 #[cfg(feature = "delta")]
 pub mod publisher;
+#[cfg(feature = "delta")]
+pub mod qap_http;
 pub mod sizing;
 #[cfg(feature = "delta")]
 pub mod telemetry;

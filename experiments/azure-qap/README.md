@@ -66,8 +66,9 @@ The YAML controls only the digest-pinned image, resource requests/limits, node
 selector and optional context. Namespace, ServiceAccount, UAMI and Azure
 resource settings come from validated stamp output. Commit the source first: the
 publisher rejects a dirty worktree so each image digest identifies a revision.
-AKS runs must include `reload`; evidence counts only the shared principal's
-StorageBlobLogs rows with a Kusto/ADX `UserAgentHeader`. The Job does not retry
+AKS runs must include `reload`; evidence uses the shared principal and trial
+path, excluding every owned read through HTTP markers and request receipts.
+No Kusto-specific user-agent is assumed. The Job does not retry
 automatically; the runner streams logs and retrieves the report/evidence/query
 files before cleaning its uniquely named Job. See [Kubernetes runtime
 configuration](../../infra/kubernetes/README.md) and [AKS QAP
@@ -86,12 +87,13 @@ operations](../../docs/operations/AKS_QAP.md).
    drops and recreates the table for `reload`.
 4. **Tail**: watches QAP state and extents; if QAP looks caught up and then
    regresses, the window restarts (bounded by `--budget`).
-5. **Log wait**: polls Log Analytics for reads by the shared principal under the
-   trial's prefix and with a Kusto/ADX `UserAgentHeader`; runner/fixture reads do
-   not count. Late logs settle within `--log-wait`.
+5. **Log wait**: polls the stamp's explicit Azure Monitor destination (Log
+   Analytics or separate diagnostic storage) for shared-principal reads under
+   the trial prefix. Complete fixture/maintenance HTTP receipts exclude owned
+   reads; missing receipts fail attribution. Late logs settle within `--log-wait`.
 6. **Report**: prints a table per trial and writes `report.md`, `report.json`,
-   `evidence.jsonl` and `queries/*.kql` under `--out`, plus the queries to
-   re-check late logs.
+   `evidence.jsonl`, `http-traces/` and saved queries under `--out`: `.kql` for
+   Log Analytics or `.yaml` for storage export. The report includes recheck commands.
 
 A trial ends as `complete`, `late-logs-pending`, `budget-exceeded` or `failed`.
 
