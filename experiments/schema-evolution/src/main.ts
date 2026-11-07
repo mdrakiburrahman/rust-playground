@@ -13,7 +13,7 @@ import { PublisherControl } from '../../../infra/azure/publisher_control.ts';
 import { runExperiment, runProcess, type StageContext } from '../../../tools/libs/experiment-kit/src/experiment.js';
 import { deletePrefix } from '../../azure-qap/src/fixtures.ts';
 import { secretsFrom } from '../../azure-qap/src/main.ts';
-import { Kusto, object, tables, type KustoClient } from '../../azure-qap/src/kusto.ts';
+import { Kusto, object, ready, tables, type KustoClient } from '../../azure-qap/src/kusto.ts';
 import { buildCatalogProof, buildClient } from './build-clients.ts';
 import { nullableBar, physicalCounts, snapshot, type Snapshot } from './delta.ts';
 import { exactRowsQuery, observeHydration, requestedNullQuery, schemaQuery, verifyExactRows } from './hydration.ts';
@@ -289,7 +289,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         if (nullableBar((await fetchSnapshot(ctx)).schema)) throw new Error('bar exists before ALTER.');
         return { status: 'passed', summary: 'Genuinely generated v1 client is still alive after publishing its first cohort.' };
       } },
-      { name: 'enable-native-refresh-before-alter', timeoutMs: 5 * 60_000, run: async ctx => {
+      { name: 'enable-native-refresh-before-alter', timeoutMs: 15 * 60_000, run: async ctx => {
         requestSignal = ctx.signal;
         const create = `.create external table ['${table}'] kind=delta (h@'${source}')`;
         await kusto!.management(create, ctx.signal);
@@ -301,6 +301,12 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         const auto = `.alter external table ['${table}'] kind=delta (h@'${source}') with (AutoUpdateSchema=true)`;
         await kusto!.management(auto, ctx.signal);
         ctx.record('native-prerequisites', { create, policy, auto });
+        const before = await fetchSnapshot(ctx);
+        await until(ctx, 'initial-qap-ready', async () => {
+          const sample = await kusto!.sample(table, ctx.signal);
+          ctx.record('initial-qap', sample);
+          return ready(sample, { version: before.version, rows: ROWS });
+        });
         const columns = await kusto!.query(schemaQuery(table), ctx.signal);
         if (columns.some(row => row[0] === 'bar')) throw new Error('Kusto exposes bar before ALTER.');
         return { status: 'passed', summary: 'Inferred v1 external table, QAP, then native AutoUpdateSchema enabled before ALTER.' };
@@ -355,6 +361,12 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       } },
       { name: 'native-kusto-schema-and-data-hydration', timeoutMs: 20 * 60_000, run: async ctx => {
         requestSignal = ctx.signal;
+        const target = await fetchSnapshot(ctx);
+        await until(ctx, 'evolved-qap-ready', async () => {
+          const sample = await kusto!.sample(table, ctx.signal);
+          ctx.record('evolved-qap', sample);
+          return ready(sample, { version: target.version, rows: ROWS * 3 });
+        });
         const counts = await observeHydration(kusto!, table, { deadline: ctx.deadline, signal: ctx.signal,
           rowsPerPhase: ROWS, record: observation => ctx.record('native-hydration', observation) });
         const exactQuery = exactRowsQuery(table), exactRows = await kusto!.query(exactQuery, ctx.signal);
