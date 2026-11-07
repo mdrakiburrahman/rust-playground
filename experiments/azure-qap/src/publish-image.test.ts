@@ -20,6 +20,7 @@ test('requires an ACR name and validates image tags', () => {
   });
   assert.throws(() => parseImageOptions(['--registry', 'bad_registry']), /registry/);
   assert.throws(() => parseImageOptions(['--registry', 'arrowcollector1', '--tag', 'UPPER']), /tag/);
+  assert.equal(parseImageOptions(['--registry', 'arrowcollector1', '--federated']).federated, true);
 });
 
 function inputs(t: test.TestContext) {
@@ -64,4 +65,63 @@ test('publishing uses the stamped subscription and produces an immutable image r
   assert.equal(image, `arrowcollector1.azurecr.io/azure-qap@${DIGEST}`);
   assert.ok(calls.every(command => !command.includes('--subscription') || command[command.indexOf('--subscription') + 1] === SUBSCRIPTION));
   assert.ok(calls.some(command => command[0] === 'docker' && command.includes('--push')));
+});
+
+test('federated publishing bootstraps the shared ServiceAccount and isolates operator credentials', async t => {
+  const calls: string[][] = [];
+  let isolated = '';
+  let identity = '';
+  const runner: typeof run_tree = async (command, _timeout, _cwd, env) => {
+    calls.push(command);
+    let stdout = '';
+    if (command[0] === 'git' && command[1] === 'rev-parse') stdout = 'deadbeef';
+    if (command[1] === 'aks') stdout = 'stamp.example.com';
+    if (command[0] === 'kubectl' && command[1] === 'config') stdout = 'https://stamp.example.com:443';
+    if (command[0] === 'kubectl' && command[1] === 'apply') identity = fs.readFileSync(command.at(-1)!, 'utf8');
+    if (command[0] === 'kubectl' && command[1] === 'create') stdout = 'header.payload.signature';
+    if (command[1] === 'account') stdout = command.includes('tenantId') ? SUBSCRIPTION : CLIENT_ID;
+    if (command[1] === 'login') isolated = env?.AZURE_CONFIG_DIR ?? '';
+    if (command[1] === 'acr' && command[2] === 'show') stdout = 'arrowcollector1.azurecr.io';
+    if (command[1] === 'acr' && command[2] === 'manifest') stdout = DIGEST;
+    if (command[0] === 'docker' || command[1] === 'acr')
+      assert.equal(env?.AZURE_CONFIG_DIR, isolated);
+    return { returncode: 0, stdout, stderr: '' };
+  };
+  const original = process.env.AZURE_CONFIG_DIR;
+  assert.equal(await publishRuntimeImage({ ...inputs(t), federated: true }, runner),
+    `arrowcollector1.azurecr.io/azure-qap@${DIGEST}`);
+  assert.match(identity, new RegExp(`azure.workload.identity/client-id: ${CLIENT_ID}`));
+  assert.match(identity, /kind: Namespace/);
+  assert.match(identity, /kind: ServiceAccount/);
+  assert.ok(calls.some(command => command.includes('api://AzureADTokenExchange')));
+  assert.ok(isolated && !fs.existsSync(path.dirname(isolated)));
+  assert.equal(process.env.AZURE_CONFIG_DIR, original);
+});
+
+test('federated publishing refuses a different cluster before applying resources', async t => {
+  const runner: typeof run_tree = async command => {
+    if (command[0] === 'git') return { returncode: 0, stdout: command[1] === 'status' ? '' : 'deadbeef', stderr: '' };
+    if (command[1] === 'aks') return { returncode: 0, stdout: 'expected.example.com', stderr: '' };
+    if (command[1] === 'config') return { returncode: 0, stdout: 'https://foreign.example.com', stderr: '' };
+    throw new Error('Publishing modified a foreign cluster.');
+  };
+  await assert.rejects(() => publishRuntimeImage({ ...inputs(t), federated: true }, runner), /stamped AKS cluster/);
+});
+
+test('failed federated login redacts the assertion and removes the isolated cache', async t => {
+  let isolated = '';
+  const assertion = 'private.payload.signature';
+  const runner: typeof run_tree = async (command, _timeout, _cwd, env) => {
+    if (command[0] === 'git') return { returncode: 0, stdout: command[1] === 'status' ? '' : 'deadbeef', stderr: '' };
+    if (command[1] === 'aks') return { returncode: 0, stdout: 'stamp.example.com', stderr: '' };
+    if (command[1] === 'config') return { returncode: 0, stdout: 'https://stamp.example.com', stderr: '' };
+    if (command[1] === 'account') return { returncode: 0, stdout: SUBSCRIPTION, stderr: '' };
+    if (command[1] === 'apply') return { returncode: 0, stdout: '', stderr: '' };
+    if (command[1] === 'create') return { returncode: 0, stdout: assertion, stderr: '' };
+    isolated = env?.AZURE_CONFIG_DIR ?? '';
+    return { returncode: 1, stdout: '', stderr: `login rejected ${assertion}` };
+  };
+  await assert.rejects(() => publishRuntimeImage({ ...inputs(t), federated: true }, runner),
+    error => error instanceof Error && error.message.includes('login rejected ******') && !error.message.includes(assertion));
+  assert.ok(isolated && !fs.existsSync(path.dirname(isolated)));
 });

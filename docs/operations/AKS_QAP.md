@@ -70,9 +70,17 @@ The image must be built for `linux/amd64`, pushed to the stamped ACR, and
 referenced by digest. The image publisher reads the identity client ID from
 `.env.azure` and subscription from the private stamp; it refuses to publish
 unless the active Azure CLI principal is the `arrow-collector` UAMI.
+For an operator-authenticated fresh clone, use `--federated`: it first verifies
+that the active kubectl context is the stamped cluster, applies the existing
+namespace/ServiceAccount templates, and obtains an AKS-issued assertion. The
+publisher signs in to the shared UAMI in a temporary Azure CLI cache, verifies
+that principal again, and removes the cache afterward. Operator credentials are
+not replaced. First obtain the stamped cluster's kubeconfig with
+`az aks get-credentials` and convert it with `kubelogin convert-kubeconfig -l azurecli`.
 
 ```bash
 npx nx run azure-qap-experiment:image -- \
+  --federated \
   --registry <stamped-acr> --env .env --azure-env .env.azure \
   --stamp-config infra/azure/stamp.yaml
 cp infra/kubernetes/azure-qap.example.yaml infra/kubernetes/azure-qap.yaml
@@ -90,6 +98,13 @@ runner streams logs and retrieves the report, JSONL evidence and KQL files
 before deleting only its uniquely named Job and generated resources.
 
 ## Evidence and validation
+
+New diagnostic routing can take
+[up to 90 minutes to start](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/diagnostic-settings#expected-latency-after-creating-a-diagnostic-setting).
+Bootstrap readiness does not imply telemetry readiness. A cold-stamp run can
+recover QAP and pass row parity while correctly failing the RELOAD positive
+control because no read logs arrived. Preserve that failed result and its query
+files; qualify routing before a new run instead of weakening evidence checks.
 
 `StorageBlobLogs` attribution must be scoped to the run's
 `experimentqap/runs/<runId>/` prefix, the shared principal, and a Kusto/ADX
