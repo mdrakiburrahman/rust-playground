@@ -238,6 +238,9 @@ async fn reserved_properties_failed_ddl_and_retained_gap() -> Result<()> {
         "ALTER TABLE arrowcol.default.events ADD COLUMNS (required BIGINT NOT NULL)",
         "ALTER TABLE arrowcol.default.events SET TBLPROPERTIES ('arrowcol.unknown'='oops')",
         "ALTER TABLE arrowcol.default.events SET TBLPROPERTIES ('delta.columnMapping.mode'='name')",
+        "ALTER TABLE arrowcol.default.events SET TBLPROPERTIES ('delta.enableDeletionVectors'='true')",
+        "ALTER TABLE arrowcol.default.events SET TBLPROPERTIES ('delta.enableRowTracking'='true')",
+        "ALTER TABLE arrowcol.default.events SET TBLPROPERTIES ('delta.appendOnly'='not-a-boolean')",
     ] {
         assert!(service.apply_sql(sql).await.is_err(), "invalid DDL was accepted: {sql}");
         assert_eq!(service.state.lock().await.event_id, from.event_id);

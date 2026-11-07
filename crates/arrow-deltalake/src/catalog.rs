@@ -212,6 +212,60 @@ impl Committer for MetadataCommitter {
         )?;
         validated.ensure_operation_supported(delta_kernel::table_features::Operation::Scan)?;
         validated.ensure_operation_supported(delta_kernel::table_features::Operation::Write)?;
+        let properties = validated.table_properties();
+        if properties
+            .column_mapping_mode
+            .unwrap_or(delta_kernel::table_features::ColumnMappingMode::None)
+            != validated.column_mapping_mode()
+        {
+            return Err(delta_kernel::Error::generic(
+                "catalog metadata cannot activate column mapping without its protocol",
+            ));
+        }
+        for (enabled, feature) in [
+            (
+                properties.enable_change_data_feed,
+                delta_kernel::table_features::TableFeature::ChangeDataFeed,
+            ),
+            (
+                properties.enable_deletion_vectors,
+                delta_kernel::table_features::TableFeature::DeletionVectors,
+            ),
+            (
+                properties.enable_row_tracking,
+                delta_kernel::table_features::TableFeature::RowTracking,
+            ),
+            (
+                properties.enable_iceberg_compat_v1,
+                delta_kernel::table_features::TableFeature::IcebergCompatV1,
+            ),
+            (
+                properties.enable_iceberg_compat_v2,
+                delta_kernel::table_features::TableFeature::IcebergCompatV2,
+            ),
+            (
+                properties.enable_iceberg_compat_v3,
+                delta_kernel::table_features::TableFeature::IcebergCompatV3,
+            ),
+            (
+                properties.enable_in_commit_timestamps,
+                delta_kernel::table_features::TableFeature::InCommitTimestamp,
+            ),
+        ] {
+            if enabled == Some(true) && !validated.is_feature_supported(&feature) {
+                return Err(delta_kernel::Error::generic(format!(
+                    "catalog metadata cannot activate {feature} without its protocol"
+                )));
+            }
+        }
+        if properties.enable_type_widening == Some(true)
+            && !validated.is_feature_supported(&delta_kernel::table_features::TableFeature::TypeWidening)
+            && !validated.is_feature_supported(&delta_kernel::table_features::TableFeature::TypeWideningPreview)
+        {
+            return Err(delta_kernel::Error::generic(
+                "catalog metadata cannot activate type widening without its protocol",
+            ));
+        }
         let serialized = serde_json::to_value(&final_metadata)?;
         let mut prepared = Vec::new();
         let mut found_metadata = false;
