@@ -180,7 +180,10 @@ fn safe_component(value: &str) -> Result<&str> {
 fn proto_source_for(schema: &CatalogSchemaVersion, descriptor: &[u8]) -> Result<Vec<u8>> {
     let canonical = generate_descriptor_artifacts(schema)?;
     if canonical.protobuf_descriptor() != descriptor {
-        bail!("catalog descriptor disagrees with immutable schema history for {}", schema.identity());
+        bail!(
+            "catalog descriptor disagrees with immutable schema history for {}",
+            schema.identity()
+        );
     }
     Ok(canonical.protobuf_source()?.into_bytes())
 }
@@ -332,7 +335,6 @@ struct RoutingManifest {
     table: String,
     schema_fingerprint: String,
 }
-
 
 #[cfg(test)]
 mod tests {

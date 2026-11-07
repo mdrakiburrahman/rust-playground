@@ -165,5 +165,5 @@ test('actual HTTP OTLP export preserves measured zeros and rejects partial accep
   assert(serialized.includes('"timeUnixNano":"1800000000000000000"'));
   assert(!serialized.includes('tenant') && !serialized.includes('table') && !serialized.includes('run_id'));
   reject = true;
-  await assert.rejects(exportQapPoints(endpoint, 1_800_000_000_000, [{ name: 'qap_pending_artifacts', pool: 'direct', value: 0 }]), /rejected/u);
+  await assert.rejects(exportQapPoints(endpoint, 1_800_000_000_000, [{ name: 'qap_pending_artifacts', pool: 'dataflow', value: 0 }]), /rejected/u);
 });

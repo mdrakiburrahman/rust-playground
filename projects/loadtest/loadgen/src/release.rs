@@ -751,7 +751,12 @@ mod tests {
         ];
         for mutate in mutations {
             let mut case = observed_crash();
-            mutate(case.drain.crashes.as_mut().expect("crash evidence"));
+            assert_eq!(
+                case.drain.crashes.as_ref().map(|crashes| crashes.publishers.len()),
+                Some(1),
+                "crash fixture must contain one publisher"
+            );
+            case.drain.crashes.iter_mut().for_each(mutate);
             assert!(!decide(case).passed);
         }
         let mut case = observed_crash();
