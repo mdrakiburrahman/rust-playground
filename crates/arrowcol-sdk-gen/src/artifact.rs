@@ -86,6 +86,7 @@ impl ArtifactBundle {
             decoded.schema.fields().to_vec(),
             decoded.schema.canonical_ddl(),
         )
+        .and_then(|schema| schema.with_metadata(decoded.schema.metadata().clone()))
         .map_err(|error| SdkGenError::Artifact(error.to_string()))?;
         if rebuilt_schema != decoded.schema {
             return Err(SdkGenError::Artifact(

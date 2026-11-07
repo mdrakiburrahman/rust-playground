@@ -1,7 +1,7 @@
 use std::{fs, path::PathBuf};
 
 use arrowcol_catalog::{
-    CatalogField, CatalogSchemaVersion, DdlCommand, DdlParser, SchemaVersion, deterministic_table_id,
+    CatalogSchemaVersion, DdlCommand, DdlParser, SchemaVersion, deterministic_table_id, next_protobuf_field_number,
 };
 use arrowcol_sdk_gen::{
     ArtifactBundle, SafeOutputPath, check_generated_sdk, generate_sdk, package_generated_sdk, verify_compatibility,
@@ -119,7 +119,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     SchemaVersion::FIRST,
                     create.fields().to_vec(),
                     create.canonical_ddl(),
-                )?,
+                )?
+                .with_metadata(create.metadata().clone())?,
                 (DdlCommand::AddColumns(add), Some(previous)) => {
                     let previous = ArtifactBundle::load_directory(previous)?;
                     let old = previous.schema();
@@ -130,20 +131,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     let mut position = old.next_position()?;
                     let mut number = old.next_field_number()?;
                     for blueprint in add.fields() {
-                        if (19_000..=19_999).contains(&number) {
-                            number = 20_000;
-                        }
-                        fields.push(CatalogField::new(
-                            blueprint.id(),
-                            blueprint.name(),
-                            position,
-                            number,
-                            blueprint.is_nullable(),
-                            None,
-                            blueprint.mapping().clone(),
-                        )?);
+                        fields.push(blueprint.materialize(position, number)?);
                         position = position.checked_add(1).ok_or("column ordinal overflow")?;
-                        number = number.checked_add(1).ok_or("protobuf number overflow")?;
+                        number = next_protobuf_field_number(number)?;
                     }
                     let candidate = CatalogSchemaVersion::new(
                         old.table_id(),
@@ -151,7 +141,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         old.version().next()?,
                         fields,
                         add.canonical_ddl(),
-                    )?;
+                    )?
+                    .with_metadata(old.metadata().clone())?;
                     verify_compatibility(&previous, &ArtifactBundle::from_schema(candidate.clone())?)?;
                     candidate
                 }

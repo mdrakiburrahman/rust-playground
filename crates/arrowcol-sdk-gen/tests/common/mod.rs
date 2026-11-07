@@ -37,6 +37,7 @@ pub fn schema_from_ddl(ddl: &str) -> CatalogSchemaVersion {
         create.fields().to_vec(),
         create.canonical_ddl(),
     )
+    .and_then(|schema| schema.with_metadata(create.metadata().clone()))
     .unwrap_or_else(|error| panic!("fixture schema must be valid: {error}"))
 }
 

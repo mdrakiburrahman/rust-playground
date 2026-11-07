@@ -12,7 +12,7 @@ use common::{clone_field, fixture_schema};
 fn nullable_tail_append_is_wire_json_and_layout_compatible() {
     let previous = fixture_schema();
     let DdlCommand::AddColumns(add) = DdlParser::default()
-        .parse("ALTER TABLE telemetry.prod.sdk_events ADD COLUMNS (status VARCHAR)")
+        .parse("ALTER TABLE telemetry.prod.sdk_events ADD COLUMNS (status STRING)")
         .unwrap_or_else(|error| panic!("append DDL must parse: {error}"))
     else {
         panic!("expected add columns");
@@ -44,6 +44,7 @@ fn nullable_tail_append_is_wire_json_and_layout_compatible() {
         fields,
         add.canonical_ddl(),
     )
+    .and_then(|schema| schema.with_metadata(previous.metadata().clone()))
     .unwrap_or_else(|error| panic!("candidate schema: {error}"));
     let report = verify_compatibility(&bundle(previous), &bundle(current))
         .unwrap_or_else(|error| panic!("append must be compatible: {error}"));
