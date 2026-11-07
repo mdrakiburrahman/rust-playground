@@ -68,6 +68,39 @@ fn valid_metadata(metadata: &BTreeMap<String, String>) -> std::result::Result<()
     Ok(())
 }
 
+fn sandbox_identity(subscription: &str, group: Option<&str>) -> Result<String> {
+    let group = group.unwrap_or("rust-playground");
+    let valid_group = group == "rust-playground"
+        || group.strip_prefix("rust-playground-").is_some_and(|suffix| {
+            suffix.split('-').all(|segment| {
+                !segment.is_empty()
+                    && segment
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            })
+        });
+    if !valid_group || group.len() > 90 {
+        bail!("Azure resource group must be rust-playground or a lowercase rust-playground- sandbox name");
+    }
+    let subscription = if subscription
+        .get(..9)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("urn:uuid:"))
+    {
+        &subscription[9..]
+    } else {
+        subscription
+    };
+    let subscription = subscription.strip_prefix('{').unwrap_or(subscription);
+    let subscription = subscription.strip_suffix('}').unwrap_or(subscription);
+    let raw = subscription.replace('-', "");
+    let subscription = uuid::Uuid::parse_str(&raw)
+        .context("Azure sandbox ownership requires a subscription UUID")?
+        .hyphenated()
+        .to_string();
+    let digest = format!("{:x}", Sha256::digest(format!("{subscription}:{group}")));
+    Ok(digest[..12].to_owned())
+}
+
 impl AzureControlContainer {
     pub(crate) fn new(account: &str, credentials: AzureCredentialProvider) -> Result<Self> {
         let container = std::env::var("AZURE_STORAGE_CHECKPOINT_CONTAINER").unwrap_or_else(|_| "checkpoints".into());
@@ -82,10 +115,15 @@ impl AzureControlContainer {
         }
         let subscription =
             std::env::var("AZURE_SUBSCRIPTION_ID").context("Azure sandbox ownership configuration missing")?;
-        let sandbox_id = format!("{:x}", Sha256::digest(format!("{subscription}:rust-playground")));
+        let group = match std::env::var("AZURE_RESOURCE_GROUP") {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(error) => return Err(error).context("Invalid Azure resource group configuration"),
+        };
+        let sandbox_id = sandbox_identity(&subscription, group.as_deref())?;
         Self::with_endpoint(
             format!("https://{account}.blob.core.windows.net/{container}"),
-            sandbox_id[..12].to_owned(),
+            sandbox_id,
             credentials,
         )
     }
@@ -303,6 +341,68 @@ mod tests {
 
     const SANDBOX: &str = "0123456789ab";
     const GENERATION: &str = "00000000-0000-4000-8000-000000000001";
+
+    #[test]
+    fn sandbox_identity_matches_typescript_and_preserves_default() -> Result<()> {
+        let subscription = "00000000-0000-0000-0000-000000000001";
+        assert_eq!(sandbox_identity(subscription, None)?, "07657369824b");
+        assert_eq!(sandbox_identity(subscription, Some("rust-playground"))?, "07657369824b");
+        assert_eq!(
+            sandbox_identity(subscription, Some("rust-playground-schema-evo"))?,
+            "582e3df61d82"
+        );
+        for normalized in [
+            "00000000000000000000000000000001",
+            "{00000000-0000-0000-0000-000000000001}",
+            "URN:UUID:00000000-0000-0000-0000-000000000001",
+        ] {
+            assert_eq!(
+                sandbox_identity(normalized, Some("rust-playground-schema-evo"))?,
+                "582e3df61d82"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sandbox_identity_rejects_invalid_configuration() {
+        for group in [
+            "",
+            "production",
+            "rust-playground-",
+            "rust-playground--evo",
+            "Rust-playground-evo",
+            "rust-playground-../other",
+            "rust-playground-evo.",
+        ] {
+            assert!(sandbox_identity(GENERATION, Some(group)).is_err(), "{group}");
+        }
+        assert!(sandbox_identity(GENERATION, Some(&format!("rust-playground-{}", "a".repeat(80)))).is_err());
+        for subscription in ["", "default", "not-a-uuid"] {
+            assert!(sandbox_identity(subscription, None).is_err());
+        }
+    }
+
+    #[test]
+    fn configured_group_does_not_adopt_foreign_authority() -> Result<()> {
+        let subscription = "00000000-0000-0000-0000-000000000001";
+        let expected = sandbox_identity(subscription, Some("rust-playground-schema-evo"))?;
+        let mut metadata = authority("ready-v1");
+        metadata.insert("sandboxid".into(), expected.clone());
+        assert!(Registry::parse(&metadata, &expected).is_ok());
+        assert!(Registry::parse(&metadata, &sandbox_identity(subscription, None)?).is_err());
+        assert!(
+            Registry::parse(
+                &metadata,
+                &sandbox_identity(
+                    "00000000-0000-0000-0000-000000000002",
+                    Some("rust-playground-schema-evo")
+                )?
+            )
+            .is_err()
+        );
+        Ok(())
+    }
 
     #[derive(Debug, Clone)]
     struct Request {

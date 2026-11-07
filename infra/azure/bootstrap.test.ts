@@ -46,6 +46,7 @@ async function custody(record = makeRecord()): Promise<b.ResetRecord> {
 
 test('default configuration is deterministic and generated values contain no subscription', () => {
   const c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB });
+  assert.equal(c.sandbox, '07657369824b');
   assert.equal(c.group, 'rust-playground'); assert.deepEqual([c.minimum, c.maximum], [2, 4]);
   assert.ok(c.generated().ARROWCOL_AZURE_TABLE_ROOT.startsWith('abfss://'));
   assert.ok(!('AZURE_SUBSCRIPTION_ID' in c.generated()));
@@ -55,6 +56,7 @@ test('named sandbox isolates resource identities and generated configuration pre
   const values = { AZURE_SUBSCRIPTION_ID: SUB, AZURE_RESOURCE_GROUP: 'rust-playground-schema-evo' };
   const c = new b.Config(values);
   assert.equal(c.group, values.AZURE_RESOURCE_GROUP);
+  assert.equal(c.sandbox, '582e3df61d82');
   assert.equal(c.sandbox, new b.Config(values).sandbox);
   assert.notEqual(c.sandbox, azure.c.sandbox);
   assert.notEqual(c.account, azure.c.account);
@@ -66,7 +68,7 @@ test('named sandbox isolates resource identities and generated configuration pre
   assert.throws(() => b.owned({ tags: azure.tags }, c), b.Failure);
 });
 for (const values of [
-  { AZURE_RESOURCE_GROUP: 'production' }, { AZURE_SUBSCRIPTION_ID: 'default' },
+  { AZURE_RESOURCE_GROUP: 'production' }, { AZURE_RESOURCE_GROUP: '' }, { AZURE_SUBSCRIPTION_ID: 'default' },
   ...['rust-playground-', 'rust-playground--evo', 'rust-playground-../other', 'Rust-playground-evo',
     'rust-playground-evo.', 'rust-playground-' + 'a'.repeat(80)].map(AZURE_RESOURCE_GROUP => ({ AZURE_RESOURCE_GROUP })),
   { AZURE_KUSTO_MAX_INSTANCES: '9' }, { AZURE_KUSTO_MIN_INSTANCES: '5', AZURE_KUSTO_MAX_INSTANCES: '4' },

@@ -80,7 +80,7 @@ export class Config {
     const get = (key: string, fallback = '') => values[key] || fallback;
     try { this.subscription = normalized_uuid(get('AZURE_SUBSCRIPTION_ID')); }
     catch { throw new Failure('AZURE_SUBSCRIPTION_ID must be a private subscription UUID.'); }
-    this.group = get('AZURE_RESOURCE_GROUP', 'rust-playground');
+    this.group = values.AZURE_RESOURCE_GROUP ?? 'rust-playground';
     if (!/^rust-playground(?:-[a-z0-9]+(?:-[a-z0-9]+)*)?$/.test(this.group) || this.group.length > 90)
       throw new Failure('Resource group must be rust-playground or a lowercase rust-playground- sandbox name.');
     this.sandbox = createHash('sha256').update(this.subscription + ':' + this.group).digest('hex').slice(0, 12);
