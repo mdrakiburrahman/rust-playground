@@ -254,7 +254,7 @@ function resources(docker: Docker, kind: 'container' | 'network' | 'volume'): Re
 
 /** Seconds a cloud mutator gets to drain before Docker kills it; collector drain budgets must fit inside. */
 export const MUTATOR_STOP_SECONDS = 300;
-const MUTATOR_SERVICES = ['direct-1', 'dataflow-1', 'tenant-stream', 'delta-maintenance'];
+const MUTATOR_SERVICES = ['dataflow-1', 'tenant-stream', 'delta-maintenance'];
 
 /** Stops only verified resources owned by this workspace, retaining data for inspection. */
 export async function stopBenchmark(
@@ -270,11 +270,11 @@ export async function stopBenchmark(
       throw new Error('Refusing to stop a Docker project owned by another workspace');
     }
     return !options.mutatorsOnly ||
-      ['direct-1', 'dataflow-1', 'tenant-stream', 'delta-maintenance'].includes(resource.labels['com.docker.compose.service']);
+      ['dataflow-1', 'tenant-stream', 'delta-maintenance'].includes(resource.labels['com.docker.compose.service']);
   });
-  if (options.mutatorsOnly && ['direct-1', 'dataflow-1'].some(service =>
+  if (options.mutatorsOnly && ['dataflow-1'].some(service =>
     !containers.some(container => container.labels['com.docker.compose.service'] === service))) {
-    throw new Error('Cannot freeze validation without both positively identified collectors');
+    throw new Error('Cannot freeze validation without the positively identified Dataflow writer');
   }
   await stopBenchmarkProcesses(workspace, directories);
   // Mutators drain through SQL Server and the router, so they stop first and alone.
@@ -290,7 +290,7 @@ export async function stopBenchmark(
     for (const container of containers) {
       const service = container.labels['com.docker.compose.service'];
       if (!service) throw new Error('Cannot verify cloud drain without Compose service identity; retain occupancy');
-      if (!['direct-1', 'dataflow-1', 'tenant-stream', 'delta-maintenance'].includes(service)) continue;
+      if (!['dataflow-1', 'tenant-stream', 'delta-maintenance'].includes(service)) continue;
       const state: unknown = JSON.parse(docker(['inspect', '--format', '{{json .State}}', container.id]));
       if (!state || typeof state !== 'object' || !('Running' in state) || state.Running !== false ||
           !('ExitCode' in state) || state.ExitCode !== 0 || !('OOMKilled' in state) || state.OOMKilled !== false) {
@@ -357,7 +357,7 @@ export async function resetBenchmark(workspace: string, docker: Docker): Promise
   const volumes = resources(docker, 'volume').filter(resource => {
     const project = resource.labels['com.docker.compose.project'];
     const volume = resource.labels['com.docker.compose.volume'];
-    if (!projects.has(project) || !['sqlserver-data', 'hive-warehouse', 'kusto-data'].includes(volume)
+    if (!projects.has(project) || !['sqlserver-data', 'kusto-data'].includes(volume)
         || resource.name !== `${project}_${volume}`) return false;
     if (volume === 'kusto-data' && resource.labels['io.arrowcol.loadtest.workspace'] !== workspace) {
       throw new Error('Refusing to reset Kusto storage owned by another or unverifiable workspace');

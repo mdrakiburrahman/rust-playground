@@ -3,7 +3,6 @@
   "$schema": "../../node_modules/nx/schemas/project-schema.json",
   "projectType": "library",
   "sourceRoot": "crates/arrowcol-catalog/src",
-  "implicitDependencies": ["arrowcol-sql-server"],
   "namedInputs": {
     "default": [
       "{projectRoot}/**/*",
@@ -57,18 +56,6 @@
       "executor": "nx:run-commands",
       "options": {
         "command": "RUSTDOCFLAGS='-D warnings' cargo doc --locked --package arrowcol-catalog --no-deps"
-      }
-    },
-    "live-integration": {
-      "executor": "nx:run-commands",
-      "cache": false,
-      "options": {
-        "command": "crates/arrowcol-catalog/scripts/live-integration.sh",
-        "cwd": "{workspaceRoot}",
-        "forwardAllArgs": false
-      },
-      "metadata": {
-        "description": "Start durable Arrowcol infrastructure, exercise SQL Server and Hive Metastore, then stop without deleting volumes."
       }
     },
     "verify": {

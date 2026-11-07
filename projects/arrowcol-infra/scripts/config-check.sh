@@ -18,8 +18,8 @@ while IFS= read -r script; do
 done < <(find "$PROJECT_ROOT/scripts" "$PROJECT_ROOT/docker" -type f -name '*.sh' -print | sort)
 
 mapfile -t migrations < <(find "$PROJECT_ROOT/migrations" -maxdepth 1 -type f -name 'V*.sql' -print | sort)
-if [[ "${#migrations[@]}" -ne 9 ]]; then
-  echo "Expected exactly 9 versioned migrations, found ${#migrations[@]}" >&2
+if [[ "${#migrations[@]}" -ne 10 ]]; then
+  echo "Expected exactly 10 versioned migrations, found ${#migrations[@]}" >&2
   exit 1
 fi
 
@@ -51,7 +51,5 @@ git -C "$WORKSPACE_ROOT" check-ignore -q \
 grep -Fxq '.env' "$PROJECT_ROOT/.dockerignore"
 grep -Fxq 'secrets/' "$PROJECT_ROOT/.dockerignore"
 grep -q '@sha256:' "$PROJECT_ROOT/docker/sqlserver/Dockerfile"
-grep -q '@sha256:' "$PROJECT_ROOT/docker/hive/Dockerfile"
-grep -q -- '--checksum=sha256:' "$PROJECT_ROOT/docker/hive/Dockerfile"
 
 echo "Compose configuration and static infrastructure checks passed"

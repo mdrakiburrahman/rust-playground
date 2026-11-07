@@ -82,7 +82,7 @@ pub struct PublisherReleaseArgs {
     #[arg(long, env = "LOADTEST_RESULTS", default_value = "/results")]
     pub results: PathBuf,
 
-    /// SQL Server host that held the run's routing and receipt state.
+    /// SQL Server host that held the run's routing state.
     #[arg(long, env = "ARROWCOL_SQL_HOST", default_value = "sqlserver")]
     pub sql_host: String,
 
@@ -256,7 +256,7 @@ pub struct RunArgs {
     pub router_endpoint: String,
 
     /// Schema Catalog service endpoint.
-    #[arg(long, env = "LOADTEST_CATALOG_ENDPOINT", default_value = "http://direct-1:50051")]
+    #[arg(long, env = "LOADTEST_CATALOG_ENDPOINT", default_value = "http://arrowcol-catalog:8817")]
     pub catalog_endpoint: String,
 
     /// Trusted-edge HMAC secret file.

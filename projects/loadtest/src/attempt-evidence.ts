@@ -15,14 +15,13 @@ import { checkedBenchmarkPath } from './lifecycle.js';
 const markerName = '.attempt-evidence.json';
 const socketName = 'router-state/arrowcol-router-upgrade.sock';
 const helpers = ['arrowcol-loadgen', 'arrowcol-sdk-gen', 'delta-inspect'] as const;
-const imageNames = ['arrowcol-rust', 'arrowcol-dataflow-rust', 'arrowcol-router-rust',
+const imageNames = ['arrowcol-dataflow-rust', 'arrowcol-router-rust', 'arrowcol-catalog-rust',
   'kusto-explorer', 'arrow-tenant-stream', 'delta-maintenance'];
 const serviceImages: Record<string, string> = {
-  'direct-1': imageNames[0], 'dataflow-1': imageNames[1], router: imageNames[2],
-  'kusto-explorer': imageNames[3], 'tenant-stream': imageNames[4],
-  'delta-maintenance': imageNames[5],
+  'dataflow-1': imageNames[0], router: imageNames[1], 'arrowcol-catalog': imageNames[2],
+  'kusto-explorer': imageNames[3], 'tenant-stream': imageNames[4], 'delta-maintenance': imageNames[5],
 };
-const mutators = ['direct-1', 'dataflow-1', 'tenant-stream', 'delta-maintenance'];
+const mutators = ['dataflow-1', 'tenant-stream', 'delta-maintenance'];
 const limits = { files: 100_000, bytes: 16 * 1024 ** 3, manifest: 256 * 1024 ** 2, milliseconds: 300_000 };
 const digest = (value: string | Buffer): string => createHash('sha256').update(value).digest('hex');
 const within = (root: string, value: string): boolean => value === root || value.startsWith(`${root}${path.sep}`);
@@ -157,7 +156,7 @@ export function stoppedAttemptMutators(workspace: string, docker: Docker, servic
   try {
     const selected = containers(docker).filter(value => owned(workspace, value)
       && mutators.includes(value.labels['com.docker.compose.service']));
-    if (['direct-1', 'dataflow-1'].some(service => !selected.some(value => value.labels['com.docker.compose.service'] === service))
+    if (['dataflow-1'].some(service => !selected.some(value => value.labels['com.docker.compose.service'] === service))
         || selected.length !== services.length) fail();
     return selected.map(value => {
       clean(value);
@@ -175,8 +174,7 @@ export function stopAttemptRouter(
   const before = containers(docker);
   const selected = before.filter(value => owned(workspace, value));
   const actual = selected.filter(value => mutators.includes(value.labels['com.docker.compose.service']));
-  if (actual.length !== expected.length || !expected.some(value => value.service === 'direct-1')
-      || !expected.some(value => value.service === 'dataflow-1')) fail();
+  if (actual.length !== expected.length || !expected.some(value => value.service === 'dataflow-1')) fail();
   for (const value of actual) {
     if (!expected.some(previous => previous.id === value.id && previous.service === value.labels['com.docker.compose.service'])) fail();
     clean(value);

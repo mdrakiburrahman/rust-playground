@@ -2,7 +2,7 @@ use std::{fmt, time::Duration};
 
 use arrowcol_catalog::{CatalogError, CatalogErrorCode};
 use arrowcol_protocol::{
-    ErrorCategory, ErrorCode, ErrorStatus, MAX_MEASUREMENT, MetadataParseError, PositiveMeasurement, ReceiptId,
+    ErrorCategory, ErrorCode, ErrorStatus, MAX_MEASUREMENT, MetadataParseError, PositiveMeasurement,
 };
 use serde::{Deserialize, Serialize};
 use tonic::{
@@ -33,7 +33,6 @@ pub struct RuntimeError {
     grpc_code: Code,
     public_message: String,
     retry_after: Option<Duration>,
-    receipt_id: Option<ReceiptId>,
 }
 
 impl RuntimeError {
@@ -48,7 +47,6 @@ impl RuntimeError {
             grpc_code,
             public_message: sanitize_public_message(public_message.as_ref()),
             retry_after: None,
-            receipt_id: None,
         }
     }
 
@@ -154,13 +152,6 @@ impl RuntimeError {
         self
     }
 
-    /// Associates the failure with a receipt.
-    #[must_use]
-    pub const fn with_receipt_id(mut self, receipt_id: ReceiptId) -> Self {
-        self.receipt_id = Some(receipt_id);
-        self
-    }
-
     /// Returns the stable protocol code.
     #[must_use]
     pub const fn code(&self) -> ErrorCode {
@@ -217,9 +208,6 @@ impl RuntimeError {
 
     fn protocol_status(&self) -> Option<ErrorStatus> {
         let mut status = ErrorStatus::new(self.code, self.public_message.clone()).ok()?;
-        if let Some(receipt_id) = self.receipt_id {
-            status = status.with_receipt_id(receipt_id);
-        }
         if let Some(delay) = self.retry_after {
             let positive = PositiveMeasurement::new(retry_after_millis(delay)).ok()?;
             status = status.with_retry_after(positive).ok()?;
@@ -310,7 +298,6 @@ const fn error_category_name(category: ErrorCategory) -> &'static str {
         ErrorCategory::Routing => "routing",
         ErrorCategory::CatalogSchema => "catalog_schema",
         ErrorCategory::CapacityBackpressure => "capacity_backpressure",
-        ErrorCategory::Receipt => "receipt",
         ErrorCategory::Publication => "publication",
         ErrorCategory::Internal => "internal",
     }
@@ -332,9 +319,6 @@ const fn error_code_name(code: ErrorCode) -> &'static str {
         ErrorCode::SchemaIncompatible => "schema_incompatible",
         ErrorCode::CapacityExhausted => "capacity_exhausted",
         ErrorCode::BackpressureTimeout => "backpressure_timeout",
-        ErrorCode::ReceiptNotFound => "receipt_not_found",
-        ErrorCode::ReceiptTransitionInvalid => "receipt_transition_invalid",
-        ErrorCode::ReceiptExpired => "receipt_expired",
         ErrorCode::PublicationConflict => "publication_conflict",
         ErrorCode::PublicationFailed => "publication_failed",
         ErrorCode::PublicationOutcomeUnknown => "publication_outcome_unknown",

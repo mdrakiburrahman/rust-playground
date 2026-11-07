@@ -11,7 +11,7 @@ const FINGERPRINT: &str = "sha256:0000000000000000000000000000000000000000000000
 fn valid_raw() -> RawGrpcMetadata<'static> {
     RawGrpcMetadata {
         protocol_version: Some("1"),
-        implementation_pool: Some("direct"),
+        implementation_pool: Some("dataflow"),
         catalog: Some("telemetry"),
         schema: Some("prod"),
         table: Some("traces"),
@@ -22,12 +22,12 @@ fn valid_raw() -> RawGrpcMetadata<'static> {
 #[test]
 fn parses_and_reencodes_canonical_metadata() -> Result<(), Box<dyn Error>> {
     let parsed = IngestMetadata::parse(valid_raw())?;
-    assert_eq!(parsed.implementation_pool(), ImplementationPool::Direct);
+    assert_eq!(parsed.implementation_pool(), ImplementationPool::Dataflow);
     assert_eq!(parsed.table().to_string(), "telemetry.prod.traces");
 
     let pairs = parsed.to_ascii_pairs();
     assert_eq!(pairs[0], (PROTOCOL_VERSION_METADATA_KEY, "1".to_owned()));
-    assert_eq!(pairs[1], (IMPLEMENTATION_POOL_METADATA_KEY, "direct".to_owned()));
+    assert_eq!(pairs[1], (IMPLEMENTATION_POOL_METADATA_KEY, "dataflow".to_owned()));
     assert_eq!(pairs[2], (CATALOG_METADATA_KEY, "telemetry".to_owned()));
     assert_eq!(pairs[3], (SCHEMA_METADATA_KEY, "prod".to_owned()));
     assert_eq!(pairs[4], (TABLE_METADATA_KEY, "traces".to_owned()));
@@ -57,6 +57,17 @@ fn rejects_every_required_metadata_failure_class() {
             ..
         })
     ));
+
+    let mut retired = valid_raw();
+    retired.implementation_pool = Some("direct");
+    assert!(matches!(
+        IngestMetadata::parse(retired),
+        Err(MetadataParseError::Malformed {
+            key: IMPLEMENTATION_POOL_METADATA_KEY,
+            ..
+        })
+    ));
+    assert!(serde_json::from_str::<ImplementationPool>("\"direct\"").is_err());
 
     let oversized_catalog = "x".repeat(129);
     let mut oversized = valid_raw();

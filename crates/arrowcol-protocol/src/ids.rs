@@ -65,11 +65,6 @@ macro_rules! uuid_id {
 }
 
 uuid_id!(
-    ReceiptId,
-    "A server-generated identifier for one accepted delivery.\n\nEvery accepted delivery receives a fresh identifier, including duplicate payloads. This type is not an idempotency or deduplication key.",
-    "Generates a fresh server receipt identifier."
-);
-uuid_id!(
     CollectorInstanceId,
     "A generated identifier for one collector process lifetime.",
     "Generates an identifier for a newly starting collector instance."

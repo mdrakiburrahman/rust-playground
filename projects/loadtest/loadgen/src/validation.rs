@@ -1178,7 +1178,6 @@ mod tests {
             let results = results_directory(test)?;
             for (file, contents) in [
                 (SEND_MANIFEST_FILE, ""),
-                (""),
                 (SCHEMA_CONTRACT_FILE, "[]"),
                 (
                     ROUTING_EVIDENCE_FILE,
@@ -1306,16 +1305,18 @@ mod tests {
     #[test]
     fn quiver_capabilities_require_durable_admission() {
         let mut capabilities = ordinary_capabilities();
-        let response = &mut capabilities["dataflow"][0]["response"];
-        response["delivery_guarantee"] = serde_json::json!("durable_admission");
-        response["completion_mode"] = serde_json::json!("durable_admission");
-        response["at_least_once"] = serde_json::json!(true);
-        response["native_quiver"] = serde_json::json!({"enabled": true});
+        {
+            let response = &mut capabilities["dataflow"][0]["response"];
+            response["delivery_guarantee"] = serde_json::json!("durable_admission");
+            response["completion_mode"] = serde_json::json!("durable_admission");
+            response["at_least_once"] = serde_json::json!(true);
+            response["native_quiver"] = serde_json::json!({"enabled": true});
+        }
         let mut failures = Vec::new();
         validate_capabilities(&capabilities, true, &mut failures);
         assert!(failures.is_empty(), "{failures:?}");
 
-        response["native_quiver"]["enabled"] = serde_json::json!(false);
+        capabilities["dataflow"][0]["response"]["native_quiver"]["enabled"] = serde_json::json!(false);
         validate_capabilities(&capabilities, true, &mut failures);
         assert_eq!(failures.len(), 1);
     }

@@ -102,7 +102,18 @@ async fn allow_all_identity_is_signed_with_a_bounded_expiry() {
 #[test]
 fn strict_yaml_rejects_unknown_fields_and_accepts_the_checked_in_config() {
     let valid = include_bytes!("../config.yaml");
-    RouterConfig::from_yaml(valid).unwrap_or_else(|error| panic!("checked-in config is invalid: {error}"));
+    for config in [
+        valid.as_slice(),
+        include_bytes!("../config.docker.yaml").as_slice(),
+        include_bytes!("../config.smoke.yaml").as_slice(),
+    ] {
+        RouterConfig::from_yaml(config).unwrap_or_else(|error| panic!("checked-in config is invalid: {error}"));
+    }
+
+    let mut retired =
+        String::from_utf8(valid.to_vec()).unwrap_or_else(|error| panic!("checked-in config is not UTF-8: {error}"));
+    retired.push_str("\nreceipts:\n  max_batch_size: 256\n");
+    assert!(RouterConfig::from_yaml(retired.as_bytes()).is_err());
 
     let mut unknown =
         String::from_utf8(valid.to_vec()).unwrap_or_else(|error| panic!("checked-in config is not UTF-8: {error}"));

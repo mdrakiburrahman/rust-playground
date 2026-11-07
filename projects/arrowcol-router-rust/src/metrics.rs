@@ -136,7 +136,7 @@ impl RouterMetrics {
 
     /// Updates aggregate cache gauges.
     pub fn update_cache_gauges(&self, view: &arrowcol_routing::RoutingView) {
-        for pool in ["direct", "dataflow"] {
+        for pool in ["dataflow"] {
             for state in ["active", "draining"] {
                 self.cached_leases.with_label_values(&[pool, state]).set(0);
             }

@@ -89,6 +89,7 @@ export function buildBenchmarkComposeOverride(hostDirectory: string, options: Be
     }
     const roots: Record<string, string> = {
       'dataflow-1': options.azure.dataflowRoot,
+      'arrowcol-catalog': options.azure.dataflowRoot,
       'tenant-stream': options.azure.tenantRoot,
       'delta-maintenance': options.azure.dataflowRoot,
     };
@@ -101,6 +102,7 @@ export function buildBenchmarkComposeOverride(hostDirectory: string, options: Be
   }
   return JSON.stringify({
     services: {
+      ...(cloud['arrowcol-catalog'] ? { 'arrowcol-catalog': cloud['arrowcol-catalog'] } : {}),
       ...(cloud['tenant-stream'] ? { 'tenant-stream': cloud['tenant-stream'] } : {}),
       ...(cloud['delta-maintenance'] ? { 'delta-maintenance': cloud['delta-maintenance'] } : {}),
       'dataflow-1': {
