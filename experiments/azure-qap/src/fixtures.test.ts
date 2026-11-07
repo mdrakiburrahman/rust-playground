@@ -135,7 +135,7 @@ test('seed passes --tombstones, retries transport errors and checks the publishe
   assert.equal(result.totalBytes, 600);
   assert.equal(result.version, 1);
   assert.equal(runner.calls.length, 2);
-  assert.equal(runner.calls[0]!.command, '/repo/target/release/arrowcol-experiment');
+  assert.equal(runner.calls[0]!.command, '/repo/target/release/qap-fixture');
   assert.deepEqual(runner.calls[0]!.args, ['--root', ROOT, '--table', 'vacuum', '--allow-table', 'vacuum', '--timeout-seconds', '60',
     'seed-scale', '--anchor-ms', '60000', '--seed-mib', '1', '--files-per-partition', '2', '--tombstones']);
 

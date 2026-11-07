@@ -32,6 +32,7 @@ export const DOCUMENTS = [
   'projects/loadtest/README.md',
   'projects/otelcol-rust/README.md',
   'bin/collector-chain/README.md',
+  'bin/qap-fixture/README.md',
   'experiments/azure-qap/README.md',
   'experiments/collector-chain/README.md',
   'experiments/schema-evolution/README.md',

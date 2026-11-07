@@ -204,7 +204,7 @@ export async function runTrial(env: TrialEnvironment, trial: Trial): Promise<Tri
     const tombstones = trial.operation === 'vacuum';
     say(`SEED: writing ${profile.files} expired + ${profile.files} compactable + 1 control + 1 live file(s) of ${profile.fileMib} MiB ` +
       `under ${trial.prefix}${tombstones ? ', then purging the expired partition so VACUUM has tombstones to delete' : ''}.`);
-    show('Fixture command', `target/release/arrowcol-experiment ${fixtures.seedArgs(trial.name, anchor, profile.fileMib, profile.files,
+    show('Fixture command', `target/release/qap-fixture ${fixtures.seedArgs(trial.name, anchor, profile.fileMib, profile.files,
       tombstones, 900).join(' ')}`, trial.name);
     const seed = await fixtures.seed(trial.name, anchor, profile.fileMib, profile.files, tombstones, signal);
     env.record(trial.name, 'seed', seed);
