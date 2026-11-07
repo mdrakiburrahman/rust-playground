@@ -803,7 +803,7 @@ Inspect these files under `onelake/benchmark/latest/results/`:
 | `kusto-explorer-validation.json` | UI gate checks, screenshots, and any browser console errors |
 | `kusto-explorer-export.json` | Per-table row counts exported through the UI |
 | `kusto-explorer-*.png` | UI screenshots in the dark and light themes, or `kusto-explorer-failure.png` |
-| `provenance.json` | Image identities and sanitized effective resource configuration |
+| `provenance.json` | Image identities, observed startup running/health state (null when no healthcheck), timestamps, and sanitized effective resource configuration |
 | `quiver-recovery.json` | `--crash-after` outage, on-disk backlog at the kill, and replay counts per collector |
 
 Startup diagnostics remain separate if synchronization subsequently recovers.
