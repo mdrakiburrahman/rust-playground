@@ -5,8 +5,7 @@ use async_trait::async_trait;
 
 use crate::{
     CatalogError, CatalogErrorCode, CatalogResult, CatalogSchemaVersion, CatalogStore, ChangeReservation, DdlCommand,
-    DdlParser, Metastore, RequestHash, ReserveOutcome, SagaId, SagaRecord, SagaStep, SchemaVersion,
-    generate_descriptor_artifacts,
+    DdlParser, RequestHash, ReserveOutcome, SagaId, SagaRecord, SagaStep, SchemaVersion, generate_descriptor_artifacts,
 };
 
 /// Flight SQL DDL request accepted by the embeddable handler.
@@ -144,12 +143,11 @@ pub trait FlightSqlDdlHandler: Send + Sync {
     async fn execute_ddl(&self, request: FlightSqlDdlRequest) -> CatalogResult<DdlCompletion>;
 }
 
-/// Production catalog control plane coordinating application state and Hive.
+/// Catalog control plane coordinating recoverable schema reservations and activation.
 #[derive(Clone)]
 pub struct CatalogControlPlane {
     parser: DdlParser,
     store: Arc<dyn CatalogStore>,
-    metastore: Arc<dyn Metastore>,
 }
 
 impl CatalogControlPlane {
@@ -158,12 +156,8 @@ impl CatalogControlPlane {
     /// Production processes should normally use [`Self::start`] so incomplete
     /// operations are reconciled before serving Flight SQL.
     #[must_use]
-    pub fn new(parser: DdlParser, store: Arc<dyn CatalogStore>, metastore: Arc<dyn Metastore>) -> Self {
-        Self {
-            parser,
-            store,
-            metastore,
-        }
+    pub fn new(parser: DdlParser, store: Arc<dyn CatalogStore>) -> Self {
+        Self { parser, store }
     }
 
     /// Creates the service and reconciles every incomplete durable saga before
@@ -175,12 +169,8 @@ impl CatalogControlPlane {
     /// run. Individual retry failures are retained in the report and in durable
     /// saga state so startup can remain observable rather than silently losing
     /// work.
-    pub async fn start(
-        parser: DdlParser,
-        store: Arc<dyn CatalogStore>,
-        metastore: Arc<dyn Metastore>,
-    ) -> CatalogResult<(Self, ReconciliationReport)> {
-        let service = Self::new(parser, store, metastore);
+    pub async fn start(parser: DdlParser, store: Arc<dyn CatalogStore>) -> CatalogResult<(Self, ReconciliationReport)> {
+        let service = Self::new(parser, store);
         let report = service.reconcile_incomplete().await?;
         Ok((service, report))
     }
@@ -308,23 +298,6 @@ impl CatalogControlPlane {
     async fn drive_saga(&self, mut saga: SagaRecord) -> CatalogResult<SagaRecord> {
         loop {
             match saga.step() {
-                SagaStep::ApplyHive => {
-                    if let Err(error) = self
-                        .metastore
-                        .ensure_schema(saga.from_schema(), saga.target_schema())
-                        .await
-                    {
-                        self.record_failure(&saga, SagaStep::ApplyHive, &error).await;
-                        return Err(error);
-                    }
-                    saga = match self.store.mark_hive_applied(saga.id()).await {
-                        Ok(saga) => saga,
-                        Err(error) => {
-                            self.record_failure(&saga, SagaStep::ApplyHive, &error).await;
-                            return Err(error);
-                        }
-                    };
-                }
                 SagaStep::PersistArtifacts => {
                     let artifacts = match generate_descriptor_artifacts(saga.target_schema()) {
                         Ok(artifacts) => artifacts,

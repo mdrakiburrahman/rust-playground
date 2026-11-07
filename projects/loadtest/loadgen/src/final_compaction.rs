@@ -1569,9 +1569,9 @@ mod tests {
     #[test]
     fn windows_drive_paths_and_unknown_schemes_stay_local() -> Result<()> {
         for path in [
-            r"C:\delta\direct",
-            "C:/delta/direct",
-            "file:///delta/direct",
+            r"C:\delta\dataflow",
+            "C:/delta/dataflow",
+            "file:///delta/dataflow",
             "other:local",
         ] {
             assert!(!cloud_root(Path::new(path)), "{path}");
@@ -1634,7 +1634,7 @@ mod tests {
         use arrow_deltalake::layout::LayoutPolicy;
         for mixed in [false, true] {
             let root = tempfile::tempdir()?;
-            let pool = root.path().join("direct");
+            let pool = root.path().join("dataflow");
             let path = pool.join("telemetry/sqlserver/saturated");
             fs::create_dir_all(&path)?;
             let schema = Arc::new(Schema::new(vec![
@@ -1671,7 +1671,7 @@ mod tests {
             }
             let deadline = Instant::now() + BUDGET;
             let mut local = Local::open(
-                &BTreeMap::from([("direct".into(), fs::canonicalize(pool)?)]),
+                &BTreeMap::from([("dataflow".into(), fs::canonicalize(pool)?)]),
                 &["saturated".into()],
                 deadline,
             )?;
@@ -1685,7 +1685,7 @@ mod tests {
             let expected = local.tables.keys().cloned().collect();
             let mut passes = Vec::new();
             let (before, after) = finish(&mut local, &expected, deadline, &mut passes)?;
-            let key = "direct/telemetry.sqlserver.saturated";
+            let key = "dataflow/telemetry.sqlserver.saturated";
             assert_eq!(before[key].multiset, after[key].multiset);
             assert_eq!(
                 after[key].inventory.version,

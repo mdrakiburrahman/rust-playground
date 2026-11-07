@@ -23,13 +23,13 @@ pub enum Command {
     Validate(ValidateArgs),
     /// Drain publication while collectors are still running, without capturing snapshots.
     Drain(ValidateArgs),
-    /// After the clean mutator drain, prove from actual SQL state that every routed publisher released.
+    /// After the clean mutator drain, prove from routing state that the Dataflow publisher stopped.
     PublisherRelease(PublisherReleaseArgs),
-    /// Compact all local source tables after positive publisher release.
+    /// Compact Dataflow tables after positive publisher release.
     FinalCompaction(FinalCompactionArgs),
     /// Record bounded read-only QAP observations without changing tables or policies.
     ObserveQap(ObserveQapArgs),
-    /// Initialize both Azure pools from the canonical schemas while reset is fenced.
+    /// Initialize Dataflow tables from the canonical schemas while reset is fenced.
     InitializeAzure(InitializeAzureArgs),
     /// Write the canonical Azure table manifest without accessing or mutating storage.
     AzureManifest(InitializeAzureArgs),
@@ -67,7 +67,7 @@ pub struct ObserveQapArgs {
     /// Optional explicit database.
     #[arg(long)]
     pub database: Option<String>,
-    /// External table names; omit for all 26 canonical source tables.
+    /// External table names; omit for all 13 canonical Dataflow tables.
     #[arg(long = "table")]
     pub tables: Vec<String>,
     /// One deadline for authentication and every management request.
@@ -356,7 +356,7 @@ pub struct ValidateArgs {
     #[arg(long, env = "LOADTEST_DRAIN_TIMEOUT", default_value = "8m")]
     pub timeout: DurationArg,
 
-    /// Require every collector in each implementation pool to own a table.
+    /// Require every Dataflow collector to own a table.
     #[arg(long, env = "LOADTEST_REQUIRE_ALL_COLLECTORS", default_value_t = true)]
     pub require_all_collectors: bool,
 
@@ -409,13 +409,13 @@ mod tests {
             "--endpoint",
             "http://kusto:8080",
             "--table",
-            "direct_sqlserver_cpu_utilization",
+            "dataflow_sqlserver_cpu_utilization",
         ])?;
         let Command::ObserveQap(arguments) = cli.command else {
             bail!("expected observe-qap command");
         };
         assert_eq!(arguments.timeout.get(), Duration::from_secs(30));
-        assert_eq!(arguments.tables, ["direct_sqlserver_cpu_utilization"]);
+        assert_eq!(arguments.tables, ["dataflow_sqlserver_cpu_utilization"]);
         assert_eq!(arguments.output, PathBuf::from("observation.json"));
         Ok(())
     }

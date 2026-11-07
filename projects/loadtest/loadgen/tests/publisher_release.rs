@@ -18,7 +18,7 @@ fn dispatched_release_rejects_missing_and_stale_evidence_before_sql() -> Result<
                     ),
                     (
                         "mutator-drain.json",
-                        json!({"run_id":"this-run","clean":true,"services":["direct-1","dataflow-1"]}),
+                        json!({"run_id":"this-run","clean":true,"services":["dataflow-1"]}),
                     ),
                     (
                         "routing.json",
@@ -39,7 +39,6 @@ fn dispatched_release_rejects_missing_and_stale_evidence_before_sql() -> Result<
             let proof: Value = serde_json::from_slice(&fs::read(directory.join("publisher-release.json"))?)?;
             assert_eq!(proof["passed"], false);
             assert!(proof["routing"].is_null());
-            assert!(proof["receipts"].is_null());
             assert_eq!(proof["run_id"], if stale { json!("this-run") } else { Value::Null });
             let errors = proof["errors"].to_string();
             assert!(

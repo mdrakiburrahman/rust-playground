@@ -1208,7 +1208,7 @@ mod tests {
             Value::Null,
             serde_json::json!({"run_id": "old", "clean": true, "services": ["dataflow-1"]}),
             serde_json::json!({"run_id": "current", "clean": false, "services": ["dataflow-1"]}),
-            serde_json::json!({"run_id": "current", "clean": true, "services": ["direct-1"]}),
+            serde_json::json!({"run_id": "current", "clean": true, "services": ["unknown"]}),
         ] {
             assert!(check_drain_evidence(&metadata, &publication, &invalid).is_err());
         }

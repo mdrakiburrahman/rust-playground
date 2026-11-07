@@ -19,7 +19,7 @@ async fn main() -> Result<()> {
             );
             let mut tables = arguments.tables;
             if tables.is_empty() {
-                for pool in ["direct", "dataflow"] {
+                for pool in ["dataflow"] {
                     for statement in arrowcol_loadgen::schema::schema_statements()? {
                         tables.push(format!("{pool}_{}", statement.identity.table()));
                     }
