@@ -38,8 +38,8 @@ Each admitted publication (and each declared partition key within it) retains it
 | Baseline `628e5131` evidence | Supported effect preserved and centrally governed |
 | --- | --- |
 | `crates/arrowcol-dataflow-components/src/config.rs` lines 637-679; `crates/arrowcol-dataflow-components/src/exporter.rs` lines 252 and 634-639 | All seven process controls already populated the estimator and triggered group flush through `should_flush(bytes)`. |
-| `crates/arrowcol-dataflow-components/src/exporter.rs` lines 730-776 | One file per admitted publication; staged Parquet observations became the live estimate only after committed receipts. |
-| `crates/arrowcol-buffer/src/manager.rs` lines 597, 983-985 and 1348-1366 | Buffer-side estimator and per-receipt replay isolation remain unchanged; DFE table overrides govern its downstream publication-group scheduler. |
+| `crates/arrowcol-dataflow-components/src/exporter.rs` lines 730-776 | One file per admitted publication; staged Parquet observations became the live estimate only after successful DFE commit acknowledgements. |
+| Retired generic Direct buffer implementation | DFE staging preserves each admitted publication's file and transaction identity across retries; table overrides govern only its downstream publication-group scheduler. |
 
 `cargo test --locked -p arrowcol-dataflow-components --lib exporter_refreshes_catalog_adaptive_grouping_without_changing_publication_identity` proves table-over-process precedence, a live same-owner high-to-low threshold update, durable completion of independent receipt files and replay without duplicate additions.
 

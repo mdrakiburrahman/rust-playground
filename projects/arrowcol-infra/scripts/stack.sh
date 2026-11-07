@@ -13,12 +13,23 @@ fi
 case "$action" in
   up)
     require_runtime_configuration
-    compose up \
-      --detach \
-      --build \
-      --wait \
-      --wait-timeout "${STACK_WAIT_SECONDS:-600}" \
-      "$@"
+    if [[ $# -gt 0 ]]; then
+      compose up \
+        --detach \
+        --build \
+        --wait \
+        --wait-timeout "${STACK_WAIT_SECONDS:-600}" \
+        "$@"
+    else
+      compose up \
+        --detach \
+        --build \
+        --wait \
+        --wait-timeout "${STACK_WAIT_SECONDS:-600}" \
+        sqlserver
+      compose run --rm --no-deps database-bootstrap
+      compose run --rm --no-deps arrowcol-migrate
+    fi
     ;;
   down)
     compose down \
