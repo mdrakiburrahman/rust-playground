@@ -74,6 +74,11 @@ uuid_id!(
     "A generated identifier for one table lease lineage.",
     "Generates an identifier for a newly assigned table lease."
 );
+uuid_id!(
+    PublicationId,
+    "An internal identifier used to deduplicate one DFE publication; it is not a client delivery receipt.",
+    "Generates an identifier for a new DFE publication operation."
+);
 
 /// Failure to parse a UUID-backed contract identifier.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]

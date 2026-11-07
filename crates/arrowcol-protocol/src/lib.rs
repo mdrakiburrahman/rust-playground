@@ -34,7 +34,7 @@ pub use identity::{
     CatalogName, IdentityError, ImplementationPool, MAX_IDENTITY_COMPONENT_BYTES, PoolParseError, SchemaName,
     TableIdentity, TableName,
 };
-pub use ids::{CollectorInstanceId, IdParseError, LeaseId};
+pub use ids::{CollectorInstanceId, IdParseError, LeaseId, PublicationId};
 pub use lease::{FencingToken, LeaseError, PublicationFence, TableLease, TableLeaseSuccessorError};
 pub use lifecycle::{CollectorInstanceStatus, InstanceLifecycleState, InstanceStatusError, InstanceTransitionError};
 pub use measurement::{

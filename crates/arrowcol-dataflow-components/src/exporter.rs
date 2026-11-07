@@ -504,7 +504,7 @@ enum WorkerCommand {
 }
 
 struct QueuedBatch {
-    publication_id: arrowcol_protocol::ReceiptId,
+    publication_id: arrowcol_protocol::PublicationId,
     ingested_at_ms: arrowcol_protocol::UnixMillis,
     batch: arrow_array::RecordBatch,
     target_schema_version: u64,
@@ -1234,7 +1234,7 @@ mod tests {
     /// Envelope admitted under `lease` by a collector registered with the `test` instance key.
     fn envelope_for(lease: &arrowcol_routing::RoutingLease) -> ArrowcolBatchEnvelope {
         ArrowcolBatchEnvelope {
-            publication_id: Some(arrowcol_protocol::ReceiptId::new()),
+            publication_id: Some(arrowcol_protocol::PublicationId::new()),
             ingested_at_ms: Some(crate::config::now_unix_millis().expect("stamp")),
             table: table(),
             source_schema_version: SchemaVersion::FIRST,
@@ -1427,7 +1427,7 @@ mod tests {
         .expect("exporter");
         let original = envelope_for(&lease);
         let mut independent = original.clone();
-        independent.publication_id = Some(arrowcol_protocol::ReceiptId::new());
+        independent.publication_id = Some(arrowcol_protocol::PublicationId::new());
         let first = exporter.stage(envelope_pdata(original.clone())).await.expect("first");
         let second = exporter.stage(envelope_pdata(independent)).await.expect("independent");
         let same_group_replay = exporter
@@ -2751,7 +2751,7 @@ mod tests {
         .expect("live batch");
         let records = encode_record_batch(
             ArrowcolBatchEnvelope {
-                publication_id: Some(arrowcol_protocol::ReceiptId::new()),
+                publication_id: Some(arrowcol_protocol::PublicationId::new()),
                 ingested_at_ms: Some(crate::config::now_unix_millis().expect("stamp")),
                 table: completion.identity().clone(),
                 source_schema_version: schema.version(),

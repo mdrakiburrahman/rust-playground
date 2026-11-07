@@ -353,7 +353,7 @@ impl StreamLifecycle for DfeStreamLifecycle {
         let bytes = arrow_deltalake::record_batch_logical_bytes(&batch).map_err(|_| RuntimeError::internal())?;
         self.metrics.batch_received(rows, bytes);
         let mut envelope = self.envelope.clone();
-        let publication_id = arrowcol_protocol::ReceiptId::new();
+        let publication_id = arrowcol_protocol::PublicationId::new();
         envelope.publication_id = Some(publication_id);
         envelope.ingested_at_ms = Some(now_unix_millis().map_err(|_| RuntimeError::internal())?);
         let records = encode_record_batch(envelope, batch).map_err(|_| RuntimeError::internal())?;
@@ -1012,7 +1012,7 @@ pub(crate) mod tests {
 
     fn envelope() -> ArrowcolBatchEnvelope {
         ArrowcolBatchEnvelope {
-            publication_id: Some(arrowcol_protocol::ReceiptId::new()),
+            publication_id: Some(arrowcol_protocol::PublicationId::new()),
             ingested_at_ms: Some(arrowcol_protocol::UnixMillis::new(1_700_000_012_345).expect("stamp")),
             table: arrowcol_protocol::TableIdentity::new(
                 CatalogName::new("demo").expect("catalog"),

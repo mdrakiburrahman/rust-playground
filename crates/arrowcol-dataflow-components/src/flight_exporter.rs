@@ -310,7 +310,7 @@ mod tests {
         CatalogControlPlane, CatalogStore, DdlParser, FlightSqlDdlHandler, FlightSqlDdlRequest, MemoryCatalogStore,
     };
     use arrowcol_flight::{ArrowColFlightService, BatchAdmission};
-    use arrowcol_protocol::{CollectorInstanceId, FencingToken, LeaseId, ReceiptId};
+    use arrowcol_protocol::{CollectorInstanceId, FencingToken, LeaseId, PublicationId};
     use arrowcol_routing::{LeaseKey, MemoryRoutingStore, RoutingStore};
     use otel_arrow_dfe_pdata::OtapPayload;
     use tokio_stream::wrappers::TcpListenerStream;
@@ -401,7 +401,7 @@ mod tests {
             ],
         )?;
         let envelope = ArrowcolBatchEnvelope {
-            publication_id: Some(ReceiptId::new()),
+            publication_id: Some(PublicationId::new()),
             ingested_at_ms: None,
             table: table.clone(),
             source_schema_version: SchemaVersion::FIRST,
