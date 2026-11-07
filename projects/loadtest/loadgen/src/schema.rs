@@ -62,7 +62,7 @@ pub fn schema_statements() -> Result<Vec<SchemaStatement>> {
             .context("synthetic table has no fields")?
             .to_arrow()?;
         if customer.name() != "customer_id" || customer.data_type() != &arrow::datatypes::DataType::Utf8 {
-            bail!("every synthetic table must start with required customer_id VARCHAR");
+            bail!("every synthetic table must start with required customer_id STRING");
         }
         statements.push(SchemaStatement {
             ddl: ddl.to_owned(),
@@ -131,7 +131,7 @@ mod tests {
         );
         assert_eq!(
             format!("sha256:{}", hex::encode(Sha256::digest(schema_ddl().as_bytes()))),
-            "sha256:83ea68f2a9ba1c34d907f6364b0a1b1b75b2a33676ebab857de446ab677f9e6e"
+            "sha256:14e42581710f1b44776f456b66e983f3832e47c3d3233364a3ae41778fcb5545"
         );
         Ok(())
     }

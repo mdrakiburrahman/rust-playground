@@ -53,6 +53,24 @@ fn unsupported_or_lossy_syntax_is_rejected() {
 }
 
 #[test]
+fn deeply_nested_input_is_bounded_before_recursive_parsing() {
+    let sql = format!(
+        "CREATE TABLE c.d.t (x {}INT{}) USING DELTA",
+        "ARRAY<".repeat(65),
+        ">".repeat(65)
+    );
+    let Err(errors) = parse(&sql) else {
+        panic!("unbounded nesting accepted");
+    };
+    assert!(errors.iter().any(|error| error.message.contains("nesting exceeds")));
+    let sql = format!(
+        "CREATE TABLE c.d.t (x STRING COMMENT '{}') USING DELTA",
+        "<".repeat(100)
+    );
+    assert!(parse(&sql).is_ok(), "literal contents must not count as nesting");
+}
+
+#[test]
 fn utf8_spans_and_escaped_literals_are_preserved() -> Result<(), Box<dyn std::error::Error>> {
     let sql = "CREATE TABLE `Cat`.`db`.`t` (`a``b` STRING COMMENT 'it''s \\\\ fine') USING DELTA COMMENT '雪' TBLPROPERTIES ('x'='line\\nnext'); -- end";
     let first = parse(sql).map_err(|errors| format!("{errors:?}"))?;

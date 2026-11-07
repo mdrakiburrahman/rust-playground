@@ -20,36 +20,36 @@ interface State {
 const TEXT = ['', 'plain', 'quote \' and " mix', 'back\\slash', 'tab\tnew\nline', 'unicodé ✓ 漢字', 'x'.repeat(300)];
 const NANOS = [-1n, 0n, 999n, 1793073575123456789n, 4102444799999999999n, -86400000000001n];
 const BOUNDS: Record<string, (number | bigint | boolean)[]> = {
-  TINYINT: [-128, 127, 0, -1, 1], 'TINYINT UNSIGNED': [0, 255, 1, 128, 254],
+  TINYINT: [-128, 127, 0, -1, 1],
   SMALLINT: [-32768, 32767, 0, -1, 1], INT: [-2147483648, 2147483647, 0, -1, 1],
   BIGINT: [-9223372036854775808n, 9223372036854775807n, 0n, -1n, 1n],
   DOUBLE: [0, -0.5, 1e308, -2.2250738585072014e-308, 123456.789012345], BOOLEAN: [true, false],
 };
 const TYPES: Record<string, DataType> = {
-  TINYINT: new Int8(), 'TINYINT UNSIGNED': new Int16(), SMALLINT: new Int16(), INT: new Int32(),
-  BIGINT: new Int64(), DOUBLE: new Float64(), BOOLEAN: new Bool(), VARCHAR: new Utf8(),
+  TINYINT: new Int8(), SMALLINT: new Int16(), INT: new Int32(),
+  BIGINT: new Int64(), DOUBLE: new Float64(), BOOLEAN: new Bool(), STRING: new Utf8(),
 };
 const DELTA_TYPES: Record<string, string> = {
-  TINYINT: 'byte', 'TINYINT UNSIGNED': 'short', SMALLINT: 'short', INT: 'integer', BIGINT: 'long',
-  DOUBLE: 'double', BOOLEAN: 'boolean', VARCHAR: 'string',
+  TINYINT: 'byte', SMALLINT: 'short', INT: 'integer', BIGINT: 'long',
+  DOUBLE: 'double', BOOLEAN: 'boolean', STRING: 'string',
 };
 const SESSION: Column[] = [
-  ['customer_id', 'VARCHAR'], ['sample_time_utc', 'TIMESTAMP(9)'], ['sql_server_instance_name', 'VARCHAR'],
-  ['machine_name', 'VARCHAR'], ['database_id', 'SMALLINT'], ['database_name', 'VARCHAR'],
-  ['session_id', 'SMALLINT'], ['session_status', 'VARCHAR'], ['connection_id', 'VARCHAR'],
+  ['customer_id', 'STRING'], ['sample_time_utc', 'TIMESTAMP'], ['sql_server_instance_name', 'STRING'],
+  ['machine_name', 'STRING'], ['database_id', 'SMALLINT'], ['database_name', 'STRING'],
+  ['session_id', 'SMALLINT'], ['session_status', 'STRING'], ['connection_id', 'STRING'],
 ];
 const AG: Column[] = [
-  ['customer_id', 'VARCHAR'], ['sample_time_utc', 'TIMESTAMP(9)'], ['failure_condition_level', 'INT'],
+  ['customer_id', 'STRING'], ['sample_time_utc', 'TIMESTAMP'], ['failure_condition_level', 'INT'],
   ['is_distributed', 'BOOLEAN'], ['lag_seconds', 'DOUBLE'], ['log_bytes', 'BIGINT'],
 ];
 const WATERMARK = 'arrowcol.purge.before-ms';
 const WATERMARKS = { prep: 1793070000000, post: 1793080000000 };
-const timestamp = (kind: string): boolean => kind.startsWith('TIMESTAMP(9)');
+const timestamp = (kind: string): boolean => kind === 'TIMESTAMP';
 const micros = (n: bigint): bigint => (n >= 0n ? n / 1000n : (n - 999n) / 1000n);
 const versionName = (v: number): string => String(v).padStart(20, '0');
 
 export function canonicalTables(sql: string): [string, Column[]][] {
-  return [...sql.matchAll(/CREATE TABLE telemetry\.sqlserver\.(\w+) \((.*?)\);/gs)].map(match => [
+  return [...sql.matchAll(/CREATE TABLE telemetry\.sqlserver\.(\w+) \((.*?)\)\s+USING DELTA;/gs)].map(match => [
     match[1], match[2].trim().split(',\n').map(line => {
       const column = /^\s*(\w+) (.+?) NOT NULL/u.exec(line);
       assert(column, `Invalid canonical column ${line}`);
@@ -67,7 +67,7 @@ export function canonicalRows(columns: Column[], start: number, count: number, b
         const nanos = NANOS[(i + index) % NANOS.length] + BigInt(i);
         row[name] = micros(nanos);
         row[`${name}__unix_nanos`] = nanos;
-      } else if (kind === 'VARCHAR') {
+      } else if (kind === 'STRING') {
         row[name] = TEXT[(i + index) % TEXT.length] + (i % 5 ? `#${i}` : '');
       } else {
         assert(BOUNDS[kind], `Unsupported canonical type ${kind}`);
@@ -182,7 +182,7 @@ function append(table: string, columns: Column[], rows: Row[], batch: string, tx
     actions.push({ protocol: { minReaderVersion: 1, minWriterVersion: 2 } }, { metaData: {
       id: randomUUID(), format: { provider: 'parquet', options: {} }, partitionColumns: ['__arrowcol_ingestion'],
       configuration: {}, createdTime: Date.now(), schemaString: JSON.stringify({ type: 'struct', fields:
-        [...columns, ['__arrowcol_ingestion', 'VARCHAR']].map(([name, kind]) => ({
+        [...columns, ['__arrowcol_ingestion', 'STRING']].map(([name, kind]) => ({
           name, type: timestamp(kind) ? 'timestamp' : DELTA_TYPES[kind], nullable, metadata: {},
         })) }),
     } });

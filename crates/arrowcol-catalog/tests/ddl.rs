@@ -4,13 +4,14 @@ use arrowcol_catalog::{CatalogErrorCode, CatalogType, DdlCommand, DdlParser, Lis
 fn synthetic_create() -> &'static str {
     r#"
         CREATE TABLE telemetry.prod.synthetic (
-            sequence BIGINT UNSIGNED NOT NULL,
-            service VARCHAR,
-            observed_at TIMESTAMP(9) NOT NULL,
-            trace_id FIXED_SIZE_BINARY(16),
-            summary ARRAY<STRUCT<quantile DOUBLE, value DOUBLE>>
+            sequence BIGINT NOT NULL,
+            service STRING,
+            observed_at TIMESTAMP_NTZ NOT NULL,
+            trace_id BINARY,
+            summary ARRAY<STRUCT<quantile: DOUBLE, value: DOUBLE>>,
+            event_date DATE NOT NULL
         )
-        PARTITIONED BY (event_date DATE NOT NULL)
+        USING DELTA PARTITIONED BY (event_date)
     "#
 }
 
@@ -21,19 +22,16 @@ fn parses_synthetic_create_with_exact_cross_system_types() -> anyhow::Result<()>
     };
     assert_eq!(create.identity().to_string(), "telemetry.prod.synthetic");
     assert_eq!(create.fields().len(), 6);
-    assert_eq!(create.fields()[0].mapping().arrow(), &CatalogType::UInt64);
-    assert_eq!(create.fields()[0].mapping().hive(), "decimal(20,0)");
+    assert_eq!(create.fields()[0].mapping().arrow(), &CatalogType::Int64);
+    assert_eq!(create.fields()[0].mapping().hive(), "bigint");
     assert_eq!(
         create.fields()[2].mapping().arrow(),
         &CatalogType::Timestamp {
-            unit: arrowcol_catalog::TimeUnit::Nanosecond,
+            unit: arrowcol_catalog::TimeUnit::Microsecond,
             timezone: None,
         }
     );
-    assert_eq!(
-        create.fields()[3].mapping().arrow(),
-        &CatalogType::FixedSizeBinary { bytes: 16 }
-    );
+    assert_eq!(create.fields()[3].mapping().arrow(), &CatalogType::Binary);
     assert!(matches!(
         create.fields()[4].mapping().arrow(),
         CatalogType::List {
@@ -50,10 +48,10 @@ fn parses_synthetic_create_with_exact_cross_system_types() -> anyhow::Result<()>
             .map(|field| field.to_arrow())
             .collect::<Result<Vec<_>, _>>()?,
     );
-    assert_eq!(schema.field(0).data_type(), &DataType::UInt64);
+    assert_eq!(schema.field(0).data_type(), &DataType::Int64);
     assert_eq!(
         schema.field(2).data_type(),
-        &DataType::Timestamp(TimeUnit::Nanosecond, None)
+        &DataType::Timestamp(TimeUnit::Microsecond, None)
     );
     Ok(())
 }
@@ -62,7 +60,7 @@ fn parses_synthetic_create_with_exact_cross_system_types() -> anyhow::Result<()>
 fn parses_plural_nullable_add_columns() -> anyhow::Result<()> {
     let command = DdlParser::default().parse(
         "ALTER TABLE telemetry.prod.synthetic ADD COLUMNS \
-         (attributes MAP(VARCHAR, VARCHAR), status SMALLINT NULL)",
+         (attributes MAP<STRING, STRING>, status SMALLINT)",
     )?;
     let DdlCommand::AddColumns(add) = command else {
         anyhow::bail!("expected add columns");
@@ -71,8 +69,8 @@ fn parses_plural_nullable_add_columns() -> anyhow::Result<()> {
     assert!(add.fields().iter().all(|field| field.is_nullable()));
     assert_eq!(
         add.canonical_ddl(),
-        "ALTER TABLE \"telemetry\".\"prod\".\"synthetic\" ADD COLUMNS \
-         (\"attributes\" MAP(VARCHAR, VARCHAR) NULL, \"status\" SMALLINT NULL)"
+        "ALTER TABLE `telemetry`.`prod`.`synthetic` ADD COLUMNS \
+         (`attributes` MAP<STRING, STRING>, `status` SMALLINT)"
     );
     Ok(())
 }
@@ -86,37 +84,37 @@ fn rejects_every_breaking_or_unsupported_mutation() {
         ),
         (
             "ALTER TABLE telemetry.prod.synthetic DROP COLUMN service",
-            CatalogErrorCode::DdlBreakingMutation,
+            CatalogErrorCode::DdlParse,
         ),
         (
             "ALTER TABLE telemetry.prod.synthetic RENAME COLUMN service TO service_name",
-            CatalogErrorCode::DdlBreakingMutation,
+            CatalogErrorCode::DdlParse,
         ),
         (
             "ALTER TABLE telemetry.prod.synthetic ALTER COLUMN service TYPE BIGINT",
-            CatalogErrorCode::DdlBreakingMutation,
+            CatalogErrorCode::DdlParse,
         ),
         (
             "ALTER TABLE telemetry.prod.synthetic ALTER COLUMN service SET NOT NULL",
-            CatalogErrorCode::DdlBreakingMutation,
+            CatalogErrorCode::DdlParse,
         ),
         (
-            "ALTER TABLE telemetry.prod.synthetic ADD COLUMN status VARCHAR FIRST",
-            CatalogErrorCode::DdlFieldReorder,
+            "ALTER TABLE telemetry.prod.synthetic ADD COLUMN status STRING FIRST",
+            CatalogErrorCode::DdlParse,
         ),
         (
             "ALTER TABLE telemetry.prod.synthetic ADD PARTITION (event_date = '2026-01-01')",
-            CatalogErrorCode::DdlPartitionMutation,
+            CatalogErrorCode::DdlParse,
         ),
         (
-            "ALTER TABLE telemetry.prod.synthetic ADD COLUMN status VARCHAR NOT NULL",
-            CatalogErrorCode::DdlNonNullableAppend,
+            "ALTER TABLE telemetry.prod.synthetic ADD COLUMN status STRING NOT NULL",
+            CatalogErrorCode::DdlParse,
         ),
         (
-            "CREATE TABLE telemetry.prod.lossy (half FLOAT16)",
-            CatalogErrorCode::TypeMappingUnsupported,
+            "CREATE TABLE telemetry.prod.lossy (half FLOAT16) USING DELTA",
+            CatalogErrorCode::DdlParse,
         ),
-        ("SELECT 1", CatalogErrorCode::DdlUnsupportedStatement),
+        ("SELECT 1", CatalogErrorCode::DdlParse),
     ];
     for (ddl, expected) in cases {
         let Err(error) = DdlParser::default().parse(ddl) else {
@@ -129,25 +127,25 @@ fn rejects_every_breaking_or_unsupported_mutation() {
 #[test]
 fn rejects_partition_changes_and_nonprimitive_partition_types() {
     let Err(error) = DdlParser::default().parse(
-        "CREATE TABLE telemetry.prod.bad_partition (id INT) \
-         PARTITIONED BY (labels ARRAY<VARCHAR>)",
+        "CREATE TABLE telemetry.prod.bad_partition (id INT, labels ARRAY<STRING>) \
+         USING DELTA PARTITIONED BY (labels)",
     ) else {
         panic!("nested partition must fail");
     };
-    assert_eq!(error.code(), CatalogErrorCode::TypeMappingUnsupported);
+    assert_eq!(error.code(), CatalogErrorCode::DdlParse);
 }
 
 #[test]
 fn rejects_lossy_lengths_and_decimal_defaults() {
     for ddl in [
-        "CREATE TABLE telemetry.prod.lossy (name VARCHAR(10))",
-        "CREATE TABLE telemetry.prod.lossy (amount DECIMAL)",
-        "CREATE TABLE telemetry.prod.lossy (amount DECIMAL(20))",
-        "CREATE TABLE telemetry.prod.lossy (bits BINARY(16))",
+        "CREATE TABLE telemetry.prod.lossy (name VARCHAR(10)) USING DELTA",
+        "CREATE TABLE telemetry.prod.lossy (amount DECIMAL) USING DELTA",
+        "CREATE TABLE telemetry.prod.lossy (amount DECIMAL(20)) USING DELTA",
+        "CREATE TABLE telemetry.prod.lossy (bits BINARY(16)) USING DELTA",
     ] {
         let Err(error) = DdlParser::default().parse(ddl) else {
             panic!("lossy mapping must fail closed: {ddl}");
         };
-        assert_eq!(error.code(), CatalogErrorCode::TypeMappingUnsupported);
+        assert_eq!(error.code(), CatalogErrorCode::DdlParse);
     }
 }

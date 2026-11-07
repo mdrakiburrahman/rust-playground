@@ -1,6 +1,12 @@
 # loadtest
 
-Every synthetic table has a required `customer_id VARCHAR` first column. The
+| Schema contract | Representation |
+| --- | --- |
+| DDL | Spark SQL `CREATE TABLE ... USING DELTA` |
+| Timestamps | `TIMESTAMP`: Arrow microseconds with UTC timezone |
+| SQL Server unsigned byte values | Spark `SMALLINT`, preserving the full 0–255 value range |
+
+Every synthetic table has a required `customer_id STRING` first column. The
 deterministic input interleaves 16 customers (`customer-0000` through
 `customer-0015`) rather than pre-sorting the input. Direct and Dataflow receive
 the same immutable encoded batches, including retries. The independent reader

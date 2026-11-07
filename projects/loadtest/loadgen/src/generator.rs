@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use arrow::{
     array::{
         ArrayRef, BooleanArray, Float64Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
-        TimestampNanosecondArray, UInt8Array,
+        TimestampMicrosecondArray, UInt8Array,
     },
     datatypes::{DataType, TimeUnit},
 };
@@ -172,15 +172,15 @@ fn deterministic_column(
     row_hasher.update(name.as_bytes());
     row_hasher.update(data_type.to_string().as_bytes());
     let array: ArrayRef = match data_type {
-        DataType::Timestamp(TimeUnit::Nanosecond, timezone)
+        DataType::Timestamp(TimeUnit::Microsecond, timezone)
             if timezone.as_deref().is_some_and(|timezone| timezone == "UTC") =>
         {
             let value = seed
                 .checked_add(offset)
-                .and_then(|seconds| seconds.checked_mul(1_000_000_000))
+                .and_then(|seconds| seconds.checked_mul(1_000_000))
                 .context("deterministic timestamp overflow")?;
             row_hasher.update(value.to_be_bytes());
-            Arc::new(TimestampNanosecondArray::from_value(value, rows).with_timezone("UTC"))
+            Arc::new(TimestampMicrosecondArray::from_value(value, rows).with_timezone("UTC"))
         }
         DataType::Utf8 if name == "customer_id" => {
             let values = (0..rows)
@@ -321,7 +321,7 @@ mod tests {
                 Field::new("customer_id", DataType::Utf8, false),
                 Field::new(
                     "sample_time_utc",
-                    DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
                     false,
                 ),
                 Field::new("database_id", DataType::Int16, false),

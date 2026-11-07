@@ -325,7 +325,7 @@ impl CatalogType {
             {
                 format!("DECIMAL({precision},{scale})")
             }
-            Self::Struct { fields } => format!(
+            Self::Struct { fields } if !fields.is_empty() => format!(
                 "STRUCT<{}>",
                 fields
                     .iter()
@@ -361,7 +361,11 @@ impl CatalogType {
                 && key.name() == "key"
                 && value.name() == "value"
                 && key.comment().is_none()
-                && value.comment().is_none() =>
+                && value.comment().is_none()
+                && matches!(
+                    key.mapping().arrow(),
+                    Self::Boolean | Self::Int8 | Self::Int16 | Self::Int32 | Self::Int64 | Self::Utf8
+                ) =>
             {
                 format!("MAP<{}, {}>", key.mapping().spark()?, value.mapping().spark()?)
             }
