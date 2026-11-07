@@ -311,9 +311,15 @@ export interface BenchmarkNetwork {
 }
 
 export const benchmarkCoreServices = [
-  'sqlserver', 'database-bootstrap', 'arrowcol-migrate', 'arrowcol-catalog',
-  'lgtm', 'cadvisor', 'portainer', 'dataflow-1', 'router',
+  'sqlserver', 'arrowcol-catalog', 'lgtm', 'cadvisor', 'portainer', 'dataflow-1', 'router',
 ];
+
+export const benchmarkStartupCommands = [
+  ['--profile', 'benchmark', 'up', '--detach', '--no-build', '--wait', '--wait-timeout', '600', 'sqlserver'],
+  ['--profile', 'benchmark', 'run', '--rm', '--no-deps', 'database-bootstrap'],
+  ['--profile', 'benchmark', 'run', '--rm', '--no-deps', 'arrowcol-migrate'],
+  ['--profile', 'benchmark', 'up', '--detach', '--no-build', '--wait', '--wait-timeout', '600', ...benchmarkCoreServices],
+] as const;
 
 function cidrRange(value: string): [number, number] | undefined {
   const match = /^(\d+)\.(\d+)\.(\d+)\.(\d+)\/(\d+)$/u.exec(value);
@@ -565,10 +571,13 @@ async function benchmark(
     ], 3_600_000);
     controller.checkRunning();
     phase = 'stack-start';
-    step(`Starting ${services.length} services and waiting for health (up to 10 minutes)`);
-    composeInteractive(project, env, [
-      '--profile', 'benchmark', 'up', '--detach', '--no-build', '--wait', '--wait-timeout', '600', ...services,
-    ], 3_600_000);
+    step('Starting SQL Server and waiting for health (up to 10 minutes)');
+    composeInteractive(project, env, [...benchmarkStartupCommands[0]], 3_600_000);
+    step('Bootstrapping routing databases and applying migrations');
+    composeInteractive(project, env, [...benchmarkStartupCommands[1]], 3_600_000);
+    composeInteractive(project, env, [...benchmarkStartupCommands[2]], 3_600_000);
+    step('Starting ' + services.length + ' long-running services and waiting for health');
+    composeInteractive(project, env, [...benchmarkStartupCommands[3]], 3_600_000);
     controller.checkRunning();
     workspaceConnection = connectWorkspaceContainer(project, env);
     if (!azure && options.validate) stackSql = sqlIdentity(workspace, args => run('docker', args));
