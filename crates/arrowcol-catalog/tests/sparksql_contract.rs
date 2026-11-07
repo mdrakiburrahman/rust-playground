@@ -34,6 +34,10 @@ fn every_spark_decimal_mapping_agrees_with_manifest_and_real_proto_contract() ->
     for (index, field) in schema.fields().iter().enumerate() {
         assert_eq!(field.mapping().protobuf(), ProtobufType::String, "{}", field.name());
         assert_eq!(fields[index].r#type(), Type::String, "{}", field.name());
+        let mapping = &manifest["schema"]["fields"][index]["mapping"];
+        assert!(mapping.get("datafusion").is_none(), "{}", field.name());
+        let restored: TypeMapping = serde_json::from_value(mapping.clone())?;
+        restored.validate()?;
         assert_eq!(
             manifest["schema"]["fields"][index]["mapping"]["protobuf"],
             "string",

@@ -27,13 +27,13 @@ for the new fields. An unregistered prefix, reordered field, changed physical
 type, nullability change, or fingerprint mismatch is rejected before collector
 admission.
 
-The SQL type surface follows DataFusion 54's Arrow mappings for booleans,
-signed/unsigned integers, real/double, strings, `BYTEA`, date, time,
-`TIMESTAMP(0|3|6|9)`, explicit `DECIMAL(p,s)`, `ARRAY`, and `STRUCT`. `MAP`
-uses the parser's `MAP(key, value)` spelling. Closed Arrow extensions required
-by collector schemas include `FIXED_SIZE_BINARY(n)`, `LARGE_STRING`,
-`STRING_VIEW`, `LARGE_BINARY`, `BINARY_VIEW`, `DATE64`, and explicit
-time/duration unit names. Unsupported or lossy mappings fail closed.
+The SQL type surface uses the lossless Spark contract: booleans, signed integers,
+`FLOAT`/`DOUBLE`, `STRING`, `BINARY`, `DATE`, microsecond `TIMESTAMP` (UTC) and
+`TIMESTAMP_NTZ`, explicit `DECIMAL(p,s)`, `ARRAY<T>`, `STRUCT<name: T>`, and
+`MAP<K,V>`. CREATE requires `USING DELTA`; see the supported statement subset in
+[arrowcol-sparksql](../arrowcol-sparksql/README.md). Unsigned integers, nonstandard
+Arrow encodings, fixed-size binary, non-microsecond timestamps, and other lossy
+representations fail closed. No DataFusion catalog dialect is retained.
 
 ## Runtime and compatibility
 
