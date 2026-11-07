@@ -82,11 +82,14 @@ export async function buildCatalogProof(signal: AbortSignal): Promise<string> {
   safeParents(client);
   fs.mkdirSync(path.join(client, 'src'), { recursive: true });
   fs.copyFileSync(path.join(WORKSPACE, 'experiments/schema-evolution/catalog-proof.rs'), path.join(client, 'src/main.rs'));
+  fs.copyFileSync(path.join(WORKSPACE, 'experiments/schema-evolution/inspect-parquet.rs'), path.join(client, 'src/inspect-parquet.rs'));
   fs.writeFileSync(path.join(client, 'Cargo.toml'), [
     '[package]', 'name = "schema-evolution-catalog-proof"', 'version = "0.1.0"', 'edition = "2024"',
+    '[[bin]]', 'name = "schema-evolution-inspect-parquet"', 'path = "src/inspect-parquet.rs"',
     '[workspace]', '[dependencies.arrowcol-catalog-client]',
     `path = ${JSON.stringify(path.join(WORKSPACE, 'crates/arrowcol-catalog-client'))}`, '[dependencies]',
     'serde_json = "=1.0.154"', 'tokio = { version = "=1.53.2", features = ["macros", "rt-multi-thread"] }', '',
+    'arrow-array = "=58.4.0"', 'parquet = { version = "=58.4.0", default-features = false, features = ["arrow", "snap", "zstd"] }', '',
   ].join('\n'));
   const manifestArg = ['--manifest-path', path.join(client, 'Cargo.toml')];
   await command('cargo', ['generate-lockfile', ...manifestArg], signal);
