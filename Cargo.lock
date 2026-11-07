@@ -921,6 +921,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrowcol-props"
+version = "0.1.0"
+
+[[package]]
 name = "arrowcol-protocol"
 version = "0.1.0"
 dependencies = [
