@@ -3,11 +3,7 @@ use async_trait::async_trait;
 
 use crate::{CatalogResult, CatalogSchemaVersion, SchemaVersion};
 
-mod thrift_adapter;
-
-pub use thrift_adapter::{HiveMetastore, HiveMetastoreConfig};
-
-/// Schema state read back through the official Hive Metastore API.
+/// Schema snapshot used by the schema-control compatibility adapter.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HiveTableSnapshot {
     identity: TableIdentity,
@@ -78,17 +74,17 @@ impl HiveTableSnapshot {
     }
 }
 
-/// Supported Hive Metastore control-plane operations.
+/// Schema-control compatibility operations.
 #[async_trait]
 pub trait Metastore: Send + Sync {
     /// Creates or alters the table idempotently and verifies the resulting
-    /// Arrowcol version/fingerprint through the official API.
+    /// Arrowcol version/fingerprint.
     async fn ensure_schema(
         &self,
         from_schema: Option<&CatalogSchemaVersion>,
         target_schema: &CatalogSchemaVersion,
     ) -> CatalogResult<HiveTableSnapshot>;
 
-    /// Reads an Arrowcol-owned table through Hive Metastore.
+    /// Reads an Arrowcol-owned table from the compatibility adapter.
     async fn table(&self, identity: &TableIdentity) -> CatalogResult<Option<HiveTableSnapshot>>;
 }

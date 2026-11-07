@@ -91,11 +91,11 @@ test('lint and tests finish before static helper installation for every loadtest
   assert.match(script, /"\$static_root\/x86_64-unknown-linux-gnu\/debug\/\$binary"/u);
 });
 
-test('real publisher services use an init and source layout overrides reach both collectors', () => {
-  for (const service of ['direct-1', 'dataflow-1', 'tenant-stream', 'delta-maintenance']) {
+test('real publisher services use init and DFE source layout overrides', () => {
+  for (const service of ['dataflow-1', 'arrowcol-catalog', 'tenant-stream', 'delta-maintenance']) {
     assert.equal(compose.services[service].init, true, `${service} must reap Azure CLI descendants`);
   }
-  for (const service of ['direct-1', 'dataflow-1']) {
+  for (const service of ['dataflow-1']) {
     assert.equal(compose.services[service].environment?.ARROWCOL_LAYOUT_ROW_GROUP_ROWS, '${ARROWCOL_LAYOUT_ROW_GROUP_ROWS:-16384}');
     assert.equal(compose.services[service].environment?.ARROWCOL_LAYOUT_PAGE_ROWS, '${ARROWCOL_LAYOUT_PAGE_ROWS:-2048}');
   }
@@ -122,9 +122,9 @@ test('real maintenance and tenant images are optional, build-covered, and use is
   assert(!maintenance.command?.includes('--unsafe-short-vacuum-for-tests'));
 });
 
-test('stack includes SQL, Hive, router, one collector per pool, Kusto, monitoring and validator', () => {
+test('stack includes SQL routing, catalog, router, DFE, Kusto, monitoring and validator', () => {
   const names = Object.keys(compose.services);
-  for (const service of ['sqlserver', 'hive-metastore', 'router', 'direct-1', 'dataflow-1', 'kusto', 'lgtm', 'cadvisor', 'portainer', 'validator']) {
+  for (const service of ['sqlserver', 'arrowcol-catalog', 'router', 'dataflow-1', 'kusto', 'lgtm', 'cadvisor', 'portainer', 'validator']) {
     assert(names.includes(service), `missing ${service}`);
     assert.deepEqual(compose.services[service].profiles, ['benchmark']);
   }
@@ -150,7 +150,7 @@ test('Kusto sees only read-only Delta roots plus owned persistent native storage
   const kusto = compose.services.kusto;
   assert.deepEqual(kusto.volumes, [
     'kusto-data:/kustodata',
-    ...['direct', 'dataflow'].map(pool => ({
+    ...['dataflow'].map(pool => ({
       type: 'bind', source: `\${ONELAKE_HOST_PATH:?Run through Nx}/${pool}`,
       target: `/delta/${pool}`, read_only: true, bind: { create_host_path: false },
     })),
@@ -170,12 +170,12 @@ test('Kusto cannot become a required collector dependency and the validator uses
     'http://${LOADTEST_KUSTO_IP:-10.89.0.50}:8080');
 });
 
-test('direct and dataflow pools use separate Delta roots', () => {
+test('catalog and DFE share the same Delta root', () => {
   const root = (service: string): string | undefined =>
     compose.services[service].volumes?.flatMap((volume) =>
-      typeof volume !== 'string' && volume.target?.startsWith('/delta/') ? [volume.source] : [])[0];
-  assert(root('direct-1'));
-  assert.notEqual(root('direct-1'), root('dataflow-1'));
+      typeof volume !== 'string' && volume.target === '/delta/dataflow' ? [volume.source] : [])[0];
+  assert(root('arrowcol-catalog'));
+  assert.equal(root('arrowcol-catalog'), root('dataflow-1'));
 });
 
 test('SQL Server publishes an overridable loopback port and retains its data and secret mounts', () => {
@@ -192,10 +192,8 @@ test('SQL Server has an overridable 16 GiB memory budget for continuous benchmar
     '${SQLSERVER_MEMORY_LIMIT_MB:-16384}');
 });
 
-test('both collectors have equal CPU budgets and explicit matching runtime thread/core counts', () => {
-  assert.equal(compose.services['direct-1'].cpus, '${LOADTEST_CPUS:-2}');
-  assert.equal(compose.services['dataflow-1'].cpus, compose.services['direct-1'].cpus);
-  assert.equal(compose.services['direct-1'].environment?.TOKIO_WORKER_THREADS, '${LOADTEST_CPUS:-2}');
+test('DFE has an explicit CPU and core budget', () => {
+  assert.equal(compose.services['dataflow-1'].cpus, '${LOADTEST_CPUS:-2}');
   assert.deepEqual(compose.services['dataflow-1'].command?.slice(0, 2), ['--num-cores', '${LOADTEST_CPUS:-2}']);
 });
 

@@ -98,7 +98,7 @@ test('cloud Compose config passes only runtime ownership inputs and isolated CLI
     mode: 'azure', azure: azureTargets(config, 'test'), azureConfigHostDirectory: '/private/run/azure-cli', azureEnvironment: environment,
   });
   const override = JSON.parse(text);
-  for (const service of ['dataflow-1']) {
+  for (const service of ['arrowcol-catalog', 'dataflow-1']) {
     const config = override.services[service];
     assert.equal(config.environment.AZURE_CONFIG_DIR, '/run/azure');
     assert.equal(config.environment.AZURE_SUBSCRIPTION_ID, environment.AZURE_SUBSCRIPTION_ID);

@@ -8,7 +8,7 @@ const workspace = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..
 for (const quiver of [false, true]) {
   const state = path.join(workspace, 'projects/loadtest/.temp', quiver ? 'compose-check-quiver' : 'compose-check');
   for (const directory of [
-    'dataflow', 'tenant', 'tenant-checkpoints', 'results', 'router-state', 'dataflow-state-1',
+    'dataflow', 'catalog-state', 'tenant', 'tenant-checkpoints', 'results', 'router-state', 'dataflow-state-1',
     ...(quiver ? [benchmarkQuiver.dataflowHostDirectory] : []),
   ]) {
     mkdirSync(path.join(state, directory), { recursive: true });

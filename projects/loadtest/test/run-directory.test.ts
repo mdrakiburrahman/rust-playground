@@ -31,14 +31,14 @@ function mockDocker(workspace: string): { commands: string[][]; docker: (args: s
   const labelled = (project: string): Record<string, string> => ({
     'com.docker.compose.project': project,
     'com.docker.compose.project.config_files': path.join(workspace, 'projects/loadtest/compose.yaml'),
-    'com.docker.compose.service': 'direct-1',
+    'com.docker.compose.service': 'dataflow-1',
   });
   const containers: Resource[] = [
     { id: 'collector', name: 'collector', labels: labelled(BENCHMARK_PROJECT) },
     { id: 'unrelated', name: 'unrelated', labels: labelled('another-project') },
   ];
   const volumes: Resource[] = [
-    ...['sqlserver-data', 'hive-warehouse', 'kusto-data'].map(volume => ({
+    ...['sqlserver-data', 'kusto-data'].map(volume => ({
       id: `${BENCHMARK_PROJECT}_${volume}`, name: `${BENCHMARK_PROJECT}_${volume}`,
       labels: { ...labelled(BENCHMARK_PROJECT), 'com.docker.compose.volume': volume,
         'io.arrowcol.loadtest.workspace': workspace },
@@ -86,7 +86,6 @@ test('Delta output has one fixed location', () => {
   assert.equal(deltaTableLocations(directory), [
     'Delta tables on disk (workspace paths)',
     '-------------------------------------',
-    `  Direct:   ${path.join(directory, 'direct')}`,
     `  Dataflow: ${path.join(directory, 'dataflow')}`,
   ].join('\n'));
 });
@@ -108,7 +107,7 @@ test('stop halts only verified workspace services and preserves every file and v
 
 test('cloud release prerequisite drains all mutators and rejects forced, OOM or unknown exits', async t => {
   const workspace = fixture(t);
-  for (const service of ['direct-1', 'dataflow-1', 'tenant-stream', 'delta-maintenance']) {
+  for (const service of ['dataflow-1', 'tenant-stream', 'delta-maintenance']) {
     for (const state of [
       { Running: false, ExitCode: 0, OOMKilled: false },
       { Running: false, ExitCode: 137, OOMKilled: false },
@@ -138,7 +137,7 @@ test('cloud release prerequisite drains all mutators and rejects forced, OOM or 
 
 test('final capture stops every mutator but keeps Kusto and live-evidence services available', async t => {
   const workspace = fixture(t);
-  const services = ['direct-1', 'dataflow-1', 'tenant-stream', 'delta-maintenance', 'kusto', 'lgtm'];
+  const services = ['dataflow-1', 'tenant-stream', 'delta-maintenance', 'kusto', 'lgtm'];
   const commands: string[][] = [];
   const docker = (args: string[]): string => {
     commands.push(args);
@@ -163,7 +162,7 @@ test('final capture stops every mutator but keeps Kusto and live-evidence servic
 
 test('full stop drains mutators before SQL Server and other infrastructure', async t => {
   const workspace = fixture(t);
-  const services = ['sqlserver', 'dataflow-1', 'router', 'direct-1'];
+  const services = ['sqlserver', 'dataflow-1', 'router'];
   const commands: string[][] = [];
   const docker = (args: string[]): string => {
     commands.push(args);
@@ -179,7 +178,7 @@ test('full stop drains mutators before SQL Server and other infrastructure', asy
   };
   await stopBenchmark(workspace, docker);
   assert.deepEqual(commands.filter(args => args[0] === 'stop'), [
-    ['stop', '--time', '30', 'dataflow-1', 'direct-1'],
+    ['stop', '--time', '30', 'dataflow-1'],
     ['stop', '--time', '30', 'sqlserver', 'router'],
   ]);
 });
@@ -193,7 +192,7 @@ test('starting again removes only already sealed output and owned SQL, Hive and 
   const { docker, commands } = mockDocker(workspace);
   assert.equal(await resetBenchmark(workspace, docker), latest);
   assert(!existsSync(path.join(latest, 'old.json')));
-  for (const volume of ['sqlserver-data', 'hive-warehouse', 'kusto-data']) {
+  for (const volume of ['sqlserver-data', 'kusto-data']) {
     assert(commands.some(args => args.join(' ') === `volume rm ${BENCHMARK_PROJECT}_${volume}`));
   }
   assert(commands.some(args => args.join(' ') === 'rm collector'));

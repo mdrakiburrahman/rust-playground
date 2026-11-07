@@ -311,7 +311,7 @@ export interface BenchmarkNetwork {
 }
 
 export const benchmarkCoreServices = [
-  'sqlserver', 'database-bootstrap', 'arrowcol-migrate',
+  'sqlserver', 'database-bootstrap', 'arrowcol-migrate', 'arrowcol-catalog',
   'lgtm', 'cadvisor', 'portainer', 'dataflow-1', 'router',
 ];
 
@@ -522,7 +522,7 @@ async function benchmark(
   controller.checkRunning();
   step('Bootstrapping secrets and preparing benchmark');
   for (const child of [
-    'dataflow', 'tenant', 'tenant-checkpoints', 'otel', 'results', 'router-state',
+    'dataflow', 'catalog-state', 'tenant', 'tenant-checkpoints', 'otel', 'results', 'router-state',
     ...(options.quiver ? [benchmarkQuiver.dataflowHostDirectory] : []),
   ]) {
     mkdirSync(path.join(directory, child), { recursive: true });
@@ -673,7 +673,7 @@ async function benchmark(
       sampleTimeoutSeconds: stressPlan.sampleTimeoutSeconds, measureSeconds: options.measureSeconds,
       privateScratch: path.join(workspace, 'projects/loadtest/.temp/loadgen/latest/diagnostics'),
       physicalRoots: Object.fromEntries([
-        'dataflow', 'tenant', 'tenant-checkpoints', 'dataflow-state-1', 'router-state',
+        'dataflow', 'catalog-state', 'tenant', 'tenant-checkpoints', 'dataflow-state-1', 'router-state',
       ].map(name => [name, path.join(directory, name)]).concat([
         ['loadgen-staging', path.join(workspace, 'projects/loadtest/.temp/loadgen/latest')],
       ])),

@@ -26,8 +26,8 @@ mod shutdown;
 pub use arrow_deltalake::delta::initialize_shared_io;
 pub use config::{
     AdaptiveFileConfig, BatchCapacity, CatalogConfig, CommitConfig, DeltaExporterConfig, FileBatchConfig,
-    FlightReceiverConfig, HiveMetastoreConnectionConfig, RegistrationConfig, RoutingStoreConfig, RuntimeLimitsConfig,
-    SqlServerConnectionConfig, configure_cloud_generation,
+    FlightReceiverConfig, RegistrationConfig, RoutingStoreConfig, RuntimeLimitsConfig, SqlServerConnectionConfig,
+    configure_cloud_generation,
 };
 pub use envelope::{
     ARROWCOL_FLIGHT_REPRESENTATION_ID, ARROWCOL_FLIGHT_REPRESENTATION_VERSION, ArrowcolBatchEnvelope,

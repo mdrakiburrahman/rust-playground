@@ -6,7 +6,7 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Bounded zero-copy Arrow batch buffering and durable publication coordination"
+description = "Shared Arrowcol cloud-generation, telemetry, and safe diagnostic utilities"
 readme = "README.md"
 
 [dependencies]

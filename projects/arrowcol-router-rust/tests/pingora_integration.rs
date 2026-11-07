@@ -396,7 +396,7 @@ fn run_child() -> anyhow::Result<()> {
             .register_collector(&CollectorRegistration {
                 instance_id: instance,
                 instance_key: "pingora-integration".to_owned(),
-                implementation_pool: ImplementationPool::Direct,
+                implementation_pool: ImplementationPool::Dataflow,
                 flight_endpoint: backend,
                 catalog_capable: true,
                 max_concurrent_streams: positive(256)?,
@@ -484,7 +484,7 @@ async fn control_request(
     let path = "/arrow.flight.protocol.FlightService/DoAction";
     let mut headers = HeaderMap::new();
     headers.insert("content-type", HeaderValue::from_static("application/grpc"));
-    headers.insert("x-arrowcol-implementation-pool", HeaderValue::from_static("direct"));
+    headers.insert("x-arrowcol-implementation-pool", HeaderValue::from_static("dataflow"));
     headers.insert("x-arrowcol-control-operation", HeaderValue::from_static("new_table"));
     headers.insert("x-arrowcol-catalog", HeaderValue::from_static("telemetry"));
     headers.insert("x-arrowcol-schema", HeaderValue::from_static("prod"));
@@ -492,7 +492,7 @@ async fn control_request(
     sign_and_copy(request.metadata_mut(), signer, &Method::POST, path, headers, nonce)?;
     request
         .metadata_mut()
-        .insert("x-arrowcol-implementation-pool", MetadataValue::from_static("direct"));
+        .insert("x-arrowcol-implementation-pool", MetadataValue::from_static("dataflow"));
     request
         .metadata_mut()
         .insert("x-arrowcol-control-operation", MetadataValue::from_static("new_table"));
@@ -554,7 +554,7 @@ fn add_ingest_metadata<S>(
     let mut headers = HeaderMap::new();
     headers.insert("content-type", HeaderValue::from_static("application/grpc"));
     headers.insert("x-arrowcol-protocol-version", HeaderValue::from_static("1"));
-    headers.insert("x-arrowcol-implementation-pool", HeaderValue::from_static("direct"));
+    headers.insert("x-arrowcol-implementation-pool", HeaderValue::from_static("dataflow"));
     headers.insert("x-arrowcol-catalog", HeaderValue::from_static("telemetry"));
     headers.insert("x-arrowcol-schema", HeaderValue::from_static("prod"));
     headers.insert("x-arrowcol-table", HeaderValue::from_static("traces"));
@@ -567,7 +567,7 @@ fn add_ingest_metadata<S>(
     }
     for (key, value) in [
         ("x-arrowcol-protocol-version", "1"),
-        ("x-arrowcol-implementation-pool", "direct"),
+        ("x-arrowcol-implementation-pool", "dataflow"),
         ("x-arrowcol-catalog", "telemetry"),
         ("x-arrowcol-schema", "prod"),
         ("x-arrowcol-table", "traces"),

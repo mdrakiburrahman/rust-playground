@@ -23,23 +23,9 @@ groups:
               admin_listening_addr: "${env:ARROWCOL_ADMIN_LISTEN:-0.0.0.0:32011}"
               native_quiver: true
               catalog:
-                type: sql_hive
-                application_database:
-                  host: "${env:ARROWCOL_SQL_HOST:-sqlserver}"
-                  port: ${env:ARROWCOL_SQL_PORT:-1433}
-                  database: "${env:ARROWCOL_SQL_DATABASE:-arrowcol}"
-                  username: "${env:ARROWCOL_SQL_USERNAME:-arrowcol_app}"
-                  password_file: "${env:ARROWCOL_SQL_PASSWORD_FILE:-/run/secrets/arrowcol-app-password}"
-                  trust_server_certificate: ${env:ARROWCOL_SQL_TRUST_CERT:-true}
-                  connect_timeout: 15s
-                  command_timeout: 30s
-                hive_metastore:
-                  host: "${env:ARROWCOL_HIVE_HOST:-hive-metastore}"
-                  port: ${env:ARROWCOL_HIVE_PORT:-9083}
-                  warehouse_root: "${env:ARROWCOL_HIVE_WAREHOUSE:-file:///opt/hive/data/warehouse}"
-                  owner: arrowcol
-                  connect_timeout: 10s
-                timestamp_timezone: UTC
+                type: remote
+                endpoint: "${env:ARROWCOL_CATALOG_ENDPOINT:-http://arrowcol-catalog:8817}"
+                maximum_cache_age: 10s
               routing:
                 type: sql_server
                 connection:
