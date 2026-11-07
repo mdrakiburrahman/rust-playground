@@ -573,6 +573,9 @@ fn run_worker(
                     Request::Ready(reply) => {
                         let _ = reply.send(Err(message.clone()));
                     }
+                    Request::AdaptiveConfig(_, reply) => {
+                        let _ = reply.send(Err(message.clone()));
+                    }
                     Request::NewFile(_, reply) | Request::NewPublication(_, _, _, _, reply) => {
                         let _ = reply.send(Err(message.clone()));
                     }

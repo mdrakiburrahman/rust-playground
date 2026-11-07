@@ -31,7 +31,17 @@ VACUUM plans and applies in one pass, reusing the independently validated histor
 
 New writer publications resolve current Delta metadata through `LayoutPolicy::from_properties` and `AdaptiveFileSizeConfig::from_properties`. Table values override validated process defaults. Sort/Bloom column names must exist in the actual schema and must not be partition columns: partition columns are omitted from the physical Parquet schema. Unsupported partition-column layout requests fail explicitly. Generated ingestion granularity must not replace a catalog-declared partition specification.
 
-**Adaptive sizing limitation:** durable DFE publications do not yet support safely splitting an admitted publication using adaptive rotation. Non-default `arrowcol.writer.*` policy is explicitly rejected before publication rather than silently accepted as an unused setting. The error is retryable after correcting table policy. This does not change OPTIMIZE's independently supported target and bounds.
+**Adaptive grouping, not file splitting:** the seven `arrowcol.writer.*` properties govern the existing DFE publication-group scheduling estimator. `targetFileSize / estimatedParquetRatio`, clamped by `minInputSize` and `maxInputSize`, determines when queued Arrow bytes trigger publication. Successful durable file observations update the bounded EWMA; failed commits do not install observations. Table properties override `file_batching.adaptive_file` process defaults and refresh on the table IO worker without a catalog RPC per admitted batch. A changed effective configuration starts a cold estimate; unchanged configuration retains learned observations.
+
+Each admitted publication (and each declared partition key within it) retains its own replay-safe file and transaction identity. Grouping changes commit scheduling, not file boundaries: `targetFileSize` is not a guarantee of individual Parquet file size. Adaptive splitting of durable publications was not a baseline capability and is not introduced here. OPTIMIZE's separately supported output target remains unchanged.
+
+| Baseline `628e5131` evidence | Supported effect preserved and centrally governed |
+| --- | --- |
+| `crates/arrowcol-dataflow-components/src/config.rs` lines 637-679; `crates/arrowcol-dataflow-components/src/exporter.rs` lines 252 and 634-639 | All seven process controls already populated the estimator and triggered group flush through `should_flush(bytes)`. |
+| `crates/arrowcol-dataflow-components/src/exporter.rs` lines 730-776 | One file per admitted publication; staged Parquet observations became the live estimate only after committed receipts. |
+| `crates/arrowcol-buffer/src/manager.rs` lines 597, 983-985 and 1348-1366 | Buffer-side estimator and per-receipt replay isolation remain unchanged; DFE table overrides govern its downstream publication-group scheduler. |
+
+`cargo test --locked -p arrowcol-dataflow-components --lib exporter_refreshes_catalog_adaptive_grouping_without_changing_publication_identity` proves table-over-process precedence, a live same-owner high-to-low threshold update, durable completion of independent receipt files and replay without duplicate additions.
 
 Refresh applies to new publications. An already-staged publication retains its file plan and transaction identity during recovery; changing layout/granularity never changes a replay identity midway through a retry.
 
@@ -43,7 +53,7 @@ Refresh applies to new publications. An already-staged publication retains its f
 | `arrowcol.vacuum.enabled`, `.retention`, `.allowShortRetention`, `.maxDeletes`, `.maxListedFiles` | Full retention authorization and bounded delete/probe config. Retention equality is not expired; incomplete inventories fail with no mutation. Persisted policy cannot lower the seven-day floor. |
 | `arrowcol.purge.enabled`, `.retention`, `arrowcol.partition.granularity` | Logical ingestion cutoff and PURGE plan before compaction; generated writer partition formatting uses current metadata policy. Declared catalog partition keys remain authoritative. |
 | `arrowcol.layout.enabled`, `.sortColumns`, `.bloomColumns`, `.maxRows`, `.maxInputSize`, `.rowGroupRows`, `.pageRows` | Sorted writer/OPTIMIZE layout config; output sorting, Bloom metadata, row-group limits and bounded buffering are observable. Invalid columns or bounds fail before commit. |
-| `arrowcol.writer.targetFileSize`, `.minInputSize`, `.maxInputSize`, `.coldStartParquetRatio`, `.ewmaWeight`, `.minParquetRatio`, `.maxParquetRatio` | Shared adaptive-config validation; non-default DFE policy is explicitly rejected while durable adaptive splitting is unsupported. |
+| `arrowcol.writer.targetFileSize`, `.minInputSize`, `.maxInputSize`, `.coldStartParquetRatio`, `.ewmaWeight`, `.minParquetRatio`, `.maxParquetRatio` | Live table policy drives DFE group-flush threshold and successful-file EWMA observations. Real pending-versus-durable receipt assertions prove table precedence and dynamic updates without changing replay identity. No individual-file size guarantee. |
 | `delta.targetFileSize`, `.deletedFileRetentionDuration`, `.logRetentionDuration`, `.checkpointInterval`, `.appendOnly` | Target fallback, tombstone/log cutoffs, checkpoint debt and strict boolean syntax. Syntax validation does not authorize a protocol/feature change. |
 
 ## Retained history and pruning proof

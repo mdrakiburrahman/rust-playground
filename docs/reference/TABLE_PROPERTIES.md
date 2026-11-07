@@ -47,11 +47,11 @@ Table TBLPROPERTIES override process defaults, which override the defaults below
 | `arrowcol.layout.maxInputSize` | Bytes | `64 MiB` | `Positive` | Table | 0.1 | Maximum Arrow input retained per sorted file. |
 | `arrowcol.layout.rowGroupRows` | Integer | `16384` | `Positive` | Table | 0.1 | Parquet row-group row limit. |
 | `arrowcol.layout.pageRows` | Integer | `2048` | `Positive` | Table | 0.1 | Parquet data-page row limit. |
-| `arrowcol.writer.targetFileSize` | Bytes | `128 MiB` | `Positive` | Table | 0.1 | Adaptive compressed file target; explicit delta.targetFileSize is the fallback. |
-| `arrowcol.writer.minInputSize` | Bytes | `16 MiB` | `Positive` | Table | 0.1 | Minimum adaptive Arrow-input target. |
-| `arrowcol.writer.maxInputSize` | Bytes | `1 GiB` | `Positive` | Table | 0.1 | Maximum adaptive Arrow-input target. |
+| `arrowcol.writer.targetFileSize` | Bytes | `128 MiB` | `Positive` | Table | 0.1 | Compressed-byte target for adaptive publication-group scheduling, not a per-file size guarantee; explicit delta.targetFileSize is the fallback. |
+| `arrowcol.writer.minInputSize` | Bytes | `16 MiB` | `Positive` | Table | 0.1 | Minimum Arrow-input threshold for adaptive publication-group scheduling. |
+| `arrowcol.writer.maxInputSize` | Bytes | `1 GiB` | `Positive` | Table | 0.1 | Maximum Arrow-input threshold for adaptive publication-group scheduling. |
 | `arrowcol.writer.coldStartParquetRatio` | Float | `0.25` | `Positive` | Table | 0.1 | Initial encoded/logical compression ratio. |
-| `arrowcol.writer.ewmaWeight` | Float | `0.2` | `Range(2.2250738585072014e-308, 0.5)` | Table | 0.1 | Weight of each file observation in adaptive sizing. |
+| `arrowcol.writer.ewmaWeight` | Float | `0.2` | `Range(2.2250738585072014e-308, 0.5)` | Table | 0.1 | Weight of each successfully committed file observation in the group-scheduling estimator. |
 | `arrowcol.writer.minParquetRatio` | Float | `0.015625` | `Positive` | Table | 0.1 | Lower compression-ratio clamp. |
 | `arrowcol.writer.maxParquetRatio` | Float | `4` | `Positive` | Table | 0.1 | Upper compression-ratio clamp. |
 

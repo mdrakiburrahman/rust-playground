@@ -1324,7 +1324,8 @@ mod tests {
             arrow_deltalake::commit::CommitOptions::default(),
             batching,
             Arc::new(RuntimeMetrics::new(holder)),
-        )?;
+        )
+        .map_err(anyhow::Error::msg)?;
         let first = exporter.stage(envelope_pdata(envelope_for(&lease))).await?;
         tokio::time::timeout(std::time::Duration::from_secs(3), first.wait()).await??;
         let path = fixture.0.join("demo/generated/events");

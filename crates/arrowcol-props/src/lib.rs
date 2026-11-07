@@ -338,21 +338,21 @@ pub static REGISTRY: &[PropKey] = &[
         Bytes,
         "128 MiB",
         Validator::Positive,
-        "Adaptive compressed file target; explicit delta.targetFileSize is the fallback."
+        "Compressed-byte target for adaptive publication-group scheduling, not a per-file size guarantee; explicit delta.targetFileSize is the fallback."
     ),
     key!(
         "arrowcol.writer.minInputSize",
         Bytes,
         "16 MiB",
         Validator::Positive,
-        "Minimum adaptive Arrow-input target."
+        "Minimum Arrow-input threshold for adaptive publication-group scheduling."
     ),
     key!(
         "arrowcol.writer.maxInputSize",
         Bytes,
         "1 GiB",
         Validator::Positive,
-        "Maximum adaptive Arrow-input target."
+        "Maximum Arrow-input threshold for adaptive publication-group scheduling."
     ),
     key!(
         "arrowcol.writer.coldStartParquetRatio",
@@ -366,7 +366,7 @@ pub static REGISTRY: &[PropKey] = &[
         Float,
         "0.2",
         Validator::Range(f64::MIN_POSITIVE, 0.5),
-        "Weight of each file observation in adaptive sizing."
+        "Weight of each successfully committed file observation in the group-scheduling estimator."
     ),
     key!(
         "arrowcol.writer.minParquetRatio",
