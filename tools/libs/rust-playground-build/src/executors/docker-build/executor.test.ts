@@ -1035,7 +1035,6 @@ test('configures runtime publication namespaces, immutability, and uncached Carg
 test('all production runtime projects expose cached image, smoke, and guarded publish targets', () => {
   for (const project of [
     'otelcol-rust',
-    'arrowcol-rust',
     'arrowcol-dataflow-rust',
     'arrowcol-router-rust',
   ]) {

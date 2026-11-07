@@ -13,7 +13,6 @@ import {
 
 export const PRODUCTION_RUNTIME_IMAGE_PROJECTS = [
   'otelcol-rust',
-  'arrowcol-rust',
   'arrowcol-dataflow-rust',
   'arrowcol-router-rust',
   'arrowcol-catalog-rust',
