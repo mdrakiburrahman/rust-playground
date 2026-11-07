@@ -752,6 +752,7 @@ dependencies = [
  "arrow-ipc 58.4.0",
  "arrow-schema 58.4.0",
  "arrowcol-protocol",
+ "arrowcol-sparksql",
  "arrowcol-sql-server",
  "async-trait",
  "hex",
@@ -1092,6 +1093,16 @@ dependencies = [
  "sha2 0.10.9",
  "syn 2.0.119",
  "tar",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "arrowcol-sparksql"
+version = "0.1.0"
+dependencies = [
+ "chumsky",
+ "proptest",
+ "serde",
  "thiserror 2.0.21",
 ]
 
@@ -1718,6 +1729,15 @@ checksum = "a6139a8597ed92cf816dfb33f5dd6cf0bb93a6adc938f11039f371bc5bcd26c3"
 dependencies = [
  "chrono",
  "phf",
+]
+
+[[package]]
+name = "chumsky"
+version = "0.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8eebd66744a15ded14960ab4ccdbfb51ad3b81f51f3f04a80adac98c985396c9"
+dependencies = [
+ "hashbrown 0.14.5",
 ]
 
 [[package]]
@@ -3745,6 +3765,10 @@ name = "hashbrown"
 version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
+dependencies = [
+ "ahash",
+ "allocator-api2",
+]
 
 [[package]]
 name = "hashbrown"

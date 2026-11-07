@@ -295,6 +295,86 @@ pub enum CatalogType {
 }
 
 impl CatalogType {
+    /// Returns a lossless Spark SQL type spelling.
+    ///
+    /// # Errors
+    ///
+    /// Rejects Arrow physical representations not expressible by Spark DDL.
+    pub fn spark_name(&self) -> CatalogResult<String> {
+        let name = match self {
+            Self::Boolean => "BOOLEAN".to_owned(),
+            Self::Int8 => "TINYINT".to_owned(),
+            Self::Int16 => "SMALLINT".to_owned(),
+            Self::Int32 => "INT".to_owned(),
+            Self::Int64 => "BIGINT".to_owned(),
+            Self::Float32 => "FLOAT".to_owned(),
+            Self::Float64 => "DOUBLE".to_owned(),
+            Self::Timestamp {
+                unit: TimeUnit::Microsecond,
+                timezone: None,
+            } => "TIMESTAMP_NTZ".to_owned(),
+            Self::Timestamp {
+                unit: TimeUnit::Microsecond,
+                timezone: Some(zone),
+            } if zone == "UTC" => "TIMESTAMP".to_owned(),
+            Self::Date32 => "DATE".to_owned(),
+            Self::Binary => "BINARY".to_owned(),
+            Self::Utf8 => "STRING".to_owned(),
+            Self::Decimal128 { precision, scale }
+                if *precision > 0 && *precision <= 38 && *scale >= 0 && *scale <= *precision as i8 =>
+            {
+                format!("DECIMAL({precision},{scale})")
+            }
+            Self::Struct { fields } => format!(
+                "STRUCT<{}>",
+                fields
+                    .iter()
+                    .map(|field| {
+                        let mut sql = format!(
+                            "{}: {}",
+                            arrowcol_sparksql::quote_identifier(field.name()),
+                            field.mapping().spark()?
+                        );
+                        if !field.is_nullable() {
+                            sql.push_str(" NOT NULL");
+                        }
+                        if let Some(comment) = field.comment() {
+                            sql.push_str(&format!(" COMMENT {}", arrowcol_sparksql::quote_string(comment)));
+                        }
+                        Ok(sql)
+                    })
+                    .collect::<CatalogResult<Vec<_>>>()?
+                    .join(", ")
+            ),
+            Self::List {
+                list_kind: ListKind::List,
+                element,
+            } if element.is_nullable() && element.name() == "item" && element.comment().is_none() => {
+                format!("ARRAY<{}>", element.mapping().spark()?)
+            }
+            Self::Map {
+                key,
+                value,
+                keys_sorted: false,
+            } if !key.is_nullable()
+                && value.is_nullable()
+                && key.name() == "key"
+                && value.name() == "value"
+                && key.comment().is_none()
+                && value.comment().is_none() =>
+            {
+                format!("MAP<{}, {}>", key.mapping().spark()?, value.mapping().spark()?)
+            }
+            _ => {
+                return Err(CatalogError::new(
+                    CatalogErrorCode::TypeMappingUnsupported,
+                    format!("Arrow type {self:?} has no lossless Spark SQL representation"),
+                ));
+            }
+        };
+        Ok(name)
+    }
+
     /// Converts the normalized type to Arrow.
     ///
     /// # Errors
@@ -485,6 +565,7 @@ impl CatalogType {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TypeMapping {
     arrow: CatalogType,
+    spark: Option<String>,
     datafusion: String,
     hive: String,
     protobuf: ProtobufType,
@@ -494,11 +575,13 @@ impl TypeMapping {
     /// Creates a mapping from a supported normalized Arrow type.
     #[must_use]
     pub fn new(arrow: CatalogType) -> Self {
+        let spark = arrow.spark_name().ok();
         let datafusion = arrow.datafusion_name();
         let hive = arrow.hive_name();
         let protobuf = arrow.protobuf_type();
         Self {
             arrow,
+            spark,
             datafusion,
             hive,
             protobuf,
@@ -509,6 +592,20 @@ impl TypeMapping {
     #[must_use]
     pub const fn arrow(&self) -> &CatalogType {
         &self.arrow
+    }
+
+    /// Returns the canonical lossless Spark SQL type.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TypeMappingUnsupported` for Arrow-only representations.
+    pub fn spark(&self) -> CatalogResult<&str> {
+        self.spark.as_deref().ok_or_else(|| {
+            CatalogError::new(
+                CatalogErrorCode::TypeMappingUnsupported,
+                format!("Arrow type {:?} has no lossless Spark SQL representation", self.arrow),
+            )
+        })
     }
 
     /// Returns the canonical DataFusion SQL type.
@@ -578,6 +675,8 @@ pub struct CatalogField {
     nullable: bool,
     partition: Option<PartitionMetadata>,
     mapping: TypeMapping,
+    #[serde(default)]
+    comment: Option<String>,
 }
 
 impl CatalogField {
@@ -603,10 +702,10 @@ impl CatalogField {
                 "catalog field name must not be empty",
             ));
         }
-        if field_number == 0 {
+        if field_number == 0 || (19_000..=19_999).contains(&field_number) || field_number > 536_870_911 {
             return Err(CatalogError::new(
                 CatalogErrorCode::CorruptCatalogState,
-                "protobuf field number must be positive",
+                "protobuf field number must be 1..=536870911 excluding 19000..=19999",
             ));
         }
         Ok(Self {
@@ -617,6 +716,7 @@ impl CatalogField {
             nullable,
             partition,
             mapping,
+            comment: None,
         })
     }
 
@@ -662,6 +762,19 @@ impl CatalogField {
         &self.mapping
     }
 
+    /// Returns the optional Spark field comment.
+    #[must_use]
+    pub fn comment(&self) -> Option<&str> {
+        self.comment.as_deref()
+    }
+
+    /// Attaches the optional Spark field comment.
+    #[must_use]
+    pub fn with_comment(mut self, comment: Option<String>) -> Self {
+        self.comment = comment;
+        self
+    }
+
     /// Converts this field to Arrow.
     ///
     /// # Errors
@@ -686,6 +799,8 @@ pub struct CatalogSchemaVersion {
     fields: Vec<CatalogField>,
     fingerprint: SchemaFingerprint,
     canonical_ddl: String,
+    #[serde(default)]
+    metadata: arrowcol_sparksql::TableMetadata,
 }
 
 impl CatalogSchemaVersion {
@@ -705,6 +820,15 @@ impl CatalogSchemaVersion {
         validate_sibling_fields(&fields, true)?;
         let schema = arrow_schema_from_fields(&fields)?;
         let fingerprint = fingerprint_schema(&schema);
+        let mut partitions = fields
+            .iter()
+            .filter_map(|field| field.partition().map(|role| (role.ordinal(), field.name().to_owned())))
+            .collect::<Vec<_>>();
+        partitions.sort_by_key(|(ordinal, _)| *ordinal);
+        let metadata = arrowcol_sparksql::TableMetadata {
+            partition_columns: partitions.into_iter().map(|(_, name)| name).collect(),
+            ..Default::default()
+        };
         Ok(Self {
             table_id,
             identity,
@@ -712,6 +836,7 @@ impl CatalogSchemaVersion {
             fields,
             fingerprint,
             canonical_ddl: canonical_ddl.into(),
+            metadata,
         })
     }
 
@@ -751,6 +876,95 @@ impl CatalogSchemaVersion {
         &self.canonical_ddl
     }
 
+    /// Returns table properties, provider, location, comment and partition names.
+    #[must_use]
+    pub const fn metadata(&self) -> &arrowcol_sparksql::TableMetadata {
+        &self.metadata
+    }
+
+    /// Sets metadata while enforcing its agreement with the partition fields.
+    ///
+    /// # Errors
+    ///
+    /// Rejects non-Delta providers or inconsistent partition declarations.
+    pub fn with_metadata(mut self, metadata: arrowcol_sparksql::TableMetadata) -> CatalogResult<Self> {
+        if metadata.provider != "delta" || metadata.partition_columns != self.metadata.partition_columns {
+            return Err(CatalogError::new(
+                CatalogErrorCode::CorruptCatalogState,
+                "metadata provider or partition columns disagree with the schema",
+            ));
+        }
+        self.metadata = metadata;
+        Ok(self)
+    }
+
+    /// Renders the full registered table as lossless Spark SQL.
+    ///
+    /// # Errors
+    ///
+    /// Rejects Arrow-only field representations.
+    pub fn to_spark_sql(&self) -> CatalogResult<String> {
+        let columns = self
+            .fields
+            .iter()
+            .map(|field| {
+                let mut sql = format!(
+                    "{} {}",
+                    arrowcol_sparksql::quote_identifier(field.name()),
+                    field.mapping().spark()?
+                );
+                if !field.is_nullable() {
+                    sql.push_str(" NOT NULL");
+                }
+                if let Some(comment) = field.comment() {
+                    sql.push_str(&format!(" COMMENT {}", arrowcol_sparksql::quote_string(comment)));
+                }
+                Ok(sql)
+            })
+            .collect::<CatalogResult<Vec<_>>>()?;
+        let name = self
+            .identity
+            .to_string()
+            .split('.')
+            .map(arrowcol_sparksql::quote_identifier)
+            .collect::<Vec<_>>()
+            .join(".");
+        let mut sql = format!("CREATE TABLE {name} ({}) USING DELTA", columns.join(", "));
+        if !self.metadata.partition_columns.is_empty() {
+            sql.push_str(&format!(
+                " PARTITIONED BY ({})",
+                self.metadata
+                    .partition_columns
+                    .iter()
+                    .map(|name| arrowcol_sparksql::quote_identifier(name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if let Some(location) = &self.metadata.location {
+            sql.push_str(&format!(" LOCATION {}", arrowcol_sparksql::quote_string(location)));
+        }
+        if let Some(comment) = &self.metadata.comment {
+            sql.push_str(&format!(" COMMENT {}", arrowcol_sparksql::quote_string(comment)));
+        }
+        if !self.metadata.properties.is_empty() {
+            sql.push_str(&format!(
+                " TBLPROPERTIES ({})",
+                self.metadata
+                    .properties
+                    .iter()
+                    .map(|(key, value)| format!(
+                        "{}={}",
+                        arrowcol_sparksql::quote_string(key),
+                        arrowcol_sparksql::quote_string(value)
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        Ok(sql)
+    }
+
     /// Reconstructs the exact registered Arrow schema.
     ///
     /// # Errors
@@ -786,11 +1000,43 @@ impl CatalogSchemaVersion {
             .iter()
             .map(CatalogField::field_number)
             .max()
-            .map_or(Ok(1), |number| {
-                number.checked_add(1).ok_or_else(field_counter_exhausted)
-            })
+            .map_or(Ok(1), |number| next_protobuf_field_number(number))
     }
+}
 
+/// Returns the next legal protobuf field number, skipping its reserved range.
+///
+/// # Errors
+///
+/// Returns a corrupt-state error when the protobuf field-number space is exhausted.
+pub fn next_protobuf_field_number(current: u32) -> CatalogResult<u32> {
+    let next = current.checked_add(1).ok_or_else(field_counter_exhausted)?;
+    let next = if (19_000..=19_999).contains(&next) {
+        20_000
+    } else {
+        next
+    };
+    if next > 536_870_911 {
+        return Err(field_counter_exhausted());
+    }
+    Ok(next)
+}
+
+/// Maps a zero-based sibling ordinal to a legal deterministic protobuf number.
+///
+/// # Errors
+///
+/// Returns a corrupt-state error when the field-number space is exhausted.
+pub fn protobuf_field_number(position: u32) -> CatalogResult<u32> {
+    let offset = if position >= 18_999 { 1_001 } else { 1 };
+    let number = position.checked_add(offset).ok_or_else(field_counter_exhausted)?;
+    if number > 536_870_911 {
+        return Err(field_counter_exhausted());
+    }
+    Ok(number)
+}
+
+impl CatalogSchemaVersion {
     /// Returns whether this version is a nullable append-only superset.
     #[must_use]
     pub fn is_nullable_append_only_superset_of(&self, older: &Self) -> bool {

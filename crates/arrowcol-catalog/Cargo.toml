@@ -13,6 +13,7 @@ readme = "README.md"
 arrow-ipc = { version = "58.3", default-features = false }
 arrow-schema = { version = "58.3", default-features = false }
 arrowcol-protocol = { path = "../arrowcol-protocol" }
+arrowcol-sparksql = { path = "../arrowcol-sparksql" }
 arrowcol-sql-server = { path = "../arrowcol-sql-server" }
 async-trait = "0.1"
 hex = "0.4"
