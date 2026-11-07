@@ -4,6 +4,22 @@
   "projectType": "application",
   "implicitDependencies": ["experiment-kit", "azure-infra"],
   "targets": {
+    "build": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "cargo build --locked --quiet --package arrowcol-catalog-rust --package arrowcol-dataflow-rust --package arrowcol-sdk-gen"
+      }
+    },
+    "run": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["build"],
+      "options": {
+        "command": "npx --no-install tsx experiments/schema-evolution/src/main.ts",
+        "forwardAllArgs": true
+      }
+    },
     "lint": {
       "executor": "nx:run-commands",
       "options": {

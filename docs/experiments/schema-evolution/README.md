@@ -8,6 +8,7 @@
 | Pinned Kustainer accepts native-refresh prerequisites | `schema-evolution-experiment:probe-kustainer` accepts create, QAP, then AutoUpdateSchema. Empty fixture means actual refresh remains inconclusive. |
 | Live catalog, SDK, Delta and Kusto evolution | Not yet qualified; component checks are not an end-to-end pass. |
 | Native Azure schema refresh | Must be observed without a post-ALTER manual external-table update. |
+| New stamp reaches supported write readiness | Full bootstrap at `937a465` completed initialization under custody, reconciled 26 Delta external tables/QAP, and exported ready-v1 in 138.4 seconds. This is not the final DFE-only topology rehearsal. |
 
 ![Schema evolution architecture](schema-evolution.drawio.png)
 
@@ -16,12 +17,24 @@
 | `npx nx run schema-evolution-experiment:verify` | Strict TypeScript checks and deterministic hydration-verifier tests. No Azure deployment. |
 | `npx nx run schema-evolution-experiment:build-fixtures` | Separately built old/new Rust clients from real generated immutable SDKs. No network writes. |
 | `npx nx run schema-evolution-experiment:probe-kustainer` | Records Kustainer command capability and string null semantics; does not claim E2E delivery. |
+| `npx nx run schema-evolution-experiment:run -- --target local` | Actual Rust catalog/DFE, real generated historical SDKs, physical Delta null inspection, pinned Kustainer native refresh. |
+| `npx nx run schema-evolution-experiment:run -- --target azure --env-file .env.schema-evo.private --ready-env .env.azure.schema-evo` | Same real flow against the isolated stamp; requires a genuine exported ready generation and records bounded native refresh. |
 | `AZURE_RESOURCE_GROUP=rust-playground-schema-evo npx --no-install tsx infra/azure/bootstrap.ts provision --infra-only --output .env.azure.schema-evo` | Creates only the selected stamp; private generated configuration preserves its RG. Real Azure charges apply. |
+| `AZURE_RESOURCE_GROUP=rust-playground-schema-evo npx nx run azure-infra:provision -- --env-file .env.schema-evo.private --tables .env.azure.schema-evo.tables.json --output .env.azure.schema-evo` | Supported full initialization, KQL reconciliation and bootstrap completion. No generation or fencing bypass. Real Azure charges apply. |
 
 Keep resource-name overrides blank when creating the separate stamp. Never
 reuse the shared sandbox's table/checkpoint roots. **Stop/reset operate on the
 selected resource group; inspect that selection before execution.**
 See [Azure sandbox safety](../../operations/AZURE_SANDBOX.md).
+
+The runner records source SHA, runbook hash, immutable v1 SDK/binary custody,
+CES and exact cohort evidence under `.temp/experiments/schema-evolution`.
+Azure inputs are explicit: the ready env is overlaid on a fresh private input
+for the separate stamp, never inferred from shared `.env.azure`. The runner
+uses standalone process-shared routing and a real remote catalog, not empty
+memory catalogs or SQL/Hive fallbacks. Cleanup stops only owned processes and
+drops only the run's external table and storage prefix. An unclean publisher
+shutdown retains cloud data and occupancy for supported recovery.
 
 ## Qualification gates
 
