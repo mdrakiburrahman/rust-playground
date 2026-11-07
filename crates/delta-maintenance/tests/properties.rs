@@ -227,7 +227,7 @@ fn changed_policy_bypasses_old_schedule_without_repeating_an_unchanged_idle_pass
     persist_policy(&source)?;
     let initial = DeltaTable::open_catalog(source.0.url.clone())?
         .catalog_snapshot()?
-        .unwrap()
+        .ok_or_else(|| anyhow!("initial table metadata missing"))?
         .version;
     let discovery = UpdatingDiscovery(Mutex::new((0, source, inventory(root.path())?, root.path().into())));
     assert!(run_with_discovery(
@@ -243,7 +243,7 @@ fn changed_policy_bypasses_old_schedule_without_repeating_an_unchanged_idle_pass
     assert_eq!(state.0, 3);
     let snapshot = DeltaTable::open_catalog(state.1.0.url.clone())?
         .catalog_snapshot()?
-        .unwrap();
+        .ok_or_else(|| anyhow!("updated table metadata missing"))?;
     assert_eq!(
         snapshot.version,
         initial + 2,
