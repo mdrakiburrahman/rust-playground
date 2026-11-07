@@ -111,15 +111,6 @@ impl TimeUnit {
             Self::Nanosecond => arrow_schema::TimeUnit::Nanosecond,
         }
     }
-
-    const fn sql_precision(self) -> u8 {
-        match self {
-            Self::Second => 0,
-            Self::Millisecond => 3,
-            Self::Microsecond => 6,
-            Self::Nanosecond => 9,
-        }
-    }
 }
 
 /// Arrow list representation retained by the catalog.
@@ -454,63 +445,6 @@ impl CatalogType {
         Ok(data_type)
     }
 
-    fn datafusion_name(&self) -> String {
-        match self {
-            Self::Boolean => "BOOLEAN".to_owned(),
-            Self::Int8 => "TINYINT".to_owned(),
-            Self::Int16 => "SMALLINT".to_owned(),
-            Self::Int32 => "INTEGER".to_owned(),
-            Self::Int64 => "BIGINT".to_owned(),
-            Self::UInt8 => "TINYINT UNSIGNED".to_owned(),
-            Self::UInt16 => "SMALLINT UNSIGNED".to_owned(),
-            Self::UInt32 => "INTEGER UNSIGNED".to_owned(),
-            Self::UInt64 => "BIGINT UNSIGNED".to_owned(),
-            Self::Float32 => "REAL".to_owned(),
-            Self::Float64 => "DOUBLE".to_owned(),
-            Self::Timestamp { unit, timezone } => {
-                let zone = if timezone.is_some() { " WITH TIME ZONE" } else { "" };
-                format!("TIMESTAMP({}){zone}", unit.sql_precision())
-            }
-            Self::Date32 => "DATE".to_owned(),
-            Self::Date64 => "DATE64".to_owned(),
-            Self::Time32 { unit } => format!("TIME32({})", unit.sql_precision()),
-            Self::Time64 { unit } => format!("TIME({})", unit.sql_precision()),
-            Self::Duration { unit } => format!("DURATION_{}", format!("{unit:?}").to_ascii_uppercase()),
-            Self::Binary => "BYTEA".to_owned(),
-            Self::FixedSizeBinary { bytes } => format!("FIXED_SIZE_BINARY({bytes})"),
-            Self::LargeBinary => "LARGE_BINARY".to_owned(),
-            Self::BinaryView => "BINARY_VIEW".to_owned(),
-            Self::Utf8 => "VARCHAR".to_owned(),
-            Self::LargeUtf8 => "LARGE_STRING".to_owned(),
-            Self::Utf8View => "STRING_VIEW".to_owned(),
-            Self::Decimal128 { precision, scale } => format!("DECIMAL({precision},{scale})"),
-            Self::Struct { fields } => format!(
-                "STRUCT<{}>",
-                fields
-                    .iter()
-                    .map(|field| format!("{} {}", field.name, field.mapping.datafusion))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-            Self::List { list_kind, element } => match list_kind {
-                ListKind::List => format!("ARRAY<{}>", element.mapping.datafusion),
-                ListKind::LargeList => format!("LARGE_LIST<{}>", element.mapping.datafusion),
-                ListKind::FixedSize(size) => format!("{}[{size}]", element.mapping.datafusion),
-                ListKind::ListView => format!("LIST_VIEW<{}>", element.mapping.datafusion),
-                ListKind::LargeListView => format!("LARGE_LIST_VIEW<{}>", element.mapping.datafusion),
-            },
-            Self::Map { key, value, .. } => {
-                format!("MAP({}, {})", key.mapping.datafusion, value.mapping.datafusion)
-            }
-            Self::Dictionary { key, value, ordered } => format!(
-                "DICTIONARY<{}, {}>{}",
-                key.datafusion_name(),
-                value.datafusion_name(),
-                if *ordered { " ORDERED" } else { "" }
-            ),
-        }
-    }
-
     fn hive_name(&self) -> String {
         match self {
             Self::Boolean => "boolean".to_owned(),
@@ -566,7 +500,6 @@ impl CatalogType {
 pub struct TypeMapping {
     arrow: CatalogType,
     spark: Option<String>,
-    datafusion: String,
     hive: String,
     protobuf: ProtobufType,
 }
@@ -576,13 +509,11 @@ impl TypeMapping {
     #[must_use]
     pub fn new(arrow: CatalogType) -> Self {
         let spark = arrow.spark_name().ok();
-        let datafusion = arrow.datafusion_name();
         let hive = arrow.hive_name();
         let protobuf = arrow.protobuf_type();
         Self {
             arrow,
             spark,
-            datafusion,
             hive,
             protobuf,
         }
@@ -606,12 +537,6 @@ impl TypeMapping {
                 format!("Arrow type {:?} has no lossless Spark SQL representation", self.arrow),
             )
         })
-    }
-
-    /// Returns the canonical DataFusion SQL type.
-    #[must_use]
-    pub fn datafusion(&self) -> &str {
-        &self.datafusion
     }
 
     /// Returns the canonical Hive type.
