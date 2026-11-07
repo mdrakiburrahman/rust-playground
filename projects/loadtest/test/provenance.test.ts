@@ -55,12 +55,44 @@ test('stack-start provenance refuses selected helper replacement after its initi
   const output = path.join(directory, 'results/provenance.json');
   const initial = { helpers: helperIdentities(selected, mounted) };
   writeFileSync(output, JSON.stringify(initial));
-  writeFileSync(path.join(root, 'docker'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  writeFileSync(path.join(root, 'docker'), `#!/bin/sh
+if [ "$1" = ps ]; then
+  printf 'catalog-id\\nrouter-id\\ndataflow-id\\nunused-id\\n'
+elif [ "$1" = inspect ]; then
+  case "$3" in
+    *'.State.Running'*'.State.Health.Status'*'.State.StartedAt'*) ;;
+    *) exit 1 ;;
+  esac
+  case "$4" in
+    catalog-id) service=catalog; running=true; health='"healthy"' ;;
+    router-id) service=router; running=true; health='"healthy"' ;;
+    dataflow-id) service=dataflow-1; running=true; health=null ;;
+    unused-id) service=unused-profile; running=false; health='"unhealthy"' ;;
+    *) exit 1 ;;
+  esac
+  printf '{"id":"%s","imageId":"sha256:fixture","service":"%s","nanoCpus":0,"memoryLimit":0,"running":%s,"healthStatus":%s,"startedAt":"2026-11-07T23:00:00Z"}\\n' "$4" "$service" "$running" "$health"
+else
+  exit 1
+fi
+`, { mode: 0o755 });
   const options = parseBenchmarkOptions([]);
   const env = { ...process.env, PATH: `${root}:${process.env.PATH}` };
   writeProvenance(root, directory, 'fixture', options, env, selected, true);
   const before = readFileSync(output, 'utf8');
-  assert.deepEqual(JSON.parse(before).helpers, initial.helpers);
+  const captured = JSON.parse(before);
+  assert.deepEqual(captured.helpers, initial.helpers);
+  assert.deepEqual(captured.containers.map((value: Record<string, unknown>) =>
+    [value.service, value.imageId, value.running, value.healthStatus]), [
+    ['catalog', 'sha256:fixture', true, 'healthy'],
+    ['router', 'sha256:fixture', true, 'healthy'],
+    ['dataflow-1', 'sha256:fixture', true, null],
+    ['unused-profile', 'sha256:fixture', false, 'unhealthy'],
+  ]);
+  for (const value of captured.containers) {
+    assert.equal(value.startedAt, '2026-11-07T23:00:00Z');
+    assert(Number.isFinite(Date.parse(value.observedAt)));
+    assert(Date.parse(value.observedAt) <= Date.parse(captured.stackStartedAt));
+  }
   writeFileSync(path.join(selected, 'arrowcol-loadgen'), 'replacement');
   copyFileSync(path.join(selected, 'arrowcol-loadgen'), path.join(mounted, 'arrowcol-loadgen'));
   assert.throws(() => writeProvenance(root, directory, 'fixture', options, env, selected, true),

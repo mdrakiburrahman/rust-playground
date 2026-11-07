@@ -127,11 +127,14 @@ export function writeProvenance(
     }
     const ids = execute('docker', ['ps', '--all', '--quiet', '--filter', `label=com.docker.compose.project=${project}`])
       .trim().split('\n').filter(Boolean);
-    provenance.containers = ids.map((id) => JSON.parse(execute('docker', [
-      'inspect', '--format',
-      '{"id":{{json .Id}},"imageId":{{json .Image}},"service":{{json (index .Config.Labels "com.docker.compose.service")}},"nanoCpus":{{json .HostConfig.NanoCpus}},"memoryLimit":{{json .HostConfig.Memory}}}',
-      id,
-    ])) as unknown);
+    provenance.containers = ids.map((id) => {
+      const observedAt = new Date().toISOString();
+      return { ...JSON.parse(execute('docker', [
+        'inspect', '--format',
+        '{"id":{{json .Id}},"imageId":{{json .Image}},"service":{{json (index .Config.Labels "com.docker.compose.service")}},"nanoCpus":{{json .HostConfig.NanoCpus}},"memoryLimit":{{json .HostConfig.Memory}},"running":{{json .State.Running}},"healthStatus":{{if .State.Health}}{{json .State.Health.Status}}{{else}}null{{end}},"startedAt":{{json .State.StartedAt}}}',
+        id,
+      ])), observedAt };
+    });
     provenance.stackStartedAt = new Date().toISOString();
     writeFileSync(output, `${JSON.stringify(provenance, null, 2)}\n`);
     return;
