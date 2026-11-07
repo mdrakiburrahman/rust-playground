@@ -1,7 +1,7 @@
 //! Catalog, schema compatibility, and Flight SQL DDL control-plane services.
 //!
 //! The crate owns the authoritative immutable schema history used by Arrow
-//! collectors. It parses a deliberately small DataFusion-compatible DDL
+//! collectors. It parses an explicit, lossless Spark SQL DDL
 //! surface, maintains recoverable schema-change sagas, and validates incoming
 //! Arrow schemas exactly. The runtime catalog service owns persistence.
 
