@@ -140,6 +140,26 @@ resource readExperiment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   }
 }
 
+resource runtimeExperimentWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(experiment.id, identity.id, 'runtime-blob-contributor')
+  scope: experiment
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource runtimeControlWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(storage.id, checkpointContainer, identity.id, 'runtime-control-contributor')
+  scope: checkpoints!
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
 resource writeData 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(storage.id, operatorObjectId, 'blob-contributor')
   scope: storage
@@ -239,6 +259,28 @@ resource experimentReader 'Microsoft.Kusto/clusters/databases/principalAssignmen
   }
 }
 
+resource runtimeExperimentAdmin 'Microsoft.Kusto/clusters/databases/principalAssignments@2024-04-13' = {
+  parent: experimentDb
+  name: 'qap-runtime-identity'
+  properties: {
+    principalId: identity.properties.clientId
+    principalType: 'App'
+    role: 'Admin'
+    tenantId: tenant().tenantId
+  }
+  dependsOn: [experimentReader]
+}
+
+resource runtimeClusterReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(cluster.id, identity.id, 'runtime-cluster-reader')
+  scope: cluster
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'acdd72a7-3385-48ef-bd42-f606fba81ae7')
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
 resource workspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
   name: logAnalyticsWorkspaceName
   location: location
@@ -274,6 +316,16 @@ resource readLogs 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '73c42c96-874c-492b-b04d-ab87d138a893')
     principalId: operatorObjectId
     principalType: operatorType == 'User' ? 'User' : 'ServicePrincipal'
+  }
+}
+
+resource runtimeReadLogs 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(workspace.id, identity.id, 'runtime-log-analytics-reader')
+  scope: workspace
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '73c42c96-874c-492b-b04d-ab87d138a893')
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
   }
 }
 
