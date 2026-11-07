@@ -14,17 +14,6 @@
     "node",
     ".devcontainer/scripts/initialize.ts"
   ],
-  "onCreateCommand": [
-    "az",
-    "extension",
-    "add",
-    "--name",
-    "aks-preview",
-    "--version",
-    "22.0.0b15",
-    "--yes",
-    "--only-show-errors"
-  ],
   "postCreateCommand": [
     "node",
     ".devcontainer/scripts/post-create.ts"

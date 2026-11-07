@@ -17,18 +17,8 @@
     "node",
     ".devcontainer/scripts/initialize.ts"
   ],
-  "onCreateCommand": [
-    "az",
-    "extension",
-    "add",
-    "--name",
-    "aks-preview",
-    "--version",
-    "22.0.0b15",
-    "--yes",
-    "--only-show-errors"
-  ],
   "features": {
+    "../features/aks-preview": {},
     "ghcr.io/devcontainers/features/rust:1": {
       "version": "1.96.1",
       "profile": "minimal",

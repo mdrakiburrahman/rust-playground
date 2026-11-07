@@ -77,6 +77,8 @@ test('normal and source configurations share workspace, user, and lifecycle beha
   assert.equal(settings['workbench.browser.enableRemoteProxy'], false);
   assert.equal(normal.dockerComposeFile, 'docker-compose.yml');
   assert.equal(normal.waitFor, 'postStartCommand');
+  assert.equal(normal.onCreateCommand, undefined);
+  assert.equal(source.onCreateCommand, undefined);
   assert.deepEqual(normal.postStartCommand, [
     'node', '.devcontainer/scripts/post-create.ts', '--permissions-only',
   ]);
@@ -146,7 +148,21 @@ test('source and image-build configurations share pinned tools and features', ()
     context: '..',
   });
   assert.equal(imageBuild.dockerComposeFile, undefined);
-  assert.deepEqual(imageBuild.features, source.features);
+  const imageFeatures = { ...imageBuild.features };
+  const sourceFeatures = { ...source.features };
+  assert.deepEqual(imageFeatures['./features/aks-preview'], {});
+  assert.deepEqual(sourceFeatures['../features/aks-preview'], {});
+  delete imageFeatures['./features/aks-preview'];
+  delete sourceFeatures['../features/aks-preview'];
+  assert.deepEqual(imageFeatures, sourceFeatures);
+  const aksFeature = JSON.parse(readFileSync(
+    join(repositoryRoot, '.devcontainer', 'features', 'aks-preview', 'devcontainer-feature.json'), 'utf8',
+  )) as { installsAfter: string[] };
+  assert.deepEqual(aksFeature.installsAfter, ['ghcr.io/devcontainers/features/azure-cli']);
+  const aksInstall = readFileSync(
+    join(repositoryRoot, '.devcontainer', 'features', 'aks-preview', 'install.sh'), 'utf8',
+  );
+  assert.match(aksInstall, /az extension add --name aks-preview --version 22\.0\.0b15 --system/u);
   assert.deepEqual(source.features['ghcr.io/devcontainers/features/rust:1'], {
     version: '1.96.1',
     profile: 'minimal',
@@ -242,11 +258,11 @@ test('feature lock covers source and image-build features with immutable digests
   };
   assert.deepEqual(
     Object.keys(lock.features).sort(),
-    Object.keys(source.features).sort(),
+    Object.keys(source.features).filter((feature) => feature.startsWith('ghcr.io/')).sort(),
   );
   assert.deepEqual(
     Object.keys(lock.features).sort(),
-    Object.keys(imageBuild.features).sort(),
+    Object.keys(imageBuild.features).filter((feature) => feature.startsWith('ghcr.io/')).sort(),
   );
   assert.deepEqual(sourceLock, lock);
   for (const [feature, entry] of Object.entries(lock.features)) {
@@ -347,6 +363,8 @@ test('content hash is order-independent, path-aware, and line-ending normalized'
   );
   assert.equal(isContentHashInput('.devcontainer/Dockerfile'), true);
   assert.equal(isContentHashInput('.dockerignore'), true);
+  assert.equal(isContentHashInput('.devcontainer/features/aks-preview/install.sh'), true);
+  assert.equal(isContentHashInput('.devcontainer/features/aks-preview/devcontainer-feature.json'), true);
   assert.equal(
     isContentHashInput('.devcontainer/devcontainer.build.json'),
     true,
