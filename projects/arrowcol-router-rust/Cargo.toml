@@ -13,7 +13,6 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 arrowcol-protocol = { path = "../../crates/arrowcol-protocol" }
-arrowcol-receipts = { path = "../../crates/arrowcol-receipts" }
 arrowcol-routing = { path = "../../crates/arrowcol-routing" }
 async-trait = "0.1"
 base64 = "0.22"
