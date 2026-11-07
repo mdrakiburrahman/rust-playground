@@ -1571,7 +1571,7 @@ impl DeltaTable {
         }
     }
 
-    fn open_connection(
+    pub(crate) fn open_connection(
         url: Url,
         partition_columns: Vec<String>,
         publication_fence: Option<Arc<dyn PublicationFence>>,

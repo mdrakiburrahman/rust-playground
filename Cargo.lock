@@ -423,6 +423,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow 58.4.0",
+ "arrow-json 58.4.0",
  "async-trait",
  "chrono",
  "delta_kernel",
@@ -776,6 +777,7 @@ dependencies = [
 name = "arrowcol-catalog-client"
 version = "0.1.0"
 dependencies = [
+ "arrow-flight",
  "arrowcol-catalog",
  "arrowcol-protocol",
  "async-trait",
@@ -790,6 +792,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrowcol-catalog-rust"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow-array 58.4.0",
+ "arrow-deltalake",
+ "arrow-flight",
+ "arrow-schema 58.4.0",
+ "arrowcol-catalog",
+ "arrowcol-catalog-client",
+ "arrowcol-props",
+ "arrowcol-protocol",
+ "arrowcol-sparksql",
+ "async-trait",
+ "clap",
+ "futures",
+ "prost 0.14.4",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "arrowcol-dataflow-components"
 version = "0.1.0"
 dependencies = [
@@ -800,6 +832,7 @@ dependencies = [
  "arrow-schema 58.4.0",
  "arrowcol-buffer",
  "arrowcol-catalog",
+ "arrowcol-catalog-client",
  "arrowcol-flight",
  "arrowcol-protocol",
  "arrowcol-routing",

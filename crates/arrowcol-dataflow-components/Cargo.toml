@@ -17,6 +17,7 @@ arrow-schema = { version = "58.3", default-features = false }
 arrow-flight = { version = "58.3", default-features = false, features = ["flight-sql"] }
 arrow-deltalake = { path = "../arrow-deltalake", features = ["delta"] }
 arrowcol-catalog = { path = "../arrowcol-catalog" }
+arrowcol-catalog-client = { path = "../arrowcol-catalog-client" }
 arrowcol-flight = { path = "../arrowcol-flight" }
 arrowcol-protocol = { path = "../arrowcol-protocol" }
 arrowcol-routing = { path = "../arrowcol-routing" }

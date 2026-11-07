@@ -18,6 +18,8 @@ pub use azure_cli::AzureCliTokenProvider;
 #[cfg(feature = "delta")]
 mod azure_fence;
 #[cfg(feature = "delta")]
+pub mod catalog;
+#[cfg(feature = "delta")]
 pub mod commit;
 #[cfg(feature = "delta")]
 pub mod delta;

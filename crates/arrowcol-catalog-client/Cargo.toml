@@ -9,6 +9,7 @@ repository.workspace = true
 description = "Resumable CES schema catalog client and bounded ingestion cache"
 
 [dependencies]
+arrow-flight = { version = "58.3", default-features = false, features = ["flight-sql"] }
 arrowcol-catalog = { path = "../arrowcol-catalog" }
 arrowcol-protocol = { path = "../arrowcol-protocol" }
 async-trait = "0.1"

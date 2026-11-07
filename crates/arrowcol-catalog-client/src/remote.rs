@@ -9,7 +9,8 @@ use std::{
 
 use arrowcol_catalog::{
     CatalogError, CatalogErrorCode, CatalogResult, CatalogSchemaVersion, CatalogStore, ChangeReservation,
-    DescriptorArtifacts, RequestHash, ReserveOutcome, SagaId, SagaRecord, SagaStep, SchemaVersion,
+    DdlCompletion, DdlCompletionDisposition, DdlParser, DescriptorArtifacts, FlightSqlDdlHandler, FlightSqlDdlRequest,
+    RequestHash, ReserveOutcome, SagaId, SagaRecord, SagaStep, SchemaVersion,
 };
 use arrowcol_protocol::{SchemaFingerprint, TableIdentity};
 use async_trait::async_trait;
@@ -51,6 +52,7 @@ struct Counters {
 
 /// Remote catalog cache with replay, restart detection and bounded outage age.
 pub struct RemoteCatalogClient {
+    channel: Channel,
     rpc: RpcClient,
     cache: Mutex<Cache>,
     maximum_age: Duration,
@@ -74,7 +76,8 @@ impl RemoteCatalogClient {
             .await
             .map_err(|error| failure(format!("catalog connection failed: {error}")))?;
         let client = Arc::new(Self {
-            rpc: RpcClient::new(channel),
+            rpc: RpcClient::new(channel.clone()),
+            channel,
             cache: Mutex::new(Cache::default()),
             maximum_age,
             counters: Counters::default(),
@@ -209,6 +212,30 @@ impl RemoteCatalogClient {
                 }
             }
         }
+    }
+}
+
+#[async_trait]
+impl FlightSqlDdlHandler for RemoteCatalogClient {
+    async fn execute_ddl(&self, request: FlightSqlDdlRequest) -> CatalogResult<DdlCompletion> {
+        let command = DdlParser::default().parse(request.command())?;
+        let identity = command.identity().clone();
+        let mut client = arrow_flight::sql::client::FlightSqlServiceClient::new(self.channel.clone());
+        self.counters.calls.fetch_add(1, Ordering::Relaxed);
+        client
+            .execute_update(request.command().to_owned(), None)
+            .await
+            .map_err(|error| failure(format!("catalog Flight SQL failed: {error}")))?;
+        self.invalidate(&identity).await;
+        let table = self.table(&identity).await?;
+        let schema = table
+            .versions
+            .last()
+            .ok_or_else(|| failure("DDL completed without a committed schema"))?;
+        Ok(DdlCompletion::from_committed(
+            schema,
+            DdlCompletionDisposition::AlreadyApplied,
+        ))
     }
 }
 

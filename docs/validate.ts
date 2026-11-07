@@ -28,6 +28,7 @@ export const DOCUMENTS = [
   'projects/arrowcol-infra/README.md',
   'projects/arrowcol-rust/README.md',
   'projects/arrowcol-router-rust/README.md',
+  'projects/arrowcol-catalog-rust/README.md',
   'projects/arrowcol-dataflow-rust/README.md',
   'projects/loadtest/README.md',
   'projects/otelcol-rust/README.md',

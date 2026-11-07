@@ -65,6 +65,18 @@ pub struct DdlCompletion {
 }
 
 impl DdlCompletion {
+    /// Builds a completion only after its schema is committed to Delta.
+    #[must_use]
+    pub fn from_committed(schema: &CatalogSchemaVersion, disposition: DdlCompletionDisposition) -> Self {
+        Self {
+            identity: schema.identity().clone(),
+            schema_version: schema.version(),
+            fingerprint: schema.fingerprint(),
+            saga_id: None,
+            disposition,
+        }
+    }
+
     /// Returns the affected table.
     #[must_use]
     pub const fn identity(&self) -> &TableIdentity {

@@ -64,6 +64,7 @@
             "arrowcol-rust",
             "arrowcol-dataflow-rust",
             "arrowcol-router-rust",
+            "arrowcol-catalog-rust",
             "kusto-explorer",
             "arrow-tenant-stream",
             "delta-maintenance"

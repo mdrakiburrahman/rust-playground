@@ -2,56 +2,71 @@
 
 [SDK pipeline diagram](diagrams/sdk-generation.html) | [Architecture index](README.md)
 
-## Supported DDL
-
-Flight SQL uses `CommandStatementUpdate` on `DoPut`, without ingest metadata.
-The maintained parser accepts exactly these shapes:
+| Surface | Contract |
+| --- | --- |
+| Flight SQL `DoPut` | Spark SQL `CommandStatementUpdate`; CREATE, nullable ADD, SET/UNSET TBLPROPERTIES, external DROP and CREATE DATABASE |
+| gRPC metadata | `SchemaCatalog.GetTable` / atomic `GetSnapshot`; committed history, Arrow IPC, manifest and protobuf descriptors |
+| Change events | `GetCurrentEventId`, `GetEvents(from)` and `Watch(from)`; CREATE_TABLE, ALTER_TABLE, DROP_TABLE, SET_PROPS |
+| Table model | Catalog/database/table, provider, location, comment, partition columns and TBLPROPERTIES |
+| Runtime | Standalone Rust catalog and Delta Kernel; no Spark process, JVM or Thrift |
 
 ```sql
 CREATE TABLE telemetry.prod.events (
     id BIGINT NOT NULL,
-    body VARCHAR NULL
-) PARTITIONED BY (id)
+    body STRING
+) USING DELTA TBLPROPERTIES ('vendor.owner' = 'telemetry');
 
-ALTER TABLE telemetry.prod.events
-ADD COLUMNS (source VARCHAR NULL)
+ALTER TABLE telemetry.prod.events ADD COLUMNS (source STRING);
 ```
 
-Transactions, body record batches, drops, renames, replacement, CTAS, defaults,
-constraints, storage clauses, type/nullability changes, reordering,
-`FIRST`/`AFTER`, partition changes, and other statements are rejected.
-The [catalog library](../../../crates/arrowcol-catalog/README.md) lists supported
-SQL/Arrow types and closed extensions; unsupported/lossy mappings fail closed.
+The Rust [Spark SQL parser](../../../crates/arrowcol-sparksql/README.md) rejects
+CTAS, arbitrary queries and breaking schema mutations. The catalog validates
+registered properties through the shared [property registry](../../../crates/arrowcol-props/README.md).
+Unrelated vendor properties remain intact in Delta `metadata.configuration`.
 
-## Durable SQL/Hive saga
+## Commit and recovery
 
-```text
-Reserve operation + pending immutable version in SQL
-  -> create/CAS Hive table through official Metastore API
-  -> persist checked manifest / Arrow schema / protobuf descriptor chunks
-  -> atomically activate the SQL catalog head
-```
-
-Startup reconciles incomplete operations. Canonical DDL hashes and deterministic
-identities make saga retries idempotent; failed steps retain attempts and errors.
-This catalog idempotency is **not** ingest deduplication.
-
-Existing fields, positions, protobuf numbers, types, nullability, and partition
-roles are immutable. Evolution permits only nullable, top-level, tail-appended
-fields; positions and protobuf numbers are never reused.
-
-## Schema admission
-
-| Incoming schema | Result |
+| Stage | Safety invariant |
 | --- | --- |
-| Claim equals computed fingerprint; exact layout identifies a registered version | Admit after other identity/lease checks |
-| Historical registered version; current head is nullable tail-append-only superset | Reuse old arrays; append all-null arrays for new fields |
-| Unregistered prefix, reordered/changed field, mismatched claim, similar but unregistered layout | Reject before a direct receipt or DFE admission |
+| Durable location index | Written before Delta CREATE, so restart can discover an unknown-success commit |
+| Delta transaction | Schema, properties, comment and immutable catalog history commit in one optimistic transaction |
+| Publication | Only a successfully read-back Delta head enters memory or emits an event |
+| Restart | Read `_delta_log` first; older seed SQL cannot overwrite committed schema or properties |
+| Concurrent DDL | Serialized catalog operations; a Delta version conflict requires fresh metadata and a rebuilt transaction |
+| External DROP | Durable catalog tombstone; never deletes Delta data or its transaction log |
 
-Historical SDKs remain valid only under that append-only rule. Clients are not
-silently coerced across breaking layouts. SDK compatibility additionally checks
-protobuf wire/JSON stability; see [generation](sdk-generation.md#evolution-and-limits).
+`catalog.schemaHistory` and `catalog.dropped` are reserved, non-tunable internal
+configuration keys. CREATE/SET/UNSET attempts to overwrite them fail. Recovery
+checks persisted history against the committed Delta schema, partitions,
+properties and comment. Existing tables without catalog history are imported
+only when their physical Arrow types map losslessly to Spark.
 
-Sources: [DDL parser](../../../crates/arrowcol-catalog/src/ddl.rs),
-[saga](../../../crates/arrowcol-catalog/src/saga.rs),
+Delta Kernel 0.29 lacks an ALTER property setter. The catalog's supported
+Committer extension augments generated metadata **before** the atomic write,
+then validates the final metadata/protocol pair. It preserves unrelated actions
+and optimistic concurrency; it never rewrites a committed log.
+
+## CES and schema admission
+
+| Incoming schema / cache state | Result |
+| --- | --- |
+| Exact claimed fingerprint and registered layout | Admit after identity/lease checks |
+| Historical registered nullable-append prefix | Reuse source arrays and null-fill appended fields |
+| Unregistered prefix, reordered/changed field or false claim | Clear Flight rejection before DFE admission |
+| Warm coherent cache | No catalog RPC per ingestion stream; validate one immutable history snapshot |
+| Epoch mismatch, retained-event gap or stream lag | Discard cached state and take a new atomic snapshot |
+| Catalog outage or missed high watermark | Fail closed after bounded freshness; never use an unbounded stale cache |
+
+The resume token is **epoch + event_id**. IDs increase within one process epoch;
+restart creates a new epoch. Snapshot high watermark and replay/subscription
+are race-safe. Clients periodically reconcile the server watermark and count
+actual RPC starts separately from local hits, misses and invalidations.
+
+Existing field identities, positions, protobuf numbers, types, nullability and
+partition roles never change. New field numbers skip protobuf's reserved range.
+Property-only revisions preserve earlier descriptor versions and do not issue
+a Delta transaction when the effective properties are unchanged.
+
+See [service setup](../../../projects/arrowcol-catalog-rust/README.md),
+[SDK generation](sdk-generation.md#evolution-and-limits) and
 [admission validation](../../../crates/arrowcol-catalog/src/validation.rs).
