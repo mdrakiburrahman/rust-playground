@@ -9,7 +9,7 @@ replace the devcontainer mode.
 | Requirement | Qualified value or guard |
 | --- | --- |
 | Azure target | The private stamp subscription, `arrow-collector-rg`, East US 2; never the separate `rust-playground` resource group. |
-| Stamp | Positive integer in ignored `infra/azure/stamp.yaml`; deployment names are derived from it. |
+| Stamp | Integer `1..999999` in ignored `infra/azure/stamp.yaml`; `arrow-collector-<stamp>` must fit Kusto's provider-enforced 22-character name limit. |
 | AKS baseline | 1.35.6; `Standard_D8s_v6` system pool with 3 initial/3 minimum/6 maximum nodes, 250 pods per node, zones 1/2/3, Azure Linux/FIPS, Entra/Azure RBAC, OIDC/workload identity, Azure CNI overlay dual stack and API-server VNet integration. |
 | Declared identity | One `arrow-collector` UAMI for control plane, kubelet, QAP ServiceAccount federation, ADX/storage and ACR. Identity-creating optional add-ons are omitted; tenant-enforced add-ons require separate live qualification below. |
 | Publisher ownership | Generated `AZURE_STAMP` selects the same `stamp-<integer>` authority in TypeScript and Rust. Invalid stamps fail closed; an absent stamp retains the Rust legacy hashed-authority path only for older deployments. |

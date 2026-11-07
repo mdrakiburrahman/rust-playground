@@ -1,5 +1,6 @@
 # Copy to infra/azure/stamp.yaml, set the subscription UUID, and verify address ranges against every connected network.
 subscription: 00000000-0000-0000-0000-000000000000
+# 1..999999: arrow-collector-<stamp> must fit Kusto's 22-character name limit.
 stamp: 1
 resourceGroup: arrow-collector-rg
 location: eastus2

@@ -32,9 +32,9 @@ fn sandbox_ownership(subscription: &str, stamp: Option<&str>) -> Result<String> 
     if let Some(raw) = stamp {
         let value = raw
             .parse::<u64>()
-            .context("AZURE_STAMP must be a positive integer no greater than 99999999999")?;
-        if !raw.bytes().all(|byte| byte.is_ascii_digit()) || !(1..=99_999_999_999).contains(&value) {
-            bail!("AZURE_STAMP must be a positive integer no greater than 99999999999");
+            .context("AZURE_STAMP must be a positive integer no greater than 999999 (Kusto cluster name limit)")?;
+        if !raw.bytes().all(|byte| byte.is_ascii_digit()) || !(1..=999_999).contains(&value) {
+            bail!("AZURE_STAMP must be a positive integer no greater than 999999 (Kusto cluster name limit)");
         }
         return Ok(format!("stamp-{value}"));
     }
@@ -329,8 +329,8 @@ mod tests {
         assert_eq!(sandbox_ownership(subscription, Some("1")).unwrap(), "stamp-1");
         assert_eq!(sandbox_ownership(subscription, Some("01")).unwrap(), "stamp-1");
         assert_eq!(
-            sandbox_ownership(subscription, Some("99999999999")).unwrap(),
-            "stamp-99999999999"
+            sandbox_ownership(subscription, Some("999999")).unwrap(),
+            "stamp-999999"
         );
         assert_eq!(sandbox_ownership(subscription, None).unwrap(), "07657369824b");
         for invalid in [
@@ -341,6 +341,8 @@ mod tests {
             "1.5",
             " 1",
             "1 ",
+            "1000000",
+            "99999999999",
             "100000000000",
             "18446744073709551616",
         ] {

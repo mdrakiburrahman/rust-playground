@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { Failure } from './authority.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+const MAX_STAMP = 999_999;
 
 export interface StampConfig {
   subscription: string;
@@ -144,8 +145,8 @@ export function assertNoStampNetworkOverlap(config: StampConfig, externalPrefixe
 
 export function defaultStampConfig(values: Record<string, string | undefined> = {}): StampConfig {
   const rawStamp = values.AZURE_STAMP ?? '1';
-  if (!/^\d+$/.test(rawStamp) || !Number.isSafeInteger(Number(rawStamp)) || Number(rawStamp) < 1 || Number(rawStamp) > 99_999_999_999)
-    throw new Failure('AZURE_STAMP must be a positive integer no greater than 99999999999.');
+  if (!/^\d+$/.test(rawStamp) || !Number.isSafeInteger(Number(rawStamp)) || Number(rawStamp) < 1 || Number(rawStamp) > MAX_STAMP)
+    throw new Failure('AZURE_STAMP must be a positive integer no greater than 999999 (Kusto cluster name limit).');
   const group = values.AZURE_RESOURCE_GROUP ?? 'arrow-collector-rg';
   if (group !== 'arrow-collector-rg') throw new Failure('Only the exact arrow-collector-rg resource group is authorized.');
   const location = values.AZURE_LOCATION ?? 'eastus2';
@@ -162,7 +163,7 @@ export function parseStampConfig(source: string): StampConfig {
   const raw = object(parsed, 'AKS stamp configuration');
   keys(raw, ['subscription', 'stamp', 'resourceGroup', 'location', 'aks', 'publisherFederatedCredentials'], 'AKS stamp configuration');
   const subscription = text(raw.subscription, 'subscription', /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i).toLowerCase();
-  const stamp = integer(raw.stamp, 'stamp', 1, 99_999_999_999);
+  const stamp = integer(raw.stamp, 'stamp', 1, MAX_STAMP);
   const resourceGroup = text(raw.resourceGroup, 'resourceGroup', /^arrow-collector-rg$/) as 'arrow-collector-rg';
   const location = text(raw.location, 'location', /^eastus2$/) as 'eastus2';
   const aksRaw = object(raw.aks, 'aks');

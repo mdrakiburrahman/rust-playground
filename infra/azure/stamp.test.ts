@@ -30,6 +30,15 @@ test('rejects invalid stamps, resource-group scope and network overlaps', () => 
     'podIpv4Cidr: 10.240.0.0/16')), /must not overlap/);
 });
 
+test('bounds YAML and environment stamps to the Kusto cluster name limit', () => {
+  assert.equal(parseStampConfig(example.replace('stamp: 1', 'stamp: 999999')).stamp, 999999);
+  assert.equal(defaultStampConfig({ AZURE_STAMP: '999999' }).stamp, 999999);
+  for (const stamp of [1000000, 99999999999]) {
+    assert.throws(() => parseStampConfig(example.replace('stamp: 1', `stamp: ${stamp}`)), /stamp must be an integer in 1\.\.999999/);
+    assert.throws(() => defaultStampConfig({ AZURE_STAMP: String(stamp) }), /Kusto cluster name limit/);
+  }
+});
+
 test('requires explicit target defaults and rejects a different group or region', () => {
   assert.equal(defaultStampConfig().stamp, 1);
   assert.throws(() => defaultStampConfig({ AZURE_RESOURCE_GROUP: 'rust-playground' }), /exact arrow-collector-rg/);
