@@ -3,9 +3,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrowcol_protocol::{
-    CATALOG_METADATA_KEY, CLAIMED_SCHEMA_FINGERPRINT_METADATA_KEY,
-    IMPLEMENTATION_POOL_METADATA_KEY, ImplementationPool, IngestMetadata, PROTOCOL_VERSION_METADATA_KEY,
-    RawGrpcMetadata, SCHEMA_METADATA_KEY, TABLE_METADATA_KEY, UnixMillis,
+    CATALOG_METADATA_KEY, CLAIMED_SCHEMA_FINGERPRINT_METADATA_KEY, IMPLEMENTATION_POOL_METADATA_KEY,
+    ImplementationPool, IngestMetadata, PROTOCOL_VERSION_METADATA_KEY, RawGrpcMetadata, SCHEMA_METADATA_KEY,
+    TABLE_METADATA_KEY, UnixMillis,
 };
 use arrowcol_routing::{ControlOperation, ControlRoute, RouteAssignment, RouteSource, RoutingEngine, RoutingErrorKind};
 use async_trait::async_trait;
@@ -26,8 +26,8 @@ use tracing::{error, info, warn};
 use crate::{
     AuthFailure, AuthFailureKind, Authenticator, EDGE_NONCE_HEADER, EDGE_SIGNATURE_HEADER, EDGE_TIMESTAMP_HEADER,
     EdgeVerifier, ExternalRequest, INTERNAL_AUTH_CONTEXT_HEADER, INTERNAL_AUTH_EXPIRES_HEADER,
-    INTERNAL_AUTH_SIGNATURE_HEADER, InternalIdentitySigner, RouterConfig, RouterMetrics,
-    SignedInternalIdentity, UpstreamConfig,
+    INTERNAL_AUTH_SIGNATURE_HEADER, InternalIdentitySigner, RouterConfig, RouterMetrics, SignedInternalIdentity,
+    UpstreamConfig,
 };
 
 /// Exact Arrow Flight `DoPut` RPC path.
@@ -259,8 +259,6 @@ impl ProductionRouter {
             _ => Ok(None),
         }
     }
-
-
 }
 
 #[derive(Default)]

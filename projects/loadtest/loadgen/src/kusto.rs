@@ -756,7 +756,7 @@ impl Exposure {
         for name in rows
             .iter()
             .filter_map(|row| row.get("TableName").and_then(Value::as_str))
-            .filter(|name| name.starts_with("direct_sqlserver_") || name.starts_with("dataflow_sqlserver_"))
+            .filter(|name| name.starts_with("dataflow_sqlserver_"))
         {
             if !live.load(Ordering::Acquire) || self.status.live_tables.contains(name) {
                 continue;
@@ -775,12 +775,12 @@ impl Exposure {
         Ok(())
     }
 
-    async fn sync_roots(&mut self, direct: &Path, dataflow: &Path, live: &AtomicBool) -> Result<()> {
+    async fn sync_roots(&mut self, dataflow: &Path, live: &AtomicBool) -> Result<()> {
         if self.client.mode == Mode::Azure {
             return self.observe_provisioned(live).await;
         }
         self.client.bootstrap().await?;
-        for (pool, root) in [("direct", direct), ("dataflow", dataflow)] {
+        for (pool, root) in [("dataflow", dataflow)] {
             let snapshot = delta_inspect::inventory(root).await?;
             self.sync(pool, &snapshot, live).await?;
         }
@@ -807,9 +807,7 @@ impl LiveSync {
             let result = async {
                 let mut exposure = Exposure::new(&endpoint, &arguments.results, &run_id)?;
                 while !stopped.is_cancelled() {
-                    let result = exposure
-                        .sync_roots(&arguments.direct_root, &arguments.dataflow_root, &active)
-                        .await;
+                    let result = exposure.sync_roots(&arguments.dataflow_root, &active).await;
                     exposure.persist(result.as_ref().err())?;
                     tokio::select! {
                         () = stopped.cancelled() => break,
@@ -823,9 +821,7 @@ impl LiveSync {
                         arguments.quiver,
                     )
                     .await?;
-                    exposure
-                        .sync_roots(&arguments.direct_root, &arguments.dataflow_root, &active)
-                        .await
+                    exposure.sync_roots(&arguments.dataflow_root, &active).await
                 })
                 .await
                 .context("Kusto final catch-up timed out")?;
@@ -1499,9 +1495,7 @@ impl KustoBound {
 pub(crate) async fn validate(
     endpoint: &str,
     results: &Path,
-    direct_root: &Path,
     dataflow_root: &Path,
-    direct: &SnapshotSummary,
     dataflow: &SnapshotSummary,
     bound: &KustoBound,
 ) -> Result<Value> {
@@ -1519,7 +1513,7 @@ pub(crate) async fn validate(
     let oracle_timer = bound.timings.measure("phase/TableOracle");
     bound.update(|progress| progress.phase = KustoPhase::TableOracle);
     let mut inputs = Vec::new();
-    for (pool, root, snapshot) in [("direct", direct_root, direct), ("dataflow", dataflow_root, dataflow)] {
+    for (pool, root, snapshot) in [("dataflow", dataflow_root, dataflow)] {
         ensure!(
             snapshot.tables.len() == TABLES_PER_POOL,
             "{pool} Kusto validation requires all {TABLES_PER_POOL} tables"

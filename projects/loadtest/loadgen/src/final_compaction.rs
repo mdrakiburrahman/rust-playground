@@ -117,7 +117,7 @@ fn enabled(args: &FinalCompactionArgs) -> Result<bool> {
         !(args.final_compaction && args.skip_final_compaction),
         "cannot request and skip final-compaction"
     );
-    let azure = cloud_root(&args.direct_root) || cloud_root(&args.dataflow_root);
+    let azure = cloud_root(&args.dataflow_root);
     ensure!(
         !(azure && args.final_compaction),
         "explicit Azure final-compaction is unsupported"
@@ -852,11 +852,7 @@ fn run_sync(args: &FinalCompactionArgs, deadline: Instant) -> Result<()> {
             return Ok(());
         }
         require_release(&args.results, receipt.run_id.as_deref().context("run_id unavailable")?)?;
-        let roots = BTreeMap::from([
-            ("direct".to_owned(), local_root(&args.direct_root)?),
-            ("dataflow".to_owned(), local_root(&args.dataflow_root)?),
-        ]);
-        ensure!(roots["direct"] != roots["dataflow"], "pool roots must not alias");
+        let roots = BTreeMap::from([("dataflow".to_owned(), local_root(&args.dataflow_root)?)]);
         let names = schema_statements()?
             .into_iter()
             .map(|statement| statement.identity.table().to_string())
@@ -864,7 +860,7 @@ fn run_sync(args: &FinalCompactionArgs, deadline: Instant) -> Result<()> {
         ensure!(names.len() == TABLE_COUNT, "canonical schema fixture changed");
         let mut local = Local::open(&roots, &names, deadline)?;
         let expected = local.tables.keys().cloned().collect::<BTreeSet<_>>();
-        ensure!(expected.len() == 2 * TABLE_COUNT, "expected exactly 26 tables");
+        ensure!(expected.len() == TABLE_COUNT, "expected exactly {TABLE_COUNT} tables");
         let (before, after) = finish(&mut local, &expected, deadline, &mut receipt.passes)?;
         for (pool, root) in roots {
             let mut evidence = PoolEvidence {
@@ -913,7 +909,6 @@ mod tests {
     fn args(results: &Path) -> FinalCompactionArgs {
         FinalCompactionArgs {
             results: results.to_owned(),
-            direct_root: results.join("direct"),
             dataflow_root: results.join("dataflow"),
             final_compaction: false,
             skip_final_compaction: false,
@@ -1499,7 +1494,6 @@ mod tests {
         let arguments = args(root.path());
         fs::write(root.path().join("run-metadata.json"), br#"{"run_id":"run-1"}"#)?;
         assert!(run_sync(&arguments, Instant::now() + BUDGET).is_err());
-        assert!(!arguments.direct_root.exists());
         failure_receipt(root.path())?;
         for release in [
             serde_json::json!({"run_id":"run-1","passed":false}),
@@ -1513,7 +1507,6 @@ mod tests {
             receipts(case.path(), release)?;
             let arguments = args(case.path());
             assert!(run_sync(&arguments, Instant::now() + BUDGET).is_err());
-            assert!(!arguments.direct_root.exists());
             let evidence = failure_receipt(case.path())?;
             assert!(
                 evidence["error"]
@@ -1540,7 +1533,6 @@ mod tests {
             )?;
             let arguments = args(root.path());
             assert!(run_sync(&arguments, Instant::now() + BUDGET).is_err());
-            assert!(!arguments.direct_root.exists());
             let evidence = failure_receipt(root.path())?;
             assert_eq!(evidence["run_id"], Value::Null);
             assert!(
@@ -1585,7 +1577,6 @@ mod tests {
             assert!(!cloud_root(Path::new(path)), "{path}");
         }
         let mut arguments = args(Path::new("results"));
-        arguments.direct_root = r"C:\delta\direct".into();
         arguments.dataflow_root = r"D:\delta\dataflow".into();
         arguments.final_compaction = true;
         assert!(enabled(&arguments)?);
@@ -1602,7 +1593,6 @@ mod tests {
         assert!(enabled(&arguments)?);
         arguments.skip_final_compaction = true;
         assert!(!enabled(&arguments)?);
-        arguments.direct_root = "abfss://container@account.dfs.core.windows.net/direct".into();
         arguments.skip_final_compaction = false;
         assert!(!enabled(&arguments)?);
         arguments.final_compaction = true;
@@ -1632,7 +1622,6 @@ mod tests {
         let evidence: Value = read_json(&case.path().join(ARTIFACT))?;
         assert_eq!(evidence["skipped"], true);
         assert_eq!(evidence["passed"], false);
-        assert!(!arguments.direct_root.exists());
         assert!(
             run_sync(&arguments, Instant::now() + BUDGET).is_err(),
             "never overwrite prior evidence"
@@ -1733,7 +1722,7 @@ mod tests {
             Field::new("name", DataType::Utf8, true),
             Field::new(INGESTION_PARTITION, DataType::Utf8, false),
         ]));
-        for pool in [&arguments.direct_root, &arguments.dataflow_root] {
+        for pool in [&arguments.dataflow_root] {
             for statement in schema_statements()? {
                 let path = pool
                     .join("telemetry/sqlserver")
@@ -1777,10 +1766,7 @@ mod tests {
                 .context("final reports")?
                 .is_empty()
         );
-        for (pool, path) in [
-            ("direct", &arguments.direct_root),
-            ("dataflow", &arguments.dataflow_root),
-        ] {
+        for (pool, path) in [("dataflow", &arguments.dataflow_root)] {
             // Existing independent test oracle only; production never calls delta-rs.
             let independent = delta_inspect::inventory(path).await?;
             assert_eq!(
