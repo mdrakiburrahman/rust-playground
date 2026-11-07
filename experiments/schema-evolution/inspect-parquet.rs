@@ -13,13 +13,12 @@ struct Counts {
     bad_sentinel: u64,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let files = std::env::args().skip(1).collect::<Vec<_>>();
+fn inspect(files: &[String]) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     if files.is_empty() {
         return Err("usage: inspect-parquet ACTIVE_DELTA_FILE [ACTIVE_DELTA_FILE ...]".into());
     }
     let mut counts = BTreeMap::<(String, String), Counts>::new();
-    for file in &files {
+    for file in files {
         for batch in ParquetRecordBatchReaderBuilder::try_new(File::open(file)?)?.build()? {
             let batch = batch?;
             let strings = |name: &str| -> Result<&StringArray, Box<dyn std::error::Error>> {
@@ -66,15 +65,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    println!(
-        "{}",
-        json!({
-            "files": files,
-            "counts": counts.iter().map(|((client, phase), counts)| json!({
-                "client": client, "phase": phase, "total": counts.rows, "nulls": counts.nulls,
-                "missingColumn": counts.missing, "filled": counts.filled, "badSentinel": counts.bad_sentinel
-            })).collect::<Vec<_>>()
-        })
-    );
+    Ok(json!({
+        "files": files,
+        "counts": counts.iter().map(|((client, phase), counts)| json!({
+            "client": client, "phase": phase, "total": counts.rows, "nulls": counts.nulls,
+            "missingColumn": counts.missing, "filled": counts.filled, "badSentinel": counts.bad_sentinel
+        })).collect::<Vec<_>>()
+    }))
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", inspect(&std::env::args().skip(1).collect::<Vec<_>>())?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+
+    use super::*;
+
+    #[test]
+    fn distinguishes_absent_historical_column_from_true_null_and_filled_sentinel()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let mut files = Vec::new();
+        for (client, phase, bar) in [
+            ("old", "before", None),
+            ("old", "after", Some(vec![None, None])),
+            ("new", "after", Some(vec![Some("bar-0"), Some("bar-1")])),
+        ] {
+            let mut columns: Vec<(&str, Arc<dyn Array>)> = vec![
+                ("client", Arc::new(StringArray::from(vec![client; 2]))),
+                ("phase", Arc::new(StringArray::from(vec![phase; 2]))),
+                ("value", Arc::new(Int64Array::from(vec![0, 1]))),
+            ];
+            if let Some(bar) = bar {
+                columns.push(("bar", Arc::new(StringArray::from(bar))));
+            }
+            let batch = RecordBatch::try_from_iter(columns)?;
+            let filename = directory.path().join(format!("{client}-{phase}.parquet"));
+            let mut writer = ArrowWriter::try_new(File::create(&filename)?, batch.schema(), None)?;
+            writer.write(&batch)?;
+            writer.close()?;
+            files.push(filename.to_string_lossy().into_owned());
+        }
+        let result = inspect(&files)?;
+        assert_eq!(
+            result["counts"],
+            json!([
+                {"client":"new","phase":"after","total":2,"nulls":0,"missingColumn":0,"filled":2,"badSentinel":0},
+                {"client":"old","phase":"after","total":2,"nulls":2,"missingColumn":0,"filled":0,"badSentinel":0},
+                {"client":"old","phase":"before","total":2,"nulls":2,"missingColumn":2,"filled":0,"badSentinel":0}
+            ])
+        );
+        assert!(inspect(&[]).is_err());
+        Ok(())
+    }
 }

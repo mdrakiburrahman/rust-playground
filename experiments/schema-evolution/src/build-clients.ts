@@ -90,10 +90,12 @@ export async function buildCatalogProof(signal: AbortSignal): Promise<string> {
     `path = ${JSON.stringify(path.join(WORKSPACE, 'crates/arrowcol-catalog-client'))}`, '[dependencies]',
     'serde_json = "=1.0.154"', 'tokio = { version = "=1.53.2", features = ["macros", "rt-multi-thread"] }', '',
     'arrow-array = "=58.4.0"', 'parquet = { version = "=58.4.0", default-features = false, features = ["arrow", "snap", "zstd"] }', '',
+    '[dev-dependencies]', 'tempfile = "=3.27.0"', '',
   ].join('\n'));
   const manifestArg = ['--manifest-path', path.join(client, 'Cargo.toml')];
   await command('cargo', ['generate-lockfile', ...manifestArg], signal);
   await command('cargo', ['build', '--locked', ...manifestArg], signal);
+  await command('cargo', ['test', '--locked', ...manifestArg, '--bin', 'schema-evolution-inspect-parquet'], signal);
   return path.join(ROOT, 'target/debug/schema-evolution-catalog-proof');
 }
 
