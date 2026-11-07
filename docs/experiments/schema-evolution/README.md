@@ -23,9 +23,9 @@
 | `npx nx run schema-evolution-experiment:build-fixtures` | Separately built old/new Rust clients from real generated immutable SDKs. No network writes. |
 | `npx nx run schema-evolution-experiment:probe-kustainer` | Records Kustainer command capability and string null semantics; does not claim E2E delivery. |
 | `npx nx run schema-evolution-experiment:run -- --target local` | Actual Rust catalog/DFE, real generated historical SDKs, physical Delta null inspection, pinned Kustainer native refresh. |
-| `npx nx run schema-evolution-experiment:run -- --target azure --env-file .env.schema-evo.private --ready-env .env.azure.schema-evo` | Same real flow against the isolated stamp; requires a genuine exported ready generation and records bounded native refresh. |
+| `npx --no-install tsx experiments/schema-evolution/src/private-nx.ts run --env-file .env.schema-evo.private --ready-env .env.azure.schema-evo` | Public Nx scenario with sanitized isolated private environment; genuine exported ready generation and bounded native refresh. |
 | `AZURE_RESOURCE_GROUP=rust-playground-schema-evo npx --no-install tsx infra/azure/bootstrap.ts provision --infra-only --output .env.azure.schema-evo` | Creates only the selected stamp; private generated configuration preserves its RG. Real Azure charges apply. |
-| `AZURE_RESOURCE_GROUP=rust-playground-schema-evo npx nx run azure-infra:provision -- --env-file .env.schema-evo.private --tables .env.azure.schema-evo.tables.json --output .env.azure.schema-evo` | Supported full initialization, KQL reconciliation and bootstrap completion. No generation or fencing bypass. Real Azure charges apply. |
+| `npx --no-install tsx experiments/schema-evolution/src/private-nx.ts provision --env-file .env.schema-evo.private --tables .env.azure.schema-evo.tables.json --output .env.azure.schema-evo` | Public Nx full initialization, KQL reconciliation and bootstrap completion with sanitized private input. No generation or fencing bypass. Real Azure charges apply. |
 
 Keep resource-name overrides blank when creating the separate stamp. Never
 reuse the shared sandbox's table/checkpoint roots. **Stop/reset operate on the
