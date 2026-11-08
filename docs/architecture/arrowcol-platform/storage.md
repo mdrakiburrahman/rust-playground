@@ -88,7 +88,7 @@ client requests to manufacture larger groups. The internal identity is not a cli
 | Kernel checkpoint | Materialize current state and preserve publication/query transaction IDs | Checkpoint cadence alone does not remove history or prove a storage plateau |
 | Guarded log pruning | Prove checkpoint state and eligible history against durable vacuum progress and a retained floor | Keep the checkpoint and its commit JSON; only eligible earlier JSON may be removed; a stricter resume retention policy is rechecked before further deletion |
 | Historical tenant fork | Capture a snapshot, then tail committed data changes; skip OPTIMIZE | Independently encoded sink files survive source purge; missing required source history is an error |
-| Native Kusto external Delta/QAP | Follow the current committed active snapshot after asynchronous cache refresh | Replacements and removals must converge within the bounded correctness gate; cached queries must match the independent oracle and uncached fallback |
+| Native Kusto external Delta/QAP | Follow the current committed active snapshot after asynchronous cache refresh | Replacements and removals must converge within the bounded correctness gate; cached queries must match the independent oracle and MaxAge-overridden query |
 
 Tenant sink transactions bind query/batch identity to publication so recovery
 after a sink commit cannot duplicate that batch. Spark-compatible metadata,

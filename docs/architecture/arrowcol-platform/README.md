@@ -23,6 +23,6 @@ There is no Direct collector, SQL catalog, Hive Metastore, client durable receip
 | [Observability](observability.md) | Router and DFE metrics, Arrow/OTEL dashboards |
 | [Lakehouse loadtest](../loadtest/README.md) | DFE, local/Azure storage, maintenance, tenant forks, Kusto, and validation |
 
-Maintenance and streaming run outside the collector. OPTIMIZE rewrites active files without creating new logical rows. A historical tenant fork skips those rewrites and owns its sink files, while native Kusto follows the active snapshot, including replacements and removals, after asynchronous cache refresh. Cache statistics are not a substitute for comparing actual cached query results with the independent oracle and uncached fallback.
+Maintenance and streaming run outside the collector. OPTIMIZE rewrites active files without creating new logical rows. A historical tenant fork skips those rewrites and owns its sink files, while native Kusto follows the active snapshot, including replacements and removals, after asynchronous cache refresh. Cache statistics are not a substitute for comparing actual cached query results with the independent oracle and MaxAge-overridden query.
 
 Start with the [root quick start](../../../README.md#arrow-collector-platform) or the [load generator guide](../loadtest/README.md). The architecture diagrams are maintained as Draw.io sources with matching PNG renders.

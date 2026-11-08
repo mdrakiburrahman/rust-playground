@@ -220,6 +220,7 @@ impl KustoClient {
                 "heavy_query_concurrency": HEAVY_QUERY_CONCURRENCY, "heavy": heavy,
                 "elapsed_ms": started.elapsed().as_millis(), "query_bytes": command.len(),
                 "management": management, "csl": redact_text(command),
+                "read_path": if management { None } else { Some(query_read_path(&body)) },
                 "http_status": status.as_u16(), "response": public
             }),
         )?;
@@ -486,6 +487,28 @@ impl KustoClient {
             chunks.push(self.multiset(&filtered, schema, &chunk.rows).await?);
         }
         Ok(CorpusResult { partitions, chunks })
+    }
+}
+
+fn query_read_path(body: &Value) -> &'static str {
+    fn remote_reads(value: &Value) -> bool {
+        match value {
+            Value::Object(fields) => {
+                let observed = fields.get("external_data").is_some_and(|external| {
+                    ["iterated_artifacts", "downloaded_items"]
+                        .iter()
+                        .any(|key| external.get(key).and_then(Value::as_u64).is_some_and(|count| count > 0))
+                });
+                observed || fields.values().any(remote_reads)
+            }
+            Value::Array(values) => values.iter().any(remote_reads),
+            _ => false,
+        }
+    }
+    if remote_reads(body) {
+        "remote-reads-observed"
+    } else {
+        "unproven"
     }
 }
 
@@ -1656,7 +1679,11 @@ pub(crate) async fn validate(
                 "expected_rows": check.summary.rows, "distinct_rows": check.corpus.distinct_rows(),
                 "oracle_chunks": check.corpus.chunks.len(), "oracle_partitions": check.corpus.partition_rows.len(),
                 "actual": {"Rows": check.fallback.rows(), "Invalid": check.fallback.unmatched()},
-                "fallback": {"query": fallback_source(&check.name)?, "result": check.fallback.evidence()},
+                "fallback": {
+                    "query": fallback_source(&check.name)?, "result": check.fallback.evidence(),
+                    "max_age_override_seconds": 1,
+                    "read_path": "not-established-by-max-age"
+                },
                 "cached": cached[&check.name],
                 "qap": {
                     "policy": check.policy,
@@ -2048,6 +2075,27 @@ mod tests {
                     error => panic!("test server failed: {error:?}"),
                 }
             }
+        }
+    }
+
+    #[test]
+    fn query_path_requires_positive_native_remote_read_statistics() {
+        for counter in ["iterated_artifacts", "downloaded_items"] {
+            let evidence = json!([{"Payload": {
+                "input_dataset_statistics": {"external_data": {counter: 1}}
+            }}]);
+            assert_eq!(query_read_path(&evidence), "remote-reads-observed");
+        }
+        for evidence in [
+            json!({}),
+            json!({"Count": 3}),
+            json!({"iterated_artifacts": 5}),
+            json!({"input_dataset_statistics": {"external_data": {
+                "iterated_artifacts": 0, "downloaded_items": 0
+            }}}),
+            json!({"external_data": {"iterated_artifacts": -1, "downloaded_items": "unknown"}}),
+        ] {
+            assert_eq!(query_read_path(&evidence), "unproven");
         }
     }
 
@@ -2495,14 +2543,24 @@ mod tests {
 
     #[tokio::test]
     async fn committed_tables_are_exposed_once_and_source_changes_fail_explicitly() -> Result<()> {
+        use arrow::array::{Int64Array, RecordBatch};
+        use arrow_deltalake::delta::{DeltaTable, DeltaTableWriter};
+
         let directory = Directory::new()?;
         let table = "telemetry.sqlserver.sqlserver_wait_stats";
         let definitions = Arc::new(AtomicUsize::new(0));
         let policies = Arc::new(AtomicUsize::new(0));
+        let reject_creation = Arc::new(AtomicBool::new(true));
+        let rejected = Arc::clone(&reject_creation);
         let (defined, altered) = (Arc::clone(&definitions), Arc::clone(&policies));
         let server = Server::start(move |request| {
             let command = request["csl"].as_str().context("command missing")?;
             if command.starts_with(".create-or-alter external table") {
+                if rejected.swap(false, Ordering::Relaxed) {
+                    let mut failed = response(&[], vec![]);
+                    failed["Exceptions"] = json!(["creation failed"]);
+                    return Ok(Some(failed));
+                }
                 ensure!(command.contains("kind=delta (h@'/delta/dataflow/telemetry/sqlserver/sqlserver_wait_stats')"));
                 defined.fetch_add(1, Ordering::Relaxed);
             } else if command.starts_with(".alter external table") {
@@ -2521,21 +2579,18 @@ mod tests {
             expected_live_tables: canonical_dataflow_tables()?,
             schemas: BTreeMap::new(),
         };
-        let snapshot = SnapshotInventory {
-            tables: BTreeMap::from([(
-                table.to_owned(),
-                TableInventory {
-                    schema: json!({"fields":[{"name":"id","type":"long"}]}),
-                    version: 1,
-                    files: vec!["part.parquet".to_owned()],
-                },
-            )]),
-        };
+        let root = directory.0.join("telemetry/sqlserver/sqlserver_wait_stats");
+        fs::create_dir_all(&root)?;
+        let url =
+            Url::from_directory_path(fs::canonicalize(&root)?).map_err(|()| anyhow::anyhow!("invalid table path"))?;
+        let batch = RecordBatch::try_from_iter(vec![("id", Arc::new(Int64Array::from(vec![1, 2, 3])) as _)])?;
+        let created =
+            DeltaTable::open_catalog(url)?.commit_catalog(None, batch.schema(), Vec::new(), BTreeMap::new(), None)?;
+        assert_eq!(created.version, 0);
         let live = AtomicBool::new(true);
-        let mut empty = snapshot.clone();
-        let empty_table = empty.tables.get_mut(table).context("table")?;
-        empty_table.version = 0;
-        empty_table.files.clear();
+        let empty = delta_inspect::inventory(&directory.0).await?;
+        assert_eq!(empty.tables[table].version, 0);
+        assert!(empty.tables[table].files.is_empty());
         exposure.sync("dataflow", &empty, &live).await?;
         exposure.sync("dataflow", &empty, &live).await?;
         assert_eq!(definitions.load(Ordering::Relaxed), 0);
@@ -2543,10 +2598,22 @@ mod tests {
         assert!(exposure.schemas.is_empty());
         assert!(exposure.status.live_tables.is_empty());
         assert!(exposure.status.tables.is_empty());
+        let mut writer = DeltaTableWriter::open(&root)?;
+        writer.write(&batch).await?;
+        writer.flush().await?;
+        let snapshot = delta_inspect::inventory(&directory.0).await?;
+        assert_eq!(snapshot.tables[table].files.len(), 1);
+        assert!(root.join(&snapshot.tables[table].files[0]).is_file());
+        assert!(exposure.sync("dataflow", &snapshot, &live).await.is_err());
+        assert!(exposure.schemas.is_empty());
+        assert!(exposure.status.tables.is_empty());
+        assert!(exposure.status.live_tables.is_empty());
+        assert_eq!(definitions.load(Ordering::Relaxed), 0);
         exposure.sync("dataflow", &snapshot, &live).await?;
-        let mut optimized = snapshot.clone();
-        optimized.tables.get_mut(table).context("table")?.files = vec!["compacted.parquet".to_owned()];
-        optimized.tables.get_mut(table).context("table")?.version = 2;
+        writer.write(&batch).await?;
+        writer.close().await?;
+        let optimized = delta_inspect::inventory(&directory.0).await?;
+        assert_eq!(optimized.tables[table].files.len(), 2);
         exposure.sync("dataflow", &optimized, &live).await?;
         assert_eq!(
             definitions.load(Ordering::Relaxed),

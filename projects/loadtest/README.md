@@ -300,6 +300,10 @@ Delta row multiset. Historical `fallback` report fields identify the overridden
 query, not proof of a physical-source read: Kusto may still use an index refreshed
 within that age. Positive counts during generation and final native acceleration,
 hydration, version and row-correctness assertions remain separate required gates.
+Query logs report `read_path: remote-reads-observed` only when native
+`external_data.iterated_artifacts` or `downloaded_items` is positive. Missing or
+zero counters report `unproven`: they prove neither remote reads nor acceleration.
+The final `fallback.read_path` explicitly records `not-established-by-max-age`.
 `MaxAge` limits acceptable index staleness; it is not a refresh-cadence guarantee.
 OPTIMIZE rewrites require reacceleration, which is not
 by itself proof of a whole-table reset.

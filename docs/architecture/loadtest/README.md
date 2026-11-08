@@ -59,7 +59,7 @@ zero pending files, and recent update time can coexist with stale query results.
 Require current `TableVersion`, healthy `IsHealthy`, and expected
 `AcceleratedRowCount` from `QueryAccelerationState`, plus actual cached
 row-multiset equality with both the
-independent oracle and uncached fallback. Record observed convergence separately
+independent oracle and MaxAge-overridden query. Record observed convergence separately
 from the bounded deadline; focused native-probe acceptance does not prove the
 integrated 13-schema workload or Explorer/stress acceptance.
 
