@@ -21,6 +21,20 @@ export function dataflowConfigFile(quiver: boolean): string {
   return 'projects/arrowcol-dataflow-rust/config' + (quiver ? '.quiver.yaml' : '.yaml');
 }
 
+export function buildLocalLoadgenEndpoints(
+  network: { router: string },
+  runnerNetwork: 'host' | 'compose',
+  hostPorts: { router: string; catalog: string },
+): { router: string; catalog: string } {
+  if (runnerNetwork === 'compose') {
+    return { router: `http://${network.router}:50050`, catalog: 'http://arrowcol-catalog:8817' };
+  }
+  return {
+    router: `http://127.0.0.1:${hostPorts.router}`,
+    catalog: `http://127.0.0.1:${hostPorts.catalog}`,
+  };
+}
+
 export interface BenchmarkRuntimeOptions {
   /** Persist every batch to native Quiver (fsync before acknowledgement) before publishing it. */
   quiver?: boolean;

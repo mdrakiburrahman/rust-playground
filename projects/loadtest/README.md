@@ -493,9 +493,10 @@ attempt synchronously before the second can reset its ephemeral runtime.
   `http://kusto:8080` over the Compose network.
 - **Logs:** `docker logs -f rust-playground-loadtest-latest-dataflow-1-1`
 
-Use `SQLSERVER_PORT`, `GRAFANA_PORT`, `PORTAINER_PORT`, `KUSTO_PORT`, or
-`KUSTO_EXPLORER_PORT` to override host ports. Published ports bind to host
-loopback only. Inside the devcontainer,
+Use `SQLSERVER_PORT`, `GRAFANA_PORT`, `PORTAINER_PORT`, `KUSTO_PORT`,
+`KUSTO_EXPLORER_PORT`, `LOADTEST_ROUTER_PORT`, or `LOADTEST_CATALOG_PORT` to
+override host ports. Published ports bind to host loopback only. A host-run
+load generator uses the router and catalog loopback ports; inside the devcontainer,
 the runner uses the emulator's allocated `10.89.x.50:8080` address instead of
 `localhost`; the host connection remains `http://localhost:${KUSTO_PORT:-8080}`.
 Do not share startup logs containing local-development passwords.

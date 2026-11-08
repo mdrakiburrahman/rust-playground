@@ -25,7 +25,8 @@ import { startQapObserver } from './qap-observer.js';
 import { readStressPlan, runStressDriver, stressInputBudget } from './stress-driver.js';
 import { LocalStressRuntime } from './stress-runtime.js';
 import {
-  benchmarkComposeFiles, benchmarkQuiver, buildBenchmarkComposeOverride, buildBenchmarkRuntimeConfigs, dataflowConfigFile,
+  benchmarkComposeFiles, benchmarkQuiver, buildBenchmarkComposeOverride, buildBenchmarkRuntimeConfigs,
+  buildLocalLoadgenEndpoints, dataflowConfigFile,
 } from './runtime-config.js';
 import { acquireBenchmarkController, discardUnsealedAttempts, requirePreviousAttemptEvidence, resetBenchmark, stopBenchmark, stopReceipt, type BenchmarkController } from './lifecycle.js';
 import { azureTargets, modeEnvironment, stageAzureCliConfig, type AzureTargets } from './mode.js';
@@ -67,11 +68,15 @@ export function mapHostPath(localPath: string, mounts: unknown): string {
   return path.join(binding.Source, path.relative(binding.Destination, localPath));
 }
 
+function runnerUsesComposeNetwork(): boolean {
+  return existsSync('/.dockerenv') || Boolean(process.env.REMOTE_CONTAINERS_IPC);
+}
+
 function hostWorkspace(): string {
   if (process.env.LOADTEST_HOST_WORKSPACE) {
     return path.resolve(process.env.LOADTEST_HOST_WORKSPACE);
   }
-  if (!existsSync('/.dockerenv') && !process.env.REMOTE_CONTAINERS_IPC) {
+  if (!runnerUsesComposeNetwork()) {
     return workspace;
   }
   const mounts: unknown = JSON.parse(run('docker', ['inspect', '--format', '{{json .Mounts}}', hostname()]));
@@ -392,13 +397,17 @@ export function localLoadgenEnvironment(
 ): NodeJS.ProcessEnv {
   const secrets = path.join(workspace, 'projects/loadtest/.temp/secrets/latest');
   const infra = path.join(workspace, 'projects/arrowcol-infra/secrets');
+  const endpoints = buildLocalLoadgenEndpoints(context.network, runnerUsesComposeNetwork() ? 'compose' : 'host', {
+    router: context.env.LOADTEST_ROUTER_PORT ?? '15050',
+    catalog: context.env.LOADTEST_CATALOG_PORT ?? '18817',
+  });
   return {
     ...context.env,
     ...(context.options.mode === 'azure' ? { AZURE_CONFIG_DIR: path.join(context.directory, 'azure-cli/loadgen') } : {}),
     LOADTEST_RESULTS: results,
     LOADTEST_DATAFLOW_ROOT: context.options.mode === 'azure' ? context.env.LOADTEST_DATAFLOW_ROOT : path.join(context.directory, 'dataflow'),
-    LOADTEST_ROUTER_ENDPOINT: `http://${context.network.router}:50050`,
-    LOADTEST_CATALOG_ENDPOINT: 'http://arrowcol-catalog:8817',
+    LOADTEST_ROUTER_ENDPOINT: endpoints.router,
+    LOADTEST_CATALOG_ENDPOINT: endpoints.catalog,
     LOADTEST_EDGE_SECRET_FILE: path.join(secrets, 'edge-hmac.txt'),
     LOADTEST_INTERNAL_SECRET_FILE: path.join(secrets, 'internal-hmac.txt'),
     LOADTEST_SCRATCH_ROOT: 'projects/loadtest/.temp/loadgen/latest',

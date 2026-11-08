@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 
 import type { ProjectConfiguration } from '@nx/devkit';
 import YAML from 'yaml';
+import { buildLocalLoadgenEndpoints } from '../src/runtime-config.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const compose = YAML.parse(readFileSync(path.join(root, 'projects/loadtest/compose.yaml'), 'utf8')) as {
@@ -176,6 +177,23 @@ test('catalog and DFE share the same Delta root', () => {
       typeof volume !== 'string' && volume.target === '/delta/dataflow' ? [volume.source] : [])[0];
   assert(root('arrowcol-catalog'));
   assert.equal(root('arrowcol-catalog'), root('dataflow-1'));
+});
+
+test('host loadgen uses loopback ports while container loadgen uses Compose endpoints', () => {
+  assert.deepEqual(compose.services['arrowcol-catalog'].ports,
+    ['127.0.0.1:${LOADTEST_CATALOG_PORT:-18817}:8817']);
+  assert.deepEqual(compose.services.router.ports,
+    ['127.0.0.1:${LOADTEST_ROUTER_PORT:-15050}:50050']);
+  assert.deepEqual(buildLocalLoadgenEndpoints({ router: '10.89.0.10' }, 'host',
+    { router: '15050', catalog: '18817' }), {
+    router: 'http://127.0.0.1:15050',
+    catalog: 'http://127.0.0.1:18817',
+  });
+  assert.deepEqual(buildLocalLoadgenEndpoints({ router: '10.89.0.10' }, 'compose',
+    { router: '15050', catalog: '18817' }), {
+    router: 'http://10.89.0.10:50050',
+    catalog: 'http://arrowcol-catalog:8817',
+  });
 });
 
 test('router and DFE receive the SQL routing credential at the configured path', () => {

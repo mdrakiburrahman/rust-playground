@@ -77,6 +77,8 @@ services:
     init: true
     user: "${LOADTEST_UID:?Run through Nx}:${LOADTEST_GID:?Run through Nx}"
     command: ["--listen", "0.0.0.0:8817", "--warehouse-root", "${LOADTEST_DATAFLOW_DELTA_ROOT:-/delta/dataflow}", "--state-dir", "/state"]
+    ports:
+      - "127.0.0.1:${LOADTEST_CATALOG_PORT:-18817}:8817"
     environment:
       OTEL_EXPORTER_OTLP_ENDPOINT: ${LOADTEST_TRACES_ENDPOINT:-http://lgtm:4318}
       OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
@@ -261,6 +263,8 @@ services:
     pull_policy: never
     user: "${LOADTEST_UID:?Run through Nx}:${LOADTEST_GID:?Run through Nx}"
     command: ["--config", "/state/config.yaml"]
+    ports:
+      - "127.0.0.1:${LOADTEST_ROUTER_PORT:-15050}:50050"
     environment:
       OTEL_EXPORTER_OTLP_ENDPOINT: ${LOADTEST_TRACES_ENDPOINT:-http://lgtm:4318}
       OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
