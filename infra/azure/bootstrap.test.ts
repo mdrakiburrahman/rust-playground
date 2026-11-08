@@ -281,6 +281,9 @@ test('preflight reserves quota for the system-pool autoscale maximum', async () 
 test('shared stamped identity can be reused without replacing other stamp consumers', async () => {
   const c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_STAMP: '89151' });
   azure.c = c;
+  c.stampConfig.publisherFederatedCredentials.push({
+    name: 'publisher', issuer: 'https://token.actions.githubusercontent.com', subject: 'repo:example/repo:environment:publish',
+  });
   mock.method(azure, 'arm', async (_method: string, resourcePath: string) => resourcePath === c.identity_id
     ? { tags: { ...b.TAGS, sandboxId: 'stamp-89150' } } : null);
   const publisherCredentials = c.stampConfig.publisherFederatedCredentials.map(({ name, issuer, subject }) => ({
@@ -292,15 +295,19 @@ test('shared stamped identity can be reused without replacing other stamp consum
 test('stamped deployment preserves previous RG/UAMI tags and does not redeclare shared publisher FICs', async () => {
   const c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_STAMP: '89151' });
   azure.c = c;
+  c.stampConfig.publisherFederatedCredentials.push({
+    name: 'publisher', issuer: 'https://token.actions.githubusercontent.com', subject: 'repo:example/repo:environment:publish',
+  });
   const groupTags = { ...b.TAGS, sandboxId: 'stamp-89150' };
   const identityTags = { ...b.TAGS, sandboxId: 'stamp-89149' };
   const publisherCredentials = c.stampConfig.publisherFederatedCredentials.map(({ name, issuer, subject }) => ({
     name, properties: { issuer, subject, audiences: ['api://AzureADTokenExchange'] },
   }));
+  let deployed = false;
   mock.method(azure, 'arm', async (_method: string, resourcePath: string) => {
     if (resourcePath === c.base) return { tags: groupTags };
     if (resourcePath === c.identity_id) return { tags: identityTags, properties: { clientId: SUB, principalId: SUB } };
-    if (resourcePath === c.cluster_id) return { properties: { uri: 'https://cluster.example' } };
+    if (resourcePath === c.cluster_id && deployed) return { properties: { uri: 'https://cluster.example' } };
     return null;
   });
   mock.method(azure, 'collection', async () => publisherCredentials);
@@ -308,6 +315,7 @@ test('stamped deployment preserves previous RG/UAMI tags and does not redeclare 
   mock.method(azure, 'cli', async (...args: string[]) => {
     assert.deepEqual(args.slice(0, 3), ['deployment', 'sub', 'create']);
     parameters = JSON.parse(fs.readFileSync(args.at(-1)!.slice(1), 'utf8')).parameters;
+    deployed = true;
     return {};
   });
   await b.deploy(azure);
@@ -318,6 +326,9 @@ test('stamped deployment preserves previous RG/UAMI tags and does not redeclare 
 test('stamped deployment refuses missing shared publisher FICs', async () => {
   const c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_STAMP: '89151' });
   azure.c = c;
+  c.stampConfig.publisherFederatedCredentials.push({
+    name: 'publisher', issuer: 'https://token.actions.githubusercontent.com', subject: 'repo:example/repo:environment:publish',
+  });
   mock.method(azure, 'arm', async (_method: string, resourcePath: string) => resourcePath === c.identity_id
     ? { tags: { ...b.TAGS, sandboxId: 'stamp-89150' } } : null);
   mock.method(azure, 'collection', async () => []);
