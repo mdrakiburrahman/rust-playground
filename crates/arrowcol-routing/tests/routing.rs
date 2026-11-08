@@ -297,7 +297,10 @@ async fn distinct_owner_policy_partitions_concurrent_table_claims() {
     assert_ne!(left_route.instance_id, right_route.instance_id);
 
     let third = left.route_ingest(&metadata_for("table_c"), millis(100_002)).await;
-    assert_eq!(third.unwrap_err().kind(), RoutingErrorKind::PoolUnavailable);
+    assert!(matches!(
+        third,
+        Err(error) if error.kind() == RoutingErrorKind::PoolUnavailable
+    ));
 }
 
 #[tokio::test]
@@ -325,9 +328,11 @@ async fn distinct_owner_store_rejects_conflicting_table_claims() {
             minimum_snapshot_at_unix_ms: millis(99_000),
             distinct_table_owners: true,
         })
-        .await
-        .unwrap_err();
-    assert_eq!(conflict.kind(), RoutingErrorKind::Conflict);
+        .await;
+    assert!(matches!(
+        conflict,
+        Err(error) if error.kind() == RoutingErrorKind::Conflict
+    ));
 }
 
 #[tokio::test]
