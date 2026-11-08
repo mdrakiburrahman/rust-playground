@@ -6,6 +6,7 @@ import { parse, stringify } from 'yaml';
 
 export interface RuntimeConfig {
   namespace: string;
+  serviceAccount?: string;
   workloadIdentityClientId: string;
   subscriptionId: string;
   stamp: string;
@@ -13,19 +14,24 @@ export interface RuntimeConfig {
   images: { sqlserver: string; catalog: string; router: string; dataflow: string };
 }
 type Resource = Record<string, any>;
-export type Phase = 'foundation' | 'bootstrap' | 'workload';
+export type Phase = 'identity' | 'foundation' | 'bootstrap' | 'workload';
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const dns = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const roles = ['sqlserver', 'catalog', 'router', 'dataflow'] as const;
 
-export function validateRuntime(input: unknown): RuntimeConfig {
+export function validateRuntime(input: unknown, allowUnpublishedImages = false): RuntimeConfig {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('runtime config must be an object');
   const c = input as RuntimeConfig;
-  if (Object.keys(c).sort().join() !== ['deltaRoot', 'images', 'namespace', 'workloadIdentityClientId', 'subscriptionId', 'stamp'].sort().join()) {
+  const required = ['deltaRoot', 'images', 'namespace', 'workloadIdentityClientId', 'subscriptionId', 'stamp'];
+  if (required.some((key) => !Object.hasOwn(c, key)) || Object.keys(c).some((key) => ![...required, 'serviceAccount'].includes(key))) {
     throw new Error('runtime config has missing or unknown fields');
   }
   if (typeof c.namespace !== 'string' || !dns.test(c.namespace) || c.namespace.startsWith('kube-') || ['default', 'azure-qap'].includes(c.namespace)) {
     throw new Error('use a dedicated OAT namespace (not the QAP namespace)');
+  }
+  if (Object.hasOwn(c, 'serviceAccount') &&
+      (typeof c.serviceAccount !== 'string' || !dns.test(c.serviceAccount) || c.serviceAccount === 'default')) {
+    throw new Error('serviceAccount must be a non-default Kubernetes DNS label');
   }
   if (typeof c.workloadIdentityClientId !== 'string' || !uuid.test(c.workloadIdentityClientId)) throw new Error('workloadIdentityClientId must be the provisioned UAMI client UUID');
   if (typeof c.subscriptionId !== 'string' || !uuid.test(c.subscriptionId) ||
@@ -38,6 +44,7 @@ export function validateRuntime(input: unknown): RuntimeConfig {
   if (new URL(c.deltaRoot).hostname !== `arrowcollector${c.stamp}.dfs.core.windows.net`) throw new Error('dataflow root must match the selected stamp');
   if (!c.images || Object.keys(c.images).sort().join() !== [...roles].sort().join()) throw new Error('all four images are required');
   for (const role of roles) {
+    if (allowUnpublishedImages && c.images[role] === 'unpublished') continue;
     if (typeof c.images[role] !== 'string' ||
         !/^[a-z0-9]+\.azurecr\.io\/[a-z0-9][a-z0-9/_.-]*@sha256:[a-f0-9]{64}$/.test(c.images[role])) {
       throw new Error(`${role} must be an ACR image pinned by registry manifest digest, not a local image ID or tag`);
@@ -65,8 +72,9 @@ const httpProbe = (path: string, port: number) => ({ httpGet: { path, port }, ti
 const execProbe = (command: string[]) => ({ exec: { command }, timeoutSeconds: 8, periodSeconds: 10, failureThreshold: 6 });
 
 export async function renderRuntime(input: unknown, phase: Phase): Promise<Resource[]> {
-  const c = validateRuntime(input);
-  if (!['foundation', 'bootstrap', 'workload'].includes(phase)) throw new Error('unknown runtime phase');
+  const c = validateRuntime(input, phase === 'identity');
+  const serviceAccount = c.serviceAccount ?? 'arrowcol-oat';
+  if (!['identity', 'foundation', 'bootstrap', 'workload'].includes(phase)) throw new Error('unknown runtime phase');
   const object = (apiVersion: string, kind: string, name: string, body: Resource): Resource => ({
     apiVersion, kind, metadata: { name, namespace: c.namespace, labels: { 'app.kubernetes.io/part-of': 'arrowcol-oat' } }, ...body,
   });
@@ -79,7 +87,7 @@ export async function renderRuntime(input: unknown, phase: Phase): Promise<Resou
   const pod = (name: string, containers: Resource[], volumes: Resource[], identity = false): Resource => ({
     metadata: { labels: { app: name, 'app.kubernetes.io/part-of': 'arrowcol-oat', ...(identity ? { 'azure.workload.identity/use': 'true' } : {}) } },
     spec: {
-      serviceAccountName: 'arrowcol-oat', automountServiceAccountToken: false,
+      serviceAccountName: serviceAccount, automountServiceAccountToken: false,
       nodeSelector: { type: 'benchmark', 'kubernetes.io/arch': 'amd64' },
       securityContext: { fsGroup: 10001, fsGroupChangePolicy: 'OnRootMismatch', seccompProfile: { type: 'RuntimeDefault' } },
       terminationGracePeriodSeconds: 360, containers, volumes,
@@ -95,13 +103,17 @@ export async function renderRuntime(input: unknown, phase: Phase): Promise<Resou
       ingress: [{ from: from.map((source) => ({ podSelector: { matchLabels: { app: source } } })), ports: [{ protocol: 'TCP', port }] }],
     },
   });
+  const identity = [
+    { apiVersion: 'v1', kind: 'Namespace', metadata: { name: c.namespace, labels: { 'app.kubernetes.io/part-of': 'arrowcol-oat' } } },
+    object('v1', 'ServiceAccount', serviceAccount, {
+      metadata: { name: serviceAccount, namespace: c.namespace, annotations: { 'azure.workload.identity/client-id': c.workloadIdentityClientId } },
+      automountServiceAccountToken: false,
+    }),
+  ];
+  if (phase === 'identity') return identity;
   if (phase === 'foundation') {
     return [
-      { apiVersion: 'v1', kind: 'Namespace', metadata: { name: c.namespace, labels: { 'app.kubernetes.io/part-of': 'arrowcol-oat' } } },
-      object('v1', 'ServiceAccount', 'arrowcol-oat', {
-        metadata: { name: 'arrowcol-oat', namespace: c.namespace, annotations: { 'azure.workload.identity/client-id': c.workloadIdentityClientId } },
-        automountServiceAccountToken: false,
-      }),
+      ...identity,
       object('networking.k8s.io/v1', 'NetworkPolicy', 'default-deny-ingress', { spec: { podSelector: {}, policyTypes: ['Ingress'] } }),
       network('sql-internal', 'arrowcol-sql', ['arrowcol', 'arrowcol-router', 'arrowcol-migrate'], 1433),
       pvc('arrowcol-sql', '32Gi'), pvc('arrowcol-catalog', '16Gi'),
@@ -225,7 +237,7 @@ async function main(args: string[]): Promise<void> {
     await writeFile(args[3], JSON.stringify({ apiVersion: 'v1', kind: 'List', items }, null, 2));
     console.log(`Rendered ${items.length} resources; no cluster changes made.`);
   } else {
-    throw new Error('Usage: runtime.ts render <runtime.json> <foundation|bootstrap|workload> <output.json> | prepare-secrets <supported-bootstrap.env> <private-directory>');
+    throw new Error('Usage: runtime.ts render <runtime.json> <identity|foundation|bootstrap|workload> <output.json> | prepare-secrets <supported-bootstrap.env> <private-directory>');
   }
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

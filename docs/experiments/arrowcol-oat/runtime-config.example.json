@@ -1,5 +1,6 @@
 {
   "namespace": "arrowcol-oat",
+  "serviceAccount": "arrowcol-oat",
   "workloadIdentityClientId": "REPLACE_WITH_PROVISIONED_UAMI_CLIENT_ID",
   "subscriptionId": "REPLACE_WITH_SUBSCRIPTION_ID",
   "stamp": "89152",

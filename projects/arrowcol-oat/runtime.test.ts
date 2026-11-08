@@ -33,6 +33,7 @@ test('isolated integrated topology pins images, WI, identity, probes and worker 
   assert.equal(dfe.spec.strategy.type, 'Recreate');
   assert.equal(dfe.spec.template.spec.nodeSelector.type, 'benchmark');
   assert.equal(dfe.spec.template.metadata.labels['azure.workload.identity/use'], 'true');
+  assert.equal(dfe.spec.template.spec.serviceAccountName, 'arrowcol-oat');
   const container = dfe.spec.template.spec.containers[0];
   assert.equal(container.image, c.images.dataflow);
   assert.deepEqual(container.args.slice(-2), ['--num-cores', '1']);
@@ -56,6 +57,38 @@ test('isolated integrated topology pins images, WI, identity, probes and worker 
   assert.equal(get('Deployment', 'arrowcol-catalog').spec.template.spec.containers[0].args.at(-1), '--ingestion-layout');
   const rules = get('NetworkPolicy', 'flight-router-only').spec.ingress;
   assert.deepEqual(rules[0].from, [{ podSelector: { matchLabels: { app: 'arrowcol-router' } } }]);
+});
+
+test('configured existing federation subject is used by every runtime phase', async () => {
+  const c = { ...config(), namespace: 'arrow-collector', serviceAccount: 'arrow-collector' };
+  for (const phase of ['identity', 'foundation', 'bootstrap', 'workload'] as const) {
+    const objects = await renderRuntime(c, phase);
+    for (const object of objects) {
+      if (object.kind !== 'Namespace') assert.equal(object.metadata.namespace, c.namespace);
+      if (object.spec?.template) assert.equal(object.spec.template.spec.serviceAccountName, c.serviceAccount);
+      if (object.kind === 'ServiceAccount') {
+        assert.equal(object.metadata.name, c.serviceAccount);
+        assert.equal(object.metadata.annotations['azure.workload.identity/client-id'], c.workloadIdentityClientId);
+        assert.equal(object.automountServiceAccountToken, false);
+      }
+    }
+  }
+  for (const serviceAccount of ['', 'default', 'Bad_Name', '../other', 'a'.repeat(64), null, 3]) {
+    assert.throws(() => validateRuntime({ ...c, serviceAccount }), /serviceAccount/);
+  }
+});
+
+test('unpublished draft images cannot be rendered as deployable resources', async () => {
+  const c = config();
+  c.images.sqlserver = 'unpublished';
+  assert.equal(validateRuntime(c, true), c);
+  assert.throws(() => validateRuntime(c), /registry manifest digest/);
+  for (const phase of ['foundation', 'bootstrap', 'workload'] as const) {
+    await assert.rejects(renderRuntime(c, phase), /registry manifest digest/);
+  }
+  const identity = await renderRuntime(c, 'identity');
+  assert.deepEqual(identity.map(o => o.kind), ['Namespace', 'ServiceAccount']);
+  assert.equal(identity.some(o => o.spec?.template || o.kind === 'Secret'), false);
 });
 
 test('SQL persistence and sequential bootstrap keep migration credentials out of runtime', async () => {
