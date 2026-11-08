@@ -275,9 +275,9 @@ async fn all_dataflow_delayed_observations_complete_inside_unchanged_30s_with_tw
         .lines()
         .map(serde_json::from_str::<Value>)
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    ensure!(artifacts.len() == 79, "every response must have a whole JSONL artifact");
+    ensure!(artifacts.len() == requests.len(), "every response must have a whole JSONL artifact");
     let diagnostic: Value = serde_json::from_slice(&fs::read(fixture.directory.join("observation-diagnostic.json"))?)?;
-    ensure!(diagnostic["queries_completed"] == 79 && diagnostic["code"] == "completed");
+    ensure!(diagnostic["queries_completed"] == requests.len() && diagnostic["code"] == "completed");
     Ok(())
 }
 
