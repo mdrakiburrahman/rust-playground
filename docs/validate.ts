@@ -24,6 +24,7 @@ export const DOCUMENTS = [
   'docs/experiments/schema-evolution/README.md',
   'docs/delivery-verification.md',
   'docs/quiver/README.md',
+  'bin/quiver-cli/README.md',
   'docs/containers/publishing.md',
   'projects/arrowcol-infra/README.md',
   'projects/arrowcol-router-rust/README.md',

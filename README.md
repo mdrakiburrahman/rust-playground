@@ -75,7 +75,7 @@ SQL Server stores router registrations, pressure, and routing/fencing leases onl
 
 Clients receive no durable receipt IDs and there is no receipt-polling or purge API. DFE completion means best-effort admission unless `durable_buffer` is enabled; `durable_admission` confirms buffer persistence only, not a Delta commit or query visibility. Preserve source data and reconcile using the application’s destination-level checks before retrying ambiguous outcomes; retries can duplicate rows.
 
-See the [platform architecture](docs/architecture/arrowcol-platform/README.md) for catalog, routing, fencing, buffering, and delivery contracts.
+See the [platform architecture](docs/architecture/arrowcol-platform/README.md) for catalog, routing, fencing, buffering, and delivery contracts. The [`quiver-cli`](bin/quiver-cli/README.md) generates and inspects the DFE `durable_buffer` Quiver layout.
 
 ### Lakehouse loadtest architecture
 
