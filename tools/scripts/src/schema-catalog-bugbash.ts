@@ -246,7 +246,7 @@ export function passedTests(text: string): string[] {
   return stripVTControlCharacters(text).split('\n').flatMap(line => {
     const rust = /\btest ([\w:]+) \.\.\. ok$/.exec(line.trim());
     const node = /^(?:ok \d+ - |✔ )(.+?)(?: \([\d.]+ms\))?$/.exec(line.trim());
-    return rust ? [rust[1]!] : node && !/# (?:SKIP|TODO)/i.test(line) ? [node[1]!] : [];
+    return rust ? [rust[1]!] : node && !/^\s*nx run(?:\s|$)/.test(node[1]!) && !/# (?:SKIP|TODO)/i.test(line) ? [node[1]!] : [];
   });
 }
 export function positiveDfeSample(sample: JsonRecord, configDigest: string): boolean {
@@ -343,7 +343,7 @@ class Rehearsal {
     const stage = this.stages.find(item => item.name === stageName);
     assert.equal(stage?.status, 'passed');
     const observed = stage.tests ?? [];
-    assert.ok(observed.length, `${stageName} selected zero completed tests`);
+    assert.ok(observed.length, `${stageName} observed zero completed tests (Nx task summaries are not tests)`);
     for (const name of names)
       assert.ok(observed.some(test => test === name || test.endsWith(`::${name}`)), `Missing executed acceptance test: ${name}`);
     const acceptance = this.receipt.acceptance ?? {};
@@ -423,7 +423,7 @@ class Rehearsal {
     this.assertions('initializer-control', [], 'Parent/CLI/initializer ownership contract');
     await this.command('catalog-evolution-regressions', [...npx, 'nx', 'run-many', '-t', 'verify',
       '--projects=tools-scripts,arrowcol-props,arrowcol-sparksql,arrowcol-catalog,arrowcol-catalog-rust,arrowcol-catalog-client,arrowcol-sdk-gen,schema-evolution-experiment,arrow-deltalake,delta-maintenance',
-      '--parallel=2', '--skip-nx-cache']);
+      '--parallel=2', '--outputStyle=static', '--skip-nx-cache']);
     this.assertions('catalog-evolution-regressions', ['flight_sql_and_warm_cache_count_actual_catalog_calls',
       'reserved_properties_failed_ddl_and_retained_gap', 'committed_delta_restart_and_concurrent_evolution',
       'commit_publication_crash_and_old_seed_do_not_rollback_delta', 'concurrent_same_ddl_coalesces_to_one_version',
