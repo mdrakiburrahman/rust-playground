@@ -987,11 +987,11 @@ export async function reset_inventory(azure: Azure): Promise<[any[], Record<stri
     throw new Failure('Unexpected Kusto database present; refusing shared-resource reset.');
   const experiment = databases.some(item => leaf(item) === c.experimentDatabase);
   const containers = (await azure.collection(c.storage_id + '/blobServices/default/containers', '2023-05-01')).map(leaf);
-  const optionalContainers = [c.experimentContainer, ...c.mode === 'stamped' ? ['$web'] : []];
+  const optionalContainers = [c.experimentContainer, ...c.mode === 'stamped' ? ['$web', 'experiments'] : []];
   if (!containers.includes(c.data) || !containers.includes(c.checkpoints) ||
       containers.some(name => ![c.data, c.checkpoints, ...optionalContainers].includes(name)))
     throw new Failure('Unexpected or missing container; refusing shared-resource reset.');
-  const owned_containers = [c.data, c.checkpoints, ...optionalContainers.filter(name => containers.includes(name))];
+  const owned_containers = [...new Set([c.data, c.checkpoints, ...optionalContainers.filter(name => containers.includes(name))])];
   for (const name of owned_containers) {
     const container = await azure.arm('GET', c.storage_id + '/blobServices/default/containers/' + name, undefined, false, '2023-05-01');
     const metadata = Object.fromEntries(Object.entries(container.properties.metadata ?? {}).map(([k, v]) => [k.toLowerCase(), v]));

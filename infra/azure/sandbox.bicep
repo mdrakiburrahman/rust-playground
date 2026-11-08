@@ -27,6 +27,8 @@ param minimumInstances int
 param maximumInstances int
 param clusterTags object
 
+var createBenchmarkResults = azureMode == 'stamped' && !contains([dataContainer, checkpointContainer, experimentContainer], 'experiments')
+
 resource identity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: identityName
   location: identityLocation
@@ -150,6 +152,28 @@ resource experiment 'Microsoft.Storage/storageAccounts/blobServices/containers@2
       sandboxid: ownership.sandboxId
       project: 'rust-playground'
     }
+  }
+}
+
+resource benchmarkResults 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = if (createBenchmarkResults) {
+  parent: blobs
+  name: 'experiments'
+  properties: {
+    publicAccess: 'None'
+    metadata: {
+      sandboxid: ownership.sandboxId
+      project: 'rust-playground'
+    }
+  }
+}
+
+resource runtimeBenchmarkWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (createBenchmarkResults) {
+  name: guid(benchmarkResults.id, identity.id, 'runtime-benchmark-contributor')
+  scope: benchmarkResults
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
   }
 }
 

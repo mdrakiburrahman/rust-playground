@@ -72,6 +72,11 @@ The stamped `$web` container carries the same ownership metadata as the private
 containers and participates in the existing guarded inventory and reset path.
 Schema-evolution mode does not enable static website hosting.
 
+Stamped OAT aggregates have a separate private `experiments` container and a
+container-scoped runtime writer grant. This is not the `experimentqap` fixture
+container. Both it and `$web` carry stamp ownership metadata and participate in
+the guarded inventory; isolated schema-evolution mode creates neither.
+
 The private stamp can opt into `aks.networkDataplane: cilium` for enforced
 NetworkPolicy; omission preserves the existing Azure data plane without policy
 enforcement. Isolated OAT workloads require Cilium before deployment.

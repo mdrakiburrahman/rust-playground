@@ -13,6 +13,7 @@ export class FakeAzure extends Azure {
   data_metadata: Metadata;
   experiment_metadata: Metadata;
   website_metadata: Metadata;
+  results_metadata: Metadata;
   experiment_objects: ExperimentObjects = { views: [], functions: [], external: [], tables: [] };
   diagnostic = true;
   settings: Record<string, any> = {};
@@ -33,6 +34,7 @@ export class FakeAzure extends Azure {
     this.data_metadata = { sandboxid: c.sandbox };
     this.experiment_metadata = { sandboxid: c.sandbox };
     this.website_metadata = { sandboxid: c.sandbox };
+    this.results_metadata = { sandboxid: c.sandbox };
     this.items = { [c.data]: [{ name: 'table/data.parquet', snapshot: null, version: null, deleted: false }], [c.checkpoints]: [] };
     this.directories = { [c.data]: [], [c.checkpoints]: [] };
     this.metadata = { sandboxid: c.sandbox, resetstate: 'ready-v1', resetgeneration: uuid(),
@@ -45,6 +47,12 @@ export class FakeAzure extends Azure {
     this.items[c.experimentContainer] = [{ name: 'runs/run-1/optimize/_delta_log/00000000000000000000.json', snapshot: null, version: null, deleted: false }];
     this.directories[c.experimentContainer] = ['runs', 'runs/run-1', 'runs/run-1/optimize', 'runs/run-1/optimize/_delta_log'];
     this.experiment_objects = { ...this.experiment_objects, ...objects };
+    return this;
+  }
+  with_results(): this {
+    this.containers.push({ name: 'experiments', properties: {} });
+    this.items.experiments = [{ name: 'arrowcol-oat/results.parquet', snapshot: null, version: null, deleted: false }];
+    this.directories.experiments = [];
     return this;
   }
   with_website(): this {
@@ -66,6 +74,8 @@ export class FakeAzure extends Azure {
       return { properties: { metadata: { ...this.experiment_metadata } } };
     if (resourcePath.endsWith('/containers/$web'))
       return { properties: { metadata: { ...this.website_metadata } } };
+    if (resourcePath.endsWith('/containers/experiments'))
+      return { properties: { metadata: { ...this.results_metadata } } };
     return { location: this.c.location, tags: { ...this.tags }, properties: { isHnsEnabled: true, uri: 'https://cluster.example',
       principalId: SUB, state: this.cluster_state, customerId: WORKSPACE_CUSTOMER, retentionInDays: 30 } };
   }

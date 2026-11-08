@@ -613,6 +613,8 @@ for (const [label, change] of [
   ['experiment container ownership', (a: FakeAzure) => { a.with_experiment().experiment_metadata.sandboxid = 'foreign'; }],
   ['website container ownership', (a: FakeAzure) => { a.with_website().website_metadata.sandboxid = 'foreign'; }],
   ['unmarked website container', (a: FakeAzure) => { a.with_website().website_metadata = {}; }],
+  ['benchmark results container ownership', (a: FakeAzure) => { a.with_results().results_metadata.sandboxid = 'foreign'; }],
+  ['unmarked benchmark results container', (a: FakeAzure) => { a.with_results().results_metadata = {}; }],
   ['database beside the experiment database', (a: FakeAzure) => { a.with_experiment().databases.push({ name: 'foreign' }); }],
   ['soft-deleted objects', (a: FakeAzure) => { a.items[a.c.data][0].deleted = true; }],
 ] as const) test(`inventory rejects ${label} without mutation`, async () => {
@@ -639,6 +641,20 @@ test('isolated inventory does not admit a static website container', async () =>
   azure.c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_RESOURCE_GROUP: b.SCHEMA_EVOLUTION_GROUP }, 'schema-evolution');
   azure.tags.sandboxId = azure.c.sandbox;
   azure.with_website();
+  await assert.rejects(() => b.reset_inventory(azure), /Unexpected or missing container/);
+  assert.deepEqual(azure.events, []);
+});
+test('stamped inventory includes owned benchmark results without mutation', async () => {
+  azure.with_results();
+  const [, inventory] = await b.reset_inventory(azure);
+  assert.deepEqual(Object.keys(inventory), [azure.c.data, azure.c.checkpoints, 'experiments']);
+  assert.equal(inventory.experiments[0].name, 'arrowcol-oat/results.parquet');
+  assert.deepEqual(azure.events, []);
+});
+test('isolated inventory does not admit the stamped benchmark results container', async () => {
+  azure.c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_RESOURCE_GROUP: b.SCHEMA_EVOLUTION_GROUP }, 'schema-evolution');
+  azure.tags.sandboxId = azure.c.sandbox;
+  azure.with_results();
   await assert.rejects(() => b.reset_inventory(azure), /Unexpected or missing container/);
   assert.deepEqual(azure.events, []);
 });
@@ -1373,6 +1389,9 @@ test('Bicep adds experiment container, database, workspace and StorageRead diagn
   assert.match(section('website'), /= if \(azureMode == 'stamped'\)[\s\S]*name: '\$web'[\s\S]*sandboxid: ownership\.sandboxId/);
   assert.match(section('storage'), /isHnsEnabled: true[\s\S]*allowBlobPublicAccess: false/);
   assert.match(section('runtimeWebsiteWriter'), /scope: website[\s\S]*ba92f5b4-2d11-453d-a403-e96b0029c9fe/);
+  assert.match(source, /var createBenchmarkResults = azureMode == 'stamped' && !contains\(\[dataContainer, checkpointContainer, experimentContainer\], 'experiments'\)/);
+  assert.match(section('benchmarkResults'), /= if \(createBenchmarkResults\)[\s\S]*name: 'experiments'[\s\S]*publicAccess: 'None'[\s\S]*sandboxid: ownership\.sandboxId/);
+  assert.match(section('runtimeBenchmarkWriter'), /= if \(createBenchmarkResults\)[\s\S]*scope: benchmarkResults[\s\S]*ba92f5b4-2d11-453d-a403-e96b0029c9fe[\s\S]*principalId: identity\.properties\.principalId/);
   assert.deepEqual([...source.matchAll(/resource (\w+) 'Microsoft\.Storage\/storageAccounts@/g)].map(match => match[1]),
     ['storage']);
   assert.match(source, /module readLogStorage '\.\/read-log-storage\.bicep' = if \(!empty\(readLogStorageAccountName\)\)/);
