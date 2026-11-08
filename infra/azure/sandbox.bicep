@@ -79,7 +79,7 @@ resource blobs 'Microsoft.Storage/storageAccounts/blobServices@2025-08-01' = {
     // $web is anonymously readable at the static website endpoint even when blob public access is disabled.
     // Only the sanitized benchmark summary is published there.
     staticWebsite: {
-      enabled: true
+      enabled: azureMode == 'stamped'
       indexDocument: 'index.html'
       errorDocument404Path: '404.html'
     }
@@ -99,9 +99,16 @@ resource blobs 'Microsoft.Storage/storageAccounts/blobServices@2025-08-01' = {
   }
 }
 
-resource website 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' existing = {
+resource website 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = if (azureMode == 'stamped') {
   parent: blobs
   name: '$web'
+  properties: {
+    publicAccess: 'None'
+    metadata: {
+      sandboxid: ownership.sandboxId
+      project: 'rust-playground'
+    }
+  }
 }
 
 resource data 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {

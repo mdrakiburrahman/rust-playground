@@ -68,6 +68,9 @@ In stamped mode, the shared runtime UAMI also has container-scoped Blob Data
 Contributor on the stamp's data container for catalog and DFE writes, plus the
 experiment, checkpoint and website containers. These runtime write grants are
 not enabled in schema-evolution mode.
+The stamped `$web` container carries the same ownership metadata as the private
+containers and participates in the existing guarded inventory and reset path.
+Schema-evolution mode does not enable static website hosting.
 
 The read-only runtime mounts writable Parquet staging at `/app/.temp/qap-stage`,
 inside the workspace as required by the fixture safety check. Native fixture

@@ -12,6 +12,7 @@ export class FakeAzure extends Azure {
   databases: any[]; containers: any[];
   data_metadata: Metadata;
   experiment_metadata: Metadata;
+  website_metadata: Metadata;
   experiment_objects: ExperimentObjects = { views: [], functions: [], external: [], tables: [] };
   diagnostic = true;
   settings: Record<string, any> = {};
@@ -31,6 +32,7 @@ export class FakeAzure extends Azure {
     this.containers = [c.data, c.checkpoints].map(name => ({ name, properties: {} }));
     this.data_metadata = { sandboxid: c.sandbox };
     this.experiment_metadata = { sandboxid: c.sandbox };
+    this.website_metadata = { sandboxid: c.sandbox };
     this.items = { [c.data]: [{ name: 'table/data.parquet', snapshot: null, version: null, deleted: false }], [c.checkpoints]: [] };
     this.directories = { [c.data]: [], [c.checkpoints]: [] };
     this.metadata = { sandboxid: c.sandbox, resetstate: 'ready-v1', resetgeneration: uuid(),
@@ -45,6 +47,12 @@ export class FakeAzure extends Azure {
     this.experiment_objects = { ...this.experiment_objects, ...objects };
     return this;
   }
+  with_website(): this {
+    this.containers.push({ name: '$web', properties: {} });
+    this.items.$web = [{ name: 'results.parquet', snapshot: null, version: null, deleted: false }];
+    this.directories.$web = [];
+    return this;
+  }
   override async arm(method: string, resourcePath: string, ..._args: any[]): Promise<any> {
     if (resourcePath === this.c.identity_id) return { location: this.c.location, tags: { ...this.tags }, properties: { clientId: SUB, principalId: SUB } };
     if (resourcePath === this.c.identity_id) return { tags: { ...this.tags }, properties: { clientId: SUB, principalId: SUB } };
@@ -56,6 +64,8 @@ export class FakeAzure extends Azure {
     if (resourcePath.endsWith('/containers/' + this.c.data)) return { properties: { metadata: { ...this.data_metadata } } };
     if (resourcePath.endsWith('/containers/' + this.c.experimentContainer))
       return { properties: { metadata: { ...this.experiment_metadata } } };
+    if (resourcePath.endsWith('/containers/$web'))
+      return { properties: { metadata: { ...this.website_metadata } } };
     return { location: this.c.location, tags: { ...this.tags }, properties: { isHnsEnabled: true, uri: 'https://cluster.example',
       principalId: SUB, state: this.cluster_state, customerId: WORKSPACE_CUSTOMER, retentionInDays: 30 } };
   }

@@ -611,6 +611,8 @@ for (const [label, change] of [
   ['missing container', (a: FakeAzure) => { a.containers.pop(); }],
   ['container ownership', (a: FakeAzure) => { a.data_metadata.sandboxid = 'foreign'; }],
   ['experiment container ownership', (a: FakeAzure) => { a.with_experiment().experiment_metadata.sandboxid = 'foreign'; }],
+  ['website container ownership', (a: FakeAzure) => { a.with_website().website_metadata.sandboxid = 'foreign'; }],
+  ['unmarked website container', (a: FakeAzure) => { a.with_website().website_metadata = {}; }],
   ['database beside the experiment database', (a: FakeAzure) => { a.with_experiment().databases.push({ name: 'foreign' }); }],
   ['soft-deleted objects', (a: FakeAzure) => { a.items[a.c.data][0].deleted = true; }],
 ] as const) test(`inventory rejects ${label} without mutation`, async () => {
@@ -625,6 +627,26 @@ test('inventory accepts the optional experiment database and container beside sa
   assert.equal(experiment, true); assert.deepEqual(databases.map(item => item.name), [c.database]);
   assert.deepEqual(Object.keys(inventory), [c.data, c.checkpoints, c.experimentContainer]);
   assert.equal(inventory[c.experimentContainer].length, 5); assert.deepEqual(azure.events, []);
+});
+test('stamped inventory includes the owned static website without mutation', async () => {
+  azure.with_website();
+  const [, inventory] = await b.reset_inventory(azure);
+  assert.deepEqual(Object.keys(inventory), [azure.c.data, azure.c.checkpoints, '$web']);
+  assert.equal(inventory.$web[0].name, 'results.parquet');
+  assert.deepEqual(azure.events, []);
+});
+test('isolated inventory does not admit a static website container', async () => {
+  azure.c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_RESOURCE_GROUP: b.SCHEMA_EVOLUTION_GROUP }, 'schema-evolution');
+  azure.tags.sandboxId = azure.c.sandbox;
+  azure.with_website();
+  await assert.rejects(() => b.reset_inventory(azure), /Unexpected or missing container/);
+  assert.deepEqual(azure.events, []);
+});
+test('owned website objects participate in the existing fenced physical cleanup', async () => {
+  azure.with_website();
+  await execute();
+  assert.deepEqual(azure.items.$web, []);
+  assert.ok(azure.events.some(event => event[0] === 'DELETE' && event[1] === 'results.parquet'));
 });
 for (const settings of [{ isVersioningEnabled: true }, { deleteRetentionPolicy: { enabled: true } },
   { containerDeleteRetentionPolicy: { enabled: true } }, { restorePolicy: { enabled: true } }])
@@ -1347,7 +1369,8 @@ test('Bicep adds experiment container, database, workspace and StorageRead diagn
   const section = (name: string) => source.split(`resource ${name} `)[1].split('\nresource ')[0].split('\noutput ')[0];
   const logSection = (name: string) => readLogSource.split(`resource ${name} `)[1].split('\nresource ')[0].split('\noutput ')[0];
   assert.match(section('experiment'), /parent: blobs[\s\S]*name: experimentContainer[\s\S]*sandboxid: ownership\.sandboxId/);
-  assert.match(section('blobs'), /staticWebsite: \{[\s\S]*enabled: true[\s\S]*indexDocument: 'index\.html'/);
+  assert.match(section('blobs'), /staticWebsite: \{[\s\S]*enabled: azureMode == 'stamped'[\s\S]*indexDocument: 'index\.html'/);
+  assert.match(section('website'), /= if \(azureMode == 'stamped'\)[\s\S]*name: '\$web'[\s\S]*sandboxid: ownership\.sandboxId/);
   assert.match(section('storage'), /isHnsEnabled: true[\s\S]*allowBlobPublicAccess: false/);
   assert.match(section('runtimeWebsiteWriter'), /scope: website[\s\S]*ba92f5b4-2d11-453d-a403-e96b0029c9fe/);
   assert.deepEqual([...source.matchAll(/resource (\w+) 'Microsoft\.Storage\/storageAccounts@/g)].map(match => match[1]),
