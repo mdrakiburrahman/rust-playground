@@ -230,20 +230,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_zero_rows_and_concurrency_before_connecting() {
-        assert!(
-            send_with_concurrency("not a url", "client-a", 0, 1)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("rows must be positive")
-        );
-        assert!(
-            send_with_concurrency("not a url", "client-a", 1, 0)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("concurrency must be positive")
-        );
+    async fn rejects_zero_rows_and_concurrency_before_connecting() -> Result<()> {
+        let rows_error = send_with_concurrency("not a url", "client-a", 0, 1)
+            .await
+            .err()
+            .context("zero rows should fail")?;
+        assert!(rows_error.to_string().contains("rows must be positive"));
+
+        let concurrency_error = send_with_concurrency("not a url", "client-a", 1, 0)
+            .await
+            .err()
+            .context("zero concurrency should fail")?;
+        assert!(concurrency_error.to_string().contains("concurrency must be positive"));
+        Ok(())
     }
 }
