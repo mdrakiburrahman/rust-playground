@@ -46,7 +46,9 @@ test('qualified success seals exact files, helpers and images privately before t
   assert.equal(statSync(path.join(root, 'manifest.json')).mode & 0o777, 0o600);
   assert.equal(readFileSync(path.join(root, 'corpus/dataflow/table/data.parquet'), 'utf8'), 'actual-parquet-fixture');
   assert.equal(manifest.entries.filter((entry: { target: string }) => entry.target.startsWith('helpers/')).length, 3);
-  assert.deepEqual(f.commands.filter(args => args[0] === 'stop'), [['stop', '--time', '300', 'router-id']]);
+  assert.equal(manifest.writers.catalog, 'arrowcol-catalog-id');
+  assert.deepEqual(f.commands.filter(args => args[0] === 'stop'),
+    [['stop', '--time', '300', 'arrowcol-catalog-id'], ['stop', '--time', '300', 'router-id']]);
   // No real Docker invocation: this is the exact second-start reset with an empty stub daemon.
   await resetBenchmark(f.workspace, () => '');
   assert.equal(readFileSync(path.join(root, 'corpus/results/grafana-validation.json'), 'utf8'), '{"passed":true}');
@@ -125,9 +127,14 @@ for (const target of ['..', 'seal.json', 'manifest.json', 'helpers', 'helpers/de
   });
 }
 
-for (const state of ['foreign', 'router-exit', 'router-oom', 'mutator-restarted', 'rw-mount', 'wrong-socket-config']) {
+for (const state of ['foreign', 'router-exit', 'router-oom', 'mutator-restarted', 'rw-mount', 'wrong-socket-config',
+  'catalog-missing', 'catalog-exit', 'catalog-oom', 'catalog-wrong-mount', 'catalog-restarted']) {
   test(`${state} cannot produce a seal or enable a destructive reset`, async t => {
     const f = fixture(t);
+    if (state === 'catalog-missing') f.values.splice(2, 1);
+    if (state === 'catalog-exit') f.values[2].state.ExitCode = 137;
+    if (state === 'catalog-oom') f.values[2].state.OOMKilled = true;
+    if (state === 'catalog-wrong-mount') f.values[2].mounts[0].Source = '/foreign/catalog-state';
     if (state === 'foreign') f.values[1].labels['com.docker.compose.project.config_files'] = '/foreign/compose.yaml';
     if (state === 'router-exit') f.values[1].state.ExitCode = 137;
     if (state === 'router-oom') f.values[1].state.OOMKilled = true;
@@ -137,7 +144,14 @@ for (const state of ['foreign', 'router-exit', 'router-oom', 'mutator-restarted'
       mounts: [{ Type: 'bind', Source: f.directory, Destination: '/other', RW: true }],
     });
     if (state === 'wrong-socket-config') writeFileSync(path.join(f.directory, 'router-state/config.yaml'), 'server:\n  state_directory: /other\n');
-    await assert.rejects(f.seal, /seal failed/u);
+    const docker = state === 'catalog-restarted' ? (args: string[]) => {
+      const result = f.docker(args);
+      if (args[0] === 'stop' && args.at(-1) === 'arrowcol-catalog-id') {
+        f.values[2].state.Running = true;
+      }
+      return result;
+    } : f.docker;
+    await assert.rejects(() => sealAttemptEvidence(f.workspace, f.directory, f.helperDirectory, docker, f.stopped), /seal failed/u);
     await assert.rejects(resetBenchmark(f.workspace, () => { throw new Error('MUST NOT CALL DOCKER'); }), /reset refused/u);
     assert.equal(f.commands.some(args => args.includes('rm')), false);
   });
@@ -238,6 +252,7 @@ test('host-mapped corpus mounts and an unrelated unlabelled builder are handled 
   const f = fixture(t);
   const hostDirectory = '/owned-host/source/onelake/benchmark/latest';
   f.values[1].mounts[0].Source = path.join(hostDirectory, 'router-state');
+  f.values[2].mounts[0].Source = path.join(hostDirectory, 'catalog-state');
   const docker = (args: string[]) => {
     if (args[0] === 'ps') return `${f.docker(args)}\nbuilder`;
     if (args.at(-1) === 'builder') return JSON.stringify({

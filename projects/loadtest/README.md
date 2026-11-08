@@ -428,7 +428,7 @@ A successful **validated local** attempt now stops its owned router only after
 the actual Grafana, native validation and Explorer gates have finished, all
 generator/helpers have returned, observer/sampler shutdown and diagnostics have
 completed, and the original source/maintenance/tenant mutators are reverified
-as cleanly stopped. The router is not kept live after qualified success.
+as cleanly stopped. The catalog and router are not kept live after qualified success.
 Other live writable mounts into the corpus are refused; read-only Kusto
 source mounts are permitted. No measurement window, query or evidence threshold
 changes.

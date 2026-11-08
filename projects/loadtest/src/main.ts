@@ -820,7 +820,7 @@ async function benchmark(
       })}\n`);
       throw error;
     }
-    step('Validated attempt evidence sealed privately; owned router stopped after qualification');
+    step('Validated attempt evidence sealed privately; owned catalog and router stopped after qualification');
   } else {
     step('Attempt remains unsealed; a subsequent reset is blocked to preserve its original data');
   }

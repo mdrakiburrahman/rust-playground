@@ -42,7 +42,7 @@ interface Manifest {
   version: 1; marker: Marker; outcome: 'validated-success'; nativeCachePreserved: false;
   hostDirectory: string;
   entries: Entry[]; images: Array<{ name: string; id: string; revision: string }>;
-  writers: { router: string; mutators: StoppedMutator[]; clean: true };
+  writers: { router: string; catalog: string; mutators: StoppedMutator[]; clean: true };
 }
 
 function boundedText(file: string, maximum: number): string {
@@ -129,9 +129,9 @@ function clean(value: Container): void {
   if (value.state.Running !== false || value.state.ExitCode !== 0 || value.state.OOMKilled !== false) fail();
 }
 
-function noLiveWriters(values: Container[], hostRoots: string[], allowedId?: string): void {
+function noLiveWriters(values: Container[], hostRoots: string[], allowedIds: string[] = []): void {
   for (const value of values) {
-    if (!value.state.Running || value.id === allowedId || value.id.startsWith(hostname())) continue;
+    if (!value.state.Running || allowedIds.includes(value.id) || value.id.startsWith(hostname())) continue;
     for (const mount of value.mounts) {
       if (mount.Type === 'bind' && mount.RW && hostRoots.some(root =>
         within(root, path.resolve(mount.Source)) || within(path.resolve(mount.Source), root))) fail();
@@ -170,7 +170,7 @@ export function stoppedAttemptMutators(workspace: string, docker: Docker, servic
 /** This is after qualification, never inside the measured or native validation window. */
 export function stopAttemptRouter(
   workspace: string, directory: string, docker: Docker, expected: StoppedMutator[], hostDirectory = directory,
-): { router: string; mutators: StoppedMutator[]; clean: true } {
+): { router: string; catalog: string; mutators: StoppedMutator[]; clean: true } {
   const before = containers(docker);
   const selected = before.filter(value => owned(workspace, value));
   const actual = selected.filter(value => mutators.includes(value.labels['com.docker.compose.service']));
@@ -182,6 +182,9 @@ export function stopAttemptRouter(
   const routers = selected.filter(value => value.labels['com.docker.compose.service'] === 'router');
   if (routers.length !== 1) fail();
   const router = routers[0];
+  const catalogs = selected.filter(value => value.labels['com.docker.compose.service'] === 'arrowcol-catalog');
+  if (catalogs.length !== 1) fail();
+  const catalog = catalogs[0];
   const hostWorkspace = path.resolve(hostDirectory, path.relative(directory, workspace));
   const hostRoots = [hostDirectory, path.join(hostWorkspace, 'projects/loadtest/.temp/loadgen/latest/diagnostics')];
   const config = YAML.parse(boundedText(checkedBenchmarkPath(workspace, path.join(directory, 'router-state/config.yaml')), 16 * 1024)) as {
@@ -190,12 +193,18 @@ export function stopAttemptRouter(
   if (config?.server?.state_directory !== '/state'
       || !router.mounts.some(mount => mount.Type === 'bind' && mount.Destination === '/state' && mount.RW
         && path.resolve(mount.Source) === path.join(hostDirectory, 'router-state'))) fail();
-  noLiveWriters(before, hostRoots, router.id);
+  if (!catalog.mounts.some(mount => mount.Type === 'bind' && mount.Destination === '/state' && mount.RW
+      && path.resolve(mount.Source) === path.join(hostDirectory, 'catalog-state'))) fail();
+  noLiveWriters(before, hostRoots, [router.id, catalog.id]);
+  docker(['stop', '--time', '300', catalog.id]);
   docker(['stop', '--time', '300', router.id]);
   const after = containers(docker);
   const stopped = after.find(value => value.id === router.id);
+  const stoppedCatalog = after.find(value => value.id === catalog.id);
   if (!stopped || !owned(workspace, stopped)) return fail();
+  if (!stoppedCatalog || !owned(workspace, stoppedCatalog)) return fail();
   clean(stopped);
+  clean(stoppedCatalog);
   const afterMutators = after.filter(value => owned(workspace, value) && mutators.includes(value.labels['com.docker.compose.service']));
   if (afterMutators.length !== expected.length) fail();
   for (const value of afterMutators) {
@@ -203,7 +212,7 @@ export function stopAttemptRouter(
     clean(value);
   }
   noLiveWriters(after, hostRoots);
-  return { router: router.id, mutators: expected, clean: true };
+  return { router: router.id, catalog: catalog.id, mutators: expected, clean: true };
 }
 
 function stamp(file: string, target: string, allowSocket: boolean): Entry {
