@@ -5,6 +5,8 @@ param location string
 param azureMode string = 'stamped'
 param resourceGroupName string = 'arrow-collector-rg'
 param sandboxId string
+param resourceGroupTags object
+param identityTags object
 param storageAccountName string
 param clusterName string
 param identityName string
@@ -42,7 +44,7 @@ var ownership = {
 resource group 'Microsoft.Resources/resourceGroups@2024-03-01' = {
   name: resourceGroupName
   location: location
-  tags: ownership
+  tags: resourceGroupTags
 }
 
 module sandbox './sandbox.bicep' = {
@@ -52,6 +54,7 @@ module sandbox './sandbox.bicep' = {
     location: location
     azureMode: azureMode
     ownership: ownership
+    identityTags: identityTags
     storageAccountName: storageAccountName
     clusterName: clusterName
     identityName: identityName

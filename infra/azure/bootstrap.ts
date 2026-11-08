@@ -580,10 +580,26 @@ export function owned(resource: any, config: Config): void {
   if (!resource || Object.entries({ ...TAGS, sandboxId: config.sandbox }).some(([k, v]) => resource.tags?.[k] !== v))
     throw new Failure('Exact sandbox ownership tags do not match; refusing adoption/mutation.');
 }
+function owned_shared_stamp_group(resource: any): void {
+  if (!resource || resource.tags?.project !== TAGS.project || resource.tags?.purpose !== TAGS.purpose ||
+      !/^stamp-\d+$/.test(resource.tags?.sandboxId ?? ''))
+    throw new Failure('Exact shared ArrowCol resource-group ownership tags do not match; refusing adoption/mutation.');
+}
 function owned_shared_stamp_identity(resource: any): void {
   if (!resource || resource.tags?.project !== TAGS.project || resource.tags?.purpose !== TAGS.purpose ||
       !/^stamp-\d+$/.test(resource.tags?.sandboxId ?? ''))
     throw new Failure('Exact shared ArrowCol identity ownership tags do not match; refusing adoption/mutation.');
+}
+async function verify_shared_publisher_credentials(azure: Azure): Promise<void> {
+  const c = azure.c;
+  const existing = await azure.collection(c.identity_id + '/federatedIdentityCredentials', '2023-01-31');
+  for (const expected of c.stampConfig.publisherFederatedCredentials) {
+    const actual = existing.find(item => item.name === expected.name)?.properties;
+    const audiences = Array.isArray(actual?.audiences) ? [...actual.audiences].sort() : [];
+    if (!actual || actual.issuer !== expected.issuer || actual.subject !== expected.subject ||
+        JSON.stringify(audiences) !== JSON.stringify(['api://AzureADTokenExchange']))
+      throw new Failure('Shared ArrowCol identity publisher federated credentials do not match the validated stamp configuration; refusing trust mutation.');
+  }
 }
 export async function retry_ready<T>(action: () => Promise<T>, label: string, timeout = 600): Promise<T> {
   const deadline = runtime.now() + timeout;
@@ -694,18 +710,23 @@ export async function preflight(azure: Azure): Promise<void> {
     'Azure subscription, AKS version, VM quota, network ranges, and one-identity preflight: ready' :
     'Azure subscription and exact isolated resource inventory preflight: ready (no AKS/ACR checks)');
 }
-export async function guard_existing(azure: Azure): Promise<void> {
-  const c = azure.c;
+export async function guard_existing(azure: Azure): Promise<{ group?: any; identity?: any }> {
+  const c = azure.c, existing: { group?: any; identity?: any } = {};
   for (const resourcePath of [c.base, c.storage_id, c.cluster_id, c.identity_id, c.workspace_id,
     ...(c.readLogStorageId ? [c.readLogStorageId] : [])]) {
     const resource = await azure.arm('GET', resourcePath, undefined, true,
       resourcePath === c.base ? '2022-09-01' : [c.storage_id, c.readLogStorageId].includes(resourcePath) ? '2023-05-01' :
         resourcePath === c.identity_id ? '2023-01-31' : resourcePath === c.workspace_id ? LOG_ANALYTICS_API : API);
     if (resource) {
-      if (c.mode === 'stamped' && resourcePath === c.identity_id) owned_shared_stamp_identity(resource);
+      if (c.mode === 'stamped' && resourcePath === c.base) owned_shared_stamp_group(resource);
+      else if (c.mode === 'stamped' && resourcePath === c.identity_id) owned_shared_stamp_identity(resource);
       else owned(resource, c);
+      if (resourcePath === c.base) existing.group = resource;
+      if (resourcePath === c.identity_id) existing.identity = resource;
     }
   }
+  if (c.mode === 'stamped' && existing.identity) await verify_shared_publisher_credentials(azure);
+  return existing;
 }
 export function fresh_authority(): Metadata {
   return { resetstate: FENCED, resetgeneration: uuid(), occupancy: 'released', publisherregistryversion: '1', publishers: '{}' };
@@ -715,11 +736,13 @@ export async function checkpoint_container(azure: Azure): Promise<any> {
 }
 export async function deploy(azure: Azure, fresh?: Metadata): Promise<void> {
   const c = azure.c;
-  await guard_existing(azure);
+  const existing = await guard_existing(azure);
+  const ownershipTags = { ...TAGS, sandboxId: c.sandbox };
   const params = { location: c.location, resourceGroupName: c.group, sandboxId: c.sandbox, storageAccountName: c.account,
+    resourceGroupTags: existing.group?.tags ?? ownershipTags, identityTags: existing.identity?.tags ?? ownershipTags,
     azureMode: c.mode, clusterName: c.cluster, identityName: c.identity, registryName: c.registry,
     aksConfig: c.mode === 'stamped' ? c.stampConfig.aks : {},
-    publisherFederatedCredentials: c.mode === 'stamped' ? c.stampConfig.publisherFederatedCredentials : [],
+    publisherFederatedCredentials: c.mode === 'stamped' && !existing.identity ? c.stampConfig.publisherFederatedCredentials : [],
     databaseName: c.database, dataContainer: c.data, checkpointContainer: c.checkpoints,
     experimentContainer: c.experimentContainer, experimentDatabase: c.experimentDatabase,
     logAnalyticsWorkspaceName: c.logAnalyticsWorkspace,

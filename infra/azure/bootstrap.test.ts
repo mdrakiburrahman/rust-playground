@@ -122,6 +122,8 @@ test('isolated deploy parameters retain hash ownership and suppress only stamped
     assert.equal(params.azureMode.value, 'schema-evolution');
     assert.equal(params.resourceGroupName.value, b.SCHEMA_EVOLUTION_GROUP);
     assert.equal(params.sandboxId.value, '582e3df61d82');
+    assert.deepEqual(params.resourceGroupTags.value, { ...b.TAGS, sandboxId: c.sandbox });
+    assert.deepEqual(params.identityTags.value, { ...b.TAGS, sandboxId: c.sandbox });
     assert.equal(params.storageAccountName.value, 'arrowcol582e3df61d82');
     assert.equal(params.registryName.value, '');
     assert.deepEqual(params.aksConfig.value, {});
@@ -281,7 +283,45 @@ test('shared stamped identity can be reused without replacing other stamp consum
   azure.c = c;
   mock.method(azure, 'arm', async (_method: string, resourcePath: string) => resourcePath === c.identity_id
     ? { tags: { ...b.TAGS, sandboxId: 'stamp-89150' } } : null);
+  const publisherCredentials = c.stampConfig.publisherFederatedCredentials.map(({ name, issuer, subject }) => ({
+    name, properties: { issuer, subject, audiences: ['api://AzureADTokenExchange'] },
+  }));
+  mock.method(azure, 'collection', async () => publisherCredentials);
   await b.guard_existing(azure);
+});
+test('stamped deployment preserves previous RG/UAMI tags and does not redeclare shared publisher FICs', async () => {
+  const c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_STAMP: '89151' });
+  azure.c = c;
+  const groupTags = { ...b.TAGS, sandboxId: 'stamp-89150' };
+  const identityTags = { ...b.TAGS, sandboxId: 'stamp-89149' };
+  const publisherCredentials = c.stampConfig.publisherFederatedCredentials.map(({ name, issuer, subject }) => ({
+    name, properties: { issuer, subject, audiences: ['api://AzureADTokenExchange'] },
+  }));
+  mock.method(azure, 'arm', async (_method: string, resourcePath: string) => {
+    if (resourcePath === c.base) return { tags: groupTags };
+    if (resourcePath === c.identity_id) return { tags: identityTags, properties: { clientId: SUB, principalId: SUB } };
+    if (resourcePath === c.cluster_id) return { properties: { uri: 'https://cluster.example' } };
+    return null;
+  });
+  mock.method(azure, 'collection', async () => publisherCredentials);
+  let parameters: any;
+  mock.method(azure, 'cli', async (...args: string[]) => {
+    assert.deepEqual(args.slice(0, 3), ['deployment', 'sub', 'create']);
+    parameters = JSON.parse(fs.readFileSync(args.at(-1)!.slice(1), 'utf8')).parameters;
+    return {};
+  });
+  await b.deploy(azure);
+  assert.deepEqual(parameters.resourceGroupTags.value, groupTags);
+  assert.deepEqual(parameters.identityTags.value, identityTags);
+  assert.deepEqual(parameters.publisherFederatedCredentials.value, []);
+});
+test('stamped deployment refuses missing shared publisher FICs', async () => {
+  const c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_STAMP: '89151' });
+  azure.c = c;
+  mock.method(azure, 'arm', async (_method: string, resourcePath: string) => resourcePath === c.identity_id
+    ? { tags: { ...b.TAGS, sandboxId: 'stamp-89150' } } : null);
+  mock.method(azure, 'collection', async () => []);
+  await assert.rejects(b.guard_existing(azure), /publisher federated credentials do not match/);
 });
 test('shared stamped identity rejects an unrelated or malformed ownership tag', async () => {
   const c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_STAMP: '89151' });
