@@ -44,13 +44,14 @@ and `SHA256SUMS` before recreating the devcontainer.
 | --- | --- | --- |
 | `verify` | `--expected-sha <full SHA>` | Clean exact draft PR head, green CI/all eight publications, regression/build gates, verified immutable images bound to actual Compose aliases, image smokes, SDK bundles. |
 | `local` | `--verified-receipt <verify/receipt.json>` | Normal then Quiver crash/recovery, native local schema evolution, all 13 table SDK/artifact bundles, preserved private seals and no live attempt writers. |
-| `azure` | `--verified-receipt <verify/receipt.json> --subscription <UUID> --resource-group <dedicated group> --env-file <private base> --ready-env <private ready output>` | Read-only ready-generation preflight, native Azure evolution, owned-process/data cleanup. Never provisions or resets. |
-| `reset` | `--verified-receipt <verify/receipt.json> --subscription <UUID> --resource-group <group> --env-file <private base> --confirm-reset <same group>` | **Destructively resets only the explicitly confirmed isolated group.** Existing ready inputs become stale; obtain a fresh supported provision output before `azure`. |
+| `azure` | `--verified-receipt <verify/receipt.json> --resource-group <dedicated group> --env-file <private base> --ready-env <private ready output>` | Read-only ready-generation preflight, native Azure evolution, owned-process/data cleanup. Never provisions or resets. |
+| `reset` | `--verified-receipt <verify/receipt.json> --resource-group <group> --env-file <private base> --confirm-reset <same group>` | **Destructively resets only the explicitly confirmed isolated group.** Existing ready inputs become stale; obtain a fresh supported provision output before `azure`. |
 
 `verify` requires existing Node dependencies, Docker/Buildx and GHCR pull
 authentication. Azure needs matching Azure CLI subscription context and separate
 approved private base/ready files from supported provisioning. No shared `.env.azure`
-or copied/invented generation is inferred. Local failure stops owned services and
+or copied/invented generation is inferred. Subscription comes only from the approved
+private base; optional `--subscription <UUID>` must match it. Local failure stops owned services and
 archives diagnostics without automatically discarding/resetting the original attempt.
 
 ## Registry commands

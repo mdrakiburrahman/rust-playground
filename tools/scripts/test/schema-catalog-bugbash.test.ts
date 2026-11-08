@@ -19,6 +19,9 @@ test('CLI separates verification, ready-only Azure and explicitly confirmed dest
   assert.equal(parseOptions(['verify', '--expected-sha', sha, ...evidence]).mode, 'verify');
   assert.equal(parseOptions(['local', ...receipt, ...evidence]).mode, 'local');
   assert.equal(parseOptions(['azure', ...receipt, ...cloud, '--ready-env', '/private/ready', ...evidence]).mode, 'azure');
+  assert.equal(parseOptions(['azure', ...receipt, ...cloud.slice(2), '--ready-env', '/private/ready', ...evidence]).subscription, undefined);
+  assert.throws(() => parseOptions(['azure', ...receipt, '--subscription', 'not-a-uuid', ...cloud.slice(2),
+    '--ready-env', '/private/ready', ...evidence]), /subscription/);
   assert.throws(() => parseOptions(['verify', '--expected-sha', sha.slice(0, 7), ...evidence]), /full SHA/);
   assert.throws(() => parseOptions(['local', ...receipt, ...cloud, ...evidence]), /Only azure/);
   assert.throws(() => parseOptions(['azure', ...receipt, ...cloud, '--ready-env', '/private/base', ...evidence]), /separate/);

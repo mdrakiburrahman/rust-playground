@@ -92,9 +92,9 @@ export function parseOptions(argv: string[]): Options {
     !values['verified-receipt'] || values['expected-sha'])
     throw new Error('verify requires --expected-sha <full SHA>; other steps require --verified-receipt <verify receipt.json>.');
   const cloud = mode === 'azure' || mode === 'reset';
-  if (cloud ? !values.subscription || !UUID.test(values.subscription) || !values['resource-group'] || !values['env-file'] :
+  if (cloud ? (values.subscription && !UUID.test(values.subscription)) || !values['resource-group'] || !values['env-file'] :
     values.subscription || values['resource-group'] || values['env-file'] || values['ready-env'] || values['confirm-reset'])
-    throw new Error('Only azure/reset accept and require --subscription <UUID> --resource-group <group> --env-file <private input>.');
+    throw new Error('Only azure/reset accept --subscription <UUID> and require --resource-group <group> --env-file <private input>.');
   if (mode === 'azure') {
     if (!values['ready-env'] || values['ready-env'] === values['env-file'] || values['confirm-reset'] ||
         values['resource-group'] === 'rust-playground-schema-evo' || !is_schema_evolution_group(values['resource-group']!))
@@ -283,7 +283,8 @@ class Rehearsal {
     return map;
   }
   async github(sha: string): Promise<void> {
-    const pr = record(JSON.parse(await this.command('pull-request', ['gh', 'api', `repos/${REPO}/pulls/76`], 60)) as unknown, 'PR');
+    const pr = record(JSON.parse(await this.command('pull-request', ['gh', 'api', `repos/${REPO}/pulls/76`,
+      '--jq', '{number,state,draft,head:{sha:.head.sha},html_url}'], 60)) as unknown, 'PR');
     assert.equal(pr.state, 'open'); assert.equal(pr.draft, true);
     assert.equal(record(pr.head, 'PR head').sha, sha);
     const runs = records(JSON.parse(await this.command('workflow-inventory', ['gh', 'run', 'list', '-R', REPO,
@@ -333,6 +334,7 @@ class Rehearsal {
     this.assertions('dfe-partition-replay', ['catalog_partitions_publish_all_rows_and_replay_across_commit_waves'],
       'Partitioned DFE commit/replay row conservation');
     await this.command('dfe-only-topology', [...npx, 'tsx', '--test', 'projects/loadtest/test/compose.test.ts']);
+    this.assertions('dfe-only-topology', [], 'DFE-only topology without Direct collector, Hive or SQL catalog');
     await this.command('sdk-compatibility', [...npx, 'nx', 'run', 'arrowcol-sdk-gen:compatibility', '--skip-nx-cache']);
     await this.command('evolution-fixtures', [...npx, 'nx', 'run', 'schema-evolution-experiment:build-fixtures', '--skip-nx-cache']);
     await this.command('reader-bundle', ['bash', 'projects/loadtest/scripts/build-reader-bundle.sh']);
@@ -537,7 +539,8 @@ class Rehearsal {
   cloudInput(): Config {
     const base = load_env(this.options.envFile!);
     const config = new Config(base, 'schema-evolution');
-    assert.equal(config.subscription.toLowerCase(), this.options.subscription!.toLowerCase(), 'Private subscription mismatch');
+    if (this.options.subscription)
+      assert.equal(config.subscription.toLowerCase(), this.options.subscription.toLowerCase(), 'Private subscription mismatch');
     assert.equal(config.group, this.options.resourceGroup, 'Private resource-group mismatch');
     if (this.options.readyEnv) {
       if (fs.realpathSync(this.options.envFile!) === fs.realpathSync(this.options.readyEnv))
@@ -576,7 +579,8 @@ class Rehearsal {
   }
   async azure(reset: boolean): Promise<void> {
     const config = this.cloudInput(), env = privateEnvironment(load_env(this.options.envFile!), this.env, 'schema-evolution');
-    const account = record(JSON.parse(await this.command('azure-account', ['az', 'account', 'show', '--output', 'json'], 60, env)) as unknown, 'Azure account');
+    const account = record(JSON.parse(await this.command('azure-account', ['az', 'account', 'show', '--query', '{id:id}',
+      '--output', 'json'], 60, env)) as unknown, 'Azure account');
     assert.equal(String(account.id).toLowerCase(), config.subscription.toLowerCase(), 'CLI subscription context mismatch');
     const common = ['npx', '--no-install', 'tsx', 'infra/azure/bootstrap.ts'];
     await this.command('azure-preflight', [...common, 'preflight', '--mode', 'schema-evolution', '--env-file', this.options.envFile!], 900, env);
