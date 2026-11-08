@@ -1,5 +1,4 @@
-#[path = "../dmv.rs"]
-mod dmv;
+use collector_chain::dmv;
 
 use anyhow::Result;
 use clap::Parser;

@@ -15,6 +15,7 @@ arrow = { version = "58.3", default-features = false }
 arrow-deltalake = { path = "../../crates/arrow-deltalake" }
 axum = "0.8"
 clap.workspace = true
+collector-chain = { path = "../../bin/collector-chain" }
 object_store = { version = "0.13.2", features = ["azure"] }
 parquet = { version = "58.3", default-features = false, features = ["arrow"] }
 serde = { version = "1", features = ["derive"] }

@@ -56,13 +56,21 @@ impl OatConfig {
         }
         if self.dfe_worker_concurrency.len() != 2
             || self.dfe_worker_concurrency.iter().any(|value| *value == 0)
-            || self.dfe_worker_concurrency.iter().copied().collect::<HashSet<_>>().len() != 2
+            || self
+                .dfe_worker_concurrency
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>()
+                .len()
+                != 2
         {
             bail!("dfe_worker_concurrency must contain two distinct positive values");
         }
         if self.tables.len() < 2 {
             bail!("tables must contain at least two distinct DMV table names");
         }
+        let available_tables = collector_chain::dmv::table_names()?;
+        let available = available_tables.iter().map(String::as_str).collect::<HashSet<_>>();
         let mut table_names = HashSet::new();
         for table in &self.tables {
             if table.is_empty() || !table.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_') {
@@ -70,6 +78,12 @@ impl OatConfig {
             }
             if !table_names.insert(table.to_ascii_lowercase()) {
                 bail!("tables must not contain duplicate names: {table}");
+            }
+            if !available.contains(table.to_ascii_lowercase().as_str()) {
+                bail!(
+                    "unknown DMV table {table:?}; available tables: {}",
+                    available_tables.join(", ")
+                );
             }
         }
         validate_storage_url(&self.result_url, "result_url")?;
@@ -111,13 +125,17 @@ mod tests {
             dfe_pod_selector: "app=arrowcol-dataflow".to_owned(),
             arrowcol_endpoint: "http://router.arrowcol.svc:32010".to_owned(),
             dmv_client_binary: "target/debug/arrowcol-dmv".to_owned(),
-            tables: vec!["dmv_wait_stats".to_owned(), "dmv_query_stats".to_owned()],
+            tables: vec![
+                "sqlserver_wait_stats".to_owned(),
+                "sqlserver_cpu_utilization".to_owned(),
+            ],
             rows_per_table: 1000,
             dmv_concurrency: 2,
             replica_counts: vec![1, 2],
             dfe_worker_concurrency: vec![2, 4],
             result_url: "abfss://experiments@account.dfs.core.windows.net/arrowcol-oat/results.parquet".to_owned(),
-            website_url: "abfss://$web@account.dfs.core.windows.net/experiments/arrowcol-oat/results.parquet".to_owned(),
+            website_url: "abfss://$web@account.dfs.core.windows.net/experiments/arrowcol-oat/results.parquet"
+                .to_owned(),
         }
     }
 
@@ -133,7 +151,7 @@ mod tests {
         assert!(config.validate().is_err());
 
         let mut config = valid();
-        config.tables[1] = "DMV_WAIT_STATS".to_owned();
+        config.tables[1] = "SQLSERVER_WAIT_STATS".to_owned();
         assert!(config.validate().is_err());
     }
 

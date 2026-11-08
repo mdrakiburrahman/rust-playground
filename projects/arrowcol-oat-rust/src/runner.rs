@@ -59,7 +59,9 @@ pub async fn execute(config: OatConfig, id: &str, state: Arc<AppState>) -> Resul
     };
 
     state
-        .update(id, |status| status.progress = "writing compact Parquet results".to_owned())
+        .update(id, |status| {
+            status.progress = "writing compact Parquet results".to_owned()
+        })
         .await;
     publish_results(&config, &results).await?;
     Ok(results.len())
@@ -84,7 +86,12 @@ async fn run_matrix(config: &OatConfig, id: &str, state: &AppState) -> Result<Ve
             rollout(config, &config.arrowcol_deployment).await?;
             rollout(config, &config.dfe_deployment).await?;
 
-            let assigned_tables = config.tables.iter().take(*replicas as usize).cloned().collect::<Vec<_>>();
+            let assigned_tables = config
+                .tables
+                .iter()
+                .take(*replicas as usize)
+                .cloned()
+                .collect::<Vec<_>>();
             let started = Instant::now();
             run_clients(config, id, &assigned_tables).await?;
             let duration_ms = u64::try_from(started.elapsed().as_millis())?.max(1);
@@ -136,7 +143,11 @@ async fn run_clients(config: &OatConfig, id: &str, tables: &[String]) -> Result<
                 .await
                 .with_context(|| format!("start DMV client for {table}"))?;
             if !output.status.success() {
-                bail!("DMV client for {table} exited with {}: {}", output.status, String::from_utf8_lossy(&output.stderr));
+                bail!(
+                    "DMV client for {table} exited with {}: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                );
             }
             Ok::<(), anyhow::Error>(())
         });
@@ -203,7 +214,15 @@ async fn restore_deployments(config: &OatConfig, arrowcol: Value, dfe: Value) ->
 async fn deployment(config: &OatConfig, name: &str) -> Result<Value> {
     let output = kubectl(
         config,
-        vec!["get", "deployment", name, "--namespace", &config.namespace, "-o", "json"],
+        vec![
+            "get",
+            "deployment",
+            name,
+            "--namespace",
+            &config.namespace,
+            "-o",
+            "json",
+        ],
         None,
     )
     .await?;
@@ -215,10 +234,20 @@ async fn apply_deployment(config: &OatConfig, mut deployment: Value) -> Result<(
         .get_mut("metadata")
         .and_then(Value::as_object_mut)
         .context("Deployment metadata must be an object")?;
-    for field in ["uid", "resourceVersion", "generation", "creationTimestamp", "managedFields", "selfLink"] {
+    for field in [
+        "uid",
+        "resourceVersion",
+        "generation",
+        "creationTimestamp",
+        "managedFields",
+        "selfLink",
+    ] {
         metadata.remove(field);
     }
-    deployment.as_object_mut().context("Deployment must be an object")?.remove("status");
+    deployment
+        .as_object_mut()
+        .context("Deployment must be an object")?
+        .remove("status");
     let payload = serde_json::to_vec(&deployment)?;
     kubectl(
         config,
@@ -372,15 +401,27 @@ fn parquet_bytes(results: &[OatResult]) -> Result<Vec<u8>> {
         Field::new("memory_bytes", DataType::UInt64, true),
     ]));
     let columns: Vec<ArrayRef> = vec![
-        Arc::new(StringArray::from_iter_values(results.iter().map(|row| row.run_id.as_str()))),
+        Arc::new(StringArray::from_iter_values(
+            results.iter().map(|row| row.run_id.as_str()),
+        )),
         Arc::new(UInt64Array::from_iter_values(results.iter().map(|row| row.replicas))),
-        Arc::new(UInt64Array::from_iter_values(results.iter().map(|row| row.dfe_worker_concurrency))),
-        Arc::new(StringArray::from_iter_values(results.iter().map(|row| row.table.as_str()))),
+        Arc::new(UInt64Array::from_iter_values(
+            results.iter().map(|row| row.dfe_worker_concurrency),
+        )),
+        Arc::new(StringArray::from_iter_values(
+            results.iter().map(|row| row.table.as_str()),
+        )),
         Arc::new(UInt64Array::from_iter_values(results.iter().map(|row| row.rows))),
         Arc::new(UInt64Array::from_iter_values(results.iter().map(|row| row.duration_ms))),
-        Arc::new(Float64Array::from_iter_values(results.iter().map(|row| row.rows_per_second))),
-        Arc::new(Float64Array::from(results.iter().map(|row| row.cpu_millicores).collect::<Vec<_>>())),
-        Arc::new(UInt64Array::from(results.iter().map(|row| row.memory_bytes).collect::<Vec<_>>())),
+        Arc::new(Float64Array::from_iter_values(
+            results.iter().map(|row| row.rows_per_second),
+        )),
+        Arc::new(Float64Array::from(
+            results.iter().map(|row| row.cpu_millicores).collect::<Vec<_>>(),
+        )),
+        Arc::new(UInt64Array::from(
+            results.iter().map(|row| row.memory_bytes).collect::<Vec<_>>(),
+        )),
     ];
     let batch = RecordBatch::try_new(Arc::clone(&schema), columns)?;
     let mut writer = ArrowWriter::try_new(Vec::new(), schema, None)?;

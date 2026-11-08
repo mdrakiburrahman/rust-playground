@@ -38,7 +38,9 @@ async fn main() -> Result<()> {
         .init();
     let args = Args::parse();
     if let Some(path) = args.validate_config {
-        let source = fs::read_to_string(&path).await.with_context(|| format!("read {}", path.display()))?;
+        let source = fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("read {}", path.display()))?;
         let config: OatConfig = serde_json::from_str(&source).context("parse OAT JSON")?;
         config.validate()?;
         println!("valid OAT config: {}", path.display());
@@ -65,7 +67,14 @@ async fn start_run(
     State(state): State<Arc<AppState>>,
     Json(config): Json<OatConfig>,
 ) -> Result<(StatusCode, Json<RunStatus>), (StatusCode, Json<ApiError>)> {
-    config.validate().map_err(|error| (StatusCode::BAD_REQUEST, Json(ApiError { error: format!("{error:#}") })))?;
+    config.validate().map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: format!("{error:#}"),
+            }),
+        )
+    })?;
     let id = uuid::Uuid::new_v4().to_string();
     let status = RunStatus {
         id: id.clone(),
@@ -111,12 +120,12 @@ async fn get_run(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<RunStatus>, (StatusCode, Json<ApiError>)> {
-    state
-        .runs
-        .lock()
-        .await
-        .get(&id)
-        .cloned()
-        .map(Json)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(ApiError { error: format!("unknown run {id}") })))
+    state.runs.lock().await.get(&id).cloned().map(Json).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ApiError {
+                error: format!("unknown run {id}"),
+            }),
+        )
+    })
 }

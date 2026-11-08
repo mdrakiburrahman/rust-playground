@@ -33,6 +33,13 @@ pub struct DmvTable {
     schema: SchemaRef,
 }
 
+pub fn table_names() -> Result<Vec<String>> {
+    Ok(tables()?
+        .into_iter()
+        .map(|table| table.identity.table().as_str().to_owned())
+        .collect())
+}
+
 pub fn tables() -> Result<Vec<DmvTable>> {
     let ddl = SCHEMA_DDL
         .lines()
@@ -114,7 +121,7 @@ pub async fn send_table_with_concurrency(
 fn table_named(table_name: &str) -> Result<DmvTable> {
     tables()?
         .into_iter()
-        .find(|table| table.identity.table().eq_ignore_ascii_case(table_name))
+        .find(|table| table.identity.table().as_str().eq_ignore_ascii_case(table_name))
         .with_context(|| format!("unknown DMV table {table_name:?}"))
 }
 
@@ -258,8 +265,8 @@ mod tests {
 
     #[test]
     fn selects_a_single_dmv_table_case_insensitively() -> Result<()> {
-        let table = table_named("DMV_WAIT_STATS")?;
-        assert_eq!(table.identity.table(), "dmv_wait_stats");
+        let table = table_named("SQLSERVER_WAIT_STATS")?;
+        assert_eq!(table.identity.table().as_str(), "sqlserver_wait_stats");
         assert!(table_named("not_a_dmv_table").is_err());
         Ok(())
     }
