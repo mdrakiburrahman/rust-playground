@@ -23,8 +23,8 @@
     2
   ],
   "dfe_worker_concurrency": [
-    2,
-    4
+    1,
+    2
   ],
   "result_url": "abfss://experiments@account.dfs.core.windows.net/arrowcol-oat/results.parquet",
   "website_url": "abfss://$web@account.dfs.core.windows.net/results.parquet"

@@ -37,6 +37,7 @@ fn main() -> Result<()> {
     let routing_store: Arc<dyn RoutingStore> = Arc::new(SqlServerRoutingStore::new(routing_sql));
     let routing = Arc::new(RoutingEngine::new(routing_store, config.routing.policy()?)?);
     let metrics = RouterMetrics::new()?;
+    metrics.set_distinct_table_owners(config.routing.distinct_table_owners);
     let authenticator: Arc<dyn Authenticator> = Arc::new(AllowAllAuthenticator);
     let edge_verifier = Arc::new(EdgeVerifier::new(edge_secret, config.auth.edge_signature_max_age_ms)?);
     let internal_signer = Arc::new(InternalIdentitySigner::new(

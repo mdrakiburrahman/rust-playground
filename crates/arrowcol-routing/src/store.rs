@@ -19,6 +19,8 @@ pub struct LeaseClaim {
     pub expires_at_unix_ms: UnixMillis,
     /// Oldest pressure timestamp acceptable at compare-and-set time.
     pub minimum_snapshot_at_unix_ms: UnixMillis,
+    /// Prevent assignment to a collector that owns another active table lease.
+    pub distinct_table_owners: bool,
 }
 
 /// Compare-and-set request to begin drain.
@@ -47,6 +49,8 @@ pub struct LeaseTransfer {
     pub expires_at_unix_ms: UnixMillis,
     /// Oldest pressure timestamp acceptable for the new owner.
     pub minimum_snapshot_at_unix_ms: UnixMillis,
+    /// Prevent assignment to a collector that owns another active table lease.
+    pub distinct_table_owners: bool,
 }
 
 /// Compare-and-set request to hand a crashed holder's lease directly to the
@@ -70,6 +74,8 @@ pub struct LeaseSuccession {
     pub expires_at_unix_ms: UnixMillis,
     /// Oldest pressure timestamp acceptable for the successor.
     pub minimum_snapshot_at_unix_ms: UnixMillis,
+    /// Prevent assignment to a collector that owns another active table lease.
+    pub distinct_table_owners: bool,
 }
 
 impl LeaseSuccession {

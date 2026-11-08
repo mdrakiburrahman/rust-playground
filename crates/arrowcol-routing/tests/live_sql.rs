@@ -254,6 +254,7 @@ async fn live_sql_hands_crashed_holder_lease_to_same_key_restart() -> anyhow::Re
                 now_unix_ms: subtract(now, 9_000)?,
                 expires_at_unix_ms: add(now, 60_000)?,
                 minimum_snapshot_at_unix_ms: subtract(now, 24_000)?,
+                distinct_table_owners: false,
             })
             .await?;
         anyhow::ensure!(
@@ -290,6 +291,7 @@ async fn live_sql_hands_crashed_holder_lease_to_same_key_restart() -> anyhow::Re
                 now_unix_ms: at,
                 expires_at_unix_ms: add(at, 60_000)?,
                 minimum_snapshot_at_unix_ms: subtract(at, 15_000)?,
+                distinct_table_owners: false,
             })
         };
 

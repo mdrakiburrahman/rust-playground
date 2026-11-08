@@ -1225,6 +1225,7 @@ mod tests {
                 now_unix_ms: observed,
                 expires_at_unix_ms: UnixMillis::new(observed.get() + 60_000).expect("expiry"),
                 minimum_snapshot_at_unix_ms: observed,
+                distinct_table_owners: false,
             })
             .await
             .expect("lease")
@@ -2754,6 +2755,7 @@ mod tests {
                 now_unix_ms: observed,
                 expires_at_unix_ms: UnixMillis::new(observed.get() + 60_000).expect("expiry"),
                 minimum_snapshot_at_unix_ms: observed,
+                distinct_table_owners: false,
             })
             .await
             .expect("live lease");

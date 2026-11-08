@@ -660,6 +660,7 @@ fn test_config(listen: SocketAddr, state_directory: String) -> RouterConfig {
             minimum_warmup_bps: 1_000,
             lease_ttl_ms: 300_000,
             readiness_max_staleness_ms: 300_000,
+            distinct_table_owners: false,
         },
         auth: AuthConfig {
             authenticator: "allow_all".to_owned(),

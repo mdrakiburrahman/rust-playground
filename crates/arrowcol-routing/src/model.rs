@@ -481,6 +481,8 @@ pub struct RoutingPolicy {
     pub lease_ttl_ms: u64,
     /// Maximum cached-view age for readiness.
     pub readiness_max_staleness_ms: u64,
+    /// Require each active table lease in a pool to have a distinct collector.
+    pub distinct_table_owners: bool,
 }
 
 impl Default for RoutingPolicy {
@@ -492,6 +494,7 @@ impl Default for RoutingPolicy {
             minimum_warmup_bps: 1_000,
             lease_ttl_ms: 30_000,
             readiness_max_staleness_ms: 30_000,
+            distinct_table_owners: false,
         }
     }
 }

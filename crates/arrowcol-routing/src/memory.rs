@@ -230,6 +230,9 @@ impl RoutingStore for MemoryRoutingStore {
         if let Some(existing) = state.leases.get(&claim.key)
             && existing.is_valid_at(claim.now_unix_ms)
         {
+            if claim.distinct_table_owners {
+                validate_distinct_table_owner(&state, &claim.key, existing.holder_instance_id, claim.now_unix_ms)?;
+            }
             return Ok(existing.clone());
         }
         validate_candidate(
@@ -238,6 +241,9 @@ impl RoutingStore for MemoryRoutingStore {
             claim.key.implementation_pool,
             claim.minimum_snapshot_at_unix_ms,
         )?;
+        if claim.distinct_table_owners {
+            validate_distinct_table_owner(&state, &claim.key, claim.candidate_instance_id, claim.now_unix_ms)?;
+        }
         let (epoch, version) = state.leases.get(&claim.key).map_or((1, 1), |existing| {
             (
                 existing.fencing_epoch.get().saturating_add(1),
@@ -311,6 +317,9 @@ impl RoutingStore for MemoryRoutingStore {
             request.key.implementation_pool,
             request.minimum_snapshot_at_unix_ms,
         )?;
+        if request.distinct_table_owners {
+            validate_distinct_table_owner(&state, &request.key, request.candidate_instance_id, request.now_unix_ms)?;
+        }
         let existing = state
             .leases
             .get_mut(&request.key)
@@ -356,6 +365,9 @@ impl RoutingStore for MemoryRoutingStore {
             ));
         }
         validate_successor(&state, request)?;
+        if request.distinct_table_owners {
+            validate_distinct_table_owner(&state, &request.key, request.successor_instance_id, request.now_unix_ms)?;
+        }
         let lease = RoutingLease {
             key: request.key.clone(),
             lease_id: LeaseId::new(),
@@ -392,6 +404,26 @@ impl MemoryRoutingStore {
             ))
         }
     }
+}
+
+fn validate_distinct_table_owner(
+    state: &MemoryState,
+    key: &crate::LeaseKey,
+    candidate: CollectorInstanceId,
+    now: UnixMillis,
+) -> RoutingResult<()> {
+    if state.leases.values().any(|lease| {
+        lease.key.implementation_pool == key.implementation_pool
+            && lease.key != *key
+            && lease.holder_instance_id == candidate
+            && lease.is_routable_at(now)
+    }) {
+        return Err(RoutingError::new(
+            RoutingErrorKind::Conflict,
+            "collector already owns another active table lease in distinct table-owner mode",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_candidate(

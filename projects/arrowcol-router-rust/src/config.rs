@@ -204,6 +204,9 @@ pub struct RoutingConfig {
     pub lease_ttl_ms: u64,
     /// Maximum cache age reported ready.
     pub readiness_max_staleness_ms: u64,
+    /// Require each active table lease in a pool to have a distinct collector.
+    #[serde(default)]
+    pub distinct_table_owners: bool,
 }
 
 impl RoutingConfig {
@@ -225,6 +228,7 @@ impl RoutingConfig {
             minimum_warmup_bps: self.minimum_warmup_bps,
             lease_ttl_ms: self.lease_ttl_ms,
             readiness_max_staleness_ms: self.readiness_max_staleness_ms,
+            distinct_table_owners: self.distinct_table_owners,
         })
     }
 }
@@ -277,4 +281,22 @@ pub struct TelemetryConfig {
     pub log_filter: String,
     /// Emit JSON log records.
     pub json_logs: bool,
+}
+
+#[cfg(test)]
+mod routing_policy_tests {
+    use super::{RouterConfig, RoutingConfig};
+
+    #[test]
+    fn distinct_table_owners_is_opt_in_and_enabled_for_loadtest() {
+        let defaults = RouterConfig::from_yaml(include_bytes!("../config.yaml"))
+            .unwrap_or_else(|error| panic!("parse default router configuration: {error}"));
+        assert!(!defaults.routing.distinct_table_owners);
+
+        let loadtest: serde_yaml::Value = serde_yaml::from_slice(include_bytes!("../../loadtest/config/router.yaml"))
+            .unwrap_or_else(|error| panic!("parse loadtest router configuration: {error}"));
+        let routing: RoutingConfig = serde_yaml::from_value(loadtest["routing"].clone())
+            .unwrap_or_else(|error| panic!("parse loadtest routing policy: {error}"));
+        assert!(routing.distinct_table_owners);
+    }
 }

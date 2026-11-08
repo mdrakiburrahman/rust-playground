@@ -29,18 +29,26 @@ fn gauge(current: u64, limit: u64) -> PressureGauge {
 }
 
 fn table() -> TableIdentity {
+    table_named("traces")
+}
+
+fn table_named(name: &str) -> TableIdentity {
     TableIdentity::new(
         CatalogName::new("telemetry").unwrap_or_else(|error| panic!("invalid catalog: {error}")),
         SchemaName::new("prod").unwrap_or_else(|error| panic!("invalid schema: {error}")),
-        TableName::new("traces").unwrap_or_else(|error| panic!("invalid table: {error}")),
+        TableName::new(name).unwrap_or_else(|error| panic!("invalid table: {error}")),
     )
 }
 
 fn metadata() -> IngestMetadata {
+    metadata_for("traces")
+}
+
+fn metadata_for(name: &str) -> IngestMetadata {
     IngestMetadata::new(
         ProtocolVersion::CURRENT,
         ImplementationPool::Dataflow,
-        table(),
+        table_named(name),
         ClaimedSchemaFingerprint::new(SchemaFingerprint::from_bytes([7; 32])),
     )
 }
@@ -247,6 +255,81 @@ async fn two_router_replicas_converge_on_one_sql_winner() {
     assert_eq!(left_route.instance_id, right_route.instance_id);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn distinct_owner_policy_partitions_concurrent_table_claims() {
+    let (store, _, _) = seeded_store().await;
+    let policy = RoutingPolicy {
+        distinct_table_owners: true,
+        ..RoutingPolicy::default()
+    };
+    let left_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);
+    let right_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);
+    let left = Arc::new(
+        RoutingEngine::new(left_store, policy.clone()).unwrap_or_else(|error| panic!("create left engine: {error}")),
+    );
+    let right = Arc::new(
+        RoutingEngine::new(right_store, policy).unwrap_or_else(|error| panic!("create right engine: {error}")),
+    );
+    left.refresh(millis(100_000))
+        .await
+        .unwrap_or_else(|error| panic!("refresh left: {error}"));
+    right
+        .refresh(millis(100_000))
+        .await
+        .unwrap_or_else(|error| panic!("refresh right: {error}"));
+
+    let left_task = {
+        let left = Arc::clone(&left);
+        tokio::spawn(async move { left.route_ingest(&metadata_for("table_a"), millis(100_001)).await })
+    };
+    let right_task = {
+        let right = Arc::clone(&right);
+        tokio::spawn(async move { right.route_ingest(&metadata_for("table_b"), millis(100_001)).await })
+    };
+    let left_route = left_task
+        .await
+        .unwrap_or_else(|error| panic!("left task failed: {error}"))
+        .unwrap_or_else(|error| panic!("left route failed: {error}"));
+    let right_route = right_task
+        .await
+        .unwrap_or_else(|error| panic!("right task failed: {error}"))
+        .unwrap_or_else(|error| panic!("right route failed: {error}"));
+    assert_ne!(left_route.instance_id, right_route.instance_id);
+
+    let third = left.route_ingest(&metadata_for("table_c"), millis(100_002)).await;
+    assert_eq!(third.unwrap_err().kind(), RoutingErrorKind::PoolUnavailable);
+}
+
+#[tokio::test]
+async fn distinct_owner_store_rejects_conflicting_table_claims() {
+    let (store, first, _) = seeded_store().await;
+    let first_table = LeaseKey::new(ImplementationPool::Dataflow, table_named("table_a"));
+    store
+        .claim_lease(&LeaseClaim {
+            key: first_table,
+            candidate_instance_id: first,
+            now_unix_ms: millis(100_001),
+            expires_at_unix_ms: millis(130_001),
+            minimum_snapshot_at_unix_ms: millis(99_000),
+            distinct_table_owners: true,
+        })
+        .await
+        .unwrap_or_else(|error| panic!("claim first table: {error}"));
+
+    let conflict = store
+        .claim_lease(&LeaseClaim {
+            key: LeaseKey::new(ImplementationPool::Dataflow, table_named("table_b")),
+            candidate_instance_id: first,
+            now_unix_ms: millis(100_002),
+            expires_at_unix_ms: millis(130_002),
+            minimum_snapshot_at_unix_ms: millis(99_000),
+            distinct_table_owners: true,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(conflict.kind(), RoutingErrorKind::Conflict);
+}
+
 #[tokio::test]
 async fn valid_lease_winner_does_not_depend_on_a_losing_candidate() {
     let (store, first, second) = seeded_store().await;
@@ -258,6 +341,7 @@ async fn valid_lease_winner_does_not_depend_on_a_losing_candidate() {
             now_unix_ms: millis(100_001),
             expires_at_unix_ms: millis(130_001),
             minimum_snapshot_at_unix_ms: millis(99_000),
+            distinct_table_owners: false,
         })
         .await
         .unwrap_or_else(|error| panic!("claim initial lease: {error}"));
@@ -273,6 +357,7 @@ async fn valid_lease_winner_does_not_depend_on_a_losing_candidate() {
             now_unix_ms: millis(100_003),
             expires_at_unix_ms: millis(130_003),
             minimum_snapshot_at_unix_ms: millis(99_000),
+            distinct_table_owners: false,
         })
         .await
         .unwrap_or_else(|error| panic!("read authoritative lease winner: {error}"));
@@ -706,6 +791,7 @@ impl CrashedHolder {
                 now_unix_ms: millis(100_001),
                 expires_at_unix_ms: millis(100_001 + lease_ttl_ms),
                 minimum_snapshot_at_unix_ms: millis(99_000),
+                distinct_table_owners: false,
             })
             .await
             .unwrap_or_else(|error| panic!("claim crashed holder lease: {error}"));
@@ -739,6 +825,7 @@ impl CrashedHolder {
             now_unix_ms: millis(now),
             expires_at_unix_ms: millis(now + LONG_LEASE_TTL_MS),
             minimum_snapshot_at_unix_ms: millis(now - RoutingPolicy::default().pressure.max_snapshot_age_ms),
+            distinct_table_owners: false,
         }
     }
 
@@ -927,6 +1014,7 @@ async fn succession_rejects_expired_lease() {
             now_unix_ms: request.now_unix_ms,
             expires_at_unix_ms: request.expires_at_unix_ms,
             minimum_snapshot_at_unix_ms: request.minimum_snapshot_at_unix_ms,
+            distinct_table_owners: false,
         })
         .await
         .unwrap_or_else(|error| panic!("claim expired lease: {error}"));

@@ -136,7 +136,7 @@ impl RoutingEngine {
     /// required lease compare-and-set fails.
     pub async fn route_ingest(&self, metadata: &IngestMetadata, now: UnixMillis) -> RoutingResult<RouteAssignment> {
         let key = LeaseKey::new(metadata.implementation_pool(), metadata.table().clone());
-        let view = self.view.read().await.clone().ok_or_else(|| {
+        let mut view = self.view.read().await.clone().ok_or_else(|| {
             RoutingError::new(
                 RoutingErrorKind::PoolUnavailable,
                 "routing cache has not completed an initial load",
@@ -145,6 +145,14 @@ impl RoutingEngine {
 
         if let Some(lease) = view.leases.get(&key) {
             if lease.is_routable_at(now) {
+                if self.policy.distinct_table_owners
+                    && has_other_active_table_lease(&view, &key, lease.holder_instance_id, now)
+                {
+                    return Err(RoutingError::new(
+                        RoutingErrorKind::PoolUnavailable,
+                        "active table lease conflicts with distinct table-owner policy",
+                    ));
+                }
                 return assignment_for_lease(&view, lease, now, &self.policy, RouteSource::CachedLease);
             }
             if lease.is_valid_at(now) && lease.state == LeaseState::Draining {
@@ -155,22 +163,47 @@ impl RoutingEngine {
             }
         }
 
-        let candidate = rank_collectors(&view, &key, now, &self.policy, false)
-            .into_iter()
-            .next()
-            .ok_or_else(|| RoutingError::new(RoutingErrorKind::PoolUnavailable, "no eligible collector"))?;
-        let lease = self
-            .store
-            .claim_lease(&LeaseClaim {
-                key: key.clone(),
-                candidate_instance_id: candidate,
-                now_unix_ms: now,
-                expires_at_unix_ms: add_millis(now, self.policy.lease_ttl_ms)?,
-                minimum_snapshot_at_unix_ms: subtract_millis(now, self.policy.pressure.max_snapshot_age_ms)?,
-            })
-            .await?;
-        let updated = self.cache_lease(lease.clone()).await?;
-        assignment_for_lease(&updated, &lease, now, &self.policy, RouteSource::LeaseClaim)
+        for _ in 0..view.collectors.len().max(1) {
+            let candidate = rank_collectors(&view, &key, now, &self.policy, false)
+                .into_iter()
+                .find(|candidate| {
+                    !self.policy.distinct_table_owners || !has_other_active_table_lease(&view, &key, *candidate, now)
+                })
+                .ok_or_else(|| {
+                    RoutingError::new(
+                        RoutingErrorKind::PoolUnavailable,
+                        "no eligible collector is available for a distinct table lease",
+                    )
+                })?;
+            let result = self
+                .store
+                .claim_lease(&LeaseClaim {
+                    key: key.clone(),
+                    candidate_instance_id: candidate,
+                    now_unix_ms: now,
+                    expires_at_unix_ms: add_millis(now, self.policy.lease_ttl_ms)?,
+                    minimum_snapshot_at_unix_ms: subtract_millis(now, self.policy.pressure.max_snapshot_age_ms)?,
+                    distinct_table_owners: self.policy.distinct_table_owners,
+                })
+                .await;
+            match result {
+                Ok(lease) => {
+                    let updated = self.cache_lease(lease.clone()).await?;
+                    return assignment_for_lease(&updated, &lease, now, &self.policy, RouteSource::LeaseClaim);
+                }
+                Err(error) if self.policy.distinct_table_owners && error.kind() == RoutingErrorKind::Conflict => {
+                    view = self.refresh(now).await?;
+                    if let Some(lease) = view.leases.get(&key).filter(|lease| lease.is_routable_at(now)) {
+                        return assignment_for_lease(&view, lease, now, &self.policy, RouteSource::CachedLease);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(RoutingError::new(
+            RoutingErrorKind::PoolUnavailable,
+            "no eligible collector is available for a distinct table lease",
+        ))
     }
 
     /// Selects a healthy catalog-capable backend for explicit Flight SQL control.
@@ -249,6 +282,7 @@ impl RoutingEngine {
                         now_unix_ms: now,
                         expires_at_unix_ms: add_millis(now, self.policy.lease_ttl_ms)?,
                         minimum_snapshot_at_unix_ms: subtract_millis(now, self.policy.pressure.max_snapshot_age_ms)?,
+                        distinct_table_owners: self.policy.distinct_table_owners,
                     })
                     .await
                 {
@@ -271,7 +305,11 @@ impl RoutingEngine {
                         .is_some_and(|collector| collector_is_eligible(collector, now, &self.policy, false));
                     let has_alternative = rank_collectors(&view, &lease.key, now, &self.policy, false)
                         .into_iter()
-                        .any(|candidate| candidate != lease.holder_instance_id);
+                        .any(|candidate| {
+                            candidate != lease.holder_instance_id
+                                && (!self.policy.distinct_table_owners
+                                    || !has_other_active_table_lease(&view, &lease.key, candidate, now))
+                        });
                     // Draining without a transfer target would only strand the table.
                     if !holder_is_safe && has_alternative {
                         match self
@@ -300,7 +338,11 @@ impl RoutingEngine {
                     }
                     let candidate = rank_collectors(&view, &lease.key, now, &self.policy, false)
                         .into_iter()
-                        .find(|candidate| *candidate != lease.holder_instance_id);
+                        .find(|candidate| {
+                            *candidate != lease.holder_instance_id
+                                && (!self.policy.distinct_table_owners
+                                    || !has_other_active_table_lease(&view, &lease.key, *candidate, now))
+                        });
                     let Some(candidate) = candidate else {
                         continue;
                     };
@@ -316,6 +358,7 @@ impl RoutingEngine {
                                 now,
                                 self.policy.pressure.max_snapshot_age_ms,
                             )?,
+                            distinct_table_owners: self.policy.distinct_table_owners,
                         })
                         .await
                     {
@@ -349,6 +392,20 @@ impl RoutingEngine {
         *guard = Some(Arc::clone(&updated));
         Ok(updated)
     }
+}
+
+fn has_other_active_table_lease(
+    view: &RoutingView,
+    key: &LeaseKey,
+    instance_id: CollectorInstanceId,
+    now: UnixMillis,
+) -> bool {
+    view.leases.values().any(|lease| {
+        lease.key.implementation_pool == key.implementation_pool
+            && lease.key != *key
+            && lease.holder_instance_id == instance_id
+            && lease.is_routable_at(now)
+    })
 }
 
 fn assignment_for_lease(

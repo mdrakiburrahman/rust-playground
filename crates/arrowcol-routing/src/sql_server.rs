@@ -599,8 +599,20 @@ impl RoutingStore for RawSqlStore {
                 .await
                 .map_err(|cause| database_error("begin lease claim", cause))?;
             let result = async {
+                if claim.distinct_table_owners {
+                    lock_distinct_table_owner_pool(&mut client, claim.key.implementation_pool).await?;
+                }
                 if let Some(existing) = select_locked_lease(&mut client, &claim.key).await? {
                     if existing.is_valid_at(claim.now_unix_ms) {
+                        if claim.distinct_table_owners {
+                            verify_distinct_table_owner(
+                                &mut client,
+                                &claim.key,
+                                existing.holder_instance_id,
+                                claim.now_unix_ms,
+                            )
+                            .await?;
+                        }
                         return Ok(existing);
                     }
                     verify_candidate(
@@ -611,6 +623,15 @@ impl RoutingStore for RawSqlStore {
                         claim.now_unix_ms,
                     )
                     .await?;
+                    if claim.distinct_table_owners {
+                        verify_distinct_table_owner(
+                            &mut client,
+                            &claim.key,
+                            claim.candidate_instance_id,
+                            claim.now_unix_ms,
+                        )
+                        .await?;
+                    }
                     let epoch = existing.fencing_epoch.next().map_err(|cause| {
                         RoutingError::new(
                             RoutingErrorKind::CorruptState,
@@ -640,6 +661,15 @@ impl RoutingStore for RawSqlStore {
                         claim.now_unix_ms,
                     )
                     .await?;
+                    if claim.distinct_table_owners {
+                        verify_distinct_table_owner(
+                            &mut client,
+                            &claim.key,
+                            claim.candidate_instance_id,
+                            claim.now_unix_ms,
+                        )
+                        .await?;
+                    }
                     insert_lease(&mut client, claim).await
                 }
             }
@@ -720,6 +750,9 @@ impl RoutingStore for RawSqlStore {
                 .await
                 .map_err(|cause| database_error("begin routing lease transfer", cause))?;
             let result = async {
+                if request.distinct_table_owners {
+                    lock_distinct_table_owner_pool(&mut client, request.key.implementation_pool).await?;
+                }
                 let existing = select_locked_lease(&mut client, &request.key)
                     .await?
                     .ok_or_else(|| RoutingError::new(RoutingErrorKind::Conflict, "routing lease was not found"))?;
@@ -737,6 +770,15 @@ impl RoutingStore for RawSqlStore {
                     request.now_unix_ms,
                 )
                 .await?;
+                if request.distinct_table_owners {
+                    verify_distinct_table_owner(
+                        &mut client,
+                        &request.key,
+                        request.candidate_instance_id,
+                        request.now_unix_ms,
+                    )
+                    .await?;
+                }
                 let epoch = existing.fencing_epoch.next().map_err(|cause| {
                     RoutingError::new(
                         RoutingErrorKind::CorruptState,
@@ -782,6 +824,9 @@ impl RoutingStore for RawSqlStore {
                 .await
                 .map_err(|cause| database_error("begin routing lease succession", cause))?;
             let result = async {
+                if request.distinct_table_owners {
+                    lock_distinct_table_owner_pool(&mut client, request.key.implementation_pool).await?;
+                }
                 let existing = select_locked_lease(&mut client, &request.key)
                     .await?
                     .ok_or_else(|| RoutingError::new(RoutingErrorKind::Conflict, "routing lease was not found"))?;
@@ -813,6 +858,15 @@ impl RoutingStore for RawSqlStore {
                         error
                     }
                 })?;
+                if request.distinct_table_owners {
+                    verify_distinct_table_owner(
+                        &mut client,
+                        &request.key,
+                        request.successor_instance_id,
+                        request.now_unix_ms,
+                    )
+                    .await?;
+                }
                 let epoch = existing.fencing_epoch.next().map_err(|cause| {
                     RoutingError::new(
                         RoutingErrorKind::CorruptState,
@@ -1004,6 +1058,64 @@ async fn select_locked_lease(client: &mut SqlClient, key: &LeaseKey) -> RoutingR
         .await
         .map_err(|cause| database_error("read locked routing lease", cause))?;
     row.as_ref().map(lease_from_row).transpose()
+}
+
+async fn lock_distinct_table_owner_pool(
+    client: &mut SqlClient,
+    implementation_pool: arrowcol_protocol::ImplementationPool,
+) -> RoutingResult<()> {
+    let resource = format!("arrowcol:distinct-table-owner:{implementation_pool}");
+    let row = client
+        .query(
+            "DECLARE @lock_result int; EXEC @lock_result = sys.sp_getapplock @Resource=@P1, @LockMode='Exclusive', @LockOwner='Transaction', @LockTimeout=5000; SELECT @lock_result AS lock_result;",
+            &[&resource],
+        )
+        .await
+        .map_err(|cause| database_error("lock distinct table-owner pool", cause))?
+        .into_row()
+        .await
+        .map_err(|cause| database_error("read distinct table-owner pool lock", cause))?;
+    if row.and_then(|row| row.get::<i32, _>(0)).is_none_or(|result| result < 0) {
+        return Err(RoutingError::new(
+            RoutingErrorKind::PoolUnavailable,
+            "could not acquire the distinct table-owner pool lock",
+        ));
+    }
+    Ok(())
+}
+
+async fn verify_distinct_table_owner(
+    client: &mut SqlClient,
+    key: &LeaseKey,
+    candidate: CollectorInstanceId,
+    now: UnixMillis,
+) -> RoutingResult<()> {
+    let holder = candidate.as_uuid();
+    let now = datetime(now)?;
+    let row = client
+        .query(
+            "SELECT TOP (1) 1 FROM arrowcol.routing_table_leases WITH (UPDLOCK, HOLDLOCK) WHERE implementation_pool=@P1 AND holder_instance_id=@P2 AND state='active' AND expires_at_utc>@P3 AND NOT (catalog_name=@P4 AND schema_name=@P5 AND table_name=@P6);",
+            &[
+                &key.implementation_pool.to_string(),
+                &holder,
+                &now,
+                &key.table.catalog().as_str(),
+                &key.table.schema().as_str(),
+                &key.table.table().as_str(),
+            ],
+        )
+        .await
+        .map_err(|cause| database_error("check distinct table-owner assignment", cause))?
+        .into_row()
+        .await
+        .map_err(|cause| database_error("read distinct table-owner assignment", cause))?;
+    if row.is_some() {
+        return Err(RoutingError::new(
+            RoutingErrorKind::Conflict,
+            "collector already owns another active table lease in distinct table-owner mode",
+        ));
+    }
+    Ok(())
 }
 
 async fn insert_lease(client: &mut SqlClient, claim: &LeaseClaim) -> RoutingResult<RoutingLease> {
