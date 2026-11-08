@@ -169,6 +169,12 @@ export function checkVerifiedReceipt(file: string): JsonRecord {
   assert.deepEqual(images.map(image => image.project).sort(), [...PUBLISHED_RUNTIME_IMAGE_PROJECTS].sort());
   return receipt;
 }
+export function validatePullRequest(value: JsonRecord, sha: string): void {
+  assert.equal(value.state, 'open');
+  assert.equal(value.merged_at, null, 'Pull request must remain unmerged');
+  assert.equal(typeof value.draft, 'boolean');
+  assert.equal(record(value.head, 'PR head').sha, sha);
+}
 export function derivedCloudInput(values: Record<string, string>, group: string): Record<string, string> {
   if (group === 'rust-playground-schema-evo' || !is_schema_evolution_group(group))
     throw new Error('A dedicated schema-evolution resource group is required.');
@@ -352,9 +358,8 @@ class Rehearsal {
   }
   async github(sha: string): Promise<void> {
     const pr = record(JSON.parse(await this.command('pull-request', ['gh', 'api', `repos/${REPO}/pulls/76`,
-      '--jq', '{number,state,draft,head:{sha:.head.sha},html_url}'], 60)) as unknown, 'PR');
-    assert.equal(pr.state, 'open'); assert.equal(pr.draft, true);
-    assert.equal(record(pr.head, 'PR head').sha, sha);
+      '--jq', '{number,state,draft,merged_at,head:{sha:.head.sha},html_url}'], 60)) as unknown, 'PR');
+    validatePullRequest(pr, sha);
     const runs = records(JSON.parse(await this.command('workflow-inventory', ['gh', 'run', 'list', '-R', REPO,
       '--commit', sha, '--limit', '100', '--json', 'databaseId,workflowName,status,conclusion,headSha,url'], 60)) as unknown, 'runs');
     const inventory: JsonRecord = {};

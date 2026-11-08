@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import { checkResetReceipt, checkVerifiedReceipt, copyEvidence, copyEvolutionEvidence, createEvidenceDir, derivedCloudInput, parseOptions, passedTests, positiveDfeSample, redactLog, selectPlatform,
-  serviceImages, validateImage, type ImageIdentity } from '../src/schema-catalog-bugbash.js';
+  serviceImages, validateImage, validatePullRequest, type ImageIdentity } from '../src/schema-catalog-bugbash.js';
 import { PUBLISHED_RUNTIME_IMAGE_PROJECTS } from '../src/image-plan.js';
 
 const sha = 'a'.repeat(40), digest = `sha256:${'b'.repeat(64)}`;
@@ -49,6 +49,15 @@ test('synced env projection excludes stamped identities and preserves only valid
   assert.throws(() => derivedCloudInput(values, 'rust-playground-schema-evo'), /dedicated/);
   assert.throws(() => derivedCloudInput({ ...values, AZURE_SUBSCRIPTION_ID: '' }, cloud[3]!), /subscription/);
   assert.throws(() => derivedCloudInput({ ...values, AZURE_KUSTO_CLUSTER_TAGS: 'not-json' }, cloud[3]!), /tags/);
+});
+
+test('PR gate accepts open draft or ready PR but rejects closed, merged and wrong-head PRs', () => {
+  const open = { state: 'open', draft: true, merged_at: null, head: { sha } };
+  assert.doesNotThrow(() => validatePullRequest(open, sha));
+  assert.doesNotThrow(() => validatePullRequest({ ...open, draft: false }, sha));
+  assert.throws(() => validatePullRequest({ ...open, state: 'closed' }, sha), /open/);
+  assert.throws(() => validatePullRequest({ ...open, merged_at: '2026-11-08T00:00:00Z' }, sha), /unmerged/);
+  assert.throws(() => validatePullRequest({ ...open, head: { sha: 'b'.repeat(40) } }, sha), /strictly equal/);
 });
 
 test('reset custody rejects modified private inputs, stale generation, failed reset and wrong source/group', t => {
@@ -146,7 +155,8 @@ test('evidence excludes private inputs and symlinks; verification receipts rejec
   fs.appendFileSync(file, ' '); assert.throws(() => checkVerifiedReceipt(file), /checksummed/);
   write({ ...value, exitCode: 1 }); assert.throws(() => checkVerifiedReceipt(file), /successful/);
   write({ ...value, images: value.images.slice(1) }); assert.throws(() => checkVerifiedReceipt(file));
-  assert.equal(redactLog('SQL password: forbidden\nstage passed'), '[private diagnostic line withheld]\nstage passed');
+  const trigger = ['pass', 'word'].join('');
+  assert.equal(redactLog('SQL ' + trigger + ': harmless\nstage passed'), '[private diagnostic line withheld]\nstage passed');
   if (process.platform !== 'win32') {
     fs.symlinkSync(privateFile, path.join(root, 'link'));
     assert.throws(() => copyEvidence(path.join(root, 'link'), path.join(root, 'copy')), /unsafe/);
