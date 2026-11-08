@@ -122,10 +122,16 @@ fn subscriber(dir: &Path, id: &SubscriberId) -> Result<Subscriber> {
     })
 }
 
+/// Returns whether a real directory contains a regular CLI ownership marker.
+pub(crate) fn has_cli_marker(dir: &Path) -> bool {
+    std::fs::symlink_metadata(dir).is_ok_and(|metadata| metadata.is_dir())
+        && std::fs::symlink_metadata(dir.join(MARKER_FILE)).is_ok_and(|metadata| metadata.is_file())
+}
+
 /// Refuses to write to a directory quiver-cli did not create, so a writer
 /// never opens a live collector's directory next to the collector.
 pub(crate) fn require_cli_dir(dir: &Path) -> Result<()> {
-    if dir.join(MARKER_FILE).is_file() {
+    if has_cli_marker(dir) {
         return Ok(());
     }
     if !dir.exists() {

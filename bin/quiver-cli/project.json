@@ -5,6 +5,7 @@
   "projectType": "application",
   "implicitDependencies": [
     "arrowcol-catalog",
+    "arrowcol-catalog-client",
     "arrowcol-protocol"
   ],
   "namedInputs": {

@@ -48,26 +48,65 @@ fn dfe_durable_buffer_walkthrough() -> Result {
     );
     let segments = run(&["segments"], &dir)?;
     assert!(segments.contains("3,546 rows"), "{segments}");
-    assert!(segments.contains("schema sha256:"), "{segments}");
+    assert!(
+        segments.contains("telemetry.sqlserver.sqlserver_wait_stats v1"),
+        "{segments}"
+    );
     let shown = run(&["show", "--columns", "customer_id,wait_type,wait_time_ms"], &dir)?;
-    for fact in ["customer-0000", "ASYNC_IO_COMPLETION", "id 0, slot 46"] {
+    for fact in [
+        "customer-0000",
+        "ASYNC_IO_COMPLETION",
+        "id 0, slot 46",
+        "telemetry.sqlserver.sqlserver_wait_stats v1",
+    ] {
         assert!(shown.contains(fact), "show output lacks {fact:?}:\n{shown}");
     }
+    assert!(
+        !shown.contains("table 0"),
+        "show decoded the envelope identity:\n{shown}"
+    );
     assert!(
         !shown.contains("machine_name"),
         "--columns selects displayed fields:\n{shown}"
     );
 
     let consumed = run(&["consume", "--ack", "1"], &dir)?;
-    assert!(consumed.contains("durable-buffer acknowledged"), "{consumed}");
+    assert!(consumed.contains("durable-buffer acknowledged 1 bundles"), "{consumed}");
     assert!(run(&["tree"], &dir)?.contains("quiver.sub.durable-buffer"));
 
-    let crashed = run(&["crash", "--bundles", "5"], &dir)?;
-    assert!(crashed.contains("fsynced to the WAL"), "{crashed}");
+    let crashed = run(&["crash", "--bundles", "21"], &dir)?;
+    assert!(
+        crashed.contains("bundle 21 fsynced to the WAL and acknowledged"),
+        "{crashed}"
+    );
     assert!(crashed.contains("child ended by signal 9"), "{crashed}");
-    assert!(run(&["wal"], &dir)?.contains("WAL only"));
+    let wal = run(&["wal"], &dir)?;
+    assert!(
+        wal.contains("21 WAL only"),
+        "crash must leave 21 replayable bundles:\n{wal}"
+    );
+    assert!(wal.contains("telemetry.sqlserver.sqlserver_wait_stats v1"), "{wal}");
+    let last_wal = run(&["show", "--wal", "48", "--rows", "2"], &dir)?;
+    assert!(
+        last_wal.contains("telemetry.sqlserver.sqlserver_wait_stats v1"),
+        "{last_wal}"
+    );
+    assert!(last_wal.contains("128 rows"), "{last_wal}");
+
     let recovered = run(&["recover"], &dir)?;
-    assert!(recovered.contains("replay"), "{recovered}");
+    assert!(recovered.contains("21 WAL-only entries"), "{recovered}");
+    assert!(recovered.contains("21 bundles, 2,688 rows"), "{recovered}");
+    let segments = run(&["segments"], &dir)?;
+    assert!(
+        segments.contains("49 bundles, 6,234 rows"),
+        "all acknowledged and replayed rows remain:\n{segments}"
+    );
+    let _ = run(&["recover"], &dir)?;
+    let segments_after_repeat = run(&["segments"], &dir)?;
+    assert!(
+        segments_after_repeat.contains("49 bundles, 6,234 rows"),
+        "recovery is idempotent:\n{segments_after_repeat}"
+    );
     assert!(run(&["wal"], &dir)?.contains("0 WAL only"));
     Ok(())
 }

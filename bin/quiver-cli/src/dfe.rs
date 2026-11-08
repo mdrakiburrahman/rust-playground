@@ -4,7 +4,8 @@ use std::time::SystemTime;
 
 use anyhow::{Context, Result, bail};
 use arrow::record_batch::RecordBatch;
-use arrowcol_catalog::CatalogSchemaVersion;
+use arrowcol_catalog::{CatalogSchemaVersion, SchemaVersion};
+use arrowcol_protocol::TableIdentity;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use otel_arrow_dfe_quiver::record_bundle::{BundleDescriptor, PayloadRef, RecordBundle, SlotDescriptor, SlotId};
@@ -113,7 +114,7 @@ impl DfeManifest {
             .map(|table| {
                 decode_envelope(&table.schema_id).map_or_else(
                     || format!("table {}", table.table_id),
-                    |envelope| format!("{} v{}", envelope.table, envelope.target_schema_version),
+                    |envelope| format!("{} v{}", envelope.table, envelope.target_schema_version.get()),
                 )
             })
             .collect::<Vec<_>>()
@@ -123,8 +124,8 @@ impl DfeManifest {
 
 #[derive(Deserialize)]
 struct EnvelopeSummary {
-    table: String,
-    target_schema_version: u32,
+    table: TableIdentity,
+    target_schema_version: SchemaVersion,
 }
 
 fn decode_envelope(schema_id: &str) -> Option<EnvelopeSummary> {
@@ -133,8 +134,8 @@ fn decode_envelope(schema_id: &str) -> Option<EnvelopeSummary> {
     serde_json::from_slice(&bytes).ok()
 }
 
-pub(crate) fn schema_description(schema_id: &str) -> Option<(String, u32)> {
-    decode_envelope(schema_id).map(|envelope| (envelope.table, envelope.target_schema_version))
+pub(crate) fn schema_description(schema_id: &str) -> Option<(String, u64)> {
+    decode_envelope(schema_id).map(|envelope| (envelope.table.to_string(), envelope.target_schema_version.get()))
 }
 
 pub(crate) struct DfeRecordBundle {
