@@ -32,7 +32,8 @@ routing:
   minimum_warmup_bps: 9500
   lease_ttl_ms: 86400000
   readiness_max_staleness_ms: 30000
-  distinct_table_owners: true
+  # This fixture has one DFE collector; exclusive table ownership needs multiple replicas.
+  distinct_table_owners: false
 
 auth:
   authenticator: allow_all
