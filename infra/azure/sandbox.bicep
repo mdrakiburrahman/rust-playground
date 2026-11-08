@@ -70,7 +70,7 @@ resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
 }
 
 // Disposable data must really disappear on reset, not remain as retained copies.
-resource blobs 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01' = {
+resource blobs 'Microsoft.Storage/storageAccounts/blobServices@2025-08-01' = {
   parent: storage
   name: 'default'
   properties: {
@@ -172,7 +172,6 @@ resource runtimeExperimentWriter 'Microsoft.Authorization/roleAssignments@2022-0
 resource runtimeWebsiteWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (azureMode == 'stamped') {
   name: guid(website.id, identity.id, 'runtime-static-site-contributor')
   scope: website
-  dependsOn: [blobs]
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
     principalId: identity.properties.principalId
