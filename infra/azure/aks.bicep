@@ -120,6 +120,27 @@ resource registryReaderRole 'Microsoft.Authorization/roleAssignments@2022-04-01'
   properties: { roleDefinitionId: readerRole, principalId: sharedIdentity.properties.principalId, principalType: 'ServicePrincipal' }
 }
 
+var userAgentPoolProfiles = [for userPool in aksConfig.userPools: {
+  name: userPool.name
+  osDiskSizeGB: 100
+  enableAutoScaling: true
+  count: userPool.initialCount
+  minCount: userPool.minCount
+  maxCount: userPool.maxCount
+  maxPods: userPool.maxPods
+  vmSize: userPool.vmSize
+  osType: 'Linux'
+  mode: 'User'
+  vnetSubnetID: nodeSubnet.id
+  enableFIPS: true
+  osSKU: 'AzureLinux'
+  availabilityZones: userPool.availabilityZones
+  nodeTaints: []
+  nodeLabels: { type: 'benchmark' }
+  upgradeSettings: { maxSurge: '33%' }
+  securityProfile: { sshAccess: 'Disabled' }
+}]
+
 resource aks 'Microsoft.ContainerService/managedClusters@2026-05-01' = {
   name: clusterName
   location: location
@@ -153,26 +174,7 @@ resource aks 'Microsoft.ContainerService/managedClusters@2026-05-01' = {
       nodeLabels: { type: 'general' }
       upgradeSettings: { maxSurge: '33%' }
       securityProfile: { sshAccess: 'Disabled' }
-    }], [for userPool in aksConfig.userPools: {
-      name: userPool.name
-      osDiskSizeGB: 100
-      enableAutoScaling: true
-      count: userPool.initialCount
-      minCount: userPool.minCount
-      maxCount: userPool.maxCount
-      maxPods: userPool.maxPods
-      vmSize: userPool.vmSize
-      osType: 'Linux'
-      mode: 'User'
-      vnetSubnetID: nodeSubnet.id
-      enableFIPS: true
-      osSKU: 'AzureLinux'
-      availabilityZones: userPool.availabilityZones
-      nodeTaints: []
-      nodeLabels: { type: 'benchmark' }
-      upgradeSettings: { maxSurge: '33%' }
-      securityProfile: { sshAccess: 'Disabled' }
-    }])
+    }], userAgentPoolProfiles)
     aadProfile: { managed: true, enableAzureRBAC: true }
     oidcIssuerProfile: { enabled: true }
     securityProfile: { workloadIdentity: { enabled: true } }
