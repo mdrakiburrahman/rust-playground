@@ -3,8 +3,8 @@
 //! Locally the emulator reads the committed Delta snapshots directly through `kind=delta`
 //! external tables with a one-minute `MaxAge` acceleration policy; no rows are copied. In Azure
 //! mode the provisioned external tables are only queried. Correctness is checked twice per table:
-//! once through the non-accelerated fallback (`MaxAge` override of one second) and once through the
-//! accelerated cache after it reports complete, fresh, and eligible state for the captured commit.
+//! once with a one-second `MaxAge` override (not proof of a physical-source read) and once through
+//! the accelerated cache after it reports complete, fresh, and eligible state for the captured commit.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -745,6 +745,9 @@ impl Exposure {
                 );
             } else {
                 if self.client.mode == Mode::Local {
+                    if inventory.files.is_empty() {
+                        continue;
+                    }
                     self.client.expose(&name, &table_location(pool, table)?).await?;
                 }
                 self.schemas.insert(name.clone(), inventory.schema.clone());
@@ -1599,7 +1602,7 @@ pub(crate) async fn validate(
                         .await?;
                     fallback
                         .check(&corpus)
-                        .with_context(|| format!("non-accelerated fallback differs from Delta for {name}"))?;
+                        .with_context(|| format!("MaxAge-overridden external query differs from Delta for {name}"))?;
                     fallback_timer.finish(true);
                     let policy_timer = bound.timings.measure(format!("policy/{name}"));
                     let (policy, max_age) = client.max_age(&name).await?;
@@ -2529,6 +2532,17 @@ mod tests {
             )]),
         };
         let live = AtomicBool::new(true);
+        let mut empty = snapshot.clone();
+        let empty_table = empty.tables.get_mut(table).context("table")?;
+        empty_table.version = 0;
+        empty_table.files.clear();
+        exposure.sync("dataflow", &empty, &live).await?;
+        exposure.sync("dataflow", &empty, &live).await?;
+        assert_eq!(definitions.load(Ordering::Relaxed), 0);
+        assert_eq!(policies.load(Ordering::Relaxed), 0);
+        assert!(exposure.schemas.is_empty());
+        assert!(exposure.status.live_tables.is_empty());
+        assert!(exposure.status.tables.is_empty());
         exposure.sync("dataflow", &snapshot, &live).await?;
         let mut optimized = snapshot.clone();
         optimized.tables.get_mut(table).context("table")?.files = vec!["compacted.parquet".to_owned()];

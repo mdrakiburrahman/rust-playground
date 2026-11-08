@@ -295,9 +295,13 @@ checkpoint-container metadata fence and occupancy CAS.
 
 Correct query counts alone do not prove an accelerated index is ready.
 Qualification must record native QAP cache state/statistics and compare both
-cached and deliberately fresh fallback queries with the complete independent
-Delta row multiset. `MaxAge` limits acceptable index staleness; it is not a
-refresh-cadence guarantee. OPTIMIZE rewrites require reacceleration, which is not
+cached and one-second `MaxAge`-overridden queries with the complete independent
+Delta row multiset. Historical `fallback` report fields identify the overridden
+query, not proof of a physical-source read: Kusto may still use an index refreshed
+within that age. Positive counts during generation and final native acceleration,
+hydration, version and row-correctness assertions remain separate required gates.
+`MaxAge` limits acceptable index staleness; it is not a refresh-cadence guarantee.
+OPTIMIZE rewrites require reacceleration, which is not
 by itself proof of a whole-table reset.
 See the public [query acceleration policy](https://learn.microsoft.com/en-us/kusto/management/query-acceleration-policy)
 and [troubleshooting guide](https://learn.microsoft.com/en-us/kusto/management/query-acceleration-troubleshooting-guide)
@@ -520,10 +524,11 @@ external_table('dataflow_sqlserver_wait_stats')
 ```
 
 Committed Parquet files become queryable incrementally while generation runs.
-Tables may be pending until their first Delta commit; readiness of the cluster
+Local external tables are first bound after their first committed data files,
+not the catalog's empty CREATE commit; readiness of the cluster
 does not establish cache eligibility. Native QAP uses `MaxAge=00:01:00`;
 validation waits within its declared timeout for actual eligible cache statistics
-and checks both the cached query and the one-second fallback against the oracle.
+and checks both the cached query and the one-second `MaxAge` override against the oracle.
 The native cached gate keeps a fixed five-minute deadline, shortened to the
 remaining absolute validation budget. The runner retains its 600-second hard
 backstop and gives validation 570 seconds, reserving 30 seconds for a failed
