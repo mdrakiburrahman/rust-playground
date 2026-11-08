@@ -300,6 +300,9 @@ Delta row multiset. Historical `fallback` report fields identify the overridden
 query, not proof of a physical-source read: Kusto may still use an index refreshed
 within that age. Positive counts during generation and final native acceleration,
 hydration, version and row-correctness assertions remain separate required gates.
+Generation-active `live_tables`/`live_observed` mean positive rows were returned
+by the one-second override query during measurement, not that those rows were read
+from physical Delta files at query time.
 Query logs report `read_path: remote-reads-observed` only when native
 `external_data.iterated_artifacts` or `downloaded_items` is positive. Missing or
 zero counters report `unproven`: they prove neither remote reads nor acceleration.

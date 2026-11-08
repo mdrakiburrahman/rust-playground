@@ -636,7 +636,7 @@ fn live_table_coverage(expected: &BTreeSet<String>, observed: &BTreeSet<String>)
     let unexpected = observed.difference(expected).cloned().collect::<Vec<_>>();
     ensure!(
         missing.is_empty() && unexpected.is_empty(),
-        "generation-active native Kusto source-row evidence is incomplete: missing Dataflow tables {missing:?}; unexpected tables {unexpected:?}"
+        "generation-active native Kusto positive-row visibility is incomplete: missing Dataflow tables {missing:?}; unexpected tables {unexpected:?}"
     );
     Ok(())
 }
@@ -1696,7 +1696,7 @@ pub(crate) async fn validate(
     live_table_coverage(&expected_tables, &status.live_tables)?;
     ensure!(
         status.live_observed,
-        "native Kusto status did not record complete generation-active source-row evidence"
+        "native Kusto status did not record complete generation-active positive-row visibility"
     );
     status.state = "healthy".to_owned();
     status.backend = BACKEND.to_owned();
