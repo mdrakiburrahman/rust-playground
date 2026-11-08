@@ -8,7 +8,7 @@
 | Ownership mode | Selection | Safety |
 | --- | --- | --- |
 | Stamped (default) | `bootstrap.ts <command> --stamp-config <private YAML>` | Main's exact `arrow-collector-rg`, stamp, AKS/ACR/network and identity checks remain mandatory. |
-| Schema evolution only | `bootstrap.ts <command> --mode schema-evolution --env-file .env.schema-evo.private` | Only the already approved `rust-playground-schema-evo`; original subscription:RG hash/account. Rejects stamp/AKS/ACR input; does not deploy stamped resources or convert authority. |
+| Schema evolution only | `bootstrap.ts <command> --mode schema-evolution --env-file .env.schema-evo.private` | Default group or dedicated `rust-playground-schema-evo-<suffix>` (lowercase alphanumeric/hyphen suffix); subscription:RG hash isolates resources. Rejects stamp/AKS/ACR input; does not deploy stamped resources or convert authority. |
 
 The isolated flag applies to **every** command, including config, status,
 reset, recovery, preflight and provision. Inspect the selected private input

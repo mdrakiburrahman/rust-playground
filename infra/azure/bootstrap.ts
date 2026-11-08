@@ -71,6 +71,9 @@ function normalized_uuid(value: string): string {
 }
 export type AzureMode = 'stamped' | 'schema-evolution';
 export const SCHEMA_EVOLUTION_GROUP = 'rust-playground-schema-evo';
+export function is_schema_evolution_group(value: string): boolean {
+  return value.length <= 90 && /^rust-playground-schema-evo(?:-[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)?$/.test(value);
+}
 export function azure_mode(value: string): AzureMode {
   if (value !== 'stamped' && value !== 'schema-evolution') throw new Failure('Azure mode must be stamped or schema-evolution.');
   return value;
@@ -104,9 +107,10 @@ export class Config {
           (/^AZURE_(STAMP$|AKS_|KUBERNETES_|CONTAINER_REGISTRY_|UAMI_)/.test(key) ||
             ['AZURE_CLIENT_ID', 'AZURE_TENANT_ID', 'AZURE_FEDERATED_TOKEN_FILE'].includes(key))))
         throw new Failure('Schema-evolution mode rejects stamp, AKS, ACR and workload identity configuration.');
-      if (values.AZURE_RESOURCE_GROUP !== SCHEMA_EVOLUTION_GROUP)
-        throw new Failure('Schema-evolution mode requires the exact approved isolated resource group.');
-      this.group = SCHEMA_EVOLUTION_GROUP;
+      const group = values.AZURE_RESOURCE_GROUP;
+      if (!group || !is_schema_evolution_group(group))
+        throw new Failure('Schema-evolution mode requires a dedicated rust-playground-schema-evo resource group.');
+      this.group = group;
       this.sandbox = createHash('sha256').update(this.subscription + ':' + this.group).digest('hex').slice(0, 12);
       this.location = get('AZURE_LOCATION', 'eastus2');
       if (this.location !== 'eastus2') throw new Failure('Only the qualified eastus2 region is authorized.');

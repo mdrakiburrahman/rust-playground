@@ -8,7 +8,7 @@ import { createInterface } from 'node:readline';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
-import { Azure, Config, identity_principal, load_env, occupancy } from '../../../infra/azure/bootstrap.ts';
+import { Azure, Config, identity_principal, is_schema_evolution_group, load_env, occupancy } from '../../../infra/azure/bootstrap.ts';
 import { PublisherControl } from '../../../infra/azure/publisher_control.ts';
 import { runExperiment, runProcess, type StageContext } from '../../../tools/libs/experiment-kit/src/experiment.js';
 import { deletePrefix } from '../../azure-qap/src/fixtures.ts';
@@ -128,8 +128,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   const config = local ? undefined : new Config(values, 'schema-evolution');
   if (config && config.sandbox !== baseConfig!.sandbox)
     throw new Error('Ready environment changed the explicitly selected isolated sandbox identity.');
-  if (config && (config.group !== 'rust-playground-schema-evo' || !values.ARROWCOL_RESET_GENERATION))
-    throw new Error('Azure requires the separately named schema-evo stamp and its genuinely exported ready generation.');
+  if (config && (!is_schema_evolution_group(config.group) || !values.ARROWCOL_RESET_GENERATION))
+    throw new Error('Azure requires a dedicated schema-evo group and its genuinely exported ready generation.');
   const azure = config ? new Azure(config) : undefined;
   const root = local ? path.join(out, 'warehouse') :
     `abfss://${config!.experimentContainer}@${config!.account}.dfs.core.windows.net/runs/${runId}`;

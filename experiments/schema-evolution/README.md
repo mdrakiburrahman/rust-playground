@@ -95,9 +95,11 @@ Fresh full provision generates the 13-root manifest and ready output itself.
 `--mode schema-evolution` is mandatory for every isolated bootstrap command
 (including read-only `config`/`status`, reset, recovery and occupancy), private
 launcher and Azure scenario. The default bootstrap remains stamped and requires
-the validated stamp YAML. Isolated mode never loads that YAML: it accepts only
-`rust-playground-schema-evo`, keeps the original subscription:RG hash and
-rejects stamp/AKS/ACR configuration or foreign accounts. Generated outputs carry
+the validated stamp YAML. Isolated mode never loads that YAML: it accepts
+`rust-playground-schema-evo` or a dedicated
+`rust-playground-schema-evo-<suffix>` group (lowercase alphanumeric/hyphen
+suffix, alphanumeric at both ends, at most 90 characters), keeps the
+subscription:RG hash and rejects stamp/AKS/ACR configuration or foreign accounts. Generated outputs carry
 `ARROWCOL_AZURE_MODE=schema-evolution` for the initializer and Rust consumers;
 that value alone cannot select the TypeScript mode. It does not adopt or migrate
 existing authority. No new Azure run is implied by a source-only verification.

@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
-import { Config, load_env, run_tree } from '../../../infra/azure/bootstrap.ts';
+import { Config, is_schema_evolution_group, load_env, run_tree } from '../../../infra/azure/bootstrap.ts';
 
 const WORKSPACE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const CLI_CONTEXT = new Set(['AZURE_CONFIG_DIR', 'AZURE_EXTENSION_DIR']);
@@ -9,8 +9,8 @@ const CLI_CONTEXT = new Set(['AZURE_CONFIG_DIR', 'AZURE_EXTENSION_DIR']);
 export function privateEnvironment(values: Record<string, string>, ambient: NodeJS.ProcessEnv, mode: string): NodeJS.ProcessEnv {
   if (mode !== 'schema-evolution') throw new Error('Private Nx requires explicit --mode schema-evolution.');
   const config = new Config(values, 'schema-evolution');
-  if (config.group !== 'rust-playground-schema-evo')
-    throw new Error('Private Nx execution requires the isolated schema-evo resource group.');
+  if (!is_schema_evolution_group(config.group))
+    throw new Error('Private Nx execution requires a dedicated schema-evo resource group.');
   const env = { ...ambient };
   for (const key of Object.keys(env)) if (/^(AZURE_|ARROWCOL_)/.test(key) && !CLI_CONTEXT.has(key)) delete env[key];
   return { ...env, ...values, ...config.generated(), NX_LOAD_DOT_ENV_FILES: 'false' };

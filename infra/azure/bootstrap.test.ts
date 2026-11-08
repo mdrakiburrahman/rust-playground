@@ -72,6 +72,29 @@ test('named sandbox isolates resource identities and generated configuration pre
   assert.throws(() => new b.Config({ ...values, ARROWCOL_AZURE_TABLE_ROOT: azure.c.table_root }, 'schema-evolution'), b.Failure);
   assert.throws(() => b.owned({ tags: azure.tags }, c), b.Failure);
 });
+test('dedicated schema-evolution groups derive disjoint storage, cluster, identity and authority paths', () => {
+  const groups = ['rust-playground-schema-evo-qualification-20261108', 'rust-playground-schema-evo-isolated-2'];
+  const configs = groups.map(group => new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_RESOURCE_GROUP: group }, 'schema-evolution'));
+  const [first, second] = configs;
+  assert.equal(first.group, groups[0]); assert.equal(second.group, groups[1]);
+  assert.notEqual(first.sandbox, second.sandbox);
+  assert.notEqual(first.account, second.account);
+  assert.notEqual(first.cluster, second.cluster);
+  assert.equal(first.identity, second.identity);
+  assert.notEqual(first.identity_id, second.identity_id);
+  assert.notEqual(first.storage_id, second.storage_id);
+  assert.notEqual(first.cluster_id, second.cluster_id);
+  assert.notEqual(first.generated().ARROWCOL_AZURE_TABLE_ROOT, second.generated().ARROWCOL_AZURE_TABLE_ROOT);
+  assert.notEqual(first.generated().ARROWCOL_AZURE_CHECKPOINT_ROOT, second.generated().ARROWCOL_AZURE_CHECKPOINT_ROOT);
+  assert.equal(first.generated().AZURE_RESOURCE_GROUP, groups[0]);
+  assert.equal(second.generated().AZURE_RESOURCE_GROUP, groups[1]);
+  for (const group of ['rust-playground', 'rust-playground-other', 'Rust-playground-schema-evo-x',
+    'rust-playground-schema-evo--bad', 'rust-playground-schema-evo-bad-',
+    'rust-playground-schema-evo_' + 'a'.repeat(64), 'rust-playground-schema-evo-' + 'a'.repeat(64)])
+    assert.throws(() => new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_RESOURCE_GROUP: group }, 'schema-evolution'), b.Failure);
+  const longest = 'rust-playground-schema-evo-' + 'a'.repeat(63);
+  assert.equal(new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_RESOURCE_GROUP: longest }, 'schema-evolution').group, longest);
+});
 test('isolated mode is explicit and rejects dual configuration, account substitution and foreign authority', async () => {
   const values = { AZURE_SUBSCRIPTION_ID: SUB, AZURE_RESOURCE_GROUP: b.SCHEMA_EVOLUTION_GROUP };
   const c = new b.Config(values, 'schema-evolution');

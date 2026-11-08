@@ -53,15 +53,17 @@ process death releases the lock without treating a stale PID file as ownership.
 names, Kusto endpoint and canonical `abfss://` data/checkpoint roots. The runner
 loads `.env`, then `.env.azure`, then explicit process-environment overrides.
 Default names derive from the validated positive integer stamp in
-`arrow-collector-rg`. The explicit schema-evolution mode retains the normalized
-subscription:RG hash only for `rust-playground-schema-evo`; it never selects
-another `rust-playground-<suffix>` group. `config` does not contact Azure and is
-not deployment proof.
+`arrow-collector-rg`. The explicit schema-evolution mode retains the normalized subscription:RG
+hash for `rust-playground-schema-evo` or a dedicated
+`rust-playground-schema-evo-<suffix>` group (lowercase alphanumeric/hyphen
+suffix, alphanumeric at both ends; Azure's 90-character resource-group limit).
+It never selects an unrelated group. `config` does not contact Azure and is not
+deployment proof.
 
 | Stamp selection | Configuration | Safety boundary |
 | --- | --- | --- |
 | Stamped default | Validated `--stamp-config <private YAML>` | Main's exact group, stamp and AKS/ACR/network/identity policy. |
-| Approved schema-evolution sandbox | `--mode schema-evolution --env-file .env.schema-evo.private` | Exact `rust-playground-schema-evo` only; no stamp/AKS/ACR inputs, foreign account or authority adoption. |
+| Approved schema-evolution sandbox | `--mode schema-evolution --env-file .env.schema-evo.private` | Default group or dedicated `rust-playground-schema-evo-<suffix>`; hash-isolated resources, no stamp/AKS/ACR inputs, foreign account or authority adoption. |
 
 The isolated mode flag is mandatory on every bootstrap command shown below
 when operating on schema evolution, including status, preflight, reset,
