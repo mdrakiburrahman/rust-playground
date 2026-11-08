@@ -65,7 +65,10 @@ test('configured existing federation subject is used by every runtime phase', as
     const objects = await renderRuntime(c, phase);
     for (const object of objects) {
       if (object.kind !== 'Namespace') assert.equal(object.metadata.namespace, c.namespace);
-      if (object.spec?.template) assert.equal(object.spec.template.spec.serviceAccountName, c.serviceAccount);
+      if (object.spec?.template) {
+        assert.equal(object.spec.template.spec.serviceAccountName, c.serviceAccount);
+        assert.equal(object.spec.template.spec.enableServiceLinks, false);
+      }
       if (object.kind === 'ServiceAccount') {
         assert.equal(object.metadata.name, c.serviceAccount);
         assert.equal(object.metadata.annotations['azure.workload.identity/client-id'], c.workloadIdentityClientId);

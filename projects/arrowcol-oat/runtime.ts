@@ -88,6 +88,7 @@ export async function renderRuntime(input: unknown, phase: Phase): Promise<Resou
     metadata: { labels: { app: name, 'app.kubernetes.io/part-of': 'arrowcol-oat', ...(identity ? { 'azure.workload.identity/use': 'true' } : {}) } },
     spec: {
       serviceAccountName: serviceAccount, automountServiceAccountToken: false,
+      enableServiceLinks: false,
       nodeSelector: { type: 'benchmark', 'kubernetes.io/arch': 'amd64' },
       securityContext: { fsGroup: 10001, fsGroupChangePolicy: 'OnRootMismatch', seccompProfile: { type: 'RuntimeDefault' } },
       terminationGracePeriodSeconds: 360, containers, volumes,
