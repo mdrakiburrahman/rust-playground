@@ -453,6 +453,7 @@ fn real_catalog_ddl_discovery_refreshes_policy_without_idle_writes() -> Result<(
         state_dir: root.path().join("catalog"),
         ddl_dir: None,
         retained_events: 16,
+        ingestion_layout: false,
     }))?;
     let listener = runtime.block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))?;
     let endpoint = format!("http://{}", listener.local_addr()?);
