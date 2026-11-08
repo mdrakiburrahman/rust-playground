@@ -108,6 +108,30 @@ fn dfe_durable_buffer_walkthrough() -> Result {
         "recovery is idempotent:\n{segments_after_repeat}"
     );
     assert!(run(&["wal"], &dir)?.contains("0 WAL only"));
+
+    let regenerated = run(
+        &["generate", "--catalog-endpoint", "memory", "--batch-rows", "256"],
+        &dir,
+    )?;
+    assert!(regenerated.contains("generated"), "{regenerated}");
+    let replaced = run(&["segments"], &dir)?;
+    assert!(
+        replaced.contains("14 bundles, 3,546 rows"),
+        "old buffers were not replaced:\n{replaced}"
+    );
+    assert!(
+        !replaced.contains("49 bundles"),
+        "old recovery data remains:\n{replaced}"
+    );
+    let marker: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("quiver-cli.json"))?)?;
+    assert_eq!(marker["generation_status"], "complete");
+    assert_eq!(marker["bundles"], 14);
+    assert_eq!(marker["rows"], 3_546);
+    let regenerated_rows = run(&["show", "--columns", "customer_id"], &dir)?;
+    assert!(
+        regenerated_rows.contains("customer-0000"),
+        "regenerated storage is readable:\n{regenerated_rows}"
+    );
     Ok(())
 }
 

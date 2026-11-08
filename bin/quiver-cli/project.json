@@ -6,6 +6,7 @@
   "implicitDependencies": [
     "arrowcol-catalog",
     "arrowcol-catalog-client",
+    "arrowcol-dataflow-components",
     "arrowcol-protocol"
   ],
   "namedInputs": {

@@ -123,6 +123,7 @@ fn prepare(dir: &Path, marker: &Value) -> Result<()> {
     validate_destination(dir)?;
     if has_cli_marker(dir) {
         fs::remove_dir_all(dir).with_context(|| format!("replace {}", dir.display()))?;
+        fs::create_dir(dir).with_context(|| format!("recreate {}", dir.display()))?;
     } else if !dir.exists() {
         let parent = dir
             .parent()

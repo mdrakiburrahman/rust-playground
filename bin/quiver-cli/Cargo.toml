@@ -25,6 +25,9 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 uuid = { version = "1", features = ["v4", "v5"] }
 
 [dev-dependencies]
+arrowcol-dataflow-components = { path = "../../crates/arrowcol-dataflow-components" }
+otel-arrow-dfe-config = { path = "../../submodules/otel-arrow/rust/otap-dataflow/crates/config" }
+otel-arrow-dfe-pdata = { path = "../../submodules/otel-arrow/rust/otap-dataflow/crates/pdata" }
 assert_cmd.workspace = true
 predicates.workspace = true
 tempfile = "3"
