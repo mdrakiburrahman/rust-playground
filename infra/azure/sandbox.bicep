@@ -209,7 +209,7 @@ resource writeData 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
 resource cluster 'Microsoft.Kusto/clusters@2024-04-13' = {
   name: clusterName
   location: location
-  tags: union(clusterTags, ownership)
+  tags: union(clusterTags, ownership, azureMode == 'schema-evolution' ? { 'NRMS.KustoPlatform.Classification.1P': 'Corp' } : {})
   identity: {
     type: 'UserAssigned'
     userAssignedIdentities: {

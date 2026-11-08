@@ -5,7 +5,8 @@ cd "$(dirname "$0")/../../.."
 case "$ARROWCOL_AZURE_MODE" in
   stamped) ;;
   schema-evolution)
-    [[ "${AZURE_RESOURCE_GROUP:-}" == "rust-playground-schema-evo" && ! -v AZURE_STAMP ]] ||
+    group="${AZURE_RESOURCE_GROUP:-}"
+    [[ "$group" =~ ^rust-playground-schema-evo(-[a-z0-9]([a-z0-9-]*[a-z0-9])?)?$ && ${#group} -le 90 && ! -v AZURE_STAMP ]] ||
       { echo "Invalid isolated Azure ownership configuration" >&2; exit 1; }
     ;;
   *) echo "Invalid Azure ownership mode" >&2; exit 1 ;;

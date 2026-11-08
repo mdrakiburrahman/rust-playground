@@ -20,9 +20,14 @@ test('private Nx environment removes shared Azure roots and generations while pr
   assert.match(env.ARROWCOL_AZURE_TABLE_ROOT!, /arrowcol582e3df61d82/);
   assert.equal(env.NX_LOAD_DOT_ENV_FILES, 'false');
   assert.equal(env.ARROWCOL_AZURE_MODE, 'schema-evolution');
+  const dedicatedValues = { ...values, AZURE_RESOURCE_GROUP: 'rust-playground-schema-evo-qualification-20261108' };
+  const dedicatedEnv = privateEnvironment(dedicatedValues, {}, 'schema-evolution');
+  assert.equal(dedicatedEnv.AZURE_RESOURCE_GROUP, dedicatedValues.AZURE_RESOURCE_GROUP);
+  assert.notEqual(dedicatedEnv.AZURE_STORAGE_ACCOUNT, env.AZURE_STORAGE_ACCOUNT);
+  assert.notEqual(dedicatedEnv.ARROWCOL_AZURE_CHECKPOINT_ROOT, env.ARROWCOL_AZURE_CHECKPOINT_ROOT);
   assert.equal(env.AZURE_STAMP, undefined);
   assert.throws(() => privateEnvironment(values, {}, 'stamped'), /explicit/);
-  assert.throws(() => privateEnvironment({ ...values, AZURE_RESOURCE_GROUP: 'rust-playground' }, {}, 'schema-evolution'), /isolated/);
+  assert.throws(() => privateEnvironment({ ...values, AZURE_RESOURCE_GROUP: 'rust-playground' }, {}, 'schema-evolution'), /dedicated/);
   assert.throws(() => privateEnvironment({ ...values, AZURE_STAMP: '1' }, {}, 'schema-evolution'), /rejects/);
 });
 

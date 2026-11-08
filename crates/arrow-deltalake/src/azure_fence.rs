@@ -81,14 +81,23 @@ fn valid_metadata(metadata: &BTreeMap<String, String>) -> std::result::Result<()
 }
 
 fn sandbox_identity(subscription: &str, group: Option<&str>) -> Result<String> {
-    if group != Some("rust-playground-schema-evo") {
-        bail!("Schema-evolution mode requires the exact approved isolated resource group");
+    const GROUP: &str = "rust-playground-schema-evo";
+    const GROUP_PREFIX: &str = "rust-playground-schema-evo-";
+    let group = group.context("Schema-evolution mode requires a dedicated resource group")?;
+    let valid_group = group == GROUP
+        || group.strip_prefix(GROUP_PREFIX).is_some_and(|suffix| {
+            let bytes = suffix.as_bytes();
+            let alphanumeric = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+            group.len() <= 90
+                && bytes.first().is_some_and(|byte| alphanumeric(*byte))
+                && bytes.last().is_some_and(|byte| alphanumeric(*byte))
+                && bytes.iter().all(|byte| alphanumeric(*byte) || *byte == b'-')
+        });
+    if !valid_group {
+        bail!("Schema-evolution mode requires a dedicated rust-playground-schema-evo resource group");
     }
     let subscription = normalized_subscription(subscription)?;
-    let digest = format!(
-        "{:x}",
-        Sha256::digest(format!("{subscription}:rust-playground-schema-evo"))
-    );
+    let digest = format!("{:x}", Sha256::digest(format!("{subscription}:{group}")));
     Ok(digest[..12].to_owned())
 }
 
@@ -423,6 +432,10 @@ mod tests {
             sandbox_identity(subscription, Some("rust-playground-schema-evo"))?,
             "582e3df61d82"
         );
+        assert_eq!(
+            sandbox_identity(subscription, Some("rust-playground-schema-evo-qualification-20261108"))?,
+            "b34995dd4053"
+        );
         for normalized in [
             "00000000000000000000000000000001",
             "{00000000-0000-0000-0000-000000000001}",
@@ -467,6 +480,11 @@ mod tests {
             "",
             "production",
             "rust-playground-",
+            "rust-playground-schema-evo-",
+            "rust-playground-schema-evo--bad",
+            "rust-playground-schema-evo-Bad",
+            "rust-playground-schema-evo-bad-",
+            "rust-playground-schema-evo-..",
             "rust-playground--evo",
             "Rust-playground-evo",
             "rust-playground-../other",
@@ -475,6 +493,13 @@ mod tests {
             assert!(sandbox_identity(GENERATION, Some(group)).is_err(), "{group}");
         }
         assert!(sandbox_identity(GENERATION, Some(&format!("rust-playground-{}", "a".repeat(80)))).is_err());
+        assert!(
+            sandbox_identity(
+                GENERATION,
+                Some(&format!("rust-playground-schema-evo-{}", "a".repeat(80)))
+            )
+            .is_err()
+        );
         for subscription in [
             "",
             "default",
@@ -490,10 +515,17 @@ mod tests {
     fn configured_group_does_not_adopt_foreign_authority() -> Result<()> {
         let subscription = "00000000-0000-0000-0000-000000000001";
         let expected = sandbox_identity(subscription, Some("rust-playground-schema-evo"))?;
+        let dedicated = sandbox_identity(subscription, Some("rust-playground-schema-evo-qualification-20261108"))?;
+        assert_ne!(expected, dedicated);
         let mut metadata = authority("ready-v1");
         metadata.insert("sandboxid".into(), expected.clone());
         assert!(Registry::parse(&metadata, &expected).is_ok());
+        assert!(Registry::parse(&metadata, &dedicated).is_err());
         assert!(Registry::parse(&metadata, &sandbox_ownership(subscription, None)?).is_err());
+        let mut dedicated_metadata = authority("ready-v1");
+        dedicated_metadata.insert("sandboxid".into(), dedicated.clone());
+        assert!(Registry::parse(&dedicated_metadata, &dedicated).is_ok());
+        assert!(Registry::parse(&dedicated_metadata, &expected).is_err());
         assert!(
             Registry::parse(
                 &metadata,
@@ -516,6 +548,19 @@ mod tests {
         assert!(configured_ownership(subscription, &account, Some("schema-evolution"), group, Some("1")).is_err());
         assert!(configured_ownership(subscription, "arrowcollector1", Some("schema-evolution"), group, None).is_err());
         assert!(configured_ownership(subscription, &account, Some("schema-evolution"), None, None).is_err());
+        let dedicated_group = Some("rust-playground-schema-evo-qualification-20261108");
+        let dedicated_account = format!("arrowcol{}", sandbox_identity(subscription, dedicated_group)?);
+        assert!(configured_ownership(subscription, &account, Some("schema-evolution"), dedicated_group, None).is_err());
+        assert_eq!(
+            configured_ownership(
+                subscription,
+                &dedicated_account,
+                Some("schema-evolution"),
+                dedicated_group,
+                None
+            )?,
+            sandbox_identity(subscription, dedicated_group)?
+        );
         assert!(configured_ownership(subscription, &account, Some("unknown"), group, None).is_err());
         assert_eq!(
             configured_ownership(subscription, "arrowcollector1", None, None, None)?,
