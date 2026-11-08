@@ -673,7 +673,9 @@ export async function preflight(azure: Azure): Promise<void> {
     'microsoft.managedidentity/userassignedidentities' && resource.name !== c.identity);
   if (legacy.length || extraIdentities.length)
     throw new Failure('Replacement is blocked while legacy resources or additional UAMIs remain in arrow-collector-rg. Preserve Terraform state, Key Vault configuration, role assignments, and publisher FIC consumers before retiring them.');
-  console.log('Azure subscription, AKS version, VM quota, network ranges, and one-identity preflight: ready');
+  console.log(c.mode === 'stamped' ?
+    'Azure subscription, AKS version, VM quota, network ranges, and one-identity preflight: ready' :
+    'Azure subscription and exact isolated resource inventory preflight: ready (no AKS/ACR checks)');
 }
 export async function guard_existing(azure: Azure): Promise<void> {
   const c = azure.c;
