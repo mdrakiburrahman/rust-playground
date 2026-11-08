@@ -38,8 +38,8 @@ impl Default for AppState {
 }
 
 impl AppState {
-    pub fn try_start_run(&self) -> Result<OwnedSemaphorePermit, ()> {
-        Arc::clone(&self.run_slot).try_acquire_owned().map_err(|_| ())
+    pub fn try_start_run(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.run_slot).try_acquire_owned().ok()
     }
 
     pub async fn update(&self, id: &str, update: impl FnOnce(&mut RunStatus)) {
@@ -62,9 +62,10 @@ mod tests {
     #[test]
     fn allows_only_one_active_run_and_releases_the_slot() {
         let state = AppState::default();
-        let first = state.try_start_run().expect("first run should acquire the slot");
-        assert!(state.try_start_run().is_err());
+        let first = state.try_start_run();
+        assert!(first.is_some());
+        assert!(state.try_start_run().is_none());
         drop(first);
-        assert!(state.try_start_run().is_ok());
+        assert!(state.try_start_run().is_some());
     }
 }

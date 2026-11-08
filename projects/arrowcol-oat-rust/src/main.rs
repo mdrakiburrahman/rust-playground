@@ -75,7 +75,7 @@ async fn start_run(
             }),
         )
     })?;
-    let permit = state.try_start_run().map_err(|()| {
+    let permit = state.try_start_run().ok_or_else(|| {
         (
             StatusCode::CONFLICT,
             Json(ApiError {

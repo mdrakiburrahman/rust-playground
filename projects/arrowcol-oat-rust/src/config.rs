@@ -29,6 +29,11 @@ pub struct OatConfig {
 }
 
 impl OatConfig {
+    /// Validates the benchmark inputs before any cluster or storage operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a setting is invalid or a requested DMV table is unsupported.
     pub fn validate(&self) -> Result<()> {
         for (field, value) in [
             ("namespace", self.namespace.as_str()),
@@ -76,7 +81,7 @@ impl OatConfig {
             bail!("replica_counts must contain exactly the initial values 1 and 2");
         }
         if self.dfe_worker_concurrency.len() != 2
-            || self.dfe_worker_concurrency.iter().any(|value| *value == 0)
+            || self.dfe_worker_concurrency.contains(&0)
             || self
                 .dfe_worker_concurrency
                 .iter()

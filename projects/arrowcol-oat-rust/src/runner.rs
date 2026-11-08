@@ -48,6 +48,12 @@ struct ResourceMetrics {
     memory_bytes: u64,
 }
 
+/// Runs the configured benchmark matrix and publishes its compact results.
+///
+/// # Errors
+///
+/// Returns an error if configuration, Kubernetes operations, measurement, restoration,
+/// or result publication fails.
 pub async fn execute(config: OatConfig, id: &str, state: Arc<AppState>) -> Result<usize> {
     config.validate()?;
     state
@@ -529,7 +535,7 @@ async fn kubectl(config: &OatConfig, args: Vec<&str>, stdin: Option<Vec<u8>>) ->
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    Ok(String::from_utf8(output.stdout).context("kubectl output was not UTF-8")?)
+    String::from_utf8(output.stdout).context("kubectl output was not UTF-8")
 }
 
 async fn publish_results(config: &OatConfig, results: &[OatResult]) -> Result<()> {
