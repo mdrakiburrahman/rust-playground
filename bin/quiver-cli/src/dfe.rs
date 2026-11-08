@@ -276,4 +276,42 @@ mod tests {
         assert!(DfeManifest::decode(&encoded[..encoded.len() - 1]).is_err());
         Ok(())
     }
+
+    #[tokio::test]
+    async fn generated_bundle_decodes_through_the_dfe_envelope_decoder() -> Result<()> {
+        use anyhow::Context;
+        use arrowcol_dataflow_components::{arrowcol_flight_representation, decode_record_set};
+        use otel_arrow_dfe_config::SignalType;
+        use otel_arrow_dfe_pdata::{PdataArrowRecordSet, PdataArrowTable, PdataSchemaId, SchemaFingerprint};
+
+        let table = crate::data::BenchmarkTable::load("memory", crate::data::DEFAULT_TABLE).await?;
+        let batch = crate::data::read_csv(&table.arrow, None, 128)?
+            .into_iter()
+            .next()
+            .context("catalog CSV produced no batch")?;
+        let bundle = DfeRecordBundle::new(&table.schema, batch)?;
+        let manifest = DfeManifest::decode(bundle.metadata().context("missing DFE manifest")?)?;
+        let manifest_table = manifest.tables.first().context("missing DFE table")?;
+        let payload = bundle
+            .payload(SlotId::new(ROOT_SLOT))
+            .context("missing pluggable-Arrow payload")?;
+        let pdata_table = PdataArrowTable::new(
+            manifest_table.table_id,
+            PdataSchemaId::from(manifest_table.schema_id.clone()),
+            SchemaFingerprint::new(manifest_table.fingerprint),
+            payload.batch.clone(),
+        )?;
+        let records = PdataArrowRecordSet::new(
+            arrowcol_flight_representation(),
+            SignalType::Logs,
+            usize::try_from(manifest.root_items)?,
+            [pdata_table],
+        )?;
+        let decoded = decode_record_set(records)?;
+        let decoded = decoded.first().context("DFE decoder returned no tables")?;
+        assert_eq!(&decoded.envelope.table, table.schema.identity());
+        assert_eq!(decoded.envelope.target_schema_version, table.schema.version());
+        assert_eq!(decoded.batch.num_rows(), 128);
+        Ok(())
+    }
 }
