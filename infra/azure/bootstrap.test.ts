@@ -155,6 +155,8 @@ test('isolated preflight uses the same subscription and inventory gates without 
   c.operator = SUB;
   const isolated = new FakeAzure(); isolated.c = c; isolated.tags = { ...b.TAGS, sandboxId: c.sandbox };
   const providers: string[] = [];
+  const messages: string[] = [];
+  mock.method(console, 'log', (message: string) => { messages.push(message); });
   isolated.cli = async (...args) => {
     if (args[0] === 'account') return { id: SUB };
     if (args[0] === 'provider' && args[1] === 'show') {
@@ -168,6 +170,7 @@ test('isolated preflight uses the same subscription and inventory gates without 
   await b.preflight(isolated);
   assert.deepEqual(providers, ['Microsoft.Kusto', 'Microsoft.Storage', 'Microsoft.ManagedIdentity',
     'Microsoft.OperationalInsights', 'Microsoft.Insights']);
+  assert.deepEqual(messages, ['Azure subscription and exact isolated resource inventory preflight: ready (no AKS/ACR checks)']);
 });
 test('network preflight uses supported peering commands and includes remote address spaces', async () => {
   const calls: string[][] = [];
