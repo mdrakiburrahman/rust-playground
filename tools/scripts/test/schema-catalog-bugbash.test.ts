@@ -5,9 +5,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
-import { checkResetReceipt, checkVerifiedReceipt, copyEvidence, copyEvolutionEvidence, createEvidenceDir, derivedCloudInput,
+import { azureAccountCommand, checkResetReceipt, checkVerifiedReceipt, copyEvidence, copyEvolutionEvidence, createEvidenceDir, derivedCloudInput,
   loadtestImageProjects, parseOptions, passedTests, positiveDfeSample, redactLog, serviceImages, validateCiRuns,
-  validateComposeImageCoverage, validateImage, type ImageIdentity } from '../src/schema-catalog-bugbash.js';
+  validateAzureAccount, validateComposeImageCoverage, validateImage, verifyAzureAccount, type ImageIdentity } from '../src/schema-catalog-bugbash.js';
 
 const sha = 'a'.repeat(40), digest = `sha256:${'b'.repeat(64)}`;
 const cloud = ['--subscription', '11111111-1111-1111-1111-111111111111',
@@ -18,6 +18,22 @@ const imageProjects = loadtestImageProjects({ targets: { build: { dependsOn: [
   'reader-build', { projects: ['arrowcol-catalog-rust', 'arrowcol-dataflow-rust', 'arrowcol-router-rust',
     'arrow-tenant-stream', 'delta-maintenance', 'kusto-explorer'], target: 'image' },
 ] } } });
+
+test('Azure account lookup is scoped to the approved subscription and rejects an unavailable target', async () => {
+  const target = cloud[1]!;
+  assert.deepEqual(azureAccountCommand(target), ['az', 'account', 'show', '--subscription', target,
+    '--query', '{id:id,state:state}', '--output', 'json']);
+  validateAzureAccount({ id: target, state: 'Enabled' }, target);
+  assert.throws(() => validateAzureAccount({ id: '22222222-2222-2222-2222-222222222222', state: 'Enabled' }, target), /mismatched/);
+  assert.throws(() => validateAzureAccount({ id: target, state: 'Disabled' }, target), /disabled/);
+  assert.throws(() => validateAzureAccount(null, target));
+  assert.throws(() => azureAccountCommand(''), /UUID/);
+  await verifyAzureAccount(target, async args => {
+    assert.equal(args[args.indexOf('--subscription') + 1], target);
+    return JSON.stringify({ id: target, state: 'Enabled' });
+  });
+  await assert.rejects(verifyAzureAccount(target, async () => { throw new Error('target unavailable'); }), /target unavailable/);
+});
 
 function imageIdentity(project: string): ImageIdentity {
   const repository = `ghcr.io/mdrakiburrahman/rust-playground/${project}`;

@@ -208,6 +208,19 @@ export function derivedCloudInput(values: Record<string, string>, group: string)
   new Config(base, 'schema-evolution');
   return base;
 }
+export function azureAccountCommand(subscription: string): string[] {
+  if (!UUID.test(subscription)) throw new Error('Azure subscription must be a UUID.');
+  return ['az', 'account', 'show', '--subscription', subscription, '--query', '{id:id,state:state}', '--output', 'json'];
+}
+export function validateAzureAccount(value: unknown, subscription: string): void {
+  const account = record(value, 'Azure account');
+  if (typeof account.id !== 'string' || account.id.toLowerCase() !== subscription.toLowerCase() || account.state !== 'Enabled')
+    throw new Error('The approved Azure subscription is unavailable, disabled, or mismatched.');
+}
+export async function verifyAzureAccount(subscription: string, lookup: (command: string[]) => Promise<string>): Promise<void> {
+  const account = JSON.parse(await lookup(azureAccountCommand(subscription))) as unknown;
+  validateAzureAccount(account, subscription);
+}
 export function checkResetReceipt(file: string, workspace: string, group: string): JsonRecord {
   if (group === 'rust-playground-schema-evo' || !is_schema_evolution_group(group))
     throw new Error('Reset receipt must identify a dedicated schema-evolution group.');
@@ -676,9 +689,7 @@ class Rehearsal {
   }
   async azure(reset: boolean): Promise<void> {
     const config = this.cloudInput(), env = privateEnvironment(load_env(this.options.envFile!), this.env, 'schema-evolution');
-    const account = record(JSON.parse(await this.command('azure-account', ['az', 'account', 'show', '--query', '{id:id}',
-      '--output', 'json'], 60, env)) as unknown, 'Azure account');
-    assert.equal(String(account.id).toLowerCase(), config.subscription.toLowerCase(), 'CLI subscription context mismatch');
+    await verifyAzureAccount(config.subscription, argv => this.command('azure-account', argv, 60, env));
     const common = ['npx', '--no-install', 'tsx', 'infra/azure/bootstrap.ts'];
     await this.command('azure-preflight', [...common, 'preflight', '--mode', 'schema-evolution', '--env-file', this.options.envFile!], 900, env);
     if (reset) {
