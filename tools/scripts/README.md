@@ -33,6 +33,26 @@ staged and unstaged tracked changes, deletions, renames, dirty submodules, and
 unexpected nonignored untracked files, with status and diff diagnostics. It is
 not a dependency of local lint: normal authoring need not be committed first.
 
+## Schema catalog bug bash
+
+Run `npx --no-install tsx tools/scripts/src/schema-catalog-bugbash.ts <step>`
+inside the Linux devcontainer. Each step needs a new absolute `--evidence-dir`
+outside the checkout. Stop on nonzero; copy its `evidence.tar`, `receipt.json`,
+and `SHA256SUMS` before recreating the devcontainer.
+
+| Step | Required arguments | Expected result |
+| --- | --- | --- |
+| `verify` | `--expected-sha <full SHA>` | Clean exact draft PR head, green CI/all eight publications, regression/build gates, verified immutable images bound to actual Compose aliases, image smokes, SDK bundles. |
+| `local` | `--verified-receipt <verify/receipt.json>` | Normal then Quiver crash/recovery, native local schema evolution, all 13 table SDK/artifact bundles, preserved private seals and no live attempt writers. |
+| `azure` | `--verified-receipt <verify/receipt.json> --subscription <UUID> --resource-group <dedicated group> --env-file <private base> --ready-env <private ready output>` | Read-only ready-generation preflight, native Azure evolution, owned-process/data cleanup. Never provisions or resets. |
+| `reset` | `--verified-receipt <verify/receipt.json> --subscription <UUID> --resource-group <group> --env-file <private base> --confirm-reset <same group>` | **Destructively resets only the explicitly confirmed isolated group.** Existing ready inputs become stale; obtain a fresh supported provision output before `azure`. |
+
+`verify` requires existing Node dependencies, Docker/Buildx and GHCR pull
+authentication. Azure needs matching Azure CLI subscription context and separate
+approved private base/ready files from supported provisioning. No shared `.env.azure`
+or copied/invented generation is inferred. Local failure stops owned services and
+archives diagnostics without automatically discarding/resetting the original attempt.
+
 ## Registry commands
 
 The registry targets forward arguments to a Commander CLI:
