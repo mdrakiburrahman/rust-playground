@@ -3,13 +3,13 @@
 | File | Purpose |
 | --- | --- |
 | `index.html` | Static, Excel-like heatmap viewer using Hyparquet in the browser, with a live numbered architecture diagram and config-to-stack mapping. |
-| `assets/*.svg` | Official Azure, Rust, and Delta Lake icons used by the live diagram. |
+| `architecture.svg` | Full-width layered architecture displayed on the live page, with embedded official icons and numbered parts 1–6. |
 | `results.parquet` | Sanitized, compact benchmark summary published by the OAT server. |
 | `oat-config.example.json` | Validated configuration template with no credentials. |
-| `architecture.drawio` / `.png` | Editable architecture diagram showing each tunable and its component. |
+| `architecture.drawio` / `architecture.drawio.png` | Editable source and rendered companion for the same layered architecture. |
 | [Runtime setup](RUNTIME.md) | Isolated internal-only Kubernetes stack, image digests, workload identity, SQL bootstrap, secret files and local rehearsal. |
 
-The six numbered stack parts are defined once in the viewer. Their numbers appear beside every OAT JSON field and Parquet result column that they affect, so the diagram, configuration reference, and heatmap stay aligned.
+The viewer's six numbered stack parts match the diagram badges. Their numbers appear beside every OAT JSON field and Parquet result column that they affect. Preserve these IDs and titles when updating the diagram, configuration reference, or heatmap.
 
 ## Parquet contract
 

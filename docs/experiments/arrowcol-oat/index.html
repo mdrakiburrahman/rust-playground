@@ -37,19 +37,8 @@
     h2 { margin: 0 0 8px; font-size: 18px; font-weight: 650; }
     .section-lede { color: #605e5c; margin: 0 0 14px; font-size: 13px; line-height: 1.5; }
     .architecture, .reference { margin: 26px 0 30px; }
-    .architecture-frame { max-width: 900px; margin: 0 auto; overflow-x: auto; background: #fff; }
-    .architecture-frame svg { display: block; min-width: 540px; width: 100%; height: auto; font-family: "Segoe UI", Arial, sans-serif; }
-    .diagram-frame { fill: #fff; stroke: #0078d4; stroke-width: 1.5; }
-    .diagram-title { font-size: 10px; font-weight: 700; fill: #201f1e; }
-    .diagram-subtitle { font-size: 8px; fill: #605e5c; }
-    .zone-label { font-size: 8px; font-weight: 700; }
-    .component-box { fill: #fff; stroke: #8a8886; stroke-width: 1; }
-    .component-heading { font-size: 8px; font-weight: 700; fill: #201f1e; }
-    .component-detail { font-size: 7.5px; fill: #605e5c; }
-    .component-chip { fill: #deecf9; stroke: #71afe5; stroke-width: 1; }
-    .chip-label { font-size: 7px; fill: #004578; }
-    .diagram-legend { font-size: 8px; fill: #605e5c; }
-    .diagram-credit { font-size: 7.5px; font-style: italic; fill: #605e5c; }
+    .architecture-frame { margin: 0 auto; background: #fff; }
+    .architecture-frame img { display: block; width: 100%; height: auto; }
     .part-badge { display: inline-flex; align-items: center; justify-content: center; min-width: 20px; margin: 0 3px 1px 5px; padding: 2px 5px; border: 1px solid #9cc9f0; border-radius: 9px; background: #eff6fc; color: #005a9e; font-size: 10px; font-weight: 700; line-height: 1; vertical-align: middle; }
     .part-name { display: inline; }
     .reference table { min-width: 700px; }
@@ -64,9 +53,9 @@
   <p class="lede">ArrowCol replicas × DFE worker concurrency · results from the published compact Parquet file</p>
   <section class="architecture" aria-labelledby="architecture-title">
     <h2 id="architecture-title">Benchmark architecture</h2>
-    <p class="section-lede">Each numbered column identifies the stack part behind the tunables and result fields below.</p>
+    <p class="section-lede">Numbered parts 1–6 identify where each tunable and result field belongs in the stack below.</p>
     <div class="architecture-frame">
-      <svg id="architecture-diagram" role="img" aria-labelledby="diagram-svg-title diagram-svg-desc" viewBox="0 0 604 324"></svg>
+      <img id="architecture-diagram" src="architecture.svg" width="809" height="585" alt="ArrowCol OAT benchmark architecture. Numbered parts: 1 OAT control plane; 2 DMV client; 3 ArrowCol Catalog Rust; 4 DFE + Delta-Maintenance; 5 Kusto QAP; 6 ADLS Gen2 + site. The operator host controls the AKS stack; table-pinned Arrow streams reach Delta tables and Kusto QAP. Matching numbers identify the configuration fields and result columns below.">
     </div>
   </section>
   <div class="toolbar">
@@ -84,11 +73,12 @@
       <caption>Each row is one table-pinned ArrowCol result. Blue intensity is relative within the published file; exact values remain visible.</caption>
       <thead><tr>
         <th data-result="run_id" scope="col">Run</th><th data-result="replicas" scope="col">ArrowCol replicas</th><th data-result="dfe_worker_concurrency" scope="col">DFE workers</th><th data-result="table" scope="col">Pinned table</th>
-        <th data-result="rows" scope="col">Rows</th><th data-result="duration_ms" scope="col">Duration (ms)</th><th data-result="rows_per_second" scope="col">Rows/s</th><th data-result="cpu_millicores" scope="col">CPU (mCPU)</th><th data-result="memory_bytes" scope="col">Memory (MiB)</th><th data-result="qap_observation_complete" scope="col">QAP complete</th><th data-result="qap_observed_tables" scope="col">QAP tables</th><th data-result="qap_completion_percent" scope="col">QAP complete (%)</th><th data-result="qap_pending_artifacts" scope="col">Pending artifacts</th><th data-result="qap_cached_bytes" scope="col">Cached (MiB)</th><th data-result="qap_unhealthy_catalogs" scope="col">Unhealthy catalogs</th><th data-result="qap_lag_seconds" scope="col">QAP lag (s)</th>
+        <th data-result="rows" scope="col">Rows</th><th data-result="duration_ms" scope="col">Duration (ms)</th><th data-result="rows_per_second" scope="col">Rows/s</th><th data-result="cpu_millicores" scope="col">CPU (mCPU)</th><th data-result="memory_bytes" scope="col">Memory (MiB)</th><th data-result="qap_observation_complete" scope="col">QAP fields complete</th><th data-result="qap_observed_tables" scope="col">QAP tables</th><th data-result="qap_completion_percent" scope="col">QAP complete (%)</th><th data-result="qap_pending_artifacts" scope="col">Pending artifacts</th><th data-result="qap_cached_bytes" scope="col">Cached (MiB)</th><th data-result="qap_unhealthy_catalogs" scope="col">Unhealthy catalogs</th><th data-result="qap_lag_seconds" scope="col">QAP lag (s)</th>
       </tr></thead>
       <tbody id="results"><tr><td class="empty" colspan="16">Loading…</td></tr></tbody>
     </table>
   </div>
+  <p class="note">Duration and throughput measure client admission, not durable Delta/QAP publication. Missing metrics appear as —, not zero. “QAP fields complete” is 1 only when all required telemetry fields were observed; it is separate from QAP completion percentage.</p>
   <p class="note">The static site and its Parquet file are anonymously readable. Only publish approved, nonsensitive benchmark summaries here; never include credentials, raw payloads, or sensitive identifiers. The viewer loads <code>results.parquet</code> from this same origin, so no cross-origin request or CORS rule is required.</p>
   <section class="reference" aria-labelledby="config-reference-title">
     <h2 id="config-reference-title">Configuration reference</h2>
@@ -105,12 +95,12 @@
 const resultUrl = new URL('results.parquet', window.location.href).toString();
 const columns = ['run_id', 'replicas', 'dfe_worker_concurrency', 'table', 'rows', 'duration_ms', 'rows_per_second', 'cpu_millicores', 'memory_bytes', 'qap_observation_complete', 'qap_observed_tables', 'qap_completion_percent', 'qap_pending_artifacts', 'qap_cached_bytes', 'qap_unhealthy_catalogs', 'qap_lag_seconds'];
 const stackParts = [
-  { id: 1, title: 'OAT control plane', zone: 'CONTROL', heading: ['OAT control', 'plane'], detail: ['Rust server', 'validated JSON'], chip: ['apply · observe', 'restore'], icon: 'assets/rust.svg', tone: 'focus' },
-  { id: 2, title: 'DMV client', zone: 'INGEST', heading: ['DMV client'], detail: ['ArrowCol-Data', 'Flow-Rust'], chip: ['parallel Arrow', 'RecordBatch'], icon: 'assets/rust.svg', tone: 'plain' },
-  { id: 3, title: 'ArrowCol Catalog Rust', zone: 'ROUTING', heading: ['ArrowCol', 'Catalog Rust'], detail: ['heuristic-aware', 'router'], chip: ['Linux SQL', 'one table /', 'collector'], chipIcon: 'assets/sql-server.svg', icon: 'assets/rust.svg', tone: 'platform' },
-  { id: 4, title: 'DFE + Delta-Maintenance', zone: 'EXECUTION', heading: ['DFE +', 'Delta-', 'Maintenance'], detail: ['Delta catalog'], chip: ['worker', 'concurrency ·', 'catalog maintenance'], icon: 'assets/delta.svg', tone: 'platform' },
-  { id: 5, title: 'Kusto QAP', zone: 'OBSERVE', heading: ['Kusto QAP'], detail: ['native progress', 'metrics'], chip: ['completion · lag', 'cache'], icon: 'assets/kusto.svg', tone: 'platform' },
-  { id: 6, title: 'ADLS Gen2 + site', zone: 'PUBLISH', heading: ['ADLS Gen2', '+ site'], detail: ['compact Parquet', 'under $web'], chip: ['Hyparquet', 'heatmap'], icon: 'assets/storage.svg', tone: 'focus' }
+  { id: 1, title: 'OAT control plane' },
+  { id: 2, title: 'DMV client' },
+  { id: 3, title: 'ArrowCol Catalog Rust' },
+  { id: 4, title: 'DFE + Delta-Maintenance' },
+  { id: 5, title: 'Kusto QAP' },
+  { id: 6, title: 'ADLS Gen2 + site' }
 ];
 const configFields = [
   ['namespace', [1, 2, 3, 4], 'Kubernetes namespace for the benchmark workloads.'],
@@ -152,26 +142,6 @@ function partBadges(ids) {
   const label = ids.join(' · ');
   return `<span class="part-badge" title="${safeText(partNames(ids))}" aria-label="Stack part${ids.length > 1 ? 's' : ''} ${safeText(ids.join(', '))}">${label}</span>`;
 }
-function renderArchitecture() {
-  const svg = document.querySelector('#architecture-diagram');
-  const columnX = index => 10 + index * 96;
-  const zones = stackParts.map((part, index) => {
-    const x = columnX(index);
-    const fill = part.tone === 'focus' ? '#eff6fc' : part.tone === 'platform' ? '#f3f2f1' : '#fff';
-    const stroke = part.tone === 'focus' ? '#9cc9f0' : part.tone === 'platform' ? '#c8c6c4' : 'none';
-    const labelColor = part.tone === 'focus' ? '#005a9e' : '#323130';
-    const chipTextX = part.chipIcon ? x + 24 : x + 45;
-    const chipAnchor = part.chipIcon ? 'start' : 'middle';
-    const chipIcon = part.chipIcon ? `<image href="${part.chipIcon}" x="${x + 8}" y="163" width="11" height="11" preserveAspectRatio="xMidYMid meet" />` : '';
-    return `<g aria-label="Part ${part.id}: ${safeText(part.title)}"><rect x="${x}" y="33" width="90" height="229" rx="4" fill="${fill}" stroke="${stroke}" stroke-width="1" /><text class="zone-label" x="${x + 8}" y="48" fill="${labelColor}">${part.id} ${safeText(part.zone)}</text><rect class="component-box" x="${x + 5}" y="77" width="80" height="74" rx="6" /><image href="${part.icon}" x="${x + 10}" y="104" width="12" height="12" preserveAspectRatio="xMidYMid meet" /><text class="component-heading" x="${x + 27}" y="${part.heading.length > 2 ? 94 : 100}">${part.heading.map((line, lineIndex) => `<tspan x="${x + 27}" dy="${lineIndex === 0 ? 0 : 9.5}">${safeText(line)}</tspan>`).join('')}</text><text class="component-detail" x="${x + 27}" y="${part.heading.length > 2 ? 126 : part.heading.length === 2 ? 122 : 115}">${part.detail.map((line, lineIndex) => `<tspan x="${x + 27}" dy="${lineIndex === 0 ? 0 : 9}">${safeText(line)}</tspan>`).join('')}</text><rect class="component-chip" x="${x + 5}" y="161" width="80" height="34" rx="4" />${chipIcon}<text class="chip-label" x="${chipTextX}" y="${part.chip.length > 2 ? 171 : 175}" text-anchor="${chipAnchor}">${part.chip.map((line, lineIndex) => `<tspan x="${chipTextX}" dy="${lineIndex === 0 ? 0 : 8.5}">${safeText(line)}</tspan>`).join('')}</text></g>`;
-  }).join('');
-  const arrows = stackParts.slice(0, 4).map((_, index) => {
-    const x = columnX(index);
-    const color = index === 0 ? '#605e5c' : '#0078d4';
-    return `<path d="M ${x + 85} 114 H ${columnX(index + 1) + 4}" fill="none" stroke="${color}" stroke-width="1.2" marker-end="url(#arrow-${index === 0 ? 'control' : 'data'})" />`;
-  }).join('');
-  svg.innerHTML = `<title id="diagram-svg-title">ArrowCol OAT benchmark architecture</title><desc id="diagram-svg-desc">Six numbered stack columns align the OAT control plane, parallel Arrow RecordBatch DMV client, heuristic-aware table-pinned ArrowCol Catalog Rust router, DFE and Delta-Maintenance, Kusto QAP, and ADLS Gen2 site with the configuration and result mappings.</desc><defs><marker id="arrow-data" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#0078d4" /></marker><marker id="arrow-control" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#605e5c" /></marker></defs><rect class="diagram-frame" x="2" y="2" width="600" height="320" rx="12" /><image href="assets/rust.svg" x="18" y="9" width="15" height="15" /><image href="assets/storage.svg" x="38" y="9" width="15" height="15" /><text class="diagram-title" x="61" y="18">ArrowCol OAT benchmark</text><text class="diagram-subtitle" x="61" y="27">ArrowCol replicas × DFE worker concurrency | table-pinned data path to compact Parquet under $web</text>${zones}${arrows}<path d="M 55 151 V 201 Q 55 207 61 207 H 529 Q 535 207 535 201 V 151" fill="none" stroke="#0078d4" stroke-width="1.2" marker-end="url(#arrow-data)" /><rect x="257" y="201" width="90" height="12" fill="#fff" /><text class="diagram-legend" x="302" y="210" text-anchor="middle" fill="#0078d4">compact Parquet</text><path d="M 20 277 H 36" stroke="#0078d4" stroke-width="1.2" marker-end="url(#arrow-data)" /><text class="diagram-legend" x="42" y="280">data flow / publish</text><path d="M 133 277 H 149" stroke="#605e5c" stroke-width="1.2" marker-end="url(#arrow-control)" /><text class="diagram-legend" x="155" y="280">OAT control / launch</text><rect class="component-chip" x="256" y="271" width="16" height="10" rx="2" /><text class="diagram-legend" x="278" y="280">component detail</text><text class="diagram-credit" x="20" y="308">Rust logo © Rust Foundation, CC-BY 4.0 · Delta Lake logo © The Delta Lake Project Authors, Apache 2.0</text>`;
-}
 function renderMappings() {
   for (const header of document.querySelectorAll('th[data-result]')) {
     const ids = resultParts[header.dataset.result];
@@ -182,6 +152,7 @@ function renderMappings() {
 }
 
 function number(value) {
+  if (value === null || value === undefined || value === '') return null;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
 }
@@ -259,7 +230,6 @@ async function loadResults() {
   }
 }
 document.querySelector('#reload').addEventListener('click', loadResults);
-renderArchitecture();
 renderMappings();
 loadResults();
 </script>
