@@ -5,6 +5,7 @@ import { parseArgs } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { parseDocument } from 'yaml';
 import { runStreamingTree } from './process.js';
+import { kubectlFailureDetail } from './kubectl-failure.js';
 import { bodyReads, type ReadGroup, type ReadSummary } from '../../../experiments/azure-qap/src/storage-reads.js';
 import { Config, load_env } from '../../../infra/azure/bootstrap.js';
 import { parseKubernetesConfig } from '../../../experiments/azure-qap/src/kubernetes.js';
@@ -283,7 +284,12 @@ async function main(): Promise<void> {
     const context = config.context ? ['--context', config.context] : [];
     await cleanupRetainedJob({ receipt, namespace: azure.kubernetesNamespace, context: config.context,
       output: path.join(path.dirname(path.resolve(values.receipt)), 'final'),
-      kubectl: (args, timeout = 120) => command('kubectl', [...context, ...args], timeout * 1000) });
+      kubectl: (args, timeout = 120) => runStreamingTree('kubectl', [...context, ...args], {
+        timeoutMs: timeout * 1000, capture: true,
+        onInterrupt: () => { interrupted = true; },
+        failureDetail: kubectlFailureDetail(args, text => azure.redact(text), Object.values(env).filter(
+          (value): value is string => typeof value === 'string' && value.length > 0)),
+      }) });
     return;
   }
   const inspectionMs = parseDuration(values['inspection-duration'] ?? '1h', '--inspection-duration');

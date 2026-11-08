@@ -5,12 +5,15 @@ export async function runStreamingTree(program: string, args: string[], options:
   capture: boolean;
   onLine?: (line: string) => void;
   onInterrupt?: () => void;
+  failureDetail?: (stderr: string) => string;
 }): Promise<string> {
   if (process.platform === 'win32') throw new Error('Process-tree execution requires a Linux environment.');
   return new Promise((resolve, reject) => {
     const child = spawn(program, args, { stdio: ['ignore', 'pipe', 'pipe'], shell: false, detached: true });
     let output = '';
     let pending = '';
+    let stderr = '';
+    let stderrOverflow = false;
     let failure: string | undefined;
     let killTimer: NodeJS.Timeout | undefined;
     const signalChild = (signal: NodeJS.Signals) => {
@@ -47,14 +50,23 @@ export async function runStreamingTree(program: string, args: string[], options:
       output += chunk.toString('utf8');
       if (output.length > 16 * 1024 * 1024) { failure = 'output limit'; terminate(); }
     });
-    child.stderr.resume();
+    child.stderr.on('data', (chunk: Buffer) => {
+      if (!options.failureDetail || stderrOverflow) return;
+      stderr += chunk.toString('utf8');
+      if (stderr.length > 64 * 1024) { stderr = ''; stderrOverflow = true; }
+    });
     child.on('error', error => { failure = `unable to start: ${(error as NodeJS.ErrnoException).code ?? 'unknown'}`; });
     child.on('close', (code, signal) => {
       clearTimeout(timer);
       if (killTimer) clearTimeout(killTimer);
       process.off('SIGINT', onSignal);
       process.off('SIGTERM', onSignal);
-      if (failure || code !== 0) reject(new Error(`${program} failed (${failure ?? signal ?? code ?? 'spawn error'}).`));
+      if (failure || code !== 0) {
+        let detail = '';
+        try { detail = options.failureDetail?.(stderrOverflow ? 'stderr exceeded capture limit.' : stderr).slice(0, 2000) ?? ''; }
+        catch { detail = 'Failure detail unavailable.'; }
+        reject(new Error(`${program} failed (${failure ?? signal ?? code ?? 'spawn error'}).${detail ? ` ${detail}` : ''}`));
+      }
       else resolve(output);
     });
   });
