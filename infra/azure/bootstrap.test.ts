@@ -1244,6 +1244,10 @@ test('Bicep adds experiment container, database, workspace and StorageRead diagn
   }
   assert.match(section('readExperiment'), /scope: experiment\n/);
   assert.match(section('readExperiment'), /2a2b9908-6ea1-4ae2-8e65-a410df84e7d1[\s\S]*principalId: identity\.properties\.principalId/);
+  assert.match(section('checkpointContainerScope'), /parent: blobs[\s\S]*name: checkpointContainer/);
+  const controlWriter = section('runtimeControlWriter');
+  assert.match(controlWriter, /name: guid\(checkpointContainerScope\.id, identity\.id, 'runtime-control-contributor'\)[\s\S]*scope: checkpointContainerScope[\s\S]*dependsOn: \[checkpoints\]/);
+  assert.doesNotMatch(controlWriter, /scope: checkpoints!/);
   assert.match(section('experimentDb'), /name: experimentDatabase[\s\S]*softDeletePeriod: 'P7D'[\s\S]*hotCachePeriod: 'P1D'/);
   assert.match(section('experimentReader'), /parent: experimentDb[\s\S]*principalId: identity\.properties\.clientId[\s\S]*role: 'Viewer'/);
   assert.match(section('workspace'), /name: logAnalyticsWorkspaceName[\s\S]*tags: ownership[\s\S]*'PerGB2018'[\s\S]*retentionInDays: 30/);

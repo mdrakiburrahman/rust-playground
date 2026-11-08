@@ -127,6 +127,11 @@ resource checkpoints 'Microsoft.Storage/storageAccounts/blobServices/containers@
   }
 }
 
+resource checkpointContainerScope 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' existing = {
+  parent: blobs
+  name: checkpointContainer
+}
+
 // Experiment fixtures live under runs/<runId>/<operation>/ and are wiped by reset.
 resource experiment 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
   parent: blobs
@@ -181,13 +186,14 @@ resource runtimeWebsiteWriter 'Microsoft.Authorization/roleAssignments@2022-04-0
 }
 
 resource runtimeControlWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (azureMode == 'stamped') {
-  name: guid(storage.id, checkpointContainer, identity.id, 'runtime-control-contributor')
-  scope: checkpoints!
+  name: guid(checkpointContainerScope.id, identity.id, 'runtime-control-contributor')
+  scope: checkpointContainerScope
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
     principalId: identity.properties.principalId
     principalType: 'ServicePrincipal'
   }
+  dependsOn: [checkpoints]
 }
 
 resource writeData 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
