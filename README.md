@@ -83,6 +83,12 @@ See the [platform architecture](docs/architecture/arrowcol-platform/README.md) f
 
 The [platform diagram](docs/architecture/arrowcol-platform/diagrams/platform.drawio) shows the remote catalog, routing/fencing, and DFE-only collection path. The [loadtest guide](projects/loadtest/README.md) documents storage modes, maintenance, validation, Kusto, and qualification evidence.
 
+### Schema Catalog architecture
+
+[![Schema Catalog architecture](docs/architecture/arrowcol-platform/diagrams/schema-catalog.png)](docs/architecture/arrowcol-platform/diagrams/schema-catalog.drawio)
+
+Spark SQL DDL creates immutable catalog contracts backed by Delta metadata, generates Rust and TypeScript SDKs, and feeds the DFE's bounded schema cache through gRPC change events. Nullable tail additions preserve registered older clients; Kusto external tables must be explicitly redefined to pick up the evolved Delta schema.
+
 The tenant fork preserves copied history after source retention cleanup; native external tables instead read the current active snapshot. Stable publication identities protect retries of the same publication, not duplicate independent client requests. Local functional results are not Azure QAP performance evidence. See the [loadtest guide](projects/loadtest/README.md) for the current CLI, credential boundaries, lifecycle commands, and qualification artifacts.
 
 ### Experiments

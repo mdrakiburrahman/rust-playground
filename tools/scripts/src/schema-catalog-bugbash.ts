@@ -5,7 +5,6 @@ import path from 'node:path';
 import { parseArgs, stripVTControlCharacters } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { createProjectGraphAsync, readProjectsConfigurationFromProjectGraph } from '@nx/devkit';
-import { PUBLISHED_RUNTIME_IMAGE_PROJECTS } from './image-plan.js';
 import { runChecked, SpawnCommandRunner } from './process.js';
 import { Azure, Config, is_schema_evolution_group, load_env, run_tree, write_private } from '../../../infra/azure/bootstrap.js';
 import { PublisherControl } from '../../../infra/azure/publisher_control.js';
@@ -38,8 +37,6 @@ export interface ImageIdentity {
   project: string;
   repository: string;
   alias: string;
-  reference: string;
-  platformDigest: string;
   configDigest: string;
   revision: string;
 }
@@ -140,17 +137,35 @@ export function serviceImages(value: unknown): Record<string, string> {
     if (!images[service]) throw new Error(`Missing DFE/catalog service: ${service}`);
   return images;
 }
-export function selectPlatform(value: unknown, digest: string): string {
-  assert.match(digest, DIGEST);
-  const manifest = record(value, 'OCI manifest');
-  if (manifest.config) return digest;
-  const matches = records(manifest.manifests, 'OCI index').filter(item => {
-    const platform = record(item.platform, 'OCI platform');
-    return platform.os === 'linux' && platform.architecture === 'amd64';
+export function loadtestImageProjects(value: unknown): string[] {
+  const targets = record(record(record(value, 'loadtest project').targets, 'loadtest targets').build, 'loadtest build target');
+  if (!Array.isArray(targets.dependsOn)) throw new Error('loadtest:build must declare its image dependencies.');
+  const projects = targets.dependsOn.flatMap((dependency: unknown) => {
+    if (!dependency || typeof dependency !== 'object' || Array.isArray(dependency)) return [];
+    const target = record(dependency, 'loadtest build dependency');
+    if (target.target !== 'image') return [];
+    if (!Array.isArray(target.projects)) throw new Error('loadtest:build image dependencies must list projects.');
+    return target.projects.map((project: unknown) => string(project, 'loadtest image project'));
   });
-  if (matches.length !== 1 || typeof matches[0]!.digest !== 'string' || !DIGEST.test(matches[0]!.digest))
-    throw new Error('Expected exactly one linux/amd64 platform manifest.');
-  return matches[0]!.digest;
+  if (!projects.length || new Set(projects).size !== projects.length)
+    throw new Error('loadtest:build must declare a non-empty, unique image project list.');
+  return projects.sort();
+}
+export function validateComposeImageCoverage(images: Record<string, string>, projects: string[],
+  repositories: Record<string, string>): void {
+  const ownedPrefix = `ghcr.io/${REPO}/`;
+  const projectSet = new Set(projects);
+  for (const [service, image] of Object.entries(images)) {
+    if (!image.startsWith(ownedPrefix) || !image.endsWith(':dev')) continue;
+    const project = image.slice(ownedPrefix.length, -':dev'.length);
+    if (!projectSet.has(project)) throw new Error(`Compose service ${service} uses an unbuilt project :dev image: ${image}`);
+  }
+  const required = { 'arrowcol-catalog': 'arrowcol-catalog-rust', 'dataflow-1': 'arrowcol-dataflow-rust',
+    router: 'arrowcol-router-rust', validator: 'arrowcol-router-rust' };
+  for (const [service, project] of Object.entries(required)) {
+    if (!projectSet.has(project) || images[service] !== `${repositories[project]}:dev`)
+      throw new Error(`Compose service ${service} is not covered by loadtest:build project ${project}.`);
+  }
 }
 export function validateImage(value: unknown, identity: ImageIdentity, sha: string): void {
   const image = record(value, 'Docker image'), config = record(image.Config, 'Docker config');
@@ -159,14 +174,30 @@ export function validateImage(value: unknown, identity: ImageIdentity, sha: stri
   assert.equal(labels['org.opencontainers.image.revision'], sha, `Revision mismatch for ${identity.alias}`);
   assert.equal(identity.revision, sha);
 }
-export function checkVerifiedReceipt(file: string): JsonRecord {
+export function validateCiRuns(value: unknown, sha: string): JsonRecord[] {
+  const runs = records(value, 'CI runs').filter(run => run.workflowName === 'CI');
+  if (!runs.length) throw new Error(`No CI workflow run exists for exact HEAD ${sha}.`);
+  for (const run of runs)
+    if (run.headSha !== sha || run.status !== 'completed' || run.conclusion !== 'success')
+      throw new Error(`Exact-head CI run ${run.databaseId} is not completed successfully.`);
+  return runs;
+}
+export function checkVerifiedReceipt(file: string, expectedProjects: string[]): JsonRecord {
   const receipt = readJson(file);
   const sums = fs.readFileSync(path.join(path.dirname(file), 'SHA256SUMS'), 'utf8');
   if (!sums.split('\n').includes(`${hash(file)}  receipt.json`) || receipt.mode !== 'verify' ||
       receipt.exitCode !== 0 || receipt.stage !== 'complete' || typeof receipt.source !== 'string' || !SHA.test(receipt.source))
     throw new Error('Expected a successful, checksummed verify receipt for this source.');
   const images = records(receipt.images, 'verified images');
-  assert.deepEqual(images.map(image => image.project).sort(), [...PUBLISHED_RUNTIME_IMAGE_PROJECTS].sort());
+  assert.deepEqual(images.map(image => string(image.project, 'image project')).sort(), [...expectedProjects].sort());
+  for (const image of images) {
+    const project = string(image.project, 'image project');
+    const repository = string(image.repository, 'image repository');
+    assert.equal(repository, `ghcr.io/${REPO}/${project}`);
+    assert.equal(string(image.alias, 'image alias'), `${repository}:dev`);
+    assert.match(string(image.configDigest, 'image config digest'), DIGEST);
+    assert.equal(image.revision, receipt.source, `Image revision mismatch for ${project}`);
+  }
   return receipt;
 }
 export function derivedCloudInput(values: Record<string, string>, group: string): Record<string, string> {
@@ -201,7 +232,8 @@ export function checkResetReceipt(file: string, workspace: string, group: string
   const ready = load_env(string(record(record(receipt.managedInputs, 'managed inputs').ready, 'ready').path, 'ready path'));
   assert.equal(ready.ARROWCOL_RESET_GENERATION, receipt.resetGeneration, 'Ready generation changed since provisioning');
   assert.ok(ready.ARROWCOL_RESET_GENERATION && UUID.test(ready.ARROWCOL_RESET_GENERATION));
-  const verified = checkVerifiedReceipt(string(receipt.verifiedReceipt, 'verify receipt path'));
+  const imageProjects = loadtestImageProjects(readJson(path.join(workspace, 'projects/loadtest/project.json')));
+  const verified = checkVerifiedReceipt(string(receipt.verifiedReceipt, 'verify receipt path'), imageProjects);
   assert.equal(receipt.source, verified.source, 'Reset and verify sources differ');
   return receipt;
 }
@@ -350,36 +382,40 @@ class Rehearsal {
     }
     return map;
   }
-  async github(sha: string): Promise<void> {
-    const pr = record(JSON.parse(await this.command('pull-request', ['gh', 'api', `repos/${REPO}/pulls/76`,
-      '--jq', '{number,state,draft,head:{sha:.head.sha},html_url}'], 60)) as unknown, 'PR');
-    assert.equal(pr.state, 'open'); assert.equal(pr.draft, true);
-    assert.equal(record(pr.head, 'PR head').sha, sha);
-    const runs = records(JSON.parse(await this.command('workflow-inventory', ['gh', 'run', 'list', '-R', REPO,
-      '--commit', sha, '--limit', '100', '--json', 'databaseId,workflowName,status,conclusion,headSha,url'], 60)) as unknown, 'runs');
-    const inventory: JsonRecord = {};
-    for (const workflow of ['CI', 'Publish runtime images']) {
-      const run = runs.find(item => item.workflowName === workflow);
-      if (!run || run.headSha !== sha || run.status !== 'completed' || run.conclusion !== 'success')
-        throw new Error(`Exact-head ${workflow} is not green yet. Wait for its automatic run, then rerun verify with a NEW --evidence-dir; retain this failed receipt. Do not dispatch a duplicate.`);
-      const detail = record(JSON.parse(await this.command(`workflow-${run.databaseId}`, ['gh', 'run', 'view',
-        String(run.databaseId), '-R', REPO, '--json', 'headSha,status,conclusion,jobs,url'], 60)) as unknown, 'workflow');
-      assert.equal(detail.headSha, sha); assert.equal(detail.conclusion, 'success');
-      const jobs = records(detail.jobs, 'workflow jobs');
+  async ci(sha: string): Promise<void> {
+    const runs = JSON.parse(await this.command('ci-inventory', ['gh', 'run', 'list', '-R', REPO,
+      '--workflow', 'CI', '--commit', sha, '--limit', '100',
+      '--json', 'databaseId,workflowName,status,conclusion,headSha,url'], 60)) as unknown;
+    const exactRuns = validateCiRuns(runs, sha);
+    const inventory: JsonRecord[] = [];
+    for (const run of exactRuns) {
+      const detail = record(JSON.parse(await this.command(`ci-${run.databaseId}`, ['gh', 'run', 'view',
+        String(run.databaseId), '-R', REPO, '--json', 'headSha,status,conclusion,jobs,url'], 60)) as unknown, 'CI workflow');
+      assert.equal(detail.headSha, sha); assert.equal(detail.status, 'completed'); assert.equal(detail.conclusion, 'success');
+      const jobs = records(detail.jobs, 'CI jobs');
       if (!jobs.length || jobs.some(job => job.status !== 'completed' || !['success', 'skipped'].includes(String(job.conclusion))))
-        throw new Error(`Incomplete or failed ${workflow} job inventory.`);
-      if (workflow === 'Publish runtime images')
-        assert.deepEqual(jobs.filter(job => String(job.name).startsWith('Publish ')).map(job => job.name).sort(),
-          PUBLISHED_RUNTIME_IMAGE_PROJECTS.map(name => `Publish ${name}`).sort());
-      inventory[workflow] = { id: run.databaseId, ...detail };
+        throw new Error(`Incomplete or failed CI job inventory for run ${run.databaseId}.`);
+      inventory.push({ id: run.databaseId, ...detail });
     }
-    saveJson(path.join(this.destination, 'github.json'), inventory);
-    this.receipt.workflows = inventory;
+    const evidence = { CI: inventory };
+    saveJson(path.join(this.destination, 'github.json'), evidence);
+    this.receipt.workflows = evidence;
   }
   async verify(sha: string): Promise<void> {
-    await this.github(sha);
+    await this.ci(sha);
     const npx = ['npx', '--no-install'];
-    await this.command('runtime-build', [...npx, 'nx', 'run', 'loadtest:build', '--parallel=2', '--outputStyle=static', '--skip-nx-cache']);
+    const imageProjects = loadtestImageProjects(readJson(path.join(this.workspace, 'projects/loadtest/project.json')));
+    const graph = readProjectsConfigurationFromProjectGraph(await createProjectGraphAsync()).projects;
+    const repositories: Record<string, string> = {};
+    for (const project of imageProjects) {
+      const targets = record(record(graph[project], `${project} project`).targets, `${project} targets`);
+      const options = record(record(targets.image, `${project} image target`).options, `${project} image options`);
+      if (typeof options.image !== 'string' || !Array.isArray(options.tags) || !options.tags.includes('dev'))
+        throw new Error(`Invalid local image contract for ${project}.`);
+      repositories[project] = options.image;
+    }
+    await this.command('runtime-build', [...npx, 'nx', 'run', 'loadtest:build', '--parallel=2', '--outputStyle=static', '--skip-nx-cache'],
+      5400, { ...this.env, REGISTRY_SHA: sha });
     await this.command('initializer-typescript', [...npx, 'nx', 'run', 'azure-infra:verify', '--skip-nx-cache']);
     await this.command('initializer-fence', ['cargo', 'test', '--locked', '-p', 'arrow-deltalake', '--lib', 'azure_fence::tests']);
     this.assertions('initializer-fence', [], 'Dedicated resource-group Rust ownership fence');
@@ -411,62 +447,53 @@ class Rehearsal {
     for (const name of ['catalog', 'catalog-v2', 'generated', 'generated-v2'])
       copyEvidence(`crates/arrowcol-sdk-gen/.temp/${name}`, path.join(sdk, name));
     const services = this.composeImages();
-    const graph = readProjectsConfigurationFromProjectGraph(await createProjectGraphAsync()).projects;
+    validateComposeImageCoverage(services, imageProjects, repositories);
     const images: ImageIdentity[] = [];
-    for (const project of PUBLISHED_RUNTIME_IMAGE_PROJECTS) {
-      const options = record(graph[project]?.targets?.image?.options, `${project} image options`);
-      const repository = options.image;
-      if (typeof repository !== 'string' || repository !== `ghcr.io/${REPO}/${project}` ||
-          !Array.isArray(options.tags) || !options.tags.includes('dev')) throw new Error(`Invalid image contract: ${project}`);
+    for (const project of imageProjects) {
+      const repository = repositories[project]!;
+      if (repository !== `ghcr.io/${REPO}/${project}`) throw new Error(`Invalid image repository for ${project}.`);
       const aliases = [...new Set(Object.values(services).filter(image => image.startsWith(repository + ':')))];
       if (aliases.length > 1 || (aliases.length && aliases[0] !== `${repository}:dev`)) throw new Error(`Ambiguous Compose alias: ${project}`);
-      const alias = aliases[0] ?? `${repository}:${String(options.tags.find(tag => tag === 'dev'))}`;
-      const tag = `${repository}:sha-${sha}`;
-      const digest = (await this.command(`${project}-index`, ['docker', 'buildx', 'imagetools', 'inspect', tag,
-        '--format', '{{.Manifest.Digest}}'], 120)).trim();
-      assert.match(digest, DIGEST);
-      const reference = `${repository}@${digest}`;
-      const raw = JSON.parse(await this.command(`${project}-manifest`, ['docker', 'buildx', 'imagetools', 'inspect', reference, '--raw'], 120)) as unknown;
-      const platformDigest = selectPlatform(raw, digest);
-      const platform = record(JSON.parse(await this.command(`${project}-platform`, ['docker', 'buildx', 'imagetools',
-        'inspect', `${repository}@${platformDigest}`, '--raw'], 120)) as unknown, 'platform manifest');
-      const configDigest = record(platform.config, 'platform config').digest;
-      if (typeof configDigest !== 'string' || !DIGEST.test(configDigest)) throw new Error(`Invalid platform config for ${project}`);
-      await this.command(`${project}-pull`, ['docker', 'pull', '--platform', 'linux/amd64', reference], 900);
-      const identity: ImageIdentity = { project, repository, alias, reference, platformDigest, configDigest, revision: sha };
-      const pulled = this.inspect(reference);
-      validateImage(pulled, identity, sha);
-      assert.ok(Array.isArray(pulled.RepoDigests) && pulled.RepoDigests.includes(reference), 'Immutable pull identity missing');
-      this.docker(['tag', reference, alias]);
-      validateImage(this.inspect(alias), identity, sha);
+      const alias = `${repository}:dev`;
+      const identity: ImageIdentity = { project, repository, alias, configDigest: '', revision: sha };
+      const local = this.inspect(alias);
+      identity.configDigest = string(local.Id, `${project} config digest`);
+      assert.match(identity.configDigest, DIGEST);
+      validateImage(local, identity, sha);
       images.push(identity);
       this.receipt.images = images; this.save();
     }
     this.receipt.serviceImages = services;
     saveJson(path.join(this.destination, 'compose-images.json'), this.imageMap(services));
-    for (const image of images)
-      await this.command(`${image.project}-smoke`, [...npx, 'nx', 'run', `${image.project}:image-smoke`,
-        '--excludeTaskDependencies', '--skip-nx-cache'], 600, { ...this.env,
-        ...(image.project === 'arrowcol-catalog-rust' ? { CATALOG_IMAGE: image.reference } : {}) });
+    for (const image of images) {
+      const targets = record(record(graph[image.project], `${image.project} project`).targets, `${image.project} targets`);
+      if (targets['image-smoke'])
+        await this.command(`${image.project}-smoke`, [...npx, 'nx', 'run', `${image.project}:image-smoke`,
+          '--excludeTaskDependencies', '--skip-nx-cache'], 600, { ...this.env,
+          ...(image.project === 'arrowcol-catalog-rust' ? { CATALOG_IMAGE: image.alias } : {}) });
+    }
     for (const image of images) validateImage(this.inspect(image.alias), image, sha);
-    await this.github(sha);
+    await this.ci(sha);
     await this.source(sha);
   }
   verified(): { sha: string; images: ImageIdentity[]; services: Record<string, string> } {
-    const value = checkVerifiedReceipt(this.options.verifiedReceipt!);
+    const imageProjects = loadtestImageProjects(readJson(path.join(this.workspace, 'projects/loadtest/project.json')));
+    const value = checkVerifiedReceipt(this.options.verifiedReceipt!, imageProjects);
     const images = records(value.images, 'images').map(item => {
       const image: ImageIdentity = { project: string(item.project, 'project'), repository: string(item.repository, 'repository'),
-        alias: string(item.alias, 'alias'), reference: string(item.reference, 'reference'),
-        platformDigest: string(item.platformDigest, 'platform digest'), configDigest: string(item.configDigest, 'config digest'),
+        alias: string(item.alias, 'alias'), configDigest: string(item.configDigest, 'config digest'),
         revision: string(item.revision, 'revision') };
       assert.match(image.configDigest, DIGEST);
-      assert.match(image.platformDigest, DIGEST);
-      assert.match(image.reference, /^ghcr\.io\/mdrakiburrahman\/rust-playground\/[a-z0-9-]+@sha256:[a-f0-9]{64}$/);
+      assert.equal(image.alias, `${image.repository}:dev`);
+      assert.equal(image.revision, value.source);
       return image;
     });
     const services = record(value.serviceImages, 'verified Compose images');
     if (Object.values(services).some(image => typeof image !== 'string')) throw new Error('Invalid verified Compose names.');
-    return { sha: String(value.source), images, services: services as Record<string, string> };
+    const resolvedServices = services as Record<string, string>;
+    validateComposeImageCoverage(resolvedServices, imageProjects,
+      Object.fromEntries(images.map(image => [image.project, image.repository])));
+    return { sha: String(value.source), images, services: resolvedServices };
   }
   producer(name: string, images: ImageIdentity[], sha: string): void {
     const provenance = readJson(`${RESULTS}/provenance.json`);
