@@ -711,6 +711,16 @@ export async function preflight(azure: Azure): Promise<void> {
     if (!quota || Number(quota.limit) - Number(quota.currentValue) < required)
       throw new Failure('Azure VM-family quota is insufficient for configured AKS pool maxima (' + family + ' requires ' + required + ' vCPUs).');
   }
+  const regionalQuota = usages.find((entry: any) => entry.name?.value === 'cores');
+  const regionalLimit = Number(regionalQuota?.limit);
+  const regionalUsed = Number(regionalQuota?.currentValue);
+  if (!Number.isSafeInteger(regionalLimit) || !Number.isSafeInteger(regionalUsed) || regionalUsed < 0 || regionalLimit < regionalUsed)
+    throw new Failure('Azure did not report valid regional vCPU quota usage.');
+  const requiredVcpus = [...requiredByFamily.values()].reduce((total, required) => total + required, 0);
+  const regionalAvailable = regionalLimit - regionalUsed;
+  if (regionalAvailable < requiredVcpus)
+    throw new Failure('Azure regional vCPU quota is insufficient for configured AKS pool maxima (requires ' +
+      requiredVcpus + ' vCPUs; ' + regionalAvailable + ' available).');
   const apiServerFeature = await azure.cli('feature', 'show', '--namespace', 'Microsoft.ContainerService',
     '--name', 'EnableAPIServerVnetIntegrationPreview', '--subscription', c.subscription);
   if (apiServerFeature.properties?.state !== 'Registered')

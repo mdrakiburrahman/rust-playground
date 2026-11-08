@@ -259,7 +259,10 @@ for (const state of ['missing', 'empty', 'legacy', 'identity', 'denied'] as cons
           const vmSize = args[args.indexOf('--size') + 1];
           return [{ name: vmSize, family: 'testFamily', capabilities: [{ name: 'vCPUs', value: '1' }] }];
         }
-        case 'vm list-usage': return [{ name: { value: 'testFamily' }, currentValue: 0, limit: 100 }];
+        case 'vm list-usage': return [
+          { name: { value: 'testFamily' }, currentValue: 0, limit: 100 },
+          { name: { value: 'cores' }, currentValue: 0, limit: 1000 },
+        ];
         case 'feature show': return { properties: { state: 'Registered' } };
         case 'network vnet': return [];
         case 'resource list':
@@ -295,13 +298,47 @@ test('preflight reserves quota for the system-pool autoscale maximum', async () 
         const vmSize = args[args.indexOf('--size') + 1];
         return [{ name: vmSize, family: 'testFamily', capabilities: [{ name: 'vCPUs', value: '1' }] }];
       }
-      case 'vm list-usage': return [{ name: { value: 'testFamily' }, currentValue: 0, limit: 4 }];
+      case 'vm list-usage': return [
+        { name: { value: 'testFamily' }, currentValue: 0, limit: 4 },
+        { name: { value: 'cores' }, currentValue: 0, limit: 1000 },
+      ];
       case 'feature show': return { properties: { state: 'Registered' } };
       case 'network vnet': return [];
       default: assert.fail('Unexpected Azure mutation or CLI command: ' + args.join(' '));
     }
   });
   await assert.rejects(b.preflight(azure), /quota is insufficient/);
+});
+test('preflight rejects AKS pool maxima that exceed regional vCPU quota', async () => {
+  const c = azure.c;
+  c.operator = SUB;
+  c.stampConfig.publisherFederatedCredentials.push({
+    name: 'publisher', issuer: 'https://token.actions.githubusercontent.com', subject: 'repo:example/repo:environment:publish',
+  });
+  mock.method(azure, 'arm', async (_method: string, resourcePath: string) =>
+    resourcePath.includes('/providers/Microsoft.ContainerService/managedClusters/') ? null : ({ tags: azure.tags }));
+  mock.method(azure, 'cli', async (...args: string[]) => {
+    switch (args.slice(0, 2).join(' ')) {
+      case 'account show': return { id: c.subscription };
+      case 'provider show': return { registrationState: 'Registered' };
+      case 'aks get-versions': return {
+        values: [{ version: c.stampConfig.aks.version.split('.').slice(0, 2).join('.'),
+          patchVersions: { [c.stampConfig.aks.version]: {} } }],
+      };
+      case 'vm list-skus': {
+        const vmSize = args[args.indexOf('--size') + 1];
+        return [{ name: vmSize, family: 'testFamily', capabilities: [{ name: 'vCPUs', value: '1' }] }];
+      }
+      case 'vm list-usage': return [
+        { name: { value: 'testFamily' }, currentValue: 0, limit: 100 },
+        { name: { value: 'cores' }, currentValue: 0, limit: 4 },
+      ];
+      case 'feature show': return { properties: { state: 'Registered' } };
+      case 'network vnet': return [];
+      default: assert.fail('Unexpected Azure mutation or CLI command: ' + args.join(' '));
+    }
+  });
+  await assert.rejects(b.preflight(azure), /regional vCPU quota is insufficient/);
 });
 test('preflight reserves only additional quota for existing AKS pools', async () => {
   const c = azure.c;
@@ -326,7 +363,10 @@ test('preflight reserves only additional quota for existing AKS pools', async ()
         const vmSize = args[args.indexOf('--size') + 1];
         return [{ name: vmSize, family: 'testFamily', capabilities: [{ name: 'vCPUs', value: '1' }] }];
       }
-      case 'vm list-usage': return [{ name: { value: 'testFamily' }, currentValue: 0, limit: 2 }];
+      case 'vm list-usage': return [
+        { name: { value: 'testFamily' }, currentValue: 0, limit: 2 },
+        { name: { value: 'cores' }, currentValue: 0, limit: 2 },
+      ];
       case 'feature show': return { properties: { state: 'Registered' } };
       case 'network vnet': return [];
       case 'resource list': return [];
