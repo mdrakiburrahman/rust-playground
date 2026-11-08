@@ -732,32 +732,38 @@ fn supervision_faults_always_kill_reap_and_propagate() -> Result<()> {
 /// parent report NotReady without Kusto.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn parent_child_env_cli_body_and_parent_validation_compose() -> Result<()> {
-    parent_chain_for("stamped").await
+    parent_chain_for("stamped", "arrow-collector-rg").await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn isolated_parent_child_env_cli_body_and_parent_validation_compose() -> Result<()> {
-    parent_chain_for("schema-evolution").await
+    parent_chain_for("schema-evolution", "rust-playground-schema-evo").await
 }
 
-async fn parent_chain_for(mode: &str) -> Result<()> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dedicated_isolated_parent_child_env_cli_body_and_parent_validation_compose() -> Result<()> {
+    parent_chain_for("schema-evolution", "rust-playground-schema-evo-qualification-20261108").await
+}
+
+async fn parent_chain_for(mode: &str, group: &str) -> Result<()> {
     use arrowcol_loadgen::initialize::InitializeAzureConfig;
     use arrowcol_loadgen::{Cli, Command};
     use clap::Parser;
 
     let scratch = Scratch::new()?;
     let values = scratch.0.join("values.json");
-    let stamp_account = if mode == "stamped" {
-        "arrowcollector1"
-    } else {
-        "arrowcol582e3df61d82"
+    let stamp_account = match (mode, group) {
+        ("stamped", _) => "arrowcollector1",
+        ("schema-evolution", "rust-playground-schema-evo") => "arrowcol582e3df61d82",
+        ("schema-evolution", "rust-playground-schema-evo-qualification-20261108") => "arrowcolb34995dd4053",
+        _ => anyhow::bail!("test configured an unknown mode or resource group"),
     };
     let stamp_root = format!("abfss://{CONTAINER}@{stamp_account}.dfs.core.windows.net/sandbox");
     std::fs::write(
         &values,
         serde_json::to_vec(&serde_json::json!({
             "AZURE_SUBSCRIPTION_ID": "00000000-0000-0000-0000-000000000001",
-            "AZURE_RESOURCE_GROUP": if mode == "stamped" { "arrow-collector-rg" } else { "rust-playground-schema-evo" },
+            "AZURE_RESOURCE_GROUP": group,
             "AZURE_STORAGE_ACCOUNT": stamp_account,
             "AZURE_STORAGE_CONTAINER": CONTAINER,
             "ARROWCOL_AZURE_TABLE_ROOT": stamp_root,
