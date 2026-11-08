@@ -19,6 +19,7 @@ export interface StampConfig {
     skuTier: 'Free' | 'Premium';
     namespace: string;
     serviceAccount: string;
+    networkDataplane?: 'azure' | 'cilium';
     systemPool: { name: string; vmSize: string; initialCount: number; minCount: number; maxCount: number; maxPods: number; availabilityZones: string[] };
     userPools: Array<{ name: string; vmSize: string; initialCount: number; minCount: number; maxCount: number; maxPods: number; availabilityZones: string[] }>;
     network: {
@@ -35,7 +36,7 @@ export interface StampConfig {
 const NAME = /^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$/;
 const FIC_NAME = /^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$/;
 const DEFAULT_AKS: StampConfig['aks'] = {
-  version: '1.35.6', skuTier: 'Free', namespace: 'arrow-collector', serviceAccount: 'arrow-collector',
+  version: '1.35.6', skuTier: 'Free', namespace: 'arrow-collector', serviceAccount: 'arrow-collector', networkDataplane: 'azure',
   systemPool: { name: 'systempool', vmSize: 'Standard_D8ds_v6', initialCount: 3, minCount: 3, maxCount: 3, maxPods: 250, availabilityZones: ['1', '2', '3'] },
   userPools: [
     { name: 'benchd64', vmSize: 'Standard_D64ds_v6', initialCount: 0, minCount: 0, maxCount: 1, maxPods: 30, availabilityZones: [] },
@@ -179,7 +180,8 @@ export function parseStampConfig(source: string): StampConfig {
   const storageReadLogDestination = text(raw.storageReadLogDestination ?? 'log-analytics', 'storageReadLogDestination',
     /^(log-analytics|storage)$/) as 'log-analytics' | 'storage';
   const aksRaw = object(raw.aks, 'aks');
-  keys(aksRaw, ['version', 'skuTier', 'namespace', 'serviceAccount', 'systemPool', 'userPools', 'network'], 'aks');
+  keys(aksRaw, ['version', 'skuTier', 'namespace', 'serviceAccount', 'networkDataplane', 'systemPool', 'userPools', 'network'], 'aks');
+  const networkDataplane = text(aksRaw.networkDataplane ?? 'azure', 'aks.networkDataplane', /^(azure|cilium)$/) as 'azure' | 'cilium';
   const version = text(aksRaw.version, 'aks.version', /^\d+\.\d+\.\d+$/);
   const skuTier = text(aksRaw.skuTier, 'aks.skuTier', /^(Free|Premium)$/) as 'Free' | 'Premium';
   const namespace = text(aksRaw.namespace, 'aks.namespace', NAME, 63);
@@ -284,7 +286,7 @@ export function parseStampConfig(source: string): StampConfig {
   if (new Set(publisherFederatedCredentials.map(fic => fic.name)).size !== publisherFederatedCredentials.length ||
       new Set(publisherFederatedCredentials.map(fic => `${fic.issuer}\0${fic.subject}`)).size !== publisherFederatedCredentials.length)
     throw new Failure('publisherFederatedCredentials must have unique names and issuer/subject pairs.');
-  return { subscription, stamp, resourceGroup, location, aks: { version, skuTier, namespace, serviceAccount, systemPool, userPools, network },
+  return { subscription, stamp, resourceGroup, location, aks: { version, skuTier, namespace, serviceAccount, networkDataplane, systemPool, userPools, network },
     publisherFederatedCredentials, storageReadLogDestination };
 }
 

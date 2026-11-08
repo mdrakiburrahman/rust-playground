@@ -24,6 +24,17 @@ test('loads the approved resource group, stamp and AKS baseline from YAML', () =
   assert.throws(() => parseStampConfig(example.replace('storageReadLogDestination: storage', 'storageReadLogDestination: metrics')), /invalid/);
 });
 
+test('network-policy enforcement is an explicit validated Cilium opt-in', () => {
+  assert.equal(parseStampConfig(example).aks.networkDataplane, 'azure');
+  assert.equal(defaultStampConfig().aks.networkDataplane, 'azure');
+  const configured = example.replace('aks:', 'aks:\n  networkDataplane: cilium');
+  assert.equal(parseStampConfig(configured).aks.networkDataplane, 'cilium');
+  assert.throws(() => parseStampConfig(configured.replace('networkDataplane: cilium', 'networkDataplane: invalid')), /networkDataplane is invalid/);
+  const template = fs.readFileSync(new URL('./aks.bicep', import.meta.url), 'utf8');
+  assert.ok(template.includes("networkDataplane: aksConfig.?networkDataplane ?? 'azure'"));
+  assert.ok(template.includes("networkPolicy: (aksConfig.?networkDataplane ?? 'azure') == 'cilium' ? 'cilium' : 'none'"));
+});
+
 test('validates zero-scaled benchmark user pools and rejects invalid pool configuration', () => {
   const config = parseStampConfig(example);
   assert.deepEqual(config.aks.userPools.map(pool => pool.vmSize), ['Standard_D64ds_v6', 'Standard_E64ds_v6']);

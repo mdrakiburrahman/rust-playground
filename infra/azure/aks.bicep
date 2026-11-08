@@ -181,6 +181,8 @@ resource aks 'Microsoft.ContainerService/managedClusters@2026-05-01' = {
     networkProfile: {
       networkPlugin: 'azure'
       networkPluginMode: 'overlay'
+      networkDataplane: aksConfig.?networkDataplane ?? 'azure'
+      networkPolicy: (aksConfig.?networkDataplane ?? 'azure') == 'cilium' ? 'cilium' : 'none'
       outboundType: 'loadBalancer'
       loadBalancerSku: 'Standard'
       loadBalancerProfile: { outboundIPPrefixes: { publicIPPrefixes: [{ id: egressIpv4Prefix.id }, { id: egressIpv6Prefix.id }] } }

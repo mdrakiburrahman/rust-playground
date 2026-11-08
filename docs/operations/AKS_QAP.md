@@ -72,6 +72,14 @@ The stamped `$web` container carries the same ownership metadata as the private
 containers and participates in the existing guarded inventory and reset path.
 Schema-evolution mode does not enable static website hosting.
 
+The private stamp can opt into `aks.networkDataplane: cilium` for enforced
+NetworkPolicy; omission preserves the existing Azure data plane without policy
+enforcement. Isolated OAT workloads require Cilium before deployment.
+[Migrating an existing cluster](https://learn.microsoft.com/en-us/azure/aks/update-azure-cni#update-the-data-plane-to-azure-cni-powered-by-cilium)
+reimages node pools and can interrupt networking. Qualify an empty disposable
+stamp first, preserve its pool counts and CIDRs, and wait for every node and
+Cilium agent to become Ready before testing allowed and denied pod traffic.
+
 The read-only runtime mounts writable Parquet staging at `/app/.temp/qap-stage`,
 inside the workspace as required by the fixture safety check. Native fixture
 copies use the same bounded, renewing CLI-or-workload credential provider as
