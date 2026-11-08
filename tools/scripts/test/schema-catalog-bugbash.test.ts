@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import { azureAccountCommand, checkResetReceipt, checkVerifiedReceipt, copyEvidence, copyEvolutionEvidence, createEvidenceDir, derivedCloudInput,
-  loadtestImageProjects, parseOptions, passedTests, positiveDfeSample, redactLog, serviceImages, validateCiRuns,
+  loadtestImageProjects, parseOptions, passedTests, positiveDfeSample, redactLog, resolveServiceImages, serviceImages, validateCiRuns,
   validateAzureAccount, validateComposeImageCoverage, validateImage, verifyAzureAccount, type ImageIdentity } from '../src/schema-catalog-bugbash.js';
 
 const sha = 'a'.repeat(40), digest = `sha256:${'b'.repeat(64)}`;
@@ -181,6 +181,18 @@ test('local image identity checks config digest and exact source revision', () =
   assert.equal(serviceImages({ services: map })['arrowcol-catalog'], image.alias);
   assert.throws(() => serviceImages({ services: { ...map, hive: { image: 'hive:dev' } } }), /removed/);
   assert.throws(() => serviceImages({ services: { ...map, router: {} } }), /Invalid/);
+  const ref = `ghcr.io/google/cadvisor:v0.60.6@${digest}`;
+  const seen: string[] = [];
+  const inspect = (image: string) => { seen.push(image); return { Id: digest }; };
+  assert.deepEqual(resolveServiceImages({ cadvisor: ref, catalog: image.alias }, inspect), {
+    cadvisor: { image: ref, configId: digest }, catalog: { image: image.alias, configId: digest },
+  });
+  assert.deepEqual(seen, [ref, image.alias]);
+  assert.throws(() => resolveServiceImages({ cadvisor: ref }, () => { throw new Error('image not found'); }), /image not found/);
+  assert.throws(() => resolveServiceImages({ cadvisor: ref }, () => ({ Id: 'invalid' })), /Invalid cadvisor config ID/);
+  assert.deepEqual(resolveServiceImages({ cadvisor: ref, catalog: image.alias }, inspect, new Set([image.alias])), {
+    cadvisor: { image: ref, status: 'not-inspected-before-compose' }, catalog: { image: image.alias, configId: digest },
+  });
 });
 
 test('evidence excludes private inputs and symlinks; verification receipts reject failure and tampering', t => {

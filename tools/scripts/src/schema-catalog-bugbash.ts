@@ -174,6 +174,20 @@ export function validateImage(value: unknown, identity: ImageIdentity, sha: stri
   assert.equal(labels['org.opencontainers.image.revision'], sha, `Revision mismatch for ${identity.alias}`);
   assert.equal(identity.revision, sha);
 }
+export function resolveServiceImages(images: Record<string, string>, inspect: (image: string) => unknown,
+  builtAliases?: ReadonlySet<string>): JsonRecord {
+  const map: JsonRecord = {};
+  for (const [service, image] of Object.entries(images)) {
+    if (builtAliases && !builtAliases.has(image)) {
+      map[service] = { image, status: 'not-inspected-before-compose' };
+      continue;
+    }
+    const configId = string(record(inspect(image), `Docker image for ${service}`).Id, `${service} config ID`);
+    assert.match(configId, DIGEST, `Invalid ${service} config ID`);
+    map[service] = { image, configId };
+  }
+  return map;
+}
 export function validateCiRuns(value: unknown, sha: string): JsonRecord[] {
   const runs = records(value, 'CI runs').filter(run => run.workflowName === 'CI');
   if (!runs.length) throw new Error(`No CI workflow run exists for exact HEAD ${sha}.`);
@@ -387,13 +401,8 @@ class Rehearsal {
       { env, stdout: 'capture', stderr: 'capture' }).stdout;
     return serviceImages(JSON.parse(output) as unknown);
   }
-  imageMap(images: Record<string, string>): JsonRecord {
-    const map: JsonRecord = {};
-    for (const [service, image] of Object.entries(images)) {
-      const present = this.docker(['image', 'ls', '--quiet', '--no-trunc', image]).trim();
-      map[service] = { image, configId: present ? this.inspect(image).Id : null };
-    }
-    return map;
+  imageMap(images: Record<string, string>, builtAliases?: ReadonlySet<string>): JsonRecord {
+    return resolveServiceImages(images, image => this.inspect(image), builtAliases);
   }
   async ci(sha: string): Promise<void> {
     const runs = JSON.parse(await this.command('ci-inventory', ['gh', 'run', 'list', '-R', REPO,
@@ -477,7 +486,7 @@ class Rehearsal {
       this.receipt.images = images; this.save();
     }
     this.receipt.serviceImages = services;
-    saveJson(path.join(this.destination, 'compose-images.json'), this.imageMap(services));
+    saveJson(path.join(this.destination, 'compose-images.json'), this.imageMap(services, new Set(images.map(image => image.alias))));
     for (const image of images) {
       const targets = record(record(graph[image.project], `${image.project} project`).targets, `${image.project} targets`);
       if (targets['image-smoke'])
