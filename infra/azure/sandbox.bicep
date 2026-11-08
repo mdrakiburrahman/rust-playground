@@ -322,53 +322,16 @@ resource workspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
   }
 }
 
-resource readLogStorage 'Microsoft.Storage/storageAccounts@2023-05-01' = if (!empty(readLogStorageAccountName)) {
-  name: readLogStorageAccountName
-  location: location
-  tags: ownership
-  kind: 'StorageV2'
-  sku: { name: 'Standard_LRS' }
-  properties: {
-    allowBlobPublicAccess: false
-    allowSharedKeyAccess: false
-    minimumTlsVersion: 'TLS1_2'
-    supportsHttpsTrafficOnly: true
-    publicNetworkAccess: 'Enabled'
-    networkAcls: {
-      bypass: 'AzureServices'
-      defaultAction: 'Allow'
-    }
-  }
-}
-
-resource operatorReadExport 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(readLogStorageAccountName)) {
-  name: guid(readLogStorage!.id, operatorObjectId, 'read-log-reader')
-  scope: readLogStorage
-  properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1')
-    principalId: operatorObjectId
-    principalType: operatorType == 'User' ? 'User' : 'ServicePrincipal'
-  }
-}
-
-resource runtimeReadExport 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(readLogStorageAccountName)) {
-  name: guid(readLogStorage!.id, identity.id, 'runtime-read-log-reader')
-  scope: readLogStorage
-  properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1')
-    principalId: identity.properties.principalId
-    principalType: 'ServicePrincipal'
-  }
-}
-
-// QAP validates sink readiness through ARM before reading the exported blobs.
-resource runtimeReadExportReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(readLogStorageAccountName)) {
-  name: guid(readLogStorage!.id, identity.id, 'runtime-read-log-arm-reader')
-  scope: readLogStorage
-  properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'acdd72a7-3385-48ef-bd42-f606fba81ae7')
-    principalId: identity.properties.principalId
-    principalType: 'ServicePrincipal'
+module readLogStorage './read-log-storage.bicep' = if (!empty(readLogStorageAccountName)) {
+  name: 'readLogStorage'
+  params: {
+    readLogStorageAccountName: readLogStorageAccountName
+    location: location
+    ownership: ownership
+    operatorObjectId: operatorObjectId
+    operatorType: operatorType
+    runtimeIdentityId: identity.id
+    runtimePrincipalId: identity.properties.principalId
   }
 }
 
@@ -377,7 +340,7 @@ resource storageReads 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview'
   scope: blobs
   properties: {
     workspaceId: workspace.id
-    storageAccountId: empty(readLogStorageAccountName) ? null : readLogStorage!.id
+    storageAccountId: empty(readLogStorageAccountName) ? null : readLogStorage!.outputs.storageAccountId
     logAnalyticsDestinationType: 'Dedicated'
     logs: [
       {
