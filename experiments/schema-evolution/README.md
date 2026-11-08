@@ -23,7 +23,7 @@ fresh-bootstrap live rehearsals remain required before final qualification.
 | Step | Command or action | Required result |
 | --- | --- | --- |
 | Pin inputs | Record `git rev-parse HEAD` and `sha256sum experiments/schema-evolution/README.md` | Both rehearsals use the same final integration SHA and runbook hash. |
-| Fresh environment | Through the owning privy lease, run `Start-DevboxBootstrap -Repo rust-playground -Mode Full -Branch mdrakiburrahman-schema-catalog -LeaseId <lease>` and check out the recorded SHA remotely | New devcontainer; record devbox, lease ID and source SHA. No local builds. |
+| Fresh environment | Through the owning privy lease, run `Start-DevboxBootstrap -Repo rust-playground -Mode Full -Branch <branch> -LeaseId <lease>` and check out the recorded SHA remotely | New devcontainer; record devbox, lease ID and source SHA. No local builds. |
 | Local qualification | `npx nx run schema-evolution-experiment:run -- --target local` | All six stages pass, actual old/new Delta cohorts and native Kustainer refresh recorded. |
 | Azure pre-pass preparation | After explicit custody authorization only: read the owned authority and inventory, then follow the bounded reset sequence below | Fresh Full deletes local manifests; a ready stamp without its manifest must not be fully provisioned or implicitly recovered. |
 | Isolated Azure readiness | `npx --no-install tsx experiments/schema-evolution/src/private-nx.ts provision --mode schema-evolution --env-file .env.schema-evo.private --tables .env.azure.schema-evo.tables.json --output .env.azure.schema-evo` | Invokes public `azure-infra:provision`: DFE-only initialization under custody, KQL reconciliation and captured ready generation. Real Azure charges apply. |

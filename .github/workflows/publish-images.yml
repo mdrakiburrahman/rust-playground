@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-      - mdrakiburrahman-schema-catalog
     paths:
       - .dockerignore
       - .github/workflows/publish-images.yml
@@ -70,7 +69,6 @@ jobs:
   publish:
     name: Publish ${{ matrix.project }}
     needs: plan
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     permissions:
@@ -135,17 +133,12 @@ jobs:
           REGISTRY_BRANCH: ${{ github.ref_name }}
           REGISTRY_ENVIRONMENT: ci
           REGISTRY_SHA: ${{ github.sha }}
-          REGISTRY_PREVIEW: ${{ github.ref == 'refs/heads/mdrakiburrahman-schema-catalog' }}
         run: |
           npx --no-install tsx tools/scripts/src/registry.ts tags \
             > "target/images/${IMAGE_PROJECT}-tags.json"
           node --input-type=module -e '
-            import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+            import { appendFileSync, readFileSync } from "node:fs";
             const tags = JSON.parse(readFileSync(process.argv[1], "utf8"));
-            if (process.env.REGISTRY_PREVIEW === "true") {
-              tags.values = [tags.shaTag];
-              writeFileSync(process.argv[1], JSON.stringify(tags));
-            }
             appendFileSync(
               process.env.GITHUB_OUTPUT,
               `branch_tag=${tags.branchTag}\nsha_tag=${tags.shaTag}\n`,
@@ -161,20 +154,12 @@ jobs:
         run: npx --no-install nx run "$IMAGE_PROJECT:publish:main"
 
       - name: Publish branch and SHA tags
-        if: github.ref != 'refs/heads/main' && github.ref != 'refs/heads/mdrakiburrahman-schema-catalog'
+        if: github.ref != 'refs/heads/main'
         env:
           IMAGE_PROJECT: ${{ matrix.project }}
           REGISTRY_BRANCH: ${{ github.ref_name }}
           REGISTRY_SHA: ${{ github.sha }}
         run: npx --no-install nx run "$IMAGE_PROJECT:publish"
-
-      - name: Publish immutable preview SHA only
-        if: github.ref == 'refs/heads/mdrakiburrahman-schema-catalog'
-        env:
-          IMAGE_PROJECT: ${{ matrix.project }}
-          REGISTRY_BRANCH: ${{ github.ref_name }}
-          REGISTRY_SHA: ${{ github.sha }}
-        run: npx --no-install nx run "$IMAGE_PROJECT:publish" --tags="sha-${REGISTRY_SHA}"
 
       - name: Verify the deterministic publication manifest
         env:
@@ -209,7 +194,6 @@ jobs:
         run: npx --no-install nx run tools-scripts:registry-manifest
 
       - name: Verify branch manifest
-        if: github.ref != 'refs/heads/mdrakiburrahman-schema-catalog'
         env:
           REGISTRY_ENVIRONMENT: ci
           REGISTRY_IMAGE: ${{ matrix.image }}

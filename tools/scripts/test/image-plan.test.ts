@@ -385,29 +385,29 @@ test('catalog image stays Rust-only with an unprivileged healthchecked runtime',
   }
 });
 
-test('integration previews push only immutable SHA tags without release aliases or PR credentials', () => {
+test('runtime image publication is main-only and keeps the normal tag contract', () => {
   const workflow = parse(readFileSync(join(workspace, '.github/workflows/publish-images.yml'), 'utf8')) as PublishWorkflow;
-  assert.deepEqual(workflow.on.push.branches, ['main', 'mdrakiburrahman-schema-catalog']);
+  assert.deepEqual(workflow.on.push.branches, ['main']);
   assert(!('pull_request' in workflow.on));
   assert(!('pull_request_target' in workflow.on));
-  assert.equal(workflow.jobs.publish?.if, "github.event_name == 'push' || github.event_name == 'workflow_dispatch'");
+  assert.equal(workflow.jobs.publish?.if, undefined);
   const steps = workflow.jobs.publish?.steps ?? [];
   const byName = (name: string) => {
     const step = steps.find(step => step.name === name);
     assert(step, name);
     return step;
   };
-  const preview = byName('Publish immutable preview SHA only');
-  assert.equal(preview.if, "github.ref == 'refs/heads/mdrakiburrahman-schema-catalog'");
-  assert.equal(preview.run, 'npx --no-install nx run "$IMAGE_PROJECT:publish" --tags="sha-${REGISTRY_SHA}"');
-  assert.doesNotMatch(preview.run ?? '', /latest|stable|:main/u);
-  assert.equal(byName('Publish branch and SHA tags').if, "github.ref != 'refs/heads/main' && github.ref != 'refs/heads/mdrakiburrahman-schema-catalog'");
+  assert(!steps.some(step => step.name === 'Publish immutable preview SHA only'));
+  assert.equal(byName('Publish branch and SHA tags').if, "github.ref != 'refs/heads/main'");
   assert.equal(byName('Publish branch, SHA, and latest tags').if, "github.ref == 'refs/heads/main'");
   assert.equal(byName('Verify latest manifest').if, "github.ref == 'refs/heads/main'");
-  assert.equal(byName('Verify branch manifest').if, "github.ref != 'refs/heads/mdrakiburrahman-schema-catalog'");
+  assert.equal(byName('Verify branch manifest').if, undefined);
   const metadata = byName('Resolve branch and immutable tags');
-  assert.equal(metadata.env?.REGISTRY_PREVIEW, "${{ github.ref == 'refs/heads/mdrakiburrahman-schema-catalog' }}");
-  assert.match(metadata.run ?? '', /if \(process\.env\.REGISTRY_PREVIEW === "true"\) \{\s+tags\.values = \[tags\.shaTag\];\s+writeFileSync/u);
+  assert.equal(metadata.env?.REGISTRY_PREVIEW, undefined);
+  assert.doesNotMatch(metadata.run ?? '', /REGISTRY_PREVIEW/u);
+  const paths = new Set(workflow.on.push.paths);
+  assert(paths.has('projects/arrowcol-catalog-rust/**'));
+  assert(!paths.has('projects/arrowcol-rust/**'));
 });
 
 

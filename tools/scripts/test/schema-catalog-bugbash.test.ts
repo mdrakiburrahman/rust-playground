@@ -5,15 +5,24 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
-import { checkResetReceipt, checkVerifiedReceipt, copyEvidence, copyEvolutionEvidence, createEvidenceDir, derivedCloudInput, parseOptions, passedTests, positiveDfeSample, redactLog, selectPlatform,
-  serviceImages, validateImage, validatePullRequest, type ImageIdentity } from '../src/schema-catalog-bugbash.js';
-import { PUBLISHED_RUNTIME_IMAGE_PROJECTS } from '../src/image-plan.js';
+import { checkResetReceipt, checkVerifiedReceipt, copyEvidence, copyEvolutionEvidence, createEvidenceDir, derivedCloudInput,
+  loadtestImageProjects, parseOptions, passedTests, positiveDfeSample, redactLog, serviceImages, validateCiRuns,
+  validateComposeImageCoverage, validateImage, type ImageIdentity } from '../src/schema-catalog-bugbash.js';
 
 const sha = 'a'.repeat(40), digest = `sha256:${'b'.repeat(64)}`;
 const cloud = ['--subscription', '11111111-1111-1111-1111-111111111111',
   '--resource-group', 'rust-playground-schema-evo-qualification-20261108', '--env-file', '/private/base'];
 const receipt = ['--verified-receipt', '/tmp/verify/receipt.json'];
 const evidence = ['--evidence-dir', '/tmp/new-evidence'];
+const imageProjects = loadtestImageProjects({ targets: { build: { dependsOn: [
+  'reader-build', { projects: ['arrowcol-catalog-rust', 'arrowcol-dataflow-rust', 'arrowcol-router-rust',
+    'arrow-tenant-stream', 'delta-maintenance', 'kusto-explorer'], target: 'image' },
+] } } });
+
+function imageIdentity(project: string): ImageIdentity {
+  const repository = `ghcr.io/mdrakiburrahman/rust-playground/${project}`;
+  return { project, repository, alias: `${repository}:dev`, configDigest: digest, revision: sha };
+}
 
 test('CLI separates verification, receipt-chained Azure and dedicated explicitly confirmed reset', () => {
   assert.equal(parseOptions(['verify', '--expected-sha', sha, ...evidence]).mode, 'verify');
@@ -51,13 +60,34 @@ test('synced env projection excludes stamped identities and preserves only valid
   assert.throws(() => derivedCloudInput({ ...values, AZURE_KUSTO_CLUSTER_TAGS: 'not-json' }, cloud[3]!), /tags/);
 });
 
-test('PR gate accepts open draft or ready PR but rejects closed, merged and wrong-head PRs', () => {
-  const open = { state: 'open', draft: true, merged_at: null, head: { sha } };
-  assert.doesNotThrow(() => validatePullRequest(open, sha));
-  assert.doesNotThrow(() => validatePullRequest({ ...open, draft: false }, sha));
-  assert.throws(() => validatePullRequest({ ...open, state: 'closed' }, sha), /open/);
-  assert.throws(() => validatePullRequest({ ...open, merged_at: '2026-11-08T00:00:00Z' }, sha), /unmerged/);
-  assert.throws(() => validatePullRequest({ ...open, head: { sha: 'b'.repeat(40) } }, sha), /strictly equal/);
+test('loadtest image projects come from build dependencies and Compose :dev images are covered', () => {
+  assert.deepEqual(imageProjects, ['arrow-tenant-stream', 'arrowcol-catalog-rust', 'arrowcol-dataflow-rust',
+    'arrowcol-router-rust', 'delta-maintenance', 'kusto-explorer']);
+  const repositories = Object.fromEntries(imageProjects.map(project =>
+    [project, `ghcr.io/mdrakiburrahman/rust-playground/${project}`]));
+  const services = { 'arrowcol-catalog': `${repositories['arrowcol-catalog-rust']}:dev`,
+    'dataflow-1': `${repositories['arrowcol-dataflow-rust']}:dev`, router: `${repositories['arrowcol-router-rust']}:dev`,
+    validator: `${repositories['arrowcol-router-rust']}:dev`, 'third-party': 'vendor/image:dev' };
+  assert.doesNotThrow(() => validateComposeImageCoverage(services, imageProjects, repositories));
+  assert.throws(() => validateComposeImageCoverage({ ...services,
+    extra: 'ghcr.io/mdrakiburrahman/rust-playground/not-built:dev' }, imageProjects, repositories), /unbuilt/);
+  assert.throws(() => validateComposeImageCoverage({ ...services, validator: 'vendor/router:dev' },
+    imageProjects, repositories), /validator/);
+  assert.throws(() => loadtestImageProjects({ targets: { build: { dependsOn: [
+    { projects: ['duplicate', 'duplicate'], target: 'image' },
+  ] } } }), /unique/);
+});
+
+test('CI gate requires every exact-head CI run to complete successfully', () => {
+  const runs = [
+    { workflowName: 'CI', headSha: sha, status: 'completed', conclusion: 'success', databaseId: 1 },
+    { workflowName: 'CI', headSha: sha, status: 'completed', conclusion: 'success', databaseId: 2 },
+    { workflowName: 'Publish runtime images', headSha: 'b'.repeat(40), status: 'queued', conclusion: null, databaseId: 3 },
+  ];
+  assert.equal(validateCiRuns(runs, sha).length, 2);
+  assert.throws(() => validateCiRuns([], sha), /No CI/);
+  assert.throws(() => validateCiRuns([...runs, { ...runs[0], status: 'in_progress' }], sha), /not completed successfully/);
+  assert.throws(() => validateCiRuns([{ ...runs[0], headSha: 'b'.repeat(40) }], sha), /not completed successfully/);
 });
 
 test('reset custody rejects modified private inputs, stale generation, failed reset and wrong source/group', t => {
@@ -65,6 +95,10 @@ test('reset custody rejects modified private inputs, stale generation, failed re
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sc-reset-custody-'));
   t.after(() => fs.rmSync(root, { recursive: true }));
   const workspace = path.join(root, 'checkout'); fs.mkdirSync(workspace);
+  const loadtestDir = path.join(workspace, 'projects', 'loadtest'); fs.mkdirSync(loadtestDir, { recursive: true });
+  fs.writeFileSync(path.join(loadtestDir, 'project.json'), JSON.stringify({ targets: { build: { dependsOn: [
+    { projects: imageProjects, target: 'image' },
+  ] } } }));
   const verify = path.join(root, 'verify'); fs.mkdirSync(verify);
   const reset = path.join(root, 'reset'); fs.mkdirSync(reset);
   const writeReceipt = (directory: string, value: unknown) => {
@@ -75,7 +109,7 @@ test('reset custody rejects modified private inputs, stale generation, failed re
     return file;
   };
   const verifiedReceipt = writeReceipt(verify, { mode: 'verify', source: sha, stage: 'complete', exitCode: 0,
-    images: PUBLISHED_RUNTIME_IMAGE_PROJECTS.map(project => ({ project })) });
+    images: imageProjects.map(imageIdentity) });
   const generation = '22222222-2222-2222-2222-222222222222';
   const managedInputs = Object.fromEntries(['base', 'ready', 'manifest'].map(name => {
     const file = path.join(root, `${name}.private`);
@@ -116,23 +150,18 @@ test('evidence paths reject checkout aliases, traversal and overwrite', t => {
   }
 });
 
-test('OCI index selection distinguishes manifest and config identities and rejects wrong revisions', () => {
-  const platform = `sha256:${'c'.repeat(64)}`;
-  assert.equal(selectPlatform({ manifests: [
-    { digest: platform, platform: { os: 'linux', architecture: 'amd64' } },
-    { digest, platform: { os: 'unknown', architecture: 'unknown' } },
-  ] }, digest), platform);
-  assert.throws(() => selectPlatform({ manifests: [] }, digest), /exactly one/);
-  const image: ImageIdentity = { project: 'arrowcol-catalog-rust', repository: 'ghcr.io/mdrakiburrahman/rust-playground/arrowcol-catalog-rust',
-    alias: 'ghcr.io/mdrakiburrahman/rust-playground/arrowcol-catalog-rust:dev',
-    reference: `ghcr.io/mdrakiburrahman/rust-playground/arrowcol-catalog-rust@${digest}`,
-    configDigest: digest, platformDigest: platform, revision: sha };
+test('local image identity checks config digest and exact source revision', () => {
+  const image = imageIdentity('arrowcol-catalog-rust');
   const docker = { Id: digest, Config: { Labels: { 'org.opencontainers.image.revision': sha } } };
   validateImage(docker, image, sha);
-  assert.throws(() => validateImage({ ...docker, Id: platform }, image, sha), /Config mismatch/);
+  assert.throws(() => validateImage({ ...docker, Id: `sha256:${'c'.repeat(64)}` }, image, sha), /Config mismatch/);
   assert.throws(() => validateImage(docker, image, 'd'.repeat(40)), /Revision mismatch/);
-  const map = { 'arrowcol-catalog': { image: image.alias }, 'dataflow-1': { image: 'registry/dfe:dev' },
-    router: { image: 'registry/router:dev' }, validator: { image: 'registry/router:dev' } };
+  const repositories = Object.fromEntries(imageProjects.map(project =>
+    [project, `ghcr.io/mdrakiburrahman/rust-playground/${project}`]));
+  const map = { 'arrowcol-catalog': { image: `${repositories['arrowcol-catalog-rust']}:dev` },
+    'dataflow-1': { image: `${repositories['arrowcol-dataflow-rust']}:dev` },
+    router: { image: `${repositories['arrowcol-router-rust']}:dev` },
+    validator: { image: `${repositories['arrowcol-router-rust']}:dev` } };
   assert.equal(serviceImages({ services: map })['arrowcol-catalog'], image.alias);
   assert.throws(() => serviceImages({ services: { ...map, hive: { image: 'hive:dev' } } }), /removed/);
   assert.throws(() => serviceImages({ services: { ...map, router: {} } }), /Invalid/);
@@ -145,16 +174,18 @@ test('evidence excludes private inputs and symlinks; verification receipts rejec
   assert.throws(() => copyEvidence(privateFile, path.join(root, 'copy')), /Private/);
   const file = path.join(root, 'receipt.json');
   const value = { mode: 'verify', source: sha, stage: 'complete', exitCode: 0,
-    images: PUBLISHED_RUNTIME_IMAGE_PROJECTS.map(project => ({ project })) };
+    images: imageProjects.map(imageIdentity) };
   const write = (input: unknown) => {
     fs.writeFileSync(file, JSON.stringify(input));
     fs.writeFileSync(path.join(root, 'SHA256SUMS'),
       `${createHash('sha256').update(fs.readFileSync(file)).digest('hex')}  receipt.json\n`);
   };
-  write(value); assert.equal(checkVerifiedReceipt(file).source, sha);
-  fs.appendFileSync(file, ' '); assert.throws(() => checkVerifiedReceipt(file), /checksummed/);
-  write({ ...value, exitCode: 1 }); assert.throws(() => checkVerifiedReceipt(file), /successful/);
-  write({ ...value, images: value.images.slice(1) }); assert.throws(() => checkVerifiedReceipt(file));
+  write(value); assert.equal(checkVerifiedReceipt(file, imageProjects).source, sha);
+  fs.appendFileSync(file, ' '); assert.throws(() => checkVerifiedReceipt(file, imageProjects), /checksummed/);
+  write({ ...value, exitCode: 1 }); assert.throws(() => checkVerifiedReceipt(file, imageProjects), /successful/);
+  write({ ...value, images: value.images.slice(1) }); assert.throws(() => checkVerifiedReceipt(file, imageProjects));
+  write({ ...value, images: value.images.map(image => ({ ...image, revision: 'c'.repeat(40) })) });
+  assert.throws(() => checkVerifiedReceipt(file, imageProjects), /revision mismatch/);
   const trigger = ['pass', 'word'].join('');
   assert.equal(redactLog('SQL ' + trigger + ': harmless\nstage passed'), '[private diagnostic line withheld]\nstage passed');
   if (process.platform !== 'win32') {

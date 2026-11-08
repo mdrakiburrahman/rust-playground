@@ -1,7 +1,7 @@
 # Container publishing
 
-The repository publishes the devcontainer, seven production Rust runtime
-images, and the retained `hello-world` sample image to GHCR through Nx targets.
+The repository publishes the devcontainer, seven production runtime images,
+and the retained `hello-world` sample image to GHCR through Nx targets.
 Run local publication from the source-built devcontainer so the pinned
 toolchain, Docker Buildx support, GitHub CLI state, and repository scripts match
 the development environment.
@@ -55,15 +55,13 @@ boundaries. An older image without graceful publisher shutdown fails this contra
 
 Published runtime tags are:
 
-- `branch-<sanitized-branch>` for the selected branch;
+- `branch-<sanitized-branch>` for the selected ref;
 - immutable `sha-<full-git-sha>`; and
 - `latest` only when the workflow publishes `main`.
 
-The `mdrakiburrahman-schema-catalog` integration branch is an exception:
-it publishes **only** immutable `sha-<full-git-sha>` previews. It never updates
-branch aliases, `stable`, or `latest`. Consume the exact preview reference,
-for example `ghcr.io/mdrakiburrahman/rust-playground/arrowcol-catalog-rust:sha-<full-git-sha>`.
-An existing immutable SHA manifest is preserved, not overwritten.
+Push-triggered runtime image publication is main-only. An explicit manual
+dispatch uses the selected ref; on `main`, the workflow publishes the branch,
+immutable SHA, and `latest` tags.
 
 ## Authenticate to GHCR
 
@@ -253,7 +251,7 @@ On `main` it also checks the `main` and `latest` manifests.
 
 `.github/workflows/publish-images.yml` runs on:
 
-- a push to `main` or `mdrakiburrahman-schema-catalog` that changes the
+- a push to `main` that changes the
   workflow, any published runtime project,
   shared crate, the pinned `otel-arrow` submodule, Cargo workspace inputs, root
   Node/Nx inputs, the Docker executor, or registry tooling;
@@ -261,8 +259,7 @@ On `main` it also checks the `main` and `latest` manifests.
 
 The workflow discovers the nine source-built publication targets from the Nx
 graph, then builds and smoke-tests each matrix entry before authentication. It
-publishes branch and immutable SHA tags for normal releases, adds `latest` on
-`main`, and publishes only the immutable SHA on the integration branch. It verifies the
+publishes branch and immutable SHA tags, and adds `latest` on `main`. It verifies the
 deterministic local publication manifest, and verifies every remote tag.
 Package write permission is scoped to the publishing job on push or manual
 dispatch; no pull-request event or privileged pull-request checkout is added.
