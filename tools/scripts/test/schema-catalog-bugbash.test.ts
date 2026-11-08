@@ -216,6 +216,12 @@ test('acceptance receipts count only real completed tests and export bounded evo
   assert.deepEqual(fs.readdirSync(output).sort(), ['evidence.jsonl', 'report.json', 'sdk-v1']);
 });
 
+test('acceptance output ignores Nx task summaries but retains Node and Rust tests', () => {
+  assert.deepEqual(passedTests('✔  nx run arrowcol-catalog:test (2s)\n✔ real Node test (1.2ms)\ntest actual_rust_test ... ok\n'),
+    ['real Node test', 'actual_rust_test']);
+  assert.deepEqual(passedTests('✔  nx run arrowcol-catalog:test\n'), []);
+});
+
 test('real wrong-head invocation fails before GitHub/build/Docker and archives a terminal failure receipt', {
   skip: process.platform !== 'linux' || !fs.existsSync('/.dockerenv') ? 'CLI execution requires the repository devcontainer' : false,
 }, t => {
