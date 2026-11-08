@@ -71,6 +71,24 @@ test('discovers production images and retains the sample publication', () => {
   }
 });
 
+test('every publication and the retained sample build bind to the Git revision', () => {
+  const projects = workspaceProjects();
+  for (const project of PUBLISHED_RUNTIME_IMAGE_PROJECTS) {
+    const dockerfile = readFileSync(join(workspace, projectPath(project).replace(/project\.json$/u, 'Dockerfile')), 'utf8');
+    assert.match(dockerfile, /^ARG VCS_REF=local$/mu, project);
+    assert.match(dockerfile, /org\.opencontainers\.image\.revision="\$\{VCS_REF\}"/u, project);
+    for (const target of project === 'hello-world' ? ['image', 'publish'] : ['publish']) {
+      assert.deepEqual(projects[project].targets?.[target]?.options?.buildArgs, ['VCS_REF={gitSha}'], `${project}:${target}`);
+      const missing = workspaceProjects();
+      delete missing[project].targets![target].options!.buildArgs;
+      assert.throws(() => createImagePublicationPlan(missing), /OCI revision build argument/u, `${project}:${target}`);
+      const stale = workspaceProjects();
+      stale[project].targets![target].options!.buildArgs = ['VCS_REF=local'];
+      assert.throws(() => createImagePublicationPlan(stale), /OCI revision build argument/u, `${project}:${target}`);
+    }
+  }
+});
+
 test('fails closed when a source-built publication is missing or unexpected', () => {
   const missing = workspaceProjects();
   delete missing['arrowcol-router-rust'];

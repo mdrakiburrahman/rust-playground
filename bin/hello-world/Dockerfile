@@ -15,6 +15,9 @@ RUN cargo build --locked --release --package hello-world \
 
 FROM --platform=linux/amd64 debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS runtime
 
+ARG VCS_REF=local
+LABEL org.opencontainers.image.revision="${VCS_REF}"
+
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \

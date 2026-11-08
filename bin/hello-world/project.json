@@ -153,6 +153,9 @@
         "tags": [
           "dev"
         ],
+        "buildArgs": [
+          "VCS_REF={gitSha}"
+        ],
         "platforms": [
           "linux/amd64"
         ],
@@ -220,6 +223,9 @@
         ],
         "immutableTags": [
           "sha-{gitSha}"
+        ],
+        "buildArgs": [
+          "VCS_REF={gitSha}"
         ],
         "requireCleanWorktree": true,
         "platforms": [
