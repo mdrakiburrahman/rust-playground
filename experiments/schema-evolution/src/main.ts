@@ -107,12 +107,14 @@ async function stop(process: Process | undefined, signal: AbortSignal, graceful:
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   const { values: args } = parseArgs({ args: argv, options: {
-    target: { type: 'string', default: 'local' }, 'env-file': { type: 'string' },
+    target: { type: 'string', default: 'local' }, mode: { type: 'string' }, 'env-file': { type: 'string' },
     'ready-env': { type: 'string' }, out: { type: 'string' },
   } });
   if (!['local', 'azure'].includes(args.target!)) throw new Error('--target must be local or azure.');
   if (args.target === 'azure' && (!args['env-file'] || !args['ready-env']))
     throw new Error('Azure requires explicit separate --env-file and --ready-env; shared .env.azure is never inferred.');
+  if (args.target === 'azure' ? args.mode !== 'schema-evolution' : args.mode !== undefined)
+    throw new Error('Azure requires explicit --mode schema-evolution; local does not accept an Azure mode.');
   const runId = `evo${Date.now()}_${randomBytes(4).toString('hex')}`, owner = randomUUID();
   const out = path.resolve(WORKSPACE, args.out ?? `.temp/experiments/schema-evolution/${runId}`);
   const confined = path.relative(path.join(WORKSPACE, '.temp/experiments/schema-evolution'), out);
@@ -120,9 +122,12 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     throw new Error('Evidence output must be inside .temp/experiments/schema-evolution.');
   fs.mkdirSync(out, { recursive: true });
   const local = args.target === 'local';
-  const values = local ? {} : { ...load_env(path.resolve(WORKSPACE, args['env-file']!)),
-    ...load_env(path.resolve(WORKSPACE, args['ready-env']!)) };
-  const config = local ? undefined : new Config(values);
+  const baseValues = local ? {} : load_env(path.resolve(WORKSPACE, args['env-file']!));
+  const baseConfig = local ? undefined : new Config(baseValues, 'schema-evolution');
+  const values = local ? {} : { ...baseValues, ...load_env(path.resolve(WORKSPACE, args['ready-env']!)) };
+  const config = local ? undefined : new Config(values, 'schema-evolution');
+  if (config && config.sandbox !== baseConfig!.sandbox)
+    throw new Error('Ready environment changed the explicitly selected isolated sandbox identity.');
   if (config && (config.group !== 'rust-playground-schema-evo' || !values.ARROWCOL_RESET_GENERATION))
     throw new Error('Azure requires the separately named schema-evo stamp and its genuinely exported ready generation.');
   const azure = config ? new Azure(config) : undefined;
@@ -135,7 +140,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   const endpoint = `http://127.0.0.1:${catalogPort}`, flight = `http://127.0.0.1:${flightPort}`;
   const env: NodeJS.ProcessEnv = { ...process.env };
   for (const key of Object.keys(env)) if (/^(AZURE_|ARROWCOL_)/.test(key)) delete env[key];
-  Object.assign(env, values, { ARROWCOL_DELTA_ROOT: root, ARROWCOL_CATALOG_ENDPOINT: endpoint,
+  Object.assign(env, values, config?.generated(), { ARROWCOL_DELTA_ROOT: root, ARROWCOL_CATALOG_ENDPOINT: endpoint,
     ARROWCOL_FLIGHT_LISTEN: `127.0.0.1:${flightPort}`, ARROWCOL_ADMIN_LISTEN: `127.0.0.1:${adminPort}`,
     ARROWCOL_INSTANCE_KEY: runId });
   fs.mkdirSync(local ? root : mirror, { recursive: true });

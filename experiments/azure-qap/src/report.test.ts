@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { MIB } from './profile.js';
-import { Evidence, exitCode, positiveControl, resultsTable, writeReport, type RunReport } from './report.js';
+import { Evidence, exitCode, lateLogHelp, positiveControl, renderMarkdown, resultsTable, writeReport, type RunReport } from './report.js';
 import type { TrialResult } from './scenario.js';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -23,7 +23,7 @@ function trial(overrides: Partial<TrialResult> & { reread?: number; unchanged?: 
 test('the reload positive control passes only when every unchanged file was seen re-read', () => {
   assert.equal(positiveControl([trial({ operation: 'optimize', trial: 'optimize', reread: 0 })]).status, 'not-run');
   assert.deepEqual(positiveControl([trial({ reread: 6 })]),
-    { status: 'detected', detail: 'reload re-read 6/6 files: StorageBlobLogs capture QAP reads.' });
+    { status: 'detected', detail: 'reload re-read 6/6 files: Azure Monitor read logs capture QAP reads.' });
   assert.equal(positiveControl([trial({ reread: 6, status: 'late-logs-pending', telemetry: 'pending' })]).status, 'detected',
     'all re-reads already observed count even while later logs are still arriving');
 
@@ -92,8 +92,35 @@ test('writeReport and Evidence write redacted JSON, Markdown and query files', a
     assert.match(markdown, /\*\*Positive control:\*\* detected/);
     assert.match(markdown, /## Cleanup: done/);
     assert.match(markdown, /az monitor log-analytics query -w 00000000-0000-0000-0000-000000000002/);
+    assert.match(markdown, /from the directory containing `report.md`/);
+    assert.match(markdown, /--analytics-query @queries\/reload.kql/);
+    assert.equal(renderMarkdown(report, '/artifacts'), renderMarkdown(report, out),
+      'copied reports must not retain pod-specific query paths');
+    assert.ok(lateLogHelp(report, out).includes(path.relative(process.cwd(), path.join(out, 'queries', 'reload.kql'))),
+      'terminal help still resolves queries from the invoking directory');
+    const pending = trial({ trial: 'optimize', operation: 'optimize', reread: 0, status: 'late-logs-pending', telemetry: 'pending' });
+    const pendingMarkdown = renderMarkdown({ ...report, trials: [pending] }, out);
+    assert.match(pendingMarkdown, /absence of re-reads is not established/);
+    assert.doesNotMatch(pendingMarkdown, /no unchanged file was re-read/);
+    assert.match(renderMarkdown({ ...report, trials: [{ ...pending, status: 'complete', telemetry: 'complete' }] }, out),
+      /no unchanged file was re-read/);
     assert.equal(fs.readFileSync(path.join(out, 'queries', 'reload.kql'), 'utf8'), 'StorageBlobLogs | take 1\n');
     assert.equal(fs.readFileSync(path.join(out, 'queries', 'reload.raw.kql'), 'utf8'), 'StorageBlobLogs | take 2\n');
+    const storageReload = { ...reload, storageReadQuery: { source: 'storage' as const, logAccount: 'arrowreadlogs1',
+      scope: { workspace: '00000000-0000-0000-0000-000000000002', account: 'arrowcollector1', container: 'experimentqap',
+        requester: '00000000-0000-0000-0000-000000000003', prefix: 'runs/run_1/reload/',
+        owned: { marker: 'arrowcol-qap/run_1/reload', requestIds: ['00000000-0000-0000-0000-000000000004'] } },
+      window: { from: 1000, mutationAt: 2000, windowEnd: 3000 } } };
+    const storageReport: RunReport = { ...report, trials: [storageReload],
+      location: { ...report.location, readLogSource: 'storage', readLogAccount: 'arrowreadlogs1' } };
+    await writeReport(storageReport, out);
+    assert.match(fs.readFileSync(path.join(out, 'queries', 'reload.yaml'), 'utf8'), /source: storage/);
+    assert.match(fs.readFileSync(path.join(out, 'queries', 'reload.raw.yaml'), 'utf8'), /raw: true/);
+    const storageMarkdown = fs.readFileSync(path.join(out, 'report.md'), 'utf8');
+    assert.match(storageMarkdown, /read-logs.ts --query "\$REPORT\/queries\/reload.yaml"/);
+    assert.match(storageMarkdown, /http-traces/);
+    assert.doesNotMatch(storageMarkdown, /az monitor log-analytics query/);
+    assert.equal(renderMarkdown(storageReport, '/artifacts'), renderMarkdown(storageReport, out));
   } finally {
     fs.rmSync(out, { recursive: true, force: true });
   }

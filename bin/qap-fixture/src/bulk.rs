@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail, ensure};
 use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
+use arrow_deltalake::AzureCliTokenProvider;
 use arrow_deltalake::delta::{DeltaTable, INGESTION_PARTITION, ingestion_partition_value};
 use arrow_deltalake::maintenance::{Granularity, MaintenanceControl, Outcome, PurgeConfig};
 use arrow_deltalake::publisher::{MutationRetries, PublisherSession};
@@ -19,8 +20,8 @@ use delta_kernel::{FileMeta, Snapshot};
 use delta_kernel_default_engine::parquet::DataFileMetadata;
 use delta_kernel_default_engine::{DefaultEngineBuilder, build_add_file_metadata};
 use futures::stream::{BoxStream, StreamExt};
-use object_store::azure::{AzureAuthorizer, AzureCredential, AzureCredentialProvider, MicrosoftAzureBuilder};
-use object_store::client::{HttpClient, HttpConnector, HttpRequest, HttpRequestBody, HttpResponse, ReqwestConnector};
+use object_store::azure::{AzureAuthorizer, AzureCredential, AzureCredentialProvider};
+use object_store::client::{HttpClient, HttpConnector, HttpRequest, HttpRequestBody, HttpResponse};
 use object_store::path::Path;
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt,
@@ -780,21 +781,21 @@ impl NativeCopyStore {
             !account.is_empty() && !container.is_empty(),
             "expected abfss container/account URL"
         );
-        let azure = MicrosoftAzureBuilder::new()
-            .with_url(url.as_str())
-            .with_use_azure_cli(true)
-            .build()?;
+        let credentials: AzureCredentialProvider = Arc::new(AzureCliTokenProvider::new(
+            "https://storage.azure.com/.default",
+            Duration::from_secs(5),
+        )?);
         let (_, owned_prefix) = ObjectStoreScheme::parse(url)?;
         let endpoint = Url::parse(&format!("https://{account}.blob.core.windows.net/"))?;
         let mut source = endpoint.clone();
         source.set_path(&format!("{container}/{}", location(url, &manifest.source)?));
         Ok(Self {
-            http: ReqwestConnector::default().connect(
+            http: arrow_deltalake::qap_http::azure_http_connector()?.connect(
                 &object_store::ClientOptions::new()
                     .with_timeout(Duration::from_secs(60))
                     .with_connect_timeout(Duration::from_secs(10)),
             )?,
-            credentials: Arc::clone(azure.credentials()),
+            credentials,
             account,
             container,
             source,
@@ -965,6 +966,7 @@ copy_transport!(LocalCopyStore, self, location, {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use object_store::client::ReqwestConnector;
     use std::io::{Read, Write};
     use std::net::TcpListener;
 

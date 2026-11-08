@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/../../.."
+: "${ARROWCOL_AZURE_MODE:?bootstrap must select the explicit Azure ownership mode}"
+case "$ARROWCOL_AZURE_MODE" in
+  stamped) ;;
+  schema-evolution)
+    [[ "${AZURE_RESOURCE_GROUP:-}" == "rust-playground-schema-evo" && ! -v AZURE_STAMP ]] ||
+      { echo "Invalid isolated Azure ownership configuration" >&2; exit 1; }
+    ;;
+  *) echo "Invalid Azure ownership mode" >&2; exit 1 ;;
+esac
 : "${ARROWCOL_AZURE_TABLE_MANIFEST:?bootstrap must provide a private manifest output path}"
 : "${ARROWCOL_AZURE_TABLE_ROOT:?bootstrap must provide the canonical ADLS root}"
 : "${AZURE_STORAGE_ACCOUNT:?bootstrap must provide the owned storage account}"

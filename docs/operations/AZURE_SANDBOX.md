@@ -3,6 +3,15 @@
 This is original, public infrastructure code. Private reference implementations
 were used only to understand operational requirements, not copied.
 
+## Scope of this guide
+
+The existing loadtest sandbox described below is separate from the new AKS QAP
+stamp. Replacement AKS, ADX, storage, registry and logging resources are scoped
+to `arrow-collector-rg`; the separate `rust-playground` resource group is not a
+deployment or cleanup target. Follow [AKS QAP operations](AKS_QAP.md) for its
+stamp, shared identity, preflight gate and Kubernetes runtime. Do not use this
+legacy sandbox guide to delete or reset the AKS stamp.
+
 Local disk and local Kusto remain the loadtest default. `--mode azure` (or
 `ARROWCOL_MODE=azure`) switches storage and Kusto together. Azure writers and the
 bootstrap use the existing signed-in Azure CLI identity; Kusto reads Delta using
@@ -43,16 +52,24 @@ process death releases the lock without treating a stale PID file as ownership.
 `.env.azure` is generated privately with mode `0600`; it contains deterministic
 names, Kusto endpoint and canonical `abfss://` data/checkpoint roots. The runner
 loads `.env`, then `.env.azure`, then explicit process-environment overrides.
-Names derive from the private subscription and configured resource
-group (`rust-playground` by default), so independent devboxes agree without sharing resource identifiers in
-commands or source. `config` does not contact Azure and is not deployment proof.
+Default names derive from the validated positive integer stamp in
+`arrow-collector-rg`. The explicit schema-evolution mode retains the normalized
+subscription:RG hash only for `rust-playground-schema-evo`; it never selects
+another `rust-playground-<suffix>` group. `config` does not contact Azure and is
+not deployment proof.
 
 | Stamp selection | Configuration | Safety boundary |
 | --- | --- | --- |
-| Existing sandbox | `AZURE_RESOURCE_GROUP=rust-playground` | Existing behavior and names are unchanged. |
-| Separate disposable sandbox | `AZURE_RESOURCE_GROUP=rust-playground-schema-evo` | Lowercase `rust-playground-<suffix>` names only; ownership tags and account/container checks still apply. |
+| Stamped default | Validated `--stamp-config <private YAML>` | Main's exact group, stamp and AKS/ACR/network/identity policy. |
+| Approved schema-evolution sandbox | `--mode schema-evolution --env-file .env.schema-evo.private` | Exact `rust-playground-schema-evo` only; no stamp/AKS/ACR inputs, foreign account or authority adoption. |
 
-For a separate stamp, keep account, cluster and workspace overrides blank and
+The isolated mode flag is mandatory on every bootstrap command shown below
+when operating on schema evolution, including status, preflight, reset,
+recovery and occupancy; ambient `.env` values do not select it. Use the
+[schema-evolution runbook](../../experiments/schema-evolution/README.md) for the
+minimal approved synced-input projection and pre-pass reset sequence.
+
+For the isolated sandbox, keep resource overrides absent and
 do not reuse the existing table/checkpoint roots. Use a separate `--output`
 file when provisioning; generated configuration preserves the selected group.
 **Reset and stop act on the selected stamp.** Check the resource group before
@@ -125,6 +142,13 @@ deploys its own storage account or workspace per run. Reset empties the
 `experimentqap` container and drops every object in the `experimentqap`
 database, but keeps that database and its managed identity policy; logs already
 in the workspace stay until its retention expires.
+
+With `storageReadLogDestination: storage` in the stamp YAML, deployment also
+creates separate `arrowreadlogs<stamp>` storage with read-only operator/shared
+identity roles for Azure Monitor diagnostic export. Reports name the selected
+evidence source and preserve raw events plus owned HTTP receipts; see
+[AKS QAP evidence](AKS_QAP.md). Reset leaves those logs intact; RG deletion
+removes them. Storage charges continue until deletion.
 
 ## Cloud occupancy and reset
 

@@ -41,3 +41,6 @@ out/
 
 # Scratch
 .temp/
+
+infra/azure/stamp.yaml
+infra/kubernetes/azure-qap.yaml
