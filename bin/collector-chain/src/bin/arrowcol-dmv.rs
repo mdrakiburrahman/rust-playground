@@ -20,12 +20,16 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
     let runtime = tokio::runtime::Runtime::new()?;
-    let table_count = runtime.block_on(dmv::send_with_concurrency(
-        &args.endpoint,
-        &args.client_id,
-        args.rows,
-        args.concurrency,
-    ))?;
+    let table_count = if args.concurrency == 1 {
+        runtime.block_on(dmv::send(&args.endpoint, &args.client_id, args.rows))?
+    } else {
+        runtime.block_on(dmv::send_with_concurrency(
+            &args.endpoint,
+            &args.client_id,
+            args.rows,
+            args.concurrency,
+        ))?
+    };
     println!(
         "uploaded {table_count} DMV tables with {} rows each using concurrency {}",
         args.rows, args.concurrency
