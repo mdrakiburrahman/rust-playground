@@ -2297,13 +2297,17 @@ mod tests {
 
         let mut missing = expected.clone();
         missing.remove("dataflow_sqlserver_wait_stats");
-        let error = live_table_coverage(&expected, &missing).unwrap_err();
-        assert!(format!("{error:#}").contains("dataflow_sqlserver_wait_stats"));
+        assert!(matches!(
+            live_table_coverage(&expected, &missing),
+            Err(error) if format!("{error:#}").contains("dataflow_sqlserver_wait_stats")
+        ));
 
         let mut retired = expected.clone();
         retired.insert("direct_sqlserver_wait_stats".to_owned());
-        let error = live_table_coverage(&expected, &retired).unwrap_err();
-        assert!(format!("{error:#}").contains("direct_sqlserver_wait_stats"));
+        assert!(matches!(
+            live_table_coverage(&expected, &retired),
+            Err(error) if format!("{error:#}").contains("direct_sqlserver_wait_stats")
+        ));
         Ok(())
     }
 
