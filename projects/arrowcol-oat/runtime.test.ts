@@ -96,11 +96,17 @@ test('SQL persistence and sequential bootstrap keep migration credentials out of
   assert.equal(foundation.filter((o) => o.kind === 'PersistentVolumeClaim').length, 2);
   const denyIndex = foundation.findIndex((o) => o.kind === 'NetworkPolicy' && o.metadata.name === 'default-deny-ingress');
   assert.ok(denyIndex >= 0 && denyIndex < foundation.findIndex((o) => o.kind === 'Deployment'));
+  const sql = foundation.find((o) => o.kind === 'Deployment')!.spec.template.spec.containers[0];
+  assert.deepEqual(sql.securityContext.capabilities, { drop: ['ALL'], add: ['NET_BIND_SERVICE'] });
+  assert.equal(sql.securityContext.allowPrivilegeEscalation, false);
   const [job] = await renderRuntime(config(), 'bootstrap');
   assert.deepEqual(job.spec.template.spec.initContainers[0].command, ['/usr/local/bin/database-bootstrap']);
   assert.deepEqual(job.spec.template.spec.containers[0].command, ['/usr/local/bin/arrowcol-migrate']);
   assert.equal(job.spec.backoffLimit, 0);
   const workload = await renderRuntime(config(), 'workload');
+  for (const deployment of workload.filter((o) => o.kind === 'Deployment')) {
+    assert.deepEqual(deployment.spec.template.spec.containers[0].securityContext.capabilities, { drop: ['ALL'] });
+  }
   assert.equal(JSON.stringify(workload).includes('arrowcol-sql-migration'), false);
   assert.equal(JSON.stringify(workload).includes('arrowcol-sql-admin'), false);
 });

@@ -119,7 +119,9 @@ export async function renderRuntime(input: unknown, phase: Phase): Promise<Resou
       pvc('arrowcol-sql', '32Gi'), pvc('arrowcol-catalog', '16Gi'),
       service('arrowcol-sql', 1433),
       deployment('arrowcol-sql', [{
-        name: 'sqlserver', image: c.images.sqlserver, securityContext: security,
+        name: 'sqlserver', image: c.images.sqlserver,
+        // The pinned sqlservr executable has cap_net_bind_service=ep; dropping it denies exec.
+        securityContext: { ...security, capabilities: { drop: ['ALL'], add: ['NET_BIND_SERVICE'] } },
         env: [env('ACCEPT_EULA', 'Y'), env('MSSQL_PID', 'Developer'), env('MSSQL_MEMORY_LIMIT_MB', '2048'),
           env('MSSQL_SA_PASSWORD_FILE', '/run/sa/password')],
         ports: [{ containerPort: 1433 }], resources: resources('1', '3Gi', '2', '4Gi'),
