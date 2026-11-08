@@ -3,6 +3,7 @@ import path from 'node:path';
 import { redactString, renderTable, toSafeJsonValue, writeFileAtomic, type Column } from '../../../tools/libs/experiment-kit/src/report.js';
 import { formatDuration, MIB, type Profile } from './profile.js';
 import type { TrialResult } from './scenario.js';
+import { stringify as stringifyYaml } from 'yaml';
 
 /** Append-only raw evidence (QAP samples, extents, Delta snapshots, log groups), one redacted JSON object per line. */
 export class Evidence {
@@ -44,10 +45,10 @@ export function positiveControl(trials: TrialResult[]): Control {
   const unseen = reloads.filter(trial => !reloadSeen(trial));
   if (unseen.length) return { status: 'not-detected', detail: unseen.map(whyNotSeen).join('; ') + '.' };
   return { status: 'detected', detail: reloads.map(trial => `${trial.trial} re-read ${trial.reads!.unchanged.files}/` +
-    `${trial.files!.unchanged} files`).join('; ') + ': StorageBlobLogs capture QAP reads.' };
+    `${trial.files!.unchanged} files`).join('; ') + ': Azure Monitor read logs capture QAP reads.' };
 }
 
-export type CleanupStatus = 'done' | 'failed' | 'nothing';
+export type CleanupStatus = 'done' | 'failed' | 'nothing' | 'retained';
 export interface Cleanup { status: CleanupStatus; errors: string[] }
 
 export interface RunReport {
@@ -56,10 +57,12 @@ export interface RunReport {
   finishedAt: string;
   durationMs: number;
   profile: Record<string, unknown>;
-  location: { account: string; container: string; database: string; workspace: string; workspaceCustomerId?: string; principal?: string };
+  location: { account: string; container: string; database: string; workspace: string; workspaceCustomerId?: string; principal?: string;
+    readLogSource?: 'log-analytics' | 'storage'; readLogAccount?: string };
   trials: TrialResult[];
   control: Control;
   cleanup: Cleanup;
+  inspection?: { mode: 'read-only'; deadline: string; tables: string[] };
   interrupted: boolean;
   error?: string;
   exitCode: number;
@@ -107,20 +110,27 @@ export function resultsTable(trials: TrialResult[], secrets: readonly string[] =
 }
 
 export function queryFile(out: string, trial: TrialResult, raw = false): string {
-  return path.join(out, 'queries', `${trial.trial}${raw ? '.raw' : ''}.kql`);
+  return path.join(out, 'queries', `${trial.trial}${raw ? '.raw' : ''}.${trial.storageReadQuery ? 'yaml' : 'kql'}`);
 }
 
 /** How to re-run the StorageBlobLogs queries once late logs have arrived. */
-export function lateLogHelp(report: RunReport, out: string): string {
+export function lateLogHelp(report: RunReport, out: string, workingDirectory = process.cwd()): string {
   const trials = report.trials.filter(trial => trial.readsQuery);
   if (!trials.length) return '';
+  if (trials.some(trial => trial.storageReadQuery)) return [
+    `Read evidence comes from Azure Monitor diagnostic storage ${report.location.readLogAccount}.`,
+    'Set REPORT to the absolute directory containing report.md, then run from a repository checkout:',
+    ...trials.map(trial => `  npx --no-install tsx experiments/azure-qap/src/read-logs.ts --query "$REPORT/queries/${trial.trial}.yaml"`),
+    'The *.raw.yaml queries return individual events. Owned HTTP receipts are preserved under http-traces/.',
+    'Only this run path and shared principal are eligible; recorded driver, fixture and maintenance requests are excluded.',
+  ].join('\n');
   const workspace = report.location.workspaceCustomerId ?? '<workspace customer id>';
   return [
     `StorageBlobLogs often land 2-10 minutes late. Re-check any trial later (workspace ${report.location.workspace}):`,
     ...trials.map(trial => `  az monitor log-analytics query -w ${workspace} --analytics-query @${
-      path.relative(process.cwd(), queryFile(out, trial))} -o table`),
-    `Or paste a query file from ${path.relative(process.cwd(), path.join(out, 'queries'))}/ into the workspace's Logs blade.`,
-    'Rows with Phase == "after-mutation" and OperationName GetBlob/ReadFile on files the mutation did not touch are QAP re-reads;',
+      path.relative(workingDirectory, queryFile(out, trial))} -o table`),
+    `Or paste a query file from ${path.relative(workingDirectory, path.join(out, 'queries'))}/ into the workspace's Logs blade.`,
+    'Only rows with the shared principal and this run path are counted; recorded owned-client requests are excluded;',
     'the *.raw.kql files list individual requests.',
   ].join('\n');
 }
@@ -129,7 +139,9 @@ function finding(trial: TrialResult): string | undefined {
   if (!trial.reads || !trial.files) return trial.error ? `- **${trial.trial}**: ${trial.status}: ${trial.error}` : undefined;
   const reread = trial.reads.unchanged;
   const verdict = trial.operation === 'reload' ? 'positive control'
-    : reread.files ? 'QAP re-read files the mutation did not change' : 'no unchanged file was re-read';
+    : reread.files ? 'QAP re-read files the mutation did not change'
+      : trial.telemetry === 'complete' ? 'no unchanged file was re-read'
+        : 'read telemetry is incomplete; absence of re-reads is not established';
   return `- **${trial.trial}** (${trial.telemetry === 'complete' ? 'logs complete' : 'logs still arriving'}): ` +
     `${reread.files}/${trial.files.unchanged} unchanged files (${mib(reread.bytes)} MiB) re-read after ${trial.operation}; ` +
     `${verdict}. Extents kept ${trial.extents?.keptRows ?? '?'}/${trial.extents?.untouchedRows ?? '?'} rows; ` +
@@ -144,6 +156,8 @@ export function renderMarkdown(report: RunReport, out: string): string {
     '',
     `Storage \`${report.location.account}/${report.location.container}/runs/${report.runId}/\`, Kusto database ` +
       `\`${report.location.database}\`, Log Analytics workspace \`${report.location.workspace}\`.`,
+    ...(report.location.readLogSource ? ['', `Read evidence source: \`${report.location.readLogSource}\`` +
+      (report.location.readLogAccount ? ` (\`${report.location.readLogAccount}\`).` : '.')] : []),
     '',
     `Profile: \`${JSON.stringify(report.profile)}\``,
     '',
@@ -168,20 +182,30 @@ export function renderMarkdown(report: RunReport, out: string): string {
     '- *Regressions*: times QAP looked caught up and then fell behind again.',
     '',
     `## Cleanup: ${report.cleanup.status}`,
+    ...(report.inspection ? [`Read-only inspection deadline: ${report.inspection.deadline}. ` +
+      'Retained is a handoff snapshot, not proof of cleanup; collect final artifacts with receipt-scoped cleanup.'] : []),
     '',
     ...report.cleanup.errors.map(error => `- ${error}`),
     '',
   ];
-  const help = lateLogHelp(report, out);
-  if (help) lines.push('## Late logs', '', '```text', help, '```', '');
+  const help = lateLogHelp(report, out, out);
+  if (help) lines.push('## Late logs', '', report.location.readLogSource === 'storage'
+    ? 'The commands below work with a copied report; use its directory as REPORT.'
+    : 'Run these commands from the directory containing `report.md`.',
+    '', '```text', help, '```', '');
   return lines.join('\n');
 }
 
 export async function writeReport(report: RunReport, out: string, secrets: readonly string[] = []): Promise<void> {
   fs.mkdirSync(path.join(out, 'queries'), { recursive: true });
   for (const trial of report.trials) {
-    if (trial.readsQuery) await writeFileAtomic(queryFile(out, trial), trial.readsQuery + '\n');
-    if (trial.rawQuery) await writeFileAtomic(queryFile(out, trial, true), trial.rawQuery + '\n');
+    if (trial.storageReadQuery) {
+      await writeFileAtomic(queryFile(out, trial), stringifyYaml(trial.storageReadQuery));
+      await writeFileAtomic(queryFile(out, trial, true), stringifyYaml({ ...trial.storageReadQuery, raw: true }));
+    } else {
+      if (trial.readsQuery) await writeFileAtomic(queryFile(out, trial), trial.readsQuery + '\n');
+      if (trial.rawQuery) await writeFileAtomic(queryFile(out, trial, true), trial.rawQuery + '\n');
+    }
   }
   const plain: unknown = JSON.parse(JSON.stringify(report));
   await writeFileAtomic(path.join(out, 'report.json'), JSON.stringify(toSafeJsonValue(plain, secrets), null, 2) + '\n');

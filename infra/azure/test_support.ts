@@ -46,6 +46,8 @@ export class FakeAzure extends Azure {
     return this;
   }
   override async arm(method: string, resourcePath: string, ..._args: any[]): Promise<any> {
+    if (resourcePath === this.c.identity_id) return { tags: { ...this.tags }, properties: { clientId: SUB, principalId: SUB } };
+    if (resourcePath === this.c.identity_id) return { tags: { ...this.tags }, properties: { clientId: SUB, principalId: SUB } };
     if (resourcePath.includes('/diagnosticSettings/'))
       return this.diagnostic ? { properties: { logs: [{ category: 'StorageRead', enabled: true }] } } : null;
     if (resourcePath.endsWith('/blobServices/default')) return { properties: this.settings };

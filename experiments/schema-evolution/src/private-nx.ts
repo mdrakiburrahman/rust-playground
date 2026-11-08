@@ -6,8 +6,9 @@ import { Config, load_env, run_tree } from '../../../infra/azure/bootstrap.ts';
 const WORKSPACE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const CLI_CONTEXT = new Set(['AZURE_CONFIG_DIR', 'AZURE_EXTENSION_DIR']);
 
-export function privateEnvironment(values: Record<string, string>, ambient: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const config = new Config(values);
+export function privateEnvironment(values: Record<string, string>, ambient: NodeJS.ProcessEnv, mode: string): NodeJS.ProcessEnv {
+  if (mode !== 'schema-evolution') throw new Error('Private Nx requires explicit --mode schema-evolution.');
+  const config = new Config(values, 'schema-evolution');
   if (config.group !== 'rust-playground-schema-evo')
     throw new Error('Private Nx execution requires the isolated schema-evo resource group.');
   const env = { ...ambient };
@@ -17,12 +18,12 @@ export function privateEnvironment(values: Record<string, string>, ambient: Node
 
 export function privateCommand(argv: string[]): { command: string[]; envFile: string } {
   const { values, positionals } = parseArgs({ args: argv, allowPositionals: true, options: {
-    'env-file': { type: 'string' }, 'ready-env': { type: 'string' }, tables: { type: 'string' },
+    mode: { type: 'string' }, 'env-file': { type: 'string' }, 'ready-env': { type: 'string' }, tables: { type: 'string' },
     output: { type: 'string' }, out: { type: 'string' }, 'wait-seconds': { type: 'string' },
   } });
   if (positionals.length !== 1 || argv[0] !== positionals[0] ||
-      !['provision', 'run'].includes(positionals[0]!) || !values['env-file'])
-    throw new Error('Use private-nx.ts provision|run --env-file <approved-private-input> with target options.');
+      !['provision', 'run'].includes(positionals[0]!) || !values['env-file'] || values.mode !== 'schema-evolution')
+    throw new Error('Use private-nx.ts provision|run --mode schema-evolution --env-file <approved-private-input> with target options.');
   const provision = positionals[0] === 'provision';
   if (provision ? !values.tables || !values.output || values['ready-env'] || values.out :
     !values['ready-env'] || values.tables || values.output || values['wait-seconds'])
@@ -35,8 +36,8 @@ export function privateCommand(argv: string[]): { command: string[]; envFile: st
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   const { command, envFile } = privateCommand(argv);
   const values = load_env(path.resolve(WORKSPACE, envFile));
-  const config = new Config(values);
-  const result = await run_tree(command, 5400, WORKSPACE, privateEnvironment(values, process.env));
+  const config = new Config(values, 'schema-evolution');
+  const result = await run_tree(command, 5400, WORKSPACE, privateEnvironment(values, process.env, 'schema-evolution'));
   const redacted = (text: string) => text.split('\n').map(line => config.redact(line)).join('\n');
   process.stdout.write(redacted(result.stdout));
   process.stderr.write(redacted(result.stderr));

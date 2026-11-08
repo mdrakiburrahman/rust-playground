@@ -1,8 +1,10 @@
-import { anchorMinute, checkMutation, trialName, type Fixtures, type SourceDelta } from './fixtures.js';
+import { anchorMinute, checkMutation, trialName, type Fixtures, type Snapshot, type SourceDelta } from './fixtures.js';
 import { describeSample, kql, ready, retainedExtentRows, unacceleratedRows, type AccelerationSample, type Kusto,
   type Target } from './kusto.js';
 import { formatDuration, MIB, type Operation, type Profile } from './profile.js';
 import { bodyReads, rawQuery, readsQuery, waitForLogs, type LogsQuery, type ReadScope, type ReadSummary } from './storage-reads.js';
+import type { OwnedReads } from './owned-reads.js';
+import type { StorageReadQuery } from './storage-export.js';
 
 export class BudgetExceeded extends Error {}
 
@@ -15,8 +17,9 @@ export const systemClock: Clock = {
   now: () => Date.now(),
   sleep: (ms, signal) => new Promise((resolve, reject) => {
     signal.throwIfAborted();
-    const timer = setTimeout(resolve, ms);
-    signal.addEventListener('abort', () => { clearTimeout(timer); reject(signal.reason); }, { once: true });
+    const onAbort = () => { clearTimeout(timer); reject(signal.reason); };
+    const timer = setTimeout(() => { signal.removeEventListener('abort', onAbort); resolve(); }, ms);
+    signal.addEventListener('abort', onAbort, { once: true });
   }),
 };
 
@@ -140,6 +143,7 @@ export interface TrialResult {
   logPolls?: number;
   readsQuery?: string;
   rawQuery?: string;
+  storageReadQuery?: StorageReadQuery;
 }
 
 export interface TrialEnvironment {
@@ -151,7 +155,8 @@ export interface TrialEnvironment {
   source: (trial: Trial) => string;
   principal: string;
   /** Absent when Log Analytics is not configured or `--log-wait 0`. */
-  logs?: { query: LogsQuery; scope: Omit<ReadScope, 'prefix'> };
+  logs?: { query: LogsQuery; scope: Omit<ReadScope, 'prefix'>; storageAccount?: string;
+    ownedReads?: (trial: string) => OwnedReads };
   clock: Clock;
   narrator: Narrator;
   deadline: number;
@@ -162,6 +167,7 @@ export interface TrialEnvironment {
   record: (trial: string, kind: string, data: unknown) => void;
   /** Registers a Kusto table for cleanup before it is created. */
   created: (table: string) => void;
+  inspectionTarget?: (trial: Trial, after: Snapshot) => void;
 }
 
 function mib(bytes: number): string {
@@ -198,6 +204,7 @@ export async function runTrial(env: TrialEnvironment, trial: Trial): Promise<Tri
   let delta: SourceDelta;
   let mutationAt: number;
   let windowEnd: number;
+  let readFrom = started - 60_000;
   try {
     // 1. Seed: a tiny Hive-partitioned Delta table, built from server-side copies of one Parquet file.
     const anchor = anchorMinute(clock.now());
@@ -217,6 +224,7 @@ export async function runTrial(env: TrialEnvironment, trial: Trial): Promise<Tri
     say(`ACCELERATE: creating external table ${trial.table} and enabling Query Acceleration.`);
     show('Kusto commands', `${kql.create(trial.table, env.source(trial))}\n${kql.policy(trial.table, env.principal)}`);
     env.created(trial.table);
+    if (env.logs?.ownedReads) readFrom = clock.now();
     await kusto.create(trial.table, env.source(trial), env.principal, signal, env.deadline);
     const accelerating = clock.now();
     say(`Waiting for QAP to accelerate Delta v${seed.version} (${seed.rows} rows). Poll every ${formatDuration(profile.pollMs)} with:`);
@@ -280,6 +288,7 @@ export async function runTrial(env: TrialEnvironment, trial: Trial): Promise<Tri
     const retained = retainedExtentRows(extentsBefore, extentsAfter, untouched);
     result.extents = { untouchedRows: retained.before, keptRows: retained.kept, unacceleratedRows: unacceleratedRows(extentsAfter) };
     await kusto.parity(trial.table, after.expectedGroups, signal);
+    env.inspectionTarget?.(trial, after);
     say(`QAP recovered ${formatDuration(result.recoveryMs)} after the mutation (${result.regressions} regression(s)). ` +
       `Untouched partitions kept ${retained.kept}/${retained.before} rows in their original extents; parity OK.`);
   } catch (error) {
@@ -295,11 +304,22 @@ export async function runTrial(env: TrialEnvironment, trial: Trial): Promise<Tri
   }
 
   // 5. Log wait: count which unchanged files Kusto's identity read again, using StorageBlobLogs.
-  const scope = env.logs && { ...env.logs.scope, prefix: trial.prefix };
+  let scope: ReadScope | undefined;
+  try {
+    scope = env.logs && { ...env.logs.scope, prefix: trial.prefix,
+      ...(env.logs.ownedReads ? { owned: env.logs.ownedReads(trial.name) } : {}) };
+  } catch (error) {
+    result.status = 'failed';
+    result.error = `Owned read attribution: ${message(error)}`;
+    say(`FAILED: ${result.error}`);
+    return finish();
+  }
   if (scope) {
-    const window = { from: started - 60_000, mutationAt, windowEnd };
+    const window = { from: readFrom, mutationAt, windowEnd };
     result.readsQuery = readsQuery(scope, window);
     result.rawQuery = rawQuery(scope, window.from);
+    if (env.logs?.storageAccount)
+      result.storageReadQuery = { source: 'storage', logAccount: env.logs.storageAccount, scope, window };
   }
   if (!env.logs || !scope || profile.logWaitMs === 0) {
     result.status = 'late-logs-pending';
@@ -308,12 +328,13 @@ export async function runTrial(env: TrialEnvironment, trial: Trial): Promise<Tri
     return finish();
   }
   const deadline = Math.min(clock.now() + profile.logWaitMs, env.deadline);
-  say(`LOG WAIT: StorageBlobLogs usually arrive minutes late. Polling every ${formatDuration(profile.logPollMs)} ` +
-    `for up to ${formatDuration(deadline - clock.now())} with this Log Analytics query:`);
-  show('Log Analytics query', result.readsQuery!, trial.prefix, true);
+  const destination = env.logs.storageAccount ? 'Azure Monitor diagnostic storage export' : 'StorageBlobLogs';
+  say(`LOG WAIT: ${destination}. Polling every ${formatDuration(profile.logPollMs)} ` +
+    `for up to ${formatDuration(deadline - clock.now())}; saved queries include the owned-request exclusions.`);
+  if (!env.logs.storageAccount) show('Log Analytics query', result.readsQuery!, trial.prefix, true);
   let lastStatus = '';
   try {
-    const wait = await waitForLogs({ query: env.logs.query, scope, window: { from: started - 60_000, mutationAt, windowEnd },
+    const wait = await waitForLogs({ query: env.logs.query, scope, window: { from: readFrom, mutationAt, windowEnd },
       deadline, pollMs: profile.logPollMs, signal: env.interrupt, now: () => clock.now(), sleep: clock.sleep,
       nudge: async () => { await kusto.marker(trial.table, env.interrupt); },
       onPoll: (groups, status) => {
@@ -333,7 +354,7 @@ export async function runTrial(env: TrialEnvironment, trial: Trial): Promise<Tri
       `(${mib(result.reads.unchanged.bytes)}) after the ${trial.operation}.`);
   } catch (error) {
     result.status = 'failed';
-    result.error = `Log Analytics: ${env.interrupt.aborted ? 'interrupted' : message(error)}`;
+    result.error = `Read telemetry: ${env.interrupt.aborted ? 'interrupted' : message(error)}`;
     say(`FAILED: ${result.error}`);
   }
   return finish();

@@ -30,9 +30,10 @@ class OfflineAzure {
 }
 
 async function main(): Promise<void> {
-  const [mode, config, manifest, store] = process.argv.slice(2);
+  const [mode, config, manifest, store, azureMode = 'stamped'] = process.argv.slice(2);
+  if (!['stamped', 'schema-evolution'].includes(azureMode)) throw new Error('invalid explicit Azure mode');
   const values = JSON.parse(readFileSync(config, 'utf8'));
-  const c = new Config(values);
+  const c = new Config(values, azureMode === 'schema-evolution' ? 'schema-evolution' : undefined);
   if (mode === 'child-env') {
     console.log(JSON.stringify(initializer_env(values, c, manifest, store)));
     return;

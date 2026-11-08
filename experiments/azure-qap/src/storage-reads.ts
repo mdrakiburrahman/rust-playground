@@ -1,8 +1,9 @@
 import { HttpFailure, Failure, type Azure } from '../../../infra/azure/bootstrap.ts';
 import { object, type Sleep } from './kusto.js';
+import type { OwnedReads } from './owned-reads.js';
 
 export type Phase = 'warm-up' | 'after-mutation' | 'late';
-/** One summarized StorageBlobLogs group: requests by the Kusto identity for one file, operation and status. */
+/** One summarized ADX-attributed StorageBlobLogs group for one file, operation and status. */
 export interface ReadGroup {
   phase: Phase;
   path: string;
@@ -11,6 +12,7 @@ export interface ReadGroup {
   requests: number;
   bytes: number;
   last: string;
+  userAgent: string;
 }
 export interface ReadScope {
   workspace: string;
@@ -18,10 +20,11 @@ export interface ReadScope {
   container: string;
   requester: string;
   prefix: string;
+  owned?: OwnedReads;
 }
 export interface ReadWindow { from: number; mutationAt: number; windowEnd: number }
 export interface ReadSummary { files: number; bytes: number; requests: number; paths: string[] }
-export type LogsQuery = (query: string, signal: AbortSignal) => Promise<unknown>;
+export type LogsQuery = (query: string, signal: AbortSignal, context?: { scope: ReadScope; window: ReadWindow }) => Promise<unknown>;
 
 /** Late events must be this far past the watch window before an absence of window reads is trusted. */
 export const LATE_MARGIN_MS = 60_000;
@@ -41,6 +44,10 @@ function quote(value: string): string {
   return JSON.stringify(value);
 }
 
+export function isAdxUserAgent(value: string): boolean {
+  return /kusto|azure[ ._\/-]?data[ ._\/-]?explorer/i.test(value);
+}
+
 function iso(ms: number): string {
   return new Date(ms).toISOString();
 }
@@ -49,6 +56,17 @@ export function validateScope(scope: ReadScope): void {
   if (!/^[a-z0-9]{3,24}$/.test(scope.account) || !/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/.test(scope.container) ||
       !/^[0-9a-f-]{36}$/i.test(scope.requester) || !/^runs\/[a-z0-9_]+\/[a-z0-9_]+\/$/.test(scope.prefix))
     throw new Error('Invalid storage read scope.');
+  if (scope.owned && (!/^arrowcol-qap\/[a-z0-9_]+\/[a-z0-9_]+$/.test(scope.owned.marker) ||
+      !scope.owned.requestIds.length || scope.owned.requestIds.some(id => !/^[0-9a-f-]{36}$/i.test(id))))
+    throw new Error('Invalid or incomplete owned-read exclusions.');
+}
+
+function attribution(scope: ReadScope): string {
+  if (!scope.owned)
+    return '| where UserAgentHeader contains "Kusto" or UserAgentHeader contains "Azure-Data-Explorer" or UserAgentHeader contains "Azure Data Explorer" or UserAgentHeader contains "AzureDataExplorer"';
+  return `| where UserAgentHeader != ${quote(scope.owned.marker)}
+| where CorrelationId !in~ (${scope.owned.requestIds.map(quote).join(', ')})
+| where ClientRequestId !in~ (${scope.owned.requestIds.map(quote).join(', ')})`;
 }
 
 /** The Log Analytics query the demo runs (printed verbatim so it can be pasted into the portal). */
@@ -58,12 +76,14 @@ export function readsQuery(scope: ReadScope, window: ReadWindow): string {
 | where TimeGenerated >= datetime(${iso(window.from)})
 | where AccountName == ${quote(scope.account)} and Category == "StorageRead"
 | where RequesterObjectId =~ ${quote(scope.requester)}
+${attribution(scope)}
 | where Uri contains ${quote(`/${scope.container}/${scope.prefix}`)}
-| distinct TimeGenerated, CorrelationId, OperationName, Uri, StatusCode, ResponseBodySize
-| extend Phase = case(TimeGenerated < datetime(${iso(window.mutationAt)}), "warm-up",
+| distinct TimeGenerated, CorrelationId, OperationName, Uri, StatusCode, ResponseBodySize, UserAgentHeader
+| extend UserAgent = tostring(UserAgentHeader),
+         Phase = case(TimeGenerated < datetime(${iso(window.mutationAt)}), "warm-up",
                       TimeGenerated < datetime(${iso(window.windowEnd)}), "after-mutation", "late"),
          Path = tostring(split(Uri, "?")[0])
-| summarize Requests = count(), Bytes = sum(ResponseBodySize), Last = max(TimeGenerated) by Phase, Path, OperationName, StatusCode
+| summarize Requests = count(), Bytes = sum(ResponseBodySize), Last = max(TimeGenerated) by Phase, Path, OperationName, StatusCode, UserAgent
 | order by Phase asc, Path asc`;
 }
 
@@ -72,8 +92,10 @@ export function rawQuery(scope: ReadScope, fromMs: number): string {
   validateScope(scope);
   return `StorageBlobLogs
 | where TimeGenerated >= datetime(${iso(fromMs)})
+| where AccountName == ${quote(scope.account)} and Category == "StorageRead"
 | where RequesterObjectId =~ ${quote(scope.requester)} and Uri contains ${quote(`/${scope.container}/${scope.prefix}`)}
-| project TimeGenerated, OperationName, StatusCode, ResponseBodySize, Uri
+${attribution(scope)}
+| project TimeGenerated, OperationName, StatusCode, ResponseBodySize, Uri, UserAgentHeader
 | order by TimeGenerated asc`;
 }
 
@@ -90,17 +112,19 @@ export function parseReads(response: unknown, scope: ReadScope): ReadGroup[] {
     return index;
   };
   const index = { phase: at('Phase'), path: at('Path'), operation: at('OperationName'), status: at('StatusCode'),
-    requests: at('Requests'), bytes: at('Bytes'), last: at('Last') };
+    requests: at('Requests'), bytes: at('Bytes'), last: at('Last'), userAgent: at('UserAgent') };
   const hosts = [`${scope.account}.blob.core.windows.net`, `${scope.account}.dfs.core.windows.net`];
   const root = `/${scope.container}/${scope.prefix}`;
   const groups: ReadGroup[] = [];
   for (const raw of table.rows) {
     if (!Array.isArray(raw) || raw.length !== columns.length) throw new Error('Malformed storage log row.');
     const phase = raw[index.phase];
+    const userAgent = String(raw[index.userAgent] ?? '');
     const url = new URL(String(raw[index.path]));
     const pathname = decodeURIComponent(url.pathname);
-    // Listing calls carry the prefix in their query string; only per-file requests are evidence.
-    if (!hosts.includes(url.hostname) || !pathname.startsWith(root)) continue;
+    // Listing calls carry the prefix in their query string; only ADX-attributed per-file requests are evidence.
+    if (!hosts.includes(url.hostname) || !pathname.startsWith(root) ||
+        (scope.owned ? userAgent === scope.owned.marker : !isAdxUserAgent(userAgent))) continue;
     const requests = raw[index.requests];
     const bytes = raw[index.bytes] ?? 0;
     const status = Number(raw[index.status]);
@@ -109,7 +133,7 @@ export function parseReads(response: unknown, scope: ReadScope): ReadGroup[] {
         typeof raw[index.last] !== 'string')
       throw new Error('Storage log group is malformed.');
     groups.push({ phase, path: pathname.slice(root.length), operation: raw[index.operation] as string, status, requests, bytes,
-      last: raw[index.last] as string });
+      last: raw[index.last] as string, userAgent });
   }
   return groups;
 }
@@ -152,8 +176,8 @@ export interface LogWaitOptions {
 }
 
 /**
- * StorageBlobLogs arrive minutes late and out of order. Logs count as complete only when the Kusto identity's own
- * later traffic (Delta-log polling) has arrived well past the watch window and the in-window picture stopped changing.
+ * StorageBlobLogs arrive minutes late and out of order. Logs count as complete only when ADX-marked
+ * Delta-log polling has arrived well past the watch window and the in-window picture stopped changing.
  */
 export async function waitForLogs(options: LogWaitOptions): Promise<LogWait> {
   const now = options.now ?? Date.now;
@@ -174,7 +198,7 @@ export async function waitForLogs(options: LogWaitOptions): Promise<LogWait> {
       await options.nudge().catch(() => undefined);
     }
     try {
-      groups = parseReads(await options.query(text, options.signal), options.scope);
+      groups = parseReads(await options.query(text, options.signal, { scope: options.scope, window: options.window }), options.scope);
       lastError = undefined;
       const window = JSON.stringify(groups.filter(group => group.phase !== 'late')
         .map(group => [group.phase, group.path, group.operation, group.status, group.requests, group.bytes]).sort());

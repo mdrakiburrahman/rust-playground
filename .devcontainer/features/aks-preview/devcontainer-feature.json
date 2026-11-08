@@ -1,0 +1,8 @@
+{
+  "id": "aks-preview",
+  "version": "1.0.0",
+  "name": "Pinned AKS Azure CLI extension",
+  "installsAfter": [
+    "ghcr.io/devcontainers/features/azure-cli"
+  ]
+}

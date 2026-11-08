@@ -69,9 +69,9 @@ test('watch restarts the hold when QAP regresses after looking caught up', async
 });
 
 const BLOB = (trial: string) => `https://acct.blob.core.windows.net/experimentqap/runs/${RUN}/${trial}/`;
-const COLUMNS = ['Phase', 'Path', 'OperationName', 'StatusCode', 'Requests', 'Bytes', 'Last'].map(name => ({ name }));
+const COLUMNS = ['Phase', 'Path', 'OperationName', 'StatusCode', 'Requests', 'Bytes', 'Last', 'UserAgent'].map(name => ({ name }));
 const logRow = (trial: string, phase: string, path: string, last = '2025-01-01T10:01:00Z') =>
-  [phase, BLOB(trial) + path, 'GetBlob', 200, 1, MIB, last];
+  [phase, BLOB(trial) + path, 'GetBlob', 200, 1, MIB, last, 'Kusto/1.0'];
 
 interface Harness { env: TrialEnvironment; lines: string[]; kinds: string[]; calls: string[]; tables: string[] }
 
