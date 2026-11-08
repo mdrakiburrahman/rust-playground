@@ -64,6 +64,11 @@ QAP service-account federated credential automatically. The QAP pod receives
 only generated resource settings and the reset-generation secret; it does not
 mount the operator's Azure CLI cache or credentials.
 
+In stamped mode, the shared runtime UAMI also has container-scoped Blob Data
+Contributor on the stamp's data container for catalog and DFE writes, plus the
+experiment, checkpoint and website containers. These runtime write grants are
+not enabled in schema-evolution mode.
+
 The read-only runtime mounts writable Parquet staging at `/app/.temp/qap-stage`,
 inside the workspace as required by the fixture safety check. Native fixture
 copies use the same bounded, renewing CLI-or-workload credential provider as

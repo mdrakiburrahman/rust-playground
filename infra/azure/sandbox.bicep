@@ -166,6 +166,16 @@ resource readExperiment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   }
 }
 
+resource runtimeDataWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (azureMode == 'stamped') {
+  name: guid(data.id, identity.id, 'runtime-data-contributor')
+  scope: data
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
 resource runtimeExperimentWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (azureMode == 'stamped') {
   name: guid(experiment.id, identity.id, 'runtime-blob-contributor')
   scope: experiment

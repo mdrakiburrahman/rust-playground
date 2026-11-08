@@ -159,7 +159,7 @@ test('isolated deploy parameters retain hash ownership and suppress only stamped
   const sandbox = fs.readFileSync(path.join(b.ROOT, 'infra/azure/sandbox.bicep'), 'utf8');
   assert.match(main, /param azureMode string = 'stamped'/);
   assert.match(sandbox, /module aks '\.\/aks\.bicep' = if \(azureMode == 'stamped'\)/);
-  for (const name of ['runtimeExperimentWriter', 'runtimeControlWriter', 'runtimeExperimentAdmin', 'runtimeClusterReader', 'runtimeReadLogs'])
+  for (const name of ['runtimeDataWriter', 'runtimeExperimentWriter', 'runtimeControlWriter', 'runtimeExperimentAdmin', 'runtimeClusterReader', 'runtimeReadLogs'])
     assert.match(sandbox, new RegExp(`resource ${name} '[^']+' = if \\(azureMode == 'stamped'\\)`));
 });
 test('isolated initializer projection rejects ambient identity and carries explicit mode', () => {
@@ -1372,6 +1372,10 @@ test('Bicep adds experiment container, database, workspace and StorageRead diagn
   }
   assert.match(section('readExperiment'), /scope: experiment\n/);
   assert.match(section('readExperiment'), /2a2b9908-6ea1-4ae2-8e65-a410df84e7d1[\s\S]*principalId: identity\.properties\.principalId/);
+  const dataWriter = section('runtimeDataWriter');
+  assert.match(dataWriter, /name: guid\(data\.id, identity\.id, 'runtime-data-contributor'\)/);
+  assert.match(dataWriter, /scope: data\n/);
+  assert.match(dataWriter, /ba92f5b4-2d11-453d-a403-e96b0029c9fe[\s\S]*principalId: identity\.properties\.principalId[\s\S]*principalType: 'ServicePrincipal'/);
   assert.match(section('checkpointContainerScope'), /parent: blobs[\s\S]*name: checkpointContainer/);
   const controlWriter = section('runtimeControlWriter');
   assert.match(controlWriter, /name: guid\(checkpointContainerScope\.id, identity\.id, 'runtime-control-contributor'\)[\s\S]*scope: checkpointContainerScope[\s\S]*dependsOn: \[checkpoints\]/);
