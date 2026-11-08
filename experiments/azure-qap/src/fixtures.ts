@@ -4,6 +4,7 @@ import { HttpFailure, Failure, parse_xml, type Azure } from '../../../infra/azur
 import { runProcess, type ProcessOptions, type ProcessResult } from '../../../tools/libs/experiment-kit/src/experiment.js';
 import { groupKey, identifier, object } from './kusto.js';
 import type { Operation } from './profile.js';
+import { ownedReads, type OwnedReads } from './owned-reads.js';
 
 export interface SourceFile { path: string; bytes: number; partition: string }
 export interface ExpectedGroup { partition: string; id: number; value: number; payloadSha256: string; multiplicity: number }
@@ -150,6 +151,8 @@ export interface FixtureOptions {
   env: NodeJS.ProcessEnv;
   redact: (text: string) => string;
   run?: Runner;
+  httpTraceDirectory?: string;
+  httpMarker?: string;
 }
 
 /** Drives `qap-fixture` (seed/inspect) and `delta-maintenance` against `<root>/<trial>/`. */
@@ -157,6 +160,8 @@ export class Fixtures {
   readonly run: Runner;
   constructor(readonly options: FixtureOptions) {
     if (!options.root.endsWith('/')) throw new Error('Fixture root must end with a slash.');
+    if (Boolean(options.httpTraceDirectory) !== Boolean(options.httpMarker))
+      throw new Error('Owned HTTP tracing requires both a directory and a run marker.');
     this.run = options.run ?? runProcess;
   }
 
@@ -177,7 +182,7 @@ export class Fixtures {
     const args = this.seedArgs(trial, anchorMs, fileMib, files, tombstones, seconds);
     let value: Record<string, unknown>;
     for (let attempt = 1; ; attempt++) {
-      try { value = await this.command(this.experimentBinary, args, signal, seconds); break; }
+      try { value = await this.command(this.experimentBinary, args, signal, seconds, trial); break; }
       catch (error) {
         // seed-scale resumes from its durable manifest, so a dropped connection can be retried safely.
         if (attempt >= 3 || signal.aborted || !transientTransport(error)) throw error;
@@ -192,7 +197,7 @@ export class Fixtures {
 
   async inspect(trial: string, signal: AbortSignal, seconds = 600): Promise<Snapshot> {
     for (let attempt = 1; ; attempt++) {
-      try { return parseSnapshot(await this.command(this.experimentBinary, this.inspectArgs(trial, seconds), signal, seconds),
+      try { return parseSnapshot(await this.command(this.experimentBinary, this.inspectArgs(trial, seconds), signal, seconds, trial),
         trial, 'inspect-scale'); }
       catch (error) {
         if (attempt >= 3 || signal.aborted || !transientTransport(error)) throw error;
@@ -207,7 +212,7 @@ export class Fixtures {
     this.stage();
     for (const apply of [false, true]) {
       const result = await this.run(this.maintenanceBinary, maintenanceArgs(this.options.root, trial, operation, anchorMs, apply, now()),
-        { signal: AbortSignal.any([signal, AbortSignal.timeout(900_000)]), cwd: this.options.repo, env: this.options.env });
+        { signal: AbortSignal.any([signal, AbortSignal.timeout(900_000)]), cwd: this.options.repo, env: this.environment(trial) });
       if (result.aborted || result.exitCode !== 0 || !result.outputClosed || result.stdoutTruncated || result.stderrTruncated)
         throw new Error(this.options.redact(`delta-maintenance ${operation} ${apply ? 'apply' : 'dry run'} failed: ${tail(result.stderr)}`));
       const report = maintenanceReport(result.stdout);
@@ -221,6 +226,21 @@ export class Fixtures {
     return ['target/release/delta-maintenance', ...maintenanceArgs(this.options.root, trial, operation, anchorMs, true, nowMs)].join(' ');
   }
 
+  ownedReads(trial: string): OwnedReads {
+    identifier(trial);
+    if (!this.options.httpTraceDirectory || !this.options.httpMarker)
+      throw new Error('Owned HTTP tracing was not enabled; attribution is unavailable.');
+    return ownedReads(path.join(this.options.httpTraceDirectory, trial + '.jsonl'), `${this.options.httpMarker}/${trial}`);
+  }
+
+  private environment(trial: string): NodeJS.ProcessEnv {
+    if (!this.options.httpTraceDirectory || !this.options.httpMarker) return this.options.env;
+    identifier(trial);
+    fs.mkdirSync(this.options.httpTraceDirectory, { recursive: true, mode: 0o700 });
+    return { ...this.options.env, ARROWCOL_QAP_CLIENT_MARKER: `${this.options.httpMarker}/${trial}`,
+      ARROWCOL_QAP_HTTP_TRACE: path.resolve(this.options.httpTraceDirectory, trial + '.jsonl') };
+  }
+
   private stage(): void {
     if (this.options.env.TMPDIR) fs.mkdirSync(this.options.env.TMPDIR, { recursive: true });
   }
@@ -230,11 +250,11 @@ export class Fixtures {
     return ['--root', this.options.root, '--table', trial, '--allow-table', trial, '--timeout-seconds', String(seconds)];
   }
 
-  private async command(binary: string, args: string[], signal: AbortSignal, seconds: number): Promise<Record<string, unknown>> {
+  private async command(binary: string, args: string[], signal: AbortSignal, seconds: number, trial: string): Promise<Record<string, unknown>> {
     signal.throwIfAborted();
     this.stage();
     const result = await this.run(binary, args, { signal: AbortSignal.any([signal, AbortSignal.timeout((seconds + 120) * 1000)]),
-      cwd: this.options.repo, env: this.options.env, killGraceMs: 60_000, closeTimeoutMs: 5000 });
+      cwd: this.options.repo, env: this.environment(trial), killGraceMs: 60_000, closeTimeoutMs: 5000 });
     if (!result.outputClosed || result.stdoutTruncated || result.stderrTruncated)
       throw new Error('Fixture process did not close its output; its Delta state is unknown.');
     const lines = result.stdout.trim().split(/\r?\n/).filter(Boolean);

@@ -10,6 +10,9 @@ import { lateLogHelp, positiveControl, profileSummary, resultsTable, writeReport
   type RunReport } from './report.js';
 import { Narrator, planTrials, runTrial, systemClock, type Trial, type TrialEnvironment, type TrialResult } from './scenario.js';
 import { logsQuery } from './storage-reads.js';
+import { runKubernetes } from './kubernetes.js';
+import { storageExportQuery } from './storage-export.js';
+import { observeInspection, type InspectionTarget } from './inspection.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CLEANUP_MS = 5 * 60_000;
@@ -76,12 +79,15 @@ export async function main(argv: readonly string[]): Promise<number> {
   const runId = makeRunId(new Date(started));
   const out = path.resolve(ROOT, options.out ?? path.join('.temp/experiments/azure-qap', runId));
   const envFile = path.resolve(ROOT, options.env);
-  const values = { ...load_env(envFile), ...process.env } as Record<string, string>;
+  const generatedEnvFile = path.join(path.dirname(envFile), '.env.azure');
+  const generatedValues = fs.existsSync(generatedEnvFile) ? load_env(generatedEnvFile) : {};
+  const values = { ...load_env(envFile), ...generatedValues, ...process.env } as Record<string, string>;
   const generation = resetGeneration(values, envFile);
   const config = new Config(values);
   const azure = new Azure(config);
   const secrets = secretsFrom({ ...values, ARROWCOL_RESET_GENERATION: generation });
-  const redact = (text: string) => config.redact(text);
+  if (options.kubernetes) return runKubernetes({ options, argv, profile, azureConfig: config, generation, secrets });
+  const redact = (text: string) => secrets.reduce((value, secret) => value.replaceAll(secret, '******'), config.redact(text));
   fs.mkdirSync(out, { recursive: true });
   const evidence = new Evidence(path.join(out, 'evidence.jsonl'), secrets);
   const narrator = new Narrator(clock, started);
@@ -90,14 +96,16 @@ export async function main(argv: readonly string[]): Promise<number> {
   const trials = planTrials(runId, profile);
   const tables = new Set<string>();
   const results: TrialResult[] = [];
+  const inspectionTargets = new Map<string, InspectionTarget>();
   const location: RunReport['location'] = { account: config.account, container: config.experimentContainer,
     database: config.experimentDatabase, workspace: config.logAnalyticsWorkspace };
 
   const interrupt = new AbortController();
   let signals = 0;
+  let inspecting = false;
   const onSignal = (name: string) => {
     if (++signals === 1) {
-      console.log(`\n${name}: stopping trials; cleanup still runs (up to ${formatDuration(CLEANUP_MS)}), then the report is written.`);
+      console.log(`\n${name}: stopping ${inspecting ? 'read-only inspection' : 'trials'}; cleanup still runs (up to ${formatDuration(CLEANUP_MS)}), then the report is written.`);
       interrupt.abort(new Error(`Interrupted by ${name}.`));
       return;
     }
@@ -131,7 +139,7 @@ export async function main(argv: readonly string[]): Promise<number> {
     const [, container] = await azure.blob('HEAD', config.experimentContainer, '', { restype: 'container' }, undefined, {}, true);
     if (!Object.keys(container).length)
       throw new Error(`Storage container ${config.experimentContainer} is missing; run \`npx nx run azure-infra:provision\`.`);
-    say(`Kusto reads storage as managed identity ${principal} (StorageBlobLogs RequesterObjectId).`);
+    say(`Read evidence requires shared principal ${principal}, this trial's path and complete receipts excluding every owned client read.`);
     const capacity = await kusto.capacity(interrupt.signal).catch(() => undefined);
     say(`QAP capacity (\`.show capacity\`): ${capacity ? `total ${capacity.Total}, consumed ${capacity.Consumed}, ` +
       `remaining ${capacity.Remaining}` : 'not reported'}.`);
@@ -145,19 +153,37 @@ export async function main(argv: readonly string[]): Promise<number> {
       location.workspaceCustomerId = customerId;
       logs = { query: logsQuery(azure, customerId), scope: { workspace: customerId, account: config.account,
         container: config.experimentContainer, requester: principal } };
-      say(`StorageBlobLogs come from workspace ${config.logAnalyticsWorkspace} (customer ID ${customerId}).`);
+      if (config.readLogDestination === 'storage') {
+        const sink = await azure.arm('GET', config.readLogStorageId, undefined, false, '2023-05-01');
+        if (sink?.properties?.provisioningState !== 'Succeeded')
+          throw new Error('Diagnostic storage is not ready; provision the configured stamp first.');
+        logs.query = storageExportQuery(azure, config.readLogAccount,
+          (scope, rows) => evidence.record(scope.prefix.split('/')[2]!, 'storage-export-raw', { account: config.readLogAccount, scope, rows }));
+        logs.storageAccount = config.readLogAccount;
+        location.readLogSource = 'storage';
+        location.readLogAccount = config.readLogAccount;
+        say(`Read evidence comes from Azure Monitor diagnostic storage ${config.readLogAccount}; Log Analytics remains configured but is not a fallback.`);
+      } else {
+        location.readLogSource = 'log-analytics';
+        say(`StorageBlobLogs come from workspace ${config.logAnalyticsWorkspace} (customer ID ${customerId}).`);
+      }
     }
 
     const root = `abfss://${config.experimentContainer}@${config.account}.dfs.core.windows.net/runs/${runId}/`;
-    const fixtures = new Fixtures({ repo: ROOT, root, redact, env: childEnvironment(
+    const fixtures = new Fixtures({ repo: ROOT, root, redact,
+      httpTraceDirectory: path.join(out, 'http-traces', runId), httpMarker: `arrowcol-qap/${runId}`, env: childEnvironment(
       { ...process.env, ...values, ...config.generated(), ARROWCOL_RESET_GENERATION: generation },
-      root, path.join(ROOT, '.temp/qap-stage')) });
+      root, process.env.ARROWCOL_QAP_STAGE ?? path.join(ROOT, '.temp/qap-stage')) });
+    if (logs) logs.ownedReads = trial => fixtures.ownedReads(trial);
     const budget = AbortSignal.timeout(Math.max(1, started + profile.budgetMs - clock.now()));
     const source = (trial: Trial) => `${root}${trial.name};managed_identity=${principal}`;
     const environment: TrialEnvironment = { runId, profile, fixtures, kusto, source, principal, logs, clock, narrator,
       deadline: started + profile.budgetMs, budget, interrupt: interrupt.signal,
       record: (trial: string, kind: string, data: unknown) => evidence.record(trial, kind, data),
       created: (table: string) => { tables.add(table); } };
+    if (options.keepRunning) environment.inspectionTarget = (trial, after) =>
+      inspectionTargets.set(trial.table, { table: trial.table, version: after.version, rows: after.rows,
+        expectedGroups: after.expectedGroups });
     trialsStarted = true;
     await limited(trials, profile.parallel, async trial => {
       if (interrupt.signal.aborted) return;
@@ -172,6 +198,35 @@ export async function main(argv: readonly string[]): Promise<number> {
   console.log(`\n${resultsTable(results, secrets)}\n`);
   const control = positiveControl(results);
   say(`Positive control: ${control.status}: ${control.detail}`);
+
+  let inspection: RunReport['inspection'];
+  if (options.keepRunning && !error && !interrupt.signal.aborted && results.length === trials.length &&
+      results.every(result => result.status === 'complete' && result.telemetry === 'complete') &&
+      control.status === 'detected' && inspectionTargets.size === trials.length) {
+    inspecting = true;
+    const deadline = clock.now() + options.inspectionMs;
+    inspection = { mode: 'read-only', deadline: new Date(deadline).toISOString(), tables: [...tables] };
+    say(`Trials finished; NO further mutations. READ-ONLY INSPECTION every 30s until ${inspection.deadline}; then scoped cleanup.`);
+    try {
+      await observeInspection({ targets: [...inspectionTargets.values()], kusto, clock, deadline,
+        signal: AbortSignal.any([interrupt.signal, AbortSignal.timeout(options.inspectionMs)]),
+        say: text => say(redact(text)),
+        record: (table, kind, data) => evidence.record(table, kind, data),
+        onReady: async () => {
+          const now = clock.now();
+          const snapshot: RunReport = { runId, startedAt: new Date(started).toISOString(),
+            finishedAt: new Date(now).toISOString(), durationMs: now - started, profile: profileSummary(profile),
+            location, trials: results, control, cleanup: { status: 'retained', errors: [] },
+            inspection, interrupted: false, exitCode: 0 };
+          await writeReport(snapshot, out, secrets);
+          fs.writeFileSync(path.join(out, 'inspection-ready'), `${inspection!.deadline}\n`, { mode: 0o600 });
+          say(`Inspection-ready report written; workload is actively reading retained run tables. Deadline ${inspection!.deadline}.`);
+        } });
+    } catch (failure) { error = redact(message(failure)); }
+    fs.rmSync(path.join(out, 'inspection-ready'), { force: true });
+  } else if (options.keepRunning) {
+    say('Inspection NOT started: all trials and read telemetry must succeed with the reload control detected. Cleaning up now.');
+  }
 
   // Cleanup always runs once any trial may have written blobs or tables: after success, failure, budget overrun or Ctrl+C.
   const cleanup: Cleanup = { status: 'nothing', errors: [] };
@@ -194,7 +249,8 @@ export async function main(argv: readonly string[]): Promise<number> {
   const finished = clock.now();
   const report: RunReport = { runId, startedAt: new Date(started).toISOString(), finishedAt: new Date(finished).toISOString(),
     durationMs: finished - started, profile: profileSummary(profile), location, trials: results, control,
-    cleanup, interrupted: interrupt.signal.aborted, ...(error ? { error } : {}), exitCode: 0 };
+    cleanup, ...(inspection ? { inspection } : {}), interrupted: interrupt.signal.aborted && !inspecting,
+    ...(error ? { error } : {}), exitCode: 0 };
   report.exitCode = exitCode(report);
   await writeReport(report, out, secrets);
   const help = lateLogHelp(report, out);

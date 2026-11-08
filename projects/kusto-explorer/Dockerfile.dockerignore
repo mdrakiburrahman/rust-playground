@@ -9,7 +9,10 @@ dev
 docs
 node_modules
 target
-tools
+tools/*
+!tools/libs
+tools/libs/*
+!tools/libs/experiment-kit
 *.log
 .temp
 onelake
@@ -27,5 +30,7 @@ onelake
 sync
 !**/.env.example
 !**/.env.*.example
+infra/kubernetes/azure-qap.yaml
+infra/azure/stamp.yaml
 **/node_modules
 **/dist

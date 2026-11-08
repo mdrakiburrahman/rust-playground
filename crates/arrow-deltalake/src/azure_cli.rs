@@ -73,12 +73,102 @@ impl Default for BoundedAzureCli {
 }
 
 impl BoundedAzureCli {
+    async fn acquire_federated(&self) -> Result<Option<(Arc<AzureCredential>, u64)>> {
+        let client_id = std::env::var("AZURE_CLIENT_ID").ok();
+        let tenant_id = std::env::var("AZURE_TENANT_ID").ok();
+        let token_file = std::env::var("AZURE_FEDERATED_TOKEN_FILE").ok();
+        if client_id.is_none() && tenant_id.is_none() && token_file.is_none() {
+            return Ok(None);
+        }
+        let (Some(client_id), Some(tenant_id), Some(token_file)) = (client_id, tenant_id, token_file) else {
+            return Err(failure(
+                "workload identity requires client ID, tenant ID and token file",
+            ));
+        };
+        if !client_id
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || value == '-')
+            || !tenant_id
+                .chars()
+                .all(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '.'))
+        {
+            return Err(failure("workload identity identifiers are invalid"));
+        }
+        let assertion = tokio::fs::read_to_string(token_file)
+            .await
+            .map_err(|_| failure("projected workload identity token could not be read"))?;
+        let assertion = assertion.trim();
+        if assertion.is_empty() || assertion.len() > 16_384 {
+            return Err(failure("projected workload identity token is empty or too large"));
+        }
+        let endpoint = format!("https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token");
+        let client = reqwest::Client::builder()
+            .timeout(self.deadline)
+            .build()
+            .map_err(|_| failure("workload identity HTTP client could not be created"))?;
+        let response = client
+            .post(endpoint)
+            .form(&[
+                ("client_id", client_id.as_str()),
+                ("scope", self.scope.as_str()),
+                ("grant_type", "client_credentials"),
+                (
+                    "client_assertion_type",
+                    "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+                ),
+                ("client_assertion", assertion),
+            ])
+            .send()
+            .await
+            .map_err(|_| failure("workload identity token exchange request failed"))?;
+        if !response.status().is_success() {
+            return Err(failure("workload identity token exchange failed"));
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|_| failure("workload identity token response could not be read"))?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|_| failure("workload identity token response was invalid"))?;
+        if !value
+            .get("token_type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("bearer"))
+        {
+            return Err(failure("workload identity returned an unsupported token type"));
+        }
+        let token = value
+            .get("access_token")
+            .and_then(serde_json::Value::as_str)
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| failure("workload identity returned no access token"))?;
+        let expires_in = value
+            .get("expires_in")
+            .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
+            .ok_or_else(|| failure("workload identity returned no token lifetime"))?;
+        let remaining = expires_in
+            .checked_sub(30)
+            .filter(|seconds| *seconds > 0)
+            .ok_or_else(|| failure("workload identity token lifetime is too short"))?;
+        Ok(Some((
+            Arc::new(AzureCredential::BearerToken(token.to_owned())),
+            remaining.min(60),
+        )))
+    }
+
     async fn acquire(&self) -> Result<Arc<AzureCredential>> {
         let mut cache = self.cache.lock().await;
         if let Some(cached) = cache.as_ref()
             && Instant::now() < cached.until
         {
             return Ok(Arc::clone(&cached.token));
+        }
+        if let Some((credential, seconds)) = self.acquire_federated().await? {
+            *cache = Some(Cached {
+                token: Arc::clone(&credential),
+                until: Instant::now() + Duration::from_secs(seconds),
+            });
+            return Ok(credential);
         }
         let mut command = tokio::process::Command::new(&self.program);
         command
@@ -177,10 +267,19 @@ impl CredentialProvider for BoundedAzureCli {
     }
 }
 
-/// Azure CLI bearer-token source for one OAuth scope, sharing the storage provider's
+/// Azure CLI or projected workload bearer-token source for one OAuth scope, sharing the storage provider's
 /// bounded acquisition: owned process-group kill on deadline or cancellation, 64 KiB
 /// output bound, no stdout/stderr text in errors and a short token cache.
 pub struct AzureCliTokenProvider(BoundedAzureCli);
+
+#[async_trait::async_trait]
+impl CredentialProvider for AzureCliTokenProvider {
+    type Credential = AzureCredential;
+
+    async fn get_credential(&self) -> Result<Arc<Self::Credential>> {
+        self.0.get_credential().await
+    }
+}
 
 impl std::fmt::Debug for AzureCliTokenProvider {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

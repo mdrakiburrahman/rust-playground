@@ -1,0 +1,10 @@
+image: arrowcollector1.azurecr.io/azure-qap@sha256:0000000000000000000000000000000000000000000000000000000000000000
+resources:
+  requests:
+    cpu: "1"
+    memory: 2Gi
+  limits:
+    cpu: "2"
+    memory: 4Gi
+nodeSelector:
+  kubernetes.io/os: linux

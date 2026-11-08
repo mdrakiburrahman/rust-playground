@@ -2,7 +2,7 @@
 //! Dataflow canonical tables go through the real bootstrap initializer over injected control metadata and a
 //! disposable local store, and the manifest is published only after every table drains. Uses the
 //! dev-only `arrow-deltalake/test-control` seam; no Azure endpoint, token or process environment.
-//! The parent-chain case composes the real Python parent's child environment, the
+//! The parent-chain case composes the real TypeScript parent's child environment, the
 //! `initialize-delta.sh` contract, the real CLI parser and the parent's manifest validation; it does
 //! not execute the release binary, whose control transport is Azure-only by design.
 //! Compiled only in debug unix test builds, matching the seam gate in arrow-deltalake.
@@ -724,7 +724,7 @@ fn supervision_faults_always_kill_reap_and_propagate() -> Result<()> {
     Ok(())
 }
 
-/// Guarantees: the environment the Azure bootstrap parent composes for the child satisfies every
+/// Guarantees: the environment the real TypeScript parent composes for the child satisfies every
 /// precondition of `initialize-delta.sh`; the script's exact argv parses through the real CLI;
 /// the shared env parser and 13-table body then initialize every table over the guarded store
 /// and drain; and the parent's real manifest/Delta-log validation accepts that manifest and
@@ -732,19 +732,35 @@ fn supervision_faults_always_kill_reap_and_propagate() -> Result<()> {
 /// parent report NotReady without Kusto.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn parent_child_env_cli_body_and_parent_validation_compose() -> Result<()> {
+    parent_chain_for("stamped").await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn isolated_parent_child_env_cli_body_and_parent_validation_compose() -> Result<()> {
+    parent_chain_for("schema-evolution").await
+}
+
+async fn parent_chain_for(mode: &str) -> Result<()> {
     use arrowcol_loadgen::initialize::InitializeAzureConfig;
     use arrowcol_loadgen::{Cli, Command};
     use clap::Parser;
 
     let scratch = Scratch::new()?;
     let values = scratch.0.join("values.json");
+    let stamp_account = if mode == "stamped" {
+        "arrowcollector1"
+    } else {
+        "arrowcol582e3df61d82"
+    };
+    let stamp_root = format!("abfss://{CONTAINER}@{stamp_account}.dfs.core.windows.net/sandbox");
     std::fs::write(
         &values,
         serde_json::to_vec(&serde_json::json!({
-            "AZURE_SUBSCRIPTION_ID": "11111111-2222-4333-8444-555555555555",
-            "AZURE_STORAGE_ACCOUNT": ACCOUNT,
+            "AZURE_SUBSCRIPTION_ID": "00000000-0000-0000-0000-000000000001",
+            "AZURE_RESOURCE_GROUP": if mode == "stamped" { "arrow-collector-rg" } else { "rust-playground-schema-evo" },
+            "AZURE_STORAGE_ACCOUNT": stamp_account,
             "AZURE_STORAGE_CONTAINER": CONTAINER,
-            "ARROWCOL_AZURE_TABLE_ROOT": ROOT,
+            "ARROWCOL_AZURE_TABLE_ROOT": stamp_root,
         }))?,
     )?;
     let child: BTreeMap<String, String> = serde_json::from_value(parent(
@@ -754,15 +770,25 @@ async fn parent_child_env_cli_body_and_parent_validation_compose() -> Result<()>
             values.as_os_str(),
             scratch.manifest().as_os_str(),
             GENERATION.as_ref(),
+            mode.as_ref(),
         ],
     )?)?;
+    assert_eq!(
+        child.get("AZURE_STAMP").map(String::as_str),
+        if mode == "stamped" { Some("1") } else { None }
+    );
+    assert_eq!(
+        child.get("AZURE_STORAGE_ACCOUNT").map(String::as_str),
+        Some(stamp_account)
+    );
 
-    let script = std::fs::read_to_string(repository().join("infra/azure/initialize-delta.sh"))?;
+    let script = std::fs::read_to_string(repository().join("projects/arrowcol-infra/scripts/initialize-delta.sh"))?;
     let required: Vec<&str> = script
         .lines()
         .filter_map(|line| line.strip_prefix(": \"${")?.split_once(":?").map(|(key, _)| key))
         .collect();
-    assert_eq!(required.len(), 6, "{required:?}");
+    assert_eq!(required.len(), 7, "{required:?}");
+    assert_eq!(child.get("ARROWCOL_AZURE_MODE").map(String::as_str), Some(mode));
     for key in &required {
         assert!(child.get(*key).is_some_and(|value| !value.is_empty()), "{key}");
     }
@@ -813,6 +839,7 @@ async fn parent_child_env_cli_body_and_parent_validation_compose() -> Result<()>
                 values.as_os_str(),
                 scratch.manifest().as_os_str(),
                 scratch.data().as_os_str(),
+                mode.as_ref(),
             ],
         )
     };

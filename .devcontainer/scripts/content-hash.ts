@@ -111,7 +111,7 @@ export function normalizeText(contents: string): string {
 
 export function isContentHashInput(path: string): boolean {
   const normalized = path.replaceAll('\\', '/');
-  return imageBuildInputs.has(normalized);
+  return imageBuildInputs.has(normalized) || normalized.startsWith('.devcontainer/features/');
 }
 
 export function computeContentHash(entries: readonly HashEntry[]): string {
