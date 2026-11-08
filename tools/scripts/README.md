@@ -42,17 +42,26 @@ and `SHA256SUMS` before recreating the devcontainer.
 
 | Step | Required arguments | Expected result |
 | --- | --- | --- |
-| `verify` | `--expected-sha <full SHA>` | Clean exact draft PR head, green CI/all eight publications, regression/build gates, verified immutable images bound to actual Compose aliases, image smokes, SDK bundles. |
+| `verify` | None; optional `--expected-sha <full SHA>` | Clean checkout must match the exact live draft PR head; green CI/all eight publications, regression/build gates, verified immutable images bound to actual Compose aliases, image smokes, SDK bundles. |
 | `local` | `--verified-receipt <verify/receipt.json>` | Normal then Quiver crash/recovery, native local schema evolution, all 13 table SDK/artifact bundles, preserved private seals and no live attempt writers. |
-| `azure` | `--verified-receipt <verify/receipt.json> --resource-group <dedicated group> --env-file <private base> --ready-env <private ready output>` | Read-only ready-generation preflight, native Azure evolution, owned-process/data cleanup. Never provisions or resets. |
-| `reset` | `--verified-receipt <verify/receipt.json> --resource-group <group> --env-file <private base> --confirm-reset <same group>` | **Destructively resets only the explicitly confirmed isolated group.** Existing ready inputs become stale; obtain a fresh supported provision output before `azure`. |
+| `reset` | `--verified-receipt <verify/receipt.json> --confirm-reset <dedicated group>` | **Destructively resets only the explicitly confirmed isolated group**, then provisions and checks fresh readiness. Saves private base/ready/manifest files outside the checkout; receipt binds their hashes, generation and source. |
+| `azure` | `--reset-receipt <reset/receipt.json>` | Checks the receipt chain and live ready generation, runs native Azure evolution, verifies owned-process/data cleanup. Never provisions or resets. |
 
 `verify` requires existing Node dependencies, Docker/Buildx and GHCR pull
-authentication. Azure needs matching Azure CLI subscription context and separate
-approved private base/ready files from supported provisioning. No shared `.env.azure`
-or copied/invented generation is inferred. Subscription comes only from the approved
-private base; optional `--subscription <UUID>` must match it. Local failure stops owned services and
-archives diagnostics without automatically discarding/resetting the original attempt.
+authentication. Azure needs the synced `.env`, `infra/azure/stamp.yaml` and signed-in
+`az`. The CLI projects only the subscription and Kusto tags from `.env`; it uses
+`--resource-group`, defaulting to `rust-playground-schema-evo-qualification-20261108`,
+and refuses the old/default or any non-dedicated group. Private inputs are mode 0600
+in CLI-managed directories outside the checkout. Stamp/AKS/ACR identities and stale
+ready generations are never copied into the schema-evolution lane.
+
+Optional `--env-file` supplies an approved base instead; `azure --verified-receipt
+<verify/receipt.json> --ready-env <ready output>` supports an already-provisioned
+sandbox without resetting it. Optional `--subscription <UUID>` must match the base.
+Do not move/delete CLI-managed private state before the Azure step. A blocked
+CI/publication gate exits nonzero: wait for the automatic run, retain its failed
+evidence, then retry `verify` with a new evidence directory. Local failure stops
+owned services and archives diagnostics without discarding/resetting the attempt.
 
 ## Registry commands
 

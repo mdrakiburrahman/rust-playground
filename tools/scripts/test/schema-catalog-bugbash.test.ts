@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
-import { checkVerifiedReceipt, copyEvidence, copyEvolutionEvidence, createEvidenceDir, parseOptions, passedTests, positiveDfeSample, redactLog, selectPlatform,
+import { checkResetReceipt, checkVerifiedReceipt, copyEvidence, copyEvolutionEvidence, createEvidenceDir, derivedCloudInput, parseOptions, passedTests, positiveDfeSample, redactLog, selectPlatform,
   serviceImages, validateImage, type ImageIdentity } from '../src/schema-catalog-bugbash.js';
 import { PUBLISHED_RUNTIME_IMAGE_PROJECTS } from '../src/image-plan.js';
 
@@ -15,9 +15,14 @@ const cloud = ['--subscription', '11111111-1111-1111-1111-111111111111',
 const receipt = ['--verified-receipt', '/tmp/verify/receipt.json'];
 const evidence = ['--evidence-dir', '/tmp/new-evidence'];
 
-test('CLI separates verification, ready-only Azure and explicitly confirmed destructive reset', () => {
+test('CLI separates verification, receipt-chained Azure and dedicated explicitly confirmed reset', () => {
   assert.equal(parseOptions(['verify', '--expected-sha', sha, ...evidence]).mode, 'verify');
+  assert.equal(parseOptions(['verify', ...evidence]).expectedSha, undefined);
   assert.equal(parseOptions(['local', ...receipt, ...evidence]).mode, 'local');
+  assert.equal(parseOptions(['azure', '--reset-receipt', '/tmp/reset/receipt.json', ...evidence]).resourceGroup, cloud[3]);
+  assert.equal(parseOptions(['reset', ...receipt, '--confirm-reset', cloud[3]!, ...evidence]).resourceGroup, cloud[3]);
+  assert.throws(() => parseOptions(['azure', '--reset-receipt', '/tmp/reset/receipt.json', ...receipt, ...evidence]), /reset-receipt/);
+  assert.throws(() => parseOptions(['azure', '--reset-receipt', '/tmp/reset/receipt.json', '--ready-env', '/private/ready', ...evidence]), /override/);
   assert.equal(parseOptions(['azure', ...receipt, ...cloud, '--ready-env', '/private/ready', ...evidence]).mode, 'azure');
   assert.equal(parseOptions(['azure', ...receipt, ...cloud.slice(2), '--ready-env', '/private/ready', ...evidence]).subscription, undefined);
   assert.throws(() => parseOptions(['azure', ...receipt, '--subscription', 'not-a-uuid', ...cloud.slice(2),
@@ -30,7 +35,62 @@ test('CLI separates verification, ready-only Azure and explicitly confirmed dest
   assert.equal(parseOptions(['reset', ...receipt, ...cloud, '--confirm-reset', cloud[3]!, ...evidence]).mode, 'reset');
   const old = [...cloud]; old[3] = 'rust-playground-schema-evo';
   assert.throws(() => parseOptions(['azure', ...receipt, ...old, '--ready-env', '/private/ready', ...evidence]), /dedicated/);
-  assert.equal(parseOptions(['reset', ...receipt, ...old, '--confirm-reset', old[3]!, ...evidence]).mode, 'reset');
+  assert.throws(() => parseOptions(['reset', ...receipt, ...old, '--confirm-reset', old[3]!, ...evidence]), /dedicated/);
+});
+
+test('synced env projection excludes stamped identities and preserves only validated subscription/tags and selected group', () => {
+  const values = { AZURE_SUBSCRIPTION_ID: cloud[1]!, AZURE_RESOURCE_GROUP: 'unrelated-stamped-group',
+    AZURE_KUSTO_CLUSTER_TAGS: '{"NRMS.KustoPlatform.Classification.1P":"Corp"}', AZURE_STAMP: '4', AZURE_CLIENT_ID: 'ignored',
+    ARROWCOL_RESET_GENERATION: 'stale', AZURE_STORAGE_ACCOUNT: 'old-account' };
+  assert.deepEqual(derivedCloudInput(values, cloud[3]!), {
+    AZURE_SUBSCRIPTION_ID: cloud[1], AZURE_RESOURCE_GROUP: cloud[3],
+    AZURE_KUSTO_CLUSTER_TAGS: values.AZURE_KUSTO_CLUSTER_TAGS, ARROWCOL_AZURE_MODE: 'schema-evolution',
+  });
+  assert.throws(() => derivedCloudInput(values, 'rust-playground-schema-evo'), /dedicated/);
+  assert.throws(() => derivedCloudInput({ ...values, AZURE_SUBSCRIPTION_ID: '' }, cloud[3]!), /subscription/);
+  assert.throws(() => derivedCloudInput({ ...values, AZURE_KUSTO_CLUSTER_TAGS: 'not-json' }, cloud[3]!), /tags/);
+});
+
+test('reset custody rejects modified private inputs, stale generation, failed reset and wrong source/group', t => {
+  if (process.platform === 'win32') { t.skip('Unix private-file ownership guard'); return; }
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sc-reset-custody-'));
+  t.after(() => fs.rmSync(root, { recursive: true }));
+  const workspace = path.join(root, 'checkout'); fs.mkdirSync(workspace);
+  const verify = path.join(root, 'verify'); fs.mkdirSync(verify);
+  const reset = path.join(root, 'reset'); fs.mkdirSync(reset);
+  const writeReceipt = (directory: string, value: unknown) => {
+    const file = path.join(directory, 'receipt.json');
+    fs.writeFileSync(file, JSON.stringify(value));
+    fs.writeFileSync(path.join(directory, 'SHA256SUMS'),
+      `${createHash('sha256').update(fs.readFileSync(file)).digest('hex')}  receipt.json\n`);
+    return file;
+  };
+  const verifiedReceipt = writeReceipt(verify, { mode: 'verify', source: sha, stage: 'complete', exitCode: 0,
+    images: PUBLISHED_RUNTIME_IMAGE_PROJECTS.map(project => ({ project })) });
+  const generation = '22222222-2222-2222-2222-222222222222';
+  const managedInputs = Object.fromEntries(['base', 'ready', 'manifest'].map(name => {
+    const file = path.join(root, `${name}.private`);
+    fs.writeFileSync(file, name === 'ready' ? `ARROWCOL_RESET_GENERATION=${generation}\n` : '{}', { mode: 0o600 });
+    return [name, { path: file, sha256: createHash('sha256').update(fs.readFileSync(file)).digest('hex') }];
+  }));
+  const value = { mode: 'reset', source: sha, stage: 'complete', exitCode: 0, resourceGroup: cloud[3],
+    verifiedReceipt, managedInputs, resetGeneration: generation,
+    reset: { explicitlyConfirmedGroup: cloud[3], executed: true, provisioned: true } };
+  let file = writeReceipt(reset, value);
+  assert.equal(checkResetReceipt(file, workspace, cloud[3]!).source, sha);
+  assert.throws(() => checkResetReceipt(file, workspace, 'rust-playground-schema-evo-other'), /successful/);
+  file = writeReceipt(reset, { ...value, exitCode: 1 });
+  assert.throws(() => checkResetReceipt(file, workspace, cloud[3]!), /successful/);
+  file = writeReceipt(reset, { ...value, source: 'c'.repeat(40) });
+  assert.throws(() => checkResetReceipt(file, workspace, cloud[3]!), /sources differ/);
+  file = writeReceipt(reset, { ...value, resetGeneration: cloud[1] });
+  assert.throws(() => checkResetReceipt(file, workspace, cloud[3]!), /generation changed/);
+  file = writeReceipt(reset, value);
+  fs.chmodSync(managedInputs.ready!.path, 0o644);
+  assert.throws(() => checkResetReceipt(file, workspace, cloud[3]!), /0600/);
+  fs.chmodSync(managedInputs.ready!.path, 0o600);
+  fs.appendFileSync(managedInputs.ready!.path, '# modified\n');
+  assert.throws(() => checkResetReceipt(file, workspace, cloud[3]!), /changed since provisioning/);
 });
 
 test('evidence paths reject checkout aliases, traversal and overwrite', t => {

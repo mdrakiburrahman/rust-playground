@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { createProjectGraphAsync, readProjectsConfigurationFromProjectGraph } from '@nx/devkit';
 import { PUBLISHED_RUNTIME_IMAGE_PROJECTS } from './image-plan.js';
 import { runChecked, SpawnCommandRunner } from './process.js';
-import { Azure, Config, is_schema_evolution_group, load_env, run_tree } from '../../../infra/azure/bootstrap.js';
+import { Azure, Config, is_schema_evolution_group, load_env, run_tree, write_private } from '../../../infra/azure/bootstrap.js';
 import { PublisherControl } from '../../../infra/azure/publisher_control.js';
 import { privateEnvironment } from '../../../experiments/schema-evolution/src/private-nx.js';
 import { requireNoLiveAttemptWriters, requireSealedAttemptEvidence } from '../../../projects/loadtest/src/attempt-evidence.js';
@@ -18,6 +18,7 @@ const DIGEST = /^sha256:[a-f0-9]{64}$/;
 const UUID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
 const LOADTEST = 'projects/loadtest/src/main.ts';
 const RESULTS = 'onelake/benchmark/latest/results';
+const QUALIFICATION_GROUP = 'rust-playground-schema-evo-qualification-20261108';
 const MODES = ['verify', 'local', 'azure', 'reset'] as const;
 type Mode = typeof MODES[number];
 type JsonRecord = Record<string, unknown>;
@@ -26,6 +27,7 @@ export interface Options {
   evidenceDir: string;
   expectedSha?: string;
   verifiedReceipt?: string;
+  resetReceipt?: string;
   subscription?: string;
   resourceGroup?: string;
   envFile?: string;
@@ -82,31 +84,35 @@ export function parseOptions(argv: string[]): Options {
   const { positionals, values } = parseArgs({ args: argv, allowPositionals: true, options: {
     'expected-sha': { type: 'string' }, 'evidence-dir': { type: 'string' },
     'verified-receipt': { type: 'string' }, subscription: { type: 'string' },
+    'reset-receipt': { type: 'string' },
     'resource-group': { type: 'string' }, 'env-file': { type: 'string' },
     'ready-env': { type: 'string' }, 'confirm-reset': { type: 'string' },
   } });
   const mode = MODES.find(item => item === positionals[0]);
   if (positionals.length !== 1 || !mode || !values['evidence-dir'])
     throw new Error('Use verify|local|azure|reset with --evidence-dir <new absolute directory>.');
-  if (mode === 'verify' ? !values['expected-sha'] || !SHA.test(values['expected-sha']) || values['verified-receipt'] :
-    !values['verified-receipt'] || values['expected-sha'])
-    throw new Error('verify requires --expected-sha <full SHA>; other steps require --verified-receipt <verify receipt.json>.');
+  if (mode === 'verify' ? (values['expected-sha'] && !SHA.test(values['expected-sha'])) || values['verified-receipt'] || values['reset-receipt'] :
+    values['expected-sha'] || (mode === 'azure' ? Boolean(values['verified-receipt']) === Boolean(values['reset-receipt']) :
+      !values['verified-receipt'] || values['reset-receipt']))
+    throw new Error('verify accepts optional --expected-sha <full SHA>; azure requires --reset-receipt or --verified-receipt; local/reset require --verified-receipt.');
   const cloud = mode === 'azure' || mode === 'reset';
-  if (cloud ? (values.subscription && !UUID.test(values.subscription)) || !values['resource-group'] || !values['env-file'] :
+  if (cloud ? values.subscription && !UUID.test(values.subscription) :
     values.subscription || values['resource-group'] || values['env-file'] || values['ready-env'] || values['confirm-reset'])
-    throw new Error('Only azure/reset accept --subscription <UUID> and require --resource-group <group> --env-file <private input>.');
+    throw new Error('Only azure/reset accept cloud inputs and --subscription <UUID>.');
+  const group = cloud ? values['resource-group'] ?? QUALIFICATION_GROUP : undefined;
+  if (cloud && (group === 'rust-playground-schema-evo' || !is_schema_evolution_group(group!)))
+    throw new Error('azure/reset require a dedicated schema-evolution group; the old default group is refused.');
   if (mode === 'azure') {
-    if (!values['ready-env'] || values['ready-env'] === values['env-file'] || values['confirm-reset'] ||
-        values['resource-group'] === 'rust-playground-schema-evo' || !is_schema_evolution_group(values['resource-group']!))
-      throw new Error('azure requires a dedicated group and a separate --ready-env; it never provisions or resets.');
-  } else if (values['ready-env'] || (mode === 'reset' && values['confirm-reset'] !== values['resource-group'])) {
+    if (values['confirm-reset'] || (values['reset-receipt'] && (values['env-file'] || values['ready-env'])) ||
+        (!values['reset-receipt'] && !values['ready-env']) ||
+        (values['env-file'] && values['ready-env'] === values['env-file']))
+      throw new Error('azure consumes --reset-receipt, or a separate --ready-env override with --verified-receipt; it never provisions or resets.');
+  } else if (values['ready-env'] || (mode === 'reset' && values['confirm-reset'] !== group)) {
     throw new Error('reset is destructive and requires --confirm-reset exactly equal to --resource-group.');
   }
-  if (mode === 'reset' && !is_schema_evolution_group(values['resource-group']!))
-    throw new Error('reset requires a supported schema-evolution resource group.');
   return { mode, evidenceDir: values['evidence-dir'], expectedSha: values['expected-sha'],
-    verifiedReceipt: values['verified-receipt'], subscription: values.subscription,
-    resourceGroup: values['resource-group'], envFile: values['env-file'], readyEnv: values['ready-env'],
+    verifiedReceipt: values['verified-receipt'], resetReceipt: values['reset-receipt'], subscription: values.subscription,
+    resourceGroup: group, envFile: values['env-file'], readyEnv: values['ready-env'],
     confirmReset: values['confirm-reset'] };
 }
 
@@ -161,6 +167,42 @@ export function checkVerifiedReceipt(file: string): JsonRecord {
     throw new Error('Expected a successful, checksummed verify receipt for this source.');
   const images = records(receipt.images, 'verified images');
   assert.deepEqual(images.map(image => image.project).sort(), [...PUBLISHED_RUNTIME_IMAGE_PROJECTS].sort());
+  return receipt;
+}
+export function derivedCloudInput(values: Record<string, string>, group: string): Record<string, string> {
+  if (group === 'rust-playground-schema-evo' || !is_schema_evolution_group(group))
+    throw new Error('A dedicated schema-evolution resource group is required.');
+  const base = { AZURE_SUBSCRIPTION_ID: values.AZURE_SUBSCRIPTION_ID ?? '', AZURE_RESOURCE_GROUP: group,
+    AZURE_KUSTO_CLUSTER_TAGS: values.AZURE_KUSTO_CLUSTER_TAGS ?? '{}', ARROWCOL_AZURE_MODE: 'schema-evolution' };
+  new Config(base, 'schema-evolution');
+  return base;
+}
+export function checkResetReceipt(file: string, workspace: string, group: string): JsonRecord {
+  if (group === 'rust-playground-schema-evo' || !is_schema_evolution_group(group))
+    throw new Error('Reset receipt must identify a dedicated schema-evolution group.');
+  const receipt = readJson(file);
+  const sums = fs.readFileSync(path.join(path.dirname(file), 'SHA256SUMS'), 'utf8');
+  if (!sums.split('\n').includes(`${hash(file)}  receipt.json`) || receipt.mode !== 'reset' ||
+      receipt.exitCode !== 0 || receipt.stage !== 'complete' || receipt.resourceGroup !== group)
+    throw new Error('Expected a successful, checksummed reset receipt for this dedicated group.');
+  const reset = record(receipt.reset, 'reset custody');
+  assert.equal(reset.explicitlyConfirmedGroup, group); assert.equal(reset.executed, true); assert.equal(reset.provisioned, true);
+  const root = fs.realpathSync(workspace);
+  for (const name of ['base', 'ready', 'manifest']) {
+    const input = record(record(receipt.managedInputs, 'managed inputs')[name], name);
+    const file = string(input.path, 'managed input path');
+    regularFile(file);
+    const resolved = fs.realpathSync(file), stat = fs.statSync(file);
+    assert.ok(path.isAbsolute(file) && resolved !== root && !resolved.startsWith(root + path.sep), 'Managed input must be outside checkout');
+    assert.equal(stat.mode & 0o777, 0o600, 'Managed inputs must have mode 0600');
+    assert.equal(stat.uid, process.getuid!(), 'Managed input belongs to another user');
+    assert.equal(hash(file), input.sha256, 'Managed input changed since provisioning');
+  }
+  const ready = load_env(string(record(record(receipt.managedInputs, 'managed inputs').ready, 'ready').path, 'ready path'));
+  assert.equal(ready.ARROWCOL_RESET_GENERATION, receipt.resetGeneration, 'Ready generation changed since provisioning');
+  assert.ok(ready.ARROWCOL_RESET_GENERATION && UUID.test(ready.ARROWCOL_RESET_GENERATION));
+  const verified = checkVerifiedReceipt(string(receipt.verifiedReceipt, 'verify receipt path'));
+  assert.equal(receipt.source, verified.source, 'Reset and verify sources differ');
   return receipt;
 }
 export function redactLog(text: string): string {
@@ -222,6 +264,32 @@ class Rehearsal {
     this.env.ARROWCOL_MODE = 'local';
   }
   save(): void { saveJson(path.join(this.destination, 'receipt.json'), this.receipt); }
+  prepareCloudInputs(): void {
+    if (this.options.mode !== 'azure' && this.options.mode !== 'reset') return;
+    if (this.options.resetReceipt) {
+      const reset = checkResetReceipt(this.options.resetReceipt, this.workspace, this.options.resourceGroup!);
+      const inputs = record(reset.managedInputs, 'managed inputs');
+      this.options.envFile = string(record(inputs.base, 'base').path, 'base path');
+      this.options.readyEnv = string(record(inputs.ready, 'ready').path, 'ready path');
+      this.options.verifiedReceipt = string(reset.verifiedReceipt, 'verify receipt');
+      this.receipt.resetReceipt = { path: path.resolve(this.options.resetReceipt), sha256: hash(this.options.resetReceipt) };
+      this.receipt.managedInputs = inputs;
+    }
+    if (!this.options.envFile || this.options.mode === 'reset') {
+      const state = fs.mkdtempSync(path.join(path.dirname(this.destination), 'schema-catalog-private-'));
+      fs.chmodSync(state, 0o700);
+      const base = this.options.envFile ? load_env(this.options.envFile) :
+        derivedCloudInput(load_env(path.join(this.workspace, '.env')), this.options.resourceGroup!);
+      const config = new Config(base, 'schema-evolution');
+      assert.equal(config.group, this.options.resourceGroup, 'Private resource-group mismatch');
+      const file = path.join(state, 'base.env');
+      write_private(file, base);
+      assert.deepEqual(load_env(file), base, 'Derived private input failed round-trip');
+      this.options.envFile = file;
+    }
+    this.receipt.verifiedReceipt = path.resolve(this.options.verifiedReceipt!);
+    this.save();
+  }
   async command(name: string, argv: string[], seconds = 5400, privateEnv = this.env): Promise<string> {
     const stage: Stage = { name, command: argv, startedAt: new Date().toISOString(), status: 'running' };
     this.stages.push(stage); this.receipt.stage = name; this.save();
@@ -293,7 +361,7 @@ class Rehearsal {
     for (const workflow of ['CI', 'Publish runtime images']) {
       const run = runs.find(item => item.workflowName === workflow);
       if (!run || run.headSha !== sha || run.status !== 'completed' || run.conclusion !== 'success')
-        throw new Error(`Exact-head ${workflow} is not green yet. Wait for its automatic run; do not dispatch a duplicate.`);
+        throw new Error(`Exact-head ${workflow} is not green yet. Wait for its automatic run, then rerun verify with a NEW --evidence-dir; retain this failed receipt. Do not dispatch a duplicate.`);
       const detail = record(JSON.parse(await this.command(`workflow-${run.databaseId}`, ['gh', 'run', 'view',
         String(run.databaseId), '-R', REPO, '--json', 'headSha,status,conclusion,jobs,url'], 60)) as unknown, 'workflow');
       assert.equal(detail.headSha, sha); assert.equal(detail.conclusion, 'success');
@@ -546,6 +614,8 @@ class Rehearsal {
       if (fs.realpathSync(this.options.envFile!) === fs.realpathSync(this.options.readyEnv))
         throw new Error('Base and ready inputs must be distinct files.');
       const ready = load_env(this.options.readyEnv);
+      assert.ok(ready.ARROWCOL_RESET_GENERATION && UUID.test(ready.ARROWCOL_RESET_GENERATION),
+        'Ready input must contain a genuine reset generation UUID');
       const merged = new Config({ ...base, ...ready }, 'schema-evolution');
       assert.equal(merged.subscription, config.subscription); assert.equal(merged.group, config.group);
       this.cloud = merged;
@@ -585,10 +655,33 @@ class Rehearsal {
     const common = ['npx', '--no-install', 'tsx', 'infra/azure/bootstrap.ts'];
     await this.command('azure-preflight', [...common, 'preflight', '--mode', 'schema-evolution', '--env-file', this.options.envFile!], 900, env);
     if (reset) {
+      const state = fs.mkdtempSync(path.join(path.dirname(this.destination), 'schema-catalog-ready-'));
+      fs.chmodSync(state, 0o700);
+      const ready = path.join(state, 'ready.env'), manifest = path.join(state, 'tables.json');
       await this.command('reset-plan', [...common, 'reset', '--mode', 'schema-evolution', '--env-file', this.options.envFile!], 900, env);
       await this.command('reset-explicit-execute', [...common, 'reset', '--mode', 'schema-evolution',
         '--env-file', this.options.envFile!, '--execute'], 5400, env);
-      this.receipt.reset = { explicitlyConfirmedGroup: this.options.confirmReset, executed: true, readyInputNowStale: true };
+      this.receipt.reset = { explicitlyConfirmedGroup: this.options.confirmReset, executed: true, provisioned: false };
+      this.save();
+      await this.command('reset-provision', [...common, 'provision', '--mode', 'schema-evolution',
+        '--env-file', this.options.envFile!, '--output', ready, '--tables', manifest], 10800, env);
+      const inputs: JsonRecord = {};
+      for (const [name, input] of Object.entries({ base: this.options.envFile!, ready, manifest })) {
+        regularFile(input);
+        const resolved = fs.realpathSync(input);
+        assert.ok(resolved !== this.workspace && !resolved.startsWith(this.workspace + path.sep),
+          'Reset private inputs must be outside checkout');
+        fs.chmodSync(input, 0o600);
+        inputs[name] = { path: resolved, sha256: hash(input) };
+      }
+      this.options.readyEnv = ready;
+      this.cloudInput();
+      await this.ready();
+      this.receipt.managedInputs = inputs;
+      this.receipt.resetGeneration = load_env(ready).ARROWCOL_RESET_GENERATION;
+      assert.ok(typeof this.receipt.resetGeneration === 'string' && UUID.test(this.receipt.resetGeneration));
+      record(this.receipt.reset, 'reset').provisioned = true;
+      this.save();
     } else {
       await this.ready();
       await this.evolution('azure');
@@ -628,8 +721,11 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   const rehearsal = new Rehearsal(options, workspace);
   let failure: unknown;
   try {
+    rehearsal.prepareCloudInputs();
     const verified = options.mode === 'verify' ? undefined : rehearsal.verified();
-    const sha = options.expectedSha ?? verified!.sha;
+    const sha = options.mode === 'verify' ? options.expectedSha ??
+      (await rehearsal.command('expected-checkout-head', ['git', 'rev-parse', 'HEAD'], 30)).trim() : verified!.sha;
+    assert.match(sha, SHA);
     await rehearsal.source(sha);
     if (options.mode === 'verify') await rehearsal.verify(sha);
     else if (options.mode === 'local') await rehearsal.local(verified!.images, verified!.services, sha);
