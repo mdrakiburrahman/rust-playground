@@ -4,12 +4,14 @@ use anyhow::{Context, Result, bail};
 use arrow::array::{ArrayRef, Float64Array, RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow_deltalake::delta::object_store_for_url;
-use object_store::{ObjectStore, PutPayload, path::Path as ObjectPath};
+use chrono::DateTime;
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload, path::Path as ObjectPath};
 use parquet::arrow::ArrowWriter;
-use serde::Serialize;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -26,6 +28,18 @@ struct OatResult {
     rows_per_second: f64,
     cpu_millicores: Option<f64>,
     memory_bytes: Option<u64>,
+    qap: QapMetrics,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct QapMetrics {
+    observation_complete: u64,
+    observed_tables: u64,
+    completion_percent: Option<f64>,
+    pending_artifacts: Option<u64>,
+    cached_bytes: Option<u64>,
+    unhealthy_catalogs: Option<u64>,
+    lag_seconds: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -92,12 +106,15 @@ async fn run_matrix(config: &OatConfig, id: &str, state: &AppState) -> Result<Ve
                 .take(*replicas as usize)
                 .cloned()
                 .collect::<Vec<_>>();
-            let started = Instant::now();
-            run_clients(config, id, &assigned_tables).await?;
-            let duration_ms = u64::try_from(started.elapsed().as_millis())?.max(1);
-            let metrics = collect_metrics(config).await?;
             let run_id = format!("{id}-r{replicas}-c{concurrency}");
+            let client_durations = run_clients(config, id, &assigned_tables).await?;
+            let qap = observe_qap(config, &run_id, &assigned_tables).await?;
+            let metrics = collect_metrics(config).await?;
             for table in assigned_tables {
+                let duration_ms = client_durations
+                    .get(&table)
+                    .copied()
+                    .with_context(|| format!("DMV client did not report a duration for {table}"))?;
                 let rows = u64::try_from(config.rows_per_table)?;
                 results.push(OatResult {
                     run_id: run_id.clone(),
@@ -109,6 +126,7 @@ async fn run_matrix(config: &OatConfig, id: &str, state: &AppState) -> Result<Ve
                     rows_per_second: rows as f64 / (duration_ms as f64 / 1000.0),
                     cpu_millicores: Some(metrics.cpu_millicores),
                     memory_bytes: Some(metrics.memory_bytes),
+                    qap,
                 });
             }
         }
@@ -116,7 +134,7 @@ async fn run_matrix(config: &OatConfig, id: &str, state: &AppState) -> Result<Ve
     Ok(results)
 }
 
-async fn run_clients(config: &OatConfig, id: &str, tables: &[String]) -> Result<()> {
+async fn run_clients(config: &OatConfig, id: &str, tables: &[String]) -> Result<HashMap<String, u64>> {
     let mut tasks = tokio::task::JoinSet::new();
     for table in tables {
         let binary = config.dmv_client_binary.clone();
@@ -126,6 +144,7 @@ async fn run_clients(config: &OatConfig, id: &str, tables: &[String]) -> Result<
         let concurrency = config.dmv_concurrency.to_string();
         let client_id = format!("oat-{id}-{table}");
         tasks.spawn(async move {
+            let started = Instant::now();
             let output = Command::new(binary)
                 .args([
                     "--endpoint",
@@ -149,13 +168,17 @@ async fn run_clients(config: &OatConfig, id: &str, tables: &[String]) -> Result<
                     String::from_utf8_lossy(&output.stderr)
                 );
             }
-            Ok::<(), anyhow::Error>(())
+            let duration_ms = u64::try_from(started.elapsed().as_millis())?.max(1);
+            Ok::<(String, u64), anyhow::Error>((table, duration_ms))
         });
     }
+    let mut durations = HashMap::with_capacity(tables.len());
     let mut first_error = None;
     while let Some(joined) = tasks.join_next().await {
         match joined {
-            Ok(Ok(())) => {}
+            Ok(Ok((table, duration_ms))) => {
+                durations.insert(table, duration_ms);
+            }
             Ok(Err(error)) if first_error.is_none() => first_error = Some(error),
             Err(error) if first_error.is_none() => first_error = Some(error.into()),
             _ => {}
@@ -164,7 +187,130 @@ async fn run_clients(config: &OatConfig, id: &str, tables: &[String]) -> Result<
     if let Some(error) = first_error {
         return Err(error);
     }
-    Ok(())
+    Ok(durations)
+}
+
+async fn observe_qap(config: &OatConfig, run_id: &str, tables: &[String]) -> Result<QapMetrics> {
+    let qap_tables = tables
+        .iter()
+        .map(|table| format!("dataflow_{table}"))
+        .collect::<Vec<_>>();
+    let results = std::env::temp_dir().join("arrowcol-oat").join(run_id);
+    let endpoint = config.qap_endpoint.clone();
+    let database = config.qap_database.clone();
+    let observer_tables = qap_tables.clone();
+    let timeout = Duration::from_secs(config.qap_timeout_seconds);
+    let observation = tokio::task::spawn_blocking(move || {
+        std::fs::create_dir_all(&results)
+            .with_context(|| format!("create QAP results directory {}", results.display()))?;
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        runtime
+            .block_on(arrowcol_loadgen::observe_qap(
+                &endpoint,
+                &results,
+                database.as_deref(),
+                &observer_tables,
+                timeout,
+            ))
+            .context("observe Kusto Query Acceleration Policy")
+    })
+    .await
+    .context("join Kusto QAP observer")??;
+    aggregate_qap(&observation, &qap_tables)
+}
+
+fn aggregate_qap(observation: &Value, expected_tables: &[String]) -> Result<QapMetrics> {
+    let expected = observation
+        .get("expected_tables")
+        .and_then(Value::as_array)
+        .context("QAP observation has no expected_tables array")?
+        .iter()
+        .map(|table| table.as_str().context("QAP expected table name must be a string"))
+        .collect::<Result<Vec<_>>>()?;
+    if expected != expected_tables.iter().map(String::as_str).collect::<Vec<_>>() {
+        bail!("QAP observation returned an unexpected table set");
+    }
+    let tables = observation
+        .get("tables")
+        .and_then(Value::as_object)
+        .context("QAP observation has no tables object")?;
+    let observed_unix_ms = observation
+        .get("observed_unix_ms")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .context("QAP observation timestamp is invalid")?;
+    let mut available = Vec::new();
+    for name in expected_tables {
+        let table = tables
+            .get(name)
+            .with_context(|| format!("QAP observation omitted expected table {name}"))?;
+        if table.get("available").and_then(Value::as_bool) == Some(true) {
+            available.push(table);
+        }
+    }
+    let all_available = available.len() == expected_tables.len();
+    let completion_values = available
+        .iter()
+        .map(|table| {
+            table
+                .pointer("/statistics/AccelerationCompletePercentage")
+                .and_then(Value::as_f64)
+        })
+        .collect::<Option<Vec<_>>>();
+    let completion_percent = completion_values
+        .and_then(|values| {
+            values
+                .iter()
+                .all(|value| (0.0..=100.0).contains(value))
+                .then(|| values.into_iter().fold(f64::INFINITY, f64::min))
+        })
+        .filter(|_| all_available);
+    let pending_artifacts =
+        sum_qap_values(&available, "/statistics/AccelerationPendingDataFilesCount").filter(|_| all_available);
+    let cached_bytes = sum_qap_values(&available, "/statistics/HotSize").filter(|_| all_available);
+    let health = available
+        .iter()
+        .map(|table| table.pointer("/state/is_healthy").and_then(Value::as_bool))
+        .collect::<Option<Vec<_>>>();
+    let unhealthy_catalogs = health
+        .map(|values| values.into_iter().filter(|healthy| !healthy).count() as u64)
+        .filter(|_| all_available);
+    let lag_values = available
+        .iter()
+        .map(|table| {
+            let updated = table
+                .pointer("/statistics/LastUpdatedDateTime")
+                .and_then(Value::as_str)?;
+            let timestamp = DateTime::parse_from_rfc3339(updated).ok()?.timestamp_millis();
+            Some((observed_unix_ms as f64 - timestamp as f64) / 1000.0)
+        })
+        .collect::<Option<Vec<_>>>();
+    let lag_seconds = lag_values
+        .filter(|values| values.iter().all(|value| value.is_finite() && *value >= 0.0))
+        .map(|values| values.into_iter().fold(0.0, f64::max))
+        .filter(|_| all_available);
+    let observation_complete = u64::from(
+        completion_percent.is_some()
+            && pending_artifacts.is_some()
+            && cached_bytes.is_some()
+            && unhealthy_catalogs.is_some()
+            && lag_seconds.is_some(),
+    );
+    Ok(QapMetrics {
+        observation_complete,
+        observed_tables: available.len() as u64,
+        completion_percent,
+        pending_artifacts,
+        cached_bytes,
+        unhealthy_catalogs,
+        lag_seconds,
+    })
+}
+
+fn sum_qap_values(tables: &[&Value], pointer: &str) -> Option<u64> {
+    tables
+        .iter()
+        .try_fold(0_u64, |sum, table| sum.checked_add(table.pointer(pointer)?.as_u64()?))
 }
 
 async fn configure_deployments(config: &OatConfig, replicas: u32, concurrency: u32) -> Result<()> {
@@ -205,10 +351,27 @@ async fn configure_deployments(config: &OatConfig, replicas: u32, concurrency: u
 }
 
 async fn restore_deployments(config: &OatConfig, arrowcol: Value, dfe: Value) -> Result<()> {
-    apply_deployment(config, arrowcol).await?;
-    apply_deployment(config, dfe).await?;
-    rollout(config, &config.arrowcol_deployment).await?;
-    rollout(config, &config.dfe_deployment).await
+    let mut failures = Vec::new();
+    if let Err(error) = apply_deployment(config, arrowcol).await {
+        failures.push(format!("restore ArrowCol Deployment: {error:#}"));
+    }
+    if let Err(error) = apply_deployment(config, dfe).await {
+        failures.push(format!("restore DFE Deployment: {error:#}"));
+    }
+    if let Err(error) = rollout(config, &config.arrowcol_deployment).await {
+        failures.push(format!("wait for ArrowCol restore: {error:#}"));
+    }
+    if let Err(error) = rollout(config, &config.dfe_deployment).await {
+        failures.push(format!("wait for DFE restore: {error:#}"));
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "deployment restoration had failures: {}",
+            failures.join("; ")
+        ))
+    }
 }
 
 async fn deployment(config: &OatConfig, name: &str) -> Result<Value> {
@@ -399,6 +562,13 @@ fn parquet_bytes(results: &[OatResult]) -> Result<Vec<u8>> {
         Field::new("rows_per_second", DataType::Float64, false),
         Field::new("cpu_millicores", DataType::Float64, true),
         Field::new("memory_bytes", DataType::UInt64, true),
+        Field::new("qap_observation_complete", DataType::UInt64, false),
+        Field::new("qap_observed_tables", DataType::UInt64, false),
+        Field::new("qap_completion_percent", DataType::Float64, true),
+        Field::new("qap_pending_artifacts", DataType::UInt64, true),
+        Field::new("qap_cached_bytes", DataType::UInt64, true),
+        Field::new("qap_unhealthy_catalogs", DataType::UInt64, true),
+        Field::new("qap_lag_seconds", DataType::Float64, true),
     ]));
     let columns: Vec<ArrayRef> = vec![
         Arc::new(StringArray::from_iter_values(
@@ -422,11 +592,31 @@ fn parquet_bytes(results: &[OatResult]) -> Result<Vec<u8>> {
         Arc::new(UInt64Array::from(
             results.iter().map(|row| row.memory_bytes).collect::<Vec<_>>(),
         )),
+        Arc::new(UInt64Array::from_iter_values(
+            results.iter().map(|row| row.qap.observation_complete),
+        )),
+        Arc::new(UInt64Array::from_iter_values(
+            results.iter().map(|row| row.qap.observed_tables),
+        )),
+        Arc::new(Float64Array::from(
+            results.iter().map(|row| row.qap.completion_percent).collect::<Vec<_>>(),
+        )),
+        Arc::new(UInt64Array::from(
+            results.iter().map(|row| row.qap.pending_artifacts).collect::<Vec<_>>(),
+        )),
+        Arc::new(UInt64Array::from(
+            results.iter().map(|row| row.qap.cached_bytes).collect::<Vec<_>>(),
+        )),
+        Arc::new(UInt64Array::from(
+            results.iter().map(|row| row.qap.unhealthy_catalogs).collect::<Vec<_>>(),
+        )),
+        Arc::new(Float64Array::from(
+            results.iter().map(|row| row.qap.lag_seconds).collect::<Vec<_>>(),
+        )),
     ];
     let batch = RecordBatch::try_new(Arc::clone(&schema), columns)?;
     let mut writer = ArrowWriter::try_new(Vec::new(), schema, None)?;
     writer.write(&batch)?;
-    writer.close()?;
     Ok(writer.into_inner()?)
 }
 
@@ -444,17 +634,71 @@ mod tests {
     }
 
     #[test]
+    fn aggregates_qap_metrics_only_when_all_expected_tables_are_measured() -> Result<()> {
+        let names = ["dataflow_sqlserver_wait_stats", "dataflow_sqlserver_cpu_utilization"].map(str::to_owned);
+        let observation = serde_json::json!({
+            "observed_unix_ms": 10_000,
+            "expected_tables": names,
+            "tables": {
+                "dataflow_sqlserver_wait_stats": {
+                    "available": true,
+                    "statistics": {
+                        "AccelerationCompletePercentage": 70.0,
+                        "AccelerationPendingDataFilesCount": 2,
+                        "HotSize": 10,
+                        "LastUpdatedDateTime": "1970-01-01T00:00:00Z"
+                    },
+                    "state": {"is_healthy": true}
+                },
+                "dataflow_sqlserver_cpu_utilization": {
+                    "available": true,
+                    "statistics": {
+                        "AccelerationCompletePercentage": 50.0,
+                        "AccelerationPendingDataFilesCount": 3,
+                        "HotSize": 20,
+                        "LastUpdatedDateTime": "1970-01-01T00:00:00Z"
+                    },
+                    "state": {"is_healthy": false}
+                }
+            }
+        });
+        let metrics = aggregate_qap(&observation, &names)?;
+        assert_eq!(metrics.observation_complete, 1);
+        assert_eq!(metrics.observed_tables, 2);
+        assert_eq!(metrics.completion_percent, Some(50.0));
+        assert_eq!(metrics.pending_artifacts, Some(5));
+        assert_eq!(metrics.cached_bytes, Some(30));
+        assert_eq!(metrics.unhealthy_catalogs, Some(1));
+        assert_eq!(metrics.lag_seconds, Some(10.0));
+
+        let partial = serde_json::json!({
+            "observed_unix_ms": 10_000,
+            "expected_tables": names,
+            "tables": {
+                "dataflow_sqlserver_wait_stats": {"available": false},
+                "dataflow_sqlserver_cpu_utilization": {"available": false}
+            }
+        });
+        let metrics = aggregate_qap(&partial, &names)?;
+        assert_eq!(metrics.observation_complete, 0);
+        assert_eq!(metrics.observed_tables, 0);
+        assert_eq!(metrics.completion_percent, None);
+        Ok(())
+    }
+
+    #[test]
     fn writes_one_compact_parquet_file_with_viewer_schema() -> Result<()> {
         let results = vec![OatResult {
             run_id: "run-1".to_owned(),
             replicas: 1,
             dfe_worker_concurrency: 2,
-            table: "dmv_wait_stats".to_owned(),
+            table: "sqlserver_wait_stats".to_owned(),
             rows: 100,
             duration_ms: 10,
             rows_per_second: 10_000.0,
             cpu_millicores: Some(50.0),
             memory_bytes: Some(1024),
+            qap: QapMetrics::default(),
         }];
         let bytes = parquet_bytes(&results)?;
         assert!(bytes.starts_with(b"PAR1"));

@@ -19,6 +19,9 @@ pub struct OatConfig {
     pub tables: Vec<String>,
     pub rows_per_table: usize,
     pub dmv_concurrency: usize,
+    pub qap_endpoint: String,
+    pub qap_database: Option<String>,
+    pub qap_timeout_seconds: u64,
     pub replica_counts: Vec<u32>,
     pub dfe_worker_concurrency: Vec<u32>,
     pub result_url: String,
@@ -36,6 +39,7 @@ impl OatConfig {
             ("arrowcol_pod_selector", self.arrowcol_pod_selector.as_str()),
             ("dfe_pod_selector", self.dfe_pod_selector.as_str()),
             ("dmv_client_binary", self.dmv_client_binary.as_str()),
+            ("qap_endpoint", self.qap_endpoint.as_str()),
         ] {
             if value.trim().is_empty() {
                 bail!("{field} must not be empty");
@@ -45,8 +49,25 @@ impl OatConfig {
         if !matches!(endpoint.scheme(), "http" | "https") || endpoint.host_str().is_none() {
             bail!("arrowcol_endpoint must be an HTTP(S) URL with a host");
         }
-        if self.rows_per_table == 0 || self.dmv_concurrency == 0 {
-            bail!("rows_per_table and dmv_concurrency must be positive");
+        if self.rows_per_table == 0 || self.dmv_concurrency == 0 || self.qap_timeout_seconds == 0 {
+            bail!("rows_per_table, dmv_concurrency, and qap_timeout_seconds must be positive");
+        }
+        let qap_endpoint = Url::parse(&self.qap_endpoint).context("qap_endpoint must be a URL")?;
+        if !matches!(qap_endpoint.scheme(), "http" | "https")
+            || qap_endpoint.host_str().is_none()
+            || !qap_endpoint.username().is_empty()
+            || qap_endpoint.password().is_some()
+            || qap_endpoint.query().is_some()
+            || qap_endpoint.fragment().is_some()
+        {
+            bail!("qap_endpoint must be a credential-free HTTP(S) URL with a host");
+        }
+        if self
+            .qap_database
+            .as_ref()
+            .is_some_and(|database| database.trim().is_empty())
+        {
+            bail!("qap_database must be omitted or nonempty");
         }
         if self.replica_counts.iter().copied().collect::<HashSet<_>>().len() != 2
             || !self.replica_counts.contains(&1)
@@ -86,8 +107,8 @@ impl OatConfig {
                 );
             }
         }
-        validate_storage_url(&self.result_url, "result_url")?;
-        validate_storage_url(&self.website_url, "website_url")?;
+        validate_storage_url(&self.result_url, "result_url", "experiments", true)?;
+        validate_storage_url(&self.website_url, "website_url", "$web", false)?;
         if self.result_url == self.website_url {
             bail!("result_url and website_url must be different object paths");
         }
@@ -95,7 +116,7 @@ impl OatConfig {
     }
 }
 
-fn validate_storage_url(value: &str, field: &str) -> Result<()> {
+fn validate_storage_url(value: &str, field: &str, expected_container: &str, allow_subdirectories: bool) -> Result<()> {
     let url = Url::parse(value).with_context(|| format!("{field} must be a URL"))?;
     if !matches!(url.scheme(), "abfs" | "abfss" | "az") {
         bail!("{field} must use an ADLS Gen2 URL scheme (abfs, abfss, or az)");
@@ -103,7 +124,23 @@ fn validate_storage_url(value: &str, field: &str) -> Result<()> {
     if url.host_str().is_none() || url.path().trim_matches('/').is_empty() {
         bail!("{field} must identify a storage account and object path");
     }
-    if url.password().is_some() || url.query().is_some() || url.fragment().is_some() {
+    let container = match url.scheme() {
+        "abfs" | "abfss" => url.username(),
+        "az" => url.host_str().unwrap_or(""),
+        _ => unreachable!("scheme validated above"),
+    };
+    if container != expected_container {
+        bail!("{field} must target the {expected_container} container");
+    }
+    let object_path = url.path().trim_matches('/');
+    if !allow_subdirectories && object_path.contains('/') {
+        bail!("{field} must place the Parquet object directly under the {expected_container} container");
+    }
+    if (url.scheme() == "az" && !url.username().is_empty())
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
         bail!("{field} must not embed credentials or query/fragment data");
     }
     Ok(())
@@ -131,11 +168,13 @@ mod tests {
             ],
             rows_per_table: 1000,
             dmv_concurrency: 2,
+            qap_endpoint: "http://kusto:8080".to_owned(),
+            qap_database: Some("experimentqap".to_owned()),
+            qap_timeout_seconds: 30,
             replica_counts: vec![1, 2],
             dfe_worker_concurrency: vec![2, 4],
             result_url: "abfss://experiments@account.dfs.core.windows.net/arrowcol-oat/results.parquet".to_owned(),
-            website_url: "abfss://$web@account.dfs.core.windows.net/experiments/arrowcol-oat/results.parquet"
-                .to_owned(),
+            website_url: "abfss://$web@account.dfs.core.windows.net/results.parquet".to_owned(),
         }
     }
 
@@ -156,6 +195,14 @@ mod tests {
     }
 
     #[test]
+    fn accepts_canonical_environment_scoped_az_urls() -> Result<()> {
+        let mut config = valid();
+        config.result_url = "az://experiments/arrowcol-oat/results.parquet".to_owned();
+        config.website_url = "az://$web/results.parquet".to_owned();
+        config.validate()
+    }
+
+    #[test]
     fn rejects_credentials_and_public_non_adls_destinations() {
         let mut config = valid();
         config.result_url = "abfss://user:secret@account.dfs.core.windows.net/path/result.parquet".to_owned();
@@ -163,6 +210,18 @@ mod tests {
 
         let mut config = valid();
         config.website_url = "https://public.example/results.parquet".to_owned();
+        assert!(config.validate().is_err());
+
+        let mut config = valid();
+        config.qap_endpoint = "https://user:password@kusto.example".to_owned();
+        assert!(config.validate().is_err());
+
+        let mut config = valid();
+        config.result_url = "abfss://$web@account.dfs.core.windows.net/results.parquet".to_owned();
+        assert!(config.validate().is_err());
+
+        let mut config = valid();
+        config.website_url = "abfss://$web@account.dfs.core.windows.net/experiments/results.parquet".to_owned();
         assert!(config.validate().is_err());
     }
 }

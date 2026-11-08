@@ -13,6 +13,8 @@ publish = false
 anyhow.workspace = true
 arrow = { version = "58.3", default-features = false }
 arrow-deltalake = { path = "../../crates/arrow-deltalake" }
+arrowcol-loadgen = { path = "../loadtest/loadgen" }
+chrono = "0.4"
 axum = "0.8"
 clap.workspace = true
 collector-chain = { path = "../../bin/collector-chain" }

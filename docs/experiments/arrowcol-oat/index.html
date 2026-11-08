@@ -55,16 +55,16 @@
       <caption>Each row is one table-pinned ArrowCol result. Blue intensity is relative within the published file; exact values remain visible.</caption>
       <thead><tr>
         <th scope="col">Run</th><th scope="col">ArrowCol replicas</th><th scope="col">DFE workers</th><th scope="col">Pinned table</th>
-        <th scope="col">Rows</th><th scope="col">Duration (ms)</th><th scope="col">Rows/s</th><th scope="col">CPU (mCPU)</th><th scope="col">Memory (MiB)</th>
+        <th scope="col">Rows</th><th scope="col">Duration (ms)</th><th scope="col">Rows/s</th><th scope="col">CPU (mCPU)</th><th scope="col">Memory (MiB)</th><th scope="col">QAP complete</th><th scope="col">QAP tables</th><th scope="col">QAP complete (%)</th><th scope="col">Pending artifacts</th><th scope="col">Cached (MiB)</th><th scope="col">Unhealthy catalogs</th><th scope="col">QAP lag (s)</th>
       </tr></thead>
-      <tbody id="results"><tr><td class="empty" colspan="9">Loading…</td></tr></tbody>
+      <tbody id="results"><tr><td class="empty" colspan="16">Loading…</td></tr></tbody>
     </table>
   </div>
   <p class="note">The static site and its Parquet file are anonymously readable. Only publish approved, nonsensitive benchmark summaries here; never include credentials, raw payloads, or sensitive identifiers. The viewer loads <code>results.parquet</code> from this same origin, so no cross-origin request or CORS rule is required.</p>
 </main>
 <script type="module">
 const resultUrl = new URL('results.parquet', window.location.href).toString();
-const columns = ['run_id', 'replicas', 'dfe_worker_concurrency', 'table', 'rows', 'duration_ms', 'rows_per_second', 'cpu_millicores', 'memory_bytes'];
+const columns = ['run_id', 'replicas', 'dfe_worker_concurrency', 'table', 'rows', 'duration_ms', 'rows_per_second', 'cpu_millicores', 'memory_bytes', 'qap_observation_complete', 'qap_observed_tables', 'qap_completion_percent', 'qap_pending_artifacts', 'qap_cached_bytes', 'qap_unhealthy_catalogs', 'qap_lag_seconds'];
 const statusNode = document.querySelector('#status');
 const bodyNode = document.querySelector('#results');
 const numberFormat = new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 });
@@ -98,7 +98,7 @@ function median(values) {
 }
 async function loadResults() {
   statusNode.textContent = 'Loading benchmark results…';
-  bodyNode.innerHTML = '<tr><td class="empty" colspan="9">Loading…</td></tr>';
+  bodyNode.innerHTML = '<tr><td class="empty" colspan="16">Loading…</td></tr>';
   try {
     const { asyncBufferFromUrl, parquetReadObjects } = await import('https://cdn.jsdelivr.net/npm/hyparquet@1.32.0/src/hyparquet.min.js');
     const file = await asyncBufferFromUrl({ url: resultUrl });
@@ -115,12 +115,17 @@ async function loadResults() {
     document.querySelector('#stat-throughput').textContent = throughput.length ? `${show(Math.max(...throughput))} rows/s` : '—';
     document.querySelector('#stat-latency').textContent = durations.length ? `${show(median(durations))} ms` : '—';
     const memory = sorted.map(row => number(row.memory_bytes)).filter(value => value !== null).map(value => value / 1048576);
+    const qapCompletions = sorted.map(row => number(row.qap_completion_percent)).filter(value => value !== null);
+    const qapPending = sorted.map(row => number(row.qap_pending_artifacts)).filter(value => value !== null);
+    const qapCached = sorted.map(row => number(row.qap_cached_bytes)).filter(value => value !== null).map(value => value / 1048576);
+    const qapUnhealthy = sorted.map(row => number(row.qap_unhealthy_catalogs)).filter(value => value !== null);
+    const qapLag = sorted.map(row => number(row.qap_lag_seconds)).filter(value => value !== null);
     bodyNode.innerHTML = sorted.map(row => {
       const duration = number(row.duration_ms);
       const rate = number(row.rows_per_second);
       const cpu = number(row.cpu_millicores);
       const memoryMiB = number(row.memory_bytes) === null ? null : number(row.memory_bytes) / 1048576;
-      return `<tr><td class="key">${safeText(row.run_id)}</td><td>${safeText(show(row.replicas, 0))}</td><td>${safeText(show(row.dfe_worker_concurrency, 0))}</td><td class="key">${safeText(row.table)}</td><td>${safeText(show(row.rows, 0))}</td><td class="heat" style="${heat(duration, durations, true)}">${safeText(show(duration))}</td><td class="heat" style="${heat(rate, throughput)}">${safeText(show(rate))}</td><td class="heat" style="${heat(cpu, sorted.map(item => number(item.cpu_millicores)).filter(value => value !== null), true)}">${safeText(show(cpu))}</td><td class="heat" style="${heat(memoryMiB, memory, true)}">${safeText(show(memoryMiB))}</td></tr>`;
+      return `<tr><td class="key">${safeText(row.run_id)}</td><td>${safeText(show(row.replicas, 0))}</td><td>${safeText(show(row.dfe_worker_concurrency, 0))}</td><td class="key">${safeText(row.table)}</td><td>${safeText(show(row.rows, 0))}</td><td class="heat" style="${heat(duration, durations, true)}">${safeText(show(duration))}</td><td class="heat" style="${heat(rate, throughput)}">${safeText(show(rate))}</td><td class="heat" style="${heat(cpu, sorted.map(item => number(item.cpu_millicores)).filter(value => value !== null), true)}">${safeText(show(cpu))}</td><td class="heat" style="${heat(memoryMiB, memory, true)}">${safeText(show(memoryMiB))}</td><td>${safeText(show(row.qap_observation_complete, 0))}</td><td>${safeText(show(row.qap_observed_tables, 0))}</td><td class="heat" style="${heat(row.qap_completion_percent, qapCompletions)}">${safeText(show(row.qap_completion_percent))}</td><td class="heat" style="${heat(row.qap_pending_artifacts, qapPending, true)}">${safeText(show(row.qap_pending_artifacts, 0))}</td><td class="heat" style="${heat(number(row.qap_cached_bytes) === null ? null : number(row.qap_cached_bytes) / 1048576, qapCached)}">${safeText(show(number(row.qap_cached_bytes) === null ? null : number(row.qap_cached_bytes) / 1048576))}</td><td class="heat" style="${heat(row.qap_unhealthy_catalogs, qapUnhealthy, true)}">${safeText(show(row.qap_unhealthy_catalogs, 0))}</td><td class="heat" style="${heat(row.qap_lag_seconds, qapLag, true)}">${safeText(show(row.qap_lag_seconds))}</td></tr>`;
     }).join('');
     statusNode.textContent = `${numberFormat.format(sorted.length)} result rows loaded from ${new URL(resultUrl).pathname.split('/').pop()}.`;
   } catch (error) {
@@ -128,7 +133,7 @@ async function loadResults() {
     document.querySelector('#stat-configs').textContent = '—';
     document.querySelector('#stat-throughput').textContent = '—';
     document.querySelector('#stat-latency').textContent = '—';
-    bodyNode.innerHTML = '<tr><td class="empty" colspan="9">No published results are available yet.</td></tr>';
+    bodyNode.innerHTML = '<tr><td class="empty" colspan="16">No published results are available yet.</td></tr>';
     statusNode.textContent = error instanceof Error ? error.message : 'Could not load benchmark results.';
   }
 }

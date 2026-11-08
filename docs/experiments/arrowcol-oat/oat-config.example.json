@@ -1,0 +1,31 @@
+{
+  "namespace": "arrowcol",
+  "kubectl_context": null,
+  "arrowcol_deployment": "arrowcol",
+  "arrowcol_container": "arrowcol",
+  "dfe_deployment": "arrowcol-dataflow",
+  "dfe_container": "dataflow",
+  "arrowcol_pod_selector": "app=arrowcol",
+  "dfe_pod_selector": "app=arrowcol-dataflow",
+  "arrowcol_endpoint": "http://router.arrowcol.svc:32010",
+  "dmv_client_binary": "/usr/local/bin/arrowcol-dmv",
+  "tables": [
+    "sqlserver_wait_stats",
+    "sqlserver_cpu_utilization"
+  ],
+  "rows_per_table": 1000,
+  "dmv_concurrency": 2,
+  "qap_endpoint": "http://kusto-service:8080",
+  "qap_database": "experimentqap",
+  "qap_timeout_seconds": 30,
+  "replica_counts": [
+    1,
+    2
+  ],
+  "dfe_worker_concurrency": [
+    2,
+    4
+  ],
+  "result_url": "abfss://experiments@account.dfs.core.windows.net/arrowcol-oat/results.parquet",
+  "website_url": "abfss://$web@account.dfs.core.windows.net/results.parquet"
+}

@@ -75,6 +75,14 @@ async fn start_run(
             }),
         )
     })?;
+    let permit = state.try_start_run().map_err(|()| {
+        (
+            StatusCode::CONFLICT,
+            Json(ApiError {
+                error: "an OAT run is already active".to_owned(),
+            }),
+        )
+    })?;
     let id = uuid::Uuid::new_v4().to_string();
     let status = RunStatus {
         id: id.clone(),
@@ -89,6 +97,7 @@ async fn start_run(
 
     let task_state = Arc::clone(&state);
     tokio::spawn(async move {
+        let _permit = permit;
         match arrowcol_oat_rust::runner::execute(config, &id, Arc::clone(&task_state)).await {
             Ok(result_count) => {
                 task_state
