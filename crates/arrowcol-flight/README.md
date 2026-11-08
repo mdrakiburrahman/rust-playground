@@ -101,6 +101,12 @@ and returns the standard protobuf `DoPutUpdateResult { record_count: 0 }`.
 Committed schema version, fingerprint, saga, identity, and disposition are
 returned as response metadata plus `x-arrowcol-ddl-completion-bin`.
 
+Routed CREATE TABLE / ADD COLUMNS requests carry the same table-routing metadata
+as data uploads. The command descriptor selects DDL dispatch, and its parsed
+table identity must match those headers before any catalog mutation. Direct DDL
+without routing metadata remains supported. The claimed Arrow fingerprint is
+validated on subsequent data uploads, not used as a DDL dispatch discriminator.
+
 ## Validation
 
 ```bash

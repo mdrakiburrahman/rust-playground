@@ -13,9 +13,14 @@ config.quiver.yaml  Arrow Flight -> processor:durable_buffer (Quiver) -> generic
 after the durable buffer persisted every batch (see
 [Delivery guarantee](#delivery-guarantee)).
 
-The process is pinned to one DFE core in both YAML policy and the documented
-command. Delta table ownership is process-shared, but a single pipeline core
-also keeps Flight registration and admin lifecycle unambiguous.
+The checked-in defaults use one DFE core. `--num-cores 2` overrides the top-level
+core policy and starts two integrated receiver/exporter workers; do not add
+group/pipeline resource overrides that shadow this CLI setting. Flight and admin
+listeners use SO_REUSEPORT, while registration, pressure and Delta ownership are
+process-shared. Concurrent HTTP/2 streams on one connection stay on one listener;
+use independent client and upstream proxy connections to exercise multiple workers. The isolated
+[OAT runtime](../../docs/experiments/arrowcol-oat/RUNTIME.md) holds CPU limits
+constant and varies replicas and `--num-cores`, not an unused side deployment.
 
 ## Build and validate
 
@@ -55,7 +60,7 @@ npx --no-install nx run arrowcol-infra:bootstrap
 npx --no-install nx run arrowcol-infra:up
 ARROWCOL_CATALOG_STATE_DIR="$PWD/onelake/catalog-state" \
 ARROWCOL_CATALOG_WAREHOUSE_ROOT="$PWD/onelake/arrowcol-dataflow" \
-npx --no-install nx run arrowcol-catalog-rust:run
+npx --no-install nx run arrowcol-catalog-rust:run -- --ingestion-layout
 ```
 
 Keep the catalog process running in a separate terminal with writable catalog
@@ -70,6 +75,7 @@ ARROWCOL_SQL_PORT=14333 \
 ARROWCOL_SQL_PASSWORD_FILE=projects/arrowcol-infra/secrets/arrowcol-app-password.txt \
 ARROWCOL_CATALOG_ENDPOINT=http://127.0.0.1:8817 \
 ARROWCOL_DELTA_ROOT="$PWD/onelake/arrowcol-dataflow" \
+ARROWCOL_PARTITION_GRANULARITY=hour \
 npx --no-install nx run arrowcol-dataflow-rust:run
 ```
 
@@ -82,6 +88,7 @@ ARROWCOL_SQL_PORT=14333 \
 ARROWCOL_SQL_PASSWORD_FILE=projects/arrowcol-infra/secrets/arrowcol-app-password.txt \
 ARROWCOL_CATALOG_ENDPOINT=http://127.0.0.1:8817 \
 ARROWCOL_DELTA_ROOT="$PWD/onelake/arrowcol-dataflow" \
+ARROWCOL_PARTITION_GRANULARITY=hour \
 npx --no-install nx run arrowcol-dataflow-rust:run-quiver
 ```
 

@@ -16,6 +16,7 @@ pub struct OatConfig {
     pub dfe_pod_selector: String,
     pub arrowcol_endpoint: String,
     pub dmv_client_binary: String,
+    pub edge_secret_file: String,
     pub tables: Vec<String>,
     pub rows_per_table: usize,
     pub dmv_concurrency: usize,
@@ -44,10 +45,17 @@ impl OatConfig {
             ("arrowcol_pod_selector", self.arrowcol_pod_selector.as_str()),
             ("dfe_pod_selector", self.dfe_pod_selector.as_str()),
             ("dmv_client_binary", self.dmv_client_binary.as_str()),
+            ("edge_secret_file", self.edge_secret_file.as_str()),
             ("qap_endpoint", self.qap_endpoint.as_str()),
         ] {
             if value.trim().is_empty() {
                 bail!("{field} must not be empty");
+            }
+            if self.arrowcol_deployment == self.dfe_deployment
+                && (self.arrowcol_container != self.dfe_container
+                    || self.arrowcol_pod_selector != self.dfe_pod_selector)
+            {
+                bail!("integrated ArrowCol/DFE must use the same container and pod selector");
             }
         }
         let endpoint = Url::parse(&self.arrowcol_endpoint).context("arrowcol_endpoint must be a URL")?;
@@ -74,7 +82,8 @@ impl OatConfig {
         {
             bail!("qap_database must be omitted or nonempty");
         }
-        if self.replica_counts.iter().copied().collect::<HashSet<_>>().len() != 2
+        if self.replica_counts.len() != 2
+            || self.replica_counts.iter().copied().collect::<HashSet<_>>().len() != 2
             || !self.replica_counts.contains(&1)
             || !self.replica_counts.contains(&2)
         {
@@ -118,6 +127,14 @@ impl OatConfig {
             bail!("result_url and website_url must be different object paths");
         }
         Ok(())
+    }
+
+    pub(crate) fn deployment_names(&self) -> Vec<&str> {
+        if self.arrowcol_deployment == self.dfe_deployment {
+            vec![&self.arrowcol_deployment]
+        } else {
+            vec![&self.arrowcol_deployment, &self.dfe_deployment]
+        }
     }
 }
 
@@ -167,6 +184,7 @@ mod tests {
             dfe_pod_selector: "app=arrowcol-dataflow".to_owned(),
             arrowcol_endpoint: "http://router.arrowcol.svc:32010".to_owned(),
             dmv_client_binary: "target/debug/arrowcol-dmv".to_owned(),
+            edge_secret_file: "out/arrowcol-oat/secrets/edge-hmac".to_owned(),
             tables: vec![
                 "sqlserver_wait_stats".to_owned(),
                 "sqlserver_cpu_utilization".to_owned(),
@@ -197,6 +215,19 @@ mod tests {
         let mut config = valid();
         config.tables[1] = "SQLSERVER_WAIT_STATS".to_owned();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn integrated_topology_has_one_restore_target_and_consistent_selector() -> Result<()> {
+        let mut config = valid();
+        config.dfe_deployment = config.arrowcol_deployment.clone();
+        config.dfe_container = config.arrowcol_container.clone();
+        config.dfe_pod_selector = config.arrowcol_pod_selector.clone();
+        config.validate()?;
+        assert_eq!(config.deployment_names(), vec!["arrowcol"]);
+        config.dfe_pod_selector = "app=unused".to_owned();
+        assert!(config.validate().is_err());
+        Ok(())
     }
 
     #[test]

@@ -16,12 +16,13 @@ use arrow_schema::{DataType, Schema, SchemaRef, TimeUnit};
 use arrowcol_catalog::{DdlCommand, DdlParser};
 use arrowcol_flight::{PutResultMetadata, decode_ddl_completion_metadata};
 use arrowcol_protocol::{
-    ClaimedSchemaFingerprint, ImplementationPool, IngestMetadata, ProtocolVersion, TableIdentity, fingerprint_schema,
+    ClaimedSchemaFingerprint, ImplementationPool, IngestMetadata, ProtocolVersion, TableIdentity, UnixMillis,
+    fingerprint_schema,
 };
+use arrowcol_router_rust::{EdgeRequestSigner, insert_edge_signature_headers};
 use futures::{StreamExt, TryStreamExt, stream};
 use prost::Message as _;
 use tonic::Request;
-use tonic::metadata::MetadataValue;
 use tonic::transport::{Channel, Endpoint};
 
 const SCHEMA_DDL: &str = include_str!("../../../projects/loadtest/schemas/sqlserver.sql");
@@ -127,7 +128,7 @@ pub async fn send(endpoint: &str, client_id: &str, rows: usize) -> Result<usize>
 ///
 /// Returns an error for invalid row or concurrency counts, invalid fixture DDL, or collector connection or upload failures.
 pub async fn send_with_concurrency(endpoint: &str, client_id: &str, rows: usize, concurrency: usize) -> Result<usize> {
-    send_tables_with_concurrency(endpoint, client_id, rows, concurrency, tables()?).await
+    send_tables_with_concurrency(endpoint, client_id, rows, concurrency, tables()?, None).await
 }
 
 /// Registers and uploads one named DMV table for a replica-pinned OAT workload.
@@ -142,7 +143,41 @@ pub async fn send_table_with_concurrency(
     rows: usize,
     concurrency: usize,
 ) -> Result<usize> {
-    send_tables_with_concurrency(endpoint, client_id, rows, concurrency, vec![table_named(table_name)?]).await
+    send_tables_with_concurrency(
+        endpoint,
+        client_id,
+        rows,
+        concurrency,
+        vec![table_named(table_name)?],
+        None,
+    )
+    .await
+}
+
+/// Uploads DMV data through a trusted-edge router, or directly when no key file is supplied.
+///
+/// # Errors
+///
+/// Rejects unreadable/short keys, invalid input, and unsuccessful registration or admission.
+pub async fn send_authenticated(
+    endpoint: &str,
+    client_id: &str,
+    table_name: Option<&str>,
+    rows: usize,
+    concurrency: usize,
+    edge_secret_file: Option<&std::path::Path>,
+) -> Result<usize> {
+    let signer = edge_secret_file
+        .map(|path| {
+            let secret = std::fs::read(path).context("read trusted-edge key file")?;
+            EdgeRequestSigner::new(secret).map_err(anyhow::Error::from)
+        })
+        .transpose()?;
+    let tables = match table_name {
+        Some(name) => vec![table_named(name)?],
+        None => tables()?,
+    };
+    send_tables_with_concurrency(endpoint, client_id, rows, concurrency, tables, signer).await
 }
 
 fn table_named(table_name: &str) -> Result<DmvTable> {
@@ -158,6 +193,7 @@ async fn send_tables_with_concurrency(
     rows: usize,
     concurrency: usize,
     tables: Vec<DmvTable>,
+    signer: Option<EdgeRequestSigner>,
 ) -> Result<usize> {
     if rows == 0 {
         bail!("rows must be positive");
@@ -176,30 +212,87 @@ async fn send_tables_with_concurrency(
     let count = tables.len();
     let mut uploads = Vec::with_capacity(count);
     for table in tables {
-        let version = register(&mut client, &table.ddl)
+        let version = register(&mut client, &table, signer.as_ref())
             .await
             .with_context(|| format!("register {}", table.identity))?;
         let batch = batch(&table, client_id, rows, now_micros)?;
-        uploads.push((table, version, batch));
+        let table = Arc::new(table);
+        for (offset, length) in batch_slices(rows, concurrency) {
+            uploads.push((Arc::clone(&table), version.clone(), batch.slice(offset, length)));
+        }
     }
 
-    let upload_client = FlightServiceClient::new(channel);
     stream::iter(uploads.into_iter().map(|(table, version, batch)| {
-        let mut client = upload_client.clone();
+        let signer = signer.clone();
         async move {
-            put(&mut client, &table, version, batch)
+            // Separate connections let Linux SO_REUSEPORT distribute streams across DFE cores.
+            let channel = Endpoint::from_shared(endpoint.to_owned())?
+                .connect_timeout(RPC_TIMEOUT)
+                .timeout(RPC_TIMEOUT)
+                .connect()
+                .await?;
+            let mut client = FlightServiceClient::new(channel);
+            put(&mut client, &table, version, batch, signer.as_ref())
                 .await
                 .with_context(|| format!("put {}", table.identity))
         }
     }))
-    .buffer_unordered(concurrency.min(count))
+    .buffer_unordered(concurrency)
     .try_collect::<Vec<_>>()
     .await?;
     Ok(count)
 }
-async fn register(client: &mut FlightServiceClient<Channel>, ddl: &str) -> Result<String> {
+fn batch_slices(rows: usize, concurrency: usize) -> Vec<(usize, usize)> {
+    let streams = concurrency.min(rows);
+    let size = rows.div_ceil(streams);
+    (0..rows)
+        .step_by(size)
+        .map(|offset| (offset, size.min(rows - offset)))
+        .collect()
+}
+
+fn request_metadata<T>(request: &mut Request<T>, table: &DmvTable, signer: Option<&EdgeRequestSigner>) -> Result<()> {
+    let metadata = IngestMetadata::new(
+        ProtocolVersion::CURRENT,
+        ImplementationPool::Dataflow,
+        table.identity.clone(),
+        ClaimedSchemaFingerprint::new(fingerprint_schema(table.schema.as_ref())),
+    );
+    let mut headers = http::HeaderMap::new();
+    for (key, value) in metadata.to_ascii_pairs() {
+        headers.insert(
+            http::header::HeaderName::from_static(key),
+            http::HeaderValue::try_from(value)?,
+        );
+    }
+    // Tonic sets this exact content type on the wire, after constructing the request.
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/grpc"),
+    );
+    if let Some(signer) = signer {
+        insert_edge_signature_headers(
+            &mut headers,
+            signer,
+            &http::Method::POST,
+            "/arrow.flight.protocol.FlightService/DoPut",
+            UnixMillis::new(u64::try_from(
+                SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
+            )?)?,
+            &uuid::Uuid::new_v4().to_string(),
+        )?;
+    }
+    *request.metadata_mut() = tonic::metadata::MetadataMap::from_headers(headers);
+    Ok(())
+}
+
+async fn register(
+    client: &mut FlightServiceClient<Channel>,
+    table: &DmvTable,
+    signer: Option<&EdgeRequestSigner>,
+) -> Result<String> {
     let command = CommandStatementUpdate {
-        query: ddl.to_owned(),
+        query: table.ddl.replacen("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1),
         transaction_id: None,
     };
     let descriptor = FlightDescriptor {
@@ -207,12 +300,12 @@ async fn register(client: &mut FlightServiceClient<Channel>, ddl: &str) -> Resul
         cmd: command.as_any().encode_to_vec().into(),
         path: Vec::new(),
     };
-    let response = client
-        .do_put(Request::new(stream::iter(vec![FlightData {
-            flight_descriptor: Some(descriptor),
-            ..FlightData::default()
-        }])))
-        .await?;
+    let mut request = Request::new(stream::iter(vec![FlightData {
+        flight_descriptor: Some(descriptor),
+        ..FlightData::default()
+    }]));
+    request_metadata(&mut request, table, signer)?;
+    let response = client.do_put(request).await?;
     let completion = decode_ddl_completion_metadata(response.metadata())?;
     let mut results = response.into_inner();
     while results.message().await?.is_some() {}
@@ -224,6 +317,7 @@ async fn put(
     table: &DmvTable,
     version: String,
     batch: RecordBatch,
+    signer: Option<&EdgeRequestSigner>,
 ) -> Result<()> {
     let identity = &table.identity;
     let descriptor = FlightDescriptor {
@@ -243,17 +337,7 @@ async fn put(
         .try_collect::<Vec<_>>()
         .await?;
     let mut request = Request::new(stream::iter(encoded));
-    let metadata = IngestMetadata::new(
-        ProtocolVersion::CURRENT,
-        ImplementationPool::Dataflow,
-        identity.clone(),
-        ClaimedSchemaFingerprint::new(fingerprint_schema(table.schema.as_ref())),
-    );
-    for (key, value) in metadata.to_ascii_pairs() {
-        request
-            .metadata_mut()
-            .insert(key, MetadataValue::try_from(value.as_str())?);
-    }
+    request_metadata(&mut request, table, signer)?;
     let mut results = client.do_put(request).await?.into_inner();
     let mut admitted = false;
     while let Some(result) = results.message().await? {
@@ -273,6 +357,40 @@ async fn put(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn splits_one_table_without_losing_or_duplicating_rows() {
+        assert_eq!(batch_slices(7, 3), vec![(0, 3), (3, 3), (6, 1)]);
+        assert_eq!(batch_slices(2, 8), vec![(0, 1), (1, 1)]);
+    }
+
+    #[test]
+    fn router_verifies_ddl_and_ingest_metadata_and_rejects_replay() -> Result<()> {
+        let table = table_named("sqlserver_wait_stats")?;
+        let key = vec![42; 32];
+        let signer = EdgeRequestSigner::new(key.clone())?;
+        let verifier = arrowcol_router_rust::EdgeVerifier::new(key, 30_000)?;
+        for _ in 0..2 {
+            let mut request = Request::new(());
+            request_metadata(&mut request, &table, Some(&signer))?;
+            let headers = request.metadata().clone().into_headers();
+            let now = UnixMillis::new(u64::try_from(
+                SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
+            )?)?;
+            let verify = || {
+                verifier.verify(
+                    &http::Method::POST,
+                    "/arrow.flight.protocol.FlightService/DoPut",
+                    &headers,
+                    now,
+                )
+            };
+            verify()?;
+            assert!(verify().is_err());
+            assert_eq!(headers["x-arrowcol-table"], "sqlserver_wait_stats");
+        }
+        Ok(())
+    }
 
     #[test]
     fn builds_a_batch_for_every_dmv_table_tagged_with_the_client() -> Result<()> {

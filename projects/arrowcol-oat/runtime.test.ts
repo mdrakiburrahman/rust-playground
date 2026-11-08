@@ -1,0 +1,94 @@
+import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
+import { chmod, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
+import test from 'node:test';
+import { parse } from 'yaml';
+import { prepareSecrets, renderRuntime, validateRuntime, type RuntimeConfig } from './runtime.js';
+
+const config = (): RuntimeConfig => ({
+  namespace: 'arrowcol-oat', workloadIdentityClientId: '00000000-0000-0000-0000-000000000001',
+  subscriptionId: '00000000-0000-0000-0000-000000000002', stamp: '89152',
+  deltaRoot: 'abfss://onelake@arrowcollector89152.dfs.core.windows.net/dataflow',
+  images: Object.fromEntries(['sqlserver', 'catalog', 'router', 'dataflow'].map((role) =>
+    [role, `arrowcollector89152.azurecr.io/${role}@sha256:${'a'.repeat(64)}`])) as RuntimeConfig['images'],
+});
+
+test('rejects mutable images, QAP namespace, wrong stamp and unknown fields', () => {
+  assert.throws(() => validateRuntime({ ...config(), namespace: 'azure-qap' }));
+  assert.throws(() => validateRuntime({ ...config(), namespace: 'kube-public' }));
+  assert.throws(() => validateRuntime({ ...config(), unexpected: true }));
+  assert.throws(() => validateRuntime({ ...config(), stamp: '89151' }));
+  assert.throws(() => validateRuntime({ ...config(), stamp: 89152 }));
+  const c = config(); c.images.dataflow = 'example:latest';
+  assert.throws(() => validateRuntime(c));
+});
+
+test('isolated integrated topology pins images, WI, identity, probes and worker policy', async () => {
+  const c = config();
+  const objects = await renderRuntime(c, 'workload');
+  const get = (kind: string, name: string) => objects.find((o) => o.kind === kind && o.metadata.name === name)!;
+  const dfe = get('Deployment', 'arrowcol');
+  assert.equal(objects.filter((o) => o.kind === 'Deployment').length, 3);
+  assert.equal(dfe.spec.strategy.type, 'Recreate');
+  assert.equal(dfe.spec.template.spec.nodeSelector.type, 'benchmark');
+  assert.equal(dfe.spec.template.metadata.labels['azure.workload.identity/use'], 'true');
+  const container = dfe.spec.template.spec.containers[0];
+  assert.equal(container.image, c.images.dataflow);
+  assert.deepEqual(container.args.slice(-2), ['--num-cores', '1']);
+  assert.equal(container.env.find((e: any) => e.name === 'ARROWCOL_INSTANCE_KEY').valueFrom.fieldRef.fieldPath, 'metadata.uid');
+  assert.equal(container.env.find((e: any) => e.name === 'POD_IP').valueFrom.fieldRef.fieldPath, 'status.podIP');
+  assert.equal(container.env.find((e: any) => e.name === 'ARROWCOL_RESET_GENERATION').valueFrom.secretKeyRef.name, 'arrowcol-generation');
+  assert.equal(container.env.find((e: any) => e.name === 'ARROWCOL_PARTITION_GRANULARITY').value, 'hour');
+  assert.equal(container.readinessProbe.httpGet.port, 32011);
+  const configs = get('ConfigMap', 'arrowcol-config').data;
+  const engine = parse(configs['dataflow.yaml']);
+  assert.equal(engine.policies.resources, undefined);
+  assert.equal(engine.groups.arrowcol.pipelines.ingest.nodes.flight.type, 'receiver:arrow_flight');
+  assert.equal(engine.groups.arrowcol.pipelines.ingest.nodes.delta.type, 'exporter:arrow_deltalake');
+  const router = parse(configs['router.yaml']);
+  assert.equal(router.upstream.tls, false);
+  assert.equal(router.upstream.max_h2_streams, 1);
+  assert.equal(router.upstream.idle_timeout_seconds, 0);
+  assert.equal(router.routing.distinct_table_owners, true);
+  assert.equal(router.auth.edge_secret_file, '/run/auth/edge-hmac');
+  assert.equal(objects.some((o) => o.kind === 'Ingress' || o.spec?.type === 'LoadBalancer'), false);
+  assert.equal(get('Deployment', 'arrowcol-catalog').spec.template.spec.containers[0].args.at(-1), '--ingestion-layout');
+  const rules = get('NetworkPolicy', 'flight-router-only').spec.ingress;
+  assert.deepEqual(rules[0].from, [{ podSelector: { matchLabels: { app: 'arrowcol-router' } } }]);
+});
+
+test('SQL persistence and sequential bootstrap keep migration credentials out of runtime', async () => {
+  const foundation = await renderRuntime(config(), 'foundation');
+  assert.equal(foundation.filter((o) => o.kind === 'PersistentVolumeClaim').length, 2);
+  const denyIndex = foundation.findIndex((o) => o.kind === 'NetworkPolicy' && o.metadata.name === 'default-deny-ingress');
+  assert.ok(denyIndex >= 0 && denyIndex < foundation.findIndex((o) => o.kind === 'Deployment'));
+  const [job] = await renderRuntime(config(), 'bootstrap');
+  assert.deepEqual(job.spec.template.spec.initContainers[0].command, ['/usr/local/bin/database-bootstrap']);
+  assert.deepEqual(job.spec.template.spec.containers[0].command, ['/usr/local/bin/arrowcol-migrate']);
+  assert.equal(job.spec.backoffLimit, 0);
+  const workload = await renderRuntime(config(), 'workload');
+  assert.equal(JSON.stringify(workload).includes('arrowcol-sql-migration'), false);
+  assert.equal(JSON.stringify(workload).includes('arrowcol-sql-admin'), false);
+});
+
+test('secret preparation never rotates an existing key or invents a generation', async () => {
+  const root = resolve('out/arrowcol-oat-tests', randomUUID());
+  const directory = resolve(root, 'secrets');
+  const bootstrap = resolve(root, 'bootstrap.env');
+  await mkdir(root, { recursive: true });
+  try {
+    await writeFile(bootstrap, 'AZURE_STAMP=89152\n');
+    await assert.rejects(prepareSecrets(directory, bootstrap), /captured/);
+    await writeFile(bootstrap, 'ARROWCOL_RESET_GENERATION=00000000-0000-0000-0000-000000000001\n');
+    await prepareSecrets(directory, bootstrap);
+    const key = await readFile(resolve(directory, 'edge-hmac'));
+    await prepareSecrets(directory, bootstrap);
+    assert.deepEqual(await readFile(resolve(directory, 'edge-hmac')), key);
+    assert.equal((await stat(resolve(directory, 'edge-hmac'))).mode & 0o777, 0o600);
+    await writeFile(bootstrap, 'ARROWCOL_RESET_GENERATION=00000000-0000-0000-0000-000000000002\n');
+    await assert.rejects(prepareSecrets(directory, bootstrap), /do not rotate/);
+    await chmod(directory, 0o755);
+    await assert.rejects(prepareSecrets(directory, bootstrap), /0700/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

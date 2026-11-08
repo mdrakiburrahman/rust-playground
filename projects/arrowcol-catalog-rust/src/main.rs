@@ -17,6 +17,8 @@ struct Args {
     #[arg(long, env = "ARROWCOL_CATALOG_DDL_DIR")]
     ddl_dir: Option<PathBuf>,
     #[arg(long)]
+    ingestion_layout: bool,
+    #[arg(long)]
     healthcheck: bool,
 }
 
@@ -44,6 +46,7 @@ async fn main() -> Result<()> {
         state_dir: args.state_dir,
         ddl_dir: args.ddl_dir,
         retained_events: 4096,
+        ingestion_layout: args.ingestion_layout,
     })
     .await?;
     tracing::info!(listen = %args.listen, "catalog Flight SQL and CES ready");

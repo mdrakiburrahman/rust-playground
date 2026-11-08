@@ -543,6 +543,67 @@ async fn flight_sql_ddl_returns_standard_and_structured_completion() -> Result<(
 }
 
 #[tokio::test]
+async fn routed_flight_sql_ddl_checks_identity_before_catalog_mutation() -> Result<()> {
+    let catalog = MockCatalogStore::new();
+    let (control_plane, report) = CatalogControlPlane::start(DdlParser::default(), Arc::new(catalog.clone())).await?;
+    assert!(report.failures.is_empty());
+    let admission = MockAdmission::new(TestCompletion::BestEffort, None);
+    let service = build_service(
+        ImplementationPool::Dataflow,
+        Arc::new(catalog),
+        admission.clone(),
+        RuntimeLimits::default(),
+    )?
+    .with_ddl_handler(Arc::new(control_plane) as Arc<dyn FlightSqlDdlHandler>);
+    let ddl = "CREATE TABLE telemetry.prod.events (id BIGINT NOT NULL, body STRING) USING DELTA";
+    let identity = DdlParser::default().parse(ddl)?.identity().clone();
+    let other = DdlParser::default()
+        .parse("CREATE TABLE telemetry.prod.other (id BIGINT NOT NULL) USING DELTA")?
+        .identity()
+        .clone();
+    for (target, valid) in [(other, false), (identity, true)] {
+        let command = CommandStatementUpdate {
+            query: ddl.to_owned(),
+            transaction_id: None,
+        };
+        let mut request = Request::new(stream::iter(vec![Ok(FlightData {
+            flight_descriptor: Some(FlightDescriptor {
+                r#type: DescriptorType::Cmd as i32,
+                cmd: command.as_any().encode_to_vec().into(),
+                path: Vec::new(),
+            }),
+            ..FlightData::default()
+        })]));
+        insert_metadata_pairs(
+            request.metadata_mut(),
+            &IngestMetadata::new(
+                ProtocolVersion::CURRENT,
+                ImplementationPool::Dataflow,
+                target,
+                ClaimedSchemaFingerprint::new(fingerprint_schema(&Schema::empty())),
+            ),
+        )?;
+        let result = service.handle_do_put(request).await;
+        if valid {
+            let response = result?;
+            let completion = decode_ddl_completion_metadata(response.metadata())?;
+            assert_eq!(completion.disposition(), "created");
+            assert_eq!(completion.table(), "events");
+            assert_eq!(
+                DoPutUpdateResult::decode(one_result(response).await?.app_metadata)?.record_count,
+                0
+            );
+        } else {
+            let status = result.err().context("mismatched DDL identity must fail")?;
+            assert_eq!(status.code(), Code::InvalidArgument);
+            assert!(status.message().contains("target does not match"));
+        }
+    }
+    assert_eq!(admission.begin_count(), 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn null_fill_alignment_reuses_every_existing_array_allocation() -> Result<()> {
     let fixture = Fixture::with_current(true).await?;
     let validator = SchemaValidator::new(Arc::new(fixture.catalog.clone()));

@@ -15,7 +15,69 @@ fn config(root: &Path) -> CatalogConfig {
         state_dir: root.join("catalog"),
         ddl_dir: None,
         retained_events: 4,
+        ingestion_layout: false,
     }
+}
+
+#[tokio::test]
+async fn ingestion_catalog_adopts_bootstrap_without_exposing_physical_columns() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let mut config = config(root.path());
+    config.ingestion_layout = true;
+    let location = root.path().join("warehouse/telemetry/sqlserver/events");
+    std::fs::create_dir_all(&location)?;
+    let url = Url::from_directory_path(&location).map_err(|()| anyhow::anyhow!("invalid test path"))?;
+    let sql = "CREATE TABLE telemetry.sqlserver.events (id BIGINT NOT NULL, observed TIMESTAMP) USING DELTA";
+    let DdlCommand::CreateTable(create) = DdlParser::default().parse(sql)? else {
+        bail!("expected CREATE");
+    };
+    let mut fields = create
+        .fields()
+        .iter()
+        .map(|field| field.to_arrow())
+        .collect::<Result<Vec<_>, _>>()?;
+    fields.push(arrow_schema::Field::new(INGESTION, arrow_schema::DataType::Utf8, false));
+    let physical = Arc::new(arrow_schema::Schema::new(fields));
+    let table = DeltaTable::open_url(url, physical, vec![INGESTION.into()])?;
+    let version = table.version()?;
+    let service = CatalogService::open(config.clone()).await?;
+    service.apply_sql(sql).await?;
+    assert!(table.version()? > version);
+    let identity = name_identity(&["telemetry".into(), "sqlserver".into(), "events".into()])?;
+    let history = service.store.schema_history(&identity).await?;
+    assert_eq!(history[0].fields().len(), 2);
+    assert_eq!(
+        table.catalog_snapshot()?.context("head")?.partition_columns,
+        [INGESTION]
+    );
+    let restarted = CatalogService::open(config.clone()).await?;
+    restarted.apply_sql(sql).await?;
+    assert_eq!(restarted.store.schema_history(&identity).await?[0].fields().len(), 2);
+    assert!(
+        restarted
+            .apply_sql("CREATE TABLE telemetry.sqlserver.events (wrong STRING) USING DELTA")
+            .await
+            .is_err()
+    );
+    restarted
+        .apply_sql("ALTER TABLE telemetry.sqlserver.events ADD COLUMNS (next_observed TIMESTAMP)")
+        .await?;
+    let snapshot = table.catalog_snapshot()?.context("head after ALTER")?;
+    assert_eq!(snapshot.schema.fields()[3].name(), INGESTION);
+    assert_eq!(snapshot.schema.fields()[4].name(), "next_observed");
+    let reopened = CatalogService::open(config).await?;
+    assert_eq!(
+        reopened
+            .store
+            .schema_history(&identity)
+            .await?
+            .last()
+            .context("head")?
+            .fields()
+            .len(),
+        3
+    );
+    Ok(())
 }
 
 const CREATE: &str = "CREATE TABLE arrowcol.default.events (id BIGINT NOT NULL, day STRING) USING DELTA PARTITIONED BY (day) COMMENT 'catalog test' TBLPROPERTIES ('vendor.setting' = 'original')";

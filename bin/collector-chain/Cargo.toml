@@ -17,8 +17,10 @@ arrow-schema = { version = "58.3", default-features = false }
 arrowcol-catalog = { path = "../../crates/arrowcol-catalog" }
 arrowcol-flight = { path = "../../crates/arrowcol-flight" }
 arrowcol-protocol = { path = "../../crates/arrowcol-protocol" }
+arrowcol-router-rust = { path = "../../projects/arrowcol-router-rust" }
 clap.workspace = true
 futures = "0.3"
+http = "1"
 opentelemetry.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry_sdk.workspace = true

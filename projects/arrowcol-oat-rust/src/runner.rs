@@ -64,10 +64,12 @@ pub async fn execute(config: OatConfig, id: &str, state: Arc<AppState>) -> Resul
         })
         .await;
 
-    let arrow_original = deployment(&config, &config.arrowcol_deployment).await?;
-    let dfe_original = deployment(&config, &config.dfe_deployment).await?;
+    let mut originals = Vec::new();
+    for name in config.deployment_names() {
+        originals.push(deployment(&config, name).await?);
+    }
     let matrix_result = run_matrix(&config, id, &state).await;
-    let restore_result = restore_deployments(&config, arrow_original, dfe_original).await;
+    let restore_result = restore_deployments(&config, originals).await;
 
     let results = match (matrix_result, restore_result) {
         (Ok(results), Ok(())) => results,
@@ -103,8 +105,12 @@ async fn run_matrix(config: &OatConfig, id: &str, state: &AppState) -> Result<Ve
                 })
                 .await;
             configure_deployments(config, *replicas, *concurrency).await?;
-            rollout(config, &config.arrowcol_deployment).await?;
-            rollout(config, &config.dfe_deployment).await?;
+            for name in config.deployment_names() {
+                rollout(config, name).await?;
+            }
+            // SQL registration/table leases live for 30s. Do not send to a predecessor pod
+            // still present in the router's snapshot after a Recreate rollout.
+            tokio::time::sleep(Duration::from_secs(32)).await;
 
             let assigned_tables = config
                 .tables
@@ -113,7 +119,7 @@ async fn run_matrix(config: &OatConfig, id: &str, state: &AppState) -> Result<Ve
                 .cloned()
                 .collect::<Vec<_>>();
             let run_id = format!("{id}-r{replicas}-c{concurrency}");
-            let client_durations = run_clients(config, id, &assigned_tables).await?;
+            let client_durations = run_clients(config, &run_id, &assigned_tables).await?;
             let qap = observe_qap(config, &run_id, &assigned_tables).await?;
             let metrics = collect_metrics(config).await?;
             for table in assigned_tables {
@@ -148,6 +154,7 @@ async fn run_clients(config: &OatConfig, id: &str, tables: &[String]) -> Result<
         let table = table.clone();
         let rows = config.rows_per_table.to_string();
         let concurrency = config.dmv_concurrency.to_string();
+        let edge_secret_file = config.edge_secret_file.clone();
         let client_id = format!("oat-{id}-{table}");
         tasks.spawn(async move {
             let started = Instant::now();
@@ -163,6 +170,8 @@ async fn run_clients(config: &OatConfig, id: &str, tables: &[String]) -> Result<
                     &concurrency,
                     "--table",
                     &table,
+                    "--edge-secret-file",
+                    &edge_secret_file,
                 ])
                 .output()
                 .await
@@ -201,7 +210,7 @@ async fn observe_qap(config: &OatConfig, run_id: &str, tables: &[String]) -> Res
         .iter()
         .map(|table| format!("dataflow_{table}"))
         .collect::<Vec<_>>();
-    let results = std::env::temp_dir().join("arrowcol-oat").join(run_id);
+    let results = std::path::PathBuf::from("out/arrowcol-oat/qap").join(run_id);
     let endpoint = config.qap_endpoint.clone();
     let database = config.qap_database.clone();
     let observer_tables = qap_tables.clone();
@@ -320,19 +329,28 @@ fn sum_qap_values(tables: &[&Value], pointer: &str) -> Option<u64> {
 }
 
 async fn configure_deployments(config: &OatConfig, replicas: u32, concurrency: u32) -> Result<()> {
-    let mut arrowcol = deployment(config, &config.arrowcol_deployment).await?;
-    arrowcol["spec"]["replicas"] = json!(replicas);
-    apply_deployment(config, arrowcol).await?;
+    for name in config.deployment_names() {
+        let mut desired = deployment(config, name).await?;
+        if name == config.arrowcol_deployment {
+            desired["spec"]["replicas"] = json!(replicas);
+        }
+        if name == config.dfe_deployment {
+            configure_workers(&mut desired, &config.dfe_container, concurrency)?;
+        }
+        apply_deployment(config, desired).await?;
+    }
+    Ok(())
+}
 
-    let mut dfe = deployment(config, &config.dfe_deployment).await?;
+fn configure_workers(dfe: &mut Value, container_name: &str, concurrency: u32) -> Result<()> {
     let containers = dfe
         .pointer_mut("/spec/template/spec/containers")
         .and_then(Value::as_array_mut)
         .context("DFE Deployment has no container list")?;
     let container = containers
         .iter_mut()
-        .find(|container| container.get("name").and_then(Value::as_str) == Some(config.dfe_container.as_str()))
-        .with_context(|| format!("DFE container {:?} was not found", config.dfe_container))?;
+        .find(|container| container.get("name").and_then(Value::as_str) == Some(container_name))
+        .with_context(|| format!("DFE container {container_name:?} was not found"))?;
     let args = container
         .get_mut("args")
         .and_then(Value::as_array_mut)
@@ -342,7 +360,17 @@ async fn configure_deployments(config: &OatConfig, replicas: u32, concurrency: u
     while index < args.len() {
         let value = args[index].as_str().context("DFE args must be strings")?;
         if value == "--num-cores" {
+            if args
+                .get(index + 1)
+                .and_then(Value::as_str)
+                .and_then(|value| value.parse::<u32>().ok())
+                .is_none()
+            {
+                bail!("--num-cores must have a numeric value");
+            }
             index += 2;
+        } else if value == "--core-id-range" || value.starts_with("--core-id-range=") {
+            bail!("DFE --core-id-range conflicts with benchmark --num-cores");
         } else if value.starts_with("--num-cores=") {
             index += 1;
         } else {
@@ -353,22 +381,20 @@ async fn configure_deployments(config: &OatConfig, replicas: u32, concurrency: u
     rewritten.push(json!("--num-cores"));
     rewritten.push(json!(concurrency.to_string()));
     container["args"] = Value::Array(rewritten);
-    apply_deployment(config, dfe).await
+    Ok(())
 }
 
-async fn restore_deployments(config: &OatConfig, arrowcol: Value, dfe: Value) -> Result<()> {
+async fn restore_deployments(config: &OatConfig, originals: Vec<Value>) -> Result<()> {
     let mut failures = Vec::new();
-    if let Err(error) = apply_deployment(config, arrowcol).await {
-        failures.push(format!("restore ArrowCol Deployment: {error:#}"));
+    for original in originals {
+        if let Err(error) = apply_deployment(config, original).await {
+            failures.push(format!("restore Deployment: {error:#}"));
+        }
     }
-    if let Err(error) = apply_deployment(config, dfe).await {
-        failures.push(format!("restore DFE Deployment: {error:#}"));
-    }
-    if let Err(error) = rollout(config, &config.arrowcol_deployment).await {
-        failures.push(format!("wait for ArrowCol restore: {error:#}"));
-    }
-    if let Err(error) = rollout(config, &config.dfe_deployment).await {
-        failures.push(format!("wait for DFE restore: {error:#}"));
+    for name in config.deployment_names() {
+        if let Err(error) = rollout(config, name).await {
+            failures.push(format!("wait for {name} restore: {error:#}"));
+        }
     }
     if failures.is_empty() {
         Ok(())
@@ -436,7 +462,7 @@ async fn rollout(config: &OatConfig, name: &str) -> Result<()> {
             &format!("deployment/{name}"),
             "--namespace",
             &config.namespace,
-            "--timeout=180s",
+            "--timeout=600s",
         ],
         None,
     )
@@ -446,15 +472,23 @@ async fn rollout(config: &OatConfig, name: &str) -> Result<()> {
 }
 
 async fn collect_metrics(config: &OatConfig) -> Result<ResourceMetrics> {
-    let arrowcol = top_metrics(config, &config.arrowcol_pod_selector).await?;
-    let dfe = top_metrics(config, &config.dfe_pod_selector).await?;
-    Ok(ResourceMetrics {
-        cpu_millicores: arrowcol.cpu_millicores + dfe.cpu_millicores,
-        memory_bytes: arrowcol.memory_bytes.saturating_add(dfe.memory_bytes),
-    })
+    let mut pods = top_metrics(config, &config.arrowcol_pod_selector).await?;
+    if config.arrowcol_pod_selector != config.dfe_pod_selector {
+        pods.extend(top_metrics(config, &config.dfe_pod_selector).await?);
+    }
+    Ok(sum_metrics(&pods))
 }
 
-async fn top_metrics(config: &OatConfig, selector: &str) -> Result<ResourceMetrics> {
+fn sum_metrics(pods: &HashMap<String, ResourceMetrics>) -> ResourceMetrics {
+    ResourceMetrics {
+        cpu_millicores: pods.values().map(|pod| pod.cpu_millicores).sum(),
+        memory_bytes: pods
+            .values()
+            .fold(0_u64, |sum, pod| sum.saturating_add(pod.memory_bytes)),
+    }
+}
+
+async fn top_metrics(config: &OatConfig, selector: &str) -> Result<HashMap<String, ResourceMetrics>> {
     let output = kubectl(
         config,
         vec![
@@ -469,19 +503,27 @@ async fn top_metrics(config: &OatConfig, selector: &str) -> Result<ResourceMetri
         None,
     )
     .await?;
-    let mut metrics = ResourceMetrics::default();
-    let mut count = 0_u64;
+    let metrics = parse_top_metrics(&output)?;
+    if metrics.is_empty() {
+        bail!("kubectl top returned no pods for selector {selector:?}");
+    }
+    Ok(metrics)
+}
+
+fn parse_top_metrics(output: &str) -> Result<HashMap<String, ResourceMetrics>> {
+    let mut metrics = HashMap::new();
     for line in output.lines().filter(|line| !line.trim().is_empty()) {
         let columns = line.split_whitespace().collect::<Vec<_>>();
         if columns.len() < 3 {
             bail!("unexpected kubectl top output row: {line}");
         }
-        metrics.cpu_millicores += parse_cpu_millicores(columns[1])?;
-        metrics.memory_bytes = metrics.memory_bytes.saturating_add(parse_memory_bytes(columns[2])?);
-        count += 1;
-    }
-    if count == 0 {
-        bail!("kubectl top returned no pods for selector {selector:?}");
+        metrics.insert(
+            columns[0].to_owned(),
+            ResourceMetrics {
+                cpu_millicores: parse_cpu_millicores(columns[1])?,
+                memory_bytes: parse_memory_bytes(columns[2])?,
+            },
+        );
     }
     Ok(metrics)
 }
@@ -629,6 +671,32 @@ fn parquet_bytes(results: &[OatResult]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn integrated_patch_preserves_replicas_config_and_replaces_all_core_arguments() -> Result<()> {
+        let mut deployment = json!({"spec":{"replicas":2,"template":{"spec":{"containers":[{
+            "name":"dataflow","args":["--config","/etc/oat/dataflow.yaml","--num-cores=1","--num-cores","3"]
+        }]}}}});
+        configure_workers(&mut deployment, "dataflow", 2)?;
+        assert_eq!(deployment["spec"]["replicas"], 2);
+        assert_eq!(
+            deployment.pointer("/spec/template/spec/containers/0/args"),
+            Some(&json!(["--config", "/etc/oat/dataflow.yaml", "--num-cores", "2"]))
+        );
+        deployment["spec"]["template"]["spec"]["containers"][0]["args"] = json!(["--num-cores"]);
+        assert!(configure_workers(&mut deployment, "dataflow", 2).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn overlapping_metrics_selectors_count_each_pod_once() -> Result<()> {
+        let mut pods = parse_top_metrics("arrowcol-a 100m 2Mi\narrowcol-b 200m 3Mi\n")?;
+        pods.extend(parse_top_metrics("arrowcol-a 100m 2Mi\n")?);
+        let total = sum_metrics(&pods);
+        assert_eq!(total.cpu_millicores, 300.0);
+        assert_eq!(total.memory_bytes, 5 * 1024 * 1024);
+        Ok(())
+    }
 
     #[test]
     fn parses_kubernetes_cpu_and_memory_units() -> Result<()> {

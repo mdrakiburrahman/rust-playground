@@ -1,0 +1,13 @@
+{
+  "namespace": "arrowcol-oat",
+  "workloadIdentityClientId": "REPLACE_WITH_PROVISIONED_UAMI_CLIENT_ID",
+  "subscriptionId": "REPLACE_WITH_SUBSCRIPTION_ID",
+  "stamp": "89152",
+  "deltaRoot": "abfss://REPLACE_WITH_STAMP_DATA_CONTAINER@arrowcollector89152.dfs.core.windows.net/dataflow",
+  "images": {
+    "sqlserver": "arrowcollector89152.azurecr.io/arrowcol-sqlserver@sha256:REPLACE_WITH_REGISTRY_MANIFEST_DIGEST",
+    "catalog": "arrowcollector89152.azurecr.io/arrowcol-catalog-rust@sha256:REPLACE_WITH_REGISTRY_MANIFEST_DIGEST",
+    "router": "arrowcollector89152.azurecr.io/arrowcol-router-rust@sha256:REPLACE_WITH_REGISTRY_MANIFEST_DIGEST",
+    "dataflow": "arrowcollector89152.azurecr.io/arrowcol-dataflow-rust@sha256:REPLACE_WITH_REGISTRY_MANIFEST_DIGEST"
+  }
+}

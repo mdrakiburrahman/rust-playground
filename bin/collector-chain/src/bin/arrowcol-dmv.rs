@@ -16,29 +16,21 @@ struct Args {
     concurrency: usize,
     #[arg(long)]
     table: Option<String>,
+    #[arg(long)]
+    edge_secret_file: Option<std::path::PathBuf>,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
     let runtime = tokio::runtime::Runtime::new()?;
-    let table_count = if let Some(table) = &args.table {
-        runtime.block_on(dmv::send_table_with_concurrency(
-            &args.endpoint,
-            &args.client_id,
-            table,
-            args.rows,
-            args.concurrency,
-        ))?
-    } else if args.concurrency == 1 {
-        runtime.block_on(dmv::send(&args.endpoint, &args.client_id, args.rows))?
-    } else {
-        runtime.block_on(dmv::send_with_concurrency(
-            &args.endpoint,
-            &args.client_id,
-            args.rows,
-            args.concurrency,
-        ))?
-    };
+    let table_count = runtime.block_on(dmv::send_authenticated(
+        &args.endpoint,
+        &args.client_id,
+        args.table.as_deref(),
+        args.rows,
+        args.concurrency,
+        args.edge_secret_file.as_deref(),
+    ))?;
     println!(
         "uploaded {table_count} DMV tables with {} rows each using concurrency {}",
         args.rows, args.concurrency

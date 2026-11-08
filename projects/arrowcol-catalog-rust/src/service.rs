@@ -32,6 +32,7 @@ use url::Url;
 
 const HISTORY_KEY: &str = "catalog.schemaHistory";
 const DROPPED_KEY: &str = "catalog.dropped";
+const INGESTION: &str = "__arrowcol_ingestion";
 
 /// Standalone service configuration; all state paths are outside source control.
 #[derive(Clone, Debug)]
@@ -44,6 +45,8 @@ pub struct CatalogConfig {
     pub ddl_dir: Option<PathBuf>,
     /// Maximum retained notifications in this process epoch.
     pub retained_events: usize,
+    /// Keep ingress schemas logical while storing the DFE ingestion partition physically.
+    pub ingestion_layout: bool,
 }
 
 #[derive(Clone)]
@@ -148,6 +151,11 @@ impl CatalogService {
                 continue;
             }
             if let Some(snapshot) = read_delta(&entry.location).await? {
+                if service.config.ingestion_layout && !snapshot.properties.contains_key(HISTORY_KEY) {
+                    // A supported bootstrap creates physical tables, not client schemas. Only
+                    // a matching CREATE may adopt them; never expose physical columns to Flight.
+                    continue;
+                }
                 if snapshot
                     .properties
                     .get(DROPPED_KEY)
@@ -181,6 +189,7 @@ impl CatalogService {
                         .unwrap_or_else(|| service.default_location(&identity));
                     if let Some(snapshot) = read_delta(&location).await?
                         && snapshot.properties.get(DROPPED_KEY).is_none_or(|value| value != "true")
+                        && (!service.config.ingestion_layout || snapshot.properties.contains_key(HISTORY_KEY))
                     {
                         let table = service.recover_table(identity.clone(), location.clone(), snapshot)?;
                         service.persist_index(&identity, &location)?;
@@ -350,9 +359,9 @@ impl CatalogService {
         if head.identity() != &identity {
             bail!("committed history identity disagrees with table index");
         }
-        let schema = arrow_deltalake::normalize::schema(&Arc::new(head.arrow_schema()?))?;
+        let schema = arrow_deltalake::normalize::schema(self.storage_schema(&history)?.as_ref())?;
         if *schema != *snapshot.schema
-            || head.metadata().partition_columns != snapshot.partition_columns
+            || self.storage_partitions(head)? != snapshot.partition_columns
             || head.metadata().properties != public_properties(&snapshot.properties)
             || head.metadata().comment != snapshot.comment
         {
@@ -363,6 +372,36 @@ impl CatalogService {
             location,
             delta_version: snapshot.version,
         })
+    }
+
+    fn storage_schema(&self, history: &[CatalogSchemaVersion]) -> Result<Arc<arrow_schema::Schema>> {
+        let head = history.last().context("empty catalog history")?;
+        let schema = head.arrow_schema()?;
+        if !self.config.ingestion_layout {
+            return Ok(Arc::new(schema));
+        }
+        if schema.field_with_name(INGESTION).is_ok() {
+            bail!("ingestion partition is reserved for the DFE writer");
+        }
+        let mut fields = schema.fields().to_vec();
+        // Keep the original physical prefix intact when nullable logical fields are appended.
+        let initial_fields = history.first().context("empty catalog history")?.fields().len();
+        fields.insert(
+            initial_fields,
+            Arc::new(arrow_schema::Field::new(INGESTION, arrow_schema::DataType::Utf8, false)),
+        );
+        Ok(Arc::new(arrow_schema::Schema::new(fields)))
+    }
+
+    fn storage_partitions(&self, head: &CatalogSchemaVersion) -> Result<Vec<String>> {
+        if self.config.ingestion_layout {
+            if !head.metadata().partition_columns.is_empty() {
+                bail!("ingestion-layout catalogs do not accept user partition columns");
+            }
+            Ok(vec![INGESTION.to_owned()])
+        } else {
+            Ok(head.metadata().partition_columns.clone())
+        }
     }
 
     async fn apply_sql(&self, sql: &str) -> Result<Option<DdlCompletion>> {
@@ -395,6 +434,7 @@ impl CatalogService {
         let identity = statement_identity(&statement)?;
         for _ in 0..5 {
             let current = self.state.lock().await.tables.get(&identity).cloned();
+            let mut bootstrap_version = None;
             let (mut history, location, kind, disposition, dropped) = match &statement {
                 SparkStatement::CreateTable(create_ast) => {
                     reject_internal(create_ast.metadata.properties.keys())?;
@@ -430,7 +470,7 @@ impl CatalogService {
                         .clone()
                         .unwrap_or_else(|| self.default_location(&identity));
                     metadata.location = Some(location.clone());
-                    let schema = CatalogSchemaVersion::new(
+                    let mut schema = CatalogSchemaVersion::new(
                         deterministic_table_id(&identity),
                         identity.clone(),
                         SchemaVersion::FIRST,
@@ -438,6 +478,29 @@ impl CatalogService {
                         create.canonical_ddl(),
                     )?
                     .with_metadata(metadata)?;
+                    if self.config.ingestion_layout
+                        && let Some(snapshot) = read_delta(&location).await?
+                    {
+                        if snapshot.properties.contains_key(HISTORY_KEY) {
+                            let recovered = self.recover_table(identity.clone(), location, snapshot)?;
+                            self.store.hydrate_committed(recovered.history.clone()).await?;
+                            self.state.lock().await.tables.insert(identity.clone(), recovered);
+                            continue;
+                        }
+                        if snapshot.properties.contains_key(DROPPED_KEY)
+                            || *arrow_deltalake::normalize::schema(
+                                self.storage_schema(std::slice::from_ref(&schema))?.as_ref(),
+                            )? != *snapshot.schema
+                            || self.storage_partitions(&schema)? != snapshot.partition_columns
+                        {
+                            bail!("bootstrap table does not match the requested logical ingress schema and layout");
+                        }
+                        let mut metadata = schema.metadata().clone();
+                        metadata.properties = public_properties(&snapshot.properties);
+                        metadata.comment = snapshot.comment;
+                        schema = schema.with_metadata(metadata)?;
+                        bootstrap_version = Some(snapshot.version);
+                    }
                     (
                         vec![schema],
                         location,
@@ -586,17 +649,17 @@ impl CatalogService {
                 _ => bail!("use Flight SQL statement query for SHOW/DESCRIBE"),
             };
             let head = history.last().context("empty proposed history")?;
-            let schema = Arc::new(head.arrow_schema()?);
+            let schema = self.storage_schema(&history)?;
             let mut properties = head.metadata().properties.clone();
             properties.insert(HISTORY_KEY.to_owned(), serde_json::to_string(&history)?);
             if dropped {
                 properties.insert(DROPPED_KEY.to_owned(), "true".to_owned());
             }
-            let partitions = head.metadata().partition_columns.clone();
+            let partitions = self.storage_partitions(head)?;
             let comment = head.metadata().comment.clone();
             self.persist_index(&identity, &location)?;
             let location_for_commit = location.clone();
-            let expected = current.as_ref().map(|table| table.delta_version);
+            let expected = current.as_ref().map(|table| table.delta_version).or(bootstrap_version);
             let committed_schema = arrow_deltalake::normalize::schema(&schema)?;
             let committed_properties = properties.clone();
             let committed_partitions = partitions.clone();

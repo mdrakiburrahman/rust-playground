@@ -25,8 +25,10 @@ LABEL org.opencontainers.image.title="arrowcol-dataflow-rust" \
       org.opencontainers.image.source="https://github.com/mdrakiburrahman/rust-playground" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.revision="${VCS_REF}"
-COPY infra/docker/install-azure-cli.sh /tmp/install-azure-cli.sh
-RUN sh /tmp/install-azure-cli.sh && rm -f /tmp/install-azure-cli.sh
+COPY infra/docker/install-azure-cli.sh /usr/local/share/install-azure-cli.sh
+RUN sed -i 's|/tmp/|/usr/local/share/|g' /usr/local/share/install-azure-cli.sh \
+    && sh /usr/local/share/install-azure-cli.sh \
+    && rm -f /usr/local/share/install-azure-cli.sh
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl tini \
     && rm -rf /var/lib/apt/lists/* \
