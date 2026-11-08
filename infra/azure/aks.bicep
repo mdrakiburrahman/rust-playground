@@ -219,7 +219,7 @@ resource operatorClusterAdminRole 'Microsoft.Authorization/roleAssignments@2022-
 
 resource qapFederatedCredential 'Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials@2023-01-31' = {
   parent: sharedIdentity
-  name: 'azure-qap'
+  name: 'azure-qap-${clusterName}'
   dependsOn: [publisherFederatedCredentialsResource]
   properties: {
     audiences: ['api://AzureADTokenExchange']

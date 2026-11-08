@@ -580,6 +580,11 @@ export function owned(resource: any, config: Config): void {
   if (!resource || Object.entries({ ...TAGS, sandboxId: config.sandbox }).some(([k, v]) => resource.tags?.[k] !== v))
     throw new Failure('Exact sandbox ownership tags do not match; refusing adoption/mutation.');
 }
+function owned_shared_stamp_identity(resource: any): void {
+  if (!resource || resource.tags?.project !== TAGS.project || resource.tags?.purpose !== TAGS.purpose ||
+      !/^stamp-\d+$/.test(resource.tags?.sandboxId ?? ''))
+    throw new Failure('Exact shared ArrowCol identity ownership tags do not match; refusing adoption/mutation.');
+}
 export async function retry_ready<T>(action: () => Promise<T>, label: string, timeout = 600): Promise<T> {
   const deadline = runtime.now() + timeout;
   for (;;) {
@@ -645,7 +650,7 @@ export async function preflight(azure: Azure): Promise<void> {
   if (!versions.values?.some((entry: any) => entry.version === versionFamily && Object.hasOwn(entry.patchVersions ?? {}, aksConfig.version)))
     throw new Failure('Configured AKS Kubernetes version is not available in the target region.');
   const pools = [
-    { ...aksConfig.systemPool, label: 'system pool', quotaCount: aksConfig.systemPool.initialCount },
+    { ...aksConfig.systemPool, label: 'system pool', quotaCount: aksConfig.systemPool.maxCount },
     ...aksConfig.userPools.map(pool => ({ ...pool, label: 'user pool ' + pool.name, quotaCount: pool.maxCount })),
   ];
   const requiredByFamily = new Map<string, number>();
@@ -696,7 +701,10 @@ export async function guard_existing(azure: Azure): Promise<void> {
     const resource = await azure.arm('GET', resourcePath, undefined, true,
       resourcePath === c.base ? '2022-09-01' : [c.storage_id, c.readLogStorageId].includes(resourcePath) ? '2023-05-01' :
         resourcePath === c.identity_id ? '2023-01-31' : resourcePath === c.workspace_id ? LOG_ANALYTICS_API : API);
-    if (resource) owned(resource, c);
+    if (resource) {
+      if (c.mode === 'stamped' && resourcePath === c.identity_id) owned_shared_stamp_identity(resource);
+      else owned(resource, c);
+    }
   }
 }
 export function fresh_authority(): Metadata {

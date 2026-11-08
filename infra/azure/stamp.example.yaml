@@ -12,10 +12,10 @@ aks:
   serviceAccount: arrow-collector
   systemPool:
     name: systempool
-    vmSize: Standard_D8s_v6
+    vmSize: Standard_D8ds_v6
     initialCount: 3
     minCount: 3
-    maxCount: 6
+    maxCount: 3
     maxPods: 250
     availabilityZones: ["1", "2", "3"]
   # User pools autoscale from zero; quota-aware maximums are intentionally conservative.
@@ -35,16 +35,16 @@ aks:
       maxPods: 30
       availabilityZones: []
   network:
-    vnetIpv4Cidr: 10.240.0.0/16
-    vnetIpv6Cidr: fd20:240::/48
-    nodeSubnetIpv4Cidr: 10.240.0.0/24
-    nodeSubnetIpv6Cidr: fd20:240:0:1::/64
-    apiServerSubnetIpv4Cidr: 10.240.1.0/28
-    podIpv4Cidr: 10.241.0.0/16
-    podIpv6Cidr: fd20:240:1::/64
-    serviceIpv4Cidr: 10.242.0.0/16
-    serviceIpv6Cidr: fd20:240:2::/108
-    dnsServiceIp: 10.242.0.10
+    vnetIpv4Cidr: 10.245.0.0/16
+    vnetIpv6Cidr: fd20:245::/48
+    nodeSubnetIpv4Cidr: 10.245.0.0/24
+    nodeSubnetIpv6Cidr: fd20:245:0:1::/64
+    apiServerSubnetIpv4Cidr: 10.245.1.0/28
+    podIpv4Cidr: 10.246.0.0/16
+    podIpv6Cidr: fd20:245:1::/64
+    serviceIpv4Cidr: 10.247.0.0/16
+    serviceIpv6Cidr: fd20:245:2::/108
+    dnsServiceIp: 10.247.0.10
     # Set only IP allocation tags authorized for the target subscription.
     egressIpv4IpTags: []
     egressIpv6IpTags: []

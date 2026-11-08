@@ -249,6 +249,47 @@ for (const state of ['missing', 'empty', 'legacy', 'identity', 'denied'] as cons
     else await b.preflight(azure);
     assert.equal(inventories, state === 'missing' || state === 'denied' ? 0 : 1);
   });
+test('preflight reserves quota for the system-pool autoscale maximum', async () => {
+  const c = azure.c;
+  c.operator = SUB;
+  c.stampConfig.publisherFederatedCredentials.push({
+    name: 'publisher', issuer: 'https://token.actions.githubusercontent.com', subject: 'repo:example/repo:environment:publish',
+  });
+  mock.method(azure, 'arm', async () => ({ tags: azure.tags }));
+  mock.method(azure, 'cli', async (...args: string[]) => {
+    switch (args.slice(0, 2).join(' ')) {
+      case 'account show': return { id: c.subscription };
+      case 'provider show': return { registrationState: 'Registered' };
+      case 'aks get-versions': return {
+        values: [{ version: c.stampConfig.aks.version.split('.').slice(0, 2).join('.'),
+          patchVersions: { [c.stampConfig.aks.version]: {} } }],
+      };
+      case 'vm list-skus': {
+        const vmSize = args[args.indexOf('--size') + 1];
+        return [{ name: vmSize, family: 'testFamily', capabilities: [{ name: 'vCPUs', value: '1' }] }];
+      }
+      case 'vm list-usage': return [{ name: { value: 'testFamily' }, currentValue: 0, limit: 7 }];
+      case 'feature show': return { properties: { state: 'Registered' } };
+      case 'network vnet': return [];
+      default: assert.fail('Unexpected Azure mutation or CLI command: ' + args.join(' '));
+    }
+  });
+  await assert.rejects(b.preflight(azure), /quota is insufficient/);
+});
+test('shared stamped identity can be reused without replacing other stamp consumers', async () => {
+  const c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_STAMP: '89151' });
+  azure.c = c;
+  mock.method(azure, 'arm', async (_method: string, resourcePath: string) => resourcePath === c.identity_id
+    ? { tags: { ...b.TAGS, sandboxId: 'stamp-89150' } } : null);
+  await b.guard_existing(azure);
+});
+test('shared stamped identity rejects an unrelated or malformed ownership tag', async () => {
+  const c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_STAMP: '89151' });
+  azure.c = c;
+  mock.method(azure, 'arm', async (_method: string, resourcePath: string) => resourcePath === c.identity_id
+    ? { tags: { ...b.TAGS, sandboxId: 'foreign' } } : null);
+  await assert.rejects(b.guard_existing(azure), /shared ArrowCol identity ownership tags/);
+});
 for (const values of [
   { AZURE_RESOURCE_GROUP: 'production' }, { AZURE_RESOURCE_GROUP: '' }, { AZURE_SUBSCRIPTION_ID: 'default' },
   { AZURE_SUBSCRIPTION_ID: '{{00000000-0000-0000-0000-000000000001}}' },
@@ -1108,6 +1149,11 @@ test('Bicep serializes AKS subnet writes on the shared VNet', () => {
   assert.match(section('apiServerSubnet'), /parent: vnet\s+name: 'apiserver-subnet'/);
   assert.match(section('apiServerSubnet'), /dependsOn:\s*\[\s*nodeSubnet\s*\]/);
   assert.doesNotMatch(section('nodeSubnet'), /dependsOn:[\s\S]*apiServerSubnet/);
+});
+test('each AKS stamp gets a distinct QAP identity trust entry', () => {
+  const source = fs.readFileSync(path.join(b.ROOT, 'infra/azure/aks.bicep'), 'utf8');
+  const section = source.split('resource qapFederatedCredential ')[1].split('\nresource ')[0];
+  assert.match(section, /name: 'azure-qap-\$\{clusterName\}'/);
 });
 test('Bicep separates Kusto client application identity from storage object principal and preserves live authority', () => {
   const source = fs.readFileSync(path.join(b.ROOT, 'infra/azure/sandbox.bicep'), 'utf8');
