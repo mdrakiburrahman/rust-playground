@@ -288,7 +288,7 @@ mod routing_policy_tests {
     use super::{RouterConfig, RoutingConfig};
 
     #[test]
-    fn distinct_table_owners_is_opt_in_and_enabled_for_loadtest() {
+    fn distinct_table_owners_is_opt_in_and_disabled_for_single_collector_loadtest() {
         let defaults = RouterConfig::from_yaml(include_bytes!("../config.yaml"))
             .unwrap_or_else(|error| panic!("parse default router configuration: {error}"));
         assert!(!defaults.routing.distinct_table_owners);
@@ -297,6 +297,6 @@ mod routing_policy_tests {
             .unwrap_or_else(|error| panic!("parse loadtest router configuration: {error}"));
         let routing: RoutingConfig = serde_yaml::from_value(loadtest["routing"].clone())
             .unwrap_or_else(|error| panic!("parse loadtest routing policy: {error}"));
-        assert!(routing.distinct_table_owners);
+        assert!(!routing.distinct_table_owners);
     }
 }
