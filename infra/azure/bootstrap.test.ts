@@ -229,9 +229,10 @@ for (const state of ['missing', 'empty', 'legacy', 'identity', 'denied'] as cons
         case 'aks get-versions': return {
           values: [{ version: aks.version.split('.').slice(0, 2).join('.'), patchVersions: { [aks.version]: {} } }],
         };
-        case 'vm list-skus': return [{
-          name: aks.systemPool.vmSize, family: 'testFamily', capabilities: [{ name: 'vCPUs', value: '1' }],
-        }];
+        case 'vm list-skus': {
+          const vmSize = args[args.indexOf('--size') + 1];
+          return [{ name: vmSize, family: 'testFamily', capabilities: [{ name: 'vCPUs', value: '1' }] }];
+        }
         case 'vm list-usage': return [{ name: { value: 'testFamily' }, currentValue: 0, limit: 100 }];
         case 'feature show': return { properties: { state: 'Registered' } };
         case 'network vnet': return [];
@@ -1119,6 +1120,9 @@ test('Bicep adds experiment container, database, workspace and StorageRead diagn
   const main = fs.readFileSync(path.join(b.ROOT, 'infra/azure/main.bicep'), 'utf8');
   const section = (name: string) => source.split(`resource ${name} `)[1].split('\nresource ')[0].split('\noutput ')[0];
   assert.match(section('experiment'), /parent: blobs[\s\S]*name: experimentContainer[\s\S]*sandboxid: ownership\.sandboxId/);
+  assert.match(section('blobs'), /staticWebsite: \{[\s\S]*enabled: true[\s\S]*indexDocument: 'index\.html'/);
+  assert.match(section('storage'), /isHnsEnabled: true[\s\S]*allowBlobPublicAccess: false/);
+  assert.match(section('runtimeWebsiteWriter'), /scope: website[\s\S]*ba92f5b4-2d11-453d-a403-e96b0029c9fe/);
   assert.deepEqual([...source.matchAll(/resource (\w+) 'Microsoft\.Storage\/storageAccounts@/g)].map(match => match[1]),
     ['storage', 'readLogStorage']);
   assert.match(section('readLogStorage'), /if \(!empty\(readLogStorageAccountName\)\)[\s\S]*name: readLogStorageAccountName[\s\S]*tags: ownership/);

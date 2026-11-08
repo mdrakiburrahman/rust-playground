@@ -134,7 +134,7 @@ resource aks 'Microsoft.ContainerService/managedClusters@2026-05-01' = {
     supportPlan: aksConfig.skuTier == 'Premium' ? 'AKSLongTermSupport' : 'KubernetesOfficial'
     kubernetesVersion: aksConfig.version
     dnsPrefix: '${clusterName}-dns'
-    agentPoolProfiles: [{
+    agentPoolProfiles: concat([{
       name: pool.name
       osDiskSizeGB: 100
       enableAutoScaling: true
@@ -153,7 +153,26 @@ resource aks 'Microsoft.ContainerService/managedClusters@2026-05-01' = {
       nodeLabels: { type: 'general' }
       upgradeSettings: { maxSurge: '33%' }
       securityProfile: { sshAccess: 'Disabled' }
-    }]
+    }], [for userPool in aksConfig.userPools: {
+      name: userPool.name
+      osDiskSizeGB: 100
+      enableAutoScaling: true
+      count: userPool.initialCount
+      minCount: userPool.minCount
+      maxCount: userPool.maxCount
+      maxPods: userPool.maxPods
+      vmSize: userPool.vmSize
+      osType: 'Linux'
+      mode: 'User'
+      vnetSubnetID: nodeSubnet.id
+      enableFIPS: true
+      osSKU: 'AzureLinux'
+      availabilityZones: userPool.availabilityZones
+      nodeTaints: []
+      nodeLabels: { type: 'benchmark' }
+      upgradeSettings: { maxSurge: '33%' }
+      securityProfile: { sshAccess: 'Disabled' }
+    }])
     aadProfile: { managed: true, enableAzureRBAC: true }
     oidcIssuerProfile: { enabled: true }
     securityProfile: { workloadIdentity: { enabled: true } }

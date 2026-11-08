@@ -12,10 +12,21 @@ test('loads the approved resource group, stamp and AKS baseline from YAML', () =
   assert.equal(config.location, 'eastus2');
   assert.equal(config.aks.version, '1.35.6');
   assert.equal(config.aks.systemPool.vmSize, 'Standard_D8s_v6');
+  assert.deepEqual(config.aks.userPools.map(pool => [pool.name, pool.initialCount, pool.minCount, pool.maxCount]),
+    [['benchd64', 0, 0, 1], ['benche64', 0, 0, 1]]);
   assert.equal(config.aks.network.dnsServiceIp, '10.242.0.10');
   assert.equal(config.storageReadLogDestination, 'storage');
   assert.equal(defaultStampConfig().storageReadLogDestination, 'log-analytics');
   assert.throws(() => parseStampConfig(example.replace('storageReadLogDestination: storage', 'storageReadLogDestination: metrics')), /invalid/);
+});
+
+test('validates zero-scaled benchmark user pools and rejects invalid pool configuration', () => {
+  const config = parseStampConfig(example);
+  assert.deepEqual(config.aks.userPools.map(pool => pool.vmSize), ['Standard_D64ds_v6', 'Standard_E64ds_v6']);
+  assert.equal(defaultStampConfig().aks.userPools[0]?.minCount, 0);
+  assert.throws(() => parseStampConfig(example.replace('initialCount: 0', 'initialCount: 2')), /counts must satisfy/);
+  assert.throws(() => parseStampConfig(example.replace('name: benche64', 'name: benchd64')), /names must be unique/);
+  assert.throws(() => parseStampConfig(example.replace('maxCount: 1', 'maxCount: 0')), /maxCount must be an integer/);
 });
 
 test('rejects invalid stamps, resource-group scope and network overlaps', () => {

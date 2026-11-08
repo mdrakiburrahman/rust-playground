@@ -644,16 +644,28 @@ export async function preflight(azure: Azure): Promise<void> {
   const versionFamily = aksConfig.version.split('.').slice(0, 2).join('.');
   if (!versions.values?.some((entry: any) => entry.version === versionFamily && Object.hasOwn(entry.patchVersions ?? {}, aksConfig.version)))
     throw new Failure('Configured AKS Kubernetes version is not available in the target region.');
-  const skuResults = await azure.cli('vm', 'list-skus', '--location', c.location, '--size', aksConfig.systemPool.vmSize,
-    '--all', '--subscription', c.subscription);
-  const sku = skuResults.find((entry: any) => entry.name === aksConfig.systemPool.vmSize);
-  if (!sku || sku.restrictions?.length) throw new Failure('Configured AKS system-pool VM SKU is unavailable or restricted in the target region.');
-  const vcpus = Number(sku.capabilities?.find((capability: any) => capability.name === 'vCPUs')?.value);
-  if (!Number.isSafeInteger(vcpus) || vcpus < 1) throw new Failure('Azure did not report the configured AKS VM vCPU count.');
+  const pools = [
+    { ...aksConfig.systemPool, label: 'system pool', quotaCount: aksConfig.systemPool.initialCount },
+    ...aksConfig.userPools.map(pool => ({ ...pool, label: 'user pool ' + pool.name, quotaCount: pool.maxCount })),
+  ];
+  const requiredByFamily = new Map<string, number>();
+  for (const pool of pools) {
+    const skuResults = await azure.cli('vm', 'list-skus', '--location', c.location, '--size', pool.vmSize,
+      '--all', '--subscription', c.subscription);
+    const sku = skuResults.find((entry: any) => entry.name === pool.vmSize);
+    if (!sku || sku.restrictions?.length)
+      throw new Failure('Configured AKS ' + pool.label + ' VM SKU is unavailable or restricted in the target region.');
+    const vcpus = Number(sku.capabilities?.find((capability: any) => capability.name === 'vCPUs')?.value);
+    if (!Number.isSafeInteger(vcpus) || vcpus < 1 || typeof sku.family !== 'string')
+      throw new Failure('Azure did not report the configured AKS ' + pool.label + ' VM family and vCPU count.');
+    requiredByFamily.set(sku.family, (requiredByFamily.get(sku.family) ?? 0) + vcpus * pool.quotaCount);
+  }
   const usages = await azure.cli('vm', 'list-usage', '--location', c.location, '--subscription', c.subscription);
-  const quota = usages.find((entry: any) => entry.name?.value === sku.family);
-  if (!quota || Number(quota.limit) - Number(quota.currentValue) < vcpus * aksConfig.systemPool.initialCount)
-    throw new Failure('Azure VM-family quota is insufficient for the configured initial AKS system-pool size.');
+  for (const [family, required] of requiredByFamily) {
+    const quota = usages.find((entry: any) => entry.name?.value === family);
+    if (!quota || Number(quota.limit) - Number(quota.currentValue) < required)
+      throw new Failure('Azure VM-family quota is insufficient for configured AKS pool maxima (' + family + ' requires ' + required + ' vCPUs).');
+  }
   const apiServerFeature = await azure.cli('feature', 'show', '--namespace', 'Microsoft.ContainerService',
     '--name', 'EnableAPIServerVnetIntegrationPreview', '--subscription', c.subscription);
   if (apiServerFeature.properties?.state !== 'Registered')

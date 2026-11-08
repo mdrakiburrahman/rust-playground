@@ -20,6 +20,7 @@ export interface StampConfig {
     namespace: string;
     serviceAccount: string;
     systemPool: { name: string; vmSize: string; initialCount: number; minCount: number; maxCount: number; maxPods: number; availabilityZones: string[] };
+    userPools: Array<{ name: string; vmSize: string; initialCount: number; minCount: number; maxCount: number; maxPods: number; availabilityZones: string[] }>;
     network: {
       vnetIpv4Cidr: string; vnetIpv6Cidr: string; nodeSubnetIpv4Cidr: string; nodeSubnetIpv6Cidr: string;
       apiServerSubnetIpv4Cidr: string; podIpv4Cidr: string; podIpv6Cidr: string;
@@ -36,6 +37,10 @@ const FIC_NAME = /^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$/;
 const DEFAULT_AKS: StampConfig['aks'] = {
   version: '1.35.6', skuTier: 'Free', namespace: 'arrow-collector', serviceAccount: 'arrow-collector',
   systemPool: { name: 'systempool', vmSize: 'Standard_D8s_v6', initialCount: 3, minCount: 3, maxCount: 6, maxPods: 250, availabilityZones: ['1', '2', '3'] },
+  userPools: [
+    { name: 'benchd64', vmSize: 'Standard_D64ds_v6', initialCount: 0, minCount: 0, maxCount: 1, maxPods: 30, availabilityZones: [] },
+    { name: 'benche64', vmSize: 'Standard_E64ds_v6', initialCount: 0, minCount: 0, maxCount: 1, maxPods: 30, availabilityZones: [] },
+  ],
   network: { vnetIpv4Cidr: '10.240.0.0/16', vnetIpv6Cidr: 'fd20:240::/48', nodeSubnetIpv4Cidr: '10.240.0.0/24',
     nodeSubnetIpv6Cidr: 'fd20:240:0:1::/64', apiServerSubnetIpv4Cidr: '10.240.1.0/28', podIpv4Cidr: '10.241.0.0/16',
     podIpv6Cidr: 'fd20:240:1::/64', serviceIpv4Cidr: '10.242.0.0/16', serviceIpv6Cidr: 'fd20:240:2::/108',
@@ -173,7 +178,7 @@ export function parseStampConfig(source: string): StampConfig {
   const storageReadLogDestination = text(raw.storageReadLogDestination ?? 'log-analytics', 'storageReadLogDestination',
     /^(log-analytics|storage)$/) as 'log-analytics' | 'storage';
   const aksRaw = object(raw.aks, 'aks');
-  keys(aksRaw, ['version', 'skuTier', 'namespace', 'serviceAccount', 'systemPool', 'network'], 'aks');
+  keys(aksRaw, ['version', 'skuTier', 'namespace', 'serviceAccount', 'systemPool', 'userPools', 'network'], 'aks');
   const version = text(aksRaw.version, 'aks.version', /^\d+\.\d+\.\d+$/);
   const skuTier = text(aksRaw.skuTier, 'aks.skuTier', /^(Free|Premium)$/) as 'Free' | 'Premium';
   const namespace = text(aksRaw.namespace, 'aks.namespace', NAME, 63);
@@ -192,6 +197,33 @@ export function parseStampConfig(source: string): StampConfig {
     throw new Failure('aks.systemPool.availabilityZones must not contain duplicates.');
   if (systemPool.minCount > systemPool.initialCount || systemPool.initialCount > systemPool.maxCount)
     throw new Failure('aks.systemPool counts must satisfy minCount <= initialCount <= maxCount.');
+  const userPoolsRaw = aksRaw.userPools ?? DEFAULT_AKS.userPools;
+  if (!Array.isArray(userPoolsRaw) || userPoolsRaw.length > 10) throw new Failure('aks.userPools must be a list of at most 10 pools.');
+  const userPools = userPoolsRaw.map((value, index) => {
+    const prefix = 'aks.userPools[' + index + ']';
+    const item = object(value, prefix);
+    keys(item, ['name', 'vmSize', 'initialCount', 'minCount', 'maxCount', 'maxPods', 'availabilityZones'], prefix);
+    const pool = {
+      name: text(item.name, prefix + '.name', /^[a-z][a-z0-9]{0,11}$/),
+      vmSize: text(item.vmSize, prefix + '.vmSize', /^Standard_[A-Za-z0-9_]+$/),
+      initialCount: integer(item.initialCount, prefix + '.initialCount', 0, 100),
+      minCount: integer(item.minCount, prefix + '.minCount', 0, 100),
+      maxCount: integer(item.maxCount, prefix + '.maxCount', 1, 100),
+      maxPods: integer(item.maxPods, prefix + '.maxPods', 30, 250),
+      availabilityZones: Array.isArray(item.availabilityZones) ? item.availabilityZones.map((zone, zoneIndex) =>
+        text(zone, prefix + '.availabilityZones[' + zoneIndex + ']', /^[1-9]$/)) : (() => {
+        throw new Failure(prefix + '.availabilityZones must be a list of supported zone numbers.');
+      })(),
+    };
+    if (new Set(pool.availabilityZones).size !== pool.availabilityZones.length)
+      throw new Failure(prefix + '.availabilityZones must not contain duplicates.');
+    if (pool.minCount > pool.initialCount || pool.initialCount > pool.maxCount)
+      throw new Failure(prefix + ' counts must satisfy minCount <= initialCount <= maxCount.');
+    return pool;
+  });
+  if (new Set(userPools.map(pool => pool.name)).size !== userPools.length ||
+      userPools.some(pool => pool.name === systemPool.name))
+    throw new Failure('AKS system and user pool names must be unique.');
   const networkRaw = object(aksRaw.network, 'aks.network');
   const networkKeys = ['vnetIpv4Cidr', 'vnetIpv6Cidr', 'nodeSubnetIpv4Cidr', 'nodeSubnetIpv6Cidr',
     'apiServerSubnetIpv4Cidr', 'podIpv4Cidr', 'podIpv6Cidr', 'serviceIpv4Cidr', 'serviceIpv6Cidr', 'dnsServiceIp'] as const;
@@ -251,7 +283,7 @@ export function parseStampConfig(source: string): StampConfig {
   if (new Set(publisherFederatedCredentials.map(fic => fic.name)).size !== publisherFederatedCredentials.length ||
       new Set(publisherFederatedCredentials.map(fic => `${fic.issuer}\0${fic.subject}`)).size !== publisherFederatedCredentials.length)
     throw new Failure('publisherFederatedCredentials must have unique names and issuer/subject pairs.');
-  return { subscription, stamp, resourceGroup, location, aks: { version, skuTier, namespace, serviceAccount, systemPool, network },
+  return { subscription, stamp, resourceGroup, location, aks: { version, skuTier, namespace, serviceAccount, systemPool, userPools, network },
     publisherFederatedCredentials, storageReadLogDestination };
 }
 

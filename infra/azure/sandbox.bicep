@@ -74,6 +74,13 @@ resource blobs 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01' = {
   parent: storage
   name: 'default'
   properties: {
+    // $web is anonymously readable at the static website endpoint even when blob public access is disabled.
+    // Only the sanitized benchmark summary is published there.
+    staticWebsite: {
+      enabled: true
+      indexDocument: 'index.html'
+      errorDocument404Path: '404.html'
+    }
     isVersioningEnabled: false
     deleteRetentionPolicy: {
       enabled: false
@@ -88,6 +95,11 @@ resource blobs 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01' = {
       enabled: false
     }
   }
+}
+
+resource website 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' existing = {
+  parent: blobs
+  name: '$web'
 }
 
 resource data 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
@@ -150,6 +162,17 @@ resource readExperiment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
 resource runtimeExperimentWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (azureMode == 'stamped') {
   name: guid(experiment.id, identity.id, 'runtime-blob-contributor')
   scope: experiment
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource runtimeWebsiteWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (azureMode == 'stamped') {
+  name: guid(website.id, identity.id, 'runtime-static-site-contributor')
+  scope: website
+  dependsOn: [blobs]
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
     principalId: identity.properties.principalId
