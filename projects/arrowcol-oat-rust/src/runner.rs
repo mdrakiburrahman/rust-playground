@@ -8,7 +8,7 @@ use chrono::DateTime;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload, path::Path as ObjectPath};
 use parquet::arrow::ArrowWriter;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -489,25 +489,83 @@ fn sum_metrics(pods: &HashMap<String, ResourceMetrics>) -> ResourceMetrics {
 }
 
 async fn top_metrics(config: &OatConfig, selector: &str) -> Result<HashMap<String, ResourceMetrics>> {
-    let output = kubectl(
+    let snapshot = kubectl(
         config,
         vec![
-            "top",
+            "get",
             "pods",
             "--namespace",
             &config.namespace,
             "--selector",
             selector,
-            "--no-headers",
+            "-o",
+            "json",
         ],
         None,
     )
     .await?;
-    let metrics = parse_top_metrics(&output)?;
-    if metrics.is_empty() {
-        bail!("kubectl top returned no pods for selector {selector:?}");
+    let expected = active_pod_names(&serde_json::from_str(&snapshot)?)?;
+    let wait = async {
+        loop {
+            let result = kubectl(
+                config,
+                vec![
+                    "top",
+                    "pods",
+                    "--namespace",
+                    &config.namespace,
+                    "--selector",
+                    selector,
+                    "--no-headers",
+                ],
+                None,
+            )
+            .await;
+            match result {
+                Ok(output) => {
+                    let metrics = parse_top_metrics(&output)?;
+                    if metrics_complete(&expected, &metrics) {
+                        return Ok(metrics);
+                    }
+                    tracing::warn!(selector, expected = ?expected, observed = ?metrics.keys(), "waiting for all current pod metrics");
+                }
+                Err(error) if error.to_string().contains("metrics not available yet") => {
+                    tracing::warn!(selector, %error, "waiting for metrics-server scrape after rollout");
+                }
+                Err(error) => return Err(error),
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(120), wait)
+        .await
+        .with_context(|| {
+            format!("timed out waiting for complete metrics for selector {selector:?}, pods {expected:?}")
+        })?
+}
+
+fn active_pod_names(snapshot: &Value) -> Result<HashSet<String>> {
+    let names = snapshot
+        .get("items")
+        .and_then(Value::as_array)
+        .context("pod snapshot has no items array")?
+        .iter()
+        .filter(|pod| pod.pointer("/metadata/deletionTimestamp").is_none_or(Value::is_null))
+        .map(|pod| {
+            pod.pointer("/metadata/name")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .context("pod snapshot has an unnamed pod")
+        })
+        .collect::<Result<HashSet<_>>>()?;
+    if names.is_empty() {
+        bail!("pod snapshot contains no active pods to measure");
     }
-    Ok(metrics)
+    Ok(names)
+}
+
+fn metrics_complete(expected: &HashSet<String>, metrics: &HashMap<String, ResourceMetrics>) -> bool {
+    metrics.len() == expected.len() && expected.iter().all(|name| metrics.contains_key(name))
 }
 
 fn parse_top_metrics(output: &str) -> Result<HashMap<String, ResourceMetrics>> {
@@ -516,6 +574,9 @@ fn parse_top_metrics(output: &str) -> Result<HashMap<String, ResourceMetrics>> {
         let columns = line.split_whitespace().collect::<Vec<_>>();
         if columns.len() < 3 {
             bail!("unexpected kubectl top output row: {line}");
+        }
+        if columns[1] == "<unknown>" || columns[2] == "<unknown>" {
+            continue;
         }
         metrics.insert(
             columns[0].to_owned(),
@@ -559,7 +620,11 @@ async fn kubectl(config: &OatConfig, args: Vec<&str>, stdin: Option<Vec<u8>>) ->
     if let Some(context) = &config.kubectl_context {
         command.args(["--context", context]);
     }
-    command.args(&args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    command
+        .args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
     if stdin.is_some() {
         command.stdin(Stdio::piped());
     }
@@ -695,6 +760,34 @@ mod tests {
         let total = sum_metrics(&pods);
         assert_eq!(total.cpu_millicores, 300.0);
         assert_eq!(total.memory_bytes, 5 * 1024 * 1024);
+        Ok(())
+    }
+
+    #[test]
+    fn metrics_require_every_current_pod_and_reject_stale_or_unknown_samples() -> Result<()> {
+        let expected = active_pod_names(&json!({"items": [
+            {"metadata": {"name": "arrowcol-a"}},
+            {"metadata": {"name": "arrowcol-b"}},
+            {"metadata": {"name": "arrowcol-old", "deletionTimestamp": "2026-11-08T00:00:00Z"}}
+        ]}))?;
+        assert_eq!(expected.len(), 2);
+        assert!(!metrics_complete(
+            &expected,
+            &parse_top_metrics("arrowcol-a 100m 2Mi\n")?
+        ));
+        assert!(!metrics_complete(
+            &expected,
+            &parse_top_metrics("arrowcol-a 100m 2Mi\narrowcol-b <unknown> <unknown>\n")?
+        ));
+        assert!(!metrics_complete(
+            &expected,
+            &parse_top_metrics("arrowcol-a 100m 2Mi\narrowcol-old 100m 2Mi\n")?
+        ));
+        assert!(metrics_complete(
+            &expected,
+            &parse_top_metrics("arrowcol-a 100m 2Mi\narrowcol-b 200m 3Mi\n")?
+        ));
+        assert!(active_pod_names(&json!({"items": []})).is_err());
         Ok(())
     }
 

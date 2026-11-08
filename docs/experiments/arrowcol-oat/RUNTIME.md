@@ -14,6 +14,12 @@ DFE explicitly enables generated ingestion partitions with
 table properties remain authoritative; without this writer mode a logical
 ingress batch lacks the physical `__arrowcol_ingestion` partition value.
 
+Runtime pods disable Kubernetes service-link variables: the generated
+`ARROWCOL_SQL_PORT=tcp://...` would otherwise override the numeric SQL setting.
+The pinned SQL executable requires `NET_BIND_SERVICE` in its capability set;
+only that container receives it, while remaining non-root with privilege
+escalation disabled. Other containers continue to drop all capabilities.
+
 ## Prerequisites and authorization
 
 Complete the selected stamp's **supported provision/bootstrap**, including Delta
@@ -200,12 +206,25 @@ Kusto observer defaults to local mode and rejects the HTTPS endpoint. Its
 `AZURE_FEDERATED_TOKEN_FILE`. Use the existing `arrow-collector` ServiceAccount's
 private assertion file prepared by the operator, with audience
 `api://AzureADTokenExchange`; keep it mode 0600 and refresh before expiry.
-Do not replace the operator's Azure CLI login used by kubelogin:
+Do not replace the operator's Azure CLI login used by kubelogin. First isolate
+the **selected dedicated Canada stamp kubeconfig** from publisher environment
+variables. Otherwise kubelogin combines its explicit subscription with the
+publisher's `AZURE_TENANT_ID`, which Azure CLI rejects. The
+`--disable-environment-override` flag must appear in the stored exec arguments;
+`convert-kubeconfig` may leave an already-converted entry unchanged.
 
 ```bash
+export KUBECONFIG="$PWD/target/arrowcol-oat/stamp-89152/kubeconfig"
+SUBSCRIPTION="$(node -p 'JSON.parse(require("fs").readFileSync("out/arrowcol-oat/runtime.json","utf8")).subscriptionId')"
+KUBE_USER="$(kubectl config view --minify -o jsonpath='{.users[0].name}')"
+kubectl config set-credentials "$KUBE_USER" \
+  --exec-command=kubelogin --exec-api-version=client.authentication.k8s.io/v1beta1 \
+  --exec-arg=get-token --exec-arg=--login --exec-arg=azurecli \
+  --exec-arg=--server-id --exec-arg=6dae42f8-4368-4678-94ff-3960e28e3630 \
+  --exec-arg=--subscription --exec-arg="$SUBSCRIPTION" \
+  --exec-arg=--disable-environment-override
 export ARROWCOL_MODE=azure
 export AZURE_CLIENT_ID="$(node -p 'JSON.parse(require("fs").readFileSync("out/arrowcol-oat/runtime.json","utf8")).workloadIdentityClientId')"
-SUBSCRIPTION="$(node -p 'JSON.parse(require("fs").readFileSync("out/arrowcol-oat/runtime.json","utf8")).subscriptionId')"
 export AZURE_TENANT_ID="$(az account show --subscription "$SUBSCRIPTION" --query tenantId -o tsv)"
 export AZURE_FEDERATED_TOKEN_FILE=/absolute/path/to/operator-prepared-private-assertion
 cargo run --locked --package arrowcol-oat-rust
@@ -215,7 +234,9 @@ In another terminal submit with
 `npx --no-install tsx projects/arrowcol-oat/launch.ts <private-oat-config.json>`.
 The server captures/restores each unique Deployment once, applies replicas/core
 args together, waits for rollout and stale 30-second leases, and counts each pod
-once. Pod UID and advertised pod IP come from the downward API.
+once. Metrics-server can lag a new rollout: sampling waits up to 120 seconds
+for every current pod, rejects stale/partial samples, and fails rather than
+substituting zero metrics. Pod UID and advertised pod IP come from the downward API.
 
 Each selected table receives independent HMAC-signed connections. The router's
 `distinct_table_owners` setting gives separate active tables separate collectors;
