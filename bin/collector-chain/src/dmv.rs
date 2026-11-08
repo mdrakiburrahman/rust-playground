@@ -180,7 +180,6 @@ async fn put(
             PutResultMetadata::BestEffortAdmission { .. } | PutResultMetadata::DurableAdmission { .. } => {
                 admitted = true;
             }
-            _ => bail!("collector reported an unexpected put result"),
         }
     }
     if !admitted {
