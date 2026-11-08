@@ -28,6 +28,18 @@ const API_VERSION: &str = "2023-11-03";
 const LEASE_SECONDS: &str = "15";
 const META_PREFIX: &str = "x-ms-meta-";
 
+fn sandbox_ownership(subscription: &str, stamp: Option<&str>) -> Result<String> {
+    normalized_subscription(subscription)?;
+    let raw = stamp.unwrap_or("1");
+    let value = raw
+        .parse::<u64>()
+        .context("AZURE_STAMP must be a positive integer no greater than 999999 (Kusto cluster name limit)")?;
+    if !raw.bytes().all(|byte| byte.is_ascii_digit()) || !(1..=999_999).contains(&value) {
+        bail!("AZURE_STAMP must be a positive integer no greater than 999999 (Kusto cluster name limit)");
+    }
+    Ok(format!("stamp-{value}"))
+}
+
 /// Lease-serialized metadata transactions on the checkpoint control container.
 pub(crate) struct AzureControlContainer {
     credentials: AzureCredentialProvider,
@@ -69,19 +81,18 @@ fn valid_metadata(metadata: &BTreeMap<String, String>) -> std::result::Result<()
 }
 
 fn sandbox_identity(subscription: &str, group: Option<&str>) -> Result<String> {
-    let group = group.unwrap_or("rust-playground");
-    let valid_group = group == "rust-playground"
-        || group.strip_prefix("rust-playground-").is_some_and(|suffix| {
-            suffix.split('-').all(|segment| {
-                !segment.is_empty()
-                    && segment
-                        .bytes()
-                        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-            })
-        });
-    if !valid_group || group.len() > 90 {
-        bail!("Azure resource group must be rust-playground or a lowercase rust-playground- sandbox name");
+    if group != Some("rust-playground-schema-evo") {
+        bail!("Schema-evolution mode requires the exact approved isolated resource group");
     }
+    let subscription = normalized_subscription(subscription)?;
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(format!("{subscription}:rust-playground-schema-evo"))
+    );
+    Ok(digest[..12].to_owned())
+}
+
+fn normalized_subscription(subscription: &str) -> Result<String> {
     let subscription = if subscription
         .get(..9)
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("urn:uuid:"))
@@ -96,12 +107,52 @@ fn sandbox_identity(subscription: &str, group: Option<&str>) -> Result<String> {
     if raw.len() != 32 || !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!("Azure sandbox ownership requires a subscription UUID");
     }
-    let subscription = uuid::Uuid::parse_str(&raw)
+    Ok(uuid::Uuid::parse_str(&raw)
         .context("Azure sandbox ownership requires a subscription UUID")?
         .hyphenated()
-        .to_string();
-    let digest = format!("{:x}", Sha256::digest(format!("{subscription}:{group}")));
-    Ok(digest[..12].to_owned())
+        .to_string())
+}
+
+fn configured_ownership(
+    subscription: &str,
+    account: &str,
+    mode: Option<&str>,
+    group: Option<&str>,
+    stamp: Option<&str>,
+) -> Result<String> {
+    let sandbox = match mode.unwrap_or("stamped") {
+        "stamped" => {
+            if group.is_some_and(|value| value != "arrow-collector-rg") {
+                bail!("Stamped Azure ownership requires arrow-collector-rg");
+            }
+            let sandbox = sandbox_ownership(subscription, stamp)?;
+            let number = sandbox.strip_prefix("stamp-").context("Invalid stamped identity")?;
+            if account != format!("arrowcollector{number}") {
+                bail!("Azure account does not match the stamped ownership identity");
+            }
+            sandbox
+        }
+        "schema-evolution" => {
+            if stamp.is_some() {
+                bail!("Schema-evolution mode rejects AZURE_STAMP");
+            }
+            let sandbox = sandbox_identity(subscription, group)?;
+            if account != format!("arrowcol{sandbox}") {
+                bail!("Azure account does not match the isolated ownership identity");
+            }
+            sandbox
+        }
+        _ => bail!("Azure mode must be stamped or schema-evolution"),
+    };
+    Ok(sandbox)
+}
+
+fn optional_env(key: &str) -> Result<Option<String>> {
+    match std::env::var(key) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("{key} must be valid UTF-8")),
+    }
 }
 
 impl AzureControlContainer {
@@ -118,12 +169,32 @@ impl AzureControlContainer {
         }
         let subscription =
             std::env::var("AZURE_SUBSCRIPTION_ID").context("Azure sandbox ownership configuration missing")?;
-        let group = match std::env::var("AZURE_RESOURCE_GROUP") {
-            Ok(value) => Some(value),
-            Err(std::env::VarError::NotPresent) => None,
-            Err(error) => return Err(error).context("Invalid Azure resource group configuration"),
-        };
-        let sandbox_id = sandbox_identity(&subscription, group.as_deref())?;
+        let mode = optional_env("ARROWCOL_AZURE_MODE")?;
+        let group = optional_env("AZURE_RESOURCE_GROUP")?;
+        let stamp = optional_env("AZURE_STAMP")?;
+        if mode.as_deref() == Some("schema-evolution")
+            && std::env::vars_os().any(|(key, _)| {
+                let key = key.to_string_lossy();
+                [
+                    "AZURE_AKS_",
+                    "AZURE_KUBERNETES_",
+                    "AZURE_CONTAINER_REGISTRY_",
+                    "AZURE_UAMI_",
+                ]
+                .iter()
+                .any(|prefix| key.starts_with(prefix))
+                    || key == "AZURE_FEDERATED_TOKEN_FILE"
+            })
+        {
+            bail!("Schema-evolution mode rejects AKS, ACR and workload identity configuration");
+        }
+        let sandbox_id = configured_ownership(
+            &subscription,
+            account,
+            mode.as_deref(),
+            group.as_deref(),
+            stamp.as_deref(),
+        )?;
         Self::with_endpoint(
             format!("https://{account}.blob.core.windows.net/{container}"),
             sandbox_id,
@@ -346,10 +417,8 @@ mod tests {
     const GENERATION: &str = "00000000-0000-4000-8000-000000000001";
 
     #[test]
-    fn sandbox_identity_matches_typescript_and_preserves_default() -> Result<()> {
+    fn explicit_isolated_identity_matches_typescript() -> Result<()> {
         let subscription = "00000000-0000-0000-0000-000000000001";
-        assert_eq!(sandbox_identity(subscription, None)?, "07657369824b");
-        assert_eq!(sandbox_identity(subscription, Some("rust-playground"))?, "07657369824b");
         assert_eq!(
             sandbox_identity(subscription, Some("rust-playground-schema-evo"))?,
             "582e3df61d82"
@@ -363,6 +432,31 @@ mod tests {
                 sandbox_identity(normalized, Some("rust-playground-schema-evo"))?,
                 "582e3df61d82"
             );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn stamped_ownership_matches_bootstrap_without_ambient_fallback() -> Result<()> {
+        let subscription = "00000000-0000-0000-0000-000000000001";
+        assert_eq!(sandbox_ownership(subscription, Some("1"))?, "stamp-1");
+        assert_eq!(sandbox_ownership(subscription, Some("01"))?, "stamp-1");
+        assert_eq!(sandbox_ownership(subscription, Some("999999"))?, "stamp-999999");
+        assert_eq!(sandbox_ownership(subscription, None)?, "stamp-1");
+        for invalid in [
+            "",
+            "0",
+            "-1",
+            "+1",
+            "1.5",
+            " 1",
+            "1 ",
+            "1000000",
+            "99999999999",
+            "100000000000",
+            "18446744073709551616",
+        ] {
+            assert!(sandbox_ownership(subscription, Some(invalid)).is_err(), "{invalid}");
         }
         Ok(())
     }
@@ -399,7 +493,7 @@ mod tests {
         let mut metadata = authority("ready-v1");
         metadata.insert("sandboxid".into(), expected.clone());
         assert!(Registry::parse(&metadata, &expected).is_ok());
-        assert!(Registry::parse(&metadata, &sandbox_identity(subscription, None)?).is_err());
+        assert!(Registry::parse(&metadata, &sandbox_ownership(subscription, None)?).is_err());
         assert!(
             Registry::parse(
                 &metadata,
@@ -409,6 +503,27 @@ mod tests {
                 )?
             )
             .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn configured_domain_rejects_ambiguous_and_wrong_account() -> Result<()> {
+        let subscription = GENERATION;
+        let group = Some("rust-playground-schema-evo");
+        let account = format!("arrowcol{}", sandbox_identity(subscription, group)?);
+        assert!(configured_ownership(subscription, &account, None, group, None).is_err());
+        assert!(configured_ownership(subscription, &account, Some("schema-evolution"), group, Some("1")).is_err());
+        assert!(configured_ownership(subscription, "arrowcollector1", Some("schema-evolution"), group, None).is_err());
+        assert!(configured_ownership(subscription, &account, Some("schema-evolution"), None, None).is_err());
+        assert!(configured_ownership(subscription, &account, Some("unknown"), group, None).is_err());
+        assert_eq!(
+            configured_ownership(subscription, "arrowcollector1", None, None, None)?,
+            "stamp-1"
+        );
+        assert_eq!(
+            configured_ownership(subscription, &account, Some("schema-evolution"), group, None)?,
+            sandbox_identity(subscription, group)?
         );
         Ok(())
     }

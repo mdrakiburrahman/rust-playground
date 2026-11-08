@@ -1191,6 +1191,7 @@ impl PublisherSession {
             Arc::new(
                 object_store::azure::MicrosoftAzureBuilder::from_env()
                     .with_url(url.as_str())
+                    .with_http_connector(crate::qap_http::azure_http_connector()?)
                     .with_credentials(credentials)
                     .with_retry(object_store::RetryConfig {
                         max_retries: 0,

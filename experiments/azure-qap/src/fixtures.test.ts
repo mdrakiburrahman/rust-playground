@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { HttpFailure } from '../../../infra/azure/bootstrap.ts';
 import type { ProcessOptions, ProcessResult } from '../../../tools/libs/experiment-kit/src/experiment.js';
 import { anchorMinute, checkMutation, childEnvironment, deletePrefix, Fixtures, maintenanceArgs, maintenanceReport,
@@ -41,6 +44,23 @@ function fakeRunner(results: ProcessResult[]) {
 
 const fixtures = (run: ReturnType<typeof fakeRunner>['run']) =>
   new Fixtures({ repo: '/repo', root: ROOT, env: {}, redact: text => text.replaceAll('secret', '[private]'), run });
+
+test('every fixture invocation receives its own complete HTTP marker and trace configuration', async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'qap-fixture-trace-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const runner = fakeRunner([processResult(wire('seed-scale', 'reload', 0, BEFORE, { publisherClosed: true, totalBytes: 600 })),
+    processResult(wire('inspect-scale', 'reload', 0, BEFORE))]);
+  const fixture = new Fixtures({ repo: '/repo', root: ROOT, env: {}, redact: text => text, run: runner.run,
+    httpTraceDirectory: directory, httpMarker: 'arrowcol-qap/run_1' });
+  await fixture.seed('reload', 1000, 1, 2, false, new AbortController().signal);
+  await fixture.inspect('reload', new AbortController().signal);
+  for (const call of runner.calls) {
+    assert.equal(call.options.env?.ARROWCOL_QAP_CLIENT_MARKER, 'arrowcol-qap/run_1/reload');
+    assert.equal(call.options.env?.ARROWCOL_QAP_HTTP_TRACE, path.join(directory, 'reload.jsonl'));
+  }
+  assert.throws(() => new Fixtures({ repo: '/repo', root: ROOT, env: {}, redact: text => text,
+    httpMarker: 'arrowcol-qap/run_1' }), /requires both/);
+});
 
 test('trial names and anchors', () => {
   assert.equal(trialName('optimize', 1), 'optimize');

@@ -3,6 +3,15 @@
 This is original, public infrastructure code. Private reference implementations
 were used only to understand operational requirements, not copied.
 
+## Scope of this guide
+
+The existing loadtest sandbox described below is separate from the new AKS QAP
+stamp. Replacement AKS, ADX, storage, registry and logging resources are scoped
+to `arrow-collector-rg`; the separate `rust-playground` resource group is not a
+deployment or cleanup target. Follow [AKS QAP operations](AKS_QAP.md) for its
+stamp, shared identity, preflight gate and Kubernetes runtime. Do not use this
+legacy sandbox guide to delete or reset the AKS stamp.
+
 Local disk and local Kusto remain the loadtest default. `--mode azure` (or
 `ARROWCOL_MODE=azure`) switches storage and Kusto together. Azure writers and the
 bootstrap use the existing signed-in Azure CLI identity; Kusto reads Delta using
@@ -125,6 +134,13 @@ deploys its own storage account or workspace per run. Reset empties the
 `experimentqap` container and drops every object in the `experimentqap`
 database, but keeps that database and its managed identity policy; logs already
 in the workspace stay until its retention expires.
+
+With `storageReadLogDestination: storage` in the stamp YAML, deployment also
+creates separate `arrowreadlogs<stamp>` storage with read-only operator/shared
+identity roles for Azure Monitor diagnostic export. Reports name the selected
+evidence source and preserve raw events plus owned HTTP receipts; see
+[AKS QAP evidence](AKS_QAP.md). Reset leaves those logs intact; RG deletion
+removes them. Storage charges continue until deletion.
 
 ## Cloud occupancy and reset
 

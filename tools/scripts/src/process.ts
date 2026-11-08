@@ -1,4 +1,64 @@
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+
+export async function runStreamingTree(program: string, args: string[], options: {
+  timeoutMs: number;
+  capture: boolean;
+  onLine?: (line: string) => void;
+  onInterrupt?: () => void;
+}): Promise<string> {
+  if (process.platform === 'win32') throw new Error('Process-tree execution requires a Linux environment.');
+  return new Promise((resolve, reject) => {
+    const child = spawn(program, args, { stdio: ['ignore', 'pipe', 'pipe'], shell: false, detached: true });
+    let output = '';
+    let pending = '';
+    let failure: string | undefined;
+    let killTimer: NodeJS.Timeout | undefined;
+    const signalChild = (signal: NodeJS.Signals) => {
+      try {
+        if (child.pid) process.kill(-child.pid, signal);
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== 'ESRCH') failure = `process-group signal failed: ${code ?? 'unknown'}`;
+      }
+    };
+    const terminate = () => {
+      signalChild('SIGTERM');
+      killTimer ??= setTimeout(() => signalChild('SIGKILL'), 360_000);
+    };
+    const timer = setTimeout(() => { failure = 'timeout'; terminate(); }, options.timeoutMs);
+    const onSignal = () => {
+      failure = 'interrupted';
+      options.onInterrupt?.();
+      terminate();
+    };
+    process.on('SIGINT', onSignal);
+    process.on('SIGTERM', onSignal);
+    child.stdout.on('data', (chunk: Buffer) => {
+      if (options.onLine) {
+        pending += chunk.toString('utf8');
+        const lines = pending.split('\n');
+        pending = lines.pop()!.slice(-4096);
+        for (const line of lines) {
+          try { options.onLine(line); }
+          catch { failure = 'receipt write failed'; terminate(); }
+        }
+      }
+      if (!options.capture) return;
+      output += chunk.toString('utf8');
+      if (output.length > 16 * 1024 * 1024) { failure = 'output limit'; terminate(); }
+    });
+    child.stderr.resume();
+    child.on('error', error => { failure = `unable to start: ${(error as NodeJS.ErrnoException).code ?? 'unknown'}`; });
+    child.on('close', (code, signal) => {
+      clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
+      process.off('SIGINT', onSignal);
+      process.off('SIGTERM', onSignal);
+      if (failure || code !== 0) reject(new Error(`${program} failed (${failure ?? signal ?? code ?? 'spawn error'}).`));
+      else resolve(output);
+    });
+  });
+}
 
 export type CommandOutput = 'capture' | 'ignore' | 'inherit';
 

@@ -23,11 +23,17 @@
 | `npx nx run schema-evolution-experiment:build-fixtures` | Separately built old/new Rust clients from real generated immutable SDKs. No network writes. |
 | `npx nx run schema-evolution-experiment:probe-kustainer` | Records Kustainer command capability and string null semantics; does not claim E2E delivery. |
 | `npx nx run schema-evolution-experiment:run -- --target local` | Actual Rust catalog/DFE, real generated historical SDKs, physical Delta null inspection, pinned Kustainer native refresh. |
-| `npx --no-install tsx experiments/schema-evolution/src/private-nx.ts run --env-file .env.schema-evo.private --ready-env .env.azure.schema-evo` | Public Nx scenario with sanitized isolated private environment; genuine exported ready generation and bounded native refresh. |
-| `AZURE_RESOURCE_GROUP=rust-playground-schema-evo npx --no-install tsx infra/azure/bootstrap.ts provision --infra-only --output .env.azure.schema-evo` | Creates only the selected stamp; private generated configuration preserves its RG. Real Azure charges apply. |
-| `npx --no-install tsx experiments/schema-evolution/src/private-nx.ts provision --env-file .env.schema-evo.private --tables .env.azure.schema-evo.tables.json --output .env.azure.schema-evo` | Public Nx full initialization, KQL reconciliation and bootstrap completion with sanitized private input. No generation or fencing bypass. Real Azure charges apply. |
+| `npx --no-install tsx experiments/schema-evolution/src/private-nx.ts run --mode schema-evolution --env-file .env.schema-evo.private --ready-env .env.azure.schema-evo` | Public Nx scenario with sanitized isolated private environment; genuine exported ready generation and bounded native refresh. |
+| `npx --no-install tsx infra/azure/bootstrap.ts config --mode schema-evolution --env-file .env.schema-evo.private --output .env.schema-evo.config` | Read-only configuration projection; selects only the exact approved isolated group, never an ambient group/stamp or AKS YAML. |
+| `npx --no-install tsx experiments/schema-evolution/src/private-nx.ts provision --mode schema-evolution --env-file .env.schema-evo.private --tables .env.azure.schema-evo.tables.json --output .env.azure.schema-evo` | Public Nx full initialization, KQL reconciliation and bootstrap completion with sanitized private input. No generation or fencing bypass. Real Azure charges apply. |
 
-Keep resource-name overrides blank when creating the separate stamp. Never
+Use explicit `--mode schema-evolution` for every isolated bootstrap operation,
+including status/reset/recovery/occupancy. Default stamped Config/CLI and AKS
+safeguards are unchanged; isolated mode rejects stamp/AKS/ACR inputs, preserves
+the original normalized subscription:RG hash and never converts authority.
+Generated mode is passed explicitly to the initializer/Rust fence. See the
+[experiment runbook](../../../experiments/schema-evolution/README.md) for the
+supported private-input projection. Keep resource-name overrides absent. Never
 reuse the shared sandbox's table/checkpoint roots. **Stop/reset operate on the
 selected resource group; inspect that selection before execution.**
 See [Azure sandbox safety](../../operations/AZURE_SANDBOX.md).

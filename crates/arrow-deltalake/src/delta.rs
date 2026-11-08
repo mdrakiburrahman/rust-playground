@@ -119,6 +119,7 @@ pub(crate) fn configured_publication_layout(schema: &SchemaRef) -> Result<Option
 fn azure_store(url: &Url) -> Result<object_store::azure::MicrosoftAzure> {
     Ok(object_store::azure::MicrosoftAzureBuilder::from_env()
         .with_url(url.as_str())
+        .with_http_connector(crate::qap_http::azure_http_connector()?)
         .with_credentials(Arc::new(crate::azure_cli::BoundedAzureCli::default()))
         .with_retry(object_store::RetryConfig {
             max_retries: 0,
