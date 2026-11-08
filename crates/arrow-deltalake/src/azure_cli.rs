@@ -41,6 +41,7 @@ pub(crate) struct BoundedAzureCli {
     /// Arguments placed before the fixed CLI arguments; empty in production.
     leading_args: Vec<OsString>,
     scope: String,
+    subscription: Option<OsString>,
     deadline: Duration,
     cache: Mutex<Option<Cached>>,
 }
@@ -66,6 +67,7 @@ impl Default for BoundedAzureCli {
             program: OsString::from("az"),
             leading_args: Vec::new(),
             scope: STORAGE_SCOPE.to_owned(),
+            subscription: std::env::var_os("AZURE_SUBSCRIPTION_ID"),
             deadline: Duration::from_secs(5),
             cache: Mutex::new(None),
         }
@@ -174,7 +176,16 @@ impl BoundedAzureCli {
         command
             .args(&self.leading_args)
             .args(["account", "get-access-token", "--output", "json", "--scope"])
-            .arg(&self.scope)
+            .arg(&self.scope);
+        if let Some(subscription) = &self.subscription {
+            if subscription.is_empty() {
+                return Err(failure("Azure CLI subscription is empty"));
+            }
+            command.arg("--subscription").arg(subscription);
+        } else if std::env::var_os("ARROWCOL_AZURE_MODE").is_some_and(|mode| mode == "schema-evolution") {
+            return Err(failure("schema-evolution requires an Azure subscription"));
+        }
+        command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -450,6 +461,23 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn cli_token_uses_selected_subscription_and_fails_if_unavailable() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let script = root.path().join("fake-az");
+        std::fs::write(
+            &script,
+            "[ \"$7\" = --subscription ] && [ \"$8\" = approved ] || exit 3\nprintf '{\"tokenType\":\"Bearer\",\"accessToken\":\"selected-token\",\"expires_on\":4102444800}'\n",
+        )?;
+        let mut provider = script_provider(&script, Duration::from_secs(5));
+        provider.subscription = Some(OsString::from("approved"));
+        assert!(provider.get_credential().await.is_ok());
+        let mut unavailable = script_provider(&script, Duration::from_secs(5));
+        unavailable.subscription = Some(OsString::from("unavailable"));
+        assert!(unavailable.get_credential().await.is_err());
+        Ok(())
+    }
+
     /// Fixtures are interpreted by `/bin/sh` rather than exec'd: a concurrently
     /// forking test can briefly inherit the fixture's write descriptor, making
     /// `execve` of a freshly written script fail with ETXTBSY.
@@ -458,6 +486,7 @@ mod tests {
             program: OsString::from("/bin/sh"),
             leading_args: vec![script.as_os_str().to_owned()],
             deadline,
+            subscription: None,
             ..BoundedAzureCli::default()
         }
     }

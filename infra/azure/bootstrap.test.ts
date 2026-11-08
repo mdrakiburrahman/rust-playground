@@ -732,6 +732,7 @@ test('stop hold excludes tests and publishers until confirmed stop releases it',
   const original = azure.cli.bind(azure);
   azure.cli = async (...args) => {
     assert.equal(azure.metadata.occupancy, 'stopping');
+    assert.equal(args[args.indexOf('--subscription') + 1], azure.c.subscription);
     await failure(() => b.occupancy(azure, 'occupy', b.uuid()));
     await failure(() => new PublisherControl(azure).admit(b.uuid(), generation));
     return original(...args);
