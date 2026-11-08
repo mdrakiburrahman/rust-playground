@@ -1116,30 +1116,30 @@ test('Bicep separates Kusto client application identity from storage object prin
 });
 test('Bicep adds experiment container, database, workspace and StorageRead diagnostics with least-privilege RBAC', () => {
   const source = fs.readFileSync(path.join(b.ROOT, 'infra/azure/sandbox.bicep'), 'utf8');
+  const readLogSource = fs.readFileSync(path.join(b.ROOT, 'infra/azure/read-log-storage.bicep'), 'utf8');
   const main = fs.readFileSync(path.join(b.ROOT, 'infra/azure/main.bicep'), 'utf8');
   const section = (name: string) => source.split(`resource ${name} `)[1].split('\nresource ')[0].split('\noutput ')[0];
+  const logSection = (name: string) => readLogSource.split(`resource ${name} `)[1].split('\nresource ')[0].split('\noutput ')[0];
   assert.match(section('experiment'), /parent: blobs[\s\S]*name: experimentContainer[\s\S]*sandboxid: ownership\.sandboxId/);
   assert.deepEqual([...source.matchAll(/resource (\w+) 'Microsoft\.Storage\/storageAccounts@/g)].map(match => match[1]),
-    ['storage', 'readLogStorage']);
-  assert.match(section('readLogStorage'), /if \(!empty\(readLogStorageAccountName\)\)[\s\S]*name: readLogStorageAccountName[\s\S]*tags: ownership/);
-  assert.match(section('readLogStorage'), /allowSharedKeyAccess: false/);
+    ['storage']);
+  assert.match(source, /module readLogStorage '\.\/read-log-storage\.bicep' = if \(!empty\(readLogStorageAccountName\)\)/);
+  assert.match(logSection('readLogStorage'), /name: readLogStorageAccountName[\s\S]*tags: ownership[\s\S]*allowSharedKeyAccess: false/);
   const sinkRoles = [
     ['operatorReadExport', 'operatorObjectId', 'read-log-reader', '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'],
-    ['runtimeReadExport', 'identity.id', 'runtime-read-log-reader', '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'],
-    ['runtimeReadExportReader', 'identity.id', 'runtime-read-log-arm-reader', 'acdd72a7-3385-48ef-bd42-f606fba81ae7'],
+    ['runtimeReadExport', 'runtimeIdentityId', 'runtime-read-log-reader', '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'],
+    ['runtimeReadExportReader', 'runtimeIdentityId', 'runtime-read-log-arm-reader', 'acdd72a7-3385-48ef-bd42-f606fba81ae7'],
   ];
-  assert.deepEqual([...source.matchAll(/resource (\w+) 'Microsoft\.Authorization\/roleAssignments@/g)]
-    .map(match => match[1]).filter(name => /scope: readLogStorage(?:!|\n)/.test(section(name))),
-  sinkRoles.map(([name]) => name));
+  assert.deepEqual([...readLogSource.matchAll(/resource (\w+) 'Microsoft\.Authorization\/roleAssignments@/g)]
+    .map(match => match[1]), sinkRoles.map(([name]) => name));
   for (const [name, principal, seed, role] of sinkRoles) {
-    const assignment = section(name);
-    assert.match(assignment, /if \(!empty\(readLogStorageAccountName\)\)/);
-    assert.ok(assignment.includes(`name: guid(readLogStorage!.id, ${principal}, '${seed}')`));
+    const assignment = logSection(name);
+    assert.ok(assignment.includes(`name: guid(readLogStorage.id, ${principal}, '${seed}')`));
     assert.match(assignment, /scope: readLogStorage\n/);
     assert.deepEqual([...assignment.matchAll(/roleDefinitionId: subscriptionResourceId\('Microsoft.Authorization\/roleDefinitions', '([^']+)'\)/g)]
       .map(match => match[1]), [role]);
-    assert.ok(assignment.includes(`principalId: ${principal === 'identity.id' ? 'identity.properties.principalId' : principal}\n`));
-    if (principal === 'identity.id') assert.match(assignment, /principalType: 'ServicePrincipal'/);
+    assert.ok(assignment.includes(`principalId: ${principal === 'runtimeIdentityId' ? 'runtimePrincipalId' : principal}\n`));
+    if (principal === 'runtimeIdentityId') assert.match(assignment, /principalType: 'ServicePrincipal'/);
   }
   assert.match(section('readExperiment'), /scope: experiment\n/);
   assert.match(section('readExperiment'), /2a2b9908-6ea1-4ae2-8e65-a410df84e7d1[\s\S]*principalId: identity\.properties\.principalId/);
@@ -1149,7 +1149,8 @@ test('Bicep adds experiment container, database, workspace and StorageRead diagn
   const reads = section('storageReads');
   assert.match(reads, /name: 'arrowcol-storage-reads'[\s\S]*scope: blobs[\s\S]*workspaceId: workspace\.id/);
   assert.match(reads, /logAnalyticsDestinationType: 'Dedicated'/); assert.match(reads, /category: 'StorageRead'/);
-  assert.match(reads, /storageAccountId: empty\(readLogStorageAccountName\) \? null : readLogStorage!\.id/);
+  assert.doesNotMatch(reads, /dependsOn:/);
+  assert.match(reads, /storageAccountId: empty\(readLogStorageAccountName\) \? null : readLogStorage!\.outputs\.storageAccountId/);
   assert.doesNotMatch(reads, /StorageWrite|StorageDelete|metrics/);
   assert.match(section('readLogs'), /scope: workspace[\s\S]*73c42c96-874c-492b-b04d-ab87d138a893[\s\S]*principalId: operatorObjectId/);
   assert.match(section('readLogs'), /principalType: operatorType == 'User' \? 'User' : 'ServicePrincipal'/);
