@@ -1086,18 +1086,25 @@ test('initializer hook calls only owned Rust command and requires every private 
     assert.notEqual(result.returncode, 0); assert.match(result.stderr, /bootstrap must provide/); assert.equal(result.stdout, '');
   }
 });
-test('isolated initializer hook accepts explicit projection and rejects missing or dual mode before cargo', async () => {
+test('isolated initializer hook accepts the approved group family and rejects invalid projections before cargo', async () => {
   const cargo = path.join(directory, 'cargo');
   fs.writeFileSync(cargo, '#!/bin/sh\nprintf "%s\\n" "$@"\n', { mode: 0o700 });
+  const hook = path.join(b.ROOT, 'projects/arrowcol-infra/scripts/initialize-delta.sh');
+  for (const group of [b.SCHEMA_EVOLUTION_GROUP, 'rust-playground-schema-evo-qualification-20261108']) {
+    const c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_RESOURCE_GROUP: group }, 'schema-evolution');
+    const env = b.initializer_env({}, c, manifest, generation);
+    env.PATH = directory + ':' + process.env.PATH;
+    const valid = await realRun(['bash', hook], 5, b.ROOT, env);
+    assert.equal(valid.returncode, 0, valid.stderr);
+    assert.match(valid.stdout, /arrowcol-loadgen/);
+  }
   const c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_RESOURCE_GROUP: b.SCHEMA_EVOLUTION_GROUP }, 'schema-evolution');
   const env = b.initializer_env({}, c, manifest, generation);
   env.PATH = directory + ':' + process.env.PATH;
-  const hook = path.join(b.ROOT, 'projects/arrowcol-infra/scripts/initialize-delta.sh');
-  const valid = await realRun(['bash', hook], 5, b.ROOT, env);
-  assert.equal(valid.returncode, 0, valid.stderr);
-  assert.match(valid.stdout, /arrowcol-loadgen/);
   const missing = { ...env }; delete missing.ARROWCOL_AZURE_MODE;
-  for (const invalid of [missing, { ...env, AZURE_STAMP: '1' }, { ...env, ARROWCOL_AZURE_MODE: 'other' }]) {
+  for (const invalid of [missing, { ...env, AZURE_STAMP: '1' }, { ...env, ARROWCOL_AZURE_MODE: 'other' },
+    { ...env, AZURE_RESOURCE_GROUP: 'rust-playground-schema-evo-invalid-' },
+    { ...env, AZURE_RESOURCE_GROUP: 'unrelated-sandbox' }]) {
     const result = await realRun(['bash', hook], 5, b.ROOT, invalid);
     assert.notEqual(result.returncode, 0);
     assert.equal(result.stdout, '');
@@ -1197,7 +1204,9 @@ for (const group of ['arrow-collector-rg', 'rust-playground-schema-evo'])
     const expected = group === 'arrow-collector-rg' ? 'arrowcol-sandbox' : 'arrowcol-sandbox-' + azure.c.sandbox;
     assert.equal(invocation[invocation.indexOf('--name') + 1], expected);
   });
-function coordinateProvision() {
+function coordinateProvision(initializer?: (command: string[], env: NodeJS.ProcessEnv) => Promise<{
+  returncode: number; stdout: string; stderr: string;
+}>) {
   const deployed: any[] = [], observed: any[] = [], child: { generation?: string; id?: string; then?: () => Promise<void> } = {};
   const originalCli = azure.cli.bind(azure), originalKql = azure.kql.bind(azure);
   azure.cli = async (...args) => {
@@ -1217,15 +1226,41 @@ function coordinateProvision() {
   azure.kql = async (command, database) => {
     observed.push(['kql', azure.metadata.resetstate, azure.registry()]); return originalKql(command, database);
   };
-  mock.method(b.runtime, 'run_tree', async (_command: string[], _timeout: number, _cwd?: string, env?: NodeJS.ProcessEnv) => {
+  mock.method(b.runtime, 'run_tree', async (command: string[], _timeout: number, cwd?: string, env?: NodeJS.ProcessEnv) => {
+    const result = initializer ? await initializer(command, env!) : { returncode: 0, stdout: '', stderr: '' };
+    if (result.returncode) return result;
     const control = new PublisherControl(azure), member = b.uuid(), gen = env!.ARROWCOL_EXPECTED_RESET_GENERATION!;
     child.id = member; child.generation = gen;
     await control.admit(member, gen, true); await control.clean_release(member, gen, true);
     if (child.then) await child.then();
-    return { returncode: 0, stdout: '', stderr: '' };
+    return result;
   });
   return { deployed, observed, child };
 }
+test('full isolated provision invokes the real initializer with a dedicated group before exporting ready generation', async () => {
+  const group = 'rust-playground-schema-evo-qualification-20261108';
+  const c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_RESOURCE_GROUP: group }, 'schema-evolution');
+  azure.c = c; azure.tags = { ...b.TAGS, sandboxId: c.sandbox };
+  azure.checkpoint_exists = false; azure.cluster_state = 'Stopped'; initialize();
+  const cargo = path.join(directory, 'cargo');
+  fs.writeFileSync(cargo, '#!/bin/sh\nprintf "%s\\n" "$@"\n', { mode: 0o700 });
+  const hook = path.join(b.ROOT, 'projects/arrowcol-infra/scripts/initialize-delta.sh');
+  let invocation = '';
+  const { deployed } = coordinateProvision(async (command, env) => {
+    assert.deepEqual(command, ['bash', hook]);
+    assert.equal(env.AZURE_RESOURCE_GROUP, group);
+    assert.equal(env.AZURE_STORAGE_ACCOUNT, c.account);
+    assert.equal(env.AZURE_KUSTO_IDENTITY_NAME, 'arrowcol-kusto-reader');
+    const result = await realRun(command, 5, b.ROOT, { ...env, PATH: directory + ':' + process.env.PATH });
+    invocation = result.stdout;
+    return result;
+  });
+  await b.provision(azure, manifest, 0, output, false, {});
+  assert.match(invocation, /initialize-azure/);
+  const ready = b.load_env(output);
+  assert.equal(ready.AZURE_RESOURCE_GROUP, group);
+  assert.equal(ready.ARROWCOL_RESET_GENERATION, deployed[0][1].resetgeneration);
+});
 test('fresh provisioning initializes v1 then child/fresh parent serialize start and all KQL', async () => {
   initialize(); azure.checkpoint_exists = false; azure.cluster_state = 'Stopped';
   const { deployed, observed, child } = coordinateProvision();
