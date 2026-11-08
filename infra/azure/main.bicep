@@ -1,6 +1,8 @@
 targetScope = 'subscription'
 
 param location string
+param resourceGroupLocation string = location
+param identityLocation string = location
 @allowed(['stamped', 'schema-evolution'])
 param azureMode string = 'stamped'
 param resourceGroupName string = 'arrow-collector-rg'
@@ -43,15 +45,16 @@ var ownership = {
 
 resource group 'Microsoft.Resources/resourceGroups@2024-03-01' = {
   name: resourceGroupName
-  location: location
+  location: resourceGroupLocation
   tags: resourceGroupTags
 }
 
 module sandbox './sandbox.bicep' = {
-  name: 'arrowcol-sandbox'
+  name: 'arrowcol-sandbox-${sandboxId}'
   scope: group
   params: {
     location: location
+    identityLocation: identityLocation
     azureMode: azureMode
     ownership: ownership
     identityTags: identityTags

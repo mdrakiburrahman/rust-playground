@@ -57,10 +57,15 @@ test('bounds YAML and environment stamps to the Kusto cluster name limit', () =>
   }
 });
 
-test('requires explicit target defaults and rejects a different group or region', () => {
+test('accepts both approved stamp regions without broadening the resource-group boundary', () => {
   assert.equal(defaultStampConfig().stamp, 1);
+  for (const location of ['eastus2', 'canadacentral']) {
+    assert.equal(defaultStampConfig({ AZURE_LOCATION: location }).location, location);
+    assert.equal(parseStampConfig(example.replace('location: eastus2', 'location: ' + location)).location, location);
+  }
   assert.throws(() => defaultStampConfig({ AZURE_RESOURCE_GROUP: 'rust-playground' }), /exact arrow-collector-rg/);
-  assert.throws(() => defaultStampConfig({ AZURE_LOCATION: 'westus2' }), /qualified eastus2/);
+  assert.throws(() => defaultStampConfig({ AZURE_LOCATION: 'westus2' }), /approved eastus2 and canadacentral/);
+  assert.throws(() => parseStampConfig(example.replace('location: eastus2', 'location: westus2')), /location is invalid/);
 });
 test('validates independently configured IPv4 and IPv6 egress allocation tags', () => {
   const configured = example.replace('egressIpv4IpTags: []',

@@ -46,7 +46,7 @@ export class FakeAzure extends Azure {
     return this;
   }
   override async arm(method: string, resourcePath: string, ..._args: any[]): Promise<any> {
-    if (resourcePath === this.c.identity_id) return { tags: { ...this.tags }, properties: { clientId: SUB, principalId: SUB } };
+    if (resourcePath === this.c.identity_id) return { location: this.c.location, tags: { ...this.tags }, properties: { clientId: SUB, principalId: SUB } };
     if (resourcePath === this.c.identity_id) return { tags: { ...this.tags }, properties: { clientId: SUB, principalId: SUB } };
     if (resourcePath.includes('/diagnosticSettings/'))
       return this.diagnostic ? { properties: { logs: [{ category: 'StorageRead', enabled: true }] } } : null;
@@ -56,7 +56,7 @@ export class FakeAzure extends Azure {
     if (resourcePath.endsWith('/containers/' + this.c.data)) return { properties: { metadata: { ...this.data_metadata } } };
     if (resourcePath.endsWith('/containers/' + this.c.experimentContainer))
       return { properties: { metadata: { ...this.experiment_metadata } } };
-    return { tags: { ...this.tags }, properties: { isHnsEnabled: true, uri: 'https://cluster.example',
+    return { location: this.c.location, tags: { ...this.tags }, properties: { isHnsEnabled: true, uri: 'https://cluster.example',
       principalId: SUB, state: this.cluster_state, customerId: WORKSPACE_CUSTOMER, retentionInDays: 30 } };
   }
   override async kql(command: string, database?: string): Promise<any> {

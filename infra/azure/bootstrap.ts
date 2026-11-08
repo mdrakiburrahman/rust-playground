@@ -771,8 +771,13 @@ export async function checkpoint_container(azure: Azure): Promise<any> {
 export async function deploy(azure: Azure, fresh?: Metadata): Promise<void> {
   const c = azure.c;
   const existing = await guard_existing(azure);
+  for (const [kind, resource] of Object.entries(existing)) {
+    if (typeof resource.location !== 'string' || !/^[a-z0-9]+$/.test(resource.location))
+      throw new Failure('Existing ' + kind + ' location is missing or invalid; refusing relocation.');
+  }
   const ownershipTags = { ...TAGS, sandboxId: c.sandbox };
   const params = { location: c.location, resourceGroupName: c.group, sandboxId: c.sandbox, storageAccountName: c.account,
+    resourceGroupLocation: existing.group?.location ?? c.location, identityLocation: existing.identity?.location ?? c.location,
     resourceGroupTags: existing.group?.tags ?? ownershipTags, identityTags: existing.identity?.tags ?? ownershipTags,
     azureMode: c.mode, clusterName: c.cluster, identityName: c.identity, registryName: c.registry,
     aksConfig: c.mode === 'stamped' ? c.stampConfig.aks : {},
@@ -789,7 +794,7 @@ export async function deploy(azure: Azure, fresh?: Metadata): Promise<void> {
   try {
     try {
       await azure.cli('deployment', 'sub', 'create', '--subscription', c.subscription, '--location', c.location,
-        '--name', c.mode === 'stamped' ? 'arrowcol-sandbox' : 'arrowcol-sandbox-' + c.sandbox,
+        '--name', 'arrowcol-sandbox-' + c.sandbox,
         '--template-file', path.join(ROOT, 'infra/azure/main.bicep'), '--parameters', '@' + filename);
     } catch (error) {
       if (error instanceof Failure && error.message.includes('DeploymentFailed')) throw new DeploymentFailed(error.message, { cause: error });

@@ -389,8 +389,9 @@ test('shared stamped identity can be reused without replacing other stamp consum
   mock.method(azure, 'collection', async () => publisherCredentials);
   await b.guard_existing(azure);
 });
-test('stamped deployment preserves previous RG/UAMI tags and does not redeclare shared publisher FICs', async () => {
-  const c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_STAMP: '89151' });
+for (const existing of [false, true])
+test(`Canada stamp preserves existing RG/UAMI locations and trust (existing=${existing})`, async () => {
+  const c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_STAMP: '89152', AZURE_LOCATION: 'canadacentral' });
   azure.c = c;
   c.stampConfig.publisherFederatedCredentials.push({
     name: 'publisher', issuer: 'https://token.actions.githubusercontent.com', subject: 'repo:example/repo:environment:publish',
@@ -402,8 +403,9 @@ test('stamped deployment preserves previous RG/UAMI tags and does not redeclare 
   }));
   let deployed = false;
   mock.method(azure, 'arm', async (_method: string, resourcePath: string) => {
-    if (resourcePath === c.base) return { tags: groupTags };
-    if (resourcePath === c.identity_id) return { tags: identityTags, properties: { clientId: SUB, principalId: SUB } };
+    if (resourcePath === c.base && existing) return { location: 'eastus2', tags: groupTags };
+    if (resourcePath === c.identity_id && (existing || deployed))
+      return { location: existing ? 'eastus2' : 'canadacentral', tags: identityTags, properties: { clientId: SUB, principalId: SUB } };
     if (resourcePath === c.cluster_id && deployed) return { properties: { uri: 'https://cluster.example' } };
     return null;
   });
@@ -411,14 +413,36 @@ test('stamped deployment preserves previous RG/UAMI tags and does not redeclare 
   let parameters: any;
   mock.method(azure, 'cli', async (...args: string[]) => {
     assert.deepEqual(args.slice(0, 3), ['deployment', 'sub', 'create']);
+    assert.equal(args[args.indexOf('--name') + 1], 'arrowcol-sandbox-stamp-89152');
+    assert.equal(args[args.indexOf('--location') + 1], 'canadacentral');
     parameters = JSON.parse(fs.readFileSync(args.at(-1)!.slice(1), 'utf8')).parameters;
     deployed = true;
     return {};
   });
   await b.deploy(azure);
-  assert.deepEqual(parameters.resourceGroupTags.value, groupTags);
-  assert.deepEqual(parameters.identityTags.value, identityTags);
-  assert.deepEqual(parameters.publisherFederatedCredentials.value, []);
+  const newTags = { ...b.TAGS, sandboxId: c.sandbox };
+  assert.equal(parameters.location.value, 'canadacentral');
+  assert.equal(parameters.resourceGroupLocation.value, existing ? 'eastus2' : 'canadacentral');
+  assert.equal(parameters.identityLocation.value, existing ? 'eastus2' : 'canadacentral');
+  assert.deepEqual(parameters.resourceGroupTags.value, existing ? groupTags : newTags);
+  assert.deepEqual(parameters.identityTags.value, existing ? identityTags : newTags);
+  assert.deepEqual(parameters.publisherFederatedCredentials.value, existing ? [] : c.stampConfig.publisherFederatedCredentials);
+  assert.equal(new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, ...c.generated() }, c.stampConfig).location, 'canadacentral');
+  const main = fs.readFileSync(path.join(b.ROOT, 'infra/azure/main.bicep'), 'utf8');
+  const sandbox = fs.readFileSync(path.join(b.ROOT, 'infra/azure/sandbox.bicep'), 'utf8');
+  assert.match(main, /name: resourceGroupName\n  location: resourceGroupLocation/);
+  assert.match(main, /identityLocation: identityLocation/);
+  assert.match(sandbox, /name: identityName\n  location: identityLocation/);
+});
+for (const key of ['base', 'identity_id'] as const)
+test(`deployment rejects missing existing ${key} location before any ARM write`, async () => {
+  const original = azure.arm.bind(azure);
+  mock.method(azure, 'arm', async (method: string, resourcePath: string) => {
+    const resource = await original(method, resourcePath);
+    return resourcePath === azure.c[key] ? { ...resource, location: undefined } : resource;
+  });
+  mock.method(azure, 'cli', async () => { assert.fail('deployment must not begin with unknown existing location'); });
+  await assert.rejects(b.deploy(azure), /location is missing or invalid; refusing relocation/);
 });
 test('stamped deployment refuses missing shared publisher FICs', async () => {
   const c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_STAMP: '89151' });
@@ -1380,7 +1404,7 @@ for (const group of ['arrow-collector-rg', 'rust-playground-schema-evo'])
     await b.deploy(azure);
     const invocation = azure.events.find(event => event[0] === 'cli' && event[1] === 'deployment');
     assert.ok(invocation);
-    const expected = group === 'arrow-collector-rg' ? 'arrowcol-sandbox' : 'arrowcol-sandbox-' + azure.c.sandbox;
+    const expected = 'arrowcol-sandbox-' + azure.c.sandbox;
     assert.equal(invocation[invocation.indexOf('--name') + 1], expected);
   });
 function coordinateProvision(initializer?: (command: string[], env: NodeJS.ProcessEnv) => Promise<{

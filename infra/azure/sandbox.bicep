@@ -1,4 +1,5 @@
 param location string
+param identityLocation string = location
 @allowed(['stamped', 'schema-evolution'])
 param azureMode string = 'stamped'
 param ownership object
@@ -28,12 +29,12 @@ param clusterTags object
 
 resource identity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: identityName
-  location: location
+  location: identityLocation
   tags: identityTags
 }
 
 module aks './aks.bicep' = if (azureMode == 'stamped') {
-  name: 'arrowcol-aks'
+  name: 'arrowcol-aks-${ownership.sandboxId}'
   params: {
     location: location
     ownership: ownership

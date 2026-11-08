@@ -8,9 +8,9 @@ replace the devcontainer mode.
 
 | Requirement | Qualified value or guard |
 | --- | --- |
-| Azure target | The private stamp subscription, `arrow-collector-rg`, East US 2; never the separate `rust-playground` resource group. |
+| Azure target | The private stamp subscription, `arrow-collector-rg`, East US 2 or Canada Central; never the separate `rust-playground` resource group. Each region still requires live SKU, version, quota and network preflight. |
 | Stamp | Integer `1..999999` in ignored `infra/azure/stamp.yaml`; `arrow-collector-<stamp>` must fit Kusto's provider-enforced 22-character name limit. |
-| AKS baseline | 1.35.6; `Standard_D8s_v6` system pool with 3 initial/3 minimum/6 maximum nodes, 250 pods per node, zones 1/2/3, Azure Linux/FIPS, Entra/Azure RBAC, OIDC/workload identity, Azure CNI overlay dual stack and API-server VNet integration. |
+| AKS baseline | 1.35.6; `Standard_D8ds_v6` system pool with 3 initial/3 minimum/3 maximum nodes, 250 pods per node, zones 1/2/3, Azure Linux/FIPS, Entra/Azure RBAC, OIDC/workload identity, Azure CNI overlay dual stack and API-server VNet integration. |
 | Declared identity | One `arrow-collector` UAMI for control plane, kubelet, QAP ServiceAccount federation, ADX/storage and ACR. Identity-creating optional add-ons are omitted; tenant-enforced add-ons require separate live qualification below. |
 | Publisher ownership | Generated `AZURE_STAMP` selects the same `stamp-<integer>` authority in TypeScript and Rust. Invalid stamps fail closed; an absent stamp retains the Rust legacy hashed-authority path only for older deployments. |
 | Networking | Explicit IPv4/IPv6 VNet, node, API, pod, service and DNS ranges; preflight checks subscription VNets and connected peering ranges before deployment. |
@@ -44,6 +44,13 @@ Prepare the private stamp from `infra/azure/stamp.example.yaml`. Keep the
 subscription UUID, real non-overlapping network ranges and preserved publisher
 FICs private. Align the operator environment's subscription, resource group and
 location with that stamp.
+
+For a different region, use a fresh stamp and separate private stamp, generated
+environment and table-manifest paths. Keep existing stamps untouched. Bootstrap
+preserves the shared resource group's and UAMI's original locations and tags,
+adds only the new stamp's service-account federation, and uses stamp-specific
+deployment names. A region change does not relocate existing resources. The
+schema-evolution mode's region boundary is unchanged.
 
 ```bash
 npx --no-install tsx infra/azure/bootstrap.ts config --stamp-config infra/azure/stamp.yaml

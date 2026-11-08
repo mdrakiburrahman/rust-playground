@@ -12,7 +12,7 @@ export interface StampConfig {
   subscription: string;
   stamp: number;
   resourceGroup: 'arrow-collector-rg';
-  location: 'eastus2';
+  location: 'eastus2' | 'canadacentral';
   storageReadLogDestination?: 'log-analytics' | 'storage';
   aks: {
     version: string;
@@ -156,7 +156,8 @@ export function defaultStampConfig(values: Record<string, string | undefined> = 
   const group = values.AZURE_RESOURCE_GROUP ?? 'arrow-collector-rg';
   if (group !== 'arrow-collector-rg') throw new Failure('Only the exact arrow-collector-rg resource group is authorized.');
   const location = values.AZURE_LOCATION ?? 'eastus2';
-  if (location !== 'eastus2') throw new Failure('Only the qualified eastus2 region is authorized.');
+  if (location !== 'eastus2' && location !== 'canadacentral')
+    throw new Failure('Only the approved eastus2 and canadacentral regions are authorized.');
   const aks = { ...DEFAULT_AKS, namespace: values.AZURE_KUBERNETES_NAMESPACE ?? DEFAULT_AKS.namespace,
     serviceAccount: values.AZURE_KUBERNETES_SERVICE_ACCOUNT ?? DEFAULT_AKS.serviceAccount };
   const destination = values.AZURE_STORAGE_READ_LOG_DESTINATION ?? 'log-analytics';
@@ -174,7 +175,7 @@ export function parseStampConfig(source: string): StampConfig {
   const subscription = text(raw.subscription, 'subscription', /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i).toLowerCase();
   const stamp = integer(raw.stamp, 'stamp', 1, MAX_STAMP);
   const resourceGroup = text(raw.resourceGroup, 'resourceGroup', /^arrow-collector-rg$/) as 'arrow-collector-rg';
-  const location = text(raw.location, 'location', /^eastus2$/) as 'eastus2';
+  const location = text(raw.location, 'location', /^(eastus2|canadacentral)$/) as StampConfig['location'];
   const storageReadLogDestination = text(raw.storageReadLogDestination ?? 'log-analytics', 'storageReadLogDestination',
     /^(log-analytics|storage)$/) as 'log-analytics' | 'storage';
   const aksRaw = object(raw.aks, 'aks');
