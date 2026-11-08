@@ -33,6 +33,11 @@ pub struct DmvTable {
     schema: SchemaRef,
 }
 
+/// Returns the names of the DMV tables in the embedded fixture.
+///
+/// # Errors
+///
+/// Returns an error if the fixture cannot be parsed into Arrow schemas.
 pub fn table_names() -> Result<Vec<String>> {
     Ok(tables()?
         .into_iter()
@@ -40,6 +45,11 @@ pub fn table_names() -> Result<Vec<String>> {
         .collect())
 }
 
+/// Parses the embedded DMV DDL fixture into table schemas.
+///
+/// # Errors
+///
+/// Returns an error if a statement is invalid, is not `CREATE TABLE`, or contains an unsupported field type.
 pub fn tables() -> Result<Vec<DmvTable>> {
     let ddl = SCHEMA_DDL
         .lines()
@@ -66,6 +76,11 @@ pub fn tables() -> Result<Vec<DmvTable>> {
     Ok(tables)
 }
 
+/// Builds an Arrow batch matching one DMV table's schema.
+///
+/// # Errors
+///
+/// Returns an error if the schema contains an unsupported type or Arrow rejects the batch.
 pub fn batch(table: &DmvTable, client_id: &str, rows: usize, now_micros: i64) -> Result<RecordBatch> {
     let columns = table
         .schema
@@ -98,16 +113,28 @@ pub fn batch(table: &DmvTable, client_id: &str, rows: usize, now_micros: i64) ->
 }
 
 /// Registers every DMV table on the collector and puts one batch per table; returns the table count.
+///
+/// # Errors
+///
+/// Returns an error if the fixture is invalid or collector registration or upload fails.
 pub async fn send(endpoint: &str, client_id: &str, rows: usize) -> Result<usize> {
     send_with_concurrency(endpoint, client_id, rows, 1).await
 }
 
 /// Registers DMV tables and uploads one Arrow batch per table with bounded concurrency.
+///
+/// # Errors
+///
+/// Returns an error for invalid row or concurrency counts, invalid fixture DDL, or collector connection or upload failures.
 pub async fn send_with_concurrency(endpoint: &str, client_id: &str, rows: usize, concurrency: usize) -> Result<usize> {
     send_tables_with_concurrency(endpoint, client_id, rows, concurrency, tables()?).await
 }
 
 /// Registers and uploads one named DMV table for a replica-pinned OAT workload.
+///
+/// # Errors
+///
+/// Returns an error if the table name is unknown, arguments are invalid, or collector connection or upload fails.
 pub async fn send_table_with_concurrency(
     endpoint: &str,
     client_id: &str,
