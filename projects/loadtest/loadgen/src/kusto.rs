@@ -48,7 +48,6 @@ const LOCAL_HOT_WINDOW: &str = "1.00:00:00";
 /// a 32-CPU devbox. Final compaction rewrites every table just before the fixed cache deadline, so the
 /// local emulator pins the devbox-proven worker count instead of inheriting the runner's core count.
 const LOCAL_QAP_WORKERS: u64 = 16;
-const TABLES_PER_POOL: usize = 13;
 // Query-engine memory is independent of the validator host's CPU count.
 const QUERY_CONCURRENCY: usize = 2;
 const HEAVY_QUERY_CONCURRENCY: usize = 1;
@@ -597,6 +596,28 @@ fn external_name(pool: &str, identity: &str) -> Result<String> {
     Ok(name)
 }
 
+fn canonical_dataflow_tables() -> Result<BTreeSet<String>> {
+    crate::schema::schema_statements()?
+        .into_iter()
+        .map(|statement| {
+            external_name(
+                "dataflow",
+                &format!("telemetry.sqlserver.{}", statement.identity.table().as_str()),
+            )
+        })
+        .collect()
+}
+
+fn live_table_coverage(expected: &BTreeSet<String>, observed: &BTreeSet<String>) -> Result<()> {
+    let missing = expected.difference(observed).cloned().collect::<Vec<_>>();
+    let unexpected = observed.difference(expected).cloned().collect::<Vec<_>>();
+    ensure!(
+        missing.is_empty() && unexpected.is_empty(),
+        "generation-active native Kusto source-row evidence is incomplete: missing Dataflow tables {missing:?}; unexpected tables {unexpected:?}"
+    );
+    Ok(())
+}
+
 /// Committed Delta table root inside the Kusto container (mounted read-only at `/delta/<pool>`).
 fn table_location(pool: &str, identity: &str) -> Result<String> {
     external_name(pool, identity)?;
@@ -666,6 +687,7 @@ struct TableProgress {
 struct Exposure {
     client: KustoClient,
     status: ExposureStatus,
+    expected_live_tables: BTreeSet<String>,
     schemas: BTreeMap<String, Value>,
 }
 
@@ -679,6 +701,7 @@ impl Exposure {
                 backend: BACKEND.to_owned(),
                 ..ExposureStatus::default()
             },
+            expected_live_tables: canonical_dataflow_tables()?,
             schemas: BTreeMap::new(),
         })
     }
@@ -695,7 +718,7 @@ impl Exposure {
             self.status.state = "healthy".to_owned();
             self.status.error = None;
         }
-        self.status.live_observed = self.status.live_tables.len() == 2 * TABLES_PER_POOL;
+        self.status.live_observed = live_table_coverage(&self.expected_live_tables, &self.status.live_tables).is_ok();
         self.status.files_ingested = self.status.tables.values().map(|table| table.active_files).sum();
         write_json(&self.client.results.join(STATUS), &self.status)
     }
@@ -729,7 +752,7 @@ impl Exposure {
             if live.load(Ordering::Acquire)
                 && !self.status.live_tables.contains(&name)
                 && !inventory.files.is_empty()
-                && self.client.count(&external_source(&name)?, "live-observation").await? > 0
+                && self.client.count(&fallback_source(&name)?, "live-observation").await? > 0
                 && live.load(Ordering::Acquire)
             {
                 self.status.live_tables.insert(name.clone());
@@ -761,7 +784,7 @@ impl Exposure {
             if !live.load(Ordering::Acquire) || self.status.live_tables.contains(name) {
                 continue;
             }
-            match self.client.count(&external_source(name)?, "live-observation").await {
+            match self.client.count(&fallback_source(name)?, "live-observation").await {
                 Ok(rows) if rows > 0 && live.load(Ordering::Acquire) => {
                     self.status.live_tables.insert(name.to_owned());
                 }
@@ -1513,10 +1536,18 @@ pub(crate) async fn validate(
     let oracle_timer = bound.timings.measure("phase/TableOracle");
     bound.update(|progress| progress.phase = KustoPhase::TableOracle);
     let mut inputs = Vec::new();
+    let expected_tables = canonical_dataflow_tables()?;
     for (pool, root, snapshot) in [("dataflow", dataflow_root, dataflow)] {
+        let observed_tables = snapshot
+            .tables
+            .keys()
+            .map(|table| external_name(pool, table))
+            .collect::<Result<BTreeSet<_>>>()?;
         ensure!(
-            snapshot.tables.len() == TABLES_PER_POOL,
-            "{pool} Kusto validation requires all {TABLES_PER_POOL} tables"
+            observed_tables == expected_tables,
+            "{pool} Kusto validation table set differs from the canonical DFE set: missing={:?}; unexpected={:?}",
+            expected_tables.difference(&observed_tables).collect::<Vec<_>>(),
+            observed_tables.difference(&expected_tables).collect::<Vec<_>>()
         );
         let timer = bound.timings.measure(format!("frozen/{pool}"));
         ensure!(
@@ -1632,10 +1663,10 @@ pub(crate) async fn validate(
             }),
         );
     }
+    live_table_coverage(&expected_tables, &status.live_tables)?;
     ensure!(
-        status.live_observed && status.live_tables.len() == 2 * TABLES_PER_POOL,
-        "all {} Kusto tables were not observed while generation was active",
-        2 * TABLES_PER_POOL
+        status.live_observed,
+        "native Kusto status did not record complete generation-active source-row evidence"
     );
     status.state = "healthy".to_owned();
     status.backend = BACKEND.to_owned();
@@ -1829,6 +1860,7 @@ pub async fn observe_qap(
             }
             json!({
                 "observed_unix_ms": now_unix_millis(), "backend": BACKEND, "mode": client.mode,
+                "expected_tables": tables,
                 "capacity": client.capacity().await, "tables": observed
             })
         })
@@ -2257,6 +2289,25 @@ mod tests {
     }
 
     #[test]
+    fn generation_active_coverage_requires_exact_canonical_dataflow_tables() -> Result<()> {
+        let expected = canonical_dataflow_tables()?;
+        assert!(expected.contains("dataflow_sqlserver_wait_stats"));
+        assert!(expected.iter().all(|table| table.starts_with("dataflow_sqlserver_")));
+        live_table_coverage(&expected, &expected)?;
+
+        let mut missing = expected.clone();
+        missing.remove("dataflow_sqlserver_wait_stats");
+        let error = live_table_coverage(&expected, &missing).unwrap_err();
+        assert!(format!("{error:#}").contains("dataflow_sqlserver_wait_stats"));
+
+        let mut retired = expected.clone();
+        retired.insert("direct_sqlserver_wait_stats".to_owned());
+        let error = live_table_coverage(&expected, &retired).unwrap_err();
+        assert!(format!("{error:#}").contains("direct_sqlserver_wait_stats"));
+        Ok(())
+    }
+
+    #[test]
     fn multiset_requires_exact_oracle_counts_and_no_unmatched_rows() -> Result<()> {
         let samples = vec![(json!({"id":1}), 2), (json!({"id":2}), 1)];
         let exact = Multiset {
@@ -2451,7 +2502,7 @@ mod tests {
                 ensure!(command.contains("query_acceleration") && command.contains("00:01:00"));
                 altered.fetch_add(1, Ordering::Relaxed);
             } else if command.ends_with("| count") {
-                ensure!(command.starts_with("external_table(\"dataflow_sqlserver_wait_stats\")"));
+                ensure!(command.starts_with("external_table(\"dataflow_sqlserver_wait_stats\", timespan(1s))"));
                 return Ok(Some(response(&["Count"], vec![json!([3])])));
             }
             Ok(Some(response(&[], vec![])))
@@ -2460,6 +2511,7 @@ mod tests {
         let mut exposure = Exposure {
             client,
             status: ExposureStatus::default(),
+            expected_live_tables: canonical_dataflow_tables()?,
             schemas: BTreeMap::new(),
         };
         let snapshot = SnapshotInventory {
@@ -3091,6 +3143,7 @@ mod tests {
         )
         .await?;
         let ready = &observed["tables"]["dataflow_ready"];
+        assert_eq!(observed["expected_tables"], json!(&tables));
         assert_eq!(ready["available"], true);
         assert_eq!(ready["statistics"]["AccelerationPendingDataFilesCount"], 2);
         assert_eq!(ready["statistics"]["AccelerationPendingDataFilesSize"], Value::Null);

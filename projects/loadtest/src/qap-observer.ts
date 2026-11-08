@@ -43,44 +43,53 @@ function measured(value: unknown): value is number {
 export function qapPoints(value: unknown): { observed: number; points: Point[] } {
   const observation = record(value);
   const tables = record(observation?.tables);
+  const expectedValues = observation?.expected_tables;
   const observed = observation?.observed_unix_ms;
-  if (!tables || !Number.isSafeInteger(observed) || typeof observed !== 'number' || observed <= 0 ||
+  if (!tables || !Array.isArray(expectedValues) || expectedValues.length === 0 ||
+      !Number.isSafeInteger(observed) || typeof observed !== 'number' || observed <= 0 ||
       observation?.backend !== 'native-qap' || !['local', 'azure'].includes(String(observation.mode))) {
     throw new Error('Malformed native QAP observation');
   }
-  const points: Point[] = [];
-  for (const pool of ['dataflow'] as const) {
-    const entries = Object.entries(tables).filter(([name]) => name.startsWith(`${pool}_sqlserver_`));
-    if (entries.length !== 13) throw new Error(`QAP observation must cover all 13 ${pool} source tables`);
-    const available = entries.map(([, table]) => record(table)).filter(table => table?.available === true);
-    const aggregates: Point[] = [];
-    for (const [name, field, reduce, unit] of [
-      ['completion_percent', 'AccelerationCompletePercentage', 'min', '%'],
-      ['pending_artifacts', 'AccelerationPendingDataFilesCount', 'sum', '1'],
-      ['cached_bytes', 'HotSize', 'sum', 'By'],
-    ] as const) {
-      const values = available.map(table => record(table?.statistics)?.[field]);
-      if (available.length === 13 && values.every(measured) &&
-          (field !== 'AccelerationCompletePercentage' || values.every(value => value <= 100))) {
-        aggregates.push({ name: `qap_${name}`, pool, value: reduce === 'min' ? Math.min(...values) :
-          values.reduce((sum, value) => sum + value, 0), unit });
-      }
+  const expectedTables = new Set<string>();
+  for (const name of expectedValues) {
+    if (typeof name !== 'string' || !/^dataflow_sqlserver_[a-z0-9_]+$/u.test(name) || expectedTables.has(name)) {
+      throw new Error('QAP expected tables must be unique Dataflow SQL Server source tables');
     }
-    const healthy = available.map(table => record(table?.state)?.is_healthy);
-    if (available.length === 13 && healthy.every(value => typeof value === 'boolean')) {
-      aggregates.push({ name: 'qap_unhealthy_catalogs', pool, value: healthy.filter(value => !value).length });
-    }
-    const updated = available.map(table => record(table?.statistics)?.LastUpdatedDateTime);
-    const ages = updated.map(value => typeof value === 'string' ? (observed - Date.parse(value)) / 1000 : Number.NaN);
-    if (available.length === 13 && ages.every(measured)) {
-      aggregates.push({ name: 'qap_lag_seconds', pool, value: Math.max(...ages), unit: 's' });
-    }
-    points.push(...aggregates,
-      { name: 'qap_observation_complete', pool, value: Number(aggregates.length === 5) },
-      { name: 'qap_observed_tables', pool, value: available.length },
-      { name: 'qap_observation_unix_seconds', pool, value: observed / 1000, unit: 's' });
+    expectedTables.add(name);
   }
-  if (Object.keys(tables).length !== 13) throw new Error('Unexpected non-source table in QAP observation');
+  const tableNames = Object.keys(tables);
+  if (tableNames.length !== expectedTables.size || tableNames.some(name => !expectedTables.has(name))) {
+    throw new Error('QAP observation does not match expected Dataflow source-table set');
+  }
+  const available = tableNames.map(name => record(tables[name])).filter(table => table?.available === true);
+  const aggregates: Point[] = [];
+  for (const [name, field, reduce, unit] of [
+    ['completion_percent', 'AccelerationCompletePercentage', 'min', '%'],
+    ['pending_artifacts', 'AccelerationPendingDataFilesCount', 'sum', '1'],
+    ['cached_bytes', 'HotSize', 'sum', 'By'],
+  ] as const) {
+    const values = available.map(table => record(table?.statistics)?.[field]);
+    if (available.length === expectedTables.size && values.every(measured) &&
+        (field !== 'AccelerationCompletePercentage' || values.every(value => value <= 100))) {
+      aggregates.push({ name: 'qap_' + name, pool: 'dataflow', value: reduce === 'min' ? Math.min(...values) :
+        values.reduce((sum, value) => sum + value, 0), unit });
+    }
+  }
+  const healthy = available.map(table => record(table?.state)?.is_healthy);
+  if (available.length === expectedTables.size && healthy.every(value => typeof value === 'boolean')) {
+    aggregates.push({ name: 'qap_unhealthy_catalogs', pool: 'dataflow', value: healthy.filter(value => !value).length });
+  }
+  const updated = available.map(table => record(table?.statistics)?.LastUpdatedDateTime);
+  const ages = updated.map(value => typeof value === 'string' ? (observed - Date.parse(value)) / 1000 : Number.NaN);
+  if (available.length === expectedTables.size && ages.every(measured)) {
+    aggregates.push({ name: 'qap_lag_seconds', pool: 'dataflow', value: Math.max(...ages), unit: 's' });
+  }
+  const points: Point[] = [
+    ...aggregates,
+    { name: 'qap_observation_complete', pool: 'dataflow', value: Number(aggregates.length === 5) },
+    { name: 'qap_observed_tables', pool: 'dataflow', value: available.length },
+    { name: 'qap_observation_unix_seconds', pool: 'dataflow', value: observed / 1000, unit: 's' },
+  ];
   return { observed, points };
 }
 

@@ -12,11 +12,10 @@ test('real helper processes isolate provenance from the concurrently appending l
   const root = await mkdtemp(path.join(os.tmpdir(), 'qap-provenance-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const fixturePath = path.join(root, 'fixture.json');
+  const expected_tables = Array.from({ length: 13 }, (_, index) => 'dataflow_sqlserver_fixture_' + index);
   await writeFile(fixturePath, JSON.stringify({
-    observed_unix_ms: 1_800_000_000_000, backend: 'native-qap', mode: 'local',
-    tables: Object.fromEntries(['dataflow'].flatMap(pool => Array.from({ length: 13 }, (_, index) => [
-      `${pool}_sqlserver_fixture_${index}`, { available: false, error: 'fixture unavailable' },
-    ]))),
+    observed_unix_ms: 1_800_000_000_000, backend: 'native-qap', mode: 'local', expected_tables,
+    tables: Object.fromEntries(expected_tables.map(name => [name, { available: false, error: 'fixture unavailable' }])),
   }));
   const binary = path.join(root, 'observer.mjs');
   await writeFile(binary, `#!${process.execPath}
