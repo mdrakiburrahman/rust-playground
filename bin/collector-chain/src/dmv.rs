@@ -18,7 +18,7 @@ use arrowcol_flight::{PutResultMetadata, decode_ddl_completion_metadata};
 use arrowcol_protocol::{
     ClaimedSchemaFingerprint, ImplementationPool, IngestMetadata, ProtocolVersion, TableIdentity, fingerprint_schema,
 };
-use futures::{TryStreamExt, stream};
+use futures::{StreamExt, TryStreamExt, stream};
 use prost::Message as _;
 use tonic::Request;
 use tonic::metadata::MetadataValue;
@@ -92,8 +92,16 @@ pub fn batch(table: &DmvTable, client_id: &str, rows: usize, now_micros: i64) ->
 
 /// Registers every DMV table on the collector and puts one batch per table; returns the table count.
 pub async fn send(endpoint: &str, client_id: &str, rows: usize) -> Result<usize> {
+    send_with_concurrency(endpoint, client_id, rows, 1).await
+}
+
+/// Registers DMV tables and uploads one Arrow batch per table with bounded concurrency.
+pub async fn send_with_concurrency(endpoint: &str, client_id: &str, rows: usize, concurrency: usize) -> Result<usize> {
     if rows == 0 {
         bail!("rows must be positive");
+    }
+    if concurrency == 0 {
+        bail!("concurrency must be positive");
     }
     let channel = Endpoint::from_shared(endpoint.to_owned())?
         .connect_timeout(RPC_TIMEOUT)
@@ -101,20 +109,33 @@ pub async fn send(endpoint: &str, client_id: &str, rows: usize) -> Result<usize>
         .connect()
         .await
         .with_context(|| format!("connect {endpoint}"))?;
-    let mut client = FlightServiceClient::new(channel);
+    let mut client = FlightServiceClient::new(channel.clone());
     let now_micros = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros())?;
     let tables = tables()?;
-    for table in &tables {
+    let count = tables.len();
+    let mut uploads = Vec::with_capacity(count);
+    for table in tables {
         let version = register(&mut client, &table.ddl)
             .await
             .with_context(|| format!("register {}", table.identity))?;
-        put(&mut client, table, version, batch(table, client_id, rows, now_micros)?)
-            .await
-            .with_context(|| format!("put {}", table.identity))?;
+        let batch = batch(&table, client_id, rows, now_micros)?;
+        uploads.push((table, version, batch));
     }
-    Ok(tables.len())
-}
 
+    let upload_client = FlightServiceClient::new(channel);
+    stream::iter(uploads.into_iter().map(|(table, version, batch)| {
+        let mut client = upload_client.clone();
+        async move {
+            put(&mut client, &table, version, batch)
+                .await
+                .with_context(|| format!("put {}", table.identity))
+        }
+    }))
+    .buffer_unordered(concurrency.min(count))
+    .try_collect::<Vec<_>>()
+    .await?;
+    Ok(count)
+}
 async fn register(client: &mut FlightServiceClient<Channel>, ddl: &str) -> Result<String> {
     let command = CommandStatementUpdate {
         query: ddl.to_owned(),
@@ -206,5 +227,23 @@ mod tests {
             assert_eq!(batch.num_rows(), 3);
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_zero_rows_and_concurrency_before_connecting() {
+        assert!(
+            send_with_concurrency("not a url", "client-a", 0, 1)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("rows must be positive")
+        );
+        assert!(
+            send_with_concurrency("not a url", "client-a", 1, 0)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("concurrency must be positive")
+        );
     }
 }
