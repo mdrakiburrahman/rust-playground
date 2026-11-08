@@ -14,6 +14,7 @@ export * from './authority.js';
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 export const API = '2024-04-13';
+const AKS_API = '2024-10-01';
 export const LOG_ANALYTICS_API = '2023-09-01';
 export const DIAGNOSTIC_API = '2021-05-01-preview';
 export const STORAGE_READS_SETTING = 'arrowcol-storage-reads';
@@ -665,12 +666,30 @@ export async function preflight(azure: Azure): Promise<void> {
   const versionFamily = aksConfig.version.split('.').slice(0, 2).join('.');
   if (!versions.values?.some((entry: any) => entry.version === versionFamily && Object.hasOwn(entry.patchVersions ?? {}, aksConfig.version)))
     throw new Failure('Configured AKS Kubernetes version is not available in the target region.');
+  const aksResourcePath = c.base + '/providers/Microsoft.ContainerService/managedClusters/arrow-collector-' + c.stamp;
+  const existingAks = await azure.arm('GET', aksResourcePath, undefined, true, AKS_API);
+  const existingPools = new Map<string, { vmSize: string; count: number }>();
+  if (existingAks) {
+    owned(existingAks, c);
+    const profiles = existingAks.properties?.agentPoolProfiles;
+    if (!Array.isArray(profiles)) throw new Failure('Azure did not report existing AKS node-pool allocations.');
+    for (const profile of profiles) {
+      const count = Number(profile.count);
+      if (typeof profile.name !== 'string' || typeof profile.vmSize !== 'string' ||
+          !Number.isSafeInteger(count) || count < 0 || existingPools.has(profile.name))
+        throw new Failure('Azure returned invalid existing AKS node-pool allocation data.');
+      existingPools.set(profile.name, { vmSize: profile.vmSize, count });
+    }
+  }
   const pools = [
-    { ...aksConfig.systemPool, label: 'system pool', quotaCount: aksConfig.systemPool.maxCount },
-    ...aksConfig.userPools.map(pool => ({ ...pool, label: 'user pool ' + pool.name, quotaCount: pool.maxCount })),
+    { ...aksConfig.systemPool, label: 'system pool' },
+    ...aksConfig.userPools.map(pool => ({ ...pool, label: 'user pool ' + pool.name })),
   ];
   const requiredByFamily = new Map<string, number>();
   for (const pool of pools) {
+    const existingPool = existingPools.get(pool.name);
+    if (existingPool && existingPool.vmSize !== pool.vmSize)
+      throw new Failure('Existing AKS ' + pool.label + ' VM SKU differs from the configured stamp.');
     const skuResults = await azure.cli('vm', 'list-skus', '--location', c.location, '--size', pool.vmSize,
       '--all', '--subscription', c.subscription);
     const sku = skuResults.find((entry: any) => entry.name === pool.vmSize);
@@ -679,7 +698,8 @@ export async function preflight(azure: Azure): Promise<void> {
     const vcpus = Number(sku.capabilities?.find((capability: any) => capability.name === 'vCPUs')?.value);
     if (!Number.isSafeInteger(vcpus) || vcpus < 1 || typeof sku.family !== 'string')
       throw new Failure('Azure did not report the configured AKS ' + pool.label + ' VM family and vCPU count.');
-    requiredByFamily.set(sku.family, (requiredByFamily.get(sku.family) ?? 0) + vcpus * pool.quotaCount);
+    const additionalNodes = Math.max(0, pool.maxCount - (existingPool?.count ?? 0));
+    requiredByFamily.set(sku.family, (requiredByFamily.get(sku.family) ?? 0) + vcpus * additionalNodes);
   }
   const usages = await azure.cli('vm', 'list-usage', '--location', c.location, '--subscription', c.subscription);
   for (const [family, required] of requiredByFamily) {

@@ -220,6 +220,7 @@ for (const state of ['missing', 'empty', 'legacy', 'identity', 'denied'] as cons
     });
     let inventories = 0;
     mock.method(azure, 'arm', async (method: string, resourcePath: string, _body: unknown, missing: boolean, api: string) => {
+      if (resourcePath.includes('/providers/Microsoft.ContainerService/managedClusters/')) return null;
       assert.deepEqual([method, resourcePath, missing, api], ['GET', c.base, true, '2022-09-01']);
       if (state === 'denied') throw new b.HttpFailure(403, 'Resource group metadata denied');
       return state === 'missing' ? null : { tags: azure.tags };
@@ -257,7 +258,8 @@ test('preflight reserves quota for the system-pool autoscale maximum', async () 
   c.stampConfig.publisherFederatedCredentials.push({
     name: 'publisher', issuer: 'https://token.actions.githubusercontent.com', subject: 'repo:example/repo:environment:publish',
   });
-  mock.method(azure, 'arm', async () => ({ tags: azure.tags }));
+  mock.method(azure, 'arm', async (_method: string, resourcePath: string) =>
+    resourcePath.includes('/providers/Microsoft.ContainerService/managedClusters/') ? null : ({ tags: azure.tags }));
   mock.method(azure, 'cli', async (...args: string[]) => {
     switch (args.slice(0, 2).join(' ')) {
       case 'account show': return { id: c.subscription };
@@ -277,6 +279,38 @@ test('preflight reserves quota for the system-pool autoscale maximum', async () 
     }
   });
   await assert.rejects(b.preflight(azure), /quota is insufficient/);
+});
+test('preflight reserves only additional quota for existing AKS pools', async () => {
+  const c = azure.c;
+  c.operator = SUB;
+  c.stampConfig.publisherFederatedCredentials.push({
+    name: 'publisher', issuer: 'https://token.actions.githubusercontent.com', subject: 'repo:example/repo:environment:publish',
+  });
+  const profiles = [c.stampConfig.aks.systemPool, ...c.stampConfig.aks.userPools].map(pool => ({
+    name: pool.name, vmSize: pool.vmSize, count: pool.initialCount,
+  }));
+  mock.method(azure, 'arm', async (_method: string, resourcePath: string) => resourcePath.includes('/providers/Microsoft.ContainerService/managedClusters/')
+    ? { tags: azure.tags, properties: { agentPoolProfiles: profiles } } : ({ tags: azure.tags }));
+  mock.method(azure, 'cli', async (...args: string[]) => {
+    switch (args.slice(0, 2).join(' ')) {
+      case 'account show': return { id: c.subscription };
+      case 'provider show': return { registrationState: 'Registered' };
+      case 'aks get-versions': return {
+        values: [{ version: c.stampConfig.aks.version.split('.').slice(0, 2).join('.'),
+          patchVersions: { [c.stampConfig.aks.version]: {} } }],
+      };
+      case 'vm list-skus': {
+        const vmSize = args[args.indexOf('--size') + 1];
+        return [{ name: vmSize, family: 'testFamily', capabilities: [{ name: 'vCPUs', value: '1' }] }];
+      }
+      case 'vm list-usage': return [{ name: { value: 'testFamily' }, currentValue: 0, limit: 2 }];
+      case 'feature show': return { properties: { state: 'Registered' } };
+      case 'network vnet': return [];
+      case 'resource list': return [];
+      default: assert.fail('Unexpected Azure mutation or CLI command: ' + args.join(' '));
+    }
+  });
+  await b.preflight(azure);
 });
 test('shared stamped identity can be reused without replacing other stamp consumers', async () => {
   const c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_STAMP: '89151' });
