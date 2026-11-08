@@ -100,7 +100,7 @@ async function loadResults() {
   statusNode.textContent = 'Loading benchmark results…';
   bodyNode.innerHTML = '<tr><td class="empty" colspan="16">Loading…</td></tr>';
   try {
-    const { asyncBufferFromUrl, parquetReadObjects } = await import('https://cdn.jsdelivr.net/npm/hyparquet@1.32.0/src/hyparquet.min.js');
+    const { asyncBufferFromUrl, parquetReadObjects } = await import('https://cdn.jsdelivr.net/npm/hyparquet@1.32.0/+esm');
     const file = await asyncBufferFromUrl({ url: resultUrl });
     const rows = await parquetReadObjects({ file, columns });
     const sorted = rows.sort((a, b) => (number(a.replicas) ?? 0) - (number(b.replicas) ?? 0)
