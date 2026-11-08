@@ -18,7 +18,7 @@ test('loads the approved resource group, stamp and AKS baseline from YAML', () =
   assert.equal(defaults.aks.network.vnetIpv4Cidr, config.aks.network.vnetIpv4Cidr);
   assert.deepEqual(config.aks.userPools.map(pool => [pool.name, pool.initialCount, pool.minCount, pool.maxCount]),
     [['benchd64', 0, 0, 1], ['benche64', 0, 0, 1]]);
-  assert.equal(config.aks.network.dnsServiceIp, '10.242.0.10');
+  assert.equal(config.aks.network.dnsServiceIp, '10.247.0.10');
   assert.equal(config.storageReadLogDestination, 'storage');
   assert.equal(defaultStampConfig().storageReadLogDestination, 'log-analytics');
   assert.throws(() => parseStampConfig(example.replace('storageReadLogDestination: storage', 'storageReadLogDestination: metrics')), /invalid/);

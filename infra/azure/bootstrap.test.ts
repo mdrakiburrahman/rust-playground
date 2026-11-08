@@ -268,7 +268,7 @@ test('preflight reserves quota for the system-pool autoscale maximum', async () 
         const vmSize = args[args.indexOf('--size') + 1];
         return [{ name: vmSize, family: 'testFamily', capabilities: [{ name: 'vCPUs', value: '1' }] }];
       }
-      case 'vm list-usage': return [{ name: { value: 'testFamily' }, currentValue: 0, limit: 7 }];
+      case 'vm list-usage': return [{ name: { value: 'testFamily' }, currentValue: 0, limit: 4 }];
       case 'feature show': return { properties: { state: 'Registered' } };
       case 'network vnet': return [];
       default: assert.fail('Unexpected Azure mutation or CLI command: ' + args.join(' '));
