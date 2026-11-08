@@ -36,15 +36,15 @@ const NAME = /^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$/;
 const FIC_NAME = /^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$/;
 const DEFAULT_AKS: StampConfig['aks'] = {
   version: '1.35.6', skuTier: 'Free', namespace: 'arrow-collector', serviceAccount: 'arrow-collector',
-  systemPool: { name: 'systempool', vmSize: 'Standard_D8s_v6', initialCount: 3, minCount: 3, maxCount: 6, maxPods: 250, availabilityZones: ['1', '2', '3'] },
+  systemPool: { name: 'systempool', vmSize: 'Standard_D8ds_v6', initialCount: 3, minCount: 3, maxCount: 3, maxPods: 250, availabilityZones: ['1', '2', '3'] },
   userPools: [
     { name: 'benchd64', vmSize: 'Standard_D64ds_v6', initialCount: 0, minCount: 0, maxCount: 1, maxPods: 30, availabilityZones: [] },
     { name: 'benche64', vmSize: 'Standard_E64ds_v6', initialCount: 0, minCount: 0, maxCount: 1, maxPods: 30, availabilityZones: [] },
   ],
-  network: { vnetIpv4Cidr: '10.240.0.0/16', vnetIpv6Cidr: 'fd20:240::/48', nodeSubnetIpv4Cidr: '10.240.0.0/24',
-    nodeSubnetIpv6Cidr: 'fd20:240:0:1::/64', apiServerSubnetIpv4Cidr: '10.240.1.0/28', podIpv4Cidr: '10.241.0.0/16',
-    podIpv6Cidr: 'fd20:240:1::/64', serviceIpv4Cidr: '10.242.0.0/16', serviceIpv6Cidr: 'fd20:240:2::/108',
-    dnsServiceIp: '10.242.0.10', egressIpv4IpTags: [], egressIpv6IpTags: [] },
+  network: { vnetIpv4Cidr: '10.245.0.0/16', vnetIpv6Cidr: 'fd20:245::/48', nodeSubnetIpv4Cidr: '10.245.0.0/24',
+    nodeSubnetIpv6Cidr: 'fd20:245:0:1::/64', apiServerSubnetIpv4Cidr: '10.245.1.0/28', podIpv4Cidr: '10.246.0.0/16',
+    podIpv6Cidr: 'fd20:245:1::/64', serviceIpv4Cidr: '10.247.0.0/16', serviceIpv6Cidr: 'fd20:245:2::/108',
+    dnsServiceIp: '10.247.0.10', egressIpv4IpTags: [], egressIpv6IpTags: [] },
 };
 
 function object(value: unknown, name: string): Record<string, unknown> {

@@ -11,7 +11,11 @@ test('loads the approved resource group, stamp and AKS baseline from YAML', () =
   assert.equal(config.resourceGroup, 'arrow-collector-rg');
   assert.equal(config.location, 'eastus2');
   assert.equal(config.aks.version, '1.35.6');
-  assert.equal(config.aks.systemPool.vmSize, 'Standard_D8s_v6');
+  assert.equal(config.aks.systemPool.vmSize, 'Standard_D8ds_v6');
+  const defaults = defaultStampConfig();
+  assert.equal(defaults.aks.systemPool.vmSize, config.aks.systemPool.vmSize);
+  assert.equal(defaults.aks.systemPool.maxCount, config.aks.systemPool.maxCount);
+  assert.equal(defaults.aks.network.vnetIpv4Cidr, config.aks.network.vnetIpv4Cidr);
   assert.deepEqual(config.aks.userPools.map(pool => [pool.name, pool.initialCount, pool.minCount, pool.maxCount]),
     [['benchd64', 0, 0, 1], ['benche64', 0, 0, 1]]);
   assert.equal(config.aks.network.dnsServiceIp, '10.242.0.10');
@@ -32,16 +36,16 @@ test('validates zero-scaled benchmark user pools and rejects invalid pool config
 test('rejects invalid stamps, resource-group scope and network overlaps', () => {
   assert.throws(() => parseStampConfig(example.replace('stamp: 1', 'stamp: 0')), /stamp must be an integer/);
   assert.throws(() => parseStampConfig(example.replace('arrow-collector-rg', 'rust-playground')), /resourceGroup is invalid/);
-  assert.throws(() => parseStampConfig(example.replace('apiServerSubnetIpv4Cidr: 10.240.1.0/28',
-    'apiServerSubnetIpv4Cidr: 10.240.0.0/28')), /non-overlapping/);
-  assert.throws(() => parseStampConfig(example.replace('serviceIpv4Cidr: 10.242.0.0/16',
-    'serviceIpv4Cidr: 10.242.0.0/24')), /prefix 16\.\.16/);
-  assert.throws(() => parseStampConfig(example.replace('serviceIpv4Cidr: 10.242.0.0/16',
+  assert.throws(() => parseStampConfig(example.replace('apiServerSubnetIpv4Cidr: 10.245.1.0/28',
+    'apiServerSubnetIpv4Cidr: 10.245.0.0/28')), /non-overlapping/);
+  assert.throws(() => parseStampConfig(example.replace('serviceIpv4Cidr: 10.247.0.0/16',
+    'serviceIpv4Cidr: 10.247.0.0/24')), /prefix 16\.\.16/);
+  assert.throws(() => parseStampConfig(example.replace('serviceIpv4Cidr: 10.247.0.0/16',
     'serviceIpv4Cidr: 172.31.0.0/16')), /platform-reserved/);
-  assert.throws(() => parseStampConfig(example.replace('podIpv4Cidr: 10.241.0.0/16',
+  assert.throws(() => parseStampConfig(example.replace('podIpv4Cidr: 10.246.0.0/16',
     'podIpv4Cidr: 172.30.0.0/16')), /platform-reserved/);
-  assert.throws(() => parseStampConfig(example.replace('podIpv4Cidr: 10.241.0.0/16',
-    'podIpv4Cidr: 10.240.0.0/16')), /must not overlap/);
+  assert.throws(() => parseStampConfig(example.replace('podIpv4Cidr: 10.246.0.0/16',
+    'podIpv4Cidr: 10.245.0.0/16')), /must not overlap/);
 });
 
 test('bounds YAML and environment stamps to the Kusto cluster name limit', () => {
@@ -75,7 +79,7 @@ test('validates publisher federation and rejects IPv4 or IPv6 overlap with Azure
     'publisherFederatedCredentials:\n  - name: github-publish\n    issuer: https://token.actions.githubusercontent.com\n    subject: repo:org@123/project@456:environment:publish');
   const config = parseStampConfig(publisher);
   assert.equal(config.publisherFederatedCredentials[0]?.subject, 'repo:org@123/project@456:environment:publish');
-  assert.throws(() => assertNoStampNetworkOverlap(config, ['10.240.64.0/18']), /overlaps an existing Azure VNet/);
-  assert.throws(() => assertNoStampNetworkOverlap(config, ['fd20:240:2::/64']), /overlaps an existing Azure VNet/);
+  assert.throws(() => assertNoStampNetworkOverlap(config, ['10.245.64.0/18']), /overlaps an existing Azure VNet/);
+  assert.throws(() => assertNoStampNetworkOverlap(config, ['fd20:245:2::/64']), /overlaps an existing Azure VNet/);
   assert.doesNotThrow(() => assertNoStampNetworkOverlap(config, ['10.0.0.0/16', 'fd00:0:0040::/56']));
 });
