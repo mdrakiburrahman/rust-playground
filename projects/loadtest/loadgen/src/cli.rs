@@ -67,7 +67,7 @@ pub struct ObserveQapArgs {
     /// Optional explicit database.
     #[arg(long)]
     pub database: Option<String>,
-    /// External table names; omit for all 13 canonical Dataflow tables.
+    /// External table names; omit for the canonical Dataflow tables.
     #[arg(long = "table")]
     pub tables: Vec<String>,
     /// One deadline for authentication and every management request.

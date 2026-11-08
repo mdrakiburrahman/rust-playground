@@ -93,28 +93,28 @@ interface FixtureTable {
 
 function fixture() {
   const observed = 1_800_000_000_000;
+  const expected_tables = Array.from({ length: 13 }, (_, index) => 'dataflow_sqlserver_fixture_' + index);
   return {
-    observed_unix_ms: observed, backend: 'native-qap', mode: 'local',
-    tables: Object.fromEntries<FixtureTable>(['dataflow'].flatMap(pool => Array.from({ length: 13 }, (_, index) => [
-      `${pool}_sqlserver_fixture_${index}`, {
-        available: true, statistics: {
-          AccelerationCompletePercentage: 80 + index, AccelerationPendingDataFilesCount: index,
-          HotSize: 1024, LastUpdatedDateTime: new Date(observed - (index + 1) * 1000).toISOString(),
-        }, state: { is_healthy: index !== 0 },
-      },
-    ] as const))),
+    observed_unix_ms: observed, backend: 'native-qap', mode: 'local', expected_tables,
+    tables: Object.fromEntries<FixtureTable>(expected_tables.map((name, index) => [name, {
+      available: true, statistics: {
+        AccelerationCompletePercentage: 80 + index, AccelerationPendingDataFilesCount: index,
+        HotSize: 1024, LastUpdatedDateTime: new Date(observed - (index + 1) * 1000).toISOString(),
+      }, state: { is_healthy: index !== 0 },
+    }])),
   };
 }
 
-test('QAP gauges aggregate all 13 Dataflow tables without table, tenant, file or run labels', () => {
-  const result = qapPoints(fixture());
+test('QAP gauges aggregate all expected Dataflow tables without table, tenant, file or run labels', () => {
+  const value = fixture();
+  const result = qapPoints(value);
   for (const pool of ['dataflow']) {
     const values = Object.fromEntries(result.points.filter(point => point.pool === pool).map(point => [point.name, point.value]));
     assert.equal(values.qap_completion_percent, 80);
     assert.equal(values.qap_pending_artifacts, 78);
-    assert.equal(values.qap_cached_bytes, 13 * 1024);
+    assert.equal(values.qap_cached_bytes, value.expected_tables.length * 1024);
     assert.equal(values.qap_unhealthy_catalogs, 1);
-    assert.equal(values.qap_lag_seconds, 13);
+    assert.equal(values.qap_lag_seconds, value.expected_tables.length);
     assert.equal(values.qap_observation_complete, 1);
   }
 });
@@ -128,7 +128,21 @@ test('QAP partial/missing measurements never become zero or reuse previous aggre
   assert(!points.some(point => point.pool === 'dataflow' && ['qap_cached_bytes', 'qap_unhealthy_catalogs', 'qap_lag_seconds'].includes(point.name)));
   assert.equal(points.find(point => point.pool === 'dataflow' && point.name === 'qap_observation_complete')?.value, 0);
   delete value.tables.dataflow_sqlserver_fixture_3;
-  assert.throws(() => qapPoints(value), /all 13/u);
+  assert.throws(() => qapPoints(value), /expected Dataflow source-table set/u);
+});
+
+test('QAP rejects retired Direct tables and any missing retained Dataflow table', () => {
+  const missing = fixture();
+  delete missing.tables.dataflow_sqlserver_fixture_12;
+  assert.throws(() => qapPoints(missing), /expected Dataflow source-table set/u);
+
+  const retired = fixture();
+  retired.tables.direct_sqlserver_wait_stats = retired.tables[retired.expected_tables[0]];
+  assert.throws(() => qapPoints(retired), /expected Dataflow source-table set/u);
+
+  const retiredExpected = fixture();
+  retiredExpected.expected_tables.push('direct_sqlserver_wait_stats');
+  assert.throws(() => qapPoints(retiredExpected), /unique Dataflow SQL Server source tables/u);
 });
 
 test('QAP rejects nonfinite percentages, future timestamps and malformed provenance', () => {
