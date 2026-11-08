@@ -44,8 +44,28 @@ validation; it is not a production reset or an unrestricted purge command.
 
 Each DFE core owns an isolated Quiver directory. Paths and byte counts depend
 on the run; historical Direct demo transcripts and screenshots are not evidence
-for current DFE images. There is no supported `quiver-cli` inspection or
-mutation command in this repository.
+for current DFE images. Use [`quiver-cli`](../../bin/quiver-cli/README.md) to
+generate a catalog-typed local fixture or inspect DFE Quiver directories. Its
+read-only commands can open loadtest storage; its writer commands only operate
+on directories marked by `generate`.
+
+## Local CLI inspection
+
+[`quiver-cli`](../../bin/quiver-cli/README.md) can generate a catalog-typed
+fixture and inspect existing loadtest DFE storage without changing it:
+
+```bash
+npx nx run quiver-cli:run -- generate --catalog-endpoint memory onelake/quiver-demo
+npx nx run quiver-cli:run -- tree onelake/quiver-demo
+npx nx run quiver-cli:run -- segments onelake/quiver-demo
+npx nx run quiver-cli:run -- wal onelake/quiver-demo
+```
+
+Generation uses the current loadtest schema seed through the catalog's in-memory
+store. Omit `--catalog-endpoint memory` to query the live Schema Catalog. The
+read-only commands also accept a loadtest Quiver directory. Only use `consume`,
+`crash`, or `recover` on a directory created by this CLI; its marker guard
+rejects collector-owned storage.
 
 ## WAL durability and recovery
 
