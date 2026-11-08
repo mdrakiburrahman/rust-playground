@@ -15,12 +15,22 @@ struct Args {
     rows: usize,
     #[arg(long, default_value_t = 4)]
     concurrency: usize,
+    #[arg(long)]
+    table: Option<String>,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
     let runtime = tokio::runtime::Runtime::new()?;
-    let table_count = if args.concurrency == 1 {
+    let table_count = if let Some(table) = &args.table {
+        runtime.block_on(dmv::send_table_with_concurrency(
+            &args.endpoint,
+            &args.client_id,
+            table,
+            args.rows,
+            args.concurrency,
+        ))?
+    } else if args.concurrency == 1 {
         runtime.block_on(dmv::send(&args.endpoint, &args.client_id, args.rows))?
     } else {
         runtime.block_on(dmv::send_with_concurrency(

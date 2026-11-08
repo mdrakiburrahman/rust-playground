@@ -97,6 +97,34 @@ pub async fn send(endpoint: &str, client_id: &str, rows: usize) -> Result<usize>
 
 /// Registers DMV tables and uploads one Arrow batch per table with bounded concurrency.
 pub async fn send_with_concurrency(endpoint: &str, client_id: &str, rows: usize, concurrency: usize) -> Result<usize> {
+    send_tables_with_concurrency(endpoint, client_id, rows, concurrency, tables()?).await
+}
+
+/// Registers and uploads one named DMV table for a replica-pinned OAT workload.
+pub async fn send_table_with_concurrency(
+    endpoint: &str,
+    client_id: &str,
+    table_name: &str,
+    rows: usize,
+    concurrency: usize,
+) -> Result<usize> {
+    send_tables_with_concurrency(endpoint, client_id, rows, concurrency, vec![table_named(table_name)?]).await
+}
+
+fn table_named(table_name: &str) -> Result<DmvTable> {
+    tables()?
+        .into_iter()
+        .find(|table| table.identity.table().eq_ignore_ascii_case(table_name))
+        .with_context(|| format!("unknown DMV table {table_name:?}"))
+}
+
+async fn send_tables_with_concurrency(
+    endpoint: &str,
+    client_id: &str,
+    rows: usize,
+    concurrency: usize,
+    tables: Vec<DmvTable>,
+) -> Result<usize> {
     if rows == 0 {
         bail!("rows must be positive");
     }
@@ -111,7 +139,6 @@ pub async fn send_with_concurrency(endpoint: &str, client_id: &str, rows: usize,
         .with_context(|| format!("connect {endpoint}"))?;
     let mut client = FlightServiceClient::new(channel.clone());
     let now_micros = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros())?;
-    let tables = tables()?;
     let count = tables.len();
     let mut uploads = Vec::with_capacity(count);
     for table in tables {
@@ -226,6 +253,14 @@ mod tests {
             assert!(customers.iter().all(|value| value == Some("client-a")));
             assert_eq!(batch.num_rows(), 3);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn selects_a_single_dmv_table_case_insensitively() -> Result<()> {
+        let table = table_named("DMV_WAIT_STATS")?;
+        assert_eq!(table.identity.table(), "dmv_wait_stats");
+        assert!(table_named("not_a_dmv_table").is_err());
         Ok(())
     }
 

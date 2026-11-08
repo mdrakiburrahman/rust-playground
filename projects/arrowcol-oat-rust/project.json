@@ -1,0 +1,38 @@
+{
+  "name": "arrowcol-oat-rust",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "application",
+  "sourceRoot": "projects/arrowcol-oat-rust/src",
+  "implicitDependencies": ["arrow-deltalake", "collector-chain"],
+  "targets": {
+    "format": {
+      "executor": "nx:run-commands",
+      "options": {"command": "cargo fmt --package arrowcol-oat-rust"}
+    },
+    "format-check": {
+      "executor": "nx:run-commands",
+      "options": {"command": "cargo fmt --package arrowcol-oat-rust -- --check"}
+    },
+    "lint": {
+      "executor": "nx:run-commands",
+      "options": {"command": "cargo clippy --locked --package arrowcol-oat-rust --all-targets -- -D warnings"}
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "options": {"command": "cargo test --locked --package arrowcol-oat-rust"}
+    },
+    "build": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {"command": "cargo build --locked --package arrowcol-oat-rust"}
+    },
+    "run": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "cargo run --locked --package arrowcol-oat-rust --bin arrowcol-oat-server",
+        "forwardAllArgs": true
+      }
+    }
+  }
+}
