@@ -14,15 +14,25 @@ use crate::dfe::DfeManifest;
 
 pub(crate) const CAPACITY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 pub(crate) const DFE_SEGMENT_MAX_OPEN: Duration = Duration::from_secs(1);
+pub(crate) const MANUAL_SEGMENT_MAX_OPEN: Duration = Duration::from_secs(3_600);
+pub(crate) const MAX_CRASH_BUNDLES: usize = 1_000;
 pub(crate) const SUBSCRIBER: &str = "durable-buffer";
 
 pub(crate) async fn open(dir: &Path) -> Result<Arc<QuiverEngine>> {
+    open_with_segment_timeout(dir, DFE_SEGMENT_MAX_OPEN).await
+}
+
+pub(crate) async fn open_for_crash(dir: &Path) -> Result<Arc<QuiverEngine>> {
+    open_with_segment_timeout(dir, MANUAL_SEGMENT_MAX_OPEN).await
+}
+
+async fn open_with_segment_timeout(dir: &Path, segment_timeout: Duration) -> Result<Arc<QuiverEngine>> {
     let mut config = QuiverConfig {
         data_dir: dir.join("core_0"),
         ..QuiverConfig::default()
     };
     config.wal.flush_interval = Duration::ZERO;
-    config.segment.max_open_duration = DFE_SEGMENT_MAX_OPEN;
+    config.segment.max_open_duration = segment_timeout;
     let budget = DiskBudget::for_config(CAPACITY_BYTES, &config, RetentionPolicy::Backpressure)?;
     let engine = QuiverEngineBuilder::new(config)
         .with_budget(Arc::new(budget))

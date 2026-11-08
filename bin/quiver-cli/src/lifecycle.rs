@@ -18,7 +18,7 @@ use serde_json::Value;
 use crate::data::{self, BUILTIN_CSV_PATH, BenchmarkTable};
 use crate::dfe::DfeRecordBundle;
 use crate::dir::{DEFAULT_DIR, MARKER_FILE, require_cli_dir, segment_files};
-use crate::engine::{self, SUBSCRIBER};
+use crate::engine::{self, MAX_CRASH_BUNDLES, SUBSCRIBER};
 use crate::format::{self, Align, Table};
 
 #[derive(Args)]
@@ -36,7 +36,7 @@ pub(crate) struct CrashArgs {
     /// Quiver data directory created by `quiver-cli generate`.
     #[arg(default_value = DEFAULT_DIR)]
     pub(crate) dir: PathBuf,
-    /// Bundles the child process persists before it is killed.
+    /// Bundles the child persists before it is killed (1-1000; no timed segment seal).
     #[arg(long, default_value_t = 5)]
     pub(crate) bundles: usize,
 }
@@ -103,8 +103,8 @@ fn segment_name(seq: u64) -> String {
 
 pub(crate) fn crash(args: &CrashArgs) -> Result<()> {
     require_cli_dir(&args.dir)?;
-    if args.bundles == 0 {
-        bail!("--bundles must be positive");
+    if !(1..=MAX_CRASH_BUNDLES).contains(&args.bundles) {
+        bail!("--bundles must be between 1 and {MAX_CRASH_BUNDLES}");
     }
     let mut child = Command::new(std::env::current_exe()?)
         .arg("crash-child")
@@ -158,7 +158,7 @@ pub(crate) async fn crash_child(args: &CrashArgs) -> Result<()> {
         .and_then(|rows| usize::try_from(rows).ok())
         .context("marker rows_per_bundle")?;
     let batches = data::read_csv(&table.arrow, csv.as_deref(), rows_per_bundle)?;
-    let engine = engine::open(&args.dir).await?;
+    let engine = engine::open_for_crash(&args.dir).await?;
     let mut stdout = std::io::stdout();
     for (ordinal, batch) in batches.iter().cycle().take(args.bundles).enumerate() {
         engine
