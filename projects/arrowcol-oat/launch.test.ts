@@ -108,7 +108,7 @@ test('changed source, failed builds and missing artifact metadata cannot start a
 test('external --server submits unchanged configuration without building or attributing that server', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-external-server-'));
   const configPath = path.join(directory, 'config.json');
-  const config = { platform: { kind: 'aks' } };
+  const config = { platform: { kind: 'local' } };
   await writeFile(configPath, JSON.stringify(config));
   let posted: unknown;
   const server = createServer(async (request, response) => {
