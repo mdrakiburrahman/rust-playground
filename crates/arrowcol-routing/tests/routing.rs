@@ -668,6 +668,59 @@ async fn fresh_oat_router_does_not_replace_a_missing_bound_owner() {
 }
 
 #[tokio::test]
+async fn oat_forwarding_rechecks_authority_after_upstream_selection() {
+    let (store, _, _) = seeded_store().await;
+    let engine_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);
+    let engine = RoutingEngine::new(engine_store, oat_policy(OAT_RUN_RESTART))
+        .unwrap_or_else(|error| panic!("create OAT engine: {error}"));
+    initialize_memory_oat_pin(&engine, OAT_RUN_RESTART, millis(100_001), millis(200_000)).await;
+    let selected = engine
+        .route_ingest_for_run(&metadata(), OAT_RUN_RESTART, millis(200_000), millis(100_002))
+        .await
+        .unwrap_or_else(|error| panic!("select pinned upstream: {error}"));
+    assert_eq!(
+        engine
+            .revalidate_run_assignment(OAT_RUN_RESTART, &selected, millis(100_003))
+            .await
+            .unwrap_or_else(|error| panic!("revalidate unchanged upstream: {error}")),
+        selected
+    );
+    let before = store.operation_counts();
+    let mut changed_endpoint = selected.clone();
+    changed_endpoint.flight_endpoint.set_port(1);
+    assert!(
+        engine
+            .revalidate_run_assignment(OAT_RUN_RESTART, &changed_endpoint, millis(100_003))
+            .await
+            .is_err()
+    );
+    store.set_available(false);
+    assert!(
+        engine
+            .revalidate_run_assignment(OAT_RUN_RESTART, &selected, millis(100_003))
+            .await
+            .is_err()
+    );
+    store.set_available(true);
+    assert!(
+        store
+            .remove_run_table_pin_for_test(OAT_RUN_RESTART, &LeaseKey::new(ImplementationPool::Dataflow, table()))
+            .await
+    );
+    assert!(
+        engine
+            .revalidate_run_assignment(OAT_RUN_RESTART, &selected, millis(100_003))
+            .await
+            .is_err()
+    );
+    assert_eq!(store.operation_counts().claim_lease, before.claim_lease);
+    assert_eq!(
+        store.operation_counts().bind_initial_run_table_pin,
+        before.bind_initial_run_table_pin
+    );
+}
+
+#[tokio::test]
 async fn fresh_oat_router_rejects_missing_bound_owner_even_with_a_valid_replacement_lease() {
     let (store, first, second) = seeded_store().await;
     let key = LeaseKey::new(ImplementationPool::Dataflow, table());

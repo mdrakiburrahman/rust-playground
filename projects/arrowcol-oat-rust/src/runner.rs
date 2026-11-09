@@ -1320,7 +1320,11 @@ async fn run_matrix(config: &OatConfig, orchestration_id: &str, state: &AppState
                 return Err(run_error.context(format!("matrix-cell platform cleanup also failed: {cleanup_error:#}")));
             }
         };
+        let pinning_failed = cell_rows.iter().any(|row| !row.pinning_ok);
         results.append(&mut cell_rows);
+        if pinning_failed {
+            break;
+        }
     }
     Ok(results)
 }
@@ -1555,16 +1559,23 @@ async fn run_matrix_cell(
         "tables": &assigned_tables,
         "warmup_seconds": config.warmup_seconds,
     }))?;
-    let qap = observe_qap(
-        &platform.qap_endpoint(config),
-        &platform.qap_observation_mode(),
-        &platform.qap_database(config)?,
-        run_id,
-        &client_run.qap_tables,
-        config.qap_timeout_seconds,
-    )
-    .await?;
-    let metrics = platform.sample_resources(config).await?;
+    let pinning_ok = client_run.pinning.violation.is_none();
+    let (qap, metrics) = if pinning_ok {
+        (
+            observe_qap(
+                &platform.qap_endpoint(config),
+                &platform.qap_observation_mode(),
+                &platform.qap_database(config)?,
+                run_id,
+                &client_run.qap_tables,
+                config.qap_timeout_seconds,
+            )
+            .await?,
+            Some(platform.sample_resources(config).await?),
+        )
+    } else {
+        (QapMetrics::default(), None)
+    };
     let mut rows = Vec::with_capacity(assigned_tables.len());
     for table in assigned_tables {
         let client = client_run
@@ -1572,7 +1583,6 @@ async fn run_matrix_cell(
             .get(&table)
             .with_context(|| format!("DMV client did not report measurements for {table}"))?;
         let owner = client_run.pinning.owners.get(&canonical_table_key(&table));
-        let pinning_ok = client_run.pinning.violation.is_none();
         rows.push(OatResult {
             run_id: run_id.to_owned(),
             mode: match platform.kind() {
@@ -1603,8 +1613,8 @@ async fn run_matrix_cell(
             rows: client.rows,
             duration_ms: client.duration_ms,
             rows_per_second: client.rows_per_second,
-            cpu_millicores: Some(metrics.cpu_millicores),
-            memory_bytes: Some(metrics.memory_bytes),
+            cpu_millicores: metrics.map(|metrics| metrics.cpu_millicores),
+            memory_bytes: metrics.map(|metrics| metrics.memory_bytes),
             qap,
         });
     }
@@ -1643,6 +1653,66 @@ struct PinningReport {
 }
 
 async fn run_clients(
+    config: &OatConfig,
+    project_run_id: &str,
+    tables: &[String],
+    platform: &mut dyn Platform,
+) -> Result<ClientRun> {
+    match run_clients_inner(config, project_run_id, tables, platform).await {
+        Ok(report) => Ok(report),
+        Err(error) => {
+            let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?;
+            let endpoint = platform.router_metrics_endpoint(config)?;
+            let sample = sample_table_owners(&client, &endpoint, tables).await;
+            let Some(pinning) = failed_client_pinning_report(&error, sample, tables) else {
+                return Err(error);
+            };
+            tracing::error!(run_id = project_run_id, error = %error, "OAT pinning violation; discarding incomplete measurements");
+            Ok(ClientRun {
+                metrics: tables
+                    .iter()
+                    .map(|table| {
+                        (
+                            table.clone(),
+                            ClientMetrics {
+                                rows: 0,
+                                duration_ms: 0,
+                                rows_per_second: 0.0,
+                            },
+                        )
+                    })
+                    .collect(),
+                pinning,
+                qap_tables: Vec::new(),
+            })
+        }
+    }
+}
+
+fn failed_client_pinning_report(
+    error: &anyhow::Error,
+    sample: Result<HashMap<String, Vec<String>>>,
+    tables: &[String],
+) -> Option<PinningReport> {
+    let mut owners = HashMap::new();
+    let detail = format!("{error:#}");
+    let violation = match sample {
+        Err(cause) => Some(format!("ownership verification after client failure failed: {cause:#}")),
+        Ok(sample) => check_owner_sample(tables, &sample, &mut owners).or_else(|| {
+            tables
+                .iter()
+                .find(|table| !owners.contains_key(&canonical_table_key(table)))
+                .map(|table| format!("table {table} has no active ArrowCol owner after client failure"))
+        }),
+    }
+    .or_else(|| detail.contains("pinning_violation").then(|| detail.clone()))?;
+    Some(PinningReport {
+        owners,
+        violation: Some(format!("{violation}; client failure: {detail}")),
+    })
+}
+
+async fn run_clients_inner(
     config: &OatConfig,
     project_run_id: &str,
     tables: &[String],
@@ -1950,7 +2020,7 @@ async fn run_clients(
         violation.get_or_insert_with(|| format!("{error:#}"));
     }
     for table in tables {
-        if !owners.contains_key(table) {
+        if !owners.contains_key(&canonical_table_key(table)) {
             violation.get_or_insert_with(|| format!("table {table} never had exactly one observed active owner"));
         }
     }
@@ -2124,6 +2194,22 @@ async fn sample_table_owners(
 }
 
 fn parse_owner_metrics(body: &str, tables: &[String]) -> Result<HashMap<String, Vec<String>>> {
+    for line in body
+        .lines()
+        .filter(|line| line.starts_with("arrowcol_router_failures_total{"))
+    {
+        let close = line.find('}').context("malformed routing failure metric labels")?;
+        let labels = parse_metric_labels(&line["arrowcol_router_failures_total{".len()..close])?;
+        if labels.get("reason").map(String::as_str) == Some("pinning_violation") {
+            let count: u64 = line[close + 1..]
+                .trim()
+                .parse()
+                .context("invalid pinning failure counter")?;
+            if count > 0 {
+                bail!("pinning_violation: router rejected {count} requests for immutable ownership loss");
+            }
+        }
+    }
     let mut owners = tables
         .iter()
         .map(|table| (canonical_table_key(table), Vec::new()))
@@ -4894,6 +4980,49 @@ fn platform_host_label(kind: crate::config::OatMode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_clients_preserve_pinning_evidence_without_masking_unrelated_failures() -> Result<()> {
+        let tables = vec!["SQLServer_Wait_Stats".to_owned()];
+        let healthy = HashMap::from([("sqlserver_wait_stats".to_owned(), vec!["collector-a".to_owned()])]);
+        let unrelated = anyhow::anyhow!("DMV source connection failed");
+        assert!(failed_client_pinning_report(&unrelated, Ok(healthy.clone()), &tables).is_none());
+        let missing = failed_client_pinning_report(&unrelated, Ok(HashMap::new()), &tables)
+            .context("missing owner must be reported")?;
+        assert!(
+            missing
+                .violation
+                .as_deref()
+                .is_some_and(|message| message.contains("no active ArrowCol"))
+        );
+        let upstream = anyhow::anyhow!("gRPC failed: pinning_violation: pinned collector became unavailable");
+        let failed = failed_client_pinning_report(&upstream, Ok(healthy), &tables)
+            .context("upstream pinning failure must survive a stale owner gauge")?;
+        assert_eq!(
+            failed.owners.get("sqlserver_wait_stats").map(String::as_str),
+            Some("collector-a")
+        );
+        assert!(
+            failed
+                .violation
+                .as_deref()
+                .is_some_and(|message| message.contains("pinning_violation"))
+        );
+
+        let metrics =
+            "arrowcol_router_failures_total{operation=\"doput\",pool=\"dataflow\",reason=\"pinning_violation\"} 1\n";
+        assert!(parse_owner_metrics(metrics, &tables).is_err());
+        assert!(parse_owner_metrics(&metrics.replace("} 1", "} 0"), &tables).is_ok());
+        let authority_loss = failed_client_pinning_report(&unrelated, parse_owner_metrics(metrics, &tables), &tables)
+            .context("router rejection counter must be retained")?;
+        assert!(
+            authority_loss
+                .violation
+                .as_deref()
+                .is_some_and(|message| message.contains("router rejected 1"))
+        );
+        Ok(())
+    }
     include!("runner_publication_tests.rs");
 
     fn router_yaml_for_pin_test(run_id: &str) -> String {

@@ -247,6 +247,53 @@ impl RoutingEngine {
         self.assignment_for_run_pin(&pin, now).await
     }
 
+    /// Revalidates an already selected OAT upstream immediately before forwarding.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on authority loss, expiry, or a changed owner/endpoint.
+    /// Never replaces the selected upstream with a different process.
+    pub async fn revalidate_run_assignment(
+        &self,
+        run_id: &str,
+        assignment: &RouteAssignment,
+        now: UnixMillis,
+    ) -> RoutingResult<RouteAssignment> {
+        if self.policy.oat_run_id.as_deref() != Some(run_id) {
+            return Err(RoutingError::new(
+                RoutingErrorKind::InvalidConfiguration,
+                "OAT run ID is not authorized by this router configuration",
+            ));
+        }
+        let selected = assignment
+            .lease
+            .as_ref()
+            .ok_or_else(|| RoutingError::new(RoutingErrorKind::Conflict, "OAT ingest assignment has no table lease"))?;
+        let pin = self
+            .store
+            .get_run_table_pin(run_id, &selected.key, now)
+            .await?
+            .ok_or_else(|| {
+                RoutingError::new(
+                    RoutingErrorKind::Conflict,
+                    "immutable OAT pin disappeared before forwarding",
+                )
+            })?;
+        let current = self.assignment_for_run_pin(&pin, now).await?;
+        if current.instance_id != assignment.instance_id
+            || current.flight_endpoint != assignment.flight_endpoint
+            || pin.holder_instance_id != selected.holder_instance_id
+            || pin.lease_id != selected.lease_id
+            || pin.fencing_epoch != selected.fencing_epoch
+        {
+            return Err(RoutingError::new(
+                RoutingErrorKind::Conflict,
+                "immutable OAT upstream changed after selection",
+            ));
+        }
+        Ok(current)
+    }
+
     /// Initializes or resumes the trusted, complete run/table pin set.
     ///
     /// This operation is reserved for the bounded migrator-authenticated setup
