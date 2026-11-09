@@ -1,14 +1,136 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, unlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { pathToFileURL } from 'node:url';
-import { launchOat, readOatConfigForMode, resolveOatConfigPath, sendViewerFile, startLocalViewer } from './launch.js';
+import {
+  buildOwnedServer, launchOat, main, readOatConfigForMode, resolveOatConfigPath, sendViewerFile,
+  startLocalServer, startLocalViewer, stopLocalServer,
+} from './launch.js';
 
 const status = (state: 'queued' | 'running' | 'succeeded') => ({
   id: 'run-a', state, progress: state, result_count: state === 'succeeded' ? 2 : 0, error: null,
+});
+
+async function ownedBuildFixture(options: {
+  dirty?: string; afterStatus?: string; afterSha?: string; noArtifact?: boolean;
+  duplicateArtifact?: boolean; buildCode?: number;
+} = {}) {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-owned-build-'));
+  const executable = path.join(directory, 'built-server');
+  await writeFile(executable, '#!/usr/bin/env node\nprocess.exit(83);\n', { mode: 0o700 });
+  const sha = 'a'.repeat(40);
+  const commands: string[][] = [];
+  let headReads = 0, statusReads = 0;
+  const runner = async (command: string[], _timeout: number, cwd?: string) => {
+    commands.push([...command]);
+    if (command[0] === 'git') {
+      const stdout = command[1] === 'rev-parse'
+        ? (headReads++ ? options.afterSha ?? sha : sha)
+        : (statusReads++ ? options.afterStatus ?? options.dirty ?? '' : options.dirty ?? '');
+      return { returncode: 0, stdout, stderr: '' };
+    }
+    assert.equal(command[0], 'cargo');
+    await writeFile(executable, `#!/usr/bin/env node
+const http = require('node:http');
+const address = process.argv[process.argv.indexOf('--listen') + 1];
+const [host, port] = address.split(':');
+http.createServer((_request, response) => {
+  response.setHeader('content-type', 'application/json');
+  response.end(JSON.stringify({ status: 'ok', git_sha: process.env.GIT_SHA }));
+}).listen(Number(port), host);
+`, { mode: 0o700 });
+    const artifact = {
+      reason: 'compiler-artifact', manifest_path: path.join(cwd!, 'projects/arrowcol-oat-rust/Cargo.toml'),
+      target: { name: 'arrowcol-oat-rust', kind: ['bin'] }, executable, fresh: false,
+    };
+    return {
+      returncode: options.buildCode ?? 0,
+      stdout: options.noArtifact ? '' : `${JSON.stringify(artifact)}\n`.repeat(options.duplicateArtifact ? 2 : 1),
+      stderr: options.buildCode ? 'synthetic build failure' : '',
+    };
+  };
+  return { directory, executable, sha, commands, runner };
+}
+
+test('owned server starts the exact successful Cargo artifact, not a stale prebuilt path', async () => {
+  const fixture = await ownedBuildFixture();
+  let server: Awaited<ReturnType<typeof startLocalServer>> | undefined;
+  const callerSha = process.env.GIT_SHA;
+  process.env.GIT_SHA = 'unverified-caller-revision';
+  try {
+    server = await startLocalServer(fixture.runner);
+    assert.deepEqual(await (await fetch(`${server.url}/healthz`)).json(), {
+      status: 'ok', git_sha: fixture.sha,
+    });
+    assert.deepEqual(fixture.commands.find((command) => command[0] === 'cargo'), [
+      'cargo', 'build', '--locked', '--package', 'arrowcol-oat-rust',
+      '--bin', 'arrowcol-oat-rust', '--message-format=json-render-diagnostics',
+    ]);
+  } finally {
+    if (callerSha === undefined) delete process.env.GIT_SHA;
+    else process.env.GIT_SHA = callerSha;
+    if (server) await stopLocalServer(server.child);
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('dirty owned builds retain unknown provenance instead of asserting a clean commit', async () => {
+  const fixture = await ownedBuildFixture({ dirty: ' M projects/arrowcol-oat/launch.ts\n' });
+  try {
+    const build = await buildOwnedServer(process.cwd(), fixture.runner);
+    assert.equal(build.gitSha, 'unknown');
+    assert.equal(build.executable, fixture.executable);
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('changed source, failed builds and missing artifact metadata cannot start an attributed server', async () => {
+  for (const [options, expected] of [
+    [{ afterSha: 'b'.repeat(40) }, /source changed/],
+    [{ afterStatus: ' M projects/arrowcol-oat/launch.ts\n' }, /source changed/],
+    [{ noArtifact: true }, /exactly one built OAT server/],
+    [{ duplicateArtifact: true }, /exactly one built OAT server/],
+    [{ buildCode: 101 }, /synthetic build failure/],
+  ] as const) {
+    const fixture = await ownedBuildFixture(options);
+    try {
+      await assert.rejects(startLocalServer(fixture.runner), expected);
+    } finally {
+      await rm(fixture.directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test('external --server submits unchanged configuration without building or attributing that server', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-external-server-'));
+  const configPath = path.join(directory, 'config.json');
+  const config = { platform: { kind: 'aks' } };
+  await writeFile(configPath, JSON.stringify(config));
+  let posted: unknown;
+  const server = createServer(async (request, response) => {
+    let body = '';
+    for await (const chunk of request) body += chunk;
+    posted = JSON.parse(body);
+    response.setHeader('content-type', 'application/json');
+    response.end(JSON.stringify(status('succeeded')));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  try {
+    await main(['--config', configPath, '--server', `http://127.0.0.1:${address.port}`], async () => {
+      throw new Error('must not build or inspect source for an independently running server');
+    });
+    assert.deepEqual(posted, config);
+    assert.equal(await readFile(configPath, 'utf8'), JSON.stringify(config));
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test('posts the JSON config and polls until the server publishes results', async () => {

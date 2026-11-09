@@ -30,7 +30,7 @@ Schema version 2 keeps every existing column and adds run/platform and pinning m
 | `table_owner` | UTF-8 string | Nullable | Stable ArrowCol owner for this table. |
 | `pinning_ok` | Boolean | Required | True only when the owner remains valid and unchanged for the full experiment. |
 | `status` | UTF-8 string | Required | Result status; pinning violations use `pinning_violation`. |
-| `git_sha` | UTF-8 string | Required | Source revision used for the run, or `unknown` when unavailable. |
+| `git_sha` | UTF-8 string | Required | Owned-server build revision from a clean, unchanged Git checkout; `unknown` for uncommitted source. External servers retain their own provenance. |
 | `tunables_json` | UTF-8 string | Required | JSON object containing the experiment tunables. |
 
 The producer retains these original result columns:
