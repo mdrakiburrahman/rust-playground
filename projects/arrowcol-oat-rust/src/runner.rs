@@ -5595,7 +5595,7 @@ mod tests {
             .context("a UID conflict must fail closed without a success receipt")
             .err();
         let error = error.context("replacement namespace deletion unexpectedly succeeded")?;
-        assert!(error.to_string().contains("409 Conflict"));
+        assert!(format!("{error:#}").contains("409 Conflict"));
         Ok(())
     }
 
