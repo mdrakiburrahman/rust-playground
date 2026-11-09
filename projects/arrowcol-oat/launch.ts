@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createServer as createHttpServer } from 'node:http';
-import { readFile, realpath } from 'node:fs/promises';
+import { readFile, realpath, stat } from 'node:fs/promises';
 import { createServer as createTcpServer } from 'node:net';
 import { extname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -15,6 +15,16 @@ export interface OatRunStatus {
 
 type FetchLike = typeof fetch;
 type ProgressHandler = (status: OatRunStatus) => void;
+
+export interface LocalViewer {
+  url: string;
+  close(): Promise<void>;
+}
+
+interface LocalViewerConfig {
+  resultsPath: string;
+  siteRoot: string;
+}
 
 export async function launchOat(
   configPath: string,
@@ -104,11 +114,19 @@ export async function main(args: string[]): Promise<void> {
   );
   const configPath = option('--config') ?? positionalConfig;
   if (!configPath) {
-    throw new Error('Usage: npx arrowcol-oat --config <oat-config.json> --mode local|aks [--server URL] [--poll-ms N]');
+    throw new Error('Usage: npx arrowcol-oat --config <oat-config.json> [--mode local|aks] [--server URL] [--poll-ms N]; or --viewer-only --config <local-oat-config.json>');
   }
   const requestedServerUrl = option('--server');
-  const pollValue = Number(option('--poll-ms') ?? 1000);
   const mode = option('--mode');
+  const viewerOnly = args.includes('--viewer-only');
+  if (viewerOnly) {
+    if (requestedServerUrl || mode !== undefined || args.includes('--poll-ms')) {
+      throw new Error('--viewer-only only supports --config');
+    }
+    await keepLocalViewerOpen(await startLocalViewer(configPath));
+    return;
+  }
+  const pollValue = Number(option('--poll-ms') ?? 1000);
   if (mode !== undefined && mode !== 'local' && mode !== 'aks') throw new Error('--mode must be local or aks');
   if (!Number.isSafeInteger(pollValue) || pollValue < 1) {
     throw new Error('Expected values after --server and --poll-ms');
@@ -131,17 +149,47 @@ export async function main(args: string[]): Promise<void> {
   await maybeServeLocalViewer(configPath, mode);
 }
 
+export async function startLocalViewer(configPath: string): Promise<LocalViewer> {
+  const config = await readLocalViewerConfig(configPath);
+  if (!config) {
+    throw new Error('--viewer-only requires platform.kind=local and website_url to be a file:// URL');
+  }
+  try {
+    const resultFile = await stat(config.resultsPath);
+    if (!resultFile.isFile()) throw new Error(`Local OAT results URL is not a file: ${config.resultsPath}`);
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
+      throw new Error(`Local OAT results file does not exist: ${config.resultsPath}`);
+    }
+    throw error;
+  }
+  return createLocalViewer(config);
+}
+
 async function maybeServeLocalViewer(configPath: string, mode?: 'local' | 'aks'): Promise<void> {
+  const config = await readLocalViewerConfig(configPath, mode);
+  if (!config) return;
+  await keepLocalViewerOpen(await createLocalViewer(config));
+}
+
+async function readLocalViewerConfig(
+  configPath: string,
+  mode?: 'local' | 'aks',
+): Promise<LocalViewerConfig | undefined> {
   const parsed: unknown = JSON.parse(await readFile(configPath, 'utf8'));
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return;
   const config = parsed as { platform?: { kind?: string }; website_url?: string };
   const platform = mode ?? config.platform?.kind;
   const websiteUrl = config.website_url;
-  if (platform !== 'local' || !websiteUrl?.startsWith('file://')) return;
-
+  if (platform !== 'local' || !websiteUrl?.startsWith('file://')) return undefined;
   const resultsPath = fileURLToPath(new URL(websiteUrl));
   const workspace = resolve(fileURLToPath(new URL('../..', import.meta.url)));
   const siteRoot = await realpath(resolve(workspace, 'docs/experiments/arrowcol-oat'));
+  return { resultsPath, siteRoot };
+}
+
+async function createLocalViewer(config: LocalViewerConfig): Promise<LocalViewer> {
+  const { resultsPath, siteRoot } = config;
   const server = createHttpServer(async (request, response) => {
     try {
       if (request.method !== 'GET' && request.method !== 'HEAD') {
@@ -196,17 +244,29 @@ async function maybeServeLocalViewer(configPath: string, mode?: 'local' | 'aks')
   });
   const address = server.address();
   if (!address || typeof address === 'string') throw new Error('Could not allocate a local viewer port');
-  console.log(`Local results viewer: http://127.0.0.1:${address.port}/`);
+  return {
+    url: `http://127.0.0.1:${address.port}/`,
+    close: () => new Promise<void>((resolvePromise, reject) => {
+      server.close((error) => error ? reject(error) : resolvePromise());
+    }),
+  };
+}
+
+async function keepLocalViewerOpen(viewer: LocalViewer): Promise<void> {
+  console.log(`Local results viewer: ${viewer.url}`);
   console.log('Press Ctrl+C to stop the viewer.');
   try {
     await new Promise<void>((resolvePromise) => {
-      process.once('SIGINT', resolvePromise);
-      process.once('SIGTERM', resolvePromise);
+      const stop = (): void => {
+        process.off('SIGINT', stop);
+        process.off('SIGTERM', stop);
+        resolvePromise();
+      };
+      process.once('SIGINT', stop);
+      process.once('SIGTERM', stop);
     });
   } finally {
-    await new Promise<void>((resolvePromise, reject) => {
-      server.close((error) => error ? reject(error) : resolvePromise());
-    });
+    await viewer.close();
   }
 }
 
