@@ -3144,9 +3144,19 @@ async fn verify_local_bind_mount(config: &OatConfig, platform: &LocalPlatform) -
         let (_, digest) = crate::local::file_digest(&observability.join(name))?;
         checksums.push_str(&format!("{digest}  /oat-observability/{name}\n"));
     }
+    let uid = platform
+        .environment
+        .get("LOADTEST_UID")
+        .context("local state UID missing")?;
+    let gid = platform
+        .environment
+        .get("LOADTEST_GID")
+        .context("local state GID missing")?;
+    let user = format!("{uid}:{gid}");
     let mut command = Command::new("docker");
     command.args([
         "run", "--rm", "--network", "none", "--read-only",
+        "--user", &user,
         "--mount", &format!("type=bind,source={state},target=/oat-bind,readonly"),
         "--mount", &format!("type=bind,source={source},target=/oat-observability,readonly"),
         "--entrypoint", "/bin/sh", "arrowcol-oat-client:local", "-ec",
