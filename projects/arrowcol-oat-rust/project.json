@@ -30,7 +30,7 @@
       "executor": "nx:run-commands",
       "cache": false,
       "options": {
-        "command": "cargo run --locked --package arrowcol-oat-rust --bin arrowcol-oat-server",
+        "command": "cargo run --locked --package arrowcol-oat-rust --bin arrowcol-oat-rust",
         "forwardAllArgs": true
       }
     },

@@ -2,14 +2,14 @@ services:
   sqlserver:
     networks:
       default:
-        ipv4_address: null
+        ipv4_address: !reset null
   arrowcol-catalog:
     build:
       context: ../..
       dockerfile: projects/arrowcol-catalog-rust/Dockerfile
     networks:
       default:
-        ipv4_address: null
+        ipv4_address: !reset null
   dataflow-1:
     build:
       context: ../..
@@ -22,24 +22,24 @@ services:
       ARROWCOL_ADVERTISED_FLIGHT_ENDPOINT: null
     networks:
       default:
-        ipv4_address: null
+        ipv4_address: !reset null
   kusto:
     networks:
       default:
-        ipv4_address: null
+        ipv4_address: !reset null
   lgtm:
     networks:
       default:
-        ipv4_address: null
+        ipv4_address: !reset null
   router:
     build:
       context: ../..
       dockerfile: projects/arrowcol-router-rust/Dockerfile
     networks:
       default:
-        ipv4_address: null
+        ipv4_address: !reset null
 
 networks:
   default:
     ipam:
-      config: []
+      config: !reset []
