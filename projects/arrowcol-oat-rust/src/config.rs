@@ -68,6 +68,16 @@ pub struct PlatformConfig {
     pub kustomize_overlay: Option<String>,
     pub runtime_config_file: Option<String>,
     pub bootstrap_env_file: Option<String>,
+    #[serde(default)]
+    pub local: LocalOptions,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalOptions {
+    pub bind_host: Option<std::net::IpAddr>,
+    pub endpoint_host: Option<String>,
+    pub snapshot_root: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -159,6 +169,17 @@ impl OatConfig {
         }
         match self.platform.kind {
             OatMode::Local => {
+                if let Some(host) = self.platform.local.bind_host
+                    && (host.is_multicast() || (host.is_unspecified() && self.platform.local.endpoint_host.is_none()))
+                {
+                    bail!("local bind_host must be unicast; wildcard binds require an explicit endpoint_host");
+                }
+                if let Some(host) = &self.platform.local.endpoint_host {
+                    crate::local::endpoint_host(host)?;
+                }
+                if let Some(root) = &self.platform.local.snapshot_root {
+                    crate::local::absolute_directory(Path::new(root))?;
+                }
                 if self
                     .qap_database
                     .as_deref()
@@ -222,7 +243,10 @@ impl OatConfig {
                 if self.platform.compose_file.is_some()
                     || self.platform.compose_override_file.is_some()
                     || self.platform.compose_project.is_some()
-                    || self.platform.compose_state_root.is_some() =>
+                    || self.platform.compose_state_root.is_some()
+                    || self.platform.local.bind_host.is_some()
+                    || self.platform.local.endpoint_host.is_some()
+                    || self.platform.local.snapshot_root.is_some() =>
             {
                 bail!("compose settings are only valid for the local platform");
             }
@@ -578,6 +602,7 @@ mod tests {
                 kustomize_overlay: None,
                 runtime_config_file: Some(runtime_config.to_string_lossy().into_owned()),
                 bootstrap_env_file: Some(bootstrap_env.to_string_lossy().into_owned()),
+                local: LocalOptions::default(),
             },
             stamp: Some("00000".to_owned()),
             warmup_seconds: 30,
@@ -710,6 +735,7 @@ mod tests {
             kustomize_overlay: None,
             runtime_config_file: None,
             bootstrap_env_file: None,
+            local: LocalOptions::default(),
         };
         config.result_url = "file:///tmp/arrowcol-oat/results.parquet".to_owned();
         config.website_url = "file:///tmp/arrowcol-oat/site/results.parquet".to_owned();
@@ -729,6 +755,7 @@ mod tests {
             kustomize_overlay: None,
             runtime_config_file: None,
             bootstrap_env_file: None,
+            local: LocalOptions::default(),
         };
         config.result_url = "file:///tmp/arrowcol-oat/results.parquet".to_owned();
         config.website_url = "abfss://$web@account.dfs.core.windows.net/results.parquet".to_owned();
@@ -801,6 +828,7 @@ mod tests {
             kustomize_overlay: None,
             runtime_config_file: None,
             bootstrap_env_file: None,
+            local: LocalOptions::default(),
         };
         config.result_url = "file:///tmp/arrowcol-oat/results.parquet".to_owned();
         config.website_url = "file:///tmp/arrowcol-oat/site/results.parquet".to_owned();
