@@ -9,10 +9,7 @@ use arrowcol_catalog::{DdlCommand, DdlParser};
 use serde::Serialize;
 use url::Url;
 
-use crate::{
-    cli::InitializeAzureArgs,
-    schema::schema_statements,
-};
+use crate::{cli::InitializeAzureArgs, schema::schema_statements};
 
 const INGESTION: &str = "__arrowcol_ingestion";
 
