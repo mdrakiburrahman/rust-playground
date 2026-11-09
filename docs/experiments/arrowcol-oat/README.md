@@ -42,8 +42,8 @@ The producer retains these original result columns:
 | `dfe_worker_concurrency` | 64-bit unsigned integer | DFE `--num-cores` setting. |
 | `table` | UTF-8 string | DMV table used as the table-scoped routing key. |
 | `rows` | 64-bit unsigned integer | Rows sent by the standalone DMV client. |
-| `duration_ms` | 64-bit unsigned integer | Per-table client duration, including connection, registration, and upload. |
-| `rows_per_second` | 64-bit float | Per-table throughput derived from the client's duration. |
+| `duration_ms` | 64-bit unsigned integer | Shared fleet measurement duration; excludes preflight and warm-up. |
+| `rows_per_second` | 64-bit float | Total table rows completed during the shared window divided by its duration. |
 | `cpu_millicores` | Nullable 64-bit float | Unique collector/DFE pod CPU from `kubectl top`; integrated pods are counted once. |
 | `memory_bytes` | Nullable 64-bit unsigned integer | Unique collector/DFE pod memory from `kubectl top`; integrated pods are counted once. |
 | `qap_observation_complete` | 64-bit unsigned integer | 1 only when all expected QAP tables and required fields were measured; otherwise 0. |
@@ -54,7 +54,7 @@ The producer retains these original result columns:
 | `qap_unhealthy_catalogs` | Nullable 64-bit unsigned integer | Sum of unhealthy catalog counts across selected tables. |
 | `qap_lag_seconds` | Nullable 64-bit float | Maximum reported QAP lag across selected tables. |
 
-The viewer reads `results.parquet` from the same origin using HTTP range requests; it does not need CORS configuration. Azure Storage static website hosting on the HNS-enabled account serves `$web` anonymously, even when account-level blob public access is disabled. The AKS defaults target `abfss://experiments@arrowcollector<stamp>.dfs.core.windows.net/arrowcol-oat/results.parquet` and the root `results.parquet` in that stamp's `$web`; explicit destinations may override them. The producer uses conditional ETag updates, deduplicates retries by `(run_id, table)`, and verifies the website copy matches the authoritative results object before success. Publish only approved nonsensitive summary metrics there—never credentials, raw payloads, or sensitive identifiers.
+The viewer reads `results.parquet` from the same origin using HTTP range requests; it does not need CORS configuration. Azure Storage static website hosting on the HNS-enabled account serves `$web` anonymously, even when account-level blob public access is disabled. The AKS defaults target `abfss://experiments@arrowcollector<stamp>.dfs.core.windows.net/arrowcol-oat/results.parquet` and the root `results.parquet` in that stamp's `$web`; explicit destinations may override them. The producer uses conditional ETag updates, deduplicates every write by `(run_id, table)` (last row wins), and verifies the website copy matches the authoritative results object before success. Local writers serialize read/merge/rename through a cross-process file lock with a 15-second timeout. Empty results files preserve the full schema and accept later appends. Publish only approved nonsensitive summary metrics there—never credentials, raw payloads, or sensitive identifiers.
 
 ## Running the OAT matrix
 
