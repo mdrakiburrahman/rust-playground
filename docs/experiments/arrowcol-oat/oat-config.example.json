@@ -5,7 +5,12 @@
     "compose_override_file": "projects/loadtest/compose.oat.yaml",
     "compose_project": "arrowcol-oat",
     "compose_state_root": "out/arrowcol-oat/local",
-    "kustomize_overlay": null
+    "kustomize_overlay": null,
+    "local": {
+      "bind_host": null,
+      "endpoint_host": null,
+      "snapshot_root": null
+    }
   },
   "stamp": null,
   "warmup_seconds": 30,
