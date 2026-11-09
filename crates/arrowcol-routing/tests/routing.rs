@@ -668,6 +668,68 @@ async fn fresh_oat_router_does_not_replace_a_missing_bound_owner() {
 }
 
 #[tokio::test]
+async fn oat_forwarding_rejects_deadlines_crossed_during_authority_reads() {
+    for boundary in ["pin", "lease", "collector", "pressure"] {
+        let store = Arc::new(MemoryRoutingStore::default());
+        let instance = CollectorInstanceId::new();
+        let mut collector = registration(instance, 5001, 20_000);
+        if boundary == "collector" {
+            collector.lease_expires_at_unix_ms = millis(100_015);
+        }
+        store
+            .register_collector(&collector)
+            .await
+            .unwrap_or_else(|error| panic!("register fixture: {error}"));
+        store
+            .publish_pressure(&snapshot(instance, 99_000, 1_000, 0))
+            .await
+            .unwrap_or_else(|error| panic!("publish fixture pressure: {error}"));
+        let engine_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);
+        let engine = RoutingEngine::new(engine_store, oat_policy(OAT_RUN_EXPIRY))
+            .unwrap_or_else(|error| panic!("create delayed-read OAT engine: {error}"));
+        let pin_expiry = millis(if boundary == "pin" { 100_015 } else { 200_000 });
+        initialize_memory_oat_pin(&engine, OAT_RUN_EXPIRY, millis(100_001), pin_expiry).await;
+        let selected = engine
+            .route_ingest_for_run(&metadata(), OAT_RUN_EXPIRY, pin_expiry, millis(100_002))
+            .await
+            .unwrap_or_else(|error| panic!("select delayed-read fixture: {error}"));
+        if boundary == "lease" {
+            let mut lease = selected
+                .lease
+                .clone()
+                .unwrap_or_else(|| panic!("selected lease missing"));
+            lease.expires_at_unix_ms = millis(100_015);
+            store
+                .insert_lease(lease)
+                .await
+                .unwrap_or_else(|error| panic!("shorten fixture lease: {error}"));
+        }
+        let (before_expiry, expired) = if boundary == "pressure" {
+            (114_000, 114_001)
+        } else {
+            (100_014, 100_015)
+        };
+        for (after_reads, should_succeed) in [(100_002, false), (before_expiry, true), (expired, false)] {
+            let before = store.operation_counts();
+            let outcome = engine
+                .revalidate_run_assignment_with_clock(OAT_RUN_EXPIRY, &selected, millis(100_003), || {
+                    assert_eq!(
+                        store.operation_counts().load_view,
+                        before.load_view + 1,
+                        "forwarding clock must be sampled after the final awaited view read"
+                    );
+                    Ok(millis(after_reads))
+                })
+                .await;
+            assert_eq!(outcome.is_ok(), should_succeed, "{boundary}: {outcome:?}");
+            let after = store.operation_counts();
+            assert_eq!(after.claim_lease, before.claim_lease);
+            assert_eq!(after.bind_initial_run_table_pin, before.bind_initial_run_table_pin);
+        }
+    }
+}
+
+#[tokio::test]
 async fn oat_forwarding_rechecks_authority_after_upstream_selection() {
     let (store, _, _) = seeded_store().await;
     let engine_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);

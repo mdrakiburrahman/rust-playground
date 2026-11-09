@@ -18,6 +18,7 @@ these changes.
 | Retry | Exact run UUID, expected keys, digest and expiry must agree. A bound marker without its owner row is a conflict, never permission to create a replacement. |
 | Retention | Parent, marker and owner rows survive expiry as tombstones. SQL rejects owner replacement, deletion and marker rollback. Historical pins intentionally do not FK-reference rotating live leases. |
 | Forwarding | Revalidate SQL authority at request admission, upstream selection and after connection acquisition before sending headers/body. Renewed lease metadata may refresh, but the selected process, endpoint and lease lineage cannot change. Streaming requests are never retried. |
+| Forwarding expiry | After the final awaited authority/view read, sample fresh monotonic time and recheck the retained pin, lease, collector lifetime and pressure deadlines. I/O crossing any deadline fails closed; no additional pre-I/O timestamped query substitutes for this check. |
 | Failure evidence | A lost pin, authority outage or unavailable pinned upstream emits `pinning_violation` routing failures. The OAT runner preserves failed-cell rows with `pinning_ok=false`; incomplete measurements are zero and QAP observation remains incomplete, never a successful throughput sample. |
 
 Finite pin-init uses login `arrowcol_migrator` and database `arrowcol`, never
