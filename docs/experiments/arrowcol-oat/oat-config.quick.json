@@ -1,0 +1,50 @@
+{
+  "platform": {
+    "kind": "local",
+    "compose_file": "projects/loadtest/compose.yaml",
+    "compose_override_file": "projects/loadtest/compose.oat.yaml",
+    "compose_project": "arrowcol-oat-quick",
+    "compose_state_root": "out/arrowcol-oat/quick",
+    "kustomize_overlay": null,
+    "local": {
+      "bind_host": null,
+      "endpoint_host": null,
+      "snapshot_root": null
+    }
+  },
+  "stamp": null,
+  "warmup_seconds": 0,
+  "measure_seconds": 1,
+  "client_ready_timeout_seconds": 600,
+  "run_pin_ttl_ms": 3600000,
+  "pilot_mode": false,
+  "namespace": "arrowcol-oat",
+  "kubectl_context": null,
+  "arrowcol_deployment": "arrowcol",
+  "arrowcol_container": "dataflow",
+  "dfe_deployment": "arrowcol",
+  "dfe_container": "dataflow",
+  "arrowcol_pod_selector": "app=arrowcol",
+  "dfe_pod_selector": "app=arrowcol",
+  "arrowcol_endpoint": "http://router:50050",
+  "router_metrics_endpoint": "http://127.0.0.1:15050/metrics",
+  "dmv_client_binary": "target/debug/arrowcol-dmv",
+  "edge_secret_file": "/run/secrets/edge-hmac",
+  "tables": [
+    "sqlserver_active_sessions"
+  ],
+  "rows_per_table": 1000,
+  "clients_per_table": 1,
+  "dmv_concurrency": 1,
+  "qap_endpoint": "http://127.0.0.1:8080",
+  "qap_database": null,
+  "qap_timeout_seconds": 60,
+  "replica_counts": [
+    1
+  ],
+  "dfe_worker_concurrency": [
+    1
+  ],
+  "result_url": "file:///tmp/arrowcol-oat-quick/results.parquet",
+  "website_url": "file:///tmp/arrowcol-oat-quick/site/results.parquet"
+}
