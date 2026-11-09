@@ -1,6 +1,6 @@
 # Copy to infra/azure/stamp.yaml, set the subscription UUID, and verify address ranges against every connected network.
 subscription: 00000000-0000-0000-0000-000000000000
-# 1..999999, or the quoted '00000': arrow-collector-<stamp> must fit Kusto's 22-character name limit.
+# 1..999999: arrow-collector-<stamp> must fit Kusto's 22-character name limit.
 stamp: 1
 storageReadLogDestination: storage
 resourceGroup: arrow-collector-rg
@@ -18,10 +18,9 @@ aks:
     maxCount: 3
     maxPods: 250
     availabilityZones: ["1", "2", "3"]
-  # User pools autoscale from zero; role sets the arrow-collector/role label and NoSchedule taint.
+  # User pools autoscale from zero; quota-aware maximums are intentionally conservative.
   userPools:
     - name: benchd64
-      role: client
       vmSize: Standard_D64ds_v6
       initialCount: 0
       minCount: 0
@@ -29,7 +28,6 @@ aks:
       maxPods: 30
       availabilityZones: []
     - name: benche64
-      role: arrowcol
       vmSize: Standard_E64ds_v6
       initialCount: 0
       minCount: 0

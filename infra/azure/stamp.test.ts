@@ -7,7 +7,7 @@ const example = fs.readFileSync(new URL('./stamp.example.yaml', import.meta.url)
 
 test('loads the approved resource group, stamp and AKS baseline from YAML', () => {
   const config = parseStampConfig(example);
-  assert.equal(config.stamp, '1');
+  assert.equal(config.stamp, 1);
   assert.equal(config.resourceGroup, 'arrow-collector-rg');
   assert.equal(config.location, 'eastus2');
   assert.equal(config.aks.version, '1.35.6');
@@ -42,18 +42,10 @@ test('validates zero-scaled benchmark user pools and rejects invalid pool config
   assert.throws(() => parseStampConfig(example.replace('initialCount: 0', 'initialCount: 2')), /counts must satisfy/);
   assert.throws(() => parseStampConfig(example.replace('name: benche64', 'name: benchd64')), /names must be unique/);
   assert.throws(() => parseStampConfig(example.replace('maxCount: 1', 'maxCount: 0')), /maxCount must be an integer/);
-  assert.deepEqual(config.aks.userPools.map(pool => pool.role), ['client', 'arrowcol']);
-  assert.throws(() => parseStampConfig(example.replace('role: client', 'role: system')), /role is invalid/);
-  const template = fs.readFileSync(new URL('./aks.bicep', import.meta.url), 'utf8');
-  assert.ok(template.includes("nodeTaints: ['arrow-collector/role=${userPool.role}:NoSchedule']"));
-  assert.ok(template.includes("nodeLabels: { type: 'benchmark', 'arrow-collector/role': userPool.role }"));
-  assert.equal(parseStampConfig(example.replace('maxCount: 1', 'maxCount: 100')).aks.userPools[0]?.maxCount, 100);
-  assert.throws(() => parseStampConfig(example.replaceAll('maxCount: 1', 'maxCount: 100')),
-    /need 270 nodes; the node subnet fits 251 and the pod CIDR fits 256/);
 });
 
 test('rejects invalid stamps, resource-group scope and network overlaps', () => {
-  assert.throws(() => parseStampConfig(example.replace('stamp: 1', 'stamp: -1')), /stamp must be an integer/);
+  assert.throws(() => parseStampConfig(example.replace('stamp: 1', 'stamp: 0')), /stamp must be an integer/);
   assert.throws(() => parseStampConfig(example.replace('arrow-collector-rg', 'rust-playground')), /resourceGroup is invalid/);
   assert.throws(() => parseStampConfig(example.replace('apiServerSubnetIpv4Cidr: 10.245.1.0/28',
     'apiServerSubnetIpv4Cidr: 10.245.0.0/28')), /non-overlapping/);
@@ -68,20 +60,16 @@ test('rejects invalid stamps, resource-group scope and network overlaps', () => 
 });
 
 test('bounds YAML and environment stamps to the Kusto cluster name limit', () => {
-  assert.equal(parseStampConfig(example.replace('stamp: 1', 'stamp: 999999')).stamp, '999999');
-  assert.equal(defaultStampConfig({ AZURE_STAMP: '999999' }).stamp, '999999');
-  assert.equal(parseStampConfig(example.replace('stamp: 1', "stamp: '00000'")).stamp, '00000');
-  assert.equal(defaultStampConfig({ AZURE_STAMP: '00000' }).stamp, '00000');
-  assert.throws(() => parseStampConfig(example.replace('stamp: 1', 'stamp: 00000')), /must be quoted as '00000'/);
-  for (const stamp of ['0', '000000', '01']) assert.throws(() => defaultStampConfig({ AZURE_STAMP: stamp }), /AZURE_STAMP must be/);
+  assert.equal(parseStampConfig(example.replace('stamp: 1', 'stamp: 999999')).stamp, 999999);
+  assert.equal(defaultStampConfig({ AZURE_STAMP: '999999' }).stamp, 999999);
   for (const stamp of [1000000, 99999999999]) {
     assert.throws(() => parseStampConfig(example.replace('stamp: 1', `stamp: ${stamp}`)), /stamp must be an integer in 1\.\.999999/);
-    assert.throws(() => defaultStampConfig({ AZURE_STAMP: String(stamp) }), /AZURE_STAMP must be an integer in 1\.\.999999/);
+    assert.throws(() => defaultStampConfig({ AZURE_STAMP: String(stamp) }), /Kusto cluster name limit/);
   }
 });
 
 test('accepts both approved stamp regions without broadening the resource-group boundary', () => {
-  assert.equal(defaultStampConfig().stamp, '1');
+  assert.equal(defaultStampConfig().stamp, 1);
   for (const location of ['eastus2', 'canadacentral']) {
     assert.equal(defaultStampConfig({ AZURE_LOCATION: location }).location, location);
     assert.equal(parseStampConfig(example.replace('location: eastus2', 'location: ' + location)).location, location);

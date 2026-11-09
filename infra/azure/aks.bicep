@@ -135,8 +135,8 @@ var userAgentPoolProfiles = [for userPool in aksConfig.userPools: {
   enableFIPS: true
   osSKU: 'AzureLinux'
   availabilityZones: userPool.availabilityZones
-  nodeTaints: ['arrow-collector/role=${userPool.role}:NoSchedule']
-  nodeLabels: { type: 'benchmark', 'arrow-collector/role': userPool.role }
+  nodeTaints: []
+  nodeLabels: { type: 'benchmark' }
   upgradeSettings: { maxSurge: '33%' }
   securityProfile: { sshAccess: 'Disabled' }
 }]

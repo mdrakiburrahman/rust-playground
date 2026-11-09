@@ -77,7 +77,7 @@ function requireFile(file: string): void {
   if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`Expected regular file: ${file}`);
 }
 
-function stamp(subscription: string): { namespace: string; stamp: string; document: ReturnType<typeof parseDocument> } {
+function stamp(subscription: string): { namespace: string; stamp: number; document: ReturnType<typeof parseDocument> } {
   const file = 'infra/azure/stamp.yaml';
   requireFile(file);
   const document = parseDocument(fs.readFileSync(file, 'utf8'));
@@ -85,10 +85,10 @@ function stamp(subscription: string): { namespace: string; stamp: string; docume
   const value = record(document.toJS() as unknown, 'private stamp');
   const aks = record(value.aks, 'AKS stamp configuration');
   if (typeof value.subscription !== 'string' || value.subscription.toLowerCase() !== subscription.toLowerCase() ||
-      value.resourceGroup !== GROUP || !(value.stamp === '00000' || (Number.isInteger(value.stamp) && Number(value.stamp) >= 1 && Number(value.stamp) <= 999999)) ||
+      value.resourceGroup !== GROUP || !Number.isInteger(value.stamp) || Number(value.stamp) < 1 || Number(value.stamp) > 999999 ||
       typeof aks.namespace !== 'string' || !/^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$/.test(aks.namespace))
     throw new Error('Private stamp does not match the authorized subscription and sandbox.');
-  return { namespace: aks.namespace, stamp: String(value.stamp), document };
+  return { namespace: aks.namespace, stamp: Number(value.stamp), document };
 }
 
 function createEvidenceDir(value: string): string {
@@ -322,7 +322,7 @@ async function main(): Promise<void> {
       stage('npm-ci');
       await command('npm', ['ci'], 30 * 60_000, false);
       const newStamp = Math.floor(Date.now() / 1000) % 999999 + 1;
-      if (String(newStamp) === info.stamp) throw new Error('Generated stamp equals the previous stamp; start a new run later.');
+      if (newStamp === info.stamp) throw new Error('Generated stamp equals the previous stamp; start a new run later.');
       info.document.set('stamp', newStamp);
       info.document.set('storageReadLogDestination', 'storage');
       info.document.setIn(['aks', 'systemPool', 'vmSize'], 'Standard_D8s_v5');
