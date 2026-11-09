@@ -914,6 +914,10 @@ async fn oat_pin_fails_closed_when_pinned_collector_process_restarts() {
         .route_ingest_for_run(&metadata(), OAT_RUN_RESTART, millis(200_000), millis(100_003))
         .await;
     assert!(matches!(retry, Err(error) if error.kind() == RoutingErrorKind::Conflict));
+    let forwarded = engine
+        .revalidate_run_assignment(OAT_RUN_RESTART, &initial, millis(100_003))
+        .await;
+    assert!(matches!(forwarded, Err(error) if error.kind() == RoutingErrorKind::Conflict));
 }
 
 #[tokio::test]
