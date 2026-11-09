@@ -15,6 +15,8 @@ use arrow_flight::{FlightData, FlightDescriptor};
 use arrow_schema::{DataType, Schema, SchemaRef, TimeUnit};
 use arrowcol_catalog::{DdlCommand, DdlParser};
 use arrowcol_flight::{PutResultMetadata, decode_ddl_completion_metadata};
+const OAT_RUN_ID_ENV: &str = "ARROWCOL_OAT_RUN_ID";
+const OAT_RUN_ID_HEADER: &str = "x-arrowcol-oat-run-id";
 use arrowcol_protocol::{
     ClaimedSchemaFingerprint, ImplementationPool, IngestMetadata, ProtocolVersion, TableIdentity, UnixMillis,
     fingerprint_schema,
@@ -32,6 +34,13 @@ pub struct DmvTable {
     ddl: String,
     identity: TableIdentity,
     schema: SchemaRef,
+}
+
+impl DmvTable {
+    #[must_use]
+    pub fn identity(&self) -> &TableIdentity {
+        &self.identity
+    }
 }
 
 /// Returns the names of the DMV tables in the embedded fixture.
@@ -265,6 +274,16 @@ fn request_metadata<T>(request: &mut Request<T>, table: &DmvTable, signer: Optio
             http::HeaderValue::try_from(value)?,
         );
     }
+    if let Some(run_id) = std::env::var_os(OAT_RUN_ID_ENV) {
+        let run_id = run_id
+            .to_str()
+            .context("ARROWCOL_OAT_RUN_ID must be valid Unicode")?;
+        validate_oat_run_id(run_id)?;
+        headers.insert(
+            http::header::HeaderName::from_static(OAT_RUN_ID_HEADER),
+            http::HeaderValue::try_from(run_id)?,
+        );
+    }
     // Tonic sets this exact content type on the wire, after constructing the request.
     headers.insert(
         http::header::CONTENT_TYPE,
@@ -283,6 +302,18 @@ fn request_metadata<T>(request: &mut Request<T>, table: &DmvTable, signer: Optio
         )?;
     }
     *request.metadata_mut() = tonic::metadata::MetadataMap::from_headers(headers);
+    Ok(())
+}
+
+fn validate_oat_run_id(run_id: &str) -> Result<()> {
+    if run_id.is_empty()
+        || run_id.len() > 64
+        || !run_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        bail!("{OAT_RUN_ID_ENV} must contain 1..=64 ASCII letters, digits, hyphens, or underscores");
+    }
     Ok(())
 }
 

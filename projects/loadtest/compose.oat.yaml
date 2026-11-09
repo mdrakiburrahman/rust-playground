@@ -1,0 +1,45 @@
+services:
+  sqlserver:
+    networks:
+      default:
+        ipv4_address: null
+  arrowcol-catalog:
+    build:
+      context: ../..
+      dockerfile: projects/arrowcol-catalog-rust/Dockerfile
+    networks:
+      default:
+        ipv4_address: null
+  dataflow-1:
+    build:
+      context: ../..
+      dockerfile: projects/arrowcol-dataflow-rust/Dockerfile
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - export ARROWCOL_INSTANCE_KEY="oat-$(hostname)"; export ARROWCOL_ADVERTISED_FLIGHT_ENDPOINT="$(hostname -i):32010"; exec /usr/bin/tini -- /usr/local/bin/arrowcol-dataflow-rust --num-cores "${LOADTEST_CPUS:-2}" --config /etc/arrowcol-dataflow-rust/config.yaml
+    environment:
+      ARROWCOL_INSTANCE_KEY: null
+      ARROWCOL_ADVERTISED_FLIGHT_ENDPOINT: null
+    networks:
+      default:
+        ipv4_address: null
+  kusto:
+    networks:
+      default:
+        ipv4_address: null
+  lgtm:
+    networks:
+      default:
+        ipv4_address: null
+  router:
+    build:
+      context: ../..
+      dockerfile: projects/arrowcol-router-rust/Dockerfile
+    networks:
+      default:
+        ipv4_address: null
+
+networks:
+  default:
+    ipam:
+      config: []

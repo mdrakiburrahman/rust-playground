@@ -20,5 +20,5 @@ pub use config::{
 pub use metrics::RouterMetrics;
 pub use router::{
     CONTROL_OPERATION_METADATA_KEY, ProductionRouter, ROUTING_FENCING_EPOCH_HEADER, ROUTING_LEASE_EXPIRES_HEADER,
-    ROUTING_LEASE_ID_HEADER, ROUTING_LEASE_VERSION_HEADER, RouterControlLoop, build_server,
+    ROUTING_LEASE_ID_HEADER, ROUTING_LEASE_VERSION_HEADER, OAT_RUN_ID_HEADER, RouterControlLoop, build_server,
 };

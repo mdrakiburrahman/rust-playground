@@ -80,6 +80,13 @@ Use `npx --no-install tsx infra/azure/bootstrap.ts <command>`:
 | `reset --execute` | Delete the sandbox Kusto database and stored blobs, versions and snapshots in all three containers; drop every table, external table, function and materialized view in the experiment database. |
 | `reset --resume` | Finish interrupted reset from its durable intent. |
 | `recover` / `recover --execute` | Preview / recover abandoned publisher occupancy after stopping writers. |
+| `prepare-run-fic` / `probe-run-fic` / `cleanup-run-fic` | Exact-run AKS trust lifecycle; [arguments and custody rules](../../docs/operations/OAT_RUN_AUTHORITY.md). **Cleanup removes only the recorded FIC after workload namespace removal; ambiguous receipts block automatic retry/recovery.** |
+| `bind-oat-qap` / `verify-oat-qap` / `cleanup-oat-qap` | **Blocked by nonretryable provider-contract qualification; not runtime-ready.** [Required workload/stop records and qualification boundary](../../docs/operations/OAT_RUN_AUTHORITY.md#run-scoped-qap-bindings). Cleanup's intended scope is only recorded external-table bindings, never data roots, databases or ownership tombstones. |
+
+External publisher federation may be empty; the separate native
+`azure-qap-${clusterName}` trust is still required and verified. OAT pin setup
+uses the finite migrator-only Job and immutable V0011 authority, not app DML;
+see [OAT run authority](../../docs/operations/OAT_RUN_AUTHORITY.md).
 
 | Task | Command |
 | --- | --- |

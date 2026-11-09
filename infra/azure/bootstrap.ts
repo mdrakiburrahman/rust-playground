@@ -284,6 +284,7 @@ export async function run_tree(command: string[], timeout: number, cwd?: string,
   });
 }
 type Headers = Record<string, string>;
+export interface HttpReceipt { status: number; bodyBase64: string; headers: Headers }
 export type BlobEntry = { name: string; snapshot?: string | null; version?: string | null; etag?: string | null;
   deleted?: boolean; directory?: boolean };
 export class Azure {
@@ -324,11 +325,12 @@ export class Azure {
     try { return await refresh; } finally { this.token_pending.delete(resource); }
   }
   async request(method: string, url: string, resource: string, body?: string | Buffer | null,
-    headers: Headers = {}, missing_ok = false, idempotent = false): Promise<[Buffer | null, Headers]> {
+    headers: Headers = {}, missing_ok = false, idempotent = false,
+    capture?: (receipt: HttpReceipt) => void): Promise<[Buffer | null, Headers]> {
     // Writes stay single-shot unless the caller proves a repeat is harmless (read-only, ifexists or conditional).
-    const attempts = idempotent || ['GET', 'HEAD'].includes(method) ? READ_ATTEMPTS : 1;
+    const attempts = capture ? 1 : idempotent || ['GET', 'HEAD'].includes(method) ? READ_ATTEMPTS : 1;
     for (let attempt = 0; attempt < attempts; attempt++) {
-      try { return await this._request_once(method, url, resource, body, headers, missing_ok); }
+      try { return await this._request_once(method, url, resource, body, headers, missing_ok, capture); }
       catch (error) {
         if (!(error instanceof Failure) || attempt + 1 === attempts ||
             (error instanceof HttpFailure && !TRANSIENT_HTTP.has(error.code))) throw error;
@@ -340,7 +342,7 @@ export class Azure {
     throw new Error('unreachable');
   }
   async _request_once(method: string, url: string, resource: string, body?: string | Buffer | null,
-    headers: Headers = {}, missing_ok = false): Promise<[Buffer | null, Headers]> {
+    headers: Headers = {}, missing_ok = false, capture?: (receipt: HttpReceipt) => void): Promise<[Buffer | null, Headers]> {
     const token = await this.token(resource);
     let response: Response;
     try {
@@ -349,6 +351,10 @@ export class Azure {
         headers: { Authorization: 'Bearer ' + token, ...(resource === 'https://storage.azure.com/' ?
           { 'x-ms-date': new Date().toUTCString() } : {}), ...headers } });
       const bytes = Buffer.from(await response.arrayBuffer());
+      capture?.({ status: response.status, bodyBase64: bytes.toString('base64'),
+        headers: Object.fromEntries([...response.headers.entries()].filter(([name]) =>
+          ['x-ms-request-id', 'x-ms-correlation-request-id', 'x-ms-client-request-id',
+            'x-ms-lease-id', 'x-ms-activity-id', 'etag', 'date'].includes(name))) });
       if (missing_ok && response.status === 404) return [null, {}];
       if (!response.ok) throw new HttpFailure(response.status, `HTTP ${response.status}: ${this.c.redact(bytes.toString())}`);
       return [bytes, { ...Object.fromEntries(response.headers.entries()), ':status': String(response.status) }];
@@ -380,12 +386,13 @@ export class Azure {
     } catch { return 'Unknown'; }
   }
   async blob(method: string, container: string, name = '', query?: Record<string, string>,
-    body?: string | Buffer | null, headers: Headers = {}, missing_ok = false, idempotent = false): Promise<[Buffer | null, Headers]> {
+    body?: string | Buffer | null, headers: Headers = {}, missing_ok = false, idempotent = false,
+    capture?: (receipt: HttpReceipt) => void): Promise<[Buffer | null, Headers]> {
     let url = `https://${this.c.account}.blob.core.windows.net/${container}`;
     if (name) url += '/' + name.split('/').map(encodeURIComponent).join('/');
     if (query && Object.keys(query).length) url += '?' + new URLSearchParams(query);
     return this.request(method, url, 'https://storage.azure.com/', body, { 'x-ms-version': '2023-11-03', ...headers },
-      missing_ok, idempotent);
+      missing_ok, idempotent, capture);
   }
   async blobs(container: string): Promise<BlobEntry[]> {
     const entries: BlobEntry[] = [];
@@ -481,10 +488,16 @@ export class Azure {
     return items;
   }
 }
+export class WorkloadIdentityPropagationPending extends Failure {}
 export async function exchange_workload_identity_token(resource: string, clientId: string, tenantId: string,
   tokenFile: string): Promise<{ token: string; expiresIn: number }> {
-  const assertion = fs.readFileSync(tokenFile, 'utf8').trim();
+  return exchange_workload_identity_assertion(resource, clientId, tenantId, fs.readFileSync(tokenFile, 'utf8').trim());
+}
+export async function exchange_workload_identity_assertion(resource: string, clientId: string, tenantId: string,
+  assertion: string, timeoutMs = 15_000): Promise<{ token: string; expiresIn: number }> {
   if (!assertion || assertion.length > 16_384) throw new Failure('Projected workload identity token is empty or too large.');
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 15_000)
+    throw new Failure('Token exchange timeout must be between 1 and 15000 ms.');
   const scope = resource.replace(/\/+$/, '') + '/.default';
   let response: Response;
   try {
@@ -493,13 +506,19 @@ export async function exchange_workload_identity_token(resource: string, clientI
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({ client_id: clientId, scope, grant_type: 'client_credentials',
         client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer', client_assertion: assertion }),
-      signal: AbortSignal.timeout(15_000),
+      signal: AbortSignal.timeout(timeoutMs),
       redirect: 'error',
     });
   } catch (error) {
     throw new Failure('Workload identity token exchange request failed.', { cause: error });
   }
-  if (!response.ok) throw new Failure(`Workload identity token exchange failed with HTTP ${response.status}.`);
+  if (!response.ok) {
+    let codes: unknown;
+    try { codes = (await response.json())?.error_codes; } catch { /* Response bodies are never exposed. */ }
+    if (response.status === 400 && Array.isArray(codes) && codes.includes(70021))
+      throw new WorkloadIdentityPropagationPending('The exact federated identity record has not propagated yet.');
+    throw new Failure(`Workload identity token exchange failed with HTTP ${response.status}.`);
+  }
   let value: unknown;
   try { value = await response.json(); }
   catch (error) { throw new Failure('Workload identity token exchange returned invalid JSON.', { cause: error }); }
@@ -595,9 +614,9 @@ function owned_shared_stamp_identity(resource: any): void {
       !/^stamp-\d+$/.test(resource.tags?.sandboxId ?? ''))
     throw new Failure('Exact shared ArrowCol identity ownership tags do not match; refusing adoption/mutation.');
 }
-async function verify_shared_publisher_credentials(azure: Azure): Promise<void> {
+async function verify_shared_publisher_credentials(azure: Azure, existing?: any[]): Promise<void> {
   const c = azure.c;
-  const existing = await azure.collection(c.identity_id + '/federatedIdentityCredentials', '2023-01-31');
+  existing ??= await azure.collection(c.identity_id + '/federatedIdentityCredentials', '2023-01-31');
   for (const expected of c.stampConfig.publisherFederatedCredentials) {
     const actual = existing.find(item => item.name === expected.name)?.properties;
     const audiences = Array.isArray(actual?.audiences) ? [...actual.audiences].sort() : [];
@@ -605,6 +624,35 @@ async function verify_shared_publisher_credentials(azure: Azure): Promise<void> 
         JSON.stringify(audiences) !== JSON.stringify(['api://AzureADTokenExchange']))
       throw new Failure('Shared ArrowCol identity publisher federated credentials do not match the validated stamp configuration; refusing trust mutation.');
   }
+}
+export async function verify_aks_native_credential(azure: Azure, cluster: any, identity: any): Promise<void> {
+  const c = azure.c;
+  if (c.mode !== 'stamped') throw new Failure('The AKS-native credential is valid only for stamped infrastructure.');
+  owned(cluster, c);
+  owned_shared_stamp_identity(identity);
+  let identityClientId: string;
+  try { identityClientId = normalized_uuid(identity?.properties?.clientId); }
+  catch { throw new Failure('The shared ArrowCol UAMI client ID is missing or invalid.'); }
+  if (c.identity_client_id && identityClientId !== c.identity_client_id)
+    throw new Failure('AKS federated credential identity client ID differs from the configured ArrowCol UAMI.');
+  if (cluster?.properties?.oidcIssuerProfile?.enabled !== true ||
+      cluster?.properties?.securityProfile?.workloadIdentity?.enabled !== true)
+    throw new Failure('AKS OIDC and workload identity must both be enabled.');
+  const issuer = cluster?.properties?.oidcIssuerProfile?.issuerURL;
+  let parsedIssuer: URL;
+  try { parsedIssuer = new URL(issuer); } catch { throw new Failure('AKS OIDC issuer is missing or invalid.'); }
+  if (parsedIssuer.protocol !== 'https:' || parsedIssuer.username || parsedIssuer.password ||
+      parsedIssuer.search || parsedIssuer.hash || !parsedIssuer.hostname)
+    throw new Failure('AKS OIDC issuer must be an HTTPS issuer URL without credentials, query, or fragment.');
+  const credentials = await azure.collection(c.identity_id + '/federatedIdentityCredentials', '2023-01-31');
+  const actual = credentials.filter(item => item.name === `azure-qap-${c.cluster}`);
+  const expectedSubject = `system:serviceaccount:${c.stampConfig.aks.namespace}:${c.stampConfig.aks.serviceAccount}`;
+  const properties = actual.length === 1 ? actual[0].properties : null;
+  const audiences = Array.isArray(properties?.audiences) ? [...properties.audiences].sort() : [];
+  if (!properties || properties.issuer !== issuer || properties.subject !== expectedSubject ||
+      JSON.stringify(audiences) !== JSON.stringify(['api://AzureADTokenExchange']))
+    throw new Failure('The required AKS-native federated credential does not match the live cluster issuer and configured ServiceAccount.');
+  await verify_shared_publisher_credentials(azure, credentials);
 }
 export async function retry_ready<T>(action: () => Promise<T>, label: string, timeout = 600): Promise<T> {
   const deadline = runtime.now() + timeout;
@@ -656,8 +704,6 @@ export async function preflight(azure: Azure): Promise<void> {
   const c = azure.c;
   const account = await azure.cli('account', 'show', '--subscription', c.subscription);
   if (account.id.toLowerCase() !== c.subscription) throw new Failure('CLI subscription mismatch; no default-subscription fallback is permitted.');
-  if (c.mode === 'stamped' && !c.stampConfig.publisherFederatedCredentials.length)
-    throw new Failure('The private stamp config must preserve the existing publisher federated credentials before provisioning.');
   for (const provider of ['Microsoft.Kusto', 'Microsoft.Storage', 'Microsoft.ManagedIdentity', 'Microsoft.OperationalInsights',
     'Microsoft.Insights', ...(c.mode === 'stamped' ?
       ['Microsoft.ContainerService', 'Microsoft.Network', 'Microsoft.ContainerRegistry', 'Microsoft.Authorization'] : [])]) {
@@ -804,6 +850,9 @@ export async function deploy(azure: Azure, fresh?: Metadata): Promise<void> {
   c.uri = (await azure.arm('GET', c.cluster_id)).properties.uri.replace(/\/+$/, '');
   if (c.mode === 'stamped') {
     const sharedIdentity = await azure.arm('GET', c.identity_id, undefined, false, '2023-01-31');
+    const aks = await azure.arm('GET', c.base + '/providers/Microsoft.ContainerService/managedClusters/' + c.cluster,
+      undefined, false, AKS_API);
+    await verify_aks_native_credential(azure, aks, sharedIdentity);
     try { c.identity_client_id = normalized_uuid(sharedIdentity?.properties?.clientId); }
     catch { throw new Failure('Deployment did not return the single arrow-collector UAMI client ID.'); }
   }
@@ -1445,10 +1494,14 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         execute: { type: 'boolean', default: false }, resume: { type: 'boolean', default: false },
         'occupancy-id': { type: 'string', default: '' }, 'reset-generation': { type: 'string', default: '' },
         'wait-seconds': { type: 'string', default: '0' }, help: { type: 'boolean', short: 'h' },
+        'run-id': { type: 'string' }, namespace: { type: 'string' },
+        'service-account': { type: 'string' }, record: { type: 'string' },
+        manifest: { type: 'string' }, 'workload-record': { type: 'string' }, 'workload-stop-record': { type: 'string' },
       } });
-    if (args.help) { console.log('Usage: bootstrap.ts <config|preflight|provision|reconcile|reset|recover|status|stop|occupy|release> [--mode stamped|schema-evolution] [--env-file PATH] [--stamp-config YAML] [--output PATH] [--tables PATH] [--infra-only] [--execute] [--resume] [--occupancy-id UUID] [--reset-generation UUID] [--wait-seconds 0..600] [--stop-command COMMAND ...]'); return 0; }
+    if (args.help) { console.log('Usage: bootstrap.ts <config|preflight|provision|reconcile|reset|recover|status|stop|occupy|release|prepare-run-fic|probe-run-fic|cleanup-run-fic|bind-oat-qap|verify-oat-qap|cleanup-oat-qap> [--mode stamped|schema-evolution] [--env-file PATH] [--stamp-config YAML] [--output PATH] [--tables PATH] [--infra-only] [--execute] [--resume] [--occupancy-id UUID] [--reset-generation UUID] [--wait-seconds 0..600] [--run-id UUID --namespace NAME --service-account NAME --record PATH] [--manifest PATH --workload-record PATH --workload-stop-record PATH] [--stop-command COMMAND ...]'); return 0; }
     const command = positionals[0];
-    if (positionals.length !== 1 || !['config', 'preflight', 'provision', 'reconcile', 'reset', 'recover', 'status', 'stop', 'occupy', 'release'].includes(command))
+    if (positionals.length !== 1 || !['config', 'preflight', 'provision', 'reconcile', 'reset', 'recover', 'status', 'stop', 'occupy', 'release',
+      'prepare-run-fic', 'probe-run-fic', 'cleanup-run-fic', 'bind-oat-qap', 'verify-oat-qap', 'cleanup-oat-qap'].includes(command))
       throw new Failure('A valid Azure bootstrap command is required.');
     const mode = azure_mode(args.mode!);
     if (mode === 'schema-evolution' && args['stamp-config'])
@@ -1462,6 +1515,40 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       throw new Failure('--wait-seconds must be in the range 0..600.');
     const azure = new Azure(c), generation = args['reset-generation'] || values.ARROWCOL_RESET_GENERATION;
     switch (command) {
+      case 'bind-oat-qap': {
+        if (!args['run-id'] || !args.manifest || !args.record || !args['workload-record'])
+          throw new Failure('QAP binding requires --run-id, --manifest, --record and --workload-record.');
+        if (c.mode !== 'stamped') throw new Failure('Run-scoped AKS QAP helpers require stamped mode.');
+        const { bind_oat_qap } = await import('./oat_qap.js');
+        await bind_oat_qap(azure, args['run-id'], args.manifest, args.record, args['workload-record']);
+        break;
+      }
+      case 'verify-oat-qap': {
+        if (!args.record) throw new Failure('QAP verification requires --record.');
+        if (c.mode !== 'stamped') throw new Failure('Run-scoped AKS QAP helpers require stamped mode.');
+        const { verify_oat_qap } = await import('./oat_qap.js');
+        await verify_oat_qap(azure, args.record);
+        break;
+      }
+      case 'cleanup-oat-qap': {
+        if (!args.record || !args['workload-stop-record'])
+          throw new Failure('QAP cleanup requires --record and positive --workload-stop-record evidence.');
+        if (c.mode !== 'stamped') throw new Failure('Run-scoped AKS QAP helpers require stamped mode.');
+        const { cleanup_oat_qap } = await import('./oat_qap.js');
+        await cleanup_oat_qap(azure, args.record, args['workload-stop-record']);
+        break;
+      }
+      case 'prepare-run-fic': case 'probe-run-fic': case 'cleanup-run-fic': {
+        if (!args['run-id'] || !args.record ||
+            (command !== 'cleanup-run-fic' && (!args.namespace || !args['service-account'])))
+          throw new Failure('Run FIC helpers require --run-id and --record, plus --namespace and --service-account for prepare/probe.');
+        const { prepare_run_fic, probe_run_fic, cleanup_run_fic } = await import('./run_fic.js');
+        if (command === 'cleanup-run-fic') await cleanup_run_fic(azure, args['run-id'], args.record);
+        else if (command === 'prepare-run-fic')
+          await prepare_run_fic(azure, args['run-id'], args.namespace!, args['service-account']!, args.record);
+        else await probe_run_fic(azure, args['run-id'], args.namespace!, args['service-account']!, args.record, wait);
+        break;
+      }
       case 'config': write_private(args.output!, c.generated()); console.log('Private generated Azure configuration written (values withheld).'); break;
       case 'preflight': await preflight(azure); break;
       case 'provision': await preflight(azure); await provision(azure, args.tables!, wait, args.output!, args['infra-only']!, values); break;
@@ -1491,5 +1578,10 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     return 1;
   }
 }
-if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href)
-  process.exitCode = await main();
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  // Helpers import this runtime back; finish module evaluation before waiting for them.
+  void main().then(code => { process.exitCode = code; }, () => {
+    process.exitCode = 1;
+    console.error('ERROR: Azure bootstrap rejected unexpectedly; private error details withheld.');
+  });
+}

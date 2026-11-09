@@ -6,6 +6,7 @@ import { parse, stringify } from 'yaml';
 
 export interface RuntimeConfig {
   namespace: string;
+  oatRunId: string;
   serviceAccount?: string;
   workloadIdentityClientId: string;
   subscriptionId: string;
@@ -22,13 +23,14 @@ const roles = ['sqlserver', 'catalog', 'router', 'dataflow'] as const;
 export function validateRuntime(input: unknown, allowUnpublishedImages = false): RuntimeConfig {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('runtime config must be an object');
   const c = input as RuntimeConfig;
-  const required = ['deltaRoot', 'images', 'namespace', 'workloadIdentityClientId', 'subscriptionId', 'stamp'];
+  const required = ['deltaRoot', 'images', 'namespace', 'oatRunId', 'workloadIdentityClientId', 'subscriptionId', 'stamp'];
   if (required.some((key) => !Object.hasOwn(c, key)) || Object.keys(c).some((key) => ![...required, 'serviceAccount'].includes(key))) {
     throw new Error('runtime config has missing or unknown fields');
   }
   if (typeof c.namespace !== 'string' || !dns.test(c.namespace) || c.namespace.startsWith('kube-') || ['default', 'azure-qap'].includes(c.namespace)) {
     throw new Error('use a dedicated OAT namespace (not the QAP namespace)');
   }
+  if (typeof c.oatRunId !== 'string' || !uuid.test(c.oatRunId)) throw new Error('oatRunId must be the current OAT run UUID');
   if (Object.hasOwn(c, 'serviceAccount') &&
       (typeof c.serviceAccount !== 'string' || !dns.test(c.serviceAccount) || c.serviceAccount === 'default')) {
     throw new Error('serviceAccount must be a non-default Kubernetes DNS label');
@@ -89,7 +91,10 @@ export async function renderRuntime(input: unknown, phase: Phase): Promise<Resou
     spec: {
       serviceAccountName: serviceAccount, automountServiceAccountToken: false,
       enableServiceLinks: false,
-      nodeSelector: { type: 'benchmark', 'kubernetes.io/arch': 'amd64' },
+      nodeSelector: { 'arrow-collector/role': 'arrowcol', 'kubernetes.io/arch': 'amd64' },
+      tolerations: [{
+        key: 'arrow-collector/role', operator: 'Equal', value: 'arrowcol', effect: 'NoSchedule',
+      }],
       securityContext: { fsGroup: 10001, fsGroupChangePolicy: 'OnRootMismatch', seccompProfile: { type: 'RuntimeDefault' } },
       terminationGracePeriodSeconds: 360, containers, volumes,
     },
@@ -116,7 +121,7 @@ export async function renderRuntime(input: unknown, phase: Phase): Promise<Resou
     return [
       ...identity,
       object('networking.k8s.io/v1', 'NetworkPolicy', 'default-deny-ingress', { spec: { podSelector: {}, policyTypes: ['Ingress'] } }),
-      network('sql-internal', 'arrowcol-sql', ['arrowcol', 'arrowcol-router', 'arrowcol-migrate'], 1433),
+      network('sql-internal', 'arrowcol-sql', ['arrowcol', 'arrowcol-router', 'arrowcol-migrate', 'arrowcol-oat-pin-init'], 1433),
       pvc('arrowcol-sql', '32Gi'), pvc('arrowcol-catalog', '16Gi'),
       service('arrowcol-sql', 1433),
       deployment('arrowcol-sql', [{
@@ -147,7 +152,7 @@ export async function renderRuntime(input: unknown, phase: Phase): Promise<Resou
         env('ARROWCOL_APP_PASSWORD_FILE', '/run/app/password'), env('ARROWCOL_MIGRATOR_PASSWORD_FILE', '/run/migration/password')],
       volumeMounts: [mount('sa', '/run/sa'), mount('app', '/run/app'), mount('migration', '/run/migration')],
     }];
-    return [object('batch/v1', 'Job', 'arrowcol-migrate-v10', { spec: { backoffLimit: 0, activeDeadlineSeconds: 600, template } })];
+    return [object('batch/v1', 'Job', 'arrowcol-migrate-v11', { spec: { backoffLimit: 0, activeDeadlineSeconds: 600, template } })];
   }
   const dataflow = parse(await readFile('projects/arrowcol-dataflow-rust/config.yaml', 'utf8'));
   // --num-cores owns the effective policy; no group/pipeline override may shadow it.
@@ -156,14 +161,16 @@ export async function renderRuntime(input: unknown, phase: Phase): Promise<Resou
   router.sql_server.host = 'arrowcol-sql';
   router.sql_server.password_file = '/run/app/password';
   router.sql_server.trust_server_certificate = true;
-  router.routing.distinct_table_owners = true;
+  router.routing.distinct_table_owners = false;
   router.routing.warmup_ms = 1000;
+  router.routing.lease_ttl_ms = 3600000;
   router.upstream.tls = false;
   router.upstream.sni = '';
   router.upstream.max_h2_streams = 1;
   router.upstream.idle_timeout_seconds = 0;
   router.auth.edge_secret_file = '/run/auth/edge-hmac';
   router.auth.internal_signing_secret_file = '/run/auth/internal-hmac';
+  router.routing.oat_run_id = c.oatRunId;
   const cloudEnv = [
     env('ARROWCOL_DELTA_ROOT', c.deltaRoot),
     env('ARROWCOL_AZURE_MODE', 'stamped'), env('AZURE_SUBSCRIPTION_ID', c.subscriptionId),
@@ -206,6 +213,7 @@ export async function renderRuntime(input: unknown, phase: Phase): Promise<Resou
     }], [{ name: 'config', configMap: { name: 'arrowcol-config' } }, secretVolume('app', 'arrowcol-sql-runtime'), secretVolume('auth', 'arrowcol-router-auth')]),
     network('catalog-internal', 'arrowcol-catalog', ['arrowcol'], 8817),
     network('flight-router-only', 'arrowcol', ['arrowcol-router'], 32010),
+    network('router-oat-client-ingress', 'arrowcol-router', ['arrowcol-oat-client'], 50050),
     // Operator port-forward is the only ingress to the router; no LoadBalancer, Ingress or NodePort.
   ];
 }

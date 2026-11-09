@@ -396,6 +396,46 @@ pub struct RoutingLease {
     pub drain_started_at_unix_ms: Option<UnixMillis>,
 }
 
+/// Immutable per-run binding between a fully qualified table and a collector process.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunTablePin {
+    /// OAT run identifier.
+    pub run_id: String,
+    /// Fully qualified table lease key.
+    pub key: LeaseKey,
+    /// Pinned collector process lifetime.
+    pub holder_instance_id: CollectorInstanceId,
+    /// Lease lineage at the time the run was pinned.
+    pub lease_id: LeaseId,
+    /// Lease fencing epoch at the time the run was pinned.
+    pub fencing_epoch: FencingToken,
+    /// Exclusive end of the run's active pin window.
+    pub expires_at_unix_ms: UnixMillis,
+}
+
+impl RunTablePin {
+    /// Validates the bounded run key and pin lifetime.
+    ///
+    /// # Errors
+    ///
+    /// Returns invalid configuration for malformed run IDs or empty pin windows.
+    pub fn validate(&self, now: UnixMillis) -> RoutingResult<()> {
+        if uuid::Uuid::parse_str(&self.run_id).is_err() {
+            return Err(RoutingError::new(
+                RoutingErrorKind::InvalidConfiguration,
+                "OAT run ID must be a UUID",
+            ));
+        }
+        if self.expires_at_unix_ms <= now {
+            return Err(RoutingError::new(
+                RoutingErrorKind::InvalidConfiguration,
+                "OAT run-table pin expiry must be later than issuance",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl RoutingLease {
     /// Validates persisted lease invariants.
     ///
@@ -443,7 +483,8 @@ impl RoutingLease {
 }
 
 /// Pressure-document validation policy.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PressurePolicy {
     /// Maximum observation age.
     pub max_snapshot_age_ms: u64,
@@ -467,7 +508,8 @@ impl Default for PressurePolicy {
 }
 
 /// Routing, warm-up, lease, and readiness policy.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RoutingPolicy {
     /// Pressure validation.
     pub pressure: PressurePolicy,
@@ -479,10 +521,14 @@ pub struct RoutingPolicy {
     pub minimum_warmup_bps: u16,
     /// New lease duration.
     pub lease_ttl_ms: u64,
+    /// Maximum lifetime of an immutable OAT run/table owner binding.
+    pub oat_run_pin_ttl_ms: u64,
     /// Maximum cached-view age for readiness.
     pub readiness_max_staleness_ms: u64,
     /// Require each active table lease in a pool to have a distinct collector.
     pub distinct_table_owners: bool,
+    /// OAT run authorized to create immutable run/table pins on this router.
+    pub oat_run_id: Option<String>,
 }
 
 impl Default for RoutingPolicy {
@@ -493,8 +539,10 @@ impl Default for RoutingPolicy {
             warmup_ms: 60_000,
             minimum_warmup_bps: 1_000,
             lease_ttl_ms: 30_000,
+            oat_run_pin_ttl_ms: 3_600_000,
             readiness_max_staleness_ms: 30_000,
             distinct_table_owners: false,
+            oat_run_id: None,
         }
     }
 }
@@ -514,11 +562,17 @@ impl RoutingPolicy {
             || self.pressure.max_snapshot_age_ms == 0
             || self.pressure.max_table_entries == 0
             || self.lease_ttl_ms == 0
+            || self.oat_run_pin_ttl_ms < self.lease_ttl_ms
+            || self.oat_run_pin_ttl_ms > 86_400_000
             || self.readiness_max_staleness_ms == 0
+            || self
+                .oat_run_id
+                .as_ref()
+                .is_some_and(|run_id| uuid::Uuid::parse_str(run_id).is_err())
         {
             return Err(RoutingError::new(
                 RoutingErrorKind::InvalidConfiguration,
-                "routing policy contains an invalid zero or basis-point bound",
+                "routing policy contains an invalid zero, duration, or basis-point bound",
             ));
         }
         Ok(())

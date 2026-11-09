@@ -7,7 +7,8 @@ import { parse } from 'yaml';
 import { prepareSecrets, renderRuntime, validateRuntime, type RuntimeConfig } from './runtime.js';
 
 const config = (): RuntimeConfig => ({
-  namespace: 'arrowcol-oat', workloadIdentityClientId: '00000000-0000-0000-0000-000000000001',
+  namespace: 'arrowcol-oat', oatRunId: '00000000-0000-0000-0000-000000000003',
+  workloadIdentityClientId: '00000000-0000-0000-0000-000000000001',
   subscriptionId: '00000000-0000-0000-0000-000000000002', stamp: '89152',
   deltaRoot: 'abfss://onelake@arrowcollector89152.dfs.core.windows.net/dataflow',
   images: Object.fromEntries(['sqlserver', 'catalog', 'router', 'dataflow'].map((role) =>
@@ -24,14 +25,16 @@ test('rejects mutable images, QAP namespace, wrong stamp and unknown fields', ()
   assert.throws(() => validateRuntime(c));
 });
 
-test('isolated integrated topology pins images, WI, identity, probes and worker policy', async () => {
+test('isolated integrated topology pins images, WI, identity, probes and pooled table ownership', async () => {
   const c = config();
   const objects = await renderRuntime(c, 'workload');
   const get = (kind: string, name: string) => objects.find((o) => o.kind === kind && o.metadata.name === name)!;
   const dfe = get('Deployment', 'arrowcol');
   assert.equal(objects.filter((o) => o.kind === 'Deployment').length, 3);
   assert.equal(dfe.spec.strategy.type, 'Recreate');
-  assert.equal(dfe.spec.template.spec.nodeSelector.type, 'benchmark');
+  assert.equal(dfe.spec.template.spec.nodeSelector['arrow-collector/role'], 'arrowcol');
+  assert.ok(dfe.spec.template.spec.tolerations.some((t: { key: string; value: string; effect: string }) =>
+    t.key === 'arrow-collector/role' && t.value === 'arrowcol' && t.effect === 'NoSchedule'));
   assert.equal(dfe.spec.template.metadata.labels['azure.workload.identity/use'], 'true');
   assert.equal(dfe.spec.template.spec.serviceAccountName, 'arrowcol-oat');
   const container = dfe.spec.template.spec.containers[0];
@@ -48,15 +51,22 @@ test('isolated integrated topology pins images, WI, identity, probes and worker 
   assert.equal(engine.groups.arrowcol.pipelines.ingest.nodes.flight.type, 'receiver:arrow_flight');
   assert.equal(engine.groups.arrowcol.pipelines.ingest.nodes.delta.type, 'exporter:arrow_deltalake');
   const router = parse(configs['router.yaml']);
+  assert.equal(router.routing.oat_run_id, c.oatRunId);
   assert.equal(router.upstream.tls, false);
   assert.equal(router.upstream.max_h2_streams, 1);
   assert.equal(router.upstream.idle_timeout_seconds, 0);
-  assert.equal(router.routing.distinct_table_owners, true);
+  assert.equal(router.routing.distinct_table_owners, false);
+  assert.equal(router.routing.lease_ttl_ms, 3_600_000);
   assert.equal(router.auth.edge_secret_file, '/run/auth/edge-hmac');
   assert.equal(objects.some((o) => o.kind === 'Ingress' || o.spec?.type === 'LoadBalancer'), false);
   assert.equal(get('Deployment', 'arrowcol-catalog').spec.template.spec.containers[0].args.at(-1), '--ingestion-layout');
   const rules = get('NetworkPolicy', 'flight-router-only').spec.ingress;
   assert.deepEqual(rules[0].from, [{ podSelector: { matchLabels: { app: 'arrowcol-router' } } }]);
+  const clientIngress = get('NetworkPolicy', 'router-oat-client-ingress').spec.ingress;
+  assert.deepEqual(clientIngress, [{
+    from: [{ podSelector: { matchLabels: { app: 'arrowcol-oat-client' } } }],
+    ports: [{ protocol: 'TCP', port: 50050 }],
+  }]);
 });
 
 test('configured existing federation subject is used by every runtime phase', async () => {
@@ -102,7 +112,10 @@ test('SQL persistence and sequential bootstrap keep migration credentials out of
   const sql = foundation.find((o) => o.kind === 'Deployment')!.spec.template.spec.containers[0];
   assert.deepEqual(sql.securityContext.capabilities, { drop: ['ALL'], add: ['NET_BIND_SERVICE'] });
   assert.equal(sql.securityContext.allowPrivilegeEscalation, false);
+  const sqlIngress = foundation.find((o) => o.kind === 'NetworkPolicy' && o.metadata.name === 'sql-internal')!.spec.ingress;
+  assert.ok(sqlIngress[0].from.some((source: any) => source.podSelector.matchLabels.app === 'arrowcol-oat-pin-init'));
   const [job] = await renderRuntime(config(), 'bootstrap');
+  assert.equal(job.metadata.name, 'arrowcol-migrate-v11');
   assert.deepEqual(job.spec.template.spec.initContainers[0].command, ['/usr/local/bin/database-bootstrap']);
   assert.deepEqual(job.spec.template.spec.containers[0].command, ['/usr/local/bin/arrowcol-migrate']);
   assert.equal(job.spec.backoffLimit, 0);

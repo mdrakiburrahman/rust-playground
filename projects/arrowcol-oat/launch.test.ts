@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { launchOat } from './launch.js';
+import { launchOat, sendViewerFile } from './launch.js';
 
 const status = (state: 'queued' | 'running' | 'succeeded') => ({
   id: 'run-a', state, progress: state, result_count: state === 'succeeded' ? 2 : 0, error: null,
@@ -43,5 +44,59 @@ test('reports validation errors returned by the server', async () => {
     await assert.rejects(launchOat(configPath, undefined, 1, fetcher), /invalid matrix/);
   } finally {
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('allows the executable to select the platform mode without editing the config file', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'arrowcol-oat-'));
+  const configPath = path.join(directory, 'oat.json');
+  await writeFile(configPath, JSON.stringify({ platform: { kind: 'aks' } }));
+  let posted: unknown;
+  const fetcher: typeof fetch = async (_input, init) => {
+    posted = JSON.parse(String(init?.body));
+    return new Response(JSON.stringify(status('succeeded')), { status: 202 });
+  };
+  try {
+    await launchOat(configPath, undefined, 1, fetcher, () => {}, 'local');
+    assert.deepEqual(posted, { platform: { kind: 'local' } });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('serves local viewer byte ranges, suffix ranges, and HEAD requests', async () => {
+  const server = createServer((request, response) => {
+    void sendViewerFile(request, response, Buffer.from('abcdef'), 'application/vnd.apache.parquet');
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  const url = `http://127.0.0.1:${address.port}/`;
+  try {
+    const partial = await fetch(url, { headers: { range: 'bytes=1-3' } });
+    assert.equal(partial.status, 206);
+    assert.equal(partial.headers.get('content-range'), 'bytes 1-3/6');
+    assert.equal(await partial.text(), 'bcd');
+
+    const suffix = await fetch(url, { headers: { range: 'bytes=-2' } });
+    assert.equal(suffix.status, 206);
+    assert.equal(suffix.headers.get('content-range'), 'bytes 4-5/6');
+    assert.equal(await suffix.text(), 'ef');
+
+    const head = await fetch(url, { method: 'HEAD' });
+    assert.equal(head.status, 200);
+    assert.equal(head.headers.get('content-length'), '6');
+    assert.equal(await head.text(), '');
+
+    const invalid = await fetch(url, { headers: { range: 'bytes=8-' } });
+    assert.equal(invalid.status, 416);
+    assert.equal(invalid.headers.get('content-range'), 'bytes */6');
+  } finally {
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    });
   }
 });

@@ -202,6 +202,12 @@ pub struct RoutingConfig {
     pub minimum_warmup_bps: u16,
     /// Routing lease duration.
     pub lease_ttl_ms: u64,
+    /// Maximum lifetime of an immutable OAT run/table owner binding.
+    #[serde(default = "default_oat_run_pin_ttl_ms")]
+    pub oat_run_pin_ttl_ms: u64,
+    /// Exact run ID authorized to create OAT pins in this run-scoped router.
+    #[serde(default)]
+    pub oat_run_id: Option<String>,
     /// Maximum cache age reported ready.
     pub readiness_max_staleness_ms: u64,
     /// Require each active table lease in a pool to have a distinct collector.
@@ -227,10 +233,16 @@ impl RoutingConfig {
             warmup_ms: self.warmup_ms,
             minimum_warmup_bps: self.minimum_warmup_bps,
             lease_ttl_ms: self.lease_ttl_ms,
+            oat_run_pin_ttl_ms: self.oat_run_pin_ttl_ms,
             readiness_max_staleness_ms: self.readiness_max_staleness_ms,
             distinct_table_owners: self.distinct_table_owners,
+            oat_run_id: self.oat_run_id.clone(),
         })
     }
+}
+
+fn default_oat_run_pin_ttl_ms() -> u64 {
+    3_600_000
 }
 
 /// Authentication and signed internal identity configuration.

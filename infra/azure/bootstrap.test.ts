@@ -3,12 +3,25 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import * as path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import * as b from './bootstrap.js';
 import { FakeAzure, SUB, WORKSPACE_CUSTOMER } from './test_support.js';
 import { PublisherControl, READY, FENCED, CLEANING, UnknownTransition } from './publisher_control.js';
 
 let azure: FakeAzure, directory: string, recordPath: string, manifest: string, output: string, stampPath: string, generation: string;
 let elapsed = 0;
+const aksIssuer = 'https://canadacentral.oic.prod-aks.azure.com/tenant/cluster/';
+const nativeCredential = (c: b.Config) => ({
+  name: `azure-qap-${c.cluster}`, properties: { issuer: aksIssuer,
+    subject: `system:serviceaccount:${c.kubernetesNamespace}:${c.kubernetesServiceAccount}`,
+    audiences: ['api://AzureADTokenExchange'] },
+});
+const nativeCluster = (c: b.Config) => ({
+  tags: { ...b.TAGS, sandboxId: c.sandbox }, properties: {
+    oidcIssuerProfile: { enabled: true, issuerURL: aksIssuer },
+    securityProfile: { workloadIdentity: { enabled: true } },
+  },
+});
 const realRun = b.run_tree;
 const parentEnvironment = process.env;
 const receipt = (generation: string) => JSON.stringify({ ...b.RECEIPT_FIELDS, resetGeneration: generation }) + '\n';
@@ -161,6 +174,68 @@ test('isolated deploy parameters retain hash ownership and suppress only stamped
   assert.match(sandbox, /module aks '\.\/aks\.bicep' = if \(azureMode == 'stamped'\)/);
   for (const name of ['runtimeDataWriter', 'runtimeExperimentWriter', 'runtimeControlWriter', 'runtimeExperimentAdmin', 'runtimeClusterReader', 'runtimeReadLogs'])
     assert.match(sandbox, new RegExp(`resource ${name} '[^']+' = if \\(azureMode == 'stamped'\\)`));
+});
+test('QAP CLI refuses omitted custody inputs before any helper or Azure operation', async () => {
+  const input = path.join(directory, '.env.qap-cli');
+  b.write_private(input, { AZURE_SUBSCRIPTION_ID: SUB });
+  prepareStamp();
+  const errors: string[] = [];
+  let externalCalls = 0;
+  mock.method(console, 'error', (message: string) => { errors.push(message); });
+  mock.method(b.Azure.prototype, 'request', async () => { externalCalls++; throw new Error('unexpected Azure request'); });
+  mock.method(b.runtime, 'run_tree', async () => { externalCalls++; throw new Error('unexpected external command'); });
+  const cases: { command: string; required: Record<string, string>; message: RegExp }[] = [
+    { command: 'bind-oat-qap', required: { '--run-id': SUB, '--manifest': manifest, '--record': recordPath,
+      '--workload-record': path.join(directory, 'fic.json') }, message: /QAP binding requires/ },
+    { command: 'verify-oat-qap', required: { '--record': recordPath }, message: /QAP verification requires/ },
+    { command: 'cleanup-oat-qap', required: { '--record': recordPath,
+      '--workload-stop-record': path.join(directory, 'stopped.json') }, message: /QAP cleanup requires/ },
+  ];
+  for (const item of cases) for (const missing of Object.keys(item.required)) {
+    const options = Object.entries(item.required).flatMap(([flag, value]) => flag === missing ? [] : [flag, value]);
+    assert.equal(await b.main([item.command, '--env-file', input, '--stamp-config', stampPath, ...options]), 1);
+    assert.match(errors.at(-1)!, item.message);
+    assert.equal(externalCalls, 0, `missing ${missing} must not reach a helper or external operation`);
+  }
+});
+test('real CLI entrypoint evaluates both helper imports and exits on local validation, not a TLA cycle', () => {
+  const input = path.join(directory, '.env.entrypoint'), guard = path.join(directory, 'deny-external-io.mjs');
+  b.write_private(input, { AZURE_SUBSCRIPTION_ID: SUB });
+  prepareStamp();
+  fs.writeFileSync(manifest, JSON.stringify({ schema_version: 1, run_id: SUB, tables: [] }), { mode: 0o600 });
+  fs.writeFileSync(guard, `
+import childProcess from 'node:child_process';
+import path from 'node:path';
+import { syncBuiltinESMExports } from 'node:module';
+const deny = () => { throw new Error('EXTERNAL_IO_FORBIDDEN'); };
+globalThis.fetch = async () => deny();
+const spawn = childProcess.spawn;
+childProcess.spawn = (command, ...args) => {
+  if (['az', 'kubectl', 'docker'].includes(path.basename(String(command)).replace(/\\.(exe|cmd)$/i, ''))) deny();
+  return spawn(command, ...args);
+};
+syncBuiltinESMExports();
+`, { mode: 0o600 });
+  const cases = [
+    { args: ['prepare-run-fic', '--run-id', 'not-a-uuid', '--namespace', 'invalid',
+      '--service-account', 'arrowcol-oat', '--record', recordPath],
+    expected: /Run FIC identifiers must be nonzero canonical lowercase UUIDs/ },
+    { args: ['bind-oat-qap', '--run-id', SUB, '--manifest', manifest, '--record', recordPath,
+      '--workload-record', path.join(directory, 'not-read.json')],
+    expected: /Manifest version, run or tables mismatch/ },
+  ];
+  for (const item of cases) {
+    const child = spawnSync(process.execPath, ['--import', 'tsx', '--import', pathToFileURL(guard).href,
+      path.join(b.ROOT, 'infra/azure/bootstrap.ts'), ...item.args, '--env-file', input, '--stamp-config', stampPath],
+    { cwd: b.ROOT, env: { ...process.env, NODE_OPTIONS: '' }, encoding: 'utf8',
+      timeout: 15_000, killSignal: 'SIGKILL', maxBuffer: 1_048_576 });
+    assert.equal(child.error, undefined, 'real entrypoint must terminate before the deadline');
+    assert.equal(child.signal, null);
+    assert.equal(child.status, 1, child.stderr);
+    assert.match(child.stderr, item.expected, 'must evaluate the requested helper and reach its local validation');
+    assert.doesNotMatch(child.stderr, /EXTERNAL_IO_FORBIDDEN|unsettled top-level await/i);
+    assert.equal(fs.existsSync(recordPath), false, 'invalid inputs must not create custody or submit work');
+  }
 });
 test('isolated initializer projection rejects ambient identity and carries explicit mode', () => {
   const c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_RESOURCE_GROUP: b.SCHEMA_EVOLUTION_GROUP }, 'schema-evolution');
@@ -407,9 +482,11 @@ test(`Canada stamp preserves existing RG/UAMI locations and trust (existing=${ex
     if (resourcePath === c.identity_id && (existing || deployed))
       return { location: existing ? 'eastus2' : 'canadacentral', tags: identityTags, properties: { clientId: SUB, principalId: SUB } };
     if (resourcePath === c.cluster_id && deployed) return { properties: { uri: 'https://cluster.example' } };
+    if (resourcePath === c.base + '/providers/Microsoft.ContainerService/managedClusters/' + c.cluster && deployed)
+      return nativeCluster(c);
     return null;
   });
-  mock.method(azure, 'collection', async () => publisherCredentials);
+  mock.method(azure, 'collection', async () => [...publisherCredentials, ...deployed ? [nativeCredential(c)] : []]);
   let parameters: any;
   mock.method(azure, 'cli', async (...args: string[]) => {
     assert.deepEqual(args.slice(0, 3), ['deployment', 'sub', 'create']);
@@ -454,6 +531,35 @@ test('stamped deployment refuses missing shared publisher FICs', async () => {
     ? { tags: { ...b.TAGS, sandboxId: 'stamp-89150' } } : null);
   mock.method(azure, 'collection', async () => []);
   await assert.rejects(b.guard_existing(azure), /publisher federated credentials do not match/);
+});
+test('empty external publisher list still requires the exact native AKS trust', async () => {
+  const c = azure.c;
+  assert.deepEqual(c.stampConfig.publisherFederatedCredentials, []);
+  const identity = await azure.arm('GET', c.identity_id);
+  mock.method(azure, 'collection', async () => [nativeCredential(c)]);
+  await b.verify_aks_native_credential(azure, nativeCluster(c), identity);
+  mock.method(azure, 'collection', async () => []);
+  await assert.rejects(b.verify_aks_native_credential(azure, nativeCluster(c), identity), /required AKS-native/);
+});
+for (const mismatch of ['name', 'issuer', 'subject', 'audience', 'duplicate'] as const)
+test(`native AKS trust rejects ${mismatch} mismatch without external publishers`, async () => {
+  const c = azure.c, credential = nativeCredential(c);
+  if (mismatch === 'name') credential.name = 'azure-qap';
+  if (mismatch === 'issuer') credential.properties.issuer += 'other/';
+  if (mismatch === 'subject') credential.properties.subject += '-other';
+  if (mismatch === 'audience') credential.properties.audiences.push('unexpected');
+  mock.method(azure, 'collection', async () => mismatch === 'duplicate' ? [credential, credential] : [credential]);
+  await assert.rejects(b.verify_aks_native_credential(azure, nativeCluster(c), await azure.arm('GET', c.identity_id)),
+    /required AKS-native/);
+});
+test('native AKS trust rejects disabled federation and a different configured UAMI', async () => {
+  const c = azure.c, cluster = nativeCluster(c), identity = await azure.arm('GET', c.identity_id);
+  mock.method(azure, 'collection', async () => [nativeCredential(c)]);
+  cluster.properties.securityProfile.workloadIdentity.enabled = false;
+  await assert.rejects(b.verify_aks_native_credential(azure, cluster, identity), /must both be enabled/);
+  cluster.properties.securityProfile.workloadIdentity.enabled = true;
+  c.identity_client_id = '00000000-0000-0000-0000-000000000002';
+  await assert.rejects(b.verify_aks_native_credential(azure, cluster, identity), /client ID differs/);
 });
 test('shared stamped identity rejects an unrelated or malformed ownership tag', async () => {
   const c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_STAMP: '89151' });
@@ -1194,6 +1300,58 @@ test('GET/HEAD transient failures retry boundedly; writes/nontransient reads rem
     real._request_once = async () => { calls++; throw new b.HttpFailure(code, 'unavailable'); };
     await failure(() => real.request(method, 'https://unused', 'resource'));
     assert.equal(calls, ['GET', 'HEAD'].includes(method) && code !== 403 ? b.READ_ATTEMPTS : 1);
+  }
+});
+test('HTTP capture persists the original response before failure handling and suppresses retries', async () => {
+  for (const [method, status] of [['PUT', 201], ['PUT', 503], ['GET', 503]] as const) {
+    const real = new b.Azure(azure.c), captured: b.HttpReceipt[] = [];
+    let calls = 0;
+    const original = JSON.stringify({ fixture: 'original response', status });
+    const filename = path.join(directory, `${method}-${status}-receipt.json`);
+    real.token = async () => 'fixture-token';
+    mock.method(globalThis, 'fetch', async () => {
+      calls++;
+      return new Response(original, { status, headers: {
+        'x-ms-request-id': 'fixture-request', 'x-ms-correlation-request-id': 'fixture-correlation',
+        'set-cookie': 'not-part-of-receipt',
+      } });
+    });
+    const pending = real.request(method, 'https://unused.invalid/credential', 'https://management.azure.com/',
+      undefined, {}, false, true, response => {
+        b.publish_private(filename, response);
+        captured.push(response);
+      });
+    if (status === 201) assert.equal((await pending)[0]!.toString(), original);
+    else await assert.rejects(pending, error => {
+      assert.equal(captured.length, 1, 'capture must precede the HTTP error');
+      assert.ok(fs.existsSync(filename), 'the failure receipt must already be durable');
+      return error instanceof b.HttpFailure && error.code === status;
+    });
+    assert.equal(calls, 1, 'capture is single-shot even for GET or explicitly idempotent writes');
+    assert.deepEqual(captured, [{ status, bodyBase64: Buffer.from(original).toString('base64'),
+      headers: { 'x-ms-request-id': 'fixture-request', 'x-ms-correlation-request-id': 'fixture-correlation' } }]);
+    assert.deepEqual(JSON.parse(fs.readFileSync(filename, 'utf8')), captured[0]);
+  }
+});
+test('receipt persistence and response-body failures remain ambiguous and never retry', async () => {
+  for (const failurePoint of ['body', 'capture']) {
+    const real = new b.Azure(azure.c);
+    let requests = 0, captures = 0;
+    real.token = async () => 'fixture-token';
+    mock.method(globalThis, 'fetch', async () => {
+      requests++;
+      const response = new Response('original', { status: 201 });
+      if (failurePoint === 'body')
+        mock.method(response, 'arrayBuffer', async () => { throw new Error('injected body read loss'); });
+      return response;
+    });
+    await assert.rejects(real.request('PUT', 'https://unused.invalid/credential', 'https://management.azure.com/',
+      undefined, {}, false, true, () => {
+        captures++;
+        throw new Error('injected receipt persistence failure');
+      }), /injected/);
+    assert.equal(requests, 1);
+    assert.equal(captures, failurePoint === 'body' ? 0 : 1);
   }
 });
 test('read retries gateway timeout then succeeds and network retry trail stays bounded', async () => {

@@ -64,6 +64,11 @@ export class FakeAzure extends Azure {
   override async arm(method: string, resourcePath: string, ..._args: any[]): Promise<any> {
     if (resourcePath === this.c.identity_id) return { location: this.c.location, tags: { ...this.tags }, properties: { clientId: SUB, principalId: SUB } };
     if (resourcePath === this.c.identity_id) return { tags: { ...this.tags }, properties: { clientId: SUB, principalId: SUB } };
+    if (resourcePath === this.c.base + '/providers/Microsoft.ContainerService/managedClusters/' + this.c.cluster)
+      return { tags: { ...this.tags }, properties: {
+        oidcIssuerProfile: { enabled: true, issuerURL: 'https://canadacentral.oic.prod-aks.azure.com/tenant/cluster/' },
+        securityProfile: { workloadIdentity: { enabled: true } },
+      } };
     if (resourcePath.includes('/diagnosticSettings/'))
       return this.diagnostic ? { properties: { logs: [{ category: 'StorageRead', enabled: true }] } } : null;
     if (resourcePath.endsWith('/blobServices/default')) return { properties: this.settings };
@@ -90,6 +95,12 @@ export class FakeAzure extends Azure {
     return {};
   }
   override async collection(resourcePath: string): Promise<any[]> {
+    if (resourcePath === this.c.identity_id + '/federatedIdentityCredentials')
+      return [{ name: `azure-qap-${this.c.cluster}`, properties: {
+        issuer: 'https://canadacentral.oic.prod-aks.azure.com/tenant/cluster/',
+        subject: `system:serviceaccount:${this.c.kubernetesNamespace}:${this.c.kubernetesServiceAccount}`,
+        audiences: ['api://AzureADTokenExchange'],
+      } }];
     return resourcePath.endsWith('/databases') ? this.databases : this.containers;
   }
   override async blobs(container: string): Promise<BlobEntry[]> {

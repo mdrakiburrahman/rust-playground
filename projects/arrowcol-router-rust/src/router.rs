@@ -42,6 +42,8 @@ pub const ROUTING_FENCING_EPOCH_HEADER: &str = "x-arrowcol-routing-fencing-epoch
 pub const ROUTING_LEASE_VERSION_HEADER: &str = "x-arrowcol-routing-lease-version";
 /// Internal routing lease expiry.
 pub const ROUTING_LEASE_EXPIRES_HEADER: &str = "x-arrowcol-routing-lease-expires";
+/// OAT run identity used to resolve the immutable table-owner binding.
+pub const OAT_RUN_ID_HEADER: &str = "x-arrowcol-oat-run-id";
 
 const FLIGHT_SERVICE_PREFIX: &str = "/arrow.flight.protocol.FlightService/";
 
@@ -140,8 +142,37 @@ impl ProductionRouter {
                     return Ok(true);
                 }
             };
+            let run_id = match parse_oat_run_id(&request.headers) {
+                Ok(run_id) => run_id,
+                Err(message) => {
+                    self.metrics.failure("doput", "unknown", "invalid_oat_run_id");
+                    write_grpc_error(session, 3, &message).await?;
+                    return Ok(true);
+                }
+            };
+            if let Err(message) = validate_oat_run_mode(self.routing.policy().oat_run_id.as_deref(), run_id.as_deref()) {
+                self.metrics.failure("doput", "unknown", "unauthorized_oat_run_id");
+                write_grpc_error(session, 7, &message).await?;
+                return Ok(true);
+            }
             let pool = metadata.implementation_pool().to_string();
-            match self.routing.route_ingest(&metadata, now).await {
+            let routed = match run_id {
+                Some(run_id) => {
+                    let expires_at = match oat_run_expiry(now, self.routing.policy().oat_run_pin_ttl_ms) {
+                        Ok(expires_at) => expires_at,
+                        Err(message) => {
+                            self.metrics.failure("doput", &pool, "invalid_oat_run_expiry");
+                            write_grpc_error(session, 3, &message).await?;
+                            return Ok(true);
+                        }
+                    };
+                    self.routing
+                        .route_ingest_for_run(&metadata, &run_id, expires_at, now)
+                        .await
+                }
+                None => self.routing.route_ingest(&metadata, now).await,
+            };
+            match routed {
                 Ok(assignment) => {
                     self.record_assignment(context, assignment, "doput", pool);
                     Ok(false)
@@ -582,6 +613,61 @@ fn parse_ingest_metadata(headers: &http::HeaderMap) -> Result<IngestMetadata, St
         claimed_schema_fingerprint: ascii_header(headers, CLAIMED_SCHEMA_FINGERPRINT_METADATA_KEY)?,
     };
     IngestMetadata::parse(raw).map_err(|cause| cause.to_string())
+}
+
+fn parse_oat_run_id(headers: &http::HeaderMap) -> Result<Option<String>, String> {
+    let values = headers.get_all(OAT_RUN_ID_HEADER);
+    if values.iter().count() > 1 {
+        return Err(format!("gRPC metadata {OAT_RUN_ID_HEADER} must occur at most once"));
+    }
+    let Some(value) = values.iter().next() else {
+        return Ok(None);
+    };
+    let run_id = value
+        .to_str()
+        .map_err(|_| format!("gRPC metadata {OAT_RUN_ID_HEADER} is not visible ASCII"))?;
+    if run_id.is_empty()
+        || run_id.len() > 64
+        || !run_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(format!(
+            "gRPC metadata {OAT_RUN_ID_HEADER} must contain 1..=64 ASCII letters, digits, hyphens, or underscores"
+        ));
+    }
+    Ok(Some(run_id.to_owned()))
+}
+
+fn validate_oat_run_mode(expected: Option<&str>, provided: Option<&str>) -> Result<(), String> {
+    match (expected, provided) {
+        (Some(expected), Some(provided)) if expected == provided => Ok(()),
+        (Some(_), _) => Err("router requires its configured OAT run ID on every ingest request".to_owned()),
+        (None, Some(_)) => Err("router is not configured to authorize OAT run pinning".to_owned()),
+        (None, None) => Ok(()),
+    }
+}
+
+fn oat_run_expiry(now: UnixMillis, ttl_ms: u64) -> Result<UnixMillis, String> {
+    let expires_at = now
+        .get()
+        .checked_add(ttl_ms)
+        .ok_or_else(|| "OAT run pin expiry overflows the timestamp range".to_owned())?;
+    UnixMillis::new(expires_at).map_err(|cause| format!("invalid OAT run pin expiry: {cause}"))
+}
+
+#[cfg(test)]
+mod oat_run_mode_tests {
+    use super::*;
+
+    #[test]
+    fn oat_run_header_requires_exact_run_scoped_router_configuration() {
+        assert!(validate_oat_run_mode(None, None).is_ok());
+        assert!(validate_oat_run_mode(None, Some("run-a")).is_err());
+        assert!(validate_oat_run_mode(Some("run-a"), Some("run-a")).is_ok());
+        assert!(validate_oat_run_mode(Some("run-a"), None).is_err());
+        assert!(validate_oat_run_mode(Some("run-a"), Some("run-b")).is_err());
+    }
 }
 
 fn parse_control_route(headers: &http::HeaderMap, path: &str) -> Result<ControlRoute, String> {

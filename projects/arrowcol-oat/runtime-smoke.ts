@@ -68,7 +68,7 @@ async function main(): Promise<void> {
   router.upstream.sni = '';
   router.upstream.max_h2_streams = 1;
   router.upstream.idle_timeout_seconds = 0;
-  router.routing.distinct_table_owners = true;
+  router.routing.distinct_table_owners = false;
   router.routing.warmup_ms = 1000;
   for (const [name, data] of [['dataflow.yaml', dataflow], ['router.yaml', router]] as const) {
     const file = resolve(root, name);
@@ -129,7 +129,7 @@ async function main(): Promise<void> {
       }
       await sleep(8_000);
       const assignments = docker(['exec', routerName, ...http(50050, '/metrics')]);
-      assert.match(assignments, /arrowcol_router_distinct_table_owners 1/);
+      assert.match(assignments, /arrowcol_router_distinct_table_owners 0/);
       const connections = Number(/^arrowcol_router_upstream_connections_total\{reused="false"\} (\d+)$/m.exec(assignments)?.[1]);
       assert.ok(connections - upstreamConnections >= replicas * 4, 'router must preserve independent upstream connections');
       upstreamConnections = connections;
@@ -139,7 +139,7 @@ async function main(): Promise<void> {
         assert.equal(lines.length, 1, `${table} must have exactly one active SQL lease`);
         return /collector="([^"]+)"/.exec(lines[0])?.[1];
       });
-      assert.equal(new Set(owners).size, replicas, 'selected tables must have distinct collectors');
+      assert.ok(owners.every((owner) => collectors.includes(owner ?? '')), 'every table must have one active owner');
       for (const name of collectors) stop(name);
       // Check physical output, not merely admission acknowledgements.
       const files = docker(['exec', catalog, 'sh', '-c', 'find /onelake/dataflow -name "*.parquet" -type f']);

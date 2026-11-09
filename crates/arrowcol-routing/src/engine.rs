@@ -1,12 +1,16 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use arrowcol_protocol::{CollectorInstanceId, ImplementationPool, IngestMetadata, TableIdentity, UnixMillis};
+use arrowcol_protocol::{
+    CatalogName, CollectorInstanceId, ImplementationPool, IngestMetadata, SchemaName, TableIdentity, TableName,
+    UnixMillis,
+};
 use tokio::sync::RwLock;
 
 use crate::{
     LeaseCas, LeaseClaim, LeaseKey, LeaseState, LeaseSuccession, LeaseTransfer, RoutingError, RoutingErrorKind,
-    RoutingLease, RoutingPolicy, RoutingResult, RoutingStore, RoutingView, collector_is_eligible, rank_collectors,
+    RoutingLease, RoutingPolicy, RoutingResult, RoutingStore, RoutingView, RunTablePin, collector_is_eligible,
+    rank_collectors,
 };
 
 /// Flight SQL control operation declared before the request body.
@@ -204,6 +208,233 @@ impl RoutingEngine {
             RoutingErrorKind::PoolUnavailable,
             "no eligible collector is available for a distinct table lease",
         ))
+    }
+
+    /// Routes an OAT request through the durable immutable run/table binding.
+    ///
+    /// The caller must pass the run expiry from trusted run configuration,
+    /// not a value supplied by the request. Existing pins are checked against
+    /// the authoritative store on every request; a missing, expired, changed,
+    /// or unavailable pin never falls back to ordinary collector selection.
+    pub async fn route_ingest_for_run(
+        &self,
+        metadata: &IngestMetadata,
+        run_id: &str,
+        run_expires_at: UnixMillis,
+        now: UnixMillis,
+    ) -> RoutingResult<RouteAssignment> {
+        if self.policy.oat_run_id.as_deref() != Some(run_id) {
+            return Err(RoutingError::new(
+                RoutingErrorKind::InvalidConfiguration,
+                "OAT run ID is not authorized by this router configuration",
+            ));
+        }
+        validate_oat_run_id(run_id, run_expires_at, now)?;
+        let metadata = canonical_oat_metadata(metadata)?;
+        let key = LeaseKey::new(metadata.implementation_pool(), metadata.table().clone());
+        let pin = self.store.get_run_table_pin(run_id, &key, now).await?.ok_or_else(|| {
+            RoutingError::new(
+                RoutingErrorKind::Conflict,
+                "immutable OAT run-table pin is missing; refusing to initialize on an ingest request",
+            )
+        })?;
+        self.assignment_for_run_pin(&pin, now).await
+    }
+
+    /// Initializes or resumes the trusted, complete run/table pin set.
+    ///
+    /// This operation is reserved for the bounded migrator-authenticated setup
+    /// process. Request routing must use [`Self::route_ingest_for_run`] and
+    /// never invoke this initializer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the run/set is invalid, SQL authority is unavailable,
+    /// any expected table lacks an eligible collector, or an existing pin or
+    /// lease no longer matches its immutable binding.
+    pub async fn initialize_run_table_pins(
+        &self,
+        run_id: &str,
+        expected: &[LeaseKey],
+        expires_at: UnixMillis,
+        now: UnixMillis,
+    ) -> RoutingResult<Vec<RunTablePin>> {
+        let started_at = std::time::Instant::now();
+        self.initialize_run_table_pins_with_clock(run_id, expected, expires_at, now, move || {
+            let elapsed_ms = u64::try_from(started_at.elapsed().as_millis()).map_err(|_| {
+                RoutingError::new(RoutingErrorKind::InvalidConfiguration, "OAT setup elapsed time overflow")
+            })?;
+            add_millis(now, elapsed_ms)
+        })
+        .await
+    }
+
+    /// Initializes a complete pin set using a caller-supplied monotonic setup clock.
+    ///
+    /// The initial timestamp establishes the lower bound; every subsequent
+    /// authority operation samples `clock` and rejects regression or expiry.
+    /// The expiry remains immutable for the entire setup attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the run/set is invalid, the clock regresses, setup
+    /// reaches the fixed expiry, SQL authority is unavailable, any expected
+    /// table lacks an eligible collector, or an existing binding changed.
+    pub async fn initialize_run_table_pins_with_clock<F>(
+        &self,
+        run_id: &str,
+        expected: &[LeaseKey],
+        expires_at: UnixMillis,
+        initial_now: UnixMillis,
+        clock: F,
+    ) -> RoutingResult<Vec<RunTablePin>>
+    where
+        F: Fn() -> RoutingResult<UnixMillis> + Send + Sync,
+    {
+        if self.policy.oat_run_id.as_deref() != Some(run_id) {
+            return Err(RoutingError::new(
+                RoutingErrorKind::InvalidConfiguration,
+                "OAT run ID is not authorized by this router configuration",
+            ));
+        }
+        validate_oat_run_id(run_id, expires_at, initial_now)?;
+        if expected.is_empty()
+            || expected.len() > 32
+            || expected.windows(2).any(|pair| pair[0] >= pair[1])
+            || expected
+                .iter()
+                .any(|key| key.implementation_pool != ImplementationPool::Dataflow)
+        {
+            return Err(RoutingError::new(
+                RoutingErrorKind::InvalidConfiguration,
+                "OAT table set must contain 1..=32 strictly sorted, unique dataflow identities",
+            ));
+        }
+        let mut last_now = initial_now;
+        let now = setup_now(&clock, &mut last_now, expires_at)?;
+        self.store
+            .initialize_run_table_set(run_id, expected, expires_at, now)
+            .await?;
+        let refresh_now = setup_now(&clock, &mut last_now, expires_at)?;
+        let mut view = self.refresh(refresh_now).await?;
+        let mut pins = Vec::with_capacity(expected.len());
+        for key in expected {
+            let now = setup_now(&clock, &mut last_now, expires_at)?;
+            if let Some(pin) = self.store.get_run_table_pin(run_id, key, now).await? {
+                if pin.expires_at_unix_ms != expires_at {
+                    return Err(RoutingError::new(
+                        RoutingErrorKind::Conflict,
+                        "existing OAT run-table pin has a different immutable expiry",
+                    ));
+                }
+                let assignment_now = setup_now(&clock, &mut last_now, expires_at)?;
+                self.assignment_for_run_pin(&pin, assignment_now).await?;
+                pins.push(pin);
+                continue;
+            }
+
+            let mut bound_pin = None;
+            for _ in 0..view.collectors.len().max(1) {
+                let now = setup_now(&clock, &mut last_now, expires_at)?;
+                view = self.refresh(now).await?;
+                let candidate = rank_collectors(&view, key, now, &self.policy, false)
+                    .into_iter()
+                    .find(|candidate| {
+                        !self.policy.distinct_table_owners
+                            || !has_other_active_table_lease(&view, key, *candidate, now)
+                    })
+                    .ok_or_else(|| {
+                        RoutingError::new(
+                            RoutingErrorKind::PoolUnavailable,
+                            "no eligible collector is available to initialize the OAT table pin",
+                        )
+                    })?;
+                let claim_now = setup_now(&clock, &mut last_now, expires_at)?;
+                let claim = self
+                    .store
+                    .claim_lease(&LeaseClaim {
+                        key: key.clone(),
+                        candidate_instance_id: candidate,
+                        now_unix_ms: claim_now,
+                        expires_at_unix_ms: add_millis(claim_now, self.policy.lease_ttl_ms)?,
+                        minimum_snapshot_at_unix_ms: subtract_millis(
+                            claim_now,
+                            self.policy.pressure.max_snapshot_age_ms,
+                        )?,
+                        distinct_table_owners: self.policy.distinct_table_owners,
+                    })
+                    .await;
+                let lease = match claim {
+                    Ok(lease) => lease,
+                    Err(error) if error.kind() == RoutingErrorKind::Conflict => {
+                        let refresh_now = setup_now(&clock, &mut last_now, expires_at)?;
+                        view = self.refresh(refresh_now).await?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                if lease.key != *key || !lease.is_routable_at(claim_now) {
+                    return Err(RoutingError::new(
+                        RoutingErrorKind::Conflict,
+                        "SQL lease claim did not return a live lease for the expected OAT table",
+                    ));
+                }
+                let pin = RunTablePin {
+                    run_id: run_id.to_owned(),
+                    key: key.clone(),
+                    holder_instance_id: lease.holder_instance_id,
+                    lease_id: lease.lease_id,
+                    fencing_epoch: lease.fencing_epoch,
+                    expires_at_unix_ms: expires_at,
+                };
+                let bind_now = setup_now(&clock, &mut last_now, expires_at)?;
+                match self.store.bind_initial_run_table_pin(&pin, bind_now).await {
+                    Ok(bound) if bound == pin => {
+                        bound_pin = Some(bound);
+                        break;
+                    }
+                    Ok(_) => {
+                        return Err(RoutingError::new(
+                            RoutingErrorKind::Conflict,
+                            "SQL run-table initializer returned a different immutable owner",
+                        ));
+                    }
+                    Err(error) if error.kind() == RoutingErrorKind::Conflict => {
+                        let refresh_now = setup_now(&clock, &mut last_now, expires_at)?;
+                        view = self.refresh(refresh_now).await?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            pins.push(bound_pin.ok_or_else(|| {
+                RoutingError::new(
+                    RoutingErrorKind::PoolUnavailable,
+                    "could not claim and bind an eligible collector for the OAT table",
+                )
+            })?);
+            let refresh_now = setup_now(&clock, &mut last_now, expires_at)?;
+            view = self.refresh(refresh_now).await?;
+        }
+        setup_now(&clock, &mut last_now, expires_at)?;
+        Ok(pins)
+    }
+
+    async fn assignment_for_run_pin(&self, pin: &RunTablePin, now: UnixMillis) -> RoutingResult<RouteAssignment> {
+        let view = self.refresh(now).await?;
+        let lease = view.leases.get(&pin.key).ok_or_else(|| {
+            RoutingError::new(RoutingErrorKind::Conflict, "pinned routing lease is missing from the fresh view")
+        })?;
+        if !lease.is_routable_at(now)
+            || lease.holder_instance_id != pin.holder_instance_id
+            || lease.lease_id != pin.lease_id
+            || lease.fencing_epoch != pin.fencing_epoch
+        {
+            return Err(RoutingError::new(
+                RoutingErrorKind::Conflict,
+                "immutable OAT run-table owner changed or expired",
+            ));
+        }
+        assignment_for_lease(&view, lease, now, &self.policy, RouteSource::CachedLease)
     }
 
     /// Selects a healthy catalog-capable backend for explicit Flight SQL control.
@@ -408,6 +639,52 @@ fn has_other_active_table_lease(
     })
 }
 
+fn canonical_oat_metadata(metadata: &IngestMetadata) -> RoutingResult<IngestMetadata> {
+    let table = metadata.table();
+    let canonical = TableIdentity::new(
+        CatalogName::new(table.catalog().as_str().to_ascii_lowercase()).map_err(|cause| {
+            RoutingError::new(
+                RoutingErrorKind::InvalidConfiguration,
+                format!("invalid canonical OAT catalog identity: {cause}"),
+            )
+        })?,
+        SchemaName::new(table.schema().as_str().to_ascii_lowercase()).map_err(|cause| {
+            RoutingError::new(
+                RoutingErrorKind::InvalidConfiguration,
+                format!("invalid canonical OAT schema identity: {cause}"),
+            )
+        })?,
+        TableName::new(table.table().as_str().to_ascii_lowercase()).map_err(|cause| {
+            RoutingError::new(
+                RoutingErrorKind::InvalidConfiguration,
+                format!("invalid canonical OAT table identity: {cause}"),
+            )
+        })?,
+    );
+    Ok(IngestMetadata::new(
+        metadata.protocol_version(),
+        metadata.implementation_pool(),
+        canonical,
+        metadata.claimed_schema_fingerprint(),
+    ))
+}
+
+fn validate_oat_run_id(run_id: &str, expires_at: UnixMillis, now: UnixMillis) -> RoutingResult<()> {
+    if uuid::Uuid::parse_str(run_id).is_err() {
+        return Err(RoutingError::new(
+            RoutingErrorKind::InvalidConfiguration,
+            "OAT run ID must be a UUID",
+        ));
+    }
+    if expires_at <= now {
+        return Err(RoutingError::new(
+            RoutingErrorKind::InvalidConfiguration,
+            "OAT run expiry must be later than the current time",
+        ));
+    }
+    Ok(())
+}
+
 fn assignment_for_lease(
     view: &RoutingView,
     lease: &RoutingLease,
@@ -531,6 +808,31 @@ fn add_millis(value: UnixMillis, delta: u64) -> RoutingResult<UnixMillis> {
             .ok_or_else(|| RoutingError::new(RoutingErrorKind::InvalidConfiguration, "routing timestamp overflow"))?,
     )
     .map_err(|cause| RoutingError::new(RoutingErrorKind::InvalidConfiguration, cause.to_string()))
+}
+
+fn setup_now<F>(
+    clock: &F,
+    last_now: &mut UnixMillis,
+    expires_at: UnixMillis,
+) -> RoutingResult<UnixMillis>
+where
+    F: Fn() -> RoutingResult<UnixMillis>,
+{
+    let now = clock()?;
+    if now < *last_now {
+        return Err(RoutingError::new(
+            RoutingErrorKind::InvalidConfiguration,
+            "OAT setup clock regressed",
+        ));
+    }
+    if now >= expires_at {
+        return Err(RoutingError::new(
+            RoutingErrorKind::Conflict,
+            "immutable OAT run pin set expired during setup",
+        ));
+    }
+    *last_now = now;
+    Ok(now)
 }
 
 fn subtract_millis(value: UnixMillis, delta: u64) -> RoutingResult<UnixMillis> {

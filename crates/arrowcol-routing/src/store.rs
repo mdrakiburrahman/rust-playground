@@ -3,7 +3,7 @@ use async_trait::async_trait;
 
 use crate::{
     CollectorRegistration, CollectorState, LeaseKey, RichPressureSnapshot, RoutingError, RoutingErrorKind,
-    RoutingLease, RoutingResult, RoutingView,
+    RoutingLease, RoutingResult, RoutingView, RunTablePin,
 };
 
 /// Request to create or observe an active lease.
@@ -132,6 +132,40 @@ pub trait RoutingStore: Send + Sync {
 
     /// Atomically creates a lease or returns the unexpired winner.
     async fn claim_lease(&self, claim: &LeaseClaim) -> RoutingResult<RoutingLease>;
+
+    /// Atomically creates or verifies the complete immutable table set for a run.
+    ///
+    /// An exact retry is allowed only while the original set and expiry remain
+    /// intact; missing, additional, or expired rows are never recreated.
+    async fn initialize_run_table_set(
+        &self,
+        run_id: &str,
+        expected: &[LeaseKey],
+        expires_at: UnixMillis,
+        now: UnixMillis,
+    ) -> RoutingResult<()>;
+
+    /// Loads and validates an existing run pin against the current table lease.
+    ///
+    /// An expired or changed pin is an error, never an invitation to select a
+    /// replacement collector.
+    async fn get_run_table_pin(
+        &self,
+        run_id: &str,
+        key: &LeaseKey,
+        now: UnixMillis,
+    ) -> RoutingResult<Option<RunTablePin>>;
+
+    /// Binds an initial owner only for an existing, live pending run/table marker
+    /// and a still-current SQL lease. Exact retries return the original binding.
+    async fn bind_initial_run_table_pin(
+        &self,
+        pin: &RunTablePin,
+        now: UnixMillis,
+    ) -> RoutingResult<RunTablePin>;
+
+    /// Returns whether any unexpired run pin protects this table lease from transfer.
+    async fn has_active_run_table_pin(&self, key: &LeaseKey, now: UnixMillis) -> RoutingResult<bool>;
 
     /// Atomically changes an active lease to draining.
     async fn begin_lease_drain(&self, request: &LeaseCas) -> RoutingResult<RoutingLease>;

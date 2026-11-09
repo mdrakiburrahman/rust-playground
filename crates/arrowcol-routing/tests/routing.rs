@@ -11,8 +11,36 @@ use arrowcol_routing::{
     RoutingLease, RoutingPolicy, RoutingStore, SubsystemState, TablePressure, rank_collectors,
 };
 
+const OAT_RUN_CONCURRENT: &str = "00000000-0000-0000-0000-000000000001";
+const OAT_RUN_EXPIRY: &str = "00000000-0000-0000-0000-000000000002";
+const OAT_RUN_RESTART: &str = "00000000-0000-0000-0000-000000000003";
+const OAT_RUN_REPLACEMENT: &str = "00000000-0000-0000-0000-000000000004";
+const OAT_RUN_CANONICAL: &str = "00000000-0000-0000-0000-000000000005";
+const OAT_RUN_UNAUTHORIZED: &str = "00000000-0000-0000-0000-000000000006";
+
 fn millis(value: u64) -> UnixMillis {
     UnixMillis::new(value).unwrap_or_else(|error| panic!("invalid test timestamp: {error}"))
+}
+
+fn oat_policy(run_id: &str) -> RoutingPolicy {
+    RoutingPolicy {
+        oat_run_id: Some(run_id.to_owned()),
+        ..RoutingPolicy::default()
+    }
+}
+
+async fn initialize_memory_oat_pin(
+    engine: &RoutingEngine,
+    run_id: &str,
+    now: UnixMillis,
+    expires_at: UnixMillis,
+) {
+    let expected = [LeaseKey::new(ImplementationPool::Dataflow, table())];
+    let pins = engine
+        .initialize_run_table_pins(run_id, &expected, expires_at, now)
+        .await
+        .unwrap_or_else(|error| panic!("initialize complete fixture OAT pin set and owner: {error}"));
+    assert_eq!(pins.len(), 1);
 }
 
 fn measurement(value: u64) -> Measurement {
@@ -234,7 +262,6 @@ async fn two_router_replicas_converge_on_one_sql_winner() {
         .refresh(millis(100_000))
         .await
         .unwrap_or_else(|error| panic!("refresh right: {error}"));
-
     let left_task = {
         let left = Arc::clone(&left);
         tokio::spawn(async move { left.route_ingest(&metadata(), millis(100_001)).await })
@@ -253,6 +280,622 @@ async fn two_router_replicas_converge_on_one_sql_winner() {
         .unwrap_or_else(|error| panic!("right route failed: {error}"));
     assert_eq!(left_route.lease, right_route.lease);
     assert_eq!(left_route.instance_id, right_route.instance_id);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_oat_router_instances_read_one_prebound_table_owner() {
+    let (store, _, _) = seeded_store().await;
+    let left_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);
+    let right_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);
+    let left = Arc::new(
+        RoutingEngine::new(left_store, oat_policy(OAT_RUN_CONCURRENT))
+            .unwrap_or_else(|error| panic!("create left engine: {error}")),
+    );
+    let right = Arc::new(
+        RoutingEngine::new(right_store, oat_policy(OAT_RUN_CONCURRENT))
+            .unwrap_or_else(|error| panic!("create right engine: {error}")),
+    );
+    left.refresh(millis(100_000))
+        .await
+        .unwrap_or_else(|error| panic!("refresh left: {error}"));
+    right
+        .refresh(millis(100_000))
+        .await
+        .unwrap_or_else(|error| panic!("refresh right: {error}"));
+    let expected = [LeaseKey::new(ImplementationPool::Dataflow, table())];
+    let prepared = left
+        .initialize_run_table_pins(OAT_RUN_CONCURRENT, &expected, millis(200_000), millis(100_001))
+        .await
+        .unwrap_or_else(|error| panic!("initialize and bind complete OAT pin set: {error}"));
+    assert_eq!(prepared.len(), 1);
+    let prepared_pin = &prepared[0];
+    let setup_counts = store.operation_counts();
+
+    let left_task = {
+        let left = Arc::clone(&left);
+        tokio::spawn(async move {
+            left.route_ingest_for_run(&metadata(), OAT_RUN_CONCURRENT, millis(200_000), millis(100_001))
+                .await
+        })
+    };
+    let right_task = {
+        let right = Arc::clone(&right);
+        tokio::spawn(async move {
+            right
+                .route_ingest_for_run(&metadata(), OAT_RUN_CONCURRENT, millis(200_000), millis(100_001))
+                .await
+        })
+    };
+    let left_route = left_task
+        .await
+        .unwrap_or_else(|error| panic!("left task failed: {error}"))
+        .unwrap_or_else(|error| panic!("left OAT route failed: {error}"));
+    let right_route = right_task
+        .await
+        .unwrap_or_else(|error| panic!("right task failed: {error}"))
+        .unwrap_or_else(|error| panic!("right OAT route failed: {error}"));
+    assert_eq!(left_route.instance_id, right_route.instance_id);
+    assert_eq!(left_route.lease, right_route.lease);
+    assert_eq!(left_route.instance_id, prepared_pin.holder_instance_id);
+    let route_lease = left_route.lease.as_ref().unwrap_or_else(|| panic!("left OAT route has no lease"));
+    assert_eq!(route_lease.key, prepared_pin.key);
+    assert_eq!(route_lease.lease_id, prepared_pin.lease_id);
+    assert_eq!(route_lease.fencing_epoch, prepared_pin.fencing_epoch);
+    assert_eq!(
+        store
+            .get_run_table_pin(
+                OAT_RUN_CONCURRENT,
+                &LeaseKey::new(ImplementationPool::Dataflow, table()),
+                millis(100_002),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("read immutable OAT pin: {error}"))
+            .map(|pin| pin.holder_instance_id),
+        Some(left_route.instance_id)
+    );
+    let after_routes = store.operation_counts();
+    assert_eq!(after_routes.claim_lease, setup_counts.claim_lease);
+    assert_eq!(
+        after_routes.bind_initial_run_table_pin,
+        setup_counts.bind_initial_run_table_pin
+    );
+}
+
+#[tokio::test]
+async fn trusted_oat_initializer_binds_multiple_tables_to_one_eligible_collector() {
+    let (store, _, unavailable) = seeded_store().await;
+    store
+        .set_collector_state(unavailable, CollectorState::Stopped, millis(100_000))
+        .await
+        .unwrap_or_else(|error| panic!("make second collector ineligible: {error}"));
+    let engine_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);
+    let policy = RoutingPolicy {
+        distinct_table_owners: false,
+        ..oat_policy(OAT_RUN_CONCURRENT)
+    };
+    let engine = RoutingEngine::new(engine_store, policy)
+        .unwrap_or_else(|error| panic!("create OAT setup engine: {error}"));
+    let mut expected = vec![
+        LeaseKey::new(ImplementationPool::Dataflow, table_named("traces")),
+        LeaseKey::new(ImplementationPool::Dataflow, table_named("spans")),
+    ];
+    expected.sort();
+
+    let pins = engine
+        .initialize_run_table_pins(OAT_RUN_CONCURRENT, &expected, millis(200_000), millis(100_001))
+        .await
+        .unwrap_or_else(|error| panic!("bind complete two-table OAT set: {error}"));
+    assert_eq!(pins.len(), 2);
+    assert_eq!(pins[0].key, expected[0]);
+    assert_eq!(pins[1].key, expected[1]);
+    assert_eq!(pins[0].holder_instance_id, pins[1].holder_instance_id);
+    let after_initialization = store.operation_counts();
+    assert_eq!(after_initialization.claim_lease, 2);
+    assert_eq!(after_initialization.bind_initial_run_table_pin, 2);
+
+    let retry = engine
+        .initialize_run_table_pins(OAT_RUN_CONCURRENT, &expected, millis(200_000), millis(100_002))
+        .await
+        .unwrap_or_else(|error| panic!("retry identical complete OAT pin setup: {error}"));
+    assert_eq!(retry, pins);
+    let after_retry = store.operation_counts();
+    assert_eq!(after_retry.claim_lease, after_initialization.claim_lease);
+    assert_eq!(
+        after_retry.bind_initial_run_table_pin,
+        after_initialization.bind_initial_run_table_pin
+    );
+}
+
+#[tokio::test]
+async fn trusted_oat_initializer_skips_occupied_preferred_collector_in_distinct_mode() {
+    let (store, _, _) = seeded_store().await;
+    let ordinary_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);
+    let ordinary = RoutingEngine::new(ordinary_store, RoutingPolicy::default())
+        .unwrap_or_else(|error| panic!("create ordinary setup engine: {error}"));
+    ordinary
+        .refresh(millis(100_000))
+        .await
+        .unwrap_or_else(|error| panic!("refresh ordinary setup engine: {error}"));
+    let occupied = ordinary
+        .route_ingest(&metadata_for("occupied"), millis(100_001))
+        .await
+        .unwrap_or_else(|error| panic!("lease preferred collector for another table: {error}"));
+    let expected_key = LeaseKey::new(ImplementationPool::Dataflow, table());
+    let policy = RoutingPolicy {
+        distinct_table_owners: true,
+        ..oat_policy(OAT_RUN_REPLACEMENT)
+    };
+    let view = store
+        .load_view(millis(100_001))
+        .await
+        .unwrap_or_else(|error| panic!("load candidate-selection fixture: {error}"));
+    let preferred = rank_collectors(&view, &expected_key, millis(100_001), &policy, false)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("fixture has no eligible preferred collector"));
+    assert_eq!(preferred, occupied.instance_id);
+
+    let setup_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);
+    let setup = RoutingEngine::new(setup_store, policy)
+        .unwrap_or_else(|error| panic!("create distinct-owner OAT setup engine: {error}"));
+    setup
+        .refresh(millis(100_001))
+        .await
+        .unwrap_or_else(|error| panic!("refresh distinct-owner OAT setup engine: {error}"));
+    let pins = setup
+        .initialize_run_table_pins(
+            OAT_RUN_REPLACEMENT,
+            std::slice::from_ref(&expected_key),
+            millis(200_000),
+            millis(100_002),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("select free alternative collector for OAT pin: {error}"));
+    assert_eq!(pins.len(), 1);
+    assert_ne!(pins[0].holder_instance_id, occupied.instance_id);
+}
+
+#[tokio::test]
+async fn trusted_oat_initializer_uses_fresh_time_for_delayed_pressure() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (store, first, _) = seeded_store().await;
+    store
+        .publish_pressure(&snapshot(first, 103_000, 1_000, 0))
+        .await
+        .unwrap_or_else(|error| panic!("publish pressure after simulated setup delay: {error}"));
+    let engine_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);
+    let engine = RoutingEngine::new(engine_store, oat_policy(OAT_RUN_CANONICAL))
+        .unwrap_or_else(|error| panic!("create delayed-pressure setup engine: {error}"));
+    let expected = [LeaseKey::new(ImplementationPool::Dataflow, table())];
+    let clock_calls = Arc::new(AtomicUsize::new(0));
+    let clock = {
+        let clock_calls = Arc::clone(&clock_calls);
+        move || {
+            let call = clock_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(if call == 0 { millis(100_000) } else { millis(103_000) })
+        }
+    };
+
+    let pins = engine
+        .initialize_run_table_pins_with_clock(
+            OAT_RUN_CANONICAL,
+            &expected,
+            millis(200_000),
+            millis(100_000),
+            clock,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("initialize using refreshed setup time: {error}"));
+    assert_eq!(pins.len(), 1);
+}
+
+#[tokio::test]
+async fn trusted_oat_initializer_stops_when_fixed_expiry_is_crossed() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (store, _, _) = seeded_store().await;
+    let engine_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);
+    let engine = RoutingEngine::new(engine_store, oat_policy(OAT_RUN_CANONICAL))
+        .unwrap_or_else(|error| panic!("create expiring setup engine: {error}"));
+    let key = LeaseKey::new(ImplementationPool::Dataflow, table());
+    let expected = [key.clone()];
+    let clock_calls = Arc::new(AtomicUsize::new(0));
+    let clock = {
+        let clock_calls = Arc::clone(&clock_calls);
+        move || {
+            let call = clock_calls.fetch_add(1, Ordering::Relaxed);
+            let now = match call {
+                0 => 100_000,
+                1 => 100_001,
+                2 => 100_002,
+                3 => 100_003,
+                _ => 100_005,
+            };
+            Ok(millis(now))
+        }
+    };
+    let before = store.operation_counts();
+    let result = engine
+        .initialize_run_table_pins_with_clock(
+            OAT_RUN_CANONICAL,
+            &expected,
+            millis(100_005),
+            millis(100_000),
+            clock,
+        )
+        .await;
+    assert!(matches!(result, Err(error) if error.kind() == RoutingErrorKind::Conflict));
+    let after = store.operation_counts();
+    assert_eq!(after.claim_lease, before.claim_lease);
+    assert_eq!(after.bind_initial_run_table_pin, before.bind_initial_run_table_pin);
+    assert!(
+        store
+            .get_run_table_pin(OAT_RUN_CANONICAL, &key, millis(100_004))
+            .await
+            .unwrap_or_else(|error| panic!("verify only a pending marker remains: {error}"))
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn trusted_oat_initializer_retries_an_existing_binding_with_fresh_setup_time() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (store, _, _) = seeded_store().await;
+    let engine_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);
+    let engine = RoutingEngine::new(engine_store, oat_policy(OAT_RUN_CANONICAL))
+        .unwrap_or_else(|error| panic!("create existing-pin retry engine: {error}"));
+    let key = LeaseKey::new(ImplementationPool::Dataflow, table());
+    let expected = [key];
+    let original = engine
+        .initialize_run_table_pins(OAT_RUN_CANONICAL, &expected, millis(200_000), millis(100_000))
+        .await
+        .unwrap_or_else(|error| panic!("prepare original immutable OAT pin: {error}"));
+
+    let clock_calls = Arc::new(AtomicUsize::new(0));
+    let clock = {
+        let clock_calls = Arc::clone(&clock_calls);
+        move || {
+            let now = match clock_calls.fetch_add(1, Ordering::Relaxed) {
+                0 => 100_010,
+                1 => 100_011,
+                2 => 100_012,
+                3 => 100_013,
+                _ => 100_014,
+            };
+            Ok(millis(now))
+        }
+    };
+    let retry = engine
+        .initialize_run_table_pins_with_clock(
+            OAT_RUN_CANONICAL,
+            &expected,
+            millis(200_000),
+            millis(100_010),
+            clock,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("retry existing immutable OAT pin with fresh time: {error}"));
+    assert_eq!(retry, original);
+    assert_eq!(clock_calls.load(Ordering::Relaxed), 5);
+}
+
+#[tokio::test]
+async fn trusted_oat_initializer_rejects_expiry_crossed_during_final_bound_pin_read() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (store, _, _) = seeded_store().await;
+    let engine_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);
+    let engine = RoutingEngine::new(engine_store, oat_policy(OAT_RUN_CANONICAL))
+        .unwrap_or_else(|error| panic!("create final-expiry setup engine: {error}"));
+    let key = LeaseKey::new(ImplementationPool::Dataflow, table());
+    let expected = [key.clone()];
+    let original = engine
+        .initialize_run_table_pins_with_clock(
+            OAT_RUN_CANONICAL,
+            &expected,
+            millis(100_015),
+            millis(100_000),
+            || Ok(millis(100_000)),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("prepare near-expiry immutable OAT pin: {error}"));
+    let before_retry = store.operation_counts();
+
+    let clock_calls = Arc::new(AtomicUsize::new(0));
+    let clock = {
+        let clock_calls = Arc::clone(&clock_calls);
+        move || {
+            let now = match clock_calls.fetch_add(1, Ordering::Relaxed) {
+                0 => 100_010,
+                1 => 100_011,
+                2 => 100_012,
+                3 => 100_013,
+                _ => 100_015,
+            };
+            Ok(millis(now))
+        }
+    };
+    let retry = engine
+        .initialize_run_table_pins_with_clock(
+            OAT_RUN_CANONICAL,
+            &expected,
+            millis(100_015),
+            millis(100_010),
+            clock,
+        )
+        .await;
+    assert!(matches!(retry, Err(error) if error.kind() == RoutingErrorKind::Conflict));
+    let after_retry = store.operation_counts();
+    assert_eq!(after_retry.claim_lease, before_retry.claim_lease);
+    assert_eq!(
+        after_retry.bind_initial_run_table_pin,
+        before_retry.bind_initial_run_table_pin
+    );
+    assert_eq!(
+        store
+            .get_run_table_pin(OAT_RUN_CANONICAL, &key, millis(100_014))
+            .await
+            .unwrap_or_else(|error| panic!("verify original pin remains intact: {error}")),
+        Some(original[0].clone())
+    );
+}
+
+#[tokio::test]
+async fn fresh_oat_router_does_not_replace_a_missing_bound_owner() {
+    let (store, _, _) = seeded_store().await;
+    let key = LeaseKey::new(ImplementationPool::Dataflow, table());
+    let setup_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);
+    let setup = RoutingEngine::new(setup_store, oat_policy(OAT_RUN_RESTART))
+        .unwrap_or_else(|error| panic!("create OAT setup engine: {error}"));
+    let pins = setup
+        .initialize_run_table_pins(
+            OAT_RUN_RESTART,
+            std::slice::from_ref(&key),
+            millis(200_000),
+            millis(100_001),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("initialize OAT owner before simulating authority loss: {error}"));
+    let original_lease_id = pins[0].lease_id;
+    let before_loss = store.operation_counts();
+    assert!(store.remove_run_table_pin_for_test(OAT_RUN_RESTART, &key).await);
+    let retained_authority = store
+        .load_view(millis(100_002))
+        .await
+        .unwrap_or_else(|error| panic!("verify table lease remains authoritative: {error}"));
+    assert_eq!(
+        retained_authority.leases.get(&key).map(|lease| lease.lease_id),
+        Some(original_lease_id)
+    );
+
+    let fresh_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);
+    let fresh = RoutingEngine::new(fresh_store, oat_policy(OAT_RUN_RESTART))
+        .unwrap_or_else(|error| panic!("create fresh OAT router: {error}"));
+    fresh
+        .refresh(millis(100_002))
+        .await
+        .unwrap_or_else(|error| panic!("refresh fresh OAT router: {error}"));
+    let route = fresh
+        .route_ingest_for_run(&metadata(), OAT_RUN_RESTART, millis(200_000), millis(100_003))
+        .await;
+    assert!(matches!(route, Err(error) if error.kind() == RoutingErrorKind::CorruptState));
+    let after_route = store.operation_counts();
+    assert_eq!(after_route.claim_lease, before_loss.claim_lease);
+    assert_eq!(
+        after_route.bind_initial_run_table_pin,
+        before_loss.bind_initial_run_table_pin
+    );
+}
+
+#[tokio::test]
+async fn oat_pin_fails_closed_on_lease_expiry_without_selecting_a_replacement() {
+    let (store, first, second) = seeded_store().await;
+    let engine_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);
+    let engine = RoutingEngine::new(engine_store, oat_policy(OAT_RUN_EXPIRY))
+        .unwrap_or_else(|error| panic!("create routing engine: {error}"));
+    engine
+        .refresh(millis(100_000))
+        .await
+        .unwrap_or_else(|error| panic!("initial refresh: {error}"));
+    initialize_memory_oat_pin(&engine, OAT_RUN_EXPIRY, millis(100_001), millis(200_000)).await;
+    let initial = engine
+        .route_ingest_for_run(&metadata(), OAT_RUN_EXPIRY, millis(200_000), millis(100_001))
+        .await
+        .unwrap_or_else(|error| panic!("initial OAT route: {error}"));
+    let pinned = initial.lease.unwrap_or_else(|| panic!("OAT route did not return a lease"));
+    let replacement = if pinned.holder_instance_id == first { second } else { first };
+    let claim = store
+        .claim_lease(&LeaseClaim {
+            key: pinned.key.clone(),
+            candidate_instance_id: replacement,
+            now_unix_ms: millis(130_002),
+            expires_at_unix_ms: millis(160_002),
+            minimum_snapshot_at_unix_ms: millis(99_000),
+            distinct_table_owners: false,
+        })
+        .await;
+    assert!(matches!(claim, Err(error) if error.kind() == RoutingErrorKind::Conflict));
+
+    let retry = engine
+        .route_ingest_for_run(&metadata(), OAT_RUN_EXPIRY, millis(200_000), millis(130_002))
+        .await;
+    assert!(matches!(retry, Err(error) if error.kind() == RoutingErrorKind::Conflict));
+}
+
+#[tokio::test]
+async fn oat_pin_fails_closed_when_pinned_collector_process_restarts() {
+    let (store, _, _) = seeded_store().await;
+    let engine_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);
+    let engine = RoutingEngine::new(engine_store, oat_policy(OAT_RUN_RESTART))
+        .unwrap_or_else(|error| panic!("create routing engine: {error}"));
+    engine
+        .refresh(millis(100_000))
+        .await
+        .unwrap_or_else(|error| panic!("initial refresh: {error}"));
+    initialize_memory_oat_pin(&engine, OAT_RUN_RESTART, millis(100_001), millis(200_000)).await;
+    let initial = engine
+        .route_ingest_for_run(&metadata(), OAT_RUN_RESTART, millis(200_000), millis(100_001))
+        .await
+        .unwrap_or_else(|error| panic!("initial OAT route: {error}"));
+    store
+        .set_collector_state(initial.instance_id, CollectorState::Stopped, millis(100_002))
+        .await
+        .unwrap_or_else(|error| panic!("stop pinned collector: {error}"));
+
+    let retry = engine
+        .route_ingest_for_run(&metadata(), OAT_RUN_RESTART, millis(200_000), millis(100_003))
+        .await;
+    assert!(matches!(retry, Err(error) if error.kind() == RoutingErrorKind::Conflict));
+}
+
+#[tokio::test]
+async fn oat_pin_rejects_an_attempt_to_replace_the_run_owner() {
+    let (store, first, second) = seeded_store().await;
+    let engine_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);
+    let engine = RoutingEngine::new(engine_store, oat_policy(OAT_RUN_REPLACEMENT))
+        .unwrap_or_else(|error| panic!("create routing engine: {error}"));
+    engine
+        .refresh(millis(100_000))
+        .await
+        .unwrap_or_else(|error| panic!("initial refresh: {error}"));
+    initialize_memory_oat_pin(&engine, OAT_RUN_REPLACEMENT, millis(100_001), millis(200_000)).await;
+    let initial = engine
+        .route_ingest_for_run(&metadata(), OAT_RUN_REPLACEMENT, millis(200_000), millis(100_001))
+        .await
+        .unwrap_or_else(|error| panic!("initial OAT route: {error}"));
+    let expected_owner = initial.instance_id;
+    let replacement = if expected_owner == first { second } else { first };
+    let mut conflicting = store
+        .get_run_table_pin(
+            OAT_RUN_REPLACEMENT,
+            &LeaseKey::new(ImplementationPool::Dataflow, table()),
+            millis(100_002),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("read initial pin: {error}"))
+        .unwrap_or_else(|| panic!("initial OAT pin is missing"));
+    conflicting.holder_instance_id = replacement;
+    let replace_result = store.bind_initial_run_table_pin(&conflicting, millis(100_002)).await;
+    assert!(matches!(replace_result, Err(error) if error.kind() == RoutingErrorKind::Conflict));
+
+    let mut same_owner = conflicting;
+    same_owner.holder_instance_id = expected_owner;
+    let idempotent = store
+        .bind_initial_run_table_pin(&same_owner, millis(100_002))
+        .await
+        .unwrap_or_else(|error| panic!("repeat same-owner pin: {error}"));
+    assert_eq!(idempotent.expires_at_unix_ms, millis(200_000));
+    let mut changed_expiry = same_owner;
+    changed_expiry.expires_at_unix_ms = millis(250_000);
+    let expiry_result = store
+        .bind_initial_run_table_pin(&changed_expiry, millis(100_002))
+        .await;
+    assert!(matches!(expiry_result, Err(error) if error.kind() == RoutingErrorKind::Conflict));
+
+    let retry = engine
+        .route_ingest_for_run(&metadata(), OAT_RUN_REPLACEMENT, millis(200_000), millis(100_003))
+        .await
+        .unwrap_or_else(|error| panic!("retry OAT route: {error}"));
+    assert_eq!(retry.instance_id, expected_owner);
+}
+
+#[tokio::test]
+async fn oat_pin_uses_canonical_full_table_identity() {
+    let (store, _, _) = seeded_store().await;
+    let engine_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);
+    let engine = RoutingEngine::new(engine_store, oat_policy(OAT_RUN_CANONICAL))
+        .unwrap_or_else(|error| panic!("create routing engine: {error}"));
+    engine
+        .refresh(millis(100_000))
+        .await
+        .unwrap_or_else(|error| panic!("initial refresh: {error}"));
+    initialize_memory_oat_pin(&engine, OAT_RUN_CANONICAL, millis(100_001), millis(200_000)).await;
+    let lower = engine
+        .route_ingest_for_run(&metadata_for("traces"), OAT_RUN_CANONICAL, millis(200_000), millis(100_001))
+        .await
+        .unwrap_or_else(|error| panic!("route lower-case table: {error}"));
+    let mixed = engine
+        .route_ingest_for_run(&metadata_for("TrAcEs"), OAT_RUN_CANONICAL, millis(200_000), millis(100_002))
+        .await
+        .unwrap_or_else(|error| panic!("route mixed-case table: {error}"));
+    assert_eq!(lower.instance_id, mixed.instance_id);
+    assert_eq!(lower.lease, mixed.lease);
+    assert_eq!(
+        store
+            .get_run_table_pin(
+                OAT_RUN_CANONICAL,
+                &LeaseKey::new(ImplementationPool::Dataflow, table()),
+                millis(100_003),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("read canonical OAT pin: {error}"))
+            .map(|pin| pin.key.table),
+        Some(table())
+    );
+}
+
+#[tokio::test]
+async fn oat_pin_rejects_unconfigured_run_ids_before_creating_a_pin() {
+    let (store, _, _) = seeded_store().await;
+    let engine_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);
+    let engine = RoutingEngine::new(engine_store, RoutingPolicy::default())
+        .unwrap_or_else(|error| panic!("create routing engine: {error}"));
+    engine
+        .refresh(millis(100_000))
+        .await
+        .unwrap_or_else(|error| panic!("initial refresh: {error}"));
+    let route = engine
+        .route_ingest_for_run(&metadata(), OAT_RUN_UNAUTHORIZED, millis(200_000), millis(100_001))
+        .await;
+    assert!(matches!(route, Err(error) if error.kind() == RoutingErrorKind::InvalidConfiguration));
+    assert!(
+        store
+            .get_run_table_pin(
+                OAT_RUN_UNAUTHORIZED,
+                &LeaseKey::new(ImplementationPool::Dataflow, table()),
+                millis(100_002),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("check rejected pin: {error}"))
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn missing_or_unavailable_oat_pin_authority_never_falls_back_to_collector_selection() {
+    let (store, _, _) = seeded_store().await;
+    let engine_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);
+    let engine = RoutingEngine::new(engine_store, oat_policy(OAT_RUN_UNAUTHORIZED))
+        .unwrap_or_else(|error| panic!("create routing engine: {error}"));
+    engine
+        .refresh(millis(100_000))
+        .await
+        .unwrap_or_else(|error| panic!("initial refresh: {error}"));
+    let before = store.operation_counts();
+    let missing = engine
+        .route_ingest_for_run(
+            &metadata(),
+            OAT_RUN_UNAUTHORIZED,
+            millis(200_000),
+            millis(100_001),
+        )
+        .await;
+    assert!(matches!(missing, Err(error) if error.kind() == RoutingErrorKind::Conflict));
+    assert_eq!(store.operation_counts().claim_lease, before.claim_lease);
+
+    store.set_available(false);
+    let unavailable = engine
+        .route_ingest_for_run(
+            &metadata(),
+            OAT_RUN_UNAUTHORIZED,
+            millis(200_000),
+            millis(100_002),
+        )
+        .await;
+    assert!(matches!(unavailable, Err(error) if error.kind() == RoutingErrorKind::Database));
+    assert_eq!(store.operation_counts().claim_lease, before.claim_lease);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -303,6 +946,24 @@ async fn distinct_owner_policy_partitions_concurrent_table_claims() {
     ));
 }
 
+#[tokio::test]
+async fn shared_owner_policy_allows_one_collector_to_own_multiple_tables() {
+    let (store, first, _) = seeded_store().await;
+    for (index, table_name) in ["table_a", "table_b"].into_iter().enumerate() {
+        let lease = store
+            .claim_lease(&LeaseClaim {
+                key: LeaseKey::new(ImplementationPool::Dataflow, table_named(table_name)),
+                candidate_instance_id: first,
+                now_unix_ms: millis(100_001 + index as i64),
+                expires_at_unix_ms: millis(130_001 + index as i64),
+                minimum_snapshot_at_unix_ms: millis(99_000),
+                distinct_table_owners: false,
+            })
+            .await
+            .unwrap_or_else(|error| panic!("claim lease for {table_name}: {error}"));
+        assert_eq!(lease.holder_instance_id, first);
+    }
+}
 #[tokio::test]
 async fn distinct_owner_store_rejects_conflicting_table_claims() {
     let (store, first, _) = seeded_store().await;

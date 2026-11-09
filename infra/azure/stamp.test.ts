@@ -111,3 +111,15 @@ test('validates publisher federation and rejects IPv4 or IPv6 overlap with Azure
   assert.throws(() => assertNoStampNetworkOverlap(config, ['fd20:245:2::/64']), /overlaps an existing Azure VNet/);
   assert.doesNotThrow(() => assertNoStampNetworkOverlap(config, ['10.0.0.0/16', 'fd00:0:0040::/56']));
 });
+
+test('empty publisher allowlist is valid without relaxing configured-entry validation', () => {
+  assert.deepEqual(parseStampConfig(example).publisherFederatedCredentials, []);
+  const entry = '\n  - name: github-publish\n    issuer: https://token.actions.githubusercontent.com\n    subject: repo:org/project:environment:publish';
+  const configured = example.replace('publisherFederatedCredentials: []', 'publisherFederatedCredentials:' + entry);
+  assert.equal(parseStampConfig(configured).publisherFederatedCredentials.length, 1);
+  assert.throws(() => parseStampConfig(configured.replace('issuer: https:', 'issuer: http:')), /issuer is invalid/);
+  assert.throws(() => parseStampConfig(configured.replace('subject: repo:org/project:environment:publish', 'subject: ""')), /subject/);
+  assert.throws(() => parseStampConfig(example.replace('publisherFederatedCredentials: []',
+    'publisherFederatedCredentials:' + entry + entry)), /unique names and issuer\/subject pairs/);
+  assert.throws(() => parseStampConfig(configured.replace('name: github-publish', 'name: github-publish\n    allowAnySubject: true')), /unsupported key/);
+});

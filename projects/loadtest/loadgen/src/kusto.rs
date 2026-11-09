@@ -54,12 +54,16 @@ const HEAVY_QUERY_CONCURRENCY: usize = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
-enum Mode {
+pub enum ObservationMode {
+    /// Local Kustainer endpoint using local authentication-free transport.
     Local,
+    /// Azure Data Explorer endpoint using the ambient Azure CLI identity.
     Azure,
 }
 
-impl Mode {
+type Mode = ObservationMode;
+
+impl ObservationMode {
     fn from_env() -> Result<Self> {
         match std::env::var("ARROWCOL_MODE").ok().as_deref().map(str::trim) {
             None | Some("" | "local") => Ok(Self::Local),
@@ -1869,14 +1873,31 @@ pub async fn observe_qap(
     tables: &[String],
     deadline: Duration,
 ) -> Result<Value> {
+    let mode = Mode::from_env()?;
+    let database = match (mode, database) {
+        (_, Some(database)) => database.to_owned(),
+        (Mode::Local, None) => DATABASE.to_owned(),
+        (Mode::Azure, None) => {
+            std::env::var("AZURE_KUSTO_DATABASE").context("AZURE_KUSTO_DATABASE is required in Azure mode")?
+        }
+    };
+    observe_qap_with_mode(endpoint, results, mode, &database, tables, deadline).await
+}
+
+/// Observes QAP using an explicit platform mode and database, without reading or mutating process environment.
+pub async fn observe_qap_with_mode(
+    endpoint: &str,
+    results: &Path,
+    mode: ObservationMode,
+    database: &str,
+    tables: &[String],
+    deadline: Duration,
+) -> Result<Value> {
     let started = Instant::now();
     let queries_completed = Arc::new(AtomicU64::new(0));
     let mut timed_out = false;
     let outcome = async {
-        let mut client = match database {
-            Some(database) => KustoClient::with_mode(endpoint, results, Mode::from_env()?, database)?,
-            None => KustoClient::new(endpoint, results)?,
-        };
+        let mut client = KustoClient::with_mode(endpoint, results, mode, database)?;
         client.queries_completed = Arc::clone(&queries_completed);
         tokio::time::timeout(deadline, async {
             let mut observed = BTreeMap::new();
@@ -1911,6 +1932,46 @@ pub async fn observe_qap(
     )
     .context("write QAP observation diagnostic")?;
     outcome
+}
+
+/// Creates run-scoped local external tables and applies the local QAP policy after Delta commits.
+pub async fn initialize_local_qap(
+    endpoint: &str,
+    results: &Path,
+    database: &str,
+    tables: &[(String, String)],
+    deadline: Duration,
+) -> Result<()> {
+    ensure!(!tables.is_empty(), "local QAP initialization requires at least one external table");
+    ensure!(
+        database == DATABASE,
+        "local QAP initialization currently requires the isolated loadtest database"
+    );
+    let mut names = BTreeSet::new();
+    for (name, location) in tables {
+        identifier(name)?;
+        ensure!(names.insert(name.clone()), "local QAP initialization contains duplicate table names");
+        ensure!(
+            location.starts_with("/delta/dataflow/") && !location.contains(['\'', '\r', '\n']),
+            "local QAP external-table location is outside the run-local Delta mount"
+        );
+    }
+    let client = KustoClient::with_mode(endpoint, results, Mode::Local, database)?;
+    tokio::time::timeout(deadline, async {
+        client.bootstrap().await?;
+        client.local_capacity().await?;
+        for (name, location) in tables {
+            client.expose(name, location).await?;
+            let (_, max_age) = client.max_age(name).await?;
+            ensure!(max_age == LOCAL_MAX_AGE, "local QAP policy for {name} did not match the configured policy");
+            client.schema(name).await.with_context(|| {
+                format!("local QAP external table {name} is not readable from its committed Delta location")
+            })?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("local QAP initialization exceeded its {deadline:?} deadline"))?
 }
 
 async fn observe_table(client: &KustoClient, name: &str) -> Value {

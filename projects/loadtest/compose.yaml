@@ -135,6 +135,51 @@ services:
         ipv4_address: ${LOADTEST_DATAFLOW_1_IP:-10.89.0.31}
     stop_grace_period: 5m
 
+  oat-client:
+    profiles: ["oat"]
+    build:
+      context: ../..
+      dockerfile: projects/arrowcol-oat-rust/Dockerfile.client
+    image: arrowcol-oat-client:local
+    pull_policy: never
+    init: true
+    user: "${LOADTEST_UID:?Run through Nx}:${LOADTEST_GID:?Run through Nx}"
+    secrets:
+      - source: edge_hmac
+        target: edge-hmac
+    volumes:
+      - type: bind
+        source: ${OAT_CONTROL_HOST_PATH:-/dev/null}
+        target: /oat-control
+        bind:
+          create_host_path: false
+
+  oat-pin-init:
+    profiles: ["oat"]
+    image: arrowcol-oat-client:local
+    pull_policy: never
+    init: true
+    user: "${LOADTEST_UID:?Run through Nx}:${LOADTEST_GID:?Run through Nx}"
+    entrypoint: ["/usr/local/bin/arrowcol-oat-pin-init"]
+    command:
+      - "--config"
+      - "/run/arrowcol-oat/pin-init.json"
+      - "--migrator-password-file"
+      - "/run/secrets/arrowcol_migrator_password"
+    secrets:
+      - source: arrowcol_migrator_password
+        target: arrowcol_migrator_password
+    volumes:
+      - type: bind
+        source: ${OAT_PIN_INIT_CONFIG_HOST_PATH:-/dev/null}
+        target: /run/arrowcol-oat/pin-init.json
+        read_only: true
+        bind:
+          create_host_path: false
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
   kusto:
     profiles: ["benchmark"]
     image: mcr.microsoft.com/azuredataexplorer/kustainer-linux@sha256:51e2250da2faf292de903f871a073eb37d3f2641cf63381b183879d21ebb1013
