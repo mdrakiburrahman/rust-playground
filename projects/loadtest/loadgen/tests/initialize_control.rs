@@ -1,5 +1,5 @@
-//! Offline proof of the shared `initialize-azure` body (`initialize_tables_with`): all 26
-//! canonical tables go through the real bootstrap initializer over injected control metadata and a
+//! Offline proof of the shared `initialize-azure` body (`initialize_tables_with`): all 13
+//! Dataflow canonical tables go through the real bootstrap initializer over injected control metadata and a
 //! disposable local store, and the manifest is published only after every table drains. Uses the
 //! dev-only `arrow-deltalake/test-control` seam; no Azure endpoint, token or process environment.
 //! The parent-chain case composes the real TypeScript parent's child environment, the
@@ -37,7 +37,7 @@ const CONTAINER: &str = "tables";
 const ROOT: &str = "abfss://tables@acct.dfs.core.windows.net/sandbox";
 const GENERATION: &str = "00000000-0000-4000-8000-000000000001";
 const ROTATED: &str = "00000000-0000-4000-8000-000000000002";
-const TABLES: usize = 26;
+const TABLES: usize = 13;
 
 #[derive(Default)]
 struct Memory(Mutex<(BTreeMap<String, String>, u64)>);
@@ -222,7 +222,7 @@ fn local(scratch: &Scratch) -> Result<Arc<dyn ObjectStore>> {
     Ok(Arc::new(LocalFileSystem::new_with_prefix(scratch.data())?))
 }
 
-/// Guarantees: every canonical table (both pools) is initialized under fenced-v1 by a bootstrap
+/// Guarantees: every Dataflow canonical table is initialized under fenced-v1 by a bootstrap
 /// member that drains and unregisters; the manifest lists exactly those tables and appears only
 /// after the last one; a rerun preserves every existing log byte-for-byte.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -277,7 +277,7 @@ async fn refused_admission_stops_at_first_table_with_no_blobs_or_manifest() -> R
             .err()
             .with_context(|| format!("{name} admitted"))?;
         assert!(
-            format!("{error:#}").contains("bootstrap canonical table direct_"),
+            format!("{error:#}").contains("bootstrap canonical table dataflow_"),
             "{name}: {error:#}"
         );
         assert_eq!(metadata.metadata(), initial, "{name}: metadata unchanged");
@@ -393,8 +393,8 @@ impl ObjectStore for DataflowPutsTimeOut {
 }
 
 /// Guarantees: an unknown-outcome write on the first dataflow table stops the run there; the
-/// already-drained direct tables persist, that table's bootstrap member stays registered as a
-/// reset blocker, the authority stays fenced-v1, and no manifest is published.
+/// the bootstrap member stays registered as a reset blocker, the authority stays fenced-v1, and no
+/// manifest is published.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unknown_write_mid_run_retains_member_and_withholds_manifest() -> Result<()> {
     let scratch = Scratch::new()?;
@@ -413,8 +413,10 @@ async fn unknown_write_mid_run_retains_member_and_withholds_manifest() -> Result
         Some("fenced-v1")
     );
     let written = logs(&scratch.data())?;
-    assert_eq!(written.len(), TABLES / 2);
-    assert!(written.keys().all(|dir| dir.starts_with("sandbox/direct/")));
+    assert!(
+        written.is_empty(),
+        "no table log is committed after the first uncertain write"
+    );
     assert!(!scratch.manifest().exists());
     Ok(())
 }
@@ -724,25 +726,44 @@ fn supervision_faults_always_kill_reap_and_propagate() -> Result<()> {
 
 /// Guarantees: the environment the real TypeScript parent composes for the child satisfies every
 /// precondition of `initialize-delta.sh`; the script's exact argv parses through the real CLI;
-/// the shared env parser and 26-table body then initialize every table over the guarded store
+/// the shared env parser and 13-table body then initialize every table over the guarded store
 /// and drain; and the parent's real manifest/Delta-log validation accepts that manifest and
 /// those logs, reaching its first ARM call with no Kusto command. Removing one log makes the
 /// parent report NotReady without Kusto.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn parent_child_env_cli_body_and_parent_validation_compose() -> Result<()> {
+    parent_chain_for("stamped", "arrow-collector-rg").await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn isolated_parent_child_env_cli_body_and_parent_validation_compose() -> Result<()> {
+    parent_chain_for("schema-evolution", "rust-playground-schema-evo").await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dedicated_isolated_parent_child_env_cli_body_and_parent_validation_compose() -> Result<()> {
+    parent_chain_for("schema-evolution", "rust-playground-schema-evo-qualification-20261108").await
+}
+
+async fn parent_chain_for(mode: &str, group: &str) -> Result<()> {
     use arrowcol_loadgen::initialize::InitializeAzureConfig;
     use arrowcol_loadgen::{Cli, Command};
     use clap::Parser;
 
     let scratch = Scratch::new()?;
     let values = scratch.0.join("values.json");
-    let stamp_account = "arrowcollector1";
+    let stamp_account = match (mode, group) {
+        ("stamped", _) => "arrowcollector1",
+        ("schema-evolution", "rust-playground-schema-evo") => "arrowcol582e3df61d82",
+        ("schema-evolution", "rust-playground-schema-evo-qualification-20261108") => "arrowcolb34995dd4053",
+        _ => anyhow::bail!("test configured an unknown mode or resource group"),
+    };
     let stamp_root = format!("abfss://{CONTAINER}@{stamp_account}.dfs.core.windows.net/sandbox");
     std::fs::write(
         &values,
         serde_json::to_vec(&serde_json::json!({
-            "AZURE_SUBSCRIPTION_ID": "11111111-2222-4333-8444-555555555555",
-            "AZURE_STAMP": "1",
+            "AZURE_SUBSCRIPTION_ID": "00000000-0000-0000-0000-000000000001",
+            "AZURE_RESOURCE_GROUP": group,
             "AZURE_STORAGE_ACCOUNT": stamp_account,
             "AZURE_STORAGE_CONTAINER": CONTAINER,
             "ARROWCOL_AZURE_TABLE_ROOT": stamp_root,
@@ -755,16 +776,25 @@ async fn parent_child_env_cli_body_and_parent_validation_compose() -> Result<()>
             values.as_os_str(),
             scratch.manifest().as_os_str(),
             GENERATION.as_ref(),
+            mode.as_ref(),
         ],
     )?)?;
-    assert_eq!(child.get("AZURE_STAMP").map(String::as_str), Some("1"));
+    assert_eq!(
+        child.get("AZURE_STAMP").map(String::as_str),
+        if mode == "stamped" { Some("1") } else { None }
+    );
+    assert_eq!(
+        child.get("AZURE_STORAGE_ACCOUNT").map(String::as_str),
+        Some(stamp_account)
+    );
 
-    let script = std::fs::read_to_string(repository().join("infra/azure/initialize-delta.sh"))?;
+    let script = std::fs::read_to_string(repository().join("projects/arrowcol-infra/scripts/initialize-delta.sh"))?;
     let required: Vec<&str> = script
         .lines()
         .filter_map(|line| line.strip_prefix(": \"${")?.split_once(":?").map(|(key, _)| key))
         .collect();
-    assert_eq!(required.len(), 6, "{required:?}");
+    assert_eq!(required.len(), 7, "{required:?}");
+    assert_eq!(child.get("ARROWCOL_AZURE_MODE").map(String::as_str), Some(mode));
     for key in &required {
         assert!(child.get(*key).is_some_and(|value| !value.is_empty()), "{key}");
     }
@@ -815,6 +845,7 @@ async fn parent_child_env_cli_body_and_parent_validation_compose() -> Result<()>
                 values.as_os_str(),
                 scratch.manifest().as_os_str(),
                 scratch.data().as_os_str(),
+                mode.as_ref(),
             ],
         )
     };

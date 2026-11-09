@@ -1,10 +1,8 @@
-//! Runs the docs/quiver tutorial end to end against the built binary and
-//! checks what each step shows.
+//! Exercises generation, inspection, acknowledgement, and crash recovery.
 
 use std::path::Path;
 
 use assert_cmd::Command;
-use predicates::prelude::*;
 use predicates::str::contains;
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -25,150 +23,142 @@ fn run(args: &[&str], dir: &Path) -> Result<String> {
     Ok(String::from_utf8(output)?)
 }
 
-fn segment(dir: &Path, seq: u64) -> std::path::PathBuf {
-    dir.join("segments").join(format!("{seq:016}.qseg"))
-}
-
 #[test]
-fn tutorial_walkthrough() -> Result {
+fn dfe_durable_buffer_walkthrough() -> Result {
     let temp = tempfile::tempdir()?;
     let dir = temp.path().join("quiver-demo");
-
-    // 1. Generate: real rows become fsynced WAL entries, then segments.
-    let generated = run(&["generate"], &dir)?;
+    let generated = run(&["generate", "--catalog-endpoint", "memory"], &dir)?;
     for fact in [
         "telemetry.sqlserver.sqlserver_wait_stats",
-        "sha256:a349410a",
-        "arrowcol.direct@1",
-        "3,546       28          28         4",
+        "arrowcol.flight@1.1",
+        "3,546",
     ] {
         assert!(generated.contains(fact), "generate output lacks {fact:?}:\n{generated}");
     }
 
-    // 2. The directory.
     let tree = run(&["tree"], &dir)?;
-    for fact in [
-        "quiver-cli.json",
-        "quiver.wal ",
-        "write-ahead log: 28 entries",
-        "every entry is in a segment, nothing to replay",
-        "0000000000000003.qseg",
-        "4 bundles, 474 rows, 0/4 acknowledged",
-    ] {
-        assert!(tree.contains(fact), "tree output lacks {fact:?}:\n{tree}");
-    }
-    assert!(
-        !tree.contains("quiver.sub."),
-        "no progress file before the first acknowledgement:\n{tree}"
-    );
+    assert!(dir.join("quiver-cli.json").is_file());
+    assert!(tree.contains("core_0"), "DFE uses a per-core Quiver directory:\n{tree}");
+    assert!(tree.contains("quiver.wal"), "{tree}");
 
-    // 3. The WAL and its cursor.
     let wal = run(&["wal"], &dir)?;
-    assert!(wal.contains("28 in segments, 0 WAL only"), "{wal}");
-
-    // 4. Segments and rows.
+    assert!(
+        wal.contains("28"),
+        "the CSV must produce 28 catalog-typed batches:\n{wal}"
+    );
     let segments = run(&["segments"], &dir)?;
-    assert!(segments.contains("4 finalized segments"), "{segments}");
-    assert!(segments.contains("(28 bundles, 3,546 rows)"), "{segments}");
-    assert!(segments.contains("slot 0, schema sha256:a349410a"), "{segments}");
+    assert!(segments.contains("3,546 rows"), "{segments}");
+    assert!(
+        segments.contains("telemetry.sqlserver.sqlserver_wait_stats v1"),
+        "{segments}"
+    );
     let shown = run(&["show", "--columns", "customer_id,wait_type,wait_time_ms"], &dir)?;
-    assert!(
-        shown.contains("segment 0000000000000000.qseg, bundle 0: 128 rows"),
-        "{shown}"
-    );
-    assert!(
-        shown.contains("table id 30bbde33-b0e2-5244-9260-b9a10c36c872"),
-        "{shown}"
-    );
-    for fact in ["| customer_id", "customer-0000", "customer-0004", "ASYNC_IO_COMPLETION"] {
+    for fact in [
+        "customer-0000",
+        "ASYNC_IO_COMPLETION",
+        "id 0, slot 46",
+        "telemetry.sqlserver.sqlserver_wait_stats v1",
+    ] {
         assert!(shown.contains(fact), "show output lacks {fact:?}:\n{shown}");
     }
-    assert!(!shown.contains("machine_name"), "--columns selects columns:\n{shown}");
-
-    // 5. Consume: the fully acknowledged segment is deleted.
-    let consumed = run(&["consume", "--ack", "12"], &dir)?;
     assert!(
-        consumed.contains("8/8  every bundle acknowledged: segment deleted"),
-        "{consumed}"
+        !shown.contains("table 0"),
+        "show decoded the envelope identity:\n{shown}"
     );
     assert!(
-        consumed.contains("4/8  kept: other bundles are still unacknowledged"),
-        "{consumed}"
-    );
-    assert!(consumed.contains("segments on disk: 4 -> 3"), "{consumed}");
-    assert!(!segment(&dir, 0).exists());
-    let tree = run(&["tree"], &dir)?;
-    assert!(
-        tree.contains("progress of subscriber arrowcol-delta: 4 of 20 bundles in segments acknowledged"),
-        "{tree}"
+        !shown.contains("machine_name"),
+        "--columns selects displayed fields:\n{shown}"
     );
 
-    // 6. Crash: five fsynced bundles that no segment holds yet.
-    let crashed = run(&["crash", "--bundles", "5"], &dir)?;
+    let consumed = run(&["consume", "--ack", "1"], &dir)?;
+    assert!(consumed.contains("durable-buffer acknowledged 1 bundles"), "{consumed}");
+    assert!(run(&["tree"], &dir)?.contains("quiver.sub.durable-buffer"));
+
+    let crashed = run(&["crash", "--bundles", "21"], &dir)?;
     assert!(
-        crashed.contains("bundle 5 fsynced to the WAL and acknowledged"),
+        crashed.contains("bundle 21 fsynced to the WAL and acknowledged"),
         "{crashed}"
     );
     assert!(crashed.contains("child ended by signal 9"), "{crashed}");
-    assert!(!segment(&dir, 4).exists());
     let wal = run(&["wal"], &dir)?;
-    assert!(wal.contains("28 in segments, 5 WAL only"), "{wal}");
-    assert!(wal.contains("WAL only: replays on next open"), "{wal}");
-    let replayable = run(&["show", "--wal", "32", "--rows", "2"], &dir)?;
     assert!(
-        replayable.contains("WAL entry 32 (WAL only: replays on next open): 128 rows"),
-        "{replayable}"
+        wal.contains("21 WAL only"),
+        "crash must leave 21 replayable bundles:\n{wal}"
     );
+    assert!(wal.contains("telemetry.sqlserver.sqlserver_wait_stats v1"), "{wal}");
+    let last_wal = run(&["show", "--wal", "48", "--rows", "2"], &dir)?;
+    assert!(
+        last_wal.contains("telemetry.sqlserver.sqlserver_wait_stats v1"),
+        "{last_wal}"
+    );
+    assert!(last_wal.contains("128 rows"), "{last_wal}");
 
-    // 7. Recover: the restart replays the WAL into a new segment.
     let recovered = run(&["recover"], &dir)?;
-    assert!(
-        recovered.contains("before   3 segments, 5 WAL-only entries"),
-        "{recovered}"
-    );
-    assert!(
-        recovered.contains("new segment 0000000000000004.qseg (5 bundles, 640 rows)"),
-        "{recovered}"
-    );
-    assert!(
-        recovered.contains("after    4 segments, 0 WAL-only entries"),
-        "{recovered}"
-    );
-    assert!(segment(&dir, 4).exists());
-    let wal = run(&["wal"], &dir)?;
-    assert!(wal.contains("33 in segments, 0 WAL only"), "{wal}");
-
-    // Generating again replaces the directory.
-    let _ = run(&["generate"], &dir)?;
+    assert!(recovered.contains("21 WAL-only entries"), "{recovered}");
+    assert!(recovered.contains("21 bundles, 2,688 rows"), "{recovered}");
     let segments = run(&["segments"], &dir)?;
-    assert!(segments.contains("4 finalized segments"), "{segments}");
+    assert!(
+        segments.contains("49 bundles, 6,234 rows"),
+        "all acknowledged and replayed rows remain:\n{segments}"
+    );
+    let _ = run(&["recover"], &dir)?;
+    let segments_after_repeat = run(&["segments"], &dir)?;
+    assert!(
+        segments_after_repeat.contains("49 bundles, 6,234 rows"),
+        "recovery is idempotent:\n{segments_after_repeat}"
+    );
+    assert!(run(&["wal"], &dir)?.contains("0 WAL only"));
+
+    let regenerated = run(
+        &["generate", "--catalog-endpoint", "memory", "--batch-rows", "256"],
+        &dir,
+    )?;
+    assert!(regenerated.contains("generated"), "{regenerated}");
+    let replaced = run(&["segments"], &dir)?;
+    assert!(
+        replaced.contains("14 bundles, 3,546 rows"),
+        "old buffers were not replaced:\n{replaced}"
+    );
+    assert!(
+        !replaced.contains("49 bundles"),
+        "old recovery data remains:\n{replaced}"
+    );
+    let marker: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("quiver-cli.json"))?)?;
+    assert_eq!(marker["generation_status"], "complete");
+    assert_eq!(marker["bundles"], 14);
+    assert_eq!(marker["rows"], 3_546);
+    let regenerated_rows = run(&["show", "--columns", "customer_id"], &dir)?;
+    assert!(
+        regenerated_rows.contains("customer-0000"),
+        "regenerated storage is readable:\n{regenerated_rows}"
+    );
     Ok(())
 }
 
 #[test]
-fn writers_refuse_directories_quiver_cli_did_not_create() -> Result {
+fn writers_refuse_unmarked_directories_before_catalog_access() -> Result {
     let temp = tempfile::tempdir()?;
     std::fs::write(temp.path().join("notes.txt"), b"someone else's files")?;
-    for writer in [vec!["consume"], vec!["crash"], vec!["recover"]] {
+    quiver_cli()
+        .args(["generate", "--catalog-endpoint", "http://127.0.0.1:1"])
+        .arg(temp.path())
+        .assert()
+        .failure()
+        .stderr(contains("is not empty and was not created by quiver-cli"));
+    for writer in ["consume", "crash", "recover"] {
         quiver_cli()
-            .args(&writer)
+            .arg(writer)
             .arg(temp.path())
             .assert()
             .failure()
             .stderr(contains("was not created by quiver-cli"));
     }
     quiver_cli()
-        .arg("generate")
-        .arg(temp.path())
-        .assert()
-        .failure()
-        .stderr(contains("is not empty and was not created by quiver-cli"));
-    quiver_cli()
         .arg("tree")
         .arg(temp.path())
         .assert()
         .success()
-        .stdout(contains("notes.txt").and(contains("not a Quiver file")));
+        .stdout(contains("notes.txt"));
     assert_eq!(std::fs::read(temp.path().join("notes.txt"))?, b"someone else's files");
     Ok(())
 }

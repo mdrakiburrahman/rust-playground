@@ -110,10 +110,16 @@ impl SchemaValidator {
             ));
         }
 
-        let registered = self
-            .store
-            .schema_by_fingerprint(identity, actual_fingerprint)
-            .await?
+        let history = self.store.schema_history(identity).await?;
+        let current = history.last().cloned().ok_or_else(|| {
+            CatalogError::new(
+                CatalogErrorCode::TableNotFound,
+                format!("catalog table {identity} does not exist"),
+            )
+        })?;
+        let registered = history
+            .into_iter()
+            .find(|schema| schema.fingerprint() == actual_fingerprint)
             .ok_or_else(|| {
                 CatalogError::new(
                     CatalogErrorCode::UnknownSchemaFingerprint,
@@ -128,12 +134,6 @@ impl SchemaValidator {
             ));
         }
 
-        let current = self.store.current_schema(identity).await?.ok_or_else(|| {
-            CatalogError::new(
-                CatalogErrorCode::TableNotFound,
-                format!("catalog table {identity} does not exist"),
-            )
-        })?;
         let alignment = if registered.version() == current.version() {
             SchemaAlignmentPlan::Exact {
                 version: current.version(),

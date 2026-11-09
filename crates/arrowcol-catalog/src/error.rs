@@ -25,7 +25,7 @@ pub enum CatalogErrorCode {
     DdlFieldReorder,
     /// An appended field was not nullable.
     DdlNonNullableAppend,
-    /// A SQL, Arrow, Hive, or protobuf type mapping was unsupported or lossy.
+    /// A SQL, Arrow, or protobuf type mapping was unsupported or lossy.
     TypeMappingUnsupported,
     /// A name or identity was invalid.
     InvalidIdentity,
@@ -45,8 +45,6 @@ pub enum CatalogErrorCode {
     CorruptCatalogState,
     /// The application database operation failed.
     ApplicationDatabase,
-    /// Hive Metastore communication or validation failed.
-    HiveMetastore,
     /// Deterministic descriptor generation failed.
     DescriptorGeneration,
     /// Saga reconciliation could not complete.
@@ -75,7 +73,6 @@ impl CatalogErrorCode {
             Self::SchemaChangeInProgress
             | Self::CorruptCatalogState
             | Self::ApplicationDatabase
-            | Self::HiveMetastore
             | Self::DescriptorGeneration
             | Self::ReconciliationFailed => ErrorCode::Internal,
         }
@@ -102,7 +99,6 @@ impl CatalogErrorCode {
             Self::SchemaIncompatible => "schema_incompatible",
             Self::CorruptCatalogState => "corrupt_catalog_state",
             Self::ApplicationDatabase => "application_database",
-            Self::HiveMetastore => "hive_metastore",
             Self::DescriptorGeneration => "descriptor_generation",
             Self::ReconciliationFailed => "reconciliation_failed",
         }
@@ -132,7 +128,6 @@ impl CatalogErrorCode {
             "schema_incompatible" => Ok(Self::SchemaIncompatible),
             "corrupt_catalog_state" => Ok(Self::CorruptCatalogState),
             "application_database" => Ok(Self::ApplicationDatabase),
-            "hive_metastore" => Ok(Self::HiveMetastore),
             "descriptor_generation" => Ok(Self::DescriptorGeneration),
             "reconciliation_failed" => Ok(Self::ReconciliationFailed),
             _ => Err(CatalogError::new(

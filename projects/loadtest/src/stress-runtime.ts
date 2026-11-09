@@ -59,7 +59,6 @@ export interface LocalStressOptions {
   composeFiles: string[];
   env: NodeJS.ProcessEnv;
   reader: string;
-  directAdmin: string;
   dataflowAdmin: string;
   quiver: boolean;
   physicalRoots: Record<string, string>;
@@ -121,7 +120,7 @@ export class LocalStressRuntime {
           throw new Error('Actual generator lifetime does not match the declared measure budget');
         }
         const pools = [];
-        for (const pool of ['direct', 'dataflow']) {
+        for (const pool of ['dataflow']) {
           pools.push(await this.readyFixture(pool, deadline));
         }
         const current = this.progress();
@@ -158,7 +157,7 @@ export class LocalStressRuntime {
       }
       await delay(Math.max(0, Math.min(100, deadline - Date.now())));
     }
-    throw new Error('Actual BOTH-pool compactable source fixtures missed the startup deadline');
+    throw new Error('Actual DFE compactable source fixture missed the startup deadline');
   }
   private async capture(command: string, input: string, output: string, deadline: number, extra: string[] = []): Promise<Record<string, unknown>> {
     this.check();
@@ -257,13 +256,12 @@ export class LocalStressRuntime {
     this.check();
     const [collectors, physical] = await Promise.all([
       Promise.all([
-        collectorSample(this.options.project, 'direct-1', this.options.directAdmin),
         collectorSample(this.options.project, 'dataflow-1', this.options.dataflowAdmin),
       ]),
       physicalInventory(this.options.physicalRoots, deadline),
     ]);
     let rssBytes = 0, backlog = 0, restarts = 0, oomEvents = 0;
-    for (const [index, raw] of collectors.entries()) {
+    for (const raw of collectors) {
       const container = ok(raw.container);
       if (container.running !== true || typeof container.id !== 'string') throw new Error('Collector is not running');
       const identity = `${container.id}:${number(container.hostPid)}`;
@@ -278,13 +276,8 @@ export class LocalStressRuntime {
       const admin = object(raw.admin);
       if (ok(admin.readiness).ready !== true) throw new Error('Collector became unready during qualification');
       const metrics = ok(admin.metrics);
-      if (index === 0) {
-        backlog += number(metrics.arrowcol_direct_active_streams);
-        if (this.options.quiver) backlog += number(metrics.arrowcol_direct_quiver_backlog_bundles);
-      } else {
-        backlog += number(metrics.arrowcol_dfe_buffered_batches) + number(metrics.arrowcol_delta_pending_commits) +
-          number(metrics.arrowcol_dataflow_durable_backlog_batches);
-      }
+      backlog += number(metrics.arrowcol_dfe_buffered_batches) + number(metrics.arrowcol_delta_pending_commits) +
+        number(metrics.arrowcol_dataflow_durable_backlog_batches);
     }
     const progress = this.progress();
     if (progress.run_id !== runId || progress.phase !== 'measure') throw new Error('Source left the declared measure phase');
@@ -294,7 +287,7 @@ export class LocalStressRuntime {
     return {
       timestamp: Date.now(), wave, phase: 'wave-boundary', driverRows: number(progress.scheduled_rows),
       rssBytes, physicalBytes: physical.fileBytes, backlog, restarts: restarts + this.unexpectedRestarts,
-      oomEvents, exhaustedRetries: number(progress.send_policy_failures) + number(progress.receipt_failures),
+      oomEvents, exhaustedRetries: number(progress.send_policy_failures),
     };
   }
   private async docker(args: string[], timeout = 5000): Promise<string> {

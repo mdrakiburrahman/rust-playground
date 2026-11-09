@@ -4,8 +4,7 @@
     "subject": "collector-client-17",
     "issuer": "https://identity.example.test",
     "scopes": [
-      "arrow.write",
-      "receipt.read"
+      "arrow.write"
     ]
   },
   "method": "bearer_token",

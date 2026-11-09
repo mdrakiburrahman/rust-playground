@@ -3,10 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 
-use arrowcol_catalog::{
-    CatalogControlPlane, CatalogStore, DdlParser, HiveMetastore, HiveMetastoreConfig, MemoryCatalogStore,
-    MemoryMetastore, SqlServerCatalogStore, SqlServerConfig,
-};
+use arrowcol_catalog::{CatalogControlPlane, CatalogStore, DdlParser, FlightSqlDdlHandler, MemoryCatalogStore};
 use arrowcol_flight::{RuntimeLimits, RuntimeResult};
 use arrowcol_protocol::{PositiveMeasurement, UnixMillis};
 use arrowcol_routing::{MemoryRoutingStore, RoutingStore, SqlServerRoutingConfig, SqlServerRoutingStore};
@@ -40,10 +37,6 @@ fn default_connect_timeout() -> Duration {
 
 fn default_command_timeout() -> Duration {
     Duration::from_secs(30)
-}
-
-fn default_hive_timeout() -> Duration {
-    Duration::from_secs(10)
 }
 
 fn default_heartbeat_interval() -> Duration {
@@ -124,18 +117,6 @@ impl SqlServerConnectionConfig {
         Ok(())
     }
 
-    pub(crate) fn catalog_config(&self) -> arrowcol_catalog::CatalogResult<SqlServerConfig> {
-        Ok(SqlServerConfig::with_password_file(
-            self.host.clone(),
-            self.port,
-            self.database.clone(),
-            self.username.clone(),
-            &self.password_file,
-        )?
-        .trust_server_certificate(self.trust_server_certificate)
-        .with_timeouts(self.connect_timeout, self.command_timeout))
-    }
-
     pub(crate) fn routing_config(&self) -> arrowcol_routing::RoutingResult<SqlServerRoutingConfig> {
         Ok(SqlServerRoutingConfig::with_password_file(
             self.host.clone(),
@@ -149,109 +130,63 @@ impl SqlServerConnectionConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct HiveMetastoreConnectionConfig {
-    /// Hive Metastore host.
-    pub host: String,
-    /// Hive Metastore Thrift port.
-    pub port: u16,
-    /// Warehouse URI used for new external tables.
-    pub warehouse_root: String,
-    /// Hive table owner.
-    pub owner: String,
-    /// TCP/read/write timeout.
-    #[serde(default = "default_hive_timeout", with = "humantime_serde")]
-    pub connect_timeout: Duration,
-}
-
-impl HiveMetastoreConnectionConfig {
-    fn validate(&self) -> Result<(), String> {
-        if self.host.is_empty()
-            || self.port == 0
-            || self.warehouse_root.is_empty()
-            || self.owner.is_empty()
-            || self.connect_timeout.is_zero()
-        {
-            return Err("Hive host, port, warehouse root, owner, and connect timeout must be set".to_owned());
-        }
-        Ok(())
-    }
-
-    fn build(&self) -> HiveMetastoreConfig {
-        HiveMetastoreConfig::new(self.host.clone(), self.port)
-            .with_warehouse_root(self.warehouse_root.clone())
-            .with_owner(self.owner.clone())
-            .with_connect_timeout(self.connect_timeout)
-    }
-}
-
 /// Catalog implementation used by the Flight receiver.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CatalogConfig {
-    /// Empty in-memory catalog and metastore, intended for focused development.
-    Memory,
-    /// Production application database plus Hive Metastore.
-    SqlHive {
-        /// Arrowcol application database.
-        application_database: Box<SqlServerConnectionConfig>,
-        /// Hive Metastore Thrift connection.
-        hive_metastore: Box<HiveMetastoreConnectionConfig>,
-        /// Time zone used for strict timestamp DDL mapping.
-        #[serde(default = "default_timezone")]
-        timestamp_timezone: String,
+    /// Standalone Flight SQL catalog with a bounded CES-backed schema cache.
+    Remote {
+        /// Flight SQL and CES endpoint, for example http://arrowcol-catalog:8817.
+        endpoint: String,
+        /// Maximum cache age without confirmed CES high-watermark reconciliation.
+        #[serde(default = "default_catalog_cache_age", with = "humantime_serde")]
+        maximum_cache_age: Duration,
     },
+    /// Empty in-memory catalog, intended for focused development.
+    Memory,
 }
 
-fn default_timezone() -> String {
-    "UTC".to_owned()
+fn default_catalog_cache_age() -> Duration {
+    Duration::from_secs(10)
 }
 
 impl CatalogConfig {
     pub(crate) fn validate(&self) -> Result<(), String> {
         match self {
-            Self::Memory => Ok(()),
-            Self::SqlHive {
-                application_database,
-                hive_metastore,
-                timestamp_timezone,
+            Self::Remote {
+                endpoint,
+                maximum_cache_age,
             } => {
-                application_database.validate()?;
-                hive_metastore.validate()?;
-                if timestamp_timezone.trim().is_empty() {
-                    return Err("catalog timestamp timezone must not be empty".to_owned());
+                if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) || maximum_cache_age.is_zero()
+                {
+                    return Err(
+                        "remote catalog endpoint must be HTTP(S) and maximum_cache_age must be positive".to_owned(),
+                    );
                 }
                 Ok(())
             }
+            Self::Memory => Ok(()),
         }
     }
 
     pub(crate) async fn start(
         &self,
-    ) -> arrowcol_catalog::CatalogResult<(Arc<dyn CatalogStore>, Arc<CatalogControlPlane>)> {
+    ) -> arrowcol_catalog::CatalogResult<(Arc<dyn CatalogStore>, Arc<dyn FlightSqlDdlHandler>)> {
         match self {
+            Self::Remote {
+                endpoint,
+                maximum_cache_age,
+            } => {
+                let client =
+                    arrowcol_catalog_client::RemoteCatalogClient::connect(endpoint, *maximum_cache_age).await?;
+                Ok((
+                    Arc::clone(&client) as Arc<dyn CatalogStore>,
+                    client as Arc<dyn FlightSqlDdlHandler>,
+                ))
+            }
             Self::Memory => {
                 let store: Arc<dyn CatalogStore> = Arc::new(MemoryCatalogStore::new());
-                let metastore = Arc::new(MemoryMetastore::new());
-                let (control, _) =
-                    CatalogControlPlane::start(DdlParser::default(), Arc::clone(&store), metastore).await?;
-                Ok((store, Arc::new(control)))
-            }
-            Self::SqlHive {
-                application_database,
-                hive_metastore,
-                timestamp_timezone,
-            } => {
-                let store: Arc<dyn CatalogStore> =
-                    Arc::new(SqlServerCatalogStore::new(application_database.catalog_config()?));
-                let metastore = Arc::new(HiveMetastore::new(hive_metastore.build()));
-                let (control, _) = CatalogControlPlane::start(
-                    DdlParser::new(timestamp_timezone.clone()),
-                    Arc::clone(&store),
-                    metastore,
-                )
-                .await?;
+                let (control, _) = CatalogControlPlane::start(DdlParser::default(), Arc::clone(&store)).await?;
                 Ok((store, Arc::new(control)))
             }
         }

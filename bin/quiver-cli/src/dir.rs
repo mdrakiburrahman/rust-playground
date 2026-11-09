@@ -54,6 +54,29 @@ pub(crate) fn segment_files(dir: &Path) -> Result<Vec<SegmentFile>> {
     Ok(files)
 }
 
+/// Resolves a Quiver data directory or a parent containing one core.
+pub(crate) fn resolve_core_dir(dir: &Path) -> Result<PathBuf> {
+    if dir.join("wal").is_dir() || dir.join("segments").is_dir() {
+        return Ok(dir.to_path_buf());
+    }
+    let mut cores = std::fs::read_dir(dir)
+        .with_context(|| format!("list {}", dir.display()))?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("core_"))
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    cores.sort();
+    match cores.as_slice() {
+        [core] => Ok(core.clone()),
+        [] => bail!("{} has no Quiver core directory", dir.display()),
+        _ => bail!(
+            "{} has multiple Quiver cores; pass one core_N directory: {}",
+            dir.display(),
+            cores.iter().map(|core| file_name(core)).collect::<Vec<_>>().join(", ")
+        ),
+    }
+}
+
 /// Acknowledgement progress of one subscriber.
 pub(crate) struct Subscriber {
     pub(crate) name: String,
@@ -99,10 +122,16 @@ fn subscriber(dir: &Path, id: &SubscriberId) -> Result<Subscriber> {
     })
 }
 
+/// Returns whether a real directory contains a regular CLI ownership marker.
+pub(crate) fn has_cli_marker(dir: &Path) -> bool {
+    std::fs::symlink_metadata(dir).is_ok_and(|metadata| metadata.is_dir())
+        && std::fs::symlink_metadata(dir.join(MARKER_FILE)).is_ok_and(|metadata| metadata.is_file())
+}
+
 /// Refuses to write to a directory quiver-cli did not create, so a writer
 /// never opens a live collector's directory next to the collector.
 pub(crate) fn require_cli_dir(dir: &Path) -> Result<()> {
-    if dir.join(MARKER_FILE).is_file() {
+    if has_cli_marker(dir) {
         return Ok(());
     }
     if !dir.exists() {

@@ -50,7 +50,7 @@ async fn live_routing_case(pooled: bool) -> anyhow::Result<()> {
         TableName::new(format!("route_{}", &Uuid::new_v4().simple().to_string()[..12]))?,
     );
     let key = LeaseKey {
-        implementation_pool: ImplementationPool::Direct,
+        implementation_pool: ImplementationPool::Dataflow,
         table: table.clone(),
     };
     let result: anyhow::Result<()> = async {
@@ -59,7 +59,7 @@ async fn live_routing_case(pooled: bool) -> anyhow::Result<()> {
                 .register_collector(&CollectorRegistration {
                     instance_id: instance,
                     instance_key: format!("live-router-{}", Uuid::new_v4().simple()),
-                    implementation_pool: ImplementationPool::Direct,
+                    implementation_pool: ImplementationPool::Dataflow,
                     flight_endpoint: format!("127.0.0.1:{port}").parse()?,
                     catalog_capable: true,
                     max_concurrent_streams: positive(64)?,
@@ -73,7 +73,7 @@ async fn live_routing_case(pooled: bool) -> anyhow::Result<()> {
 
         let metadata = IngestMetadata::new(
             ProtocolVersion::CURRENT,
-            ImplementationPool::Direct,
+            ImplementationPool::Dataflow,
             table.clone(),
             ClaimedSchemaFingerprint::new(SchemaFingerprint::from_bytes([11; 32])),
         );
@@ -231,7 +231,7 @@ async fn live_sql_hands_crashed_holder_lease_to_same_key_restart() -> anyhow::Re
         SchemaName::new("live")?,
         TableName::new(format!("succession_{}", &Uuid::new_v4().simple().to_string()[..12]))?,
     );
-    let key = LeaseKey::new(ImplementationPool::Direct, table.clone());
+    let key = LeaseKey::new(ImplementationPool::Dataflow, table.clone());
     let result: anyhow::Result<()> = async {
         // The crashed registration closes before wall-clock now, so later
         // cases can never select it even though it never records a state.
@@ -363,7 +363,7 @@ async fn live_sql_hands_crashed_holder_lease_to_same_key_restart() -> anyhow::Re
 
         let metadata = IngestMetadata::new(
             ProtocolVersion::CURRENT,
-            ImplementationPool::Direct,
+            ImplementationPool::Dataflow,
             table.clone(),
             ClaimedSchemaFingerprint::new(SchemaFingerprint::from_bytes([12; 32])),
         );
@@ -528,7 +528,7 @@ fn live_registration(
     Ok(CollectorRegistration {
         instance_id,
         instance_key,
-        implementation_pool: ImplementationPool::Direct,
+        implementation_pool: ImplementationPool::Dataflow,
         flight_endpoint: format!("127.0.0.1:{port}").parse()?,
         catalog_capable: true,
         max_concurrent_streams: positive(64)?,
@@ -618,7 +618,7 @@ async fn active_lease_count(table: &TableIdentity) -> anyhow::Result<i64> {
     let row = client
         .query(
             "SELECT COUNT_BIG(*) AS active_leases FROM arrowcol.routing_table_leases \
-             WHERE implementation_pool = 'direct' AND catalog_name = @P1 AND schema_name = @P2 \
+             WHERE implementation_pool = 'dataflow' AND catalog_name = @P1 AND schema_name = @P2 \
                AND table_name = @P3 AND state = 'active';",
             &[
                 &table.catalog().as_str(),
@@ -642,7 +642,7 @@ async fn delete_fixture_lease(table: &TableIdentity) -> anyhow::Result<()> {
     client
         .execute(
             "DELETE FROM arrowcol.routing_table_leases \
-             WHERE implementation_pool = 'direct' AND catalog_name = @P1 AND schema_name = @P2 \
+             WHERE implementation_pool = 'dataflow' AND catalog_name = @P1 AND schema_name = @P2 \
                AND table_name = @P3;",
             &[
                 &table.catalog().as_str(),

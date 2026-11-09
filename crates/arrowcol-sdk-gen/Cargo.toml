@@ -10,13 +10,17 @@ description = "Deterministic Rust and TypeScript SDK generation for Arrowcol cat
 readme = "README.md"
 
 [dependencies]
+arrow-flight = { version = "58.4", default-features = false, features = ["flight-sql"] }
 arrow-ipc = { version = "58.4", default-features = false }
 arrow-schema = { version = "58.4", default-features = false }
 arrowcol-catalog = { path = "../arrowcol-catalog" }
+arrowcol-catalog-client = { path = "../arrowcol-catalog-client" }
+arrowcol-protocol = { path = "../arrowcol-protocol" }
 clap.workspace = true
 flate2 = "1"
 hex = "0.4"
 prost = "0.14"
+prost-build = "0.14"
 prost-types = "0.14"
 prettyplease = "0.2"
 serde = { version = "1", features = ["derive"] }
@@ -25,9 +29,8 @@ sha2 = "0.10"
 syn = { version = "2", features = ["full"] }
 tar = "0.4"
 thiserror.workspace = true
-
-[dev-dependencies]
-arrowcol-protocol = { path = "../arrowcol-protocol" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tonic = { version = "0.14", features = ["transport"] }
 
 [lints]
 workspace = true

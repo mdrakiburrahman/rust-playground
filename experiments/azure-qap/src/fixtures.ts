@@ -22,7 +22,7 @@ export type Runner = (command: string, args: readonly string[], options: Process
 
 const UUID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
 
-/** Trial names double as Delta table directories and must satisfy `arrowcol-experiment --table`. */
+/** Trial names double as Delta table directories and must satisfy `qap-fixture --table`. */
 export function trialName(operation: Operation, repetition: number): string {
   if (!Number.isSafeInteger(repetition) || repetition < 1) throw new Error('Repetitions start at 1.');
   return repetition === 1 ? operation : `${operation}_${repetition}`;
@@ -155,7 +155,7 @@ export interface FixtureOptions {
   httpMarker?: string;
 }
 
-/** Drives `arrowcol-experiment` (seed/inspect) and `delta-maintenance` against `<root>/<trial>/`. */
+/** Drives `qap-fixture` (seed/inspect) and `delta-maintenance` against `<root>/<trial>/`. */
 export class Fixtures {
   readonly run: Runner;
   constructor(readonly options: FixtureOptions) {
@@ -165,7 +165,7 @@ export class Fixtures {
     this.run = options.run ?? runProcess;
   }
 
-  get experimentBinary(): string { return path.join(this.options.repo, 'target/release/arrowcol-experiment'); }
+  get experimentBinary(): string { return path.join(this.options.repo, 'target/release/qap-fixture'); }
   get maintenanceBinary(): string { return path.join(this.options.repo, 'target/release/delta-maintenance'); }
 
   seedArgs(trial: string, anchorMs: number, fileMib: number, files: number, tombstones: boolean, seconds: number): string[] {

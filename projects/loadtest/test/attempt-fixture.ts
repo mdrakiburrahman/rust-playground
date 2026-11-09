@@ -22,13 +22,15 @@ export function attemptFixture(workspace: string, directory = path.join(workspac
   writeFileSync(path.join(workspace, 'Cargo.lock'), 'lock');
   writeFileSync(path.join(workspace, 'package-lock.json'), '{}');
   beginAttemptEvidence(workspace, directory);
-  const values = ['direct-1', 'dataflow-1', 'router'].map(service => ({
+  const values = ['dataflow-1', 'router', 'arrowcol-catalog'].map(service => ({
     id: `${service}-id`, name: service, image: `sha256:${'b'.repeat(64)}`,
     labels: { 'com.docker.compose.project': BENCHMARK_PROJECT, 'com.docker.compose.service': service,
       'com.docker.compose.project.config_files': path.join(workspace, 'projects/loadtest/compose.yaml') },
-    state: { Running: service === 'router', ExitCode: 0, OOMKilled: false },
-    mounts: service === 'router'
-      ? [{ Type: 'bind', Source: path.join(directory, 'router-state'), Destination: '/state', RW: true }] : [],
+    state: { Running: service !== 'dataflow-1', ExitCode: 0, OOMKilled: false },
+    mounts: service === 'dataflow-1' ? [] : [{
+      Type: 'bind', Source: path.join(directory, service === 'router' ? 'router-state' : 'catalog-state'),
+      Destination: '/state', RW: true,
+    }],
   }));
   writeFileSync(path.join(directory, 'results/provenance.json'), JSON.stringify({ helpers: { host }, source: { head },
     containers: values.map(value => ({ id: value.id, imageId: value.image, service: value.name })) }));
@@ -44,7 +46,7 @@ export function attemptFixture(workspace: string, directory = path.join(workspac
     if (args[0] === 'inspect') return JSON.stringify(value);
     throw new Error('Unexpected fixture command');
   };
-  const stopped = stoppedAttemptMutators(workspace, docker, ['direct-1', 'dataflow-1']);
+  const stopped = stoppedAttemptMutators(workspace, docker, ['dataflow-1']);
   return { directory, helperDirectory, commands, docker, values, stopped,
     seal: () => sealAttemptEvidence(workspace, directory, helperDirectory, docker, stopped) };
 }

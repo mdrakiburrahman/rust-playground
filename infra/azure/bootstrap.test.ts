@@ -51,10 +51,149 @@ async function custody(record = makeRecord()): Promise<b.ResetRecord> {
 
 test('default configuration is deterministic and generated values contain no subscription', () => {
   const c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB });
+  assert.equal(c.sandbox, 'stamp-1');
   assert.equal(c.group, 'arrow-collector-rg'); assert.deepEqual([c.minimum, c.maximum], [2, 4]);
   assert.ok(c.generated().ARROWCOL_AZURE_TABLE_ROOT.startsWith('abfss://'));
   assert.ok(!('AZURE_SUBSCRIPTION_ID' in c.generated()));
   assert.equal(c.account, azure.c.account);
+});
+test('named sandbox isolates resource identities and generated configuration preserves its group', () => {
+  const values = { AZURE_SUBSCRIPTION_ID: SUB, AZURE_RESOURCE_GROUP: 'rust-playground-schema-evo' };
+  const c = new b.Config(values, 'schema-evolution');
+  assert.equal(c.group, values.AZURE_RESOURCE_GROUP);
+  assert.equal(c.sandbox, '582e3df61d82');
+  assert.equal(c.sandbox, new b.Config(values, 'schema-evolution').sandbox);
+  assert.notEqual(c.sandbox, azure.c.sandbox);
+  assert.notEqual(c.account, azure.c.account);
+  assert.notEqual(c.cluster, azure.c.cluster);
+  assert.ok(c.storage_id.startsWith(c.base + '/'));
+  assert.equal(c.generated().AZURE_RESOURCE_GROUP, c.group);
+  assert.equal(new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, ...c.generated() }, 'schema-evolution').table_root, c.table_root);
+  assert.throws(() => new b.Config({ ...values, ARROWCOL_AZURE_TABLE_ROOT: azure.c.table_root }, 'schema-evolution'), b.Failure);
+  assert.throws(() => b.owned({ tags: azure.tags }, c), b.Failure);
+});
+test('dedicated schema-evolution groups derive disjoint storage, cluster, identity and authority paths', () => {
+  const groups = ['rust-playground-schema-evo-qualification-20261108', 'rust-playground-schema-evo-isolated-2'];
+  const configs = groups.map(group => new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_RESOURCE_GROUP: group }, 'schema-evolution'));
+  const [first, second] = configs;
+  assert.equal(first.group, groups[0]); assert.equal(second.group, groups[1]);
+  assert.notEqual(first.sandbox, second.sandbox);
+  assert.notEqual(first.account, second.account);
+  assert.notEqual(first.cluster, second.cluster);
+  assert.equal(first.identity, second.identity);
+  assert.notEqual(first.identity_id, second.identity_id);
+  assert.notEqual(first.storage_id, second.storage_id);
+  assert.notEqual(first.cluster_id, second.cluster_id);
+  assert.notEqual(first.generated().ARROWCOL_AZURE_TABLE_ROOT, second.generated().ARROWCOL_AZURE_TABLE_ROOT);
+  assert.notEqual(first.generated().ARROWCOL_AZURE_CHECKPOINT_ROOT, second.generated().ARROWCOL_AZURE_CHECKPOINT_ROOT);
+  assert.equal(first.generated().AZURE_RESOURCE_GROUP, groups[0]);
+  assert.equal(second.generated().AZURE_RESOURCE_GROUP, groups[1]);
+  for (const group of ['rust-playground', 'rust-playground-other', 'Rust-playground-schema-evo-x',
+    'rust-playground-schema-evo--bad', 'rust-playground-schema-evo-bad-',
+    'rust-playground-schema-evo_' + 'a'.repeat(64), 'rust-playground-schema-evo-' + 'a'.repeat(64)])
+    assert.throws(() => new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_RESOURCE_GROUP: group }, 'schema-evolution'), b.Failure);
+  const longest = 'rust-playground-schema-evo-' + 'a'.repeat(63);
+  assert.equal(new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_RESOURCE_GROUP: longest }, 'schema-evolution').group, longest);
+});
+test('isolated mode is explicit and rejects dual configuration, account substitution and foreign authority', async () => {
+  const values = { AZURE_SUBSCRIPTION_ID: SUB, AZURE_RESOURCE_GROUP: b.SCHEMA_EVOLUTION_GROUP };
+  const c = new b.Config(values, 'schema-evolution');
+  assert.throws(() => new b.Config(values), b.Failure);
+  assert.throws(() => new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, ARROWCOL_AZURE_MODE: 'schema-evolution' }), b.Failure);
+  assert.throws(() => new b.Config({ ...values, AZURE_STORAGE_ACCOUNT: azure.c.account }, 'schema-evolution'), b.Failure);
+  assert.throws(() => new b.Config({ ...values, AZURE_RESOURCE_GROUP: 'rust-playground' }, 'schema-evolution'), b.Failure);
+  for (const key of ['AZURE_STAMP', 'AZURE_AKS_CONFIG', 'AZURE_CONTAINER_REGISTRY_NAME',
+    'AZURE_KUBERNETES_NAMESPACE', 'AZURE_UAMI_CLIENT_ID', 'AZURE_FEDERATED_TOKEN_FILE', 'AZURE_CLIENT_ID', 'AZURE_TENANT_ID'])
+    assert.throws(() => new b.Config({ ...values, [key]: '1' }, 'schema-evolution'), b.Failure);
+  assert.throws(() => new b.Config({ ...values, ARROWCOL_AZURE_MODE: 'stamped' }, 'schema-evolution'), b.Failure);
+  assert.throws(() => c.stampConfig, b.Failure);
+  assert.equal(c.generated().ARROWCOL_AZURE_MODE, 'schema-evolution');
+  assert.ok(!Object.hasOwn(c.generated(), 'AZURE_STAMP'));
+  const wrong = new FakeAzure(); wrong.c = c;
+  await assert.rejects(() => new PublisherControl(wrong).read(), b.Failure);
+});
+test('isolated authentication fails before IO on ambient workload identity', async () => {
+  const c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_RESOURCE_GROUP: b.SCHEMA_EVOLUTION_GROUP }, 'schema-evolution');
+  const client = new b.Azure(c);
+  client.cli = async () => { assert.fail('authentication attempted before rejecting foreign workload context'); };
+  process.env.AZURE_CLIENT_ID = SUB;
+  await assert.rejects(client.token('https://storage.azure.com/'), /approved Azure CLI context/);
+});
+test('CLI isolates only explicitly selected private input and never falls back from ambient mode', async () => {
+  const input = path.join(directory, '.env.schema-evo');
+  b.write_private(input, { AZURE_SUBSCRIPTION_ID: SUB, AZURE_RESOURCE_GROUP: b.SCHEMA_EVOLUTION_GROUP });
+  process.env.ARROWCOL_AZURE_MODE = 'schema-evolution'; process.env.AZURE_STAMP = '1';
+  process.env.AZURE_RESOURCE_GROUP = 'arrow-collector-rg';
+  assert.equal(await b.main(['config', '--mode', 'schema-evolution', '--env-file', input, '--output', output]), 0);
+  const projected = b.load_env(output);
+  assert.equal(projected.ARROWCOL_AZURE_MODE, 'schema-evolution');
+  assert.equal(projected.AZURE_STORAGE_ACCOUNT, 'arrowcol582e3df61d82');
+  assert.ok(!Object.hasOwn(projected, 'AZURE_STAMP'));
+  prepareStamp();
+  assert.equal(await b.main(['config', '--env-file', input, '--stamp-config', stampPath, '--output', output]), 1);
+  assert.equal(await b.main(['config', '--mode', 'schema-evolution', '--env-file', input,
+    '--stamp-config', stampPath, '--output', output]), 1);
+});
+test('isolated deploy parameters retain hash ownership and suppress only stamped resources', async () => {
+  const values = { AZURE_SUBSCRIPTION_ID: SUB, AZURE_RESOURCE_GROUP: b.SCHEMA_EVOLUTION_GROUP };
+  const c = new b.Config(values, 'schema-evolution');
+  const isolated = new FakeAzure(); isolated.c = c; isolated.tags = { ...b.TAGS, sandboxId: c.sandbox };
+  let calls = 0;
+  isolated.cli = async (...args: string[]) => {
+    assert.deepEqual(args.slice(0, 3), ['deployment', 'sub', 'create']);
+    const params = JSON.parse(fs.readFileSync(args.at(-1)!.slice(1), 'utf8')).parameters;
+    assert.equal(params.azureMode.value, 'schema-evolution');
+    assert.equal(params.resourceGroupName.value, b.SCHEMA_EVOLUTION_GROUP);
+    assert.equal(params.sandboxId.value, '582e3df61d82');
+    assert.equal(params.storageAccountName.value, 'arrowcol582e3df61d82');
+    assert.equal(params.registryName.value, '');
+    assert.deepEqual(params.aksConfig.value, {});
+    assert.deepEqual(params.publisherFederatedCredentials.value, []);
+    calls++; return {};
+  };
+  await b.deploy(isolated);
+  assert.equal(calls, 1);
+  const main = fs.readFileSync(path.join(b.ROOT, 'infra/azure/main.bicep'), 'utf8');
+  const sandbox = fs.readFileSync(path.join(b.ROOT, 'infra/azure/sandbox.bicep'), 'utf8');
+  assert.match(main, /param azureMode string = 'stamped'/);
+  assert.match(sandbox, /module aks '\.\/aks\.bicep' = if \(azureMode == 'stamped'\)/);
+  for (const name of ['runtimeExperimentWriter', 'runtimeControlWriter', 'runtimeExperimentAdmin', 'runtimeClusterReader', 'runtimeReadLogs'])
+    assert.match(sandbox, new RegExp(`resource ${name} '[^']+' = if \\(azureMode == 'stamped'\\)`));
+});
+test('isolated initializer projection rejects ambient identity and carries explicit mode', () => {
+  const c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_RESOURCE_GROUP: b.SCHEMA_EVOLUTION_GROUP }, 'schema-evolution');
+  process.env.AZURE_STAMP = '1'; process.env.AZURE_KUBERNETES_NAMESPACE = 'foreign';
+  process.env.AZURE_CONFIG_DIR = 'selected-cli';
+  const env = b.initializer_env({}, c, manifest, generation);
+  assert.equal(env.ARROWCOL_AZURE_MODE, 'schema-evolution');
+  assert.equal(env.AZURE_STAMP, undefined);
+  assert.equal(env.AZURE_KUBERNETES_NAMESPACE, undefined);
+  assert.equal(env.AZURE_CONFIG_DIR, 'selected-cli');
+  assert.equal(env.AZURE_STORAGE_ACCOUNT, 'arrowcol582e3df61d82');
+  assert.equal(env.ARROWCOL_EXPECTED_RESET_GENERATION, generation);
+  assert.throws(() => b.initializer_env({ AZURE_STAMP: '1' }, c, manifest, generation), b.Failure);
+});
+test('isolated preflight uses the same subscription and inventory gates without AKS operations', async () => {
+  const c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_RESOURCE_GROUP: b.SCHEMA_EVOLUTION_GROUP }, 'schema-evolution');
+  c.operator = SUB;
+  const isolated = new FakeAzure(); isolated.c = c; isolated.tags = { ...b.TAGS, sandboxId: c.sandbox };
+  const providers: string[] = [];
+  const messages: string[] = [];
+  mock.method(console, 'log', (message: string) => { messages.push(message); });
+  isolated.cli = async (...args) => {
+    if (args[0] === 'account') return { id: SUB };
+    if (args[0] === 'provider' && args[1] === 'show') {
+      providers.push(args[args.indexOf('--namespace') + 1]!); return { registrationState: 'Registered' };
+    }
+    if (args[0] === 'resource' && args[1] === 'list') {
+      assert.equal(args[args.indexOf('--resource-group') + 1], b.SCHEMA_EVOLUTION_GROUP); return [];
+    }
+    assert.fail('Unexpected isolated preflight operation: ' + args.join(' '));
+  };
+  await b.preflight(isolated);
+  assert.deepEqual(providers, ['Microsoft.Kusto', 'Microsoft.Storage', 'Microsoft.ManagedIdentity',
+    'Microsoft.OperationalInsights', 'Microsoft.Insights']);
+  assert.deepEqual(messages, ['Azure subscription and exact isolated resource inventory preflight: ready (no AKS/ACR checks)']);
 });
 test('network preflight uses supported peering commands and includes remote address spaces', async () => {
   const calls: string[][] = [];
@@ -133,7 +272,11 @@ for (const state of ['missing', 'empty', 'legacy', 'identity', 'denied'] as cons
     assert.equal(inventories, state === 'missing' || state === 'denied' ? 0 : 1);
   });
 for (const values of [
-  { AZURE_RESOURCE_GROUP: 'production' }, { AZURE_SUBSCRIPTION_ID: 'default' },
+  { AZURE_RESOURCE_GROUP: 'production' }, { AZURE_RESOURCE_GROUP: '' }, { AZURE_SUBSCRIPTION_ID: 'default' },
+  { AZURE_SUBSCRIPTION_ID: '{{00000000-0000-0000-0000-000000000001}}' },
+  { AZURE_SUBSCRIPTION_ID: '{urn:uuid:00000000-0000-0000-0000-000000000001}' },
+  ...['rust-playground-', 'rust-playground--evo', 'rust-playground-../other', 'Rust-playground-evo',
+    'rust-playground-evo.', 'rust-playground-' + 'a'.repeat(80)].map(AZURE_RESOURCE_GROUP => ({ AZURE_RESOURCE_GROUP })),
   { AZURE_KUSTO_MAX_INSTANCES: '9' }, { AZURE_KUSTO_MIN_INSTANCES: '5', AZURE_KUSTO_MAX_INSTANCES: '4' },
   { AZURE_KUSTO_QAP_HOT_DAYS: '0' }, { AZURE_KUSTO_QAP_HOT_DAYS: '1.5' }, { AZURE_KUSTO_MAX_INSTANCES: 'NaN' },
   { AZURE_STORAGE_CHECKPOINT_CONTAINER: 'arrowcol' }, { AZURE_OPERATOR_TYPE: 'App' },
@@ -589,6 +732,7 @@ test('stop hold excludes tests and publishers until confirmed stop releases it',
   const original = azure.cli.bind(azure);
   azure.cli = async (...args) => {
     assert.equal(azure.metadata.occupancy, 'stopping');
+    assert.equal(args[args.indexOf('--subscription') + 1], azure.c.subscription);
     await failure(() => b.occupancy(azure, 'occupy', b.uuid()));
     await failure(() => new PublisherControl(azure).admit(b.uuid(), generation));
     return original(...args);
@@ -678,17 +822,16 @@ for (const repoint of [true, false]) test(`${repoint ? 'repointed' : 'same-locat
   if (repoint) assert.ok(deletion < commands.findIndex(command => command.includes('.create-or-alter')));
   assert.match(commands.at(-1), /query_acceleration/);
 });
-test('both pools use catalog paths, inferred schema and isolated root prefix', async () => {
+test('Dataflow catalog paths retain inferred schema and isolated root prefix', async () => {
   azure.c.table_prefix = 'loadtest/run-example';
-  const bindings = ['direct', 'dataflow'].map(pool => ({ name: pool + '_table', relative_path: pool + '/telemetry/sqlserver/table' }));
+  const bindings = [{ name: 'dataflow_table', relative_path: 'dataflow/telemetry/sqlserver/table' }];
   fs.writeFileSync(manifest, JSON.stringify(bindings));
   for (const item of bindings) azure.logs.set(`loadtest/run-example/${item.relative_path}/_delta_log/00000000000000000000.json`,
     Buffer.from('{"protocol":{}}\n{"metaData":{}}'));
   await b.reconcile(azure, manifest);
   const commands = azure.events.filter(event => event[0] === 'kql').map(event => event[1]);
-  assert.equal(commands.length, 6);
-  assert.match(commands[2], /\['direct_table'\] kind=delta.*\/loadtest\/run-example\/direct\/telemetry\/sqlserver\/table;/);
-  assert.match(commands[4], /\['dataflow_table'\] kind=delta/);
+  assert.equal(commands.length, 4);
+  assert.match(commands[2], /\['dataflow_table'\] kind=delta.*\/loadtest\/run-example\/dataflow\/telemetry\/sqlserver\/table;/);
 });
 
 function leasedStorage() {
@@ -932,7 +1075,7 @@ test('initializer hook calls only owned Rust command and requires every private 
   fs.writeFileSync(cargo, '#!/bin/sh\nprintf "%s\\n" "$@"\n', { mode: 0o700 });
   const env = b.initializer_env({}, azure.c, manifest, generation);
   env.PATH = directory + ':' + process.env.PATH;
-  const hook = path.join(b.ROOT, 'infra/azure/initialize-delta.sh');
+  const hook = path.join(b.ROOT, 'projects/arrowcol-infra/scripts/initialize-delta.sh');
   const result = await realRun(['bash', hook], 5, b.ROOT, env);
   assert.equal(result.returncode, 0, result.stderr);
   assert.deepEqual(result.stdout.trim().split('\n'), ['run', '--locked', '--quiet', '--package', 'arrowcol-loadgen',
@@ -942,6 +1085,30 @@ test('initializer hook calls only owned Rust command and requires every private 
     const incomplete = { ...env }; delete incomplete[missing];
     const result = await realRun(['bash', hook], 5, b.ROOT, incomplete);
     assert.notEqual(result.returncode, 0); assert.match(result.stderr, /bootstrap must provide/); assert.equal(result.stdout, '');
+  }
+});
+test('isolated initializer hook accepts the approved group family and rejects invalid projections before cargo', async () => {
+  const cargo = path.join(directory, 'cargo');
+  fs.writeFileSync(cargo, '#!/bin/sh\nprintf "%s\\n" "$@"\n', { mode: 0o700 });
+  const hook = path.join(b.ROOT, 'projects/arrowcol-infra/scripts/initialize-delta.sh');
+  for (const group of [b.SCHEMA_EVOLUTION_GROUP, 'rust-playground-schema-evo-qualification-20261108']) {
+    const c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_RESOURCE_GROUP: group }, 'schema-evolution');
+    const env = b.initializer_env({}, c, manifest, generation);
+    env.PATH = directory + ':' + process.env.PATH;
+    const valid = await realRun(['bash', hook], 5, b.ROOT, env);
+    assert.equal(valid.returncode, 0, valid.stderr);
+    assert.match(valid.stdout, /arrowcol-loadgen/);
+  }
+  const c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_RESOURCE_GROUP: b.SCHEMA_EVOLUTION_GROUP }, 'schema-evolution');
+  const env = b.initializer_env({}, c, manifest, generation);
+  env.PATH = directory + ':' + process.env.PATH;
+  const missing = { ...env }; delete missing.ARROWCOL_AZURE_MODE;
+  for (const invalid of [missing, { ...env, AZURE_STAMP: '1' }, { ...env, ARROWCOL_AZURE_MODE: 'other' },
+    { ...env, AZURE_RESOURCE_GROUP: 'rust-playground-schema-evo-invalid-' },
+    { ...env, AZURE_RESOURCE_GROUP: 'unrelated-sandbox' }]) {
+    const result = await realRun(['bash', hook], 5, b.ROOT, invalid);
+    assert.notEqual(result.returncode, 0);
+    assert.equal(result.stdout, '');
   }
 });
 test('timeout kills complete process group and reports unknown outcome', async () => {
@@ -980,30 +1147,30 @@ test('Bicep separates Kusto client application identity from storage object prin
 });
 test('Bicep adds experiment container, database, workspace and StorageRead diagnostics with least-privilege RBAC', () => {
   const source = fs.readFileSync(path.join(b.ROOT, 'infra/azure/sandbox.bicep'), 'utf8');
+  const readLogSource = fs.readFileSync(path.join(b.ROOT, 'infra/azure/read-log-storage.bicep'), 'utf8');
   const main = fs.readFileSync(path.join(b.ROOT, 'infra/azure/main.bicep'), 'utf8');
   const section = (name: string) => source.split(`resource ${name} `)[1].split('\nresource ')[0].split('\noutput ')[0];
+  const logSection = (name: string) => readLogSource.split(`resource ${name} `)[1].split('\nresource ')[0].split('\noutput ')[0];
   assert.match(section('experiment'), /parent: blobs[\s\S]*name: experimentContainer[\s\S]*sandboxid: ownership\.sandboxId/);
   assert.deepEqual([...source.matchAll(/resource (\w+) 'Microsoft\.Storage\/storageAccounts@/g)].map(match => match[1]),
-    ['storage', 'readLogStorage']);
-  assert.match(section('readLogStorage'), /if \(!empty\(readLogStorageAccountName\)\)[\s\S]*name: readLogStorageAccountName[\s\S]*tags: ownership/);
-  assert.match(section('readLogStorage'), /allowSharedKeyAccess: false/);
+    ['storage']);
+  assert.match(source, /module readLogStorage '\.\/read-log-storage\.bicep' = if \(!empty\(readLogStorageAccountName\)\)/);
+  assert.match(logSection('readLogStorage'), /name: readLogStorageAccountName[\s\S]*tags: ownership[\s\S]*allowSharedKeyAccess: false/);
   const sinkRoles = [
     ['operatorReadExport', 'operatorObjectId', 'read-log-reader', '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'],
-    ['runtimeReadExport', 'identity.id', 'runtime-read-log-reader', '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'],
-    ['runtimeReadExportReader', 'identity.id', 'runtime-read-log-arm-reader', 'acdd72a7-3385-48ef-bd42-f606fba81ae7'],
+    ['runtimeReadExport', 'runtimeIdentityId', 'runtime-read-log-reader', '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'],
+    ['runtimeReadExportReader', 'runtimeIdentityId', 'runtime-read-log-arm-reader', 'acdd72a7-3385-48ef-bd42-f606fba81ae7'],
   ];
-  assert.deepEqual([...source.matchAll(/resource (\w+) 'Microsoft\.Authorization\/roleAssignments@/g)]
-    .map(match => match[1]).filter(name => /scope: readLogStorage(?:!|\n)/.test(section(name))),
-  sinkRoles.map(([name]) => name));
+  assert.deepEqual([...readLogSource.matchAll(/resource (\w+) 'Microsoft\.Authorization\/roleAssignments@/g)]
+    .map(match => match[1]), sinkRoles.map(([name]) => name));
   for (const [name, principal, seed, role] of sinkRoles) {
-    const assignment = section(name);
-    assert.match(assignment, /if \(!empty\(readLogStorageAccountName\)\)/);
-    assert.ok(assignment.includes(`name: guid(readLogStorage!.id, ${principal}, '${seed}')`));
+    const assignment = logSection(name);
+    assert.ok(assignment.includes(`name: guid(readLogStorage.id, ${principal}, '${seed}')`));
     assert.match(assignment, /scope: readLogStorage\n/);
     assert.deepEqual([...assignment.matchAll(/roleDefinitionId: subscriptionResourceId\('Microsoft.Authorization\/roleDefinitions', '([^']+)'\)/g)]
       .map(match => match[1]), [role]);
-    assert.ok(assignment.includes(`principalId: ${principal === 'identity.id' ? 'identity.properties.principalId' : principal}\n`));
-    if (principal === 'identity.id') assert.match(assignment, /principalType: 'ServicePrincipal'/);
+    assert.ok(assignment.includes(`principalId: ${principal === 'runtimeIdentityId' ? 'runtimePrincipalId' : principal}\n`));
+    if (principal === 'runtimeIdentityId') assert.match(assignment, /principalType: 'ServicePrincipal'/);
   }
   assert.match(section('readExperiment'), /scope: experiment\n/);
   assert.match(section('readExperiment'), /2a2b9908-6ea1-4ae2-8e65-a410df84e7d1[\s\S]*principalId: identity\.properties\.principalId/);
@@ -1013,7 +1180,8 @@ test('Bicep adds experiment container, database, workspace and StorageRead diagn
   const reads = section('storageReads');
   assert.match(reads, /name: 'arrowcol-storage-reads'[\s\S]*scope: blobs[\s\S]*workspaceId: workspace\.id/);
   assert.match(reads, /logAnalyticsDestinationType: 'Dedicated'/); assert.match(reads, /category: 'StorageRead'/);
-  assert.match(reads, /storageAccountId: empty\(readLogStorageAccountName\) \? null : readLogStorage!\.id/);
+  assert.doesNotMatch(reads, /dependsOn:/);
+  assert.match(reads, /storageAccountId: empty\(readLogStorageAccountName\) \? null : readLogStorage!\.outputs\.storageAccountId/);
   assert.doesNotMatch(reads, /StorageWrite|StorageDelete|metrics/);
   assert.match(section('readLogs'), /scope: workspace[\s\S]*73c42c96-874c-492b-b04d-ab87d138a893[\s\S]*principalId: operatorObjectId/);
   assert.match(section('readLogs'), /principalType: operatorType == 'User' \? 'User' : 'ServicePrincipal'/);
@@ -1026,7 +1194,20 @@ test('Bicep adds experiment container, database, workspace and StorageRead diagn
   assert.match(main, /param experimentDatabase string = 'experimentqap'/);
   assert.match(main, /param logAnalyticsWorkspaceName string = 'arrow-collector-1'/);
 });
-function coordinateProvision() {
+for (const group of ['arrow-collector-rg', 'rust-playground-schema-evo'])
+  test(`deployment name is isolated for ${group}`, async () => {
+    azure.c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_RESOURCE_GROUP: group },
+      group === 'rust-playground-schema-evo' ? 'schema-evolution' : undefined);
+    azure.tags = { ...b.TAGS, sandboxId: azure.c.sandbox };
+    await b.deploy(azure);
+    const invocation = azure.events.find(event => event[0] === 'cli' && event[1] === 'deployment');
+    assert.ok(invocation);
+    const expected = group === 'arrow-collector-rg' ? 'arrowcol-sandbox' : 'arrowcol-sandbox-' + azure.c.sandbox;
+    assert.equal(invocation[invocation.indexOf('--name') + 1], expected);
+  });
+function coordinateProvision(initializer?: (command: string[], env: NodeJS.ProcessEnv) => Promise<{
+  returncode: number; stdout: string; stderr: string;
+}>) {
   const deployed: any[] = [], observed: any[] = [], child: { generation?: string; id?: string; then?: () => Promise<void> } = {};
   const originalCli = azure.cli.bind(azure), originalKql = azure.kql.bind(azure);
   azure.cli = async (...args) => {
@@ -1046,15 +1227,41 @@ function coordinateProvision() {
   azure.kql = async (command, database) => {
     observed.push(['kql', azure.metadata.resetstate, azure.registry()]); return originalKql(command, database);
   };
-  mock.method(b.runtime, 'run_tree', async (_command: string[], _timeout: number, _cwd?: string, env?: NodeJS.ProcessEnv) => {
+  mock.method(b.runtime, 'run_tree', async (command: string[], _timeout: number, cwd?: string, env?: NodeJS.ProcessEnv) => {
+    const result = initializer ? await initializer(command, env!) : { returncode: 0, stdout: '', stderr: '' };
+    if (result.returncode) return result;
     const control = new PublisherControl(azure), member = b.uuid(), gen = env!.ARROWCOL_EXPECTED_RESET_GENERATION!;
     child.id = member; child.generation = gen;
     await control.admit(member, gen, true); await control.clean_release(member, gen, true);
     if (child.then) await child.then();
-    return { returncode: 0, stdout: '', stderr: '' };
+    return result;
   });
   return { deployed, observed, child };
 }
+test('full isolated provision invokes the real initializer with a dedicated group before exporting ready generation', async () => {
+  const group = 'rust-playground-schema-evo-qualification-20261108';
+  const c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_RESOURCE_GROUP: group }, 'schema-evolution');
+  azure.c = c; azure.tags = { ...b.TAGS, sandboxId: c.sandbox };
+  azure.checkpoint_exists = false; azure.cluster_state = 'Stopped'; initialize();
+  const cargo = path.join(directory, 'cargo');
+  fs.writeFileSync(cargo, '#!/bin/sh\nprintf "%s\\n" "$@"\n', { mode: 0o700 });
+  const hook = path.join(b.ROOT, 'projects/arrowcol-infra/scripts/initialize-delta.sh');
+  let invocation = '';
+  const { deployed } = coordinateProvision(async (command, env) => {
+    assert.deepEqual(command, ['bash', hook]);
+    assert.equal(env.AZURE_RESOURCE_GROUP, group);
+    assert.equal(env.AZURE_STORAGE_ACCOUNT, c.account);
+    assert.equal(env.AZURE_KUSTO_IDENTITY_NAME, 'arrowcol-kusto-reader');
+    const result = await realRun(command, 5, b.ROOT, { ...env, PATH: directory + ':' + process.env.PATH });
+    invocation = result.stdout;
+    return result;
+  });
+  await b.provision(azure, manifest, 0, output, false, {});
+  assert.match(invocation, /initialize-azure/);
+  const ready = b.load_env(output);
+  assert.equal(ready.AZURE_RESOURCE_GROUP, group);
+  assert.equal(ready.ARROWCOL_RESET_GENERATION, deployed[0][1].resetgeneration);
+});
 test('fresh provisioning initializes v1 then child/fresh parent serialize start and all KQL', async () => {
   initialize(); azure.checkpoint_exists = false; azure.cluster_state = 'Stopped';
   const { deployed, observed, child } = coordinateProvision();

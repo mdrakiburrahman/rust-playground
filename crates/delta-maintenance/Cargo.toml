@@ -8,6 +8,8 @@ description = "Standalone OPTIMIZE, PURGE and VACUUM LITE service for arrow-delt
 
 [dependencies]
 anyhow.workspace = true
+arrowcol-props = { path = "../arrowcol-props" }
+arrowcol-catalog-client = { path = "../arrowcol-catalog-client" }
 arrow-deltalake = { path = "../arrow-deltalake" }
 clap.workspace = true
 ctrlc.workspace = true
@@ -20,13 +22,18 @@ serde_json = "1"
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 url = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+tonic = { version = "0.14", default-features = false, features = ["transport"] }
 
 [dev-dependencies]
 arrow = { version = "58.3", default-features = false }
+arrow-flight = { version = "58.3", default-features = false, features = ["flight-sql"] }
+arrowcol-catalog-rust = { path = "../../projects/arrowcol-catalog-rust" }
 assert_cmd.workspace = true
 parquet = { version = "58.3", default-features = false, features = ["arrow"] }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt"] }
+tokio-stream = { version = "0.1", features = ["net"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 rustix = { version = "1", features = ["process"] }

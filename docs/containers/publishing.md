@@ -1,7 +1,7 @@
 # Container publishing
 
-The repository publishes the devcontainer, five production Rust runtime
-images, and the retained `hello-world` sample image to GHCR through Nx targets.
+The repository publishes the devcontainer, seven production runtime images,
+and the retained `hello-world` sample image to GHCR through Nx targets.
 Run local publication from the source-built devcontainer so the pinned
 toolchain, Docker Buildx support, GitHub CLI state, and repository scripts match
 the development environment.
@@ -9,9 +9,8 @@ the development environment.
 These are expected operations and tag policies. They do not assert that CI or
 the publication workflows are currently green.
 
-No image is published by a checkout, local build, image smoke, or documentation
-change. This uncommitted workspace has not pushed an image. In the repository
-release path, GHCR publication begins only when
+A checkout, local build, or image smoke does not publish an image. In the
+repository release path, GHCR publication begins only when
 `.github/workflows/publish-images.yml` runs on GitHub and verifies the remote
 manifests.
 
@@ -20,20 +19,49 @@ manifests.
 | Project | GHCR image | Local non-publishing smoke |
 | --- | --- | --- |
 | `otelcol-rust` | `ghcr.io/mdrakiburrahman/rust-playground/otelcol-rust` | `npx --no-install nx run otelcol-rust:image-smoke` |
-| `arrowcol-rust` | `ghcr.io/mdrakiburrahman/rust-playground/arrowcol-rust` | `npx --no-install nx run arrowcol-rust:image-smoke` |
 | `arrowcol-dataflow-rust` | `ghcr.io/mdrakiburrahman/rust-playground/arrowcol-dataflow-rust` | `npx --no-install nx run arrowcol-dataflow-rust:image-smoke` |
 | `arrowcol-router-rust` | `ghcr.io/mdrakiburrahman/rust-playground/arrowcol-router-rust` | `npx --no-install nx run arrowcol-router-rust:image-smoke` |
+| `arrowcol-catalog-rust` | `ghcr.io/mdrakiburrahman/rust-playground/arrowcol-catalog-rust` | `npx --no-install nx run arrowcol-catalog-rust:image-smoke` |
+| `delta-maintenance` | `ghcr.io/mdrakiburrahman/rust-playground/delta-maintenance` | `npx --no-install nx run delta-maintenance:image-smoke` |
+| `arrow-tenant-stream` | `ghcr.io/mdrakiburrahman/rust-playground/arrow-tenant-stream` | `npx --no-install nx run arrow-tenant-stream:image-smoke` |
 | `kusto-explorer` | `ghcr.io/mdrakiburrahman/rust-playground/kusto-explorer` | `npx --no-install nx run kusto-explorer:image-smoke` |
 
 Each smoke target builds or reuses the local `linux/amd64` `:dev` image and
 validates its embedded configuration and bounded startup/shutdown contract. It
 does not log in to GHCR and does not push.
 
+The [Rust catalog service](../../projects/arrowcol-catalog-rust/README.md)
+listens on port `8817`. Its image uses the service binary's `--healthcheck`
+mode against `http://127.0.0.1:8817`, runs as `10001:10001` under `tini`,
+and uses the shared pinned Azure CLI for storage authentication. Its CLI
+config directory is empty, mode `0700`, and owned by the service user; mount
+isolated runtime credentials rather than baking authentication into an image.
+The catalog application is Rust-only; Python is present only through Azure CLI.
+Ordinary `verify`
+checks do not build or smoke-test Docker images.
+
+To verify a published catalog digest without rebuilding, set its exact reference:
+
+```bash
+export CATALOG_IMAGE="ghcr.io/mdrakiburrahman/rust-playground/arrowcol-catalog-rust@sha256:<published-digest>"
+docker pull "$CATALOG_IMAGE"
+npx --no-install nx run arrowcol-catalog-rust:image-smoke --excludeTaskDependencies
+```
+
+The existing smoke starts the service, checks its health, sends default SIGTERM
+with a ten-second stop bound, requires exit code `0` and the publisher-drained
+log marker, then removes its container. It also checks the CLI and auth-directory
+boundaries. An older image without graceful publisher shutdown fails this contract.
+
 Published runtime tags are:
 
-- `branch-<sanitized-branch>` for the selected branch;
+- `branch-<sanitized-branch>` for the selected ref;
 - immutable `sha-<full-git-sha>`; and
 - `latest` only when the workflow publishes `main`.
+
+Push-triggered runtime image publication is main-only. An explicit manual
+dispatch uses the selected ref; on `main`, the workflow publishes the branch,
+immutable SHA, and `latest` tags.
 
 ## Authenticate to GHCR
 
@@ -83,9 +111,11 @@ npx --no-install devcontainer exec \
 The production runtime projects are:
 
 - `otelcol-rust`
-- `arrowcol-rust`
 - `arrowcol-dataflow-rust`
 - `arrowcol-router-rust`
+- `arrowcol-catalog-rust`
+- `delta-maintenance`
+- `arrow-tenant-stream`
 - `kusto-explorer`
 
 `hello-world` remains published as the repository sample. Every `publish`
@@ -221,26 +251,30 @@ On `main` it also checks the `main` and `latest` manifests.
 
 `.github/workflows/publish-images.yml` runs on:
 
-- a push to `main` that changes the workflow, any published runtime project,
+- a push to `main` that changes the
+  workflow, any published runtime project,
   shared crate, the pinned `otel-arrow` submodule, Cargo workspace inputs, root
   Node/Nx inputs, the Docker executor, or registry tooling;
 - manual `workflow_dispatch`.
 
-The workflow discovers the six source-built publication targets from the Nx
+The workflow discovers the nine source-built publication targets from the Nx
 graph, then builds and smoke-tests each matrix entry before authentication. It
-publishes branch and immutable SHA tags, adds `latest` on `main`, verifies the
+publishes branch and immutable SHA tags, and adds `latest` on `main`. It verifies the
 deterministic local publication manifest, and verifies every remote tag.
+Package write permission is scoped to the publishing job on push or manual
+dispatch; no pull-request event or privileged pull-request checkout is added.
 Package visibility remains the explicit GitHub UI step described above.
 
-The six-target matrix contains the five production images listed above plus
+The nine-target matrix contains the eight production images listed above plus
 the retained `hello-world` sample image. The devcontainer is published by its
 separate workflow.
 
 ## Image metadata and attestations
 
-The five production runtime Dockerfiles set OCI title, description, source,
-license, and revision labels. Local `:dev` builds use `revision=local`;
-publication targets pass the full Git SHA.
+The eight production runtime Dockerfiles set OCI title, description, source,
+license, and revision labels. Source-built `:dev` and publication targets pass
+the full Git SHA and require a clean Git worktree. The Dockerfile default
+`revision=local` applies only when built directly without the Nx build argument.
 
 The current `rust-playground-build:docker-build` executor does not expose
 Buildx SBOM or provenance attestation options. The workflow therefore does not

@@ -1,4 +1,6 @@
 param location string
+@allowed(['stamped', 'schema-evolution'])
+param azureMode string = 'stamped'
 param ownership object
 param storageAccountName string
 param clusterName string
@@ -29,7 +31,7 @@ resource identity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' 
   tags: ownership
 }
 
-module aks './aks.bicep' = {
+module aks './aks.bicep' = if (azureMode == 'stamped') {
   name: 'arrowcol-aks'
   params: {
     location: location
@@ -145,7 +147,7 @@ resource readExperiment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   }
 }
 
-resource runtimeExperimentWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+resource runtimeExperimentWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (azureMode == 'stamped') {
   name: guid(experiment.id, identity.id, 'runtime-blob-contributor')
   scope: experiment
   properties: {
@@ -155,7 +157,7 @@ resource runtimeExperimentWriter 'Microsoft.Authorization/roleAssignments@2022-0
   }
 }
 
-resource runtimeControlWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+resource runtimeControlWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (azureMode == 'stamped') {
   name: guid(storage.id, checkpointContainer, identity.id, 'runtime-control-contributor')
   scope: checkpoints!
   properties: {
@@ -178,7 +180,7 @@ resource writeData 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
 resource cluster 'Microsoft.Kusto/clusters@2024-04-13' = {
   name: clusterName
   location: location
-  tags: union(clusterTags, ownership)
+  tags: union(clusterTags, ownership, azureMode == 'schema-evolution' ? { 'NRMS.KustoPlatform.Classification.1P': 'Corp' } : {})
   identity: {
     type: 'UserAssigned'
     userAssignedIdentities: {
@@ -264,7 +266,7 @@ resource experimentReader 'Microsoft.Kusto/clusters/databases/principalAssignmen
   }
 }
 
-resource runtimeExperimentAdmin 'Microsoft.Kusto/clusters/databases/principalAssignments@2024-04-13' = {
+resource runtimeExperimentAdmin 'Microsoft.Kusto/clusters/databases/principalAssignments@2024-04-13' = if (azureMode == 'stamped') {
   parent: experimentDb
   name: 'qap-runtime-identity'
   properties: {
@@ -276,7 +278,7 @@ resource runtimeExperimentAdmin 'Microsoft.Kusto/clusters/databases/principalAss
   dependsOn: [experimentReader]
 }
 
-resource runtimeClusterReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+resource runtimeClusterReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (azureMode == 'stamped') {
   name: guid(cluster.id, identity.id, 'runtime-cluster-reader')
   scope: cluster
   properties: {
@@ -298,53 +300,16 @@ resource workspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
   }
 }
 
-resource readLogStorage 'Microsoft.Storage/storageAccounts@2023-05-01' = if (!empty(readLogStorageAccountName)) {
-  name: readLogStorageAccountName
-  location: location
-  tags: ownership
-  kind: 'StorageV2'
-  sku: { name: 'Standard_LRS' }
-  properties: {
-    allowBlobPublicAccess: false
-    allowSharedKeyAccess: false
-    minimumTlsVersion: 'TLS1_2'
-    supportsHttpsTrafficOnly: true
-    publicNetworkAccess: 'Enabled'
-    networkAcls: {
-      bypass: 'AzureServices'
-      defaultAction: 'Allow'
-    }
-  }
-}
-
-resource operatorReadExport 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(readLogStorageAccountName)) {
-  name: guid(readLogStorage!.id, operatorObjectId, 'read-log-reader')
-  scope: readLogStorage
-  properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1')
-    principalId: operatorObjectId
-    principalType: operatorType == 'User' ? 'User' : 'ServicePrincipal'
-  }
-}
-
-resource runtimeReadExport 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(readLogStorageAccountName)) {
-  name: guid(readLogStorage!.id, identity.id, 'runtime-read-log-reader')
-  scope: readLogStorage
-  properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1')
-    principalId: identity.properties.principalId
-    principalType: 'ServicePrincipal'
-  }
-}
-
-// QAP validates sink readiness through ARM before reading the exported blobs.
-resource runtimeReadExportReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(readLogStorageAccountName)) {
-  name: guid(readLogStorage!.id, identity.id, 'runtime-read-log-arm-reader')
-  scope: readLogStorage
-  properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'acdd72a7-3385-48ef-bd42-f606fba81ae7')
-    principalId: identity.properties.principalId
-    principalType: 'ServicePrincipal'
+module readLogStorage './read-log-storage.bicep' = if (!empty(readLogStorageAccountName)) {
+  name: 'readLogStorage'
+  params: {
+    readLogStorageAccountName: readLogStorageAccountName
+    location: location
+    ownership: ownership
+    operatorObjectId: operatorObjectId
+    operatorType: operatorType
+    runtimeIdentityId: identity.id
+    runtimePrincipalId: identity.properties.principalId
   }
 }
 
@@ -353,7 +318,7 @@ resource storageReads 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview'
   scope: blobs
   properties: {
     workspaceId: workspace.id
-    storageAccountId: empty(readLogStorageAccountName) ? null : readLogStorage!.id
+    storageAccountId: empty(readLogStorageAccountName) ? null : readLogStorage!.outputs.storageAccountId
     logAnalyticsDestinationType: 'Dedicated'
     logs: [
       {
@@ -374,7 +339,7 @@ resource readLogs 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   }
 }
 
-resource runtimeReadLogs 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+resource runtimeReadLogs 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (azureMode == 'stamped') {
   name: guid(workspace.id, identity.id, 'runtime-log-analytics-reader')
   scope: workspace
   properties: {
@@ -390,7 +355,7 @@ output logAnalyticsWorkspaceId string = workspace.id
 output logAnalyticsCustomerId string = workspace.properties.customerId
 output readLogStorageAccountName string = readLogStorageAccountName
 
-output aksClusterName string = aks.outputs.clusterName
-output aksOidcIssuer string = aks.outputs.oidcIssuer
+output aksClusterName string = azureMode == 'stamped' ? aks!.outputs.clusterName : ''
+output aksOidcIssuer string = azureMode == 'stamped' ? aks!.outputs.oidcIssuer : ''
 output identityClientId string = identity.properties.clientId
-output registryLoginServer string = aks.outputs.registryLoginServer
+output registryLoginServer string = azureMode == 'stamped' ? aks!.outputs.registryLoginServer : ''

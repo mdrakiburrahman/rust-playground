@@ -1,0 +1,60 @@
+version: otel_dataflow/v1
+engine: {}
+policies:
+  resources:
+    core_allocation:
+      type: core_count
+      count: 1
+groups:
+  arrowcol:
+    pipelines:
+      ingest:
+        policies:
+          channel_capacity:
+            control:
+              node: 16
+              pipeline: 16
+            pdata: 4
+        nodes:
+          flight:
+            type: receiver:arrow_flight
+            config:
+              listening_addr: "${env:ARROWCOL_FLIGHT_LISTEN}"
+              admin_listening_addr: "${env:ARROWCOL_ADMIN_LISTEN}"
+              catalog:
+                type: remote
+                endpoint: "${env:ARROWCOL_CATALOG_ENDPOINT}"
+                maximum_cache_age: 10s
+              routing:
+                type: standalone
+              registration:
+                instance_key: "${env:ARROWCOL_INSTANCE_KEY}"
+                flight_endpoint: "${env:ARROWCOL_FLIGHT_LISTEN}"
+                max_concurrent_streams: 4
+                heartbeat_interval: 1s
+                pressure_interval: 1s
+                registration_ttl: 10s
+                rss_limit_bytes: 2147483648
+                buffered_bytes_limit: 1048576
+                buffered_rows_limit: 10000
+                buffered_batches_limit: 16
+              limits:
+                batch_channel_capacity: 2
+                admission_timeout: 10s
+                max_stream_duration: 30s
+          delta:
+            type: exporter:arrow_deltalake
+            config:
+              base_path: "${env:ARROWCOL_DELTA_ROOT}"
+              routing:
+                type: standalone
+              commit:
+                batch_window: 100ms
+                max_files_per_commit: 1
+                max_pending_files: 4
+              batching:
+                max_age: 100ms
+              authority_timeout: 5s
+        connections:
+          - from: flight
+            to: delta

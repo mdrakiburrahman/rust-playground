@@ -13,7 +13,7 @@ fn request_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert("content-type", HeaderValue::from_static("application/grpc"));
     headers.insert("x-arrowcol-protocol-version", HeaderValue::from_static("1"));
-    headers.insert("x-arrowcol-implementation-pool", HeaderValue::from_static("direct"));
+    headers.insert("x-arrowcol-implementation-pool", HeaderValue::from_static("dataflow"));
     headers.insert("x-arrowcol-catalog", HeaderValue::from_static("telemetry"));
     headers.insert("x-arrowcol-schema", HeaderValue::from_static("prod"));
     headers.insert("x-arrowcol-table", HeaderValue::from_static("traces"));
@@ -83,7 +83,7 @@ async fn allow_all_identity_is_signed_with_a_bounded_expiry() {
         .authenticate(
             &ExternalRequest {
                 method: Method::GET,
-                path: "/v1/receipts/00000000-0000-0000-0000-000000000001".to_owned(),
+                path: "/arrow.flight.protocol.FlightService/DoPut".to_owned(),
             },
             now(200_000),
         )
@@ -102,7 +102,18 @@ async fn allow_all_identity_is_signed_with_a_bounded_expiry() {
 #[test]
 fn strict_yaml_rejects_unknown_fields_and_accepts_the_checked_in_config() {
     let valid = include_bytes!("../config.yaml");
-    RouterConfig::from_yaml(valid).unwrap_or_else(|error| panic!("checked-in config is invalid: {error}"));
+    for config in [
+        valid.as_slice(),
+        include_bytes!("../config.docker.yaml").as_slice(),
+        include_bytes!("../config.smoke.yaml").as_slice(),
+    ] {
+        RouterConfig::from_yaml(config).unwrap_or_else(|error| panic!("checked-in config is invalid: {error}"));
+    }
+
+    let mut retired =
+        String::from_utf8(valid.to_vec()).unwrap_or_else(|error| panic!("checked-in config is not UTF-8: {error}"));
+    retired.push_str("\nreceipts:\n  max_batch_size: 256\n");
+    assert!(RouterConfig::from_yaml(retired.as_bytes()).is_err());
 
     let mut unknown =
         String::from_utf8(valid.to_vec()).unwrap_or_else(|error| panic!("checked-in config is not UTF-8: {error}"));

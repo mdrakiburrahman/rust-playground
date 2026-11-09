@@ -10,9 +10,9 @@ fn descriptor_artifacts_are_deterministic_and_round_trip() -> anyhow::Result<()>
     let DdlCommand::CreateTable(create) = DdlParser::default().parse(
         "CREATE TABLE telemetry.prod.descriptors ( \
             id BIGINT NOT NULL, \
-            spans ARRAY<STRUCT<trace_id FIXED_SIZE_BINARY(16), duration BIGINT UNSIGNED>>, \
-            labels MAP(VARCHAR, VARCHAR) \
-         )",
+            spans ARRAY<STRUCT<trace_id: BINARY, duration: BIGINT>>, \
+            labels MAP<STRING, STRING> \
+         ) USING DELTA",
     )?
     else {
         anyhow::bail!("expected create");

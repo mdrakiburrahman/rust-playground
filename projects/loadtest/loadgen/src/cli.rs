@@ -23,13 +23,13 @@ pub enum Command {
     Validate(ValidateArgs),
     /// Drain publication while collectors are still running, without capturing snapshots.
     Drain(ValidateArgs),
-    /// After the clean mutator drain, prove from actual SQL state that every routed publisher released.
+    /// After the clean mutator drain, prove from routing state that the Dataflow publisher stopped.
     PublisherRelease(PublisherReleaseArgs),
-    /// Compact all local source tables after positive publisher release.
+    /// Compact Dataflow tables after positive publisher release.
     FinalCompaction(FinalCompactionArgs),
     /// Record bounded read-only QAP observations without changing tables or policies.
     ObserveQap(ObserveQapArgs),
-    /// Initialize both Azure pools from the canonical schemas while reset is fenced.
+    /// Initialize Dataflow tables from the canonical schemas while reset is fenced.
     InitializeAzure(InitializeAzureArgs),
     /// Write the canonical Azure table manifest without accessing or mutating storage.
     AzureManifest(InitializeAzureArgs),
@@ -42,8 +42,6 @@ pub enum Command {
 pub struct FinalCompactionArgs {
     #[arg(long, env = "LOADTEST_RESULTS", default_value = "/results")]
     pub results: PathBuf,
-    #[arg(long, env = "LOADTEST_DIRECT_ROOT", default_value = "/delta/direct")]
-    pub direct_root: PathBuf,
     #[arg(long, env = "LOADTEST_DATAFLOW_ROOT", default_value = "/delta/dataflow")]
     pub dataflow_root: PathBuf,
     /// Explicit request (Azure rejects it); local compaction is already on by default.
@@ -69,7 +67,7 @@ pub struct ObserveQapArgs {
     /// Optional explicit database.
     #[arg(long)]
     pub database: Option<String>,
-    /// External table names; omit for all 26 canonical source tables.
+    /// External table names; omit for the canonical Dataflow tables.
     #[arg(long = "table")]
     pub tables: Vec<String>,
     /// One deadline for authentication and every management request.
@@ -84,7 +82,7 @@ pub struct PublisherReleaseArgs {
     #[arg(long, env = "LOADTEST_RESULTS", default_value = "/results")]
     pub results: PathBuf,
 
-    /// SQL Server host that held the run's routing and receipt state.
+    /// SQL Server host that held the run's routing state.
     #[arg(long, env = "ARROWCOL_SQL_HOST", default_value = "sqlserver")]
     pub sql_host: String,
 
@@ -125,22 +123,14 @@ pub struct InitializeAzureArgs {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum Scenario {
-    /// Arrow traffic routed only to durable direct collectors.
-    Direct,
-    /// Arrow traffic routed only to best-effort dataflow collectors.
+    /// Arrow traffic routed to Dataflow Engine collectors.
     Dataflow,
-    /// The same logical batch is sent concurrently to both pools.
-    Paired,
 }
 
 impl Scenario {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Direct => "direct",
-            Self::Dataflow => "dataflow",
-            Self::Paired => "paired",
-        }
+        "dataflow"
     }
 }
 
@@ -208,7 +198,7 @@ pub struct RunArgs {
     #[arg(long, env = "LOADTEST_CAPTURE_SETTLE", default_value = "30s")]
     pub capture_settle: DurationArg,
 
-    /// Maximum time to wait for direct receipts and graceful publication drain.
+    /// Maximum time to wait for downstream publication to settle.
     #[arg(long, env = "LOADTEST_DRAIN_TIMEOUT", default_value = "2m")]
     pub drain_timeout: DurationArg,
 
@@ -216,7 +206,7 @@ pub struct RunArgs {
     #[arg(long, env = "LOADTEST_REQUEST_TIMEOUT", default_value = "1m")]
     pub request_timeout: DurationArg,
 
-    /// Run paired load until Ctrl+C. This overrides configured scenarios and measurement duration.
+    /// Run Dataflow load until Ctrl+C. This overrides the configured measurement duration.
     #[arg(long, env = "LOADTEST_CONTINUOUS", default_value_t = false)]
     pub continuous: bool,
 
@@ -229,7 +219,7 @@ pub struct RunArgs {
         long = "scenario",
         env = "LOADTEST_SCENARIOS",
         value_delimiter = ',',
-        default_value = "direct,dataflow,paired"
+        default_value = "dataflow"
     )]
     pub scenarios: Vec<Scenario>,
 
@@ -257,7 +247,7 @@ pub struct RunArgs {
     #[arg(long, env = "LOADTEST_RETRY_WINDOW")]
     pub retry_window: Option<DurationArg>,
 
-    /// Both collectors persist every batch to native Quiver before acknowledging it.
+    /// The Dataflow collector persists every batch to native Quiver before acknowledging it.
     #[arg(long, env = "LOADTEST_QUIVER", default_value_t = false)]
     pub quiver: bool,
 
@@ -265,19 +255,19 @@ pub struct RunArgs {
     #[arg(long, env = "LOADTEST_ROUTER_ENDPOINT", default_value = "http://router:50050")]
     pub router_endpoint: String,
 
-    /// Direct collector used for Flight SQL catalog registration.
-    #[arg(long, env = "LOADTEST_CATALOG_ENDPOINT", default_value = "http://direct-1:50051")]
+    /// Schema Catalog service endpoint.
+    #[arg(
+        long,
+        env = "LOADTEST_CATALOG_ENDPOINT",
+        default_value = "http://arrowcol-catalog:8817"
+    )]
     pub catalog_endpoint: String,
-
-    /// Router HTTP base URL used for receipt polling.
-    #[arg(long, env = "LOADTEST_RECEIPT_ENDPOINT", default_value = "http://router:50050")]
-    pub receipt_endpoint: String,
 
     /// Trusted-edge HMAC secret file.
     #[arg(long, env = "LOADTEST_EDGE_SECRET_FILE", default_value = "/run/secrets/edge-hmac")]
     pub edge_secret_file: PathBuf,
 
-    /// Router-to-collector HMAC secret used only for direct Flight SQL control.
+    /// Internal HMAC secret for authenticated router-to-Dataflow traffic.
     #[arg(
         long,
         env = "LOADTEST_INTERNAL_SECRET_FILE",
@@ -285,7 +275,7 @@ pub struct RunArgs {
     )]
     pub internal_secret_file: PathBuf,
 
-    /// SQL Server host used to export immutable catalog artifacts and routing evidence.
+    /// SQL Server host used only for routing evidence.
     #[arg(long, env = "ARROWCOL_SQL_HOST", default_value = "sqlserver")]
     pub sql_host: String,
 
@@ -321,10 +311,6 @@ pub struct RunArgs {
     #[arg(long, env = "LOADTEST_RESULTS", default_value = "/results")]
     pub results: PathBuf,
 
-    /// Direct-pool Delta root.
-    #[arg(long, env = "LOADTEST_DIRECT_ROOT", default_value = "/delta/direct")]
-    pub direct_root: PathBuf,
-
     /// Dataflow-pool Delta root.
     #[arg(long, env = "LOADTEST_DATAFLOW_ROOT", default_value = "/delta/dataflow")]
     pub dataflow_root: PathBuf,
@@ -332,15 +318,6 @@ pub struct RunArgs {
     /// arrowcol-sdk-gen executable.
     #[arg(long, env = "ARROWCOL_SDK_GEN", default_value = "arrowcol-sdk-gen")]
     pub sdk_generator: PathBuf,
-
-    /// Comma-separated direct collector admin base URLs.
-    #[arg(
-        long,
-        env = "LOADTEST_DIRECT_ADMIN_ENDPOINTS",
-        value_delimiter = ',',
-        default_value = "http://direct-1:8081"
-    )]
-    pub direct_admin_endpoints: Vec<String>,
 
     /// Comma-separated dataflow collector admin base URLs.
     #[arg(
@@ -357,11 +334,11 @@ pub struct RunArgs {
 }
 
 impl RunArgs {
-    /// Returns scenarios after continuous-mode precedence is applied.
+    /// Returns the configured Dataflow scenario, including in continuous mode.
     #[must_use]
     pub fn effective_scenarios(&self) -> Vec<Scenario> {
         if self.continuous {
-            vec![Scenario::Paired]
+            vec![Scenario::Dataflow]
         } else {
             self.scenarios.clone()
         }
@@ -375,10 +352,6 @@ pub struct ValidateArgs {
     #[arg(long, env = "LOADTEST_RESULTS", default_value = "/results")]
     pub results: PathBuf,
 
-    /// Direct-pool Delta root.
-    #[arg(long, env = "LOADTEST_DIRECT_ROOT", default_value = "/delta/direct")]
-    pub direct_root: PathBuf,
-
     /// Dataflow-pool Delta root.
     #[arg(long, env = "LOADTEST_DATAFLOW_ROOT", default_value = "/delta/dataflow")]
     pub dataflow_root: PathBuf,
@@ -387,7 +360,7 @@ pub struct ValidateArgs {
     #[arg(long, env = "LOADTEST_DRAIN_TIMEOUT", default_value = "8m")]
     pub timeout: DurationArg,
 
-    /// Require every collector in each implementation pool to own a table.
+    /// Require every Dataflow collector to own a table.
     #[arg(long, env = "LOADTEST_REQUIRE_ALL_COLLECTORS", default_value_t = true)]
     pub require_all_collectors: bool,
 
@@ -404,7 +377,7 @@ pub struct ValidateArgs {
     )]
     pub dataflow_admin_endpoints: Vec<String>,
 
-    /// Both collectors persisted to native Quiver: every acknowledged dataflow row must be published.
+    /// Dataflow persisted to native Quiver: every acknowledged row must be published.
     #[arg(long, env = "LOADTEST_QUIVER", default_value_t = false)]
     pub quiver: bool,
 
@@ -440,13 +413,13 @@ mod tests {
             "--endpoint",
             "http://kusto:8080",
             "--table",
-            "direct_sqlserver_cpu_utilization",
+            "dataflow_sqlserver_cpu_utilization",
         ])?;
         let Command::ObserveQap(arguments) = cli.command else {
             bail!("expected observe-qap command");
         };
         assert_eq!(arguments.timeout.get(), Duration::from_secs(30));
-        assert_eq!(arguments.tables, ["direct_sqlserver_cpu_utilization"]);
+        assert_eq!(arguments.tables, ["dataflow_sqlserver_cpu_utilization"]);
         assert_eq!(arguments.output, PathBuf::from("observation.json"));
         Ok(())
     }
@@ -509,7 +482,7 @@ mod tests {
             "--batch-rows",
             "1024",
             "--scenario",
-            "paired",
+            "dataflow",
         ])?;
         let Command::Run(arguments) = cli.command else {
             bail!("expected run command");
@@ -518,12 +491,12 @@ mod tests {
         assert_eq!(arguments.measure.get(), Duration::from_secs(30));
         assert_eq!(arguments.lanes, 8);
         assert_eq!(arguments.batch_rows, 1024);
-        assert_eq!(arguments.effective_scenarios(), vec![Scenario::Paired]);
+        assert_eq!(arguments.effective_scenarios(), vec![Scenario::Dataflow]);
         Ok(())
     }
 
     #[test]
-    fn continuous_mode_forces_paired_scheduling() {
+    fn continuous_mode_forces_dataflow_scheduling() {
         let arguments = RunArgs {
             warmup: DurationArg(Duration::ZERO),
             measure: DurationArg(Duration::from_secs(1)),
@@ -532,7 +505,7 @@ mod tests {
             request_timeout: DurationArg(Duration::from_secs(1)),
             continuous: true,
             keep_stack: false,
-            scenarios: vec![Scenario::Direct, Scenario::Dataflow],
+            scenarios: vec![Scenario::Dataflow],
             tables: Vec::new(),
             lanes: 1,
             batch_rows: 1,
@@ -542,7 +515,6 @@ mod tests {
             quiver: false,
             router_endpoint: "http://localhost".to_owned(),
             catalog_endpoint: "http://localhost".to_owned(),
-            receipt_endpoint: "http://localhost".to_owned(),
             edge_secret_file: "secret".into(),
             internal_secret_file: "internal".into(),
             sql_host: "localhost".to_owned(),
@@ -552,14 +524,12 @@ mod tests {
             sql_password_file: "password".into(),
             scratch_root: "target/loadtest".into(),
             results: "target/results".into(),
-            direct_root: "target/direct".into(),
             dataflow_root: "target/dataflow".into(),
             sdk_generator: "arrowcol-sdk-gen".into(),
-            direct_admin_endpoints: Vec::new(),
             dataflow_admin_endpoints: Vec::new(),
             kusto_endpoint: None,
         };
-        assert_eq!(arguments.effective_scenarios(), vec![Scenario::Paired]);
+        assert_eq!(arguments.effective_scenarios(), vec![Scenario::Dataflow]);
     }
 
     #[test]

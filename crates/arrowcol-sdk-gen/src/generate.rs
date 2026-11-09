@@ -65,6 +65,7 @@ pub fn write_artifact_bundle(bundle: &ArtifactBundle, output: &SafeOutputPath) -
         (PathBuf::from("manifest.json"), bundle.manifest().to_vec()),
         (PathBuf::from("schema.arrow"), bundle.arrow_schema().to_vec()),
         (PathBuf::from("descriptor.pb"), bundle.protobuf_descriptor().to_vec()),
+        (PathBuf::from("schema.proto"), bundle.protobuf_source().to_vec()),
     ]);
     replace_directory(output, &files)
 }

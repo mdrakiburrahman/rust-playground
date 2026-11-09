@@ -1,6 +1,8 @@
 targetScope = 'subscription'
 
 param location string
+@allowed(['stamped', 'schema-evolution'])
+param azureMode string = 'stamped'
 param resourceGroupName string = 'arrow-collector-rg'
 param sandboxId string
 param storageAccountName string
@@ -48,6 +50,7 @@ module sandbox './sandbox.bicep' = {
   scope: group
   params: {
     location: location
+    azureMode: azureMode
     ownership: ownership
     storageAccountName: storageAccountName
     clusterName: clusterName

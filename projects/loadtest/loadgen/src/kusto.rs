@@ -3,8 +3,8 @@
 //! Locally the emulator reads the committed Delta snapshots directly through `kind=delta`
 //! external tables with a one-minute `MaxAge` acceleration policy; no rows are copied. In Azure
 //! mode the provisioned external tables are only queried. Correctness is checked twice per table:
-//! once through the non-accelerated fallback (`MaxAge` override of one second) and once through the
-//! accelerated cache after it reports complete, fresh, and eligible state for the captured commit.
+//! once with a one-second `MaxAge` override (not proof of a physical-source read) and once through
+//! the accelerated cache after it reports complete, fresh, and eligible state for the captured commit.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -48,7 +48,6 @@ const LOCAL_HOT_WINDOW: &str = "1.00:00:00";
 /// a 32-CPU devbox. Final compaction rewrites every table just before the fixed cache deadline, so the
 /// local emulator pins the devbox-proven worker count instead of inheriting the runner's core count.
 const LOCAL_QAP_WORKERS: u64 = 16;
-const TABLES_PER_POOL: usize = 13;
 // Query-engine memory is independent of the validator host's CPU count.
 const QUERY_CONCURRENCY: usize = 2;
 const HEAVY_QUERY_CONCURRENCY: usize = 1;
@@ -221,6 +220,7 @@ impl KustoClient {
                 "heavy_query_concurrency": HEAVY_QUERY_CONCURRENCY, "heavy": heavy,
                 "elapsed_ms": started.elapsed().as_millis(), "query_bytes": command.len(),
                 "management": management, "csl": redact_text(command),
+                "read_path": if management { None } else { Some(query_read_path(&body)) },
                 "http_status": status.as_u16(), "response": public
             }),
         )?;
@@ -490,6 +490,28 @@ impl KustoClient {
     }
 }
 
+fn query_read_path(body: &Value) -> &'static str {
+    fn remote_reads(value: &Value) -> bool {
+        match value {
+            Value::Object(fields) => {
+                let observed = fields.get("external_data").is_some_and(|external| {
+                    ["iterated_artifacts", "downloaded_items"]
+                        .iter()
+                        .any(|key| external.get(key).and_then(Value::as_u64).is_some_and(|count| count > 0))
+                });
+                observed || fields.values().any(remote_reads)
+            }
+            Value::Array(values) => values.iter().any(remote_reads),
+            _ => false,
+        }
+    }
+    if remote_reads(body) {
+        "remote-reads-observed"
+    } else {
+        "unproven"
+    }
+}
+
 fn decode_response(body: &Value) -> Result<Vec<BTreeMap<String, Value>>> {
     if body.get("error").is_some() || body.get("Error").is_some() {
         bail!("Kusto command failed: {body}");
@@ -584,7 +606,7 @@ fn identifier(value: &str) -> Result<String> {
 }
 
 fn external_name(pool: &str, identity: &str) -> Result<String> {
-    ensure!(matches!(pool, "direct" | "dataflow"), "unknown Kusto source pool");
+    ensure!(pool == "dataflow", "unknown Kusto source pool");
     let name = identity
         .strip_prefix("telemetry.sqlserver.")
         .context("unexpected loadtest table namespace")?;
@@ -595,6 +617,28 @@ fn external_name(pool: &str, identity: &str) -> Result<String> {
     let name = format!("{pool}_{name}");
     identifier(&name)?;
     Ok(name)
+}
+
+fn canonical_dataflow_tables() -> Result<BTreeSet<String>> {
+    crate::schema::schema_statements()?
+        .into_iter()
+        .map(|statement| {
+            external_name(
+                "dataflow",
+                &format!("telemetry.sqlserver.{}", statement.identity.table().as_str()),
+            )
+        })
+        .collect()
+}
+
+fn live_table_coverage(expected: &BTreeSet<String>, observed: &BTreeSet<String>) -> Result<()> {
+    let missing = expected.difference(observed).cloned().collect::<Vec<_>>();
+    let unexpected = observed.difference(expected).cloned().collect::<Vec<_>>();
+    ensure!(
+        missing.is_empty() && unexpected.is_empty(),
+        "generation-active native Kusto positive-row visibility is incomplete: missing Dataflow tables {missing:?}; unexpected tables {unexpected:?}"
+    );
+    Ok(())
 }
 
 /// Committed Delta table root inside the Kusto container (mounted read-only at `/delta/<pool>`).
@@ -666,6 +710,7 @@ struct TableProgress {
 struct Exposure {
     client: KustoClient,
     status: ExposureStatus,
+    expected_live_tables: BTreeSet<String>,
     schemas: BTreeMap<String, Value>,
 }
 
@@ -679,6 +724,7 @@ impl Exposure {
                 backend: BACKEND.to_owned(),
                 ..ExposureStatus::default()
             },
+            expected_live_tables: canonical_dataflow_tables()?,
             schemas: BTreeMap::new(),
         })
     }
@@ -695,7 +741,7 @@ impl Exposure {
             self.status.state = "healthy".to_owned();
             self.status.error = None;
         }
-        self.status.live_observed = self.status.live_tables.len() == 2 * TABLES_PER_POOL;
+        self.status.live_observed = live_table_coverage(&self.expected_live_tables, &self.status.live_tables).is_ok();
         self.status.files_ingested = self.status.tables.values().map(|table| table.active_files).sum();
         write_json(&self.client.results.join(STATUS), &self.status)
     }
@@ -722,6 +768,9 @@ impl Exposure {
                 );
             } else {
                 if self.client.mode == Mode::Local {
+                    if inventory.files.is_empty() {
+                        continue;
+                    }
                     self.client.expose(&name, &table_location(pool, table)?).await?;
                 }
                 self.schemas.insert(name.clone(), inventory.schema.clone());
@@ -729,7 +778,7 @@ impl Exposure {
             if live.load(Ordering::Acquire)
                 && !self.status.live_tables.contains(&name)
                 && !inventory.files.is_empty()
-                && self.client.count(&external_source(&name)?, "live-observation").await? > 0
+                && self.client.count(&fallback_source(&name)?, "live-observation").await? > 0
                 && live.load(Ordering::Acquire)
             {
                 self.status.live_tables.insert(name.clone());
@@ -756,12 +805,12 @@ impl Exposure {
         for name in rows
             .iter()
             .filter_map(|row| row.get("TableName").and_then(Value::as_str))
-            .filter(|name| name.starts_with("direct_sqlserver_") || name.starts_with("dataflow_sqlserver_"))
+            .filter(|name| name.starts_with("dataflow_sqlserver_"))
         {
             if !live.load(Ordering::Acquire) || self.status.live_tables.contains(name) {
                 continue;
             }
-            match self.client.count(&external_source(name)?, "live-observation").await {
+            match self.client.count(&fallback_source(name)?, "live-observation").await {
                 Ok(rows) if rows > 0 && live.load(Ordering::Acquire) => {
                     self.status.live_tables.insert(name.to_owned());
                 }
@@ -775,12 +824,12 @@ impl Exposure {
         Ok(())
     }
 
-    async fn sync_roots(&mut self, direct: &Path, dataflow: &Path, live: &AtomicBool) -> Result<()> {
+    async fn sync_roots(&mut self, dataflow: &Path, live: &AtomicBool) -> Result<()> {
         if self.client.mode == Mode::Azure {
             return self.observe_provisioned(live).await;
         }
         self.client.bootstrap().await?;
-        for (pool, root) in [("direct", direct), ("dataflow", dataflow)] {
+        for (pool, root) in [("dataflow", dataflow)] {
             let snapshot = delta_inspect::inventory(root).await?;
             self.sync(pool, &snapshot, live).await?;
         }
@@ -807,9 +856,7 @@ impl LiveSync {
             let result = async {
                 let mut exposure = Exposure::new(&endpoint, &arguments.results, &run_id)?;
                 while !stopped.is_cancelled() {
-                    let result = exposure
-                        .sync_roots(&arguments.direct_root, &arguments.dataflow_root, &active)
-                        .await;
+                    let result = exposure.sync_roots(&arguments.dataflow_root, &active).await;
                     exposure.persist(result.as_ref().err())?;
                     tokio::select! {
                         () = stopped.cancelled() => break,
@@ -823,9 +870,7 @@ impl LiveSync {
                         arguments.quiver,
                     )
                     .await?;
-                    exposure
-                        .sync_roots(&arguments.direct_root, &arguments.dataflow_root, &active)
-                        .await
+                    exposure.sync_roots(&arguments.dataflow_root, &active).await
                 })
                 .await
                 .context("Kusto final catch-up timed out")?;
@@ -1499,9 +1544,7 @@ impl KustoBound {
 pub(crate) async fn validate(
     endpoint: &str,
     results: &Path,
-    direct_root: &Path,
     dataflow_root: &Path,
-    direct: &SnapshotSummary,
     dataflow: &SnapshotSummary,
     bound: &KustoBound,
 ) -> Result<Value> {
@@ -1519,10 +1562,18 @@ pub(crate) async fn validate(
     let oracle_timer = bound.timings.measure("phase/TableOracle");
     bound.update(|progress| progress.phase = KustoPhase::TableOracle);
     let mut inputs = Vec::new();
-    for (pool, root, snapshot) in [("direct", direct_root, direct), ("dataflow", dataflow_root, dataflow)] {
+    let expected_tables = canonical_dataflow_tables()?;
+    for (pool, root, snapshot) in [("dataflow", dataflow_root, dataflow)] {
+        let observed_tables = snapshot
+            .tables
+            .keys()
+            .map(|table| external_name(pool, table))
+            .collect::<Result<BTreeSet<_>>>()?;
         ensure!(
-            snapshot.tables.len() == TABLES_PER_POOL,
-            "{pool} Kusto validation requires all {TABLES_PER_POOL} tables"
+            observed_tables == expected_tables,
+            "{pool} Kusto validation table set differs from the canonical DFE set: missing={:?}; unexpected={:?}",
+            expected_tables.difference(&observed_tables).collect::<Vec<_>>(),
+            observed_tables.difference(&expected_tables).collect::<Vec<_>>()
         );
         let timer = bound.timings.measure(format!("frozen/{pool}"));
         ensure!(
@@ -1574,7 +1625,7 @@ pub(crate) async fn validate(
                         .await?;
                     fallback
                         .check(&corpus)
-                        .with_context(|| format!("non-accelerated fallback differs from Delta for {name}"))?;
+                        .with_context(|| format!("MaxAge-overridden external query differs from Delta for {name}"))?;
                     fallback_timer.finish(true);
                     let policy_timer = bound.timings.measure(format!("policy/{name}"));
                     let (policy, max_age) = client.max_age(&name).await?;
@@ -1628,7 +1679,11 @@ pub(crate) async fn validate(
                 "expected_rows": check.summary.rows, "distinct_rows": check.corpus.distinct_rows(),
                 "oracle_chunks": check.corpus.chunks.len(), "oracle_partitions": check.corpus.partition_rows.len(),
                 "actual": {"Rows": check.fallback.rows(), "Invalid": check.fallback.unmatched()},
-                "fallback": {"query": fallback_source(&check.name)?, "result": check.fallback.evidence()},
+                "fallback": {
+                    "query": fallback_source(&check.name)?, "result": check.fallback.evidence(),
+                    "max_age_override_seconds": 1,
+                    "read_path": "not-established-by-max-age"
+                },
                 "cached": cached[&check.name],
                 "qap": {
                     "policy": check.policy,
@@ -1638,10 +1693,10 @@ pub(crate) async fn validate(
             }),
         );
     }
+    live_table_coverage(&expected_tables, &status.live_tables)?;
     ensure!(
-        status.live_observed && status.live_tables.len() == 2 * TABLES_PER_POOL,
-        "all {} Kusto tables were not observed while generation was active",
-        2 * TABLES_PER_POOL
+        status.live_observed,
+        "native Kusto status did not record complete generation-active positive-row visibility"
     );
     status.state = "healthy".to_owned();
     status.backend = BACKEND.to_owned();
@@ -1835,6 +1890,7 @@ pub async fn observe_qap(
             }
             json!({
                 "observed_unix_ms": now_unix_millis(), "backend": BACKEND, "mode": client.mode,
+                "expected_tables": tables,
                 "capacity": client.capacity().await, "tables": observed
             })
         })
@@ -2019,6 +2075,27 @@ mod tests {
                     error => panic!("test server failed: {error:?}"),
                 }
             }
+        }
+    }
+
+    #[test]
+    fn query_path_requires_positive_native_remote_read_statistics() {
+        for counter in ["iterated_artifacts", "downloaded_items"] {
+            let evidence = json!([{"Payload": {
+                "input_dataset_statistics": {"external_data": {counter: 1}}
+            }}]);
+            assert_eq!(query_read_path(&evidence), "remote-reads-observed");
+        }
+        for evidence in [
+            json!({}),
+            json!({"Count": 3}),
+            json!({"iterated_artifacts": 5}),
+            json!({"input_dataset_statistics": {"external_data": {
+                "iterated_artifacts": 0, "downloaded_items": 0
+            }}}),
+            json!({"external_data": {"iterated_artifacts": -1, "downloaded_items": "unknown"}}),
+        ] {
+            assert_eq!(query_read_path(&evidence), "unproven");
         }
     }
 
@@ -2247,17 +2324,41 @@ mod tests {
         assert!(predicate.contains("a\\\"b\\\\c"));
         assert!(columns(&json!({"fields":[{"name":"bad","type":"binary"}]})).is_err());
         assert!(identifier("x'); .drop database loadtest").is_err());
-        assert!(external_name("direct", "unexpected.sqlserver.sqlserver_wait_stats").is_err());
-        assert!(table_location("direct", "telemetry.sqlserver.sqlserver_wait_stats/../x").is_err());
+        assert!(external_name("direct", "telemetry.sqlserver.sqlserver_wait_stats").is_err());
+        assert!(external_name("dataflow", "unexpected.sqlserver.sqlserver_wait_stats").is_err());
+        assert!(table_location("dataflow", "telemetry.sqlserver.sqlserver_wait_stats/../x").is_err());
         assert_eq!(
             table_location("dataflow", "telemetry.sqlserver.sqlserver_wait_stats")?,
             "/delta/dataflow/telemetry/sqlserver/sqlserver_wait_stats"
         );
         assert_eq!(
-            fallback_source("direct_sqlserver_wait_stats")?,
-            "external_table(\"direct_sqlserver_wait_stats\", timespan(1s))"
+            fallback_source("dataflow_sqlserver_wait_stats")?,
+            "external_table(\"dataflow_sqlserver_wait_stats\", timespan(1s))"
         );
         assert!(external_source("x\") | take 1; //").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn generation_active_coverage_requires_exact_canonical_dataflow_tables() -> Result<()> {
+        let expected = canonical_dataflow_tables()?;
+        assert!(expected.contains("dataflow_sqlserver_wait_stats"));
+        assert!(expected.iter().all(|table| table.starts_with("dataflow_sqlserver_")));
+        live_table_coverage(&expected, &expected)?;
+
+        let mut missing = expected.clone();
+        missing.remove("dataflow_sqlserver_wait_stats");
+        assert!(matches!(
+            live_table_coverage(&expected, &missing),
+            Err(error) if format!("{error:#}").contains("dataflow_sqlserver_wait_stats")
+        ));
+
+        let mut retired = expected.clone();
+        retired.insert("direct_sqlserver_wait_stats".to_owned());
+        assert!(matches!(
+            live_table_coverage(&expected, &retired),
+            Err(error) if format!("{error:#}").contains("direct_sqlserver_wait_stats")
+        ));
         Ok(())
     }
 
@@ -2286,7 +2387,7 @@ mod tests {
             "reingested duplicates must fail"
         );
         let query = multiset_query(
-            "external_table(\"direct_x\", timespan(1s))",
+            "external_table(\"dataflow_x\", timespan(1s))",
             &json!({"fields":[{"name":"id","type":"long"}]}),
             &samples,
         )?;
@@ -2332,10 +2433,10 @@ mod tests {
         }
         // Freshness compares the refresh time with the Delta commit, so an idle table whose cache
         // refreshed after its last commit but before snapshot capture remains ready.
-        let command = acceleration_command("direct_x", "00:01:00", Some(1_700_000_000_000))?;
+        let command = acceleration_command("dataflow_x", "00:01:00", Some(1_700_000_000_000))?;
         assert!(command.contains("LastUpdatedDateTime >= unixtime_milliseconds_todatetime(1700000000000)"));
         assert!(command.contains("LastUpdatedDateTime > now() - totimespan(\"00:01:00\")"));
-        assert!(acceleration_command("direct_x", "1m; .drop", None).is_err());
+        assert!(acceleration_command("dataflow_x", "1m; .drop", None).is_err());
         let details = json!({"QueryAccelerationState": {
             "TableVersion": 4, "IsHealthy": true, "RowCount": 3, "AcceleratedRowCount": 3, "NotHealthyReason": ""
         }});
@@ -2357,7 +2458,7 @@ mod tests {
         let observed = sanitize(&json!({
             "IsEnabled": true, "MaxAge": "00:01:00", "CachedTableName": "$_cached_x",
             "ConnectionStrings": ["abfss://c@a.dfs.core.windows.net/x;impersonate"],
-            "State": "{\"CompletePercentage\":100,\"DataPath\":\"/delta/direct/x\",\"Note\":\"h@'/delta'\"}",
+            "State": "{\"CompletePercentage\":100,\"DataPath\":\"/delta/dataflow/x\",\"Note\":\"h@'/delta'\"}",
             "Nested": [{"Uri": "https://a?sig=secret", "HotSize": 7}]
         }));
         let text = observed.to_string();
@@ -2389,7 +2490,11 @@ mod tests {
         assert!(KustoClient::with_mode("https://localhost:8080", &directory.0, Mode::Local, DATABASE).is_err());
         let client = KustoClient::with_mode("https://cluster.kusto.windows.net", &directory.0, Mode::Azure, "db")?;
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-        assert!(runtime.block_on(client.expose("direct_x", "/delta/direct/x")).is_err());
+        assert!(
+            runtime
+                .block_on(client.expose("dataflow_x", "/delta/dataflow/x"))
+                .is_err()
+        );
         assert!(runtime.block_on(client.bootstrap()).is_ok());
         Ok(())
     }
@@ -2438,21 +2543,31 @@ mod tests {
 
     #[tokio::test]
     async fn committed_tables_are_exposed_once_and_source_changes_fail_explicitly() -> Result<()> {
+        use arrow::array::{Int64Array, RecordBatch};
+        use arrow_deltalake::delta::{DeltaTable, DeltaTableWriter};
+
         let directory = Directory::new()?;
         let table = "telemetry.sqlserver.sqlserver_wait_stats";
         let definitions = Arc::new(AtomicUsize::new(0));
         let policies = Arc::new(AtomicUsize::new(0));
+        let reject_creation = Arc::new(AtomicBool::new(true));
+        let rejected = Arc::clone(&reject_creation);
         let (defined, altered) = (Arc::clone(&definitions), Arc::clone(&policies));
         let server = Server::start(move |request| {
             let command = request["csl"].as_str().context("command missing")?;
             if command.starts_with(".create-or-alter external table") {
-                ensure!(command.contains("kind=delta (h@'/delta/direct/telemetry/sqlserver/sqlserver_wait_stats')"));
+                if rejected.swap(false, Ordering::Relaxed) {
+                    let mut failed = response(&[], vec![]);
+                    failed["Exceptions"] = json!(["creation failed"]);
+                    return Ok(Some(failed));
+                }
+                ensure!(command.contains("kind=delta (h@'/delta/dataflow/telemetry/sqlserver/sqlserver_wait_stats')"));
                 defined.fetch_add(1, Ordering::Relaxed);
             } else if command.starts_with(".alter external table") {
                 ensure!(command.contains("query_acceleration") && command.contains("00:01:00"));
                 altered.fetch_add(1, Ordering::Relaxed);
             } else if command.ends_with("| count") {
-                ensure!(command.starts_with("external_table(\"direct_sqlserver_wait_stats\")"));
+                ensure!(command.starts_with("external_table(\"dataflow_sqlserver_wait_stats\", timespan(1s))"));
                 return Ok(Some(response(&["Count"], vec![json!([3])])));
             }
             Ok(Some(response(&[], vec![])))
@@ -2461,39 +2576,60 @@ mod tests {
         let mut exposure = Exposure {
             client,
             status: ExposureStatus::default(),
+            expected_live_tables: canonical_dataflow_tables()?,
             schemas: BTreeMap::new(),
         };
-        let snapshot = SnapshotInventory {
-            tables: BTreeMap::from([(
-                table.to_owned(),
-                TableInventory {
-                    schema: json!({"fields":[{"name":"id","type":"long"}]}),
-                    version: 1,
-                    files: vec!["part.parquet".to_owned()],
-                },
-            )]),
-        };
+        let root = directory.0.join("telemetry/sqlserver/sqlserver_wait_stats");
+        fs::create_dir_all(&root)?;
+        let url =
+            Url::from_directory_path(fs::canonicalize(&root)?).map_err(|()| anyhow::anyhow!("invalid table path"))?;
+        let batch = RecordBatch::try_from_iter(vec![("id", Arc::new(Int64Array::from(vec![1, 2, 3])) as _)])?;
+        let created =
+            DeltaTable::open_catalog(url)?.commit_catalog(None, batch.schema(), Vec::new(), BTreeMap::new(), None)?;
+        assert_eq!(created.version, 0);
         let live = AtomicBool::new(true);
-        exposure.sync("direct", &snapshot, &live).await?;
-        let mut optimized = snapshot.clone();
-        optimized.tables.get_mut(table).context("table")?.files = vec!["compacted.parquet".to_owned()];
-        optimized.tables.get_mut(table).context("table")?.version = 2;
-        exposure.sync("direct", &optimized, &live).await?;
+        let empty = delta_inspect::inventory(&directory.0).await?;
+        assert_eq!(empty.tables[table].version, 0);
+        assert!(empty.tables[table].files.is_empty());
+        exposure.sync("dataflow", &empty, &live).await?;
+        exposure.sync("dataflow", &empty, &live).await?;
+        assert_eq!(definitions.load(Ordering::Relaxed), 0);
+        assert_eq!(policies.load(Ordering::Relaxed), 0);
+        assert!(exposure.schemas.is_empty());
+        assert!(exposure.status.live_tables.is_empty());
+        assert!(exposure.status.tables.is_empty());
+        let mut writer = DeltaTableWriter::open(&root)?;
+        writer.write(&batch).await?;
+        writer.flush().await?;
+        let snapshot = delta_inspect::inventory(&directory.0).await?;
+        assert_eq!(snapshot.tables[table].files.len(), 1);
+        assert!(root.join(&snapshot.tables[table].files[0]).is_file());
+        assert!(exposure.sync("dataflow", &snapshot, &live).await.is_err());
+        assert!(exposure.schemas.is_empty());
+        assert!(exposure.status.tables.is_empty());
+        assert!(exposure.status.live_tables.is_empty());
+        assert_eq!(definitions.load(Ordering::Relaxed), 0);
+        exposure.sync("dataflow", &snapshot, &live).await?;
+        writer.write(&batch).await?;
+        writer.close().await?;
+        let optimized = delta_inspect::inventory(&directory.0).await?;
+        assert_eq!(optimized.tables[table].files.len(), 2);
+        exposure.sync("dataflow", &optimized, &live).await?;
         assert_eq!(
             definitions.load(Ordering::Relaxed),
             1,
             "file replacement needs no redefinition"
         );
         assert_eq!(policies.load(Ordering::Relaxed), 1);
-        assert!(exposure.status.live_tables.contains("direct_sqlserver_wait_stats"));
-        assert_eq!(exposure.status.tables["direct_sqlserver_wait_stats"].version, 2);
+        assert!(exposure.status.live_tables.contains("dataflow_sqlserver_wait_stats"));
+        assert_eq!(exposure.status.tables["dataflow_sqlserver_wait_stats"].version, 2);
         let mut changed = optimized.clone();
         changed.tables.get_mut(table).context("table")?.schema["fields"][0]["type"] = json!("string");
-        assert!(exposure.sync("direct", &changed, &live).await.is_err());
+        assert!(exposure.sync("dataflow", &changed, &live).await.is_err());
         let removed = SnapshotInventory {
             tables: BTreeMap::new(),
         };
-        assert!(exposure.sync("direct", &removed, &live).await.is_err());
+        assert!(exposure.sync("dataflow", &removed, &live).await.is_err());
         Ok(())
     }
 
@@ -2587,9 +2723,9 @@ mod tests {
 
     fn deadline_check() -> TableCheck {
         TableCheck {
-            name: "direct_x".to_owned(),
+            name: "dataflow_x".to_owned(),
             table: "telemetry.sqlserver.x".to_owned(),
-            pool: "direct",
+            pool: "dataflow",
             summary: TableSummary {
                 schema: json!({"fields":[{"name":"id","type":"long"}]}),
                 version: 4,
@@ -2651,7 +2787,7 @@ mod tests {
                 )));
             }
             ensure!(
-                command.starts_with("external_table(\"direct_x\")"),
+                command.starts_with("external_table(\"dataflow_x\")"),
                 "unexpected {command}"
             );
             thread::sleep(Duration::from_millis(delay.load(Ordering::Relaxed)));
@@ -2914,11 +3050,11 @@ mod tests {
         check.fallback = chunked_result(2, 1, None);
         let checks = [check];
         let converged = converge(&client, &checks, Duration::from_secs(10), &KustoBound::default()).await?;
-        assert_eq!(converged["direct_x"]["result"]["chunks"], 2);
-        assert_eq!(converged["direct_x"]["result"]["rows"], 3);
+        assert_eq!(converged["dataflow_x"]["result"]["chunks"], 2);
+        assert_eq!(converged["dataflow_x"]["result"]["rows"], 3);
         {
             let commands = commands.lock().map_err(|_| anyhow::anyhow!("poisoned"))?;
-            let source = "external_table(\"direct_x\")";
+            let source = "external_table(\"dataflow_x\")";
             assert!(commands.iter().any(|command| command
                 == &format!("{source} | summarize Rows = count() by Partition = tostring(['__arrowcol_ingestion'])")));
             assert!(
@@ -2946,7 +3082,7 @@ mod tests {
         let client = KustoClient::with_mode(&server.endpoint, &directory.0, Mode::Local, DATABASE)?;
         let checks = [deadline_check()];
         let converged = converge(&client, &checks, Duration::from_secs(10), &KustoBound::default()).await?;
-        let observations = converged["direct_x"]["observations"]
+        let observations = converged["dataflow_x"]["observations"]
             .as_array()
             .context("observations recorded")?;
         assert_eq!(observations.len(), 1);
@@ -2991,13 +3127,13 @@ mod tests {
         assert!(format!("{error:#}").contains("(cache budget 10s)"), "{error:#}");
         let mut progress = bound.into_progress();
         progress.phase = KustoPhase::Converge;
-        assert_eq!(progress.last_qap["direct_x"]["outcome"], "not-ready");
+        assert_eq!(progress.last_qap["dataflow_x"]["outcome"], "not-ready");
         let report = validation_failure(&directory.0, &error, &progress)?;
         let written: Value = serde_json::from_slice(&fs::read(directory.0.join("kusto-validation.json"))?)?;
         assert_eq!(written, report);
         assert_eq!(written["passed"], false);
         assert_eq!(written["phase"], "converge");
-        assert_eq!(written["last_qap"]["direct_x"]["outcome"], "not-ready");
+        assert_eq!(written["last_qap"]["dataflow_x"]["outcome"], "not-ready");
 
         // A cached success that returns after the ceiling is rejected and its request cancelled.
         let checks = [deadline_check()];
@@ -3044,9 +3180,9 @@ mod tests {
             seen.lock()
                 .map_err(|_| anyhow::anyhow!("poisoned"))?
                 .push(command.clone());
-            if command.contains("direct_absent") {
+            if command.contains("dataflow_absent") {
                 let mut failed = response(&["Rows"], vec![]);
-                failed["Exceptions"] = json!(["'direct_absent' was not found"]);
+                failed["Exceptions"] = json!(["'dataflow_absent' was not found"]);
                 return Ok(Some(failed));
             }
             if command.ends_with("policy query_acceleration") {
@@ -3057,7 +3193,7 @@ mod tests {
                     ])],
                 )));
             }
-            if command.contains("query_acceleration statistics") && command.contains("direct_ready") {
+            if command.contains("query_acceleration statistics") && command.contains("dataflow_ready") {
                 return Ok(Some(response(
                     &[
                         "HotSize",
@@ -3082,7 +3218,7 @@ mod tests {
             }
             Ok(Some(response(&[], vec![])))
         })?;
-        let tables = ["direct_ready", "direct_empty", "direct_absent"].map(str::to_owned);
+        let tables = ["dataflow_ready", "dataflow_empty", "dataflow_absent"].map(str::to_owned);
         let observed = observe_qap(
             &server.endpoint,
             &directory.0,
@@ -3091,7 +3227,8 @@ mod tests {
             Duration::from_secs(10),
         )
         .await?;
-        let ready = &observed["tables"]["direct_ready"];
+        let ready = &observed["tables"]["dataflow_ready"];
+        assert_eq!(observed["expected_tables"], json!(&tables));
         assert_eq!(ready["available"], true);
         assert_eq!(ready["statistics"]["AccelerationPendingDataFilesCount"], 2);
         assert_eq!(ready["statistics"]["AccelerationPendingDataFilesSize"], Value::Null);
@@ -3100,8 +3237,8 @@ mod tests {
         assert_eq!(ready["statistics"]["Fresh"], Value::Null, "no correctness claim");
         assert_eq!(ready["state"]["TableVersion"], 3);
         assert_eq!(ready["state"]["AcceleratedRowCount"], Value::Null);
-        assert_eq!(observed["tables"]["direct_empty"]["statistics"], Value::Null);
-        assert_eq!(observed["tables"]["direct_absent"]["available"], false);
+        assert_eq!(observed["tables"]["dataflow_empty"]["statistics"], Value::Null);
+        assert_eq!(observed["tables"]["dataflow_absent"]["available"], false);
         assert_eq!(observed["capacity"]["available"], true);
         let commands = commands.lock().map_err(|_| anyhow::anyhow!("poisoned"))?;
         let diagnostic: Value = serde_json::from_slice(&fs::read(directory.0.join("observation-diagnostic.json"))?)?;
@@ -3119,7 +3256,9 @@ mod tests {
     #[tokio::test]
     async fn observation_diagnostics_classify_real_deadline_and_setup_failure_without_error_text() -> Result<()> {
         let directory = Directory::new()?;
-        let server = Server::start(|request| {
+        let deadline = Duration::from_secs(2);
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let server = Server::start(move |request| {
             if request["csl"]
                 .as_str()
                 .is_some_and(|command| command.ends_with("policy query_acceleration"))
@@ -3129,24 +3268,27 @@ mod tests {
                     vec![json!(["{\"IsEnabled\":true,\"MaxAge\":\"00:01:00\"}"])],
                 )));
             }
-            std::thread::sleep(Duration::from_millis(200));
-            Ok(Some(response(&[], vec![])))
+            let _ = blocked.recv();
+            Ok(None)
         })?;
-        assert!(
-            observe_qap(
-                &server.endpoint,
-                &directory.0,
-                Some(DATABASE),
-                &["direct_ready".to_owned()],
-                Duration::from_millis(50),
-            )
-            .await
-            .is_err()
-        );
+        let observed = observe_qap(
+            &server.endpoint,
+            &directory.0,
+            Some(DATABASE),
+            &["dataflow_ready".to_owned()],
+            deadline,
+        )
+        .await;
+        drop(release);
+        assert!(observed.is_err());
         let diagnostic: Value = serde_json::from_slice(&fs::read(directory.0.join("observation-diagnostic.json"))?)?;
         assert_eq!(diagnostic["code"], "deadline_exceeded");
         assert_eq!(diagnostic["queries_completed"], 1);
-        assert!(diagnostic["elapsed_ms"].as_u64().is_some_and(|elapsed| elapsed >= 50));
+        assert!(
+            diagnostic["elapsed_ms"]
+                .as_u64()
+                .is_some_and(|elapsed| u128::from(elapsed) >= deadline.as_millis())
+        );
         assert!(
             observe_qap(
                 "https://private.invalid/password?secret=canary",
@@ -3213,9 +3355,9 @@ mod tests {
     }
 
     /// Real-emulator check of every native validation step against a pool root mounted at
-    /// `/delta/direct`. `loadgen/scripts/kusto-qap-it.sh` writes, mutates and VACUUMs the fixture.
+    /// `/delta/dataflow`. `loadgen/scripts/kusto-qap-it.sh` writes, mutates and VACUUMs the fixture.
     #[tokio::test]
-    #[ignore = "requires KUSTO_IT_ENDPOINT and KUSTO_IT_ROOT (emulator mounting the root at /delta/direct)"]
+    #[ignore = "requires KUSTO_IT_ENDPOINT and KUSTO_IT_ROOT (emulator mounting the root at /delta/dataflow)"]
     async fn native_qap_converges_on_emulator() -> Result<()> {
         let endpoint = std::env::var("KUSTO_IT_ENDPOINT")?;
         let root = PathBuf::from(std::env::var("KUSTO_IT_ROOT")?);
@@ -3226,9 +3368,9 @@ mod tests {
         let summary = delta_inspect::summarize(&root).await?;
         ensure!(!summary.tables.is_empty(), "fixture has no Delta tables");
         for (table, table_summary) in &summary.tables {
-            let name = external_name("direct", table)?;
+            let name = external_name("dataflow", table)?;
             if std::env::var_os("KUSTO_IT_EXPOSE").is_some() {
-                client.expose(&name, &table_location("direct", table)?).await?;
+                client.expose(&name, &table_location("dataflow", table)?).await?;
             }
             assert_eq!(client.schema(&name).await?, columns(&table_summary.schema)?);
             // One chunk per partition exercises the partition-filtered chunk queries on the emulator.

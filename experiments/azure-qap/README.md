@@ -107,7 +107,7 @@ and `tools-scripts:qap-rehearsal` Nx targets.
 
 ## What a trial does
 
-1. **Seed**: `arrowcol-experiment seed-scale` writes the table under
+1. **Seed**: `qap-fixture seed-scale` writes the table under
    `experimentqap/runs/<runId>/<trial>/` using server-side blob copies of one
    seed Parquet file. The VACUUM trial is seeded with tombstones already in its
    Delta history, so VACUUM only deletes files that were unreferenced before QAP

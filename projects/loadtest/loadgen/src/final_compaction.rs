@@ -18,7 +18,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
@@ -117,7 +117,7 @@ fn enabled(args: &FinalCompactionArgs) -> Result<bool> {
         !(args.final_compaction && args.skip_final_compaction),
         "cannot request and skip final-compaction"
     );
-    let azure = cloud_root(&args.direct_root) || cloud_root(&args.dataflow_root);
+    let azure = cloud_root(&args.dataflow_root);
     ensure!(
         !(azure && args.final_compaction),
         "explicit Azure final-compaction is unsupported"
@@ -260,7 +260,7 @@ trait Backend {
 fn exact_keys<T>(values: &BTreeMap<String, T>, expected: &BTreeSet<String>) -> Result<()> {
     ensure!(
         values.keys().cloned().collect::<BTreeSet<_>>() == *expected,
-        "final-compaction table set must match all 26 expected tables"
+        "final-compaction table set must match the expected tables"
     );
     Ok(())
 }
@@ -444,6 +444,8 @@ struct Table {
     root: PathBuf,
     url: Url,
     table: Arc<DeltaTable>,
+    partition_columns: Vec<String>,
+    granularity: Option<Granularity>,
 }
 
 struct Local {
@@ -451,6 +453,22 @@ struct Local {
     engine: DefaultEngine<TokioBackgroundExecutor>,
     config: OptimizeConfig,
     plans: BTreeMap<String, OptimizePlan>,
+    plan_configs: BTreeMap<String, OptimizeConfig>,
+}
+
+fn table_granularity(
+    partition_columns: &[String],
+    configuration: &HashMap<String, String>,
+) -> Result<Option<Granularity>> {
+    if partition_columns == [INGESTION_PARTITION] {
+        let name = configuration
+            .get("arrowcol.partition.granularity")
+            .map(String::as_str)
+            .unwrap_or("minute");
+        Ok(Some(Granularity::parse_name(name)?))
+    } else {
+        Ok(None)
+    }
 }
 
 impl Local {
@@ -472,12 +490,18 @@ impl Local {
                 ensure!(all_paths.insert(canonical.clone()), "pool tables alias each other");
                 let url = Url::from_directory_path(&canonical).map_err(|()| anyhow::anyhow!("invalid table URL"))?;
                 let table = DeltaTable::open_for_maintenance(&url)?;
+                let snapshot = Snapshot::builder_for(url.as_str()).build(&engine)?;
+                let metadata = snapshot.table_configuration().metadata();
+                let partition_columns = metadata.partition_columns().to_vec();
+                let granularity = table_granularity(&partition_columns, metadata.configuration())?;
                 tables.insert(
                     format!("{pool}/telemetry.sqlserver.{name}"),
                     Table {
                         root: canonical,
                         url,
                         table,
+                        partition_columns,
+                        granularity,
                     },
                 );
             }
@@ -487,10 +511,10 @@ impl Local {
             engine,
             config: OptimizeConfig {
                 sealed_final: true,
-                granularity: Some(Granularity::Minute),
                 ..OptimizeConfig::default()
             },
             plans: BTreeMap::new(),
+            plan_configs: BTreeMap::new(),
         })
     }
 
@@ -502,9 +526,19 @@ impl Local {
         let schema = Arc::new(schema);
         let partitions = metadata.partition_columns().to_vec();
         ensure!(
-            partitions == [INGESTION_PARTITION],
-            "expected ingestion-minute partition column"
+            partitions == table.partition_columns,
+            "table partition layout changed during final-compaction"
         );
+        ensure!(
+            table_granularity(&partitions, metadata.configuration())? == table.granularity,
+            "table partition granularity changed during final-compaction"
+        );
+        for column in &partitions {
+            ensure!(
+                schema.field_with_name(column)?.data_type() == &DataType::Utf8,
+                "partition column must be UTF8"
+            );
+        }
         let schema_json = serde_json::to_value(snapshot.schema())?;
         let mut state = State {
             inventory: Inventory {
@@ -513,7 +547,7 @@ impl Local {
                 files: Vec::new(),
             },
             table_id: metadata.id().to_string(),
-            partition_columns: partitions,
+            partition_columns: partitions.clone(),
             multiset: BTreeMap::new(),
             rows: 0,
             retained_bytes: 0,
@@ -561,16 +595,18 @@ impl Local {
             for group in builder.metadata().row_groups() {
                 row_group_bound(group.total_byte_size())?;
             }
-            let partition = file
-                .partition_values
-                .get(INGESTION_PARTITION)
-                .and_then(Option::as_deref)
-                .context("missing nonnull ingestion partition")?;
+            ensure!(
+                file.partition_values.len() == partitions.len()
+                    && partitions
+                        .iter()
+                        .all(|column| file.partition_values.contains_key(column)),
+                "Add partition values differ from committed table layout"
+            );
             for batch in builder.with_batch_size(1024).build()? {
                 check(deadline)?;
                 let batch = batch?;
                 batch_bound(batch.get_array_memory_size())?;
-                let logical = logical_batch(&batch, &schema, partition)?;
+                let logical = logical_batch(&batch, &schema, &partitions, &file.partition_values)?;
                 let rows = converter.convert_columns(logical.columns())?;
                 for row in rows.iter() {
                     state.add_row(row.as_ref())?;
@@ -588,12 +624,32 @@ impl Local {
     }
 }
 
-fn logical_batch(batch: &RecordBatch, schema: &SchemaRef, partition: &str) -> Result<RecordBatch> {
+fn logical_batch(
+    batch: &RecordBatch,
+    schema: &SchemaRef,
+    partition_columns: &[String],
+    partition_values: &BTreeMap<String, Option<String>>,
+) -> Result<RecordBatch> {
     let mut columns: Vec<ArrayRef> = Vec::new();
     for field in schema.fields() {
-        let array = if field.name() == INGESTION_PARTITION {
-            ensure!(field.data_type() == &DataType::Utf8, "ingestion partition must be UTF8");
-            Arc::new(StringArray::from(vec![partition; batch.num_rows()])) as ArrayRef
+        let array = if partition_columns.iter().any(|name| name.as_str() == field.name()) {
+            ensure!(field.data_type() == &DataType::Utf8, "partition column must be UTF8");
+            let value = partition_values
+                .get(field.name())
+                .context("missing committed partition value")?
+                .as_deref();
+            if let Some(physical) = batch.column_by_name(field.name()) {
+                let physical = arrow::compute::cast(physical, &DataType::Utf8)?;
+                let physical = physical
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .context("physical partition must be UTF8")?;
+                ensure!(
+                    physical.iter().all(|physical| physical == value),
+                    "physical partition differs from committed Add"
+                );
+            }
+            Arc::new(StringArray::from(vec![value; batch.num_rows()])) as ArrayRef
         } else if let Some(array) = batch.column_by_name(field.name()) {
             arrow::compute::cast(array, field.data_type())?
         } else {
@@ -605,16 +661,6 @@ fn logical_batch(batch: &RecordBatch, schema: &SchemaRef, partition: &str) -> Re
             "required field contains nulls"
         );
         columns.push(array);
-    }
-    if let Some(physical) = batch.column_by_name(INGESTION_PARTITION) {
-        let physical = physical
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .context("physical partition must be UTF8")?;
-        ensure!(
-            physical.null_count() == 0 && physical.iter().all(|value| value == Some(partition)),
-            "physical partition differs from committed Add"
-        );
     }
     Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
 }
@@ -633,10 +679,13 @@ impl Backend for Local {
 
     fn plan(&mut self, deadline: Instant) -> Result<BTreeMap<String, Planned>> {
         self.plans.clear();
+        self.plan_configs.clear();
         let mut evidence = BTreeMap::new();
         for (key, table) in &self.tables {
             check(deadline)?;
-            let plan = table.table.plan_optimize(&self.config)?;
+            let mut config = self.config.clone();
+            config.granularity = table.granularity;
+            let plan = table.table.plan_optimize(&config)?;
             evidence.insert(
                 key.clone(),
                 Planned {
@@ -651,6 +700,7 @@ impl Backend for Local {
                 },
             );
             self.plans.insert(key.clone(), plan);
+            self.plan_configs.insert(key.clone(), config);
         }
         Ok(evidence)
     }
@@ -660,7 +710,7 @@ impl Backend for Local {
         let control = MaintenanceControl::new(Arc::new(AtomicBool::new(false)), Some(deadline));
         self.tables.get(key).context("unknown table")?.table.apply_optimize(
             self.plans.get(key).context("missing fresh plan")?,
-            &self.config,
+            self.plan_configs.get(key).context("missing plan configuration")?,
             &control,
         )
     }
@@ -852,11 +902,7 @@ fn run_sync(args: &FinalCompactionArgs, deadline: Instant) -> Result<()> {
             return Ok(());
         }
         require_release(&args.results, receipt.run_id.as_deref().context("run_id unavailable")?)?;
-        let roots = BTreeMap::from([
-            ("direct".to_owned(), local_root(&args.direct_root)?),
-            ("dataflow".to_owned(), local_root(&args.dataflow_root)?),
-        ]);
-        ensure!(roots["direct"] != roots["dataflow"], "pool roots must not alias");
+        let roots = BTreeMap::from([("dataflow".to_owned(), local_root(&args.dataflow_root)?)]);
         let names = schema_statements()?
             .into_iter()
             .map(|statement| statement.identity.table().to_string())
@@ -864,7 +910,7 @@ fn run_sync(args: &FinalCompactionArgs, deadline: Instant) -> Result<()> {
         ensure!(names.len() == TABLE_COUNT, "canonical schema fixture changed");
         let mut local = Local::open(&roots, &names, deadline)?;
         let expected = local.tables.keys().cloned().collect::<BTreeSet<_>>();
-        ensure!(expected.len() == 2 * TABLE_COUNT, "expected exactly 26 tables");
+        ensure!(expected.len() == TABLE_COUNT, "expected exactly {TABLE_COUNT} tables");
         let (before, after) = finish(&mut local, &expected, deadline, &mut receipt.passes)?;
         for (pool, root) in roots {
             let mut evidence = PoolEvidence {
@@ -913,7 +959,6 @@ mod tests {
     fn args(results: &Path) -> FinalCompactionArgs {
         FinalCompactionArgs {
             results: results.to_owned(),
-            direct_root: results.join("direct"),
             dataflow_root: results.join("dataflow"),
             final_compaction: false,
             skip_final_compaction: false,
@@ -1499,7 +1544,6 @@ mod tests {
         let arguments = args(root.path());
         fs::write(root.path().join("run-metadata.json"), br#"{"run_id":"run-1"}"#)?;
         assert!(run_sync(&arguments, Instant::now() + BUDGET).is_err());
-        assert!(!arguments.direct_root.exists());
         failure_receipt(root.path())?;
         for release in [
             serde_json::json!({"run_id":"run-1","passed":false}),
@@ -1513,7 +1557,6 @@ mod tests {
             receipts(case.path(), release)?;
             let arguments = args(case.path());
             assert!(run_sync(&arguments, Instant::now() + BUDGET).is_err());
-            assert!(!arguments.direct_root.exists());
             let evidence = failure_receipt(case.path())?;
             assert!(
                 evidence["error"]
@@ -1540,7 +1583,6 @@ mod tests {
             )?;
             let arguments = args(root.path());
             assert!(run_sync(&arguments, Instant::now() + BUDGET).is_err());
-            assert!(!arguments.direct_root.exists());
             let evidence = failure_receipt(root.path())?;
             assert_eq!(evidence["run_id"], Value::Null);
             assert!(
@@ -1577,15 +1619,14 @@ mod tests {
     #[test]
     fn windows_drive_paths_and_unknown_schemes_stay_local() -> Result<()> {
         for path in [
-            r"C:\delta\direct",
-            "C:/delta/direct",
-            "file:///delta/direct",
+            r"C:\delta\dataflow",
+            "C:/delta/dataflow",
+            "file:///delta/dataflow",
             "other:local",
         ] {
             assert!(!cloud_root(Path::new(path)), "{path}");
         }
         let mut arguments = args(Path::new("results"));
-        arguments.direct_root = r"C:\delta\direct".into();
         arguments.dataflow_root = r"D:\delta\dataflow".into();
         arguments.final_compaction = true;
         assert!(enabled(&arguments)?);
@@ -1602,8 +1643,9 @@ mod tests {
         assert!(enabled(&arguments)?);
         arguments.skip_final_compaction = true;
         assert!(!enabled(&arguments)?);
-        arguments.direct_root = "abfss://container@account.dfs.core.windows.net/direct".into();
         arguments.skip_final_compaction = false;
+        assert!(enabled(&arguments)?);
+        arguments.dataflow_root = PathBuf::from("abfss://account/container");
         assert!(!enabled(&arguments)?);
         arguments.final_compaction = true;
         assert!(
@@ -1632,7 +1674,6 @@ mod tests {
         let evidence: Value = read_json(&case.path().join(ARTIFACT))?;
         assert_eq!(evidence["skipped"], true);
         assert_eq!(evidence["passed"], false);
-        assert!(!arguments.direct_root.exists());
         assert!(
             run_sync(&arguments, Instant::now() + BUDGET).is_err(),
             "never overwrite prior evidence"
@@ -1645,7 +1686,7 @@ mod tests {
         use arrow_deltalake::layout::LayoutPolicy;
         for mixed in [false, true] {
             let root = tempfile::tempdir()?;
-            let pool = root.path().join("direct");
+            let pool = root.path().join("dataflow");
             let path = pool.join("telemetry/sqlserver/saturated");
             fs::create_dir_all(&path)?;
             let schema = Arc::new(Schema::new(vec![
@@ -1682,7 +1723,7 @@ mod tests {
             }
             let deadline = Instant::now() + BUDGET;
             let mut local = Local::open(
-                &BTreeMap::from([("direct".into(), fs::canonicalize(pool)?)]),
+                &BTreeMap::from([("dataflow".into(), fs::canonicalize(pool)?)]),
                 &["saturated".into()],
                 deadline,
             )?;
@@ -1696,7 +1737,7 @@ mod tests {
             let expected = local.tables.keys().cloned().collect();
             let mut passes = Vec::new();
             let (before, after) = finish(&mut local, &expected, deadline, &mut passes)?;
-            let key = "direct/telemetry.sqlserver.saturated";
+            let key = "dataflow/telemetry.sqlserver.saturated";
             assert_eq!(before[key].multiset, after[key].multiset);
             assert_eq!(
                 after[key].inventory.version,
@@ -1724,36 +1765,130 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_26_table_fixture_compacts_and_binds_independent_validation_inventory() -> Result<()> {
+    async fn catalog_declared_empty_and_custom_layouts_compact_and_validate_sorted_rows() -> Result<()> {
+        use arrow_deltalake::layout::LayoutPolicy;
+
+        for custom_partition in [false, true] {
+            let root = tempfile::tempdir()?;
+            let pool = root.path().join("dataflow");
+            let table_name = if custom_partition { "custom" } else { "unpartitioned" };
+            let path = pool.join("telemetry/sqlserver").join(table_name);
+            fs::create_dir_all(&path)?;
+            let mut fields = vec![Field::new("id", DataType::Int64, false)];
+            let partition_columns = if custom_partition {
+                fields.push(Field::new("tenant", DataType::Utf8, false));
+                vec!["tenant".to_owned()]
+            } else {
+                Vec::new()
+            };
+            let schema = Arc::new(Schema::new(fields));
+            let url = Url::from_directory_path(&path).map_err(|()| anyhow::anyhow!("fixture URL"))?;
+            let table = DeltaTable::open_url(url, Arc::clone(&schema), partition_columns.clone())?;
+            let partition_count = if custom_partition { 2 } else { 1 };
+
+            for partition in 0..partition_count {
+                let value = format!("tenant-{partition}");
+                for file_index in 0..2 {
+                    let first_id = (partition * 4 + file_index * 2) as i64;
+                    let ids = vec![first_id + 1, first_id];
+                    let batch = if custom_partition {
+                        RecordBatch::try_new(
+                            Arc::clone(&schema),
+                            vec![
+                                Arc::new(Int64Array::from(ids)),
+                                Arc::new(StringArray::from(vec![value.as_str(); 2])),
+                            ],
+                        )?
+                    } else {
+                        RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int64Array::from(ids))])?
+                    };
+                    let mut writer = if custom_partition {
+                        table.new_file_partitioned(
+                            Arc::clone(&schema),
+                            BTreeMap::from([("tenant".to_owned(), Some(value.clone()))]),
+                        )?
+                    } else {
+                        table.new_file(Arc::clone(&schema))?
+                    };
+                    writer.write(&batch).await?;
+                    writer.finish().await?;
+                }
+            }
+
+            let deadline = Instant::now() + BUDGET;
+            let mut local = Local::open(
+                &BTreeMap::from([("dataflow".into(), fs::canonicalize(pool)?)]),
+                &[table_name.to_owned()],
+                deadline,
+            )?;
+            local.config.layout = Some(LayoutPolicy {
+                sort_columns: vec!["id".into()],
+                bloom_columns: Vec::new(),
+                max_rows: 4,
+                ..LayoutPolicy::default()
+            });
+            let key = format!("dataflow/telemetry.sqlserver.{table_name}");
+            let expected = local.tables.keys().cloned().collect();
+            let mut passes = Vec::new();
+            let (before, after) = finish(&mut local, &expected, deadline, &mut passes)?;
+
+            assert_eq!(before[&key].partition_columns, partition_columns);
+            assert_eq!(after[&key].partition_columns, partition_columns);
+            assert_eq!(before[&key].rows, after[&key].rows);
+            assert_eq!(before[&key].multiset, after[&key].multiset);
+            let report = &passes[0].reports[&key];
+            assert_eq!(report.outcome, Outcome::Committed);
+            assert!(report.files_removed > report.files_added);
+            assert!(report.files_added > 0);
+            assert_eq!(report.skipped_partitions, 0);
+            assert!(passes.last().context("final fresh plan")?.reports.is_empty());
+
+            let table_root = &local.tables[&key].root;
+            for relative in &after[&key].inventory.files {
+                let input = File::open(table_root.join(relative))?;
+                let reader = ParquetRecordBatchReaderBuilder::try_new(input)?.build()?;
+                for batch in reader {
+                    let batch = batch?;
+                    let ids = batch
+                        .column_by_name("id")
+                        .context("sorted output is missing id")?
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .context("sorted output id must be Int64")?;
+                    ensure!(
+                        ids.values().windows(2).all(|pair| pair[0] <= pair[1]),
+                        "final-compaction output is not sorted by id"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_13_table_fixture_compacts_and_binds_independent_validation_inventory() -> Result<()> {
         let root = tempfile::tempdir()?;
         let arguments = args(root.path());
         receipts(root.path(), serde_json::json!({"run_id":"run-1","passed":true}))?;
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, true),
-            Field::new(INGESTION_PARTITION, DataType::Utf8, false),
         ]));
-        for pool in [&arguments.direct_root, &arguments.dataflow_root] {
+        for pool in [&arguments.dataflow_root] {
             for statement in schema_statements()? {
                 let path = pool
                     .join("telemetry/sqlserver")
                     .join(statement.identity.table().as_str());
                 fs::create_dir_all(&path)?;
                 let url = Url::from_directory_path(&path).map_err(|()| anyhow::anyhow!("fixture URL"))?;
-                let table = DeltaTable::open_url(url, Arc::clone(&schema), vec![INGESTION_PARTITION.into()])?;
+                let table = DeltaTable::open_url(url, Arc::clone(&schema), Vec::new())?;
                 for id in 0..2 {
-                    let mut writer = table
-                        .new_file_partitioned(
-                            Arc::clone(&schema),
-                            BTreeMap::from([(INGESTION_PARTITION.into(), Some("2024-01-01-00-00".into()))]),
-                        )?
-                        .with_ingestion_time(1_704_067_200_000)?;
+                    let mut writer = table.new_file(Arc::clone(&schema))?;
                     let batch = RecordBatch::try_new(
                         Arc::clone(&schema),
                         vec![
                             Arc::new(Int64Array::from(vec![id, id])),
                             Arc::new(StringArray::from(vec![Some("a|b"), None])),
-                            Arc::new(StringArray::from(vec!["2024-01-01-00-00"; 2])),
                         ],
                     )?;
                     writer.write(&batch).await?;
@@ -1769,7 +1904,7 @@ mod tests {
         assert_eq!(receipt["passes"].as_array().context("passes")?.len(), 2);
         assert_eq!(
             receipt["passes"][0]["reports"].as_object().context("reports")?.len(),
-            26
+            13
         );
         assert!(
             receipt["passes"][1]["reports"]
@@ -1777,10 +1912,7 @@ mod tests {
                 .context("final reports")?
                 .is_empty()
         );
-        for (pool, path) in [
-            ("direct", &arguments.direct_root),
-            ("dataflow", &arguments.dataflow_root),
-        ] {
+        for (pool, path) in [("dataflow", &arguments.dataflow_root)] {
             // Existing independent test oracle only; production never calls delta-rs.
             let independent = delta_inspect::inventory(path).await?;
             assert_eq!(

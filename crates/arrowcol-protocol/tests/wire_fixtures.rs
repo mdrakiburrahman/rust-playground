@@ -1,8 +1,7 @@
 use std::error::Error;
 
 use arrowcol_protocol::{
-    AuthContext, CollectorCapabilities, CollectorInstanceStatus, ErrorStatus, PressureSnapshot, ReceiptStatus,
-    TableLease,
+    AuthContext, CollectorCapabilities, CollectorInstanceStatus, ErrorStatus, PressureSnapshot, TableLease,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -25,17 +24,7 @@ fn v1_json_fixtures_round_trip_as_wire_snapshots() -> Result<(), Box<dyn Error>>
     assert_snapshot::<PressureSnapshot>(include_str!("fixtures/pressure-snapshot-v1.json"))?;
     assert_snapshot::<TableLease>(include_str!("fixtures/table-lease-v1.json"))?;
     assert_snapshot::<CollectorInstanceStatus>(include_str!("fixtures/instance-status-v1.json"))?;
-    assert_snapshot::<ReceiptStatus>(include_str!("fixtures/receipt-accepted-v1.json"))?;
-    assert_snapshot::<ReceiptStatus>(include_str!("fixtures/receipt-published-v1.json"))?;
     assert_snapshot::<ErrorStatus>(include_str!("fixtures/error-status-v1.json"))?;
-    Ok(())
-}
-
-#[test]
-fn committed_v1_minimal_receipt_remains_backward_compatible() -> Result<(), Box<dyn Error>> {
-    let status: ReceiptStatus = serde_json::from_str(include_str!("fixtures/receipt-accepted-v1.json"))?;
-    assert!(status.publication().is_none());
-    assert!(status.error().is_none());
     Ok(())
 }
 
@@ -49,12 +38,20 @@ fn wire_deserialization_revalidates_measurement_and_cross_field_bounds() -> Resu
     negative["buffered_bytes"]["current"] = Value::from(-1);
     assert!(serde_json::from_value::<PressureSnapshot>(negative).is_err());
 
-    let mut receipt: Value = serde_json::from_str(include_str!("fixtures/receipt-published-v1.json"))?;
-    receipt["publication"]["fence"]["table"]["table"] = Value::from("metrics");
-    assert!(serde_json::from_value::<ReceiptStatus>(receipt).is_err());
+    let mut lease: Value = serde_json::from_str(include_str!("fixtures/table-lease-v1.json"))?;
+    lease["expires_at_unix_ms"] = lease["issued_at_unix_ms"].clone();
+    assert!(serde_json::from_value::<TableLease>(lease).is_err());
+
+    let mut retired: Value = serde_json::from_str(include_str!("fixtures/collector-capabilities-v1.json"))?;
+    retired["capabilities"] = serde_json::json!(["receipt_status"]);
+    assert!(serde_json::from_value::<CollectorCapabilities>(retired).is_err());
+
+    let mut retired_error: Value = serde_json::from_str(include_str!("fixtures/error-status-v1.json"))?;
+    retired_error["code"] = Value::from("receipt_not_found");
+    assert!(serde_json::from_value::<ErrorStatus>(retired_error).is_err());
 
     let mut capabilities: Value = serde_json::from_str(include_str!("fixtures/collector-capabilities-v1.json"))?;
-    capabilities["capabilities"] = serde_json::json!(["receipt_status", "receipt_status"]);
+    capabilities["capabilities"] = serde_json::json!(["pressure_reporting", "pressure_reporting"]);
     assert!(serde_json::from_value::<CollectorCapabilities>(capabilities).is_err());
     Ok(())
 }

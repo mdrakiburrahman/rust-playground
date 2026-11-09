@@ -218,11 +218,11 @@ fn response(columns: &[&str], rows: Vec<Value>) -> Value {
 }
 
 #[tokio::test]
-async fn all26_delayed_observations_complete_inside_unchanged_30s_with_two_request_slots() -> Result<()> {
+async fn all_dataflow_delayed_observations_complete_inside_unchanged_30s_with_two_request_slots() -> Result<()> {
     let mut fixture = Fixture::new(Duration::from_millis(450))?;
-    let tables = ["direct", "dataflow"]
+    let tables = arrowcol_loadgen::schema::schema_statements()?
         .into_iter()
-        .flat_map(|pool| (0..13).map(move |index| format!("{pool}_fixture_{index}")))
+        .map(|statement| format!("dataflow_{}", statement.identity.table()))
         .collect::<Vec<_>>();
     let started = Instant::now();
     let outcome = observe_qap(
@@ -252,9 +252,12 @@ async fn all26_delayed_observations_complete_inside_unchanged_30s_with_two_reque
         "must overlap exactly two requests"
     );
     let requests = fixture.requests()?;
-    ensure!(requests.len() == 79 && requests.last().is_some_and(|command| command == ".show capacity"));
+    ensure!(
+        requests.len() == tables.len() * 3 + 1 && requests.last().is_some_and(|command| command == ".show capacity")
+    );
     let observed = observation["tables"].as_object().context("observed table map")?;
-    ensure!(observed.len() == 26 && tables.iter().all(|table| observed.contains_key(table)));
+    ensure!(observed.len() == tables.len() && tables.iter().all(|table| observed.contains_key(table)));
+    ensure!(observation["expected_tables"] == json!(tables));
     for table in &tables {
         let identifier = format!("['{table}']");
         let literal = format!("ExternalTableName == \"{table}\"");
@@ -272,9 +275,12 @@ async fn all26_delayed_observations_complete_inside_unchanged_30s_with_two_reque
         .lines()
         .map(serde_json::from_str::<Value>)
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    ensure!(artifacts.len() == 79, "every response must have a whole JSONL artifact");
+    ensure!(
+        artifacts.len() == requests.len(),
+        "every response must have a whole JSONL artifact"
+    );
     let diagnostic: Value = serde_json::from_slice(&fs::read(fixture.directory.join("observation-diagnostic.json"))?)?;
-    ensure!(diagnostic["queries_completed"] == 79 && diagnostic["code"] == "completed");
+    ensure!(diagnostic["queries_completed"] == requests.len() && diagnostic["code"] == "completed");
     Ok(())
 }
 

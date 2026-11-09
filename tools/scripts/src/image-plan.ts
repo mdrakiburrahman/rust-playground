@@ -13,9 +13,9 @@ import {
 
 export const PRODUCTION_RUNTIME_IMAGE_PROJECTS = [
   'otelcol-rust',
-  'arrowcol-rust',
   'arrowcol-dataflow-rust',
   'arrowcol-router-rust',
+  'arrowcol-catalog-rust',
   'delta-maintenance',
   'arrow-tenant-stream',
   'kusto-explorer',
@@ -123,6 +123,13 @@ export function createImagePublicationPlan(
       ['dev'],
       `${project}:image tags`,
     );
+    if ((RETAINED_RUNTIME_IMAGE_PROJECTS as readonly string[]).includes(project)) {
+      requireStringArray(
+        imageTarget.buildArgs,
+        ['VCS_REF={gitSha}'],
+        `${project}:image OCI revision build argument`,
+      );
+    }
     requireStringArray(
       imageTarget.platforms,
       ['linux/amd64'],
@@ -168,17 +175,11 @@ export function createImagePublicationPlan(
       publishManifest,
       `${project}:publish manifest`,
     );
-    if (
-      (PRODUCTION_RUNTIME_IMAGE_PROJECTS as readonly string[]).includes(
-        project,
-      )
-    ) {
-      requireStringArray(
-        publishTarget.buildArgs,
-        ['VCS_REF={gitSha}'],
-        `${project}:publish OCI revision build argument`,
-      );
-    }
+    requireStringArray(
+      publishTarget.buildArgs,
+      ['VCS_REF={gitSha}'],
+      `${project}:publish OCI revision build argument`,
+    );
     requireStringArray(
       configuration.targets?.publish?.configurations?.main?.options
         ?.tags ??

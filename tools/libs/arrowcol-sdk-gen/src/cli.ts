@@ -17,6 +17,9 @@ export function runCli(
   args: readonly string[],
   tool: SdkGenerationTool = new SdkGenerationTool(),
 ): readonly string[] {
+  if (args[0] === 'generate') {
+    return tool.generate(args.slice(1)).commands;
+  }
   if (args.length !== 1) {
     throw new Error(
       'Usage: cli.ts <generate-fixture|generate|check|compatibility|test|package-artifact>',
@@ -26,8 +29,6 @@ export function runCli(
   switch (command) {
     case 'generate-fixture':
       return tool.generateFixture().commands;
-    case 'generate':
-      return tool.generate().commands;
     case 'check':
       return tool.check().commands;
     case 'compatibility':

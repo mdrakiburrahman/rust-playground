@@ -10,13 +10,15 @@ description = "Deterministic many-table Arrow Flight benchmark and validator"
 publish = false
 
 [dependencies]
+arrowcol-buffer = { path = "../../../crates/arrowcol-buffer" }
+arrowcol-catalog = { path = "../../../crates/arrowcol-catalog" }
 anyhow.workspace = true
 arrow = { version = "58.3", default-features = false, features = ["ipc"] }
 arrow-flight = { version = "58.3", default-features = false, features = ["flight-sql"] }
 arrow-ipc = { version = "58.3", default-features = false }
 arrow-schema = { version = "58.3", default-features = false }
 arrow-deltalake = { path = "../../../crates/arrow-deltalake" }
-arrowcol-catalog = { path = "../../../crates/arrowcol-catalog" }
+arrowcol-catalog-client = { path = "../../../crates/arrowcol-catalog-client" }
 arrowcol-flight = { path = "../../../crates/arrowcol-flight" }
 arrowcol-protocol = { path = "../../../crates/arrowcol-protocol" }
 arrowcol-routing = { path = "../../../crates/arrowcol-routing" }

@@ -44,7 +44,7 @@ if(value.fail) {
     writeFileSync(path.join(results, 'driver-progress.json'), JSON.stringify({
       run_id: 'readiness-fixture', scenario: 'paired', phase: 'measure', timestamp: Date.now(),
       phase_started_at: startedAt, phase_duration_ms: 30_000, phase_remaining_ms: remaining,
-      scheduled_rows: 4, send_policy_failures: 0, receipt_failures: 0,
+      scheduled_rows: 4, send_policy_failures: 0,
     }));
   };
   progress();
@@ -66,7 +66,7 @@ if(value.fail) {
   };
   const runtime = new LocalStressRuntime({
     workspace: process.cwd(), directory, project: 'fixture-ready', composeFiles: [],
-    env: process.env, reader, directAdmin: '', dataflowAdmin: '', quiver: false, physicalRoots: {},
+    env: process.env, reader, dataflowAdmin: '', quiver: false, physicalRoots: {},
     fixture: fixtureLayout, windowSeconds: 9, sampleTimeoutSeconds: 1, measureSeconds: 30,
     privateScratch,
     loadEnded: new AbortController().signal, checkRunning: () => {},
@@ -88,11 +88,11 @@ function assertPublicTreeIsClean(directory: string, canary: string, privateScrat
   }
 }
 
-test('v0 missing then actual BOTH-pool compactable fixtures publishes a bound readiness receipt', async t => {
+test('v0 missing then actual DFE compactable fixture publishes bound readiness evidence', async t => {
   const f = fixture(t);
   let createdAt = 0;
   const timer = setTimeout(() => {
-    f.install('direct'); f.install('dataflow'); createdAt = Date.now();
+    f.install('dataflow'); createdAt = Date.now();
   }, 150);
   t.after(() => clearTimeout(timer));
   let deadline = 0;
@@ -122,14 +122,13 @@ test('v0 missing then actual BOTH-pool compactable fixtures publishes a bound re
   assert.equal(receipt.generator.phase_started_at, f.startedAt);
   assert.equal(receipt.generator.phase_duration_ms, 30_000);
   assert(receipt.generator.conservatively_remaining_ms >= receipt.required_input_ms);
-  assert.deepEqual(receipt.pools.map((pool: { pool: string }) => pool.pool), ['direct', 'dataflow']);
+  assert.deepEqual(receipt.pools.map((pool: { pool: string }) => pool.pool), ['dataflow']);
   assert(receipt.pools.every((pool: { selected_bin_files: number; row_groups: number }) =>
     pool.selected_bin_files === 2 && pool.row_groups === 2));
 });
 
-test('one ready root cannot start a window while the second root remains unready', async t => {
+test('an unready DFE root cannot start a window before its fixture appears', async t => {
   const f = fixture(t);
-  f.install('direct');
   const timer = setTimeout(() => f.install('dataflow'), 500);
   t.after(() => clearTimeout(timer));
   const start = Date.now();
@@ -137,7 +136,7 @@ test('one ready root cannot start a window while the second root remains unready
   assert(Date.now() - start >= 500);
 });
 
-test('missing roots expire the original absolute startup deadline without extending it', async t => {
+test('a missing DFE root expires the original absolute startup deadline without extending it', async t => {
   const f = fixture(t);
   const start = Date.now();
   await assert.rejects(f.runtime.waitForInput(start + 180), /startup deadline/u);
@@ -165,9 +164,9 @@ for (const mode of ['newest-only', 'future-open', 'latest-eligible-single-file',
       ] : []),
       { path: 'z.parquet', rows: 4, bytes: 10, partition_values: { __arrowcol_ingestion: partition(-1) } },
     ];
-    f.install('direct', files); f.install('dataflow', files);
+    f.install('dataflow', files);
     if (mode === 'single-rowgroup') {
-      for (const pool of ['direct', 'dataflow']) {
+      for (const pool of ['dataflow']) {
         const table = path.join(f.directory, pool, ...tableParts);
         for (const file of files) writeFileSync(path.join(table, `${file.path}.layout.json`),
           JSON.stringify({ rows: file.rows, row_groups: [{ rows: 4 }] }));
@@ -180,8 +179,8 @@ for (const mode of ['newest-only', 'future-open', 'latest-eligible-single-file',
 
 test('nonretryable reader failure is preserved privately and is not polled until success', async t => {
   const f = fixture(t);
-  f.install('direct'); f.install('dataflow');
-  writeFileSync(path.join(f.directory, 'direct/fixture.json'), '{"fail":true}');
+  f.install('dataflow');
+  writeFileSync(path.join(f.directory, 'dataflow/fixture.json'), '{"fail":true}');
   await assert.rejects(f.runtime.waitForInput(Date.now() + 5000), /did not complete cleanly/u);
   assert.equal(readFileSync(f.calls, 'utf8').trim().split('\n').length, 1);
   const directories = readdirSync(f.privateScratch);
@@ -197,8 +196,8 @@ test('nonretryable reader failure is preserved privately and is not polled until
 
 test('raw reader stderr retains only a bounded private tail outside public artifacts', async t => {
   const f = fixture(t);
-  f.install('direct'); f.install('dataflow');
-  writeFileSync(path.join(f.directory, 'direct/fixture.json'), '{"fail":true,"flood":true}');
+  f.install('dataflow');
+  writeFileSync(path.join(f.directory, 'dataflow/fixture.json'), '{"fail":true,"flood":true}');
   await assert.rejects(f.runtime.waitForInput(Date.now() + 5000), /did not complete cleanly/u);
   const [name] = readdirSync(f.privateScratch);
   const log = path.join(f.privateScratch, name, 'reader-stderr.private.log');
@@ -209,12 +208,12 @@ test('raw reader stderr retains only a bounded private tail outside public artif
 
 test('large complete reader JSON is retained independently of the private stderr bound', async t => {
   const f = fixture(t);
-  f.install('direct'); f.install('dataflow');
-  const input = path.join(f.directory, 'direct/fixture.json');
+  f.install('dataflow');
+  const input = path.join(f.directory, 'dataflow/fixture.json');
   const complete = { ...JSON.parse(readFileSync(input, 'utf8')), large_json: 'O'.repeat(131072) };
   writeFileSync(input, JSON.stringify(complete));
   await f.runtime.waitForInput(Date.now() + 5000);
-  assert.deepEqual(JSON.parse(readFileSync(path.join(f.results, 'stress-readiness-direct.json'), 'utf8')), complete);
+  assert.deepEqual(JSON.parse(readFileSync(path.join(f.results, 'stress-readiness-dataflow.json'), 'utf8')), complete);
   const [name] = readdirSync(f.privateScratch);
   assert.deepEqual(readdirSync(path.join(f.privateScratch, name)), ['reader-stderr.private.log']);
   assertPublicTreeIsClean(f.results, f.canary, f.privateScratch);
@@ -222,8 +221,8 @@ test('large complete reader JSON is retained independently of the private stderr
 
 test('a timed-out reader preserves even a short private stderr cause before EOF', async t => {
   const f = fixture(t);
-  f.install('direct'); f.install('dataflow');
-  writeFileSync(path.join(f.directory, 'direct/fixture.json'), '{"fail":true,"hang":true}');
+  f.install('dataflow');
+  writeFileSync(path.join(f.directory, 'dataflow/fixture.json'), '{"fail":true,"hang":true}');
   await assert.rejects(f.runtime.waitForInput(Date.now() + 1000), /did not complete cleanly/u);
   const [name] = readdirSync(f.privateScratch);
   const log = path.join(f.privateScratch, name, 'reader-stderr.private.log');
@@ -237,7 +236,7 @@ test('private diagnostic storage cannot be configured inside the public artifact
 
 test('a symlink cannot redirect private reader stderr into public artifacts', async t => {
   const f = fixture(t);
-  f.install('direct'); f.install('dataflow');
+  f.install('dataflow');
   symlinkSync(f.results, f.privateScratch, 'dir');
   await assert.rejects(f.runtime.waitForInput(Date.now() + 5000), /outside the public results tree/u);
   assert(!existsSync(f.calls), 'reject before invoking any reader or writing raw stderr');
@@ -245,7 +244,7 @@ test('a symlink cannot redirect private reader stderr into public artifacts', as
 
 test('malformed committed partition metadata fails immediately without retry', async t => {
   const f = fixture(t);
-  f.install('direct', [
+  f.install('dataflow', [
     { path: 'a.parquet', rows: 4, bytes: 10, partition_values: { __arrowcol_ingestion: '2026-02-31-00-00' } },
   ]);
   await assert.rejects(f.runtime.waitForInput(Date.now() + 5000), /Malformed CPU ingestion partition/u);
@@ -254,14 +253,14 @@ test('malformed committed partition metadata fails immediately without retry', a
 
 test('actual generator remaining budget must cover the whole window and final sample before start', async t => {
   const f = fixture(t);
-  f.install('direct'); f.install('dataflow'); f.progress(9000);
+  f.install('dataflow'); f.progress(9000);
   await assert.rejects(f.runtime.waitForInput(Date.now() + 5000), /cannot cover the immutable window/u);
   assert(!existsSync(path.join(f.results, 'stress-readiness.json')));
 });
 
 test('a remaining-input counter cannot exceed the declared generator lifetime', async t => {
   const f = fixture(t);
-  f.install('direct'); f.install('dataflow'); f.progress(31_000);
+  f.install('dataflow'); f.progress(31_000);
   await assert.rejects(f.runtime.waitForInput(Date.now() + 5000), /exceeds its declared phase duration/u);
   assert(!existsSync(path.join(f.results, 'stress-readiness.json')));
 });

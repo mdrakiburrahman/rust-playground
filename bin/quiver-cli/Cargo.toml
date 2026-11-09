@@ -1,6 +1,6 @@
 [package]
 name = "quiver-cli"
-description = "Generate and inspect Quiver storage exactly as the Arrowcol Direct collector writes it"
+description = "Generate and inspect DFE durable_buffer Quiver storage"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,18 +11,23 @@ readme = "README.md"
 
 [dependencies]
 anyhow.workspace = true
-arrow = { version = "58.3", default-features = false, features = ["prettyprint"] }
+arrow = { version = "58.3", default-features = false, features = ["prettyprint", "chrono-tz"] }
 arrow-csv = "58.3"
-arrowcol-buffer = { path = "../../crates/arrowcol-buffer" }
 arrowcol-catalog = { path = "../../crates/arrowcol-catalog" }
+arrowcol-catalog-client = { path = "../../crates/arrowcol-catalog-client" }
 arrowcol-protocol = { path = "../../crates/arrowcol-protocol" }
+base64 = "0.22"
 clap.workspace = true
 otel-arrow-dfe-quiver = { path = "../../submodules/otel-arrow/rust/otap-dataflow/crates/quiver", default-features = false, features = ["mmap"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 uuid = { version = "1", features = ["v4", "v5"] }
 
 [dev-dependencies]
+arrowcol-dataflow-components = { path = "../../crates/arrowcol-dataflow-components" }
+otel-arrow-dfe-config = { path = "../../submodules/otel-arrow/rust/otap-dataflow/crates/config" }
+otel-arrow-dfe-pdata = { path = "../../submodules/otel-arrow/rust/otap-dataflow/crates/pdata" }
 assert_cmd.workspace = true
 predicates.workspace = true
 tempfile = "3"

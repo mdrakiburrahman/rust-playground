@@ -504,7 +504,7 @@ enum WorkerCommand {
 }
 
 struct QueuedBatch {
-    publication_id: arrowcol_protocol::ReceiptId,
+    publication_id: arrowcol_protocol::PublicationId,
     ingested_at_ms: arrowcol_protocol::UnixMillis,
     batch: arrow_array::RecordBatch,
     target_schema_version: u64,
@@ -564,6 +564,7 @@ async fn run_batch_worker(
         metrics: &metrics,
         identity: &identity,
         max_pending_files,
+        adaptive_defaults: policy.adaptive_file.build(),
     };
     loop {
         let next = if closing {
@@ -628,6 +629,11 @@ async fn run_batch_worker(
                 break;
             }
         }
+        if let Err(error) = publisher.refresh_estimator(&mut estimator).await {
+            tracing::warn!(table = %identity, error_message = %error.safe_message(), "Delta grouping policy refresh failed");
+            next.complete(&Err(error));
+            continue;
+        }
         rows += next.rows;
         bytes += next.bytes;
         group.push(next);
@@ -677,11 +683,25 @@ struct GroupPublisher<'a> {
     metrics: &'a RuntimeMetrics,
     identity: &'a arrowcol_protocol::TableIdentity,
     max_pending_files: usize,
+    adaptive_defaults: arrow_deltalake::sizing::AdaptiveFileSizeConfig,
 }
 
 impl GroupPublisher<'_> {
     fn retired(&self) -> bool {
         self.table.is_none()
+    }
+
+    async fn refresh_estimator(&self, estimator: &mut AdaptiveFileSizeEstimator) -> Result<(), ExportFailure> {
+        let table = self.table.as_ref().ok_or_else(retired_owner_failure)?;
+        let config = table
+            .adaptive_file_config(self.adaptive_defaults)
+            .await
+            .map_err(|error| ExportFailure::Transient(format!("writer policy refresh failed: {error:#}")))?;
+        if estimator.config() != &config {
+            *estimator = AdaptiveFileSizeEstimator::new(config)
+                .map_err(|error| ExportFailure::Permanent(format!("invalid writer policy: {error}")))?;
+        }
+        Ok(())
     }
 
     async fn publish(&mut self, group: &mut Vec<QueuedBatch>, estimator: &mut AdaptiveFileSizeEstimator) {
@@ -707,6 +727,7 @@ impl GroupPublisher<'_> {
         let mut worker_failed = false;
         let mut published_files = 0;
         let result = async {
+            self.refresh_estimator(estimator).await?;
             let _slot = self
                 .flush_slots
                 .acquire()
@@ -727,9 +748,9 @@ impl GroupPublisher<'_> {
                 }
                 let stamp = i64::try_from(entry.ingested_at_ms.get())
                     .map_err(|error| ExportFailure::Transient(error.to_string()))?;
-                let mut writer = table
-                    .new_file_with_publication(
-                        entry.batch.schema(),
+                let files = table
+                    .new_partitioned_publication_files(
+                        entry.batch.clone(),
                         format!("arrowcol.publication.{}", entry.publication_id),
                         0,
                         stamp,
@@ -739,18 +760,20 @@ impl GroupPublisher<'_> {
                         worker_failed = true;
                         ExportFailure::Transient(format!("{error:#}"))
                     })?;
-                writer
-                    .write(&entry.batch)
-                    .await
-                    .map_err(|error| ExportFailure::Permanent(format!("{error:#}")))?;
-                let append = writer
-                    .stage()
-                    .await
-                    .map_err(|error| ExportFailure::Transient(format!("{error:#}")))?;
-                updated_estimator
-                    .observe(append.observation())
-                    .map_err(|error| ExportFailure::Permanent(format!("file sizing observation failed: {error}")))?;
-                staged.push(append);
+                for (mut writer, partition_batch) in files {
+                    writer
+                        .write(&partition_batch)
+                        .await
+                        .map_err(|error| ExportFailure::Permanent(format!("{error:#}")))?;
+                    let append = writer
+                        .stage()
+                        .await
+                        .map_err(|error| ExportFailure::Transient(format!("{error:#}")))?;
+                    updated_estimator.observe(append.observation()).map_err(|error| {
+                        ExportFailure::Permanent(format!("file sizing observation failed: {error}"))
+                    })?;
+                    staged.push(append);
+                }
             }
             let mut receipts = Vec::with_capacity(staged.len());
             let total = staged.len();
@@ -1225,7 +1248,7 @@ mod tests {
     /// Envelope admitted under `lease` by a collector registered with the `test` instance key.
     fn envelope_for(lease: &arrowcol_routing::RoutingLease) -> ArrowcolBatchEnvelope {
         ArrowcolBatchEnvelope {
-            publication_id: Some(arrowcol_protocol::ReceiptId::new()),
+            publication_id: Some(arrowcol_protocol::PublicationId::new()),
             ingested_at_ms: Some(crate::config::now_unix_millis().expect("stamp")),
             table: table(),
             source_schema_version: SchemaVersion::FIRST,
@@ -1270,6 +1293,104 @@ mod tests {
         };
         store.insert_lease(next.clone()).await.expect("re-issued lease");
         next
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exporter_refreshes_catalog_adaptive_grouping_without_changing_publication_identity() -> anyhow::Result<()>
+    {
+        let fixture = tempfile::tempdir()?;
+        let store = Arc::new(MemoryRoutingStore::default());
+        let holder = CollectorInstanceId::new();
+        let lease = lease(&store, holder).await;
+        let mut batching = FileBatchConfig {
+            max_age: std::time::Duration::from_secs(60),
+            ..Default::default()
+        };
+        batching.adaptive_file.min_input_bytes = 1;
+        batching.adaptive_file.max_input_bytes = 1;
+        let exporter = GenericDeltaExporter::with_batching(
+            fixture.path().to_path_buf(),
+            Arc::clone(&store) as Arc<dyn RoutingStore>,
+            arrow_deltalake::commit::CommitOptions::default(),
+            batching,
+            Arc::new(RuntimeMetrics::new(holder)),
+        )
+        .map_err(anyhow::Error::msg)?;
+        let first = exporter.stage(envelope_pdata(envelope_for(&lease))).await?;
+        tokio::time::timeout(std::time::Duration::from_secs(3), first.wait()).await??;
+        let path = fixture.path().join("demo/generated/events");
+        let alter = |input: &str| -> anyhow::Result<()> {
+            let url = format!("file://{}/", path.display()).parse()?;
+            let catalog = arrow_deltalake::delta::DeltaTable::open_catalog(url)?;
+            let snapshot = catalog.catalog_snapshot()?.expect("catalog table");
+            let mut props = snapshot.properties;
+            props.insert("catalog.schemaHistory".into(), "[]".into());
+            for (key, value) in [
+                ("arrowcol.writer.targetFileSize", "262144"),
+                ("arrowcol.writer.minInputSize", input),
+                ("arrowcol.writer.maxInputSize", input),
+                ("arrowcol.writer.coldStartParquetRatio", "0.5"),
+                ("arrowcol.writer.ewmaWeight", "0.4"),
+                ("arrowcol.writer.minParquetRatio", "0.1"),
+                ("arrowcol.writer.maxParquetRatio", "2"),
+            ] {
+                props.insert(key.into(), value.into());
+            }
+            catalog.commit_catalog(
+                Some(snapshot.version),
+                snapshot.schema,
+                snapshot.partition_columns,
+                props,
+                snapshot.comment,
+            )?;
+            Ok(())
+        };
+        tokio::task::block_in_place(|| alter("1024"))?;
+        let retry = envelope_for(&lease);
+        let publication = exporter.stage(envelope_pdata(retry.clone())).await?;
+        let mut pending = Box::pin(publication.wait());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut pending)
+                .await
+                .is_err(),
+            "table policy must override the process's one-byte immediate flush"
+        );
+        let log = path.join("_delta_log");
+        let additions = || -> anyhow::Result<usize> {
+            let mut count = 0;
+            for entry in std::fs::read_dir(&log)? {
+                let path = entry?.path();
+                if path.extension().is_some_and(|ext| ext == "json") {
+                    for line in std::fs::read_to_string(path)?.lines() {
+                        if serde_json::from_str::<serde_json::Value>(line)?.get("add").is_some() {
+                            count += 1;
+                        }
+                    }
+                }
+            }
+            Ok(count)
+        };
+        assert_eq!(additions()?, 1);
+        tokio::task::block_in_place(|| alter("1"))?;
+        let next = exporter.stage(envelope_pdata(envelope_for(&lease))).await?;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            pending.await?;
+            next.wait().await
+        })
+        .await??;
+        assert_eq!(
+            additions()?,
+            3,
+            "same owner refreshed policy and committed two independent receipt files"
+        );
+        let replay = exporter.stage(envelope_pdata(retry)).await?;
+        tokio::time::timeout(std::time::Duration::from_secs(3), replay.wait()).await??;
+        assert_eq!(
+            additions()?,
+            3,
+            "policy change must not change publication replay identity"
+        );
+        Ok(())
     }
 
     fn delta_version_exists(directory: &std::path::Path, version: u64) -> bool {
@@ -1348,7 +1469,7 @@ mod tests {
         .expect("exporter");
         let original = envelope_for(&lease);
         let mut independent = original.clone();
-        independent.publication_id = Some(arrowcol_protocol::ReceiptId::new());
+        independent.publication_id = Some(arrowcol_protocol::PublicationId::new());
         let first = exporter.stage(envelope_pdata(original.clone())).await.expect("first");
         let second = exporter.stage(envelope_pdata(independent)).await.expect("independent");
         let same_group_replay = exporter
@@ -1403,6 +1524,167 @@ mod tests {
             matches!(result, Err(ExportFailure::Transient(message)) if message.contains("operator reconciliation"))
         );
         assert!(!directory.path().join("demo/generated/events/_delta_log").exists());
+    }
+
+    #[tokio::test]
+    async fn catalog_partitions_publish_all_rows_and_replay_across_commit_waves() {
+        let directory = tempfile::tempdir().expect("directory");
+        let root = directory.path().join("demo/generated/events");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("region", DataType::Utf8, true),
+            Field::new("bucket", DataType::Int32, false),
+        ]));
+        let table = arrow_deltalake::delta::DeltaTable::open_url(
+            format!("file://{}/", root.display()).parse().expect("url"),
+            Arc::clone(&schema),
+            vec!["region".to_owned(), "bucket".to_owned()],
+        )
+        .expect("partitioned table");
+        drop(table);
+        let store = Arc::new(MemoryRoutingStore::default());
+        let holder = CollectorInstanceId::new();
+        let lease = lease(&store, holder).await;
+        let metrics = Arc::new(RuntimeMetrics::new(holder));
+        let exporter = GenericDeltaExporter::with_store(
+            directory.path().to_path_buf(),
+            store as Arc<dyn RoutingStore>,
+            arrow_deltalake::commit::CommitOptions {
+                max_files_per_commit: 1,
+                max_pending_files: 2,
+                ..Default::default()
+            },
+            Arc::clone(&metrics),
+        )
+        .expect("exporter");
+        let batch = arrow_array::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("US/East"),
+                    None,
+                    Some("US/East"),
+                    Some("EU"),
+                    None,
+                    Some("EU"),
+                    Some("US/East"),
+                    None,
+                ])) as ArrayRef,
+                Arc::new(arrow_array::Int32Array::from(vec![1, 1, 2, 1, 1, 1, 1, 1])) as ArrayRef,
+            ],
+        )
+        .expect("batch");
+        let envelope = envelope_for(&lease);
+        let partial = arrow_deltalake::delta::DeltaTable::open(&root).expect("partial writer");
+        let mut files = partial
+            .new_partitioned_publication_files(
+                batch.clone(),
+                format!(
+                    "arrowcol.publication.{}",
+                    envelope.publication_id.expect("publication id")
+                ),
+                0,
+                i64::try_from(envelope.ingested_at_ms.expect("stamp").get()).expect("stamp"),
+            )
+            .expect("partitioned files")
+            .into_iter();
+        let (mut first, first_batch) = files.next().expect("first partition");
+        first.write(&first_batch).await.expect("partial write");
+        first.finish().await.expect("partial commit");
+        drop(files);
+        drop(partial);
+        let records = encode_record_batch(envelope, batch).expect("records");
+        let pdata = OtapPdata::new_todo_context(otel_arrow_dfe_pdata::OtapPayload::from_pdata_arrow(records));
+        exporter.export(pdata.clone()).await.expect("partition publication");
+        exporter.export(pdata).await.expect("replay");
+        let mut rows = 0;
+        let mut committed_ids = Vec::new();
+        let mut partitions = std::collections::BTreeMap::new();
+        let mut transaction_ids = std::collections::BTreeSet::new();
+        for log in std::fs::read_dir(root.join("_delta_log")).expect("logs") {
+            let path = log.expect("entry").path();
+            if path.extension().is_none_or(|extension| extension != "json") {
+                continue;
+            }
+            for line in std::fs::read_to_string(path).expect("log").lines() {
+                let action: serde_json::Value = serde_json::from_str(line).expect("action");
+                if let Some(txn) = action.get("txn") {
+                    transaction_ids.insert(txn["appId"].as_str().expect("app id").to_owned());
+                }
+                if let Some(add) = action.get("add") {
+                    let stats: serde_json::Value =
+                        serde_json::from_str(add["stats"].as_str().expect("stats")).expect("parsed stats");
+                    let count = stats["numRecords"].as_u64().expect("rows");
+                    rows += count;
+                    let values = &add["partitionValues"];
+                    let key = (
+                        values["region"].as_str().map(str::to_owned),
+                        values["bucket"].as_str().expect("bucket").to_owned(),
+                    );
+                    let region = key
+                        .0
+                        .as_deref()
+                        .unwrap_or("__HIVE_DEFAULT_PARTITION__")
+                        .replace('/', "%2F");
+                    let filename = add["path"]
+                        .as_str()
+                        .expect("path")
+                        .rsplit('/')
+                        .next()
+                        .expect("filename");
+                    let path = root.join(format!("bucket={}/region={region}/{filename}", key.1));
+                    let reader =
+                        ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path).expect("committed parquet"))
+                            .expect("reader")
+                            .build()
+                            .expect("build");
+                    for batch in reader {
+                        let batch = batch.expect("read committed data");
+                        assert_eq!(
+                            batch.num_columns(),
+                            1,
+                            "partition columns belong in Delta metadata, not the physical data"
+                        );
+                        committed_ids.extend_from_slice(
+                            batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<arrow_array::Int64Array>()
+                                .expect("ids")
+                                .values(),
+                        );
+                    }
+                    assert!(
+                        partitions.insert(key, count).is_none(),
+                        "replay duplicated a partition Add"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            rows, 8,
+            "admission alone is insufficient; every row must have a committed Add"
+        );
+        assert_eq!(partitions.len(), 4);
+        assert_eq!(partitions[&(None, "1".to_owned())], 3);
+        assert_eq!(partitions[&(Some("US/East".to_owned()), "1".to_owned())], 2);
+        assert_eq!(partitions[&(Some("US/East".to_owned()), "2".to_owned())], 1);
+        assert_eq!(partitions[&(Some("EU".to_owned()), "1".to_owned())], 2);
+        assert_eq!(
+            transaction_ids.len(),
+            4,
+            "each key must be independently replay-safe across commit waves"
+        );
+        committed_ids.sort_unstable();
+        assert_eq!(
+            committed_ids,
+            (0..8).collect::<Vec<i64>>(),
+            "partial commit and replay must neither lose nor duplicate row values"
+        );
+        assert!(root.join("bucket=1/region=US%2FEast").is_dir());
+        assert!(root.join("bucket=1/region=__HIVE_DEFAULT_PARTITION__").is_dir());
+        assert!(!root.join("bucket=1/region=US").exists());
     }
 
     /// Scenario: A generated non-OTAP Arrow schema reaches the generic Delta exporter.
@@ -2354,17 +2636,17 @@ mod tests {
         );
     }
 
-    /// Scenario: Repository SQL Server, Hive Metastore, routing leases, and local Delta are live.
+    /// Scenario: Remote Schema Catalog, SQL Server routing leases, and local Delta are live.
     /// Guarantees: Strict catalog validation and authoritative fencing precede generic Delta publication.
     #[tokio::test]
-    #[ignore = "requires projects/arrowcol-infra"]
-    async fn live_sql_hive_delta() {
+    #[ignore = "requires projects/arrowcol-infra and a running remote catalog service"]
+    async fn live_remote_catalog_delta() {
         if std::env::var("ARROWCOL_RUN_LIVE_TESTS").as_deref() != Ok("1") {
             return;
         }
-        use crate::{CatalogConfig, HiveMetastoreConnectionConfig, RoutingStoreConfig, SqlServerConnectionConfig};
+        use crate::{CatalogConfig, RoutingStoreConfig, SqlServerConnectionConfig};
         use arrow_array::Int64Array;
-        use arrowcol_catalog::{FlightSqlDdlHandler, SchemaValidator};
+        use arrowcol_catalog::SchemaValidator;
         use arrowcol_protocol::{ClaimedSchemaFingerprint, fingerprint_schema};
 
         let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -2384,26 +2666,17 @@ mod tests {
             connect_timeout: std::time::Duration::from_secs(15),
             command_timeout: std::time::Duration::from_secs(30),
         };
-        let catalog_config = CatalogConfig::SqlHive {
-            application_database: Box::new(sql.clone()),
-            hive_metastore: Box::new(HiveMetastoreConnectionConfig {
-                host: std::env::var("ARROWCOL_HIVE_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
-                port: std::env::var("ARROWCOL_HIVE_PORT")
-                    .ok()
-                    .and_then(|value| value.parse().ok())
-                    .unwrap_or(9_083),
-                warehouse_root: "file:///opt/hive/data/warehouse".to_owned(),
-                owner: "arrowcol".to_owned(),
-                connect_timeout: std::time::Duration::from_secs(10),
-            }),
-            timestamp_timezone: "UTC".to_owned(),
+        let catalog_config = CatalogConfig::Remote {
+            endpoint: std::env::var("ARROWCOL_CATALOG_ENDPOINT")
+                .expect("ARROWCOL_CATALOG_ENDPOINT must point to the running catalog service"),
+            maximum_cache_age: std::time::Duration::from_secs(10),
         };
         let (catalog_store, control) = catalog_config.start().await.expect("start live catalog");
         let suffix = uuid::Uuid::new_v4().simple().to_string();
         let table_name = format!("dfe_events_{}", &suffix[..12]);
         let completion = control
             .execute_ddl(arrowcol_catalog::FlightSqlDdlRequest::new(format!(
-                "CREATE TABLE arrowcol.live.{table_name} (id BIGINT NOT NULL, label STRING)"
+                "CREATE TABLE arrowcol.live.{table_name} (id BIGINT NOT NULL, label STRING) USING DELTA"
             )))
             .await
             .expect("live DDL");
@@ -2485,7 +2758,7 @@ mod tests {
             .await
             .expect("live lease");
 
-        let output = repository_root.join("projects/arrowcol-dataflow-rust/.temp/live-sql-hive-delta");
+        let output = repository_root.join("projects/arrowcol-dataflow-rust/.temp/live-remote-catalog-delta");
         let _ = std::fs::remove_dir_all(&output);
         std::fs::create_dir_all(&output).expect("create output");
         let delta_log = output
@@ -2520,7 +2793,7 @@ mod tests {
         .expect("live batch");
         let records = encode_record_batch(
             ArrowcolBatchEnvelope {
-                publication_id: Some(arrowcol_protocol::ReceiptId::new()),
+                publication_id: Some(arrowcol_protocol::PublicationId::new()),
                 ingested_at_ms: Some(crate::config::now_unix_millis().expect("stamp")),
                 table: completion.identity().clone(),
                 source_schema_version: schema.version(),

@@ -353,7 +353,7 @@ impl StreamLifecycle for DfeStreamLifecycle {
         let bytes = arrow_deltalake::record_batch_logical_bytes(&batch).map_err(|_| RuntimeError::internal())?;
         self.metrics.batch_received(rows, bytes);
         let mut envelope = self.envelope.clone();
-        let publication_id = arrowcol_protocol::ReceiptId::new();
+        let publication_id = arrowcol_protocol::PublicationId::new();
         envelope.publication_id = Some(publication_id);
         envelope.ingested_at_ms = Some(now_unix_millis().map_err(|_| RuntimeError::internal())?);
         let records = encode_record_batch(envelope, batch).map_err(|_| RuntimeError::internal())?;
@@ -963,9 +963,7 @@ pub(crate) mod tests {
     use arrow_flight::flight_descriptor::DescriptorType;
     use arrow_flight::{FlightData, FlightDescriptor};
     use arrow_schema::{DataType, Field, Schema};
-    use arrowcol_catalog::{
-        CatalogControlPlane, CatalogStore, DdlParser, FlightSqlDdlHandler, MemoryCatalogStore, MemoryMetastore,
-    };
+    use arrowcol_catalog::{CatalogControlPlane, CatalogStore, DdlParser, FlightSqlDdlHandler, MemoryCatalogStore};
     use arrowcol_flight::{DeliveryGuarantee, PutResultMetadata};
     use arrowcol_protocol::{
         BasisPoints, CatalogName, ClaimedSchemaFingerprint, IngestMetadata, Measurement, PressureGauge,
@@ -1014,7 +1012,7 @@ pub(crate) mod tests {
 
     fn envelope() -> ArrowcolBatchEnvelope {
         ArrowcolBatchEnvelope {
-            publication_id: Some(arrowcol_protocol::ReceiptId::new()),
+            publication_id: Some(arrowcol_protocol::PublicationId::new()),
             ingested_at_ms: Some(arrowcol_protocol::UnixMillis::new(1_700_000_012_345).expect("stamp")),
             table: arrowcol_protocol::TableIdentity::new(
                 CatalogName::new("demo").expect("catalog"),
@@ -1279,15 +1277,10 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn exact_flight_ingest_returns_best_effort_pdata() -> Result<()> {
         let catalog = Arc::new(MemoryCatalogStore::new());
-        let metastore = Arc::new(MemoryMetastore::new());
-        let control = CatalogControlPlane::new(
-            DdlParser::default(),
-            Arc::clone(&catalog) as Arc<dyn CatalogStore>,
-            metastore,
-        );
+        let control = CatalogControlPlane::new(DdlParser::default(), Arc::clone(&catalog) as Arc<dyn CatalogStore>);
         let ddl = control
             .execute_ddl(arrowcol_catalog::FlightSqlDdlRequest::new(
-                "CREATE TABLE demo.generated.events (id BIGINT NOT NULL, body VARCHAR)",
+                "CREATE TABLE demo.generated.events (id BIGINT NOT NULL, body STRING) USING DELTA",
             ))
             .await?;
         let current = catalog
@@ -1339,7 +1332,6 @@ pub(crate) mod tests {
         assert_eq!(results.len(), 1);
         let completion = PutResultMetadata::from_put_result(&results[0])?;
         assert_eq!(completion.delivery_guarantee(), Some(DeliveryGuarantee::BestEffort));
-        assert_eq!(completion.receipt_id(), None);
         let captured = sender.sent.lock().expect("capture lock");
         assert_eq!(captured.len(), 1);
         assert_eq!(
@@ -1354,15 +1346,10 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn breaking_flight_schema_is_rejected_before_dfe() -> Result<()> {
         let catalog = Arc::new(MemoryCatalogStore::new());
-        let metastore = Arc::new(MemoryMetastore::new());
-        let control = CatalogControlPlane::new(
-            DdlParser::default(),
-            Arc::clone(&catalog) as Arc<dyn CatalogStore>,
-            metastore,
-        );
+        let control = CatalogControlPlane::new(DdlParser::default(), Arc::clone(&catalog) as Arc<dyn CatalogStore>);
         let ddl = control
             .execute_ddl(arrowcol_catalog::FlightSqlDdlRequest::new(
-                "CREATE TABLE demo.generated.events (id BIGINT NOT NULL)",
+                "CREATE TABLE demo.generated.events (id BIGINT NOT NULL) USING DELTA",
             ))
             .await?;
         let current = catalog
@@ -1747,14 +1734,10 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn exact_flight_ingest_returns_durable_admission() -> Result<()> {
         let catalog = Arc::new(MemoryCatalogStore::new());
-        let control = CatalogControlPlane::new(
-            DdlParser::default(),
-            Arc::clone(&catalog) as Arc<dyn CatalogStore>,
-            Arc::new(MemoryMetastore::new()),
-        );
+        let control = CatalogControlPlane::new(DdlParser::default(), Arc::clone(&catalog) as Arc<dyn CatalogStore>);
         let ddl = control
             .execute_ddl(arrowcol_catalog::FlightSqlDdlRequest::new(
-                "CREATE TABLE demo.generated.events (id BIGINT NOT NULL)",
+                "CREATE TABLE demo.generated.events (id BIGINT NOT NULL) USING DELTA",
             ))
             .await?;
         let current = catalog
@@ -1825,7 +1808,6 @@ pub(crate) mod tests {
             completion.delivery_guarantee(),
             Some(DeliveryGuarantee::DurableAdmission)
         );
-        assert_eq!(completion.receipt_id(), None);
         let sent = sender.sent.lock().expect("capture lock").clone();
         assert_eq!(sent.len(), 3);
         assert!(sent.iter().all(|envelope| envelope.instance_key == "dfe-flight-test"));

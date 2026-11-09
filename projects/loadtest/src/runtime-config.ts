@@ -9,24 +9,30 @@ export const benchmarkBufferBudget = Object.freeze({
   max_arrow_memory_per_flush: 33554432,
 });
 
-/** Native Quiver placement for `--quiver`; directories are container paths on writable bind mounts. */
+/** Native Quiver placement for --quiver; directories are container paths on writable bind mounts. */
 export const benchmarkQuiver = Object.freeze({
-  directDirectory: '/state/quiver',
   dataflowDirectory: '/quiver',
   dataflowHostDirectory: 'dataflow-state-1/quiver',
-  directHostDirectory: 'direct-state-1/quiver',
   capacityBytes: 4294967296,
 });
 
-/** Workspace-relative Dataflow configuration: `--quiver` selects the durable-buffer topology. */
+/** Workspace-relative Dataflow configuration: --quiver selects the durable-buffer topology. */
 export function dataflowConfigFile(quiver: boolean): string {
-  return `projects/arrowcol-dataflow-rust/${quiver ? 'config.quiver.yaml' : 'config.yaml'}`;
+  return 'projects/arrowcol-dataflow-rust/config' + (quiver ? '.quiver.yaml' : '.yaml');
 }
 
-interface DirectIdentity {
-  instanceKey: string;
-  advertisedEndpoint: string;
-  generation: number;
+export function buildLocalLoadgenEndpoints(
+  network: { router: string },
+  runnerNetwork: 'host' | 'compose',
+  hostPorts: { router: string; catalog: string },
+): { router: string; catalog: string } {
+  if (runnerNetwork === 'compose') {
+    return { router: `http://${network.router}:50050`, catalog: 'http://arrowcol-catalog:8817' };
+  }
+  return {
+    router: `http://127.0.0.1:${hostPorts.router}`,
+    catalog: `http://127.0.0.1:${hostPorts.catalog}`,
+  };
 }
 
 export interface BenchmarkRuntimeOptions {
@@ -39,34 +45,22 @@ export interface BenchmarkRuntimeOptions {
 }
 
 export function buildBenchmarkRuntimeConfigs(
-  directSource: string,
   dataflowSource: string,
-  identity?: DirectIdentity,
   options: BenchmarkRuntimeOptions = {},
-): { directYaml: string; dataflowYaml: string } {
-  if (identity) {
-    if (!Number.isSafeInteger(identity.generation) || identity.generation <= 0) throw new Error('Invalid direct generation');
-    directSource = directSource
-      .replaceAll('__INSTANCE_KEY__', identity.instanceKey)
-      .replaceAll('__ADVERTISED_ENDPOINT__', identity.advertisedEndpoint)
-      .replaceAll('__GENERATION__', String(identity.generation));
-  }
-  const direct = YAML.parse(directSource);
+): { dataflowYaml: string } {
   const dataflow = YAML.parse(dataflowSource);
   const nodes = dataflow.groups.arrowcol.pipelines.ingest.nodes;
+  const batching = nodes.delta.config.batching;
   if (options.mode === 'azure') {
     if (!options.azure) throw new Error('Azure runtime requires validated targets');
-    direct.delta.root = options.azure.directRoot;
     nodes.delta.config.base_path = options.azure.dataflowRoot;
   }
-  for (const buffer of [direct.buffer, nodes.delta.config.batching]) {
-    buffer.global_capacity = { ...benchmarkBufferBudget.global_capacity };
-    buffer.per_table_capacity = { ...benchmarkBufferBudget.per_table_capacity };
-    buffer.max_arrow_memory_per_flush = benchmarkBufferBudget.max_arrow_memory_per_flush;
-    if (buffer.max_rows_per_flush > buffer.per_table_capacity.rows ||
-        buffer.max_batches_per_flush > buffer.per_table_capacity.batches) {
-      throw new Error('Benchmark capacity is below the preserved flush row/batch limits');
-    }
+  batching.global_capacity = { ...benchmarkBufferBudget.global_capacity };
+  batching.per_table_capacity = { ...benchmarkBufferBudget.per_table_capacity };
+  batching.max_arrow_memory_per_flush = benchmarkBufferBudget.max_arrow_memory_per_flush;
+  if (batching.max_rows_per_flush > batching.per_table_capacity.rows ||
+      batching.max_batches_per_flush > batching.per_table_capacity.batches) {
+    throw new Error('Benchmark capacity is below the preserved flush row/batch limits');
   }
   Object.assign(nodes.flight.config.registration, {
     buffered_bytes_limit: benchmarkBufferBudget.global_capacity.bytes,
@@ -82,46 +76,39 @@ export function buildBenchmarkRuntimeConfigs(
     durable[0].config = {
       ...durable[0].config,
       path: benchmarkQuiver.dataflowDirectory,
-      retention_size_cap: `${benchmarkQuiver.capacityBytes / 1073741824}GiB`,
+      retention_size_cap: String(benchmarkQuiver.capacityBytes / 1073741824) + 'GiB',
       wal_flush_interval: '0s',
     };
-    direct.buffer.native_quiver = {
-      ...direct.buffer.native_quiver,
-      enabled: true,
-      directory: benchmarkQuiver.directDirectory,
-      capacity_bytes: benchmarkQuiver.capacityBytes,
-      wal_flush_interval_ms: 0,
-    };
-  } else if (durable.length > 0 || nodes.flight.config.native_quiver === true || direct.buffer.native_quiver?.enabled) {
+  } else if (durable.length > 0 || nodes.flight.config.native_quiver === true) {
     throw new Error('Native Quiver configuration requires --quiver');
   }
-  return { directYaml: YAML.stringify(direct), dataflowYaml: YAML.stringify(dataflow) };
+  return { dataflowYaml: YAML.stringify(dataflow) };
 }
 
 export function buildBenchmarkComposeOverride(hostDirectory: string, options: BenchmarkRuntimeOptions = {}): string {
   const cloud: Record<string, { environment: Record<string, string>; volumes: object[] }> = {};
   if (options.mode === 'azure') {
-    if (!options.azureConfigHostDirectory || !options.azure) throw new Error('Azure runtime requires isolated writable CLI configuration and validated roots');
+    if (!options.azureConfigHostDirectory || !options.azure) {
+      throw new Error('Azure runtime requires isolated writable CLI configuration and validated roots');
+    }
     const environment: Record<string, string> = { AZURE_CONFIG_DIR: '/run/azure', AZURE_USE_AZURE_CLI: 'true' };
     for (const key of ['AZURE_SUBSCRIPTION_ID', 'AZURE_STORAGE_ACCOUNT', 'AZURE_STORAGE_CONTAINER',
       'AZURE_STORAGE_CHECKPOINT_CONTAINER', 'ARROWCOL_RESET_GENERATION']) {
       const value = options.azureEnvironment?.[key];
-      if (!value) throw new Error(`Azure runtime requires ${key}`);
+      if (!value) throw new Error('Azure runtime requires ' + key);
       environment[key] = value;
     }
     if (!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/iu.test(environment.ARROWCOL_RESET_GENERATION)) {
       throw new Error('Azure runtime requires a metadata-issued ARROWCOL_RESET_GENERATION UUID');
     }
     const roots: Record<string, string> = {
-      'direct-1': options.azure.directRoot,
       'dataflow-1': options.azure.dataflowRoot,
+      'arrowcol-catalog': options.azure.dataflowRoot,
       'tenant-stream': options.azure.tenantRoot,
-      'delta-maintenance': options.azure.directRoot,
+      'delta-maintenance': options.azure.dataflowRoot,
     };
     for (const [service, root] of Object.entries(roots)) {
-      cloud[service] = { environment: { ...environment,
-        ARROWCOL_DELTA_ROOT: root,
-      }, volumes: [{
+      cloud[service] = { environment: { ...environment, ARROWCOL_DELTA_ROOT: root }, volumes: [{
         type: 'bind', source: path.join(options.azureConfigHostDirectory, service),
         target: '/run/azure', bind: { create_host_path: false },
       }] };
@@ -129,22 +116,18 @@ export function buildBenchmarkComposeOverride(hostDirectory: string, options: Be
   }
   return JSON.stringify({
     services: {
-      ...(cloud['direct-1'] ? { 'direct-1': cloud['direct-1'] } : {}),
+      ...(cloud['arrowcol-catalog'] ? { 'arrowcol-catalog': cloud['arrowcol-catalog'] } : {}),
       ...(cloud['tenant-stream'] ? { 'tenant-stream': cloud['tenant-stream'] } : {}),
       ...(cloud['delta-maintenance'] ? { 'delta-maintenance': cloud['delta-maintenance'] } : {}),
       'dataflow-1': {
         ...(cloud['dataflow-1'] ? { environment: cloud['dataflow-1'].environment } : {}),
         volumes: [{
-          type: 'bind',
-          source: path.join(hostDirectory, 'dataflow-state-1/dataflow.yaml'),
-          target: '/etc/arrowcol-dataflow-rust/config.yaml',
-          read_only: true,
+          type: 'bind', source: path.join(hostDirectory, 'dataflow-state-1/dataflow.yaml'),
+          target: '/etc/arrowcol-dataflow-rust/config.yaml', read_only: true,
           bind: { create_host_path: false },
         }, ...(options.quiver ? [{
-          type: 'bind',
-          source: path.join(hostDirectory, benchmarkQuiver.dataflowHostDirectory),
-          target: benchmarkQuiver.dataflowDirectory,
-          bind: { create_host_path: false },
+          type: 'bind', source: path.join(hostDirectory, benchmarkQuiver.dataflowHostDirectory),
+          target: benchmarkQuiver.dataflowDirectory, bind: { create_host_path: false },
         }] : []), ...(cloud['dataflow-1']?.volumes ?? [])],
       },
     },

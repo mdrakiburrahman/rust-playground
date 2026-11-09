@@ -33,6 +33,37 @@ staged and unstaged tracked changes, deletions, renames, dirty submodules, and
 unexpected nonignored untracked files, with status and diff diagnostics. It is
 not a dependency of local lint: normal authoring need not be committed first.
 
+## Schema catalog bug bash
+
+Run `npx --no-install tsx tools/scripts/src/schema-catalog-bugbash.ts <step>`
+inside the Linux devcontainer. Each step needs a new absolute `--evidence-dir`
+outside the checkout. Stop on nonzero; copy its `evidence.tar`, `receipt.json`,
+and `SHA256SUMS` before recreating the devcontainer.
+
+| Step | Required arguments | Expected result |
+| --- | --- | --- |
+| `verify` | None; optional `--expected-sha <full SHA>` | Clean checkout must match the exact HEAD SHA; all exact-head CI runs succeed, regression/build gates pass, six `loadtest:build` images are revision- and config-verified against Compose aliases, supported image smokes and SDK bundles pass. |
+| `local` | `--verified-receipt <verify/receipt.json>` | Normal then Quiver crash/recovery, native local schema evolution, all 13 table SDK/artifact bundles, preserved private seals and no live attempt writers. |
+| `reset` | `--verified-receipt <verify/receipt.json> --confirm-reset <dedicated group>` | **Destructively resets only the explicitly confirmed isolated group**, then provisions and checks fresh readiness. Saves private base/ready/manifest files outside the checkout; receipt binds their hashes, generation and source. |
+| `azure` | `--reset-receipt <reset/receipt.json>` | Checks the receipt chain and live ready generation, runs native Azure evolution, verifies owned-process/data cleanup. Never provisions or resets. |
+
+`verify` requires existing Node dependencies and Docker; it builds the six
+`loadtest:build` image dependencies locally and does not pull published images.
+Azure needs the synced `.env`, `infra/azure/stamp.yaml` and signed-in
+`az`. The CLI projects only the subscription and Kusto tags from `.env`; it uses
+`--resource-group`, defaulting to `rust-playground-schema-evo-qualification-20261108`,
+and refuses the old/default or any non-dedicated group. Private inputs are mode 0600
+in CLI-managed directories outside the checkout. Stamp/AKS/ACR identities and stale
+ready generations are never copied into the schema-evolution lane.
+
+Optional `--env-file` supplies an approved base instead; `azure --verified-receipt
+<verify/receipt.json> --ready-env <ready output>` supports an already-provisioned
+sandbox without resetting it. Optional `--subscription <UUID>` must match the base.
+Do not move/delete CLI-managed private state before the Azure step. A blocked
+CI gate exits nonzero: wait for the automatic run, retain its failed
+evidence, then retry `verify` with a new evidence directory. Local failure stops
+owned services and archives diagnostics without discarding/resetting the attempt.
+
 ## Registry commands
 
 The registry targets forward arguments to a Commander CLI:

@@ -1,0 +1,82 @@
+# Schema evolution to Kusto
+
+| Claim | Evidence |
+| --- | --- |
+| A separate disposable stamp does not alias the shared sandbox | Azure configuration tests verify distinct RG-derived account, cluster, ownership and deployment names. |
+| Hydration requires old-client writes both before and after ALTER, plus filled new-client rows | `schema-evolution-experiment:verify` checks exact per-client/per-phase counts and bounded observations. |
+| Genuine historical and evolved SDK clients compile independently | Live run at `377b388` generated separate v1/v2 SDKs from the real catalog; immutable v1 PID 90453 continued after ALTER, distinct v2 PID 90835 wrote new values. |
+| Pinned Kustainer accepts native-refresh prerequisites | `schema-evolution-experiment:probe-kustainer` accepts create, QAP, then AutoUpdateSchema. Empty fixture means actual refresh remains inconclusive. |
+| Live local catalog, SDK, Delta and Kusto evolution | Passed at `377b388` in 335191 ms: Delta v4, 24 exact rows in three partitioned active files, server-side wrong-schema rejection and clean shutdown. |
+| Physical appended-field compatibility | Eight old-after rows have true physical NULL `bar` values; eight new-after rows contain exact `bar-0` through `bar-7` sentinels. |
+| Native Kustainer schema and accelerated data hydration | Without post-ALTER reconciliation, QAP reached v4, 100%, 24 accelerated rows and zero pending files after 294006 ms; exact old/new values and multiplicities matched. |
+| First real partitioned v1 publication | At `420f039`, live catalog CREATE and genuine v1 SDK admission succeeded, but Delta rejected missing partition values. No data commit landed; fixture partitioning was not removed. |
+| Native Azure schema and accelerated data hydration | Observed at `377b388`: v4, 100%, 24 accelerated rows, zero pending files after 292289 ms, with exact old/new values and no post-ALTER management reconciliation. |
+| Azure rehearsal cleanup | Failed: an active publisher remained after owned runtime shutdown despite an unchanged authority generation. Cloud run data and test occupancy were retained; this is not a qualifying pass. |
+| Supported recovery after catalog shutdown repair | `3fa52f5` passed a genuine local regression with clean termination. Authorized isolated recovery used a genuine stop receipt and 61954 ms quiescence, producing fenced-v1, released occupancy and an empty registry without deleting data. Azure reset/full provision and both final rehearsals remain outstanding. |
+| New stamp reaches supported write readiness | Full bootstrap at `937a465` completed initialization under custody, reconciled 26 Delta external tables/QAP, and exported ready-v1 in 138.4 seconds. This is not the final DFE-only topology rehearsal. |
+
+![Schema evolution architecture](schema-evolution.drawio.png)
+
+| Command | Expected result |
+| --- | --- |
+| `npx nx run schema-evolution-experiment:verify` | Strict TypeScript checks and deterministic hydration-verifier tests. No Azure deployment. |
+| `npx nx run schema-evolution-experiment:build-fixtures` | Separately built old/new Rust clients from real generated immutable SDKs. No network writes. |
+| `npx nx run schema-evolution-experiment:probe-kustainer` | Records Kustainer command capability and string null semantics; does not claim E2E delivery. |
+| `npx nx run schema-evolution-experiment:run -- --target local` | Actual Rust catalog/DFE, real generated historical SDKs, physical Delta null inspection, pinned Kustainer native refresh. |
+| `npx --no-install tsx experiments/schema-evolution/src/private-nx.ts run --mode schema-evolution --env-file .env.schema-evo.private --ready-env .env.azure.schema-evo` | Public Nx scenario with sanitized isolated private environment; genuine exported ready generation and bounded native refresh. |
+| `npx --no-install tsx infra/azure/bootstrap.ts config --mode schema-evolution --env-file .env.schema-evo.private --output .env.schema-evo.config` | Read-only configuration projection; selects only the exact approved isolated group, never an ambient group/stamp or AKS YAML. |
+| `npx --no-install tsx experiments/schema-evolution/src/private-nx.ts provision --mode schema-evolution --env-file .env.schema-evo.private --tables .env.azure.schema-evo.tables.json --output .env.azure.schema-evo` | Public Nx full initialization, KQL reconciliation and bootstrap completion with sanitized private input. No generation or fencing bypass. Real Azure charges apply. |
+
+Use explicit `--mode schema-evolution` for every isolated bootstrap operation,
+including status/reset/recovery/occupancy. Default stamped Config/CLI and AKS
+safeguards are unchanged; isolated mode rejects stamp/AKS/ACR inputs, preserves
+the original normalized subscription:RG hash and never converts authority.
+Generated mode is passed explicitly to the initializer/Rust fence. See the
+[experiment runbook](../../../experiments/schema-evolution/README.md) for the
+supported private-input projection. Keep resource-name overrides absent. Never
+reuse the shared sandbox's table/checkpoint roots. **Stop/reset operate on the
+selected resource group; inspect that selection before execution.**
+See [Azure sandbox safety](../../operations/AZURE_SANDBOX.md).
+
+The runner records source SHA, runbook hash, immutable v1 SDK/binary custody,
+CES and exact cohort evidence under `.temp/experiments/schema-evolution`.
+Azure inputs are explicit: the ready env is overlaid on a fresh private input
+for the separate stamp, never inferred from shared `.env.azure`. The runner
+uses standalone process-shared routing and a real remote catalog, not empty
+memory catalogs or SQL/Hive fallbacks. Cleanup stops only owned processes and
+drops only the run's external table and storage prefix. An unclean publisher
+shutdown retains cloud data and occupancy for supported recovery.
+
+## Qualification gates
+
+Native-refresh setup is ordered: create an inferred external table, enable
+QAP, then enable `AutoUpdateSchema=true` before Delta ALTER. Pinned Kustainer
+rejects the flag when QAP is not yet enabled. No external-table ALTER is
+allowed during the subsequent native-hydration observation.
+
+| Step | Required evidence |
+| --- | --- |
+| CREATE v1 | Spark SQL text, catalog version, Delta schema and immutable generated v1 SDK hash. |
+| Old client before ALTER | Accepted writes and persistent process identity. |
+| ADD COLUMNS | `ALTER TABLE foo ADD COLUMNS (bar STRING)`, nullable Delta field, CES event and generated v2 SDK hash. Column mapping and deletion vectors remain off. |
+| Old/new clients after ALTER | Same v1 process continues; genuine v2 SDK writes nonempty `bar`; wrong-schema client is rejected by DFE. |
+| Azure Kusto | `AutoUpdateSchema=true` and QAP, elapsed bounded-poll observations and exact old/new data counts; no manual reconciliation after ALTER. |
+| Kustainer | Record whether native refresh works. Production CES-triggered reconciliation, if required, is distinct from native refresh. |
+| Bug bash | Two fresh Full bootstraps at the same final SHA and runbook hash, each including Azure, with stamp identity and reproducible commands. |
+
+Kusto `string` values do not have null semantics like nullable Arrow/Delta
+strings. Record the requested `isnull(bar)` query unchanged, but verify
+old-client string representation using `isempty(bar)` and independently verify
+physical Delta nulls. New-client fixture values must be nonempty, making empty
+old values distinguishable without calling Kusto empty strings SQL NULL.
+
+Successful Kusto warning-only responses preserve their completion details in
+evidence; errors, partial results and ambiguous completion remain fatal.
+Fallback warnings never prove acceleration: initial and evolved QAP samples
+must match the actual Delta version, exact row count, zero pending files and
+healthy 100% completion before the native schema/data proof.
+
+| Verification KQL | Purpose |
+| --- | --- |
+| `external_table('foo') \| summarize total=count(), nulls=countif(isnull(bar)), filled=countif(isnotnull(bar)) by client` | Original requested observation; do not reinterpret Kusto string null semantics. |
+| `external_table('foo') \| summarize total=count(), empty=countif(isempty(bar)), filled=countif(isnotempty(bar)) by client, phase` | Exact data proof for old-before, old-after and new-after cohorts. |

@@ -9,7 +9,7 @@ export const MIB = 1024 * 1024;
 const SECOND = 1000;
 const MINUTE = 60 * SECOND;
 const HOUR = 60 * MINUTE;
-/** Same ceiling as `arrowcol-experiment seed-scale --max-total-bytes`. */
+/** Same ceiling as `qap-fixture seed-scale --max-total-bytes`. */
 export const MAX_TRIAL_BYTES = 2 * 1024 * MIB;
 
 export interface Profile {

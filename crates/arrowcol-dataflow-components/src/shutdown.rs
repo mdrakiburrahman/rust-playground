@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::{Context, Result, bail};
-use arrowcol_protocol::{CollectorInstanceId, ReceiptId};
+use arrowcol_protocol::{CollectorInstanceId, PublicationId};
 use arrowcol_routing::{CollectorState, RoutingStore};
 
 use crate::config::now_unix_millis;
@@ -16,7 +16,7 @@ pub(crate) static PROCESS_ROUTING_SHUTDOWN: LazyLock<RoutingShutdown> = LazyLock
 pub struct RoutingShutdown {
     registrations: Mutex<Vec<(Arc<dyn RoutingStore>, CollectorInstanceId)>>,
     failed: AtomicBool,
-    pending: Mutex<HashSet<ReceiptId>>,
+    pending: Mutex<HashSet<PublicationId>>,
     workers: Mutex<HashMap<PathBuf, Arc<AtomicBool>>>,
 }
 
@@ -42,7 +42,7 @@ impl RoutingShutdown {
     ///
     /// # Errors
     /// Reports poisoned publication accounting rather than assuming the batch was published.
-    pub fn publication_finished(&self, publication_id: ReceiptId, published: bool) -> Result<()> {
+    pub fn publication_finished(&self, publication_id: PublicationId, published: bool) -> Result<()> {
         let mut pending = self
             .pending
             .lock()

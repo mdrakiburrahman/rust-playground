@@ -15,7 +15,7 @@ test('physical accounting includes JSON/checkpoints/WAL/staging/orphans and dedu
   };
   for (const [file, bytes] of Object.entries(files)) writeFileSync(path.join(root, file), 'x'.repeat(bytes));
   linkSync(path.join(root, 'orphan.parquet'), path.join(root, 'same-inode.parquet'));
-  const inventory = await physicalInventory({ direct: root }, Date.now() + 2000);
+  const inventory = await physicalInventory({ dataflow: root }, Date.now() + 2000);
   assert.equal(inventory.files, 5);
   assert.equal(inventory.fileBytes, 83);
   assert.equal(inventory.byKind['delta-log-json'].bytes, 11);

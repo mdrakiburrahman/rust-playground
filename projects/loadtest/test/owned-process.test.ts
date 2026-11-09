@@ -93,15 +93,21 @@ for (const mode of ['deadline', 'parent-exit', 'interrupt']) {
   });
 }
 
-test('operator interrupts reach owned mutations but let read-only helpers finish their bounded deadline', async () => {
+test('operator interrupts reach owned mutations but let read-only helpers finish their bounded deadline', async t => {
   const options = { cwd: process.cwd(), env: process.env, timeoutMs: 10_000 };
-  const script = 'setTimeout(() => process.exit(0), 750)';
+  const root = mkdtempSync(path.join(os.tmpdir(), 'loadtest-owned-interrupt-'));
+  t.after(() => rmSync(root, { force: true, recursive: true }));
+  const ready = path.join(root, 'ready');
+  const script = `require("node:fs").writeFileSync(${JSON.stringify(ready)},"ready");setTimeout(() => process.exit(0), 10_000)`;
   const interrupted = assert.rejects(runOwnedProcess(process.execPath, ['-e', script], options),
     (error: unknown) => error instanceof OwnedProcessError && error.outcome?.interrupted === true);
-  await new Promise(resolve => setTimeout(resolve, 300));
+  const deadline = Date.now() + 5000;
+  while (!existsSync(ready) && Date.now() < deadline) await delay(10);
+  assert(existsSync(ready), 'owned command must start before interrupting');
   process.emit('SIGINT');
   await interrupted;
-  const helper = runOwnedProcess(process.execPath, ['-e', script], { ...options, forwardInterrupts: false });
+  const helper = runOwnedProcess(process.execPath, ['-e', 'setTimeout(() => process.exit(0), 250)'],
+    { ...options, forwardInterrupts: false });
   await new Promise(resolve => setTimeout(resolve, 300));
   assert.equal(process.listenerCount('SIGINT'), 0);
   await helper;

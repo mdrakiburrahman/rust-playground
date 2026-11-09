@@ -42,14 +42,12 @@ for attempt in $(seq 1 60); do
         IF EXISTS (
           SELECT 1
           FROM sys.databases
-          WHERE [name] IN (N'arrowcol', N'hive_metastore')
+          WHERE [name] = N'arrowcol'
             AND [state_desc] <> N'ONLINE'
         )
           THROW 50000, 'Existing application databases are not online yet.', 1;
         IF DB_ID(N'arrowcol') IS NOT NULL
           EXEC(N'USE [arrowcol]; SELECT TOP (0) [name] FROM sys.database_principals;');
-        IF DB_ID(N'hive_metastore') IS NOT NULL
-          EXEC(N'USE [hive_metastore]; SELECT TOP (0) [name] FROM sys.database_principals;');
         SELECT 1;" \
     -o /dev/null; then
     break
@@ -70,10 +68,6 @@ export ARROWCOL_MIGRATOR_PASSWORD_SQL="$(
   read_secret "${ARROWCOL_MIGRATOR_PASSWORD_FILE:-/run/secrets/arrowcol_migrator_password}" |
     sql_literal_escape
 )"
-export HIVE_METASTORE_PASSWORD_SQL="$(
-  read_secret "${HIVE_METASTORE_PASSWORD_FILE:-/run/secrets/hive_metastore_password}" |
-    sql_literal_escape
-)"
 
 "$sqlcmd" \
   -S "tcp:${host},${port}" \
@@ -87,7 +81,6 @@ export HIVE_METASTORE_PASSWORD_SQL="$(
 
 unset ARROWCOL_APP_PASSWORD_SQL
 unset ARROWCOL_MIGRATOR_PASSWORD_SQL
-unset HIVE_METASTORE_PASSWORD_SQL
 
 "$sqlcmd" \
   -S "tcp:${host},${port}" \
@@ -96,4 +89,4 @@ unset HIVE_METASTORE_PASSWORD_SQL
   -b \
   -l 30 \
   -d master \
-  -Q "SET NOCOUNT ON; SELECT [name], state_desc FROM sys.databases WHERE [name] IN (N'arrowcol', N'hive_metastore') ORDER BY [name];"
+  -Q "SET NOCOUNT ON; SELECT [name], state_desc FROM sys.databases WHERE [name] = N'arrowcol' ORDER BY [name];"

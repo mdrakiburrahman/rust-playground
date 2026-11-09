@@ -45,7 +45,7 @@ test('native Delta fixtures retain mutations, partition purge, transactions and 
   }
 });
 
-test('all canonical schemas preserve signed boundaries, normalized unsigneds and exact timestamp micros/nanos', t => {
+test('all canonical Spark schemas preserve signed boundaries and exact timestamp micros/nanos', t => {
   const root = mkdtempSync(path.join(process.cwd(), '.kusto-schema-test-'));
   t.after(() => rmSync(root, { force: true, recursive: true }));
   const sql = path.join(process.cwd(), 'projects/loadtest/schemas/sqlserver.sql');
@@ -62,7 +62,7 @@ test('all canonical schemas preserve signed boundaries, normalized unsigneds and
     assert.equal(table.numRows, 30);
     const expected = canonicalRows(columns, 0, 30, 'b1');
     for (const [column, kind] of columns) {
-      if (kind.startsWith('TIMESTAMP(9)')) {
+      if (kind === 'TIMESTAMP') {
         const nanos = table.getChild(`${column}__unix_nanos`)!;
         const micros = table.getChild(column)!.data[0].values as BigInt64Array;
         assert(Array.from(nanos).some(value => value! < 0n));

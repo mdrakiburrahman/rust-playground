@@ -1,14 +1,12 @@
 use std::os::fd::RawFd;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrowcol_protocol::{
-    CATALOG_METADATA_KEY, CLAIMED_SCHEMA_FINGERPRINT_METADATA_KEY, ErrorCode, ErrorStatus,
-    IMPLEMENTATION_POOL_METADATA_KEY, ImplementationPool, IngestMetadata, PROTOCOL_VERSION_METADATA_KEY,
-    RawGrpcMetadata, ReceiptId, ReceiptStatus, SCHEMA_METADATA_KEY, TABLE_METADATA_KEY, UnixMillis,
+    CATALOG_METADATA_KEY, CLAIMED_SCHEMA_FINGERPRINT_METADATA_KEY, IMPLEMENTATION_POOL_METADATA_KEY,
+    ImplementationPool, IngestMetadata, PROTOCOL_VERSION_METADATA_KEY, RawGrpcMetadata, SCHEMA_METADATA_KEY,
+    TABLE_METADATA_KEY, UnixMillis,
 };
-use arrowcol_receipts::{ReceiptErrorKind, ReceiptRecord, ReceiptStore};
 use arrowcol_routing::{ControlOperation, ControlRoute, RouteAssignment, RouteSource, RoutingEngine, RoutingErrorKind};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -28,8 +26,8 @@ use tracing::{error, info, warn};
 use crate::{
     AuthFailure, AuthFailureKind, Authenticator, EDGE_NONCE_HEADER, EDGE_SIGNATURE_HEADER, EDGE_TIMESTAMP_HEADER,
     EdgeVerifier, ExternalRequest, INTERNAL_AUTH_CONTEXT_HEADER, INTERNAL_AUTH_EXPIRES_HEADER,
-    INTERNAL_AUTH_SIGNATURE_HEADER, InternalIdentitySigner, ReceiptApiConfig, RouterConfig, RouterMetrics,
-    SignedInternalIdentity, UpstreamConfig,
+    INTERNAL_AUTH_SIGNATURE_HEADER, InternalIdentitySigner, RouterConfig, RouterMetrics, SignedInternalIdentity,
+    UpstreamConfig,
 };
 
 /// Exact Arrow Flight `DoPut` RPC path.
@@ -51,12 +49,10 @@ const FLIGHT_SERVICE_PREFIX: &str = "/arrow.flight.protocol.FlightService/";
 #[derive(Clone)]
 pub struct ProductionRouter {
     routing: Arc<RoutingEngine>,
-    receipts: Arc<dyn ReceiptStore>,
     authenticator: Arc<dyn Authenticator>,
     edge_verifier: Arc<EdgeVerifier>,
     internal_signer: Arc<InternalIdentitySigner>,
     upstream: UpstreamConfig,
-    receipt_config: ReceiptApiConfig,
     metrics: RouterMetrics,
 }
 
@@ -66,22 +62,18 @@ impl ProductionRouter {
     #[must_use]
     pub fn new(
         routing: Arc<RoutingEngine>,
-        receipts: Arc<dyn ReceiptStore>,
         authenticator: Arc<dyn Authenticator>,
         edge_verifier: Arc<EdgeVerifier>,
         internal_signer: Arc<InternalIdentitySigner>,
         upstream: UpstreamConfig,
-        receipt_config: ReceiptApiConfig,
         metrics: RouterMetrics,
     ) -> Self {
         Self {
             routing,
-            receipts,
             authenticator,
             edge_verifier,
             internal_signer,
             upstream,
-            receipt_config,
             metrics,
         }
     }
@@ -249,8 +241,6 @@ impl ProductionRouter {
                     &CapabilitiesResponse {
                         protocol_version: 1,
                         transparent_flight_data: true,
-                        receipt_status: true,
-                        bounded_receipt_batch: self.receipt_config.max_batch_size,
                         flight_sql_control_metadata: CONTROL_OPERATION_METADATA_KEY,
                         identity_propagation: "hmac_sha256",
                     },
@@ -266,112 +256,7 @@ impl ProductionRouter {
                 write_bytes(session, StatusCode::OK, "text/plain; version=0.0.4", body).await?;
                 Ok(Some(true))
             }
-            _ if path.starts_with("/v1/receipts") => {
-                if session.req_header().method != Method::GET {
-                    write_api_error(
-                        session,
-                        StatusCode::METHOD_NOT_ALLOWED,
-                        ErrorCode::ReceiptTransitionInvalid,
-                        "receipt status APIs require GET",
-                    )
-                    .await?;
-                    return Ok(Some(true));
-                }
-                if let Err(failure) = self.authenticate_and_sign(session, now).await {
-                    write_api_error(
-                        session,
-                        auth_http_status(failure.kind()),
-                        auth_error_code(failure.kind()),
-                        failure.message(),
-                    )
-                    .await?;
-                    return Ok(Some(true));
-                }
-                self.handle_receipts(session, path).await?;
-                Ok(Some(true))
-            }
             _ => Ok(None),
-        }
-    }
-
-    async fn handle_receipts(&self, session: &mut Session, path: &str) -> pingora::Result<()> {
-        if let Some(id) = path.strip_prefix("/v1/receipts/") {
-            if id.is_empty() || id.contains('/') {
-                return write_api_error(
-                    session,
-                    StatusCode::BAD_REQUEST,
-                    ErrorCode::ReceiptTransitionInvalid,
-                    "receipt path must contain one UUID",
-                )
-                .await;
-            }
-            let receipt_id = match ReceiptId::from_str(id) {
-                Ok(receipt_id) => receipt_id,
-                Err(_) => {
-                    return write_api_error(
-                        session,
-                        StatusCode::BAD_REQUEST,
-                        ErrorCode::ReceiptTransitionInvalid,
-                        "receipt identifier is invalid",
-                    )
-                    .await;
-                }
-            };
-            match self.receipts.receipt(receipt_id).await {
-                Ok(Some(record)) => write_receipt_record(session, record).await,
-                Ok(None) => {
-                    write_api_error(
-                        session,
-                        StatusCode::NOT_FOUND,
-                        ErrorCode::ReceiptNotFound,
-                        "receipt was not found",
-                    )
-                    .await
-                }
-                Err(error) => write_receipt_store_error(session, error.kind(), error.message()).await,
-            }
-        } else if path == "/v1/receipts" {
-            let query = session.req_header().uri.query().unwrap_or("");
-            let ids = match parse_receipt_query(query, self.receipt_config.max_batch_size) {
-                Ok(ids) => ids,
-                Err(message) => {
-                    return write_api_error(
-                        session,
-                        StatusCode::BAD_REQUEST,
-                        ErrorCode::ReceiptTransitionInvalid,
-                        &message,
-                    )
-                    .await;
-                }
-            };
-            match self.receipts.receipts(&ids).await {
-                Ok(records) => {
-                    let entries = ids
-                        .into_iter()
-                        .zip(records)
-                        .map(|(receipt_id, record)| match record {
-                            Some(record) => ReceiptBatchEntry::from_record(receipt_id, record),
-                            None => ReceiptBatchEntry {
-                                receipt_id,
-                                found: false,
-                                purge_allowed: false,
-                                status: None,
-                                error: Some(public_error(ErrorCode::ReceiptNotFound, "receipt was not found")),
-                            },
-                        })
-                        .collect();
-                    write_json(session, StatusCode::OK, &ReceiptBatchResponse { receipts: entries }).await
-                }
-                Err(error) => write_receipt_store_error(session, error.kind(), error.message()).await,
-            }
-        } else {
-            write_api_error(
-                session,
-                StatusCode::NOT_FOUND,
-                ErrorCode::ReceiptNotFound,
-                "receipt API path was not found",
-            )
-            .await
         }
     }
 }
@@ -738,82 +623,6 @@ fn ascii_header<'a>(headers: &'a http::HeaderMap, key: &str) -> Result<Option<&'
         .transpose()
 }
 
-fn parse_receipt_query(query: &str, maximum: usize) -> Result<Vec<ReceiptId>, String> {
-    let value = query
-        .strip_prefix("ids=")
-        .ok_or_else(|| "batch receipt query must use ?ids=<uuid>,<uuid>".to_owned())?;
-    if value.is_empty() {
-        return Err("batch receipt query must contain at least one identifier".to_owned());
-    }
-    let parts: Vec<_> = value.split(',').collect();
-    if parts.len() > maximum {
-        return Err(format!(
-            "batch receipt query contains {} identifiers; maximum is {maximum}",
-            parts.len()
-        ));
-    }
-    parts
-        .into_iter()
-        .map(|value| ReceiptId::from_str(value).map_err(|_| format!("invalid receipt identifier {value:?}")))
-        .collect()
-}
-
-async fn write_receipt_record(session: &mut Session, record: ReceiptRecord) -> pingora::Result<()> {
-    let response = ReceiptResponse::from_record(record).map_err(|cause| {
-        Error::explain(
-            ErrorType::HTTPStatus(500),
-            format!("persisted receipt could not be rendered: {cause}"),
-        )
-    })?;
-    write_json(session, StatusCode::OK, &response).await
-}
-
-async fn write_receipt_store_error(
-    session: &mut Session,
-    kind: ReceiptErrorKind,
-    message: &str,
-) -> pingora::Result<()> {
-    let (status, code) = match kind {
-        ReceiptErrorKind::RequestTooLarge | ReceiptErrorKind::InvalidConfiguration => {
-            (StatusCode::BAD_REQUEST, ErrorCode::ReceiptTransitionInvalid)
-        }
-        ReceiptErrorKind::NotFound => (StatusCode::NOT_FOUND, ErrorCode::ReceiptNotFound),
-        ReceiptErrorKind::Conflict | ReceiptErrorKind::Fenced | ReceiptErrorKind::Draining => {
-            (StatusCode::CONFLICT, ErrorCode::ReceiptTransitionInvalid)
-        }
-        ReceiptErrorKind::Database => (StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Internal),
-        ReceiptErrorKind::CorruptState => (StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal),
-        _ => (StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal),
-    };
-    write_api_error(session, status, code, message).await
-}
-
-async fn write_api_error(
-    session: &mut Session,
-    status: StatusCode,
-    code: ErrorCode,
-    message: &str,
-) -> pingora::Result<()> {
-    write_json(
-        session,
-        status,
-        &ApiErrorResponse {
-            error: public_error(code, message),
-        },
-    )
-    .await
-}
-
-fn public_error(code: ErrorCode, message: &str) -> ErrorStatus {
-    match ErrorStatus::new(code, sanitize_public_message(message)) {
-        Ok(error) => error,
-        Err(_) => match ErrorStatus::new(ErrorCode::Internal, "internal router error") {
-            Ok(error) => error,
-            Err(_) => unreachable!("static public error is valid"),
-        },
-    }
-}
-
 fn sanitize_public_message(message: &str) -> String {
     let mut output: String = message
         .chars()
@@ -919,25 +728,6 @@ fn auth_grpc_status(kind: AuthFailureKind) -> u16 {
     }
 }
 
-fn auth_http_status(kind: AuthFailureKind) -> StatusCode {
-    match kind {
-        AuthFailureKind::Forbidden => StatusCode::FORBIDDEN,
-        AuthFailureKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
-        AuthFailureKind::Missing | AuthFailureKind::Invalid | AuthFailureKind::ForgedInternalIdentity => {
-            StatusCode::UNAUTHORIZED
-        }
-    }
-}
-
-fn auth_error_code(kind: AuthFailureKind) -> ErrorCode {
-    match kind {
-        AuthFailureKind::Missing => ErrorCode::AuthenticationMissing,
-        AuthFailureKind::Forbidden => ErrorCode::AuthenticationForbidden,
-        AuthFailureKind::Invalid | AuthFailureKind::ForgedInternalIdentity => ErrorCode::AuthenticationInvalid,
-        AuthFailureKind::Internal => ErrorCode::Internal,
-    }
-}
-
 fn now_unix_millis() -> anyhow::Result<UnixMillis> {
     let millis = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
     Ok(UnixMillis::new(u64::try_from(millis)?)?)
@@ -958,67 +748,6 @@ struct ReadinessResponse {
 struct CapabilitiesResponse {
     protocol_version: u16,
     transparent_flight_data: bool,
-    receipt_status: bool,
-    bounded_receipt_batch: usize,
     flight_sql_control_metadata: &'static str,
     identity_propagation: &'static str,
-}
-
-#[derive(Serialize)]
-struct ApiErrorResponse {
-    error: ErrorStatus,
-}
-
-#[derive(Serialize)]
-struct ReceiptResponse {
-    status: ReceiptStatus,
-    purge_allowed: bool,
-}
-
-impl ReceiptResponse {
-    fn from_record(record: ReceiptRecord) -> arrowcol_receipts::ReceiptResult<Self> {
-        let purge_allowed = record.can_client_purge();
-        Ok(Self {
-            status: record.protocol_status()?,
-            purge_allowed,
-        })
-    }
-}
-
-#[derive(Serialize)]
-struct ReceiptBatchResponse {
-    receipts: Vec<ReceiptBatchEntry>,
-}
-
-#[derive(Serialize)]
-struct ReceiptBatchEntry {
-    receipt_id: ReceiptId,
-    found: bool,
-    purge_allowed: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    status: Option<ReceiptStatus>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<ErrorStatus>,
-}
-
-impl ReceiptBatchEntry {
-    fn from_record(receipt_id: ReceiptId, record: ReceiptRecord) -> Self {
-        let purge_allowed = record.can_client_purge();
-        match record.protocol_status() {
-            Ok(status) => Self {
-                receipt_id,
-                found: true,
-                purge_allowed,
-                status: Some(status),
-                error: None,
-            },
-            Err(cause) => Self {
-                receipt_id,
-                found: true,
-                purge_allowed: false,
-                status: None,
-                error: Some(public_error(ErrorCode::Internal, cause.message())),
-            },
-        }
-    }
 }

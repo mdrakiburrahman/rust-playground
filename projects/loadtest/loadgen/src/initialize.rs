@@ -50,31 +50,29 @@ fn checked_root(raw: &str, account: &str, container: &str) -> Result<Url> {
 fn entries() -> Result<Vec<(ManifestEntry, Arc<Schema>)>> {
     let parser = DdlParser::default();
     let mut entries = Vec::new();
-    for pool in ["direct", "dataflow"] {
-        for statement in schema_statements()? {
-            let DdlCommand::CreateTable(create) = parser.parse(&statement.ddl)? else {
-                bail!("canonical fixture contains a non-CREATE statement");
-            };
-            let mut fields = create
-                .fields()
-                .iter()
-                .map(arrowcol_catalog::CatalogField::to_arrow)
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            fields.push(Field::new(INGESTION, DataType::Utf8, false));
-            let identity = statement.identity;
-            entries.push((
-                ManifestEntry {
-                    name: format!("{pool}_{}", identity.table()),
-                    relative_path: format!(
-                        "{pool}/{}/{}/{}",
-                        identity.catalog(),
-                        identity.schema(),
-                        identity.table()
-                    ),
-                },
-                Arc::new(Schema::new(fields)),
-            ));
-        }
+    for statement in schema_statements()? {
+        let DdlCommand::CreateTable(create) = parser.parse(&statement.ddl)? else {
+            bail!("canonical fixture contains a non-CREATE statement");
+        };
+        let mut fields = create
+            .fields()
+            .iter()
+            .map(arrowcol_catalog::CatalogField::to_arrow)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        fields.push(Field::new(INGESTION, DataType::Utf8, false));
+        let identity = statement.identity;
+        entries.push((
+            ManifestEntry {
+                name: format!("dataflow_{}", identity.table()),
+                relative_path: format!(
+                    "dataflow/{}/{}/{}",
+                    identity.catalog(),
+                    identity.schema(),
+                    identity.table()
+                ),
+            },
+            Arc::new(Schema::new(fields)),
+        ));
     }
     Ok(entries)
 }
@@ -223,28 +221,24 @@ mod tests {
     }
 
     #[test]
-    fn both_pools_use_raw_registry_and_required_partition() -> Result<()> {
+    fn dataflow_uses_raw_registry_and_required_partition() -> Result<()> {
         let entries = entries()?;
-        assert_eq!(entries.len(), 26);
+        assert_eq!(entries.len(), 13);
         let names = entries
             .iter()
             .map(|(entry, _)| &entry.name)
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(names.len(), 26);
+        assert_eq!(names.len(), 13);
         for (index, (entry, schema)) in entries.into_iter().enumerate() {
-            assert!(
-                entry.relative_path.starts_with("direct/telemetry/sqlserver/")
-                    || entry.relative_path.starts_with("dataflow/telemetry/sqlserver/")
-            );
+            assert!(entry.relative_path.starts_with("dataflow/telemetry/sqlserver/"));
             assert_eq!(schema.field(0).name(), "customer_id");
             let field = schema.field_with_name(INGESTION)?;
             assert!(!field.is_nullable());
             assert_eq!(field.data_type(), &DataType::Utf8);
-            assert_eq!(schema.fields().len(), schema_statements()?[index % 13].field_count + 1);
+            assert_eq!(schema.fields().len(), schema_statements()?[index].field_count + 1);
         }
         Ok(())
     }
-
     #[test]
     fn root_is_bounded_to_configured_account_and_container() -> Result<()> {
         let base = "abfss://tables@account.dfs.core.windows.net/sandbox";

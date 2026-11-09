@@ -25,7 +25,8 @@ import { startQapObserver } from './qap-observer.js';
 import { readStressPlan, runStressDriver, stressInputBudget } from './stress-driver.js';
 import { LocalStressRuntime } from './stress-runtime.js';
 import {
-  benchmarkComposeFiles, benchmarkQuiver, buildBenchmarkComposeOverride, buildBenchmarkRuntimeConfigs, dataflowConfigFile,
+  benchmarkComposeFiles, benchmarkQuiver, buildBenchmarkComposeOverride, buildBenchmarkRuntimeConfigs,
+  buildLocalLoadgenEndpoints, dataflowConfigFile,
 } from './runtime-config.js';
 import { acquireBenchmarkController, discardUnsealedAttempts, requirePreviousAttemptEvidence, resetBenchmark, stopBenchmark, stopReceipt, type BenchmarkController } from './lifecycle.js';
 import { azureTargets, modeEnvironment, stageAzureCliConfig, type AzureTargets } from './mode.js';
@@ -67,11 +68,15 @@ export function mapHostPath(localPath: string, mounts: unknown): string {
   return path.join(binding.Source, path.relative(binding.Destination, localPath));
 }
 
+function runnerUsesComposeNetwork(): boolean {
+  return existsSync('/.dockerenv') || Boolean(process.env.REMOTE_CONTAINERS_IPC);
+}
+
 function hostWorkspace(): string {
   if (process.env.LOADTEST_HOST_WORKSPACE) {
     return path.resolve(process.env.LOADTEST_HOST_WORKSPACE);
   }
-  if (!existsSync('/.dockerenv') && !process.env.REMOTE_CONTAINERS_IPC) {
+  if (!runnerUsesComposeNetwork()) {
     return workspace;
   }
   const mounts: unknown = JSON.parse(run('docker', ['inspect', '--format', '{{json .Mounts}}', hostname()]));
@@ -203,39 +208,24 @@ function stageHelperBinaries(): string {
   return destination;
 }
 
-function writeDirectConfig(directory: string, service: string, network: BenchmarkNetwork, quiver: boolean, azure?: AzureTargets, privateEnv?: NodeJS.ProcessEnv): void {
-  const state = path.join(directory, `direct-state-${service.split('-')[1]}`);
-  mkdirSync(state, { recursive: true });
-  const generationFile = path.join(state, 'generation');
-  const previous = existsSync(generationFile)
-    ? Number(readFileSync(generationFile, 'utf8').trim())
-    : 0;
-  if (!Number.isSafeInteger(previous) || previous < 0 || previous >= 2_147_483_646) {
-    throw new Error(`Invalid persisted direct collector generation for ${service}`);
-  }
-  const generation = previous + 1;
-  const address = network.direct;
-  const template = readFileSync(path.join(workspace, 'projects/loadtest/config/direct.yaml.tmpl'), 'utf8');
-  const runtime = buildBenchmarkRuntimeConfigs(template,
-    readFileSync(path.join(workspace, dataflowConfigFile(quiver)), 'utf8'),
-    { instanceKey: `loadtest-${service}`, advertisedEndpoint: `${address}:50051`, generation },
-    { quiver, mode: azure ? 'azure' : 'local', azure });
-  writeFileSync(path.join(state, 'direct.yaml'), runtime.directYaml);
+function writeDataflowConfig(directory: string, quiver: boolean, azure?: AzureTargets, privateEnv?: NodeJS.ProcessEnv): void {
   const dataflowState = path.join(directory, 'dataflow-state-1');
   mkdirSync(dataflowState, { recursive: true });
+  const runtime = buildBenchmarkRuntimeConfigs(
+    readFileSync(path.join(workspace, dataflowConfigFile(quiver)), 'utf8'),
+    { quiver, mode: azure ? 'azure' : 'local', azure },
+  );
   writeFileSync(path.join(dataflowState, 'dataflow.yaml'), runtime.dataflowYaml);
   writeFileSync(path.join(directory, 'router-state/compose-runtime.json'),
-    `${buildBenchmarkComposeOverride(hostPath(directory), { quiver, ...(azure ? {
+    buildBenchmarkComposeOverride(hostPath(directory), { quiver, ...(azure ? {
       mode: 'azure', azure, azureConfigHostDirectory: hostPath(path.join(directory, 'azure-cli')), azureEnvironment: privateEnv,
-    } : {}) })}\n`);
-  writeFileSync(generationFile, `${generation}\n`);
+    } : {}) }) + String.fromCharCode(10));
 }
 
-function writeRuntimeConfigs(directory: string, network: BenchmarkNetwork, quiver: boolean, azure?: AzureTargets, privateEnv?: NodeJS.ProcessEnv): void {
-  writeDirectConfig(directory, 'direct-1', network, quiver, azure, privateEnv);
+function writeRuntimeConfigs(directory: string, quiver: boolean, azure?: AzureTargets, privateEnv?: NodeJS.ProcessEnv): void {
+  writeDataflowConfig(directory, quiver, azure, privateEnv);
   writeRouterConfig(directory, 500);
 }
-
 function writeRouterConfig(directory: string, refreshIntervalMs: number): void {
   const config = readFileSync(path.join(workspace, 'projects/loadtest/config/router.yaml'), 'utf8')
     .replace(/refresh_interval_ms: [0-9]+/u, `refresh_interval_ms: ${refreshIntervalMs}`);
@@ -260,14 +250,12 @@ function benchmarkEnvironment(
     ...privateEnv,
     ARROWCOL_MODE: options.mode,
     ARROWCOL_PARTITION_GRANULARITY: 'minute',
-    LOADTEST_DIRECT_DELTA_ROOT: azure?.directRoot ?? '/delta/direct',
     LOADTEST_DATAFLOW_DELTA_ROOT: azure?.dataflowRoot ?? '/delta/dataflow',
     ...(azure ? {
       ARROWCOL_AZURE_TABLE_ROOT: azure.root,
-      LOADTEST_DIRECT_ROOT: azure.directRoot,
       LOADTEST_DATAFLOW_ROOT: azure.dataflowRoot,
-      LOADTEST_MAINTENANCE_ROOT: `${azure.directRoot}/telemetry/sqlserver/`,
-      LOADTEST_TENANT_SOURCE: `${azure.directRoot}/telemetry/sqlserver/sqlserver_cpu_utilization`,
+      LOADTEST_MAINTENANCE_ROOT: `${azure.dataflowRoot}/telemetry/sqlserver/`,
+      LOADTEST_TENANT_SOURCE: `${azure.dataflowRoot}/telemetry/sqlserver/sqlserver_cpu_utilization`,
       LOADTEST_TENANT_TARGET: `${azure.tenantRoot}/sqlserver_cpu_utilization`,
       LOADTEST_TENANT_CHECKPOINT: `${azure.checkpointRoot}/tenant-cpu`,
       AZURE_USE_AZURE_CLI: 'true',
@@ -283,7 +271,7 @@ function benchmarkEnvironment(
     LOADTEST_LANES: String(options.concurrency),
     LOADTEST_BATCH_ROWS: String(options.batchRows),
     LOADTEST_SEED: String(options.seed),
-    LOADTEST_SCENARIOS: 'paired',
+    LOADTEST_SCENARIOS: 'dataflow',
     LOADTEST_QUIVER: String(options.quiver),
     // The crash demo keeps retrying through the collector outage instead of exhausting attempts.
     ...(options.crashAfterSeconds === undefined ? {} : { LOADTEST_RETRY_WINDOW: '5m' }),
@@ -293,9 +281,7 @@ function benchmarkEnvironment(
     LOADTEST_BIN_HOST_PATH: hostPath(binaryDirectory),
     LOADTEST_SUBNET: network.subnet,
     LOADTEST_SQL_IP: network.sql,
-    LOADTEST_HIVE_IP: network.hive,
     LOADTEST_ROUTER_IP: network.router,
-    LOADTEST_DIRECT_1_IP: network.direct,
     LOADTEST_DATAFLOW_1_IP: network.dataflow,
     LOADTEST_KUSTO_IP: network.kusto,
     LOADTEST_KUSTO_EXPLORER_IP: network.kustoExplorer,
@@ -306,7 +292,6 @@ function benchmarkEnvironment(
     SQLSERVER_SA_PASSWORD_FILE: hostPath(path.join(infra, 'sqlserver-sa-password.txt')),
     ARROWCOL_APP_PASSWORD_FILE: hostPath(path.join(infra, 'arrowcol-app-password.txt')),
     ARROWCOL_MIGRATOR_PASSWORD_FILE: hostPath(path.join(infra, 'arrowcol-migrator-password.txt')),
-    HIVE_METASTORE_PASSWORD_FILE: hostPath(path.join(infra, 'hive-metastore-password.txt')),
   };
 }
 
@@ -323,9 +308,7 @@ interface BenchmarkContext {
 export interface BenchmarkNetwork {
   subnet: string;
   sql: string;
-  hive: string;
   router: string;
-  direct: string;
   dataflow: string;
   kusto: string;
   kustoExplorer: string;
@@ -333,9 +316,15 @@ export interface BenchmarkNetwork {
 }
 
 export const benchmarkCoreServices = [
-  'sqlserver', 'database-bootstrap', 'arrowcol-migrate', 'hive-schema', 'hive-metastore',
-  'lgtm', 'cadvisor', 'portainer', 'direct-1', 'dataflow-1', 'router',
+  'sqlserver', 'arrowcol-catalog', 'lgtm', 'cadvisor', 'portainer', 'dataflow-1', 'router',
 ];
+
+export const benchmarkStartupCommands = [
+  ['--profile', 'benchmark', 'up', '--detach', '--no-build', '--wait', '--wait-timeout', '600', 'sqlserver'],
+  ['--profile', 'benchmark', 'run', '--rm', '--no-deps', 'database-bootstrap'],
+  ['--profile', 'benchmark', 'run', '--rm', '--no-deps', 'arrowcol-migrate'],
+  ['--profile', 'benchmark', 'up', '--detach', '--no-build', '--wait', '--wait-timeout', '600', ...benchmarkCoreServices],
+] as const;
 
 function cidrRange(value: string): [number, number] | undefined {
   const match = /^(\d+)\.(\d+)\.(\d+)\.(\d+)\/(\d+)$/u.exec(value);
@@ -366,8 +355,8 @@ function selectBenchmarkNetwork(): BenchmarkNetwork {
     const range = cidrRange(subnet)!;
     if (used.some(([start, end]) => range[0] <= end && start <= range[1])) continue;
     return {
-      subnet, sql: `${base}.2`, hive: `${base}.3`, router: `${base}.10`,
-      direct: `${base}.21`, dataflow: `${base}.31`,
+      subnet, sql: `${base}.2`, router: `${base}.10`,
+      dataflow: `${base}.31`,
       kusto: `${base}.50`, kustoExplorer: `${base}.51`, playwright: `${base}.52`,
     };
   }
@@ -408,19 +397,20 @@ export function localLoadgenEnvironment(
 ): NodeJS.ProcessEnv {
   const secrets = path.join(workspace, 'projects/loadtest/.temp/secrets/latest');
   const infra = path.join(workspace, 'projects/arrowcol-infra/secrets');
+  const endpoints = buildLocalLoadgenEndpoints(context.network, runnerUsesComposeNetwork() ? 'compose' : 'host', {
+    router: context.env.LOADTEST_ROUTER_PORT ?? '15050',
+    catalog: context.env.LOADTEST_CATALOG_PORT ?? '18817',
+  });
   return {
     ...context.env,
     ...(context.options.mode === 'azure' ? { AZURE_CONFIG_DIR: path.join(context.directory, 'azure-cli/loadgen') } : {}),
     LOADTEST_RESULTS: results,
-    LOADTEST_DIRECT_ROOT: context.options.mode === 'azure' ? context.env.LOADTEST_DIRECT_ROOT : path.join(context.directory, 'direct'),
     LOADTEST_DATAFLOW_ROOT: context.options.mode === 'azure' ? context.env.LOADTEST_DATAFLOW_ROOT : path.join(context.directory, 'dataflow'),
-    LOADTEST_ROUTER_ENDPOINT: `http://${context.network.router}:50050`,
-    LOADTEST_CATALOG_ENDPOINT: `http://${context.network.direct}:50051`,
-    LOADTEST_RECEIPT_ENDPOINT: `http://${context.network.router}:50050`,
+    LOADTEST_ROUTER_ENDPOINT: endpoints.router,
+    LOADTEST_CATALOG_ENDPOINT: endpoints.catalog,
     LOADTEST_EDGE_SECRET_FILE: path.join(secrets, 'edge-hmac.txt'),
     LOADTEST_INTERNAL_SECRET_FILE: path.join(secrets, 'internal-hmac.txt'),
     LOADTEST_SCRATCH_ROOT: 'projects/loadtest/.temp/loadgen/latest',
-    LOADTEST_DIRECT_ADMIN_ENDPOINTS: `http://${context.network.direct}:8081`,
     LOADTEST_DATAFLOW_ADMIN_ENDPOINTS: `http://${context.network.dataflow}:32011`,
     LOADTEST_KUSTO_ENDPOINT: context.options.mode === 'azure' ? context.env.AZURE_KUSTO_URI : `http://${context.network.kusto}:8080`,
     ARROWCOL_SQL_HOST: context.network.sql,
@@ -485,24 +475,16 @@ export function sqlserverAccess(port: string, passwordFile: string): string {
 
 export function quiverLocations(directory: string): string {
   const root = path.resolve(directory);
-  return [
-    'Quiver write-ahead logs and segments on disk (workspace paths)',
+  return ['Quiver write-ahead logs and segments on disk (workspace paths)',
     '-------------------------------------------------------------',
-    `  Direct:   ${path.join(root, benchmarkQuiver.directHostDirectory)}`,
-    `  Dataflow: ${path.join(root, benchmarkQuiver.dataflowHostDirectory)}`,
-  ].join('\n');
+    '  Dataflow: ' + path.join(root, benchmarkQuiver.dataflowHostDirectory)].join(String.fromCharCode(10));
 }
 
 export function deltaTableLocations(directory: string): string {
   const root = path.resolve(directory);
-  return [
-    'Delta tables on disk (workspace paths)',
-    '-------------------------------------',
-    `  Direct:   ${path.join(root, 'direct')}`,
-    `  Dataflow: ${path.join(root, 'dataflow')}`,
-  ].join('\n');
+  return ['Delta tables on disk (workspace paths)', '-------------------------------------',
+    '  Dataflow: ' + path.join(root, 'dataflow')].join(String.fromCharCode(10));
 }
-
 async function reconcileAzure(context: BenchmarkContext, occupancyId: string): Promise<void> {
   const manifest = path.join(context.directory, 'router-state/azure-tables.json');
   run(path.join(cargoTargetDirectory(), 'debug/arrowcol-loadgen'), ['azure-manifest', '--manifest', manifest], context.env);
@@ -555,9 +537,8 @@ async function benchmark(
   controller.checkRunning();
   step('Bootstrapping secrets and preparing benchmark');
   for (const child of [
-    'direct', 'dataflow', 'tenant', 'tenant-checkpoints', 'otel', 'results', 'router-state',
-    'direct-state-1',
-    ...(options.quiver ? [benchmarkQuiver.directHostDirectory, benchmarkQuiver.dataflowHostDirectory] : []),
+    'dataflow', 'catalog-state', 'tenant', 'tenant-checkpoints', 'otel', 'results', 'router-state',
+    ...(options.quiver ? [benchmarkQuiver.dataflowHostDirectory] : []),
   ]) {
     mkdirSync(path.join(directory, child), { recursive: true });
   }
@@ -570,7 +551,7 @@ async function benchmark(
     mkdirSync(path.join(workspace, 'projects/loadtest/.temp'), { recursive: true });
     network = selectBenchmarkNetwork();
     if (azure) stageAzureCliConfig(directory, privateEnv);
-    writeRuntimeConfigs(directory, network, options.quiver, azure, privateEnv);
+    writeRuntimeConfigs(directory, options.quiver, azure, privateEnv);
     writeFileSync(path.join(directory, 'router-state/network.json'), `${JSON.stringify(network, null, 2)}\n`);
     env = benchmarkEnvironment(directory, options, network, stageHelperBinaries(), privateEnv, azure);
   } catch (error) {
@@ -593,16 +574,19 @@ async function benchmark(
     writeProvenance(workspace, directory, project, options, env, path.join(cargoTargetDirectory(), 'debug'));
     compose(project, env, ['--profile', 'benchmark', 'config', '--quiet']);
     phase = 'image-build';
-    step('Building sqlserver and hive-metastore images (can take several minutes on first run)');
+    step('Building the SQL Server routing-store image (can take several minutes on first run)');
     composeInteractive(project, env, [
-      '--profile', 'benchmark', 'build', 'sqlserver', 'hive-metastore',
+      '--profile', 'benchmark', 'build', 'sqlserver',
     ], 3_600_000);
     controller.checkRunning();
     phase = 'stack-start';
-    step(`Starting ${services.length} services and waiting for health (up to 10 minutes)`);
-    composeInteractive(project, env, [
-      '--profile', 'benchmark', 'up', '--detach', '--no-build', '--wait', '--wait-timeout', '600', ...services,
-    ], 3_600_000);
+    step('Starting SQL Server and waiting for health (up to 10 minutes)');
+    composeInteractive(project, env, [...benchmarkStartupCommands[0]], 3_600_000);
+    step('Bootstrapping routing databases and applying migrations');
+    composeInteractive(project, env, [...benchmarkStartupCommands[1]], 3_600_000);
+    composeInteractive(project, env, [...benchmarkStartupCommands[2]], 3_600_000);
+    step('Starting ' + services.length + ' long-running services and waiting for health');
+    composeInteractive(project, env, [...benchmarkStartupCommands[3]], 3_600_000);
     controller.checkRunning();
     workspaceConnection = connectWorkspaceContainer(project, env);
     if (!azure && options.validate) stackSql = sqlIdentity(workspace, args => run('docker', args));
@@ -635,7 +619,6 @@ async function benchmark(
     phase = 'sampler-start';
     stopSampler = await startResourceSampler({
       project, results: path.join(directory, 'results'),
-      directAdmin: `http://${network.direct}:8081`,
       dataflowAdmin: `http://${network.dataflow}:32011`,
     });
     if (options.validate) {
@@ -666,11 +649,10 @@ async function benchmark(
     phase = 'load-generation';
     step('Running load generator (Ctrl+C to stop; stack is kept)');
     const loadEnded = new AbortController();
-    const crashEndpoints = { direct: `http://${network.direct}:8081`, dataflow: `http://${network.dataflow}:32011` };
+    const crashEndpoints = { dataflow: `http://${network.dataflow}:32011` };
     let killedPublishers: KilledPublishers | undefined;
     const crash = options.crashAfterSeconds === undefined ? undefined : runQuiverCrash({
       crashAfterSeconds: options.crashAfterSeconds,
-      directAdmin: `http://${network.direct}:8081`,
       dataflowAdmin: `http://${network.dataflow}:32011`,
       results: path.join(directory, 'results'),
       kill: async () => {
@@ -678,16 +660,15 @@ async function benchmark(
           workspace, results: path.join(directory, 'results'), endpoints: crashEndpoints,
           docker: args => run('docker', args, env),
           kill: async () => {
-            await composeAsync(project, env, ['--profile', 'benchmark', 'kill', '--signal', 'SIGKILL', 'direct-1', 'dataflow-1']);
+            await composeAsync(project, env, ['--profile', 'benchmark', 'kill', '--signal', 'SIGKILL', 'dataflow-1']);
           },
         });
       },
       restart: async () => {
-        // A restarted Direct process is a new receipt-owner generation that adopts its predecessor's receipts.
-        writeDirectConfig(directory, 'direct-1', network, true, azure, privateEnv);
+        writeDataflowConfig(directory, true, azure, privateEnv);
         await composeAsync(project, env, [
           '--profile', 'benchmark', 'up', '--detach', '--no-build', '--no-deps', '--wait', '--wait-timeout', '300',
-          'direct-1', 'dataflow-1',
+          'dataflow-1',
         ], 360_000);
         assert(killedPublishers, 'Missing exact killed collector identities');
         await recordQuiverSuccessors({
@@ -704,13 +685,13 @@ async function benchmark(
     const stressRuntime = stressPlan ? new LocalStressRuntime({
       workspace, directory, project, env, composeFiles: benchmarkComposeFiles(composeFile, env),
       reader: path.join(cargoTargetDirectory(), 'debug/delta-inspect'),
-      directAdmin: `http://${network.direct}:8081`, dataflowAdmin: `http://${network.dataflow}:32011`,
+      dataflowAdmin: `http://${network.dataflow}:32011`,
       quiver: options.quiver, loadEnded: loadEnded.signal, checkRunning: () => controller.checkRunning(),
       fixture: stressPlan.fixture, windowSeconds: stressPlan.durationSeconds,
       sampleTimeoutSeconds: stressPlan.sampleTimeoutSeconds, measureSeconds: options.measureSeconds,
       privateScratch: path.join(workspace, 'projects/loadtest/.temp/loadgen/latest/diagnostics'),
       physicalRoots: Object.fromEntries([
-        'direct', 'dataflow', 'tenant', 'tenant-checkpoints', 'direct-state-1', 'dataflow-state-1', 'router-state',
+        'dataflow', 'catalog-state', 'tenant', 'tenant-checkpoints', 'dataflow-state-1', 'router-state',
       ].map(name => [name, path.join(directory, name)]).concat([
         ['loadgen-staging', path.join(workspace, 'projects/loadtest/.temp/loadgen/latest')],
       ])),
@@ -848,7 +829,7 @@ async function benchmark(
       })}\n`);
       throw error;
     }
-    step('Validated attempt evidence sealed privately; owned router stopped after qualification');
+    step('Validated attempt evidence sealed privately; owned catalog and router stopped after qualification');
   } else {
     step('Attempt remains unsealed; a subsequent reset is blocked to preserve its original data');
   }

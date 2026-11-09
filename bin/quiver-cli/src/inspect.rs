@@ -9,11 +9,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::pretty_format_batches;
-use arrowcol_buffer::DeliveryManifest;
 use clap::Args;
 use otel_arrow_dfe_quiver::inspect::{WalEntry, WalInspection, inspect_wal, wal_entry_batches};
 use otel_arrow_dfe_quiver::segment::SegmentReader;
 
+use crate::dfe::{DfeManifest, schema_description};
 use crate::dir::{DEFAULT_DIR, MARKER_FILE, SegmentFile, Subscriber, file_name, file_size, segment_files, subscribers};
 use crate::format::{self, Align, Table};
 
@@ -93,12 +93,17 @@ fn summaries(dir: &Path) -> Result<Vec<SegmentSummary>> {
         .collect())
 }
 
-/// Short description of bundle metadata: the table of an arrowcol.direct
-/// manifest, or the kind of an opaque manifest.
+/// Short description of DFE bundle metadata or an opaque manifest.
 fn describe_metadata(bytes: &[u8]) -> String {
-    match DeliveryManifest::decode(bytes) {
-        Ok(manifest) => manifest.table.table().to_string(),
-        Err(_) if bytes.starts_with(b"QPA") => "Dataflow pluggable-Arrow manifest".to_owned(),
+    match DfeManifest::decode(bytes) {
+        Ok(manifest) => format!(
+            "{}@{}.{} DFE bundle: {}",
+            manifest.representation,
+            manifest.major,
+            manifest.minor,
+            manifest.table_summary()
+        ),
+        Err(_) if bytes.starts_with(b"QPA") => "DFE pluggable-Arrow manifest".to_owned(),
         Err(_) => format!("{} bytes of opaque metadata", bytes.len()),
     }
 }
@@ -132,7 +137,8 @@ pub(crate) fn tree(args: &DirArgs) -> Result<()> {
     if !dir.join("wal").exists() && !cores.is_empty() {
         println!("{} holds one Quiver directory per Dataflow core:", dir.display());
         for core in &cores {
-            println!("  {core}/   quiver-cli tree {}", dir.join(core).display());
+            println!("  {core}/");
+            tree(&DirArgs { dir: dir.join(core) })?;
         }
         return Ok(());
     }
@@ -161,7 +167,7 @@ pub(crate) fn tree(args: &DirArgs) -> Result<()> {
             file_size(&subscriber.path),
             if segment_bundles == 0 {
                 format!(
-                    "progress of subscriber {}: nothing pending, acknowledged segments are deleted",
+                    "progress of subscriber {}: no readable segment bundles",
                     subscriber.name
                 )
             } else {
@@ -205,12 +211,12 @@ pub(crate) fn tree(args: &DirArgs) -> Result<()> {
         let replayable = wal.unconsumed().count();
         let meaning = if replayable == 0 {
             format!(
-                "cursor at {}: every entry is in a segment, nothing to replay",
+                "cursor at {}: every entry is checkpointed, nothing to replay",
                 format::count(cursor)
             )
         } else {
             format!(
-                "cursor at {}: {replayable} entries after it are WAL-only and replay on next open",
+                "cursor at {}: {replayable} uncheckpointed entries replay on next open",
                 format::count(cursor)
             )
         };
@@ -273,10 +279,10 @@ fn unknown_entries(dir: &Path, known: &BTreeSet<String>) -> Vec<String> {
 }
 
 pub(crate) fn segments(args: &DirArgs) -> Result<()> {
-    let dir = &args.dir;
-    require_dir(dir)?;
-    let segments = summaries(dir)?;
-    let subscribers = subscribers(dir)?;
+    let dir = crate::dir::resolve_core_dir(&args.dir)?;
+    require_dir(&dir)?;
+    let segments = summaries(&dir)?;
+    let subscribers = subscribers(&dir)?;
     let bundles = segments.iter().map(|segment| u64::from(segment.bundles)).sum::<u64>();
     let rows = segments.iter().map(|segment| segment.rows).sum::<u64>();
     println!(
@@ -287,7 +293,7 @@ pub(crate) fn segments(args: &DirArgs) -> Result<()> {
         format::count(rows)
     );
     if segments.is_empty() {
-        println!("  none yet: bundles are still in the open segment, which only the WAL holds");
+        println!("  no readable finalized segments found; inspect WAL for replay status");
         return Ok(());
     }
     println!();
@@ -350,10 +356,11 @@ fn acknowledgements(subscribers: &[Subscriber], segment: &SegmentSummary) -> Str
 }
 
 pub(crate) fn show(args: &ShowArgs) -> Result<()> {
-    require_dir(&args.dir)?;
+    let dir = crate::dir::resolve_core_dir(&args.dir)?;
+    require_dir(&dir)?;
     let (title, metadata, batches) = match args.wal {
-        Some(sequence) => wal_bundle(&args.dir, sequence)?,
-        None => segment_bundle(&args.dir, args.segment, args.bundle)?,
+        Some(sequence) => wal_bundle(&dir, sequence)?,
+        None => segment_bundle(&dir, args.segment, args.bundle)?,
     };
     let rows = batches.iter().map(|(_, batch)| batch.num_rows()).sum::<usize>();
     println!("{title}: {rows} rows");
@@ -422,33 +429,31 @@ fn print_metadata(metadata: Option<&[u8]>) {
         println!("no bundle metadata");
         return;
     };
-    let Ok(manifest) = DeliveryManifest::decode(bytes) else {
+    let Ok(manifest) = DfeManifest::decode(bytes) else {
         println!("bundle metadata: {}", describe_metadata(bytes));
         return;
     };
     println!(
-        "manifest ({}@{}, the bundle metadata a restarted collector publishes from)",
-        manifest.format, manifest.version
+        "manifest ({}@{}.{}, DFE durable_buffer pluggable Arrow)",
+        manifest.representation, manifest.major, manifest.minor
     );
-    println!("  table     {}  (table id {})", manifest.table, manifest.table_id);
+    let signal = match manifest.signal {
+        0 => "logs",
+        1 => "metrics",
+        2 => "traces",
+        _ => "unknown",
+    };
     println!(
-        "  schema    v{}, {}",
-        manifest.schema_version.get(),
-        format::fingerprint(manifest.schema_fingerprint.as_bytes())
+        "  signal    {signal}; {} root items",
+        format::count(manifest.root_items)
     );
-    println!(
-        "  receipt   {}  (revision {})",
-        manifest.receipt_id, manifest.receipt_revision
-    );
-    println!(
-        "  lease     {}  (owner {}, fencing epoch {})",
-        manifest.lease_id, manifest.owner_instance_id, manifest.fencing_token
-    );
-    println!(
-        "  size      {} rows, {} of Arrow memory",
-        format::count(manifest.rows),
-        format::bytes(manifest.arrow_memory_bytes)
-    );
+    for table in &manifest.tables {
+        let schema = schema_description(&table.schema_id)
+            .map(|(identity, version)| format!("{identity} v{version}"))
+            .unwrap_or_else(|| table.schema_id.clone());
+        println!("  table     {} (id {}, slot {})", schema, table.table_id, table.slot);
+        println!("  schema    {}", format::fingerprint(&table.fingerprint));
+    }
 }
 
 fn project(batch: &RecordBatch, columns: &[String]) -> Result<RecordBatch> {
@@ -465,16 +470,17 @@ fn project(batch: &RecordBatch, columns: &[String]) -> Result<RecordBatch> {
 
 fn state(entry: &WalEntry) -> &'static str {
     if entry.consumed {
-        "in a segment"
+        "checkpointed: not replayed"
     } else {
         "WAL only: replays on next open"
     }
 }
 
 pub(crate) fn wal(args: &WalArgs) -> Result<()> {
-    require_dir(&args.dir)?;
-    let wal = inspect_wal(&args.dir)?;
-    print_wal(&args.dir, &wal, args.last)
+    let dir = crate::dir::resolve_core_dir(&args.dir)?;
+    require_dir(&dir)?;
+    let wal = inspect_wal(&dir)?;
+    print_wal(&dir, &wal, args.last)
 }
 
 fn print_wal(dir: &Path, wal: &WalInspection, last: usize) -> Result<()> {
@@ -508,14 +514,14 @@ fn print_wal(dir: &Path, wal: &WalInspection, last: usize) -> Result<()> {
     println!();
     match wal.cursor_position {
         Some(cursor) => println!(
-            "  cursor at {}: entries before it are in segments; entries after it replay on next open",
+            "  cursor at {}: entries ending at or before it are checkpointed and skipped during replay; later entries replay on next open",
             format::count(cursor)
         ),
-        None => println!("  no cursor yet: no segment was finalized, so every entry replays on next open"),
+        None => println!("  no cursor: every entry replays on next open"),
     }
     let replayable = wal.unconsumed().count();
     println!(
-        "  {} in segments, {replayable} WAL only",
+        "  {} checkpointed, {replayable} WAL only",
         wal.entries.len() - replayable
     );
     println!();

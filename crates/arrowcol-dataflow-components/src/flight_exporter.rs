@@ -308,10 +308,9 @@ mod tests {
     use arrow_array::{ArrayRef, Int64Array, StringArray};
     use arrowcol_catalog::{
         CatalogControlPlane, CatalogStore, DdlParser, FlightSqlDdlHandler, FlightSqlDdlRequest, MemoryCatalogStore,
-        MemoryMetastore,
     };
     use arrowcol_flight::{ArrowColFlightService, BatchAdmission};
-    use arrowcol_protocol::{CollectorInstanceId, FencingToken, LeaseId, ReceiptId};
+    use arrowcol_protocol::{CollectorInstanceId, FencingToken, LeaseId, PublicationId};
     use arrowcol_routing::{LeaseKey, MemoryRoutingStore, RoutingStore};
     use otel_arrow_dfe_pdata::OtapPayload;
     use tokio_stream::wrappers::TcpListenerStream;
@@ -336,7 +335,6 @@ mod tests {
         let control = Arc::new(CatalogControlPlane::new(
             DdlParser::default(),
             Arc::clone(&catalog) as Arc<dyn CatalogStore>,
-            Arc::new(MemoryMetastore::new()),
         ));
         let routing = Arc::new(MemoryRoutingStore::default());
         let instance_id = CollectorInstanceId::new();
@@ -383,11 +381,7 @@ mod tests {
 
     async fn upstream_table(ddl: &str) -> Result<(TableIdentity, Arc<arrow_schema::Schema>)> {
         let catalog = Arc::new(MemoryCatalogStore::new());
-        let control = CatalogControlPlane::new(
-            DdlParser::default(),
-            Arc::clone(&catalog) as Arc<dyn CatalogStore>,
-            Arc::new(MemoryMetastore::new()),
-        );
+        let control = CatalogControlPlane::new(DdlParser::default(), Arc::clone(&catalog) as Arc<dyn CatalogStore>);
         let completion = control.execute_ddl(FlightSqlDdlRequest::new(ddl)).await?;
         let current = catalog
             .current_schema(completion.identity())
@@ -407,7 +401,7 @@ mod tests {
             ],
         )?;
         let envelope = ArrowcolBatchEnvelope {
-            publication_id: Some(ReceiptId::new()),
+            publication_id: Some(PublicationId::new()),
             ingested_at_ms: None,
             table: table.clone(),
             source_schema_version: SchemaVersion::FIRST,
@@ -444,7 +438,7 @@ mod tests {
     #[tokio::test]
     async fn forwards_batches_with_replayed_ddl_to_downstream_collector() -> Result<()> {
         let (table, schema) =
-            upstream_table("CREATE TABLE chain.forward.events (id BIGINT NOT NULL, body VARCHAR)").await?;
+            upstream_table("CREATE TABLE chain.forward.events (id BIGINT NOT NULL, body STRING) USING DELTA").await?;
         let downstream = downstream().await?;
         let (mut exporter, mut client) = exporter(&downstream.endpoint)?;
 
@@ -491,7 +485,8 @@ mod tests {
     /// Guarantees: forwarding fails permanently instead of retrying forever.
     #[tokio::test]
     async fn unknown_local_table_is_a_permanent_failure() -> Result<()> {
-        let (_, schema) = upstream_table("CREATE TABLE chain.known.events (id BIGINT NOT NULL, body VARCHAR)").await?;
+        let (_, schema) =
+            upstream_table("CREATE TABLE chain.known.events (id BIGINT NOT NULL, body STRING) USING DELTA").await?;
         let unknown = TableIdentity::new(
             arrowcol_protocol::CatalogName::new("chain")?,
             arrowcol_protocol::SchemaName::new("unknown")?,

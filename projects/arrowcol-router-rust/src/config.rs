@@ -24,7 +24,7 @@ pub struct Cli {
 pub struct RouterConfig {
     /// Listener and process lifecycle settings.
     pub server: ServerConfig,
-    /// SQL Server application database.
+    /// SQL Server database for routing registrations, pressure, and fenced leases.
     pub sql_server: SqlServerConfig,
     /// Routing and pressure policy.
     pub routing: RoutingConfig,
@@ -32,8 +32,6 @@ pub struct RouterConfig {
     pub auth: AuthConfig,
     /// Upstream HTTP/2 transport settings.
     pub upstream: UpstreamConfig,
-    /// Receipt API bounds.
-    pub receipts: ReceiptApiConfig,
     /// Logging settings.
     pub telemetry: TelemetryConfig,
 }
@@ -117,10 +115,6 @@ impl RouterConfig {
                 && self.server.h2.stream_window_bytes > 0
                 && self.server.h2.connection_window_bytes >= self.server.h2.stream_window_bytes,
             "downstream H2 stream/window bounds are invalid"
-        );
-        ensure!(
-            self.receipts.max_batch_size > 0 && self.receipts.max_batch_size <= 512,
-            "receipts.max_batch_size must be in 1..=512"
         );
         match self.auth.authenticator.as_str() {
             "allow_all" => {}
@@ -273,14 +267,6 @@ pub struct UpstreamConfig {
     pub idle_timeout_seconds: u64,
     /// Optional H2 ping interval.
     pub ping_interval_seconds: Option<u64>,
-}
-
-/// Receipt query API limits.
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReceiptApiConfig {
-    /// Maximum IDs in one status query.
-    pub max_batch_size: usize,
 }
 
 /// Router logging configuration.

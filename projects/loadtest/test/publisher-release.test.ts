@@ -33,22 +33,27 @@ function fixture(t: TestContext) {
   });
   const docker = (args: string[]): string => {
     if (args[0] === 'inspect' && args[2] === '{{.State.StartedAt}}') return writerStartedAt;
-    if (args[0] === 'ps') return args.includes('--filter') ? 'sql-id' : 'direct-id\ndataflow-id';
+    if (args[0] === 'ps') return args.includes('--filter') ? 'sql-id' : 'dataflow-id';
     if (args[0] === 'inspect' && args[1] !== '--format') return JSON.stringify([{
       Id: 'a'.repeat(64), Image: 'sha256:sql', Config: { Labels: labels('sqlserver') },
       State: { Running: true, StartedAt: generation },
     }]);
-    const service = args.at(-1) === 'direct-id' ? 'direct-1' : 'dataflow-1';
+    const service = args.at(-1) === 'dataflow-id' ? 'dataflow-1' : 'dataflow-1';
     return JSON.stringify({ id: args.at(-1), labels: labels(service), image: 'image', mounts: [],
       state: { Running: !stopped, ExitCode: 0, OOMKilled: false } });
   };
-  const stop = async () => { events.push('stop'); stopped = true; return ['direct-1', 'dataflow-1']; };
+  const stop = async () => { events.push('stop'); stopped = true; return ['dataflow-1']; };
   const release = async () => {
     assert(stopped);
     assert(existsSync(path.join(results, 'mutator-drain.json')));
     events.push('sql-release');
-    writeFileSync(path.join(results, 'publisher-release.json'),
-      JSON.stringify({ passed: true, run_id: 'run-1', errors: [], routing: {}, receipts: {} }));
+    writeFileSync(path.join(results, 'publisher-release.json'), JSON.stringify({ passed: true, run_id: 'run-1',
+      checked_at_unix_ms: 2, publishers: [{ instance_id: '22222222-2222-4222-8222-222222222222',
+        instance_key: 'loadtest-dataflow-1', implementation_pool: 'dataflow', state: 'ready', terminated: false }],
+      errors: [], routing: { run_id: null, loaded_at_unix_ms: 3,
+        collectors: [{ instance_id: '22222222-2222-4222-8222-222222222222',
+          instance_key: 'loadtest-dataflow-1', implementation_pool: 'dataflow', state: 'stopped', terminated: true }],
+        leases: [] } }));
   };
   const compact = async () => { events.push('final-compaction'); };
   return { workspace, directory, results, sdk, docker, stop, release, compact, events,
@@ -56,13 +61,13 @@ function fixture(t: TestContext) {
     restartWriter: () => { writerStartedAt = '2026-01-01T00:00:01Z'; } };
 }
 
-test('release reads SQL only after every writer exits and persists a same-run protocol binding', async t => {
+test('release reads routing only after every writer exits and persists a same-run protocol binding', async t => {
   const f = fixture(t);
   const mutators = await admitPublisherRelease(f);
   assert.deepEqual(f.events, ['stop', 'sql-release', 'final-compaction']);
-  assert.equal(mutators.length, 2);
+  assert.equal(mutators.length, 1);
   const receipt = JSON.parse(readFileSync(path.join(f.results, 'publisher-admission.json'), 'utf8'));
-  assert.equal(receipt.protocol, 'sql-terminal-state-and-owned-clean-exit');
+  assert.equal(receipt.protocol, 'routing-terminal-state-and-owned-clean-exit');
   assert.equal(receipt.run_id, 'run-1');
   assert.equal(receipt.release_sha256.length, 64);
   assert.equal(receipt.sdk_sha256.length, 64);
@@ -79,13 +84,13 @@ test('stop failure prevents SQL release and all downstream compaction', async t 
   assert.deepEqual(f.events, []);
 });
 
-test('SQL release failure never admits downstream maintenance', async t => {
+test('routing proof failure never admits downstream maintenance', async t => {
   const f = fixture(t);
   let compacted = false;
   await assert.rejects(async () => {
-    await admitPublisherRelease({ ...f, release: async () => { throw new Error('SQL owner draining'); } });
+    await admitPublisherRelease({ ...f, release: async () => { throw new Error('routing read failed'); } });
     compacted = true;
-  }, /SQL owner draining/u);
+  }, /routing read failed/u);
   assert.equal(compacted, false);
   assert.equal(existsSync(path.join(f.results, 'publisher-admission.json')), false);
 });
@@ -102,10 +107,10 @@ test('SQL generation changes before or during read fail admission', async t => {
   }
 });
 
-test('stale or failed SQL receipt is not a clean-exit substitute', async t => {
+test('stale or failed routing proof is not a clean-exit substitute', async t => {
   for (const proof of [
-    { passed: false, run_id: 'run-1', errors: ['owner draining'], routing: {}, receipts: {} },
-    { passed: true, run_id: 'old-run', errors: [], routing: {}, receipts: {} },
+    { passed: false, run_id: 'run-1', errors: ['owner draining'], routing: {} },
+    { passed: true, run_id: 'old-run', errors: [], routing: {} },
     { passed: true, run_id: 'run-1', errors: [], routing: {} },
   ]) {
     const f = fixture(t);

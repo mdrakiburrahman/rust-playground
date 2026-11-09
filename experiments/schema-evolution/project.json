@@ -1,0 +1,55 @@
+{
+  "name": "schema-evolution-experiment",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "application",
+  "implicitDependencies": ["experiment-kit", "azure-infra"],
+  "targets": {
+    "build": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "cargo build --locked --quiet --package arrowcol-catalog-rust --package arrowcol-dataflow-rust --package arrowcol-sdk-gen"
+      }
+    },
+    "run": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["build"],
+      "options": {
+        "command": "npx --no-install tsx experiments/schema-evolution/src/main.ts",
+        "forwardAllArgs": true
+      }
+    },
+    "lint": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "npx --no-install tsc --project experiments/schema-evolution/tsconfig.json"
+      }
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "npx --no-install tsx --test experiments/schema-evolution/src/*.test.ts"
+      }
+    },
+    "verify": {
+      "executor": "nx:run-commands",
+      "dependsOn": ["lint", "test"],
+      "options": { "commands": [] }
+    },
+    "probe-kustainer": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install tsx experiments/schema-evolution/src/probe-kustainer.ts"
+      }
+    },
+    "build-fixtures": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install tsx experiments/schema-evolution/src/build-clients.ts --fixtures"
+      }
+    }
+  }
+}

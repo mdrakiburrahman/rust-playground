@@ -19,7 +19,6 @@ mod measurement;
 mod metadata;
 mod pressure;
 mod protocol;
-mod receipt;
 
 pub use auth::{
     AuthContext, AuthContextError, AuthMethod, AuthenticatedPrincipal, PrincipalError, PrincipalId, PrincipalIssuer,
@@ -35,7 +34,7 @@ pub use identity::{
     CatalogName, IdentityError, ImplementationPool, MAX_IDENTITY_COMPONENT_BYTES, PoolParseError, SchemaName,
     TableIdentity, TableName,
 };
-pub use ids::{CollectorInstanceId, IdParseError, LeaseId, ReceiptId};
+pub use ids::{CollectorInstanceId, IdParseError, LeaseId, PublicationId};
 pub use lease::{FencingToken, LeaseError, PublicationFence, TableLease, TableLeaseSuccessorError};
 pub use lifecycle::{CollectorInstanceStatus, InstanceLifecycleState, InstanceStatusError, InstanceTransitionError};
 pub use measurement::{
@@ -50,7 +49,3 @@ pub use metadata::{
 };
 pub use pressure::PressureSnapshot;
 pub use protocol::{ProtocolVersion, ProtocolVersionError};
-pub use receipt::{
-    DeltaPublicationResult, PublicationResultError, ReceiptState, ReceiptStatus, ReceiptStatusError,
-    ReceiptTransitionError,
-};

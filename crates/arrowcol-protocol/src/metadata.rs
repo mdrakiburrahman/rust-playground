@@ -6,7 +6,7 @@ use thiserror::Error;
 
 /// gRPC metadata key carrying the Arrow collector protocol version.
 pub const PROTOCOL_VERSION_METADATA_KEY: &str = "x-arrowcol-protocol-version";
-/// gRPC metadata key selecting `direct` or `dataflow`.
+/// gRPC metadata key selecting the `dataflow` pool.
 pub const IMPLEMENTATION_POOL_METADATA_KEY: &str = "x-arrowcol-implementation-pool";
 /// gRPC metadata key carrying the catalog component.
 pub const CATALOG_METADATA_KEY: &str = "x-arrowcol-catalog";
@@ -98,7 +98,7 @@ impl IngestMetadata {
         .parse()
         .map_err(|_| MetadataParseError::Malformed {
             key: IMPLEMENTATION_POOL_METADATA_KEY,
-            reason: "expected direct or dataflow",
+            reason: "expected dataflow",
         })?;
 
         let catalog = CatalogName::new(required(

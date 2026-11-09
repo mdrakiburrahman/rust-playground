@@ -1,7 +1,7 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use thiserror::Error;
 
-use crate::{PositiveMeasurement, ProtocolVersion, ReceiptId};
+use crate::{PositiveMeasurement, ProtocolVersion};
 
 const MAX_ERROR_MESSAGE_BYTES: usize = 1_024;
 
@@ -17,8 +17,6 @@ pub enum ErrorCategory {
     CatalogSchema,
     /// Capacity was exhausted or backpressure timed out.
     CapacityBackpressure,
-    /// Receipt lookup or state handling failed.
-    Receipt,
     /// Delta publication failed or has an uncertain outcome.
     Publication,
     /// An unexpected internal failure occurred.
@@ -57,12 +55,6 @@ pub enum ErrorCode {
     CapacityExhausted,
     /// Waiting for capacity exceeded the configured deadline.
     BackpressureTimeout,
-    /// The requested receipt does not exist.
-    ReceiptNotFound,
-    /// A receipt state transition was invalid or raced.
-    ReceiptTransitionInvalid,
-    /// The receipt is no longer retained.
-    ReceiptExpired,
     /// Delta publication conflicted with another writer.
     PublicationConflict,
     /// Delta publication failed with a known non-commit outcome.
@@ -91,7 +83,6 @@ impl ErrorCode {
             | Self::SchemaFingerprintMismatch
             | Self::SchemaIncompatible => ErrorCategory::CatalogSchema,
             Self::CapacityExhausted | Self::BackpressureTimeout => ErrorCategory::CapacityBackpressure,
-            Self::ReceiptNotFound | Self::ReceiptTransitionInvalid | Self::ReceiptExpired => ErrorCategory::Receipt,
             Self::PublicationConflict | Self::PublicationFailed | Self::PublicationOutcomeUnknown => {
                 ErrorCategory::Publication
             }
@@ -101,9 +92,8 @@ impl ErrorCode {
 
     /// Returns whether a later retry may be useful.
     ///
-    /// A retry is always a new delivery with a new receipt. This flag never
-    /// promises idempotency or deduplication. Unknown publication outcomes are
-    /// deliberately non-retryable until their receipt is reconciled.
+    /// This flag never promises idempotency or deduplication. Unknown
+    /// publication outcomes are non-retryable until storage is reconciled.
     #[must_use]
     pub const fn is_retryable(self) -> bool {
         matches!(
@@ -112,7 +102,6 @@ impl ErrorCode {
                 | Self::LeaseFenced
                 | Self::CapacityExhausted
                 | Self::BackpressureTimeout
-                | Self::ReceiptTransitionInvalid
                 | Self::PublicationConflict
                 | Self::PublicationFailed
                 | Self::Internal
@@ -126,7 +115,6 @@ pub struct ErrorStatus {
     protocol_version: ProtocolVersion,
     code: ErrorCode,
     message: String,
-    receipt_id: Option<ReceiptId>,
     retry_after_ms: Option<PositiveMeasurement>,
 }
 
@@ -144,16 +132,8 @@ impl ErrorStatus {
             protocol_version: ProtocolVersion::CURRENT,
             code,
             message,
-            receipt_id: None,
             retry_after_ms: None,
         })
-    }
-
-    /// Associates the failure with a server receipt.
-    #[must_use]
-    pub const fn with_receipt_id(mut self, receipt_id: ReceiptId) -> Self {
-        self.receipt_id = Some(receipt_id);
-        self
     }
 
     /// Adds a retry delay to a retryable failure.
@@ -200,12 +180,6 @@ impl ErrorStatus {
         &self.message
     }
 
-    /// Returns the associated receipt, when one exists.
-    #[must_use]
-    pub const fn receipt_id(&self) -> Option<ReceiptId> {
-        self.receipt_id
-    }
-
     /// Returns a suggested retry delay for a new delivery.
     #[must_use]
     pub const fn retry_after_ms(&self) -> Option<PositiveMeasurement> {
@@ -226,8 +200,6 @@ impl Serialize for ErrorStatus {
             retryable: bool,
             message: &'a str,
             #[serde(skip_serializing_if = "Option::is_none")]
-            receipt_id: Option<ReceiptId>,
-            #[serde(skip_serializing_if = "Option::is_none")]
             retry_after_ms: Option<PositiveMeasurement>,
         }
 
@@ -237,7 +209,6 @@ impl Serialize for ErrorStatus {
             category: self.category(),
             retryable: self.is_retryable(),
             message: &self.message,
-            receipt_id: self.receipt_id,
             retry_after_ms: self.retry_after_ms,
         }
         .serialize(serializer)
@@ -257,8 +228,6 @@ impl<'de> Deserialize<'de> for ErrorStatus {
             retryable: bool,
             message: String,
             #[serde(default)]
-            receipt_id: Option<ReceiptId>,
-            #[serde(default)]
             retry_after_ms: Option<PositiveMeasurement>,
         }
 
@@ -271,7 +240,6 @@ impl<'de> Deserialize<'de> for ErrorStatus {
         }
         let mut status = Self::new(wire.code, wire.message).map_err(de::Error::custom)?;
         status.protocol_version = wire.protocol_version;
-        status.receipt_id = wire.receipt_id;
         if let Some(delay) = wire.retry_after_ms {
             status = status.with_retry_after(delay).map_err(de::Error::custom)?;
         }

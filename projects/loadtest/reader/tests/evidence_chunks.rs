@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf, process::Command, sync::Arc};
+use std::{fs, process::Command, sync::Arc};
 
 use anyhow::{Context, Result};
 use arrow::{
@@ -8,19 +8,12 @@ use arrow::{
 use parquet::arrow::ArrowWriter;
 use serde_json::{Value, json};
 
-struct Fixture(PathBuf);
+struct Fixture(tempfile::TempDir);
 
 impl Fixture {
     fn new(partitions: usize, distinct: i32) -> Result<Self> {
-        let root = std::env::temp_dir().join(format!(
-            "evidence-chunks-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_nanos()
-        ));
-        let fixture = Self(root);
-        let table = fixture.0.join("telemetry/sqlserver/fixture");
+        let fixture = Self(tempfile::tempdir()?);
+        let table = fixture.0.path().join("telemetry/sqlserver/fixture");
         fs::create_dir_all(table.join("_delta_log"))?;
         let arrow_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
         let schema = json!({"type":"struct","fields":[
@@ -55,23 +48,17 @@ impl Fixture {
     fn cli(&self, command: &str, table: &str) -> Result<std::process::Output> {
         Command::new(env!("CARGO_BIN_EXE_delta-inspect"))
             .arg(command)
-            .arg(&self.0)
+            .arg(self.0.path())
             .args(["--table", table])
             .output()
             .context("run actual reader CLI")
     }
 }
 
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
 #[test]
 fn actual_cli_keeps_complete_long_window_chunks_and_legacy_guard() -> Result<()> {
     let fixture = Fixture::new(2, 200)?;
-    let sibling = fixture.0.join("telemetry/sqlserver/corrupt/_delta_log");
+    let sibling = fixture.0.path().join("telemetry/sqlserver/corrupt/_delta_log");
     fs::create_dir_all(&sibling)?;
     fs::write(sibling.join("00000000000000000000.json"), "not a Delta action")?;
     let output = fixture.cli("evidence-chunks", "telemetry.sqlserver.fixture")?;
@@ -96,7 +83,7 @@ fn actual_cli_keeps_complete_long_window_chunks_and_legacy_guard() -> Result<()>
     );
     let metadata = Command::new(env!("CARGO_BIN_EXE_delta-inspect"))
         .arg("file-metadata")
-        .arg(fixture.0.join("telemetry/sqlserver/fixture/part-0.parquet"))
+        .arg(fixture.0.path().join("telemetry/sqlserver/fixture/part-0.parquet"))
         .output()?;
     assert!(metadata.status.success());
     let metadata: Value = serde_json::from_slice(&metadata.stdout)?;
@@ -135,7 +122,7 @@ async fn compacted_multi_table_parallel_preparation_beats_serial_without_changin
         return Ok(());
     }
     let fixture = Fixture::new(2, 31)?;
-    let original = fixture.0.join("telemetry/sqlserver/fixture");
+    let original = fixture.0.path().join("telemetry/sqlserver/fixture");
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
     for partition in 0..2 {
         let file = original.join(format!("part-{partition}.parquet"));
@@ -167,7 +154,7 @@ async fn compacted_multi_table_parallel_preparation_beats_serial_without_changin
     let mut identities = vec!["telemetry.sqlserver.fixture".to_owned()];
     for table in 0..15 {
         let name = format!("table_{table:02}");
-        let root = fixture.0.join("telemetry/sqlserver").join(&name);
+        let root = fixture.0.path().join("telemetry/sqlserver").join(&name);
         fs::create_dir_all(root.join("_delta_log"))?;
         fs::copy(&log, root.join("_delta_log/00000000000000000000.json"))?;
         for partition in 0..2 {
@@ -179,9 +166,9 @@ async fn compacted_multi_table_parallel_preparation_beats_serial_without_changin
     let started = Instant::now();
     let mut serial = std::collections::BTreeMap::new();
     for identity in &identities {
-        let snapshot = delta_inspect::summarize_selected(&fixture.0, std::slice::from_ref(identity)).await?;
+        let snapshot = delta_inspect::summarize_selected(fixture.0.path(), std::slice::from_ref(identity)).await?;
         let summary = snapshot.tables.get(identity).context("serial table")?;
-        let root = fixture.0.clone();
+        let root = fixture.0.path().to_path_buf();
         let name = identity.clone();
         let table = summary.clone();
         let corpus = delta_inspect::scheduler::oracle_scheduler()
@@ -191,10 +178,10 @@ async fn compacted_multi_table_parallel_preparation_beats_serial_without_changin
     }
     let serial_elapsed = started.elapsed();
     let started = Instant::now();
-    let snapshot = delta_inspect::summarize(&fixture.0).await?;
+    let snapshot = delta_inspect::summarize(fixture.0.path()).await?;
     let mut pending = tokio::task::JoinSet::new();
     for (identity, summary) in snapshot.tables {
-        let root = fixture.0.clone();
+        let root = fixture.0.path().to_path_buf();
         pending.spawn(async move {
             delta_inspect::scheduler::oracle_scheduler()
                 .run(None, move || {

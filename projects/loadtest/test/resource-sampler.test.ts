@@ -31,15 +31,15 @@ test('sampler parses PID 1 RSS, anonymous RSS, threads and cgroup working set/CP
 test('runtime counters/backlog retain numeric values without exposing metric labels or arbitrary output', () => {
   assert.deepEqual(parseMetrics([
     '# HELP ignored',
-    'arrowcol_direct_received_rows_total 123',
+    'arrowcol_received_rows_total 123',
     'arrowcol_delta_pending_commits 7',
-    'arrowcol_direct_stream_outcomes_total{outcome="TOP_SECRET"} 2',
-    'arrowcol_direct_stream_outcomes_total{outcome="another"} 3',
+    'arrowcol_dataflow_stream_outcomes_total{outcome="TOP_SECRET"} 2',
+    'arrowcol_dataflow_stream_outcomes_total{outcome="another"} 3',
     'unrelated_password_info{password="TOP_SECRET"} 1',
   ].join('\n')), {
-    arrowcol_direct_received_rows_total: 123,
+    arrowcol_received_rows_total: 123,
     arrowcol_delta_pending_commits: 7,
-    arrowcol_direct_stream_outcomes_total: 5,
+    arrowcol_dataflow_stream_outcomes_total: 5,
   });
 
   assert.throws(() => parseMetrics('not metrics'), /No Arrowcol/u);
@@ -53,7 +53,7 @@ cat() {
     /proc/1/task/1/children) printf '42';;
     /proc/42/comm) printf 'tini';;
     /proc/42/task/42/children) printf '43';;
-    /proc/43/comm) printf 'arrowcol-rust';;
+    /proc/43/comm) printf 'arrowcol-dataflow-rust';;
     /proc/43/status) printf '%s' '${status.replace('Pid:\t1', 'Pid:\t43')}';;
     /sys/fs/cgroup/memory.current) printf '4096';;
     /sys/fs/cgroup/memory.stat) printf 'inactive_file 1024\\n';;
@@ -66,7 +66,7 @@ cat() {
   const run = (executable: string) => spawnSync('sh', ['-c',
     `${procFixture}\nreadlink() { printf '%s' '${executable}'; }\n${resourceScript}`,
   ], { encoding: 'utf8' });
-  const valid = run('/usr/local/bin/arrowcol-rust');
+  const valid = run('/usr/local/bin/arrowcol-dataflow-rust');
   assert.equal(valid.status, 0, valid.stderr);
   assert.deepEqual(parseResources(valid.stdout).process, {
     ok: true, value: { pid: 43, rssBytes: 2097152, rssAnonBytes: 1048576, threads: 7 },
@@ -92,7 +92,7 @@ else process.exit(1);
 `, { mode: 0o755 });
   const stop = await startResourceSampler({
     project: BENCHMARK_PROJECT, results,
-    directAdmin: 'http://127.0.0.1:1', dataflowAdmin: 'http://127.0.0.1:1',
+    dataflowAdmin: 'http://127.0.0.1:1',
   }, { ...process.env, PATH: `${results}:${process.env.PATH}` });
   try {
     const work = spawnSync(process.execPath, ['-e', 'Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 11200)']);
@@ -129,12 +129,12 @@ test('admin metrics and non-ready HTTP status are sampled without saving secret 
   const endpoint = `http://127.0.0.1:${address.port}`;
   const running = runResourceSampler({
     project: 'rust-playground-loadtest-no-such-fixture', results,
-    directAdmin: endpoint, dataflowAdmin: endpoint,
+dataflowAdmin: endpoint,
   });
   try {
     await assert.rejects(runResourceSampler({
       project: 'rust-playground-loadtest-no-such-fixture', results,
-      directAdmin: endpoint, dataflowAdmin: endpoint,
+dataflowAdmin: endpoint,
     }), { code: 'EEXIST' });
     const deadline = Date.now() + 8000;
     while (Date.now() < deadline) {

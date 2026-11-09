@@ -32,7 +32,7 @@ pub use error::{
 };
 pub use flight_sql::{
     DDL_COMPLETION_METADATA_KEY, DdlCompletionMetadata, FlightSqlDdlAdapter, FlightSqlDdlResponse,
-    decode_ddl_completion_metadata,
+    decode_ddl_completion_metadata, encode_ddl_completion_response,
 };
 pub use ingest::{RuntimeLimits, align_record_batch};
 pub use lifecycle::{

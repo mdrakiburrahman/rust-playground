@@ -4,8 +4,9 @@
   "sourceRoot": "bin/quiver-cli/src",
   "projectType": "application",
   "implicitDependencies": [
-    "arrowcol-buffer",
     "arrowcol-catalog",
+    "arrowcol-catalog-client",
+    "arrowcol-dataflow-components",
     "arrowcol-protocol"
   ],
   "namedInputs": {
@@ -31,7 +32,7 @@
     ]
   },
   "metadata": {
-    "description": "Generate Quiver storage from real SQL Server data exactly as the Arrowcol Direct collector writes it, then inspect the files."
+    "description": "Generate and inspect DFE durable_buffer Quiver storage using Schema Catalog schemas."
   },
   "targets": {
     "clean": {

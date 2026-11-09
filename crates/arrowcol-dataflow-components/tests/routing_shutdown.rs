@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arrowcol_dataflow_components::RoutingShutdown;
-use arrowcol_protocol::{CollectorInstanceId, ImplementationPool, PositiveMeasurement, ReceiptId, UnixMillis};
+use arrowcol_protocol::{CollectorInstanceId, ImplementationPool, PositiveMeasurement, PublicationId, UnixMillis};
 use arrowcol_routing::{CollectorRegistration, CollectorState, MemoryRoutingStore, RoutingStore};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -84,7 +84,7 @@ async fn publication_failure_prevents_stopped_after_clean_controller_exit() -> T
     let (store, id) = draining_store().await?;
     let shutdown = RoutingShutdown::default();
     shutdown.register(Arc::clone(&store) as Arc<dyn RoutingStore>, id)?;
-    shutdown.publication_finished(ReceiptId::new(), false)?;
+    shutdown.publication_finished(PublicationId::new(), false)?;
     assert!(shutdown.finish(true).await.is_err());
     assert_eq!(
         store.load_view(UnixMillis::new(2)?).await?.collectors[&id].state,
@@ -99,9 +99,9 @@ async fn publication_failure_prevents_stopped_after_clean_controller_exit() -> T
 async fn recovered_nack_can_stop_but_different_publication_does_not_clear_it() -> TestResult {
     let (store, id) = draining_store().await?;
     let shutdown = RoutingShutdown::default();
-    let publication = ReceiptId::new();
+    let publication = PublicationId::new();
     shutdown.publication_finished(publication, false)?;
-    shutdown.publication_finished(ReceiptId::new(), true)?;
+    shutdown.publication_finished(PublicationId::new(), true)?;
     // The unregistered probe proves accounting only; a registered failed finish
     // would persist the sticky `failed` terminal state checked below.
     assert!(shutdown.finish(true).await.is_err());
@@ -122,7 +122,7 @@ async fn persisted_failure_is_not_overwritten_by_later_clean_finish() -> TestRes
     let (store, id) = draining_store().await?;
     let shutdown = RoutingShutdown::default();
     shutdown.register(Arc::clone(&store) as Arc<dyn RoutingStore>, id)?;
-    let publication = ReceiptId::new();
+    let publication = PublicationId::new();
     shutdown.publication_finished(publication, false)?;
     assert!(shutdown.finish(true).await.is_err());
     shutdown.publication_finished(publication, true)?;

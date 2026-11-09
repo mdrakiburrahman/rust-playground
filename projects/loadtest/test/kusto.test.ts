@@ -9,7 +9,8 @@ import {
   kustoComposeStartArguments, kustoStatusSummary, readKustoStatus, requireHealthyKusto, safeKustoError, startKusto,
 } from '../src/kusto.js';
 import {
-  benchmarkCoreServices, LOADGEN_PHASE_TIMEOUT_MS, loadgenSpawnPlan, localLoadgenEnvironment, VALIDATE_RESERVE_MS,
+  benchmarkCoreServices, benchmarkStartupCommands, LOADGEN_PHASE_TIMEOUT_MS, loadgenSpawnPlan,
+  localLoadgenEnvironment, VALIDATE_RESERVE_MS,
   type BenchmarkNetwork,
 } from '../src/main.js';
 import { fixtureDirectory } from './fixture-directory.js';
@@ -41,10 +42,26 @@ test('Kusto starts independently without core --wait or required dependencies', 
   ]);
 });
 
+test('one-shot database bootstrap and migrations run between SQL readiness and long-running services', () => {
+  assert.deepEqual(benchmarkCoreServices, [
+    'sqlserver', 'arrowcol-catalog', 'lgtm', 'cadvisor', 'portainer', 'dataflow-1', 'router',
+  ]);
+  assert.deepEqual(benchmarkStartupCommands.slice(0, 3), [
+    ['--profile', 'benchmark', 'up', '--detach', '--no-build', '--wait', '--wait-timeout', '600', 'sqlserver'],
+    ['--profile', 'benchmark', 'run', '--rm', '--no-deps', 'database-bootstrap'],
+    ['--profile', 'benchmark', 'run', '--rm', '--no-deps', 'arrowcol-migrate'],
+  ]);
+  const longRunning = benchmarkStartupCommands[3];
+  assert.equal(longRunning[2], 'up');
+  assert(longRunning.includes('dataflow-1'));
+  assert(!longRunning.includes('database-bootstrap'));
+  assert(!longRunning.includes('arrowcol-migrate'));
+});
+
 test('both local helper commands always receive the allocated internal Kusto endpoint', () => {
   const network: BenchmarkNetwork = {
-    subnet: '10.89.42.0/24', sql: '10.89.42.2', hive: '10.89.42.3', router: '10.89.42.10',
-    direct: '10.89.42.21', dataflow: '10.89.42.31', kusto: '10.89.42.50',
+    subnet: '10.89.42.0/24', sql: '10.89.42.2', router: '10.89.42.10',
+    dataflow: '10.89.42.31', kusto: '10.89.42.50',
     kustoExplorer: '10.89.42.51', playwright: '10.89.42.52',
   };
   const env = localLoadgenEnvironment({
@@ -52,7 +69,6 @@ test('both local helper commands always receive the allocated internal Kusto end
     env: { LOADTEST_KUSTO_ENDPOINT: 'http://wrong-endpoint:1', KUSTO_PORT: '18080' },
   }, '/workspace/onelake/benchmark/latest/results');
   assert.equal(env.LOADTEST_KUSTO_ENDPOINT, 'http://10.89.42.50:8080');
-  assert.equal(env.LOADTEST_DIRECT_ROOT, '/workspace/onelake/benchmark/latest/direct');
   assert.equal(env.LOADTEST_DATAFLOW_ROOT, '/workspace/onelake/benchmark/latest/dataflow');
 });
 

@@ -9,8 +9,7 @@ use tokio::sync::Mutex;
 
 use crate::{
     CatalogError, CatalogErrorCode, CatalogResult, CatalogSchemaVersion, CatalogStore, ChangeReservation,
-    DescriptorArtifacts, HiveTableSnapshot, Metastore, RequestHash, ReserveOutcome, SagaId, SagaRecord, SagaState,
-    SagaStep, SchemaVersion,
+    DescriptorArtifacts, RequestHash, ReserveOutcome, SagaId, SagaRecord, SagaState, SagaStep, SchemaVersion,
 };
 
 /// Deterministic failure-injection point used by saga tests.
@@ -18,12 +17,6 @@ use crate::{
 pub enum FailurePoint {
     /// Before a change is reserved.
     Reserve,
-    /// Before Hive applies or verifies a schema.
-    HiveApply,
-    /// Before Hive reads a table.
-    HiveRead,
-    /// Before the application store records successful Hive application.
-    MarkHiveApplied,
     /// Before descriptor artifacts are persisted.
     PersistArtifacts,
     /// Before the schema head is finalized.
@@ -53,6 +46,72 @@ impl MemoryCatalogStore {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Hydrates immutable versions read from already committed Delta metadata.
+    ///
+    /// # Errors
+    /// Rejects inconsistent identities, incompatible history or active schema changes.
+    pub async fn hydrate_committed(&self, history: Vec<CatalogSchemaVersion>) -> CatalogResult<()> {
+        let Some(head) = history.last() else {
+            return Err(CatalogError::new(
+                CatalogErrorCode::CorruptCatalogState,
+                "empty committed history",
+            ));
+        };
+        let identity = head.identity().clone();
+        for pair in history.windows(2) {
+            if pair[1].version() <= pair[0].version() || !pair[1].is_nullable_append_only_superset_of(&pair[0]) {
+                return Err(CatalogError::new(
+                    CatalogErrorCode::CorruptCatalogState,
+                    "Delta catalog history is not monotonic nullable append-only",
+                ));
+            }
+        }
+        let mut artifacts = Vec::with_capacity(history.len());
+        for schema in &history {
+            if schema.identity() != &identity {
+                return Err(CatalogError::new(
+                    CatalogErrorCode::CorruptCatalogState,
+                    "Delta catalog history contains mismatched identities",
+                ));
+            }
+            artifacts.push(crate::generate_descriptor_artifacts(schema)?);
+        }
+        let mut state = self.state.lock().await;
+        if state.active.contains_key(&identity) {
+            return Err(CatalogError::new(
+                CatalogErrorCode::SchemaChangeInProgress,
+                "cannot hydrate an active schema change",
+            ));
+        }
+        let version = head.version();
+        let mut versions = BTreeMap::new();
+        for (schema, artifacts) in history.into_iter().zip(artifacts) {
+            state.artifacts.insert((identity.clone(), schema.version()), artifacts);
+            versions.insert(schema.version(), schema);
+        }
+        state.versions.insert(identity.clone(), versions);
+        state.current.insert(identity, version);
+        Ok(())
+    }
+
+    /// Removes a table after its Delta tombstone has committed.
+    ///
+    /// # Errors
+    /// Rejects removal during an active schema change.
+    pub async fn remove_committed(&self, identity: &TableIdentity) -> CatalogResult<()> {
+        let mut state = self.state.lock().await;
+        if state.active.contains_key(identity) {
+            return Err(CatalogError::new(
+                CatalogErrorCode::SchemaChangeInProgress,
+                "cannot remove a table during an active schema change",
+            ));
+        }
+        state.current.remove(identity);
+        state.versions.remove(identity);
+        state.artifacts.retain(|(table, _), _| table != identity);
+        Ok(())
     }
 
     /// Fails the next matching operation.
@@ -175,18 +234,6 @@ impl CatalogStore for MemoryCatalogStore {
         Ok(self.state.lock().await.sagas.get(&saga_id).cloned())
     }
 
-    async fn mark_hive_applied(&self, saga_id: SagaId) -> CatalogResult<SagaRecord> {
-        let mut state = self.state.lock().await;
-        maybe_fail(&mut state, FailurePoint::MarkHiveApplied)?;
-        let saga = state.sagas.get_mut(&saga_id).ok_or_else(corrupt_saga)?;
-        if saga.step <= SagaStep::ApplyHive {
-            saga.state = SagaState::HiveApplied;
-            saga.step = SagaStep::PersistArtifacts;
-            saga.last_error = None;
-        }
-        Ok(saga.clone())
-    }
-
     async fn persist_artifacts(&self, saga_id: SagaId, artifacts: &DescriptorArtifacts) -> CatalogResult<SagaRecord> {
         let mut state = self.state.lock().await;
         maybe_fail(&mut state, FailurePoint::PersistArtifacts)?;
@@ -269,81 +316,6 @@ impl CatalogStore for MemoryCatalogStore {
     }
 }
 
-#[derive(Default)]
-struct MemoryMetastoreState {
-    tables: BTreeMap<TableIdentity, CatalogSchemaVersion>,
-    failures: VecDeque<FailurePoint>,
-}
-
-/// Idempotent in-memory metastore used by saga tests.
-#[derive(Clone, Default)]
-pub struct MemoryMetastore {
-    state: Arc<Mutex<MemoryMetastoreState>>,
-}
-
-impl MemoryMetastore {
-    /// Creates an empty metastore.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Fails the next matching metastore operation.
-    pub async fn fail_next(&self, point: FailurePoint) {
-        self.state.lock().await.failures.push_back(point);
-    }
-}
-
-#[async_trait]
-impl Metastore for MemoryMetastore {
-    async fn ensure_schema(
-        &self,
-        from_schema: Option<&CatalogSchemaVersion>,
-        target_schema: &CatalogSchemaVersion,
-    ) -> CatalogResult<HiveTableSnapshot> {
-        let mut state = self.state.lock().await;
-        maybe_fail_metastore(&mut state, FailurePoint::HiveApply)?;
-        let identity = target_schema.identity().clone();
-        match state.tables.get(&identity) {
-            Some(existing) if existing.fingerprint() == target_schema.fingerprint() => {}
-            None if from_schema.is_none() => {
-                state.tables.insert(identity, target_schema.clone());
-            }
-            Some(existing)
-                if from_schema.is_some_and(|from| {
-                    existing.version() == from.version() && existing.fingerprint() == from.fingerprint()
-                }) =>
-            {
-                state.tables.insert(identity, target_schema.clone());
-            }
-            None => {
-                return Err(CatalogError::new(
-                    CatalogErrorCode::HiveMetastore,
-                    format!("Hive table {} is missing during ALTER", target_schema.identity()),
-                ));
-            }
-            Some(existing) => {
-                return Err(CatalogError::new(
-                    CatalogErrorCode::HiveMetastore,
-                    format!(
-                        "Hive table {} drifted at version {} with fingerprint {}",
-                        existing.identity(),
-                        existing.version(),
-                        existing.fingerprint()
-                    ),
-                ));
-            }
-        }
-        Ok(HiveTableSnapshot::from_schema(target_schema))
-    }
-
-    async fn table(&self, identity: &TableIdentity) -> CatalogResult<Option<HiveTableSnapshot>> {
-        let mut state = self.state.lock().await;
-        maybe_fail_metastore(&mut state, FailurePoint::HiveRead)?;
-        Ok(state.tables.get(identity).map(HiveTableSnapshot::from_schema))
-    }
-}
-
 fn current_from_state(state: &MemoryState, identity: &TableIdentity) -> Option<CatalogSchemaVersion> {
     state
         .current
@@ -360,20 +332,9 @@ fn maybe_fail(state: &mut MemoryState, point: FailurePoint) -> CatalogResult<()>
     Ok(())
 }
 
-fn maybe_fail_metastore(state: &mut MemoryMetastoreState, point: FailurePoint) -> CatalogResult<()> {
-    if state.failures.front() == Some(&point) {
-        state.failures.pop_front();
-        return Err(injected_failure(point));
-    }
-    Ok(())
-}
-
 fn injected_failure(point: FailurePoint) -> CatalogError {
     CatalogError::new(
-        match point {
-            FailurePoint::HiveApply | FailurePoint::HiveRead => CatalogErrorCode::HiveMetastore,
-            _ => CatalogErrorCode::ApplicationDatabase,
-        },
+        CatalogErrorCode::ApplicationDatabase,
         format!("injected failure at {point:?}"),
     )
 }

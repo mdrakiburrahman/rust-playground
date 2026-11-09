@@ -51,9 +51,6 @@ upstream:
   idle_timeout_seconds: 30
   ping_interval_seconds: 5
 
-receipts:
-  max_batch_size: 16
-
 telemetry:
   log_filter: info
   json_logs: true

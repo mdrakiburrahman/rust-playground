@@ -8,18 +8,15 @@ const workspace = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..
 for (const quiver of [false, true]) {
   const state = path.join(workspace, 'projects/loadtest/.temp', quiver ? 'compose-check-quiver' : 'compose-check');
   for (const directory of [
-    'direct', 'dataflow', 'tenant', 'tenant-checkpoints', 'results', 'router-state', 'direct-state-1', 'dataflow-state-1',
-    ...(quiver ? [benchmarkQuiver.directHostDirectory, benchmarkQuiver.dataflowHostDirectory] : []),
+    'dataflow', 'catalog-state', 'tenant', 'tenant-checkpoints', 'results', 'router-state', 'dataflow-state-1',
+    ...(quiver ? [benchmarkQuiver.dataflowHostDirectory] : []),
   ]) {
     mkdirSync(path.join(state, directory), { recursive: true });
   }
   const runtime = buildBenchmarkRuntimeConfigs(
-    readFileSync(path.join(workspace, 'projects/loadtest/config/direct.yaml.tmpl'), 'utf8'),
     readFileSync(path.join(workspace, dataflowConfigFile(quiver)), 'utf8'),
-    { instanceKey: 'loadtest-direct-1', advertisedEndpoint: '10.89.0.21:50051', generation: 1 },
     { quiver },
   );
-  writeFileSync(path.join(state, 'direct-state-1/direct.yaml'), runtime.directYaml);
   writeFileSync(path.join(state, 'dataflow-state-1/dataflow.yaml'), runtime.dataflowYaml);
   const overrideFile = path.join(state, 'router-state/compose-runtime.json');
   writeFileSync(overrideFile, buildBenchmarkComposeOverride(state, { quiver }));

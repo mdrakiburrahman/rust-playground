@@ -65,11 +65,6 @@ macro_rules! uuid_id {
 }
 
 uuid_id!(
-    ReceiptId,
-    "A server-generated identifier for one accepted delivery.\n\nEvery accepted delivery receives a fresh identifier, including duplicate payloads. This type is not an idempotency or deduplication key.",
-    "Generates a fresh server receipt identifier."
-);
-uuid_id!(
     CollectorInstanceId,
     "A generated identifier for one collector process lifetime.",
     "Generates an identifier for a newly starting collector instance."
@@ -78,6 +73,11 @@ uuid_id!(
     LeaseId,
     "A generated identifier for one table lease lineage.",
     "Generates an identifier for a newly assigned table lease."
+);
+uuid_id!(
+    PublicationId,
+    "An internal identifier used to deduplicate one DFE publication; it is not a client delivery receipt.",
+    "Generates an identifier for a new DFE publication operation."
 );
 
 /// Failure to parse a UUID-backed contract identifier.

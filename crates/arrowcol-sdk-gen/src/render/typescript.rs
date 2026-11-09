@@ -89,8 +89,7 @@ export const TABLE_NAME = {} as const;\n\
 export const TABLE_ID = {} as const;\n\
 export const SCHEMA_VERSION = {} as const;\n\
 export const SCHEMA_FINGERPRINT = {} as const;\n\
-export const DO_PUT_PATH = '/arrow.flight.protocol.FlightService/DoPut' as const;\n\
-export const RECEIPT_STATUS_PATH_TEMPLATE = '/v1/receipts/{{receipt_id}}' as const;\n",
+export const DO_PUT_PATH = '/arrow.flight.protocol.FlightService/DoPut' as const;\n",
         ts_string(context.schema.identity().catalog().as_str())?,
         ts_string(context.schema.identity().schema().as_str())?,
         ts_string(context.schema.identity().table().as_str())?,
@@ -566,8 +565,6 @@ import {{\n\
   TABLE_NAME,\n\
   {builder_name},\n\
   createDoPutPlan,\n\
-  parseReceiptId,\n\
-  receiptStatusUrl,\n\
   recordBatch,\n\
 }} from '../src/index.js';\n\n\
 test('generated fixture builds exact batch and client surfaces', () => {{\n\
@@ -578,11 +575,9 @@ test('generated fixture builds exact batch and client surfaces', () => {{\n\
   assert.equal(SCHEMA_VERSION, {version});\n\
   assert.match(SCHEMA_FINGERPRINT, /^sha256:[0-9a-f]{{64}}$/u);\n\
   assert.equal(TABLE_NAME, {table});\n\n\
-  const plan = createDoPutPlan(batch, 'direct');\n\
+  const plan = createDoPutPlan(batch);\n\
   assert.equal(plan.headers['x-arrowcol-table'], TABLE_NAME);\n\
   assert.deepEqual(plan.descriptorPath.slice(0, 3), [{catalog}, {schema}, TABLE_NAME]);\n\n\
-  const receipt = parseReceiptId('{{\"receipt_id\":\"33333333-3333-4333-8333-333333333333\"}}');\n\
-  assert.equal(receiptStatusUrl('https://collector.example/api/', receipt), 'https://collector.example/api/v1/receipts/33333333-3333-4333-8333-333333333333');\n\
 }});\n",
         builder_name = context.builder_name,
         builder = builder,

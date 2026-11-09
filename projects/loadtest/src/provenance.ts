@@ -55,59 +55,32 @@ function pick(document: Document, names: string[]): Document {
   return Object.fromEntries(names.filter((name) => document[name] !== undefined).map((name) => [name, document[name]]));
 }
 
-export function safeCollectorPolicies(direct: Document, dataflow: Document): Document {
+export function safeCollectorPolicies(dataflow: Document): Document {
   const nodes = dataflow.groups.arrowcol.pipelines.ingest.nodes;
-  return {
-    direct: {
-      flight: pick(direct.flight, [
-        'max_concurrent_streams', 'max_metadata_bytes', 'max_schema_bytes', 'max_message_bytes',
-        'batch_channel_capacity', 'put_result_channel_capacity', 'max_stream_duration_ms', 'admission_timeout_ms', 'max_ddl_bytes',
-      ]),
-      buffer: pick(direct.buffer, [
-        'global_capacity', 'per_table_capacity', 'max_arrow_memory_per_flush', 'max_rows_per_flush', 'max_batches_per_flush',
-        'max_age_ms', 'age_check_interval_ms', 'max_concurrent_flushes', 'receipt_lease_duration_ms', 'adaptive_file',
-      ]),
-      delta: pick(direct.delta, ['commit_batch_window_ms', 'max_files_per_commit', 'max_pending_files']),
-      routing: pick(direct.routing, ['rss_limit_bytes', 'require_lease_headers']),
-      receipts: pick(direct.receipts, [
-        'owner_lease_ttl_ms', 'owner_heartbeat_ms', 'table_lease_ttl_ms', 'table_lease_renew_ms',
-        'receipt_lease_duration_ms', 'admission_timeout_ms', 'mutation_batch_size', 'status_batch_size', 'reconciliation_batch_size',
-      ]),
-      shutdown: pick(direct.shutdown, ['stream_drain_timeout_ms', 'publication_drain_timeout_ms']),
-      sql_pool: pick(direct.sql_server.pool ?? {}, [
-        'receipts_max_size', 'routing_max_size', 'catalog_max_size', 'acquire_timeout_ms',
-      ]),
-      native_quiver: pick(direct.buffer.native_quiver ?? {}, [
-        'enabled', 'directory', 'capacity_bytes', 'wal_flush_interval_ms', 'segment_max_open_ms', 'max_in_flight',
-        'recovery_window_ms',
-      ]),
-    },
-    dataflow: {
-      pipeline: pick(dataflow.groups.arrowcol.pipelines.ingest.policies, ['channel_capacity']),
-      registration: pick(nodes.flight.config.registration, [
-        'max_concurrent_streams', 'rss_limit_bytes', 'buffered_bytes_limit', 'buffered_rows_limit', 'buffered_batches_limit',
-        'heartbeat_interval', 'pressure_interval', 'registration_ttl',
-      ]),
-      limits: pick(nodes.flight.config.limits, [
-        'max_metadata_bytes', 'max_schema_bytes', 'max_message_bytes', 'batch_channel_capacity', 'put_result_channel_capacity',
-        'max_stream_duration', 'admission_timeout', 'max_ddl_bytes',
-      ]),
-      commit: pick(nodes.delta.config.commit, ['batch_window', 'max_files_per_commit', 'max_pending_files']),
-      batching: pick(nodes.delta.config.batching, [
-        'global_capacity', 'per_table_capacity', 'max_arrow_memory_per_flush', 'max_rows_per_flush', 'max_batches_per_flush',
-        'max_age', 'max_concurrent_flushes', 'adaptive_file',
-      ]),
-      native_quiver: nodes.flight.config.native_quiver === true,
-      durable_buffer: pick(Object.values(nodes as Document).find((node) => node.type === 'processor:durable_buffer')?.config ?? {}, [
-        'path', 'retention_size_cap', 'size_cap_policy', 'wal_flush_interval', 'max_segment_open_duration', 'poll_interval',
-        'initial_retry_interval', 'max_retry_interval', 'max_in_flight',
-      ]),
-    },
-  };
+  return { dataflow: {
+    pipeline: pick(dataflow.groups.arrowcol.pipelines.ingest.policies, ['channel_capacity']),
+    registration: pick(nodes.flight.config.registration, [
+      'max_concurrent_streams', 'rss_limit_bytes', 'buffered_bytes_limit', 'buffered_rows_limit', 'buffered_batches_limit',
+      'heartbeat_interval', 'pressure_interval', 'registration_ttl',
+    ]),
+    limits: pick(nodes.flight.config.limits, [
+      'max_metadata_bytes', 'max_schema_bytes', 'max_message_bytes', 'batch_channel_capacity', 'put_result_channel_capacity',
+      'max_stream_duration', 'admission_timeout', 'max_ddl_bytes',
+    ]),
+    commit: pick(nodes.delta.config.commit, ['batch_window', 'max_files_per_commit', 'max_pending_files']),
+    batching: pick(nodes.delta.config.batching, [
+      'global_capacity', 'per_table_capacity', 'max_arrow_memory_per_flush', 'max_rows_per_flush', 'max_batches_per_flush',
+      'max_age', 'max_concurrent_flushes', 'adaptive_file',
+    ]),
+    native_quiver: nodes.flight.config.native_quiver === true,
+    durable_buffer: pick(Object.values(nodes as Document).find((node) => node.type === 'processor:durable_buffer')?.config ?? {}, [
+      'path', 'retention_size_cap', 'size_cap_policy', 'wal_flush_interval', 'max_segment_open_duration', 'poll_interval',
+      'initial_retry_interval', 'max_retry_interval', 'max_in_flight',
+    ]),
+  } };
 }
-
 export function safeComposeSettings(compose: Document): Document {
-  const names = ['direct-1', 'dataflow-1', 'sqlserver', 'kusto'].filter(name => compose.services[name]);
+  const names = ['dataflow-1', 'sqlserver', 'kusto'].filter(name => compose.services[name]);
   return Object.fromEntries(names.map((name) => {
     const service = compose.services[name];
     const environment = service.environment ?? {};
@@ -154,20 +127,21 @@ export function writeProvenance(
     }
     const ids = execute('docker', ['ps', '--all', '--quiet', '--filter', `label=com.docker.compose.project=${project}`])
       .trim().split('\n').filter(Boolean);
-    provenance.containers = ids.map((id) => JSON.parse(execute('docker', [
-      'inspect', '--format',
-      '{"id":{{json .Id}},"imageId":{{json .Image}},"service":{{json (index .Config.Labels "com.docker.compose.service")}},"nanoCpus":{{json .HostConfig.NanoCpus}},"memoryLimit":{{json .HostConfig.Memory}}}',
-      id,
-    ])) as unknown);
+    provenance.containers = ids.map((id) => {
+      const observedAt = new Date().toISOString();
+      return { ...JSON.parse(execute('docker', [
+        'inspect', '--format',
+        '{"id":{{json .Id}},"imageId":{{json .Image}},"service":{{json (index .Config.Labels "com.docker.compose.service")}},"nanoCpus":{{json .HostConfig.NanoCpus}},"memoryLimit":{{json .HostConfig.Memory}},"running":{{json .State.Running}},"healthStatus":{{with (index .State "Health")}}{{json .Status}}{{else}}null{{end}},"startedAt":{{json .State.StartedAt}}}',
+        id,
+      ])), observedAt };
+    });
     provenance.stackStartedAt = new Date().toISOString();
     writeFileSync(output, `${JSON.stringify(provenance, null, 2)}\n`);
     return;
   }
   const files = [
-    'projects/loadtest/compose.yaml', 'projects/loadtest/config/direct.yaml.tmpl',
-    dataflowConfigFile(options.quiver), 'projects/loadtest/config/router.yaml',
+    'projects/loadtest/compose.yaml', dataflowConfigFile(options.quiver), 'projects/loadtest/config/router.yaml',
   ];
-  const direct = YAML.parse(readFileSync(path.join(directory, 'direct-state-1/direct.yaml'), 'utf8')) as Document;
   const dataflow = YAML.parse(readFileSync(path.join(directory, 'dataflow-state-1/dataflow.yaml'), 'utf8')) as Document;
   const revision = (root: string): Document => ({
     head: execute('git', ['-C', root, 'rev-parse', 'HEAD']).trim(),
@@ -181,12 +155,11 @@ export function writeProvenance(
     source: revision('.'), otelArrowSource: revision('submodules/otel-arrow'),
     helpers: helperIdentities(helperDirectory, path.join(workspace, 'projects/loadtest/.temp/bin/latest')),
     configSha256: Object.fromEntries(files.map((file) => [file, sha256(readFileSync(path.join(workspace, file)))])),
-    generatedDirectConfigSha256: sha256(readFileSync(path.join(directory, 'direct-state-1/direct.yaml'))),
     generatedDataflowConfigSha256: sha256(readFileSync(path.join(directory, 'dataflow-state-1/dataflow.yaml'))),
     runtimeComposeOverrideSha256: sha256(readFileSync(path.join(directory, 'router-state/compose-runtime.json'))),
-    policies: safeCollectorPolicies(direct, dataflow),
+    policies: safeCollectorPolicies(dataflow),
     workload: {
-      ...options, scenario: 'paired', tables: env.LOADTEST_TABLES?.split(',') ?? 'all schema fixtures (13 tables)',
+      ...options, scenario: 'dataflow', tables: env.LOADTEST_TABLES?.split(',') ?? 'all schema fixtures (13 tables)',
       maxAttempts: env.LOADTEST_MAX_ATTEMPTS ?? '16',
       continuous: options.measureSeconds === undefined, keepStack: true,
     },

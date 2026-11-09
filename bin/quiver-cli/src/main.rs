@@ -1,7 +1,7 @@
-//! `quiver-cli`: generate Quiver storage from real data exactly as the
-//! Arrowcol Direct collector writes it, then look inside.
+//! `quiver-cli`: generate and inspect the DFE durable_buffer Quiver layout.
 
 mod data;
+mod dfe;
 mod dir;
 mod engine;
 mod format;
@@ -11,7 +11,7 @@ mod lifecycle;
 
 use clap::{Parser, Subcommand};
 
-/// Generate Quiver storage from real data like the Arrowcol Direct collector, and look inside it.
+/// Generate and inspect DFE durable_buffer Quiver storage.
 #[derive(Parser)]
 #[command(name = "quiver-cli", version)]
 struct Cli {
@@ -21,7 +21,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Write CSV rows to Quiver like the Direct collector: an fsynced WAL entry per bundle, then segments.
+    /// Write catalog-typed CSV rows as DFE pluggable-Arrow bundles.
     Generate(generate::GenerateArgs),
     /// Every file in a Quiver directory and what it means.
     Tree(inspect::DirArgs),
@@ -29,7 +29,7 @@ enum Command {
     Segments(inspect::DirArgs),
     /// One bundle's manifest and rows, from a segment or the WAL.
     Show(inspect::ShowArgs),
-    /// WAL entries and the cursor: what is in a segment and what replays on open.
+    /// WAL entries and the cursor: what is checkpointed and what replays on open.
     Wal(inspect::WalArgs),
     /// Acknowledge bundles like the Delta publisher; fully acknowledged segments are deleted.
     Consume(lifecycle::ConsumeArgs),

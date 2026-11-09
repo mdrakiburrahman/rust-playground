@@ -17,13 +17,13 @@ export const sdkMetricFamilies = [
 
 export function requiredMetrics(scope: 'source-sdk' | 'service-qualification'): RequiredMetric[] {
   const metrics: RequiredMetric[] = [];
-  for (const [pool, service] of [['direct', 'arrowcol-rust'], ['dataflow', 'arrowcol-dataflow-rust']]) {
+  for (const [pool, service] of [['dataflow', 'arrowcol-dataflow-rust']]) {
     for (const name of sdkMetricFamilies) {
       metrics.push({ name: `${pool}:${name}`, query: `sum(${name}{service_name="${service}"})`,
         allowZero: name === 'delta_kernel_version' });
     }
   }
-  metrics.push({ name: 'collector_scrapes', query: 'count(up{job=~"direct|dataflow"} == 1) == bool 2', allowZero: false });
+  metrics.push({ name: 'collector_scrapes', query: 'count(up{job="dataflow"} == 1) == bool 1', allowZero: false });
   if (scope === 'service-qualification') {
     for (const name of ['runs_total', 'cycles_total', 'heartbeat_timestamp_ms', 'backlog_files',
       'retention_cutoff_ms', 'purge_watermark_ms', 'files_removed_total', 'files_added_total',
@@ -51,7 +51,7 @@ export function requiredMetrics(scope: 'source-sdk' | 'service-qualification'): 
       metrics.push({ name: family, query: `sum(${family}{job="tenant-stream"})`,
         allowZero: !['bytes_scanned', 'row_groups_pruned_statistics'].includes(name) });
     }
-    for (const pool of ['direct', 'dataflow']) {
+    for (const pool of ['dataflow']) {
       for (const name of ['completion_percent', 'pending_artifacts', 'cached_bytes', 'unhealthy_catalogs', 'lag_seconds']) {
         const family = `qap_${name}`;
         metrics.push({ name: `${pool}:${family}`, query: `sum(${family}{pool="${pool}"} and on(pool) ` +

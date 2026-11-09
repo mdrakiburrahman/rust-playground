@@ -5,6 +5,10 @@ evidence. It records delivered files and local verification only. It does not
 claim that any GitHub issue is closed, that a pull request is merged, or that a
 GHCR image has been pushed.
 
+## Current delivery contract
+
+The verification records below preserve historical evidence, including runs made before issue #75 retired the Direct collector and SQL/Hive catalog. The current topology uses the remote Schema Catalog, DFE as the sole Arrow collector, and SQL Server only for router routing/fencing. Clients receive no durable receipt IDs and have no receipt-polling or purge API. DFE completion is best-effort admission unless `durable_buffer` is enabled; durable admission confirms buffer persistence, not Delta publication. Historical Direct receipt results below are not current behavior or qualification of the DFE-only topology.
+
 ## Lakehouse integration scope
 
 The current integration covers only the following five issues. The older matrix
@@ -18,9 +22,7 @@ below is retained as historical context, not as additional integration scope.
 | #48 | `projects/loadtest/`: lifecycle, generated clients, all-13-schema fixtures, independent reader, LGTM | Component checks, source-built images, live workload correctness, and measured stress are separate claims |
 | #47 | `crates/arrow-tenant-stream/`; sorted customer layout in `crates/arrow-deltalake/` | Historical snapshot then logical tail, Spark-compatible recovery, and independent sink replay are distinct from native Kusto snapshot tracking |
 
-The [root loadtest architecture](../loadtest-architecture.html) and its
-[browser-rendered PNG](../loadtest-architecture.png) show the integrated
-publication, consumer, authority, and evidence boundaries.
+The [platform architecture](architecture/arrowcol-platform/diagrams/platform.drawio) and its [PNG render](architecture/arrowcol-platform/diagrams/platform.png) show the DFE-only collector and routing boundaries.
 
 ## Source-bound integration evidence
 
@@ -308,11 +310,11 @@ disabled; preview is not execution approval.
 
 | Issue | Delivered scope | Concrete files and features | Verification |
 | --- | --- | --- | --- |
-| #8 | Durable, schema-enforced direct Arrow collector | `projects/arrowcol-rust/`; `crates/arrowcol-catalog/`; `crates/arrowcol-flight/`; `crates/arrowcol-buffer/`; `crates/arrowcol-receipts/`; SQL/Hive migrations in `projects/arrowcol-infra/migrations/` | `arrowcol-rust:verify`, direct live E2E, and `loadtest:e2e` schema/receipt/crash/fencing probes |
+| #8 | Former Direct collector implementation (retired) | Catalog, Flight, buffer, and SQL/Hive migration support; receipt crate retired with the collector | Historical `arrowcol-rust:verify`, direct live E2E, and `loadtest:e2e` schema/receipt/crash/fencing probes |
 | #11 | DFE-based arbitrary-Arrow collector | `projects/arrowcol-dataflow-rust/`; `crates/arrowcol-dataflow-components/`; representation-local Arrow envelope, bounded DFE admission, fenced Delta exporter, honest capability document | `arrowcol-dataflow-rust:verify`, component tests, DFE live E2E, and the dataflow phases of `loadtest:e2e` |
 | #15 | Direct-versus-DFE benchmark and Grafana comparison | `projects/loadtest/src/`; `projects/loadtest/compose.yaml` | loadtest Rust/TypeScript tests, Compose validation, finite E2E, and continuous `run` workflow |
 | #18 | GHCR-ready OTEL collector image | `projects/otelcol-rust/Dockerfile`; `projects/otelcol-rust/project.json`; `projects/otelcol-rust/scripts/image-smoke.sh`; `.github/workflows/publish-images.yml` | `otelcol-rust:image-smoke` and image-plan/registry workflow tests; no publication claimed from this workspace |
-| #19 | GHCR-ready direct, DFE, and router images | Dockerfiles, Nx image/publish targets, and image-smoke scripts under `projects/arrowcol-rust/`, `projects/arrowcol-dataflow-rust/`, and `projects/arrowcol-router-rust/`; shared publication workflow | Three Arrow image-smoke targets and image-plan/manifest tests; no publication claimed from this workspace |
+| #19 | Historical Direct, DFE, and router image work (Direct image retired) | Dockerfiles, Nx image/publish targets, and image-smoke scripts for the former Direct, DFE, and router images; shared publication workflow | Historical local image-smoke targets and image-plan/manifest tests; no publication claimed from this workspace |
 | #22 | Load generated from catalog-owned schemas | `projects/loadtest/schemas/sqlserver.sql`; `projects/loadtest/loadgen/src/sdk.rs`; `generator.rs`; `transport.rs`; `crates/arrowcol-sdk-gen/` | SDK generator verification, exact artifact regeneration, generated-package tests, schema-contract manifests, and finite loadtest validation |
 
 ## Historical qualification snapshot

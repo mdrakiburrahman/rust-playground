@@ -1,0 +1,20 @@
+{
+  "name": "arrowcol-props",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "library",
+  "sourceRoot": "crates/arrowcol-props/src",
+  "namedInputs": {
+    "default": ["{projectRoot}/**/*", "{workspaceRoot}/Cargo.toml", "{workspaceRoot}/Cargo.lock", "{workspaceRoot}/docs/reference/TABLE_PROPERTIES.md"]
+  },
+  "targets": {
+    "format": {"executor": "nx:run-commands", "options": {"command": "cargo fmt --package arrowcol-props"}},
+    "format-check": {"executor": "nx:run-commands", "options": {"command": "cargo fmt --package arrowcol-props -- --check"}},
+    "lint": {"executor": "nx:run-commands", "options": {"command": "cargo clippy --locked --package arrowcol-props --all-targets -- -D warnings"}},
+    "build": {"executor": "nx:run-commands", "options": {"command": "cargo build --locked --package arrowcol-props"}},
+    "test": {"executor": "nx:run-commands", "options": {"command": "cargo test --locked --package arrowcol-props"}},
+    "generate-docs": {"executor": "nx:run-commands", "cache": false, "options": {"command": "cargo run --locked --quiet --package arrowcol-props --bin table-properties -- docs/reference/TABLE_PROPERTIES.md"}},
+    "check-docs": {"executor": "nx:run-commands", "options": {"command": "cargo run --locked --quiet --package arrowcol-props --bin table-properties -- docs/reference/TABLE_PROPERTIES.md --check"}},
+    "verify": {"executor": "nx:run-commands", "dependsOn": ["format-check", "lint", "build", "test", "check-docs"], "options": {"commands": []}}
+  },
+  "tags": ["scope:rust", "type:library"]
+}

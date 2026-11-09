@@ -4,10 +4,10 @@ import { test } from 'node:test';
 import { requiredMetrics, sdkMetricFamilies } from '../src/metric-contract.js';
 import { metricRangeEvidence, panelFrameEvidence } from '../src/metrics-gate.js';
 
-test('baseline requires each real SDK family from both source providers, not any delta metric', () => {
+test('baseline requires each real SDK family from the Dataflow provider, not any delta metric', () => {
   const metrics = requiredMetrics('source-sdk');
-  assert.equal(metrics.length, 2 * sdkMetricFamilies.length + 1);
-  for (const [pool, service] of [['direct', 'arrowcol-rust'], ['dataflow', 'arrowcol-dataflow-rust']]) {
+  assert.equal(metrics.length, sdkMetricFamilies.length + 1);
+  for (const [pool, service] of [['dataflow', 'arrowcol-dataflow-rust']]) {
     for (const family of sdkMetricFamilies) {
       const metric = metrics.find(metric => metric.name === `${pool}:${family}`);
       assert.equal(metric?.query, `sum(${family}{service_name="${service}"})`);
@@ -32,8 +32,7 @@ test('a panel canvas alone cannot qualify without actual numeric frames delivere
 test('service qualification cannot pass without real maintenance effects, skipping and per-pool QAP', () => {
   const metrics = requiredMetrics('service-qualification');
   for (const name of ['optimize:actual_removals', 'purge:actual_removals', 'delta_maintenance_files_deleted_total',
-    'tenant_stream_datafusion_row_groups_pruned_statistics_total', 'direct:qap_completion_percent',
-    'dataflow:qap_completion_percent']) {
+    'tenant_stream_datafusion_row_groups_pruned_statistics_total', 'dataflow:qap_completion_percent']) {
     assert.equal(metrics.find(metric => metric.name === name)?.allowZero, false, name);
   }
 });

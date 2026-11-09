@@ -5,3 +5,7 @@ npx --no-install tsc --project infra/azure/tsconfig.json
 npx --no-install tsx --test infra/azure/*.test.ts
 # Compilation requires no Azure sign-in and performs no deployment.
 az bicep build --file infra/azure/main.bicep --stdout >/dev/null
+template="$(mktemp)"
+trap 'rm -f "$template"' EXIT
+az bicep build --file infra/azure/sandbox.bicep --stdout > "$template"
+npx --no-install tsx infra/azure/arm-template-check.ts "$template"

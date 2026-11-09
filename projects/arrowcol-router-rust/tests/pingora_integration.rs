@@ -16,12 +16,10 @@ use arrow_flight::{
 use arrowcol_protocol::{
     BasisPoints, CollectorInstanceId, ImplementationPool, Measurement, PositiveMeasurement, PressureGauge, UnixMillis,
 };
-use arrowcol_receipts::{ReceiptStore, SqlServerReceiptConfig, SqlServerReceiptStore};
 use arrowcol_router_rust::{
     AllowAllAuthenticator, AuthConfig, Authenticator, EdgeRequestSigner, EdgeVerifier, H2Config,
-    InternalIdentitySigner, ProductionRouter, ReceiptApiConfig, RouterConfig, RouterControlLoop, RouterMetrics,
-    RoutingConfig, ServerConfig, SqlServerConfig, TelemetryConfig, UpstreamConfig, build_server,
-    insert_edge_signature_headers,
+    InternalIdentitySigner, ProductionRouter, RouterConfig, RouterControlLoop, RouterMetrics, RoutingConfig,
+    ServerConfig, SqlServerConfig, TelemetryConfig, UpstreamConfig, build_server, insert_edge_signature_headers,
 };
 use arrowcol_routing::{
     CollectorRegistration, MemoryRoutingStore, RichPressureSnapshot, RoutingEngine, RoutingPolicy, RoutingStore,
@@ -398,7 +396,7 @@ fn run_child() -> anyhow::Result<()> {
             .register_collector(&CollectorRegistration {
                 instance_id: instance,
                 instance_key: "pingora-integration".to_owned(),
-                implementation_pool: ImplementationPool::Direct,
+                implementation_pool: ImplementationPool::Dataflow,
                 flight_endpoint: backend,
                 catalog_capable: true,
                 max_concurrent_streams: positive(256)?,
@@ -421,19 +419,14 @@ fn run_child() -> anyhow::Result<()> {
     runtime.block_on(routing.refresh(current))?;
     drop(runtime);
 
-    let receipt_config =
-        SqlServerReceiptConfig::new("127.0.0.1", 9, "unused", "unused", "unused").trust_server_certificate(true);
-    let receipts: Arc<dyn ReceiptStore> = Arc::new(SqlServerReceiptStore::new(receipt_config));
     let metrics = RouterMetrics::new()?;
     let authenticator: Arc<dyn Authenticator> = Arc::new(AllowAllAuthenticator);
     let router = ProductionRouter::new(
         Arc::clone(&routing),
-        receipts,
         authenticator,
         Arc::new(EdgeVerifier::new(vec![1_u8; 32], 30_000)?),
         Arc::new(InternalIdentitySigner::new(vec![2_u8; 32], 30_000)?),
         upstream_config(),
-        ReceiptApiConfig { max_batch_size: 16 },
         metrics.clone(),
     );
     let config = test_config(listen, state);
@@ -491,7 +484,7 @@ async fn control_request(
     let path = "/arrow.flight.protocol.FlightService/DoAction";
     let mut headers = HeaderMap::new();
     headers.insert("content-type", HeaderValue::from_static("application/grpc"));
-    headers.insert("x-arrowcol-implementation-pool", HeaderValue::from_static("direct"));
+    headers.insert("x-arrowcol-implementation-pool", HeaderValue::from_static("dataflow"));
     headers.insert("x-arrowcol-control-operation", HeaderValue::from_static("new_table"));
     headers.insert("x-arrowcol-catalog", HeaderValue::from_static("telemetry"));
     headers.insert("x-arrowcol-schema", HeaderValue::from_static("prod"));
@@ -499,7 +492,7 @@ async fn control_request(
     sign_and_copy(request.metadata_mut(), signer, &Method::POST, path, headers, nonce)?;
     request
         .metadata_mut()
-        .insert("x-arrowcol-implementation-pool", MetadataValue::from_static("direct"));
+        .insert("x-arrowcol-implementation-pool", MetadataValue::from_static("dataflow"));
     request
         .metadata_mut()
         .insert("x-arrowcol-control-operation", MetadataValue::from_static("new_table"));
@@ -561,7 +554,7 @@ fn add_ingest_metadata<S>(
     let mut headers = HeaderMap::new();
     headers.insert("content-type", HeaderValue::from_static("application/grpc"));
     headers.insert("x-arrowcol-protocol-version", HeaderValue::from_static("1"));
-    headers.insert("x-arrowcol-implementation-pool", HeaderValue::from_static("direct"));
+    headers.insert("x-arrowcol-implementation-pool", HeaderValue::from_static("dataflow"));
     headers.insert("x-arrowcol-catalog", HeaderValue::from_static("telemetry"));
     headers.insert("x-arrowcol-schema", HeaderValue::from_static("prod"));
     headers.insert("x-arrowcol-table", HeaderValue::from_static("traces"));
@@ -574,7 +567,7 @@ fn add_ingest_metadata<S>(
     }
     for (key, value) in [
         ("x-arrowcol-protocol-version", "1"),
-        ("x-arrowcol-implementation-pool", "direct"),
+        ("x-arrowcol-implementation-pool", "dataflow"),
         ("x-arrowcol-catalog", "telemetry"),
         ("x-arrowcol-schema", "prod"),
         ("x-arrowcol-table", "traces"),
@@ -676,7 +669,6 @@ fn test_config(listen: SocketAddr, state_directory: String) -> RouterConfig {
             internal_identity_ttl_ms: 30_000,
         },
         upstream: upstream_config(),
-        receipts: ReceiptApiConfig { max_batch_size: 16 },
         telemetry: TelemetryConfig {
             log_filter: "info".to_owned(),
             json_logs: false,

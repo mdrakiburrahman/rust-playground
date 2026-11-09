@@ -2,11 +2,7 @@
   "name": "azure-qap-experiment",
   "$schema": "../../node_modules/nx/schemas/project-schema.json",
   "projectType": "application",
-  "implicitDependencies": [
-    "experiment-kit",
-    "arrowcol-experiment",
-    "delta-maintenance"
-  ],
+  "implicitDependencies": ["experiment-kit", "qap-fixture", "delta-maintenance"],
   "targets": {
     "lint": {
       "executor": "nx:run-commands",
@@ -24,7 +20,7 @@
       "executor": "nx:run-commands",
       "cache": false,
       "options": {
-        "command": "cargo build --locked --release --package arrowcol-experiment --package delta-maintenance"
+        "command": "cargo build --locked --release --package qap-fixture --package delta-maintenance"
       }
     },
     "verify": {

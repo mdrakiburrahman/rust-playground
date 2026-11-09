@@ -243,13 +243,15 @@ test('actual CI image configuration retains dev tags and complete BuildKit cache
   const configuration = image.configurations['ci-verify'];
   assert.ok(configuration);
   assert.equal(configuration.tags, undefined);
-  const harness = createHarness();
+  const sha = 'abcdef0123456789abcdef0123456789abcdef0123';
+  const harness = createHarness(() => successfulCommand, { REGISTRY_SHA: sha });
   const result = await runDockerBuildExecutorWithDependencies(
     { ...image.options, ...configuration }, createContext(), harness.dependencies,
   );
   assert.deepEqual(result, { success: true });
   const args = harness.invocations[0]?.args ?? [];
   assert.ok(args.includes('ghcr.io/mdrakiburrahman/rust-playground/hello-world:dev'));
+  assert.ok(args.includes(`VCS_REF=${sha}`));
   assert.equal(args.filter((argument) => argument === '--cache-from').length, 1);
   assert.equal(args.filter((argument) => argument === '--cache-to').length, 1);
   assert.ok(args.includes('type=gha,version=2,scope=hello-world-image'));
@@ -1035,7 +1037,6 @@ test('configures runtime publication namespaces, immutability, and uncached Carg
 test('all production runtime projects expose cached image, smoke, and guarded publish targets', () => {
   for (const project of [
     'otelcol-rust',
-    'arrowcol-rust',
     'arrowcol-dataflow-rust',
     'arrowcol-router-rust',
   ]) {

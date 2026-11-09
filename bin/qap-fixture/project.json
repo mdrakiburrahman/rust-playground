@@ -1,0 +1,66 @@
+{
+  "name": "qap-fixture",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "application",
+  "sourceRoot": "bin/qap-fixture/src",
+  "implicitDependencies": [
+    "arrowcol-buffer",
+    "arrow-deltalake"
+  ],
+  "namedInputs": {
+    "default": [
+      "{projectRoot}/**/*",
+      "{workspaceRoot}/Cargo.toml",
+      "{workspaceRoot}/Cargo.lock",
+      "{workspaceRoot}/rust-toolchain.toml",
+      "{workspaceRoot}/rustfmt.toml"
+    ]
+  },
+  "targets": {
+    "format": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "cargo fmt --package qap-fixture"
+      }
+    },
+    "format-check": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "cargo fmt --package qap-fixture -- --check"
+      }
+    },
+    "lint": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "cargo clippy --locked --package qap-fixture --all-targets -j 2 -- -D warnings"
+      }
+    },
+    "build": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "cargo build --locked --package qap-fixture -j 2"
+      }
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "cargo test --locked --package qap-fixture -j 2"
+      }
+    },
+    "verify": {
+      "executor": "nx:run-commands",
+      "dependsOn": [
+        "format-check",
+        "lint",
+        "test"
+      ],
+      "options": {
+        "commands": []
+      }
+    }
+  },
+  "tags": [
+    "scope:rust",
+    "type:app"
+  ]
+}

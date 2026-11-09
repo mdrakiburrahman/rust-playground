@@ -258,11 +258,48 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn spawned_owner_offloads_sync_delta_calls() -> Result<()> {
+        const CHILD: &str = "ARROWCOL_TEST_ISOLATED_OFFLOAD";
+        if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new("1")) {
+            let mut child = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "delta_io::tests::spawned_owner_offloads_sync_delta_calls",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .spawn()
+                .context("start isolated shared-executor offload test")?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        anyhow::ensure!(
+                            status.success(),
+                            "isolated shared-executor offload test failed: {status}"
+                        );
+                        return Ok(());
+                    }
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    result => {
+                        child.kill().context("stop isolated shared-executor offload test")?;
+                        child.wait().context("reap isolated shared-executor offload test")?;
+                        result.context("poll isolated shared-executor offload test")?;
+                        anyhow::bail!("isolated shared-executor offload test exceeded 30s watchdog");
+                    }
+                }
+            }
+        }
         let directory = tempfile::tempdir()?;
+        let caller_runtime = tokio::runtime::Handle::current().id();
         let task = spawn_shared_io(async move {
+            assert_ne!(tokio::runtime::Handle::current().id(), caller_runtime);
+            let owner_thread = std::thread::current().id();
             let executor = shared_executor()?;
             executor
                 .spawn_blocking(move || {
+                    assert_ne!(std::thread::current().id(), owner_thread);
                     use arrow::datatypes::{DataType, Field, Schema};
                     let table = crate::delta::DeltaTable::open(directory.path())?;
                     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));

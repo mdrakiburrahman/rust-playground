@@ -21,9 +21,9 @@ use arrow_flight::{
 use arrow_schema::{DataType, Field, Schema};
 use arrowcol_catalog::{
     CatalogControlPlane, CatalogError, CatalogField, CatalogResult, CatalogSchemaVersion, CatalogStore, CatalogType,
-    ChangeReservation, DdlParser, DescriptorArtifacts, FlightSqlDdlHandler, MemoryCatalogStore, MemoryMetastore,
-    RequestHash, ReserveOutcome, SagaId, SagaRecord, SagaStep, SchemaValidator, SchemaVersion, TypeMapping,
-    deterministic_field_id, deterministic_table_id, generate_descriptor_artifacts,
+    ChangeReservation, DdlParser, DescriptorArtifacts, FlightSqlDdlHandler, MemoryCatalogStore, RequestHash,
+    ReserveOutcome, SagaId, SagaRecord, SagaStep, SchemaValidator, SchemaVersion, TypeMapping, deterministic_field_id,
+    deterministic_table_id, generate_descriptor_artifacts,
 };
 use arrowcol_flight::{
     ArrowColFlightService, AuthenticationRequest, Authenticator, BatchAdmission, DeliveryGuarantee, PressureEvent,
@@ -47,20 +47,19 @@ use tonic::{
 use uuid::Uuid;
 
 #[tokio::test]
-async fn exact_schema_multi_batch_returns_sdk_compatible_receipt() -> Result<()> {
+async fn exact_schema_multi_batch_returns_durable_admission_without_receipt() -> Result<()> {
     let fixture = Fixture::with_current(false).await?;
-    let receipt = receipt_id()?;
-    let admission = MockAdmission::new(TestCompletion::Receipt(receipt), None);
+    let admission = MockAdmission::new(TestCompletion::DurableAdmission, None);
     let pressure = Arc::new(RecordingPressure::default());
     let pressure_hooks: Arc<dyn PressureHooks> = Arc::<RecordingPressure>::clone(&pressure);
     let service = fixture
-        .service(ImplementationPool::Direct, admission.clone())?
+        .service(ImplementationPool::Dataflow, admission.clone())?
         .with_pressure_hooks(pressure_hooks);
     let batches = vec![v1_batch(&fixture.v1, 0)?, v1_batch(&fixture.v1, 10)?];
     let request = ingest_request(
         &fixture.v1,
         batches,
-        ImplementationPool::Direct,
+        ImplementationPool::Dataflow,
         fixture.v1.fingerprint(),
     )
     .await?;
@@ -76,13 +75,10 @@ async fn exact_schema_multi_batch_returns_sdk_compatible_receipt() -> Result<()>
     assert_eq!(admission.batches().await.len(), 2);
     assert_eq!(results.len(), 1);
     let metadata = PutResultMetadata::from_put_result(&results[0])?;
-    assert_eq!(metadata.receipt_id(), Some(receipt));
-    assert_eq!(metadata.delivery_guarantee(), Some(DeliveryGuarantee::DurableReceipt));
+    assert_eq!(metadata.delivery_guarantee(), Some(DeliveryGuarantee::DurableAdmission));
+    assert!(matches!(&metadata, PutResultMetadata::DurableAdmission { .. }));
     let json: serde_json::Value = serde_json::from_slice(&results[0].app_metadata)?;
-    assert_eq!(
-        json.get("receipt_id").and_then(serde_json::Value::as_str),
-        Some(receipt.to_string().as_str())
-    );
+    assert!(json.get("receipt_id").is_none());
     let events = pressure.events();
     assert!(events.contains(&PressureEvent::StreamStarted));
     assert!(events.iter().any(|event| matches!(
@@ -121,7 +117,6 @@ async fn registered_older_schema_is_null_filled_to_current() -> Result<()> {
     assert_eq!(batches[0].column(2).null_count(), batches[0].num_rows());
     let metadata = PutResultMetadata::from_put_result(&results[0])?;
     assert_eq!(metadata.delivery_guarantee(), Some(DeliveryGuarantee::BestEffort));
-    assert_eq!(metadata.receipt_id(), None);
     assert!(matches!(
         metadata,
         PutResultMetadata::BestEffortAdmission {
@@ -138,14 +133,14 @@ async fn registered_older_schema_is_null_filled_to_current() -> Result<()> {
 async fn every_unregistered_breaking_mutation_is_rejected_before_admission() -> Result<()> {
     let fixture = Fixture::with_current(false).await?;
     let admission = MockAdmission::new(TestCompletion::BestEffort, None);
-    let service = fixture.service(ImplementationPool::Direct, admission.clone())?;
+    let service = fixture.service(ImplementationPool::Dataflow, admission.clone())?;
     let schemas = breaking_schemas();
 
     for (name, schema) in schemas {
         let request = schema_only_request(
             &schema,
             SchemaVersion::FIRST,
-            ImplementationPool::Direct,
+            ImplementationPool::Dataflow,
             fingerprint_schema(&schema),
         )
         .await?;
@@ -182,7 +177,7 @@ async fn known_historical_breaking_schema_is_rejected_before_admission() -> Resu
     install_schema(&catalog, Some(v1.clone()), &v2).await?;
     let admission = MockAdmission::new(TestCompletion::BestEffort, None);
     let service = build_service(
-        ImplementationPool::Direct,
+        ImplementationPool::Dataflow,
         Arc::new(catalog),
         admission.clone(),
         RuntimeLimits::default(),
@@ -190,7 +185,7 @@ async fn known_historical_breaking_schema_is_rejected_before_admission() -> Resu
     let request = ingest_request(
         &v1,
         vec![v1_batch(&v1, 0)?],
-        ImplementationPool::Direct,
+        ImplementationPool::Dataflow,
         v1.fingerprint(),
     )
     .await?;
@@ -216,7 +211,7 @@ async fn malformed_metadata_is_rejected_before_body_or_authentication() -> Resul
     let auth = Arc::new(MockAuthenticator::new(test_auth_context()?));
     let auth_provider: Arc<dyn Authenticator> = Arc::<MockAuthenticator>::clone(&auth);
     let service = ArrowColFlightService::new(
-        ImplementationPool::Direct,
+        ImplementationPool::Dataflow,
         Arc::new(fixture.catalog.clone()),
         auth_provider,
         Arc::new(admission.clone()),
@@ -249,12 +244,12 @@ async fn malformed_metadata_is_rejected_before_body_or_authentication() -> Resul
 async fn untrusted_claimed_fingerprint_is_rejected_before_admission() -> Result<()> {
     let fixture = Fixture::with_current(false).await?;
     let admission = MockAdmission::new(TestCompletion::BestEffort, None);
-    let service = fixture.service(ImplementationPool::Direct, admission.clone())?;
+    let service = fixture.service(ImplementationPool::Dataflow, admission.clone())?;
     let wrong_schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
     let request = ingest_request(
         &fixture.v1,
         vec![v1_batch(&fixture.v1, 0)?],
-        ImplementationPool::Direct,
+        ImplementationPool::Dataflow,
         fingerprint_schema(&wrong_schema),
     )
     .await?;
@@ -280,7 +275,7 @@ async fn unvalidated_internal_identity_is_rejected_before_body() -> Result<()> {
     let auth = Arc::new(MockAuthenticator::new(test_auth_context()?));
     let auth_provider: Arc<dyn Authenticator> = Arc::<MockAuthenticator>::clone(&auth);
     let service = ArrowColFlightService::new(
-        ImplementationPool::Direct,
+        ImplementationPool::Dataflow,
         Arc::new(fixture.catalog.clone()),
         auth_provider,
         Arc::new(admission.clone()),
@@ -293,7 +288,7 @@ async fn unvalidated_internal_identity_is_rejected_before_body() -> Result<()> {
     insert_ingest_metadata(
         request.metadata_mut(),
         &fixture.v1,
-        ImplementationPool::Direct,
+        ImplementationPool::Dataflow,
         fixture.v1.fingerprint(),
     )?;
     request.metadata_mut().insert_bin(
@@ -316,7 +311,7 @@ async fn unvalidated_internal_identity_is_rejected_before_body() -> Result<()> {
 async fn a_second_schema_message_aborts_the_admitted_stream() -> Result<()> {
     let fixture = Fixture::with_current(false).await?;
     let admission = MockAdmission::new(TestCompletion::BestEffort, None);
-    let service = fixture.service(ImplementationPool::Direct, admission.clone())?;
+    let service = fixture.service(ImplementationPool::Dataflow, admission.clone())?;
     let mut messages = encode_ingest(&fixture.v1, Vec::new()).await?;
     let mut second = messages
         .first()
@@ -328,7 +323,7 @@ async fn a_second_schema_message_aborts_the_admitted_stream() -> Result<()> {
     insert_ingest_metadata(
         request.metadata_mut(),
         &fixture.v1,
-        ImplementationPool::Direct,
+        ImplementationPool::Dataflow,
         fixture.v1.fingerprint(),
     )?;
 
@@ -356,7 +351,7 @@ async fn bounded_channel_applies_backpressure_to_the_input_stream() -> Result<()
         batch_channel_capacity: 1,
         ..RuntimeLimits::default()
     };
-    let service = fixture.service_with_limits(ImplementationPool::Direct, admission, limits)?;
+    let service = fixture.service_with_limits(ImplementationPool::Dataflow, admission, limits)?;
     let batches = (0..6)
         .map(|index| v1_batch(&fixture.v1, index * 10))
         .collect::<Result<Vec<_>>>()?;
@@ -371,7 +366,7 @@ async fn bounded_channel_applies_backpressure_to_the_input_stream() -> Result<()
     insert_ingest_metadata(
         request.metadata_mut(),
         &fixture.v1,
-        ImplementationPool::Direct,
+        ImplementationPool::Dataflow,
         fixture.v1.fingerprint(),
     )?;
     let response = service.handle_do_put(request).await?;
@@ -392,11 +387,11 @@ async fn dropping_the_response_cancels_and_aborts_admission() -> Result<()> {
     let fixture = Fixture::with_current(false).await?;
     let gate = Arc::new(BatchGate::new());
     let admission = MockAdmission::new(TestCompletion::BestEffort, Some(Arc::clone(&gate)));
-    let service = fixture.service(ImplementationPool::Direct, admission.clone())?;
+    let service = fixture.service(ImplementationPool::Dataflow, admission.clone())?;
     let request = ingest_request(
         &fixture.v1,
         vec![v1_batch(&fixture.v1, 0)?],
-        ImplementationPool::Direct,
+        ImplementationPool::Dataflow,
         fixture.v1.fingerprint(),
     )
     .await?;
@@ -413,11 +408,11 @@ async fn grpc_deadline_aborts_a_blocked_admission() -> Result<()> {
     let fixture = Fixture::with_current(false).await?;
     let gate = Arc::new(BatchGate::new());
     let admission = MockAdmission::new(TestCompletion::BestEffort, Some(Arc::clone(&gate)));
-    let service = fixture.service(ImplementationPool::Direct, admission.clone())?;
+    let service = fixture.service(ImplementationPool::Dataflow, admission.clone())?;
     let mut request = ingest_request(
         &fixture.v1,
         vec![v1_batch(&fixture.v1, 0)?],
-        ImplementationPool::Direct,
+        ImplementationPool::Dataflow,
         fixture.v1.fingerprint(),
     )
     .await?;
@@ -445,11 +440,11 @@ async fn schema_size_limit_rejects_before_admission() -> Result<()> {
         max_schema_bytes: 16,
         ..RuntimeLimits::default()
     };
-    let service = fixture.service_with_limits(ImplementationPool::Direct, admission.clone(), limits)?;
+    let service = fixture.service_with_limits(ImplementationPool::Dataflow, admission.clone(), limits)?;
     let request = schema_only_request(
         &fixture.v1.arrow_schema()?,
         fixture.v1.version(),
-        ImplementationPool::Direct,
+        ImplementationPool::Dataflow,
         fixture.v1.fingerprint(),
     )
     .await?;
@@ -465,40 +460,39 @@ async fn schema_size_limit_rejects_before_admission() -> Result<()> {
 }
 
 #[tokio::test]
-async fn direct_and_dfe_completion_modes_are_distinct() -> Result<()> {
-    let direct_fixture = Fixture::with_current(false).await?;
-    let receipt = receipt_id()?;
-    let direct_admission = MockAdmission::new(TestCompletion::Receipt(receipt), None);
-    let direct = direct_fixture.service(ImplementationPool::Direct, direct_admission)?;
-    let direct_request = ingest_request(
-        &direct_fixture.v1,
-        vec![v1_batch(&direct_fixture.v1, 0)?],
-        ImplementationPool::Direct,
-        direct_fixture.v1.fingerprint(),
+async fn durable_and_best_effort_dataflow_completions_are_distinct() -> Result<()> {
+    let durable_fixture = Fixture::with_current(false).await?;
+    let durable_admission = MockAdmission::new(TestCompletion::DurableAdmission, None);
+    let durable = durable_fixture.service(ImplementationPool::Dataflow, durable_admission)?;
+    let durable_request = ingest_request(
+        &durable_fixture.v1,
+        vec![v1_batch(&durable_fixture.v1, 0)?],
+        ImplementationPool::Dataflow,
+        durable_fixture.v1.fingerprint(),
     )
     .await?;
-    let direct_result = one_result(direct.handle_do_put(direct_request).await?).await?;
+    let durable_result = one_result(durable.handle_do_put(durable_request).await?).await?;
     assert!(matches!(
-        PutResultMetadata::from_put_result(&direct_result)?,
-        PutResultMetadata::Receipt {
-            delivery_guarantee: DeliveryGuarantee::DurableReceipt,
+        PutResultMetadata::from_put_result(&durable_result)?,
+        PutResultMetadata::DurableAdmission {
+            delivery_guarantee: DeliveryGuarantee::DurableAdmission,
             ..
         }
     ));
 
-    let dfe_fixture = Fixture::with_current(false).await?;
-    let dfe_admission = MockAdmission::new(TestCompletion::BestEffort, None);
-    let dfe = dfe_fixture.service(ImplementationPool::Dataflow, dfe_admission)?;
-    let dfe_request = ingest_request(
-        &dfe_fixture.v1,
-        vec![v1_batch(&dfe_fixture.v1, 0)?],
+    let best_effort_fixture = Fixture::with_current(false).await?;
+    let best_effort_admission = MockAdmission::new(TestCompletion::BestEffort, None);
+    let best_effort = best_effort_fixture.service(ImplementationPool::Dataflow, best_effort_admission)?;
+    let best_effort_request = ingest_request(
+        &best_effort_fixture.v1,
+        vec![v1_batch(&best_effort_fixture.v1, 0)?],
         ImplementationPool::Dataflow,
-        dfe_fixture.v1.fingerprint(),
+        best_effort_fixture.v1.fingerprint(),
     )
     .await?;
-    let dfe_result = one_result(dfe.handle_do_put(dfe_request).await?).await?;
+    let best_effort_result = one_result(best_effort.handle_do_put(best_effort_request).await?).await?;
     assert!(matches!(
-        PutResultMetadata::from_put_result(&dfe_result)?,
+        PutResultMetadata::from_put_result(&best_effort_result)?,
         PutResultMetadata::BestEffortAdmission {
             delivery_guarantee: DeliveryGuarantee::BestEffort,
             ..
@@ -510,20 +504,18 @@ async fn direct_and_dfe_completion_modes_are_distinct() -> Result<()> {
 #[tokio::test]
 async fn flight_sql_ddl_returns_standard_and_structured_completion() -> Result<()> {
     let catalog = MockCatalogStore::new();
-    let metastore = MemoryMetastore::new();
-    let (control_plane, report) =
-        CatalogControlPlane::start(DdlParser::default(), Arc::new(catalog.clone()), Arc::new(metastore)).await?;
+    let (control_plane, report) = CatalogControlPlane::start(DdlParser::default(), Arc::new(catalog.clone())).await?;
     assert!(report.failures.is_empty());
     let admission = MockAdmission::new(TestCompletion::BestEffort, None);
     let service = build_service(
-        ImplementationPool::Direct,
+        ImplementationPool::Dataflow,
         Arc::new(catalog),
         admission.clone(),
         RuntimeLimits::default(),
     )?
     .with_ddl_handler(Arc::new(control_plane) as Arc<dyn FlightSqlDdlHandler>);
     let command = CommandStatementUpdate {
-        query: "CREATE TABLE telemetry.prod.events (id BIGINT NOT NULL, body VARCHAR)".to_owned(),
+        query: "CREATE TABLE telemetry.prod.events (id BIGINT NOT NULL, body STRING) USING DELTA".to_owned(),
         transaction_id: None,
     };
     let descriptor = FlightDescriptor {
@@ -655,7 +647,7 @@ impl Authenticator for MockAuthenticator {
 
 #[derive(Clone, Copy)]
 enum TestCompletion {
-    Receipt(arrowcol_protocol::ReceiptId),
+    DurableAdmission,
     BestEffort,
 }
 
@@ -748,7 +740,7 @@ impl StreamLifecycle for MockLifecycle {
 
     async fn complete(&mut self, _summary: StreamSummary) -> RuntimeResult<StreamCompletion> {
         Ok(match self.state.completion {
-            TestCompletion::Receipt(receipt_id) => StreamCompletion::receipt(receipt_id),
+            TestCompletion::DurableAdmission => StreamCompletion::durable_admission(),
             TestCompletion::BestEffort => StreamCompletion::best_effort(),
         })
     }
@@ -876,10 +868,6 @@ impl CatalogStore for MockCatalogStore {
         self.inner.saga(saga_id).await
     }
 
-    async fn mark_hive_applied(&self, saga_id: SagaId) -> CatalogResult<SagaRecord> {
-        self.inner.mark_hive_applied(saga_id).await
-    }
-
     async fn persist_artifacts(&self, saga_id: SagaId, artifacts: &DescriptorArtifacts) -> CatalogResult<SagaRecord> {
         self.inner.persist_artifacts(saga_id, artifacts).await
     }
@@ -919,7 +907,6 @@ async fn install_schema(
         ReserveOutcome::Reserved(saga) | ReserveOutcome::Existing(saga) => saga,
         ReserveOutcome::AlreadyCurrent(_) => return Ok(()),
     };
-    store.mark_hive_applied(saga.id()).await?;
     let artifacts = generate_descriptor_artifacts(target_schema)?;
     store.persist_artifacts(saga.id(), &artifacts).await?;
     store.finalize(saga.id()).await?;
@@ -1133,10 +1120,6 @@ fn test_auth_context() -> Result<AuthContext> {
         UnixMillis::new(1)?,
         None,
     )?)
-}
-
-fn receipt_id() -> Result<arrowcol_protocol::ReceiptId> {
-    "c7f0d870-5870-4ec7-9de8-c7ef1f0ac158".parse().map_err(Into::into)
 }
 
 async fn one_result(response: tonic::Response<arrowcol_flight::FlightResponseStream<PutResult>>) -> Result<PutResult> {

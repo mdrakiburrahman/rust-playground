@@ -12,7 +12,7 @@ RUN apt-get update \
 
 WORKDIR /workspace
 COPY . .
-RUN cargo build --locked --release --package arrowcol-experiment --package delta-maintenance
+RUN cargo build --locked --release --package qap-fixture --package delta-maintenance
 
 FROM node:24.22.2-bookworm-slim
 
@@ -23,7 +23,7 @@ RUN npm ci --omit=dev --no-audit --no-fund
 COPY infra/azure/ ./infra/azure/
 COPY experiments/azure-qap/ ./experiments/azure-qap/
 COPY tools/libs/experiment-kit/src/ ./tools/libs/experiment-kit/src/
-COPY --from=rust-build /workspace/target/release/arrowcol-experiment ./target/release/arrowcol-experiment
+COPY --from=rust-build /workspace/target/release/qap-fixture ./target/release/qap-fixture
 COPY --from=rust-build /workspace/target/release/delta-maintenance ./target/release/delta-maintenance
 USER 10001:10001
 ENTRYPOINT ["node_modules/.bin/tsx", "experiments/azure-qap/src/job.ts"]

@@ -4,7 +4,6 @@
   "projectType": "library",
   "implicitDependencies": [
     "arrowcol-buffer",
-    "arrowcol-receipts",
     "arrowcol-catalog",
     "arrowcol-protocol",
     "arrowcol-flight",
@@ -13,8 +12,8 @@
     "arrowcol-dataflow-components",
     "arrowcol-dataflow-rust",
     "arrowcol-router-rust",
+    "arrowcol-catalog-rust",
     "kusto-explorer",
-    "arrowcol-rust",
     "arrowcol-sdk-gen",
     "arrow-deltalake",
     "arrow-tenant-stream",
@@ -37,7 +36,6 @@
         {
           "projects": [
             "arrowcol-buffer",
-            "arrowcol-receipts",
             "arrowcol-catalog",
             "arrowcol-protocol",
             "arrowcol-flight",
@@ -46,8 +44,8 @@
             "arrowcol-dataflow-components",
             "arrowcol-dataflow-rust",
             "arrowcol-router-rust",
+            "arrowcol-catalog-rust",
             "kusto-explorer",
-            "arrowcol-rust",
             "arrowcol-sdk-gen",
             "arrow-deltalake",
             "arrow-tenant-stream",
@@ -83,7 +81,6 @@
         {
           "projects": [
             "arrowcol-buffer",
-            "arrowcol-receipts",
             "arrowcol-catalog",
             "arrowcol-protocol",
             "arrowcol-flight",
@@ -92,8 +89,8 @@
             "arrowcol-dataflow-components",
             "arrowcol-dataflow-rust",
             "arrowcol-router-rust",
+            "arrowcol-catalog-rust",
             "kusto-explorer",
-            "arrowcol-rust",
             "arrowcol-sdk-gen",
             "arrow-deltalake",
             "arrow-tenant-stream",
@@ -122,7 +119,6 @@
         {
           "projects": [
             "arrowcol-buffer",
-            "arrowcol-receipts",
             "arrowcol-catalog",
             "arrowcol-protocol",
             "arrowcol-flight",
@@ -131,8 +127,8 @@
             "arrowcol-dataflow-components",
             "arrowcol-dataflow-rust",
             "arrowcol-router-rust",
+            "arrowcol-catalog-rust",
             "kusto-explorer",
-            "arrowcol-rust",
             "arrowcol-sdk-gen",
             "arrow-deltalake",
             "arrow-tenant-stream",
@@ -167,7 +163,6 @@
         {
           "projects": [
             "arrowcol-buffer",
-            "arrowcol-receipts",
             "arrowcol-catalog",
             "arrowcol-protocol",
             "arrowcol-flight",
@@ -176,8 +171,8 @@
             "arrowcol-dataflow-components",
             "arrowcol-dataflow-rust",
             "arrowcol-router-rust",
+            "arrowcol-catalog-rust",
             "kusto-explorer",
-            "arrowcol-rust",
             "arrowcol-sdk-gen",
             "arrow-deltalake",
             "arrow-tenant-stream",
@@ -224,7 +219,6 @@
         {
           "projects": [
             "arrowcol-buffer",
-            "arrowcol-receipts",
             "arrowcol-catalog",
             "arrowcol-protocol",
             "arrowcol-flight",
@@ -233,8 +227,8 @@
             "arrowcol-dataflow-components",
             "arrowcol-dataflow-rust",
             "arrowcol-router-rust",
+            "arrowcol-catalog-rust",
             "kusto-explorer",
-            "arrowcol-rust",
             "arrowcol-sdk-gen",
             "arrow-deltalake",
             "arrow-tenant-stream",
@@ -268,7 +262,6 @@
         {
           "projects": [
             "arrowcol-buffer",
-            "arrowcol-receipts",
             "arrowcol-catalog",
             "arrowcol-protocol",
             "arrowcol-flight",
@@ -277,8 +270,8 @@
             "arrowcol-dataflow-components",
             "arrowcol-dataflow-rust",
             "arrowcol-router-rust",
+            "arrowcol-catalog-rust",
             "kusto-explorer",
-            "arrowcol-rust",
             "arrowcol-sdk-gen",
             "arrow-deltalake",
             "arrow-tenant-stream",
@@ -311,7 +304,6 @@
         "{workspaceRoot}/projects/arrowcol-dataflow-rust/Cargo.toml",
         "{workspaceRoot}/projects/loadtest/loadgen/Cargo.toml",
         "{workspaceRoot}/projects/loadtest/reader/Cargo.toml",
-        "{workspaceRoot}/projects/arrowcol-rust/Cargo.toml",
         "{workspaceRoot}/projects/otelcol-rust/Cargo.toml",
         "{workspaceRoot}/projects/kusto-explorer/Cargo.toml",
         "{workspaceRoot}/projects/kusto-explorer/api/Cargo.toml",
@@ -343,8 +335,6 @@
         "{workspaceRoot}/projects/loadtest/loadgen/src/**/*",
         "{workspaceRoot}/projects/loadtest/reader/Cargo.toml",
         "{workspaceRoot}/projects/loadtest/reader/src/**/*",
-        "{workspaceRoot}/projects/arrowcol-rust/Cargo.toml",
-        "{workspaceRoot}/projects/arrowcol-rust/src/**/*",
         "{workspaceRoot}/projects/otelcol-rust/Cargo.toml",
         "{workspaceRoot}/projects/otelcol-rust/src/**/*",
         "{workspaceRoot}/projects/kusto-explorer/Cargo.toml",

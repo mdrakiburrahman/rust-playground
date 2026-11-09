@@ -3,7 +3,7 @@
   "$schema": "../../node_modules/nx/schemas/project-schema.json",
   "projectType": "application",
   "metadata": {
-    "description": "Local SQL Server and Apache Hive Metastore infrastructure for Arrowcol."
+    "description": "Local SQL Server routing and fencing infrastructure."
   },
   "targets": {
     "bootstrap": {
@@ -40,7 +40,7 @@
         "forwardAllArgs": true
       },
       "metadata": {
-        "description": "Build and start the stack, waiting for deterministic service health."
+        "description": "Start healthy SQL Server, then run database bootstrap and migrations to completion."
       }
     },
     "down": {
@@ -101,7 +101,7 @@
         "forwardAllArgs": false
       },
       "metadata": {
-        "description": "Start the stack and verify health, databases, migrations, Hive schema, and rerunnable initialization."
+        "description": "Verify SQL health, routing tables/indexes/constraints, migration checksums, retired-table absence, and idempotent initialization."
       }
     },
     "verify": {

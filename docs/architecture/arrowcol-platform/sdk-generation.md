@@ -1,146 +1,73 @@
-# DDL to client SDK
-
-[![DDL, immutable artifacts, validation, and language SDK generation](diagrams/sdk-generation.png)](diagrams/sdk-generation.html)
+# Catalog-driven SDK generation
 
 [Architecture index](README.md)
 
-**The flow is DDL -> normalized catalog -> validated artifacts -> custom
-Rust/TypeScript renderers. It is not DDL -> protoc -> SDK.**
+Spark SQL `.sql` DDL defines the table; the catalog owns immutable schema
+versions and stable field identities. Generated SDKs use **Arrow Flight for
+transport**. Protobuf is a schema contract, not an ingestion wire format.
 
-## One schema, three artifacts
-
-```sql
-CREATE TABLE telemetry.prod.events (
-    id BIGINT NOT NULL,
-    body VARCHAR NULL
-)
-```
-
-The [DDL parser](../../../crates/arrowcol-catalog/src/ddl.rs) creates a
-`CatalogSchemaVersion` with stable table/field identities, ordered positions,
-protobuf field numbers, Arrow type/nullability/partition mappings, canonical
-DDL, version, and fingerprint. The [SQL/Hive saga](catalog.md#durable-sqlhive-saga)
-persists deterministic artifacts before activating the catalog head.
-
-| Artifact | Purpose |
+| Catalog artifact | Contract |
 | --- | --- |
-| `manifest.json` | Canonical normalized catalog schema; preserves Arrow-specific details |
-| `schema.arrow` | Exact Arrow IPC schema message; no row data |
-| `descriptor.pb` | Binary proto2 `FileDescriptorSet` generated with prost descriptor types |
+| `manifest.json` | Canonical schema, identities, version, Arrow logical details and fingerprint |
+| `schema.arrow` | Exact Arrow IPC schema; no row data |
+| `descriptor.pb` | Proto2 `FileDescriptorSet` |
+| `schema.proto` | Real source reconstructed deterministically from the persisted descriptor |
 
-These are sibling outputs of the normalized schema. The descriptor names a
-versioned `.proto` file but does not emit that source file or invoke `protoc`.
-Scalar non-null/nullable fields use required/optional labels; collection
-representations use repeated/message mappings. The descriptor alone is not a
-lossless replacement for the Arrow-aware manifest.
+All scalar protobuf fields are optional, including SQL `NOT NULL` columns.
+SQL/Arrow nullability remains authoritative for ingestion. Timestamp contract
+values are `int64` UTC microseconds; decimals are base-10 strings. Collections
+use repeated/message fields. Field numbers survive version changes and catalog
+restart, are never reused, and skip the protobuf-reserved range 19000-19999.
 
-## Validate, render, package
-
-```text
-Export immutable version's artifacts
-  -> rebuild manifest schema and fingerprint
-  -> regenerate all 3 artifacts; require exact byte equality
-  -> validate supported types and identifiers
-  -> render Rust + TypeScript from the normalized schema
-  -> stage/replace output; emit descriptors and hashed sdk-manifest
-  -> check exact regeneration; optionally package deterministic archive
-```
-
-The generator rejects missing, edited, inconsistent, or lossy input.
-`check` does not mutate output and rejects missing, extra, or changed files.
-Write commands require workspace-relative output under gitignored `.temp` or
-`target`; traversal, absolute paths, symlinked parents, and collisions fail closed.
-
-| Generated API | Client responsibility |
+| Generated surface | Responsibility |
 | --- | --- |
-| Typed row/nested builders; exact schema and RecordBatch construction | Supply values matching the generated types |
-| Table/version/fingerprint constants; routing metadata; Flight request helpers | Configure authenticated transport and send requests |
-| Receipt-ID parsing and receipt-status URL helpers | Persist source/receipt mapping, poll, retry/reconcile, enforce purge rule |
+| Rust `src/proto.rs` | Prost-generated contract types, alongside Arrow row builders |
+| Rust and TypeScript row/builders | Construct the exact registered Arrow layout |
+| Flight descriptor, fingerprint and routing helpers | Configure transport and send through Dataflow |
+| `sdk-manifest.json` | Hashes of artifacts and generated files; package/version identity |
 
-The packages are schema/building/protocol helpers, not an automatic networking
-or retry service. Delivery differs by pool; see [client contract](delivery-guarantees.md).
+Generation cross-checks source, descriptor, Arrow schema and normalized manifest.
+Unsupported/lossy types, identifier collisions, stale output, symlinks and unsafe
+paths fail explicitly. `check` is read-only and requires byte-exact output.
+Generated roots must remain under gitignored `.temp` or `target`; archive
+historical clients before cleanup.
 
-## Local example
+## Commands
 
-`fixture` is an example/test path, not production catalog registration:
+Run inside the repository devcontainer.
 
 ```bash
-cargo run --locked -p arrowcol-sdk-gen -- \
-  fixture --ddl crates/arrowcol-sdk-gen/fixtures/telemetry-events.sql \
-  --out crates/arrowcol-sdk-gen/.temp/catalog
-
-cargo run --locked -p arrowcol-sdk-gen -- \
-  generate --artifacts crates/arrowcol-sdk-gen/.temp/catalog \
-  --out crates/arrowcol-sdk-gen/.temp/generated
-
-cargo run --locked -p arrowcol-sdk-gen -- \
-  check --artifacts crates/arrowcol-sdk-gen/.temp/catalog \
-  --out crates/arrowcol-sdk-gen/.temp/generated
-
-cargo run --locked -p arrowcol-sdk-gen -- \
-  package-artifact --input crates/arrowcol-sdk-gen/.temp/generated \
-  --out crates/arrowcol-sdk-gen/.temp/arrowcol-sdk.tar.gz
+cargo run --locked -p arrowcol-sdk-gen -- generate \
+  --catalog-endpoint http://127.0.0.1:8817 \
+  --ddl schemas/events.sql --table telemetry.prod.events \
+  --out .temp/sdk/events --export-artifacts .temp/catalog/events
 ```
 
-```text
-crates/arrowcol-sdk-gen/.temp/
-  catalog/{manifest.json,schema.arrow,descriptor.pb}
-  generated/
-    sdk-manifest.json
-    descriptors/{manifest.json,schema.arrow,descriptor.pb}
-    rust/{Cargo.toml,src/lib.rs,tests/generated.rs}
-    typescript/{package.json,src/index.ts,test/generated.test.ts}
-```
+`--ddl` is repeatable and ordered; each regular `.sql` file is one Spark DDL
+statement. The command connects to the running catalog, executes Flight SQL,
+then validates the catalog's committed history and artifacts. `--version 1`
+selects a historical contract without changing it to the current head.
+`--artifacts` remains available for offline generation from validated exports.
 
-`sdk-manifest.json` records identity, version, fingerprint, descriptor hashes,
-Flight routing details, package roots, and generated-file hashes.
-Generation replaces staged output so old files disappear.
+| Command | Expected result |
+| --- | --- |
+| `npx --no-install nx run arrowcol-sdk-gen:generate` | Separate v1/v2 artifacts and Rust/TS SDKs |
+| `npx --no-install nx run arrowcol-sdk-gen:check` | Deterministic generated output matches |
+| `npx --no-install nx run arrowcol-sdk-gen:compatibility` | Catalog nullable-tail checks and real Buf `WIRE_JSON` both pass |
+| `npx --no-install nx run arrowcol-sdk-gen:generated-test` | Generated Rust/Prost and TypeScript packages compile and execute |
+| `npx --no-install nx run arrowcol-sdk-gen:package-artifact` | Deterministic SDK archive |
 
-The [load generator integration](../../../projects/loadtest/loadgen/src/sdk.rs)
-registers real DDL through Flight SQL, checks the SQL catalog head, exports the
-version's artifacts via `CatalogStore::artifacts`, and runs `generate` + `check`
-per table:
-
-```text
-projects/loadtest/.temp/loadgen/<run-id>/artifacts/<table>/
-projects/loadtest/.temp/loadgen/<run-id>/generated/<table>/
-```
-
-It consumes generated manifests/descriptors for batch construction. There is
-no automatic public HTTP artifact export or npm/crates registry publishing
-implied by this workflow.
+Offline fixtures materialize CREATE followed by ALTER into distinct immutable versions;
+v1 output is not regenerated as v2. CI compares their separate `schema.proto`
+files using the pinned npm Buf CLI and root `buf.yaml`. Rust compatibility checks
+remain stricter than protobuf: existing Arrow fields and partition roles cannot
+change, and additions must be nullable trailing columns.
 
 ## Evolution and limits
 
-```sql
-ALTER TABLE telemetry.prod.events
-ADD COLUMNS (source VARCHAR NULL)
-```
+A historical SDK continues to send its exact registered old Arrow layout.
+The collector reuses existing arrays and null-fills only new trailing fields.
+Protobuf optionality does not weaken that validation.
 
-The new immutable version preserves existing fields, positions, numbers, types,
-nullability, and partition roles. A historical SDK can still send its **exact
-registered** old layout; the collector reuses its arrays and null-fills only
-new trailing fields.
-
-`compatibility` checks catalog evolution plus protobuf wire/JSON stability:
-removals, reordering, renumbering, name/type changes, required additions,
-partition changes, or changed contents for one immutable version are rejected.
-
-```bash
-npx --no-install nx run arrowcol-sdk-gen:verify
-```
-
-Supported lossless mappings include scalars, timestamps/timezones, binary/view,
-decimal, list/large-list/fixed-size-list, struct, and map. Dictionary and ListView
-are rejected by the shared Rust/Arrow JavaScript construction path.
-
-All generated roots are disposable and gitignored. Retain packaged historical
-SDKs outside these roots if clients need them long-term.
-See the [generator guide](../../../crates/arrowcol-sdk-gen/README.md) for
-`compatibility` CLI arguments and individual Nx targets.
-
-Sources: [artifact creation](../../../crates/arrowcol-catalog/src/artifacts.rs),
-[artifact verification](../../../crates/arrowcol-sdk-gen/src/artifact.rs),
-[renderers](../../../crates/arrowcol-sdk-gen/src/render/mod.rs),
-[generation/check](../../../crates/arrowcol-sdk-gen/src/generate.rs),
-[compatibility](../../../crates/arrowcol-sdk-gen/src/compatibility.rs).
+See the [generator CLI guide](../../../crates/arrowcol-sdk-gen/README.md) for
+artifact-based export, packaging and safety details.

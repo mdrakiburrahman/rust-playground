@@ -5,7 +5,8 @@
   "sourceRoot": "projects/arrowcol-dataflow-rust/src",
   "implicitDependencies": [
     "arrowcol-dataflow-components",
-    "arrowcol-infra"
+    "arrowcol-infra",
+    "arrowcol-catalog-rust"
   ],
   "namedInputs": {
     "default": [
@@ -154,6 +155,7 @@
     "live-e2e": {
       "executor": "nx:run-commands",
       "cache": false,
+      "dependsOn": [{ "projects": ["arrowcol-catalog-rust"], "target": "build" }],
       "options": {
         "command": "projects/arrowcol-dataflow-rust/scripts/live-e2e.sh",
         "cwd": "{workspaceRoot}",

@@ -1,174 +1,102 @@
-# delta-maintenance
+# Delta maintenance
 
-A standalone Delta Lake maintenance service built on `arrow_deltalake::maintenance`. It runs on Delta Kernel 0.29 only, with no delta-rs.
-
-It is a separate process, not a collector task. It opens tables with `DeltaTable::open_for_maintenance`, so it does not take the collector's writer-lifetime lock. Every publish and delete goes through the core's `check_publication()` hook and its `GuardedCommitter`.
-
-## Operations
-
-| Operation | Effect | Commit |
-| --- | --- | --- |
-| `optimize` | Rewrites small files in the latest-N closed Hive partitions into sorted files of about 128 MiB. Rows, schema and partition values are preserved. | One atomic `dataChange=false` add+remove |
-| `purge` | Removes still-active files in expired `__arrowcol_ingestion` partitions. | `dataChange=true` removes, plus the `arrowcol.purge.before-ms` watermark, in the same transaction |
-| `vacuum` | VACUUM LITE: physically deletes tombstoned files older than the retention period, using `_delta_log` only (no data directory listing). | None |
-| `checkpoint` | Writes a classic Kernel checkpoint once `--checkpoint-every-commits` (default 100) commits follow the hinted checkpoint. This bounds snapshot replay for the collector and readers. Application transactions (publication and purge identities) and metadata are retained. JSON history is never deleted. | None (checkpoint Parquet + `_last_checkpoint` hint) |
-| `prune-log` | Deletes `_delta_log` history (`NNN.json` strictly below `C`, and older checkpoints; `C.json` is retained) once checkpoint `C` is proven equivalent to it. See [Log pruning](#log-pruning). | None |
-
-## Safety
-
-- **Dry run by default.** The service plans and prints JSON reports and changes nothing unless you pass `--apply`.
-- **Applying revalidates first.** Before applying a plan the service rechecks the table id, metadata, protocol and the exact readset. Stale plans fail with `stale_plan` or `metadata_changed`.
-- **Commit retries are bounded.** Commit collisions retry at most 8 times within 10 seconds, with jitter.
-- **Default frontier protection.** OPTIMIZE protects the newest ingestion partition and every still-open partition. Only the explicit one-shot `--sealed-final` OPTIMIZE policy bypasses this churn protection. PURGE protection is unchanged.
-- **Bad partitions are never deleted.** Malformed or null partition values fail closed.
-- **No empty commits.** No-op runs and repeated runs leave the table version unchanged. The watermark is never committed on its own.
-- **VACUUM defaults to seven days.** Ordinary local/Azure maintenance can explicitly use `--vacuum-retention-secs 0` (or another nonnegative value below seven days) with `--allow-short-vacuum-retention`: **old snapshot/QAP readers can break**. This acknowledges VACUUM risk only, not shorter log retention. The separate `--unsafe-short-vacuum-for-tests` override still requires a marked disposable local temp root. JSON `vacuum` evidence reports the effective retention in milliseconds and both acknowledgement flags.
-- **VACUUM needs explained history.** It requires contiguous JSON commits `0..=version`, or, after `prune-log`, a durable log floor `F` whose checkpoint exists, covered by the VACUUM LITE progress record, followed by contiguous JSON `F+1..=version`. Any other gap fails visibly with `unsupported`.
-- **VACUUM rejects unsafe paths.** Traversal and external paths are rejected.
-- **VACUUM reports partial progress.** Cancelling mid-delete reports a `partial` outcome.
-
-On Azure the service opens tables through the shared publisher session and closes it after the run; a failed close exits nonzero and leaves its registration in place. Reset execution stays disabled, so the service does not claim infra-reset safety.
-
-### Log pruning
-
-`prune-log` never guesses; when any condition fails it reports `noop` (or refuses with `unsupported` on a disagreement) and deletes nothing.
-
-**VACUUM LITE progress.** Only a complete VACUUM LITE apply (not a dry run, not partial or cancelled, no backlog) writes `_arrowcol_maintenance/vacuum-lite.json` under the table root (never inside `_delta_log`): `{table_id, version, cutoff_ms}`. It states that every remove in commits `0..=version` with `deletionTimestamp < cutoff_ms` was physically deleted or confirmed absent. `version` is the version that VACUUM actually replayed. The record is bound to the table id and is monotonic: it is replaced only by a record with both a greater-or-equal version and a greater-or-equal cutoff. It is written with an exclusive lock, temp file, fsync and rename on local roots, and with create-if-absent or etag-conditional puts on object stores.
-
-**Proof.** A plan picks the newest classic checkpoint `C` such that:
-
-1. checkpoint `C` exists, `_last_checkpoint` points at a version `>= C`, and no multi-part, V2 or compacted log object exists at or below it;
-2. an independent, hand-written replay of every JSON commit `0..=C` (every file must be present) yields the same recovery-relevant state as both a direct Parquet read of checkpoint `C` and Delta Kernel loading the snapshot at `C` from it. That state is: the table id; every active add path with its normalized `partitionValues` and `size`; the protocol (reader/writer versions and features); the metadata schema, `partitionColumns` and `configuration`; and `appId -> version` for every application transaction (publications, maintenance plans and the `arrowcol.purge.before-ms` watermark). Per-file `stats` are advisory and not compared, and nothing is compared as serialized bytes. Txn-retention properties are refused;
-3. the progress record has the same table id, `version >= C`, and every remove in `0..=C` has a `deletionTimestamp` (missing fails) older than its `cutoff_ms`. Kernel checkpoints drop expired tombstones, so this is what keeps pruning from leaking never-vacuumed files;
-4. every deleted commit (`< C`) is older than `now - log retention`, using the later of `commitInfo.timestamp`/`inCommitTimestamp` and the file's modification time. `C.json` is retained, so its age does not matter, but its removes still count for rule 3. Every checkpoint below `C` that would be deleted (including an old floor checkpoint when the floor advances) must also have a modification time older than the cutoff; otherwise the plan is `noop` and a pending apply is `stale-plan`.
-
-Like Delta's own log cleanup (which keeps commits from the latest checkpoint version on), pruning never deletes `C.json`: writers such as delta-rs need the commit at the checkpoint version to append. A `_last_checkpoint` that is malformed is an `unsupported` error for pruning (checkpointing treats it as absent and repairs it). One that points below the durable floor, for example after a delayed older checkpoint, makes the plan `noop` and a pending apply `stale-plan`, with nothing deleted.
-
-Log retention is `--log-retention-secs`, defaulting to `delta.logRetentionDuration` (30 days when unset). A shorter value still needs `--unsafe-short-vacuum-for-tests` and a marked disposable temp root; `--allow-short-vacuum-retention` does not authorize it.
-
-**Apply.** Apply re-proves everything against fresh state and checks publication authority. It then durably writes `_arrowcol_maintenance/log-floor.json` (`{table_id, checkpoint_version: C}`; table-bound, never lowered, fsynced) **before** the first delete. It then deletes `NNN.json` below `C` and checkpoints below `C` in ascending order. `NotFound` counts as already absent. At most `--max-prune-files` (default 10,000) objects are deleted per run; the rest is reported as backlog. It stops between deletes on cancel or deadline with a `partial` outcome. Checkpoint `C`, `C.json`, `_last_checkpoint` and anything newer are never deleted, and no Delta commit is written.
-
-After a floor `F` exists, the next proof replays the Parquet contents of checkpoint `F` plus JSON `F+1..=C'`; checkpoint `F`'s tombstones must also be older than the progress cutoff. The retained `F.json` becomes deletable when the floor advances, so it must pass the same age and remove checks. A run interrupted after writing the floor is completed by a later plan that re-verifies checkpoint `F` against Kernel and deletes the leftovers below it (JSON `< F`). The full proof held before that floor was written.
-
-### Log growth
-
-Without `prune-log`, `_delta_log` grows without bound: VACUUM LITE proves tombstones from the log, and `checkpoint` bounds replay *time*, not log *size*. VACUUM refuses with `resource_limit` once the replayed history exceeds `max_log_files` (100,000 commits); it never falls back to a partial scan.
-
-With `vacuum`, `checkpoint` and `prune-log` scheduled, the **number** of JSON commits and old checkpoint files plateaus at about max(VACUUM retention, log retention) worth of commits, plus the checkpoint interval. A commit becomes prunable only once its removes are vacuumed (VACUUM retention, seven days by default) and it is older than the log retention (30 days by default). That plateau is reachable inside a short stress window only under the test overrides (`--vacuum-retention-secs 0 --log-retention-secs 0 --unsafe-short-vacuum-for-tests` on a disposable root).
-
-**Known limitation: total log bytes are not bounded.** Checkpoints carry every application transaction forever, because transaction retention is disallowed. That includes one `arrowcol.publication.<uuid>` per receipt and one `arrowcol.purge.plan.<uuid>` per maintenance plan. The newest checkpoint therefore grows with the number of publications and plans. Pruning bounds only the count of historical JSON commits and old checkpoint files, not total `_delta_log` bytes. Only classic single-file checkpoints are supported.
-
-## Usage
-
-```bash
-# One-shot dry run, then apply
-delta-maintenance --root file:///data/delta/ --table events --operation optimize --operation purge \
-  --granularity minute --purge-retention-secs 86400
-delta-maintenance ... --apply
-
-# Scheduled service with Prometheus metrics on 127.0.0.1:9467
-delta-maintenance --root abfss://c@acct.dfs.core.windows.net/delta/ --table events \
-  --operation optimize --operation vacuum --interval-secs 300 --apply
-```
-
-### Scheduled mode
-
-- Tables are processed one operation at a time per table. Use `--max-concurrent-tables` (1..=16) to process several tables in parallel.
-- When a cycle finds no work, the next interval doubles, up to `--max-idle-backoff-secs`.
-- Each operation is limited by `--operation-timeout-secs`.
-- A heartbeat line goes to stderr every cycle.
-- SIGINT and SIGTERM stop the service between bounded steps.
-
-### Final-compaction policy and evidence
-
-`--sealed-final` is an opt-in **OPTIMIZE churn policy**, not a verified seal,
-publisher-release receipt, reader lease, or retention override. Its default is
-false. It includes valid newest and still-open ingestion partitions in the same
-small-file planner. Null/malformed partitions remain skipped. Every existing
-byte, row, bin, action and decoding bound still applies; one file per partition
-is not guaranteed. Unrelated blind appends remain compatible: apply revalidates
-each planned input and preserves files appended after planning.
-
-The CLI accepts this flag only for one-shot `--operation optimize`, both dry-run
-and apply. It rejects `--interval-secs`, `--max-cycles`, and any mixed or other
-operation before opening tables or starting telemetry/metrics. It changes no
-VACUUM, PURGE, log-cleanup, publication-transaction or retention safety rule.
-Compaction adds its existing maintenance-plan transaction; existing publication
-transactions remain intact.
-
-```bash
-# Inspect the real final-compaction plan; no files or commits are changed.
-delta-maintenance --root file:///data/delta/ --table events --operation optimize \
-  --granularity minute --sealed-final
-# Apply one bounded plan; repeat planning explicitly if work remains.
-delta-maintenance --root file:///data/delta/ --table events --operation optimize \
-  --granularity minute --sealed-final --apply
-```
-
-Each OPTIMIZE JSON line includes `optimize.config` (the effective policy and
-limits, including its resolved `now_ms`) and `optimize.plan` (the actual typed
-plan, with `header.read_version`, partition-valued input `bins`, `backlog_files`,
-`protected_partitions`, and `skipped_partitions`). A null config `layout` means
-the existing schema-derived default layout is used. Outputs cannot be known
-until real Parquet rewriting: `report.outputs` and `report.files_added` describe
-actual apply results, not estimated dry-run outputs. `report.read_version` is
-the plan version; `report.version` is the observed/apply result version.
-Evidence is retained on an apply error when planning succeeded.
-
-A fresh **dry-run** empty plan still has `report.outcome = "planned"`, not
-`"noop"`. An empty-plan **apply** has `report.outcome = "noop"` and makes no
-commit. Zero `report.files_added` alone proves neither emptiness nor success.
-Callers must require a successful exit, exactly one error-free OPTIMIZE result
-for every expected table, and real `optimize.plan.bins = []` with no backlog.
-For a complete final-compaction gate they must also reject skipped/protected
-partitions and verify the expected policy/config, table/root/run bindings and
-the current versions. Missing reports or operation failures are not no-ops.
-
-Lifecycle orchestration must independently establish positive writer release,
-clean mutator-drain evidence and run/root/table/SDK bindings before final
-compaction, and join all maintenance processes before capturing immutable reader
-snapshots. This CLI neither verifies those receipts nor orchestrates repeated
-passes. OPTIMIZE preserves exact rows, schema, partition values and history
-using `dataChange=false`; it does not promise a particular external cache
-convergence time or discard historical acceleration work.
-
-### Exit codes
-
-| Code | Meaning |
+| Surface | Contract |
 | --- | --- |
-| 0 | Success |
-| 1 | An operation failed. Its JSON report includes `error_kind`. |
-| 2 | Invalid configuration |
+| Policy | Catalog TBLPROPERTIES override CLI/process defaults, then the [central registry](../reference/TABLE_PROPERTIES.md). Unknown `arrowcol.*` keys fail DDL validation. |
+| Discovery | `--catalog-endpoint http://catalog:8817` uses `arrowcol-catalog-client`'s generated GetSnapshot RPC: one atomic catalog snapshot per pass, shared by all workers. `FilesystemDiscovery` supports explicit local/cloud allowlists and bounded automatic local discovery. |
+| Ordering | PURGE -> OPTIMIZE -> VACUUM -> checkpoint -> PRUNE-LOG, serially for each table; bounded parallelism across tables. |
+| Coordination | Process-wide striped mutexes serialize passes for the same table URL, including overlapping service invocations. Delta commits and guarded storage still coordinate independent processes. |
+| Schedule | `arrowcol.maintenance.interval` applies independently to each table. An error is not an idle success and does not trigger idle exponential backoff. |
+| Observability | JSON results identify `negative_probe`; Prometheus `delta_maintenance_negative_probes_total` and outcome-labelled runs distinguish cheap noops from plans, work and errors. Equivalent counters are exported through OpenTelemetry. |
 
-## Metrics
+## Negative admission, before replay
 
-**Prometheus.** `GET /metrics` is served on `--listen` (default `127.0.0.1:9467`) in scheduled mode. In containers, pass `--listen 0.0.0.0:9467`.
+Probes open the guarded storage transport only: no schema initialization, Delta commit, checkpoint or maintenance-record write. Complete bounded inventories are mandatory. Every negative proof is fenced by the entire log-object identity inventory before and after, not just its latest version. Inventory failure, cancellation, malformed metadata or concurrent log advancement fails explicitly rather than producing a success-shaped noop.
 
-The only labels are `operation` and `outcome`. Table names are never used as labels. Series:
+| Phase | Cheap negative proof |
+| --- | --- |
+| PURGE | No physical ingestion partition ends at or before the retention cutoff. Malformed or non-ingestion partition layouts require the normal planner or return an error. |
+| OPTIMIZE | No eligible physical partition contains the configured minimum small files (at least two). The newest ingestion partition is excluded when `sealedPartitionsOnly` is true; categorical/multi-column Hive partitions conservatively use the full planner. Inactive physical files can force a full plan, but cannot authorize compaction. |
+| VACUUM | Every physical data object is at or newer than the retention cutoff, no old log objects exist, and checkpoint debt is below the configured interval. This is a negative proof only; physical timestamps never authorize deletion. |
+| Checkpoint | Latest log version minus checkpoint version is below `delta.checkpointInterval`. Unsupported multipart/v2 layouts go through the full path. |
+| PRUNE-LOG | No checkpoint exists or no retained log object is older than log retention. Otherwise the existing checkpoint/history equivalence proof remains mandatory. |
 
-- `delta_maintenance_runs_total`, with outcomes: planned, noop, committed, already_applied, deleted, checkpointed, pruned, partial, and error kinds
-- Files, rows and bytes processed
-- Commit collisions, retries and exhausted retries
-- Backlog
-- Retention cutoff
-- Cycles
-- Heartbeat
+Metadata-only filesystem property caches are fenced by log-object identity tokens, including checkpoint changes and same-version replacements. Retention probes are recomputed against the current clock every pass; they are never cached solely by version.
 
-**OTLP.** When `OTEL_EXPORTER_OTLP_ENDPOINT` is set, the same instruments are exported over OTLP http/protobuf every 2 s. Delta Kernel metrics are attached through `arrow_deltalake::telemetry::kernel_metrics_reporter()`. Use `RUST_LOG` to control stderr logs (default `warn`).
+## Destructive safety
 
-## Container
+**PURGE removes logical data; VACUUM physically deletes files.** Keep readers within the retained history window. Table properties cannot bypass the seven-day VACUUM floor, retained-tombstone constraints or the storage publication/reset fence. CLI-only disposable-test acknowledgements remain invocation controls and are never persisted into catalog policy.
 
-The `Dockerfile` installs the Azure CLI with the shared signed helper `infra/docker/install-azure-cli.sh` and runs as UID 10001.
+VACUUM plans and applies in one pass, reusing the independently validated history and active set only while the fresh Kernel snapshot version and metadata still match. Each deletion chunk rechecks current metadata, active references, cancellation and publication authority. Historical replay is repeated only when concurrent advancement requires it. Progress is written after durable deletions; an idle pass does not rewrite an existing same-version progress record. PRUNE-LOG retains its complete history/checkpoint proof before deleting any log.
 
-`AZURE_CONFIG_DIR=/var/lib/delta-maintenance-azure` is an empty 0700 directory owned by UID 10001. Runners should mount an isolated runtime directory over it. No credentials or config are baked into the image.
+New writer publications resolve current Delta metadata through `LayoutPolicy::from_properties` and `AdaptiveFileSizeConfig::from_properties`. Table values override validated process defaults. Sort/Bloom column names must exist in the actual schema and must not be partition columns: partition columns are omitted from the physical Parquet schema. Unsupported partition-column layout requests fail explicitly. Generated ingestion granularity must not replace a catalog-declared partition specification.
 
-`tini` is PID 1 so orphaned Azure CLI descendants are reaped.
+**Adaptive grouping, not file splitting:** the seven `arrowcol.writer.*` properties govern the existing DFE publication-group scheduling estimator. `targetFileSize / estimatedParquetRatio`, clamped by `minInputSize` and `maxInputSize`, determines when queued Arrow bytes trigger publication. Successful durable file observations update the bounded EWMA; failed commits do not install observations. Table properties override `file_batching.adaptive_file` process defaults and refresh on the table IO worker without a catalog RPC per admitted batch. A changed effective configuration starts a cold estimate; unchanged configuration retains learned observations.
 
-The `HEALTHCHECK` runs a bounded `curl` (3 s, 1 MiB) against the real Prometheus listener at `DELTA_MAINTENANCE_HEALTH_URL` (default `http://127.0.0.1:9467/metrics`). Only scheduled runs serve the listener, so one-shot runs never report healthy. Set the variable when using a different `--listen`.
+Each admitted publication (and each declared partition key within it) retains its own replay-safe file and transaction identity. Grouping changes commit scheduling, not file boundaries: `targetFileSize` is not a guarantee of individual Parquet file size. Adaptive splitting of durable publications was not a baseline capability and is not introduced here. OPTIMIZE's separately supported output target remains unchanged.
 
-## Nx
+| Baseline `628e5131` evidence | Supported effect preserved and centrally governed |
+| --- | --- |
+| `crates/arrowcol-dataflow-components/src/config.rs` lines 637-679; `crates/arrowcol-dataflow-components/src/exporter.rs` lines 252 and 634-639 | All seven process controls already populated the estimator and triggered group flush through `should_flush(bytes)`. |
+| `crates/arrowcol-dataflow-components/src/exporter.rs` lines 730-776 | One file per admitted publication; staged Parquet observations became the live estimate only after successful DFE commit acknowledgements. |
+| Retired generic Direct buffer implementation | DFE staging preserves each admitted publication's file and transaction identity across retries; table overrides govern only its downstream publication-group scheduler. |
 
-```bash
-npx nx run delta-maintenance:verify       # format-check, lint, build, test
-npx nx run delta-maintenance:image-smoke
-```
+`cargo test --locked -p arrowcol-dataflow-components --lib exporter_refreshes_catalog_adaptive_grouping_without_changing_publication_identity` proves table-over-process precedence, a live same-owner high-to-low threshold update, durable completion of independent receipt files and replay without duplicate additions.
+
+Refresh applies to new publications. An already-staged publication retains its file plan and transaction identity during recovery; changing layout/granularity never changes a replay identity midway through a retry.
+
+| Property group | Runtime consumer / observable acceptance |
+| --- | --- |
+| `arrowcol.maintenance.enabled`, `.interval`, `.operationTimeout` | Effective operation selection, policy-aware per-table schedule and cancellation deadline. Changed policy is reconsidered before the old interval expires; errors are retryable, not idle. |
+| `arrowcol.optimize.enabled`, `.minFiles`, `.targetFileSize`, `.smallFileSize`, `.sealedPartitionsOnly`, `.latestPartitions` | Effective OPTIMIZE config and bin filtering. Real catalog `minFiles=3 -> 2` change switches from unchanged idle state to a two-file sealed-partition commit; newest ingestion partition remains untouched. |
+| `arrowcol.optimize.max*`, `.batchRows` | Existing planner/decoder/Parquet/action limits receive resolved values; effective JSON config exposes exact bounds and violations fail explicitly. |
+| `arrowcol.vacuum.enabled`, `.retention`, `.allowShortRetention`, `.maxDeletes`, `.maxListedFiles` | Full retention authorization and bounded delete/probe config. Retention equality is not expired; incomplete inventories fail with no mutation. Persisted policy cannot lower the seven-day floor. |
+| `arrowcol.purge.enabled`, `.retention`, `arrowcol.partition.granularity` | Logical ingestion cutoff and PURGE plan before compaction; generated writer partition formatting uses current metadata policy. Declared catalog partition keys remain authoritative. |
+| `arrowcol.layout.enabled`, `.sortColumns`, `.bloomColumns`, `.maxRows`, `.maxInputSize`, `.rowGroupRows`, `.pageRows` | Sorted writer/OPTIMIZE layout config; output sorting, Bloom metadata, row-group limits and bounded buffering are observable. Invalid columns or bounds fail before commit. |
+| `arrowcol.writer.targetFileSize`, `.minInputSize`, `.maxInputSize`, `.coldStartParquetRatio`, `.ewmaWeight`, `.minParquetRatio`, `.maxParquetRatio` | Live table policy drives DFE group-flush threshold and successful-file EWMA observations. Real pending-versus-durable receipt assertions prove table precedence and dynamic updates without changing replay identity. No individual-file size guarantee. |
+| `delta.targetFileSize`, `.deletedFileRetentionDuration`, `.logRetentionDuration`, `.checkpointInterval`, `.appendOnly` | Target fallback, tombstone/log cutoffs, checkpoint debt and strict boolean syntax. Syntax validation does not authorize a protocol/feature change. |
+
+## Retained history and pruning proof
+
+VACUUM requires contiguous JSON commits `0..=version`, or a durable log floor `F` with its checkpoint present and covered by the VACUUM progress record, followed by contiguous JSON `F+1..=version`. Any other gap fails explicitly. Traversal and external data paths are rejected. Cancellation mid-delete reports partial progress.
+
+The progress record `_arrowcol_maintenance/vacuum-lite.json` is `{table_id, version, cutoff_ms}`: every remove in the replayed history before that cutoff was physically deleted or confirmed absent. A partial, cancelled, dry-run or backlogged pass never writes this claim. The record is table-bound and monotonic; local writes use exclusive locking, a temporary file, fsync and rename, while cloud writes are create-if-absent or ETag-conditional.
+
+A PRUNE-LOG plan chooses a classic checkpoint `C` only when all of these conditions hold:
+
+1. The checkpoint exists, `_last_checkpoint` points to a version at least `C`, and no unsupported multipart, v2 or compacted log object exists at or below it.
+2. Independent JSON replay through `C` agrees with both a direct Parquet checkpoint read and Delta Kernel loading `C`: table id, every active path with partition values and size, protocol, schema, partition columns, configuration, and every application transaction. Advisory statistics and serialized byte encodings are not compared. Transaction-retention settings are refused.
+3. The progress record has the same table id and covers `C`; every remove through `C` has a deletion timestamp strictly before its progress cutoff. Checkpoints may drop expired tombstones, so this prevents pruning from hiding unvacuumed files.
+4. Every deleted JSON commit below `C` is older than log retention using the later of commit/in-commit time and object modification time. Every deleted older checkpoint also passes the modification-time cutoff. `C.json` is retained for append compatibility, though its removes still satisfy the previous rule.
+
+Apply re-proves the plan against fresh state, checks publication authority, and durably writes `_arrowcol_maintenance/log-floor.json` before deleting anything. The checkpoint, `C.json`, `_last_checkpoint` and newer objects are retained. Deletions are ordered and bounded by `--max-prune-files`; `NotFound` counts as already absent, and cancellation reports partial progress. A later pass can finish leftovers below an already-durable floor after re-verifying that floor with Kernel.
+
+Malformed checkpoint hints, record/checkpoint disagreement, unsupported history or missing remove timestamps fail closed. A hint below the durable floor produces a no-work plan rather than dropping more history. Shorter log retention requires the CLI-only marked disposable-test override; acknowledging short VACUUM reader risk does not authorize shorter log retention.
+
+**Log-size limitation:** pruning bounds historical JSON/checkpoint object count, not total log bytes. Checkpoints retain publication and maintenance application transactions forever; transaction retention is deliberately disallowed. The newest checkpoint can therefore grow with publication count. Only classic single-file checkpoints support pruning.
+
+## Final-compaction evidence and lifecycle
+
+The explicit one-shot `--sealed-final --operation optimize` policy bypasses only newest/open partition churn protection, not schema, retention, publication or byte/action/decoding limits. It is not a verified publisher-release receipt or reader lease. The CLI still rejects scheduled, mixed-operation or other-operation uses of this flag. A table's `arrowcol.optimize.sealedPartitionsOnly=false` is likewise an explicit churn policy, never a storage authority override.
+
+Final-compaction runs retain their full typed OPTIMIZE plan and effective configuration even for an empty result: the cheap negative shortcut is deliberately not used for that lifecycle gate. A dry-run empty final plan reports `planned`; an apply reports `noop` and writes no commit. Zero output files alone prove neither emptiness nor success.
+
+Lifecycle orchestration must require one successful, error-free result per expected table with `optimize.plan.bins=[]`, no backlog and no skipped/protected partitions, and verify the expected policy, table/root/run/SDK bindings and current versions. Missing reports and failures are not noops. Writer release and clean mutator-drain evidence must be established independently before compaction; maintenance processes must be joined before capturing immutable reader snapshots.
+
+OPTIMIZE uses `dataChange=false` and preserves exact rows, schema, partition values, publication identities and retained history. JSON `optimize.config` includes resolved policy and limits, `optimize.plan` contains the input bins/read version, and `report.outputs` describes actual outputs only after successful rewriting. Planned evidence is retained when apply fails. Neither one file per partition nor external cache-convergence time is guaranteed.
+
+## Commands and expected results
+
+Run these inside the repository devcontainer on a leased devbox:
+
+| Command | Expected result |
+| --- | --- |
+| `npx nx run arrowcol-props:generate-docs` | Regenerates the reference table from the runtime registry. |
+| `npx nx run-many -t verify --projects=arrowcol-props,arrow-deltalake,delta-maintenance --parallel=1` | Registry, generated-document freshness, transport/planner safety and maintenance service checks pass. |
+| `cargo test --locked -p delta-maintenance --test properties` | Exercises catalog-style policy overrides, negative probes, idle before/after state, retention boundaries and inventory failure. |
+| `cargo run --locked -p delta-maintenance -- --root file:///tmp/disposable-tables/ --table events --operation optimize --operation vacuum` | Dry-run JSON only. Negative results leave table and maintenance metadata unchanged. |
+| `cargo test --locked -p delta-maintenance --test properties real_catalog_ddl_discovery_refreshes_policy_without_idle_writes` | Real Rust catalog + Flight SQL DDL + gRPC discovery: two idle passes preserve file bytes/mtimes; stale policy is rejected; changing `minFiles` from three to two compacts only the sealed pair. |
+
+For a bug bash, first create a disposable table using the catalog, capture the `_delta_log` and `_arrowcol_maintenance` file inventory, run two idle passes, and compare names, sizes, hashes and modification times. Set `arrowcol.optimize.minFiles` above the sealed partition's file count: no compaction should occur. Lower it to two and add two small files in an older partition plus one newest partition: only the sealed pair may compact. An unknown property or a retention below seven days must be rejected before table metadata changes.
+
+Catalog policy is refreshed each scheduling pass. Changes to typed policy immediately reconsider a table's interval instead of retaining its previous deadline; failed passes remain retryable. Catalog history and purge bookkeeping are not user policy, but changed registered tunables must match current Delta metadata before a negative probe can report success.

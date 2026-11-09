@@ -21,12 +21,9 @@ use arrow_flight::{
 };
 use arrow_schema::{ArrowError, DataType, Field, Fields, Schema, SchemaRef, TimeUnit};
 use futures::{Stream, TryStreamExt};
-use serde::Deserialize;
 use thiserror::Error;
 use tonic::{
     Request, Response, Streaming,
     metadata::{Ascii, MetadataKey, MetadataValue},
     transport::Channel,
 };
-use url::Url;
-use uuid::Uuid;

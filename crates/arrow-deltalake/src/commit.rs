@@ -2,6 +2,7 @@
 
 use crate::delta::{AppendResult, DeltaFileWriter, DeltaTable, PublicationFence, PublicationFenceError, StagedAppend};
 use anyhow::{Context, Result, bail};
+use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use std::collections::HashMap;
 use std::error::Error;
@@ -77,6 +78,10 @@ struct Publication {
 
 enum Request {
     Ready(oneshot::Sender<std::result::Result<(), CommitReceiptError>>),
+    AdaptiveConfig(
+        crate::sizing::AdaptiveFileSizeConfig,
+        oneshot::Sender<std::result::Result<crate::sizing::AdaptiveFileSizeConfig, CommitReceiptError>>,
+    ),
     NewFile(
         SchemaRef,
         oneshot::Sender<std::result::Result<DeltaFileWriter, CommitReceiptError>>,
@@ -87,6 +92,13 @@ enum Request {
         i64,
         i64,
         oneshot::Sender<std::result::Result<DeltaFileWriter, CommitReceiptError>>,
+    ),
+    NewPartitionedPublication(
+        RecordBatch,
+        String,
+        i64,
+        i64,
+        oneshot::Sender<std::result::Result<Vec<(DeltaFileWriter, RecordBatch)>, CommitReceiptError>>,
     ),
     Publish(Box<Publication>),
 }
@@ -285,6 +297,25 @@ impl BatchedTable {
             .map_err(anyhow::Error::new)
     }
 
+    /// Read current adaptive scheduling policy on the table's IO worker.
+    ///
+    /// # Errors
+    /// Returns metadata, configuration or worker failures without preparing a publication.
+    pub async fn adaptive_file_config(
+        &self,
+        defaults: crate::sizing::AdaptiveFileSizeConfig,
+    ) -> Result<crate::sizing::AdaptiveFileSizeConfig> {
+        let (reply, receive) = oneshot::channel();
+        self.sender
+            .send(Request::AdaptiveConfig(defaults, reply))
+            .await
+            .context("Delta worker stopped")?;
+        receive
+            .await
+            .context("Delta worker stopped during policy refresh")?
+            .map_err(anyhow::Error::new)
+    }
+
     /// Obtain a file without doing synchronous Kernel work on a collector core.
     ///
     /// # Errors
@@ -320,6 +351,28 @@ impl BatchedTable {
         receive
             .await
             .context("Delta worker stopped during publication preparation")?
+            .map_err(anyhow::Error::new)
+    }
+
+    /// Prepare separate replay-safe files for the batch's committed table partition keys.
+    ///
+    /// # Errors
+    /// Rejects invalid batch values and schema, ownership or worker failures.
+    pub async fn new_partitioned_publication_files(
+        &self,
+        batch: RecordBatch,
+        app_id: String,
+        version: i64,
+        stamp: i64,
+    ) -> Result<Vec<(DeltaFileWriter, RecordBatch)>> {
+        let (reply, receive) = oneshot::channel();
+        self.sender
+            .send(Request::NewPartitionedPublication(batch, app_id, version, stamp, reply))
+            .await
+            .context("Delta worker stopped")?;
+        receive
+            .await
+            .context("Delta worker stopped during partition preparation")?
             .map_err(anyhow::Error::new)
     }
 
@@ -444,6 +497,17 @@ fn run_worker(
                     Some(Request::Ready(reply)) => {
                         let _ = reply.send(failure.as_ref().map_or(Ok(()), |error| Err(error.clone())));
                     }
+                    Some(Request::AdaptiveConfig(defaults, reply)) => {
+                        let result = match (&table, &failure) {
+                            (Ok(table), None) => table
+                                .adaptive_file_config(&defaults)
+                                .map_err(CommitReceiptError::from_anyhow),
+                            _ => Err(failure.clone().unwrap_or_else(|| {
+                                CommitReceiptError::commit_failed("Delta table initialization failed")
+                            })),
+                        };
+                        let _ = reply.send(result);
+                    }
                     Some(Request::NewFile(schema, reply)) => {
                         let result = match (&table, &failure) {
                             (Ok(table), None) => table.new_file(schema).map_err(CommitReceiptError::from_anyhow),
@@ -462,6 +526,17 @@ fn run_worker(
                         let result = match (&table, &failure) {
                             (Ok(table), None) => table
                                 .new_file_with_publication(schema, app_id, version, stamp)
+                                .map_err(CommitReceiptError::from_anyhow),
+                            _ => Err(failure.clone().unwrap_or_else(|| {
+                                CommitReceiptError::commit_failed("Delta table initialization failed")
+                            })),
+                        };
+                        let _ = reply.send(result);
+                    }
+                    Some(Request::NewPartitionedPublication(batch, app_id, version, stamp, reply)) => {
+                        let result = match (&table, &failure) {
+                            (Ok(table), None) => table
+                                .new_partitioned_publication_files(batch, app_id, version, stamp)
                                 .map_err(CommitReceiptError::from_anyhow),
                             _ => Err(failure.clone().unwrap_or_else(|| {
                                 CommitReceiptError::commit_failed("Delta table initialization failed")
@@ -498,7 +573,13 @@ fn run_worker(
                     Request::Ready(reply) => {
                         let _ = reply.send(Err(message.clone()));
                     }
+                    Request::AdaptiveConfig(_, reply) => {
+                        let _ = reply.send(Err(message.clone()));
+                    }
                     Request::NewFile(_, reply) | Request::NewPublication(_, _, _, _, reply) => {
+                        let _ = reply.send(Err(message.clone()));
+                    }
+                    Request::NewPartitionedPublication(_, _, _, _, reply) => {
                         let _ = reply.send(Err(message.clone()));
                     }
                     Request::Publish(publication) => {

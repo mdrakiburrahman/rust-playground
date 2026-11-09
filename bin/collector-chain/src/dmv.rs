@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use arrow_array::{
     ArrayRef, BooleanArray, Float64Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
-    TimestampNanosecondArray, UInt8Array,
+    TimestampMicrosecondArray, UInt8Array,
 };
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
@@ -59,7 +59,7 @@ pub fn tables() -> Result<Vec<DmvTable>> {
     Ok(tables)
 }
 
-pub fn batch(table: &DmvTable, client_id: &str, rows: usize, now_nanos: i64) -> Result<RecordBatch> {
+pub fn batch(table: &DmvTable, client_id: &str, rows: usize, now_micros: i64) -> Result<RecordBatch> {
     let columns = table
         .schema
         .fields()
@@ -79,8 +79,8 @@ pub fn batch(table: &DmvTable, client_id: &str, rows: usize, now_nanos: i64) -> 
                 DataType::Int32 => Arc::new(Int32Array::from_iter_values((0..rows).map(|row| row as i32))),
                 DataType::Int64 => Arc::new(Int64Array::from_iter_values((0..rows).map(|row| row as i64))),
                 DataType::Float64 => Arc::new(Float64Array::from_iter_values((0..rows).map(|row| row as f64 / 10.0))),
-                DataType::Timestamp(TimeUnit::Nanosecond, timezone) => Arc::new(
-                    TimestampNanosecondArray::from_iter_values((0..rows).map(|row| now_nanos + row as i64))
+                DataType::Timestamp(TimeUnit::Microsecond, timezone) => Arc::new(
+                    TimestampMicrosecondArray::from_iter_values((0..rows).map(|row| now_micros + row as i64))
                         .with_timezone_opt(timezone.clone()),
                 ),
                 other => bail!("unsupported DMV type {other} for {}.{name}", table.identity),
@@ -102,13 +102,13 @@ pub async fn send(endpoint: &str, client_id: &str, rows: usize) -> Result<usize>
         .await
         .with_context(|| format!("connect {endpoint}"))?;
     let mut client = FlightServiceClient::new(channel);
-    let now_nanos = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
+    let now_micros = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros())?;
     let tables = tables()?;
     for table in &tables {
         let version = register(&mut client, &table.ddl)
             .await
             .with_context(|| format!("register {}", table.identity))?;
-        put(&mut client, table, version, batch(table, client_id, rows, now_nanos)?)
+        put(&mut client, table, version, batch(table, client_id, rows, now_micros)?)
             .await
             .with_context(|| format!("put {}", table.identity))?;
     }
@@ -180,7 +180,6 @@ async fn put(
             PutResultMetadata::BestEffortAdmission { .. } | PutResultMetadata::DurableAdmission { .. } => {
                 admitted = true;
             }
-            _ => bail!("collector reported an unexpected put result"),
         }
     }
     if !admitted {

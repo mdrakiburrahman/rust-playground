@@ -12,8 +12,6 @@ pub const ARROW_SCHEMA_CONTRACT_VERSION: &str = "58.3";
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
-    /// Accepted deliveries receive queryable server-generated receipts.
-    ReceiptStatus,
     /// The instance can publish Arrow deliveries to Delta tables.
     DeltaPublication,
     /// The instance enforces table lease fencing.
@@ -34,7 +32,6 @@ pub struct CollectorCapabilities {
     supported_protocol_versions: Vec<ProtocolVersion>,
     max_request_bytes: PositiveMeasurement,
     max_concurrent_streams: PositiveMeasurement,
-    max_pending_receipts: PositiveMeasurement,
     capabilities: BTreeSet<Capability>,
 }
 
@@ -46,7 +43,6 @@ impl CollectorCapabilities {
         implementation_pool: ImplementationPool,
         max_request_bytes: PositiveMeasurement,
         max_concurrent_streams: PositiveMeasurement,
-        max_pending_receipts: PositiveMeasurement,
         capabilities: BTreeSet<Capability>,
     ) -> Self {
         Self {
@@ -56,7 +52,6 @@ impl CollectorCapabilities {
             supported_protocol_versions: vec![ProtocolVersion::CURRENT],
             max_request_bytes,
             max_concurrent_streams,
-            max_pending_receipts,
             capabilities,
         }
     }
@@ -97,12 +92,6 @@ impl CollectorCapabilities {
         self.max_concurrent_streams
     }
 
-    /// Returns the maximum pending receipt count.
-    #[must_use]
-    pub const fn max_pending_receipts(&self) -> PositiveMeasurement {
-        self.max_pending_receipts
-    }
-
     /// Returns advertised behaviors.
     #[must_use]
     pub const fn capabilities(&self) -> &BTreeSet<Capability> {
@@ -130,7 +119,6 @@ impl Serialize for CollectorCapabilities {
             arrow_schema_contract_version: &'static str,
             max_request_bytes: PositiveMeasurement,
             max_concurrent_streams: PositiveMeasurement,
-            max_pending_receipts: PositiveMeasurement,
             capabilities: &'a BTreeSet<Capability>,
         }
 
@@ -142,7 +130,6 @@ impl Serialize for CollectorCapabilities {
             arrow_schema_contract_version: ARROW_SCHEMA_CONTRACT_VERSION,
             max_request_bytes: self.max_request_bytes,
             max_concurrent_streams: self.max_concurrent_streams,
-            max_pending_receipts: self.max_pending_receipts,
             capabilities: &self.capabilities,
         }
         .serialize(serializer)
@@ -163,7 +150,6 @@ impl<'de> Deserialize<'de> for CollectorCapabilities {
             arrow_schema_contract_version: String,
             max_request_bytes: PositiveMeasurement,
             max_concurrent_streams: PositiveMeasurement,
-            max_pending_receipts: PositiveMeasurement,
             capabilities: Vec<Capability>,
         }
 
@@ -194,7 +180,6 @@ impl<'de> Deserialize<'de> for CollectorCapabilities {
             supported_protocol_versions: wire.supported_protocol_versions,
             max_request_bytes: wire.max_request_bytes,
             max_concurrent_streams: wire.max_concurrent_streams,
-            max_pending_receipts: wire.max_pending_receipts,
             capabilities,
         })
     }

@@ -14,7 +14,6 @@ const TIMEOUT_MS = 2500;
 export interface SamplerOptions {
   project: string;
   results: string;
-  directAdmin: string;
   dataflowAdmin: string;
   ownerPid?: number;
 }
@@ -76,7 +75,7 @@ export const resourceScript = [
     'case "$(cat "/proc/$pid/comm")" in docker-init|tini) set -- $(cat "/proc/$pid/task/$pid/children"); ' +
     'if [ "$#" -ne 1 ]; then printf "__READ_ERROR__\\n"; exit 1; fi; pid="$1"; depth=$((depth+1));; *) break;; esac; done',
   'if [ "$depth" -ge 8 ]; then printf "__READ_ERROR__\\n"; exit 1; fi',
-  'case "$(readlink "/proc/$pid/exe")" in */arrowcol-rust|*/arrowcol-dataflow-rust) ;; ' +
+  'case "$(readlink "/proc/$pid/exe")" in */arrowcol-dataflow-rust) ;; ' +
     '*) printf "__READ_ERROR__\\n"; exit 1;; esac',
   'printf "\\n__status__\\n"; cat "/proc/$pid/status" 2>/dev/null || printf "__READ_ERROR__\\n"',
   ...[
@@ -194,7 +193,6 @@ export async function runResourceSampler(options: SamplerOptions): Promise<void>
       const timestamp = new Date().toISOString();
       const start = Date.now();
       const collectors = await Promise.all([
-        collectorSample(options.project, 'direct-1', options.directAdmin),
         collectorSample(options.project, 'dataflow-1', options.dataflowAdmin),
       ]);
       appendFileSync(samples, `${JSON.stringify({ timestamp, sequence: sequence++, collectors })}\n`);
@@ -219,7 +217,7 @@ export async function startResourceSampler(options: SamplerOptions, env: NodeJS.
   const child = spawn(process.execPath, [
     ...process.execArgv, fileURLToPath(import.meta.url),
     '--project', options.project, '--results', options.results,
-    '--direct-admin', options.directAdmin, '--dataflow-admin', options.dataflowAdmin,
+    '--dataflow-admin', options.dataflowAdmin,
     '--owner-pid', String(process.pid),
   ], { env, stdio: ['ignore', fd, fd] });
   closeSync(fd);
@@ -262,7 +260,7 @@ export async function startResourceSampler(options: SamplerOptions, env: NodeJS.
 function parseSamplerOptions(args: string[]): SamplerOptions {
   const values = new Map<string, string>();
   for (let index = 0; index < args.length; index += 2) {
-    if (!['--project', '--results', '--direct-admin', '--dataflow-admin', '--owner-pid'].includes(args[index]) || !args[index + 1]) {
+    if (!['--project', '--results', '--dataflow-admin', '--owner-pid'].includes(args[index]) || !args[index + 1]) {
       throw new Error('Invalid sampler arguments');
     }
     values.set(args[index], args[index + 1]);
@@ -286,7 +284,7 @@ function parseSamplerOptions(args: string[]): SamplerOptions {
     throw new Error('Invalid sampler owner PID');
   }
   return {
-    project, results, directAdmin: endpoint('--direct-admin'), dataflowAdmin: endpoint('--dataflow-admin'),
+    project, results, dataflowAdmin: endpoint('--dataflow-admin'),
     ownerPid: owner === undefined ? undefined : Number(owner),
   };
 }

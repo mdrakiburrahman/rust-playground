@@ -69,24 +69,66 @@ function normalized_uuid(value: string): string {
   if (!/^[0-9a-f]{32}$/.test(raw)) throw new Failure('Invalid UUID.');
   return `${raw.slice(0, 8)}-${raw.slice(8, 12)}-${raw.slice(12, 16)}-${raw.slice(16, 20)}-${raw.slice(20)}`;
 }
+export type AzureMode = 'stamped' | 'schema-evolution';
+export const SCHEMA_EVOLUTION_GROUP = 'rust-playground-schema-evo';
+export function is_schema_evolution_group(value: string): boolean {
+  return value.length <= 90 && /^rust-playground-schema-evo(?:-[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)?$/.test(value);
+}
+export function azure_mode(value: string): AzureMode {
+  if (value !== 'stamped' && value !== 'schema-evolution') throw new Failure('Azure mode must be stamped or schema-evolution.');
+  return value;
+}
 export class Config {
   subscription: string; group: string; stamp: number; sandbox: string; location: string; account: string; registry: string; registryLoginServer: string;
   cluster: string; identity: string; identity_client_id: string; kubernetesNamespace: string; kubernetesServiceAccount: string;
-  stampConfig: StampConfig; database: string; data: string; checkpoints: string;
+  private validatedStamp?: StampConfig;
+  readonly mode: AzureMode;
+  get stampConfig(): StampConfig {
+    if (!this.validatedStamp) throw new Failure('AKS stamp configuration is unavailable in schema-evolution mode.');
+    return this.validatedStamp;
+  }
+  database: string; data: string; checkpoints: string;
   experimentContainer: string; experimentDatabase: string; logAnalyticsWorkspace: string;
   readLogDestination: 'log-analytics' | 'storage'; readLogAccount: string; readLogStorageId: string;
   sku: string; minimum: number; maximum: number; hot: number; cluster_tags: Record<string, string>;
   operator: string; operator_type: string; operator_application: string; base: string;
   storage_id: string; cluster_id: string; identity_id: string; workspace_id: string; registry_id: string;
   uri: string; table_root: string; table_prefix: string;
-  constructor(values: Record<string, string | undefined>, stampConfig: StampConfig = defaultStampConfig(values)) {
+  constructor(values: Record<string, string | undefined>, selection?: StampConfig | 'schema-evolution') {
+    this.mode = selection === 'schema-evolution' ? 'schema-evolution' : 'stamped';
+    if (values.ARROWCOL_AZURE_MODE !== undefined && values.ARROWCOL_AZURE_MODE !== this.mode)
+      throw new Failure('Exported Azure mode does not match the explicit configuration selection.');
     const get = (key: string, fallback = '') => values[key] || fallback;
     try { this.subscription = normalized_uuid(get('AZURE_SUBSCRIPTION_ID')); }
     catch { throw new Failure('AZURE_SUBSCRIPTION_ID must be a private subscription UUID.'); }
+    const stampConfig = selection === 'schema-evolution' ? undefined : selection ?? defaultStampConfig(values);
+    if (!stampConfig) {
+      if (Object.keys(values).some(key => values[key] !== undefined &&
+          (/^AZURE_(STAMP$|AKS_|KUBERNETES_|CONTAINER_REGISTRY_|UAMI_)/.test(key) ||
+            ['AZURE_CLIENT_ID', 'AZURE_TENANT_ID', 'AZURE_FEDERATED_TOKEN_FILE'].includes(key))))
+        throw new Failure('Schema-evolution mode rejects stamp, AKS, ACR and workload identity configuration.');
+      const group = values.AZURE_RESOURCE_GROUP;
+      if (!group || !is_schema_evolution_group(group))
+        throw new Failure('Schema-evolution mode requires a dedicated rust-playground-schema-evo resource group.');
+      this.group = group;
+      this.sandbox = createHash('sha256').update(this.subscription + ':' + this.group).digest('hex').slice(0, 12);
+      this.location = get('AZURE_LOCATION', 'eastus2');
+      if (this.location !== 'eastus2') throw new Failure('Only the qualified eastus2 region is authorized.');
+      this.account = get('AZURE_STORAGE_ACCOUNT', 'arrowcol' + this.sandbox);
+      this.cluster = get('AZURE_KUSTO_CLUSTER', 'arrowcol-' + this.sandbox);
+      this.identity = get('AZURE_KUSTO_IDENTITY_NAME', 'arrowcol-kusto-reader');
+      if (this.account !== 'arrowcol' + this.sandbox || this.cluster !== 'arrowcol-' + this.sandbox ||
+          this.identity !== 'arrowcol-kusto-reader')
+        throw new Failure('Resource names must match the exact isolated subscription and group identity.');
+      this.stamp = 0; this.registry = ''; this.registryLoginServer = '';
+      this.identity_client_id = ''; this.kubernetesNamespace = ''; this.kubernetesServiceAccount = '';
+    } else {
     if (stampConfig.subscription && this.subscription !== stampConfig.subscription)
       throw new Failure('AZURE_SUBSCRIPTION_ID must match the validated AKS stamp configuration.');
-    this.stampConfig = stampConfig;
+    this.validatedStamp = stampConfig;
     this.stamp = stampConfig.stamp;
+    if (values.AZURE_STAMP !== undefined && (!/^\d+$/.test(values.AZURE_STAMP) || Number(values.AZURE_STAMP) !== this.stamp))
+      throw new Failure('AZURE_STAMP must match the validated AKS stamp configuration.');
     this.group = stampConfig.resourceGroup;
     if (values.AZURE_RESOURCE_GROUP && values.AZURE_RESOURCE_GROUP !== this.group)
       throw new Failure('AZURE_RESOURCE_GROUP must match the validated AKS stamp configuration.');
@@ -115,13 +157,14 @@ export class Config {
     if ((values.AZURE_KUBERNETES_NAMESPACE && values.AZURE_KUBERNETES_NAMESPACE !== this.kubernetesNamespace) ||
         (values.AZURE_KUBERNETES_SERVICE_ACCOUNT && values.AZURE_KUBERNETES_SERVICE_ACCOUNT !== this.kubernetesServiceAccount))
       throw new Failure('Kubernetes namespace and service account must match the validated stamp configuration.');
+    }
     this.database = get('AZURE_KUSTO_DATABASE', 'arrowcol');
     this.data = get('AZURE_STORAGE_CONTAINER', 'arrowcol');
     this.checkpoints = get('AZURE_STORAGE_CHECKPOINT_CONTAINER', 'checkpoints');
     this.experimentContainer = get('AZURE_STORAGE_EXPERIMENT_CONTAINER', 'experimentqap');
     this.experimentDatabase = get('AZURE_KUSTO_EXPERIMENT_DATABASE', 'experimentqap');
     this.logAnalyticsWorkspace = get('AZURE_LOG_ANALYTICS_WORKSPACE', this.cluster);
-    this.readLogDestination = stampConfig.storageReadLogDestination ?? 'log-analytics';
+    this.readLogDestination = stampConfig?.storageReadLogDestination ?? 'log-analytics';
     if (values.AZURE_STORAGE_READ_LOG_DESTINATION && values.AZURE_STORAGE_READ_LOG_DESTINATION !== this.readLogDestination)
       throw new Failure('Storage read-log destination must match the validated stamp configuration.');
     this.readLogAccount = this.readLogDestination === 'storage' ? 'arrowreadlogs' + this.stamp : '';
@@ -188,10 +231,11 @@ export class Config {
       .replace(/bearer\s+\S+/gi, '******').slice(0, 2000);
   }
   generated(): Record<string, string> {
-    return { AZURE_RESOURCE_GROUP: this.group, AZURE_STAMP: String(this.stamp), AZURE_LOCATION: this.location,
+    return { ARROWCOL_AZURE_MODE: this.mode, AZURE_RESOURCE_GROUP: this.group, AZURE_LOCATION: this.location,
+      ...(this.mode === 'stamped' ? { AZURE_STAMP: String(this.stamp),
       AZURE_CONTAINER_REGISTRY_NAME: this.registry, AZURE_CONTAINER_REGISTRY_SERVER: this.registryLoginServer,
       AZURE_KUBERNETES_NAMESPACE: this.kubernetesNamespace, AZURE_KUBERNETES_SERVICE_ACCOUNT: this.kubernetesServiceAccount,
-      ...(this.identity_client_id ? { AZURE_UAMI_CLIENT_ID: this.identity_client_id } : {}),
+      ...(this.identity_client_id ? { AZURE_UAMI_CLIENT_ID: this.identity_client_id } : {}) } : {}),
       AZURE_STORAGE_ACCOUNT: this.account, AZURE_STORAGE_CONTAINER: this.data,
       AZURE_STORAGE_CHECKPOINT_CONTAINER: this.checkpoints, AZURE_KUSTO_CLUSTER: this.cluster,
       AZURE_KUSTO_DATABASE: this.database, AZURE_KUSTO_IDENTITY_NAME: this.identity, AZURE_KUSTO_URI: this.uri,
@@ -259,6 +303,8 @@ export class Azure {
     const refresh = (async () => {
       const federated = ['AZURE_CLIENT_ID', 'AZURE_TENANT_ID', 'AZURE_FEDERATED_TOKEN_FILE']
         .map(key => process.env[key] || '');
+      if (this.c.mode === 'schema-evolution' && federated.some(Boolean))
+        throw new Failure('Schema-evolution mode requires the approved Azure CLI context, not ambient workload identity.');
       let token: string;
       let lifetime = 240;
       if (federated.some(Boolean)) {
@@ -585,16 +631,19 @@ export async function existing_network_prefixes(azure: Pick<Azure, 'cli'>, subsc
   return [...new Set([...externalNetworks.flatMap(prefixes), ...remoteNetworks.flatMap(prefixes)])];
 }
 export async function preflight(azure: Azure): Promise<void> {
-  const c = azure.c, aksConfig = c.stampConfig.aks;
+  const c = azure.c;
   const account = await azure.cli('account', 'show', '--subscription', c.subscription);
   if (account.id.toLowerCase() !== c.subscription) throw new Failure('CLI subscription mismatch; no default-subscription fallback is permitted.');
-  if (!c.stampConfig.publisherFederatedCredentials.length)
+  if (c.mode === 'stamped' && !c.stampConfig.publisherFederatedCredentials.length)
     throw new Failure('The private stamp config must preserve the existing publisher federated credentials before provisioning.');
   for (const provider of ['Microsoft.Kusto', 'Microsoft.Storage', 'Microsoft.ManagedIdentity', 'Microsoft.OperationalInsights',
-    'Microsoft.Insights', 'Microsoft.ContainerService', 'Microsoft.Network', 'Microsoft.ContainerRegistry', 'Microsoft.Authorization']) {
+    'Microsoft.Insights', ...(c.mode === 'stamped' ?
+      ['Microsoft.ContainerService', 'Microsoft.Network', 'Microsoft.ContainerRegistry', 'Microsoft.Authorization'] : [])]) {
     const state = (await azure.cli('provider', 'show', '--namespace', provider, '--subscription', c.subscription)).registrationState;
     if (state !== 'Registered') await azure.cli('provider', 'register', '--namespace', provider, '--subscription', c.subscription, '--wait');
   }
+  if (c.mode === 'stamped') {
+  const aksConfig = c.stampConfig.aks;
   const versions = await azure.cli('aks', 'get-versions', '--location', c.location, '--subscription', c.subscription);
   const versionFamily = aksConfig.version.split('.').slice(0, 2).join('.');
   if (!versions.values?.some((entry: any) => entry.version === versionFamily && Object.hasOwn(entry.patchVersions ?? {}, aksConfig.version)))
@@ -615,6 +664,7 @@ export async function preflight(azure: Azure): Promise<void> {
     throw new Failure('AKS API-server VNet integration is not registered in the target subscription.');
   const existingPrefixes = await existing_network_prefixes(azure, c.subscription, c);
   assertNoStampNetworkOverlap(c.stampConfig, existingPrefixes);
+  }
   if (!c.operator) {
     const token = await azure.token('https://management.azure.com/');
     c.operator = normalized_uuid(JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString()).oid);
@@ -627,7 +677,9 @@ export async function preflight(azure: Azure): Promise<void> {
     'microsoft.managedidentity/userassignedidentities' && resource.name !== c.identity);
   if (legacy.length || extraIdentities.length)
     throw new Failure('Replacement is blocked while legacy resources or additional UAMIs remain in arrow-collector-rg. Preserve Terraform state, Key Vault configuration, role assignments, and publisher FIC consumers before retiring them.');
-  console.log('Azure subscription, AKS version, VM quota, network ranges, and one-identity preflight: ready');
+  console.log(c.mode === 'stamped' ?
+    'Azure subscription, AKS version, VM quota, network ranges, and one-identity preflight: ready' :
+    'Azure subscription and exact isolated resource inventory preflight: ready (no AKS/ACR checks)');
 }
 export async function guard_existing(azure: Azure): Promise<void> {
   const c = azure.c;
@@ -649,8 +701,10 @@ export async function deploy(azure: Azure, fresh?: Metadata): Promise<void> {
   const c = azure.c;
   await guard_existing(azure);
   const params = { location: c.location, resourceGroupName: c.group, sandboxId: c.sandbox, storageAccountName: c.account,
-    clusterName: c.cluster, identityName: c.identity, registryName: c.registry, aksConfig: c.stampConfig.aks,
-    publisherFederatedCredentials: c.stampConfig.publisherFederatedCredentials, databaseName: c.database, dataContainer: c.data, checkpointContainer: c.checkpoints,
+    azureMode: c.mode, clusterName: c.cluster, identityName: c.identity, registryName: c.registry,
+    aksConfig: c.mode === 'stamped' ? c.stampConfig.aks : {},
+    publisherFederatedCredentials: c.mode === 'stamped' ? c.stampConfig.publisherFederatedCredentials : [],
+    databaseName: c.database, dataContainer: c.data, checkpointContainer: c.checkpoints,
     experimentContainer: c.experimentContainer, experimentDatabase: c.experimentDatabase,
     logAnalyticsWorkspaceName: c.logAnalyticsWorkspace,
     readLogStorageAccountName: c.readLogAccount,
@@ -662,16 +716,19 @@ export async function deploy(azure: Azure, fresh?: Metadata): Promise<void> {
   try {
     try {
       await azure.cli('deployment', 'sub', 'create', '--subscription', c.subscription, '--location', c.location,
-        '--name', 'arrowcol-sandbox', '--template-file', path.join(ROOT, 'infra/azure/main.bicep'), '--parameters', '@' + filename);
+        '--name', c.mode === 'stamped' ? 'arrowcol-sandbox' : 'arrowcol-sandbox-' + c.sandbox,
+        '--template-file', path.join(ROOT, 'infra/azure/main.bicep'), '--parameters', '@' + filename);
     } catch (error) {
       if (error instanceof Failure && error.message.includes('DeploymentFailed')) throw new DeploymentFailed(error.message, { cause: error });
       throw error;
     }
   } finally { fs.unlinkSync(filename); }
   c.uri = (await azure.arm('GET', c.cluster_id)).properties.uri.replace(/\/+$/, '');
-  const sharedIdentity = await azure.arm('GET', c.identity_id, undefined, false, '2023-01-31');
-  try { c.identity_client_id = normalized_uuid(sharedIdentity?.properties?.clientId); }
-  catch { throw new Failure('Deployment did not return the single arrow-collector UAMI client ID.'); }
+  if (c.mode === 'stamped') {
+    const sharedIdentity = await azure.arm('GET', c.identity_id, undefined, false, '2023-01-31');
+    try { c.identity_client_id = normalized_uuid(sharedIdentity?.properties?.clientId); }
+    catch { throw new Failure('Deployment did not return the single arrow-collector UAMI client ID.'); }
+  }
   await retry_ready(() => azure.blobs(c.data), 'Storage RBAC');
   console.log('Declarative resources and storage access: ready');
 }
@@ -679,7 +736,8 @@ export async function ensure_running(azure: Azure): Promise<void> {
   const c = azure.c, cluster = await azure.arm('GET', c.cluster_id);
   owned(cluster, c); c.uri = cluster.properties.uri.replace(/\/+$/, '');
   if (cluster.properties.state === 'Stopped')
-    await azure.cli('rest', '--method', 'post', '--url', 'https://management.azure.com' + c.cluster_id + '/start?api-version=' + API);
+    await azure.cli('rest', '--method', 'post', '--url', 'https://management.azure.com' + c.cluster_id + '/start?api-version=' + API,
+      '--subscription', c.subscription);
   await retry_ready(() => azure.kql('.show cluster'), 'Kusto');
   console.log('Kusto cluster: running');
 }
@@ -702,8 +760,15 @@ export async function exclusive(control: PublisherControl, generation: string, s
   }
   await control.complete_bootstrap(operator, generation, true);
 }
+export function owned_environment(values: Record<string, string>, c: Config): NodeJS.ProcessEnv {
+  new Config({ AZURE_SUBSCRIPTION_ID: c.subscription, ...c.generated(), ...values },
+    c.mode === 'schema-evolution' ? 'schema-evolution' : c.stampConfig);
+  const ambient = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
+    !/^(AZURE_|ARROWCOL_)/.test(key) || ['AZURE_CONFIG_DIR', 'AZURE_EXTENSION_DIR'].includes(key)));
+  return { ...ambient, ...values, AZURE_SUBSCRIPTION_ID: c.subscription, ...c.generated() };
+}
 export function initializer_env(values: Record<string, string>, c: Config, tables: string, generation: string): NodeJS.ProcessEnv {
-  return { ...process.env, ...values, ...c.generated(), ARROWCOL_AZURE_TABLE_MANIFEST: path.resolve(tables),
+  return { ...owned_environment(values, c), ARROWCOL_AZURE_TABLE_MANIFEST: path.resolve(tables),
     ARROWCOL_EXPECTED_RESET_GENERATION: generation };
 }
 export const initializerEnv = initializer_env;
@@ -749,7 +814,7 @@ export async function provision(azure: Azure, tables: string, wait_seconds: numb
   }
   write_private(output, c.generated());
   if (infra_only) { console.log('INFRA-ONLY: Delta initialization and external-table/QAP reconciliation NOT verified.'); return; }
-  const initializer = path.join(ROOT, 'infra/azure/initialize-delta.sh');
+  const initializer = path.join(ROOT, 'projects/arrowcol-infra/scripts/initialize-delta.sh');
   if (!fs.existsSync(initializer)) throw new Failure('Delta initializer is unavailable; infra exists, full bootstrap is NOT complete.');
   const result = await runtime.run_tree(['bash', initializer], 1800, ROOT, initializer_env(values, c, tables, generation));
   if (result.returncode) throw new Failure('Delta initialization failed; KQL reconciliation was not attempted. ' + c.redact(result.stderr));
@@ -1053,7 +1118,7 @@ export async function _locked_reset_sequence(azure: Azure, stop_command: string[
     throw new Failure('Authority is not ready-v1 or fenced-v1; use reset --resume for existing cleanup custody. Nothing was stopped or deleted.');
   const generation = metadata.resetgeneration;
   if (metadata.resetstate === READY) await control.fence(generation);
-  const result = await runtime.run_tree(stop_command, 180, ROOT, { ...process.env, ARROWCOL_RESET_GENERATION: generation });
+  const result = await runtime.run_tree(stop_command, 180, ROOT, { ...owned_environment({}, azure.c), ARROWCOL_RESET_GENERATION: generation });
   if (result.returncode) throw new Failure('Writer/consumer stop failed; reset fence retained, no workload data deleted. ' + c.redact(result.stderr));
   if (!verified_stop_receipt(result.stdout, generation))
     throw new Failure('Runner did not verify workspace-owned services stopped for this reset generation; reset fence retained.');
@@ -1243,7 +1308,7 @@ export async function recover(azure: Azure, execute: boolean, stop_command: stri
   const generation = metadata.resetgeneration;
   if (![READY, FENCED].includes(metadata.resetstate) || metadata.occupancy === 'stopping')
     throw new Failure('Cleanup or a cluster stop owns authority; recovery refused before any stop.');
-  const result = await runtime.run_tree(stop_command, 180, ROOT, { ...process.env, ARROWCOL_RESET_GENERATION: generation });
+  const result = await runtime.run_tree(stop_command, 180, ROOT, { ...owned_environment({}, azure.c), ARROWCOL_RESET_GENERATION: generation });
   if (result.returncode || !verified_stop_receipt(result.stdout, generation))
     throw new Failure('Runner did not verify workspace-owned services stopped; nothing recovered. ' + azure.c.redact(result.stderr));
   console.log('Local writers stopped; waiting 60s for bounded in-flight publications.');
@@ -1265,7 +1330,8 @@ export async function stop_cluster(azure: Azure): Promise<void> {
   const hold = uuid();
   metadata.occupancy = 'stopping'; metadata.occupancyid = hold;
   await azure.set_control(metadata, etag);
-  await azure.cli('rest', '--method', 'post', '--url', 'https://management.azure.com' + azure.c.cluster_id + '/stop?api-version=' + API);
+  await azure.cli('rest', '--method', 'post', '--url', 'https://management.azure.com' + azure.c.cluster_id + '/stop?api-version=' + API,
+    '--subscription', azure.c.subscription);
   await retry_ready(() => stopped(azure), 'Cluster stop', 1200);
   const [current, currentEtag] = await azure.control();
   if (current.occupancy !== 'stopping' || current.occupancyid !== hold)
@@ -1294,18 +1360,24 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     const stopCommand = stopIndex < 0 || stopIndex === argv.length - 1 ? DEFAULT_STOP_COMMAND : argv.slice(stopIndex + 1);
     const { values: args, positionals } = parseArgs({ args: stopIndex < 0 ? argv : argv.slice(0, stopIndex),
       allowPositionals: true, options: {
-        'env-file': { type: 'string', default: path.join(ROOT, '.env') }, 'stamp-config': { type: 'string', default: path.join(ROOT, 'infra/azure/stamp.yaml') }, output: { type: 'string', default: path.join(ROOT, '.env.azure') },
+        mode: { type: 'string', default: 'stamped' }, 'env-file': { type: 'string', default: path.join(ROOT, '.env') },
+        'stamp-config': { type: 'string' }, output: { type: 'string', default: path.join(ROOT, '.env.azure') },
         tables: { type: 'string', default: path.join(ROOT, '.env.azure.tables.json') }, 'infra-only': { type: 'boolean', default: false },
         execute: { type: 'boolean', default: false }, resume: { type: 'boolean', default: false },
         'occupancy-id': { type: 'string', default: '' }, 'reset-generation': { type: 'string', default: '' },
         'wait-seconds': { type: 'string', default: '0' }, help: { type: 'boolean', short: 'h' },
       } });
-    if (args.help) { console.log('Usage: bootstrap.ts <config|preflight|provision|reconcile|reset|recover|status|stop|occupy|release> [--env-file PATH] [--stamp-config YAML] [--output PATH] [--tables PATH] [--infra-only] [--execute] [--resume] [--occupancy-id UUID] [--reset-generation UUID] [--wait-seconds 0..600] [--stop-command COMMAND ...]'); return 0; }
+    if (args.help) { console.log('Usage: bootstrap.ts <config|preflight|provision|reconcile|reset|recover|status|stop|occupy|release> [--mode stamped|schema-evolution] [--env-file PATH] [--stamp-config YAML] [--output PATH] [--tables PATH] [--infra-only] [--execute] [--resume] [--occupancy-id UUID] [--reset-generation UUID] [--wait-seconds 0..600] [--stop-command COMMAND ...]'); return 0; }
     const command = positionals[0];
     if (positionals.length !== 1 || !['config', 'preflight', 'provision', 'reconcile', 'reset', 'recover', 'status', 'stop', 'occupy', 'release'].includes(command))
       throw new Failure('A valid Azure bootstrap command is required.');
-    const values = { ...load_env(args['env-file']!), ...process.env } as Record<string, string>;
-    c = new Config(values, loadStampConfig(args['stamp-config']!));
+    const mode = azure_mode(args.mode!);
+    if (mode === 'schema-evolution' && args['stamp-config'])
+      throw new Failure('Schema-evolution mode does not accept an AKS stamp configuration.');
+    const privateValues = load_env(args['env-file']!);
+    const values = (mode === 'stamped' ? { ...privateValues, ...process.env } : privateValues) as Record<string, string>;
+    c = new Config(values, mode === 'schema-evolution' ? 'schema-evolution' :
+      loadStampConfig(args['stamp-config'] ?? path.join(ROOT, 'infra/azure/stamp.yaml')));
     const wait = Number(args['wait-seconds']);
     if (!/^\d+$/.test(args['wait-seconds']!) || !Number.isInteger(wait) || wait < 0 || wait > 600)
       throw new Failure('--wait-seconds must be in the range 0..600.');
