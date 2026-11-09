@@ -1939,7 +1939,16 @@ async fn run_clients_inner(
     let mut completed_clients = HashSet::new();
     let mut active_clients = vec![true; handles.len()];
     while completed_clients.len() < handles.len() {
-        let progress = match poll_clients(platform, config, &handles).await {
+        let pending_indices = handles
+            .iter()
+            .enumerate()
+            .filter_map(|(index, handle)| (!completed_clients.contains(&handle.client_id)).then_some(index))
+            .collect::<Vec<_>>();
+        let pending_handles = pending_indices
+            .iter()
+            .map(|index| handles[*index].clone())
+            .collect::<Vec<_>>();
+        let progress = match poll_clients(platform, config, &pending_handles).await {
             Ok(progress) => progress,
             Err(error) => {
                 let cleanup = cancel_active_clients(platform, config, &handles, &active_clients).await;
@@ -1951,7 +1960,8 @@ async fn run_clients_inner(
                 };
             }
         };
-        for (index, (handle, state)) in handles.iter().zip(progress).enumerate() {
+        for (index, state) in pending_indices.into_iter().zip(progress) {
+            let handle = &handles[index];
             if let Some(failure) = state.failure {
                 let error = anyhow::anyhow!("OAT client {} failed: {failure}", handle.client_id);
                 let cleanup = cancel_active_clients(platform, config, &handles, &active_clients).await;
