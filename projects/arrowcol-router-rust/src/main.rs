@@ -1,10 +1,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use arrowcol_router_rust::{
     AllowAllAuthenticator, Authenticator, Cli, EdgeVerifier, InternalIdentitySigner, ProductionRouter, RouterConfig,
-    RouterControlLoop, RouterMetrics, build_server,
+    RouterControlLoop, RouterMetrics, build_server, read_secret_file,
 };
 use arrowcol_routing::{RoutingEngine, RoutingStore, SqlServerRoutingConfig, SqlServerRoutingStore};
 use clap::Parser;
@@ -20,8 +20,8 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let edge_secret = read_secret(&config.auth.edge_secret_file)?;
-    let internal_secret = read_secret(&config.auth.internal_signing_secret_file)?;
+    let edge_secret = read_secret_file(&config.auth.edge_secret_file)?;
+    let internal_secret = read_secret_file(&config.auth.internal_signing_secret_file)?;
     let routing_sql = SqlServerRoutingConfig::with_password_file(
         &config.sql_server.host,
         config.sql_server.port,
@@ -78,19 +78,4 @@ fn initialize_tracing(config: &RouterConfig) -> Result<()> {
             .map_err(|error| anyhow::anyhow!("initialize tracing: {error}"))?;
     }
     Ok(())
-}
-
-fn read_secret(path: &std::path::Path) -> Result<Vec<u8>> {
-    let value = std::fs::read(path).with_context(|| format!("read secret file {}", path.display()))?;
-    let value = value
-        .strip_suffix(b"\n")
-        .and_then(|value| value.strip_suffix(b"\r").or(Some(value)))
-        .unwrap_or(&value);
-    ensure!(!value.is_empty(), "secret file {} is empty", path.display());
-    ensure!(
-        !value.contains(&b'\n') && !value.contains(&b'\r'),
-        "secret file {} must contain one line",
-        path.display()
-    );
-    Ok(value.to_vec())
 }

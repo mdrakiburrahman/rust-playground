@@ -9,10 +9,10 @@ replace the devcontainer mode.
 | Requirement | Qualified value or guard |
 | --- | --- |
 | Azure target | The private stamp subscription, `arrow-collector-rg`, East US 2 or Canada Central; never the separate `rust-playground` resource group. Each region still requires live SKU, version, quota and network preflight. |
-| Stamp | Integer `1..999999` in ignored `infra/azure/stamp.yaml`; `arrow-collector-<stamp>` must fit Kusto's provider-enforced 22-character name limit. |
+| Stamp | Integer `1..999999` or the quoted five-digit string `'00000'` in ignored `infra/azure/stamp.yaml`; `arrow-collector-<stamp>` must fit Kusto's provider-enforced 22-character name limit. |
 | AKS baseline | 1.35.6; `Standard_D8ds_v6` system pool with 3 initial/3 minimum/3 maximum nodes, 250 pods per node, zones 1/2/3, Azure Linux/FIPS, Entra/Azure RBAC, OIDC/workload identity, Azure CNI overlay dual stack and API-server VNet integration. |
 | Declared identity | One `arrow-collector` UAMI for control plane, kubelet, QAP ServiceAccount federation, ADX/storage and ACR. Identity-creating optional add-ons are omitted; tenant-enforced add-ons require separate live qualification below. |
-| Publisher ownership | Generated `AZURE_STAMP` selects the same `stamp-<integer>` authority in TypeScript and Rust. Invalid stamps fail closed; an absent stamp retains the Rust legacy hashed-authority path only for older deployments. |
+| Publisher ownership | Generated `AZURE_STAMP` selects the same `stamp-<stamp>` authority in TypeScript and Rust, preserving `00000` when selected. Invalid stamps fail closed; an absent stamp retains the Rust legacy hashed-authority path only for older deployments. |
 | Networking | Explicit IPv4/IPv6 VNet, node, API, pod, service and DNS ranges; preflight checks subscription VNets and connected peering ranges before deployment. |
 | Legacy gate | Preflight blocks while old `project=arrow-collector` resources or additional UAMIs remain. Preserve Terraform state, Key Vault dependencies, role assignments, registry publishing consumers and every FIC subject before retiring the old stamp. |
 
@@ -41,9 +41,12 @@ or an explicitly approved platform-identity exception is required before
 declaring the one-UAMI requirement complete.
 
 Prepare the private stamp from `infra/azure/stamp.example.yaml`. Keep the
-subscription UUID, real non-overlapping network ranges and preserved publisher
-FICs private. Align the operator environment's subscription, resource group and
-location with that stamp.
+subscription UUID, real non-overlapping network ranges and any configured external
+publisher FICs private. Optional `publisherFederatedCredentials` may be empty
+(`[]`); the stamp's native AKS ServiceAccount federation remains required.
+Preserve any existing in-use trusts; an empty optional list is not a request to
+restore or add external trusts. Align the operator environment's subscription,
+resource group and location with that stamp.
 
 For a different region, use a fresh stamp and separate private stamp, generated
 environment and table-manifest paths. Keep existing stamps untouched. Bootstrap
@@ -105,6 +108,11 @@ publisher signs in to the shared UAMI in a temporary Azure CLI cache, verifies
 that principal again, and removes the cache afterward. Operator credentials are
 not replaced. First obtain the stamped cluster's kubeconfig with
 `az aks get-credentials` and convert it with `kubelogin convert-kubeconfig -l azurecli`.
+
+This native-federated ACR publisher is separate from repository GitHub Actions
+image publication to GHCR, which uses `GITHUB_TOKEN` with `packages: write`, not
+Azure OIDC. GHCR CI does not require external publisher FICs or Azure Actions
+variables.
 
 ```bash
 npx nx run azure-qap-experiment:image -- \

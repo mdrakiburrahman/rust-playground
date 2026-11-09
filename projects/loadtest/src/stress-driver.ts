@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { setTimeout as delay } from 'node:timers/promises';
+import timers from 'node:timers/promises';
 import { evaluateStress, type StressCriteria, type StressVerdict, type WaveSample } from './stress-criteria.js';
 
 export interface StressPlan {
@@ -180,7 +180,11 @@ export async function runStressDriver(options: StressDriverOptions): Promise<Str
       await options.operate(wave, deadline);
       if (Date.now() > deadline) throw new Error('Maintenance wave exceeded its fixed operation budget');
       check();
-      await delay(Math.max(0, boundary - Date.now()), undefined, { signal: options.loadEnded });
+      // A timer wake does not prove that the absolute wave boundary has been reached.
+      while (Date.now() < boundary) {
+        check();
+        await timers.setTimeout(boundary - Date.now(), undefined, { signal: options.loadEnded });
+      }
       await sample(wave);
     }
   } catch (error) {

@@ -1,6 +1,8 @@
 use std::collections::{BTreeSet, HashMap};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use anyhow::{Context as _, ensure};
 use arrowcol_protocol::{
     AuthContext, AuthMethod, AuthenticatedPrincipal, PrincipalId, PrincipalIssuer, PrincipalScope, UnixMillis,
 };
@@ -115,6 +117,28 @@ impl Authenticator for AllowAllAuthenticator {
         .map_err(principal_failure)?;
         AuthContext::new(principal, AuthMethod::WorkloadIdentity, now, None).map_err(principal_failure)
     }
+}
+
+/// Reads a one-line secret file, removing one trailing LF or CRLF line ending.
+///
+/// Signers and verifiers must both load key files through this function so they HMAC identical bytes.
+///
+/// # Errors
+///
+/// Rejects unreadable, empty, or multi-line secret files.
+pub fn read_secret_file(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let value = std::fs::read(path).with_context(|| format!("read secret file {}", path.display()))?;
+    let value = value
+        .strip_suffix(b"\n")
+        .and_then(|value| value.strip_suffix(b"\r").or(Some(value)))
+        .unwrap_or(&value);
+    ensure!(!value.is_empty(), "secret file {} is empty", path.display());
+    ensure!(
+        !value.contains(&b'\n') && !value.contains(&b'\r'),
+        "secret file {} must contain one line",
+        path.display()
+    );
+    Ok(value.to_vec())
 }
 
 /// HMAC signer used by an external TLS terminator or integration test.

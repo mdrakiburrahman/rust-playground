@@ -21,7 +21,7 @@ use arrowcol_protocol::{
     ClaimedSchemaFingerprint, ImplementationPool, IngestMetadata, ProtocolVersion, TableIdentity, UnixMillis,
     fingerprint_schema,
 };
-use arrowcol_router_rust::{EdgeRequestSigner, insert_edge_signature_headers};
+use arrowcol_router_rust::{EdgeRequestSigner, insert_edge_signature_headers, read_secret_file};
 use futures::{StreamExt, TryStreamExt, stream};
 use prost::Message as _;
 use tonic::Request;
@@ -176,17 +176,17 @@ pub async fn send_authenticated(
     concurrency: usize,
     edge_secret_file: Option<&std::path::Path>,
 ) -> Result<usize> {
-    let signer = edge_secret_file
-        .map(|path| {
-            let secret = std::fs::read(path).context("read trusted-edge key file")?;
-            EdgeRequestSigner::new(secret).map_err(anyhow::Error::from)
-        })
-        .transpose()?;
+    let signer = edge_secret_file.map(edge_signer_from_file).transpose()?;
     let tables = match table_name {
         Some(name) => vec![table_named(name)?],
         None => tables()?,
     };
     send_tables_with_concurrency(endpoint, client_id, rows, concurrency, tables, signer).await
+}
+
+fn edge_signer_from_file(path: &std::path::Path) -> Result<EdgeRequestSigner> {
+    let secret = read_secret_file(path).context("read trusted-edge key file")?;
+    EdgeRequestSigner::new(secret).map_err(anyhow::Error::from)
 }
 
 fn table_named(table_name: &str) -> Result<DmvTable> {
@@ -418,6 +418,31 @@ mod tests {
             assert!(verify().is_err());
             assert_eq!(headers["x-arrowcol-table"], "sqlserver_wait_stats");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn client_signs_with_the_router_key_from_a_newline_terminated_file() -> Result<()> {
+        let table = table_named("sqlserver_wait_stats")?;
+        let directory = std::env::temp_dir().join(format!("arrowcol-dmv-edge-key-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory)?;
+        let key_file = directory.join("edge-hmac");
+        std::fs::write(&key_file, format!("{}\n", "k".repeat(64)))?;
+        let signer = edge_signer_from_file(&key_file);
+        let router_key = read_secret_file(&key_file);
+        std::fs::remove_dir_all(&directory)?;
+        let verifier = arrowcol_router_rust::EdgeVerifier::new(router_key?, 30_000)?;
+        let mut request = Request::new(());
+        request_metadata(&mut request, &table, Some(&signer?))?;
+        let now = UnixMillis::new(u64::try_from(
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
+        )?)?;
+        verifier.verify(
+            &http::Method::POST,
+            "/arrow.flight.protocol.FlightService/DoPut",
+            &request.metadata().clone().into_headers(),
+            now,
+        )?;
         Ok(())
     }
 
