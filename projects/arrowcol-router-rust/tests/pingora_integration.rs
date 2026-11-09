@@ -659,6 +659,8 @@ fn test_config(listen: SocketAddr, state_directory: String) -> RouterConfig {
             warmup_ms: 0,
             minimum_warmup_bps: 1_000,
             lease_ttl_ms: 300_000,
+            oat_run_pin_ttl_ms: 3_600_000,
+            oat_run_id: None,
             readiness_max_staleness_ms: 300_000,
             distinct_table_owners: false,
         },

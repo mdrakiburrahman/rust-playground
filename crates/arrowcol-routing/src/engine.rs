@@ -216,6 +216,12 @@ impl RoutingEngine {
     /// not a value supplied by the request. Existing pins are checked against
     /// the authoritative store on every request; a missing, expired, changed,
     /// or unavailable pin never falls back to ordinary collector selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the run is unauthorized or invalid, metadata is
+    /// invalid, the authoritative pin cannot be read, or its immutable binding
+    /// is missing, expired, corrupt, or no longer routable.
     pub async fn route_ingest_for_run(
         &self,
         metadata: &IngestMetadata,

@@ -160,6 +160,10 @@ const DEADLOCK_ATTEMPTS: u32 = 6;
 ///
 /// The digest is stable across input order and encodes each UTF-8 identity
 /// component before joining rows, matching the SQL Server authority function.
+///
+/// # Errors
+///
+/// Returns an error if the pin set is empty or contains duplicate table keys.
 pub fn run_table_pin_set_digest(expected: &[LeaseKey]) -> RoutingResult<String> {
     if expected.is_empty() {
         return Err(RoutingError::new(

@@ -33,6 +33,12 @@
         "command": "cargo run --locked --package arrowcol-oat-rust --bin arrowcol-oat-server",
         "forwardAllArgs": true
       }
+    },
+    "verify": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["build", "format-check", "lint", "test"],
+      "options": {"commands": []}
     }
   }
 }

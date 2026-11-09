@@ -12,6 +12,12 @@
       "executor": "nx:run-commands",
       "options": {"command": "npx --no-install tsc --project projects/arrowcol-oat/tsconfig.json"}
     },
+    "verify": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["test", "typecheck"],
+      "options": {"commands": []}
+    },
     "launch": {
       "executor": "nx:run-commands",
       "cache": false,

@@ -746,7 +746,8 @@ async fn fresh_oat_router_rejects_missing_bound_owner_even_with_a_valid_replacem
     let authority_error = store
         .get_run_table_pin(OAT_RUN_RESTART, &key, request_now)
         .await
-        .expect_err("bound run/table authority must remain while its owner row is missing");
+        .err()
+        .unwrap_or_else(|| panic!("bound run/table authority must remain while its owner row is missing"));
     assert_eq!(authority_error.kind(), RoutingErrorKind::CorruptState);
     assert!(
         authority_error
@@ -772,7 +773,8 @@ async fn fresh_oat_router_rejects_missing_bound_owner_even_with_a_valid_replacem
     let missing_owner_again = store
         .get_run_table_pin(OAT_RUN_RESTART, &key, request_now)
         .await
-        .expect_err("failed request must not recreate the missing owner row");
+        .err()
+        .unwrap_or_else(|| panic!("failed request must not recreate the missing owner row"));
     assert_eq!(missing_owner_again.kind(), RoutingErrorKind::CorruptState);
     assert!(
         missing_owner_again
@@ -1050,13 +1052,13 @@ async fn distinct_owner_policy_partitions_concurrent_table_claims() {
 #[tokio::test]
 async fn shared_owner_policy_allows_one_collector_to_own_multiple_tables() {
     let (store, first, _) = seeded_store().await;
-    for (index, table_name) in ["table_a", "table_b"].into_iter().enumerate() {
+    for (index, table_name) in (0_u64..).zip(["table_a", "table_b"]) {
         let lease = store
             .claim_lease(&LeaseClaim {
                 key: LeaseKey::new(ImplementationPool::Dataflow, table_named(table_name)),
                 candidate_instance_id: first,
-                now_unix_ms: millis(100_001 + index as i64),
-                expires_at_unix_ms: millis(130_001 + index as i64),
+                now_unix_ms: millis(100_001 + index),
+                expires_at_unix_ms: millis(130_001 + index),
                 minimum_snapshot_at_unix_ms: millis(99_000),
                 distinct_table_owners: false,
             })

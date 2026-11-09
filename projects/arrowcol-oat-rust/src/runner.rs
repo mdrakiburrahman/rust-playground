@@ -3406,7 +3406,7 @@ fn namespace_matches_run(namespace: &Value, run_id: &str, owner_token: &str, exp
         && actual_owner_token == Some(owner_token)
         && annotated_run_id == Some(run_id)
         && annotated_owner_token == Some(owner_token)
-        && expected_uid.map_or(true, |uid| actual_uid == Some(uid))
+        && expected_uid.is_none_or(|uid| actual_uid == Some(uid))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3994,7 +3994,7 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
     let mut failures = Vec::new();
     let mut namespace_removed = false;
     if let Some(forward) = platform.router_tunnel.take() {
-        match stop_port_forward(forward).await.and_then(|stderr| Ok(stderr)) {
+        match stop_port_forward(forward).await {
             Ok(stderr) => {
                 if let Err(error) = collect_port_forward_stderr(stderr).await {
                     failures.push(format!(
@@ -4991,7 +4991,10 @@ mod tests {
     #[test]
     fn checked_unix_millisecond_conversion_rejects_values_outside_supported_range() {
         let maximum = u128::from(u64::MAX);
-        assert_eq!(checked_unix_time_ms(maximum).expect("u64 maximum fits"), u64::MAX);
+        assert_eq!(
+            checked_unix_time_ms(maximum).unwrap_or_else(|error| panic!("u64 maximum must fit: {error}")),
+            u64::MAX
+        );
         assert!(checked_unix_time_ms(maximum + 1).is_err());
     }
 
@@ -5144,14 +5147,23 @@ mod tests {
             "oat-client-test-c1",
             &["--rows".to_owned()],
         );
-        let service = args.iter().position(|arg| arg == "oat-client").unwrap();
-        let env = args.iter().position(|arg| arg == "--env").unwrap();
+        let service = args
+            .iter()
+            .position(|arg| arg == "oat-client")
+            .unwrap_or_else(|| panic!("missing oat-client argument"));
+        let env = args
+            .iter()
+            .position(|arg| arg == "--env")
+            .unwrap_or_else(|| panic!("missing --env argument"));
         assert!(env < service);
         assert_eq!(
             args[env + 1],
             "ARROWCOL_OAT_RUN_ID=00000000-0000-0000-0000-000000000001"
         );
-        let name = args.iter().position(|arg| arg == "--name").unwrap();
+        let name = args
+            .iter()
+            .position(|arg| arg == "--name")
+            .unwrap_or_else(|| panic!("missing --name argument"));
         assert!(name < service);
         assert_eq!(args[name + 1], "oat-client-test-c1");
         assert_eq!(args[service + 1], "--rows");
@@ -5406,7 +5418,8 @@ mod tests {
             ("qap_unhealthy_catalogs", DataType::UInt64, true),
             ("qap_lag_seconds", DataType::Float64, true),
         ];
-        let actual = result_schema()
+        let schema = result_schema();
+        let actual = schema
             .fields()
             .iter()
             .map(|field| (field.name().as_str(), field.data_type().clone(), field.is_nullable()))
@@ -5704,7 +5717,7 @@ mod tests {
     #[test]
     fn writes_one_compact_parquet_file_with_viewer_schema() -> Result<()> {
         let results = vec![sample_result("run-1", "sqlserver_wait_stats", 100)];
-        let bytes = parquet_bytes(&results)?;
+        let bytes = encode_parquet(&parquet_batch(&results)?)?;
         assert!(bytes.starts_with(b"PAR1"));
         assert!(bytes.ends_with(b"PAR1"));
         Ok(())
@@ -5730,7 +5743,7 @@ mod tests {
                 batch
                     .column_by_name("rows")
                     .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
-                    .expect("schema contains UInt64 rows")
+                    .unwrap_or_else(|| panic!("schema must contain UInt64 rows"))
                     .values()
                     .iter()
                     .copied()
@@ -5771,20 +5784,19 @@ mod tests {
         assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
         let rows = batches
             .iter()
-            .map(|batch| {
+            .flat_map(|batch| {
                 let run_id = batch
                     .column_by_name("run_id")
                     .and_then(|column| column.as_any().downcast_ref::<StringArray>())
-                    .expect("schema contains UTF-8 run_id");
+                    .unwrap_or_else(|| panic!("schema must contain UTF-8 run_id"));
                 let table = batch
                     .column_by_name("table")
                     .and_then(|column| column.as_any().downcast_ref::<StringArray>())
-                    .expect("schema contains UTF-8 table");
+                    .unwrap_or_else(|| panic!("schema must contain UTF-8 table"));
                 (0..batch.num_rows())
                     .map(|index| (run_id.value(index).to_owned(), table.value(index).to_owned()))
                     .collect::<Vec<_>>()
             })
-            .flatten()
             .collect::<HashSet<_>>();
         assert_eq!(
             rows,

@@ -139,7 +139,7 @@ impl OatConfig {
         }
         if self.pilot_mode
             && (!(60..=600).contains(&self.measure_seconds)
-                || self.measure_seconds % 30 != 0
+                || !self.measure_seconds.is_multiple_of(30)
                 || self.warmup_seconds + self.measure_seconds > 600)
         {
             bail!(
@@ -238,10 +238,10 @@ impl OatConfig {
                         bail!("platform.{field} must identify an existing file");
                     }
                 }
-                if let Some(overlay) = self.platform.kustomize_overlay.as_deref() {
-                    if overlay.trim().is_empty() || overlay.contains('\0') || !Path::new(overlay).is_dir() {
-                        bail!("kustomize_overlay must identify an existing local directory");
-                    }
+                if let Some(overlay) = self.platform.kustomize_overlay.as_deref()
+                    && (overlay.trim().is_empty() || overlay.contains('\0') || !Path::new(overlay).is_dir())
+                {
+                    bail!("kustomize_overlay must identify an existing local directory");
                 }
                 validate_dns_label(&self.namespace, "namespace")?;
                 if self.arrowcol_deployment != "arrowcol"

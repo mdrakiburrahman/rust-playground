@@ -1885,6 +1885,12 @@ pub async fn observe_qap(
 }
 
 /// Observes QAP using an explicit platform mode and database, without reading or mutating process environment.
+///
+/// # Errors
+///
+/// Returns an error if client setup, the observation deadline, elapsed-time
+/// conversion, or diagnostic publication fails. Per-table failures are recorded
+/// in the returned JSON rather than failing the entire observation.
 pub async fn observe_qap_with_mode(
     endpoint: &str,
     results: &Path,
@@ -1935,6 +1941,11 @@ pub async fn observe_qap_with_mode(
 }
 
 /// Creates run-scoped local external tables and applies the local QAP policy after Delta commits.
+///
+/// # Errors
+///
+/// Returns an error if the database, table set, or locations are invalid, or client
+/// initialization, policy application/read-back, schema access, or the deadline fails.
 pub async fn initialize_local_qap(
     endpoint: &str,
     results: &Path,

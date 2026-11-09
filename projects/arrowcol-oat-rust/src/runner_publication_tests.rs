@@ -3,8 +3,8 @@ mod publication_fault_tests {
     use async_trait::async_trait;
     use futures_util::stream::BoxStream;
     use object_store::{
-        CopyOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions,
-        PutResult, memory::InMemory,
+        CopyOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions, PutResult,
+        memory::InMemory,
     };
     use std::collections::VecDeque;
     use std::fmt;
@@ -28,7 +28,10 @@ mod publication_fault_tests {
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum Attempt {
         Create,
-        Update { e_tag: Option<String>, version: Option<String> },
+        Update {
+            e_tag: Option<String>,
+            version: Option<String>,
+        },
         Overwrite,
     }
 
@@ -59,26 +62,39 @@ mod publication_fault_tests {
         }
 
         fn attempts(&self) -> Vec<Attempt> {
-            self.attempts.lock().expect("attempt mutex").clone()
+            self.attempts
+                .lock()
+                .unwrap_or_else(|error| panic!("attempt mutex: {error}"))
+                .clone()
         }
 
         fn reads(&self) -> usize {
-            *self.reads.lock().expect("read mutex")
+            *self.reads.lock().unwrap_or_else(|error| panic!("read mutex: {error}"))
         }
 
         fn pause_next_read(&self) -> Arc<ReadGate> {
             let gate = Arc::new(ReadGate::default());
-            *self.read_gate.lock().expect("gate mutex") = Some(gate.clone());
+            *self
+                .read_gate
+                .lock()
+                .unwrap_or_else(|error| panic!("gate mutex: {error}")) = Some(Arc::<ReadGate>::clone(&gate));
             gate
         }
 
         async fn seed(&self, location: &ObjectPath, bytes: Vec<u8>) -> Result<()> {
-            self.inner.put_opts(location, PutPayload::from(bytes), PutOptions::default()).await?;
+            self.inner
+                .put_opts(location, PutPayload::from(bytes), PutOptions::default())
+                .await?;
             Ok(())
         }
 
         async fn stored_rows(&self, location: &ObjectPath) -> Result<Vec<(String, String, u64)>> {
-            let bytes = self.inner.get_opts(location, GetOptions::default()).await?.bytes().await?;
+            let bytes = self
+                .inner
+                .get_opts(location, GetOptions::default())
+                .await?
+                .bytes()
+                .await?;
             decoded_rows(bytes.to_vec())
         }
     }
@@ -106,12 +122,21 @@ mod publication_fault_tests {
                 },
                 PutMode::Overwrite => Attempt::Overwrite,
             };
-            self.attempts.lock().expect("attempt mutex").push(attempt);
-            let fault = self.faults.lock().expect("fault mutex").pop_front();
+            self.attempts
+                .lock()
+                .unwrap_or_else(|error| panic!("attempt mutex: {error}"))
+                .push(attempt);
+            let fault = self
+                .faults
+                .lock()
+                .unwrap_or_else(|error| panic!("fault mutex: {error}"))
+                .pop_front();
             match fault {
                 Some(Fault::RivalWrite(bytes)) => {
                     // The rival commits between the real helper's GET and conditional PUT.
-                    self.inner.put_opts(location, PutPayload::from(bytes), PutOptions::default()).await?;
+                    self.inner
+                        .put_opts(location, PutPayload::from(bytes), PutOptions::default())
+                        .await?;
                 }
                 Some(Fault::Conflict) => {
                     return Err(object_store::Error::Precondition {
@@ -131,9 +156,13 @@ mod publication_fault_tests {
         }
 
         async fn get_opts(&self, location: &ObjectPath, options: GetOptions) -> object_store::Result<GetResult> {
-            *self.reads.lock().expect("read mutex") += 1;
+            *self.reads.lock().unwrap_or_else(|error| panic!("read mutex: {error}")) += 1;
             let object = self.inner.get_opts(location, options).await;
-            let gate = self.read_gate.lock().expect("gate mutex").take();
+            let gate = self
+                .read_gate
+                .lock()
+                .unwrap_or_else(|error| panic!("gate mutex: {error}"))
+                .take();
             if let Some(gate) = gate {
                 gate.captured.notify_one();
                 gate.resume.notified().await;
@@ -175,19 +204,35 @@ mod publication_fault_tests {
     }
 
     fn decoded_rows(bytes: Vec<u8>) -> Result<Vec<(String, String, u64)>> {
-        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)?.build()?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes))?.build()?;
         let mut output = Vec::new();
         for batch in reader {
             let batch = batch?;
-            let runs = batch.column_by_name("run_id").context("run_id")?
-                .as_any().downcast_ref::<StringArray>().context("UTF-8 run_id")?;
-            let tables = batch.column_by_name("table").context("table")?
-                .as_any().downcast_ref::<StringArray>().context("UTF-8 table")?;
-            let rows = batch.column_by_name("rows").context("rows")?
-                .as_any().downcast_ref::<UInt64Array>().context("uint64 rows")?;
+            let runs = batch
+                .column_by_name("run_id")
+                .context("run_id")?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .context("UTF-8 run_id")?;
+            let tables = batch
+                .column_by_name("table")
+                .context("table")?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .context("UTF-8 table")?;
+            let rows = batch
+                .column_by_name("rows")
+                .context("rows")?
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .context("uint64 rows")?;
             for index in 0..batch.num_rows() {
                 assert!(!runs.is_null(index) && !tables.is_null(index) && !rows.is_null(index));
-                output.push((runs.value(index).to_owned(), tables.value(index).to_owned(), rows.value(index)));
+                output.push((
+                    runs.value(index).to_owned(),
+                    tables.value(index).to_owned(),
+                    rows.value(index),
+                ));
             }
         }
         output.sort();
@@ -207,9 +252,19 @@ mod publication_fault_tests {
         let location = ObjectPath::from("synthetic/results.parquet");
         let rival = encode_parquet(&batch("rival", "sqlserver_rival", 41)?)?;
         let store = ControlledStore::new(vec![Fault::RivalWrite(rival)]);
-        put_parquet(store.clone(), location.clone(), batch("ours", "sqlserver_ours", 19)?).await?;
-        assert_eq!(store.stored_rows(&location).await?,
-            vec![expected("ours", "sqlserver_ours", 19), expected("rival", "sqlserver_rival", 41)]);
+        put_parquet(
+            Arc::<ControlledStore>::clone(&store),
+            location.clone(),
+            batch("ours", "sqlserver_ours", 19)?,
+        )
+        .await?;
+        assert_eq!(
+            store.stored_rows(&location).await?,
+            vec![
+                expected("ours", "sqlserver_ours", 19),
+                expected("rival", "sqlserver_rival", 41)
+            ]
+        );
         let attempts = store.attempts();
         assert_eq!(attempts.len(), 2);
         assert_eq!(attempts[0], Attempt::Create);
@@ -226,19 +281,34 @@ mod publication_fault_tests {
         let store = ControlledStore::new(vec![Fault::RivalWrite(rival)]);
         store.seed(&location, encode_parquet(&original)?).await?;
         let original_version = store.inner.get_opts(&location, GetOptions::default()).await?.meta;
-        put_parquet(store.clone(), location.clone(), batch("ours", "sqlserver_ours", 23)?).await?;
-        assert_eq!(store.stored_rows(&location).await?, vec![
-            expected("baseline", "sqlserver_baseline", 7),
-            expected("ours", "sqlserver_ours", 23),
-            expected("rival", "sqlserver_rival", 13),
-        ]);
+        put_parquet(
+            Arc::<ControlledStore>::clone(&store),
+            location.clone(),
+            batch("ours", "sqlserver_ours", 23)?,
+        )
+        .await?;
+        assert_eq!(
+            store.stored_rows(&location).await?,
+            vec![
+                expected("baseline", "sqlserver_baseline", 7),
+                expected("ours", "sqlserver_ours", 23),
+                expected("rival", "sqlserver_rival", 13),
+            ]
+        );
         let attempts = store.attempts();
         assert_eq!(attempts.len(), 2);
-        assert_eq!(attempts[0], Attempt::Update {
-            e_tag: original_version.e_tag, version: original_version.version,
-        });
+        assert_eq!(
+            attempts[0],
+            Attempt::Update {
+                e_tag: original_version.e_tag,
+                version: original_version.version,
+            }
+        );
         assert!(matches!(&attempts[1], Attempt::Update { e_tag: Some(_), .. }));
-        assert_ne!(attempts[0], attempts[1], "Retry must use the newly observed rival version.");
+        assert_ne!(
+            attempts[0], attempts[1],
+            "Retry must use the newly observed rival version."
+        );
         assert_eq!(store.reads(), 2);
         Ok(())
     }
@@ -252,19 +322,31 @@ mod publication_fault_tests {
             sample_result("same-run", "sqlserver_b", 2),
             sample_result("other-run", "sqlserver_a", 3),
         ])?;
-        put_parquet(store.clone(), location.clone(), initial).await?;
+        put_parquet(Arc::<ControlledStore>::clone(&store), location.clone(), initial).await?;
         let incoming = batch("same-run", "sqlserver_a", 99)?;
-        put_parquet(store.clone(), location.clone(), incoming.clone()).await?;
-        put_parquet(store.clone(), location.clone(), incoming).await?;
-        assert_eq!(store.stored_rows(&location).await?, vec![
-            expected("other-run", "sqlserver_a", 3),
-            expected("same-run", "sqlserver_a", 99),
-            expected("same-run", "sqlserver_b", 2),
-        ]);
+        put_parquet(
+            Arc::<ControlledStore>::clone(&store),
+            location.clone(),
+            incoming.clone(),
+        )
+        .await?;
+        put_parquet(Arc::<ControlledStore>::clone(&store), location.clone(), incoming).await?;
+        assert_eq!(
+            store.stored_rows(&location).await?,
+            vec![
+                expected("other-run", "sqlserver_a", 3),
+                expected("same-run", "sqlserver_a", 99),
+                expected("same-run", "sqlserver_b", 2),
+            ]
+        );
         let attempts = store.attempts();
         assert_eq!(attempts.len(), 3);
         assert_eq!(attempts[0], Attempt::Create);
-        assert!(attempts[1..].iter().all(|mode| matches!(mode, Attempt::Update { e_tag: Some(_), .. })));
+        assert!(
+            attempts[1..]
+                .iter()
+                .all(|mode| matches!(mode, Attempt::Update { e_tag: Some(_), .. }))
+        );
         Ok(())
     }
 
@@ -272,13 +354,30 @@ mod publication_fault_tests {
     async fn conflict_exhaustion_stops_at_eight_conditional_updates_and_preserves_destination() -> Result<()> {
         let location = ObjectPath::from("synthetic/results.parquet");
         let store = ControlledStore::new((0..8).map(|_| Fault::Conflict).collect());
-        store.seed(&location, encode_parquet(&batch("rival", "sqlserver_rival", 31)?)?).await?;
-        assert!(put_parquet(store.clone(), location.clone(), batch("ours", "sqlserver_ours", 17)?).await.is_err());
-        assert_eq!(store.stored_rows(&location).await?, vec![expected("rival", "sqlserver_rival", 31)]);
+        store
+            .seed(&location, encode_parquet(&batch("rival", "sqlserver_rival", 31)?)?)
+            .await?;
+        assert!(
+            put_parquet(
+                Arc::<ControlledStore>::clone(&store),
+                location.clone(),
+                batch("ours", "sqlserver_ours", 17)?
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            store.stored_rows(&location).await?,
+            vec![expected("rival", "sqlserver_rival", 31)]
+        );
         assert_eq!(store.reads(), 8);
         let attempts = store.attempts();
         assert_eq!(attempts.len(), 8);
-        assert!(attempts.iter().all(|mode| matches!(mode, Attempt::Update { e_tag: Some(_), .. })));
+        assert!(
+            attempts
+                .iter()
+                .all(|mode| matches!(mode, Attempt::Update { e_tag: Some(_), .. }))
+        );
         assert!(attempts.windows(2).all(|pair| pair[0] == pair[1]));
         Ok(())
     }
@@ -287,9 +386,22 @@ mod publication_fault_tests {
     async fn nonconflict_failure_before_commit_is_not_blindly_replayed() -> Result<()> {
         let location = ObjectPath::from("synthetic/results.parquet");
         let store = ControlledStore::new(vec![Fault::FailureBeforeCommit]);
-        store.seed(&location, encode_parquet(&batch("rival", "sqlserver_rival", 43)?)?).await?;
-        assert!(put_parquet(store.clone(), location.clone(), batch("ours", "sqlserver_ours", 29)?).await.is_err());
-        assert_eq!(store.stored_rows(&location).await?, vec![expected("rival", "sqlserver_rival", 43)]);
+        store
+            .seed(&location, encode_parquet(&batch("rival", "sqlserver_rival", 43)?)?)
+            .await?;
+        assert!(
+            put_parquet(
+                Arc::<ControlledStore>::clone(&store),
+                location.clone(),
+                batch("ours", "sqlserver_ours", 29)?
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            store.stored_rows(&location).await?,
+            vec![expected("rival", "sqlserver_rival", 43)]
+        );
         assert_eq!(store.reads(), 1);
         assert_eq!(store.attempts().len(), 1);
         assert!(matches!(&store.attempts()[0], Attempt::Update { e_tag: Some(_), .. }));
@@ -300,8 +412,19 @@ mod publication_fault_tests {
     async fn lost_acknowledgement_after_commit_returns_error_without_replay() -> Result<()> {
         let location = ObjectPath::from("synthetic/results.parquet");
         let store = ControlledStore::new(vec![Fault::FailureAfterCommit]);
-        assert!(put_parquet(store.clone(), location.clone(), batch("ours", "sqlserver_ours", 59)?).await.is_err());
-        assert_eq!(store.stored_rows(&location).await?, vec![expected("ours", "sqlserver_ours", 59)]);
+        assert!(
+            put_parquet(
+                Arc::<ControlledStore>::clone(&store),
+                location.clone(),
+                batch("ours", "sqlserver_ours", 59)?
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            store.stored_rows(&location).await?,
+            vec![expected("ours", "sqlserver_ours", 59)]
+        );
         assert_eq!(store.reads(), 1);
         assert_eq!(store.attempts(), vec![Attempt::Create]);
         Ok(())
@@ -314,13 +437,16 @@ mod publication_fault_tests {
         snapshot: DestinationSnapshot,
     ) -> Result<bool> {
         let source_location = location.clone();
-        write_cloud_exact_destination(destination, location, &snapshot,
-            || read_cloud_destination_versioned(source, source_location)).await
+        write_cloud_exact_destination(destination, location, &snapshot, || {
+            read_cloud_destination_versioned(source, source_location)
+        })
+        .await
     }
 
     async fn wait_for_capture(gate: &ReadGate) -> Result<()> {
         tokio::time::timeout(Duration::from_secs(5), gate.captured.notified())
-            .await.context("controlled read was not reached")?;
+            .await
+            .context("controlled read was not reached")?;
         Ok(())
     }
 
@@ -332,21 +458,42 @@ mod publication_fault_tests {
         let old = encode_parquet(&batch("old", "sqlserver_old", 11)?)?;
         source.seed(&location, old.clone()).await?;
         destination.seed(&location, old.clone()).await?;
-        let stale = read_cloud_destination_versioned(source.clone(), location.clone()).await?;
+        let stale = read_cloud_destination_versioned(Arc::<ControlledStore>::clone(&source), location.clone()).await?;
         let gate = destination.pause_next_read();
-        let caller = tokio::spawn(mirror(destination.clone(), source.clone(), location.clone(), stale));
+        let caller = tokio::spawn(mirror(
+            Arc::<ControlledStore>::clone(&destination),
+            Arc::<ControlledStore>::clone(&source),
+            location.clone(),
+            stale,
+        ));
         wait_for_capture(&gate).await?;
         // Destination version is captured before this newer authoritative publication.
         let new = merge_parquet_bytes(&old, &batch("new", "sqlserver_new", 37)?)?;
         source.seed(&location, new.clone()).await?;
-        let fresh = read_cloud_destination_versioned(source.clone(), location.clone()).await?;
-        assert!(mirror(destination.clone(), source.clone(), location.clone(), fresh).await?);
+        let fresh = read_cloud_destination_versioned(Arc::<ControlledStore>::clone(&source), location.clone()).await?;
+        assert!(
+            mirror(
+                Arc::<ControlledStore>::clone(&destination),
+                Arc::<ControlledStore>::clone(&source),
+                location.clone(),
+                fresh
+            )
+            .await?
+        );
         gate.resume.notify_one();
         assert!(!caller.await??);
-        assert_eq!(destination.stored_rows(&location).await?,
-            vec![expected("new", "sqlserver_new", 37), expected("old", "sqlserver_old", 11)]);
+        assert_eq!(
+            destination.stored_rows(&location).await?,
+            vec![
+                expected("new", "sqlserver_new", 37),
+                expected("old", "sqlserver_old", 11)
+            ]
+        );
         assert_eq!(destination.attempts().len(), 1, "Stale source must cause no PUT.");
-        assert!(matches!(&destination.attempts()[0], Attempt::Update { e_tag: Some(_), .. }));
+        assert!(matches!(
+            &destination.attempts()[0],
+            Attempt::Update { e_tag: Some(_), .. }
+        ));
         assert_eq!(source.reads(), 4);
         assert_eq!(destination.reads(), 2);
         Ok(())
@@ -360,23 +507,54 @@ mod publication_fault_tests {
         let old = encode_parquet(&batch("old", "sqlserver_old", 5)?)?;
         source.seed(&location, old.clone()).await?;
         destination.seed(&location, old.clone()).await?;
-        let stale = read_cloud_destination_versioned(source.clone(), location.clone()).await?;
+        let stale = read_cloud_destination_versioned(Arc::<ControlledStore>::clone(&source), location.clone()).await?;
         let old_destination = destination.inner.get_opts(&location, GetOptions::default()).await?.meta;
         let gate = source.pause_next_read();
-        let caller = tokio::spawn(mirror(destination.clone(), source.clone(), location.clone(), stale));
+        let caller = tokio::spawn(mirror(
+            Arc::<ControlledStore>::clone(&destination),
+            Arc::<ControlledStore>::clone(&source),
+            location.clone(),
+            stale,
+        ));
         wait_for_capture(&gate).await?;
-        assert_eq!(destination.reads(), 1, "Destination version must precede fresh source GET.");
+        assert_eq!(
+            destination.reads(),
+            1,
+            "Destination version must precede fresh source GET."
+        );
         let new = merge_parquet_bytes(&old, &batch("new", "sqlserver_new", 47)?)?;
         source.seed(&location, new).await?;
-        let fresh = read_cloud_destination_versioned(source.clone(), location.clone()).await?;
-        assert!(mirror(destination.clone(), source.clone(), location.clone(), fresh).await?);
+        let fresh = read_cloud_destination_versioned(Arc::<ControlledStore>::clone(&source), location.clone()).await?;
+        assert!(
+            mirror(
+                Arc::<ControlledStore>::clone(&destination),
+                Arc::<ControlledStore>::clone(&source),
+                location.clone(),
+                fresh
+            )
+            .await?
+        );
         gate.resume.notify_one();
-        assert!(!caller.await??, "Stale PUT must be a conditional conflict, not success.");
-        assert_eq!(destination.stored_rows(&location).await?,
-            vec![expected("new", "sqlserver_new", 47), expected("old", "sqlserver_old", 5)]);
+        assert!(
+            !caller.await??,
+            "Stale PUT must be a conditional conflict, not success."
+        );
+        assert_eq!(
+            destination.stored_rows(&location).await?,
+            vec![
+                expected("new", "sqlserver_new", 47),
+                expected("old", "sqlserver_old", 5)
+            ]
+        );
         let attempts = destination.attempts();
         assert_eq!(attempts.len(), 2);
-        assert_eq!(attempts[1], Attempt::Update { e_tag: old_destination.e_tag, version: old_destination.version });
+        assert_eq!(
+            attempts[1],
+            Attempt::Update {
+                e_tag: old_destination.e_tag,
+                version: old_destination.version
+            }
+        );
         assert_eq!(destination.reads(), 2);
         Ok(())
     }
@@ -387,11 +565,25 @@ mod publication_fault_tests {
         let source = ControlledStore::new(vec![]);
         let rival = encode_parquet(&batch("rival", "sqlserver_rival", 61)?)?;
         let destination = ControlledStore::new(vec![Fault::RivalWrite(rival)]);
-        source.seed(&location, encode_parquet(&batch("ours", "sqlserver_ours", 71)?)?).await?;
-        let snapshot = read_cloud_destination_versioned(source.clone(), location.clone()).await?;
-        assert!(!mirror(destination.clone(), source, location.clone(), snapshot).await?);
+        source
+            .seed(&location, encode_parquet(&batch("ours", "sqlserver_ours", 71)?)?)
+            .await?;
+        let snapshot =
+            read_cloud_destination_versioned(Arc::<ControlledStore>::clone(&source), location.clone()).await?;
+        assert!(
+            !mirror(
+                Arc::<ControlledStore>::clone(&destination),
+                source,
+                location.clone(),
+                snapshot
+            )
+            .await?
+        );
         assert_eq!(destination.attempts(), vec![Attempt::Create]);
-        assert_eq!(destination.stored_rows(&location).await?, vec![expected("rival", "sqlserver_rival", 61)]);
+        assert_eq!(
+            destination.stored_rows(&location).await?,
+            vec![expected("rival", "sqlserver_rival", 61)]
+        );
         Ok(())
     }
 
@@ -403,18 +595,39 @@ mod publication_fault_tests {
             let location = ObjectPath::from("synthetic/results.parquet");
             let source = ControlledStore::new(vec![]);
             let destination = ControlledStore::new(vec![fault]);
-            destination.seed(&location, encode_parquet(&batch("old", "sqlserver_old", 17)?)?).await?;
-            source.seed(&location, encode_parquet(&batch("new", "sqlserver_new", 83)?)?).await?;
-            let snapshot = read_cloud_destination_versioned(source.clone(), location.clone()).await?;
-            let outcome = mirror(destination.clone(), source, location.clone(), snapshot).await;
-            if conflict { assert!(!outcome?); } else { assert!(outcome.is_err()); }
-            assert_eq!(destination.attempts().len(), 1);
-            assert!(matches!(&destination.attempts()[0], Attempt::Update { e_tag: Some(_), .. }));
-            assert_eq!(destination.stored_rows(&location).await?, if committed {
-                vec![expected("new", "sqlserver_new", 83)]
+            destination
+                .seed(&location, encode_parquet(&batch("old", "sqlserver_old", 17)?)?)
+                .await?;
+            source
+                .seed(&location, encode_parquet(&batch("new", "sqlserver_new", 83)?)?)
+                .await?;
+            let snapshot =
+                read_cloud_destination_versioned(Arc::<ControlledStore>::clone(&source), location.clone()).await?;
+            let outcome = mirror(
+                Arc::<ControlledStore>::clone(&destination),
+                source,
+                location.clone(),
+                snapshot,
+            )
+            .await;
+            if conflict {
+                assert!(!outcome?);
             } else {
-                vec![expected("old", "sqlserver_old", 17)]
-            });
+                assert!(outcome.is_err());
+            }
+            assert_eq!(destination.attempts().len(), 1);
+            assert!(matches!(
+                &destination.attempts()[0],
+                Attempt::Update { e_tag: Some(_), .. }
+            ));
+            assert_eq!(
+                destination.stored_rows(&location).await?,
+                if committed {
+                    vec![expected("new", "sqlserver_new", 83)]
+                } else {
+                    vec![expected("old", "sqlserver_old", 17)]
+                }
+            );
             assert_eq!(destination.reads(), 1);
         }
         Ok(())
