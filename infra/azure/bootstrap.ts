@@ -80,7 +80,7 @@ export function azure_mode(value: string): AzureMode {
   return value;
 }
 export class Config {
-  subscription: string; group: string; stamp: number; sandbox: string; location: string; account: string; registry: string; registryLoginServer: string;
+  subscription: string; group: string; stamp: string; sandbox: string; location: string; account: string; registry: string; registryLoginServer: string;
   cluster: string; identity: string; identity_client_id: string; kubernetesNamespace: string; kubernetesServiceAccount: string;
   private validatedStamp?: StampConfig;
   readonly mode: AzureMode;
@@ -121,14 +121,14 @@ export class Config {
       if (this.account !== 'arrowcol' + this.sandbox || this.cluster !== 'arrowcol-' + this.sandbox ||
           this.identity !== 'arrowcol-kusto-reader')
         throw new Failure('Resource names must match the exact isolated subscription and group identity.');
-      this.stamp = 0; this.registry = ''; this.registryLoginServer = '';
+      this.stamp = ''; this.registry = ''; this.registryLoginServer = '';
       this.identity_client_id = ''; this.kubernetesNamespace = ''; this.kubernetesServiceAccount = '';
     } else {
     if (stampConfig.subscription && this.subscription !== stampConfig.subscription)
       throw new Failure('AZURE_SUBSCRIPTION_ID must match the validated AKS stamp configuration.');
     this.validatedStamp = stampConfig;
     this.stamp = stampConfig.stamp;
-    if (values.AZURE_STAMP !== undefined && (!/^\d+$/.test(values.AZURE_STAMP) || Number(values.AZURE_STAMP) !== this.stamp))
+    if (values.AZURE_STAMP !== undefined && values.AZURE_STAMP !== this.stamp)
       throw new Failure('AZURE_STAMP must match the validated AKS stamp configuration.');
     this.group = stampConfig.resourceGroup;
     if (values.AZURE_RESOURCE_GROUP && values.AZURE_RESOURCE_GROUP !== this.group)
@@ -146,7 +146,7 @@ export class Config {
     this.registry = get('AZURE_CONTAINER_REGISTRY_NAME', expectedRegistry);
     this.registryLoginServer = get('AZURE_CONTAINER_REGISTRY_SERVER', this.registry + '.azurecr.io');
     if (this.account !== expectedAccount || this.cluster !== expectedCluster || this.identity !== 'arrow-collector' || this.registry !== expectedRegistry)
-      throw new Failure('Resource names must match the positive integer stamp and the single arrow-collector identity.');
+      throw new Failure('Resource names must match the configured stamp and the single arrow-collector identity.');
     if (this.registryLoginServer !== this.registry + '.azurecr.io') throw new Failure('Container Registry login server must match the stamped registry.');
     this.identity_client_id = get('AZURE_UAMI_CLIENT_ID');
     if (this.identity_client_id) {
@@ -233,7 +233,7 @@ export class Config {
   }
   generated(): Record<string, string> {
     return { ARROWCOL_AZURE_MODE: this.mode, AZURE_RESOURCE_GROUP: this.group, AZURE_LOCATION: this.location,
-      ...(this.mode === 'stamped' ? { AZURE_STAMP: String(this.stamp),
+      ...(this.mode === 'stamped' ? { AZURE_STAMP: this.stamp,
       AZURE_CONTAINER_REGISTRY_NAME: this.registry, AZURE_CONTAINER_REGISTRY_SERVER: this.registryLoginServer,
       AZURE_KUBERNETES_NAMESPACE: this.kubernetesNamespace, AZURE_KUBERNETES_SERVICE_ACCOUNT: this.kubernetesServiceAccount,
       ...(this.identity_client_id ? { AZURE_UAMI_CLIENT_ID: this.identity_client_id } : {}) } : {}),

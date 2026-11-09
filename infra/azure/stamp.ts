@@ -7,10 +7,12 @@ import { Failure } from './authority.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const MAX_STAMP = 999_999;
+const MAX_USER_POOLS = 99;
+export type PoolRole = 'arrowcol' | 'client';
 
 export interface StampConfig {
   subscription: string;
-  stamp: number;
+  stamp: string;
   resourceGroup: 'arrow-collector-rg';
   location: 'eastus2' | 'canadacentral';
   storageReadLogDestination?: 'log-analytics' | 'storage';
@@ -21,7 +23,7 @@ export interface StampConfig {
     serviceAccount: string;
     networkDataplane?: 'azure' | 'cilium';
     systemPool: { name: string; vmSize: string; initialCount: number; minCount: number; maxCount: number; maxPods: number; availabilityZones: string[] };
-    userPools: Array<{ name: string; vmSize: string; initialCount: number; minCount: number; maxCount: number; maxPods: number; availabilityZones: string[] }>;
+    userPools: Array<{ name: string; role: PoolRole; vmSize: string; initialCount: number; minCount: number; maxCount: number; maxPods: number; availabilityZones: string[] }>;
     network: {
       vnetIpv4Cidr: string; vnetIpv6Cidr: string; nodeSubnetIpv4Cidr: string; nodeSubnetIpv6Cidr: string;
       apiServerSubnetIpv4Cidr: string; podIpv4Cidr: string; podIpv6Cidr: string;
@@ -39,8 +41,8 @@ const DEFAULT_AKS: StampConfig['aks'] = {
   version: '1.35.6', skuTier: 'Free', namespace: 'arrow-collector', serviceAccount: 'arrow-collector', networkDataplane: 'azure',
   systemPool: { name: 'systempool', vmSize: 'Standard_D8ds_v6', initialCount: 3, minCount: 3, maxCount: 3, maxPods: 250, availabilityZones: ['1', '2', '3'] },
   userPools: [
-    { name: 'benchd64', vmSize: 'Standard_D64ds_v6', initialCount: 0, minCount: 0, maxCount: 1, maxPods: 30, availabilityZones: [] },
-    { name: 'benche64', vmSize: 'Standard_E64ds_v6', initialCount: 0, minCount: 0, maxCount: 1, maxPods: 30, availabilityZones: [] },
+    { name: 'benchd64', role: 'client', vmSize: 'Standard_D64ds_v6', initialCount: 0, minCount: 0, maxCount: 1, maxPods: 30, availabilityZones: [] },
+    { name: 'benche64', role: 'arrowcol', vmSize: 'Standard_E64ds_v6', initialCount: 0, minCount: 0, maxCount: 1, maxPods: 30, availabilityZones: [] },
   ],
   network: { vnetIpv4Cidr: '10.245.0.0/16', vnetIpv6Cidr: 'fd20:245::/48', nodeSubnetIpv4Cidr: '10.245.0.0/24',
     nodeSubnetIpv6Cidr: 'fd20:245:0:1::/64', apiServerSubnetIpv4Cidr: '10.245.1.0/28', podIpv4Cidr: '10.246.0.0/16',
@@ -61,6 +63,12 @@ function keys(value: Record<string, unknown>, allowed: readonly string[], name: 
 function text(value: unknown, name: string, pattern: RegExp, maximum = 255): string {
   if (typeof value !== 'string' || value.length > maximum || !pattern.test(value)) throw new Failure(`${name} is invalid.`);
   return value;
+}
+
+function stampText(value: unknown, name: string): string {
+  if (typeof value === 'string' && /^(00000|[1-9]\d{0,5})$/.test(value)) return value;
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 1 && value <= MAX_STAMP) return String(value);
+  throw new Failure(`${name} must be an integer in 1..${MAX_STAMP} or the quoted five-digit '00000'.`);
 }
 
 function integer(value: unknown, name: string, minimum: number, maximum: number): number {
@@ -152,8 +160,7 @@ export function assertNoStampNetworkOverlap(config: StampConfig, externalPrefixe
 
 export function defaultStampConfig(values: Record<string, string | undefined> = {}): StampConfig {
   const rawStamp = values.AZURE_STAMP ?? '1';
-  if (!/^\d+$/.test(rawStamp) || !Number.isSafeInteger(Number(rawStamp)) || Number(rawStamp) < 1 || Number(rawStamp) > MAX_STAMP)
-    throw new Failure('AZURE_STAMP must be a positive integer no greater than 999999 (Kusto cluster name limit).');
+  const stamp = stampText(rawStamp, 'AZURE_STAMP');
   const group = values.AZURE_RESOURCE_GROUP ?? 'arrow-collector-rg';
   if (group !== 'arrow-collector-rg') throw new Failure('Only the exact arrow-collector-rg resource group is authorized.');
   const location = values.AZURE_LOCATION ?? 'eastus2';
@@ -163,7 +170,7 @@ export function defaultStampConfig(values: Record<string, string | undefined> = 
     serviceAccount: values.AZURE_KUBERNETES_SERVICE_ACCOUNT ?? DEFAULT_AKS.serviceAccount };
   const destination = values.AZURE_STORAGE_READ_LOG_DESTINATION ?? 'log-analytics';
   if (destination !== 'log-analytics' && destination !== 'storage') throw new Failure('Invalid storage read-log destination.');
-  return { subscription: values.AZURE_SUBSCRIPTION_ID ?? '', stamp: Number(rawStamp), resourceGroup: group, location, aks,
+  return { subscription: values.AZURE_SUBSCRIPTION_ID ?? '', stamp, resourceGroup: group, location, aks,
     storageReadLogDestination: destination, publisherFederatedCredentials: [] };
 }
 
@@ -174,7 +181,8 @@ export function parseStampConfig(source: string): StampConfig {
   const raw = object(parsed, 'AKS stamp configuration');
   keys(raw, ['subscription', 'stamp', 'resourceGroup', 'location', 'aks', 'publisherFederatedCredentials', 'storageReadLogDestination'], 'AKS stamp configuration');
   const subscription = text(raw.subscription, 'subscription', /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i).toLowerCase();
-  const stamp = integer(raw.stamp, 'stamp', 1, MAX_STAMP);
+  if (raw.stamp === 0) throw new Failure("stamp 00000 must be quoted as '00000' so YAML keeps its digits.");
+  const stamp = stampText(raw.stamp, 'stamp');
   const resourceGroup = text(raw.resourceGroup, 'resourceGroup', /^arrow-collector-rg$/) as 'arrow-collector-rg';
   const location = text(raw.location, 'location', /^(eastus2|canadacentral)$/) as StampConfig['location'];
   const storageReadLogDestination = text(raw.storageReadLogDestination ?? 'log-analytics', 'storageReadLogDestination',
@@ -201,13 +209,15 @@ export function parseStampConfig(source: string): StampConfig {
   if (systemPool.minCount > systemPool.initialCount || systemPool.initialCount > systemPool.maxCount)
     throw new Failure('aks.systemPool counts must satisfy minCount <= initialCount <= maxCount.');
   const userPoolsRaw = aksRaw.userPools ?? DEFAULT_AKS.userPools;
-  if (!Array.isArray(userPoolsRaw) || userPoolsRaw.length > 10) throw new Failure('aks.userPools must be a list of at most 10 pools.');
+  if (!Array.isArray(userPoolsRaw) || userPoolsRaw.length > MAX_USER_POOLS)
+    throw new Failure(`aks.userPools must be a list of at most ${MAX_USER_POOLS} pools.`);
   const userPools = userPoolsRaw.map((value, index) => {
     const prefix = 'aks.userPools[' + index + ']';
     const item = object(value, prefix);
-    keys(item, ['name', 'vmSize', 'initialCount', 'minCount', 'maxCount', 'maxPods', 'availabilityZones'], prefix);
+    keys(item, ['name', 'role', 'vmSize', 'initialCount', 'minCount', 'maxCount', 'maxPods', 'availabilityZones'], prefix);
     const pool = {
       name: text(item.name, prefix + '.name', /^[a-z][a-z0-9]{0,11}$/),
+      role: text(item.role, prefix + '.role', /^(arrowcol|client)$/) as PoolRole,
       vmSize: text(item.vmSize, prefix + '.vmSize', /^Standard_[A-Za-z0-9_]+$/),
       initialCount: integer(item.initialCount, prefix + '.initialCount', 0, 100),
       minCount: integer(item.minCount, prefix + '.minCount', 0, 100),
@@ -273,6 +283,13 @@ export function parseStampConfig(source: string): StampConfig {
     throw new Failure('AKS VNet, pod and service CIDRs must not overlap.');
   const dns = ipv4Number(network.dnsServiceIp);
   if (isIP(network.dnsServiceIp) !== 4 || dns < serviceStart || dns > serviceEnd) throw new Failure('aks.network.dnsServiceIp must be inside serviceIpv4Cidr.');
+  const surgedNodes = [systemPool, ...userPools].reduce((total, pool) => total + pool.maxCount + Math.ceil(pool.maxCount * 33 / 100), 0);
+  const [nodeStart, nodeEnd] = ipv4Range(network.nodeSubnetIpv4Cidr);
+  const [podStart, podEnd] = ipv4Range(network.podIpv4Cidr);
+  const nodeCapacity = Number(nodeEnd - nodeStart + 1n) - 5;
+  const podNodeCapacity = Number((podEnd - podStart + 1n) / 256n);
+  if (surgedNodes > nodeCapacity || surgedNodes > podNodeCapacity)
+    throw new Failure(`AKS pool maxima with upgrade surge need ${surgedNodes} nodes; the node subnet fits ${nodeCapacity} and the pod CIDR fits ${podNodeCapacity}.`);
   const credentials = raw.publisherFederatedCredentials ?? [];
   if (!Array.isArray(credentials) || credentials.length > 20) throw new Failure('publisherFederatedCredentials must be a list of at most 20 entries.');
   const publisherFederatedCredentials = credentials.map((value, index) => {
