@@ -6732,6 +6732,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "quiver-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow 58.4.0",
+ "arrow-csv 58.4.0",
+ "arrowcol-catalog",
+ "arrowcol-catalog-client",
+ "arrowcol-dataflow-components",
+ "arrowcol-protocol",
+ "assert_cmd",
+ "base64 0.22.1",
+ "clap",
+ "otel-arrow-dfe-config",
+ "otel-arrow-dfe-pdata",
+ "otel-arrow-dfe-quiver",
+ "predicates",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"

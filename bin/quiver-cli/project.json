@@ -1,0 +1,148 @@
+{
+  "name": "quiver-cli",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "sourceRoot": "bin/quiver-cli/src",
+  "projectType": "application",
+  "implicitDependencies": [
+    "arrowcol-catalog",
+    "arrowcol-catalog-client",
+    "arrowcol-dataflow-components",
+    "arrowcol-protocol"
+  ],
+  "namedInputs": {
+    "default": [
+      "{projectRoot}/Cargo.toml",
+      "{projectRoot}/README.md",
+      "{projectRoot}/data/**/*",
+      "{projectRoot}/src/**/*",
+      "{projectRoot}/tests/**/*",
+      "{workspaceRoot}/Cargo.toml",
+      "{workspaceRoot}/Cargo.lock",
+      "{workspaceRoot}/rust-toolchain.toml",
+      "{workspaceRoot}/rustfmt.toml",
+      "{workspaceRoot}/projects/loadtest/reader/Cargo.toml",
+      "{workspaceRoot}/projects/loadtest/reader/src/**/*",
+      "{workspaceRoot}/projects/loadtest/schemas/sqlserver.sql",
+      "{workspaceRoot}/submodules/otel-arrow/rust/otap-dataflow/crates/quiver/**/*"
+    ],
+    "production": [
+      "default",
+      "!{projectRoot}/README.md",
+      "!{projectRoot}/tests/**/*"
+    ]
+  },
+  "metadata": {
+    "description": "Generate and inspect DFE durable_buffer Quiver storage using Schema Catalog schemas."
+  },
+  "targets": {
+    "clean": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install tsx tools/scripts/src/clean.ts bin/quiver-cli",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      }
+    },
+    "format": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "cargo fmt --package quiver-cli",
+        "cwd": "."
+      },
+      "metadata": {
+        "description": "Format the quiver-cli package."
+      }
+    },
+    "format-check": {
+      "executor": "nx:run-commands",
+      "cache": true,
+      "inputs": [
+        "default"
+      ],
+      "options": {
+        "command": "cargo fmt --package quiver-cli -- --check",
+        "cwd": "."
+      },
+      "metadata": {
+        "description": "Check formatting for the quiver-cli package."
+      }
+    },
+    "lint": {
+      "executor": "nx:run-commands",
+      "inputs": [
+        "default",
+        "^default"
+      ],
+      "options": {
+        "command": "cargo clippy --locked --package quiver-cli --all-targets --all-features -- -D warnings",
+        "cwd": "."
+      },
+      "metadata": {
+        "description": "Run Clippy for every quiver-cli target with warnings denied."
+      }
+    },
+    "build": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "inputs": [
+        "production",
+        "^production"
+      ],
+      "options": {
+        "command": "cargo build --locked --package quiver-cli --all-features",
+        "cwd": "."
+      },
+      "metadata": {
+        "description": "Build the quiver-cli package."
+      }
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "inputs": [
+        "default",
+        "^default"
+      ],
+      "options": {
+        "command": "cargo test --locked --package quiver-cli --bins --tests --examples --all-features",
+        "cwd": "."
+      },
+      "metadata": {
+        "description": "Run quiver-cli unit tests and the docs/quiver walkthrough integration test; workspace doc-tests run in rust:doc-test."
+      }
+    },
+    "verify": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": [
+        "format-check",
+        "lint",
+        "build",
+        "test"
+      ],
+      "options": {
+        "commands": []
+      },
+      "metadata": {
+        "description": "Run all quiver-cli quality targets."
+      }
+    },
+    "run": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "cargo run --locked --package quiver-cli --",
+        "cwd": ".",
+        "forwardAllArgs": true
+      },
+      "metadata": {
+        "description": "Run quiver-cli and forward arguments to the CLI."
+      }
+    }
+  },
+  "tags": [
+    "scope:rust",
+    "type:application"
+  ]
+}

@@ -65,6 +65,15 @@ rechecks object ownership before deleting those three exact objects. Failure
 to verify cleanup or ownership leaves the objects intact; no selectors,
 prefix-wide deletion or user-supplied generic object names are accepted.
 
+Signals use the image's Node executable, not an external `kill` binary (absent
+from the slim image). The host finds exactly one `job.ts` Node runtime among
+PID 1 and its immediate children, excluding the tsx supervisor, and checks its
+process identity before signaling it. TERM stops inspection; after the final
+cleanup report is copied and verified, USR1 releases the artifact holder.
+Unexpected process layouts fail closed. Cleanup command failures include
+bounded, sanitized kubectl stderr and the operation, never private exec argv.
+This host-side fix also works with an already published runtime image.
+
 Run cleanup **before the inspection deadline** to reliably collect final
 artifacts. Automatic deadline cleanup still removes run tables/blobs, but the
 Job's hard active deadline (trial budget + inspection bound + cleanup/startup/

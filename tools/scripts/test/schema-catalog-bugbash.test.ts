@@ -5,9 +5,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
-import { checkResetReceipt, checkVerifiedReceipt, copyEvidence, copyEvolutionEvidence, createEvidenceDir, derivedCloudInput,
-  loadtestImageProjects, parseOptions, passedTests, positiveDfeSample, redactLog, serviceImages, validateCiRuns,
-  validateComposeImageCoverage, validateImage, type ImageIdentity } from '../src/schema-catalog-bugbash.js';
+import { azureAccountCommand, checkResetReceipt, checkVerifiedReceipt, copyEvidence, copyEvolutionEvidence, createEvidenceDir, derivedCloudInput,
+  loadtestImageProjects, parseOptions, passedTests, positiveDfeSample, redactLog, resolveServiceImages, serviceImages, validateCiRuns,
+  validateAzureAccount, validateComposeImageCoverage, validateImage, verifyAzureAccount, type ImageIdentity } from '../src/schema-catalog-bugbash.js';
 
 const sha = 'a'.repeat(40), digest = `sha256:${'b'.repeat(64)}`;
 const cloud = ['--subscription', '11111111-1111-1111-1111-111111111111',
@@ -18,6 +18,22 @@ const imageProjects = loadtestImageProjects({ targets: { build: { dependsOn: [
   'reader-build', { projects: ['arrowcol-catalog-rust', 'arrowcol-dataflow-rust', 'arrowcol-router-rust',
     'arrow-tenant-stream', 'delta-maintenance', 'kusto-explorer'], target: 'image' },
 ] } } });
+
+test('Azure account lookup is scoped to the approved subscription and rejects an unavailable target', async () => {
+  const target = cloud[1]!;
+  assert.deepEqual(azureAccountCommand(target), ['az', 'account', 'show', '--subscription', target,
+    '--query', '{id:id,state:state}', '--output', 'json']);
+  validateAzureAccount({ id: target, state: 'Enabled' }, target);
+  assert.throws(() => validateAzureAccount({ id: '22222222-2222-2222-2222-222222222222', state: 'Enabled' }, target), /mismatched/);
+  assert.throws(() => validateAzureAccount({ id: target, state: 'Disabled' }, target), /disabled/);
+  assert.throws(() => validateAzureAccount(null, target));
+  assert.throws(() => azureAccountCommand(''), /UUID/);
+  await verifyAzureAccount(target, async args => {
+    assert.equal(args[args.indexOf('--subscription') + 1], target);
+    return JSON.stringify({ id: target, state: 'Enabled' });
+  });
+  await assert.rejects(verifyAzureAccount(target, async () => { throw new Error('target unavailable'); }), /target unavailable/);
+});
 
 function imageIdentity(project: string): ImageIdentity {
   const repository = `ghcr.io/mdrakiburrahman/rust-playground/${project}`;
@@ -165,6 +181,18 @@ test('local image identity checks config digest and exact source revision', () =
   assert.equal(serviceImages({ services: map })['arrowcol-catalog'], image.alias);
   assert.throws(() => serviceImages({ services: { ...map, hive: { image: 'hive:dev' } } }), /removed/);
   assert.throws(() => serviceImages({ services: { ...map, router: {} } }), /Invalid/);
+  const ref = `ghcr.io/google/cadvisor:v0.60.6@${digest}`;
+  const seen: string[] = [];
+  const inspect = (image: string) => { seen.push(image); return { Id: digest }; };
+  assert.deepEqual(resolveServiceImages({ cadvisor: ref, catalog: image.alias }, inspect), {
+    cadvisor: { image: ref, configId: digest }, catalog: { image: image.alias, configId: digest },
+  });
+  assert.deepEqual(seen, [ref, image.alias]);
+  assert.throws(() => resolveServiceImages({ cadvisor: ref }, () => { throw new Error('image not found'); }), /image not found/);
+  assert.throws(() => resolveServiceImages({ cadvisor: ref }, () => ({ Id: 'invalid' })), /Invalid cadvisor config ID/);
+  assert.deepEqual(resolveServiceImages({ cadvisor: ref, catalog: image.alias }, inspect, new Set([image.alias])), {
+    cadvisor: { image: ref, status: 'not-inspected-before-compose' }, catalog: { image: image.alias, configId: digest },
+  });
 });
 
 test('evidence excludes private inputs and symlinks; verification receipts reject failure and tampering', t => {
@@ -214,6 +242,12 @@ test('acceptance receipts count only real completed tests and export bounded evo
   fs.writeFileSync(path.join(input, 'sdk-v1', 'sdk-manifest.json'), '{}');
   const output = path.join(root, 'output'); copyEvolutionEvidence(input, output);
   assert.deepEqual(fs.readdirSync(output).sort(), ['evidence.jsonl', 'report.json', 'sdk-v1']);
+});
+
+test('acceptance output ignores Nx task summaries but retains Node and Rust tests', () => {
+  assert.deepEqual(passedTests('✔  nx run arrowcol-catalog:test (2s)\n✔ real Node test (1.2ms)\ntest actual_rust_test ... ok\n'),
+    ['real Node test', 'actual_rust_test']);
+  assert.deepEqual(passedTests('✔  nx run arrowcol-catalog:test\n'), []);
 });
 
 test('real wrong-head invocation fails before GitHub/build/Docker and archives a terminal failure receipt', {

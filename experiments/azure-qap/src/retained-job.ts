@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { runtimeSignalCommand } from './runtime-signal.js';
 
 const JOB = /^azure-qap-[0-9]{14}-[a-f0-9]{8}$/;
 const UID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
@@ -76,7 +77,7 @@ export async function cleanupRetainedJob(input: {
     throw new Error('Live workload report does not match the retained receipt.');
   if (fs.existsSync(input.output)) throw new Error('Refusing to overwrite final cleanup artifacts.');
   console.log(`Stopping read-only inspection for exact owned Job ${receipt.jobName}; waiting up to 6m for scoped cleanup.`);
-  if (cleanup.status === 'retained') await exec(['kill', '-TERM', '1']);
+  if (cleanup.status === 'retained') await exec(runtimeSignalCommand('SIGTERM'));
   const now = input.now ?? Date.now;
   const sleep = input.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
   const deadline = now() + 360_000;
@@ -97,7 +98,7 @@ export async function cleanupRetainedJob(input: {
     throw new Error('Final scoped table/blob cleanup failed; artifacts copied but owned resources were NOT deleted.');
   for (const [name, uid] of Object.entries(receipt.resources))
     validateOwnedMetadata(await get(name), name.split('/')[1]!, receipt.namespace, receipt.jobName, uid);
-  await exec(['kill', '-USR1', '1']);
+  await exec(runtimeSignalCommand('SIGUSR1'));
   await kubectl(['delete', ...Object.keys(receipt.resources), '-n', receipt.namespace,
     '--wait=true', '--timeout=60s'], 90);
   console.log(`Scoped cleanup verified; final artifacts: ${input.output}`);

@@ -38,14 +38,34 @@ validation; it is not a production reset or an unrestricted purge command.
 | Path under the run's `dataflow-state-1/quiver/core_N/` | Purpose |
 | --- | --- |
 | `wal/quiver.wal`, rotated WAL files | Append-only persisted bundles |
-| `wal/quiver.wal.cursor` | Position already represented in finalized segments |
+| `wal/quiver.wal.cursor` | Checkpoint: WAL entries ending at or before this position are skipped on replay |
 | `segments/*.qseg` | Finalized Arrow data and bundle metadata available downstream |
 | `quiver.sub.durable-buffer` | Internal subscriber progress |
 
 Each DFE core owns an isolated Quiver directory. Paths and byte counts depend
 on the run; historical Direct demo transcripts and screenshots are not evidence
-for current DFE images. There is no supported `quiver-cli` inspection or
-mutation command in this repository.
+for current DFE images. Use [`quiver-cli`](../../bin/quiver-cli/README.md) to
+generate a catalog-typed local fixture or inspect DFE Quiver directories. Its
+read-only commands can open loadtest storage; its writer commands only operate
+on directories marked by `generate`.
+
+## Local CLI inspection
+
+[`quiver-cli`](../../bin/quiver-cli/README.md) can generate a catalog-typed
+fixture and inspect existing loadtest DFE storage without changing it:
+
+```bash
+npx nx run quiver-cli:run -- generate --catalog-endpoint memory onelake/quiver-demo
+npx nx run quiver-cli:run -- tree onelake/quiver-demo
+npx nx run quiver-cli:run -- segments onelake/quiver-demo
+npx nx run quiver-cli:run -- wal onelake/quiver-demo
+```
+
+Generation uses the current loadtest schema seed through the catalog's in-memory
+store. Omit `--catalog-endpoint memory` to query the live Schema Catalog. The
+read-only commands also accept a loadtest Quiver directory. Only use `consume`,
+`crash`, or `recover` on a directory created by this CLI; its marker guard
+rejects collector-owned storage.
 
 ## WAL durability and recovery
 
@@ -54,8 +74,8 @@ before its upstream acknowledgement. The native processor's default interval
 is 25 ms, which can leave acknowledged WAL appends vulnerable to a crash before
 fsync. Do not generalize the loadtest's zero-interval guarantee to other configs.
 
-On reopening preserved storage, Quiver recovers WAL entries not yet represented
-in finalized segments. DFE replays retained bundles downstream and maintains
+On reopening preserved storage, Quiver recovers WAL entries not yet checkpointed
+by the persisted cursor. DFE replays retained bundles downstream and maintains
 internal subscriber progress. A restart must preserve the state volume, original
 publication identity, ingestion timestamp, and cloud reset generation; replay
 must not bypass current routing/publication fences.

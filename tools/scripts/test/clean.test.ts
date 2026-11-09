@@ -161,6 +161,7 @@ test('every project exposes clean and the root includes every child', () => {
     'project.json',
     '.devcontainer/project.json',
     'bin/hello-world/project.json',
+    'bin/quiver-cli/project.json',
     'crates/arrowcol-buffer/project.json',
     'crates/arrowcol-catalog/project.json',
     'crates/arrowcol-dataflow-components/project.json',

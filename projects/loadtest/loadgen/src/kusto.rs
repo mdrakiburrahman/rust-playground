@@ -3256,7 +3256,9 @@ mod tests {
     #[tokio::test]
     async fn observation_diagnostics_classify_real_deadline_and_setup_failure_without_error_text() -> Result<()> {
         let directory = Directory::new()?;
-        let server = Server::start(|request| {
+        let deadline = Duration::from_secs(2);
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let server = Server::start(move |request| {
             if request["csl"]
                 .as_str()
                 .is_some_and(|command| command.ends_with("policy query_acceleration"))
@@ -3266,24 +3268,27 @@ mod tests {
                     vec![json!(["{\"IsEnabled\":true,\"MaxAge\":\"00:01:00\"}"])],
                 )));
             }
-            std::thread::sleep(Duration::from_millis(200));
-            Ok(Some(response(&[], vec![])))
+            let _ = blocked.recv();
+            Ok(None)
         })?;
-        assert!(
-            observe_qap(
-                &server.endpoint,
-                &directory.0,
-                Some(DATABASE),
-                &["dataflow_ready".to_owned()],
-                Duration::from_millis(50),
-            )
-            .await
-            .is_err()
-        );
+        let observed = observe_qap(
+            &server.endpoint,
+            &directory.0,
+            Some(DATABASE),
+            &["dataflow_ready".to_owned()],
+            deadline,
+        )
+        .await;
+        drop(release);
+        assert!(observed.is_err());
         let diagnostic: Value = serde_json::from_slice(&fs::read(directory.0.join("observation-diagnostic.json"))?)?;
         assert_eq!(diagnostic["code"], "deadline_exceeded");
         assert_eq!(diagnostic["queries_completed"], 1);
-        assert!(diagnostic["elapsed_ms"].as_u64().is_some_and(|elapsed| elapsed >= 50));
+        assert!(
+            diagnostic["elapsed_ms"]
+                .as_u64()
+                .is_some_and(|elapsed| u128::from(elapsed) >= deadline.as_millis())
+        );
         assert!(
             observe_qap(
                 "https://private.invalid/password?secret=canary",

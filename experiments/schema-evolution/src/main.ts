@@ -17,6 +17,7 @@ import { Kusto, object, ready, tables, type KustoClient } from '../../azure-qap/
 import { buildCatalogProof, buildClient } from './build-clients.ts';
 import { nullableBar, physicalCounts, snapshot, type Snapshot } from './delta.ts';
 import { exactRowsQuery, observeHydration, requestedNullQuery, schemaQuery, verifyExactRows } from './hydration.ts';
+import { privateEnvironment } from './private-nx.ts';
 
 const WORKSPACE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const IMAGE = 'mcr.microsoft.com/azuredataexplorer/kustainer-linux@sha256:51e2250da2faf292de903f871a073eb37d3f2641cf63381b183879d21ebb1013';
@@ -138,8 +139,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   const [catalogPort, flightPort, adminPort] = await Promise.all([port(), port(), port()]);
   if (new Set([catalogPort, flightPort, adminPort]).size !== 3) throw new Error('Loopback port allocation collided.');
   const endpoint = `http://127.0.0.1:${catalogPort}`, flight = `http://127.0.0.1:${flightPort}`;
-  const env: NodeJS.ProcessEnv = { ...process.env };
-  for (const key of Object.keys(env)) if (/^(AZURE_|ARROWCOL_)/.test(key)) delete env[key];
+  const env: NodeJS.ProcessEnv = local ? { ...process.env } : privateEnvironment(values, process.env, 'schema-evolution');
+  if (local) for (const key of Object.keys(env)) if (/^(AZURE_|ARROWCOL_)/.test(key)) delete env[key];
   Object.assign(env, values, config?.generated(), { ARROWCOL_DELTA_ROOT: root, ARROWCOL_CATALOG_ENDPOINT: endpoint,
     ARROWCOL_FLIGHT_LISTEN: `127.0.0.1:${flightPort}`, ARROWCOL_ADMIN_LISTEN: `127.0.0.1:${adminPort}`,
     ARROWCOL_INSTANCE_KEY: runId });

@@ -814,7 +814,8 @@ export async function ensure_running(azure: Azure): Promise<void> {
   const c = azure.c, cluster = await azure.arm('GET', c.cluster_id);
   owned(cluster, c); c.uri = cluster.properties.uri.replace(/\/+$/, '');
   if (cluster.properties.state === 'Stopped')
-    await azure.cli('rest', '--method', 'post', '--url', 'https://management.azure.com' + c.cluster_id + '/start?api-version=' + API);
+    await azure.cli('rest', '--method', 'post', '--url', 'https://management.azure.com' + c.cluster_id + '/start?api-version=' + API,
+      '--subscription', c.subscription);
   await retry_ready(() => azure.kql('.show cluster'), 'Kusto');
   console.log('Kusto cluster: running');
 }
@@ -1408,7 +1409,8 @@ export async function stop_cluster(azure: Azure): Promise<void> {
   const hold = uuid();
   metadata.occupancy = 'stopping'; metadata.occupancyid = hold;
   await azure.set_control(metadata, etag);
-  await azure.cli('rest', '--method', 'post', '--url', 'https://management.azure.com' + azure.c.cluster_id + '/stop?api-version=' + API);
+  await azure.cli('rest', '--method', 'post', '--url', 'https://management.azure.com' + azure.c.cluster_id + '/stop?api-version=' + API,
+    '--subscription', azure.c.subscription);
   await retry_ready(() => stopped(azure), 'Cluster stop', 1200);
   const [current, currentEtag] = await azure.control();
   if (current.occupancy !== 'stopping' || current.occupancyid !== hold)

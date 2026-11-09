@@ -174,6 +174,20 @@ export function validateImage(value: unknown, identity: ImageIdentity, sha: stri
   assert.equal(labels['org.opencontainers.image.revision'], sha, `Revision mismatch for ${identity.alias}`);
   assert.equal(identity.revision, sha);
 }
+export function resolveServiceImages(images: Record<string, string>, inspect: (image: string) => unknown,
+  builtAliases?: ReadonlySet<string>): JsonRecord {
+  const map: JsonRecord = {};
+  for (const [service, image] of Object.entries(images)) {
+    if (builtAliases && !builtAliases.has(image)) {
+      map[service] = { image, status: 'not-inspected-before-compose' };
+      continue;
+    }
+    const configId = string(record(inspect(image), `Docker image for ${service}`).Id, `${service} config ID`);
+    assert.match(configId, DIGEST, `Invalid ${service} config ID`);
+    map[service] = { image, configId };
+  }
+  return map;
+}
 export function validateCiRuns(value: unknown, sha: string): JsonRecord[] {
   const runs = records(value, 'CI runs').filter(run => run.workflowName === 'CI');
   if (!runs.length) throw new Error(`No CI workflow run exists for exact HEAD ${sha}.`);
@@ -207,6 +221,19 @@ export function derivedCloudInput(values: Record<string, string>, group: string)
     AZURE_KUSTO_CLUSTER_TAGS: values.AZURE_KUSTO_CLUSTER_TAGS ?? '{}', ARROWCOL_AZURE_MODE: 'schema-evolution' };
   new Config(base, 'schema-evolution');
   return base;
+}
+export function azureAccountCommand(subscription: string): string[] {
+  if (!UUID.test(subscription)) throw new Error('Azure subscription must be a UUID.');
+  return ['az', 'account', 'show', '--subscription', subscription, '--query', '{id:id,state:state}', '--output', 'json'];
+}
+export function validateAzureAccount(value: unknown, subscription: string): void {
+  const account = record(value, 'Azure account');
+  if (typeof account.id !== 'string' || account.id.toLowerCase() !== subscription.toLowerCase() || account.state !== 'Enabled')
+    throw new Error('The approved Azure subscription is unavailable, disabled, or mismatched.');
+}
+export async function verifyAzureAccount(subscription: string, lookup: (command: string[]) => Promise<string>): Promise<void> {
+  const account = JSON.parse(await lookup(azureAccountCommand(subscription))) as unknown;
+  validateAzureAccount(account, subscription);
 }
 export function checkResetReceipt(file: string, workspace: string, group: string): JsonRecord {
   if (group === 'rust-playground-schema-evo' || !is_schema_evolution_group(group))
@@ -246,7 +273,7 @@ export function passedTests(text: string): string[] {
   return stripVTControlCharacters(text).split('\n').flatMap(line => {
     const rust = /\btest ([\w:]+) \.\.\. ok$/.exec(line.trim());
     const node = /^(?:ok \d+ - |✔ )(.+?)(?: \([\d.]+ms\))?$/.exec(line.trim());
-    return rust ? [rust[1]!] : node && !/# (?:SKIP|TODO)/i.test(line) ? [node[1]!] : [];
+    return rust ? [rust[1]!] : node && !/^\s*nx run(?:\s|$)/.test(node[1]!) && !/# (?:SKIP|TODO)/i.test(line) ? [node[1]!] : [];
   });
 }
 export function positiveDfeSample(sample: JsonRecord, configDigest: string): boolean {
@@ -343,7 +370,7 @@ class Rehearsal {
     const stage = this.stages.find(item => item.name === stageName);
     assert.equal(stage?.status, 'passed');
     const observed = stage.tests ?? [];
-    assert.ok(observed.length, `${stageName} selected zero completed tests`);
+    assert.ok(observed.length, `${stageName} observed zero completed tests (Nx task summaries are not tests)`);
     for (const name of names)
       assert.ok(observed.some(test => test === name || test.endsWith(`::${name}`)), `Missing executed acceptance test: ${name}`);
     const acceptance = this.receipt.acceptance ?? {};
@@ -374,13 +401,8 @@ class Rehearsal {
       { env, stdout: 'capture', stderr: 'capture' }).stdout;
     return serviceImages(JSON.parse(output) as unknown);
   }
-  imageMap(images: Record<string, string>): JsonRecord {
-    const map: JsonRecord = {};
-    for (const [service, image] of Object.entries(images)) {
-      const present = this.docker(['image', 'ls', '--quiet', '--no-trunc', image]).trim();
-      map[service] = { image, configId: present ? this.inspect(image).Id : null };
-    }
-    return map;
+  imageMap(images: Record<string, string>, builtAliases?: ReadonlySet<string>): JsonRecord {
+    return resolveServiceImages(images, image => this.inspect(image), builtAliases);
   }
   async ci(sha: string): Promise<void> {
     const runs = JSON.parse(await this.command('ci-inventory', ['gh', 'run', 'list', '-R', REPO,
@@ -423,7 +445,7 @@ class Rehearsal {
     this.assertions('initializer-control', [], 'Parent/CLI/initializer ownership contract');
     await this.command('catalog-evolution-regressions', [...npx, 'nx', 'run-many', '-t', 'verify',
       '--projects=tools-scripts,arrowcol-props,arrowcol-sparksql,arrowcol-catalog,arrowcol-catalog-rust,arrowcol-catalog-client,arrowcol-sdk-gen,schema-evolution-experiment,arrow-deltalake,delta-maintenance',
-      '--parallel=2', '--skip-nx-cache']);
+      '--parallel=2', '--outputStyle=static', '--skip-nx-cache']);
     this.assertions('catalog-evolution-regressions', ['flight_sql_and_warm_cache_count_actual_catalog_calls',
       'reserved_properties_failed_ddl_and_retained_gap', 'committed_delta_restart_and_concurrent_evolution',
       'commit_publication_crash_and_old_seed_do_not_rollback_delta', 'concurrent_same_ddl_coalesces_to_one_version',
@@ -464,7 +486,7 @@ class Rehearsal {
       this.receipt.images = images; this.save();
     }
     this.receipt.serviceImages = services;
-    saveJson(path.join(this.destination, 'compose-images.json'), this.imageMap(services));
+    saveJson(path.join(this.destination, 'compose-images.json'), this.imageMap(services, new Set(images.map(image => image.alias))));
     for (const image of images) {
       const targets = record(record(graph[image.project], `${image.project} project`).targets, `${image.project} targets`);
       if (targets['image-smoke'])
@@ -676,9 +698,7 @@ class Rehearsal {
   }
   async azure(reset: boolean): Promise<void> {
     const config = this.cloudInput(), env = privateEnvironment(load_env(this.options.envFile!), this.env, 'schema-evolution');
-    const account = record(JSON.parse(await this.command('azure-account', ['az', 'account', 'show', '--query', '{id:id}',
-      '--output', 'json'], 60, env)) as unknown, 'Azure account');
-    assert.equal(String(account.id).toLowerCase(), config.subscription.toLowerCase(), 'CLI subscription context mismatch');
+    await verifyAzureAccount(config.subscription, argv => this.command('azure-account', argv, 60, env));
     const common = ['npx', '--no-install', 'tsx', 'infra/azure/bootstrap.ts'];
     await this.command('azure-preflight', [...common, 'preflight', '--mode', 'schema-evolution', '--env-file', this.options.envFile!], 900, env);
     if (reset) {

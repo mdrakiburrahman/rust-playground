@@ -36,13 +36,62 @@ test('scoped teardown signals only the verified Pod, waits for cleanup, copies f
         if (args[0] === 'cp') fs.writeFileSync(path.join(output, 'report.json'), JSON.stringify(report('done')));
         return '';
       } });
-    const signal = calls.findIndex(call => call.includes('kill'));
+    const signal = calls.findIndex(call => call.includes('SIGTERM'));
     const copied = calls.findIndex(call => call[0] === 'cp');
     const deleted = calls.findIndex(call => call[0] === 'delete');
     assert.ok(signal > 3 && copied > signal && deleted > copied);
     assert.deepEqual(calls[signal]!.slice(0, 7), ['exec', '--container', 'experiment', '-n', 'azure-qap', receipt.pod, '--']);
     assert.deepEqual(calls[deleted]!.slice(1, 4), Object.keys(receipt.resources));
+    const release = calls.findIndex(call => call.includes('SIGUSR1'));
+    assert.ok(release > copied && deleted > release);
     assert.ok(calls.every(call => !call.includes('--all') && !call.includes('--selector')));
+  } finally { fs.rmSync(output, { recursive: true, force: true }); }
+});
+
+test('signal, copy, release and revalidated ownership failures preserve exact owned resources', async () => {
+  for (const failure of ['SIGTERM', 'cp', 'SIGUSR1', 'revalidation']) {
+    const output = path.resolve(`.temp/retained-job-error-${failure}-${process.pid}`);
+    fs.rmSync(output, { recursive: true, force: true });
+    let copied = false;
+    const calls: string[][] = [];
+    try {
+      await assert.rejects(cleanupRetainedJob({ receipt, namespace: receipt.namespace, output,
+        kubectl: async args => {
+          calls.push(args);
+          if (args.includes(failure)) throw new Error(`simulated ${failure} failure`);
+          if (args[0] === 'get') return JSON.stringify({ metadata: { ...metadata(args[1]!.split('/')[1]!),
+            ...(failure === 'revalidation' && copied ? { uid: 'aaaaaaaa-2222-3333-4444-555555555555' } : {}) } });
+          if (args.includes('/artifacts/report.json')) return JSON.stringify(report('retained'));
+          if (args.includes('sh')) return 'done';
+          if (args[0] === 'cp') {
+            fs.writeFileSync(path.join(output, 'report.json'), JSON.stringify(report('done')));
+            copied = true;
+          }
+          return '';
+        } }));
+      assert.equal(calls.some(call => call[0] === 'delete'), false);
+      if (failure !== 'SIGUSR1') assert.equal(calls.some(call => call.includes('SIGUSR1')), false);
+    } finally { fs.rmSync(output, { recursive: true, force: true }); }
+  }
+});
+
+test('already-completed deadline cleanup skips TERM but still verifies evidence before releasing the holder', async () => {
+  const output = path.resolve(`.temp/retained-job-completed-${process.pid}`);
+  fs.rmSync(output, { recursive: true, force: true });
+  const calls: string[][] = [];
+  try {
+    await cleanupRetainedJob({ receipt, namespace: receipt.namespace, output,
+      kubectl: async args => {
+        calls.push(args);
+        if (args[0] === 'get') return JSON.stringify({ metadata: metadata(args[1]!.split('/')[1]!) });
+        if (args.includes('/artifacts/report.json')) return JSON.stringify(report('done'));
+        if (args.includes('sh')) return 'done';
+        if (args[0] === 'cp') fs.writeFileSync(path.join(output, 'report.json'), JSON.stringify(report('done')));
+        return '';
+      } });
+    assert.equal(calls.some(call => call.includes('SIGTERM')), false);
+    assert.ok(calls.findIndex(call => call.includes('SIGUSR1')) > calls.findIndex(call => call[0] === 'cp'));
+    assert.equal(calls.at(-1)?.[0], 'delete');
   } finally { fs.rmSync(output, { recursive: true, force: true }); }
 });
 
@@ -67,7 +116,7 @@ test('ownership mismatch, cleanup timeout and failed cleanup never delete object
         } }), failure === 'ownership' ? /Ownership mismatch/ : failure === 'run' ? /report does not match/ :
         failure === 'timeout' ? /within 6m/ : /cleanup failed/);
       assert.equal(calls.some(call => call[0] === 'delete'), false);
-      if (failure === 'ownership' || failure === 'run') assert.equal(calls.some(call => call.includes('kill')), false);
+      if (failure === 'ownership' || failure === 'run') assert.equal(calls.some(call => call.includes('SIGTERM')), false);
     } finally { fs.rmSync(output, { recursive: true, force: true }); }
   }
 });
