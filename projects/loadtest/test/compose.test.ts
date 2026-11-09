@@ -9,6 +9,7 @@ import YAML from 'yaml';
 import { buildLocalLoadgenEndpoints } from '../src/runtime-config.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
+const bindHost = '${LOADTEST_BIND_HOST:-127.0.0.1}';
 const compose = YAML.parse(readFileSync(path.join(root, 'projects/loadtest/compose.yaml'), 'utf8')) as {
   services: Record<string, {
     profiles?: string[];
@@ -134,12 +135,12 @@ test('stack includes SQL routing, catalog, router, DFE, Kusto, monitoring and va
   }
 });
 
-test('Kusto is pinned, memory-bounded, loopback-only and keeps its documented default startup', () => {
+test('Kusto is pinned, memory-bounded, defaults its bind to loopback and keeps its documented startup', () => {
   const kusto = compose.services.kusto;
   assert.match(kusto.image ?? '', /^mcr\.microsoft\.com\/azuredataexplorer\/kustainer-linux@sha256:[0-9a-f]{64}$/u);
   assert.equal(kusto.mem_limit, '${KUSTO_MEMORY_LIMIT:-6g}');
   assert.deepEqual(kusto.environment, { ACCEPT_EULA: 'Y' });
-  assert.deepEqual(kusto.ports, ['127.0.0.1:${KUSTO_PORT:-8080}:8080']);
+  assert.deepEqual(kusto.ports, [`${bindHost}:\${KUSTO_PORT:-8080}:8080`]);
   assert.equal(kusto.entrypoint, undefined);
   assert.equal(kusto.command, undefined);
   assert.equal(kusto.networks?.default?.ipv4_address, '${LOADTEST_KUSTO_IP:-10.89.0.50}');
@@ -179,11 +180,11 @@ test('catalog and DFE share the same Delta root', () => {
   assert.equal(root('arrowcol-catalog'), root('dataflow-1'));
 });
 
-test('host loadgen uses loopback ports while container loadgen uses Compose endpoints', () => {
+test('host loadgen uses default-loopback ports while container loadgen uses Compose endpoints', () => {
   assert.deepEqual(compose.services['arrowcol-catalog'].ports,
-    ['127.0.0.1:${LOADTEST_CATALOG_PORT:-18817}:8817']);
+    [`${bindHost}:\${LOADTEST_CATALOG_PORT:-18817}:8817`]);
   assert.deepEqual(compose.services.router.ports,
-    ['127.0.0.1:${LOADTEST_ROUTER_PORT:-15050}:50050']);
+    [`${bindHost}:\${LOADTEST_ROUTER_PORT:-15050}:50050`]);
   assert.deepEqual(buildLocalLoadgenEndpoints({ router: '10.89.0.10' }, 'host',
     { router: '15050', catalog: '18817' }), {
     router: 'http://127.0.0.1:15050',
@@ -207,7 +208,7 @@ test('router and DFE receive the SQL routing credential at the configured path',
 
 test('SQL Server publishes an overridable loopback port and retains its data and secret mounts', () => {
   const sqlserver = compose.services.sqlserver;
-  assert.deepEqual(sqlserver.ports, ['127.0.0.1:${SQLSERVER_PORT:-14333}:1433']);
+  assert.deepEqual(sqlserver.ports, [`${bindHost}:\${SQLSERVER_PORT:-14333}:1433`]);
   assert(sqlserver.volumes?.includes('sqlserver-data:/var/opt/mssql'));
   assert(sqlserver.secrets?.includes('sqlserver_sa_password'));
   const devcontainer = JSON.parse(readFileSync(path.join(root, '.devcontainer/devcontainer.json'), 'utf8'));
