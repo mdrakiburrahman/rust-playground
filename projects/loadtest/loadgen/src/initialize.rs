@@ -9,7 +9,10 @@ use arrowcol_catalog::{DdlCommand, DdlParser};
 use serde::Serialize;
 use url::Url;
 
-use crate::{cli::InitializeAzureArgs, schema::schema_statements};
+use crate::{
+    cli::InitializeAzureArgs,
+    schema::{TABLE_COUNT, schema_statements},
+};
 
 const INGESTION: &str = "__arrowcol_ingestion";
 
@@ -223,12 +226,12 @@ mod tests {
     #[test]
     fn dataflow_uses_raw_registry_and_required_partition() -> Result<()> {
         let entries = entries()?;
-        assert_eq!(entries.len(), 13);
+        assert_eq!(entries.len(), TABLE_COUNT);
         let names = entries
             .iter()
             .map(|(entry, _)| &entry.name)
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(names.len(), 13);
+        assert_eq!(names.len(), TABLE_COUNT);
         for (index, (entry, schema)) in entries.into_iter().enumerate() {
             assert!(entry.relative_path.starts_with("dataflow/telemetry/sqlserver/"));
             assert_eq!(schema.field(0).name(), "customer_id");

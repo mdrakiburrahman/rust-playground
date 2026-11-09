@@ -3,7 +3,7 @@
 #
 # usage: kusto-qap-it.sh all|schemas|prune|start|init|mutate|vacuum|schemas-write|check [expose]|stop
 #   all     start, init, check expose, mutate, check, vacuum, check, stop
-#   schemas start, all 13 canonical sqlserver.sql tables with boundary values, check expose, stop
+#   schemas start, all 32 canonical sqlserver.sql tables with boundary values, check expose, stop
 #   prune   DELTA_MAINTENANCE_REF=<core commit> required. Builds delta-maintenance from exactly that
 #           commit, then on the marked disposable fixture (UNSAFE zero VACUUM/log retention):
 #           init, mutate, prune-prep (receipt txns, watermark PURGE, OPTIMIZE), check expose;

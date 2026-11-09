@@ -258,7 +258,7 @@ export function runFixture(root: string, step: string, sql?: string): void {
   if (step === 'schemas') {
     assert(sql, 'schemas requires canonical SQL');
     const schemas = canonicalTables(readFileSync(sql, 'utf8'));
-    assert.equal(schemas.length, 13);
+    assert.equal(schemas.length, 32);
     paths = [];
     for (const [name, columns] of schemas) {
       const table = path.join(base, name);

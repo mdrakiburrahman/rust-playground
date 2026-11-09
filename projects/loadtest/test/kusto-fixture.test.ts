@@ -88,7 +88,7 @@ test('all canonical Spark schemas preserve signed boundaries and exact timestamp
   t.after(() => rmSync(root, { force: true, recursive: true }));
   const sql = path.join(process.cwd(), 'projects/loadtest/schemas/sqlserver.sql');
   const tables = canonicalTables(readFileSync(sql, 'utf8'));
-  assert.equal(tables.length, 13);
+  assert.equal(tables.length, 32);
   runFixture(root, 'schemas', sql);
   for (const [name, columns] of tables) {
     const directory = path.join(root, 'telemetry/sqlserver', name);

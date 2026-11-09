@@ -558,7 +558,7 @@ class Rehearsal {
     assert.ok(typeof runId === 'string' && /^run-[0-9]+-[a-f0-9]{32}$/.test(runId));
     const root = `projects/loadtest/.temp/loadgen/latest/${runId}`;
     const tables = fs.readdirSync(`${root}/artifacts`).sort();
-    assert.equal(tables.length, 13); assert.ok(tables.includes('sqlserver_active_sessions'));
+    assert.equal(tables.length, 32); assert.ok(tables.includes('sqlserver_active_sessions'));
     assert.deepEqual(fs.readdirSync(`${root}/generated`).sort(), tables);
     for (const table of tables) {
       for (const file of ['manifest.json', 'schema.arrow', 'descriptor.pb', 'schema.proto']) {

@@ -648,6 +648,21 @@ mod tests {
     }
 
     #[test]
+    fn accepts_all_supported_tables_and_rejects_unknown_and_case_insensitive_duplicates() -> Result<()> {
+        let mut config = valid();
+        config.tables = collector_chain::dmv::table_names()?;
+        assert_eq!(config.tables.len(), 32);
+        config.validate()?;
+
+        config.tables[31] = "sqlserver_not_supported".to_owned();
+        assert!(config.validate().is_err());
+
+        config.tables[31] = config.tables[0].to_ascii_uppercase();
+        assert!(config.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
     fn pin_ttl_covers_the_full_startup_and_client_lifetime_envelope() -> Result<()> {
         let mut config = valid();
         config.client_ready_timeout_seconds = 1_800;
