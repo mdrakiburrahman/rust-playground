@@ -5533,6 +5533,8 @@ mod tests {
 
     #[tokio::test]
     async fn replacement_namespace_uid_conflict_preserves_replacement() -> Result<()> {
+        let observed_namespace = json!({ "metadata": { "uid": "namespace-uid-a" } });
+        let observed_uid = namespace_uid_for_cleanup(&observed_namespace, None)?;
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let server = tokio::spawn(async move {
@@ -5585,9 +5587,10 @@ mod tests {
         });
 
         let result =
-            delete_namespace_with_uid_precondition(&format!("http://{address}"), "arrowcol-oat-run", "namespace-uid-a")
+            delete_namespace_with_uid_precondition(&format!("http://{address}"), "arrowcol-oat-run", &observed_uid)
                 .await;
         let (request_line, requested_uid, surviving_uid) = server.await??;
+        assert_eq!(observed_uid, "namespace-uid-a");
         assert_eq!(request_line, "DELETE /api/v1/namespaces/arrowcol-oat-run HTTP/1.1");
         assert_eq!(requested_uid, "namespace-uid-a");
         assert_eq!(surviving_uid, "namespace-uid-b");
