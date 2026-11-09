@@ -5591,11 +5591,11 @@ mod tests {
         assert_eq!(request_line, "DELETE /api/v1/namespaces/arrowcol-oat-run HTTP/1.1");
         assert_eq!(requested_uid, "namespace-uid-a");
         assert_eq!(surviving_uid, "namespace-uid-b");
-        assert!(
-            result.is_err(),
-            "a UID conflict must fail closed without a success receipt"
-        );
-        assert!(result.unwrap_err().to_string().contains("409 Conflict"));
+        let error = result
+            .context("a UID conflict must fail closed without a success receipt")
+            .err();
+        let error = error.context("replacement namespace deletion unexpectedly succeeded")?;
+        assert!(error.to_string().contains("409 Conflict"));
         Ok(())
     }
 
