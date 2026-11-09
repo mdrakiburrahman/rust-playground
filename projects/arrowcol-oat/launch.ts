@@ -1,9 +1,10 @@
-import { spawn, type ChildProcess } from 'node:child_process';
-import { createServer as createHttpServer } from 'node:http';
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { readFile, realpath, stat } from 'node:fs/promises';
-import { createServer as createTcpServer } from 'node:net';
+import { createServer as createHttpServer } from 'node:http';
+import { createServer as createTcpServer, isIP } from 'node:net';
 import { extname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { formatPreflightReport, runAksPreflight } from './aks-preflight.js';
 
 export interface OatRunStatus {
   id: string;
@@ -26,6 +27,50 @@ interface LocalViewerConfig {
   siteRoot: string;
 }
 
+const workspaceRoot = resolve(fileURLToPath(new URL('../..', import.meta.url)));
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+export function resolveOatConfigPath(mode: 'local' | 'aks', configPath?: string): string {
+  if (configPath) return configPath;
+  const name = mode === 'local' ? 'oat-config.quick.json' : 'oat-config.aks.quick.json';
+  return resolve(workspaceRoot, 'docs/experiments/arrowcol-oat', name);
+}
+
+function getDockerBridgeGateway(): string {
+  try {
+    const gateway = execFileSync('docker', [
+      'network', 'inspect', 'bridge', '--format', '{{(index .IPAM.Config 0).Gateway}}',
+    ], { encoding: 'utf8', timeout: 10_000 }).trim();
+    if (!gateway || isIP(gateway) === 0) throw new Error('Docker bridge returned no valid gateway address');
+    return gateway;
+  } catch (error) {
+    throw new Error(`Could not detect Docker bridge gateway: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+export async function readOatConfigForMode(
+  configPath: string,
+  mode: 'local' | 'aks',
+  bridgeGateway: () => string = getDockerBridgeGateway,
+): Promise<Record<string, unknown>> {
+  const parsed: unknown = JSON.parse(await readFile(configPath, 'utf8'));
+  if (!isRecord(parsed)) throw new Error('OAT config must be a JSON object');
+  const platform: Record<string, unknown> = isRecord(parsed.platform) ? { ...parsed.platform, kind: mode } : { kind: mode };
+  if (mode === 'local' && isRecord(platform.local)) {
+    const local = { ...platform.local };
+    if (local.bind_host == null || local.endpoint_host == null) {
+      const gateway = bridgeGateway();
+      if (local.bind_host == null) local.bind_host = gateway;
+      if (local.endpoint_host == null) local.endpoint_host = gateway;
+    }
+    platform.local = local;
+  }
+  return { ...parsed, platform };
+}
+
 export async function launchOat(
   configPath: string,
   serverUrl = 'http://127.0.0.1:8088',
@@ -33,6 +78,7 @@ export async function launchOat(
   fetcher: FetchLike = fetch,
   onProgress: ProgressHandler = (status) => console.log(`${status.state}: ${status.progress}`),
   mode?: 'local' | 'aks',
+  bridgeGateway: () => string = getDockerBridgeGateway,
 ): Promise<OatRunStatus> {
   if (!Number.isSafeInteger(pollIntervalMs) || pollIntervalMs < 1) {
     throw new Error('poll interval must be a positive integer');
@@ -41,22 +87,10 @@ export async function launchOat(
   if (!['http:', 'https:'].includes(server.protocol)) {
     throw new Error('server URL must use HTTP or HTTPS');
   }
-  const configText = await readFile(configPath, 'utf8');
-  const parsedConfig: unknown = JSON.parse(configText);
-  const config = mode && parsedConfig !== null && typeof parsedConfig === 'object' && !Array.isArray(parsedConfig)
-    ? {
-        ...parsedConfig,
-        platform: {
-          ...(Object.hasOwn(parsedConfig, 'platform') && 'platform' in parsedConfig && typeof parsedConfig.platform === 'object' && parsedConfig.platform !== null
-            ? parsedConfig.platform
-            : {}),
-          kind: mode,
-        },
-      }
-    : parsedConfig;
-  if (config === null || typeof config !== 'object' || Array.isArray(config)) {
-    throw new Error('OAT config must be a JSON object');
-  }
+  const config = mode
+    ? await readOatConfigForMode(configPath, mode, bridgeGateway)
+    : JSON.parse(await readFile(configPath, 'utf8'));
+  if (!isRecord(config)) throw new Error('OAT config must be a JSON object');
 
   const startResponse = await fetcher(new URL('/runs', server), {
     method: 'POST',
@@ -112,24 +146,41 @@ export async function main(args: string[]): Promise<void> {
   const positionalConfig = args.find((value, index) =>
     !value.startsWith('--') && !valuedOptions.has(args[index - 1] ?? ''),
   );
-  const configPath = option('--config') ?? positionalConfig;
-  if (!configPath) {
-    throw new Error('Usage: npx arrowcol-oat --config <oat-config.json> [--mode local|aks] [--server URL] [--poll-ms N]; or --viewer-only --config <local-oat-config.json>');
+  const requestedMode = option('--mode');
+  if (requestedMode !== undefined && requestedMode !== 'local' && requestedMode !== 'aks') {
+    throw new Error('--mode must be local or aks');
   }
+  const requestedConfig = option('--config') ?? positionalConfig;
   const requestedServerUrl = option('--server');
-  const mode = option('--mode');
   const viewerOnly = args.includes('--viewer-only');
+  const preflightOnly = args.includes('--preflight-only');
+  if (preflightOnly) {
+    if (requestedMode !== 'aks' || viewerOnly || requestedServerUrl || args.includes('--poll-ms')) {
+      throw new Error('--preflight-only requires --mode aks and cannot be combined with viewer/server/poll options');
+    }
+    const configPath = resolveOatConfigPath('aks', requestedConfig);
+    const report = await runAksPreflight(configPath);
+    console.log(formatPreflightReport(report));
+    if (!report.ready) process.exitCode = 2;
+    return;
+  }
+  const mode: 'local' | 'aks' = requestedMode === 'aks' ? 'aks' : 'local';
+  const configPath = resolveOatConfigPath(mode, requestedConfig);
   if (viewerOnly) {
-    if (requestedServerUrl || mode !== undefined || args.includes('--poll-ms')) {
-      throw new Error('--viewer-only only supports --config');
+    if (mode !== 'local' || requestedServerUrl || args.includes('--poll-ms')) {
+      throw new Error('--viewer-only is local-only and supports only --mode local and --config');
     }
     await keepLocalViewerOpen(await startLocalViewer(configPath));
     return;
   }
   const pollValue = Number(option('--poll-ms') ?? 1000);
-  if (mode !== undefined && mode !== 'local' && mode !== 'aks') throw new Error('--mode must be local or aks');
   if (!Number.isSafeInteger(pollValue) || pollValue < 1) {
     throw new Error('Expected values after --server and --poll-ms');
+  }
+  if (mode === 'aks') {
+    const report = await runAksPreflight(configPath);
+    console.log(formatPreflightReport(report));
+    if (!report.ready) throw new Error('AKS preflight is NOT READY; refusing to start the benchmark.');
   }
   if (requestedServerUrl) {
     const status = await launchOat(configPath, requestedServerUrl, pollValue, fetch, undefined, mode);

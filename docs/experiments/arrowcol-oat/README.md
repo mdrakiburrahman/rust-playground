@@ -75,3 +75,33 @@ Each matrix cell receives a canonical UUID and an isolated platform stack, run-s
 For AKS, copy the example and set `platform.kind` to `aks`, remove the local Compose settings, and configure the AKS endpoints, secret path, context, namespace, and result destinations described above. Local configurations use the configured `compose_project` as a prefix and append the unique OAT run ID, isolating the network, containers, and volumes; `compose_state_root` contains generated local credentials and bind-mounted state for that run.
 
 The server never creates, deletes, or scales AKS node pools. Run `cargo run --locked --package arrowcol-oat-rust -- --validate-config docs/experiments/arrowcol-oat/oat-config.example.json` before submission to validate the shape without changing cluster state; placeholders still need replacing. The `az://container/object` URL form is also accepted when Azure account authentication is already configured for the process.
+
+## Mode-based quick bug bash
+
+From the repository root, the local mode selects `oat-config.quick.json`, detects the Docker bridge hosts when needed, runs one quick matrix cell, publishes the local results, and keeps the loopback website open:
+
+```bash
+npx --no-install arrowcol-oat --mode local
+```
+
+Reopen the existing local results website without rebuilding Rust, starting Docker, or rerunning the benchmark:
+
+```bash
+npx --no-install arrowcol-oat --mode local --viewer-only
+```
+
+The viewer reports an error if the configured Parquet results file is missing. It serves only on loopback with HTTP range support.
+
+AKS mode selects `oat-config.aks.quick.json`. Run its read-only preflight explicitly with:
+
+```bash
+npx --no-install arrowcol-oat --mode aks --preflight-only
+```
+
+A full AKS benchmark invocation is:
+
+```bash
+npx --no-install arrowcol-oat --mode aks
+```
+
+It repeats the preflight and refuses to submit unless every readiness gate passes. The AKS quick stack is **not staged or qualified**: required workload resources and immutable images are absent, enforcing network policy and behavioral proof are missing, current workload metrics are empty, and QAP is not qualified. The checked-in AKS config references runtime/bootstrap files not present in the checkout and leaves the database and client image unset; do not treat a preflight result as permission to provision resources. There is no AKS website-only mode.
