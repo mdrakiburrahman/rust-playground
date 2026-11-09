@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, unlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { launchOat, sendViewerFile } from './launch.js';
+import { pathToFileURL } from 'node:url';
+import { launchOat, sendViewerFile, startLocalViewer } from './launch.js';
 
 const status = (state: 'queued' | 'running' | 'succeeded') => ({
   id: 'run-a', state, progress: state, result_count: state === 'succeeded' ? 2 : 0, error: null,
@@ -98,5 +99,45 @@ test('serves local viewer byte ranges, suffix ranges, and HEAD requests', async 
     await new Promise<void>((resolve, reject) => {
       server.close((error) => error ? reject(error) : resolve());
     });
+  }
+});
+
+test('opens the existing local results in viewer-only mode without losing missing-file errors', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'arrowcol-oat-viewer-'));
+  const configPath = path.join(directory, 'oat.json');
+  const resultsPath = path.join(directory, 'results.parquet');
+  await writeFile(resultsPath, Buffer.from('PAR1data'));
+  await writeFile(configPath, JSON.stringify({
+    platform: { kind: 'local' },
+    website_url: pathToFileURL(resultsPath).href,
+  }));
+  let viewer: Awaited<ReturnType<typeof startLocalViewer>> | undefined;
+  try {
+    viewer = await startLocalViewer(configPath);
+    assert.equal(new URL(viewer.url).hostname, '127.0.0.1');
+
+    const page = await fetch(viewer.url);
+    assert.equal(page.status, 200);
+    assert.match(await page.text(), /ArrowCol OAT benchmark/);
+
+    const resultsUrl = new URL('/results.parquet', viewer.url);
+    const range = await fetch(resultsUrl, { headers: { range: 'bytes=0-3' } });
+    assert.equal(range.status, 206);
+    assert.equal(range.headers.get('content-range'), 'bytes 0-3/8');
+    assert.equal(await range.text(), 'PAR1');
+
+    const head = await fetch(resultsUrl, { method: 'HEAD' });
+    assert.equal(head.status, 200);
+    assert.equal(head.headers.get('content-length'), '8');
+    assert.equal(await head.text(), '');
+
+    await unlink(resultsPath);
+    const missing = await fetch(resultsUrl);
+    assert.equal(missing.status, 404);
+    assert.equal(await missing.text(), 'Not found');
+    await assert.rejects(startLocalViewer(configPath), /Local OAT results file does not exist/);
+  } finally {
+    if (viewer) await viewer.close();
+    await rm(directory, { recursive: true, force: true });
   }
 });

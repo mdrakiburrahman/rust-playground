@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, ensure};
+use arrow_deltalake::delta::WRITER_LOCK;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -180,6 +181,13 @@ fn inventory(root: &Path, directory: &Path, files: &mut Vec<SnapshotFile>) -> Re
     }
     files.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(())
+}
+
+fn table_inventory(root: &Path) -> Result<Vec<SnapshotFile>> {
+    let mut files = Vec::new();
+    inventory(root, root, &mut files)?;
+    files.retain(|file| !(file.path == WRITER_LOCK && file.size == 0));
+    Ok(files)
 }
 
 fn delta_path(raw: &str) -> Result<String> {
@@ -407,8 +415,7 @@ pub(crate) fn export_stopped(
         fs::create_dir(&table_destination)?;
         let copied = table_destination.join("table");
         fs::create_dir(&copied)?;
-        let mut files = Vec::new();
-        inventory(&source, &source, &mut files)?;
+        let files = table_inventory(&source)?;
         for entry in &files {
             let target = copied.join(&entry.path);
             let parent = target.parent().context("snapshot payload has no parent")?;
@@ -424,9 +431,10 @@ pub(crate) fn export_stopped(
                 "snapshot copy verification failed"
             );
         }
-        let mut after = Vec::new();
-        inventory(&source, &source, &mut after)?;
-        ensure!(after == files, "stopped source changed during snapshot");
+        ensure!(
+            table_inventory(&source)? == files,
+            "stopped source changed during snapshot"
+        );
         let proof = snapshot_proof(&copied, &files)?;
         let mut verified = Vec::new();
         inventory(&copied, &copied, &mut verified)?;
@@ -502,6 +510,7 @@ mod tests {
         let state = fixture.0.join("state");
         let table = state.join("dataflow/telemetry/sqlserver/sqlserver_active_sessions");
         fs::create_dir_all(table.join("_delta_log"))?;
+        File::create(table.join(WRITER_LOCK))?;
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int64Array::from(vec![1_i64, 2]))])?;
         let mut writer = ArrowWriter::try_new(File::create(table.join("part.parquet"))?, schema, None)?;
@@ -535,6 +544,8 @@ mod tests {
         assert_eq!(manifest["rowCount"], 2);
         assert_eq!(manifest["latestVersion"], 1);
         assert_eq!(manifest["files"].as_array().context("missing inventory")?.len(), 4);
+        assert!(table.join(WRITER_LOCK).exists());
+        assert!(!root.join("table").join(WRITER_LOCK).exists());
         assert_eq!(
             fs::read(root.join("table/_delta_log/00000000000000000000.json"))?,
             log.as_bytes()

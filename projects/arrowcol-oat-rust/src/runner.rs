@@ -2454,6 +2454,9 @@ fn validate_client_measurement_interval(
     if report.measurement_window_start_unix_ms != expected_start_unix_ms
         || report.measurement_window_end_unix_ms != expected_end_unix_ms
         || report.measurement_started_unix_ms.abs_diff(expected_start_unix_ms) > 250
+        || (report.duration_seconds - expected_end_unix_ms.saturating_sub(expected_start_unix_ms) as f64 / 1_000.0)
+            .abs()
+            > 0.0005
     {
         bail!("client did not cover the shared measurement interval");
     }
@@ -5150,7 +5153,7 @@ fn merge_parquet_bytes(existing_bytes: &[u8], incoming: &RecordBatch) -> Result<
     let mut batches = existing_reader.build()?.collect::<std::result::Result<Vec<_>, _>>()?;
     batches.push(incoming.clone());
     let merged = concat_batches(&schema, &batches)?;
-    encode_parquet(&deduplicate_results(&merged)?)
+    encode_parquet(&merged)
 }
 
 fn deduplicate_results(batch: &RecordBatch) -> Result<RecordBatch> {
@@ -5312,9 +5315,10 @@ fn result_schema() -> Arc<Schema> {
 }
 
 fn encode_parquet(batch: &RecordBatch) -> Result<Vec<u8>> {
+    let batch = deduplicate_results(batch)?;
     let schema = batch.schema();
     let mut writer = ArrowWriter::try_new(Vec::new(), schema, None)?;
-    writer.write(batch)?;
+    writer.write(&batch)?;
     Ok(writer.into_inner()?)
 }
 
@@ -6290,6 +6294,52 @@ mod tests {
         assert_eq!(metrics.observation_complete, 0);
         assert_eq!(metrics.observed_tables, 0);
         assert_eq!(metrics.completion_percent, None);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_reported_duration_shorter_than_the_shared_window() -> Result<()> {
+        let report = parse_client_metrics(
+            "measured_rows=100 measured_seconds=1 rows_per_second=100 measurement_window_start_unix_ms=100000 measurement_window_end_unix_ms=160000 measurement_started_unix_ms=100000",
+        )?;
+        assert!(validate_client_measurement_interval(&report, 100_000, 160_000, false).is_err());
+        let aligned = ClientReport {
+            duration_seconds: 60.0,
+            ..report
+        };
+        assert!(validate_client_measurement_interval(&aligned, 100_000, 160_000, false).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn initial_parquet_write_deduplicates_run_table_keys() -> Result<()> {
+        let batch = parquet_batch(&[
+            sample_result("run-1", "table-a", 100),
+            sample_result("run-1", "table-a", 200),
+        ])?;
+        let bytes = encode_parquet(&batch)?;
+        let batches = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes))?
+            .build()?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        let rows = batches[0]
+            .column_by_name("rows")
+            .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+            .context("missing UInt64 rows")?;
+        assert_eq!(rows.value(0), 200);
+        Ok(())
+    }
+
+    #[test]
+    fn zero_row_parquet_preserves_schema_and_accepts_a_later_append() -> Result<()> {
+        let empty = encode_parquet(&parquet_batch(&[])?)?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::copy_from_slice(&empty))?;
+        assert_eq!(reader.schema().as_ref(), result_schema().as_ref());
+        assert_eq!(reader.metadata().file_metadata().num_rows(), 0);
+        assert_eq!(reader.build()?.count(), 0);
+        let appended = merge_parquet_bytes(&empty, &parquet_batch(&[sample_result("run-1", "table-a", 100)])?)?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(appended))?;
+        assert_eq!(reader.metadata().file_metadata().num_rows(), 1);
         Ok(())
     }
 
