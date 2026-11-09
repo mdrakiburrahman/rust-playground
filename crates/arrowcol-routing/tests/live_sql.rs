@@ -193,10 +193,7 @@ async fn live_oat_pin_case(case: LiveOatPinCase) -> anyhow::Result<()> {
                         && error.to_string().to_ascii_lowercase().contains("permission"),
                     "application initialization did not fail on SQL permission denial: {error}"
                 );
-                anyhow::ensure!(
-                    pin_authority_snapshot(&denied_run).await? == "[]",
-                    "denied setup left authority"
-                );
+                assert_pin_authority_absent(&denied_run).await?;
                 let expired = store.get_run_table_pin(&run_id, &keys[0], expires_at).await;
                 anyhow::ensure!(
                     matches!(expired, Err(error) if error.kind() == RoutingErrorKind::Conflict),
@@ -308,6 +305,31 @@ async fn assert_app_pin_permissions() -> anyhow::Result<()> {
         row.try_get::<i32, _>("writes")? == Some(0),
         "application has immutable-authority write privilege"
     );
+    connection.finish().await?;
+    Ok(())
+}
+
+async fn assert_pin_authority_absent(run_id: &str) -> anyhow::Result<()> {
+    let mut connection = SqlConnection::connect(&sql_connection_config()?).await?;
+    let run_id = Uuid::parse_str(run_id)?;
+    let row = connection
+        .query(
+            "SELECT \
+             (SELECT COUNT_BIG(*) FROM arrowcol.routing_run_pin_sets WHERE run_id=@P1) AS sets, \
+             (SELECT COUNT_BIG(*) FROM arrowcol.routing_run_table_initializations WHERE run_id=@P1) AS markers, \
+             (SELECT COUNT_BIG(*) FROM arrowcol.routing_run_table_pins WHERE run_id=@P1) AS pins;",
+            &[&run_id],
+        )
+        .await?
+        .into_row()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("missing denied-run authority counts"))?;
+    for field in ["sets", "markers", "pins"] {
+        let count = row
+            .try_get::<i64, _>(field)?
+            .ok_or_else(|| anyhow::anyhow!("NULL denied-run {field} count"))?;
+        anyhow::ensure!(count == 0, "denied setup left {count} authority rows in {field}");
+    }
     connection.finish().await?;
     Ok(())
 }
