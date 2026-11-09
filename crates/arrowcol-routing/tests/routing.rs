@@ -688,7 +688,16 @@ async fn oat_forwarding_rejects_deadlines_crossed_during_authority_reads() {
         let engine = RoutingEngine::new(engine_store, oat_policy(OAT_RUN_EXPIRY))
             .unwrap_or_else(|error| panic!("create delayed-read OAT engine: {error}"));
         let pin_expiry = millis(if boundary == "pin" { 100_015 } else { 200_000 });
-        initialize_memory_oat_pin(&engine, OAT_RUN_EXPIRY, millis(100_001), pin_expiry).await;
+        engine
+            .initialize_run_table_pins_with_clock(
+                OAT_RUN_EXPIRY,
+                &[LeaseKey::new(ImplementationPool::Dataflow, table())],
+                pin_expiry,
+                millis(100_001),
+                || Ok(millis(100_001)),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("initialize fixed-clock fixture: {error}"));
         let selected = engine
             .route_ingest_for_run(&metadata(), OAT_RUN_EXPIRY, pin_expiry, millis(100_002))
             .await
