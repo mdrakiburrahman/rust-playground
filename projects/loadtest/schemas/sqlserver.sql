@@ -343,9 +343,9 @@ CREATE TABLE telemetry.sqlserver.sqlserver_database_index_operational_stats (
     forwarded_fetch_count BIGINT NOT NULL,
     row_lock_count BIGINT NOT NULL,
     row_lock_wait_count BIGINT NOT NULL,
-    row_lock_wait_ms BIGINT NOT NULL,
+    row_lock_wait_in_ms BIGINT NOT NULL,
     page_latch_wait_count BIGINT NOT NULL,
-    page_latch_wait_ms BIGINT NOT NULL
+    page_latch_wait_in_ms BIGINT NOT NULL
 ) USING DELTA;
 
 CREATE TABLE telemetry.sqlserver.sqlserver_database_index_usage (
@@ -494,7 +494,7 @@ CREATE TABLE telemetry.sqlserver.sqlserver_query_memory_grants (
     session_id SMALLINT NOT NULL,
     request_id INT NOT NULL,
     scheduler_id INT NOT NULL,
-    dop INT NOT NULL,
+    dop SMALLINT NOT NULL,
     request_time TIMESTAMP NOT NULL,
     grant_time TIMESTAMP NOT NULL,
     requested_memory_kb BIGINT NOT NULL,
@@ -503,8 +503,8 @@ CREATE TABLE telemetry.sqlserver.sqlserver_query_memory_grants (
     used_memory_kb BIGINT NOT NULL,
     max_used_memory_kb BIGINT NOT NULL,
     wait_time_ms BIGINT NOT NULL,
-    resource_semaphore_id INT NOT NULL,
-    queue_id INT NOT NULL,
+    resource_semaphore_id SMALLINT NOT NULL,
+    queue_id SMALLINT NOT NULL,
     wait_order INT NOT NULL,
     timeout_sec INT NOT NULL,
     plan_handle STRING NOT NULL,
@@ -590,7 +590,10 @@ CREATE TABLE telemetry.sqlserver.sqlserver_session_transactions (
     transaction_descriptor STRING NOT NULL,
     enlist_count INT NOT NULL,
     is_user_transaction BOOLEAN NOT NULL,
-    is_local BOOLEAN NOT NULL
+    is_local BOOLEAN NOT NULL,
+    is_enlisted BOOLEAN NOT NULL,
+    is_bound BOOLEAN NOT NULL,
+    open_transaction_count INT NOT NULL
 ) USING DELTA;
 
 CREATE TABLE telemetry.sqlserver.sqlserver_tempdb_space_usage (
@@ -605,8 +608,8 @@ CREATE TABLE telemetry.sqlserver.sqlserver_tempdb_space_usage (
     user_objects_dealloc_page_count BIGINT NOT NULL,
     internal_objects_alloc_page_count BIGINT NOT NULL,
     internal_objects_dealloc_page_count BIGINT NOT NULL,
-    total_allocated_pages BIGINT NOT NULL,
-    total_deallocated_pages BIGINT NOT NULL
+    user_objects_deferred_dealloc_page_count BIGINT NOT NULL,
+    internal_objects_deferred_dealloc_page_count BIGINT NOT NULL
 ) USING DELTA;
 
 CREATE TABLE telemetry.sqlserver.sqlserver_transaction_stats (
@@ -620,8 +623,8 @@ CREATE TABLE telemetry.sqlserver.sqlserver_transaction_stats (
     transaction_type SMALLINT NOT NULL,
     transaction_state SMALLINT NOT NULL,
     transaction_uow STRING NOT NULL,
-    transaction_sequence_num BIGINT NOT NULL,
-    transaction_isolation_level SMALLINT NOT NULL,
-    transaction_type_desc STRING NOT NULL,
-    transaction_state_desc STRING NOT NULL
+    transaction_status INT NOT NULL,
+    transaction_status2 INT NOT NULL,
+    dtc_state INT NOT NULL,
+    dtc_status INT NOT NULL
 ) USING DELTA;

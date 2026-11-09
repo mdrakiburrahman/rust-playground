@@ -11,7 +11,7 @@ use url::Url;
 
 use crate::{
     cli::InitializeAzureArgs,
-    schema::{TABLE_COUNT, schema_statements},
+    schema::schema_statements,
 };
 
 const INGESTION: &str = "__arrowcol_ingestion";
@@ -177,6 +177,7 @@ pub async fn write_manifest(args: InitializeAzureArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::TABLE_COUNT;
 
     #[test]
     fn actual_bootstrap_preserves_existing_logs_and_normalizes_timestamp_companions_once() -> Result<()> {

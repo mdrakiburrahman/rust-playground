@@ -141,7 +141,7 @@ mod tests {
                 ("sqlserver_query_stats".to_owned(), 25),
                 ("sqlserver_resource_semaphores".to_owned(), 16),
                 ("sqlserver_scheduler_stats".to_owned(), 19),
-                ("sqlserver_session_transactions".to_owned(), 10),
+                ("sqlserver_session_transactions".to_owned(), 13),
                 ("sqlserver_storage_io".to_owned(), 19),
                 ("sqlserver_tempdb_space_usage".to_owned(), 13),
                 ("sqlserver_transaction_stats".to_owned(), 14),
@@ -150,7 +150,7 @@ mod tests {
         );
         assert_eq!(
             format!("sha256:{}", hex::encode(Sha256::digest(schema_ddl().as_bytes()))),
-            "sha256:0f070457c1bcf4bb698d0560233c6a32f420e0a1b8da0e17b9029ce3a92dca18"
+            "sha256:1cd6ef49b860566f0a4ac74afb079d12f1a62ee73fca02392ec9c15ead8882bf"
         );
         Ok(())
     }
