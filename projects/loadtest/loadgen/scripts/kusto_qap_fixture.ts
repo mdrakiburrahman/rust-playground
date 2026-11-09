@@ -172,7 +172,8 @@ function addFile(table: string, columns: Column[], rows: Row[], batch: string, d
   mkdirSync(path.join(table, directory), { recursive: true });
   writeFileSync(path.join(table, relative), parquetRows(columns, rows));
   return { add: { path: relative, partitionValues: { __arrowcol_ingestion: batch },
-    size: statSync(path.join(table, relative)).size, modificationTime: Date.now(), dataChange } };
+    size: statSync(path.join(table, relative)).size, modificationTime: Date.now(), dataChange,
+    stats: JSON.stringify({ numRecords: rows.length }) } };
 }
 
 function append(table: string, columns: Column[], rows: Row[], batch: string, txns: Action[] = [], nullable = true): void {
