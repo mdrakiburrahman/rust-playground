@@ -109,6 +109,7 @@ async fn live_oat_pin_case(case: LiveOatPinCase) -> anyhow::Result<()> {
         anyhow::ensure!(pins.len() == keys.len(), "trusted setup did not bind the full set");
         let app_store: Arc<dyn RoutingStore> = Arc::<SqlServerRoutingStore>::clone(&store);
         let app = RoutingEngine::new(app_store, policy.clone())?;
+        let mut selected = Vec::with_capacity(keys.len());
         for (key, pin) in keys.iter().zip(&pins) {
             anyhow::ensure!(
                 pin.key == *key && pin.expires_at_unix_ms == expires_at,
@@ -135,6 +136,12 @@ async fn live_oat_pin_case(case: LiveOatPinCase) -> anyhow::Result<()> {
                     && lease.fencing_epoch == pin.fencing_epoch,
                 "application routing did not use the trusted immutable binding"
             );
+            let revalidated = app.revalidate_run_assignment(&run_id, &route, now()?).await?;
+            anyhow::ensure!(
+                revalidated.instance_id == route.instance_id && revalidated.flight_endpoint == route.flight_endpoint,
+                "forwarding revalidation changed the selected collector"
+            );
+            selected.push(route);
         }
         let authority = pin_authority_snapshot(&run_id).await?;
         match case {
@@ -206,6 +213,11 @@ async fn live_oat_pin_case(case: LiveOatPinCase) -> anyhow::Result<()> {
                     matches!(expired_route, Err(error) if error.kind() == RoutingErrorKind::InvalidConfiguration),
                     "application router accepted a request at the immutable expiry"
                 );
+                let expired_forward = app.revalidate_run_assignment(&run_id, &selected[0], expires_at).await;
+                anyhow::ensure!(
+                    matches!(expired_forward, Err(error) if error.kind() == RoutingErrorKind::Conflict),
+                    "application router forwarded an earlier assignment after immutable expiry"
+                );
             }
             LiveOatPinCase::MissingLease | LiveOatPinCase::DifferentValidOwner => {
                 let key = &keys[0];
@@ -247,6 +259,11 @@ async fn live_oat_pin_case(case: LiveOatPinCase) -> anyhow::Result<()> {
                 anyhow::ensure!(
                     matches!(rejected, Err(error) if error.kind() == RoutingErrorKind::Conflict),
                     "fresh application router accepted missing or replaced bound lease"
+                );
+                let rejected_forward = app.revalidate_run_assignment(&run_id, &selected[0], route_at).await;
+                anyhow::ensure!(
+                    matches!(rejected_forward, Err(error) if error.kind() == RoutingErrorKind::Conflict),
+                    "application router forwarded a cached assignment after lease loss or owner replacement"
                 );
                 anyhow::ensure!(
                     store.load_view(route_at).await?.leases == before_route.leases,

@@ -247,6 +247,90 @@ impl RoutingEngine {
         self.assignment_for_run_pin(&pin, now).await
     }
 
+    /// Revalidates an already selected OAT upstream immediately before forwarding.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on authority loss, expiry, or a changed owner/endpoint.
+    /// Never replaces the selected upstream with a different process.
+    pub async fn revalidate_run_assignment(
+        &self,
+        run_id: &str,
+        assignment: &RouteAssignment,
+        now: UnixMillis,
+    ) -> RoutingResult<RouteAssignment> {
+        let started_at = std::time::Instant::now();
+        self.revalidate_run_assignment_with_clock(run_id, assignment, now, move || {
+            let elapsed_ms = u64::try_from(started_at.elapsed().as_millis()).map_err(|_| {
+                RoutingError::new(
+                    RoutingErrorKind::InvalidConfiguration,
+                    "OAT forwarding elapsed time overflow",
+                )
+            })?;
+            add_millis(now, elapsed_ms)
+        })
+        .await
+    }
+
+    /// Revalidates a selected upstream using a caller-supplied monotonic clock.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on authority loss, changed ownership, clock regression,
+    /// or expiry after the final awaited authority/view read.
+    pub async fn revalidate_run_assignment_with_clock<F>(
+        &self,
+        run_id: &str,
+        assignment: &RouteAssignment,
+        now: UnixMillis,
+        clock: F,
+    ) -> RoutingResult<RouteAssignment>
+    where
+        F: Fn() -> RoutingResult<UnixMillis>,
+    {
+        if self.policy.oat_run_id.as_deref() != Some(run_id) {
+            return Err(RoutingError::new(
+                RoutingErrorKind::InvalidConfiguration,
+                "OAT run ID is not authorized by this router configuration",
+            ));
+        }
+        let selected = assignment
+            .lease
+            .as_ref()
+            .ok_or_else(|| RoutingError::new(RoutingErrorKind::Conflict, "OAT ingest assignment has no table lease"))?;
+        let pin = self
+            .store
+            .get_run_table_pin(run_id, &selected.key, now)
+            .await?
+            .ok_or_else(|| {
+                RoutingError::new(
+                    RoutingErrorKind::Conflict,
+                    "immutable OAT pin disappeared before forwarding",
+                )
+            })?;
+        let view = self.refresh(now).await?;
+        let checked_at = clock()?;
+        if checked_at < now {
+            return Err(RoutingError::new(
+                RoutingErrorKind::InvalidConfiguration,
+                "OAT forwarding clock regressed",
+            ));
+        }
+        let current = self.assignment_for_run_pin_in_view(&pin, &view, checked_at)?;
+        if current.instance_id != assignment.instance_id
+            || current.flight_endpoint != assignment.flight_endpoint
+            || pin.holder_instance_id != selected.holder_instance_id
+            || pin.lease_id != selected.lease_id
+            || pin.fencing_epoch != selected.fencing_epoch
+        {
+            return Err(RoutingError::new(
+                RoutingErrorKind::Conflict,
+                "immutable OAT upstream changed after selection",
+            ));
+        }
+        Ok(current)
+    }
+
     /// Initializes or resumes the trusted, complete run/table pin set.
     ///
     /// This operation is reserved for the bounded migrator-authenticated setup
@@ -429,6 +513,21 @@ impl RoutingEngine {
 
     async fn assignment_for_run_pin(&self, pin: &RunTablePin, now: UnixMillis) -> RoutingResult<RouteAssignment> {
         let view = self.refresh(now).await?;
+        self.assignment_for_run_pin_in_view(pin, &view, now)
+    }
+
+    fn assignment_for_run_pin_in_view(
+        &self,
+        pin: &RunTablePin,
+        view: &RoutingView,
+        now: UnixMillis,
+    ) -> RoutingResult<RouteAssignment> {
+        if pin.expires_at_unix_ms <= now {
+            return Err(RoutingError::new(
+                RoutingErrorKind::Conflict,
+                "immutable OAT run-table pin expired before forwarding",
+            ));
+        }
         let lease = view.leases.get(&pin.key).ok_or_else(|| {
             RoutingError::new(
                 RoutingErrorKind::Conflict,
@@ -445,7 +544,7 @@ impl RoutingEngine {
                 "immutable OAT run-table owner changed or expired",
             ));
         }
-        assignment_for_lease(&view, lease, now, &self.policy, RouteSource::CachedLease)
+        assignment_for_lease(view, lease, now, &self.policy, RouteSource::CachedLease)
     }
 
     /// Selects a healthy catalog-capable backend for explicit Flight SQL control.

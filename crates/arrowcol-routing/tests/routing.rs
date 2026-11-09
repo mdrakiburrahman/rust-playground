@@ -668,6 +668,130 @@ async fn fresh_oat_router_does_not_replace_a_missing_bound_owner() {
 }
 
 #[tokio::test]
+async fn oat_forwarding_rejects_deadlines_crossed_during_authority_reads() {
+    for boundary in ["pin", "lease", "collector", "pressure"] {
+        let store = Arc::new(MemoryRoutingStore::default());
+        let instance = CollectorInstanceId::new();
+        let mut collector = registration(instance, 5001, 20_000);
+        if boundary == "collector" {
+            collector.lease_expires_at_unix_ms = millis(100_015);
+        }
+        store
+            .register_collector(&collector)
+            .await
+            .unwrap_or_else(|error| panic!("register fixture: {error}"));
+        store
+            .publish_pressure(&snapshot(instance, 99_000, 1_000, 0))
+            .await
+            .unwrap_or_else(|error| panic!("publish fixture pressure: {error}"));
+        let engine_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);
+        let engine = RoutingEngine::new(engine_store, oat_policy(OAT_RUN_EXPIRY))
+            .unwrap_or_else(|error| panic!("create delayed-read OAT engine: {error}"));
+        let pin_expiry = millis(if boundary == "pin" { 100_015 } else { 200_000 });
+        engine
+            .initialize_run_table_pins_with_clock(
+                OAT_RUN_EXPIRY,
+                &[LeaseKey::new(ImplementationPool::Dataflow, table())],
+                pin_expiry,
+                millis(100_001),
+                || Ok(millis(100_001)),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("initialize fixed-clock fixture: {error}"));
+        let selected = engine
+            .route_ingest_for_run(&metadata(), OAT_RUN_EXPIRY, pin_expiry, millis(100_002))
+            .await
+            .unwrap_or_else(|error| panic!("select delayed-read fixture: {error}"));
+        if boundary == "lease" {
+            let mut lease = selected
+                .lease
+                .clone()
+                .unwrap_or_else(|| panic!("selected lease missing"));
+            lease.expires_at_unix_ms = millis(100_015);
+            store
+                .insert_lease(lease)
+                .await
+                .unwrap_or_else(|error| panic!("shorten fixture lease: {error}"));
+        }
+        let (before_expiry, expired) = if boundary == "pressure" {
+            (114_000, 114_001)
+        } else {
+            (100_014, 100_015)
+        };
+        for (after_reads, should_succeed) in [(100_002, false), (before_expiry, true), (expired, false)] {
+            let before = store.operation_counts();
+            let outcome = engine
+                .revalidate_run_assignment_with_clock(OAT_RUN_EXPIRY, &selected, millis(100_003), || {
+                    assert_eq!(
+                        store.operation_counts().load_view,
+                        before.load_view + 1,
+                        "forwarding clock must be sampled after the final awaited view read"
+                    );
+                    Ok(millis(after_reads))
+                })
+                .await;
+            assert_eq!(outcome.is_ok(), should_succeed, "{boundary}: {outcome:?}");
+            let after = store.operation_counts();
+            assert_eq!(after.claim_lease, before.claim_lease);
+            assert_eq!(after.bind_initial_run_table_pin, before.bind_initial_run_table_pin);
+        }
+    }
+}
+
+#[tokio::test]
+async fn oat_forwarding_rechecks_authority_after_upstream_selection() {
+    let (store, _, _) = seeded_store().await;
+    let engine_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);
+    let engine = RoutingEngine::new(engine_store, oat_policy(OAT_RUN_RESTART))
+        .unwrap_or_else(|error| panic!("create OAT engine: {error}"));
+    initialize_memory_oat_pin(&engine, OAT_RUN_RESTART, millis(100_001), millis(200_000)).await;
+    let selected = engine
+        .route_ingest_for_run(&metadata(), OAT_RUN_RESTART, millis(200_000), millis(100_002))
+        .await
+        .unwrap_or_else(|error| panic!("select pinned upstream: {error}"));
+    assert_eq!(
+        engine
+            .revalidate_run_assignment(OAT_RUN_RESTART, &selected, millis(100_003))
+            .await
+            .unwrap_or_else(|error| panic!("revalidate unchanged upstream: {error}")),
+        selected
+    );
+    let before = store.operation_counts();
+    let mut changed_endpoint = selected.clone();
+    changed_endpoint.flight_endpoint.set_port(1);
+    assert!(
+        engine
+            .revalidate_run_assignment(OAT_RUN_RESTART, &changed_endpoint, millis(100_003))
+            .await
+            .is_err()
+    );
+    store.set_available(false);
+    assert!(
+        engine
+            .revalidate_run_assignment(OAT_RUN_RESTART, &selected, millis(100_003))
+            .await
+            .is_err()
+    );
+    store.set_available(true);
+    assert!(
+        store
+            .remove_run_table_pin_for_test(OAT_RUN_RESTART, &LeaseKey::new(ImplementationPool::Dataflow, table()))
+            .await
+    );
+    assert!(
+        engine
+            .revalidate_run_assignment(OAT_RUN_RESTART, &selected, millis(100_003))
+            .await
+            .is_err()
+    );
+    assert_eq!(store.operation_counts().claim_lease, before.claim_lease);
+    assert_eq!(
+        store.operation_counts().bind_initial_run_table_pin,
+        before.bind_initial_run_table_pin
+    );
+}
+
+#[tokio::test]
 async fn fresh_oat_router_rejects_missing_bound_owner_even_with_a_valid_replacement_lease() {
     let (store, first, second) = seeded_store().await;
     let key = LeaseKey::new(ImplementationPool::Dataflow, table());
@@ -861,6 +985,10 @@ async fn oat_pin_fails_closed_when_pinned_collector_process_restarts() {
         .route_ingest_for_run(&metadata(), OAT_RUN_RESTART, millis(200_000), millis(100_003))
         .await;
     assert!(matches!(retry, Err(error) if error.kind() == RoutingErrorKind::Conflict));
+    let forwarded = engine
+        .revalidate_run_assignment(OAT_RUN_RESTART, &initial, millis(100_003))
+        .await;
+    assert!(matches!(forwarded, Err(error) if error.kind() == RoutingErrorKind::Conflict));
 }
 
 #[tokio::test]

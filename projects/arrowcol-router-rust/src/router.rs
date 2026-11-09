@@ -157,6 +157,7 @@ impl ProductionRouter {
                 return Ok(true);
             }
             let pool = metadata.implementation_pool().to_string();
+            let is_oat = run_id.is_some();
             let routed = match run_id {
                 Some(run_id) => {
                     let expires_at = match oat_run_expiry(now, self.routing.policy().oat_run_pin_ttl_ms) {
@@ -179,8 +180,13 @@ impl ProductionRouter {
                     Ok(false)
                 }
                 Err(error) => {
-                    self.metrics.failure("doput", &pool, routing_reason(error.kind()));
-                    write_grpc_error(session, routing_grpc_status(error.kind()), error.message()).await?;
+                    if is_oat {
+                        self.metrics.failure("doput", &pool, "pinning_violation");
+                        write_grpc_error(session, 9, &format!("pinning_violation: {}", error.message())).await?;
+                    } else {
+                        self.metrics.failure("doput", &pool, routing_reason(error.kind()));
+                        write_grpc_error(session, routing_grpc_status(error.kind()), error.message()).await?;
+                    }
                     Ok(true)
                 }
             }
@@ -229,6 +235,53 @@ impl ProductionRouter {
         context.operation = operation;
         context.pool = Some(pool);
         context.stream_counted = true;
+    }
+
+    async fn revalidate_oat_upstream(&self, context: &mut RequestContext) -> pingora::Result<()> {
+        let Some(run_id) = self.routing.policy().oat_run_id.as_deref() else {
+            return Ok(());
+        };
+        let Some(assignment) = context
+            .assignment
+            .as_ref()
+            .filter(|assignment| assignment.lease.is_some())
+        else {
+            return Ok(());
+        };
+        let now = now_unix_millis()
+            .map_err(|cause| Error::because(ErrorType::InternalError, "read OAT forwarding timestamp", cause))?;
+        match self.routing.revalidate_run_assignment(run_id, assignment, now).await {
+            Ok(current) => {
+                context.assignment = Some(current);
+                Ok(())
+            }
+            Err(cause) => {
+                self.metrics.failure(
+                    "doput",
+                    context.pool.as_deref().unwrap_or("unknown"),
+                    "pinning_violation",
+                );
+                context.pinning_error = Some(format!("pinning_violation: {cause}"));
+                Err(Error::explain(ErrorType::InternalError, cause.to_string()))
+            }
+        }
+    }
+
+    fn record_oat_upstream_failure(&self, context: &mut RequestContext) {
+        if self.routing.policy().oat_run_id.is_some()
+            && context
+                .assignment
+                .as_ref()
+                .is_some_and(|assignment| assignment.lease.is_some())
+            && context.pinning_error.is_none()
+        {
+            self.metrics.failure(
+                "doput",
+                context.pool.as_deref().unwrap_or("unknown"),
+                "pinning_violation",
+            );
+            context.pinning_error = Some("pinning_violation: pinned collector became unavailable".to_owned());
+        }
     }
 
     async fn handle_http_api(
@@ -301,6 +354,7 @@ pub struct RequestContext {
     pool: Option<String>,
     is_grpc: bool,
     stream_counted: bool,
+    pinning_error: Option<String>,
 }
 
 #[async_trait]
@@ -322,6 +376,7 @@ impl ProxyHttp for ProductionRouter {
     }
 
     async fn upstream_peer(&self, _session: &mut Session, context: &mut Self::CTX) -> pingora::Result<Box<HttpPeer>> {
+        self.revalidate_oat_upstream(context).await?;
         let assignment = context.assignment.as_ref().ok_or_else(|| {
             Error::explain(
                 ErrorType::InternalError,
@@ -359,6 +414,7 @@ impl ProxyHttp for ProductionRouter {
         upstream_request: &mut RequestHeader,
         context: &mut Self::CTX,
     ) -> pingora::Result<()> {
+        self.revalidate_oat_upstream(context).await?;
         for header in [
             EDGE_TIMESTAMP_HEADER,
             EDGE_NONCE_HEADER,
@@ -416,9 +472,10 @@ impl ProxyHttp for ProductionRouter {
         &self,
         _session: &mut Session,
         _peer: &HttpPeer,
-        _context: &mut Self::CTX,
+        context: &mut Self::CTX,
         mut error: Box<Error>,
     ) -> Box<Error> {
+        self.record_oat_upstream_failure(context);
         error.set_retry(false);
         error
     }
@@ -428,16 +485,23 @@ impl ProxyHttp for ProductionRouter {
         peer: &HttpPeer,
         _session: &mut Session,
         mut error: Box<Error>,
-        _context: &mut Self::CTX,
+        context: &mut Self::CTX,
         _client_reused: bool,
     ) -> Box<Error> {
+        if matches!(error.esource(), ErrorSource::Upstream) {
+            self.record_oat_upstream_failure(context);
+        }
         error.set_retry(false);
         error.more_context(format!("non-retryable streaming request to {peer}"))
     }
 
     async fn fail_to_proxy(&self, session: &mut Session, error: &Error, context: &mut Self::CTX) -> FailToProxy {
         let code = if context.is_grpc && session.response_written().is_none() {
-            if let Err(write_error) = write_grpc_error(session, 14, "upstream collector is unavailable").await {
+            let (grpc_status, message) = context
+                .pinning_error
+                .as_deref()
+                .map_or((14, "upstream collector is unavailable"), |message| (9, message));
+            if let Err(write_error) = write_grpc_error(session, grpc_status, message).await {
                 warn!(error = %write_error, "failed to write canonical gRPC proxy error");
             }
             200
