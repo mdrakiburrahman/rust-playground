@@ -156,7 +156,7 @@ struct AksPlatform {
     runtime_dir: Option<PathBuf>,
     qap_relative_data_root: Option<String>,
     router_metrics_url: Option<String>,
-    router_tunnel: Option<OwnedPortForward>,
+    router_tunnel: Option<OwnedKubectlProcess>,
     fic_record_path: Option<PathBuf>,
     fic_ready_snapshot_path: Option<PathBuf>,
     fic_prepare_attempted: bool,
@@ -169,7 +169,7 @@ struct AksPlatform {
     router_yaml: Option<String>,
 }
 
-struct OwnedPortForward {
+struct OwnedKubectlProcess {
     child: Child,
     stderr: JoinHandle<std::io::Result<Vec<u8>>>,
 }
@@ -3772,7 +3772,7 @@ async fn start_router_metrics_tunnel(config: &OatConfig, platform: &mut AksPlatf
         let mut stderr = stderr;
         stderr.read_to_end(&mut bytes).await.map(|_| bytes)
     });
-    let mut forward = OwnedPortForward { child, stderr };
+    let mut forward = OwnedKubectlProcess { child, stderr };
     let metrics_url = format!("http://127.0.0.1:{port}/metrics");
     let ready_url = format!("http://127.0.0.1:{port}/readyz");
     let client = reqwest::Client::builder()
@@ -3786,7 +3786,7 @@ async fn start_router_metrics_tunnel(config: &OatConfig, platform: &mut AksPlatf
             .try_wait()
             .context("check AKS router port-forward process")?
         {
-            let stderr = collect_port_forward_stderr(forward.stderr).await?;
+            let stderr = collect_kubectl_stderr(forward.stderr).await?;
             bail!(
                 "AKS router port-forward exited before readiness with {status}: {}",
                 String::from_utf8_lossy(&stderr).trim()
@@ -3803,7 +3803,7 @@ async fn start_router_metrics_tunnel(config: &OatConfig, platform: &mut AksPlatf
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
-            let stderr = collect_port_forward_stderr(stop_port_forward(forward).await?).await?;
+            let stderr = collect_kubectl_stderr(stop_kubectl_process(forward).await?).await?;
             bail!(
                 "AKS router metrics tunnel did not become ready within 60 seconds: {}",
                 String::from_utf8_lossy(&stderr).trim()
@@ -3813,31 +3813,174 @@ async fn start_router_metrics_tunnel(config: &OatConfig, platform: &mut AksPlatf
     }
 }
 
-async fn stop_port_forward(mut forward: OwnedPortForward) -> Result<JoinHandle<std::io::Result<Vec<u8>>>> {
+async fn stop_kubectl_process(mut forward: OwnedKubectlProcess) -> Result<JoinHandle<std::io::Result<Vec<u8>>>> {
     if forward
         .child
         .try_wait()
-        .context("check owned AKS router port-forward before stopping")?
+        .context("check owned kubectl process before stopping")?
         .is_none()
     {
-        forward
-            .child
-            .start_kill()
-            .context("stop owned AKS router port-forward")?;
+        forward.child.start_kill().context("stop owned kubectl process")?;
     }
     forward
         .child
         .wait()
         .await
-        .context("wait for owned AKS router port-forward to stop")?;
+        .context("wait for owned kubectl process to stop")?;
     Ok(forward.stderr)
 }
 
-async fn collect_port_forward_stderr(stderr: JoinHandle<std::io::Result<Vec<u8>>>) -> Result<Vec<u8>> {
+async fn collect_kubectl_stderr(stderr: JoinHandle<std::io::Result<Vec<u8>>>) -> Result<Vec<u8>> {
     stderr
         .await
-        .context("join AKS router port-forward diagnostics reader")?
-        .context("read AKS router port-forward diagnostics")
+        .context("join kubectl process diagnostics reader")?
+        .context("read kubectl process diagnostics")
+}
+
+async fn start_kubectl_api_proxy(config: &OatConfig) -> Result<(OwnedKubectlProcess, String)> {
+    let reservation = TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("reserve a local port for the authenticated Kubernetes API proxy")?;
+    let port = reservation
+        .local_addr()
+        .context("read reserved Kubernetes API proxy port")?
+        .port();
+    drop(reservation);
+
+    let port_arg = port.to_string();
+    let mut command = Command::new("kubectl");
+    if let Some(context) = config.kubectl_context.as_deref() {
+        command.args(["--context", context]);
+    }
+    command
+        .args(["proxy", "--address", "127.0.0.1", "--port", &port_arg])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().context("start authenticated Kubernetes API proxy")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("capture Kubernetes API proxy diagnostics")?;
+    let stderr = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        let mut stderr = stderr;
+        stderr.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
+    let mut proxy = OwnedKubectlProcess { child, stderr };
+    let api_url = format!("http://127.0.0.1:{port}");
+    let readiness_url = format!("{api_url}/api");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .no_proxy()
+        .build()
+        .context("build Kubernetes API proxy readiness client")?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+
+    loop {
+        if let Some(status) = proxy.child.try_wait().context("check Kubernetes API proxy process")? {
+            let stderr = collect_kubectl_stderr(proxy.stderr).await?;
+            bail!(
+                "authenticated Kubernetes API proxy exited before readiness with {status}: {}",
+                String::from_utf8_lossy(&stderr).trim()
+            );
+        }
+        if client
+            .get(&readiness_url)
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success())
+        {
+            return Ok((proxy, api_url));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let stderr = collect_kubectl_stderr(stop_kubectl_process(proxy).await?).await?;
+            bail!(
+                "authenticated Kubernetes API proxy did not become ready within 30 seconds: {}",
+                String::from_utf8_lossy(&stderr).trim()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn delete_namespace_with_uid_precondition(api_url: &str, namespace: &str, uid: &str) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .no_proxy()
+        .build()
+        .context("build Kubernetes namespace deletion client")?;
+    let endpoint = format!("{}/api/v1/namespaces/{namespace}", api_url.trim_end_matches('/'));
+    let response = client
+        .delete(endpoint)
+        .json(&serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "DeleteOptions",
+            "preconditions": { "uid": uid }
+        }))
+        .send()
+        .await
+        .context("send UID-preconditioned Kubernetes namespace deletion")?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .context("read Kubernetes namespace deletion failure response")?;
+        bail!(
+            "UID-preconditioned namespace deletion returned HTTP {status}: {}",
+            body.trim()
+        );
+    }
+    Ok(())
+}
+
+async fn delete_run_owned_namespace_with_uid(config: &OatConfig, namespace_uid: &str) -> Result<()> {
+    let (proxy, api_url) = start_kubectl_api_proxy(config).await?;
+    let delete_result = delete_namespace_with_uid_precondition(&api_url, &config.namespace, namespace_uid).await;
+    let stop_result = match stop_kubectl_process(proxy).await {
+        Ok(stderr) => collect_kubectl_stderr(stderr).await.map(|_| ()),
+        Err(error) => Err(error),
+    };
+    match (delete_result, stop_result) {
+        (Err(error), Err(stop_error)) => {
+            Err(error.context(format!("also failed to stop Kubernetes API proxy: {stop_error:#}")))
+        }
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error).context("stop Kubernetes API proxy after namespace deletion request"),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+async fn wait_for_run_owned_namespace_absence(config: &OatConfig) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+    loop {
+        let output = kubectl(
+            config,
+            vec![
+                "get",
+                "namespace",
+                &config.namespace,
+                "--ignore-not-found=true",
+                "-o",
+                "name",
+                "--request-timeout=30s",
+            ],
+            None,
+        )
+        .await
+        .context("confirm run-owned AKS namespace absence after deletion")?;
+        if output.trim().is_empty() {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!(
+                "run-owned AKS namespace still exists after bounded deletion wait: {}",
+                output.trim()
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
 }
 
 fn without_identity_resources(resources: Vec<Value>) -> Vec<Value> {
@@ -4015,9 +4158,9 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
     let mut failures = Vec::new();
     let mut namespace_removed = false;
     if let Some(forward) = platform.router_tunnel.take() {
-        match stop_port_forward(forward).await {
+        match stop_kubectl_process(forward).await {
             Ok(stderr) => {
-                if let Err(error) = collect_port_forward_stderr(stderr).await {
+                if let Err(error) = collect_kubectl_stderr(stderr).await {
                     failures.push(format!(
                         "collect AKS router tunnel diagnostics during cleanup: {error:#}"
                     ));
@@ -4041,55 +4184,21 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
                     NamespaceCleanupAction::Delete => {
                         let namespace_uid = namespace_uid_for_cleanup(&namespace, platform.namespace_uid.as_deref())?;
                         platform.namespace_uid = Some(namespace_uid.clone());
-                        if let Err(error) = kubectl(
-                            config,
-                            vec![
-                                "delete",
-                                "namespace",
-                                &config.namespace,
-                                "--wait=true",
-                                "--timeout=600s",
-                            ],
-                            None,
-                        )
-                        .await
-                        {
-                            failures.push(format!("delete run-owned AKS namespace: {error:#}"));
+                        if let Err(error) = delete_run_owned_namespace_with_uid(config, &namespace_uid).await {
+                            failures.push(format!(
+                                "delete run-owned AKS namespace with UID precondition: {error:#}"
+                            ));
+                        } else if let Err(error) = wait_for_run_owned_namespace_absence(config).await {
+                            failures.push(format!(
+                                "confirm run-owned AKS namespace absence after deletion: {error:#}"
+                            ));
+                        } else if let Err(error) = write_workload_stop_receipt(config, platform, &namespace_uid).await {
+                            failures.push(format!("write exact-run workload stop receipt: {error:#}"));
                         } else {
-                            match kubectl(
-                                config,
-                                vec![
-                                    "get",
-                                    "namespace",
-                                    &config.namespace,
-                                    "--ignore-not-found=true",
-                                    "-o",
-                                    "name",
-                                ],
-                                None,
-                            )
-                            .await
-                            {
-                                Ok(output) if output.trim().is_empty() => {
-                                    if let Err(error) =
-                                        write_workload_stop_receipt(config, platform, &namespace_uid).await
-                                    {
-                                        failures.push(format!("write exact-run workload stop receipt: {error:#}"));
-                                    } else {
-                                        namespace_removed = true;
-                                        platform.namespace_created = false;
-                                        platform.namespace_create_attempted = false;
-                                        platform.namespace_uid = None;
-                                    }
-                                }
-                                Ok(output) => failures.push(format!(
-                                    "run-owned AKS namespace still exists after deletion: {}",
-                                    output.trim()
-                                )),
-                                Err(error) => failures.push(format!(
-                                    "confirm run-owned AKS namespace absence after deletion: {error:#}"
-                                )),
-                            }
+                            namespace_removed = true;
+                            platform.namespace_created = false;
+                            platform.namespace_create_attempted = false;
+                            platform.namespace_uid = None;
                         }
                     }
                     NamespaceCleanupAction::Ignore => {
@@ -5419,6 +5528,74 @@ mod tests {
             NamespaceCleanupAction::Refuse,
             "an ownership change after creation must fail closed"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replacement_namespace_uid_conflict_preserves_replacement() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 2048];
+            let (header_end, content_length) = loop {
+                let read = stream.read(&mut buffer).await?;
+                if read == 0 {
+                    bail!("Kubernetes API test server received an incomplete request");
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .context("namespace delete request must include Content-Length")?;
+                    if request.len() >= header_end + 4 + content_length {
+                        break (header_end, content_length);
+                    }
+                }
+            };
+            let request_line = String::from_utf8_lossy(&request)
+                .lines()
+                .next()
+                .context("namespace delete request must include a request line")?
+                .to_owned();
+            let body_start = header_end + 4;
+            let options: Value = serde_json::from_slice(&request[body_start..body_start + content_length])?;
+            let requested_uid = options
+                .pointer("/preconditions/uid")
+                .and_then(Value::as_str)
+                .context("namespace delete must include a UID precondition")?
+                .to_owned();
+            let replacement_uid = "namespace-uid-b".to_owned();
+            let response_body = r#"{"apiVersion":"v1","kind":"Status","status":"Failure","reason":"Conflict","message":"UID precondition does not match replacement namespace","code":409}"#;
+            let response = format!(
+                "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(response.as_bytes()).await?;
+            Ok::<_, anyhow::Error>((request_line, requested_uid, replacement_uid))
+        });
+
+        let result =
+            delete_namespace_with_uid_precondition(&format!("http://{address}"), "arrowcol-oat-run", "namespace-uid-a")
+                .await;
+        let (request_line, requested_uid, surviving_uid) = server.await??;
+        assert_eq!(request_line, "DELETE /api/v1/namespaces/arrowcol-oat-run HTTP/1.1");
+        assert_eq!(requested_uid, "namespace-uid-a");
+        assert_eq!(surviving_uid, "namespace-uid-b");
+        assert!(
+            result.is_err(),
+            "a UID conflict must fail closed without a success receipt"
+        );
+        assert!(result.unwrap_err().to_string().contains("409 Conflict"));
         Ok(())
     }
 
