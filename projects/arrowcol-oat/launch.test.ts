@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { pathToFileURL } from 'node:url';
-import { launchOat, sendViewerFile, startLocalViewer } from './launch.js';
+import { launchOat, readOatConfigForMode, resolveOatConfigPath, sendViewerFile, startLocalViewer } from './launch.js';
 
 const status = (state: 'queued' | 'running' | 'succeeded') => ({
   id: 'run-a', state, progress: state, result_count: state === 'succeeded' ? 2 : 0, error: null,
@@ -60,6 +60,44 @@ test('allows the executable to select the platform mode without editing the conf
   try {
     await launchOat(configPath, undefined, 1, fetcher, () => {}, 'local');
     assert.deepEqual(posted, { platform: { kind: 'local' } });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('selects a per-mode quick config when no path is supplied', () => {
+  assert.equal(path.basename(resolveOatConfigPath('local')), 'oat-config.quick.json');
+  assert.equal(path.basename(resolveOatConfigPath('aks')), 'oat-config.aks.quick.json');
+  assert.equal(resolveOatConfigPath('aks', 'custom.json'), 'custom.json');
+});
+
+test('fills missing local Docker bridge hosts while preserving explicit values', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'arrowcol-oat-mode-'));
+  const configPath = path.join(directory, 'oat.json');
+  let gatewayCalls = 0;
+  try {
+    await writeFile(configPath, JSON.stringify({
+      platform: { kind: 'aks', local: { bind_host: null, endpoint_host: null } },
+    }));
+    const config = await readOatConfigForMode(configPath, 'local', () => {
+      gatewayCalls += 1;
+      return '172.18.0.1';
+    });
+    const platform = config.platform as { kind: string; local: { bind_host: string; endpoint_host: string } };
+    assert.equal(platform.kind, 'local');
+    assert.equal(platform.local.bind_host, '172.18.0.1');
+    assert.equal(platform.local.endpoint_host, '172.18.0.1');
+    assert.equal(gatewayCalls, 1);
+
+    await writeFile(configPath, JSON.stringify({
+      platform: { kind: 'local', local: { bind_host: '192.0.2.1', endpoint_host: 'oat.example.test' } },
+    }));
+    const explicit = await readOatConfigForMode(configPath, 'local', () => {
+      throw new Error('bridge lookup should not run when both hosts are explicit');
+    });
+    const explicitPlatform = explicit.platform as { local: { bind_host: string; endpoint_host: string } };
+    assert.equal(explicitPlatform.local.bind_host, '192.0.2.1');
+    assert.equal(explicitPlatform.local.endpoint_host, 'oat.example.test');
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
