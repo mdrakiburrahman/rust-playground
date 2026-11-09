@@ -488,7 +488,9 @@ impl ProxyHttp for ProductionRouter {
         context: &mut Self::CTX,
         _client_reused: bool,
     ) -> Box<Error> {
-        self.record_oat_upstream_failure(context);
+        if matches!(error.esource(), ErrorSource::Upstream) {
+            self.record_oat_upstream_failure(context);
+        }
         error.set_retry(false);
         error.more_context(format!("non-retryable streaming request to {peer}"))
     }
