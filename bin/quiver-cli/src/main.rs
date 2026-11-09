@@ -29,7 +29,7 @@ enum Command {
     Segments(inspect::DirArgs),
     /// One bundle's manifest and rows, from a segment or the WAL.
     Show(inspect::ShowArgs),
-    /// WAL entries and the cursor: what is in a segment and what replays on open.
+    /// WAL entries and the cursor: what is checkpointed and what replays on open.
     Wal(inspect::WalArgs),
     /// Acknowledge bundles like the Delta publisher; fully acknowledged segments are deleted.
     Consume(lifecycle::ConsumeArgs),

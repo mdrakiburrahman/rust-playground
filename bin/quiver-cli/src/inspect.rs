@@ -167,7 +167,7 @@ pub(crate) fn tree(args: &DirArgs) -> Result<()> {
             file_size(&subscriber.path),
             if segment_bundles == 0 {
                 format!(
-                    "progress of subscriber {}: nothing pending, acknowledged segments are deleted",
+                    "progress of subscriber {}: no readable segment bundles",
                     subscriber.name
                 )
             } else {
@@ -211,12 +211,12 @@ pub(crate) fn tree(args: &DirArgs) -> Result<()> {
         let replayable = wal.unconsumed().count();
         let meaning = if replayable == 0 {
             format!(
-                "cursor at {}: every entry is in a segment, nothing to replay",
+                "cursor at {}: every entry is checkpointed, nothing to replay",
                 format::count(cursor)
             )
         } else {
             format!(
-                "cursor at {}: {replayable} entries after it are WAL-only and replay on next open",
+                "cursor at {}: {replayable} uncheckpointed entries replay on next open",
                 format::count(cursor)
             )
         };
@@ -293,7 +293,7 @@ pub(crate) fn segments(args: &DirArgs) -> Result<()> {
         format::count(rows)
     );
     if segments.is_empty() {
-        println!("  none yet: bundles are still in the open segment, which only the WAL holds");
+        println!("  no readable finalized segments found; inspect WAL for replay status");
         return Ok(());
     }
     println!();
@@ -470,7 +470,7 @@ fn project(batch: &RecordBatch, columns: &[String]) -> Result<RecordBatch> {
 
 fn state(entry: &WalEntry) -> &'static str {
     if entry.consumed {
-        "in a segment"
+        "checkpointed: not replayed"
     } else {
         "WAL only: replays on next open"
     }
@@ -514,14 +514,14 @@ fn print_wal(dir: &Path, wal: &WalInspection, last: usize) -> Result<()> {
     println!();
     match wal.cursor_position {
         Some(cursor) => println!(
-            "  cursor at {}: entries before it are in segments; entries after it replay on next open",
+            "  cursor at {}: entries ending at or before it are checkpointed and skipped during replay; later entries replay on next open",
             format::count(cursor)
         ),
-        None => println!("  no cursor yet: no segment was finalized, so every entry replays on next open"),
+        None => println!("  no cursor: every entry replays on next open"),
     }
     let replayable = wal.unconsumed().count();
     println!(
-        "  {} in segments, {replayable} WAL only",
+        "  {} checkpointed, {replayable} WAL only",
         wal.entries.len() - replayable
     );
     println!();

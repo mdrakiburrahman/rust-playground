@@ -38,7 +38,7 @@ validation; it is not a production reset or an unrestricted purge command.
 | Path under the run's `dataflow-state-1/quiver/core_N/` | Purpose |
 | --- | --- |
 | `wal/quiver.wal`, rotated WAL files | Append-only persisted bundles |
-| `wal/quiver.wal.cursor` | Position already represented in finalized segments |
+| `wal/quiver.wal.cursor` | Checkpoint: WAL entries ending at or before this position are skipped on replay |
 | `segments/*.qseg` | Finalized Arrow data and bundle metadata available downstream |
 | `quiver.sub.durable-buffer` | Internal subscriber progress |
 
@@ -74,8 +74,8 @@ before its upstream acknowledgement. The native processor's default interval
 is 25 ms, which can leave acknowledged WAL appends vulnerable to a crash before
 fsync. Do not generalize the loadtest's zero-interval guarantee to other configs.
 
-On reopening preserved storage, Quiver recovers WAL entries not yet represented
-in finalized segments. DFE replays retained bundles downstream and maintains
+On reopening preserved storage, Quiver recovers WAL entries not yet checkpointed
+by the persisted cursor. DFE replays retained bundles downstream and maintains
 internal subscriber progress. A restart must preserve the state volume, original
 publication identity, ingestion timestamp, and cloud reset generation; replay
 must not bypass current routing/publication fences.
