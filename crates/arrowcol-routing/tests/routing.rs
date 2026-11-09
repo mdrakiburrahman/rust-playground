@@ -407,17 +407,6 @@ async fn trusted_oat_initializer_binds_multiple_tables_to_one_eligible_collector
 #[tokio::test]
 async fn trusted_oat_initializer_skips_occupied_preferred_collector_in_distinct_mode() {
     let (store, _, _) = seeded_store().await;
-    let ordinary_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);
-    let ordinary = RoutingEngine::new(ordinary_store, RoutingPolicy::default())
-        .unwrap_or_else(|error| panic!("create ordinary setup engine: {error}"));
-    ordinary
-        .refresh(millis(100_000))
-        .await
-        .unwrap_or_else(|error| panic!("refresh ordinary setup engine: {error}"));
-    let occupied = ordinary
-        .route_ingest(&metadata_for("occupied"), millis(100_001))
-        .await
-        .unwrap_or_else(|error| panic!("lease preferred collector for another table: {error}"));
     let expected_key = LeaseKey::new(ImplementationPool::Dataflow, table());
     let policy = RoutingPolicy {
         distinct_table_owners: true,
@@ -427,11 +416,29 @@ async fn trusted_oat_initializer_skips_occupied_preferred_collector_in_distinct_
         .load_view(millis(100_001))
         .await
         .unwrap_or_else(|error| panic!("load candidate-selection fixture: {error}"));
-    let preferred = rank_collectors(&view, &expected_key, millis(100_001), &policy, false)
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| panic!("fixture has no eligible preferred collector"));
-    assert_eq!(preferred, occupied.instance_id);
+    let ranked = rank_collectors(&view, &expected_key, millis(100_001), &policy, false);
+    assert_eq!(ranked.len(), 2);
+    let preferred = ranked[0];
+    let occupied = store
+        .claim_lease(&LeaseClaim {
+            key: LeaseKey::new(ImplementationPool::Dataflow, table_named("occupied")),
+            candidate_instance_id: preferred,
+            now_unix_ms: millis(100_001),
+            expires_at_unix_ms: millis(130_001),
+            minimum_snapshot_at_unix_ms: millis(99_000),
+            distinct_table_owners: true,
+        })
+        .await
+        .unwrap_or_else(|error| panic!("occupy the expected table's actual preferred collector: {error}"));
+    assert_eq!(preferred, occupied.holder_instance_id);
+    let occupied_view = store
+        .load_view(millis(100_002))
+        .await
+        .unwrap_or_else(|error| panic!("load occupied candidate fixture: {error}"));
+    assert_eq!(
+        rank_collectors(&occupied_view, &expected_key, millis(100_002), &policy, false),
+        ranked
+    );
 
     let setup_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);
     let setup = RoutingEngine::new(setup_store, policy)
@@ -450,7 +457,8 @@ async fn trusted_oat_initializer_skips_occupied_preferred_collector_in_distinct_
         .await
         .unwrap_or_else(|error| panic!("select free alternative collector for OAT pin: {error}"));
     assert_eq!(pins.len(), 1);
-    assert_ne!(pins[0].holder_instance_id, occupied.instance_id);
+    assert_ne!(pins[0].holder_instance_id, occupied.holder_instance_id);
+    assert_eq!(pins[0].holder_instance_id, ranked[1]);
 }
 
 #[tokio::test]
@@ -959,21 +967,25 @@ async fn oat_pin_rejects_unconfigured_run_ids_before_creating_a_pin() {
         .refresh(millis(100_000))
         .await
         .unwrap_or_else(|error| panic!("initial refresh: {error}"));
+    let before = store.operation_counts();
     let route = engine
         .route_ingest_for_run(&metadata(), OAT_RUN_UNAUTHORIZED, millis(200_000), millis(100_001))
         .await;
     assert!(matches!(route, Err(error) if error.kind() == RoutingErrorKind::InvalidConfiguration));
-    assert!(
-        store
-            .get_run_table_pin(
-                OAT_RUN_UNAUTHORIZED,
-                &LeaseKey::new(ImplementationPool::Dataflow, table()),
-                millis(100_002),
-            )
-            .await
-            .unwrap_or_else(|error| panic!("check rejected pin: {error}"))
-            .is_none()
-    );
+    assert_eq!(store.operation_counts(), before);
+    let rejected_pin = store
+        .get_run_table_pin(
+            OAT_RUN_UNAUTHORIZED,
+            &LeaseKey::new(ImplementationPool::Dataflow, table()),
+            millis(100_002),
+        )
+        .await;
+    assert!(matches!(rejected_pin, Err(error) if error.kind() == RoutingErrorKind::Conflict));
+    let view = store
+        .load_view(millis(100_002))
+        .await
+        .unwrap_or_else(|error| panic!("check rejected run created no lease: {error}"));
+    assert!(view.leases.is_empty());
 }
 
 #[tokio::test]
@@ -1492,6 +1504,36 @@ fn pressure_validation_rejects_duplicate_tables_and_future_observations() {
 const RESTARTED_KEY: &str = "loadtest-dataflow-1";
 /// Production-like lease duration that outlives the crashed registration.
 const LONG_LEASE_TTL_MS: u64 = 86_400_000;
+
+#[test]
+fn ordinary_long_leases_do_not_require_an_oat_pin_lifetime() {
+    let mut policy = RoutingPolicy {
+        lease_ttl_ms: LONG_LEASE_TTL_MS,
+        ..RoutingPolicy::default()
+    };
+    assert!(policy.oat_run_id.is_none());
+    assert!(policy.oat_run_pin_ttl_ms < policy.lease_ttl_ms);
+    assert!(policy.validate().is_ok());
+
+    policy.oat_run_id = Some(OAT_RUN_CONCURRENT.to_owned());
+    assert!(matches!(
+        policy.validate(),
+        Err(error) if error.kind() == RoutingErrorKind::InvalidConfiguration
+    ));
+    policy.oat_run_pin_ttl_ms = LONG_LEASE_TTL_MS;
+    assert!(policy.validate().is_ok());
+
+    for run_id in [None, Some(OAT_RUN_CONCURRENT.to_owned())] {
+        policy.oat_run_id = run_id;
+        for invalid_ttl in [0, LONG_LEASE_TTL_MS + 1] {
+            policy.oat_run_pin_ttl_ms = invalid_ttl;
+            assert!(matches!(
+                policy.validate(),
+                Err(error) if error.kind() == RoutingErrorKind::InvalidConfiguration
+            ));
+        }
+    }
+}
 
 fn keyed_registration(
     instance_id: CollectorInstanceId,

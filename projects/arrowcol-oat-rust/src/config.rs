@@ -527,8 +527,48 @@ fn validate_storage_url(value: &str, field: &str, expected_container: &str, allo
 mod tests {
     use super::*;
 
-    fn valid() -> OatConfig {
-        OatConfig {
+    struct TestConfig {
+        config: OatConfig,
+        directory: std::path::PathBuf,
+    }
+
+    impl std::ops::Deref for TestConfig {
+        type Target = OatConfig;
+
+        fn deref(&self) -> &Self::Target {
+            &self.config
+        }
+    }
+
+    impl std::ops::DerefMut for TestConfig {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.config
+        }
+    }
+
+    impl Drop for TestConfig {
+        fn drop(&mut self) {
+            if let Err(error) = std::fs::remove_dir_all(&self.directory) {
+                eprintln!(
+                    "remove isolated OAT config fixture {}: {error}",
+                    self.directory.display()
+                );
+                assert!(std::thread::panicking(), "OAT config fixture cleanup failed");
+            }
+        }
+    }
+
+    fn valid() -> TestConfig {
+        let directory = std::env::temp_dir().join(format!("arrowcol-oat-config-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory)
+            .unwrap_or_else(|error| panic!("create isolated OAT config fixture {}: {error}", directory.display()));
+        let runtime_config = directory.join("runtime.json");
+        let bootstrap_env = directory.join("bootstrap.env");
+        for path in [&runtime_config, &bootstrap_env] {
+            std::fs::write(path, "")
+                .unwrap_or_else(|error| panic!("write isolated OAT config fixture {}: {error}", path.display()));
+        }
+        let config = OatConfig {
             platform: PlatformConfig {
                 kind: OatMode::Aks,
                 compose_file: None,
@@ -536,8 +576,8 @@ mod tests {
                 compose_project: None,
                 compose_state_root: None,
                 kustomize_overlay: None,
-                runtime_config_file: Some("projects/arrowcol-oat/runtime.ts".to_owned()),
-                bootstrap_env_file: Some("projects/arrowcol-oat/runtime.test.ts".to_owned()),
+                runtime_config_file: Some(runtime_config.to_string_lossy().into_owned()),
+                bootstrap_env_file: Some(bootstrap_env.to_string_lossy().into_owned()),
             },
             stamp: Some("00000".to_owned()),
             warmup_seconds: 30,
@@ -573,7 +613,8 @@ mod tests {
             dfe_worker_concurrency: vec![2, 4],
             result_url: "abfss://experiments@account.dfs.core.windows.net/arrowcol-oat/results.parquet".to_owned(),
             website_url: "abfss://$web@account.dfs.core.windows.net/results.parquet".to_owned(),
-        }
+        };
+        TestConfig { config, directory }
     }
 
     #[test]
@@ -652,6 +693,7 @@ mod tests {
     fn allows_one_to_sixteen_replica_cases_and_tables() -> Result<()> {
         let mut config = valid();
         config.replica_counts = (1..=16).collect();
+        config.dfe_worker_concurrency.truncate(1);
         config.tables.truncate(1);
         config.validate()
     }
@@ -671,6 +713,7 @@ mod tests {
         };
         config.result_url = "file:///tmp/arrowcol-oat/results.parquet".to_owned();
         config.website_url = "file:///tmp/arrowcol-oat/site/results.parquet".to_owned();
+        config.qap_database = None;
         config.validate()
     }
 
@@ -689,6 +732,7 @@ mod tests {
         };
         config.result_url = "file:///tmp/arrowcol-oat/results.parquet".to_owned();
         config.website_url = "abfss://$web@account.dfs.core.windows.net/results.parquet".to_owned();
+        config.qap_database = Some("loadtest".to_owned());
         config.validate()
     }
 
@@ -698,16 +742,77 @@ mod tests {
         config.platform.kustomize_overlay = Some(String::new());
         assert!(config.validate().is_err());
 
-        config.platform.kustomize_overlay = Some(".".to_owned());
+        config.platform.kustomize_overlay = Some(config.directory.to_string_lossy().into_owned());
         config.validate()?;
 
         config.platform.kind = OatMode::Local;
+        config.platform.runtime_config_file = None;
+        config.platform.bootstrap_env_file = None;
+        config.qap_database = None;
         config.platform.compose_file = Some("projects/loadtest/compose.yaml".to_owned());
         config.platform.compose_override_file = Some("projects/loadtest/compose.oat.yaml".to_owned());
         config.platform.compose_project = Some("oat-test-run".to_owned());
         config.platform.compose_state_root = Some("out/arrowcol-oat/local".to_owned());
         assert!(config.validate().is_err());
         Ok(())
+    }
+
+    #[test]
+    fn aks_fixture_files_are_isolated_and_missing_files_are_rejected() -> Result<()> {
+        let mut first = valid();
+        let second = valid();
+        assert_ne!(first.directory, second.directory);
+        first.validate()?;
+        second.validate()?;
+        for field in ["runtime_config_file", "bootstrap_env_file"] {
+            let original = match field {
+                "runtime_config_file" => first.platform.runtime_config_file.clone(),
+                _ => first.platform.bootstrap_env_file.clone(),
+            };
+            let missing = Some(first.directory.join("missing").to_string_lossy().into_owned());
+            match field {
+                "runtime_config_file" => first.platform.runtime_config_file = missing,
+                _ => first.platform.bootstrap_env_file = missing,
+            }
+            let error = first
+                .validate()
+                .err()
+                .context("AKS validation accepted a missing fixture file")?;
+            assert!(error.to_string().contains(field));
+            match field {
+                "runtime_config_file" => first.platform.runtime_config_file = original,
+                _ => first.platform.bootstrap_env_file = original,
+            }
+        }
+        first.validate()?;
+        second.validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn local_mode_rejects_a_nonisolated_qap_database() -> Result<()> {
+        let mut config = valid();
+        config.platform = PlatformConfig {
+            kind: OatMode::Local,
+            compose_file: Some("projects/loadtest/compose.yaml".to_owned()),
+            compose_override_file: Some("projects/loadtest/compose.oat.yaml".to_owned()),
+            compose_project: Some("oat-test-run".to_owned()),
+            compose_state_root: Some("out/arrowcol-oat/local".to_owned()),
+            kustomize_overlay: None,
+            runtime_config_file: None,
+            bootstrap_env_file: None,
+        };
+        config.result_url = "file:///tmp/arrowcol-oat/results.parquet".to_owned();
+        config.website_url = "file:///tmp/arrowcol-oat/site/results.parquet".to_owned();
+        let error = config
+            .validate()
+            .err()
+            .context("local validation accepted the AKS QAP database")?;
+        assert!(error.to_string().contains("isolated loadtest Kusto database"));
+        config.qap_database = None;
+        config.validate()?;
+        config.qap_database = Some("loadtest".to_owned());
+        config.validate()
     }
 
     #[test]

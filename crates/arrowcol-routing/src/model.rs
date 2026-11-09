@@ -522,6 +522,7 @@ pub struct RoutingPolicy {
     /// New lease duration.
     pub lease_ttl_ms: u64,
     /// Maximum lifetime of an immutable OAT run/table owner binding.
+    /// Must cover the lease duration when an OAT run is configured.
     pub oat_run_pin_ttl_ms: u64,
     /// Maximum cached-view age for readiness.
     pub readiness_max_staleness_ms: u64,
@@ -562,7 +563,8 @@ impl RoutingPolicy {
             || self.pressure.max_snapshot_age_ms == 0
             || self.pressure.max_table_entries == 0
             || self.lease_ttl_ms == 0
-            || self.oat_run_pin_ttl_ms < self.lease_ttl_ms
+            || self.oat_run_pin_ttl_ms == 0
+            || (self.oat_run_id.is_some() && self.oat_run_pin_ttl_ms < self.lease_ttl_ms)
             || self.oat_run_pin_ttl_ms > 86_400_000
             || self.readiness_max_staleness_ms == 0
             || self

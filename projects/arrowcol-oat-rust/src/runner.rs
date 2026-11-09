@@ -3337,18 +3337,28 @@ fn run_delta_root(shared_root: &str, run_id: &str) -> Result<String> {
 }
 
 fn qap_relative_data_root(run_root: &str) -> Result<String> {
-    let root = Url::parse(run_root).context("parse run-scoped ArrowCol data root")?;
-    if root.scheme() != "abfss" || root.query().is_some() || root.fragment().is_some() {
-        bail!("run-scoped ArrowCol data root must be a plain abfss URL");
-    }
-    let path = root.path().trim_start_matches('/');
+    let path = run_root
+        .split_once("://")
+        .and_then(|(_, authority_and_path)| authority_and_path.split_once('/'))
+        .map(|(_, path)| path)
+        .context("run-scoped ArrowCol data root must include a path")?;
     if path.is_empty()
         || path
             .split('/')
             .any(|segment| segment.is_empty() || matches!(segment, "." | "..") || segment.contains('\\'))
         || path.contains('%')
+        || path
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
     {
         bail!("run-scoped ArrowCol data root contains an unsafe path component");
+    }
+    let root = Url::parse(run_root).context("parse run-scoped ArrowCol data root")?;
+    if root.scheme() != "abfss" || root.query().is_some() || root.fragment().is_some() {
+        bail!("run-scoped ArrowCol data root must be a plain abfss URL");
+    }
+    if root.path().strip_prefix('/') != Some(path) {
+        bail!("run-scoped ArrowCol data root must preserve its literal path");
     }
     Ok(path.to_owned())
 }
@@ -5138,6 +5148,39 @@ mod tests {
                 .is_err()
         );
         assert!(aks_qap_relative_path("oat-prefix/runs/run/dataflow", "../other-table").is_err());
+    }
+
+    #[test]
+    fn qap_data_root_rejects_literal_and_encoded_path_normalization() -> Result<()> {
+        let authority = "abfss://data@account.dfs.core.windows.net";
+        for path in [
+            "/oat-prefix/runs/./dataflow",
+            "/oat-prefix/runs/../dataflow",
+            "/oat-prefix/runs/%2e/dataflow",
+            "/oat-prefix/runs/%2E%2e/dataflow",
+            "/oat-prefix/runs/.%2e/dataflow",
+            "/oat-prefix/runs/%2e./dataflow",
+            "/oat-prefix/runs/%2f/dataflow",
+            "/oat-prefix/runs\\..\\dataflow",
+            "//oat-prefix/runs/dataflow",
+            "/oat-prefix//runs/dataflow",
+            "/oat-prefix/runs/dataflow/",
+            "/oat-prefix/runs/\t../dataflow",
+            "/oat-prefix/runs/\n../dataflow",
+            "/oat-prefix/runs/ dataflow",
+        ] {
+            assert!(
+                qap_relative_data_root(&format!("{authority}{path}")).is_err(),
+                "unsafe literal path was accepted: {path:?}"
+            );
+        }
+        for path in ["/oat-prefix/runs/run/dataflow", "/dataflow"] {
+            assert_eq!(
+                qap_relative_data_root(&format!("{authority}{path}"))?,
+                path.strip_prefix('/').context("test path must be absolute")?
+            );
+        }
+        Ok(())
     }
 
     #[test]
