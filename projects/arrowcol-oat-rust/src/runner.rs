@@ -936,7 +936,7 @@ fn local_owner_ids(_workspace: &Path) -> Result<(String, String)> {
 fn random_secret() -> String {
     format!(
         "Aa1!{}",
-        (0..4)
+        (0..3)
             .map(|_| uuid::Uuid::new_v4().simple().to_string())
             .collect::<String>()
     )
@@ -5232,6 +5232,17 @@ fn platform_host_label(kind: crate::config::OatMode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_credentials_fit_sql_server_password_limits() {
+        let secret = random_secret();
+        assert!((32..=128).contains(&secret.len()));
+        assert!(secret.bytes().all(|byte| byte.is_ascii_graphic()));
+        assert!(secret.bytes().any(|byte| byte.is_ascii_uppercase()));
+        assert!(secret.bytes().any(|byte| byte.is_ascii_lowercase()));
+        assert!(secret.bytes().any(|byte| byte.is_ascii_digit()));
+        assert!(secret.bytes().any(|byte| byte.is_ascii_punctuation()));
+    }
 
     #[test]
     fn snapshot_stop_keeps_writer_dependencies_alive_and_rejects_uncertain_custody() -> Result<()> {
