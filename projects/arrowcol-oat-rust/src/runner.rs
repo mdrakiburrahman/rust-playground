@@ -3436,6 +3436,17 @@ fn namespace_cleanup_action(namespace_created: bool, namespace_matches: bool) ->
     }
 }
 
+fn namespace_uid_for_cleanup(namespace: &Value, expected_uid: Option<&str>) -> Result<String> {
+    let uid = namespace
+        .pointer("/metadata/uid")
+        .and_then(Value::as_str)
+        .context("run-owned AKS namespace UID is missing before deletion")?;
+    if expected_uid.is_some_and(|expected| expected != uid) {
+        bail!("run-owned AKS namespace UID changed before deletion");
+    }
+    Ok(uid.to_owned())
+}
+
 async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) -> Result<()> {
     let parent = std::env::temp_dir().join("arrowcol-oat");
     tokio::fs::create_dir_all(&parent)
@@ -4028,10 +4039,8 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
                 );
                 match namespace_cleanup_action(platform.namespace_created, ours) {
                     NamespaceCleanupAction::Delete => {
-                        let namespace_uid = platform
-                            .namespace_uid
-                            .clone()
-                            .context("run-owned AKS namespace UID is missing before deletion")?;
+                        let namespace_uid = namespace_uid_for_cleanup(&namespace, platform.namespace_uid.as_deref())?;
+                        platform.namespace_uid = Some(namespace_uid.clone());
                         if let Err(error) = kubectl(
                             config,
                             vec![
@@ -5396,6 +5405,15 @@ mod tests {
             NamespaceCleanupAction::Ignore,
             "an ambiguous create must not delete an existing namespace with another owner token"
         );
+        assert_eq!(
+            namespace_uid_for_cleanup(&empty_run_namespace, None)?,
+            "namespace-uid-a"
+        );
+        assert_eq!(
+            namespace_uid_for_cleanup(&empty_run_namespace, Some("namespace-uid-a"))?,
+            "namespace-uid-a"
+        );
+        assert!(namespace_uid_for_cleanup(&empty_run_namespace, Some("namespace-uid-b")).is_err());
         assert_eq!(
             namespace_cleanup_action(true, false),
             NamespaceCleanupAction::Refuse,
