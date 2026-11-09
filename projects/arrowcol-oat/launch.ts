@@ -4,6 +4,7 @@ import { readFile, realpath, stat } from 'node:fs/promises';
 import { createServer as createTcpServer } from 'node:net';
 import { extname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { run_tree } from '../../infra/azure/bootstrap.js';
 
 export interface OatRunStatus {
   id: string;
@@ -100,7 +101,7 @@ async function readStatus(response: Response, action: string): Promise<OatRunSta
   return body as OatRunStatus;
 }
 
-export async function main(args: string[]): Promise<void> {
+export async function main(args: string[], runner: typeof run_tree = run_tree): Promise<void> {
   const option = (name: string): string | undefined => {
     const index = args.indexOf(name);
     if (index < 0) return undefined;
@@ -138,7 +139,7 @@ export async function main(args: string[]): Promise<void> {
     return;
   }
 
-  const server = await startLocalServer();
+  const server = await startLocalServer(runner);
   let status: OatRunStatus;
   try {
     status = await launchOat(configPath, server.url, pollValue, fetch, undefined, mode);
@@ -313,14 +314,60 @@ export async function sendViewerFile(
   response.end(request.method === 'HEAD' ? undefined : body);
 }
 
-async function startLocalServer(): Promise<{ child: ChildProcess; url: string }> {
+export async function buildOwnedServer(
+  workspace: string,
+  runner: typeof run_tree = run_tree,
+): Promise<{ executable: string; gitSha: string }> {
+  const root = await realpath(workspace);
+  const run = async (command: string[]): Promise<string> => {
+    const result = await runner(command, command[0] === 'cargo' ? 600 : 15, root);
+    if (result.returncode) throw new Error(`OAT ${command[0]} failed: ${result.stderr.trim()}`);
+    if (command[0] === 'cargo' && result.stderr) process.stderr.write(result.stderr);
+    return result.stdout;
+  };
+  const source = async () => ({
+    sha: (await run(['git', 'rev-parse', '--verify', 'HEAD'])).trim(),
+    status: await run(['git', 'status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none']),
+  });
+  const before = await source();
+  if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(before.sha)) {
+    throw new Error('Git did not return a full OAT source commit');
+  }
+  const output = await run([
+    'cargo', 'build', '--locked', '--package', 'arrowcol-oat-rust',
+    '--bin', 'arrowcol-oat-rust', '--message-format=json-render-diagnostics',
+  ]);
+  const after = await source();
+  if (before.sha !== after.sha || before.status !== after.status) {
+    throw new Error('OAT source changed during the build; refusing to start an ambiguously attributed server');
+  }
+  const executables: string[] = [];
+  for (const line of output.split('\n').filter((line) => line.trim())) {
+    const message: unknown = JSON.parse(line);
+    if (!message || typeof message !== 'object' ||
+        !('reason' in message) || message.reason !== 'compiler-artifact' ||
+        !('manifest_path' in message) ||
+        message.manifest_path !== resolve(root, 'projects/arrowcol-oat-rust/Cargo.toml') ||
+        !('target' in message) || !message.target || typeof message.target !== 'object' ||
+        !('name' in message.target) || message.target.name !== 'arrowcol-oat-rust' ||
+        !('kind' in message.target) || !Array.isArray(message.target.kind) || !message.target.kind.includes('bin') ||
+        !('executable' in message) || typeof message.executable !== 'string' || !isAbsolute(message.executable)) continue;
+    executables.push(message.executable);
+  }
+  if (executables.length !== 1) throw new Error('Cargo did not identify exactly one built OAT server executable');
+  const gitSha = before.status.trim() ? 'unknown' : before.sha;
+  if (gitSha === 'unknown') console.warn('OAT source has uncommitted changes; result git_sha will remain unknown.');
+  return { executable: await realpath(executables[0]!), gitSha };
+}
+
+export async function startLocalServer(runner: typeof run_tree = run_tree): Promise<{ child: ChildProcess; url: string }> {
+  const workspace = resolve(fileURLToPath(new URL('../..', import.meta.url)));
+  const build = await buildOwnedServer(workspace, runner);
   const port = await availablePort();
   const url = `http://127.0.0.1:${port}`;
-  const workspace = resolve(fileURLToPath(new URL('../..', import.meta.url)));
-  const child = spawn('cargo', [
-    'run', '--locked', '--package', 'arrowcol-oat-rust', '--',
-    '--listen', `127.0.0.1:${port}`,
-  ], { cwd: workspace, stdio: 'inherit' });
+  const child = spawn(build.executable, ['--listen', `127.0.0.1:${port}`], {
+    cwd: workspace, stdio: 'inherit', env: { ...process.env, GIT_SHA: build.gitSha },
+  });
   let exit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
   let spawnError: Error | undefined;
   child.once('exit', (code, signal) => { exit = { code, signal }; });
@@ -357,7 +404,7 @@ async function availablePort(): Promise<number> {
   return port;
 }
 
-async function stopLocalServer(child: ChildProcess): Promise<void> {
+export async function stopLocalServer(child: ChildProcess): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return;
   const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()));
   child.kill('SIGTERM');
