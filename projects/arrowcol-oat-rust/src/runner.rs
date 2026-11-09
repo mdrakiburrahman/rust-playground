@@ -182,6 +182,7 @@ struct LocalPlatform {
     client_progress: std::sync::Mutex<HashMap<String, ClientProgress>>,
     router_metrics_url: Option<String>,
     qap_url: Option<String>,
+    daemon_endpoint: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -407,6 +408,7 @@ impl Platform for LocalPlatform {
     }
 
     async fn ensure_stack(&mut self, config: &OatConfig) -> Result<()> {
+        self.daemon_endpoint = Some(local_docker_daemon().await?);
         prepare_local_platform(config, self).await?;
         self.router_metrics_url = Some(local_compose_endpoint(config, self, "router", "50050", "/metrics").await?);
         self.qap_url = Some(local_compose_endpoint(config, self, "kusto", "8080", "").await?);
@@ -531,6 +533,14 @@ impl LocalPlatform {
             .as_deref()
             .context("local compose state root is missing")?;
         let state_dir = std::env::current_dir()?.join(state_root).join(run_id);
+        crate::local::absolute_directory(&state_dir)?;
+        if let Some(destination) = &config.platform.local.snapshot_root {
+            let destination = Path::new(destination);
+            crate::local::absolute_directory(destination)?;
+            if destination.starts_with(&state_dir) || state_dir.starts_with(destination) {
+                bail!("snapshot destination must be separate from generated state");
+            }
+        }
         if state_dir.exists() {
             bail!(
                 "run-scoped local OAT state directory already exists: {}",
@@ -560,6 +570,7 @@ impl LocalPlatform {
             client_progress: std::sync::Mutex::new(HashMap::new()),
             router_metrics_url: None,
             qap_url: None,
+            daemon_endpoint: None,
         })
     }
 
@@ -619,6 +630,16 @@ fn prepare_local_state(config: &OatConfig, state_dir: &Path, run_id: &str) -> Re
         ("GRAFANA_PORT".to_owned(), "0".to_owned()),
         ("LOADTEST_ROUTER_PORT".to_owned(), "0".to_owned()),
         ("KUSTO_PORT".to_owned(), "0".to_owned()),
+        ("LOADTEST_DATAFLOW_DELTA_ROOT".to_owned(), "/delta/dataflow".to_owned()),
+        ("LOADTEST_TRACES_ENDPOINT".to_owned(), "http://lgtm:4318".to_owned()),
+        (
+            "LOADTEST_BIND_HOST".to_owned(),
+            match config.platform.local.bind_host {
+                Some(std::net::IpAddr::V6(host)) => format!("[{host}]"),
+                Some(host) => host.to_string(),
+                None => "127.0.0.1".to_owned(),
+            },
+        ),
     ]);
     environment.extend(local_control_mount_environment(state_dir));
     for (variable, name) in secret_paths {
@@ -915,7 +936,7 @@ fn local_owner_ids(_workspace: &Path) -> Result<(String, String)> {
 fn random_secret() -> String {
     format!(
         "Aa1!{}",
-        (0..4)
+        (0..3)
             .map(|_| uuid::Uuid::new_v4().simple().to_string())
             .collect::<String>()
     )
@@ -2337,6 +2358,9 @@ fn validate_client_measurement_interval(
     if report.measurement_window_start_unix_ms != expected_start_unix_ms
         || report.measurement_window_end_unix_ms != expected_end_unix_ms
         || report.measurement_started_unix_ms.abs_diff(expected_start_unix_ms) > 250
+        || (report.duration_seconds - expected_end_unix_ms.saturating_sub(expected_start_unix_ms) as f64 / 1_000.0)
+            .abs()
+            > 0.0005
     {
         bail!("client did not cover the shared measurement interval");
     }
@@ -2541,7 +2565,7 @@ fn scoped_compose_project(base: &str, run_id: &str) -> String {
 
 fn compose_command(compose_file: &str, override_file: Option<&str>, project: &str, profile: &str) -> Command {
     let mut command = Command::new("docker");
-    command.args(["compose", "--file", compose_file]);
+    command.args(["compose", "--env-file", "/dev/null", "--file", compose_file]);
     if let Some(override_file) = override_file {
         command.args(["--file", override_file]);
     }
@@ -2922,6 +2946,7 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
     platform.add_compose_environment(&mut build_client);
     build_client.args(["build", "oat-client"]);
     run_command(build_client, "build OAT client container").await?;
+    verify_local_bind_mount(config, platform).await?;
 
     let mut up = compose_command(
         compose_file,
@@ -3048,20 +3073,336 @@ async fn local_compose_endpoint(
     command.args(["port", service, container_port]);
     let output = run_command(command, &format!("discover local {service} endpoint")).await?;
     let binding = String::from_utf8(output.stdout)?;
-    let port = binding
+    let binding = binding
         .lines()
         .next()
-        .and_then(|binding| binding.rsplit(':').next())
-        .context("Compose returned no published port")?
-        .parse::<u16>()
-        .context("Compose returned an invalid published port")?;
-    if port == 0 {
-        bail!("Compose returned port zero for local {service}");
+        .context("Compose returned no published binding")?;
+    let endpoint = crate::local::published_endpoint(
+        binding,
+        config.platform.local.endpoint_host.as_deref(),
+        platform
+            .daemon_endpoint
+            .as_deref()
+            .context("Docker daemon endpoint not resolved")?,
+        path,
+    )?;
+    let url = Url::parse(&endpoint)?;
+    let host = url
+        .host_str()
+        .context("local endpoint has no host")?
+        .trim_matches(['[', ']']);
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::TcpStream::connect((host, url.port_or_known_default().context("local endpoint has no port")?)),
+    )
+    .await
+    .with_context(|| format!("local {service} endpoint {endpoint} is unreachable; configure platform.local.bind_host/endpoint_host, not a loopback fallback"))?
+    .with_context(|| format!("connect local {service} endpoint {endpoint}"))?;
+    Ok(endpoint)
+}
+
+async fn local_docker_daemon() -> Result<String> {
+    if std::env::var_os("DOCKER_CONTEXT").is_none()
+        && let Ok(host) = std::env::var("DOCKER_HOST")
+    {
+        Url::parse(&host).context("invalid DOCKER_HOST")?;
+        return Ok(host);
     }
-    Ok(format!("http://127.0.0.1:{port}{path}"))
+    let mut command = Command::new("docker");
+    command.args(["context", "inspect", "--format", "{{.Endpoints.docker.Host}}"]);
+    let output = run_command(command, "resolve active Docker daemon endpoint").await?;
+    let endpoint = String::from_utf8(output.stdout)?.trim().to_owned();
+    Url::parse(&endpoint).context("Docker context returned an invalid daemon endpoint")?;
+    Ok(endpoint)
+}
+
+async fn verify_local_bind_mount(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let probe = platform.state_dir.join("control/daemon-bind-probe");
+    fs::write(&probe, &nonce)?;
+    let state = platform.state_dir.to_str().context("local state path is not UTF-8")?;
+    let compose = std::env::current_dir()?.join(
+        config
+            .platform
+            .compose_file
+            .as_deref()
+            .context("missing local compose file")?,
+    );
+    let observability = compose
+        .parent()
+        .context("local compose file has no parent")?
+        .join("observability");
+    crate::local::absolute_directory(&observability)?;
+    let source = observability.to_str().context("observability path is not UTF-8")?;
+    if state.contains(',') || source.contains(',') {
+        bail!("local bind source paths cannot contain a Docker --mount separator");
+    }
+    let mut checksums = String::new();
+    for name in [
+        "prometheus.yaml",
+        "dashboards.yaml",
+        "arrowcol.json",
+        "delta-operations.json",
+    ] {
+        let (_, digest) = crate::local::file_digest(&observability.join(name))?;
+        checksums.push_str(&format!("{digest}  /oat-observability/{name}\n"));
+    }
+    let uid = platform
+        .environment
+        .get("LOADTEST_UID")
+        .context("local state UID missing")?;
+    let gid = platform
+        .environment
+        .get("LOADTEST_GID")
+        .context("local state GID missing")?;
+    let user = format!("{uid}:{gid}");
+    let mut command = Command::new("docker");
+    command.args([
+        "run", "--rm", "--network", "none", "--read-only",
+        "--user", &user,
+        "--mount", &format!("type=bind,source={state},target=/oat-bind,readonly"),
+        "--mount", &format!("type=bind,source={source},target=/oat-observability,readonly"),
+        "--entrypoint", "/bin/sh", "arrowcol-oat-client:local", "-ec",
+        "test \"$(cat /oat-bind/control/daemon-bind-probe)\" = \"$1\" && test -f /oat-bind/router-state/config.yaml && printf '%s' \"$2\" | sha256sum -c -",
+        "oat-bind-probe", &nonce, &checksums,
+    ]);
+    run_command(command, "verify Docker daemon sees the same absolute generated-state path and bytes; remote path remapping is unsupported").await?;
+    fs::remove_file(probe)?;
+    Ok(())
+}
+
+async fn stop_local_snapshot_writers(config: &OatConfig, platform: &LocalPlatform) -> Result<Vec<Value>> {
+    let project = scoped_compose_project(
+        config
+            .platform
+            .compose_project
+            .as_deref()
+            .context("missing local project")?,
+        &platform.run_id,
+    );
+    let mut list = Command::new("docker");
+    list.args([
+        "ps",
+        "--all",
+        "--quiet",
+        "--no-trunc",
+        "--filter",
+        &format!("label=com.docker.compose.project={project}"),
+    ]);
+    let output = run_command(list, "list owned local containers before snapshot").await?;
+    let ids = String::from_utf8(output.stdout)?;
+    let ids = ids.split_whitespace().map(str::to_owned).collect::<Vec<_>>();
+    if ids.is_empty() {
+        bail!("no owned containers to establish stopped snapshot custody");
+    }
+    let mut inspect = Command::new("docker");
+    inspect.arg("inspect").args(&ids);
+    let before: Vec<Value> =
+        serde_json::from_slice(&run_command(inspect, "inspect local snapshot ownership").await?.stdout)?;
+    validate_snapshot_container_ownership(&before, &project)?;
+    for phase in snapshot_stop_phases(&before)? {
+        if !phase.is_empty() {
+            let mut stop = Command::new("docker");
+            stop.args(["stop", "--time", "300"]).args(phase);
+            run_command(
+                stop,
+                "stop owned local ingress, then collectors, then catalog, then dependencies",
+            )
+            .await?;
+        }
+    }
+    let mut inspect = Command::new("docker");
+    inspect.arg("inspect").args(&ids);
+    let after: Vec<Value> = serde_json::from_slice(
+        &run_command(inspect, "verify definite stopped local container outcomes")
+            .await?
+            .stdout,
+    )?;
+    let receipt = json!({
+        "schema_version": 1, "run_id": platform.run_id, "project": project,
+        "containers": after.iter().map(|container| json!({
+            "id": container["Id"],
+            "service": container.pointer("/Config/Labels/com.docker.compose.service"),
+            "state": {
+                "Running": container["State"]["Running"], "Paused": container["State"]["Paused"],
+                "Dead": container["State"]["Dead"], "Status": container["State"]["Status"],
+                "Error": container["State"]["Error"], "ExitCode": container["State"]["ExitCode"],
+                "OOMKilled": container["State"]["OOMKilled"], "FinishedAt": container["State"]["FinishedAt"],
+            },
+        })).collect::<Vec<_>>(),
+    });
+    let mut receipt_file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(platform.control_dir.join("snapshot-stop.json"))?;
+    receipt_file.write_all(&serde_json::to_vec_pretty(&receipt)?)?;
+    receipt_file.sync_all()?;
+    let mut list = Command::new("docker");
+    list.args([
+        "ps",
+        "--all",
+        "--quiet",
+        "--no-trunc",
+        "--filter",
+        &format!("label=com.docker.compose.project={project}"),
+    ]);
+    let listed = run_command(list, "verify no new owned containers appeared during snapshot stop").await?;
+    let listed = String::from_utf8(listed.stdout)?;
+    if listed.split_whitespace().collect::<HashSet<_>>() != ids.iter().map(String::as_str).collect::<HashSet<_>>() {
+        bail!("owned local container set changed while stopping; preserving state");
+    }
+    snapshot_container_outcomes(&before, &after, &project)
+}
+
+fn snapshot_container_outcomes(before: &[Value], after: &[Value], project: &str) -> Result<Vec<Value>> {
+    validate_snapshot_container_ownership(before, project)?;
+    validate_snapshot_container_ownership(after, project)?;
+    let before_by_id = before
+        .iter()
+        .map(|container| {
+            Ok((
+                container
+                    .get("Id")
+                    .and_then(Value::as_str)
+                    .context("container ID missing")?,
+                container,
+            ))
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
+    if before.len() != after.len() || before_by_id.len() != before.len() {
+        bail!("owned local container set changed while stopping");
+    }
+    let mut writers = Vec::new();
+    let mut seen = HashSet::new();
+    for container in after {
+        let id = container
+            .get("Id")
+            .and_then(Value::as_str)
+            .context("container ID missing")?;
+        if !seen.insert(id) {
+            bail!("duplicate container in stopped snapshot receipt");
+        }
+        let original = before_by_id
+            .get(id)
+            .context("owned container identity changed while stopping")?;
+        let state = container.get("State").context("container has no stop state")?;
+        if state.get("Running").and_then(Value::as_bool) != Some(false)
+            || state.get("Paused").and_then(Value::as_bool) != Some(false)
+            || state.get("Dead").and_then(Value::as_bool) != Some(false)
+            || state.get("Status").and_then(Value::as_str) != Some("exited")
+            || state.get("Error").and_then(Value::as_str) != Some("")
+        {
+            bail!("uncertain local container stop outcome; preserving state");
+        }
+        let service = container
+            .pointer("/Config/Labels/com.docker.compose.service")
+            .and_then(Value::as_str)
+            .context("container service label missing")?;
+        if original
+            .pointer("/Config/Labels/com.docker.compose.service")
+            .and_then(Value::as_str)
+            != Some(service)
+        {
+            bail!("owned container service changed while stopping");
+        }
+        let was_running = original
+            .pointer("/State/Running")
+            .and_then(Value::as_bool)
+            .context("original container running state missing")?;
+        let exit = state
+            .get("ExitCode")
+            .and_then(Value::as_i64)
+            .context("container exit code missing")?;
+        if !(exit == 0 || (was_running && exit == 143))
+            || state.get("OOMKilled").and_then(Value::as_bool) != Some(false)
+        {
+            bail!("owned container {service} failed or was forcibly stopped ({exit}); preserving data");
+        }
+        let finished_at = state
+            .get("FinishedAt")
+            .and_then(Value::as_str)
+            .context("container finish time missing")?;
+        if chrono::DateTime::parse_from_rfc3339(finished_at)?.timestamp() <= 0 {
+            bail!("owned container has no definite finish time");
+        }
+        writers.push(json!({
+            "id": id, "service": service, "was_running": was_running, "exit_code": exit,
+            "finished_at": finished_at, "oom_killed": state["OOMKilled"],
+        }));
+    }
+    Ok(writers)
+}
+
+fn validate_snapshot_container_ownership(containers: &[Value], project: &str) -> Result<()> {
+    let mut services = HashSet::new();
+    for container in containers {
+        if container
+            .pointer("/Config/Labels/com.docker.compose.project")
+            .and_then(Value::as_str)
+            != Some(project)
+        {
+            bail!("refusing snapshot stop outside the exact owned Compose project");
+        }
+        services.insert(
+            container
+                .pointer("/Config/Labels/com.docker.compose.service")
+                .and_then(Value::as_str)
+                .context("missing owned Compose service")?,
+        );
+    }
+    if !services.contains("dataflow-1") || !services.contains("arrowcol-catalog") {
+        bail!("snapshot requires the owned collector and catalog, not a partially prepared stack");
+    }
+    Ok(())
+}
+
+fn snapshot_stop_phases(containers: &[Value]) -> Result<[Vec<String>; 4]> {
+    let mut phases: [Vec<String>; 4] = std::array::from_fn(|_| Vec::new());
+    for container in containers {
+        let service = container
+            .pointer("/Config/Labels/com.docker.compose.service")
+            .and_then(Value::as_str)
+            .context("missing owned Compose service")?;
+        let phase = match service {
+            "dataflow-1" => 1,
+            "arrowcol-catalog" => 2,
+            "sqlserver" | "kusto" | "lgtm" => 3,
+            _ => 0,
+        };
+        phases[phase].push(
+            container
+                .get("Id")
+                .and_then(Value::as_str)
+                .context("container ID missing")?
+                .to_owned(),
+        );
+    }
+    Ok(phases)
 }
 
 async fn cleanup_local_platform(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
+    if let Some(destination) = &config.platform.local.snapshot_root {
+        return crate::local::snapshot_then_cleanup(
+            async {
+                tokio::time::timeout(Duration::from_secs(1_440), stop_local_snapshot_writers(config, platform))
+                    .await
+                    .context("local stop deadline exceeded; outcome uncertain, retaining owned data")?
+            },
+            |writers| crate::local::export_stopped(
+                &platform.state_dir, Path::new(destination), &platform.run_id, &config.tables, &writers,
+            ),
+            destroy_local_platform(config, platform),
+        )
+        .await
+        .with_context(|| format!(
+            "local snapshot/cleanup failed; source recovery path: {} (stop/export failures retain it; destructive-cleanup failures may be partial)",
+            platform.state_dir.display()
+        ));
+    }
+    destroy_local_platform(config, platform).await
+}
+
+async fn destroy_local_platform(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
     let base_project = config
         .platform
         .compose_project
@@ -4834,7 +5175,7 @@ fn merge_parquet_bytes(existing_bytes: &[u8], incoming: &RecordBatch) -> Result<
     let mut batches = existing_reader.build()?.collect::<std::result::Result<Vec<_>, _>>()?;
     batches.push(incoming.clone());
     let merged = concat_batches(&schema, &batches)?;
-    encode_parquet(&deduplicate_results(&merged)?)
+    encode_parquet(&merged)
 }
 
 fn deduplicate_results(batch: &RecordBatch) -> Result<RecordBatch> {
@@ -4996,9 +5337,10 @@ fn result_schema() -> Arc<Schema> {
 }
 
 fn encode_parquet(batch: &RecordBatch) -> Result<Vec<u8>> {
+    let batch = deduplicate_results(batch)?;
     let schema = batch.schema();
     let mut writer = ArrowWriter::try_new(Vec::new(), schema, None)?;
-    writer.write(batch)?;
+    writer.write(&batch)?;
     Ok(writer.into_inner()?)
 }
 
@@ -5012,6 +5354,65 @@ fn platform_host_label(kind: crate::config::OatMode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_credentials_fit_sql_server_password_limits() {
+        let secret = random_secret();
+        assert!((32..=128).contains(&secret.len()));
+        assert!(secret.bytes().all(|byte| byte.is_ascii_graphic()));
+        assert!(secret.bytes().any(|byte| byte.is_ascii_uppercase()));
+        assert!(secret.bytes().any(|byte| byte.is_ascii_lowercase()));
+        assert!(secret.bytes().any(|byte| byte.is_ascii_digit()));
+        assert!(secret.bytes().any(|byte| byte.is_ascii_punctuation()));
+    }
+
+    #[test]
+    fn snapshot_stop_keeps_writer_dependencies_alive_and_rejects_uncertain_custody() -> Result<()> {
+        let project = "owned-run";
+        let services = ["sqlserver", "arrowcol-catalog", "dataflow-1", "router", "oat-client"];
+        let before = services.iter().enumerate().map(|(index, service)| json!({
+            "Id": format!("id-{index}"),
+            "Config": {"Labels": {"com.docker.compose.project": project, "com.docker.compose.service": service}},
+            "State": {"Running": true}
+        })).collect::<Vec<_>>();
+        assert_eq!(
+            snapshot_stop_phases(&before)?,
+            [
+                vec!["id-3".to_owned(), "id-4".to_owned()],
+                vec!["id-2".to_owned()],
+                vec!["id-1".to_owned()],
+                vec!["id-0".to_owned()]
+            ]
+        );
+        let mut after = before.clone();
+        for container in &mut after {
+            container["State"] = json!({
+                "Running": false, "Paused": false, "Dead": false, "Status": "exited",
+                "Error": "", "ExitCode": 0, "OOMKilled": false, "FinishedAt": "2026-01-01T00:00:00Z"
+            });
+        }
+        after[2]["State"]["ExitCode"] = json!(143);
+        assert_eq!(
+            snapshot_container_outcomes(&before, &after, project)?.len(),
+            services.len()
+        );
+        let mut invalid = after.clone();
+        invalid[2]["State"]["ExitCode"] = json!(137);
+        assert!(snapshot_container_outcomes(&before, &invalid, project).is_err());
+        invalid = after.clone();
+        invalid[2]["State"]["OOMKilled"] = json!(true);
+        assert!(snapshot_container_outcomes(&before, &invalid, project).is_err());
+        invalid = after.clone();
+        invalid[2]["Id"] = json!("replacement");
+        assert!(snapshot_container_outcomes(&before, &invalid, project).is_err());
+        invalid = after.clone();
+        invalid[2]["Config"]["Labels"]["com.docker.compose.project"] = json!("other-run");
+        assert!(snapshot_container_outcomes(&before, &invalid, project).is_err());
+        let mut already_failed = before;
+        already_failed[2]["State"]["Running"] = json!(false);
+        assert!(snapshot_container_outcomes(&already_failed, &after, project).is_err());
+        Ok(())
+    }
     include!("runner_publication_tests.rs");
 
     fn router_yaml_for_pin_test(run_id: &str) -> String {
@@ -5952,6 +6353,52 @@ mod tests {
         assert_eq!(metrics.observation_complete, 0);
         assert_eq!(metrics.observed_tables, 0);
         assert_eq!(metrics.completion_percent, None);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_reported_duration_shorter_than_the_shared_window() -> Result<()> {
+        let report = parse_client_metrics(
+            "measured_rows=100 measured_seconds=1 rows_per_second=100 measurement_window_start_unix_ms=100000 measurement_window_end_unix_ms=160000 measurement_started_unix_ms=100000",
+        )?;
+        assert!(validate_client_measurement_interval(&report, 100_000, 160_000, false).is_err());
+        let aligned = ClientReport {
+            duration_seconds: 60.0,
+            ..report
+        };
+        assert!(validate_client_measurement_interval(&aligned, 100_000, 160_000, false).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn initial_parquet_write_deduplicates_run_table_keys() -> Result<()> {
+        let batch = parquet_batch(&[
+            sample_result("run-1", "table-a", 100),
+            sample_result("run-1", "table-a", 200),
+        ])?;
+        let bytes = encode_parquet(&batch)?;
+        let batches = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes))?
+            .build()?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        let rows = batches[0]
+            .column_by_name("rows")
+            .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+            .context("missing UInt64 rows")?;
+        assert_eq!(rows.value(0), 200);
+        Ok(())
+    }
+
+    #[test]
+    fn zero_row_parquet_preserves_schema_and_accepts_a_later_append() -> Result<()> {
+        let empty = encode_parquet(&parquet_batch(&[])?)?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::copy_from_slice(&empty))?;
+        assert_eq!(reader.schema().as_ref(), result_schema().as_ref());
+        assert_eq!(reader.metadata().file_metadata().num_rows(), 0);
+        assert_eq!(reader.build()?.count(), 0);
+        let appended = merge_parquet_bytes(&empty, &parquet_batch(&[sample_result("run-1", "table-a", 100)])?)?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(appended))?;
+        assert_eq!(reader.metadata().file_metadata().num_rows(), 1);
         Ok(())
     }
 

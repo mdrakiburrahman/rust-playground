@@ -13,7 +13,7 @@ services:
     secrets:
       - sqlserver_sa_password
     ports:
-      - "127.0.0.1:${SQLSERVER_PORT:-14333}:1433"
+      - "${LOADTEST_BIND_HOST:-127.0.0.1}:${SQLSERVER_PORT:-14333}:1433"
     volumes:
       - sqlserver-data:/var/opt/mssql
     healthcheck:
@@ -78,7 +78,7 @@ services:
     user: "${LOADTEST_UID:?Run through Nx}:${LOADTEST_GID:?Run through Nx}"
     command: ["--listen", "0.0.0.0:8817", "--warehouse-root", "${LOADTEST_DATAFLOW_DELTA_ROOT:-/delta/dataflow}", "--state-dir", "/state"]
     ports:
-      - "127.0.0.1:${LOADTEST_CATALOG_PORT:-18817}:8817"
+      - "${LOADTEST_BIND_HOST:-127.0.0.1}:${LOADTEST_CATALOG_PORT:-18817}:8817"
     environment:
       OTEL_EXPORTER_OTLP_ENDPOINT: ${LOADTEST_TRACES_ENDPOINT:-http://lgtm:4318}
       OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
@@ -183,6 +183,8 @@ services:
   kusto:
     profiles: ["benchmark"]
     image: mcr.microsoft.com/azuredataexplorer/kustainer-linux@sha256:51e2250da2faf292de903f871a073eb37d3f2641cf63381b183879d21ebb1013
+    # /start-kusto.sh runs Kusto without exec; as PID 1 that bash ignores SIGTERM, so stops end in SIGKILL.
+    init: true
     # Serial validation retained a 3.855 GiB baseline and reached the 4 GiB ceiling.
     # Attempt-7 simultaneous benchmark peak 7.811 GiB + 2 GiB = 9.811 GiB.
     # Public ubuntu-24.04 CI has 16 GB RAM and no development workspace container.
@@ -190,7 +192,7 @@ services:
     environment:
       ACCEPT_EULA: "Y"
     ports:
-      - "127.0.0.1:${KUSTO_PORT:-8080}:8080"
+      - "${LOADTEST_BIND_HOST:-127.0.0.1}:${KUSTO_PORT:-8080}:8080"
     volumes:
       - kusto-data:/kustodata
       - type: bind
@@ -245,7 +247,7 @@ services:
       default:
         ipv4_address: ${LOADTEST_LGTM_IP:-10.89.0.40}
     ports:
-      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+      - "${LOADTEST_BIND_HOST:-127.0.0.1}:${GRAFANA_PORT:-3000}:3000"
     volumes:
       - ./observability/prometheus.yaml:/otel-lgtm/prometheus.yaml:ro
       - ./observability/dashboards.yaml:/otel-lgtm/grafana/conf/provisioning/dashboards/arrowcol.yaml:ro
@@ -309,7 +311,7 @@ services:
     user: "${LOADTEST_UID:?Run through Nx}:${LOADTEST_GID:?Run through Nx}"
     command: ["--config", "/state/config.yaml"]
     ports:
-      - "127.0.0.1:${LOADTEST_ROUTER_PORT:-15050}:50050"
+      - "${LOADTEST_BIND_HOST:-127.0.0.1}:${LOADTEST_ROUTER_PORT:-15050}:50050"
     environment:
       OTEL_EXPORTER_OTLP_ENDPOINT: ${LOADTEST_TRACES_ENDPOINT:-http://lgtm:4318}
       OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf

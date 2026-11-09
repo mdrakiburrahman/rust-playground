@@ -22,6 +22,77 @@ escalation disabled. Other containers continue to drop all capabilities.
 
 ## Prerequisites and authorization
 
+For AKS prerequisites, continue below. Local runs use the following independent path.
+
+## Local smoke and stopped Delta snapshots
+
+| Setting / boundary | Contract |
+| --- | --- |
+| `platform.local.bind_host` | Optional Docker host IP for the SQL/catalog/router/Kusto/Grafana ephemeral port bindings; default `127.0.0.1`. For a bridged devcontainer, explicitly choose the daemon's reachable private bridge address. No gateway is guessed. |
+| `platform.local.endpoint_host` | Optional bare reachable DNS/IP host (IPv6 accepted), without scheme/port/credentials. Overrides only discovered host, never its dynamic port. Otherwise the actual binding/active Docker context determines the endpoint; remote daemon loopback and ambiguous wildcard bindings fail closed. |
+| Docker filesystem | Unix runner and daemon must see the **same absolute generated-state path**. A no-network, read-only nonce bind probe verifies actual bytes before SQL starts. Remote path remapping is unsupported, not silently approximated. |
+| Local inputs | New per-cell project/network/SQL and Kusto volumes, private app/migrator/HMAC files; no retained SQL volume or Azure environment file is used. Compose auto `.env` loading is disabled. Images/build cache and host resources remain shared. |
+| `platform.local.snapshot_root` | Optional absolute directory, outside generated state and not its ancestor. Opt-in export; default `null` retains automatic cleanup without exporting. Never point it at public website storage: snapshots contain real payloads. |
+| Stop/export/cleanup | Stop owned ingress, then all collectors, then catalog, then dependencies. Require definite stopped outcomes without OOM or forced writer termination (exit 0, or intentional SIGTERM/143 only for a previously running writer); copy/verify/sync snapshot and provenance **before** owned stack/volume/state deletion. Stop/export failure returns an error and preserves recoverable source state/volumes and any incomplete export. Do not retry into or remove that destination blindly. |
+| Snapshot meaning | Last committed stopped data, **not** proof every admitted row was flushed. No measurement, pinning, unknown-count or QAP acceptance gate is relaxed. |
+
+Functional smoke only (not E1-E5 or Kustainer performance evidence), from the
+repository root in the devcontainer. Rust, Node workspace dependencies and Docker
+Compose are required; image pulls/builds can require registry access. On a
+bridged runner first set `OAT_DOCKER_BIND_HOST` and `OAT_DOCKER_ENDPOINT_HOST` to the
+verified private daemon binding/reachable host; omit them for an ordinary
+same-host runner. No Azure credentials or publication are required:
+
+```bash
+mkdir -p out
+export OAT_SMOKE_ROOT="$(mktemp -d "$PWD/out/arrowcol-oat-smoke-XXXXXXXX")"
+node --input-type=module -e '
+import fs from "node:fs";
+import { pathToFileURL } from "node:url";
+const root = process.env.OAT_SMOKE_ROOT;
+const config = JSON.parse(fs.readFileSync("docs/experiments/arrowcol-oat/oat-config.example.json", "utf8"));
+Object.assign(config.platform, {
+  compose_project: "oat-smoke", compose_state_root: `${root}/state`,
+  local: { bind_host: process.env.OAT_DOCKER_BIND_HOST ?? null,
+    endpoint_host: process.env.OAT_DOCKER_ENDPOINT_HOST ?? null, snapshot_root: `${root}/snapshots` }
+});
+Object.assign(config, {
+  tables: ["sqlserver_active_sessions"], replica_counts: [1], dfe_worker_concurrency: [1],
+  clients_per_table: 1, dmv_concurrency: 1, rows_per_table: 1000,
+  warmup_seconds: 0, measure_seconds: 1, pilot_mode: false, qap_timeout_seconds: 60,
+  stamp: null, qap_database: null,
+  result_url: pathToFileURL(`${root}/results.parquet`).href,
+  website_url: pathToFileURL(`${root}/site/results.parquet`).href
+});
+fs.writeFileSync(`${root}/config.json`, JSON.stringify(config), { flag: "wx" });
+'
+npx --no-install arrowcol-oat --config "$OAT_SMOKE_ROOT/config.json" --mode local
+```
+
+The one-second measurement still follows image/stack startup, trusted immutable
+pin initialization, whole-fleet preflight/QAP setup and a fixed 60-second schedule
+lead. The viewer stays open after completion until Ctrl+C. A successful smoke
+must have real positive committed rows in the exported dataset, not merely an
+upload acknowledgement. Parquet summary schema v2 remains unchanged: missing QAP
+measurements stay null; a completed pinning violation is published as failed
+pinning, while preparation/client/cleanup errors can abort before Parquet exists.
+
+| Retained output | Evidence / limits |
+| --- | --- |
+| `snapshots/<cell-run-UUID>/stopped.json` and `complete.json` | Stopped container identities/outcomes and completion manifest with per-table manifest SHA256. An absent completion marker means incomplete export, not permission to clean source data. |
+| `snapshots/<cell-run-UUID>/sqlserver_active_sessions/table/` | Unchanged genuine Delta JSON log and payload bytes; only the empty writer lock file is omitted. No symlinks/nonregular files, checkpoints, deletion vectors, external paths, history gaps or missing historical Add payloads are accepted. |
+| Sibling `manifest.json` | Version 1 `schema_version`, `run_id`, `table`, `latestVersion`, positive `rowCount`, original `schemaString`, `files[{path,size,sha256}]`, stopped `writers` and semantics. Paths are relative to `table/`; active rows are independently decoded and checked against Parquet footer counts, never inferred from Add statistics. |
+| `results.parquet`, `site/results.parquet` | Local summary/mirror outside generated state. Not the Delta dataset and not a provider qualification receipt. |
+
+For a separately authorized later provider probe, select exactly one completed
+table directory and bind its raw manifest hash, run ID and table identity. Replay
+the complete version-zero-through-latest history and verify every inventoried
+byte plus all historical/active Add references before copying. Do not fabricate
+schemas, edit logs, race-copy live writers, or treat this export as Azure
+publication authority.
+
+## AKS prerequisites and authorization
+
 Complete the selected stamp's **supported provision/bootstrap**, including Delta
 initialization and `complete_bootstrap`, before starting writers. Select the
 generated `.env.azure` and `.env.azure.tables.json` for that stamp, not a different
