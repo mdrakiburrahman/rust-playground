@@ -347,9 +347,7 @@ impl RoutingStore for MemoryRoutingStore {
             .run_pin_sets
             .insert(run_id.to_owned(), (expected.to_vec(), expires_at));
         for key in expected {
-            state
-                .run_pin_markers
-                .insert((run_id.to_owned(), key.clone()), false);
+            state.run_pin_markers.insert((run_id.to_owned(), key.clone()), false);
         }
         Ok(())
     }
@@ -362,9 +360,10 @@ impl RoutingStore for MemoryRoutingStore {
     ) -> RoutingResult<Option<RunTablePin>> {
         self.ensure_available()?;
         let state = self.state.lock().await;
-        let (expected, expiry) = state.run_pin_sets.get(run_id).ok_or_else(|| {
-            RoutingError::new(RoutingErrorKind::Conflict, "immutable OAT run pin set is missing")
-        })?;
+        let (expected, expiry) = state
+            .run_pin_sets
+            .get(run_id)
+            .ok_or_else(|| RoutingError::new(RoutingErrorKind::Conflict, "immutable OAT run pin set is missing"))?;
         if *expiry <= now || !expected.contains(key) {
             return Err(RoutingError::new(
                 RoutingErrorKind::Conflict,
@@ -374,7 +373,12 @@ impl RoutingStore for MemoryRoutingStore {
         let marker = state
             .run_pin_markers
             .get(&(run_id.to_owned(), key.clone()))
-            .ok_or_else(|| RoutingError::new(RoutingErrorKind::CorruptState, "OAT table initialization marker is missing"))?;
+            .ok_or_else(|| {
+                RoutingError::new(
+                    RoutingErrorKind::CorruptState,
+                    "OAT table initialization marker is missing",
+                )
+            })?;
         let pin = state.run_table_pins.get(&(run_id.to_owned(), key.clone()));
         match (*marker, pin) {
             (false, None) => return Ok(None),
@@ -403,9 +407,10 @@ impl RoutingStore for MemoryRoutingStore {
         self.ensure_available()?;
         pin.validate(now)?;
         let mut state = self.state.lock().await;
-        let (expected, expiry) = state.run_pin_sets.get(&pin.run_id).ok_or_else(|| {
-            RoutingError::new(RoutingErrorKind::Conflict, "immutable OAT run pin set is missing")
-        })?;
+        let (expected, expiry) = state
+            .run_pin_sets
+            .get(&pin.run_id)
+            .ok_or_else(|| RoutingError::new(RoutingErrorKind::Conflict, "immutable OAT run pin set is missing"))?;
         if *expiry <= now || *expiry != pin.expires_at_unix_ms || !expected.contains(&pin.key) {
             return Err(RoutingError::new(
                 RoutingErrorKind::Conflict,
@@ -414,11 +419,17 @@ impl RoutingStore for MemoryRoutingStore {
         }
         let marker_key = (pin.run_id.clone(), pin.key.clone());
         let marker = state.run_pin_markers.get(&marker_key).copied().ok_or_else(|| {
-            RoutingError::new(RoutingErrorKind::CorruptState, "OAT table initialization marker is missing")
+            RoutingError::new(
+                RoutingErrorKind::CorruptState,
+                "OAT table initialization marker is missing",
+            )
         })?;
         if marker {
             let existing = state.run_table_pins.get(&marker_key).ok_or_else(|| {
-                RoutingError::new(RoutingErrorKind::CorruptState, "bound OAT table marker is missing its owner")
+                RoutingError::new(
+                    RoutingErrorKind::CorruptState,
+                    "bound OAT table marker is missing its owner",
+                )
             })?;
             if !same_run_pin(existing, pin) {
                 return Err(RoutingError::new(
@@ -443,7 +454,8 @@ impl RoutingStore for MemoryRoutingStore {
 
     async fn has_active_run_table_pin(&self, key: &crate::LeaseKey, now: UnixMillis) -> RoutingResult<bool> {
         self.ensure_available()?;
-        Ok(has_active_run_pin(&self.state.lock().await, key, now))
+        let state = self.state.lock().await;
+        Ok(has_active_run_pin(&state, key, now))
     }
 
     async fn begin_lease_drain(&self, request: &LeaseCas) -> RoutingResult<RoutingLease> {
@@ -607,11 +619,15 @@ fn has_active_run_pin(state: &MemoryState, key: &crate::LeaseKey, now: UnixMilli
 
 fn validate_run_pin_against_lease(state: &MemoryState, pin: &RunTablePin, now: UnixMillis) -> RoutingResult<()> {
     pin.validate(now)?;
-    let lease = state.leases.get(&pin.key).ok_or_else(|| {
-        RoutingError::new(RoutingErrorKind::Conflict, "pinned routing lease is missing")
-    })?;
+    let lease = state
+        .leases
+        .get(&pin.key)
+        .ok_or_else(|| RoutingError::new(RoutingErrorKind::Conflict, "pinned routing lease is missing"))?;
     let collector = state.collectors.get(&pin.holder_instance_id).ok_or_else(|| {
-        RoutingError::new(RoutingErrorKind::Conflict, "pinned collector process registration is missing")
+        RoutingError::new(
+            RoutingErrorKind::Conflict,
+            "pinned collector process registration is missing",
+        )
     })?;
     if !lease.is_routable_at(now)
         || lease.holder_instance_id != pin.holder_instance_id

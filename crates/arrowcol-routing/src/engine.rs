@@ -262,7 +262,10 @@ impl RoutingEngine {
         let started_at = std::time::Instant::now();
         self.initialize_run_table_pins_with_clock(run_id, expected, expires_at, now, move || {
             let elapsed_ms = u64::try_from(started_at.elapsed().as_millis()).map_err(|_| {
-                RoutingError::new(RoutingErrorKind::InvalidConfiguration, "OAT setup elapsed time overflow")
+                RoutingError::new(
+                    RoutingErrorKind::InvalidConfiguration,
+                    "OAT setup elapsed time overflow",
+                )
             })?;
             add_millis(now, elapsed_ms)
         })
@@ -340,8 +343,7 @@ impl RoutingEngine {
                 let candidate = rank_collectors(&view, key, now, &self.policy, false)
                     .into_iter()
                     .find(|candidate| {
-                        !self.policy.distinct_table_owners
-                            || !has_other_active_table_lease(&view, key, *candidate, now)
+                        !self.policy.distinct_table_owners || !has_other_active_table_lease(&view, key, *candidate, now)
                     })
                     .ok_or_else(|| {
                         RoutingError::new(
@@ -368,7 +370,7 @@ impl RoutingEngine {
                     Ok(lease) => lease,
                     Err(error) if error.kind() == RoutingErrorKind::Conflict => {
                         let refresh_now = setup_now(&clock, &mut last_now, expires_at)?;
-                        view = self.refresh(refresh_now).await?;
+                        self.refresh(refresh_now).await?;
                         continue;
                     }
                     Err(error) => return Err(error),
@@ -401,7 +403,7 @@ impl RoutingEngine {
                     }
                     Err(error) if error.kind() == RoutingErrorKind::Conflict => {
                         let refresh_now = setup_now(&clock, &mut last_now, expires_at)?;
-                        view = self.refresh(refresh_now).await?;
+                        self.refresh(refresh_now).await?;
                     }
                     Err(error) => return Err(error),
                 }
@@ -422,7 +424,10 @@ impl RoutingEngine {
     async fn assignment_for_run_pin(&self, pin: &RunTablePin, now: UnixMillis) -> RoutingResult<RouteAssignment> {
         let view = self.refresh(now).await?;
         let lease = view.leases.get(&pin.key).ok_or_else(|| {
-            RoutingError::new(RoutingErrorKind::Conflict, "pinned routing lease is missing from the fresh view")
+            RoutingError::new(
+                RoutingErrorKind::Conflict,
+                "pinned routing lease is missing from the fresh view",
+            )
         })?;
         if !lease.is_routable_at(now)
             || lease.holder_instance_id != pin.holder_instance_id
@@ -810,11 +815,7 @@ fn add_millis(value: UnixMillis, delta: u64) -> RoutingResult<UnixMillis> {
     .map_err(|cause| RoutingError::new(RoutingErrorKind::InvalidConfiguration, cause.to_string()))
 }
 
-fn setup_now<F>(
-    clock: &F,
-    last_now: &mut UnixMillis,
-    expires_at: UnixMillis,
-) -> RoutingResult<UnixMillis>
+fn setup_now<F>(clock: &F, last_now: &mut UnixMillis, expires_at: UnixMillis) -> RoutingResult<UnixMillis>
 where
     F: Fn() -> RoutingResult<UnixMillis>,
 {

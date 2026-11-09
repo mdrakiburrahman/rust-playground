@@ -1942,7 +1942,10 @@ pub async fn initialize_local_qap(
     tables: &[(String, String)],
     deadline: Duration,
 ) -> Result<()> {
-    ensure!(!tables.is_empty(), "local QAP initialization requires at least one external table");
+    ensure!(
+        !tables.is_empty(),
+        "local QAP initialization requires at least one external table"
+    );
     ensure!(
         database == DATABASE,
         "local QAP initialization currently requires the isolated loadtest database"
@@ -1950,7 +1953,10 @@ pub async fn initialize_local_qap(
     let mut names = BTreeSet::new();
     for (name, location) in tables {
         identifier(name)?;
-        ensure!(names.insert(name.clone()), "local QAP initialization contains duplicate table names");
+        ensure!(
+            names.insert(name.clone()),
+            "local QAP initialization contains duplicate table names"
+        );
         ensure!(
             location.starts_with("/delta/dataflow/") && !location.contains(['\'', '\r', '\n']),
             "local QAP external-table location is outside the run-local Delta mount"
@@ -1963,7 +1969,10 @@ pub async fn initialize_local_qap(
         for (name, location) in tables {
             client.expose(name, location).await?;
             let (_, max_age) = client.max_age(name).await?;
-            ensure!(max_age == LOCAL_MAX_AGE, "local QAP policy for {name} did not match the configured policy");
+            ensure!(
+                max_age == LOCAL_MAX_AGE,
+                "local QAP policy for {name} did not match the configured policy"
+            );
             client.schema(name).await.with_context(|| {
                 format!("local QAP external table {name} is not readable from its committed Delta location")
             })?;

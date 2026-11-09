@@ -150,7 +150,8 @@ impl ProductionRouter {
                     return Ok(true);
                 }
             };
-            if let Err(message) = validate_oat_run_mode(self.routing.policy().oat_run_id.as_deref(), run_id.as_deref()) {
+            if let Err(message) = validate_oat_run_mode(self.routing.policy().oat_run_id.as_deref(), run_id.as_deref())
+            {
                 self.metrics.failure("doput", "unknown", "unauthorized_oat_run_id");
                 write_grpc_error(session, 7, &message).await?;
                 return Ok(true);

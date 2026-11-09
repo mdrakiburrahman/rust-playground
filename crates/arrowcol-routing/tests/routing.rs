@@ -29,12 +29,7 @@ fn oat_policy(run_id: &str) -> RoutingPolicy {
     }
 }
 
-async fn initialize_memory_oat_pin(
-    engine: &RoutingEngine,
-    run_id: &str,
-    now: UnixMillis,
-    expires_at: UnixMillis,
-) {
+async fn initialize_memory_oat_pin(engine: &RoutingEngine, run_id: &str, now: UnixMillis, expires_at: UnixMillis) {
     let expected = [LeaseKey::new(ImplementationPool::Dataflow, table())];
     let pins = engine
         .initialize_run_table_pins(run_id, &expected, expires_at, now)
@@ -337,7 +332,10 @@ async fn concurrent_oat_router_instances_read_one_prebound_table_owner() {
     assert_eq!(left_route.instance_id, right_route.instance_id);
     assert_eq!(left_route.lease, right_route.lease);
     assert_eq!(left_route.instance_id, prepared_pin.holder_instance_id);
-    let route_lease = left_route.lease.as_ref().unwrap_or_else(|| panic!("left OAT route has no lease"));
+    let route_lease = left_route
+        .lease
+        .as_ref()
+        .unwrap_or_else(|| panic!("left OAT route has no lease"));
     assert_eq!(route_lease.key, prepared_pin.key);
     assert_eq!(route_lease.lease_id, prepared_pin.lease_id);
     assert_eq!(route_lease.fencing_epoch, prepared_pin.fencing_epoch);
@@ -373,8 +371,8 @@ async fn trusted_oat_initializer_binds_multiple_tables_to_one_eligible_collector
         distinct_table_owners: false,
         ..oat_policy(OAT_RUN_CONCURRENT)
     };
-    let engine = RoutingEngine::new(engine_store, policy)
-        .unwrap_or_else(|error| panic!("create OAT setup engine: {error}"));
+    let engine =
+        RoutingEngine::new(engine_store, policy).unwrap_or_else(|error| panic!("create OAT setup engine: {error}"));
     let mut expected = vec![
         LeaseKey::new(ImplementationPool::Dataflow, table_named("traces")),
         LeaseKey::new(ImplementationPool::Dataflow, table_named("spans")),
@@ -478,13 +476,7 @@ async fn trusted_oat_initializer_uses_fresh_time_for_delayed_pressure() {
     };
 
     let pins = engine
-        .initialize_run_table_pins_with_clock(
-            OAT_RUN_CANONICAL,
-            &expected,
-            millis(200_000),
-            millis(100_000),
-            clock,
-        )
+        .initialize_run_table_pins_with_clock(OAT_RUN_CANONICAL, &expected, millis(200_000), millis(100_000), clock)
         .await
         .unwrap_or_else(|error| panic!("initialize using refreshed setup time: {error}"));
     assert_eq!(pins.len(), 1);
@@ -517,13 +509,7 @@ async fn trusted_oat_initializer_stops_when_fixed_expiry_is_crossed() {
     };
     let before = store.operation_counts();
     let result = engine
-        .initialize_run_table_pins_with_clock(
-            OAT_RUN_CANONICAL,
-            &expected,
-            millis(100_005),
-            millis(100_000),
-            clock,
-        )
+        .initialize_run_table_pins_with_clock(OAT_RUN_CANONICAL, &expected, millis(100_005), millis(100_000), clock)
         .await;
     assert!(matches!(result, Err(error) if error.kind() == RoutingErrorKind::Conflict));
     let after = store.operation_counts();
@@ -568,13 +554,7 @@ async fn trusted_oat_initializer_retries_an_existing_binding_with_fresh_setup_ti
         }
     };
     let retry = engine
-        .initialize_run_table_pins_with_clock(
-            OAT_RUN_CANONICAL,
-            &expected,
-            millis(200_000),
-            millis(100_010),
-            clock,
-        )
+        .initialize_run_table_pins_with_clock(OAT_RUN_CANONICAL, &expected, millis(200_000), millis(100_010), clock)
         .await
         .unwrap_or_else(|error| panic!("retry existing immutable OAT pin with fresh time: {error}"));
     assert_eq!(retry, original);
@@ -592,13 +572,9 @@ async fn trusted_oat_initializer_rejects_expiry_crossed_during_final_bound_pin_r
     let key = LeaseKey::new(ImplementationPool::Dataflow, table());
     let expected = [key.clone()];
     let original = engine
-        .initialize_run_table_pins_with_clock(
-            OAT_RUN_CANONICAL,
-            &expected,
-            millis(100_015),
-            millis(100_000),
-            || Ok(millis(100_000)),
-        )
+        .initialize_run_table_pins_with_clock(OAT_RUN_CANONICAL, &expected, millis(100_015), millis(100_000), || {
+            Ok(millis(100_000))
+        })
         .await
         .unwrap_or_else(|error| panic!("prepare near-expiry immutable OAT pin: {error}"));
     let before_retry = store.operation_counts();
@@ -618,13 +594,7 @@ async fn trusted_oat_initializer_rejects_expiry_crossed_during_final_bound_pin_r
         }
     };
     let retry = engine
-        .initialize_run_table_pins_with_clock(
-            OAT_RUN_CANONICAL,
-            &expected,
-            millis(100_015),
-            millis(100_010),
-            clock,
-        )
+        .initialize_run_table_pins_with_clock(OAT_RUN_CANONICAL, &expected, millis(100_015), millis(100_010), clock)
         .await;
     assert!(matches!(retry, Err(error) if error.kind() == RoutingErrorKind::Conflict));
     let after_retry = store.operation_counts();
@@ -690,6 +660,133 @@ async fn fresh_oat_router_does_not_replace_a_missing_bound_owner() {
 }
 
 #[tokio::test]
+async fn fresh_oat_router_rejects_missing_bound_owner_even_with_a_valid_replacement_lease() {
+    let (store, first, second) = seeded_store().await;
+    let key = LeaseKey::new(ImplementationPool::Dataflow, table());
+    let setup_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);
+    let setup = RoutingEngine::new(setup_store, oat_policy(OAT_RUN_RESTART))
+        .unwrap_or_else(|error| panic!("create OAT setup engine: {error}"));
+    let pins = setup
+        .initialize_run_table_pins(
+            OAT_RUN_RESTART,
+            std::slice::from_ref(&key),
+            millis(200_000),
+            millis(100_001),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("bind real OAT owner before simulating authority loss: {error}"));
+    let original_pin = pins[0].clone();
+    let original_lease = store
+        .load_view(millis(100_002))
+        .await
+        .unwrap_or_else(|error| panic!("load initialized table lease: {error}"))
+        .leases
+        .get(&key)
+        .cloned()
+        .unwrap_or_else(|| panic!("trusted initializer did not create the table lease"));
+    assert_eq!(original_lease.holder_instance_id, original_pin.holder_instance_id);
+    assert_eq!(original_lease.lease_id, original_pin.lease_id);
+    assert!(original_lease.is_routable_at(millis(100_002)));
+
+    assert!(store.remove_run_table_pin_for_test(OAT_RUN_RESTART, &key).await);
+    let replacement = if original_pin.holder_instance_id == first {
+        second
+    } else {
+        first
+    };
+    let mut replacement_lease = original_lease;
+    replacement_lease.holder_instance_id = replacement;
+    replacement_lease.lease_id = arrowcol_protocol::LeaseId::new();
+    replacement_lease.fencing_epoch = arrowcol_protocol::FencingToken::new(
+        replacement_lease
+            .fencing_epoch
+            .get()
+            .checked_add(1)
+            .unwrap_or_else(|| panic!("test fencing epoch overflow")),
+    )
+    .unwrap_or_else(|error| panic!("create replacement fencing epoch: {error}"));
+    replacement_lease.lease_version = replacement_lease
+        .lease_version
+        .checked_add(1)
+        .unwrap_or_else(|| panic!("test lease version overflow"));
+    replacement_lease.issued_at_unix_ms = millis(100_002);
+    replacement_lease.renewed_at_unix_ms = millis(100_002);
+    replacement_lease.expires_at_unix_ms = millis(180_000);
+    store
+        .insert_lease(replacement_lease.clone())
+        .await
+        .unwrap_or_else(|error| panic!("install controlled valid replacement lease: {error}"));
+
+    let request_now = millis(100_003);
+    let replacement_view = store
+        .load_view(request_now)
+        .await
+        .unwrap_or_else(|error| panic!("verify replacement lease and collector: {error}"));
+    let replacement_collector = replacement_view
+        .collectors
+        .get(&replacement)
+        .unwrap_or_else(|| panic!("replacement collector is absent from the live routing view"));
+    assert_eq!(replacement_collector.state, CollectorState::Ready);
+    assert!(replacement_collector.registration.is_live_at(request_now));
+    assert!(replacement_lease.is_routable_at(request_now));
+    assert_ne!(replacement_lease.holder_instance_id, original_pin.holder_instance_id);
+    assert_ne!(replacement_lease.lease_id, original_pin.lease_id);
+    assert!(
+        rank_collectors(
+            &replacement_view,
+            &key,
+            request_now,
+            &oat_policy(OAT_RUN_RESTART),
+            false
+        )
+        .contains(&replacement),
+        "replacement collector must be eligible, not merely registered"
+    );
+
+    let authority_error = store
+        .get_run_table_pin(OAT_RUN_RESTART, &key, request_now)
+        .await
+        .expect_err("bound run/table authority must remain while its owner row is missing");
+    assert_eq!(authority_error.kind(), RoutingErrorKind::CorruptState);
+    assert!(
+        authority_error
+            .to_string()
+            .contains("bound OAT table marker is missing its immutable owner")
+    );
+
+    let before_route = store.operation_counts();
+    let fresh_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);
+    let fresh = RoutingEngine::new(fresh_store, oat_policy(OAT_RUN_RESTART))
+        .unwrap_or_else(|error| panic!("create fresh OAT router: {error}"));
+    let route = fresh
+        .route_ingest_for_run(&metadata(), OAT_RUN_RESTART, millis(200_000), request_now)
+        .await;
+    assert!(matches!(route, Err(error) if error.kind() == RoutingErrorKind::CorruptState));
+
+    let after_route = store.operation_counts();
+    assert_eq!(after_route.claim_lease, before_route.claim_lease);
+    assert_eq!(
+        after_route.bind_initial_run_table_pin,
+        before_route.bind_initial_run_table_pin
+    );
+    let missing_owner_again = store
+        .get_run_table_pin(OAT_RUN_RESTART, &key, request_now)
+        .await
+        .expect_err("failed request must not recreate the missing owner row");
+    assert_eq!(missing_owner_again.kind(), RoutingErrorKind::CorruptState);
+    assert!(
+        missing_owner_again
+            .to_string()
+            .contains("bound OAT table marker is missing its immutable owner")
+    );
+    let after_rejection = store
+        .load_view(request_now)
+        .await
+        .unwrap_or_else(|error| panic!("verify rejected route did not rewrite lease state: {error}"));
+    assert_eq!(after_rejection.leases.get(&key), Some(&replacement_lease));
+}
+
+#[tokio::test]
 async fn oat_pin_fails_closed_on_lease_expiry_without_selecting_a_replacement() {
     let (store, first, second) = seeded_store().await;
     let engine_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);
@@ -704,8 +801,14 @@ async fn oat_pin_fails_closed_on_lease_expiry_without_selecting_a_replacement() 
         .route_ingest_for_run(&metadata(), OAT_RUN_EXPIRY, millis(200_000), millis(100_001))
         .await
         .unwrap_or_else(|error| panic!("initial OAT route: {error}"));
-    let pinned = initial.lease.unwrap_or_else(|| panic!("OAT route did not return a lease"));
-    let replacement = if pinned.holder_instance_id == first { second } else { first };
+    let pinned = initial
+        .lease
+        .unwrap_or_else(|| panic!("OAT route did not return a lease"));
+    let replacement = if pinned.holder_instance_id == first {
+        second
+    } else {
+        first
+    };
     let claim = store
         .claim_lease(&LeaseClaim {
             key: pinned.key.clone(),
@@ -789,9 +892,7 @@ async fn oat_pin_rejects_an_attempt_to_replace_the_run_owner() {
     assert_eq!(idempotent.expires_at_unix_ms, millis(200_000));
     let mut changed_expiry = same_owner;
     changed_expiry.expires_at_unix_ms = millis(250_000);
-    let expiry_result = store
-        .bind_initial_run_table_pin(&changed_expiry, millis(100_002))
-        .await;
+    let expiry_result = store.bind_initial_run_table_pin(&changed_expiry, millis(100_002)).await;
     assert!(matches!(expiry_result, Err(error) if error.kind() == RoutingErrorKind::Conflict));
 
     let retry = engine
@@ -813,11 +914,21 @@ async fn oat_pin_uses_canonical_full_table_identity() {
         .unwrap_or_else(|error| panic!("initial refresh: {error}"));
     initialize_memory_oat_pin(&engine, OAT_RUN_CANONICAL, millis(100_001), millis(200_000)).await;
     let lower = engine
-        .route_ingest_for_run(&metadata_for("traces"), OAT_RUN_CANONICAL, millis(200_000), millis(100_001))
+        .route_ingest_for_run(
+            &metadata_for("traces"),
+            OAT_RUN_CANONICAL,
+            millis(200_000),
+            millis(100_001),
+        )
         .await
         .unwrap_or_else(|error| panic!("route lower-case table: {error}"));
     let mixed = engine
-        .route_ingest_for_run(&metadata_for("TrAcEs"), OAT_RUN_CANONICAL, millis(200_000), millis(100_002))
+        .route_ingest_for_run(
+            &metadata_for("TrAcEs"),
+            OAT_RUN_CANONICAL,
+            millis(200_000),
+            millis(100_002),
+        )
         .await
         .unwrap_or_else(|error| panic!("route mixed-case table: {error}"));
     assert_eq!(lower.instance_id, mixed.instance_id);
@@ -875,24 +986,14 @@ async fn missing_or_unavailable_oat_pin_authority_never_falls_back_to_collector_
         .unwrap_or_else(|error| panic!("initial refresh: {error}"));
     let before = store.operation_counts();
     let missing = engine
-        .route_ingest_for_run(
-            &metadata(),
-            OAT_RUN_UNAUTHORIZED,
-            millis(200_000),
-            millis(100_001),
-        )
+        .route_ingest_for_run(&metadata(), OAT_RUN_UNAUTHORIZED, millis(200_000), millis(100_001))
         .await;
     assert!(matches!(missing, Err(error) if error.kind() == RoutingErrorKind::Conflict));
     assert_eq!(store.operation_counts().claim_lease, before.claim_lease);
 
     store.set_available(false);
     let unavailable = engine
-        .route_ingest_for_run(
-            &metadata(),
-            OAT_RUN_UNAUTHORIZED,
-            millis(200_000),
-            millis(100_002),
-        )
+        .route_ingest_for_run(&metadata(), OAT_RUN_UNAUTHORIZED, millis(200_000), millis(100_002))
         .await;
     assert!(matches!(unavailable, Err(error) if error.kind() == RoutingErrorKind::Database));
     assert_eq!(store.operation_counts().claim_lease, before.claim_lease);

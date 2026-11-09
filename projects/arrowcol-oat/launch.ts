@@ -37,7 +37,7 @@ export async function launchOat(
     ? {
         ...parsedConfig,
         platform: {
-          ...(Object.hasOwn(parsedConfig, 'platform') && typeof parsedConfig.platform === 'object' && parsedConfig.platform !== null
+          ...(Object.hasOwn(parsedConfig, 'platform') && 'platform' in parsedConfig && typeof parsedConfig.platform === 'object' && parsedConfig.platform !== null
             ? parsedConfig.platform
             : {}),
           kind: mode,

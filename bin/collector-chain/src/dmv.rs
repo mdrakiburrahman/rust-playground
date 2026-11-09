@@ -275,9 +275,7 @@ fn request_metadata<T>(request: &mut Request<T>, table: &DmvTable, signer: Optio
         );
     }
     if let Some(run_id) = std::env::var_os(OAT_RUN_ID_ENV) {
-        let run_id = run_id
-            .to_str()
-            .context("ARROWCOL_OAT_RUN_ID must be valid Unicode")?;
+        let run_id = run_id.to_str().context("ARROWCOL_OAT_RUN_ID must be valid Unicode")?;
         validate_oat_run_id(run_id)?;
         headers.insert(
             http::header::HeaderName::from_static(OAT_RUN_ID_HEADER),

@@ -949,7 +949,10 @@ impl RoutingStore for RawSqlStore {
                         RoutingErrorKind::Conflict,
                         "bound OAT run-table marker is missing its immutable owner row",
                     )),
-                    _ => Err(RoutingError::new(RoutingErrorKind::CorruptState, "OAT run marker has an invalid state")),
+                    _ => Err(RoutingError::new(
+                        RoutingErrorKind::CorruptState,
+                        "OAT run marker has an invalid state",
+                    )),
                 };
             };
             if marker_state != "bound" {
@@ -1809,9 +1812,9 @@ async fn verify_run_pin_set(
         .into_first_result()
         .await
         .map_err(|cause| database_error("read OAT run pin set verification", cause))?;
-    let row = rows.first().ok_or_else(|| {
-        RoutingError::new(RoutingErrorKind::Conflict, "immutable OAT run pin set is missing")
-    })?;
+    let row = rows
+        .first()
+        .ok_or_else(|| RoutingError::new(RoutingErrorKind::Conflict, "immutable OAT run pin set is missing"))?;
     if required_i64(row, "expected_table_count")? != i64::from(expected_count)
         || required_i64(row, "actual_table_count")? != i64::from(expected_count)
         || required_str(row, "expected_table_set_sha256")? != expected_digest
@@ -1843,9 +1846,9 @@ async fn validate_live_run_pin_set(client: &mut SqlClient, run_id: Uuid, now: Un
         .into_first_result()
         .await
         .map_err(|cause| database_error("read OAT run pin set validation", cause))?;
-    let row = rows.first().ok_or_else(|| {
-        RoutingError::new(RoutingErrorKind::Conflict, "immutable OAT run pin set is missing")
-    })?;
+    let row = rows
+        .first()
+        .ok_or_else(|| RoutingError::new(RoutingErrorKind::Conflict, "immutable OAT run pin set is missing"))?;
     if required_i64(row, "expected_table_count")? != required_i64(row, "actual_table_count")?
         || required_str(row, "expected_table_set_sha256")? != required_str(row, "actual_table_set_sha256")?
         || unix_millis(required_datetime(row, "expires_at_utc")?)? <= now
@@ -1858,17 +1861,9 @@ async fn validate_live_run_pin_set(client: &mut SqlClient, run_id: Uuid, now: Un
     Ok(())
 }
 
-fn validate_run_id(run_id: &str) -> RoutingResult<()> {
-    parse_run_id(run_id).map(|_| ())
-}
-
 fn parse_run_id(run_id: &str) -> RoutingResult<uuid::Uuid> {
-    let parsed = uuid::Uuid::parse_str(run_id).map_err(|_| {
-        RoutingError::new(
-            RoutingErrorKind::InvalidConfiguration,
-            "OAT run ID must be a UUID",
-        )
-    })?;
+    let parsed = uuid::Uuid::parse_str(run_id)
+        .map_err(|_| RoutingError::new(RoutingErrorKind::InvalidConfiguration, "OAT run ID must be a UUID"))?;
     if parsed.to_string() != run_id {
         return Err(RoutingError::new(
             RoutingErrorKind::InvalidConfiguration,
@@ -1929,7 +1924,10 @@ async fn validate_sql_run_pin(client: &mut SqlClient, pin: &RunTablePin, now: Un
         .await
         .map_err(|cause| database_error("read pinned collector process", cause))?;
     let row = rows.first().ok_or_else(|| {
-        RoutingError::new(RoutingErrorKind::Conflict, "pinned collector process registration is missing")
+        RoutingError::new(
+            RoutingErrorKind::Conflict,
+            "pinned collector process registration is missing",
+        )
     })?;
     if parse_pool(required_str(row, "implementation_pool")?)? != pin.key.implementation_pool
         || parse_collector_state(required_str(row, "state")?)? != CollectorState::Ready

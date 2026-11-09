@@ -1,8 +1,6 @@
 use crate::config::OatConfig;
 use crate::model::{AppState, RunState, unix_time_ms};
 use anyhow::{Context, Result, bail};
-use arrowcol_protocol::{ImplementationPool, UnixMillis};
-use arrowcol_routing::{LeaseKey, PressurePolicy, RoutingPolicy, run_table_pin_set_digest};
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
     TimestampMillisecondArray, UInt64Array,
@@ -10,13 +8,13 @@ use arrow::array::{
 use arrow::compute::{concat_batches, take};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow_deltalake::delta::object_store_for_url;
+use arrowcol_protocol::ImplementationPool;
+use arrowcol_routing::{LeaseKey, PressurePolicy, RoutingPolicy, run_table_pin_set_digest};
+use bytes::Bytes;
 use chrono::DateTime;
 use fs2::FileExt;
 use futures_util::future::join_all;
-use object_store::{
-    GetOptions, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion,
-    path::Path as ObjectPath,
-};
+use object_store::{GetOptions, ObjectStore, PutMode, PutOptions, PutPayload, UpdateVersion, path::Path as ObjectPath};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde_json::{Value, json};
@@ -230,7 +228,15 @@ impl Platform for AksPlatform {
         expires_at_unix_ms: u64,
         now_unix_ms: u64,
     ) -> Result<()> {
-        run_aks_pin_setup_job(config, self, run_id, expected_keys_json, expires_at_unix_ms, now_unix_ms).await
+        run_aks_pin_setup_job(
+            config,
+            self,
+            run_id,
+            expected_keys_json,
+            expires_at_unix_ms,
+            now_unix_ms,
+        )
+        .await
     }
 
     fn qap_observation_mode(&self) -> arrowcol_loadgen::ObservationMode {
@@ -247,19 +253,22 @@ impl Platform for AksPlatform {
 
     async fn initialize_qap(&mut self, _config: &OatConfig, run_id: &str, tables: &[String]) -> Result<Vec<String>> {
         let bindings = qap_bindings(run_id, tables)?;
-        let runtime_dir = self.runtime_dir.as_deref().context("AKS runtime directory is not available")?;
+        let runtime_dir = self
+            .runtime_dir
+            .as_deref()
+            .context("AKS runtime directory is not available")?;
         let manifest_path = runtime_dir.join("oat-qap-manifest.json");
         let record_path = runtime_dir.join("oat-qap-record.json");
         let manifest = json!({
             "schema_version": 1,
             "run_id": run_id,
-            "tables": bindings.iter().map(|binding| json!({
+            "tables": bindings.iter().map(|binding| Ok(json!({
                 "external_table": binding.external_table,
                 "relative_path": aks_qap_relative_path(
                     self.qap_relative_data_root.as_deref().context("AKS run-scoped data root is missing")?,
                     &binding.logical_table,
                 )?,
-            })).collect::<Result<Vec<_>>>()?,
+            }))).collect::<Result<Vec<_>>>()?,
         });
         tokio::fs::write(&manifest_path, serde_json::to_vec(&manifest)?)
             .await
@@ -278,8 +287,8 @@ impl Platform for AksPlatform {
             None,
             &record_path,
         )
-            .await
-            .context("bind run-owned AKS QAP external tables")?;
+        .await
+        .context("bind run-owned AKS QAP external tables")?;
         require_nonempty_record(&record_path).await?;
         run_oat_qap_helper("verify-oat-qap", run_id, None, None, None, &record_path)
             .await
@@ -308,13 +317,10 @@ impl Platform for AksPlatform {
             },
             "data": { "schedule": "pending" },
         }))?;
-        kubectl(
-            config,
-            vec!["create", "-f", "-"],
-            Some(payload),
-        )
-        .await
-        .context("create unique AKS client schedule ConfigMap")
+        kubectl(config, vec!["create", "-f", "-"], Some(payload))
+            .await
+            .context("create unique AKS client schedule ConfigMap")
+            .map(|_| ())
     }
 
     async fn start_client(
@@ -353,9 +359,14 @@ impl Platform for AksPlatform {
             },
             "data": { "schedule": run_start_unix_ms.to_string() },
         }))?;
-        kubectl(config, vec!["apply", "--namespace", &config.namespace, "-f", "-"], Some(payload))
-            .await
-            .context("arm the common AKS client measurement schedule")
+        kubectl(
+            config,
+            vec!["apply", "--namespace", &config.namespace, "-f", "-"],
+            Some(payload),
+        )
+        .await
+        .context("arm the common AKS client measurement schedule")
+        .map(|_| ())
     }
 
     async fn finish_client(&self, config: &OatConfig, handle: ClientHandle) -> Result<String> {
@@ -414,7 +425,15 @@ impl Platform for LocalPlatform {
         expires_at_unix_ms: u64,
         now_unix_ms: u64,
     ) -> Result<()> {
-        run_local_pin_setup(config, self, run_id, expected_keys_json, expires_at_unix_ms, now_unix_ms).await
+        run_local_pin_setup(
+            config,
+            self,
+            run_id,
+            expected_keys_json,
+            expires_at_unix_ms,
+            now_unix_ms,
+        )
+        .await
     }
 
     fn qap_observation_mode(&self) -> arrowcol_loadgen::ObservationMode {
@@ -473,11 +492,7 @@ impl Platform for LocalPlatform {
         poll_local_client(handle).await
     }
 
-    async fn poll_client_fleet(
-        &self,
-        _config: &OatConfig,
-        handles: &[ClientHandle],
-    ) -> Result<Vec<ClientProgress>> {
+    async fn poll_client_fleet(&self, _config: &OatConfig, handles: &[ClientHandle]) -> Result<Vec<ClientProgress>> {
         poll_local_client_fleet(handles, &self.client_progress).await
     }
 
@@ -517,7 +532,10 @@ impl LocalPlatform {
             .context("local compose state root is missing")?;
         let state_dir = std::env::current_dir()?.join(state_root).join(run_id);
         if state_dir.exists() {
-            bail!("run-scoped local OAT state directory already exists: {}", state_dir.display());
+            bail!(
+                "run-scoped local OAT state directory already exists: {}",
+                state_dir.display()
+            );
         }
         fs::create_dir_all(state_dir.parent().context("local OAT state directory has no parent")?)?;
         fs::create_dir(&state_dir)
@@ -587,8 +605,14 @@ fn prepare_local_state(config: &OatConfig, state_dir: &Path, run_id: &str) -> Re
     let mut environment = HashMap::from([
         ("LOADTEST_UID".to_owned(), uid),
         ("LOADTEST_GID".to_owned(), gid),
-        ("LOADTEST_WORKSPACE".to_owned(), workspace.to_string_lossy().into_owned()),
-        ("LOADTEST_BIN_HOST_PATH".to_owned(), workspace.to_string_lossy().into_owned()),
+        (
+            "LOADTEST_WORKSPACE".to_owned(),
+            workspace.to_string_lossy().into_owned(),
+        ),
+        (
+            "LOADTEST_BIN_HOST_PATH".to_owned(),
+            workspace.to_string_lossy().into_owned(),
+        ),
         ("ONELAKE_HOST_PATH".to_owned(), state_dir.to_string_lossy().into_owned()),
         ("SQLSERVER_PORT".to_owned(), "0".to_owned()),
         ("LOADTEST_CATALOG_PORT".to_owned(), "0".to_owned()),
@@ -650,7 +674,13 @@ async fn start_local_client(
     let compact_run_id: String = run_id.chars().filter(char::is_ascii_alphanumeric).take(12).collect();
     let safe_table: String = table
         .chars()
-        .map(|character| if character.is_ascii_alphanumeric() { character.to_ascii_lowercase() } else { '-' })
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect();
     let container_name = format!("oat-client-{compact_run_id}-{safe_table}-c{client_index}");
     let mut command = compose_command(
@@ -695,7 +725,10 @@ async fn poll_local_client(handle: &ClientHandle) -> Result<ClientProgress> {
     )
     .await?;
     let state = String::from_utf8(inspect.stdout).context("local OAT container state was not UTF-8")?;
-    let (state, exit_code) = state.trim().split_once('|').context("parse local OAT container state")?;
+    let (state, exit_code) = state
+        .trim()
+        .split_once('|')
+        .context("parse local OAT container state")?;
     let exit_code = exit_code
         .parse::<i32>()
         .context("parse local OAT container exit code")?;
@@ -764,9 +797,7 @@ async fn poll_local_client_fleet(
             let ClientProcess::Local { container_id } = &handle.process else {
                 return None;
             };
-            let exited = states
-                .get(container_id)
-                .is_some_and(|(status, _)| status == "exited");
+            let exited = states.get(container_id).is_some_and(|(status, _)| status == "exited");
             (exited || !previous[index].ready || !previous[index].schedule_received).then_some(index)
         })
         .collect::<Vec<_>>();
@@ -774,7 +805,12 @@ async fn poll_local_client_fleet(
         let container_id = match &handles[*index].process {
             ClientProcess::Local { container_id } => container_id,
             ClientProcess::Aks { .. } => {
-                return (*index, Err(anyhow::anyhow!("local client fleet poll received a non-local process handle")));
+                return (
+                    *index,
+                    Err(anyhow::anyhow!(
+                        "local client fleet poll received a non-local process handle"
+                    )),
+                );
             }
         };
         let mut command = Command::new("docker");
@@ -830,7 +866,10 @@ async fn finish_local_client(handle: ClientHandle) -> Result<String> {
         bail!("{failure}");
     }
     if !progress.completed {
-        bail!("local OAT client container {} was not complete at finish", handle.client_id);
+        bail!(
+            "local OAT client container {} was not complete at finish",
+            handle.client_id
+        );
     }
     let mut remove = Command::new("docker");
     remove.args(["rm", container_id]);
@@ -1074,7 +1113,16 @@ async fn poll_aks_client_fleet(
     let selector = format!("app=arrowcol-oat-client,arrowcol-oat-run={run_label}");
     let jobs_output = kubectl(
         config,
-        vec!["get", "jobs", "--namespace", &config.namespace, "--selector", &selector, "-o", "json"],
+        vec![
+            "get",
+            "jobs",
+            "--namespace",
+            &config.namespace,
+            "--selector",
+            &selector,
+            "-o",
+            "json",
+        ],
         None,
     )
     .await
@@ -1206,7 +1254,7 @@ async fn cancel_aks_client_job(config: &OatConfig, handle: &ClientHandle) -> Res
 ///
 /// Returns an error if configuration, Kubernetes operations, measurement, restoration,
 /// or result publication fails.
-pub async fn execute(mut config: OatConfig, id: &str, state: Arc<AppState>) -> Result<usize> {
+pub async fn execute(config: OatConfig, id: &str, state: Arc<AppState>) -> Result<usize> {
     config.validate()?;
     state
         .update(id, |status| {
@@ -1224,64 +1272,55 @@ pub async fn execute(mut config: OatConfig, id: &str, state: Arc<AppState>) -> R
         })
         .await;
     publish_results(&config, &results).await?;
-    if let Some(violation) = results
-        .iter()
-        .find_map(|row| row.pinning_error.as_deref())
-    {
+    if let Some(violation) = results.iter().find_map(|row| row.pinning_error.as_deref()) {
         bail!("pinning_violation: {violation}");
     }
     Ok(results.len())
 }
 
-async fn run_matrix(
-    config: &OatConfig,
-    orchestration_id: &str,
-    state: &AppState,
-) -> Result<Vec<OatResult>> {
+async fn run_matrix(config: &OatConfig, orchestration_id: &str, state: &AppState) -> Result<Vec<OatResult>> {
     let mut results = Vec::new();
     let cells = matrix_cell_specs(config);
     let total = cells.len();
     for (completed, (replicas, concurrency, run_id)) in cells.into_iter().enumerate() {
-            state
-                .update(orchestration_id, |status| {
-                    status.progress = format!(
-                        "experiment {}/{total}: ArrowCol replicas={replicas}, DFE --num-cores={concurrency}",
-                        completed + 1
-                    );
-                })
-                .await;
-            let cell_config = config_for_run(config, &run_id)?;
-            let mut platform = platform_for_run(&cell_config, &run_id)?;
-            if let Err(prepare_error) = platform.ensure_stack(&cell_config).await {
-                let cleanup_error = platform.cleanup(&cell_config).await;
-                return match cleanup_error {
-                    Ok(()) => Err(prepare_error).context("prepare isolated OAT matrix-cell platform"),
-                    Err(cleanup_error) => Err(prepare_error.context(format!(
-                        "platform cleanup after preparation also failed: {cleanup_error:#}"
-                    ))),
-                };
-            }
-            let cell_result = run_matrix_cell(
-                &cell_config,
-                orchestration_id,
-                &run_id,
-                replicas,
-                concurrency,
-                platform.as_mut(),
-            )
+        state
+            .update(orchestration_id, |status| {
+                status.progress = format!(
+                    "experiment {}/{total}: ArrowCol replicas={replicas}, DFE --num-cores={concurrency}",
+                    completed + 1
+                );
+            })
             .await;
-            let cleanup_result = platform.cleanup(&cell_config).await;
-            let mut cell_rows = match (cell_result, cleanup_result) {
-                (Ok(rows), Ok(())) => rows,
-                (Err(run_error), Ok(())) => return Err(run_error),
-                (Ok(_), Err(cleanup_error)) => return Err(cleanup_error).context("clean up isolated matrix-cell platform"),
-                (Err(run_error), Err(cleanup_error)) => {
-                    return Err(run_error.context(format!(
-                        "matrix-cell platform cleanup also failed: {cleanup_error:#}"
-                    )));
-                }
+        let cell_config = config_for_run(config, &run_id)?;
+        let mut platform = platform_for_run(&cell_config, &run_id)?;
+        if let Err(prepare_error) = platform.ensure_stack(&cell_config).await {
+            let cleanup_error = platform.cleanup(&cell_config).await;
+            return match cleanup_error {
+                Ok(()) => Err(prepare_error).context("prepare isolated OAT matrix-cell platform"),
+                Err(cleanup_error) => Err(prepare_error.context(format!(
+                    "platform cleanup after preparation also failed: {cleanup_error:#}"
+                ))),
             };
-            results.append(&mut cell_rows);
+        }
+        let cell_result = run_matrix_cell(
+            &cell_config,
+            orchestration_id,
+            &run_id,
+            replicas,
+            concurrency,
+            platform.as_mut(),
+        )
+        .await;
+        let cleanup_result = platform.cleanup(&cell_config).await;
+        let mut cell_rows = match (cell_result, cleanup_result) {
+            (Ok(rows), Ok(())) => rows,
+            (Err(run_error), Ok(())) => return Err(run_error),
+            (Ok(_), Err(cleanup_error)) => return Err(cleanup_error).context("clean up isolated matrix-cell platform"),
+            (Err(run_error), Err(cleanup_error)) => {
+                return Err(run_error.context(format!("matrix-cell platform cleanup also failed: {cleanup_error:#}")));
+            }
+        };
+        results.append(&mut cell_rows);
     }
     Ok(results)
 }
@@ -1291,9 +1330,10 @@ fn matrix_cell_specs(config: &OatConfig) -> Vec<(u32, u32, String)> {
         .replica_counts
         .iter()
         .flat_map(|replicas| {
-            config.dfe_worker_concurrency.iter().map(move |concurrency| {
-                (*replicas, *concurrency, uuid::Uuid::new_v4().to_string())
-            })
+            config
+                .dfe_worker_concurrency
+                .iter()
+                .map(move |concurrency| (*replicas, *concurrency, uuid::Uuid::new_v4().to_string()))
         })
         .collect()
 }
@@ -1320,7 +1360,8 @@ fn platform_for_run(config: &OatConfig, run_id: &str) -> Result<Box<dyn Platform
             workload_stop_record_path: None,
             schedule_configmap_name: format!(
                 "oat-schedule-{}",
-                run_id.chars()
+                run_id
+                    .chars()
                     .filter(|character| character.is_ascii_alphanumeric())
                     .take(16)
                     .collect::<String>()
@@ -1335,10 +1376,14 @@ fn config_for_run(config: &OatConfig, run_id: &str) -> Result<OatConfig> {
     let mut cell_config = config.clone();
     if cell_config.platform.kind == crate::config::OatMode::Aks {
         cell_config.namespace = scoped_aks_namespace(&config.namespace, run_id)?;
-        cell_config.arrowcol_endpoint =
-            format!("http://arrowcol-router.{}.svc.cluster.local:50050", cell_config.namespace);
-        cell_config.router_metrics_endpoint =
-            format!("http://arrowcol-router.{}.svc.cluster.local:50050/metrics", cell_config.namespace);
+        cell_config.arrowcol_endpoint = format!(
+            "http://arrowcol-router.{}.svc.cluster.local:50050",
+            cell_config.namespace
+        );
+        cell_config.router_metrics_endpoint = format!(
+            "http://arrowcol-router.{}.svc.cluster.local:50050/metrics",
+            cell_config.namespace
+        );
     }
     cell_config.validate()?;
     Ok(cell_config)
@@ -1418,8 +1463,7 @@ fn default_oat_run_pin_ttl_ms() -> u64 {
 }
 
 fn routing_policy_from_yaml(router_yaml: &str, run_id: &str) -> Result<RoutingPolicy> {
-    let router: RouterYaml =
-        serde_yaml::from_str(router_yaml).context("parse exact rendered router routing config")?;
+    let router: RouterYaml = serde_yaml::from_str(router_yaml).context("parse exact rendered router routing config")?;
     let routing = router.routing;
     let policy = RoutingPolicy {
         pressure: PressurePolicy {
@@ -1450,10 +1494,7 @@ fn routing_policy_from_yaml(router_yaml: &str, run_id: &str) -> Result<RoutingPo
 fn rendered_router_yaml(resources: &[Value]) -> Result<String> {
     let mut matches = resources.iter().filter(|resource| {
         resource.get("kind").and_then(Value::as_str) == Some("ConfigMap")
-            && resource
-                .pointer("/metadata/name")
-                .and_then(Value::as_str)
-                == Some("arrowcol-config")
+            && resource.pointer("/metadata/name").and_then(Value::as_str) == Some("arrowcol-config")
     });
     let config = matches
         .next()
@@ -1492,8 +1533,7 @@ async fn run_matrix_cell(
             pin_now_unix_ms,
         )
         .await?;
-    let started_at_ms =
-        i64::try_from(unix_time_ms()).context("run start timestamp exceeds Arrow timestamp range")?;
+    let started_at_ms = i64::try_from(unix_time_ms()).context("run start timestamp exceeds Arrow timestamp range")?;
     let client_run = run_clients(config, run_id, &assigned_tables, platform).await?;
     let client_count = config
         .clients_per_table
@@ -1531,10 +1571,7 @@ async fn run_matrix_cell(
             .metrics
             .get(&table)
             .with_context(|| format!("DMV client did not report measurements for {table}"))?;
-        let owner = client_run
-            .pinning
-            .owners
-            .get(&canonical_table_key(&table));
+        let owner = client_run.pinning.owners.get(&canonical_table_key(&table));
         let pinning_ok = client_run.pinning.violation.is_none();
         rows.push(OatResult {
             run_id: run_id.to_owned(),
@@ -1731,8 +1768,8 @@ async fn run_clients(
             };
         }
     };
-    let schedule_deadline = tokio::time::Instant::now()
-        + Duration::from_secs(crate::config::SCHEDULE_DELIVERY_TIMEOUT_SECONDS);
+    let schedule_deadline =
+        tokio::time::Instant::now() + Duration::from_secs(crate::config::SCHEDULE_DELIVERY_TIMEOUT_SECONDS);
     let run_start_unix_ms = unix_time_ms_u64()?
         .checked_add(crate::config::SCHEDULE_DELIVERY_TIMEOUT_SECONDS.saturating_mul(1_000))
         .context("shared OAT run start timestamp overflow")?;
@@ -1791,9 +1828,8 @@ async fn run_clients(
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     if !schedule_acknowledged {
-        let error = anyhow::anyhow!(
-            "OAT client schedule acknowledgement timed out or the final armed window was missed"
-        );
+        let error =
+            anyhow::anyhow!("OAT client schedule acknowledgement timed out or the final armed window was missed");
         let cleanup = cancel_clients(platform, config, &handles).await;
         return match cleanup {
             Ok(()) => Err(error),
@@ -1839,8 +1875,7 @@ async fn run_clients(
                 let output = match platform.finish_client(config, handle.clone()).await {
                     Ok(output) => output,
                     Err(error) => {
-                        let cleanup =
-                            cancel_active_clients(platform, config, &handles, &active_clients).await;
+                        let cleanup = cancel_active_clients(platform, config, &handles, &active_clients).await;
                         return match cleanup {
                             Ok(()) => Err(error),
                             Err(cleanup_error) => Err(error.context(format!(
@@ -1859,14 +1894,10 @@ async fn run_clients(
                         config.pilot_mode,
                     )
                     .with_context(|| format!("validate client measurement interval for {}", handle.table))?;
-                    if report.rows == 0
-                        || !report.rows_per_second.is_finite()
-                        || report.rows_per_second <= 0.0
-                    {
+                    if report.rows == 0 || !report.rows_per_second.is_finite() || report.rows_per_second <= 0.0 {
                         bail!("DMV client for {} returned invalid measured throughput", handle.table);
                     }
-                    let duration_ms =
-                        u64::try_from((report.duration_seconds * 1000.0).round() as u128)?.max(1);
+                    let duration_ms = u64::try_from((report.duration_seconds * 1000.0).round() as u128)?.max(1);
                     Ok::<_, anyhow::Error>(ClientMeasurement {
                         metrics: ClientMetrics {
                             rows: report.rows,
@@ -1879,8 +1910,7 @@ async fn run_clients(
                 let measurement = match measurement {
                     Ok(measurement) => measurement,
                     Err(error) => {
-                        let cleanup =
-                            cancel_active_clients(platform, config, &handles, &active_clients).await;
+                        let cleanup = cancel_active_clients(platform, config, &handles, &active_clients).await;
                         return match cleanup {
                             Ok(()) => Err(error),
                             Err(cleanup_error) => Err(error.context(format!(
@@ -1889,7 +1919,10 @@ async fn run_clients(
                         };
                     }
                 };
-                client_metrics.entry(handle.table.clone()).or_default().push(measurement);
+                client_metrics
+                    .entry(handle.table.clone())
+                    .or_default()
+                    .push(measurement);
                 completed_clients.insert(handle.client_id.clone());
             }
         }
@@ -1907,10 +1940,10 @@ async fn run_clients(
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
-    if let Some(error) = sample_table_owners(&metrics_client, &metrics_endpoint, tables).await
+    if let Some(error) = sample_table_owners(&metrics_client, &metrics_endpoint, tables)
+        .await
         .and_then(|sample| {
-            check_owner_sample(tables, &sample, &mut owners)
-                .map_or(Ok(()), |error| Err(anyhow::anyhow!(error)))
+            check_owner_sample(tables, &sample, &mut owners).map_or(Ok(()), |error| Err(anyhow::anyhow!(error)))
         })
         .err()
     {
@@ -1937,10 +1970,7 @@ async fn run_clients(
             .iter()
             .try_fold(0_u64, |sum, report| sum.checked_add(report.metrics.rows))
             .context("aggregated DMV row count overflow")?;
-        let rows_per_second = reports
-            .iter()
-            .map(|report| report.metrics.rows_per_second)
-            .sum::<f64>();
+        let rows_per_second = reports.iter().map(|report| report.metrics.rows_per_second).sum::<f64>();
         if !rows_per_second.is_finite() || rows_per_second <= 0.0 {
             bail!("aggregated DMV throughput for {table} is invalid");
         }
@@ -1955,9 +1985,7 @@ async fn run_clients(
         }
         if config.pilot_mode {
             let expected_windows = config.measure_seconds / 30;
-            if windows.len() != expected_windows as usize
-                || windows.keys().copied().ne(0..expected_windows)
-            {
+            if windows.len() != expected_windows as usize || windows.keys().copied().ne(0..expected_windows) {
                 bail!("pilot clients returned an incomplete 30-second window set for {table}");
             }
             let mut rates = Vec::with_capacity(windows.len());
@@ -1969,8 +1997,8 @@ async fn run_clients(
                     index + 1
                 );
             }
-            let stable_horizon = stable_window_horizon(&rates)
-                .map_or_else(|| "none".to_owned(), |seconds| seconds.to_string());
+            let stable_horizon =
+                stable_window_horizon(&rates).map_or_else(|| "none".to_owned(), |seconds| seconds.to_string());
             println!("pilot_table={table} stable_from_seconds={stable_horizon}");
         } else if !windows.is_empty() {
             bail!("non-pilot DMV client unexpectedly returned pilot windows for {table}");
@@ -1979,7 +2007,11 @@ async fn run_clients(
             table.clone(),
             ClientMetrics {
                 rows,
-                duration_ms: reports.iter().map(|report| report.metrics.duration_ms).max().unwrap_or(1),
+                duration_ms: reports
+                    .iter()
+                    .map(|report| report.metrics.duration_ms)
+                    .max()
+                    .unwrap_or(1),
                 rows_per_second,
             },
         );
@@ -1991,11 +2023,7 @@ async fn run_clients(
     })
 }
 
-fn validate_client_readiness(
-    clients: &[ClientProgress],
-    elapsed: Duration,
-    timeout: Duration,
-) -> Result<bool> {
+fn validate_client_readiness(clients: &[ClientProgress], elapsed: Duration, timeout: Duration) -> Result<bool> {
     if let Some(failure) = clients.iter().find_map(|client| client.failure.as_deref()) {
         bail!("OAT client failed during preflight: {failure}");
     }
@@ -2015,7 +2043,10 @@ fn validate_client_schedule(clients: &[ClientProgress], now_unix_ms: u64, run_st
     if let Some(failure) = clients.iter().find_map(|client| client.failure.as_deref()) {
         bail!("OAT client failed while receiving armed schedule: {failure}");
     }
-    if clients.iter().any(|client| client.completed && !client.schedule_received) {
+    if clients
+        .iter()
+        .any(|client| client.completed && !client.schedule_received)
+    {
         bail!("an OAT client completed without receiving the final armed schedule");
     }
     if clients.iter().all(|client| client.schedule_received) {
@@ -2083,6 +2114,7 @@ async fn sample_table_owners(
 ) -> Result<HashMap<String, Vec<String>>> {
     let response = client
         .get(endpoint)
+        .send()
         .await
         .with_context(|| format!("GET router metrics {endpoint}"))?
         .error_for_status()
@@ -2096,7 +2128,10 @@ fn parse_owner_metrics(body: &str, tables: &[String]) -> Result<HashMap<String, 
         .iter()
         .map(|table| (canonical_table_key(table), Vec::new()))
         .collect::<HashMap<_, _>>();
-    for line in body.lines().filter(|line| line.starts_with("arrowcol_router_table_owners{")) {
+    for line in body
+        .lines()
+        .filter(|line| line.starts_with("arrowcol_router_table_owners{"))
+    {
         let close = line.find('}').context("malformed table-owner metric labels")?;
         let labels = parse_metric_labels(&line["arrowcol_router_table_owners{".len()..close])?;
         if labels.get("state").map(String::as_str) != Some("active") {
@@ -2112,7 +2147,9 @@ fn parse_owner_metrics(body: &str, tables: &[String]) -> Result<HashMap<String, 
         if value != "1" {
             bail!("table-owner gauge for {table_name} had unexpected value {value:?}");
         }
-        let collector = labels.get("collector").context("table-owner metric omitted collector label")?;
+        let collector = labels
+            .get("collector")
+            .context("table-owner metric omitted collector label")?;
         found.push(collector.clone());
     }
     Ok(owners)
@@ -2179,6 +2216,10 @@ fn unescape_prometheus_label(value: &str) -> Result<String> {
     Ok(unescaped)
 }
 
+fn canonical_table_key(table: &str) -> String {
+    table.to_ascii_lowercase()
+}
+
 fn check_owner_sample(
     tables: &[String],
     sample: &HashMap<String, Vec<String>>,
@@ -2191,9 +2232,6 @@ fn check_owner_sample(
             continue;
         }
 
-        fn canonical_table_key(table: &str) -> String {
-            table.to_ascii_lowercase()
-        }
         if current.len() != 1 {
             return Some(format!(
                 "table {table} has {} active ArrowCol owners; expected exactly one",
@@ -2203,7 +2241,9 @@ fn check_owner_sample(
         if let Some(previous) = owners.get(&key) {
             let current = &current[0];
             if previous != current {
-                return Some(format!("table {table} changed ArrowCol owner from {previous} to {current}"));
+                return Some(format!(
+                    "table {table} changed ArrowCol owner from {previous} to {current}"
+                ));
             }
         } else {
             let current = &current[0];
@@ -2245,8 +2285,7 @@ fn parse_client_metrics(output: &str) -> Result<ClientReport> {
         .and_then(|value| value.strip_prefix("rows_per_second="))
         .context("DMV client rows_per_second field is missing")?
         .parse::<f64>()?;
-    let measurement_window_start_unix_ms =
-        parse_metric_value(fields.next(), "measurement_window_start_unix_ms")?;
+    let measurement_window_start_unix_ms = parse_metric_value(fields.next(), "measurement_window_start_unix_ms")?;
     let measurement_window_end_unix_ms = parse_metric_value(fields.next(), "measurement_window_end_unix_ms")?;
     let measurement_started_unix_ms = parse_metric_value(fields.next(), "measurement_started_unix_ms")?;
     if fields.next().is_some()
@@ -2261,8 +2300,8 @@ fn parse_client_metrics(output: &str) -> Result<ClientReport> {
     let mut pilot_windows = Vec::new();
     for line in output.lines().filter(|line| line.starts_with("pilot_window=")) {
         let mut fields = line.split_whitespace();
-        let index = parse_metric_value(fields.next(), "pilot_window")?;
-        let seconds = parse_metric_value(fields.next(), "window_seconds")?;
+        let index = parse_metric_value::<u64>(fields.next(), "pilot_window")?;
+        let seconds = parse_metric_value::<u64>(fields.next(), "window_seconds")?;
         let window_rows = parse_metric_value(fields.next(), "rows")?;
         let window_rate = parse_metric_value::<f64>(fields.next(), "rows_per_second")?;
         let start_unix_ms = parse_metric_value(fields.next(), "window_start_unix_ms")?;
@@ -2275,10 +2314,7 @@ fn parse_client_metrics(output: &str) -> Result<ClientReport> {
             start_unix_ms,
         });
     }
-    if pilot_windows
-        .windows(2)
-        .any(|pair| pair[0].index >= pair[1].index)
-    {
+    if pilot_windows.windows(2).any(|pair| pair[0].index >= pair[1].index) {
         bail!("DMV client emitted duplicate or out-of-order pilot windows");
     }
     Ok(ClientReport {
@@ -2494,7 +2530,13 @@ fn scoped_compose_project(base: &str, run_id: &str) -> String {
         .collect::<String>()
         .to_ascii_lowercase();
     let prefix_limit = 48_usize.saturating_sub(suffix.len() + 1);
-    format!("{}-{suffix}", base.chars().take(prefix_limit).collect::<String>().trim_end_matches(['-', '_']))
+    format!(
+        "{}-{suffix}",
+        base.chars()
+            .take(prefix_limit)
+            .collect::<String>()
+            .trim_end_matches(['-', '_'])
+    )
 }
 
 fn compose_command(compose_file: &str, override_file: Option<&str>, project: &str, profile: &str) -> Command {
@@ -2544,8 +2586,8 @@ fn pin_init_config_json(
     if expires_at_unix_ms <= now_unix_ms {
         bail!("pin initialization expiry must be later than its start time");
     }
-    let pin_set: Value = serde_json::from_str(expected_keys_json)
-        .context("parse expected OAT table pin-set configuration")?;
+    let pin_set: Value =
+        serde_json::from_str(expected_keys_json).context("parse expected OAT table pin-set configuration")?;
     let expected_keys = pin_set
         .get("expected_keys")
         .and_then(Value::as_array)
@@ -2603,8 +2645,7 @@ async fn run_local_pin_setup(
         &router_yaml,
     )?;
     let config_path = platform.state_dir.join("pin-init.json");
-    write_private_secret(&config_path, &pin_config)
-        .context("write private local OAT pin initialization config")?;
+    write_private_secret(&config_path, &pin_config).context("write private local OAT pin initialization config")?;
     let project = scoped_compose_project(
         config
             .platform
@@ -2778,14 +2819,28 @@ async fn run_aks_pin_setup_job(
     wait_for_aks_pin_setup(config, &job_name, run_id).await?;
     kubectl(
         config,
-        vec!["delete", "job", &job_name, "--namespace", &config.namespace, "--wait=true"],
+        vec![
+            "delete",
+            "job",
+            &job_name,
+            "--namespace",
+            &config.namespace,
+            "--wait=true",
+        ],
         None,
     )
     .await
     .context("remove completed AKS OAT pin initialization Job")?;
     kubectl(
         config,
-        vec!["delete", "configmap", &config_map_name, "--namespace", &config.namespace, "--wait=true"],
+        vec![
+            "delete",
+            "configmap",
+            &config_map_name,
+            "--namespace",
+            &config.namespace,
+            "--wait=true",
+        ],
         None,
     )
     .await
@@ -2875,7 +2930,15 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
         "benchmark",
     );
     platform.add_compose_environment(&mut up);
-    up.args(["up", "--detach", "--build", "--wait", "--wait-timeout", "600", "sqlserver"]);
+    up.args([
+        "up",
+        "--detach",
+        "--build",
+        "--wait",
+        "--wait-timeout",
+        "600",
+        "sqlserver",
+    ]);
     run_command(up, "start local OAT SQL Server")
         .await
         .context("start local OAT stack")?;
@@ -2900,8 +2963,17 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
     );
     platform.add_compose_environment(&mut up);
     up.args([
-        "up", "--detach", "--build", "--wait", "--wait-timeout", "600",
-        "arrowcol-catalog", "dataflow-1", "kusto", "lgtm", "router",
+        "up",
+        "--detach",
+        "--build",
+        "--wait",
+        "--wait-timeout",
+        "600",
+        "arrowcol-catalog",
+        "dataflow-1",
+        "kusto",
+        "lgtm",
+        "router",
     ]);
     run_command(up, "start remaining local OAT stack")
         .await
@@ -3036,16 +3108,28 @@ async fn collect_local_metrics(config: &OatConfig, platform: &LocalPlatform) -> 
     list.envs(&platform.environment);
     list.args(["ps", "--quiet", "dataflow-1"]);
     let ids = String::from_utf8(run_command(list, "list local ArrowCol containers").await?.stdout)?;
-    let ids = ids.lines().map(str::trim).filter(|id| !id.is_empty()).collect::<Vec<_>>();
+    let ids = ids
+        .lines()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .collect::<Vec<_>>();
     if ids.is_empty() {
         bail!("local Compose project has no running ArrowCol containers");
     }
     let mut stats = Command::new("docker");
-    stats.args(["stats", "--no-stream", "--format", "{{.Name}} {{.CPUPerc}} {{.MemUsage}}"]);
-    stats.args(ids);
+    stats.args([
+        "stats",
+        "--no-stream",
+        "--format",
+        "{{.Name}} {{.CPUPerc}} {{.MemUsage}}",
+    ]);
+    stats.args(&ids);
     let output = run_command(stats, "sample local ArrowCol resource metrics").await?;
     let mut pods = HashMap::new();
-    for line in String::from_utf8(output.stdout)?.lines().filter(|line| !line.trim().is_empty()) {
+    for line in String::from_utf8(output.stdout)?
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+    {
         let fields = line.split_whitespace().collect::<Vec<_>>();
         if fields.len() < 4 {
             bail!("unexpected docker stats output row: {line}");
@@ -3160,7 +3244,16 @@ async fn apply_aks_overlay(config: &OatConfig, overlay: &str) -> Result<()> {
 
     let validated = kubectl(
         config,
-        vec!["apply", "--namespace", &config.namespace, "--dry-run=client", "-f", "-", "-o", "json"],
+        vec![
+            "apply",
+            "--namespace",
+            &config.namespace,
+            "--dry-run=client",
+            "-f",
+            "-",
+            "-o",
+            "json",
+        ],
         Some(rendered.as_bytes().to_vec()),
     )
     .await
@@ -3174,11 +3267,7 @@ async fn apply_aks_overlay(config: &OatConfig, overlay: &str) -> Result<()> {
             resources.push(value);
         }
     }
-    let allowed_names = config
-        .deployment_names()
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
+    let allowed_names = config.deployment_names().into_iter().map(str::to_owned).collect();
     validate_aks_overlay_resources(&resources, &allowed_names, &config.namespace)?;
 
     kubectl(
@@ -3203,7 +3292,9 @@ fn validate_aks_overlay_resources(resources: &[Value], allowed_names: &HashSet<S
             || !name.is_some_and(|name| allowed_names.contains(name))
             || resource_namespace.is_some_and(|resource_namespace| resource_namespace != namespace)
         {
-            bail!("configured AKS Kustomize overlay may only include the configured ArrowCol and DFE Deployments in the target namespace");
+            bail!(
+                "configured AKS Kustomize overlay may only include the configured ArrowCol and DFE Deployments in the target namespace"
+            );
         }
     }
     Ok(())
@@ -3274,9 +3365,7 @@ fn qap_bindings(run_id: &str, tables: &[String]) -> Result<Vec<QapBinding>> {
         .map(|table| {
             if !table.starts_with("sqlserver_")
                 || table.is_empty()
-                || !table
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                || !table.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
             {
                 bail!("OAT QAP table name {table:?} is not a canonical SQL Server DMV identity");
             }
@@ -3292,11 +3381,7 @@ fn qap_bindings(run_id: &str, tables: &[String]) -> Result<Vec<QapBinding>> {
 }
 
 fn aks_qap_relative_path(run_root: &str, table: &str) -> Result<String> {
-    if !table.starts_with("sqlserver_")
-        || !table
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-    {
+    if !table.starts_with("sqlserver_") || !table.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_') {
         bail!("OAT QAP table path has an invalid table identity");
     }
     Ok(format!("{run_root}/telemetry/sqlserver/{table}"))
@@ -3409,8 +3494,7 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
         .cloned()
         .collect::<Vec<_>>();
     if namespace_resources.len() != 1
-        || namespace_resources[0].pointer("/metadata/name").and_then(Value::as_str)
-            != Some(config.namespace.as_str())
+        || namespace_resources[0].pointer("/metadata/name").and_then(Value::as_str) != Some(config.namespace.as_str())
     {
         bail!("runtime identity phase did not render exactly the expected run namespace");
     }
@@ -3418,8 +3502,7 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
     namespace_resource["metadata"]["labels"]["arrowcol-oat/run-id"] = json!(platform.run_id);
     namespace_resource["metadata"]["annotations"]["arrowcol-oat/run-id"] = json!(platform.run_id);
     namespace_resource["metadata"]["labels"]["arrowcol-oat/owner-token"] = json!(platform.namespace_owner_token);
-    namespace_resource["metadata"]["annotations"]["arrowcol-oat/owner-token"] =
-        json!(platform.namespace_owner_token);
+    namespace_resource["metadata"]["annotations"]["arrowcol-oat/owner-token"] = json!(platform.namespace_owner_token);
     let namespace_payload = serde_json::to_vec(&serde_json::json!({
         "apiVersion": "v1",
         "kind": "List",
@@ -3430,16 +3513,17 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
         .await
         .context("create unique OAT-owned namespace without mutating an existing namespace")?;
     platform.namespace_created = true;
-    let namespace = kubectl(
-        config,
-        vec!["get", "namespace", &config.namespace, "-o", "json"],
-        None,
-    )
-    .await
-    .context("verify newly created OAT namespace ownership")?;
+    let namespace = kubectl(config, vec!["get", "namespace", &config.namespace, "-o", "json"], None)
+        .await
+        .context("verify newly created OAT namespace ownership")?;
     let namespace: Value = serde_json::from_str(&namespace).context("parse created OAT namespace")?;
-    let uid = namespace.pointer("/metadata/uid").and_then(Value::as_str).context("created OAT namespace has no UID")?;
-    if namespace.pointer("/metadata/labels/arrowcol-oat~1run-id").and_then(Value::as_str)
+    let uid = namespace
+        .pointer("/metadata/uid")
+        .and_then(Value::as_str)
+        .context("created OAT namespace has no UID")?;
+    if namespace
+        .pointer("/metadata/labels/arrowcol-oat~1run-id")
+        .and_then(Value::as_str)
         != Some(platform.run_id.as_str())
     {
         bail!("created AKS namespace is missing this run's ownership label");
@@ -3516,7 +3600,14 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
     .context("wait for run-scoped SQL bootstrap and migration Job")?;
     kubectl(
         config,
-        vec!["delete", "job", "arrowcol-migrate-v11", "--namespace", &config.namespace, "--wait=true"],
+        vec![
+            "delete",
+            "job",
+            "arrowcol-migrate-v11",
+            "--namespace",
+            &config.namespace,
+            "--wait=true",
+        ],
         None,
     )
     .await
@@ -3593,15 +3684,11 @@ async fn run_oat_qap_helper(
         command.args(["--run-id", run_id, "--manifest"]);
         command.arg(manifest_path);
         command.arg("--workload-record");
-        command.arg(
-            workload_record_path.context("QAP binding requires the verified workload ownership record")?,
-        );
+        command.arg(workload_record_path.context("QAP binding requires the verified workload ownership record")?);
     }
     if operation == "cleanup-oat-qap" {
         command.arg("--workload-stop-record");
-        command.arg(
-            workload_stop_record_path.context("QAP cleanup requires the exact-run workload stop receipt")?,
-        );
+        command.arg(workload_stop_record_path.context("QAP cleanup requires the exact-run workload stop receipt")?);
     }
     command.arg("--record");
     command.arg(record_path);
@@ -3655,13 +3742,16 @@ async fn start_router_metrics_tunnel(config: &OatConfig, platform: &mut AksPlatf
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     let mut child = command.spawn().context("start owned AKS router metrics port-forward")?;
-    let stderr = child.stderr.take().context("capture AKS router port-forward diagnostics")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("capture AKS router port-forward diagnostics")?;
     let stderr = tokio::spawn(async move {
         let mut bytes = Vec::new();
         let mut stderr = stderr;
-        stderr.read_to_end(&mut bytes).await.map(|()| bytes)
+        stderr.read_to_end(&mut bytes).await.map(|_| bytes)
     });
-    let forward = OwnedPortForward { child, stderr };
+    let mut forward = OwnedPortForward { child, stderr };
     let metrics_url = format!("http://127.0.0.1:{port}/metrics");
     let ready_url = format!("http://127.0.0.1:{port}/readyz");
     let client = reqwest::Client::builder()
@@ -3823,9 +3913,7 @@ async fn create_runtime_secrets(config: &OatConfig, secrets_dir: &Path) -> Resul
         let mut arguments = vec!["create", "secret", "generic", name, "--namespace", &config.namespace];
         let from_files = keys
             .iter()
-            .map(|(key, file)| {
-                format!("--from-file={key}={}", secrets_dir.join(file).display())
-            })
+            .map(|(key, file)| format!("--from-file={key}={}", secrets_dir.join(file).display()))
             .collect::<Vec<_>>();
         arguments.extend(from_files.iter().map(String::as_str));
         kubectl(config, arguments, None)
@@ -3909,7 +3997,9 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
         match stop_port_forward(forward).await.and_then(|stderr| Ok(stderr)) {
             Ok(stderr) => {
                 if let Err(error) = collect_port_forward_stderr(stderr).await {
-                    failures.push(format!("collect AKS router tunnel diagnostics during cleanup: {error:#}"));
+                    failures.push(format!(
+                        "collect AKS router tunnel diagnostics during cleanup: {error:#}"
+                    ));
                 }
             }
             Err(error) => failures.push(format!("stop owned AKS router metrics tunnel: {error:#}")),
@@ -3917,13 +4007,7 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
         platform.router_metrics_url = None;
     }
     if platform.namespace_created || platform.namespace_create_attempted {
-        match kubectl(
-            config,
-            vec!["get", "namespace", &config.namespace, "-o", "json"],
-            None,
-        )
-        .await
-        {
+        match kubectl(config, vec!["get", "namespace", &config.namespace, "-o", "json"], None).await {
             Ok(output) => {
                 let namespace: Value = serde_json::from_str(&output).context("parse OAT namespace during cleanup")?;
                 let ours = namespace_matches_run(
@@ -3993,7 +4077,8 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
                         platform.namespace_create_attempted = false;
                     }
                     NamespaceCleanupAction::Refuse => {
-                        failures.push("refusing AKS cleanup because namespace run ownership markers changed".to_owned());
+                        failures
+                            .push("refusing AKS cleanup because namespace run ownership markers changed".to_owned());
                     }
                 }
                 if namespace_removed && platform.qap_bind_attempted {
@@ -4027,17 +4112,12 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
     }
     if namespace_removed && platform.fic_prepare_attempted {
         if let Some(record_path) = platform.fic_record_path.as_deref() {
-            if let Err(error) = run_run_fic_helper(
-                "cleanup-run-fic",
-                &platform.run_id,
-                None,
-                None,
-                record_path,
-                None,
-            )
-            .await
+            if let Err(error) =
+                run_run_fic_helper("cleanup-run-fic", &platform.run_id, None, None, record_path, None).await
             {
-                failures.push(format!("remove exact run-owned workload identity credential: {error:#}"));
+                failures.push(format!(
+                    "remove exact run-owned workload identity credential: {error:#}"
+                ));
             }
         } else {
             failures.push("workload identity cleanup has no durable run record path".to_owned());
@@ -4054,7 +4134,10 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
             platform.qap_outcome_unresolved || !failures.is_empty(),
         );
         if let Err(error) = apply_runtime_evidence_retention(&runtime_dir, retention).await {
-            failures.push(format!("remove private AKS runtime files {}: {error:#}", runtime_dir.display()));
+            failures.push(format!(
+                "remove private AKS runtime files {}: {error:#}",
+                runtime_dir.display()
+            ));
         }
     }
     if failures.is_empty() {
@@ -4103,10 +4186,7 @@ fn qap_lease_sidecar_path(record_path: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
-async fn apply_runtime_evidence_retention(
-    directory: &Path,
-    retention: RuntimeEvidenceRetention,
-) -> Result<()> {
+async fn apply_runtime_evidence_retention(directory: &Path, retention: RuntimeEvidenceRetention) -> Result<()> {
     match retention {
         RuntimeEvidenceRetention::PreserveAll => Ok(()),
         RuntimeEvidenceRetention::PruneExcept(preserve) => remove_runtime_dir_except(directory, &preserve).await,
@@ -4467,7 +4547,10 @@ async fn acquire_local_publication_lock(target: &Path) -> Result<LocalPublicatio
             }
         }
     }
-    bail!("timed out waiting 15 seconds for local results lock {}", target.display())
+    bail!(
+        "timed out waiting 15 seconds for local results lock {}",
+        target.display()
+    )
 }
 
 async fn read_destination(url: &Url) -> Result<Vec<u8>> {
@@ -4518,16 +4601,12 @@ async fn read_cloud_destination_versioned(
         bail!("object store returned no conditional version for Parquet object {path}");
     }
     Ok(DestinationSnapshot {
-        bytes: object.bytes().await?,
+        bytes: object.bytes().await?.to_vec(),
         version: Some(version),
     })
 }
 
-async fn write_exact_destination(
-    url: &Url,
-    authoritative: &Url,
-    snapshot: &DestinationSnapshot,
-) -> Result<bool> {
+async fn write_exact_destination(url: &Url, authoritative: &Url, snapshot: &DestinationSnapshot) -> Result<bool> {
     if url.scheme() == "file" {
         let target = local_file_path(url)?;
         let parent = target.parent().context("local results file has no parent directory")?;
@@ -4575,11 +4654,7 @@ where
         return Ok(false);
     }
     match store
-        .put_opts(
-            &path,
-            PutPayload::from(snapshot.bytes.clone()),
-            PutOptions::from(mode),
-        )
+        .put_opts(&path, PutPayload::from(snapshot.bytes.clone()), PutOptions::from(mode))
         .await
     {
         Ok(_) => Ok(true),
@@ -4600,13 +4675,19 @@ async fn put_parquet(store: Arc<dyn ObjectStore>, path: ObjectPath, incoming: Re
                     bail!("object store returned no conditional version for existing benchmark Parquet object {path}");
                 }
                 let existing_bytes = object.bytes().await?;
-                Some((merge_parquet_bytes(&existing_bytes, &incoming)?, PutMode::Update(version)))
+                Some((
+                    merge_parquet_bytes(&existing_bytes, &incoming)?,
+                    PutMode::Update(version),
+                ))
             }
             Err(object_store::Error::NotFound { .. }) => Some((encode_parquet(&incoming)?, PutMode::Create)),
             Err(error) => return Err(error).with_context(|| format!("read benchmark Parquet object {path}")),
         };
         let (payload, mode) = current.context("Parquet merge unexpectedly produced no update")?;
-        match store.put_opts(&path, PutPayload::from(payload), PutOptions::from(mode)).await {
+        match store
+            .put_opts(&path, PutPayload::from(payload), PutOptions::from(mode))
+            .await
+        {
             Ok(_) => return Ok(()),
             Err(object_store::Error::Precondition { .. } | object_store::Error::AlreadyExists { .. }) => continue,
             Err(error) => return Err(error).with_context(|| format!("write benchmark Parquet object {path}")),
@@ -4616,7 +4697,7 @@ async fn put_parquet(store: Arc<dyn ObjectStore>, path: ObjectPath, incoming: Re
 }
 
 fn merge_parquet_bytes(existing_bytes: &[u8], incoming: &RecordBatch) -> Result<Vec<u8>> {
-    let existing_reader = ParquetRecordBatchReaderBuilder::try_new(existing_bytes.to_vec())
+    let existing_reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::copy_from_slice(existing_bytes))
         .context("read existing benchmark Parquet object")?;
     let schema = Arc::clone(existing_reader.schema());
     if incoming.schema().as_ref() != schema.as_ref() {
@@ -4688,7 +4769,9 @@ fn parquet_batch(results: &[OatResult]) -> Result<RecordBatch> {
         Arc::new(StringArray::from(
             results.iter().map(|row| row.table_owner.as_deref()).collect::<Vec<_>>(),
         )),
-        Arc::new(BooleanArray::from_iter_values(results.iter().map(|row| row.pinning_ok))),
+        Arc::new(BooleanArray::from(
+            results.iter().map(|row| row.pinning_ok).collect::<Vec<_>>(),
+        )),
         Arc::new(StringArray::from_iter_values(
             results.iter().map(|row| row.status.as_str()),
         )),
@@ -4811,8 +4894,9 @@ mod tests {
 
     #[test]
     fn matrix_cells_use_distinct_canonical_run_ids_for_multiple_combinations() -> Result<()> {
-        let config: OatConfig =
-            serde_json::from_str(include_str!("../../../docs/experiments/arrowcol-oat/oat-config.example.json"))?;
+        let config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.example.json"
+        ))?;
         let cells = matrix_cell_specs(&config);
         assert_eq!(
             cells.len(),
@@ -4825,10 +4909,7 @@ mod tests {
         for (_, _, run_id) in &cells {
             let parsed = uuid::Uuid::parse_str(run_id)?;
             assert_eq!(parsed.to_string(), *run_id, "run IDs use canonical lowercase UUID form");
-            let local_router = run_scoped_local_router_config(
-                "routing:\n  lease_ttl_ms: 86400000\n",
-                run_id,
-            )?;
+            let local_router = run_scoped_local_router_config("routing:\n  lease_ttl_ms: 86400000\n", run_id)?;
             assert!(local_router.contains(&format!("oat_run_id: \"{run_id}\"")));
         }
         Ok(())
@@ -4867,15 +4948,7 @@ mod tests {
         let expected = expected_pin_keys_json(&["sqlserver_wait_stats".to_owned()])?;
         let run_id = "00000000-0000-0000-0000-000000000001";
         let router_yaml = router_yaml_for_pin_test(run_id);
-        assert!(pin_init_config_json(
-            run_id,
-            &expected,
-            10_000,
-            10_000,
-            "sqlserver",
-            &router_yaml,
-        )
-        .is_err());
+        assert!(pin_init_config_json(run_id, &expected, 10_000, 10_000, "sqlserver", &router_yaml,).is_err());
         assert!(pin_init_config_json(
             run_id,
             r#"{"expected_keys":[],"expected_digest":"0000000000000000000000000000000000000000000000000000000000000000"}"#,
@@ -4886,9 +4959,7 @@ mod tests {
         )
         .is_err());
         let mismatched_run_yaml = router_yaml_for_pin_test("00000000-0000-0000-0000-000000000002");
-        assert!(
-            pin_init_config_json(run_id, &expected, 20_000, 10_000, "sqlserver", &mismatched_run_yaml).is_err()
-        );
+        assert!(pin_init_config_json(run_id, &expected, 20_000, 10_000, "sqlserver", &mismatched_run_yaml).is_err());
         Ok(())
     }
 
@@ -4937,32 +5008,26 @@ mod tests {
         }
 
         let result = async {
-            let unresolved = runtime_evidence_retention(
-                true,
-                None,
-                None,
-                true,
-                Some(&record),
-                Some(&stop_record),
-                true,
-            );
+            let unresolved =
+                runtime_evidence_retention(true, None, None, true, Some(&record), Some(&stop_record), true);
             apply_runtime_evidence_retention(&directory, unresolved).await?;
             for path in [&record, &sidecar, &stop_record, &private_manifest] {
-                anyhow::ensure!(tokio::fs::try_exists(path).await?, "unresolved outcome lost {}", path.display());
+                anyhow::ensure!(
+                    tokio::fs::try_exists(path).await?,
+                    "unresolved outcome lost {}",
+                    path.display()
+                );
             }
 
-            let completed = runtime_evidence_retention(
-                false,
-                None,
-                None,
-                true,
-                Some(&record),
-                Some(&stop_record),
-                false,
-            );
+            let completed =
+                runtime_evidence_retention(false, None, None, true, Some(&record), Some(&stop_record), false);
             apply_runtime_evidence_retention(&directory, completed).await?;
             for path in [&record, &sidecar, &stop_record] {
-                anyhow::ensure!(tokio::fs::try_exists(path).await?, "successful cleanup lost {}", path.display());
+                anyhow::ensure!(
+                    tokio::fs::try_exists(path).await?,
+                    "successful cleanup lost {}",
+                    path.display()
+                );
             }
             anyhow::ensure!(
                 !tokio::fs::try_exists(&private_manifest).await?,
@@ -4979,8 +5044,9 @@ mod tests {
 
     #[test]
     fn startup_wait_budget_covers_early_ready_fleet_qap_delay_and_final_delivery() -> Result<()> {
-        let mut config: OatConfig =
-            serde_json::from_str(include_str!("../../../docs/experiments/arrowcol-oat/oat-config.example.json"))?;
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.example.json"
+        ))?;
         config.client_ready_timeout_seconds = 30;
         config.qap_timeout_seconds = 30;
         config.warmup_seconds = 60;
@@ -5054,13 +5120,20 @@ mod tests {
 
     #[test]
     fn qap_run_paths_reject_noncanonical_run_ids_and_unsafe_roots() {
-        assert!(run_delta_root(
-            "abfss://data@account.dfs.core.windows.net/oat-prefix/dataflow",
-            "00000000-0000-0000-0000-000000000001/"
-        )
-        .is_err());
-        assert!(qap_relative_data_root("abfss://data@account.dfs.core.windows.net/oat-prefix/runs/../dataflow").is_err());
-        assert!(qap_relative_data_root("abfss://data@account.dfs.core.windows.net/oat-prefix/runs/%2F..%2F/dataflow").is_err());
+        assert!(
+            run_delta_root(
+                "abfss://data@account.dfs.core.windows.net/oat-prefix/dataflow",
+                "00000000-0000-0000-0000-000000000001/"
+            )
+            .is_err()
+        );
+        assert!(
+            qap_relative_data_root("abfss://data@account.dfs.core.windows.net/oat-prefix/runs/../dataflow").is_err()
+        );
+        assert!(
+            qap_relative_data_root("abfss://data@account.dfs.core.windows.net/oat-prefix/runs/%2F..%2F/dataflow")
+                .is_err()
+        );
         assert!(aks_qap_relative_path("oat-prefix/runs/run/dataflow", "../other-table").is_err());
     }
 
@@ -5113,24 +5186,20 @@ mod tests {
     #[test]
     fn readiness_barrier_rejects_timeout_and_partial_fleet() {
         let partial = [client_progress(true, false), client_progress(false, false)];
-        assert!(matches!(validate_client_readiness(
-            &partial,
-            Duration::from_secs(10),
-            Duration::from_secs(600)
-        ), Ok(false)));
-        assert!(validate_client_readiness(
-            &partial,
-            Duration::from_secs(600),
-            Duration::from_secs(600)
-        )
-        .is_err());
+        assert!(matches!(
+            validate_client_readiness(&partial, Duration::from_secs(10), Duration::from_secs(600)),
+            Ok(false)
+        ));
+        assert!(validate_client_readiness(&partial, Duration::from_secs(600), Duration::from_secs(600)).is_err());
         let fully_ready_too_late = [client_progress(true, false), client_progress(true, false)];
-        assert!(validate_client_readiness(
-            &fully_ready_too_late,
-            Duration::from_secs(600),
-            Duration::from_secs(600)
-        )
-        .is_err());
+        assert!(
+            validate_client_readiness(
+                &fully_ready_too_late,
+                Duration::from_secs(600),
+                Duration::from_secs(600)
+            )
+            .is_err()
+        );
         let failed = [
             client_progress(true, false),
             ClientProgress {
@@ -5149,23 +5218,30 @@ mod tests {
             start - 1,
             start
         )?);
-        assert!(matches!(validate_client_schedule(
-            &[client_progress(true, true), client_progress(true, false)],
-            start - 1,
-            start
-        ), Ok(false)));
-        assert!(validate_client_schedule(
-            &[client_progress(true, true), client_progress(true, false)],
-            start,
-            start
-        )
-        .is_err());
-        assert!(validate_client_schedule(
-            &[client_progress(true, true), client_progress(true, true)],
-            start,
-            start
-        )
-        .is_err());
+        assert!(matches!(
+            validate_client_schedule(
+                &[client_progress(true, true), client_progress(true, false)],
+                start - 1,
+                start
+            ),
+            Ok(false)
+        ));
+        assert!(
+            validate_client_schedule(
+                &[client_progress(true, true), client_progress(true, false)],
+                start,
+                start
+            )
+            .is_err()
+        );
+        assert!(
+            validate_client_schedule(
+                &[client_progress(true, true), client_progress(true, true)],
+                start,
+                start
+            )
+            .is_err()
+        );
         Ok(())
     }
 
@@ -5191,7 +5267,11 @@ mod tests {
             "tunables_json",
         ];
         assert_eq!(
-            fields.iter().take(added.len()).map(|field| field.name().as_str()).collect::<Vec<_>>(),
+            fields
+                .iter()
+                .take(added.len())
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
             added
         );
         assert_eq!(
@@ -5277,11 +5357,13 @@ mod tests {
         )?;
         assert!(configured.contains("  lease_ttl_ms: 3600000\n  oat_run_id: \"run-one\"\n"));
         assert!(run_scoped_local_router_config("routing:\n  lease_ttl_ms: 30000\n", "run-two").is_err());
-        assert!(run_scoped_local_router_config(
-            "routing:\n  lease_ttl_ms: 86400000\n  oat_run_id: run-existing\n",
-            "run-one",
-        )
-        .is_err());
+        assert!(
+            run_scoped_local_router_config(
+                "routing:\n  lease_ttl_ms: 86400000\n  oat_run_id: run-existing\n",
+                "run-one",
+            )
+            .is_err()
+        );
         Ok(())
     }
 
@@ -5293,7 +5375,11 @@ mod tests {
             ("stamp", DataType::Utf8, true),
             ("host", DataType::Utf8, false),
             ("experiment", DataType::Utf8, false),
-            ("started_at", DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())), false),
+            (
+                "started_at",
+                DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+                false,
+            ),
             ("measure_seconds", DataType::Float64, false),
             ("arrowcols", DataType::Int32, false),
             ("clients", DataType::Int32, false),
@@ -5335,7 +5421,10 @@ mod tests {
         let one = HashMap::from([("sqlserver_wait_stats".to_owned(), vec!["collector-a".to_owned()])]);
         assert_eq!(check_owner_sample(&tables, &HashMap::new(), &mut owners), None);
         assert_eq!(check_owner_sample(&tables, &one, &mut owners), None);
-        assert_eq!(owners.get("sqlserver_wait_stats").map(String::as_str), Some("collector-a"));
+        assert_eq!(
+            owners.get("sqlserver_wait_stats").map(String::as_str),
+            Some("collector-a")
+        );
         assert!(check_owner_sample(&tables, &HashMap::new(), &mut owners).is_some());
 
         let mut owners = HashMap::new();
@@ -5361,7 +5450,9 @@ mod tests {
         let mut stable = HashMap::new();
         assert_eq!(check_owner_sample(&configured_tables, &owners, &mut stable), None);
         assert_eq!(
-            stable.get(&canonical_table_key(&configured_tables[0])).map(String::as_str),
+            stable
+                .get(&canonical_table_key(&configured_tables[0]))
+                .map(String::as_str),
             Some("collector-a")
         );
         Ok(())
@@ -5382,24 +5473,30 @@ mod tests {
         });
         validate_aks_overlay_resources(&[arrowcol.clone(), dfe_without_namespace], &allowed, "arrowcol")?;
         assert!(validate_aks_overlay_resources(&[], &allowed, "arrowcol").is_err());
-        assert!(validate_aks_overlay_resources(
-            &[json!({"kind": "ConfigMap", "metadata": {"name": "settings"}})],
-            &allowed,
-            "arrowcol",
-        )
-        .is_err());
-        assert!(validate_aks_overlay_resources(
-            &[json!({"kind": "Deployment", "metadata": {"name": "unconfigured"}})],
-            &allowed,
-            "arrowcol",
-        )
-        .is_err());
-        assert!(validate_aks_overlay_resources(
-            &[json!({"kind": "Deployment", "metadata": {"name": "arrowcol", "namespace": "other"}})],
-            &allowed,
-            "arrowcol",
-        )
-        .is_err());
+        assert!(
+            validate_aks_overlay_resources(
+                &[json!({"kind": "ConfigMap", "metadata": {"name": "settings"}})],
+                &allowed,
+                "arrowcol",
+            )
+            .is_err()
+        );
+        assert!(
+            validate_aks_overlay_resources(
+                &[json!({"kind": "Deployment", "metadata": {"name": "unconfigured"}})],
+                &allowed,
+                "arrowcol",
+            )
+            .is_err()
+        );
+        assert!(
+            validate_aks_overlay_resources(
+                &[json!({"kind": "Deployment", "metadata": {"name": "arrowcol", "namespace": "other"}})],
+                &allowed,
+                "arrowcol",
+            )
+            .is_err()
+        );
         Ok(())
     }
 
@@ -5624,7 +5721,7 @@ mod tests {
             sample_result("run-2", "sqlserver_wait_stats", 300),
         ])?;
         let bytes = merge_parquet_bytes(&encode_parquet(&current)?, &retry)?;
-        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes))?;
         let batches = reader.build()?.collect::<std::result::Result<Vec<_>, _>>()?;
         assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
         let rows = batches
@@ -5669,7 +5766,7 @@ mod tests {
             assert!(status.success(), "local writer child exited with {status}");
         }
         let bytes = std::fs::read(&target)?;
-        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes))?;
         let batches = reader.build()?.collect::<std::result::Result<Vec<_>, _>>()?;
         assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
         let rows = batches

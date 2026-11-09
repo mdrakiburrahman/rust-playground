@@ -54,7 +54,9 @@ async fn main() -> Result<()> {
             || args.duration_secs % 30 != 0
             || args.warmup_secs + args.duration_secs > 600)
     {
-        anyhow::bail!("pilot mode requires a 30-second-multiple measurement from 60 to 600 seconds and a total warm-up plus measurement of at most 600 seconds");
+        anyhow::bail!(
+            "pilot mode requires a 30-second-multiple measurement from 60 to 600 seconds and a total warm-up plus measurement of at most 600 seconds"
+        );
     }
     let send = || {
         dmv::send_authenticated(
@@ -83,9 +85,7 @@ async fn main() -> Result<()> {
                 run_start_unix_ms
             }
             (None, Some(run_start_unix_ms)) => run_start_unix_ms,
-            (None, None) => anyhow::bail!(
-                "duration-based clients require --schedule-file or --run-start-unix-ms"
-            ),
+            (None, None) => anyhow::bail!("duration-based clients require --schedule-file or --run-start-unix-ms"),
         };
         let current_unix_ms = unix_time_ms()?;
         if current_unix_ms >= run_start_unix_ms {
@@ -182,12 +182,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn record_pilot_window(
-    index: u64,
-    rows: u64,
-    measurement_start_unix_ms: u64,
-    rates: &mut Vec<f64>,
-) {
+fn record_pilot_window(index: u64, rows: u64, measurement_start_unix_ms: u64, rates: &mut Vec<f64>) {
     let rate = rows as f64 / 30.0;
     rates.push(rate);
     let window_start_unix_ms = measurement_start_unix_ms.saturating_add(index.saturating_mul(30_000));
@@ -259,7 +254,9 @@ fn validate_schedule_timeout(timeout_secs: u64) -> Result<()> {
 }
 
 fn unix_time_ms() -> Result<u64> {
-    Ok(u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?)
+    Ok(u64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
+    )?)
 }
 
 #[cfg(test)]

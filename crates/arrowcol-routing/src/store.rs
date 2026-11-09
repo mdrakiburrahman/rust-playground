@@ -158,11 +158,7 @@ pub trait RoutingStore: Send + Sync {
 
     /// Binds an initial owner only for an existing, live pending run/table marker
     /// and a still-current SQL lease. Exact retries return the original binding.
-    async fn bind_initial_run_table_pin(
-        &self,
-        pin: &RunTablePin,
-        now: UnixMillis,
-    ) -> RoutingResult<RunTablePin>;
+    async fn bind_initial_run_table_pin(&self, pin: &RunTablePin, now: UnixMillis) -> RoutingResult<RunTablePin>;
 
     /// Returns whether any unexpired run pin protects this table lease from transfer.
     async fn has_active_run_table_pin(&self, key: &LeaseKey, now: UnixMillis) -> RoutingResult<bool>;

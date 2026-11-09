@@ -1,10 +1,7 @@
 use anyhow::{Context, Result, bail};
-use arrowcol_protocol::{
-    CatalogName, ImplementationPool, SchemaName, TableIdentity, TableName, UnixMillis,
-};
+use arrowcol_protocol::{CatalogName, ImplementationPool, SchemaName, TableIdentity, TableName, UnixMillis};
 use arrowcol_routing::{
-    LeaseKey, RoutingEngine, RoutingPolicy, SqlServerRoutingConfig, SqlServerRoutingStore,
-    run_table_pin_set_digest,
+    LeaseKey, RoutingEngine, RoutingPolicy, SqlServerRoutingConfig, SqlServerRoutingStore, run_table_pin_set_digest,
 };
 use clap::Parser;
 use serde::Deserialize;
@@ -58,8 +55,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let bytes = std::fs::read(&cli.config)
         .with_context(|| format!("read OAT pin initialization config {}", cli.config.display()))?;
-    let config: PinInitConfig =
-        serde_json::from_slice(&bytes).context("parse OAT pin initialization config")?;
+    let config: PinInitConfig = serde_json::from_slice(&bytes).context("parse OAT pin initialization config")?;
     let expected = validate_config(&config)?;
     let actual_digest = config.expected_digest.as_str();
 
@@ -220,7 +216,10 @@ mod tests {
     fn pin_init_config_requires_matching_digest_and_validated_table_identities() -> Result<()> {
         let valid = config()?;
         assert_eq!(validate_config(&valid)?.len(), 1);
-        assert_eq!(validate_expiry(&valid, UnixMillis::new(9_000)?)?, UnixMillis::new(10_000)?);
+        assert_eq!(
+            validate_expiry(&valid, UnixMillis::new(9_000)?)?,
+            UnixMillis::new(10_000)?
+        );
 
         let mut too_long_expiry = config()?;
         too_long_expiry.routing_policy.oat_run_pin_ttl_ms = 500;
@@ -266,7 +265,7 @@ mod tests {
                     "port": 1433,
                     "trust_server_certificate": true
                 },
-                "password": "must-not-be-in-config"
+                "password": null
             }"#,
         );
         assert!(error.is_err());

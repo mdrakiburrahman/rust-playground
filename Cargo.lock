@@ -946,6 +946,7 @@ dependencies = [
  "arrowcol-routing",
  "async-trait",
  "axum",
+ "bytes",
  "chrono",
  "clap",
  "collector-chain",

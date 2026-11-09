@@ -132,17 +132,19 @@ impl OatConfig {
             bail!("qap_timeout_seconds must be between 1 and 300");
         }
         let minimum_pin_ttl_ms = self.timing_budget()?.minimum_pin_ttl_ms;
-        if !(60_000..=86_400_000).contains(&self.run_pin_ttl_ms)
-            || self.run_pin_ttl_ms < minimum_pin_ttl_ms
-        {
-            bail!("run_pin_ttl_ms must cover pin setup, readiness, QAP preparation, schedule delivery, workload, and Job cleanup margin, and be between 60,000 and 86,400,000");
+        if !(60_000..=86_400_000).contains(&self.run_pin_ttl_ms) || self.run_pin_ttl_ms < minimum_pin_ttl_ms {
+            bail!(
+                "run_pin_ttl_ms must cover pin setup, readiness, QAP preparation, schedule delivery, workload, and Job cleanup margin, and be between 60,000 and 86,400,000"
+            );
         }
         if self.pilot_mode
             && (!(60..=600).contains(&self.measure_seconds)
                 || self.measure_seconds % 30 != 0
                 || self.warmup_seconds + self.measure_seconds > 600)
         {
-            bail!("pilot_mode requires a 30-second-multiple measurement from 60 to 600 seconds and a total warm-up plus measurement of at most 600 seconds");
+            bail!(
+                "pilot_mode requires a 30-second-multiple measurement from 60 to 600 seconds and a total warm-up plus measurement of at most 600 seconds"
+            );
         }
         if self.stamp.as_ref().is_some_and(|stamp| stamp.trim().is_empty()) {
             bail!("stamp must be omitted or nonempty");
@@ -157,7 +159,11 @@ impl OatConfig {
         }
         match self.platform.kind {
             OatMode::Local => {
-                if self.qap_database.as_deref().is_some_and(|database| database != "loadtest") {
+                if self
+                    .qap_database
+                    .as_deref()
+                    .is_some_and(|database| database != "loadtest")
+                {
                     bail!("local platform uses the isolated loadtest Kusto database");
                 }
                 if self.platform.kustomize_overlay.is_some() {
@@ -189,7 +195,9 @@ impl OatConfig {
                         .first()
                         .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
                 {
-                    bail!("compose_project must be a run-scoped lowercase Compose project name of at most 48 characters");
+                    bail!(
+                        "compose_project must be a run-scoped lowercase Compose project name of at most 48 characters"
+                    );
                 }
                 let state_root = self
                     .platform
@@ -244,7 +252,9 @@ impl OatConfig {
                     || self.dfe_pod_selector != "app=arrowcol"
                     || self.edge_secret_name != "arrowcol-router-auth"
                 {
-                    bail!("fresh AKS runs use runtime-rendered names: namespace prefix, arrowcol/dataflow and app=arrowcol, with edge_secret_name arrowcol-router-auth");
+                    bail!(
+                        "fresh AKS runs use runtime-rendered names: namespace prefix, arrowcol/dataflow and app=arrowcol, with edge_secret_name arrowcol-router-auth"
+                    );
                 }
             }
         }
@@ -312,14 +322,14 @@ impl OatConfig {
         if !matches!(metrics_endpoint.scheme(), "http" | "https") || metrics_endpoint.host_str().is_none() {
             bail!("router_metrics_endpoint must be an HTTP(S) URL with a host");
         }
-        if self.rows_per_table == 0
-            || self.rows_per_table > 1_000_000
-            || !(1..=64).contains(&self.dmv_concurrency)
-        {
+        if self.rows_per_table == 0 || self.rows_per_table > 1_000_000 || !(1..=64).contains(&self.dmv_concurrency) {
             bail!("rows_per_table must be 1..=1000000 and dmv_concurrency 1..=64");
         }
         if !(1..=4).contains(&self.clients_per_table)
-            || self.clients_per_table.checked_mul(self.tables.len()).is_none_or(|total| total > 128)
+            || self
+                .clients_per_table
+                .checked_mul(self.tables.len())
+                .is_none_or(|total| total > 128)
         {
             bail!("clients_per_table must be between 1 and 4 and the client fleet may not exceed 128");
         }
@@ -450,14 +460,8 @@ fn validate_dns_label(value: &str, field: &str) -> Result<()> {
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        || !value
-            .as_bytes()
-            .first()
-            .is_some_and(u8::is_ascii_alphanumeric)
-        || !value
-            .as_bytes()
-            .last()
-            .is_some_and(u8::is_ascii_alphanumeric)
+        || !value.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
+        || !value.as_bytes().last().is_some_and(u8::is_ascii_alphanumeric)
         || value.starts_with("kube-")
         || value == "default"
     {
@@ -588,7 +592,10 @@ mod tests {
         config.validate()?;
 
         config.run_pin_ttl_ms -= 1;
-        assert!(config.validate().is_err(), "a pin expiring before the bounded Job lifetime must be rejected");
+        assert!(
+            config.validate().is_err(),
+            "a pin expiring before the bounded Job lifetime must be rejected"
+        );
         Ok(())
     }
 

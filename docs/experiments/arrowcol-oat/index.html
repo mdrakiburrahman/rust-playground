@@ -10,7 +10,7 @@
     :root { color-scheme: light; font-family: "Segoe UI", Arial, sans-serif; color: #201f1e; background: #f7f9fb; }
     * { box-sizing: border-box; }
     body { margin: 0; }
-    main { max-width: 1180px; margin: 0 auto; padding: 28px 20px 48px; }
+    main { max-width: 1440px; min-width: 0; margin: 0 auto; padding: 28px 20px 48px; }
     h1 { margin: 0; font-size: 24px; font-weight: 650; }
     .lede { color: #605e5c; margin: 7px 0 22px; font-size: 14px; }
     .toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
@@ -44,6 +44,33 @@
     .reference table { min-width: 700px; }
     .reference td:first-child { font-family: Consolas, monospace; font-weight: 600; }
     .mapping { text-align: left !important; white-space: normal; min-width: 190px; }
+    .filters { border: 1px solid #d5dfe8; background: #fff; border-radius: 6px; padding: 14px; }
+    .filter-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+    .filter-heading h2 { margin: 0; }
+    .filter-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(155px, 1fr)); gap: 10px; }
+    .filter-grid label { display: flex; flex-direction: column; min-width: 0; gap: 4px; color: #605e5c; font-size: 11px; font-weight: 600; }
+    .filter-grid select, .filter-grid input { width: 100%; min-width: 0; height: 34px; padding: 5px 8px; border: 1px solid #c8c6c4; border-radius: 4px; background: #fff; color: #201f1e; font: inherit; font-size: 13px; }
+    .filter-grid .search { grid-column: span 2; }
+    .results-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin: 18px 0 8px; }
+    .results-heading h2 { margin: 0; }
+    .results-table th button { display: inline-flex; align-items: center; gap: 4px; padding: 0; border: 0; background: transparent; color: inherit; font: inherit; white-space: nowrap; }
+    .results-table th button:hover { color: #005a9e; }
+    .results-table th[aria-sort="ascending"] button::after { content: " ▲"; }
+    .results-table th[aria-sort="descending"] button::after { content: " ▼"; }
+    .badge { display: inline-block; border-radius: 12px; padding: 2px 7px; font-size: 11px; font-weight: 650; }
+    .badge-local { background: #e8f4fd; color: #005a9e; }
+    .badge-aks { background: #e8ecf7; color: #354b85; }
+    .badge-alert { background: #fde7e9; color: #a4262c; }
+    .badge-ok { background: #e5f3e7; color: #107c10; }
+    .results-table tr.problem td { border-bottom-color: #e8a4a8; background-color: #fff7f7; }
+    .results-table tr.problem td.heat { background-image: linear-gradient(#fff7f780, #fff7f780); }
+    details { text-align: left; white-space: normal; min-width: 85px; }
+    details summary { cursor: pointer; color: #005a9e; }
+    details pre { max-width: 380px; max-height: 220px; overflow: auto; margin: 6px 0; padding: 8px; border-radius: 4px; background: #f3f2f1; font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .results-table { min-width: 1200px; }
+    .table-wrap { max-width: 100%; }
+    .table-wrap caption { white-space: normal; }
+    @media (max-width: 500px) { .filter-grid .search { grid-column: auto; } }
     @media (max-width: 680px) { main { padding: 20px 12px 32px; } .stats { grid-template-columns: repeat(2, minmax(120px, 1fr)); } h1 { font-size: 21px; } }
   </style>
 </head>
@@ -51,13 +78,6 @@
 <main>
   <h1>ArrowCol OAT benchmark</h1>
   <p class="lede">ArrowCol replicas × DFE worker concurrency · results from the published compact Parquet file</p>
-  <section class="architecture" aria-labelledby="architecture-title">
-    <h2 id="architecture-title">Benchmark architecture</h2>
-    <p class="section-lede">Numbered parts 1–6 identify where each tunable and result field belongs in the stack below.</p>
-    <div class="architecture-frame">
-      <img id="architecture-diagram" src="architecture.svg" width="809" height="585" alt="ArrowCol OAT benchmark architecture. Numbered parts: 1 OAT control plane; 2 DMV client; 3 ArrowCol Catalog Rust; 4 DFE + Delta-Maintenance; 5 Kusto QAP; 6 ADLS Gen2 + site. The operator host controls the AKS stack; table-pinned Arrow streams reach Delta tables and Kusto QAP. Matching numbers identify the configuration fields and result columns below.">
-    </div>
-  </section>
   <div class="toolbar">
     <button id="reload" type="button">Reload results</button>
     <span id="status" class="status" role="status" aria-live="polite">Loading benchmark results…</span>
@@ -65,24 +85,41 @@
   <section class="stats" aria-label="Benchmark summary">
     <div class="stat"><span class="stat-label">Rows</span><strong id="stat-rows" class="stat-value">—</strong></div>
     <div class="stat"><span class="stat-label">Configurations</span><strong id="stat-configs" class="stat-value">—</strong></div>
-    <div class="stat"><span class="stat-label">Best throughput</span><strong id="stat-throughput" class="stat-value">—</strong></div>
-    <div class="stat"><span class="stat-label">Median latency</span><strong id="stat-latency" class="stat-value">—</strong></div>
+    <div class="stat"><span class="stat-label">Peak admission rate (filtered)</span><strong id="stat-throughput" class="stat-value">—</strong></div>
+    <div class="stat"><span class="stat-label">Median admission duration (filtered)</span><strong id="stat-latency" class="stat-value">—</strong></div>
   </section>
+  <section class="filters" aria-labelledby="filter-title">
+    <div class="filter-heading"><h2 id="filter-title">Explore results</h2><button id="clear" type="button">Clear all</button></div>
+    <div id="filter-grid" class="filter-grid">
+      <label class="search">Search<input id="search" type="search" placeholder="Search runs, hosts, tunables…"></label>
+    </div>
+  </section>
+  <div class="results-heading"><h2>Results</h2><span id="filtered-count" class="status" aria-live="polite"></span></div>
   <div class="table-wrap">
-    <table>
-      <caption>Each row is one table-pinned ArrowCol result. Blue intensity is relative within the published file; exact values remain visible.</caption>
+    <table class="results-table">
+      <caption>Each row is one table-pinned ArrowCol result. Blue intensity is relative to the filtered results; select a column heading to sort.</caption>
       <thead><tr>
+        <th data-column="mode" scope="col">Mode</th><th data-column="stamp" scope="col">Stamp</th><th data-column="experiment" scope="col">Experiment</th><th data-column="status" scope="col">Status</th><th data-column="pinning_ok" scope="col">Pinning</th>
         <th data-result="run_id" scope="col">Run</th><th data-result="replicas" scope="col">ArrowCol replicas</th><th data-result="dfe_worker_concurrency" scope="col">DFE workers</th><th data-result="table" scope="col">Pinned table</th>
+        <th data-column="table_owner" scope="col">Table owner</th><th data-column="clients" scope="col">Clients</th>
         <th data-result="rows" scope="col">Rows</th><th data-result="duration_ms" scope="col">Duration (ms)</th><th data-result="rows_per_second" scope="col">Rows/s</th><th data-result="cpu_millicores" scope="col">CPU (mCPU)</th><th data-result="memory_bytes" scope="col">Memory (MiB)</th><th data-result="qap_observation_complete" scope="col">QAP fields complete</th><th data-result="qap_observed_tables" scope="col">QAP tables</th><th data-result="qap_completion_percent" scope="col">QAP complete (%)</th><th data-result="qap_pending_artifacts" scope="col">Pending artifacts</th><th data-result="qap_cached_bytes" scope="col">Cached (MiB)</th><th data-result="qap_unhealthy_catalogs" scope="col">Unhealthy catalogs</th><th data-result="qap_lag_seconds" scope="col">QAP lag (s)</th>
+        <th data-column="host" scope="col">Host</th><th data-column="started_at" scope="col">Started (UTC)</th><th data-column="measure_seconds" scope="col">Measure (s)</th><th data-column="tables" scope="col">Tables</th><th data-column="git_sha" scope="col">Git SHA</th><th scope="col">Tunables</th>
       </tr></thead>
-      <tbody id="results"><tr><td class="empty" colspan="16">Loading…</td></tr></tbody>
+      <tbody id="results"><tr><td class="empty" colspan="29">Loading…</td></tr></tbody>
     </table>
   </div>
-  <p class="note">Duration and throughput measure client admission, not durable Delta/QAP publication. Missing metrics appear as —, not zero. “QAP fields complete” is 1 only when all required telemetry fields were observed; it is separate from QAP completion percentage.</p>
+  <p class="note">Summary values and heatmap ranges use all rows matching the current filters, including failed and pinning-violation rows; they are not success-only performance claims. Throughput and duration measure client admission, not durable Delta/QAP publication. Missing metrics appear as —, not zero. “QAP fields complete” is 1 only when all required telemetry fields were observed; it is separate from QAP completion percentage.</p>
   <p class="note">The static site and its Parquet file are anonymously readable. Only publish approved, nonsensitive benchmark summaries here; never include credentials, raw payloads, or sensitive identifiers. The viewer loads <code>results.parquet</code> from this same origin, so no cross-origin request or CORS rule is required.</p>
+  <section class="architecture" aria-labelledby="architecture-title">
+    <h2 id="architecture-title">Benchmark architecture</h2>
+    <p class="section-lede">Numbered parts 1–6 identify where each tunable and result field belongs in the stack below.</p>
+    <div class="architecture-frame">
+      <img id="architecture-diagram" src="architecture.svg" width="809" height="585" alt="ArrowCol OAT benchmark architecture. Numbered parts: 1 OAT control plane; 2 DMV client; 3 ArrowCol Catalog Rust; 4 DFE + Delta-Maintenance; 5 Kusto QAP; 6 ADLS Gen2 + site. The operator host controls the AKS stack; table-pinned Arrow streams reach Delta tables and Kusto QAP. Matching numbers identify the configuration fields and result columns below.">
+    </div>
+  </section>
   <section class="reference" aria-labelledby="config-reference-title">
     <h2 id="config-reference-title">Configuration reference</h2>
-    <p class="section-lede">Every validated OAT JSON field is mapped to the numbered stack part it configures.</p>
+    <p class="section-lede">OAT JSON tunables are mapped to the numbered stack parts they configure.</p>
     <div class="table-wrap">
       <table>
         <thead><tr><th scope="col">OAT JSON field</th><th scope="col">Affects</th><th scope="col">Purpose</th></tr></thead>
@@ -93,7 +130,6 @@
 </main>
 <script type="module">
 const resultUrl = new URL('results.parquet', window.location.href).toString();
-const columns = ['run_id', 'replicas', 'dfe_worker_concurrency', 'table', 'rows', 'duration_ms', 'rows_per_second', 'cpu_millicores', 'memory_bytes', 'qap_observation_complete', 'qap_observed_tables', 'qap_completion_percent', 'qap_pending_artifacts', 'qap_cached_bytes', 'qap_unhealthy_catalogs', 'qap_lag_seconds'];
 const stackParts = [
   { id: 1, title: 'OAT control plane' },
   { id: 2, title: 'DMV client' },
@@ -149,6 +185,18 @@ function renderMappings() {
   }
   document.querySelector('#config-reference').innerHTML = configFields.map(([field, ids, purpose]) =>
     `<tr><td>${safeText(field)}</td><td class="mapping">${partBadges(ids)} ${safeText(partNames(ids))}</td><td class="mapping">${safeText(purpose)}</td></tr>`).join('');
+  for (const header of document.querySelectorAll('.results-table th[data-result], .results-table th[data-column]')) {
+    const key = header.dataset.column || header.dataset.result;
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.innerHTML = header.innerHTML;
+    button.addEventListener('click', () => {
+      state.direction = state.sort === key && state.direction === 'asc' ? 'desc' : 'asc';
+      state.sort = key;
+      render();
+    });
+    header.replaceChildren(button);
+  }
 }
 
 function number(value) {
@@ -163,8 +211,8 @@ function show(value, digits = 2) {
 function heat(value, values, lowerIsBetter = false) {
   const parsed = number(value);
   if (parsed === null || values.length < 2) return '';
-  const min = Math.min(...values);
-  const max = Math.max(...values);
+  const min = values.reduce((best, item) => Math.min(best, item), Infinity);
+  const max = values.reduce((best, item) => Math.max(best, item), -Infinity);
   if (min === max) return 'background-color:rgba(0,120,212,.14)';
   let ratio = (parsed - min) / (max - min);
   if (lowerIsBetter) ratio = 1 - ratio;
@@ -179,57 +227,182 @@ function median(values) {
   const middle = Math.floor(sorted.length / 2);
   return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
 }
-function showNoResults(message) {
-  document.querySelector('#stat-rows').textContent = '—';
-  document.querySelector('#stat-configs').textContent = '—';
-  document.querySelector('#stat-throughput').textContent = '—';
-  document.querySelector('#stat-latency').textContent = '—';
-  bodyNode.innerHTML = '<tr><td class="empty" colspan="16">No published results are available yet.</td></tr>';
-  statusNode.textContent = message;
+const facets = [
+  ['mode', 'Mode'], ['stamp', 'Stamp'], ['experiment', 'Experiment'],
+  ['arrowcols', 'ArrowCols'], ['dfe_worker_concurrency', 'DFE concurrency'],
+  ['clients', 'Clients'], ['table', 'Table'], ['table_owner', 'Table owner'],
+  ['status', 'Status'], ['pinning_ok', 'Pinning OK']
+];
+const state = { filters: {}, search: '', sort: 'replicas', direction: 'asc' };
+let allRows = [];
+let loadMessage = 'No published results are available yet.';
+const missing = 'n';
+const valueFor = (row, key) => key === 'replicas' || key === 'arrowcols' ? (row.arrowcols ?? row.replicas) : row[key];
+const facetValue = value => value === null || value === undefined ? missing : `v${String(value)}`;
+const facetLabel = value => value === missing ? 'Not available' : value.slice(1);
+
+function readUrl() {
+  const params = new URLSearchParams(location.search);
+  state.search = params.get('q') || '';
+  const requestedSort = params.get('sort') || 'replicas';
+  state.sort = [...document.querySelectorAll('.results-table th[data-result], .results-table th[data-column]')]
+    .some(header => (header.dataset.column || header.dataset.result) === requestedSort) ? requestedSort : 'replicas';
+  state.direction = params.get('dir') === 'desc' ? 'desc' : 'asc';
+  state.filters = Object.fromEntries(facets.map(([key]) => [key, params.get(key) || '']));
+  document.querySelector('#search').value = state.search;
 }
-async function loadResults() {
-  statusNode.textContent = 'Loading benchmark results…';
-  bodyNode.innerHTML = '<tr><td class="empty" colspan="16">Loading…</td></tr>';
-  try {
-    const response = await fetch(resultUrl, { method: 'HEAD', cache: 'no-store' });
-    if (response.status === 404) {
-      showNoResults('No published results are available yet.');
-      return;
+function writeUrl() {
+  const url = new URL(location.href);
+  for (const [key] of facets) {
+    if (state.filters[key]) url.searchParams.set(key, state.filters[key]);
+    else url.searchParams.delete(key);
+  }
+  for (const [key, value] of [['q', state.search], ['sort', state.sort === 'replicas' ? '' : state.sort], ['dir', state.direction === 'asc' ? '' : state.direction]]) {
+    if (value) url.searchParams.set(key, value);
+    else url.searchParams.delete(key);
+  }
+  history.replaceState(null, '', url);
+}
+function matches(row, excludedFacet = '') {
+  if (state.search && !Object.values(row).some(value => String(value ?? '').toLocaleLowerCase().includes(state.search.toLocaleLowerCase()))) return false;
+  return facets.every(([key]) => key === excludedFacet || !state.filters[key] || facetValue(valueFor(row, key)) === state.filters[key]);
+}
+function renderFacets() {
+  for (const [key] of facets) {
+    const select = document.querySelector(`[data-facet="${key}"]`);
+    const counts = new Map();
+    for (const row of allRows.filter(row => matches(row, key))) {
+      const value = facetValue(valueFor(row, key));
+      counts.set(value, (counts.get(value) || 0) + 1);
     }
-    if (!response.ok) throw new Error(`Could not check benchmark results (${response.status}).`);
-    const { asyncBufferFromUrl, parquetReadObjects } = await import('https://cdn.jsdelivr.net/npm/hyparquet@1.32.0/+esm');
-    const file = await asyncBufferFromUrl({ url: resultUrl });
-    const rows = await parquetReadObjects({ file, columns });
-    const sorted = rows.sort((a, b) => (number(a.replicas) ?? 0) - (number(b.replicas) ?? 0)
-      || (number(a.dfe_worker_concurrency) ?? 0) - (number(b.dfe_worker_concurrency) ?? 0)
-      || String(a.table ?? '').localeCompare(String(b.table ?? '')));
-    if (!sorted.length) throw new Error('The Parquet file contains no benchmark rows.');
-    const throughput = sorted.map(row => number(row.rows_per_second)).filter(value => value !== null);
-    const durations = sorted.map(row => number(row.duration_ms)).filter(value => value !== null);
-    const configs = new Set(sorted.map(row => `${row.replicas}:${row.dfe_worker_concurrency}`));
-    document.querySelector('#stat-rows').textContent = numberFormat.format(sorted.length);
-    document.querySelector('#stat-configs').textContent = numberFormat.format(configs.size);
-    document.querySelector('#stat-throughput').textContent = throughput.length ? `${show(Math.max(...throughput))} rows/s` : '—';
-    document.querySelector('#stat-latency').textContent = durations.length ? `${show(median(durations))} ms` : '—';
-    const memory = sorted.map(row => number(row.memory_bytes)).filter(value => value !== null).map(value => value / 1048576);
-    const qapCompletions = sorted.map(row => number(row.qap_completion_percent)).filter(value => value !== null);
-    const qapPending = sorted.map(row => number(row.qap_pending_artifacts)).filter(value => value !== null);
-    const qapCached = sorted.map(row => number(row.qap_cached_bytes)).filter(value => value !== null).map(value => value / 1048576);
-    const qapUnhealthy = sorted.map(row => number(row.qap_unhealthy_catalogs)).filter(value => value !== null);
-    const qapLag = sorted.map(row => number(row.qap_lag_seconds)).filter(value => value !== null);
-    bodyNode.innerHTML = sorted.map(row => {
-      const duration = number(row.duration_ms);
-      const rate = number(row.rows_per_second);
-      const cpu = number(row.cpu_millicores);
-      const memoryMiB = number(row.memory_bytes) === null ? null : number(row.memory_bytes) / 1048576;
-      return `<tr><td class="key">${safeText(row.run_id)}</td><td>${safeText(show(row.replicas, 0))}</td><td>${safeText(show(row.dfe_worker_concurrency, 0))}</td><td class="key">${safeText(row.table)}</td><td>${safeText(show(row.rows, 0))}</td><td class="heat" style="${heat(duration, durations, true)}">${safeText(show(duration))}</td><td class="heat" style="${heat(rate, throughput)}">${safeText(show(rate))}</td><td class="heat" style="${heat(cpu, sorted.map(item => number(item.cpu_millicores)).filter(value => value !== null), true)}">${safeText(show(cpu))}</td><td class="heat" style="${heat(memoryMiB, memory, true)}">${safeText(show(memoryMiB))}</td><td>${safeText(show(row.qap_observation_complete, 0))}</td><td>${safeText(show(row.qap_observed_tables, 0))}</td><td class="heat" style="${heat(row.qap_completion_percent, qapCompletions)}">${safeText(show(row.qap_completion_percent))}</td><td class="heat" style="${heat(row.qap_pending_artifacts, qapPending, true)}">${safeText(show(row.qap_pending_artifacts, 0))}</td><td class="heat" style="${heat(number(row.qap_cached_bytes) === null ? null : number(row.qap_cached_bytes) / 1048576, qapCached)}">${safeText(show(number(row.qap_cached_bytes) === null ? null : number(row.qap_cached_bytes) / 1048576))}</td><td class="heat" style="${heat(row.qap_unhealthy_catalogs, qapUnhealthy, true)}">${safeText(show(row.qap_unhealthy_catalogs, 0))}</td><td class="heat" style="${heat(row.qap_lag_seconds, qapLag, true)}">${safeText(show(row.qap_lag_seconds))}</td></tr>`;
-    }).join('');
-    statusNode.textContent = `${numberFormat.format(sorted.length)} result rows loaded from ${new URL(resultUrl).pathname.split('/').pop()}.`;
-  } catch (error) {
-    showNoResults(error instanceof Error ? error.message : 'Could not load benchmark results.');
+    if (state.filters[key] && !counts.has(state.filters[key])) counts.set(state.filters[key], 0);
+    const options = [...counts].sort((a, b) => facetLabel(a[0]).localeCompare(facetLabel(b[0]), undefined, { numeric: true }));
+    select.innerHTML = `<option value="">All (${allRows.filter(row => matches(row, key)).length})</option>` +
+      options.map(([value, count]) => `<option value="${safeText(value)}">${safeText(facetLabel(value))} (${count})</option>`).join('');
+    select.value = state.filters[key] || '';
   }
 }
+function compareRows(a, b) {
+  const left = valueFor(a, state.sort);
+  const right = valueFor(b, state.sort);
+  if (left == null || right == null) return left == null ? (right == null ? 0 : 1) : -1;
+  const numeric = number(left) !== null && number(right) !== null;
+  const comparison = numeric ? number(left) - number(right) : String(left).localeCompare(String(right), undefined, { numeric: true });
+  return state.direction === 'desc' ? -comparison : comparison;
+}
+function formattedTunables(value) {
+  if (value == null || value === '') return '—';
+  try { return JSON.stringify(JSON.parse(value), null, 2); }
+  catch { return String(value); }
+}
+function timestamp(value) {
+  if (value == null || value === '') return '—';
+  const date = new Date(typeof value === 'bigint' ? Number(value) : value);
+  return Number.isNaN(date.valueOf()) ? String(value) : date.toISOString().replace('T', ' ').replace('.000Z', 'Z');
+}
+function render() {
+  writeUrl();
+  renderFacets();
+  const rows = allRows.filter(row => matches(row)).sort(compareRows);
+  const values = key => rows.map(row => number(valueFor(row, key))).filter(value => value !== null);
+  const throughput = values('rows_per_second');
+  const durations = values('duration_ms');
+  const configs = new Set(rows.map(row => JSON.stringify([row.mode, row.stamp, row.experiment, valueFor(row, 'arrowcols'), row.dfe_worker_concurrency, row.clients, row.tables, row.tunables_json], (_, value) => typeof value === 'bigint' ? value.toString() : value)));
+  document.querySelector('#stat-rows').textContent = numberFormat.format(rows.length);
+  document.querySelector('#stat-configs').textContent = numberFormat.format(configs.size);
+  document.querySelector('#stat-throughput').textContent = throughput.length ? `${show(throughput.reduce((best, value) => Math.max(best, value), -Infinity))} rows/s` : '—';
+  document.querySelector('#stat-latency').textContent = durations.length ? `${show(median(durations))} ms` : '—';
+  document.querySelector('#filtered-count').textContent = `${numberFormat.format(rows.length)} of ${numberFormat.format(allRows.length)} rows`;
+  for (const header of document.querySelectorAll('.results-table th[data-result], .results-table th[data-column]')) {
+    const key = header.dataset.column || header.dataset.result;
+    if (key === state.sort) header.setAttribute('aria-sort', state.direction === 'asc' ? 'ascending' : 'descending');
+    else header.removeAttribute('aria-sort');
+  }
+  if (!rows.length) {
+    bodyNode.innerHTML = `<tr><td class="empty" colspan="29">${safeText(allRows.length ? 'No results match these filters. Try clearing or changing them.' : loadMessage)}</td></tr>`;
+    return;
+  }
+  const heatColumns = {
+    duration_ms: [durations, true, 1], rows_per_second: [throughput, false, 1],
+    cpu_millicores: [values('cpu_millicores'), true, 1], memory_bytes: [values('memory_bytes').map(v => v / 1048576), true, 1048576],
+    qap_completion_percent: [values('qap_completion_percent'), false, 1], qap_pending_artifacts: [values('qap_pending_artifacts'), true, 1],
+    qap_cached_bytes: [values('qap_cached_bytes').map(v => v / 1048576), false, 1048576],
+    qap_unhealthy_catalogs: [values('qap_unhealthy_catalogs'), true, 1], qap_lag_seconds: [values('qap_lag_seconds'), true, 1]
+  };
+  const numericCell = (row, key, digits = 2) => {
+    const spec = heatColumns[key];
+    const raw = number(valueFor(row, key));
+    const value = raw === null ? null : raw / (spec?.[2] || 1);
+    return `<td${spec ? ` class="heat" style="${heat(value, spec[0], spec[1])}"` : ''}>${safeText(show(value, digits))}</td>`;
+  };
+  bodyNode.innerHTML = rows.map(row => {
+    const problem = row.status === 'failed' || row.status === 'pinning_violation' || row.pinning_ok === false;
+    const modeClass = row.mode === 'local' ? 'badge-local' : row.mode === 'aks' ? 'badge-aks' : '';
+    const statusClass = row.status === 'succeeded' ? 'badge-ok' : problem ? 'badge-alert' : '';
+    const pinning = row.pinning_ok === true ? 'OK' : row.pinning_ok === false ? 'Violation' : '—';
+    return `<tr${problem ? ' class="problem"' : ''}>
+      <td><span class="badge ${modeClass}">${safeText(row.mode)}</span></td><td>${safeText(row.stamp)}</td><td>${safeText(row.experiment)}</td>
+      <td><span class="badge ${statusClass}">${safeText(row.status)}</span></td><td><span class="badge ${row.pinning_ok === false ? 'badge-alert' : row.pinning_ok === true ? 'badge-ok' : ''}">${pinning}</span></td>
+      <td class="key">${safeText(row.run_id)}</td>${numericCell(row, 'replicas', 0)}${numericCell(row, 'dfe_worker_concurrency', 0)}
+      <td class="key">${safeText(row.table)}</td><td>${safeText(row.table_owner)}</td>${numericCell(row, 'clients', 0)}
+      ${numericCell(row, 'rows', 0)}${numericCell(row, 'duration_ms')}${numericCell(row, 'rows_per_second')}${numericCell(row, 'cpu_millicores')}${numericCell(row, 'memory_bytes')}
+      ${numericCell(row, 'qap_observation_complete', 0)}${numericCell(row, 'qap_observed_tables', 0)}${numericCell(row, 'qap_completion_percent')}${numericCell(row, 'qap_pending_artifacts', 0)}${numericCell(row, 'qap_cached_bytes')}${numericCell(row, 'qap_unhealthy_catalogs', 0)}${numericCell(row, 'qap_lag_seconds')}
+      <td>${safeText(row.host)}</td><td>${safeText(timestamp(row.started_at))}</td>${numericCell(row, 'measure_seconds')}${numericCell(row, 'tables', 0)}<td>${safeText(row.git_sha)}</td>
+      <td><details><summary>View</summary><pre>${safeText(formattedTunables(row.tunables_json))}</pre></details></td></tr>`;
+  }).join('');
+}
+async function loadResults() {
+  document.querySelector('#reload').disabled = true;
+  statusNode.textContent = 'Loading benchmark results…';
+  bodyNode.innerHTML = '<tr><td class="empty" colspan="29">Loading…</td></tr>';
+  try {
+    const response = await fetch(resultUrl, { cache: 'no-store' });
+    if (response.status === 404 || (response.ok && response.headers.get('content-length') === '0')) {
+      allRows = [];
+      loadMessage = 'No published results are available yet.';
+    } else {
+      if (!response.ok) throw new Error(`Could not check benchmark results (${response.status}).`);
+      const file = await response.arrayBuffer();
+      if (!file.byteLength) {
+        allRows = [];
+      } else {
+        const { parquetReadObjects } = await import('https://cdn.jsdelivr.net/npm/hyparquet@1.32.0/+esm');
+        allRows = await parquetReadObjects({ file });
+      }
+      loadMessage = 'No published results are available yet.';
+    }
+    statusNode.textContent = allRows.length ? `${numberFormat.format(allRows.length)} result rows loaded from results.parquet.` : loadMessage;
+  } catch (error) {
+    allRows = [];
+    loadMessage = error instanceof Error ? `Could not load results: ${error.message}` : 'Could not load benchmark results.';
+    statusNode.textContent = loadMessage;
+  } finally {
+    document.querySelector('#reload').disabled = false;
+  }
+  render();
+}
+for (const [key, label] of facets) {
+  const wrapper = document.createElement('label');
+  wrapper.textContent = label;
+  const select = document.createElement('select');
+  select.setAttribute('aria-label', label);
+  select.dataset.facet = key;
+  select.addEventListener('change', () => { state.filters[key] = select.value; render(); });
+  wrapper.append(select);
+  document.querySelector('#filter-grid').append(wrapper);
+}
+document.querySelector('#search').addEventListener('input', event => { state.search = event.target.value; render(); });
+document.querySelector('#clear').addEventListener('click', () => {
+  state.filters = {};
+  state.search = '';
+  state.sort = 'replicas';
+  state.direction = 'asc';
+  document.querySelector('#search').value = '';
+  render();
+});
+window.addEventListener('popstate', () => { readUrl(); render(); });
 document.querySelector('#reload').addEventListener('click', loadResults);
+readUrl();
 renderMappings();
 loadResults();
 </script>

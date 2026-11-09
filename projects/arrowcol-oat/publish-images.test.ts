@@ -31,6 +31,7 @@ function fixture(t: test.TestContext) {
   fs.writeFileSync(options.stampConfig, stringify(stamp));
   fs.writeFileSync(options.runtimeConfig, JSON.stringify({
     namespace: 'arrow-collector', serviceAccount: 'arrow-collector', stamp: String(stamp.stamp),
+    oatRunId: '00000000-0000-0000-0000-000000000003',
     workloadIdentityClientId: client, subscriptionId: subscription,
     deltaRoot: `abfss://arrowcol@${registry}.dfs.core.windows.net/dataflow`,
     images: { sqlserver: 'unpublished', catalog: 'unpublished', router: 'unpublished', dataflow: 'unpublished' },
@@ -84,6 +85,7 @@ test('publishes four existing images as federated UAMI without applying identity
   const originalAzure = process.env.AZURE_CONFIG_DIR;
   const originalDocker = process.env.DOCKER_CONFIG;
   const result = await publishImages(options, m.runner);
+  assert.equal(result.oatRunId, '00000000-0000-0000-0000-000000000003');
   assert.equal(validateRuntime(result), result);
   assert.equal(m.calls.filter(c => c[0] === 'docker' && c[1] === 'push').length, 4);
   assert.ok(m.calls.every(c => !c.includes('apply') && !c.includes('build') && !c.includes('federated-credential')));
@@ -110,6 +112,23 @@ test('invalid registry digest preserves the draft and removes isolated credentia
   await assert.rejects(publishImages(options, m.runner), /invalid sqlserver manifest digest/);
   assert.equal(fs.readFileSync(options.runtimeConfig, 'utf8'), original);
   assert.equal(fs.existsSync(m.cache()), false);
+});
+
+test('missing or malformed run identity is rejected before credentials or publication', async t => {
+  const options = fixture(t);
+  const valid = fs.readFileSync(options.runtimeConfig, 'utf8');
+  for (const runId of [undefined, 'not-a-uuid']) {
+    const config = JSON.parse(valid);
+    if (runId === undefined) delete config.oatRunId;
+    else config.oatRunId = runId;
+    const original = JSON.stringify(config);
+    fs.writeFileSync(options.runtimeConfig, original);
+    const m = mock(options.registry);
+    await assert.rejects(publishImages(options, m.runner),
+      runId === undefined ? /missing or unknown fields/ : /oatRunId/);
+    assert.ok(m.calls.every(c => c[0] === 'git' && c[1] === 'check-ignore'));
+    assert.equal(fs.readFileSync(options.runtimeConfig, 'utf8'), original);
+  }
 });
 
 test('requires federation, matching runtime subject and all amd64 images before Azure calls', async t => {

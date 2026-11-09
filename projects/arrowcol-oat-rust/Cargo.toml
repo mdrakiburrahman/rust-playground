@@ -19,6 +19,7 @@ arrow-deltalake = { path = "../../crates/arrow-deltalake" }
 arrowcol-loadgen = { path = "../loadtest/loadgen" }
 chrono = "0.4"
 axum = "0.8"
+bytes = "1"
 clap.workspace = true
 collector-chain = { path = "../../bin/collector-chain" }
 futures-util = "0.3"
