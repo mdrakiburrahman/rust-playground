@@ -148,6 +148,11 @@ test('Kusto is pinned, memory-bounded, defaults its bind to loopback and keeps i
   assert.equal(devcontainer.portsAttributes['8080'].onAutoForward, 'ignore');
 });
 
+test('Kusto runs under init so a graceful stop does not wait for SIGKILL', () => {
+  // The image entrypoint is a bash script that never execs Kusto, and bash as PID 1 ignores SIGTERM.
+  assert.equal(compose.services.kusto.init, true);
+});
+
 test('Kusto sees only read-only Delta roots plus owned persistent native storage', () => {
   const kusto = compose.services.kusto;
   assert.deepEqual(kusto.volumes, [
