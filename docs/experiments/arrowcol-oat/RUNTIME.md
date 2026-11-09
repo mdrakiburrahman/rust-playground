@@ -80,7 +80,7 @@ pinning, while preparation/client/cleanup errors can abort before Parquet exists
 | Retained output | Evidence / limits |
 | --- | --- |
 | `snapshots/<cell-run-UUID>/stopped.json` and `complete.json` | Stopped container identities/outcomes and completion manifest with per-table manifest SHA256. An absent completion marker means incomplete export, not permission to clean source data. |
-| `snapshots/<cell-run-UUID>/sqlserver_active_sessions/table/` | Unchanged genuine Delta JSON log and payload bytes. No symlinks/nonregular files, checkpoints, deletion vectors, external paths, history gaps or missing historical Add payloads are accepted. |
+| `snapshots/<cell-run-UUID>/sqlserver_active_sessions/table/` | Unchanged genuine Delta JSON log and payload bytes; only the empty writer lock file is omitted. No symlinks/nonregular files, checkpoints, deletion vectors, external paths, history gaps or missing historical Add payloads are accepted. |
 | Sibling `manifest.json` | Version 1 `schema_version`, `run_id`, `table`, `latestVersion`, positive `rowCount`, original `schemaString`, `files[{path,size,sha256}]`, stopped `writers` and semantics. Paths are relative to `table/`; active rows are independently decoded and checked against Parquet footer counts, never inferred from Add statistics. |
 | `results.parquet`, `site/results.parquet` | Local summary/mirror outside generated state. Not the Delta dataset and not a provider qualification receipt. |
 
