@@ -17,6 +17,7 @@ use crate::{
         AckOutcome, CAPABILITY_EVIDENCE_FILE, ROUTING_EVIDENCE_FILE, SCHEMA_CONTRACT_FILE, SEND_MANIFEST_FILE,
         SchemaContract, SendManifestEntry, VALIDATION_FILE,
     },
+    schema::TABLE_COUNT,
 };
 
 /// Wait for real publication queues while their admin endpoints are still alive.
@@ -236,8 +237,8 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
     };
     check(!sends.is_empty(), "send manifest is empty", &mut failures);
     check(
-        contracts.len() == 13,
-        "schema contract does not contain 13 tables",
+        contracts.len() == TABLE_COUNT,
+        "schema contract does not contain 32 tables",
         &mut failures,
     );
     let contract_map = contracts
@@ -519,7 +520,7 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
         );
     }
     println!(
-        "PASS: 13 schemas, Dataflow rows, routing, capabilities, and {} Delta files",
+        "PASS: {TABLE_COUNT} schemas, Dataflow rows, routing, capabilities, and {} Delta files",
         report.dataflow.as_ref().map_or(0, |snapshot| snapshot.files)
     );
     Ok(())

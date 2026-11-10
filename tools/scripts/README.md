@@ -43,7 +43,7 @@ and `SHA256SUMS` before recreating the devcontainer.
 | Step | Required arguments | Expected result |
 | --- | --- | --- |
 | `verify` | None; optional `--expected-sha <full SHA>` | Clean checkout must match the exact HEAD SHA; all exact-head CI runs succeed, regression/build gates pass, six `loadtest:build` images are revision- and config-verified against Compose aliases, supported image smokes and SDK bundles pass. |
-| `local` | `--verified-receipt <verify/receipt.json>` | Normal then Quiver crash/recovery, native local schema evolution, all 13 table SDK/artifact bundles, preserved private seals and no live attempt writers. |
+| `local` | `--verified-receipt <verify/receipt.json>` | Normal then Quiver crash/recovery, native local schema evolution, all 32 table SDK/artifact bundles, preserved private seals and no live attempt writers. |
 | `reset` | `--verified-receipt <verify/receipt.json> --confirm-reset <dedicated group>` | **Destructively resets only the explicitly confirmed isolated group**, then provisions and checks fresh readiness. Saves private base/ready/manifest files outside the checkout; receipt binds their hashes, generation and source. |
 | `azure` | `--reset-receipt <reset/receipt.json>` | Checks the receipt chain and live ready generation, runs native Azure evolution, verifies owned-process/data cleanup. Never provisions or resets. |
 

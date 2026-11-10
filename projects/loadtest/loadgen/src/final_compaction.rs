@@ -1866,7 +1866,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_13_table_fixture_compacts_and_binds_independent_validation_inventory() -> Result<()> {
+    async fn local_canonical_fixture_compacts_and_binds_independent_validation_inventory() -> Result<()> {
         let root = tempfile::tempdir()?;
         let arguments = args(root.path());
         receipts(root.path(), serde_json::json!({"run_id":"run-1","passed":true}))?;
@@ -1904,7 +1904,7 @@ mod tests {
         assert_eq!(receipt["passes"].as_array().context("passes")?.len(), 2);
         assert_eq!(
             receipt["passes"][0]["reports"].as_object().context("reports")?.len(),
-            13
+            TABLE_COUNT
         );
         assert!(
             receipt["passes"][1]["reports"]
@@ -1920,7 +1920,7 @@ mod tests {
                 serde_json::to_value(independent)?
             );
             let tables = receipt["pools"][pool]["tables"].as_object().context("tables")?;
-            assert_eq!(tables.len(), 13);
+            assert_eq!(tables.len(), TABLE_COUNT);
             for evidence in tables.values() {
                 assert_eq!(evidence["rows"], 4);
                 assert_eq!(

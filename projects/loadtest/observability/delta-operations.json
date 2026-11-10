@@ -92,7 +92,7 @@
     },
     {
       "id": 15, "type": "timeseries", "interval": "2s", "title": "Native QAP: observation completeness and readable tables",
-      "description": "Complete is one only when all 13 tables in the pool supply every plotted measurement; it does not assert cached correctness.",
+      "description": "Complete is one only when every table in the pool supply every plotted measurement; it does not assert cached correctness.",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "x": 12, "y": 48, "w": 12, "h": 8 },
       "targets": [{ "refId": "A", "expr": "sum by (__name__, pool) ({__name__=~\"qap_observation_complete|qap_observed_tables\"})", "legendFormat": "{{__name__}} {{pool}}" }]

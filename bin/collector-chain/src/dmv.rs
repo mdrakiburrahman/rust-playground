@@ -449,7 +449,7 @@ mod tests {
     #[test]
     fn builds_a_batch_for_every_dmv_table_tagged_with_the_client() -> Result<()> {
         let tables = tables()?;
-        assert_eq!(tables.len(), 13);
+        assert_eq!(tables.len(), 32);
         for table in &tables {
             let batch = batch(table, "client-a", 3, 1)?;
             let customers = batch

@@ -173,7 +173,7 @@ pub fn run_metadata(run_id: &str, arguments: &RunArgs, schema_contract_sha256: &
             "max_attempts": arguments.max_attempts,
             "retry_window_seconds": arguments.retry_window.map(|window| window.get().as_secs()),
             "quiver": arguments.quiver,
-            "scheduler": "single global atomic ordinal; seed-rotated equal round-robin across all 13 tables",
+            "scheduler": "single global atomic ordinal; seed-rotated equal round-robin across all configured tables",
             "dataflow_delivery": if arguments.quiver {
                 "durable admission: Quiver WAL fsync before completion; replayed after a crash (at least once)"
             } else {
