@@ -39,11 +39,11 @@ async function fixture(t: test.TestContext, stamp = '00000') {
 
 function fake(options: {
   clusters?: string[]; state?: string; preflightFailures?: number; fail?: string;
-  missingImages?: boolean; registryAbsent?: boolean; badProvenance?: boolean; badDigest?: boolean;
+  missingImages?: boolean; olderTags?: boolean; registryAbsent?: boolean; badProvenance?: boolean; badDigest?: boolean;
 } = {}) {
   const calls: string[][] = [];
   let preflights = 0;
-  let published = !options.missingImages;
+  let published = !options.missingImages && !options.olderTags;
   const missingMetadata = new Set<string>();
   const runner: typeof run_tree = async (command, _timeout, _cwd, env) => {
     calls.push(command);
@@ -62,7 +62,8 @@ function fake(options: {
     ]);
     else if (text.startsWith('az acr repository show-tags')) {
       const repository = command[command.indexOf('--repository') + 1]!;
-      stdout = JSON.stringify(!published && missingMetadata.has(repository) ? [] : [`oat-${revision}`]);
+      stdout = JSON.stringify(!published && options.olderTags ? [`oat-${'f'.repeat(40)}`] :
+        !published && missingMetadata.has(repository) ? [] : [`oat-${revision}`]);
     }
     else if (text.startsWith('az storage container show')) stdout = JSON.stringify({
       properties: { etag: '"authority"' }, metadata: {
@@ -222,6 +223,22 @@ test('skip-images and hard provenance failures never trigger builds or overwrite
   await assert.rejects(setup({ ...options, skipPreflight: true }, failedBuild.runner), /Docker build failed/);
   assert.equal(await readFile(result.runtimeConfigPath, 'utf8'), original);
   await assert.rejects(readFile(resolve(output, 'runtime.publish.json')), { code: 'ENOENT' });
+});
+
+test('repositories with only older revision tags build and publish without pre-build manifest lookups', async t => {
+  await mkdir(output, { mode: 0o700 });
+  t.after(() => rm(output, { force: true, recursive: true }));
+  const options = await fixture(t);
+  const m = fake({ olderTags: true });
+  const result = await setup({ ...options, skipPreflight: true }, m.runner);
+  const firstBuild = m.calls.findIndex(c => c[0] === 'docker' && c[1] === 'buildx');
+  assert.ok(firstBuild > 0);
+  assert.equal(m.calls.slice(0, firstBuild).filter(c => c.slice(0, 4).join(' ') === 'az acr repository show-tags').length, 5);
+  assert.ok(m.calls.slice(0, firstBuild).every(c => c.slice(0, 4).join(' ') !== 'az acr manifest show-metadata'));
+  assert.equal(m.calls.filter(c => c[0] === 'docker' && c[1] === 'buildx').length, 5);
+  assert.equal(m.calls.filter(c => c[0] === 'docker' && c[1] === 'push').length, 5);
+  assert.equal(m.calls.filter(c => c[0] === 'docker' && c[1] === 'pull').length, 5);
+  assert.ok(Object.values(result.images).every(image => image.endsWith(`@${digest}`)));
 });
 
 test('real absent-registry failure never becomes missing images or triggers build/publication', async t => {
