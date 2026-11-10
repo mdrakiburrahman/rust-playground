@@ -87,6 +87,84 @@ test('provision previews and creates with the identical parameter file and resol
 const resourceGroupId = '/subscriptions/' + subscription + '/resourceGroups/arrow-collector-rg';
 const identityId = resourceGroupId + '/providers/Microsoft.ManagedIdentity/userAssignedIdentities/arrow-collector';
 const clusterId = resourceGroupId + '/providers/Microsoft.Kusto/clusters/arrow-collector-89152';
+for (const envelope of ['flat CLI', 'nested REST']) {
+  for (const scenario of [
+    { name: 'Error', diagnostics: [{ level: 'Error', code: 'ProviderEvaluationFailed' }],
+      error: /level=Error code=ProviderEvaluationFailed/ },
+    { name: 'Warning', diagnostics: [{ level: 'Warning', code: 'NestedDeploymentShortCircuited' }],
+      error: /level=Warning code=NestedDeploymentShortCircuited/ },
+    { name: 'missing level', diagnostics: [{ code: 'MissingLevel' }],
+      error: /level=<missing> code=MissingLevel/ },
+    { name: 'unknown level', diagnostics: [{ level: 'Trace', code: 'UnexpectedLevel' }],
+      error: /level=Trace code=UnexpectedLevel/ },
+    { name: 'non-array diagnostics', diagnostics: {}, error: /diagnostic/ },
+    { name: 'non-object diagnostic', diagnostics: [null], error: /diagnostic/ },
+  ]) {
+    test(`R4 refuses ${scenario.name} diagnostics in ${envelope} before create`, async () => {
+      const stamp = defaultStampConfig({ AZURE_STAMP: '89152' });
+      stamp.subscription = subscription;
+      const azure = new Azure(new Config({ AZURE_SUBSCRIPTION_ID: subscription }, stamp));
+      azure.arm = async () => null;
+      const calls: string[] = [], logs: string[] = [];
+      const originalLog = console.log;
+      console.log = (...values) => logs.push(values.join(' '));
+      azure.cli = async (...args) => {
+        calls.push(args[2]!);
+        if (args[2] !== 'what-if') throw new Failure('DeploymentFailed: simulated create rejection');
+        const body = { changes: [{ changeType: 'Ignore', resourceId: clusterId }], diagnostics: scenario.diagnostics };
+        return envelope === 'flat CLI' ? { status: 'Succeeded', ...body } : { status: 'Succeeded', properties: body };
+      };
+      try {
+        await assert.rejects(provision(azure, '', 0, '/tmp/arrowcol-preview-test-output', true, {}, true),
+          (error: unknown) => error instanceof ArmPreviewFailure && scenario.error.test(error.message));
+      } finally { console.log = originalLog; }
+      assert.deepEqual(calls, ['what-if']);
+      assert.equal(logs.some(line => line.startsWith('ARM_PREVIEW_VERIFIED')), false);
+    });
+  }
+  test(`R4 prints Info diagnostics in ${envelope} and permits a verified create`, async () => {
+    const stamp = defaultStampConfig({ AZURE_STAMP: '89152' });
+    stamp.subscription = subscription;
+    const azure = new Azure(new Config({ AZURE_SUBSCRIPTION_ID: subscription }, stamp));
+    azure.arm = async () => null;
+    const calls: string[] = [], logs: string[] = [];
+    const originalLog = console.log;
+    console.log = (...values) => logs.push(values.join(' '));
+    azure.cli = async (...args) => {
+      calls.push(args[2]!);
+      if (args[2] !== 'what-if') throw new Failure('DeploymentFailed: simulated create rejection');
+      const body = { changes: [], diagnostics: [
+        { level: 'Info', code: 'PreviewInformation', message: 'All template resources evaluated.' },
+      ] };
+      return envelope === 'flat CLI' ? { status: 'Succeeded', ...body } : { status: 'Succeeded', properties: body };
+    };
+    try { await assert.rejects(provision(azure, '', 0, '/tmp/arrowcol-preview-test-output', true, {}, true), /DeploymentFailed/); }
+    finally { console.log = originalLog; }
+    assert.deepEqual(calls, ['what-if', 'create']);
+    assert.ok(logs.some(line => line.includes('level=Info code=PreviewInformation message=All template resources evaluated.')));
+    assert.ok(logs.some(line => line.startsWith('ARM_PREVIEW_VERIFIED')));
+  });
+}
+
+test('R4 refuses top-level diagnostics alongside a REST properties envelope before create', async () => {
+  const stamp = defaultStampConfig({ AZURE_STAMP: '89152' });
+  stamp.subscription = subscription;
+  const azure = new Azure(new Config({ AZURE_SUBSCRIPTION_ID: subscription }, stamp));
+  azure.arm = async () => null;
+  const calls: string[] = [], logs: string[] = [];
+  const originalLog = console.log;
+  console.log = (...values) => logs.push(values.join(' '));
+  azure.cli = async (...args) => {
+    calls.push(args[2]!);
+    if (args[2] !== 'what-if') throw new Failure('DeploymentFailed: simulated create rejection');
+    return { status: 'Succeeded', diagnostics: null, properties: { changes: [], diagnostics: [] } };
+  };
+  try { await assert.rejects(provision(azure, '', 0, '/tmp/arrowcol-preview-test-output', true, {}, true), ArmPreviewFailure); }
+  finally { console.log = originalLog; }
+  assert.deepEqual(calls, ['what-if']);
+  assert.equal(logs.some(line => line.startsWith('ARM_PREVIEW_VERIFIED')), false);
+});
+
 const microsoftRestTagCreateModify = JSON.parse(fs.readFileSync(
   new URL('./fixtures/what-if-rest-tag-create.synthetic.json', import.meta.url), 'utf8'));
 const observedCliPreview = JSON.parse(fs.readFileSync(
@@ -201,8 +279,8 @@ test('R3 verifies the observed role reference against the live identity and reje
         calls.push(args[2]!);
         if (args[2] === 'create') throw new Failure('DeploymentFailed: simulated create rejection');
         if (nested) {
-          const { changes, potentialChanges, ...rest } = observedCliPreview;
-          return { ...rest, properties: { changes, potentialChanges } };
+          const { changes, potentialChanges, diagnostics, ...rest } = observedCliPreview;
+          return { ...rest, properties: { changes, potentialChanges, diagnostics } };
         }
         return observedCliPreview;
       };

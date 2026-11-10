@@ -82,6 +82,10 @@ accepted only when both the parent and extension types are allowlisted.
 Both definite and potential changes receive the same checks, in either the
 observed flat CLI envelope or the REST `properties` envelope; ambiguous or
 malformed envelopes fail closed. `NoEffect` is not a resource change type.
+Diagnostics are read from the same envelope. Error, Warning (including skipped
+nested deployments), unknown or missing levels, malformed diagnostics and
+ambiguous placement stop before create. Info diagnostics print their level, code
+and redacted message; absent, null or empty diagnostics are allowed.
 A `Modify` is accepted only for the exact shared resource group or UAMI.
 Their Bicep-managed projection is name, location and tags (checked against the
 compiled templates in tests). Both snapshots must include matching resource

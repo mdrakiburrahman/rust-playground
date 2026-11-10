@@ -1094,9 +1094,20 @@ async function verified_arm_what_if_changes(result: unknown, azure: Azure): Prom
   let properties = response;
   if (Object.hasOwn(response, 'properties')) {
     if (!arm_what_if_record(response.properties) || Object.hasOwn(response, 'changes') ||
-        Object.hasOwn(response, 'potentialChanges'))
+        Object.hasOwn(response, 'potentialChanges') || Object.hasOwn(response, 'diagnostics'))
       throw new Failure('ARM what-if returned an invalid or ambiguous response envelope.');
     properties = response.properties;
+  }
+  const diagnostics = properties.diagnostics;
+  if (diagnostics !== undefined && diagnostics !== null) {
+    if (!Array.isArray(diagnostics)) throw new Failure('ARM what-if response has an invalid diagnostics list.');
+    for (const diagnostic of diagnostics) {
+      if (!arm_what_if_record(diagnostic)) throw new Failure('ARM what-if returned an invalid diagnostic entry.');
+      const label = 'level=' + String(diagnostic.level ?? '<missing>') + ' code=' + String(diagnostic.code ?? '<missing>');
+      if (diagnostic.level !== 'Info')
+        throw new Failure('ARM what-if diagnostic ' + label + ' prevents a verified preview.');
+      console.log(config.redact('ARM what-if diagnostic ' + label + ' message=' + String(diagnostic.message ?? '<missing>')));
+    }
   }
   if (!Array.isArray(properties.changes)) throw new Failure('ARM what-if response is missing its changes list.');
   const potentialChanges = properties.potentialChanges;
