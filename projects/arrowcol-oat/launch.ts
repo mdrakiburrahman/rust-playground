@@ -1,4 +1,5 @@
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { readFile, realpath, stat } from 'node:fs/promises';
 import { createServer as createHttpServer } from 'node:http';
 import { createServer as createTcpServer, isIP } from 'node:net';
@@ -34,10 +35,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-export function resolveOatConfigPath(mode: 'local' | 'aks', configPath?: string): string {
+export function resolveOatConfigPath(mode: 'local' | 'aks', configPath?: string, root = workspaceRoot): string {
   if (configPath) return configPath;
+  if (mode === 'aks') {
+    const generated = resolve(root, 'out/arrowcol-oat/oat-config.aks.json');
+    if (existsSync(generated)) return generated;
+  }
   const name = mode === 'local' ? 'oat-config.quick.json' : 'oat-config.aks.quick.json';
-  return resolve(workspaceRoot, 'docs/experiments/arrowcol-oat', name);
+  return resolve(root, 'docs/experiments/arrowcol-oat', name);
 }
 
 function getDockerBridgeGateway(): string {
