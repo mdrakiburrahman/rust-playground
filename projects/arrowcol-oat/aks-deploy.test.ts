@@ -4,18 +4,25 @@ import path from 'node:path';
 import test from 'node:test';
 import { parse, stringify } from 'yaml';
 import { ROOT, run_tree, TAGS } from '../../infra/azure/bootstrap.js';
-import { deploy, deployInfrastructure, main, pickStamp } from './aks-deploy.js';
+import { deploy, deployInfrastructure as runDeployInfrastructure, main, pickStamp } from './aks-deploy.js';
 import { renderStampConfig } from './aks-stamp.js';
 
 const subscription = '00000000-0000-0000-0000-000000000001';
 const stamp = '89152';
 const clusterName = `arrow-collector-${stamp}`;
-const state = path.join(ROOT, 'out', 'arrowcol-oat');
 type Fault = 'cluster' | 'other' | 'timeout' | 'quota' | 'identity' | 'database' | 'publisher' | 'native-federation' | 'network' | 'missing-target' | 'convergence' | 'run-fic-permission';
+
+function deployInfrastructure(
+  options: Parameters<typeof runDeployInfrastructure>[0] & { stateDirectory: string }, runner: typeof run_tree,
+) {
+  const { stateDirectory, ...deployOptions } = options;
+  return runDeployInfrastructure(deployOptions, runner, stateDirectory);
+}
 
 function fixture(t: test.TestContext, faults: Fault[] = []) {
   fs.mkdirSync(path.join(ROOT, 'out'), { recursive: true });
   const directory = fs.mkdtempSync(path.join(ROOT, 'out', 'deploy-test-'));
+  const stateDirectory = path.join(directory, 'state');
   const stampConfig = path.join(directory, 'stamp.yaml');
   const config = parse(fs.readFileSync(path.join(ROOT, 'infra', 'azure', 'stamp.example.yaml'), 'utf8'));
   config.subscription = subscription;
@@ -23,7 +30,7 @@ function fixture(t: test.TestContext, faults: Fault[] = []) {
   config.publisherFederatedCredentials = [{ name: 'publisher', issuer: 'https://issuer.example/', subject: 'publisher' }];
   fs.writeFileSync(stampConfig, stringify(config));
   const original = fs.readFileSync(stampConfig, 'utf8');
-  const receiptPath = path.join(state, 'receipts', `deploy-${stamp}.yaml`);
+  const receiptPath = path.join(stateDirectory, 'receipts', `deploy-${stamp}.yaml`);
   const calls: string[][] = [];
   let provisionCount = 0;
   let collision = false;
@@ -113,15 +120,19 @@ function fixture(t: test.TestContext, faults: Fault[] = []) {
   };
   t.after(() => {
     fs.rmSync(directory, { recursive: true, force: true });
-    fs.rmSync(receiptPath, { force: true });
   });
-  return { options: { stamp, stampConfig }, original, runner, calls, receiptPath,
+  return { options: { stamp, stampConfig, stateDirectory }, original, runner, calls, receiptPath,
     collide: () => { collision = true; }, live: () => { live = true; },
     receipt: () => parse(fs.readFileSync(receiptPath, 'utf8')) };
 }
 
 test('fresh success is one azure pass, records explicit postconditions and private receipt', async t => {
   const f = fixture(t);
+  const other = fixture(t);
+  assert.notEqual(f.options.stateDirectory, other.options.stateDirectory);
+  fs.mkdirSync(other.options.stateDirectory, { mode: 0o700 });
+  const sentinel = path.join(other.options.stateDirectory, 'runtime.json');
+  fs.writeFileSync(sentinel, 'another private output', { mode: 0o600 });
   const result = await deployInfrastructure(f.options, f.runner);
   assert.equal(result.network, 'azure');
   assert.deepEqual(result.attempts, [{ network: 'azure', outcome: 'succeeded' }]);
@@ -130,6 +141,9 @@ test('fresh success is one azure pass, records explicit postconditions and priva
   assert.equal(fs.statSync(result.receiptPath).mode & 0o777, 0o600);
   assert.equal(parse(fs.readFileSync(f.options.stampConfig, 'utf8')).stamp, stamp);
   assert.equal(fs.readFileSync(f.options.stampConfig, 'utf8'), renderStampConfig(f.original, { stamp }));
+  assert.equal(fs.readFileSync(sentinel, 'utf8'), 'another private output');
+  assert.equal(fs.readFileSync(other.options.stampConfig, 'utf8'), other.original);
+  assert.equal(fs.existsSync(other.receiptPath), false);
 });
 
 test('only proven AKS failure deletes that cluster and retries Cilium once', async t => {
@@ -230,7 +244,7 @@ test('quota failure leaves YAML unchanged and provisions nothing', async t => {
 
 test('what-if previews first-attempt network and never invokes provision, delete, or setup', async t => {
   const f = fixture(t);
-  const result = await deploy({ ...f.options, whatIf: true }, f.runner);
+  const result = await deploy({ ...f.options, whatIf: true }, f.runner, f.options.stateDirectory);
   assert.deepEqual(result.attempts, []);
   assert.equal(result.network, 'azure');
   assert.equal(fs.readFileSync(f.options.stampConfig, 'utf8'), f.original);
@@ -262,7 +276,7 @@ test('stamp picker always produces a five-digit fresh-range integer', () => {
 test('generated candidate collisions are bounded at ten with no mutation', async t => {
   const f = fixture(t);
   f.collide();
-  await assert.rejects(deployInfrastructure({ stampConfig: f.options.stampConfig }, f.runner), /10 candidates/);
+  await assert.rejects(deployInfrastructure({ stampConfig: f.options.stampConfig, stateDirectory: f.options.stateDirectory }, f.runner), /10 candidates/);
   assert.equal(f.calls.filter(call => call[1] === 'storage' &&
     call[call.indexOf('--name') + 1]?.startsWith('arrowcollector')).length, 10);
   assert.equal(fs.readFileSync(f.options.stampConfig, 'utf8'), f.original);
@@ -301,10 +315,12 @@ test('tracked stamp configuration is never rewritten', async t => {
 
 test('stale derived state refuses instead of adopting a previous stamp', async t => {
   const f = fixture(t);
-  const exists = fs.existsSync;
-  t.mock.method(fs, 'existsSync', (filename: fs.PathLike) => filename === path.join(state, 'runtime.json') || exists(filename));
+  fs.mkdirSync(f.options.stateDirectory, { recursive: true });
+  const stalePath = path.join(f.options.stateDirectory, 'runtime.json');
+  fs.writeFileSync(stalePath, 'operator-owned private state');
   await assert.rejects(deployInfrastructure(f.options, f.runner), /Generated state.*aks destroy/s);
   assert.equal(f.calls.some(call => call[1] === 'storage'), false);
+  assert.equal(fs.readFileSync(stalePath, 'utf8'), 'operator-owned private state');
 });
 
 test('mixed resource and cluster ARM failures never delete the cluster', async t => {

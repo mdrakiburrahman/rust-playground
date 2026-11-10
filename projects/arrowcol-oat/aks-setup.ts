@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { chmod, lstat, mkdir, readFile, rm } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { parseDocument } from 'yaml';
@@ -15,7 +15,6 @@ import { generatePrivateInputs, renderBootstrapEnv, validateRuntime, writePrivat
 const setupCommand = 'npx --no-install arrowcol-oat aks setup';
 const destroyCommand = 'npx --no-install arrowcol-oat aks destroy --confirm arrow-collector-rg';
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
-const directory = resolve(ROOT, 'out/arrowcol-oat');
 
 async function checked(runner: typeof run_tree, command: string[], timeout: number, label: string,
   environment?: NodeJS.ProcessEnv): Promise<string> {
@@ -56,7 +55,7 @@ export async function discoverLiveStamp(options: SetupOptions = {}, runner: type
   return { stamp, subscription: config.subscription, resourceGroup: config.resourceGroup, clusterName };
 }
 
-async function requireCurrentState(stamp: LiveStamp): Promise<void> {
+async function requireCurrentState(stamp: LiveStamp, directory: string): Promise<void> {
   for (const filename of ['runtime.json', 'oat-config.aks.json']) {
     try {
       const state = JSON.parse(await readFile(resolve(directory, filename), 'utf8')) as { stamp?: unknown; subscriptionId?: unknown };
@@ -91,12 +90,14 @@ async function capturedGeneration(config: Config, runner: typeof run_tree): Prom
   return metadata.resetgeneration;
 }
 
-export async function setup(options: SetupOptions = {}, runner: typeof run_tree = run_tree): Promise<SetupResult> {
+export async function setup(
+  options: SetupOptions = {}, runner: typeof run_tree = run_tree, directory = resolve(ROOT, 'out/arrowcol-oat'),
+): Promise<SetupResult> {
   if (options.tag !== undefined && !/^[a-z0-9][a-z0-9._-]{0,127}$/.test(options.tag)) {
     throw new Error('--tag must be a valid lowercase container tag.');
   }
   const live = await discoverLiveStamp(options, runner);
-  await requireCurrentState(live);
+  await requireCurrentState(live, directory);
   const stampConfigPath = resolve(ROOT, options.stampConfig ?? 'infra/azure/stamp.yaml');
   await checked(runner, ['git', 'check-ignore', '--quiet', '--', stampConfigPath], 15, 'Private stamp configuration ignore check');
   const original = await readFile(stampConfigPath, 'utf8');
@@ -110,9 +111,8 @@ export async function setup(options: SetupOptions = {}, runner: typeof run_tree 
   if (stampConfig.aks.namespace !== 'arrow-collector' || stampConfig.aks.serviceAccount !== 'arrow-collector') {
     throw new Error('The host publisher namespace and ServiceAccount must both be arrow-collector.');
   }
-  const privatePaths = ['out/arrowcol-oat/runtime.json',
-    'out/arrowcol-oat/bootstrap.env', 'out/arrowcol-oat/aks.env', 'out/arrowcol-oat/oat-config.aks.json',
-    'out/arrowcol-oat/secrets/publisher-assertion.jwt'];
+  const privatePaths = ['runtime.json', 'bootstrap.env', 'aks.env', 'oat-config.aks.json',
+    'secrets/publisher-assertion.jwt'].map(filename => relative(ROOT, resolve(directory, filename)));
   const ignored = await checked(runner, ['git', 'check-ignore', ...privatePaths], 15, 'Private-state ignore check');
   if (ignored.split(/\r?\n/).sort().join('\n') !== [...privatePaths].sort().join('\n')) {
     throw new Error('All AKS private inputs must be ignored by git.');
