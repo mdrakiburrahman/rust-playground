@@ -1,6 +1,8 @@
 import { execFileSync } from 'node:child_process';
-import { readFile, stat } from 'node:fs/promises';
+import { lstat, readFile } from 'node:fs/promises';
 import { isAbsolute, resolve } from 'node:path';
+import { loadStampConfig } from '../../infra/azure/stamp.js';
+import { validateRuntime, type RuntimeConfig } from './runtime.js';
 
 export interface PreflightCheck {
   name: string;
@@ -13,6 +15,8 @@ export interface PreflightReport {
   ready: boolean;
   checks: PreflightCheck[];
   nextCommand: string;
+  warnings: string[];
+  network: { provider: string; enforcing: boolean };
 }
 
 interface CommandResult {
@@ -29,483 +33,428 @@ interface PreflightOptions {
 }
 
 type JsonRecord = Record<string, unknown>;
-
+const setupCommand = 'npx --no-install arrowcol-oat aks setup';
 const publisherNamespace = 'arrow-collector';
 const publisherServiceAccount = 'arrow-collector';
 const resourceGroup = 'arrow-collector-rg';
 const identityName = 'arrow-collector';
-const secretRequirements = [
-  ['arrowcol-sql-admin', ['password']],
-  ['arrowcol-sql-runtime', ['password']],
-  ['arrowcol-sql-migration', ['password']],
-  ['arrowcol-router-auth', ['edge-hmac', 'internal-hmac']],
-  ['arrowcol-generation', ['generation']],
-] as const;
+const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function isRecord(value: unknown): value is JsonRecord {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
-
-function readString(value: unknown): string | undefined {
+function text(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value : undefined;
 }
-
-function readStringAt(value: unknown, key: string): string | undefined {
-  return isRecord(value) ? readString(value[key]) : undefined;
+function at(value: unknown, key: string): string | undefined {
+  return isRecord(value) ? text(value[key]) : undefined;
 }
-
-function runLocalCommand(command: string, args: string[]): CommandResult {
-  try {
-    return {
-      stdout: execFileSync(command, args, { encoding: 'utf8', timeout: 30_000, maxBuffer: 8 * 1024 * 1024 }),
-      exitCode: 0,
-    };
-  } catch (error) {
-    const status = isRecord(error) && typeof error.status === 'number' ? error.status : 1;
-    return { stdout: '', exitCode: status };
-  }
+function records(value: unknown): JsonRecord[] {
+  return Array.isArray(value) ? value.filter(isRecord) : [];
 }
-
-function commandOutput(
-  runCommand: NonNullable<PreflightOptions['runCommand']>,
-  command: string,
-  args: string[],
-): string {
-  const result = runCommand(command, args);
-  if (result.exitCode !== 0) throw new Error(`${command} exited with status ${result.exitCode}`);
-  return result.stdout.trim();
+function condition(value: unknown, name: string): boolean {
+  return records(value).some((item) => item.type === name && item.status === 'True');
 }
-
-function commandJsonValue(
-  runCommand: NonNullable<PreflightOptions['runCommand']>,
-  command: string,
-  args: string[],
-): unknown {
-  const output = commandOutput(runCommand, command, args);
-  try {
-    return JSON.parse(output);
-  } catch {
-    throw new Error(command + ' returned invalid JSON');
-  }
+function object(value: unknown, label: string): JsonRecord {
+  if (!isRecord(value)) throw new Error(`${label} must be an object.`);
+  return value;
 }
-
-function commandJson(
-  runCommand: NonNullable<PreflightOptions['runCommand']>,
-  command: string,
-  args: string[],
-): JsonRecord {
-  const value = commandJsonValue(runCommand, command, args);
-  if (!isRecord(value)) throw new Error(command + ' returned an unexpected JSON shape');
+function requireValue(value: string | undefined, label: string): string {
+  if (!value) throw new Error(`${label} is missing; run \`${setupCommand}\`.`);
   return value;
 }
 
-function kubectlArgs(context: string, args: string[]): string[] {
-  return ['--context', context, '--request-timeout=30s', ...args];
+async function privateText(filename: string): Promise<string> {
+  const info = await lstat(filename);
+  if (!info.isFile() || info.isSymbolicLink() || (info.mode & 0o777) !== 0o600 || info.size > 1024 * 1024) {
+    throw new Error('Generated AKS state must be a bounded 0600 regular file, not a symlink.');
+  }
+  return readFile(filename, 'utf8');
 }
 
-function azArgs(subscription: string, args: string[]): string[] {
-  return [...args, '--subscription', subscription, '-o', 'json'];
+export async function loadAksEnvironment(
+  workspaceRoot: string,
+  base: NodeJS.ProcessEnv = process.env,
+): Promise<NodeJS.ProcessEnv> {
+  let contents: string;
+  try {
+    contents = await privateText(resolve(workspaceRoot, 'out/arrowcol-oat/aks.env'));
+  } catch (error) {
+    if (isRecord(error) && error.code === 'ENOENT') return { ...base };
+    throw new Error(`Could not load private AKS environment; run \`${setupCommand}\`.`, { cause: error });
+  }
+  const values: NodeJS.ProcessEnv = {};
+  for (const raw of contents.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const match = /^(?:export )?([A-Z][A-Z0-9_]*)=(.*)$/.exec(line);
+    if (!match || Object.hasOwn(values, match[1]!)) {
+      throw new Error(`Invalid or duplicate AKS environment assignment; run \`${setupCommand}\`.`);
+    }
+    let value = match[2]!;
+    if (value.startsWith('"') || value.startsWith("'")) {
+      if (value.length < 2 || value.at(-1) !== value[0]) throw new Error('Unclosed AKS environment quote.');
+      value = value.slice(1, -1);
+    }
+    values[match[1]!] = value;
+  }
+  return { ...values, ...Object.fromEntries(Object.entries(base).filter(([, value]) => value !== undefined)) };
 }
 
-function addCheck(
-  checks: PreflightCheck[],
-  name: string,
-  ready: boolean,
-  detail: string,
-  next: string,
-): void {
-  checks.push({ name, ready, detail, next });
+function matchesAction(pattern: string, action: string): boolean {
+  const expression = pattern.split('*').map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('.*');
+  return new RegExp(`^${expression}$`, 'i').test(action);
 }
 
-function recordArray(value: unknown): JsonRecord[] {
-  return Array.isArray(value) ? value.filter(isRecord) : [];
-}
-
-function checkCondition(value: unknown, type: string): boolean {
-  return recordArray(value).some((condition) => condition.type === type && condition.status === 'True');
-}
-
-function parseImage(image: string): { repository: string; digest: string } | undefined {
-  const match = /^[a-z0-9]+\.azurecr\.io\/([a-z0-9][a-z0-9/_.-]*)@(sha256:[a-f0-9]{64})$/.exec(image);
-  return match ? { repository: match[1]!, digest: match[2]! } : undefined;
+export function permitsAction(permissions: unknown, action: string): boolean {
+  return records(permissions).some((permission) => {
+    const actions = Array.isArray(permission.actions) ? permission.actions : [];
+    const denied = Array.isArray(permission.notActions) ? permission.notActions : [];
+    return actions.some((entry) => typeof entry === 'string' && matchesAction(entry, action)) &&
+      !denied.some((entry) => typeof entry === 'string' && matchesAction(entry, action));
+  });
 }
 
 export async function runAksPreflight(configPath: string, options: PreflightOptions = {}): Promise<PreflightReport> {
-  const workspaceRoot = resolve(options.workspaceRoot ?? process.cwd());
+  const root = resolve(options.workspaceRoot ?? process.cwd());
   const environment = options.environment ?? process.env;
-  const runCommand = options.runCommand ?? runLocalCommand;
   const fetcher = options.fetcher ?? fetch;
   const now = options.now ?? Date.now;
+  const runCommand = options.runCommand ?? ((command: string, args: string[]): CommandResult => {
+    try {
+      return { stdout: execFileSync(command, args, {
+        encoding: 'utf8', timeout: 30_000, maxBuffer: 8 * 1024 * 1024, env: environment, stdio: ['ignore', 'pipe', 'pipe'],
+      }), exitCode: 0 };
+    } catch (error) {
+      return { stdout: '', exitCode: isRecord(error) && typeof error.status === 'number' ? error.status : 1 };
+    }
+  });
   const checks: PreflightCheck[] = [];
+  const warnings: string[] = [];
+  const network = { provider: 'unknown', enforcing: false };
   const nextCommand = 'npx --no-install arrowcol-oat --mode aks --preflight-only';
-  const configFile = resolve(workspaceRoot, configPath);
-  let config: JsonRecord;
-  let platform: JsonRecord;
-  let runtime: JsonRecord;
-  let runtimeFile: string;
+  const output = (command: string, args: string[]): string => {
+    const result = runCommand(command, args);
+    if (result.exitCode !== 0) throw new Error(`${command} exited with status ${result.exitCode}; command output withheld.`);
+    return result.stdout.trim();
+  };
+  const json = (command: string, args: string[]): unknown => {
+    try { return JSON.parse(output(command, args)); }
+    catch { throw new Error(`${command} returned an unsuccessful or invalid JSON response; output withheld.`); }
+  };
+  const check = async (name: string, work: () => Promise<string> | string, next = `Run \`${setupCommand}\`, then retry.`) => {
+    try { checks.push({ name, ready: true, detail: await work(), next }); }
+    catch (error) {
+      checks.push({ name, ready: false, detail: error instanceof Error ? error.message : 'Read-only check failed.', next });
+    }
+  };
+
+  let config: JsonRecord = {};
+  let platform: JsonRecord = {};
+  let configError: string | undefined;
   try {
-    const parsed: unknown = JSON.parse(await readFile(configFile, 'utf8'));
-    if (!isRecord(parsed) || !isRecord(parsed.platform)) throw new Error('OAT config must contain a platform object');
-    config = parsed;
-    platform = config.platform as JsonRecord;
-    if (platform.kind !== 'aks') throw new Error('AKS preflight requires platform.kind=aks');
-    const stamp = readString(config.stamp);
-    if (!stamp || !/^\d{5}$/.test(stamp)) throw new Error('AKS config requires a five-digit stamp');
-    if (!readString(config.qap_database)) throw new Error('Set the selected QAP database explicitly');
-    const resultUrl = readString(config.result_url);
-    const websiteUrl = readString(config.website_url);
-    if (!resultUrl || !websiteUrl ||
-        !resultUrl.startsWith(`abfss://experiments@arrowcollector${stamp}.dfs.core.windows.net/`) ||
-        !websiteUrl.startsWith(`abfss://$web@arrowcollector${stamp}.dfs.core.windows.net/`) || resultUrl === websiteUrl) {
-      throw new Error('AKS results must target separate experiments and root $web paths for the selected stamp');
-    }
-    const runtimeRelative = readStringAt(platform, 'runtime_config_file');
-    const bootstrapRelative = readStringAt(platform, 'bootstrap_env_file');
-    if (!runtimeRelative || !bootstrapRelative) throw new Error('AKS config requires runtime_config_file and bootstrap_env_file');
-    runtimeFile = resolve(workspaceRoot, runtimeRelative);
-    const bootstrapFile = resolve(workspaceRoot, bootstrapRelative);
-    const [runtimeInfo, bootstrapInfo] = await Promise.all([stat(runtimeFile), stat(bootstrapFile)]);
-    if (!runtimeInfo.isFile() || !bootstrapInfo.isFile()) throw new Error('AKS runtime and bootstrap files must be regular files');
-    const runtimeValue: unknown = JSON.parse(await readFile(runtimeFile, 'utf8'));
-    if (!isRecord(runtimeValue) || !readString(runtimeValue.subscriptionId) ||
-        !readString(runtimeValue.workloadIdentityClientId) || runtimeValue.stamp !== stamp || !isRecord(runtimeValue.images)) {
-      throw new Error('Runtime config must identify the selected subscription, stamp, UAMI, and immutable images');
-    }
-    runtime = runtimeValue;
-    const validation = runCommand('cargo', [
-      'run', '--locked', '--package', 'arrowcol-oat-rust', '--', '--validate-config', configFile,
-    ]);
-    if (validation.exitCode !== 0) throw new Error('Rust OAT config validation failed; inspect the validator output and correct the config');
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : 'configuration could not be read';
-    addCheck(checks, 'Configuration, stamp, and destinations', false, detail,
-      'Correct the AKS config/runtime files, then rerun the preflight.');
-    for (const name of [
-      'Kubernetes context and credentials', 'Fixed publisher identity', 'Federated credential', 'Required secrets',
-      'AKS deployments', 'Router service and endpoints', 'Immutable ACR images', 'Fresh pod metrics',
-      'Selected QAP endpoint/database', 'Network-policy enforcement proof', 'Storage and website publication',
-    ]) addCheck(checks, name, false, 'Blocked until configuration and destination validation pass.',
-      'Fix the configuration gate above, then rerun the preflight.');
-    return { ready: false, checks, nextCommand };
-  }
-
-  addCheck(checks, 'Configuration, stamp, and destinations', true,
-    'Rust validation passed; the selected five-digit stamp and separate experiments/$web destinations match.', nextCommand);
-
-  const subscription = readString(runtime.subscriptionId)!;
-  const clientId = readString(runtime.workloadIdentityClientId)!;
-  const stamp = readString(config.stamp)!;
-  const expectedContext = readString(config.kubectl_context) ?? `arrow-collector-${stamp}`;
-  const clusterName = `arrow-collector-${stamp}`;
-  const kube = (args: string[]) => commandJson(runCommand, 'kubectl', kubectlArgs(expectedContext, args));
-  const az = (args: string[]) => commandJson(runCommand, 'az', azArgs(subscription, args));
+    config = object(JSON.parse(await readFile(resolve(root, configPath), 'utf8')), 'OAT config');
+    platform = object(config.platform, 'OAT platform');
+  } catch { configError = `AKS config is missing or invalid; run \`${setupCommand}\`.`; }
+  const stamp = text(config.stamp);
+  const context = text(config.kubectl_context) ?? (stamp ? `arrow-collector-${stamp}` : undefined);
+  let runtime: RuntimeConfig | undefined;
+  let runtimeError: string | undefined;
+  let bootstrap: string | undefined;
+  try {
+    const filename = resolve(root, requireValue(text(platform.runtime_config_file), 'runtime_config_file'));
+    runtime = validateRuntime(JSON.parse(await privateText(filename)));
+  } catch { runtimeError = `Private runtime.json is missing or invalid; run \`${setupCommand}\`.`; }
+  try {
+    bootstrap = await privateText(resolve(root, requireValue(text(platform.bootstrap_env_file), 'bootstrap_env_file')));
+  } catch { /* The independent runtime gate reports unavailable private bootstrap state. */ }
+  let selectedStamp: ReturnType<typeof loadStampConfig> | undefined;
+  try { selectedStamp = loadStampConfig(resolve(root, 'infra/azure/stamp.yaml')); } catch { /* Gate 1 reports it. */ }
+  const subscription = runtime?.subscriptionId ?? environment.AZURE_SUBSCRIPTION_ID ?? selectedStamp?.subscription;
+  const clientId = runtime?.workloadIdentityClientId ?? environment.AZURE_CLIENT_ID;
+  const clusterName = stamp && /^\d{5}$/.test(stamp) ? `arrow-collector-${stamp}` : undefined;
+  const kubeArgs = (args: string[]) => ['--context', requireValue(context, 'kubectl_context'), '--request-timeout=30s', ...args];
+  const kube = (args: string[]) => object(json('kubectl', kubeArgs(args)), 'Kubernetes response');
+  const azArgs = (args: string[]) => [...args, '--subscription', requireValue(subscription, 'subscription'), '-o', 'json'];
+  const az = (args: string[]) => object(json('az', azArgs(args)), 'Azure response');
   let aks: JsonRecord | undefined;
   let apiServer: string | undefined;
   let issuer: string | undefined;
   let principalId: string | undefined;
-
-  try {
-    const currentContext = commandOutput(runCommand, 'kubectl', ['config', 'current-context']);
-    const kubeConfig = commandJson(runCommand, 'kubectl', ['config', 'view', '--minify', '--context', expectedContext, '-o', 'json']);
-    const clusters = recordArray(kubeConfig.clusters);
-    const users = recordArray(kubeConfig.users);
-    apiServer = readStringAt(clusters[0]?.cluster, 'server');
-    const user = isRecord(users[0]?.user) ? users[0]!.user as JsonRecord : undefined;
-    const execConfig = isRecord(user?.exec) ? user!.exec as JsonRecord : undefined;
-    const execArgs = Array.isArray(execConfig?.args) ? execConfig!.args.filter((value): value is string => typeof value === 'string') : [];
-    const kubeloginVersion = commandOutput(runCommand, 'kubelogin', ['--version']);
-    commandOutput(runCommand, 'kubectl', kubectlArgs(expectedContext, ['get', '--raw=/version']));
-    const account = az(['account', 'show']);
-    const tenantId = readStringAt(account, 'tenantId');
-    const accountSubscription = readStringAt(account, 'id');
-    const publisherEnvSet = Boolean(environment.AZURE_TENANT_ID || environment.AZURE_SUBSCRIPTION_ID);
-    const hasSafeExec = execArgs.includes('--disable-environment-override');
-    const subscriptionEnvReady = environment.AZURE_SUBSCRIPTION_ID === undefined || environment.AZURE_SUBSCRIPTION_ID === subscription;
-    const envReady = environment.ARROWCOL_MODE === 'azure' && environment.AZURE_CLIENT_ID === clientId &&
-      Boolean(environment.AZURE_TENANT_ID) && (!tenantId || environment.AZURE_TENANT_ID === tenantId) && subscriptionEnvReady;
-    const assertionPath = environment.AZURE_FEDERATED_TOKEN_FILE;
-    let assertionReady = false;
-    if (assertionPath && isAbsolute(assertionPath)) {
-      try {
-        const assertion = await stat(assertionPath);
-        assertionReady = assertion.isFile() && assertion.size > 0 && (assertion.mode & 0o777) === 0o600;
-      } catch {
-        assertionReady = false;
-      }
-    }
-    aks = az(['aks', 'show', '-g', resourceGroup, '-n', clusterName]);
-    const fqdn = readStringAt(aks, 'fqdn');
-    issuer = readStringAt(aks.oidcIssuerProfile, 'issuerUrl');
-    const endpointHost = apiServer ? new URL(apiServer).hostname.toLowerCase() : '';
-    const ready = currentContext === expectedContext && Boolean(endpointHost) && Boolean(fqdn) &&
-      endpointHost === fqdn!.toLowerCase() && accountSubscription?.toLowerCase() === subscription.toLowerCase() &&
-      hasSafeExec && (!publisherEnvSet || hasSafeExec) && envReady && assertionReady;
-    addCheck(checks, 'Kubernetes context and credentials', ready,
-      ready ? `Context ${expectedContext} is reachable; ${kubeloginVersion.trim()} uses the expected API endpoint and private assertion.` :
-        `Context/API/auth mismatch or required Azure environment/assertion is missing; server reported ${endpointHost || 'no API endpoint'}.`,
-      'Use the selected stamp kubeconfig, prepare the documented 0600 assertion file, set the documented Azure variables, and add --disable-environment-override to stored kubelogin exec args.');
-  } catch (error) {
-    addCheck(checks, 'Kubernetes context and credentials', false,
-      error instanceof Error ? error.message : 'Kubernetes/Azure read-only checks failed.',
-      'Prepare local kubeconfig/auth as documented; do not run az login or get-credentials automatically.');
-  }
-
-  try {
-    const namespace = kube(['get', 'ns', publisherNamespace, '-o', 'json']);
-    const namespaceReady = readStringAt(namespace.status, 'phase') === 'Active';
-    const serviceAccount = kube(['-n', publisherNamespace, 'get', 'sa', publisherServiceAccount, '-o', 'json']);
-    const annotations = isRecord(serviceAccount.metadata) && isRecord(serviceAccount.metadata.annotations)
-      ? serviceAccount.metadata.annotations : {};
-    const ready = namespaceReady && annotations['azure.workload.identity/client-id'] === clientId;
-    addCheck(checks, 'Fixed publisher identity', ready,
-      ready ? 'The fixed arrow-collector namespace/ServiceAccount is active and annotated with the selected UAMI.' :
-        'The fixed publisher namespace is missing/terminating or its ServiceAccount annotation does not match the selected UAMI. Run-scoped future namespaces are intentionally not required here.',
-      'Request C2 identity approval; render the identity phase and have the cluster owner apply it.');
-  } catch (error) {
-    addCheck(checks, 'Fixed publisher identity', false,
-      error instanceof Error ? error.message : 'Could not inspect the fixed publisher identity.',
-      'Request C2 identity approval; no namespace or ServiceAccount was created by preflight.');
-  }
-
-  try {
-    if (!aks || !issuer) throw new Error('Could not establish the selected cluster OIDC issuer.');
-    const identity = az(['identity', 'show', '-g', resourceGroup, '-n', identityName]);
-    principalId = readStringAt(identity, 'principalId');
-    const identityClientId = readStringAt(identity, 'clientId');
-    const credentials = recordArray(commandJsonValue(runCommand, 'az', azArgs(subscription, ['identity', 'federated-credential', 'list', '-g', resourceGroup, '--identity-name', identityName])));
-    const subject = `system:serviceaccount:${publisherNamespace}:${publisherServiceAccount}`;
-    const ready = Boolean(principalId) && identityClientId === clientId && credentials.some((credential) =>
-      credential.issuer === issuer && credential.subject === subject &&
-      Array.isArray(credential.audiences) && credential.audiences.includes('api://AzureADTokenExchange'));
-    addCheck(checks, 'Federated credential', ready,
-      ready ? 'The existing UAMI FIC exactly matches the selected issuer, fixed ServiceAccount subject, and audience; run-scoped FIC preparation remains runner-owned.' :
-        'No exact existing UAMI FIC matched issuer, fixed subject, and audience; future run-scoped namespaces remain pending runner preparation.',
-      'Request owner approval to prepare the exact fixed-subject FIC; do not create a wildcard or a new identity.');
-  } catch (error) {
-    addCheck(checks, 'Federated credential', false,
-      error instanceof Error ? error.message : 'Could not inspect the UAMI federated credentials.',
-      'Verify the selected subscription, cluster OIDC issuer, and existing UAMI FIC with the cluster owner.');
-  }
-
-  try {
-    const missing: string[] = [];
-    for (const [name, keys] of secretRequirements) {
-      const secret = kube(['-n', publisherNamespace, 'get', 'secret', name, '-o', 'json']);
-      const data = isRecord(secret.data) ? secret.data : {};
-      for (const key of keys) {
-        const encoded = data[key];
-        if (typeof encoded !== 'string' || !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded) || Buffer.from(encoded, 'base64').length === 0) missing.push(`${name}/${key}`);
-      }
-    }
-    const ready = missing.length === 0;
-    addCheck(checks, 'Required secrets', ready,
-      ready ? 'All five required Kubernetes Secrets exist with nonempty required keys; secret values were not logged.' :
-        `Missing Secret metadata or required keys: ${missing.join(', ')}. Secret contents were not logged.`,
-      'Request approved C5 secret preparation; never print Secret JSON/data.');
-  } catch (error) {
-    addCheck(checks, 'Required secrets', false,
-      error instanceof Error ? error.message : 'Could not inspect required Secret metadata.',
-      'Request approved C5 secret preparation; preflight does not create Kubernetes Secrets.');
-  }
-
-  try {
-    const deployments = kube(['-n', publisherNamespace, 'get', 'deploy', 'arrowcol-sql', 'arrowcol-catalog', 'arrowcol', 'arrowcol-router', '-o', 'json']);
-    const items = recordArray(deployments.items);
-    const names = ['arrowcol-sql', 'arrowcol-catalog', 'arrowcol', 'arrowcol-router'];
-    const states = names.map((name) => {
-      const item = items.find((entry) => readStringAt(entry.metadata, 'name') === name);
-      const spec = isRecord(item?.spec) ? item!.spec as JsonRecord : {};
-      const status = isRecord(item?.status) ? item!.status as JsonRecord : {};
-      const metadata = isRecord(item?.metadata) ? item!.metadata as JsonRecord : {};
-      const desired = typeof spec.replicas === 'number' ? spec.replicas : 1;
-      const generation = typeof metadata.generation === 'number' ? metadata.generation : Number.POSITIVE_INFINITY;
-      return Boolean(item) && desired > 0 && typeof status.observedGeneration === 'number' &&
-        status.observedGeneration >= generation && status.availableReplicas === desired &&
-        status.readyReplicas === desired && status.updatedReplicas === desired;
-    });
-    const ready = states.every(Boolean);
-    addCheck(checks, 'AKS deployments', ready,
-      ready ? 'All four deployments have observed the current generation and matching desired/available/ready/updated replicas.' :
-        'One or more required deployments are missing, scaled to zero, stale, or not fully available.',
-      'Request approved C5 workload preparation; preflight does not apply manifests or change replicas.');
-  } catch (error) {
-    addCheck(checks, 'AKS deployments', false,
-      error instanceof Error ? error.message : 'Could not inspect required deployment status.',
-      'Request approved C5 workload preparation; no rollout or scaling command was run.');
-  }
-
-  try {
-    const service = kube(['-n', publisherNamespace, 'get', 'svc', 'arrowcol-router', '-o', 'json']);
-    const spec = isRecord(service.spec) ? service.spec : {};
-    const ports = recordArray(spec.ports);
-    const serviceReady = spec.type === 'ClusterIP' && !spec.externalIPs &&
-      ports.some((port) => port.port === 50050 && !port.nodePort);
-    const slices = kube(['-n', publisherNamespace, 'get', 'endpointslices', '-l', 'kubernetes.io/service-name=arrowcol-router', '-o', 'json']);
-    const endpoints = recordArray(slices.items).flatMap((slice) => recordArray(slice.endpoints));
-    const readyEndpoints = endpoints.filter((endpoint) => isRecord(endpoint.conditions) && endpoint.conditions.ready === true);
-    const ready = serviceReady && readyEndpoints.length > 0;
-    addCheck(checks, 'Router service and endpoints', ready,
-      ready ? 'Router is ClusterIP-only on 50050 and has ready EndpointSlice endpoints.' :
-        'Router is not ClusterIP-only on 50050 or has no ready EndpointSlice endpoints.',
-      'Request approved C5 router/service preparation; do not expose a public or node port.');
-  } catch (error) {
-    addCheck(checks, 'Router service and endpoints', false,
-      error instanceof Error ? error.message : 'Could not inspect router service/endpoints.',
-      'Request approved C5 router/service preparation; preflight does not create or expose services.');
-  }
-
-  try {
-    const runtimeImages = isRecord(runtime.images) ? runtime.images : {};
-    if (Object.keys(runtimeImages).sort().join(',') !== 'catalog,dataflow,router,sqlserver') throw new Error('Runtime config must list exactly the sqlserver, catalog, router, and dataflow images.');
-    const images = [...Object.values(runtimeImages), config.dmv_client_image]
-      .filter((image): image is string => typeof image === 'string');
-    if (images.length < 5) throw new Error('Runtime config and OAT config do not list all four service images plus dmv_client_image.');
-    const parsedImages = images.map(parseImage);
-    if (parsedImages.some((image) => !image)) {
-      throw new Error('Every service image and dmv_client_image must be pinned to an immutable ACR sha256 digest; tags/placeholders are not ready.');
-    }
-    for (const image of parsedImages) {
-      const result = az(['acr', 'repository', 'show', '-n', `arrowcollector${stamp}`, '--image', `${image!.repository}@${image!.digest}`]);
-      const foundDigest = readStringAt(result, 'digest');
-      if (foundDigest !== image!.digest) throw new Error(`ACR did not confirm the requested manifest digest for ${image!.repository}.`);
-    }
-    addCheck(checks, 'Immutable ACR images', true,
-      'All four runtime images and dmv_client_image are exact digests present in the selected stamp ACR.', nextCommand);
-  } catch (error) {
-    addCheck(checks, 'Immutable ACR images', false,
-      error instanceof Error ? error.message : 'Could not verify immutable ACR image digests.',
-      'Request C3 approval to publish and pin every image by registry manifest digest; tags and unpublished placeholders do not pass.');
-  }
-
-  try {
-    const apiService = kube(['get', 'apiservice', 'v1beta1.metrics.k8s.io', '-o', 'json']);
-    const apiStatus = isRecord(apiService.status) ? apiService.status : {};
-    if (!checkCondition(apiStatus.conditions, 'Available')) throw new Error('metrics.k8s.io APIService is not Available=True.');
-    const pods = kube(['-n', publisherNamespace, 'get', 'pods', '-o', 'json']);
-    const workloads = recordArray(pods.items).filter((pod) => {
-      const metadata = isRecord(pod.metadata) ? pod.metadata : {};
-      const labels = isRecord(metadata.labels) ? metadata.labels : {};
-      const status = isRecord(pod.status) ? pod.status : {};
-      return ['arrowcol-sql', 'arrowcol-catalog', 'arrowcol', 'arrowcol-router'].includes(String(labels.app ?? '')) &&
-        status.phase === 'Running' && checkCondition(status.conditions, 'Ready');
-    });
-    const metricsPath = `/apis/metrics.k8s.io/v1beta1/namespaces/${publisherNamespace}/pods`;
-    const metricList: unknown = JSON.parse(commandOutput(runCommand, 'kubectl', kubectlArgs(expectedContext, ['get', `--raw=${metricsPath}`])));
-    const metricItems = isRecord(metricList) ? recordArray(metricList.items) : [];
-    const metricByName = new Map(metricItems.map((item) => [readStringAt(item.metadata, 'name') ?? '', item]));
-    const timestampFresh = (item: JsonRecord): boolean => {
-      const stampText = readStringAt(item, 'timestamp');
-      const stampTime = stampText ? Date.parse(stampText) : Number.NaN;
-      return Number.isFinite(stampTime) && now() - stampTime <= 5 * 60_000 && now() >= stampTime;
-    };
-    const ready = workloads.length > 0 && workloads.every((pod) => {
-      const name = readStringAt(pod.metadata, 'name');
-      const metric = name ? metricByName.get(name) : undefined;
-      return Boolean(metric && timestampFresh(metric));
-    });
-    addCheck(checks, 'Fresh pod metrics', ready,
-      ready ? `Fresh metrics cover all ${workloads.length} current ArrowCol stack pods.` :
-        'Metrics API is available, but current workload pod coverage is empty, incomplete, or stale.',
-      'Restore metrics-server coverage for every current workload pod; zero/fallback metrics do not pass.');
-  } catch (error) {
-    addCheck(checks, 'Fresh pod metrics', false,
-      error instanceof Error ? error.message : 'Could not verify current pod metrics.',
-      'Repair metrics-server coverage and rerun the read-only preflight.');
-  }
-
-  try {
-    const qap = new URL(readString(config.qap_endpoint)!);
-    const database = readString(config.qap_database)!;
-    if (qap.protocol !== 'https:') throw new Error('The selected QAP endpoint must use HTTPS.');
-    commandOutput(runCommand, 'getent', ['ahosts', qap.hostname]);
-    const token = commandOutput(runCommand, 'az', [
-      'account', 'get-access-token', '--subscription', subscription,
-      '--resource', 'https://kusto.kusto.windows.net', '--query', 'accessToken', '-o', 'tsv',
-    ]);
-    const response = await fetcher(new URL('/v1/rest/query', qap), {
-      method: 'POST',
-      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ db: database, csl: 'print OatPreflight = 1' }),
+  let identityId: string | undefined;
+  let assertion: string | undefined;
+  const tokens = new Map<string, string>();
+  const federatedToken = async (resource: string): Promise<string> => {
+    const cached = tokens.get(resource);
+    if (cached) return cached;
+    if (!assertion) throw new Error(`A valid private federated assertion is required; run \`${setupCommand}\`.`);
+    const tenant = requireValue(environment.AZURE_TENANT_ID, 'AZURE_TENANT_ID');
+    if (!uuid.test(tenant) || !clientId || !uuid.test(clientId)) throw new Error('Invalid federation tenant or client identity.');
+    const response = await fetcher(`https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`, {
+      method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: clientId, grant_type: 'client_credentials', scope: `${resource.replace(/\/$/, '')}/.default`,
+        client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer', client_assertion: assertion,
+      }),
       signal: AbortSignal.timeout(30_000),
     });
-    if (!response.ok) throw new Error(`Selected QAP query returned HTTP ${response.status}.`);
-    addCheck(checks, 'Selected QAP endpoint/database', true,
-      `DNS and a bounded read-only query succeeded for the configured database ${database}.`, nextCommand);
-  } catch (error) {
-    addCheck(checks, 'Selected QAP endpoint/database', false,
-      error instanceof Error ? error.message : 'Could not query the configured QAP endpoint/database.',
-      'Set the selected stamp QAP endpoint and database and obtain owner-approved QAP qualification; DNS alone is insufficient.');
-  }
+    if (!response.ok) throw new Error(`Federated token exchange failed (HTTP ${response.status}); response withheld.`);
+    const body: unknown = await response.json();
+    const token = at(body, 'access_token');
+    if (!token) throw new Error('Federated token exchange returned no access token; response withheld.');
+    tokens.set(resource, token);
+    return token;
+  };
+  const request = async (url: string, resource: string, init?: RequestInit): Promise<unknown> => {
+    const token = await federatedToken(resource);
+    const response = await fetcher(url, {
+      ...init, headers: { ...init?.headers, authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(30_000),
+    });
+    if (!response.ok) throw new Error(`Read-only provider request failed (HTTP ${response.status}); response withheld.`);
+    return response.json();
+  };
 
-  try {
-    const networkProfile = isRecord(aks?.networkProfile) ? aks!.networkProfile as JsonRecord : {};
-    const policy = readStringAt(networkProfile, 'networkPolicy');
-    const cilium = kube(['-n', 'kube-system', 'get', 'ds', 'cilium', '-o', 'json']);
-    const ciliumStatus = isRecord(cilium.status) ? cilium.status : {};
-    const agentsReady = typeof ciliumStatus.desiredNumberScheduled === 'number' && ciliumStatus.desiredNumberScheduled > 0 &&
-      ciliumStatus.numberReady === ciliumStatus.desiredNumberScheduled;
-    const policies = kube(['-n', publisherNamespace, 'get', 'networkpolicies', '-o', 'json']);
-    const proofPath = environment.ARROWCOL_NETWORK_POLICY_RECEIPT;
-    let proofReady = false;
-    if (proofPath && apiServer) {
-      try {
-        const proof: unknown = JSON.parse(await readFile(proofPath, 'utf8'));
-        proofReady = isRecord(proof) && proof.clusterServer === apiServer && proof.namespace === publisherNamespace &&
-          proof.ownerApproved === true && proof.positivePath === true && proof.negativePath === true &&
-          typeof proof.recordedAt === 'string' && Number.isFinite(Date.parse(proof.recordedAt)) &&
-          now() - Date.parse(proof.recordedAt) <= 30 * 24 * 60 * 60_000;
-      } catch {
-        proofReady = false;
-      }
+  await check('Configuration, stamp, and destinations', () => {
+    if (configError) throw new Error(configError);
+    if (platform.kind !== 'aks' || !stamp || !/^\d{5}$/.test(stamp)) throw new Error(`AKS config needs a five-digit stamp; run \`${setupCommand}\`.`);
+    if (!selectedStamp || selectedStamp.stamp !== stamp || selectedStamp.subscription !== subscription) {
+      throw new Error(`Private stamp YAML and AKS configuration must select the same stamp/subscription; run \`${setupCommand}\`.`);
     }
-    const ready = Boolean(policy && policy.toLowerCase() !== 'none') && agentsReady && recordArray(policies.items).length > 0 && proofReady;
-    addCheck(checks, 'Network-policy enforcement proof', ready,
-      ready ? 'Enforcing dataplane, healthy agents, namespace policies, and a current owner-approved positive/negative receipt match this API server.' :
-        'Enforcing dataplane/healthy agents, namespace policy topology, or an exact-cluster owner-approved positive/negative traffic receipt is missing. Read-only preflight cannot create behavioral proof.',
-      'Request C1 approval and an owner-approved positive/negative traffic proof receipt for this exact cluster; do not infer enforcement from policy objects alone.');
-  } catch (error) {
-    addCheck(checks, 'Network-policy enforcement proof', false,
-      error instanceof Error ? error.message : 'Could not inspect network-policy enforcement.',
-      'Request C1 approval and exact-cluster behavioral proof; preflight performs no traffic or policy mutation.');
-  }
+    const results = text(config.result_url), website = text(config.website_url);
+    if (!results?.startsWith(`abfss://experiments@arrowcollector${stamp}.dfs.core.windows.net/`) ||
+        !website?.startsWith(`abfss://$web@arrowcollector${stamp}.dfs.core.windows.net/`) || results === website) {
+      throw new Error('AKS destinations must use separate selected-stamp experiments and root $web paths.');
+    }
+    const validation = runCommand('cargo', ['run', '--locked', '--package', 'arrowcol-oat-rust', '--', '--validate-config', resolve(root, configPath)]);
+    if (validation.exitCode !== 0) throw new Error(`Rust configuration validation failed; run \`${setupCommand}\`.`);
+    return 'Selected five-digit stamp, private stamp YAML and separate result/website destinations match.';
+  });
 
-  try {
+  await check('Kubernetes context and credentials', async () => {
+    const current = output('kubectl', ['config', 'current-context']);
+    const local = object(json('kubectl', ['config', 'view', '--minify', '--context', requireValue(context, 'context'), '-o', 'json']), 'Kubeconfig');
+    apiServer = at(records(local.clusters)[0]?.cluster, 'server');
+    const user = object(records(local.users)[0]?.user, 'Kubeconfig user');
+    const exec = object(user.exec, 'Kubeconfig exec');
+    const args = Array.isArray(exec.args) ? exec.args : [];
+    output('kubelogin', ['--version']);
+    output('kubectl', kubeArgs(['get', '--raw=/version']));
+    const account = az(['account', 'show']);
+    aks = az(['aks', 'show', '-g', resourceGroup, '-n', requireValue(clusterName, 'cluster name')]);
+    issuer = at(aks.oidcIssuerProfile, 'issuerUrl');
+    if (current !== context || exec.command !== 'kubelogin' || !args.includes('--disable-environment-override') ||
+        args[args.indexOf('--subscription') + 1] !== subscription ||
+        !apiServer || new URL(apiServer).protocol !== 'https:' ||
+        new URL(apiServer).hostname.toLowerCase() !== at(aks, 'fqdn')?.toLowerCase() ||
+        account.id !== subscription || account.tenantId !== environment.AZURE_TENANT_ID ||
+        environment.ARROWCOL_MODE !== 'azure' || environment.AZURE_CLIENT_ID !== clientId ||
+        (environment.AZURE_SUBSCRIPTION_ID !== undefined && environment.AZURE_SUBSCRIPTION_ID !== subscription)) {
+      throw new Error(`Kubeconfig, live cluster, selected subscription or publisher environment mismatch; run \`${setupCommand}\`.`);
+    }
+    const path = requireValue(environment.AZURE_FEDERATED_TOKEN_FILE, 'AZURE_FEDERATED_TOKEN_FILE');
+    if (!isAbsolute(path)) throw new Error('Federated assertion path must be absolute.');
+    let candidate: string;
+    try {
+      candidate = (await privateText(path)).trim();
+      const parts = candidate.split('.');
+      if (parts.length !== 3) throw new Error('Malformed assertion');
+      const claims: unknown = JSON.parse(Buffer.from(parts[1]!, 'base64url').toString('utf8'));
+      if (!isRecord(claims) || typeof claims.exp !== 'number' || !Number.isFinite(claims.exp) || claims.exp * 1000 <= now() ||
+          (claims.nbf !== undefined && (typeof claims.nbf !== 'number' || !Number.isFinite(claims.nbf) || claims.nbf * 1000 > now()))) {
+        throw new Error('Expired or not-yet-valid assertion');
+      }
+    } catch { throw new Error(`Federated assertion is invalid or expired; run \`${setupCommand}\`.`); }
+    assertion = candidate;
+    return 'Selected live API endpoint, bounded kube authentication and private unexpired publisher assertion verified.';
+  });
+
+  await check('Fixed publisher identity', () => {
+    const ns = kube(['get', 'ns', publisherNamespace, '-o', 'json']);
+    const sa = kube(['-n', publisherNamespace, 'get', 'sa', publisherServiceAccount, '-o', 'json']);
+    const metadata = object(sa.metadata, 'ServiceAccount metadata');
+    if (at(ns.status, 'phase') !== 'Active' || (isRecord(ns.metadata) && ns.metadata.deletionTimestamp) ||
+        !clientId || at(metadata.annotations, 'azure.workload.identity/client-id') !== clientId) {
+      throw new Error('Fixed host publisher namespace/ServiceAccount is absent, terminating or annotated for a different identity.');
+    }
+    return 'Fixed host publisher identity matches; benchmark namespaces and workload identities remain runner-owned.';
+  });
+
+  await check('Federated credential', () => {
+    if (!issuer) throw new Error('Selected live cluster OIDC issuer is unavailable.');
+    const identity = az(['identity', 'show', '-g', resourceGroup, '-n', identityName]);
+    principalId = at(identity, 'principalId');
+    identityId = at(identity, 'id');
+    const credentials = records(json('az', azArgs(['identity', 'federated-credential', 'list', '-g', resourceGroup, '--identity-name', identityName])));
+    if (!principalId || !identityId || identity.clientId !== clientId || !credentials.some((credential) =>
+      credential.issuer === issuer && credential.subject === `system:serviceaccount:${publisherNamespace}:${publisherServiceAccount}` &&
+      Array.isArray(credential.audiences) && credential.audiences.length === 1 && credential.audiences[0] === 'api://AzureADTokenExchange')) {
+      throw new Error('Existing fixed publisher federation does not exactly match the live cluster and selected UAMI.');
+    }
+    return 'Exact fixed publisher issuer, subject, audience and existing UAMI verified.';
+  });
+
+  await check('Run-scoped runtime and bootstrap inputs', () => {
+    if (!runtime) throw new Error(runtimeError);
+    if (runtime.stamp !== stamp || runtime.subscriptionId !== subscription || runtime.workloadIdentityClientId !== clientId) {
+      throw new Error('Runtime configuration identity does not match the selected stamp.');
+    }
+    const generations = (bootstrap ?? '').split(/\r?\n/).filter((line) => /^(?:export )?ARROWCOL_RESET_GENERATION=/.test(line));
+    const generation = generations[0]?.slice(generations[0].indexOf('=') + 1).replace(/^(['"])(.*)\1$/, '$2');
+    if (generations.length !== 1 || !generation || !uuid.test(generation) || generation !== environment.ARROWCOL_RESET_GENERATION) {
+      throw new Error('Private bootstrap generation is missing, invalid or differs from the merged AKS environment.');
+    }
+    return 'Private runtime and captured bootstrap generation are valid; per-run secrets/workloads will be created by the runner.';
+  });
+
+  await check('Namespace permissions and planned pool capacity', () => {
+    for (const verb of ['create', 'delete']) {
+      if (output('kubectl', kubeArgs(['auth', 'can-i', verb, 'namespaces'])) !== 'yes') throw new Error(`Operator cannot ${verb} run namespaces.`);
+    }
+    const live = aks ?? az(['aks', 'show', '-g', resourceGroup, '-n', requireValue(clusterName, 'cluster name')]);
+    const pools = records(live.agentPoolProfiles);
+    for (const role of ['arrowcol', 'client']) {
+      const eligible = pools.filter((pool) => at(pool.nodeLabels, 'arrow-collector/role') === role &&
+        pool.osType === 'Linux' && pool.provisioningState === 'Succeeded' &&
+        ((typeof pool.count === 'number' && pool.count > 0) ||
+         (pool.enableAutoScaling === true && typeof pool.maxCount === 'number' && pool.maxCount > 0)));
+      if (!eligible.length) throw new Error(`No live ${role} pool has capacity or autoscaler headroom.`);
+      const nodes = records(kube(['get', 'nodes', '-l', `arrow-collector/role=${role}`, '-o', 'json']).items);
+      if (nodes.length && !nodes.some((node) =>
+        condition(isRecord(node.status) ? node.status.conditions : undefined, 'Ready') &&
+        !(isRecord(node.spec) && node.spec.unschedulable))) throw new Error(`Existing ${role} nodes are not schedulable/Ready.`);
+    }
+    const namespaces = records(kube(['get', 'ns', '-o', 'json']).items)
+      .map((item) => at(item.metadata, 'name')).filter((name) => name && /^arrow-collector-[a-f0-9]{32}$/.test(name));
+    if (namespaces.length) warnings.push(`${namespaces.length} run-scoped namespace(s) remain; investigate possible orphan runs before concurrent execution. No cleanup was attempted.`);
+    return 'Operator can create/delete namespaces; role pools have current capacity or scale-from-zero headroom. No scaling was attempted.';
+  });
+
+  await check('Immutable ACR images', () => {
+    if (!runtime) throw new Error(runtimeError);
+    const images = [...Object.values(runtime.images), config.dmv_client_image];
+    for (const image of images) {
+      const match = typeof image === 'string' && new RegExp(`^arrowcollector${stamp}\\.azurecr\\.io/([a-z0-9][a-z0-9/_.-]*)@(sha256:[a-f0-9]{64})$`).exec(image);
+      if (!match) throw new Error('All five images, including the DMV client, must be immutable digests in the selected stamp registry.');
+      const found = az(['acr', 'repository', 'show', '-n', `arrowcollector${stamp}`, '--image', `${match[1]}@${match[2]}`]);
+      if (found.digest !== match[2]) throw new Error('Registry manifest digest does not match the selected immutable image.');
+    }
+    return 'All four runtime images and the fifth DMV client digest exist in the selected registry.';
+  });
+
+  await check('Metrics API availability', () => {
+    const api = kube(['get', 'apiservice', 'v1beta1.metrics.k8s.io', '-o', 'json']);
+    if (!condition(isRecord(api.status) ? api.status.conditions : undefined, 'Available')) throw new Error('metrics.k8s.io APIService is not Available=True.');
+    return 'Metrics APIService is Available; per-run pod coverage is checked during the benchmark, not before pods exist.';
+  });
+
+  await check('Selected QAP endpoint/database and binding permission', async () => {
+    const database = text(config.qap_database);
+    if (!database || database !== environment.AZURE_KUSTO_EXPERIMENT_DATABASE) {
+      throw new Error(`qap_database must be set and equal the generated experiment database; run \`${setupCommand}\`.`);
+    }
+    const endpoint = new URL(requireValue(text(config.qap_endpoint), 'qap_endpoint'));
+    if (endpoint.protocol !== 'https:' || endpoint.hostname !== `${clusterName}.${selectedStamp?.location}.kusto.windows.net` ||
+        endpoint.username || endpoint.password || endpoint.search || endpoint.hash || endpoint.pathname !== '/') {
+      throw new Error('QAP endpoint must match the exact selected stamp and region.');
+    }
+    output('getent', ['ahosts', endpoint.hostname]);
+    const query = await request(new URL('/v1/rest/query', endpoint).href, 'https://kusto.kusto.windows.net', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ db: database, csl: 'print OatPreflight = 1' }),
+    });
+    if (!isRecord(query) || !Array.isArray(query.Tables)) throw new Error('QAP query returned an invalid response.');
+    const principals = await request(new URL('/v1/rest/mgmt', endpoint).href, 'https://kusto.kusto.windows.net', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ db: database, csl: '.show database principals' }),
+    });
+    const tables = isRecord(principals) ? records(principals.Tables) : [];
+    const admin = tables.some((table) => {
+      const columns = records(table.Columns).map((column) => column.ColumnName);
+      const rows = Array.isArray(table.Rows) ? table.Rows : [];
+      return rows.some((row) => {
+        if (!Array.isArray(row)) return false;
+        const values = Object.fromEntries(columns.map((name, index) => [String(name), row[index]]));
+        return values.Role === 'Database Admin' &&
+          [values.PrincipalObjectId, values.PrincipalFQN].some((value) =>
+            typeof value === 'string' && Boolean(principalId) && value.toLowerCase().split(';').includes(principalId!.toLowerCase()));
+      });
+    });
+    if (!admin) throw new Error('Selected workload UAMI lacks verified database Admin permission for per-run external-table bindings.');
+    return 'Selected experiment database is queryable through the workload UAMI and has per-run binding permission. This is not a data-flow verdict.';
+  });
+
+  await check('Network-policy enforcement proof', async () => {
+    const live = aks ?? az(['aks', 'show', '-g', resourceGroup, '-n', requireValue(clusterName, 'cluster name')]);
+    const profile = object(live.networkProfile, 'Live networkProfile');
+    const dataplane = at(profile, 'networkDataplane')?.toLowerCase();
+    const policy = at(profile, 'networkPolicy')?.toLowerCase();
+    network.provider = dataplane === 'cilium' || policy === 'cilium' ? 'cilium' : policy && policy !== 'none' ? policy : 'none';
+    network.enforcing = network.provider !== 'none';
+    if (!network.enforcing) {
+      warnings.push("No network-policy provider enforces the router-only fence: another workload inside the cluster could reach the dataflow engine's passwordless port. There is no public ingress.");
+      return 'Live cluster has no enforcing provider; explicit risk warning applies. Run-scoped policies are rendered by the runner.';
+    }
+    if (network.provider !== 'cilium') throw new Error('The live enforcing provider is not qualified by this preflight.');
+    const cilium = kube(['-n', 'kube-system', 'get', 'ds', 'cilium', '-o', 'json']);
+    const status = object(cilium.status, 'Cilium status');
+    if (typeof status.desiredNumberScheduled !== 'number' || status.desiredNumberScheduled < 1 ||
+        status.numberReady !== status.desiredNumberScheduled) throw new Error('Live Cilium agents are not all ready.');
+    const proofPath = requireValue(environment.ARROWCOL_NETWORK_POLICY_RECEIPT, 'ARROWCOL_NETWORK_POLICY_RECEIPT');
+    let proof: JsonRecord;
+    try { proof = object(JSON.parse(await readFile(proofPath, 'utf8')), 'Network proof'); }
+    catch { throw new Error('Network-policy proof receipt is missing or invalid.'); }
+    const recorded = typeof proof.recordedAt === 'string' ? Date.parse(proof.recordedAt) : NaN;
+    if (!apiServer || proof.clusterServer !== apiServer || proof.ownerApproved !== true ||
+        proof.positivePath !== true || proof.negativePath !== true || !Number.isFinite(recorded) ||
+        recorded > now() || now() - recorded > 30 * 24 * 60 * 60_000) {
+      throw new Error('A current exact-cluster owner-approved positive/negative policy proof is required.');
+    }
+    return 'Live Cilium agents and exact-cluster behavioral proof verified; policies follow the per-run lifecycle.';
+  }, 'Obtain an owner-approved exact-cluster behavioral proof receipt; preflight never creates traffic/policies.');
+
+  await check('Storage and website publication', () => {
     const accountName = `arrowcollector${stamp}`;
     const account = az(['storage', 'account', 'show', '-n', accountName]);
-    const accountId = readStringAt(account, 'id');
-    if (!accountId) throw new Error('Selected storage account metadata is missing.');
+    const accountId = requireValue(at(account, 'id'), 'storage account ID');
     for (const container of ['experiments', '$web']) {
       az(['storage', 'container', 'show', '-n', container, '--account-name', accountName, '--auth-mode', 'login']);
-      commandOutput(runCommand, 'az', [
-        'storage', 'blob', 'list', '--container-name', container, '--account-name', accountName,
-        '--auth-mode', 'login', '--num-results', '1', '--subscription', subscription, '-o', 'json',
-      ]);
+      output('az', azArgs(['storage', 'blob', 'list', '--container-name', container, '--account-name', accountName, '--auth-mode', 'login', '--num-results', '1']));
+      const scope = `${accountId}/blobServices/default/containers/${container}`;
+      const assignments = records(json('az', azArgs(['role', 'assignment', 'list', '--scope', scope, '--include-inherited'])));
+      if (!principalId || !assignments.some((assignment) => assignment.principalId === principalId &&
+          assignment.roleDefinitionName === 'Storage Blob Data Contributor' && typeof assignment.scope === 'string' &&
+          (scope.toLowerCase() === assignment.scope.toLowerCase() || scope.toLowerCase().startsWith(`${assignment.scope.toLowerCase()}/`)))) {
+        throw new Error('Producer UAMI storage write-role evidence is missing.');
+      }
     }
-    const website = az(['storage', 'blob', 'service-properties', 'show', '--account-name', accountName]);
-    const staticWebsite = isRecord(website.staticWebsite) ? website.staticWebsite : {};
-    const roleScopes = ['experiments', '$web'].map((container) => `${accountId}/blobServices/default/containers/${container}`);
-    const assignments = roleScopes.map((scope) => recordArray(commandJsonValue(runCommand, 'az', azArgs(subscription, ['role', 'assignment', 'list', '--scope', scope, '--include-inherited']))));
-    const writerReady = Boolean(principalId) && roleScopes.every((scope, index) => assignments[index]!.some((assignment) =>
-      assignment.principalId === principalId && assignment.roleDefinitionName === 'Storage Blob Data Contributor' &&
-      typeof assignment.scope === 'string' && scope.toLowerCase().startsWith(assignment.scope.toLowerCase())));
-    const ready = staticWebsite.enabled === true && writerReady;
-    addCheck(checks, 'Storage and website publication', ready,
-      ready ? 'experiments and root $web metadata/list checks passed; static website is enabled and the workload UAMI has write-role evidence.' :
-        'Container/list access, static website configuration, or producer-principal write-role evidence is missing. No write probe was performed.',
-      'Request C5 storage approval and producer-principal RBAC evidence; preflight performs no write probe.');
-  } catch (error) {
-    addCheck(checks, 'Storage and website publication', false,
-      error instanceof Error ? error.message : 'Could not verify selected storage destinations.',
-      'Request C5 storage approval and verify read/list plus producer write-role evidence; do not run a write probe.');
-  }
+    const website = az(['storage', 'blob', 'service-properties', 'show', '--account-name', accountName, '--auth-mode', 'login']);
+    if (!isRecord(website.staticWebsite) || website.staticWebsite.enabled !== true) throw new Error('Static website is not enabled.');
+    return 'Container metadata/read access, root static website and producer UAMI write-role evidence verified. No write probe performed.';
+  });
 
-  return { ready: checks.every((check) => check.ready), checks, nextCommand };
+  await check('Run federated-credential permissions and headroom', async () => {
+    const id = requireValue(identityId, 'UAMI resource ID');
+    const page = object(await request(`https://management.azure.com${id}/providers/Microsoft.Authorization/permissions?api-version=2022-04-01`,
+      'https://management.azure.com'), 'Effective permissions');
+    if (page.nextLink) throw new Error('Effective permissions response is paginated; complete permission evidence is required.');
+    for (const action of ['write', 'delete']) {
+      if (!permitsAction(page.value, `Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials/${action}`)) {
+        throw new Error(`The workload UAMI lacks effective run FIC ${action} permission.`);
+      }
+    }
+    const credentials = records(json('az', azArgs(['identity', 'federated-credential', 'list', '-g', resourceGroup, '--identity-name', identityName])));
+    const leaked = credentials.filter((credential) => at(credential, 'name')?.startsWith('arrowcol-run-'));
+    if (leaked.length) warnings.push(`${leaked.length} run FIC(s) remain; investigate possible leaked credentials. No deletion attempted.`);
+    if (credentials.length >= 20) throw new Error('UAMI federated credentials are at the limit of 20; no run credential headroom remains.');
+    return `Workload UAMI effective permissions allow run FIC create/delete; ${20 - credentials.length} slot(s) remain across native and external trusts.`;
+  });
+  return { ready: checks.every((entry) => entry.ready), checks, nextCommand, warnings, network };
 }
 
 export function formatPreflightReport(report: PreflightReport): string {
-  const lines = [`AKS preflight: ${report.ready ? 'READY' : 'NOT READY'}`];
+  const lines = [`AKS preflight: ${report.ready ? 'READY' : 'NOT READY'}`,
+    `Network provider: ${report.network.provider}; enforcing: ${report.network.enforcing}`];
+  for (const warning of report.warnings) lines.push(`WARNING: ${warning}`);
   for (const check of report.checks) {
-    lines.push(`${check.ready ? 'READY' : 'NOT READY'}: ${check.name} — ${check.detail}`);
+    lines.push(`${check.ready ? 'READY' : 'NOT READY'}: ${check.name} - ${check.detail}`);
     if (!check.ready) lines.push(`  Next: ${check.next}`);
   }
   lines.push(`Next command: ${report.nextCommand}`);

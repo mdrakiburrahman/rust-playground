@@ -5,7 +5,7 @@ import { createServer as createHttpServer } from 'node:http';
 import { createServer as createTcpServer, isIP } from 'node:net';
 import { extname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { formatPreflightReport, runAksPreflight } from './aks-preflight.js';
+import { formatPreflightReport, loadAksEnvironment, runAksPreflight } from './aks-preflight.js';
 import { run_tree } from '../../infra/azure/bootstrap.js';
 
 export interface OatRunStatus {
@@ -160,6 +160,7 @@ export async function main(args: string[], runner: typeof run_tree = run_tree): 
   const requestedServerUrl = option('--server');
   const viewerOnly = args.includes('--viewer-only');
   const preflightOnly = args.includes('--preflight-only');
+  if (requestedMode === 'aks') Object.assign(process.env, await loadAksEnvironment(workspaceRoot));
   if (preflightOnly) {
     if (requestedMode !== 'aks' || viewerOnly || requestedServerUrl || args.includes('--poll-ms')) {
       throw new Error('--preflight-only requires --mode aks and cannot be combined with viewer/server/poll options');
