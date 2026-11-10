@@ -700,7 +700,7 @@ export async function existing_network_prefixes(azure: Pick<Azure, 'cli'>, subsc
   });
   return [...new Set([...externalNetworks.flatMap(prefixes), ...remoteNetworks.flatMap(prefixes)])];
 }
-export async function preflight(azure: Azure): Promise<void> {
+export async function preflight(azure: Azure, readOnly = false): Promise<void> {
   const c = azure.c;
   const account = await azure.cli('account', 'show', '--subscription', c.subscription);
   if (account.id.toLowerCase() !== c.subscription) throw new Failure('CLI subscription mismatch; no default-subscription fallback is permitted.');
@@ -708,7 +708,10 @@ export async function preflight(azure: Azure): Promise<void> {
     'Microsoft.Insights', ...(c.mode === 'stamped' ?
       ['Microsoft.ContainerService', 'Microsoft.Network', 'Microsoft.ContainerRegistry', 'Microsoft.Authorization'] : [])]) {
     const state = (await azure.cli('provider', 'show', '--namespace', provider, '--subscription', c.subscription)).registrationState;
-    if (state !== 'Registered') await azure.cli('provider', 'register', '--namespace', provider, '--subscription', c.subscription, '--wait');
+    if (state !== 'Registered') {
+      if (readOnly) throw new Failure(`Provider ${provider} is not registered; read-only preflight cannot register it.`);
+      await azure.cli('provider', 'register', '--namespace', provider, '--subscription', c.subscription, '--wait');
+    }
   }
   if (c.mode === 'stamped') {
   const aksConfig = c.stampConfig.aks;
@@ -814,7 +817,7 @@ export function fresh_authority(): Metadata {
 export async function checkpoint_container(azure: Azure): Promise<any> {
   return azure.arm('GET', azure.c.storage_id + '/blobServices/default/containers/' + azure.c.checkpoints, undefined, true, '2023-05-01');
 }
-export async function deploy(azure: Azure, fresh?: Metadata): Promise<void> {
+export async function deploy(azure: Azure, fresh?: Metadata, whatIf = false): Promise<void> {
   const c = azure.c;
   const existing = await guard_existing(azure);
   for (const [kind, resource] of Object.entries(existing)) {
@@ -839,14 +842,16 @@ export async function deploy(azure: Azure, fresh?: Metadata): Promise<void> {
     JSON.stringify({ parameters: Object.fromEntries(Object.entries(params).map(([k, v]) => [k, { value: v }])) }));
   try {
     try {
-      await azure.cli('deployment', 'sub', 'create', '--subscription', c.subscription, '--location', c.location,
+      const result = await azure.cli('deployment', 'sub', whatIf ? 'what-if' : 'create', '--subscription', c.subscription, '--location', c.location,
         '--name', 'arrowcol-sandbox-' + c.sandbox,
         '--template-file', path.join(ROOT, 'infra/azure/main.bicep'), '--parameters', '@' + filename);
+      if (whatIf) console.log(JSON.stringify(result, null, 2));
     } catch (error) {
       if (error instanceof Failure && error.message.includes('DeploymentFailed')) throw new DeploymentFailed(error.message, { cause: error });
       throw error;
     }
   } finally { fs.unlinkSync(filename); }
+  if (whatIf) return;
   c.uri = (await azure.arm('GET', c.cluster_id)).properties.uri.replace(/\/+$/, '');
   if (c.mode === 'stamped') {
     const sharedIdentity = await azure.arm('GET', c.identity_id, undefined, false, '2023-01-31');
@@ -1492,18 +1497,21 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         'stamp-config': { type: 'string' }, output: { type: 'string', default: path.join(ROOT, '.env.azure') },
         tables: { type: 'string', default: path.join(ROOT, '.env.azure.tables.json') }, 'infra-only': { type: 'boolean', default: false },
         execute: { type: 'boolean', default: false }, resume: { type: 'boolean', default: false },
+        'read-only': { type: 'boolean', default: false },
         'occupancy-id': { type: 'string', default: '' }, 'reset-generation': { type: 'string', default: '' },
         'wait-seconds': { type: 'string', default: '0' }, help: { type: 'boolean', short: 'h' },
         'run-id': { type: 'string' }, namespace: { type: 'string' },
         'service-account': { type: 'string' }, record: { type: 'string' },
         manifest: { type: 'string' }, 'workload-record': { type: 'string' }, 'workload-stop-record': { type: 'string' },
       } });
-    if (args.help) { console.log('Usage: bootstrap.ts <config|preflight|provision|reconcile|reset|recover|status|stop|occupy|release|prepare-run-fic|probe-run-fic|cleanup-run-fic|bind-oat-qap|verify-oat-qap|cleanup-oat-qap> [--mode stamped|schema-evolution] [--env-file PATH] [--stamp-config YAML] [--output PATH] [--tables PATH] [--infra-only] [--execute] [--resume] [--occupancy-id UUID] [--reset-generation UUID] [--wait-seconds 0..600] [--run-id UUID --namespace NAME --service-account NAME --record PATH] [--manifest PATH --workload-record PATH --workload-stop-record PATH] [--stop-command COMMAND ...]'); return 0; }
+    if (args.help) { console.log('Usage: bootstrap.ts <config|preflight|what-if|provision|reconcile|reset|recover|status|stop|occupy|release|prepare-run-fic|probe-run-fic|cleanup-run-fic|bind-oat-qap|verify-oat-qap|cleanup-oat-qap> [--mode stamped|schema-evolution] [--env-file PATH] [--stamp-config YAML] [--output PATH] [--tables PATH] [--infra-only] [--read-only] [--execute] [--resume] [--occupancy-id UUID] [--reset-generation UUID] [--wait-seconds 0..600] [--run-id UUID --namespace NAME --service-account NAME --record PATH] [--manifest PATH --workload-record PATH --workload-stop-record PATH] [--stop-command COMMAND ...]'); return 0; }
     const command = positionals[0];
-    if (positionals.length !== 1 || !['config', 'preflight', 'provision', 'reconcile', 'reset', 'recover', 'status', 'stop', 'occupy', 'release',
+    if (positionals.length !== 1 || !['config', 'preflight', 'what-if', 'provision', 'reconcile', 'reset', 'recover', 'status', 'stop', 'occupy', 'release',
       'prepare-run-fic', 'probe-run-fic', 'cleanup-run-fic', 'bind-oat-qap', 'verify-oat-qap', 'cleanup-oat-qap'].includes(command))
       throw new Failure('A valid Azure bootstrap command is required.');
     const mode = azure_mode(args.mode!);
+    if (args['read-only'] && command !== 'preflight' && command !== 'what-if')
+      throw new Failure('--read-only is only supported for preflight and what-if.');
     if (mode === 'schema-evolution' && args['stamp-config'])
       throw new Failure('Schema-evolution mode does not accept an AKS stamp configuration.');
     const privateValues = load_env(args['env-file']!);
@@ -1550,7 +1558,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         break;
       }
       case 'config': write_private(args.output!, c.generated()); console.log('Private generated Azure configuration written (values withheld).'); break;
-      case 'preflight': await preflight(azure); break;
+      case 'preflight': await preflight(azure, args['read-only']); break;
+      case 'what-if': await preflight(azure, true); await deploy(azure, fresh_authority(), true); break;
       case 'provision': await preflight(azure); await provision(azure, args.tables!, wait, args.output!, args['infra-only']!, values); break;
       case 'reconcile': await reconcile_command(azure, args.tables!, args['occupancy-id']!, wait, generation); break;
       case 'reset': await reset(azure, args.execute!, stopCommand, args.resume!); break;
