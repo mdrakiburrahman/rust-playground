@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -71,11 +71,6 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
         tokio::time::sleep(arguments.capture_settle.get()).await;
     }
 
-    let mut batches = BTreeMap::new();
-    for table in &load_tables {
-        let batch = build_logical_batch(Arc::clone(table), arguments.batch_rows, arguments.seed).await?;
-        batches.insert(table.identity.to_string(), Arc::new(batch));
-    }
     let scheduled_table_count = load_tables.len();
     let scheduler = Arc::new(Scheduler::new(load_tables, arguments.seed)?);
     let cancellation = CancellationToken::new();
@@ -101,7 +96,6 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
                 Some(arguments.warmup.get()),
                 &arguments,
                 Arc::clone(&scheduler),
-                &batches,
                 transport.clone(),
                 manifests.clone(),
                 cancellation.clone(),
@@ -125,7 +119,6 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
             duration,
             &arguments,
             Arc::clone(&scheduler),
-            &batches,
             transport.clone(),
             manifests.clone(),
             cancellation.clone(),
@@ -205,7 +198,6 @@ async fn run_phase(
     duration: Option<Duration>,
     arguments: &RunArgs,
     scheduler: Arc<Scheduler>,
-    batches: &BTreeMap<String, Arc<LogicalBatch>>,
     transport: FlightTransport,
     manifests: ManifestWriter,
     cancellation: CancellationToken,
@@ -219,11 +211,11 @@ async fn run_phase(
     let deadline = duration.map(|duration| Instant::now() + duration);
     let first_ordinal = scheduler.scheduled();
     let mut lanes = JoinSet::new();
-    let batches = Arc::new(batches.clone());
     let send_policy_failures = Arc::new(AtomicU64::new(0));
     for lane in 0..arguments.lanes {
         let scheduler = Arc::clone(&scheduler);
-        let batches = Arc::clone(&batches);
+        let batch_rows = arguments.batch_rows;
+        let seed = arguments.seed;
         let transport = transport.clone();
         let manifests = manifests.clone();
         let cancellation = cancellation.clone();
@@ -242,9 +234,10 @@ async fn run_phase(
                     break;
                 }
                 let scheduled = scheduler.next();
-                let batch = batches
-                    .get(&scheduled.table.identity.to_string())
-                    .context("scheduled table has no generated batch")?;
+                let batch_seed = seed
+                    .checked_add(scheduled.table_batch_ordinal)
+                    .context("logical batch seed overflow")?;
+                let batch = Arc::new(build_logical_batch(Arc::clone(&scheduled.table), batch_rows, batch_seed).await?);
                 let logical_batch_id = format!("{}:{}:{}:{}", run_id, scenario.as_str(), phase, scheduled.ordinal);
                 let sent = send_pool_with_retry(
                     &run_id,
@@ -255,7 +248,7 @@ async fn run_phase(
                     scheduled.table_batch_ordinal,
                     lane,
                     ImplementationPool::Dataflow,
-                    Arc::clone(batch),
+                    Arc::clone(&batch),
                     &transport,
                     &manifests,
                     request_timeout,
@@ -394,6 +387,7 @@ async fn send_pool_with_retry(
                         arrow_bytes: batch.arrow_bytes,
                         payload_sha256: batch.payload_sha256.clone(),
                         row_sha256: batch.row_sha256.clone(),
+                        row_hashes: batch.row_hashes.clone(),
                         lane,
                         pool: pool.to_string(),
                         attempt,
@@ -423,6 +417,7 @@ async fn send_pool_with_retry(
                         arrow_bytes: batch.arrow_bytes,
                         payload_sha256: batch.payload_sha256.clone(),
                         row_sha256: batch.row_sha256.clone(),
+                        row_hashes: batch.row_hashes.clone(),
                         lane,
                         pool: pool.to_string(),
                         attempt,

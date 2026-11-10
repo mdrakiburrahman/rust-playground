@@ -6,13 +6,14 @@ use std::sync::{
 use anyhow::{Context, Result, bail};
 use arrow::{
     array::{
-        ArrayRef, BooleanArray, Float64Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
+        Array, ArrayRef, BooleanArray, Float64Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
         TimestampMicrosecondArray, UInt8Array,
     },
     datatypes::{DataType, TimeUnit},
 };
 use arrow_flight::{FlightData, encode::FlightDataEncoderBuilder, error::FlightError};
 use futures::{TryStreamExt, stream};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::sdk::GeneratedTable;
@@ -31,6 +32,7 @@ pub struct LogicalBatch {
     pub arrow_bytes: u64,
     pub payload_sha256: String,
     pub row_sha256: String,
+    pub row_hashes: Vec<(String, u64)>,
 }
 
 /// Global deterministic table scheduler shared by all lanes.
@@ -120,6 +122,7 @@ pub async fn build_logical_batch(table: Arc<GeneratedTable>, rows: usize, seed: 
         columns.push(column);
     }
     let record_batch = RecordBatch::try_new(Arc::clone(&table.schema), columns)?;
+    let row_hashes = row_hash_multiset(&record_batch)?;
     let arrow_bytes = u64::try_from(record_batch.get_array_memory_size()).context("Arrow byte count overflow")?;
     let (encoded, payload_sha256) = encode_record_batch(&table, &record_batch).await?;
     Ok(LogicalBatch {
@@ -130,7 +133,86 @@ pub async fn build_logical_batch(table: Arc<GeneratedTable>, rows: usize, seed: 
         arrow_bytes,
         payload_sha256,
         row_sha256: format!("sha256:{}", hex::encode(row_hasher.finalize())),
+        row_hashes,
     })
+}
+
+fn row_hash_multiset(batch: &RecordBatch) -> Result<Vec<(String, u64)>> {
+    let mut counts = std::collections::BTreeMap::<String, u64>::new();
+    for row in 0..batch.num_rows() {
+        let mut values = Map::new();
+        for (field, array) in batch.schema().fields().iter().zip(batch.columns()) {
+            let value = if array.is_null(row) {
+                Value::Null
+            } else {
+                match field.data_type() {
+                    DataType::Boolean => json!(
+                        array
+                            .as_any()
+                            .downcast_ref::<BooleanArray>()
+                            .context("boolean row array")?
+                            .value(row)
+                    ),
+                    DataType::UInt8 => json!(
+                        array
+                            .as_any()
+                            .downcast_ref::<UInt8Array>()
+                            .context("uint8 row array")?
+                            .value(row)
+                    ),
+                    DataType::Int16 => json!(
+                        array
+                            .as_any()
+                            .downcast_ref::<Int16Array>()
+                            .context("int16 row array")?
+                            .value(row)
+                    ),
+                    DataType::Int32 => json!(
+                        array
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .context("int32 row array")?
+                            .value(row)
+                    ),
+                    DataType::Int64 => json!(
+                        array
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .context("int64 row array")?
+                            .value(row)
+                    ),
+                    DataType::Float64 => json!(
+                        array
+                            .as_any()
+                            .downcast_ref::<Float64Array>()
+                            .context("float64 row array")?
+                            .value(row)
+                    ),
+                    DataType::Utf8 => json!(
+                        array
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .context("UTF-8 row array")?
+                            .value(row)
+                    ),
+                    DataType::Timestamp(TimeUnit::Microsecond, _) => json!(
+                        array
+                            .as_any()
+                            .downcast_ref::<TimestampMicrosecondArray>()
+                            .context("timestamp row array")?
+                            .value(row)
+                    ),
+                    other => bail!("unsupported synthetic generated type {other} for row hash"),
+                }
+            };
+            values.insert(field.name().clone(), value);
+        }
+        let encoded = serde_json::to_string(&Value::Object(values))?;
+        let hash = format!("sha256:{}", hex::encode(Sha256::digest(encoded.as_bytes())));
+        let count = counts.entry(hash).or_default();
+        *count = count.checked_add(1).context("row hash multiplicity overflow")?;
+    }
+    Ok(counts.into_iter().collect())
 }
 
 /// Encodes a batch with the generated SDK manifest's descriptor path.
@@ -339,6 +421,9 @@ mod tests {
         assert_eq!(first.record_batch, second.record_batch);
         assert_eq!(first.payload_sha256, second.payload_sha256);
         assert_eq!(first.row_sha256, second.row_sha256);
+        assert_eq!(first.row_hashes, second.row_hashes);
+        let different_seed = build_logical_batch(generated_table()?, 4, 8).await?;
+        assert_ne!(first.row_hashes, different_seed.row_hashes);
         Ok(())
     }
 
