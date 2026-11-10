@@ -273,8 +273,11 @@ async function createLocalViewer(config: LocalViewerConfig): Promise<LocalViewer
   const { resultsPath, siteRoot } = config;
   const server = createHttpServer(async (request, response) => {
     const port = request.socket.localPort;
+    const hostHeaderCount = request.rawHeaders.filter((header, index) =>
+      index % 2 === 0 && header.toLowerCase() === 'host').length;
+    const host = request.headers.host?.toLowerCase();
     const allowedHosts = port === undefined ? [] : [`127.0.0.1:${port}`, `localhost:${port}`];
-    if (!request.headers.host || !allowedHosts.includes(request.headers.host)) {
+    if (hostHeaderCount !== 1 || !host || !allowedHosts.includes(host)) {
       response.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' }).end('Invalid Host header');
       return;
     }
@@ -282,7 +285,8 @@ async function createLocalViewer(config: LocalViewerConfig): Promise<LocalViewer
       `http://127.0.0.1:${port}`,
       `http://localhost:${port}`,
     ];
-    if (request.headers.origin !== undefined && !allowedOrigins.includes(request.headers.origin)) {
+    const origin = request.headers.origin?.toLowerCase();
+    if (origin !== undefined && !allowedOrigins.includes(origin)) {
       response.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' }).end('Origin not allowed');
       return;
     }
@@ -328,8 +332,11 @@ async function createLocalViewer(config: LocalViewerConfig): Promise<LocalViewer
         contentTypes[extname(actualFile).toLowerCase()] ?? 'application/octet-stream',
       );
     } catch (error) {
-      const code = error instanceof Error && 'code' in error && error.code === 'ENOENT' ? 404 : 500;
-      response.writeHead(code).end(code === 404 ? 'Not found' : 'Could not serve local OAT viewer');
+      const errorCode = error instanceof Error && 'code' in error ? error.code : undefined;
+      const code = errorCode === 'ENOENT' || errorCode === 'ENOTDIR' ? 404
+        : errorCode === 'ENAMETOOLONG' ? 414 : 500;
+      response.writeHead(code).end(code === 404 ? 'Not found'
+        : code === 414 ? 'Request-URI Too Long' : 'Could not serve local OAT viewer');
       if (code === 500) console.error(error);
     }
   });
