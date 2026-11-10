@@ -95,6 +95,20 @@ test('query response maps primary results by TOC and distinguishes an unaccelera
   assert.equal(parsed.accelerated_read_proven, false);
 });
 test('query response rejects malformed TOC, unknown statuses and partial failures', () => {
+  const wrongIdType = structuredClone(queryResponse()); wrongIdType.Tables[3].Columns[3].ColumnType = 'guid';
+  assert.throws(() => parseKustoQueryResult(wrongIdType), /unexpected column types or fields/);
+  const wrongPrettyNameType = structuredClone(queryResponse()); wrongPrettyNameType.Tables[3].Columns[4].ColumnType = 'dynamic';
+  assert.throws(() => parseKustoQueryResult(wrongPrettyNameType), /unexpected column types or fields/);
+  const malformedId = structuredClone(queryResponse()); malformedId.Tables[3].Rows[0][3] = 0;
+  assert.throws(() => parseKustoQueryResult(malformedId), /table of contents is malformed/);
+  const missingId = structuredClone(queryResponse()); missingId.Tables[3].Rows[0][3] = '';
+  assert.throws(() => parseKustoQueryResult(missingId), /table of contents is malformed/);
+  const malformedPrettyName = structuredClone(queryResponse()); malformedPrettyName.Tables[3].Rows[1][4] = null;
+  assert.throws(() => parseKustoQueryResult(malformedPrettyName), /table of contents is malformed/);
+  const contradictoryIdentity = structuredClone(queryResponse());
+  contradictoryIdentity.Tables[3].Rows[0][3] = null;
+  contradictoryIdentity.Tables[3].Rows[0][4] = 0;
+  assert.throws(() => parseKustoQueryResult(contradictoryIdentity), /table of contents is malformed/);
   const badOrdinal = structuredClone(queryResponse()); badOrdinal.Tables[3].Rows[2][0] = 9;
   assert.throws(() => parseKustoQueryResult(badOrdinal), /table of contents is malformed/);
   const duplicatePrimary = structuredClone(queryResponse()); duplicatePrimary.Tables[3].Rows.push([...duplicatePrimary.Tables[3].Rows[2]]);

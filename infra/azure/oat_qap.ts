@@ -166,17 +166,26 @@ export function parseKustoQueryResult(value: unknown): KustoQueryResult {
     table.columns.some(column => column.name === name)));
   if (tocCandidates.length !== 1) throw new Failure('Kusto query table of contents is missing or ambiguous.');
   const toc = tocCandidates[0];
+  const tocColumnTypes: Record<string, string> = {
+    Ordinal: 'long', Kind: 'string', Name: 'string', Id: 'string', PrettyName: 'string',
+  };
+  if (toc.columns.length !== Object.keys(tocColumnTypes).length ||
+      Object.entries(tocColumnTypes).some(([name, type]) =>
+        toc.columns.find(column => column.name === name)?.type !== type))
+    throw new Failure('Kusto query table of contents has unexpected column types or fields.');
   const indexes = Object.fromEntries(['Ordinal', 'Kind', 'Name', 'Id', 'PrettyName'].map(name =>
     [name, toc.columns.findIndex(column => column.name === name)]));
   const ordinals = new Set<number>();
   const entries = toc.rows.map(row => {
     const ordinal = row[indexes.Ordinal], kind = row[indexes.Kind], name = row[indexes.Name];
+    const id = row[indexes.Id], prettyName = row[indexes.PrettyName];
     if (typeof ordinal !== 'number' || !Number.isInteger(ordinal) || ordinal < 0 || ordinal >= tables.length ||
-        typeof kind !== 'string' || typeof name !== 'string' || ordinals.has(ordinal) ||
+        typeof kind !== 'string' || typeof name !== 'string' || typeof id !== 'string' || !id.length ||
+        typeof prettyName !== 'string' || ordinals.has(ordinal) ||
         tables[ordinal].name !== `Table_${ordinal}`)
       throw new Failure('Kusto query table of contents is malformed.');
     ordinals.add(ordinal);
-    return { ordinal, kind, name };
+    return { ordinal, kind, name, id, prettyName };
   });
   if (entries.length !== tables.length - 1 || ordinals.has(tables.indexOf(toc)))
     throw new Failure('Kusto query table of contents does not map every result table.');
