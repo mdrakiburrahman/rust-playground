@@ -1,5 +1,5 @@
-import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
-import { isAbsolute, relative, resolve } from 'node:path';
+import { lstat, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { readOatConfigForMode } from './launch.js';
@@ -58,7 +58,31 @@ export function prepareExperiments(
   ]));
 }
 
-export async function main(args: string[]): Promise<void> {
+async function assertSafeOutputParents(workspaceRoot: string, out: string): Promise<void> {
+  const root = resolve(workspaceRoot);
+  const relativeParent = relative(root, dirname(out));
+  let current = root;
+  for (const component of ['', ...relativeParent.split(sep)]) {
+    if (component) current = resolve(current, component);
+    try {
+      const info = await lstat(current);
+      if (info.isSymbolicLink() || !info.isDirectory()) {
+        throw new Error(`--out path has a symlink or non-directory component: ${current}`);
+      }
+    } catch (error) {
+      if (error instanceof Error && 'code' in error && error.code === 'ENOENT') break;
+      throw error;
+    }
+  }
+  try {
+    await lstat(out);
+    throw new Error('EEXIST: --out must be a new subdirectory of out/arrowcol-oat');
+  } catch (error) {
+    if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error;
+  }
+}
+
+export async function main(args: string[], workspaceRoot = resolve('.')): Promise<void> {
   const { values } = parseArgs({ args, options: {
     base: { type: 'string' }, out: { type: 'string' },
     'warmup-seconds': { type: 'string' }, 'measure-seconds': { type: 'string' },
@@ -72,9 +96,12 @@ export async function main(args: string[]): Promise<void> {
   for (const key of ['base', 'out', 'warmup-seconds', 'measure-seconds', 'higher-dfe'] as const) {
     if (!values[key]?.trim()) throw new Error(`--${key} is required; pilot values have no defaults`);
   }
-  const out = resolve(values.out!);
-  const child = relative(resolve('out/arrowcol-oat'), out);
+  const root = resolve(workspaceRoot);
+  const out = resolve(root, values.out!);
+  const privateRoot = resolve(root, 'out/arrowcol-oat');
+  const child = relative(privateRoot, out);
   if (!child || child.startsWith('..') || isAbsolute(child)) throw new Error('--out must be a new subdirectory of out/arrowcol-oat');
+  await assertSafeOutputParents(root, out);
   const base = await readOatConfigForMode(values.base!, 'aks');
   const platform = base.platform as Record<string, unknown>;
   if (typeof platform.runtime_config_file !== 'string' || typeof platform.bootstrap_env_file !== 'string') {
@@ -88,13 +115,13 @@ export async function main(args: string[]): Promise<void> {
       !/^[a-z0-9]+\.azurecr\.io\/[a-z0-9][a-z0-9/_.-]*@sha256:[a-f0-9]{64}$/.test(base.dmv_client_image)) {
     throw new Error('generated AKS config must supply a digest-pinned DMV client image');
   }
-  const tables = fixtureTables(await readFile('projects/loadtest/schemas/sqlserver.sql', 'utf8'));
+  const tables = fixtureTables(await readFile(resolve(root, 'projects/loadtest/schemas/sqlserver.sql'), 'utf8'));
   const configs = prepareExperiments(base, tables, {
     warmupSeconds: Number(values['warmup-seconds']),
     measureSeconds: Number(values['measure-seconds']),
     higherDfeConcurrency: Number(values['higher-dfe']),
   });
-  await mkdir(resolve('out/arrowcol-oat'), { recursive: true, mode: 0o700 });
+  await mkdir(privateRoot, { recursive: true, mode: 0o700 });
   await mkdir(out, { mode: 0o700 });
   for (const [name, config] of Object.entries(configs)) {
     await writeFile(resolve(out, `${name}.config.json`), `${JSON.stringify(config, null, 2)}\n`, { flag: 'wx', mode: 0o600 });

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import test from 'node:test';
 import { fixtureTables, main, prepareExperiments } from './prepare-experiments.js';
@@ -53,6 +54,47 @@ test('CLI fails before reading private settings when pilot values or private out
     '--base', 'not-read', '--out', 'docs/published', '--warmup-seconds', '30',
     '--measure-seconds', '90', '--higher-dfe', '4',
   ]), /new subdirectory/);
+});
+
+test('CLI rejects a symlinked private root before writing outside it', async () => {
+  const workspace = await mkdtemp(resolve(tmpdir(), 'oat-linked-root-'));
+  const outside = resolve(workspace, 'outside-root');
+  await mkdir(resolve(workspace, 'out'));
+  await mkdir(outside);
+  const sentinel = resolve(outside, 'operator-state');
+  await writeFile(sentinel, 'keep private state');
+  await symlink(outside, resolve(workspace, 'out/arrowcol-oat'));
+  try {
+    await assert.rejects(main([
+      '--base', 'not-read', '--out', resolve(workspace, 'out/arrowcol-oat/new'),
+      '--warmup-seconds', '30', '--measure-seconds', '90', '--higher-dfe', '4',
+    ], workspace), /symlink or non-directory component/);
+    assert.equal(await readFile(sentinel, 'utf8'), 'keep private state');
+    assert.deepEqual(await readdir(outside), ['operator-state']);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test('CLI rejects a symlinked intermediate output parent without changing its target', async () => {
+  const workspace = await mkdtemp(resolve(tmpdir(), 'oat-linked-parent-'));
+  const privateRoot = resolve(workspace, 'out/arrowcol-oat');
+  const outside = resolve(workspace, 'outside-parent');
+  await mkdir(privateRoot, { recursive: true });
+  await mkdir(outside);
+  const sentinel = resolve(outside, 'operator-state');
+  await writeFile(sentinel, 'keep private state');
+  await symlink(outside, resolve(privateRoot, 'linked'));
+  try {
+    await assert.rejects(main([
+      '--base', 'not-read', '--out', resolve(privateRoot, 'linked/new'),
+      '--warmup-seconds', '30', '--measure-seconds', '90', '--higher-dfe', '4',
+    ], workspace), /symlink or non-directory component/);
+    assert.equal(await readFile(sentinel, 'utf8'), 'keep private state');
+    assert.deepEqual(await readdir(outside), ['operator-state']);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
 });
 
 test('offline CLI binds fake private AKS settings, preserves runtime and refuses replacement', async () => {
