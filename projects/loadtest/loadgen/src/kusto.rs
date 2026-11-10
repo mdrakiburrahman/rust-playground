@@ -2055,7 +2055,10 @@ mod tests {
     use std::{
         io::Read,
         net::{TcpListener, TcpStream},
-        sync::atomic::{AtomicU64, AtomicUsize},
+        sync::{
+            Condvar,
+            atomic::{AtomicU64, AtomicUsize},
+        },
         thread,
     };
 
@@ -2217,16 +2220,23 @@ mod tests {
     #[tokio::test]
     async fn cloned_clients_bound_actual_inflight_queries_independently_of_cpu_workers() -> Result<()> {
         for heavy in [false, true] {
+            let bound = if heavy {
+                HEAVY_QUERY_CONCURRENCY
+            } else {
+                QUERY_CONCURRENCY
+            };
             let listener = TcpListener::bind("127.0.0.1:0")?;
             let endpoint = format!("http://{}", listener.local_addr()?);
             let active = Arc::new(AtomicUsize::new(0));
             let peak = Arc::new(AtomicUsize::new(0));
             let observed = Arc::clone(&peak);
+            let arrivals = Arc::new((Mutex::new(0usize), Condvar::new()));
             let server = thread::spawn(move || -> Result<()> {
                 let mut workers = Vec::new();
                 for _ in 0..8 {
                     let (mut socket, _) = listener.accept()?;
                     let (active, peak) = (Arc::clone(&active), Arc::clone(&peak));
+                    let arrivals = Arc::clone(&arrivals);
                     workers.push(thread::spawn(move || -> Result<()> {
                         socket.set_read_timeout(Some(Duration::from_secs(5)))?;
                         let mut header = Vec::new();
@@ -2250,14 +2260,30 @@ mod tests {
                         socket.read_exact(&mut request)?;
                         let current = active.fetch_add(1, Ordering::SeqCst) + 1;
                         peak.fetch_max(current, Ordering::SeqCst);
-                        thread::sleep(Duration::from_millis(40));
+                        let (arrived, ready) = &*arrivals;
+                        let mut arrived = arrived
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("query arrival lock poisoned"))?;
+                        *arrived += 1;
+                        let batch_end = (arrived.div_ceil(bound) * bound).min(8);
+                        ready.notify_all();
+                        let (arrived, _) = ready
+                            .wait_timeout_while(arrived, Duration::from_secs(10), |arrived| *arrived < batch_end)
+                            .map_err(|_| anyhow::anyhow!("query arrival lock poisoned"))?;
+                        ensure!(
+                            *arrived >= batch_end,
+                            "query test server timed out waiting for {batch_end} admitted requests; observed {}",
+                            *arrived
+                        );
+                        drop(arrived);
                         let body = response(&["Rows"], vec![json!([1])]).to_string();
+                        // Count completion before the response can release the client's permit.
+                        active.fetch_sub(1, Ordering::SeqCst);
                         write!(
                             socket,
                             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                             body.len()
                         )?;
-                        active.fetch_sub(1, Ordering::SeqCst);
                         Ok(())
                     }));
                 }
@@ -2281,20 +2307,17 @@ mod tests {
                     }
                 });
             }
+            let mut query_results = Vec::new();
             while let Some(result) = pending.join_next().await {
-                assert_eq!(result??[0]["Rows"], 1);
+                query_results.push(result);
             }
             server
                 .join()
                 .map_err(|_| anyhow::anyhow!("query test server panicked"))??;
-            assert_eq!(
-                observed.load(Ordering::SeqCst),
-                if heavy {
-                    HEAVY_QUERY_CONCURRENCY
-                } else {
-                    QUERY_CONCURRENCY
-                }
-            );
+            for result in query_results {
+                assert_eq!(result??[0]["Rows"], 1);
+            }
+            assert_eq!(observed.load(Ordering::SeqCst), bound);
         }
         Ok(())
     }
