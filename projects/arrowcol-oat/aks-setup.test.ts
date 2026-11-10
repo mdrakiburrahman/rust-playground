@@ -13,6 +13,15 @@ const output = resolve(ROOT, 'out/arrowcol-oat');
 const revision = '0123456789abcdef0123456789abcdef01234567';
 const digest = `sha256:${'a'.repeat(64)}`;
 const token = `header.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 })).toString('base64url')}.signature`;
+const tagFormImageMissing = `WARNING: Command group 'acr manifest' is in preview and under development. Reference and support levels: https://aka.ms/CLI_refstatus
+ERROR: 2026-11-10 03:20:12.297874 Error: the specified tag does not exist. Correlation ID: 7c9221a5-5f81-4cca-8000-4dcab1f95660.
+`;
+const registryAbsent = `WARNING: Command group 'acr manifest' is in preview and under development. Reference and support levels: https://aka.ms/CLI_refstatus
+WARNING: The resource with name 'arrowcollector99999' and type 'Microsoft.ContainerRegistry/registries' could not be found in subscription 'ArcData Monitoring Dev (68fa0545-661c-4152-93f2-fc8ae1c231b8)'.
+Using 'arrowcollector99999.azurecr.io' as the default registry login server.
+ERROR: Could not connect to the registry login server 'arrowcollector99999.azurecr.io'. Please verify that the registry exists and the URL 'https://arrowcollector99999.azurecr.io/v2/' is reachable from your environment.
+Try running 'az acr check-health -n arrowcollector99999 --yes' to diagnose this issue.
+`;
 
 async function fixture(t: test.TestContext, stamp = '00000') {
   const parent = resolve(ROOT, 'out/aks-setup-tests');
@@ -30,7 +39,7 @@ async function fixture(t: test.TestContext, stamp = '00000') {
 
 function fake(options: {
   clusters?: string[]; state?: string; preflightFailures?: number; fail?: string;
-  missingImages?: boolean; badProvenance?: boolean; badDigest?: boolean;
+  missingImages?: boolean; registryAbsent?: boolean; badProvenance?: boolean; badDigest?: boolean;
 } = {}) {
   const calls: string[][] = [];
   let preflights = 0;
@@ -68,7 +77,8 @@ function fake(options: {
       assert.match(manifest, new RegExp(clientId));
     } else if (command[0] === 'kubectl' && command.includes('token')) stdout = token;
     else if (text.startsWith('az acr manifest show-metadata')) {
-      if (!published) return { returncode: 1, stdout: '', stderr: 'MANIFEST_UNKNOWN: manifest unknown' };
+      if (options.registryAbsent) return { returncode: 1, stdout: '', stderr: registryAbsent };
+      if (!published) return { returncode: 3, stdout: '', stderr: tagFormImageMissing };
       stdout = options.badDigest ? 'invalid-digest' : digest;
     } else if (text.startsWith('docker image inspect')) {
       const reference = command.at(-1)!;
@@ -200,6 +210,18 @@ test('skip-images and hard provenance failures never trigger builds or overwrite
   const failedBuild = fake({ missingImages: true, fail: 'docker buildx build' });
   await assert.rejects(setup({ ...options, skipPreflight: true }, failedBuild.runner), /Docker build failed/);
   assert.equal(await readFile(result.runtimeConfigPath, 'utf8'), original);
+  await assert.rejects(readFile(resolve(output, 'runtime.publish.json')), { code: 'ENOENT' });
+});
+
+test('real absent-registry failure never becomes missing images or triggers build/publication', async t => {
+  await mkdir(output, { mode: 0o700 });
+  t.after(() => rm(output, { force: true, recursive: true }));
+  const options = await fixture(t);
+  const m = fake({ registryAbsent: true });
+  await assert.rejects(setup({ ...options, skipPreflight: true }, m.runner), /Could not connect to the registry login server/);
+  assert.ok(m.calls.some(c => c.slice(0, 4).join(' ') === 'az acr manifest show-metadata'));
+  assert.ok(m.calls.every(c => c[0] !== 'docker' || !['buildx', 'push'].includes(c[1]!)));
+  await assert.rejects(readFile(resolve(output, 'runtime.json')), { code: 'ENOENT' });
   await assert.rejects(readFile(resolve(output, 'runtime.publish.json')), { code: 'ENOENT' });
 });
 
