@@ -69,6 +69,13 @@ function fixture(t: test.TestContext, faults: Fault[] = []) {
       tags: { ...TAGS, sandboxId: `stamp-${stamp}` }, networkProfile: { networkDataplane: faults.includes('network') ? 'wrong' : selectedNetwork },
       oidcIssuerProfile: { issuerUrl: 'https://aks.example/' },
     }]);
+    if (command[1] === 'deployment' && command[2] === 'sub') {
+      assert.equal(command[3], 'show');
+      assert.equal(command[command.indexOf('--name') + 1], `arrowcol-sandbox-stamp-${stamp}`);
+      return success({ name: `arrowcol-sandbox-stamp-${stamp}`, properties: {
+        provisioningState: lastFault === 'convergence' ? 'Succeeded' : 'Failed',
+      } });
+    }
     if (command[1] === 'deployment' && command[2] === 'group') return success([
       { name: `arrowcol-sandbox-stamp-${stamp}`, properties: { provisioningState: 'Failed' } },
       { name: `arrowcol-aks-stamp-${stamp}`, properties: { provisioningState: 'Failed' } },
@@ -131,9 +138,44 @@ test('only proven AKS failure deletes that cluster and retries Cilium once', asy
   assert.equal(result.network, 'cilium');
   assert.deepEqual(result.attempts.map(attempt => attempt.outcome), ['cluster-create-failed', 'succeeded']);
   assert.equal(f.calls.filter(call => call[2] === 'delete').length, 1);
+  assert.ok(f.calls.findIndex(call => call[1] === 'deployment' && call[2] === 'sub') <
+    f.calls.findIndex(call => call[2] === 'delete'));
   assert.deepEqual(f.receipt().networkPath, ['azure', 'cilium']);
   assert.match(f.receipt().attempts[0].error, /ARM rejected creation/);
   assert.equal(fs.readFileSync(f.options.stampConfig, 'utf8'), renderStampConfig(f.original, { stamp }));
+});
+
+for (const parent of [
+  ...['Running', 'Accepted', 'Creating', 'Succeeded', 'Unknown'].map(provisioningState => ({
+    name: `arrowcol-sandbox-stamp-${stamp}`, properties: { provisioningState },
+  })),
+  null, {}, { name: `arrowcol-sandbox-stamp-${stamp}`, properties: {} },
+  { name: 'another-deployment', properties: { provisioningState: 'Failed' } },
+]) {
+  test(`failed child deployments cannot trigger fallback with unproven terminal parent: ${JSON.stringify(parent)}`, async t => {
+    const f = fixture(t, ['cluster']);
+    const runner: typeof run_tree = async (...args) => {
+      const result = await f.runner(...args);
+      return args[0][1] === 'deployment' && args[0][2] === 'sub'
+        ? { ...result, stdout: JSON.stringify(parent) } : result;
+    };
+    await assert.rejects(deployInfrastructure(f.options, runner), /ARM rejected creation/);
+    assert.equal(f.calls.filter(call => call[4] === 'provision').length, 1);
+    assert.equal(f.calls.some(call => call[2] === 'delete'), false);
+    assert.match(f.receipt().attempts[0].error, /ARM rejected creation/);
+  });
+}
+
+test('failed subscription deployment read cannot authorize fallback', async t => {
+  const f = fixture(t, ['cluster']);
+  const runner: typeof run_tree = async (...args) => {
+    const result = await f.runner(...args);
+    return args[0][1] === 'deployment' && args[0][2] === 'sub'
+      ? { returncode: 1, stdout: '', stderr: 'Polling transport failed' } : result;
+  };
+  await assert.rejects(deployInfrastructure(f.options, runner), /ARM rejected creation.*Could not prove.*Polling transport failed/s);
+  assert.equal(f.calls.some(call => call[2] === 'delete'), false);
+  assert.match(f.receipt().attempts[0].error, /ARM rejected creation/);
 });
 
 for (const fault of ['other', 'missing-target', 'timeout'] as const) {

@@ -237,6 +237,10 @@ export async function deployInfrastructure(options: Options, runner: typeof run_
 }
 
 async function failedClusterOnly(config: StampConfig, az: (...args: string[]) => Promise<unknown>): Promise<boolean> {
+  const parentName = `arrowcol-sandbox-stamp-${config.stamp}`;
+  const parent = object(await az('deployment', 'sub', 'show', '--name', parentName), 'subscription deployment');
+  if (parent.name !== parentName ||
+      object(parent.properties, 'subscription deployment properties').provisioningState !== 'Failed') return false;
   const deployments = list(await az('deployment', 'group', 'list', '--resource-group', GROUP), 'group deployments');
   const names = [`arrowcol-sandbox-stamp-${config.stamp}`, `arrowcol-aks-stamp-${config.stamp}`];
   if (names.some(name => !deployments.some(item => item.name === name &&
