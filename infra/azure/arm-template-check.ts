@@ -5,12 +5,14 @@ import { Config, SCHEMA_EVOLUTION_GROUP } from './bootstrap.js';
 interface ArmResource {
   type: string;
   name: string;
+  scope?: string;
   dependsOn?: unknown[];
   condition?: string;
   properties?: Record<string, unknown>;
 }
 interface ArmTemplate {
   resources?: ArmResource[];
+  variables?: Record<string, unknown>;
   outputs?: Record<string, { value?: unknown }>;
 }
 
@@ -73,4 +75,19 @@ const evaluateStorageAccountId = (config: Config): string | null => config.readL
 assert.equal(evaluateStorageAccountId(isolated), null, 'isolated mode must not evaluate an empty Storage name');
 assert.equal(evaluateStorageAccountId(stamped),
   `${stamped.base}/providers/Microsoft.Storage/storageAccounts/${stamped.readLogAccount}`);
-console.log('Compiled Azure template Storage module evaluation passed.');
+const aksModule = resources.find(resource => resource.type === 'Microsoft.Resources/deployments' &&
+  String(resource.name).includes('arrowcol-aks-'));
+assert.ok(aksModule, 'compiled sandbox must contain the AKS module');
+const aksTemplate = aksModule.properties?.template as ArmTemplate;
+const runFederationRole = (aksTemplate.resources ?? []).find(resource =>
+  resource.type === 'Microsoft.Authorization/roleAssignments' && String(resource.name).includes('run-federation-contributor'));
+assert.ok(runFederationRole, 'runtime UAMI must be able to create and clean up its per-run federated credentials');
+assert.equal(runFederationRole.scope,
+  "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', parameters('sharedIdentityName'))]",
+  'FIC management permission must be scoped only to the single shared identity');
+assert.equal(runFederationRole.properties?.principalId,
+  "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', parameters('sharedIdentityName')), '2023-01-31').principalId]");
+assert.equal(runFederationRole.properties?.roleDefinitionId, "[variables('federatedCredentialContributorRole')]");
+assert.equal(aksTemplate.variables?.federatedCredentialContributorRole,
+  "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '7e559ce2-48d7-4b27-9128-fa1b247f1308')]");
+console.log('Compiled Azure template Storage module and identity-scoped run federation evaluation passed.');

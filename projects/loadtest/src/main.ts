@@ -565,7 +565,7 @@ async function benchmark(
   let failure: unknown;
   let phase = 'compose-validation';
   let stopSampler: (() => Promise<void>) | undefined;
-  let stopQapObserver: (() => Promise<void>) | undefined;
+  let stopQapObserver: ReturnType<typeof startQapObserver> | undefined;
   let stoppedMutators: StoppedMutator[] | undefined;
   let stackSql: SqlIdentity | undefined;
   const resultsDirectory = path.relative(workspace, path.join(directory, 'results'));
@@ -722,6 +722,10 @@ async function benchmark(
     }
     if (crash) step(`Quiver crash recovery evidence: ${resultsDirectory}/${QUIVER_RECOVERY_FILE}`);
     if (options.validate) {
+      phase = 'qap-observer-quiesce';
+      assert(stopQapObserver, 'Validated benchmark requires its live QAP observer');
+      step('Finishing live QAP observation before exclusive output qualification');
+      await stopQapObserver();
       phase = 'publication-drain';
       step('Draining publication while collector admin endpoints remain available');
       await runLocalLoadgen(context, 'drain', path.join(directory, 'results'), controller);
@@ -780,6 +784,9 @@ async function benchmark(
       });
       step(`kusto-explorer UI gate passed: ${gate.tables} tables and ${gate.rows} rows matched through the UI`);
       }
+      phase = 'final-qap-observation';
+      step('Recording final QAP observation after output qualification');
+      await stopQapObserver.sampleFinal();
     }
     if (stressOutcome.status === 'rejected') {
       phase = 'fixed-window-stress';

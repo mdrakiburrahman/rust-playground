@@ -16,6 +16,7 @@ var network = aksConfig.network
 var pool = aksConfig.systemPool
 var networkContributorRole = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4d97b98b-1d4f-4787-a291-c67834d212e7')
 var managedIdentityOperatorRole = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'f1a07417-d97a-45cb-824c-7a7467783830')
+var federatedCredentialContributorRole = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '7e559ce2-48d7-4b27-9128-fa1b247f1308')
 var acrPullRole = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '7f951dda-4ed3-4680-a7ca-43fe172d538d')
 var acrPushRole = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '8311e382-0749-4cb8-b61a-304f252e45ec')
 var readerRole = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'acdd72a7-3385-48ef-bd42-f606fba81ae7')
@@ -76,6 +77,12 @@ resource identityOperatorRole 'Microsoft.Authorization/roleAssignments@2022-04-0
   name: guid(sharedIdentity.id, sharedIdentity.id, 'managed-identity-operator')
   scope: sharedIdentity
   properties: { roleDefinitionId: managedIdentityOperatorRole, principalId: sharedIdentity.properties.principalId, principalType: 'ServicePrincipal' }
+}
+
+resource runFederationRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(sharedIdentity.id, sharedIdentity.id, 'run-federation-contributor')
+  scope: sharedIdentity
+  properties: { roleDefinitionId: federatedCredentialContributorRole, principalId: sharedIdentity.properties.principalId, principalType: 'ServicePrincipal' }
 }
 
 resource egressIpv4Prefix 'Microsoft.Network/publicIPPrefixes@2024-05-01' = {
