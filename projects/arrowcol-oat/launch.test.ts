@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises';
-import { createServer } from 'node:http';
+import { createServer, request as createHttpRequest } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -283,19 +283,41 @@ test('opens the existing local results in viewer-only mode without losing missin
     viewer = await startLocalViewer(configPath);
     assert.equal(new URL(viewer.url).hostname, '127.0.0.1');
 
-    const port = new URL(viewer.url).port;
-    const localhost = await fetch(viewer.url, {
-      headers: { host: `localhost:${port}`, origin: `http://localhost:${port}` },
+    const viewerUrl = viewer.url;
+    const port = new URL(viewerUrl).port;
+    const requestViewer = (headers: Record<string, string>) => new Promise<{
+      status: number | undefined;
+      text: string;
+    }>((resolve, reject) => {
+      const target = new URL(viewerUrl);
+      const request = createHttpRequest({
+        hostname: target.hostname,
+        port: Number(target.port),
+        path: target.pathname,
+        method: 'GET',
+        headers,
+        agent: false,
+      }, (response) => {
+        const chunks: Buffer[] = [];
+        response.on('data', (chunk: Buffer) => chunks.push(chunk));
+        response.on('end', () => resolve({
+          status: response.statusCode,
+          text: Buffer.concat(chunks).toString('utf8'),
+        }));
+      });
+      request.once('error', reject);
+      request.end();
     });
+    const localhost = await requestViewer({ host: `localhost:${port}`, origin: `http://localhost:${port}` });
     assert.equal(localhost.status, 200);
 
-    const invalidHost = await fetch(viewer.url, { headers: { host: `example.com:${port}` } });
+    const invalidHost = await requestViewer({ host: `example.com:${port}` });
     assert.equal(invalidHost.status, 400);
-    assert.equal(await invalidHost.text(), 'Invalid Host header');
+    assert.equal(invalidHost.text, 'Invalid Host header');
 
-    const invalidOrigin = await fetch(viewer.url, { headers: { origin: 'https://example.com' } });
+    const invalidOrigin = await requestViewer({ origin: 'https://example.com' });
     assert.equal(invalidOrigin.status, 403);
-    assert.equal(await invalidOrigin.text(), 'Origin not allowed');
+    assert.equal(invalidOrigin.text, 'Origin not allowed');
 
     const page = await fetch(viewer.url);
     assert.equal(page.status, 200);
