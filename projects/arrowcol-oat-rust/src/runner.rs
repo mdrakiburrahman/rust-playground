@@ -988,16 +988,66 @@ async fn start_aks_client_job(
     let job_name = format!("oat-{run_label}-{table_label}-c{client_index}");
     let run_seconds = i64::try_from(config.timing_budget()?.client_job_lifetime_seconds)
         .context("OAT client Job lifetime exceeds Kubernetes range")?;
+    let job = build_aks_client_job(AksClientJobSpec {
+        namespace: &config.namespace,
+        client_image: &config.dmv_client_image,
+        router_auth_secret_name: &config.edge_secret_name,
+        schedule_configmap_name: &platform.schedule_configmap_name,
+        run_id,
+        run_label: &run_label,
+        job_name: &job_name,
+        args,
+        run_seconds,
+    });
+    let payload = serde_json::to_vec(&job)?;
+    kubectl(
+        config,
+        vec!["apply", "--namespace", &config.namespace, "-f", "-"],
+        Some(payload),
+    )
+    .await
+    .with_context(|| format!("create AKS DMV client Job {job_name}"))?;
+    Ok(ClientHandle {
+        client_id: format!("{run_id}:{table}:{client_index}"),
+        table: table.to_owned(),
+        process: ClientProcess::Aks { job_name },
+    })
+}
+
+struct AksClientJobSpec<'a> {
+    namespace: &'a str,
+    client_image: &'a str,
+    router_auth_secret_name: &'a str,
+    schedule_configmap_name: &'a str,
+    run_id: &'a str,
+    run_label: &'a str,
+    job_name: &'a str,
+    args: &'a [String],
+    run_seconds: i64,
+}
+
+fn build_aks_client_job(spec: AksClientJobSpec<'_>) -> Value {
+    let AksClientJobSpec {
+        namespace,
+        client_image,
+        router_auth_secret_name,
+        schedule_configmap_name,
+        run_id,
+        run_label,
+        job_name,
+        args,
+        run_seconds,
+    } = spec;
     let labels = json!({
         "app": "arrowcol-oat-client",
         "arrowcol-oat-run": run_label,
     });
-    let job = json!({
+    json!({
         "apiVersion": "batch/v1",
         "kind": "Job",
         "metadata": {
             "name": job_name,
-            "namespace": config.namespace,
+            "namespace": namespace,
             "labels": labels,
         },
         "spec": {
@@ -1024,13 +1074,13 @@ async fn start_aks_client_job(
                     }],
                     "containers": [{
                         "name": "client",
-                        "image": config.dmv_client_image,
+                        "image": client_image,
                         "imagePullPolicy": "IfNotPresent",
                         "args": args,
-                        "env": [{
-                            "name": "ARROWCOL_OAT_RUN_ID",
-                            "value": run_id,
-                        }],
+                        "env": [
+                            { "name": "ARROWCOL_OAT_RUN_ID", "value": run_id },
+                            { "name": "LOADTEST_INTERNAL_SECRET_FILE", "value": "/run/secrets/internal-hmac" },
+                        ],
                         "resources": {
                             "requests": { "cpu": "250m", "memory": "256Mi" },
                             "limits": { "cpu": "2", "memory": "2Gi" },
@@ -1041,6 +1091,11 @@ async fn start_aks_client_job(
                             "subPath": "edge-hmac",
                             "readOnly": true,
                         }, {
+                            "name": "internal-hmac",
+                            "mountPath": "/run/secrets/internal-hmac",
+                            "subPath": "internal-hmac",
+                            "readOnly": true,
+                        }, {
                             "name": "oat-schedule",
                             "mountPath": "/oat-schedule",
                             "readOnly": true,
@@ -1049,32 +1104,25 @@ async fn start_aks_client_job(
                     "volumes": [{
                         "name": "edge-hmac",
                         "secret": {
-                            "secretName": config.edge_secret_name,
+                            "secretName": router_auth_secret_name,
                             "items": [{ "key": "edge-hmac", "path": "edge-hmac" }],
+                        },
+                    }, {
+                        "name": "internal-hmac",
+                        "secret": {
+                            "secretName": router_auth_secret_name,
+                            "items": [{ "key": "internal-hmac", "path": "internal-hmac" }],
                         },
                     }, {
                         "name": "oat-schedule",
                         "configMap": {
-                            "name": platform.schedule_configmap_name,
+                            "name": schedule_configmap_name,
                             "items": [{ "key": "schedule", "path": "schedule" }],
                         },
                     }],
                 },
             },
         },
-    });
-    let payload = serde_json::to_vec(&job)?;
-    kubectl(
-        config,
-        vec!["apply", "--namespace", &config.namespace, "-f", "-"],
-        Some(payload),
-    )
-    .await
-    .with_context(|| format!("create AKS DMV client Job {job_name}"))?;
-    Ok(ClientHandle {
-        client_id: format!("{run_id}:{table}:{client_index}"),
-        table: table.to_owned(),
-        process: ClientProcess::Aks { job_name },
     })
 }
 
@@ -5725,6 +5773,52 @@ fn platform_host_label(kind: crate::config::OatMode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aks_client_job_mounts_internal_identity_key_for_direct_catalog_ddl() -> Result<()> {
+        let job = build_aks_client_job(AksClientJobSpec {
+            namespace: "oat-test",
+            client_image: "example.invalid/client@sha256:abc",
+            router_auth_secret_name: "arrowcol-router-auth",
+            schedule_configmap_name: "oat-test-schedule",
+            run_id: "00000000-0000-0000-0000-000000000001",
+            run_label: "00000000",
+            job_name: "oat-00000000-table-c0",
+            args: &["--endpoint".to_owned(), "http://arrowcol-router:50050".to_owned()],
+            run_seconds: 3_600,
+        });
+        let container = &job["spec"]["template"]["spec"]["containers"][0];
+        let mounts = container["volumeMounts"].as_array().context("client volume mounts")?;
+        let identity_mount = mounts
+            .iter()
+            .find(|mount| mount["mountPath"] == "/run/secrets/internal-hmac")
+            .context("mounted internal identity key")?;
+        assert_eq!(identity_mount["name"], "internal-hmac");
+        assert_eq!(identity_mount["subPath"], "internal-hmac");
+        assert_eq!(identity_mount["readOnly"], true);
+        assert_eq!(
+            container["env"]
+                .as_array()
+                .context("client environment")?
+                .iter()
+                .find(|entry| entry["name"] == "LOADTEST_INTERNAL_SECRET_FILE")
+                .context("loadgen internal identity key path")?["value"],
+            "/run/secrets/internal-hmac"
+        );
+        let volumes = job["spec"]["template"]["spec"]["volumes"]
+            .as_array()
+            .context("client volumes")?;
+        let identity_volume = volumes
+            .iter()
+            .find(|volume| volume["name"] == "internal-hmac")
+            .context("internal identity secret volume")?;
+        assert_eq!(identity_volume["secret"]["secretName"], "arrowcol-router-auth");
+        assert_eq!(
+            identity_volume["secret"]["items"][0],
+            json!({ "key": "internal-hmac", "path": "internal-hmac" })
+        );
+        Ok(())
+    }
 
     #[test]
     fn failed_clients_preserve_pinning_evidence_without_masking_unrelated_failures() -> Result<()> {
