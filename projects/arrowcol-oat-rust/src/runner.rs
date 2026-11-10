@@ -1492,11 +1492,11 @@ fn finish_matrix_cell(
                 .failure
                 .as_ref()
                 .map_or_else(|| detail.clone(), |failure| format!("{failure}; {detail}"));
-            row.failure = Some(failure.clone());
-            // This JSON was constructed in result_rows; retain the failure beside the original tunables.
+            row.failure = Some(failure);
+            // Public Parquet carries fixed categories, never raw command output.
             match serde_json::from_str::<Value>(&row.tunables_json) {
                 Ok(mut tunables) => {
-                    tunables["failure"] = Value::String(failure);
+                    tunables["cleanup_failed"] = Value::Bool(true);
                     row.tunables_json = tunables.to_string();
                 }
                 Err(cause) => {
@@ -1802,9 +1802,9 @@ fn result_rows(
         "rows_per_table": config.rows_per_table,
         "tables": &assigned_tables,
         "warmup_seconds": config.warmup_seconds,
-        "failure": client_run.failure,
-        "pinning_violation": client_run.pinning.violation,
-        "pinning_verification_error": client_run.pinning.verification_error,
+        "failure": client_run.failure.as_ref().map(|_| "measurement_or_observation_failed"),
+        "pinning_violation": client_run.pinning.violation.is_some(),
+        "pinning_verification_error": client_run.pinning.verification_error.as_ref().map(|_| "ownership_verification_failed"),
     }))?;
     let details = [
         client_run.failure.clone(),
@@ -1921,9 +1921,12 @@ async fn run_clients(
     match run_clients_inner(config, project_run_id, tables, platform, &mut pinning).await {
         Ok(report) => Ok(report),
         Err(error) => {
-            let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?;
-            let endpoint = platform.router_metrics_endpoint(config)?;
-            let sample = sample_table_owners(&client, &endpoint, tables).await;
+            let sample = async {
+                let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?;
+                let endpoint = platform.router_metrics_endpoint(config)?;
+                sample_table_owners(&client, &endpoint, tables).await
+            }
+            .await;
             let pinning = failed_client_pinning_report(&error, sample, tables, pinning);
             tracing::error!(run_id = project_run_id, error = %error, "OAT client run failed; incomplete measurements are unavailable");
             Ok(ClientRun {

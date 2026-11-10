@@ -113,7 +113,14 @@ mod failure_evidence_tests {
             .downcast_ref::<UInt64Array>()
             .context("uint64")?;
         assert_eq!(measured.value(0), 0);
-        assert!(rows[1].tunables_json.contains("source disconnected"));
+        assert!(
+            rows[1]
+                .failure
+                .as_deref()
+                .is_some_and(|error| error.contains("source disconnected"))
+        );
+        assert!(rows[1].tunables_json.contains("measurement_or_observation_failed"));
+        assert!(!rows[1].tunables_json.contains("source disconnected"));
         Ok(())
     }
 
@@ -160,7 +167,8 @@ mod failure_evidence_tests {
         assert!(!rows[0].pinning_ok);
         assert!(rows[0].pinning_error.is_none());
         assert_eq!(rows[0].rows, Some(60));
-        assert!(rows[0].tunables_json.contains("HTTP timeout"));
+        assert!(rows[0].tunables_json.contains("ownership_verification_failed"));
+        assert!(!rows[0].tunables_json.contains("HTTP timeout"));
         assert!(
             finish_matrix_cell(&config, "orchestration", "unknown", 1, 2, Ok(rows), Ok(()))
                 .error
@@ -253,7 +261,8 @@ mod failure_evidence_tests {
             assert_ne!(outcome.rows[0].run_id, failed_run);
             let error = publish_matrix_outcome(&config, outcome)
                 .await
-                .expect_err("overall failure remains fatal");
+                .err()
+                .context("overall failure remains fatal")?;
             let detail = format!("{error:#}");
             assert!(detail.contains("cleanup custody unresolved"));
             if !cleanup_only {
@@ -276,7 +285,10 @@ mod failure_evidence_tests {
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .context("string")?;
-            assert!(tunables.value(1).contains("cleanup custody unresolved"));
+            let public_failure: Value = serde_json::from_str(tunables.value(1))?;
+            assert_eq!(public_failure["cleanup_failed"], true);
+            assert!(!tunables.value(1).contains("cleanup custody unresolved"));
+            assert!(!tunables.value(1).contains("second cell failed"));
             for name in [
                 "results.parquet",
                 "website.parquet",
@@ -309,7 +321,8 @@ mod failure_evidence_tests {
         );
         let error = publish_matrix_outcome(&config, outcome)
             .await
-            .expect_err("publication must fail");
+            .err()
+            .context("publication must fail")?;
         let detail = format!("{error:#}");
         for expected in [
             "client evidence failure",

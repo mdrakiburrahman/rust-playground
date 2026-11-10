@@ -27,8 +27,11 @@ schema. Readers must accept null measurements, including failed-cell records.
 
 Completed earlier matrix cells are published even when a later cell or cleanup
 fails, and the overall run still fails. Failed cells retain their run/table
-identity and failure details in `tunables_json`; incomplete cell measurements
-remain null. Cleanup failures after completed measurement retain those values.
+identity and fixed failure categories in `tunables_json`; incomplete cell
+measurements remain null. Cleanup failures after completed measurement retain
+those values and set `cleanup_failed: true`. Original diagnostic errors remain
+in the overall failed-run error chain/receipt, not the public Parquet mirror:
+arbitrary command output must not be published as sanitized benchmark data.
 `status` is `succeeded`, `failed` or `pinning_violation`. A failed ownership
 observation is unverified (`failed`, `pinning_ok: false`), not proof of an
 ownership violation; only observed invariant loss or an explicit router
