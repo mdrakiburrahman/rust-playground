@@ -60,7 +60,13 @@ test('isolated integrated topology pins images, WI, identity, probes and pooled 
   assert.equal(router.routing.lease_ttl_ms, 3_600_000);
   assert.equal(router.auth.edge_secret_file, '/run/auth/edge-hmac');
   assert.equal(objects.some((o) => o.kind === 'Ingress' || o.spec?.type === 'LoadBalancer'), false);
-  assert.equal(get('Deployment', 'arrowcol-catalog').spec.template.spec.containers[0].args.at(-1), '--ingestion-layout');
+  const catalog = get('Deployment', 'arrowcol-catalog').spec.template.spec;
+  assert.ok(catalog.containers[0].args.includes('--ingestion-layout'));
+  assert.deepEqual(catalog.containers[0].args.slice(-2), ['--ddl-identity-secret-file', '/run/auth/internal-hmac']);
+  assert.ok(catalog.containers[0].volumeMounts.some((mount: any) =>
+    mount.name === 'auth' && mount.mountPath === '/run/auth' && mount.readOnly));
+  assert.ok(catalog.volumes.some((volume: any) =>
+    volume.name === 'auth' && volume.secret.secretName === 'arrowcol-router-auth'));
   const rules = get('NetworkPolicy', 'flight-router-only').spec.ingress;
   assert.deepEqual(rules[0].from, [{ podSelector: { matchLabels: { app: 'arrowcol-router' } } }]);
   const clientIngress = get('NetworkPolicy', 'router-oat-client-ingress').spec.ingress;

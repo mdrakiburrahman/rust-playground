@@ -76,7 +76,11 @@ services:
     pull_policy: never
     init: true
     user: "${LOADTEST_UID:?Run through Nx}:${LOADTEST_GID:?Run through Nx}"
-    command: ["--listen", "0.0.0.0:8817", "--warehouse-root", "${LOADTEST_DATAFLOW_DELTA_ROOT:-/delta/dataflow}", "--state-dir", "/state"]
+    command: ["--listen", "0.0.0.0:8817", "--warehouse-root", "${LOADTEST_DATAFLOW_DELTA_ROOT:-/delta/dataflow}",
+      "--state-dir", "/state", "--ddl-identity-secret-file", "/run/secrets/internal-hmac"]
+    secrets:
+      - source: internal_hmac
+        target: internal-hmac
     ports:
       - "${LOADTEST_BIND_HOST:-127.0.0.1}:${LOADTEST_CATALOG_PORT:-18817}:8817"
     environment:

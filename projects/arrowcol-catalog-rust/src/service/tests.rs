@@ -1,5 +1,6 @@
 use std::{sync::atomic::Ordering, time::Duration};
 
+use crate::{DdlIdentityPolicy, DdlIdentityVerifier};
 use arrow_flight::{flight_service_server::FlightServiceServer, sql::client::FlightSqlServiceClient};
 use arrowcol_catalog::{CatalogStore, SchemaAlignmentPlan, SchemaValidator};
 use arrowcol_catalog_client::{CatalogClient, RemoteCatalogClient};
@@ -227,6 +228,51 @@ async fn commit_publication_crash_and_old_seed_do_not_rollback_delta() -> Result
 }
 
 #[tokio::test]
+async fn flight_sql_ddl_requires_signed_identity_before_mutating_catalog() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let service = CatalogService::open(config(root.path())).await?;
+    let verifier = DdlIdentityVerifier::from_secret(b"catalog-integration-key-at-least-32-bytes".to_vec())?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}", listener.local_addr()?);
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    let server_service = service.clone();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(FlightServiceServer::new(
+                server_service.flight_service_with_ddl_identity(DdlIdentityPolicy::require_signed(verifier)),
+            ))
+            .serve_with_incoming_shutdown(tokio_stream::wrappers::TcpListenerStream::new(listener), async {
+                let _ = stopped.await;
+            })
+            .await
+    });
+    let channel = tonic::transport::Endpoint::from_shared(endpoint)?.connect().await?;
+    let mut flight = arrow_flight::flight_service_client::FlightServiceClient::new(channel);
+    let command = CommandStatementUpdate {
+        query: CREATE.to_owned(),
+        transaction_id: None,
+    };
+    let error = flight
+        .do_put(futures::stream::iter([arrow_flight::FlightData {
+            flight_descriptor: Some(FlightDescriptor {
+                r#type: arrow_flight::flight_descriptor::DescriptorType::Cmd as i32,
+                cmd: command.as_any().encode_to_vec().into(),
+                path: Vec::new(),
+            }),
+            ..arrow_flight::FlightData::default()
+        }]))
+        .await
+        .err()
+        .context("unsigned DDL must be rejected")?;
+    assert_eq!(error.code(), tonic::Code::Unauthenticated);
+    let identity = name_identity(&["arrowcol".into(), "default".into(), "events".into()])?;
+    assert!(service.store.current_schema(&identity).await?.is_none());
+    let _ = shutdown.send(());
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
 async fn flight_sql_and_warm_cache_count_actual_catalog_calls() -> Result<()> {
     let root = tempfile::tempdir()?;
     let service = CatalogService::open(config(root.path())).await?;
@@ -236,7 +282,9 @@ async fn flight_sql_and_warm_cache_count_actual_catalog_calls() -> Result<()> {
     let server_service = service.clone();
     let server = tokio::spawn(async move {
         tonic::transport::Server::builder()
-            .add_service(FlightServiceServer::new(server_service.flight_service()))
+            .add_service(FlightServiceServer::new(
+                server_service.flight_service_with_ddl_identity(DdlIdentityPolicy::dev_only_allow_unsigned()),
+            ))
             .add_service(SchemaCatalogServer::new(server_service))
             .serve_with_incoming_shutdown(tokio_stream::wrappers::TcpListenerStream::new(listener), async {
                 let _ = stopped.await;
@@ -390,7 +438,9 @@ async fn flight_sql_and_warm_cache_count_actual_catalog_calls() -> Result<()> {
     let server_service = restarted.clone();
     let server = tokio::spawn(async move {
         tonic::transport::Server::builder()
-            .add_service(FlightServiceServer::new(server_service.flight_service()))
+            .add_service(FlightServiceServer::new(
+                server_service.flight_service_with_ddl_identity(DdlIdentityPolicy::dev_only_allow_unsigned()),
+            ))
             .add_service(SchemaCatalogServer::new(server_service))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await

@@ -185,6 +185,14 @@ test('catalog and DFE share the same Delta root', () => {
   assert.equal(root('arrowcol-catalog'), root('dataflow-1'));
 });
 
+test('catalog DDL verifier uses the shared internal HMAC secret', () => {
+  const catalog = compose.services['arrowcol-catalog'];
+  assert.ok(catalog.command.includes('--ddl-identity-secret-file'));
+  assert.ok(catalog.command.includes('/run/secrets/internal-hmac'));
+  assert.ok(catalog.secrets?.some(secret =>
+    typeof secret !== 'string' && secret.source === 'internal_hmac' && secret.target === 'internal-hmac'));
+});
+
 test('host loadgen uses default-loopback ports while container loadgen uses Compose endpoints', () => {
   assert.deepEqual(compose.services['arrowcol-catalog'].ports,
     [`${bindHost}:\${LOADTEST_CATALOG_PORT:-18817}:8817`]);

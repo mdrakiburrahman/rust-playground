@@ -184,12 +184,16 @@ export async function renderRuntime(input: unknown, phase: Phase): Promise<Resou
     service('arrowcol-catalog', 8817), service('arrowcol-router', 50050),
     deployment('arrowcol-catalog', [{
       name: 'catalog', image: c.images.catalog, securityContext: security,
-      args: ['--warehouse-root', c.deltaRoot, '--state-dir', '/data/catalog', '--ingestion-layout'],
+      args: ['--warehouse-root', c.deltaRoot, '--state-dir', '/data/catalog', '--ingestion-layout',
+        '--ddl-identity-secret-file', '/run/auth/internal-hmac'],
       env: cloudEnv, ports: [{ containerPort: 8817 }], resources: resources('500m', '1Gi', '2', '4Gi'),
       startupProbe: { ...execProbe(['/usr/local/bin/arrowcol-catalog-rust', '--healthcheck']), failureThreshold: 60 },
       readinessProbe: execProbe(['/usr/local/bin/arrowcol-catalog-rust', '--healthcheck']),
-      volumeMounts: [mount('state', '/data', false)],
-    }], [{ name: 'state', persistentVolumeClaim: { claimName: 'arrowcol-catalog' } }], true),
+      volumeMounts: [mount('state', '/data', false), mount('auth', '/run/auth')],
+    }], [
+      { name: 'state', persistentVolumeClaim: { claimName: 'arrowcol-catalog' } },
+      secretVolume('auth', 'arrowcol-router-auth'),
+    ], true),
     deployment('arrowcol', [{
       name: 'dataflow', image: c.images.dataflow, securityContext: security,
       args: ['--config', '/etc/oat/dataflow.yaml', '--num-cores', '1'],
