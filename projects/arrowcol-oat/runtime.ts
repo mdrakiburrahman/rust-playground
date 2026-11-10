@@ -279,6 +279,10 @@ export async function generatePrivateInputs(input: PrivateInputs): Promise<{
   runtimeConfigPath: string; bootstrapEnvPath: string; aksConfigPath: string;
 }> {
   const runtime = validateRuntime(input.runtime);
+  const qapDatabase = input.bootstrapValues.AZURE_KUSTO_EXPERIMENT_DATABASE;
+  if (!qapDatabase || !/^[a-z][a-z0-9-]{1,62}$/.test(qapDatabase)) {
+    throw new Error('The generated experiment database is required for the AKS QAP target.');
+  }
   if (Object.values(runtime.images).some(image => !image.startsWith(`arrowcollector${runtime.stamp}.azurecr.io/`))) {
     throw new Error('All runtime images must use the selected stamp registry.');
   }
@@ -352,7 +356,7 @@ export async function generatePrivateInputs(input: PrivateInputs): Promise<{
     ...input.oatTemplate,
     platform: { ...platform, runtime_config_file: runtimeConfigPath, bootstrap_env_file: bootstrapEnvPath },
     stamp: runtime.stamp, kubectl_context: `arrow-collector-${runtime.stamp}`,
-    qap_endpoint: input.qapEndpoint, qap_database: 'arrowcol', dmv_client_image: input.clientImage,
+    qap_endpoint: input.qapEndpoint, qap_database: qapDatabase, dmv_client_image: input.clientImage,
     result_url: `abfss://experiments@${account}.dfs.core.windows.net/arrowcol-oat/results.parquet`,
     website_url: `abfss://$web@${account}.dfs.core.windows.net/results.parquet`,
   }, null, 2)}\n`);

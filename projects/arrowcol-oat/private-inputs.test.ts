@@ -31,7 +31,8 @@ async function fixture(t: test.TestContext): Promise<PrivateInputs> {
     },
   };
   return { directory, runtime, tenantId, resetGeneration: generation, assertion: assertion(),
-    bootstrapValues: { AZURE_SUBSCRIPTION_ID: runtime.subscriptionId, AZURE_STAMP: '89152' },
+    bootstrapValues: { AZURE_SUBSCRIPTION_ID: runtime.subscriptionId, AZURE_STAMP: '89152',
+      AZURE_KUSTO_EXPERIMENT_DATABASE: 'experimentqap' },
     clientImage: `${registry}/arrowcol-oat-client@sha256:${digest}`,
     qapEndpoint: 'https://arrow-collector-89152.canadacentral.kusto.windows.net',
     oatTemplate: JSON.parse(await readFile(resolve(ROOT,
@@ -54,7 +55,7 @@ test('generates private inputs from authoritative generation and pins the comple
   assert.equal(env.AZURE_FEDERATED_TOKEN_FILE, resolve(input.directory, 'secrets/publisher-assertion.jwt'));
   assert.equal((await readFile(env.AZURE_FEDERATED_TOKEN_FILE!, 'utf8')).trim(), input.assertion);
   const config = JSON.parse(await readFile(files.aksConfigPath, 'utf8'));
-  assert.equal(config.qap_database, 'arrowcol');
+  assert.equal(config.qap_database, 'experimentqap');
   assert.equal(config.stamp, '89152');
   assert.equal(config.kubectl_context, 'arrow-collector-89152');
   assert.equal(config.dmv_client_image, input.clientImage);
@@ -94,6 +95,7 @@ test('rejects expired or malformed assertions, mutable images and mismatched sta
   await assert.rejects(generatePrivateInputs({ ...input, assertion: 'do-not-echo-this-token' }), /invalid host federation/);
   await assert.rejects(generatePrivateInputs({ ...input, assertion: 'header.bad.signature' }), /invalid host assertion claims/);
   await assert.rejects(generatePrivateInputs({ ...input, clientImage: 'latest' }), /pinned by manifest digest/);
+  await assert.rejects(generatePrivateInputs({ ...input, bootstrapValues: {} }), /generated experiment database/);
   await assert.rejects(generatePrivateInputs({ ...input, runtime: { ...input.runtime,
     images: { ...input.runtime.images, dataflow: `other.azurecr.io/dataflow@sha256:${digest}` } } }), /selected stamp registry/);
   await assert.rejects(generatePrivateInputs({ ...input, qapEndpoint: 'https://arrow-collector-00000.canadacentral.kusto.windows.net' }), /selected stamp/);
