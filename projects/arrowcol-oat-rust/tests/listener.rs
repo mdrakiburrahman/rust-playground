@@ -1,5 +1,5 @@
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -16,7 +16,9 @@ fn start(listen: &str, allow_remote: bool) -> std::io::Result<Server> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_arrowcol-oat-rust"));
     command
         .args(["--listen", listen])
-        .stdout(Stdio::null())
+        .env("RUST_LOG", "info")
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if allow_remote {
         command.arg("--allow-insecure-non-loopback");
@@ -50,10 +52,35 @@ fn non_loopback_api_requires_explicit_opt_in_and_loopback_still_works() -> std::
         );
     }
     for (host, allow_remote) in [("127.0.0.1", false), ("0.0.0.0", true)] {
-        let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
-        let mut server = start(&format!("{host}:{port}"), allow_remote)?;
+        let mut server = start(&format!("{host}:0"), allow_remote)?;
+        let stdout = server.0.stdout.take().expect("server stdout is piped");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                match line {
+                    Ok(line) if line.contains("ArrowCol OAT server listening") => {
+                        let _ = sender.send(line);
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+        let line = receiver
+            .recv_timeout(Duration::from_secs(3))
+            .expect("server must report its bound address");
+        reader.join().expect("server log reader panicked");
+        let bound: SocketAddr = line
+            .split("address=")
+            .nth(1)
+            .and_then(|value| value.split_whitespace().next())
+            .expect("listener log must contain its address")
+            .parse()
+            .expect("listener log must contain a socket address");
+        assert_ne!(bound.port(), 0, "server must report its actual assigned port");
         let deadline = Instant::now() + Duration::from_secs(3);
-        let address = SocketAddr::from(([127, 0, 0, 1], port));
+        let address = SocketAddr::from(([127, 0, 0, 1], bound.port()));
         let mut stream = loop {
             if let Ok(stream) = TcpStream::connect_timeout(&address, Duration::from_millis(50)) {
                 break stream;

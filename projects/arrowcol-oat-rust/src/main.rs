@@ -65,7 +65,7 @@ async fn main() -> Result<()> {
         .route("/runs/{id}", get(get_run))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
-    tracing::info!(address = %args.listen, "ArrowCol OAT server listening");
+    tracing::info!(address = %listener.local_addr()?, "ArrowCol OAT server listening");
     axum::serve(listener, app).await?;
     Ok(())
 }
