@@ -200,6 +200,13 @@ export async function main(args: string[], runner: typeof run_tree = run_tree): 
     }
   }
   const config = await readOatConfigForMode(configPath, mode);
+  if (mode === 'aks') {
+    const subscriptionId = process.env.AZURE_SUBSCRIPTION_ID;
+    if (!subscriptionId || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(subscriptionId)) {
+      throw new Error('Validated selected Azure subscription is missing or invalid; rerun AKS setup.');
+    }
+    config.subscriptionId = subscriptionId;
+  }
   if (requestedServerUrl) {
     const code = await reportDataFlowRun(
       (progress) => launchOat(configPath, requestedServerUrl, pollValue, fetch, progress, mode),
