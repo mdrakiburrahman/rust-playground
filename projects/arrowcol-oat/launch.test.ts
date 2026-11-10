@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { pathToFileURL } from 'node:url';
 import {
-  buildOwnedServer, launchOat, main, readOatConfigForMode, resolveOatConfigPath, sendViewerFile,
+  buildOwnedServer, cleanupLocalComposeProjects, launchOat, main, readOatConfigForMode, resolveOatConfigPath, sendViewerFile,
   startLocalServer, startLocalViewer, stopLocalServer,
 } from './launch.js';
 
@@ -323,4 +323,86 @@ test('CLI help is available and unknown options fail as usage errors', async () 
     main(['--not-a-real-option', '--config', '/missing-oat-config.json']),
     (error: unknown) => error instanceof Error && error.message === 'Unknown option: --not-a-real-option' && 'exitCode' in error && error.exitCode === 2,
   );
+});
+
+
+test('local cleanup removes only the Compose project derived from the supplied cell UUID', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-cleanup-'));
+  const runId = '123e4567-e89b-42d3-a456-426614174000';
+  const stateRoot = path.join(directory, 'state');
+  const stateDir = path.join(stateRoot, runId);
+  await mkdir(stateDir, { recursive: true });
+  const project = 'arrowcol-oat-quick-123e4567';
+  const calls: string[][] = [];
+  const docker = (args: string[]): string => {
+    calls.push(args);
+    const joined = args.join(' ');
+    if (joined === 'ps -aq --filter label=com.docker.compose.project') return 'container-target\ncontainer-other\n';
+    if (joined === 'network ls -q --filter label=com.docker.compose.project') return 'network-target\nnetwork-other\n';
+    if (joined === 'volume ls -q --filter label=com.docker.compose.project') return 'volume-target\nvolume-other\n';
+    if (args[0] === 'inspect' || args[0] === 'network' && args[1] === 'inspect' || args[0] === 'volume' && args[1] === 'inspect') {
+      const id = args.at(-1);
+      return id?.endsWith('target') ? project : 'arrowcol-oat-quick-deadbeef';
+    }
+    if (joined.includes('label=com.docker.compose.project=' + project)) return joined.startsWith('ps ') ? 'container-target\n' : joined.startsWith('network ls') ? 'network-target\n' : 'volume-target\n';
+    return '';
+  };
+  try {
+    const projects = await cleanupLocalComposeProjects({
+      platform: { compose_project: 'arrowcol-oat-quick', compose_state_root: stateRoot },
+    }, runId, docker);
+    assert.deepEqual(projects, [project]);
+    assert.ok(calls.some(args => args[0] === 'rm' && args.includes('container-target')));
+    assert.ok(calls.some(args => args[0] === 'network' && args.includes('network-target')));
+    assert.ok(calls.some(args => args[0] === 'volume' && args.includes('volume-target')));
+    assert.ok(calls.filter(args => args[0] === 'rm' || args[0] === 'network' && args[1] === 'rm' || args[0] === 'volume' && args[1] === 'rm').every(args => !args.includes('container-other') && !args.includes('network-other') && !args.includes('volume-other')));
+    await assert.rejects(stat(stateDir), { code: 'ENOENT' });
+    await assert.rejects(cleanupLocalComposeProjects({ platform: { compose_project: 'arrowcol-oat-quick' } }, 'not-a-uuid', docker), /canonical OAT cell run UUID/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+
+test('local interruption requests cancellation and waits for the server to finish cleanup', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-cancel-'));
+  const configPath = path.join(directory, 'oat.json');
+  await writeFile(configPath, JSON.stringify({
+    platform: { kind: 'local', local: { bind_host: '127.0.0.1', endpoint_host: '127.0.0.1' } },
+  }));
+  const requests: string[] = [];
+  let status: { id: string; state: string; progress: string; result_count: number; error: string | null } = { id: 'run-a', state: 'running', progress: 'starting', result_count: 0, error: null };
+  const server = createServer((request, response) => {
+    requests.push(request.method + ' ' + request.url);
+    response.setHeader('content-type', 'application/json');
+    if (request.method === 'POST' && request.url === '/runs') {
+      response.writeHead(202).end(JSON.stringify(status));
+    } else if (request.method === 'POST' && request.url === '/runs/run-a/cancel') {
+      status = { ...status, state: 'cancelled', progress: 'local resources cleaned', error: 'run cancelled by request' };
+      response.writeHead(202).end();
+    } else {
+      response.end(JSON.stringify(status));
+    }
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10);
+  try {
+    await assert.rejects(
+      launchOat(configPath, 'http://127.0.0.1:' + address.port, 1, fetch, () => {}, 'local', () => '127.0.0.1', controller.signal),
+      /run cancelled by request/,
+    );
+    assert.ok(requests.includes('POST /runs/run-a/cancel'));
+    assert.ok(requests.some(request => request === 'GET /runs/run-a'));
+    assert.equal(status.state, 'cancelled');
+  } finally {
+    clearTimeout(timer);
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    await rm(directory, { recursive: true, force: true });
+  }
 });

@@ -1282,7 +1282,12 @@ async fn cancel_aks_client_job(config: &OatConfig, handle: &ClientHandle) -> Res
 ///
 /// Returns an error if configuration, Kubernetes operations, measurement, restoration,
 /// or result publication fails.
-pub async fn execute(config: OatConfig, id: &str, state: Arc<AppState>, cancellation: watch::Receiver<bool>) -> Result<usize> {
+pub async fn execute(
+    config: OatConfig,
+    id: &str,
+    state: Arc<AppState>,
+    cancellation: watch::Receiver<bool>,
+) -> Result<usize> {
     config.validate()?;
     state
         .update(id, |status| {
@@ -1292,7 +1297,7 @@ pub async fn execute(config: OatConfig, id: &str, state: Arc<AppState>, cancella
         })
         .await;
 
-    let outcome = run_matrix(&config, id, state, cancellation).await;
+    let outcome = run_matrix(&config, id, Arc::clone(&state), cancellation).await;
 
     state
         .update(id, |status| {
@@ -1337,7 +1342,6 @@ async fn run_matrix(
                 run_id,
                 replicas,
                 concurrency,
-                Arc::clone(&state),
                 cancellation.clone(),
             )
         },
@@ -1399,7 +1403,6 @@ async fn run_isolated_cell(
     run_id: String,
     replicas: u32,
     concurrency: u32,
-    state: Arc<AppState>,
     mut cancellation: watch::Receiver<bool>,
 ) -> MatrixOutcome {
     let mut platform = match platform_for_run(&config, &run_id) {

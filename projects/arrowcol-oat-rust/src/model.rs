@@ -70,7 +70,13 @@ impl AppState {
             return Err(CancelRunError::NotActive);
         }
         drop(runs);
-        let sender = self.cancel_senders.lock().await.get(id).cloned().ok_or(CancelRunError::NotActive)?;
+        let sender = self
+            .cancel_senders
+            .lock()
+            .await
+            .get(id)
+            .cloned()
+            .ok_or(CancelRunError::NotActive)?;
         sender.send_replace(true);
         Ok(())
     }
@@ -107,5 +113,50 @@ mod tests {
         assert!(state.try_start_run().is_none());
         drop(first);
         assert!(state.try_start_run().is_some());
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    fn status(id: &str) -> RunStatus {
+        RunStatus {
+            id: id.to_owned(),
+            state: RunState::Queued,
+            progress: "queued".to_owned(),
+            result_count: 0,
+            error: None,
+            started_at_unix_ms: unix_time_ms(),
+            finished_at_unix_ms: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_is_local_only_and_signals_the_run() {
+        let state = AppState::default();
+        state.runs.lock().await.insert("local".to_owned(), status("local"));
+        state.runs.lock().await.insert("aks".to_owned(), status("aks"));
+        let local = state.register_run_cancel("local", true).await;
+        let aks = state.register_run_cancel("aks", false).await;
+
+        state.request_local_cancel("local").await.unwrap();
+        assert!(*local.borrow());
+        assert_eq!(state.request_local_cancel("aks").await, Err(CancelRunError::NotLocal));
+        assert!(!*aks.borrow());
+        assert_eq!(
+            state.request_local_cancel("missing").await,
+            Err(CancelRunError::NotFound)
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_local_run_cannot_be_cancelled_again() {
+        let state = AppState::default();
+        let mut completed = status("done");
+        completed.state = RunState::Succeeded;
+        state.runs.lock().await.insert("done".to_owned(), completed);
+        state.register_run_cancel("done", true).await;
+        assert_eq!(state.request_local_cancel("done").await, Err(CancelRunError::NotActive));
     }
 }

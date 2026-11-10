@@ -156,14 +156,23 @@ async fn cancel_run(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
-    state.request_local_cancel(&id).await.map(|()| StatusCode::ACCEPTED).map_err(|error| {
-        let (status, message) = match error {
-            CancelRunError::NotFound => (StatusCode::NOT_FOUND, "unknown OAT run"),
-            CancelRunError::NotLocal => (StatusCode::FORBIDDEN, "only local OAT runs can be cancelled"),
-            CancelRunError::NotActive => (StatusCode::CONFLICT, "OAT run is not active"),
-        };
-        (status, Json(ApiError { error: message.to_owned() }))
-    })
+    state
+        .request_local_cancel(&id)
+        .await
+        .map(|()| StatusCode::ACCEPTED)
+        .map_err(|error| {
+            let (status, message) = match error {
+                CancelRunError::NotFound => (StatusCode::NOT_FOUND, "unknown OAT run"),
+                CancelRunError::NotLocal => (StatusCode::FORBIDDEN, "only local OAT runs can be cancelled"),
+                CancelRunError::NotActive => (StatusCode::CONFLICT, "OAT run is not active"),
+            };
+            (
+                status,
+                Json(ApiError {
+                    error: message.to_owned(),
+                }),
+            )
+        })
 }
 
 async fn get_run(
