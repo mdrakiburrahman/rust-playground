@@ -1,4 +1,5 @@
-use std::collections::{BTreeSet, HashMap};
+use std::cmp::Reverse;
+use std::collections::{BTreeSet, BinaryHeap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -187,7 +188,28 @@ pub struct EdgeVerifier {
     signer: EdgeRequestSigner,
     max_age_ms: u64,
     max_replay_nonces: usize,
-    seen_nonces: Mutex<HashMap<String, u64>>,
+    seen_nonces: Mutex<ReplayCache>,
+}
+
+#[derive(Default)]
+struct ReplayCache {
+    nonces: HashMap<String, u64>,
+    expiries: BinaryHeap<Reverse<(u64, String)>>,
+}
+
+impl ReplayCache {
+    fn insert(&mut self, nonce: String, expiry: u64) {
+        self.expiries.push(Reverse((expiry, nonce.clone())));
+        self.nonces.insert(nonce, expiry);
+    }
+
+    fn reclaim_expired(&mut self, now: u64) {
+        while self.expiries.peek().is_some_and(|Reverse((expiry, _))| *expiry < now) {
+            if let Some(Reverse((_, nonce))) = self.expiries.pop() {
+                self.nonces.remove(&nonce);
+            }
+        }
+    }
 }
 
 impl EdgeVerifier {
@@ -220,7 +242,7 @@ impl EdgeVerifier {
             signer: EdgeRequestSigner::new(secret)?,
             max_age_ms,
             max_replay_nonces,
-            seen_nonces: Mutex::new(HashMap::new()),
+            seen_nonces: Mutex::new(ReplayCache::default()),
         })
     }
 
@@ -284,14 +306,14 @@ impl EdgeVerifier {
             .seen_nonces
             .lock()
             .map_err(|_| AuthFailure::new(AuthFailureKind::Internal, "edge replay cache is unavailable"))?;
-        seen.retain(|_, expiry| *expiry >= now.get());
-        if seen.contains_key(nonce) {
+        seen.reclaim_expired(now.get());
+        if seen.nonces.contains_key(nonce) {
             return Err(AuthFailure::new(
                 AuthFailureKind::Invalid,
                 "edge assertion nonce was replayed",
             ));
         }
-        if seen.len() >= self.max_replay_nonces {
+        if seen.nonces.len() >= self.max_replay_nonces {
             return Err(AuthFailure::new(
                 AuthFailureKind::ReplayCapacity,
                 "edge replay cache is full; retry after assertions expire",
@@ -601,6 +623,37 @@ mod replay_tests {
     }
 
     #[test]
+    fn earlier_expiry_is_reclaimed_behind_an_earlier_arriving_future_nonce() -> Result<(), AuthFailure> {
+        let verifier = EdgeVerifier::with_replay_capacity(vec![7_u8; 32], 30_000, 2)?;
+        let future = headers(130_000, "future-first")?;
+        verifier.verify(&Method::POST, "/flight", &future, now(100_000))?;
+        verifier.verify(
+            &Method::POST,
+            "/flight",
+            &headers(100_000, "expires-first")?,
+            now(100_000),
+        )?;
+        verifier.verify(
+            &Method::POST,
+            "/flight",
+            &headers(130_001, "replacement")?,
+            now(130_001),
+        )?;
+        let seen = verifier
+            .seen_nonces
+            .lock()
+            .unwrap_or_else(|error| panic!("lock replay cache: {error}"));
+        assert_eq!(seen.nonces.len(), 2);
+        assert_eq!(seen.expiries.len(), 2);
+        assert!(!seen.nonces.contains_key("expires-first"));
+        assert!(seen.nonces.contains_key("future-first"));
+        drop(seen);
+        let replay = verifier.verify(&Method::POST, "/flight", &future, now(130_001));
+        assert!(replay.is_err_and(|failure| failure.message() == "edge assertion nonce was replayed"));
+        Ok(())
+    }
+
+    #[test]
     fn full_replay_cache_rejects_new_nonce_preserves_live_entries_and_reclaims_expired() -> Result<(), AuthFailure> {
         let verifier = EdgeVerifier::new(vec![7_u8; 32], 30_000)?;
         {
@@ -627,16 +680,16 @@ mod replay_tests {
                 .seen_nonces
                 .lock()
                 .unwrap_or_else(|error| panic!("lock replay cache: {error}"));
-            assert_eq!(seen.len(), 65_536);
-            assert!(!seen.contains_key("new"));
+            assert_eq!(seen.nonces.len(), 65_536);
+            assert!(!seen.nonces.contains_key("new"));
         }
         verifier.verify(&Method::POST, "/flight", &headers(130_001, "new")?, now(130_001))?;
         let seen = verifier
             .seen_nonces
             .lock()
             .unwrap_or_else(|error| panic!("lock replay cache: {error}"));
-        assert_eq!(seen.len(), 1);
-        assert!(seen.contains_key("new"));
+        assert_eq!(seen.nonces.len(), 1);
+        assert!(seen.nonces.contains_key("new"));
         Ok(())
     }
 
