@@ -43,13 +43,36 @@ export function assertExperimentPoolCapacity(
         total + Math.max(0, pool.maxPods - DAEMONSET_POD_ALLOWANCE_PER_NODE) * pool.maxCount, 0);
       if (podCount <= workloadSlots) continue;
       const poolNames = matchingPools.map((pool) => `"${pool.name}"`).join(', ');
+      const recommendation = capacityRecommendation(userPools, matchingPools, podCount, workloadSlots);
       throw new Error(
         `${experiment.name} requires ${podCount} ${role} pods, but pools ${poolNames} have only ${workloadSlots} combined workload slots ` +
-        `after reserving ${DAEMONSET_POD_ALLOWANCE_PER_NODE} pods per node for DaemonSets; increase maxPods (up to ${MAX_PODS_PER_NODE}) ` +
-        `or maxCount for one or more of these pools: ${poolNames}.`,
+        `after reserving ${DAEMONSET_POD_ALLOWANCE_PER_NODE} pods per node for DaemonSets; ${recommendation}.`,
       );
     }
   }
+}
+
+function capacityRecommendation(
+  userPools: StampConfig['aks']['userPools'],
+  matchingPools: StampConfig['aks']['userPools'],
+  podCount: number,
+  workloadSlots: number,
+): string {
+  const maxWorkloadSlotsPerNode = MAX_PODS_PER_NODE - DAEMONSET_POD_ALLOWANCE_PER_NODE;
+  for (const pool of matchingPools) {
+    if (pool.maxCount === 0) continue;
+    const poolWorkloadSlots = Math.max(0, pool.maxPods - DAEMONSET_POD_ALLOWANCE_PER_NODE) * pool.maxCount;
+    const otherWorkloadSlots = workloadSlots - poolWorkloadSlots;
+    const minimumMaxPods = DAEMONSET_POD_ALLOWANCE_PER_NODE + Math.ceil((podCount - otherWorkloadSlots) / pool.maxCount);
+    if (minimumMaxPods <= MAX_PODS_PER_NODE) {
+      return `raise aks.userPools[${userPools.indexOf(pool)}].maxPods to at least ${minimumMaxPods}`;
+    }
+  }
+  const pool = matchingPools[0]!;
+  const poolWorkloadSlots = Math.max(0, pool.maxPods - DAEMONSET_POD_ALLOWANCE_PER_NODE) * pool.maxCount;
+  const otherWorkloadSlots = workloadSlots - poolWorkloadSlots;
+  const minimumMaxCount = Math.ceil((podCount - otherWorkloadSlots) / maxWorkloadSlotsPerNode);
+  return `raise aks.userPools[${userPools.indexOf(pool)}].maxCount to at least ${minimumMaxCount} with maxPods=${MAX_PODS_PER_NODE}`;
 }
 
 export interface PilotBinding {

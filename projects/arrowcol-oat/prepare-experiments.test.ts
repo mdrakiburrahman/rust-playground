@@ -79,7 +79,7 @@ test('example stamp fits the default run, 32-table pilot, and documented E1-E5 p
   const undersizedClientPools = stamp.aks.userPools.map((pool) =>
     pool.role === 'client' ? { ...pool, maxPods: 30 } : pool);
   assert.throws(() => assertExperimentPoolCapacity(undersizedClientPools, [E4]),
-    /E4 requires 128 client pods.*pools "benchd64" have only 0 combined workload slots.*increase maxPods.*"benchd64"/);
+    /E4 requires 128 client pods.*only 0 combined workload slots.*raise aks\.userPools\[0\]\.maxPods to at least 160\./);
 });
 
 test('capacity sums same-role pool slots before rejecting an experiment', async () => {
@@ -93,6 +93,23 @@ test('capacity sums same-role pool slots before rejecting an experiment', async 
   const firstOnlyClientPools = splitPools.filter((pool) => pool.role !== 'client' || pool.name === firstClientPool.name);
   assert.throws(() => assertExperimentPoolCapacity(firstOnlyClientPools, [E4]), /only 68 combined workload slots/);
   assert.doesNotThrow(() => assertExperimentPoolCapacity(splitPools, [E4]));
+  const insufficientPools = stamp.aks.userPools.flatMap((pool) => pool.role === 'client'
+    ? [{ ...pool, name: `${pool.name}-a`, maxPods: 60 }, { ...pool, name: `${pool.name}-b`, maxPods: 50 }]
+    : [pool]);
+  assert.throws(() => assertExperimentPoolCapacity(insufficientPools, [E4]),
+    /E4 requires 128 client pods.*only 46 combined workload slots.*raise aks\.userPools\[0\]\.maxPods to at least 142\./);
+});
+
+test('capacity recommendations use maxCount safely beyond the per-node pod limit', async () => {
+  const stamp = parseStampConfig(await readFile('infra/azure/stamp.example.yaml', 'utf8'));
+  const largeRun = experimentPoolPodCount('512-client-pod run', { tables, clients_per_table: 16, replica_counts: [1] });
+  const fullPods = stamp.aks.userPools.map((pool) => pool.role === 'client' ? { ...pool, maxPods: 250 } : pool);
+  assert.throws(() => assertExperimentPoolCapacity(fullPods, [largeRun]),
+    /512-client-pod run requires 512 client pods.*only 218 combined workload slots.*raise aks\.userPools\[0\]\.maxCount to at least 3 with maxPods=250\./);
+
+  const noNodes = stamp.aks.userPools.map((pool) => pool.role === 'client' ? { ...pool, maxPods: 30, maxCount: 0 } : pool);
+  assert.throws(() => assertExperimentPoolCapacity(noNodes, [largeRun]),
+    /512-client-pod run requires 512 client pods.*only 0 combined workload slots.*raise aks\.userPools\[0\]\.maxCount to at least 3 with maxPods=250\./);
 });
 
 test('binding refuses unknown/out-of-budget pilot settings, ambiguous baselines and invented tables', () => {
