@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from 'node:crypto';
-import { lstat, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parse, stringify } from 'yaml';
@@ -279,6 +279,9 @@ export async function generatePrivateInputs(input: PrivateInputs): Promise<{
   runtimeConfigPath: string; bootstrapEnvPath: string; aksConfigPath: string;
 }> {
   const runtime = validateRuntime(input.runtime);
+  if (Object.values(runtime.images).some(image => !image.startsWith(`arrowcollector${runtime.stamp}.azurecr.io/`))) {
+    throw new Error('All runtime images must use the selected stamp registry.');
+  }
   if (!uuid.test(input.tenantId)) throw new Error('Azure tenant must be a UUID.');
   if (!/^[a-z0-9]+\.azurecr\.io\/arrowcol-oat-client@sha256:[a-f0-9]{64}$/.test(input.clientImage) ||
       !input.clientImage.startsWith(`arrowcollector${runtime.stamp}.azurecr.io/`)) {
@@ -303,7 +306,8 @@ export async function generatePrivateInputs(input: PrivateInputs): Promise<{
   const directory = resolve(input.directory);
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const directoryInfo = await lstat(directory);
-  if (!directoryInfo.isDirectory() || directoryInfo.mode & 0o077) throw new Error('Private input directory must have mode 0700.');
+  if (!directoryInfo.isDirectory()) throw new Error('Private input directory must be a real directory.');
+  await chmod(directory, 0o700);
   const runtimeConfigPath = resolve(directory, 'runtime.json');
   try {
     const existing = JSON.parse(await readFile(runtimeConfigPath, 'utf8')) as RuntimeConfig;
@@ -322,6 +326,14 @@ export async function generatePrivateInputs(input: PrivateInputs): Promise<{
     if (!info.isDirectory() || info.mode & 0o077) throw new Error('Secret directory must be a real directory with mode 0700.');
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  for (const key of ['sa-password', 'app-password', 'migration-password', 'edge-hmac', 'internal-hmac', 'generation']) {
+    try {
+      const info = await lstat(resolve(secrets, key));
+      if (!info.isFile() || info.mode & 0o077) throw new Error('Secret files must be regular files with mode 0600.');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
   }
   await prepareSecrets(secrets, bootstrapEnvPath);
   const assertionFile = resolve(secrets, 'publisher-assertion.jwt');

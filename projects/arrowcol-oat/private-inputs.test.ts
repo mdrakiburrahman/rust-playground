@@ -92,21 +92,22 @@ test('rejects expired or malformed assertions, mutable images and mismatched sta
   await assert.rejects(generatePrivateInputs({ ...input, assertion: 'do-not-echo-this-token' }), /invalid host federation/);
   await assert.rejects(generatePrivateInputs({ ...input, assertion: 'header.bad.signature' }), /invalid host assertion claims/);
   await assert.rejects(generatePrivateInputs({ ...input, clientImage: 'latest' }), /pinned by manifest digest/);
+  await assert.rejects(generatePrivateInputs({ ...input, runtime: { ...input.runtime,
+    images: { ...input.runtime.images, dataflow: `other.azurecr.io/dataflow@sha256:${digest}` } } }), /selected stamp registry/);
   await assert.rejects(generatePrivateInputs({ ...input, qapEndpoint: 'https://arrow-collector-00000.canadacentral.kusto.windows.net' }), /selected stamp/);
 });
 
-test('refuses another stamp, permissive permissions and symlinked private state without following it', async t => {
+test('refuses another stamp and symlinked secrets without following them, and restricts an existing output directory', async t => {
   const input = await fixture(t);
   await writeFile(resolve(input.directory, 'runtime.json'), JSON.stringify({ stamp: '00000', subscriptionId: input.runtime.subscriptionId }), { mode: 0o600 });
   await assert.rejects(generatePrivateInputs(input), /aks destroy --confirm arrow-collector-rg/);
   await rm(resolve(input.directory, 'runtime.json'));
   await chmod(input.directory, 0o755);
-  await assert.rejects(generatePrivateInputs(input), /0700/);
-  await chmod(input.directory, 0o700);
   const target = resolve(input.directory, 'target');
   await mkdir(target, { mode: 0o700 });
   await symlink(target, resolve(input.directory, 'secrets'));
   await assert.rejects(generatePrivateInputs(input), /real directory/);
+  assert.equal((await lstat(input.directory)).mode & 0o777, 0o700);
 });
 
 test('bootstrap generation is never synthesized and environment entries cannot inject lines', () => {

@@ -54,13 +54,16 @@ export async function discoverLiveStamp(options: SetupOptions = {}, runner: type
 }
 
 async function requireCurrentState(stamp: LiveStamp): Promise<void> {
-  try {
-    const runtime = JSON.parse(await readFile(resolve(directory, 'runtime.json'), 'utf8')) as RuntimeConfig;
-    if (runtime.stamp !== stamp.stamp || runtime.subscriptionId.toLowerCase() !== stamp.subscription.toLowerCase()) {
-      throw new Error(`Stale AKS private inputs belong to another stamp; run \`${destroyCommand}\` before deploying.`);
+  for (const filename of ['runtime.json', 'oat-config.aks.json']) {
+    try {
+      const state = JSON.parse(await readFile(resolve(directory, filename), 'utf8')) as { stamp?: unknown; subscriptionId?: unknown };
+      if (state.stamp !== stamp.stamp || (filename === 'runtime.json' &&
+          (typeof state.subscriptionId !== 'string' || state.subscriptionId.toLowerCase() !== stamp.subscription.toLowerCase()))) {
+        throw new Error(`Stale AKS private inputs belong to another stamp; run \`${destroyCommand}\` before deploying.`);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
 }
 
@@ -86,6 +89,9 @@ async function capturedGeneration(config: Config, runner: typeof run_tree): Prom
 }
 
 export async function setup(options: SetupOptions = {}, runner: typeof run_tree = run_tree): Promise<SetupResult> {
+  if (options.tag !== undefined && !/^[a-z0-9][a-z0-9._-]{0,127}$/.test(options.tag)) {
+    throw new Error('--tag must be a valid lowercase container tag.');
+  }
   const live = await discoverLiveStamp(options, runner);
   await requireCurrentState(live);
   const stampConfigPath = resolve(ROOT, options.stampConfig ?? 'infra/azure/stamp.yaml');
@@ -111,7 +117,8 @@ export async function setup(options: SetupOptions = {}, runner: typeof run_tree 
   }
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const info = await lstat(directory);
-  if (!info.isDirectory() || info.mode & 0o077) throw new Error('Private input directory must have mode 0700.');
+  if (!info.isDirectory()) throw new Error('Private input directory must be a real directory.');
+  await chmod(directory, 0o700);
   await checked(runner, ['az', 'aks', 'get-credentials', '--subscription', live.subscription,
     '--resource-group', live.resourceGroup, '--name', live.clusterName, '--context', live.clusterName,
     '--overwrite-existing', '--only-show-errors'], 180, 'Fetch AKS credentials');
@@ -157,7 +164,6 @@ export async function setup(options: SetupOptions = {}, runner: typeof run_tree 
   if (!/^[a-z0-9][a-z0-9._-]{0,127}$/.test(tag)) throw new Error('--tag must be a valid lowercase container tag.');
   const imageOptions = { env: bootstrapEnvPath, azureEnv: bootstrapEnvPath, stampConfig: stampConfigPath,
     registry: config.registry, federated: true, tag, runtimeConfig: runtimeConfigPath };
-  // Image helpers are imported only after discovering and validating the selected live stamp.
   const imagesApi = await import('./publish-images.js');
   let runtime: RuntimeConfig;
   let clientImage: string;
