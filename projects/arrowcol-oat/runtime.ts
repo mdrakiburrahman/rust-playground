@@ -319,7 +319,7 @@ export async function generatePrivateInputs(input: PrivateInputs): Promise<{
   }
   const bootstrapEnvPath = resolve(directory, 'bootstrap.env');
   const aksConfigPath = resolve(directory, 'oat-config.aks.json');
-  await writePrivateFile(bootstrapEnvPath, renderBootstrapEnv(input.bootstrapValues, input.resetGeneration));
+  const bootstrap = renderBootstrapEnv(input.bootstrapValues, input.resetGeneration);
   const secrets = resolve(directory, 'secrets');
   try {
     const info = await lstat(secrets);
@@ -331,10 +331,14 @@ export async function generatePrivateInputs(input: PrivateInputs): Promise<{
     try {
       const info = await lstat(resolve(secrets, key));
       if (!info.isFile() || info.mode & 0o077) throw new Error('Secret files must be regular files with mode 0600.');
+      if (key === 'generation' && await readFile(resolve(secrets, key), 'utf8') !== input.resetGeneration) {
+        throw new Error('unsafe existing generation; do not rotate secrets or publisher generation during a run');
+      }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
   }
+  await writePrivateFile(bootstrapEnvPath, bootstrap);
   await prepareSecrets(secrets, bootstrapEnvPath);
   const assertionFile = resolve(secrets, 'publisher-assertion.jwt');
   await writePrivateFile(assertionFile, `${input.assertion}\n`);

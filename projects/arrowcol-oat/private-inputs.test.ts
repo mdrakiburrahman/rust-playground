@@ -84,6 +84,8 @@ test('rerunning refreshes the assertion without rotating existing SQL or HMAC se
   assert.equal(await readFile(resolve(input.directory, 'secrets/edge-hmac'), 'utf8'), hmac);
   assert.equal((await readFile(resolve(input.directory, 'secrets/publisher-assertion.jwt'), 'utf8')).trim(), refreshed);
   await assert.rejects(generatePrivateInputs({ ...input, resetGeneration: randomUUID() }), /unsafe existing generation/);
+  assert.equal(load_env(resolve(input.directory, 'bootstrap.env')).ARROWCOL_RESET_GENERATION, generation);
+  assert.equal((await readFile(resolve(input.directory, 'secrets/publisher-assertion.jwt'), 'utf8')).trim(), refreshed);
 });
 
 test('rejects expired or malformed assertions, mutable images and mismatched stamp endpoints', async t => {

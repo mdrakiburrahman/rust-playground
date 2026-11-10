@@ -32,7 +32,7 @@ function stampNumber(value: string): string {
 }
 
 export async function discoverLiveStamp(options: SetupOptions = {}, runner: typeof run_tree = run_tree): Promise<LiveStamp> {
-  const config = loadStampConfig(options.stampConfig);
+  const config = loadStampConfig(resolve(ROOT, options.stampConfig ?? 'infra/azure/stamp.yaml'));
   const result = await runner(['az', 'aks', 'list', '--subscription', config.subscription,
     '--resource-group', config.resourceGroup, '--output', 'json', '--only-show-errors'], 120, ROOT);
   if (result.returncode) {
@@ -132,6 +132,13 @@ export async function setup(options: SetupOptions = {}, runner: typeof run_tree 
   if (!uuid.test(clientId) || !uuid.test(tenantId)) throw new Error('Azure returned an invalid UAMI client ID or tenant UUID.');
   const config = new Config({ AZURE_SUBSCRIPTION_ID: live.subscription, AZURE_UAMI_CLIENT_ID: clientId }, stampConfig);
   const generation = await capturedGeneration(config, runner);
+  try {
+    if (await readFile(resolve(directory, 'secrets/generation'), 'utf8') !== generation) {
+      throw new Error('Existing private secrets capture a different publisher generation; do not rotate secrets or publisher generation during a run.');
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
   const bootstrapValues = { ...config.generated(), AZURE_SUBSCRIPTION_ID: live.subscription };
   const bootstrapEnvPath = resolve(directory, 'bootstrap.env');
   await writePrivateFile(bootstrapEnvPath, renderBootstrapEnv(bootstrapValues, generation));
