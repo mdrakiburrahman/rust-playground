@@ -3772,6 +3772,43 @@ async fn cleanup_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
     destroy_local_platform(config, platform).await
 }
 
+fn local_oat_client_list_args(project: &str) -> Vec<String> {
+    vec![
+        "ps".to_owned(),
+        "-aq".to_owned(),
+        "--filter".to_owned(),
+        format!("label=com.docker.compose.project={project}"),
+        "--filter".to_owned(),
+        "label=com.docker.compose.service=oat-client".to_owned(),
+    ]
+}
+
+fn local_oat_client_remove_args(container_ids: &[String]) -> Vec<String> {
+    let mut args = vec!["rm".to_owned(), "--force".to_owned()];
+    args.extend(container_ids.iter().cloned());
+    args
+}
+
+async fn remove_local_oat_client_containers(project: &str) -> Result<bool> {
+    let mut list = Command::new("docker");
+    list.args(local_oat_client_list_args(project));
+    let output = run_command(list, "list local OAT client containers for cleanup").await?;
+    let ids = String::from_utf8(output.stdout)
+        .context("local OAT client container IDs were not UTF-8")?
+        .lines()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        return Ok(false);
+    }
+    let mut remove = Command::new("docker");
+    remove.args(local_oat_client_remove_args(&ids));
+    run_command(remove, "remove local OAT client containers").await?;
+    Ok(true)
+}
+
 async fn destroy_local_platform(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
     let base_project = config
         .platform
@@ -3784,15 +3821,26 @@ async fn destroy_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
         .as_deref()
         .context("local compose file is missing")?;
     let project = scoped_compose_project(base_project, &platform.run_id);
-    let mut down = compose_command(
-        compose_file,
-        config.platform.compose_override_file.as_deref(),
-        &project,
-        "benchmark",
-    );
-    down.envs(&platform.environment);
-    down.args(["down", "--volumes", "--remove-orphans"]);
-    run_command(down, "clean up local OAT stack").await?;
+    let mut stack_clean = false;
+    for _ in 0..3 {
+        remove_local_oat_client_containers(&project).await?;
+        let mut down = compose_command(
+            compose_file,
+            config.platform.compose_override_file.as_deref(),
+            &project,
+            "benchmark",
+        );
+        down.envs(&platform.environment);
+        down.args(["down", "--volumes", "--remove-orphans"]);
+        run_command(down, "clean up local OAT stack").await?;
+        if !remove_local_oat_client_containers(&project).await? {
+            stack_clean = true;
+            break;
+        }
+    }
+    if !stack_clean {
+        bail!("local OAT client containers continued to appear during cleanup");
+    }
     if platform.state_dir.exists() {
         fs::remove_dir_all(&platform.state_dir)
             .with_context(|| format!("remove generated local OAT state {}", platform.state_dir.display()))?;
@@ -5762,6 +5810,25 @@ fn platform_host_label(kind: crate::config::OatMode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_client_cleanup_is_scoped_to_the_cell_project_and_service() {
+        assert_eq!(
+            local_oat_client_list_args("arrowcol-oat-quick-123e4567"),
+            [
+                "ps",
+                "-aq",
+                "--filter",
+                "label=com.docker.compose.project=arrowcol-oat-quick-123e4567",
+                "--filter",
+                "label=com.docker.compose.service=oat-client",
+            ]
+        );
+        assert_eq!(
+            local_oat_client_remove_args(&["client-a".to_owned(), "client-b".to_owned()]),
+            ["rm", "--force", "client-a", "client-b"]
+        );
+    }
 
     #[test]
     fn failed_clients_preserve_pinning_evidence_without_masking_unrelated_failures() -> Result<()> {
