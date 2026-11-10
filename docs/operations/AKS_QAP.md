@@ -4,6 +4,10 @@ The AKS mode runs the existing Azure QAP experiment runtime as a Kubernetes Job.
 It does not deploy the unrelated SQL Server/Hive Compose stack and does not
 replace the devcontainer mode.
 
+## Router authentication
+
+Edge HMAC works end-to-end in the proven local flow; using it on AKS requires matching mounted keys, updated pinned router and client images and a trusted TLS and authorization edge, not a different router mode. Catalog identity and TLS, and any QAP host allowlist, are open policy decisions; arbitrary credential-free HTTP(S) hosts remain allowed by existing QAP validation.
+
 ## Qualification and safety
 
 | Requirement | Qualified value or guard |
