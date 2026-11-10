@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::{
     cli::{RunArgs, Scenario},
-    generator::{LogicalBatch, Scheduler, build_logical_batch},
+    generator::{LogicalBatch, Scheduler, build_logical_batch, scheduled_batch_seed},
     manifest::{
         AckOutcome, CAPABILITY_EVIDENCE_FILE, ManifestWriter, ROUTING_EVIDENCE_FILE, RUN_METADATA_FILE,
         SendManifestEntry, run_metadata,
@@ -234,9 +234,7 @@ async fn run_phase(
                     break;
                 }
                 let scheduled = scheduler.next();
-                let batch_seed = seed
-                    .checked_add(scheduled.table_batch_ordinal)
-                    .context("logical batch seed overflow")?;
+                let batch_seed = scheduled_batch_seed(seed, scheduled.table_batch_ordinal)?;
                 let batch = Arc::new(build_logical_batch(Arc::clone(&scheduled.table), batch_rows, batch_seed).await?);
                 let logical_batch_id = format!("{}:{}:{}:{}", run_id, scenario.as_str(), phase, scheduled.ordinal);
                 let sent = send_pool_with_retry(

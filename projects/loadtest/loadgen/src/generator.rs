@@ -3,7 +3,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use arrow::{
     array::{
         Array, ArrayRef, BooleanArray, Float64Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
@@ -21,6 +21,14 @@ use crate::sdk::GeneratedTable;
 const MAX_FLIGHT_DATA_BYTES: usize = 31 * 1024 * 1024;
 /// Interleaved tenants deliberately provide an unsorted input for layout tests.
 pub const CUSTOMER_COUNT: usize = 16;
+
+pub(crate) fn scheduled_batch_seed(seed: u64, table_batch_ordinal: u64) -> Result<u64> {
+    let variants = u64::try_from(delta_inspect::MAX_CHUNK_DISTINCT_ROWS / CUSTOMER_COUNT)
+        .context("logical batch seed variant count exceeds evidence bounds")?;
+    ensure!(variants > 0, "row validation limit permits no logical batch variants");
+    seed.checked_add(table_batch_ordinal % variants)
+        .context("logical batch seed overflow")
+}
 
 /// One immutable logical batch reused by paired pool sends and retries.
 #[derive(Clone)]
@@ -370,7 +378,7 @@ fn hash_bytes(hasher: &mut Sha256, value: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::BTreeSet, sync::Arc};
 
     use anyhow::Result;
     use arrow::array::Array;
@@ -424,6 +432,38 @@ mod tests {
         assert_eq!(first.row_hashes, second.row_hashes);
         let different_seed = build_logical_batch(generated_table()?, 4, 8).await?;
         assert_ne!(first.row_hashes, different_seed.row_hashes);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scheduled_batch_seeds_fit_the_reader_distinct_row_limit() -> Result<()> {
+        let variants = delta_inspect::MAX_CHUNK_DISTINCT_ROWS / CUSTOMER_COUNT;
+        let mut hashes = BTreeSet::new();
+        let mut first = None;
+        let mut previous = None;
+        for variant in 0..variants {
+            let seed = scheduled_batch_seed(7, u64::try_from(variant)?)?;
+            if let Some(previous) = previous {
+                assert_ne!(seed, previous);
+            }
+            let batch = build_logical_batch(generated_table()?, CUSTOMER_COUNT, seed).await?;
+            if let Some(first) = &first {
+                assert_ne!(batch.row_hashes, *first);
+            } else {
+                first = Some(batch.row_hashes.clone());
+            }
+            hashes.extend(batch.row_hashes.iter().map(|(hash, _)| hash.clone()));
+            previous = Some(seed);
+        }
+        assert_eq!(hashes.len(), delta_inspect::MAX_CHUNK_DISTINCT_ROWS);
+
+        let repeated = build_logical_batch(
+            generated_table()?,
+            CUSTOMER_COUNT,
+            scheduled_batch_seed(7, u64::try_from(variants)?)?,
+        )
+        .await?;
+        assert_eq!(Some(repeated.row_hashes), first);
         Ok(())
     }
 
