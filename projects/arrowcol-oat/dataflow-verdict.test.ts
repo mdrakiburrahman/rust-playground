@@ -16,8 +16,9 @@ import type { OatRunStatus } from './launch.js';
 const orchestration = '11111111-1111-4111-8111-111111111111';
 const cell = '22222222-2222-4222-8222-222222222222';
 const sha = 'a'.repeat(40);
+const subscriptionId = '00000000-0000-0000-0000-000000000001';
 const config = {
-  stamp: '00000', namespace: 'arrow-collector', kubectl_context: 'arrow-collector-00000',
+  stamp: '00000', namespace: 'arrow-collector', kubectl_context: 'arrow-collector-00000', subscriptionId,
   qap_database: 'experimentqap', tables: ['sqlserver_active_sessions'], replica_counts: [1], dfe_worker_concurrency: [8],
 };
 const status: OatRunStatus = { id: orchestration, state: 'succeeded', progress: 'published', result_count: 1, error: null };
@@ -255,14 +256,35 @@ test('cleanup waits for Terminating namespaces and scoped FICs, but ignores the 
       reads++;
       return ok(JSON.stringify({ items: reads === 1 ? [{ status: { phase: 'Terminating' } }] : [] }));
     }
+    assert.deepEqual(args, [
+      'az', 'identity', 'federated-credential', 'list', '-g', 'arrow-collector-rg',
+      '--identity-name', 'arrow-collector', '--subscription', subscriptionId, '-o', 'json',
+    ]);
     return ok(JSON.stringify([{ name: 'azure-qap-arrow-collector-00000', subject: 'system:serviceaccount:arrow-collector:arrow-collector' }]));
   };
-  await verifyRunCleanup([row()], config, runner, () => now, async (ms) => { now += ms; });
+  await verifyRunCleanup(
+    [row()], config, runner, () => now, async (ms) => { now += ms; }, { AZURE_SUBSCRIPTION_ID: subscriptionId },
+  );
   assert.equal(reads, 2);
   assert.equal(now, 5000);
   const leaked: typeof run_tree = async (args) => ok(JSON.stringify(args[0] === 'kubectl' ? { items: [] } : [
     { name: 'unexpected-name', subject: `system:serviceaccount:arrow-collector-${cell.replaceAll('-', '')}:oat` },
   ]));
-  await assert.rejects(verifyRunCleanup([row()], config, leaked, () => now, async (ms) => { now += ms; }), /cleanup timed out/);
+  await assert.rejects(verifyRunCleanup(
+    [row()], config, leaked, () => now, async (ms) => { now += ms; }, { AZURE_SUBSCRIPTION_ID: subscriptionId },
+  ), /cleanup timed out/);
   assert.equal(now, 5000 + CLEANUP_TIMEOUT_MS);
+});
+
+test('cleanup fails closed when the selected subscription is missing or conflicts with the environment', async () => {
+  let calls = 0;
+  const runner: typeof run_tree = async () => { calls++; return ok('[]'); };
+  const sleep = async () => {};
+  await assert.rejects(verifyRunCleanup([row()], { ...config, subscriptionId: undefined }, runner, () => 0, sleep, {
+    AZURE_SUBSCRIPTION_ID: subscriptionId,
+  }), /selected subscription is missing or invalid/);
+  await assert.rejects(verifyRunCleanup([row()], config, runner, () => 0, sleep, {
+    AZURE_SUBSCRIPTION_ID: '00000000-0000-0000-0000-000000000002',
+  }), /conflicts with the selected subscription/);
+  assert.equal(calls, 0);
 });

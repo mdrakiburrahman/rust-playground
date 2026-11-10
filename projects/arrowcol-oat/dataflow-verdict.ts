@@ -249,8 +249,17 @@ export async function readResultBytes(
 export async function verifyRunCleanup(
   rows: RecordValue[], config: RecordValue, runner: typeof run_tree = run_tree,
   clock: () => number = Date.now, sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  environment: NodeJS.ProcessEnv = process.env,
 ): Promise<void> {
   stampAccount(config);
+  const subscription = config.subscriptionId;
+  if (typeof subscription !== 'string' || !UUID.test(subscription)) {
+    throw new Error('cleanup selected subscription is missing or invalid');
+  }
+  if (environment.AZURE_SUBSCRIPTION_ID !== undefined &&
+      environment.AZURE_SUBSCRIPTION_ID.toLowerCase() !== subscription.toLowerCase()) {
+    throw new Error('cleanup Azure environment conflicts with the selected subscription');
+  }
   const context = `arrow-collector-${String(config.stamp)}`;
   if (config.kubectl_context !== context) throw new Error('cleanup context differs from selected stamp');
   const prefix = String(config.namespace ?? '').slice(0, 30).replace(/-+$/, '');
@@ -272,7 +281,8 @@ export async function verifyRunCleanup(
       leaked ||= output.items.length > 0;
     }
     const credentials: unknown = JSON.parse(await boundedCommand(['az', 'identity', 'federated-credential',
-      'list', '-g', 'arrow-collector-rg', '--identity-name', 'arrow-collector', '-o', 'json']));
+      'list', '-g', 'arrow-collector-rg', '--identity-name', 'arrow-collector',
+      '--subscription', subscription, '-o', 'json']));
     if (!Array.isArray(credentials) || credentials.some((item) => !record(item) || typeof item.subject !== 'string' || typeof item.name !== 'string')) {
       throw new Error('invalid federated credential cleanup response');
     }
