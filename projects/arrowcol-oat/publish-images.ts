@@ -64,7 +64,28 @@ async function verifyLocalImage(role: string, reference: string, revision: strin
 }
 
 function missingManifest(result: { stdout: string; stderr: string }): boolean {
-  return /(?:MANIFEST_UNKNOWN|manifest unknown)/i.test(`${result.stderr}\n${result.stdout}`);
+  return /(?:Error:\s*the specified tag does not exist\.|Error:\s*manifest unknown\.)/i.test(`${result.stderr}\n${result.stdout}`);
+}
+
+function parseStringList(output: string, label: string): string[] {
+  let value: unknown;
+  try { value = JSON.parse(output); } catch { throw new Error(`${label} returned invalid JSON.`); }
+  if (!Array.isArray(value) || !value.every((item): item is string => typeof item === 'string')) {
+    throw new Error(`${label} returned an invalid list.`);
+  }
+  return value;
+}
+
+async function listRepositories(session: PublisherSession, options: ImageOptions): Promise<Set<string>> {
+  const output = session.clean('ACR repository list', await session.run(['az', 'acr', 'repository', 'list',
+    '--name', options.registry, '--subscription', session.subscription, '--output', 'json'], 120));
+  return new Set(parseStringList(output, 'ACR repository list'));
+}
+
+async function listRepositoryTags(session: PublisherSession, options: ImageOptions, repository: string): Promise<Set<string>> {
+  const output = session.clean(`ACR tags ${repository}`, await session.run(['az', 'acr', 'repository', 'show-tags',
+    '--name', options.registry, '--repository', repository, '--subscription', session.subscription, '--output', 'json'], 120));
+  return new Set(parseStringList(output, `ACR tags ${repository}`));
 }
 
 async function publishedDigest(session: PublisherSession, options: ImageOptions, repository: string, tag: string): Promise<string> {
@@ -118,11 +139,18 @@ export async function readPublishedImages(
     const allRepositories: Array<[keyof typeof repositories | 'client', string]> = [
       ...(Object.entries(repositories) as Array<[keyof typeof repositories, string]>), ['client', clientRepository],
     ];
+    const repositoryNames = await listRepositories(session, options);
     for (const [role, repository] of allRepositories) {
+      if (!repositoryNames.has(repository)) { missing.push(role); continue; }
+      let tags = await listRepositoryTags(session, options, repository);
+      if (!tags.has(tag)) { missing.push(role); continue; }
       const metadata = await session.run(['az', 'acr', 'manifest', 'show-metadata', '--registry', options.registry,
         '--name', `${repository}:${tag}`, '--subscription', session.subscription, '--query', 'digest', '--output', 'tsv'], 120);
       if (metadata.returncode) {
-        if (missingManifest(metadata)) { missing.push(role); continue; }
+        if (missingManifest(metadata)) {
+          tags = await listRepositoryTags(session, options, repository);
+          if (!tags.has(tag)) { missing.push(role); continue; }
+        }
         session.clean(`ACR manifest ${repository}`, metadata);
       }
       const digest = session.clean(`ACR manifest ${repository}`, metadata);

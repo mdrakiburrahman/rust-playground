@@ -40,8 +40,25 @@ function fixture(t: test.TestContext) {
   return options;
 }
 
-function mock(registry: string, fault?: 'identity' | 'digest' | 'architecture' | 'missing' | 'provenance' | 'local-provenance') {
+const capturedMissingTagStderr = `WARNING: Command group 'acr manifest' is in preview and under development. Reference and support levels: https://aka.ms/CLI_refstatus
+ERROR: 2026-11-10 03:20:12.297874 Error: the specified tag does not exist. Correlation ID: 7c9221a5-5f81-4cca-8000-4dcab1f95660.
+`;
+const capturedMissingDigestStderr = `WARNING: Command group 'acr manifest' is in preview and under development. Reference and support levels: https://aka.ms/CLI_refstatus
+ERROR: 2026-11-10 03:23:57.226499 Error: manifest unknown. Correlation ID: 1d08beb8-49e6-40bf-8e20-ca304981052d.
+`;
+const capturedRegistryAbsentStderr = `WARNING: Command group 'acr manifest' is in preview and under development. Reference and support levels: https://aka.ms/CLI_refstatus
+WARNING: The resource with name 'arrowcollector99999' and type 'Microsoft.ContainerRegistry/registries' could not be found in subscription 'ArcData Monitoring Dev (68fa0545-661c-4152-93f2-fc8ae1c231b8)'.
+Using 'arrowcollector99999.azurecr.io' as the default registry login server.
+ERROR: Could not connect to the registry login server 'arrowcollector99999.azurecr.io'. Please verify that the registry exists and the URL 'https://arrowcollector99999.azurecr.io/v2/' is reachable from your environment.
+Try running 'az acr check-health -n arrowcollector99999 --yes' to diagnose this issue.
+`;
+
+type Fault = 'identity' | 'digest' | 'architecture' | 'missing-tag' | 'missing-digest' | 'empty-registry' |
+  'registry-absent' | 'auth' | 'dns' | 'timeout' | 'throttle' | 'server' | 'provenance' | 'local-provenance' | 'published-missing';
+
+function mock(registry: string, fault?: Fault) {
   const calls: string[][] = [];
+  const tagCalls = new Map<string, number>();
   let azure = '';
   let docker = '';
   const runner: typeof run_tree = async (command, _timeout, _cwd, env) => {
@@ -56,7 +73,7 @@ function mock(registry: string, fault?: 'identity' | 'digest' | 'architecture' |
         const reference = command.at(-1)!;
         const repo = reference.startsWith(`${registry}.azurecr.io/`) ? reference.split('/').at(-1)!.split(':')[0] : '';
         stdout = JSON.stringify({
-          Os: fault === 'architecture' ? 'linux' : 'linux', Architecture: fault === 'architecture' ? 'arm64' : 'amd64',
+          Os: 'linux', Architecture: fault === 'architecture' ? 'arm64' : 'amd64',
           Config: { Labels: { 'org.opencontainers.image.revision': fault === 'provenance' || (fault === 'local-provenance' && !repo) ? subscription : revision } },
           ...(repo ? { RepoDigests: [`${registry}.azurecr.io/${repo}@${digest}`] } : {}),
         });
@@ -88,12 +105,28 @@ function mock(registry: string, fault?: 'identity' | 'digest' | 'architecture' |
       assert.equal(env?.AZURE_CONFIG_DIR, azure);
       assert.equal(env?.DOCKER_CONFIG, docker);
       if (command[2] === 'show') stdout = `${registry}.azurecr.io`;
+      if (command[2] === 'repository' && command[3] === 'list') {
+        if (fault === 'empty-registry') stdout = '[]';
+        else if (fault === 'registry-absent') { returncode = 1; stderr = capturedRegistryAbsentStderr; }
+        else if (fault === 'auth') { returncode = 1; stderr = 'ERROR: 2026-11-10 03:24:00.000000 DENIED: access forbidden (HTTP 403).\n'; }
+        else if (fault === 'dns') { returncode = 1; stderr = 'ERROR: Could not resolve registry login server\n'; }
+        else if (fault === 'timeout') { returncode = 1; stderr = 'ERROR: request timed out while contacting registry\n'; }
+        else if (fault === 'throttle') { returncode = 1; stderr = 'ERROR: 429 Too Many Requests\n'; }
+        else if (fault === 'server') { returncode = 1; stderr = 'ERROR: 503 Service Unavailable\n'; }
+        else stdout = JSON.stringify(['arrowcol-sqlserver', 'arrowcol-catalog-rust', 'arrowcol-router-rust', 'arrowcol-dataflow-rust', 'arrowcol-oat-client']);
+      }
+      if (command[2] === 'repository' && command[3] === 'show-tags') {
+        const repository = command[command.indexOf('--repository') + 1];
+        const count = tagCalls.get(repository) ?? 0;
+        tagCalls.set(repository, count + 1);
+        stdout = ['missing-tag', 'missing-digest'].includes(fault ?? '') && repository === 'arrowcol-oat-client' && count > 0 ? '[]' : JSON.stringify([`oat-${revision}`]);
+      }
       if (command[2] === 'manifest') {
         const name = command[command.indexOf('--name') + 1];
-        if (fault === 'missing' && name.startsWith('arrowcol-oat-client:')) {
-          returncode = 1;
-          stderr = `MANIFEST_UNKNOWN: manifest tagged by '${name}' is not found`;
-        } else stdout = fault === 'digest' ? 'not-a-digest' : digest;
+        if (fault === 'missing-tag' && name.startsWith('arrowcol-oat-client:')) { returncode = 3; stderr = capturedMissingTagStderr; }
+        else if (fault === 'missing-digest' && name.startsWith('arrowcol-oat-client:')) { returncode = 3; stderr = capturedMissingDigestStderr; }
+        else if (fault === 'published-missing' && name.startsWith('arrowcol-oat-client:')) { returncode = 3; stderr = capturedMissingTagStderr; }
+        else stdout = fault === 'digest' ? 'not-a-digest' : digest;
       }
     } else throw new Error(`Unexpected operation ${command.slice(0, 3).join(' ')}`);
     return { returncode, stdout, stderr };
@@ -227,16 +260,67 @@ test('reads and verifies all five revision tags without building or pushing', as
   assert.ok(m.calls.filter(c => c[0] === 'az' && c[2] === 'manifest').every(c => c.some(arg => arg.includes(`oat-${revision}`))));
 });
 
-test('reports absent revision tags distinctly while provenance mismatches fail closed', async t => {
+test('empty ACR inventory returns typed missing images without calling manifest lookup', async t => {
   const options = fixture(t);
-  const missing = mock(options.registry, 'missing');
-  await assert.rejects(readPublishedImages({ ...options, revision }, missing.runner), error => {
+  const m = mock(options.registry, 'empty-registry');
+  await assert.rejects(readPublishedImages({ ...options, revision }, m.runner), error => {
+    assert.ok(error instanceof MissingPublishedImagesError);
+    assert.deepEqual(error.missingRoles, ['sqlserver', 'catalog', 'router', 'dataflow', 'client']);
+    return true;
+  });
+  assert.ok(m.calls.some(c => c.slice(1, 4).join(' ') === 'acr repository list'));
+  assert.ok(!m.calls.some(c => c.slice(1, 3).join(' ') === 'acr manifest'));
+});
+
+test('real az tag-missing stderr becomes typed only after structured tag recheck confirms absence', async t => {
+  const options = fixture(t);
+  const m = mock(options.registry, 'missing-tag');
+  await assert.rejects(readPublishedImages({ ...options, revision }, m.runner), error => {
     assert.ok(error instanceof MissingPublishedImagesError);
     assert.deepEqual(error.missingRoles, ['client']);
     return true;
   });
-  assert.ok(!missing.calls.some(c => c[0] === 'docker' && ['buildx', 'push'].includes(c[1])));
-  const badProvenance = mock(options.registry, 'provenance');
-  await assert.rejects(readPublishedImages({ ...options, revision }, badProvenance.runner), /revision provenance does not match/);
-  assert.ok(!badProvenance.calls.some(c => c[0] === 'docker' && ['buildx', 'push'].includes(c[1])));
+  assert.ok(m.calls.some(c => c.slice(1, 3).join(' ') === 'acr manifest'));
+  assert.equal(m.calls.filter(c => c.slice(1, 4).join(' ') === 'acr repository show-tags' && c.includes('arrowcol-oat-client')).length, 2);
+  assert.ok(!m.calls.some(c => c[0] === 'docker' && ['buildx', 'push'].includes(c[1])));
+});
+
+test('real manifest-missing fixture is recognized but not-found exit code alone is insufficient', async t => {
+  const options = fixture(t);
+  const m = mock(options.registry, 'missing-digest');
+  await assert.rejects(readPublishedImages({ ...options, revision }, m.runner), error => {
+    assert.ok(error instanceof MissingPublishedImagesError);
+    assert.deepEqual(error.missingRoles, ['client']);
+    return true;
+  });
+  assert.equal(m.calls.filter(c => c.slice(1, 4).join(' ') === 'acr repository show-tags' && c.includes('arrowcol-oat-client')).length, 2);
+  assert.ok(capturedMissingTagStderr.includes('7c9221a5-5f81-4cca-8000-4dcab1f95660'));
+  assert.ok(capturedMissingDigestStderr.includes('1d08beb8-49e6-40bf-8e20-ca304981052d'));
+});
+
+test('registry absence and authorization errors remain hard failures', async t => {
+  const options = fixture(t);
+  for (const [fault, pattern] of [
+    ['registry-absent', 'Could not connect to the registry login server'], ['auth', 'DENIED: access forbidden'],
+    ['dns', 'Could not resolve registry login server'], ['timeout', 'request timed out'],
+    ['throttle', '429 Too Many Requests'], ['server', '503 Service Unavailable'],
+  ] as const) {
+    const m = mock(options.registry, fault);
+    await assert.rejects(readPublishedImages({ ...options, revision }, m.runner), error => {
+      assert.ok(!(error instanceof MissingPublishedImagesError));
+      assert.match(String(error), new RegExp(pattern));
+      return true;
+    });
+    assert.ok(!m.calls.some(c => c[0] === 'docker' && ['buildx', 'push'].includes(c[1])));
+  }
+});
+
+test('post-push missing digest lookup is a hard failure, not a rebuild signal', async t => {
+  const options = fixture(t);
+  const m = mock(options.registry, 'published-missing');
+  await assert.rejects(publishClientImage(options, m.runner), error => {
+    assert.ok(!(error instanceof MissingPublishedImagesError));
+    assert.match(String(error), /the specified tag does not exist/);
+    return true;
+  });
 });
