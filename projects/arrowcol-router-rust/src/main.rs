@@ -46,7 +46,11 @@ fn main() -> Result<()> {
             Arc::new(AllowAllAuthenticator)
         }
     };
-    let edge_verifier = Arc::new(EdgeVerifier::new(edge_secret, config.auth.edge_signature_max_age_ms)?);
+    let edge_verifier = Arc::new(EdgeVerifier::with_replay_capacity(
+        edge_secret,
+        config.auth.edge_signature_max_age_ms,
+        config.auth.edge_replay_max_nonces,
+    )?);
     let internal_signer = Arc::new(InternalIdentitySigner::new(
         internal_secret,
         config.auth.internal_identity_ttl_ms,

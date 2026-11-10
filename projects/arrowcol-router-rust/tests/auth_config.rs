@@ -138,6 +138,29 @@ fn startup_requires_explicit_development_authentication_mode() {
 }
 
 #[test]
+fn replay_capacity_configuration_is_bounded_and_preserves_the_default() -> anyhow::Result<()> {
+    let valid = std::str::from_utf8(include_bytes!("../config.yaml"))?;
+    assert_eq!(
+        RouterConfig::from_yaml(valid.as_bytes())?.auth.edge_replay_max_nonces,
+        65_536
+    );
+    for capacity in [1, 1_048_576] {
+        let configured = valid.replace("auth:\n", &format!("auth:\n  edge_replay_max_nonces: {capacity}\n"));
+        assert_eq!(
+            RouterConfig::from_yaml(configured.as_bytes())?
+                .auth
+                .edge_replay_max_nonces,
+            capacity
+        );
+    }
+    for capacity in [0, 1_048_577] {
+        let configured = valid.replace("auth:\n", &format!("auth:\n  edge_replay_max_nonces: {capacity}\n"));
+        assert!(RouterConfig::from_yaml(configured.as_bytes()).is_err());
+    }
+    Ok(())
+}
+
+#[test]
 fn oat_run_id_cannot_be_added_removed_or_changed_after_edge_signing() {
     let signer = EdgeRequestSigner::new(vec![7_u8; 32]).unwrap_or_else(|error| panic!("create edge signer: {error}"));
     let path = "/arrow.flight.protocol.FlightService/DoPut";

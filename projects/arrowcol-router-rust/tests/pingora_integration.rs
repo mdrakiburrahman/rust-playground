@@ -669,6 +669,7 @@ fn test_config(listen: SocketAddr, state_directory: String) -> RouterConfig {
             edge_secret_file: "unused-edge".into(),
             internal_signing_secret_file: "unused-internal".into(),
             edge_signature_max_age_ms: 30_000,
+            edge_replay_max_nonces: 65_536,
             internal_identity_ttl_ms: 30_000,
         },
         upstream: upstream_config(),
