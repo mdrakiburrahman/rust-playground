@@ -461,16 +461,12 @@ async function runLocalLoadgen(
   );
 }
 
-export function portainerAccess(port: string, passwordFile: string): string {
-  // Portainer trims exactly one trailing newline from --admin-password-file.
-  const password = readFileSync(passwordFile, 'utf8').replace(/\n$/u, '');
-  return `Portainer: https://localhost:${port} (port ${port}, username admin, password ${password}; self-signed TLS)`;
+export function portainerAccess(port: string, credentialFile: string): string {
+  return `Portainer: https://localhost:${port} (port ${port}, username admin, credential file ${credentialFile}; self-signed TLS)`;
 }
 
-export function sqlserverAccess(port: string, passwordFile: string): string {
-  const password = readFileSync(passwordFile, 'utf8').replace(/\n+$/u, '');
-  assert(password.length > 0 && !/[\r\n]/u.test(password), 'SQL Server password secret must be non-empty and single-line');
-  return `SQL Server: localhost,${port} (host port ${port} -> container port 1433, username sa, password ${password})`;
+export function sqlserverAccess(port: string, credentialFile: string): string {
+  return `SQL Server: localhost,${port} (host port ${port} -> container port 1433, username sa, credential file ${credentialFile})`;
 }
 
 export function quiverLocations(directory: string): string {
@@ -637,11 +633,11 @@ async function benchmark(
     );
     step(portainerAccess(
       process.env.PORTAINER_PORT ?? '9444',
-      path.join(workspace, 'projects/arrowcol-infra/secrets/sqlserver-sa-password.txt'),
+      'projects/arrowcol-infra/secrets/sqlserver-sa-password.txt',
     ));
     step(sqlserverAccess(
       process.env.SQLSERVER_PORT ?? '14333',
-      path.join(workspace, 'projects/arrowcol-infra/secrets/sqlserver-sa-password.txt'),
+      'projects/arrowcol-infra/secrets/sqlserver-sa-password.txt',
     ));
     step(azure ? 'Delta storage: isolated ADLS run roots (locations retained only in private runtime configuration)' : deltaTableLocations(directory));
     if (options.quiver) step(quiverLocations(directory));

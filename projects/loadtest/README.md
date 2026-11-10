@@ -482,10 +482,11 @@ attempt synchronously before the second can reset its ephemeral runtime.
 ## Watch and inspect
 
 - **Grafana:** <http://localhost:3000/d/arrowcol> (`admin` / `admin`).
-- **SQL Server:** `localhost,14333`, username `sa`. The local password is printed
-  at startup and stored in `projects/arrowcol-infra/secrets/sqlserver-sa-password.txt`.
-- **Portainer:** <https://localhost:9444>, username `admin`, the SQL Server password.
-  The local certificate is self-signed.
+- **SQL Server:** `localhost,14333`, username `sa`. Startup prints the location, not the contents, of the private
+  password file: `projects/arrowcol-infra/secrets/sqlserver-sa-password.txt`.
+- **Portainer:** <https://localhost:9444>, username `admin`, authenticated with the SQL Server
+  password in that file. Startup prints the credential file location without revealing
+  its contents. The local certificate is self-signed.
 - **Kusto:** <http://localhost:8080>, database `loadtest`, no authentication.
   This is an HTTP query endpoint, not a browser UI.
 - **kusto-explorer:** <http://localhost:8090>, a browser KQL workbench with the
@@ -499,7 +500,7 @@ override host ports. Published ports bind to host loopback only. A host-run
 load generator uses the router and catalog loopback ports; inside the devcontainer,
 the runner uses the emulator's allocated `10.89.x.50:8080` address instead of
 `localhost`; the host connection remains `http://localhost:${KUSTO_PORT:-8080}`.
-Do not share startup logs containing local-development passwords.
+Do not copy the password from its private file into shared logs.
 
 Output is always under `onelake/benchmark/latest/`:
 
