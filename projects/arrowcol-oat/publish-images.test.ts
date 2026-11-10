@@ -53,7 +53,7 @@ ERROR: Could not connect to the registry login server 'arrowcollector99999.azure
 Try running 'az acr check-health -n arrowcollector99999 --yes' to diagnose this issue.
 `;
 
-type Fault = 'identity' | 'digest' | 'architecture' | 'missing-tag' | 'missing-digest' | 'empty-registry' |
+type Fault = 'identity' | 'digest' | 'architecture' | 'missing-tag' | 'missing-digest' | 'older-tags' | 'tag-still-present' | 'unknown-not-found' | 'empty-registry' |
   'registry-absent' | 'auth' | 'dns' | 'timeout' | 'throttle' | 'server' | 'provenance' | 'local-provenance' | 'published-missing';
 
 function mock(registry: string, fault?: Fault) {
@@ -119,12 +119,15 @@ function mock(registry: string, fault?: Fault) {
         const repository = command[command.indexOf('--repository') + 1];
         const count = tagCalls.get(repository) ?? 0;
         tagCalls.set(repository, count + 1);
-        stdout = ['missing-tag', 'missing-digest'].includes(fault ?? '') && repository === 'arrowcol-oat-client' && count > 0 ? '[]' : JSON.stringify([`oat-${revision}`]);
+        stdout = fault === 'older-tags' ? JSON.stringify([`oat-${'f'.repeat(40)}`]) :
+          ['missing-tag', 'missing-digest'].includes(fault ?? '') && repository === 'arrowcol-oat-client' && count > 0 ? '[]' : JSON.stringify([`oat-${revision}`]);
       }
       if (command[2] === 'manifest') {
         const name = command[command.indexOf('--name') + 1];
         if (fault === 'missing-tag' && name.startsWith('arrowcol-oat-client:')) { returncode = 3; stderr = capturedMissingTagStderr; }
         else if (fault === 'missing-digest' && name.startsWith('arrowcol-oat-client:')) { returncode = 3; stderr = capturedMissingDigestStderr; }
+        else if (fault === 'tag-still-present' && name.startsWith('arrowcol-oat-client:')) { returncode = 3; stderr = capturedMissingTagStderr; }
+        else if (fault === 'unknown-not-found' && name.startsWith('arrowcol-oat-client:')) { returncode = 3; stderr = 'ERROR: unrecognized resource was not found.\n'; }
         else if (fault === 'published-missing' && name.startsWith('arrowcol-oat-client:')) { returncode = 3; stderr = capturedMissingTagStderr; }
         else stdout = fault === 'digest' ? 'not-a-digest' : digest;
       }
@@ -260,6 +263,26 @@ test('reads and verifies all five revision tags without building or pushing', as
   assert.ok(m.calls.filter(c => c[0] === 'az' && c[2] === 'manifest').every(c => c.some(arg => arg.includes(`oat-${revision}`))));
 });
 
+test('published image provenance mismatch fails without building or pushing', async t => {
+  const options = fixture(t);
+  const m = mock(options.registry, 'provenance');
+  await assert.rejects(readPublishedImages({ ...options, revision }, m.runner), /revision provenance does not match/);
+  assert.ok(!m.calls.some(c => c[0] === 'docker' && ['buildx', 'push'].includes(c[1])));
+});
+
+test('existing repositories with only older revision tags return exactly the missing roles before metadata lookup', async t => {
+  const options = fixture(t);
+  const m = mock(options.registry, 'older-tags');
+  await assert.rejects(readPublishedImages({ ...options, revision }, m.runner), error => {
+    assert.ok(error instanceof MissingPublishedImagesError);
+    assert.deepEqual(error.missingRoles, ['sqlserver', 'catalog', 'router', 'dataflow', 'client']);
+    return true;
+  });
+  assert.equal(m.calls.filter(c => c.slice(1, 4).join(' ') === 'acr repository show-tags').length, 5);
+  assert.ok(!m.calls.some(c => c.slice(1, 4).join(' ') === 'acr manifest show-metadata'));
+  assert.ok(!m.calls.some(c => c[0] === 'docker' && ['buildx', 'push'].includes(c[1])));
+});
+
 test('empty ACR inventory returns typed missing images without calling manifest lookup', async t => {
   const options = fixture(t);
   const m = mock(options.registry, 'empty-registry');
@@ -285,7 +308,7 @@ test('real az tag-missing stderr becomes typed only after structured tag recheck
   assert.ok(!m.calls.some(c => c[0] === 'docker' && ['buildx', 'push'].includes(c[1])));
 });
 
-test('real manifest-missing fixture is recognized but not-found exit code alone is insufficient', async t => {
+test('real manifest-missing fixture becomes typed after structured tag recheck confirms absence', async t => {
   const options = fixture(t);
   const m = mock(options.registry, 'missing-digest');
   await assert.rejects(readPublishedImages({ ...options, revision }, m.runner), error => {
@@ -296,6 +319,30 @@ test('real manifest-missing fixture is recognized but not-found exit code alone 
   assert.equal(m.calls.filter(c => c.slice(1, 4).join(' ') === 'acr repository show-tags' && c.includes('arrowcol-oat-client')).length, 2);
   assert.ok(capturedMissingTagStderr.includes('7c9221a5-5f81-4cca-8000-4dcab1f95660'));
   assert.ok(capturedMissingDigestStderr.includes('1d08beb8-49e6-40bf-8e20-ca304981052d'));
+});
+
+test('real tag-missing stderr stays hard when the structured recheck still lists the tag', async t => {
+  const options = fixture(t);
+  const m = mock(options.registry, 'tag-still-present');
+  await assert.rejects(readPublishedImages({ ...options, revision }, m.runner), error => {
+    assert.ok(!(error instanceof MissingPublishedImagesError));
+    assert.match(String(error), /the specified tag does not exist/);
+    return true;
+  });
+  assert.equal(m.calls.filter(c => c.slice(1, 4).join(' ') === 'acr repository show-tags' && c.includes('arrowcol-oat-client')).length, 2);
+  assert.ok(!m.calls.some(c => c[0] === 'docker' && ['buildx', 'push'].includes(c[1])));
+});
+
+test('exit code three with unrecognized wording stays hard without a tag recheck', async t => {
+  const options = fixture(t);
+  const m = mock(options.registry, 'unknown-not-found');
+  await assert.rejects(readPublishedImages({ ...options, revision }, m.runner), error => {
+    assert.ok(!(error instanceof MissingPublishedImagesError));
+    assert.match(String(error), /unrecognized resource was not found/);
+    return true;
+  });
+  assert.equal(m.calls.filter(c => c.slice(1, 4).join(' ') === 'acr repository show-tags' && c.includes('arrowcol-oat-client')).length, 1);
+  assert.ok(!m.calls.some(c => c[0] === 'docker' && ['buildx', 'push'].includes(c[1])));
 });
 
 test('registry absence and authorization errors remain hard failures', async t => {
