@@ -5,6 +5,7 @@ import test from 'node:test';
 import { parse, stringify } from 'yaml';
 import { ROOT, run_tree, TAGS } from '../../infra/azure/bootstrap.js';
 import { deploy, deployInfrastructure, main, pickStamp } from './aks-deploy.js';
+import { renderStampConfig } from './aks-stamp.js';
 
 const subscription = '00000000-0000-0000-0000-000000000001';
 const stamp = '89152';
@@ -121,6 +122,7 @@ test('fresh success is one azure pass, records explicit postconditions and priva
   assert.ok(Object.values(f.receipt().postconditions).every(value => value === true));
   assert.equal(fs.statSync(result.receiptPath).mode & 0o777, 0o600);
   assert.equal(parse(fs.readFileSync(f.options.stampConfig, 'utf8')).stamp, stamp);
+  assert.equal(fs.readFileSync(f.options.stampConfig, 'utf8'), renderStampConfig(f.original, { stamp }));
 });
 
 test('only proven AKS failure deletes that cluster and retries Cilium once', async t => {
@@ -131,6 +133,7 @@ test('only proven AKS failure deletes that cluster and retries Cilium once', asy
   assert.equal(f.calls.filter(call => call[2] === 'delete').length, 1);
   assert.deepEqual(f.receipt().networkPath, ['azure', 'cilium']);
   assert.match(f.receipt().attempts[0].error, /ARM rejected creation/);
+  assert.equal(fs.readFileSync(f.options.stampConfig, 'utf8'), renderStampConfig(f.original, { stamp }));
 });
 
 for (const fault of ['other', 'missing-target', 'timeout'] as const) {

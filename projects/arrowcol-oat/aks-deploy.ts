@@ -7,8 +7,9 @@ import { Config, ROOT, run_tree } from '../../infra/azure/bootstrap.js';
 import { loadStampConfig, type StampConfig } from '../../infra/azure/stamp.js';
 import type { AksNetworkMode, DeployAttempt, DeployOptions, DeployResult } from './aks-types.js';
 import { setup } from './aks-setup.js';
+import { renderStampConfig } from './aks-stamp.js';
 
-type Options = DeployOptions & { subscription?: string };
+type Options = DeployOptions;
 type Network = Exclude<AksNetworkMode, 'auto'>;
 type Json = Record<string, unknown>;
 const GROUP = 'arrow-collector-rg';
@@ -131,10 +132,8 @@ export async function deployInfrastructure(options: Options, runner: typeof run_
   }
   if (!available) throw new Error('Could not find an available stamp after 10 candidates; no resources were created.');
 
-  const document = parseDocument(fs.readFileSync(configPath, 'utf8'));
-  if (document.errors.length) throw new Error('Invalid private stamp YAML.');
-  document.set('stamp', stamp);
-  document.setIn(['aks', 'networkDataplane'], network);
+  const original = fs.readFileSync(configPath, 'utf8');
+  const persisted = renderStampConfig(original, { stamp });
   const selected: StampConfig = { ...config, stamp, aks: { ...config.aks, networkDataplane: network } };
   bootstrapEnvironment = {
     ...Object.fromEntries(Object.entries(process.env).filter(([key]) =>
@@ -146,8 +145,8 @@ export async function deployInfrastructure(options: Options, runner: typeof run_
   const work = fs.mkdtempSync(path.join(STATE, '.deploy-'));
   fs.chmodSync(work, 0o700);
   const candidatePath = path.join(work, 'stamp.yaml');
-  privateWrite(candidatePath, document.toString());
-  const bootstrap = (command: string, filename = configPath) =>
+  privateWrite(candidatePath, renderStampConfig(original, { stamp, network }));
+  const bootstrap = (command: string, filename: string) =>
     ['npx', '--no-install', 'tsx', 'infra/azure/bootstrap.ts', command, '--stamp-config', filename];
   const receiptPath = path.join(STATE, 'receipts', `deploy-${stamp}.yaml`);
   const attempts: DeployAttempt[] = [];
@@ -170,14 +169,14 @@ export async function deployInfrastructure(options: Options, runner: typeof run_
       console.log(`Read-only ARM what-if complete; private stamp YAML unchanged. Receipt: ${receiptPath}`);
       return { stamp, network, attempts, receiptPath };
     }
-    privateWrite(configPath, document.toString());
+    privateWrite(configPath, persisted);
     for (let pass = 1; pass <= 2; pass++) {
       console.log(`Provisioning pass ${pass}/2: stamp ${stamp}, network ${current} (timeout ${PROVISION_SECONDS}s).`);
       receipt.networkPath = [...attempts.map(attempt => attempt.network), current];
       save();
       let provision: Awaited<ReturnType<typeof runner>>;
       try {
-        provision = await exec([...bootstrap('provision'), '--wait-seconds', '600'], PROVISION_SECONDS);
+        provision = await exec([...bootstrap('provision', candidatePath), '--wait-seconds', '600'], PROVISION_SECONDS);
       } catch (error) {
         attempts.push({ network: current, outcome: 'other-failure', error: safeError(String(error)) });
         throw error;
@@ -208,8 +207,7 @@ export async function deployInfrastructure(options: Options, runner: typeof run_
         if (remaining.some(cluster => cluster.name === `arrow-collector-${stamp}`))
           throw new Error('Failed cluster is still present; refusing a dataplane change.');
         current = 'cilium';
-        document.setIn(['aks', 'networkDataplane'], current);
-        privateWrite(configPath, document.toString());
+        privateWrite(candidatePath, renderStampConfig(original, { stamp, network: current }));
         continue;
       }
       if (pass === 1 && provision.returncode === 3 && !clusterFailure) {
