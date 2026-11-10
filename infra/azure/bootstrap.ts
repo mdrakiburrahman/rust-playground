@@ -822,7 +822,8 @@ export async function checkpoint_container(azure: Azure): Promise<any> {
 const ARM_WHAT_IF_CHANGE_TYPES = new Set([
   'Create', 'Delete', 'Modify', 'NoChange', 'Ignore', 'Deploy', 'NoEffect', 'Unsupported',
 ]);
-const ARM_WHAT_IF_RESOURCE_TYPES = new Set([
+export const ARM_WHAT_IF_RESOURCE_TYPES = new Set([
+  'microsoft.resources/resourcegroups',
   'microsoft.authorization/roleassignments',
   'microsoft.containerregistry/registries',
   'microsoft.containerservice/managedclusters',
@@ -843,6 +844,9 @@ const ARM_WHAT_IF_RESOURCE_TYPES = new Set([
   'microsoft.storage/storageaccounts/blobservices',
   'microsoft.storage/storageaccounts/blobservices/containers',
 ]);
+export const ARM_WHAT_IF_EXTENSION_TYPES = new Set([
+  'microsoft.authorization/roleassignments',
+]);
 const ARM_WHAT_IF_REMOVED_VALUES = new Set(['<null>', '<deleted>', '<removed>', '<not specified>']);
 function verified_arm_what_if_resource_scope(resourceId: string, config: Config): void {
   const base = config.base;
@@ -853,11 +857,32 @@ function verified_arm_what_if_resource_scope(resourceId: string, config: Config)
   if (!resourceId.toLowerCase().startsWith(prefix.toLowerCase()))
     throw new Failure('ARM what-if contains a resource outside the selected subscription and resource group.');
   const segments = resourceId.slice(prefix.length).split('/');
-  if (segments.length < 3 || (segments.length - 1) % 2 !== 0 || segments.some(segment => !segment))
+  if (segments.length < 3 || segments.some(segment => !segment))
     throw new Failure('ARM what-if returned an invalid resource identifier.');
-  const resourceType = [segments[0], ...segments.slice(1).filter((_, index) => index % 2 === 0)].join('/').toLowerCase();
-  if (!ARM_WHAT_IF_RESOURCE_TYPES.has(resourceType))
-    throw new Failure('ARM what-if contains a resource type outside the allowed deployment templates.');
+  let segment = 0;
+  let providerIndex = 0;
+  while (segment < segments.length) {
+    const namespace = segments[segment++];
+    if (!namespace || namespace.toLowerCase() === 'providers')
+      throw new Failure('ARM what-if returned an invalid resource identifier.');
+    const typeNames: string[] = [];
+    while (segment < segments.length && segments[segment]!.toLowerCase() !== 'providers') {
+      const type = segments[segment];
+      const name = segments[segment + 1];
+      if (!type || !name) throw new Failure('ARM what-if returned an invalid resource identifier.');
+      typeNames.push(type);
+      segment += 2;
+    }
+    if (!typeNames.length) throw new Failure('ARM what-if returned an invalid resource identifier.');
+    const resourceType = `${namespace}/${typeNames.join('/')}`.toLowerCase();
+    const allowedTypes = providerIndex === 0 ? ARM_WHAT_IF_RESOURCE_TYPES : ARM_WHAT_IF_EXTENSION_TYPES;
+    if (!allowedTypes.has(resourceType))
+      throw new Failure('ARM what-if contains a resource type outside the allowed deployment templates.');
+    if (segment < segments.length) {
+      segment++;
+      providerIndex++;
+    }
+  }
 }
 function arm_what_if_value_removed(before: unknown, after: unknown): boolean {
   if (before !== undefined && before !== null && (after === null ||
@@ -876,30 +901,87 @@ function arm_what_if_value_removed(before: unknown, after: unknown): boolean {
   }
   return false;
 }
-function arm_what_if_tag_property(propertyPath: string): boolean {
-  const path = propertyPath.toLowerCase();
-  return path === 'tags' || path.startsWith('tags.') || path.startsWith('tags/') || path.startsWith('tags[');
+function arm_what_if_record(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value));
+}
+function arm_what_if_equal(left: unknown, right: unknown): boolean {
+  return canonical_json(left) === canonical_json(right);
+}
+function arm_what_if_tag_delta_key(path: string, keys: string[]): string | undefined {
+  const normalized = path.replace(/^\//, '').toLowerCase();
+  return keys.find(key => {
+    const tagPath = key.toLowerCase();
+    return normalized === `tags.${tagPath}` || normalized === `tags/${tagPath}`;
+  });
 }
 function verify_arm_what_if_modify(item: Record<string, unknown>): void {
+  if (!arm_what_if_record(item.before) || !arm_what_if_record(item.after))
+    throw new Failure('ARM what-if Modify has no verifiable before/after resource snapshots.');
+  const before = item.before;
+  const after = item.after;
+  const propertyNames = new Set([...Object.keys(before), ...Object.keys(after)]);
+  for (const name of propertyNames) {
+    if (name === 'tags') continue;
+    if (!Object.hasOwn(before, name) || !Object.hasOwn(after, name) || !arm_what_if_equal(before[name], after[name]))
+      throw new Failure('ARM what-if Modify changes a non-tag resource property.');
+  }
+  const beforeHasTags = Object.hasOwn(before, 'tags');
+  const afterHasTags = Object.hasOwn(after, 'tags');
+  const beforeTagsValue = beforeHasTags ? before.tags : {};
+  const afterTagsValue = afterHasTags ? after.tags : {};
+  if (!arm_what_if_record(beforeTagsValue) || !arm_what_if_record(afterTagsValue) ||
+      [...Object.values(beforeTagsValue), ...Object.values(afterTagsValue)].some(value => typeof value !== 'string'))
+    throw new Failure('ARM what-if Modify has unverifiable tag snapshots.');
+  const beforeTags = beforeTagsValue;
+  const afterTags = afterTagsValue;
+  const tagKeys = new Set([...Object.keys(beforeTags), ...Object.keys(afterTags)]);
+  const changedTags = [...tagKeys].filter(key => !Object.hasOwn(beforeTags, key) || !Object.hasOwn(afterTags, key) ||
+    !arm_what_if_equal(beforeTags[key], afterTags[key]));
+  if (!changedTags.length || arm_what_if_value_removed(beforeTags, afterTags))
+    throw new Failure('ARM what-if Modify is empty or removes an existing tag.');
   if (!Array.isArray(item.delta) || item.delta.length === 0)
     throw new Failure('ARM what-if Modify has no verifiable property delta.');
+  let wholeTagsDelta = false;
+  const verifiedTagKeys = new Set<string>();
   for (const value of item.delta) {
     if (!value || typeof value !== 'object' || Array.isArray(value))
       throw new Failure('ARM what-if Modify has an invalid property delta.');
     const delta = value as Record<string, unknown>;
-    if (typeof delta.propertyPath !== 'string' || !delta.propertyPath.trim() ||
-        !Object.prototype.hasOwnProperty.call(delta, 'before') ||
-        !Object.prototype.hasOwnProperty.call(delta, 'after'))
+    if (typeof delta.path !== 'string' || !delta.path.trim() || typeof delta.propertyChangeType !== 'string')
       throw new Failure('ARM what-if Modify has an incomplete property delta.');
-    if (delta.propertyPath.trim().toLowerCase() === 'tags' &&
-        (delta.after === null || typeof delta.after !== 'object' || Array.isArray(delta.after) ||
-         (delta.before !== null && typeof delta.before !== 'object')))
-      throw new Failure('ARM what-if Modify has an unverifiable tags object.');
-    if (arm_what_if_value_removed(delta.before, delta.after))
-      throw new Failure('ARM what-if Modify removes an existing property.');
-    if (!arm_what_if_tag_property(delta.propertyPath))
-      throw new Failure('ARM what-if Modify changes a non-tag property.');
+    const changeType = delta.propertyChangeType;
+    if (delta.path.trim().toLowerCase() === 'tags') {
+      if (wholeTagsDelta || item.delta.length !== 1)
+        throw new Failure('ARM what-if Modify has overlapping tag deltas.');
+      wholeTagsDelta = true;
+      if (changeType === 'Create') {
+        if (beforeHasTags || !afterHasTags || Object.hasOwn(delta, 'before') || !Object.hasOwn(delta, 'after') ||
+            !arm_what_if_equal(delta.after, afterTags))
+          throw new Failure('ARM what-if Modify has an inconsistent tag creation delta.');
+      } else if (changeType === 'Modify') {
+        if (!beforeHasTags || !afterHasTags || !Object.hasOwn(delta, 'before') || !Object.hasOwn(delta, 'after') ||
+            !arm_what_if_equal(delta.before, beforeTags) || !arm_what_if_equal(delta.after, afterTags))
+          throw new Failure('ARM what-if Modify has an inconsistent tag modification delta.');
+      } else throw new Failure('ARM what-if Modify has an unsupported tag change type.');
+      continue;
+    }
+    const key = arm_what_if_tag_delta_key(delta.path.trim(), changedTags);
+    if (!key || verifiedTagKeys.has(key)) throw new Failure('ARM what-if Modify has an unexpected or duplicate property delta.');
+    verifiedTagKeys.add(key);
+    const beforeHasKey = Object.hasOwn(beforeTags, key);
+    const afterHasKey = Object.hasOwn(afterTags, key);
+    if (changeType === 'Create') {
+      if (beforeHasKey || !afterHasKey || Object.hasOwn(delta, 'before') || !Object.hasOwn(delta, 'after') ||
+          !arm_what_if_equal(delta.after, afterTags[key]))
+        throw new Failure('ARM what-if Modify has an inconsistent tag creation delta.');
+    } else if (changeType === 'Modify') {
+      if (!beforeHasKey || !afterHasKey || !Object.hasOwn(delta, 'before') || !Object.hasOwn(delta, 'after') ||
+          !arm_what_if_equal(delta.before, beforeTags[key]) || !arm_what_if_equal(delta.after, afterTags[key]))
+        throw new Failure('ARM what-if Modify has an inconsistent tag modification delta.');
+    } else throw new Failure('ARM what-if Modify removes or has an unsupported tag change.');
   }
+  if (!wholeTagsDelta && changedTags.some(key => !verifiedTagKeys.has(key)))
+    throw new Failure('ARM what-if Modify property deltas do not cover all tag snapshot changes.');
 }
 function verified_arm_what_if_changes(result: unknown, config: Config): number {
   if (!result || typeof result !== 'object' || Array.isArray(result))
@@ -918,6 +1000,7 @@ function verified_arm_what_if_changes(result: unknown, config: Config): number {
     verified_arm_what_if_resource_scope(item.resourceId, config);
     if (item.changeType === 'Delete') throw new Failure('ARM what-if contains a resource deletion.');
     if (item.changeType === 'Unsupported') throw new Failure('ARM what-if contains an unsupported resource change.');
+    if (item.changeType === 'Deploy') throw new Failure('ARM what-if contains an unverifiable deployment-only change.');
     if (item.changeType === 'Modify') verify_arm_what_if_modify(item);
   }
   return response.changes.length;
@@ -958,6 +1041,7 @@ export async function deploy(azure: Azure, fresh?: Metadata, whatIf = false, pre
   try {
     const parametersSha256 = sha256_file(filename);
     const invoke = (operation: 'what-if' | 'create') => azure.cli('deployment', 'sub', operation,
+      ...(operation === 'what-if' ? ['--result-format', 'FullResourcePayloads', '--no-pretty-print'] : []),
       '--subscription', c.subscription, '--location', c.location, '--name', 'arrowcol-sandbox-' + c.sandbox,
       '--template-file', template, '--parameters', '@' + filename);
     if (whatIf || previewBeforeCreate) {

@@ -73,12 +73,16 @@ attempt and any allowed Cilium or convergence retry. Bootstrap reuses the same
 resolved stamp, reset authority, resource-group/UAMI locations and tags, template
 path, and private parameter file for each preview and its create. A failed,
 timed-out, or unverified preview stops before creation and cannot trigger network
-fallback. The validator rejects deletions, resource IDs outside the selected
-subscription/resource group, unexpected resource types, and Modify changes that
-remove properties or change anything other than tags. Complete tag-only Modify
-deltas remain allowed for existing resource-group and shared-identity metadata.
-The direct `bootstrap.ts provision` command requires
-`--preview-before-create` to enable this guard. The standalone
+fallback. The preview pins Azure CLI to `--result-format FullResourcePayloads` and
+`--no-pretty-print`. The validator rejects deletions, `Deploy` and unsupported
+changes, resource IDs outside the selected subscription/resource group, and
+resource types outside the templates; extension-resource role assignments are
+accepted only when both the parent and extension types are allowlisted. A
+`Modify` is accepted only when the full before/after snapshots prove that tags
+are the only changed resource property and provider `path`/`propertyChangeType`
+deltas account for every tag change. Tag removals, incomplete snapshots, or an
+unverifiable delta fail closed. The direct `bootstrap.ts provision` command
+requires `--preview-before-create` to enable this guard. The standalone
 `aks deploy --what-if` command remains read-only.
 
 In stamped mode, the shared runtime UAMI also has container-scoped Blob Data
