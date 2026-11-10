@@ -53,7 +53,11 @@ fn non_loopback_api_requires_explicit_opt_in_and_loopback_still_works() -> std::
     }
     for (host, allow_remote) in [("127.0.0.1", false), ("0.0.0.0", true)] {
         let mut server = start(&format!("{host}:0"), allow_remote)?;
-        let stdout = server.0.stdout.take().expect("server stdout is piped");
+        let stdout = server
+            .0
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("server stdout is not piped"))?;
         let (sender, receiver) = std::sync::mpsc::channel();
         let reader = std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
@@ -69,15 +73,17 @@ fn non_loopback_api_requires_explicit_opt_in_and_loopback_still_works() -> std::
         });
         let line = receiver
             .recv_timeout(Duration::from_secs(3))
-            .expect("server must report its bound address");
-        reader.join().expect("server log reader panicked");
+            .map_err(|error| std::io::Error::other(format!("server did not report its bound address: {error}")))?;
+        reader
+            .join()
+            .map_err(|_| std::io::Error::other("server log reader panicked"))?;
         let bound: SocketAddr = line
             .split("address=")
             .nth(1)
             .and_then(|value| value.split_whitespace().next())
-            .expect("listener log must contain its address")
+            .ok_or_else(|| std::io::Error::other("listener log does not contain its address"))?
             .parse()
-            .expect("listener log must contain a socket address");
+            .map_err(|error| std::io::Error::other(format!("invalid listener socket address: {error}")))?;
         assert_ne!(bound.port(), 0, "server must report its actual assigned port");
         let deadline = Instant::now() + Duration::from_secs(3);
         let address = SocketAddr::from(([127, 0, 0, 1], bound.port()));
