@@ -28,6 +28,7 @@ pub const INTERNAL_AUTH_EXPIRES_HEADER: &str = "x-arrowcol-internal-auth-expires
 pub const INTERNAL_AUTH_SIGNATURE_HEADER: &str = "x-arrowcol-internal-auth-signature";
 
 const MAX_NONCE_BYTES: usize = 64;
+const MAX_REPLAY_NONCES: usize = 65_536;
 const MAX_SIGNATURE_BYTES: usize = 128;
 const MAX_INTERNAL_CONTEXT_BYTES: usize = 3_072;
 
@@ -57,6 +58,9 @@ pub enum AuthFailureKind {
     /// The authenticated principal was not authorized.
     #[error("authenticated principal is forbidden")]
     Forbidden,
+    /// Replay protection cannot safely admit another live assertion.
+    #[error("edge replay cache is full")]
+    ReplayCapacity,
     /// Signing configuration or principal serialization failed.
     #[error("authentication subsystem failed")]
     Internal,
@@ -265,14 +269,20 @@ impl EdgeVerifier {
             .seen_nonces
             .lock()
             .map_err(|_| AuthFailure::new(AuthFailureKind::Internal, "edge replay cache is unavailable"))?;
-        seen.retain(|_, expiry| *expiry > now.get());
+        seen.retain(|_, expiry| *expiry >= now.get());
         if seen.contains_key(nonce) {
             return Err(AuthFailure::new(
                 AuthFailureKind::Invalid,
                 "edge assertion nonce was replayed",
             ));
         }
-        seen.insert(nonce.to_owned(), now.get().saturating_add(self.max_age_ms));
+        if seen.len() >= MAX_REPLAY_NONCES {
+            return Err(AuthFailure::new(
+                AuthFailureKind::ReplayCapacity,
+                "edge replay cache is full; retry after assertions expire",
+            ));
+        }
+        seen.insert(nonce.to_owned(), timestamp.get().saturating_add(self.max_age_ms));
         Ok(())
     }
 }
@@ -495,4 +505,74 @@ pub fn insert_edge_signature_headers(
             .map_err(|_| AuthFailure::new(AuthFailureKind::Internal, "could not encode edge signature"))?,
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+
+    fn now(value: u64) -> UnixMillis {
+        UnixMillis::new(value).unwrap_or_else(|error| panic!("invalid test timestamp: {error}"))
+    }
+
+    fn headers(timestamp: u64, nonce: &str) -> Result<HeaderMap, AuthFailure> {
+        let signer = EdgeRequestSigner::new(vec![7_u8; 32])?;
+        let mut headers = HeaderMap::new();
+        insert_edge_signature_headers(&mut headers, &signer, &Method::POST, "/flight", now(timestamp), nonce)?;
+        Ok(headers)
+    }
+
+    #[test]
+    fn full_replay_cache_rejects_new_nonce_preserves_live_entries_and_reclaims_expired() -> Result<(), AuthFailure> {
+        let verifier = EdgeVerifier::new(vec![7_u8; 32], 30_000)?;
+        {
+            let mut seen = verifier
+                .seen_nonces
+                .lock()
+                .unwrap_or_else(|error| panic!("lock replay cache: {error}"));
+            for index in 0..65_536 {
+                seen.insert(format!("live-{index}"), 130_000);
+            }
+        }
+        let Err(failure) = verifier.verify(&Method::POST, "/flight", &headers(100_000, "new")?, now(100_000)) else {
+            panic!("full replay cache must reject a new nonce");
+        };
+        assert_eq!(
+            failure.message(),
+            "edge replay cache is full; retry after assertions expire"
+        );
+        assert_eq!(failure.kind(), AuthFailureKind::ReplayCapacity);
+        let replay = verifier.verify(&Method::POST, "/flight", &headers(100_000, "live-0")?, now(100_000));
+        assert!(replay.is_err_and(|failure| failure.message() == "edge assertion nonce was replayed"));
+        {
+            let seen = verifier
+                .seen_nonces
+                .lock()
+                .unwrap_or_else(|error| panic!("lock replay cache: {error}"));
+            assert_eq!(seen.len(), 65_536);
+            assert!(!seen.contains_key("new"));
+        }
+        verifier.verify(&Method::POST, "/flight", &headers(130_001, "new")?, now(130_001))?;
+        let seen = verifier
+            .seen_nonces
+            .lock()
+            .unwrap_or_else(|error| panic!("lock replay cache: {error}"));
+        assert_eq!(seen.len(), 1);
+        assert!(seen.contains_key("new"));
+        Ok(())
+    }
+
+    #[test]
+    fn future_dated_nonce_remains_protected_through_its_last_valid_millisecond() -> Result<(), AuthFailure> {
+        let verifier = EdgeVerifier::new(vec![7_u8; 32], 30_000)?;
+        let signed = headers(130_000, "future")?;
+        verifier.verify(&Method::POST, "/flight", &signed, now(100_000))?;
+        for timestamp in [130_000, 160_000] {
+            let Err(failure) = verifier.verify(&Method::POST, "/flight", &signed, now(timestamp)) else {
+                panic!("still-valid assertion must remain protected from replay at {timestamp}");
+            };
+            assert_eq!(failure.message(), "edge assertion nonce was replayed");
+        }
+        Ok(())
+    }
 }

@@ -867,6 +867,7 @@ fn auth_reason(kind: AuthFailureKind) -> &'static str {
         AuthFailureKind::Invalid => "invalid",
         AuthFailureKind::ForgedInternalIdentity => "forged_internal_identity",
         AuthFailureKind::Forbidden => "forbidden",
+        AuthFailureKind::ReplayCapacity => "replay_capacity",
         AuthFailureKind::Internal => "internal",
     }
 }
@@ -874,6 +875,7 @@ fn auth_reason(kind: AuthFailureKind) -> &'static str {
 fn auth_grpc_status(kind: AuthFailureKind) -> u16 {
     match kind {
         AuthFailureKind::Forbidden => 7,
+        AuthFailureKind::ReplayCapacity => 8,
         AuthFailureKind::Internal => 13,
         AuthFailureKind::Missing | AuthFailureKind::Invalid | AuthFailureKind::ForgedInternalIdentity => 16,
     }

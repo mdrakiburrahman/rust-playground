@@ -82,6 +82,13 @@ Assertions are time-bounded and
 nonces are replay-protected in process. Direct traffic, tampering, replay, and
 externally supplied `x-arrowcol-internal-auth-*` headers are rejected.
 
+Replay memory admits at most 65,536 nonces per router process. Expired assertions
+are removed before admission; a full cache rejects new assertions with gRPC
+`RESOURCE_EXHAUSTED` rather than growing or evicting live nonces. Nonces remain
+protected through the assertion's last valid millisecond, including accepted
+future clock skew. Size edge rate limits for this capacity and the configured
+assertion lifetime; replay protection is process-local, not shared across replicas.
+
 Startup requires an explicit `auth.authenticator: dev_only_allow_all`. Missing,
 legacy `allow_all`, and unknown modes are rejected before listeners start.
 This development-only mode grants the same principal to every **edge-verified**
