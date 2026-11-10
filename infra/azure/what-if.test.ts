@@ -89,6 +89,41 @@ const identityId = resourceGroupId + '/providers/Microsoft.ManagedIdentity/userA
 const clusterId = resourceGroupId + '/providers/Microsoft.Kusto/clusters/arrow-collector-89152';
 for (const envelope of ['flat CLI', 'nested REST']) {
   for (const scenario of [
+    { name: 'code and message', fields: { code: [], message: 42 } },
+    { name: 'code', fields: { code: [] } },
+    { name: 'message', fields: { message: 42 } },
+    { name: 'target', fields: { target: [] } },
+    { name: 'additionalInfo list', fields: { additionalInfo: {} } },
+    { name: 'additionalInfo entry', fields: { additionalInfo: [null] } },
+    { name: 'additionalInfo type', fields: { additionalInfo: [{ type: 42 }] } },
+    { name: 'additionalInfo object', fields: { additionalInfo: [{ info: [] }] } },
+  ]) {
+    test(`R5 refuses malformed Info ${scenario.name} in ${envelope} before create`, async () => {
+      const stamp = defaultStampConfig({ AZURE_STAMP: '89152' });
+      stamp.subscription = subscription;
+      const azure = new Azure(new Config({ AZURE_SUBSCRIPTION_ID: subscription }, stamp));
+      azure.arm = async () => null;
+      const calls: string[] = [], logs: string[] = [];
+      const originalLog = console.log;
+      console.log = (...values) => logs.push(values.join(' '));
+      azure.cli = async (...args) => {
+        calls.push(args[2]!);
+        if (args[2] !== 'what-if') throw new Failure('DeploymentFailed: simulated create rejection');
+        const body = { changes: [], diagnostics: [
+          { level: 'Info', code: 'PreviewInformation', message: 'Template evaluated.', ...scenario.fields },
+        ] };
+        return envelope === 'flat CLI' ? { status: 'Succeeded', ...body } : { status: 'Succeeded', properties: body };
+      };
+      try { await assert.rejects(provision(azure, '', 0, '/tmp/arrowcol-preview-test-output', true, {}, true), ArmPreviewFailure); }
+      finally { console.log = originalLog; }
+      assert.deepEqual(calls, ['what-if']);
+      assert.equal(logs.some(line => line.startsWith('ARM_PREVIEW_VERIFIED')), false);
+    });
+  }
+}
+
+for (const envelope of ['flat CLI', 'nested REST']) {
+  for (const scenario of [
     { name: 'Error', diagnostics: [{ level: 'Error', code: 'ProviderEvaluationFailed' }],
       error: /level=Error code=ProviderEvaluationFailed/ },
     { name: 'Warning', diagnostics: [{ level: 'Warning', code: 'NestedDeploymentShortCircuited' }],
@@ -134,7 +169,9 @@ for (const envelope of ['flat CLI', 'nested REST']) {
       calls.push(args[2]!);
       if (args[2] !== 'what-if') throw new Failure('DeploymentFailed: simulated create rejection');
       const body = { changes: [], diagnostics: [
-        { level: 'Info', code: 'PreviewInformation', message: 'All template resources evaluated.' },
+        { level: 'Info' },
+        { level: 'Info', code: 'PreviewInformation', message: 'All template resources evaluated.',
+          target: 'template', additionalInfo: [{}, { type: 'EvaluationInfo', info: { stages: ['what-if'] } }] },
       ] };
       return envelope === 'flat CLI' ? { status: 'Succeeded', ...body } : { status: 'Succeeded', properties: body };
     };

@@ -1103,10 +1103,18 @@ async function verified_arm_what_if_changes(result: unknown, azure: Azure): Prom
     if (!Array.isArray(diagnostics)) throw new Failure('ARM what-if response has an invalid diagnostics list.');
     for (const diagnostic of diagnostics) {
       if (!arm_what_if_record(diagnostic)) throw new Failure('ARM what-if returned an invalid diagnostic entry.');
-      const label = 'level=' + String(diagnostic.level ?? '<missing>') + ' code=' + String(diagnostic.code ?? '<missing>');
+      const label = 'level=' + String(diagnostic.level ?? '<missing>') + ' code=' +
+        (typeof diagnostic.code === 'string' ? diagnostic.code : diagnostic.code === undefined ? '<missing>' : '<invalid>');
+      if (['code', 'message', 'target'].some(key => diagnostic[key] !== undefined && typeof diagnostic[key] !== 'string'))
+        throw new Failure('ARM what-if diagnostic ' + label + ' has invalid string metadata.');
+      const additionalInfo = diagnostic.additionalInfo;
+      if (additionalInfo !== undefined && (!Array.isArray(additionalInfo) || additionalInfo.some(info =>
+        !arm_what_if_record(info) || (info.type !== undefined && typeof info.type !== 'string') ||
+        (info.info !== undefined && !arm_what_if_record(info.info)))))
+        throw new Failure('ARM what-if diagnostic ' + label + ' has invalid additional info.');
       if (diagnostic.level !== 'Info')
         throw new Failure('ARM what-if diagnostic ' + label + ' prevents a verified preview.');
-      console.log(config.redact('ARM what-if diagnostic ' + label + ' message=' + String(diagnostic.message ?? '<missing>')));
+      console.log(config.redact('ARM what-if diagnostic ' + label + ' message=' + (diagnostic.message ?? '<missing>')));
     }
   }
   if (!Array.isArray(properties.changes)) throw new Failure('ARM what-if response is missing its changes list.');
