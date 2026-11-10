@@ -1287,7 +1287,7 @@ pub async fn execute(
     id: &str,
     state: Arc<AppState>,
     cancellation: watch::Receiver<bool>,
-) -> Result<usize> {
+) -> Result<RunOutcome> {
     config.validate()?;
     state
         .update(id, |status| {
@@ -1305,13 +1305,23 @@ pub async fn execute(
         })
         .await;
     let result_count = outcome.rows.len();
+    let cancelled = outcome.cancelled;
     publish_matrix_outcome(&config, outcome).await?;
-    Ok(result_count)
+    Ok(RunOutcome {
+        result_count,
+        cancelled,
+    })
+}
+
+pub struct RunOutcome {
+    pub result_count: usize,
+    pub cancelled: bool,
 }
 
 struct MatrixOutcome {
     rows: Vec<OatResult>,
     error: Option<anyhow::Error>,
+    cancelled: bool,
 }
 
 async fn publish_matrix_outcome(config: &OatConfig, outcome: MatrixOutcome) -> Result<()> {
@@ -1384,16 +1394,25 @@ where
             ),
         };
         results.append(&mut cell.rows);
+        if cell.cancelled {
+            return MatrixOutcome {
+                rows: results,
+                error: None,
+                cancelled: true,
+            };
+        }
         if cell.error.is_some() {
             return MatrixOutcome {
                 rows: results,
                 error: cell.error,
+                cancelled: false,
             };
         }
     }
     MatrixOutcome {
         rows: results,
         error: None,
+        cancelled: false,
     }
 }
 
@@ -1419,7 +1438,7 @@ async fn run_isolated_cell(
             );
         }
     };
-    let result = tokio::select! {
+    let (result, cancelled) = tokio::select! {
         result = async {
             match platform.ensure_stack(&config).await {
                 Ok(()) => {
@@ -1435,10 +1454,17 @@ async fn run_isolated_cell(
                 }
                 Err(error) => Err(error).context("prepare isolated OAT matrix-cell platform"),
             }
-        } => result,
-        _ = wait_for_cancellation(&mut cancellation) => Err(anyhow::anyhow!("local OAT run cancelled")),
+        } => (result, false),
+        _ = wait_for_cancellation(&mut cancellation) => (Err(anyhow::anyhow!("local OAT run cancelled")), true),
     };
     let cleanup = platform.cleanup(&config).await;
+    if cancelled && cleanup.is_ok() {
+        return MatrixOutcome {
+            rows: Vec::new(),
+            error: None,
+            cancelled: true,
+        };
+    }
     finish_matrix_cell(
         &config,
         orchestration_id,
@@ -1544,7 +1570,11 @@ fn finish_matrix_cell(
             }
         }
     }
-    MatrixOutcome { rows, error }
+    MatrixOutcome {
+        rows,
+        error,
+        cancelled: false,
+    }
 }
 
 fn matrix_cell_specs(config: &OatConfig) -> Vec<(u32, u32, String)> {
@@ -5828,6 +5858,58 @@ mod tests {
             local_oat_client_remove_args(&["client-a".to_owned(), "client-b".to_owned()]),
             ["rm", "--force", "client-a", "client-b"]
         );
+    }
+
+    #[test]
+    fn cleanup_failure_after_cancellation_is_not_reported_as_cleaned() -> Result<()> {
+        let config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        let outcome = finish_matrix_cell(
+            &config,
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+            1,
+            1,
+            Err(anyhow::anyhow!("local OAT run cancelled")),
+            Err(anyhow::anyhow!("fixture cleanup failure")),
+        );
+        assert!(!outcome.cancelled);
+        assert!(outcome.error.is_some());
+        assert!(outcome.rows.iter().any(|row| {
+            row.failure
+                .as_deref()
+                .is_some_and(|failure| failure.contains("fixture cleanup failure"))
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_stops_matrix_after_the_cleaned_cell() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.replica_counts = vec![1, 2];
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let call_counter = std::sync::Arc::clone(&calls);
+        let outcome = run_matrix_with(
+            &config,
+            "11111111-1111-4111-8111-111111111111",
+            &AppState::default(),
+            move |_, _, _, _| {
+                call_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(MatrixOutcome {
+                    rows: Vec::new(),
+                    error: None,
+                    cancelled: true,
+                })
+            },
+        )
+        .await;
+        assert!(outcome.cancelled);
+        assert!(outcome.error.is_none());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        Ok(())
     }
 
     #[test]

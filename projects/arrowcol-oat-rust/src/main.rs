@@ -109,29 +109,27 @@ async fn start_run(
 
     let local = config.platform.kind == OatMode::Local;
     let cancellation = state.register_run_cancel(&id, local).await;
-    let was_cancelled = cancellation.clone();
     let task_state = Arc::clone(&state);
     tokio::spawn(async move {
         let _permit = permit;
         let result = arrowcol_oat_rust::runner::execute(config, &id, Arc::clone(&task_state), cancellation).await;
-        if *was_cancelled.borrow() {
-            task_state
-                .update(&id, |status| {
-                    status.state = RunState::Cancelled;
-                    status.progress = "local resources cleaned after cancellation".to_owned();
-                    status.error = Some("run cancelled by request".to_owned());
-                    status.finished_at_unix_ms = Some(unix_time_ms());
-                })
-                .await;
-            return;
-        }
         match result {
-            Ok(result_count) => {
+            Ok(outcome) if outcome.cancelled => {
+                task_state
+                    .update(&id, |status| {
+                        status.state = RunState::Cancelled;
+                        status.progress = "local resources cleaned after cancellation".to_owned();
+                        status.error = Some("run cancelled by request".to_owned());
+                        status.finished_at_unix_ms = Some(unix_time_ms());
+                    })
+                    .await;
+            }
+            Ok(outcome) => {
                 task_state
                     .update(&id, |status| {
                         status.state = RunState::Succeeded;
                         status.progress = "published Parquet results".to_owned();
-                        status.result_count = result_count;
+                        status.result_count = outcome.result_count;
                         status.finished_at_unix_ms = Some(unix_time_ms());
                     })
                     .await;
