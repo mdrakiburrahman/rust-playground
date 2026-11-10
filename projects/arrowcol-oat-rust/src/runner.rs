@@ -556,7 +556,8 @@ impl LocalPlatform {
         fs::create_dir_all(state_dir.parent().context("local OAT state directory has no parent")?)?;
         fs::create_dir(&state_dir)
             .with_context(|| format!("create isolated local OAT state directory {}", state_dir.display()))?;
-        let environment = match prepare_local_state(config, &state_dir, run_id) {
+        let internal_secret_file = std::env::var_os("LOADTEST_INTERNAL_HMAC_FILE").map(PathBuf::from);
+        let environment = match prepare_local_state(config, &state_dir, run_id, internal_secret_file.as_deref()) {
             Ok(environment) => environment,
             Err(error) => {
                 return match fs::remove_dir_all(&state_dir) {
@@ -585,7 +586,12 @@ impl LocalPlatform {
     }
 }
 
-fn prepare_local_state(config: &OatConfig, state_dir: &Path, run_id: &str) -> Result<HashMap<String, String>> {
+fn prepare_local_state(
+    config: &OatConfig,
+    state_dir: &Path,
+    run_id: &str,
+    internal_secret_file: Option<&Path>,
+) -> Result<HashMap<String, String>> {
     for directory in ["catalog-state", "dataflow", "router-state", "control"] {
         fs::create_dir(state_dir.join(directory))
             .with_context(|| format!("create local OAT state directory {directory}"))?;
@@ -617,7 +623,6 @@ fn prepare_local_state(config: &OatConfig, state_dir: &Path, run_id: &str) -> Re
         ("ARROWCOL_APP_PASSWORD_FILE", "arrowcol-app-password"),
         ("ARROWCOL_MIGRATOR_PASSWORD_FILE", "arrowcol-migrator-password"),
         ("LOADTEST_EDGE_HMAC_FILE", "edge-hmac"),
-        ("LOADTEST_INTERNAL_HMAC_FILE", "internal-hmac"),
     ];
     let mut environment = HashMap::from([
         ("LOADTEST_UID".to_owned(), uid),
@@ -653,9 +658,23 @@ fn prepare_local_state(config: &OatConfig, state_dir: &Path, run_id: &str) -> Re
         write_private_secret(&path, &random_secret())?;
         environment.insert(variable.to_owned(), path.to_string_lossy().into_owned());
     }
+    let internal_secret_file = shared_internal_secret_file(internal_secret_file)?;
+    environment.insert(
+        "LOADTEST_INTERNAL_HMAC_FILE".to_owned(),
+        internal_secret_file.to_string_lossy().into_owned(),
+    );
     Ok(environment)
 }
 
+fn shared_internal_secret_file(path: Option<&Path>) -> Result<PathBuf> {
+    let path = path.context("LOADTEST_INTERNAL_HMAC_FILE is required for local OAT catalog DDL clients")?;
+    let metadata =
+        fs::metadata(path).with_context(|| format!("inspect shared internal HMAC secret {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("shared internal HMAC secret must be a regular file");
+    }
+    Ok(path.to_path_buf())
+}
 fn local_control_mount_environment(state_dir: &Path) -> HashMap<String, String> {
     HashMap::from([(
         "OAT_CONTROL_HOST_PATH".to_owned(),
@@ -6006,6 +6025,13 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn local_oat_client_inherits_the_catalog_identity_key_file() -> Result<()> {
+        let shared_key = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        assert_eq!(shared_internal_secret_file(Some(&shared_key))?, shared_key);
+        assert!(shared_internal_secret_file(None).is_err());
+        Ok(())
+    }
     #[test]
     fn local_pin_init_compose_build_has_parse_default_and_selected_run_supplies_private_config() {
         let compose = include_str!("../../loadtest/compose.yaml");
