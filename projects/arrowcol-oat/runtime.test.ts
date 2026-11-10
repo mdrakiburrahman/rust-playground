@@ -67,6 +67,11 @@ test('isolated integrated topology pins images, WI, identity, probes and pooled 
     mount.name === 'auth' && mount.mountPath === '/run/auth' && mount.readOnly));
   assert.ok(catalog.volumes.some((volume: any) =>
     volume.name === 'auth' && volume.secret.secretName === 'arrowcol-router-auth'));
+  const catalogIngress = get('NetworkPolicy', 'catalog-internal').spec.ingress;
+  assert.deepEqual(catalogIngress[0].from, [
+    { podSelector: { matchLabels: { app: 'arrowcol' } } },
+    { podSelector: { matchLabels: { app: 'arrowcol-oat-client' } } },
+  ]);
   const rules = get('NetworkPolicy', 'flight-router-only').spec.ingress;
   assert.deepEqual(rules[0].from, [{ podSelector: { matchLabels: { app: 'arrowcol-router' } } }]);
   const clientIngress = get('NetworkPolicy', 'router-oat-client-ingress').spec.ingress;

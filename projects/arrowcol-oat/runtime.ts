@@ -216,7 +216,7 @@ export async function renderRuntime(input: unknown, phase: Phase): Promise<Resou
       readinessProbe: httpProbe('/readyz', 50050), livenessProbe: httpProbe('/healthz', 50050),
       volumeMounts: [mount('config', '/etc/oat'), mount('app', '/run/app'), mount('auth', '/run/auth')],
     }], [{ name: 'config', configMap: { name: 'arrowcol-config' } }, secretVolume('app', 'arrowcol-sql-runtime'), secretVolume('auth', 'arrowcol-router-auth')]),
-    network('catalog-internal', 'arrowcol-catalog', ['arrowcol'], 8817),
+    network('catalog-internal', 'arrowcol-catalog', ['arrowcol', 'arrowcol-oat-client'], 8817),
     network('flight-router-only', 'arrowcol', ['arrowcol-router'], 32010),
     network('router-oat-client-ingress', 'arrowcol-router', ['arrowcol-oat-client'], 50050),
     // Operator port-forward is the only ingress to the router; no LoadBalancer, Ingress or NodePort.
