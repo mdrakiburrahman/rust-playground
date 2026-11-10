@@ -145,18 +145,33 @@ These are the AKS caller contracts. The local platform uses its explicit
 local Kustainer path, not ambient Azure authentication or this helper.
 The helper handoff and CLI integration must be qualified together.
 
-**Provider qualification blocker:** the current helper deliberately raises
-a nonretryable `Failure` before ownership writes, lease acquisition or mutation. Official
-external-table output documents an opaque `Properties` value, not a
-`ConnectionStrings` column or an exact connection/authentication schema.
-Authorized observed Delta table-type, property and redaction evidence is
-required before implementing that parser; desired configuration cannot serve
-as observed provider proof. ARM reads explicitly use Storage `2023-05-01`
-and Kusto `2024-04-13`. Unset/default QAP policy and mutation receipt shapes
-also remain unqualified. The command contracts below are not a claim that
-the current draft can bind or clean up QAP resources.
-Read-only provider KQL may already have run before this failure; it must not
-be reported as `DELTA_LOGS_ABSENT` or `kql_attempted=false`. Genuine absent
+**Provider contract qualification:** one authorized, run-owned Delta probe
+established the observed `TableType=Delta`, JSON-string `Properties`, and
+dynamic `ConnectionStrings` shapes. The production helper accepts only the
+qualified Delta property set (`Format=Parquet`, `AutoUpdateSchema=false` and
+the observed compression, encoding, header, prefix and shortcut defaults) and
+one `abfss://...;managed_identity=<principal-guid>` connection. The URI is
+compared with the configured run path and ARM-derived UAMI **principal ID**;
+the client ID is not a substitute. Create receipts require the matching table,
+Delta type, owner `DocString` and qualified properties. The observed drop
+receipt instead has the matching `TableName` and null `TableType`,
+`DocString` and `Properties`; cleanup also independently verifies absence.
+Unknown shapes and ownership mismatches fail closed. Storage reads use API
+`2023-05-01`; Kusto reads use `2024-04-13`.
+
+The same probe's empty-log count returned zero with a successful completion
+record and the typed catalog-uninitialized warning
+`Severity=3`, `SeverityName=Warning`, `StatusCode=-2133196383`. The parser
+classifies only that exact warning shape, retains the separate successful
+completion requirement, rejects `Severity<=2` and unknown or malformed
+statuses, and reports acceleration as not applied/unproven. This qualifies
+provider receipts and parsing only; it does **not** prove accelerated reads,
+benchmark readiness or end-to-end dataflow. Cycle E1-E5 still requires real
+data and positive accelerated-read evidence. The read-only query response is
+parsed separately through its validated table-of-contents ordinals; mutation
+receipts remain strict single-primary management results.
+Read-only provider KQL may already have run before a later failure; it must
+not be reported as `DELTA_LOGS_ABSENT` or `kql_attempted=false`. Genuine absent
 Delta logs retain their separate retryable handling.
 
 | Command suffix for `npx --no-install tsx infra/azure/bootstrap.ts` | Required custody |
