@@ -289,19 +289,25 @@ export async function collectDataFlow(
   runner: typeof run_tree = run_tree,
 ): Promise<Verdict> {
   if (status.state !== 'succeeded') return evaluateDataFlow(status, [], expectedSha, mode, config);
+  let verdict: Verdict;
   try {
     const bytes = await readResultBytes(config, mode, runner);
-    const verdict = evaluateDataFlow(status, decodeResultRows(bytes), expectedSha, mode, config);
-    if (mode === 'aks' && verdict.pass) {
-      await verifyRunCleanup(verdict.rows, config, runner);
-      verdict.lines.push('cleanup: zero run-scoped namespaces or federated credentials');
-    }
-    return verdict;
+    verdict = evaluateDataFlow(status, decodeResultRows(bytes), expectedSha, mode, config);
   } catch (error) {
     const verdict = evaluateDataFlow(status, [], expectedSha, mode, config);
     verdict.reasons.push(error instanceof Error ? error.message : 'unreadable result evidence');
     return verdict;
   }
+  if (mode === 'aks' && verdict.pass) {
+    try {
+      await verifyRunCleanup(verdict.rows, config, runner);
+      verdict.lines.push('cleanup: zero run-scoped namespaces or federated credentials');
+    } catch (error) {
+      verdict.pass = false;
+      verdict.reasons.push(error instanceof Error ? error.message : 'unreadable cleanup evidence');
+    }
+  }
+  return verdict;
 }
 
 export async function reportDataFlowRun(

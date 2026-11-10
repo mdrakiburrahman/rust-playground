@@ -33,6 +33,19 @@ function row(overrides: Record<string, unknown> = {}) {
 }
 const ok = (stdout: string) => ({ returncode: 0, stdout, stderr: '' });
 
+function resultParquet(mode: 'local' | 'aks', revision = sha): Uint8Array {
+  const table = tableFromArrays({
+    schema_version: [2], run_id: [cell], mode: [mode], stamp: ['00000'],
+    tunables_json: [JSON.stringify({ orchestration_run_id: orchestration })], git_sha: [revision],
+    status: ['succeeded'], pinning_ok: [true], table_owner: ['owner-a'], rows: [100n],
+    duration_ms: [1000n], rows_per_second: [100], replicas: [1n], dfe_worker_concurrency: [8n],
+    table: ['sqlserver_active_sessions'], tables: [1], qap_observation_complete: [1n],
+    qap_observed_tables: [1n], qap_completion_percent: [100], qap_pending_artifacts: [0n],
+    qap_unhealthy_catalogs: [0n],
+  });
+  return writeParquet(WasmTable.fromIPCStream(tableToIPC(table, 'stream')));
+}
+
 test('only the launched orchestration, exact source revision and full matrix can pass', () => {
   const result = evaluateDataFlow(status, [row(), row({ tunables_json: '{"orchestration_run_id":"old"}' })], sha, 'aks', config);
   assert.equal(result.pass, true);
@@ -172,14 +185,7 @@ test('local evidence collection passes only a readable Parquet containing this r
   const path = join(directory, 'results.parquet');
   const localConfig = { ...config, result_url: pathToFileURL(path).href };
   const writeResult = async (revision: string) => {
-    const table = tableFromArrays({
-      schema_version: [2], run_id: [cell], mode: ['local'], stamp: ['00000'],
-      tunables_json: [JSON.stringify({ orchestration_run_id: orchestration })], git_sha: [revision],
-      status: ['succeeded'], pinning_ok: [true], table_owner: ['owner-a'], rows: [100n],
-      duration_ms: [1000n], rows_per_second: [100], replicas: [1n], dfe_worker_concurrency: [8n],
-      table: ['sqlserver_active_sessions'], tables: [1],
-    });
-    await writeFile(path, writeParquet(WasmTable.fromIPCStream(tableToIPC(table, 'stream'))));
+    await writeFile(path, resultParquet('local', revision));
   };
   try {
     await writeResult(sha);
@@ -191,6 +197,27 @@ test('local evidence collection passes only a readable Parquet containing this r
     await writeFile(path, '');
     assert.equal((await collectDataFlow(status, localConfig, 'local', sha)).pass, false);
   } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test('AKS collection preserves verified rows when cleanup evidence fails and passes only after absence', async (t) => {
+  const bytes = resultParquet('aks');
+  t.mock.method(globalThis, 'fetch', async () => new Response(Buffer.from(bytes)));
+  let cleanupFails = true;
+  const runner: typeof run_tree = async (args) => {
+    if (args[1] === 'storage') return ok('https://arrowcollector00000.z1.web.core.windows.net/');
+    if (args[0] === 'kubectl') return cleanupFails
+      ? { returncode: 1, stdout: '', stderr: 'not authorized' } : ok('{"items":[]}');
+    return ok('[]');
+  };
+  const failed = await collectDataFlow(status, config, 'aks', sha, runner);
+  assert.equal(failed.pass, false);
+  assert.equal(failed.rows.length, 1);
+  assert.match(failed.reasons.join(), /evidence command failed: kubectl/);
+  assert.doesNotMatch(failed.reasons.join(), /no Parquet rows/);
+  cleanupFails = false;
+  const succeeded = await collectDataFlow(status, config, 'aks', sha, runner);
+  assert.equal(succeeded.pass, true);
+  assert.match(succeeded.lines.join(), /zero run-scoped namespaces or federated credentials/);
 });
 
 test('AKS reads sanitized mirror by configured path and visibly falls back only on unavailable mirror', async () => {
@@ -234,7 +261,7 @@ test('cleanup waits for Terminating namespaces and scoped FICs, but ignores the 
   assert.equal(reads, 2);
   assert.equal(now, 5000);
   const leaked: typeof run_tree = async (args) => ok(JSON.stringify(args[0] === 'kubectl' ? { items: [] } : [
-    { name: `arrowcol-run-${cell}`, subject: `system:serviceaccount:arrow-collector-${cell.replaceAll('-', '')}:oat` },
+    { name: 'unexpected-name', subject: `system:serviceaccount:arrow-collector-${cell.replaceAll('-', '')}:oat` },
   ]));
   await assert.rejects(verifyRunCleanup([row()], config, leaked, () => now, async (ms) => { now += ms; }), /cleanup timed out/);
   assert.equal(now, 5000 + CLEANUP_TIMEOUT_MS);
