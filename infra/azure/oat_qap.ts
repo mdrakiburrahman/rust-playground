@@ -54,7 +54,7 @@ const digest = (value: unknown): string => createHash('sha256').update(canonical
 const parse = (bytes: string | Buffer, name: string): unknown => {
   try { return JSON.parse(bytes.toString()); } catch (cause) { throw new Failure(`${name} is malformed.`, { cause }); }
 };
-function rows(value: unknown): Record<string, unknown>[] {
+export function managementRows(value: unknown): Record<string, unknown>[] {
   const result = object(value, 'Kusto result');
   if (result.error || result.HasErrors || (Array.isArray(result.Exceptions) ? result.Exceptions.length : result.Exceptions))
     throw new Failure('Kusto reported management errors; response is not success.');
@@ -66,12 +66,162 @@ function rows(value: unknown): Record<string, unknown>[] {
   if (primary.length !== 1) throw new Failure('Expected one Kusto primary result table.');
   const table = object(primary[0], 'Kusto primary result');
   if (!Array.isArray(table.Columns) || !Array.isArray(table.Rows)) throw new Failure('Kusto columns/rows missing.');
-  const columns = table.Columns.map(column => text(object(column, 'Kusto column').ColumnName, 'ColumnName'));
+  const columns = table.Columns.map(column => {
+    const item = object(column, 'Kusto column');
+    text(item.ColumnType, 'ColumnType');
+    return text(item.ColumnName, 'ColumnName');
+  });
   if (new Set(columns).size !== columns.length || !columns.length) throw new Failure('Duplicate/empty Kusto columns.');
   return table.Rows.map(row => {
     if (!Array.isArray(row) || row.length !== columns.length) throw new Failure('Kusto row width mismatch.');
     return Object.fromEntries(columns.map((name, index) => [name, row[index]]));
   });
+}
+const qualifiedDeltaProperties = {
+  AutoUpdateSchema: false,
+  Compressed: false,
+  CompressionType: null,
+  Encoding: null,
+  FileExtension: null,
+  Format: 'Parquet',
+  IncludeHeaders: 'None',
+  NamePrefix: null,
+  Shortcut: false,
+};
+const managedIdentityConnection = /^abfss:\/\/[^/@;]+@[a-z0-9]{3,24}\.dfs\.core\.windows\.net\/[A-Za-z0-9/_-]+;managed_identity=[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
+function deltaProperties(value: unknown): Record<string, unknown> {
+  if (typeof value !== 'string') throw new Failure('Qualified Delta Properties must be the observed JSON string shape.');
+  const parsed = object(jsonField(value, 'External properties'), 'External properties');
+  if (canonical_json(parsed) !== canonical_json(qualifiedDeltaProperties))
+    throw new Failure('Delta Properties differ from the qualified provider shape.');
+  return parsed;
+}
+function qualifiedReceiptProperties(value: unknown): boolean {
+  try { deltaProperties(value); return true; } catch (error) {
+    if (error instanceof Failure) return false;
+    throw error;
+  }
+}
+export function parseQualifiedDeltaDefinition(value: unknown, expectedName: string): {
+  connectionStrings: string[];
+  docString: string;
+  properties: Record<string, unknown>;
+  definition: Record<string, unknown>;
+} {
+  const definition = object(value, 'External definition');
+  if (definition.TableName !== expectedName || definition.TableType !== 'Delta')
+    throw new Failure('External table name/type differs from the qualified Delta shape.');
+  const properties = deltaProperties(definition.Properties);
+  if (!Array.isArray(definition.ConnectionStrings) || definition.ConnectionStrings.length !== 1 ||
+      typeof definition.ConnectionStrings[0] !== 'string' || !managedIdentityConnection.test(definition.ConnectionStrings[0]))
+    throw new Failure('Delta ConnectionStrings differ from the qualified managed-identity shape.');
+  return { connectionStrings: definition.ConnectionStrings as string[],
+    docString: text(definition.DocString, 'External owner docString'), properties, definition };
+}
+export function validateExternalMutationReceipt(operation: 'create' | 'drop', name: string, owner: string,
+  value: unknown): Record<string, unknown> {
+  const receipt = object(value, 'External mutation receipt');
+  if (operation === 'create') {
+    if (receipt.TableName !== name || receipt.TableType !== 'Delta' || receipt.DocString !== owner)
+      throw new Failure('Create receipt differs from the qualified Delta owner shape.');
+    deltaProperties(receipt.Properties);
+  } else if (receipt.TableName !== name || receipt.TableType !== null ||
+      receipt.DocString !== null || receipt.Properties !== null) {
+    throw new Failure('Drop receipt is not the qualified matching-name null tombstone.');
+  }
+  return receipt;
+}
+export function assertExactConnectionStrings(actual: unknown, expected: string): string[] {
+  if (!Array.isArray(actual) || actual.length !== 1 || actual[0] !== expected)
+    throw new Failure('External connection does not match the exact owned run URI and UAMI principal.');
+  return [expected];
+}
+export interface KustoQueryResult {
+  rows: Record<string, unknown>[];
+  query_completed: true;
+  query_acceleration_not_applied: boolean;
+  query_acceleration_applied: false | null;
+  accelerated_read_proven: false;
+}
+const QAP_CATALOG_UNINITIALIZED_WARNING = -2133196383;
+export function parseKustoQueryResult(value: unknown): KustoQueryResult {
+  const response = object(value, 'Kusto query result');
+  if (response.error || response.HasErrors || (Array.isArray(response.Exceptions) ? response.Exceptions.length > 0 : Boolean(response.Exceptions)))
+    throw new Failure('Kusto query response reports failure.');
+  if (!Array.isArray(response.Tables) || response.Tables.length < 3) throw new Failure('Kusto query tables are missing.');
+  const tables = response.Tables.map((raw, index) => {
+    const table = object(raw, 'Kusto query table');
+    if (table.TableName !== `Table_${index}` || !Array.isArray(table.Columns) || !Array.isArray(table.Rows))
+      throw new Failure('Kusto query table shape is invalid.');
+    const columns = table.Columns.map(column => {
+      const item = object(column, 'Kusto query column');
+      return { name: text(item.ColumnName, 'Query ColumnName'), type: text(item.ColumnType, 'Query ColumnType') };
+    });
+    if (!columns.length || new Set(columns.map(column => column.name)).size !== columns.length ||
+        table.Rows.some(row => !Array.isArray(row) || row.length !== columns.length))
+      throw new Failure('Kusto query columns or rows are malformed.');
+    return { name: table.TableName, columns, rows: table.Rows as unknown[][] };
+  });
+  const tocCandidates = tables.filter(table => ['Ordinal', 'Kind', 'Name', 'Id', 'PrettyName'].every(name =>
+    table.columns.some(column => column.name === name)));
+  if (tocCandidates.length !== 1) throw new Failure('Kusto query table of contents is missing or ambiguous.');
+  const toc = tocCandidates[0];
+  const tocColumnTypes: Record<string, string> = {
+    Ordinal: 'long', Kind: 'string', Name: 'string', Id: 'string', PrettyName: 'string',
+  };
+  if (toc.columns.length !== Object.keys(tocColumnTypes).length ||
+      Object.entries(tocColumnTypes).some(([name, type]) =>
+        toc.columns.find(column => column.name === name)?.type !== type))
+    throw new Failure('Kusto query table of contents has unexpected column types or fields.');
+  const indexes = Object.fromEntries(['Ordinal', 'Kind', 'Name', 'Id', 'PrettyName'].map(name =>
+    [name, toc.columns.findIndex(column => column.name === name)]));
+  const ordinals = new Set<number>();
+  const entries = toc.rows.map(row => {
+    const ordinal = row[indexes.Ordinal], kind = row[indexes.Kind], name = row[indexes.Name];
+    const id = row[indexes.Id], prettyName = row[indexes.PrettyName];
+    if (typeof ordinal !== 'number' || !Number.isInteger(ordinal) || ordinal < 0 || ordinal >= tables.length ||
+        typeof kind !== 'string' || typeof name !== 'string' || typeof id !== 'string' || !id.length ||
+        typeof prettyName !== 'string' || ordinals.has(ordinal) ||
+        tables[ordinal].name !== `Table_${ordinal}`)
+      throw new Failure('Kusto query table of contents is malformed.');
+    ordinals.add(ordinal);
+    return { ordinal, kind, name, id, prettyName };
+  });
+  if (entries.length !== tables.length - 1 || ordinals.has(tables.indexOf(toc)))
+    throw new Failure('Kusto query table of contents does not map every result table.');
+  const primaryEntries = entries.filter(entry => entry.kind === 'QueryResult' && entry.name === 'PrimaryResult');
+  const statusEntries = entries.filter(entry => entry.kind === 'QueryStatus' && entry.name === 'QueryStatus');
+  const propertyEntries = entries.filter(entry => entry.kind === 'QueryProperties' && entry.name === '@ExtendedProperties');
+  if (primaryEntries.length !== 1 || statusEntries.length !== 1 || propertyEntries.length !== 1)
+    throw new Failure('Kusto query result/status/property tables are incomplete or ambiguous.');
+  const status = tables[statusEntries[0].ordinal];
+  const columnIndex = (name: string) => status.columns.findIndex(column => column.name === name);
+  const severityIndex = columnIndex('Severity'), severityNameIndex = columnIndex('SeverityName'), statusCodeIndex = columnIndex('StatusCode');
+  if (severityIndex < 0 || severityNameIndex < 0 || statusCodeIndex < 0 || !status.rows.length)
+    throw new Failure('Kusto QueryStatus is missing required fields or rows.');
+  let accelerationNotApplied = false, completed = false;
+  for (const row of status.rows) {
+    const severity = row[severityIndex], severityName = row[severityNameIndex], statusCode = row[statusCodeIndex];
+    if (typeof severity !== 'number' || !Number.isInteger(severity) ||
+        typeof severityName !== 'string' || typeof statusCode !== 'number' || !Number.isInteger(statusCode))
+      throw new Failure('Kusto QueryStatus contains malformed severity/status values.');
+    if (severity <= 2) throw new Failure('Kusto QueryStatus reports a partial query failure.');
+    if (severity === 4 && severityName === 'Info' && statusCode === 0) {
+      completed = true;
+      continue;
+    }
+    if (severity === 6 && severityName === 'Stats' && statusCode === 0) continue;
+    if (severity === 3 && severityName === 'Warning' && statusCode === QAP_CATALOG_UNINITIALIZED_WARNING) {
+      accelerationNotApplied = true;
+      continue;
+    }
+    throw new Failure('Kusto QueryStatus contains an unknown or unsuccessful status.');
+  }
+  if (!completed) throw new Failure('Kusto QueryStatus has no successful completion record.');
+  const primary = tables[primaryEntries[0].ordinal];
+  return { rows: primary.rows.map(row => Object.fromEntries(primary.columns.map((column, index) => [column.name, row[index]]))),
+    query_completed: true, query_acceleration_not_applied: accelerationNotApplied,
+    query_acceleration_applied: accelerationNotApplied ? false : null, accelerated_read_proven: false };
 }
 const jsonField = (value: unknown, label: string): unknown =>
   typeof value === 'string' ? parse(value, label) : value;
@@ -85,10 +235,6 @@ function privateJson(filename: string): unknown {
   if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) || stat.size > 4_194_304)
     throw new Failure('QAP custody/input must be a bounded private regular file.');
   return parse(fs.readFileSync(filename), 'QAP private input');
-}
-function requireDeltaPropertiesQualification(): never {
-  // Learn documents Properties as opaque JSON, not a connection-field schema.
-  throw new Failure('QAP provider-read qualification required before mutation (nonretryable provider-contract failure): establish the observed Delta Properties connection/authentication shape from authoritative provider evidence, including redaction and table-type semantics. No ConnectionStrings projection, aliases or desired-config substitution is supported.');
 }
 function operations(azure: Azure, filename: string, stopPath?: string): OatQapOperations {
   let activeRun: string | undefined;
@@ -271,7 +417,7 @@ function operations(azure: Azure, filename: string, stopPath?: string): OatQapOp
       const [, container] = await azure.blob('HEAD', c.data, '', { restype: 'container' }, undefined, {}, false, true);
       if (container[':status'] !== '200' || container['x-ms-meta-sandboxid'] !== c.sandbox) throw new Failure('Data container stamp ownership mismatch.');
       const principal = text(object(identity.properties, 'UAMI properties').principalId, 'UAMI principal');
-      const policies = rows(await azure.kql(`.show database ['${c.experimentDatabase}'] policy managed_identity`, c.experimentDatabase, true));
+      const policies = managementRows(await azure.kql(`.show database ['${c.experimentDatabase}'] policy managed_identity`, c.experimentDatabase, true));
       if (policies.length !== 1) throw new Failure('Experiment managed identity policy receipt missing.');
       const policy = jsonField(policies[0].Policy, 'Managed identity policy');
       if (!Array.isArray(policy) || !policy.some(item => {
@@ -280,31 +426,29 @@ function operations(azure: Azure, filename: string, stopPath?: string): OatQapOp
           ['ExternalTable', 'AutomatedFlows'].every(usage => typeof p.AllowedUsages === 'string' &&
             p.AllowedUsages.split(',').map(s => s.trim()).includes(usage));
       })) throw new Failure('Required existing UAMI external-table/QAP policy is absent.');
-      requireDeltaPropertiesQualification();
     },
     async inspect(database, name): Promise<OatObservation> {
-      const regular = rows(await azure.kql('.show tables', database, true));
+      const regular = managementRows(await azure.kql('.show tables', database, true));
       if (regular.some(row => text(row.TableName, 'regular TableName').toLowerCase() === name.toLowerCase()))
         return { kind: 'regular', evidence: digest(regular) };
-      const external = rows(await azure.kql('.show external tables', database, true));
+      const external = managementRows(await azure.kql('.show external tables', database, true));
       const matching = external.filter(row => text(row.TableName, 'external TableName').toLowerCase() === name.toLowerCase());
       if (!matching.length) return { kind: 'absent', evidence: digest({ regular, external }) };
       if (matching.length !== 1 || matching[0].TableName !== name) throw new Failure('External-name identity/duplicates mismatch.');
       const definition = matching[0];
-      if (definition.TableType !== 'Delta') throw new Failure('Owned candidate is not a Delta external table.');
-      object(jsonField(definition.Properties, 'External properties'), 'External properties');
-      const connectionStrings: string[] = requireDeltaPropertiesQualification();
-      const schemas = rows(await azure.kql(`.show external table ['${name}'] schema as json`, database, true));
+      const qualified = parseQualifiedDeltaDefinition(definition, name);
+      const connectionStrings = qualified.connectionStrings;
+      const schemas = managementRows(await azure.kql(`.show external table ['${name}'] schema as json`, database, true));
       if (schemas.length !== 1 || schemas[0].TableName !== name || schemas[0].DatabaseName !== database)
         throw new Failure('External schema identity mismatch.');
       const schema = object(jsonField(schemas[0].Schema, 'External schema'), 'External schema');
       if (!Array.isArray(schema.OrderedColumns) || !schema.OrderedColumns.length) throw new Failure('Actual external schema missing.');
-      const policies = rows(await azure.kql(`.show external table ['${name}'] policy query_acceleration`, database, true));
+      const policies = managementRows(await azure.kql(`.show external table ['${name}'] policy query_acceleration`, database, true));
       if (policies.length !== 1 || policies[0].EntityName !== `[${database}].[${name}]` ||
           policies[0].EntityType !== 'ExternalTable') throw new Failure('QAP policy identity/receipt missing.');
       const qapPolicy = policies[0].Policy === null ? null : jsonField(policies[0].Policy, 'QAP policy');
       return { kind: 'external', snapshot: { kind: 'delta', name, connectionStrings,
-        docString: text(definition.DocString, 'External owner docString'), schema, qapPolicy, definition },
+        docString: qualified.docString, schema, qapPolicy, definition: qualified.definition },
         evidence: digest({ definition, schemas, policies }) };
     },
     async validateDelta(storagePath, initialLog) {
@@ -333,24 +477,24 @@ function operations(azure: Azure, filename: string, stopPath?: string): OatQapOp
         throw new Failure('Current Delta commit inventory does not contain initialized metadata.');
     },
     requireReceipt(operation, name, value) {
-      const result = rows(value);
+      const result = managementRows(value);
       if (result.length !== 1) throw new Failure('Mutation response lacks one affirmative entity receipt.');
       if (operation === 'policy') {
         if (result[0].EntityName !== `[${azure.c.experimentDatabase}].[${name}]` || result[0].EntityType !== 'ExternalTable')
           throw new Failure('Policy mutation entity receipt mismatch.');
         object(jsonField(result[0].Policy, 'Mutation policy'), 'Mutation policy');
-      } else if (result[0].TableName !== name || result[0].TableType !== 'Delta' ||
-          typeof result[0].DocString !== 'string' || typeof result[0].Properties !== 'string')
-        throw new Failure('Create/drop lacks exact external entity property receipt.');
+      } else {
+        const record = readRecord(azure, filename);
+        const owner = `arrowcol-oat:${record.run_id}:${record.nonce}:${record.manifest_sha256}`;
+        validateExternalMutationReceipt(operation, name, owner, result[0]);
+      }
       if (operation !== 'policy') {
         const record = readRecord(azure, filename);
-        if (result[0].DocString !== `arrowcol-oat:${record.run_id}:${record.nonce}:${record.manifest_sha256}`)
+        if (operation === 'create' && result[0].DocString !== `arrowcol-oat:${record.run_id}:${record.nonce}:${record.manifest_sha256}`)
           throw new Failure('Original mutation receipt does not belong to recorded owner.');
         const entry = record.entries.find(item => item.name === name);
-        if (operation === 'drop' && (!entry?.snapshot ||
-            canonical_json(jsonField(result[0].Properties, 'Drop properties')) !==
-            canonical_json(jsonField(object(entry.snapshot.definition, 'Saved definition').Properties, 'Saved properties'))))
-          throw new Failure('Drop receipt reports changed external definition; intent retained.');
+        if (operation === 'drop' && !entry?.snapshot)
+          throw new Failure('Drop receipt has no saved positive ownership snapshot; intent retained.');
       }
       return digest(result);
     },
@@ -518,12 +662,16 @@ function readRecord(azure: Azure, filename: string): RecordV1 {
           receipt.evidence.startsWith('{')).map(receipt => object(parse(receipt.evidence, 'Original mutation receipt'), 'Original mutation receipt'));
         if (!responses.some(response => {
           if (response.status !== 200 || typeof response.bodyBase64 !== 'string') return false;
-          const entities = rows(parse(Buffer.from(response.bodyBase64, 'base64'), 'Original Kusto response'));
+          const entities = managementRows(parse(Buffer.from(response.bodyBase64, 'base64'), 'Original Kusto response'));
           return entities.length === 1 && (operation === 'policy'
             ? entities[0].EntityName === `[${azure.c.experimentDatabase}].[${entry.name}]` &&
               policyMatches(jsonField(entities[0].Policy, 'Original policy'), policy)
-            : entities[0].TableName === entry.name &&
-              entities[0].DocString === `arrowcol-oat:${runId}:${raw.nonce}:${raw.manifest_sha256}`);
+            : operation === 'create'
+              ? entities[0].TableName === entry.name && entities[0].TableType === 'Delta' &&
+                entities[0].DocString === `arrowcol-oat:${runId}:${raw.nonce}:${raw.manifest_sha256}` &&
+                qualifiedReceiptProperties(entities[0].Properties)
+              : entities[0].TableName === entry.name && entities[0].TableType === null &&
+                entities[0].DocString === null && entities[0].Properties === null);
         })) throw new Failure('Completion lacks original definitive mutation/entity receipts.');
       }
     }
@@ -544,9 +692,9 @@ function snapshot(value: OatObservation, entry: Entry, record: RecordV1, expecte
   if (value.kind !== 'external') throw new Failure('Owned external binding is missing or replaced.');
   const found = value.snapshot;
   if (found.kind !== 'delta' || found.name !== entry.name || found.docString !== `arrowcol-oat:${record.run_id}:${record.nonce}:${record.manifest_sha256}` ||
-      canonical_json(found.connectionStrings) !== canonical_json([entry.connection]) ||
       found.schema === null || found.schema === undefined || found.definition === null || found.definition === undefined ||
       !policyMatches(found.qapPolicy, expectedPolicy)) throw new Failure('Owned external binding/schema marker/QAP policy does not match.');
+  assertExactConnectionStrings(found.connectionStrings, entry.connection);
   return found;
 }
 async function unchanged(guard: OatQapOperations, record: RecordV1, entry: Entry): Promise<void> {

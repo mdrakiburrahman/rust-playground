@@ -81,7 +81,7 @@ Use `npx --no-install tsx infra/azure/bootstrap.ts <command>`:
 | `reset --resume` | Finish interrupted reset from its durable intent. |
 | `recover` / `recover --execute` | Preview / recover abandoned publisher occupancy after stopping writers. |
 | `prepare-run-fic` / `probe-run-fic` / `cleanup-run-fic` | Exact-run AKS trust lifecycle; [arguments and custody rules](../../docs/operations/OAT_RUN_AUTHORITY.md). **Cleanup removes only the recorded FIC after workload namespace removal; ambiguous receipts block automatic retry/recovery.** |
-| `bind-oat-qap` / `verify-oat-qap` / `cleanup-oat-qap` | **Blocked by nonretryable provider-contract qualification; not runtime-ready.** [Required workload/stop records and qualification boundary](../../docs/operations/OAT_RUN_AUTHORITY.md#run-scoped-qap-bindings). Cleanup's intended scope is only recorded external-table bindings, never data roots, databases or ownership tombstones. |
+| `bind-oat-qap` / `verify-oat-qap` / `cleanup-oat-qap` | Run-scoped bindings use the qualified Delta `Properties`, `ConnectionStrings`, mutation-receipt and cleanup-tombstone contracts. **Provider-contract qualification is not accelerated-read or benchmark readiness.** [Required workload/stop records and qualification boundary](../../docs/operations/OAT_RUN_AUTHORITY.md#run-scoped-qap-bindings). Cleanup's scope is only recorded external-table bindings, never data roots, databases or ownership tombstones. |
 
 External publisher federation may be empty; the separate native
 `azure-qap-${clusterName}` trust is still required and verified. OAT pin setup
