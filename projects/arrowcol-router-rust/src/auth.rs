@@ -186,6 +186,7 @@ impl EdgeRequestSigner {
 pub struct EdgeVerifier {
     signer: EdgeRequestSigner,
     max_age_ms: u64,
+    max_replay_nonces: usize,
     seen_nonces: Mutex<HashMap<String, u64>>,
 }
 
@@ -196,15 +197,29 @@ impl EdgeVerifier {
     ///
     /// Rejects a zero age or short secret.
     pub fn new(secret: impl Into<Vec<u8>>, max_age_ms: u64) -> Result<Self, AuthFailure> {
-        if max_age_ms == 0 {
+        Self::with_replay_capacity(secret, max_age_ms, MAX_REPLAY_NONCES)
+    }
+
+    /// Creates a verifier with an explicitly sized, fail-closed replay bound.
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero age or capacity, capacity above 1,048,576, or a short secret.
+    pub fn with_replay_capacity(
+        secret: impl Into<Vec<u8>>,
+        max_age_ms: u64,
+        max_replay_nonces: usize,
+    ) -> Result<Self, AuthFailure> {
+        if max_age_ms == 0 || !(1..=1_048_576).contains(&max_replay_nonces) {
             return Err(AuthFailure::new(
                 AuthFailureKind::Internal,
-                "edge assertion maximum age must be positive",
+                "edge assertion age must be positive and replay capacity must be between 1 and 1048576",
             ));
         }
         Ok(Self {
             signer: EdgeRequestSigner::new(secret)?,
             max_age_ms,
+            max_replay_nonces,
             seen_nonces: Mutex::new(HashMap::new()),
         })
     }
@@ -276,7 +291,7 @@ impl EdgeVerifier {
                 "edge assertion nonce was replayed",
             ));
         }
-        if seen.len() >= MAX_REPLAY_NONCES {
+        if seen.len() >= self.max_replay_nonces {
             return Err(AuthFailure::new(
                 AuthFailureKind::ReplayCapacity,
                 "edge replay cache is full; retry after assertions expire",
@@ -511,6 +526,46 @@ pub fn insert_edge_signature_headers(
 mod replay_tests {
     use super::*;
 
+    #[test]
+    fn canonical_edge_request_matches_wire_golden_vector() -> Result<(), AuthFailure> {
+        let mut headers = HeaderMap::new();
+        for (key, value) in [
+            ("x-arrowcol-protocol-version", "1"),
+            ("x-arrowcol-implementation-pool", "dataflow"),
+            ("x-arrowcol-catalog", "telemetry"),
+            ("x-arrowcol-schema", "prod"),
+            ("x-arrowcol-table", "traces"),
+            ("x-arrowcol-schema-fingerprint", "sha256:0123456789abcdef"),
+            ("x-arrowcol-oat-run-id", "00000000-0000-0000-0000-000000000001"),
+            ("content-type", "application/grpc"),
+        ] {
+            headers.insert(key, HeaderValue::from_static(value));
+        }
+        let expected = concat!(
+            "100000\nwire-golden-1\nPOST\n/arrow.flight.protocol.FlightService/DoPut\n",
+            "x-arrowcol-protocol-version:1\n",
+            "x-arrowcol-implementation-pool:dataflow\n",
+            "x-arrowcol-catalog:telemetry\n",
+            "x-arrowcol-schema:prod\n",
+            "x-arrowcol-table:traces\n",
+            "x-arrowcol-schema-fingerprint:sha256:0123456789abcdef\n",
+            "x-arrowcol-control-operation:\n",
+            "x-arrowcol-oat-run-id:00000000-0000-0000-0000-000000000001\n",
+            "content-type:application/grpc\n",
+        );
+        assert_eq!(
+            canonical_edge_request(
+                &Method::POST,
+                "/arrow.flight.protocol.FlightService/DoPut",
+                &headers,
+                now(100_000),
+                "wire-golden-1",
+            )?,
+            expected
+        );
+        Ok(())
+    }
+
     fn now(value: u64) -> UnixMillis {
         UnixMillis::new(value).unwrap_or_else(|error| panic!("invalid test timestamp: {error}"))
     }
@@ -520,6 +575,29 @@ mod replay_tests {
         let mut headers = HeaderMap::new();
         insert_edge_signature_headers(&mut headers, &signer, &Method::POST, "/flight", now(timestamp), nonce)?;
         Ok(headers)
+    }
+
+    #[test]
+    fn configured_capacity_applies_only_after_signature_verification() -> Result<(), AuthFailure> {
+        assert!(EdgeVerifier::with_replay_capacity(vec![7_u8; 32], 30_000, 0).is_err());
+        assert!(EdgeVerifier::with_replay_capacity(vec![7_u8; 32], 30_000, 1_048_577).is_err());
+        let verifier = EdgeVerifier::with_replay_capacity(vec![7_u8; 32], 30_000, 1)?;
+        for nonce in ["forged-1", "forged-2"] {
+            let mut forged = headers(100_000, nonce)?;
+            forged.insert(EDGE_SIGNATURE_HEADER, HeaderValue::from_static("AAAA"));
+            assert!(
+                verifier
+                    .verify(&Method::POST, "/flight", &forged, now(100_000))
+                    .is_err()
+            );
+        }
+        verifier.verify(&Method::POST, "/flight", &headers(100_000, "valid")?, now(100_000))?;
+        let Err(failure) = verifier.verify(&Method::POST, "/flight", &headers(100_000, "overflow")?, now(100_000))
+        else {
+            panic!("configured one-entry cache must reject a second valid nonce");
+        };
+        assert_eq!(failure.kind(), AuthFailureKind::ReplayCapacity);
+        Ok(())
     }
 
     #[test]
