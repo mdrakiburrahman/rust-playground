@@ -51,6 +51,7 @@ test('isolated integrated topology pins images, WI, identity, probes and pooled 
   assert.equal(engine.groups.arrowcol.pipelines.ingest.nodes.flight.type, 'receiver:arrow_flight');
   assert.equal(engine.groups.arrowcol.pipelines.ingest.nodes.delta.type, 'exporter:arrow_deltalake');
   const router = parse(configs['router.yaml']);
+  assert.equal(router.auth.authenticator, 'dev_only_allow_all');
   assert.equal(router.routing.oat_run_id, c.oatRunId);
   assert.equal(router.upstream.tls, false);
   assert.equal(router.upstream.max_h2_streams, 1);

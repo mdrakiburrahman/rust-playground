@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use arrowcol_routing::{PressurePolicy, RoutingPolicy};
 use clap::Parser;
 use serde::Deserialize;
@@ -101,6 +101,10 @@ impl RouterConfig {
             "authentication time bounds must be positive"
         );
         ensure!(
+            (1..=1_048_576).contains(&self.auth.edge_replay_max_nonces),
+            "auth.edge_replay_max_nonces must be between 1 and 1048576"
+        );
+        ensure!(
             self.auth.edge_secret_file != self.auth.internal_signing_secret_file,
             "edge and internal signing secrets must use different files"
         );
@@ -116,10 +120,6 @@ impl RouterConfig {
                 && self.server.h2.connection_window_bytes >= self.server.h2.stream_window_bytes,
             "downstream H2 stream/window bounds are invalid"
         );
-        match self.auth.authenticator.as_str() {
-            "allow_all" => {}
-            unsupported => bail!("unsupported auth.authenticator {unsupported:?}"),
-        }
         Ok(())
     }
 }
@@ -245,20 +245,35 @@ fn default_oat_run_pin_ttl_ms() -> u64 {
     3_600_000
 }
 
+/// Explicit authentication mode; no production identity provider is implemented.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthenticatorMode {
+    /// Grants a shared principal after edge verification, for development only.
+    DevOnlyAllowAll,
+}
+
 /// Authentication and signed internal identity configuration.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     /// Pluggable authenticator name.
-    pub authenticator: String,
+    pub authenticator: AuthenticatorMode,
     /// Secret used by the trusted external TLS terminator.
     pub edge_secret_file: PathBuf,
     /// Separate secret used to sign internal principal metadata.
     pub internal_signing_secret_file: PathBuf,
     /// Maximum edge assertion age.
     pub edge_signature_max_age_ms: u64,
+    /// Maximum live verified edge nonces retained per router process.
+    #[serde(default = "default_edge_replay_max_nonces")]
+    pub edge_replay_max_nonces: usize,
     /// Internal identity validity interval.
     pub internal_identity_ttl_ms: u64,
+}
+
+fn default_edge_replay_max_nonces() -> usize {
+    65_536
 }
 
 /// Upstream HTTP/2 transport and connection reuse configuration.

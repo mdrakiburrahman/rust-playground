@@ -1206,7 +1206,8 @@ footer { color: var(--muted); font-size: 12.5px; text-align: center; padding: 10
 </section>
 
 <section id="infra">
-<h2>Azure setup</h2>
+<h2>Historical Azure sandbox setup</h2>
+<p>This topology describes recorded devcontainer runs, not the current AKS stamp. Current AKS uses <code>arrow-collector-rg</code> and the shared <code>arrow-collector</code> UAMI; see <a href="../../operations/AKS_QAP.md">AKS QAP operations</a> for the current topology.</p>
 <figure class="fig"><svg xmlns="http://www.w3.org/2000/svg" width="1000" height="930" viewBox="0 0 1000 930" role="img" aria-labelledby="infra-title infra-desc" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif">
 <title id="infra-title">Azure resources used by the QAP experiment</title>
 <desc id="infra-desc">The devcontainer runs nx targets against one resource group, rust-playground. It holds the managed identity arrowcol-kusto-reader, the Kusto cluster arrowcol-&lt;sandboxId&gt; with databases arrowcol and the new experimentqap, the storage account arrowcol&lt;sandboxId&gt; with containers arrowcol, checkpoints and the new experimentqap, a new StorageRead diagnostic setting, and a new Log Analytics workspace arrowcol-&lt;sandboxId&gt;. Three new role assignments let the identity read the container and view the database, and let the operator read the logs.</desc>

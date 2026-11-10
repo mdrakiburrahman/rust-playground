@@ -3,12 +3,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use arrowcol_router_rust::{
-    AllowAllAuthenticator, Authenticator, Cli, EdgeVerifier, InternalIdentitySigner, ProductionRouter, RouterConfig,
-    RouterControlLoop, RouterMetrics, build_server, read_secret_file,
+    AllowAllAuthenticator, Authenticator, AuthenticatorMode, Cli, EdgeVerifier, InternalIdentitySigner,
+    ProductionRouter, RouterConfig, RouterControlLoop, RouterMetrics, build_server, read_secret_file,
 };
 use arrowcol_routing::{RoutingEngine, RoutingStore, SqlServerRoutingConfig, SqlServerRoutingStore};
 use clap::Parser;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<()> {
@@ -38,8 +38,19 @@ fn main() -> Result<()> {
     let routing = Arc::new(RoutingEngine::new(routing_store, config.routing.policy()?)?);
     let metrics = RouterMetrics::new()?;
     metrics.set_distinct_table_owners(config.routing.distinct_table_owners);
-    let authenticator: Arc<dyn Authenticator> = Arc::new(AllowAllAuthenticator);
-    let edge_verifier = Arc::new(EdgeVerifier::new(edge_secret, config.auth.edge_signature_max_age_ms)?);
+    let authenticator: Arc<dyn Authenticator> = match config.auth.authenticator {
+        AuthenticatorMode::DevOnlyAllowAll => {
+            warn!(
+                "dev_only_allow_all grants a shared principal after edge HMAC verification; not production authentication"
+            );
+            Arc::new(AllowAllAuthenticator)
+        }
+    };
+    let edge_verifier = Arc::new(EdgeVerifier::with_replay_capacity(
+        edge_secret,
+        config.auth.edge_signature_max_age_ms,
+        config.auth.edge_replay_max_nonces,
+    )?);
     let internal_signer = Arc::new(InternalIdentitySigner::new(
         internal_secret,
         config.auth.internal_identity_ttl_ms,

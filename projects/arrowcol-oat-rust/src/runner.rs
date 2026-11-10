@@ -6425,6 +6425,11 @@ mod tests {
 
     #[test]
     fn local_router_configuration_authorizes_only_its_run() -> Result<()> {
+        let generated = run_scoped_local_router_config(include_str!("../../loadtest/config/router.yaml"), "run-one")?;
+        let generated: serde_yaml::Value = serde_yaml::from_str(&generated)?;
+        assert_eq!(generated["auth"]["authenticator"].as_str(), Some("dev_only_allow_all"));
+        assert_eq!(generated["routing"]["oat_run_id"].as_str(), Some("run-one"));
+
         let configured = run_scoped_local_router_config(
             "routing:\n  lease_ttl_ms: 86400000\n  readiness_max_staleness_ms: 30000\n",
             "run-one",

@@ -34,7 +34,7 @@ routing:
   readiness_max_staleness_ms: 30000
 
 auth:
-  authenticator: allow_all
+  authenticator: dev_only_allow_all
   edge_secret_file: /var/run/arrowcol-router/edge-hmac
   internal_signing_secret_file: /var/run/arrowcol-router/internal-hmac
   edge_signature_max_age_ms: 30000

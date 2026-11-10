@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use arrowcol_oat_rust::config::OatConfig;
 use arrowcol_oat_rust::model::{AppState, RunState, RunStatus, unix_time_ms};
 use axum::extract::{Path, State};
@@ -17,6 +17,9 @@ use tokio::fs;
 struct Args {
     #[arg(long, default_value = "127.0.0.1:8088")]
     listen: SocketAddr,
+    /// Expose the unauthenticated control API outside loopback for trusted development networks only.
+    #[arg(long)]
+    allow_insecure_non_loopback: bool,
     #[arg(long)]
     validate_config: Option<PathBuf>,
 }
@@ -47,6 +50,14 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    ensure!(
+        args.listen.ip().is_loopback() || args.allow_insecure_non_loopback,
+        "non-loopback OAT listeners require --allow-insecure-non-loopback; the control API has no authentication"
+    );
+    if !args.listen.ip().is_loopback() {
+        tracing::warn!(address = %args.listen, "explicitly exposing unauthenticated OAT control API outside loopback");
+    }
+
     let state = Arc::new(AppState::default());
     let app = Router::new()
         .route("/healthz", get(health))
@@ -54,7 +65,7 @@ async fn main() -> Result<()> {
         .route("/runs/{id}", get(get_run))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
-    tracing::info!(address = %args.listen, "ArrowCol OAT server listening");
+    tracing::info!(address = %listener.local_addr()?, "ArrowCol OAT server listening");
     axum::serve(listener, app).await?;
     Ok(())
 }

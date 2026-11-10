@@ -5,9 +5,11 @@
 | `arrowcol` Deployment / `dataflow` container | Integrated Flight receiver → Delta exporter. One or two replicas, each with `--num-cores 1` or `2`; constant CPU request/limit of 2. |
 | `arrowcol-router:50050` | ClusterIP only, h2c to private Flight `32010`, mandatory trusted-edge HMAC, SQL-serialized distinct table owners. Operator access by port-forward only. |
 | `arrowcol-catalog:8817` | Persistent 16Gi state PVC, same stamped dataflow warehouse as DFE, `--ingestion-layout`. |
-| `arrowcol-sql:1433` | Persistent 32Gi PVC; SQL2022 CU27, routing/fencing only. SA bootstrap then checksum-verified V1–V10 migrations; separate SA/app/migrator secrets. |
+| `arrowcol-sql:1433` | Persistent 32Gi PVC; SQL2022 CU27, routing/fencing only. SA bootstrap then checksum-verified V1–V11 migrations; separate SA/app/migrator secrets. |
 | Namespace and scheduling | Configurable namespace, default example `arrowcol-oat`; benchmark node labels `type=benchmark`, amd64. No changes to the Azure QAP Job overlay or system node pools. |
 | Identity | Workload-identity-labeled catalog/DFE pods; optional `serviceAccount` defaults to `arrowcol-oat`. Stamp 89152 reuses namespace/service account `arrow-collector`. No Azure/GitHub CLI credential mounts. |
+
+OAT router configurations explicitly select `auth.authenticator: dev_only_allow_all`. Missing, legacy `allow_all` and unknown modes fail startup. Every non-public request still needs a valid edge HMAC; the shared development principal is not production caller authorization. Rebuild router and signing-client images together because `x-arrowcol-oat-run-id` is now signed, including its absence.
 
 DFE explicitly enables generated ingestion partitions with
 `ARROWCOL_PARTITION_GRANULARITY=hour`. Existing committed partition layout and
@@ -93,6 +95,23 @@ publication authority.
 
 ## AKS prerequisites and authorization
 
+For a new deployment, create the ignored private `infra/azure/stamp.yaml` and
+authorize the selected subscription before running this Azure-changing command:
+
+```bash
+npx --no-install arrowcol-oat aks deploy --stamp-config infra/azure/stamp.yaml --network cilium
+```
+
+This provisions the selected stamp and runs OAT setup. Setup writes the private
+runtime inputs under `out/arrowcol-oat`, obtains operator credentials for the
+live cluster, and reports whether preflight is READY. Continue only when setup
+reports READY. If infrastructure deployment succeeded but setup failed, rerun
+setup for the selected five-digit stamp instead of redeploying:
+
+```bash
+npx --no-install arrowcol-oat aks setup --stamp-config infra/azure/stamp.yaml --stamp <selected-five-digit-stamp>
+```
+
 Complete the selected stamp's **supported provision/bootstrap**, including Delta
 initialization and `complete_bootstrap`, before starting writers. Select the
 generated `.env.azure` and `.env.azure.tables.json` for that stamp, not a different
@@ -118,12 +137,13 @@ The private fixture container `experimentqap` is not a substitute for the owned
 `experiments` results container. Complete its supported provisioning/role
 reconciliation before publishing OAT results.
 
-**An enforcing Kubernetes network-policy provider is mandatory.** Azure CNI
-Overlay alone is not proof of enforcement. The internal DFE receiver does not
-authenticate public clients; only the HMAC-checking router may reach Flight.
-The infrastructure owner must verify the cluster's policy provider before
-deployment. Foundation installs default-deny ingress before any workload starts;
-do not omit that phase or run this topology on a cluster ignoring NetworkPolicy.
+NetworkPolicy objects are declared in the manifests, but they are enforced only
+when the stamp is deployed with `--network cilium`. The default Azure network
+dataplane sets `networkPolicy` to `none`, so default-deny ingress and the
+policy-based restrictions on SQL and Flight traffic are not enforced in that
+mode. The DFE Flight receiver does not authenticate clients; deploy this topology
+with `--network cilium` so only the HMAC-checking router can reach Flight. Keep
+the foundation phase, which installs default-deny ingress, before any workload.
 
 ## Build and rehearse
 
@@ -173,7 +193,6 @@ and ServiceAccount, never a pod or secret. If they do not yet exist, the cluster
 owner can establish the already-federated subject before image publication:
 
 ```bash
-export KUBECONFIG="$PWD/target/arrowcol-oat/stamp-89152/kubeconfig"
 npx --no-install tsx projects/arrowcol-oat/runtime.ts render \
   out/arrowcol-oat/runtime.json identity out/arrowcol-oat/identity.json
 # Authorized cluster-owner action; creates/updates only namespace and ServiceAccount.
@@ -187,11 +206,12 @@ local service images and atomically replaces draft image values with real
 **registry manifest digests**; it does not apply workloads or identity resources:
 
 ```bash
-export KUBECONFIG="$PWD/target/arrowcol-oat/stamp-89152/kubeconfig"
+STAMP="$(sed -n 's/^stamp:[[:space:]]*//p' infra/azure/stamp.yaml | sed "s/[\"']//g")"
+REGISTRY="arrowcollector${STAMP}"
 npx --no-install tsx projects/arrowcol-oat/publish-images.ts \
-  out/arrowcol-oat/runtime.json --federated --registry arrowcollector89152 \
-  --env .env --azure-env target/arrowcol-oat/stamp-89152/.env.azure \
-  --stamp-config target/arrowcol-oat/stamp-89152/stamp.yaml
+  out/arrowcol-oat/runtime.json --federated --registry "$REGISTRY" \
+  --env .env --azure-env out/arrowcol-oat/bootstrap.env \
+  --stamp-config infra/azure/stamp.yaml
 ```
 
 Before publication, build the local service tags from the clean checked-out source; the publisher requires linux/amd64 images labeled with the full 40-character `org.opencontainers.image.revision` SHA. The default ACR tag is `oat-<full-SHA>`. The setup helpers build all five local images, publish the DMV client separately, and can read all five existing tags without building or pushing; missing tags are distinguishable from provenance failures.
@@ -211,7 +231,7 @@ perform no cluster actions:
 ```bash
 mkdir -p out/arrowcol-oat
 npx --no-install tsx projects/arrowcol-oat/runtime.ts prepare-secrets \
-  target/arrowcol-oat/stamp-89152/.env.azure out/arrowcol-oat/secrets
+  out/arrowcol-oat/bootstrap.env out/arrowcol-oat/secrets
 for phase in foundation bootstrap workload; do
   npx --no-install tsx projects/arrowcol-oat/runtime.ts render \
     out/arrowcol-oat/runtime.json "$phase" "out/arrowcol-oat/$phase.json"
@@ -231,8 +251,8 @@ Apply only after the selected stamp, role scope and federation are ready.
 Use the approved context and namespace consistently:
 
 ```bash
-export KUBECONFIG="$PWD/target/arrowcol-oat/stamp-89152/kubeconfig"
 NAMESPACE="$(node -p 'JSON.parse(require("fs").readFileSync("out/arrowcol-oat/runtime.json","utf8")).namespace')"
+kubectl config current-context
 kubectl apply -f out/arrowcol-oat/foundation.json
 kubectl -n "$NAMESPACE" create secret generic arrowcol-sql-admin \
   --from-file=password=out/arrowcol-oat/secrets/sa-password --dry-run=client -o json | kubectl apply -f -
@@ -247,7 +267,7 @@ kubectl -n "$NAMESPACE" create secret generic arrowcol-generation \
   --from-file=generation=out/arrowcol-oat/secrets/generation --dry-run=client -o json | kubectl apply -f -
 kubectl -n "$NAMESPACE" rollout status deployment/arrowcol-sql --timeout=600s
 kubectl apply -f out/arrowcol-oat/bootstrap.json
-kubectl -n "$NAMESPACE" wait --for=condition=complete job/arrowcol-migrate-v10 --timeout=600s
+kubectl -n "$NAMESPACE" wait --for=condition=complete job/arrowcol-migrate-v11 --timeout=600s
 kubectl apply -f out/arrowcol-oat/workload.json
 kubectl -n "$NAMESPACE" rollout status deployment/arrowcol-catalog --timeout=600s
 kubectl -n "$NAMESPACE" rollout status deployment/arrowcol --timeout=600s
@@ -258,9 +278,9 @@ kubectl -n "$NAMESPACE" port-forward service/arrowcol-router 50050:50050
 Stop on failed migration/readiness; inspect logs without printing secret files.
 Do not delete PVCs or reset publisher authority. Bootstrap/migrations run once as
 a completed Job; runtime pods never mount the migrator or SA credentials.
-Network policies deny pod ingress by default, permit only router→Flight,
-DFE→catalog and runtime/migration→SQL. Kubelet probes and operator port-forward
-remain available. No public router, external catalog, or direct public collector.
+With `--network cilium`, NetworkPolicies deny pod ingress by default, permit only
+router→Flight, DFE→catalog and runtime/migration→SQL. Kubelet probes and operator
+port-forward remain available. No public router, external catalog, or direct public collector.
 
 ## Matrix and interpretation
 
@@ -287,7 +307,6 @@ publisher's `AZURE_TENANT_ID`, which Azure CLI rejects. The
 `convert-kubeconfig` may leave an already-converted entry unchanged.
 
 ```bash
-export KUBECONFIG="$PWD/target/arrowcol-oat/stamp-89152/kubeconfig"
 SUBSCRIPTION="$(node -p 'JSON.parse(require("fs").readFileSync("out/arrowcol-oat/runtime.json","utf8")).subscriptionId')"
 KUBE_USER="$(kubectl config view --minify -o jsonpath='{.users[0].name}')"
 kubectl config set-credentials "$KUBE_USER" \
