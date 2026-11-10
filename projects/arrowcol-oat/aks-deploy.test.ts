@@ -218,7 +218,8 @@ test('generated candidate collisions are bounded at ten with no mutation', async
   const f = fixture(t);
   f.collide();
   await assert.rejects(deployInfrastructure({ stampConfig: f.options.stampConfig }, f.runner), /10 candidates/);
-  assert.equal(f.calls.filter(call => call[1] === 'storage').length, 10);
+  assert.equal(f.calls.filter(call => call[1] === 'storage' &&
+    call[call.indexOf('--name') + 1]?.startsWith('arrowcollector')).length, 10);
   assert.equal(fs.readFileSync(f.options.stampConfig, 'utf8'), f.original);
 });
 
@@ -316,4 +317,13 @@ test('native publisher federation works without optional external publisher cred
   const result = await deployInfrastructure(f.options, f.runner);
   assert.equal(result.network, 'azure');
   assert.equal(f.receipt().postconditions.nativeFederation, true);
+});
+
+test('diagnostic storage name collision is checked before any provisioning', async t => {
+  const f = fixture(t);
+  const runner: typeof run_tree = async (...args) => args[0].includes(`arrowreadlogs${stamp}`)
+    ? { returncode: 0, stdout: JSON.stringify({ nameAvailable: false }), stderr: '' } : f.runner(...args);
+  await assert.rejects(deployInfrastructure(f.options, runner), /name collision/);
+  assert.equal(f.calls.some(call => call[0] === 'npx'), false);
+  assert.equal(fs.readFileSync(f.options.stampConfig, 'utf8'), f.original);
 });

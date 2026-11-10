@@ -111,15 +111,19 @@ export async function deployInfrastructure(options: Options, runner: typeof run_
   let available = false;
   for (let candidate = 0; candidate < 10; candidate++) {
     const storage = object(await az('storage', 'account', 'check-name', '--name', `arrowcollector${stamp}`), 'storage name availability');
+    const readLogs = config.storageReadLogDestination === 'storage'
+      ? object(await az('storage', 'account', 'check-name', '--name', `arrowreadlogs${stamp}`), 'read-log storage name availability')
+      : undefined;
     const registry = object(await az('acr', 'check-name', '--name', `arrowcollector${stamp}`), 'ACR name availability');
     const kusto = object(await az('rest', '--method', 'post', '--url',
       `https://management.azure.com/subscriptions/${subscription}/providers/Microsoft.Kusto/locations/${config.location}/checkNameAvailability?api-version=2024-04-13`,
       '--body', JSON.stringify({ name: `arrow-collector-${stamp}`, type: 'Microsoft.Kusto/clusters' })), 'Kusto name availability');
-    if (storage.nameAvailable === true && registry.nameAvailable === true && kusto.nameAvailable === true) {
+    const names = [storage, registry, kusto, ...(readLogs ? [readLogs] : [])];
+    if (names.every(response => response.nameAvailable === true)) {
       available = true;
       break;
     }
-    for (const response of [storage, registry, kusto])
+    for (const response of names)
       if (typeof response.nameAvailable !== 'boolean') throw new Error('Azure did not report explicit name availability.');
     if (options.stamp !== undefined) throw new Error(`Stamp ${stamp} has a name collision; no resources were created. Choose another --stamp.`);
     console.log(`Stamp ${stamp} unavailable; choosing another five-digit stamp.`);
