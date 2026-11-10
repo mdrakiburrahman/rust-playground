@@ -1,7 +1,7 @@
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, watch};
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -10,6 +10,7 @@ pub enum RunState {
     Running,
     Succeeded,
     Failed,
+    Cancelled,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -26,6 +27,8 @@ pub struct RunStatus {
 pub struct AppState {
     pub runs: Mutex<HashMap<String, RunStatus>>,
     pub run_slot: Arc<Semaphore>,
+    cancel_senders: Mutex<HashMap<String, watch::Sender<bool>>>,
+    local_runs: Mutex<HashSet<String>>,
 }
 
 impl Default for AppState {
@@ -33,6 +36,8 @@ impl Default for AppState {
         Self {
             runs: Mutex::default(),
             run_slot: Arc::new(Semaphore::new(1)),
+            cancel_senders: Mutex::default(),
+            local_runs: Mutex::default(),
         }
     }
 }
@@ -42,11 +47,46 @@ impl AppState {
         Arc::clone(&self.run_slot).try_acquire_owned().ok()
     }
 
+    pub async fn register_run_cancel(&self, id: &str, local: bool) -> watch::Receiver<bool> {
+        let (sender, receiver) = watch::channel(false);
+        self.cancel_senders.lock().await.insert(id.to_owned(), sender);
+        if local {
+            self.local_runs.lock().await.insert(id.to_owned());
+        }
+        receiver
+    }
+
+    pub async fn request_local_cancel(&self, id: &str) -> Result<(), CancelRunError> {
+        if !self.local_runs.lock().await.contains(id) {
+            return if self.runs.lock().await.contains_key(id) {
+                Err(CancelRunError::NotLocal)
+            } else {
+                Err(CancelRunError::NotFound)
+            };
+        }
+        let runs = self.runs.lock().await;
+        let status = runs.get(id).ok_or(CancelRunError::NotFound)?;
+        if !matches!(status.state, RunState::Queued | RunState::Running) {
+            return Err(CancelRunError::NotActive);
+        }
+        drop(runs);
+        let sender = self.cancel_senders.lock().await.get(id).cloned().ok_or(CancelRunError::NotActive)?;
+        sender.send_replace(true);
+        Ok(())
+    }
+
     pub async fn update(&self, id: &str, update: impl FnOnce(&mut RunStatus)) {
         if let Some(status) = self.runs.lock().await.get_mut(id) {
             update(status);
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CancelRunError {
+    NotFound,
+    NotLocal,
+    NotActive,
 }
 
 pub fn unix_time_ms() -> u128 {

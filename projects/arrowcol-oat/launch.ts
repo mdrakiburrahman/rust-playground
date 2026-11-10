@@ -11,7 +11,7 @@ import { record, reportDataFlowRun, type NetworkObservation } from './dataflow-v
 
 export interface OatRunStatus {
   id: string;
-  state: 'queued' | 'running' | 'succeeded' | 'failed';
+  state: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
   progress: string;
   result_count: number;
   error: string | null;
@@ -31,6 +31,45 @@ interface LocalViewerConfig {
 }
 
 const workspaceRoot = resolve(fileURLToPath(new URL('../..', import.meta.url)));
+
+export class OatCliError extends Error {
+  readonly exitCode = 2;
+}
+
+export function cliExitCode(error: unknown): number {
+  return error instanceof OatCliError ? error.exitCode : 1;
+}
+
+function validateArguments(args: string[]): void {
+  const valuedOptions = new Set(['--config', '--mode', '--server', '--poll-ms']);
+  const flags = new Set(['--viewer-only', '--preflight-only']);
+  let positionalConfig = false;
+  for (let index = 0; index < args.length; index++) {
+    const argument = args[index]!;
+    if (argument === '-h' || argument === '--help') continue;
+    if (valuedOptions.has(argument)) {
+      const value = args[index + 1];
+      if (!value || value.startsWith('-')) throw new OatCliError(`Expected a value after ${argument}`);
+      index++;
+      continue;
+    }
+    if (flags.has(argument)) continue;
+    if (argument.startsWith('-')) throw new OatCliError(`Unknown option: ${argument}`);
+    if (positionalConfig) throw new OatCliError(`Unexpected argument: ${argument}`);
+    positionalConfig = true;
+  }
+}
+
+const cliUsage = `Usage: arrowcol-oat [options] [config]
+
+Options:
+  --mode <local|aks>   Select the execution mode
+  --config <path>      Use a configuration file
+  --server <URL>       Use an existing OAT API server
+  --poll-ms <number>   Set the status polling interval
+  --viewer-only        Serve existing local results without running a benchmark
+  --preflight-only     Run the read-only AKS preflight
+  -h, --help           Show this help`;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -86,6 +125,7 @@ export async function launchOat(
   onProgress: ProgressHandler = (status) => console.log(`${status.state}: ${status.progress}`),
   mode?: 'local' | 'aks',
   bridgeGateway: () => string = getDockerBridgeGateway,
+  signal?: AbortSignal,
 ): Promise<OatRunStatus> {
   if (!Number.isSafeInteger(pollIntervalMs) || pollIntervalMs < 1) {
     throw new Error('poll interval must be a positive integer');
@@ -107,16 +147,35 @@ export async function launchOat(
   });
   let status = await readStatus(startResponse, 'start OAT run');
   onProgress(status);
-  while (status.state === 'queued' || status.state === 'running') {
-    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
-    const response = await fetcher(new URL(`/runs/${encodeURIComponent(status.id)}`, server), {
-      signal: AbortSignal.timeout(30_000),
-    });
-    status = await readStatus(response, 'poll OAT run');
-    onProgress(status);
+  let cancellationRequest: Promise<void> = Promise.resolve();
+  const requestCancellation = (): void => {
+    cancellationRequest = (async () => {
+      const response = await fetcher(new URL(`/runs/${encodeURIComponent(status.id)}/cancel`, server), {
+        method: 'POST',
+        signal: AbortSignal.timeout(30_000),
+      });
+      if (!response.ok && response.status !== 409) {
+        await readStatus(response, 'cancel local OAT run');
+      }
+    })();
+  };
+  if (signal?.aborted) requestCancellation();
+  else signal?.addEventListener('abort', requestCancellation, { once: true });
+  try {
+    while (status.state === 'queued' || status.state === 'running') {
+      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+      if (signal?.aborted) await cancellationRequest;
+      const response = await fetcher(new URL(`/runs/${encodeURIComponent(status.id)}`, server), {
+        signal: AbortSignal.timeout(30_000),
+      });
+      status = await readStatus(response, 'poll OAT run');
+      onProgress(status);
+    }
+  } finally {
+    signal?.removeEventListener('abort', requestCancellation);
   }
-  if (status.state === 'failed') {
-    throw new Error(status.error ?? `OAT run ${status.id} failed`);
+  if (status.state === 'failed' || status.state === 'cancelled') {
+    throw new Error(status.error ?? `OAT run ${status.id} ${status.state}`);
   }
   return status;
 }
@@ -132,7 +191,7 @@ async function readStatus(response: Response, action: string): Promise<OatRunSta
   if (
     body === null || typeof body !== 'object' ||
     !('id' in body) || typeof body.id !== 'string' ||
-    !('state' in body) || !['queued', 'running', 'succeeded', 'failed'].includes(String(body.state)) ||
+    !('state' in body) || !['queued', 'running', 'succeeded', 'failed', 'cancelled'].includes(String(body.state)) ||
     !('progress' in body) || typeof body.progress !== 'string' ||
     !('result_count' in body) || typeof body.result_count !== 'number'
   ) {
@@ -142,11 +201,16 @@ async function readStatus(response: Response, action: string): Promise<OatRunSta
 }
 
 export async function main(args: string[], runner: typeof run_tree = run_tree): Promise<void> {
+  if (args.includes('-h') || args.includes('--help')) {
+    console.log(cliUsage);
+    return;
+  }
+  validateArguments(args);
   const option = (name: string): string | undefined => {
     const index = args.indexOf(name);
     if (index < 0) return undefined;
     const value = args[index + 1];
-    if (!value || value.startsWith('--')) throw new Error(`Expected a value after ${name}`);
+    if (!value || value.startsWith('-')) throw new OatCliError(`Expected a value after ${name}`);
     return value;
   };
   const valuedOptions = new Set(['--config', '--mode', '--server', '--poll-ms']);
@@ -155,7 +219,7 @@ export async function main(args: string[], runner: typeof run_tree = run_tree): 
   );
   const requestedMode = option('--mode');
   if (requestedMode !== undefined && requestedMode !== 'local' && requestedMode !== 'aks') {
-    throw new Error('--mode must be local or aks');
+    throw new OatCliError('--mode must be local or aks');
   }
   const requestedConfig = option('--config') ?? positionalConfig;
   const requestedServerUrl = option('--server');
@@ -164,7 +228,7 @@ export async function main(args: string[], runner: typeof run_tree = run_tree): 
   if (requestedMode === 'aks') Object.assign(process.env, await loadAksEnvironment(workspaceRoot));
   if (preflightOnly) {
     if (requestedMode !== 'aks' || viewerOnly || requestedServerUrl || args.includes('--poll-ms')) {
-      throw new Error('--preflight-only requires --mode aks and cannot be combined with viewer/server/poll options');
+      throw new OatCliError('--preflight-only requires --mode aks and cannot be combined with viewer/server/poll options');
     }
     const configPath = resolveOatConfigPath('aks', requestedConfig);
     const report = await runAksPreflight(configPath);
@@ -176,14 +240,14 @@ export async function main(args: string[], runner: typeof run_tree = run_tree): 
   const configPath = resolveOatConfigPath(mode, requestedConfig);
   if (viewerOnly) {
     if (mode !== 'local' || requestedServerUrl || args.includes('--poll-ms')) {
-      throw new Error('--viewer-only is local-only and supports only --mode local and --config');
+      throw new OatCliError('--viewer-only is local-only and supports only --mode local and --config');
     }
     await keepLocalViewerOpen(await startLocalViewer(configPath));
     return;
   }
   const pollValue = Number(option('--poll-ms') ?? 1000);
   if (!Number.isSafeInteger(pollValue) || pollValue < 1) {
-    throw new Error('Expected values after --server and --poll-ms');
+    throw new OatCliError('Expected values after --server and --poll-ms');
   }
   let network: NetworkObservation | undefined;
   let warnings: string[] = [];
@@ -218,13 +282,25 @@ export async function main(args: string[], runner: typeof run_tree = run_tree): 
   }
 
   const server = await startLocalServer(runner);
+  const interrupt = mode === 'local' ? registerLocalInterrupts() : undefined;
   try {
-    const code = await reportDataFlowRun(
-      (progress) => launchOat(configPath, server.url, pollValue, fetch, progress, mode),
-      config, mode, server.gitSha, runner, network, warnings,
-    );
-    if (code) process.exitCode = code;
+    try {
+      const code = await reportDataFlowRun(
+        (progress) => launchOat(configPath, server.url, pollValue, fetch, progress, mode, getDockerBridgeGateway, interrupt?.controller.signal),
+        config, mode, server.gitSha, runner, network, warnings,
+      );
+      if (interrupt?.signal) {
+        process.exitCode = interrupt.exitCode;
+        return;
+      }
+      if (code) process.exitCode = code;
+    } catch (error) {
+      if (!interrupt?.signal) throw error;
+      process.exitCode = interrupt.exitCode;
+      return;
+    }
   } finally {
+    interrupt?.dispose();
     await stopLocalServer(server.child);
   }
   await maybeServeLocalViewer(configPath, mode);
@@ -333,6 +409,36 @@ async function createLocalViewer(config: LocalViewerConfig): Promise<LocalViewer
   };
 }
 
+function registerLocalInterrupts(): {
+  controller: AbortController;
+  readonly signal: NodeJS.Signals | undefined;
+  readonly exitCode: number;
+  dispose(): void;
+} {
+  const controller = new AbortController();
+  let received: NodeJS.Signals | undefined;
+  let count = 0;
+  const exitCodes: Partial<Record<NodeJS.Signals, number>> = { SIGINT: 130, SIGTERM: 143, SIGHUP: 129 };
+  const handlers = new Map<NodeJS.Signals, () => void>();
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
+    const handler = (): void => {
+      count++;
+      if (count > 1) process.exit(128 + (exitCodes[signal] ?? 1));
+      received = signal;
+      controller.abort();
+    };
+    handlers.set(signal, handler);
+    process.on(signal, handler);
+  }
+  return {
+    controller,
+    get signal() { return received; },
+    get exitCode() { return received ? exitCodes[received] ?? 1 : 0; },
+    dispose() {
+      for (const [signal, handler] of handlers) process.off(signal, handler);
+    },
+  };
+}
 async function keepLocalViewerOpen(viewer: LocalViewer): Promise<void> {
   console.log(`Local results viewer: ${viewer.url}`);
   console.log('Press Ctrl+C to stop the viewer.');
@@ -500,6 +606,6 @@ export async function stopLocalServer(child: ChildProcess): Promise<void> {
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main(process.argv.slice(2)).catch((error: unknown) => {
     console.error(error instanceof Error ? error.message : String(error));
-    process.exitCode = 1;
+    process.exitCode = cliExitCode(error);
   });
 }

@@ -308,3 +308,19 @@ test('opens the existing local results in viewer-only mode without losing missin
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test('CLI help is available and unknown options fail as usage errors', async () => {
+  const originalLog = console.log;
+  const messages: string[] = [];
+  console.log = (message?: unknown) => messages.push(String(message ?? ''));
+  try {
+    await main(['--help', '--config', '/missing-oat-config.json']);
+  } finally {
+    console.log = originalLog;
+  }
+  assert.match(messages.join('\n'), /Usage:.*arrowcol-oat/s);
+  await assert.rejects(
+    main(['--not-a-real-option', '--config', '/missing-oat-config.json']),
+    (error: unknown) => error instanceof Error && error.message === 'Unknown option: --not-a-real-option' && 'exitCode' in error && error.exitCode === 2,
+  );
+});

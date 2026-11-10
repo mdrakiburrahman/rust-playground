@@ -212,15 +212,26 @@ function pinningLabel(row) {
   if (row.status === 'pinning_violation') return 'Violation';
   return row.pinning_ok === true ? 'OK' : 'Unverified';
 }
-function heat(value, values, lowerIsBetter = false) {
+const MAX_RENDERED_ROWS = 250;
+function heatBounds(values) {
+  let min = Infinity;
+  let max = -Infinity;
+  let count = 0;
+  for (const value of values) {
+    min = Math.min(min, value);
+    max = Math.max(max, value);
+    count++;
+  }
+  return { min, max, count };
+}
+function heat(value, bounds, lowerIsBetter = false) {
   const parsed = number(value);
-  if (parsed === null || values.length < 2) return '';
-  const min = values.reduce((best, item) => Math.min(best, item), Infinity);
-  const max = values.reduce((best, item) => Math.max(best, item), -Infinity);
+  if (parsed === null || bounds.count < 2) return '';
+  const { min, max } = bounds;
   if (min === max) return 'background-color:rgba(0,120,212,.14)';
   let ratio = (parsed - min) / (max - min);
   if (lowerIsBetter) ratio = 1 - ratio;
-  return `background-color:rgba(0,120,212,${(0.06 + ratio * 0.22).toFixed(3)})`;
+  return 'background-color:rgba(0,120,212,' + (0.06 + ratio * 0.22).toFixed(3) + ')';
 }
 function safeText(value) {
   return String(value ?? '—').replace(/[&<>"']/g, char => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' })[char]);
@@ -316,7 +327,7 @@ function render() {
   document.querySelector('#stat-configs').textContent = numberFormat.format(configs.size);
   document.querySelector('#stat-throughput').textContent = throughput.length ? `${show(throughput.reduce((best, value) => Math.max(best, value), -Infinity))} rows/s` : '—';
   document.querySelector('#stat-latency').textContent = durations.length ? `${show(median(durations))} ms` : '—';
-  document.querySelector('#filtered-count').textContent = `${numberFormat.format(rows.length)} of ${numberFormat.format(allRows.length)} rows`;
+  document.querySelector('#filtered-count').textContent = `${numberFormat.format(rows.length)} of ${numberFormat.format(allRows.length)} rows${rows.length > MAX_RENDERED_ROWS ? ` (showing first ${MAX_RENDERED_ROWS}; filter to narrow)` : ''}`;
   for (const header of document.querySelectorAll('.results-table th[data-result], .results-table th[data-column]')) {
     const key = header.dataset.column || header.dataset.result;
     if (key === state.sort) header.setAttribute('aria-sort', state.direction === 'asc' ? 'ascending' : 'descending');
@@ -333,13 +344,14 @@ function render() {
     qap_cached_bytes: [values('qap_cached_bytes').map(v => v / 1048576), false, 1048576],
     qap_unhealthy_catalogs: [values('qap_unhealthy_catalogs'), true, 1], qap_lag_seconds: [values('qap_lag_seconds'), true, 1]
   };
+  const heatRanges = Object.fromEntries(Object.entries(heatColumns).map(([key, spec]) => [key, heatBounds(spec[0])]));
   const numericCell = (row, key, digits = 2) => {
     const spec = heatColumns[key];
     const raw = number(valueFor(row, key));
     const value = raw === null ? null : raw / (spec?.[2] || 1);
-    return `<td${spec ? ` class="heat" style="${heat(value, spec[0], spec[1])}"` : ''}>${safeText(show(value, digits))}</td>`;
+    return `<td${spec ? ` class="heat" style="${heat(value, heatRanges[key], spec[1])}"` : ''}>${safeText(show(value, digits))}</td>`;
   };
-  bodyNode.innerHTML = rows.map(row => {
+  bodyNode.innerHTML = rows.slice(0, MAX_RENDERED_ROWS).map(row => {
     const problem = row.status === 'failed' || row.status === 'pinning_violation' || row.pinning_ok === false;
     const modeClass = row.mode === 'local' ? 'badge-local' : row.mode === 'aks' ? 'badge-aks' : '';
     const statusClass = row.status === 'succeeded' ? 'badge-ok' : problem ? 'badge-alert' : '';

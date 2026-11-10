@@ -28,6 +28,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::process::{Child, Command};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use url::Url;
 
@@ -1281,7 +1282,7 @@ async fn cancel_aks_client_job(config: &OatConfig, handle: &ClientHandle) -> Res
 ///
 /// Returns an error if configuration, Kubernetes operations, measurement, restoration,
 /// or result publication fails.
-pub async fn execute(config: OatConfig, id: &str, state: Arc<AppState>) -> Result<usize> {
+pub async fn execute(config: OatConfig, id: &str, state: Arc<AppState>, cancellation: watch::Receiver<bool>) -> Result<usize> {
     config.validate()?;
     state
         .update(id, |status| {
@@ -1291,7 +1292,7 @@ pub async fn execute(config: OatConfig, id: &str, state: Arc<AppState>) -> Resul
         })
         .await;
 
-    let outcome = run_matrix(&config, id, &state).await;
+    let outcome = run_matrix(&config, id, state, cancellation).await;
 
     state
         .update(id, |status| {
@@ -1319,13 +1320,26 @@ async fn publish_matrix_outcome(config: &OatConfig, outcome: MatrixOutcome) -> R
     }
 }
 
-async fn run_matrix(config: &OatConfig, orchestration_id: &str, state: &AppState) -> MatrixOutcome {
+async fn run_matrix(
+    config: &OatConfig,
+    orchestration_id: &str,
+    state: Arc<AppState>,
+    cancellation: watch::Receiver<bool>,
+) -> MatrixOutcome {
     run_matrix_with(
         config,
         orchestration_id,
-        state,
-        |cell_config, run_id, replicas, concurrency| {
-            run_isolated_cell(cell_config, orchestration_id, run_id, replicas, concurrency)
+        &state,
+        move |cell_config, run_id, replicas, concurrency| {
+            run_isolated_cell(
+                cell_config,
+                orchestration_id,
+                run_id,
+                replicas,
+                concurrency,
+                Arc::clone(&state),
+                cancellation.clone(),
+            )
         },
     )
     .await
@@ -1385,6 +1399,8 @@ async fn run_isolated_cell(
     run_id: String,
     replicas: u32,
     concurrency: u32,
+    state: Arc<AppState>,
+    mut cancellation: watch::Receiver<bool>,
 ) -> MatrixOutcome {
     let mut platform = match platform_for_run(&config, &run_id) {
         Ok(platform) => platform,
@@ -1400,19 +1416,24 @@ async fn run_isolated_cell(
             );
         }
     };
-    let result = match platform.ensure_stack(&config).await {
-        Ok(()) => {
-            run_matrix_cell(
-                &config,
-                orchestration_id,
-                &run_id,
-                replicas,
-                concurrency,
-                platform.as_mut(),
-            )
-            .await
-        }
-        Err(error) => Err(error).context("prepare isolated OAT matrix-cell platform"),
+    let result = tokio::select! {
+        result = async {
+            match platform.ensure_stack(&config).await {
+                Ok(()) => {
+                    run_matrix_cell(
+                        &config,
+                        orchestration_id,
+                        &run_id,
+                        replicas,
+                        concurrency,
+                        platform.as_mut(),
+                    )
+                    .await
+                }
+                Err(error) => Err(error).context("prepare isolated OAT matrix-cell platform"),
+            }
+        } => result,
+        _ = wait_for_cancellation(&mut cancellation) => Err(anyhow::anyhow!("local OAT run cancelled")),
     };
     let cleanup = platform.cleanup(&config).await;
     finish_matrix_cell(
@@ -1424,6 +1445,17 @@ async fn run_isolated_cell(
         result,
         cleanup,
     )
+}
+
+async fn wait_for_cancellation(cancellation: &mut watch::Receiver<bool>) {
+    loop {
+        if *cancellation.borrow() {
+            return;
+        }
+        if cancellation.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 fn finish_matrix_cell(
@@ -3758,8 +3790,10 @@ async fn destroy_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
     down.envs(&platform.environment);
     down.args(["down", "--volumes", "--remove-orphans"]);
     run_command(down, "clean up local OAT stack").await?;
-    fs::remove_dir_all(&platform.state_dir)
-        .with_context(|| format!("remove generated local OAT state {}", platform.state_dir.display()))?;
+    if platform.state_dir.exists() {
+        fs::remove_dir_all(&platform.state_dir)
+            .with_context(|| format!("remove generated local OAT state {}", platform.state_dir.display()))?;
+    }
     Ok(())
 }
 
