@@ -37,18 +37,16 @@ export function assertExperimentPoolCapacity(
   for (const experiment of experiments) {
     for (const [role, podCount] of [['client', experiment.clientPods], ['arrowcol', experiment.arrowcolPods]] as const) {
       if (!Number.isSafeInteger(podCount) || podCount < 0) throw new Error(`${experiment.name} has an invalid ${role} pod count`);
-      const poolIndex = userPools.findIndex((pool) => pool.role === role);
-      if (poolIndex < 0) throw new Error(`AKS stamp has no ${role} user pool; ${experiment.name} capacity cannot be verified`);
-      const pool = userPools[poolIndex]!;
-      const workloadSlots = (pool.maxPods - DAEMONSET_POD_ALLOWANCE_PER_NODE) * pool.maxCount;
+      const matchingPools = userPools.filter((pool) => pool.role === role);
+      if (matchingPools.length === 0) throw new Error(`AKS stamp has no ${role} user pool; ${experiment.name} capacity cannot be verified`);
+      const workloadSlots = matchingPools.reduce((total, pool) =>
+        total + Math.max(0, pool.maxPods - DAEMONSET_POD_ALLOWANCE_PER_NODE) * pool.maxCount, 0);
       if (podCount <= workloadSlots) continue;
-      const minimumMaxPods = Math.ceil(podCount / pool.maxCount + DAEMONSET_POD_ALLOWANCE_PER_NODE);
-      const recommendation = minimumMaxPods <= MAX_PODS_PER_NODE
-        ? `raise aks.userPools[${poolIndex}].maxPods to at least ${minimumMaxPods}`
-        : `raise aks.userPools[${poolIndex}].maxCount to at least ${Math.ceil(podCount / (MAX_PODS_PER_NODE - DAEMONSET_POD_ALLOWANCE_PER_NODE))} with maxPods=${MAX_PODS_PER_NODE}`;
+      const poolNames = matchingPools.map((pool) => `"${pool.name}"`).join(', ');
       throw new Error(
-        `${experiment.name} requires ${podCount} ${role} pods, but pool "${pool.name}" has only ${workloadSlots} workload slots ` +
-        `after reserving ${DAEMONSET_POD_ALLOWANCE_PER_NODE} pods per node for DaemonSets; ${recommendation}.`,
+        `${experiment.name} requires ${podCount} ${role} pods, but pools ${poolNames} have only ${workloadSlots} combined workload slots ` +
+        `after reserving ${DAEMONSET_POD_ALLOWANCE_PER_NODE} pods per node for DaemonSets; increase maxPods (up to ${MAX_PODS_PER_NODE}) ` +
+        `or maxCount for one or more of these pools: ${poolNames}.`,
       );
     }
   }

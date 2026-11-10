@@ -15,9 +15,9 @@ now-approved canonical fixture rather than copying or inventing table names.
 
 ## Capacity prerequisites
 
-The example stamp configures one node in each user pool. Azure CNI Overlay
-supports at most 250 pods per node and assigns each node a /24 pod address
-block ([Azure CNI Overlay planning](https://learn.microsoft.com/azure/aks/azure-cni-overlay#ip-address-planning)).
+The example's user pools can autoscale from zero to one node; per-node capacity
+is the maximum scale-up headroom. Azure CNI Overlay supports at most 250 pods
+per node and assigns each node a /24 pod address block ([Azure CNI Overlay planning](https://learn.microsoft.com/azure/aks/azure-cni-overlay#ip-address-planning)).
 Reserve 32 pod slots per node for DaemonSets; with maxPods 250 this leaves 218
 workload slots. The minimum maxPods values for the largest planned workloads
 are 160 for the client pool (128 E4 Jobs + 32 reserved) and 52 for the ArrowCol

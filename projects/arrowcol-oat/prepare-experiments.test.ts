@@ -40,7 +40,6 @@ test('example stamp fits the default run, 32-table pilot, and documented E1-E5 p
   assert.equal(defaultRun.arrowcolPods, 5);
 
   const pilot = { ...quick, tables, clients_per_table: 1, replica_counts: [1], pilot_mode: true };
-  assert.equal(pilot.pilot_mode, true);
   const pilotCounts = experimentPoolPodCount('32-table pilot', pilot);
   assert.equal(pilotCounts.clientPods, 32);
   assert.equal(pilotCounts.arrowcolPods, 5);
@@ -80,7 +79,20 @@ test('example stamp fits the default run, 32-table pilot, and documented E1-E5 p
   const undersizedClientPools = stamp.aks.userPools.map((pool) =>
     pool.role === 'client' ? { ...pool, maxPods: 30 } : pool);
   assert.throws(() => assertExperimentPoolCapacity(undersizedClientPools, [E4]),
-    /E4 requires 128 client pods.*benchd64.*only -2 workload slots.*maxPods to at least 160/);
+    /E4 requires 128 client pods.*pools "benchd64" have only 0 combined workload slots.*increase maxPods.*"benchd64"/);
+});
+
+test('capacity sums same-role pool slots before rejecting an experiment', async () => {
+  const stamp = parseStampConfig(await readFile('infra/azure/stamp.example.yaml', 'utf8'));
+  const E4 = experimentPoolPodCount('E4', { tables, clients_per_table: 4, replica_counts: [16] });
+  const splitPools = stamp.aks.userPools.flatMap((pool) => pool.role === 'client'
+    ? [{ ...pool, name: `${pool.name}-a`, maxPods: 100 }, { ...pool, name: `${pool.name}-b`, maxPods: 100 }]
+    : [pool]);
+  const firstClientPool = splitPools.find((pool) => pool.role === 'client');
+  assert.ok(firstClientPool);
+  const firstOnlyClientPools = splitPools.filter((pool) => pool.role !== 'client' || pool.name === firstClientPool.name);
+  assert.throws(() => assertExperimentPoolCapacity(firstOnlyClientPools, [E4]), /only 68 combined workload slots/);
+  assert.doesNotThrow(() => assertExperimentPoolCapacity(splitPools, [E4]));
 });
 
 test('binding refuses unknown/out-of-budget pilot settings, ambiguous baselines and invented tables', () => {
