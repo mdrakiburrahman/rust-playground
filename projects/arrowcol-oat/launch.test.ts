@@ -190,10 +190,14 @@ test('allows the executable to select the platform mode without editing the conf
   }
 });
 
-test('selects a per-mode quick config when no path is supplied', () => {
-  assert.equal(path.basename(resolveOatConfigPath('local')), 'oat-config.quick.json');
-  assert.equal(path.basename(resolveOatConfigPath('aks')), 'oat-config.aks.quick.json');
-  assert.equal(resolveOatConfigPath('aks', 'custom.json'), 'custom.json');
+test('selects a per-mode quick config when no path is supplied', async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'oat-quick-config-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  assert.equal(resolveOatConfigPath('local', undefined, root),
+    path.join(root, 'docs/experiments/arrowcol-oat/oat-config.quick.json'));
+  assert.equal(resolveOatConfigPath('aks', undefined, root),
+    path.join(root, 'docs/experiments/arrowcol-oat/oat-config.aks.quick.json'));
+  assert.equal(resolveOatConfigPath('aks', 'custom.json', root), 'custom.json');
 });
 
 test('fills missing local Docker bridge hosts while preserving explicit values', async () => {
