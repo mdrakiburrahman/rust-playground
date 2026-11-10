@@ -28,9 +28,13 @@ async function fixture(t: test.TestContext, stamp = '00000') {
   return { stampConfig };
 }
 
-function fake(options: { clusters?: string[]; state?: string; preflightFailures?: number; fail?: string } = {}) {
+function fake(options: {
+  clusters?: string[]; state?: string; preflightFailures?: number; fail?: string;
+  missingImages?: boolean; badProvenance?: boolean; badDigest?: boolean;
+} = {}) {
   const calls: string[][] = [];
   let preflights = 0;
+  let published = !options.missingImages;
   const runner: typeof run_tree = async (command, _timeout, _cwd, env) => {
     calls.push(command);
     const text = command.join(' ');
@@ -38,8 +42,11 @@ function fake(options: { clusters?: string[]; state?: string; preflightFailures?
     let stdout = '';
     if (text.startsWith('az aks list')) stdout = JSON.stringify((options.clusters ?? ['arrow-collector-89152']).map(name => ({ name })));
     else if (text.startsWith('az aks get-credentials') || command[0] === 'kubelogin') { /* credential setup */ }
+    else if (text.startsWith('az aks show')) stdout = 'stamp.example.com';
     else if (text.startsWith('az identity show')) stdout = clientId;
-    else if (text.startsWith('az account show')) stdout = subscription;
+    else if (text.startsWith('az account show')) stdout = command.includes('user.name') ? clientId : subscription;
+    else if (text.startsWith('az login') || text.startsWith('az acr login')) { /* isolated publisher login */ }
+    else if (text.startsWith('az acr show')) stdout = 'arrowcollector89152.azurecr.io';
     else if (text.startsWith('az storage container show')) stdout = JSON.stringify({
       properties: { etag: '"authority"' }, metadata: {
         sandboxid: 'stamp-89152', resetstate: options.state ?? 'ready-v1', resetgeneration: generation,
@@ -47,18 +54,33 @@ function fake(options: { clusters?: string[]; state?: string; preflightFailures?
       },
     });
     else if (command[0] === 'git' && command[1] === 'check-ignore') stdout = command.slice(2).join('\n');
-    else if (command[0] === 'git' && command[1] === 'rev-parse') stdout = revision;
+    else if (command[0] === 'git' && command[1] === 'rev-parse') stdout = command.includes('--short=12') ? revision.slice(0, 12) : revision;
     else if (command[0] === 'git' && command[1] === 'status') stdout = '';
+    else if (command[0] === 'kubectl' && command[1] === 'config') stdout = 'https://stamp.example.com';
+    else if (command[0] === 'kubectl' && command[1] === 'get') stdout = JSON.stringify({
+      metadata: { name: 'arrow-collector', namespace: 'arrow-collector',
+        annotations: { 'azure.workload.identity/client-id': clientId } },
+    });
     else if (command[0] === 'kubectl' && command.includes('apply')) {
       const file = command[command.indexOf('--filename') + 1]!;
       const manifest = await readFile(file, 'utf8');
       assert.match(manifest, /name: arrow-collector/);
       assert.match(manifest, new RegExp(clientId));
     } else if (command[0] === 'kubectl' && command.includes('token')) stdout = token;
-    else if (text.startsWith('az acr manifest show-metadata')) stdout = command.includes('--query') ? digest : JSON.stringify({ digest });
-    else if (text.startsWith('docker buildx imagetools inspect')) stdout = JSON.stringify({
-      config: { Labels: { 'org.opencontainers.image.revision': revision } },
-    });
+    else if (text.startsWith('az acr manifest show-metadata')) {
+      if (!published) return { returncode: 1, stdout: '', stderr: 'MANIFEST_UNKNOWN: manifest unknown' };
+      stdout = options.badDigest ? 'invalid-digest' : digest;
+    } else if (text.startsWith('docker image inspect')) {
+      const reference = command.at(-1)!;
+      const repository = reference.startsWith('arrowcollector89152.azurecr.io/') ? reference.split('/').at(-1)!.split(':')[0] : '';
+      stdout = JSON.stringify({
+        Os: 'linux', Architecture: 'amd64',
+        Config: { Labels: { 'org.opencontainers.image.revision': options.badProvenance ? subscription : revision } },
+        RepoDigests: repository ? [`arrowcollector89152.azurecr.io/${repository}@${digest}`] : [],
+      });
+    } else if (text.startsWith('docker buildx build') || text.startsWith('docker tag') || text.startsWith('docker pull')) {
+      /* fake image operations */
+    } else if (text.startsWith('docker push')) published = true;
     else if (command[0] === 'npx' && command.includes('--preflight-only')) {
       preflights++;
       assert.equal(env?.ARROWCOL_MODE, process.env.ARROWCOL_MODE ?? 'azure');
@@ -124,6 +146,9 @@ test('setup safely repairs YAML, reuses published images, refreshes private inpu
   assert.equal(second.preflightReady, false);
   assert.equal(await readFile(resolve(output, 'secrets/sa-password'), 'utf8'), originalPassword);
   assert.equal(again.calls.some(c => c.includes('--preflight-only')), false);
+  const reuse = fake();
+  await setup({ ...options, skipPreflight: true }, reuse.runner);
+  assert.ok(reuse.calls.every(c => c[0] !== 'docker' || !['buildx', 'push'].includes(c[1]!)));
   await chmod(options.stampConfig, 0o644);
   const fail = fake({ preflightFailures: 3 });
   await assert.rejects(setup({ ...options, skipImages: true }, fail.runner), /three bounded passes/);
@@ -134,6 +159,48 @@ test('setup safely repairs YAML, reuses published images, refreshes private inpu
   const stale = fake();
   await assert.rejects(setup({ ...options, skipImages: true }, stale.runner), /aks destroy --confirm arrow-collector-rg/);
   assert.equal(stale.calls.length, 1);
+});
+
+test('missing revision images build and publish all five once, then verify every registry digest', async t => {
+  await mkdir(output, { mode: 0o700 });
+  t.after(() => rm(output, { force: true, recursive: true }));
+  const options = await fixture(t);
+  const m = fake({ missingImages: true });
+  const result = await setup({ ...options, skipPreflight: true }, m.runner);
+  assert.equal(Object.keys(result.images).length, 5);
+  assert.equal(m.calls.filter(c => c[0] === 'docker' && c[1] === 'buildx').length, 5);
+  assert.equal(m.calls.filter(c => c[0] === 'docker' && c[1] === 'push').length, 5);
+  assert.equal(m.calls.filter(c => c[0] === 'docker' && c[1] === 'pull').length, 5);
+  for (const command of m.calls.filter(c => c[0] === 'docker' && c[1] === 'push')) {
+    assert.ok(command.at(-1)!.endsWith(`:oat-${revision}`));
+  }
+  assert.ok(Object.values(result.images).every(image => image.endsWith(`@${digest}`)));
+  await assert.rejects(readFile(resolve(output, 'runtime.publish.json')), { code: 'ENOENT' });
+});
+
+test('skip-images and hard provenance failures never trigger builds or overwrite a valid runtime', async t => {
+  await mkdir(output, { mode: 0o700 });
+  t.after(() => rm(output, { force: true, recursive: true }));
+  const options = await fixture(t);
+  const result = await setup({ ...options, skipImages: true, skipPreflight: true }, fake().runner);
+  const original = await readFile(result.runtimeConfigPath, 'utf8');
+  for (const [fault, pattern] of [
+    [{ missingImages: true }, /without --skip-images/],
+    [{ badProvenance: true }, /revision provenance/],
+    [{ badDigest: true }, /invalid .* manifest digest/],
+  ] as const) {
+    const m = fake(fault);
+    await assert.rejects(setup({ ...options, skipImages: true, skipPreflight: true }, m.runner), pattern);
+    assert.ok(m.calls.every(c => c[0] !== 'docker' || !['buildx', 'push'].includes(c[1]!)));
+    assert.equal(await readFile(result.runtimeConfigPath, 'utf8'), original);
+  }
+  const hard = fake({ badProvenance: true });
+  await assert.rejects(setup({ ...options, skipPreflight: true }, hard.runner), /revision provenance/);
+  assert.ok(hard.calls.every(c => c[0] !== 'docker' || !['buildx', 'push'].includes(c[1]!)));
+  const failedBuild = fake({ missingImages: true, fail: 'docker buildx build' });
+  await assert.rejects(setup({ ...options, skipPreflight: true }, failedBuild.runner), /Docker build failed/);
+  assert.equal(await readFile(result.runtimeConfigPath, 'utf8'), original);
+  await assert.rejects(readFile(resolve(output, 'runtime.publish.json')), { code: 'ENOENT' });
 });
 
 test('non-READY authority is refused before identity, assertion or image publication', async t => {
