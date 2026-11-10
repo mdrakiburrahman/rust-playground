@@ -360,6 +360,30 @@ async fn concurrent_oat_router_instances_read_one_prebound_table_owner() {
 }
 
 #[tokio::test]
+async fn trusted_oat_initializer_rejects_run_longer_than_owner_lease() {
+    let (store, _, _) = seeded_store().await;
+    let engine_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);
+    let engine = RoutingEngine::new(engine_store, oat_policy(OAT_RUN_CANONICAL))
+        .unwrap_or_else(|error| panic!("create short-lease setup engine: {error}"));
+    let expected = [LeaseKey::new(ImplementationPool::Dataflow, table())];
+    let before = store.operation_counts();
+
+    let result = engine
+        .initialize_run_table_pins(OAT_RUN_CANONICAL, &expected, millis(160_000), millis(100_000))
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(error)
+            if error.kind() == RoutingErrorKind::InvalidConfiguration
+                && error.to_string().contains("lease")
+    ));
+    let after = store.operation_counts();
+    assert_eq!(after.claim_lease, before.claim_lease);
+    assert_eq!(after.bind_initial_run_table_pin, before.bind_initial_run_table_pin);
+}
+
+#[tokio::test]
 async fn trusted_oat_initializer_binds_multiple_tables_to_one_eligible_collector() {
     let (store, _, unavailable) = seeded_store().await;
     store
