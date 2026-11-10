@@ -6,7 +6,7 @@ replace the devcontainer mode.
 
 ## Router authentication
 
-Edge HMAC works end-to-end in the proven local flow; using it on AKS requires matching mounted keys, updated pinned router and client images and a trusted TLS and authorization edge, not a different router mode. Catalog identity and TLS, and any QAP host allowlist, are open policy decisions; The shared config validator checks URL shape only; AKS preflight pins `qap_endpoint` to HTTPS and the exact selected stamp and region Kusto host, with no credentials, query, fragment, or path beyond a slash. A destination allowlist beyond those checks remains an open policy decision.
+Edge HMAC is enabled on AKS with matching mounted keys and pinned router and client images; it authenticates requests to the router but does not provide TLS. Catalog Flight SQL DDL requires signed internal identity by default: the catalog reads the `internal-hmac` key from `arrowcol-router-auth` at `/run/auth/internal-hmac`, and generated direct OAT client Jobs mount that key at `/run/secrets/internal-hmac` and set `LOADTEST_INTERNAL_SECRET_FILE` to that path. `--ddl-auth-mode dev_only_allow_unsigned` is an explicit development-only bypass; do not use it on AKS. This authentication applies only to catalog DDL; data-plane Flight SQL is unchanged. TLS/mTLS is deferred. NetworkPolicy objects are not assumed to be enforced on the default AKS dataplane, and no QAP host allowlist is added. The shared `qap_endpoint` validator checks URL shape only; AKS preflight pins it to HTTPS and the exact selected stamp and region Kusto host, with no credentials, query, fragment, or path beyond a slash. A destination allowlist beyond those checks remains a deferred policy decision.
 
 ## Qualification and safety
 
