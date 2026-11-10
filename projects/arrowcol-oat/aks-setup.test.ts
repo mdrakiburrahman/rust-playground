@@ -10,7 +10,7 @@ const subscription = '00000000-0000-0000-0000-000000000001';
 const clientId = '00000000-0000-0000-0000-000000000002';
 const generation = '00000000-0000-0000-0000-000000000003';
 const output = resolve(ROOT, 'out/arrowcol-oat');
-const revision = '0123456789ab';
+const revision = '0123456789abcdef0123456789abcdef01234567';
 const digest = `sha256:${'a'.repeat(64)}`;
 const token = `header.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 })).toString('base64url')}.signature`;
 
@@ -89,6 +89,8 @@ test('missing, ambiguous and malformed live stamps fail with actionable guidance
   await assert.rejects(discoverLiveStamp(options, fake({ fail: 'az aks list' }).runner), /az login --use-device-code/);
   const absent: typeof run_tree = async () => ({ returncode: 1, stdout: '', stderr: 'ResourceGroupNotFound' });
   await assert.rejects(discoverLiveStamp(options, absent), /aks deploy/);
+  const malformed: typeof run_tree = async () => ({ returncode: 0, stdout: '{bad', stderr: '' });
+  await assert.rejects(discoverLiveStamp(options, malformed), /invalid AKS inventory JSON.*aks setup/);
 });
 
 test('CLI validates options before attempting any Azure operation', async () => {
@@ -150,6 +152,15 @@ test('operator credential failure is actionable and does not fall back to UAMI o
   const m = fake({ fail: 'az aks get-credentials' });
   await assert.rejects(setup({ ...options, skipImages: true }, m.runner), /Fetch AKS credentials failed.*aks setup/);
   assert.ok(m.calls.every(c => !c.includes('apply') && !c.includes('token') && !c.includes('login')));
+});
+
+test('tracked stamp configuration is refused before rewriting or requesting cluster credentials', async t => {
+  const options = await fixture(t);
+  const before = await readFile(options.stampConfig, 'utf8');
+  const m = fake({ fail: 'git check-ignore --quiet' });
+  await assert.rejects(setup({ ...options, skipImages: true }, m.runner), /Private stamp configuration ignore check failed/);
+  assert.equal(await readFile(options.stampConfig, 'utf8'), before);
+  assert.ok(m.calls.every(c => !c.includes('get-credentials') && !c.includes('apply') && !c.includes('token')));
 });
 
 test('generation drift is refused before changing the captured bootstrap file', async t => {

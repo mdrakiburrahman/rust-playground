@@ -9,6 +9,7 @@ import { loadStampConfig } from '../../infra/azure/stamp.js';
 import { PublisherControl, READY } from '../../infra/azure/publisher_control.js';
 import type { Metadata } from '../../infra/azure/authority.js';
 import type { LiveStamp, SetupOptions, SetupResult } from './aks-types.js';
+import { renderStampConfig } from './aks-stamp.js';
 import { generatePrivateInputs, renderBootstrapEnv, validateRuntime, writePrivateFile, type RuntimeConfig } from './runtime.js';
 
 const setupCommand = 'npx --no-install arrowcol-oat aks setup';
@@ -39,8 +40,10 @@ export async function discoverLiveStamp(options: SetupOptions = {}, runner: type
     if (/ResourceGroupNotFound/.test(result.stderr)) throw new Error('No live stamp; run `npx --no-install arrowcol-oat aks deploy`.');
     throw new Error('Could not discover the live AKS stamp; run `az login --use-device-code`, then retry `npx --no-install arrowcol-oat aks setup`.');
   }
-  const value: unknown = JSON.parse(result.stdout);
-  if (!Array.isArray(value)) throw new Error('Azure returned an invalid AKS inventory.');
+  let value: unknown;
+  try { value = JSON.parse(result.stdout); }
+  catch { throw new Error(`Azure returned invalid AKS inventory JSON; retry \`${setupCommand}\`.`); }
+  if (!Array.isArray(value)) throw new Error(`Azure returned an invalid AKS inventory; retry \`${setupCommand}\`.`);
   const clusters = value.filter((item): item is { name: string } =>
     item !== null && typeof item === 'object' && typeof item.name === 'string' && item.name.startsWith('arrow-collector-'));
   if (!clusters.length) throw new Error('No live stamp; run `npx --no-install arrowcol-oat aks deploy`.');
@@ -95,14 +98,13 @@ export async function setup(options: SetupOptions = {}, runner: typeof run_tree 
   const live = await discoverLiveStamp(options, runner);
   await requireCurrentState(live);
   const stampConfigPath = resolve(ROOT, options.stampConfig ?? 'infra/azure/stamp.yaml');
+  await checked(runner, ['git', 'check-ignore', '--quiet', '--', stampConfigPath], 15, 'Private stamp configuration ignore check');
   const original = await readFile(stampConfigPath, 'utf8');
-  const document = parseDocument(original);
-  if (document.errors.length) throw new Error('Invalid stamp YAML.');
-  document.set('stamp', live.stamp);
-  if (document.toString() !== original) {
+  const selected = renderStampConfig(original, { stamp: live.stamp });
+  if (selected !== original) {
     if (!(await lstat(stampConfigPath)).isFile()) throw new Error('Stamp YAML must be a regular file.');
     await chmod(stampConfigPath, 0o600);
-    await writePrivateFile(stampConfigPath, document.toString());
+    await writePrivateFile(stampConfigPath, selected);
   }
   const stampConfig = loadStampConfig(stampConfigPath);
   if (stampConfig.aks.namespace !== 'arrow-collector' || stampConfig.aks.serviceAccount !== 'arrow-collector') {
@@ -164,8 +166,8 @@ export async function setup(options: SetupOptions = {}, runner: typeof run_tree 
     deltaRoot: `${config.table_root}dataflow`,
     images: { sqlserver: 'unpublished', catalog: 'unpublished', router: 'unpublished', dataflow: 'unpublished' },
   };
-  const revision = await checked(runner, ['git', 'rev-parse', '--short=12', 'HEAD'], 15, 'Read source revision');
-  if (!/^[a-f0-9]{12}$/.test(revision)) throw new Error('Git returned an invalid source revision.');
+  const revision = await checked(runner, ['git', 'rev-parse', 'HEAD'], 15, 'Read source revision');
+  if (!/^[a-f0-9]{40}$/.test(revision)) throw new Error('Git returned an invalid full source revision.');
   const tag = options.tag ?? `oat-${revision}`;
   if (!/^[a-z0-9][a-z0-9._-]{0,127}$/.test(tag)) throw new Error('--tag must be a valid lowercase container tag.');
   const imageOptions = { env: bootstrapEnvPath, azureEnv: bootstrapEnvPath, stampConfig: stampConfigPath,
@@ -173,16 +175,22 @@ export async function setup(options: SetupOptions = {}, runner: typeof run_tree 
   const imagesApi = await import('./publish-images.js');
   let runtime: RuntimeConfig;
   let clientImage: string;
-  if (options.skipImages) {
+  try {
     const published = await imagesApi.readPublishedImages({ ...imageOptions, revision }, runner);
     runtime = validateRuntime({ ...draft, images: published.images });
     clientImage = published.client;
-  } else {
+    console.log(`Reusing five revision-verified images for ${revision}.`);
+  } catch (error) {
+    if (!(error instanceof imagesApi.MissingPublishedImagesError)) throw error;
+    if (options.skipImages) throw new Error(`Revision-pinned images are missing; run \`${setupCommand}\` without --skip-images.`, { cause: error });
     try {
       await writePrivateFile(imageOptions.runtimeConfig, `${JSON.stringify(validateRuntime(draft, true), null, 2)}\n`);
       await imagesApi.buildLocalImages({ revision }, runner);
-      runtime = await imagesApi.publishImages(imageOptions, runner);
-      clientImage = await imagesApi.publishClientImage(imageOptions, runner);
+      await imagesApi.publishImages(imageOptions, runner);
+      await imagesApi.publishClientImage(imageOptions, runner);
+      const verified = await imagesApi.readPublishedImages({ ...imageOptions, revision }, runner);
+      runtime = validateRuntime({ ...draft, images: verified.images });
+      clientImage = verified.client;
     } finally { await rm(imageOptions.runtimeConfig, { force: true }); }
   }
   const assertion = await checked(runner, ['kubectl', '--context', live.clusterName, '--request-timeout=60s',
