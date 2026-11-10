@@ -95,6 +95,7 @@ test('CLI validates options before attempting any Azure operation', async () => 
   const m = fake();
   await assert.rejects(main(['--stamp', '1'], m.runner), /10000..99999/);
   await assert.rejects(main(['--unknown'], m.runner), /Unknown option/);
+  await assert.rejects(main(['--tag', 'Bad Tag'], m.runner), /valid lowercase container tag/);
   assert.equal(m.calls.length, 0);
 });
 
@@ -139,5 +140,28 @@ test('non-READY authority is refused before identity, assertion or image publica
   const options = await fixture(t);
   const m = fake({ state: 'fenced-v1' });
   await assert.rejects(setup({ ...options, skipImages: true }, m.runner), /ready-v1.*finish provisioning/);
+  assert.ok(m.calls.every(c => !c.includes('apply') && !c.includes('token') && !c.includes('push')));
+});
+
+test('operator credential failure is actionable and does not fall back to UAMI or publish images', async t => {
+  await mkdir(output, { mode: 0o700 });
+  t.after(() => rm(output, { force: true, recursive: true }));
+  const options = await fixture(t);
+  const m = fake({ fail: 'az aks get-credentials' });
+  await assert.rejects(setup({ ...options, skipImages: true }, m.runner), /Fetch AKS credentials failed.*aks setup/);
+  assert.ok(m.calls.every(c => !c.includes('apply') && !c.includes('token') && !c.includes('login')));
+});
+
+test('generation drift is refused before changing the captured bootstrap file', async t => {
+  await mkdir(output, { mode: 0o700 });
+  t.after(() => rm(output, { force: true, recursive: true }));
+  await mkdir(resolve(output, 'secrets'), { mode: 0o700 });
+  await writeFile(resolve(output, 'secrets/generation'), subscription, { mode: 0o600 });
+  const captured = `ARROWCOL_RESET_GENERATION=${subscription}\n`;
+  await writeFile(resolve(output, 'bootstrap.env'), captured, { mode: 0o600 });
+  const options = await fixture(t);
+  const m = fake();
+  await assert.rejects(setup({ ...options, skipImages: true }, m.runner), /different publisher generation/);
+  assert.equal(await readFile(resolve(output, 'bootstrap.env'), 'utf8'), captured);
   assert.ok(m.calls.every(c => !c.includes('apply') && !c.includes('token') && !c.includes('push')));
 });
