@@ -267,6 +267,58 @@ async fn flight_sql_ddl_requires_signed_identity_before_mutating_catalog() -> Re
     assert_eq!(error.code(), tonic::Code::Unauthenticated);
     let identity = name_identity(&["arrowcol".into(), "default".into(), "events".into()])?;
     assert!(service.store.current_schema(&identity).await?.is_none());
+    use arrowcol_protocol::{
+        AuthContext, AuthMethod, AuthenticatedPrincipal, PrincipalId, PrincipalIssuer, PrincipalScope, UnixMillis,
+    };
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    use std::{
+        collections::BTreeSet,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    let now_ms = u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
+    let principal = AuthenticatedPrincipal::new(
+        PrincipalId::new("loadtest-catalog")?,
+        PrincipalIssuer::new("arrowcol-loadgen")?,
+        BTreeSet::from([PrincipalScope::new("arrowcol/catalog")?]),
+    )?;
+    let context = AuthContext::new(principal, AuthMethod::WorkloadIdentity, UnixMillis::new(now_ms)?, None)?;
+    let encoded_context = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&context)?);
+    let expiry = now_ms.checked_add(30_000).context("identity expiry overflow")?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(b"catalog-integration-key-at-least-32-bytes")?;
+    mac.update(format!("{encoded_context}\n{expiry}").as_bytes());
+    let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    let command = CommandStatementUpdate {
+        query: CREATE.to_owned(),
+        transaction_id: None,
+    };
+    let mut request = tonic::Request::new(futures::stream::iter([arrow_flight::FlightData {
+        flight_descriptor: Some(FlightDescriptor {
+            r#type: arrow_flight::flight_descriptor::DescriptorType::Cmd as i32,
+            cmd: command.as_any().encode_to_vec().into(),
+            path: Vec::new(),
+        }),
+        ..arrow_flight::FlightData::default()
+    }]));
+    request
+        .metadata_mut()
+        .insert("x-arrowcol-internal-auth-context", encoded_context.parse()?);
+    request
+        .metadata_mut()
+        .insert("x-arrowcol-internal-auth-expires", expiry.to_string().parse()?);
+    request
+        .metadata_mut()
+        .insert("x-arrowcol-internal-auth-signature", signature.parse()?);
+    let response = flight.do_put(request).await?;
+    assert_eq!(
+        arrowcol_flight::decode_ddl_completion_metadata(response.metadata())?.table(),
+        "events"
+    );
+    let mut results = response.into_inner();
+    assert!(results.message().await?.is_some());
+    assert!(service.store.current_schema(&identity).await?.is_some());
     let _ = shutdown.send(());
     server.await??;
     Ok(())
