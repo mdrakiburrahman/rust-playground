@@ -610,9 +610,12 @@ export async function main(args: string[], runner: typeof run_tree = run_tree): 
       return;
     }
   } finally {
-    interrupt?.dispose();
-    await stopLocalServer(server.child);
-    if (markerWritten && runCleanupComplete && markerContext) await unlink(markerContext.path);
+    try {
+      await stopLocalServer(server.child);
+      if (markerWritten && runCleanupComplete && markerContext) await unlink(markerContext.path);
+    } finally {
+      interrupt?.dispose();
+    }
   }
   await maybeServeLocalViewer(configPath, mode);
 }
