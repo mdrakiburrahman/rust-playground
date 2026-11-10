@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
-import { ARM_WHAT_IF_EXTENSION_TYPES, ARM_WHAT_IF_RESOURCE_TYPES, ArmPreviewFailure, Azure, Config, Failure, deploy, fresh_authority, preflight, provision, SCHEMA_EVOLUTION_GROUP } from './bootstrap.js';
+import { ARM_WHAT_IF_EXTENSION_TYPES, ARM_WHAT_IF_RESOURCE_TYPES, ArmPreviewFailure, Azure, Config, Failure, arm_what_if_runtime_roles, deploy, fresh_authority, preflight, provision, SCHEMA_EVOLUTION_GROUP } from './bootstrap.js';
 import { defaultStampConfig } from './stamp.js';
 import { FENCED } from './publisher_control.js';
 
@@ -89,6 +89,167 @@ const identityId = resourceGroupId + '/providers/Microsoft.ManagedIdentity/userA
 const clusterId = resourceGroupId + '/providers/Microsoft.Kusto/clusters/arrow-collector-89152';
 const microsoftRestTagCreateModify = JSON.parse(fs.readFileSync(
   new URL('./fixtures/what-if-rest-tag-create.synthetic.json', import.meta.url), 'utf8'));
+const observedCliPreview = JSON.parse(fs.readFileSync(
+  new URL('./fixtures/what-if-cli-observed.sanitized.json', import.meta.url), 'utf8'));
+const fullSnapshot = (id: string, tags: Record<string, string>) => ({
+  id, name: id.split('/').at(-1)!, apiVersion: '2023-01-31', location: 'canadacentral', tags,
+  type: id === resourceGroupId ? 'Microsoft.Resources/resourceGroups' : 'Microsoft.ManagedIdentity/userAssignedIdentities',
+});
+const tagModify = () => ({
+  changeType: 'Modify', resourceId: identityId,
+  before: fullSnapshot(identityId, { owner: 'old' }), after: fullSnapshot(identityId, { owner: 'new' }),
+  delta: [{ path: 'tags.owner', propertyChangeType: 'Modify', before: 'old', after: 'new' }],
+});
+
+for (const scenario of [
+  { name: 'minimized tag-only snapshots', change: { ...tagModify(),
+    before: { tags: { owner: 'old' } }, after: { tags: { owner: 'new' } } } },
+  { name: 'conflicting nested tag child', change: { ...tagModify(), delta: [
+    { path: 'tags.owner', propertyChangeType: 'Modify', before: 'old', after: 'new',
+      children: [{ path: 'properties.principalId', propertyChangeType: 'Delete', before: 'principal' }] },
+  ] } },
+  { name: 'malformed nested tag children', change: { ...tagModify(), delta: [
+    { path: 'tags.owner', propertyChangeType: 'Modify', before: 'old', after: 'new', children: {} },
+  ] } },
+  { name: 'snapshot with mismatched identity', change: { ...tagModify(),
+    before: fullSnapshot(identityId + '-other', { owner: 'old' }),
+    after: fullSnapshot(identityId + '-other', { owner: 'new' }) } },
+  { name: 'NoEffect resource type', change: { changeType: 'NoEffect', resourceId: clusterId } },
+  { name: 'dangling provider suffix', change: { changeType: 'Create', resourceId: clusterId + '/providers' } },
+  { name: 'potential deletion', change: { changeType: 'Delete', resourceId: clusterId }, potential: true },
+  { name: 'potential out-of-scope change', change: { changeType: 'Create',
+    resourceId: resourceGroupId.replace('arrow-collector-rg', 'other-rg') + '/providers/Microsoft.Kusto/clusters/other' }, potential: true },
+]) {
+  test('R3 refuses ' + scenario.name + ' without a verified marker or create', async () => {
+    const stamp = defaultStampConfig({ AZURE_STAMP: '89152' });
+    stamp.subscription = subscription;
+    const azure = new Azure(new Config({ AZURE_SUBSCRIPTION_ID: subscription }, stamp));
+    azure.arm = async () => null;
+    const variants = scenario.name === 'dangling provider suffix' ? [
+      scenario.change,
+      { changeType: 'Ignore', resourceId: identityId + '/providers//roleAssignments/role' },
+      { changeType: 'Create', resourceId: identityId + '/providers/Microsoft.Authorization' },
+      { changeType: 'Create', resourceId: identityId + '/providers/Microsoft.Authorization/roleAssignments' },
+    ] : [scenario.change];
+    for (const change of variants) {
+      const calls: string[] = [], logs: string[] = [];
+      const originalLog = console.log;
+      console.log = (...values) => logs.push(values.join(' '));
+      azure.cli = async (...args) => {
+        calls.push(args[2]!);
+        return scenario.potential ? { status: 'Succeeded', changes: [], potentialChanges: [change] } :
+          { status: 'Succeeded', changes: [change] };
+      };
+      try { await assert.rejects(provision(azure, '', 0, '/tmp/arrowcol-preview-test-output', true, {}, true), ArmPreviewFailure); }
+      finally { console.log = originalLog; }
+      assert.deepEqual(calls, ['what-if']);
+      assert.equal(logs.some(line => line.startsWith('ARM_PREVIEW_VERIFIED')), false);
+    }
+  });
+}
+
+for (const properties of [
+  { changes: [{ changeType: 'Create', resourceId: clusterId }] },
+  { changes: [], potentialChanges: [{ changeType: 'Ignore', resourceId: identityId +
+    '/providers/Microsoft.Authorization/roleAssignments/identity-role' }] },
+]) {
+  test('R3 accepts the documented REST properties envelope and validates both lists', async () => {
+    const stamp = defaultStampConfig({ AZURE_STAMP: '89152' });
+    stamp.subscription = subscription;
+    const azure = new Azure(new Config({ AZURE_SUBSCRIPTION_ID: subscription }, stamp));
+    azure.arm = async () => null;
+    const calls: string[] = [], logs: string[] = [];
+    const originalLog = console.log;
+    console.log = (...values) => logs.push(values.join(' '));
+    azure.cli = async (...args) => {
+      calls.push(args[2]!);
+      if (args[2] === 'what-if') return { status: 'Succeeded', properties };
+      throw new Failure('DeploymentFailed: simulated create rejection');
+    };
+    try { await assert.rejects(provision(azure, '', 0, '/tmp/arrowcol-preview-test-output', true, {}, true), /DeploymentFailed/); }
+    finally { console.log = originalLog; }
+    assert.deepEqual(calls, ['what-if', 'create']);
+    assert.ok(logs.some(line => line.startsWith('ARM_PREVIEW_VERIFIED ') && line.endsWith(' changes=1')));
+  });
+}
+
+test('R3 verifies the observed role reference against the live identity and rejects changes without that proof', async () => {
+  const stamp = defaultStampConfig({ AZURE_STAMP: '89152' });
+  stamp.subscription = subscription;
+  const azure = new Azure(new Config({ AZURE_SUBSCRIPTION_ID: subscription }, stamp));
+  const role = observedCliPreview.changes.find((item: { changeType: string }) => item.changeType === 'Modify');
+  let livePrincipal: unknown = role.before.properties.principalId;
+  let identityReads = 0;
+  azure.arm = async (method, resource, _body, optional) => {
+    assert.equal(method, 'GET');
+    if (!optional) {
+      assert.equal(resource, identityId);
+      identityReads++;
+      return { properties: { principalId: livePrincipal } };
+    }
+    return null;
+  };
+  const originalLog = console.log;
+  const logs: string[] = [];
+  console.log = (...values) => logs.push(values.join(' '));
+  try {
+    for (const nested of [false, true]) {
+      const calls: string[] = [];
+      identityReads = 0;
+      logs.length = 0;
+      azure.cli = async (...args) => {
+        calls.push(args[2]!);
+        if (args[2] === 'create') throw new Failure('DeploymentFailed: simulated create rejection');
+        if (nested) {
+          const { changes, potentialChanges, ...rest } = observedCliPreview;
+          return { ...rest, properties: { changes, potentialChanges } };
+        }
+        return observedCliPreview;
+      };
+      await assert.rejects(deploy(azure, fresh_authority(), false, true), /DeploymentFailed/);
+      assert.deepEqual(calls, ['what-if', 'create']);
+      assert.equal(identityReads, 1);
+      assert.ok(logs.some(line => line.startsWith('ARM_PREVIEW_VERIFIED ')));
+    }
+    for (const fault of ['principal mismatch', 'unexpected assignment', 'role definition delta', 'Delete', 'missing before',
+      'nested delta', 'different identity expression', 'changed snapshot scope']) {
+      const item = structuredClone(role);
+      livePrincipal = role.before.properties.principalId;
+      if (fault === 'principal mismatch') livePrincipal = subscription;
+      if (fault === 'unexpected assignment') {
+        item.resourceId += '-other';
+        for (const snapshot of [item.before, item.after]) {
+          snapshot.id = item.resourceId;
+          snapshot.name += '-other';
+        }
+      }
+      if (fault === 'role definition delta') {
+        item.after.properties.roleDefinitionId += '-other';
+        item.delta.push({ path: 'properties.roleDefinitionId', propertyChangeType: 'Modify',
+          before: item.before.properties.roleDefinitionId, after: item.after.properties.roleDefinitionId });
+      }
+      if (fault === 'Delete') item.changeType = 'Delete';
+      if (fault === 'missing before') delete item.before;
+      if (fault === 'nested delta') item.delta[0].children = [
+        { path: 'properties.roleDefinitionId', propertyChangeType: 'Delete', before: 'role' },
+      ];
+      if (fault === 'different identity expression') {
+        item.after.properties.principalId = item.after.properties.principalId.replace('arrow-collector', 'other');
+        item.delta[0].after = item.after.properties.principalId;
+      }
+      if (fault === 'changed snapshot scope') item.after.properties.scope = resourceGroupId;
+      const calls: string[] = [];
+      logs.length = 0;
+      azure.cli = async (...args) => {
+        calls.push(args[2]!);
+        return { status: 'Succeeded', changes: [item] };
+      };
+      await assert.rejects(deploy(azure, fresh_authority(), false, true), ArmPreviewFailure, fault);
+      assert.deepEqual(calls, ['what-if'], fault);
+      assert.equal(logs.some(line => line.startsWith('ARM_PREVIEW_VERIFIED')), false, fault);
+    }
+  } finally { console.log = originalLog; }
+});
 
 test('what-if allowlist covers every resource type in the compiled main Bicep template', () => {
   const compiled = spawnSync('az', ['bicep', 'build', '--file', 'infra/azure/main.bicep', '--stdout'],
@@ -97,9 +258,23 @@ test('what-if allowlist covers every resource type in the compiled main Bicep te
   assert.equal(compiled.status, 0, compiled.stderr);
   const template = JSON.parse(compiled.stdout);
   const types = new Set<string>();
+  const runtimeRoles: string[] = [];
   const visit = (value: any): void => {
     for (const resource of value.resources ?? []) {
       if (typeof resource.type === 'string') types.add(resource.type.toLowerCase());
+      if (['microsoft.resources/resourcegroups', 'microsoft.managedidentity/userassignedidentities'].includes(resource.type?.toLowerCase())) {
+        assert.deepEqual(Object.keys(resource).sort(), ['apiVersion', 'location', 'name', 'tags', 'type'],
+          'Shared-resource Modify verification must be revisited if Bicep manages additional fields.');
+      }
+      if (resource.type?.toLowerCase() === 'microsoft.authorization/roleassignments' &&
+          /(?:\.principalId|runtimePrincipalId)/.test(resource.properties?.principalId ?? '')) {
+        const seed = resource.name.match(/'([^']+)'\)\]$/)?.[1];
+        const roleExpression = resource.properties.roleDefinitionId;
+        const variable = roleExpression.match(/^\[variables\('([^']+)'\)\]$/)?.[1];
+        const role = (variable ? value.variables[variable] : roleExpression).match(/[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}/)?.[0];
+        assert.ok(seed && role, 'Runtime role assignments must retain deterministic names and explicit role definitions.');
+        runtimeRoles.push(seed + ':' + role);
+      }
       if (resource.properties?.template && typeof resource.properties.template === 'object') visit(resource.properties.template);
     }
     for (const definition of Object.values(value.definitions ?? {}) as any[]) {
@@ -110,6 +285,11 @@ test('what-if allowlist covers every resource type in the compiled main Bicep te
   assert.ok(types.size > 0);
   assert.deepEqual([...types].filter(type => !ARM_WHAT_IF_RESOURCE_TYPES.has(type)), []);
   for (const type of ARM_WHAT_IF_EXTENSION_TYPES) assert.ok(ARM_WHAT_IF_RESOURCE_TYPES.has(type));
+  const stamp = defaultStampConfig({ AZURE_STAMP: '89152' });
+  stamp.subscription = subscription;
+  stamp.storageReadLogDestination = 'storage';
+  const expectedRoles = arm_what_if_runtime_roles(new Config({ AZURE_SUBSCRIPTION_ID: subscription }, stamp));
+  assert.deepEqual(runtimeRoles.sort(), expectedRoles.map(role => role.seed + ':' + role.role.split('/').at(-1)).sort());
 });
 
 for (const scope of [
@@ -146,17 +326,20 @@ for (const scenario of [
   { name: 'unexpected resource type', result: { changes: [{ changeType: 'Create', resourceId: resourceGroupId + '/providers/Microsoft.Test/items/x' }] } },
   { name: 'Modify without snapshots', result: { changes: [{ changeType: 'Modify', resourceId: identityId, delta: [{ path: 'tags.owner', propertyChangeType: 'Modify', before: 'old', after: 'new' }] }] } },
   { name: 'non-tag snapshot change hidden by a tag-only delta', result: { changes: [{ changeType: 'Modify', resourceId: identityId,
-    before: { location: 'canadacentral', tags: { owner: 'old' } }, after: { location: 'eastus2', tags: { owner: 'new' } },
+    before: fullSnapshot(identityId, { owner: 'old' }), after: { ...fullSnapshot(identityId, { owner: 'new' }), location: 'eastus2' },
     delta: [{ path: 'tags.owner', propertyChangeType: 'Modify', before: 'old', after: 'new' }] }] } },
   { name: 'tag removal', result: { changes: [{ changeType: 'Modify', resourceId: identityId,
-    before: { tags: { retired: 'old' } }, after: { tags: {} },
+    before: fullSnapshot(identityId, { retired: 'old' }), after: fullSnapshot(identityId, {}),
     delta: [{ path: 'tags.retired', propertyChangeType: 'Delete', before: 'old' }] }] } },
   { name: 'whole tags object removal', result: { changes: [{ changeType: 'Modify', resourceId: identityId,
-    before: { tags: { retired: 'old' } }, after: { tags: {} },
+    before: fullSnapshot(identityId, { retired: 'old' }), after: fullSnapshot(identityId, {}),
     delta: [{ path: 'tags', propertyChangeType: 'Modify', before: { retired: 'old' }, after: {} }] }] } },
   { name: 'replacement-sensitive Modify', result: { changes: [{ changeType: 'Modify', resourceId: identityId,
-    before: { location: 'eastus2', tags: { owner: 'old' } }, after: { location: 'canadacentral', tags: { owner: 'new' } },
+    before: { ...fullSnapshot(identityId, { owner: 'old' }), location: 'eastus2' }, after: fullSnapshot(identityId, { owner: 'new' }),
     delta: [{ path: 'location', propertyChangeType: 'Modify', before: 'eastus2', after: 'canadacentral' }] }] } },
+  { name: 'ambiguous flat and properties envelopes', result: { changes: [],
+    properties: { changes: [{ changeType: 'Delete', resourceId: clusterId }] } } },
+  { name: 'malformed potential changes list', result: { changes: [], potentialChanges: {} } },
 ]) {
   test('provision refuses ' + scenario.name + ' before create', async () => {
     const stamp = defaultStampConfig({ AZURE_STAMP: '89152' });
@@ -180,7 +363,7 @@ for (const scenario of [
   });
 }
 
-test('provision permits Microsoft REST-shaped tag-only Modify with tag creation lacking before', async () => {
+test('provision permits synthetic REST tag creation; this Modify shape is not provider-observed', async () => {
   const stamp = defaultStampConfig({ AZURE_STAMP: '89152' });
   stamp.subscription = subscription;
   const azure = new Azure(new Config({ AZURE_SUBSCRIPTION_ID: subscription }, stamp));
@@ -211,16 +394,16 @@ test('provision allows complete Microsoft REST-shaped tag Modify deltas on the r
   console.log = (...values) => logs.push(values.join(' '));
   azure.cli = async (...args) => {
     calls.push(args[2]!);
-    if (args[2] === 'what-if') return { changes: [
+    if (args[2] === 'what-if') return { status: 'Succeeded', properties: { changes: [
       { changeType: 'Modify', resourceId: resourceGroupId,
-        before: { location: 'canadacentral', tags: { owner: 'previous' } },
-        after: { location: 'canadacentral', tags: { owner: 'current' } },
+        before: fullSnapshot(resourceGroupId, { owner: 'previous' }),
+        after: fullSnapshot(resourceGroupId, { owner: 'current' }),
         delta: [{ path: 'tags.owner', propertyChangeType: 'Modify', before: 'previous', after: 'current' }] },
       { changeType: 'Modify', resourceId: identityId,
-        before: { location: 'canadacentral', tags: { owner: 'previous' } },
-        after: { location: 'canadacentral', tags: { owner: 'current' } },
+        before: fullSnapshot(identityId, { owner: 'previous' }),
+        after: fullSnapshot(identityId, { owner: 'current' }),
         delta: [{ path: 'tags.owner', propertyChangeType: 'Modify', before: 'previous', after: 'current' }] },
-    ] };
+    ] } };
     throw new Failure('DeploymentFailed: simulated create rejection');
   };
   try { await assert.rejects(provision(azure, '', 0, '/tmp/arrowcol-preview-test-output', true, {}, true), /DeploymentFailed/); }

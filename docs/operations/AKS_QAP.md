@@ -76,14 +76,42 @@ timed-out, or unverified preview stops before creation and cannot trigger networ
 fallback. The preview pins Azure CLI to `--result-format FullResourcePayloads` and
 `--no-pretty-print`. The validator rejects deletions, `Deploy` and unsupported
 changes, resource IDs outside the selected subscription/resource group, and
-resource types outside the templates; extension-resource role assignments are
-accepted only when both the parent and extension types are allowlisted. A
-`Modify` is accepted only when the full before/after snapshots prove that tags
-are the only changed resource property and provider `path`/`propertyChangeType`
-deltas account for every tag change. Tag removals, incomplete snapshots, or an
-unverifiable delta fail closed. The direct `bootstrap.ts provision` command
+resource types outside the templates; extension-resource role assignments and
+diagnostic settings are
+accepted only when both the parent and extension types are allowlisted.
+Both definite and potential changes receive the same checks, in either the
+observed flat CLI envelope or the REST `properties` envelope; ambiguous or
+malformed envelopes fail closed. `NoEffect` is not a resource change type.
+A `Modify` is accepted only for the exact shared resource group or UAMI.
+Their Bicep-managed projection is name, location and tags (checked against the
+compiled templates in tests). Both snapshots must include matching resource
+ID, type, name, API version and location; every non-tag field must remain
+identical. Flat `path`/`propertyChangeType` deltas must account for every tag
+change. Missing identity fields, tag removals, nested/array deltas, and all
+other resource modifications fail closed except the proven role-reference no-op
+below, including an in-place AKS pool
+update. Nested children are unsupported, not silently discarded.
+The direct `bootstrap.ts provision` command
 requires `--preview-before-create` to enable this guard. The standalone
 `aks deploy --what-if` command remains read-only.
+
+For Cilium retries and idempotent reruns, a role-assignment `Modify` is accepted
+only for an exact template-derived deterministic ID and role definition.
+The only allowed delta is an unresolved `properties.principalId` reference to
+the shared UAMI, optionally accompanied by `principalType: ServicePrincipal`
+as `NoEffect`. One read-only UAMI lookup per preview must prove that the before
+principal equals the live identity principal; snapshots must preserve every
+other assignment property and scope. Missing proof or any other delta stops
+before create. The template parity test also checks the runtime role list.
+
+The sanitized Azure CLI 2.92.0 fixture is a projection of a read-only
+provider capture: shared RG/UAMI `NoChange` snapshots, diagnostic-settings
+`Create`, and a role-assignment
+`Modify` with the unresolved principal reference described above.
+Tag-only `Modify` and the REST `properties` wrapper are synthetic test cases;
+those shapes remain unobserved in this capture. A successful ARM preview is
+not authorization to deploy, and an unresolved expression alone is not proof
+of a safe principal replacement.
 
 In stamped mode, the shared runtime UAMI also has container-scoped Blob Data
 Contributor on the stamp's data container for catalog and DFE writes, plus the

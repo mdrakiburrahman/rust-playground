@@ -820,7 +820,7 @@ export async function checkpoint_container(azure: Azure): Promise<any> {
   return azure.arm('GET', azure.c.storage_id + '/blobServices/default/containers/' + azure.c.checkpoints, undefined, true, '2023-05-01');
 }
 const ARM_WHAT_IF_CHANGE_TYPES = new Set([
-  'Create', 'Delete', 'Modify', 'NoChange', 'Ignore', 'Deploy', 'NoEffect', 'Unsupported',
+  'Create', 'Delete', 'Modify', 'NoChange', 'Ignore', 'Deploy', 'Unsupported',
 ]);
 export const ARM_WHAT_IF_RESOURCE_TYPES = new Set([
   'microsoft.resources/resourcegroups',
@@ -846,6 +846,7 @@ export const ARM_WHAT_IF_RESOURCE_TYPES = new Set([
 ]);
 export const ARM_WHAT_IF_EXTENSION_TYPES = new Set([
   'microsoft.authorization/roleassignments',
+  'microsoft.insights/diagnosticsettings',
 ]);
 const ARM_WHAT_IF_REMOVED_VALUES = new Set(['<null>', '<deleted>', '<removed>', '<not specified>']);
 function verified_arm_what_if_resource_scope(resourceId: string, config: Config): void {
@@ -881,6 +882,8 @@ function verified_arm_what_if_resource_scope(resourceId: string, config: Config)
     if (segment < segments.length) {
       segment++;
       providerIndex++;
+      if (segments.length - segment < 3)
+        throw new Failure('ARM what-if returned an incomplete extension-resource identifier.');
     }
   }
 }
@@ -914,11 +917,106 @@ function arm_what_if_tag_delta_key(path: string, keys: string[]): string | undef
     return normalized === `tags.${tagPath}` || normalized === `tags/${tagPath}`;
   });
 }
-function verify_arm_what_if_modify(item: Record<string, unknown>): void {
+export function arm_what_if_runtime_roles(c: Config): Array<{ id: string; scope: string; role: string; seed: string }> {
+  if (c.mode !== 'stamped') return [];
+  const reader = 'acdd72a7-3385-48ef-bd42-f606fba81ae7';
+  const blobReader = '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1';
+  const blobWriter = 'ba92f5b4-2d11-453d-a403-e96b0029c9fe';
+  const container = (name: string) => c.storage_id + '/blobServices/default/containers/' + name;
+  const vnet = c.base + '/providers/Microsoft.Network/virtualNetworks/' + c.cluster + '-vnet/subnets/';
+  const roles: Array<[string, string, string]> = [
+    [vnet + c.stampConfig.aks.systemPool.name, 'network-contributor', '4d97b98b-1d4f-4787-a291-c67834d212e7'],
+    [vnet + 'apiserver-subnet', 'network-contributor', '4d97b98b-1d4f-4787-a291-c67834d212e7'],
+    [c.identity_id, 'managed-identity-operator', 'f1a07417-d97a-45cb-824c-7a7467783830'],
+    [c.identity_id, 'run-federation-contributor', '7e559ce2-48d7-4b27-9128-fa1b247f1308'],
+    [c.registry_id, 'acr-pull', '7f951dda-4ed3-4680-a7ca-43fe172d538d'],
+    [c.registry_id, 'acr-push', '8311e382-0749-4cb8-b61a-304f252e45ec'],
+    [c.registry_id, 'registry-reader', reader],
+    [container(c.data), 'blob-reader', blobReader],
+    [container(c.experimentContainer), 'blob-reader', blobReader],
+    [container(c.data), 'runtime-data-contributor', blobWriter],
+    [container(c.experimentContainer), 'runtime-blob-contributor', blobWriter],
+    [container('$web'), 'runtime-static-site-contributor', blobWriter],
+    [container(c.checkpoints), 'runtime-control-contributor', blobWriter],
+    [container('experiments'), 'runtime-benchmark-contributor', blobWriter],
+    [c.cluster_id, 'runtime-cluster-reader', reader],
+    [c.workspace_id, 'runtime-log-analytics-reader', '73c42c96-874c-492b-b04d-ab87d138a893'],
+  ];
+  if (c.readLogStorageId) roles.push(
+    [c.readLogStorageId, 'runtime-read-log-reader', blobReader],
+    [c.readLogStorageId, 'runtime-read-log-arm-reader', reader],
+  );
+  return roles.map(([scope, seed, role]) => {
+    const bytes = createHash('sha1').update(Buffer.from('11fb06fb712d4ddd98c7e71bbd588830', 'hex'))
+      .update([scope, c.identity_id, seed].join('-')).digest().subarray(0, 16);
+    bytes[6] = (bytes[6]! & 0x0f) | 0x50;
+    bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+    const name = normalized_uuid(bytes.toString('hex'));
+    return { id: scope + '/providers/Microsoft.Authorization/roleAssignments/' + name, scope, seed,
+      role: '/subscriptions/' + c.subscription + '/providers/Microsoft.Authorization/roleDefinitions/' + role };
+  });
+}
+function verify_arm_what_if_role_modify(item: Record<string, unknown>, c: Config): string {
+  const expected = arm_what_if_runtime_roles(c).find(role => role.id.toLowerCase() === String(item.resourceId).toLowerCase());
+  if (!expected || !arm_what_if_record(item.before) || !arm_what_if_record(item.after))
+    throw new Failure('ARM what-if role Modify has no expected template assignment or complete snapshots.');
+  const before = item.before, after = item.after;
+  for (const snapshot of [before, after]) {
+    if (typeof snapshot.id !== 'string' || snapshot.id.toLowerCase() !== expected.id.toLowerCase() ||
+        typeof snapshot.name !== 'string' || snapshot.name.toLowerCase() !== expected.id.split('/').at(-1)!.toLowerCase() ||
+        String(snapshot.type).toLowerCase() !== 'microsoft.authorization/roleassignments' ||
+        snapshot.apiVersion !== '2022-04-01' || !arm_what_if_record(snapshot.properties))
+      throw new Failure('ARM what-if role Modify has incomplete or mismatched assignment snapshots.');
+  }
+  const previous = before.properties as Record<string, unknown>, next = after.properties as Record<string, unknown>;
+  const principal = typeof previous.principalId === 'string' ? normalized_uuid(previous.principalId) : '';
+  const expression = `[reference('${c.identity_id}', '2023-01-31').principalId]`;
+  if (!principal || next.principalId !== expression || previous.roleDefinitionId !== expected.role ||
+      next.roleDefinitionId !== expected.role ||
+      [before, after, previous, next].some(value => value.scope !== undefined && value.scope !== expected.scope) ||
+      [previous, next].some(properties => properties.principalType !== undefined && properties.principalType !== 'ServicePrincipal'))
+    throw new Failure('ARM what-if role Modify cannot prove unchanged principal, role and scope.');
+  const comparable = (snapshot: Record<string, unknown>, properties: Record<string, unknown>) => ({
+    ...snapshot, properties: { ...properties, principalId: principal, principalType: 'ServicePrincipal' },
+  });
+  if (!arm_what_if_equal(comparable(before, previous), comparable(after, next)) ||
+      !Array.isArray(item.delta) || !item.delta.length)
+    throw new Failure('ARM what-if role Modify changes other assignment properties or omits its delta.');
+  const paths = new Set<string>();
+  for (const delta of item.delta) {
+    if (!arm_what_if_record(delta) || typeof delta.path !== 'string' || paths.has(delta.path) ||
+        (delta.children !== undefined && delta.children !== null &&
+          (!Array.isArray(delta.children) || delta.children.length !== 0)))
+      throw new Failure('ARM what-if role Modify has an invalid or nested property delta.');
+    paths.add(delta.path);
+    if (delta.path === 'properties.principalId' && delta.propertyChangeType === 'Modify' &&
+        delta.before === previous.principalId && delta.after === expression) continue;
+    if (delta.path === 'properties.principalType' && delta.propertyChangeType === 'NoEffect' &&
+        (delta.before === undefined || delta.before === null || delta.before === 'ServicePrincipal') &&
+        delta.after === 'ServicePrincipal') continue;
+    throw new Failure('ARM what-if role Modify has an unproven assignment property delta.');
+  }
+  if (!paths.has('properties.principalId')) throw new Failure('ARM what-if role Modify omits the principal reference delta.');
+  return principal;
+}
+function verify_arm_what_if_modify(item: Record<string, unknown>, config: Config): void {
+  const resourceId = item.resourceId as string;
+  const resourceType = resourceId.toLowerCase() === config.base.toLowerCase() ? 'Microsoft.Resources/resourceGroups' :
+    resourceId.toLowerCase() === config.identity_id.toLowerCase() ? 'Microsoft.ManagedIdentity/userAssignedIdentities' : undefined;
+  if (!resourceType)
+    throw new Failure('ARM what-if Modify is only verifiable for the shared resource group and identity.');
   if (!arm_what_if_record(item.before) || !arm_what_if_record(item.after))
     throw new Failure('ARM what-if Modify has no verifiable before/after resource snapshots.');
   const before = item.before;
   const after = item.after;
+  for (const snapshot of [before, after]) {
+    if (typeof snapshot.id !== 'string' || snapshot.id.toLowerCase() !== resourceId.toLowerCase() ||
+        typeof snapshot.type !== 'string' || snapshot.type.toLowerCase() !== resourceType.toLowerCase() ||
+        typeof snapshot.name !== 'string' || snapshot.name.toLowerCase() !== resourceId.split('/').at(-1)!.toLowerCase() ||
+        typeof snapshot.apiVersion !== 'string' || !/^\d{4}-\d{2}-\d{2}(?:-preview)?$/.test(snapshot.apiVersion) ||
+        typeof snapshot.location !== 'string' || !/^[a-z0-9]+$/.test(snapshot.location))
+      throw new Failure('ARM what-if Modify has an incomplete or mismatched FullResourcePayloads snapshot.');
+  }
   const propertyNames = new Set([...Object.keys(before), ...Object.keys(after)]);
   for (const name of propertyNames) {
     if (name === 'tags') continue;
@@ -949,6 +1047,9 @@ function verify_arm_what_if_modify(item: Record<string, unknown>): void {
     const delta = value as Record<string, unknown>;
     if (typeof delta.path !== 'string' || !delta.path.trim() || typeof delta.propertyChangeType !== 'string')
       throw new Failure('ARM what-if Modify has an incomplete property delta.');
+    if (delta.children !== undefined && delta.children !== null &&
+        (!Array.isArray(delta.children) || delta.children.length !== 0))
+      throw new Failure('ARM what-if Modify contains unverifiable nested property deltas.');
     const changeType = delta.propertyChangeType;
     if (delta.path.trim().toLowerCase() === 'tags') {
       if (wholeTagsDelta || item.delta.length !== 1)
@@ -983,14 +1084,27 @@ function verify_arm_what_if_modify(item: Record<string, unknown>): void {
   if (!wholeTagsDelta && changedTags.some(key => !verifiedTagKeys.has(key)))
     throw new Failure('ARM what-if Modify property deltas do not cover all tag snapshot changes.');
 }
-function verified_arm_what_if_changes(result: unknown, config: Config): number {
+async function verified_arm_what_if_changes(result: unknown, azure: Azure): Promise<number> {
+  const config = azure.c;
   if (!result || typeof result !== 'object' || Array.isArray(result))
     throw new Failure('ARM what-if returned an unverifiable response object.');
   const response = result as Record<string, unknown>;
   if (response.error || (response.status !== undefined && response.status !== 'Succeeded'))
     throw new Failure('ARM what-if reported a failed or incomplete deployment preview.');
-  if (!Array.isArray(response.changes)) throw new Failure('ARM what-if response is missing its changes list.');
-  for (const change of response.changes) {
+  let properties = response;
+  if (Object.hasOwn(response, 'properties')) {
+    if (!arm_what_if_record(response.properties) || Object.hasOwn(response, 'changes') ||
+        Object.hasOwn(response, 'potentialChanges'))
+      throw new Failure('ARM what-if returned an invalid or ambiguous response envelope.');
+    properties = response.properties;
+  }
+  if (!Array.isArray(properties.changes)) throw new Failure('ARM what-if response is missing its changes list.');
+  const potentialChanges = properties.potentialChanges;
+  if (potentialChanges !== undefined && potentialChanges !== null && !Array.isArray(potentialChanges))
+    throw new Failure('ARM what-if response has an invalid potential changes list.');
+  const changes = [...properties.changes, ...(Array.isArray(potentialChanges) ? potentialChanges : [])];
+  let livePrincipal: string | undefined;
+  for (const change of changes) {
     if (!change || typeof change !== 'object' || Array.isArray(change))
       throw new Failure('ARM what-if returned an unverifiable resource change.');
     const item = change as Record<string, unknown>;
@@ -1001,9 +1115,21 @@ function verified_arm_what_if_changes(result: unknown, config: Config): number {
     if (item.changeType === 'Delete') throw new Failure('ARM what-if contains a resource deletion.');
     if (item.changeType === 'Unsupported') throw new Failure('ARM what-if contains an unsupported resource change.');
     if (item.changeType === 'Deploy') throw new Failure('ARM what-if contains an unverifiable deployment-only change.');
-    if (item.changeType === 'Modify') verify_arm_what_if_modify(item);
+    if (item.changeType === 'Modify') {
+      if (item.resourceId.toLowerCase().includes('/providers/microsoft.authorization/roleassignments/')) {
+        const principal = verify_arm_what_if_role_modify(item, config);
+        if (livePrincipal === undefined) {
+          const identity = await azure.arm('GET', config.identity_id, undefined, false, '2023-01-31');
+          if (typeof identity?.properties?.principalId !== 'string')
+            throw new Failure('ARM what-if role Modify has no live shared-identity principal proof.');
+          livePrincipal = normalized_uuid(identity.properties.principalId);
+        }
+        if (principal !== livePrincipal)
+          throw new Failure('ARM what-if role Modify principal does not match the live shared identity.');
+      } else verify_arm_what_if_modify(item, config);
+    }
   }
-  return response.changes.length;
+  return changes.length;
 }
 const sha256_file = (filename: string): string => createHash('sha256').update(fs.readFileSync(filename)).digest('hex');
 
@@ -1047,7 +1173,7 @@ export async function deploy(azure: Azure, fresh?: Metadata, whatIf = false, pre
     if (whatIf || previewBeforeCreate) {
       try {
         const result = await invoke('what-if');
-        const changes = verified_arm_what_if_changes(result, c);
+        const changes = await verified_arm_what_if_changes(result, azure);
         if (whatIf) console.log(JSON.stringify(result, null, 2));
         if (previewBeforeCreate) {
           if (canonical_json(resolvedExisting(await guard_existing(azure))) !== canonical_json(existingParameters))
