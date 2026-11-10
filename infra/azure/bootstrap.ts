@@ -24,6 +24,8 @@ export const DEFAULT_STOP_COMMAND = ['npx', '--no-install', 'tsx', 'projects/loa
 export const DELETE_PARALLELISM = 32;
 export const READ_ATTEMPTS = 5;
 export const TRANSIENT_HTTP = new Set([408, 429, 500, 502, 503, 504]);
+export class ArmPreviewFailure extends Failure {}
+export const ARM_PREVIEW_FAILURE_EXIT = 4;
 export const SERVICE_NAMES: Record<string, string> = {
   'https://management.azure.com/': 'ARM', 'https://storage.azure.com/': 'Storage', 'https://kusto.kusto.windows.net': 'Kusto',
 };
@@ -817,18 +819,47 @@ export function fresh_authority(): Metadata {
 export async function checkpoint_container(azure: Azure): Promise<any> {
   return azure.arm('GET', azure.c.storage_id + '/blobServices/default/containers/' + azure.c.checkpoints, undefined, true, '2023-05-01');
 }
-export async function deploy(azure: Azure, fresh?: Metadata, whatIf = false): Promise<void> {
+const ARM_WHAT_IF_CHANGE_TYPES = new Set([
+  'Create', 'Delete', 'Modify', 'NoChange', 'Ignore', 'Deploy', 'NoEffect', 'Unsupported',
+]);
+function verified_arm_what_if_changes(result: unknown): number {
+  if (!result || typeof result !== 'object' || Array.isArray(result))
+    throw new Failure('ARM what-if returned an unverifiable response object.');
+  const response = result as Record<string, unknown>;
+  if (response.error || (response.status !== undefined && response.status !== 'Succeeded'))
+    throw new Failure('ARM what-if reported a failed or incomplete deployment preview.');
+  if (!Array.isArray(response.changes)) throw new Failure('ARM what-if response is missing its changes list.');
+  for (const change of response.changes) {
+    if (!change || typeof change !== 'object' || Array.isArray(change))
+      throw new Failure('ARM what-if returned an unverifiable resource change.');
+    const item = change as Record<string, unknown>;
+    if (typeof item.resourceId !== 'string' || !item.resourceId.startsWith('/subscriptions/') ||
+        typeof item.changeType !== 'string' || !ARM_WHAT_IF_CHANGE_TYPES.has(item.changeType))
+      throw new Failure('ARM what-if returned an unverifiable resource change.');
+    if (item.changeType === 'Unsupported') throw new Failure('ARM what-if contains an unsupported resource change.');
+  }
+  return response.changes.length;
+}
+const sha256_file = (filename: string): string => createHash('sha256').update(fs.readFileSync(filename)).digest('hex');
+
+export async function deploy(azure: Azure, fresh?: Metadata, whatIf = false, previewBeforeCreate = false): Promise<void> {
   const c = azure.c;
+  if (whatIf && previewBeforeCreate) throw new Failure('Standalone what-if cannot be combined with --preview-before-create.');
   const existing = await guard_existing(azure);
   for (const [kind, resource] of Object.entries(existing)) {
     if (typeof resource.location !== 'string' || !/^[a-z0-9]+$/.test(resource.location))
       throw new Failure('Existing ' + kind + ' location is missing or invalid; refusing relocation.');
   }
   const ownershipTags = { ...TAGS, sandboxId: c.sandbox };
+  const resolvedExisting = (state: typeof existing) => ({
+    resourceGroupLocation: state.group?.location ?? c.location,
+    identityLocation: state.identity?.location ?? c.location,
+    resourceGroupTags: state.group?.tags ?? ownershipTags,
+    identityTags: state.identity?.tags ?? ownershipTags,
+  });
+  const existingParameters = resolvedExisting(existing);
   const params = { location: c.location, resourceGroupName: c.group, sandboxId: c.sandbox, storageAccountName: c.account,
-    resourceGroupLocation: existing.group?.location ?? c.location, identityLocation: existing.identity?.location ?? c.location,
-    resourceGroupTags: existing.group?.tags ?? ownershipTags, identityTags: existing.identity?.tags ?? ownershipTags,
-    azureMode: c.mode, clusterName: c.cluster, identityName: c.identity, registryName: c.registry,
+    ...existingParameters, azureMode: c.mode, clusterName: c.cluster, identityName: c.identity, registryName: c.registry,
     aksConfig: c.mode === 'stamped' ? c.stampConfig.aks : {},
     publisherFederatedCredentials: c.mode === 'stamped' && !existing.identity ? c.stampConfig.publisherFederatedCredentials : [],
     databaseName: c.database, dataContainer: c.data, checkpointContainer: c.checkpoints,
@@ -838,15 +869,40 @@ export async function deploy(azure: Azure, fresh?: Metadata, whatIf = false): Pr
     operatorObjectId: c.operator, operatorKustoPrincipalId: c.operator_type === 'App' ? c.operator_application : c.operator,
     controlMetadata: fresh ?? {}, checkpointExists: fresh === undefined, operatorType: c.operator_type,
     clusterSku: c.sku, minimumInstances: c.minimum, maximumInstances: c.maximum, clusterTags: c.cluster_tags };
+  const template = path.join(ROOT, 'infra/azure/main.bicep');
+  const templateSha256 = sha256_file(template);
   const filename = private_file(path.join(ROOT, '.env.azure.parameters.json'),
     JSON.stringify({ parameters: Object.fromEntries(Object.entries(params).map(([k, v]) => [k, { value: v }])) }));
   try {
+    const parametersSha256 = sha256_file(filename);
+    const invoke = (operation: 'what-if' | 'create') => azure.cli('deployment', 'sub', operation,
+      '--subscription', c.subscription, '--location', c.location, '--name', 'arrowcol-sandbox-' + c.sandbox,
+      '--template-file', template, '--parameters', '@' + filename);
+    if (whatIf || previewBeforeCreate) {
+      try {
+        const result = await invoke('what-if');
+        const changes = verified_arm_what_if_changes(result);
+        if (whatIf) console.log(JSON.stringify(result, null, 2));
+        if (previewBeforeCreate) {
+          if (canonical_json(resolvedExisting(await guard_existing(azure))) !== canonical_json(existingParameters))
+            throw new Failure('Resource-group or UAMI location/tags changed during ARM what-if; refusing create.');
+          if (sha256_file(filename) !== parametersSha256 || sha256_file(template) !== templateSha256)
+            throw new Failure('ARM template or parameter payload changed during what-if; refusing create.');
+          console.log('ARM_PREVIEW_VERIFIED parametersSha256=' + parametersSha256 + ' templateSha256=' + templateSha256 + ' changes=' + changes);
+        }
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new ArmPreviewFailure('ARM what-if failed or could not be verified; no deployment create was attempted. ' + c.redact(detail), { cause: error });
+      }
+    }
     try {
-      const result = await azure.cli('deployment', 'sub', whatIf ? 'what-if' : 'create', '--subscription', c.subscription, '--location', c.location,
-        '--name', 'arrowcol-sandbox-' + c.sandbox,
-        '--template-file', path.join(ROOT, 'infra/azure/main.bicep'), '--parameters', '@' + filename);
-      if (whatIf) console.log(JSON.stringify(result, null, 2));
+      if (!whatIf) {
+        if (previewBeforeCreate && (sha256_file(filename) !== parametersSha256 || sha256_file(template) !== templateSha256))
+          throw new ArmPreviewFailure('ARM template or parameter payload changed after what-if; refusing create.');
+        await invoke('create');
+      }
     } catch (error) {
+      if (error instanceof ArmPreviewFailure) throw error;
       if (error instanceof Failure && error.message.includes('DeploymentFailed')) throw new DeploymentFailed(error.message, { cause: error });
       throw error;
     }
@@ -875,7 +931,7 @@ export async function ensure_running(azure: Azure): Promise<void> {
 }
 export async function held<T>(control: PublisherControl, publisher: string, generation: string, work: () => Promise<T>): Promise<T> {
   try { return await work(); } catch (error) {
-    if (error instanceof NotReady || error instanceof DeploymentFailed) await control.clean_release(publisher, generation, true);
+    if (error instanceof NotReady || error instanceof DeploymentFailed || error instanceof ArmPreviewFailure) await control.clean_release(publisher, generation, true);
     else { try { await control.uncertain(publisher, generation); } catch { /* Active still blocks. */ } }
     throw error;
   }
@@ -886,7 +942,7 @@ export async function exclusive(control: PublisherControl, generation: string, s
   try {
     for (const step of steps) { await control.bootstrap_owner(operator, generation); await step(); }
   } catch (error) {
-    if (error instanceof NotReady || error instanceof DeploymentFailed) await control.complete_bootstrap(operator, generation, true);
+    if (error instanceof NotReady || error instanceof DeploymentFailed || error instanceof ArmPreviewFailure) await control.complete_bootstrap(operator, generation, true);
     else { try { await control.uncertain(operator, generation); } catch { /* Active still blocks. */ } }
     throw error;
   }
@@ -905,7 +961,7 @@ export function initializer_env(values: Record<string, string>, c: Config, table
 }
 export const initializerEnv = initializer_env;
 export async function provision(azure: Azure, tables: string, wait_seconds: number, output: string,
-  infra_only: boolean, values: Record<string, string>): Promise<void> {
+  infra_only: boolean, values: Record<string, string>, previewBeforeCreate = false): Promise<void> {
   const c = azure.c, control = new PublisherControl(azure);
   await guard_existing(azure);
   let generation: string;
@@ -916,7 +972,7 @@ export async function provision(azure: Azure, tables: string, wait_seconds: numb
   };
   if (await checkpoint_container(azure) === null) {
     const fresh = fresh_authority();
-    await deploy(azure, fresh);
+    await deploy(azure, fresh, false, previewBeforeCreate);
     const [metadata, registry] = await control.read();
     if (metadata.resetgeneration !== fresh.resetgeneration || metadata.resetstate !== FENCED ||
         Object.keys(registry).length || metadata.occupancy !== 'released')
@@ -931,7 +987,8 @@ export async function provision(azure: Azure, tables: string, wait_seconds: numb
     if (metadata.resetstate === READY) {
       if (!infra_only && !fs.existsSync(tables))
         throw new Failure('Table manifest is missing; run provision --infra-only, or reset --execute then a full provision.');
-      const steps: (() => Promise<unknown>)[] = [() => deploy(azure), () => ensure_running(azure), () => experiment_policy(azure)];
+      const steps: (() => Promise<unknown>)[] = [() => deploy(azure, undefined, false, previewBeforeCreate),
+        () => ensure_running(azure), () => experiment_policy(azure)];
       if (!infra_only) steps.push(() => reconcile(azure, tables, wait_seconds));
       await exclusive(control, generation, steps);
       write_private(output, { ...c.generated(), ARROWCOL_RESET_GENERATION: generation });
@@ -941,7 +998,7 @@ export async function provision(azure: Azure, tables: string, wait_seconds: numb
     if (metadata.resetstate !== FENCED || Object.keys(registry).length)
       throw new Failure('Authority is cleanup-owned or has registered publishers; provisioning refused.');
     await control.admit(member, generation, true);
-    await held(control, member, generation, async () => { await deploy(azure); await experiment(); });
+    await held(control, member, generation, async () => { await deploy(azure, undefined, false, previewBeforeCreate); await experiment(); });
     await control.clean_release(member, generation, true);
   }
   write_private(output, c.generated());
@@ -1503,8 +1560,9 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         'run-id': { type: 'string' }, namespace: { type: 'string' },
         'service-account': { type: 'string' }, record: { type: 'string' },
         manifest: { type: 'string' }, 'workload-record': { type: 'string' }, 'workload-stop-record': { type: 'string' },
+        'preview-before-create': { type: 'boolean', default: false },
       } });
-    if (args.help) { console.log('Usage: bootstrap.ts <config|preflight|what-if|provision|reconcile|reset|recover|status|stop|occupy|release|prepare-run-fic|probe-run-fic|cleanup-run-fic|bind-oat-qap|verify-oat-qap|cleanup-oat-qap> [--mode stamped|schema-evolution] [--env-file PATH] [--stamp-config YAML] [--output PATH] [--tables PATH] [--infra-only] [--read-only] [--execute] [--resume] [--occupancy-id UUID] [--reset-generation UUID] [--wait-seconds 0..600] [--run-id UUID --namespace NAME --service-account NAME --record PATH] [--manifest PATH --workload-record PATH --workload-stop-record PATH] [--stop-command COMMAND ...]'); return 0; }
+    if (args.help) { console.log('Usage: bootstrap.ts <config|preflight|what-if|provision|reconcile|reset|recover|status|stop|occupy|release|prepare-run-fic|probe-run-fic|cleanup-run-fic|bind-oat-qap|verify-oat-qap|cleanup-oat-qap> [--mode stamped|schema-evolution] [--env-file PATH] [--stamp-config YAML] [--output PATH] [--tables PATH] [--infra-only] [--read-only] [--preview-before-create] [--execute] [--resume] [--occupancy-id UUID] [--reset-generation UUID] [--wait-seconds 0..600] [--run-id UUID --namespace NAME --service-account NAME --record PATH] [--manifest PATH --workload-record PATH --workload-stop-record PATH] [--stop-command COMMAND ...]'); return 0; }
     const command = positionals[0];
     if (positionals.length !== 1 || !['config', 'preflight', 'what-if', 'provision', 'reconcile', 'reset', 'recover', 'status', 'stop', 'occupy', 'release',
       'prepare-run-fic', 'probe-run-fic', 'cleanup-run-fic', 'bind-oat-qap', 'verify-oat-qap', 'cleanup-oat-qap'].includes(command))
@@ -1512,6 +1570,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     const mode = azure_mode(args.mode!);
     if (args['read-only'] && command !== 'preflight' && command !== 'what-if')
       throw new Failure('--read-only is only supported for preflight and what-if.');
+    if (args['preview-before-create'] && command !== 'provision')
+      throw new Failure('--preview-before-create is only supported for provision.');
     if (mode === 'schema-evolution' && args['stamp-config'])
       throw new Failure('Schema-evolution mode does not accept an AKS stamp configuration.');
     const privateValues = load_env(args['env-file']!);
@@ -1560,7 +1620,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       case 'config': write_private(args.output!, c.generated()); console.log('Private generated Azure configuration written (values withheld).'); break;
       case 'preflight': await preflight(azure, args['read-only']); break;
       case 'what-if': await preflight(azure, true); await deploy(azure, fresh_authority(), true); break;
-      case 'provision': await preflight(azure); await provision(azure, args.tables!, wait, args.output!, args['infra-only']!, values); break;
+      case 'provision': await preflight(azure); await provision(azure, args.tables!, wait, args.output!, args['infra-only']!, values,
+        args['preview-before-create']!); break;
       case 'reconcile': await reconcile_command(azure, args.tables!, args['occupancy-id']!, wait, generation); break;
       case 'reset': await reset(azure, args.execute!, stopCommand, args.resume!); break;
       case 'recover': await recover(azure, args.execute!, stopCommand); break;
@@ -1580,6 +1641,11 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     }
     return 0;
   } catch (error) {
+    if (error instanceof ArmPreviewFailure) {
+      console.error(JSON.stringify({ status: 'arm_preview_failed', code: 'ARM_WHAT_IF_UNVERIFIED', create_attempted: false,
+        error: c ? c.redact(error.message) : error.message }));
+      return ARM_PREVIEW_FAILURE_EXIT;
+    }
     if (error instanceof NotReady) {
       console.error(JSON.stringify({ status: 'not_ready', code: 'DELTA_LOGS_ABSENT', retryable: true, kql_attempted: false })); return 3;
     }

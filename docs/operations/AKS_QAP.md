@@ -67,6 +67,15 @@ QAP service-account federated credential automatically. The QAP pod receives
 only generated resource settings and the reset-generation secret; it does not
 mount the operator's Azure CLI cache or credentials.
 
+`npx --no-install arrowcol-oat aks deploy` runs a read-only ARM what-if immediately
+before every create attempt, including the Azure dataplane attempt and any allowed
+Cilium or convergence retry. Bootstrap reuses the same resolved stamp, reset
+authority, resource-group/UAMI locations and tags, template path, and private
+parameter file for each preview and its create. A failed, timed-out, or
+unverifiable preview stops before create and cannot trigger network fallback;
+only a proven AKS-only creation failure can permit one Cilium retry, which gets
+its own preview. The standalone `aks deploy --what-if` command remains read-only.
+
 In stamped mode, the shared runtime UAMI also has container-scoped Blob Data
 Contributor on the stamp's data container for catalog and DFE writes, plus the
 experiment, checkpoint and website containers. These runtime write grants are
