@@ -396,6 +396,33 @@ impl KustoClient {
         Ok(rows.first().map(Acceleration::from_row))
     }
 
+    async fn observation_statistics(
+        &self,
+        policies: &BTreeMap<String, String>,
+    ) -> Result<BTreeMap<String, Acceleration>> {
+        let rows = self
+            .execute(&observation_statistics_command(policies)?, true, "qap")
+            .await?;
+        let mut statistics = BTreeMap::new();
+        for row in rows {
+            let name = row
+                .get("ExternalTableName")
+                .and_then(Value::as_str)
+                .context("observation statistics table name missing")?;
+            ensure!(
+                policies.contains_key(name),
+                "unexpected observation statistics table {name}"
+            );
+            ensure!(
+                statistics
+                    .insert(name.to_owned(), Acceleration::from_row(&row))
+                    .is_none(),
+                "duplicate observation statistics for {name}"
+            );
+        }
+        Ok(statistics)
+    }
+
     /// Best-effort sanitized `QueryAccelerationState`; never fails validation on its own.
     async fn details(&self, name: &str) -> Value {
         let Ok(table) = identifier(name) else {
@@ -1125,6 +1152,11 @@ fn local_capacity_command() -> String {
     format!(".alter-merge cluster policy capacity @'{policy}'")
 }
 
+const ACCELERATION_COLUMNS: &str = "HotSize = tolong(HotSize), LastUpdatedDateTime, \
+    PendingFiles = tolong(AccelerationPendingDataFilesCount), \
+    PendingBytes = tolong(column_ifexists('AccelerationPendingDataFilesSize', long(null))), \
+    Complete = todouble(AccelerationCompletePercentage), Eligible, Fresh";
+
 fn acceleration_command(name: &str, max_age: &str, commit_ms: Option<u64>) -> Result<String> {
     identifier(name)?;
     timespan(max_age)?;
@@ -1136,12 +1168,33 @@ fn acceleration_command(name: &str, max_age: &str, commit_ms: Option<u64>) -> Re
         ".show external tables operations query_acceleration statistics \
          | where ExternalTableName == {} \
          | extend Eligible = LastUpdatedDateTime > now() - totimespan({}), Fresh = {fresh} \
-         | project HotSize = tolong(HotSize), LastUpdatedDateTime, \
-           PendingFiles = tolong(AccelerationPendingDataFilesCount), \
-           PendingBytes = tolong(column_ifexists('AccelerationPendingDataFilesSize', long(null))), \
-           Complete = todouble(AccelerationCompletePercentage), Eligible, Fresh",
+         | project {ACCELERATION_COLUMNS}",
         literal(name)?,
         literal(max_age)?
+    ))
+}
+
+fn observation_statistics_command(policies: &BTreeMap<String, String>) -> Result<String> {
+    ensure!(!policies.is_empty(), "observation statistics require requested tables");
+    let mut names = Vec::new();
+    let mut ages = Vec::new();
+    for (name, max_age) in policies {
+        identifier(name)?;
+        timespan(max_age)?;
+        let name = literal(name)?;
+        names.push(name.clone());
+        ages.push(format!(
+            "ExternalTableName == {name}, totimespan({})",
+            literal(max_age)?
+        ));
+    }
+    Ok(format!(
+        ".show external tables operations query_acceleration statistics \
+         | where ExternalTableName in ({}) \
+         | extend Eligible = LastUpdatedDateTime > now() - case({}, timespan(0s)), Fresh = true \
+         | project ExternalTableName, {ACCELERATION_COLUMNS}",
+        names.join(", "),
+        ages.join(", ")
     ))
 }
 
@@ -1906,26 +1959,63 @@ pub async fn observe_qap_with_mode(
         let mut client = KustoClient::with_mode(endpoint, results, mode, database)?;
         client.queries_completed = Arc::clone(&queries_completed);
         tokio::time::timeout(deadline, async {
+            let mut requested = BTreeSet::new();
+            for name in tables {
+                identifier(name)?;
+                ensure!(requested.insert(name), "duplicate observation table {name}");
+            }
             let mut observed = BTreeMap::new();
+            let mut policies = BTreeMap::new();
             // Poll both lanes in this parent task: synchronous artifact appends cannot interleave,
             // and dropping the deadline future cancels every in-flight table request.
             let mut pending = stream::iter(tables)
-                .map(|name| async { (name.clone(), observe_table(&client, name).await) })
+                .map(|name| async { (name.clone(), observe_table_metadata(&client, name).await) })
                 .buffer_unordered(2);
             while let Some((name, table)) = pending.next().await {
-                observed.insert(name, table);
+                match table {
+                    Ok((table, max_age)) => {
+                        policies.insert(name.clone(), max_age);
+                        observed.insert(name, table);
+                    }
+                    Err(error) => {
+                        observed.insert(name, json!({"available": false, "error": short_error(&error)}));
+                    }
+                }
             }
-            json!({
+            if !policies.is_empty() {
+                // Statistics enumerate the database before filtering; scan once, not once per table.
+                match client.observation_statistics(&policies).await {
+                    Ok(statistics) => {
+                        for name in policies.keys() {
+                            let mut value = statistics
+                                .get(name)
+                                .map(serde_json::to_value)
+                                .transpose()?
+                                .unwrap_or(Value::Null);
+                            if !value.is_null() {
+                                value["Fresh"] = Value::Null;
+                            }
+                            observed.get_mut(name).context("observed table missing")?["statistics"] = value;
+                        }
+                    }
+                    Err(error) => {
+                        for name in policies.keys() {
+                            observed.insert(name.clone(), json!({"available": false, "error": short_error(&error)}));
+                        }
+                    }
+                }
+            }
+            Ok::<_, anyhow::Error>(json!({
                 "observed_unix_ms": now_unix_millis(), "backend": BACKEND, "mode": client.mode,
                 "expected_tables": tables,
                 "capacity": client.capacity().await, "tables": observed
-            })
+            }))
         })
         .await
         .map_err(|_| {
             timed_out = true;
             anyhow::anyhow!("QAP observation exceeded its {deadline:?} deadline")
-        })
+        })?
     }
     .await;
     write_json(
@@ -1994,25 +2084,16 @@ pub async fn initialize_local_qap(
     .map_err(|_| anyhow::anyhow!("local QAP initialization exceeded its {deadline:?} deadline"))?
 }
 
-async fn observe_table(client: &KustoClient, name: &str) -> Value {
-    let observed = async {
-        let (policy, max_age) = client.max_age(name).await?;
-        let statistics = match client.acceleration_row(name, &max_age, None).await? {
-            Some(row) => {
-                let mut statistics = serde_json::to_value(row)?;
-                statistics["Fresh"] = Value::Null;
-                statistics
-            }
-            None => Value::Null,
-        };
-        let details = client.details(name).await;
-        let state = CacheState::from_details(&details);
-        Ok::<_, anyhow::Error>(json!({
-            "available": true, "policy": policy, "statistics": statistics, "state": state, "details": details
-        }))
-    }
-    .await;
-    observed.unwrap_or_else(|error| json!({"available": false, "error": short_error(&error)}))
+async fn observe_table_metadata(client: &KustoClient, name: &str) -> Result<(Value, String)> {
+    let (policy, max_age) = client.max_age(name).await?;
+    let details = client.details(name).await;
+    let state = CacheState::from_details(&details);
+    Ok((
+        json!({
+            "available": true, "policy": policy, "statistics": null, "state": state, "details": details
+        }),
+        max_age,
+    ))
 }
 
 pub(crate) fn validation_failure(results: &Path, error: &anyhow::Error, progress: &KustoProgress) -> Result<Value> {
@@ -3251,6 +3332,146 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn observation_statistics_bind_each_requested_table_to_its_validated_max_age() -> Result<()> {
+        let policies = BTreeMap::from([
+            ("dataflow_a".to_owned(), "00:01:00".to_owned()),
+            ("dataflow_b".to_owned(), "1.02:03:04".to_owned()),
+        ]);
+        let command = observation_statistics_command(&policies)?;
+        assert!(command.contains("where ExternalTableName in (\"dataflow_a\", \"dataflow_b\")"));
+        assert!(command.contains(
+            "case(ExternalTableName == \"dataflow_a\", totimespan(\"00:01:00\"), \
+             ExternalTableName == \"dataflow_b\", totimespan(\"1.02:03:04\"), timespan(0s))"
+        ));
+        assert!(command.ends_with(&format!("project ExternalTableName, {ACCELERATION_COLUMNS}")));
+        assert_eq!(command.matches(".show external tables").count(), 1);
+        assert!(observation_statistics_command(&BTreeMap::new()).is_err());
+        for (name, age) in [("bad'; drop", "00:01:00"), ("dataflow_a", "invalid")] {
+            assert!(observation_statistics_command(&BTreeMap::from([(name.to_owned(), age.to_owned())])).is_err());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn batched_observation_statistics_match_single_table_numeric_and_null_semantics() -> Result<()> {
+        let directory = Directory::new()?;
+        let rows = vec![
+            json!(["dataflow_a", 10, "2026-10-27T00:00:00Z", 2, null, 50.0, 1, 1]),
+            json!(["dataflow_b", null, null, -1, null, null, 0, 1]),
+        ];
+        let server = Server::start(move |request| {
+            let command = request["csl"].as_str().context("command missing")?;
+            let selected = if command.contains("ExternalTableName in (") {
+                rows.clone()
+            } else if command.contains("ExternalTableName == \"dataflow_a\"") {
+                vec![rows[0].clone()]
+            } else {
+                vec![rows[1].clone()]
+            };
+            Ok(Some(response(
+                &[
+                    "ExternalTableName",
+                    "HotSize",
+                    "LastUpdatedDateTime",
+                    "PendingFiles",
+                    "PendingBytes",
+                    "Complete",
+                    "Eligible",
+                    "Fresh",
+                ],
+                selected,
+            )))
+        })?;
+        let client = KustoClient::with_mode(&server.endpoint, &directory.0, Mode::Local, DATABASE)?;
+        let policies = BTreeMap::from([
+            ("dataflow_a".to_owned(), "00:01:00".to_owned()),
+            ("dataflow_b".to_owned(), "00:02:00".to_owned()),
+            ("dataflow_missing".to_owned(), "00:03:00".to_owned()),
+        ]);
+        let batch = client.observation_statistics(&policies).await?;
+        assert_eq!(batch.len(), 2);
+        assert!(!batch.contains_key("dataflow_missing"));
+        for name in ["dataflow_a", "dataflow_b"] {
+            assert_eq!(
+                Some(&batch[name]),
+                client.acceleration_row(name, &policies[name], None).await?.as_ref()
+            );
+        }
+        let nullable = serde_json::to_value(&batch["dataflow_b"])?;
+        assert_eq!(nullable["HotSize"], Value::Null);
+        assert_eq!(nullable["AccelerationPendingDataFilesCount"], Value::Null);
+        assert_eq!(nullable["AccelerationCompletePercentage"], Value::Null);
+        assert_eq!(nullable["Eligible"], false);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn batched_observation_rejects_unbound_duplicate_or_failed_statistics_without_measured_fallbacks()
+    -> Result<()> {
+        for rows in [
+            vec![json!(["dataflow_a", 10]), json!(["dataflow_a", 20])],
+            vec![json!(["unrequested_table", 10])],
+            vec![json!([null, 10])],
+        ] {
+            let directory = Directory::new()?;
+            let server = Server::start(move |request| {
+                let command = request["csl"].as_str().context("command missing")?;
+                let body = if command.ends_with("policy query_acceleration") {
+                    response(
+                        &["Policy"],
+                        vec![json!(["{\"IsEnabled\":true,\"MaxAge\":\"00:01:00\"}"])],
+                    )
+                } else if command.contains("query_acceleration statistics") {
+                    response(&["ExternalTableName", "HotSize"], rows.clone())
+                } else {
+                    response(&[], vec![])
+                };
+                Ok(Some(body))
+            })?;
+            let result = observe_qap_with_mode(
+                &server.endpoint,
+                &directory.0,
+                Mode::Local,
+                DATABASE,
+                &["dataflow_a".to_owned(), "dataflow_b".to_owned()],
+                Duration::from_secs(5),
+            )
+            .await?;
+            for name in ["dataflow_a", "dataflow_b"] {
+                assert_eq!(result["tables"][name]["available"], false);
+                assert!(result["tables"][name].get("statistics").is_none());
+                assert!(
+                    result["tables"][name]["error"]
+                        .as_str()
+                        .is_some_and(|error| error.contains("statistics"))
+                );
+            }
+        }
+        let directory = Directory::new()?;
+        let server = Server::start(|_| Ok(Some(json!({"error": {"code": "Failure"}}))))?;
+        let client = KustoClient::with_mode(&server.endpoint, &directory.0, Mode::Local, DATABASE)?;
+        assert!(
+            client
+                .observation_statistics(&BTreeMap::from([("dataflow_a".to_owned(), "00:01:00".to_owned())]))
+                .await
+                .is_err()
+        );
+        assert!(
+            observe_qap_with_mode(
+                &server.endpoint,
+                &directory.0,
+                Mode::Local,
+                DATABASE,
+                &["dataflow_a".to_owned(), "dataflow_a".to_owned()],
+                Duration::from_secs(5),
+            )
+            .await
+            .is_err()
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn live_observation_is_read_only_and_never_fabricates_measurements() -> Result<()> {
         let directory = Directory::new()?;
@@ -3277,6 +3498,7 @@ mod tests {
             if command.contains("query_acceleration statistics") && command.contains("dataflow_ready") {
                 return Ok(Some(response(
                     &[
+                        "ExternalTableName",
                         "HotSize",
                         "LastUpdatedDateTime",
                         "PendingFiles",
@@ -3285,7 +3507,16 @@ mod tests {
                         "Eligible",
                         "Fresh",
                     ],
-                    vec![json!([10, "2026-10-27T00:00:00Z", 2, null, 50.0, 1, 1])],
+                    vec![json!([
+                        "dataflow_ready",
+                        10,
+                        "2026-10-27T00:00:00Z",
+                        2,
+                        null,
+                        50.0,
+                        1,
+                        1
+                    ])],
                 )));
             }
             if command.ends_with(" details") {

@@ -32,6 +32,10 @@ struct Fixture {
 
 impl Fixture {
     fn new(delay: Duration) -> Result<Self> {
+        Self::with_delays(delay, delay)
+    }
+
+    fn with_delays(delay: Duration, statistics_delay: Duration) -> Result<Self> {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let directory = PathBuf::from(format!(
             "target/observer-scheduling/{}-{}",
@@ -56,7 +60,7 @@ impl Fixture {
                 match listener.accept() {
                     Ok((socket, _)) => {
                         let state = Arc::clone(&owned);
-                        handlers.push(thread::spawn(move || handle(socket, &state, delay)));
+                        handlers.push(thread::spawn(move || handle(socket, &state, delay, statistics_delay)));
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(2));
@@ -126,7 +130,7 @@ impl Drop for Active<'_> {
     }
 }
 
-fn handle(mut socket: TcpStream, state: &State, delay: Duration) -> Result<()> {
+fn handle(mut socket: TcpStream, state: &State, delay: Duration, statistics_delay: Duration) -> Result<()> {
     state.handlers.fetch_add(1, Ordering::AcqRel);
     let _handler = Active(&state.handlers);
     let active = state.active.fetch_add(1, Ordering::AcqRel) + 1;
@@ -160,7 +164,12 @@ fn handle(mut socket: TcpStream, state: &State, delay: Duration) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("fixture mutex"))?
         .push(command.clone());
     socket.set_nonblocking(true)?;
-    let deadline = Instant::now() + delay;
+    let deadline = Instant::now()
+        + if command.contains("query_acceleration statistics") {
+            statistics_delay
+        } else {
+            delay
+        };
     while Instant::now() < deadline && !state.stop.load(Ordering::Acquire) {
         match socket.peek(&mut [0]) {
             Ok(0) => return Ok(()),
@@ -218,8 +227,8 @@ fn response(columns: &[&str], rows: Vec<Value>) -> Value {
 }
 
 #[tokio::test]
-async fn all_dataflow_delayed_observations_complete_inside_unchanged_30s_with_two_request_slots() -> Result<()> {
-    let mut fixture = Fixture::new(Duration::from_millis(450))?;
+async fn all_dataflow_observations_share_one_statistics_scan_with_two_request_slots() -> Result<()> {
+    let mut fixture = Fixture::with_delays(Duration::from_millis(5), Duration::from_millis(100))?;
     let tables = arrowcol_loadgen::schema::schema_statements()?
         .into_iter()
         .map(|statement| format!("dataflow_{}", statement.identity.table()))
@@ -253,22 +262,29 @@ async fn all_dataflow_delayed_observations_complete_inside_unchanged_30s_with_tw
     );
     let requests = fixture.requests()?;
     ensure!(
-        requests.len() == tables.len() * 3 + 1 && requests.last().is_some_and(|command| command == ".show capacity")
+        requests.len() == tables.len() * 2 + 2 && requests.last().is_some_and(|command| command == ".show capacity")
+    );
+    let statistics = requests
+        .iter()
+        .filter(|command| command.contains("query_acceleration statistics"))
+        .collect::<Vec<_>>();
+    ensure!(
+        statistics.len() == 1,
+        "one database-wide statistics scan per observation"
     );
     let observed = observation["tables"].as_object().context("observed table map")?;
     ensure!(observed.len() == tables.len() && tables.iter().all(|table| observed.contains_key(table)));
     ensure!(observation["expected_tables"] == json!(tables));
     for table in &tables {
         let identifier = format!("['{table}']");
-        let literal = format!("ExternalTableName == \"{table}\"");
         let commands = requests
             .iter()
-            .filter(|command| command.contains(&identifier) || command.contains(&literal))
+            .filter(|command| command.contains(&identifier))
             .collect::<Vec<_>>();
-        ensure!(commands.len() == 3, "one serial triple per table");
+        ensure!(commands.len() == 2, "one policy/details pair per table");
         ensure!(commands[0].ends_with("policy query_acceleration"));
-        ensure!(commands[1].contains("query_acceleration statistics"));
-        ensure!(commands[2].ends_with(" details"));
+        ensure!(commands[1].ends_with(" details"));
+        ensure!(statistics[0].contains(&format!("ExternalTableName == \"{table}\", totimespan(\"00:01:00\")")));
     }
     let lines = fs::read_to_string(fixture.directory.join("kusto-queries.jsonl"))?;
     let artifacts = lines
@@ -281,6 +297,40 @@ async fn all_dataflow_delayed_observations_complete_inside_unchanged_30s_with_tw
     );
     let diagnostic: Value = serde_json::from_slice(&fs::read(fixture.directory.join("observation-diagnostic.json"))?)?;
     ensure!(diagnostic["queries_completed"] == requests.len() && diagnostic["code"] == "completed");
+    Ok(())
+}
+
+#[tokio::test]
+async fn progress_does_not_extend_fixed_deadline_or_publish_partial_statistics() -> Result<()> {
+    let mut fixture = Fixture::with_delays(Duration::from_millis(5), Duration::from_secs(60))?;
+    let outcome = observe_qap(
+        &fixture.endpoint,
+        &fixture.directory,
+        Some("loadtest"),
+        &["dataflow_a".to_owned(), "dataflow_b".to_owned()],
+        Duration::from_millis(250),
+    )
+    .await;
+    ensure!(
+        outcome.is_err(),
+        "completed metadata cannot renew the observation deadline"
+    );
+    let diagnostic_path = fixture.directory.join("observation-diagnostic.json");
+    let diagnostic = fs::read(&diagnostic_path)?;
+    let parsed: Value = serde_json::from_slice(&diagnostic)?;
+    ensure!(parsed["code"] == "deadline_exceeded" && parsed["queries_completed"] == 4);
+    fixture.finish()?;
+    let requests = fixture.requests()?;
+    ensure!(requests.len() == 5 && requests[4].contains("query_acceleration statistics"));
+    let log_path = fixture.directory.join("kusto-queries.jsonl");
+    let log = fs::read_to_string(&log_path)?;
+    ensure!(
+        log.lines().count() == 4,
+        "only completed policy/details requests are retained"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    ensure!(fixture.requests()? == requests);
+    ensure!(fs::read_to_string(log_path)? == log && fs::read(diagnostic_path)? == diagnostic);
     Ok(())
 }
 
