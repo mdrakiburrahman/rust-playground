@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import test from 'node:test';
 import { Azure, Config, deploy, fresh_authority, preflight, SCHEMA_EVOLUTION_GROUP } from './bootstrap.js';
 import { defaultStampConfig } from './stamp.js';
+import { FENCED } from './publisher_control.js';
 
 const subscription = '00000000-0000-0000-0000-000000000001';
 
@@ -32,7 +33,7 @@ for (const network of ['azure', 'cilium'] as const) {
       assert.equal(parameters.clusterName.value, 'arrow-collector-89152');
       assert.equal(parameters.identityName.value, 'arrow-collector');
       assert.equal(parameters.checkpointExists.value, false);
-      assert.equal(parameters.controlMetadata.value.resetstate, 'fenced');
+      assert.equal(parameters.controlMetadata.value.resetstate, FENCED);
       return { changes: [] };
     };
     await deploy(azure, fresh_authority(), true);

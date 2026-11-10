@@ -4,7 +4,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { parse, stringify } from 'yaml';
 import { ROOT, run_tree, TAGS } from '../../infra/azure/bootstrap.js';
-import { deployInfrastructure, main, pickStamp } from './aks-deploy.js';
+import { deploy, deployInfrastructure, main, pickStamp } from './aks-deploy.js';
 
 const subscription = '00000000-0000-0000-0000-000000000001';
 const stamp = '89152';
@@ -30,11 +30,18 @@ function fixture(t: test.TestContext, faults: Fault[] = []) {
   let deleted = false;
   let lastFault: Fault | undefined;
   let selectedNetwork = 'azure';
-  const runner: typeof run_tree = async (command, timeout) => {
+  const runner: typeof run_tree = async (command, timeout, _cwd, env) => {
     calls.push(command);
     assert.ok(timeout > 0 && timeout <= 3600);
     const success = (value: unknown) => ({ returncode: 0, stdout: JSON.stringify(value), stderr: '' });
+    if (command[0] === 'git') return success(null);
     if (command[0] === 'npx') {
+      assert.equal(env?.AZURE_STAMP, stamp);
+      assert.equal(env?.AZURE_RESOURCE_GROUP, 'arrow-collector-rg');
+      assert.equal(env?.AZURE_STORAGE_ACCOUNT, `arrowcollector${stamp}`);
+      assert.equal(env?.AZURE_UAMI_CLIENT_ID, '');
+      assert.equal(env?.AZURE_CLIENT_ID, undefined);
+      assert.equal(env?.AZURE_CLIENT_SECRET, undefined);
       const selectedPath = command[command.indexOf('--stamp-config') + 1]!;
       selectedNetwork = parse(fs.readFileSync(selectedPath, 'utf8')).aks.networkDataplane;
       if (command[4] === 'preflight') return faults.includes('quota')
@@ -59,6 +66,7 @@ function fixture(t: test.TestContext, faults: Fault[] = []) {
     if (command[1] === 'aks') return success(deleted && provisionCount === 1 ? [] : [{
       name: clusterName, provisioningState: live || ['cluster', 'other', 'missing-target'].includes(lastFault ?? '') ? 'Failed' : 'Succeeded',
       tags: { ...TAGS, sandboxId: `stamp-${stamp}` }, networkProfile: { networkDataplane: faults.includes('network') ? 'wrong' : selectedNetwork },
+      oidcIssuerProfile: { issuerUrl: 'https://aks.example/' },
     }]);
     if (command[1] === 'deployment' && command[2] === 'group') return success([
       { name: `arrowcol-sandbox-stamp-${stamp}`, properties: { provisioningState: 'Failed' } },
@@ -78,8 +86,10 @@ function fixture(t: test.TestContext, faults: Fault[] = []) {
       { name: clusterName, type: 'Microsoft.Kusto/clusters' },
     ]);
     if (command[1] === 'identity') return success([
-      { name: `azure-qap-${clusterName}`, issuer: 'https://aks.example/', subject: 'system:serviceaccount:arrow-collector:arrow-collector' },
-      ...(faults.includes('publisher') ? [] : config.publisherFederatedCredentials),
+      { name: `azure-qap-${clusterName}`, issuer: 'https://aks.example/', subject: 'system:serviceaccount:arrow-collector:arrow-collector',
+        audiences: ['api://AzureADTokenExchange'] },
+      ...(faults.includes('publisher') ? [] : config.publisherFederatedCredentials.map((entry: object) =>
+        ({ ...entry, audiences: ['api://AzureADTokenExchange'] }))),
     ]);
     throw new Error(`Unexpected command ${command.join(' ')}`);
   };
@@ -165,7 +175,7 @@ test('quota failure leaves YAML unchanged and provisions nothing', async t => {
 
 test('what-if previews first-attempt network and never invokes provision, delete, or setup', async t => {
   const f = fixture(t);
-  const result = await deployInfrastructure({ ...f.options, whatIf: true }, f.runner);
+  const result = await deploy({ ...f.options, whatIf: true }, f.runner);
   assert.deepEqual(result.attempts, []);
   assert.equal(result.network, 'azure');
   assert.equal(fs.readFileSync(f.options.stampConfig, 'utf8'), f.original);
@@ -207,4 +217,83 @@ test('CLI validates network and stamp before calling Azure', async () => {
   await assert.rejects(main(['--network', 'invalid'], runner), /--network/);
   await assert.rejects(main(['--stamp', '100000'], runner), /exactly five digits/);
   await assert.rejects(main(['--stamp', '0'], runner), /exactly five digits/);
+});
+
+test('unauthenticated CLI prints the device-code login command without credentials', async t => {
+  const f = fixture(t);
+  const runner: typeof run_tree = async (...args) => args[0][1] === 'account'
+    ? { returncode: 1, stdout: '', stderr: 'private authentication diagnostics' } : f.runner(...args);
+  await assert.rejects(deployInfrastructure(f.options, runner), error =>
+    error instanceof Error && error.message.includes('az login --use-device-code') &&
+    !error.message.includes('private authentication diagnostics'));
+  assert.equal(fs.readFileSync(f.options.stampConfig, 'utf8'), f.original);
+});
+
+test('subscription mismatch is refused before Azure commands', async t => {
+  const f = fixture(t);
+  await assert.rejects(deployInfrastructure({ ...f.options, subscription: '00000000-0000-0000-0000-000000000002' }, f.runner), /must match/);
+  assert.equal(f.calls.length, 0);
+});
+
+test('tracked stamp configuration is never rewritten', async t => {
+  const f = fixture(t);
+  const runner: typeof run_tree = async (...args) => args[0][0] === 'git'
+    ? { returncode: 1, stdout: '', stderr: '' } : f.runner(...args);
+  await assert.rejects(deployInfrastructure(f.options, runner), /gitignored private file/);
+  assert.equal(fs.readFileSync(f.options.stampConfig, 'utf8'), f.original);
+});
+
+test('stale derived state refuses instead of adopting a previous stamp', async t => {
+  const f = fixture(t);
+  const exists = fs.existsSync;
+  t.mock.method(fs, 'existsSync', (filename: fs.PathLike) => filename === path.join(state, 'runtime.json') || exists(filename));
+  await assert.rejects(deployInfrastructure(f.options, f.runner), /Generated state.*aks destroy/s);
+  assert.equal(f.calls.some(call => call[1] === 'storage'), false);
+});
+
+test('mixed resource and cluster ARM failures never delete the cluster', async t => {
+  const f = fixture(t, ['cluster']);
+  const runner: typeof run_tree = async (...args) => {
+    const result = await f.runner(...args);
+    if (args[0][1] !== 'deployment' || args[0][2] !== 'operation') return result;
+    const operations = JSON.parse(result.stdout);
+    operations.push({ properties: { provisioningState: 'Failed',
+      targetResource: { resourceType: 'Microsoft.Storage/storageAccounts', resourceName: 'storage' } } });
+    return { ...result, stdout: JSON.stringify(operations) };
+  };
+  await assert.rejects(deployInfrastructure(f.options, runner), /ARM rejected creation/);
+  assert.equal(f.calls.some(call => call[2] === 'delete'), false);
+});
+
+for (const state of ['Creating', 'Succeeded']) {
+  test(`cluster in ${state} is not a failed cluster eligible for fallback`, async t => {
+    const f = fixture(t, ['cluster']);
+    const runner: typeof run_tree = async (...args) => {
+      const result = await f.runner(...args);
+      if (args[0][1] !== 'aks') return result;
+      const clusters = JSON.parse(result.stdout);
+      clusters[0].provisioningState = state;
+      return { ...result, stdout: JSON.stringify(clusters) };
+    };
+    await assert.rejects(deployInfrastructure(f.options, runner), /ARM rejected creation/);
+    assert.equal(f.calls.some(call => call[2] === 'delete'), false);
+  });
+}
+
+test('classification failure retains the original ARM error in the durable receipt', async t => {
+  const f = fixture(t, ['cluster']);
+  const runner: typeof run_tree = async (...args) => args[0][1] === 'deployment'
+    ? { returncode: 1, stdout: '', stderr: 'AuthorizationFailed for deployment inventory' } : f.runner(...args);
+  await assert.rejects(deployInfrastructure(f.options, runner), /ARM rejected creation.*Could not prove.*AuthorizationFailed/s);
+  assert.match(f.receipt().attempts[0].error, /ARM rejected creation/);
+  assert.equal(f.calls.some(call => call[2] === 'delete'), false);
+});
+
+test('bootstrap receives fresh stamp-derived env rather than stale workload identity', async t => {
+  const f = fixture(t);
+  const previous = process.env;
+  process.env = { ...previous, AZURE_STAMP: '00000', AZURE_CLIENT_ID: 'stale', AZURE_CLIENT_SECRET: 'not-a-real-secret' };
+  t.after(() => { process.env = previous; });
+  await deployInfrastructure(f.options, f.runner);
+  assert.equal(process.env.AZURE_STAMP, '00000');
 });
