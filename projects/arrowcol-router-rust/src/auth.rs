@@ -585,6 +585,29 @@ mod replay_tests {
             )?,
             expected
         );
+        headers.remove("x-arrowcol-oat-run-id");
+        let absent_expected = concat!(
+            "100000\nwire-golden-1\nPOST\n/arrow.flight.protocol.FlightService/DoPut\n",
+            "x-arrowcol-protocol-version:1\n",
+            "x-arrowcol-implementation-pool:dataflow\n",
+            "x-arrowcol-catalog:telemetry\n",
+            "x-arrowcol-schema:prod\n",
+            "x-arrowcol-table:traces\n",
+            "x-arrowcol-schema-fingerprint:sha256:0123456789abcdef\n",
+            "x-arrowcol-control-operation:\n",
+            "x-arrowcol-oat-run-id:\n",
+            "content-type:application/grpc\n",
+        );
+        assert_eq!(
+            canonical_edge_request(
+                &Method::POST,
+                "/arrow.flight.protocol.FlightService/DoPut",
+                &headers,
+                now(100_000),
+                "wire-golden-1",
+            )?,
+            absent_expected
+        );
         Ok(())
     }
 

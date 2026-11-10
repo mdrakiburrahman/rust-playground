@@ -89,12 +89,14 @@ are removed before admission; a full cache rejects new assertions with gRPC
 `RESOURCE_EXHAUSTED` rather than growing or evicting live nonces. Nonces remain
 protected through the assertion's last valid millisecond, including accepted
 future clock skew. Only successfully verified signatures consume capacity.
-At the default 30-second age, 65,536 entries cover about 2,184 requests/s with
-current timestamps, or 1,092 requests/s with the maximum accepted future skew.
-For peak signed-request rate R, size capacity above `R * (2 * age_seconds + 1)`
-including bursts and all control requests. E4's 128 clients are not a request-rate
-bound: 2,184 requests/s is only 17 requests/s per client if one router receives
-the entire fleet. Measure signed-request rate before qualification and increase
+For peak signed-request rate R per router replica, size capacity above
+`R * (2 * age_seconds + 1)`, including future skew, bursts and all control requests.
+With the defaults, the conservative window is `2 * 30 + 1 = 61` seconds and the
+whole-number peak is `floor(65,536 / 61) = 1,074` signed requests/s per router
+replica, before reserving additional burst headroom. The extra second covers the
+inclusive expiry boundary: an assertion expires only when its expiry is strictly
+less than the current time. E4's 128 clients are not a request-rate bound.
+Measure the peak per-replica signed-request rate before qualification and increase
 capacity or bound the edge rate; do not treat capacity rejection as throughput.
 Replay protection is process-local, not shared across replicas.
 
