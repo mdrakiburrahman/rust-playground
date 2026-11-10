@@ -7,11 +7,18 @@ import test from 'node:test';
 import { main } from './cli.js';
 import { resolveOatConfigPath } from './launch.js';
 
-test('AKS subcommands dispatch without invoking the benchmark or a command runner', async () => {
+test('AKS subcommands lazily dispatch only the selected module with its arguments and runner', async () => {
   for (const subcommand of ['destroy', 'deploy', 'setup']) {
-    await assert.rejects(main(['aks', subcommand, '--stamp', '12345'], async () => {
-      throw new Error('must not invoke commands from a stub');
-    }), new RegExp(`^Error: aks ${subcommand} is not implemented yet$`));
+    const calls: string[] = [];
+    const runner = async () => { throw new Error('routing must not invoke a command'); };
+    await main(['aks', subcommand, '--stamp', '12345'], runner, async (selected) => {
+      calls.push(selected);
+      return { main: async (args, injectedRunner) => {
+        assert.deepEqual(args, ['--stamp', '12345']);
+        assert.equal(injectedRunner, runner);
+      } };
+    });
+    assert.deepEqual(calls, [subcommand]);
   }
 });
 
