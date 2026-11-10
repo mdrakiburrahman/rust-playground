@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises';
-import { createServer } from 'node:http';
+import { createServer, request as createHttpRequest } from 'node:http';
+import { connect as createTcpConnection } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -282,6 +283,71 @@ test('opens the existing local results in viewer-only mode without losing missin
   try {
     viewer = await startLocalViewer(configPath);
     assert.equal(new URL(viewer.url).hostname, '127.0.0.1');
+
+    const viewerUrl = viewer.url;
+    const port = new URL(viewerUrl).port;
+    const target = new URL(viewerUrl);
+    const requestViewer = (headers: Record<string, string>, requestPath = target.pathname) => new Promise<{
+      status: number | undefined;
+      text: string;
+    }>((resolve, reject) => {
+      const request = createHttpRequest({
+        hostname: target.hostname,
+        port: Number(target.port),
+        path: requestPath,
+        method: 'GET',
+        headers,
+        agent: false,
+      }, (response) => {
+        const chunks: Buffer[] = [];
+        response.on('data', (chunk: Buffer) => chunks.push(chunk));
+        response.on('end', () => resolve({
+          status: response.statusCode,
+          text: Buffer.concat(chunks).toString('utf8'),
+        }));
+      });
+      request.once('error', reject);
+      request.end();
+    });
+    const localhost = await requestViewer({ host: `localhost:${port}`, origin: `http://localhost:${port}` });
+    assert.equal(localhost.status, 200);
+
+    const uppercaseHostAndOrigin = await requestViewer({
+      host: `LOCALHOST:${port}`, origin: `HTTP://127.0.0.1:${port}`,
+    });
+    assert.equal(uppercaseHostAndOrigin.status, 200);
+
+    const duplicateHost = await new Promise<{ status: number | undefined; text: string }>((resolve, reject) => {
+      const socket = createTcpConnection({ host: '127.0.0.1', port: Number(port) }, () => {
+        socket.write('GET / HTTP/1.1\r\nHost: 127.0.0.1:' + port + '\r\nHost: localhost:' + port + '\r\nConnection: close\r\n\r\n');
+      });
+      const chunks: string[] = [];
+      socket.setTimeout(5000, () => socket.destroy(new Error('Duplicate Host request timed out')));
+      socket.on('data', (chunk: Buffer | string) => chunks.push(typeof chunk === 'string' ? chunk : chunk.toString('utf8')));
+      socket.once('error', reject);
+      socket.once('end', () => {
+        const response = chunks.join('');
+        const [headers, body = ''] = response.split('\r\n\r\n');
+        resolve({ status: Number(headers.match(/^HTTP\/1\.1 (\d{3})/m)?.[1]), text: body.trim() });
+      });
+    });
+    assert.equal(duplicateHost.status, 400);
+    assert.match(duplicateHost.text, /Invalid Host header/);
+
+    const notDirectory = await requestViewer({}, '/index.html/child');
+    assert.equal(notDirectory.status, 404);
+    assert.equal(notDirectory.text, 'Not found');
+
+    const tooLongPath = await requestViewer({}, '/' + 'a'.repeat(12_000));
+    assert.equal(tooLongPath.status, 414);
+
+    const invalidHost = await requestViewer({ host: `example.com:${port}` });
+    assert.equal(invalidHost.status, 400);
+    assert.equal(invalidHost.text, 'Invalid Host header');
+
+    const invalidOrigin = await requestViewer({ origin: 'https://example.com' });
+    assert.equal(invalidOrigin.status, 403);
+    assert.equal(invalidOrigin.text, 'Origin not allowed');
 
     const page = await fetch(viewer.url);
     assert.equal(page.status, 200);
