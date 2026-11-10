@@ -10,7 +10,7 @@ const subscription = '00000000-0000-0000-0000-000000000001';
 const stamp = '89152';
 const clusterName = `arrow-collector-${stamp}`;
 const state = path.join(ROOT, 'out', 'arrowcol-oat');
-type Fault = 'cluster' | 'other' | 'timeout' | 'quota' | 'identity' | 'database' | 'publisher' | 'network' | 'missing-target' | 'convergence' | 'run-fic-permission';
+type Fault = 'cluster' | 'other' | 'timeout' | 'quota' | 'identity' | 'database' | 'publisher' | 'native-federation' | 'network' | 'missing-target' | 'convergence' | 'run-fic-permission';
 
 function fixture(t: test.TestContext, faults: Fault[] = []) {
   fs.mkdirSync(path.join(ROOT, 'out'), { recursive: true });
@@ -94,8 +94,10 @@ function fixture(t: test.TestContext, faults: Fault[] = []) {
       principalId: subscription,
     });
     if (command[1] === 'identity') return success([
-      { name: `azure-qap-${clusterName}`, issuer: 'https://aks.example/', subject: 'system:serviceaccount:arrow-collector:arrow-collector',
-        audiences: ['api://AzureADTokenExchange'] },
+      ...(faults.includes('native-federation') ? [] : [{
+        name: `azure-qap-${clusterName}`, issuer: 'https://aks.example/', subject: 'system:serviceaccount:arrow-collector:arrow-collector',
+        audiences: ['api://AzureADTokenExchange'],
+      }]),
       ...(faults.includes('publisher') ? [] : config.publisherFederatedCredentials.map((entry: object) =>
         ({ ...entry, audiences: ['api://AzureADTokenExchange'] }))),
     ]);
@@ -199,7 +201,7 @@ test('Delta convergence retries once without changing network', async t => {
   assert.equal(f.calls.some(call => call[2] === 'delete'), false);
 });
 
-for (const fault of ['identity', 'database', 'publisher', 'network', 'run-fic-permission'] as const) {
+for (const fault of ['identity', 'database', 'publisher', 'native-federation', 'network', 'run-fic-permission'] as const) {
   test(`missing ${fault} postcondition cannot claim deployed`, async t => {
     const f = fixture(t, [fault]);
     await assert.rejects(deployInfrastructure(f.options, f.runner), /postconditions failed/);
@@ -304,4 +306,14 @@ test('bootstrap receives fresh stamp-derived env rather than stale workload iden
   t.after(() => { process.env = previous; });
   await deployInfrastructure(f.options, f.runner);
   assert.equal(process.env.AZURE_STAMP, '00000');
+});
+
+test('native publisher federation works without optional external publisher credentials', async t => {
+  const f = fixture(t, ['publisher']);
+  const config = parse(fs.readFileSync(f.options.stampConfig, 'utf8'));
+  config.publisherFederatedCredentials = [];
+  fs.writeFileSync(f.options.stampConfig, stringify(config));
+  const result = await deployInfrastructure(f.options, f.runner);
+  assert.equal(result.network, 'azure');
+  assert.equal(f.receipt().postconditions.nativeFederation, true);
 });

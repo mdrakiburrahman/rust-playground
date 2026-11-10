@@ -66,8 +66,6 @@ export async function deployInfrastructure(options: Options, runner: typeof run_
   validateOptions(options);
   const configPath = path.resolve(ROOT, options.stampConfig ?? 'infra/azure/stamp.yaml');
   const config = loadStampConfig(configPath);
-  if (!config.publisherFederatedCredentials.length)
-    throw new Error('Private stamp configuration must include the approved publisher federated credential before deployment.');
   if (options.subscription && options.subscription.toLowerCase() !== config.subscription)
     throw new Error('--subscription must match the private stamp configuration; no implicit subscription override is allowed.');
   const subscription = config.subscription;
@@ -298,8 +296,7 @@ async function verifyPostconditions(config: StampConfig, az: (...args: string[])
   receipt.nativeFederation = credentials.some(item => item.name === `azure-qap-${name}` &&
     properties(item).subject === `system:serviceaccount:${config.aks.namespace}:${config.aks.serviceAccount}` &&
     properties(item).issuer === object(cluster?.oidcIssuerProfile, 'AKS OIDC profile').issuerUrl && validAudience(item));
-  receipt.publisherFederation = config.publisherFederatedCredentials.length > 0 &&
-    config.publisherFederatedCredentials.every(expected => credentials.some(item => item.name === expected.name &&
+  receipt.publisherFederation = config.publisherFederatedCredentials.every(expected => credentials.some(item => item.name === expected.name &&
       properties(item).issuer === expected.issuer && properties(item).subject === expected.subject && validAudience(item)));
   const failed = Object.entries(receipt).filter(([, passed]) => !passed).map(([key]) => key);
   if (failed.length) throw new Error(`Deployment postconditions failed: ${failed.join(', ')}.`);
