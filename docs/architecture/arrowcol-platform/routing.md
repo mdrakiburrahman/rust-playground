@@ -33,11 +33,11 @@ External client
 ```
 
 The router checks timestamp, nonce, signature, method, path, content type, and
-routing/control metadata. Edge and internal-hop keys are different. The
-The pluggable authenticator is explicitly configured as
-`dev_only_allow_all` (development-only); it acts only after the trusted-edge
-signature is verified and is not an anonymous bypass. A real identity provider
-and internal mTLS are extension points, not checked-in production guarantees.
+routing/control metadata. Edge and internal-hop keys are different. The pluggable
+authenticator is explicitly configured as `dev_only_allow_all`
+(development-only); it acts only after the trusted-edge signature is verified and
+is not an anonymous bypass. A real identity provider and internal mTLS are
+extension points, not checked-in production guarantees.
 
 | Edge-to-router proof header | Contract |
 | --- | --- |
