@@ -428,6 +428,46 @@ mod error_diagnostics_tests {
     use super::*;
 
     #[test]
+    fn canonical_edge_request_matches_wire_golden_vector() -> Result<()> {
+        let mut headers = HeaderMap::new();
+        for (key, value) in [
+            ("x-arrowcol-protocol-version", "1"),
+            ("x-arrowcol-implementation-pool", "dataflow"),
+            ("x-arrowcol-catalog", "telemetry"),
+            ("x-arrowcol-schema", "prod"),
+            ("x-arrowcol-table", "traces"),
+            ("x-arrowcol-schema-fingerprint", "sha256:0123456789abcdef"),
+            ("x-arrowcol-oat-run-id", "00000000-0000-0000-0000-000000000001"),
+            ("content-type", "application/grpc"),
+        ] {
+            headers.insert(key, HeaderValue::from_static(value));
+        }
+        let expected = concat!(
+            "100000\nwire-golden-1\nPOST\n/arrow.flight.protocol.FlightService/DoPut\n",
+            "x-arrowcol-protocol-version:1\n",
+            "x-arrowcol-implementation-pool:dataflow\n",
+            "x-arrowcol-catalog:telemetry\n",
+            "x-arrowcol-schema:prod\n",
+            "x-arrowcol-table:traces\n",
+            "x-arrowcol-schema-fingerprint:sha256:0123456789abcdef\n",
+            "x-arrowcol-control-operation:\n",
+            "x-arrowcol-oat-run-id:00000000-0000-0000-0000-000000000001\n",
+            "content-type:application/grpc\n",
+        );
+        assert_eq!(
+            canonical_edge_request(
+                &Method::POST,
+                "/arrow.flight.protocol.FlightService/DoPut",
+                &headers,
+                100_000,
+                "wire-golden-1",
+            )?,
+            expected
+        );
+        Ok(())
+    }
+
+    #[test]
     fn edge_signer_covers_oat_run_id_even_when_absent() -> Result<()> {
         let run_id = "00000000-0000-0000-0000-000000000001";
         let mut headers = HeaderMap::new();

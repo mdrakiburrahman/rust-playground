@@ -101,6 +101,10 @@ impl RouterConfig {
             "authentication time bounds must be positive"
         );
         ensure!(
+            (1..=1_048_576).contains(&self.auth.edge_replay_max_nonces),
+            "auth.edge_replay_max_nonces must be between 1 and 1048576"
+        );
+        ensure!(
             self.auth.edge_secret_file != self.auth.internal_signing_secret_file,
             "edge and internal signing secrets must use different files"
         );
@@ -261,8 +265,15 @@ pub struct AuthConfig {
     pub internal_signing_secret_file: PathBuf,
     /// Maximum edge assertion age.
     pub edge_signature_max_age_ms: u64,
+    /// Maximum live verified edge nonces retained per router process.
+    #[serde(default = "default_edge_replay_max_nonces")]
+    pub edge_replay_max_nonces: usize,
     /// Internal identity validity interval.
     pub internal_identity_ttl_ms: u64,
+}
+
+fn default_edge_replay_max_nonces() -> usize {
+    65_536
 }
 
 /// Upstream HTTP/2 transport and connection reuse configuration.

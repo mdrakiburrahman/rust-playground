@@ -82,12 +82,21 @@ Assertions are time-bounded and
 nonces are replay-protected in process. Direct traffic, tampering, replay, and
 externally supplied `x-arrowcol-internal-auth-*` headers are rejected.
 
-Replay memory admits at most 65,536 nonces per router process. Expired assertions
+Replay memory defaults to 65,536 nonces per router process; configure
+`auth.edge_replay_max_nonces` from 1 to 1,048,576 before a higher-rate run.
+Expired assertions
 are removed before admission; a full cache rejects new assertions with gRPC
 `RESOURCE_EXHAUSTED` rather than growing or evicting live nonces. Nonces remain
 protected through the assertion's last valid millisecond, including accepted
-future clock skew. Size edge rate limits for this capacity and the configured
-assertion lifetime; replay protection is process-local, not shared across replicas.
+future clock skew. Only successfully verified signatures consume capacity.
+At the default 30-second age, 65,536 entries cover about 2,184 requests/s with
+current timestamps, or 1,092 requests/s with the maximum accepted future skew.
+For peak signed-request rate R, size capacity above `R * (2 * age_seconds + 1)`
+including bursts and all control requests. E4's 128 clients are not a request-rate
+bound: 2,184 requests/s is only 17 requests/s per client if one router receives
+the entire fleet. Measure signed-request rate before qualification and increase
+capacity or bound the edge rate; do not treat capacity rejection as throughput.
+Replay protection is process-local, not shared across replicas.
 
 Startup requires an explicit `auth.authenticator: dev_only_allow_all`. Missing,
 legacy `allow_all`, and unknown modes are rejected before listeners start.
