@@ -323,7 +323,9 @@ export async function runAksPreflight(configPath: string, options: PreflightOpti
         condition(isRecord(node.status) ? node.status.conditions : undefined, 'Ready') &&
         !(isRecord(node.spec) && node.spec.unschedulable))) throw new Error(`Existing ${role} nodes are not schedulable/Ready.`);
     }
-    const namespaces = records(kube(['get', 'ns', '-o', 'json']).items)
+    const namespaceList = kube(['get', 'ns', '-o', 'json']);
+    if (!Array.isArray(namespaceList.items)) throw new Error('Namespace inventory is not a Kubernetes list.');
+    const namespaces = records(namespaceList.items)
       .map((item) => at(item.metadata, 'name')).filter((name) => name && /^arrow-collector-[a-f0-9]{32}$/.test(name));
     if (namespaces.length) warnings.push(`${namespaces.length} run-scoped namespace(s) remain; investigate possible orphan runs before concurrent execution. No cleanup was attempted.`);
     return 'Operator can create/delete namespaces; role pools have current capacity or scale-from-zero headroom. No scaling was attempted.';
@@ -386,6 +388,7 @@ export async function runAksPreflight(configPath: string, options: PreflightOpti
     const profile = object(live.networkProfile, 'Live networkProfile');
     const dataplane = at(profile, 'networkDataplane')?.toLowerCase();
     const policy = at(profile, 'networkPolicy')?.toLowerCase();
+    if (dataplane !== 'azure' && dataplane !== 'cilium') throw new Error('Live cluster network dataplane is missing or unsupported.');
     network.provider = dataplane === 'cilium' || policy === 'cilium' ? 'cilium' : policy && policy !== 'none' ? policy : 'none';
     network.enforcing = network.provider !== 'none';
     if (!network.enforcing) {
@@ -430,7 +433,7 @@ export async function runAksPreflight(configPath: string, options: PreflightOpti
     return 'Container metadata/read access, root static website and producer UAMI write-role evidence verified. No write probe performed.';
   });
 
-  await check('Run federated-credential permissions and headroom', async () => {
+  await check('Run federated-credential permissions', async () => {
     const id = requireValue(identityId, 'UAMI resource ID');
     const page = object(await request(`https://management.azure.com${id}/providers/Microsoft.Authorization/permissions?api-version=2022-04-01`,
       'https://management.azure.com'), 'Effective permissions');
@@ -440,13 +443,19 @@ export async function runAksPreflight(configPath: string, options: PreflightOpti
         throw new Error(`The workload UAMI lacks effective run FIC ${action} permission.`);
       }
     }
-    const credentials = records(json('az', azArgs(['identity', 'federated-credential', 'list', '-g', resourceGroup, '--identity-name', identityName])));
+    return 'Workload UAMI effective permissions allow creating and deleting run federated credentials.';
+  });
+  await check('Run federated-credential headroom', () => {
+    const inventory = json('az', azArgs(['identity', 'federated-credential', 'list', '-g', resourceGroup, '--identity-name', identityName]));
+    if (!Array.isArray(inventory) || !inventory.every(isRecord)) throw new Error('Federated-credential inventory is invalid; headroom cannot be established.');
+    const credentials = inventory;
     const leaked = credentials.filter((credential) => at(credential, 'name')?.startsWith('arrowcol-run-'));
     if (leaked.length) warnings.push(`${leaked.length} run FIC(s) remain; investigate possible leaked credentials. No deletion attempted.`);
     if (credentials.length >= 20) throw new Error('UAMI federated credentials are at the limit of 20; no run credential headroom remains.');
-    return `Workload UAMI effective permissions allow run FIC create/delete; ${20 - credentials.length} slot(s) remain across native and external trusts.`;
+    return `${20 - credentials.length} FIC slot(s) remain across native and external trusts.`;
   });
-  return { ready: checks.every((entry) => entry.ready), checks, nextCommand, warnings, network };
+  const ready = checks.every((entry) => entry.ready);
+  return { ready, checks, nextCommand: ready ? 'npx --no-install arrowcol-oat --mode aks' : nextCommand, warnings, network };
 }
 
 export function formatPreflightReport(report: PreflightReport): string {

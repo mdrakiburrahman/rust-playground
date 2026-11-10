@@ -152,7 +152,7 @@ test('fresh-run preflight passes without staged workloads and exposes the no-pro
     const report = await f.run();
     assert.deepEqual(report.checks.filter((entry) => !entry.ready), []);
     assert.equal(report.ready, true);
-    assert.equal(report.checks.length, 12);
+    assert.equal(report.checks.length, 13);
     assert.deepEqual(report.network, { provider: 'none', enforcing: false });
     assert.match(formatPreflightReport(report), /WARNING:.*passwordless port/);
     assert.equal(f.calls.filter((call) => call.command === 'az' && call.args[0] === 'acr').length, 5);
@@ -179,7 +179,7 @@ test('null QAP and invalid config do not mask independent readiness gates', asyn
     assert.equal(report.checks.find((entry) => entry.name === 'Metrics API availability')!.ready, true);
     await writeFile(path.join(f.root, 'oat.json'), '{}');
     report = await f.run();
-    assert.equal(report.checks.length, 12);
+    assert.equal(report.checks.length, 13);
     assert.match(report.checks[0]!.detail, /aks setup/);
     assert.ok(report.checks.some((entry) => entry.name === 'Metrics API availability'));
   } finally { await f.cleanup(); }
@@ -286,6 +286,7 @@ test('FIC effective permissions use the workload UAMI and require both write and
     assert.equal(report.checks.find((entry) => entry.name.startsWith('Run federated'))!.ready, false);
     assert.match(report.checks.find((entry) => entry.name.startsWith('Run federated'))!.detail, /delete permission/);
     assert.ok(f.requests.some((request) => request.url.includes(`${identityId}/providers/Microsoft.Authorization/permissions`)));
+    assert.equal(report.checks.find((entry) => entry.name === 'Run federated-credential headroom')!.ready, true);
   } finally { await f.cleanup(); }
   assert.equal(permitsAction([{ actions: ['*'], notActions: ['Microsoft.ManagedIdentity/*'] }], 'Microsoft.ManagedIdentity/write'), false);
   assert.equal(permitsAction([{ actions: ['Microsoft.ManagedIdentity/*'], notActions: [] }], 'Microsoft.ManagedIdentity/write'), true);
@@ -302,7 +303,7 @@ test('FIC headroom counts all trusts while leaked run resources are warnings, no
     assert.ok(report.warnings.some((warning) => warning.includes('leaked')));
     for (let index = f.state.credentials.length; index < 20; index++) f.state.credentials.push({ name: `external-trust-${index}` });
     report = await f.run();
-    assert.equal(report.checks.find((entry) => entry.name.startsWith('Run federated'))!.ready, false);
+    assert.equal(report.checks.find((entry) => entry.name === 'Run federated-credential headroom')!.ready, false);
     assert.match(formatPreflightReport(report), /limit of 20/);
   } finally { await f.cleanup(); }
 });
