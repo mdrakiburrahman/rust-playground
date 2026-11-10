@@ -758,7 +758,7 @@ function registerLocalInterrupts(): {
   for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
     const handler = (): void => {
       count++;
-      if (count > 1) process.exit(128 + (exitCodes[signal] ?? 1));
+      if (count > 1) process.exit(exitCodes[signal] ?? 1);
       received = signal;
       controller.abort();
     };
