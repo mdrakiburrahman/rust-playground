@@ -121,13 +121,16 @@ test('external --server submits unchanged configuration without building or attr
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
   assert.ok(address && typeof address !== 'string');
+  const previousExitCode = process.exitCode;
   try {
     await main(['--config', configPath, '--server', `http://127.0.0.1:${address.port}`], async () => {
       throw new Error('must not build or inspect source for an independently running server');
     });
+    assert.equal(process.exitCode, 1);
     assert.deepEqual(posted, config);
     assert.equal(await readFile(configPath, 'utf8'), JSON.stringify(config));
   } finally {
+    process.exitCode = previousExitCode;
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     await rm(directory, { recursive: true, force: true });
   }
