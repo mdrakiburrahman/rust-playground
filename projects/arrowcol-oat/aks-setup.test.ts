@@ -44,6 +44,7 @@ function fake(options: {
   const calls: string[][] = [];
   let preflights = 0;
   let published = !options.missingImages;
+  const missingMetadata = new Set<string>();
   const runner: typeof run_tree = async (command, _timeout, _cwd, env) => {
     calls.push(command);
     const text = command.join(' ');
@@ -56,6 +57,13 @@ function fake(options: {
     else if (text.startsWith('az account show')) stdout = command.includes('user.name') ? clientId : subscription;
     else if (text.startsWith('az login') || text.startsWith('az acr login')) { /* isolated publisher login */ }
     else if (text.startsWith('az acr show')) stdout = 'arrowcollector89152.azurecr.io';
+    else if (text.startsWith('az acr repository list')) stdout = JSON.stringify([
+      'arrowcol-sqlserver', 'arrowcol-catalog-rust', 'arrowcol-router-rust', 'arrowcol-dataflow-rust', 'arrowcol-oat-client',
+    ]);
+    else if (text.startsWith('az acr repository show-tags')) {
+      const repository = command[command.indexOf('--repository') + 1]!;
+      stdout = JSON.stringify(!published && missingMetadata.has(repository) ? [] : [`oat-${revision}`]);
+    }
     else if (text.startsWith('az storage container show')) stdout = JSON.stringify({
       properties: { etag: '"authority"' }, metadata: {
         sandboxid: 'stamp-89152', resetstate: options.state ?? 'ready-v1', resetgeneration: generation,
@@ -78,7 +86,10 @@ function fake(options: {
     } else if (command[0] === 'kubectl' && command.includes('token')) stdout = token;
     else if (text.startsWith('az acr manifest show-metadata')) {
       if (options.registryAbsent) return { returncode: 1, stdout: '', stderr: registryAbsent };
-      if (!published) return { returncode: 3, stdout: '', stderr: tagFormImageMissing };
+      if (!published) {
+        missingMetadata.add(command[command.indexOf('--name') + 1]!.split(':')[0]!);
+        return { returncode: 3, stdout: '', stderr: tagFormImageMissing };
+      }
       stdout = options.badDigest ? 'invalid-digest' : digest;
     } else if (text.startsWith('docker image inspect')) {
       const reference = command.at(-1)!;
