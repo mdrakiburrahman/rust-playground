@@ -109,6 +109,7 @@ test('publishes four existing images as federated UAMI without applying identity
   assert.equal(result.oatRunId, '00000000-0000-0000-0000-000000000003');
   assert.equal(validateRuntime(result), result);
   assert.equal(m.calls.filter(c => c[0] === 'docker' && c[1] === 'push').length, 4);
+  assert.ok(m.calls.filter(c => c[0] === 'docker' && c[1] === 'tag').every(c => c.at(-1)?.endsWith(`:oat-${revision}`)));
   assert.ok(m.calls.every(c => !c.includes('apply') && !c.includes('build') && !c.includes('federated-credential')));
   assert.ok(m.calls.every(c => !c.includes('--subscription') || c[c.indexOf('--subscription') + 1] === subscription));
   for (const image of Object.values(result.images)) assert.ok(image.endsWith(`@${digest}`));
@@ -124,6 +125,13 @@ test('wrong existing ServiceAccount is rejected before minting a token or publis
   const m = mock(options.registry, 'identity');
   await assert.rejects(publishImages(options, m.runner), /existing publisher ServiceAccount/);
   assert.ok(!m.calls.some(c => c[1] === 'create' || c[1] === 'login' || c[1] === 'push'));
+});
+
+test('stale local image provenance is rejected before Azure credentials are used', async t => {
+  const options = fixture(t);
+  const m = mock(options.registry, 'local-provenance');
+  await assert.rejects(publishImages(options, m.runner), /Local sqlserver image revision provenance/);
+  assert.ok(!m.calls.some(c => c[0] === 'az' || c[0] === 'kubectl'));
 });
 
 test('invalid registry digest preserves the draft and removes isolated credential caches', async t => {
@@ -168,9 +176,13 @@ test('requires federation, matching runtime subject and all amd64 images before 
 
 test('builds all five local images for linux/amd64 with the full revision label', async () => {
   const calls: string[][] = [];
-  const runner: typeof run_tree = async command => { calls.push(command); return { returncode: 0, stdout: '', stderr: '' }; };
+  const runner: typeof run_tree = async command => {
+    if (command[0] === 'git') return { returncode: 0, stdout: command[1] === 'rev-parse' ? revision : '', stderr: '' };
+    calls.push(command);
+    return { returncode: 0, stdout: '', stderr: '' };
+  };
   await buildLocalImages({ revision }, runner);
-  assert.equal(calls.length, 5);
+  assert.equal(calls.filter(c => c[0] === 'docker').length, 5);
   assert.ok(calls.every(c => c.slice(0, 3).join(' ') === 'docker buildx build' && c.includes('linux/amd64') && c.includes('--load')));
   assert.ok(calls.every(c => c.includes(`org.opencontainers.image.revision=${revision}`)));
   assert.deepEqual(calls.map(c => c[c.indexOf('--tag') + 1]), [
@@ -180,6 +192,10 @@ test('builds all five local images for linux/amd64 with the full revision label'
   calls.length = 0;
   await assert.rejects(buildLocalImages({ revision: 'abc' }, runner), /full 40-character/);
   assert.equal(calls.length, 0);
+  const dirtyRunner: typeof run_tree = async command => ({
+    returncode: 0, stdout: command[1] === 'rev-parse' ? revision : ' M file.ts', stderr: '',
+  });
+  await assert.rejects(buildLocalImages({ revision }, dirtyRunner), /Commit the source changes/);
 });
 
 test('publishes the revision-proven client image as a digest-pinned ACR reference', async t => {
@@ -208,7 +224,7 @@ test('reads and verifies all five revision tags without building or pushing', as
   });
   assert.equal(m.calls.filter(c => c[0] === 'docker' && c[1] === 'pull').length, 5);
   assert.ok(!m.calls.some(c => c[0] === 'docker' && ['buildx', 'push', 'tag'].includes(c[1])));
-  assert.ok(m.calls.filter(c => c[0] === 'az' && c[2] === 'manifest').every(c => c.includes(`oat-${revision}`)));
+  assert.ok(m.calls.filter(c => c[0] === 'az' && c[2] === 'manifest').every(c => c.some(arg => arg.includes(`oat-${revision}`))));
 });
 
 test('reports absent revision tags distinctly while provenance mismatches fail closed', async t => {

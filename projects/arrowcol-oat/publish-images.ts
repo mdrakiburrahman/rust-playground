@@ -77,6 +77,9 @@ async function publishedDigest(session: PublisherSession, options: ImageOptions,
 
 export async function buildLocalImages({ revision }: { revision: string }, runner: typeof run_tree = run_tree): Promise<void> {
   const source = requireRevision(revision);
+  if (await getSourceRevision(runner) !== source) throw new Error('Image revision does not match the checked-out source.');
+  const status = await runner(['git', 'status', '--porcelain'], 15, ROOT);
+  if (status.returncode || status.stdout.trim()) throw new Error('Commit the source changes before building revision-proven images.');
   for (const [role, dockerfile, context] of imageBuilds) {
     const result = await runner(['docker', 'buildx', 'build', '--pull', '--platform', 'linux/amd64', '--load',
       '--tag', localImages[role], '--label', `${revisionLabel}=${source}`, '--file', dockerfile, context], 3600, ROOT);
@@ -127,8 +130,9 @@ export async function readPublishedImages(
       const tagged = `${session.loginServer}/${repository}:${tag}`;
       session.clean(`docker pull ${role}`, await session.run(['docker', 'pull', tagged], 3600));
       const inspect = session.clean(`docker inspect ${role}`, await session.run(['docker', 'image', 'inspect', '--format', '{{json .}}', tagged], 30));
-      let image: { Config?: { Labels?: Record<string, string> | null }; RepoDigests?: string[] };
+      let image: { Os?: string; Architecture?: string; Config?: { Labels?: Record<string, string> | null }; RepoDigests?: string[] };
       try { image = JSON.parse(inspect); } catch { throw new Error(`Docker returned invalid ${role} image metadata.`); }
+      if (`${image.Os}/${image.Architecture}` !== 'linux/amd64') throw new Error(`Published ${role} image must be linux/amd64.`);
       if (image.Config?.Labels?.[revisionLabel] !== source) throw new Error(`Published ${role} image revision provenance does not match ${source}.`);
       if (!image.RepoDigests?.includes(`${session.loginServer}/${repository}@${digest}`))
         throw new Error(`Published ${role} image digest changed while it was being verified.`);
@@ -154,11 +158,10 @@ export async function publishImages(options: Options, runner: typeof run_tree = 
       config.namespace !== stamp.aks.namespace || (config.serviceAccount ?? 'arrowcol-oat') !== stamp.aks.serviceAccount) {
     throw new Error('Runtime configuration must reuse the selected stamp namespace, ServiceAccount and UAMI.');
   }
-  for (const role of Object.keys(repositories)) {
-    const result = await runner(['docker', 'image', 'inspect', '--format', '{{.Os}}/{{.Architecture}}', `arrowcol-oat/${role}:local`], 30);
-    if (result.returncode || result.stdout.trim() !== 'linux/amd64') throw new Error(`Missing linux/amd64 local image for ${role}; build it before publishing.`);
-  }
   const source = await getSourceRevision(runner);
+  for (const role of Object.keys(repositories) as Array<keyof typeof repositories>) {
+    await verifyLocalImage(role, localImages[role], source, runner);
+  }
   const images = await withPublisherIdentity(options, async ({ run, clean, revision, loginServer, subscription }) => {
     if (!source.startsWith(revision.toLowerCase())) throw new Error('Source revision changed during image publication.');
     const published = {} as RuntimeConfig['images'];
