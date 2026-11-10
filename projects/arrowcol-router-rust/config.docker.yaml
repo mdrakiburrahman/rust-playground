@@ -34,7 +34,7 @@ routing:
   readiness_max_staleness_ms: 30000
 
 auth:
-  authenticator: allow_all
+  authenticator: dev_only_allow_all
   edge_secret_file: /run/secrets/edge-hmac
   internal_signing_secret_file: /run/secrets/internal-hmac
   edge_signature_max_age_ms: 30000
