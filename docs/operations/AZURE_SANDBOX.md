@@ -12,6 +12,11 @@ deployment or cleanup target. Follow [AKS QAP operations](AKS_QAP.md) for its
 stamp, shared identity, preflight gate and Kubernetes runtime. Do not use this
 legacy sandbox guide to delete or reset the AKS stamp.
 
+The unqualified `bootstrap.ts` examples below do not target the historical
+`rust-playground` resource group: the current CLI defaults to stamped mode and
+uses the private `infra/azure/stamp.yaml` for `arrow-collector-rg`. Only explicit
+schema-evolution mode targets its dedicated sandbox; see its runbook below.
+
 Local disk and local Kusto remain the loadtest default. `--mode azure` (or
 `ARROWCOL_MODE=azure`) switches storage and Kusto together. Azure writers and the
 bootstrap use the existing signed-in Azure CLI identity; Kusto reads Delta using
@@ -34,7 +39,13 @@ Copy the root `.env.example` into repo-bootstrapper's private
 `sync/rust-playground/.env`, fill in the authorized subscription, and let
 repo-bootstrapper distribute it. Never commit or print the filled file.
 
-Run all following commands inside the repository Linux devcontainer:
+The commands below run inside the Linux devcontainer. They target the current
+stamped AKS environment, not the historical sandbox: `config` and `preflight`
+inspect that stamp, and `provision` can create or update resources in
+`arrow-collector-rg`. For current QAP deployment, follow [AKS QAP operations](AKS_QAP.md).
+To target the dedicated schema-evolution sandbox, pass
+`--mode schema-evolution --env-file .env.schema-evo.private` to every bootstrap
+command and follow the [schema-evolution runbook](../../experiments/schema-evolution/README.md).
 
 ```bash
 npx --no-install tsx infra/azure/bootstrap.ts config
@@ -74,8 +85,10 @@ minimal approved synced-input projection and pre-pass reset sequence.
 For the isolated sandbox, keep resource overrides absent and
 do not reuse the existing table/checkpoint roots. Use a separate `--output`
 file when provisioning; generated configuration preserves the selected group.
-**Reset and stop act on the selected stamp.** Check the resource group before
-using either destructive command.
+Reset and stop act on the selected mode's target. Unqualified commands select
+the stamped environment in `arrow-collector-rg`, not the historical sandbox.
+Check the selected resource group before using either destructive command and
+pass the explicit schema-evolution mode flags when using that dedicated sandbox.
 
 Optional private knobs include region, supported Standard Kusto SKU, QAP hot
 days, identity/database/container names, and autoscaling bounds. Defaults are
@@ -154,9 +167,11 @@ removes them. Storage charges continue until deletion.
 
 ## Cloud occupancy and reset
 
-**Data-plane reset is enabled for this disposable, single-operator sandbox.**
 `reset` previews; `reset --execute` runs the fenced custody sequence below;
 `reset --resume` continues an interrupted cleanup from its custody record.
+These unqualified examples default to stamped mode and act on the stamp in
+`infra/azure/stamp.yaml` under `arrow-collector-rg`, not the historical
+`rust-playground` sandbox. Confirm that selected stamp before any execution.
 It refuses unless occupancy is released, the publisher registry is empty and
 authority is `ready-v1`/`fenced-v1`. Known limitation: safety relies on every
 mutating process participating in the publisher registry; processes outside the

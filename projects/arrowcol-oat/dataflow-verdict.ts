@@ -296,7 +296,7 @@ export async function verifyRunCleanup(
 
 export async function collectDataFlow(
   status: OatRunStatus, config: RecordValue, mode: 'local' | 'aks', expectedSha: string | undefined,
-  runner: typeof run_tree = run_tree,
+  runner: typeof run_tree = run_tree, environment: NodeJS.ProcessEnv = process.env,
 ): Promise<Verdict> {
   if (status.state !== 'succeeded') return evaluateDataFlow(status, [], expectedSha, mode, config);
   let verdict: Verdict;
@@ -310,7 +310,7 @@ export async function collectDataFlow(
   }
   if (mode === 'aks' && verdict.pass) {
     try {
-      await verifyRunCleanup(verdict.rows, config, runner);
+      await verifyRunCleanup(verdict.rows, config, runner, Date.now, undefined, environment);
       verdict.lines.push('cleanup: zero run-scoped namespaces or federated credentials');
     } catch (error) {
       verdict.pass = false;

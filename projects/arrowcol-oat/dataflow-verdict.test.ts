@@ -204,19 +204,20 @@ test('AKS collection preserves verified rows when cleanup evidence fails and pas
   const bytes = resultParquet('aks');
   t.mock.method(globalThis, 'fetch', async () => new Response(Buffer.from(bytes)));
   let cleanupFails = true;
+  const environment: NodeJS.ProcessEnv = { AZURE_SUBSCRIPTION_ID: subscriptionId };
   const runner: typeof run_tree = async (args) => {
     if (args[1] === 'storage') return ok('https://arrowcollector00000.z1.web.core.windows.net/');
     if (args[0] === 'kubectl') return cleanupFails
       ? { returncode: 1, stdout: '', stderr: 'not authorized' } : ok('{"items":[]}');
     return ok('[]');
   };
-  const failed = await collectDataFlow(status, config, 'aks', sha, runner);
+  const failed = await collectDataFlow(status, config, 'aks', sha, runner, environment);
   assert.equal(failed.pass, false);
   assert.equal(failed.rows.length, 1);
   assert.match(failed.reasons.join(), /evidence command failed: kubectl/);
   assert.doesNotMatch(failed.reasons.join(), /no Parquet rows/);
   cleanupFails = false;
-  const succeeded = await collectDataFlow(status, config, 'aks', sha, runner);
+  const succeeded = await collectDataFlow(status, config, 'aks', sha, runner, environment);
   assert.equal(succeeded.pass, true);
   assert.match(succeeded.lines.join(), /zero run-scoped namespaces or federated credentials/);
 });
