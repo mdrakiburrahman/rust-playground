@@ -4,7 +4,15 @@ FROM mcr.microsoft.com/devcontainers/base:ubuntu-24.04
 
 ARG DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update \
+RUN printf '%s\n' \
+        'Acquire::Retries "2";' \
+        'Acquire::http::Timeout "30";' \
+        'Acquire::https::Timeout "30";' \
+        'APT::Update::Error-Mode "any";' \
+        > /etc/apt/apt.conf.d/99-rust-playground-transport \
+    && find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) \
+        -exec sed -i -E 's#http://(archive|security)\.ubuntu\.com/ubuntu([/[:space:]]|$)#https://\1.ubuntu.com/ubuntu\2#g' {} + \
+    && apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
