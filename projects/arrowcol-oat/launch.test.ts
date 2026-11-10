@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises';
+import { execFileSync, spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer, request as createHttpRequest } from 'node:http';
 import { connect as createTcpConnection } from 'node:net';
 import os from 'node:os';
@@ -7,7 +9,8 @@ import path from 'node:path';
 import test from 'node:test';
 import { pathToFileURL } from 'node:url';
 import {
-  buildOwnedServer, cleanupLocalComposeProjects, launchOat, main, readOatConfigForMode, resolveOatConfigPath, sendViewerFile,
+  buildOwnedServer, cleanupLocalComposeProjects, finishOwnedLocalRun, launchOat, main, readOatConfigForMode,
+  resolveCliConfigPath, resolveOatConfigPath, sendViewerFile,
   startLocalServer, startLocalViewer, stopLocalServer,
 } from './launch.js';
 
@@ -469,6 +472,174 @@ test('local interruption requests cancellation and waits for the server to finis
   } finally {
     clearTimeout(timer);
     await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('owned server is isolated from the launcher foreground process group on Linux', { skip: process.platform !== 'linux' }, async () => {
+  const fixture = await ownedBuildFixture();
+  let server: Awaited<ReturnType<typeof startLocalServer>> | undefined;
+  try {
+    server = await startLocalServer(fixture.runner);
+    const serverGroup = execFileSync('ps', ['-o', 'pgid=', '-p', String(server.child.pid)], { encoding: 'utf8' }).trim();
+    const launcherGroup = execFileSync('ps', ['-o', 'pgid=', '-p', String(process.pid)], { encoding: 'utf8' }).trim();
+    assert.equal(serverGroup, String(server.child.pid));
+    assert.notEqual(serverGroup, launcherGroup);
+  } finally {
+    if (server) await stopLocalServer(server.child);
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('a signal received during owned-server teardown prevents viewer startup', async () => {
+  let signal: NodeJS.Signals | undefined;
+  let releaseStop!: () => void;
+  let disposed = false;
+  let viewerStarted = false;
+  const previousExitCode = process.exitCode;
+  const stopping = new Promise<void>((resolve) => { releaseStop = resolve; });
+  const interrupt = {
+    get signal() { return signal; },
+    get exitCode() { return signal === 'SIGTERM' ? 143 : 0; },
+    dispose() { disposed = true; },
+  };
+  try {
+    const finishing = finishOwnedLocalRun(
+      async () => stopping,
+      async () => {},
+      interrupt,
+      async () => { viewerStarted = true; },
+    );
+    signal = 'SIGTERM';
+    releaseStop();
+    await finishing;
+    assert.equal(process.exitCode, 143);
+    assert.equal(viewerStarted, false);
+    assert.equal(disposed, true);
+  } finally {
+    process.exitCode = previousExitCode;
+  }
+});
+
+test('cleanup-local config resolution skips its UUID and honors positional and explicit config paths', async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'oat-cleanup-config-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const runId = '123e4567-e89b-42d3-a456-426614174000';
+  assert.equal(resolveCliConfigPath(['--cleanup-local', runId], 'local', root),
+    path.join(root, 'docs/experiments/arrowcol-oat/oat-config.quick.json'));
+  assert.equal(resolveCliConfigPath(['--cleanup-local', runId, './after.json'], 'local', root), './after.json');
+  assert.equal(resolveCliConfigPath(['--cleanup-local', runId, '--config', './explicit.json'], 'local', root), './explicit.json');
+});
+
+test('immediately propagates cancellation HTTP and transport errors with a long poll interval', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-cancel-error-'));
+  const configPath = path.join(directory, 'oat.json');
+  await writeFile(configPath, JSON.stringify({ platform: { kind: 'local' } }));
+  try {
+    for (const failure of ['http', 'transport'] as const) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 10);
+      const fetcher: typeof fetch = async (input) => {
+        const url = new URL(String(input));
+        if (url.pathname === '/runs') return new Response(JSON.stringify(status('running')), { status: 202 });
+        if (url.pathname.endsWith('/cancel')) {
+          if (failure === 'transport') throw new Error('synthetic cancel transport failure');
+          return new Response(JSON.stringify({ error: 'synthetic cancel HTTP failure' }), { status: 500 });
+        }
+        return new Response(JSON.stringify(status('running')), { status: 200 });
+      };
+      const started = Date.now();
+      try {
+        await assert.rejects(
+          launchOat(configPath, undefined, 10_000, fetcher, () => {}, 'local', () => '127.0.0.1', controller.signal),
+          failure === 'transport' ? /synthetic cancel transport failure/ : /synthetic cancel HTTP failure/,
+        );
+        assert.ok(Date.now() - started < 1_000, 'cancellation failure should not wait for the polling interval');
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('failed interrupted cleanup blocks startup and retains evidence until explicit local cleanup', { skip: process.platform !== 'linux' }, async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-recovery-failed-'));
+  const stateRoot = path.join(directory, 'state');
+  const cellRunId = '123e4567-e89b-42d3-a456-426614174000';
+  const cellState = path.join(stateRoot, cellRunId);
+  const markerPath = path.join(stateRoot, '.arrowcol-oat-owner-123e4567-e89b-42d3-a456-426614174000.json');
+  const configPath = path.join(directory, 'oat.json');
+  const serverScript = path.join(directory, 'server.cjs');
+  const reservation = createServer();
+  await new Promise<void>((resolve, reject) => {
+    reservation.once('error', reject);
+    reservation.listen(0, '127.0.0.1', resolve);
+  });
+  const address = reservation.address();
+  assert.ok(address && typeof address !== 'string');
+  await new Promise<void>((resolve, reject) => reservation.close((error) => error ? reject(error) : resolve()));
+  await mkdir(cellState, { recursive: true });
+  await writeFile(configPath, JSON.stringify({
+    platform: {
+      kind: 'local', compose_project: 'arrowcol-oat-test', compose_state_root: stateRoot,
+      local: { bind_host: '127.0.0.1', endpoint_host: '127.0.0.1' },
+    },
+  }));
+  await writeFile(serverScript, `
+const http = require('node:http');
+let state = 'running';
+const server = http.createServer((request, response) => {
+  response.setHeader('content-type', 'application/json');
+  if (request.method === 'POST' && request.url === '/runs/123e4567-e89b-42d3-a456-426614174000/cancel') {
+    state = 'failed';
+    response.writeHead(202).end(JSON.stringify({ id: '123e4567-e89b-42d3-a456-426614174000', state, progress: 'cleanup failed', result_count: 0, error: 'synthetic Compose cleanup failure' }));
+    return;
+  }
+  response.end(JSON.stringify({ id: '123e4567-e89b-42d3-a456-426614174000', state, progress: state, result_count: 0, error: state === 'failed' ? 'synthetic Compose cleanup failure' : null }));
+});
+server.listen(Number(process.argv[2]), '127.0.0.1');
+`);
+  const child = spawn(process.execPath, [serverScript, String(address.port)], { stdio: 'ignore' });
+  const childExit = once(child, 'exit');
+  try {
+    assert.ok(child.pid);
+    const serverUrl = `http://127.0.0.1:${address.port}`;
+    const readyBy = Date.now() + 5_000;
+    while (Date.now() < readyBy) {
+      try {
+        const response = await fetch(new URL('/runs/123e4567-e89b-42d3-a456-426614174000', serverUrl));
+        if (response.ok) break;
+      } catch {}
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    const processStat = await readFile(`/proc/${child.pid}/stat`, 'utf8');
+    const serverStartTicks = processStat.slice(processStat.lastIndexOf(')') + 2).trim().split(/\s+/)[19];
+    assert.ok(serverStartTicks);
+    await writeFile(markerPath, JSON.stringify({
+      version: 1, runId: '123e4567-e89b-42d3-a456-426614174000', ownerPid: 2147483647, ownerStartTicks: '0',
+      serverPid: child.pid, serverStartTicks, serverUrl, serverExecutable: await realpath(process.execPath),
+    }));
+    const runner = async () => { throw new Error('startup must remain blocked'); };
+    await assert.rejects(main(['--config', configPath], runner), /synthetic Compose cleanup failure/);
+    assert.ok((await stat(markerPath)).isFile());
+    assert.ok((await stat(cellState)).isDirectory());
+    assert.equal((await fetch(new URL('/runs/123e4567-e89b-42d3-a456-426614174000', serverUrl))).ok, true);
+
+    const cleaned: string[] = [];
+    await main(['--config', configPath, '--cleanup-local', cellRunId], runner, async (_config, runId) => {
+      cleaned.push(runId);
+      await rm(path.join(stateRoot, runId), { recursive: true, force: true });
+      return [];
+    });
+    assert.deepEqual(cleaned, [cellRunId]);
+    await assert.rejects(stat(markerPath), { code: 'ENOENT' });
+    await assert.rejects(stat(cellState), { code: 'ENOENT' });
+    await childExit;
+  } finally {
+    if (child.exitCode === null && child.signalCode === null && child.pid) child.kill('SIGTERM');
+    if (child.exitCode === null && child.signalCode === null) await childExit;
     await rm(directory, { recursive: true, force: true });
   }
 });
