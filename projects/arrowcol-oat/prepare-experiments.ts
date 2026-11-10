@@ -1,0 +1,110 @@
+import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { isAbsolute, relative, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { parseArgs } from 'node:util';
+import { readOatConfigForMode } from './launch.js';
+import { validateRuntime } from './runtime.js';
+
+export interface PilotBinding {
+  warmupSeconds: number;
+  measureSeconds: number;
+  higherDfeConcurrency: number;
+}
+
+function integer(value: unknown, min: number, max: number, name: string): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < min || value > max) {
+    throw new Error(`${name} must be an integer from ${min} through ${max}`);
+  }
+  return value;
+}
+
+export function fixtureTables(ddl: string): string[] {
+  const tables = [...ddl.matchAll(/^CREATE TABLE telemetry\.sqlserver\.(\w+) \(/gm)].map((match) => match[1]);
+  if (tables.length !== 32 || new Set(tables).size !== 32) throw new Error('expected exactly 32 distinct fixture tables');
+  return tables;
+}
+
+export function prepareExperiments(
+  base: Record<string, unknown>, tables: string[], binding: PilotBinding,
+): Record<string, Record<string, unknown>> {
+  if (tables.length !== 32 || new Set(tables).size !== 32 ||
+      tables.some((table) => !/^sqlserver_[a-z0-9_]+$/.test(table))) {
+    throw new Error('expected 32 distinct supported fixture table names');
+  }
+  const warmup = integer(binding.warmupSeconds, 0, 300, 'pilot warmup seconds');
+  const measure = integer(binding.measureSeconds, 60, 600, 'pilot measurement seconds');
+  if (measure % 30 || warmup + measure > 600) {
+    throw new Error('pilot binding requires full 30-second measurement windows within the ten-minute pilot budget');
+  }
+  if (base.clients_per_table !== 1) throw new Error('baseline must have one client per table so E4 fits the 128-client limit');
+  if (!Array.isArray(base.dfe_worker_concurrency) || base.dfe_worker_concurrency.length !== 1) {
+    throw new Error('baseline must select exactly one DFE concurrency');
+  }
+  const baselineDfe = integer(base.dfe_worker_concurrency[0], 1, 256, 'baseline DFE concurrency');
+  const higherDfe = integer(binding.higherDfeConcurrency, 1, 256, 'higher DFE concurrency');
+  if (higherDfe <= baselineDfe) throw new Error('E5 DFE concurrency must exceed the baseline');
+  integer(base.rows_per_table, 1, 1_000_000, 'rows per table');
+  integer(base.dmv_concurrency, 1, 64, 'DMV concurrency');
+  if (typeof base.qap_database !== 'string' || !base.qap_database.trim()) {
+    throw new Error('generated AKS config must supply its QAP observation database');
+  }
+  const common = { ...base, tables: [...tables], warmup_seconds: warmup, measure_seconds: measure, pilot_mode: false };
+  return Object.fromEntries([4, 8, 16, 16, 16].map((replicas, index) => [
+    `E${index + 1}`,
+    structuredClone({
+      ...common, replica_counts: [replicas], clients_per_table: index === 3 ? 4 : 1,
+      dfe_worker_concurrency: [index === 4 ? higherDfe : baselineDfe],
+    }),
+  ]));
+}
+
+export async function main(args: string[]): Promise<void> {
+  const { values } = parseArgs({ args, options: {
+    base: { type: 'string' }, out: { type: 'string' },
+    'warmup-seconds': { type: 'string' }, 'measure-seconds': { type: 'string' },
+    'higher-dfe': { type: 'string' }, help: { type: 'boolean' },
+  } });
+  if (values.help) {
+    console.log('Offline only: --base <private AKS config> --out <new out/arrowcol-oat/subdirectory> ' +
+      '--warmup-seconds <measured> --measure-seconds <measured> --higher-dfe <approved>');
+    return;
+  }
+  for (const key of ['base', 'out', 'warmup-seconds', 'measure-seconds', 'higher-dfe'] as const) {
+    if (!values[key]?.trim()) throw new Error(`--${key} is required; pilot values have no defaults`);
+  }
+  const out = resolve(values.out!);
+  const child = relative(resolve('out/arrowcol-oat'), out);
+  if (!child || child.startsWith('..') || isAbsolute(child)) throw new Error('--out must be a new subdirectory of out/arrowcol-oat');
+  const base = await readOatConfigForMode(values.base!, 'aks');
+  const platform = base.platform as Record<string, unknown>;
+  if (typeof platform.runtime_config_file !== 'string' || typeof platform.bootstrap_env_file !== 'string') {
+    throw new Error('generated AKS runtime_config_file and bootstrap_env_file are required');
+  }
+  const runtime = validateRuntime(JSON.parse(await readFile(platform.runtime_config_file, 'utf8')));
+  if (runtime.stamp !== base.stamp || !((await stat(platform.bootstrap_env_file)).isFile())) {
+    throw new Error('generated runtime stamp must match the AKS config and its bootstrap file must exist');
+  }
+  if (typeof base.dmv_client_image !== 'string' ||
+      !/^[a-z0-9]+\.azurecr\.io\/[a-z0-9][a-z0-9/_.-]*@sha256:[a-f0-9]{64}$/.test(base.dmv_client_image)) {
+    throw new Error('generated AKS config must supply a digest-pinned DMV client image');
+  }
+  const tables = fixtureTables(await readFile('projects/loadtest/schemas/sqlserver.sql', 'utf8'));
+  const configs = prepareExperiments(base, tables, {
+    warmupSeconds: Number(values['warmup-seconds']),
+    measureSeconds: Number(values['measure-seconds']),
+    higherDfeConcurrency: Number(values['higher-dfe']),
+  });
+  await mkdir(resolve('out/arrowcol-oat'), { recursive: true, mode: 0o700 });
+  await mkdir(out, { mode: 0o700 });
+  for (const [name, config] of Object.entries(configs)) {
+    await writeFile(resolve(out, `${name}.config.json`), `${JSON.stringify(config, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
+  }
+  console.log(`Prepared E1-E5 in ${out}; no benchmark or cloud operation was performed. Pilot evidence requires operator review.`);
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main(process.argv.slice(2)).catch((error: unknown) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  });
+}
