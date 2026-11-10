@@ -26,6 +26,7 @@ export interface DestroyResult {
 }
 
 export interface DeployOptions {
+  subscription?: string;
   stampConfig?: string;
   stamp?: string;
   network?: AksNetworkMode;
