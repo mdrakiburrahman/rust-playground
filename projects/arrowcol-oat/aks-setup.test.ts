@@ -4,12 +4,11 @@ import { resolve } from 'node:path';
 import test from 'node:test';
 import { parse, stringify } from 'yaml';
 import { ROOT, run_tree } from '../../infra/azure/bootstrap.js';
-import { discoverLiveStamp, main, setup } from './aks-setup.js';
+import { discoverLiveStamp, main, setup as runSetup } from './aks-setup.js';
 
 const subscription = '00000000-0000-0000-0000-000000000001';
 const clientId = '00000000-0000-0000-0000-000000000002';
 const generation = '00000000-0000-0000-0000-000000000003';
-const output = resolve(ROOT, 'out/arrowcol-oat');
 const revision = '0123456789abcdef0123456789abcdef01234567';
 const digest = `sha256:${'a'.repeat(64)}`;
 const token = `header.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 })).toString('base64url')}.signature`;
@@ -23,21 +22,29 @@ ERROR: Could not connect to the registry login server 'arrowcollector99999.azure
 Try running 'az acr check-health -n arrowcollector99999 --yes' to diagnose this issue.
 `;
 
+function setup(options: Parameters<typeof runSetup>[0] & { output: string }, runner: typeof run_tree) {
+  const { output, ...setupOptions } = options;
+  return runSetup(setupOptions, runner, output);
+}
+
 async function fixture(t: test.TestContext, stamp = '00000') {
   const parent = resolve(ROOT, 'out/aks-setup-tests');
   await mkdir(parent, { recursive: true });
   const directory = await mkdtemp(resolve(parent, 'case-'));
   t.after(() => rm(directory, { force: true, recursive: true }));
+  const output = resolve(directory, 'state');
+  await mkdir(output, { mode: 0o700 });
   const value = parse(await readFile(resolve(ROOT, 'infra/azure/stamp.example.yaml'), 'utf8'));
   value.subscription = subscription;
   value.stamp = stamp;
   value.aks.namespace = value.aks.serviceAccount = 'arrow-collector';
   const stampConfig = resolve(directory, 'stamp.yaml');
   await writeFile(stampConfig, `# Preserve operator settings\n${stringify(value)}`, { mode: 0o600 });
-  return { stampConfig };
+  return { stampConfig, output };
 }
 
 function fake(options: {
+  output?: string;
   clusters?: string[]; state?: string; preflightFailures?: number; fail?: string;
   missingImages?: boolean; olderTags?: boolean; registryAbsent?: boolean; badProvenance?: boolean; badDigest?: boolean;
 } = {}) {
@@ -107,7 +114,8 @@ function fake(options: {
       preflights++;
       assert.equal(env?.ARROWCOL_MODE, process.env.ARROWCOL_MODE ?? 'azure');
       assert.equal(env?.AZURE_CLIENT_ID, process.env.AZURE_CLIENT_ID ?? clientId);
-      assert.ok(command.includes(resolve(output, 'oat-config.aks.json')));
+      assert.ok(options.output);
+      assert.ok(command.includes(resolve(options.output, 'oat-config.aks.json')));
       if (preflights <= (options.preflightFailures ?? 0)) return { returncode: 1, stdout: 'WAIT: propagation', stderr: '' };
       stdout = 'AKS preflight READY';
     } else throw new Error(`Unexpected fake-runner call: ${command.slice(0, 5).join(' ')}`);
@@ -146,11 +154,9 @@ test('CLI validates options before attempting any Azure operation', async () => 
 });
 
 test('setup safely repairs YAML, reuses published images, refreshes private inputs and bounds preflight', async t => {
-  // Never remove a developer's real generated inputs when running the fake-runner suite.
-  await mkdir(output, { mode: 0o700 });
-  t.after(() => rm(output, { force: true, recursive: true }));
   const options = await fixture(t);
-  const m = fake({ preflightFailures: 1 });
+  const { output } = options;
+  const m = fake({ preflightFailures: 1, output });
   const result = await setup({ ...options, skipImages: true }, m.runner);
   assert.equal(result.stamp, '89152');
   assert.equal(result.preflightReady, true);
@@ -172,7 +178,7 @@ test('setup safely repairs YAML, reuses published images, refreshes private inpu
   await setup({ ...options, skipPreflight: true }, reuse.runner);
   assert.ok(reuse.calls.every(c => c[0] !== 'docker' || !['buildx', 'push'].includes(c[1]!)));
   await chmod(options.stampConfig, 0o644);
-  const fail = fake({ preflightFailures: 3 });
+  const fail = fake({ preflightFailures: 3, output });
   await assert.rejects(setup({ ...options, skipImages: true }, fail.runner), /three bounded passes/);
   assert.equal(fail.calls.filter(c => c.includes('--preflight-only')).length, 3);
   const bad = JSON.parse(await readFile(result.runtimeConfigPath, 'utf8'));
@@ -184,9 +190,8 @@ test('setup safely repairs YAML, reuses published images, refreshes private inpu
 });
 
 test('missing revision images build and publish all five once, then verify every registry digest', async t => {
-  await mkdir(output, { mode: 0o700 });
-  t.after(() => rm(output, { force: true, recursive: true }));
   const options = await fixture(t);
+  const { output } = options;
   const m = fake({ missingImages: true });
   const result = await setup({ ...options, skipPreflight: true }, m.runner);
   assert.equal(Object.keys(result.images).length, 5);
@@ -201,9 +206,8 @@ test('missing revision images build and publish all five once, then verify every
 });
 
 test('skip-images and hard provenance failures never trigger builds or overwrite a valid runtime', async t => {
-  await mkdir(output, { mode: 0o700 });
-  t.after(() => rm(output, { force: true, recursive: true }));
   const options = await fixture(t);
+  const { output } = options;
   const result = await setup({ ...options, skipImages: true, skipPreflight: true }, fake().runner);
   const original = await readFile(result.runtimeConfigPath, 'utf8');
   for (const [fault, pattern] of [
@@ -226,8 +230,6 @@ test('skip-images and hard provenance failures never trigger builds or overwrite
 });
 
 test('repositories with only older revision tags build and publish without pre-build manifest lookups', async t => {
-  await mkdir(output, { mode: 0o700 });
-  t.after(() => rm(output, { force: true, recursive: true }));
   const options = await fixture(t);
   const m = fake({ olderTags: true });
   const result = await setup({ ...options, skipPreflight: true }, m.runner);
@@ -242,9 +244,8 @@ test('repositories with only older revision tags build and publish without pre-b
 });
 
 test('real absent-registry failure never becomes missing images or triggers build/publication', async t => {
-  await mkdir(output, { mode: 0o700 });
-  t.after(() => rm(output, { force: true, recursive: true }));
   const options = await fixture(t);
+  const { output } = options;
   const m = fake({ registryAbsent: true });
   await assert.rejects(setup({ ...options, skipPreflight: true }, m.runner), /Could not connect to the registry login server/);
   assert.ok(m.calls.some(c => c.slice(0, 4).join(' ') === 'az acr manifest show-metadata'));
@@ -254,8 +255,6 @@ test('real absent-registry failure never becomes missing images or triggers buil
 });
 
 test('non-READY authority is refused before identity, assertion or image publication', async t => {
-  await mkdir(output, { mode: 0o700 });
-  t.after(() => rm(output, { force: true, recursive: true }));
   const options = await fixture(t);
   const m = fake({ state: 'fenced-v1' });
   await assert.rejects(setup({ ...options, skipImages: true }, m.runner), /ready-v1.*finish provisioning/);
@@ -263,8 +262,6 @@ test('non-READY authority is refused before identity, assertion or image publica
 });
 
 test('operator credential failure is actionable and does not fall back to UAMI or publish images', async t => {
-  await mkdir(output, { mode: 0o700 });
-  t.after(() => rm(output, { force: true, recursive: true }));
   const options = await fixture(t);
   const m = fake({ fail: 'az aks get-credentials' });
   await assert.rejects(setup({ ...options, skipImages: true }, m.runner), /Fetch AKS credentials failed.*aks setup/);
@@ -281,15 +278,28 @@ test('tracked stamp configuration is refused before rewriting or requesting clus
 });
 
 test('generation drift is refused before changing the captured bootstrap file', async t => {
-  await mkdir(output, { mode: 0o700 });
-  t.after(() => rm(output, { force: true, recursive: true }));
+  const options = await fixture(t);
+  const { output } = options;
   await mkdir(resolve(output, 'secrets'), { mode: 0o700 });
   await writeFile(resolve(output, 'secrets/generation'), subscription, { mode: 0o600 });
   const captured = `ARROWCOL_RESET_GENERATION=${subscription}\n`;
   await writeFile(resolve(output, 'bootstrap.env'), captured, { mode: 0o600 });
-  const options = await fixture(t);
   const m = fake();
   await assert.rejects(setup({ ...options, skipImages: true }, m.runner), /different publisher generation/);
   assert.equal(await readFile(resolve(output, 'bootstrap.env'), 'utf8'), captured);
   assert.ok(m.calls.every(c => !c.includes('apply') && !c.includes('token') && !c.includes('push')));
+});
+
+test('independent setup fixtures preserve another private output and its sentinel', async t => {
+  const first = await fixture(t);
+  const second = await fixture(t);
+  assert.notEqual(first.output, second.output);
+  const sentinel = resolve(second.output, 'operator-sentinel');
+  await writeFile(sentinel, 'keep private inputs', { mode: 0o600 });
+  const untouched = await readFile(second.stampConfig, 'utf8');
+  const result = await setup({ ...first, skipImages: true, skipPreflight: true }, fake().runner);
+  assert.equal(result.runtimeConfigPath, resolve(first.output, 'runtime.json'));
+  assert.equal(await readFile(sentinel, 'utf8'), 'keep private inputs');
+  assert.equal(await readFile(second.stampConfig, 'utf8'), untouched);
+  await assert.rejects(readFile(resolve(second.output, 'runtime.json')), { code: 'ENOENT' });
 });

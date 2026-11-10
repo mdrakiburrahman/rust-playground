@@ -49,9 +49,9 @@ function validateOptions(options: Options): void {
     throw new Error('--subscription must be a UUID.');
 }
 
-function assertCleanState(subscription: string): void {
+function assertCleanState(subscription: string, stateDirectory: string): void {
   const stale = ['.env.azure', '.env.azure.tables.json'].map(name => path.join(ROOT, name))
-    .concat(['runtime.json', 'bootstrap.env', 'aks.env', 'oat-config.aks.json', 'secrets'].map(name => path.join(STATE, name)))
+    .concat(['runtime.json', 'bootstrap.env', 'aks.env', 'oat-config.aks.json', 'secrets'].map(name => path.join(stateDirectory, name)))
     .filter(filename => fs.existsSync(filename));
   if (stale.length) throw new Error(`Generated state already exists (${stale.map(filename => path.relative(ROOT, filename)).join(', ')}). ` +
     `Refusing to overwrite it. Run: ${destroyCommand(subscription)}`);
@@ -63,7 +63,9 @@ function privateWrite(filename: string, contents: string): void {
   fs.chmodSync(filename, 0o600);
 }
 
-export async function deployInfrastructure(options: Options, runner: typeof run_tree = run_tree): Promise<DeployResult> {
+export async function deployInfrastructure(
+  options: Options, runner: typeof run_tree = run_tree, stateDirectory = STATE,
+): Promise<DeployResult> {
   validateOptions(options);
   const configPath = path.resolve(ROOT, options.stampConfig ?? 'infra/azure/stamp.yaml');
   const config = loadStampConfig(configPath);
@@ -106,7 +108,7 @@ export async function deployInfrastructure(options: Options, runner: typeof run_
     const resources = list(await az('resource', 'list', '--resource-group', GROUP), 'resource inventory');
     if (resources.length) throw new Error(`Partial stamp resources already exist; refusing to reuse live names. Run: ${destroyCommand(subscription)}`);
   }
-  if (!options.whatIf) assertCleanState(subscription);
+  if (!options.whatIf) assertCleanState(subscription, stateDirectory);
 
   let stamp = String(options.stamp ?? pickStamp());
   let available = false;
@@ -141,14 +143,14 @@ export async function deployInfrastructure(options: Options, runner: typeof run_
     ...new Config({ AZURE_SUBSCRIPTION_ID: subscription }, selected).generated(),
     AZURE_SUBSCRIPTION_ID: subscription, AZURE_UAMI_CLIENT_ID: '', ARROWCOL_RESET_GENERATION: '',
   };
-  fs.mkdirSync(STATE, { recursive: true, mode: 0o700 });
-  const work = fs.mkdtempSync(path.join(STATE, '.deploy-'));
+  fs.mkdirSync(stateDirectory, { recursive: true, mode: 0o700 });
+  const work = fs.mkdtempSync(path.join(stateDirectory, '.deploy-'));
   fs.chmodSync(work, 0o700);
   const candidatePath = path.join(work, 'stamp.yaml');
   privateWrite(candidatePath, renderStampConfig(original, { stamp, network }));
   const bootstrap = (command: string, filename: string) =>
     ['npx', '--no-install', 'tsx', 'infra/azure/bootstrap.ts', command, '--stamp-config', filename];
-  const receiptPath = path.join(STATE, 'receipts', `deploy-${stamp}.yaml`);
+  const receiptPath = path.join(stateDirectory, 'receipts', `deploy-${stamp}.yaml`);
   const attempts: DeployAttempt[] = [];
   const postconditions: Record<string, boolean> = {};
   const receipt: Json = { stamp, subscription, resourceGroup: GROUP, whatIf: options.whatIf ?? false,
@@ -308,11 +310,13 @@ async function verifyPostconditions(config: StampConfig, az: (...args: string[])
   if (failed.length) throw new Error(`Deployment postconditions failed: ${failed.join(', ')}.`);
 }
 
-export async function deploy(options: Options, runner: typeof run_tree = run_tree): Promise<DeployResult> {
-  const result = await deployInfrastructure(options, runner);
+export async function deploy(
+  options: Options, runner: typeof run_tree = run_tree, stateDirectory = STATE,
+): Promise<DeployResult> {
+  const result = await deployInfrastructure(options, runner, stateDirectory);
   if (!options.whatIf) {
     try {
-      result.setup = await setup({ stamp: result.stamp, stampConfig: options.stampConfig }, runner);
+      result.setup = await setup({ stamp: result.stamp, stampConfig: options.stampConfig }, runner, stateDirectory);
       if (!result.setup.preflightReady) throw new Error('Setup did not reach preflight READY.');
     } catch (error) {
       const document = parseDocument(fs.readFileSync(result.receiptPath, 'utf8'));
