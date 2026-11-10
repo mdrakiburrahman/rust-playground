@@ -4,12 +4,13 @@ import path from 'node:path';
 import test from 'node:test';
 import { parse, stringify } from 'yaml';
 import { ROOT, run_tree } from '../../infra/azure/bootstrap.js';
-import { publishImages } from './publish-images.js';
+import { buildLocalImages, MissingPublishedImagesError, publishClientImage, publishImages, readPublishedImages } from './publish-images.js';
 import { validateRuntime } from './runtime.js';
 
 const client = '00000000-0000-0000-0000-000000000002';
 const subscription = '00000000-0000-0000-0000-000000000001';
 const digest = `sha256:${'a'.repeat(64)}`;
+const revision = '0123456789abcdef0123456789abcdef01234567';
 
 function fixture(t: test.TestContext) {
   const root = path.join(ROOT, 'out', 'arrowcol-oat-publish-tests');
@@ -39,17 +40,32 @@ function fixture(t: test.TestContext) {
   return options;
 }
 
-function mock(registry: string, fault?: 'identity' | 'digest' | 'architecture') {
+function mock(registry: string, fault?: 'identity' | 'digest' | 'architecture' | 'missing' | 'provenance' | 'local-provenance') {
   const calls: string[][] = [];
   let azure = '';
   let docker = '';
   const runner: typeof run_tree = async (command, _timeout, _cwd, env) => {
     calls.push(command);
     let stdout = '';
-    if (command[0] === 'git') stdout = command[1] === 'rev-parse' ? '0123456789ab' : '';
-    else if (command[0] === 'docker' && command[1] === 'image') stdout = fault === 'architecture' ? 'linux/arm64' : 'linux/amd64';
-    else if (command[0] === 'docker') {
-      assert.ok(['tag', 'push'].includes(command[1]));
+    let stderr = '';
+    let returncode = 0;
+    if (command[0] === 'git') {
+      if (command[1] === 'rev-parse') stdout = command.includes('--short=12') ? revision.slice(0, 12) : revision;
+    } else if (command[0] === 'docker' && command[1] === 'image') {
+      if (command[2] === 'inspect' && command.includes('{{json .}}')) {
+        const reference = command.at(-1)!;
+        const repo = reference.startsWith(`${registry}.azurecr.io/`) ? reference.split('/').at(-1)!.split(':')[0] : '';
+        stdout = JSON.stringify({
+          Os: fault === 'architecture' ? 'linux' : 'linux', Architecture: fault === 'architecture' ? 'arm64' : 'amd64',
+          Config: { Labels: { 'org.opencontainers.image.revision': fault === 'provenance' || (fault === 'local-provenance' && !repo) ? subscription : revision } },
+          ...(repo ? { RepoDigests: [`${registry}.azurecr.io/${repo}@${digest}`] } : {}),
+        });
+      } else stdout = fault === 'architecture' ? 'linux/arm64' : 'linux/amd64';
+    } else if (command[0] === 'docker' && command[1] === 'buildx') {
+      assert.equal(command[2], 'build');
+      assert.ok(command.includes('--load'));
+    } else if (command[0] === 'docker') {
+      assert.ok(['tag', 'push', 'pull'].includes(command[1]));
       assert.equal(env?.AZURE_CONFIG_DIR, azure);
       assert.equal(env?.DOCKER_CONFIG, docker);
     } else if (command[1] === 'aks') stdout = 'stamp.example.com';
@@ -72,13 +88,18 @@ function mock(registry: string, fault?: 'identity' | 'digest' | 'architecture') 
       assert.equal(env?.AZURE_CONFIG_DIR, azure);
       assert.equal(env?.DOCKER_CONFIG, docker);
       if (command[2] === 'show') stdout = `${registry}.azurecr.io`;
-      if (command[2] === 'manifest') stdout = fault === 'digest' ? 'not-a-digest' : digest;
+      if (command[2] === 'manifest') {
+        const name = command[command.indexOf('--name') + 1];
+        if (fault === 'missing' && name.startsWith('arrowcol-oat-client:')) {
+          returncode = 1;
+          stderr = `MANIFEST_UNKNOWN: manifest tagged by '${name}' is not found`;
+        } else stdout = fault === 'digest' ? 'not-a-digest' : digest;
+      }
     } else throw new Error(`Unexpected operation ${command.slice(0, 3).join(' ')}`);
-    return { returncode: 0, stdout, stderr: '' };
+    return { returncode, stdout, stderr };
   };
   return { calls, runner, cache: () => path.dirname(azure) };
 }
-
 test('publishes four existing images as federated UAMI without applying identity and pins the ignored config', async t => {
   const options = fixture(t);
   const m = mock(options.registry);
@@ -142,4 +163,64 @@ test('requires federation, matching runtime subject and all amd64 images before 
   config.serviceAccount = 'different';
   fs.writeFileSync(options.runtimeConfig, JSON.stringify(config));
   await assert.rejects(publishImages(options, m.runner), /reuse the selected stamp/);
+});
+
+
+test('builds all five local images for linux/amd64 with the full revision label', async () => {
+  const calls: string[][] = [];
+  const runner: typeof run_tree = async command => { calls.push(command); return { returncode: 0, stdout: '', stderr: '' }; };
+  await buildLocalImages({ revision }, runner);
+  assert.equal(calls.length, 5);
+  assert.ok(calls.every(c => c.slice(0, 3).join(' ') === 'docker buildx build' && c.includes('linux/amd64') && c.includes('--load')));
+  assert.ok(calls.every(c => c.includes(`org.opencontainers.image.revision=${revision}`)));
+  assert.deepEqual(calls.map(c => c[c.indexOf('--tag') + 1]), [
+    'arrowcol-oat/sqlserver:local', 'arrowcol-oat/catalog:local', 'arrowcol-oat/router:local',
+    'arrowcol-oat/dataflow:local', 'arrowcol-oat/client:local',
+  ]);
+  calls.length = 0;
+  await assert.rejects(buildLocalImages({ revision: 'abc' }, runner), /full 40-character/);
+  assert.equal(calls.length, 0);
+});
+
+test('publishes the revision-proven client image as a digest-pinned ACR reference', async t => {
+  const options = fixture(t);
+  const m = mock(options.registry);
+  const image = await publishClientImage(options, m.runner);
+  assert.equal(image, `${options.registry}.azurecr.io/arrowcol-oat-client@${digest}`);
+  assert.ok(m.calls.some(c => c[0] === 'docker' && c[1] === 'push' && c[2].endsWith(`:oat-${revision}`)));
+  assert.equal(m.calls.filter(c => c[0] === 'docker' && c[1] === 'push').length, 1);
+  assert.ok(!m.calls.some(c => c[1] === 'apply' || c[1] === 'buildx'));
+  assert.equal(fs.existsSync(m.cache()), false);
+});
+
+test('reads and verifies all five revision tags without building or pushing', async t => {
+  const options = fixture(t);
+  const m = mock(options.registry);
+  const result = await readPublishedImages({ ...options, revision }, m.runner);
+  assert.deepEqual(result, {
+    images: {
+      sqlserver: `${options.registry}.azurecr.io/arrowcol-sqlserver@${digest}`,
+      catalog: `${options.registry}.azurecr.io/arrowcol-catalog-rust@${digest}`,
+      router: `${options.registry}.azurecr.io/arrowcol-router-rust@${digest}`,
+      dataflow: `${options.registry}.azurecr.io/arrowcol-dataflow-rust@${digest}`,
+    },
+    client: `${options.registry}.azurecr.io/arrowcol-oat-client@${digest}`,
+  });
+  assert.equal(m.calls.filter(c => c[0] === 'docker' && c[1] === 'pull').length, 5);
+  assert.ok(!m.calls.some(c => c[0] === 'docker' && ['buildx', 'push', 'tag'].includes(c[1])));
+  assert.ok(m.calls.filter(c => c[0] === 'az' && c[2] === 'manifest').every(c => c.includes(`oat-${revision}`)));
+});
+
+test('reports absent revision tags distinctly while provenance mismatches fail closed', async t => {
+  const options = fixture(t);
+  const missing = mock(options.registry, 'missing');
+  await assert.rejects(readPublishedImages({ ...options, revision }, missing.runner), error => {
+    assert.ok(error instanceof MissingPublishedImagesError);
+    assert.deepEqual(error.missingRoles, ['client']);
+    return true;
+  });
+  assert.ok(!missing.calls.some(c => c[0] === 'docker' && ['buildx', 'push'].includes(c[1])));
+  const badProvenance = mock(options.registry, 'provenance');
+  await assert.rejects(readPublishedImages({ ...options, revision }, badProvenance.runner), /revision provenance does not match/);
+  assert.ok(!badProvenance.calls.some(c => c[0] === 'docker' && ['buildx', 'push'].includes(c[1])));
 });
