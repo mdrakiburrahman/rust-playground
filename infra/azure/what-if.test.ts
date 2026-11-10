@@ -84,9 +84,16 @@ test('provision previews and creates with the identical parameter file and resol
 
 for (const scenario of [
   { name: 'missing change list', result: {} },
-  { name: 'unsupported resource change', result: { changes: [{ changeType: 'Unsupported', resourceId: '/subscriptions/' + subscription + '/providers/Microsoft.Test/items/x' }] } },
+  { name: 'unsupported resource change', result: { changes: [{ changeType: 'Unsupported', resourceId: '/subscriptions/' + subscription + '/resourceGroups/arrow-collector-rg/providers/Microsoft.Kusto/clusters/arrow-collector-89152' }] } },
   { name: 'missing resource identifier', result: { changes: [{ changeType: 'Create' }] } },
   { name: 'incomplete preview status', result: { status: 'Running', changes: [] } },
+  { name: 'Delete change', result: { changes: [{ changeType: 'Delete', resourceId: '/subscriptions/' + subscription + '/resourceGroups/arrow-collector-rg/providers/Microsoft.Kusto/clusters/arrow-collector-89152' }] } },
+  { name: 'resource in another resource group', result: { changes: [{ changeType: 'Create', resourceId: '/subscriptions/' + subscription + '/resourceGroups/other-rg/providers/Microsoft.Kusto/clusters/other' }] } },
+  { name: 'resource in another subscription', result: { changes: [{ changeType: 'Create', resourceId: '/subscriptions/00000000-0000-0000-0000-000000000002/resourceGroups/arrow-collector-rg/providers/Microsoft.Kusto/clusters/other' }] } },
+  { name: 'unexpected resource type', result: { changes: [{ changeType: 'Create', resourceId: '/subscriptions/' + subscription + '/resourceGroups/arrow-collector-rg/providers/Microsoft.Test/items/x' }] } },
+  { name: 'Modify property removal', result: { changes: [{ changeType: 'Modify', resourceId: '/subscriptions/' + subscription + '/resourceGroups/arrow-collector-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/arrow-collector', delta: [{ propertyPath: 'tags.retired', before: 'old', after: null }] }] } },
+  { name: 'whole tags object removal', result: { changes: [{ changeType: 'Modify', resourceId: '/subscriptions/' + subscription + '/resourceGroups/arrow-collector-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/arrow-collector', delta: [{ propertyPath: 'tags', before: { retired: 'old' }, after: {} }] }] } },
+  { name: 'replacement-sensitive Modify', result: { changes: [{ changeType: 'Modify', resourceId: '/subscriptions/' + subscription + '/resourceGroups/arrow-collector-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/arrow-collector', delta: [{ propertyPath: 'location', before: 'eastus2', after: 'canadacentral' }] }] } },
 ]) {
   test('provision refuses ' + scenario.name + ' before create', async () => {
     const stamp = defaultStampConfig({ AZURE_STAMP: '89152' });
@@ -94,12 +101,46 @@ for (const scenario of [
     const azure = new Azure(new Config({ AZURE_SUBSCRIPTION_ID: subscription }, stamp));
     azure.arm = async () => null;
     const calls: string[] = [];
+    const logs: string[] = [];
+    const originalLog = console.log;
+    console.log = (...values) => logs.push(values.join(' '));
     azure.cli = async (...args) => { calls.push(args[2]!); return scenario.result; };
-    await assert.rejects(provision(azure, '', 0, '/tmp/arrowcol-preview-test-output', true, {}, true),
-      error => error instanceof ArmPreviewFailure);
+    try {
+      await assert.rejects(provision(azure, '', 0, '/tmp/arrowcol-preview-test-output', true, {}, true), error => {
+        if (!(error instanceof ArmPreviewFailure)) return false;
+        assert.doesNotMatch(error.message, /\/subscriptions\//);
+        return true;
+      });
+    } finally { console.log = originalLog; }
     assert.deepEqual(calls, ['what-if']);
+    assert.equal(logs.some(line => line.startsWith('ARM_PREVIEW_VERIFIED')), false);
   });
 }
+
+test('provision allows complete non-destructive Modify deltas on the resource group and shared UAMI', async () => {
+  const stamp = defaultStampConfig({ AZURE_STAMP: '89152' });
+  stamp.subscription = subscription;
+  const azure = new Azure(new Config({ AZURE_SUBSCRIPTION_ID: subscription }, stamp));
+  azure.arm = async () => null;
+  const calls: string[] = [];
+  const logs: string[] = [];
+  const originalLog = console.log;
+  console.log = (...values) => logs.push(values.join(' '));
+  azure.cli = async (...args) => {
+    calls.push(args[2]!);
+    if (args[2] === 'what-if') return { changes: [
+      { changeType: 'Modify', resourceId: '/subscriptions/' + subscription + '/resourceGroups/arrow-collector-rg',
+        delta: [{ propertyPath: 'tags.owner', before: 'previous', after: 'current' }] },
+      { changeType: 'Modify', resourceId: '/subscriptions/' + subscription + '/resourceGroups/arrow-collector-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/arrow-collector',
+        delta: [{ propertyPath: 'tags.owner', before: 'previous', after: 'current' }] },
+    ] };
+    throw new Failure('DeploymentFailed: simulated create rejection');
+  };
+  try { await assert.rejects(provision(azure, '', 0, '/tmp/arrowcol-preview-test-output', true, {}, true), /DeploymentFailed/); }
+  finally { console.log = originalLog; }
+  assert.deepEqual(calls, ['what-if', 'create']);
+  assert.ok(logs.some(line => line.startsWith('ARM_PREVIEW_VERIFIED ') && line.endsWith(' changes=2')));
+});
 
 test('provision treats a timed-out ARM what-if as a preview failure before create', async () => {
   const stamp = defaultStampConfig({ AZURE_STAMP: '89152' });

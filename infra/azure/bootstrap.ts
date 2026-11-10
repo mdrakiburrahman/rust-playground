@@ -822,7 +822,86 @@ export async function checkpoint_container(azure: Azure): Promise<any> {
 const ARM_WHAT_IF_CHANGE_TYPES = new Set([
   'Create', 'Delete', 'Modify', 'NoChange', 'Ignore', 'Deploy', 'NoEffect', 'Unsupported',
 ]);
-function verified_arm_what_if_changes(result: unknown): number {
+const ARM_WHAT_IF_RESOURCE_TYPES = new Set([
+  'microsoft.authorization/roleassignments',
+  'microsoft.containerregistry/registries',
+  'microsoft.containerservice/managedclusters',
+  'microsoft.insights/diagnosticsettings',
+  'microsoft.kusto/clusters',
+  'microsoft.kusto/clusters/databases',
+  'microsoft.kusto/clusters/databases/principalassignments',
+  'microsoft.kusto/clusters/principalassignments',
+  'microsoft.managedidentity/userassignedidentities',
+  'microsoft.managedidentity/userassignedidentities/federatedidentitycredentials',
+  'microsoft.network/networksecuritygroups',
+  'microsoft.network/publicipprefixes',
+  'microsoft.network/virtualnetworks',
+  'microsoft.network/virtualnetworks/subnets',
+  'microsoft.operationalinsights/workspaces',
+  'microsoft.resources/deployments',
+  'microsoft.storage/storageaccounts',
+  'microsoft.storage/storageaccounts/blobservices',
+  'microsoft.storage/storageaccounts/blobservices/containers',
+]);
+const ARM_WHAT_IF_REMOVED_VALUES = new Set(['<null>', '<deleted>', '<removed>', '<not specified>']);
+function verified_arm_what_if_resource_scope(resourceId: string, config: Config): void {
+  const base = config.base;
+  if (resourceId.trim() !== resourceId || resourceId.includes('?') || resourceId.includes('#'))
+    throw new Failure('ARM what-if returned an invalid resource identifier.');
+  if (resourceId.toLowerCase() === base.toLowerCase()) return;
+  const prefix = base + '/providers/';
+  if (!resourceId.toLowerCase().startsWith(prefix.toLowerCase()))
+    throw new Failure('ARM what-if contains a resource outside the selected subscription and resource group.');
+  const segments = resourceId.slice(prefix.length).split('/');
+  if (segments.length < 3 || (segments.length - 1) % 2 !== 0 || segments.some(segment => !segment))
+    throw new Failure('ARM what-if returned an invalid resource identifier.');
+  const resourceType = [segments[0], ...segments.slice(1).filter((_, index) => index % 2 === 0)].join('/').toLowerCase();
+  if (!ARM_WHAT_IF_RESOURCE_TYPES.has(resourceType))
+    throw new Failure('ARM what-if contains a resource type outside the allowed deployment templates.');
+}
+function arm_what_if_value_removed(before: unknown, after: unknown): boolean {
+  if (before !== undefined && before !== null && (after === null ||
+      (typeof after === 'string' && ARM_WHAT_IF_REMOVED_VALUES.has(after.trim().toLowerCase()) && before !== after)))
+    return true;
+  if (Array.isArray(before) && Array.isArray(after)) {
+    if (after.length < before.length) return true;
+    return before.some((value, index) => arm_what_if_value_removed(value, after[index]));
+  }
+  if (before && after && typeof before === 'object' && typeof after === 'object' &&
+      !Array.isArray(before) && !Array.isArray(after)) {
+    const previous = before as Record<string, unknown>;
+    const next = after as Record<string, unknown>;
+    return Object.entries(previous).some(([key, value]) =>
+      !Object.prototype.hasOwnProperty.call(next, key) || arm_what_if_value_removed(value, next[key]));
+  }
+  return false;
+}
+function arm_what_if_tag_property(propertyPath: string): boolean {
+  const path = propertyPath.toLowerCase();
+  return path === 'tags' || path.startsWith('tags.') || path.startsWith('tags/') || path.startsWith('tags[');
+}
+function verify_arm_what_if_modify(item: Record<string, unknown>): void {
+  if (!Array.isArray(item.delta) || item.delta.length === 0)
+    throw new Failure('ARM what-if Modify has no verifiable property delta.');
+  for (const value of item.delta) {
+    if (!value || typeof value !== 'object' || Array.isArray(value))
+      throw new Failure('ARM what-if Modify has an invalid property delta.');
+    const delta = value as Record<string, unknown>;
+    if (typeof delta.propertyPath !== 'string' || !delta.propertyPath.trim() ||
+        !Object.prototype.hasOwnProperty.call(delta, 'before') ||
+        !Object.prototype.hasOwnProperty.call(delta, 'after'))
+      throw new Failure('ARM what-if Modify has an incomplete property delta.');
+    if (delta.propertyPath.trim().toLowerCase() === 'tags' &&
+        (delta.after === null || typeof delta.after !== 'object' || Array.isArray(delta.after) ||
+         (delta.before !== null && typeof delta.before !== 'object')))
+      throw new Failure('ARM what-if Modify has an unverifiable tags object.');
+    if (arm_what_if_value_removed(delta.before, delta.after))
+      throw new Failure('ARM what-if Modify removes an existing property.');
+    if (!arm_what_if_tag_property(delta.propertyPath))
+      throw new Failure('ARM what-if Modify changes a non-tag property.');
+  }
+}
+function verified_arm_what_if_changes(result: unknown, config: Config): number {
   if (!result || typeof result !== 'object' || Array.isArray(result))
     throw new Failure('ARM what-if returned an unverifiable response object.');
   const response = result as Record<string, unknown>;
@@ -833,10 +912,13 @@ function verified_arm_what_if_changes(result: unknown): number {
     if (!change || typeof change !== 'object' || Array.isArray(change))
       throw new Failure('ARM what-if returned an unverifiable resource change.');
     const item = change as Record<string, unknown>;
-    if (typeof item.resourceId !== 'string' || !item.resourceId.startsWith('/subscriptions/') ||
+    if (typeof item.resourceId !== 'string' ||
         typeof item.changeType !== 'string' || !ARM_WHAT_IF_CHANGE_TYPES.has(item.changeType))
       throw new Failure('ARM what-if returned an unverifiable resource change.');
+    verified_arm_what_if_resource_scope(item.resourceId, config);
+    if (item.changeType === 'Delete') throw new Failure('ARM what-if contains a resource deletion.');
     if (item.changeType === 'Unsupported') throw new Failure('ARM what-if contains an unsupported resource change.');
+    if (item.changeType === 'Modify') verify_arm_what_if_modify(item);
   }
   return response.changes.length;
 }
@@ -881,7 +963,7 @@ export async function deploy(azure: Azure, fresh?: Metadata, whatIf = false, pre
     if (whatIf || previewBeforeCreate) {
       try {
         const result = await invoke('what-if');
-        const changes = verified_arm_what_if_changes(result);
+        const changes = verified_arm_what_if_changes(result, c);
         if (whatIf) console.log(JSON.stringify(result, null, 2));
         if (previewBeforeCreate) {
           if (canonical_json(resolvedExisting(await guard_existing(azure))) !== canonical_json(existingParameters))

@@ -58,7 +58,7 @@ schema-evolution mode's region boundary is unchanged.
 ```bash
 npx --no-install tsx infra/azure/bootstrap.ts config --stamp-config infra/azure/stamp.yaml
 npx --no-install tsx infra/azure/bootstrap.ts preflight --stamp-config infra/azure/stamp.yaml
-npx --no-install tsx infra/azure/bootstrap.ts provision --stamp-config infra/azure/stamp.yaml
+npx --no-install tsx infra/azure/bootstrap.ts provision --stamp-config infra/azure/stamp.yaml --preview-before-create
 ```
 
 `provision` applies subnet Network Contributor, AKS control-plane/kubelet
@@ -67,14 +67,19 @@ QAP service-account federated credential automatically. The QAP pod receives
 only generated resource settings and the reset-generation secret; it does not
 mount the operator's Azure CLI cache or credentials.
 
-`npx --no-install arrowcol-oat aks deploy` runs a read-only ARM what-if immediately
-before every create attempt, including the Azure dataplane attempt and any allowed
-Cilium or convergence retry. Bootstrap reuses the same resolved stamp, reset
-authority, resource-group/UAMI locations and tags, template path, and private
-parameter file for each preview and its create. A failed, timed-out, or
-unverifiable preview stops before create and cannot trigger network fallback;
-only a proven AKS-only creation failure can permit one Cilium retry, which gets
-its own preview. The standalone `aks deploy --what-if` command remains read-only.
+`npx --no-install arrowcol-oat aks deploy` automatically runs a read-only ARM
+what-if immediately before every create attempt, including the Azure dataplane
+attempt and any allowed Cilium or convergence retry. Bootstrap reuses the same
+resolved stamp, reset authority, resource-group/UAMI locations and tags, template
+path, and private parameter file for each preview and its create. A failed,
+timed-out, or unverified preview stops before creation and cannot trigger network
+fallback. The validator rejects deletions, resource IDs outside the selected
+subscription/resource group, unexpected resource types, and Modify changes that
+remove properties or change anything other than tags. Complete tag-only Modify
+deltas remain allowed for existing resource-group and shared-identity metadata.
+The direct `bootstrap.ts provision` command requires
+`--preview-before-create` to enable this guard. The standalone
+`aks deploy --what-if` command remains read-only.
 
 In stamped mode, the shared runtime UAMI also has container-scoped Blob Data
 Contributor on the stamp's data container for catalog and DFE writes, plus the
