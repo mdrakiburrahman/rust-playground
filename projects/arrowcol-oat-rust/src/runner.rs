@@ -31,6 +31,9 @@ use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 use url::Url;
 
+#[cfg(test)]
+include!("runner_failure_tests.rs");
+
 #[derive(Clone, Debug)]
 struct OatResult {
     run_id: String,
