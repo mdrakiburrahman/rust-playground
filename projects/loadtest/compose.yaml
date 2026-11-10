@@ -151,6 +151,8 @@ services:
     secrets:
       - source: edge_hmac
         target: edge-hmac
+      - source: internal_hmac
+        target: internal-hmac
     volumes:
       - type: bind
         source: ${OAT_CONTROL_HOST_PATH:-/dev/null}

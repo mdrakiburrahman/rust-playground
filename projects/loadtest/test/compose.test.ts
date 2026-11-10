@@ -193,6 +193,11 @@ test('catalog DDL verifier uses the shared internal HMAC secret', () => {
     typeof secret !== 'string' && secret.source === 'internal_hmac' && secret.target === 'internal-hmac'));
 });
 
+test('OAT client mounts the shared internal HMAC secret for catalog DDL', () => {
+  assert.ok(compose.services['oat-client'].secrets?.some(secret =>
+    typeof secret !== 'string' && secret.source === 'internal_hmac' && secret.target === 'internal-hmac'));
+});
+
 test('host loadgen uses default-loopback ports while container loadgen uses Compose endpoints', () => {
   assert.deepEqual(compose.services['arrowcol-catalog'].ports,
     [`${bindHost}:\${LOADTEST_CATALOG_PORT:-18817}:8817`]);
