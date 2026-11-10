@@ -49,15 +49,16 @@ struct OatResult {
     table_owner: Option<String>,
     pinning_ok: bool,
     pinning_error: Option<String>,
+    failure: Option<String>,
     status: String,
     git_sha: String,
     tunables_json: String,
     replicas: u64,
     dfe_worker_concurrency: u64,
     table: String,
-    rows: u64,
-    duration_ms: u64,
-    rows_per_second: f64,
+    rows: Option<u64>,
+    duration_ms: Option<u64>,
+    rows_per_second: Option<f64>,
     cpu_millicores: Option<f64>,
     memory_bytes: Option<u64>,
     qap: QapMetrics,
@@ -1290,21 +1291,56 @@ pub async fn execute(config: OatConfig, id: &str, state: Arc<AppState>) -> Resul
         })
         .await;
 
-    let results = run_matrix(&config, id, &state).await?;
+    let outcome = run_matrix(&config, id, &state).await;
 
     state
         .update(id, |status| {
             status.progress = "writing compact Parquet results".to_owned()
         })
         .await;
-    publish_results(&config, &results).await?;
-    if let Some(violation) = results.iter().find_map(|row| row.pinning_error.as_deref()) {
-        bail!("pinning_violation: {violation}");
-    }
-    Ok(results.len())
+    let result_count = outcome.rows.len();
+    publish_matrix_outcome(&config, outcome).await?;
+    Ok(result_count)
 }
 
-async fn run_matrix(config: &OatConfig, orchestration_id: &str, state: &AppState) -> Result<Vec<OatResult>> {
+struct MatrixOutcome {
+    rows: Vec<OatResult>,
+    error: Option<anyhow::Error>,
+}
+
+async fn publish_matrix_outcome(config: &OatConfig, outcome: MatrixOutcome) -> Result<()> {
+    let publication = publish_results(config, &outcome.rows).await;
+    match (outcome.error, publication) {
+        (None, result) => result,
+        (Some(error), Ok(())) => Err(error),
+        (Some(error), Err(publication_error)) => Err(error.context(format!(
+            "publishing retained matrix evidence also failed: {publication_error:#}"
+        ))),
+    }
+}
+
+async fn run_matrix(config: &OatConfig, orchestration_id: &str, state: &AppState) -> MatrixOutcome {
+    run_matrix_with(
+        config,
+        orchestration_id,
+        state,
+        |cell_config, run_id, replicas, concurrency| {
+            run_isolated_cell(cell_config, orchestration_id, run_id, replicas, concurrency)
+        },
+    )
+    .await
+}
+
+async fn run_matrix_with<F, Fut>(
+    config: &OatConfig,
+    orchestration_id: &str,
+    state: &AppState,
+    mut run_cell: F,
+) -> MatrixOutcome
+where
+    F: FnMut(OatConfig, String, u32, u32) -> Fut,
+    Fut: std::future::Future<Output = MatrixOutcome>,
+{
     let mut results = Vec::new();
     let cells = matrix_cell_specs(config);
     let total = cells.len();
@@ -1317,42 +1353,163 @@ async fn run_matrix(config: &OatConfig, orchestration_id: &str, state: &AppState
                 );
             })
             .await;
-        let cell_config = config_for_run(config, &run_id)?;
-        let mut platform = platform_for_run(&cell_config, &run_id)?;
-        if let Err(prepare_error) = platform.ensure_stack(&cell_config).await {
-            let cleanup_error = platform.cleanup(&cell_config).await;
-            return match cleanup_error {
-                Ok(()) => Err(prepare_error).context("prepare isolated OAT matrix-cell platform"),
-                Err(cleanup_error) => Err(prepare_error.context(format!(
-                    "platform cleanup after preparation also failed: {cleanup_error:#}"
-                ))),
+        let mut cell = match config_for_run(config, &run_id) {
+            Ok(cell_config) => run_cell(cell_config, run_id.clone(), replicas, concurrency).await,
+            Err(error) => finish_matrix_cell(
+                config,
+                orchestration_id,
+                &run_id,
+                replicas,
+                concurrency,
+                Err(error),
+                Ok(()),
+            ),
+        };
+        results.append(&mut cell.rows);
+        if cell.error.is_some() {
+            return MatrixOutcome {
+                rows: results,
+                error: cell.error,
             };
         }
-        let cell_result = run_matrix_cell(
-            &cell_config,
-            orchestration_id,
-            &run_id,
-            replicas,
-            concurrency,
-            platform.as_mut(),
-        )
-        .await;
-        let cleanup_result = platform.cleanup(&cell_config).await;
-        let mut cell_rows = match (cell_result, cleanup_result) {
-            (Ok(rows), Ok(())) => rows,
-            (Err(run_error), Ok(())) => return Err(run_error),
-            (Ok(_), Err(cleanup_error)) => return Err(cleanup_error).context("clean up isolated matrix-cell platform"),
-            (Err(run_error), Err(cleanup_error)) => {
-                return Err(run_error.context(format!("matrix-cell platform cleanup also failed: {cleanup_error:#}")));
+    }
+    MatrixOutcome {
+        rows: results,
+        error: None,
+    }
+}
+
+async fn run_isolated_cell(
+    config: OatConfig,
+    orchestration_id: &str,
+    run_id: String,
+    replicas: u32,
+    concurrency: u32,
+) -> MatrixOutcome {
+    let mut platform = match platform_for_run(&config, &run_id) {
+        Ok(platform) => platform,
+        Err(error) => {
+            return finish_matrix_cell(
+                &config,
+                orchestration_id,
+                &run_id,
+                replicas,
+                concurrency,
+                Err(error),
+                Ok(()),
+            );
+        }
+    };
+    let result = match platform.ensure_stack(&config).await {
+        Ok(()) => {
+            run_matrix_cell(
+                &config,
+                orchestration_id,
+                &run_id,
+                replicas,
+                concurrency,
+                platform.as_mut(),
+            )
+            .await
+        }
+        Err(error) => Err(error).context("prepare isolated OAT matrix-cell platform"),
+    };
+    let cleanup = platform.cleanup(&config).await;
+    finish_matrix_cell(
+        &config,
+        orchestration_id,
+        &run_id,
+        replicas,
+        concurrency,
+        result,
+        cleanup,
+    )
+}
+
+fn finish_matrix_cell(
+    config: &OatConfig,
+    orchestration_id: &str,
+    run_id: &str,
+    replicas: u32,
+    concurrency: u32,
+    result: Result<Vec<OatResult>>,
+    cleanup: Result<()>,
+) -> MatrixOutcome {
+    let (mut rows, mut error) = match result {
+        Ok(rows) => {
+            let error = rows
+                .iter()
+                .find_map(|row| row.failure.as_deref())
+                .map(|error| anyhow::anyhow!("{error}"));
+            (rows, error)
+        }
+        Err(error) => {
+            let rows = (|| {
+                let started_at_ms =
+                    i64::try_from(unix_time_ms()).context("failed cell timestamp exceeds Arrow timestamp range")?;
+                result_rows(
+                    config,
+                    orchestration_id,
+                    run_id,
+                    replicas,
+                    concurrency,
+                    CellMeasurements {
+                        clients: ClientRun {
+                            metrics: HashMap::new(),
+                            pinning: PinningReport::default(),
+                            qap_tables: Vec::new(),
+                            failure: Some(format!("{error:#}")),
+                        },
+                        started_at_ms,
+                        qap: QapMetrics::default(),
+                        resources: None,
+                    },
+                )
+            })();
+            match rows {
+                Ok(rows) => (rows, Some(error)),
+                Err(record_error) => (
+                    Vec::new(),
+                    Some(error.context(format!("recording failed cell also failed: {record_error:#}"))),
+                ),
             }
-        };
-        let pinning_failed = cell_rows.iter().any(|row| !row.pinning_ok);
-        results.append(&mut cell_rows);
-        if pinning_failed {
-            break;
+        }
+    };
+    if let Err(cleanup_error) = cleanup {
+        let detail = format!("clean up isolated matrix-cell platform: {cleanup_error:#}");
+        error = Some(match error {
+            Some(error) => error.context(detail.clone()),
+            None => anyhow::anyhow!("{detail}"),
+        });
+        for row in &mut rows {
+            row.status = if row.pinning_error.is_some() {
+                "pinning_violation"
+            } else {
+                "failed"
+            }
+            .to_owned();
+            let failure = row
+                .failure
+                .as_ref()
+                .map_or_else(|| detail.clone(), |failure| format!("{failure}; {detail}"));
+            row.failure = Some(failure.clone());
+            // This JSON was constructed in result_rows; retain the failure beside the original tunables.
+            match serde_json::from_str::<Value>(&row.tunables_json) {
+                Ok(mut tunables) => {
+                    tunables["failure"] = Value::String(failure);
+                    row.tunables_json = tunables.to_string();
+                }
+                Err(cause) => {
+                    if let Some(original) = error.take() {
+                        error = Some(original.context(format!(
+                            "attaching cleanup failure to result tunables also failed: {cause}"
+                        )));
+                    }
+                }
+            }
         }
     }
-    Ok(results)
+    MatrixOutcome { rows, error }
 }
 
 fn matrix_cell_specs(config: &OatConfig) -> Vec<(u32, u32, String)> {
@@ -1564,7 +1721,68 @@ async fn run_matrix_cell(
         )
         .await?;
     let started_at_ms = i64::try_from(unix_time_ms()).context("run start timestamp exceeds Arrow timestamp range")?;
-    let client_run = run_clients(config, run_id, &assigned_tables, platform).await?;
+    let mut client_run = run_clients(config, run_id, &assigned_tables, platform).await?;
+    let pinning_ok = client_run.pinning.violation.is_none()
+        && client_run.pinning.verification_error.is_none()
+        && client_run.failure.is_none();
+    let mut qap = QapMetrics::default();
+    let mut metrics = None;
+    if pinning_ok {
+        let observation = async {
+            qap = observe_qap(
+                &platform.qap_endpoint(config),
+                &platform.qap_observation_mode(),
+                &platform.qap_database(config)?,
+                run_id,
+                &client_run.qap_tables,
+                config.qap_timeout_seconds,
+            )
+            .await?;
+            metrics = Some(platform.sample_resources(config).await?);
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = observation {
+            client_run.failure = Some(format!("observe completed matrix cell: {error:#}"));
+        }
+    }
+    result_rows(
+        config,
+        orchestration_id,
+        run_id,
+        replicas,
+        concurrency,
+        CellMeasurements {
+            clients: client_run,
+            started_at_ms,
+            qap,
+            resources: metrics,
+        },
+    )
+}
+
+struct CellMeasurements {
+    clients: ClientRun,
+    started_at_ms: i64,
+    qap: QapMetrics,
+    resources: Option<ResourceMetrics>,
+}
+
+fn result_rows(
+    config: &OatConfig,
+    orchestration_id: &str,
+    run_id: &str,
+    replicas: u32,
+    concurrency: u32,
+    measurements: CellMeasurements,
+) -> Result<Vec<OatResult>> {
+    let CellMeasurements {
+        clients: client_run,
+        started_at_ms,
+        qap,
+        resources: metrics,
+    } = measurements;
+    let assigned_tables = config.tables.clone();
     let client_count = config
         .clients_per_table
         .checked_mul(assigned_tables.len())
@@ -1584,40 +1802,45 @@ async fn run_matrix_cell(
         "rows_per_table": config.rows_per_table,
         "tables": &assigned_tables,
         "warmup_seconds": config.warmup_seconds,
+        "failure": client_run.failure,
+        "pinning_violation": client_run.pinning.violation,
+        "pinning_verification_error": client_run.pinning.verification_error,
     }))?;
-    let pinning_ok = client_run.pinning.violation.is_none();
-    let (qap, metrics) = if pinning_ok {
-        (
-            observe_qap(
-                &platform.qap_endpoint(config),
-                &platform.qap_observation_mode(),
-                &platform.qap_database(config)?,
-                run_id,
-                &client_run.qap_tables,
-                config.qap_timeout_seconds,
-            )
-            .await?,
-            Some(platform.sample_resources(config).await?),
-        )
-    } else {
-        (QapMetrics::default(), None)
-    };
+    let details = [
+        client_run.failure.clone(),
+        client_run
+            .pinning
+            .violation
+            .as_ref()
+            .map(|error| format!("pinning_violation: {error}")),
+        client_run.pinning.verification_error.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let failure = (!details.is_empty()).then(|| details.join("; "));
+    let pinning_ok = client_run.pinning.violation.is_none()
+        && client_run.pinning.verification_error.is_none()
+        && assigned_tables.iter().all(|table| {
+            client_run.metrics.contains_key(table)
+                && client_run.pinning.owners.contains_key(&canonical_table_key(table))
+        });
     let mut rows = Vec::with_capacity(assigned_tables.len());
     for table in assigned_tables {
-        let client = client_run
-            .metrics
-            .get(&table)
-            .with_context(|| format!("DMV client did not report measurements for {table}"))?;
+        let client = client_run.metrics.get(&table);
+        if client.is_none() && failure.is_none() {
+            bail!("DMV client did not report measurements for {table}");
+        }
         let owner = client_run.pinning.owners.get(&canonical_table_key(&table));
         rows.push(OatResult {
             run_id: run_id.to_owned(),
-            mode: match platform.kind() {
+            mode: match config.platform.kind {
                 crate::config::OatMode::Local => "local",
                 crate::config::OatMode::Aks => "aks",
             }
             .to_owned(),
             stamp: config.stamp.clone(),
-            host: platform_host_label(platform.kind()).to_owned(),
+            host: platform_host_label(config.platform.kind).to_owned(),
             experiment: format!("arrowcols-{replicas}-dfe-{concurrency}"),
             started_at_ms,
             measure_seconds: config.measure_seconds as f64,
@@ -1627,7 +1850,15 @@ async fn run_matrix_cell(
             table_owner: owner.cloned(),
             pinning_ok,
             pinning_error: client_run.pinning.violation.clone(),
-            status: if pinning_ok { "succeeded" } else { "pinning_violation" }.to_owned(),
+            failure: failure.clone(),
+            status: if client_run.pinning.violation.is_some() {
+                "pinning_violation"
+            } else if failure.is_some() {
+                "failed"
+            } else {
+                "succeeded"
+            }
+            .to_owned(),
             git_sha: std::env::var("GIT_SHA")
                 .ok()
                 .filter(|value| !value.trim().is_empty())
@@ -1636,9 +1867,9 @@ async fn run_matrix_cell(
             replicas: u64::from(replicas),
             dfe_worker_concurrency: u64::from(concurrency),
             table,
-            rows: client.rows,
-            duration_ms: client.duration_ms,
-            rows_per_second: client.rows_per_second,
+            rows: client.map(|client| client.rows),
+            duration_ms: client.map(|client| client.duration_ms),
+            rows_per_second: client.map(|client| client.rows_per_second),
             cpu_millicores: metrics.map(|metrics| metrics.cpu_millicores),
             memory_bytes: metrics.map(|metrics| metrics.memory_bytes),
             qap,
@@ -1670,12 +1901,14 @@ struct ClientRun {
     metrics: HashMap<String, ClientMetrics>,
     pinning: PinningReport,
     qap_tables: Vec<String>,
+    failure: Option<String>,
 }
 
 #[derive(Default)]
 struct PinningReport {
     owners: HashMap<String, String>,
     violation: Option<String>,
+    verification_error: Option<String>,
 }
 
 async fn run_clients(
@@ -1684,32 +1917,20 @@ async fn run_clients(
     tables: &[String],
     platform: &mut dyn Platform,
 ) -> Result<ClientRun> {
-    match run_clients_inner(config, project_run_id, tables, platform).await {
+    let mut pinning = PinningReport::default();
+    match run_clients_inner(config, project_run_id, tables, platform, &mut pinning).await {
         Ok(report) => Ok(report),
         Err(error) => {
             let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?;
             let endpoint = platform.router_metrics_endpoint(config)?;
             let sample = sample_table_owners(&client, &endpoint, tables).await;
-            let Some(pinning) = failed_client_pinning_report(&error, sample, tables) else {
-                return Err(error);
-            };
-            tracing::error!(run_id = project_run_id, error = %error, "OAT pinning violation; discarding incomplete measurements");
+            let pinning = failed_client_pinning_report(&error, sample, tables, pinning);
+            tracing::error!(run_id = project_run_id, error = %error, "OAT client run failed; incomplete measurements are unavailable");
             Ok(ClientRun {
-                metrics: tables
-                    .iter()
-                    .map(|table| {
-                        (
-                            table.clone(),
-                            ClientMetrics {
-                                rows: 0,
-                                duration_ms: 0,
-                                rows_per_second: 0.0,
-                            },
-                        )
-                    })
-                    .collect(),
+                metrics: HashMap::new(),
                 pinning,
                 qap_tables: Vec::new(),
+                failure: Some(format!("{error:#}")),
             })
         }
     }
@@ -1719,23 +1940,49 @@ fn failed_client_pinning_report(
     error: &anyhow::Error,
     sample: Result<HashMap<String, Vec<String>>>,
     tables: &[String],
-) -> Option<PinningReport> {
-    let mut owners = HashMap::new();
+    mut report: PinningReport,
+) -> PinningReport {
     let detail = format!("{error:#}");
-    let violation = match sample {
-        Err(cause) => Some(format!("ownership verification after client failure failed: {cause:#}")),
-        Ok(sample) => check_owner_sample(tables, &sample, &mut owners).or_else(|| {
-            tables
-                .iter()
-                .find(|table| !owners.contains_key(&canonical_table_key(table)))
-                .map(|table| format!("table {table} has no active ArrowCol owner after client failure"))
-        }),
+    record_owner_observation(&mut report, sample, tables, true);
+    if detail.contains("pinning_violation") {
+        report.violation.get_or_insert(detail);
     }
-    .or_else(|| detail.contains("pinning_violation").then(|| detail.clone()))?;
-    Some(PinningReport {
-        owners,
-        violation: Some(format!("{violation}; client failure: {detail}")),
-    })
+    report
+}
+
+fn record_owner_observation(
+    report: &mut PinningReport,
+    sample: Result<HashMap<String, Vec<String>>>,
+    tables: &[String],
+    require_owner: bool,
+) {
+    match sample {
+        Ok(sample) => {
+            let violation = check_owner_sample(tables, &sample, &mut report.owners).or_else(|| {
+                require_owner
+                    .then(|| {
+                        tables
+                            .iter()
+                            .find(|table| !report.owners.contains_key(&canonical_table_key(table)))
+                            .map(|table| format!("table {table} has no active ArrowCol owner"))
+                    })
+                    .flatten()
+            });
+            if let Some(violation) = violation {
+                report.violation.get_or_insert(violation);
+            }
+        }
+        Err(error) => {
+            let detail = format!("{error:#}");
+            if detail.contains("pinning_violation") {
+                report.violation.get_or_insert(detail);
+            } else {
+                report
+                    .verification_error
+                    .get_or_insert_with(|| format!("ownership verification failed: {detail}"));
+            }
+        }
+    }
 }
 
 async fn run_clients_inner(
@@ -1743,6 +1990,7 @@ async fn run_clients_inner(
     project_run_id: &str,
     tables: &[String],
     platform: &mut dyn Platform,
+    pinning: &mut PinningReport,
 ) -> Result<ClientRun> {
     let timing_budget = config.timing_budget()?;
     let metrics_endpoint = platform.router_metrics_endpoint(config)?;
@@ -1879,8 +2127,6 @@ async fn run_clients_inner(
         };
     }
 
-    let mut owners = HashMap::<String, String>::new();
-    let mut violation = None;
     let mut schedule_acknowledged = false;
     while tokio::time::Instant::now() < schedule_deadline {
         let progress = match poll_clients(platform, config, &handles).await {
@@ -1911,16 +2157,12 @@ async fn run_clients_inner(
                 };
             }
         }
-        match sample_table_owners(&metrics_client, &metrics_endpoint, tables).await {
-            Ok(sample) => {
-                if let Some(error) = check_owner_sample(tables, &sample, &mut owners) {
-                    violation.get_or_insert(error);
-                }
-            }
-            Err(error) => {
-                violation.get_or_insert_with(|| format!("could not sample router ownership metrics: {error:#}"));
-            }
-        }
+        record_owner_observation(
+            pinning,
+            sample_table_owners(&metrics_client, &metrics_endpoint, tables).await,
+            tables,
+            false,
+        );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     if !schedule_acknowledged {
@@ -2032,34 +2274,22 @@ async fn run_clients_inner(
                 completed_clients.insert(handle.client_id.clone());
             }
         }
-        match sample_table_owners(&metrics_client, &metrics_endpoint, tables).await {
-            Ok(sample) => {
-                if let Some(error) = check_owner_sample(tables, &sample, &mut owners) {
-                    violation.get_or_insert(error);
-                }
-            }
-            Err(error) => {
-                violation.get_or_insert_with(|| format!("could not sample router ownership metrics: {error:#}"));
-            }
-        }
+        record_owner_observation(
+            pinning,
+            sample_table_owners(&metrics_client, &metrics_endpoint, tables).await,
+            tables,
+            false,
+        );
         if completed_clients.len() < handles.len() {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
-    if let Some(error) = sample_table_owners(&metrics_client, &metrics_endpoint, tables)
-        .await
-        .and_then(|sample| {
-            check_owner_sample(tables, &sample, &mut owners).map_or(Ok(()), |error| Err(anyhow::anyhow!(error)))
-        })
-        .err()
-    {
-        violation.get_or_insert_with(|| format!("{error:#}"));
-    }
-    for table in tables {
-        if !owners.contains_key(&canonical_table_key(table)) {
-            violation.get_or_insert_with(|| format!("table {table} never had exactly one observed active owner"));
-        }
-    }
+    record_owner_observation(
+        pinning,
+        sample_table_owners(&metrics_client, &metrics_endpoint, tables).await,
+        tables,
+        true,
+    );
     let mut metrics = HashMap::with_capacity(tables.len());
     for table in tables {
         let reports = client_metrics
@@ -2124,7 +2354,8 @@ async fn run_clients_inner(
     }
     Ok(ClientRun {
         metrics,
-        pinning: PinningReport { owners, violation },
+        pinning: std::mem::take(pinning),
+        failure: None,
         qap_tables,
     })
 }
@@ -5269,11 +5500,27 @@ async fn put_parquet(store: Arc<dyn ObjectStore>, path: ObjectPath, incoming: Re
 fn merge_parquet_bytes(existing_bytes: &[u8], incoming: &RecordBatch) -> Result<Vec<u8>> {
     let existing_reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::copy_from_slice(existing_bytes))
         .context("read existing benchmark Parquet object")?;
-    let schema = Arc::clone(existing_reader.schema());
-    if incoming.schema().as_ref() != schema.as_ref() {
+    let schema = result_schema();
+    let existing_schema = existing_reader.schema();
+    if incoming.schema().as_ref() != schema.as_ref()
+        || (existing_schema.as_ref() != schema.as_ref() && existing_schema.as_ref() != legacy_result_schema().as_ref())
+    {
         bail!("existing benchmark Parquet schema changed");
     }
-    let mut batches = existing_reader.build()?.collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut batches = existing_reader
+        .build()?
+        .map(|batch| -> Result<_> {
+            let batch = batch?;
+            let versions = batch
+                .column_by_name("schema_version")
+                .and_then(|column| column.as_any().downcast_ref::<Int32Array>())
+                .context("result Parquet has no int32 schema_version")?;
+            if versions.iter().any(|version| version != Some(2)) {
+                bail!("existing benchmark Parquet contains an unsupported schema_version");
+            }
+            Ok(RecordBatch::try_new(Arc::clone(&schema), batch.columns().to_vec())?)
+        })
+        .collect::<Result<Vec<_>>>()?;
     batches.push(incoming.clone());
     let merged = concat_batches(&schema, &batches)?;
     encode_parquet(&merged)
@@ -5361,10 +5608,14 @@ fn parquet_batch(results: &[OatResult]) -> Result<RecordBatch> {
         Arc::new(StringArray::from_iter_values(
             results.iter().map(|row| row.table.as_str()),
         )),
-        Arc::new(UInt64Array::from_iter_values(results.iter().map(|row| row.rows))),
-        Arc::new(UInt64Array::from_iter_values(results.iter().map(|row| row.duration_ms))),
-        Arc::new(Float64Array::from_iter_values(
-            results.iter().map(|row| row.rows_per_second),
+        Arc::new(UInt64Array::from(
+            results.iter().map(|row| row.rows).collect::<Vec<_>>(),
+        )),
+        Arc::new(UInt64Array::from(
+            results.iter().map(|row| row.duration_ms).collect::<Vec<_>>(),
+        )),
+        Arc::new(Float64Array::from(
+            results.iter().map(|row| row.rows_per_second).collect::<Vec<_>>(),
         )),
         Arc::new(Float64Array::from(
             results.iter().map(|row| row.cpu_millicores).collect::<Vec<_>>(),
@@ -5422,9 +5673,9 @@ fn result_schema() -> Arc<Schema> {
         Field::new("replicas", DataType::UInt64, false),
         Field::new("dfe_worker_concurrency", DataType::UInt64, false),
         Field::new("table", DataType::Utf8, false),
-        Field::new("rows", DataType::UInt64, false),
-        Field::new("duration_ms", DataType::UInt64, false),
-        Field::new("rows_per_second", DataType::Float64, false),
+        Field::new("rows", DataType::UInt64, true),
+        Field::new("duration_ms", DataType::UInt64, true),
+        Field::new("rows_per_second", DataType::Float64, true),
         Field::new("cpu_millicores", DataType::Float64, true),
         Field::new("memory_bytes", DataType::UInt64, true),
         Field::new("qap_observation_complete", DataType::UInt64, false),
@@ -5435,6 +5686,22 @@ fn result_schema() -> Arc<Schema> {
         Field::new("qap_unhealthy_catalogs", DataType::UInt64, true),
         Field::new("qap_lag_seconds", DataType::Float64, true),
     ]))
+}
+
+fn legacy_result_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(
+        result_schema()
+            .fields()
+            .iter()
+            .map(|field| {
+                if matches!(field.name().as_str(), "rows" | "duration_ms" | "rows_per_second") {
+                    field.as_ref().clone().with_nullable(false)
+                } else {
+                    field.as_ref().clone()
+                }
+            })
+            .collect::<Vec<_>>(),
+    ))
 }
 
 fn encode_parquet(batch: &RecordBatch) -> Result<Vec<u8>> {
@@ -5461,9 +5728,12 @@ mod tests {
         let tables = vec!["SQLServer_Wait_Stats".to_owned()];
         let healthy = HashMap::from([("sqlserver_wait_stats".to_owned(), vec!["collector-a".to_owned()])]);
         let unrelated = anyhow::anyhow!("DMV source connection failed");
-        assert!(failed_client_pinning_report(&unrelated, Ok(healthy.clone()), &tables).is_none());
-        let missing = failed_client_pinning_report(&unrelated, Ok(HashMap::new()), &tables)
-            .context("missing owner must be reported")?;
+        assert!(
+            failed_client_pinning_report(&unrelated, Ok(healthy.clone()), &tables, PinningReport::default())
+                .violation
+                .is_none()
+        );
+        let missing = failed_client_pinning_report(&unrelated, Ok(HashMap::new()), &tables, PinningReport::default());
         assert!(
             missing
                 .violation
@@ -5471,8 +5741,7 @@ mod tests {
                 .is_some_and(|message| message.contains("no active ArrowCol"))
         );
         let upstream = anyhow::anyhow!("gRPC failed: pinning_violation: pinned collector became unavailable");
-        let failed = failed_client_pinning_report(&upstream, Ok(healthy), &tables)
-            .context("upstream pinning failure must survive a stale owner gauge")?;
+        let failed = failed_client_pinning_report(&upstream, Ok(healthy), &tables, PinningReport::default());
         assert_eq!(
             failed.owners.get("sqlserver_wait_stats").map(String::as_str),
             Some("collector-a")
@@ -5488,8 +5757,12 @@ mod tests {
             "arrowcol_router_failures_total{operation=\"doput\",pool=\"dataflow\",reason=\"pinning_violation\"} 1\n";
         assert!(parse_owner_metrics(metrics, &tables).is_err());
         assert!(parse_owner_metrics(&metrics.replace("} 1", "} 0"), &tables).is_ok());
-        let authority_loss = failed_client_pinning_report(&unrelated, parse_owner_metrics(metrics, &tables), &tables)
-            .context("router rejection counter must be retained")?;
+        let authority_loss = failed_client_pinning_report(
+            &unrelated,
+            parse_owner_metrics(metrics, &tables),
+            &tables,
+            PinningReport::default(),
+        );
         assert!(
             authority_loss
                 .violation
@@ -6191,9 +6464,9 @@ mod tests {
             ("replicas", DataType::UInt64, false),
             ("dfe_worker_concurrency", DataType::UInt64, false),
             ("table", DataType::Utf8, false),
-            ("rows", DataType::UInt64, false),
-            ("duration_ms", DataType::UInt64, false),
-            ("rows_per_second", DataType::Float64, false),
+            ("rows", DataType::UInt64, true),
+            ("duration_ms", DataType::UInt64, true),
+            ("rows_per_second", DataType::Float64, true),
             ("cpu_millicores", DataType::Float64, true),
             ("memory_bytes", DataType::UInt64, true),
             ("qap_observation_complete", DataType::UInt64, false),
@@ -6710,15 +6983,16 @@ mod tests {
             table_owner: Some("collector-a".to_owned()),
             pinning_ok: true,
             pinning_error: None,
+            failure: None,
             status: "succeeded".to_owned(),
             git_sha: "test".to_owned(),
             tunables_json: "{}".to_owned(),
             replicas: 1,
             dfe_worker_concurrency: 2,
             table: table.to_owned(),
-            rows,
-            duration_ms: 10,
-            rows_per_second: rows as f64 / 60.0,
+            rows: Some(rows),
+            duration_ms: Some(10),
+            rows_per_second: Some(rows as f64 / 60.0),
             cpu_millicores: Some(50.0),
             memory_bytes: Some(1024),
             qap: QapMetrics::default(),

@@ -208,6 +208,10 @@ function show(value, digits = 2) {
   const parsed = number(value);
   return parsed === null ? '—' : new Intl.NumberFormat(undefined, { maximumFractionDigits: digits }).format(parsed);
 }
+function pinningLabel(row) {
+  if (row.status === 'pinning_violation') return 'Violation';
+  return row.pinning_ok === true ? 'OK' : 'Unverified';
+}
 function heat(value, values, lowerIsBetter = false) {
   const parsed = number(value);
   if (parsed === null || values.length < 2) return '';
@@ -339,7 +343,7 @@ function render() {
     const problem = row.status === 'failed' || row.status === 'pinning_violation' || row.pinning_ok === false;
     const modeClass = row.mode === 'local' ? 'badge-local' : row.mode === 'aks' ? 'badge-aks' : '';
     const statusClass = row.status === 'succeeded' ? 'badge-ok' : problem ? 'badge-alert' : '';
-    const pinning = row.pinning_ok === true ? 'OK' : row.pinning_ok === false ? 'Violation' : '—';
+    const pinning = pinningLabel(row);
     return `<tr${problem ? ' class="problem"' : ''}>
       <td><span class="badge ${modeClass}">${safeText(row.mode)}</span></td><td>${safeText(row.stamp)}</td><td>${safeText(row.experiment)}</td>
       <td><span class="badge ${statusClass}">${safeText(row.status)}</span></td><td><span class="badge ${row.pinning_ok === false ? 'badge-alert' : row.pinning_ok === true ? 'badge-ok' : ''}">${pinning}</span></td>

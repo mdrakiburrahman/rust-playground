@@ -15,6 +15,26 @@ The viewer's six numbered stack parts match the diagram badges. Their numbers ap
 
 Schema version 2 keeps every existing column and adds run/platform and pinning metadata. `started_at` is an Arrow `timestamp[ms, tz=UTC]`; nullable fields are written as null when unavailable, never as synthetic zeroes.
 
+The failure-evidence amendment makes `rows`, `duration_ms` and
+`rows_per_second` nullable without changing their names, order or logical types.
+Uncompleted measurements are null; completed measurements and historical zero
+values remain values, never retroactively inferred as missing. The producer
+accepts the exact prior 31-column v2 schema (including field/schema metadata)
+only by widening these three fields from required to nullable during append.
+All other schema differences are rejected; the output retains `schema_version: 2`.
+This is an explicit nullability amendment, not the unchanged original strict
+schema. Readers must accept null measurements, including failed-cell records.
+
+Completed earlier matrix cells are published even when a later cell or cleanup
+fails, and the overall run still fails. Failed cells retain their run/table
+identity and failure details in `tunables_json`; incomplete cell measurements
+remain null. Cleanup failures after completed measurement retain those values.
+`status` is `succeeded`, `failed` or `pinning_violation`. A failed ownership
+observation is unverified (`failed`, `pinning_ok: false`), not proof of an
+ownership violation; only observed invariant loss or an explicit router
+pinning rejection warrants `pinning_violation`. The viewer labels these states
+separately and continues displaying null metrics as a dash, not zero.
+
 | Column | Type | Nullability | Meaning |
 | --- | --- | --- | --- |
 | `schema_version` | 32-bit signed integer | Required | Contract version; currently `2`. |
@@ -41,9 +61,9 @@ The producer retains these original result columns:
 | `replicas` | 64-bit unsigned integer | ArrowCol replica count. |
 | `dfe_worker_concurrency` | 64-bit unsigned integer | DFE `--num-cores` setting. |
 | `table` | UTF-8 string | DMV table used as the table-scoped routing key. |
-| `rows` | 64-bit unsigned integer | Rows sent by the standalone DMV client. |
-| `duration_ms` | 64-bit unsigned integer | Shared fleet measurement duration; excludes preflight and warm-up. |
-| `rows_per_second` | 64-bit float | Total table rows completed during the shared window divided by its duration. |
+| `rows` | Nullable 64-bit unsigned integer | Rows sent by the standalone DMV client; null if no complete measurement. |
+| `duration_ms` | Nullable 64-bit unsigned integer | Shared fleet measurement duration; excludes preflight and warm-up; null if unmeasured. |
+| `rows_per_second` | Nullable 64-bit float | Total table rows completed during the shared window divided by its duration; null if unmeasured. |
 | `cpu_millicores` | Nullable 64-bit float | Unique collector/DFE pod CPU from `kubectl top`; integrated pods are counted once. |
 | `memory_bytes` | Nullable 64-bit unsigned integer | Unique collector/DFE pod memory from `kubectl top`; integrated pods are counted once. |
 | `qap_observation_complete` | 64-bit unsigned integer | 1 only when all expected QAP tables and required fields were measured; otherwise 0. |
