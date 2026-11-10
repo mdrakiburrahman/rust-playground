@@ -283,6 +283,20 @@ test('opens the existing local results in viewer-only mode without losing missin
     viewer = await startLocalViewer(configPath);
     assert.equal(new URL(viewer.url).hostname, '127.0.0.1');
 
+    const port = new URL(viewer.url).port;
+    const localhost = await fetch(viewer.url, {
+      headers: { host: `localhost:${port}`, origin: `http://localhost:${port}` },
+    });
+    assert.equal(localhost.status, 200);
+
+    const invalidHost = await fetch(viewer.url, { headers: { host: `example.com:${port}` } });
+    assert.equal(invalidHost.status, 400);
+    assert.equal(await invalidHost.text(), 'Invalid Host header');
+
+    const invalidOrigin = await fetch(viewer.url, { headers: { origin: 'https://example.com' } });
+    assert.equal(invalidOrigin.status, 403);
+    assert.equal(await invalidOrigin.text(), 'Origin not allowed');
+
     const page = await fetch(viewer.url);
     assert.equal(page.status, 200);
     assert.match(await page.text(), /ArrowCol OAT benchmark/);

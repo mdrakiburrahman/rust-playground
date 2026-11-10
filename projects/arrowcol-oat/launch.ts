@@ -272,6 +272,20 @@ async function readLocalViewerConfig(
 async function createLocalViewer(config: LocalViewerConfig): Promise<LocalViewer> {
   const { resultsPath, siteRoot } = config;
   const server = createHttpServer(async (request, response) => {
+    const port = request.socket.localPort;
+    const allowedHosts = port === undefined ? [] : [`127.0.0.1:${port}`, `localhost:${port}`];
+    if (!request.headers.host || !allowedHosts.includes(request.headers.host)) {
+      response.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' }).end('Invalid Host header');
+      return;
+    }
+    const allowedOrigins = port === undefined ? [] : [
+      `http://127.0.0.1:${port}`,
+      `http://localhost:${port}`,
+    ];
+    if (request.headers.origin !== undefined && !allowedOrigins.includes(request.headers.origin)) {
+      response.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' }).end('Origin not allowed');
+      return;
+    }
     try {
       if (request.method !== 'GET' && request.method !== 'HEAD') {
         response.writeHead(405, { allow: 'GET, HEAD' }).end();
