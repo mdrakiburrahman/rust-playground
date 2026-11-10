@@ -55,6 +55,8 @@ async function fixture() {
   const fixedCredential = { name: 'arrow-collector', issuer: 'https://issuer.example.test/',
     subject: 'system:serviceaccount:arrow-collector:arrow-collector', audiences: ['api://AzureADTokenExchange'] };
   const state = {
+    now,
+    onPermissions: undefined as (() => void | Promise<void>) | undefined,
     credentials: [fixedCredential] as Record<string, unknown>[],
     permissions: [{ actions: ['Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials/*'], notActions: [] as string[] }],
     network: { networkDataplane: 'azure', networkPolicy: 'none' },
@@ -126,6 +128,7 @@ async function fixture() {
     assert.equal(new Headers(init?.headers).get('authorization'), 'Bearer access-token-canary');
     if (url.includes('Microsoft.Authorization/permissions')) {
       assert.equal(init?.method ?? 'GET', 'GET');
+      await state.onPermissions?.();
       return Response.json({ value: state.permissions });
     }
     const body = JSON.parse(String(init?.body));
@@ -140,7 +143,7 @@ async function fixture() {
     }
     throw new Error('Unexpected fake provider request');
   };
-  const run = () => runAksPreflight('oat.json', { workspaceRoot: root, environment, runCommand, fetcher, now: () => now });
+  const run = () => runAksPreflight('oat.json', { workspaceRoot: root, environment, runCommand, fetcher, now: () => state.now });
   return { root, config, runtime, environment, calls, requests, state, assertion, run,
     saveConfig: () => writeFile(path.join(root, 'oat.json'), JSON.stringify(config)),
     cleanup: () => rm(root, { recursive: true, force: true }) };
@@ -214,6 +217,47 @@ test('expired or mismatched publisher credentials block federation without discl
     f.environment.AZURE_CLIENT_ID = runId;
     assert.equal((await f.run()).checks.find((entry) => entry.name === 'Kubernetes context and credentials')!.ready, false);
   } finally { await f.cleanup(); }
+});
+
+test('final readiness rejects an assertion expiring during later requests but accepts an unexpired control', async () => {
+  for (const elapsedSeconds of [3599, 3600, 3601]) {
+    const f = await fixture();
+    try {
+      f.state.onPermissions = () => { f.state.now += elapsedSeconds * 1000; };
+      const report = await f.run();
+      const valid = elapsedSeconds < 3600;
+      assert.equal(report.ready, valid);
+      assert.equal(report.checks.length, 13);
+      assert.equal(report.checks.find((entry) => entry.name === 'Kubernetes context and credentials')!.ready, valid);
+      assert.equal(report.checks.find((entry) => entry.name === 'Run federated-credential permissions')!.ready, true);
+      if (!valid) {
+        assert.match(formatPreflightReport(report), /NOT READY.*assertion expired.*aks setup/);
+        assert.match(report.nextCommand, /--preflight-only$/);
+      }
+      assert.ok(!formatPreflightReport(report).includes(f.assertion));
+    } finally { await f.cleanup(); }
+  }
+});
+
+test('final readiness rejects private assertion changes and lost file custody during later requests', async () => {
+  for (const invalidate of [
+    (filename: string) => writeFile(filename, 'malformed-assertion-canary'),
+    (filename: string) => chmod(filename, 0o644),
+    (filename: string) => unlink(filename),
+    (filename: string) => writeFile(filename,
+      `header.${Buffer.from(JSON.stringify({ exp: now / 1000 + 7200 })).toString('base64url')}.replacement-canary`),
+  ]) {
+    const f = await fixture();
+    try {
+      f.state.onPermissions = () => invalidate(f.environment.AZURE_FEDERATED_TOKEN_FILE!);
+      const report = await f.run();
+      assert.equal(report.ready, false);
+      assert.equal(report.checks.find((entry) => entry.name === 'Run federated-credential permissions')!.ready, true);
+      assert.match(report.checks.find((entry) => entry.name === 'Kubernetes context and credentials')!.detail,
+        /became invalid during preflight.*aks setup/);
+      assert.ok(!formatPreflightReport(report).includes('canary'));
+    } finally { await f.cleanup(); }
+  }
 });
 
 test('publisher identity and exact fixed federation remain mandatory', async () => {

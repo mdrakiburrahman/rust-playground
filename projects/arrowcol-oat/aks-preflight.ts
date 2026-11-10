@@ -72,6 +72,19 @@ async function privateText(filename: string): Promise<string> {
   return readFile(filename, 'utf8');
 }
 
+async function publisherAssertion(filename: string, now: () => number): Promise<string> {
+  const candidate = (await privateText(filename)).trim();
+  const parts = candidate.split('.');
+  if (parts.length !== 3) throw new Error('Malformed assertion');
+  const claims: unknown = JSON.parse(Buffer.from(parts[1]!, 'base64url').toString('utf8'));
+  const timestamp = now();
+  if (!isRecord(claims) || typeof claims.exp !== 'number' || !Number.isFinite(claims.exp) || claims.exp * 1000 <= timestamp ||
+      (claims.nbf !== undefined && (typeof claims.nbf !== 'number' || !Number.isFinite(claims.nbf) || claims.nbf * 1000 > timestamp))) {
+    throw new Error('Expired or not-yet-valid assertion');
+  }
+  return candidate;
+}
+
 export async function loadAksEnvironment(
   workspaceRoot: string,
   base: NodeJS.ProcessEnv = process.env,
@@ -183,6 +196,7 @@ export async function runAksPreflight(configPath: string, options: PreflightOpti
   let principalId: string | undefined;
   let identityId: string | undefined;
   let assertion: string | undefined;
+  let assertionPath: string | undefined;
   const tokens = new Map<string, string>();
   const federatedToken = async (resource: string): Promise<string> => {
     const cached = tokens.get(resource);
@@ -255,16 +269,10 @@ export async function runAksPreflight(configPath: string, options: PreflightOpti
     if (!isAbsolute(path)) throw new Error('Federated assertion path must be absolute.');
     let candidate: string;
     try {
-      candidate = (await privateText(path)).trim();
-      const parts = candidate.split('.');
-      if (parts.length !== 3) throw new Error('Malformed assertion');
-      const claims: unknown = JSON.parse(Buffer.from(parts[1]!, 'base64url').toString('utf8'));
-      if (!isRecord(claims) || typeof claims.exp !== 'number' || !Number.isFinite(claims.exp) || claims.exp * 1000 <= now() ||
-          (claims.nbf !== undefined && (typeof claims.nbf !== 'number' || !Number.isFinite(claims.nbf) || claims.nbf * 1000 > now()))) {
-        throw new Error('Expired or not-yet-valid assertion');
-      }
+      candidate = await publisherAssertion(path, now);
     } catch { throw new Error(`Federated assertion is invalid or expired; run \`${setupCommand}\`.`); }
     assertion = candidate;
+    assertionPath = path;
     return 'Selected live API endpoint, bounded kube authentication and private unexpired publisher assertion verified.';
   });
 
@@ -454,6 +462,15 @@ export async function runAksPreflight(configPath: string, options: PreflightOpti
     if (credentials.length >= 20) throw new Error('UAMI federated credentials are at the limit of 20; no run credential headroom remains.');
     return `${20 - credentials.length} FIC slot(s) remain across native and external trusts.`;
   });
+  if (assertion && assertionPath) {
+    try {
+      if (await publisherAssertion(assertionPath, now) !== assertion) throw new Error('Publisher assertion changed during preflight');
+    } catch {
+      const credentials = checks.find((entry) => entry.name === 'Kubernetes context and credentials')!;
+      credentials.ready = false;
+      credentials.detail = `Federated assertion expired, changed or became invalid during preflight; run \`${setupCommand}\`, then retry.`;
+    }
+  }
   const ready = checks.every((entry) => entry.ready);
   return { ready, checks, nextCommand: ready ? 'npx --no-install arrowcol-oat --mode aks' : nextCommand, warnings, network };
 }
