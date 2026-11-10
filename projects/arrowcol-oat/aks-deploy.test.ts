@@ -10,7 +10,7 @@ const subscription = '00000000-0000-0000-0000-000000000001';
 const stamp = '89152';
 const clusterName = `arrow-collector-${stamp}`;
 const state = path.join(ROOT, 'out', 'arrowcol-oat');
-type Fault = 'cluster' | 'other' | 'timeout' | 'quota' | 'identity' | 'database' | 'publisher' | 'network' | 'missing-target' | 'convergence';
+type Fault = 'cluster' | 'other' | 'timeout' | 'quota' | 'identity' | 'database' | 'publisher' | 'network' | 'missing-target' | 'convergence' | 'run-fic-permission';
 
 function fixture(t: test.TestContext, faults: Fault[] = []) {
   fs.mkdirSync(path.join(ROOT, 'out'), { recursive: true });
@@ -85,6 +85,14 @@ function fixture(t: test.TestContext, faults: Fault[] = []) {
       { name: `arrowcollector${stamp}`, type: 'Microsoft.ContainerRegistry/registries' },
       { name: clusterName, type: 'Microsoft.Kusto/clusters' },
     ]);
+    if (command[1] === 'role') return success(faults.includes('run-fic-permission') ? [] : [{
+      principalId: subscription,
+      roleDefinitionId: `/subscriptions/${subscription}/providers/Microsoft.Authorization/roleDefinitions/7e559ce2-48d7-4b27-9128-fa1b247f1308`,
+    }]);
+    if (command[1] === 'identity' && command[2] === 'show') return success({
+      id: `/subscriptions/${subscription}/resourceGroups/arrow-collector-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/arrow-collector`,
+      principalId: subscription,
+    });
     if (command[1] === 'identity') return success([
       { name: `azure-qap-${clusterName}`, issuer: 'https://aks.example/', subject: 'system:serviceaccount:arrow-collector:arrow-collector',
         audiences: ['api://AzureADTokenExchange'] },
@@ -191,7 +199,7 @@ test('Delta convergence retries once without changing network', async t => {
   assert.equal(f.calls.some(call => call[2] === 'delete'), false);
 });
 
-for (const fault of ['identity', 'database', 'publisher', 'network'] as const) {
+for (const fault of ['identity', 'database', 'publisher', 'network', 'run-fic-permission'] as const) {
   test(`missing ${fault} postcondition cannot claim deployed`, async t => {
     const f = fixture(t, [fault]);
     await assert.rejects(deployInfrastructure(f.options, f.runner), /postconditions failed/);

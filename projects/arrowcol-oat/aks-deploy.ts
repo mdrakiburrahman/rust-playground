@@ -96,7 +96,8 @@ export async function deployInfrastructure(options: Options, runner: typeof run_
   };
   const account = await exec(['az', 'account', 'show', '--subscription', subscription, '--only-show-errors', '--output', 'json'], 60);
   if (account.returncode) throw new Error('Azure CLI is not signed in to the configured subscription. Run: az login --use-device-code');
-  if (object(JSON.parse(account.stdout), 'Azure account').id !== subscription)
+  const accountId = object(JSON.parse(account.stdout), 'Azure account').id;
+  if (typeof accountId !== 'string' || accountId.toLowerCase() !== subscription)
     throw new Error('Azure CLI account does not match the configured subscription. Run: az login --use-device-code');
   const exists = await az('group', 'exists', '--name', GROUP);
   if (typeof exists !== 'boolean') throw new Error('Azure did not report resource-group existence.');
@@ -220,7 +221,7 @@ export async function deployInfrastructure(options: Options, runner: typeof run_
     await verifyPostconditions({ ...selected, aks: { ...selected.aks, networkDataplane: current } }, az, postconditions);
     receipt.completedAt = new Date().toISOString();
     save();
-    console.log(`Identity receipt: exactly one UAMI arrow-collector; native and publisher federated credentials verified.`);
+    console.log(`Identity receipt: exactly one UAMI arrow-collector; native and publisher federation plus run-FIC permission verified.`);
     console.log(`Deployed stamp ${stamp}; network path: ${attempts.map(attempt => attempt.network).join(' -> ')}. Receipt: ${receiptPath}`);
     if (current === 'azure') console.warn('WARNING: Azure dataplane has no enforcing network-policy provider. In-cluster workloads can reach the passwordless dataflow port; there is no public ingress.');
     return { stamp, network: current, attempts, receiptPath };
@@ -271,6 +272,14 @@ async function verifyPostconditions(config: StampConfig, az: (...args: string[])
   const resources = list(await az('resource', 'list', '--resource-group', GROUP), 'resource inventory');
   const identities = resources.filter(item => String(item.type).toLowerCase() === 'microsoft.managedidentity/userassignedidentities');
   receipt.identity = identities.length === 1 && identities[0]?.name === 'arrow-collector';
+  const identity = object(await az('identity', 'show', '--resource-group', GROUP, '--name', 'arrow-collector'), 'shared identity');
+  if (typeof identity.id !== 'string' || typeof identity.principalId !== 'string')
+    throw new Error('Shared identity resource ID and principal ID are missing.');
+  const assignments = list(await az('role', 'assignment', 'list', '--scope', identity.id, '--include-inherited'), 'identity role assignments');
+  receipt.runFederationPermission = assignments.some(assignment =>
+    assignment.principalId === identity.principalId &&
+    typeof assignment.roleDefinitionId === 'string' &&
+    assignment.roleDefinitionId.toLowerCase().endsWith('/7e559ce2-48d7-4b27-9128-fa1b247f1308'));
   for (const [key, type, resourceName] of [
     ['storage', 'Microsoft.Storage/storageAccounts', account], ['acr', 'Microsoft.ContainerRegistry/registries', account],
     ['kusto', 'Microsoft.Kusto/clusters', name],
@@ -301,6 +310,7 @@ export async function deploy(options: Options, runner: typeof run_tree = run_tre
   if (!options.whatIf) {
     try {
       result.setup = await setup({ stamp: result.stamp, stampConfig: options.stampConfig }, runner);
+      if (!result.setup.preflightReady) throw new Error('Setup did not reach preflight READY.');
     } catch (error) {
       const document = parseDocument(fs.readFileSync(result.receiptPath, 'utf8'));
       document.set('setup', { outcome: 'failed', error: safeError(String(error)) });
