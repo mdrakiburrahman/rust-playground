@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use arrowcol_routing::{PressurePolicy, RoutingPolicy};
 use clap::Parser;
 use serde::Deserialize;
@@ -116,10 +116,6 @@ impl RouterConfig {
                 && self.server.h2.connection_window_bytes >= self.server.h2.stream_window_bytes,
             "downstream H2 stream/window bounds are invalid"
         );
-        match self.auth.authenticator.as_str() {
-            "allow_all" => {}
-            unsupported => bail!("unsupported auth.authenticator {unsupported:?}"),
-        }
         Ok(())
     }
 }
@@ -245,12 +241,20 @@ fn default_oat_run_pin_ttl_ms() -> u64 {
     3_600_000
 }
 
+/// Explicit authentication mode; no production identity provider is implemented.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthenticatorMode {
+    /// Grants a shared principal after edge verification, for development only.
+    DevOnlyAllowAll,
+}
+
 /// Authentication and signed internal identity configuration.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     /// Pluggable authenticator name.
-    pub authenticator: String,
+    pub authenticator: AuthenticatorMode,
     /// Secret used by the trusted external TLS terminator.
     pub edge_secret_file: PathBuf,
     /// Separate secret used to sign internal principal metadata.

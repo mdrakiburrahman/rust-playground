@@ -14,8 +14,8 @@ pub use auth::{
     insert_edge_signature_headers, read_secret_file,
 };
 pub use config::{
-    AuthConfig, Cli, H2Config, RouterConfig, RoutingConfig, ServerConfig, SqlServerConfig, TelemetryConfig,
-    UpstreamConfig,
+    AuthConfig, AuthenticatorMode, Cli, H2Config, RouterConfig, RoutingConfig, ServerConfig, SqlServerConfig,
+    TelemetryConfig, UpstreamConfig,
 };
 pub use metrics::RouterMetrics;
 pub use router::{

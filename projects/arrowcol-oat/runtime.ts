@@ -158,6 +158,7 @@ export async function renderRuntime(input: unknown, phase: Phase): Promise<Resou
   // --num-cores owns the effective policy; no group/pipeline override may shadow it.
   delete dataflow.policies.resources;
   const router = parse(await readFile('projects/arrowcol-router-rust/config.docker.yaml', 'utf8'));
+  router.auth.authenticator = 'dev_only_allow_all';
   router.sql_server.host = 'arrowcol-sql';
   router.sql_server.password_file = '/run/app/password';
   router.sql_server.trust_server_certificate = true;

@@ -665,7 +665,7 @@ fn test_config(listen: SocketAddr, state_directory: String) -> RouterConfig {
             distinct_table_owners: false,
         },
         auth: AuthConfig {
-            authenticator: "allow_all".to_owned(),
+            authenticator: arrowcol_router_rust::AuthenticatorMode::DevOnlyAllowAll,
             edge_secret_file: "unused-edge".into(),
             internal_signing_secret_file: "unused-internal".into(),
             edge_signature_max_age_ms: 30_000,

@@ -59,6 +59,7 @@ async function main(): Promise<void> {
   const dataflow = parse(await readFile('projects/arrowcol-dataflow-rust/config.yaml', 'utf8'));
   delete dataflow.policies.resources;
   const router = parse(await readFile('projects/arrowcol-router-rust/config.docker.yaml', 'utf8'));
+  router.auth.authenticator = 'dev_only_allow_all';
   router.sql_server.host = `${prefix}-sql`;
   router.sql_server.trust_server_certificate = true;
   router.sql_server.password_file = '/run/oat/app-password';

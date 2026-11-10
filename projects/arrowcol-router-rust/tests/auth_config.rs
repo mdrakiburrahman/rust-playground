@@ -106,6 +106,7 @@ fn strict_yaml_rejects_unknown_fields_and_accepts_the_checked_in_config() {
         valid.as_slice(),
         include_bytes!("../config.docker.yaml").as_slice(),
         include_bytes!("../config.smoke.yaml").as_slice(),
+        include_bytes!("../../loadtest/config/router.yaml").as_slice(),
     ] {
         RouterConfig::from_yaml(config).unwrap_or_else(|error| panic!("checked-in config is invalid: {error}"));
     }
@@ -119,4 +120,19 @@ fn strict_yaml_rejects_unknown_fields_and_accepts_the_checked_in_config() {
         String::from_utf8(valid.to_vec()).unwrap_or_else(|error| panic!("checked-in config is not UTF-8: {error}"));
     unknown.push_str("\nunknown_router_option: true\n");
     assert!(RouterConfig::from_yaml(unknown.as_bytes()).is_err());
+}
+
+#[test]
+fn startup_requires_explicit_development_authentication_mode() {
+    let valid = std::str::from_utf8(include_bytes!("../config.yaml"))
+        .unwrap_or_else(|error| panic!("checked-in config is not UTF-8: {error}"));
+    for mode in ["allow_all", "production", ""] {
+        let invalid = valid.replace("authenticator: dev_only_allow_all", &format!("authenticator: {mode}"));
+        assert!(
+            RouterConfig::from_yaml(invalid.as_bytes()).is_err(),
+            "accepted mode {mode:?}"
+        );
+    }
+    let missing = valid.replace("  authenticator: dev_only_allow_all\n", "");
+    assert!(RouterConfig::from_yaml(missing.as_bytes()).is_err());
 }

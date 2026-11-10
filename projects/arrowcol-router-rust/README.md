@@ -79,8 +79,15 @@ type, routing metadata, and control metadata. Assertions are time-bounded and
 nonces are replay-protected in process. Direct traffic, tampering, replay, and
 externally supplied `x-arrowcol-internal-auth-*` headers are rejected.
 
-The current pluggable authenticator is `allow_all`. After authentication the
-router strips edge proof and signs a bounded serialized `AuthContext` for the
+Startup requires an explicit `auth.authenticator: dev_only_allow_all`. Missing,
+legacy `allow_all`, and unknown modes are rejected before listeners start.
+This development-only mode grants the same principal to every **edge-verified**
+request; it never bypasses the mandatory edge HMAC. Checked-in local, Compose,
+image-smoke and generated Kubernetes OAT configurations explicitly select it.
+These are development/qualification deployments, not production identity
+authentication. No production authenticator is implemented.
+
+After authentication the router strips edge proof and signs a bounded serialized `AuthContext` for the
 collector:
 
 ```text
