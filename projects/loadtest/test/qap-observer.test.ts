@@ -8,6 +8,92 @@ import { test } from 'node:test';
 
 import { exportQapPoints, qapPoints, startQapObserver } from '../src/qap-observer.js';
 
+test('qualification drains the in-flight observer and requires one fresh final sample without validation contention', async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'qap-scheduling-'));
+  t.after(() => rm(root, { force: true, recursive: true }));
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
+  let release!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  let announce!: () => void;
+  const started = new Promise<void>(resolve => { announce = resolve; });
+  let helpers = 0, exports = 0;
+  let validating = false;
+  const observer = startQapObserver({
+    binary: 'fake-helper', cwd: root, env: {}, results: root,
+    endpoint: 'http://fixture.invalid', otlpEndpoint: 'http://fixture.invalid', intervalMs: 1,
+  }, {
+    runHelper: async (_command, args, options) => {
+      assert.equal(validating, false);
+      assert.equal(args[args.indexOf('--timeout') + 1], '30s');
+      assert.equal(options.timeoutMs, 40_000);
+      if (++helpers === 1) { announce(); await blocked; }
+      await writeFile(args[args.indexOf('--output') + 1]!, JSON.stringify(fixture()));
+    },
+    publish: async () => { assert.equal(validating, false); exports++; },
+  });
+  await started;
+  let stopped = false;
+  const draining = observer().then(() => { stopped = true; });
+  await Promise.resolve();
+  assert.equal(stopped, false, 'stop must await the already-admitted helper');
+  release();
+  await draining;
+  validating = true;
+  t.mock.timers.tick(600_000);
+  assert.equal(helpers, 1, 'no periodic helper may overlap the heavy validation window');
+  validating = false;
+  await observer.sampleFinal();
+  await observer.sampleFinal();
+  await observer();
+  assert.equal(helpers, 2);
+  assert.equal(exports, 2);
+  const receipts = (await readFile(path.join(root, 'qap-observer.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+  assert.deepEqual(receipts.map(receipt => receipt.final), [false, true]);
+  assert.deepEqual(receipts.map(receipt => receipt.artifact), ['qap-observations/0/observation.json', 'qap-observations/1/observation.json']);
+  const main = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
+  const quiesce = main.indexOf("phase = 'qap-observer-quiesce'");
+  const drain = main.indexOf('await stopQapObserver()', quiesce);
+  const validate = main.indexOf("await runLocalLoadgen(context, 'validate'", drain);
+  const ui = main.indexOf('await runUiGate(', validate);
+  const final = main.indexOf('await stopQapObserver.sampleFinal()', ui);
+  assert(quiesce >= 0 && drain > quiesce && validate > drain && ui > validate && final > ui);
+  assert(main.indexOf("phase = 'publication-drain'", drain) < validate);
+});
+
+for (const failingPhase of ['helper', 'export'] as const) {
+  test(`final ${failingPhase} failure remains recorded and fails qualification without retry`, async t => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'qap-final-failure-'));
+    t.after(() => rm(root, { force: true, recursive: true }));
+    let announce!: () => void;
+    const published = new Promise<void>(resolve => { announce = resolve; });
+    let helpers = 0, exports = 0;
+    const observer = startQapObserver({
+      binary: 'fake-helper', cwd: root, env: {}, results: root,
+      endpoint: 'http://fixture.invalid', otlpEndpoint: 'http://fixture.invalid',
+    }, {
+      runHelper: async (_command, args) => {
+        if (++helpers === 2 && failingPhase === 'helper') throw new Error('injected final helper failure');
+        await writeFile(args[args.indexOf('--output') + 1]!, JSON.stringify(fixture()));
+      },
+      publish: async () => {
+        if (++exports === 2 && failingPhase === 'export') throw new Error('injected final export failure');
+        announce();
+      },
+    });
+    await published;
+    await observer();
+    await assert.rejects(observer.sampleFinal(), /qualification is incomplete/u);
+    await assert.rejects(observer.sampleFinal(), /qualification is incomplete/u);
+    await assert.rejects(observer(), /qualification is incomplete/u);
+    assert.equal(helpers, 2);
+    const receipts = (await readFile(path.join(root, 'qap-observer.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+    assert.equal(receipts.length, 2);
+    assert.equal(receipts[1].final, true);
+    assert.equal(receipts[1].phase, failingPhase);
+    assert.equal(receipts[1].exported, false);
+  });
+}
+
 for (const mode of ['child-failure', 'invalid-output', 'invalid-diagnostic', 'array-code', 'nested-array-code'] as const) {
   test(`observer reports fixed privacy-safe phases for actual ${mode}`, async t => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'qap-diagnostic-'));

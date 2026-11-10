@@ -194,6 +194,8 @@ npx --no-install tsx projects/arrowcol-oat/publish-images.ts \
   --stamp-config target/arrowcol-oat/stamp-89152/stamp.yaml
 ```
 
+Before publication, build the local service tags from the clean checked-out source; the publisher requires linux/amd64 images labeled with the full 40-character `org.opencontainers.image.revision` SHA. The default ACR tag is `oat-<full-SHA>`. The setup helpers build all five local images, publish the DMV client separately, and can read all five existing tags without building or pushing; missing tags are distinguishable from provenance failures.
+
 This reuses the QAP publisher's `withPublisherIdentity` helper: verify the stamped
 cluster and **existing** ServiceAccount annotation, obtain a short-lived AKS
 assertion, authenticate as the shared UAMI, then verify the principal before ACR

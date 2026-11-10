@@ -7,6 +7,7 @@ import { extname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { formatPreflightReport, loadAksEnvironment, runAksPreflight } from './aks-preflight.js';
 import { run_tree } from '../../infra/azure/bootstrap.js';
+import { record, reportDataFlowRun, type NetworkObservation } from './dataflow-verdict.js';
 
 export interface OatRunStatus {
   id: string;
@@ -184,23 +185,38 @@ export async function main(args: string[], runner: typeof run_tree = run_tree): 
   if (!Number.isSafeInteger(pollValue) || pollValue < 1) {
     throw new Error('Expected values after --server and --poll-ms');
   }
+  let network: NetworkObservation | undefined;
+  let warnings: string[] = [];
   if (mode === 'aks') {
     const report = await runAksPreflight(configPath);
     console.log(formatPreflightReport(report));
     if (!report.ready) throw new Error('AKS preflight is NOT READY; refusing to start the benchmark.');
+    if ('network' in report && record(report.network) &&
+        typeof report.network.provider === 'string' && typeof report.network.enforcing === 'boolean') {
+      network = { provider: report.network.provider, enforcing: report.network.enforcing };
+    }
+    if ('warnings' in report && Array.isArray(report.warnings)) {
+      warnings = report.warnings.filter((warning): warning is string => typeof warning === 'string');
+    }
   }
+  const config = await readOatConfigForMode(configPath, mode);
   if (requestedServerUrl) {
-    const status = await launchOat(configPath, requestedServerUrl, pollValue, fetch, undefined, mode);
-    console.log(`Completed ${status.id}: published ${status.result_count} result rows`);
+    const code = await reportDataFlowRun(
+      (progress) => launchOat(configPath, requestedServerUrl, pollValue, fetch, progress, mode),
+      config, mode, undefined, runner, network, warnings,
+    );
+    if (code) process.exitCode = code;
     await maybeServeLocalViewer(configPath, mode);
     return;
   }
 
   const server = await startLocalServer(runner);
-  let status: OatRunStatus;
   try {
-    status = await launchOat(configPath, server.url, pollValue, fetch, undefined, mode);
-    console.log(`Completed ${status.id}: published ${status.result_count} result rows`);
+    const code = await reportDataFlowRun(
+      (progress) => launchOat(configPath, server.url, pollValue, fetch, progress, mode),
+      config, mode, server.gitSha, runner, network, warnings,
+    );
+    if (code) process.exitCode = code;
   } finally {
     await stopLocalServer(server.child);
   }
@@ -417,7 +433,7 @@ export async function buildOwnedServer(
   return { executable: await realpath(executables[0]!), gitSha };
 }
 
-export async function startLocalServer(runner: typeof run_tree = run_tree): Promise<{ child: ChildProcess; url: string }> {
+export async function startLocalServer(runner: typeof run_tree = run_tree): Promise<{ child: ChildProcess; url: string; gitSha: string }> {
   const workspace = resolve(fileURLToPath(new URL('../..', import.meta.url)));
   const build = await buildOwnedServer(workspace, runner);
   const port = await availablePort();
@@ -435,7 +451,7 @@ export async function startLocalServer(runner: typeof run_tree = run_tree): Prom
     if (exit) throw new Error(`OAT server exited before becoming ready (${exit.signal ?? exit.code})`);
     try {
       const response = await fetch(new URL('/healthz', url), { signal: AbortSignal.timeout(2000) });
-      if (response.ok) return { child, url };
+      if (response.ok) return { child, url, gitSha: build.gitSha };
     } catch {
       // The server may still be compiling or starting.
     }

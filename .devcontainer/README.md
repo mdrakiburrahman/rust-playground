@@ -50,3 +50,16 @@ discover it without a per-user installation or a mounted Azure CLI cache. Verify
 the source configuration with `nx run devcontainer:test-source`; `nx run
 devcontainer:build` builds the Dockerfile image but does not by itself prove
 that the Dev Container Features were applied.
+
+Source builds retain APT signature and hash verification, and apply this policy
+before the first package update so subsequent Features inherit it:
+
+| Setting | Source-build policy |
+| --- | --- |
+| Official Ubuntu archive/security sources | HTTPS; other repositories unchanged |
+| Transport retries | Two retries |
+| HTTP/HTTPS inactivity timeout | 30 seconds, not a whole-build deadline |
+| Index update errors | Any failed index makes the update fail |
+
+This bounds transport failures; it does not repair inconsistent upstream indexes.
+The CI environment build still has its existing 30-minute deadline.

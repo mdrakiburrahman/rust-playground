@@ -121,13 +121,16 @@ test('external --server submits unchanged configuration without building or attr
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
   assert.ok(address && typeof address !== 'string');
+  const previousExitCode = process.exitCode;
   try {
     await main(['--config', configPath, '--server', `http://127.0.0.1:${address.port}`], async () => {
       throw new Error('must not build or inspect source for an independently running server');
     });
+    assert.equal(process.exitCode, 1);
     assert.deepEqual(posted, config);
     assert.equal(await readFile(configPath, 'utf8'), JSON.stringify(config));
   } finally {
+    process.exitCode = previousExitCode;
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     await rm(directory, { recursive: true, force: true });
   }
@@ -187,10 +190,14 @@ test('allows the executable to select the platform mode without editing the conf
   }
 });
 
-test('selects a per-mode quick config when no path is supplied', () => {
-  assert.equal(path.basename(resolveOatConfigPath('local')), 'oat-config.quick.json');
-  assert.equal(path.basename(resolveOatConfigPath('aks')), 'oat-config.aks.quick.json');
-  assert.equal(resolveOatConfigPath('aks', 'custom.json'), 'custom.json');
+test('selects a per-mode quick config when no path is supplied', async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'oat-quick-config-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  assert.equal(resolveOatConfigPath('local', undefined, root),
+    path.join(root, 'docs/experiments/arrowcol-oat/oat-config.quick.json'));
+  assert.equal(resolveOatConfigPath('aks', undefined, root),
+    path.join(root, 'docs/experiments/arrowcol-oat/oat-config.aks.quick.json'));
+  assert.equal(resolveOatConfigPath('aks', 'custom.json', root), 'custom.json');
 });
 
 test('fills missing local Docker bridge hosts while preserving explicit values', async () => {
