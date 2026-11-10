@@ -202,7 +202,7 @@ test('real CLI entrypoint evaluates both helper imports and exits on local valid
   const input = path.join(directory, '.env.entrypoint'), guard = path.join(directory, 'deny-external-io.mjs');
   b.write_private(input, { AZURE_SUBSCRIPTION_ID: SUB });
   prepareStamp();
-  fs.writeFileSync(manifest, JSON.stringify({ schema_version: 1, run_id: SUB, tables: [] }), { mode: 0o600 });
+  fs.writeFileSync(manifest, JSON.stringify({ schema_version: 1, run_id: SUB, database: 'experimentqap', tables: [] }), { mode: 0o600 });
   fs.writeFileSync(guard, `
 import childProcess from 'node:child_process';
 import path from 'node:path';

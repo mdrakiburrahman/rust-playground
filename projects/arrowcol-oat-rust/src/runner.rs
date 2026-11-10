@@ -252,8 +252,9 @@ impl Platform for AksPlatform {
             .context("AKS QAP requires qap_database or AZURE_KUSTO_EXPERIMENT_DATABASE")
     }
 
-    async fn initialize_qap(&mut self, _config: &OatConfig, run_id: &str, tables: &[String]) -> Result<Vec<String>> {
+    async fn initialize_qap(&mut self, config: &OatConfig, run_id: &str, tables: &[String]) -> Result<Vec<String>> {
         let bindings = qap_bindings(run_id, tables)?;
+        let database = self.qap_database(config)?;
         let runtime_dir = self
             .runtime_dir
             .as_deref()
@@ -263,6 +264,7 @@ impl Platform for AksPlatform {
         let manifest = json!({
             "schema_version": 1,
             "run_id": run_id,
+            "database": database,
             "tables": bindings.iter().map(|binding| Ok(json!({
                 "external_table": binding.external_table,
                 "relative_path": aks_qap_relative_path(

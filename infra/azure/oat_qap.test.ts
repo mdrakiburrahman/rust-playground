@@ -11,7 +11,7 @@ const id = '22222222-2222-4222-8222-222222222222';
 const run = '9dcd6847-2a56-45a3-bd3c-54af839f451e';
 const name = `oat_${run.replaceAll('-', '')}_sqlserver_synthetic_table`;
 const relative = `synthetic/runs/${run}/dataflow/telemetry/sqlserver/sqlserver_synthetic_table`;
-const manifest = { schema_version: 1, run_id: run, tables: [{ external_table: name, relative_path: relative }] };
+const manifest = { schema_version: 1, run_id: run, database: 'experimentqap', tables: [{ external_table: name, relative_path: relative }] };
 afterEach(() => mock.restoreAll());
 
 function fixture(t: TestContext) {
@@ -154,6 +154,8 @@ test('locked run/path/name validation still rejects traversal, wrong identity an
   const azure = new Azure(new Config({ AZURE_SUBSCRIPTION_ID: id }));
   azure.c.table_prefix = 'synthetic';
   assert.deepEqual(validate_oat_manifest(azure, run, manifest), manifest);
+  assert.throws(() => validate_oat_manifest(azure, run, { schema_version: 1, run_id: run, tables: manifest.tables }), /missing or unexpected fields/);
+  assert.throws(() => validate_oat_manifest(azure, run, { ...manifest, database: 'arrowcol' }), /must match the configured experiment database/);
   for (const patch of [
     { run_id: id }, { schema_version: '1' }, { tables: [manifest.tables[0], manifest.tables[0]] },
     { tables: [{ external_table: name, relative_path: relative + '/child' }] },

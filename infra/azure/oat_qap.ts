@@ -7,6 +7,7 @@ import { read_run_fic_record, parse_run_fic_record, verify_run_fic, type RunFicR
 export interface OatManifest {
   schema_version: 1;
   run_id: string;
+  database: string;
   tables: { external_table: string; relative_path: string }[];
 }
 export interface OatSnapshot {
@@ -388,8 +389,11 @@ function prefixFor(azure: Azure): string {
 export function validate_oat_manifest(azure: Azure, runId: string, value: unknown): OatManifest {
   canonicalRun(runId);
   const manifest = object(value, 'OAT manifest');
-  exactKeys(manifest, ['schema_version', 'run_id', 'tables'], 'OAT manifest');
+  exactKeys(manifest, ['schema_version', 'run_id', 'database', 'tables'], 'OAT manifest');
   if (manifest.schema_version !== 1 || manifest.run_id !== runId || !Array.isArray(manifest.tables) || !manifest.tables.length) throw new Failure('Manifest version, run or tables mismatch.');
+  const database = text(manifest.database, 'database');
+  if (database !== text(azure.c.experimentDatabase, 'experiment database'))
+    throw new Failure('OAT manifest database must match the configured experiment database.');
   const names = new Set<string>(), paths = new Set<string>();
   const namePrefix = `oat_${runId.replaceAll('-', '')}_`;
   const tableRoot = `${prefixFor(azure)}/${runId}/dataflow/telemetry/sqlserver/`;
@@ -404,7 +408,7 @@ export function validate_oat_manifest(azure: Azure, runId: string, value: unknow
     names.add(name.toLowerCase()); paths.add(relative);
     return { external_table: name, relative_path: relative };
   }).sort((a, b) => a.external_table.localeCompare(b.external_table));
-  return { schema_version: 1, run_id: runId, tables };
+  return { schema_version: 1, run_id: runId, database, tables };
 }
 type Entry = {
   name: string; storagePath: string; connection: string;
