@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { chmod, lstat, mkdir, readFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, readFile, rm } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -158,7 +158,6 @@ export async function setup(options: SetupOptions = {}, runner: typeof run_tree 
   await checked(runner, ['kubectl', '--context', live.clusterName, '--request-timeout=60s', 'apply',
     '--filename', identityPath], 120, 'Apply host publisher identity');
 
-  const runtimeConfigPath = resolve(directory, 'runtime.json');
   const draft: RuntimeConfig = {
     namespace: 'arrow-collector', serviceAccount: 'arrow-collector', oatRunId: randomUUID(),
     workloadIdentityClientId: clientId, subscriptionId: live.subscription, stamp: live.stamp,
@@ -170,7 +169,7 @@ export async function setup(options: SetupOptions = {}, runner: typeof run_tree 
   const tag = options.tag ?? `oat-${revision}`;
   if (!/^[a-z0-9][a-z0-9._-]{0,127}$/.test(tag)) throw new Error('--tag must be a valid lowercase container tag.');
   const imageOptions = { env: bootstrapEnvPath, azureEnv: bootstrapEnvPath, stampConfig: stampConfigPath,
-    registry: config.registry, federated: true, tag, runtimeConfig: runtimeConfigPath };
+    registry: config.registry, federated: true, tag, runtimeConfig: resolve(directory, 'runtime.publish.json') };
   const imagesApi = await import('./publish-images.js');
   let runtime: RuntimeConfig;
   let clientImage: string;
@@ -179,10 +178,12 @@ export async function setup(options: SetupOptions = {}, runner: typeof run_tree 
     runtime = validateRuntime({ ...draft, images: published.images });
     clientImage = published.client;
   } else {
-    await writePrivateFile(runtimeConfigPath, `${JSON.stringify(validateRuntime(draft, true), null, 2)}\n`);
-    await imagesApi.buildLocalImages({ revision }, runner);
-    runtime = await imagesApi.publishImages(imageOptions, runner);
-    clientImage = await imagesApi.publishClientImage(imageOptions, runner);
+    try {
+      await writePrivateFile(imageOptions.runtimeConfig, `${JSON.stringify(validateRuntime(draft, true), null, 2)}\n`);
+      await imagesApi.buildLocalImages({ revision }, runner);
+      runtime = await imagesApi.publishImages(imageOptions, runner);
+      clientImage = await imagesApi.publishClientImage(imageOptions, runner);
+    } finally { await rm(imageOptions.runtimeConfig, { force: true }); }
   }
   const assertion = await checked(runner, ['kubectl', '--context', live.clusterName, '--request-timeout=60s',
     'create', 'token', 'arrow-collector', '--namespace', 'arrow-collector', '--audience',
