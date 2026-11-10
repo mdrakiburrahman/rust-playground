@@ -8,6 +8,7 @@
 | `oat-config.example.json` | Validated configuration template with no credentials. |
 | `architecture.drawio` / `architecture.drawio.png` | Editable source and rendered companion for the same layered architecture. |
 | [Runtime setup](RUNTIME.md) | Isolated internal-only Kubernetes stack, image digests, workload identity, SQL bootstrap, secret files and local rehearsal. |
+| [E1-E5 input preparation](EXPERIMENTS.md) | Offline binding of private AKS settings and reviewed pilot windows into five comparable 32-table runs. |
 
 The viewer's six numbered stack parts match the diagram badges. Their numbers appear beside every OAT JSON field and Parquet result column that they affect. Preserve these IDs and titles when updating the diagram, configuration reference, or heatmap.
 
