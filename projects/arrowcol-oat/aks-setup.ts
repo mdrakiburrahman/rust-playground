@@ -1,14 +1,213 @@
-import { run_tree } from '../../infra/azure/bootstrap.js';
+import { randomUUID } from 'node:crypto';
+import { chmod, lstat, mkdir, readFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { parseArgs } from 'node:util';
+import { parseDocument } from 'yaml';
+import { Config, load_env, ROOT, run_tree } from '../../infra/azure/bootstrap.js';
+import { loadStampConfig } from '../../infra/azure/stamp.js';
+import { PublisherControl, READY } from '../../infra/azure/publisher_control.js';
+import type { Metadata } from '../../infra/azure/authority.js';
 import type { LiveStamp, SetupOptions, SetupResult } from './aks-types.js';
+import { generatePrivateInputs, renderBootstrapEnv, validateRuntime, writePrivateFile, type RuntimeConfig } from './runtime.js';
 
-export async function setup(_options: SetupOptions, _runner: typeof run_tree = run_tree): Promise<SetupResult> {
-  throw new Error('aks setup is not implemented yet');
+const setupCommand = 'npx --no-install arrowcol-oat aks setup';
+const destroyCommand = 'npx --no-install arrowcol-oat aks destroy --confirm arrow-collector-rg';
+const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
+const directory = resolve(ROOT, 'out/arrowcol-oat');
+
+async function checked(runner: typeof run_tree, command: string[], timeout: number, label: string,
+  environment?: NodeJS.ProcessEnv): Promise<string> {
+  const result = await runner(command, timeout, ROOT, environment);
+  if (result.returncode) {
+    const detail = result.stderr.trim().replace(/[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, '[redacted]').slice(0, 1000);
+    throw new Error(`${label} failed (${result.returncode})${detail ? `: ${detail}` : ''}. Run \`${setupCommand}\` after correcting the failure.`);
+  }
+  return result.stdout.trim();
 }
 
-export async function discoverLiveStamp(_options: SetupOptions, _runner: typeof run_tree = run_tree): Promise<LiveStamp> {
-  throw new Error('aks setup is not implemented yet');
+function stampNumber(value: string): string {
+  if (!/^(?:00000|[1-9]\d{4})$/.test(value)) throw new Error('--stamp must be 00000 or an integer in 10000..99999.');
+  return value;
 }
 
-export async function main(_args: string[], _runner: typeof run_tree = run_tree): Promise<void> {
-  throw new Error('aks setup is not implemented yet');
+export async function discoverLiveStamp(options: SetupOptions = {}, runner: typeof run_tree = run_tree): Promise<LiveStamp> {
+  const config = loadStampConfig(options.stampConfig);
+  const result = await runner(['az', 'aks', 'list', '--subscription', config.subscription,
+    '--resource-group', config.resourceGroup, '--output', 'json', '--only-show-errors'], 120, ROOT);
+  if (result.returncode) {
+    if (/ResourceGroupNotFound/.test(result.stderr)) throw new Error('No live stamp; run `npx --no-install arrowcol-oat aks deploy`.');
+    throw new Error('Could not discover the live AKS stamp; run `az login --use-device-code`, then retry `npx --no-install arrowcol-oat aks setup`.');
+  }
+  const value: unknown = JSON.parse(result.stdout);
+  if (!Array.isArray(value)) throw new Error('Azure returned an invalid AKS inventory.');
+  const clusters = value.filter((item): item is { name: string } =>
+    item !== null && typeof item === 'object' && typeof item.name === 'string' && item.name.startsWith('arrow-collector-'));
+  if (!clusters.length) throw new Error('No live stamp; run `npx --no-install arrowcol-oat aks deploy`.');
+  if (clusters.length !== 1) throw new Error(`Several live AKS stamps found: ${clusters.map(c => c.name).sort().join(', ')}. Select one live stamp before setup; inventory with \`npx --no-install arrowcol-oat aks destroy\`.`);
+  const clusterName = clusters[0]!.name;
+  const stamp = stampNumber(clusterName.slice('arrow-collector-'.length));
+  if (options.stamp !== undefined && stampNumber(String(options.stamp)) !== stamp) {
+    throw new Error(`Requested stamp ${options.stamp} disagrees with live cluster ${clusterName}; run \`${setupCommand} --stamp ${stamp}\`.`);
+  }
+  return { stamp, subscription: config.subscription, resourceGroup: config.resourceGroup, clusterName };
+}
+
+async function requireCurrentState(stamp: LiveStamp): Promise<void> {
+  try {
+    const runtime = JSON.parse(await readFile(resolve(directory, 'runtime.json'), 'utf8')) as RuntimeConfig;
+    if (runtime.stamp !== stamp.stamp || runtime.subscriptionId.toLowerCase() !== stamp.subscription.toLowerCase()) {
+      throw new Error(`Stale AKS private inputs belong to another stamp; run \`${destroyCommand}\` before deploying.`);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+}
+
+async function capturedGeneration(config: Config, runner: typeof run_tree): Promise<string> {
+  const authority = new PublisherControl({
+    c: { sandbox: config.sandbox },
+    async head_control(): Promise<[Metadata, string]> {
+      const value = JSON.parse(await checked(runner, ['az', 'storage', 'container', 'show',
+        '--account-name', config.account, '--name', config.checkpoints, '--auth-mode', 'login',
+        '--subscription', config.subscription, '--output', 'json', '--only-show-errors'], 120, 'Read publisher authority')) as {
+          metadata?: Metadata; properties?: { etag?: string };
+        };
+      if (!value.metadata || !value.properties?.etag) throw new Error('Publisher authority metadata or ETag is missing.');
+      return [value.metadata, value.properties.etag];
+    },
+    async set_control(): Promise<void> { throw new Error('Setup must never mutate publisher authority.'); },
+  });
+  const [metadata] = await authority.read();
+  if (metadata.resetstate !== READY) {
+    throw new Error('Publisher authority must be ready-v1 before setup; finish provisioning first.');
+  }
+  return metadata.resetgeneration;
+}
+
+export async function setup(options: SetupOptions = {}, runner: typeof run_tree = run_tree): Promise<SetupResult> {
+  const live = await discoverLiveStamp(options, runner);
+  await requireCurrentState(live);
+  const stampConfigPath = resolve(ROOT, options.stampConfig ?? 'infra/azure/stamp.yaml');
+  const original = await readFile(stampConfigPath, 'utf8');
+  const document = parseDocument(original);
+  if (document.errors.length) throw new Error('Invalid stamp YAML.');
+  document.set('stamp', live.stamp);
+  if (document.toString() !== original) {
+    if (!(await lstat(stampConfigPath)).isFile()) throw new Error('Stamp YAML must be a regular file.');
+    await chmod(stampConfigPath, 0o600);
+    await writePrivateFile(stampConfigPath, document.toString());
+  }
+  const stampConfig = loadStampConfig(stampConfigPath);
+  if (stampConfig.aks.namespace !== 'arrow-collector' || stampConfig.aks.serviceAccount !== 'arrow-collector') {
+    throw new Error('The host publisher namespace and ServiceAccount must both be arrow-collector.');
+  }
+  const privatePaths = ['out/arrowcol-oat/runtime.json',
+    'out/arrowcol-oat/bootstrap.env', 'out/arrowcol-oat/aks.env', 'out/arrowcol-oat/oat-config.aks.json',
+    'out/arrowcol-oat/secrets/publisher-assertion.jwt'];
+  const ignored = await checked(runner, ['git', 'check-ignore', ...privatePaths], 15, 'Private-state ignore check');
+  if (ignored.split(/\r?\n/).sort().join('\n') !== [...privatePaths].sort().join('\n')) {
+    throw new Error('All AKS private inputs must be ignored by git.');
+  }
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const info = await lstat(directory);
+  if (!info.isDirectory() || info.mode & 0o077) throw new Error('Private input directory must have mode 0700.');
+  await checked(runner, ['az', 'aks', 'get-credentials', '--subscription', live.subscription,
+    '--resource-group', live.resourceGroup, '--name', live.clusterName, '--context', live.clusterName,
+    '--overwrite-existing', '--only-show-errors'], 180, 'Fetch AKS credentials');
+  await checked(runner, ['kubelogin', 'convert-kubeconfig', '--context', live.clusterName, '-l', 'azurecli',
+    '--disable-environment-override'], 60, 'Configure operator kube authentication');
+  const clientId = await checked(runner, ['az', 'identity', 'show', '--subscription', live.subscription,
+    '--resource-group', live.resourceGroup, '--name', 'arrow-collector', '--query', 'clientId',
+    '--output', 'tsv', '--only-show-errors'], 60, 'Read arrow-collector UAMI');
+  const tenantId = await checked(runner, ['az', 'account', 'show', '--subscription', live.subscription,
+    '--query', 'tenantId', '--output', 'tsv', '--only-show-errors'], 60, 'Read operator tenant');
+  if (!uuid.test(clientId) || !uuid.test(tenantId)) throw new Error('Azure returned an invalid UAMI client ID or tenant UUID.');
+  const config = new Config({ AZURE_SUBSCRIPTION_ID: live.subscription, AZURE_UAMI_CLIENT_ID: clientId }, stampConfig);
+  const generation = await capturedGeneration(config, runner);
+  const bootstrapValues = { ...config.generated(), AZURE_SUBSCRIPTION_ID: live.subscription };
+  const bootstrapEnvPath = resolve(directory, 'bootstrap.env');
+  await writePrivateFile(bootstrapEnvPath, renderBootstrapEnv(bootstrapValues, generation));
+
+  const manifests = await Promise.all(['namespace.yaml', 'service-account.yaml'].map(async filename => {
+    const template = parseDocument(await readFile(resolve(ROOT, 'infra/kubernetes/base', filename), 'utf8'));
+    if (template.errors.length) throw new Error(`Invalid publisher identity template ${filename}.`);
+    template.setIn(['metadata', 'name'], 'arrow-collector');
+    if (filename === 'service-account.yaml') {
+      template.setIn(['metadata', 'namespace'], 'arrow-collector');
+      template.setIn(['metadata', 'annotations', 'azure.workload.identity/client-id'], clientId);
+    }
+    return template.toString();
+  }));
+  const identityPath = resolve(directory, 'publisher-identity.yaml');
+  await writePrivateFile(identityPath, manifests.join('---\n'));
+  await checked(runner, ['kubectl', '--context', live.clusterName, '--request-timeout=60s', 'apply',
+    '--filename', identityPath], 120, 'Apply host publisher identity');
+
+  const runtimeConfigPath = resolve(directory, 'runtime.json');
+  const draft: RuntimeConfig = {
+    namespace: 'arrow-collector', serviceAccount: 'arrow-collector', oatRunId: randomUUID(),
+    workloadIdentityClientId: clientId, subscriptionId: live.subscription, stamp: live.stamp,
+    deltaRoot: `${config.table_root}dataflow`,
+    images: { sqlserver: 'unpublished', catalog: 'unpublished', router: 'unpublished', dataflow: 'unpublished' },
+  };
+  const revision = await checked(runner, ['git', 'rev-parse', '--short=12', 'HEAD'], 15, 'Read source revision');
+  if (!/^[a-f0-9]{12}$/.test(revision)) throw new Error('Git returned an invalid source revision.');
+  const tag = options.tag ?? `oat-${revision}`;
+  if (!/^[a-z0-9][a-z0-9._-]{0,127}$/.test(tag)) throw new Error('--tag must be a valid lowercase container tag.');
+  const imageOptions = { env: bootstrapEnvPath, azureEnv: bootstrapEnvPath, stampConfig: stampConfigPath,
+    registry: config.registry, federated: true, tag, runtimeConfig: runtimeConfigPath };
+  // Image helpers are imported only after discovering and validating the selected live stamp.
+  const imagesApi = await import('./publish-images.js');
+  let runtime: RuntimeConfig;
+  let clientImage: string;
+  if (options.skipImages) {
+    const published = await imagesApi.readPublishedImages({ ...imageOptions, revision }, runner);
+    runtime = validateRuntime({ ...draft, images: published.images });
+    clientImage = published.client;
+  } else {
+    await writePrivateFile(runtimeConfigPath, `${JSON.stringify(validateRuntime(draft, true), null, 2)}\n`);
+    await imagesApi.buildLocalImages({ revision }, runner);
+    runtime = await imagesApi.publishImages(imageOptions, runner);
+    clientImage = await imagesApi.publishClientImage(imageOptions, runner);
+  }
+  const assertion = await checked(runner, ['kubectl', '--context', live.clusterName, '--request-timeout=60s',
+    'create', 'token', 'arrow-collector', '--namespace', 'arrow-collector', '--audience',
+    'api://AzureADTokenExchange', '--duration', '1h'], 90, 'Mint host federation assertion');
+  const oatTemplate = JSON.parse(await readFile(resolve(ROOT,
+    'docs/experiments/arrowcol-oat/oat-config.aks.quick.json'), 'utf8')) as Record<string, unknown>;
+  const files = await generatePrivateInputs({ directory, runtime, bootstrapValues, resetGeneration: generation,
+    tenantId, assertion, clientImage, qapEndpoint: config.uri, oatTemplate });
+  let preflightReady = false;
+  if (!options.skipPreflight) {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      console.log(`AKS preflight pass ${attempt}/3 for ${live.clusterName}`);
+      const result = await runner(['npx', '--no-install', 'arrowcol-oat', '--mode', 'aks', '--preflight-only',
+        '--config', files.aksConfigPath], 600, ROOT, { ...load_env(resolve(directory, 'aks.env')), ...process.env });
+      if (result.stdout.trim()) console.log(result.stdout.trim());
+      if (!result.returncode) { preflightReady = true; break; }
+      if (result.stderr.trim()) console.error(result.stderr.trim());
+    }
+    if (!preflightReady) throw new Error(`AKS preflight did not become READY in three bounded passes; correct the reported gates and run \`${setupCommand}\`.`);
+  }
+  console.log(`AKS setup ${preflightReady ? 'READY' : 'prepared (preflight skipped)'}: stamp ${live.stamp}, ${live.clusterName}, five digest-pinned images.`);
+  console.log('Host assertion lasts one hour; rerun setup before it expires. Next: npx --no-install arrowcol-oat --mode aks');
+  return { stamp: live.stamp, clusterName: live.clusterName, images: { ...runtime.images, client: clientImage },
+    ...files, preflightReady };
+}
+
+export async function main(args: string[], runner: typeof run_tree = run_tree): Promise<void> {
+  const { values } = parseArgs({ args, strict: true, allowPositionals: false, options: {
+    stamp: { type: 'string' }, 'stamp-config': { type: 'string' }, tag: { type: 'string' },
+    'skip-images': { type: 'boolean', default: false }, 'skip-preflight': { type: 'boolean', default: false },
+  } });
+  await setup({ stamp: values.stamp === undefined ? undefined : stampNumber(values.stamp),
+    stampConfig: values['stamp-config'], tag: values.tag,
+    skipImages: values['skip-images'], skipPreflight: values['skip-preflight'] }, runner);
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main(process.argv.slice(2)).catch((error: unknown) => {
+    console.error(error instanceof Error ? error.message : 'AKS setup failed'); process.exitCode = 1;
+  });
 }

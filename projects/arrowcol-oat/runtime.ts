@@ -1,6 +1,6 @@
-import { randomBytes } from 'node:crypto';
-import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { randomBytes, randomUUID } from 'node:crypto';
+import { lstat, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { dirname, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parse, stringify } from 'yaml';
 
@@ -237,6 +237,110 @@ export async function prepareSecrets(directory: string, bootstrapEnv: string): P
       }
     }
   }
+}
+
+export async function writePrivateFile(filename: string, content: string): Promise<void> {
+  await mkdir(dirname(filename), { recursive: true, mode: 0o700 });
+  try {
+    const info = await lstat(filename);
+    if (!info.isFile() || info.mode & 0o077) throw new Error('Refusing to overwrite an unsafe private input file.');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  const pending = `${filename}.${randomUUID()}.pending`;
+  try {
+    await writeFile(pending, content, { flag: 'wx', mode: 0o600 });
+    await rename(pending, filename);
+  } finally { await rm(pending, { force: true }); }
+}
+
+export function renderBootstrapEnv(values: Record<string, string>, generation: string): string {
+  if (!uuid.test(generation)) throw new Error('bootstrap generation is not a UUID; never synthesize one');
+  const entries = { ...values, ARROWCOL_RESET_GENERATION: generation };
+  for (const [key, value] of Object.entries(entries)) {
+    if (!/^[A-Z][A-Z0-9_]*$/.test(key) || /[\r\n\0]/.test(value)) throw new Error('Invalid bootstrap environment entry.');
+  }
+  return Object.entries(entries).map(([key, value]) => `${key}=${value}\n`).join('');
+}
+
+export interface PrivateInputs {
+  directory: string;
+  runtime: RuntimeConfig;
+  bootstrapValues: Record<string, string>;
+  resetGeneration: string;
+  tenantId: string;
+  assertion: string;
+  clientImage: string;
+  qapEndpoint: string;
+  oatTemplate: Record<string, unknown>;
+}
+
+export async function generatePrivateInputs(input: PrivateInputs): Promise<{
+  runtimeConfigPath: string; bootstrapEnvPath: string; aksConfigPath: string;
+}> {
+  const runtime = validateRuntime(input.runtime);
+  if (!uuid.test(input.tenantId)) throw new Error('Azure tenant must be a UUID.');
+  if (!/^[a-z0-9]+\.azurecr\.io\/arrowcol-oat-client@sha256:[a-f0-9]{64}$/.test(input.clientImage) ||
+      !input.clientImage.startsWith(`arrowcollector${runtime.stamp}.azurecr.io/`)) {
+    throw new Error('DMV client must be pinned by manifest digest in the selected stamp registry.');
+  }
+  if (!/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(input.assertion) || input.assertion.length > 16_384) {
+    throw new Error('Kubernetes returned an invalid host federation assertion.');
+  }
+  let claims: { exp?: unknown };
+  try { claims = JSON.parse(Buffer.from(input.assertion.split('.')[1]!, 'base64url').toString('utf8')); }
+  catch { throw new Error('Kubernetes returned invalid host assertion claims.'); }
+  if (!claims || typeof claims.exp !== 'number' || claims.exp <= Date.now() / 1000 + 60) {
+    throw new Error('Host assertion is expired or expires within one minute; run `npx --no-install arrowcol-oat aks setup`.');
+  }
+  const platform = input.oatTemplate.platform;
+  if (!platform || typeof platform !== 'object' || Array.isArray(platform) ||
+      (platform as Record<string, unknown>).kind !== 'aks') throw new Error('Expected the committed AKS OAT template.');
+  const endpoint = new URL(input.qapEndpoint);
+  if (endpoint.protocol !== 'https:' || !endpoint.hostname.startsWith(`arrow-collector-${runtime.stamp}.`) ||
+      !endpoint.hostname.endsWith('.kusto.windows.net') || endpoint.username || endpoint.password ||
+      endpoint.search || endpoint.hash || endpoint.port || endpoint.pathname !== '/') throw new Error('QAP endpoint must match the selected stamp.');
+  const directory = resolve(input.directory);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const directoryInfo = await lstat(directory);
+  if (!directoryInfo.isDirectory() || directoryInfo.mode & 0o077) throw new Error('Private input directory must have mode 0700.');
+  const runtimeConfigPath = resolve(directory, 'runtime.json');
+  try {
+    const existing = JSON.parse(await readFile(runtimeConfigPath, 'utf8')) as RuntimeConfig;
+    if (existing.stamp !== runtime.stamp || existing.subscriptionId !== runtime.subscriptionId) {
+      throw new Error('Stale AKS private inputs belong to another stamp; run `npx --no-install arrowcol-oat aks destroy --confirm arrow-collector-rg` before deploying.');
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  const bootstrapEnvPath = resolve(directory, 'bootstrap.env');
+  const aksConfigPath = resolve(directory, 'oat-config.aks.json');
+  await writePrivateFile(bootstrapEnvPath, renderBootstrapEnv(input.bootstrapValues, input.resetGeneration));
+  const secrets = resolve(directory, 'secrets');
+  try {
+    const info = await lstat(secrets);
+    if (!info.isDirectory() || info.mode & 0o077) throw new Error('Secret directory must be a real directory with mode 0700.');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  await prepareSecrets(secrets, bootstrapEnvPath);
+  const assertionFile = resolve(secrets, 'publisher-assertion.jwt');
+  await writePrivateFile(assertionFile, `${input.assertion}\n`);
+  await writePrivateFile(resolve(directory, 'aks.env'), renderBootstrapEnv({
+    ...input.bootstrapValues, ARROWCOL_MODE: 'azure', AZURE_CLIENT_ID: runtime.workloadIdentityClientId,
+    AZURE_TENANT_ID: input.tenantId, AZURE_FEDERATED_TOKEN_FILE: assertionFile,
+  }, input.resetGeneration));
+  await writePrivateFile(runtimeConfigPath, `${JSON.stringify(runtime, null, 2)}\n`);
+  const account = `arrowcollector${runtime.stamp}`;
+  await writePrivateFile(aksConfigPath, `${JSON.stringify({
+    ...input.oatTemplate,
+    platform: { ...platform, runtime_config_file: runtimeConfigPath, bootstrap_env_file: bootstrapEnvPath },
+    stamp: runtime.stamp, kubectl_context: `arrow-collector-${runtime.stamp}`,
+    qap_endpoint: input.qapEndpoint, qap_database: 'arrowcol', dmv_client_image: input.clientImage,
+    result_url: `abfss://experiments@${account}.dfs.core.windows.net/arrowcol-oat/results.parquet`,
+    website_url: `abfss://$web@${account}.dfs.core.windows.net/results.parquet`,
+  }, null, 2)}\n`);
+  return { runtimeConfigPath, bootstrapEnvPath, aksConfigPath };
 }
 
 async function main(args: string[]): Promise<void> {
