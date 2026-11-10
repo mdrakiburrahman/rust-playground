@@ -354,7 +354,7 @@ fn canonical_edge_request(
     timestamp: UnixMillis,
     nonce: &str,
 ) -> Result<String, AuthFailure> {
-    const SIGNED_HEADERS: [&str; 8] = [
+    const SIGNED_HEADERS: [&str; 9] = [
         "x-arrowcol-protocol-version",
         "x-arrowcol-implementation-pool",
         "x-arrowcol-catalog",
@@ -362,6 +362,7 @@ fn canonical_edge_request(
         "x-arrowcol-table",
         "x-arrowcol-schema-fingerprint",
         "x-arrowcol-control-operation",
+        "x-arrowcol-oat-run-id",
         "content-type",
     ];
     if path.is_empty() || path.len() > 2_048 || path.chars().any(char::is_control) {

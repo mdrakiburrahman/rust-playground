@@ -75,7 +75,10 @@ x-arrowcol-edge-signature
 ```
 
 The signature is HMAC-SHA256 over the timestamp, nonce, method, path, content
-type, routing metadata, and control metadata. Assertions are time-bounded and
+type, routing metadata (including `x-arrowcol-oat-run-id`), and control metadata.
+Router and edge-signing clients must be upgraded together when this signed
+header set changes, including requests without an OAT run ID.
+Assertions are time-bounded and
 nonces are replay-protected in process. Direct traffic, tampering, replay, and
 externally supplied `x-arrowcol-internal-auth-*` headers are rejected.
 

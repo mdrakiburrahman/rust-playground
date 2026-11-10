@@ -356,7 +356,7 @@ fn canonical_edge_request(
     timestamp: u64,
     nonce: &str,
 ) -> Result<String> {
-    const SIGNED_HEADERS: [&str; 8] = [
+    const SIGNED_HEADERS: [&str; 9] = [
         "x-arrowcol-protocol-version",
         "x-arrowcol-implementation-pool",
         "x-arrowcol-catalog",
@@ -364,6 +364,7 @@ fn canonical_edge_request(
         "x-arrowcol-table",
         "x-arrowcol-schema-fingerprint",
         "x-arrowcol-control-operation",
+        "x-arrowcol-oat-run-id",
         "content-type",
     ];
     if path.is_empty()
@@ -425,6 +426,19 @@ fn bounded_error(value: &str) -> String {
 #[cfg(test)]
 mod error_diagnostics_tests {
     use super::*;
+
+    #[test]
+    fn edge_signer_covers_oat_run_id_even_when_absent() -> Result<()> {
+        let run_id = "00000000-0000-0000-0000-000000000001";
+        let mut headers = HeaderMap::new();
+        let absent = canonical_edge_request(&Method::POST, DO_PUT_PATH, &headers, 100_000, "nonce")?;
+        assert!(absent.contains("\nx-arrowcol-oat-run-id:\n"));
+        headers.insert("x-arrowcol-oat-run-id", HeaderValue::from_static(run_id));
+        let present = canonical_edge_request(&Method::POST, DO_PUT_PATH, &headers, 100_000, "nonce")?;
+        assert!(present.contains(&format!("\nx-arrowcol-oat-run-id:{run_id}\n")));
+        assert_ne!(absent, present);
+        Ok(())
+    }
 
     #[test]
     fn status_fields_keep_error_code_and_redact_private_values() {
