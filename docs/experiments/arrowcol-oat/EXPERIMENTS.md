@@ -13,6 +13,37 @@ ran. Earlier parse-only drafts with 19 `TODO` table slots and fixed 30/120-secon
 timings are historical receipts, not executable inputs. The binder reads the
 now-approved canonical fixture rather than copying or inventing table names.
 
+## Capacity prerequisites
+
+The example stamp configures one node in each user pool. Azure CNI Overlay
+supports at most 250 pods per node and assigns each node a /24 pod address
+block ([Azure CNI Overlay planning](https://learn.microsoft.com/azure/aks/azure-cni-overlay#ip-address-planning)).
+Reserve 32 pod slots per node for DaemonSets; with maxPods 250 this leaves 218
+workload slots. The minimum maxPods values for the largest planned workloads
+are 160 for the client pool (128 E4 Jobs + 32 reserved) and 52 for the ArrowCol
+pool (20 workload pods + 32 reserved).
+
+| Run | Client-pool Job pods | ArrowCol-pool peak pods |
+| --- | ---: | ---: |
+| Default AKS quick run | 1 | 5 |
+| 32-table pilot | 32 | 5 |
+| E1 | 32 | 8 |
+| E2 | 32 | 12 |
+| E3 | 32 | 20 |
+| E4 | 128 | 20 |
+| E5 | 32 | 20 |
+
+Each client Job requests 250m CPU and 256Mi memory. E4 therefore requests
+32 CPU and 32Gi but configures 2 CPU and 2Gi limits per Job; its aggregate
+limits are 256 CPU and 256Gi on a 64-vCPU node, making CPU throttling a
+measurement-validity risk. The ArrowCol pool's peak comprises SQL Server
+(1 CPU/3Gi), catalog (500m/1Gi), router (500m/512Mi), the configured Dataflow
+replicas (2 CPU/4Gi each), and one transient pin-init Job (100m/128Mi). The
+32-slot DaemonSet reserve is a conservative capacity allowance, not a measured
+count for a particular node image. During the pilot, retain per-container CPU
+usage, CFS throttled seconds, throttled periods divided by total periods, and
+node CPU utilization aligned to each 30-second measurement window.
+
 ## Inputs and remaining binding
 
 | Input | Source / rule |

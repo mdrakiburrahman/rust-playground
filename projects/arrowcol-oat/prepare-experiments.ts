@@ -5,6 +5,55 @@ import { parseArgs } from 'node:util';
 import { readOatConfigForMode } from './launch.js';
 import { validateRuntime } from './runtime.js';
 
+import { parseStampConfig, type StampConfig } from '../../infra/azure/stamp.js';
+export const DAEMONSET_POD_ALLOWANCE_PER_NODE = 32;
+const MAX_PODS_PER_NODE = 250;
+const FIXED_ARROWCOL_PODS = 3;
+const PIN_INIT_JOB_PODS = 1;
+
+export interface ExperimentPoolPodCount {
+  name: string;
+  clientPods: number;
+  arrowcolPods: number;
+}
+
+export function experimentPoolPodCount(name: string, config: Record<string, unknown>): ExperimentPoolPodCount {
+  if (!Array.isArray(config.tables) || config.tables.length === 0) throw new Error(`${name} must have at least one table`);
+  const clientsPerTable = integer(config.clients_per_table, 1, 128, `${name} clients_per_table`);
+  if (!Array.isArray(config.replica_counts) || config.replica_counts.length === 0) {
+    throw new Error(`${name} must have at least one ArrowCol replica count`);
+  }
+  const maximumReplicas = Math.max(...config.replica_counts.map((value) => integer(value, 1, 16, `${name} replica_counts`)));
+  return {
+    name,
+    clientPods: config.tables.length * clientsPerTable,
+    arrowcolPods: FIXED_ARROWCOL_PODS + maximumReplicas + PIN_INIT_JOB_PODS,
+  };
+}
+
+export function assertExperimentPoolCapacity(
+  userPools: StampConfig['aks']['userPools'], experiments: ExperimentPoolPodCount[],
+): void {
+  for (const experiment of experiments) {
+    for (const [role, podCount] of [['client', experiment.clientPods], ['arrowcol', experiment.arrowcolPods]] as const) {
+      if (!Number.isSafeInteger(podCount) || podCount < 0) throw new Error(`${experiment.name} has an invalid ${role} pod count`);
+      const poolIndex = userPools.findIndex((pool) => pool.role === role);
+      if (poolIndex < 0) throw new Error(`AKS stamp has no ${role} user pool; ${experiment.name} capacity cannot be verified`);
+      const pool = userPools[poolIndex]!;
+      const workloadSlots = (pool.maxPods - DAEMONSET_POD_ALLOWANCE_PER_NODE) * pool.maxCount;
+      if (podCount <= workloadSlots) continue;
+      const minimumMaxPods = Math.ceil(podCount / pool.maxCount + DAEMONSET_POD_ALLOWANCE_PER_NODE);
+      const recommendation = minimumMaxPods <= MAX_PODS_PER_NODE
+        ? `raise aks.userPools[${poolIndex}].maxPods to at least ${minimumMaxPods}`
+        : `raise aks.userPools[${poolIndex}].maxCount to at least ${Math.ceil(podCount / (MAX_PODS_PER_NODE - DAEMONSET_POD_ALLOWANCE_PER_NODE))} with maxPods=${MAX_PODS_PER_NODE}`;
+      throw new Error(
+        `${experiment.name} requires ${podCount} ${role} pods, but pool "${pool.name}" has only ${workloadSlots} workload slots ` +
+        `after reserving ${DAEMONSET_POD_ALLOWANCE_PER_NODE} pods per node for DaemonSets; ${recommendation}.`,
+      );
+    }
+  }
+}
+
 export interface PilotBinding {
   warmupSeconds: number;
   measureSeconds: number;
@@ -121,6 +170,18 @@ export async function main(args: string[], workspaceRoot = resolve('.')): Promis
     measureSeconds: Number(values['measure-seconds']),
     higherDfeConcurrency: Number(values['higher-dfe']),
   });
+  let stampSource: string;
+  try {
+    stampSource = await readFile(resolve(root, 'infra/azure/stamp.yaml'), 'utf8');
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
+      throw new Error('Configured AKS pool limits are required; create infra/azure/stamp.yaml from infra/azure/stamp.example.yaml before preparing E1-E5.', { cause: error });
+    }
+    throw error;
+  }
+  const stamp = parseStampConfig(stampSource);
+  assertExperimentPoolCapacity(stamp.aks.userPools, Object.entries(configs).map(([name, config]) =>
+    experimentPoolPodCount(name, config)));
   await mkdir(privateRoot, { recursive: true, mode: 0o700 });
   await mkdir(out, { mode: 0o700 });
   for (const [name, config] of Object.entries(configs)) {
