@@ -4483,20 +4483,25 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
     Ok(())
 }
 
-async fn run_run_fic_helper(
+fn run_fic_helper_command(
     operation: &str,
     run_id: &str,
     namespace: Option<&str>,
     service_account: Option<&str>,
     record_path: &Path,
     wait_seconds: Option<&str>,
-) -> Result<()> {
-    let script = std::env::current_dir()?.join("infra/azure/bootstrap.ts");
+) -> Result<Command> {
+    let workspace = std::env::current_dir()?;
+    let script = workspace.join("infra/azure/bootstrap.ts");
     let mut command = Command::new("npx");
     command
-        .current_dir(std::env::current_dir()?)
+        .current_dir(workspace)
         .args(["--no-install", "tsx"])
         .kill_on_drop(true);
+    // Run-FIC ARM mutations use the operator context whose permissions preflight checks.
+    for variable in ["AZURE_CLIENT_ID", "AZURE_TENANT_ID", "AZURE_FEDERATED_TOKEN_FILE"] {
+        command.env_remove(variable);
+    }
     command.arg(script);
     command.args([operation, "--run-id", run_id]);
     if let Some(namespace) = namespace {
@@ -4510,7 +4515,18 @@ async fn run_run_fic_helper(
     if let Some(wait_seconds) = wait_seconds {
         command.args(["--wait-seconds", wait_seconds]);
     }
-    let output = command
+    Ok(command)
+}
+
+async fn run_run_fic_helper(
+    operation: &str,
+    run_id: &str,
+    namespace: Option<&str>,
+    service_account: Option<&str>,
+    record_path: &Path,
+    wait_seconds: Option<&str>,
+) -> Result<()> {
+    let output = run_fic_helper_command(operation, run_id, namespace, service_account, record_path, wait_seconds)?
         .output()
         .await
         .with_context(|| format!("start {operation} helper"))?;
@@ -5888,6 +5904,30 @@ fn platform_host_label(kind: crate::config::OatMode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_fic_helper_uses_operator_cli_identity_for_every_phase() -> Result<()> {
+        for operation in ["prepare-run-fic", "probe-run-fic", "cleanup-run-fic"] {
+            let command = run_fic_helper_command(
+                operation,
+                "00000000-0000-0000-0000-000000000001",
+                Some("arrow-collector-00000000000000000000000000000001"),
+                Some("arrowcol-oat"),
+                Path::new("/tmp/run-fic.json"),
+                None,
+            )?;
+            for variable in ["AZURE_CLIENT_ID", "AZURE_TENANT_ID", "AZURE_FEDERATED_TOKEN_FILE"] {
+                assert!(
+                    command
+                        .as_std()
+                        .get_envs()
+                        .any(|(key, value)| key == variable && value.is_none()),
+                    "{operation} must clear inherited {variable}"
+                );
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn aks_client_job_mounts_internal_identity_key_for_direct_catalog_ddl() -> Result<()> {
