@@ -42,6 +42,86 @@ async fn live_sql_immutable_oat_routing_rejects_different_valid_lease_owner() ->
     live_oat_pin_case(LiveOatPinCase::DifferentValidOwner).await
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires the local arrowcol-infra SQL Server integration harness"]
+async fn live_sql_pressure_publication_preserves_newest_timestamp_under_concurrent_writers() -> anyhow::Result<()> {
+    if std::env::var("ARROWCOL_SQLSERVER_TEST").as_deref() != Ok("1") {
+        return Ok(());
+    }
+    let _isolation = LIVE_ROUTING_CASE.lock().await;
+    let store = Arc::new(SqlServerRoutingStore::new(sql_config()?));
+    let started = now()?;
+    let instances = [CollectorInstanceId::new(), CollectorInstanceId::new()];
+    let fixture_table = TableIdentity::new(
+        CatalogName::new("telemetry")?,
+        SchemaName::new("live")?,
+        TableName::new(format!("pressure_{}", Uuid::new_v4().simple()))?,
+    );
+    let mut result: anyhow::Result<()> = async {
+        for (instance, port) in instances.iter().copied().zip([51_013, 51_014]) {
+            store
+                .register_collector(&live_registration(
+                    instance,
+                    format!("live-pressure-{}", Uuid::new_v4().simple()),
+                    port,
+                    subtract(started, 1_000)?,
+                    add(started, 600_000)?,
+                )?)
+                .await?;
+        }
+        store
+            .publish_pressure(&snapshot(instances[0], subtract(started, 10_000)?, 500, 0, None)?)
+            .await?;
+        publish_concurrent_pressure_writers(&store, instances[0], started).await?;
+        publish_concurrent_pressure_writers(&store, instances[1], started).await?;
+        Ok(())
+    }
+    .await;
+    result = finish_fixture(&store, result, &instances, &fixture_table, now()?).await;
+    result
+}
+
+async fn publish_concurrent_pressure_writers(
+    store: &Arc<SqlServerRoutingStore>,
+    instance_id: CollectorInstanceId,
+    started: UnixMillis,
+) -> anyhow::Result<()> {
+    const WRITERS: usize = 32;
+    let barrier = Arc::new(tokio::sync::Barrier::new(WRITERS));
+    let mut writers = Vec::with_capacity(WRITERS);
+    for offset in (1..=WRITERS).rev() {
+        let store = Arc::clone(store);
+        let barrier = Arc::clone(&barrier);
+        let pressure = snapshot(instance_id, subtract(started, 1_000 - offset as u64)?, 500, 0, None)?;
+        writers.push(tokio::spawn(async move {
+            barrier.wait().await;
+            store.publish_pressure(&pressure).await
+        }));
+    }
+    for writer in writers {
+        if let Err(error) = writer.await? {
+            anyhow::ensure!(
+                error.kind() == RoutingErrorKind::Conflict
+                    || error.to_string().contains("routing pressure timestamp did not advance"),
+                "pressure writer failed unexpectedly: {error}"
+            );
+        }
+    }
+    let view = store.load_view(now()?).await?;
+    let actual = view
+        .collectors
+        .get(&instance_id)
+        .and_then(|record| record.pressure.as_ref())
+        .map(|pressure| pressure.observed_at_unix_ms)
+        .ok_or_else(|| anyhow::anyhow!("concurrent pressure writers left no latest snapshot"))?;
+    let expected = subtract(started, 1_000 - WRITERS as u64)?;
+    anyhow::ensure!(
+        actual == expected,
+        "latest pressure timestamp regressed: expected {expected:?}, found {actual:?}"
+    );
+    Ok(())
+}
+
 async fn live_oat_pin_case(case: LiveOatPinCase) -> anyhow::Result<()> {
     if std::env::var("ARROWCOL_SQLSERVER_TEST").as_deref() != Ok("1") {
         return Ok(());

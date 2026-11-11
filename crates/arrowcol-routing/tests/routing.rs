@@ -25,6 +25,7 @@ fn millis(value: u64) -> UnixMillis {
 fn oat_policy(run_id: &str) -> RoutingPolicy {
     RoutingPolicy {
         oat_run_id: Some(run_id.to_owned()),
+        lease_ttl_ms: 200_000,
         ..RoutingPolicy::default()
     }
 }
@@ -357,6 +358,32 @@ async fn concurrent_oat_router_instances_read_one_prebound_table_owner() {
         after_routes.bind_initial_run_table_pin,
         setup_counts.bind_initial_run_table_pin
     );
+}
+
+#[tokio::test]
+async fn trusted_oat_initializer_rejects_run_longer_than_owner_lease() {
+    let (store, _, _) = seeded_store().await;
+    let engine_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);
+    let mut policy = oat_policy(OAT_RUN_CANONICAL);
+    policy.lease_ttl_ms = 30_000;
+    let engine = RoutingEngine::new(engine_store, policy)
+        .unwrap_or_else(|error| panic!("create short-lease setup engine: {error}"));
+    let expected = [LeaseKey::new(ImplementationPool::Dataflow, table())];
+    let before = store.operation_counts();
+
+    let result = engine
+        .initialize_run_table_pins(OAT_RUN_CANONICAL, &expected, millis(160_000), millis(100_000))
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(error)
+            if error.kind() == RoutingErrorKind::InvalidConfiguration
+                && error.to_string().contains("lease")
+    ));
+    let after = store.operation_counts();
+    assert_eq!(after.claim_lease, before.claim_lease);
+    assert_eq!(after.bind_initial_run_table_pin, before.bind_initial_run_table_pin);
 }
 
 #[tokio::test]
@@ -924,20 +951,27 @@ async fn fresh_oat_router_rejects_missing_bound_owner_even_with_a_valid_replacem
 async fn oat_pin_fails_closed_on_lease_expiry_without_selecting_a_replacement() {
     let (store, first, second) = seeded_store().await;
     let engine_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);
-    let engine = RoutingEngine::new(engine_store, oat_policy(OAT_RUN_EXPIRY))
-        .unwrap_or_else(|error| panic!("create routing engine: {error}"));
+    let mut policy = oat_policy(OAT_RUN_EXPIRY);
+    policy.lease_ttl_ms = 30_000;
+    let engine =
+        RoutingEngine::new(engine_store, policy).unwrap_or_else(|error| panic!("create routing engine: {error}"));
     engine
         .refresh(millis(100_000))
         .await
         .unwrap_or_else(|error| panic!("initial refresh: {error}"));
-    initialize_memory_oat_pin(&engine, OAT_RUN_EXPIRY, millis(100_001), millis(200_000)).await;
+    initialize_memory_oat_pin(&engine, OAT_RUN_EXPIRY, millis(100_001), millis(130_000)).await;
     let initial = engine
-        .route_ingest_for_run(&metadata(), OAT_RUN_EXPIRY, millis(200_000), millis(100_001))
+        .route_ingest_for_run(&metadata(), OAT_RUN_EXPIRY, millis(130_000), millis(100_001))
         .await
         .unwrap_or_else(|error| panic!("initial OAT route: {error}"));
-    let pinned = initial
+    let mut pinned = initial
         .lease
         .unwrap_or_else(|| panic!("OAT route did not return a lease"));
+    pinned.expires_at_unix_ms = millis(120_000);
+    store
+        .insert_lease(pinned.clone())
+        .await
+        .unwrap_or_else(|error| panic!("expire the pinned owner before the run: {error}"));
     let replacement = if pinned.holder_instance_id == first {
         second
     } else {
@@ -947,8 +981,8 @@ async fn oat_pin_fails_closed_on_lease_expiry_without_selecting_a_replacement() 
         .claim_lease(&LeaseClaim {
             key: pinned.key.clone(),
             candidate_instance_id: replacement,
-            now_unix_ms: millis(130_002),
-            expires_at_unix_ms: millis(160_002),
+            now_unix_ms: millis(120_001),
+            expires_at_unix_ms: millis(150_001),
             minimum_snapshot_at_unix_ms: millis(99_000),
             distinct_table_owners: false,
         })
@@ -956,7 +990,7 @@ async fn oat_pin_fails_closed_on_lease_expiry_without_selecting_a_replacement() 
     assert!(matches!(claim, Err(error) if error.kind() == RoutingErrorKind::Conflict));
 
     let retry = engine
-        .route_ingest_for_run(&metadata(), OAT_RUN_EXPIRY, millis(200_000), millis(130_002))
+        .route_ingest_for_run(&metadata(), OAT_RUN_EXPIRY, millis(130_000), millis(120_001))
         .await;
     assert!(matches!(retry, Err(error) if error.kind() == RoutingErrorKind::Conflict));
 }

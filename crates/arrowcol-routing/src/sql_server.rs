@@ -520,7 +520,7 @@ impl RoutingStore for RawSqlStore {
                 .execute(
                     "IF NOT EXISTS (SELECT 1 FROM arrowcol.routing_collectors WHERE instance_id = @P1) \
                          THROW 51101, 'routing collector registration is missing', 1; \
-                     IF EXISTS (SELECT 1 FROM arrowcol.routing_pressure_latest \
+                     IF EXISTS (SELECT 1 FROM arrowcol.routing_pressure_latest WITH (UPDLOCK, HOLDLOCK) \
                                 WHERE collector_instance_id = @P1 AND observed_at_utc >= @P2) \
                          THROW 51102, 'routing pressure timestamp did not advance', 1; \
                      UPDATE arrowcol.routing_pressure_latest SET \
