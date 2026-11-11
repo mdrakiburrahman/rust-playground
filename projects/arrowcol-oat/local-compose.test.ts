@@ -35,6 +35,7 @@ test('real Compose merge removes fixed networking and preserves daemon-selected 
     assert.equal(result.status, 0, result.stderr);
     const resolved = JSON.parse(result.stdout) as {
       services: Record<string, {
+        environment?: Record<string, string>;
         networks: Record<string, { ipv4_address?: string }>;
         ports?: Array<{ host_ip: string; published: string }>;
       }>;
@@ -47,6 +48,10 @@ test('real Compose merge removes fixed networking and preserves daemon-selected 
         assert.equal(port.published, '0', service);
       }
     }
+    assert.equal(
+      resolved.services['arrowcol-catalog']?.environment?.ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE,
+      '/run/secrets/internal-hmac',
+    );
     assert.equal(resolved.networks.default?.ipam?.config?.length ?? 0, 0);
   } finally {
     await rm(temporary, { recursive: true, force: true });

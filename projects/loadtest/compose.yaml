@@ -84,6 +84,7 @@ services:
     ports:
       - "${LOADTEST_BIND_HOST:-127.0.0.1}:${LOADTEST_CATALOG_PORT:-18817}:8817"
     environment:
+      ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE: /run/secrets/internal-hmac
       OTEL_EXPORTER_OTLP_ENDPOINT: ${LOADTEST_TRACES_ENDPOINT:-http://lgtm:4318}
       OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
     volumes:

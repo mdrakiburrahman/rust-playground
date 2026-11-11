@@ -68,6 +68,10 @@ test('isolated integrated topology pins images, WI, identity, probes and pooled 
   const catalog = get('Deployment', 'arrowcol-catalog').spec.template.spec;
   assert.ok(catalog.containers[0].args.includes('--ingestion-layout'));
   assert.deepEqual(catalog.containers[0].args.slice(-2), ['--ddl-identity-secret-file', '/run/auth/internal-hmac']);
+  assert.equal(
+    catalog.containers[0].env.find((e: any) => e.name === 'ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE').value,
+    '/run/auth/internal-hmac',
+  );
   assert.ok(catalog.containers[0].volumeMounts.some((mount: any) =>
     mount.name === 'auth' && mount.mountPath === '/run/auth' && mount.readOnly));
   assert.ok(catalog.volumes.some((volume: any) =>
