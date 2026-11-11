@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { Azure, Config, canonical_json } from './bootstrap.js';
 import { managementRows, parseKustoQueryResult, parseQualifiedDeltaDefinition,
-  assertExactConnectionStrings, validateExternalMutationReceipt, validate_experiment_database_resource, validate_oat_manifest } from './oat_qap.js';
+  assertExactConnectionStrings, validateExternalMutationReceipt,
+  validate_experiment_database_resource, validate_oat_manifest } from './oat_qap.js';
 
 const id = '22222222-2222-4222-8222-222222222222';
 const run = '9dcd6847-2a56-45a3-bd3c-54af839f451e';
