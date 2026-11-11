@@ -204,11 +204,14 @@ fn row_hash_multiset(batch: &RecordBatch) -> Result<Vec<(String, u64)>> {
                             .value(row)
                     ),
                     DataType::Timestamp(TimeUnit::Microsecond, _) => json!(
-                        array
-                            .as_any()
-                            .downcast_ref::<TimestampMicrosecondArray>()
-                            .context("timestamp row array")?
-                            .value(row)
+                        parquet::record::Field::TimestampMicros(
+                            array
+                                .as_any()
+                                .downcast_ref::<TimestampMicrosecondArray>()
+                                .context("timestamp row array")?
+                                .value(row)
+                        )
+                        .to_string()
                     ),
                     other => bail!("unsupported synthetic generated type {other} for row hash"),
                 }
@@ -463,7 +466,7 @@ mod tests {
         });
         let batch = build_logical_batch(table, 1, 7).await?;
         let expected = serde_json::json!({
-            "sample_time_utc": 8_000_000,
+            "sample_time_utc": "1970-01-01 00:00:08.000000 +00:00",
             "sample_time_utc__unix_nanos": 8_000_000_000_i64,
         });
         let hash = format!(
@@ -471,6 +474,17 @@ mod tests {
             hex::encode(Sha256::digest(serde_json::to_string(&expected)?.as_bytes()))
         );
         assert_eq!(batch.row_hashes, vec![(hash, 1)]);
+        let directory = tempfile::tempdir()?;
+        let mut writer =
+            arrow_deltalake::delta::DeltaTableWriter::open(directory.path().join(batch.table.identity.to_string()))?;
+        writer.write(&batch.record_batch).await?;
+        writer.close().await?;
+        let snapshot = delta_inspect::summarize(directory.path()).await?;
+        assert_eq!(
+            snapshot.tables[&batch.table.identity.to_string()].row_hashes,
+            batch.row_hashes.iter().cloned().collect(),
+            "durable acknowledgement hashes must match independently decoded Delta rows"
+        );
         Ok(())
     }
 
@@ -608,6 +622,18 @@ mod tests {
             assert!(
                 decoded_bytes <= LOADTEST_MAX_MESSAGE_BYTES as u64,
                 "{} decoded to {decoded_bytes} logical bytes",
+                statement.identity
+            );
+            let directory = tempfile::tempdir()?;
+            let mut writer =
+                arrow_deltalake::delta::DeltaTableWriter::open(directory.path().join(statement.identity.to_string()))?;
+            writer.write(&decoded[0]).await?;
+            writer.close().await?;
+            let snapshot = delta_inspect::summarize(directory.path()).await?;
+            assert_eq!(
+                snapshot.tables[&statement.identity.to_string()].row_hashes,
+                batch.row_hashes.iter().cloned().collect(),
+                "{} durable row hashes must match the independent Delta snapshot",
                 statement.identity
             );
         }
