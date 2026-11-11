@@ -4,7 +4,9 @@ import path from 'node:path';
 import test from 'node:test';
 import { parse, stringify } from 'yaml';
 import { ROOT, run_tree } from '../../infra/azure/bootstrap.js';
-import { buildLocalImages, MissingPublishedImagesError, publishClientImage, publishImages, readPublishedImages } from './publish-images.js';
+import {
+  buildLocalImages, MissingPublishedImagesError, publishClientImage, publishImages, publishViewer, readPublishedImages,
+} from './publish-images.js';
 import { validateRuntime } from './runtime.js';
 
 const client = '00000000-0000-0000-0000-000000000002';
@@ -85,6 +87,8 @@ function mock(registry: string, fault?: Fault) {
       assert.ok(['tag', 'push', 'pull'].includes(command[1]));
       assert.equal(env?.AZURE_CONFIG_DIR, azure);
       assert.equal(env?.DOCKER_CONFIG, docker);
+    } else if (command[0] === 'az' && command[1] === 'storage') {
+      assert.equal(env?.AZURE_CONFIG_DIR, azure);
     } else if (command[1] === 'aks') stdout = 'stamp.example.com';
     else if (command[0] === 'kubectl' && command[1] === 'config') stdout = 'https://stamp.example.com';
     else if (command[0] === 'kubectl' && command[1] === 'get') stdout = JSON.stringify({
@@ -244,6 +248,29 @@ test('publishes the revision-proven client image as a digest-pinned ACR referenc
   assert.ok(m.calls.some(c => c[0] === 'docker' && c[1] === 'push' && c[2].endsWith(`:oat-${revision}`)));
   assert.equal(m.calls.filter(c => c[0] === 'docker' && c[1] === 'push').length, 1);
   assert.ok(!m.calls.some(c => c[1] === 'apply' || c[1] === 'buildx'));
+  assert.equal(fs.existsSync(m.cache()), false);
+});
+
+test('publishes the static viewer to the stamped root website through the federated UAMI', async t => {
+  const options = fixture(t);
+  const m = mock(options.registry);
+  await assert.rejects(publishViewer({ ...options, federated: false }, m.runner), /requires --federated/);
+  assert.equal(m.calls.length, 0);
+  await publishViewer(options, m.runner);
+  const upload = m.calls.find(command =>
+    command[0] === 'az' && command[1] === 'storage' && command[2] === 'blob' && command[3] === 'upload');
+  assert.ok(upload);
+  const argument = (name: string) => upload[upload.indexOf(name) + 1];
+  assert.equal(argument('--account-name'), options.registry);
+  assert.equal(argument('--container-name'), '$web');
+  assert.equal(argument('--name'), 'index.html');
+  assert.equal(argument('--file'), path.join(ROOT, 'docs/experiments/arrowcol-oat/index.html'));
+  assert.equal(argument('--auth-mode'), 'login');
+  assert.equal(argument('--overwrite'), 'true');
+  assert.equal(argument('--content-type'), 'text/html; charset=utf-8');
+  assert.equal(argument('--content-cache-control'), 'no-cache');
+  assert.equal(argument('--subscription'), subscription);
+  assert.ok(!m.calls.some(command => command[0] === 'docker'));
   assert.equal(fs.existsSync(m.cache()), false);
 });
 

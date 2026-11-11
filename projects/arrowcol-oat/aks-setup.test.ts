@@ -90,7 +90,12 @@ function fake(options: {
       stdout = JSON.stringify(!published && options.olderTags ? [`oat-${'f'.repeat(40)}`] :
         !published && missingMetadata.has(repository) ? [] : [`oat-${revision}`]);
     }
-    else if (text.startsWith('az storage container show')) stdout = JSON.stringify({
+    else if (text.startsWith('az storage blob upload')) {
+      assert.equal(command[command.indexOf('--container-name') + 1], '$web');
+      assert.equal(command[command.indexOf('--name') + 1], 'index.html');
+      assert.equal(command[command.indexOf('--auth-mode') + 1], 'login');
+      assert.equal(command[command.indexOf('--subscription') + 1], subscription);
+    } else if (text.startsWith('az storage container show')) stdout = JSON.stringify({
       properties: { etag: '"authority"' }, metadata: {
         sandboxid: 'stamp-89152', resetstate: options.state ?? 'ready-v1', resetgeneration: generation,
         occupancy: 'released', publisherregistryversion: '1', publishers: '{}',
@@ -179,6 +184,8 @@ test('setup safely repairs YAML, reuses published images, refreshes private inpu
   assert.equal(result.stamp, '89152');
   assert.equal(result.preflightReady, true);
   assert.equal(Object.keys(result.images).length, 5);
+  assert.ok(m.calls.some(command => command[0] === 'az' && command[1] === 'storage' && command[2] === 'blob' &&
+    command[3] === 'upload' && command[command.indexOf('--name') + 1] === 'index.html'));
   assert.equal(m.calls.filter(c => c.includes('--preflight-only')).length, 2);
   const yaml = await readFile(options.stampConfig, 'utf8');
   assert.match(yaml, /^# Preserve operator settings/);

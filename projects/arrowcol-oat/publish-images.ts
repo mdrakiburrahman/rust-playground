@@ -108,6 +108,24 @@ export async function buildLocalImages({ revision }: { revision: string }, runne
   }
 }
 
+export async function publishViewer(options: ImageOptions, runner: typeof run_tree = run_tree): Promise<void> {
+  if (!options.federated) {
+    throw new Error('OAT viewer publishing requires --federated; never use operator credentials for storage publication.');
+  }
+  const stamp = loadStampConfig(options.stampConfig);
+  const accountName = `arrowcollector${stamp.stamp}`;
+  if (options.registry !== accountName) throw new Error('OAT viewer storage account must match the selected stamp.');
+  const viewer = resolve(ROOT, 'docs/experiments/arrowcol-oat/index.html');
+  await withPublisherIdentity(options, async ({ run, clean, subscription }) => {
+    clean('OAT static viewer upload', await run([
+      'az', 'storage', 'blob', 'upload', '--account-name', accountName,
+      '--container-name', '$web', '--name', 'index.html', '--file', viewer,
+      '--auth-mode', 'login', '--overwrite', 'true', '--content-type', 'text/html; charset=utf-8',
+      '--content-cache-control', 'no-cache', '--subscription', subscription, '--output', 'none',
+    ], 120));
+  }, runner, true);
+}
+
 export async function publishClientImage(options: ImageOptions, runner: typeof run_tree = run_tree): Promise<string> {
   if (!options.federated) throw new Error('OAT publishing requires --federated; never use operator credentials for ACR publication.');
   const source = await getSourceRevision(runner);

@@ -269,6 +269,7 @@ export async function setup(
       clientImage = verified.client;
     } finally { await rm(imageOptions.runtimeConfig, { force: true }); }
   }
+  await imagesApi.publishViewer(imageOptions, runner);
   const assertion = await checked(runner, ['kubectl', '--context', live.clusterName, '--request-timeout=60s',
     'create', 'token', 'arrow-collector', '--namespace', 'arrow-collector', '--audience',
     'api://AzureADTokenExchange', '--duration', '1h'], 90, 'Mint host federation assertion');
