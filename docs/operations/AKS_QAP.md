@@ -181,23 +181,29 @@ generation Secret.
 
 ## Image and run
 
-The image must be built for `linux/amd64`, pushed to the stamped ACR, and
-referenced by digest. `aks setup` performs or reuses this revision-pinned image
-publication and generates private runtime inputs under ignored `out/arrowcol-oat`. The image publisher reads the identity client ID from
-`.env.azure` and subscription from the private stamp; it refuses to publish
-unless the active Azure CLI principal is the `arrow-collector` UAMI.
-For an operator-authenticated fresh clone, use `--federated`: it first verifies
-that the active kubectl context is the stamped cluster, applies the existing
-namespace/ServiceAccount templates, and obtains an AKS-issued assertion. The
-publisher signs in to the shared UAMI in a temporary Azure CLI cache, verifies
-that principal again, and removes the cache afterward. Operator credentials are
-not replaced. First obtain the stamped cluster's kubeconfig with
-`az aks get-credentials` and convert it with `kubelogin convert-kubeconfig -l azurecli`.
+`aks setup` builds or reuses, publishes and verifies the five revision-pinned
+OAT images (SQL Server, catalog, router, dataflow and client), then generates
+private OAT runtime inputs under ignored `out/arrowcol-oat`. This is separate
+from the standalone Azure QAP image used by the bounded Job below. Build that
+`azure-qap` image for `linux/amd64`, publish it to the stamped ACR and reference
+it by digest with the `azure-qap-experiment:image` command below. The Azure QAP
+image publisher reads the identity client ID from `.env.azure` and subscription
+from the private stamp; it refuses to publish unless the active Azure CLI
+principal is the `arrow-collector` UAMI.
 
-This native-federated ACR publisher is separate from repository GitHub Actions
-image publication to GHCR, which uses `GITHUB_TOKEN` with `packages: write`, not
-Azure OIDC. GHCR CI does not require external publisher FICs or Azure Actions
-variables.
+For an operator-authenticated fresh clone, use `--federated` with this Azure QAP
+image command: it first verifies that the active kubectl context is the stamped
+cluster, applies the existing namespace/ServiceAccount templates, and obtains an
+AKS-issued assertion. The publisher signs in to the shared UAMI in a temporary
+Azure CLI cache, verifies that principal again, and removes the cache afterward.
+Operator credentials are not replaced. First obtain the stamped cluster's
+kubeconfig with `az aks get-credentials` and convert it with
+`kubelogin convert-kubeconfig -l azurecli`.
+
+This native-federated Azure QAP ACR publisher is separate from repository GitHub
+Actions image publication to GHCR, which uses `GITHUB_TOKEN` with
+`packages: write`, not Azure OIDC. GHCR CI does not require external publisher
+FICs or Azure Actions variables.
 
 ```bash
 npx nx run azure-qap-experiment:image -- \

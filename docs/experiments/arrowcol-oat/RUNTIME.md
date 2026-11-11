@@ -177,12 +177,14 @@ namespace prefix. The persistent DFE Deployment uses the
 pool must have that configured role. The QAP experiment's fixture database is
 not the loadtest database `arrowcol`.
 
-The OAT **host process** must set `ARROWCOL_MODE=azure`; otherwise the loadgen
-Kusto observer defaults to local mode and rejects the HTTPS endpoint. Its
-`BoundedAzureCli` provider accepts `AZURE_CLIENT_ID`, `AZURE_TENANT_ID` and
-`AZURE_FEDERATED_TOKEN_FILE`. Use the existing `arrow-collector` ServiceAccount's
-private assertion file prepared by the operator, with audience
-`api://AzureADTokenExchange`; keep it mode 0600 and refresh before expiry.
+The OAT Rust runner selects its Kusto observation mode from the platform: the
+Azure platform uses `ObservationMode::Azure`, while the local platform uses
+`ObservationMode::Local`. No global `ARROWCOL_MODE` setting is required for this
+selection. The Azure platform's `BoundedAzureCli` provider accepts
+`AZURE_CLIENT_ID`, `AZURE_TENANT_ID` and `AZURE_FEDERATED_TOKEN_FILE`. Use the
+existing `arrow-collector` ServiceAccount's private assertion file prepared by
+the operator, with audience `api://AzureADTokenExchange`; keep it mode 0600 and
+refresh before expiry.
 Do not replace the operator's Azure CLI login used by kubelogin. First isolate
 the **selected dedicated Canada stamp kubeconfig** from publisher environment
 variables. Otherwise kubelogin combines its explicit subscription with the
@@ -199,7 +201,6 @@ kubectl config set-credentials "$KUBE_USER" \
   --exec-arg=--server-id --exec-arg=6dae42f8-4368-4678-94ff-3960e28e3630 \
   --exec-arg=--subscription --exec-arg="$SUBSCRIPTION" \
   --exec-arg=--disable-environment-override
-export ARROWCOL_MODE=azure
 export AZURE_CLIENT_ID="$(node -p 'JSON.parse(require("fs").readFileSync("out/arrowcol-oat/runtime.json","utf8")).workloadIdentityClientId')"
 export AZURE_TENANT_ID="$(az account show --subscription "$SUBSCRIPTION" --query tenantId -o tsv)"
 export AZURE_FEDERATED_TOKEN_FILE=/absolute/path/to/operator-prepared-private-assertion
@@ -214,9 +215,11 @@ once. Metrics-server can lag a new rollout: sampling waits up to 120 seconds
 for every current pod, rejects stale/partial samples, and fails rather than
 substituting zero metrics. Pod UID and advertised pod IP come from the downward API.
 
-Each selected table receives independent HMAC-signed connections. The router's
-`distinct_table_owners` setting gives separate active tables separate collectors;
-one HTTP/2 connection alone cannot exercise multiple SO_REUSEPORT workers.
+Each selected table uses independent HMAC-signed connections. The OAT router
+sets `distinct_table_owners=false`, so different tables retain stable ownership
+while sharing collectors. This supports the 32-table matrix with 4 to 16
+collectors; one HTTP/2 connection alone cannot exercise multiple SO_REUSEPORT
+workers.
 The benchmark router also limits each upstream H2 connection to one active
 stream and uses zero idle timeout, preventing upstream multiplexing from
 collapsing independent client connections onto one DFE worker. These settings
