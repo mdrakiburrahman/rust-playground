@@ -3167,7 +3167,6 @@ fn scoped_compose_project(base: &str, run_id: &str) -> String {
     let suffix = run_id
         .chars()
         .filter(|character| character.is_ascii_alphanumeric())
-        .take(8)
         .collect::<String>()
         .to_ascii_lowercase();
     let prefix_limit = 48_usize.saturating_sub(suffix.len() + 1);

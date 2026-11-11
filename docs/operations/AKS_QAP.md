@@ -44,6 +44,10 @@ cannot be bypassed; use fresh stamped names after an authorized reset.
 
 ### Tenant-enforced identities
 
+The deploy receipt verifies exactly one `arrow-collector` UAMI in the primary
+resource group only; it does not inventory or certify managed-resource-group or
+deployment-wide identity cardinality.
+
 The live target's mandatory Azure Policy and AzureSecurityLinuxAgent deployments
 create identities in the AKS-managed resource group even though the template
 omits identity-creating add-ons. This does **not** satisfy a literal one-UAMI

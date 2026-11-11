@@ -245,9 +245,10 @@ export async function deployInfrastructure(
     }
     if (attempts.at(-1)?.outcome !== 'succeeded') throw new Error('Provisioning did not converge within two passes.');
     await verifyPostconditions({ ...selected, aks: { ...selected.aks, networkDataplane: current } }, az, postconditions);
+    receipt.identityScope = { primaryResourceGroup: GROUP, managedResourceGroup: 'not inventoried', deploymentWide: 'not verified' };
     receipt.completedAt = new Date().toISOString();
     save();
-    console.log(`Identity receipt: exactly one UAMI arrow-collector; native and publisher federation verified.`);
+    console.log(`Identity receipt: primary resource group ${GROUP} contains exactly one UAMI, arrow-collector; managed-resource-group and deployment-wide counts were not verified. Native and publisher federation verified.`);
     console.log(`Deployed stamp ${stamp}; network path: ${attempts.map(attempt => attempt.network).join(' -> ')}. Receipt: ${receiptPath}`);
     if (current === 'azure') console.warn('WARNING: Azure dataplane has no enforcing network-policy provider. In-cluster workloads can reach the passwordless dataflow port; there is no public ingress.');
     return { stamp, network: current, attempts, receiptPath };
@@ -301,7 +302,7 @@ async function verifyPostconditions(config: StampConfig, az: (...args: string[])
     object(cluster.networkProfile, 'AKS network profile').networkDataplane === config.aks.networkDataplane;
   const resources = list(await az('resource', 'list', '--resource-group', GROUP), 'resource inventory');
   const identities = resources.filter(item => String(item.type).toLowerCase() === 'microsoft.managedidentity/userassignedidentities');
-  receipt.identity = identities.length === 1 && identities[0]?.name === 'arrow-collector';
+  receipt.primaryResourceGroupIdentity = identities.length === 1 && identities[0]?.name === 'arrow-collector';
   const identity = object(await az('identity', 'show', '--resource-group', GROUP, '--name', 'arrow-collector'), 'shared identity');
   if (typeof identity.id !== 'string' || typeof identity.principalId !== 'string')
     throw new Error('Shared identity resource ID and principal ID are missing.');

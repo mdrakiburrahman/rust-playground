@@ -505,7 +505,8 @@ test('local cleanup removes only the Compose project derived from the supplied c
   const stateRoot = path.join(directory, 'state');
   const stateDir = path.join(stateRoot, runId);
   await mkdir(stateDir, { recursive: true });
-  const project = 'arrowcol-oat-quick-123e4567';
+  const project = 'arrowcol-oat-qu-123e4567e89b42d3a456426614174000';
+  const otherProject = 'arrowcol-oat-qu-123e4567e89b42d3a456426614174001';
   const calls: string[][] = [];
   const docker = (args: string[]): string => {
     calls.push(args);
@@ -515,7 +516,7 @@ test('local cleanup removes only the Compose project derived from the supplied c
     if (joined === 'volume ls -q --filter label=com.docker.compose.project') return 'volume-target\nvolume-other\n';
     if (args[0] === 'inspect' || args[0] === 'network' && args[1] === 'inspect' || args[0] === 'volume' && args[1] === 'inspect') {
       const id = args.at(-1);
-      return id?.endsWith('target') ? project : 'arrowcol-oat-quick-deadbeef';
+      return id?.endsWith('target') ? project : otherProject;
     }
     if (joined.includes('label=com.docker.compose.project=' + project)) return joined.startsWith('ps ') ? 'container-target\n' : joined.startsWith('network ls') ? 'network-target\n' : 'volume-target\n';
     return '';
@@ -534,6 +535,26 @@ test('local cleanup removes only the Compose project derived from the supplied c
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test('local cleanup refuses ambiguous legacy project before removing resources or state', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-legacy-cleanup-'));
+  const runId = '123e4567-e89b-42d3-a456-426614174000';
+  const stateDir = path.join(directory, runId);
+  const calls: string[][] = [];
+  await mkdir(stateDir, { recursive: true });
+  const docker = (args: string[]): string => {
+    calls.push(args);
+    if (args.join(' ') === 'ps -aq --filter label=com.docker.compose.project') return 'legacy-container\n';
+    if (args[0] === 'inspect') return 'arrowcol-oat-quick-123e4567';
+    return '';
+  };
+  try {
+    await assert.rejects(cleanupLocalComposeProjects({ platform: { compose_project: 'arrowcol-oat-quick', compose_state_root: directory } }, runId, docker),
+      /Legacy Compose project .* ownership is ambiguous/);
+    assert.ok((await stat(stateDir)).isDirectory());
+    assert.ok(!calls.some(args => args[0] === 'rm' || args[1] === 'rm'));
+  } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
 

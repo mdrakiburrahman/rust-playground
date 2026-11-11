@@ -3,6 +3,17 @@ mod failure_evidence_tests {
     use super::*;
 
     #[test]
+    fn compose_project_keeps_full_cell_uuid_even_when_prefixes_collide() {
+        let first = scoped_compose_project("arrowcol-oat-quick", "123e4567-e89b-42d3-a456-426614174000");
+        let second = scoped_compose_project("arrowcol-oat-quick", "123e4567-e89b-42d3-a456-426614174001");
+        assert_eq!(first, "arrowcol-oat-qu-123e4567e89b42d3a456426614174000");
+        assert_eq!(second, "arrowcol-oat-qu-123e4567e89b42d3a456426614174001");
+        assert_ne!(first, second);
+        assert_eq!(first.len(), 48);
+        assert!(first.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'));
+    }
+
+    #[test]
     fn ownership_transport_failure_is_not_a_confirmed_pinning_violation() {
         let report = failed_client_pinning_report(
             &anyhow::anyhow!("DMV source connection failed"),

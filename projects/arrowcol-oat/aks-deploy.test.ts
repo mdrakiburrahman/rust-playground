@@ -140,7 +140,14 @@ test('fresh success is one azure pass, records explicit postconditions and priva
   fs.mkdirSync(other.options.stateDirectory, { mode: 0o700 });
   const sentinel = path.join(other.options.stateDirectory, 'runtime.json');
   fs.writeFileSync(sentinel, 'another private output', { mode: 0o600 });
-  const result = await deployInfrastructure(f.options, f.runner);
+  const originalLog = console.log;
+  const logs: string[] = [];
+  console.log = (...args: unknown[]) => { logs.push(args.map(String).join(' ')); };
+  let result: Awaited<ReturnType<typeof deployInfrastructure>>;
+  try { result = await deployInfrastructure(f.options, f.runner); }
+  finally { console.log = originalLog; }
+  assert.ok(logs.some(message => message.includes('primary resource group arrow-collector-rg contains exactly one UAMI') &&
+    message.includes('managed-resource-group and deployment-wide counts were not verified')));
   assert.equal(result.network, 'azure');
   assert.equal(result.attempts.length, 1);
   assert.equal(result.attempts[0]!.network, 'azure');
@@ -148,6 +155,10 @@ test('fresh success is one azure pass, records explicit postconditions and priva
   assert.deepEqual(result.attempts[0]!.preview, { outcome: 'verified', parametersSha256: 'a'.repeat(64), templateSha256: 'b'.repeat(64), changes: 0 });
   assert.equal(f.calls.filter(call => call[4] === 'provision').length, 1);
   assert.ok(Object.values(f.receipt().postconditions).every(value => value === true));
+  assert.equal(f.receipt().postconditions.primaryResourceGroupIdentity, true);
+  assert.equal(f.receipt().postconditions.identity, undefined);
+  assert.deepEqual(f.receipt().identityScope, { primaryResourceGroup: 'arrow-collector-rg',
+    managedResourceGroup: 'not inventoried', deploymentWide: 'not verified' });
   assert.equal(fs.statSync(result.receiptPath).mode & 0o777, 0o600);
   assert.equal(parse(fs.readFileSync(f.options.stampConfig, 'utf8')).stamp, stamp);
   assert.equal(fs.readFileSync(f.options.stampConfig, 'utf8'), renderStampConfig(f.original, { stamp }));

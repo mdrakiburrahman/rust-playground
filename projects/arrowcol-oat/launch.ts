@@ -102,11 +102,11 @@ function runDocker(args: string[]): string {
   return execFileSync('docker', args, { encoding: 'utf8', timeout: 30_000 });
 }
 
-function localProjectPrefix(config: Record<string, unknown>): string {
+function localProjectPrefix(config: Record<string, unknown>, length: number): string {
   const platform = isRecord(config.platform) ? config.platform : {};
   const base = platform.compose_project;
-  if (typeof base !== 'string' || !base.trim()) throw new Error('Local Compose project is missing from config');
-  return `${base.slice(0, 39).replace(/[-_]+$/g, '')}-`;
+  if (typeof base !== 'string' || !/^[a-z0-9][a-z0-9_-]{0,47}$/.test(base)) throw new Error('Local Compose project is invalid or missing from config');
+  return `${base.slice(0, length).replace(/[-_]+$/g, '')}-`;
 }
 
 export async function cleanupLocalComposeProjects(
@@ -117,10 +117,11 @@ export async function cleanupLocalComposeProjects(
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(runId)) {
     throw new Error('--cleanup-local requires a canonical OAT cell run UUID');
   }
-  const prefix = localProjectPrefix(config);
-  const targetProject = prefix + runId.replace(/-/g, '').slice(0, 8).toLowerCase();
-  const projectPattern = /^[a-z0-9][a-z0-9_-]*-[a-f0-9]{8}$/i;
+  const compactRunId = runId.replace(/-/g, '').toLowerCase();
+  const targetProject = localProjectPrefix(config, 15) + compactRunId;
+  const legacyProject = localProjectPrefix(config, 39) + compactRunId.slice(0, 8);
   const projects = new Set<string>();
+  let legacyFound = false;
   const resources: Array<{ list: string[]; inspect: (id: string) => string[] }> = [
     {
       list: ['ps', '-aq', '--filter', 'label=com.docker.compose.project'],
@@ -138,8 +139,13 @@ export async function cleanupLocalComposeProjects(
   for (const resource of resources) {
     for (const id of docker(resource.list).split(/\r?\n/).filter(Boolean)) {
       const project = docker(resource.inspect(id)).trim();
-      if (project === targetProject && projectPattern.test(project)) projects.add(project);
+      if (project === legacyProject) legacyFound = true;
+      if (project === targetProject) projects.add(project);
     }
+  }
+  if (legacyFound) {
+    throw new Error(`Legacy Compose project ${legacyProject} has only an eight-character run prefix; ` +
+      'ownership is ambiguous. Inspect and clean it manually; no resources or state were removed.');
   }
   projects.add(targetProject);
   for (const project of projects) {

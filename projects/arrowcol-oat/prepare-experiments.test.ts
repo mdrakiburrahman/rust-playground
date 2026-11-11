@@ -178,7 +178,7 @@ test('CLI rejects a symlinked intermediate output parent without changing its ta
   }
 });
 
-test('offline CLI binds fake private AKS settings, preserves runtime and refuses replacement', async () => {
+test('offline CLI selects matching stamp capacity inputs and rejects mismatches or missing files', async () => {
   const workspace = await mkdtemp(resolve(tmpdir(), 'oat-e1-e5-workspace-'));
   const root = resolve(workspace, 'out/arrowcol-oat', `test-e1-e5-${randomUUID()}`);
   await mkdir(root, { recursive: true });
@@ -186,7 +186,8 @@ test('offline CLI binds fake private AKS settings, preserves runtime and refuses
   await writeFile(resolve(workspace, 'projects/loadtest/schemas/sqlserver.sql'),
     await readFile('projects/loadtest/schemas/sqlserver.sql', 'utf8'));
   await mkdir(resolve(workspace, 'infra/azure'), { recursive: true });
-  await writeFile(resolve(workspace, 'infra/azure/stamp.yaml'), await readFile('infra/azure/stamp.example.yaml', 'utf8'));
+  const exampleStamp = await readFile('infra/azure/stamp.example.yaml', 'utf8');
+  await writeFile(resolve(workspace, 'infra/azure/stamp.yaml'), exampleStamp.replace('stamp: 1', 'stamp: 89152'));
   try {
     const images = Object.fromEntries(['sqlserver', 'catalog', 'router', 'dataflow'].map((role) =>
       [role, `arrowcollector89152.azurecr.io/${role}@sha256:${'a'.repeat(64)}`]));
@@ -206,16 +207,32 @@ test('offline CLI binds fake private AKS settings, preserves runtime and refuses
     await writeFile(resolve(root, 'base.json'), JSON.stringify(config));
     const args = ['--base', resolve(root, 'base.json'), '--out', resolve(root, 'bound'),
       '--warmup-seconds', '30', '--measure-seconds', '90', '--higher-dfe', '4'];
-    await main(args, workspace);
+    const selectedStampPath = resolve(workspace, 'selected/stamp-89152.yaml');
+    await mkdir(resolve(workspace, 'selected'), { recursive: true });
+    await writeFile(selectedStampPath, exampleStamp.replace('stamp: 1', 'stamp: 89152'));
+    await main([...args, '--out', resolve(root, 'bound-default')], workspace);
+    await writeFile(resolve(workspace, 'infra/azure/stamp.yaml'), exampleStamp
+      .replace('stamp: 1', 'stamp: 89152')
+      .replace(/(- name: benchd64[\s\S]*?maxPods:) 250/, '$1 32'));
+    await main([...args, '--stamp-config', selectedStampPath], workspace);
     for (const [name, expected] of Object.entries(prepareExperiments(config, tables, binding))) {
       const file = resolve(root, 'bound', `${name}.config.json`);
       assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), expected);
       if (process.platform !== 'win32') assert.equal((await stat(file)).mode & 0o777, 0o600);
     }
-    await assert.rejects(main(args, workspace), /EEXIST/);
+    await assert.rejects(main([...args, '--stamp-config', selectedStampPath], workspace), /EEXIST/);
+    await writeFile(resolve(workspace, 'infra/azure/stamp.yaml'), exampleStamp.replace('stamp: 1', 'stamp: 2'));
+    await assert.rejects(main([...args, '--out', resolve(root, 'default-mismatch')], workspace),
+      /Selected AKS stamp config stamp 2 does not match baseline config stamp 89152/);
+    const mismatchedStampPath = resolve(workspace, 'selected/stamp-2.yaml');
+    await writeFile(mismatchedStampPath, exampleStamp.replace('stamp: 1', 'stamp: 2'));
+    await assert.rejects(main([...args, '--out', resolve(root, 'selected-mismatch'), '--stamp-config', mismatchedStampPath], workspace),
+      /Selected AKS stamp config stamp 2 does not match baseline config stamp 89152/);
+    await assert.rejects(main([...args, '--out', resolve(root, 'missing-selected'), '--stamp-config', 'selected/missing.yaml'], workspace),
+      /selected stamp config is missing at .*selected\/missing\.yaml/);
     await rm(resolve(workspace, 'infra/azure/stamp.yaml'));
-    const missingStampArgs = args.map((arg, index) => index === 3 ? resolve(root, 'unconfigured') : arg);
-    await assert.rejects(main(missingStampArgs, workspace), /Configured AKS pool limits are required/);
+    await assert.rejects(main([...args, '--out', resolve(root, 'missing-default')], workspace),
+      /selected stamp config is missing at .*infra\/azure\/stamp\.yaml/);
     assert.deepEqual(JSON.parse(await readFile(platform.runtime_config_file, 'utf8')), runtime);
   } finally {
     await rm(workspace, { recursive: true, force: true });
