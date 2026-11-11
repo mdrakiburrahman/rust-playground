@@ -146,13 +146,13 @@ export async function runAksPreflight(configPath: string, options: PreflightOpti
   const warnings: string[] = [];
   const network = { provider: 'unknown', enforcing: false };
   const nextCommand = 'npx --no-install arrowcol-oat --mode aks --preflight-only';
-  const output = (command: string, args: string[]): string => {
-    const result = runCommand(command, args);
+  const output = (command: string, args: string[], timeoutMs?: number): string => {
+    const result = runCommand(command, args, timeoutMs);
     if (result.exitCode !== 0) throw new Error(`${command} exited with status ${result.exitCode}; command output withheld.`);
     return result.stdout.trim();
   };
-  const json = (command: string, args: string[]): unknown => {
-    try { return JSON.parse(output(command, args)); }
+  const json = (command: string, args: string[], timeoutMs?: number): unknown => {
+    try { return JSON.parse(output(command, args, timeoutMs)); }
     catch { throw new Error(`${command} returned an unsuccessful or invalid JSON response; output withheld.`); }
   };
   const check = async (name: string, work: () => Promise<string> | string, next = `Run \`${setupCommand}\`, then retry.`) => {
@@ -382,9 +382,9 @@ export async function runAksPreflight(configPath: string, options: PreflightOpti
       return rows.some((row) => {
         if (!Array.isArray(row)) return false;
         const values = Object.fromEntries(columns.map((name, index) => [String(name), row[index]]));
-        return values.Role === 'Database Admin' &&
-          [values.PrincipalObjectId, values.PrincipalFQN].some((value) =>
-            typeof value === 'string' && Boolean(principalId) && value.toLowerCase().split(';').includes(principalId!.toLowerCase()));
+        return typeof values.Role === 'string' && values.Role.toLowerCase() === `database ${database} admin`.toLowerCase() &&
+          typeof values.PrincipalObjectId === 'string' && Boolean(principalId) &&
+          values.PrincipalObjectId.toLowerCase() === principalId!.toLowerCase();
       });
     });
     if (!admin) throw new Error('Selected workload UAMI lacks verified database Admin permission for per-run external-table bindings.');
@@ -443,15 +443,17 @@ export async function runAksPreflight(configPath: string, options: PreflightOpti
 
   await check('Run federated-credential permissions', async () => {
     const id = requireValue(identityId, 'UAMI resource ID');
-    const page = object(await request(`https://management.azure.com${id}/providers/Microsoft.Authorization/permissions?api-version=2022-04-01`,
-      'https://management.azure.com'), 'Effective permissions');
+    const page = object(json('az', ['rest', '--method', 'GET', '--url',
+      `https://management.azure.com${id}/providers/Microsoft.Authorization/permissions?api-version=2022-04-01`,
+      '--subscription', requireValue(subscription, 'subscription')], 30_000),
+    'Operator effective permissions');
     if (page.nextLink) throw new Error('Effective permissions response is paginated; complete permission evidence is required.');
     for (const action of ['write', 'delete']) {
       if (!permitsAction(page.value, `Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials/${action}`)) {
-        throw new Error(`The workload UAMI lacks effective run FIC ${action} permission.`);
+        throw new Error(`The operator Azure CLI context lacks effective run FIC ${action} permission at the selected UAMI scope.`);
       }
     }
-    return 'Workload UAMI effective permissions allow creating and deleting run federated credentials.';
+    return 'Operator Azure CLI permissions allow creating and deleting run federated credentials on the selected UAMI.';
   });
   await check('Run federated-credential headroom', () => {
     const inventory = json('az', azArgs(['identity', 'federated-credential', 'list', '-g', resourceGroup, '--identity-name', identityName]));

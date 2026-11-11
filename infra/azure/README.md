@@ -121,11 +121,13 @@ publishing/pull. Preflight qualifies Azure support, quota and networking, and
 blocks replacement while legacy Terraform state, Key Vault consumers, role
 assignments, registry publishers or FIC subjects remain unaccounted for.
 The operator principal must be authorized to create and delete federated
-identity credentials on the UAMI; this external permission cannot be proven or
-checked by the repository's deployment preflight. Removing the runtime grant
-from the template does not remove it from an existing incremental-deployment
-stamp; only a clean redeploy under a new stamp number proves the change live.
-This role change does not alter the Cilium networking decision.
+identity credentials on the UAMI. AKS setup checks those effective permissions
+read-only through the current Azure CLI context at the selected UAMI's scope;
+the workload UAMI itself does not receive the FIC Contributor role. Removing
+the runtime grant from the template does not remove it from an existing
+incremental-deployment stamp; only a clean redeploy under a new stamp number
+proves the change live. This role change does not alter the Cilium networking
+decision.
 
 | Task | Entry point |
 | --- | --- |
