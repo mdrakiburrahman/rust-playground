@@ -187,6 +187,7 @@ test('catalog and DFE share the same Delta root', () => {
 
 test('catalog DDL verifier uses the shared internal HMAC secret', () => {
   const catalog = compose.services['arrowcol-catalog'];
+  assert.ok(catalog.command);
   assert.ok(catalog.command.includes('--ddl-identity-secret-file'));
   assert.ok(catalog.command.includes('/run/secrets/internal-hmac'));
   assert.ok(catalog.secrets?.some(secret =>
