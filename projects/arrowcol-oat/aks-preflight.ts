@@ -26,6 +26,7 @@ interface CommandResult {
 
 interface PreflightOptions {
   workspaceRoot?: string;
+  stampConfigPath?: string;
   environment?: NodeJS.ProcessEnv;
   runCommand?: (command: string, args: string[], timeoutMs?: number) => CommandResult;
   fetcher?: typeof fetch;
@@ -183,7 +184,7 @@ export async function runAksPreflight(configPath: string, options: PreflightOpti
   } catch { /* The independent runtime gate reports unavailable private bootstrap state. */ }
   let selectedStamp: ReturnType<typeof loadStampConfig> | undefined;
   try {
-    const stampConfigFile = text(platform.stamp_config_file) ?? 'infra/azure/stamp.yaml';
+    const stampConfigFile = options.stampConfigPath ?? 'infra/azure/stamp.yaml';
     const stampConfigPath = resolve(root, stampConfigFile);
     const relativeStampConfigPath = relative(root, stampConfigPath);
     if (isAbsolute(stampConfigFile) || relativeStampConfigPath === '..' ||

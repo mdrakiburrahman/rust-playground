@@ -35,7 +35,6 @@ async function fixture(t: test.TestContext): Promise<PrivateInputs> {
       AZURE_KUSTO_EXPERIMENT_DATABASE: 'experimentqap' },
     clientImage: `${registry}/arrowcol-oat-client@sha256:${digest}`,
     qapEndpoint: 'https://arrow-collector-89152.canadacentral.kusto.windows.net',
-    stampConfigFile: 'infra/azure/stamp.yaml',
     oatTemplate: JSON.parse(await readFile(resolve(ROOT,
       'docs/experiments/arrowcol-oat/oat-config.aks.quick.json'), 'utf8')) as Record<string, unknown> };
 }
@@ -63,7 +62,7 @@ test('generates private inputs from authoritative generation and pins the comple
   assert.equal(config.qap_endpoint, input.qapEndpoint);
   assert.equal(config.platform.runtime_config_file, files.runtimeConfigPath);
   assert.equal(config.platform.bootstrap_env_file, files.bootstrapEnvPath);
-  assert.equal(config.platform.stamp_config_file, input.stampConfigFile);
+  assert.equal(Object.hasOwn(config.platform, 'stamp_config_file'), false);
   assert.equal(config.website_url, 'abfss://$web@arrowcollector89152.dfs.core.windows.net/results.parquet');
   assert.equal(config.result_url, 'abfss://experiments@arrowcollector89152.dfs.core.windows.net/arrowcol-oat/results.parquet');
   for (const path of [input.directory, resolve(input.directory, 'secrets')]) {

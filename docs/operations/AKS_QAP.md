@@ -7,18 +7,18 @@ replace the devcontainer mode.
 ## Existing-stamp OAT setup
 
 For an existing stamp, pass its ignored private YAML explicitly; the tracked
-`infra/azure/stamp.yaml` may describe a different region or stamp. Setup stores
-that selected path in the generated OAT config, and preflight uses it to validate
-the QAP hostname against the same stamp and region. Do not use
-`--skip-preflight`. For example:
+`infra/azure/stamp.yaml` may describe a different region or stamp. Setup passes
+the selected path to its preflight; use the same path for standalone preflight and
+benchmark launch. Do not use `--skip-preflight`. For example:
 
 ```bash
 npx --no-install arrowcol-oat aks setup --stamp 87513 --stamp-config .temp/stamp-87513.yaml
-npx --no-install arrowcol-oat --mode aks --preflight-only --config out/arrowcol-oat/oat-config.aks.json
+npx --no-install arrowcol-oat --mode aks --preflight-only --stamp-config .temp/stamp-87513.yaml --config out/arrowcol-oat/oat-config.aks.json
+npx --no-install arrowcol-oat --mode aks --stamp-config .temp/stamp-87513.yaml
 ```
 
-The second command is a read-only input check: it must report the selected QAP
-endpoint/database gate READY before launching a benchmark.
+The standalone preflight is a read-only input check: it must report the selected
+QAP endpoint/database gate READY before launching a benchmark.
 
 ## Router authentication
 

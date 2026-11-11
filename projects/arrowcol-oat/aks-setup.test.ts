@@ -187,8 +187,8 @@ test('setup safely repairs YAML, reuses published images, refreshes private inpu
   assert.equal(result.stamp, '89152');
   assert.equal(result.preflightReady, true);
   assert.equal(Object.keys(result.images).length, 5);
-  const aksConfig = JSON.parse(await readFile(result.aksConfigPath, 'utf8'));
-  assert.equal(aksConfig.platform.stamp_config_file, relative(ROOT, options.stampConfig));
+  const preflight = m.calls.find(command => command.includes('--preflight-only'))!;
+  assert.equal(preflight[preflight.indexOf('--stamp-config') + 1], relative(ROOT, options.stampConfig));
   const viewerAssets = m.calls.filter(command => command[0] === 'az' && command[1] === 'storage' &&
     command[2] === 'blob' && command[3] === 'upload').map(command => command[command.indexOf('--name') + 1]).sort();
   assert.deepEqual(viewerAssets, ['architecture.svg', 'index.html']);

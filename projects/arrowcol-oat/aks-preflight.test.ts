@@ -32,8 +32,7 @@ async function fixture() {
     images: { sqlserver: image('sqlserver'), catalog: image('catalog'), router: image('router'), dataflow: image('dataflow') },
   };
   const config = {
-    platform: { kind: 'aks', runtime_config_file: 'runtime.json', bootstrap_env_file: 'bootstrap.env',
-      stamp_config_file: 'infra/azure/stamp.yaml' },
+    platform: { kind: 'aks', runtime_config_file: 'runtime.json', bootstrap_env_file: 'bootstrap.env' },
     stamp: '00000', qap_endpoint: 'https://arrow-collector-00000.canadacentral.kusto.windows.net',
     qap_database: 'experimentqap' as string | null, replica_counts: [1], dfe_worker_concurrency: [1],
     dmv_client_image: image('client'),
@@ -143,7 +142,7 @@ async function fixture() {
     }
     throw new Error('Unexpected fake provider request');
   };
-  const run = () => runAksPreflight('oat.json', { workspaceRoot: root, environment, runCommand, fetcher, now: () => state.now });
+  const run = (stampConfigPath?: string) => runAksPreflight('oat.json', { workspaceRoot: root, stampConfigPath, environment, runCommand, fetcher, now: () => state.now });
   return { root, config, runtime, environment, calls, requests, state, assertion, run,
     saveConfig: () => writeFile(path.join(root, 'oat.json'), JSON.stringify(config)),
     cleanup: () => rm(root, { recursive: true, force: true }) };
@@ -160,9 +159,7 @@ test('preflight uses the stamp config selected by setup for QAP hostname validat
     await writeFile(path.join(f.root, 'infra/azure/stamp.yaml'), stringify(defaultStampConfig({
       AZURE_STAMP: '00000', AZURE_SUBSCRIPTION_ID: subscription, AZURE_LOCATION: 'eastus2',
     })));
-    f.config.platform.stamp_config_file = selectedPath;
-    await f.saveConfig();
-    const report = await f.run();
+    const report = await f.run(selectedPath);
     assert.equal(report.checks.find((entry) => entry.name.startsWith('Selected QAP'))!.ready, true);
     assert.equal(report.ready, true);
   } finally { await f.cleanup(); }
@@ -171,9 +168,7 @@ test('preflight uses the stamp config selected by setup for QAP hostname validat
 test('preflight rejects a stamp config path that escapes the workspace', async () => {
   const f = await fixture();
   try {
-    f.config.platform.stamp_config_file = '../stamp.yaml';
-    await f.saveConfig();
-    const report = await f.run();
+    const report = await f.run('../stamp.yaml');
     assert.equal(report.checks.find((entry) => entry.name.startsWith('Selected QAP'))!.ready, false);
     assert.equal(report.checks.find((entry) => entry.name === 'Configuration, stamp, and destinations')!.ready, false);
   } finally { await f.cleanup(); }

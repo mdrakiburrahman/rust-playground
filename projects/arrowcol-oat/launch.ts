@@ -31,7 +31,7 @@ interface LocalViewerConfig {
 }
 
 const workspaceRoot = resolve(fileURLToPath(new URL('../..', import.meta.url)));
-const cliValuedOptions = new Set(['--config', '--mode', '--server', '--poll-ms', '--cleanup-local']);
+const cliValuedOptions = new Set(['--config', '--mode', '--server', '--poll-ms', '--cleanup-local', '--stamp-config']);
 
 export class OatCliError extends Error {
   readonly exitCode = 2;
@@ -65,6 +65,7 @@ const cliUsage = `Usage: arrowcol-oat [options] [config]
 Options:
   --mode <local|aks>   Select the execution mode
   --config <path>      Use a configuration file
+  --stamp-config <path> Use the private stamp YAML for AKS validation
   --server <URL>       Use an existing OAT API server
   --poll-ms <number>   Set the status polling interval
   --viewer-only        Serve existing local results without running a benchmark
@@ -563,6 +564,10 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
     throw new OatCliError('--mode must be local or aks');
   }
   const requestedServerUrl = option('--server');
+  const requestedStampConfigPath = option('--stamp-config');
+  if (requestedStampConfigPath !== undefined && requestedMode !== 'aks') {
+    throw new OatCliError('--stamp-config requires --mode aks');
+  }
   const cleanupRunId = option('--cleanup-local');
   const viewerOnly = args.includes('--viewer-only');
   const preflightOnly = args.includes('--preflight-only');
@@ -575,7 +580,7 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
       throw new OatCliError('--preflight-only requires --mode aks and cannot be combined with viewer/server/poll options');
     }
     const configPath = resolveCliConfigPath(args, 'aks');
-    const report = await runAksPreflight(configPath);
+    const report = await runAksPreflight(configPath, { stampConfigPath: requestedStampConfigPath });
     console.log(formatPreflightReport(report));
     if (!report.ready) process.exitCode = 2;
     return;
@@ -596,7 +601,7 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
   let network: NetworkObservation | undefined;
   let warnings: string[] = [];
   if (mode === 'aks') {
-    const report = await runAksPreflight(configPath);
+    const report = await runAksPreflight(configPath, { stampConfigPath: requestedStampConfigPath });
     console.log(formatPreflightReport(report));
     if (!report.ready) throw new Error('AKS preflight is NOT READY; refusing to start the benchmark.');
     if ('network' in report && record(report.network) &&

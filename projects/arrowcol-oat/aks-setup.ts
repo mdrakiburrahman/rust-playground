@@ -276,13 +276,13 @@ export async function setup(
   const oatTemplate = JSON.parse(await readFile(resolve(ROOT,
     'docs/experiments/arrowcol-oat/oat-config.aks.quick.json'), 'utf8')) as Record<string, unknown>;
   const files = await generatePrivateInputs({ directory, runtime, bootstrapValues, resetGeneration: generation,
-    tenantId, assertion, clientImage, qapEndpoint: config.uri, stampConfigFile: relative(ROOT, stampConfigPath), oatTemplate });
+    tenantId, assertion, clientImage, qapEndpoint: config.uri, oatTemplate });
   let preflightReady = false;
   if (!options.skipPreflight) {
     for (let attempt = 1; attempt <= 3; attempt++) {
       console.log(`AKS preflight pass ${attempt}/3 for ${live.clusterName}`);
       const result = await runner(['npx', '--no-install', 'arrowcol-oat', '--mode', 'aks', '--preflight-only',
-        '--config', files.aksConfigPath], 600, ROOT, { ...load_env(resolve(directory, 'aks.env')), ...process.env });
+        '--stamp-config', relative(ROOT, stampConfigPath), '--config', files.aksConfigPath], 600, ROOT, { ...load_env(resolve(directory, 'aks.env')), ...process.env });
       if (result.stdout.trim()) console.log(result.stdout.trim());
       if (!result.returncode) { preflightReady = true; break; }
       if (result.stderr.trim()) console.error(result.stderr.trim());
@@ -290,7 +290,7 @@ export async function setup(
     if (!preflightReady) throw new Error(`AKS preflight did not become READY in three bounded passes; correct the reported gates and run \`${setupCommand}\`.`);
   }
   console.log(`AKS setup ${preflightReady ? 'READY' : 'prepared (preflight skipped)'}: stamp ${live.stamp}, ${live.clusterName}, five digest-pinned images.`);
-  console.log('Host assertion lasts one hour; rerun setup before it expires. Next: npx --no-install arrowcol-oat --mode aks');
+  console.log('Host assertion lasts one hour; rerun setup before it expires. Next: npx --no-install arrowcol-oat --mode aks --stamp-config ' + relative(ROOT, stampConfigPath));
   return { stamp: live.stamp, clusterName: live.clusterName, images: { ...runtime.images, client: clientImage },
     ...files, preflightReady };
 }
