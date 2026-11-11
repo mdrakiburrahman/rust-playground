@@ -24,6 +24,8 @@ export const DEFAULT_STOP_COMMAND = ['npx', '--no-install', 'tsx', 'projects/loa
 export const DELETE_PARALLELISM = 32;
 export const READ_ATTEMPTS = 5;
 export const TRANSIENT_HTTP = new Set([408, 429, 500, 502, 503, 504]);
+export class ArmPreviewFailure extends Failure {}
+export const ARM_PREVIEW_FAILURE_EXIT = 4;
 export const SERVICE_NAMES: Record<string, string> = {
   'https://management.azure.com/': 'ARM', 'https://storage.azure.com/': 'Storage', 'https://kusto.kusto.windows.net': 'Kusto',
 };
@@ -817,18 +819,357 @@ export function fresh_authority(): Metadata {
 export async function checkpoint_container(azure: Azure): Promise<any> {
   return azure.arm('GET', azure.c.storage_id + '/blobServices/default/containers/' + azure.c.checkpoints, undefined, true, '2023-05-01');
 }
-export async function deploy(azure: Azure, fresh?: Metadata, whatIf = false): Promise<void> {
+const ARM_WHAT_IF_CHANGE_TYPES = new Set([
+  'Create', 'Delete', 'Modify', 'NoChange', 'Ignore', 'Deploy', 'Unsupported',
+]);
+export const ARM_WHAT_IF_RESOURCE_TYPES = new Set([
+  'microsoft.resources/resourcegroups',
+  'microsoft.authorization/roleassignments',
+  'microsoft.containerregistry/registries',
+  'microsoft.containerservice/managedclusters',
+  'microsoft.insights/diagnosticsettings',
+  'microsoft.kusto/clusters',
+  'microsoft.kusto/clusters/databases',
+  'microsoft.kusto/clusters/databases/principalassignments',
+  'microsoft.kusto/clusters/principalassignments',
+  'microsoft.managedidentity/userassignedidentities',
+  'microsoft.managedidentity/userassignedidentities/federatedidentitycredentials',
+  'microsoft.network/networksecuritygroups',
+  'microsoft.network/publicipprefixes',
+  'microsoft.network/virtualnetworks',
+  'microsoft.network/virtualnetworks/subnets',
+  'microsoft.operationalinsights/workspaces',
+  'microsoft.resources/deployments',
+  'microsoft.storage/storageaccounts',
+  'microsoft.storage/storageaccounts/blobservices',
+  'microsoft.storage/storageaccounts/blobservices/containers',
+]);
+export const ARM_WHAT_IF_EXTENSION_TYPES = new Set([
+  'microsoft.authorization/roleassignments',
+  'microsoft.insights/diagnosticsettings',
+]);
+const ARM_WHAT_IF_REMOVED_VALUES = new Set(['<null>', '<deleted>', '<removed>', '<not specified>']);
+function verified_arm_what_if_resource_scope(resourceId: string, config: Config): void {
+  const base = config.base;
+  if (resourceId.trim() !== resourceId || resourceId.includes('?') || resourceId.includes('#'))
+    throw new Failure('ARM what-if returned an invalid resource identifier.');
+  if (resourceId.toLowerCase() === base.toLowerCase()) return;
+  const prefix = base + '/providers/';
+  if (!resourceId.toLowerCase().startsWith(prefix.toLowerCase()))
+    throw new Failure('ARM what-if contains a resource outside the selected subscription and resource group.');
+  const segments = resourceId.slice(prefix.length).split('/');
+  if (segments.length < 3 || segments.some(segment => !segment))
+    throw new Failure('ARM what-if returned an invalid resource identifier.');
+  let segment = 0;
+  let providerIndex = 0;
+  while (segment < segments.length) {
+    const namespace = segments[segment++];
+    if (!namespace || namespace.toLowerCase() === 'providers')
+      throw new Failure('ARM what-if returned an invalid resource identifier.');
+    const typeNames: string[] = [];
+    while (segment < segments.length && segments[segment]!.toLowerCase() !== 'providers') {
+      const type = segments[segment];
+      const name = segments[segment + 1];
+      if (!type || !name) throw new Failure('ARM what-if returned an invalid resource identifier.');
+      typeNames.push(type);
+      segment += 2;
+    }
+    if (!typeNames.length) throw new Failure('ARM what-if returned an invalid resource identifier.');
+    const resourceType = `${namespace}/${typeNames.join('/')}`.toLowerCase();
+    const allowedTypes = providerIndex === 0 ? ARM_WHAT_IF_RESOURCE_TYPES : ARM_WHAT_IF_EXTENSION_TYPES;
+    if (!allowedTypes.has(resourceType))
+      throw new Failure('ARM what-if contains a resource type outside the allowed deployment templates.');
+    if (segment < segments.length) {
+      segment++;
+      providerIndex++;
+      if (segments.length - segment < 3)
+        throw new Failure('ARM what-if returned an incomplete extension-resource identifier.');
+    }
+  }
+}
+function arm_what_if_value_removed(before: unknown, after: unknown): boolean {
+  if (before !== undefined && before !== null && (after === null ||
+      (typeof after === 'string' && ARM_WHAT_IF_REMOVED_VALUES.has(after.trim().toLowerCase()) && before !== after)))
+    return true;
+  if (Array.isArray(before) && Array.isArray(after)) {
+    if (after.length < before.length) return true;
+    return before.some((value, index) => arm_what_if_value_removed(value, after[index]));
+  }
+  if (before && after && typeof before === 'object' && typeof after === 'object' &&
+      !Array.isArray(before) && !Array.isArray(after)) {
+    const previous = before as Record<string, unknown>;
+    const next = after as Record<string, unknown>;
+    return Object.entries(previous).some(([key, value]) =>
+      !Object.prototype.hasOwnProperty.call(next, key) || arm_what_if_value_removed(value, next[key]));
+  }
+  return false;
+}
+function arm_what_if_record(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value));
+}
+function arm_what_if_equal(left: unknown, right: unknown): boolean {
+  return canonical_json(left) === canonical_json(right);
+}
+function arm_what_if_tag_delta_key(path: string, keys: string[]): string | undefined {
+  const normalized = path.replace(/^\//, '').toLowerCase();
+  return keys.find(key => {
+    const tagPath = key.toLowerCase();
+    return normalized === `tags.${tagPath}` || normalized === `tags/${tagPath}`;
+  });
+}
+export function arm_what_if_runtime_roles(c: Config): Array<{ id: string; scope: string; role: string; seed: string }> {
+  if (c.mode !== 'stamped') return [];
+  const reader = 'acdd72a7-3385-48ef-bd42-f606fba81ae7';
+  const blobReader = '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1';
+  const blobWriter = 'ba92f5b4-2d11-453d-a403-e96b0029c9fe';
+  const container = (name: string) => c.storage_id + '/blobServices/default/containers/' + name;
+  const vnet = c.base + '/providers/Microsoft.Network/virtualNetworks/' + c.cluster + '-vnet/subnets/';
+  const roles: Array<[string, string, string]> = [
+    [vnet + c.stampConfig.aks.systemPool.name, 'network-contributor', '4d97b98b-1d4f-4787-a291-c67834d212e7'],
+    [vnet + 'apiserver-subnet', 'network-contributor', '4d97b98b-1d4f-4787-a291-c67834d212e7'],
+    [c.identity_id, 'managed-identity-operator', 'f1a07417-d97a-45cb-824c-7a7467783830'],
+    [c.identity_id, 'run-federation-contributor', '7e559ce2-48d7-4b27-9128-fa1b247f1308'],
+    [c.registry_id, 'acr-pull', '7f951dda-4ed3-4680-a7ca-43fe172d538d'],
+    [c.registry_id, 'acr-push', '8311e382-0749-4cb8-b61a-304f252e45ec'],
+    [c.registry_id, 'registry-reader', reader],
+    [container(c.data), 'blob-reader', blobReader],
+    [container(c.experimentContainer), 'blob-reader', blobReader],
+    [container(c.data), 'runtime-data-contributor', blobWriter],
+    [container(c.experimentContainer), 'runtime-blob-contributor', blobWriter],
+    [container('$web'), 'runtime-static-site-contributor', blobWriter],
+    [container(c.checkpoints), 'runtime-control-contributor', blobWriter],
+    [container('experiments'), 'runtime-benchmark-contributor', blobWriter],
+    [c.cluster_id, 'runtime-cluster-reader', reader],
+    [c.workspace_id, 'runtime-log-analytics-reader', '73c42c96-874c-492b-b04d-ab87d138a893'],
+  ];
+  if (c.readLogStorageId) roles.push(
+    [c.readLogStorageId, 'runtime-read-log-reader', blobReader],
+    [c.readLogStorageId, 'runtime-read-log-arm-reader', reader],
+  );
+  return roles.map(([scope, seed, role]) => {
+    const bytes = createHash('sha1').update(Buffer.from('11fb06fb712d4ddd98c7e71bbd588830', 'hex'))
+      .update([scope, c.identity_id, seed].join('-')).digest().subarray(0, 16);
+    bytes[6] = (bytes[6]! & 0x0f) | 0x50;
+    bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+    const name = normalized_uuid(bytes.toString('hex'));
+    return { id: scope + '/providers/Microsoft.Authorization/roleAssignments/' + name, scope, seed,
+      role: '/subscriptions/' + c.subscription + '/providers/Microsoft.Authorization/roleDefinitions/' + role };
+  });
+}
+function verify_arm_what_if_role_modify(item: Record<string, unknown>, c: Config): string {
+  const expected = arm_what_if_runtime_roles(c).find(role => role.id.toLowerCase() === String(item.resourceId).toLowerCase());
+  if (!expected || !arm_what_if_record(item.before) || !arm_what_if_record(item.after))
+    throw new Failure('ARM what-if role Modify has no expected template assignment or complete snapshots.');
+  const before = item.before, after = item.after;
+  for (const snapshot of [before, after]) {
+    if (typeof snapshot.id !== 'string' || snapshot.id.toLowerCase() !== expected.id.toLowerCase() ||
+        typeof snapshot.name !== 'string' || snapshot.name.toLowerCase() !== expected.id.split('/').at(-1)!.toLowerCase() ||
+        String(snapshot.type).toLowerCase() !== 'microsoft.authorization/roleassignments' ||
+        snapshot.apiVersion !== '2022-04-01' || !arm_what_if_record(snapshot.properties))
+      throw new Failure('ARM what-if role Modify has incomplete or mismatched assignment snapshots.');
+  }
+  const previous = before.properties as Record<string, unknown>, next = after.properties as Record<string, unknown>;
+  const principal = typeof previous.principalId === 'string' ? normalized_uuid(previous.principalId) : '';
+  const expression = `[reference('${c.identity_id}', '2023-01-31').principalId]`;
+  if (!principal || next.principalId !== expression || previous.roleDefinitionId !== expected.role ||
+      next.roleDefinitionId !== expected.role ||
+      [before, after, previous, next].some(value => value.scope !== undefined && value.scope !== expected.scope) ||
+      [previous, next].some(properties => properties.principalType !== undefined && properties.principalType !== 'ServicePrincipal'))
+    throw new Failure('ARM what-if role Modify cannot prove unchanged principal, role and scope.');
+  const comparable = (snapshot: Record<string, unknown>, properties: Record<string, unknown>) => ({
+    ...snapshot, properties: { ...properties, principalId: principal, principalType: 'ServicePrincipal' },
+  });
+  if (!arm_what_if_equal(comparable(before, previous), comparable(after, next)) ||
+      !Array.isArray(item.delta) || !item.delta.length)
+    throw new Failure('ARM what-if role Modify changes other assignment properties or omits its delta.');
+  const paths = new Set<string>();
+  for (const delta of item.delta) {
+    if (!arm_what_if_record(delta) || typeof delta.path !== 'string' || paths.has(delta.path) ||
+        (delta.children !== undefined && delta.children !== null &&
+          (!Array.isArray(delta.children) || delta.children.length !== 0)))
+      throw new Failure('ARM what-if role Modify has an invalid or nested property delta.');
+    paths.add(delta.path);
+    if (delta.path === 'properties.principalId' && delta.propertyChangeType === 'Modify' &&
+        delta.before === previous.principalId && delta.after === expression) continue;
+    if (delta.path === 'properties.principalType' && delta.propertyChangeType === 'NoEffect' &&
+        (delta.before === undefined || delta.before === null || delta.before === 'ServicePrincipal') &&
+        delta.after === 'ServicePrincipal') continue;
+    throw new Failure('ARM what-if role Modify has an unproven assignment property delta.');
+  }
+  if (!paths.has('properties.principalId')) throw new Failure('ARM what-if role Modify omits the principal reference delta.');
+  return principal;
+}
+function verify_arm_what_if_modify(item: Record<string, unknown>, config: Config): void {
+  const resourceId = item.resourceId as string;
+  const resourceType = resourceId.toLowerCase() === config.base.toLowerCase() ? 'Microsoft.Resources/resourceGroups' :
+    resourceId.toLowerCase() === config.identity_id.toLowerCase() ? 'Microsoft.ManagedIdentity/userAssignedIdentities' : undefined;
+  if (!resourceType)
+    throw new Failure('ARM what-if Modify is only verifiable for the shared resource group and identity.');
+  if (!arm_what_if_record(item.before) || !arm_what_if_record(item.after))
+    throw new Failure('ARM what-if Modify has no verifiable before/after resource snapshots.');
+  const before = item.before;
+  const after = item.after;
+  for (const snapshot of [before, after]) {
+    if (typeof snapshot.id !== 'string' || snapshot.id.toLowerCase() !== resourceId.toLowerCase() ||
+        typeof snapshot.type !== 'string' || snapshot.type.toLowerCase() !== resourceType.toLowerCase() ||
+        typeof snapshot.name !== 'string' || snapshot.name.toLowerCase() !== resourceId.split('/').at(-1)!.toLowerCase() ||
+        typeof snapshot.apiVersion !== 'string' || !/^\d{4}-\d{2}-\d{2}(?:-preview)?$/.test(snapshot.apiVersion) ||
+        typeof snapshot.location !== 'string' || !/^[a-z0-9]+$/.test(snapshot.location))
+      throw new Failure('ARM what-if Modify has an incomplete or mismatched FullResourcePayloads snapshot.');
+  }
+  const propertyNames = new Set([...Object.keys(before), ...Object.keys(after)]);
+  for (const name of propertyNames) {
+    if (name === 'tags') continue;
+    if (!Object.hasOwn(before, name) || !Object.hasOwn(after, name) || !arm_what_if_equal(before[name], after[name]))
+      throw new Failure('ARM what-if Modify changes a non-tag resource property.');
+  }
+  const beforeHasTags = Object.hasOwn(before, 'tags');
+  const afterHasTags = Object.hasOwn(after, 'tags');
+  const beforeTagsValue = beforeHasTags ? before.tags : {};
+  const afterTagsValue = afterHasTags ? after.tags : {};
+  if (!arm_what_if_record(beforeTagsValue) || !arm_what_if_record(afterTagsValue) ||
+      [...Object.values(beforeTagsValue), ...Object.values(afterTagsValue)].some(value => typeof value !== 'string'))
+    throw new Failure('ARM what-if Modify has unverifiable tag snapshots.');
+  const beforeTags = beforeTagsValue;
+  const afterTags = afterTagsValue;
+  const tagKeys = new Set([...Object.keys(beforeTags), ...Object.keys(afterTags)]);
+  const changedTags = [...tagKeys].filter(key => !Object.hasOwn(beforeTags, key) || !Object.hasOwn(afterTags, key) ||
+    !arm_what_if_equal(beforeTags[key], afterTags[key]));
+  if (!changedTags.length || arm_what_if_value_removed(beforeTags, afterTags))
+    throw new Failure('ARM what-if Modify is empty or removes an existing tag.');
+  if (!Array.isArray(item.delta) || item.delta.length === 0)
+    throw new Failure('ARM what-if Modify has no verifiable property delta.');
+  let wholeTagsDelta = false;
+  const verifiedTagKeys = new Set<string>();
+  for (const value of item.delta) {
+    if (!value || typeof value !== 'object' || Array.isArray(value))
+      throw new Failure('ARM what-if Modify has an invalid property delta.');
+    const delta = value as Record<string, unknown>;
+    if (typeof delta.path !== 'string' || !delta.path.trim() || typeof delta.propertyChangeType !== 'string')
+      throw new Failure('ARM what-if Modify has an incomplete property delta.');
+    if (delta.children !== undefined && delta.children !== null &&
+        (!Array.isArray(delta.children) || delta.children.length !== 0))
+      throw new Failure('ARM what-if Modify contains unverifiable nested property deltas.');
+    const changeType = delta.propertyChangeType;
+    if (delta.path.trim().toLowerCase() === 'tags') {
+      if (wholeTagsDelta || item.delta.length !== 1)
+        throw new Failure('ARM what-if Modify has overlapping tag deltas.');
+      wholeTagsDelta = true;
+      if (changeType === 'Create') {
+        if (beforeHasTags || !afterHasTags || Object.hasOwn(delta, 'before') || !Object.hasOwn(delta, 'after') ||
+            !arm_what_if_equal(delta.after, afterTags))
+          throw new Failure('ARM what-if Modify has an inconsistent tag creation delta.');
+      } else if (changeType === 'Modify') {
+        if (!beforeHasTags || !afterHasTags || !Object.hasOwn(delta, 'before') || !Object.hasOwn(delta, 'after') ||
+            !arm_what_if_equal(delta.before, beforeTags) || !arm_what_if_equal(delta.after, afterTags))
+          throw new Failure('ARM what-if Modify has an inconsistent tag modification delta.');
+      } else throw new Failure('ARM what-if Modify has an unsupported tag change type.');
+      continue;
+    }
+    const key = arm_what_if_tag_delta_key(delta.path.trim(), changedTags);
+    if (!key || verifiedTagKeys.has(key)) throw new Failure('ARM what-if Modify has an unexpected or duplicate property delta.');
+    verifiedTagKeys.add(key);
+    const beforeHasKey = Object.hasOwn(beforeTags, key);
+    const afterHasKey = Object.hasOwn(afterTags, key);
+    if (changeType === 'Create') {
+      if (beforeHasKey || !afterHasKey || Object.hasOwn(delta, 'before') || !Object.hasOwn(delta, 'after') ||
+          !arm_what_if_equal(delta.after, afterTags[key]))
+        throw new Failure('ARM what-if Modify has an inconsistent tag creation delta.');
+    } else if (changeType === 'Modify') {
+      if (!beforeHasKey || !afterHasKey || !Object.hasOwn(delta, 'before') || !Object.hasOwn(delta, 'after') ||
+          !arm_what_if_equal(delta.before, beforeTags[key]) || !arm_what_if_equal(delta.after, afterTags[key]))
+        throw new Failure('ARM what-if Modify has an inconsistent tag modification delta.');
+    } else throw new Failure('ARM what-if Modify removes or has an unsupported tag change.');
+  }
+  if (!wholeTagsDelta && changedTags.some(key => !verifiedTagKeys.has(key)))
+    throw new Failure('ARM what-if Modify property deltas do not cover all tag snapshot changes.');
+}
+async function verified_arm_what_if_changes(result: unknown, azure: Azure): Promise<number> {
+  const config = azure.c;
+  if (!result || typeof result !== 'object' || Array.isArray(result))
+    throw new Failure('ARM what-if returned an unverifiable response object.');
+  const response = result as Record<string, unknown>;
+  if (response.error || (response.status !== undefined && response.status !== 'Succeeded'))
+    throw new Failure('ARM what-if reported a failed or incomplete deployment preview.');
+  let properties = response;
+  if (Object.hasOwn(response, 'properties')) {
+    if (!arm_what_if_record(response.properties) || Object.hasOwn(response, 'changes') ||
+        Object.hasOwn(response, 'potentialChanges') || Object.hasOwn(response, 'diagnostics'))
+      throw new Failure('ARM what-if returned an invalid or ambiguous response envelope.');
+    properties = response.properties;
+  }
+  const diagnostics = properties.diagnostics;
+  if (diagnostics !== undefined && diagnostics !== null) {
+    if (!Array.isArray(diagnostics)) throw new Failure('ARM what-if response has an invalid diagnostics list.');
+    for (const diagnostic of diagnostics) {
+      if (!arm_what_if_record(diagnostic)) throw new Failure('ARM what-if returned an invalid diagnostic entry.');
+      const label = 'level=' + String(diagnostic.level ?? '<missing>') + ' code=' +
+        (typeof diagnostic.code === 'string' ? diagnostic.code : diagnostic.code === undefined ? '<missing>' : '<invalid>');
+      if (['code', 'message', 'target'].some(key => diagnostic[key] !== undefined && typeof diagnostic[key] !== 'string'))
+        throw new Failure('ARM what-if diagnostic ' + label + ' has invalid string metadata.');
+      const additionalInfo = diagnostic.additionalInfo;
+      if (additionalInfo !== undefined && (!Array.isArray(additionalInfo) || additionalInfo.some(info =>
+        !arm_what_if_record(info) || (info.type !== undefined && typeof info.type !== 'string') ||
+        (info.info !== undefined && !arm_what_if_record(info.info)))))
+        throw new Failure('ARM what-if diagnostic ' + label + ' has invalid additional info.');
+      if (diagnostic.level !== 'Info')
+        throw new Failure('ARM what-if diagnostic ' + label + ' prevents a verified preview.');
+      console.log(config.redact('ARM what-if diagnostic ' + label + ' message=' + (diagnostic.message ?? '<missing>')));
+    }
+  }
+  if (!Array.isArray(properties.changes)) throw new Failure('ARM what-if response is missing its changes list.');
+  const potentialChanges = properties.potentialChanges;
+  if (potentialChanges !== undefined && potentialChanges !== null && !Array.isArray(potentialChanges))
+    throw new Failure('ARM what-if response has an invalid potential changes list.');
+  const changes = [...properties.changes, ...(Array.isArray(potentialChanges) ? potentialChanges : [])];
+  let livePrincipal: string | undefined;
+  for (const change of changes) {
+    if (!change || typeof change !== 'object' || Array.isArray(change))
+      throw new Failure('ARM what-if returned an unverifiable resource change.');
+    const item = change as Record<string, unknown>;
+    if (typeof item.resourceId !== 'string' ||
+        typeof item.changeType !== 'string' || !ARM_WHAT_IF_CHANGE_TYPES.has(item.changeType))
+      throw new Failure('ARM what-if returned an unverifiable resource change.');
+    verified_arm_what_if_resource_scope(item.resourceId, config);
+    if (item.changeType === 'Delete') throw new Failure('ARM what-if contains a resource deletion.');
+    if (item.changeType === 'Unsupported') throw new Failure('ARM what-if contains an unsupported resource change.');
+    if (item.changeType === 'Deploy') throw new Failure('ARM what-if contains an unverifiable deployment-only change.');
+    if (item.changeType === 'Modify') {
+      if (item.resourceId.toLowerCase().includes('/providers/microsoft.authorization/roleassignments/')) {
+        const principal = verify_arm_what_if_role_modify(item, config);
+        if (livePrincipal === undefined) {
+          const identity = await azure.arm('GET', config.identity_id, undefined, false, '2023-01-31');
+          if (typeof identity?.properties?.principalId !== 'string')
+            throw new Failure('ARM what-if role Modify has no live shared-identity principal proof.');
+          livePrincipal = normalized_uuid(identity.properties.principalId);
+        }
+        if (principal !== livePrincipal)
+          throw new Failure('ARM what-if role Modify principal does not match the live shared identity.');
+      } else verify_arm_what_if_modify(item, config);
+    }
+  }
+  return changes.length;
+}
+const sha256_file = (filename: string): string => createHash('sha256').update(fs.readFileSync(filename)).digest('hex');
+
+export async function deploy(azure: Azure, fresh?: Metadata, whatIf = false, previewBeforeCreate = false): Promise<void> {
   const c = azure.c;
+  if (whatIf && previewBeforeCreate) throw new Failure('Standalone what-if cannot be combined with --preview-before-create.');
   const existing = await guard_existing(azure);
   for (const [kind, resource] of Object.entries(existing)) {
     if (typeof resource.location !== 'string' || !/^[a-z0-9]+$/.test(resource.location))
       throw new Failure('Existing ' + kind + ' location is missing or invalid; refusing relocation.');
   }
   const ownershipTags = { ...TAGS, sandboxId: c.sandbox };
+  const resolvedExisting = (state: typeof existing) => ({
+    resourceGroupLocation: state.group?.location ?? c.location,
+    identityLocation: state.identity?.location ?? c.location,
+    resourceGroupTags: state.group?.tags ?? ownershipTags,
+    identityTags: state.identity?.tags ?? ownershipTags,
+  });
+  const existingParameters = resolvedExisting(existing);
   const params = { location: c.location, resourceGroupName: c.group, sandboxId: c.sandbox, storageAccountName: c.account,
-    resourceGroupLocation: existing.group?.location ?? c.location, identityLocation: existing.identity?.location ?? c.location,
-    resourceGroupTags: existing.group?.tags ?? ownershipTags, identityTags: existing.identity?.tags ?? ownershipTags,
-    azureMode: c.mode, clusterName: c.cluster, identityName: c.identity, registryName: c.registry,
+    ...existingParameters, azureMode: c.mode, clusterName: c.cluster, identityName: c.identity, registryName: c.registry,
     aksConfig: c.mode === 'stamped' ? c.stampConfig.aks : {},
     publisherFederatedCredentials: c.mode === 'stamped' && !existing.identity ? c.stampConfig.publisherFederatedCredentials : [],
     databaseName: c.database, dataContainer: c.data, checkpointContainer: c.checkpoints,
@@ -838,15 +1179,41 @@ export async function deploy(azure: Azure, fresh?: Metadata, whatIf = false): Pr
     operatorObjectId: c.operator, operatorKustoPrincipalId: c.operator_type === 'App' ? c.operator_application : c.operator,
     controlMetadata: fresh ?? {}, checkpointExists: fresh === undefined, operatorType: c.operator_type,
     clusterSku: c.sku, minimumInstances: c.minimum, maximumInstances: c.maximum, clusterTags: c.cluster_tags };
+  const template = path.join(ROOT, 'infra/azure/main.bicep');
+  const templateSha256 = sha256_file(template);
   const filename = private_file(path.join(ROOT, '.env.azure.parameters.json'),
     JSON.stringify({ parameters: Object.fromEntries(Object.entries(params).map(([k, v]) => [k, { value: v }])) }));
   try {
+    const parametersSha256 = sha256_file(filename);
+    const invoke = (operation: 'what-if' | 'create') => azure.cli('deployment', 'sub', operation,
+      ...(operation === 'what-if' ? ['--result-format', 'FullResourcePayloads', '--no-pretty-print'] : []),
+      '--subscription', c.subscription, '--location', c.location, '--name', 'arrowcol-sandbox-' + c.sandbox,
+      '--template-file', template, '--parameters', '@' + filename);
+    if (whatIf || previewBeforeCreate) {
+      try {
+        const result = await invoke('what-if');
+        const changes = await verified_arm_what_if_changes(result, azure);
+        if (whatIf) console.log(JSON.stringify(result, null, 2));
+        if (previewBeforeCreate) {
+          if (canonical_json(resolvedExisting(await guard_existing(azure))) !== canonical_json(existingParameters))
+            throw new Failure('Resource-group or UAMI location/tags changed during ARM what-if; refusing create.');
+          if (sha256_file(filename) !== parametersSha256 || sha256_file(template) !== templateSha256)
+            throw new Failure('ARM template or parameter payload changed during what-if; refusing create.');
+          console.log('ARM_PREVIEW_VERIFIED parametersSha256=' + parametersSha256 + ' templateSha256=' + templateSha256 + ' changes=' + changes);
+        }
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new ArmPreviewFailure('ARM what-if failed or could not be verified; no deployment create was attempted. ' + c.redact(detail), { cause: error });
+      }
+    }
     try {
-      const result = await azure.cli('deployment', 'sub', whatIf ? 'what-if' : 'create', '--subscription', c.subscription, '--location', c.location,
-        '--name', 'arrowcol-sandbox-' + c.sandbox,
-        '--template-file', path.join(ROOT, 'infra/azure/main.bicep'), '--parameters', '@' + filename);
-      if (whatIf) console.log(JSON.stringify(result, null, 2));
+      if (!whatIf) {
+        if (previewBeforeCreate && (sha256_file(filename) !== parametersSha256 || sha256_file(template) !== templateSha256))
+          throw new ArmPreviewFailure('ARM template or parameter payload changed after what-if; refusing create.');
+        await invoke('create');
+      }
     } catch (error) {
+      if (error instanceof ArmPreviewFailure) throw error;
       if (error instanceof Failure && error.message.includes('DeploymentFailed')) throw new DeploymentFailed(error.message, { cause: error });
       throw error;
     }
@@ -875,7 +1242,7 @@ export async function ensure_running(azure: Azure): Promise<void> {
 }
 export async function held<T>(control: PublisherControl, publisher: string, generation: string, work: () => Promise<T>): Promise<T> {
   try { return await work(); } catch (error) {
-    if (error instanceof NotReady || error instanceof DeploymentFailed) await control.clean_release(publisher, generation, true);
+    if (error instanceof NotReady || error instanceof DeploymentFailed || error instanceof ArmPreviewFailure) await control.clean_release(publisher, generation, true);
     else { try { await control.uncertain(publisher, generation); } catch { /* Active still blocks. */ } }
     throw error;
   }
@@ -886,7 +1253,7 @@ export async function exclusive(control: PublisherControl, generation: string, s
   try {
     for (const step of steps) { await control.bootstrap_owner(operator, generation); await step(); }
   } catch (error) {
-    if (error instanceof NotReady || error instanceof DeploymentFailed) await control.complete_bootstrap(operator, generation, true);
+    if (error instanceof NotReady || error instanceof DeploymentFailed || error instanceof ArmPreviewFailure) await control.complete_bootstrap(operator, generation, true);
     else { try { await control.uncertain(operator, generation); } catch { /* Active still blocks. */ } }
     throw error;
   }
@@ -905,7 +1272,7 @@ export function initializer_env(values: Record<string, string>, c: Config, table
 }
 export const initializerEnv = initializer_env;
 export async function provision(azure: Azure, tables: string, wait_seconds: number, output: string,
-  infra_only: boolean, values: Record<string, string>): Promise<void> {
+  infra_only: boolean, values: Record<string, string>, previewBeforeCreate = false): Promise<void> {
   const c = azure.c, control = new PublisherControl(azure);
   await guard_existing(azure);
   let generation: string;
@@ -916,7 +1283,7 @@ export async function provision(azure: Azure, tables: string, wait_seconds: numb
   };
   if (await checkpoint_container(azure) === null) {
     const fresh = fresh_authority();
-    await deploy(azure, fresh);
+    await deploy(azure, fresh, false, previewBeforeCreate);
     const [metadata, registry] = await control.read();
     if (metadata.resetgeneration !== fresh.resetgeneration || metadata.resetstate !== FENCED ||
         Object.keys(registry).length || metadata.occupancy !== 'released')
@@ -931,7 +1298,8 @@ export async function provision(azure: Azure, tables: string, wait_seconds: numb
     if (metadata.resetstate === READY) {
       if (!infra_only && !fs.existsSync(tables))
         throw new Failure('Table manifest is missing; run provision --infra-only, or reset --execute then a full provision.');
-      const steps: (() => Promise<unknown>)[] = [() => deploy(azure), () => ensure_running(azure), () => experiment_policy(azure)];
+      const steps: (() => Promise<unknown>)[] = [() => deploy(azure, undefined, false, previewBeforeCreate),
+        () => ensure_running(azure), () => experiment_policy(azure)];
       if (!infra_only) steps.push(() => reconcile(azure, tables, wait_seconds));
       await exclusive(control, generation, steps);
       write_private(output, { ...c.generated(), ARROWCOL_RESET_GENERATION: generation });
@@ -941,7 +1309,7 @@ export async function provision(azure: Azure, tables: string, wait_seconds: numb
     if (metadata.resetstate !== FENCED || Object.keys(registry).length)
       throw new Failure('Authority is cleanup-owned or has registered publishers; provisioning refused.');
     await control.admit(member, generation, true);
-    await held(control, member, generation, async () => { await deploy(azure); await experiment(); });
+    await held(control, member, generation, async () => { await deploy(azure, undefined, false, previewBeforeCreate); await experiment(); });
     await control.clean_release(member, generation, true);
   }
   write_private(output, c.generated());
@@ -1503,8 +1871,9 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         'run-id': { type: 'string' }, namespace: { type: 'string' },
         'service-account': { type: 'string' }, record: { type: 'string' },
         manifest: { type: 'string' }, 'workload-record': { type: 'string' }, 'workload-stop-record': { type: 'string' },
+        'preview-before-create': { type: 'boolean', default: false },
       } });
-    if (args.help) { console.log('Usage: bootstrap.ts <config|preflight|what-if|provision|reconcile|reset|recover|status|stop|occupy|release|prepare-run-fic|probe-run-fic|cleanup-run-fic|bind-oat-qap|verify-oat-qap|cleanup-oat-qap> [--mode stamped|schema-evolution] [--env-file PATH] [--stamp-config YAML] [--output PATH] [--tables PATH] [--infra-only] [--read-only] [--execute] [--resume] [--occupancy-id UUID] [--reset-generation UUID] [--wait-seconds 0..600] [--run-id UUID --namespace NAME --service-account NAME --record PATH] [--manifest PATH --workload-record PATH --workload-stop-record PATH] [--stop-command COMMAND ...]'); return 0; }
+    if (args.help) { console.log('Usage: bootstrap.ts <config|preflight|what-if|provision|reconcile|reset|recover|status|stop|occupy|release|prepare-run-fic|probe-run-fic|cleanup-run-fic|bind-oat-qap|verify-oat-qap|cleanup-oat-qap> [--mode stamped|schema-evolution] [--env-file PATH] [--stamp-config YAML] [--output PATH] [--tables PATH] [--infra-only] [--read-only] [--preview-before-create] [--execute] [--resume] [--occupancy-id UUID] [--reset-generation UUID] [--wait-seconds 0..600] [--run-id UUID --namespace NAME --service-account NAME --record PATH] [--manifest PATH --workload-record PATH --workload-stop-record PATH] [--stop-command COMMAND ...]'); return 0; }
     const command = positionals[0];
     if (positionals.length !== 1 || !['config', 'preflight', 'what-if', 'provision', 'reconcile', 'reset', 'recover', 'status', 'stop', 'occupy', 'release',
       'prepare-run-fic', 'probe-run-fic', 'cleanup-run-fic', 'bind-oat-qap', 'verify-oat-qap', 'cleanup-oat-qap'].includes(command))
@@ -1512,6 +1881,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     const mode = azure_mode(args.mode!);
     if (args['read-only'] && command !== 'preflight' && command !== 'what-if')
       throw new Failure('--read-only is only supported for preflight and what-if.');
+    if (args['preview-before-create'] && command !== 'provision')
+      throw new Failure('--preview-before-create is only supported for provision.');
     if (mode === 'schema-evolution' && args['stamp-config'])
       throw new Failure('Schema-evolution mode does not accept an AKS stamp configuration.');
     const privateValues = load_env(args['env-file']!);
@@ -1560,7 +1931,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       case 'config': write_private(args.output!, c.generated()); console.log('Private generated Azure configuration written (values withheld).'); break;
       case 'preflight': await preflight(azure, args['read-only']); break;
       case 'what-if': await preflight(azure, true); await deploy(azure, fresh_authority(), true); break;
-      case 'provision': await preflight(azure); await provision(azure, args.tables!, wait, args.output!, args['infra-only']!, values); break;
+      case 'provision': await preflight(azure); await provision(azure, args.tables!, wait, args.output!, args['infra-only']!, values,
+        args['preview-before-create']!); break;
       case 'reconcile': await reconcile_command(azure, args.tables!, args['occupancy-id']!, wait, generation); break;
       case 'reset': await reset(azure, args.execute!, stopCommand, args.resume!); break;
       case 'recover': await recover(azure, args.execute!, stopCommand); break;
@@ -1580,6 +1952,11 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     }
     return 0;
   } catch (error) {
+    if (error instanceof ArmPreviewFailure) {
+      console.error(JSON.stringify({ status: 'arm_preview_failed', code: 'ARM_WHAT_IF_UNVERIFIED', create_attempted: false,
+        error: c ? c.redact(error.message) : error.message }));
+      return ARM_PREVIEW_FAILURE_EXIT;
+    }
     if (error instanceof NotReady) {
       console.error(JSON.stringify({ status: 'not_ready', code: 'DELTA_LOGS_ABSENT', retryable: true, kql_attempted: false })); return 3;
     }
