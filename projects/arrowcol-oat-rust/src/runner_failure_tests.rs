@@ -447,3 +447,97 @@ mod failure_evidence_tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod router_metrics_tunnel_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn exited_owned_tunnel_is_restarted_before_owner_sampling() -> Result<()> {
+        let script_path = std::env::temp_dir().join(format!("oat-fake-kubectl-{}.js", uuid::Uuid::new_v4()));
+        fs::write(
+            &script_path,
+            r#"const http = require('node:http');
+const port = Number(process.argv.at(-1).split(':')[0]);
+http.createServer((request, response) => {
+  if (request.url === '/readyz') return response.writeHead(200).end('ok');
+  if (request.url === '/metrics') {
+    response.writeHead(200, {'content-type': 'text/plain'});
+    return response.end('arrowcol_router_table_owners{pool=\"dataflow\",catalog=\"c\",schema=\"s\",table=\"sqlserver_wait_stats\",collector=\"collector-a\",state=\"active\"} 1\n');
+  }
+  response.writeHead(404).end();
+}).listen(port, '127.0.0.1');"#,
+        )?;
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.example.json"
+        ))?;
+        config.platform.kind = crate::config::OatMode::Aks;
+        config.namespace = "arrow-collector-test".to_owned();
+        config.kubectl_context = None;
+        let mut platform = AksPlatform {
+            run_id: "00000000-0000-0000-0000-000000000001".to_owned(),
+            namespace_created: false,
+            namespace_create_attempted: false,
+            namespace_owner_token: "test-owner".to_owned(),
+            namespace_uid: None,
+            runtime_dir: None,
+            qap_relative_data_root: None,
+            router_metrics_url: None,
+            router_tunnel: None,
+            fic_record_path: None,
+            fic_ready_snapshot_path: None,
+            fic_prepare_attempted: false,
+            qap_record_path: None,
+            qap_bind_attempted: false,
+            qap_outcome_unresolved: false,
+            workload_stop_record_path: None,
+            schedule_configmap_name: "oat-schedule-test".to_owned(),
+            service_account: None,
+            router_yaml: None,
+        };
+        let script = script_path.clone();
+        let mut command = || {
+            let mut command = Command::new("node");
+            command.arg(&script);
+            command
+        };
+        start_router_metrics_tunnel_with(&config, &mut platform, command()).await?;
+        let endpoint = platform.router_metrics_endpoint(&config)?;
+        let client = reqwest::Client::new();
+        let tables = vec!["sqlserver_wait_stats".to_owned()];
+        let owners = sample_table_owners(&client, &endpoint, &tables).await?;
+        assert_eq!(owners["sqlserver_wait_stats"], vec!["collector-a".to_owned()]);
+
+        platform
+            .router_tunnel
+            .as_mut()
+            .context("fake router metrics tunnel was not started")?
+            .child
+            .start_kill()?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if platform
+                    .router_tunnel
+                    .as_mut()
+                    .context("fake router metrics tunnel disappeared")?
+                    .child
+                    .try_wait()?
+                    .is_some()
+                {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("fake router metrics tunnel did not exit after termination")??;
+
+        assert!(ensure_router_metrics_tunnel_with(&config, &mut platform, &mut command).await?);
+        let endpoint = platform.router_metrics_endpoint(&config)?;
+        let owners = sample_table_owners(&client, &endpoint, &tables).await?;
+        assert_eq!(owners["sqlserver_wait_stats"], vec!["collector-a".to_owned()]);
+        cleanup_aks_platform(&config, &mut platform).await?;
+        fs::remove_file(script_path)?;
+        Ok(())
+    }
+}

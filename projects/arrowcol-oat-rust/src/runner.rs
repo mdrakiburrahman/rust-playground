@@ -114,6 +114,9 @@ trait Platform: Send + Sync {
     fn kind(&self) -> crate::config::OatMode;
     fn workload_endpoint(&self, config: &OatConfig) -> String;
     fn router_metrics_endpoint(&self, config: &OatConfig) -> Result<String>;
+    async fn ensure_router_metrics_endpoint(&mut self, config: &OatConfig) -> Result<(String, bool)> {
+        Ok((self.router_metrics_endpoint(config)?, false))
+    }
     fn qap_endpoint(&self, config: &OatConfig) -> String;
     async fn ensure_stack(&mut self, config: &OatConfig) -> Result<()>;
     async fn scale_arrowcols(&mut self, config: &OatConfig, replicas: u32, concurrency: u32) -> Result<()>;
@@ -204,6 +207,11 @@ impl Platform for AksPlatform {
         self.router_metrics_url
             .clone()
             .context("AKS router metrics tunnel is not ready")
+    }
+
+    async fn ensure_router_metrics_endpoint(&mut self, config: &OatConfig) -> Result<(String, bool)> {
+        let restarted = ensure_router_metrics_tunnel(config, self).await?;
+        Ok((self.router_metrics_endpoint(config)?, restarted))
     }
 
     fn qap_endpoint(&self, config: &OatConfig) -> String {
@@ -2155,8 +2163,7 @@ async fn run_clients(
         Err(error) => {
             let sample = async {
                 let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?;
-                let endpoint = platform.router_metrics_endpoint(config)?;
-                sample_table_owners(&client, &endpoint, tables).await
+                sample_router_table_owners(platform, config, &client, tables).await
             }
             .await;
             let pinning = failed_client_pinning_report(&error, sample, tables, pinning);
@@ -2228,7 +2235,7 @@ async fn run_clients_inner(
     pinning: &mut PinningReport,
 ) -> Result<ClientRun> {
     let timing_budget = config.timing_budget()?;
-    let metrics_endpoint = platform.router_metrics_endpoint(config)?;
+    platform.ensure_router_metrics_endpoint(config).await?;
     let metrics_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
@@ -2394,7 +2401,7 @@ async fn run_clients_inner(
         }
         record_owner_observation(
             pinning,
-            sample_table_owners(&metrics_client, &metrics_endpoint, tables).await,
+            sample_router_table_owners(platform, config, &metrics_client, tables).await,
             tables,
             false,
         );
@@ -2511,7 +2518,7 @@ async fn run_clients_inner(
         }
         record_owner_observation(
             pinning,
-            sample_table_owners(&metrics_client, &metrics_endpoint, tables).await,
+            sample_router_table_owners(platform, config, &metrics_client, tables).await,
             tables,
             false,
         );
@@ -2521,7 +2528,7 @@ async fn run_clients_inner(
     }
     record_owner_observation(
         pinning,
-        sample_table_owners(&metrics_client, &metrics_endpoint, tables).await,
+        sample_router_table_owners(platform, config, &metrics_client, tables).await,
         tables,
         true,
     );
@@ -2693,6 +2700,39 @@ async fn sample_table_owners(
         .context("router metrics endpoint returned an error status")?;
     let body = response.text().await.context("read router metrics response")?;
     parse_owner_metrics(&body, tables)
+}
+
+async fn sample_router_table_owners(
+    platform: &mut dyn Platform,
+    config: &OatConfig,
+    client: &reqwest::Client,
+    tables: &[String],
+) -> Result<HashMap<String, Vec<String>>> {
+    let (endpoint, _) = platform.ensure_router_metrics_endpoint(config).await?;
+    match sample_table_owners(client, &endpoint, tables).await {
+        Ok(sample) => Ok(sample),
+        Err(error) => {
+            if !error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<reqwest::Error>()
+                    .is_some_and(|cause| cause.is_connect())
+            }) {
+                return Err(error);
+            }
+            let (retry_endpoint, restarted) = match platform.ensure_router_metrics_endpoint(config).await {
+                Ok(endpoint) => endpoint,
+                Err(recovery_error) => {
+                    return Err(error.context(format!("router metrics tunnel recovery failed: {recovery_error:#}")));
+                }
+            };
+            if !restarted {
+                return Err(error);
+            }
+            sample_table_owners(client, &retry_endpoint, tables)
+                .await
+                .map_err(|retry_error| retry_error.context(format!("initial router metrics sample failed: {error:#}")))
+        }
+    }
 }
 
 fn parse_owner_metrics(body: &str, tables: &[String]) -> Result<HashMap<String, Vec<String>>> {
@@ -4879,6 +4919,14 @@ async fn require_nonempty_record(record_path: &Path) -> Result<()> {
 }
 
 async fn start_router_metrics_tunnel(config: &OatConfig, platform: &mut AksPlatform) -> Result<()> {
+    start_router_metrics_tunnel_with(config, platform, Command::new("kubectl")).await
+}
+
+async fn start_router_metrics_tunnel_with(
+    config: &OatConfig,
+    platform: &mut AksPlatform,
+    mut command: Command,
+) -> Result<()> {
     let reservation = TcpListener::bind("127.0.0.1:0")
         .await
         .context("reserve a loopback port for the AKS router metrics tunnel")?;
@@ -4886,7 +4934,6 @@ async fn start_router_metrics_tunnel(config: &OatConfig, platform: &mut AksPlatf
     drop(reservation);
 
     let port_mapping = format!("{port}:50050");
-    let mut command = Command::new("kubectl");
     if let Some(context) = &config.kubectl_context {
         command.args(["--context", context]);
     }
@@ -4952,6 +4999,44 @@ async fn start_router_metrics_tunnel(config: &OatConfig, platform: &mut AksPlatf
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+}
+
+async fn ensure_router_metrics_tunnel(config: &OatConfig, platform: &mut AksPlatform) -> Result<bool> {
+    ensure_router_metrics_tunnel_with(config, platform, || Command::new("kubectl")).await
+}
+
+async fn ensure_router_metrics_tunnel_with<F>(
+    config: &OatConfig,
+    platform: &mut AksPlatform,
+    mut command: F,
+) -> Result<bool>
+where
+    F: FnMut() -> Command,
+{
+    if let Some(mut forward) = platform.router_tunnel.take() {
+        match forward
+            .child
+            .try_wait()
+            .context("check owned AKS router metrics tunnel")?
+        {
+            None => {
+                platform.router_tunnel = Some(forward);
+                return Ok(false);
+            }
+            Some(status) => {
+                platform.router_metrics_url = None;
+                let stderr = collect_kubectl_stderr(forward.stderr).await?;
+                tracing::warn!(
+                    exit_status = %status,
+                    stderr = %String::from_utf8_lossy(&stderr),
+                    "owned AKS router metrics port-forward exited; restarting it"
+                );
+            }
+        }
+    }
+    platform.router_metrics_url = None;
+    start_router_metrics_tunnel_with(config, platform, command()).await?;
+    Ok(true)
 }
 
 async fn stop_kubectl_process(mut forward: OwnedKubectlProcess) -> Result<JoinHandle<std::io::Result<Vec<u8>>>> {
