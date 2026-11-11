@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, ensure};
-use arrowcol_oat_rust::config::OatConfig;
-use arrowcol_oat_rust::model::{AppState, RunState, RunStatus, unix_time_ms};
+use arrowcol_oat_rust::config::{OatConfig, OatMode};
+use arrowcol_oat_rust::model::{AppState, CancelRunError, RunState, RunStatus, unix_time_ms};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
@@ -63,6 +63,7 @@ async fn main() -> Result<()> {
         .route("/healthz", get(health))
         .route("/runs", post(start_run))
         .route("/runs/{id}", get(get_run))
+        .route("/runs/{id}/cancel", post(cancel_run))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     tracing::info!(address = %listener.local_addr()?, "ArrowCol OAT server listening");
@@ -106,16 +107,29 @@ async fn start_run(
     };
     state.runs.lock().await.insert(id.clone(), status.clone());
 
+    let local = config.platform.kind == OatMode::Local;
+    let cancellation = state.register_run_cancel(&id, local).await;
     let task_state = Arc::clone(&state);
     tokio::spawn(async move {
         let _permit = permit;
-        match arrowcol_oat_rust::runner::execute(config, &id, Arc::clone(&task_state)).await {
-            Ok(result_count) => {
+        let result = arrowcol_oat_rust::runner::execute(config, &id, Arc::clone(&task_state), cancellation).await;
+        match result {
+            Ok(outcome) if outcome.cancelled => {
+                task_state
+                    .update(&id, |status| {
+                        status.state = RunState::Cancelled;
+                        status.progress = "local resources cleaned after cancellation".to_owned();
+                        status.error = Some("run cancelled by request".to_owned());
+                        status.finished_at_unix_ms = Some(unix_time_ms());
+                    })
+                    .await;
+            }
+            Ok(outcome) => {
                 task_state
                     .update(&id, |status| {
                         status.state = RunState::Succeeded;
                         status.progress = "published Parquet results".to_owned();
-                        status.result_count = result_count;
+                        status.result_count = outcome.result_count;
                         status.finished_at_unix_ms = Some(unix_time_ms());
                     })
                     .await;
@@ -134,6 +148,29 @@ async fn start_run(
         }
     });
     Ok((StatusCode::ACCEPTED, Json(status)))
+}
+
+async fn cancel_run(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    state
+        .request_local_cancel(&id)
+        .await
+        .map(|()| StatusCode::ACCEPTED)
+        .map_err(|error| {
+            let (status, message) = match error {
+                CancelRunError::NotFound => (StatusCode::NOT_FOUND, "unknown OAT run"),
+                CancelRunError::NotLocal => (StatusCode::FORBIDDEN, "only local OAT runs can be cancelled"),
+                CancelRunError::NotActive => (StatusCode::CONFLICT, "OAT run is not active"),
+            };
+            (
+                status,
+                Json(ApiError {
+                    error: message.to_owned(),
+                }),
+            )
+        })
 }
 
 async fn get_run(
