@@ -18,6 +18,7 @@ arrowcol-catalog-client = { path = "../arrowcol-catalog-client" }
 arrowcol-protocol = { path = "../arrowcol-protocol" }
 clap.workspace = true
 flate2 = "1"
+futures = "0.3"
 hex = "0.4"
 prost = "0.14"
 prost-build = "0.14"

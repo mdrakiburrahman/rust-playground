@@ -14,11 +14,29 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::{CatalogService, DdlIdentityPolicy, identity::now_unix_millis};
 
+const FLIGHT_DO_PUT_PATH: &str = "/arrow.flight.protocol.FlightService/DoPut";
+
 /// Flight SQL transport retaining the committed Arrowcol DDL completion headers.
 #[derive(Clone)]
 pub struct CatalogFlightService {
     catalog: CatalogService,
     ddl_identity_policy: DdlIdentityPolicy,
+}
+
+impl CatalogFlightService {
+    fn verify_message<T: Message>(&self, request: &Request<T>, method: &str) -> Result<(), Status> {
+        self.ddl_identity_policy.verify_request(
+            request.metadata(),
+            method,
+            &request.get_ref().encode_to_vec(),
+            now_unix_millis(),
+        )
+    }
+
+    fn verify_empty(&self, metadata: &tonic::metadata::MetadataMap, method: &str) -> Result<(), Status> {
+        self.ddl_identity_policy
+            .verify_request(metadata, method, &[], now_unix_millis())
+    }
 }
 
 impl CatalogService {
@@ -54,31 +72,36 @@ impl FlightService for CatalogFlightService {
         &self,
         request: Request<Streaming<HandshakeRequest>>,
     ) -> Result<Response<Self::HandshakeStream>, Status> {
+        self.verify_empty(request.metadata(), "/arrow.flight.protocol.FlightService/Handshake")?;
         self.catalog.handshake(request).await
     }
 
     async fn list_flights(&self, request: Request<Criteria>) -> Result<Response<Self::ListFlightsStream>, Status> {
+        self.verify_message(&request, "/arrow.flight.protocol.FlightService/ListFlights")?;
         self.catalog.list_flights(request).await
     }
 
     async fn get_flight_info(&self, request: Request<FlightDescriptor>) -> Result<Response<FlightInfo>, Status> {
+        self.verify_message(&request, "/arrow.flight.protocol.FlightService/GetFlightInfo")?;
         self.catalog.get_flight_info(request).await
     }
 
     async fn poll_flight_info(&self, request: Request<FlightDescriptor>) -> Result<Response<PollInfo>, Status> {
+        self.verify_message(&request, "/arrow.flight.protocol.FlightService/PollFlightInfo")?;
         self.catalog.poll_flight_info(request).await
     }
 
     async fn get_schema(&self, request: Request<FlightDescriptor>) -> Result<Response<SchemaResult>, Status> {
+        self.verify_message(&request, "/arrow.flight.protocol.FlightService/GetSchema")?;
         self.catalog.get_schema(request).await
     }
 
     async fn do_get(&self, request: Request<Ticket>) -> Result<Response<Self::DoGetStream>, Status> {
+        self.verify_message(&request, "/arrow.flight.protocol.FlightService/DoGet")?;
         self.catalog.do_get(request).await
     }
 
     async fn do_put(&self, request: Request<Streaming<FlightData>>) -> Result<Response<Self::DoPutStream>, Status> {
-        self.ddl_identity_policy.verify(request.metadata(), now_unix_millis())?;
         let mut request = request.map(StreamExt::peekable);
         let first = tokio::time::timeout(std::time::Duration::from_secs(10), Pin::new(request.get_mut()).peek())
             .await
@@ -91,6 +114,12 @@ impl FlightService for CatalogFlightService {
         if descriptor.r#type != arrow_flight::flight_descriptor::DescriptorType::Cmd as i32 {
             return Err(Status::invalid_argument("catalog DDL requires a command descriptor"));
         }
+        self.ddl_identity_policy.verify_request(
+            request.metadata(),
+            FLIGHT_DO_PUT_PATH,
+            &descriptor.cmd,
+            now_unix_millis(),
+        )?;
         let any = Any::decode(descriptor.cmd)
             .map_err(|error| Status::invalid_argument(format!("invalid catalog DDL command: {error}")))?;
         let command = Command::try_from(any)
@@ -122,14 +151,17 @@ impl FlightService for CatalogFlightService {
         &self,
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoExchangeStream>, Status> {
+        self.verify_empty(request.metadata(), "/arrow.flight.protocol.FlightService/DoExchange")?;
         self.catalog.do_exchange(request).await
     }
 
     async fn do_action(&self, request: Request<Action>) -> Result<Response<Self::DoActionStream>, Status> {
+        self.verify_message(&request, "/arrow.flight.protocol.FlightService/DoAction")?;
         self.catalog.do_action(request).await
     }
 
     async fn list_actions(&self, request: Request<Empty>) -> Result<Response<Self::ListActionsStream>, Status> {
+        self.verify_message(&request, "/arrow.flight.protocol.FlightService/ListActions")?;
         self.catalog.list_actions(request).await
     }
 }

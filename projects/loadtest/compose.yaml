@@ -117,6 +117,7 @@ services:
       ARROWCOL_LAYOUT_ROW_GROUP_ROWS: ${ARROWCOL_LAYOUT_ROW_GROUP_ROWS:-16384}
       ARROWCOL_LAYOUT_PAGE_ROWS: ${ARROWCOL_LAYOUT_PAGE_ROWS:-2048}
       ARROWCOL_MAX_MESSAGE_BYTES: "33554432"
+      ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE: /run/secrets/internal-hmac
       OTEL_EXPORTER_OTLP_ENDPOINT: ${LOADTEST_TRACES_ENDPOINT:-http://lgtm:4318}
       OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
       OTEL_METRIC_EXPORT_INTERVAL: "2000"
@@ -129,6 +130,8 @@ services:
     secrets:
       - source: arrowcol_app_password
         target: arrowcol-app-password
+      - source: internal_hmac
+        target: internal-hmac
     depends_on:
       arrowcol-catalog:
         condition: service_healthy
@@ -148,6 +151,9 @@ services:
     pull_policy: never
     init: true
     user: "${LOADTEST_UID:?Run through Nx}:${LOADTEST_GID:?Run through Nx}"
+    environment:
+      LOADTEST_INTERNAL_SECRET_FILE: /run/secrets/internal-hmac
+      ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE: /run/secrets/internal-hmac
     secrets:
       - source: edge_hmac
         target: edge-hmac
@@ -371,9 +377,13 @@ services:
       - --listen
       - "0.0.0.0:9467"
     environment:
+      ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE: /run/secrets/internal-hmac
       OTEL_EXPORTER_OTLP_ENDPOINT: ${LOADTEST_TRACES_ENDPOINT:-http://lgtm:4318}
       OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
       OTEL_METRIC_EXPORT_INTERVAL: "2000"
+    secrets:
+      - source: internal_hmac
+        target: internal-hmac
     volumes:
       - type: bind
         source: ${ONELAKE_HOST_PATH:?Run through Nx}/dataflow

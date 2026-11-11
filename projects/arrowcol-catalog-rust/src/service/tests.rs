@@ -1,9 +1,9 @@
 use std::{sync::atomic::Ordering, time::Duration};
 
-use crate::{DdlIdentityPolicy, DdlIdentityVerifier};
+use crate::{CatalogCesService, DdlIdentityPolicy, DdlIdentityVerifier};
 use arrow_flight::{flight_service_server::FlightServiceServer, sql::client::FlightSqlServiceClient};
 use arrowcol_catalog::{CatalogStore, SchemaAlignmentPlan, SchemaValidator};
-use arrowcol_catalog_client::{CatalogClient, RemoteCatalogClient};
+use arrowcol_catalog_client::{CatalogClient, InternalRequestSigner, RemoteCatalogClient};
 use arrowcol_protocol::{ClaimedSchemaFingerprint, fingerprint_schema};
 use futures::TryStreamExt;
 use rpc::schema_catalog_server::{SchemaCatalog, SchemaCatalogServer};
@@ -283,53 +283,50 @@ async fn flight_sql_ddl_requires_signed_identity_before_mutating_catalog() -> Re
         "sqlserver_active_sessions".into(),
     ])?;
     assert!(service.store.current_schema(&identity).await?.is_none());
-    use arrowcol_protocol::{
-        AuthContext, AuthMethod, AuthenticatedPrincipal, PrincipalId, PrincipalIssuer, PrincipalScope, UnixMillis,
-    };
-    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-    use std::{
-        collections::BTreeSet,
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
-    let now_ms = u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
-    let principal = AuthenticatedPrincipal::new(
-        PrincipalId::new("loadtest-catalog")?,
-        PrincipalIssuer::new("arrowcol-loadgen")?,
-        BTreeSet::from([PrincipalScope::new("arrowcol/catalog")?]),
-    )?;
-    let context = AuthContext::new(principal, AuthMethod::WorkloadIdentity, UnixMillis::new(now_ms)?, None)?;
-    let encoded_context = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&context)?);
-    let expiry = now_ms.checked_add(30_000).context("identity expiry overflow")?;
-    let mut mac = Hmac::<Sha256>::new_from_slice(b"catalog-integration-key-at-least-32-bytes")?;
-    mac.update(format!("{encoded_context}\n{expiry}").as_bytes());
-    let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
-    let mut wrong_mac = Hmac::<Sha256>::new_from_slice(b"not-the-catalog-integration-key-at-least-32-bytes")?;
-    wrong_mac.update(format!("{encoded_context}\n{expiry}").as_bytes());
-    let wrong_signature = URL_SAFE_NO_PAD.encode(wrong_mac.finalize().into_bytes());
+    let signer = InternalRequestSigner::from_secret(b"catalog-integration-key-at-least-32-bytes".to_vec())?;
     let command = CommandStatementUpdate {
         query: ddl.clone(),
         transaction_id: None,
     };
-    let mut rejected_request = tonic::Request::new(futures::stream::iter([arrow_flight::FlightData {
+    let payload = command.as_any().encode_to_vec();
+    let mut tampered = tonic::Request::new(futures::stream::iter([arrow_flight::FlightData {
         flight_descriptor: Some(FlightDescriptor {
             r#type: arrow_flight::flight_descriptor::DescriptorType::Cmd as i32,
-            cmd: command.as_any().encode_to_vec().into(),
+            cmd: CommandStatementUpdate {
+                query: "DROP TABLE telemetry.sqlserver.sqlserver_active_sessions".to_owned(),
+                transaction_id: None,
+            }
+            .as_any()
+            .encode_to_vec()
+            .into(),
             path: Vec::new(),
         }),
         ..arrow_flight::FlightData::default()
     }]));
-    rejected_request
-        .metadata_mut()
-        .insert("x-arrowcol-internal-auth-context", encoded_context.parse()?);
-    rejected_request
-        .metadata_mut()
-        .insert("x-arrowcol-internal-auth-expires", expiry.to_string().parse()?);
-    rejected_request
-        .metadata_mut()
-        .insert("x-arrowcol-internal-auth-signature", wrong_signature.parse()?);
+    signer.sign_payload(&mut tampered, "/arrow.flight.protocol.FlightService/DoPut", &payload)?;
+    let error = flight
+        .do_put(tampered)
+        .await
+        .err()
+        .context("tampered DDL payload must be rejected")?;
+    assert_eq!(error.code(), tonic::Code::Unauthenticated);
+    assert!(service.store.current_schema(&identity).await?.is_none());
+
+    let mut rejected_request = tonic::Request::new(futures::stream::iter([arrow_flight::FlightData {
+        flight_descriptor: Some(FlightDescriptor {
+            r#type: arrow_flight::flight_descriptor::DescriptorType::Cmd as i32,
+            cmd: payload.clone().into(),
+            path: Vec::new(),
+        }),
+        ..arrow_flight::FlightData::default()
+    }]));
+    let wrong_signer =
+        InternalRequestSigner::from_secret(b"not-the-catalog-integration-key-at-least-32-bytes".to_vec())?;
+    wrong_signer.sign_payload(
+        &mut rejected_request,
+        "/arrow.flight.protocol.FlightService/DoPut",
+        &payload,
+    )?;
     let error = flight
         .do_put(rejected_request)
         .await
@@ -337,23 +334,16 @@ async fn flight_sql_ddl_requires_signed_identity_before_mutating_catalog() -> Re
         .context("wrongly signed DDL must be rejected")?;
     assert_eq!(error.code(), tonic::Code::Unauthenticated);
     assert!(service.store.current_schema(&identity).await?.is_none());
+
     let mut request = tonic::Request::new(futures::stream::iter([arrow_flight::FlightData {
         flight_descriptor: Some(FlightDescriptor {
             r#type: arrow_flight::flight_descriptor::DescriptorType::Cmd as i32,
-            cmd: command.as_any().encode_to_vec().into(),
+            cmd: payload.clone().into(),
             path: Vec::new(),
         }),
         ..arrow_flight::FlightData::default()
     }]));
-    request
-        .metadata_mut()
-        .insert("x-arrowcol-internal-auth-context", encoded_context.parse()?);
-    request
-        .metadata_mut()
-        .insert("x-arrowcol-internal-auth-expires", expiry.to_string().parse()?);
-    request
-        .metadata_mut()
-        .insert("x-arrowcol-internal-auth-signature", signature.parse()?);
+    signer.sign_payload(&mut request, "/arrow.flight.protocol.FlightService/DoPut", &payload)?;
     let response = flight.do_put(request).await?;
     assert_eq!(
         arrowcol_flight::decode_ddl_completion_metadata(response.metadata())?.table(),
@@ -364,6 +354,46 @@ async fn flight_sql_ddl_requires_signed_identity_before_mutating_catalog() -> Re
     assert!(service.store.current_schema(&identity).await?.is_some());
     let _ = shutdown.send(());
     server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn catalog_ces_rejects_anonymous_reads_and_replayed_signed_reads() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let service = CatalogService::open(config(root.path())).await?;
+    let verifier = DdlIdentityVerifier::from_secret(b"catalog-integration-key-at-least-32-bytes".to_vec())?;
+    let ces = CatalogCesService::new(service, DdlIdentityPolicy::require_signed(verifier));
+
+    let anonymous = SchemaCatalog::get_snapshot(&ces, tonic::Request::new(rpc::Empty {}))
+        .await
+        .unwrap_err();
+    assert_eq!(anonymous.code(), tonic::Code::Unauthenticated);
+
+    let signer = InternalRequestSigner::from_secret(b"catalog-integration-key-at-least-32-bytes".to_vec())?;
+    let mut request = tonic::Request::new(rpc::Empty {});
+    signer.sign_message(&mut request, "/arrowcol.catalog.v1.SchemaCatalog/GetSnapshot")?;
+    let replay = request.metadata().clone();
+    SchemaCatalog::get_snapshot(&ces, request).await?;
+    let mut replayed = tonic::Request::new(rpc::Empty {});
+    *replayed.metadata_mut() = replay;
+    let error = SchemaCatalog::get_snapshot(&ces, replayed).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unauthenticated);
+    Ok(())
+}
+
+#[tokio::test]
+async fn catalog_flight_rejects_anonymous_metadata_reads() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let service = CatalogService::open(config(root.path())).await?;
+    let verifier = DdlIdentityVerifier::from_secret(b"catalog-integration-key-at-least-32-bytes".to_vec())?;
+    let flight = service.flight_service_with_ddl_identity(DdlIdentityPolicy::require_signed(verifier));
+    let error = arrow_flight::flight_service_server::FlightService::get_flight_info(
+        &flight,
+        tonic::Request::new(FlightDescriptor::default()),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unauthenticated);
     Ok(())
 }
 
@@ -440,7 +470,12 @@ async fn flight_sql_and_warm_cache_count_actual_catalog_calls() -> Result<()> {
             .await
             .is_err()
     );
-    let client = RemoteCatalogClient::connect(&endpoint, Duration::from_millis(250)).await?;
+    let client = RemoteCatalogClient::connect_with_signer(
+        &endpoint,
+        Duration::from_millis(250),
+        InternalRequestSigner::from_secret(b"catalog-integration-key-at-least-32-bytes".to_vec())?,
+    )
+    .await?;
     let identity = name_identity(&["arrowcol".into(), "default".into(), "events".into()])?;
     tokio::time::sleep(Duration::from_millis(50)).await;
     let baseline = client.metrics().catalog_calls;

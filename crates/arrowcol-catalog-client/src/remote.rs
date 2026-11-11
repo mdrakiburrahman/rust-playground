@@ -7,6 +7,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use arrow_flight::{
+    FlightData, FlightDescriptor,
+    flight_descriptor::DescriptorType,
+    flight_service_client::FlightServiceClient,
+    sql::{CommandStatementUpdate, ProstMessageExt},
+};
 use arrowcol_catalog::{
     CatalogError, CatalogErrorCode, CatalogResult, CatalogSchemaVersion, CatalogStore, ChangeReservation,
     DdlCompletion, DdlCompletionDisposition, DdlParser, DescriptorArtifacts, FlightSqlDdlHandler, FlightSqlDdlRequest,
@@ -14,10 +20,19 @@ use arrowcol_catalog::{
 };
 use arrowcol_protocol::{SchemaFingerprint, TableIdentity};
 use async_trait::async_trait;
+use futures::stream;
+use prost::Message;
 use tokio::sync::Mutex;
+use tonic::Request;
 use tonic::transport::{Channel, Endpoint};
 
-use crate::{CachedTable, CatalogClient, rpc};
+use crate::{CachedTable, CatalogClient, InternalRequestSigner, rpc};
+
+const CES_CURRENT_PATH: &str = "/arrowcol.catalog.v1.SchemaCatalog/GetCurrentEventId";
+const CES_WATCH_PATH: &str = "/arrowcol.catalog.v1.SchemaCatalog/Watch";
+const CES_TABLE_PATH: &str = "/arrowcol.catalog.v1.SchemaCatalog/GetTable";
+const CES_SNAPSHOT_PATH: &str = "/arrowcol.catalog.v1.SchemaCatalog/GetSnapshot";
+const FLIGHT_DO_PUT_PATH: &str = "/arrow.flight.protocol.FlightService/DoPut";
 
 type RpcClient = rpc::schema_catalog_client::SchemaCatalogClient<Channel>;
 
@@ -56,6 +71,7 @@ pub struct RemoteCatalogClient {
     rpc: RpcClient,
     cache: Mutex<Cache>,
     maximum_age: Duration,
+    signer: InternalRequestSigner,
     counters: Counters,
 }
 
@@ -65,6 +81,23 @@ impl RemoteCatalogClient {
     /// # Errors
     /// Rejects an invalid endpoint, zero maximum age, unavailable catalog or corrupt snapshot.
     pub async fn connect(endpoint: &str, maximum_age: Duration) -> CatalogResult<Arc<Self>> {
+        let secret_file = std::env::var_os("ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE")
+            .or_else(|| std::env::var_os("LOADTEST_INTERNAL_SECRET_FILE"))
+            .ok_or_else(|| failure("catalog internal identity secret file is not configured"))?;
+        let signer = InternalRequestSigner::from_file(secret_file)
+            .map_err(|error| failure(format!("load catalog internal identity signer: {error}")))?;
+        Self::connect_with_signer(endpoint, maximum_age, signer).await
+    }
+
+    /// Connects with an explicitly provided internal request signer.
+    ///
+    /// # Errors
+    /// Rejects an invalid endpoint, zero maximum age, unavailable catalog or corrupt snapshot.
+    pub async fn connect_with_signer(
+        endpoint: &str,
+        maximum_age: Duration,
+        signer: InternalRequestSigner,
+    ) -> CatalogResult<Arc<Self>> {
         if maximum_age.is_zero() {
             return Err(failure("catalog maximum cache age must be positive"));
         }
@@ -80,6 +113,7 @@ impl RemoteCatalogClient {
             channel,
             cache: Mutex::new(Cache::default()),
             maximum_age,
+            signer,
             counters: Counters::default(),
         });
         client.reconcile().await?;
@@ -109,9 +143,13 @@ impl RemoteCatalogClient {
     /// Returns transport, epoch or invalid committed-history errors.
     pub async fn reconcile(&self) -> CatalogResult<()> {
         let generation = self.cache.lock().await.generation;
+        let mut request = Request::new(rpc::Empty {});
+        self.signer
+            .sign_message(&mut request, CES_SNAPSHOT_PATH)
+            .map_err(|error| failure(format!("catalog request signing failed: {error}")))?;
         let snapshot = self
             .rpc_call()
-            .get_snapshot(rpc::Empty {})
+            .get_snapshot(request)
             .await
             .map_err(rpc_error)?
             .into_inner();
@@ -171,12 +209,11 @@ impl RemoteCatalogClient {
 
     async fn watch_once(&self) -> CatalogResult<()> {
         let from = self.cache.lock().await.position.clone();
-        let mut stream = self
-            .rpc_call()
-            .watch(rpc::EventsRequest { from })
-            .await
-            .map_err(rpc_error)?
-            .into_inner();
+        let mut request = Request::new(rpc::EventsRequest { from });
+        self.signer
+            .sign_message(&mut request, CES_WATCH_PATH)
+            .map_err(|error| failure(format!("catalog request signing failed: {error}")))?;
+        let mut stream = self.rpc_call().watch(request).await.map_err(rpc_error)?.into_inner();
         let mut reconcile_tick = tokio::time::interval(Duration::from_secs(5));
         let lifetime = tokio::time::sleep(Duration::from_secs(30));
         tokio::pin!(lifetime);
@@ -198,7 +235,9 @@ impl RemoteCatalogClient {
                     self.counters.invalidations.fetch_add(1, Ordering::Relaxed);
                 }
                 _ = reconcile_tick.tick() => {
-                    let remote = self.rpc_call().get_current_event_id(rpc::Empty {}).await.map_err(rpc_error)?.into_inner();
+                    let mut request = Request::new(rpc::Empty {});
+                    self.signer.sign_message(&mut request, CES_CURRENT_PATH).map_err(|error| failure(format!("catalog request signing failed: {error}")))?;
+                    let remote = self.rpc_call().get_current_event_id(request).await.map_err(rpc_error)?.into_inner();
                     let mut cache = self.cache.lock().await;
                     let local = cache.position.as_ref().ok_or_else(|| failure("CES cache has no position"))?;
                     if remote.epoch != local.epoch || remote.event_id < local.event_id {
@@ -220,12 +259,32 @@ impl FlightSqlDdlHandler for RemoteCatalogClient {
     async fn execute_ddl(&self, request: FlightSqlDdlRequest) -> CatalogResult<DdlCompletion> {
         let command = DdlParser::default().parse(request.command())?;
         let identity = command.identity().clone();
-        let mut client = arrow_flight::sql::client::FlightSqlServiceClient::new(self.channel.clone());
+        let command = CommandStatementUpdate {
+            query: request.command().to_owned(),
+            transaction_id: None,
+        };
+        let payload = command.as_any().encode_to_vec();
+        let mut flight_request = Request::new(stream::iter([FlightData {
+            flight_descriptor: Some(FlightDescriptor {
+                r#type: DescriptorType::Cmd as i32,
+                cmd: payload.clone().into(),
+                path: Vec::new(),
+            }),
+            ..FlightData::default()
+        }]));
+        self.signer
+            .sign_payload(&mut flight_request, FLIGHT_DO_PUT_PATH, &payload)
+            .map_err(|error| failure(format!("catalog request signing failed: {error}")))?;
         self.counters.calls.fetch_add(1, Ordering::Relaxed);
-        client
-            .execute_update(request.command().to_owned(), None)
+        let response = FlightServiceClient::new(self.channel.clone())
+            .do_put(flight_request)
             .await
             .map_err(|error| failure(format!("catalog Flight SQL failed: {error}")))?;
+        let mut completion = response.into_inner();
+        completion
+            .message()
+            .await
+            .map_err(|error| failure(format!("catalog Flight SQL completion failed: {error}")))?;
         self.invalidate(&identity).await;
         let table = self.table(&identity).await?;
         let schema = table
@@ -317,9 +376,13 @@ impl CatalogClient for RemoteCatalogClient {
                 cache.generation
             };
             self.counters.misses.fetch_add(1, Ordering::Relaxed);
+            let mut request = Request::new(table_request(identity));
+            self.signer
+                .sign_message(&mut request, CES_TABLE_PATH)
+                .map_err(|error| failure(format!("catalog request signing failed: {error}")))?;
             let response = self
                 .rpc_call()
-                .get_table(table_request(identity))
+                .get_table(request)
                 .await
                 .map_err(rpc_error)?
                 .into_inner();

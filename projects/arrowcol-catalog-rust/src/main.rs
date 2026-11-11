@@ -2,8 +2,9 @@ use std::{net::SocketAddr, path::PathBuf};
 
 use anyhow::{Context, Result};
 use arrow_flight::flight_service_server::FlightServiceServer;
-use arrowcol_catalog_client::rpc::{self, schema_catalog_client::SchemaCatalogClient};
-use arrowcol_catalog_rust::{CatalogConfig, CatalogService, DdlIdentityPolicy, DdlIdentityVerifier};
+use arrowcol_catalog_client::rpc::schema_catalog_client::SchemaCatalogClient;
+use arrowcol_catalog_client::{InternalRequestSigner, rpc};
+use arrowcol_catalog_rust::{CatalogCesService, CatalogConfig, CatalogService, DdlIdentityPolicy, DdlIdentityVerifier};
 use clap::{Parser, ValueEnum};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -44,10 +45,17 @@ async fn main() -> Result<()> {
     if args.healthcheck {
         let endpoint = format!("http://127.0.0.1:{}", args.listen.port());
         let check = async {
-            SchemaCatalogClient::connect(endpoint)
-                .await?
-                .get_current_event_id(rpc::Empty {})
-                .await?;
+            let mut client = SchemaCatalogClient::connect(endpoint).await?;
+            let mut request = tonic::Request::new(rpc::Empty {});
+            if args.ddl_auth_mode == DdlAuthMode::SignedIdentity {
+                let path = args
+                    .ddl_identity_secret_file
+                    .as_deref()
+                    .context("ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE or --ddl-identity-secret-file is required")?;
+                InternalRequestSigner::from_file(path)?
+                    .sign_message(&mut request, "/arrowcol.catalog.v1.SchemaCatalog/GetCurrentEventId")?;
+            }
+            client.get_current_event_id(request).await?;
             Ok::<_, anyhow::Error>(())
         };
         return tokio::time::timeout(std::time::Duration::from_secs(3), check).await?;
@@ -83,12 +91,12 @@ async fn main() -> Result<()> {
     let (signal_sender, signal_receiver) = tokio::sync::oneshot::channel();
     tonic::transport::Server::builder()
         .add_service(
-            FlightServiceServer::new(service.flight_service_with_ddl_identity(ddl_identity_policy))
+            FlightServiceServer::new(service.flight_service_with_ddl_identity(ddl_identity_policy.clone()))
                 .max_decoding_message_size(8 * 1024 * 1024)
                 .max_encoding_message_size(8 * 1024 * 1024),
         )
         .add_service(
-            rpc::schema_catalog_server::SchemaCatalogServer::new(service)
+            rpc::schema_catalog_server::SchemaCatalogServer::new(CatalogCesService::new(service, ddl_identity_policy))
                 .max_decoding_message_size(8 * 1024 * 1024)
                 .max_encoding_message_size(8 * 1024 * 1024),
         )

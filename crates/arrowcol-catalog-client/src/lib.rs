@@ -1,7 +1,13 @@
 //! Catalog RPC contract and CES-backed schema clients.
 #![forbid(unsafe_code)]
 
+mod internal_auth;
 mod remote;
+pub use internal_auth::{
+    INTERNAL_AUTH_CONTEXT_HEADER, INTERNAL_AUTH_EXPIRES_HEADER, INTERNAL_AUTH_METHOD_HEADER,
+    INTERNAL_AUTH_NONCE_HEADER, INTERNAL_AUTH_PAYLOAD_DIGEST_HEADER, INTERNAL_AUTH_SIGNATURE_HEADER,
+    InternalRequestSigner, MAX_INTERNAL_AUTH_TTL_MS, canonical_request, payload_digest,
+};
 pub use remote::{CacheMetrics, RemoteCatalogClient, decode_table, identity_from_request, table_request};
 
 /// Generated catalog metadata and change-event RPC types.
