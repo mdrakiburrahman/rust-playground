@@ -317,7 +317,7 @@ export async function runAksPreflight(configPath: string, options: PreflightOpti
       credentials.some((credential) => publisherCredentialMatches(credential, expected)))) {
       throw new Error('Configured stamp publisher federation does not exactly match the selected stamp configuration and UAMI.');
     }
-    return 'Exact fixed publisher issuer, subject, audience and existing UAMI verified.';
+    return 'Exact fixed publisher federation and all configured stamp publisher federation verified.';
   });
 
   await check('Run-scoped runtime and bootstrap inputs', () => {

@@ -335,6 +335,18 @@ test('configured stamp publisher federation requires each exact name and trust t
   } finally { await f.cleanup(); }
 });
 
+test('empty external publisher federation remains optional', async () => {
+  const f = await fixture();
+  try {
+    await writeFile(path.join(f.root, 'infra/azure/stamp.yaml'), stringify({
+      ...testStampConfig(), publisherFederatedCredentials: [],
+    }));
+    const report = await f.run();
+    assert.equal(report.checks.find((entry) => entry.name === 'Federated credential')!.ready, true);
+    assert.equal(report.ready, true);
+  } finally { await f.cleanup(); }
+});
+
 test('namespace permission and scale-from-zero pool headroom are checked without scaling', async () => {
   const f = await fixture();
   try {
