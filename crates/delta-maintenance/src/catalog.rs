@@ -48,9 +48,6 @@ impl CatalogDiscovery {
                 tokio::time::timeout(RPC_TIMEOUT, SchemaCatalogClient::connect(endpoint.to_owned())).await
             })
             .context("catalog connection timeout")??;
-        let secret_file = std::env::var_os("ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE")
-            .context("ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE is required for catalog reads")?;
-        let signer = InternalRequestSigner::from_file(secret_file)?;
         Ok(Self {
             runtime,
             client: Mutex::new(client.max_decoding_message_size(32 * 1024 * 1024)),
