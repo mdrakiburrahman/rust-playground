@@ -4578,6 +4578,12 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
     Ok(())
 }
 
+fn use_operator_cli_identity(command: &mut Command) {
+    for variable in ["AZURE_CLIENT_ID", "AZURE_TENANT_ID", "AZURE_FEDERATED_TOKEN_FILE"] {
+        command.env_remove(variable);
+    }
+}
+
 fn run_fic_helper_command(
     operation: &str,
     run_id: &str,
@@ -4593,10 +4599,7 @@ fn run_fic_helper_command(
         .current_dir(workspace)
         .args(["--no-install", "tsx"])
         .kill_on_drop(true);
-    // Run-FIC ARM mutations use the operator context whose permissions preflight checks.
-    for variable in ["AZURE_CLIENT_ID", "AZURE_TENANT_ID", "AZURE_FEDERATED_TOKEN_FILE"] {
-        command.env_remove(variable);
-    }
+    use_operator_cli_identity(&mut command);
     command.arg(script);
     command.args([operation, "--run-id", run_id]);
     if let Some(namespace) = namespace {
@@ -4635,20 +4638,21 @@ async fn run_run_fic_helper(
     Ok(())
 }
 
-async fn run_oat_qap_helper(
+fn run_oat_qap_helper_command(
     operation: &str,
     run_id: &str,
     manifest_path: Option<&Path>,
     workload_record_path: Option<&Path>,
     workload_stop_record_path: Option<&Path>,
     record_path: &Path,
-) -> Result<()> {
+) -> Result<Command> {
     let script = std::env::current_dir()?.join("infra/azure/bootstrap.ts");
     let mut command = Command::new("npx");
     command
         .current_dir(std::env::current_dir()?)
         .args(["--no-install", "tsx"])
         .kill_on_drop(true);
+    use_operator_cli_identity(&mut command);
     command.arg(script).arg(operation);
     if operation == "bind-oat-qap" {
         let manifest_path = manifest_path.context("QAP binding requires its exact manifest path")?;
@@ -4663,10 +4667,28 @@ async fn run_oat_qap_helper(
     }
     command.arg("--record");
     command.arg(record_path);
-    let output = command
-        .output()
-        .await
-        .with_context(|| format!("start {operation} helper"))?;
+    Ok(command)
+}
+
+async fn run_oat_qap_helper(
+    operation: &str,
+    run_id: &str,
+    manifest_path: Option<&Path>,
+    workload_record_path: Option<&Path>,
+    workload_stop_record_path: Option<&Path>,
+    record_path: &Path,
+) -> Result<()> {
+    let output = run_oat_qap_helper_command(
+        operation,
+        run_id,
+        manifest_path,
+        workload_record_path,
+        workload_stop_record_path,
+        record_path,
+    )?
+    .output()
+    .await
+    .with_context(|| format!("start {operation} helper"))?;
     if !output.status.success() {
         bail!(
             "{operation} helper failed with {}: {}",
@@ -4676,7 +4698,6 @@ async fn run_oat_qap_helper(
     }
     Ok(())
 }
-
 async fn require_nonempty_record(record_path: &Path) -> Result<()> {
     let metadata = tokio::fs::metadata(record_path)
         .await
@@ -6021,6 +6042,43 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn oat_qap_helpers_use_operator_cli_identity_for_every_phase() -> Result<()> {
+        let run_id = "00000000-0000-0000-0000-000000000001";
+        let manifest = Path::new("/tmp/oat-qap-manifest.json");
+        let workload = Path::new("/tmp/oat-qap-workload.json");
+        let stop = Path::new("/tmp/oat-qap-stop.json");
+        let record = Path::new("/tmp/oat-qap-record.json");
+        for (operation, manifest_path, workload_record_path, workload_stop_record_path) in [
+            ("bind-oat-qap", Some(manifest), Some(workload), None),
+            ("verify-oat-qap", None, None, None),
+            ("cleanup-oat-qap", None, None, Some(stop)),
+        ] {
+            let command = run_oat_qap_helper_command(
+                operation,
+                run_id,
+                manifest_path,
+                workload_record_path,
+                workload_stop_record_path,
+                record,
+            )?;
+            for variable in ["AZURE_CLIENT_ID", "AZURE_TENANT_ID", "AZURE_FEDERATED_TOKEN_FILE"] {
+                assert!(
+                    command
+                        .as_std()
+                        .get_envs()
+                        .any(|(key, value)| key == variable && value.is_none()),
+                    "{operation} must clear inherited {variable}"
+                );
+            }
+            if operation == "cleanup-oat-qap" {
+                assert!(command.as_std().get_args().any(|arg| arg == "--workload-stop-record"));
+            }
+        }
+        assert!(run_oat_qap_helper_command("cleanup-oat-qap", run_id, None, None, None, record).is_err());
         Ok(())
     }
 
