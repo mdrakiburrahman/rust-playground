@@ -45,6 +45,11 @@ test('isolated integrated topology pins images, WI, identity, probes and pooled 
   assert.equal(container.env.find((e: any) => e.name === 'ARROWCOL_RESET_GENERATION').valueFrom.secretKeyRef.name, 'arrowcol-generation');
   assert.equal(container.env.find((e: any) => e.name === 'ARROWCOL_PARTITION_GRANULARITY').value, 'hour');
   assert.equal(container.readinessProbe.httpGet.port, 32011);
+  assert.equal(container.env.find((e: any) => e.name === 'ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE').value, '/run/auth/internal-hmac');
+  assert.ok(dfe.spec.template.spec.containers[0].volumeMounts.some((mount: any) =>
+    mount.name === 'auth' && mount.mountPath === '/run/auth' && mount.readOnly));
+  assert.ok(dfe.spec.template.spec.volumes.some((volume: any) =>
+    volume.name === 'auth' && volume.secret.secretName === 'arrowcol-router-auth'));
   const configs = get('ConfigMap', 'arrowcol-config').data;
   const engine = parse(configs['dataflow.yaml']);
   assert.equal(engine.policies.resources, undefined);

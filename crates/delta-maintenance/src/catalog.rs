@@ -28,6 +28,17 @@ impl CatalogDiscovery {
     /// # Errors
     /// Returns endpoint, timeout or transport failures without falling back to disk.
     pub fn connect(endpoint: &str, allowlist: Vec<String>) -> Result<Self> {
+        let secret_file = std::env::var_os("ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE")
+            .context("ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE is required for catalog reads")?;
+        let signer = InternalRequestSigner::from_file(secret_file)?;
+        Self::connect_with_signer(endpoint, allowlist, signer)
+    }
+
+    /// Connects with an explicitly provided internal request signer.
+    ///
+    /// # Errors
+    /// Returns endpoint, timeout or transport failures without falling back to disk.
+    pub fn connect_with_signer(endpoint: &str, allowlist: Vec<String>, signer: InternalRequestSigner) -> Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
