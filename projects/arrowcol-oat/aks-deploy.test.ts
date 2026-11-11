@@ -48,6 +48,8 @@ function fixture(t: test.TestContext, faults: Fault[] = []) {
       assert.equal(env?.AZURE_STAMP, stamp);
       assert.equal(env?.AZURE_RESOURCE_GROUP, 'arrow-collector-rg');
       assert.equal(env?.AZURE_STORAGE_ACCOUNT, `arrowcollector${stamp}`);
+      if (process.env.AZURE_KUSTO_CLUSTER_TAGS !== undefined)
+        assert.equal(env?.AZURE_KUSTO_CLUSTER_TAGS, process.env.AZURE_KUSTO_CLUSTER_TAGS);
       assert.equal(env?.AZURE_UAMI_CLIENT_ID, '');
       assert.equal(env?.AZURE_CLIENT_ID, undefined);
       assert.equal(env?.AZURE_CLIENT_SECRET, undefined);
@@ -288,7 +290,7 @@ test('Delta convergence retries once without changing network', async t => {
   assert.equal(f.calls.some(call => call[2] === 'delete'), false);
 });
 
-for (const fault of ['identity', 'database', 'publisher', 'native-federation', 'network', 'run-fic-permission'] as const) {
+for (const fault of ['identity', 'database', 'publisher', 'native-federation', 'network'] as const) {
   test(`missing ${fault} postcondition cannot claim deployed`, async t => {
     const f = fixture(t, [fault]);
     await assert.rejects(deployInfrastructure(f.options, f.runner), /postconditions failed/);
@@ -296,6 +298,14 @@ for (const fault of ['identity', 'database', 'publisher', 'native-federation', '
     assert.equal(f.calls.some(call => call[2] === 'delete'), false);
   });
 }
+
+test('removed run-FIC Contributor role is not a deployment postcondition', async t => {
+  const f = fixture(t, ['run-fic-permission']);
+  const result = await deployInfrastructure(f.options, f.runner);
+  assert.equal(result.network, 'azure');
+  assert.equal(f.receipt().postconditions.runFederationPermission, undefined);
+  assert.equal(f.calls.some(call => call[1] === 'role' && call[2] === 'assignment'), false);
+});
 
 test('stamp picker always produces a five-digit fresh-range integer', () => {
   for (let index = 0; index < 1000; index++) assert.match(pickStamp(), /^[1-9]\d{4}$/);
@@ -389,10 +399,11 @@ test('classification failure retains the original ARM error in the durable recei
   assert.equal(f.calls.some(call => call[2] === 'delete'), false);
 });
 
-test('bootstrap receives fresh stamp-derived env rather than stale workload identity', async t => {
+test('bootstrap receives fresh stamp-derived env and approved Kusto tags, not stale workload identity', async t => {
   const f = fixture(t);
   const previous = process.env;
-  process.env = { ...previous, AZURE_STAMP: '00000', AZURE_CLIENT_ID: 'stale', AZURE_CLIENT_SECRET: 'not-a-real-secret' };
+  process.env = { ...previous, AZURE_STAMP: '00000', AZURE_CLIENT_ID: 'stale', AZURE_CLIENT_SECRET: 'not-a-real-secret',
+    AZURE_KUSTO_CLUSTER_TAGS: '{"classification":"test"}' };
   t.after(() => { process.env = previous; });
   await deployInfrastructure(f.options, f.runner);
   assert.equal(process.env.AZURE_STAMP, '00000');

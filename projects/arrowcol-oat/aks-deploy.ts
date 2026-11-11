@@ -149,6 +149,8 @@ export async function deployInfrastructure(
     ...Object.fromEntries(Object.entries(process.env).filter(([key]) =>
       !/^(AZURE_|ARROWCOL_)/.test(key) || ['AZURE_CONFIG_DIR', 'AZURE_EXTENSION_DIR'].includes(key))),
     ...new Config({ AZURE_SUBSCRIPTION_ID: subscription }, selected).generated(),
+    ...(process.env.AZURE_KUSTO_CLUSTER_TAGS === undefined ? {} :
+      { AZURE_KUSTO_CLUSTER_TAGS: process.env.AZURE_KUSTO_CLUSTER_TAGS }),
     AZURE_SUBSCRIPTION_ID: subscription, AZURE_UAMI_CLIENT_ID: '', ARROWCOL_RESET_GENERATION: '',
   };
   fs.mkdirSync(stateDirectory, { recursive: true, mode: 0o700 });
@@ -245,7 +247,7 @@ export async function deployInfrastructure(
     await verifyPostconditions({ ...selected, aks: { ...selected.aks, networkDataplane: current } }, az, postconditions);
     receipt.completedAt = new Date().toISOString();
     save();
-    console.log(`Identity receipt: exactly one UAMI arrow-collector; native and publisher federation plus run-FIC permission verified.`);
+    console.log(`Identity receipt: exactly one UAMI arrow-collector; native and publisher federation verified.`);
     console.log(`Deployed stamp ${stamp}; network path: ${attempts.map(attempt => attempt.network).join(' -> ')}. Receipt: ${receiptPath}`);
     if (current === 'azure') console.warn('WARNING: Azure dataplane has no enforcing network-policy provider. In-cluster workloads can reach the passwordless dataflow port; there is no public ingress.');
     return { stamp, network: current, attempts, receiptPath };
@@ -303,11 +305,6 @@ async function verifyPostconditions(config: StampConfig, az: (...args: string[])
   const identity = object(await az('identity', 'show', '--resource-group', GROUP, '--name', 'arrow-collector'), 'shared identity');
   if (typeof identity.id !== 'string' || typeof identity.principalId !== 'string')
     throw new Error('Shared identity resource ID and principal ID are missing.');
-  const assignments = list(await az('role', 'assignment', 'list', '--scope', identity.id, '--include-inherited'), 'identity role assignments');
-  receipt.runFederationPermission = assignments.some(assignment =>
-    assignment.principalId === identity.principalId &&
-    typeof assignment.roleDefinitionId === 'string' &&
-    assignment.roleDefinitionId.toLowerCase().endsWith('/7e559ce2-48d7-4b27-9128-fa1b247f1308'));
   for (const [key, type, resourceName] of [
     ['storage', 'Microsoft.Storage/storageAccounts', account], ['acr', 'Microsoft.ContainerRegistry/registries', account],
     ['kusto', 'Microsoft.Kusto/clusters', name],
