@@ -117,9 +117,10 @@ test('changed source, failed builds and missing artifact metadata cannot start a
 test('executable help resolves its tsx loader outside the repository', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-cli-cwd-'));
   try {
-    const output = execFileSync(process.execPath, [
-      fileURLToPath(new URL('./cli.mjs', import.meta.url)), '--help',
-    ], { cwd: directory, encoding: 'utf8', timeout: 15_000 });
+    const executable = fileURLToPath(new URL('./cli.mjs', import.meta.url));
+    const output = execFileSync(process.platform === 'win32' ? process.execPath : executable,
+      process.platform === 'win32' ? [executable, '--help'] : ['--help'],
+      { cwd: directory, encoding: 'utf8', timeout: 15_000 });
     assert.match(output, /Usage: arrowcol-oat/);
   } finally {
     await rm(directory, { recursive: true, force: true });
