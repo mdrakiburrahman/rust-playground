@@ -231,6 +231,18 @@ async fn commit_publication_crash_and_old_seed_do_not_rollback_delta() -> Result
 async fn flight_sql_ddl_requires_signed_identity_before_mutating_catalog() -> Result<()> {
     let root = tempfile::tempdir()?;
     let service = CatalogService::open(config(root.path())).await?;
+    let fixture = include_str!("../../../loadtest/schemas/sqlserver.sql");
+    let ddl = fixture
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let ddl = ddl
+        .split(";")
+        .next()
+        .context("first schema statement")?
+        .trim()
+        .to_owned();
     let verifier = DdlIdentityVerifier::from_secret(b"catalog-integration-key-at-least-32-bytes".to_vec())?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("http://{}", listener.local_addr()?);
@@ -249,7 +261,7 @@ async fn flight_sql_ddl_requires_signed_identity_before_mutating_catalog() -> Re
     let channel = tonic::transport::Endpoint::from_shared(endpoint)?.connect().await?;
     let mut flight = arrow_flight::flight_service_client::FlightServiceClient::new(channel);
     let command = CommandStatementUpdate {
-        query: CREATE.to_owned(),
+        query: ddl.clone(),
         transaction_id: None,
     };
     let error = flight
@@ -265,7 +277,11 @@ async fn flight_sql_ddl_requires_signed_identity_before_mutating_catalog() -> Re
         .err()
         .context("unsigned DDL must be rejected")?;
     assert_eq!(error.code(), tonic::Code::Unauthenticated);
-    let identity = name_identity(&["arrowcol".into(), "default".into(), "events".into()])?;
+    let identity = name_identity(&[
+        "telemetry".into(),
+        "sqlserver".into(),
+        "sqlserver_active_sessions".into(),
+    ])?;
     assert!(service.store.current_schema(&identity).await?.is_none());
     use arrowcol_protocol::{
         AuthContext, AuthMethod, AuthenticatedPrincipal, PrincipalId, PrincipalIssuer, PrincipalScope, UnixMillis,
@@ -290,10 +306,37 @@ async fn flight_sql_ddl_requires_signed_identity_before_mutating_catalog() -> Re
     let mut mac = Hmac::<Sha256>::new_from_slice(b"catalog-integration-key-at-least-32-bytes")?;
     mac.update(format!("{encoded_context}\n{expiry}").as_bytes());
     let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    let mut wrong_mac = Hmac::<Sha256>::new_from_slice(b"not-the-catalog-integration-key-at-least-32-bytes")?;
+    wrong_mac.update(format!("{encoded_context}\n{expiry}").as_bytes());
+    let wrong_signature = URL_SAFE_NO_PAD.encode(wrong_mac.finalize().into_bytes());
     let command = CommandStatementUpdate {
-        query: CREATE.to_owned(),
+        query: ddl.clone(),
         transaction_id: None,
     };
+    let mut rejected_request = tonic::Request::new(futures::stream::iter([arrow_flight::FlightData {
+        flight_descriptor: Some(FlightDescriptor {
+            r#type: arrow_flight::flight_descriptor::DescriptorType::Cmd as i32,
+            cmd: command.as_any().encode_to_vec().into(),
+            path: Vec::new(),
+        }),
+        ..arrow_flight::FlightData::default()
+    }]));
+    rejected_request
+        .metadata_mut()
+        .insert("x-arrowcol-internal-auth-context", encoded_context.parse()?);
+    rejected_request
+        .metadata_mut()
+        .insert("x-arrowcol-internal-auth-expires", expiry.to_string().parse()?);
+    rejected_request
+        .metadata_mut()
+        .insert("x-arrowcol-internal-auth-signature", wrong_signature.parse()?);
+    let error = flight
+        .do_put(rejected_request)
+        .await
+        .err()
+        .context("wrongly signed DDL must be rejected")?;
+    assert_eq!(error.code(), tonic::Code::Unauthenticated);
+    assert!(service.store.current_schema(&identity).await?.is_none());
     let mut request = tonic::Request::new(futures::stream::iter([arrow_flight::FlightData {
         flight_descriptor: Some(FlightDescriptor {
             r#type: arrow_flight::flight_descriptor::DescriptorType::Cmd as i32,
@@ -314,7 +357,7 @@ async fn flight_sql_ddl_requires_signed_identity_before_mutating_catalog() -> Re
     let response = flight.do_put(request).await?;
     assert_eq!(
         arrowcol_flight::decode_ddl_completion_metadata(response.metadata())?.table(),
-        "events"
+        "sqlserver_active_sessions"
     );
     let mut results = response.into_inner();
     assert!(results.message().await?.is_some());
