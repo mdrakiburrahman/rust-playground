@@ -70,8 +70,10 @@ test('probe exchanges an exact SA assertion only in memory and retries propagati
     assert.equal(body.get('client_assertion'), token);
     assert.equal(body.get('client_id'), owner.clientId);
     requests++;
+    if (requests === 1)
+      return new Response(JSON.stringify({ error_codes: [700213], error_description: token }), { status: 401 });
     return requests < 3
-      ? new Response(JSON.stringify({ error_codes: [70021], error_description: token }), { status: requests === 1 ? 401 : 400 })
+      ? new Response(JSON.stringify({ error_codes: [70021], error_description: token }), { status: 400 })
       : new Response(JSON.stringify({ access_token: 'fixture-access-token', token_type: 'Bearer', expires_in: 3600 }));
   });
   await probe_fic_exchange(owner, 30);
@@ -97,10 +99,10 @@ test('probe does not retry HTTP 401 responses with a different AADSTS code', asy
   mock.method(runtime, 'run_tree', async () => ({ returncode: 0, stdout: assertion(), stderr: '' }));
   mock.method(globalThis, 'fetch', async () => {
     requests++;
-    return new Response(JSON.stringify({ error_codes: [700213], error_description: 'private failure details' }), { status: 401 });
+    return new Response(JSON.stringify({ error_codes: [700016], error_description: 'private failure details' }), { status: 401 });
   });
   await assert.rejects(probe_fic_exchange(record(), 30),
-    error => error instanceof Error && error.message === 'Workload identity token exchange failed with HTTP 401 (AADSTS 700213).');
+    error => error instanceof Error && error.message === 'Workload identity token exchange failed with HTTP 401 (AADSTS 700016).');
   assert.equal(requests, 1);
 });
 test('probe rejects wrong assertion identity before sending it to Entra', async () => {

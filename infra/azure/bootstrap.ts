@@ -519,7 +519,7 @@ export async function exchange_workload_identity_assertion(resource: string, cli
     try { codes = (await response.json())?.error_codes; } catch { /* Response bodies are never exposed. */ }
     const errorCodes = Array.isArray(codes) ? codes.filter((code): code is number =>
       typeof code === 'number' && Number.isSafeInteger(code)) : [];
-    if (errorCodes.includes(70021))
+    if (errorCodes.some((code) => code === 70021 || code === 700213))
       throw new WorkloadIdentityPropagationPending('The exact federated identity record has not propagated yet.');
     const diagnostic = errorCodes.length ? ` (AADSTS ${errorCodes.join(',')})` : '';
     throw new Failure(`Workload identity token exchange failed with HTTP ${response.status}${diagnostic}.`);
