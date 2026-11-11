@@ -56,7 +56,8 @@ http.createServer((request, response) => {
     }));
     return;
   }
-  response.end(JSON.stringify({ status: 'ok', git_sha: process.env.GIT_SHA }));
+  response.end(JSON.stringify({ status: 'ok', git_sha: process.env.GIT_SHA,
+    stamp_config: process.env.ARROWCOL_AKS_STAMP_CONFIG_FILE ?? null }));
 }).listen(Number(port), host);
 `, { mode: 0o700 });
     const artifact = {
@@ -78,9 +79,11 @@ test('owned server starts the exact successful Cargo artifact, not a stale prebu
   const callerSha = process.env.GIT_SHA;
   process.env.GIT_SHA = 'unverified-caller-revision';
   try {
-    server = await startLocalServer(fixture.runner);
+    server = await startLocalServer(fixture.runner, {
+      ARROWCOL_AKS_STAMP_CONFIG_FILE: '.temp/stamp-87513.yaml',
+    });
     assert.deepEqual(await (await fetch(`${server.url}/healthz`)).json(), {
-      status: 'ok', git_sha: fixture.sha,
+      status: 'ok', git_sha: fixture.sha, stamp_config: '.temp/stamp-87513.yaml',
     });
     assert.deepEqual(fixture.commands.find((command) => command[0] === 'cargo'), [
       'cargo', 'build', '--locked', '--package', 'arrowcol-oat-rust',

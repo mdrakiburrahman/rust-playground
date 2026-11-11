@@ -4594,6 +4594,30 @@ fn use_operator_cli_identity(command: &mut Command) {
     }
 }
 
+fn selected_aks_stamp_config_path(workspace: &Path) -> Result<PathBuf> {
+    let configured = std::env::var_os("ARROWCOL_AKS_STAMP_CONFIG_FILE")
+        .context("selected AKS stamp configuration was not forwarded to the owned server")?;
+    resolve_aks_stamp_config_path(workspace, &PathBuf::from(configured))
+}
+
+fn resolve_aks_stamp_config_path(workspace: &Path, configured: &Path) -> Result<PathBuf> {
+    let path = if configured.is_absolute() {
+        configured.to_path_buf()
+    } else {
+        workspace.join(configured)
+    };
+    let workspace = workspace
+        .canonicalize()
+        .context("resolve OAT workspace for AKS stamp configuration")?;
+    let path = path
+        .canonicalize()
+        .context("resolve selected AKS stamp configuration")?;
+    if !path.starts_with(&workspace) {
+        bail!("selected AKS stamp configuration is outside the OAT workspace");
+    }
+    Ok(path)
+}
+
 fn run_fic_helper_command(
     operation: &str,
     run_id: &str,
@@ -4601,6 +4625,7 @@ fn run_fic_helper_command(
     service_account: Option<&str>,
     record_path: &Path,
     wait_seconds: Option<&str>,
+    stamp_config_path: &Path,
 ) -> Result<Command> {
     let workspace = std::env::current_dir()?;
     let script = workspace.join("infra/azure/bootstrap.ts");
@@ -4612,6 +4637,7 @@ fn run_fic_helper_command(
     use_operator_cli_identity(&mut command);
     command.arg(script);
     command.args([operation, "--run-id", run_id]);
+    command.arg("--stamp-config").arg(stamp_config_path);
     if let Some(namespace) = namespace {
         command.args(["--namespace", namespace]);
     }
@@ -4634,10 +4660,20 @@ async fn run_run_fic_helper(
     record_path: &Path,
     wait_seconds: Option<&str>,
 ) -> Result<()> {
-    let output = run_fic_helper_command(operation, run_id, namespace, service_account, record_path, wait_seconds)?
-        .output()
-        .await
-        .with_context(|| format!("start {operation} helper"))?;
+    let workspace = std::env::current_dir()?;
+    let stamp_config_path = selected_aks_stamp_config_path(&workspace)?;
+    let output = run_fic_helper_command(
+        operation,
+        run_id,
+        namespace,
+        service_account,
+        record_path,
+        wait_seconds,
+        &stamp_config_path,
+    )?
+    .output()
+    .await
+    .with_context(|| format!("start {operation} helper"))?;
     if !output.status.success() {
         bail!(
             "{operation} helper failed with {}: {}",
@@ -4655,6 +4691,7 @@ fn run_oat_qap_helper_command(
     workload_record_path: Option<&Path>,
     workload_stop_record_path: Option<&Path>,
     record_path: &Path,
+    stamp_config_path: &Path,
 ) -> Result<Command> {
     let script = std::env::current_dir()?.join("infra/azure/bootstrap.ts");
     let mut command = Command::new("npx");
@@ -4664,6 +4701,7 @@ fn run_oat_qap_helper_command(
         .kill_on_drop(true);
     use_operator_cli_identity(&mut command);
     command.arg(script).arg(operation);
+    command.arg("--stamp-config").arg(stamp_config_path);
     if operation == "bind-oat-qap" {
         let manifest_path = manifest_path.context("QAP binding requires its exact manifest path")?;
         command.args(["--run-id", run_id, "--manifest"]);
@@ -4688,6 +4726,8 @@ async fn run_oat_qap_helper(
     workload_stop_record_path: Option<&Path>,
     record_path: &Path,
 ) -> Result<()> {
+    let workspace = std::env::current_dir()?;
+    let stamp_config_path = selected_aks_stamp_config_path(&workspace)?;
     let output = run_oat_qap_helper_command(
         operation,
         run_id,
@@ -4695,6 +4735,7 @@ async fn run_oat_qap_helper(
         workload_record_path,
         workload_stop_record_path,
         record_path,
+        &stamp_config_path,
     )?
     .output()
     .await
@@ -6029,6 +6070,15 @@ fn platform_host_label(kind: crate::config::OatMode) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn selected_aks_stamp_config_is_workspace_contained() -> Result<()> {
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let selected = resolve_aks_stamp_config_path(&workspace, Path::new("infra/azure/stamp.yaml"))?;
+        assert!(selected.starts_with(workspace.canonicalize()?));
+        assert!(resolve_aks_stamp_config_path(&workspace, Path::new("../")).is_err());
+        Ok(())
+    }
+
     use super::*;
 
     #[test]
@@ -6041,7 +6091,13 @@ mod tests {
                 Some("arrowcol-oat"),
                 Path::new("/tmp/run-fic.json"),
                 None,
+                Path::new("/tmp/stamp-87513.yaml"),
             )?;
+            assert!(
+                command.as_std().get_args().collect::<Vec<_>>().windows(2).any(
+                    |pair| pair[0] == "--stamp-config" && pair[1] == Path::new("/tmp/stamp-87513.yaml").as_os_str()
+                )
+            );
             for variable in ["AZURE_CLIENT_ID", "AZURE_TENANT_ID", "AZURE_FEDERATED_TOKEN_FILE"] {
                 assert!(
                     command
@@ -6074,7 +6130,13 @@ mod tests {
                 workload_record_path,
                 workload_stop_record_path,
                 record,
+                Path::new("/tmp/stamp-87513.yaml"),
             )?;
+            assert!(
+                command.as_std().get_args().collect::<Vec<_>>().windows(2).any(
+                    |pair| pair[0] == "--stamp-config" && pair[1] == Path::new("/tmp/stamp-87513.yaml").as_os_str()
+                )
+            );
             for variable in ["AZURE_CLIENT_ID", "AZURE_TENANT_ID", "AZURE_FEDERATED_TOKEN_FILE"] {
                 assert!(
                     command
@@ -6088,7 +6150,18 @@ mod tests {
                 assert!(command.as_std().get_args().any(|arg| arg == "--workload-stop-record"));
             }
         }
-        assert!(run_oat_qap_helper_command("cleanup-oat-qap", run_id, None, None, None, record).is_err());
+        assert!(
+            run_oat_qap_helper_command(
+                "cleanup-oat-qap",
+                run_id,
+                None,
+                None,
+                None,
+                record,
+                Path::new("/tmp/stamp-87513.yaml")
+            )
+            .is_err()
+        );
         Ok(())
     }
 

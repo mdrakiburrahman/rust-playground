@@ -656,7 +656,10 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
   }
 
   if (mode === 'local') await recoverInterruptedLocalRuns(config);
-  const server = await startLocalServer(runner);
+  const serverEnvironment = mode === 'aks'
+    ? { ARROWCOL_AKS_STAMP_CONFIG_FILE: requestedStampConfigPath ?? 'infra/azure/stamp.yaml' }
+    : {};
+  const server = await startLocalServer(runner, serverEnvironment);
   let markerContext: LocalRunMarkerContext | undefined;
   try {
     if (mode === 'local') markerContext = await prepareLocalRunMarker(config, server);
@@ -987,13 +990,17 @@ export async function buildOwnedServer(
   return { executable: await realpath(executables[0]!), gitSha };
 }
 
-export async function startLocalServer(runner: typeof run_tree = run_tree): Promise<{ child: ChildProcess; url: string; gitSha: string; executable: string }> {
+export async function startLocalServer(
+  runner: typeof run_tree = run_tree,
+  serverEnvironment: NodeJS.ProcessEnv = {},
+): Promise<{ child: ChildProcess; url: string; gitSha: string; executable: string }> {
   const workspace = resolve(fileURLToPath(new URL('../..', import.meta.url)));
   const build = await buildOwnedServer(workspace, runner);
   const port = await availablePort();
   const url = `http://127.0.0.1:${port}`;
   const child = spawn(build.executable, ['--listen', `127.0.0.1:${port}`], {
-    cwd: workspace, detached: process.platform === 'linux', stdio: 'inherit', env: { ...process.env, GIT_SHA: build.gitSha },
+    cwd: workspace, detached: process.platform === 'linux', stdio: 'inherit',
+    env: { ...process.env, ...serverEnvironment, GIT_SHA: build.gitSha },
   });
   let exit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
   let spawnError: Error | undefined;
