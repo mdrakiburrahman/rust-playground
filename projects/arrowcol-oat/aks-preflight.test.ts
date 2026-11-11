@@ -72,6 +72,8 @@ async function fixture() {
     writerReady: true,
     queryStatus: 200,
     qapAdmin: true,
+    qapRole: 'Database experimentqap Admin',
+    qapPrincipalId: principalId,
     ciliumReady: true,
   };
   const output = (value: unknown) => ({ stdout: typeof value === 'string' ? value : JSON.stringify(value), exitCode: 0 });
@@ -100,6 +102,7 @@ async function fixture() {
     }
     if (command === 'az') {
       if (args[0] === 'account' && args[1] === 'show') return output({ id: subscription, tenantId: tenant });
+      if (args[0] === 'rest') return output({ value: state.permissions });
       if (args[0] === 'aks' && args[1] === 'show') return output({
         fqdn: new URL(server).hostname, oidcIssuerProfile: { issuerUrl: 'https://issuer.example.test/' },
         networkProfile: state.network, agentPoolProfiles: state.pools,
@@ -126,19 +129,15 @@ async function fixture() {
       return Response.json({ access_token: 'access-token-canary' });
     }
     assert.equal(new Headers(init?.headers).get('authorization'), 'Bearer access-token-canary');
-    if (url.includes('Microsoft.Authorization/permissions')) {
-      assert.equal(init?.method ?? 'GET', 'GET');
-      await state.onPermissions?.();
-      return Response.json({ value: state.permissions });
-    }
     const body = JSON.parse(String(init?.body));
     assert.equal(body.db, 'experimentqap');
     if (url.endsWith('/v1/rest/query')) return Response.json({ Tables: [] }, { status: state.queryStatus });
     if (url.endsWith('/v1/rest/mgmt')) {
       assert.equal(body.csl, '.show database principals');
+      await state.onPermissions?.();
       return Response.json({ Tables: [{
         Columns: [{ ColumnName: 'Role' }, { ColumnName: 'PrincipalObjectId' }],
-        Rows: state.qapAdmin ? [['Database Admin', principalId]] : [],
+        Rows: state.qapAdmin ? [[state.qapRole, state.qapPrincipalId]] : [],
       }] });
     }
     throw new Error('Unexpected fake provider request');
@@ -167,6 +166,7 @@ test('fresh-run preflight passes without staged workloads and exposes the no-pro
     assert.ok(!f.calls.some((call) => ['create', 'delete'].some((verb) => call.args.includes(verb) && !call.args.includes('can-i'))));
     assert.ok(!f.calls.some((call) => call.command === 'az' &&
       (call.args[0] === 'login' || (call.args[0] === 'aks' && call.args[1] === 'get-credentials'))));
+    assert.ok(!f.requests.some((request) => request.url.includes('Microsoft.Authorization/permissions')));
     assert.ok(!JSON.stringify(report).includes(f.assertion));
     assert.ok(!JSON.stringify(report).includes('access-token-canary'));
   } finally { await f.cleanup(); }
@@ -323,14 +323,29 @@ test('Cilium requires healthy agents and a current exact-cluster behavioral rece
   } finally { await f.cleanup(); }
 });
 
-test('FIC effective permissions use the workload UAMI and require both write and delete', async () => {
+test('database Admin matches the selected database and UAMI object ID; operator FIC permissions require write and delete', async () => {
   const f = await fixture();
   try {
+    f.state.qapPrincipalId = clientId;
+    let principalCheck = await f.run();
+    assert.equal(principalCheck.checks.find((entry) => entry.name.startsWith('Selected QAP'))!.ready, false);
+    f.state.qapPrincipalId = principalId;
+    f.state.qapRole = 'Database otherdb Admin';
+    principalCheck = await f.run();
+    assert.equal(principalCheck.checks.find((entry) => entry.name.startsWith('Selected QAP'))!.ready, false);
+    f.state.qapRole = 'Database experimentqap Viewer';
+    principalCheck = await f.run();
+    assert.equal(principalCheck.checks.find((entry) => entry.name.startsWith('Selected QAP'))!.ready, false);
+    f.state.qapRole = 'Database experimentqap Admin';
+    principalCheck = await f.run();
+    assert.equal(principalCheck.checks.find((entry) => entry.name.startsWith('Selected QAP'))!.ready, true);
     f.state.permissions[0]!.notActions = ['Microsoft.ManagedIdentity/*/federatedIdentityCredentials/delete'];
     const report = await f.run();
     assert.equal(report.checks.find((entry) => entry.name.startsWith('Run federated'))!.ready, false);
     assert.match(report.checks.find((entry) => entry.name.startsWith('Run federated'))!.detail, /delete permission/);
-    assert.ok(f.requests.some((request) => request.url.includes(`${identityId}/providers/Microsoft.Authorization/permissions`)));
+    assert.ok(f.calls.some((call) => call.command === 'az' && call.args[0] === 'rest' &&
+      call.args.some((arg) => arg.includes(`${identityId}/providers/Microsoft.Authorization/permissions`))));
+    assert.ok(f.calls.some((call) => call.command === 'az' && call.args[0] === 'rest' && call.timeoutMs === 30_000));
     assert.equal(report.checks.find((entry) => entry.name === 'Run federated-credential headroom')!.ready, true);
   } finally { await f.cleanup(); }
   assert.equal(permitsAction([{ actions: ['*'], notActions: ['Microsoft.ManagedIdentity/*'] }], 'Microsoft.ManagedIdentity/write'), false);
