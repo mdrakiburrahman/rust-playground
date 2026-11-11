@@ -27,7 +27,7 @@ interface CommandResult {
 interface PreflightOptions {
   workspaceRoot?: string;
   environment?: NodeJS.ProcessEnv;
-  runCommand?: (command: string, args: string[]) => CommandResult;
+  runCommand?: (command: string, args: string[], timeoutMs?: number) => CommandResult;
   fetcher?: typeof fetch;
   now?: () => number;
 }
@@ -133,10 +133,10 @@ export async function runAksPreflight(configPath: string, options: PreflightOpti
   const environment = options.environment ?? process.env;
   const fetcher = options.fetcher ?? fetch;
   const now = options.now ?? Date.now;
-  const runCommand = options.runCommand ?? ((command: string, args: string[]): CommandResult => {
+  const runCommand = options.runCommand ?? ((command: string, args: string[], timeoutMs = 30_000): CommandResult => {
     try {
       return { stdout: execFileSync(command, args, {
-        encoding: 'utf8', timeout: 30_000, maxBuffer: 8 * 1024 * 1024, env: environment, stdio: ['ignore', 'pipe', 'pipe'],
+        encoding: 'utf8', timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024, env: environment, stdio: ['ignore', 'pipe', 'pipe'],
       }), exitCode: 0 };
     } catch (error) {
       return { stdout: '', exitCode: isRecord(error) && typeof error.status === 'number' ? error.status : 1 };
@@ -239,7 +239,7 @@ export async function runAksPreflight(configPath: string, options: PreflightOpti
         !website?.startsWith(`abfss://$web@arrowcollector${stamp}.dfs.core.windows.net/`) || results === website) {
       throw new Error('AKS destinations must use separate selected-stamp experiments and root $web paths.');
     }
-    const validation = runCommand('cargo', ['run', '--locked', '--package', 'arrowcol-oat-rust', '--', '--validate-config', resolve(root, configPath)]);
+    const validation = runCommand('cargo', ['run', '--locked', '--package', 'arrowcol-oat-rust', '--', '--validate-config', resolve(root, configPath)], 300_000);
     if (validation.exitCode !== 0) throw new Error(`Rust configuration validation failed; run \`${setupCommand}\`.`);
     return 'Selected five-digit stamp, private stamp YAML and separate result/website destinations match.';
   });

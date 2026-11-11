@@ -26,6 +26,10 @@ async function checked(runner: typeof run_tree, command: string[], timeout: numb
   return result.stdout.trim();
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 function stampNumber(value: string): string {
   if (!/^(?:00000|[1-9]\d{4})$/.test(value)) throw new Error('--stamp must be 00000 or an integer in 10000..99999.');
   return value;
@@ -124,8 +128,80 @@ export async function setup(
   await checked(runner, ['az', 'aks', 'get-credentials', '--subscription', live.subscription,
     '--resource-group', live.resourceGroup, '--name', live.clusterName, '--context', live.clusterName,
     '--overwrite-existing', '--only-show-errors'], 180, 'Fetch AKS credentials');
+  const kubeloginHelp = await checked(runner, ['kubelogin', 'get-token', '--help'], 30, 'Verify kubelogin environment override support');
+  if (!kubeloginHelp.includes('--disable-environment-override')) throw new Error('Installed kubelogin does not support --disable-environment-override.');
   await checked(runner, ['kubelogin', 'convert-kubeconfig', '--context', live.clusterName, '-l', 'azurecli',
-    '--disable-environment-override'], 60, 'Configure operator kube authentication');
+    '--subscription', live.subscription, '--disable-environment-override'], 60, 'Configure operator kube authentication');
+  const kubeconfigText = await checked(runner, ['kubectl', 'config', 'view', '--minify', '--context', live.clusterName,
+    '-o', 'json'], 30, 'Read operator kube authentication configuration');
+  let kubeconfig: unknown;
+  try { kubeconfig = JSON.parse(kubeconfigText); }
+  catch { throw new Error('AKS returned invalid kubeconfig JSON after credential conversion.'); }
+  if (!isRecord(kubeconfig) || !Array.isArray(kubeconfig.contexts) || !Array.isArray(kubeconfig.users)) {
+    throw new Error('AKS returned an invalid kubeconfig structure after credential conversion.');
+  }
+  const activeContext = kubeconfig.contexts[0];
+  const context = isRecord(activeContext) && isRecord(activeContext.context) ? activeContext.context : undefined;
+  const kubeUser = context?.user;
+  if (typeof kubeUser !== 'string' || !kubeUser) throw new Error('AKS kubeconfig has no active user after credential conversion.');
+  const user = kubeconfig.users.find(entry => isRecord(entry) && entry.name === kubeUser);
+  const userConfig = isRecord(user) && isRecord(user.user) ? user.user : undefined;
+  const exec = userConfig && isRecord(userConfig.exec) ? userConfig.exec : undefined;
+  const rawExecArgs = exec?.args;
+  if (!exec || exec.command !== 'kubelogin' || !Array.isArray(rawExecArgs) ||
+      !rawExecArgs.every((arg): arg is string => typeof arg === 'string')) {
+    throw new Error('AKS kubeconfig has no valid kubelogin exec configuration after credential conversion.');
+  }
+  if (exec.apiVersion !== undefined && typeof exec.apiVersion !== 'string') {
+    throw new Error('AKS kubeconfig has an invalid kubelogin API version.');
+  }
+  if (exec.interactiveMode !== undefined && typeof exec.interactiveMode !== 'string') {
+    throw new Error('AKS kubeconfig has an invalid kubelogin interactive mode.');
+  }
+  if (exec.provideClusterInfo !== undefined && typeof exec.provideClusterInfo !== 'boolean') {
+    throw new Error('AKS kubeconfig has an invalid kubelogin cluster-info setting.');
+  }
+  const rawExecEnv = exec.env;
+  if (rawExecEnv !== undefined && rawExecEnv !== null && !Array.isArray(rawExecEnv)) {
+    throw new Error('AKS kubeconfig has invalid kubelogin environment settings.');
+  }
+  const execEnv: Array<{ name: string; value: string }> = [];
+  for (const value of (Array.isArray(rawExecEnv) ? rawExecEnv : [])) {
+    if (!isRecord(value) || typeof value.name !== 'string' || typeof value.value !== 'string') {
+      throw new Error('AKS kubeconfig has invalid kubelogin environment settings.');
+    }
+    execEnv.push({ name: value.name, value: value.value });
+  }
+  const originalArgs = rawExecArgs;
+  const normalizedArgs: string[] = [];
+  for (let index = 0; index < originalArgs.length; index++) {
+    const arg = originalArgs[index]!;
+    if (arg === '--subscription') {
+      if (!originalArgs[index + 1] || originalArgs[index + 1]!.startsWith('--')) {
+        throw new Error('AKS kubeconfig has a malformed kubelogin subscription argument.');
+      }
+      index++;
+    } else if (arg.startsWith('--subscription=') ||
+      arg === '--disable-environment-override' || arg.startsWith('--disable-environment-override=')) {
+      continue;
+    } else {
+      normalizedArgs.push(arg);
+    }
+  }
+  normalizedArgs.push('--subscription', live.subscription, '--disable-environment-override');
+  if (normalizedArgs.length !== originalArgs.length || normalizedArgs.some((arg, index) => arg !== originalArgs[index])) {
+    const setArgs = ['config', 'set-credentials', kubeUser, `--exec-command=${exec.command}`];
+    if (typeof exec.apiVersion === 'string') setArgs.push(`--exec-api-version=${exec.apiVersion}`);
+    setArgs.push(...normalizedArgs.map(arg => `--exec-arg=${arg}`));
+    for (const entry of execEnv) {
+      setArgs.push(`--exec-env=${entry.name}=${entry.value}`);
+    }
+    if (typeof exec.interactiveMode === 'string') setArgs.push(`--exec-interactive-mode=${exec.interactiveMode}`);
+    if (typeof exec.provideClusterInfo === 'boolean') {
+      setArgs.push(`--exec-provide-cluster-info=${exec.provideClusterInfo}`);
+    }
+    await checked(runner, ['kubectl', ...setArgs], 60, 'Harden kubelogin operator authentication');
+  }
   const clientId = await checked(runner, ['az', 'identity', 'show', '--subscription', live.subscription,
     '--resource-group', live.resourceGroup, '--name', 'arrow-collector', '--query', 'clientId',
     '--output', 'tsv', '--only-show-errors'], 60, 'Read arrow-collector UAMI');

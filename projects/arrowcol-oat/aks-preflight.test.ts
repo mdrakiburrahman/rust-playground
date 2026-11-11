@@ -50,7 +50,7 @@ async function fixture() {
     AZURE_SUBSCRIPTION_ID: subscription, AZURE_FEDERATED_TOKEN_FILE: assertionPath,
     ARROWCOL_RESET_GENERATION: generation, AZURE_KUSTO_EXPERIMENT_DATABASE: 'experimentqap',
   };
-  const calls: Array<{ command: string; args: string[] }> = [];
+  const calls: Array<{ command: string; args: string[]; timeoutMs?: number }> = [];
   const requests: Array<{ url: string; init?: RequestInit }> = [];
   const fixedCredential = { name: 'arrow-collector', issuer: 'https://issuer.example.test/',
     subject: 'system:serviceaccount:arrow-collector:arrow-collector', audiences: ['api://AzureADTokenExchange'] };
@@ -75,8 +75,8 @@ async function fixture() {
     ciliumReady: true,
   };
   const output = (value: unknown) => ({ stdout: typeof value === 'string' ? value : JSON.stringify(value), exitCode: 0 });
-  const runCommand = (command: string, args: string[]) => {
-    calls.push({ command, args: [...args] });
+  const runCommand = (command: string, args: string[], timeoutMs?: number) => {
+    calls.push({ command, args: [...args], timeoutMs });
     if (state.commandFailure && `${command} ${args.join(' ')}`.includes(state.commandFailure)) {
       return { exitCode: 7, stdout: assertion };
     }
@@ -156,6 +156,7 @@ test('fresh-run preflight passes without staged workloads and exposes the no-pro
     assert.deepEqual(report.checks.filter((entry) => !entry.ready), []);
     assert.equal(report.ready, true);
     assert.equal(report.checks.length, 13);
+    assert.equal(f.calls.find((call) => call.command === 'cargo')?.timeoutMs, 300_000);
     assert.deepEqual(report.network, { provider: 'none', enforcing: false });
     assert.match(formatPreflightReport(report), /WARNING:.*passwordless port/);
     assert.equal(f.calls.filter((call) => call.command === 'az' && call.args[0] === 'acr').length, 5);

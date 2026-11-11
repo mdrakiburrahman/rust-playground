@@ -47,9 +47,12 @@ function fake(options: {
   output?: string;
   clusters?: string[]; state?: string; preflightFailures?: number; fail?: string;
   missingImages?: boolean; olderTags?: boolean; registryAbsent?: boolean; badProvenance?: boolean; badDigest?: boolean;
+  alreadyHardened?: boolean; unsupportedDisableFlag?: boolean; nullExecEnv?: boolean;
 } = {}) {
   const calls: string[][] = [];
   let preflights = 0;
+  let kubeArgs = ['get-token', '--login', 'azurecli', '--server-id', 'api://AzureADTokenExchange',
+    '--subscription', subscription, ...(options.alreadyHardened ? ['--disable-environment-override'] : [])];
   let published = !options.missingImages && !options.olderTags;
   const missingMetadata = new Set<string>();
   const runner: typeof run_tree = async (command, _timeout, _cwd, env) => {
@@ -58,6 +61,21 @@ function fake(options: {
     if (options.fail && text.includes(options.fail)) return { returncode: 1, stdout: '', stderr: 'simulated failure' };
     let stdout = '';
     if (text.startsWith('az aks list')) stdout = JSON.stringify((options.clusters ?? ['arrow-collector-89152']).map(name => ({ name })));
+    else if (text === 'kubelogin get-token --help') stdout = options.unsupportedDisableFlag ? 'usage: kubelogin get-token' : '--disable-environment-override';
+    else if (text.startsWith('kubectl config view')) {
+      if (command.includes('json')) stdout = JSON.stringify({
+          contexts: [{ context: { user: 'cluster-user' } }],
+          users: [{ name: 'cluster-user', user: { exec: {
+            command: 'kubelogin', apiVersion: 'client.authentication.k8s.io/v1beta1', args: kubeArgs,
+            env: options.nullExecEnv ? null : [{ name: 'KUBELOGIN_TEST', value: 'preserved' }], interactiveMode: 'IfAvailable',
+            provideClusterInfo: false, installHint: 'preserved',
+          } } }],
+        });
+      else stdout = 'https://stamp.example.com';
+    }
+    else if (text.startsWith('kubectl config set-credentials')) {
+      kubeArgs = command.filter(arg => arg.startsWith('--exec-arg=')).map(arg => arg.slice('--exec-arg='.length));
+    }
     else if (text.startsWith('az aks get-credentials') || command[0] === 'kubelogin') { /* credential setup */ }
     else if (text.startsWith('az aks show')) stdout = 'stamp.example.com';
     else if (text.startsWith('az identity show')) stdout = clientId;
@@ -167,6 +185,21 @@ test('setup safely repairs YAML, reuses published images, refreshes private inpu
   assert.equal(parse(yaml).stamp, '89152');
   assert.ok(m.calls.some(c => c[0] === 'kubelogin' && c.includes('--disable-environment-override') &&
     c[c.indexOf('--context') + 1] === 'arrow-collector-89152'));
+  const conversion = m.calls.find(c => c[0] === 'kubelogin' && c.includes('convert-kubeconfig'))!;
+  assert.equal(conversion[conversion.indexOf('--subscription') + 1], subscription);
+  assert.ok(m.calls.some(c => c[0] === 'kubelogin' && c.join(' ') === 'kubelogin get-token --help'));
+  const hardening = m.calls.find(c => c[0] === 'kubectl' && c.includes('set-credentials'))!;
+  assert.equal(hardening[3], 'cluster-user');
+  assert.deepEqual(hardening.filter(arg => arg.startsWith('--exec-arg=')).map(arg => arg.slice('--exec-arg='.length)), [
+    'get-token', '--login', 'azurecli', '--server-id', 'api://AzureADTokenExchange',
+    '--subscription', subscription, '--disable-environment-override',
+  ]);
+  assert.ok(hardening.includes('--exec-env=KUBELOGIN_TEST=preserved'));
+  assert.ok(hardening.includes('--exec-api-version=client.authentication.k8s.io/v1beta1'));
+  assert.ok(hardening.includes('--exec-interactive-mode=IfAvailable'));
+  assert.ok(hardening.includes('--exec-provide-cluster-info=false'));
+  await setup({ ...options, skipImages: true, skipPreflight: true }, m.runner);
+  assert.equal(m.calls.filter(c => c[0] === 'kubectl' && c.includes('set-credentials')).length, 1);
   assert.ok(m.calls.every(c => c[0] !== 'docker' || !c.includes('build')));
   const originalPassword = await readFile(resolve(output, 'secrets/sa-password'), 'utf8');
   const again = fake();
@@ -187,6 +220,24 @@ test('setup safely repairs YAML, reuses published images, refreshes private inpu
   const stale = fake();
   await assert.rejects(setup({ ...options, skipImages: true }, stale.runner), /aks destroy --confirm arrow-collector-rg/);
   assert.equal(stale.calls.length, 1);
+});
+
+test('setup verifies kubelogin support and avoids duplicating the hardening argument', async t => {
+  const options = await fixture(t);
+  const existing = fake({ output: options.output, alreadyHardened: true });
+  await setup({ ...options, skipImages: true, skipPreflight: true }, existing.runner);
+  assert.equal(existing.calls.filter(c => c[0] === 'kubectl' && c.includes('set-credentials')).length, 0);
+
+  const nullEnvOptions = await fixture(t);
+  const nullEnv = fake({ output: nullEnvOptions.output, nullExecEnv: true });
+  await setup({ ...nullEnvOptions, skipImages: true, skipPreflight: true }, nullEnv.runner);
+  assert.equal(nullEnv.calls.filter(c => c[0] === 'kubectl' && c.includes('set-credentials')).length, 1);
+  assert.ok(!nullEnv.calls.find(c => c[0] === 'kubectl' && c.includes('set-credentials'))?.some(arg => arg.startsWith('--exec-env=')));
+
+  const unsupported = fake({ output: options.output, unsupportedDisableFlag: true });
+  await assert.rejects(setup({ ...options, skipImages: true, skipPreflight: true }, unsupported.runner),
+    /does not support --disable-environment-override/);
+  assert.ok(!unsupported.calls.some(c => c.includes('convert-kubeconfig') || c.includes('set-credentials')));
 });
 
 test('missing revision images build and publish all five once, then verify every registry digest', async t => {
