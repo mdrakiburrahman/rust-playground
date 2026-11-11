@@ -182,12 +182,12 @@ fn row_hash_multiset(batch: &RecordBatch) -> Result<Vec<(String, u64)>> {
                             .context("int32 row array")?
                             .value(row)
                     ),
-                    DataType::Int64 => json!(
+                    DataType::Int64 => persisted_long_value(
                         array
                             .as_any()
                             .downcast_ref::<Int64Array>()
                             .context("int64 row array")?
-                            .value(row)
+                            .value(row),
                     ),
                     DataType::Float64 => json!(
                         array
@@ -225,10 +225,10 @@ fn row_hash_multiset(batch: &RecordBatch) -> Result<Vec<(String, u64)>> {
                         .downcast_ref::<TimestampMicrosecondArray>()
                         .context("timestamp row array")?
                         .value(row);
-                    json!(
+                    persisted_long_value(
                         timestamp
                             .checked_mul(1_000)
-                            .context("timestamp nanosecond companion overflow")?
+                            .context("timestamp nanosecond companion overflow")?,
                     )
                 };
                 values.insert(format!("{}__unix_nanos", field.name()), nanoseconds);
@@ -241,6 +241,14 @@ fn row_hash_multiset(batch: &RecordBatch) -> Result<Vec<(String, u64)>> {
         *count = count.checked_add(1).context("row hash multiplicity overflow")?;
     }
     Ok(counts.into_iter().collect())
+}
+
+fn persisted_long_value(value: i64) -> Value {
+    if value.unsigned_abs() > 9_007_199_254_740_991 {
+        json!(value.to_string())
+    } else {
+        json!(value)
+    }
 }
 
 /// Encodes a batch with the generated SDK manifest's descriptor path.
@@ -554,6 +562,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn row_hashes_preserve_wide_integer_boundaries_through_delta() -> Result<()> {
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "value",
+                Arc::new(Int64Array::from(vec![
+                    i64::MIN,
+                    -9_007_199_254_740_992,
+                    -9_007_199_254_740_991,
+                    9_007_199_254_740_991,
+                    9_007_199_254_740_992,
+                    i64::MAX,
+                ])) as ArrayRef,
+            ),
+            (
+                "sample_time_utc",
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![
+                        -9_007_199_254_741,
+                        -9_007_199_254_740,
+                        0,
+                        9_007_199_254_740,
+                        9_007_199_254_741,
+                        20_260_923_000_000,
+                    ])
+                    .with_timezone("UTC"),
+                ) as ArrayRef,
+            ),
+        ])?;
+        let expected = row_hash_multiset(&batch)?;
+        let directory = tempfile::tempdir()?;
+        let table = "telemetry.sqlserver.wide_integer_boundaries";
+        let mut writer = arrow_deltalake::delta::DeltaTableWriter::open(directory.path().join(table))?;
+        writer.write(&batch).await?;
+        writer.close().await?;
+        let snapshot = delta_inspect::summarize(directory.path()).await?;
+        assert_eq!(
+            snapshot.tables[table].row_hashes,
+            expected.into_iter().collect(),
+            "safe-integer boundaries must match the independent reader without losing precision"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn default_schema_batches_stay_one_flight_record_batch() -> Result<()> {
         const LOADTEST_MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 
@@ -582,7 +634,7 @@ mod tests {
                 schema,
                 generated_root: "target/generated".into(),
             });
-            let batch = build_logical_batch(table, 8_192, 7).await?;
+            let batch = build_logical_batch(table, 8_192, 20_260_923).await?;
 
             for offset in (CUSTOMER_COUNT..batch.rows).step_by(CUSTOMER_COUNT) {
                 assert_eq!(

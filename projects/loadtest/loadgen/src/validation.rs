@@ -1491,4 +1491,53 @@ mod tests {
         validate_row_multiset("dataflow", "table", &expected, &extra_rows, &mut failures);
         assert!(failures.is_empty(), "{failures:?}");
     }
+
+    #[tokio::test]
+    async fn default_seed_durable_hashes_validate_against_independent_delta_rows() -> Result<()> {
+        use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+        use arrowcol_protocol::{CatalogName, SchemaName, TableIdentity, TableName};
+        use std::sync::Arc;
+
+        let table = Arc::new(crate::sdk::GeneratedTable {
+            identity: TableIdentity::new(
+                CatalogName::new("telemetry")?,
+                SchemaName::new("sqlserver")?,
+                TableName::new("sqlserver_active_requests")?,
+            ),
+            schema_version: 1,
+            fingerprint: format!("sha256:{}", "a".repeat(64)),
+            descriptor_path: vec![
+                "telemetry".into(),
+                "sqlserver".into(),
+                "sqlserver_active_requests".into(),
+                "v1".into(),
+            ],
+            schema: Arc::new(Schema::new(vec![
+                Field::new("customer_id", DataType::Utf8, false),
+                Field::new(
+                    "sample_time_utc",
+                    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                    false,
+                ),
+            ])),
+            generated_root: "target/generated".into(),
+        });
+        let batch = crate::generator::build_logical_batch(table, 1_024, 20_260_923).await?;
+        let directory = tempfile::tempdir()?;
+        let identity = batch.table.identity.to_string();
+        let mut writer = arrow_deltalake::delta::DeltaTableWriter::open(directory.path().join(&identity))?;
+        writer.write(&batch.record_batch).await?;
+        writer.close().await?;
+        let snapshot = delta_inspect::summarize(directory.path()).await?;
+        let mut expected = BTreeMap::new();
+        merge_row_hashes(&mut expected, &batch.row_hashes, batch.rows)?;
+        let mut actual = snapshot.tables[&identity].row_hashes.clone();
+        let mut failures = Vec::new();
+        validate_row_multiset("dataflow", &identity, &expected, &actual, &mut failures);
+        assert!(failures.is_empty(), "{failures:?}");
+        actual.pop_first();
+        validate_row_multiset("dataflow", &identity, &expected, &actual, &mut failures);
+        assert_eq!(failures.len(), 1, "missing durable rows must still fail validation");
+        Ok(())
+    }
 }
