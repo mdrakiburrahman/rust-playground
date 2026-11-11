@@ -79,6 +79,7 @@ The final binding step, after that review and explicit run authorization, is:
 : "${HIGHER_DFE:?bind the approved E5 concurrency}"
 npx --no-install tsx projects/arrowcol-oat/prepare-experiments.ts \
   --base out/arrowcol-oat/oat-config.aks.json \
+  --stamp-config .temp/stamp-87513.yaml \
   --out out/arrowcol-oat/e1-e5-approved \
   --warmup-seconds "$WARMUP_SECONDS" --measure-seconds "$MEASURE_SECONDS" \
   --higher-dfe "$HIGHER_DFE"
@@ -90,14 +91,19 @@ existing private runtime/bootstrap files and digest-pinned images, and writes
 five mode-0600 JSON configs into a new private output directory. It refuses to
 overwrite existing output. Keep the original pilot records unchanged; this
 command binds reviewed values, **does not independently certify pilot evidence**
-and does not replace the Rust runner's complete config validation.
+and does not replace the Rust runner's complete config validation. Pass the same
+private stamp YAML selected for deployment using `--stamp-config` (for example,
+`--stamp-config .temp/stamp-87513.yaml`). The binder checks that its stamp ID
+matches the generated baseline before using its pool limits; when omitted, it uses
+`infra/azure/stamp.yaml` and still requires that stamp to match. Never copy or
+overwrite a private stamp file just to satisfy this check.
 
 Before any authorized execution, archive hashes of the five configs, source,
 runtime, images and overlay beside the pilot decision. Compare E4/E5 to E3:
 only `clients_per_table` / `dfe_worker_concurrency`, respectively, may differ.
 Do not change rows, DMV concurrency, pod resources or windows between runs.
 Launch each config separately with the existing command:
-`npx nx run arrowcol-oat:cli -- --mode aks --config out/arrowcol-oat/e1-e5-approved/E1.config.json`
+`npx nx run arrowcol-oat:cli -- --mode aks --stamp-config .temp/stamp-87513.yaml --config out/arrowcol-oat/e1-e5-approved/E1.config.json`
 (substitute E2-E5). **Launching is a live mutating operation and requires
 separate authorization; preparation does not grant it.** Each launch retains
 the runner's fresh cell identity/scoped namespace and cleanup behavior; the

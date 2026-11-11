@@ -154,13 +154,14 @@ async function assertSafeOutputParents(workspaceRoot: string, out: string): Prom
 
 export async function main(args: string[], workspaceRoot = resolve('.')): Promise<void> {
   const { values } = parseArgs({ args, options: {
-    base: { type: 'string' }, out: { type: 'string' },
+    base: { type: 'string' }, out: { type: 'string' }, 'stamp-config': { type: 'string' },
     'warmup-seconds': { type: 'string' }, 'measure-seconds': { type: 'string' },
     'higher-dfe': { type: 'string' }, help: { type: 'boolean' },
   } });
   if (values.help) {
     console.log('Offline only: --base <private AKS config> --out <new out/arrowcol-oat/subdirectory> ' +
-      '--warmup-seconds <measured> --measure-seconds <measured> --higher-dfe <approved>');
+      '[--stamp-config <selected private stamp YAML>] --warmup-seconds <measured> ' +
+      '--measure-seconds <measured> --higher-dfe <approved>');
     return;
   }
   for (const key of ['base', 'out', 'warmup-seconds', 'measure-seconds', 'higher-dfe'] as const) {
@@ -191,16 +192,20 @@ export async function main(args: string[], workspaceRoot = resolve('.')): Promis
     measureSeconds: Number(values['measure-seconds']),
     higherDfeConcurrency: Number(values['higher-dfe']),
   });
+  const stampConfigPath = resolve(root, values['stamp-config'] ?? 'infra/azure/stamp.yaml');
   let stampSource: string;
   try {
-    stampSource = await readFile(resolve(root, 'infra/azure/stamp.yaml'), 'utf8');
+    stampSource = await readFile(stampConfigPath, 'utf8');
   } catch (error) {
     if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
-      throw new Error('Configured AKS pool limits are required; create infra/azure/stamp.yaml from infra/azure/stamp.example.yaml before preparing E1-E5.', { cause: error });
+      throw new Error(`Configured AKS pool limits are required; selected stamp config is missing at ${stampConfigPath}.`, { cause: error });
     }
     throw error;
   }
   const stamp = parseStampConfig(stampSource);
+  if (stamp.stamp !== base.stamp) {
+    throw new Error(`Selected AKS stamp config stamp ${stamp.stamp} does not match baseline config stamp ${String(base.stamp)}.`);
+  }
   assertExperimentPoolCapacity(stamp.aks.userPools, Object.entries(configs).map(([name, config]) =>
     experimentPoolPodCount(name, config)));
   await mkdir(privateRoot, { recursive: true, mode: 0o700 });
