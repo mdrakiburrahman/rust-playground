@@ -22,6 +22,7 @@ async function ownedBuildFixture(options: {
   dirty?: string; afterStatus?: string; afterSha?: string; noArtifact?: boolean;
   duplicateArtifact?: boolean; buildCode?: number;
   rejectRun?: boolean;
+  succeedRun?: boolean;
 } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-owned-build-'));
   const executable = path.join(directory, 'built-server');
@@ -46,6 +47,13 @@ http.createServer((request, response) => {
   response.setHeader('content-type', 'application/json');
   if (${options.rejectRun ?? false} && request.url === '/runs') {
     response.writeHead(422).end(JSON.stringify({ error: 'invalid matrix fixture' }));
+    return;
+  }
+  if (${options.succeedRun ?? false} && request.url === '/runs') {
+    response.end(JSON.stringify({
+      id: '123e4567-e89b-42d3-a456-426614174000', state: 'succeeded',
+      progress: 'published', result_count: 1, error: null,
+    }));
     return;
   }
   response.end(JSON.stringify({ status: 'ok', git_sha: process.env.GIT_SHA }));
@@ -127,14 +135,19 @@ test('executable help resolves its tsx loader outside the repository', async () 
   }
 });
 
-test('rejected local submissions exit without serving absent or stale results', { skip: process.platform !== 'linux' }, async (t) => {
-  for (const owned of [true, false]) {
-    await t.test(owned ? 'owned server' : 'external server', async () => {
-      const fixture = await ownedBuildFixture({ rejectRun: true });
+test('failed local runs exit without serving absent or stale results', { skip: process.platform !== 'linux' }, async (t) => {
+  for (const [scenario, owned] of [
+    ['rejected', true], ['rejected', false], ['failed-verdict', true], ['failed-verdict', false],
+  ] as const) {
+    await t.test(`${scenario}: ${owned ? 'owned server' : 'external server'}`, async () => {
+      const fixture = await ownedBuildFixture({ rejectRun: scenario === 'rejected', succeedRun: scenario === 'failed-verdict' });
       const configPath = path.join(fixture.directory, 'config.json');
+      const resultsPath = path.join(fixture.directory, 'results.parquet');
+      if (scenario === 'failed-verdict') await writeFile(resultsPath, 'PAR1stalePAR1');
       await writeFile(configPath, JSON.stringify({
         platform: { kind: 'local', compose_state_root: path.join(fixture.directory, 'state') },
-        website_url: pathToFileURL(path.join(fixture.directory, 'missing.parquet')).href,
+        website_url: pathToFileURL(resultsPath).href,
+        result_url: pathToFileURL(resultsPath).href,
       }));
       const server = owned ? undefined : await startLocalServer(fixture.runner);
       const previousExitCode = process.exitCode;
@@ -151,7 +164,8 @@ test('rejected local submissions exit without serving absent or stale results', 
         await main(['--mode', 'local', '--config', configPath,
           ...(server ? ['--server', server.url] : [])], fixture.runner);
         assert.equal(process.exitCode, 1);
-        assert.ok(lines.some((line) => line.includes('invalid matrix fixture')));
+        assert.ok(lines.some((line) => line.includes(
+          scenario === 'rejected' ? 'invalid matrix fixture' : 'DATA FLOW: FAIL')));
         assert.equal(lines.some((line) => line.startsWith('Local results viewer:')), false);
       } finally {
         console.log = log;

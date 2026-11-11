@@ -605,18 +605,18 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
   }
   if (requestedServerUrl) {
     const interrupt = mode === 'local' ? registerLocalInterrupts() : undefined;
-    let runSucceeded = false;
+    let runPassed = false;
     try {
       try {
         const code = await reportDataFlowRun(
-          (progress) => launchOat(configPath, requestedServerUrl, pollValue, fetch, progress, mode, getDockerBridgeGateway,
-            interrupt?.controller.signal, undefined, (status) => { runSucceeded = status.state === 'succeeded'; }),
+          (progress) => launchOat(configPath, requestedServerUrl, pollValue, fetch, progress, mode, getDockerBridgeGateway, interrupt?.controller.signal),
           config, mode, undefined, runner, network, warnings,
         );
         if (interrupt?.signal) {
           process.exitCode = interrupt.exitCode;
           return;
         }
+        runPassed = code === 0;
         if (code) process.exitCode = code;
       } catch (error) {
         if (!interrupt?.signal) throw error;
@@ -626,7 +626,7 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
     } finally {
       interrupt?.dispose();
     }
-    if (runSucceeded) await maybeServeLocalViewer(configPath, mode);
+    if (runPassed) await maybeServeLocalViewer(configPath, mode);
     return;
   }
 
@@ -641,7 +641,7 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
   }
   let markerWritten = false;
   let runCleanupComplete = false;
-  let runSucceeded = false;
+  let runPassed = false;
   const interrupt = mode === 'local' ? registerLocalInterrupts() : undefined;
   try {
     try {
@@ -651,7 +651,6 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
         markerWritten = true;
       } : undefined;
       const onRunFinished = (status: OatRunStatus): void => {
-        runSucceeded = status.state === 'succeeded';
         runCleanupComplete = status.state === 'succeeded' || status.state === 'cancelled';
       };
       const code = await reportDataFlowRun(
@@ -662,6 +661,7 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
         process.exitCode = interrupt.exitCode;
         return;
       }
+      runPassed = code === 0;
       if (code) process.exitCode = code;
     } catch (error) {
       if (!interrupt?.signal) throw error;
@@ -675,7 +675,7 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
         if (markerWritten && runCleanupComplete && markerContext) await unlink(markerContext.path);
       },
       interrupt,
-      async () => { if (runSucceeded) await maybeServeLocalViewer(configPath, mode); },
+      async () => { if (runPassed) await maybeServeLocalViewer(configPath, mode); },
     );
   }
 }
