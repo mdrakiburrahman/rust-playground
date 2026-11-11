@@ -53,6 +53,11 @@ function at(value: unknown, key: string): string | undefined {
 function records(value: unknown): JsonRecord[] {
   return Array.isArray(value) ? value.filter(isRecord) : [];
 }
+function publisherCredentialMatches(actual: JsonRecord, expected: { name: string; issuer: string; subject: string }): boolean {
+  const audiences = Array.isArray(actual.audiences) ? [...actual.audiences].sort() : [];
+  return actual.name === expected.name && actual.issuer === expected.issuer && actual.subject === expected.subject &&
+    JSON.stringify(audiences) === JSON.stringify(['api://AzureADTokenExchange']);
+}
 function condition(value: unknown, name: string): boolean {
   return records(value).some((item) => item.type === name && item.status === 'True');
 }
@@ -307,6 +312,10 @@ export async function runAksPreflight(configPath: string, options: PreflightOpti
       credential.issuer === issuer && credential.subject === `system:serviceaccount:${publisherNamespace}:${publisherServiceAccount}` &&
       Array.isArray(credential.audiences) && credential.audiences.length === 1 && credential.audiences[0] === 'api://AzureADTokenExchange')) {
       throw new Error('Existing fixed publisher federation does not exactly match the live cluster and selected UAMI.');
+    }
+    if (!selectedStamp || !selectedStamp.publisherFederatedCredentials.every((expected) =>
+      credentials.some((credential) => publisherCredentialMatches(credential, expected)))) {
+      throw new Error('Configured stamp publisher federation does not exactly match the selected stamp configuration and UAMI.');
     }
     return 'Exact fixed publisher issuer, subject, audience and existing UAMI verified.';
   });

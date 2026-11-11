@@ -19,11 +19,24 @@ const identityId = `/subscriptions/${subscription}/resourceGroups/arrow-collecto
 const storageId = `/subscriptions/${subscription}/resourceGroups/arrow-collector-rg/providers/Microsoft.Storage/storageAccounts/arrowcollector00000`;
 const image = (name: string) => `arrowcollector00000.azurecr.io/${name}@sha256:${'a'.repeat(64)}`;
 
+const publisherCredentials = [
+  { name: 'github-terraform-apply', issuer: 'https://token.actions.githubusercontent.com', subject: 'repo:example/arrow-collector:environment:terraform-apply' },
+  { name: 'github-terraform-plan', issuer: 'https://token.actions.githubusercontent.com', subject: 'repo:example/arrow-collector:environment:terraform-plan' },
+  { name: 'github-devcontainer-publish', issuer: 'https://token.actions.githubusercontent.com', subject: 'repo:example/arrow-collector:environment:devcontainer-publish' },
+] as const;
+
+function testStampConfig(location: 'canadacentral' | 'eastus2' = 'canadacentral') {
+  return {
+    ...defaultStampConfig({ AZURE_STAMP: '00000', AZURE_SUBSCRIPTION_ID: subscription, AZURE_LOCATION: location }),
+    publisherFederatedCredentials: publisherCredentials.map((credential) => ({ ...credential })),
+  };
+}
+
 async function fixture() {
   const root = await mkdtemp(path.join(os.tmpdir(), 'oat-preflight-'));
   await mkdir(path.join(root, 'infra/azure'), { recursive: true });
   await mkdir(path.join(root, 'out/arrowcol-oat'), { recursive: true });
-  const stamp = defaultStampConfig({ AZURE_STAMP: '00000', AZURE_SUBSCRIPTION_ID: subscription, AZURE_LOCATION: 'canadacentral' });
+  const stamp = testStampConfig();
   await writeFile(path.join(root, 'infra/azure/stamp.yaml'), stringify(stamp));
   const runtime = {
     namespace: 'arrow-collector', oatRunId: runId, workloadIdentityClientId: clientId,
@@ -54,10 +67,11 @@ async function fixture() {
   const requests: Array<{ url: string; init?: RequestInit }> = [];
   const fixedCredential = { name: 'arrow-collector', issuer: 'https://issuer.example.test/',
     subject: 'system:serviceaccount:arrow-collector:arrow-collector', audiences: ['api://AzureADTokenExchange'] };
+  const configuredCredentials = publisherCredentials.map((credential) => ({ ...credential, audiences: ['api://AzureADTokenExchange'] }));
   const state = {
     now,
     onPermissions: undefined as (() => void | Promise<void>) | undefined,
-    credentials: [fixedCredential] as Record<string, unknown>[],
+    credentials: [fixedCredential, ...configuredCredentials] as Record<string, unknown>[],
     permissions: [{ actions: ['Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials/*'], notActions: [] as string[] }],
     network: { networkDataplane: 'azure', networkPolicy: 'none' },
     nodes: [] as Record<string, unknown>[],
@@ -153,12 +167,8 @@ test('preflight uses the stamp config selected by setup for QAP hostname validat
   try {
     const selectedPath = '.temp/stamp-00000.yaml';
     await mkdir(path.join(f.root, '.temp'), { recursive: true });
-    await writeFile(path.join(f.root, selectedPath), stringify(defaultStampConfig({
-      AZURE_STAMP: '00000', AZURE_SUBSCRIPTION_ID: subscription, AZURE_LOCATION: 'canadacentral',
-    })));
-    await writeFile(path.join(f.root, 'infra/azure/stamp.yaml'), stringify(defaultStampConfig({
-      AZURE_STAMP: '00000', AZURE_SUBSCRIPTION_ID: subscription, AZURE_LOCATION: 'eastus2',
-    })));
+    await writeFile(path.join(f.root, selectedPath), stringify(testStampConfig('canadacentral')));
+    await writeFile(path.join(f.root, 'infra/azure/stamp.yaml'), stringify(testStampConfig('eastus2')));
     const report = await f.run(selectedPath);
     assert.equal(report.checks.find((entry) => entry.name.startsWith('Selected QAP'))!.ready, true);
     assert.equal(report.ready, true);
@@ -295,6 +305,33 @@ test('publisher identity and exact fixed federation remain mandatory', async () 
     f.state.commandFailure = '';
     f.state.credentials[0]!.subject = 'system:serviceaccount:wrong:wrong';
     assert.equal((await f.run()).checks.find((entry) => entry.name === 'Federated credential')!.ready, false);
+  } finally { await f.cleanup(); }
+});
+
+test('configured stamp publisher federation requires each exact name and trust tuple', async () => {
+  const f = await fixture();
+  try {
+    for (const expected of publisherCredentials) {
+      const index = f.state.credentials.findIndex((credential) => credential.name === expected.name);
+      assert.notEqual(index, -1);
+      const original = f.state.credentials[index]!;
+      for (const invalid of [
+        { ...original, name: `${expected.name}-wrong` },
+        { ...original, issuer: 'https://wrong.example.test/' },
+        { ...original, subject: 'repo:example/arrow-collector:environment:wrong' },
+        { ...original, audiences: [] },
+        { ...original, audiences: ['api://AzureADTokenExchange', 'extra'] },
+      ]) {
+        f.state.credentials[index] = invalid;
+        const report = await f.run();
+        assert.equal(report.checks.find((entry) => entry.name === 'Federated credential')!.ready, false);
+      }
+      f.state.credentials[index] = original;
+      f.state.credentials.splice(index, 1);
+      const report = await f.run();
+      assert.equal(report.checks.find((entry) => entry.name === 'Federated credential')!.ready, false);
+      f.state.credentials.splice(index, 0, original);
+    }
   } finally { await f.cleanup(); }
 });
 

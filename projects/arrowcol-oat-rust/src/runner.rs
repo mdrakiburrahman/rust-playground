@@ -6073,7 +6073,7 @@ mod tests {
     #[test]
     fn selected_aks_stamp_config_is_workspace_contained() -> Result<()> {
         let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let selected = resolve_aks_stamp_config_path(&workspace, Path::new("infra/azure/stamp.yaml"))?;
+        let selected = resolve_aks_stamp_config_path(&workspace, Path::new("infra/azure/stamp.example.yaml"))?;
         assert!(selected.starts_with(workspace.canonicalize()?));
         assert!(resolve_aks_stamp_config_path(&workspace, Path::new("../")).is_err());
         Ok(())
