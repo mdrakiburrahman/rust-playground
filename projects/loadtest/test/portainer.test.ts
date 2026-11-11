@@ -14,16 +14,12 @@ function passwordFile(t: { after: (callback: () => void) => void }, content: str
   return file;
 }
 
-test('portainer access prints URL, port, username and password', (t) => {
-  const line = portainerAccess('9443', passwordFile(t, 'Aa1!secret\n'));
+test('portainer startup access prints the credential file, never its contents', (t) => {
+  const file = passwordFile(t, 'synthetic-startup-secret-sentinel\n');
+  const line = portainerAccess('9443', file);
   assert.match(line, /https:\/\/localhost:9443 /u);
   assert.match(line, /port 9443,/u);
   assert.match(line, /username admin,/u);
-  assert.match(line, /password Aa1!secret;/u);
-});
-
-test('portainer password matches the seeded value with or without a trailing newline', (t) => {
-  const fake = 'fixture-value';
-  assert.match(portainerAccess('9444', passwordFile(t, fake)), new RegExp(`localhost:9444 .*password ${fake};`, 'u'));
-  assert.doesNotMatch(portainerAccess('9443', passwordFile(t, 'Aa1!secret\n')), /\n/u);
+  assert.ok(line.includes(`credential file ${file}`));
+  assert.doesNotMatch(line, /synthetic-startup-secret-sentinel/u);
 });
