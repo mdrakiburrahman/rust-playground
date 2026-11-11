@@ -7,7 +7,7 @@ import { connect as createTcpConnection } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   buildOwnedServer, cleanupLocalComposeProjects, finishOwnedLocalRun, launchOat, main, readOatConfigForMode,
   resolveCliConfigPath, resolveOatConfigPath, sendViewerFile,
@@ -21,6 +21,7 @@ const status = (state: 'queued' | 'running' | 'succeeded') => ({
 async function ownedBuildFixture(options: {
   dirty?: string; afterStatus?: string; afterSha?: string; noArtifact?: boolean;
   duplicateArtifact?: boolean; buildCode?: number;
+  rejectRun?: boolean;
 } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-owned-build-'));
   const executable = path.join(directory, 'built-server');
@@ -41,8 +42,12 @@ async function ownedBuildFixture(options: {
 const http = require('node:http');
 const address = process.argv[process.argv.indexOf('--listen') + 1];
 const [host, port] = address.split(':');
-http.createServer((_request, response) => {
+http.createServer((request, response) => {
   response.setHeader('content-type', 'application/json');
+  if (${options.rejectRun ?? false} && request.url === '/runs') {
+    response.writeHead(422).end(JSON.stringify({ error: 'invalid matrix fixture' }));
+    return;
+  }
   response.end(JSON.stringify({ status: 'ok', git_sha: process.env.GIT_SHA }));
 }).listen(Number(port), host);
 `, { mode: 0o700 });
@@ -106,6 +111,54 @@ test('changed source, failed builds and missing artifact metadata cannot start a
     } finally {
       await rm(fixture.directory, { recursive: true, force: true });
     }
+  }
+});
+
+test('executable help resolves its tsx loader outside the repository', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-cli-cwd-'));
+  try {
+    const output = execFileSync(process.execPath, [
+      fileURLToPath(new URL('./cli.mjs', import.meta.url)), '--help',
+    ], { cwd: directory, encoding: 'utf8', timeout: 15_000 });
+    assert.match(output, /Usage: arrowcol-oat/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('rejected local submissions exit without serving absent or stale results', { skip: process.platform !== 'linux' }, async (t) => {
+  for (const owned of [true, false]) {
+    await t.test(owned ? 'owned server' : 'external server', async () => {
+      const fixture = await ownedBuildFixture({ rejectRun: true });
+      const configPath = path.join(fixture.directory, 'config.json');
+      await writeFile(configPath, JSON.stringify({
+        platform: { kind: 'local', compose_state_root: path.join(fixture.directory, 'state') },
+        website_url: pathToFileURL(path.join(fixture.directory, 'missing.parquet')).href,
+      }));
+      const server = owned ? undefined : await startLocalServer(fixture.runner);
+      const previousExitCode = process.exitCode;
+      const log = console.log;
+      const lines: string[] = [];
+      console.log = (...values: unknown[]) => {
+        const line = values.map(String).join(' ');
+        lines.push(line);
+        if (line.startsWith('Local results viewer:')) {
+          setImmediate(() => process.emit('SIGTERM'));
+        }
+      };
+      try {
+        await main(['--mode', 'local', '--config', configPath,
+          ...(server ? ['--server', server.url] : [])], fixture.runner);
+        assert.equal(process.exitCode, 1);
+        assert.ok(lines.some((line) => line.includes('invalid matrix fixture')));
+        assert.equal(lines.some((line) => line.startsWith('Local results viewer:')), false);
+      } finally {
+        console.log = log;
+        process.exitCode = previousExitCode;
+        if (server) await stopLocalServer(server.child);
+        await rm(fixture.directory, { recursive: true, force: true });
+      }
+    });
   }
 });
 

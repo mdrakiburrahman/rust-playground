@@ -605,10 +605,12 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
   }
   if (requestedServerUrl) {
     const interrupt = mode === 'local' ? registerLocalInterrupts() : undefined;
+    let runSucceeded = false;
     try {
       try {
         const code = await reportDataFlowRun(
-          (progress) => launchOat(configPath, requestedServerUrl, pollValue, fetch, progress, mode, getDockerBridgeGateway, interrupt?.controller.signal),
+          (progress) => launchOat(configPath, requestedServerUrl, pollValue, fetch, progress, mode, getDockerBridgeGateway,
+            interrupt?.controller.signal, undefined, (status) => { runSucceeded = status.state === 'succeeded'; }),
           config, mode, undefined, runner, network, warnings,
         );
         if (interrupt?.signal) {
@@ -624,7 +626,7 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
     } finally {
       interrupt?.dispose();
     }
-    await maybeServeLocalViewer(configPath, mode);
+    if (runSucceeded) await maybeServeLocalViewer(configPath, mode);
     return;
   }
 
@@ -639,6 +641,7 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
   }
   let markerWritten = false;
   let runCleanupComplete = false;
+  let runSucceeded = false;
   const interrupt = mode === 'local' ? registerLocalInterrupts() : undefined;
   try {
     try {
@@ -648,6 +651,7 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
         markerWritten = true;
       } : undefined;
       const onRunFinished = (status: OatRunStatus): void => {
+        runSucceeded = status.state === 'succeeded';
         runCleanupComplete = status.state === 'succeeded' || status.state === 'cancelled';
       };
       const code = await reportDataFlowRun(
@@ -671,7 +675,7 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
         if (markerWritten && runCleanupComplete && markerContext) await unlink(markerContext.path);
       },
       interrupt,
-      () => maybeServeLocalViewer(configPath, mode),
+      async () => { if (runSucceeded) await maybeServeLocalViewer(configPath, mode); },
     );
   }
 }

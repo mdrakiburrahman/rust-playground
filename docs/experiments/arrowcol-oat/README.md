@@ -88,7 +88,7 @@ Run the local OAT from the repository root with `npx arrowcol-oat --config docs/
 
 ### CLI options and local cleanup
 
-Run `npx --no-install arrowcol-oat --help` for the supported options. Unknown options fail before startup with exit code 2. In local mode, SIGINT, SIGTERM and SIGHUP request cancellation and wait for the local Compose cleanup; a second signal forces a fast exit. If only the CLI process is killed, the next local run checks its ownership marker and asks the still-running OAT server to cancel and clean up.
+Run `npx --no-install arrowcol-oat --help` for the supported options. Unknown options fail before startup with exit code 2. Failed or rejected runs exit without opening the viewer; use `--viewer-only` to inspect any previously published results, including partial failure evidence. In local mode, SIGINT, SIGTERM and SIGHUP request cancellation and wait for the local Compose cleanup; a second signal forces a fast exit. If only the CLI process is killed, the next local run checks its ownership marker and asks the still-running OAT server to cancel and clean up.
 
 If the OAT server is no longer running, remove one abandoned local cell with `npx --no-install arrowcol-oat --cleanup-local <cell-run-uuid> --config <config-path>`. Get the cell UUID from its directory under `platform.compose_state_root`. This command is local-only and removes only that cell's Compose resources and state; it does not operate on AKS.
 
