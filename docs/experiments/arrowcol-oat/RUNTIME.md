@@ -4,12 +4,14 @@
 | --- | --- |
 | `arrowcol` Deployment / `dataflow` container | Integrated Flight receiver → Delta exporter. One or two replicas, each with `--num-cores 1` or `2`; constant CPU request/limit of 2. |
 | `arrowcol-router:50050` | ClusterIP only, h2c to private Flight `32010`, mandatory trusted-edge HMAC, SQL-serialized distinct table owners. Operator access by port-forward only. |
-| `arrowcol-catalog:8817` | Persistent 16Gi state PVC, same stamped dataflow warehouse as DFE, `--ingestion-layout`. |
+| `arrowcol-catalog:8817` | Persistent 16Gi state PVC, same stamped dataflow warehouse as DFE, `--ingestion-layout`; catalog Flight SQL DDL requires signed internal identity by default. |
 | `arrowcol-sql:1433` | Persistent 32Gi PVC; SQL2022 CU27, routing/fencing only. SA bootstrap then checksum-verified V1–V11 migrations; separate SA/app/migrator secrets. |
 | Namespace and scheduling | Configurable namespace, default example `arrowcol-oat`; benchmark node labels `type=benchmark`, amd64. No changes to the Azure QAP Job overlay or system node pools. |
 | Identity | Workload-identity-labeled catalog/DFE pods; optional `serviceAccount` defaults to `arrowcol-oat`. Stamp 89152 reuses namespace/service account `arrow-collector`. No Azure/GitHub CLI credential mounts. |
 
 OAT router configurations explicitly select `auth.authenticator: dev_only_allow_all`. Missing, legacy `allow_all` and unknown modes fail startup. Every non-public request still needs a valid edge HMAC; the shared development principal is not production caller authorization. Rebuild router and signing-client images together because `x-arrowcol-oat-run-id` is now signed, including its absence.
+
+Catalog Flight SQL and CES requests require signed internal identity by default. Each assertion binds the RPC method and payload digest, carries a one-time nonce, and expires within 30 seconds; the replay cache is bounded at 65,536 requests per catalog replica and rejects new requests when full. AKS catalog and dataflow pods mount the `internal-hmac` key from `arrowcol-router-auth` at `/run/auth/internal-hmac`; generated direct OAT client Jobs mount the same key at `/run/secrets/internal-hmac` and set `LOADTEST_INTERNAL_SECRET_FILE` to that path. `--ddl-auth-mode dev_only_allow_unsigned` bypasses catalog RPC identity checks and is for development only; do not use it in AKS. The separate data-plane Flight SQL service is unchanged. TLS/mTLS is deferred, no NetworkPolicy enforcement is assumed, and no QAP host allowlist is added.
 
 DFE explicitly enables generated ingestion partitions with
 `ARROWCOL_PARTITION_GRANULARITY=hour`. Existing committed partition layout and

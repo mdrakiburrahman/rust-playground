@@ -1,8 +1,9 @@
 use std::{sync::atomic::Ordering, time::Duration};
 
+use crate::{CatalogCesService, DdlIdentityPolicy, DdlIdentityVerifier};
 use arrow_flight::{flight_service_server::FlightServiceServer, sql::client::FlightSqlServiceClient};
 use arrowcol_catalog::{CatalogStore, SchemaAlignmentPlan, SchemaValidator};
-use arrowcol_catalog_client::{CatalogClient, RemoteCatalogClient};
+use arrowcol_catalog_client::{CatalogClient, InternalRequestSigner, RemoteCatalogClient};
 use arrowcol_protocol::{ClaimedSchemaFingerprint, fingerprint_schema};
 use futures::TryStreamExt;
 use rpc::schema_catalog_server::{SchemaCatalog, SchemaCatalogServer};
@@ -227,6 +228,176 @@ async fn commit_publication_crash_and_old_seed_do_not_rollback_delta() -> Result
 }
 
 #[tokio::test]
+async fn flight_sql_ddl_requires_signed_identity_before_mutating_catalog() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let service = CatalogService::open(config(root.path())).await?;
+    let fixture = include_str!("../../../loadtest/schemas/sqlserver.sql");
+    let ddl = fixture
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let ddl = ddl
+        .split(";")
+        .next()
+        .context("first schema statement")?
+        .trim()
+        .to_owned();
+    let verifier = DdlIdentityVerifier::from_secret(b"catalog-integration-key-at-least-32-bytes".to_vec())?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}", listener.local_addr()?);
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    let server_service = service.clone();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(FlightServiceServer::new(
+                server_service.flight_service_with_ddl_identity(DdlIdentityPolicy::require_signed(verifier)),
+            ))
+            .serve_with_incoming_shutdown(tokio_stream::wrappers::TcpListenerStream::new(listener), async {
+                let _ = stopped.await;
+            })
+            .await
+    });
+    let channel = tonic::transport::Endpoint::from_shared(endpoint)?.connect().await?;
+    let mut flight = arrow_flight::flight_service_client::FlightServiceClient::new(channel);
+    let command = CommandStatementUpdate {
+        query: ddl.clone(),
+        transaction_id: None,
+    };
+    let error = flight
+        .do_put(futures::stream::iter([arrow_flight::FlightData {
+            flight_descriptor: Some(FlightDescriptor {
+                r#type: arrow_flight::flight_descriptor::DescriptorType::Cmd as i32,
+                cmd: command.as_any().encode_to_vec().into(),
+                path: Vec::new(),
+            }),
+            ..arrow_flight::FlightData::default()
+        }]))
+        .await
+        .err()
+        .context("unsigned DDL must be rejected")?;
+    assert_eq!(error.code(), tonic::Code::Unauthenticated);
+    let identity = name_identity(&[
+        "telemetry".into(),
+        "sqlserver".into(),
+        "sqlserver_active_sessions".into(),
+    ])?;
+    assert!(service.store.current_schema(&identity).await?.is_none());
+    let signer = InternalRequestSigner::from_secret(b"catalog-integration-key-at-least-32-bytes".to_vec())?;
+    let command = CommandStatementUpdate {
+        query: ddl.clone(),
+        transaction_id: None,
+    };
+    let payload = command.as_any().encode_to_vec();
+    let mut tampered = tonic::Request::new(futures::stream::iter([arrow_flight::FlightData {
+        flight_descriptor: Some(FlightDescriptor {
+            r#type: arrow_flight::flight_descriptor::DescriptorType::Cmd as i32,
+            cmd: CommandStatementUpdate {
+                query: "DROP TABLE telemetry.sqlserver.sqlserver_active_sessions".to_owned(),
+                transaction_id: None,
+            }
+            .as_any()
+            .encode_to_vec()
+            .into(),
+            path: Vec::new(),
+        }),
+        ..arrow_flight::FlightData::default()
+    }]));
+    signer.sign_payload(&mut tampered, "/arrow.flight.protocol.FlightService/DoPut", &payload)?;
+    let error = flight
+        .do_put(tampered)
+        .await
+        .err()
+        .context("tampered DDL payload must be rejected")?;
+    assert_eq!(error.code(), tonic::Code::Unauthenticated);
+    assert!(service.store.current_schema(&identity).await?.is_none());
+
+    let mut rejected_request = tonic::Request::new(futures::stream::iter([arrow_flight::FlightData {
+        flight_descriptor: Some(FlightDescriptor {
+            r#type: arrow_flight::flight_descriptor::DescriptorType::Cmd as i32,
+            cmd: payload.clone().into(),
+            path: Vec::new(),
+        }),
+        ..arrow_flight::FlightData::default()
+    }]));
+    let wrong_signer =
+        InternalRequestSigner::from_secret(b"not-the-catalog-integration-key-at-least-32-bytes".to_vec())?;
+    wrong_signer.sign_payload(
+        &mut rejected_request,
+        "/arrow.flight.protocol.FlightService/DoPut",
+        &payload,
+    )?;
+    let error = flight
+        .do_put(rejected_request)
+        .await
+        .err()
+        .context("wrongly signed DDL must be rejected")?;
+    assert_eq!(error.code(), tonic::Code::Unauthenticated);
+    assert!(service.store.current_schema(&identity).await?.is_none());
+
+    let mut request = tonic::Request::new(futures::stream::iter([arrow_flight::FlightData {
+        flight_descriptor: Some(FlightDescriptor {
+            r#type: arrow_flight::flight_descriptor::DescriptorType::Cmd as i32,
+            cmd: payload.clone().into(),
+            path: Vec::new(),
+        }),
+        ..arrow_flight::FlightData::default()
+    }]));
+    signer.sign_payload(&mut request, "/arrow.flight.protocol.FlightService/DoPut", &payload)?;
+    let response = flight.do_put(request).await?;
+    assert_eq!(
+        arrowcol_flight::decode_ddl_completion_metadata(response.metadata())?.table(),
+        "sqlserver_active_sessions"
+    );
+    let mut results = response.into_inner();
+    assert!(results.message().await?.is_some());
+    assert!(service.store.current_schema(&identity).await?.is_some());
+    let _ = shutdown.send(());
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn catalog_ces_rejects_anonymous_reads_and_replayed_signed_reads() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let service = CatalogService::open(config(root.path())).await?;
+    let verifier = DdlIdentityVerifier::from_secret(b"catalog-integration-key-at-least-32-bytes".to_vec())?;
+    let ces = CatalogCesService::new(service, DdlIdentityPolicy::require_signed(verifier));
+
+    let anonymous = SchemaCatalog::get_snapshot(&ces, tonic::Request::new(rpc::Empty {}))
+        .await
+        .unwrap_err();
+    assert_eq!(anonymous.code(), tonic::Code::Unauthenticated);
+
+    let signer = InternalRequestSigner::from_secret(b"catalog-integration-key-at-least-32-bytes".to_vec())?;
+    let mut request = tonic::Request::new(rpc::Empty {});
+    signer.sign_message(&mut request, "/arrowcol.catalog.v1.SchemaCatalog/GetSnapshot")?;
+    let replay = request.metadata().clone();
+    SchemaCatalog::get_snapshot(&ces, request).await?;
+    let mut replayed = tonic::Request::new(rpc::Empty {});
+    *replayed.metadata_mut() = replay;
+    let error = SchemaCatalog::get_snapshot(&ces, replayed).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unauthenticated);
+    Ok(())
+}
+
+#[tokio::test]
+async fn catalog_flight_rejects_anonymous_metadata_reads() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let service = CatalogService::open(config(root.path())).await?;
+    let verifier = DdlIdentityVerifier::from_secret(b"catalog-integration-key-at-least-32-bytes".to_vec())?;
+    let flight = service.flight_service_with_ddl_identity(DdlIdentityPolicy::require_signed(verifier));
+    let error = arrow_flight::flight_service_server::FlightService::get_flight_info(
+        &flight,
+        tonic::Request::new(FlightDescriptor::default()),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unauthenticated);
+    Ok(())
+}
+
+#[tokio::test]
 async fn flight_sql_and_warm_cache_count_actual_catalog_calls() -> Result<()> {
     let root = tempfile::tempdir()?;
     let service = CatalogService::open(config(root.path())).await?;
@@ -236,7 +407,9 @@ async fn flight_sql_and_warm_cache_count_actual_catalog_calls() -> Result<()> {
     let server_service = service.clone();
     let server = tokio::spawn(async move {
         tonic::transport::Server::builder()
-            .add_service(FlightServiceServer::new(server_service.flight_service()))
+            .add_service(FlightServiceServer::new(
+                server_service.flight_service_with_ddl_identity(DdlIdentityPolicy::dev_only_allow_unsigned()),
+            ))
             .add_service(SchemaCatalogServer::new(server_service))
             .serve_with_incoming_shutdown(tokio_stream::wrappers::TcpListenerStream::new(listener), async {
                 let _ = stopped.await;
@@ -297,7 +470,12 @@ async fn flight_sql_and_warm_cache_count_actual_catalog_calls() -> Result<()> {
             .await
             .is_err()
     );
-    let client = RemoteCatalogClient::connect(&endpoint, Duration::from_millis(250)).await?;
+    let client = RemoteCatalogClient::connect_with_signer(
+        &endpoint,
+        Duration::from_millis(250),
+        InternalRequestSigner::from_secret(b"catalog-integration-key-at-least-32-bytes".to_vec())?,
+    )
+    .await?;
     let identity = name_identity(&["arrowcol".into(), "default".into(), "events".into()])?;
     tokio::time::sleep(Duration::from_millis(50)).await;
     let baseline = client.metrics().catalog_calls;
@@ -390,7 +568,9 @@ async fn flight_sql_and_warm_cache_count_actual_catalog_calls() -> Result<()> {
     let server_service = restarted.clone();
     let server = tokio::spawn(async move {
         tonic::transport::Server::builder()
-            .add_service(FlightServiceServer::new(server_service.flight_service()))
+            .add_service(FlightServiceServer::new(
+                server_service.flight_service_with_ddl_identity(DdlIdentityPolicy::dev_only_allow_unsigned()),
+            ))
             .add_service(SchemaCatalogServer::new(server_service))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await

@@ -973,6 +973,61 @@ impl rpc::schema_catalog_server::SchemaCatalog for CatalogService {
     }
 }
 
+/// CES endpoint that requires signed identity metadata for every read.
+#[derive(Clone)]
+pub struct CatalogCesService {
+    inner: CatalogService,
+    identity_policy: crate::DdlIdentityPolicy,
+}
+
+impl CatalogCesService {
+    /// Creates an authenticated CES service over the catalog state.
+    #[must_use]
+    pub fn new(inner: CatalogService, identity_policy: crate::DdlIdentityPolicy) -> Self {
+        Self { inner, identity_policy }
+    }
+
+    fn authorize<T: Message>(&self, request: Request<T>, method: &str) -> Result<Request<T>, Status> {
+        self.identity_policy.verify_request(
+            request.metadata(),
+            method,
+            &request.get_ref().encode_to_vec(),
+            crate::identity::now_unix_millis(),
+        )?;
+        Ok(request)
+    }
+}
+
+#[async_trait]
+impl rpc::schema_catalog_server::SchemaCatalog for CatalogCesService {
+    type WatchStream = EventStream;
+
+    async fn get_current_event_id(&self, request: Request<rpc::Empty>) -> Result<Response<rpc::EventPosition>, Status> {
+        let request = self.authorize(request, "/arrowcol.catalog.v1.SchemaCatalog/GetCurrentEventId")?;
+        rpc::schema_catalog_server::SchemaCatalog::get_current_event_id(&self.inner, request).await
+    }
+
+    async fn get_events(&self, request: Request<rpc::EventsRequest>) -> Result<Response<rpc::EventsResponse>, Status> {
+        let request = self.authorize(request, "/arrowcol.catalog.v1.SchemaCatalog/GetEvents")?;
+        rpc::schema_catalog_server::SchemaCatalog::get_events(&self.inner, request).await
+    }
+
+    async fn watch(&self, request: Request<rpc::EventsRequest>) -> Result<Response<Self::WatchStream>, Status> {
+        let request = self.authorize(request, "/arrowcol.catalog.v1.SchemaCatalog/Watch")?;
+        rpc::schema_catalog_server::SchemaCatalog::watch(&self.inner, request).await
+    }
+
+    async fn get_table(&self, request: Request<rpc::TableRequest>) -> Result<Response<rpc::TableSnapshot>, Status> {
+        let request = self.authorize(request, "/arrowcol.catalog.v1.SchemaCatalog/GetTable")?;
+        rpc::schema_catalog_server::SchemaCatalog::get_table(&self.inner, request).await
+    }
+
+    async fn get_snapshot(&self, request: Request<rpc::Empty>) -> Result<Response<rpc::CatalogSnapshot>, Status> {
+        let request = self.authorize(request, "/arrowcol.catalog.v1.SchemaCatalog/GetSnapshot")?;
+        rpc::schema_catalog_server::SchemaCatalog::get_snapshot(&self.inner, request).await
+    }
+}
+
 fn checked_from(state: &State, from: Option<rpc::EventPosition>) -> Result<u64, Status> {
     let from = from.ok_or_else(|| Status::invalid_argument("CES requires an epoch/event_id snapshot position"))?;
     let oldest = state

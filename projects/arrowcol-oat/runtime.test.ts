@@ -45,6 +45,11 @@ test('isolated integrated topology pins images, WI, identity, probes and pooled 
   assert.equal(container.env.find((e: any) => e.name === 'ARROWCOL_RESET_GENERATION').valueFrom.secretKeyRef.name, 'arrowcol-generation');
   assert.equal(container.env.find((e: any) => e.name === 'ARROWCOL_PARTITION_GRANULARITY').value, 'hour');
   assert.equal(container.readinessProbe.httpGet.port, 32011);
+  assert.equal(container.env.find((e: any) => e.name === 'ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE').value, '/run/auth/internal-hmac');
+  assert.ok(dfe.spec.template.spec.containers[0].volumeMounts.some((mount: any) =>
+    mount.name === 'auth' && mount.mountPath === '/run/auth' && mount.readOnly));
+  assert.ok(dfe.spec.template.spec.volumes.some((volume: any) =>
+    volume.name === 'auth' && volume.secret.secretName === 'arrowcol-router-auth'));
   const configs = get('ConfigMap', 'arrowcol-config').data;
   const engine = parse(configs['dataflow.yaml']);
   assert.equal(engine.policies.resources, undefined);
@@ -60,7 +65,22 @@ test('isolated integrated topology pins images, WI, identity, probes and pooled 
   assert.equal(router.routing.lease_ttl_ms, 3_600_000);
   assert.equal(router.auth.edge_secret_file, '/run/auth/edge-hmac');
   assert.equal(objects.some((o) => o.kind === 'Ingress' || o.spec?.type === 'LoadBalancer'), false);
-  assert.equal(get('Deployment', 'arrowcol-catalog').spec.template.spec.containers[0].args.at(-1), '--ingestion-layout');
+  const catalog = get('Deployment', 'arrowcol-catalog').spec.template.spec;
+  assert.ok(catalog.containers[0].args.includes('--ingestion-layout'));
+  assert.deepEqual(catalog.containers[0].args.slice(-2), ['--ddl-identity-secret-file', '/run/auth/internal-hmac']);
+  assert.equal(
+    catalog.containers[0].env.find((e: any) => e.name === 'ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE').value,
+    '/run/auth/internal-hmac',
+  );
+  assert.ok(catalog.containers[0].volumeMounts.some((mount: any) =>
+    mount.name === 'auth' && mount.mountPath === '/run/auth' && mount.readOnly));
+  assert.ok(catalog.volumes.some((volume: any) =>
+    volume.name === 'auth' && volume.secret.secretName === 'arrowcol-router-auth'));
+  const catalogIngress = get('NetworkPolicy', 'catalog-internal').spec.ingress;
+  assert.deepEqual(catalogIngress[0].from, [
+    { podSelector: { matchLabels: { app: 'arrowcol' } } },
+    { podSelector: { matchLabels: { app: 'arrowcol-oat-client' } } },
+  ]);
   const rules = get('NetworkPolicy', 'flight-router-only').spec.ingress;
   assert.deepEqual(rules[0].from, [{ podSelector: { matchLabels: { app: 'arrowcol-router' } } }]);
   const clientIngress = get('NetworkPolicy', 'router-oat-client-ingress').spec.ingress;

@@ -89,8 +89,10 @@ async function main(): Promise<void> {
   for (let i = 0; i < 2; i++) docker([...bootstrap, '-e', 'ARROWCOL_MIGRATOR_PASSWORD_FILE=/run/oat/migration-password',
     '--entrypoint', '/usr/local/bin/arrowcol-migrate', images.sql]);
   const catalog = `${prefix}-catalog`;
-  const startCatalog = () => run(catalog, ['-v', `${volumes[1]}:/data`, '-v', `${volumes[2]}:/onelake`], images.catalog,
-    ['--warehouse-root', '/onelake/dataflow', '--ingestion-layout']);
+  const startCatalog = () => run(catalog, ['-v', `${volumes[0]}:/run/oat:ro`, '-v', `${volumes[1]}:/data`,
+    '-v', `${volumes[2]}:/onelake`], images.catalog,
+  ['--warehouse-root', '/onelake/dataflow', '--ingestion-layout',
+    '--ddl-identity-secret-file', '/run/oat/internal-hmac']);
   startCatalog();
   await waitReady(catalog, ['/usr/local/bin/arrowcol-catalog-rust', '--healthcheck']);
   const routerName = `${prefix}-router`;
@@ -122,7 +124,8 @@ async function main(): Promise<void> {
       await waitReady(routerName, http(50050, '/readyz'));
       await sleep(32_000);
       for (const table of tables.slice(0, replicas)) {
-        const args = ['run', '--rm', '--network', network, ...secretMount, images.client,
+        const args = ['run', '--rm', '--network', network, ...secretMount,
+          '-e', 'LOADTEST_INTERNAL_SECRET_FILE=/run/oat/internal-hmac', images.client,
           '--endpoint', `http://${routerName}:50050`, '--table', table, '--rows', '100', '--concurrency', '4'];
         const unsigned = spawnSync('docker', args, { encoding: 'utf8' });
         assert.notEqual(unsigned.status, 0, 'router must reject unsigned requests');
