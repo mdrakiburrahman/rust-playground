@@ -91,7 +91,7 @@ fn default_client_ready_timeout_seconds() -> u64 {
     600
 }
 
-pub(crate) const SCHEDULE_DELIVERY_TIMEOUT_SECONDS: u64 = 60;
+pub(crate) const SCHEDULE_DELIVERY_TIMEOUT_SECONDS: u64 = 180;
 pub(crate) const PIN_INIT_SETUP_TIMEOUT_SECONDS: u64 = 180;
 const CLIENT_JOB_CLEANUP_GRACE_SECONDS: u64 = 300;
 
@@ -669,7 +669,7 @@ mod tests {
         config.qap_timeout_seconds = 300;
         config.warmup_seconds = 300;
         config.measure_seconds = 600;
-        config.run_pin_ttl_ms = 3_540_000;
+        config.run_pin_ttl_ms = 3_660_000;
         config.validate()?;
 
         config.run_pin_ttl_ms -= 1;

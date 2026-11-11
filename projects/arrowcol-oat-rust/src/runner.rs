@@ -6498,7 +6498,7 @@ mod tests {
             .saturating_sub(first_client_ready_at)
             .saturating_add(qap_preparation_seconds)
             .saturating_add(final_schedule_delivery_seconds);
-        assert_eq!(budget.schedule_wait_seconds, 120);
+        assert_eq!(budget.schedule_wait_seconds, 240);
         assert!(
             earliest_client_schedule_wait <= budget.schedule_wait_seconds,
             "a client that became ready early must remain alive through readiness, QAP, and final delivery"
