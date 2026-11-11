@@ -24,7 +24,7 @@ const imageBuilds = [
   ['catalog', 'projects/arrowcol-catalog-rust/Dockerfile', '.'],
   ['router', 'projects/arrowcol-router-rust/Dockerfile', '.'],
   ['dataflow', 'projects/arrowcol-dataflow-rust/Dockerfile', '.'],
-  ['client', 'projects/arrowcol-oat/Dockerfile', '.'],
+  ['client', 'projects/arrowcol-oat-rust/Dockerfile.client', '.'],
 ] as const;
 
 export class MissingPublishedImagesError extends Error {

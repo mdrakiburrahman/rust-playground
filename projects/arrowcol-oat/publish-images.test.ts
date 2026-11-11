@@ -225,6 +225,8 @@ test('builds all five local images for linux/amd64 with the full revision label'
     'arrowcol-oat/sqlserver:local', 'arrowcol-oat/catalog:local', 'arrowcol-oat/router:local',
     'arrowcol-oat/dataflow:local', 'arrowcol-oat/client:local',
   ]);
+  const clientBuild = calls.find(c => c.includes('arrowcol-oat/client:local'))!;
+  assert.equal(clientBuild[clientBuild.indexOf('--file') + 1], 'projects/arrowcol-oat-rust/Dockerfile.client');
   calls.length = 0;
   await assert.rejects(buildLocalImages({ revision: 'abc' }, runner), /full 40-character/);
   assert.equal(calls.length, 0);
