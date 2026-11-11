@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { lstat, readFile } from 'node:fs/promises';
-import { isAbsolute, resolve } from 'node:path';
+import { isAbsolute, relative, resolve, sep } from 'node:path';
 import { loadStampConfig } from '../../infra/azure/stamp.js';
 import { validateRuntime, type RuntimeConfig } from './runtime.js';
 
@@ -182,7 +182,16 @@ export async function runAksPreflight(configPath: string, options: PreflightOpti
     bootstrap = await privateText(resolve(root, requireValue(text(platform.bootstrap_env_file), 'bootstrap_env_file')));
   } catch { /* The independent runtime gate reports unavailable private bootstrap state. */ }
   let selectedStamp: ReturnType<typeof loadStampConfig> | undefined;
-  try { selectedStamp = loadStampConfig(resolve(root, 'infra/azure/stamp.yaml')); } catch { /* Gate 1 reports it. */ }
+  try {
+    const stampConfigFile = text(platform.stamp_config_file) ?? 'infra/azure/stamp.yaml';
+    const stampConfigPath = resolve(root, stampConfigFile);
+    const relativeStampConfigPath = relative(root, stampConfigPath);
+    if (isAbsolute(stampConfigFile) || relativeStampConfigPath === '..' ||
+        relativeStampConfigPath.split(sep)[0] === '..' || isAbsolute(relativeStampConfigPath)) {
+      throw new Error('Stamp config file must be within the workspace.');
+    }
+    selectedStamp = loadStampConfig(stampConfigPath);
+  } catch { /* Gate 1 reports it. */ }
   const subscription = runtime?.subscriptionId ?? environment.AZURE_SUBSCRIPTION_ID ?? selectedStamp?.subscription;
   const clientId = runtime?.workloadIdentityClientId ?? environment.AZURE_CLIENT_ID;
   const clusterName = stamp && /^\d{5}$/.test(stamp) ? `arrow-collector-${stamp}` : undefined;

@@ -276,7 +276,7 @@ export async function setup(
   const oatTemplate = JSON.parse(await readFile(resolve(ROOT,
     'docs/experiments/arrowcol-oat/oat-config.aks.quick.json'), 'utf8')) as Record<string, unknown>;
   const files = await generatePrivateInputs({ directory, runtime, bootstrapValues, resetGeneration: generation,
-    tenantId, assertion, clientImage, qapEndpoint: config.uri, oatTemplate });
+    tenantId, assertion, clientImage, qapEndpoint: config.uri, stampConfigFile: relative(ROOT, stampConfigPath), oatTemplate });
   let preflightReady = false;
   if (!options.skipPreflight) {
     for (let attempt = 1; attempt <= 3; attempt++) {

@@ -1,6 +1,6 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { chmod, lstat, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
-import { dirname, resolve } from 'node:path';
+import { dirname, isAbsolute, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parse, stringify } from 'yaml';
 
@@ -279,6 +279,7 @@ export interface PrivateInputs {
   assertion: string;
   clientImage: string;
   qapEndpoint: string;
+  stampConfigFile: string;
   oatTemplate: Record<string, unknown>;
 }
 
@@ -310,6 +311,10 @@ export async function generatePrivateInputs(input: PrivateInputs): Promise<{
   const platform = input.oatTemplate.platform;
   if (!platform || typeof platform !== 'object' || Array.isArray(platform) ||
       (platform as Record<string, unknown>).kind !== 'aks') throw new Error('Expected the committed AKS OAT template.');
+  if (!input.stampConfigFile || isAbsolute(input.stampConfigFile) ||
+      input.stampConfigFile.split(/[\\/]/).includes('..')) {
+    throw new Error('Stamp config file must be a workspace-relative path.');
+  }
   const endpoint = new URL(input.qapEndpoint);
   if (endpoint.protocol !== 'https:' || !endpoint.hostname.startsWith(`arrow-collector-${runtime.stamp}.`) ||
       !endpoint.hostname.endsWith('.kusto.windows.net') || endpoint.username || endpoint.password ||
@@ -361,7 +366,8 @@ export async function generatePrivateInputs(input: PrivateInputs): Promise<{
   const account = `arrowcollector${runtime.stamp}`;
   await writePrivateFile(aksConfigPath, `${JSON.stringify({
     ...input.oatTemplate,
-    platform: { ...platform, runtime_config_file: runtimeConfigPath, bootstrap_env_file: bootstrapEnvPath },
+    platform: { ...platform, runtime_config_file: runtimeConfigPath, bootstrap_env_file: bootstrapEnvPath,
+      stamp_config_file: input.stampConfigFile },
     stamp: runtime.stamp, kubectl_context: `arrow-collector-${runtime.stamp}`,
     qap_endpoint: input.qapEndpoint, qap_database: qapDatabase, dmv_client_image: input.clientImage,
     result_url: `abfss://experiments@${account}.dfs.core.windows.net/arrowcol-oat/results.parquet`,
