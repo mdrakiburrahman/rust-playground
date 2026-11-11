@@ -56,10 +56,13 @@ before the first package update so subsequent Features inherit it:
 
 | Setting | Source-build policy |
 | --- | --- |
-| Official Ubuntu archive/security sources | HTTPS; other repositories unchanged |
+| Ubuntu archive/security transport | Linux Kernel Archives HTTPS mirror; other repositories unchanged |
 | Transport retries | Two retries |
 | HTTP/HTTPS inactivity timeout | 30 seconds, not a whole-build deadline |
 | Index update errors | Any failed index makes the update fail |
 
-This bounds transport failures; it does not repair inconsistent upstream indexes.
+The mirror changes transport only; packages and indexes still require the
+existing Ubuntu archive trust keys. This avoids the demonstrated Ubuntu-host
+DNS failure without overriding DNS. It does not repair inconsistent upstream
+indexes or add freshness guarantees beyond normal APT verification.
 The CI environment build still has its existing 30-minute deadline.

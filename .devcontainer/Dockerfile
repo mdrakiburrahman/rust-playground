@@ -11,7 +11,7 @@ RUN printf '%s\n' \
         'APT::Update::Error-Mode "any";' \
         > /etc/apt/apt.conf.d/99-rust-playground-transport \
     && find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) \
-        -exec sed -i -E 's#http://(archive|security)\.ubuntu\.com/ubuntu([/[:space:]]|$)#https://\1.ubuntu.com/ubuntu\2#g' {} + \
+        -exec sed -i -E 's#http://(archive|security)\.ubuntu\.com/ubuntu([/[:space:]]|$)#https://mirrors.edge.kernel.org/ubuntu\2#g' {} + \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential \
