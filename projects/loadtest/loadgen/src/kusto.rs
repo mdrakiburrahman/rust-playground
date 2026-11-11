@@ -2742,8 +2742,11 @@ mod tests {
         let endpoint = format!("http://{}", listener.local_addr()?);
         let server = thread::spawn(move || -> Result<()> {
             let (mut stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
             let mut request = [0; 1024];
-            let _ = stream.read(&mut request)?;
+            if stream.read(&mut request)? == 0 {
+                return Ok(());
+            }
             thread::sleep(Duration::from_millis(100));
             let body =
                 "arrowcol_flight_active_streams 0\narrowcol_dfe_buffered_batches 0\narrowcol_delta_pending_commits 0\n";
@@ -2755,7 +2758,9 @@ mod tests {
             Ok(())
         });
 
-        let result = settle_dataflow(&[endpoint], Duration::from_millis(30), false).await;
+        let result = settle_dataflow(std::slice::from_ref(&endpoint), Duration::from_millis(30), false).await;
+        // Wake accept if the deadline expired before opening a connection.
+        drop(TcpStream::connect(endpoint.trim_start_matches("http://")));
         match server.join() {
             Ok(result) => result?,
             Err(_) => bail!("metrics server thread panicked"),
