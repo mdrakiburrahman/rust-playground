@@ -46,7 +46,8 @@ async function fixture(t: test.TestContext, stamp = '00000') {
 function fake(options: {
   output?: string;
   clusters?: string[]; state?: string; preflightFailures?: number; fail?: string;
-  missingImages?: boolean; olderTags?: boolean; registryAbsent?: boolean; badProvenance?: boolean; badDigest?: boolean; alreadyHardened?: boolean; unsupportedDisableFlag?: boolean;
+  missingImages?: boolean; olderTags?: boolean; registryAbsent?: boolean; badProvenance?: boolean; badDigest?: boolean;
+  alreadyHardened?: boolean; unsupportedDisableFlag?: boolean; nullExecEnv?: boolean;
 } = {}) {
   const calls: string[][] = [];
   let preflights = 0;
@@ -66,7 +67,7 @@ function fake(options: {
           contexts: [{ context: { user: 'cluster-user' } }],
           users: [{ name: 'cluster-user', user: { exec: {
             command: 'kubelogin', apiVersion: 'client.authentication.k8s.io/v1beta1', args: kubeArgs,
-            env: [{ name: 'KUBELOGIN_TEST', value: 'preserved' }], interactiveMode: 'IfAvailable',
+            env: options.nullExecEnv ? null : [{ name: 'KUBELOGIN_TEST', value: 'preserved' }], interactiveMode: 'IfAvailable',
             provideClusterInfo: false, installHint: 'preserved',
           } } }],
         });
@@ -226,6 +227,12 @@ test('setup verifies kubelogin support and avoids duplicating the hardening argu
   const existing = fake({ output: options.output, alreadyHardened: true });
   await setup({ ...options, skipImages: true, skipPreflight: true }, existing.runner);
   assert.equal(existing.calls.filter(c => c[0] === 'kubectl' && c.includes('set-credentials')).length, 0);
+
+  const nullEnvOptions = await fixture(t);
+  const nullEnv = fake({ output: nullEnvOptions.output, nullExecEnv: true });
+  await setup({ ...nullEnvOptions, skipImages: true, skipPreflight: true }, nullEnv.runner);
+  assert.equal(nullEnv.calls.filter(c => c[0] === 'kubectl' && c.includes('set-credentials')).length, 1);
+  assert.ok(!nullEnv.calls.find(c => c[0] === 'kubectl' && c.includes('set-credentials'))?.some(arg => arg.startsWith('--exec-env=')));
 
   const unsupported = fake({ output: options.output, unsupportedDisableFlag: true });
   await assert.rejects(setup({ ...options, skipImages: true, skipPreflight: true }, unsupported.runner),

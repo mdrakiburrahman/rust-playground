@@ -162,7 +162,7 @@ export async function setup(
     throw new Error('AKS kubeconfig has an invalid kubelogin cluster-info setting.');
   }
   const rawExecEnv = exec.env;
-  if (rawExecEnv !== undefined && !Array.isArray(rawExecEnv)) {
+  if (rawExecEnv !== undefined && rawExecEnv !== null && !Array.isArray(rawExecEnv)) {
     throw new Error('AKS kubeconfig has invalid kubelogin environment settings.');
   }
   const execEnv: Array<{ name: string; value: string }> = [];
