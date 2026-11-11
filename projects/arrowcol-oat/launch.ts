@@ -151,7 +151,7 @@ export async function cleanupLocalComposeProjects(
   }
   const platform = isRecord(config.platform) ? config.platform : {};
   if (typeof platform.compose_state_root === 'string') {
-    const stateRoot = resolve(platform.compose_state_root);
+    const stateRoot = localStateRoot(config);
     for (const project of projects) {
       const matches = (await readdir(stateRoot, { withFileTypes: true }).catch((error: unknown) => {
         if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return [];
@@ -188,7 +188,7 @@ function localStateRoot(config: Record<string, unknown>): string {
   if (typeof platform.compose_state_root !== 'string' || !platform.compose_state_root) {
     throw new Error('Local Compose state root is missing from config');
   }
-  return resolve(platform.compose_state_root);
+  return resolve(workspaceRoot, platform.compose_state_root);
 }
 
 async function processStartTicks(pid: number): Promise<string | undefined> {

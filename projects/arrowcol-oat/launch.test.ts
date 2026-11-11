@@ -501,6 +501,44 @@ test('local cleanup removes only the Compose project derived from the supplied c
 });
 
 
+test('local recovery and cleanup resolve relative state beside the owned server, not the caller cwd', { skip: process.platform !== 'linux' }, async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-recovery-cwd-'));
+  const workspace = fileURLToPath(new URL('../..', import.meta.url));
+  const runId = '123e4567-e89b-42d3-a456-426614174000';
+  const stateRoot = path.join(directory, 'state');
+  const cellState = path.join(stateRoot, runId);
+  const markerPath = path.join(stateRoot, '.arrowcol-oat-owner-2147483647.json');
+  const configPath = path.join(directory, 'config.json');
+  const config = {
+    platform: {
+      kind: 'local', compose_project: 'oat-recovery-test',
+      compose_state_root: path.relative(workspace, stateRoot),
+    },
+  };
+  await mkdir(cellState, { recursive: true });
+  await writeFile(configPath, JSON.stringify(config));
+  await writeFile(markerPath, JSON.stringify({
+    version: 1, runId, ownerPid: 2147483647, ownerStartTicks: '0',
+    serverPid: 2147483647, serverStartTicks: '0',
+    serverUrl: 'http://127.0.0.1:12345', serverExecutable: process.execPath,
+  }));
+  const cwd = process.cwd();
+  const callerDirectory = path.join(directory, 'caller', 'nested');
+  await mkdir(callerDirectory, { recursive: true });
+  process.chdir(callerDirectory);
+  try {
+    const runner = async () => { throw new Error('startup must remain blocked'); };
+    await assert.rejects(main(['--config', configPath], runner), /Interrupted OAT server is gone/);
+    await main(['--config', configPath, '--cleanup-local', runId], runner,
+      (value, id) => cleanupLocalComposeProjects(value, id, () => ''));
+    await assert.rejects(stat(cellState), { code: 'ENOENT' });
+    await assert.rejects(stat(markerPath), { code: 'ENOENT' });
+  } finally {
+    process.chdir(cwd);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('local interruption requests cancellation and waits for the server to finish cleanup', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-cancel-'));
   const configPath = path.join(directory, 'oat.json');
