@@ -92,7 +92,10 @@ function fake(options: {
     }
     else if (text.startsWith('az storage blob upload')) {
       assert.equal(command[command.indexOf('--container-name') + 1], '$web');
-      assert.equal(command[command.indexOf('--name') + 1], 'index.html');
+      const name = command[command.indexOf('--name') + 1];
+      assert.ok(name === 'index.html' || name === 'architecture.svg');
+      assert.equal(command[command.indexOf('--content-type') + 1],
+        name === 'index.html' ? 'text/html; charset=utf-8' : 'image/svg+xml');
       assert.equal(command[command.indexOf('--auth-mode') + 1], 'login');
       assert.equal(command[command.indexOf('--subscription') + 1], subscription);
     } else if (text.startsWith('az storage container show')) stdout = JSON.stringify({
@@ -184,8 +187,9 @@ test('setup safely repairs YAML, reuses published images, refreshes private inpu
   assert.equal(result.stamp, '89152');
   assert.equal(result.preflightReady, true);
   assert.equal(Object.keys(result.images).length, 5);
-  assert.ok(m.calls.some(command => command[0] === 'az' && command[1] === 'storage' && command[2] === 'blob' &&
-    command[3] === 'upload' && command[command.indexOf('--name') + 1] === 'index.html'));
+  const viewerAssets = m.calls.filter(command => command[0] === 'az' && command[1] === 'storage' &&
+    command[2] === 'blob' && command[3] === 'upload').map(command => command[command.indexOf('--name') + 1]).sort();
+  assert.deepEqual(viewerAssets, ['architecture.svg', 'index.html']);
   assert.equal(m.calls.filter(c => c.includes('--preflight-only')).length, 2);
   const yaml = await readFile(options.stampConfig, 'utf8');
   assert.match(yaml, /^# Preserve operator settings/);

@@ -257,19 +257,23 @@ test('publishes the static viewer to the stamped root website through the federa
   await assert.rejects(publishViewer({ ...options, federated: false }, m.runner), /requires --federated/);
   assert.equal(m.calls.length, 0);
   await publishViewer(options, m.runner);
-  const upload = m.calls.find(command =>
+  const uploads = m.calls.filter(command =>
     command[0] === 'az' && command[1] === 'storage' && command[2] === 'blob' && command[3] === 'upload');
-  assert.ok(upload);
-  const argument = (name: string) => upload[upload.indexOf(name) + 1];
-  assert.equal(argument('--account-name'), options.registry);
-  assert.equal(argument('--container-name'), '$web');
-  assert.equal(argument('--name'), 'index.html');
-  assert.equal(argument('--file'), path.join(ROOT, 'docs/experiments/arrowcol-oat/index.html'));
-  assert.equal(argument('--auth-mode'), 'login');
-  assert.equal(argument('--overwrite'), 'true');
-  assert.equal(argument('--content-type'), 'text/html; charset=utf-8');
-  assert.equal(argument('--content-cache-control'), 'no-cache');
-  assert.equal(argument('--subscription'), subscription);
+  assert.equal(uploads.length, 2);
+  const argument = (command: string[], name: string) => command[command.indexOf(name) + 1];
+  assert.deepEqual(uploads.map(command => [argument(command, '--name'), argument(command, '--content-type'),
+    argument(command, '--file')]).sort((a, b) => a[0].localeCompare(b[0])), [
+    ['architecture.svg', 'image/svg+xml', path.join(ROOT, 'docs/experiments/arrowcol-oat/architecture.svg')],
+    ['index.html', 'text/html; charset=utf-8', path.join(ROOT, 'docs/experiments/arrowcol-oat/index.html')],
+  ]);
+  for (const upload of uploads) {
+    assert.equal(argument(upload, '--account-name'), options.registry);
+    assert.equal(argument(upload, '--container-name'), '$web');
+    assert.equal(argument(upload, '--auth-mode'), 'login');
+    assert.equal(argument(upload, '--overwrite'), 'true');
+    assert.equal(argument(upload, '--content-cache-control'), 'no-cache');
+    assert.equal(argument(upload, '--subscription'), subscription);
+  }
   assert.ok(!m.calls.some(command => command[0] === 'docker'));
   assert.equal(fs.existsSync(m.cache()), false);
 });
