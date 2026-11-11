@@ -333,13 +333,11 @@ mod tests {
         let verifier = DdlIdentityVerifier::from_secret(KEY.to_vec())?;
 
         assert_eq!(verifier.verify_request(&metadata, METHOD, PAYLOAD, now)?, expected);
-        assert_eq!(
-            verifier
-                .verify_request(&metadata, METHOD, PAYLOAD, now)
-                .unwrap_err()
-                .code(),
-            tonic::Code::Unauthenticated
-        );
+        let replay_error = verifier
+            .verify_request(&metadata, METHOD, PAYLOAD, now)
+            .err()
+            .context("replayed signed request must be rejected")?;
+        assert_eq!(replay_error.code(), tonic::Code::Unauthenticated);
         Ok(())
     }
 
@@ -423,7 +421,10 @@ mod tests {
             "6123456789abcdef0123456789abcdef",
         )?;
         verifier.verify_request(&later_request, METHOD, PAYLOAD, 1_100)?;
-        let replay = verifier.replay.lock().expect("test replay mutex");
+        let replay = verifier
+            .replay
+            .lock()
+            .map_err(|_| anyhow::anyhow!("test replay mutex poisoned"))?;
         assert!(replay.nonces.contains_key("4123456789abcdef0123456789abcdef"));
         assert!(!replay.nonces.contains_key("5123456789abcdef0123456789abcdef"));
         Ok(())

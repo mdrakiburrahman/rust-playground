@@ -366,7 +366,8 @@ async fn catalog_ces_rejects_anonymous_reads_and_replayed_signed_reads() -> Resu
 
     let anonymous = SchemaCatalog::get_snapshot(&ces, tonic::Request::new(rpc::Empty {}))
         .await
-        .unwrap_err();
+        .err()
+        .context("anonymous catalog read must be rejected")?;
     assert_eq!(anonymous.code(), tonic::Code::Unauthenticated);
 
     let signer = InternalRequestSigner::from_secret(b"catalog-integration-key-at-least-32-bytes".to_vec())?;
@@ -376,7 +377,10 @@ async fn catalog_ces_rejects_anonymous_reads_and_replayed_signed_reads() -> Resu
     SchemaCatalog::get_snapshot(&ces, request).await?;
     let mut replayed = tonic::Request::new(rpc::Empty {});
     *replayed.metadata_mut() = replay;
-    let error = SchemaCatalog::get_snapshot(&ces, replayed).await.unwrap_err();
+    let error = SchemaCatalog::get_snapshot(&ces, replayed)
+        .await
+        .err()
+        .context("replayed catalog read must be rejected")?;
     assert_eq!(error.code(), tonic::Code::Unauthenticated);
     Ok(())
 }
@@ -392,7 +396,8 @@ async fn catalog_flight_rejects_anonymous_metadata_reads() -> Result<()> {
         tonic::Request::new(FlightDescriptor::default()),
     )
     .await
-    .unwrap_err();
+    .err()
+    .context("anonymous Flight metadata read must be rejected")?;
     assert_eq!(error.code(), tonic::Code::Unauthenticated);
     Ok(())
 }
