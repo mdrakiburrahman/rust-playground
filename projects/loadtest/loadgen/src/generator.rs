@@ -213,6 +213,23 @@ fn row_hash_multiset(batch: &RecordBatch) -> Result<Vec<(String, u64)>> {
                     other => bail!("unsupported synthetic generated type {other} for row hash"),
                 }
             };
+            if let DataType::Timestamp(TimeUnit::Microsecond, _) = field.data_type() {
+                let nanoseconds = if array.is_null(row) {
+                    Value::Null
+                } else {
+                    let timestamp = array
+                        .as_any()
+                        .downcast_ref::<TimestampMicrosecondArray>()
+                        .context("timestamp row array")?
+                        .value(row);
+                    json!(
+                        timestamp
+                            .checked_mul(1_000)
+                            .context("timestamp nanosecond companion overflow")?
+                    )
+                };
+                values.insert(format!("{}__unix_nanos", field.name()), nanoseconds);
+            }
             values.insert(field.name().clone(), value);
         }
         let encoded = serde_json::to_string(&Value::Object(values))?;
@@ -419,6 +436,42 @@ mod tests {
             ])),
             generated_root: "target/generated".into(),
         }))
+    }
+
+    #[tokio::test]
+    async fn row_hashes_include_delta_timestamp_nanosecond_companions() -> Result<()> {
+        let table = Arc::new(GeneratedTable {
+            identity: TableIdentity::new(
+                CatalogName::new("telemetry")?,
+                SchemaName::new("sqlserver")?,
+                TableName::new("sqlserver_active_sessions")?,
+            ),
+            schema_version: 1,
+            fingerprint: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            descriptor_path: vec![
+                "telemetry".to_owned(),
+                "sqlserver".to_owned(),
+                "sqlserver_active_sessions".to_owned(),
+                "v1".to_owned(),
+            ],
+            schema: Arc::new(Schema::new(vec![Field::new(
+                "sample_time_utc",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            )])),
+            generated_root: "target/generated".into(),
+        });
+        let batch = build_logical_batch(table, 1, 7).await?;
+        let expected = serde_json::json!({
+            "sample_time_utc": 8_000_000,
+            "sample_time_utc__unix_nanos": 8_000_000_000_i64,
+        });
+        let hash = format!(
+            "sha256:{}",
+            hex::encode(Sha256::digest(serde_json::to_string(&expected)?.as_bytes()))
+        );
+        assert_eq!(batch.row_hashes, vec![(hash, 1)]);
+        Ok(())
     }
 
     #[tokio::test]
