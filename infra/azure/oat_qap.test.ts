@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { Azure, Config, canonical_json } from './bootstrap.js';
 import { managementRows, parseKustoQueryResult, parseQualifiedDeltaDefinition,
-  assertExactConnectionStrings, validateExternalMutationReceipt, validate_oat_manifest } from './oat_qap.js';
+  assertExactConnectionStrings, validateExternalMutationReceipt, validate_experiment_database_resource, validate_oat_manifest } from './oat_qap.js';
 
 const id = '22222222-2222-4222-8222-222222222222';
 const run = '9dcd6847-2a56-45a3-bd3c-54af839f451e';
@@ -45,6 +45,21 @@ function queryResponse(statusRows: unknown[][] = [
       [2, 'QueryStatus', 'QueryStatus', 'id2', '']]),
   ] };
 }
+test('validates the qualified Azure Kusto database resource name and case-insensitive type', () => {
+  const cluster = 'arrow-collector-87513';
+  assert.doesNotThrow(() => validate_experiment_database_resource({
+    name: `${cluster}/experimentqap`, type: 'Microsoft.Kusto/Clusters/Databases',
+  }, cluster, 'experimentqap'));
+  assert.doesNotThrow(() => validate_experiment_database_resource({
+    name: 'experimentqap', type: 'microsoft.kusto/clusters/databases',
+  }, cluster, 'experimentqap'));
+  for (const resource of [
+    { name: 'arrow-collector-00001/experimentqap', type: 'Microsoft.Kusto/Clusters/Databases' },
+    { name: 'arrow-collector-87513/other', type: 'Microsoft.Kusto/Clusters/Databases' },
+    { name: 'arrow-collector-87513/experimentqap', type: 'Microsoft.Kusto/Clusters' },
+  ]) assert.throws(() => validate_experiment_database_resource(resource, cluster, 'experimentqap'), error =>
+    error instanceof Error && error.message === 'Existing experiment database resource name/type mismatch.');
+});
 test('qualified Delta provider shape parses typed connection and opaque Properties without desired-value substitution', () => {
   const parsed = parseQualifiedDeltaDefinition(externalDefinition(), name);
   assert.deepEqual(parsed.connectionStrings, [externalConnection]);

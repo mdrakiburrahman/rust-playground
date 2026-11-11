@@ -410,10 +410,11 @@ function operations(azure: Azure, filename: string, stopPath?: string): OatQapOp
       if (storage.name !== c.account || object(storage.properties, 'storage properties').isHnsEnabled !== true ||
           object(cluster.properties, 'cluster properties').state !== 'Running' ||
           object(cluster.properties, 'cluster properties').uri !== c.uri) throw new Failure('Existing stamp storage/cluster readiness mismatch.');
-      const database = object(await azure.arm('GET', c.cluster_id + '/databases/' + c.experimentDatabase,
-        undefined, false, '2024-04-13'), 'Experiment database');
-      if (database.name !== c.experimentDatabase || database.type !== 'Microsoft.Kusto/clusters/databases')
-        throw new Failure('Existing experiment database identity mismatch.');
+      validate_experiment_database_resource(
+        await azure.arm('GET', c.cluster_id + '/databases/' + c.experimentDatabase, undefined, false, '2024-04-13'),
+        c.cluster,
+        c.experimentDatabase,
+      );
       const [, container] = await azure.blob('HEAD', c.data, '', { restype: 'container' }, undefined, {}, false, true);
       if (container[':status'] !== '200' || container['x-ms-meta-sandboxid'] !== c.sandbox) throw new Failure('Data container stamp ownership mismatch.');
       const principal = text(object(identity.properties, 'UAMI properties').principalId, 'UAMI principal');
@@ -529,6 +530,14 @@ function prefixFor(azure: Azure): string {
   const prefix = azure.c.table_prefix;
   if (typeof prefix !== 'string' || (prefix && !/^[A-Za-z0-9_-]+(?:\/[A-Za-z0-9_-]+)*$/.test(prefix))) throw new Failure('Configured table_prefix is unsafe.');
   return [prefix, 'runs'].filter(Boolean).join('/');
+}
+export function validate_experiment_database_resource(value: unknown, clusterName: string, databaseName: string): void {
+  const database = object(value, 'Experiment database');
+  const actualName = text(database.name, 'experiment database name').toLowerCase();
+  const expectedNames = [databaseName, `${clusterName}/${databaseName}`].map(name => name.toLowerCase());
+  if (!expectedNames.includes(actualName) ||
+      text(database.type, 'experiment database type').toLowerCase() !== 'microsoft.kusto/clusters/databases')
+    throw new Failure('Existing experiment database resource name/type mismatch.');
 }
 export function validate_oat_manifest(azure: Azure, runId: string, value: unknown): OatManifest {
   canonicalRun(runId);
