@@ -28,6 +28,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::process::{Child, Command};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use url::Url;
 
@@ -1329,7 +1330,12 @@ async fn cancel_aks_client_job(config: &OatConfig, handle: &ClientHandle) -> Res
 ///
 /// Returns an error if configuration, Kubernetes operations, measurement, restoration,
 /// or result publication fails.
-pub async fn execute(config: OatConfig, id: &str, state: Arc<AppState>) -> Result<usize> {
+pub async fn execute(
+    config: OatConfig,
+    id: &str,
+    state: Arc<AppState>,
+    cancellation: watch::Receiver<bool>,
+) -> Result<RunOutcome> {
     config.validate()?;
     state
         .update(id, |status| {
@@ -1339,7 +1345,7 @@ pub async fn execute(config: OatConfig, id: &str, state: Arc<AppState>) -> Resul
         })
         .await;
 
-    let outcome = run_matrix(&config, id, &state).await;
+    let outcome = run_matrix(&config, id, Arc::clone(&state), cancellation).await;
 
     state
         .update(id, |status| {
@@ -1347,13 +1353,23 @@ pub async fn execute(config: OatConfig, id: &str, state: Arc<AppState>) -> Resul
         })
         .await;
     let result_count = outcome.rows.len();
+    let cancelled = outcome.cancelled;
     publish_matrix_outcome(&config, outcome).await?;
-    Ok(result_count)
+    Ok(RunOutcome {
+        result_count,
+        cancelled,
+    })
+}
+
+pub struct RunOutcome {
+    pub result_count: usize,
+    pub cancelled: bool,
 }
 
 struct MatrixOutcome {
     rows: Vec<OatResult>,
     error: Option<anyhow::Error>,
+    cancelled: bool,
 }
 
 async fn publish_matrix_outcome(config: &OatConfig, outcome: MatrixOutcome) -> Result<()> {
@@ -1367,13 +1383,25 @@ async fn publish_matrix_outcome(config: &OatConfig, outcome: MatrixOutcome) -> R
     }
 }
 
-async fn run_matrix(config: &OatConfig, orchestration_id: &str, state: &AppState) -> MatrixOutcome {
+async fn run_matrix(
+    config: &OatConfig,
+    orchestration_id: &str,
+    state: Arc<AppState>,
+    cancellation: watch::Receiver<bool>,
+) -> MatrixOutcome {
     run_matrix_with(
         config,
         orchestration_id,
-        state,
-        |cell_config, run_id, replicas, concurrency| {
-            run_isolated_cell(cell_config, orchestration_id, run_id, replicas, concurrency)
+        &state,
+        move |cell_config, run_id, replicas, concurrency| {
+            run_isolated_cell(
+                cell_config,
+                orchestration_id,
+                run_id,
+                replicas,
+                concurrency,
+                cancellation.clone(),
+            )
         },
     )
     .await
@@ -1414,16 +1442,25 @@ where
             ),
         };
         results.append(&mut cell.rows);
+        if cell.cancelled {
+            return MatrixOutcome {
+                rows: results,
+                error: None,
+                cancelled: true,
+            };
+        }
         if cell.error.is_some() {
             return MatrixOutcome {
                 rows: results,
                 error: cell.error,
+                cancelled: false,
             };
         }
     }
     MatrixOutcome {
         rows: results,
         error: None,
+        cancelled: false,
     }
 }
 
@@ -1433,6 +1470,7 @@ async fn run_isolated_cell(
     run_id: String,
     replicas: u32,
     concurrency: u32,
+    mut cancellation: watch::Receiver<bool>,
 ) -> MatrixOutcome {
     let mut platform = match platform_for_run(&config, &run_id) {
         Ok(platform) => platform,
@@ -1448,21 +1486,33 @@ async fn run_isolated_cell(
             );
         }
     };
-    let result = match platform.ensure_stack(&config).await {
-        Ok(()) => {
-            run_matrix_cell(
-                &config,
-                orchestration_id,
-                &run_id,
-                replicas,
-                concurrency,
-                platform.as_mut(),
-            )
-            .await
-        }
-        Err(error) => Err(error).context("prepare isolated OAT matrix-cell platform"),
+    let (result, cancelled) = tokio::select! {
+        result = async {
+            match platform.ensure_stack(&config).await {
+                Ok(()) => {
+                    run_matrix_cell(
+                        &config,
+                        orchestration_id,
+                        &run_id,
+                        replicas,
+                        concurrency,
+                        platform.as_mut(),
+                    )
+                    .await
+                }
+                Err(error) => Err(error).context("prepare isolated OAT matrix-cell platform"),
+            }
+        } => (result, false),
+        _ = wait_for_cancellation(&mut cancellation) => (Err(anyhow::anyhow!("local OAT run cancelled")), true),
     };
     let cleanup = platform.cleanup(&config).await;
+    if cancelled && cleanup.is_ok() {
+        return MatrixOutcome {
+            rows: Vec::new(),
+            error: None,
+            cancelled: true,
+        };
+    }
     finish_matrix_cell(
         &config,
         orchestration_id,
@@ -1472,6 +1522,17 @@ async fn run_isolated_cell(
         result,
         cleanup,
     )
+}
+
+async fn wait_for_cancellation(cancellation: &mut watch::Receiver<bool>) {
+    loop {
+        if *cancellation.borrow() {
+            return;
+        }
+        if cancellation.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 fn finish_matrix_cell(
@@ -1557,7 +1618,11 @@ fn finish_matrix_cell(
             }
         }
     }
-    MatrixOutcome { rows, error }
+    MatrixOutcome {
+        rows,
+        error,
+        cancelled: false,
+    }
 }
 
 fn matrix_cell_specs(config: &OatConfig) -> Vec<(u32, u32, String)> {
@@ -3785,6 +3850,43 @@ async fn cleanup_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
     destroy_local_platform(config, platform).await
 }
 
+fn local_oat_client_list_args(project: &str) -> Vec<String> {
+    vec![
+        "ps".to_owned(),
+        "-aq".to_owned(),
+        "--filter".to_owned(),
+        format!("label=com.docker.compose.project={project}"),
+        "--filter".to_owned(),
+        "label=com.docker.compose.service=oat-client".to_owned(),
+    ]
+}
+
+fn local_oat_client_remove_args(container_ids: &[String]) -> Vec<String> {
+    let mut args = vec!["rm".to_owned(), "--force".to_owned()];
+    args.extend(container_ids.iter().cloned());
+    args
+}
+
+async fn remove_local_oat_client_containers(project: &str) -> Result<bool> {
+    let mut list = Command::new("docker");
+    list.args(local_oat_client_list_args(project));
+    let output = run_command(list, "list local OAT client containers for cleanup").await?;
+    let ids = String::from_utf8(output.stdout)
+        .context("local OAT client container IDs were not UTF-8")?
+        .lines()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        return Ok(false);
+    }
+    let mut remove = Command::new("docker");
+    remove.args(local_oat_client_remove_args(&ids));
+    run_command(remove, "remove local OAT client containers").await?;
+    Ok(true)
+}
+
 async fn destroy_local_platform(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
     let base_project = config
         .platform
@@ -3797,17 +3899,30 @@ async fn destroy_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
         .as_deref()
         .context("local compose file is missing")?;
     let project = scoped_compose_project(base_project, &platform.run_id);
-    let mut down = compose_command(
-        compose_file,
-        config.platform.compose_override_file.as_deref(),
-        &project,
-        "benchmark",
-    );
-    down.envs(&platform.environment);
-    down.args(["down", "--volumes", "--remove-orphans"]);
-    run_command(down, "clean up local OAT stack").await?;
-    fs::remove_dir_all(&platform.state_dir)
-        .with_context(|| format!("remove generated local OAT state {}", platform.state_dir.display()))?;
+    let mut stack_clean = false;
+    for _ in 0..3 {
+        remove_local_oat_client_containers(&project).await?;
+        let mut down = compose_command(
+            compose_file,
+            config.platform.compose_override_file.as_deref(),
+            &project,
+            "benchmark",
+        );
+        down.envs(&platform.environment);
+        down.args(["down", "--volumes", "--remove-orphans"]);
+        run_command(down, "clean up local OAT stack").await?;
+        if !remove_local_oat_client_containers(&project).await? {
+            stack_clean = true;
+            break;
+        }
+    }
+    if !stack_clean {
+        bail!("local OAT client containers continued to appear during cleanup");
+    }
+    if platform.state_dir.exists() {
+        fs::remove_dir_all(&platform.state_dir)
+            .with_context(|| format!("remove generated local OAT state {}", platform.state_dir.display()))?;
+    }
     Ok(())
 }
 
@@ -5817,6 +5932,77 @@ mod tests {
             identity_volume["secret"]["items"][0],
             json!({ "key": "internal-hmac", "path": "internal-hmac" })
         );
+        Ok(())
+    }
+
+    #[test]
+    fn local_client_cleanup_is_scoped_to_the_cell_project_and_service() {
+        assert_eq!(
+            local_oat_client_list_args("arrowcol-oat-quick-123e4567"),
+            [
+                "ps",
+                "-aq",
+                "--filter",
+                "label=com.docker.compose.project=arrowcol-oat-quick-123e4567",
+                "--filter",
+                "label=com.docker.compose.service=oat-client",
+            ]
+        );
+        assert_eq!(
+            local_oat_client_remove_args(&["client-a".to_owned(), "client-b".to_owned()]),
+            ["rm", "--force", "client-a", "client-b"]
+        );
+    }
+
+    #[test]
+    fn cleanup_failure_after_cancellation_is_not_reported_as_cleaned() -> Result<()> {
+        let config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        let outcome = finish_matrix_cell(
+            &config,
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+            1,
+            1,
+            Err(anyhow::anyhow!("local OAT run cancelled")),
+            Err(anyhow::anyhow!("fixture cleanup failure")),
+        );
+        assert!(!outcome.cancelled);
+        assert!(outcome.error.is_some());
+        assert!(outcome.rows.iter().any(|row| {
+            row.failure
+                .as_deref()
+                .is_some_and(|failure| failure.contains("fixture cleanup failure"))
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_stops_matrix_after_the_cleaned_cell() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.replica_counts = vec![1, 2];
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let call_counter = std::sync::Arc::clone(&calls);
+        let outcome = run_matrix_with(
+            &config,
+            "11111111-1111-4111-8111-111111111111",
+            &AppState::default(),
+            move |_, _, _, _| {
+                call_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(MatrixOutcome {
+                    rows: Vec::new(),
+                    error: None,
+                    cancelled: true,
+                })
+            },
+        )
+        .await;
+        assert!(outcome.cancelled);
+        assert!(outcome.error.is_none());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         Ok(())
     }
 

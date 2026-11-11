@@ -120,12 +120,18 @@ shared by ADX, AKS control plane and kubelet, the federated pod, and ACR image
 publishing/pull. Preflight qualifies Azure support, quota and networking, and
 blocks replacement while legacy Terraform state, Key Vault consumers, role
 assignments, registry publishers or FIC subjects remain unaccounted for.
+The operator principal must be authorized to create and delete federated
+identity credentials on the UAMI; this external permission cannot be proven or
+checked by the repository's deployment preflight. Removing the runtime grant
+from the template does not remove it from an existing incremental-deployment
+stamp; only a clean redeploy under a new stamp number proves the change live.
+This role change does not alter the Cilium networking decision.
 
 | Task | Entry point |
 | --- | --- |
 | Configure / qualify / provision | `infra/azure/stamp.example.yaml`; follow [AKS QAP operations](../../docs/operations/AKS_QAP.md) before provisioning. |
 | Fresh resource group | No manual group creation: subscription Bicep creates an absent `arrow-collector-rg`. Preflight still rejects metadata access failures, legacy resources and extra declared identities. |
-| Egress IP allocation policy | Set `aks.network.egressIpv4IpTags` and `egressIpv6IpTags` in private stamp YAML only to allocation tags authorized for the target subscription. Empty lists request untagged prefixes; Azure policy may reject them. No policy exemption or skip tags are added. |
+| Egress IP allocation policy | Set `aks.network.egressIpv4IpTags` and `egressIpv6IpTags` in private stamp YAML only to allocation tags authorized for the target subscription. Empty lists request untagged prefixes; Azure policy may reject them. Corporate-tenant policy can also require a Kusto classification tag (`AZURE_KUSTO_CLUSTER_TAGS` in `.env.example`) and first-party allocation ipTags for both egress prefixes. No policy exemption or skip tags are added. |
 | Stamp and user-pool roles | `stamp` is `1`..`999999` or the quoted `'00000'`. Each user pool sets `role: arrowcol` or `role: client`, which applies label `arrow-collector/role=<role>` and taint `arrow-collector/role=<role>:NoSchedule`; workloads need the matching selector and toleration. Pool maxima plus 33% upgrade surge must fit the node subnet and the /16 overlay pod CIDR. |
 | Kustomize Job config | Copy `infra/kubernetes/azure-qap.example.yaml` to ignored `azure-qap.yaml`; set a digest-pinned image and desired resources/node selector. |
 | Run on AKS | `npx nx run azure-qap-experiment:run -- --kubernetes --kubernetes-config infra/kubernetes/azure-qap.yaml` |

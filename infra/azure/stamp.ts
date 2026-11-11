@@ -41,8 +41,8 @@ const DEFAULT_AKS: StampConfig['aks'] = {
   version: '1.35.6', skuTier: 'Free', namespace: 'arrow-collector', serviceAccount: 'arrow-collector', networkDataplane: 'azure',
   systemPool: { name: 'systempool', vmSize: 'Standard_D8ds_v6', initialCount: 3, minCount: 3, maxCount: 3, maxPods: 250, availabilityZones: ['1', '2', '3'] },
   userPools: [
-    { name: 'benchd64', role: 'client', vmSize: 'Standard_D64ds_v6', initialCount: 0, minCount: 0, maxCount: 1, maxPods: 30, availabilityZones: [] },
-    { name: 'benche64', role: 'arrowcol', vmSize: 'Standard_E64ds_v6', initialCount: 0, minCount: 0, maxCount: 1, maxPods: 30, availabilityZones: [] },
+    { name: 'benchd64', role: 'client', vmSize: 'Standard_D64ds_v6', initialCount: 0, minCount: 0, maxCount: 1, maxPods: 250, availabilityZones: [] },
+    { name: 'benche64', role: 'arrowcol', vmSize: 'Standard_E64ds_v6', initialCount: 0, minCount: 0, maxCount: 1, maxPods: 250, availabilityZones: [] },
   ],
   network: { vnetIpv4Cidr: '10.245.0.0/16', vnetIpv6Cidr: 'fd20:245::/48', nodeSubnetIpv4Cidr: '10.245.0.0/24',
     nodeSubnetIpv6Cidr: 'fd20:245:0:1::/64', apiServerSubnetIpv4Cidr: '10.245.1.0/28', podIpv4Cidr: '10.246.0.0/16',

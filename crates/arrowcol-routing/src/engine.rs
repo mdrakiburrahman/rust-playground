@@ -405,6 +405,12 @@ impl RoutingEngine {
         }
         let mut last_now = initial_now;
         let now = setup_now(&clock, &mut last_now, expires_at)?;
+        if expires_at > add_millis(now, self.policy.lease_ttl_ms)? {
+            return Err(RoutingError::new(
+                RoutingErrorKind::InvalidConfiguration,
+                "OAT run expiry exceeds the routing owner lease lifetime",
+            ));
+        }
         self.store
             .initialize_run_table_set(run_id, expected, expires_at, now)
             .await?;
@@ -469,6 +475,12 @@ impl RoutingEngine {
                     return Err(RoutingError::new(
                         RoutingErrorKind::Conflict,
                         "SQL lease claim did not return a live lease for the expected OAT table",
+                    ));
+                }
+                if lease.expires_at_unix_ms < expires_at {
+                    return Err(RoutingError::new(
+                        RoutingErrorKind::InvalidConfiguration,
+                        "routing owner lease expires before the immutable OAT run expiry",
                     ));
                 }
                 let pin = RunTablePin {

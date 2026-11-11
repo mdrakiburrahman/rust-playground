@@ -32,7 +32,7 @@ SELF=$(hostname)
 
 write() {
   (cd "$REPO" && npx --no-install tsx \
-    projects/loadtest/loadgen/scripts/kusto_qap_fixture.ts "$IT/direct" "$1" \
+    projects/loadtest/loadgen/scripts/kusto_qap_fixture.ts "$IT/dataflow" "$1" \
     projects/loadtest/schemas/sqlserver.sql) ||
     return 1
   docker run --rm -v "$IT:/t" alpine chmod -R a+rwX /t
@@ -47,7 +47,7 @@ check() {
     sleep 2
   done
   (cd "$REPO" && cargo test -q -p arrowcol-loadgen --no-run &&
-    env KUSTO_IT_ENDPOINT="http://$ip:8080" KUSTO_IT_ROOT="$IT/direct" ${1:+KUSTO_IT_EXPOSE=1} \
+    env KUSTO_IT_ENDPOINT="http://$ip:8080" KUSTO_IT_ROOT="$IT/dataflow" ${1:+KUSTO_IT_EXPOSE=1} \
       timeout "${KUSTO_IT_PHASE_SECS:-900}" \
       cargo test -q -p arrowcol-loadgen native_qap_converges_on_emulator -- --ignored --nocapture)
 }
@@ -72,11 +72,11 @@ maintenance_bin() {
 maintain() {
   local args=() table
   for table in sqlserver_active_sessions sqlserver_availability_group_states; do
-    touch "$IT/direct/telemetry/sqlserver/$table/.arrowcol-disposable-test-root"
+    touch "$IT/dataflow/telemetry/sqlserver/$table/.arrowcol-disposable-test-root"
     args+=(--table "$table")
   done
   sleep 1
-  args+=(--root "file://$IT/direct/telemetry/sqlserver/" --apply --anchor-ms "$(date +%s%3N)"
+  args+=(--root "file://$IT/dataflow/telemetry/sqlserver/" --apply --anchor-ms "$(date +%s%3N)"
     --vacuum-retention-secs 0 --log-retention-secs 0 --checkpoint-every-commits 1 --unsafe-short-vacuum-for-tests)
   TMPDIR="$IT" "$DM" "${args[@]}" --operation vacuum --operation checkpoint | tee "$IT/maintenance-$1-checkpoint.out"
   TMPDIR="$IT" "$DM" "${args[@]}" --operation vacuum --operation prune-log | tee "$IT/maintenance-$1-prune.out"
@@ -93,9 +93,9 @@ start() {
   docker network create "$NET" >/dev/null
   docker network connect "$NET" "$SELF"
   docker run --rm -v "$REPO/.temp:/t" alpine rm -rf /t/kusto-qap-it
-  mkdir -p "$IT/direct" && chmod 777 "$IT/direct"
+  mkdir -p "$IT/dataflow" && chmod 777 "$IT/dataflow"
   docker run -d --name "$KUSTO" --network "$NET" -e ACCEPT_EULA=Y -m 4g \
-    -v "$IT/direct:/delta/direct:ro" "$IMAGE" >/dev/null
+    -v "$IT/dataflow:/delta/dataflow:ro" "$IMAGE" >/dev/null
 }
 
 case "${1:-}" in

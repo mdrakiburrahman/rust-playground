@@ -1,6 +1,6 @@
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { readFile, realpath, stat } from 'node:fs/promises';
+import { lstat, mkdir, readFile, realpath, readdir, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer as createHttpServer } from 'node:http';
 import { createServer as createTcpServer, isIP } from 'node:net';
 import { extname, isAbsolute, relative, resolve, sep } from 'node:path';
@@ -11,7 +11,7 @@ import { record, reportDataFlowRun, type NetworkObservation } from './dataflow-v
 
 export interface OatRunStatus {
   id: string;
-  state: 'queued' | 'running' | 'succeeded' | 'failed';
+  state: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
   progress: string;
   result_count: number;
   error: string | null;
@@ -31,6 +31,46 @@ interface LocalViewerConfig {
 }
 
 const workspaceRoot = resolve(fileURLToPath(new URL('../..', import.meta.url)));
+const cliValuedOptions = new Set(['--config', '--mode', '--server', '--poll-ms', '--cleanup-local']);
+
+export class OatCliError extends Error {
+  readonly exitCode = 2;
+}
+
+export function cliExitCode(error: unknown): number {
+  return error instanceof OatCliError ? error.exitCode : 1;
+}
+
+function validateArguments(args: string[]): void {
+  const flags = new Set(['--viewer-only', '--preflight-only']);
+  let positionalConfig = false;
+  for (let index = 0; index < args.length; index++) {
+    const argument = args[index]!;
+    if (argument === '-h' || argument === '--help') continue;
+    if (cliValuedOptions.has(argument)) {
+      const value = args[index + 1];
+      if (!value || value.startsWith('-')) throw new OatCliError(`Expected a value after ${argument}`);
+      index++;
+      continue;
+    }
+    if (flags.has(argument)) continue;
+    if (argument.startsWith('-')) throw new OatCliError(`Unknown option: ${argument}`);
+    if (positionalConfig) throw new OatCliError(`Unexpected argument: ${argument}`);
+    positionalConfig = true;
+  }
+}
+
+const cliUsage = `Usage: arrowcol-oat [options] [config]
+
+Options:
+  --mode <local|aks>   Select the execution mode
+  --config <path>      Use a configuration file
+  --server <URL>       Use an existing OAT API server
+  --poll-ms <number>   Set the status polling interval
+  --viewer-only        Serve existing local results without running a benchmark
+  --preflight-only     Run the read-only AKS preflight
+  --cleanup-local <id> Remove one abandoned local Compose cell by its run UUID
+  -h, --help           Show this help`;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -46,6 +86,297 @@ export function resolveOatConfigPath(mode: 'local' | 'aks', configPath?: string,
   return resolve(root, 'docs/experiments/arrowcol-oat', name);
 }
 
+export function resolveCliConfigPath(args: string[], mode: 'local' | 'aks', root = workspaceRoot): string {
+  const configIndex = args.indexOf('--config');
+  const explicitConfig = configIndex < 0 ? undefined : args[configIndex + 1];
+  const positionalConfig = args.find((value, index) =>
+    !value.startsWith('--') && !cliValuedOptions.has(args[index - 1] ?? ''),
+  );
+  return resolveOatConfigPath(mode, explicitConfig ?? positionalConfig, root);
+}
+
+export type DockerCommand = (args: string[]) => string;
+
+function runDocker(args: string[]): string {
+  return execFileSync('docker', args, { encoding: 'utf8', timeout: 30_000 });
+}
+
+function localProjectPrefix(config: Record<string, unknown>): string {
+  const platform = isRecord(config.platform) ? config.platform : {};
+  const base = platform.compose_project;
+  if (typeof base !== 'string' || !base.trim()) throw new Error('Local Compose project is missing from config');
+  return `${base.slice(0, 39).replace(/[-_]+$/g, '')}-`;
+}
+
+export async function cleanupLocalComposeProjects(
+  config: Record<string, unknown>,
+  runId: string,
+  docker: DockerCommand = runDocker,
+): Promise<string[]> {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(runId)) {
+    throw new Error('--cleanup-local requires a canonical OAT cell run UUID');
+  }
+  const prefix = localProjectPrefix(config);
+  const targetProject = prefix + runId.replace(/-/g, '').slice(0, 8).toLowerCase();
+  const projectPattern = /^[a-z0-9][a-z0-9_-]*-[a-f0-9]{8}$/i;
+  const projects = new Set<string>();
+  const resources: Array<{ list: string[]; inspect: (id: string) => string[] }> = [
+    {
+      list: ['ps', '-aq', '--filter', 'label=com.docker.compose.project'],
+      inspect: (id) => ['inspect', '--format', '{{ index .Config.Labels "com.docker.compose.project" }}', id],
+    },
+    {
+      list: ['network', 'ls', '-q', '--filter', 'label=com.docker.compose.project'],
+      inspect: (id) => ['network', 'inspect', '--format', '{{ index .Labels "com.docker.compose.project" }}', id],
+    },
+    {
+      list: ['volume', 'ls', '-q', '--filter', 'label=com.docker.compose.project'],
+      inspect: (id) => ['volume', 'inspect', '--format', '{{ index .Labels "com.docker.compose.project" }}', id],
+    },
+  ];
+  for (const resource of resources) {
+    for (const id of docker(resource.list).split(/\r?\n/).filter(Boolean)) {
+      const project = docker(resource.inspect(id)).trim();
+      if (project === targetProject && projectPattern.test(project)) projects.add(project);
+    }
+  }
+  projects.add(targetProject);
+  for (const project of projects) {
+    const containers = docker(['ps', '-aq', '--filter', `label=com.docker.compose.project=${project}`]).split(/\r?\n/).filter(Boolean);
+    if (containers.length) docker(['rm', '-f', ...containers]);
+    const networks = docker(['network', 'ls', '-q', '--filter', `label=com.docker.compose.project=${project}`]).split(/\r?\n/).filter(Boolean);
+    if (networks.length) docker(['network', 'rm', ...networks]);
+    const volumes = docker(['volume', 'ls', '-q', '--filter', `label=com.docker.compose.project=${project}`]).split(/\r?\n/).filter(Boolean);
+    if (volumes.length) docker(['volume', 'rm', ...volumes]);
+  }
+  const platform = isRecord(config.platform) ? config.platform : {};
+  if (typeof platform.compose_state_root === 'string') {
+    const stateRoot = localStateRoot(config);
+    for (const project of projects) {
+      const matches = (await readdir(stateRoot, { withFileTypes: true }).catch((error: unknown) => {
+        if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return [];
+        throw error;
+      })).filter((entry) => entry.isDirectory() && entry.name.toLowerCase() === runId.toLowerCase());
+      if (matches.length > 1) throw new Error(`Multiple local state directories match Compose project ${project}`);
+      if (matches.length === 1) {
+        const stateDir = resolve(stateRoot, matches[0]!.name);
+        if ((await lstat(stateDir)).isSymbolicLink()) throw new Error(`Refusing symlinked local OAT state directory ${stateDir}`);
+        await rm(stateDir, { recursive: true });
+      }
+    }
+  }
+  return [...projects];
+}
+interface LocalRunMarker {
+  version: 1;
+  runId: string;
+  ownerPid: number;
+  ownerStartTicks: string;
+  serverPid: number;
+  serverStartTicks: string;
+  serverUrl: string;
+  serverExecutable: string;
+}
+
+interface LocalRunMarkerContext {
+  path: string;
+  marker: Omit<LocalRunMarker, 'runId'>;
+}
+
+function localStateRoot(config: Record<string, unknown>): string {
+  const platform = isRecord(config.platform) ? config.platform : {};
+  if (typeof platform.compose_state_root !== 'string' || !platform.compose_state_root) {
+    throw new Error('Local Compose state root is missing from config');
+  }
+  return resolve(workspaceRoot, platform.compose_state_root);
+}
+
+async function processStartTicks(pid: number): Promise<string | undefined> {
+  if (process.platform !== 'linux') return undefined;
+  let statText: string;
+  try {
+    statText = await readFile(`/proc/${pid}/stat`, 'utf8');
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return undefined;
+    throw error;
+  }
+  const fields = statText.slice(statText.lastIndexOf(')') + 2).trim().split(/\s+/);
+  if (fields[0] === 'Z' || fields.length <= 19) return undefined;
+  return fields[19];
+}
+
+async function prepareLocalRunMarker(config: Record<string, unknown>, server: {
+  child: ChildProcess;
+  url: string;
+  executable: string;
+}): Promise<LocalRunMarkerContext> {
+  const serverPid = server.child.pid;
+  if (!serverPid) throw new Error('Could not identify the owned OAT server process');
+  const ownerStartTicks = await processStartTicks(process.pid);
+  const serverStartTicks = await processStartTicks(serverPid);
+  if (!ownerStartTicks || !serverStartTicks) {
+    throw new Error('Cannot safely record local OAT process ownership on this platform');
+  }
+  const root = localStateRoot(config);
+  await mkdir(root, { recursive: true });
+  const path = resolve(root, `.arrowcol-oat-owner-${serverPid}.json`);
+  return {
+    path,
+    marker: {
+      version: 1,
+      ownerPid: process.pid,
+      ownerStartTicks,
+      serverPid,
+      serverStartTicks,
+      serverUrl: server.url,
+      serverExecutable: await realpath(server.executable),
+    },
+  };
+}
+
+async function persistLocalRunMarker(context: LocalRunMarkerContext, status: OatRunStatus): Promise<void> {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(status.id)) {
+    throw new Error('OAT server returned a noncanonical run ID; local recovery marker was not written');
+  }
+  const marker: LocalRunMarker = { ...context.marker, runId: status.id };
+  await writeFile(context.path, JSON.stringify(marker), { flag: 'wx', mode: 0o600 });
+}
+
+function parseLocalRunMarker(text: string, markerPath: string): LocalRunMarker {
+  const value: unknown = JSON.parse(text);
+  if (!isRecord(value) || value.version !== 1 ||
+      typeof value.runId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value.runId) ||
+      typeof value.ownerPid !== 'number' || !Number.isSafeInteger(value.ownerPid) ||
+      typeof value.ownerStartTicks !== 'string' ||
+      typeof value.serverPid !== 'number' || !Number.isSafeInteger(value.serverPid) ||
+      typeof value.serverStartTicks !== 'string' ||
+      typeof value.serverUrl !== 'string' || typeof value.serverExecutable !== 'string') {
+    throw new Error(`Invalid local OAT ownership marker: ${markerPath}`);
+  }
+  const server = new URL(value.serverUrl);
+  if (server.protocol !== 'http:' || server.hostname !== '127.0.0.1' || !server.port) {
+    throw new Error(`Unsafe local OAT ownership marker URL: ${markerPath}`);
+  }
+  return {
+    version: 1,
+    runId: value.runId,
+    ownerPid: value.ownerPid,
+    ownerStartTicks: value.ownerStartTicks,
+    serverPid: value.serverPid,
+    serverStartTicks: value.serverStartTicks,
+    serverUrl: value.serverUrl,
+    serverExecutable: value.serverExecutable,
+  };
+}
+
+async function cancelMarkedRun(marker: LocalRunMarker): Promise<OatRunStatus> {
+  const statusUrl = new URL('/runs/' + encodeURIComponent(marker.runId), marker.serverUrl);
+  let response = await fetch(statusUrl, { signal: AbortSignal.timeout(10_000) });
+  let status = await readStatus(response, 'inspect interrupted local OAT run');
+  if (status.state === 'queued' || status.state === 'running') {
+    response = await fetch(new URL('/runs/' + encodeURIComponent(marker.runId) + '/cancel', marker.serverUrl), {
+      method: 'POST',
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!response.ok && response.status !== 409) await readStatus(response, 'cancel interrupted local OAT run');
+    const deadline = Date.now() + 10 * 60 * 1000;
+    while (status.state === 'queued' || status.state === 'running') {
+      if (Date.now() >= deadline) throw new Error('Timed out waiting for local OAT cleanup for run ' + marker.runId);
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 250));
+      response = await fetch(statusUrl, { signal: AbortSignal.timeout(10_000) });
+      status = await readStatus(response, 'wait for interrupted local OAT cleanup');
+    }
+  }
+  return status;
+}
+async function stopMarkedServer(marker: LocalRunMarker): Promise<void> {
+  if (await processStartTicks(marker.serverPid) !== marker.serverStartTicks) return;
+  const executable = await realpath(`/proc/${marker.serverPid}/exe`);
+  if (executable !== marker.serverExecutable) throw new Error('Refusing to stop a process that does not match the recorded OAT server');
+  process.kill(marker.serverPid, 'SIGTERM');
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline && await processStartTicks(marker.serverPid) === marker.serverStartTicks) {
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
+  }
+  if (await processStartTicks(marker.serverPid) === marker.serverStartTicks) {
+    process.kill(marker.serverPid, 'SIGKILL');
+    const killDeadline = Date.now() + 1_000;
+    while (Date.now() < killDeadline && await processStartTicks(marker.serverPid) === marker.serverStartTicks) {
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
+    }
+    if (await processStartTicks(marker.serverPid) === marker.serverStartTicks) {
+      throw new Error(`Could not stop interrupted OAT server process ${marker.serverPid}`);
+    }
+  }
+}
+
+async function removeStaleLocalMarkers(config: Record<string, unknown>): Promise<void> {
+  const root = localStateRoot(config);
+  const files = await readdir(root).catch((error: unknown) => {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return [];
+    throw error;
+  });
+  const remainingCells = files.filter((entry) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(entry));
+  if (remainingCells.length) return;
+  for (const name of files.filter((entry) => entry.startsWith('.arrowcol-oat-owner-') && entry.endsWith('.json'))) {
+    const markerPath = resolve(root, name);
+    const marker = parseLocalRunMarker(await readFile(markerPath, 'utf8'), markerPath);
+    if (await processStartTicks(marker.ownerPid) === marker.ownerStartTicks ||
+        await processStartTicks(marker.serverPid) === marker.serverStartTicks) {
+      throw new Error(`Refusing to remove ownership marker for active local run ${marker.runId}`);
+    }
+    await unlink(markerPath);
+  }
+}
+async function recoverInterruptedLocalRuns(
+  config: Record<string, unknown>,
+  cleanupRunId?: string,
+  cleanup: typeof cleanupLocalComposeProjects = cleanupLocalComposeProjects,
+): Promise<string[] | undefined> {
+  let explicitlyCleanedProjects: string[] | undefined;
+  const root = localStateRoot(config);
+  const files = await readdir(root).catch((error: unknown) => {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return [];
+    throw error;
+  });
+  for (const name of files.filter((entry) => entry.startsWith('.arrowcol-oat-owner-') && entry.endsWith('.json'))) {
+    const markerPath = resolve(root, name);
+    const marker = parseLocalRunMarker(await readFile(markerPath, 'utf8'), markerPath);
+    if (await processStartTicks(marker.ownerPid) === marker.ownerStartTicks) {
+      throw new Error('Local OAT run ' + marker.runId + ' is still owned by process ' + marker.ownerPid);
+    }
+    if (await processStartTicks(marker.serverPid) === marker.serverStartTicks) {
+      const executable = await realpath('/proc/' + marker.serverPid + '/exe');
+      if (executable !== marker.serverExecutable) throw new Error('OAT server ownership marker does not match the live process');
+      const status = await cancelMarkedRun(marker);
+      if (status.state === 'failed') {
+        if (cleanupRunId === undefined) {
+          throw new Error('Local OAT recovery did not confirm cleanup for run ' + marker.runId + ': ' + (status.error ?? status.state));
+        }
+        explicitlyCleanedProjects = await cleanup(config, cleanupRunId);
+        const remainingFiles = await readdir(root).catch((error: unknown) => {
+          if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return [];
+          throw error;
+        });
+        const remainingCells = remainingFiles.filter((entry) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(entry));
+        if (remainingCells.length) {
+          throw new Error('Local OAT cleanup is still incomplete. Clean each remaining cell with --cleanup-local <cell-run-uuid>: ' + remainingCells.join(', '));
+        }
+      } else if (status.state !== 'succeeded' && status.state !== 'cancelled') {
+        throw new Error('Local OAT recovery did not confirm cleanup for run ' + marker.runId + ': ' + (status.error ?? status.state));
+      }
+      await stopMarkedServer(marker);
+      await unlink(markerPath);
+    } else if (cleanupRunId === undefined) {
+      const cellRuns = files.filter((entry) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(entry));
+      if (cellRuns.length) {
+        throw new Error('Interrupted OAT server is gone; clean each local cell with --cleanup-local <cell-run-uuid>. Remaining cells: ' + cellRuns.join(', '));
+      }
+      await unlink(markerPath);
+    }
+  }
+  return explicitlyCleanedProjects;
+}
 function getDockerBridgeGateway(): string {
   try {
     const gateway = execFileSync('docker', [
@@ -86,6 +417,9 @@ export async function launchOat(
   onProgress: ProgressHandler = (status) => console.log(`${status.state}: ${status.progress}`),
   mode?: 'local' | 'aks',
   bridgeGateway: () => string = getDockerBridgeGateway,
+  signal?: AbortSignal,
+  onRunStarted?: (status: OatRunStatus) => Promise<void>,
+  onRunFinished?: (status: OatRunStatus) => void,
 ): Promise<OatRunStatus> {
   if (!Number.isSafeInteger(pollIntervalMs) || pollIntervalMs < 1) {
     throw new Error('poll interval must be a positive integer');
@@ -106,17 +440,87 @@ export async function launchOat(
     signal: AbortSignal.timeout(30_000),
   });
   let status = await readStatus(startResponse, 'start OAT run');
-  onProgress(status);
-  while (status.state === 'queued' || status.state === 'running') {
-    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
-    const response = await fetcher(new URL(`/runs/${encodeURIComponent(status.id)}`, server), {
-      signal: AbortSignal.timeout(30_000),
-    });
-    status = await readStatus(response, 'poll OAT run');
+  let startFailure: { error: unknown } | undefined;
+  type CancellationOutcome = { ok: true } | { ok: false; error: unknown };
+  let cancellationRequest: Promise<CancellationOutcome> = Promise.resolve({ ok: true });
+  let cancellationRequested = false;
+  let cancellationObserved = false;
+  let resolveCancellationStarted!: () => void;
+  const cancellationStarted = new Promise<void>((resolve) => { resolveCancellationStarted = resolve; });
+  const requestCancellation = (): void => {
+    if (cancellationRequested) return;
+    cancellationRequested = true;
+    resolveCancellationStarted();
+    cancellationRequest = (async (): Promise<void> => {
+      const response = await fetcher(new URL('/runs/' + encodeURIComponent(status.id) + '/cancel', server), {
+        method: 'POST',
+        signal: AbortSignal.timeout(30_000),
+      });
+      if (!response.ok && response.status !== 409) {
+        await readStatus(response, 'cancel local OAT run');
+      }
+    })().then(
+      () => ({ ok: true as const }),
+      (error: unknown) => ({ ok: false as const, error }),
+    );
+  };
+  if (signal?.aborted) requestCancellation();
+  else signal?.addEventListener('abort', requestCancellation, { once: true });
+  try {
+    try {
+      await onRunStarted?.(status);
+    } catch (error) {
+      startFailure = { error };
+      if (status.state === 'queued' || status.state === 'running') requestCancellation();
+    }
     onProgress(status);
+    while (status.state === 'queued' || status.state === 'running') {
+      if (!cancellationRequested || cancellationObserved) {
+        let pollTimer: NodeJS.Timeout;
+        const pollDelay = new Promise<'poll'>((resolve) => {
+          pollTimer = setTimeout(() => resolve('poll'), pollIntervalMs);
+        });
+        if (cancellationRequested) {
+          await pollDelay;
+        } else {
+          const waitResult = await Promise.race([
+            pollDelay,
+            cancellationStarted.then(() => 'cancel' as const),
+          ]);
+          if (waitResult === 'cancel') clearTimeout(pollTimer!);
+        }
+      }
+      if (cancellationRequested && !cancellationObserved) {
+        const result = await cancellationRequest;
+        cancellationObserved = true;
+        if (!result.ok) throw result.error instanceof Error ? result.error : new Error(String(result.error));
+      }
+      const response = await fetcher(new URL('/runs/' + encodeURIComponent(status.id), server), {
+        signal: AbortSignal.timeout(30_000),
+      });
+      status = await readStatus(response, 'poll OAT run');
+      onProgress(status);
+    }
+  } catch (error) {
+    if (startFailure) {
+      const original = startFailure.error instanceof Error ? startFailure.error.message : String(startFailure.error);
+      const cleanup = error instanceof Error ? error.message : String(error);
+      throw new Error(`OAT run ownership could not be recorded: ${original}; cancellation cleanup also failed: ${cleanup}`, { cause: error });
+    }
+    throw error;
+  } finally {
+    signal?.removeEventListener('abort', requestCancellation);
   }
-  if (status.state === 'failed') {
-    throw new Error(status.error ?? `OAT run ${status.id} failed`);
+  onRunFinished?.(status);
+  if (startFailure) {
+    if (status.state !== 'succeeded' && status.state !== 'cancelled') {
+      const original = startFailure.error instanceof Error ? startFailure.error.message : String(startFailure.error);
+      throw new Error(`OAT run ownership could not be recorded: ${original}; cancellation did not confirm cleanup: ${status.error ?? status.state}`);
+    }
+    throw startFailure.error instanceof Error ? startFailure.error : new Error(String(startFailure.error));
+  }
+  if (status.state === 'failed' || status.state === 'cancelled') {
+    throw new Error(status.error ?? `OAT run ${status.id} ${status.state}`);
   }
   return status;
 }
@@ -132,7 +536,7 @@ async function readStatus(response: Response, action: string): Promise<OatRunSta
   if (
     body === null || typeof body !== 'object' ||
     !('id' in body) || typeof body.id !== 'string' ||
-    !('state' in body) || !['queued', 'running', 'succeeded', 'failed'].includes(String(body.state)) ||
+    !('state' in body) || !['queued', 'running', 'succeeded', 'failed', 'cancelled'].includes(String(body.state)) ||
     !('progress' in body) || typeof body.progress !== 'string' ||
     !('result_count' in body) || typeof body.result_count !== 'number'
   ) {
@@ -141,49 +545,53 @@ async function readStatus(response: Response, action: string): Promise<OatRunSta
   return body as OatRunStatus;
 }
 
-export async function main(args: string[], runner: typeof run_tree = run_tree): Promise<void> {
+export async function main(args: string[], runner: typeof run_tree = run_tree, cleanupLocal = cleanupLocalComposeProjects): Promise<void> {
+  if (args.includes('-h') || args.includes('--help')) {
+    console.log(cliUsage);
+    return;
+  }
+  validateArguments(args);
   const option = (name: string): string | undefined => {
     const index = args.indexOf(name);
     if (index < 0) return undefined;
     const value = args[index + 1];
-    if (!value || value.startsWith('--')) throw new Error(`Expected a value after ${name}`);
+    if (!value || value.startsWith('-')) throw new OatCliError(`Expected a value after ${name}`);
     return value;
   };
-  const valuedOptions = new Set(['--config', '--mode', '--server', '--poll-ms']);
-  const positionalConfig = args.find((value, index) =>
-    !value.startsWith('--') && !valuedOptions.has(args[index - 1] ?? ''),
-  );
   const requestedMode = option('--mode');
   if (requestedMode !== undefined && requestedMode !== 'local' && requestedMode !== 'aks') {
-    throw new Error('--mode must be local or aks');
+    throw new OatCliError('--mode must be local or aks');
   }
-  const requestedConfig = option('--config') ?? positionalConfig;
   const requestedServerUrl = option('--server');
+  const cleanupRunId = option('--cleanup-local');
   const viewerOnly = args.includes('--viewer-only');
   const preflightOnly = args.includes('--preflight-only');
+  if (cleanupRunId !== undefined && (requestedMode === 'aks' || requestedServerUrl || args.includes('--poll-ms') || args.includes('--viewer-only') || args.includes('--preflight-only'))) {
+    throw new OatCliError('--cleanup-local requires local mode and cannot be combined with server, poll, viewer, or preflight options');
+  }
   if (requestedMode === 'aks') Object.assign(process.env, await loadAksEnvironment(workspaceRoot));
   if (preflightOnly) {
     if (requestedMode !== 'aks' || viewerOnly || requestedServerUrl || args.includes('--poll-ms')) {
-      throw new Error('--preflight-only requires --mode aks and cannot be combined with viewer/server/poll options');
+      throw new OatCliError('--preflight-only requires --mode aks and cannot be combined with viewer/server/poll options');
     }
-    const configPath = resolveOatConfigPath('aks', requestedConfig);
+    const configPath = resolveCliConfigPath(args, 'aks');
     const report = await runAksPreflight(configPath);
     console.log(formatPreflightReport(report));
     if (!report.ready) process.exitCode = 2;
     return;
   }
   const mode: 'local' | 'aks' = requestedMode === 'aks' ? 'aks' : 'local';
-  const configPath = resolveOatConfigPath(mode, requestedConfig);
+  const configPath = resolveCliConfigPath(args, mode);
   if (viewerOnly) {
     if (mode !== 'local' || requestedServerUrl || args.includes('--poll-ms')) {
-      throw new Error('--viewer-only is local-only and supports only --mode local and --config');
+      throw new OatCliError('--viewer-only is local-only and supports only --mode local and --config');
     }
     await keepLocalViewerOpen(await startLocalViewer(configPath));
     return;
   }
   const pollValue = Number(option('--poll-ms') ?? 1000);
   if (!Number.isSafeInteger(pollValue) || pollValue < 1) {
-    throw new Error('Expected values after --server and --poll-ms');
+    throw new OatCliError('Expected values after --server and --poll-ms');
   }
   let network: NetworkObservation | undefined;
   let warnings: string[] = [];
@@ -200,6 +608,14 @@ export async function main(args: string[], runner: typeof run_tree = run_tree): 
     }
   }
   const config = await readOatConfigForMode(configPath, mode);
+  if (cleanupRunId !== undefined) {
+    if (mode !== 'local') throw new OatCliError('--cleanup-local is local-only');
+    const recoveredProjects = await recoverInterruptedLocalRuns(config, cleanupRunId, cleanupLocal);
+    const projects = recoveredProjects ?? await cleanupLocal(config, cleanupRunId);
+    await removeStaleLocalMarkers(config);
+    console.log(projects.length ? `Cleaned local Compose project(s): ${projects.join(', ')}` : `No resources found for local run ${cleanupRunId}`);
+    return;
+  }
   if (mode === 'aks') {
     const subscriptionId = process.env.AZURE_SUBSCRIPTION_ID;
     if (!subscriptionId || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(subscriptionId)) {
@@ -208,26 +624,80 @@ export async function main(args: string[], runner: typeof run_tree = run_tree): 
     config.subscriptionId = subscriptionId;
   }
   if (requestedServerUrl) {
-    const code = await reportDataFlowRun(
-      (progress) => launchOat(configPath, requestedServerUrl, pollValue, fetch, progress, mode),
-      config, mode, undefined, runner, network, warnings,
-    );
-    if (code) process.exitCode = code;
-    await maybeServeLocalViewer(configPath, mode);
+    const interrupt = mode === 'local' ? registerLocalInterrupts() : undefined;
+    let runPassed = false;
+    try {
+      try {
+        const code = await reportDataFlowRun(
+          (progress) => launchOat(configPath, requestedServerUrl, pollValue, fetch, progress, mode, getDockerBridgeGateway, interrupt?.controller.signal),
+          config, mode, undefined, runner, network, warnings,
+        );
+        if (interrupt?.signal) {
+          process.exitCode = interrupt.exitCode;
+          return;
+        }
+        runPassed = code === 0;
+        if (code) process.exitCode = code;
+      } catch (error) {
+        if (!interrupt?.signal) throw error;
+        process.exitCode = interrupt.exitCode;
+        return;
+      }
+    } finally {
+      interrupt?.dispose();
+    }
+    if (runPassed) await maybeServeLocalViewer(configPath, mode);
     return;
   }
 
+  if (mode === 'local') await recoverInterruptedLocalRuns(config);
   const server = await startLocalServer(runner);
+  let markerContext: LocalRunMarkerContext | undefined;
   try {
-    const code = await reportDataFlowRun(
-      (progress) => launchOat(configPath, server.url, pollValue, fetch, progress, mode),
-      config, mode, server.gitSha, runner, network, warnings,
-    );
-    if (code) process.exitCode = code;
-  } finally {
+    if (mode === 'local') markerContext = await prepareLocalRunMarker(config, server);
+  } catch (error) {
     await stopLocalServer(server.child);
+    throw error;
   }
-  await maybeServeLocalViewer(configPath, mode);
+  let markerWritten = false;
+  let runCleanupComplete = false;
+  let runPassed = false;
+  const interrupt = mode === 'local' ? registerLocalInterrupts() : undefined;
+  try {
+    try {
+      const localMarker = markerContext;
+      const onRunStarted = localMarker ? async (status: OatRunStatus): Promise<void> => {
+        await persistLocalRunMarker(localMarker, status);
+        markerWritten = true;
+      } : undefined;
+      const onRunFinished = (status: OatRunStatus): void => {
+        runCleanupComplete = status.state === 'succeeded' || status.state === 'cancelled';
+      };
+      const code = await reportDataFlowRun(
+        (progress) => launchOat(configPath, server.url, pollValue, fetch, progress, mode, getDockerBridgeGateway, interrupt?.controller.signal, onRunStarted, onRunFinished),
+        config, mode, server.gitSha, runner, network, warnings,
+      );
+      if (interrupt?.signal) {
+        process.exitCode = interrupt.exitCode;
+        return;
+      }
+      runPassed = code === 0;
+      if (code) process.exitCode = code;
+    } catch (error) {
+      if (!interrupt?.signal) throw error;
+      process.exitCode = interrupt.exitCode;
+      return;
+    }
+  } finally {
+    await finishOwnedLocalRun(
+      () => stopLocalServer(server.child),
+      async () => {
+        if (markerWritten && runCleanupComplete && markerContext) await unlink(markerContext.path);
+      },
+      interrupt,
+      async () => { if (runPassed) await maybeServeLocalViewer(configPath, mode); },
+    );
+  }
 }
 
 export async function startLocalViewer(configPath: string): Promise<LocalViewer> {
@@ -354,6 +824,55 @@ async function createLocalViewer(config: LocalViewerConfig): Promise<LocalViewer
   };
 }
 
+function registerLocalInterrupts(): {
+  controller: AbortController;
+  readonly signal: NodeJS.Signals | undefined;
+  readonly exitCode: number;
+  dispose(): void;
+} {
+  const controller = new AbortController();
+  let received: NodeJS.Signals | undefined;
+  let count = 0;
+  const exitCodes: Partial<Record<NodeJS.Signals, number>> = { SIGINT: 130, SIGTERM: 143, SIGHUP: 129 };
+  const handlers = new Map<NodeJS.Signals, () => void>();
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
+    const handler = (): void => {
+      count++;
+      if (count > 1) process.exit(exitCodes[signal] ?? 1);
+      received = signal;
+      controller.abort();
+    };
+    handlers.set(signal, handler);
+    process.on(signal, handler);
+  }
+  return {
+    controller,
+    get signal() { return received; },
+    get exitCode() { return received ? exitCodes[received] ?? 1 : 0; },
+    dispose() {
+      for (const [signal, handler] of handlers) process.off(signal, handler);
+    },
+  };
+}
+export async function finishOwnedLocalRun(
+  stopServer: () => Promise<void>,
+  removeMarker: () => Promise<void>,
+  interrupt: { readonly signal: NodeJS.Signals | undefined; readonly exitCode: number; dispose(): void } | undefined,
+  serveViewer: () => Promise<void>,
+): Promise<void> {
+  try {
+    await stopServer();
+    await removeMarker();
+    if (interrupt?.signal) {
+      process.exitCode = interrupt.exitCode;
+      return;
+    }
+  } finally {
+    interrupt?.dispose();
+  }
+  await serveViewer();
+}
+
 async function keepLocalViewerOpen(viewer: LocalViewer): Promise<void> {
   console.log(`Local results viewer: ${viewer.url}`);
   console.log('Press Ctrl+C to stop the viewer.');
@@ -362,10 +881,12 @@ async function keepLocalViewerOpen(viewer: LocalViewer): Promise<void> {
       const stop = (): void => {
         process.off('SIGINT', stop);
         process.off('SIGTERM', stop);
+        process.off('SIGHUP', stop);
         resolvePromise();
       };
       process.once('SIGINT', stop);
       process.once('SIGTERM', stop);
+      process.once('SIGHUP', stop);
     });
   } finally {
     await viewer.close();
@@ -461,13 +982,13 @@ export async function buildOwnedServer(
   return { executable: await realpath(executables[0]!), gitSha };
 }
 
-export async function startLocalServer(runner: typeof run_tree = run_tree): Promise<{ child: ChildProcess; url: string; gitSha: string }> {
+export async function startLocalServer(runner: typeof run_tree = run_tree): Promise<{ child: ChildProcess; url: string; gitSha: string; executable: string }> {
   const workspace = resolve(fileURLToPath(new URL('../..', import.meta.url)));
   const build = await buildOwnedServer(workspace, runner);
   const port = await availablePort();
   const url = `http://127.0.0.1:${port}`;
   const child = spawn(build.executable, ['--listen', `127.0.0.1:${port}`], {
-    cwd: workspace, stdio: 'inherit', env: { ...process.env, GIT_SHA: build.gitSha },
+    cwd: workspace, detached: process.platform === 'linux', stdio: 'inherit', env: { ...process.env, GIT_SHA: build.gitSha },
   });
   let exit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
   let spawnError: Error | undefined;
@@ -479,7 +1000,7 @@ export async function startLocalServer(runner: typeof run_tree = run_tree): Prom
     if (exit) throw new Error(`OAT server exited before becoming ready (${exit.signal ?? exit.code})`);
     try {
       const response = await fetch(new URL('/healthz', url), { signal: AbortSignal.timeout(2000) });
-      if (response.ok) return { child, url, gitSha: build.gitSha };
+      if (response.ok) return { child, url, gitSha: build.gitSha, executable: build.executable };
     } catch {
       // The server may still be compiling or starting.
     }
@@ -521,6 +1042,6 @@ export async function stopLocalServer(child: ChildProcess): Promise<void> {
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main(process.argv.slice(2)).catch((error: unknown) => {
     console.error(error instanceof Error ? error.message : String(error));
-    process.exitCode = 1;
+    process.exitCode = cliExitCode(error);
   });
 }

@@ -1378,18 +1378,24 @@ fn commit_millis(root: &Path, identity: &str, version: u64) -> Option<u64> {
 
 pub(crate) async fn settle_dataflow(endpoints: &[String], timeout: Duration, quiver: bool) -> Result<()> {
     ensure!(!endpoints.is_empty(), "Dataflow publication endpoints are missing");
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .context("Dataflow settle deadline overflow")?;
+    let deadline_at = tokio::time::Instant::from_std(deadline);
     let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
-    let deadline = Instant::now() + timeout;
     let mut replay = ReplayQuiescence::default();
     loop {
+        ensure!(
+            Instant::now() < deadline,
+            "Dataflow publication did not settle before Kusto validation"
+        );
         let mut settled = true;
         let mut replay_counters = Vec::new();
         for endpoint in endpoints {
-            let response = client
-                .get(format!("{}/metrics", endpoint.trim_end_matches('/')))
-                .send()
-                .await?;
-            let text = response.error_for_status()?.text().await?;
+            let request = client.get(format!("{}/metrics", endpoint.trim_end_matches('/'))).send();
+            let text = tokio::time::timeout_at(deadline_at, async { request.await?.error_for_status()?.text().await })
+                .await
+                .context("Dataflow publication did not settle before Kusto validation")??;
             settled &= publication_idle(&text)?;
             if quiver {
                 settled &= metric_value(&text, "arrowcol_dataflow_durable_backlog_batches")? == 0;
@@ -1405,13 +1411,15 @@ pub(crate) async fn settle_dataflow(endpoints: &[String], timeout: Duration, qui
             settled = replay.observe(settled, replay_counters, Instant::now());
         }
         if settled {
+            ensure!(
+                Instant::now() < deadline,
+                "Dataflow publication did not settle before Kusto validation"
+            );
             return Ok(());
         }
-        ensure!(
-            Instant::now() < deadline,
-            "Dataflow publication did not settle before Kusto validation"
-        );
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::timeout_at(deadline_at, tokio::time::sleep(Duration::from_millis(250)))
+            .await
+            .context("Dataflow publication did not settle before Kusto validation")?;
     }
 }
 
@@ -2724,6 +2732,36 @@ mod tests {
         assert!(!replay.observe(true, vec![2, 0], at(13)));
         assert!(!replay.observe(true, vec![2, 0], at(17)));
         assert!(replay.observe(true, vec![2, 0], at(18)));
+    }
+
+    #[tokio::test]
+    async fn settle_rejects_idle_metrics_returned_after_deadline() -> Result<()> {
+        use std::io::Write;
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let server = thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request)?;
+            thread::sleep(Duration::from_millis(100));
+            let body =
+                "arrowcol_flight_active_streams 0\narrowcol_dfe_buffered_batches 0\narrowcol_delta_pending_commits 0\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            Ok(())
+        });
+
+        let result = settle_dataflow(&[endpoint], Duration::from_millis(30), false).await;
+        match server.join() {
+            Ok(result) => result?,
+            Err(_) => bail!("metrics server thread panicked"),
+        }
+        assert!(result.is_err(), "late idle metrics must not satisfy the deadline");
+        Ok(())
     }
 
     #[tokio::test]

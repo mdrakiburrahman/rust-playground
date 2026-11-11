@@ -3,7 +3,7 @@ import path from 'node:path';
 import { randomInt } from 'node:crypto';
 import { parseArgs } from 'node:util';
 import { parseDocument, stringify } from 'yaml';
-import { Config, ROOT, run_tree } from '../../infra/azure/bootstrap.js';
+import { ARM_PREVIEW_FAILURE_EXIT, Config, ROOT, run_tree } from '../../infra/azure/bootstrap.js';
 import { loadStampConfig, type StampConfig } from '../../infra/azure/stamp.js';
 import type { AksNetworkMode, DeployAttempt, DeployOptions, DeployResult } from './aks-types.js';
 import { setup } from './aks-setup.js';
@@ -34,6 +34,14 @@ function safeError(value: string): string {
     .replace(/([?&](?:sig|token|key|secret)=)[^&\s"']+/gi, '$1[redacted]')
     .replace(/("(?:accessToken|refreshToken|clientSecret|password|token)"\s*:\s*")[^"]*/gi, '$1[redacted]')
     .slice(0, 16000);
+}
+
+function armPreviewEvidence(stdout: string): DeployAttempt['preview'] | undefined {
+  const markers = [...stdout.matchAll(/^ARM_PREVIEW_VERIFIED parametersSha256=([a-f0-9]{64}) templateSha256=([a-f0-9]{64}) changes=(\d+)\r?$/gm)];
+  if (markers.length !== 1) return undefined;
+  const changes = Number(markers[0]![3]);
+  if (!Number.isSafeInteger(changes)) return undefined;
+  return { outcome: 'verified', parametersSha256: markers[0]![1], templateSha256: markers[0]![2], changes };
 }
 
 export function pickStamp(): string {
@@ -141,6 +149,8 @@ export async function deployInfrastructure(
     ...Object.fromEntries(Object.entries(process.env).filter(([key]) =>
       !/^(AZURE_|ARROWCOL_)/.test(key) || ['AZURE_CONFIG_DIR', 'AZURE_EXTENSION_DIR'].includes(key))),
     ...new Config({ AZURE_SUBSCRIPTION_ID: subscription }, selected).generated(),
+    ...(process.env.AZURE_KUSTO_CLUSTER_TAGS === undefined ? {} :
+      { AZURE_KUSTO_CLUSTER_TAGS: process.env.AZURE_KUSTO_CLUSTER_TAGS }),
     AZURE_SUBSCRIPTION_ID: subscription, AZURE_UAMI_CLIENT_ID: '', ARROWCOL_RESET_GENERATION: '',
   };
   fs.mkdirSync(stateDirectory, { recursive: true, mode: 0o700 });
@@ -178,18 +188,32 @@ export async function deployInfrastructure(
       save();
       let provision: Awaited<ReturnType<typeof runner>>;
       try {
-        provision = await exec([...bootstrap('provision', candidatePath), '--wait-seconds', '600'], PROVISION_SECONDS);
+        provision = await exec([...bootstrap('provision', candidatePath), '--wait-seconds', '600', '--preview-before-create'], PROVISION_SECONDS);
       } catch (error) {
-        attempts.push({ network: current, outcome: 'other-failure', error: safeError(String(error)) });
+        attempts.push({ network: current, outcome: 'preview-unverified', preview: { outcome: 'unverified' }, error: safeError(String(error)) });
+        save();
         throw error;
       }
+      const preview = armPreviewEvidence(provision.stdout);
+      if (provision.returncode === ARM_PREVIEW_FAILURE_EXIT) {
+        const error = safeError(provision.stderr || provision.stdout || 'ARM what-if failed without diagnostics.');
+        attempts.push({ network: current, outcome: 'preview-failed', preview: { outcome: 'failed' }, error });
+        save();
+        throw new Error('ARM what-if failed; create was not attempted and network fallback is disabled. ' + error);
+      }
+      if (!preview) {
+        const error = safeError(provision.stderr || provision.stdout || 'Bootstrap did not report verifiable ARM preview evidence.');
+        attempts.push({ network: current, outcome: 'preview-unverified', preview: { outcome: 'unverified' }, error });
+        save();
+        throw new Error('ARM what-if evidence is missing or unverifiable; create was not authorized. ' + error);
+      }
       if (!provision.returncode) {
-        attempts.push({ network: current, outcome: 'succeeded' });
+        attempts.push({ network: current, outcome: 'succeeded', preview });
         break;
       }
       const error = safeError(provision.stderr || provision.stdout || 'Provisioning failed without diagnostics.');
-      console.error(`Provisioning pass ${pass} (${current}) failed: ${error}`);
-      const attempt: DeployAttempt = { network: current, outcome: 'other-failure', error };
+      console.error('Provisioning pass ' + pass + ' (' + current + ') failed: ' + error);
+      const attempt: DeployAttempt = { network: current, outcome: 'other-failure', preview, error };
       attempts.push(attempt);
       save();
       let clusterFailure: boolean;
@@ -223,7 +247,7 @@ export async function deployInfrastructure(
     await verifyPostconditions({ ...selected, aks: { ...selected.aks, networkDataplane: current } }, az, postconditions);
     receipt.completedAt = new Date().toISOString();
     save();
-    console.log(`Identity receipt: exactly one UAMI arrow-collector; native and publisher federation plus run-FIC permission verified.`);
+    console.log(`Identity receipt: exactly one UAMI arrow-collector; native and publisher federation verified.`);
     console.log(`Deployed stamp ${stamp}; network path: ${attempts.map(attempt => attempt.network).join(' -> ')}. Receipt: ${receiptPath}`);
     if (current === 'azure') console.warn('WARNING: Azure dataplane has no enforcing network-policy provider. In-cluster workloads can reach the passwordless dataflow port; there is no public ingress.');
     return { stamp, network: current, attempts, receiptPath };
@@ -281,11 +305,6 @@ async function verifyPostconditions(config: StampConfig, az: (...args: string[])
   const identity = object(await az('identity', 'show', '--resource-group', GROUP, '--name', 'arrow-collector'), 'shared identity');
   if (typeof identity.id !== 'string' || typeof identity.principalId !== 'string')
     throw new Error('Shared identity resource ID and principal ID are missing.');
-  const assignments = list(await az('role', 'assignment', 'list', '--scope', identity.id, '--include-inherited'), 'identity role assignments');
-  receipt.runFederationPermission = assignments.some(assignment =>
-    assignment.principalId === identity.principalId &&
-    typeof assignment.roleDefinitionId === 'string' &&
-    assignment.roleDefinitionId.toLowerCase().endsWith('/7e559ce2-48d7-4b27-9128-fa1b247f1308'));
   for (const [key, type, resourceName] of [
     ['storage', 'Microsoft.Storage/storageAccounts', account], ['acr', 'Microsoft.ContainerRegistry/registries', account],
     ['kusto', 'Microsoft.Kusto/clusters', name],
