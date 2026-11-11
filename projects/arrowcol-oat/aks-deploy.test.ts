@@ -3,14 +3,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { parse, stringify } from 'yaml';
-import { ROOT, run_tree, TAGS } from '../../infra/azure/bootstrap.js';
+import { ARM_PREVIEW_FAILURE_EXIT, ROOT, run_tree, TAGS } from '../../infra/azure/bootstrap.js';
 import { deploy, deployInfrastructure as runDeployInfrastructure, main, pickStamp } from './aks-deploy.js';
 import { renderStampConfig } from './aks-stamp.js';
+import type { DeployAttempt } from './aks-types.js';
 
 const subscription = '00000000-0000-0000-0000-000000000001';
 const stamp = '89152';
 const clusterName = `arrow-collector-${stamp}`;
-type Fault = 'cluster' | 'other' | 'timeout' | 'quota' | 'identity' | 'database' | 'publisher' | 'native-federation' | 'network' | 'missing-target' | 'convergence' | 'run-fic-permission';
+type Fault = 'cluster' | 'other' | 'preview' | 'unverified-preview' | 'timeout' | 'quota' | 'identity' | 'database' | 'publisher' | 'native-federation' | 'network' | 'missing-target' | 'convergence' | 'run-fic-permission';
 
 function deployInfrastructure(
   options: Parameters<typeof runDeployInfrastructure>[0] & { stateDirectory: string }, runner: typeof run_tree,
@@ -54,14 +55,18 @@ function fixture(t: test.TestContext, faults: Fault[] = []) {
       selectedNetwork = parse(fs.readFileSync(selectedPath, 'utf8')).aks.networkDataplane;
       if (command[4] === 'preflight') return faults.includes('quota')
         ? { returncode: 1, stdout: '', stderr: 'Azure VM-family quota is insufficient' } : success({});
-      if (command[4] === 'what-if') return success({ changes: [{ changeType: 'Create' }] });
+      if (command[4] === 'what-if') return success({ changes: [{ changeType: 'Create', resourceId: '/subscriptions/' + subscription + '/resourceGroups/arrow-collector-rg/providers/Microsoft.Kusto/clusters/' + clusterName }] });
       assert.equal(command[4], 'provision');
+      assert.ok(command.includes('--preview-before-create'));
+      const previewMarker = 'ARM_PREVIEW_VERIFIED parametersSha256=' + 'a'.repeat(64) + ' templateSha256=' + 'b'.repeat(64) + ' changes=0\n';
       lastFault = faults[provisionCount++];
       if (lastFault === 'timeout') throw new Error('Command timed out; outcome unknown');
+      if (lastFault === 'preview') return { returncode: ARM_PREVIEW_FAILURE_EXIT, stdout: '', stderr: 'ARM what-if failed; no deployment create was attempted.' };
+      if (lastFault === 'unverified-preview') return { returncode: 0, stdout: JSON.stringify({}), stderr: '' };
       if (lastFault === 'cluster' || lastFault === 'other' || lastFault === 'missing-target')
-        return { returncode: 1, stdout: '', stderr: `DeploymentFailed ${lastFault}: ARM rejected creation` };
-      if (lastFault === 'convergence') return { returncode: 3, stdout: '', stderr: 'DELTA_LOGS_ABSENT' };
-      return success({});
+        return { returncode: 1, stdout: previewMarker, stderr: 'DeploymentFailed ' + lastFault + ': ARM rejected creation' };
+      if (lastFault === 'convergence') return { returncode: 3, stdout: previewMarker, stderr: 'DELTA_LOGS_ABSENT' };
+      return { returncode: 0, stdout: previewMarker + JSON.stringify({}), stderr: '' };
     }
     assert.equal(command[0], 'az');
     assert.equal(command[command.indexOf('--subscription') + 1], subscription);
@@ -135,7 +140,10 @@ test('fresh success is one azure pass, records explicit postconditions and priva
   fs.writeFileSync(sentinel, 'another private output', { mode: 0o600 });
   const result = await deployInfrastructure(f.options, f.runner);
   assert.equal(result.network, 'azure');
-  assert.deepEqual(result.attempts, [{ network: 'azure', outcome: 'succeeded' }]);
+  assert.equal(result.attempts.length, 1);
+  assert.equal(result.attempts[0]!.network, 'azure');
+  assert.equal(result.attempts[0]!.outcome, 'succeeded');
+  assert.deepEqual(result.attempts[0]!.preview, { outcome: 'verified', parametersSha256: 'a'.repeat(64), templateSha256: 'b'.repeat(64), changes: 0 });
   assert.equal(f.calls.filter(call => call[4] === 'provision').length, 1);
   assert.ok(Object.values(f.receipt().postconditions).every(value => value === true));
   assert.equal(fs.statSync(result.receiptPath).mode & 0o777, 0o600);
@@ -146,12 +154,32 @@ test('fresh success is one azure pass, records explicit postconditions and priva
   assert.equal(fs.existsSync(other.receiptPath), false);
 });
 
+test('ARM preview failure is recorded and never triggers create or network fallback', async t => {
+  const f = fixture(t, ['preview']);
+  await assert.rejects(deployInfrastructure(f.options, f.runner), /ARM what-if failed; create was not attempted/);
+  assert.equal(f.receipt().attempts[0].outcome, 'preview-failed');
+  assert.deepEqual(f.receipt().attempts[0].preview, { outcome: 'failed' });
+  assert.equal(f.calls.filter(call => call[0] === 'npx' && call[4] === 'provision').length, 1);
+  assert.equal(f.calls.some(call => call[0] === 'az' && call[1] === 'deployment'), false);
+  assert.equal(f.calls.some(call => call[0] === 'az' && call[1] === 'aks' && call[2] === 'delete'), false);
+});
+
+test('missing preview evidence fails closed even when bootstrap reports success', async t => {
+  const f = fixture(t, ['unverified-preview']);
+  await assert.rejects(deployInfrastructure(f.options, f.runner), /ARM what-if evidence is missing or unverifiable/);
+  assert.equal(f.receipt().attempts[0].outcome, 'preview-unverified');
+  assert.equal(f.calls.some(call => call[0] === 'az' && call[1] === 'deployment'), false);
+  assert.equal(f.calls.some(call => call[0] === 'az' && call[1] === 'aks' && call[2] === 'delete'), false);
+});
+
 test('only proven AKS failure deletes that cluster and retries Cilium once', async t => {
   const f = fixture(t, ['cluster']);
   const result = await deployInfrastructure(f.options, f.runner);
   assert.equal(result.network, 'cilium');
   assert.deepEqual(result.attempts.map(attempt => attempt.outcome), ['cluster-create-failed', 'succeeded']);
   assert.equal(f.calls.filter(call => call[2] === 'delete').length, 1);
+  assert.ok(f.calls.filter(call => call[0] === 'npx' && call[4] === 'provision').every(call => call.includes('--preview-before-create')));
+  assert.ok(f.receipt().attempts.every((attempt: DeployAttempt) => attempt.preview?.outcome === 'verified'));
   assert.ok(f.calls.findIndex(call => call[1] === 'deployment' && call[2] === 'sub') <
     f.calls.findIndex(call => call[2] === 'delete'));
   assert.deepEqual(f.receipt().networkPath, ['azure', 'cilium']);

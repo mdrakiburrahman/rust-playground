@@ -26,7 +26,7 @@ aks:
       initialCount: 0
       minCount: 0
       maxCount: 1
-      maxPods: 30
+      maxPods: 250
       availabilityZones: []
     - name: benche64
       role: arrowcol
@@ -34,7 +34,7 @@ aks:
       initialCount: 0
       minCount: 0
       maxCount: 1
-      maxPods: 30
+      maxPods: 250
       availabilityZones: []
   network:
     vnetIpv4Cidr: 10.245.0.0/16

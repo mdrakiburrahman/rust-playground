@@ -33,9 +33,17 @@ export interface DeployOptions {
   whatIf?: boolean;
 }
 
+export interface ArmPreviewEvidence {
+  outcome: 'verified' | 'failed' | 'unverified';
+  parametersSha256?: string;
+  templateSha256?: string;
+  changes?: number;
+}
+
 export interface DeployAttempt {
   network: AksNetworkMode;
-  outcome: 'succeeded' | 'cluster-create-failed' | 'other-failure';
+  outcome: 'succeeded' | 'cluster-create-failed' | 'other-failure' | 'preview-failed' | 'preview-unverified';
+  preview?: ArmPreviewEvidence;
   error?: string;
 }
 

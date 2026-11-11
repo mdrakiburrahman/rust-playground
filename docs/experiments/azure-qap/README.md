@@ -285,13 +285,15 @@ CLI contract.
 About 5 minutes plus a bounded log wait. The defaults run each operation once,
 on the small 6-file table with 1 MiB files, four trials at a time:
 
-```bash
-npx nx run azure-infra:provision
-npx nx run azure-qap-experiment:run
-```
+The provisioning command in the recorded runs is historical, not a fresh setup
+for this checkout: `azure-infra:provision` now defaults to stamped AKS resources
+in `arrow-collector-rg`, not the historical sandbox. For the current experiment,
+follow [AKS QAP operations](../../operations/AKS_QAP.md) to qualify and provision
+the selected stamp and publish its digest-pinned image, then run:
 
-Run `provision` once; it creates or updates the sandbox, including the
-experiment's container, database and Log Analytics workspace.
+```bash
+npx nx run azure-qap-experiment:run -- --kubernetes --kubernetes-config infra/kubernetes/azure-qap.yaml --operations optimize,purge,vacuum,reload
+```
 
 **Measured runtime on 2026-10-31:** the default run reached the end of its
 observation windows in about **5m13s**, then waited about **4m42s** for logs.
@@ -536,8 +538,10 @@ after cleanup the fixture blobs, Delta logs included, are gone.
 npx nx run azure-infra:reset
 ```
 
-`reset` on its own only previews. With `--execute` (see the
-[sandbox guide](../../operations/AZURE_SANDBOX.md#cloud-occupancy-and-reset)) it:
+`reset` previews the stamped environment, not the historical sandbox. In this
+checkout `azure-infra:reset` defaults to stamped mode and uses private
+`infra/azure/stamp.yaml`; with `--execute` it mutates the selected stamp in
+`arrow-collector-rg` (see the [operations guide](../../operations/AZURE_SANDBOX.md#cloud-occupancy-and-reset)):
 
 - deletes the main `arrowcol` Kusto database; `provision` recreates it;
 - empties the `experimentqap` database, dropping every table, external table,
@@ -547,8 +551,10 @@ npx nx run azure-infra:reset
   containers, but keeps the containers.
 
 It keeps the account, cluster, managed identity and Log Analytics workspace, and
-the logs already in the workspace. Run `npx nx run azure-infra:provision` after
-a reset before the next experiment or loadtest.
+the logs already in the workspace. For current AKS cleanup, follow [AKS QAP
+operations](../../operations/AKS_QAP.md) and confirm the exact stamp before
+executing any reset. Do not execute this reset from the historical experiment
+instructions.
 
 ## Limits
 
