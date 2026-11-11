@@ -308,10 +308,15 @@ export async function runAksPreflight(configPath: string, options: PreflightOpti
     principalId = at(identity, 'principalId');
     identityId = at(identity, 'id');
     const credentials = records(json('az', azArgs(['identity', 'federated-credential', 'list', '-g', resourceGroup, '--identity-name', identityName])));
-    if (!principalId || !identityId || identity.clientId !== clientId || !credentials.some((credential) =>
-      credential.issuer === issuer && credential.subject === `system:serviceaccount:${publisherNamespace}:${publisherServiceAccount}` &&
-      Array.isArray(credential.audiences) && credential.audiences.length === 1 && credential.audiences[0] === 'api://AzureADTokenExchange')) {
-      throw new Error('Existing fixed publisher federation does not exactly match the live cluster and selected UAMI.');
+    const nativeCredentials = clusterName
+      ? credentials.filter((credential) => credential.name === `azure-qap-${clusterName}`)
+      : [];
+    const nativeCredential = nativeCredentials.length === 1 ? nativeCredentials[0] : undefined;
+    if (!principalId || !identityId || identity.clientId !== clientId || !nativeCredential ||
+      nativeCredential.issuer !== issuer || nativeCredential.subject !== `system:serviceaccount:${publisherNamespace}:${publisherServiceAccount}` ||
+      !Array.isArray(nativeCredential.audiences) || nativeCredential.audiences.length !== 1 ||
+      nativeCredential.audiences[0] !== 'api://AzureADTokenExchange') {
+      throw new Error('Required AKS-native federation name and trust tuple do not exactly match the live cluster and selected UAMI.');
     }
     if (!selectedStamp || !selectedStamp.publisherFederatedCredentials.every((expected) =>
       credentials.some((credential) => publisherCredentialMatches(credential, expected)))) {

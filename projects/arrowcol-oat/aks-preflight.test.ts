@@ -65,7 +65,7 @@ async function fixture() {
   };
   const calls: Array<{ command: string; args: string[]; timeoutMs?: number }> = [];
   const requests: Array<{ url: string; init?: RequestInit }> = [];
-  const fixedCredential = { name: 'arrow-collector', issuer: 'https://issuer.example.test/',
+  const fixedCredential = { name: 'azure-qap-arrow-collector-00000', issuer: 'https://issuer.example.test/',
     subject: 'system:serviceaccount:arrow-collector:arrow-collector', audiences: ['api://AzureADTokenExchange'] };
   const configuredCredentials = publisherCredentials.map((credential) => ({ ...credential, audiences: ['api://AzureADTokenExchange'] }));
   const state = {
@@ -303,7 +303,12 @@ test('publisher identity and exact fixed federation remain mandatory', async () 
     f.state.commandFailure = 'get sa';
     assert.equal((await f.run()).checks.find((entry) => entry.name === 'Fixed publisher identity')!.ready, false);
     f.state.commandFailure = '';
-    f.state.credentials[0]!.subject = 'system:serviceaccount:wrong:wrong';
+    const native = f.state.credentials[0]!;
+    f.state.credentials[0] = { ...native, name: 'arrow-collector' };
+    assert.equal((await f.run()).checks.find((entry) => entry.name === 'Federated credential')!.ready, false);
+    f.state.credentials[0] = { ...native, subject: 'system:serviceaccount:wrong:wrong' };
+    assert.equal((await f.run()).checks.find((entry) => entry.name === 'Federated credential')!.ready, false);
+    f.state.credentials.splice(0, 1);
     assert.equal((await f.run()).checks.find((entry) => entry.name === 'Federated credential')!.ready, false);
   } finally { await f.cleanup(); }
 });
