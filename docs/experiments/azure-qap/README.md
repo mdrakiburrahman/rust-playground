@@ -236,11 +236,14 @@ Other findings from that matrix still hold:
 
 ## Azure setup
 
-![Azure resources: the existing rust-playground sandbox plus a new experimentqap container, a new experimentqap Kusto database, a StorageRead diagnostic setting and a Log Analytics workspace, with three new role assignments](images/infra.svg)
+![Historical Azure resources: the original rust-playground sandbox, its former arrowcol-kusto-reader identity, experimentqap container and database, StorageRead diagnostic setting, Log Analytics workspace, and three role assignments](images/infra.svg)
 
-The experiment lives inside the normal
-[Azure sandbox](../../operations/AZURE_SANDBOX.md). `azure-infra:provision`
-deploys everything in one Bicep deployment; names follow the private sandbox ID.
+This figure and table preserve the original devcontainer experiment setup in
+the legacy `rust-playground` sandbox, including its former
+`arrowcol-kusto-reader` identity. They are historical, not the current AKS stamp.
+The current stamped resources and safe operations are documented in the
+[Azure sandbox guide](../../operations/AZURE_SANDBOX.md) and [AKS QAP
+operations](../../operations/AKS_QAP.md).
 
 | Resource | Name | Status | Purpose |
 | --- | --- | --- | --- |
@@ -248,7 +251,7 @@ deploys everything in one Bicep deployment; names follow the private sandbox ID.
 | Blob container | `experimentqap` | **New** | Fixtures under `runs/<runId>/<trial>/` |
 | Kusto cluster | `arrowcol-<sandboxId>` | Reused, unchanged | E4ads_v5, autoscale 2 to 4 |
 | Kusto database | `experimentqap` | **New** | One external table per trial, `qap_<runId>_<trial>` |
-| Managed identity | `arrowcol-kusto-reader` | Reused | Kusto reads storage as this identity |
+| Historical managed identity | `arrowcol-kusto-reader` | Reused in the original sandbox only | Kusto read storage as this former identity |
 | Diagnostic setting | On the account's blob service | **New** | Sends `StorageRead` logs only |
 | Log Analytics workspace | `arrowcol-<sandboxId>` | **New** | Stores `StorageBlobLogs` |
 
@@ -262,8 +265,10 @@ New role assignments:
 
 The historical results and resource table above document the original
 sandbox-based, devcontainer runs. The current AKS stamp is a separate deployment
-in `arrow-collector-rg` with one shared `arrow-collector` UAMI. It can run the
-same scenario as a non-retrying Kubernetes Job; see [AKS QAP
+in `arrow-collector-rg` with one template-declared `arrow-collector` UAMI in
+the primary resource group. Mandatory platform extensions may create separate
+identities in the AKS-managed resource group; the template identity is not a
+deployment-wide count. It can run the same scenario as a non-retrying Kubernetes Job; see [AKS QAP
 operations](../../operations/AKS_QAP.md) and the [runtime
 README](../../../experiments/azure-qap/README.md#run-on-aks). Do not interpret
 fixture/setup reads by that shared identity as proof of ADX table reads. AKS
@@ -282,8 +287,9 @@ CLI contract.
 
 ### Quick demo
 
-About 5 minutes plus a bounded log wait. The defaults run each operation once,
-on the small 6-file table with 1 MiB files, four trials at a time:
+The historical sandbox run took about 5 minutes plus a bounded log wait. Its
+defaults ran each operation once on the small 6-file table with 1 MiB files, four
+trials at a time:
 
 The provisioning command in the recorded runs is historical, not a fresh setup
 for this checkout: `azure-infra:provision` now defaults to stamped AKS resources
@@ -489,8 +495,8 @@ the old and new snapshot but appears here after the mutation is a reread.
 
 ### Rerun the log queries after cleanup
 
-The Log Analytics queries keep working after the run has cleaned up, and after
-`azure-infra:reset`. The rows live in the workspace, not in the tables or
+The Log Analytics queries remain available after fixture cleanup and a current-stamp
+data reset. The rows live in the workspace, not in the tables or
 blobs, and stay until the workspace's retention expires.
 
 The run saves two queries per trial in its `--out` folder, by default
@@ -532,26 +538,24 @@ after cleanup the fixture blobs, Delta logs included, are gone.
   blob read in the account is logged, including the loadtest's.
 - **Each run deletes its own tables and fixture prefix**, always, even when it
   fails. Its storage logs stay in Log Analytics.
-- **Reset the data plane** when you are done:
 
-```bash
-npx nx run azure-infra:reset
-```
+**Reset:** do not run a reset command from this historical experiment guide. The old
+unqualified command now operates on the selected stamped environment in
+`arrow-collector-rg`, not the original `rust-playground` sandbox. For an
+intentional current-stamp reset, follow the [operations guide](../../operations/AZURE_SANDBOX.md#cloud-occupancy-and-reset)
+and explicitly pass its private `--stamp-config` path after reviewing the target.
+A current-stamp reset:
 
-`reset` previews the stamped environment, not the historical sandbox. In this
-checkout `azure-infra:reset` defaults to stamped mode and uses private
-`infra/azure/stamp.yaml`; with `--execute` it mutates the selected stamp in
-`arrow-collector-rg` (see the [operations guide](../../operations/AZURE_SANDBOX.md#cloud-occupancy-and-reset)):
-
-- deletes the main `arrowcol` Kusto database; `provision` recreates it;
+- deletes the main `arrowcol` Kusto database; provisioning recreates it;
 - empties the `experimentqap` database, dropping every table, external table,
   function and materialized view, but keeps the database and its managed
   identity policy;
 - deletes every blob in the `arrowcol`, `checkpoints` and `experimentqap`
   containers, but keeps the containers.
 
-It keeps the account, cluster, managed identity and Log Analytics workspace, and
-the logs already in the workspace. For current AKS cleanup, follow [AKS QAP
+The historical sandbox reset kept its storage account, cluster, former managed
+identity and Log Analytics workspace; this is not a current cleanup recipe.
+For current AKS cleanup, follow [AKS QAP
 operations](../../operations/AKS_QAP.md) and confirm the exact stamp before
 executing any reset. Do not execute this reset from the historical experiment
 instructions.

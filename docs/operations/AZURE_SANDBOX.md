@@ -48,9 +48,10 @@ To target the dedicated schema-evolution sandbox, pass
 command and follow the [schema-evolution runbook](../../experiments/schema-evolution/README.md).
 
 ```bash
-npx --no-install tsx infra/azure/bootstrap.ts config
-npx --no-install tsx infra/azure/bootstrap.ts preflight
-npx --no-install tsx infra/azure/bootstrap.ts provision
+STAMP_CONFIG=infra/azure/stamp.yaml
+npx --no-install tsx infra/azure/bootstrap.ts config --stamp-config "$STAMP_CONFIG"
+npx --no-install tsx infra/azure/bootstrap.ts preflight --stamp-config "$STAMP_CONFIG"
+npx --no-install tsx infra/azure/bootstrap.ts provision --stamp-config "$STAMP_CONFIG" --preview-before-create
 ```
 
 The orchestration and offline tests are native TypeScript on the repository's
@@ -169,9 +170,9 @@ removes them. Storage charges continue until deletion.
 
 `reset` previews; `reset --execute` runs the fenced custody sequence below;
 `reset --resume` continues an interrupted cleanup from its custody record.
-These unqualified examples default to stamped mode and act on the stamp in
-`infra/azure/stamp.yaml` under `arrow-collector-rg`, not the historical
-`rust-playground` sandbox. Confirm that selected stamp before any execution.
+These commands explicitly select the private stamp in `infra/azure/stamp.yaml`
+under `arrow-collector-rg`, not the historical `rust-playground` sandbox. Confirm
+that exact stamp and resource group before any execution.
 It refuses unless occupancy is released, the publisher registry is empty and
 authority is `ready-v1`/`fenced-v1`. Known limitation: safety relies on every
 mutating process participating in the publisher registry; processes outside the
@@ -309,10 +310,11 @@ live process will ever clean-release; `release`, `provision` and `reset` then
 refuse. The explicit operator escape hatch is:
 
 ```bash
-npx --no-install tsx infra/azure/bootstrap.ts recover            # preview
-npx --no-install tsx infra/azure/bootstrap.ts recover --execute  # stop local writers, fence, rotate
-npx --no-install tsx infra/azure/bootstrap.ts reset --execute    # data written by the failed run is untrusted
-npx --no-install tsx infra/azure/bootstrap.ts provision          # back to ready-v1
+STAMP_CONFIG=infra/azure/stamp.yaml
+npx --no-install tsx infra/azure/bootstrap.ts recover --stamp-config "$STAMP_CONFIG"
+npx --no-install tsx infra/azure/bootstrap.ts recover --stamp-config "$STAMP_CONFIG" --execute
+npx --no-install tsx infra/azure/bootstrap.ts reset --stamp-config "$STAMP_CONFIG" --execute  # destructive; failed-run data is untrusted
+npx --no-install tsx infra/azure/bootstrap.ts provision --stamp-config "$STAMP_CONFIG" --preview-before-create
 ```
 
 `recover --execute` requires the generation-bound local stop receipt, waits the
@@ -371,15 +373,15 @@ it from a run/occupancy UUID.
 Azure reads.
 
 ```bash
-# Preview only: no mutation.
-npx --no-install tsx infra/azure/bootstrap.ts reset
-# Fence, stop the local loadtest, quiesce 60s, delete the sandbox database,
-# empty the experiment database and delete all blobs in the three containers.
-npx --no-install tsx infra/azure/bootstrap.ts reset --execute
-# Continue an interrupted cleanup from .env.azure.reset.json.
-npx --no-install tsx infra/azure/bootstrap.ts reset --resume
-# Restore the declared baseline (ready-v1).
-npx --no-install tsx infra/azure/bootstrap.ts provision
+STAMP_CONFIG=infra/azure/stamp.yaml
+# Preview only; explicitly selects this private stamp.
+npx --no-install tsx infra/azure/bootstrap.ts reset --stamp-config "$STAMP_CONFIG"
+# Destructive: first stop all publishers and verify the selected group/stamp.
+npx --no-install tsx infra/azure/bootstrap.ts reset --stamp-config "$STAMP_CONFIG" --execute
+# Continue that selected stamp's interrupted cleanup.
+npx --no-install tsx infra/azure/bootstrap.ts reset --stamp-config "$STAMP_CONFIG" --resume
+# Restore the declared baseline (ready-v1) with ARM preview.
+npx --no-install tsx infra/azure/bootstrap.ts provision --stamp-config "$STAMP_CONFIG" --preview-before-create
 ```
 
 Execution verifies exact ownership, HNS, disabled retention, the exact database

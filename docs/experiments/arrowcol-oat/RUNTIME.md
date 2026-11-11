@@ -5,9 +5,9 @@
 | `arrowcol` Deployment / `dataflow` container | Integrated Flight receiver → Delta exporter. One or two replicas, each with `--num-cores 1` or `2`; constant CPU request/limit of 2. |
 | `arrowcol-router:50050` | ClusterIP only, h2c to private Flight `32010`, mandatory trusted-edge HMAC, SQL-serialized distinct table owners. Operator access by port-forward only. |
 | `arrowcol-catalog:8817` | Persistent 16Gi state PVC, same stamped dataflow warehouse as DFE, `--ingestion-layout`; catalog Flight SQL DDL requires signed internal identity by default. |
-| `arrowcol-sql:1433` | Persistent 32Gi PVC; SQL2022 CU27, routing/fencing only. SA bootstrap then checksum-verified V1–V11 migrations; separate SA/app/migrator secrets. |
-| Namespace and scheduling | Configurable namespace, default example `arrowcol-oat`; benchmark node labels `type=benchmark`, amd64. No changes to the Azure QAP Job overlay or system node pools. |
-| Identity | Workload-identity-labeled catalog/DFE pods; optional `serviceAccount` defaults to `arrowcol-oat`. Stamp 89152 reuses namespace/service account `arrow-collector`. No Azure/GitHub CLI credential mounts. |
+| `arrowcol-sql:1433` | Persistent 32Gi PVC; SQL2022 CU27, routing/fencing only. SA bootstrap then checksum-verified migrations through V0011; separate SA/app/migrator secrets. |
+| Namespace and scheduling | Every AKS cell gets a namespace derived from the configured prefix plus its compact run UUID. The runtime selects `arrow-collector/role=arrowcol` nodes (amd64) and tolerates that role's `NoSchedule` taint. |
+| Identity | `aks setup` prepares the shared `arrow-collector` ServiceAccount and workload identity. OAT cells use run-scoped namespaces and clean up only their owned namespace/FIC; no Azure/GitHub CLI credential mounts. |
 
 OAT router configurations explicitly select `auth.authenticator: dev_only_allow_all`. Missing, legacy `allow_all` and unknown modes fail startup. Every non-public request still needs a valid edge HMAC; the shared development principal is not production caller authorization. Rebuild router and signing-client images together because `x-arrowcol-oat-run-id` is now signed, including its absence.
 
@@ -97,55 +97,31 @@ publication authority.
 
 ## AKS prerequisites and authorization
 
-For a new deployment, create the ignored private `infra/azure/stamp.yaml` and
-authorize the selected subscription before running this Azure-changing command:
+Create a private stamp file from `infra/azure/stamp.example.yaml`, fill in the authorized subscription and non-overlapping network ranges, and sign in with `az login --use-device-code`. Keep the same private path for every command:
 
 ```bash
-npx --no-install arrowcol-oat aks deploy --stamp-config infra/azure/stamp.yaml --network cilium
+STAMP_CONFIG=infra/azure/stamp.yaml
+# First deployment only; skip this for an existing stamp.
+npx --no-install arrowcol-oat aks deploy --stamp-config "$STAMP_CONFIG"
 ```
 
-This provisions the selected stamp and runs OAT setup. Setup writes the private
-runtime inputs under `out/arrowcol-oat`, obtains operator credentials for the
-live cluster, and reports whether preflight is READY. Continue only when setup
-reports READY. If infrastructure deployment succeeded but setup failed, rerun
-setup for the selected five-digit stamp instead of redeploying:
+Deployment defaults to automatic networking: Azure first, with one Cilium retry only after a proven AKS-creation failure. Preflight or ARM preview failures do not trigger fallback. Pass `--network azure` or `--network cilium` to pin the choice; a pinned deployment has no network fallback. Azure's default dataplane sets `networkPolicy` to `none`, so declared Kubernetes NetworkPolicies are **not enforced**. In-cluster workloads can reach the passwordless DFE Flight port, although there is no public ingress. Pin Cilium when policy enforcement is required; the automatic fallback is not a security-policy upgrade.
+
+For a new or existing deployed stamp, run setup, then the OAT benchmark:
 
 ```bash
-npx --no-install arrowcol-oat aks setup --stamp-config infra/azure/stamp.yaml --stamp <selected-five-digit-stamp>
+npx --no-install arrowcol-oat aks setup --stamp-config "$STAMP_CONFIG"
+npx --no-install arrowcol-oat --mode aks --stamp-config "$STAMP_CONFIG" \
+  --config out/arrowcol-oat/oat-config.aks.json
 ```
 
-Complete the selected stamp's **supported provision/bootstrap**, including Delta
-initialization and `complete_bootstrap`, before starting writers. Select the
-generated `.env.azure` and `.env.azure.tables.json` for that stamp, not a different
-stamp's repository defaults. Never invent/reset a generation or recover/delete
-publisher state to make a run proceed.
+If multiple live stamps are present in the selected resource group, also pass `--stamp <five-digit-stamp>` to setup. Setup prepares revision-pinned images and private inputs under ignored `out/arrowcol-oat` (including `runtime.json`, `oat-config.aks.json`, `bootstrap.env`, `aks.env`, secrets and the publisher identity manifest), then runs preflight. Continue only when setup reports READY. Correct a failed gate and rerun setup; do not skip preflight or copy generated files between stamps.
 
-The runtime UAMI needs:
+The template declares one `arrow-collector` UAMI in the primary resource group. That is not a count of all identities: required Azure platform extensions can create identities in the AKS-managed resource group. Inventory those separately; see [identity qualification](../../operations/AKS_QAP.md#tenant-enforced-identities). The runtime identity needs Blob Data Contributor on the selected data container and checkpoints access for publisher fencing; setup establishes the host `arrow-collector` namespace/ServiceAccount federation. OAT cells use a unique namespace derived from the configured prefix plus their compact run UUID, select `arrow-collector/role=arrowcol` nodes, and clean only their owned namespace and run-scoped FIC. The final verdict checks that run-scoped namespaces and FICs are gone.
 
-* **Storage Blob Data Contributor on the selected stamped data container**:
-  catalog metadata commits and DFE Parquet/Delta writes under
-  `dataflow/<catalog>/<schema>/<table>`. Reader is insufficient.
-* Existing checkpoints-container contributor for generation/publisher fencing.
-* Federation for the configured namespace/service account, audience
-  `api://AzureADTokenExchange`. Stamp 89152 already authorizes
-  `system:serviceaccount:arrow-collector:arrow-collector`; set both configuration
-  fields to `arrow-collector`, without adding a FIC or changing the shared UAMI.
+The generated QAP database is `experimentqap`, distinct from the main `arrowcol` database and from the OAT results destination. The operator also needs the selected cluster context, image-pull readiness, metrics API access, and write access to the configured `experiments` and root `$web` destinations. The fixture container is not the results container.
 
-The operator needs an authorized Kubernetes context, image-pull readiness,
-metrics API, a real QAP endpoint, and write access to approved `experiments`
-and root `$web` destinations. Ensure at least one benchmark node is available;
-this runtime never scales node pools or grants Azure roles.
-The private fixture container `experimentqap` is not a substitute for the owned
-`experiments` results container. Complete its supported provisioning/role
-reconciliation before publishing OAT results.
-
-NetworkPolicy objects are declared in the manifests, but they are enforced only
-when the stamp is deployed with `--network cilium`. The default Azure network
-dataplane sets `networkPolicy` to `none`, so default-deny ingress and the
-policy-based restrictions on SQL and Flight traffic are not enforced in that
-mode. The DFE Flight receiver does not authenticate clients; deploy this topology
-with `--network cilium` so only the HMAC-checking router can reach Flight. Keep
-the foundation phase, which installs default-deny ingress, before any workload.
+`aks destroy --stamp-config "$STAMP_CONFIG"` only prints a read-only inventory. Adding `--confirm arrow-collector-rg` deletes the entire `arrow-collector-rg` and its captured AKS-managed resource groups, including every stamp there; it is not per-run cleanup. OAT benchmark cleanup is automatic and run-scoped.
 
 ## Build and rehearse
 
@@ -173,127 +149,33 @@ The client image is only for rehearsal. Build both host binaries for live OAT:
 cargo build --locked --package collector-chain --bin arrowcol-dmv --package arrowcol-oat-rust --bin arrowcol-oat-rust
 ```
 
-## Prepare manifests and private files
+## Generated private files
 
-Copy `runtime-config.example.json` to an ignored directory under `out/arrowcol-oat`
-and replace every placeholder with the selected stamp's actual values/digests.
-For stamp 89152 set both `namespace` and `serviceAccount` to `arrow-collector`.
-`deltaRoot` must be that stamp's bootstrapped **data container** plus `/dataflow`
-(include the actual prefix if provision used one), not experiments or `$web`.
-For stamp 89152 the verified root is
-`abfss://arrowcol@arrowcollector89152.dfs.core.windows.net/dataflow`.
-Use `subscription` from the selected `stamp.yaml` and `AZURE_UAMI_CLIENT_ID`
-from its generated `.env.azure`; the generated environment has no subscription ID.
-Do not copy passwords, tokens or the generation into runtime JSON.
+The normal `aks setup --stamp-config "$STAMP_CONFIG"` path creates the selected stamp's private runtime configuration, OAT configuration, bootstrap environment, temporary AKS environment, secret files and publisher identity manifest under ignored `out/arrowcol-oat`. Use the generated `oat-config.aks.json` for the run; do not hand-copy passwords, tokens or the reset generation into JSON or move these files between stamps.
 
-Before publication, each image value may be the explicit marker `"unpublished"`
-in this ignored draft. **The renderer rejects such drafts**; never substitute
-Docker image IDs or invented manifest digests.
+For manual renderer troubleshooting only, `runtime-config.example.json` may be copied into an ignored directory under `out/arrowcol-oat`. Its namespace is a prefix, not a shared workload namespace; the selected stamp supplies its data-container `deltaRoot`, workload identity and QAP endpoint/database (`experimentqap`). The normal CLI setup already creates and validates these inputs and the publisher ServiceAccount, so manual rendering and `kubectl apply` are not part of the standard OAT run.
 
-The identity-only phase is the sole exception: it renders only the namespace
-and ServiceAccount, never a pod or secret. If they do not yet exist, the cluster
-owner can establish the already-federated subject before image publication:
+## Normal OAT run and cleanup
+
+The normal `--mode aks` path runs preflight, creates isolated per-cell namespaces, executes the benchmark, retrieves results, and validates owned cleanup. A namespace is `<configured-prefix>-<compact-run-UUID>` (at most 63 characters) and carries the `arrowcol-oat/run-id` ownership label. Cleanup targets only that run's namespace and federated credential; the final verdict fails if either remains. Do not apply a shared static workload namespace as a substitute.
 
 ```bash
-npx --no-install tsx projects/arrowcol-oat/runtime.ts render \
-  out/arrowcol-oat/runtime.json identity out/arrowcol-oat/identity.json
-# Authorized cluster-owner action; creates/updates only namespace and ServiceAccount.
-kubectl apply -f out/arrowcol-oat/identity.json
+npx --no-install arrowcol-oat --mode aks --stamp-config "$STAMP_CONFIG" \
+  --config out/arrowcol-oat/oat-config.aks.json
 ```
 
-This does not create/change the Azure UAMI or FIC and does not start workloads.
+The report's QAP endpoint/database are observation context, not proof of ADX row counts or ingestion parity. Stop on a failed setup or preflight gate rather than bypassing preflight or deleting run-owned resources manually.
 
-Commit source changes first. The following authorized command pushes the four
-local service images and atomically replaces draft image values with real
-**registry manifest digests**; it does not apply workloads or identity resources:
+## Advanced direct collector inspection
 
-```bash
-STAMP="$(sed -n 's/^stamp:[[:space:]]*//p' infra/azure/stamp.yaml | sed "s/[\"']//g")"
-REGISTRY="arrowcollector${STAMP}"
-npx --no-install tsx projects/arrowcol-oat/publish-images.ts \
-  out/arrowcol-oat/runtime.json --federated --registry "$REGISTRY" \
-  --env .env --azure-env out/arrowcol-oat/bootstrap.env \
-  --stamp-config infra/azure/stamp.yaml
-```
+The commands in this section are for direct runtime diagnosis; the normal OAT benchmark is the `--mode aks` command above.
 
-Before publication, build the local service tags from the clean checked-out source; the publisher requires linux/amd64 images labeled with the full 40-character `org.opencontainers.image.revision` SHA. The default ACR tag is `oat-<full-SHA>`. The setup helpers build all five local images, publish the DMV client separately, and can read all five existing tags without building or pushing; missing tags are distinguishable from provenance failures.
-
-This reuses the QAP publisher's `withPublisherIdentity` helper: verify the stamped
-cluster and **existing** ServiceAccount annotation, obtain a short-lived AKS
-assertion, authenticate as the shared UAMI, then verify the principal before ACR
-login. Azure and Docker credential caches are isolated under ignored `out/` and
-removed afterward; operator credentials are not replaced. It never creates or
-updates a FIC, namespace or ServiceAccount. If the already-authorized
-ServiceAccount is absent or mismatched, stop and have its owner establish it.
-Do not replace this command with operator `az acr login`.
-
-After publication, prepare secret files and render manifests. These commands
-perform no cluster actions:
-
-```bash
-mkdir -p out/arrowcol-oat
-npx --no-install tsx projects/arrowcol-oat/runtime.ts prepare-secrets \
-  out/arrowcol-oat/bootstrap.env out/arrowcol-oat/secrets
-for phase in foundation bootstrap workload; do
-  npx --no-install tsx projects/arrowcol-oat/runtime.ts render \
-    out/arrowcol-oat/runtime.json "$phase" "out/arrowcol-oat/$phase.json"
-done
-```
-
-Secret generation reads the **captured real generation** and creates exclusive
-0600 files in a 0700 directory on the devbox. Existing credentials are preserved;
-generation changes or unsafe permissions fail. Do not print these files, put
-values in shell history/job code, check them in, or rotate them with existing
-SQL/catalog state.
-
-## Operator deployment sequence
-
-The following changes the live cluster and is deliberately separate from render.
-Apply only after the selected stamp, role scope and federation are ready.
-Use the approved context and namespace consistently:
-
-```bash
-NAMESPACE="$(node -p 'JSON.parse(require("fs").readFileSync("out/arrowcol-oat/runtime.json","utf8")).namespace')"
-kubectl config current-context
-kubectl apply -f out/arrowcol-oat/foundation.json
-kubectl -n "$NAMESPACE" create secret generic arrowcol-sql-admin \
-  --from-file=password=out/arrowcol-oat/secrets/sa-password --dry-run=client -o json | kubectl apply -f -
-kubectl -n "$NAMESPACE" create secret generic arrowcol-sql-runtime \
-  --from-file=password=out/arrowcol-oat/secrets/app-password --dry-run=client -o json | kubectl apply -f -
-kubectl -n "$NAMESPACE" create secret generic arrowcol-sql-migration \
-  --from-file=password=out/arrowcol-oat/secrets/migration-password --dry-run=client -o json | kubectl apply -f -
-kubectl -n "$NAMESPACE" create secret generic arrowcol-router-auth \
-  --from-file=edge-hmac=out/arrowcol-oat/secrets/edge-hmac \
-  --from-file=internal-hmac=out/arrowcol-oat/secrets/internal-hmac --dry-run=client -o json | kubectl apply -f -
-kubectl -n "$NAMESPACE" create secret generic arrowcol-generation \
-  --from-file=generation=out/arrowcol-oat/secrets/generation --dry-run=client -o json | kubectl apply -f -
-kubectl -n "$NAMESPACE" rollout status deployment/arrowcol-sql --timeout=600s
-kubectl apply -f out/arrowcol-oat/bootstrap.json
-kubectl -n "$NAMESPACE" wait --for=condition=complete job/arrowcol-migrate-v11 --timeout=600s
-kubectl apply -f out/arrowcol-oat/workload.json
-kubectl -n "$NAMESPACE" rollout status deployment/arrowcol-catalog --timeout=600s
-kubectl -n "$NAMESPACE" rollout status deployment/arrowcol --timeout=600s
-kubectl -n "$NAMESPACE" rollout status deployment/arrowcol-router --timeout=600s
-kubectl -n "$NAMESPACE" port-forward service/arrowcol-router 50050:50050
-```
-
-Stop on failed migration/readiness; inspect logs without printing secret files.
-Do not delete PVCs or reset publisher authority. Bootstrap/migrations run once as
-a completed Job; runtime pods never mount the migrator or SA credentials.
-With `--network cilium`, NetworkPolicies deny pod ingress by default, permit only
-router→Flight, DFE→catalog and runtime/migration→SQL. Kubelet probes and operator
-port-forward remain available. No public router, external catalog, or direct public collector.
-
-## Matrix and interpretation
-
-Copy `oat-config.example.json` into the ignored run directory. Keep both
-Deployment/container/selector pairs identical (`arrowcol`/`dataflow`/`app=arrowcol`),
-set its namespace to the configured runtime namespace (`arrow-collector` on 89152),
-use `http://127.0.0.1:50050`, the private edge-key path, the host DMV binary, actual
-QAP endpoint/database and actual experiments/root `$web` destinations.
-Read the QAP endpoint/database from the selected environment's `AZURE_KUSTO_URI`
-and `AZURE_KUSTO_DATABASE`, not the experiment database or repository defaults.
-The QAP database for stamp 89152 is **`arrowcol`**, not `experimentqap`.
+The generated AKS configuration supplies the selected stamp's QAP endpoint and
+`experimentqap` database, workload identity, result destinations, and run-scoped
+namespace prefix. The persistent DFE Deployment uses the
+`arrow-collector/role=arrowcol` node selector and matching toleration; a user
+pool must have that configured role. The QAP experiment's fixture database is
+not the loadtest database `arrowcol`.
 
 The OAT **host process** must set `ARROWCOL_MODE=azure`; otherwise the loadgen
 Kusto observer defaults to local mode and rejects the HTTPS endpoint. Its

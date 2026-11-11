@@ -6,19 +6,25 @@ replace the devcontainer mode.
 
 ## Existing-stamp OAT setup
 
-For an existing stamp, pass its ignored private YAML explicitly; the tracked
-`infra/azure/stamp.yaml` may describe a different region or stamp. Setup passes
-the selected path to its preflight; use the same path for standalone preflight and
-benchmark launch. Do not use `--skip-preflight`. For example:
+Use the ignored private YAML for the intended stamp; the tracked example/default may describe a different region or stamp. Pass the same path to setup, standalone preflight and the run:
 
 ```bash
-npx --no-install arrowcol-oat aks setup --stamp 87513 --stamp-config .temp/stamp-87513.yaml
-npx --no-install arrowcol-oat --mode aks --preflight-only --stamp-config .temp/stamp-87513.yaml --config out/arrowcol-oat/oat-config.aks.json
-npx --no-install arrowcol-oat --mode aks --stamp-config .temp/stamp-87513.yaml
+STAMP_CONFIG=infra/azure/stamp.yaml
+# For a new stamp only; auto uses Azure first and one eligible Cilium fallback.
+npx --no-install arrowcol-oat aks deploy --stamp-config "$STAMP_CONFIG"
+# Existing stamp, or after deploy:
+npx --no-install arrowcol-oat aks setup --stamp-config "$STAMP_CONFIG"
+npx --no-install arrowcol-oat --mode aks --preflight-only \
+  --stamp-config "$STAMP_CONFIG" --config out/arrowcol-oat/oat-config.aks.json
+npx --no-install arrowcol-oat --mode aks --stamp-config "$STAMP_CONFIG" \
+  --config out/arrowcol-oat/oat-config.aks.json
 ```
 
-The standalone preflight is a read-only input check: it must report the selected
-QAP endpoint/database gate READY before launching a benchmark.
+Setup builds or reuses revision-pinned images, writes private runtime inputs under ignored `out/arrowcol-oat`, and runs preflight itself; continue only when it reports READY. Use `--stamp <five-digit-stamp>` if more than one live AKS cluster is present in the selected resource group. Do not use `--skip-preflight`. The separate read-only preflight command is optional confirmation, not a bypass.
+
+Each OAT cell creates a namespace from the configured prefix plus its compact run UUID, applies a run ownership label, and cleans up only its own namespace and federated credential. The benchmark verdict checks for remaining run-scoped resources. Do not manually apply a shared static workload namespace.
+
+`aks destroy --stamp-config "$STAMP_CONFIG"` only inventories resources. Adding `--confirm arrow-collector-rg` deletes the whole primary resource group and captured AKS-managed resource groups, including every stamp there; it is not per-run cleanup. Use that confirmation only for an intentional full teardown after reviewing the inventory and receipt.
 
 ## Router authentication
 
@@ -31,10 +37,10 @@ Edge HMAC is enabled on AKS with matching mounted keys and pinned router and cli
 | Azure target | The private stamp subscription, `arrow-collector-rg`, East US 2 or Canada Central; never the separate `rust-playground` resource group. Each region still requires live SKU, version, quota and network preflight. |
 | Stamp | Integer `1..999999` or the quoted five-digit string `'00000'` in ignored `infra/azure/stamp.yaml`; `arrow-collector-<stamp>` must fit Kusto's provider-enforced 22-character name limit. |
 | AKS baseline | 1.35.6; `Standard_D8ds_v6` system pool with 3 initial/3 minimum/3 maximum nodes, 250 pods per node, zones 1/2/3, Azure Linux/FIPS, Entra/Azure RBAC, OIDC/workload identity, Azure CNI overlay dual stack and API-server VNet integration. |
-| Declared identity | One `arrow-collector` UAMI for control plane, kubelet, QAP ServiceAccount federation, ADX/storage and ACR. Identity-creating optional add-ons are omitted; tenant-enforced add-ons require separate live qualification below. |
+| Template identity | One `arrow-collector` UAMI is declared in the primary resource group for control plane, kubelet, QAP ServiceAccount federation, ADX/storage and ACR. This is not a managed-resource-group or deployment-wide identity count; see tenant-enforced identities below. |
 | Publisher ownership | Generated `AZURE_STAMP` selects the same `stamp-<stamp>` authority in TypeScript and Rust, preserving `00000` when selected. Invalid stamps fail closed; an absent stamp retains the Rust legacy hashed-authority path only for older deployments. |
 | Networking | Explicit IPv4/IPv6 VNet, node, API, pod, service and DNS ranges; preflight checks subscription VNets and connected peering ranges before deployment. |
-| Legacy gate | Preflight blocks while old `project=arrow-collector` resources or additional UAMIs remain. Preserve Terraform state, Key Vault dependencies, role assignments, registry publishing consumers and every FIC subject before retiring the old stamp. |
+| Legacy gate | Preflight blocks unaccounted legacy `project=arrow-collector` resources or extra application UAMIs in the primary resource group. Preserve Terraform state, Key Vault dependencies, role assignments, registry publishers and every FIC subject before retiring old resources. Platform-managed identities in the AKS-managed group are separately inventoried. |
 
 No destructive replacement is authorized outside `arrow-collector-rg`. The
 separate `rust-playground` resource group must remain untouched. Retiring old
@@ -154,9 +160,13 @@ container-scoped runtime writer grant. This is not the `experimentqap` fixture
 container. Both it and `$web` carry stamp ownership metadata and participate in
 the guarded inventory; isolated schema-evolution mode creates neither.
 
-The private stamp can opt into `aks.networkDataplane: cilium` for enforced
-NetworkPolicy; omission preserves the existing Azure data plane without policy
-enforcement. Isolated OAT workloads require Cilium before deployment.
+`aks deploy` defaults to Azure networking and allows one Cilium retry only
+after a proven AKS-creation failure. Use `--network azure` or `--network cilium`
+to pin a dataplane; a pin disables fallback. A raw bootstrap deployment can
+select `aks.networkDataplane: cilium` in the private stamp. Azure dataplane
+NetworkPolicy objects are not enforced (`networkPolicy: none`): in-cluster
+workloads can reach the passwordless dataflow Flight port, though there is no
+public ingress. Cilium enforces the declared policies.
 [Migrating an existing cluster](https://learn.microsoft.com/en-us/azure/aks/update-azure-cni#update-the-data-plane-to-azure-cni-powered-by-cilium)
 reimages node pools and can interrupt networking. Qualify an empty disposable
 stamp first, preserve its pool counts and CIDRs, and wait for every node and
@@ -172,7 +182,8 @@ generation Secret.
 ## Image and run
 
 The image must be built for `linux/amd64`, pushed to the stamped ACR, and
-referenced by digest. The image publisher reads the identity client ID from
+referenced by digest. `aks setup` performs or reuses this revision-pinned image
+publication and generates private runtime inputs under ignored `out/arrowcol-oat`. The image publisher reads the identity client ID from
 `.env.azure` and subscription from the private stamp; it refuses to publish
 unless the active Azure CLI principal is the `arrow-collector` UAMI.
 For an operator-authenticated fresh clone, use `--federated`: it first verifies

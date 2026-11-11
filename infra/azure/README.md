@@ -24,15 +24,15 @@ Declarative Bicep infrastructure with TypeScript orchestration. Run from the rep
 | Private configuration | Copy `.env.example` to repo-bootstrapper's `sync/rust-playground/.env`; fill in the authorized subscription and required tags. |
 | Authentication | `az login --use-device-code`; the identity needs deployment and role-assignment permissions. |
 | Runtime | Repository Node.js, `npm ci`, Azure CLI and Linux `flock`. |
-| Infrastructure | Resource group, ADX cluster/database, ADLS Gen2 containers, managed identity, RBAC, 13 Dataflow external Delta tables and QAP. |
+| Historical infrastructure | The legacy `rust-playground` sandbox: ADX, storage, its former `arrowcol-kusto-reader` identity/RBAC, 13 Dataflow external Delta tables and QAP. These names are not the current AKS stamp. |
 | QAP experiment | `experimentqap` container and Kusto database, Log Analytics workspace `arrowcol-<sandboxId>` and a blob `StorageRead` diagnostic setting. |
 | Loadtest default | DFE collector, remote Schema Catalog, local disk and Kusto; Azure is opt-in. |
 | SQL Server | Router routing/fencing only; no SQL catalog or delivery-receipt store. |
 
 ```mermaid
 flowchart LR
-  subgraph rg["Resource group rust-playground"]
-    mi["Managed identity arrowcol-kusto-reader"]
+  subgraph rg["Historical legacy loadtest sandbox: rust-playground"]
+    mi["Historical identity arrowcol-kusto-reader"]
     subgraph st["Storage account arrowcol#lt;sandboxId#gt;"]
       c1["arrowcol container"]
       c2["checkpoints container"]
@@ -67,21 +67,21 @@ flowchart LR
 
 The storage account is shared with the loadtest, so `StorageBlobLogs` also holds loadtest reads. Filter by the `experimentqap/runs/<runId>/` path and the Kusto managed identity. Log ingestion is billed per GB and kept for 30 days. To pause it, run `az monitor diagnostic-settings delete --name arrowcol-storage-reads --resource <storage-account-id>/blobServices/default --subscription <subscription>`; the next `provision` recreates it.
 
-Use `npx --no-install tsx infra/azure/bootstrap.ts <command>`:
+Set `STAMP_CONFIG` to the ignored private YAML for the intended stamp (for example, `STAMP_CONFIG=infra/azure/stamp.yaml`). Each command below explicitly selects it; the legacy diagram and identities above are historical only. Run `npx --no-install tsx infra/azure/bootstrap.ts <command> --stamp-config "$STAMP_CONFIG"`:
 
 | Command | Result |
 | --- | --- |
-| `config` | Generate private `.env.azure`; no Azure calls. |
-| `preflight` | Check subscription and provisioning identity. |
-| `provision --wait-seconds 600` | Create or reconcile infrastructure, Delta roots, external tables and QAP; rerunnable. |
-| `provision --infra-only` | Create or reconcile Azure resources and both managed identity policies only. |
-| `status` | Check deployed infrastructure, Kusto capacity, experiment container/database, workspace customer ID and the `StorageRead` diagnostic setting. |
-| `reset` | Preview data-plane deletion; no mutation. |
-| `reset --execute` | Delete the sandbox Kusto database and stored blobs, versions and snapshots in all three containers; drop every table, external table, function and materialized view in the experiment database. |
-| `reset --resume` | Finish interrupted reset from its durable intent. |
-| `recover` / `recover --execute` | Preview / recover abandoned publisher occupancy after stopping writers. |
-| `prepare-run-fic` / `probe-run-fic` / `cleanup-run-fic` | Exact-run AKS trust lifecycle; [arguments and custody rules](../../docs/operations/OAT_RUN_AUTHORITY.md). **Cleanup removes only the recorded FIC after workload namespace removal; ambiguous receipts block automatic retry/recovery.** |
-| `bind-oat-qap` / `verify-oat-qap` / `cleanup-oat-qap` | Run-scoped bindings use the qualified Delta `Properties`, `ConnectionStrings`, mutation-receipt and cleanup-tombstone contracts. **Provider-contract qualification is not accelerated-read or benchmark readiness.** [Required workload/stop records and qualification boundary](../../docs/operations/OAT_RUN_AUTHORITY.md#run-scoped-qap-bindings). Cleanup's scope is only recorded external-table bindings, never data roots, databases or ownership tombstones. |
+| `config --stamp-config "$STAMP_CONFIG"` | Generate private `.env.azure`; no Azure calls. |
+| `preflight --stamp-config "$STAMP_CONFIG"` | Check subscription and provisioning identity. |
+| `provision --stamp-config "$STAMP_CONFIG" --wait-seconds 600 --preview-before-create` | Create or reconcile infrastructure, Delta roots, external tables and QAP; rerunnable. |
+| `provision --stamp-config "$STAMP_CONFIG" --infra-only --preview-before-create` | Create or reconcile Azure resources and both managed identity policies only. |
+| `status --stamp-config "$STAMP_CONFIG"` | Check deployed infrastructure, Kusto capacity, experiment container/database, workspace customer ID and the `StorageRead` diagnostic setting. |
+| `reset --stamp-config "$STAMP_CONFIG"` | Preview data-plane deletion; no mutation. |
+| `reset --stamp-config "$STAMP_CONFIG" --execute` | Destructively delete the selected stamp's main Kusto database and blobs, versions and snapshots in its three containers; empty the experiment database. |
+| `reset --stamp-config "$STAMP_CONFIG" --resume` | Finish interrupted reset from its durable intent. |
+| `recover --stamp-config "$STAMP_CONFIG"` / `recover --stamp-config "$STAMP_CONFIG" --execute` | Preview / recover abandoned publisher occupancy after stopping writers. |
+| `prepare-run-fic --stamp-config "$STAMP_CONFIG"` / `probe-run-fic --stamp-config "$STAMP_CONFIG"` / `cleanup-run-fic --stamp-config "$STAMP_CONFIG"` | Exact-run AKS trust lifecycle; [arguments and custody rules](../../docs/operations/OAT_RUN_AUTHORITY.md). **Cleanup removes only the recorded FIC after workload namespace removal; ambiguous receipts block automatic retry/recovery.** |
+| `bind-oat-qap --stamp-config "$STAMP_CONFIG"` / `verify-oat-qap --stamp-config "$STAMP_CONFIG"` / `cleanup-oat-qap --stamp-config "$STAMP_CONFIG"` | Run-scoped bindings use the qualified Delta `Properties`, `ConnectionStrings`, mutation-receipt and cleanup-tombstone contracts. **Provider-contract qualification is not accelerated-read or benchmark readiness.** [Required workload/stop records and qualification boundary](../../docs/operations/OAT_RUN_AUTHORITY.md#run-scoped-qap-bindings). Cleanup's scope is only recorded external-table bindings, never data roots, databases or ownership tombstones. |
 
 External publisher federation may be empty; the separate native
 `azure-qap-${clusterName}` trust is still required and verified. OAT pin setup
@@ -92,7 +92,7 @@ see [OAT run authority](../../docs/operations/OAT_RUN_AUTHORITY.md).
 | --- | --- |
 | Azure benchmark | `npx nx run loadtest:run -- --mode azure --validate --measure 2m` |
 | Archive an unsealed prior attempt | `npx --no-install tsx projects/loadtest/src/main.ts --discard-unsealed` |
-| Recreate empty tables after reset | `npx --no-install tsx infra/azure/bootstrap.ts provision --wait-seconds 600` |
+| Recreate empty tables after reset | `npx --no-install tsx infra/azure/bootstrap.ts provision --stamp-config "$STAMP_CONFIG" --wait-seconds 600 --preview-before-create` |
 | Offline checks | `npx nx run azure-infra:verify` |
 
 Full provision runs the fenced Rust initializer, then KQL reconciliation under
@@ -115,9 +115,11 @@ delivery receipts.
 ## AKS QAP stamp
 
 The AKS runtime runs the existing QAP driver and Rust binaries in a Kubernetes
-Job; devcontainer mode remains the default. One `arrow-collector` UAMI is
-shared by ADX, AKS control plane and kubelet, the federated pod, and ACR image
-publishing/pull. Preflight qualifies Azure support, quota and networking, and
+Job; devcontainer mode remains the default. The template declares one
+`arrow-collector` UAMI in the primary resource group, shared by ADX, AKS control
+plane and kubelet, the federated pod, and ACR image publishing/pull. This is not
+a count of AKS-managed resource-group identities; required platform extensions
+may create separate identities there. See [identity qualification](../../docs/operations/AKS_QAP.md#tenant-enforced-identities). Preflight qualifies Azure support, quota and networking, and
 blocks replacement while legacy Terraform state, Key Vault consumers, role
 assignments, registry publishers or FIC subjects remain unaccounted for.
 The operator principal must be authorized to create and delete federated
