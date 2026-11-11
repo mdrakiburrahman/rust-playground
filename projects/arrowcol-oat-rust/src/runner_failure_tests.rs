@@ -45,6 +45,44 @@ mod failure_evidence_tests {
         Ok(config)
     }
 
+    #[test]
+    fn host_publisher_assertion_command_uses_fixed_service_account_and_operator_identity() -> Result<()> {
+        let mut config = config()?;
+        config.kubectl_context = Some("selected-cluster".to_owned());
+        let command = host_publisher_assertion_command(&config);
+        let arguments = command
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(arguments, [
+            "--context", "selected-cluster", "--request-timeout=60s", "create", "token",
+            "arrow-collector", "--namespace", "arrow-collector", "--audience",
+            "api://AzureADTokenExchange", "--duration", "1h",
+        ]);
+        for variable in ["AZURE_CLIENT_ID", "AZURE_TENANT_ID", "AZURE_FEDERATED_TOKEN_FILE"] {
+            assert!(command.as_std().get_envs().any(|(key, value)| key == variable && value.is_none()));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refreshed_host_publisher_assertion_replaces_private_file_atomically() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("oat-host-publisher-{}.jwt", uuid::Uuid::new_v4()));
+        write_private_secret(&path, "old.header.signature")?;
+        let assertion = validated_host_publisher_assertion("new.header.signature\n")?;
+        replace_private_secret(&path, assertion)?;
+        assert_eq!(fs::read_to_string(&path)?, "new.header.signature\n");
+        assert!(validated_host_publisher_assertion("not-a-jwt").is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+        }
+        fs::remove_file(&path)?;
+        Ok(())
+    }
+
     fn completed(config: &OatConfig, run_id: &str, replicas: u32, rows: u64) -> Result<Vec<OatResult>> {
         result_rows(
             config,

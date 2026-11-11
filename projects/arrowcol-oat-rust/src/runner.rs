@@ -1373,13 +1373,132 @@ struct MatrixOutcome {
 }
 
 async fn publish_matrix_outcome(config: &OatConfig, outcome: MatrixOutcome) -> Result<()> {
-    let publication = publish_results(config, &outcome.rows).await;
+    let publication = async {
+        if config.platform.kind == crate::config::OatMode::Aks {
+            refresh_host_publisher_assertion(config).await?;
+        }
+        publish_results(config, &outcome.rows).await
+    }
+    .await;
     match (outcome.error, publication) {
         (None, result) => result,
         (Some(error), Ok(())) => Err(error),
         (Some(error), Err(publication_error)) => Err(error.context(format!(
             "publishing retained matrix evidence also failed: {publication_error:#}"
         ))),
+    }
+}
+
+fn host_publisher_assertion_command(config: &OatConfig) -> Command {
+    let mut command = Command::new("kubectl");
+    if let Some(context) = &config.kubectl_context {
+        command.args(["--context", context]);
+    }
+    command.args([
+        "--request-timeout=60s",
+        "create",
+        "token",
+        "arrow-collector",
+        "--namespace",
+        "arrow-collector",
+        "--audience",
+        "api://AzureADTokenExchange",
+        "--duration",
+        "1h",
+    ]);
+    use_operator_cli_identity(&mut command);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    command
+}
+
+async fn refresh_host_publisher_assertion(config: &OatConfig) -> Result<()> {
+    let client_id = std::env::var_os("AZURE_CLIENT_ID").filter(|value| !value.is_empty());
+    let tenant_id = std::env::var_os("AZURE_TENANT_ID").filter(|value| !value.is_empty());
+    let token_file = std::env::var_os("AZURE_FEDERATED_TOKEN_FILE").filter(|value| !value.is_empty());
+    if client_id.is_none() || tenant_id.is_none() {
+        bail!("AKS publisher workload identity configuration is incomplete");
+    }
+    let token_file = token_file.context("AKS publisher assertion file is not configured")?;
+    let output = tokio::time::timeout(
+        Duration::from_secs(90),
+        host_publisher_assertion_command(config).output(),
+    )
+    .await
+    .context("timed out refreshing the AKS host publisher assertion")?
+    .context("start kubectl to refresh the AKS host publisher assertion")?;
+    if !output.status.success() {
+        bail!(
+            "kubectl could not refresh the AKS host publisher assertion ({})",
+            output.status
+        );
+    }
+    let assertion =
+        String::from_utf8(output.stdout).context("kubectl returned a non-UTF-8 AKS host publisher assertion")?;
+    let assertion = validated_host_publisher_assertion(&assertion)?;
+    replace_private_secret(Path::new(&token_file), assertion)
+}
+
+fn validated_host_publisher_assertion(assertion: &str) -> Result<&str> {
+    let assertion = assertion.trim();
+    let parts = assertion.split('.').collect::<Vec<_>>();
+    if assertion.len() > 16_384
+        || parts.len() != 3
+        || parts.iter().any(|part| {
+            part.is_empty()
+                || !part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'='))
+        })
+    {
+        bail!("kubectl returned an invalid AKS host publisher assertion");
+    }
+    Ok(assertion)
+}
+
+fn replace_private_secret(path: &Path, contents: &str) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let metadata = fs::symlink_metadata(path).context("inspect existing AKS host publisher assertion file")?;
+        if !metadata.file_type().is_file() {
+            bail!("AKS host publisher assertion path is not a regular file");
+        }
+        let parent = path
+            .parent()
+            .context("AKS host publisher assertion has no parent directory")?;
+        let name = path
+            .file_name()
+            .context("AKS host publisher assertion has no file name")?;
+        let temporary = parent.join(format!(".{}.{}.tmp", name.to_string_lossy(), uuid::Uuid::new_v4()));
+        let result = (|| -> Result<()> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temporary)
+                .context("create refreshed private AKS host publisher assertion")?;
+            file.write_all(contents.as_bytes())
+                .context("write refreshed private AKS host publisher assertion")?;
+            file.write_all(b"\n")
+                .context("finish refreshed private AKS host publisher assertion")?;
+            file.sync_all()
+                .context("sync refreshed private AKS host publisher assertion")?;
+            fs::rename(&temporary, path).context("replace expired private AKS host publisher assertion")?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, contents);
+        bail!("AKS host publisher assertions require a Unix devcontainer")
     }
 }
 
