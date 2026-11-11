@@ -56,6 +56,11 @@ impl AppState {
         receiver
     }
 
+    /// Requests cancellation of a locally owned run.
+    ///
+    /// # Errors
+    /// Returns [`CancelRunError::NotFound`] if the run is missing, [`CancelRunError::NotLocal`] if it is not locally
+    /// owned, or [`CancelRunError::NotActive`] if cancellation is no longer available.
     pub async fn request_local_cancel(&self, id: &str) -> Result<(), CancelRunError> {
         if !self.local_runs.lock().await.contains(id) {
             return if self.runs.lock().await.contains_key(id) {
@@ -140,7 +145,7 @@ mod cancellation_tests {
         let local = state.register_run_cancel("local", true).await;
         let aks = state.register_run_cancel("aks", false).await;
 
-        state.request_local_cancel("local").await.unwrap();
+        assert!(state.request_local_cancel("local").await.is_ok());
         assert!(*local.borrow());
         assert_eq!(state.request_local_cancel("aks").await, Err(CancelRunError::NotLocal));
         assert!(!*aks.borrow());
