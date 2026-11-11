@@ -3320,6 +3320,76 @@ async fn run_aks_pin_setup_job(
     Ok(())
 }
 
+fn pin_init_job_failure_diagnostics(job: &Value, pods: &Value) -> String {
+    let mut details = Vec::new();
+    if let Some(conditions) = job.pointer("/status/conditions").and_then(Value::as_array) {
+        for condition in conditions.iter().filter(|condition| condition["status"] == "True") {
+            details.push(format!(
+                "Job {}: {} {}",
+                condition["type"].as_str().unwrap_or("condition"),
+                condition["reason"].as_str().unwrap_or("unknown"),
+                condition["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .chars()
+                    .take(240)
+                    .collect::<String>(),
+            ));
+        }
+    }
+    if let Some(items) = pods["items"].as_array() {
+        for pod in items {
+            let name = pod
+                .pointer("/metadata/name")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let phase = pod
+                .pointer("/status/phase")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            details.push(format!("Pod {name}: phase={phase}"));
+            if let Some(conditions) = pod.pointer("/status/conditions").and_then(Value::as_array) {
+                for condition in conditions.iter().filter(|condition| condition["status"] == "False") {
+                    details.push(format!(
+                        "Pod {name} {}: {} {}",
+                        condition["type"].as_str().unwrap_or("condition"),
+                        condition["reason"].as_str().unwrap_or("unknown"),
+                        condition["message"]
+                            .as_str()
+                            .unwrap_or("")
+                            .chars()
+                            .take(240)
+                            .collect::<String>(),
+                    ));
+                }
+            }
+            if let Some(containers) = pod.pointer("/status/containerStatuses").and_then(Value::as_array) {
+                for container in containers {
+                    let name = container["name"].as_str().unwrap_or("container");
+                    if let Some(waiting) = container.pointer("/state/waiting") {
+                        details.push(format!(
+                            "Container {name}: waiting={}",
+                            waiting["reason"].as_str().unwrap_or("unknown")
+                        ));
+                    }
+                    if let Some(terminated) = container.pointer("/state/terminated") {
+                        details.push(format!(
+                            "Container {name}: terminated={} exitCode={}",
+                            terminated["reason"].as_str().unwrap_or("unknown"),
+                            terminated["exitCode"].as_i64().unwrap_or_default()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if details.is_empty() {
+        "no Kubernetes Job or Pod failure details were available".to_owned()
+    } else {
+        details.join("; ")
+    }
+}
+
 async fn wait_for_aks_pin_setup(config: &OatConfig, job_name: &str, run_id: &str) -> Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(200);
     loop {
@@ -3352,8 +3422,33 @@ async fn wait_for_aks_pin_setup(config: &OatConfig, job_name: &str, run_id: &str
             )
             .await
             .unwrap_or_else(|error| format!("<could not read setup Job logs: {error:#}>"));
+            let pods = kubectl(
+                config,
+                vec![
+                    "get",
+                    "pods",
+                    "--namespace",
+                    &config.namespace,
+                    "--selector",
+                    &format!("job-name={job_name}"),
+                    "-o",
+                    "json",
+                ],
+                None,
+            )
+            .await
+            .and_then(|output| serde_json::from_str::<Value>(&output).context("parse pin initialization Pod status"));
+            let diagnostics = match pods {
+                Ok(pods) => pin_init_job_failure_diagnostics(&job, &pods),
+                Err(error) => format!("Pod diagnostics unavailable: {error:#}"),
+            };
+            let logs = if logs.trim().is_empty() {
+                "<no container logs>"
+            } else {
+                logs.trim()
+            };
             bail!(
-                "AKS OAT pin initialization Job {job_name} {}: {logs}",
+                "AKS OAT pin initialization Job {job_name} {}: {logs}; {diagnostics}",
                 if failed { "failed" } else { "timed out" }
             );
         }
@@ -6230,6 +6325,16 @@ mod tests {
         let mismatched_run_yaml = router_yaml_for_pin_test("00000000-0000-0000-0000-000000000002");
         assert!(pin_init_config_json(run_id, &expected, 20_000, 10_000, "sqlserver", &mismatched_run_yaml).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn pin_init_job_failure_diagnostics_include_job_and_pod_reasons() {
+        let job = json!({"status":{"conditions":[{"type":"Failed","status":"True","reason":"DeadlineExceeded"}]}});
+        let pods = json!({"items":[{"metadata":{"name":"oat-pin-init-pod"},"status":{"phase":"Failed","conditions":[{"type":"PodScheduled","status":"False","reason":"Unschedulable","message":"no matching nodes"}],"containerStatuses":[{"name":"pin-init","state":{"waiting":{"reason":"ImagePullBackOff"}}}]}}]});
+        let details = pin_init_job_failure_diagnostics(&job, &pods);
+        assert!(details.contains("DeadlineExceeded"));
+        assert!(details.contains("Unschedulable"));
+        assert!(details.contains("ImagePullBackOff"));
     }
 
     #[test]
