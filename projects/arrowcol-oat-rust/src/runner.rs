@@ -11,7 +11,7 @@ use arrow_deltalake::delta::object_store_for_url;
 use arrowcol_protocol::ImplementationPool;
 use arrowcol_routing::{LeaseKey, PressurePolicy, RoutingPolicy, run_table_pin_set_digest};
 use bytes::Bytes;
-use chrono::DateTime;
+use chrono::{DateTime, NaiveDateTime};
 use fs2::FileExt;
 use futures_util::future::join_all;
 use object_store::{GetOptions, ObjectStore, PutMode, PutOptions, PutPayload, UpdateVersion, path::Path as ObjectPath};
@@ -2900,6 +2900,16 @@ async fn observe_qap(
     aggregate_qap(&observation, qap_tables)
 }
 
+fn parse_qap_timestamp(value: &str) -> Option<i64> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.timestamp_millis())
+        .or_else(|_| {
+            NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
+                .map(|timestamp| timestamp.and_utc().timestamp_millis())
+        })
+        .ok()
+}
+
 fn aggregate_qap(observation: &Value, expected_tables: &[String]) -> Result<QapMetrics> {
     let expected = observation
         .get("expected_tables")
@@ -2951,7 +2961,7 @@ fn aggregate_qap(observation: &Value, expected_tables: &[String]) -> Result<QapM
     let cached_bytes = sum_qap_values(&available, "/statistics/HotSize").filter(|_| all_available);
     let health = available
         .iter()
-        .map(|table| table.pointer("/state/is_healthy").and_then(Value::as_bool))
+        .map(|table| table.pointer("/state/IsHealthy").and_then(Value::as_bool))
         .collect::<Option<Vec<_>>>();
     let unhealthy_catalogs = health
         .map(|values| values.into_iter().filter(|healthy| !healthy).count() as u64)
@@ -2962,7 +2972,7 @@ fn aggregate_qap(observation: &Value, expected_tables: &[String]) -> Result<QapM
             let updated = table
                 .pointer("/statistics/LastUpdatedDateTime")
                 .and_then(Value::as_str)?;
-            let timestamp = DateTime::parse_from_rfc3339(updated).ok()?.timestamp_millis();
+            let timestamp = parse_qap_timestamp(updated)?;
             Some((observed_unix_ms as f64 - timestamp as f64) / 1000.0)
         })
         .collect::<Option<Vec<_>>>();
@@ -7213,6 +7223,7 @@ mod tests {
 
     #[test]
     fn aggregates_qap_metrics_only_when_all_expected_tables_are_measured() -> Result<()> {
+        assert_eq!(parse_qap_timestamp("1970-01-01T00:00:00Z"), Some(0));
         let names = ["dataflow_sqlserver_wait_stats", "dataflow_sqlserver_cpu_utilization"].map(str::to_owned);
         let observation = serde_json::json!({
             "observed_unix_ms": 10_000,
@@ -7224,9 +7235,9 @@ mod tests {
                         "AccelerationCompletePercentage": 70.0,
                         "AccelerationPendingDataFilesCount": 2,
                         "HotSize": 10,
-                        "LastUpdatedDateTime": "1970-01-01T00:00:00Z"
+                        "LastUpdatedDateTime": "1970-01-01 00:00:00.0000000"
                     },
-                    "state": {"is_healthy": true}
+                    "state": {"IsHealthy": true}
                 },
                 "dataflow_sqlserver_cpu_utilization": {
                     "available": true,
@@ -7234,9 +7245,9 @@ mod tests {
                         "AccelerationCompletePercentage": 50.0,
                         "AccelerationPendingDataFilesCount": 3,
                         "HotSize": 20,
-                        "LastUpdatedDateTime": "1970-01-01T00:00:00Z"
+                        "LastUpdatedDateTime": "1970-01-01 00:00:00.0000000"
                     },
-                    "state": {"is_healthy": false}
+                    "state": {"IsHealthy": false}
                 }
             }
         });
