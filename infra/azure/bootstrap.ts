@@ -928,7 +928,6 @@ export function arm_what_if_runtime_roles(c: Config): Array<{ id: string; scope:
     [vnet + c.stampConfig.aks.systemPool.name, 'network-contributor', '4d97b98b-1d4f-4787-a291-c67834d212e7'],
     [vnet + 'apiserver-subnet', 'network-contributor', '4d97b98b-1d4f-4787-a291-c67834d212e7'],
     [c.identity_id, 'managed-identity-operator', 'f1a07417-d97a-45cb-824c-7a7467783830'],
-    [c.identity_id, 'run-federation-contributor', '7e559ce2-48d7-4b27-9128-fa1b247f1308'],
     [c.registry_id, 'acr-pull', '7f951dda-4ed3-4680-a7ca-43fe172d538d'],
     [c.registry_id, 'acr-push', '8311e382-0749-4cb8-b61a-304f252e45ec'],
     [c.registry_id, 'registry-reader', reader],
