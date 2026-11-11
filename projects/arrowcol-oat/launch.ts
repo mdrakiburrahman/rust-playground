@@ -440,8 +440,7 @@ export async function launchOat(
     signal: AbortSignal.timeout(30_000),
   });
   let status = await readStatus(startResponse, 'start OAT run');
-  await onRunStarted?.(status);
-  onProgress(status);
+  let startFailure: { error: unknown } | undefined;
   type CancellationOutcome = { ok: true } | { ok: false; error: unknown };
   let cancellationRequest: Promise<CancellationOutcome> = Promise.resolve({ ok: true });
   let cancellationRequested = false;
@@ -468,6 +467,13 @@ export async function launchOat(
   if (signal?.aborted) requestCancellation();
   else signal?.addEventListener('abort', requestCancellation, { once: true });
   try {
+    try {
+      await onRunStarted?.(status);
+    } catch (error) {
+      startFailure = { error };
+      if (status.state === 'queued' || status.state === 'running') requestCancellation();
+    }
+    onProgress(status);
     while (status.state === 'queued' || status.state === 'running') {
       if (!cancellationRequested || cancellationObserved) {
         let pollTimer: NodeJS.Timeout;
@@ -495,10 +501,24 @@ export async function launchOat(
       status = await readStatus(response, 'poll OAT run');
       onProgress(status);
     }
+  } catch (error) {
+    if (startFailure) {
+      const original = startFailure.error instanceof Error ? startFailure.error.message : String(startFailure.error);
+      const cleanup = error instanceof Error ? error.message : String(error);
+      throw new Error(`OAT run ownership could not be recorded: ${original}; cancellation cleanup also failed: ${cleanup}`, { cause: error });
+    }
+    throw error;
   } finally {
     signal?.removeEventListener('abort', requestCancellation);
   }
   onRunFinished?.(status);
+  if (startFailure) {
+    if (status.state !== 'succeeded' && status.state !== 'cancelled') {
+      const original = startFailure.error instanceof Error ? startFailure.error.message : String(startFailure.error);
+      throw new Error(`OAT run ownership could not be recorded: ${original}; cancellation did not confirm cleanup: ${status.error ?? status.state}`);
+    }
+    throw startFailure.error instanceof Error ? startFailure.error : new Error(String(startFailure.error));
+  }
   if (status.state === 'failed' || status.state === 'cancelled') {
     throw new Error(status.error ?? `OAT run ${status.id} ${status.state}`);
   }

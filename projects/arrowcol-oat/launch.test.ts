@@ -245,6 +245,39 @@ test('reports validation errors returned by the server', async () => {
   }
 });
 
+test('ownership persistence failures cancel the accepted run before propagating the disk error', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-owner-enospc-'));
+  const configPath = path.join(directory, 'config.json');
+  await writeFile(configPath, '{}');
+  try {
+    for (const cleanupFails of [false, true]) {
+      const calls: string[] = [];
+      let cleanupFinished = false;
+      const fetcher: typeof fetch = async (input, init) => {
+        const url = new URL(String(input));
+        calls.push(`${init?.method ?? 'GET'} ${url.pathname}`);
+        if (url.pathname === '/runs') return new Response(JSON.stringify(status('queued')), { status: 202 });
+        if (url.pathname.endsWith('/cancel')) {
+          return new Response(JSON.stringify(cleanupFails ? { error: 'synthetic cleanup failure' } : {}), { status: cleanupFails ? 500 : 202 });
+        }
+        return new Response(JSON.stringify({
+          ...status('running'), state: 'cancelled', error: 'run cancelled by request',
+        }));
+      };
+      await assert.rejects(launchOat(configPath, undefined, 1, fetcher, () => {}, undefined, undefined, undefined,
+        async () => { throw new Error('ENOSPC writing ownership marker'); },
+        () => { cleanupFinished = true; }),
+      cleanupFails ? /ENOSPC writing ownership marker.*synthetic cleanup failure/ : /ENOSPC writing ownership marker/);
+      assert.deepEqual(calls, cleanupFails
+        ? ['POST /runs', 'POST /runs/run-a/cancel']
+        : ['POST /runs', 'POST /runs/run-a/cancel', 'GET /runs/run-a']);
+      assert.equal(cleanupFinished, !cleanupFails);
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('allows the executable to select the platform mode without editing the config file', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'arrowcol-oat-'));
   const configPath = path.join(directory, 'oat.json');
