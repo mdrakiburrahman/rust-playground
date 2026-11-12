@@ -61,6 +61,7 @@ async fn main() -> Result<()> {
         );
     }
     let admissions = Cell::new((0_usize, 0_usize));
+    let mut admission_accounting_complete = true;
     let send = || async {
         let report = dmv::send_authenticated_report(
             &args.endpoint,
@@ -118,7 +119,7 @@ async fn main() -> Result<()> {
         let deadline = measured_at
             .checked_add(measure)
             .ok_or_else(|| anyhow::anyhow!("measurement deadline is out of range"))?;
-        warmup_until(measured_at, &send).await?;
+        admission_accounting_complete = !warmup_until(measured_at, &send).await?;
         let measurement_started_unix_ms = unix_time_ms()?;
         let measurement_window_start_unix_ms = run_start_unix_ms
             .checked_add(args.warmup_secs.saturating_mul(1_000))
@@ -193,6 +194,7 @@ async fn main() -> Result<()> {
         serde_json::json!({
             "best_effort_streams": best_effort_streams,
             "durable_streams": durable_streams,
+            "admission_accounting_complete": admission_accounting_complete,
             "completed_at_unix_ms": unix_time_ms()?,
         })
     );
@@ -280,25 +282,26 @@ fn unix_time_ms() -> Result<u64> {
     )?)
 }
 
-async fn warmup_until<F, Fut>(measured_at: Instant, mut send: F) -> Result<()>
+/// Reports whether the boundary cancelled an upload, leaving admission counts incomplete.
+async fn warmup_until<F, Fut>(measured_at: Instant, mut send: F) -> Result<bool>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<usize>>,
 {
     loop {
         if Instant::now() >= measured_at {
-            return Ok(());
+            return Ok(false);
         }
         tokio::select! {
             biased;
             result = send() => {
                 result?;
                 if Instant::now() >= measured_at {
-                    return Ok(());
+                    return Ok(false);
                 }
             }
             // Dropping this owned DoPut future cancels the streams; no upload is detached.
-            _ = tokio::time::sleep_until(measured_at) => return Ok(()),
+            _ = tokio::time::sleep_until(measured_at) => return Ok(true),
         }
     }
 }
@@ -331,7 +334,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn warmup_cancels_a_slow_send_at_the_shared_boundary() -> anyhow::Result<()> {
+    async fn warmup_cancellation_marks_partial_concurrent_accounting_incomplete() -> anyhow::Result<()> {
         struct DropFlag(Arc<AtomicBool>);
 
         impl Drop for DropFlag {
@@ -343,21 +346,35 @@ mod tests {
         let started = Arc::new(AtomicBool::new(false));
         let cancelled = Arc::new(AtomicBool::new(false));
         let completed = Arc::new(AtomicBool::new(false));
+        let observed_streams = Arc::new(AtomicUsize::new(0));
+        let reported_streams = Arc::new(AtomicUsize::new(0));
         let deadline = Instant::now() + Duration::from_millis(40);
-        warmup_until(deadline, {
+        let cancelled_upload = warmup_until(deadline, {
             let started = Arc::clone(&started);
             let cancelled = Arc::clone(&cancelled);
             let completed = Arc::clone(&completed);
+            let observed_streams = Arc::clone(&observed_streams);
+            let reported_streams = Arc::clone(&reported_streams);
             move || {
                 let started = Arc::clone(&started);
                 let cancelled = Arc::clone(&cancelled);
                 let completed = Arc::clone(&completed);
+                let observed_streams = Arc::clone(&observed_streams);
+                let reported_streams = Arc::clone(&reported_streams);
                 async move {
-                    let _drop_flag = DropFlag(cancelled);
                     started.store(true, Ordering::SeqCst);
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    tokio::join!(
+                        async {
+                            observed_streams.fetch_add(1, Ordering::SeqCst);
+                        },
+                        async {
+                            let _drop_flag = DropFlag(cancelled);
+                            std::future::pending::<()>().await;
+                        },
+                    );
+                    reported_streams.fetch_add(observed_streams.load(Ordering::SeqCst), Ordering::SeqCst);
                     completed.store(true, Ordering::SeqCst);
-                    Ok(1)
+                    Ok(2)
                 }
             }
         })
@@ -366,6 +383,9 @@ mod tests {
         assert!(started.load(Ordering::SeqCst));
         assert!(cancelled.load(Ordering::SeqCst));
         assert!(!completed.load(Ordering::SeqCst));
+        assert_eq!(observed_streams.load(Ordering::SeqCst), 1);
+        assert_eq!(reported_streams.load(Ordering::SeqCst), 0);
+        assert!(cancelled_upload);
         Ok(())
     }
 

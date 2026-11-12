@@ -2152,6 +2152,7 @@ struct ClientMetrics {
 struct CollectorCompletion {
     best_effort_streams: u64,
     durable_streams: u64,
+    admission_accounting_complete: bool,
     completed_at_unix_ms: u64,
 }
 
@@ -7691,11 +7692,17 @@ mod tests {
     #[test]
     fn client_completion_keeps_actual_admission_kinds_and_rejects_bad_evidence() -> Result<()> {
         let metrics = "measured_rows=100 measured_seconds=60 rows_per_second=1.667 measurement_window_start_unix_ms=100000 measurement_window_end_unix_ms=160000 measurement_started_unix_ms=100000";
-        let completion =
-            r#"OAT_COLLECTOR_COMPLETION {"best_effort_streams":3,"durable_streams":2,"completed_at_unix_ms":160001}"#;
+        let completion = r#"OAT_COLLECTOR_COMPLETION {"best_effort_streams":3,"durable_streams":2,"admission_accounting_complete":false,"completed_at_unix_ms":160001}"#;
         let report = parse_client_metrics(&format!("{metrics}\n{completion}"))?;
         let evidence = report.collector_completion.context("completion evidence missing")?;
         assert_eq!((evidence.best_effort_streams, evidence.durable_streams), (3, 2));
+        assert!(!evidence.admission_accounting_complete);
+        assert!(
+            parse_client_metrics(&format!("{metrics}\n{}", completion.replace("false", "true")))?
+                .collector_completion
+                .context("complete accounting evidence missing")?
+                .admission_accounting_complete
+        );
         assert!(parse_client_metrics(metrics)?.collector_completion.is_none());
         assert!(parse_client_metrics(&format!("{metrics}\n{completion}\n{completion}")).is_err());
         assert!(parse_client_metrics(&format!("{metrics}\n{}", completion.replace("160001", "159999"))).is_err());

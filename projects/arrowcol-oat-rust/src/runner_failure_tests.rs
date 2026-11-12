@@ -112,6 +112,7 @@ mod failure_evidence_tests {
                             completions: vec![CollectorCompletion {
                                 best_effort_streams: 3,
                                 durable_streams: 2,
+                                admission_accounting_complete: false,
                                 completed_at_unix_ms: 1_794_173_460_000,
                             }],
                         },
@@ -138,6 +139,7 @@ mod failure_evidence_tests {
         assert_eq!(tunables["delta_delivery"], "not_established");
         assert_eq!(tunables["collector_completion"]["evidence"], "reported");
         assert_eq!(tunables["collector_completion"]["clients"][0]["best_effort_streams"], 3);
+        assert_eq!(tunables["collector_completion"]["clients"][0]["admission_accounting_complete"], false);
         assert_eq!(tunables["collector_completion"]["clients"][0]["durable_streams"], 2);
         Ok(())
     }

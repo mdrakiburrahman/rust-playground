@@ -48,7 +48,7 @@ node CPU utilization aligned to each 30-second measurement window.
 
 | Evidence stage | Meaning |
 | --- | --- |
-| Collector completion | All clients completed their uploads and measurement interval. Result `tunables_json.collector_completion` preserves each client's actual best-effort/durable admission counts and completion timestamp from completed upload calls across preflight, warm-up and measurement. Partial or cancelled upload calls are not counted. Missing reports are explicitly unavailable. |
+| Collector completion | All clients completed their uploads and measurement interval. Result `tunables_json.collector_completion` preserves each client's actual best-effort/durable admission counts and completion timestamp from completed upload calls across preflight, warm-up and measurement. Partial or cancelled upload calls are not counted; `admission_accounting_complete=false` explicitly marks incomplete accounting when warm-up cancels an upload. Missing reports are explicitly unavailable. |
 | Delta delivery | `tunables_json.delta_delivery` remains `not_established`. Durable admission acknowledges local WAL persistence, not Delta commit/flush or ADX visibility; no delivery barrier is implied. |
 | QAP catch-up | After client completion, sample read-only QAP metadata until every expected table is healthy, 100% complete and has zero pending files, or the existing single `qap_timeout_seconds` observation budget expires. Keep the last complete snapshot on deadline; incomplete QAP still fails the unchanged verdict. |
 
