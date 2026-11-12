@@ -102,6 +102,9 @@ impl RuntimeError {
                 catalog_error_code = code,
                 catalog_error_cause = cause,
                 catalog_error_origin = origin,
+                catalog_error_operation = error.operation().unwrap_or("unclassified"),
+                catalog_grpc_status = error.grpc_status().unwrap_or("none"),
+                catalog_failure_id = error.failure_id().unwrap_or("none"),
                 "catalog operation failed"
             );
         }
@@ -388,26 +391,36 @@ mod tests {
                 CatalogErrorCode::CorruptCatalogState,
                 "persisted_catalog_state_invalid",
                 CatalogErrorOrigin::LocalCatalog,
+                None,
+                None,
             ),
             (
                 CatalogErrorCode::ApplicationDatabase,
                 "application_database_operation_failed",
                 CatalogErrorOrigin::LocalCatalog,
+                None,
+                None,
             ),
             (
                 CatalogErrorCode::DescriptorGeneration,
                 "descriptor_generation_failed",
                 CatalogErrorOrigin::LocalCatalog,
+                None,
+                None,
             ),
             (
                 CatalogErrorCode::ReconciliationFailed,
                 "catalog_saga_reconciliation_failed",
                 CatalogErrorOrigin::LocalCatalog,
+                None,
+                None,
             ),
             (
                 CatalogErrorCode::ReconciliationFailed,
                 "catalog_saga_reconciliation_failed",
                 CatalogErrorOrigin::RemoteGrpc,
+                Some("flight_do_put"),
+                Some("internal"),
             ),
         ];
         let logs = TestWriter::default();
@@ -420,10 +433,11 @@ mod tests {
             let _guard = tracing_subscriber::util::SubscriberInitExt::set_default(subscriber);
             cases
                 .iter()
-                .map(|(code, _, origin)| {
+                .map(|(code, _, origin, operation, grpc_status)| {
                     RuntimeError::from_catalog(
                         &arrowcol_catalog::CatalogError::new(*code, "connection_string=do-not-log")
-                            .with_origin(*origin),
+                            .with_origin(*origin)
+                            .with_diagnostic_context(operation.unwrap_or("test_operation"), *grpc_status, None),
                     )
                 })
                 .collect::<Vec<_>>()
@@ -435,7 +449,7 @@ mod tests {
                 .clone(),
         )?;
         assert!(!output.contains("do-not-log"), "{output}");
-        for ((code, cause, origin), status) in cases.iter().zip(statuses) {
+        for ((code, cause, origin, operation, grpc_status), status) in cases.iter().zip(statuses) {
             assert!(output.contains(code.as_str()), "missing {code} in {output}");
             assert!(output.contains(cause), "missing {cause} in {output}");
             assert!(
@@ -443,6 +457,12 @@ mod tests {
                 "missing {} in {output}",
                 origin.as_str()
             );
+            if let Some(operation) = operation {
+                assert!(output.contains(operation), "missing {operation} in {output}");
+            }
+            if let Some(grpc_status) = grpc_status {
+                assert!(output.contains(grpc_status), "missing {grpc_status} in {output}");
+            }
             assert_eq!(status.grpc_code(), Code::Internal);
             assert_eq!(status.public_message(), "catalog operation failed");
         }

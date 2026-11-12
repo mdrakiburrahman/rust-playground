@@ -764,7 +764,13 @@ impl FlightSqlDdlHandler for CatalogService {
     async fn execute_ddl(&self, request: FlightSqlDdlRequest) -> CatalogResult<DdlCompletion> {
         self.apply_sql(request.command())
             .await
-            .map_err(|error| CatalogError::new(CatalogErrorCode::ReconciliationFailed, format!("{error:#}")))?
+            .map_err(|error| {
+                CatalogError::new(CatalogErrorCode::ReconciliationFailed, format!("{error:#}")).with_diagnostic_context(
+                    "catalog_execute_ddl",
+                    None,
+                    Some("catalog_apply_sql_failure"),
+                )
+            })?
             .ok_or_else(|| {
                 CatalogError::new(
                     CatalogErrorCode::DdlUnsupportedStatement,

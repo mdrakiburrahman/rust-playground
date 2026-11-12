@@ -168,6 +168,9 @@ pub struct CatalogError {
     code: CatalogErrorCode,
     message: String,
     origin: CatalogErrorOrigin,
+    operation: Option<&'static str>,
+    grpc_status: Option<&'static str>,
+    failure_id: Option<&'static str>,
 }
 
 impl CatalogError {
@@ -178,6 +181,9 @@ impl CatalogError {
             code,
             message: message.into(),
             origin: CatalogErrorOrigin::LocalCatalog,
+            operation: None,
+            grpc_status: None,
+            failure_id: None,
         }
     }
 
@@ -185,6 +191,20 @@ impl CatalogError {
     #[must_use]
     pub const fn with_origin(mut self, origin: CatalogErrorOrigin) -> Self {
         self.origin = origin;
+        self
+    }
+
+    /// Adds safe, static diagnostic context.
+    #[must_use]
+    pub const fn with_diagnostic_context(
+        mut self,
+        operation: &'static str,
+        grpc_status: Option<&'static str>,
+        failure_id: Option<&'static str>,
+    ) -> Self {
+        self.operation = Some(operation);
+        self.grpc_status = grpc_status;
+        self.failure_id = failure_id;
         self
     }
 
@@ -198,6 +218,24 @@ impl CatalogError {
     #[must_use]
     pub const fn origin(&self) -> CatalogErrorOrigin {
         self.origin
+    }
+
+    /// Returns the static operation associated with this failure.
+    #[must_use]
+    pub const fn operation(&self) -> Option<&'static str> {
+        self.operation
+    }
+
+    /// Returns the static gRPC status name, when the failure came from gRPC.
+    #[must_use]
+    pub const fn grpc_status(&self) -> Option<&'static str> {
+        self.grpc_status
+    }
+
+    /// Returns the static local failure identifier, when available.
+    #[must_use]
+    pub const fn failure_id(&self) -> Option<&'static str> {
+        self.failure_id
     }
 
     /// Returns the safe human-readable explanation.

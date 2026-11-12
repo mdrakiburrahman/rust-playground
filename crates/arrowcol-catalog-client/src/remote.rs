@@ -151,7 +151,7 @@ impl RemoteCatalogClient {
             .rpc_call()
             .get_snapshot(request)
             .await
-            .map_err(rpc_error)?
+            .map_err(|status| rpc_error("get_snapshot", status))?
             .into_inner();
         let position = snapshot
             .position
@@ -189,7 +189,14 @@ impl RemoteCatalogClient {
                 return;
             };
             if let Err(error) = client.watch_once().await {
-                tracing::warn!(%error, "catalog CES disconnected; reconciling before reconnect");
+                tracing::warn!(
+                    catalog_error_code = error.code().as_str(),
+                    catalog_error_origin = error.origin().as_str(),
+                    catalog_error_operation = error.operation().unwrap_or("unclassified"),
+                    catalog_grpc_status = error.grpc_status().unwrap_or("none"),
+                    catalog_failure_id = error.failure_id().unwrap_or("none"),
+                    "catalog CES disconnected; reconciling before reconnect"
+                );
                 let mut cache = client.cache.lock().await;
                 cache.tables.clear();
                 cache.healthy_at = None;
@@ -202,7 +209,14 @@ impl RemoteCatalogClient {
                 return;
             };
             if let Err(error) = client.reconcile().await {
-                tracing::warn!(%error, "catalog reconciliation failed");
+                tracing::warn!(
+                    catalog_error_code = error.code().as_str(),
+                    catalog_error_origin = error.origin().as_str(),
+                    catalog_error_operation = error.operation().unwrap_or("unclassified"),
+                    catalog_grpc_status = error.grpc_status().unwrap_or("none"),
+                    catalog_failure_id = error.failure_id().unwrap_or("none"),
+                    "catalog reconciliation failed"
+                );
             }
         }
     }
@@ -213,7 +227,12 @@ impl RemoteCatalogClient {
         self.signer
             .sign_message(&mut request, CES_WATCH_PATH)
             .map_err(|error| failure(format!("catalog request signing failed: {error}")))?;
-        let mut stream = self.rpc_call().watch(request).await.map_err(rpc_error)?.into_inner();
+        let mut stream = self
+            .rpc_call()
+            .watch(request)
+            .await
+            .map_err(|status| rpc_error("watch", status))?
+            .into_inner();
         let mut reconcile_tick = tokio::time::interval(Duration::from_secs(5));
         let lifetime = tokio::time::sleep(Duration::from_secs(30));
         tokio::pin!(lifetime);
@@ -221,7 +240,9 @@ impl RemoteCatalogClient {
             tokio::select! {
                 _ = &mut lifetime => return Ok(()),
                 event = stream.message() => {
-                    let event = event.map_err(rpc_error)?.ok_or_else(|| failure("catalog CES ended"))?;
+                    let event = event
+                        .map_err(|status| rpc_error("watch_message", status))?
+                        .ok_or_else(|| failure("catalog CES ended"))?;
                     let position = event.position.ok_or_else(|| failure("CES event has no position"))?;
                     let identity = identity_from_request(&event.table.ok_or_else(|| failure("CES event has no table"))?)?;
                     let mut cache = self.cache.lock().await;
@@ -237,7 +258,12 @@ impl RemoteCatalogClient {
                 _ = reconcile_tick.tick() => {
                     let mut request = Request::new(rpc::Empty {});
                     self.signer.sign_message(&mut request, CES_CURRENT_PATH).map_err(|error| failure(format!("catalog request signing failed: {error}")))?;
-                    let remote = self.rpc_call().get_current_event_id(request).await.map_err(rpc_error)?.into_inner();
+                    let remote = self
+                        .rpc_call()
+                        .get_current_event_id(request)
+                        .await
+                        .map_err(|status| rpc_error("get_current_event_id", status))?
+                        .into_inner();
                     let mut cache = self.cache.lock().await;
                     let local = cache.position.as_ref().ok_or_else(|| failure("CES cache has no position"))?;
                     if remote.epoch != local.epoch || remote.event_id < local.event_id {
@@ -279,12 +305,12 @@ impl FlightSqlDdlHandler for RemoteCatalogClient {
         let response = FlightServiceClient::new(self.channel.clone())
             .do_put(flight_request)
             .await
-            .map_err(|error| failure(format!("catalog Flight SQL failed: {error}")))?;
+            .map_err(|status| flight_rpc_error("flight_do_put", status))?;
         let mut completion = response.into_inner();
         completion
             .message()
             .await
-            .map_err(|error| failure(format!("catalog Flight SQL completion failed: {error}")))?;
+            .map_err(|status| flight_rpc_error("flight_do_put_completion", status))?;
         self.invalidate(&identity).await;
         let table = self.table(&identity).await?;
         let schema = table
@@ -384,7 +410,7 @@ impl CatalogClient for RemoteCatalogClient {
                 .rpc_call()
                 .get_table(request)
                 .await
-                .map_err(rpc_error)?
+                .map_err(|status| rpc_error("get_table", status))?
                 .into_inner();
             let table = decode_table(response)?;
             if table.versions[0].identity() != identity {
@@ -418,19 +444,50 @@ impl CatalogClient for RemoteCatalogClient {
 }
 
 fn failure(message: impl Into<String>) -> CatalogError {
-    CatalogError::new(CatalogErrorCode::ReconciliationFailed, message).with_origin(CatalogErrorOrigin::RemoteClient)
+    CatalogError::new(CatalogErrorCode::ReconciliationFailed, message)
+        .with_origin(CatalogErrorOrigin::RemoteClient)
+        .with_diagnostic_context("remote_catalog_client", None, Some("remote_catalog_client_failure"))
 }
 
-fn rpc_error(status: tonic::Status) -> CatalogError {
+fn rpc_error(operation: &'static str, status: tonic::Status) -> CatalogError {
     CatalogError::new(
         if status.code() == tonic::Code::NotFound {
             CatalogErrorCode::TableNotFound
         } else {
             CatalogErrorCode::ReconciliationFailed
         },
-        format!("catalog RPC {}: {}", status.code(), status.message()),
+        "remote catalog RPC failed",
     )
     .with_origin(CatalogErrorOrigin::RemoteGrpc)
+    .with_diagnostic_context(operation, Some(grpc_status_name(status.code())), None)
+}
+
+fn flight_rpc_error(operation: &'static str, status: tonic::Status) -> CatalogError {
+    CatalogError::new(CatalogErrorCode::ReconciliationFailed, "remote Flight SQL RPC failed")
+        .with_origin(CatalogErrorOrigin::RemoteGrpc)
+        .with_diagnostic_context(operation, Some(grpc_status_name(status.code())), None)
+}
+
+const fn grpc_status_name(code: tonic::Code) -> &'static str {
+    match code {
+        tonic::Code::Ok => "ok",
+        tonic::Code::Cancelled => "cancelled",
+        tonic::Code::Unknown => "unknown",
+        tonic::Code::InvalidArgument => "invalid_argument",
+        tonic::Code::DeadlineExceeded => "deadline_exceeded",
+        tonic::Code::NotFound => "not_found",
+        tonic::Code::AlreadyExists => "already_exists",
+        tonic::Code::PermissionDenied => "permission_denied",
+        tonic::Code::ResourceExhausted => "resource_exhausted",
+        tonic::Code::FailedPrecondition => "failed_precondition",
+        tonic::Code::Aborted => "aborted",
+        tonic::Code::OutOfRange => "out_of_range",
+        tonic::Code::Unimplemented => "unimplemented",
+        tonic::Code::Internal => "internal",
+        tonic::Code::Unavailable => "unavailable",
+        tonic::Code::DataLoss => "data_loss",
+        tonic::Code::Unauthenticated => "unauthenticated",
+    }
 }
 
 fn read_only() -> CatalogError {
@@ -494,7 +551,7 @@ impl CatalogStore for RemoteCatalogClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{failure, rpc_error};
+    use super::{failure, flight_rpc_error, grpc_status_name, rpc_error};
     use arrowcol_catalog::{CatalogErrorCode, CatalogErrorOrigin};
     use tonic::Status;
 
@@ -503,13 +560,35 @@ mod tests {
         let client_error = failure("local client failure");
         assert_eq!(client_error.code(), CatalogErrorCode::ReconciliationFailed);
         assert_eq!(client_error.origin(), CatalogErrorOrigin::RemoteClient);
+        assert_eq!(client_error.failure_id(), Some("remote_catalog_client_failure"));
 
-        let grpc_error = rpc_error(Status::internal("remote service failure"));
+        let grpc_error = rpc_error("get_table", Status::internal("remote service failure"));
         assert_eq!(grpc_error.code(), CatalogErrorCode::ReconciliationFailed);
         assert_eq!(grpc_error.origin(), CatalogErrorOrigin::RemoteGrpc);
+        assert_eq!(grpc_error.operation(), Some("get_table"));
+        assert_eq!(grpc_error.grpc_status(), Some("internal"));
 
-        let missing_table = rpc_error(Status::not_found("missing table"));
+        let missing_table = rpc_error("get_table", Status::not_found("missing table"));
         assert_eq!(missing_table.code(), CatalogErrorCode::TableNotFound);
         assert_eq!(missing_table.origin(), CatalogErrorOrigin::RemoteGrpc);
+        assert_eq!(missing_table.grpc_status(), Some("not_found"));
+
+        let put_error = flight_rpc_error("flight_do_put", Status::not_found("remote service failure"));
+        assert_eq!(put_error.code(), CatalogErrorCode::ReconciliationFailed);
+        assert_eq!(put_error.origin(), CatalogErrorOrigin::RemoteGrpc);
+        assert_eq!(put_error.operation(), Some("flight_do_put"));
+        assert_eq!(put_error.grpc_status(), Some("not_found"));
+        let completion_error = flight_rpc_error(
+            "flight_do_put_completion",
+            Status::unavailable("remote service failure"),
+        );
+        assert_eq!(completion_error.code(), CatalogErrorCode::ReconciliationFailed);
+        assert_eq!(completion_error.origin(), CatalogErrorOrigin::RemoteGrpc);
+        assert_eq!(completion_error.operation(), Some("flight_do_put_completion"));
+        assert_eq!(completion_error.grpc_status(), Some("unavailable"));
+        assert_eq!(
+            grpc_status_name(Status::deadline_exceeded("").code()),
+            "deadline_exceeded"
+        );
     }
 }
