@@ -698,15 +698,11 @@ async fn unrelated_table_invalidations_during_table_fetch_do_not_exhaust_retries
     let race_client = Arc::clone(&client);
     let requested = identity.clone();
     let mut fetch = tokio::spawn(async move { race_client.table(&requested).await });
-    let mut response_is_held = false;
+    tokio::time::timeout(Duration::from_secs(5), gate.started.notified())
+        .await
+        .context("catalog GetTable response was not held")?;
     let mut fetched = None;
     for _ in 0..3 {
-        if !response_is_held {
-            tokio::time::timeout(Duration::from_secs(5), gate.started.notified())
-                .await
-                .context("catalog GetTable response was not held")?;
-        }
-        response_is_held = false;
         client.invalidate(&unrelated).await;
         gate.release.notify_one();
 
@@ -722,7 +718,6 @@ async fn unrelated_table_invalidations_during_table_fetch_do_not_exhaust_retries
             fetched = Some(result.context("table fetch task panicked")??);
             break;
         }
-        response_is_held = true;
     }
     let fetched = match fetched {
         Some(table) => table,
