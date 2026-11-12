@@ -2,6 +2,7 @@ use collector_chain::dmv;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use std::future::Future;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::Instant;
 
@@ -104,9 +105,7 @@ async fn main() -> Result<()> {
         let deadline = measured_at
             .checked_add(measure)
             .ok_or_else(|| anyhow::anyhow!("measurement deadline is out of range"))?;
-        while Instant::now() < measured_at {
-            let _ = send().await?;
-        }
+        warmup_until(measured_at, &send).await?;
         let measurement_started_unix_ms = unix_time_ms()?;
         let measurement_window_start_unix_ms = run_start_unix_ms
             .checked_add(args.warmup_secs.saturating_mul(1_000))
@@ -259,9 +258,36 @@ fn unix_time_ms() -> Result<u64> {
     )?)
 }
 
+async fn warmup_until<F, Fut>(measured_at: Instant, mut send: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<usize>>,
+{
+    loop {
+        if Instant::now() >= measured_at {
+            return Ok(());
+        }
+        tokio::select! {
+            biased;
+            result = send() => {
+                result?;
+                if Instant::now() >= measured_at {
+                    return Ok(());
+                }
+            }
+            // Dropping this owned DoPut future cancels the streams; no upload is detached.
+            _ = tokio::time::sleep_until(measured_at) => return Ok(()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{MAX_SCHEDULE_TIMEOUT_SECS, stable_window_horizon, validate_schedule_timeout};
+    use super::{MAX_SCHEDULE_TIMEOUT_SECS, stable_window_horizon, validate_schedule_timeout, warmup_until};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio::time::Instant;
 
     #[test]
     fn later_throughput_collapse_invalidates_the_stable_hint() {
@@ -280,5 +306,92 @@ mod tests {
         assert!(validate_schedule_timeout(MAX_SCHEDULE_TIMEOUT_SECS).is_ok());
         assert!(validate_schedule_timeout(0).is_err());
         assert!(validate_schedule_timeout(MAX_SCHEDULE_TIMEOUT_SECS + 1).is_err());
+    }
+
+    #[tokio::test]
+    async fn warmup_cancels_a_slow_send_at_the_shared_boundary() {
+        struct DropFlag(Arc<AtomicBool>);
+
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let started = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let completed = Arc::new(AtomicBool::new(false));
+        let deadline = Instant::now() + Duration::from_millis(40);
+        warmup_until(deadline, {
+            let started = Arc::clone(&started);
+            let cancelled = Arc::clone(&cancelled);
+            let completed = Arc::clone(&completed);
+            move || {
+                let started = Arc::clone(&started);
+                let cancelled = Arc::clone(&cancelled);
+                let completed = Arc::clone(&completed);
+                async move {
+                    let _drop_flag = DropFlag(cancelled);
+                    started.store(true, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    completed.store(true, Ordering::SeqCst);
+                    Ok(1)
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(started.load(Ordering::SeqCst));
+        assert!(cancelled.load(Ordering::SeqCst));
+        assert!(!completed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn warmup_runs_completed_sends_until_the_boundary() {
+        let sends = Arc::new(AtomicUsize::new(0));
+        let deadline = Instant::now() + Duration::from_millis(60);
+        warmup_until(deadline, {
+            let sends = Arc::clone(&sends);
+            move || {
+                let sends = Arc::clone(&sends);
+                async move {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    sends.fetch_add(1, Ordering::SeqCst);
+                    Ok(1)
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(sends.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn warmup_propagates_send_errors() {
+        let error = warmup_until(Instant::now() + Duration::from_secs(1), || async {
+            anyhow::bail!("warm-up upload failed");
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "warm-up upload failed");
+    }
+
+    #[tokio::test]
+    async fn zero_warmup_does_not_start_a_send() {
+        let sends = Arc::new(AtomicUsize::new(0));
+        warmup_until(Instant::now(), {
+            let sends = Arc::clone(&sends);
+            move || {
+                sends.fetch_add(1, Ordering::SeqCst);
+                async { Ok(1) }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(sends.load(Ordering::SeqCst), 0);
     }
 }
