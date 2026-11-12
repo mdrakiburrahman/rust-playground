@@ -811,9 +811,19 @@ impl CatalogService {
         tokio::time::timeout(std::time::Duration::from_secs(10), consume)
             .await
             .map_err(|_| Status::deadline_exceeded("catalog DDL input did not close"))??;
-        self.apply_sql(&query.query)
-            .await
-            .map_err(|error| Status::failed_precondition(format!("{error:#}")))
+        self.apply_sql(&query.query).await.map_err(|error| {
+            tracing::error!(
+                target: "arrowcol_flight::catalog",
+                catalog_error_code = "reconciliation_failed",
+                catalog_error_cause = "catalog_saga_reconciliation_failed",
+                catalog_error_origin = "local_catalog",
+                catalog_error_operation = "catalog_flight_do_put_statement_update",
+                catalog_grpc_status = "failed_precondition",
+                catalog_failure_id = "catalog_apply_sql_failure",
+                "catalog operation failed"
+            );
+            Status::failed_precondition(format!("{error:#}"))
+        })
     }
 }
 

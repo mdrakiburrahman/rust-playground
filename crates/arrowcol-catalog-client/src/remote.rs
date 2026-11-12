@@ -247,8 +247,8 @@ impl RemoteCatalogClient {
                     let identity = identity_from_request(&event.table.ok_or_else(|| failure("CES event has no table"))?)?;
                     let mut cache = self.cache.lock().await;
                     let previous = cache.position.as_ref().ok_or_else(|| failure("CES cache has no position"))?;
-                    if position.epoch != previous.epoch || position.event_id != previous.event_id.checked_add(1).ok_or_else(|| failure("CES event ID exhausted"))? {
-                        return Err(failure("CES epoch changed or retained event gap detected"));
+                    if position.epoch != previous.epoch || position.event_id != previous.event_id.checked_add(1).ok_or_else(|| failure_at("catalog_ces_event_id_exhausted", "CES event ID exhausted"))? {
+                        return Err(failure_at("catalog_ces_epoch_or_gap_detected", "CES epoch changed or retained event gap detected"));
                     }
                     cache.tables.remove(&identity);
                     cache.position = Some(position);
@@ -267,12 +267,12 @@ impl RemoteCatalogClient {
                     let mut cache = self.cache.lock().await;
                     let local = cache.position.as_ref().ok_or_else(|| failure("CES cache has no position"))?;
                     if remote.epoch != local.epoch || remote.event_id < local.event_id {
-                        return Err(failure("catalog restart detected during reconciliation"));
+                        return Err(failure_at("catalog_restart_during_reconciliation", "catalog restart detected during reconciliation"));
                     }
                     if remote == *local {
                         cache.healthy_at = Some(Instant::now());
                     } else if cache.healthy_at.is_none_or(|time| time.elapsed() > self.maximum_age) {
-                        return Err(failure("CES failed to catch up within maximum cache age"));
+                        return Err(failure_at("catalog_ces_reconcile_maximum_age_exceeded", "CES failed to catch up within maximum cache age"));
                     }
                 }
             }
@@ -427,13 +427,19 @@ impl CatalogClient for RemoteCatalogClient {
             {
                 cache.tables.clear();
                 cache.healthy_at = None;
-                return Err(failure("catalog restarted; reconcile before serving cached schemas"));
+                return Err(failure_at(
+                    "catalog_restart_during_table_fetch",
+                    "catalog restarted; reconcile before serving cached schemas",
+                ));
             }
             cache.tables.insert(identity.clone(), table.clone());
             // A fresh table RPC validates this table, not all older cached tables.
             return Ok(table);
         }
-        Err(failure("catalog changed repeatedly during table fetch"))
+        Err(failure_at(
+            "catalog_table_fetch_retries_exhausted",
+            "catalog changed repeatedly during table fetch",
+        ))
     }
 
     async fn invalidate(&self, identity: &TableIdentity) {
@@ -444,9 +450,13 @@ impl CatalogClient for RemoteCatalogClient {
 }
 
 fn failure(message: impl Into<String>) -> CatalogError {
+    failure_at("remote_catalog_client_failure", message)
+}
+
+fn failure_at(failure_id: &'static str, message: impl Into<String>) -> CatalogError {
     CatalogError::new(CatalogErrorCode::ReconciliationFailed, message)
         .with_origin(CatalogErrorOrigin::RemoteClient)
-        .with_diagnostic_context("remote_catalog_client", None, Some("remote_catalog_client_failure"))
+        .with_diagnostic_context("remote_catalog_client", None, Some(failure_id))
 }
 
 fn rpc_error(operation: &'static str, status: tonic::Status) -> CatalogError {
@@ -551,7 +561,7 @@ impl CatalogStore for RemoteCatalogClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{failure, flight_rpc_error, grpc_status_name, rpc_error};
+    use super::{failure, failure_at, flight_rpc_error, grpc_status_name, rpc_error};
     use arrowcol_catalog::{CatalogErrorCode, CatalogErrorOrigin};
     use tonic::Status;
 
@@ -561,6 +571,15 @@ mod tests {
         assert_eq!(client_error.code(), CatalogErrorCode::ReconciliationFailed);
         assert_eq!(client_error.origin(), CatalogErrorOrigin::RemoteClient);
         assert_eq!(client_error.failure_id(), Some("remote_catalog_client_failure"));
+
+        let epoch_error = failure_at("catalog_ces_epoch_or_gap_detected", "dynamic detail omitted");
+        let exhausted_error = failure_at("catalog_table_fetch_retries_exhausted", "dynamic detail omitted");
+        assert_ne!(epoch_error.failure_id(), exhausted_error.failure_id());
+        assert_eq!(epoch_error.failure_id(), Some("catalog_ces_epoch_or_gap_detected"));
+        assert_eq!(
+            exhausted_error.failure_id(),
+            Some("catalog_table_fetch_retries_exhausted")
+        );
 
         let grpc_error = rpc_error("get_table", Status::internal("remote service failure"));
         assert_eq!(grpc_error.code(), CatalogErrorCode::ReconciliationFailed);
