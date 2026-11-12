@@ -46,6 +46,18 @@ node CPU utilization aligned to each 30-second measurement window.
 
 ## Inputs and remaining binding
 
+| Evidence stage | Meaning |
+| --- | --- |
+| Collector completion | All clients completed their uploads and measurement interval. Result `tunables_json.collector_completion` preserves each client's actual best-effort/durable admission counts and completion timestamp, including preflight and warm-up uploads. Missing reports are explicitly unavailable. |
+| Delta delivery | `tunables_json.delta_delivery` remains `not_established`. Durable admission acknowledges local WAL persistence, not Delta commit/flush or ADX visibility; no delivery barrier is implied. |
+| QAP catch-up | After client completion, sample read-only QAP metadata until every expected table is healthy, 100% complete and has zero pending files, or the existing single `qap_timeout_seconds` observation budget expires. Keep the last complete snapshot on deadline; incomplete QAP still fails the unchanged verdict. |
+
+Historical query responses remain in `out/arrowcol-oat/qap/<cell-run-id>/kusto-queries.jsonl`.
+Catch-up also retains timestamped sanitized samples in `qap-observations.jsonl`
+and its terminal outcome in `catch-up-diagnostic.json`. The separate QAP setup
+budget is unchanged. Policy `MaxAge` is a freshness cutoff, not a deadline
+guaranteeing that caching has completed.
+
 | Input | Source / rule |
 | --- | --- |
 | Private baseline | Generated `out/arrowcol-oat/oat-config.aks.json`, its runtime JSON and bootstrap environment file. Do not copy secrets into tracked files. |

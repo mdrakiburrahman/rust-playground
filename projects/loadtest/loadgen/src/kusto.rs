@@ -2092,6 +2092,90 @@ pub async fn initialize_local_qap(
     .map_err(|_| anyhow::anyhow!("local QAP initialization exceeded its {deadline:?} deadline"))?
 }
 
+/// Samples QAP until every requested table is fully cached and healthy, or the
+/// single observation budget expires. Neither outcome proves Delta delivery.
+///
+/// # Errors
+///
+/// Returns setup, publication and observation failures, including a deadline
+/// reached before any complete observation could be retained.
+pub async fn observe_qap_until_ready(
+    endpoint: &str,
+    results: &Path,
+    mode: ObservationMode,
+    database: &str,
+    tables: &[String],
+    budget: Duration,
+) -> Result<Value> {
+    ensure!(!tables.is_empty(), "QAP catch-up requires expected tables");
+    let started = Instant::now();
+    let mut last = None;
+    let mut samples = 0_u64;
+    let outcome = loop {
+        let remaining = budget.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            break last
+                .map(|observation| (observation, false))
+                .context("QAP catch-up deadline elapsed before any observation");
+        }
+        let sample_started_unix_ms = now_unix_millis();
+        let sample = tokio::time::timeout(
+            remaining,
+            observe_qap_with_mode(endpoint, results, mode, database, tables, remaining),
+        )
+        .await;
+        match sample {
+            Ok(Ok(observation)) => {
+                samples += 1;
+                let ready = tables.iter().all(|name| {
+                    let table = &observation["tables"][name];
+                    table["available"] == true
+                        && table["state"]["IsHealthy"] == true
+                        && table["statistics"]["AccelerationCompletePercentage"].as_f64() == Some(100.0)
+                        && table["statistics"]["AccelerationPendingDataFilesCount"].as_u64() == Some(0)
+                });
+                append(
+                    &results.join("qap-observations.jsonl"),
+                    &json!({
+                        "sample": samples,
+                        "started_unix_ms": sample_started_unix_ms,
+                        "finished_unix_ms": now_unix_millis(),
+                        "caught_up": ready,
+                        "observation": sanitize(&observation),
+                    }),
+                )?;
+                if ready {
+                    break Ok((observation, true));
+                }
+                last = Some(observation);
+            }
+            Ok(Err(error)) if started.elapsed() < budget => break Err(error),
+            Ok(Err(_)) | Err(_) => {
+                break last
+                    .map(|observation| (observation, false))
+                    .context("QAP catch-up deadline elapsed before any observation");
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1).min(budget.saturating_sub(started.elapsed()))).await;
+    };
+    write_json(
+        &results.join("catch-up-diagnostic.json"),
+        &json!({
+            "code": match &outcome {
+                Ok((_, true)) => "caught_up",
+                Ok((_, false)) => "deadline_incomplete",
+                Err(_) => "observation_failed",
+            },
+            "elapsed_ms": u64::try_from(started.elapsed().as_millis())?,
+            "samples": samples,
+            "delta_delivery": "not_established",
+        }),
+    )?;
+    let (mut observation, caught_up) = outcome?;
+    observation["catch_up_status"] = json!(if caught_up { "caught_up" } else { "deadline_incomplete" });
+    Ok(observation)
+}
+
 async fn observe_table_metadata(client: &KustoClient, name: &str) -> Result<(Value, String)> {
     let (policy, max_age) = client.max_age(name).await?;
     let details = client.details(name).await;
@@ -3535,6 +3619,116 @@ mod tests {
             .await
             .is_err()
         );
+        Ok(())
+    }
+
+    fn catch_up_server(slow_second_sample: bool) -> Result<(Server, Arc<AtomicUsize>)> {
+        let samples = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&samples);
+        let server = Server::start(move |request| {
+            let command = request["csl"].as_str().context("command missing")?;
+            if command.ends_with("policy query_acceleration") {
+                return Ok(Some(response(
+                    &["Policy"],
+                    vec![json!(["{\"IsEnabled\":true,\"MaxAge\":\"00:05:00\"}"])],
+                )));
+            }
+            if command.ends_with(" details") {
+                return Ok(Some(response(
+                    &["QueryAccelerationState"],
+                    vec![json!(["{\"IsHealthy\":true}"])],
+                )));
+            }
+            if command.contains("query_acceleration statistics") {
+                let sample = seen.fetch_add(1, Ordering::SeqCst);
+                if sample > 0 && slow_second_sample {
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+                return Ok(Some(response(
+                    &[
+                        "ExternalTableName",
+                        "HotSize",
+                        "LastUpdatedDateTime",
+                        "PendingFiles",
+                        "PendingBytes",
+                        "Complete",
+                        "Eligible",
+                        "Fresh",
+                    ],
+                    vec![
+                        json!(["dataflow_a", 10, "2026-10-27T00:00:00Z", 0, 0, 100.0, 1, 1]),
+                        json!([
+                            "dataflow_b",
+                            10,
+                            "2026-10-27T00:00:00Z",
+                            if sample == 0 { 3 } else { 0 },
+                            0,
+                            if sample == 0 { 50.0 } else { 100.0 },
+                            1,
+                            1
+                        ]),
+                    ],
+                )));
+            }
+            Ok(Some(response(&[], vec![])))
+        })?;
+        Ok((server, samples))
+    }
+
+    #[tokio::test]
+    async fn catch_up_waits_for_every_table_and_retains_each_observation() -> Result<()> {
+        let directory = Directory::new()?;
+        let (server, samples) = catch_up_server(false)?;
+        let observed = observe_qap_until_ready(
+            &server.endpoint,
+            &directory.0,
+            Mode::Local,
+            DATABASE,
+            &["dataflow_a".to_owned(), "dataflow_b".to_owned()],
+            Duration::from_secs(5),
+        )
+        .await?;
+        assert_eq!(samples.load(Ordering::SeqCst), 2);
+        assert_eq!(observed["catch_up_status"], "caught_up");
+        assert_eq!(
+            observed["tables"]["dataflow_b"]["statistics"]["AccelerationPendingDataFilesCount"],
+            0
+        );
+        let history = fs::read_to_string(directory.0.join("qap-observations.jsonl"))?;
+        let history = history
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0]["caught_up"], false);
+        assert_eq!(history[1]["caught_up"], true);
+        assert!(history[0]["finished_unix_ms"].as_u64() <= history[1]["started_unix_ms"].as_u64());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catch_up_uses_one_deadline_and_retains_the_last_pending_snapshot() -> Result<()> {
+        let directory = Directory::new()?;
+        let (server, samples) = catch_up_server(true)?;
+        let observed = observe_qap_until_ready(
+            &server.endpoint,
+            &directory.0,
+            Mode::Local,
+            DATABASE,
+            &["dataflow_a".to_owned(), "dataflow_b".to_owned()],
+            Duration::from_millis(1500),
+        )
+        .await?;
+        assert_eq!(samples.load(Ordering::SeqCst), 2);
+        assert_eq!(observed["catch_up_status"], "deadline_incomplete");
+        assert_eq!(
+            observed["tables"]["dataflow_b"]["statistics"]["AccelerationPendingDataFilesCount"],
+            3
+        );
+        let diagnostic: Value = serde_json::from_slice(&fs::read(directory.0.join("catch-up-diagnostic.json"))?)?;
+        assert_eq!(diagnostic["code"], "deadline_incomplete");
+        assert_eq!(diagnostic["samples"], 1);
+        assert_eq!(diagnostic["delta_delivery"], "not_established");
         Ok(())
     }
 

@@ -2,6 +2,7 @@ use collector_chain::dmv;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use std::cell::Cell;
 use std::future::Future;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::Instant;
@@ -59,8 +60,9 @@ async fn main() -> Result<()> {
             "pilot mode requires a 30-second-multiple measurement from 60 to 600 seconds and a total warm-up plus measurement of at most 600 seconds"
         );
     }
-    let send = || {
-        dmv::send_authenticated(
+    let admissions = Cell::new((0_usize, 0_usize));
+    let send = || async {
+        let report = dmv::send_authenticated_report(
             &args.endpoint,
             &args.client_id,
             args.table.as_deref(),
@@ -68,6 +70,17 @@ async fn main() -> Result<()> {
             args.concurrency,
             args.edge_secret_file.as_deref(),
         )
+        .await?;
+        let (best_effort, durable) = admissions.get();
+        admissions.set((
+            best_effort
+                .checked_add(report.best_effort_streams)
+                .context("best-effort admission count overflow")?,
+            durable
+                .checked_add(report.durable_streams)
+                .context("durable admission count overflow")?,
+        ));
+        Ok::<_, anyhow::Error>(report.tables)
     };
     let table_count = if args.duration_secs == 0 {
         send().await?
@@ -174,6 +187,15 @@ async fn main() -> Result<()> {
             }
         }
     };
+    let (best_effort_streams, durable_streams) = admissions.get();
+    println!(
+        "OAT_COLLECTOR_COMPLETION {}",
+        serde_json::json!({
+            "best_effort_streams": best_effort_streams,
+            "durable_streams": durable_streams,
+            "completed_at_unix_ms": unix_time_ms()?,
+        })
+    );
     println!(
         "uploaded {table_count} DMV tables with {} rows each using concurrency {}",
         args.rows, args.concurrency

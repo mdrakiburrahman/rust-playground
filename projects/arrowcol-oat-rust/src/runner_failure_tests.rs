@@ -109,6 +109,11 @@ mod failure_evidence_tests {
                             rows,
                             duration_ms: 60_000,
                             rows_per_second: rows as f64 / 60.0,
+                            completions: vec![CollectorCompletion {
+                                best_effort_streams: 3,
+                                durable_streams: 2,
+                                completed_at_unix_ms: 1_794_173_460_000,
+                            }],
                         },
                     )]),
                     pinning: PinningReport {
@@ -123,6 +128,18 @@ mod failure_evidence_tests {
                 resources: None,
             },
         )
+    }
+
+    #[test]
+    fn results_separate_collector_completion_from_delta_delivery() -> Result<()> {
+        let rows = completed(&config()?, "completed", 1, 100)?;
+        assert_eq!(rows[0].status, "succeeded");
+        let tunables: Value = serde_json::from_str(&rows[0].tunables_json)?;
+        assert_eq!(tunables["delta_delivery"], "not_established");
+        assert_eq!(tunables["collector_completion"]["evidence"], "reported");
+        assert_eq!(tunables["collector_completion"]["clients"][0]["best_effort_streams"], 3);
+        assert_eq!(tunables["collector_completion"]["clients"][0]["durable_streams"], 2);
+        Ok(())
     }
 
     fn read_batch(bytes: Vec<u8>) -> Result<RecordBatch> {
@@ -201,6 +218,7 @@ mod failure_evidence_tests {
                             rows: 60,
                             duration_ms: 60_000,
                             rows_per_second: 1.0,
+                            completions: Vec::new(),
                         },
                     )]),
                     pinning,

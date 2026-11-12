@@ -14,7 +14,7 @@ use arrow_flight::sql::{CommandStatementUpdate, ProstMessageExt};
 use arrow_flight::{FlightData, FlightDescriptor};
 use arrow_schema::{DataType, Schema, SchemaRef, TimeUnit};
 use arrowcol_catalog::{DdlCommand, DdlParser};
-use arrowcol_flight::{PutResultMetadata, decode_ddl_completion_metadata};
+use arrowcol_flight::{DeliveryGuarantee, PutResultMetadata, decode_ddl_completion_metadata};
 const OAT_RUN_ID_ENV: &str = "ARROWCOL_OAT_RUN_ID";
 const OAT_RUN_ID_HEADER: &str = "x-arrowcol-oat-run-id";
 use arrowcol_protocol::{
@@ -176,12 +176,40 @@ pub async fn send_authenticated(
     concurrency: usize,
     edge_secret_file: Option<&std::path::Path>,
 ) -> Result<usize> {
+    Ok(
+        send_authenticated_report(endpoint, client_id, table_name, rows, concurrency, edge_secret_file)
+            .await?
+            .tables,
+    )
+}
+
+/// Observed admission completions, not proof of downstream Delta delivery.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UploadReport {
+    pub tables: usize,
+    pub best_effort_streams: usize,
+    pub durable_streams: usize,
+}
+
+/// Uploads DMV data and preserves the actual admission guarantees.
+///
+/// # Errors
+///
+/// Returns the same validation, transport and admission failures as `send_authenticated`.
+pub async fn send_authenticated_report(
+    endpoint: &str,
+    client_id: &str,
+    table_name: Option<&str>,
+    rows: usize,
+    concurrency: usize,
+    edge_secret_file: Option<&std::path::Path>,
+) -> Result<UploadReport> {
     let signer = edge_secret_file.map(edge_signer_from_file).transpose()?;
     let tables = match table_name {
         Some(name) => vec![table_named(name)?],
         None => tables()?,
     };
-    send_tables_with_concurrency(endpoint, client_id, rows, concurrency, tables, signer).await
+    send_tables_report(endpoint, client_id, rows, concurrency, tables, signer).await
 }
 
 fn edge_signer_from_file(path: &std::path::Path) -> Result<EdgeRequestSigner> {
@@ -204,6 +232,21 @@ async fn send_tables_with_concurrency(
     tables: Vec<DmvTable>,
     signer: Option<EdgeRequestSigner>,
 ) -> Result<usize> {
+    Ok(
+        send_tables_report(endpoint, client_id, rows, concurrency, tables, signer)
+            .await?
+            .tables,
+    )
+}
+
+async fn send_tables_report(
+    endpoint: &str,
+    client_id: &str,
+    rows: usize,
+    concurrency: usize,
+    tables: Vec<DmvTable>,
+    signer: Option<EdgeRequestSigner>,
+) -> Result<UploadReport> {
     if rows == 0 {
         bail!("rows must be positive");
     }
@@ -231,7 +274,7 @@ async fn send_tables_with_concurrency(
         }
     }
 
-    stream::iter(uploads.into_iter().map(|(table, version, batch)| {
+    let admissions = stream::iter(uploads.into_iter().map(|(table, version, batch)| {
         let signer = signer.clone();
         async move {
             // Separate connections let Linux SO_REUSEPORT distribute streams across DFE cores.
@@ -249,7 +292,17 @@ async fn send_tables_with_concurrency(
     .buffer_unordered(concurrency)
     .try_collect::<Vec<_>>()
     .await?;
-    Ok(count)
+    Ok(UploadReport {
+        tables: count,
+        best_effort_streams: admissions
+            .iter()
+            .filter(|value| **value == DeliveryGuarantee::BestEffort)
+            .count(),
+        durable_streams: admissions
+            .iter()
+            .filter(|value| **value == DeliveryGuarantee::DurableAdmission)
+            .count(),
+    })
 }
 fn batch_slices(rows: usize, concurrency: usize) -> Vec<(usize, usize)> {
     let streams = concurrency.min(rows);
@@ -347,7 +400,7 @@ async fn put(
     version: String,
     batch: RecordBatch,
     signer: Option<&EdgeRequestSigner>,
-) -> Result<()> {
+) -> Result<DeliveryGuarantee> {
     let identity = &table.identity;
     let descriptor = FlightDescriptor {
         r#type: DescriptorType::Path as i32,
@@ -367,25 +420,64 @@ async fn put(
         .await?;
     let mut request = Request::new(stream::iter(encoded));
     request_metadata(&mut request, table, signer)?;
-    let mut results = client.do_put(request).await?.into_inner();
-    let mut admitted = false;
-    while let Some(result) = results.message().await? {
+    completed_admission(client.do_put(request).await?.into_inner()).await
+}
+
+async fn completed_admission(
+    mut results: impl futures::Stream<Item = std::result::Result<arrow_flight::PutResult, tonic::Status>> + Unpin,
+) -> Result<DeliveryGuarantee> {
+    let mut admitted = None;
+    while let Some(result) = results.next().await {
+        let result = result?;
         match PutResultMetadata::from_put_result(&result)? {
             PutResultMetadata::Progress { .. } => {}
-            PutResultMetadata::BestEffortAdmission { .. } | PutResultMetadata::DurableAdmission { .. } => {
-                admitted = true;
-            }
+            PutResultMetadata::BestEffortAdmission { .. } => admitted = Some(DeliveryGuarantee::BestEffort),
+            PutResultMetadata::DurableAdmission { .. } => admitted = Some(DeliveryGuarantee::DurableAdmission),
         }
     }
-    if !admitted {
-        bail!("collector closed the put stream without admitting the batch");
-    }
-    Ok(())
+    admitted.context("collector closed the put stream without admitting the batch")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn completion_stream_preserves_admission_kind_and_propagates_terminal_failure() -> Result<()> {
+        use arrowcol_catalog::SchemaVersion;
+        use arrowcol_flight::{StreamCompletion, StreamSummary};
+        for (completion, expected) in [
+            (StreamCompletion::best_effort(), DeliveryGuarantee::BestEffort),
+            (
+                StreamCompletion::durable_admission(),
+                DeliveryGuarantee::DurableAdmission,
+            ),
+        ] {
+            let metadata = PutResultMetadata::completion(
+                completion,
+                SchemaVersion::FIRST,
+                SchemaVersion::FIRST,
+                fingerprint_schema(&Schema::empty()),
+                StreamSummary::new(1, 1, 1),
+            )
+            .context("completion missing")?
+            .into_put_result()?;
+            assert_eq!(
+                completed_admission(stream::iter([Ok(metadata.clone())])).await?,
+                expected
+            );
+            assert!(
+                completed_admission(stream::iter([
+                    Ok(metadata),
+                    Err(tonic::Status::unavailable("terminal failure")),
+                ]))
+                .await
+                .is_err()
+            );
+        }
+        assert!(completed_admission(stream::empty()).await.is_err());
+        Ok(())
+    }
 
     #[test]
     fn splits_one_table_without_losing_or_duplicating_rows() {

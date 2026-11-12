@@ -2038,7 +2038,7 @@ fn result_rows(
         .checked_mul(assigned_tables.len())
         .context("OAT client count overflow")?;
     let observed_owners = client_run.pinning.owners.values().collect::<HashSet<_>>().len();
-    let tunables_json = serde_json::to_string(&json!({
+    let tunables = json!({
         "arrowcols": replicas,
         "clients": client_count,
         "clients_per_table": config.clients_per_table,
@@ -2055,7 +2055,8 @@ fn result_rows(
         "failure": client_run.failure.as_ref().map(|_| "measurement_or_observation_failed"),
         "pinning_violation": client_run.pinning.violation.is_some(),
         "pinning_verification_error": client_run.pinning.verification_error.as_ref().map(|_| "ownership_verification_failed"),
-    }))?;
+        "delta_delivery": "not_established",
+    });
     let details = [
         client_run.failure.clone(),
         client_run
@@ -2082,6 +2083,16 @@ fn result_rows(
             bail!("DMV client did not report measurements for {table}");
         }
         let owner = client_run.pinning.owners.get(&canonical_table_key(&table));
+        let mut table_tunables = tunables.clone();
+        table_tunables["collector_completion"] = json!({
+            "evidence": if client.is_some_and(|client| client.completions.len() == config.clients_per_table) {
+                "reported"
+            } else {
+                "unavailable"
+            },
+            "admission_scope": "preflight_warmup_measurement",
+            "clients": client.map(|client| &client.completions),
+        });
         rows.push(OatResult {
             run_id: run_id.to_owned(),
             mode: match config.platform.kind {
@@ -2113,7 +2124,7 @@ fn result_rows(
                 .ok()
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| "unknown".to_owned()),
-            tunables_json: tunables_json.clone(),
+            tunables_json: serde_json::to_string(&table_tunables)?,
             replicas: u64::from(replicas),
             dfe_worker_concurrency: u64::from(concurrency),
             table,
@@ -2133,6 +2144,15 @@ struct ClientMetrics {
     rows: u64,
     duration_ms: u64,
     rows_per_second: f64,
+    completions: Vec<CollectorCompletion>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CollectorCompletion {
+    best_effort_streams: u64,
+    durable_streams: u64,
+    completed_at_unix_ms: u64,
 }
 
 struct ClientMeasurement {
@@ -2503,6 +2523,7 @@ async fn run_clients_inner(
                             rows: report.rows,
                             duration_ms,
                             rows_per_second: report.rows_per_second,
+                            completions: report.collector_completion.into_iter().collect(),
                         },
                         pilot_windows: report.pilot_windows,
                     })
@@ -2601,6 +2622,10 @@ async fn run_clients_inner(
                     .max()
                     .unwrap_or(1),
                 rows_per_second,
+                completions: reports
+                    .iter()
+                    .flat_map(|report| report.metrics.completions.clone())
+                    .collect(),
             },
         );
     }
@@ -2900,6 +2925,7 @@ struct ClientReport {
     measurement_window_end_unix_ms: u64,
     measurement_started_unix_ms: u64,
     pilot_windows: Vec<PilotWindow>,
+    collector_completion: Option<CollectorCompletion>,
 }
 
 fn parse_client_metrics(output: &str) -> Result<ClientReport> {
@@ -2955,6 +2981,25 @@ fn parse_client_metrics(output: &str) -> Result<ClientReport> {
     if pilot_windows.windows(2).any(|pair| pair[0].index >= pair[1].index) {
         bail!("DMV client emitted duplicate or out-of-order pilot windows");
     }
+    let mut completions = output
+        .lines()
+        .filter_map(|line| line.strip_prefix("OAT_COLLECTOR_COMPLETION "));
+    let collector_completion = completions
+        .next()
+        .map(serde_json::from_str::<CollectorCompletion>)
+        .transpose()
+        .context("invalid collector completion report")?;
+    if completions.next().is_some()
+        || collector_completion.as_ref().is_some_and(|report| {
+            report
+                .best_effort_streams
+                .checked_add(report.durable_streams)
+                .is_none_or(|count| count == 0)
+                || report.completed_at_unix_ms < measurement_window_end_unix_ms
+        })
+    {
+        bail!("invalid or duplicate collector completion evidence");
+    }
     Ok(ClientReport {
         rows,
         duration_seconds,
@@ -2963,6 +3008,7 @@ fn parse_client_metrics(output: &str) -> Result<ClientReport> {
         measurement_window_end_unix_ms,
         measurement_started_unix_ms,
         pilot_windows,
+        collector_completion,
     })
 }
 
@@ -3054,7 +3100,7 @@ async fn observe_qap(
             .with_context(|| format!("create QAP results directory {}", results.display()))?;
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         runtime
-            .block_on(arrowcol_loadgen::observe_qap_with_mode(
+            .block_on(arrowcol_loadgen::observe_qap_until_ready(
                 &endpoint,
                 &results,
                 mode,
@@ -7639,6 +7685,20 @@ mod tests {
         assert_eq!(metrics.observation_complete, 0);
         assert_eq!(metrics.observed_tables, 0);
         assert_eq!(metrics.completion_percent, None);
+        Ok(())
+    }
+
+    #[test]
+    fn client_completion_keeps_actual_admission_kinds_and_rejects_bad_evidence() -> Result<()> {
+        let metrics = "measured_rows=100 measured_seconds=60 rows_per_second=1.667 measurement_window_start_unix_ms=100000 measurement_window_end_unix_ms=160000 measurement_started_unix_ms=100000";
+        let completion =
+            r#"OAT_COLLECTOR_COMPLETION {"best_effort_streams":3,"durable_streams":2,"completed_at_unix_ms":160001}"#;
+        let report = parse_client_metrics(&format!("{metrics}\n{completion}"))?;
+        let evidence = report.collector_completion.context("completion evidence missing")?;
+        assert_eq!((evidence.best_effort_streams, evidence.durable_streams), (3, 2));
+        assert!(parse_client_metrics(metrics)?.collector_completion.is_none());
+        assert!(parse_client_metrics(&format!("{metrics}\n{completion}\n{completion}")).is_err());
+        assert!(parse_client_metrics(&format!("{metrics}\n{}", completion.replace("160001", "159999"))).is_err());
         Ok(())
     }
 
