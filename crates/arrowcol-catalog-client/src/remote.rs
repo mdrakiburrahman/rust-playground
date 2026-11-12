@@ -465,7 +465,9 @@ impl CatalogClient for RemoteCatalogClient {
                 .as_ref()
                 .is_some_and(|position| position.epoch != table.position.epoch)
             {
-                cache.invalidate_all();
+                if cache.healthy_at.is_some() {
+                    cache.invalidate_all();
+                }
                 return Err(failure_at(
                     "catalog_restart_during_table_fetch",
                     "catalog restarted; reconcile before serving cached schemas",

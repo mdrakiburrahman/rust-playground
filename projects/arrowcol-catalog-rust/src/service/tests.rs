@@ -26,6 +26,9 @@ struct TableResponseGate {
     started: std::sync::Arc<tokio::sync::Notify>,
     release: std::sync::Arc<tokio::sync::Notify>,
     get_table_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    snapshot_armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    snapshot_started: std::sync::Arc<tokio::sync::Notify>,
+    snapshot_release: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl Default for TableResponseGate {
@@ -35,6 +38,9 @@ impl Default for TableResponseGate {
             started: std::sync::Arc::new(tokio::sync::Notify::new()),
             release: std::sync::Arc::new(tokio::sync::Notify::new()),
             get_table_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            snapshot_armed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            snapshot_started: std::sync::Arc::new(tokio::sync::Notify::new()),
+            snapshot_release: std::sync::Arc::new(tokio::sync::Semaphore::new(0)),
         }
     }
 }
@@ -72,7 +78,17 @@ impl SchemaCatalog for GatedSchemaCatalog {
     }
 
     async fn get_snapshot(&self, request: Request<rpc::Empty>) -> Result<Response<rpc::CatalogSnapshot>, Status> {
-        self.inner.get_snapshot(request).await
+        let response = self.inner.get_snapshot(request).await?;
+        if self.gate.snapshot_armed.load(Ordering::SeqCst) {
+            self.gate.snapshot_started.notify_one();
+            let _permit = self
+                .gate
+                .snapshot_release
+                .acquire()
+                .await
+                .map_err(|_| Status::unavailable("snapshot gate closed"))?;
+        }
+        Ok(response)
     }
 }
 
@@ -871,5 +887,94 @@ async fn snapshot_watch_replays_racing_ddl_and_drop_retry_retains_delta() -> Res
         .await?
         .context("retained Delta table")?;
     assert_eq!(delta.properties.get(DROPPED_KEY).map(String::as_str), Some("true"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn repeated_new_epoch_table_responses_do_not_invalidate_reconciliation() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let config = config(root.path());
+    let service = CatalogService::open(config.clone()).await?;
+    service.apply_sql(CREATE).await?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}", listener.local_addr()?);
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    let old_service = service.clone();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(SchemaCatalogServer::new(old_service))
+            .serve_with_incoming_shutdown(tokio_stream::wrappers::TcpListenerStream::new(listener), async {
+                let _ = stopped.await;
+            })
+            .await
+    });
+    let client = RemoteCatalogClient::connect_with_signer(
+        &endpoint,
+        Duration::from_secs(5),
+        InternalRequestSigner::from_secret(b"catalog-integration-key-at-least-32-bytes".to_vec())?,
+    )
+    .await?;
+    let identity = name_identity(&["arrowcol".into(), "default".into(), "events".into()])?;
+    let original = client.table(&identity).await?;
+    shutdown
+        .send(())
+        .map_err(|()| anyhow::anyhow!("server already stopped"))?;
+    server.abort();
+    let _ = server.await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let restarted = CatalogService::open(config).await?;
+    restarted
+        .apply_sql("ALTER TABLE arrowcol.default.events ADD COLUMNS (while_disconnected STRING)")
+        .await?;
+    let gate = TableResponseGate::default();
+    gate.snapshot_armed.store(true, Ordering::SeqCst);
+    let listener = tokio::net::TcpListener::bind(
+        url::Url::parse(&endpoint)?
+            .socket_addrs(|| None)?
+            .first()
+            .context("endpoint address")?,
+    )
+    .await?;
+    let gate_for_server = gate.clone();
+    let service_for_server = restarted.clone();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(SchemaCatalogServer::new(GatedSchemaCatalog {
+                inner: service_for_server,
+                gate: gate_for_server,
+            }))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await
+    });
+    let error = match client.table(&identity).await {
+        Ok(_) => bail!("old catalog epoch was served after restart"),
+        Err(error) => error,
+    };
+    assert_eq!(error.failure_id(), Some("catalog_restart_during_table_fetch"));
+
+    let reconcile_client = Arc::clone(&client);
+    let reconciliation = tokio::spawn(async move { reconcile_client.reconcile().await });
+    tokio::time::timeout(Duration::from_secs(5), gate.snapshot_started.notified())
+        .await
+        .context("reconciliation snapshot did not start")?;
+    for _ in 0..10 {
+        let error = match client.table(&identity).await {
+            Ok(_) => bail!("old catalog epoch was served while reconciliation was held"),
+            Err(error) => error,
+        };
+        assert_eq!(error.failure_id(), Some("catalog_restart_during_table_fetch"));
+    }
+    gate.snapshot_armed.store(false, Ordering::SeqCst);
+    gate.snapshot_release.add_permits(16);
+    tokio::time::timeout(Duration::from_secs(5), reconciliation)
+        .await
+        .context("reconciliation did not finish")?
+        .context("reconciliation task panicked")??;
+    let recovered = client.table(&identity).await?;
+    assert_ne!(recovered.position.epoch, original.position.epoch);
+    assert_eq!(recovered.versions.last().context("head")?.fields().len(), 3);
+    server.abort();
+    let _ = server.await;
     Ok(())
 }
