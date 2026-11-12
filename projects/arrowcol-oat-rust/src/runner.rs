@@ -2090,7 +2090,7 @@ fn result_rows(
             } else {
                 "unavailable"
             },
-            "admission_scope": "preflight_warmup_measurement",
+            "admission_scope": "completed_upload_calls_across_preflight_warmup_measurement",
             "clients": client.map(|client| &client.completions),
         });
         rows.push(OatResult {

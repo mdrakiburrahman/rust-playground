@@ -186,8 +186,11 @@ pub async fn send_authenticated(
 /// Observed admission completions, not proof of downstream Delta delivery.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct UploadReport {
+    /// Tables in this successfully completed upload call.
     pub tables: usize,
+    /// Streams completed with a best-effort admission acknowledgement.
     pub best_effort_streams: usize,
+    /// Streams completed with a local durable-buffer acknowledgement.
     pub durable_streams: usize,
 }
 
