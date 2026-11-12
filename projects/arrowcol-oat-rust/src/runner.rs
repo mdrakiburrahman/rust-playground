@@ -4927,6 +4927,48 @@ async fn run_run_fic_helper(
     Ok(())
 }
 
+fn oat_qap_helper_launcher(script: &Path) -> Result<Command> {
+    let mut command = Command::new("npx");
+    command
+        .current_dir(std::env::current_dir()?)
+        .args(["--no-install", "tsx"])
+        .kill_on_drop(true);
+    use_operator_cli_identity(&mut command);
+    command.arg(script);
+    Ok(command)
+}
+
+#[cfg(unix)]
+struct OwnedQapHelperGroup(rustix::process::Pid);
+
+#[cfg(unix)]
+impl Drop for OwnedQapHelperGroup {
+    fn drop(&mut self) {
+        match rustix::process::kill_process_group(self.0, rustix::process::Signal::KILL) {
+            Ok(()) | Err(rustix::io::Errno::SRCH) => {}
+            Err(error) => tracing::error!(%error, group = ?self.0, "QAP helper process-group cleanup failed"),
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn run_oat_qap_helper_output(mut command: Command) -> Result<std::process::Output> {
+    command
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = command.spawn().context("spawn owned QAP helper")?;
+    let pid = i32::try_from(child.id().context("QAP helper PID unavailable")?).context("QAP helper PID invalid")?;
+    let _group = OwnedQapHelperGroup(rustix::process::Pid::from_raw(pid).context("QAP helper PID invalid")?);
+    Ok(child.wait_with_output().await?)
+}
+
+#[cfg(not(unix))]
+async fn run_oat_qap_helper_output(_command: Command) -> Result<std::process::Output> {
+    bail!("owned QAP helper process-group cancellation requires Unix")
+}
+
 fn run_oat_qap_helper_command(
     operation: &str,
     run_id: &str,
@@ -4937,13 +4979,8 @@ fn run_oat_qap_helper_command(
     config_paths: AksHelperConfigPaths<'_>,
 ) -> Result<Command> {
     let script = std::env::current_dir()?.join("infra/azure/bootstrap.ts");
-    let mut command = Command::new("npx");
-    command
-        .current_dir(std::env::current_dir()?)
-        .args(["--no-install", "tsx"])
-        .kill_on_drop(true);
-    use_operator_cli_identity(&mut command);
-    command.arg(script).arg(operation);
+    let mut command = oat_qap_helper_launcher(&script)?;
+    command.arg(operation);
     command.arg("--env-file").arg(config_paths.bootstrap_env_file);
     command.arg("--stamp-config").arg(config_paths.stamp_config_path);
     if operation == "bind-oat-qap" {
@@ -4973,7 +5010,7 @@ async fn run_oat_qap_helper(
 ) -> Result<()> {
     let workspace = std::env::current_dir()?;
     let stamp_config_path = selected_aks_stamp_config_path(&workspace)?;
-    let output = run_oat_qap_helper_command(
+    let command = run_oat_qap_helper_command(
         operation,
         run_id,
         manifest_path,
@@ -4984,10 +5021,10 @@ async fn run_oat_qap_helper(
             stamp_config_path: &stamp_config_path,
             bootstrap_env_file,
         },
-    )?
-    .output()
-    .await
-    .with_context(|| format!("start {operation} helper"))?;
+    )?;
+    let output = run_oat_qap_helper_output(command)
+        .await
+        .with_context(|| format!("start {operation} helper"))?;
     if !output.status.success() {
         bail!(
             "{operation} helper failed with {}: {}",

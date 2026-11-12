@@ -572,3 +572,186 @@ http.createServer((request, response) => {
         Ok(())
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod qap_helper_lifetime_tests {
+    use super::*;
+
+    struct Fixture {
+        root: PathBuf,
+        owned: Vec<(u32, u64)>,
+    }
+
+    fn process_status(pid: u32) -> Result<Option<(char, u32, u64)>> {
+        let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let (_, fields) = stat.rsplit_once(')').context("fixture process stat")?;
+        let fields: Vec<_> = fields.split_whitespace().collect();
+        Ok(Some((
+            fields
+                .first()
+                .and_then(|state| state.chars().next())
+                .context("fixture process state")?,
+            fields.get(1).context("fixture parent PID")?.parse()?,
+            fields.get(19).context("fixture process start time")?.parse()?,
+        )))
+    }
+
+    impl Fixture {
+        fn new() -> Result<Self> {
+            let root = std::env::temp_dir().join(format!("oat-qap-helper-lifetime-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&root)?;
+            Ok(Self {
+                root,
+                owned: Vec::new(),
+            })
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.root.join(name)
+        }
+
+        fn command(&self) -> Result<Command> {
+            let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qap-helper-lifetime.ts");
+            let mut command = oat_qap_helper_launcher(&script)?;
+            command
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").context("fixture PATH")?)
+                .env("HOME", &self.root)
+                .env("npm_config_offline", "true")
+                .env("npm_config_update_notifier", "false")
+                .arg("helper")
+                .arg(self.path("ready"))
+                .arg(self.path("release"))
+                .arg(self.path("receipt"));
+            Ok(command)
+        }
+
+        fn capture_owned_pids(&mut self) -> Result<()> {
+            let ready: Value = serde_json::from_slice(&fs::read(self.path("ready"))?)?;
+            let helper = u32::try_from(ready["helperPid"].as_u64().context("fixture helper PID")?)?;
+            let worker = u32::try_from(ready["workerPid"].as_u64().context("fixture worker PID")?)?;
+            for mut pid in [helper, worker] {
+                while pid != std::process::id() {
+                    anyhow::ensure!(pid > 1, "fixture ancestry must terminate at its owning test");
+                    let (_, parent, start) = process_status(pid)?.context("fixture process already exited")?;
+                    if !self.owned.iter().any(|(owned, _)| *owned == pid) {
+                        self.owned.push((pid, start));
+                    }
+                    pid = parent;
+                }
+            }
+            eprintln!("owned QAP fixture PIDs: {:?}", self.owned);
+            Ok(())
+        }
+
+        fn running(&self) -> Result<Vec<u32>> {
+            self.owned.iter().try_fold(Vec::new(), |mut running, (pid, start)| {
+                if let Some((state, _, observed_start)) = process_status(*pid)?
+                    && observed_start == *start
+                    && !matches!(state, 'Z' | 'X')
+                {
+                    running.push(*pid);
+                }
+                Ok(running)
+            })
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            for (pid, start) in &self.owned {
+                match process_status(*pid) {
+                    Ok(Some((state, _, observed_start))) if observed_start == *start && !matches!(state, 'Z' | 'X') => {
+                        let Some(owned_pid) = i32::try_from(*pid).ok().and_then(rustix::process::Pid::from_raw) else {
+                            eprintln!("invalid owned fixture PID: {pid}");
+                            continue;
+                        };
+                        if let Err(error) = rustix::process::kill_process(owned_pid, rustix::process::Signal::KILL)
+                            && error != rustix::io::Errno::SRCH
+                        {
+                            eprintln!("owned fixture PID cleanup failed: {pid:?}: {error}");
+                        }
+                    }
+                    Err(error) => eprintln!("owned fixture PID inspection failed: {error:#}"),
+                    _ => {}
+                }
+            }
+            if let Err(error) = fs::remove_dir_all(&self.root) {
+                eprintln!("owned fixture directory cleanup failed: {error}");
+            }
+        }
+    }
+
+    async fn ready(path: PathBuf) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while !path.is_file() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("real npx/tsx fixture did not publish descendant readiness")
+    }
+
+    #[tokio::test]
+    async fn oat_qap_helper_normal_completion_retains_descendant_receipt() -> Result<()> {
+        let mut fixture = Fixture::new()?;
+        let mut operation = Box::pin(run_oat_qap_helper_output(fixture.command()?));
+        tokio::select! {
+            result = &mut operation => bail!("QAP fixture exited before readiness: {result:?}"),
+            result = ready(fixture.path("ready")) => result?,
+        }
+        fixture.capture_owned_pids()?;
+        fs::write(fixture.path("release"), b"complete")?;
+        let output = tokio::time::timeout(Duration::from_secs(5), operation).await??;
+        anyhow::ensure!(output.status.success(), "QAP fixture failed: {output:?}");
+        let receipt = fs::read_to_string(fixture.path("receipt"))?;
+        eprintln!("normal QAP descendant receipt: {receipt}");
+        assert!(
+            fixture.running()?.is_empty(),
+            "normal QAP helper left live owned processes"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oat_qap_helper_timeout_prevents_descendant_receipt() -> Result<()> {
+        let mut fixture = Fixture::new()?;
+        let mut operation = Box::pin(run_oat_qap_helper_output(fixture.command()?));
+        tokio::select! {
+            result = &mut operation => bail!("QAP fixture exited before readiness: {result:?}"),
+            result = ready(fixture.path("ready")) => result?,
+        }
+        fixture.capture_owned_pids()?;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), operation)
+                .await
+                .is_err()
+        );
+        eprintln!("QAP caller timeout returned at {}", unix_time_ms());
+        fs::write(fixture.path("release"), b"after caller timeout")?;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !fixture.path("receipt").exists() && !fixture.running()?.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        let receipt = if fixture.path("receipt").exists() {
+            Some(fs::read_to_string(fixture.path("receipt"))?)
+        } else {
+            None
+        };
+        let running = fixture.running()?;
+        eprintln!("after QAP cancellation: receipt={receipt:?}, live_owned_pids={running:?}");
+        assert!(
+            receipt.is_none(),
+            "QAP descendant wrote its receipt after caller timeout: {receipt:?}"
+        );
+        assert!(running.is_empty(), "QAP cancellation left live owned PIDs: {running:?}");
+        Ok(())
+    }
+}

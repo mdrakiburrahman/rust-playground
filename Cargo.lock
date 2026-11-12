@@ -965,6 +965,7 @@ dependencies = [
  "object_store",
  "parquet 58.4.0",
  "reqwest 0.12.28",
+ "rustix",
  "serde",
  "serde_json",
  "serde_yaml",

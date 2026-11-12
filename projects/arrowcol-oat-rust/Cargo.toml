@@ -38,5 +38,8 @@ tracing-subscriber.workspace = true
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["process"] }
+
 [lints]
 workspace = true

@@ -55,7 +55,10 @@ node CPU utilization aligned to each 30-second measurement window.
 Historical query responses remain in `out/arrowcol-oat/qap/<cell-run-id>/kusto-queries.jsonl`.
 Catch-up also retains timestamped sanitized samples in `qap-observations.jsonl`
 and its terminal outcome in `catch-up-diagnostic.json`. The separate QAP setup
-budget is unchanged. Policy `MaxAge` is a freshness cutoff, not a deadline
+budget is unchanged. Unix QAP helpers run in an owned process group; cancellation
+stops local `npx`/`tsx` descendants, not just the launcher. This does not undo
+provider requests: timed-out setup remains indeterminate and is not retried.
+Policy `MaxAge` is a freshness cutoff, not a deadline
 guaranteeing that caching has completed.
 
 | Input | Source / rule |
