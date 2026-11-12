@@ -1,6 +1,6 @@
 use std::{fmt, time::Duration};
 
-use arrowcol_catalog::{CatalogError, CatalogErrorCode, CatalogErrorOrigin};
+use arrowcol_catalog::{CatalogError, CatalogErrorCode};
 use arrowcol_protocol::{
     ErrorCategory, ErrorCode, ErrorStatus, MAX_MEASUREMENT, MetadataParseError, PositiveMeasurement,
 };
