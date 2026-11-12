@@ -42,6 +42,52 @@ struct Cache {
     position: Option<rpc::EventPosition>,
     healthy_at: Option<Instant>,
     generation: u64,
+    snapshot_generation: u64,
+    table_generations: BTreeMap<TableIdentity, u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TableFetchToken {
+    snapshot_generation: u64,
+    table_generation: u64,
+}
+
+impl Cache {
+    fn table_fetch_token(&self, identity: &TableIdentity) -> TableFetchToken {
+        TableFetchToken {
+            snapshot_generation: self.snapshot_generation,
+            table_generation: self.table_generations.get(identity).copied().unwrap_or_default(),
+        }
+    }
+
+    fn table_fetch_token_is_current(&self, identity: &TableIdentity, token: TableFetchToken) -> bool {
+        self.snapshot_generation == token.snapshot_generation
+            && self.table_generations.get(identity).copied().unwrap_or_default() == token.table_generation
+    }
+
+    fn invalidate_table(&mut self, identity: &TableIdentity) {
+        self.tables.remove(identity);
+        let generation = self.table_generations.entry(identity.clone()).or_default();
+        *generation = generation.wrapping_add(1);
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    fn invalidate_all(&mut self) {
+        self.tables.clear();
+        self.table_generations.clear();
+        self.healthy_at = None;
+        self.snapshot_generation = self.snapshot_generation.wrapping_add(1);
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    fn replace_snapshot(&mut self, tables: BTreeMap<TableIdentity, CachedTable>, position: rpc::EventPosition) {
+        self.tables = tables;
+        self.position = Some(position);
+        self.healthy_at = Some(Instant::now());
+        self.table_generations.clear();
+        self.snapshot_generation = self.snapshot_generation.wrapping_add(1);
+        self.generation = self.generation.wrapping_add(1);
+    }
 }
 
 /// Actual catalog calls and local cache operations, independent of latency.
@@ -176,10 +222,7 @@ impl RemoteCatalogClient {
                 "catalog changed during reconciliation; retry from a fresh snapshot",
             ));
         }
-        cache.tables = tables;
-        cache.position = Some(position);
-        cache.healthy_at = Some(Instant::now());
-        cache.generation = cache.generation.wrapping_add(1);
+        cache.replace_snapshot(tables, position);
         Ok(())
     }
 
@@ -198,9 +241,7 @@ impl RemoteCatalogClient {
                     "catalog CES disconnected; reconciling before reconnect"
                 );
                 let mut cache = client.cache.lock().await;
-                cache.tables.clear();
-                cache.healthy_at = None;
-                cache.generation = cache.generation.wrapping_add(1);
+                cache.invalidate_all();
                 drop(cache);
             }
             drop(client);
@@ -250,9 +291,8 @@ impl RemoteCatalogClient {
                     if position.epoch != previous.epoch || position.event_id != previous.event_id.checked_add(1).ok_or_else(|| failure_at("catalog_ces_event_id_exhausted", "CES event ID exhausted"))? {
                         return Err(failure_at("catalog_ces_epoch_or_gap_detected", "CES epoch changed or retained event gap detected"));
                     }
-                    cache.tables.remove(&identity);
+                    cache.invalidate_table(&identity);
                     cache.position = Some(position);
-                    cache.generation = cache.generation.wrapping_add(1);
                     self.counters.invalidations.fetch_add(1, Ordering::Relaxed);
                 }
                 _ = reconcile_tick.tick() => {
@@ -391,7 +431,7 @@ pub fn decode_table(snapshot: rpc::TableSnapshot) -> CatalogResult<CachedTable> 
 impl CatalogClient for RemoteCatalogClient {
     async fn table(&self, identity: &TableIdentity) -> CatalogResult<CachedTable> {
         for _ in 0..3 {
-            let generation = {
+            let fetch_token = {
                 let cache = self.cache.lock().await;
                 if cache.healthy_at.is_some_and(|time| time.elapsed() <= self.maximum_age)
                     && let Some(table) = cache.tables.get(identity)
@@ -399,7 +439,7 @@ impl CatalogClient for RemoteCatalogClient {
                     self.counters.hits.fetch_add(1, Ordering::Relaxed);
                     return Ok(table.clone());
                 }
-                cache.generation
+                cache.table_fetch_token(identity)
             };
             self.counters.misses.fetch_add(1, Ordering::Relaxed);
             let mut request = Request::new(table_request(identity));
@@ -417,7 +457,7 @@ impl CatalogClient for RemoteCatalogClient {
                 return Err(failure("catalog returned a different table"));
             }
             let mut cache = self.cache.lock().await;
-            if cache.generation != generation {
+            if !cache.table_fetch_token_is_current(identity, fetch_token) {
                 continue;
             }
             if cache
@@ -425,8 +465,7 @@ impl CatalogClient for RemoteCatalogClient {
                 .as_ref()
                 .is_some_and(|position| position.epoch != table.position.epoch)
             {
-                cache.tables.clear();
-                cache.healthy_at = None;
+                cache.invalidate_all();
                 return Err(failure_at(
                     "catalog_restart_during_table_fetch",
                     "catalog restarted; reconcile before serving cached schemas",
@@ -444,8 +483,7 @@ impl CatalogClient for RemoteCatalogClient {
 
     async fn invalidate(&self, identity: &TableIdentity) {
         let mut cache = self.cache.lock().await;
-        cache.tables.remove(identity);
-        cache.generation = cache.generation.wrapping_add(1);
+        cache.invalidate_table(identity);
     }
 }
 
@@ -561,9 +599,69 @@ impl CatalogStore for RemoteCatalogClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{failure, failure_at, flight_rpc_error, grpc_status_name, rpc_error};
-    use arrowcol_catalog::{CatalogErrorCode, CatalogErrorOrigin};
+    use super::{
+        Cache, failure, failure_at, flight_rpc_error, grpc_status_name, identity_from_request, rpc, rpc_error,
+    };
+    use arrowcol_catalog::{CatalogErrorCode, CatalogErrorOrigin, CatalogResult};
+    use arrowcol_protocol::TableIdentity;
     use tonic::Status;
+
+    fn test_identity(table: &str) -> CatalogResult<TableIdentity> {
+        identity_from_request(&rpc::TableRequest {
+            catalog: "catalog".to_owned(),
+            database: "database".to_owned(),
+            table: table.to_owned(),
+        })
+    }
+
+    #[test]
+    fn unrelated_table_invalidations_do_not_stale_a_fetch() -> CatalogResult<()> {
+        let requested = test_identity("requested")?;
+        let unrelated = test_identity("unrelated")?;
+        let mut cache = Cache::default();
+        let token = cache.table_fetch_token(&requested);
+        let initial_generation = cache.generation;
+
+        for _ in 0..3 {
+            cache.invalidate_table(&unrelated);
+            assert!(cache.table_fetch_token_is_current(&requested, token));
+        }
+
+        assert_ne!(cache.generation, initial_generation);
+        Ok(())
+    }
+
+    #[test]
+    fn same_table_invalidation_stales_a_fetch() -> CatalogResult<()> {
+        let requested = test_identity("requested")?;
+        let mut cache = Cache::default();
+        let token = cache.table_fetch_token(&requested);
+
+        cache.invalidate_table(&requested);
+
+        assert!(!cache.table_fetch_token_is_current(&requested, token));
+        Ok(())
+    }
+
+    #[test]
+    fn full_cache_reset_and_snapshot_replacement_stale_fetches() -> CatalogResult<()> {
+        let requested = test_identity("requested")?;
+        let mut cache = Cache::default();
+        let reset_token = cache.table_fetch_token(&requested);
+        cache.invalidate_all();
+        assert!(!cache.table_fetch_token_is_current(&requested, reset_token));
+
+        let snapshot_token = cache.table_fetch_token(&requested);
+        cache.replace_snapshot(
+            std::collections::BTreeMap::new(),
+            rpc::EventPosition {
+                epoch: String::new(),
+                event_id: 0,
+            },
+        );
+        assert!(!cache.table_fetch_token_is_current(&requested, snapshot_token));
+        Ok(())
+    }
 
     #[test]
     fn remote_catalog_errors_preserve_their_origin_and_code() {
