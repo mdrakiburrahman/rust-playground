@@ -20,7 +20,7 @@ mod validation;
 pub use arrowcol_sparksql::{Statement as SparkStatement, TableMetadata};
 pub use artifacts::{ArtifactKind, DescriptorArtifacts, generate_descriptor_artifacts};
 pub use ddl::{DdlCommand, DdlParser, FieldBlueprint, ParsedAddColumns, ParsedCreateTable};
-pub use error::{CatalogError, CatalogErrorCode, CatalogResult};
+pub use error::{CatalogError, CatalogErrorCode, CatalogErrorOrigin, CatalogResult};
 pub use ir::{
     CatalogField, CatalogSchemaVersion, CatalogType, FieldPath, ListKind, PartitionMetadata, ProtobufType,
     SchemaVersion, TimeUnit, TypeMapping, deterministic_field_id, deterministic_table_id, next_protobuf_field_number,

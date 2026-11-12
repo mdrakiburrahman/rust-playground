@@ -138,12 +138,36 @@ impl CatalogErrorCode {
     }
 }
 
+/// Origin of a catalog failure, for safe internal diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CatalogErrorOrigin {
+    /// Failure constructed by the local catalog service.
+    LocalCatalog,
+    /// Failure detected by the remote catalog client before receiving a gRPC status.
+    RemoteClient,
+    /// Failure mapped from a remote catalog gRPC status.
+    RemoteGrpc,
+}
+
+impl CatalogErrorOrigin {
+    /// Stable diagnostic value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalCatalog => "local_catalog",
+            Self::RemoteClient => "remote_client",
+            Self::RemoteGrpc => "remote_grpc",
+        }
+    }
+}
+
 /// Structured catalog failure with a stable protocol mapping.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 #[error("{code}: {message}")]
 pub struct CatalogError {
     code: CatalogErrorCode,
     message: String,
+    origin: CatalogErrorOrigin,
 }
 
 impl CatalogError {
@@ -153,13 +177,27 @@ impl CatalogError {
         Self {
             code,
             message: message.into(),
+            origin: CatalogErrorOrigin::LocalCatalog,
         }
+    }
+
+    /// Sets the safe internal origin for this failure.
+    #[must_use]
+    pub const fn with_origin(mut self, origin: CatalogErrorOrigin) -> Self {
+        self.origin = origin;
+        self
     }
 
     /// Returns the stable detailed catalog code.
     #[must_use]
     pub const fn code(&self) -> CatalogErrorCode {
         self.code
+    }
+
+    /// Returns the failure origin.
+    #[must_use]
+    pub const fn origin(&self) -> CatalogErrorOrigin {
+        self.origin
     }
 
     /// Returns the safe human-readable explanation.

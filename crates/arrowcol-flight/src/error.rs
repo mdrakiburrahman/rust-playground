@@ -1,6 +1,6 @@
 use std::{fmt, time::Duration};
 
-use arrowcol_catalog::{CatalogError, CatalogErrorCode};
+use arrowcol_catalog::{CatalogError, CatalogErrorCode, CatalogErrorOrigin};
 use arrowcol_protocol::{
     ErrorCategory, ErrorCode, ErrorStatus, MAX_MEASUREMENT, MetadataParseError, PositiveMeasurement,
 };
@@ -96,11 +96,12 @@ impl RuntimeError {
     /// Maps catalog validation and DDL failures onto the stable public surface.
     #[must_use]
     pub fn from_catalog(error: &CatalogError) -> Self {
-        if let Some((code, cause)) = catalog_error_diagnostic(error) {
+        if let Some((code, cause, origin)) = catalog_error_diagnostic(error) {
             tracing::error!(
                 target: "arrowcol_flight::catalog",
                 catalog_error_code = code,
                 catalog_error_cause = cause,
+                catalog_error_origin = origin,
                 "catalog operation failed"
             );
         }
@@ -236,7 +237,7 @@ impl fmt::Display for RuntimeError {
 
 impl std::error::Error for RuntimeError {}
 
-fn catalog_error_diagnostic(error: &CatalogError) -> Option<(&'static str, &'static str)> {
+fn catalog_error_diagnostic(error: &CatalogError) -> Option<(&'static str, &'static str, &'static str)> {
     let cause = match error.code() {
         CatalogErrorCode::CorruptCatalogState => "persisted_catalog_state_invalid",
         CatalogErrorCode::ApplicationDatabase => "application_database_operation_failed",
@@ -244,7 +245,7 @@ fn catalog_error_diagnostic(error: &CatalogError) -> Option<(&'static str, &'sta
         CatalogErrorCode::ReconciliationFailed => "catalog_saga_reconciliation_failed",
         _ => return None,
     };
-    Some((error.code().as_str(), cause))
+    Some((error.code().as_str(), cause, error.origin().as_str()))
 }
 
 /// Structured fields decoded from a tonic status produced by this crate.
@@ -351,7 +352,7 @@ mod tests {
     };
 
     use super::RuntimeError;
-    use arrowcol_catalog::CatalogErrorCode;
+    use arrowcol_catalog::{CatalogErrorCode, CatalogErrorOrigin};
     use tonic::Code;
 
     #[derive(Clone, Default)]
@@ -383,15 +384,30 @@ mod tests {
     #[test]
     fn internal_catalog_failures_log_safe_classes_and_keep_public_status_generic() -> anyhow::Result<()> {
         let cases = [
-            (CatalogErrorCode::CorruptCatalogState, "persisted_catalog_state_invalid"),
+            (
+                CatalogErrorCode::CorruptCatalogState,
+                "persisted_catalog_state_invalid",
+                CatalogErrorOrigin::LocalCatalog,
+            ),
             (
                 CatalogErrorCode::ApplicationDatabase,
                 "application_database_operation_failed",
+                CatalogErrorOrigin::LocalCatalog,
             ),
-            (CatalogErrorCode::DescriptorGeneration, "descriptor_generation_failed"),
+            (
+                CatalogErrorCode::DescriptorGeneration,
+                "descriptor_generation_failed",
+                CatalogErrorOrigin::LocalCatalog,
+            ),
             (
                 CatalogErrorCode::ReconciliationFailed,
                 "catalog_saga_reconciliation_failed",
+                CatalogErrorOrigin::LocalCatalog,
+            ),
+            (
+                CatalogErrorCode::ReconciliationFailed,
+                "catalog_saga_reconciliation_failed",
+                CatalogErrorOrigin::RemoteGrpc,
             ),
         ];
         let logs = TestWriter::default();
@@ -404,11 +420,11 @@ mod tests {
             let _guard = tracing_subscriber::util::SubscriberInitExt::set_default(subscriber);
             cases
                 .iter()
-                .map(|(code, _)| {
-                    RuntimeError::from_catalog(&arrowcol_catalog::CatalogError::new(
-                        *code,
-                        "connection_string=do-not-log",
-                    ))
+                .map(|(code, _, origin)| {
+                    RuntimeError::from_catalog(
+                        &arrowcol_catalog::CatalogError::new(*code, "connection_string=do-not-log")
+                            .with_origin(*origin),
+                    )
                 })
                 .collect::<Vec<_>>()
         };
@@ -419,9 +435,14 @@ mod tests {
                 .clone(),
         )?;
         assert!(!output.contains("do-not-log"), "{output}");
-        for ((code, cause), status) in cases.iter().zip(statuses) {
+        for ((code, cause, origin), status) in cases.iter().zip(statuses) {
             assert!(output.contains(code.as_str()), "missing {code} in {output}");
             assert!(output.contains(cause), "missing {cause} in {output}");
+            assert!(
+                output.contains(origin.as_str()),
+                "missing {} in {output}",
+                origin.as_str()
+            );
             assert_eq!(status.grpc_code(), Code::Internal);
             assert_eq!(status.public_message(), "catalog operation failed");
         }

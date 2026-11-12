@@ -14,9 +14,9 @@ use arrow_flight::{
     sql::{CommandStatementUpdate, ProstMessageExt},
 };
 use arrowcol_catalog::{
-    CatalogError, CatalogErrorCode, CatalogResult, CatalogSchemaVersion, CatalogStore, ChangeReservation,
-    DdlCompletion, DdlCompletionDisposition, DdlParser, DescriptorArtifacts, FlightSqlDdlHandler, FlightSqlDdlRequest,
-    RequestHash, ReserveOutcome, SagaId, SagaRecord, SagaStep, SchemaVersion,
+    CatalogError, CatalogErrorCode, CatalogErrorOrigin, CatalogResult, CatalogSchemaVersion, CatalogStore,
+    ChangeReservation, DdlCompletion, DdlCompletionDisposition, DdlParser, DescriptorArtifacts, FlightSqlDdlHandler,
+    FlightSqlDdlRequest, RequestHash, ReserveOutcome, SagaId, SagaRecord, SagaStep, SchemaVersion,
 };
 use arrowcol_protocol::{SchemaFingerprint, TableIdentity};
 use async_trait::async_trait;
@@ -418,7 +418,7 @@ impl CatalogClient for RemoteCatalogClient {
 }
 
 fn failure(message: impl Into<String>) -> CatalogError {
-    CatalogError::new(CatalogErrorCode::ReconciliationFailed, message)
+    CatalogError::new(CatalogErrorCode::ReconciliationFailed, message).with_origin(CatalogErrorOrigin::RemoteClient)
 }
 
 fn rpc_error(status: tonic::Status) -> CatalogError {
@@ -430,6 +430,7 @@ fn rpc_error(status: tonic::Status) -> CatalogError {
         },
         format!("catalog RPC {}: {}", status.code(), status.message()),
     )
+    .with_origin(CatalogErrorOrigin::RemoteGrpc)
 }
 
 fn read_only() -> CatalogError {
@@ -488,5 +489,27 @@ impl CatalogStore for RemoteCatalogClient {
     }
     async fn incomplete_sagas(&self) -> CatalogResult<Vec<SagaRecord>> {
         Err(read_only())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{failure, rpc_error};
+    use arrowcol_catalog::{CatalogErrorCode, CatalogErrorOrigin};
+    use tonic::Status;
+
+    #[test]
+    fn remote_catalog_errors_preserve_their_origin_and_code() {
+        let client_error = failure("local client failure");
+        assert_eq!(client_error.code(), CatalogErrorCode::ReconciliationFailed);
+        assert_eq!(client_error.origin(), CatalogErrorOrigin::RemoteClient);
+
+        let grpc_error = rpc_error(Status::internal("remote service failure"));
+        assert_eq!(grpc_error.code(), CatalogErrorCode::ReconciliationFailed);
+        assert_eq!(grpc_error.origin(), CatalogErrorOrigin::RemoteGrpc);
+
+        let missing_table = rpc_error(Status::not_found("missing table"));
+        assert_eq!(missing_table.code(), CatalogErrorCode::TableNotFound);
+        assert_eq!(missing_table.origin(), CatalogErrorOrigin::RemoteGrpc);
     }
 }
