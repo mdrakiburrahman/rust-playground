@@ -198,13 +198,16 @@ function localStateRoot(config: Record<string, unknown>): string {
   return resolve(workspaceRoot, platform.compose_state_root);
 }
 
-async function processStartTicks(pid: number): Promise<string | undefined> {
+export async function processStartTicks(
+  pid: number,
+  readProcStat: (path: string) => Promise<string> = (path) => readFile(path, 'utf8'),
+): Promise<string | undefined> {
   if (process.platform !== 'linux') return undefined;
   let statText: string;
   try {
-    statText = await readFile(`/proc/${pid}/stat`, 'utf8');
+    statText = await readProcStat(`/proc/${pid}/stat`);
   } catch (error) {
-    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return undefined;
+    if (error instanceof Error && 'code' in error && (error.code === 'ENOENT' || error.code === 'ESRCH')) return undefined;
     throw error;
   }
   const fields = statText.slice(statText.lastIndexOf(')') + 2).trim().split(/\s+/);

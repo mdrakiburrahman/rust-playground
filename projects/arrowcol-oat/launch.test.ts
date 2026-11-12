@@ -10,12 +10,21 @@ import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   buildOwnedServer, cleanupLocalComposeProjects, finishOwnedLocalRun, launchOat, main, readOatConfigForMode,
-  resolveCliConfigPath, resolveOatConfigPath, sendViewerFile,
+  processStartTicks, resolveCliConfigPath, resolveOatConfigPath, sendViewerFile,
   startLocalServer, startLocalViewer, stopLocalServer,
 } from './launch.js';
 
 const status = (state: 'queued' | 'running' | 'succeeded') => ({
   id: 'run-a', state, progress: state, result_count: state === 'succeeded' ? 2 : 0, error: null,
+});
+
+test('procfs ESRCH race is treated as an exited process', { skip: process.platform !== 'linux' }, async () => {
+  const error = Object.assign(new Error('process disappeared during procfs read'), { code: 'ESRCH' });
+  const readProcStat = async (procPath: string): Promise<string> => {
+    assert.equal(procPath, '/proc/12345/stat');
+    throw error;
+  };
+  assert.equal(await processStartTicks(12345, readProcStat), undefined);
 });
 
 async function ownedBuildFixture(options: {
