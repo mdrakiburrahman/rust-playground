@@ -268,6 +268,7 @@ impl Platform for AksPlatform {
     async fn initialize_qap(&mut self, config: &OatConfig, run_id: &str, tables: &[String]) -> Result<Vec<String>> {
         let bindings = qap_bindings(run_id, tables)?;
         let database = self.qap_database(config)?;
+        let bootstrap_env_file = configured_bootstrap_env_file(config)?;
         let runtime_dir = self
             .runtime_dir
             .as_deref()
@@ -302,13 +303,22 @@ impl Platform for AksPlatform {
             Some(workload_record),
             None,
             &record_path,
+            bootstrap_env_file,
         )
         .await
         .context("bind run-owned AKS QAP external tables")?;
         require_nonempty_record(&record_path).await?;
-        run_oat_qap_helper("verify-oat-qap", run_id, None, None, None, &record_path)
-            .await
-            .context("verify run-owned AKS QAP bindings")?;
+        run_oat_qap_helper(
+            "verify-oat-qap",
+            run_id,
+            None,
+            None,
+            None,
+            &record_path,
+            bootstrap_env_file,
+        )
+        .await
+        .context("verify run-owned AKS QAP bindings")?;
         Ok(bindings.iter().map(|binding| binding.external_table.clone()).collect())
     }
 
@@ -4601,6 +4611,7 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
         .bootstrap_env_file
         .as_deref()
         .context("AKS platform bootstrap_env_file is missing")?;
+    let bootstrap_env_file = Path::new(bootstrap_env);
     let secrets_dir = runtime_dir.join("secrets");
     let runtime_script = std::env::current_dir()?.join("projects/arrowcol-oat/runtime.ts");
     run_npx_runtime(
@@ -4678,6 +4689,7 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
         Some(&service_account),
         &fic_record,
         None,
+        bootstrap_env_file,
     )
     .await
     .context("prepare exact run-owned workload identity credential")?;
@@ -4689,6 +4701,7 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
         Some(&service_account),
         &fic_record,
         Some("300"),
+        bootstrap_env_file,
     )
     .await
     .context("wait for run-owned workload identity token exchange before workload rollout")?;
@@ -4776,6 +4789,26 @@ fn resolve_aks_stamp_config_path(workspace: &Path, configured: &Path) -> Result<
     Ok(path)
 }
 
+fn configured_bootstrap_env_file(config: &OatConfig) -> Result<&Path> {
+    let path = config
+        .platform
+        .bootstrap_env_file
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+        .map(Path::new)
+        .context("AKS platform bootstrap_env_file is missing")?;
+    if !path.is_file() {
+        bail!("AKS platform bootstrap_env_file must identify an existing file");
+    }
+    Ok(path)
+}
+
+#[derive(Clone, Copy)]
+struct AksHelperConfigPaths<'a> {
+    stamp_config_path: &'a Path,
+    bootstrap_env_file: &'a Path,
+}
+
 fn run_fic_helper_command(
     operation: &str,
     run_id: &str,
@@ -4783,7 +4816,7 @@ fn run_fic_helper_command(
     service_account: Option<&str>,
     record_path: &Path,
     wait_seconds: Option<&str>,
-    stamp_config_path: &Path,
+    config_paths: AksHelperConfigPaths<'_>,
 ) -> Result<Command> {
     let workspace = std::env::current_dir()?;
     let script = workspace.join("infra/azure/bootstrap.ts");
@@ -4795,7 +4828,8 @@ fn run_fic_helper_command(
     use_operator_cli_identity(&mut command);
     command.arg(script);
     command.args([operation, "--run-id", run_id]);
-    command.arg("--stamp-config").arg(stamp_config_path);
+    command.arg("--env-file").arg(config_paths.bootstrap_env_file);
+    command.arg("--stamp-config").arg(config_paths.stamp_config_path);
     if let Some(namespace) = namespace {
         command.args(["--namespace", namespace]);
     }
@@ -4817,6 +4851,7 @@ async fn run_run_fic_helper(
     service_account: Option<&str>,
     record_path: &Path,
     wait_seconds: Option<&str>,
+    bootstrap_env_file: &Path,
 ) -> Result<()> {
     let workspace = std::env::current_dir()?;
     let stamp_config_path = selected_aks_stamp_config_path(&workspace)?;
@@ -4827,7 +4862,10 @@ async fn run_run_fic_helper(
         service_account,
         record_path,
         wait_seconds,
-        &stamp_config_path,
+        AksHelperConfigPaths {
+            stamp_config_path: &stamp_config_path,
+            bootstrap_env_file,
+        },
     )?
     .output()
     .await
@@ -4849,7 +4887,7 @@ fn run_oat_qap_helper_command(
     workload_record_path: Option<&Path>,
     workload_stop_record_path: Option<&Path>,
     record_path: &Path,
-    stamp_config_path: &Path,
+    config_paths: AksHelperConfigPaths<'_>,
 ) -> Result<Command> {
     let script = std::env::current_dir()?.join("infra/azure/bootstrap.ts");
     let mut command = Command::new("npx");
@@ -4859,7 +4897,8 @@ fn run_oat_qap_helper_command(
         .kill_on_drop(true);
     use_operator_cli_identity(&mut command);
     command.arg(script).arg(operation);
-    command.arg("--stamp-config").arg(stamp_config_path);
+    command.arg("--env-file").arg(config_paths.bootstrap_env_file);
+    command.arg("--stamp-config").arg(config_paths.stamp_config_path);
     if operation == "bind-oat-qap" {
         let manifest_path = manifest_path.context("QAP binding requires its exact manifest path")?;
         command.args(["--run-id", run_id, "--manifest"]);
@@ -4883,6 +4922,7 @@ async fn run_oat_qap_helper(
     workload_record_path: Option<&Path>,
     workload_stop_record_path: Option<&Path>,
     record_path: &Path,
+    bootstrap_env_file: &Path,
 ) -> Result<()> {
     let workspace = std::env::current_dir()?;
     let stamp_config_path = selected_aks_stamp_config_path(&workspace)?;
@@ -4893,7 +4933,10 @@ async fn run_oat_qap_helper(
         workload_record_path,
         workload_stop_record_path,
         record_path,
-        &stamp_config_path,
+        AksHelperConfigPaths {
+            stamp_config_path: &stamp_config_path,
+            bootstrap_env_file,
+        },
     )?
     .output()
     .await
@@ -5443,16 +5486,22 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
                             if tokio::fs::try_exists(record_path).await?
                                 && tokio::fs::try_exists(stop_record_path).await? =>
                         {
-                            if let Err(error) = run_oat_qap_helper(
-                                "cleanup-oat-qap",
-                                &platform.run_id,
-                                None,
-                                None,
-                                Some(stop_record_path),
-                                record_path,
-                            )
-                            .await
-                            {
+                            let cleanup_result = match configured_bootstrap_env_file(config) {
+                                Ok(bootstrap_env_file) => {
+                                    run_oat_qap_helper(
+                                        "cleanup-oat-qap",
+                                        &platform.run_id,
+                                        None,
+                                        None,
+                                        Some(stop_record_path),
+                                        record_path,
+                                        bootstrap_env_file,
+                                    )
+                                    .await
+                                }
+                                Err(error) => Err(error),
+                            };
+                            if let Err(error) = cleanup_result {
                                 failures.push(format!("remove exact run-owned QAP bindings: {error:#}"));
                             }
                         }
@@ -5465,9 +5514,22 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
     }
     if namespace_removed && platform.fic_prepare_attempted {
         if let Some(record_path) = platform.fic_record_path.as_deref() {
-            if let Err(error) =
-                run_run_fic_helper("cleanup-run-fic", &platform.run_id, None, None, record_path, None).await
-            {
+            let cleanup_result = match configured_bootstrap_env_file(config) {
+                Ok(bootstrap_env_file) => {
+                    run_run_fic_helper(
+                        "cleanup-run-fic",
+                        &platform.run_id,
+                        None,
+                        None,
+                        record_path,
+                        None,
+                        bootstrap_env_file,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+            if let Err(error) = cleanup_result {
                 failures.push(format!(
                     "remove exact run-owned workload identity credential: {error:#}"
                 ));
@@ -6294,12 +6356,25 @@ mod tests {
                 Some("arrowcol-oat"),
                 Path::new("/tmp/run-fic.json"),
                 None,
-                Path::new("/tmp/stamp-87513.yaml"),
+                AksHelperConfigPaths {
+                    stamp_config_path: Path::new("/tmp/stamp-87513.yaml"),
+                    bootstrap_env_file: Path::new("/tmp/oat-private-bootstrap.env"),
+                },
             )?;
             assert!(
                 command.as_std().get_args().collect::<Vec<_>>().windows(2).any(
                     |pair| pair[0] == "--stamp-config" && pair[1] == Path::new("/tmp/stamp-87513.yaml").as_os_str()
                 )
+            );
+            assert!(
+                command
+                    .as_std()
+                    .get_args()
+                    .collect::<Vec<_>>()
+                    .windows(2)
+                    .any(|pair| pair[0] == "--env-file"
+                        && pair[1] == Path::new("/tmp/oat-private-bootstrap.env").as_os_str()),
+                "{operation} must use the configured private bootstrap env file"
             );
             for variable in ["AZURE_CLIENT_ID", "AZURE_TENANT_ID", "AZURE_FEDERATED_TOKEN_FILE"] {
                 assert!(
@@ -6321,6 +6396,7 @@ mod tests {
         let workload = Path::new("/tmp/oat-qap-workload.json");
         let stop = Path::new("/tmp/oat-qap-stop.json");
         let record = Path::new("/tmp/oat-qap-record.json");
+        let bootstrap_env_file = Path::new("/tmp/oat-private-bootstrap.env");
         for (operation, manifest_path, workload_record_path, workload_stop_record_path) in [
             ("bind-oat-qap", Some(manifest), Some(workload), None),
             ("verify-oat-qap", None, None, None),
@@ -6333,12 +6409,24 @@ mod tests {
                 workload_record_path,
                 workload_stop_record_path,
                 record,
-                Path::new("/tmp/stamp-87513.yaml"),
+                AksHelperConfigPaths {
+                    stamp_config_path: Path::new("/tmp/stamp-87513.yaml"),
+                    bootstrap_env_file,
+                },
             )?;
             assert!(
                 command.as_std().get_args().collect::<Vec<_>>().windows(2).any(
                     |pair| pair[0] == "--stamp-config" && pair[1] == Path::new("/tmp/stamp-87513.yaml").as_os_str()
                 )
+            );
+            assert!(
+                command
+                    .as_std()
+                    .get_args()
+                    .collect::<Vec<_>>()
+                    .windows(2)
+                    .any(|pair| pair[0] == "--env-file" && pair[1] == bootstrap_env_file.as_os_str()),
+                "{operation} must use the configured private bootstrap env file"
             );
             for variable in ["AZURE_CLIENT_ID", "AZURE_TENANT_ID", "AZURE_FEDERATED_TOKEN_FILE"] {
                 assert!(
@@ -6361,7 +6449,10 @@ mod tests {
                 None,
                 None,
                 record,
-                Path::new("/tmp/stamp-87513.yaml")
+                AksHelperConfigPaths {
+                    stamp_config_path: Path::new("/tmp/stamp-87513.yaml"),
+                    bootstrap_env_file,
+                },
             )
             .is_err()
         );
