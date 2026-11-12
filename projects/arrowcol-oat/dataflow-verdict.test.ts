@@ -222,6 +222,42 @@ test('AKS collection preserves verified rows when cleanup evidence fails and pas
   assert.match(succeeded.lines.join(), /zero run-scoped namespaces or federated credentials/);
 });
 
+test('AKS mirror endpoint lookup uses configured subscription despite ambient selection', async () => {
+  const logs: string[] = [];
+  const previous = process.env.AZURE_SUBSCRIPTION_ID;
+  process.env.AZURE_SUBSCRIPTION_ID = '00000000-0000-0000-0000-000000000002';
+  let calls = 0;
+  try {
+    const runner: typeof run_tree = async (args) => {
+      calls++;
+      assert.deepEqual(args, ['az', 'storage', 'account', 'show', '-g', 'arrow-collector-rg',
+        '-n', 'arrowcollector00000', '--subscription', subscriptionId, '--query', 'primaryEndpoints.web', '-o', 'tsv']);
+      return ok('https://arrowcollector00000.z1.web.core.windows.net/');
+    };
+    const bytes = await readResultBytes(config, 'aks', runner, async () => new Response('PAR1'), (message) => logs.push(message));
+    assert.equal(Buffer.from(bytes).toString(), 'PAR1');
+    assert.equal(calls, 1);
+    assert.match(logs.join(), /public sanitized/);
+    assert.doesNotMatch(logs.join(), /WARNING:.*authenticated/);
+  } finally {
+    if (previous === undefined) delete process.env.AZURE_SUBSCRIPTION_ID;
+    else process.env.AZURE_SUBSCRIPTION_ID = previous;
+  }
+});
+
+test('AKS mirror lookup rejects missing or malformed selected subscription before fallback', async () => {
+  for (const subscription of [undefined, 'not-a-subscription']) {
+    let calls = 0;
+    const logs: string[] = [];
+    const runner: typeof run_tree = async () => { calls++; return ok(''); };
+    await assert.rejects(readResultBytes({ ...config, subscriptionId: subscription }, 'aks', runner,
+      async () => new Response('PAR1'), (message) => logs.push(message)),
+    /AKS result lookup selected subscription is missing or invalid/);
+    assert.equal(calls, 0);
+    assert.deepEqual(logs, []);
+  }
+});
+
 test('AKS reads sanitized mirror by configured path and visibly falls back only on unavailable mirror', async () => {
   const logs: string[] = [];
   const runner: typeof run_tree = async (args, timeout) => {

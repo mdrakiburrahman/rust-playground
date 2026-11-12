@@ -209,9 +209,13 @@ export async function readResultBytes(
       [authoritative, mirror].some((url) => url.hostname !== `${account}.dfs.core.windows.net` || url.password || url.search || url.hash)) {
     throw new Error('result URLs do not match the selected stamp');
   }
+  const subscription = config.subscriptionId;
+  if (typeof subscription !== 'string' || !UUID.test(subscription)) {
+    throw new Error('AKS result lookup selected subscription is missing or invalid');
+  }
   try {
     const endpoint = (await command(runner, ['az', 'storage', 'account', 'show', '-g', 'arrow-collector-rg',
-      '-n', account, '--query', 'primaryEndpoints.web', '-o', 'tsv'])).trim();
+      '-n', account, '--subscription', subscription, '--query', 'primaryEndpoints.web', '-o', 'tsv'])).trim();
     const url = new URL(endpoint);
     if (url.protocol !== 'https:' || !url.hostname.startsWith(`${account}.`) ||
         !url.hostname.endsWith('.web.core.windows.net') || url.username || url.password || url.search || url.hash) {
