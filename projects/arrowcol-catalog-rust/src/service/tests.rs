@@ -20,6 +20,62 @@ fn config(root: &Path) -> CatalogConfig {
     }
 }
 
+#[derive(Clone)]
+struct TableResponseGate {
+    armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    started: std::sync::Arc<tokio::sync::Notify>,
+    release: std::sync::Arc<tokio::sync::Notify>,
+    get_table_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Default for TableResponseGate {
+    fn default() -> Self {
+        Self {
+            armed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            started: std::sync::Arc::new(tokio::sync::Notify::new()),
+            release: std::sync::Arc::new(tokio::sync::Notify::new()),
+            get_table_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct GatedSchemaCatalog {
+    inner: CatalogService,
+    gate: TableResponseGate,
+}
+
+#[async_trait::async_trait]
+impl SchemaCatalog for GatedSchemaCatalog {
+    type WatchStream = super::EventStream;
+
+    async fn get_current_event_id(&self, request: Request<rpc::Empty>) -> Result<Response<rpc::EventPosition>, Status> {
+        self.inner.get_current_event_id(request).await
+    }
+
+    async fn get_events(&self, request: Request<rpc::EventsRequest>) -> Result<Response<rpc::EventsResponse>, Status> {
+        self.inner.get_events(request).await
+    }
+
+    async fn watch(&self, request: Request<rpc::EventsRequest>) -> Result<Response<Self::WatchStream>, Status> {
+        self.inner.watch(request).await
+    }
+
+    async fn get_table(&self, request: Request<rpc::TableRequest>) -> Result<Response<rpc::TableSnapshot>, Status> {
+        self.gate.get_table_calls.fetch_add(1, Ordering::SeqCst);
+        let response = self.inner.get_table(request).await?;
+        if self.gate.armed.load(Ordering::SeqCst) {
+            self.gate.started.notify_one();
+            self.gate.release.notified().await;
+        }
+        Ok(response)
+    }
+
+    async fn get_snapshot(&self, request: Request<rpc::Empty>) -> Result<Response<rpc::CatalogSnapshot>, Status> {
+        self.inner.get_snapshot(request).await
+    }
+}
+
 #[tokio::test]
 async fn ingestion_catalog_adopts_bootstrap_without_exposing_physical_columns() -> Result<()> {
     let root = tempfile::tempdir()?;
@@ -603,6 +659,90 @@ async fn flight_sql_and_warm_cache_count_actual_catalog_calls() -> Result<()> {
         recovered.position.epoch, evolved.position.epoch,
         "restart must replace epoch"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn unrelated_table_invalidations_during_table_fetch_do_not_exhaust_retries() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let service = CatalogService::open(config(root.path())).await?;
+    service.apply_sql(CREATE).await?;
+    let gate = TableResponseGate::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}", listener.local_addr()?);
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn({
+        let service = service.clone();
+        let gate = gate.clone();
+        async move {
+            tonic::transport::Server::builder()
+                .add_service(SchemaCatalogServer::new(GatedSchemaCatalog { inner: service, gate }))
+                .serve_with_incoming_shutdown(tokio_stream::wrappers::TcpListenerStream::new(listener), async {
+                    let _ = stopped.await;
+                })
+                .await
+        }
+    });
+    let client = RemoteCatalogClient::connect_with_signer(
+        &endpoint,
+        Duration::from_secs(30),
+        InternalRequestSigner::from_secret(b"catalog-integration-key-at-least-32-bytes".to_vec())?,
+    )
+    .await?;
+    let identity = name_identity(&["arrowcol".into(), "default".into(), "events".into()])?;
+    let unrelated = name_identity(&["arrowcol".into(), "default".into(), "unrelated".into()])?;
+    client.invalidate(&identity).await;
+    let calls_before = gate.get_table_calls.load(Ordering::SeqCst);
+    gate.armed.store(true, Ordering::SeqCst);
+
+    let race_client = Arc::clone(&client);
+    let requested = identity.clone();
+    let mut fetch = tokio::spawn(async move { race_client.table(&requested).await });
+    let mut response_is_held = false;
+    let mut fetched = None;
+    for _ in 0..3 {
+        if !response_is_held {
+            tokio::time::timeout(Duration::from_secs(5), gate.started.notified())
+                .await
+                .context("catalog GetTable response was not held")?;
+        }
+        response_is_held = false;
+        client.invalidate(&unrelated).await;
+        gate.release.notify_one();
+
+        let next = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                result = &mut fetch => Some(result),
+                _ = gate.started.notified() => None,
+            }
+        })
+        .await
+        .context("table fetch did not continue after a released response")?;
+        if let Some(result) = next {
+            fetched = Some(result.context("table fetch task panicked")??);
+            break;
+        }
+        response_is_held = true;
+    }
+    let fetched = match fetched {
+        Some(table) => table,
+        None => tokio::time::timeout(Duration::from_secs(5), &mut fetch)
+            .await
+            .context("table fetch exceeded its retry budget")?
+            .context("table fetch task panicked")??,
+    };
+    gate.armed.store(false, Ordering::SeqCst);
+    assert_eq!(fetched.versions.last().context("table head")?.fields().len(), 2);
+    assert_eq!(
+        gate.get_table_calls.load(Ordering::SeqCst),
+        calls_before + 1,
+        "unrelated table invalidations must not trigger table fetch retries"
+    );
+    shutdown
+        .send(())
+        .map_err(|()| anyhow::anyhow!("server already stopped"))?;
+    server.abort();
+    let _ = server.await;
     Ok(())
 }
 
