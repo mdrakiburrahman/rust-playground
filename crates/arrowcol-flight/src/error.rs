@@ -96,6 +96,14 @@ impl RuntimeError {
     /// Maps catalog validation and DDL failures onto the stable public surface.
     #[must_use]
     pub fn from_catalog(error: &CatalogError) -> Self {
+        if let Some((code, cause)) = catalog_error_diagnostic(error) {
+            tracing::error!(
+                target: "arrowcol_flight::catalog",
+                catalog_error_code = code,
+                catalog_error_cause = cause,
+                "catalog operation failed"
+            );
+        }
         let grpc_code = match error.code() {
             CatalogErrorCode::TableNotFound => Code::NotFound,
             CatalogErrorCode::SchemaChangeInProgress | CatalogErrorCode::SchemaVersionConflict => Code::Aborted,
@@ -228,6 +236,17 @@ impl fmt::Display for RuntimeError {
 
 impl std::error::Error for RuntimeError {}
 
+fn catalog_error_diagnostic(error: &CatalogError) -> Option<(&'static str, &'static str)> {
+    let cause = match error.code() {
+        CatalogErrorCode::CorruptCatalogState => "persisted_catalog_state_invalid",
+        CatalogErrorCode::ApplicationDatabase => "application_database_operation_failed",
+        CatalogErrorCode::DescriptorGeneration => "descriptor_generation_failed",
+        CatalogErrorCode::ReconciliationFailed => "catalog_saga_reconciliation_failed",
+        _ => return None,
+    };
+    Some((error.code().as_str(), cause))
+}
+
 /// Structured fields decoded from a tonic status produced by this crate.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GrpcStatusMetadata {
@@ -321,5 +340,92 @@ const fn error_code_name(code: ErrorCode) -> &'static str {
         ErrorCode::PublicationFailed => "publication_failed",
         ErrorCode::PublicationOutcomeUnknown => "publication_outcome_unknown",
         ErrorCode::Internal => "internal",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::{self, Write},
+        sync::{Arc, Mutex},
+    };
+
+    use super::RuntimeError;
+    use arrowcol_catalog::CatalogErrorCode;
+    use tonic::Code;
+
+    #[derive(Clone, Default)]
+    struct TestWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for TestWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let mut output = self
+                .0
+                .lock()
+                .map_err(|_| io::Error::other("test log buffer lock poisoned"))?;
+            output.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TestWriter {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn internal_catalog_failures_log_safe_classes_and_keep_public_status_generic() -> anyhow::Result<()> {
+        let cases = [
+            (CatalogErrorCode::CorruptCatalogState, "persisted_catalog_state_invalid"),
+            (
+                CatalogErrorCode::ApplicationDatabase,
+                "application_database_operation_failed",
+            ),
+            (CatalogErrorCode::DescriptorGeneration, "descriptor_generation_failed"),
+            (
+                CatalogErrorCode::ReconciliationFailed,
+                "catalog_saga_reconciliation_failed",
+            ),
+        ];
+        let logs = TestWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_env_filter(tracing_subscriber::EnvFilter::new("arrowcol_flight::catalog=error"))
+            .with_ansi(false)
+            .finish();
+        let statuses = {
+            let _guard = tracing_subscriber::util::SubscriberInitExt::set_default(subscriber);
+            cases
+                .iter()
+                .map(|(code, _)| {
+                    RuntimeError::from_catalog(&arrowcol_catalog::CatalogError::new(
+                        *code,
+                        "connection_string=do-not-log",
+                    ))
+                })
+                .collect::<Vec<_>>()
+        };
+        let output = String::from_utf8(
+            logs.0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("test log buffer lock poisoned"))?
+                .clone(),
+        )?;
+        assert!(!output.contains("do-not-log"), "{output}");
+        for ((code, cause), status) in cases.iter().zip(statuses) {
+            assert!(output.contains(code.as_str()), "missing {code} in {output}");
+            assert!(output.contains(cause), "missing {cause} in {output}");
+            assert_eq!(status.grpc_code(), Code::Internal);
+            assert_eq!(status.public_message(), "catalog operation failed");
+        }
+        assert_eq!(output.matches("catalog operation failed").count(), cases.len());
+        Ok(())
     }
 }
