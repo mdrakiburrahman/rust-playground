@@ -309,7 +309,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn warmup_cancels_a_slow_send_at_the_shared_boundary() {
+    async fn warmup_cancels_a_slow_send_at_the_shared_boundary() -> anyhow::Result<()> {
         struct DropFlag(Arc<AtomicBool>);
 
         impl Drop for DropFlag {
@@ -339,16 +339,16 @@ mod tests {
                 }
             }
         })
-        .await
-        .unwrap();
+        .await?;
 
         assert!(started.load(Ordering::SeqCst));
         assert!(cancelled.load(Ordering::SeqCst));
         assert!(!completed.load(Ordering::SeqCst));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn warmup_runs_completed_sends_until_the_boundary() {
+    async fn warmup_runs_completed_sends_until_the_boundary() -> anyhow::Result<()> {
         let sends = Arc::new(AtomicUsize::new(0));
         let deadline = Instant::now() + Duration::from_millis(60);
         warmup_until(deadline, {
@@ -362,25 +362,29 @@ mod tests {
                 }
             }
         })
-        .await
-        .unwrap();
+        .await?;
 
         assert!(sends.load(Ordering::SeqCst) >= 1);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn warmup_propagates_send_errors() {
-        let error = warmup_until(Instant::now() + Duration::from_secs(1), || async {
+    async fn warmup_propagates_send_errors() -> anyhow::Result<()> {
+        let error = match warmup_until(Instant::now() + Duration::from_secs(1), || async {
             anyhow::bail!("warm-up upload failed");
         })
         .await
-        .unwrap_err();
+        {
+            Err(error) => error,
+            Ok(_) => anyhow::bail!("warm-up send unexpectedly succeeded"),
+        };
 
         assert_eq!(error.to_string(), "warm-up upload failed");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn zero_warmup_does_not_start_a_send() {
+    async fn zero_warmup_does_not_start_a_send() -> anyhow::Result<()> {
         let sends = Arc::new(AtomicUsize::new(0));
         warmup_until(Instant::now(), {
             let sends = Arc::clone(&sends);
@@ -389,9 +393,9 @@ mod tests {
                 async { Ok(1) }
             }
         })
-        .await
-        .unwrap();
+        .await?;
 
         assert_eq!(sends.load(Ordering::SeqCst), 0);
+        Ok(())
     }
 }
