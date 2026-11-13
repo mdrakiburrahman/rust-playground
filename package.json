@@ -12,7 +12,7 @@
   "overrides": {
     "axios": "1.20.0",
     "brace-expansion": "5.0.12",
-    "smol-toml": "1.9.0"
+    "smol-toml": "1.9.1"
   },
   "devDependencies": {
     "@bufbuild/buf": "1.75.0",
@@ -26,7 +26,7 @@
     "nx": "23.3.0",
     "parquet-wasm": "0.9.0",
     "playwright": "1.64.1",
-    "smol-toml": "1.9.0",
+    "smol-toml": "1.9.1",
     "typescript": "7.0.2"
   },
   "dependencies": {
