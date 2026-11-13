@@ -1,6 +1,7 @@
 version: 2
 secret:
   ignored_paths:
-    - projects/loadtest/test/portainer.test.ts
-    - projects/loadtest/test/sqlserver.test.ts
-    - tools/scripts/test/schema-catalog-bugbash.test.ts
+    - '**/test/**'
+    - '**/tests/**'
+    - '**/fixtures/**'
+    - '**/*.test.*'

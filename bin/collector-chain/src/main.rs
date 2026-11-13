@@ -1,4 +1,4 @@
-mod dmv;
+use collector_chain::dmv;
 mod otlp;
 
 use std::time::Duration;

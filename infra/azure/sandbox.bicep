@@ -1,7 +1,9 @@
 param location string
+param identityLocation string = location
 @allowed(['stamped', 'schema-evolution'])
 param azureMode string = 'stamped'
 param ownership object
+param identityTags object
 param storageAccountName string
 param clusterName string
 param identityName string
@@ -25,14 +27,16 @@ param minimumInstances int
 param maximumInstances int
 param clusterTags object
 
+var createBenchmarkResults = azureMode == 'stamped' && !contains([dataContainer, checkpointContainer, experimentContainer], 'experiments')
+
 resource identity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: identityName
-  location: location
-  tags: ownership
+  location: identityLocation
+  tags: identityTags
 }
 
 module aks './aks.bicep' = if (azureMode == 'stamped') {
-  name: 'arrowcol-aks'
+  name: 'arrowcol-aks-${ownership.sandboxId}'
   params: {
     location: location
     ownership: ownership
@@ -70,10 +74,17 @@ resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
 }
 
 // Disposable data must really disappear on reset, not remain as retained copies.
-resource blobs 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01' = {
+resource blobs 'Microsoft.Storage/storageAccounts/blobServices@2025-08-01' = {
   parent: storage
   name: 'default'
   properties: {
+    // $web is anonymously readable at the static website endpoint even when blob public access is disabled.
+    // Only the sanitized benchmark summary is published there.
+    staticWebsite: {
+      enabled: azureMode == 'stamped'
+      indexDocument: 'index.html'
+      errorDocument404Path: '404.html'
+    }
     isVersioningEnabled: false
     deleteRetentionPolicy: {
       enabled: false
@@ -86,6 +97,18 @@ resource blobs 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01' = {
     }
     restorePolicy: {
       enabled: false
+    }
+  }
+}
+
+resource website 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = if (azureMode == 'stamped') {
+  parent: blobs
+  name: '$web'
+  properties: {
+    publicAccess: 'None'
+    metadata: {
+      sandboxid: ownership.sandboxId
+      project: 'rust-playground'
     }
   }
 }
@@ -114,6 +137,11 @@ resource checkpoints 'Microsoft.Storage/storageAccounts/blobServices/containers@
   }
 }
 
+resource checkpointContainerScope 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' existing = {
+  parent: blobs
+  name: checkpointContainer
+}
+
 // Experiment fixtures live under runs/<runId>/<operation>/ and are wiped by reset.
 resource experiment 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
   parent: blobs
@@ -124,6 +152,28 @@ resource experiment 'Microsoft.Storage/storageAccounts/blobServices/containers@2
       sandboxid: ownership.sandboxId
       project: 'rust-playground'
     }
+  }
+}
+
+resource benchmarkResults 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = if (createBenchmarkResults) {
+  parent: blobs
+  name: 'experiments'
+  properties: {
+    publicAccess: 'None'
+    metadata: {
+      sandboxid: ownership.sandboxId
+      project: 'rust-playground'
+    }
+  }
+}
+
+resource runtimeBenchmarkWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (createBenchmarkResults) {
+  name: guid(benchmarkResults.id, identity.id, 'runtime-benchmark-contributor')
+  scope: benchmarkResults
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
   }
 }
 
@@ -147,6 +197,16 @@ resource readExperiment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   }
 }
 
+resource runtimeDataWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (azureMode == 'stamped') {
+  name: guid(data.id, identity.id, 'runtime-data-contributor')
+  scope: data
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
 resource runtimeExperimentWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (azureMode == 'stamped') {
   name: guid(experiment.id, identity.id, 'runtime-blob-contributor')
   scope: experiment
@@ -157,14 +217,25 @@ resource runtimeExperimentWriter 'Microsoft.Authorization/roleAssignments@2022-0
   }
 }
 
-resource runtimeControlWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (azureMode == 'stamped') {
-  name: guid(storage.id, checkpointContainer, identity.id, 'runtime-control-contributor')
-  scope: checkpoints!
+resource runtimeWebsiteWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (azureMode == 'stamped') {
+  name: guid(website.id, identity.id, 'runtime-static-site-contributor')
+  scope: website
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
     principalId: identity.properties.principalId
     principalType: 'ServicePrincipal'
   }
+}
+
+resource runtimeControlWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (azureMode == 'stamped') {
+  name: guid(checkpointContainerScope.id, identity.id, 'runtime-control-contributor')
+  scope: checkpointContainerScope
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+  dependsOn: [checkpoints]
 }
 
 resource writeData 'Microsoft.Authorization/roleAssignments@2022-04-01' = {

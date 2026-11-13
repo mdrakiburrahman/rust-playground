@@ -42,6 +42,8 @@ pub const ROUTING_FENCING_EPOCH_HEADER: &str = "x-arrowcol-routing-fencing-epoch
 pub const ROUTING_LEASE_VERSION_HEADER: &str = "x-arrowcol-routing-lease-version";
 /// Internal routing lease expiry.
 pub const ROUTING_LEASE_EXPIRES_HEADER: &str = "x-arrowcol-routing-lease-expires";
+/// OAT run identity used to resolve the immutable table-owner binding.
+pub const OAT_RUN_ID_HEADER: &str = "x-arrowcol-oat-run-id";
 
 const FLIGHT_SERVICE_PREFIX: &str = "/arrow.flight.protocol.FlightService/";
 
@@ -140,15 +142,51 @@ impl ProductionRouter {
                     return Ok(true);
                 }
             };
+            let run_id = match parse_oat_run_id(&request.headers) {
+                Ok(run_id) => run_id,
+                Err(message) => {
+                    self.metrics.failure("doput", "unknown", "invalid_oat_run_id");
+                    write_grpc_error(session, 3, &message).await?;
+                    return Ok(true);
+                }
+            };
+            if let Err(message) = validate_oat_run_mode(self.routing.policy().oat_run_id.as_deref(), run_id.as_deref())
+            {
+                self.metrics.failure("doput", "unknown", "unauthorized_oat_run_id");
+                write_grpc_error(session, 7, &message).await?;
+                return Ok(true);
+            }
             let pool = metadata.implementation_pool().to_string();
-            match self.routing.route_ingest(&metadata, now).await {
+            let is_oat = run_id.is_some();
+            let routed = match run_id {
+                Some(run_id) => {
+                    let expires_at = match oat_run_expiry(now, self.routing.policy().oat_run_pin_ttl_ms) {
+                        Ok(expires_at) => expires_at,
+                        Err(message) => {
+                            self.metrics.failure("doput", &pool, "invalid_oat_run_expiry");
+                            write_grpc_error(session, 3, &message).await?;
+                            return Ok(true);
+                        }
+                    };
+                    self.routing
+                        .route_ingest_for_run(&metadata, &run_id, expires_at, now)
+                        .await
+                }
+                None => self.routing.route_ingest(&metadata, now).await,
+            };
+            match routed {
                 Ok(assignment) => {
                     self.record_assignment(context, assignment, "doput", pool);
                     Ok(false)
                 }
                 Err(error) => {
-                    self.metrics.failure("doput", &pool, routing_reason(error.kind()));
-                    write_grpc_error(session, routing_grpc_status(error.kind()), error.message()).await?;
+                    if is_oat {
+                        self.metrics.failure("doput", &pool, "pinning_violation");
+                        write_grpc_error(session, 9, &format!("pinning_violation: {}", error.message())).await?;
+                    } else {
+                        self.metrics.failure("doput", &pool, routing_reason(error.kind()));
+                        write_grpc_error(session, routing_grpc_status(error.kind()), error.message()).await?;
+                    }
                     Ok(true)
                 }
             }
@@ -197,6 +235,53 @@ impl ProductionRouter {
         context.operation = operation;
         context.pool = Some(pool);
         context.stream_counted = true;
+    }
+
+    async fn revalidate_oat_upstream(&self, context: &mut RequestContext) -> pingora::Result<()> {
+        let Some(run_id) = self.routing.policy().oat_run_id.as_deref() else {
+            return Ok(());
+        };
+        let Some(assignment) = context
+            .assignment
+            .as_ref()
+            .filter(|assignment| assignment.lease.is_some())
+        else {
+            return Ok(());
+        };
+        let now = now_unix_millis()
+            .map_err(|cause| Error::because(ErrorType::InternalError, "read OAT forwarding timestamp", cause))?;
+        match self.routing.revalidate_run_assignment(run_id, assignment, now).await {
+            Ok(current) => {
+                context.assignment = Some(current);
+                Ok(())
+            }
+            Err(cause) => {
+                self.metrics.failure(
+                    "doput",
+                    context.pool.as_deref().unwrap_or("unknown"),
+                    "pinning_violation",
+                );
+                context.pinning_error = Some(format!("pinning_violation: {cause}"));
+                Err(Error::explain(ErrorType::InternalError, cause.to_string()))
+            }
+        }
+    }
+
+    fn record_oat_upstream_failure(&self, context: &mut RequestContext) {
+        if self.routing.policy().oat_run_id.is_some()
+            && context
+                .assignment
+                .as_ref()
+                .is_some_and(|assignment| assignment.lease.is_some())
+            && context.pinning_error.is_none()
+        {
+            self.metrics.failure(
+                "doput",
+                context.pool.as_deref().unwrap_or("unknown"),
+                "pinning_violation",
+            );
+            context.pinning_error = Some("pinning_violation: pinned collector became unavailable".to_owned());
+        }
     }
 
     async fn handle_http_api(
@@ -269,6 +354,7 @@ pub struct RequestContext {
     pool: Option<String>,
     is_grpc: bool,
     stream_counted: bool,
+    pinning_error: Option<String>,
 }
 
 #[async_trait]
@@ -290,6 +376,7 @@ impl ProxyHttp for ProductionRouter {
     }
 
     async fn upstream_peer(&self, _session: &mut Session, context: &mut Self::CTX) -> pingora::Result<Box<HttpPeer>> {
+        self.revalidate_oat_upstream(context).await?;
         let assignment = context.assignment.as_ref().ok_or_else(|| {
             Error::explain(
                 ErrorType::InternalError,
@@ -327,6 +414,7 @@ impl ProxyHttp for ProductionRouter {
         upstream_request: &mut RequestHeader,
         context: &mut Self::CTX,
     ) -> pingora::Result<()> {
+        self.revalidate_oat_upstream(context).await?;
         for header in [
             EDGE_TIMESTAMP_HEADER,
             EDGE_NONCE_HEADER,
@@ -384,9 +472,10 @@ impl ProxyHttp for ProductionRouter {
         &self,
         _session: &mut Session,
         _peer: &HttpPeer,
-        _context: &mut Self::CTX,
+        context: &mut Self::CTX,
         mut error: Box<Error>,
     ) -> Box<Error> {
+        self.record_oat_upstream_failure(context);
         error.set_retry(false);
         error
     }
@@ -396,16 +485,23 @@ impl ProxyHttp for ProductionRouter {
         peer: &HttpPeer,
         _session: &mut Session,
         mut error: Box<Error>,
-        _context: &mut Self::CTX,
+        context: &mut Self::CTX,
         _client_reused: bool,
     ) -> Box<Error> {
+        if matches!(error.esource(), ErrorSource::Upstream) {
+            self.record_oat_upstream_failure(context);
+        }
         error.set_retry(false);
         error.more_context(format!("non-retryable streaming request to {peer}"))
     }
 
     async fn fail_to_proxy(&self, session: &mut Session, error: &Error, context: &mut Self::CTX) -> FailToProxy {
         let code = if context.is_grpc && session.response_written().is_none() {
-            if let Err(write_error) = write_grpc_error(session, 14, "upstream collector is unavailable").await {
+            let (grpc_status, message) = context
+                .pinning_error
+                .as_deref()
+                .map_or((14, "upstream collector is unavailable"), |message| (9, message));
+            if let Err(write_error) = write_grpc_error(session, grpc_status, message).await {
                 warn!(error = %write_error, "failed to write canonical gRPC proxy error");
             }
             200
@@ -584,6 +680,61 @@ fn parse_ingest_metadata(headers: &http::HeaderMap) -> Result<IngestMetadata, St
     IngestMetadata::parse(raw).map_err(|cause| cause.to_string())
 }
 
+fn parse_oat_run_id(headers: &http::HeaderMap) -> Result<Option<String>, String> {
+    let values = headers.get_all(OAT_RUN_ID_HEADER);
+    if values.iter().count() > 1 {
+        return Err(format!("gRPC metadata {OAT_RUN_ID_HEADER} must occur at most once"));
+    }
+    let Some(value) = values.iter().next() else {
+        return Ok(None);
+    };
+    let run_id = value
+        .to_str()
+        .map_err(|_| format!("gRPC metadata {OAT_RUN_ID_HEADER} is not visible ASCII"))?;
+    if run_id.is_empty()
+        || run_id.len() > 64
+        || !run_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(format!(
+            "gRPC metadata {OAT_RUN_ID_HEADER} must contain 1..=64 ASCII letters, digits, hyphens, or underscores"
+        ));
+    }
+    Ok(Some(run_id.to_owned()))
+}
+
+fn validate_oat_run_mode(expected: Option<&str>, provided: Option<&str>) -> Result<(), String> {
+    match (expected, provided) {
+        (Some(expected), Some(provided)) if expected == provided => Ok(()),
+        (Some(_), _) => Err("router requires its configured OAT run ID on every ingest request".to_owned()),
+        (None, Some(_)) => Err("router is not configured to authorize OAT run pinning".to_owned()),
+        (None, None) => Ok(()),
+    }
+}
+
+fn oat_run_expiry(now: UnixMillis, ttl_ms: u64) -> Result<UnixMillis, String> {
+    let expires_at = now
+        .get()
+        .checked_add(ttl_ms)
+        .ok_or_else(|| "OAT run pin expiry overflows the timestamp range".to_owned())?;
+    UnixMillis::new(expires_at).map_err(|cause| format!("invalid OAT run pin expiry: {cause}"))
+}
+
+#[cfg(test)]
+mod oat_run_mode_tests {
+    use super::*;
+
+    #[test]
+    fn oat_run_header_requires_exact_run_scoped_router_configuration() {
+        assert!(validate_oat_run_mode(None, None).is_ok());
+        assert!(validate_oat_run_mode(None, Some("run-a")).is_err());
+        assert!(validate_oat_run_mode(Some("run-a"), Some("run-a")).is_ok());
+        assert!(validate_oat_run_mode(Some("run-a"), None).is_err());
+        assert!(validate_oat_run_mode(Some("run-a"), Some("run-b")).is_err());
+    }
+}
+
 fn parse_control_route(headers: &http::HeaderMap, path: &str) -> Result<ControlRoute, String> {
     let pool = ascii_header(headers, IMPLEMENTATION_POOL_METADATA_KEY)?
         .ok_or_else(|| format!("required gRPC metadata key {IMPLEMENTATION_POOL_METADATA_KEY} is missing"))?
@@ -716,6 +867,7 @@ fn auth_reason(kind: AuthFailureKind) -> &'static str {
         AuthFailureKind::Invalid => "invalid",
         AuthFailureKind::ForgedInternalIdentity => "forged_internal_identity",
         AuthFailureKind::Forbidden => "forbidden",
+        AuthFailureKind::ReplayCapacity => "replay_capacity",
         AuthFailureKind::Internal => "internal",
     }
 }
@@ -723,6 +875,7 @@ fn auth_reason(kind: AuthFailureKind) -> &'static str {
 fn auth_grpc_status(kind: AuthFailureKind) -> u16 {
     match kind {
         AuthFailureKind::Forbidden => 7,
+        AuthFailureKind::ReplayCapacity => 8,
         AuthFailureKind::Internal => 13,
         AuthFailureKind::Missing | AuthFailureKind::Invalid | AuthFailureKind::ForgedInternalIdentity => 16,
     }

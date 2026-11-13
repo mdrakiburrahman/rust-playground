@@ -1083,6 +1083,7 @@ pub(crate) mod tests {
                 now_unix_ms: now,
                 expires_at_unix_ms: UnixMillis::new(now.get() + 60_000)?,
                 minimum_snapshot_at_unix_ms: now,
+                distinct_table_owners: false,
             })
             .await?;
         Ok(())

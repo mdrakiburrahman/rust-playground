@@ -1534,8 +1534,9 @@ mod io_tests {
     }
 }
 
-// Older and renamed writers must contend for the same persisted lock.
-const WRITER_LOCK: &str = ".arrow-lake-writer.lock";
+/// Table-root file a writer holds an exclusive advisory lock on. It is never written, so it is not
+/// table content. Older and renamed writers must contend for the same persisted lock.
+pub const WRITER_LOCK: &str = ".arrow-lake-writer.lock";
 
 /// Immutable details passed to a publication fence immediately before commit.
 #[derive(Clone, Copy, Debug)]

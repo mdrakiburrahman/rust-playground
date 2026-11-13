@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { ROOT, run_tree } from '../../../infra/azure/bootstrap.js';
@@ -24,7 +23,9 @@ test('requires an ACR name and validates image tags', () => {
 });
 
 function inputs(t: test.TestContext) {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'azure-qap-image-test-'));
+  const root = path.join(ROOT, 'out', 'azure-qap-image-tests');
+  fs.mkdirSync(root, { recursive: true });
+  const directory = fs.mkdtempSync(path.join(root, 'case-'));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const env = path.join(directory, '.env');
   const azureEnv = path.join(directory, '.env.azure');

@@ -1,0 +1,53 @@
+{
+  "name": "arrowcol-oat",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "application",
+  "sourceRoot": "projects/arrowcol-oat",
+  "targets": {
+    "test": {
+      "executor": "nx:run-commands",
+      "options": {"command": "npx --no-install tsx --test projects/arrowcol-oat/*.test.ts"}
+    },
+    "typecheck": {
+      "executor": "nx:run-commands",
+      "options": {"command": "npx --no-install tsc --project projects/arrowcol-oat/tsconfig.json"}
+    },
+    "verify": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["test", "typecheck"],
+      "options": {"commands": []}
+    },
+    "cli": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install tsx projects/arrowcol-oat/cli.ts",
+        "forwardAllArgs": true
+      }
+    },
+    "launch": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install tsx projects/arrowcol-oat/launch.ts",
+        "forwardAllArgs": true
+      }
+    },
+    "runtime": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {"command": "npx --no-install tsx projects/arrowcol-oat/runtime.ts", "forwardAllArgs": true}
+    },
+    "runtime-smoke": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {"command": "npx --no-install tsx projects/arrowcol-oat/runtime-smoke.ts"}
+    },
+    "image-publish": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {"command": "npx --no-install tsx projects/arrowcol-oat/publish-images.ts", "forwardAllArgs": true}
+    }
+  }
+}

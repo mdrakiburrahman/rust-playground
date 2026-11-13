@@ -54,12 +54,16 @@ const HEAVY_QUERY_CONCURRENCY: usize = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
-enum Mode {
+pub enum ObservationMode {
+    /// Local Kustainer endpoint using local authentication-free transport.
     Local,
+    /// Azure Data Explorer endpoint using the ambient Azure CLI identity.
     Azure,
 }
 
-impl Mode {
+type Mode = ObservationMode;
+
+impl ObservationMode {
     fn from_env() -> Result<Self> {
         match std::env::var("ARROWCOL_MODE").ok().as_deref().map(str::trim) {
             None | Some("" | "local") => Ok(Self::Local),
@@ -390,6 +394,33 @@ impl KustoClient {
             .await?;
         ensure!(rows.len() <= 1, "duplicate acceleration statistics for {name}");
         Ok(rows.first().map(Acceleration::from_row))
+    }
+
+    async fn observation_statistics(
+        &self,
+        policies: &BTreeMap<String, String>,
+    ) -> Result<BTreeMap<String, Acceleration>> {
+        let rows = self
+            .execute(&observation_statistics_command(policies)?, true, "qap")
+            .await?;
+        let mut statistics = BTreeMap::new();
+        for row in rows {
+            let name = row
+                .get("ExternalTableName")
+                .and_then(Value::as_str)
+                .context("observation statistics table name missing")?;
+            ensure!(
+                policies.contains_key(name),
+                "unexpected observation statistics table {name}"
+            );
+            ensure!(
+                statistics
+                    .insert(name.to_owned(), Acceleration::from_row(&row))
+                    .is_none(),
+                "duplicate observation statistics for {name}"
+            );
+        }
+        Ok(statistics)
     }
 
     /// Best-effort sanitized `QueryAccelerationState`; never fails validation on its own.
@@ -1121,6 +1152,11 @@ fn local_capacity_command() -> String {
     format!(".alter-merge cluster policy capacity @'{policy}'")
 }
 
+const ACCELERATION_COLUMNS: &str = "HotSize = tolong(HotSize), LastUpdatedDateTime, \
+    PendingFiles = tolong(AccelerationPendingDataFilesCount), \
+    PendingBytes = tolong(column_ifexists('AccelerationPendingDataFilesSize', long(null))), \
+    Complete = todouble(AccelerationCompletePercentage), Eligible, Fresh";
+
 fn acceleration_command(name: &str, max_age: &str, commit_ms: Option<u64>) -> Result<String> {
     identifier(name)?;
     timespan(max_age)?;
@@ -1132,12 +1168,33 @@ fn acceleration_command(name: &str, max_age: &str, commit_ms: Option<u64>) -> Re
         ".show external tables operations query_acceleration statistics \
          | where ExternalTableName == {} \
          | extend Eligible = LastUpdatedDateTime > now() - totimespan({}), Fresh = {fresh} \
-         | project HotSize = tolong(HotSize), LastUpdatedDateTime, \
-           PendingFiles = tolong(AccelerationPendingDataFilesCount), \
-           PendingBytes = tolong(column_ifexists('AccelerationPendingDataFilesSize', long(null))), \
-           Complete = todouble(AccelerationCompletePercentage), Eligible, Fresh",
+         | project {ACCELERATION_COLUMNS}",
         literal(name)?,
         literal(max_age)?
+    ))
+}
+
+fn observation_statistics_command(policies: &BTreeMap<String, String>) -> Result<String> {
+    ensure!(!policies.is_empty(), "observation statistics require requested tables");
+    let mut names = Vec::new();
+    let mut ages = Vec::new();
+    for (name, max_age) in policies {
+        identifier(name)?;
+        timespan(max_age)?;
+        let name = literal(name)?;
+        names.push(name.clone());
+        ages.push(format!(
+            "ExternalTableName == {name}, totimespan({})",
+            literal(max_age)?
+        ));
+    }
+    Ok(format!(
+        ".show external tables operations query_acceleration statistics \
+         | where ExternalTableName in ({}) \
+         | extend Eligible = LastUpdatedDateTime > now() - case({}, timespan(0s)), Fresh = true \
+         | project ExternalTableName, {ACCELERATION_COLUMNS}",
+        names.join(", "),
+        ages.join(", ")
     ))
 }
 
@@ -1321,18 +1378,24 @@ fn commit_millis(root: &Path, identity: &str, version: u64) -> Option<u64> {
 
 pub(crate) async fn settle_dataflow(endpoints: &[String], timeout: Duration, quiver: bool) -> Result<()> {
     ensure!(!endpoints.is_empty(), "Dataflow publication endpoints are missing");
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .context("Dataflow settle deadline overflow")?;
+    let deadline_at = tokio::time::Instant::from_std(deadline);
     let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
-    let deadline = Instant::now() + timeout;
     let mut replay = ReplayQuiescence::default();
     loop {
+        ensure!(
+            Instant::now() < deadline,
+            "Dataflow publication did not settle before Kusto validation"
+        );
         let mut settled = true;
         let mut replay_counters = Vec::new();
         for endpoint in endpoints {
-            let response = client
-                .get(format!("{}/metrics", endpoint.trim_end_matches('/')))
-                .send()
-                .await?;
-            let text = response.error_for_status()?.text().await?;
+            let request = client.get(format!("{}/metrics", endpoint.trim_end_matches('/'))).send();
+            let text = tokio::time::timeout_at(deadline_at, async { request.await?.error_for_status()?.text().await })
+                .await
+                .context("Dataflow publication did not settle before Kusto validation")??;
             settled &= publication_idle(&text)?;
             if quiver {
                 settled &= metric_value(&text, "arrowcol_dataflow_durable_backlog_batches")? == 0;
@@ -1348,13 +1411,15 @@ pub(crate) async fn settle_dataflow(endpoints: &[String], timeout: Duration, qui
             settled = replay.observe(settled, replay_counters, Instant::now());
         }
         if settled {
+            ensure!(
+                Instant::now() < deadline,
+                "Dataflow publication did not settle before Kusto validation"
+            );
             return Ok(());
         }
-        ensure!(
-            Instant::now() < deadline,
-            "Dataflow publication did not settle before Kusto validation"
-        );
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::timeout_at(deadline_at, tokio::time::sleep(Duration::from_millis(250)))
+            .await
+            .context("Dataflow publication did not settle before Kusto validation")?;
     }
 }
 
@@ -1869,36 +1934,96 @@ pub async fn observe_qap(
     tables: &[String],
     deadline: Duration,
 ) -> Result<Value> {
+    let mode = Mode::from_env()?;
+    let database = match (mode, database) {
+        (_, Some(database)) => database.to_owned(),
+        (Mode::Local, None) => DATABASE.to_owned(),
+        (Mode::Azure, None) => {
+            std::env::var("AZURE_KUSTO_DATABASE").context("AZURE_KUSTO_DATABASE is required in Azure mode")?
+        }
+    };
+    observe_qap_with_mode(endpoint, results, mode, &database, tables, deadline).await
+}
+
+/// Observes QAP using an explicit platform mode and database, without reading or mutating process environment.
+///
+/// # Errors
+///
+/// Returns an error if client setup, the observation deadline, elapsed-time
+/// conversion, or diagnostic publication fails. Per-table failures are recorded
+/// in the returned JSON rather than failing the entire observation.
+pub async fn observe_qap_with_mode(
+    endpoint: &str,
+    results: &Path,
+    mode: ObservationMode,
+    database: &str,
+    tables: &[String],
+    deadline: Duration,
+) -> Result<Value> {
     let started = Instant::now();
     let queries_completed = Arc::new(AtomicU64::new(0));
     let mut timed_out = false;
     let outcome = async {
-        let mut client = match database {
-            Some(database) => KustoClient::with_mode(endpoint, results, Mode::from_env()?, database)?,
-            None => KustoClient::new(endpoint, results)?,
-        };
+        let mut client = KustoClient::with_mode(endpoint, results, mode, database)?;
         client.queries_completed = Arc::clone(&queries_completed);
         tokio::time::timeout(deadline, async {
+            let mut requested = BTreeSet::new();
+            for name in tables {
+                identifier(name)?;
+                ensure!(requested.insert(name), "duplicate observation table {name}");
+            }
             let mut observed = BTreeMap::new();
+            let mut policies = BTreeMap::new();
             // Poll both lanes in this parent task: synchronous artifact appends cannot interleave,
             // and dropping the deadline future cancels every in-flight table request.
             let mut pending = stream::iter(tables)
-                .map(|name| async { (name.clone(), observe_table(&client, name).await) })
+                .map(|name| async { (name.clone(), observe_table_metadata(&client, name).await) })
                 .buffer_unordered(2);
             while let Some((name, table)) = pending.next().await {
-                observed.insert(name, table);
+                match table {
+                    Ok((table, max_age)) => {
+                        policies.insert(name.clone(), max_age);
+                        observed.insert(name, table);
+                    }
+                    Err(error) => {
+                        observed.insert(name, json!({"available": false, "error": short_error(&error)}));
+                    }
+                }
             }
-            json!({
+            if !policies.is_empty() {
+                // Statistics enumerate the database before filtering; scan once, not once per table.
+                match client.observation_statistics(&policies).await {
+                    Ok(statistics) => {
+                        for name in policies.keys() {
+                            let mut value = statistics
+                                .get(name)
+                                .map(serde_json::to_value)
+                                .transpose()?
+                                .unwrap_or(Value::Null);
+                            if !value.is_null() {
+                                value["Fresh"] = Value::Null;
+                            }
+                            observed.get_mut(name).context("observed table missing")?["statistics"] = value;
+                        }
+                    }
+                    Err(error) => {
+                        for name in policies.keys() {
+                            observed.insert(name.clone(), json!({"available": false, "error": short_error(&error)}));
+                        }
+                    }
+                }
+            }
+            Ok::<_, anyhow::Error>(json!({
                 "observed_unix_ms": now_unix_millis(), "backend": BACKEND, "mode": client.mode,
                 "expected_tables": tables,
                 "capacity": client.capacity().await, "tables": observed
-            })
+            }))
         })
         .await
         .map_err(|_| {
             timed_out = true;
             anyhow::anyhow!("QAP observation exceeded its {deadline:?} deadline")
-        })
+        })?
     }
     .await;
     write_json(
@@ -1913,25 +2038,154 @@ pub async fn observe_qap(
     outcome
 }
 
-async fn observe_table(client: &KustoClient, name: &str) -> Value {
-    let observed = async {
-        let (policy, max_age) = client.max_age(name).await?;
-        let statistics = match client.acceleration_row(name, &max_age, None).await? {
-            Some(row) => {
-                let mut statistics = serde_json::to_value(row)?;
-                statistics["Fresh"] = Value::Null;
-                statistics
-            }
-            None => Value::Null,
-        };
-        let details = client.details(name).await;
-        let state = CacheState::from_details(&details);
-        Ok::<_, anyhow::Error>(json!({
-            "available": true, "policy": policy, "statistics": statistics, "state": state, "details": details
-        }))
+/// Creates run-scoped local external tables and applies the local QAP policy after Delta commits.
+///
+/// # Errors
+///
+/// Returns an error if the database, table set, or locations are invalid, or client
+/// initialization, policy application/read-back, schema access, or the deadline fails.
+pub async fn initialize_local_qap(
+    endpoint: &str,
+    results: &Path,
+    database: &str,
+    tables: &[(String, String)],
+    deadline: Duration,
+) -> Result<()> {
+    ensure!(
+        !tables.is_empty(),
+        "local QAP initialization requires at least one external table"
+    );
+    ensure!(
+        database == DATABASE,
+        "local QAP initialization currently requires the isolated loadtest database"
+    );
+    let mut names = BTreeSet::new();
+    for (name, location) in tables {
+        identifier(name)?;
+        ensure!(
+            names.insert(name.clone()),
+            "local QAP initialization contains duplicate table names"
+        );
+        ensure!(
+            location.starts_with("/delta/dataflow/") && !location.contains(['\'', '\r', '\n']),
+            "local QAP external-table location is outside the run-local Delta mount"
+        );
     }
-    .await;
-    observed.unwrap_or_else(|error| json!({"available": false, "error": short_error(&error)}))
+    let client = KustoClient::with_mode(endpoint, results, Mode::Local, database)?;
+    tokio::time::timeout(deadline, async {
+        client.bootstrap().await?;
+        client.local_capacity().await?;
+        for (name, location) in tables {
+            client.expose(name, location).await?;
+            let (_, max_age) = client.max_age(name).await?;
+            ensure!(
+                max_age == LOCAL_MAX_AGE,
+                "local QAP policy for {name} did not match the configured policy"
+            );
+            client.schema(name).await.with_context(|| {
+                format!("local QAP external table {name} is not readable from its committed Delta location")
+            })?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("local QAP initialization exceeded its {deadline:?} deadline"))?
+}
+
+/// Samples QAP until every requested table is fully cached and healthy, or the
+/// single observation budget expires. Neither outcome proves Delta delivery.
+///
+/// # Errors
+///
+/// Returns setup, publication and observation failures, including a deadline
+/// reached before any complete observation could be retained.
+pub async fn observe_qap_until_ready(
+    endpoint: &str,
+    results: &Path,
+    mode: ObservationMode,
+    database: &str,
+    tables: &[String],
+    budget: Duration,
+) -> Result<Value> {
+    ensure!(!tables.is_empty(), "QAP catch-up requires expected tables");
+    let started = Instant::now();
+    let mut last = None;
+    let mut samples = 0_u64;
+    let outcome = loop {
+        let remaining = budget.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            break last
+                .map(|observation| (observation, false))
+                .context("QAP catch-up deadline elapsed before any observation");
+        }
+        let sample_started_unix_ms = now_unix_millis();
+        let sample = tokio::time::timeout(
+            remaining,
+            observe_qap_with_mode(endpoint, results, mode, database, tables, remaining),
+        )
+        .await;
+        match sample {
+            Ok(Ok(observation)) => {
+                samples += 1;
+                let ready = tables.iter().all(|name| {
+                    let table = &observation["tables"][name];
+                    table["available"] == true
+                        && table["state"]["IsHealthy"] == true
+                        && table["statistics"]["AccelerationCompletePercentage"].as_f64() == Some(100.0)
+                        && table["statistics"]["AccelerationPendingDataFilesCount"].as_u64() == Some(0)
+                });
+                append(
+                    &results.join("qap-observations.jsonl"),
+                    &json!({
+                        "sample": samples,
+                        "started_unix_ms": sample_started_unix_ms,
+                        "finished_unix_ms": now_unix_millis(),
+                        "caught_up": ready,
+                        "observation": sanitize(&observation),
+                    }),
+                )?;
+                if ready {
+                    break Ok((observation, true));
+                }
+                last = Some(observation);
+            }
+            Ok(Err(error)) if started.elapsed() < budget => break Err(error),
+            Ok(Err(_)) | Err(_) => {
+                break last
+                    .map(|observation| (observation, false))
+                    .context("QAP catch-up deadline elapsed before any observation");
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1).min(budget.saturating_sub(started.elapsed()))).await;
+    };
+    write_json(
+        &results.join("catch-up-diagnostic.json"),
+        &json!({
+            "code": match &outcome {
+                Ok((_, true)) => "caught_up",
+                Ok((_, false)) => "deadline_incomplete",
+                Err(_) => "observation_failed",
+            },
+            "elapsed_ms": u64::try_from(started.elapsed().as_millis())?,
+            "samples": samples,
+            "delta_delivery": "not_established",
+        }),
+    )?;
+    let (mut observation, caught_up) = outcome?;
+    observation["catch_up_status"] = json!(if caught_up { "caught_up" } else { "deadline_incomplete" });
+    Ok(observation)
+}
+
+async fn observe_table_metadata(client: &KustoClient, name: &str) -> Result<(Value, String)> {
+    let (policy, max_age) = client.max_age(name).await?;
+    let details = client.details(name).await;
+    let state = CacheState::from_details(&details);
+    Ok((
+        json!({
+            "available": true, "policy": policy, "statistics": null, "state": state, "details": details
+        }),
+        max_age,
+    ))
 }
 
 pub(crate) fn validation_failure(results: &Path, error: &anyhow::Error, progress: &KustoProgress) -> Result<Value> {
@@ -1974,7 +2228,10 @@ mod tests {
     use std::{
         io::Read,
         net::{TcpListener, TcpStream},
-        sync::atomic::{AtomicU64, AtomicUsize},
+        sync::{
+            Condvar,
+            atomic::{AtomicU64, AtomicUsize},
+        },
         thread,
     };
 
@@ -2136,16 +2393,23 @@ mod tests {
     #[tokio::test]
     async fn cloned_clients_bound_actual_inflight_queries_independently_of_cpu_workers() -> Result<()> {
         for heavy in [false, true] {
+            let bound = if heavy {
+                HEAVY_QUERY_CONCURRENCY
+            } else {
+                QUERY_CONCURRENCY
+            };
             let listener = TcpListener::bind("127.0.0.1:0")?;
             let endpoint = format!("http://{}", listener.local_addr()?);
             let active = Arc::new(AtomicUsize::new(0));
             let peak = Arc::new(AtomicUsize::new(0));
             let observed = Arc::clone(&peak);
+            let arrivals = Arc::new((Mutex::new(0usize), Condvar::new()));
             let server = thread::spawn(move || -> Result<()> {
                 let mut workers = Vec::new();
                 for _ in 0..8 {
                     let (mut socket, _) = listener.accept()?;
                     let (active, peak) = (Arc::clone(&active), Arc::clone(&peak));
+                    let arrivals = Arc::clone(&arrivals);
                     workers.push(thread::spawn(move || -> Result<()> {
                         socket.set_read_timeout(Some(Duration::from_secs(5)))?;
                         let mut header = Vec::new();
@@ -2169,14 +2433,30 @@ mod tests {
                         socket.read_exact(&mut request)?;
                         let current = active.fetch_add(1, Ordering::SeqCst) + 1;
                         peak.fetch_max(current, Ordering::SeqCst);
-                        thread::sleep(Duration::from_millis(40));
+                        let (arrived, ready) = &*arrivals;
+                        let mut arrived = arrived
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("query arrival lock poisoned"))?;
+                        *arrived += 1;
+                        let batch_end = (arrived.div_ceil(bound) * bound).min(8);
+                        ready.notify_all();
+                        let (arrived, _) = ready
+                            .wait_timeout_while(arrived, Duration::from_secs(10), |arrived| *arrived < batch_end)
+                            .map_err(|_| anyhow::anyhow!("query arrival lock poisoned"))?;
+                        ensure!(
+                            *arrived >= batch_end,
+                            "query test server timed out waiting for {batch_end} admitted requests; observed {}",
+                            *arrived
+                        );
+                        drop(arrived);
                         let body = response(&["Rows"], vec![json!([1])]).to_string();
+                        // Count completion before the response can release the client's permit.
+                        active.fetch_sub(1, Ordering::SeqCst);
                         write!(
                             socket,
                             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                             body.len()
                         )?;
-                        active.fetch_sub(1, Ordering::SeqCst);
                         Ok(())
                     }));
                 }
@@ -2200,20 +2480,17 @@ mod tests {
                     }
                 });
             }
+            let mut query_results = Vec::new();
             while let Some(result) = pending.join_next().await {
-                assert_eq!(result??[0]["Rows"], 1);
+                query_results.push(result);
             }
             server
                 .join()
                 .map_err(|_| anyhow::anyhow!("query test server panicked"))??;
-            assert_eq!(
-                observed.load(Ordering::SeqCst),
-                if heavy {
-                    HEAVY_QUERY_CONCURRENCY
-                } else {
-                    QUERY_CONCURRENCY
-                }
-            );
+            for result in query_results {
+                assert_eq!(result??[0]["Rows"], 1);
+            }
+            assert_eq!(observed.load(Ordering::SeqCst), bound);
         }
         Ok(())
     }
@@ -2539,6 +2816,41 @@ mod tests {
         assert!(!replay.observe(true, vec![2, 0], at(13)));
         assert!(!replay.observe(true, vec![2, 0], at(17)));
         assert!(replay.observe(true, vec![2, 0], at(18)));
+    }
+
+    #[tokio::test]
+    async fn settle_rejects_idle_metrics_returned_after_deadline() -> Result<()> {
+        use std::io::Write;
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let server = thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            let mut request = [0; 1024];
+            if stream.read(&mut request)? == 0 {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(100));
+            let body =
+                "arrowcol_flight_active_streams 0\narrowcol_dfe_buffered_batches 0\narrowcol_delta_pending_commits 0\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            Ok(())
+        });
+
+        let result = settle_dataflow(std::slice::from_ref(&endpoint), Duration::from_millis(30), false).await;
+        // Wake accept if the deadline expired before opening a connection.
+        drop(TcpStream::connect(endpoint.trim_start_matches("http://")));
+        match server.join() {
+            Ok(result) => result?,
+            Err(_) => bail!("metrics server thread panicked"),
+        }
+        assert!(result.is_err(), "late idle metrics must not satisfy the deadline");
+        Ok(())
     }
 
     #[tokio::test]
@@ -3170,6 +3482,256 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn observation_statistics_bind_each_requested_table_to_its_validated_max_age() -> Result<()> {
+        let policies = BTreeMap::from([
+            ("dataflow_a".to_owned(), "00:01:00".to_owned()),
+            ("dataflow_b".to_owned(), "1.02:03:04".to_owned()),
+        ]);
+        let command = observation_statistics_command(&policies)?;
+        assert!(command.contains("where ExternalTableName in (\"dataflow_a\", \"dataflow_b\")"));
+        assert!(command.contains(
+            "case(ExternalTableName == \"dataflow_a\", totimespan(\"00:01:00\"), \
+             ExternalTableName == \"dataflow_b\", totimespan(\"1.02:03:04\"), timespan(0s))"
+        ));
+        assert!(command.ends_with(&format!("project ExternalTableName, {ACCELERATION_COLUMNS}")));
+        assert_eq!(command.matches(".show external tables").count(), 1);
+        assert!(observation_statistics_command(&BTreeMap::new()).is_err());
+        for (name, age) in [("bad'; drop", "00:01:00"), ("dataflow_a", "invalid")] {
+            assert!(observation_statistics_command(&BTreeMap::from([(name.to_owned(), age.to_owned())])).is_err());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn batched_observation_statistics_match_single_table_numeric_and_null_semantics() -> Result<()> {
+        let directory = Directory::new()?;
+        let rows = vec![
+            json!(["dataflow_a", 10, "2026-10-27T00:00:00Z", 2, null, 50.0, 1, 1]),
+            json!(["dataflow_b", null, null, -1, null, null, 0, 1]),
+        ];
+        let server = Server::start(move |request| {
+            let command = request["csl"].as_str().context("command missing")?;
+            let selected = if command.contains("ExternalTableName in (") {
+                rows.clone()
+            } else if command.contains("ExternalTableName == \"dataflow_a\"") {
+                vec![rows[0].clone()]
+            } else {
+                vec![rows[1].clone()]
+            };
+            Ok(Some(response(
+                &[
+                    "ExternalTableName",
+                    "HotSize",
+                    "LastUpdatedDateTime",
+                    "PendingFiles",
+                    "PendingBytes",
+                    "Complete",
+                    "Eligible",
+                    "Fresh",
+                ],
+                selected,
+            )))
+        })?;
+        let client = KustoClient::with_mode(&server.endpoint, &directory.0, Mode::Local, DATABASE)?;
+        let policies = BTreeMap::from([
+            ("dataflow_a".to_owned(), "00:01:00".to_owned()),
+            ("dataflow_b".to_owned(), "00:02:00".to_owned()),
+            ("dataflow_missing".to_owned(), "00:03:00".to_owned()),
+        ]);
+        let batch = client.observation_statistics(&policies).await?;
+        assert_eq!(batch.len(), 2);
+        assert!(!batch.contains_key("dataflow_missing"));
+        for name in ["dataflow_a", "dataflow_b"] {
+            assert_eq!(
+                Some(&batch[name]),
+                client.acceleration_row(name, &policies[name], None).await?.as_ref()
+            );
+        }
+        let nullable = serde_json::to_value(&batch["dataflow_b"])?;
+        assert_eq!(nullable["HotSize"], Value::Null);
+        assert_eq!(nullable["AccelerationPendingDataFilesCount"], Value::Null);
+        assert_eq!(nullable["AccelerationCompletePercentage"], Value::Null);
+        assert_eq!(nullable["Eligible"], false);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn batched_observation_rejects_unbound_duplicate_or_failed_statistics_without_measured_fallbacks()
+    -> Result<()> {
+        for rows in [
+            vec![json!(["dataflow_a", 10]), json!(["dataflow_a", 20])],
+            vec![json!(["unrequested_table", 10])],
+            vec![json!([null, 10])],
+        ] {
+            let directory = Directory::new()?;
+            let server = Server::start(move |request| {
+                let command = request["csl"].as_str().context("command missing")?;
+                let body = if command.ends_with("policy query_acceleration") {
+                    response(
+                        &["Policy"],
+                        vec![json!(["{\"IsEnabled\":true,\"MaxAge\":\"00:01:00\"}"])],
+                    )
+                } else if command.contains("query_acceleration statistics") {
+                    response(&["ExternalTableName", "HotSize"], rows.clone())
+                } else {
+                    response(&[], vec![])
+                };
+                Ok(Some(body))
+            })?;
+            let result = observe_qap_with_mode(
+                &server.endpoint,
+                &directory.0,
+                Mode::Local,
+                DATABASE,
+                &["dataflow_a".to_owned(), "dataflow_b".to_owned()],
+                Duration::from_secs(5),
+            )
+            .await?;
+            for name in ["dataflow_a", "dataflow_b"] {
+                assert_eq!(result["tables"][name]["available"], false);
+                assert!(result["tables"][name].get("statistics").is_none());
+                assert!(
+                    result["tables"][name]["error"]
+                        .as_str()
+                        .is_some_and(|error| error.contains("statistics"))
+                );
+            }
+        }
+        let directory = Directory::new()?;
+        let server = Server::start(|_| Ok(Some(json!({"error": {"code": "Failure"}}))))?;
+        let client = KustoClient::with_mode(&server.endpoint, &directory.0, Mode::Local, DATABASE)?;
+        assert!(
+            client
+                .observation_statistics(&BTreeMap::from([("dataflow_a".to_owned(), "00:01:00".to_owned())]))
+                .await
+                .is_err()
+        );
+        assert!(
+            observe_qap_with_mode(
+                &server.endpoint,
+                &directory.0,
+                Mode::Local,
+                DATABASE,
+                &["dataflow_a".to_owned(), "dataflow_a".to_owned()],
+                Duration::from_secs(5),
+            )
+            .await
+            .is_err()
+        );
+        Ok(())
+    }
+
+    fn catch_up_server(slow_second_sample: bool) -> Result<(Server, Arc<AtomicUsize>)> {
+        let samples = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&samples);
+        let server = Server::start(move |request| {
+            let command = request["csl"].as_str().context("command missing")?;
+            if command.ends_with("policy query_acceleration") {
+                return Ok(Some(response(
+                    &["Policy"],
+                    vec![json!(["{\"IsEnabled\":true,\"MaxAge\":\"00:05:00\"}"])],
+                )));
+            }
+            if command.ends_with(" details") {
+                return Ok(Some(response(
+                    &["QueryAccelerationState"],
+                    vec![json!(["{\"IsHealthy\":true}"])],
+                )));
+            }
+            if command.contains("query_acceleration statistics") {
+                let sample = seen.fetch_add(1, Ordering::SeqCst);
+                if sample > 0 && slow_second_sample {
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+                return Ok(Some(response(
+                    &[
+                        "ExternalTableName",
+                        "HotSize",
+                        "LastUpdatedDateTime",
+                        "PendingFiles",
+                        "PendingBytes",
+                        "Complete",
+                        "Eligible",
+                        "Fresh",
+                    ],
+                    vec![
+                        json!(["dataflow_a", 10, "2026-10-27T00:00:00Z", 0, 0, 100.0, 1, 1]),
+                        json!([
+                            "dataflow_b",
+                            10,
+                            "2026-10-27T00:00:00Z",
+                            if sample == 0 { 3 } else { 0 },
+                            0,
+                            if sample == 0 { 50.0 } else { 100.0 },
+                            1,
+                            1
+                        ]),
+                    ],
+                )));
+            }
+            Ok(Some(response(&[], vec![])))
+        })?;
+        Ok((server, samples))
+    }
+
+    #[tokio::test]
+    async fn catch_up_waits_for_every_table_and_retains_each_observation() -> Result<()> {
+        let directory = Directory::new()?;
+        let (server, samples) = catch_up_server(false)?;
+        let observed = observe_qap_until_ready(
+            &server.endpoint,
+            &directory.0,
+            Mode::Local,
+            DATABASE,
+            &["dataflow_a".to_owned(), "dataflow_b".to_owned()],
+            Duration::from_secs(5),
+        )
+        .await?;
+        assert_eq!(samples.load(Ordering::SeqCst), 2);
+        assert_eq!(observed["catch_up_status"], "caught_up");
+        assert_eq!(
+            observed["tables"]["dataflow_b"]["statistics"]["AccelerationPendingDataFilesCount"],
+            0
+        );
+        let history = fs::read_to_string(directory.0.join("qap-observations.jsonl"))?;
+        let history = history
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0]["caught_up"], false);
+        assert_eq!(history[1]["caught_up"], true);
+        assert!(history[0]["finished_unix_ms"].as_u64() <= history[1]["started_unix_ms"].as_u64());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catch_up_uses_one_deadline_and_retains_the_last_pending_snapshot() -> Result<()> {
+        let directory = Directory::new()?;
+        let (server, samples) = catch_up_server(true)?;
+        let observed = observe_qap_until_ready(
+            &server.endpoint,
+            &directory.0,
+            Mode::Local,
+            DATABASE,
+            &["dataflow_a".to_owned(), "dataflow_b".to_owned()],
+            Duration::from_millis(1500),
+        )
+        .await?;
+        assert_eq!(samples.load(Ordering::SeqCst), 2);
+        assert_eq!(observed["catch_up_status"], "deadline_incomplete");
+        assert_eq!(
+            observed["tables"]["dataflow_b"]["statistics"]["AccelerationPendingDataFilesCount"],
+            3
+        );
+        let diagnostic: Value = serde_json::from_slice(&fs::read(directory.0.join("catch-up-diagnostic.json"))?)?;
+        assert_eq!(diagnostic["code"], "deadline_incomplete");
+        assert_eq!(diagnostic["samples"], 1);
+        assert_eq!(diagnostic["delta_delivery"], "not_established");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn live_observation_is_read_only_and_never_fabricates_measurements() -> Result<()> {
         let directory = Directory::new()?;
@@ -3196,6 +3758,7 @@ mod tests {
             if command.contains("query_acceleration statistics") && command.contains("dataflow_ready") {
                 return Ok(Some(response(
                     &[
+                        "ExternalTableName",
                         "HotSize",
                         "LastUpdatedDateTime",
                         "PendingFiles",
@@ -3204,7 +3767,16 @@ mod tests {
                         "Eligible",
                         "Fresh",
                     ],
-                    vec![json!([10, "2026-10-27T00:00:00Z", 2, null, 50.0, 1, 1])],
+                    vec![json!([
+                        "dataflow_ready",
+                        10,
+                        "2026-10-27T00:00:00Z",
+                        2,
+                        null,
+                        50.0,
+                        1,
+                        1
+                    ])],
                 )));
             }
             if command.ends_with(" details") {

@@ -1,0 +1,426 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
+  <meta name="description" content="ArrowCol OAT benchmark results">
+  <title>ArrowCol OAT benchmark</title>
+  <style>
+    :root { color-scheme: light; font-family: "Segoe UI", Arial, sans-serif; color: #201f1e; background: #f7f9fb; }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    main { max-width: 1440px; min-width: 0; margin: 0 auto; padding: 28px 20px 48px; }
+    h1 { margin: 0; font-size: 24px; font-weight: 650; }
+    .lede { color: #605e5c; margin: 7px 0 22px; font-size: 14px; }
+    .toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+    .status { color: #605e5c; font-size: 13px; }
+    button { border: 1px solid #8a8886; border-radius: 4px; background: #fff; padding: 7px 12px; color: #201f1e; cursor: pointer; }
+    button:hover { border-color: #0078d4; color: #005a9e; }
+    .stats { display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); gap: 10px; margin: 14px 0 18px; }
+    .stat { border: 1px solid #d5dfe8; background: #fff; border-radius: 5px; padding: 11px 13px; }
+    .stat-label { color: #605e5c; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+    .stat-value { display: block; margin-top: 5px; font-size: 18px; font-weight: 650; font-variant-numeric: tabular-nums; }
+    .table-wrap { overflow: auto; border: 1px solid #c8c6c4; border-radius: 5px; background: #fff; }
+    table { border-collapse: separate; border-spacing: 0; width: 100%; min-width: 760px; font-size: 12px; font-variant-numeric: tabular-nums; }
+    caption { text-align: left; padding: 11px 12px; color: #605e5c; font-size: 12px; }
+    th, td { padding: 8px 10px; text-align: right; white-space: nowrap; border-bottom: 1px solid #edebe9; }
+    th { position: sticky; top: 0; z-index: 1; background: #f3f2f1; color: #323130; font-weight: 600; }
+    th:first-child, td:first-child { text-align: left; }
+    tbody tr:last-child td { border-bottom: 0; }
+    tbody tr:hover td { outline: 1px solid #9cc9f0; outline-offset: -1px; }
+    td.key { background: #faf9f8; font-weight: 600; }
+    td.heat { color: #004578; }
+    .empty { color: #605e5c; text-align: center !important; padding: 34px 14px; }
+    .note { color: #605e5c; font-size: 11px; line-height: 1.5; margin-top: 12px; }
+    code { font-family: Consolas, monospace; font-size: 11px; }
+    h2 { margin: 0 0 8px; font-size: 18px; font-weight: 650; }
+    .section-lede { color: #605e5c; margin: 0 0 14px; font-size: 13px; line-height: 1.5; }
+    .architecture, .reference { margin: 26px 0 30px; }
+    .architecture-frame { margin: 0 auto; background: #fff; }
+    .architecture-frame img { display: block; width: 100%; height: auto; }
+    .part-badge { display: inline-flex; align-items: center; justify-content: center; min-width: 20px; margin: 0 3px 1px 5px; padding: 2px 5px; border: 1px solid #9cc9f0; border-radius: 9px; background: #eff6fc; color: #005a9e; font-size: 10px; font-weight: 700; line-height: 1; vertical-align: middle; }
+    .part-name { display: inline; }
+    .reference table { min-width: 700px; }
+    .reference td:first-child { font-family: Consolas, monospace; font-weight: 600; }
+    .mapping { text-align: left !important; white-space: normal; min-width: 190px; }
+    .filters { border: 1px solid #d5dfe8; background: #fff; border-radius: 6px; padding: 14px; }
+    .filter-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+    .filter-heading h2 { margin: 0; }
+    .filter-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(155px, 1fr)); gap: 10px; }
+    .filter-grid label { display: flex; flex-direction: column; min-width: 0; gap: 4px; color: #605e5c; font-size: 11px; font-weight: 600; }
+    .filter-grid select, .filter-grid input { width: 100%; min-width: 0; height: 34px; padding: 5px 8px; border: 1px solid #c8c6c4; border-radius: 4px; background: #fff; color: #201f1e; font: inherit; font-size: 13px; }
+    .filter-grid .search { grid-column: span 2; }
+    .results-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin: 18px 0 8px; }
+    .results-heading h2 { margin: 0; }
+    .results-table th button { display: inline-flex; align-items: center; gap: 4px; padding: 0; border: 0; background: transparent; color: inherit; font: inherit; white-space: nowrap; }
+    .results-table th button:hover { color: #005a9e; }
+    .results-table th[aria-sort="ascending"] button::after { content: " ▲"; }
+    .results-table th[aria-sort="descending"] button::after { content: " ▼"; }
+    .badge { display: inline-block; border-radius: 12px; padding: 2px 7px; font-size: 11px; font-weight: 650; }
+    .badge-local { background: #e8f4fd; color: #005a9e; }
+    .badge-aks { background: #e8ecf7; color: #354b85; }
+    .badge-alert { background: #fde7e9; color: #a4262c; }
+    .badge-ok { background: #e5f3e7; color: #107c10; }
+    .results-table tr.problem td { border-bottom-color: #e8a4a8; background-color: #fff7f7; }
+    .results-table tr.problem td.heat { background-image: linear-gradient(#fff7f780, #fff7f780); }
+    details { text-align: left; white-space: normal; min-width: 85px; }
+    details summary { cursor: pointer; color: #005a9e; }
+    details pre { max-width: 380px; max-height: 220px; overflow: auto; margin: 6px 0; padding: 8px; border-radius: 4px; background: #f3f2f1; font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .results-table { min-width: 1200px; }
+    .table-wrap { max-width: 100%; }
+    .table-wrap caption { white-space: normal; }
+    @media (max-width: 500px) { .filter-grid .search { grid-column: auto; } }
+    @media (max-width: 680px) { main { padding: 20px 12px 32px; } .stats { grid-template-columns: repeat(2, minmax(120px, 1fr)); } h1 { font-size: 21px; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>ArrowCol OAT benchmark</h1>
+  <p class="lede">ArrowCol replicas × DFE worker concurrency · results from the published compact Parquet file</p>
+  <div class="toolbar">
+    <button id="reload" type="button">Reload results</button>
+    <span id="status" class="status" role="status" aria-live="polite">Loading benchmark results…</span>
+  </div>
+  <section class="stats" aria-label="Benchmark summary">
+    <div class="stat"><span class="stat-label">Rows</span><strong id="stat-rows" class="stat-value">—</strong></div>
+    <div class="stat"><span class="stat-label">Configurations</span><strong id="stat-configs" class="stat-value">—</strong></div>
+    <div class="stat"><span class="stat-label">Peak admission rate (filtered)</span><strong id="stat-throughput" class="stat-value">—</strong></div>
+    <div class="stat"><span class="stat-label">Median admission duration (filtered)</span><strong id="stat-latency" class="stat-value">—</strong></div>
+  </section>
+  <section class="filters" aria-labelledby="filter-title">
+    <div class="filter-heading"><h2 id="filter-title">Explore results</h2><button id="clear" type="button">Clear all</button></div>
+    <div id="filter-grid" class="filter-grid">
+      <label class="search">Search<input id="search" type="search" placeholder="Search runs, hosts, tunables…"></label>
+    </div>
+  </section>
+  <div class="results-heading"><h2>Results</h2><span id="filtered-count" class="status" aria-live="polite"></span></div>
+  <div class="table-wrap">
+    <table class="results-table">
+      <caption>Each row is one table-pinned ArrowCol result. Blue intensity is relative to the filtered results; select a column heading to sort.</caption>
+      <thead><tr>
+        <th data-column="mode" scope="col">Mode</th><th data-column="stamp" scope="col">Stamp</th><th data-column="experiment" scope="col">Experiment</th><th data-column="status" scope="col">Status</th><th data-column="pinning_ok" scope="col">Pinning</th>
+        <th data-result="run_id" scope="col">Run</th><th data-result="replicas" scope="col">ArrowCol replicas</th><th data-result="dfe_worker_concurrency" scope="col">DFE workers</th><th data-result="table" scope="col">Pinned table</th>
+        <th data-column="table_owner" scope="col">Table owner</th><th data-column="clients" scope="col">Clients</th>
+        <th data-result="rows" scope="col">Rows</th><th data-result="duration_ms" scope="col">Duration (ms)</th><th data-result="rows_per_second" scope="col">Rows/s</th><th data-result="cpu_millicores" scope="col">CPU (mCPU)</th><th data-result="memory_bytes" scope="col">Memory (MiB)</th><th data-result="qap_observation_complete" scope="col">QAP fields complete</th><th data-result="qap_observed_tables" scope="col">QAP tables</th><th data-result="qap_completion_percent" scope="col">QAP complete (%)</th><th data-result="qap_pending_artifacts" scope="col">Pending artifacts</th><th data-result="qap_cached_bytes" scope="col">Cached (MiB)</th><th data-result="qap_unhealthy_catalogs" scope="col">Unhealthy catalogs</th><th data-result="qap_lag_seconds" scope="col">QAP lag (s)</th>
+        <th data-column="host" scope="col">Host</th><th data-column="started_at" scope="col">Started (UTC)</th><th data-column="measure_seconds" scope="col">Measure (s)</th><th data-column="tables" scope="col">Tables</th><th data-column="git_sha" scope="col">Git SHA</th><th scope="col">Tunables</th>
+      </tr></thead>
+      <tbody id="results"><tr><td class="empty" colspan="29">Loading…</td></tr></tbody>
+    </table>
+  </div>
+  <p class="note">Summary values and heatmap ranges use all rows matching the current filters, including failed and pinning-violation rows; they are not success-only performance claims. Throughput and duration measure client admission, not durable Delta/QAP publication. Missing metrics appear as —, not zero. “QAP fields complete” is 1 only when all required telemetry fields were observed; it is separate from QAP completion percentage.</p>
+  <p class="note">The static site and its Parquet file are anonymously readable. Only publish approved, nonsensitive benchmark summaries here; never include credentials, raw payloads, or sensitive identifiers. The viewer loads <code>results.parquet</code> from this same origin, so no cross-origin request or CORS rule is required.</p>
+  <section class="architecture" aria-labelledby="architecture-title">
+    <h2 id="architecture-title">Benchmark architecture</h2>
+    <p class="section-lede">Numbered parts 1–6 identify where each tunable and result field belongs in the stack below.</p>
+    <div class="architecture-frame">
+      <img id="architecture-diagram" src="architecture.svg" width="809" height="585" alt="ArrowCol OAT benchmark architecture. Numbered parts: 1 OAT control plane; 2 DMV client; 3 ArrowCol Catalog Rust; 4 DFE + Delta-Maintenance; 5 Kusto QAP; 6 ADLS Gen2 + site. The operator host controls the AKS stack; table-pinned Arrow streams reach Delta tables and Kusto QAP. Matching numbers identify the configuration fields and result columns below.">
+    </div>
+  </section>
+  <section class="reference" aria-labelledby="config-reference-title">
+    <h2 id="config-reference-title">Configuration reference</h2>
+    <p class="section-lede">OAT JSON tunables are mapped to the numbered stack parts they configure.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th scope="col">OAT JSON field</th><th scope="col">Affects</th><th scope="col">Purpose</th></tr></thead>
+        <tbody id="config-reference"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+<script type="module">
+const resultUrl = new URL('results.parquet', window.location.href).toString();
+const stackParts = [
+  { id: 1, title: 'OAT control plane' },
+  { id: 2, title: 'DMV client' },
+  { id: 3, title: 'ArrowCol Catalog Rust' },
+  { id: 4, title: 'DFE + Delta-Maintenance' },
+  { id: 5, title: 'Kusto QAP' },
+  { id: 6, title: 'ADLS Gen2 + site' }
+];
+const configFields = [
+  ['namespace', [1, 2, 3, 4], 'Kubernetes namespace for the benchmark workloads.'],
+  ['kubectl_context', [1], 'Optional Kubernetes context; null uses the current context.'],
+  ['arrowcol_deployment', [3], 'ArrowCol Deployment to observe and temporarily scale.'],
+  ['arrowcol_container', [3], 'Container in the ArrowCol Deployment.'],
+  ['dfe_deployment', [4], 'Data Flow Engine Deployment to observe and configure.'],
+  ['dfe_container', [4], 'Container in the DFE Deployment.'],
+  ['arrowcol_pod_selector', [3], 'Pod selector used to collect ArrowCol metrics.'],
+  ['dfe_pod_selector', [4], 'Pod selector used to collect DFE metrics.'],
+  ['arrowcol_endpoint', [2, 3], 'Router endpoint used by the standalone DMV client.'],
+  ['dmv_client_binary', [2], 'Path to the ArrowCol DMV client executable.'],
+  ['tables', [2, 3], 'Distinct DMV table names used as stable routing keys.'],
+  ['rows_per_table', [2], 'Rows sent by each client for each table.'],
+  ['dmv_concurrency', [2], 'Maximum concurrent DMV table clients per matrix case.'],
+  ['qap_endpoint', [5], 'Kusto endpoint queried for native QAP metrics.'],
+  ['qap_database', [5], 'Optional QAP database name.'],
+  ['qap_timeout_seconds', [1, 5], 'Timeout for QAP observation requests.'],
+  ['replica_counts', [3], 'ArrowCol replica values in the experiment matrix.'],
+  ['dfe_worker_concurrency', [4], 'DFE worker concurrency values in the experiment matrix.'],
+  ['result_url', [6], 'ADLS Gen2 experiments destination for compact Parquet.'],
+  ['website_url', [6], 'Parquet object path directly under the public $web container.']
+];
+const resultParts = {
+  run_id: [1], replicas: [3], dfe_worker_concurrency: [4], table: [2, 3],
+  rows: [2], duration_ms: [2], rows_per_second: [2], cpu_millicores: [3, 4],
+  memory_bytes: [3, 4], qap_observation_complete: [5], qap_observed_tables: [5],
+  qap_completion_percent: [5], qap_pending_artifacts: [5], qap_cached_bytes: [5],
+  qap_unhealthy_catalogs: [5], qap_lag_seconds: [5]
+};
+const statusNode = document.querySelector('#status');
+const bodyNode = document.querySelector('#results');
+const numberFormat = new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 });
+
+function partNames(ids) {
+  return ids.map(id => `${id} ${stackParts.find(part => part.id === id).title}`).join('; ');
+}
+function partBadges(ids) {
+  const label = ids.join(' · ');
+  return `<span class="part-badge" title="${safeText(partNames(ids))}" aria-label="Stack part${ids.length > 1 ? 's' : ''} ${safeText(ids.join(', '))}">${label}</span>`;
+}
+function renderMappings() {
+  for (const header of document.querySelectorAll('th[data-result]')) {
+    const ids = resultParts[header.dataset.result];
+    header.insertAdjacentHTML('beforeend', partBadges(ids));
+  }
+  document.querySelector('#config-reference').innerHTML = configFields.map(([field, ids, purpose]) =>
+    `<tr><td>${safeText(field)}</td><td class="mapping">${partBadges(ids)} ${safeText(partNames(ids))}</td><td class="mapping">${safeText(purpose)}</td></tr>`).join('');
+  for (const header of document.querySelectorAll('.results-table th[data-result], .results-table th[data-column]')) {
+    const key = header.dataset.column || header.dataset.result;
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.innerHTML = header.innerHTML;
+    button.addEventListener('click', () => {
+      state.direction = state.sort === key && state.direction === 'asc' ? 'desc' : 'asc';
+      state.sort = key;
+      render();
+    });
+    header.replaceChildren(button);
+  }
+}
+
+function number(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+function show(value, digits = 2) {
+  const parsed = number(value);
+  return parsed === null ? '—' : new Intl.NumberFormat(undefined, { maximumFractionDigits: digits }).format(parsed);
+}
+function pinningLabel(row) {
+  if (row.status === 'pinning_violation') return 'Violation';
+  return row.pinning_ok === true ? 'OK' : 'Unverified';
+}
+const MAX_RENDERED_ROWS = 250;
+function heatBounds(values) {
+  let min = Infinity;
+  let max = -Infinity;
+  let count = 0;
+  for (const value of values) {
+    min = Math.min(min, value);
+    max = Math.max(max, value);
+    count++;
+  }
+  return { min, max, count };
+}
+function heat(value, bounds, lowerIsBetter = false) {
+  const parsed = number(value);
+  if (parsed === null || bounds.count < 2) return '';
+  const { min, max } = bounds;
+  if (min === max) return 'background-color:rgba(0,120,212,.14)';
+  let ratio = (parsed - min) / (max - min);
+  if (lowerIsBetter) ratio = 1 - ratio;
+  return 'background-color:rgba(0,120,212,' + (0.06 + ratio * 0.22).toFixed(3) + ')';
+}
+function safeText(value) {
+  return String(value ?? '—').replace(/[&<>"']/g, char => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' })[char]);
+}
+function median(values) {
+  if (!values.length) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+const facets = [
+  ['mode', 'Mode'], ['stamp', 'Stamp'], ['experiment', 'Experiment'],
+  ['arrowcols', 'ArrowCols'], ['dfe_worker_concurrency', 'DFE concurrency'],
+  ['clients', 'Clients'], ['table', 'Table'], ['table_owner', 'Table owner'],
+  ['status', 'Status'], ['pinning_ok', 'Pinning OK']
+];
+const state = { filters: {}, search: '', sort: 'replicas', direction: 'asc' };
+let allRows = [];
+let loadMessage = 'No published results are available yet.';
+const missing = 'n';
+const valueFor = (row, key) => key === 'replicas' || key === 'arrowcols' ? (row.arrowcols ?? row.replicas) : row[key];
+const facetValue = value => value === null || value === undefined ? missing : `v${String(value)}`;
+const facetLabel = value => value === missing ? 'Not available' : value.slice(1);
+
+function readUrl() {
+  const params = new URLSearchParams(location.search);
+  state.search = params.get('q') || '';
+  const requestedSort = params.get('sort') || 'replicas';
+  state.sort = [...document.querySelectorAll('.results-table th[data-result], .results-table th[data-column]')]
+    .some(header => (header.dataset.column || header.dataset.result) === requestedSort) ? requestedSort : 'replicas';
+  state.direction = params.get('dir') === 'desc' ? 'desc' : 'asc';
+  state.filters = Object.fromEntries(facets.map(([key]) => [key, params.get(key) || '']));
+  document.querySelector('#search').value = state.search;
+}
+function writeUrl() {
+  const url = new URL(location.href);
+  for (const [key] of facets) {
+    if (state.filters[key]) url.searchParams.set(key, state.filters[key]);
+    else url.searchParams.delete(key);
+  }
+  for (const [key, value] of [['q', state.search], ['sort', state.sort === 'replicas' ? '' : state.sort], ['dir', state.direction === 'asc' ? '' : state.direction]]) {
+    if (value) url.searchParams.set(key, value);
+    else url.searchParams.delete(key);
+  }
+  history.replaceState(null, '', url);
+}
+function matches(row, excludedFacet = '') {
+  if (state.search && !Object.values(row).some(value => String(value ?? '').toLocaleLowerCase().includes(state.search.toLocaleLowerCase()))) return false;
+  return facets.every(([key]) => key === excludedFacet || !state.filters[key] || facetValue(valueFor(row, key)) === state.filters[key]);
+}
+function renderFacets() {
+  for (const [key] of facets) {
+    const select = document.querySelector(`[data-facet="${key}"]`);
+    const counts = new Map();
+    for (const row of allRows.filter(row => matches(row, key))) {
+      const value = facetValue(valueFor(row, key));
+      counts.set(value, (counts.get(value) || 0) + 1);
+    }
+    if (state.filters[key] && !counts.has(state.filters[key])) counts.set(state.filters[key], 0);
+    const options = [...counts].sort((a, b) => facetLabel(a[0]).localeCompare(facetLabel(b[0]), undefined, { numeric: true }));
+    select.innerHTML = `<option value="">All (${allRows.filter(row => matches(row, key)).length})</option>` +
+      options.map(([value, count]) => `<option value="${safeText(value)}">${safeText(facetLabel(value))} (${count})</option>`).join('');
+    select.value = state.filters[key] || '';
+  }
+}
+function compareRows(a, b) {
+  const left = valueFor(a, state.sort);
+  const right = valueFor(b, state.sort);
+  if (left == null || right == null) return left == null ? (right == null ? 0 : 1) : -1;
+  const numeric = number(left) !== null && number(right) !== null;
+  const comparison = numeric ? number(left) - number(right) : String(left).localeCompare(String(right), undefined, { numeric: true });
+  return state.direction === 'desc' ? -comparison : comparison;
+}
+function formattedTunables(value) {
+  if (value == null || value === '') return '—';
+  try { return JSON.stringify(JSON.parse(value), null, 2); }
+  catch { return String(value); }
+}
+function timestamp(value) {
+  if (value == null || value === '') return '—';
+  const date = new Date(typeof value === 'bigint' ? Number(value) : value);
+  return Number.isNaN(date.valueOf()) ? String(value) : date.toISOString().replace('T', ' ').replace('.000Z', 'Z');
+}
+function render() {
+  writeUrl();
+  renderFacets();
+  const rows = allRows.filter(row => matches(row)).sort(compareRows);
+  const values = key => rows.map(row => number(valueFor(row, key))).filter(value => value !== null);
+  const throughput = values('rows_per_second');
+  const durations = values('duration_ms');
+  const configs = new Set(rows.map(row => JSON.stringify([row.mode, row.stamp, row.experiment, valueFor(row, 'arrowcols'), row.dfe_worker_concurrency, row.clients, row.tables, row.tunables_json], (_, value) => typeof value === 'bigint' ? value.toString() : value)));
+  document.querySelector('#stat-rows').textContent = numberFormat.format(rows.length);
+  document.querySelector('#stat-configs').textContent = numberFormat.format(configs.size);
+  document.querySelector('#stat-throughput').textContent = throughput.length ? `${show(throughput.reduce((best, value) => Math.max(best, value), -Infinity))} rows/s` : '—';
+  document.querySelector('#stat-latency').textContent = durations.length ? `${show(median(durations))} ms` : '—';
+  document.querySelector('#filtered-count').textContent = `${numberFormat.format(rows.length)} of ${numberFormat.format(allRows.length)} rows${rows.length > MAX_RENDERED_ROWS ? ` (showing first ${MAX_RENDERED_ROWS}; filter to narrow)` : ''}`;
+  for (const header of document.querySelectorAll('.results-table th[data-result], .results-table th[data-column]')) {
+    const key = header.dataset.column || header.dataset.result;
+    if (key === state.sort) header.setAttribute('aria-sort', state.direction === 'asc' ? 'ascending' : 'descending');
+    else header.removeAttribute('aria-sort');
+  }
+  if (!rows.length) {
+    bodyNode.innerHTML = `<tr><td class="empty" colspan="29">${safeText(allRows.length ? 'No results match these filters. Try clearing or changing them.' : loadMessage)}</td></tr>`;
+    return;
+  }
+  const heatColumns = {
+    duration_ms: [durations, true, 1], rows_per_second: [throughput, false, 1],
+    cpu_millicores: [values('cpu_millicores'), true, 1], memory_bytes: [values('memory_bytes').map(v => v / 1048576), true, 1048576],
+    qap_completion_percent: [values('qap_completion_percent'), false, 1], qap_pending_artifacts: [values('qap_pending_artifacts'), true, 1],
+    qap_cached_bytes: [values('qap_cached_bytes').map(v => v / 1048576), false, 1048576],
+    qap_unhealthy_catalogs: [values('qap_unhealthy_catalogs'), true, 1], qap_lag_seconds: [values('qap_lag_seconds'), true, 1]
+  };
+  const heatRanges = Object.fromEntries(Object.entries(heatColumns).map(([key, spec]) => [key, heatBounds(spec[0])]));
+  const numericCell = (row, key, digits = 2) => {
+    const spec = heatColumns[key];
+    const raw = number(valueFor(row, key));
+    const value = raw === null ? null : raw / (spec?.[2] || 1);
+    return `<td${spec ? ` class="heat" style="${heat(value, heatRanges[key], spec[1])}"` : ''}>${safeText(show(value, digits))}</td>`;
+  };
+  bodyNode.innerHTML = rows.slice(0, MAX_RENDERED_ROWS).map(row => {
+    const problem = row.status === 'failed' || row.status === 'pinning_violation' || row.pinning_ok === false;
+    const modeClass = row.mode === 'local' ? 'badge-local' : row.mode === 'aks' ? 'badge-aks' : '';
+    const statusClass = row.status === 'succeeded' ? 'badge-ok' : problem ? 'badge-alert' : '';
+    const pinning = pinningLabel(row);
+    return `<tr${problem ? ' class="problem"' : ''}>
+      <td><span class="badge ${modeClass}">${safeText(row.mode)}</span></td><td>${safeText(row.stamp)}</td><td>${safeText(row.experiment)}</td>
+      <td><span class="badge ${statusClass}">${safeText(row.status)}</span></td><td><span class="badge ${row.pinning_ok === false ? 'badge-alert' : row.pinning_ok === true ? 'badge-ok' : ''}">${pinning}</span></td>
+      <td class="key">${safeText(row.run_id)}</td>${numericCell(row, 'replicas', 0)}${numericCell(row, 'dfe_worker_concurrency', 0)}
+      <td class="key">${safeText(row.table)}</td><td>${safeText(row.table_owner)}</td>${numericCell(row, 'clients', 0)}
+      ${numericCell(row, 'rows', 0)}${numericCell(row, 'duration_ms')}${numericCell(row, 'rows_per_second')}${numericCell(row, 'cpu_millicores')}${numericCell(row, 'memory_bytes')}
+      ${numericCell(row, 'qap_observation_complete', 0)}${numericCell(row, 'qap_observed_tables', 0)}${numericCell(row, 'qap_completion_percent')}${numericCell(row, 'qap_pending_artifacts', 0)}${numericCell(row, 'qap_cached_bytes')}${numericCell(row, 'qap_unhealthy_catalogs', 0)}${numericCell(row, 'qap_lag_seconds')}
+      <td>${safeText(row.host)}</td><td>${safeText(timestamp(row.started_at))}</td>${numericCell(row, 'measure_seconds')}${numericCell(row, 'tables', 0)}<td>${safeText(row.git_sha)}</td>
+      <td><details><summary>View</summary><pre>${safeText(formattedTunables(row.tunables_json))}</pre></details></td></tr>`;
+  }).join('');
+}
+async function loadResults() {
+  document.querySelector('#reload').disabled = true;
+  statusNode.textContent = 'Loading benchmark results…';
+  bodyNode.innerHTML = '<tr><td class="empty" colspan="29">Loading…</td></tr>';
+  try {
+    const response = await fetch(resultUrl, { cache: 'no-store' });
+    if (response.status === 404 || (response.ok && response.headers.get('content-length') === '0')) {
+      allRows = [];
+      loadMessage = 'No published results are available yet.';
+    } else {
+      if (!response.ok) throw new Error(`Could not check benchmark results (${response.status}).`);
+      const file = await response.arrayBuffer();
+      if (!file.byteLength) {
+        allRows = [];
+      } else {
+        const { parquetReadObjects } = await import('https://cdn.jsdelivr.net/npm/hyparquet@1.32.0/+esm');
+        allRows = await parquetReadObjects({ file });
+      }
+      loadMessage = 'No published results are available yet.';
+    }
+    statusNode.textContent = allRows.length ? `${numberFormat.format(allRows.length)} result rows loaded from results.parquet.` : loadMessage;
+  } catch (error) {
+    allRows = [];
+    loadMessage = error instanceof Error ? `Could not load results: ${error.message}` : 'Could not load benchmark results.';
+    statusNode.textContent = loadMessage;
+  } finally {
+    document.querySelector('#reload').disabled = false;
+  }
+  render();
+}
+for (const [key, label] of facets) {
+  const wrapper = document.createElement('label');
+  wrapper.textContent = label;
+  const select = document.createElement('select');
+  select.setAttribute('aria-label', label);
+  select.dataset.facet = key;
+  select.addEventListener('change', () => { state.filters[key] = select.value; render(); });
+  wrapper.append(select);
+  document.querySelector('#filter-grid').append(wrapper);
+}
+document.querySelector('#search').addEventListener('input', event => { state.search = event.target.value; render(); });
+document.querySelector('#clear').addEventListener('click', () => {
+  state.filters = {};
+  state.search = '';
+  state.sort = 'replicas';
+  state.direction = 'asc';
+  document.querySelector('#search').value = '';
+  render();
+});
+window.addEventListener('popstate', () => { readUrl(); render(); });
+document.querySelector('#reload').addEventListener('click', loadResults);
+readUrl();
+renderMappings();
+loadResults();
+</script>
+</body>
+</html>

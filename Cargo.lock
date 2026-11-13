@@ -763,18 +763,23 @@ dependencies = [
 name = "arrowcol-catalog-client"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "arrow-flight",
  "arrowcol-catalog",
  "arrowcol-protocol",
  "async-trait",
+ "base64 0.22.1",
  "futures",
+ "hmac",
  "prost 0.14.4",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -793,11 +798,14 @@ dependencies = [
  "arrowcol-protocol",
  "arrowcol-sparksql",
  "async-trait",
+ "base64 0.22.1",
  "clap",
  "futures",
+ "hmac",
  "prost 0.14.4",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -883,6 +891,8 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "tonic",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -930,6 +940,39 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "tonic",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "arrowcol-oat-rust"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow 58.4.0",
+ "arrow-deltalake",
+ "arrowcol-loadgen",
+ "arrowcol-protocol",
+ "arrowcol-routing",
+ "async-trait",
+ "axum",
+ "bytes",
+ "chrono",
+ "clap",
+ "collector-chain",
+ "fs2",
+ "futures-util",
+ "object_store",
+ "parquet 58.4.0",
+ "reqwest 0.12.28",
+ "rustix",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2 0.10.9",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
  "url",
  "uuid",
 ]
@@ -1014,6 +1057,7 @@ dependencies = [
  "arrowcol-protocol",
  "clap",
  "flate2",
+ "futures",
  "hex",
  "prettyplease 0.2.37",
  "prost 0.14.4",
@@ -1777,8 +1821,10 @@ dependencies = [
  "arrowcol-catalog",
  "arrowcol-flight",
  "arrowcol-protocol",
+ "arrowcol-router-rust",
  "clap",
  "futures",
+ "http",
  "opentelemetry 0.31.0",
  "opentelemetry-otlp",
  "opentelemetry_sdk 0.31.0",

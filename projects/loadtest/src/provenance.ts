@@ -159,7 +159,7 @@ export function writeProvenance(
     runtimeComposeOverrideSha256: sha256(readFileSync(path.join(directory, 'router-state/compose-runtime.json'))),
     policies: safeCollectorPolicies(dataflow),
     workload: {
-      ...options, scenario: 'dataflow', tables: env.LOADTEST_TABLES?.split(',') ?? 'all schema fixtures (13 tables)',
+      ...options, scenario: 'dataflow', tables: env.LOADTEST_TABLES?.split(',') ?? 'all schema fixtures (32 tables)',
       maxAttempts: env.LOADTEST_MAX_ATTEMPTS ?? '16',
       continuous: options.measureSeconds === undefined, keepStack: true,
     },

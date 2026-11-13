@@ -1,10 +1,48 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
 import { tableFromIPC } from 'apache-arrow';
 import { readParquet } from 'parquet-wasm';
 import { canonicalRows, canonicalTables, readState, runFixture } from '../loadgen/scripts/kusto_qap_fixture.js';
+
+test('Delta Add statistics match actual Parquet rows across append and rewrite versions', t => {
+  const root = mkdtempSync(path.join(process.cwd(), '.kusto-stats-test-'));
+  t.after(() => rmSync(root, { force: true, recursive: true }));
+  const checkAdds = (directory: string): { counts: number[]; optimized: boolean } => {
+    const counts: number[] = [];
+    let optimized = false;
+    for (const name of readdirSync(path.join(directory, '_delta_log')).filter(name => /^\d{20}\.json$/u.test(name)).sort()) {
+      for (const line of readFileSync(path.join(directory, '_delta_log', name), 'utf8').trim().split('\n')) {
+        const { add } = JSON.parse(line);
+        if (!add) continue;
+        assert.deepEqual(Object.keys(add).sort(),
+          ['dataChange', 'modificationTime', 'partitionValues', 'path', 'size', 'stats']);
+        assert.equal(typeof add.stats, 'string');
+        const actual = tableFromIPC(readParquet(readFileSync(path.join(directory, add.path))).intoIPCStream()).numRows;
+        assert.deepEqual(JSON.parse(add.stats), { numRecords: actual });
+        assert.equal(add.size, statSync(path.join(directory, add.path)).size);
+        assert.equal(typeof add.dataChange, 'boolean');
+        optimized ||= add.dataChange === false;
+        counts.push(actual);
+      }
+    }
+    return { counts, optimized };
+  };
+  const directory = path.join(root, 'telemetry/sqlserver/sqlserver_active_sessions');
+  const log = path.join(directory, '_delta_log');
+  runFixture(root, 'init');
+  const initialLogs = ['00000000000000000000.json', '00000000000000000001.json']
+    .map(name => readFileSync(path.join(log, name), 'utf8'));
+  assert.equal(readState(directory).version, 1);
+  runFixture(root, 'mutate');
+  assert.equal(readState(directory).version, 3);
+  initialLogs.forEach((contents, version) =>
+    assert.equal(readFileSync(path.join(log, `${String(version).padStart(20, '0')}.json`), 'utf8'), contents));
+  assert.deepEqual(checkAdds(directory).counts, [50, 50, 25]);
+  assert(checkAdds(path.join(root, 'telemetry/sqlserver/sqlserver_availability_group_states')).optimized);
+  assert.deepEqual(readState(directory).metadata.partitionColumns, ['__arrowcol_ingestion']);
+});
 
 test('native Delta fixtures retain mutations, partition purge, transactions and vacuum tombstones', t => {
   const root = mkdtempSync(path.join(process.cwd(), '.kusto-fixture-test-'));
@@ -50,7 +88,7 @@ test('all canonical Spark schemas preserve signed boundaries and exact timestamp
   t.after(() => rmSync(root, { force: true, recursive: true }));
   const sql = path.join(process.cwd(), 'projects/loadtest/schemas/sqlserver.sql');
   const tables = canonicalTables(readFileSync(sql, 'utf8'));
-  assert.equal(tables.length, 13);
+  assert.equal(tables.length, 32);
   runFixture(root, 'schemas', sql);
   for (const [name, columns] of tables) {
     const directory = path.join(root, 'telemetry/sqlserver', name);

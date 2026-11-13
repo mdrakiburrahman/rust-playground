@@ -439,7 +439,7 @@ fn prepared_optimize_rejects_concurrent_schema_change_before_any_rewrite() -> Re
 #[test]
 fn real_catalog_ddl_discovery_refreshes_policy_without_idle_writes() -> Result<()> {
     use arrow_flight::{flight_service_server::FlightServiceServer, sql::client::FlightSqlServiceClient};
-    use arrowcol_catalog_client::rpc::schema_catalog_server::SchemaCatalogServer;
+    use arrowcol_catalog_client::{InternalRequestSigner, rpc::schema_catalog_server::SchemaCatalogServer};
     use arrowcol_catalog_rust::{CatalogConfig, CatalogService};
     use delta_maintenance::catalog::CatalogDiscovery;
 
@@ -453,6 +453,7 @@ fn real_catalog_ddl_discovery_refreshes_policy_without_idle_writes() -> Result<(
         state_dir: root.path().join("catalog"),
         ddl_dir: None,
         retained_events: 16,
+        ingestion_layout: false,
     }))?;
     let listener = runtime.block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))?;
     let endpoint = format!("http://{}", listener.local_addr()?);
@@ -472,7 +473,11 @@ fn real_catalog_ddl_discovery_refreshes_policy_without_idle_writes() -> Result<(
         "CREATE TABLE arrowcol.default.events (id BIGINT NOT NULL, __arrowcol_ingestion STRING NOT NULL) USING DELTA PARTITIONED BY (__arrowcol_ingestion) TBLPROPERTIES ('arrowcol.optimize.minFiles'='3', 'arrowcol.partition.granularity'='minute', 'delta.checkpointInterval'='100')".into(),
         None,
     ))?;
-    let source = CatalogDiscovery::connect(&endpoint, Vec::new())?;
+    let source = CatalogDiscovery::connect_with_signer(
+        &endpoint,
+        Vec::new(),
+        InternalRequestSigner::from_secret(b"catalog-integration-key-at-least-32-bytes".to_vec())?,
+    )?;
     let names = source.tables()?;
     assert_eq!(names, ["arrowcol.default.events"]);
     let discovered = source.table(&names[0])?;

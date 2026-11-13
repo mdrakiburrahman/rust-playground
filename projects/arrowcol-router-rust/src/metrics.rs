@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use prometheus::{
-    Encoder, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder, register_int_counter_vec_with_registry,
-    register_int_gauge_vec_with_registry,
+    Encoder, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder, register_int_counter_vec_with_registry,
+    register_int_gauge_vec_with_registry, register_int_gauge_with_registry,
 };
 
 /// Low-cardinality router metrics.
@@ -16,6 +16,8 @@ pub struct RouterMetrics {
     upstream_connections: IntCounterVec,
     active_streams: IntGaugeVec,
     cached_leases: IntGaugeVec,
+    table_owners: IntGaugeVec,
+    distinct_table_owners: IntGauge,
     maximum_pressure_bps: IntGaugeVec,
 }
 
@@ -74,6 +76,21 @@ impl RouterMetrics {
             &["pool", "state"],
             registry.as_ref()
         )?;
+        let table_owners = register_int_gauge_vec_with_registry!(
+            Opts::new(
+                "arrowcol_router_table_owners",
+                "Current collector assignment for each cached table lease",
+            ),
+            &["pool", "catalog", "schema", "table", "collector", "state"],
+            registry.as_ref()
+        )?;
+        let distinct_table_owners = register_int_gauge_with_registry!(
+            Opts::new(
+                "arrowcol_router_distinct_table_owners",
+                "Whether active table leases require distinct collectors",
+            ),
+            registry.as_ref()
+        )?;
         let maximum_pressure_bps = register_int_gauge_vec_with_registry!(
             Opts::new(
                 "arrowcol_router_maximum_collector_pressure_bps",
@@ -91,6 +108,8 @@ impl RouterMetrics {
             upstream_connections,
             active_streams,
             cached_leases,
+            table_owners,
+            distinct_table_owners,
             maximum_pressure_bps,
         })
     }
@@ -134,8 +153,14 @@ impl RouterMetrics {
         self.active_streams.with_label_values(&[pool]).dec();
     }
 
-    /// Updates aggregate cache gauges.
+    /// Records whether table ownership requires unique collectors.
+    pub fn set_distinct_table_owners(&self, enabled: bool) {
+        self.distinct_table_owners.set(i64::from(enabled));
+    }
+
+    /// Updates cache and table-owner gauges.
     pub fn update_cache_gauges(&self, view: &arrowcol_routing::RoutingView) {
+        self.table_owners.reset();
         for pool in ["dataflow"] {
             for state in ["active", "draining"] {
                 self.cached_leases.with_label_values(&[pool, state]).set(0);
@@ -150,6 +175,16 @@ impl RouterMetrics {
             self.cached_leases
                 .with_label_values(&[&lease.key.implementation_pool.to_string(), state])
                 .inc();
+            self.table_owners
+                .with_label_values(&[
+                    &lease.key.implementation_pool.to_string(),
+                    lease.key.table.catalog().as_str(),
+                    lease.key.table.schema().as_str(),
+                    lease.key.table.table().as_str(),
+                    &lease.holder_instance_id.to_string(),
+                    state,
+                ])
+                .set(1);
         }
         for collector in view.collectors.values() {
             if let Some(pressure) = collector.pressure.as_ref() {

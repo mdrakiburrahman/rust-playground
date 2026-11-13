@@ -22,6 +22,8 @@ cached lease is valid.
 - warm-up weighting for newly registered collectors;
 - SQL outage behavior that uses only unexpired cached leases and fails closed
   after expiry;
+- immutable OAT run pins are initialized only when the owner lease covers the
+  full run lifetime;
 - no body or Arrow dependency: all inputs are bounded control-plane values.
 
 ## Main APIs

@@ -1,8 +1,9 @@
 use std::{sync::atomic::Ordering, time::Duration};
 
+use crate::{CatalogCesService, DdlIdentityPolicy, DdlIdentityVerifier};
 use arrow_flight::{flight_service_server::FlightServiceServer, sql::client::FlightSqlServiceClient};
 use arrowcol_catalog::{CatalogStore, SchemaAlignmentPlan, SchemaValidator};
-use arrowcol_catalog_client::{CatalogClient, RemoteCatalogClient};
+use arrowcol_catalog_client::{CatalogClient, InternalRequestSigner, RemoteCatalogClient};
 use arrowcol_protocol::{ClaimedSchemaFingerprint, fingerprint_schema};
 use futures::TryStreamExt;
 use rpc::schema_catalog_server::{SchemaCatalog, SchemaCatalogServer};
@@ -15,7 +16,141 @@ fn config(root: &Path) -> CatalogConfig {
         state_dir: root.join("catalog"),
         ddl_dir: None,
         retained_events: 4,
+        ingestion_layout: false,
     }
+}
+
+#[derive(Clone)]
+struct TableResponseGate {
+    armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    started: std::sync::Arc<tokio::sync::Notify>,
+    release: std::sync::Arc<tokio::sync::Notify>,
+    get_table_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    snapshot_armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    snapshot_started: std::sync::Arc<tokio::sync::Notify>,
+    snapshot_release: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for TableResponseGate {
+    fn default() -> Self {
+        Self {
+            armed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            started: std::sync::Arc::new(tokio::sync::Notify::new()),
+            release: std::sync::Arc::new(tokio::sync::Notify::new()),
+            get_table_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            snapshot_armed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            snapshot_started: std::sync::Arc::new(tokio::sync::Notify::new()),
+            snapshot_release: std::sync::Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct GatedSchemaCatalog {
+    inner: CatalogService,
+    gate: TableResponseGate,
+}
+
+#[async_trait::async_trait]
+impl SchemaCatalog for GatedSchemaCatalog {
+    type WatchStream = super::EventStream;
+
+    async fn get_current_event_id(&self, request: Request<rpc::Empty>) -> Result<Response<rpc::EventPosition>, Status> {
+        self.inner.get_current_event_id(request).await
+    }
+
+    async fn get_events(&self, request: Request<rpc::EventsRequest>) -> Result<Response<rpc::EventsResponse>, Status> {
+        self.inner.get_events(request).await
+    }
+
+    async fn watch(&self, request: Request<rpc::EventsRequest>) -> Result<Response<Self::WatchStream>, Status> {
+        self.inner.watch(request).await
+    }
+
+    async fn get_table(&self, request: Request<rpc::TableRequest>) -> Result<Response<rpc::TableSnapshot>, Status> {
+        self.gate.get_table_calls.fetch_add(1, Ordering::SeqCst);
+        let response = self.inner.get_table(request).await?;
+        if self.gate.armed.load(Ordering::SeqCst) {
+            self.gate.started.notify_one();
+            self.gate.release.notified().await;
+        }
+        Ok(response)
+    }
+
+    async fn get_snapshot(&self, request: Request<rpc::Empty>) -> Result<Response<rpc::CatalogSnapshot>, Status> {
+        let response = self.inner.get_snapshot(request).await?;
+        if self.gate.snapshot_armed.load(Ordering::SeqCst) {
+            self.gate.snapshot_started.notify_one();
+            let _permit = self
+                .gate
+                .snapshot_release
+                .acquire()
+                .await
+                .map_err(|_| Status::unavailable("snapshot gate closed"))?;
+        }
+        Ok(response)
+    }
+}
+
+#[tokio::test]
+async fn ingestion_catalog_adopts_bootstrap_without_exposing_physical_columns() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let mut config = config(root.path());
+    config.ingestion_layout = true;
+    let location = root.path().join("warehouse/telemetry/sqlserver/events");
+    std::fs::create_dir_all(&location)?;
+    let url = Url::from_directory_path(&location).map_err(|()| anyhow::anyhow!("invalid test path"))?;
+    let sql = "CREATE TABLE telemetry.sqlserver.events (id BIGINT NOT NULL, observed TIMESTAMP) USING DELTA";
+    let DdlCommand::CreateTable(create) = DdlParser::default().parse(sql)? else {
+        bail!("expected CREATE");
+    };
+    let mut fields = create
+        .fields()
+        .iter()
+        .map(|field| field.to_arrow())
+        .collect::<Result<Vec<_>, _>>()?;
+    fields.push(arrow_schema::Field::new(INGESTION, arrow_schema::DataType::Utf8, false));
+    let physical = Arc::new(arrow_schema::Schema::new(fields));
+    let table = DeltaTable::open_url(url, physical, vec![INGESTION.into()])?;
+    let version = table.version()?;
+    let service = CatalogService::open(config.clone()).await?;
+    service.apply_sql(sql).await?;
+    assert!(table.version()? > version);
+    let identity = name_identity(&["telemetry".into(), "sqlserver".into(), "events".into()])?;
+    let history = service.store.schema_history(&identity).await?;
+    assert_eq!(history[0].fields().len(), 2);
+    assert_eq!(
+        table.catalog_snapshot()?.context("head")?.partition_columns,
+        [INGESTION]
+    );
+    let restarted = CatalogService::open(config.clone()).await?;
+    restarted.apply_sql(sql).await?;
+    assert_eq!(restarted.store.schema_history(&identity).await?[0].fields().len(), 2);
+    assert!(
+        restarted
+            .apply_sql("CREATE TABLE telemetry.sqlserver.events (wrong STRING) USING DELTA")
+            .await
+            .is_err()
+    );
+    restarted
+        .apply_sql("ALTER TABLE telemetry.sqlserver.events ADD COLUMNS (next_observed TIMESTAMP)")
+        .await?;
+    let snapshot = table.catalog_snapshot()?.context("head after ALTER")?;
+    assert_eq!(snapshot.schema.fields()[3].name(), INGESTION);
+    assert_eq!(snapshot.schema.fields()[4].name(), "next_observed");
+    let reopened = CatalogService::open(config).await?;
+    assert_eq!(
+        reopened
+            .store
+            .schema_history(&identity)
+            .await?
+            .last()
+            .context("head")?
+            .fields()
+            .len(),
+        3
+    );
+    Ok(())
 }
 
 const CREATE: &str = "CREATE TABLE arrowcol.default.events (id BIGINT NOT NULL, day STRING) USING DELTA PARTITIONED BY (day) COMMENT 'catalog test' TBLPROPERTIES ('vendor.setting' = 'original')";
@@ -165,6 +300,181 @@ async fn commit_publication_crash_and_old_seed_do_not_rollback_delta() -> Result
 }
 
 #[tokio::test]
+async fn flight_sql_ddl_requires_signed_identity_before_mutating_catalog() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let service = CatalogService::open(config(root.path())).await?;
+    let fixture = include_str!("../../../loadtest/schemas/sqlserver.sql");
+    let ddl = fixture
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let ddl = ddl
+        .split(";")
+        .next()
+        .context("first schema statement")?
+        .trim()
+        .to_owned();
+    let verifier = DdlIdentityVerifier::from_secret(b"catalog-integration-key-at-least-32-bytes".to_vec())?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}", listener.local_addr()?);
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    let server_service = service.clone();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(FlightServiceServer::new(
+                server_service.flight_service_with_ddl_identity(DdlIdentityPolicy::require_signed(verifier)),
+            ))
+            .serve_with_incoming_shutdown(tokio_stream::wrappers::TcpListenerStream::new(listener), async {
+                let _ = stopped.await;
+            })
+            .await
+    });
+    let channel = tonic::transport::Endpoint::from_shared(endpoint)?.connect().await?;
+    let mut flight = arrow_flight::flight_service_client::FlightServiceClient::new(channel);
+    let command = CommandStatementUpdate {
+        query: ddl.clone(),
+        transaction_id: None,
+    };
+    let error = flight
+        .do_put(futures::stream::iter([arrow_flight::FlightData {
+            flight_descriptor: Some(FlightDescriptor {
+                r#type: arrow_flight::flight_descriptor::DescriptorType::Cmd as i32,
+                cmd: command.as_any().encode_to_vec().into(),
+                path: Vec::new(),
+            }),
+            ..arrow_flight::FlightData::default()
+        }]))
+        .await
+        .err()
+        .context("unsigned DDL must be rejected")?;
+    assert_eq!(error.code(), tonic::Code::Unauthenticated);
+    let identity = name_identity(&[
+        "telemetry".into(),
+        "sqlserver".into(),
+        "sqlserver_active_sessions".into(),
+    ])?;
+    assert!(service.store.current_schema(&identity).await?.is_none());
+    let signer = InternalRequestSigner::from_secret(b"catalog-integration-key-at-least-32-bytes".to_vec())?;
+    let command = CommandStatementUpdate {
+        query: ddl.clone(),
+        transaction_id: None,
+    };
+    let payload = command.as_any().encode_to_vec();
+    let mut tampered = tonic::Request::new(futures::stream::iter([arrow_flight::FlightData {
+        flight_descriptor: Some(FlightDescriptor {
+            r#type: arrow_flight::flight_descriptor::DescriptorType::Cmd as i32,
+            cmd: CommandStatementUpdate {
+                query: "DROP TABLE telemetry.sqlserver.sqlserver_active_sessions".to_owned(),
+                transaction_id: None,
+            }
+            .as_any()
+            .encode_to_vec()
+            .into(),
+            path: Vec::new(),
+        }),
+        ..arrow_flight::FlightData::default()
+    }]));
+    signer.sign_payload(&mut tampered, "/arrow.flight.protocol.FlightService/DoPut", &payload)?;
+    let error = flight
+        .do_put(tampered)
+        .await
+        .err()
+        .context("tampered DDL payload must be rejected")?;
+    assert_eq!(error.code(), tonic::Code::Unauthenticated);
+    assert!(service.store.current_schema(&identity).await?.is_none());
+
+    let mut rejected_request = tonic::Request::new(futures::stream::iter([arrow_flight::FlightData {
+        flight_descriptor: Some(FlightDescriptor {
+            r#type: arrow_flight::flight_descriptor::DescriptorType::Cmd as i32,
+            cmd: payload.clone().into(),
+            path: Vec::new(),
+        }),
+        ..arrow_flight::FlightData::default()
+    }]));
+    let wrong_signer =
+        InternalRequestSigner::from_secret(b"not-the-catalog-integration-key-at-least-32-bytes".to_vec())?;
+    wrong_signer.sign_payload(
+        &mut rejected_request,
+        "/arrow.flight.protocol.FlightService/DoPut",
+        &payload,
+    )?;
+    let error = flight
+        .do_put(rejected_request)
+        .await
+        .err()
+        .context("wrongly signed DDL must be rejected")?;
+    assert_eq!(error.code(), tonic::Code::Unauthenticated);
+    assert!(service.store.current_schema(&identity).await?.is_none());
+
+    let mut request = tonic::Request::new(futures::stream::iter([arrow_flight::FlightData {
+        flight_descriptor: Some(FlightDescriptor {
+            r#type: arrow_flight::flight_descriptor::DescriptorType::Cmd as i32,
+            cmd: payload.clone().into(),
+            path: Vec::new(),
+        }),
+        ..arrow_flight::FlightData::default()
+    }]));
+    signer.sign_payload(&mut request, "/arrow.flight.protocol.FlightService/DoPut", &payload)?;
+    let response = flight.do_put(request).await?;
+    assert_eq!(
+        arrowcol_flight::decode_ddl_completion_metadata(response.metadata())?.table(),
+        "sqlserver_active_sessions"
+    );
+    let mut results = response.into_inner();
+    assert!(results.message().await?.is_some());
+    assert!(service.store.current_schema(&identity).await?.is_some());
+    let _ = shutdown.send(());
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn catalog_ces_rejects_anonymous_reads_and_replayed_signed_reads() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let service = CatalogService::open(config(root.path())).await?;
+    let verifier = DdlIdentityVerifier::from_secret(b"catalog-integration-key-at-least-32-bytes".to_vec())?;
+    let ces = CatalogCesService::new(service, DdlIdentityPolicy::require_signed(verifier));
+
+    let anonymous = SchemaCatalog::get_snapshot(&ces, tonic::Request::new(rpc::Empty {}))
+        .await
+        .err()
+        .context("anonymous catalog read must be rejected")?;
+    assert_eq!(anonymous.code(), tonic::Code::Unauthenticated);
+
+    let signer = InternalRequestSigner::from_secret(b"catalog-integration-key-at-least-32-bytes".to_vec())?;
+    let mut request = tonic::Request::new(rpc::Empty {});
+    signer.sign_message(&mut request, "/arrowcol.catalog.v1.SchemaCatalog/GetSnapshot")?;
+    let replay = request.metadata().clone();
+    SchemaCatalog::get_snapshot(&ces, request).await?;
+    let mut replayed = tonic::Request::new(rpc::Empty {});
+    *replayed.metadata_mut() = replay;
+    let error = SchemaCatalog::get_snapshot(&ces, replayed)
+        .await
+        .err()
+        .context("replayed catalog read must be rejected")?;
+    assert_eq!(error.code(), tonic::Code::Unauthenticated);
+    Ok(())
+}
+
+#[tokio::test]
+async fn catalog_flight_rejects_anonymous_metadata_reads() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let service = CatalogService::open(config(root.path())).await?;
+    let verifier = DdlIdentityVerifier::from_secret(b"catalog-integration-key-at-least-32-bytes".to_vec())?;
+    let flight = service.flight_service_with_ddl_identity(DdlIdentityPolicy::require_signed(verifier));
+    let error = arrow_flight::flight_service_server::FlightService::get_flight_info(
+        &flight,
+        tonic::Request::new(FlightDescriptor::default()),
+    )
+    .await
+    .err()
+    .context("anonymous Flight metadata read must be rejected")?;
+    assert_eq!(error.code(), tonic::Code::Unauthenticated);
+    Ok(())
+}
+
+#[tokio::test]
 async fn flight_sql_and_warm_cache_count_actual_catalog_calls() -> Result<()> {
     let root = tempfile::tempdir()?;
     let service = CatalogService::open(config(root.path())).await?;
@@ -174,7 +484,9 @@ async fn flight_sql_and_warm_cache_count_actual_catalog_calls() -> Result<()> {
     let server_service = service.clone();
     let server = tokio::spawn(async move {
         tonic::transport::Server::builder()
-            .add_service(FlightServiceServer::new(server_service.flight_service()))
+            .add_service(FlightServiceServer::new(
+                server_service.flight_service_with_ddl_identity(DdlIdentityPolicy::dev_only_allow_unsigned()),
+            ))
             .add_service(SchemaCatalogServer::new(server_service))
             .serve_with_incoming_shutdown(tokio_stream::wrappers::TcpListenerStream::new(listener), async {
                 let _ = stopped.await;
@@ -235,7 +547,12 @@ async fn flight_sql_and_warm_cache_count_actual_catalog_calls() -> Result<()> {
             .await
             .is_err()
     );
-    let client = RemoteCatalogClient::connect(&endpoint, Duration::from_millis(250)).await?;
+    let client = RemoteCatalogClient::connect_with_signer(
+        &endpoint,
+        Duration::from_millis(250),
+        InternalRequestSigner::from_secret(b"catalog-integration-key-at-least-32-bytes".to_vec())?,
+    )
+    .await?;
     let identity = name_identity(&["arrowcol".into(), "default".into(), "events".into()])?;
     tokio::time::sleep(Duration::from_millis(50)).await;
     let baseline = client.metrics().catalog_calls;
@@ -328,7 +645,9 @@ async fn flight_sql_and_warm_cache_count_actual_catalog_calls() -> Result<()> {
     let server_service = restarted.clone();
     let server = tokio::spawn(async move {
         tonic::transport::Server::builder()
-            .add_service(FlightServiceServer::new(server_service.flight_service()))
+            .add_service(FlightServiceServer::new(
+                server_service.flight_service_with_ddl_identity(DdlIdentityPolicy::dev_only_allow_unsigned()),
+            ))
             .add_service(SchemaCatalogServer::new(server_service))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await
@@ -356,6 +675,85 @@ async fn flight_sql_and_warm_cache_count_actual_catalog_calls() -> Result<()> {
         recovered.position.epoch, evolved.position.epoch,
         "restart must replace epoch"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn unrelated_table_invalidations_during_table_fetch_do_not_exhaust_retries() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let service = CatalogService::open(config(root.path())).await?;
+    service.apply_sql(CREATE).await?;
+    let gate = TableResponseGate::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}", listener.local_addr()?);
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn({
+        let service = service.clone();
+        let gate = gate.clone();
+        async move {
+            tonic::transport::Server::builder()
+                .add_service(SchemaCatalogServer::new(GatedSchemaCatalog { inner: service, gate }))
+                .serve_with_incoming_shutdown(tokio_stream::wrappers::TcpListenerStream::new(listener), async {
+                    let _ = stopped.await;
+                })
+                .await
+        }
+    });
+    let client = RemoteCatalogClient::connect_with_signer(
+        &endpoint,
+        Duration::from_secs(30),
+        InternalRequestSigner::from_secret(b"catalog-integration-key-at-least-32-bytes".to_vec())?,
+    )
+    .await?;
+    let identity = name_identity(&["arrowcol".into(), "default".into(), "events".into()])?;
+    let unrelated = name_identity(&["arrowcol".into(), "default".into(), "unrelated".into()])?;
+    client.invalidate(&identity).await;
+    let calls_before = gate.get_table_calls.load(Ordering::SeqCst);
+    gate.armed.store(true, Ordering::SeqCst);
+
+    let race_client = Arc::clone(&client);
+    let requested = identity.clone();
+    let mut fetch = tokio::spawn(async move { race_client.table(&requested).await });
+    tokio::time::timeout(Duration::from_secs(5), gate.started.notified())
+        .await
+        .context("catalog GetTable response was not held")?;
+    let mut fetched = None;
+    for _ in 0..3 {
+        client.invalidate(&unrelated).await;
+        gate.release.notify_one();
+
+        let next = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                result = &mut fetch => Some(result),
+                _ = gate.started.notified() => None,
+            }
+        })
+        .await
+        .context("table fetch did not continue after a released response")?;
+        if let Some(result) = next {
+            fetched = Some(result.context("table fetch task panicked")??);
+            break;
+        }
+    }
+    let fetched = match fetched {
+        Some(table) => table,
+        None => tokio::time::timeout(Duration::from_secs(5), &mut fetch)
+            .await
+            .context("table fetch exceeded its retry budget")?
+            .context("table fetch task panicked")??,
+    };
+    gate.armed.store(false, Ordering::SeqCst);
+    assert_eq!(fetched.versions.last().context("table head")?.fields().len(), 2);
+    assert_eq!(
+        gate.get_table_calls.load(Ordering::SeqCst),
+        calls_before + 1,
+        "unrelated table invalidations must not trigger table fetch retries"
+    );
+    shutdown
+        .send(())
+        .map_err(|()| anyhow::anyhow!("server already stopped"))?;
+    server.abort();
+    let _ = server.await;
     Ok(())
 }
 
@@ -489,5 +887,94 @@ async fn snapshot_watch_replays_racing_ddl_and_drop_retry_retains_delta() -> Res
         .await?
         .context("retained Delta table")?;
     assert_eq!(delta.properties.get(DROPPED_KEY).map(String::as_str), Some("true"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn repeated_new_epoch_table_responses_do_not_invalidate_reconciliation() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let config = config(root.path());
+    let service = CatalogService::open(config.clone()).await?;
+    service.apply_sql(CREATE).await?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}", listener.local_addr()?);
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    let old_service = service.clone();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(SchemaCatalogServer::new(old_service))
+            .serve_with_incoming_shutdown(tokio_stream::wrappers::TcpListenerStream::new(listener), async {
+                let _ = stopped.await;
+            })
+            .await
+    });
+    let client = RemoteCatalogClient::connect_with_signer(
+        &endpoint,
+        Duration::from_secs(5),
+        InternalRequestSigner::from_secret(b"catalog-integration-key-at-least-32-bytes".to_vec())?,
+    )
+    .await?;
+    let identity = name_identity(&["arrowcol".into(), "default".into(), "events".into()])?;
+    let original = client.table(&identity).await?;
+    shutdown
+        .send(())
+        .map_err(|()| anyhow::anyhow!("server already stopped"))?;
+    server.abort();
+    let _ = server.await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let restarted = CatalogService::open(config).await?;
+    restarted
+        .apply_sql("ALTER TABLE arrowcol.default.events ADD COLUMNS (while_disconnected STRING)")
+        .await?;
+    let gate = TableResponseGate::default();
+    gate.snapshot_armed.store(true, Ordering::SeqCst);
+    let listener = tokio::net::TcpListener::bind(
+        url::Url::parse(&endpoint)?
+            .socket_addrs(|| None)?
+            .first()
+            .context("endpoint address")?,
+    )
+    .await?;
+    let gate_for_server = gate.clone();
+    let service_for_server = restarted.clone();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(SchemaCatalogServer::new(GatedSchemaCatalog {
+                inner: service_for_server,
+                gate: gate_for_server,
+            }))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await
+    });
+    let error = match client.table(&identity).await {
+        Ok(_) => bail!("old catalog epoch was served after restart"),
+        Err(error) => error,
+    };
+    assert_eq!(error.failure_id(), Some("catalog_restart_during_table_fetch"));
+
+    let reconcile_client = Arc::clone(&client);
+    let reconciliation = tokio::spawn(async move { reconcile_client.reconcile().await });
+    tokio::time::timeout(Duration::from_secs(5), gate.snapshot_started.notified())
+        .await
+        .context("reconciliation snapshot did not start")?;
+    for _ in 0..10 {
+        let error = match client.table(&identity).await {
+            Ok(_) => bail!("old catalog epoch was served while reconciliation was held"),
+            Err(error) => error,
+        };
+        assert_eq!(error.failure_id(), Some("catalog_restart_during_table_fetch"));
+    }
+    gate.snapshot_armed.store(false, Ordering::SeqCst);
+    gate.snapshot_release.add_permits(16);
+    tokio::time::timeout(Duration::from_secs(5), reconciliation)
+        .await
+        .context("reconciliation did not finish")?
+        .context("reconciliation task panicked")??;
+    let recovered = client.table(&identity).await?;
+    assert_ne!(recovered.position.epoch, original.position.epoch);
+    assert_eq!(recovered.versions.last().context("head")?.fields().len(), 3);
+    server.abort();
+    let _ = server.await;
     Ok(())
 }

@@ -4,10 +4,18 @@ use std::{
     time::Duration,
 };
 
-use arrow_flight::sql::client::FlightSqlServiceClient;
+use arrow_flight::{
+    FlightData, FlightDescriptor,
+    flight_descriptor::DescriptorType,
+    flight_service_client::FlightServiceClient,
+    sql::{CommandStatementUpdate, ProstMessageExt},
+};
 use arrowcol_catalog::{CatalogSchemaVersion, SchemaVersion};
-use arrowcol_catalog_client::{CatalogClient, rpc};
+use arrowcol_catalog_client::{CatalogClient, InternalRequestSigner, rpc};
 use arrowcol_protocol::TableIdentity;
+use futures::stream;
+use prost::Message;
+use tonic::Request;
 use tonic::transport::Endpoint;
 
 use crate::{ArtifactBundle, SdkGenError, SdkGenResult, verify_compatibility};
@@ -123,20 +131,43 @@ pub async fn hydrate_catalog(
         .connect()
         .await
         .map_err(|error| SdkGenError::Artifact(format!("catalog connection failed: {error}")))?;
-    let mut flight = FlightSqlServiceClient::new(channel.clone());
+    let secret_file = std::env::var_os("ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE")
+        .ok_or_else(|| SdkGenError::Artifact("ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE is required".into()))?;
+    let signer = InternalRequestSigner::from_file(secret_file)
+        .map_err(|error| SdkGenError::Artifact(format!("catalog identity signer: {error}")))?;
     for (path, statement) in ddl.iter().zip(statements) {
-        flight
-            .execute_update(statement, None)
+        let command = CommandStatementUpdate {
+            query: statement,
+            transaction_id: None,
+        };
+        let payload = command.as_any().encode_to_vec();
+        let mut request = Request::new(stream::iter([FlightData {
+            flight_descriptor: Some(FlightDescriptor {
+                r#type: DescriptorType::Cmd as i32,
+                cmd: payload.clone().into(),
+                path: Vec::new(),
+            }),
+            ..FlightData::default()
+        }]));
+        signer
+            .sign_payload(&mut request, "/arrow.flight.protocol.FlightService/DoPut", &payload)
+            .map_err(|error| SdkGenError::Artifact(format!("catalog DDL signer: {error}")))?;
+        FlightServiceClient::new(channel.clone())
+            .do_put(request)
             .await
             .map_err(|error| SdkGenError::Artifact(format!("catalog DDL {} failed: {error}", path.display())))?;
     }
     let mut client = rpc::schema_catalog_client::SchemaCatalogClient::new(channel);
+    let mut request = Request::new(rpc::TableRequest {
+        catalog: identity.catalog().as_str().to_owned(),
+        database: identity.schema().as_str().to_owned(),
+        table: identity.table().as_str().to_owned(),
+    });
+    signer
+        .sign_message(&mut request, "/arrowcol.catalog.v1.SchemaCatalog/GetTable")
+        .map_err(|error| SdkGenError::Artifact(format!("catalog read signer: {error}")))?;
     let snapshot = client
-        .get_table(rpc::TableRequest {
-            catalog: identity.catalog().as_str().to_owned(),
-            database: identity.schema().as_str().to_owned(),
-            table: identity.table().as_str().to_owned(),
-        })
+        .get_table(request)
         .await
         .map_err(|error| SdkGenError::Artifact(format!("catalog GetTable failed: {error}")))?
         .into_inner();

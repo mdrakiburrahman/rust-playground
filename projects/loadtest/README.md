@@ -185,7 +185,7 @@ npx nx run loadtest:run -- --warmup 2m --concurrency 8 --batch-rows 1024
 This starts a fresh routing SQL Server, remote Schema Catalog, router, DFE
 Dataflow collector, Kusto emulator, [kusto-explorer](../kusto-explorer/README.md) query
 UI, and monitoring stack, then sends Arrow batches to Dataflow
-across all 13 tables. Kusto provides live functional inspection of committed
+across all 32 tables. Kusto provides live functional inspection of committed
 output. Native Delta external-table/QAP validation is the default target.
 
 **A start replaces only a previously sealed, validated local attempt.** Its
@@ -229,10 +229,10 @@ Private environment inputs are `ARROWCOL_AZURE_TABLE_ROOT`,
 owned and **fenced** during initialization; this command cannot acquire a data
 writer or bypass the reset fence.
 
-The canonical registry initializes the Dataflow pool/all 13 schemas with required
+The canonical registry initializes the Dataflow pool/all 32 schemas with required
 `__arrowcol_ingestion STRING` partitions. Core normalization runs exactly once,
 including timestamp companions. Existing compatible roots are preserved.
-Only after all 13 roots succeed is the `{name, relative_path}` JSON manifest
+Only after all 32 roots succeed is the `{name, relative_path}` JSON manifest
 written; paths such as `dataflow/telemetry/sqlserver/sqlserver_active_sessions`
 are relative to `ARROWCOL_AZURE_TABLE_ROOT`, including any private isolated-run
 prefix. Initialization does not insert data or prove Azure/QAP readiness.
@@ -314,7 +314,7 @@ See the public [query acceleration policy](https://learn.microsoft.com/en-us/kus
 and [troubleshooting guide](https://learn.microsoft.com/en-us/kusto/management/query-acceleration-troubleshooting-guide)
 for supported table features, cache limits and unhealthy-catalog behavior.
 
-For isolated Azure runs, the runner writes the same canonical 13-table Dataflow manifest
+For isolated Azure runs, the runner writes the same canonical 32-table Dataflow manifest
 without mutating storage (`arrowcol-loadgen azure-manifest --manifest PATH`),
 then reconciles external-table bindings while generation is active. The
 infrastructure helper has a fixed 120-second absent-log wait and distinguishes
@@ -482,10 +482,11 @@ attempt synchronously before the second can reset its ephemeral runtime.
 ## Watch and inspect
 
 - **Grafana:** <http://localhost:3000/d/arrowcol> (`admin` / `admin`).
-- **SQL Server:** `localhost,14333`, username `sa`. The local password is printed
-  at startup and stored in `projects/arrowcol-infra/secrets/sqlserver-sa-password.txt`.
-- **Portainer:** <https://localhost:9444>, username `admin`, the SQL Server password.
-  The local certificate is self-signed.
+- **SQL Server:** `localhost,14333`, username `sa`. Startup prints the location, not the contents, of the private
+  password file: `projects/arrowcol-infra/secrets/sqlserver-sa-password.txt`.
+- **Portainer:** <https://localhost:9444>, username `admin`, authenticated with the SQL Server
+  password in that file. Startup prints the credential file location without revealing
+  its contents. The local certificate is self-signed.
 - **Kusto:** <http://localhost:8080>, database `loadtest`, no authentication.
   This is an HTTP query endpoint, not a browser UI.
 - **kusto-explorer:** <http://localhost:8090>, a browser KQL workbench with the
@@ -499,7 +500,7 @@ override host ports. Published ports bind to host loopback only. A host-run
 load generator uses the router and catalog loopback ports; inside the devcontainer,
 the runner uses the emulator's allocated `10.89.x.50:8080` address instead of
 `localhost`; the host connection remains `http://localhost:${KUSTO_PORT:-8080}`.
-Do not share startup logs containing local-development passwords.
+Do not copy the password from its private file into shared logs.
 
 Output is always under `onelake/benchmark/latest/`:
 
@@ -560,7 +561,7 @@ cluster-wide guarantees against memory pressure from other processes.
 The independent reader still reads each captured file twice: the first pass
 builds the snapshot hashes, and the second constructs the exact bounded corpus
 and verifies those hashes. Snapshot hashes alone cannot replace decoded rows
-needed for Kusto's exact multiset predicates. Frozen inventory checks, all 13 Dataflow
+needed for Kusto's exact multiset predicates. Frozen inventory checks, all 32 Dataflow
 fallback and accelerated checks, and deadline rejection remain mandatory.
 `validation.json` and `kusto-validation.json` include `timings` with Unix start
 times, elapsed milliseconds and outcomes for phases, snapshot tables and Kusto
@@ -605,7 +606,7 @@ ordinary collector load generation. The runner prints an explicit
 an ordinary run may still exit successfully.
 
 `--validate` and `loadtest:e2e` require real post-run KQL correctness assertions
-for all 13 Dataflow tables and an in-run live-query observation. They fail if Kusto is
+for all 32 Dataflow tables and an in-run live-query observation. They fail if Kusto is
 unavailable, incomplete, inconsistent, or unverifiable. Counts are compared with
 each pool's captured Delta snapshot, not with acknowledgements or an assumption
 that the two pools have equal physical row multiplicities.
@@ -615,7 +616,7 @@ runner starts a Playwright browser container (Compose profile `ui-gate`) on the
 stack's network and drives `http://kusto-explorer:8080` like a user. The gate
 explicitly expands the External tables folder when collapsed, then
 checks the configured cluster is `http://kusto:8080`, the connections tree lists
-all 13 Dataflow tables, and the per-table row counts exported from the UI match
+all 32 Dataflow tables, and the per-table row counts exported from the UI match
 `kusto-validation.json`. It also runs a management command and a column chart,
 and fails on any browser console error. In ordinary runs, a kusto-explorer
 startup failure is only a warning.
@@ -676,7 +677,7 @@ drive paths and other non-Azure roots are treated as filesystem paths.
 
 Before opening tables it requires `publisher-release.json` with `passed=true`
 and the same nonnull `run_id` as `run-metadata.json`. It then uses Kernel active
-snapshots and the core's `sealed_final` OPTIMIZE policy on exactly 13 canonical
+snapshots and the core's `sealed_final` OPTIMIZE policy on exactly 32 canonical
 `telemetry/sqlserver/<table>` directories in the Dataflow pool. This flag only changes
 OPTIMIZE's newest/open-partition churn protection, not retention or authority.
 No VACUUM, PURGE, checkpoint, log pruning, cache-policy reset or delta-rs mutation
@@ -685,7 +686,7 @@ is performed.
 One cooperative **300-second** deadline covers preconditions, snapshots, exact
 row comparisons, planning and applying. Operations are joined; a timeout never
 abandons a mutator. Only the outer runner's process kill is a hard bound.
-Every progress pass starts with fresh dry-run plans for all 13 Dataflow tables. At most
+Every progress pass starts with fresh dry-run plans for all 32 Dataflow tables. At most
 three progress passes are allowed, with no external retry on an operation error.
 Success requires a final independent all-table plan with no unproven work,
 zero backlog and zero skipped/protected partitions. A nonreducing/no-op commit
@@ -798,8 +799,8 @@ Run the focused verification suite with:
 npx nx run loadtest:verify
 ```
 
-Its functional E2E uses 1,024-row batches while retaining all 13 schemas and all
-13 Dataflow external-table assertions. It runs twice in sequence: the baseline, then
+Its functional E2E uses 1,024-row batches while retaining all 32 schemas and all
+32 Dataflow external-table assertions. It runs twice in sequence: the baseline, then
 `--quiver --crash-after 15s`. The second run resets the first only after its
 validated corpus and evidence are privately sealed. The ephemeral `latest`
 results are from the Quiver crash run; both successful attempts have separate

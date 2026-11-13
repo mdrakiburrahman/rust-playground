@@ -1,0 +1,9 @@
+{
+  "name": "arrowcol-oat",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "arrowcol-oat": "cli.mjs"
+  }
+}

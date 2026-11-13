@@ -517,13 +517,15 @@ struct QueuedBatch {
 }
 
 impl QueuedBatch {
-    fn complete(&mut self, result: &Result<(), ExportFailure>) {
-        if let Some(reply) = self.reply.take() {
-            let result = match result {
-                Ok(()) => Ok(()),
-                Err(error) if error.permanent() => Err(ExportFailure::Permanent(error.to_string())),
-                Err(error) => Err(ExportFailure::Transient(error.to_string())),
-            };
+    fn complete(mut self, result: &Result<(), ExportFailure>) {
+        let reply = self.reply.take();
+        let result = match result {
+            Ok(()) => Ok(()),
+            Err(error) if error.permanent() => Err(ExportFailure::Permanent(error.to_string())),
+            Err(error) => Err(ExportFailure::Transient(error.to_string())),
+        };
+        drop(self);
+        if let Some(reply) = reply {
             let _ = reply.send(result);
         }
     }
@@ -604,7 +606,7 @@ async fn run_batch_worker(
             }
             return;
         };
-        let mut next = match next {
+        let next = match next {
             WorkerCommand::Batch(batch) => batch,
             WorkerCommand::Flush(reply) => {
                 publisher.publish(&mut group, &mut estimator).await;
@@ -655,7 +657,7 @@ async fn run_batch_worker(
     receiver.close();
     while let Some(command) = receiver.recv().await {
         match command {
-            WorkerCommand::Batch(mut batch) => batch.complete(&Err(retired_owner_failure())),
+            WorkerCommand::Batch(batch) => batch.complete(&Err(retired_owner_failure())),
             WorkerCommand::Flush(reply) => {
                 let _ = reply.send(());
             }
@@ -709,7 +711,7 @@ impl GroupPublisher<'_> {
             return;
         }
         let Some(table) = self.table.as_ref() else {
-            for mut entry in group.drain(..) {
+            for entry in group.drain(..) {
                 entry.complete(&Err(retired_owner_failure()));
             }
             return;
@@ -815,7 +817,7 @@ impl GroupPublisher<'_> {
             self.retired.store(true, std::sync::atomic::Ordering::Release);
         }
         let outcome = result.map(|_| ());
-        for mut entry in group.drain(..) {
+        for entry in group.drain(..) {
             if let Err(error) = &outcome {
                 tracing::warn!(
                     table = %self.identity,
@@ -1225,6 +1227,7 @@ mod tests {
                 now_unix_ms: observed,
                 expires_at_unix_ms: UnixMillis::new(observed.get() + 60_000).expect("expiry"),
                 minimum_snapshot_at_unix_ms: observed,
+                distinct_table_owners: false,
             })
             .await
             .expect("lease")
@@ -2754,6 +2757,7 @@ mod tests {
                 now_unix_ms: observed,
                 expires_at_unix_ms: UnixMillis::new(observed.get() + 60_000).expect("expiry"),
                 minimum_snapshot_at_unix_ms: observed,
+                distinct_table_owners: false,
             })
             .await
             .expect("live lease");

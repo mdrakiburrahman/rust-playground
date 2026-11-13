@@ -8,13 +8,14 @@ use arrowcol_protocol::{
 };
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDateTime, Utc};
-use tiberius::{IsolationLevel, Row};
+use sha2::{Digest, Sha256};
+use tiberius::{IsolationLevel, Query, Row};
 use uuid::Uuid;
 
 use crate::{
     CollectorRecord, CollectorRegistration, CollectorState, LeaseCas, LeaseClaim, LeaseKey, LeaseState,
     LeaseSuccession, LeaseTransfer, RichPressureSnapshot, RoutingError, RoutingErrorKind, RoutingLease, RoutingResult,
-    RoutingStore, RoutingView, SubsystemState,
+    RoutingStore, RoutingView, RunTablePin, SubsystemState,
 };
 
 use arrowcol_sql_server::{ConnectionConfig, SqlClient, SqlConnection, SqlPool};
@@ -155,6 +156,57 @@ impl SqlServerRoutingStore {
 
 const DEADLOCK_ATTEMPTS: u32 = 6;
 
+/// Computes the canonical digest for an immutable run-table pin set.
+///
+/// The digest is stable across input order and encodes each UTF-8 identity
+/// component before joining rows, matching the SQL Server authority function.
+///
+/// # Errors
+///
+/// Returns an error if the pin set is empty or contains duplicate table keys.
+pub fn run_table_pin_set_digest(expected: &[LeaseKey]) -> RoutingResult<String> {
+    if expected.is_empty() {
+        return Err(RoutingError::new(
+            RoutingErrorKind::InvalidConfiguration,
+            "OAT run pin set must not be empty",
+        ));
+    }
+    let mut rows = expected
+        .iter()
+        .map(|key| {
+            [
+                encode_hex(pool_name(key.implementation_pool).as_bytes()),
+                encode_hex(key.table.catalog().as_str().as_bytes()),
+                encode_hex(key.table.schema().as_str().as_bytes()),
+                encode_hex(key.table.table().as_str().as_bytes()),
+            ]
+        })
+        .collect::<Vec<_>>();
+    rows.sort_unstable();
+    if rows.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(RoutingError::new(
+            RoutingErrorKind::InvalidConfiguration,
+            "OAT run pin set contains duplicate table keys",
+        ));
+    }
+    let mut preimage = b"arrowcol-oat-pin-set-v1\n".to_vec();
+    for row in rows {
+        preimage.extend_from_slice(row.join(":").as_bytes());
+        preimage.push(b'\n');
+    }
+    Ok(format!("{:x}", Sha256::digest(preimage)))
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
 async fn retry_deadlock<T, F, Fut>(mut operation: F) -> RoutingResult<T>
 where
     F: FnMut() -> Fut,
@@ -210,6 +262,33 @@ impl RoutingStore for SqlServerRoutingStore {
 
     async fn claim_lease(&self, claim: &LeaseClaim) -> RoutingResult<RoutingLease> {
         retry_deadlock(|| self.inner.claim_lease(claim)).await
+    }
+
+    async fn initialize_run_table_set(
+        &self,
+        run_id: &str,
+        expected: &[LeaseKey],
+        expires_at: UnixMillis,
+        now: UnixMillis,
+    ) -> RoutingResult<()> {
+        retry_deadlock(|| self.inner.initialize_run_table_set(run_id, expected, expires_at, now)).await
+    }
+
+    async fn get_run_table_pin(
+        &self,
+        run_id: &str,
+        key: &LeaseKey,
+        now: UnixMillis,
+    ) -> RoutingResult<Option<RunTablePin>> {
+        retry_deadlock(|| self.inner.get_run_table_pin(run_id, key, now)).await
+    }
+
+    async fn bind_initial_run_table_pin(&self, pin: &RunTablePin, now: UnixMillis) -> RoutingResult<RunTablePin> {
+        retry_deadlock(|| self.inner.bind_initial_run_table_pin(pin, now)).await
+    }
+
+    async fn has_active_run_table_pin(&self, key: &LeaseKey, now: UnixMillis) -> RoutingResult<bool> {
+        retry_deadlock(|| self.inner.has_active_run_table_pin(key, now)).await
     }
 
     async fn begin_lease_drain(&self, request: &LeaseCas) -> RoutingResult<RoutingLease> {
@@ -441,7 +520,7 @@ impl RoutingStore for RawSqlStore {
                 .execute(
                     "IF NOT EXISTS (SELECT 1 FROM arrowcol.routing_collectors WHERE instance_id = @P1) \
                          THROW 51101, 'routing collector registration is missing', 1; \
-                     IF EXISTS (SELECT 1 FROM arrowcol.routing_pressure_latest \
+                     IF EXISTS (SELECT 1 FROM arrowcol.routing_pressure_latest WITH (UPDLOCK, HOLDLOCK) \
                                 WHERE collector_instance_id = @P1 AND observed_at_utc >= @P2) \
                          THROW 51102, 'routing pressure timestamp did not advance', 1; \
                      UPDATE arrowcol.routing_pressure_latest SET \
@@ -599,9 +678,27 @@ impl RoutingStore for RawSqlStore {
                 .await
                 .map_err(|cause| database_error("begin lease claim", cause))?;
             let result = async {
+                if claim.distinct_table_owners {
+                    lock_distinct_table_owner_pool(&mut client, claim.key.implementation_pool).await?;
+                }
                 if let Some(existing) = select_locked_lease(&mut client, &claim.key).await? {
                     if existing.is_valid_at(claim.now_unix_ms) {
+                        if claim.distinct_table_owners {
+                            verify_distinct_table_owner(
+                                &mut client,
+                                &claim.key,
+                                existing.holder_instance_id,
+                                claim.now_unix_ms,
+                            )
+                            .await?;
+                        }
                         return Ok(existing);
+                    }
+                    if active_run_pin_exists(&mut client, &claim.key, claim.now_unix_ms).await? {
+                        return Err(RoutingError::new(
+                            RoutingErrorKind::Conflict,
+                            "expired table lease is protected by an active immutable OAT run pin",
+                        ));
                     }
                     verify_candidate(
                         &mut client,
@@ -611,6 +708,15 @@ impl RoutingStore for RawSqlStore {
                         claim.now_unix_ms,
                     )
                     .await?;
+                    if claim.distinct_table_owners {
+                        verify_distinct_table_owner(
+                            &mut client,
+                            &claim.key,
+                            claim.candidate_instance_id,
+                            claim.now_unix_ms,
+                        )
+                        .await?;
+                    }
                     let epoch = existing.fencing_epoch.next().map_err(|cause| {
                         RoutingError::new(
                             RoutingErrorKind::CorruptState,
@@ -632,6 +738,12 @@ impl RoutingStore for RawSqlStore {
                     )
                     .await
                 } else {
+                    if active_run_pin_exists(&mut client, &claim.key, claim.now_unix_ms).await? {
+                        return Err(RoutingError::new(
+                            RoutingErrorKind::Conflict,
+                            "missing table lease is protected by an active immutable OAT run pin",
+                        ));
+                    }
                     verify_candidate(
                         &mut client,
                         claim.candidate_instance_id,
@@ -640,6 +752,15 @@ impl RoutingStore for RawSqlStore {
                         claim.now_unix_ms,
                     )
                     .await?;
+                    if claim.distinct_table_owners {
+                        verify_distinct_table_owner(
+                            &mut client,
+                            &claim.key,
+                            claim.candidate_instance_id,
+                            claim.now_unix_ms,
+                        )
+                        .await?;
+                    }
                     insert_lease(&mut client, claim).await
                 }
             }
@@ -658,6 +779,331 @@ impl RoutingStore for RawSqlStore {
         Ok(value)
     }
 
+    async fn initialize_run_table_set(
+        &self,
+        run_id: &str,
+        expected: &[LeaseKey],
+        expires_at: UnixMillis,
+        now: UnixMillis,
+    ) -> RoutingResult<()> {
+        let run_id = parse_run_id(run_id)?;
+        if expected.is_empty()
+            || expected.len() > 32
+            || expected.windows(2).any(|pair| pair[0] >= pair[1])
+            || expires_at <= now
+        {
+            return Err(RoutingError::new(
+                RoutingErrorKind::InvalidConfiguration,
+                "OAT run pin set must be live and contain 1..=32 strictly sorted, unique table keys",
+            ));
+        }
+        let digest = run_table_pin_set_digest(expected)?;
+        let expected_count = i32::try_from(expected.len()).map_err(|_| {
+            RoutingError::new(
+                RoutingErrorKind::InvalidConfiguration,
+                "OAT run table count exceeds SQL Server limits",
+            )
+        })?;
+        let now_sql = datetime(now)?;
+        let expires_sql = datetime(expires_at)?;
+        let mut client = self.connect().await?;
+        let result: RoutingResult<()> = async {
+            client
+                .begin_transaction_with_isolation(IsolationLevel::Serializable)
+                .await
+                .map_err(|cause| database_error("begin OAT run pin-set initialization", cause))?;
+            let result = async {
+                let rows = client
+                    .query(
+                        "SELECT CONVERT(bigint, expected_table_count) AS expected_table_count, \
+                                expected_table_set_sha256, expires_at_utc \
+                         FROM arrowcol.routing_run_pin_sets WITH (UPDLOCK, HOLDLOCK) WHERE run_id=@P1;",
+                        &[&run_id],
+                    )
+                    .await
+                    .map_err(|cause| database_error("lock OAT run pin set", cause))?
+                    .into_first_result()
+                    .await
+                    .map_err(|cause| database_error("read OAT run pin set", cause))?;
+                if let Some(row) = rows.first() {
+                    if required_i64(row, "expected_table_count")? != i64::from(expected_count)
+                        || required_str(row, "expected_table_set_sha256")? != digest
+                        || unix_millis(required_datetime(row, "expires_at_utc")?)? != expires_at
+                    {
+                        return Err(RoutingError::new(
+                            RoutingErrorKind::Conflict,
+                            "immutable OAT run pin set already exists with a different count, digest, or expiry",
+                        ));
+                    }
+                    verify_run_pin_set(&mut client, run_id, expected_count, &digest, expires_at, now).await?;
+                    return Ok(());
+                }
+
+                client
+                    .execute(
+                        "INSERT INTO arrowcol.routing_run_pin_sets \
+                         (run_id, expected_table_count, expected_table_set_sha256, expires_at_utc, created_at_utc) \
+                         VALUES (@P1,@P2,@P3,@P4,@P5);",
+                        &[&run_id, &expected_count, &digest, &expires_sql, &now_sql],
+                    )
+                    .await
+                    .map_err(|cause| database_error("insert OAT run pin set", cause))?;
+
+                let mut values = Vec::with_capacity(expected.len());
+                for index in 0..expected.len() {
+                    let first = index * 5 + 1;
+                    values.push(format!(
+                        "(@P{first},@P{},@P{},@P{},@P{})",
+                        first + 1,
+                        first + 2,
+                        first + 3,
+                        first + 4
+                    ));
+                }
+                let sql = format!(
+                    "INSERT INTO arrowcol.routing_run_table_initializations \
+                     (run_id, implementation_pool, catalog_name, schema_name, table_name) VALUES {};",
+                    values.join(",")
+                );
+                let mut query = Query::new(sql);
+                for key in expected {
+                    query.bind(run_id);
+                    query.bind(pool_name(key.implementation_pool).to_owned());
+                    query.bind(key.table.catalog().as_str().to_owned());
+                    query.bind(key.table.schema().as_str().to_owned());
+                    query.bind(key.table.table().as_str().to_owned());
+                }
+                query
+                    .execute(&mut client)
+                    .await
+                    .map_err(|cause| database_error("insert complete OAT run table set", cause))?;
+                verify_run_pin_set(&mut client, run_id, expected_count, &digest, expires_at, now).await
+            }
+            .await;
+            finish_transaction(&mut client, result, "initialize OAT run pin set").await
+        }
+        .await;
+        result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(operation = "initialize_run_table_set", error = %error, "SQL Server session cleanup failed");
+        }
+        Ok(())
+    }
+
+    async fn get_run_table_pin(
+        &self,
+        run_id: &str,
+        key: &LeaseKey,
+        now: UnixMillis,
+    ) -> RoutingResult<Option<RunTablePin>> {
+        let run_id = parse_run_id(run_id)?;
+        let mut client = self.connect().await?;
+        client
+            .begin_transaction_with_isolation(IsolationLevel::Serializable)
+            .await
+            .map_err(|cause| database_error("begin OAT run-table pin validation", cause))?;
+        let result: RoutingResult<_> = async {
+            validate_live_run_pin_set(&mut client, run_id, now).await?;
+            let markers = client
+                .query(
+                    "SELECT state FROM arrowcol.routing_run_table_initializations \
+                     WHERE run_id=@P1 AND implementation_pool=@P2 AND catalog_name=@P3 \
+                       AND schema_name=@P4 AND table_name=@P5;",
+                    &[
+                        &run_id,
+                        &pool_name(key.implementation_pool),
+                        &key.table.catalog().as_str(),
+                        &key.table.schema().as_str(),
+                        &key.table.table().as_str(),
+                    ],
+                )
+                .await
+                .map_err(|cause| database_error("load OAT run table initializer", cause))?
+                .into_first_result()
+                .await
+                .map_err(|cause| database_error("read OAT run table initializer", cause))?;
+            let marker = markers.first().ok_or_else(|| {
+                RoutingError::new(RoutingErrorKind::Conflict, "table is not in the immutable OAT run set")
+            })?;
+            let marker_state = required_str(marker, "state")?;
+            let rows = client
+                .query(
+                    "SELECT run_id, implementation_pool, catalog_name, schema_name, table_name, \
+                            holder_instance_id, lease_id, fencing_epoch, expires_at_utc \
+                     FROM arrowcol.routing_run_table_pins \
+                     WHERE run_id=@P1 AND implementation_pool=@P2 AND catalog_name=@P3 \
+                       AND schema_name=@P4 AND table_name=@P5;",
+                    &[
+                        &run_id,
+                        &pool_name(key.implementation_pool),
+                        &key.table.catalog().as_str(),
+                        &key.table.schema().as_str(),
+                        &key.table.table().as_str(),
+                    ],
+                )
+                .await
+                .map_err(|cause| database_error("load OAT run-table pin", cause))?
+                .into_first_result()
+                .await
+                .map_err(|cause| database_error("read OAT run-table pin", cause))?;
+            let Some(row) = rows.first() else {
+                return match marker_state {
+                    "pending" => Ok(None),
+                    "bound" => Err(RoutingError::new(
+                        RoutingErrorKind::Conflict,
+                        "bound OAT run-table marker is missing its immutable owner row",
+                    )),
+                    _ => Err(RoutingError::new(
+                        RoutingErrorKind::CorruptState,
+                        "OAT run marker has an invalid state",
+                    )),
+                };
+            };
+            if marker_state != "bound" {
+                return Err(RoutingError::new(
+                    RoutingErrorKind::CorruptState,
+                    "OAT run-table owner exists before its marker is bound",
+                ));
+            }
+            let pin = run_table_pin_from_row(row)?;
+            validate_sql_run_pin(&mut client, &pin, now).await?;
+            Ok(Some(pin))
+        }
+        .await;
+        let value = finish_transaction(&mut client, result, "validate OAT run-table pin").await?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(operation = "get_run_table_pin", error = %error, "SQL Server session cleanup failed");
+        }
+        Ok(value)
+    }
+
+    async fn bind_initial_run_table_pin(&self, pin: &RunTablePin, now: UnixMillis) -> RoutingResult<RunTablePin> {
+        pin.validate(now)?;
+        let run_id = parse_run_id(&pin.run_id)?;
+        let mut client = self.connect().await?;
+        let result: RoutingResult<_> = async {
+            client
+                .begin_transaction_with_isolation(IsolationLevel::Serializable)
+                .await
+                .map_err(|cause| database_error("begin OAT run-table pin", cause))?;
+            let result = async {
+                validate_live_run_pin_set(&mut client, run_id, now).await?;
+                let marker_rows = client
+                    .query(
+                        "SELECT i.state, s.expires_at_utc \
+                         FROM arrowcol.routing_run_table_initializations i \
+                         JOIN arrowcol.routing_run_pin_sets s ON s.run_id=i.run_id \
+                         WHERE i.run_id=@P1 AND i.implementation_pool=@P2 AND i.catalog_name=@P3 \
+                           AND i.schema_name=@P4 AND i.table_name=@P5;",
+                        &[
+                            &run_id,
+                            &pool_name(pin.key.implementation_pool),
+                            &pin.key.table.catalog().as_str(),
+                            &pin.key.table.schema().as_str(),
+                            &pin.key.table.table().as_str(),
+                        ],
+                    )
+                    .await
+                    .map_err(|cause| database_error("lock OAT run-table initialization marker", cause))?
+                    .into_first_result()
+                    .await
+                    .map_err(|cause| database_error("read OAT run-table initialization marker", cause))?;
+                let marker = marker_rows.first().ok_or_else(|| {
+                    RoutingError::new(RoutingErrorKind::Conflict, "table is not in the immutable OAT run set")
+                })?;
+                let marker_state = required_str(marker, "state")?;
+                if unix_millis(required_datetime(marker, "expires_at_utc")?)? != pin.expires_at_unix_ms
+                    || marker_state == "pending" && pin.expires_at_unix_ms <= now
+                {
+                    return Err(RoutingError::new(
+                        RoutingErrorKind::Conflict,
+                        "OAT table marker expiry differs from the requested immutable pin",
+                    ));
+                }
+                let rows = client
+                    .query(
+                        "SELECT run_id, implementation_pool, catalog_name, schema_name, table_name, \
+                                holder_instance_id, lease_id, fencing_epoch, expires_at_utc \
+                         FROM arrowcol.routing_run_table_pins WITH (UPDLOCK, HOLDLOCK) \
+                         WHERE run_id=@P1 AND implementation_pool=@P2 AND catalog_name=@P3 \
+                           AND schema_name=@P4 AND table_name=@P5;",
+                        &[
+                            &run_id,
+                            &pool_name(pin.key.implementation_pool),
+                            &pin.key.table.catalog().as_str(),
+                            &pin.key.table.schema().as_str(),
+                            &pin.key.table.table().as_str(),
+                        ],
+                    )
+                    .await
+                    .map_err(|cause| database_error("lock OAT run-table pin", cause))?
+                    .into_first_result()
+                    .await
+                    .map_err(|cause| database_error("read OAT run-table pin", cause))?;
+                if let Some(row) = rows.first() {
+                    let existing = run_table_pin_from_row(row)?;
+                    if marker_state != "bound"
+                        || existing.expires_at_unix_ms <= now
+                        || !same_run_table_pin(&existing, pin)
+                    {
+                        return Err(RoutingError::new(
+                            RoutingErrorKind::Conflict,
+                            "immutable OAT run-table pin already exists with a different or expired owner",
+                        ));
+                    }
+                    validate_sql_run_pin(&mut client, &existing, now).await?;
+                    return Ok(existing);
+                }
+                if marker_state != "pending" {
+                    return Err(RoutingError::new(
+                        RoutingErrorKind::Conflict,
+                        "bound OAT run-table marker is missing its immutable owner row",
+                    ));
+                }
+                validate_sql_run_pin(&mut client, pin, now).await?;
+                client
+                    .execute(
+                        "INSERT INTO arrowcol.routing_run_table_pins \
+                         (run_id, implementation_pool, catalog_name, schema_name, table_name, \
+                          holder_instance_id, lease_id, fencing_epoch, expires_at_utc) \
+                         VALUES (@P1,@P2,@P3,@P4,@P5,@P6,@P7,@P8,@P9);",
+                        &[
+                            &run_id,
+                            &pool_name(pin.key.implementation_pool),
+                            &pin.key.table.catalog().as_str(),
+                            &pin.key.table.schema().as_str(),
+                            &pin.key.table.table().as_str(),
+                            &pin.holder_instance_id.as_uuid(),
+                            &pin.lease_id.as_uuid(),
+                            &to_i64(pin.fencing_epoch.get(), "fencing epoch")?,
+                            &datetime(pin.expires_at_unix_ms)?,
+                        ],
+                    )
+                    .await
+                    .map_err(|cause| database_error("insert OAT run-table pin", cause))?;
+                Ok(pin.clone())
+            }
+            .await;
+            finish_transaction(&mut client, result, "create OAT run-table pin").await
+        }
+        .await;
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(operation = "bind_initial_run_table_pin", error = %error, "SQL Server session cleanup failed");
+        }
+        Ok(value)
+    }
+
+    async fn has_active_run_table_pin(&self, key: &LeaseKey, now: UnixMillis) -> RoutingResult<bool> {
+        let mut client = self.connect().await?;
+        let result = active_run_pin_exists(&mut client, key, now).await;
+        let value = result?;
+        if let Err(error) = client.finish().await {
+            tracing::warn!(operation = "has_active_run_table_pin", error = %error, "SQL Server session cleanup failed");
+        }
+        Ok(value)
+    }
+
     async fn begin_lease_drain(&self, request: &LeaseCas) -> RoutingResult<RoutingLease> {
         let version = request
             .expected_version
@@ -666,38 +1112,52 @@ impl RoutingStore for RawSqlStore {
         let now = datetime(request.now_unix_ms)?;
         let mut client = self.connect().await?;
         let result: RoutingResult<_> = async {
-            let rows = client
-                .query(
-                    &format!(
-                        "UPDATE arrowcol.routing_table_leases SET \
-                        state='draining', lease_version=@P5, renewed_at_utc=@P6, drain_started_at_utc=@P6 \
-                     OUTPUT INSERTED.{columns} \
-                     WHERE implementation_pool=@P1 AND catalog_name=@P2 AND schema_name=@P3 AND table_name=@P4 \
-                       AND lease_version=@P7 AND state='active';",
-                        columns = LEASE_COLUMNS.replace(", ", ", INSERTED.")
-                    ),
-                    &[
-                        &request.key.implementation_pool.to_string(),
-                        &request.key.table.catalog().as_str(),
-                        &request.key.table.schema().as_str(),
-                        &request.key.table.table().as_str(),
-                        &to_i64(version, "lease version")?,
-                        &now,
-                        &to_i64(request.expected_version, "expected lease version")?,
-                    ],
-                )
+            client
+                .begin_transaction_with_isolation(IsolationLevel::Serializable)
                 .await
-                .map_err(|cause| database_error("begin routing lease drain", cause))?
-                .into_first_result()
-                .await
-                .map_err(|cause| database_error("read routing lease drain result", cause))?;
-            let row = rows.into_iter().next().ok_or_else(|| {
-                RoutingError::new(
-                    RoutingErrorKind::Conflict,
-                    "routing lease changed before drain compare-and-set",
-                )
-            })?;
-            lease_from_row(&row)
+                .map_err(|cause| database_error("begin routing lease drain", cause))?;
+            let result = async {
+                if active_run_pin_exists(&mut client, &request.key, request.now_unix_ms).await? {
+                    return Err(RoutingError::new(
+                        RoutingErrorKind::Conflict,
+                        "table lease is protected by an active immutable OAT run pin",
+                    ));
+                }
+                let rows = client
+                    .query(
+                        &format!(
+                            "UPDATE arrowcol.routing_table_leases SET \
+                            state='draining', lease_version=@P5, renewed_at_utc=@P6, drain_started_at_utc=@P6 \
+                         OUTPUT INSERTED.{columns} \
+                         WHERE implementation_pool=@P1 AND catalog_name=@P2 AND schema_name=@P3 AND table_name=@P4 \
+                           AND lease_version=@P7 AND state='active';",
+                            columns = LEASE_COLUMNS.replace(", ", ", INSERTED.")
+                        ),
+                        &[
+                            &request.key.implementation_pool.to_string(),
+                            &request.key.table.catalog().as_str(),
+                            &request.key.table.schema().as_str(),
+                            &request.key.table.table().as_str(),
+                            &to_i64(version, "lease version")?,
+                            &now,
+                            &to_i64(request.expected_version, "expected lease version")?,
+                        ],
+                    )
+                    .await
+                    .map_err(|cause| database_error("begin routing lease drain", cause))?
+                    .into_first_result()
+                    .await
+                    .map_err(|cause| database_error("read routing lease drain result", cause))?;
+                let row = rows.into_iter().next().ok_or_else(|| {
+                    RoutingError::new(
+                        RoutingErrorKind::Conflict,
+                        "routing lease changed before drain compare-and-set",
+                    )
+                })?;
+                lease_from_row(&row)
+            }
+            .await;
+            finish_transaction(&mut client, result, "begin routing lease drain").await
         }
         .await;
         let value = result?;
@@ -720,9 +1180,18 @@ impl RoutingStore for RawSqlStore {
                 .await
                 .map_err(|cause| database_error("begin routing lease transfer", cause))?;
             let result = async {
+                if request.distinct_table_owners {
+                    lock_distinct_table_owner_pool(&mut client, request.key.implementation_pool).await?;
+                }
                 let existing = select_locked_lease(&mut client, &request.key)
                     .await?
                     .ok_or_else(|| RoutingError::new(RoutingErrorKind::Conflict, "routing lease was not found"))?;
+                if active_run_pin_exists(&mut client, &request.key, request.now_unix_ms).await? {
+                    return Err(RoutingError::new(
+                        RoutingErrorKind::Conflict,
+                        "table lease is protected by an active immutable OAT run pin",
+                    ));
+                }
                 if existing.state != LeaseState::Draining || existing.lease_version != request.expected_version {
                     return Err(RoutingError::new(
                         RoutingErrorKind::Conflict,
@@ -737,6 +1206,15 @@ impl RoutingStore for RawSqlStore {
                     request.now_unix_ms,
                 )
                 .await?;
+                if request.distinct_table_owners {
+                    verify_distinct_table_owner(
+                        &mut client,
+                        &request.key,
+                        request.candidate_instance_id,
+                        request.now_unix_ms,
+                    )
+                    .await?;
+                }
                 let epoch = existing.fencing_epoch.next().map_err(|cause| {
                     RoutingError::new(
                         RoutingErrorKind::CorruptState,
@@ -782,9 +1260,18 @@ impl RoutingStore for RawSqlStore {
                 .await
                 .map_err(|cause| database_error("begin routing lease succession", cause))?;
             let result = async {
+                if request.distinct_table_owners {
+                    lock_distinct_table_owner_pool(&mut client, request.key.implementation_pool).await?;
+                }
                 let existing = select_locked_lease(&mut client, &request.key)
                     .await?
                     .ok_or_else(|| RoutingError::new(RoutingErrorKind::Conflict, "routing lease was not found"))?;
+                if active_run_pin_exists(&mut client, &request.key, request.now_unix_ms).await? {
+                    return Err(RoutingError::new(
+                        RoutingErrorKind::Conflict,
+                        "table lease is protected by an active immutable OAT run pin",
+                    ));
+                }
                 if existing.lease_version != request.expected_version
                     || existing.holder_instance_id != request.predecessor_instance_id
                     || !existing.is_valid_at(request.now_unix_ms)
@@ -813,6 +1300,15 @@ impl RoutingStore for RawSqlStore {
                         error
                     }
                 })?;
+                if request.distinct_table_owners {
+                    verify_distinct_table_owner(
+                        &mut client,
+                        &request.key,
+                        request.successor_instance_id,
+                        request.now_unix_ms,
+                    )
+                    .await?;
+                }
                 let epoch = existing.fencing_epoch.next().map_err(|cause| {
                     RoutingError::new(
                         RoutingErrorKind::CorruptState,
@@ -1004,6 +1500,64 @@ async fn select_locked_lease(client: &mut SqlClient, key: &LeaseKey) -> RoutingR
         .await
         .map_err(|cause| database_error("read locked routing lease", cause))?;
     row.as_ref().map(lease_from_row).transpose()
+}
+
+async fn lock_distinct_table_owner_pool(
+    client: &mut SqlClient,
+    implementation_pool: arrowcol_protocol::ImplementationPool,
+) -> RoutingResult<()> {
+    let resource = format!("arrowcol:distinct-table-owner:{implementation_pool}");
+    let row = client
+        .query(
+            "DECLARE @lock_result int; EXEC @lock_result = sys.sp_getapplock @Resource=@P1, @LockMode='Exclusive', @LockOwner='Transaction', @LockTimeout=5000; SELECT @lock_result AS lock_result;",
+            &[&resource],
+        )
+        .await
+        .map_err(|cause| database_error("lock distinct table-owner pool", cause))?
+        .into_row()
+        .await
+        .map_err(|cause| database_error("read distinct table-owner pool lock", cause))?;
+    if row.and_then(|row| row.get::<i32, _>(0)).is_none_or(|result| result < 0) {
+        return Err(RoutingError::new(
+            RoutingErrorKind::PoolUnavailable,
+            "could not acquire the distinct table-owner pool lock",
+        ));
+    }
+    Ok(())
+}
+
+async fn verify_distinct_table_owner(
+    client: &mut SqlClient,
+    key: &LeaseKey,
+    candidate: CollectorInstanceId,
+    now: UnixMillis,
+) -> RoutingResult<()> {
+    let holder = candidate.as_uuid();
+    let now = datetime(now)?;
+    let row = client
+        .query(
+            "SELECT TOP (1) 1 FROM arrowcol.routing_table_leases WITH (UPDLOCK, HOLDLOCK) WHERE implementation_pool=@P1 AND holder_instance_id=@P2 AND state='active' AND expires_at_utc>@P3 AND NOT (catalog_name=@P4 AND schema_name=@P5 AND table_name=@P6);",
+            &[
+                &key.implementation_pool.to_string(),
+                &holder,
+                &now,
+                &key.table.catalog().as_str(),
+                &key.table.schema().as_str(),
+                &key.table.table().as_str(),
+            ],
+        )
+        .await
+        .map_err(|cause| database_error("check distinct table-owner assignment", cause))?
+        .into_row()
+        .await
+        .map_err(|cause| database_error("read distinct table-owner assignment", cause))?;
+    if row.is_some() {
+        return Err(RoutingError::new(
+            RoutingErrorKind::Conflict,
+            "collector already owns another active table lease in distinct table-owner mode",
+        ));
+    }
+    Ok(())
 }
 
 async fn insert_lease(client: &mut SqlClient, claim: &LeaseClaim) -> RoutingResult<RoutingLease> {
@@ -1211,6 +1765,198 @@ fn lease_from_row(row: &Row) -> RoutingResult<RoutingLease> {
     };
     lease.validate()?;
     Ok(lease)
+}
+
+fn run_table_pin_from_row(row: &Row) -> RoutingResult<RunTablePin> {
+    let pin = RunTablePin {
+        run_id: required_uuid(row, "run_id")?.to_string(),
+        key: LeaseKey::new(
+            parse_pool(required_str(row, "implementation_pool")?)?,
+            TableIdentity::new(
+                CatalogName::new(required_str(row, "catalog_name")?).map_err(corrupt)?,
+                SchemaName::new(required_str(row, "schema_name")?).map_err(corrupt)?,
+                TableName::new(required_str(row, "table_name")?).map_err(corrupt)?,
+            ),
+        ),
+        holder_instance_id: collector_id(required_uuid(row, "holder_instance_id")?)?,
+        lease_id: LeaseId::from_str(&required_uuid(row, "lease_id")?.to_string()).map_err(corrupt)?,
+        fencing_epoch: FencingToken::new(to_u64(required_i64(row, "fencing_epoch")?, "fencing epoch")?)
+            .map_err(corrupt)?,
+        expires_at_unix_ms: unix_millis(required_datetime(row, "expires_at_utc")?)?,
+    };
+    if uuid::Uuid::parse_str(&pin.run_id).is_err() {
+        return Err(RoutingError::new(
+            RoutingErrorKind::CorruptState,
+            "persisted OAT run-table pin has an invalid UUID run ID",
+        ));
+    }
+    Ok(pin)
+}
+
+async fn verify_run_pin_set(
+    client: &mut SqlClient,
+    run_id: Uuid,
+    expected_count: i32,
+    expected_digest: &str,
+    expires_at: UnixMillis,
+    now: UnixMillis,
+) -> RoutingResult<()> {
+    let rows = client
+        .query(
+            "SELECT CONVERT(bigint, expected_table_count) AS expected_table_count, \
+                    expected_table_set_sha256, expires_at_utc, \
+                    (SELECT COUNT_BIG(*) FROM arrowcol.routing_run_table_initializations m \
+                     WHERE m.run_id=s.run_id) AS actual_table_count, \
+                    arrowcol.routing_run_pin_set_digest(s.run_id) AS actual_table_set_sha256 \
+             FROM arrowcol.routing_run_pin_sets s WITH (UPDLOCK, HOLDLOCK) WHERE s.run_id=@P1;",
+            &[&run_id],
+        )
+        .await
+        .map_err(|cause| database_error("verify OAT run pin set", cause))?
+        .into_first_result()
+        .await
+        .map_err(|cause| database_error("read OAT run pin set verification", cause))?;
+    let row = rows
+        .first()
+        .ok_or_else(|| RoutingError::new(RoutingErrorKind::Conflict, "immutable OAT run pin set is missing"))?;
+    if required_i64(row, "expected_table_count")? != i64::from(expected_count)
+        || required_i64(row, "actual_table_count")? != i64::from(expected_count)
+        || required_str(row, "expected_table_set_sha256")? != expected_digest
+        || required_str(row, "actual_table_set_sha256")? != expected_digest
+        || unix_millis(required_datetime(row, "expires_at_utc")?)? != expires_at
+        || expires_at <= now
+    {
+        return Err(RoutingError::new(
+            RoutingErrorKind::Conflict,
+            "OAT run pin set is incomplete, expired, or differs from its immutable digest and expiry",
+        ));
+    }
+    Ok(())
+}
+
+async fn validate_live_run_pin_set(client: &mut SqlClient, run_id: Uuid, now: UnixMillis) -> RoutingResult<()> {
+    let rows = client
+        .query(
+            "SELECT CONVERT(bigint, expected_table_count) AS expected_table_count, \
+                    expected_table_set_sha256, expires_at_utc, \
+                    (SELECT COUNT_BIG(*) FROM arrowcol.routing_run_table_initializations m \
+                     WHERE m.run_id=s.run_id) AS actual_table_count, \
+                    arrowcol.routing_run_pin_set_digest(s.run_id) AS actual_table_set_sha256 \
+             FROM arrowcol.routing_run_pin_sets s WHERE s.run_id=@P1;",
+            &[&run_id],
+        )
+        .await
+        .map_err(|cause| database_error("validate OAT run pin set", cause))?
+        .into_first_result()
+        .await
+        .map_err(|cause| database_error("read OAT run pin set validation", cause))?;
+    let row = rows
+        .first()
+        .ok_or_else(|| RoutingError::new(RoutingErrorKind::Conflict, "immutable OAT run pin set is missing"))?;
+    if required_i64(row, "expected_table_count")? != required_i64(row, "actual_table_count")?
+        || required_str(row, "expected_table_set_sha256")? != required_str(row, "actual_table_set_sha256")?
+        || unix_millis(required_datetime(row, "expires_at_utc")?)? <= now
+    {
+        return Err(RoutingError::new(
+            RoutingErrorKind::Conflict,
+            "OAT run pin set is incomplete, expired, or has a changed digest",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_run_id(run_id: &str) -> RoutingResult<uuid::Uuid> {
+    let parsed = uuid::Uuid::parse_str(run_id)
+        .map_err(|_| RoutingError::new(RoutingErrorKind::InvalidConfiguration, "OAT run ID must be a UUID"))?;
+    if parsed.to_string() != run_id {
+        return Err(RoutingError::new(
+            RoutingErrorKind::InvalidConfiguration,
+            "OAT run ID must be a canonical lowercase UUID",
+        ));
+    }
+    Ok(parsed)
+}
+
+async fn active_run_pin_exists(client: &mut SqlClient, key: &LeaseKey, now: UnixMillis) -> RoutingResult<bool> {
+    let now = datetime(now)?;
+    let rows = client
+        .query(
+            "SELECT TOP (1) run_id FROM arrowcol.routing_run_table_pins WITH (UPDLOCK, HOLDLOCK) \
+             WHERE implementation_pool=@P1 AND catalog_name=@P2 AND schema_name=@P3 AND table_name=@P4 \
+               AND expires_at_utc>@P5;",
+            &[
+                &pool_name(key.implementation_pool),
+                &key.table.catalog().as_str(),
+                &key.table.schema().as_str(),
+                &key.table.table().as_str(),
+                &now,
+            ],
+        )
+        .await
+        .map_err(|cause| database_error("check active OAT run-table pin", cause))?
+        .into_first_result()
+        .await
+        .map_err(|cause| database_error("read active OAT run-table pin", cause))?;
+    Ok(!rows.is_empty())
+}
+
+async fn validate_sql_run_pin(client: &mut SqlClient, pin: &RunTablePin, now: UnixMillis) -> RoutingResult<()> {
+    pin.validate(now)?;
+    let lease = select_locked_lease(client, &pin.key)
+        .await?
+        .ok_or_else(|| RoutingError::new(RoutingErrorKind::Conflict, "pinned routing lease is missing"))?;
+    if !lease.is_routable_at(now)
+        || lease.holder_instance_id != pin.holder_instance_id
+        || lease.lease_id != pin.lease_id
+        || lease.fencing_epoch != pin.fencing_epoch
+    {
+        return Err(RoutingError::new(
+            RoutingErrorKind::Conflict,
+            "pinned table owner or lease epoch changed or expired",
+        ));
+    }
+    let holder = pin.holder_instance_id.as_uuid();
+    let rows = client
+        .query(
+            "SELECT implementation_pool, state, lease_expires_at_utc \
+             FROM arrowcol.routing_collectors WHERE instance_id=@P1;",
+            &[&holder],
+        )
+        .await
+        .map_err(|cause| database_error("validate pinned collector process", cause))?
+        .into_first_result()
+        .await
+        .map_err(|cause| database_error("read pinned collector process", cause))?;
+    let row = rows.first().ok_or_else(|| {
+        RoutingError::new(
+            RoutingErrorKind::Conflict,
+            "pinned collector process registration is missing",
+        )
+    })?;
+    if parse_pool(required_str(row, "implementation_pool")?)? != pin.key.implementation_pool
+        || parse_collector_state(required_str(row, "state")?)? != CollectorState::Ready
+        || unix_millis(required_datetime(row, "lease_expires_at_utc")?)? <= now
+    {
+        return Err(RoutingError::new(
+            RoutingErrorKind::Conflict,
+            "pinned collector process lifetime has expired or is not ready",
+        ));
+    }
+    Ok(())
+}
+
+fn same_run_table_pin(existing: &RunTablePin, requested: &RunTablePin) -> bool {
+    existing.run_id == requested.run_id
+        && existing.key == requested.key
+        && existing.holder_instance_id == requested.holder_instance_id
+        && existing.lease_id == requested.lease_id
+        && existing.fencing_epoch == requested.fencing_epoch
+}
+
+fn pool_name(pool: ImplementationPool) -> &'static str {
+    match pool {
+        ImplementationPool::Dataflow => "dataflow",
+    }
 }
 
 async fn finish_transaction<T>(

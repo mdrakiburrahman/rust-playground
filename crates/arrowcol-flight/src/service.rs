@@ -16,7 +16,7 @@ use arrow_flight::{
 };
 use arrow_ipc::MessageHeader;
 use arrow_schema::{Schema, SchemaRef};
-use arrowcol_catalog::{CatalogStore, FlightSqlDdlHandler, SchemaValidator, SchemaVersion};
+use arrowcol_catalog::{CatalogStore, DdlParser, FlightSqlDdlHandler, SchemaValidator, SchemaVersion};
 use arrowcol_protocol::{
     CATALOG_METADATA_KEY, CLAIMED_SCHEMA_FINGERPRINT_METADATA_KEY, IMPLEMENTATION_POOL_METADATA_KEY,
     ImplementationPool, IngestMetadata, PROTOCOL_VERSION_METADATA_KEY, RawGrpcMetadata, SCHEMA_METADATA_KEY,
@@ -183,12 +183,21 @@ impl ArrowColFlightService {
         let first = next_message(&mut stream, deadline).await?;
         validate_message_size(&first, self.limits.max_message_bytes)?;
 
+        if first
+            .flight_descriptor
+            .as_ref()
+            .is_some_and(|descriptor| descriptor.r#type() == DescriptorType::Cmd)
+        {
+            return self
+                .execute_ddl(first, stream, deadline, permit, ingest_metadata.as_ref())
+                .await;
+        }
         match ingest_metadata {
             Some(ingest_metadata) => {
                 self.start_ingest(ingest_metadata, authentication, first, stream, deadline, permit)
                     .await
             }
-            None => self.execute_ddl(first, stream, deadline, permit).await,
+            None => self.execute_ddl(first, stream, deadline, permit, None).await,
         }
     }
 
@@ -284,6 +293,7 @@ impl ArrowColFlightService {
         mut stream: InboundFlightStream,
         deadline: Instant,
         _permit: DrainPermit,
+        routing: Option<&IngestMetadata>,
     ) -> RuntimeResult<Response<FlightResponseStream<PutResult>>> {
         let adapter = self.ddl.as_ref().ok_or_else(|| {
             RuntimeError::new(
@@ -293,6 +303,18 @@ impl ArrowColFlightService {
             )
         })?;
         let command = decode_ddl_command(&first)?;
+        if let Some(routing) = routing {
+            let parsed = DdlParser::default()
+                .parse(&command.query)
+                .map_err(|error| RuntimeError::from_catalog(&error))?;
+            if parsed.identity() != routing.table() {
+                return Err(RuntimeError::new(
+                    arrowcol_protocol::ErrorCode::RoutingMetadataInvalid,
+                    Code::InvalidArgument,
+                    "Flight SQL target does not match collector routing metadata",
+                ));
+            }
+        }
         match next_optional_message(&mut stream, deadline).await? {
             None => {}
             Some(data) => {

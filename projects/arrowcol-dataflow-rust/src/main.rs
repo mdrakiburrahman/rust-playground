@@ -60,11 +60,7 @@ fn finish_shutdown<E: std::fmt::Display>(
     close: impl FnOnce() -> Result<(), E>,
     terminal: impl FnOnce(bool) -> Result<(), String>,
 ) -> Result<(), String> {
-    let closed = if clean {
-        close().map_err(|error| error.to_string())
-    } else {
-        Ok(())
-    };
+    let closed = close().map_err(|error| error.to_string());
     let terminal = terminal(clean && closed.is_ok());
     let mut errors = Vec::new();
     if !clean {
@@ -121,16 +117,76 @@ mod tests {
     }
 
     #[test]
-    fn unclean_drain_records_failed_without_cleanly_closing_publisher() {
+    fn unclean_shutdown_attempts_publisher_close_before_recording_failed() {
+        let closed = Cell::new(false);
         let result = finish_shutdown(
             false,
-            || -> Result<(), String> { panic!("unclean drain must not close publishers as clean") },
+            || {
+                closed.set(true);
+                Ok::<_, String>(())
+            },
             |clean| {
+                assert!(closed.get());
                 assert!(!clean);
                 Ok(())
             },
         );
-        assert!(result.is_err());
+        assert_eq!(result, Err("engine startup or controller drain failed".to_owned()));
+    }
+
+    #[test]
+    fn unclean_shutdown_preserves_close_and_terminal_errors_and_original_engine_error() {
+        let result = finish_shutdown(
+            false,
+            || Err("outcome unknown; registration retained"),
+            |clean| {
+                assert!(!clean);
+                Err("SQL unavailable".to_owned())
+            },
+        );
+        assert_eq!(
+            result,
+            Err(concat!(
+                "engine startup or controller drain failed; ",
+                "publisher session close failed: outcome unknown; registration retained; ",
+                "terminal routing state failed: SQL unavailable"
+            )
+            .to_owned())
+        );
+        let engine_error: Box<dyn std::error::Error> = "IncompatiblePdataWiring".into();
+        let original = std::ptr::from_ref(engine_error.as_ref());
+        let Err(returned) = propagate(Err(engine_error), result.err()) else {
+            panic!("engine error must be preserved");
+        };
+        assert!(std::ptr::eq(original, std::ptr::from_ref(returned.as_ref())));
+    }
+
+    #[test]
+    fn repeated_failed_startups_invoke_owned_cleanup_without_sweeping_other_members() {
+        use arrow_deltalake::publisher::{MAX_PUBLISHERS, MemberState};
+        use std::collections::BTreeMap;
+
+        // The close callback models the publisher's guarded, owner-only metadata transaction.
+        let retained = BTreeMap::from([(0, MemberState::Active), (1, MemberState::Uncertain)]);
+        let mut members = retained.clone();
+        assert_eq!(MAX_PUBLISHERS, 16);
+        for owned in 2..(2 + MAX_PUBLISHERS * 2) {
+            assert!(members.len() < MAX_PUBLISHERS);
+            assert!(members.insert(owned, MemberState::Active).is_none());
+            let result = finish_shutdown(
+                false,
+                || {
+                    assert_eq!(members.remove(&owned), Some(MemberState::Active));
+                    Ok::<_, String>(())
+                },
+                |clean| {
+                    assert!(!clean);
+                    Ok(())
+                },
+            );
+            assert_eq!(result, Err("engine startup or controller drain failed".to_owned()));
+            assert_eq!(members, retained);
+        }
     }
 
     #[test]

@@ -46,6 +46,7 @@ pub struct SendManifestEntry {
     pub arrow_bytes: u64,
     pub payload_sha256: String,
     pub row_sha256: String,
+    pub row_hashes: Vec<(String, u64)>,
     pub lane: usize,
     pub pool: String,
     pub attempt: u32,
@@ -173,7 +174,7 @@ pub fn run_metadata(run_id: &str, arguments: &RunArgs, schema_contract_sha256: &
             "max_attempts": arguments.max_attempts,
             "retry_window_seconds": arguments.retry_window.map(|window| window.get().as_secs()),
             "quiver": arguments.quiver,
-            "scheduler": "single global atomic ordinal; seed-rotated equal round-robin across all 13 tables",
+            "scheduler": "single global atomic ordinal; seed-rotated equal round-robin across all configured tables",
             "dataflow_delivery": if arguments.quiver {
                 "durable admission: Quiver WAL fsync before completion; replayed after a crash (at least once)"
             } else {
@@ -249,6 +250,7 @@ mod tests {
                 arrow_bytes: 128,
                 payload_sha256: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
                 row_sha256: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_owned(),
+                row_hashes: vec![],
                 lane: 0,
                 pool: "dataflow".to_owned(),
                 attempt: 1,

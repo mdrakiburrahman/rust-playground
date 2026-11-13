@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use arrowcol_routing::{PressurePolicy, RoutingPolicy};
 use clap::Parser;
 use serde::Deserialize;
@@ -101,6 +101,10 @@ impl RouterConfig {
             "authentication time bounds must be positive"
         );
         ensure!(
+            (1..=1_048_576).contains(&self.auth.edge_replay_max_nonces),
+            "auth.edge_replay_max_nonces must be between 1 and 1048576"
+        );
+        ensure!(
             self.auth.edge_secret_file != self.auth.internal_signing_secret_file,
             "edge and internal signing secrets must use different files"
         );
@@ -116,10 +120,6 @@ impl RouterConfig {
                 && self.server.h2.connection_window_bytes >= self.server.h2.stream_window_bytes,
             "downstream H2 stream/window bounds are invalid"
         );
-        match self.auth.authenticator.as_str() {
-            "allow_all" => {}
-            unsupported => bail!("unsupported auth.authenticator {unsupported:?}"),
-        }
         Ok(())
     }
 }
@@ -202,8 +202,17 @@ pub struct RoutingConfig {
     pub minimum_warmup_bps: u16,
     /// Routing lease duration.
     pub lease_ttl_ms: u64,
+    /// Maximum lifetime of an immutable OAT run/table owner binding.
+    #[serde(default = "default_oat_run_pin_ttl_ms")]
+    pub oat_run_pin_ttl_ms: u64,
+    /// Exact run ID authorized to create OAT pins in this run-scoped router.
+    #[serde(default)]
+    pub oat_run_id: Option<String>,
     /// Maximum cache age reported ready.
     pub readiness_max_staleness_ms: u64,
+    /// Require each active table lease in a pool to have a distinct collector.
+    #[serde(default)]
+    pub distinct_table_owners: bool,
 }
 
 impl RoutingConfig {
@@ -224,9 +233,24 @@ impl RoutingConfig {
             warmup_ms: self.warmup_ms,
             minimum_warmup_bps: self.minimum_warmup_bps,
             lease_ttl_ms: self.lease_ttl_ms,
+            oat_run_pin_ttl_ms: self.oat_run_pin_ttl_ms,
             readiness_max_staleness_ms: self.readiness_max_staleness_ms,
+            distinct_table_owners: self.distinct_table_owners,
+            oat_run_id: self.oat_run_id.clone(),
         })
     }
+}
+
+fn default_oat_run_pin_ttl_ms() -> u64 {
+    3_600_000
+}
+
+/// Explicit authentication mode; no production identity provider is implemented.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthenticatorMode {
+    /// Grants a shared principal after edge verification, for development only.
+    DevOnlyAllowAll,
 }
 
 /// Authentication and signed internal identity configuration.
@@ -234,15 +258,22 @@ impl RoutingConfig {
 #[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     /// Pluggable authenticator name.
-    pub authenticator: String,
+    pub authenticator: AuthenticatorMode,
     /// Secret used by the trusted external TLS terminator.
     pub edge_secret_file: PathBuf,
     /// Separate secret used to sign internal principal metadata.
     pub internal_signing_secret_file: PathBuf,
     /// Maximum edge assertion age.
     pub edge_signature_max_age_ms: u64,
+    /// Maximum live verified edge nonces retained per router process.
+    #[serde(default = "default_edge_replay_max_nonces")]
+    pub edge_replay_max_nonces: usize,
     /// Internal identity validity interval.
     pub internal_identity_ttl_ms: u64,
+}
+
+fn default_edge_replay_max_nonces() -> usize {
+    65_536
 }
 
 /// Upstream HTTP/2 transport and connection reuse configuration.
@@ -277,4 +308,22 @@ pub struct TelemetryConfig {
     pub log_filter: String,
     /// Emit JSON log records.
     pub json_logs: bool,
+}
+
+#[cfg(test)]
+mod routing_policy_tests {
+    use super::{RouterConfig, RoutingConfig};
+
+    #[test]
+    fn distinct_table_owners_is_opt_in_and_disabled_for_single_collector_loadtest() {
+        let defaults = RouterConfig::from_yaml(include_bytes!("../config.yaml"))
+            .unwrap_or_else(|error| panic!("parse default router configuration: {error}"));
+        assert!(!defaults.routing.distinct_table_owners);
+
+        let loadtest: serde_yaml::Value = serde_yaml::from_slice(include_bytes!("../../loadtest/config/router.yaml"))
+            .unwrap_or_else(|error| panic!("parse loadtest router configuration: {error}"));
+        let routing: RoutingConfig = serde_yaml::from_value(loadtest["routing"].clone())
+            .unwrap_or_else(|error| panic!("parse loadtest routing policy: {error}"));
+        assert!(!routing.distinct_table_owners);
+    }
 }

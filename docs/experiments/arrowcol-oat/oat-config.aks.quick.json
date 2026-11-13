@@ -1,0 +1,45 @@
+{
+  "platform": {
+    "kind": "aks",
+    "kustomize_overlay": null,
+    "runtime_config_file": "out/arrowcol-oat/runtime.json",
+    "bootstrap_env_file": "out/arrowcol-oat/bootstrap.env"
+  },
+  "stamp": "00000",
+  "warmup_seconds": 0,
+  "measure_seconds": 1,
+  "client_ready_timeout_seconds": 600,
+  "run_pin_ttl_ms": 3600000,
+  "pilot_mode": false,
+  "namespace": "arrow-collector",
+  "kubectl_context": "arrow-collector-00000",
+  "arrowcol_deployment": "arrowcol",
+  "arrowcol_container": "dataflow",
+  "dfe_deployment": "arrowcol",
+  "dfe_container": "dataflow",
+  "arrowcol_pod_selector": "app=arrowcol",
+  "dfe_pod_selector": "app=arrowcol",
+  "arrowcol_endpoint": "http://arrowcol-router.arrow-collector.svc.cluster.local:50050",
+  "router_metrics_endpoint": "http://arrowcol-router.arrow-collector.svc.cluster.local:15050/metrics",
+  "dmv_client_binary": "target/debug/arrowcol-dmv",
+  "dmv_client_image": "",
+  "edge_secret_file": "/run/secrets/edge-hmac",
+  "edge_secret_name": "arrowcol-router-auth",
+  "tables": [
+    "sqlserver_active_sessions"
+  ],
+  "rows_per_table": 1000,
+  "clients_per_table": 1,
+  "dmv_concurrency": 1,
+  "qap_endpoint": "https://arrow-collector-00000.canadacentral.kusto.windows.net",
+  "qap_database": null,
+  "qap_timeout_seconds": 60,
+  "replica_counts": [
+    1
+  ],
+  "dfe_worker_concurrency": [
+    1
+  ],
+  "result_url": "abfss://experiments@arrowcollector00000.dfs.core.windows.net/arrowcol-oat/results.parquet",
+  "website_url": "abfss://$web@arrowcollector00000.dfs.core.windows.net/results.parquet"
+}

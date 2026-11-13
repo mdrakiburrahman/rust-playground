@@ -75,12 +75,40 @@ x-arrowcol-edge-signature
 ```
 
 The signature is HMAC-SHA256 over the timestamp, nonce, method, path, content
-type, routing metadata, and control metadata. Assertions are time-bounded and
+type, routing metadata (including `x-arrowcol-oat-run-id`), and control metadata.
+Router and edge-signing clients must be upgraded together when this signed
+header set changes, including requests without an OAT run ID.
+Assertions are time-bounded and
 nonces are replay-protected in process. Direct traffic, tampering, replay, and
 externally supplied `x-arrowcol-internal-auth-*` headers are rejected.
 
-The current pluggable authenticator is `allow_all`. After authentication the
-router strips edge proof and signs a bounded serialized `AuthContext` for the
+Replay memory defaults to 65,536 nonces per router process; configure
+`auth.edge_replay_max_nonces` from 1 to 1,048,576 before a higher-rate run.
+Expired assertions
+are removed before admission; a full cache rejects new assertions with gRPC
+`RESOURCE_EXHAUSTED` rather than growing or evicting live nonces. Nonces remain
+protected through the assertion's last valid millisecond, including accepted
+future clock skew. Only successfully verified signatures consume capacity.
+For peak signed-request rate R per router replica, size capacity above
+`R * (2 * age_seconds + 1)`, including future skew, bursts and all control requests.
+With the defaults, the conservative window is `2 * 30 + 1 = 61` seconds and the
+whole-number peak is `floor(65,536 / 61) = 1,074` signed requests/s per router
+replica, before reserving additional burst headroom. The extra second covers the
+inclusive expiry boundary: an assertion expires only when its expiry is strictly
+less than the current time. E4's 128 clients are not a request-rate bound.
+Measure the peak per-replica signed-request rate before qualification and increase
+capacity or bound the edge rate; do not treat capacity rejection as throughput.
+Replay protection is process-local, not shared across replicas.
+
+Startup requires an explicit `auth.authenticator: dev_only_allow_all`. Missing,
+legacy `allow_all`, and unknown modes are rejected before listeners start.
+This development-only mode grants the same principal to every **edge-verified**
+request; it never bypasses the mandatory edge HMAC. Checked-in local, Compose,
+image-smoke and generated Kubernetes OAT configurations explicitly select it.
+These are development/qualification deployments, not production identity
+authentication. No production authenticator is implemented.
+
+After authentication the router strips edge proof and signs a bounded serialized `AuthContext` for the
 collector:
 
 ```text

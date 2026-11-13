@@ -9,13 +9,16 @@ use tokio::sync::Mutex;
 use crate::{
     CollectorRecord, CollectorRegistration, CollectorState, LeaseCas, LeaseClaim, LeaseState, LeaseSuccession,
     LeaseTransfer, RichPressureSnapshot, RoutingError, RoutingErrorKind, RoutingLease, RoutingResult, RoutingStore,
-    RoutingView,
+    RoutingView, RunTablePin,
 };
 
 #[derive(Default)]
 struct MemoryState {
     collectors: BTreeMap<CollectorInstanceId, CollectorRecord>,
     leases: BTreeMap<crate::LeaseKey, RoutingLease>,
+    run_pin_sets: BTreeMap<String, (Vec<crate::LeaseKey>, UnixMillis)>,
+    run_pin_markers: BTreeMap<(String, crate::LeaseKey), bool>,
+    run_table_pins: BTreeMap<(String, crate::LeaseKey), RunTablePin>,
 }
 
 /// Operation counts used to prove request-path cache behavior.
@@ -25,6 +28,8 @@ pub struct MemoryOperationCounts {
     pub load_view: u64,
     /// Lease claims.
     pub claim_lease: u64,
+    /// Initial run-table owner binding attempts.
+    pub bind_initial_run_table_pin: u64,
     /// Drain compare-and-set operations.
     pub begin_drain: u64,
     /// Transfer compare-and-set operations.
@@ -40,6 +45,7 @@ pub struct MemoryRoutingStore {
     available: Arc<AtomicBool>,
     load_view: Arc<AtomicU64>,
     claim_lease: Arc<AtomicU64>,
+    bind_initial_run_table_pin: Arc<AtomicU64>,
     begin_drain: Arc<AtomicU64>,
     transfer: Arc<AtomicU64>,
     succession: Arc<AtomicU64>,
@@ -52,6 +58,7 @@ impl Default for MemoryRoutingStore {
             available: Arc::new(AtomicBool::new(true)),
             load_view: Arc::new(AtomicU64::new(0)),
             claim_lease: Arc::new(AtomicU64::new(0)),
+            bind_initial_run_table_pin: Arc::new(AtomicU64::new(0)),
             begin_drain: Arc::new(AtomicU64::new(0)),
             transfer: Arc::new(AtomicU64::new(0)),
             succession: Arc::new(AtomicU64::new(0)),
@@ -73,6 +80,7 @@ impl MemoryRoutingStore {
         MemoryOperationCounts {
             load_view: self.load_view.load(Ordering::Relaxed),
             claim_lease: self.claim_lease.load(Ordering::Relaxed),
+            bind_initial_run_table_pin: self.bind_initial_run_table_pin.load(Ordering::Relaxed),
             begin_drain: self.begin_drain.load(Ordering::Relaxed),
             transfer: self.transfer.load(Ordering::Relaxed),
             succession: self.succession.load(Ordering::Relaxed),
@@ -88,6 +96,17 @@ impl MemoryRoutingStore {
         lease.validate()?;
         self.state.lock().await.leases.insert(lease.key.clone(), lease);
         Ok(())
+    }
+
+    /// Removes only the owner row to model authority-row loss in fail-closed tests.
+    #[doc(hidden)]
+    pub async fn remove_run_table_pin_for_test(&self, run_id: &str, key: &crate::LeaseKey) -> bool {
+        self.state
+            .lock()
+            .await
+            .run_table_pins
+            .remove(&(run_id.to_owned(), key.clone()))
+            .is_some()
     }
 }
 
@@ -230,7 +249,16 @@ impl RoutingStore for MemoryRoutingStore {
         if let Some(existing) = state.leases.get(&claim.key)
             && existing.is_valid_at(claim.now_unix_ms)
         {
+            if claim.distinct_table_owners {
+                validate_distinct_table_owner(&state, &claim.key, existing.holder_instance_id, claim.now_unix_ms)?;
+            }
             return Ok(existing.clone());
+        }
+        if has_active_run_pin(&state, &claim.key, claim.now_unix_ms) {
+            return Err(RoutingError::new(
+                RoutingErrorKind::Conflict,
+                "expired table lease is protected by an active immutable OAT run pin",
+            ));
         }
         validate_candidate(
             &state,
@@ -238,6 +266,9 @@ impl RoutingStore for MemoryRoutingStore {
             claim.key.implementation_pool,
             claim.minimum_snapshot_at_unix_ms,
         )?;
+        if claim.distinct_table_owners {
+            validate_distinct_table_owner(&state, &claim.key, claim.candidate_instance_id, claim.now_unix_ms)?;
+        }
         let (epoch, version) = state.leases.get(&claim.key).map_or((1, 1), |existing| {
             (
                 existing.fencing_epoch.get().saturating_add(1),
@@ -266,10 +297,177 @@ impl RoutingStore for MemoryRoutingStore {
         Ok(lease)
     }
 
+    async fn initialize_run_table_set(
+        &self,
+        run_id: &str,
+        expected: &[crate::LeaseKey],
+        expires_at: UnixMillis,
+        now: UnixMillis,
+    ) -> RoutingResult<()> {
+        self.ensure_available()?;
+        if uuid::Uuid::parse_str(run_id).is_err()
+            || expires_at <= now
+            || expected.is_empty()
+            || expected.len() > 32
+            || expected.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(RoutingError::new(
+                RoutingErrorKind::InvalidConfiguration,
+                "OAT run pin set requires a UUID, future expiry, and 1..=32 sorted unique table keys",
+            ));
+        }
+        let mut state = self.state.lock().await;
+        if let Some((existing, existing_expiry)) = state.run_pin_sets.get(run_id) {
+            let marker_keys = state
+                .run_pin_markers
+                .keys()
+                .filter(|(candidate_run, _)| candidate_run == run_id)
+                .map(|(_, key)| key.clone())
+                .collect::<Vec<_>>();
+            let pin_keys = state
+                .run_table_pins
+                .keys()
+                .filter(|(candidate_run, _)| candidate_run == run_id)
+                .map(|(_, key)| key.clone())
+                .collect::<Vec<_>>();
+            if *existing_expiry <= now
+                || *existing_expiry != expires_at
+                || existing != expected
+                || marker_keys.as_slice() != existing.as_slice()
+                || pin_keys.iter().any(|key| !existing.contains(key))
+            {
+                return Err(RoutingError::new(
+                    RoutingErrorKind::Conflict,
+                    "immutable OAT run pin set is expired, incomplete, or different from its original identity set",
+                ));
+            }
+            return Ok(());
+        }
+        state
+            .run_pin_sets
+            .insert(run_id.to_owned(), (expected.to_vec(), expires_at));
+        for key in expected {
+            state.run_pin_markers.insert((run_id.to_owned(), key.clone()), false);
+        }
+        Ok(())
+    }
+
+    async fn get_run_table_pin(
+        &self,
+        run_id: &str,
+        key: &crate::LeaseKey,
+        now: UnixMillis,
+    ) -> RoutingResult<Option<RunTablePin>> {
+        self.ensure_available()?;
+        let state = self.state.lock().await;
+        let (expected, expiry) = state
+            .run_pin_sets
+            .get(run_id)
+            .ok_or_else(|| RoutingError::new(RoutingErrorKind::Conflict, "immutable OAT run pin set is missing"))?;
+        if *expiry <= now || !expected.contains(key) {
+            return Err(RoutingError::new(
+                RoutingErrorKind::Conflict,
+                "immutable OAT run pin set is expired or does not include this table",
+            ));
+        }
+        let marker = state
+            .run_pin_markers
+            .get(&(run_id.to_owned(), key.clone()))
+            .ok_or_else(|| {
+                RoutingError::new(
+                    RoutingErrorKind::CorruptState,
+                    "OAT table initialization marker is missing",
+                )
+            })?;
+        let pin = state.run_table_pins.get(&(run_id.to_owned(), key.clone()));
+        match (*marker, pin) {
+            (false, None) => return Ok(None),
+            (false, Some(_)) => {
+                return Err(RoutingError::new(
+                    RoutingErrorKind::CorruptState,
+                    "pending OAT table marker unexpectedly has an owner binding",
+                ));
+            }
+            (true, None) => {
+                return Err(RoutingError::new(
+                    RoutingErrorKind::CorruptState,
+                    "bound OAT table marker is missing its immutable owner",
+                ));
+            }
+            (true, Some(pin)) => {
+                let pin = pin.clone();
+                validate_run_pin_against_lease(&state, &pin, now)?;
+                return Ok(Some(pin));
+            }
+        }
+    }
+
+    async fn bind_initial_run_table_pin(&self, pin: &RunTablePin, now: UnixMillis) -> RoutingResult<RunTablePin> {
+        self.bind_initial_run_table_pin.fetch_add(1, Ordering::Relaxed);
+        self.ensure_available()?;
+        pin.validate(now)?;
+        let mut state = self.state.lock().await;
+        let (expected, expiry) = state
+            .run_pin_sets
+            .get(&pin.run_id)
+            .ok_or_else(|| RoutingError::new(RoutingErrorKind::Conflict, "immutable OAT run pin set is missing"))?;
+        if *expiry <= now || *expiry != pin.expires_at_unix_ms || !expected.contains(&pin.key) {
+            return Err(RoutingError::new(
+                RoutingErrorKind::Conflict,
+                "OAT pin does not match a live immutable run/table initialization marker",
+            ));
+        }
+        let marker_key = (pin.run_id.clone(), pin.key.clone());
+        let marker = state.run_pin_markers.get(&marker_key).copied().ok_or_else(|| {
+            RoutingError::new(
+                RoutingErrorKind::CorruptState,
+                "OAT table initialization marker is missing",
+            )
+        })?;
+        if marker {
+            let existing = state.run_table_pins.get(&marker_key).ok_or_else(|| {
+                RoutingError::new(
+                    RoutingErrorKind::CorruptState,
+                    "bound OAT table marker is missing its owner",
+                )
+            })?;
+            if !same_run_pin(existing, pin) {
+                return Err(RoutingError::new(
+                    RoutingErrorKind::Conflict,
+                    "immutable OAT run-table pin already exists with a different owner",
+                ));
+            }
+            validate_run_pin_against_lease(&state, existing, now)?;
+            return Ok(existing.clone());
+        }
+        if state.run_table_pins.contains_key(&marker_key) {
+            return Err(RoutingError::new(
+                RoutingErrorKind::CorruptState,
+                "pending OAT table marker unexpectedly has an owner binding",
+            ));
+        }
+        validate_run_pin_against_lease(&state, pin, now)?;
+        state.run_table_pins.insert(marker_key.clone(), pin.clone());
+        state.run_pin_markers.insert(marker_key, true);
+        Ok(pin.clone())
+    }
+
+    async fn has_active_run_table_pin(&self, key: &crate::LeaseKey, now: UnixMillis) -> RoutingResult<bool> {
+        self.ensure_available()?;
+        let state = self.state.lock().await;
+        Ok(has_active_run_pin(&state, key, now))
+    }
+
     async fn begin_lease_drain(&self, request: &LeaseCas) -> RoutingResult<RoutingLease> {
         self.begin_drain.fetch_add(1, Ordering::Relaxed);
         self.ensure_available()?;
         let mut state = self.state.lock().await;
+        if has_active_run_pin(&state, &request.key, request.now_unix_ms) {
+            return Err(RoutingError::new(
+                RoutingErrorKind::Conflict,
+                "table lease is protected by an active immutable OAT run pin",
+            ));
+        }
         let existing = state
             .leases
             .get_mut(&request.key)
@@ -295,6 +493,12 @@ impl RoutingStore for MemoryRoutingStore {
         self.transfer.fetch_add(1, Ordering::Relaxed);
         self.ensure_available()?;
         let mut state = self.state.lock().await;
+        if has_active_run_pin(&state, &request.key, request.now_unix_ms) {
+            return Err(RoutingError::new(
+                RoutingErrorKind::Conflict,
+                "table lease is protected by an active immutable OAT run pin",
+            ));
+        }
         let existing = state
             .leases
             .get(&request.key)
@@ -311,6 +515,9 @@ impl RoutingStore for MemoryRoutingStore {
             request.key.implementation_pool,
             request.minimum_snapshot_at_unix_ms,
         )?;
+        if request.distinct_table_owners {
+            validate_distinct_table_owner(&state, &request.key, request.candidate_instance_id, request.now_unix_ms)?;
+        }
         let existing = state
             .leases
             .get_mut(&request.key)
@@ -342,6 +549,12 @@ impl RoutingStore for MemoryRoutingStore {
         self.ensure_available()?;
         request.validate()?;
         let mut state = self.state.lock().await;
+        if has_active_run_pin(&state, &request.key, request.now_unix_ms) {
+            return Err(RoutingError::new(
+                RoutingErrorKind::Conflict,
+                "table lease is protected by an active immutable OAT run pin",
+            ));
+        }
         let existing = state
             .leases
             .get(&request.key)
@@ -356,6 +569,9 @@ impl RoutingStore for MemoryRoutingStore {
             ));
         }
         validate_successor(&state, request)?;
+        if request.distinct_table_owners {
+            validate_distinct_table_owner(&state, &request.key, request.successor_instance_id, request.now_unix_ms)?;
+        }
         let lease = RoutingLease {
             key: request.key.clone(),
             lease_id: LeaseId::new(),
@@ -392,6 +608,69 @@ impl MemoryRoutingStore {
             ))
         }
     }
+}
+
+fn has_active_run_pin(state: &MemoryState, key: &crate::LeaseKey, now: UnixMillis) -> bool {
+    state
+        .run_table_pins
+        .values()
+        .any(|pin| pin.key == *key && pin.expires_at_unix_ms > now)
+}
+
+fn validate_run_pin_against_lease(state: &MemoryState, pin: &RunTablePin, now: UnixMillis) -> RoutingResult<()> {
+    pin.validate(now)?;
+    let lease = state
+        .leases
+        .get(&pin.key)
+        .ok_or_else(|| RoutingError::new(RoutingErrorKind::Conflict, "pinned routing lease is missing"))?;
+    let collector = state.collectors.get(&pin.holder_instance_id).ok_or_else(|| {
+        RoutingError::new(
+            RoutingErrorKind::Conflict,
+            "pinned collector process registration is missing",
+        )
+    })?;
+    if !lease.is_routable_at(now)
+        || lease.holder_instance_id != pin.holder_instance_id
+        || lease.lease_id != pin.lease_id
+        || lease.fencing_epoch != pin.fencing_epoch
+        || collector.registration.implementation_pool != pin.key.implementation_pool
+        || !collector.registration.is_live_at(now)
+        || collector.state != CollectorState::Ready
+    {
+        return Err(RoutingError::new(
+            RoutingErrorKind::Conflict,
+            "pinned table owner, lease epoch, or collector process lifetime changed or expired",
+        ));
+    }
+    Ok(())
+}
+
+fn same_run_pin(existing: &RunTablePin, requested: &RunTablePin) -> bool {
+    existing.run_id == requested.run_id
+        && existing.key == requested.key
+        && existing.holder_instance_id == requested.holder_instance_id
+        && existing.lease_id == requested.lease_id
+        && existing.fencing_epoch == requested.fencing_epoch
+}
+
+fn validate_distinct_table_owner(
+    state: &MemoryState,
+    key: &crate::LeaseKey,
+    candidate: CollectorInstanceId,
+    now: UnixMillis,
+) -> RoutingResult<()> {
+    if state.leases.values().any(|lease| {
+        lease.key.implementation_pool == key.implementation_pool
+            && lease.key != *key
+            && lease.holder_instance_id == candidate
+            && lease.is_routable_at(now)
+    }) {
+        return Err(RoutingError::new(
+            RoutingErrorKind::Conflict,
+            "collector already owns another active table lease in distinct table-owner mode",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_candidate(

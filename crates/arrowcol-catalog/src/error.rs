@@ -138,12 +138,39 @@ impl CatalogErrorCode {
     }
 }
 
+/// Origin of a catalog failure, for safe internal diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CatalogErrorOrigin {
+    /// Failure constructed by the local catalog service.
+    LocalCatalog,
+    /// Failure detected by the remote catalog client before receiving a gRPC status.
+    RemoteClient,
+    /// Failure mapped from a remote catalog gRPC status.
+    RemoteGrpc,
+}
+
+impl CatalogErrorOrigin {
+    /// Stable diagnostic value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalCatalog => "local_catalog",
+            Self::RemoteClient => "remote_client",
+            Self::RemoteGrpc => "remote_grpc",
+        }
+    }
+}
+
 /// Structured catalog failure with a stable protocol mapping.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 #[error("{code}: {message}")]
 pub struct CatalogError {
     code: CatalogErrorCode,
     message: String,
+    origin: CatalogErrorOrigin,
+    operation: Option<&'static str>,
+    grpc_status: Option<&'static str>,
+    failure_id: Option<&'static str>,
 }
 
 impl CatalogError {
@@ -153,13 +180,62 @@ impl CatalogError {
         Self {
             code,
             message: message.into(),
+            origin: CatalogErrorOrigin::LocalCatalog,
+            operation: None,
+            grpc_status: None,
+            failure_id: None,
         }
+    }
+
+    /// Sets the safe internal origin for this failure.
+    #[must_use]
+    pub const fn with_origin(mut self, origin: CatalogErrorOrigin) -> Self {
+        self.origin = origin;
+        self
+    }
+
+    /// Adds safe, static diagnostic context.
+    #[must_use]
+    pub const fn with_diagnostic_context(
+        mut self,
+        operation: &'static str,
+        grpc_status: Option<&'static str>,
+        failure_id: Option<&'static str>,
+    ) -> Self {
+        self.operation = Some(operation);
+        self.grpc_status = grpc_status;
+        self.failure_id = failure_id;
+        self
     }
 
     /// Returns the stable detailed catalog code.
     #[must_use]
     pub const fn code(&self) -> CatalogErrorCode {
         self.code
+    }
+
+    /// Returns the failure origin.
+    #[must_use]
+    pub const fn origin(&self) -> CatalogErrorOrigin {
+        self.origin
+    }
+
+    /// Returns the static operation associated with this failure.
+    #[must_use]
+    pub const fn operation(&self) -> Option<&'static str> {
+        self.operation
+    }
+
+    /// Returns the static gRPC status name, when the failure came from gRPC.
+    #[must_use]
+    pub const fn grpc_status(&self) -> Option<&'static str> {
+        self.grpc_status
+    }
+
+    /// Returns the static local failure identifier, when available.
+    #[must_use]
+    pub const fn failure_id(&self) -> Option<&'static str> {
+        self.failure_id
     }
 
     /// Returns the safe human-readable explanation.
