@@ -106,30 +106,28 @@ async fn main() -> Result<()> {
         if current_unix_ms >= run_start_unix_ms {
             anyhow::bail!("client missed the shared OAT run start time");
         }
-        let run_start_delay = Duration::from_millis(run_start_unix_ms - current_unix_ms);
-        let warmup = Duration::from_secs(args.warmup_secs);
-        let measure = Duration::from_secs(args.duration_secs);
-        let run_started = Instant::now()
-            .checked_add(run_start_delay)
-            .ok_or_else(|| anyhow::anyhow!("shared run start deadline is out of range"))?;
-        tokio::time::sleep_until(run_started).await;
-        let measured_at = run_started
-            .checked_add(warmup)
-            .ok_or_else(|| anyhow::anyhow!("warm-up deadline is out of range"))?;
-        let deadline = measured_at
-            .checked_add(measure)
-            .ok_or_else(|| anyhow::anyhow!("measurement deadline is out of range"))?;
-        admission_accounting_complete = !warmup_until(measured_at, &send).await?;
-        let measurement_started_unix_ms = unix_time_ms()?;
         let measurement_window_start_unix_ms = run_start_unix_ms
             .checked_add(args.warmup_secs.saturating_mul(1_000))
             .ok_or_else(|| anyhow::anyhow!("shared measurement start timestamp overflow"))?;
         let measurement_window_end_unix_ms = measurement_window_start_unix_ms
             .checked_add(args.duration_secs.saturating_mul(1_000))
             .ok_or_else(|| anyhow::anyhow!("shared measurement end timestamp overflow"))?;
-        if measurement_started_unix_ms.abs_diff(measurement_window_start_unix_ms) > 1_000 {
-            anyhow::bail!("client did not start within 1 second of the shared measurement interval");
+        wait_until_unix_ms(run_start_unix_ms, unix_time_ms).await?;
+        admission_accounting_complete = !warmup_until(measurement_window_start_unix_ms, &send).await?;
+        let measurement_started_unix_ms = unix_time_ms()?;
+        if measurement_started_unix_ms.abs_diff(measurement_window_start_unix_ms) > 250 {
+            anyhow::bail!(
+                "client did not start within 250ms of the shared measurement interval: expected={measurement_window_start_unix_ms}, actual={measurement_started_unix_ms}"
+            );
         }
+        let measured_at = Instant::now()
+            .checked_sub(Duration::from_millis(
+                measurement_started_unix_ms.saturating_sub(measurement_window_start_unix_ms),
+            ))
+            .ok_or_else(|| anyhow::anyhow!("measurement start is out of range"))?;
+        let deadline = measured_at
+            .checked_add(Duration::from_secs(args.duration_secs))
+            .ok_or_else(|| anyhow::anyhow!("measurement deadline is out of range"))?;
         let mut measured_rows = 0_u64;
         let mut pilot_window_rows = 0_u64;
         let mut pilot_window_index = 0_u64;
@@ -282,37 +280,70 @@ fn unix_time_ms() -> Result<u64> {
     )?)
 }
 
+async fn wait_until_unix_ms(deadline: u64, mut now: impl FnMut() -> Result<u64>) -> Result<()> {
+    loop {
+        let current = now()?;
+        if current >= deadline {
+            return Ok(());
+        }
+        // A shared Unix deadline must track wall-clock corrections during the schedule lead and warm-up.
+        tokio::time::sleep(Duration::from_millis((deadline - current).min(100))).await;
+    }
+}
+
 /// Reports whether the boundary cancelled an upload, leaving admission counts incomplete.
-async fn warmup_until<F, Fut>(measured_at: Instant, mut send: F) -> Result<bool>
+async fn warmup_until<F, Fut>(measurement_start_unix_ms: u64, mut send: F) -> Result<bool>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<usize>>,
 {
     loop {
-        if Instant::now() >= measured_at {
+        if unix_time_ms()? >= measurement_start_unix_ms {
             return Ok(false);
         }
         tokio::select! {
             biased;
             result = send() => {
                 result?;
-                if Instant::now() >= measured_at {
+                if unix_time_ms()? >= measurement_start_unix_ms {
                     return Ok(false);
                 }
             }
             // Dropping this owned DoPut future cancels the streams; no upload is detached.
-            _ = tokio::time::sleep_until(measured_at) => return Ok(true),
+            result = wait_until_unix_ms(measurement_start_unix_ms, unix_time_ms) => {
+                result?;
+                return Ok(true);
+            },
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_SCHEDULE_TIMEOUT_SECS, stable_window_horizon, validate_schedule_timeout, warmup_until};
+    use super::{
+        MAX_SCHEDULE_TIMEOUT_SECS, stable_window_horizon, unix_time_ms, validate_schedule_timeout, wait_until_unix_ms,
+        warmup_until,
+    };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
-    use tokio::time::Instant;
+
+    #[tokio::test]
+    async fn shared_start_wait_rechecks_backward_clock_steps() -> anyhow::Result<()> {
+        let mut times = [1_000, 900, 1_002].into_iter();
+        wait_until_unix_ms(1_002, || times.next().ok_or_else(|| anyhow::anyhow!("clock exhausted"))).await?;
+        assert!(
+            times.next().is_none(),
+            "must not start while the corrected wall clock is still early"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shared_start_wait_propagates_clock_failures() {
+        let result = wait_until_unix_ms(1_002, || anyhow::bail!("clock unavailable")).await;
+        assert!(matches!(result, Err(error) if error.to_string() == "clock unavailable"));
+    }
 
     #[test]
     fn later_throughput_collapse_invalidates_the_stable_hint() {
@@ -348,7 +379,7 @@ mod tests {
         let completed = Arc::new(AtomicBool::new(false));
         let observed_streams = Arc::new(AtomicUsize::new(0));
         let reported_streams = Arc::new(AtomicUsize::new(0));
-        let deadline = Instant::now() + Duration::from_millis(40);
+        let deadline = unix_time_ms()? + 40;
         let cancelled_upload = warmup_until(deadline, {
             let started = Arc::clone(&started);
             let cancelled = Arc::clone(&cancelled);
@@ -392,7 +423,7 @@ mod tests {
     #[tokio::test]
     async fn warmup_runs_completed_sends_until_the_boundary() -> anyhow::Result<()> {
         let sends = Arc::new(AtomicUsize::new(0));
-        let deadline = Instant::now() + Duration::from_millis(60);
+        let deadline = unix_time_ms()? + 60;
         warmup_until(deadline, {
             let sends = Arc::clone(&sends);
             move || {
@@ -412,7 +443,7 @@ mod tests {
 
     #[tokio::test]
     async fn warmup_propagates_send_errors() -> anyhow::Result<()> {
-        let error = match warmup_until(Instant::now() + Duration::from_secs(1), || async {
+        let error = match warmup_until(unix_time_ms()? + 1_000, || async {
             anyhow::bail!("warm-up upload failed");
         })
         .await
@@ -428,7 +459,7 @@ mod tests {
     #[tokio::test]
     async fn zero_warmup_does_not_start_a_send() -> anyhow::Result<()> {
         let sends = Arc::new(AtomicUsize::new(0));
-        warmup_until(Instant::now(), {
+        warmup_until(unix_time_ms()?, {
             let sends = Arc::clone(&sends);
             move || {
                 sends.fetch_add(1, Ordering::SeqCst);

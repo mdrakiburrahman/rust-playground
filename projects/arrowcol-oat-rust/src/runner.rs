@@ -1978,6 +1978,7 @@ async fn run_matrix_cell(
     let mut qap = QapMetrics::default();
     let mut metrics = None;
     if pinning_ok {
+        local_progress(config, "clients finished; observing Kusto QAP and sampling resources");
         let observation = async {
             qap = observe_qap(
                 &platform.qap_endpoint(config),
@@ -2266,6 +2267,13 @@ async fn run_clients_inner(
     pinning: &mut PinningReport,
 ) -> Result<ClientRun> {
     let timing_budget = config.timing_budget()?;
+    local_progress(
+        config,
+        &format!(
+            "starting clients and waiting for DMV preflight (timeout {}s)",
+            config.client_ready_timeout_seconds
+        ),
+    );
     platform.ensure_router_metrics_endpoint(config).await?;
     let metrics_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -2361,6 +2369,13 @@ async fn run_clients_inner(
     }
 
     // Delta metadata is committed during preflight, so QAP binding must precede arming.
+    local_progress(
+        config,
+        &format!(
+            "clients ready; initializing Kusto QAP (timeout {}s)",
+            config.qap_timeout_seconds
+        ),
+    );
     let qap_result = tokio::time::timeout(
         Duration::from_secs(config.qap_timeout_seconds),
         platform.initialize_qap(config, project_run_id, tables),
@@ -2399,6 +2414,15 @@ async fn run_clients_inner(
             ))),
         };
     }
+    local_progress(
+        config,
+        &format!(
+            "clients armed; schedule lead {}s, warm-up {}s, measurement {}s",
+            crate::config::SCHEDULE_DELIVERY_TIMEOUT_SECONDS,
+            config.warmup_seconds,
+            config.measure_seconds
+        ),
+    );
 
     let mut schedule_acknowledged = false;
     while tokio::time::Instant::now() < schedule_deadline {
@@ -3238,7 +3262,17 @@ fn scoped_compose_project(base: &str, run_id: &str) -> String {
 
 fn compose_command(compose_file: &str, override_file: Option<&str>, project: &str, profile: &str) -> Command {
     let mut command = Command::new("docker");
-    command.args(["compose", "--env-file", "/dev/null", "--file", compose_file]);
+    command.args([
+        "compose",
+        "--progress",
+        "plain",
+        "--ansi",
+        "never",
+        "--env-file",
+        "/dev/null",
+        "--file",
+        compose_file,
+    ]);
     if let Some(override_file) = override_file {
         command.args(["--file", override_file]);
     }
@@ -3266,6 +3300,66 @@ async fn run_command(mut command: Command, action: &str) -> Result<std::process:
         );
     }
     Ok(output)
+}
+
+fn local_progress(config: &OatConfig, message: &str) {
+    if config.platform.kind == crate::config::OatMode::Local {
+        eprintln!("[oat] {message}");
+    }
+}
+
+async fn stream_command_output(
+    mut reader: impl tokio::io::AsyncRead + Unpin,
+    mut writer: impl Write,
+) -> std::io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut buffer = [0; 8192];
+    loop {
+        let count = reader.read(&mut buffer).await?;
+        if count == 0 {
+            return Ok(output);
+        }
+        writer.write_all(&buffer[..count])?;
+        writer.flush()?;
+        output.extend_from_slice(&buffer[..count]);
+    }
+}
+
+async fn run_streaming_command_to(
+    mut command: Command,
+    action: &str,
+    stdout: impl Write,
+    stderr: impl Write,
+) -> Result<()> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("{action}: start process"))?;
+    let child_stdout = child.stdout.take().context("command stdout is missing")?;
+    let child_stderr = child.stderr.take().context("command stderr is missing")?;
+    let (status, _, stderr) = tokio::try_join!(
+        child.wait(),
+        stream_command_output(child_stdout, stdout),
+        stream_command_output(child_stderr, stderr),
+    )
+    .with_context(|| format!("{action}: stream process output"))?;
+    if !status.success() {
+        bail!(
+            "{action} failed with {status}: {}",
+            String::from_utf8_lossy(&stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+async fn run_streaming_command(command: Command, action: &str) -> Result<()> {
+    eprintln!("[oat] {action}...");
+    let started = tokio::time::Instant::now();
+    run_streaming_command_to(command, action, std::io::stdout(), std::io::stderr()).await?;
+    eprintln!("[oat] {action}: done ({:.1}s)", started.elapsed().as_secs_f64());
+    Ok(())
 }
 
 fn pin_init_config_json(
@@ -3366,7 +3460,7 @@ async fn run_local_pin_setup(
     command.args(["run", "--rm", "--no-deps", "oat-pin-init"]);
     match tokio::time::timeout(
         Duration::from_secs(crate::config::PIN_INIT_SETUP_TIMEOUT_SECONDS),
-        run_command(command, "initialize local immutable OAT table pin set"),
+        run_streaming_command(command, "initialize local immutable OAT table pin set"),
     )
     .await
     {
@@ -3713,7 +3807,7 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
     );
     platform.add_compose_environment(&mut build_client);
     build_client.args(["build", "oat-client"]);
-    run_command(build_client, "build OAT client container").await?;
+    run_streaming_command(build_client, "build OAT client container").await?;
     verify_local_bind_mount(config, platform).await?;
 
     let mut up = compose_command(
@@ -3732,7 +3826,7 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
         "600",
         "sqlserver",
     ]);
-    run_command(up, "start local OAT SQL Server")
+    run_streaming_command(up, "start local OAT SQL Server")
         .await
         .context("start local OAT stack")?;
 
@@ -3745,7 +3839,7 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
         );
         platform.add_compose_environment(&mut migration);
         migration.args(["run", "--rm", "--no-deps", service]);
-        run_command(migration, &format!("run local OAT {service}")).await?;
+        run_streaming_command(migration, &format!("run local OAT {service}")).await?;
     }
 
     let mut up = compose_command(
@@ -3768,7 +3862,7 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
         "lgtm",
         "router",
     ]);
-    run_command(up, "start remaining local OAT stack")
+    run_streaming_command(up, "start remaining local OAT stack")
         .await
         .context("local compose stack is a per-run project; results are not touched by stack cleanup")?;
     Ok(())
@@ -3809,7 +3903,7 @@ async fn scale_local_arrowcols(
         &format!("dataflow-1={replicas}"),
         "dataflow-1",
     ]);
-    run_command(up, "scale local ArrowCol containers").await?;
+    run_streaming_command(up, "scale local ArrowCol containers").await?;
     Ok(())
 }
 
@@ -4230,7 +4324,7 @@ async fn destroy_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
         );
         down.envs(&platform.environment);
         down.args(["down", "--volumes", "--remove-orphans"]);
-        run_command(down, "clean up local OAT stack").await?;
+        run_streaming_command(down, "clean up local OAT stack").await?;
         if !remove_local_oat_client_containers(&project).await? {
             stack_clean = true;
             break;

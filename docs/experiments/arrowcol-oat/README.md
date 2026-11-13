@@ -116,6 +116,15 @@ From the repository root, the local mode selects `oat-config.quick.json`, detect
 npx --no-install arrowcol-oat --mode local
 ```
 
+The terminal shows the native benchmark server's loopback URL/PID, live Cargo
+and Compose build output, startup health checks, migrations, pin setup and
+cleanup. Each local setup command has a phase label and elapsed completion
+time; unchanged polled run statuses are not repeated. With `--server`, server-side
+setup logs remain in that server's terminal.
+
+Shared-start and warm-up waits track wall-clock corrections rather than a stale
+timer conversion. Clients still fail if they miss the shared measurement window.
+
 Reopen the existing local results website without rebuilding Rust, starting Docker, or rerunning the benchmark:
 
 ```bash

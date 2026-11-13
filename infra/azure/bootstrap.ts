@@ -265,7 +265,7 @@ export function write_private(filename: string, values: Record<string, string>):
 }
 export interface ProcessResult { returncode: number; stdout: string; stderr: string }
 export async function run_tree(command: string[], timeout: number, cwd?: string,
-  env?: NodeJS.ProcessEnv): Promise<ProcessResult> {
+  env?: NodeJS.ProcessEnv, onStderr?: (chunk: string) => void): Promise<ProcessResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(command[0], command.slice(1), { detached: true, cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '', stderr = '', failure: Failure | undefined;
@@ -279,7 +279,11 @@ export async function run_tree(command: string[], timeout: number, cwd?: string,
     const timer = setTimeout(() => kill('Command timed out; outcome unknown and process group killed. Authority stays blocking; no automatic clear.'), timeout * 1000);
     process.on('SIGINT', interrupt); process.on('SIGTERM', interrupt);
     child.stdout.on('data', data => { stdout += data.toString(); });
-    child.stderr.on('data', data => { stderr += data.toString(); });
+    child.stderr.on('data', data => {
+      const chunk = data.toString();
+      stderr += chunk;
+      onStderr?.(chunk);
+    });
     const cleanup = () => { clearTimeout(timer); process.off('SIGINT', interrupt); process.off('SIGTERM', interrupt); };
     child.once('error', error => { cleanup(); reject(new Failure('Command could not start.', { cause: error })); });
     child.once('close', code => { cleanup(); if (failure) reject(failure); else resolve({ returncode: code ?? -1, stdout, stderr }); });

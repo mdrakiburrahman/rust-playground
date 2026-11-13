@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
+import { writeFileSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, realpath, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer, request as createHttpRequest } from 'node:http';
 import { connect as createTcpConnection } from 'node:net';
@@ -8,6 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { run_tree } from '../../infra/azure/bootstrap.js';
 import {
   buildOwnedServer, cleanupLocalComposeProjects, finishOwnedLocalRun, launchOat, main, readOatConfigForMode,
   processStartTicks, resolveCliConfigPath, resolveOatConfigPath, sendViewerFile,
@@ -225,7 +227,10 @@ test('posts the JSON config and polls until the server publishes results', async
   const configPath = path.join(directory, 'oat.json');
   await writeFile(configPath, JSON.stringify({ replica_counts: [1, 2] }));
   const calls: Array<{ url: string; method: string }> = [];
-  const responses = [status('queued'), status('running'), status('succeeded')];
+  const responses = [
+    status('queued'), status('queued'), status('running'), status('running'),
+    { ...status('running'), progress: 'measuring' }, status('succeeded'),
+  ];
   const fetcher: typeof fetch = async (input, init) => {
     calls.push({ url: String(input), method: init?.method ?? 'GET' });
     const next = responses.shift();
@@ -234,12 +239,40 @@ test('posts the JSON config and polls until the server publishes results', async
   };
   const progress: string[] = [];
   try {
-    const result = await launchOat(configPath, 'http://127.0.0.1:8088', 1, fetcher, (value) => progress.push(value.state));
+    const result = await launchOat(configPath, 'http://127.0.0.1:8088', 1, fetcher, (value) => progress.push(`${value.state}: ${value.progress}`));
     assert.equal(result.result_count, 2);
-    assert.deepEqual(progress, ['queued', 'running', 'succeeded']);
-    assert.deepEqual(calls.map((call) => call.method), ['POST', 'GET', 'GET']);
+    assert.deepEqual(progress, ['queued: queued', 'running: running', 'running: measuring', 'succeeded: succeeded']);
+    assert.deepEqual(calls.map((call) => call.method), ['POST', 'GET', 'GET', 'GET', 'GET', 'GET']);
     assert.equal(calls[0]?.url, 'http://127.0.0.1:8088/runs');
     assert.equal(calls[1]?.url, 'http://127.0.0.1:8088/runs/run-a');
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('build progress streams before process exit while preserving captured diagnostics', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-build-progress-'));
+  const gate = path.join(directory, 'progress-seen');
+  const chunks: string[] = [];
+  try {
+    const result = await run_tree([process.execPath, '--input-type=module', '-e', `
+      import { existsSync } from 'node:fs';
+      process.stdout.write('{"reason":"compiler-artifact"}\\n');
+      process.stderr.write('Compiling OAT\\n');
+      const timer = setInterval(() => {
+        if (existsSync(process.argv[1])) {
+          clearInterval(timer);
+          process.exitCode = 7;
+        }
+      }, 10);
+    `, gate], 10, directory, undefined, (chunk) => {
+      chunks.push(chunk);
+      writeFileSync(gate, 'seen');
+    });
+    assert.equal(result.returncode, 7);
+    assert.equal(result.stdout, '{"reason":"compiler-artifact"}\n');
+    assert.equal(result.stderr, 'Compiling OAT\n');
+    assert.equal(chunks.join(''), result.stderr);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
