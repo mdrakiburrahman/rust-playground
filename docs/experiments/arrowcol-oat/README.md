@@ -110,39 +110,45 @@ The server never creates, deletes, or scales AKS node pools. Run `cargo run --lo
 
 ## Mode-based quick bug bash
 
-From the repository root, the local mode selects `oat-config.quick.json`, detects the Docker bridge hosts when needed, runs one quick matrix cell, publishes the local results, and keeps the loopback website open:
+From the repository root. Local needs Docker Compose, Rust/Cargo and the npm dependencies.
+
+### Local
 
 ```bash
-npx --no-install arrowcol-oat --mode local
+npx --no-install arrowcol-oat --mode local               # run one quick cell, serve results on loopback until Ctrl+C
+npx --no-install arrowcol-oat --mode local --viewer-only # reopen the last results; no rebuild, Docker or rerun
 ```
 
-The terminal shows the native benchmark server's loopback URL/PID, live Cargo
-and Compose build output, startup health checks, migrations, pin setup and
-cleanup. Each local setup command has a phase label and elapsed completion
-time; unchanged polled run statuses are not repeated. With `--server`, server-side
-setup logs remain in that server's terminal.
+- The terminal streams the server URL/PID, Cargo and Compose builds, health checks, migrations, pin setup and cleanup, each with a phase label and elapsed time. With `--server`, server logs stay in the server's terminal.
+- Shared-start and warm-up waits follow wall-clock corrections; clients still fail if they miss the shared measurement window.
+- `--viewer-only` is local-only and errors if the results file is missing.
 
-Shared-start and warm-up waits track wall-clock corrections rather than a stale
-timer conversion. Clients still fail if they miss the shared measurement window.
-
-Reopen the existing local results website without rebuilding Rust, starting Docker, or rerunning the benchmark:
+### AKS create
 
 ```bash
-npx --no-install arrowcol-oat --mode local --viewer-only
+az login --use-device-code
+cp infra/azure/stamp.example.yaml infra/azure/stamp.yaml  # once: set subscription and non-overlapping network ranges
+export STAMP_CONFIG=infra/azure/stamp.yaml
+
+npx --no-install arrowcol-oat aks deploy --stamp-config "$STAMP_CONFIG"
+npx --no-install arrowcol-oat --mode aks --stamp-config "$STAMP_CONFIG" --config out/arrowcol-oat/oat-config.aks.json
 ```
 
-The viewer reports an error if the configured Parquet results file is missing. It serves only on loopback with HTTP range support.
+- `deploy` picks a fresh five-digit stamp, rewrites `stamp:` in the YAML, provisions, then runs `aks setup` (writes `out/arrowcol-oat/*`) and must end preflight READY.
+- It refuses if a live or partial stamp or stale generated state exists: [destroy](#aks-destroy) first.
+- Flags: `--what-if` read-only preview; `--network cilium` enforces NetworkPolicy (the default Azure dataplane prints `network: NOT ENFORCED`); `--stamp NNNNN` pins the stamp.
+- The run repeats preflight and refuses to start unless READY; `--preflight-only` runs just that read-only check. Setup's host assertion lasts one hour: re-run `aks setup --stamp-config "$STAMP_CONFIG"` if the run starts later.
+- Pass: `DATA FLOW: PASS` and no run-scoped namespaces or federated credentials left.
 
-AKS mode selects `oat-config.aks.quick.json`. Run its read-only preflight explicitly with:
+### AKS destroy
+
+**Destructive:** `--confirm` deletes all of `arrow-collector-rg` and its AKS-managed resource groups, every stamp included. It is not per-run cleanup.
 
 ```bash
-npx --no-install arrowcol-oat --mode aks --preflight-only
+npx --no-install arrowcol-oat aks destroy --stamp-config "$STAMP_CONFIG"                                # read-only inventory
+npx --no-install arrowcol-oat aks destroy --stamp-config "$STAMP_CONFIG" --confirm arrow-collector-rg   # delete
 ```
 
-A full AKS benchmark invocation is:
+Also clears the generated local state (`.env.azure*`, `out/arrowcol-oat` inputs); the receipt is written outside the checkout. Then [AKS create](#aks-create) again.
 
-```bash
-npx --no-install arrowcol-oat --mode aks
-```
-
-It repeats the preflight and refuses to submit unless every readiness gate passes. The AKS quick stack is **not staged or qualified**: required workload resources and immutable images are absent, enforcing network policy and behavioral proof are missing, current workload metrics are empty, and QAP is not qualified. The checked-in AKS config references runtime/bootstrap files not present in the checkout and leaves the database and client image unset; do not treat a preflight result as permission to provision resources. There is no AKS website-only mode.
+More: [AKS QAP operations](../../operations/AKS_QAP.md), [runtime setup](RUNTIME.md).
