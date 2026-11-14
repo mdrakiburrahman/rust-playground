@@ -30,9 +30,8 @@ pub enum ComponentRole {
 #[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum DurabilityClass {
-    WalDisabled,
-    FsyncPerWrite,
-    PeriodicFsync,
+    Durable,
+    FsyncBatched,
     LossyEviction,
 }
 
@@ -178,24 +177,7 @@ impl Tunables {
                 bail!("transport.dictionary_handling=resend is unsupported for the current plain DMV schema");
             }
         }
-        if let Some(router) = &self.router {
-            positive("router.worker_threads", router.worker_threads)?;
-            positive("router.listener_threads", router.listener_threads)?;
-            positive("router.max_downstream_streams", router.max_downstream_streams)?;
-            positive("router.max_upstream_streams", router.max_upstream_streams)?;
-            positive("router.stream_window_bytes", router.stream_window_bytes)?;
-            positive("router.connection_window_bytes", router.connection_window_bytes)?;
-            positive("router.request_timeout_ms", router.request_timeout_ms)?;
-            positive("router.idle_timeout_ms", router.idle_timeout_ms)?;
-            positive("router.connect_timeout_ms", router.connect_timeout_ms)?;
-            let stream_window = router.stream_window_bytes.unwrap_or(1_048_576);
-            let connection_window = router.connection_window_bytes.unwrap_or(16_777_216);
-            validate_h2_window("router.stream_window_bytes", stream_window)?;
-            validate_h2_window("router.connection_window_bytes", connection_window)?;
-            if stream_window > connection_window {
-                bail!("router.stream_window_bytes must not exceed connection_window_bytes");
-            }
-        }
+        validate_router(self.router.as_ref())?;
         if let Some(collector) = &self.collector {
             validate_batching(collector.batching.as_ref())?;
             validate_commit(collector.commit.as_ref())?;
@@ -206,24 +188,7 @@ impl Tunables {
         if let Some(writer) = &self.parquet_writer {
             writer.validate()?;
         }
-        if let Some(wal) = &self.wal {
-            positive("wal.capacity_bytes", wal.capacity_bytes)?;
-            positive("wal.segment_size_bytes", wal.segment_size_bytes)?;
-            positive("wal.poll_interval_ms", wal.poll_interval_ms)?;
-            positive("wal.retry_min_ms", wal.retry_min_ms)?;
-            positive("wal.retry_max_ms", wal.retry_max_ms)?;
-            positive("wal.max_retries", wal.max_retries)?;
-            if wal
-                .segment_size_bytes
-                .zip(wal.capacity_bytes)
-                .is_some_and(|(segment, capacity)| segment > capacity)
-            {
-                bail!("wal.segment_size_bytes must not exceed wal.capacity_bytes");
-            }
-            if wal.retry_min_ms.unwrap_or(250) > wal.retry_max_ms.unwrap_or(2_000) {
-                bail!("wal.retry_min_ms must not exceed retry_max_ms");
-            }
-        }
+        validate_wal(self.wal.as_ref())?;
         if let Some(maintenance) = &self.maintenance {
             validate_maintenance(maintenance)?;
         }
@@ -278,16 +243,13 @@ impl Tunables {
         let Some(wal) = &self.wal else {
             return DurabilityClass::FsyncPerWrite;
         };
-        if wal.enabled == Some(false) {
-            return DurabilityClass::WalDisabled;
-        }
-        if wal.overflow_policy == Some(WalOverflowPolicy::EvictOldest) {
+        if wal.max_age_secs.is_some() || wal.size_cap_policy == Some(WalSizeCapPolicy::DropOldest) {
             return DurabilityClass::LossyEviction;
         }
-        if wal.fsync_interval_ms.is_some_and(|interval| interval > 0) {
-            return DurabilityClass::PeriodicFsync;
+        if wal.flush_interval_ms.unwrap_or(0) > 0 {
+            return DurabilityClass::FsyncBatched;
         }
-        DurabilityClass::FsyncPerWrite
+        DurabilityClass::Durable
     }
 
     /// Projects configured scalar values to component-prefixed environment variables.
@@ -346,6 +308,13 @@ impl Tunables {
                 );
                 continue;
             }
+            if section == "wal" {
+                project_wal(
+                    self.wal.as_ref().expect("serialized section comes from config"),
+                    &mut output,
+                );
+                continue;
+            }
             let prefix = match section.as_str() {
                 "client" => "ARROWCOL_CLIENT",
                 "transport" => "ARROWCOL_CLIENT",
@@ -359,6 +328,206 @@ impl Tunables {
         }
         Ok(output)
     }
+}
+
+fn validate_router(router: Option<&RouterTunables>) -> Result<()> {
+    let router = router.cloned().unwrap_or_default();
+    for (name, value, minimum, maximum) in [
+        ("workers", router.workers, 1, 256),
+        ("listener_tasks_per_fd", router.listener_tasks_per_fd, 1, 64),
+        ("keepalive_pool_size", router.keepalive_pool_size, 1, 65_536),
+        (
+            "h2_max_concurrent_streams",
+            router.h2_max_concurrent_streams.map(|value| value as usize),
+            1,
+            65_535,
+        ),
+        ("max_table_entries", router.max_table_entries, 1, 1_048_576),
+        ("edge_replay_max_nonces", router.edge_replay_max_nonces, 1, 1_048_576),
+        ("upstream_max_h2_streams", router.upstream_max_h2_streams, 1, 65_535),
+    ] {
+        if value.is_some_and(|value| !(minimum..=maximum).contains(&value)) {
+            bail!("router.{name} must be between {minimum} and {maximum}");
+        }
+    }
+    let downstream_stream_window = router.h2_stream_window_bytes.unwrap_or(1_048_576);
+    let downstream_connection_window = router.h2_connection_window_bytes.unwrap_or(16_777_216);
+    validate_h2_window("router.h2_stream_window_bytes", downstream_stream_window)?;
+    validate_h2_window("router.h2_connection_window_bytes", downstream_connection_window)?;
+    if downstream_connection_window < downstream_stream_window {
+        bail!("router.h2_connection_window_bytes must not be less than h2_stream_window_bytes");
+    }
+    let upstream_stream_window = router.upstream_stream_window_bytes.unwrap_or(1_048_576);
+    let upstream_connection_window = router.upstream_connection_window_bytes.unwrap_or(16_777_216);
+    validate_h2_window("router.upstream_stream_window_bytes", upstream_stream_window)?;
+    validate_h2_window("router.upstream_connection_window_bytes", upstream_connection_window)?;
+    if upstream_connection_window < upstream_stream_window {
+        bail!("router.upstream_connection_window_bytes must not be less than upstream_stream_window_bytes");
+    }
+
+    for (name, value, minimum, maximum) in [
+        ("h2_idle_timeout_seconds", router.h2_idle_timeout_seconds, 1, 86_400),
+        ("sql_connect_timeout_ms", router.sql_connect_timeout_ms, 1, 600_000),
+        ("sql_command_timeout_ms", router.sql_command_timeout_ms, 1, 600_000),
+        ("refresh_interval_ms", router.refresh_interval_ms, 1, 3_600_000),
+        (
+            "upstream_connection_timeout_ms",
+            router.upstream_connection_timeout_ms,
+            1,
+            600_000,
+        ),
+        (
+            "upstream_total_connection_timeout_ms",
+            router.upstream_total_connection_timeout_ms,
+            1,
+            600_000,
+        ),
+        (
+            "upstream_idle_timeout_seconds",
+            router.upstream_idle_timeout_seconds,
+            1,
+            86_400,
+        ),
+    ] {
+        if value.is_some_and(|value| !(minimum..=maximum).contains(&value)) {
+            bail!("router.{name} must be between {minimum} and {maximum}");
+        }
+    }
+    let connect_timeout = router.upstream_connection_timeout_ms.unwrap_or(1_000);
+    if router.upstream_total_connection_timeout_ms.unwrap_or(3_000) < connect_timeout {
+        bail!("router.upstream_total_connection_timeout_ms must be at least upstream_connection_timeout_ms");
+    }
+    if router.upstream_ping_interval_seconds.is_some_and(|value| value > 3_600) {
+        bail!("router.upstream_ping_interval_seconds must be 0 (disabled) or at most 3600");
+    }
+    for (name, value) in [
+        ("max_snapshot_age_ms", router.max_snapshot_age_ms),
+        ("max_future_skew_ms", router.max_future_skew_ms),
+        ("max_oldest_buffer_age_ms", router.max_oldest_buffer_age_ms),
+        ("warmup_ms", router.warmup_ms),
+        ("lease_ttl_ms", router.lease_ttl_ms),
+        ("oat_run_pin_ttl_ms", router.oat_run_pin_ttl_ms),
+        ("readiness_max_staleness_ms", router.readiness_max_staleness_ms),
+    ] {
+        if value.is_some_and(|value| value > 86_400_000) {
+            bail!("router.{name} must not exceed 86400000 milliseconds");
+        }
+    }
+    for (name, value) in [
+        ("hard_pressure_bps", router.hard_pressure_bps),
+        ("minimum_warmup_bps", router.minimum_warmup_bps),
+    ] {
+        if value.is_some_and(|value| value > 10_000) {
+            bail!("router.{name} must not exceed 10000 basis points");
+        }
+    }
+    Ok(())
+}
+
+fn validate_wal(wal: Option<&WalTunables>) -> Result<()> {
+    let Some(wal) = wal else {
+        return Ok(());
+    };
+    if wal
+        .flush_interval_ms
+        .is_some_and(|value| value > i64::MAX as u64 / 1_000_000)
+    {
+        bail!("wal.flush_interval_ms exceeds the consumer duration range");
+    }
+    positive("wal.retention_size_cap_bytes", wal.retention_size_cap_bytes)?;
+    if wal
+        .retention_size_cap_bytes
+        .is_some_and(|value| value > i64::MAX as u64)
+    {
+        bail!("wal.retention_size_cap_bytes exceeds the consumer byte-size range");
+    }
+    if wal
+        .max_age_secs
+        .is_some_and(|value| value == 0 || value > i64::MAX as u64 / 1_000_000_000)
+    {
+        bail!("wal.max_age_secs must be positive and fit the consumer duration range");
+    }
+    for (name, value) in [
+        ("max_segment_open_duration_ms", wal.max_segment_open_duration_ms),
+        ("poll_interval_ms", wal.poll_interval_ms),
+        ("initial_retry_interval_ms", wal.initial_retry_interval_ms),
+        ("max_retry_interval_ms", wal.max_retry_interval_ms),
+    ] {
+        if value.is_some_and(|value| value == 0 || value > i64::MAX as u64 / 1_000_000) {
+            bail!("wal.{name} must be positive and fit the consumer duration range");
+        }
+    }
+    if wal.initial_retry_interval_ms.unwrap_or(250) > wal.max_retry_interval_ms.unwrap_or(2_000) {
+        bail!("wal.initial_retry_interval_ms must not exceed max_retry_interval_ms");
+    }
+    if wal
+        .retry_multiplier
+        .is_some_and(|value| !value.is_finite() || value <= 0.0)
+    {
+        bail!("wal.retry_multiplier must be finite and positive");
+    }
+    if wal
+        .max_in_flight
+        .is_some_and(|value| value == 0 || value > (usize::MAX >> 3))
+    {
+        bail!("wal.max_in_flight must be positive and not exceed Semaphore::MAX_PERMITS");
+    }
+    Ok(())
+}
+
+fn project_wal(wal: &WalTunables, output: &mut BTreeMap<String, String>) {
+    let mut insert_duration = |key: &str, value: Option<u64>| {
+        if let Some(value) = value {
+            let duration = humantime::format_duration(Duration::from_millis(value)).to_string();
+            output.insert(key.to_owned(), duration);
+        }
+    };
+    insert_duration("ARROWCOL_WAL_FLUSH_INTERVAL", wal.flush_interval_ms);
+    insert_duration(
+        "ARROWCOL_WAL_MAX_SEGMENT_OPEN_DURATION",
+        wal.max_segment_open_duration_ms,
+    );
+    insert_duration("ARROWCOL_WAL_POLL_INTERVAL", wal.poll_interval_ms);
+    insert_duration("ARROWCOL_WAL_INITIAL_RETRY_INTERVAL", wal.initial_retry_interval_ms);
+    insert_duration("ARROWCOL_WAL_MAX_RETRY_INTERVAL", wal.max_retry_interval_ms);
+    if let Some(bytes) = wal.retention_size_cap_bytes {
+        output.insert("ARROWCOL_WAL_RETENTION_SIZE_CAP".to_owned(), format_byte_size(bytes));
+    }
+    if let Some(seconds) = wal.max_age_secs {
+        output.insert(
+            "ARROWCOL_WAL_MAX_AGE".to_owned(),
+            humantime::format_duration(Duration::from_secs(seconds)).to_string(),
+        );
+    }
+    if let Some(policy) = wal.size_cap_policy {
+        let value = match policy {
+            WalSizeCapPolicy::Backpressure => "backpressure",
+            WalSizeCapPolicy::DropOldest => "drop_oldest",
+        };
+        output.insert("ARROWCOL_WAL_SIZE_CAP_POLICY".to_owned(), value.to_owned());
+    }
+    if let Some(multiplier) = wal.retry_multiplier {
+        output.insert("ARROWCOL_WAL_RETRY_MULTIPLIER".to_owned(), multiplier.to_string());
+    }
+    if let Some(value) = wal.max_in_flight {
+        output.insert("ARROWCOL_WAL_MAX_IN_FLIGHT".to_owned(), value.to_string());
+    }
+    if let Some(handling) = wal.otlp_handling {
+        let value = match handling {
+            WalOtlpHandling::PassThrough => "pass_through",
+            WalOtlpHandling::ConvertToArrow => "convert_to_arrow",
+        };
+        output.insert("ARROWCOL_WAL_OTLP_HANDLING".to_owned(), value.to_owned());
+    }
+}
+
+fn format_byte_size(bytes: u64) -> String {
+    for (unit, multiplier) in [("GiB", 1_u64 << 30), ("MiB", 1_u64 << 20), ("KiB", 1_u64 << 10)] {
+        if bytes.is_multiple_of(multiplier) {
+            return format!("{} {unit}", bytes / multiplier);
+        }
+    }
+    format!("{bytes} B")
 }
 
 fn validate_h2_window(field: &str, window: u32) -> Result<()> {
@@ -659,6 +828,11 @@ fn validate_maintenance(maintenance: &MaintenanceTunables) -> Result<()> {
         ),
         ("layout_page_rows", maintenance.layout_page_rows.is_some(), has_optimize),
         (
+            "input_read_strategy",
+            maintenance.input_read_strategy.is_some(),
+            has_optimize,
+        ),
+        (
             "max_concurrent_decoded_bytes",
             maintenance.max_concurrent_decoded_bytes.is_some(),
             has_optimize,
@@ -719,10 +893,11 @@ fn validate_maintenance(maintenance: &MaintenanceTunables) -> Result<()> {
         maintenance.max_idle_backoff_secs.or(Some(3_600)),
     )?;
     positive("maintenance.max_cycles", maintenance.max_cycles)?;
-    positive(
-        "maintenance.max_concurrent_tables",
-        maintenance.max_concurrent_tables.or(Some(1)),
-    )?;
+    let concurrent_tables = maintenance.max_concurrent_tables.unwrap_or(1);
+    positive("maintenance.max_concurrent_tables", Some(concurrent_tables))?;
+    if concurrent_tables > 16 {
+        bail!("maintenance.max_concurrent_tables must be between 1 and 16");
+    }
     positive(
         "maintenance.operation_timeout_secs",
         maintenance.operation_timeout_secs.or(Some(900)),
@@ -739,8 +914,27 @@ fn validate_maintenance(maintenance: &MaintenanceTunables) -> Result<()> {
     if maintenance.commit_attempts.is_some_and(|attempts| attempts > 1_000) {
         bail!("maintenance.commit_attempts must not exceed 1000");
     }
-    if maintenance.commit_budget_secs.is_some_and(|seconds| seconds > 86_400) {
-        bail!("maintenance.commit_budget_secs must not exceed 86400 seconds");
+    if maintenance.commit_budget_secs.is_some_and(|seconds| seconds > 3_600) {
+        bail!("maintenance.commit_budget_secs must not exceed 3600 seconds");
+    }
+    let idle_backoff = maintenance.max_idle_backoff_secs.unwrap_or(3_600);
+    if maintenance
+        .interval_secs
+        .is_some_and(|interval| interval > idle_backoff)
+    {
+        bail!("maintenance.max_idle_backoff_secs must be at least interval_secs");
+    }
+    let catalog_threads = maintenance.catalog_runtime_threads.unwrap_or(2);
+    if !(1..=64).contains(&catalog_threads) {
+        bail!("maintenance.catalog_runtime_threads must be between 1 and 64");
+    }
+    let catalog_timeout = maintenance.catalog_rpc_timeout_secs.unwrap_or(30);
+    if !(1..=3_600).contains(&catalog_timeout) {
+        bail!("maintenance.catalog_rpc_timeout_secs must be between 1 and 3600");
+    }
+    let catalog_message_bytes = maintenance.catalog_max_decoding_message_bytes.unwrap_or(33_554_432);
+    if !(1_024..=1_073_741_824).contains(&catalog_message_bytes) {
+        bail!("maintenance.catalog_max_decoding_message_bytes must be between 1024 and 1073741824");
     }
     if let Some(budget) = maintenance.max_concurrent_decoded_bytes {
         let concurrency = u64::try_from(maintenance.max_concurrent_tables.unwrap_or(1))
@@ -762,7 +956,9 @@ fn validate_maintenance(maintenance: &MaintenanceTunables) -> Result<()> {
         "maintenance.vacuum_retention_secs",
         maintenance.vacuum_retention_secs.or(Some(604_800)),
     )?;
-    positive("maintenance.min_files", maintenance.min_files)?;
+    if maintenance.min_files.is_some_and(|value| value < 2) {
+        bail!("maintenance.min_files must be at least 2");
+    }
     positive("maintenance.vacuum_max_deletes", maintenance.vacuum_max_deletes)?;
     positive(
         "maintenance.vacuum_max_listed_files",
@@ -772,6 +968,9 @@ fn validate_maintenance(maintenance: &MaintenanceTunables) -> Result<()> {
     positive("maintenance.layout_max_input_bytes", maintenance.layout_max_input_bytes)?;
     positive("maintenance.layout_row_group_rows", maintenance.layout_row_group_rows)?;
     positive("maintenance.layout_page_rows", maintenance.layout_page_rows)?;
+    if maintenance.max_files_per_bin.is_some_and(|value| value < 2) {
+        bail!("maintenance.max_files_per_bin must be at least 2");
+    }
     positive(
         "maintenance.max_files_per_bin",
         maintenance.max_files_per_bin.or(Some(64)),
@@ -780,14 +979,16 @@ fn validate_maintenance(maintenance: &MaintenanceTunables) -> Result<()> {
         "maintenance.max_bins_per_commit",
         maintenance.max_bins_per_commit.or(Some(16)),
     )?;
-    positive(
-        "maintenance.max_actions_per_commit",
-        maintenance.max_actions_per_commit.or(Some(2_048)),
-    )?;
-    positive(
-        "maintenance.max_plan_bytes",
-        maintenance.max_plan_bytes.or(Some(1_048_576)),
-    )?;
+    let max_actions = maintenance.max_actions_per_commit.unwrap_or(2_048);
+    if max_actions < 3 {
+        bail!("maintenance.max_actions_per_commit must be at least 3");
+    }
+    positive("maintenance.max_actions_per_commit", Some(max_actions))?;
+    let max_plan = maintenance.max_plan_bytes.unwrap_or(1_048_576);
+    if max_plan < 1_024 {
+        bail!("maintenance.max_plan_bytes must be at least 1024");
+    }
+    positive("maintenance.max_plan_bytes", Some(max_plan))?;
     positive(
         "maintenance.max_decoded_bytes_per_bin",
         maintenance.max_decoded_bytes_per_bin.or(Some(1_073_741_824)),
@@ -825,7 +1026,9 @@ fn validate_maintenance(maintenance: &MaintenanceTunables) -> Result<()> {
     )?;
 
     let target_mib = maintenance.target_file_mib.unwrap_or(128);
-    positive("maintenance.target_file_mib", Some(target_mib))?;
+    if !(1..=1_023).contains(&target_mib) {
+        bail!("maintenance.target_file_mib must be between 1 and 1023");
+    }
     let target_bytes = target_mib
         .checked_mul(1_048_576)
         .context("maintenance.target_file_mib overflows byte conversion")?;
@@ -835,6 +1038,19 @@ fn validate_maintenance(maintenance: &MaintenanceTunables) -> Result<()> {
     positive("maintenance.small_file_bytes", Some(small_bytes))?;
     if small_bytes > target_bytes {
         bail!("maintenance.small_file_bytes must not exceed target_file_mib converted to bytes");
+    }
+    let max_output_bytes = maintenance.max_output_file_bytes.unwrap_or(1_072_693_248);
+    if max_output_bytes < target_bytes || max_output_bytes >= 1_073_741_824 {
+        bail!("maintenance.max_output_file_bytes must be at least target_file_mib and less than 1073741824 bytes");
+    }
+    if let Some(columns) = &maintenance.layout_sort_columns {
+        validate_column_list("maintenance.layout_sort_columns", columns, true)?;
+    }
+    if let Some(columns) = &maintenance.layout_bloom_columns {
+        validate_column_list("maintenance.layout_bloom_columns", columns, false)?;
+    }
+    if maintenance.layout_max_rows.is_some_and(|rows| rows > u32::MAX as usize) {
+        bail!("maintenance.layout_max_rows must not exceed 4294967295");
     }
     if u128::from(maintenance.max_batch_bytes.unwrap_or(67_108_864) as u64)
         > u128::from(maintenance.max_decoded_bytes_per_bin.unwrap_or(1_073_741_824))
@@ -847,6 +1063,22 @@ fn validate_maintenance(maintenance: &MaintenanceTunables) -> Result<()> {
     }
     if maintenance.allow_short_vacuum_retention == Some(true) && vacuum_retention >= 604_800 {
         bail!("allow_short_vacuum_retention only applies below seven days");
+    }
+    Ok(())
+}
+
+fn validate_column_list(field: &str, columns: &[String], nonempty: bool) -> Result<()> {
+    if nonempty && columns.is_empty() {
+        bail!("{field} must not be empty");
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for column in columns {
+        if column.trim().is_empty() || column.trim() != column || column.contains(',') {
+            bail!("{field} entries must be nonempty, trimmed column names without commas");
+        }
+        if !seen.insert(column) {
+            bail!("{field} entries must be unique");
+        }
     }
     Ok(())
 }
@@ -1028,12 +1260,19 @@ mod tests {
         assert!(invalid.validate().unwrap_err().to_string().contains("rss_limit"));
         let invalid = Tunables {
             wal: Some(WalTunables {
-                retry_min_ms: Some(2_001),
+                initial_retry_interval_ms: Some(2_001),
+                max_retry_interval_ms: Some(2_000),
                 ..Default::default()
             }),
             ..Default::default()
         };
-        assert!(invalid.validate().unwrap_err().to_string().contains("retry_min_ms"));
+        assert!(
+            invalid
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("initial_retry_interval_ms")
+        );
         let invalid = Tunables {
             transport: Some(TransportTunables {
                 stream_window_bytes: Some(16_777_217),
@@ -1107,20 +1346,20 @@ mod tests {
 
     #[test]
     fn canonical_json_environment_and_durability_are_deterministic() -> Result<()> {
-        let config: Tunables = serde_json::from_str(r#"{"wal":{"fsync_interval_ms":15},"client":{"batch_rows":4}}"#)?;
+        let config: Tunables = serde_json::from_str(r#"{"wal":{"flush_interval_ms":15},"client":{"batch_rows":4}}"#)?;
         assert_eq!(
             config.canonical_json()?,
-            r#"{"client":{"batch_rows":4},"wal":{"fsync_interval_ms":15}}"#
+            r#"{"client":{"batch_rows":4},"wal":{"flush_interval_ms":15}}"#
         );
-        assert_eq!(config.durability_class(), DurabilityClass::PeriodicFsync);
-        let effective = config.canonical_effective_json(&serde_json::json!({"client":{"batch_rows":8192,"workers":0},"wal":{"fsync_interval_ms":0,"capacity_bytes":4294967296u64}}))?;
+        assert_eq!(config.durability_class(), DurabilityClass::FsyncBatched);
+        let effective = config.canonical_effective_json(&serde_json::json!({"client":{"batch_rows":8192,"workers":0},"wal":{"flush_interval_ms":0,"retention_size_cap_bytes":4294967296u64}}))?;
         assert_eq!(
             effective,
-            r#"{"client":{"batch_rows":4,"workers":0},"wal":{"capacity_bytes":4294967296,"fsync_interval_ms":15}}"#
+            r#"{"client":{"batch_rows":4,"workers":0},"wal":{"flush_interval_ms":15,"retention_size_cap_bytes":4294967296}}"#
         );
         let env = config.environment()?;
         assert_eq!(env["ARROWCOL_CLIENT_BATCH_ROWS"], "4");
-        assert_eq!(env["ARROWCOL_WAL_FSYNC_INTERVAL_MS"], "15");
+        assert_eq!(env["ARROWCOL_WAL_FLUSH_INTERVAL"], "15ms");
         assert!(config.validate().is_ok());
         assert_eq!(
             config.environment_for(ComponentRole::Client)?["ARROWCOL_CLIENT_BATCH_ROWS"],
@@ -1128,9 +1367,89 @@ mod tests {
         );
         assert_eq!(config.environment_for(ComponentRole::Router)?.len(), 0);
         assert_eq!(
-            config.environment_for(ComponentRole::Collector)?["ARROWCOL_WAL_FSYNC_INTERVAL_MS"],
-            "15"
+            config.environment_for(ComponentRole::Collector)?["ARROWCOL_WAL_FLUSH_INTERVAL"],
+            "15ms"
         );
+        assert_eq!(Tunables::default().durability_class(), DurabilityClass::Durable);
+        Ok(())
+    }
+
+    #[test]
+    fn router_projection_uses_the_consumer_environment_contract() -> Result<()> {
+        let config = Tunables {
+            router: Some(RouterTunables {
+                workers: Some(4),
+                listener_tasks_per_fd: Some(2),
+                h2_max_concurrent_streams: Some(512),
+                h2_stream_window_bytes: Some(2_097_152),
+                h2_connection_window_bytes: Some(8_388_608),
+                sql_connect_timeout_ms: Some(8_000),
+                refresh_interval_ms: Some(2_000),
+                upstream_ping_interval_seconds: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        config.validate_for_oat()?;
+        let env = config.environment_for(ComponentRole::Router)?;
+        assert_eq!(env["ARROWCOL_ROUTER_WORKERS"], "4");
+        assert_eq!(env["ARROWCOL_ROUTER_LISTENER_TASKS_PER_FD"], "2");
+        assert_eq!(env["ARROWCOL_ROUTER_H2_MAX_CONCURRENT_STREAMS"], "512");
+        assert_eq!(env["ARROWCOL_ROUTER_H2_STREAM_WINDOW_BYTES"], "2097152");
+        assert_eq!(env["ARROWCOL_ROUTER_H2_CONNECTION_WINDOW_BYTES"], "8388608");
+        assert_eq!(env["ARROWCOL_ROUTER_SQL_CONNECT_TIMEOUT_MS"], "8000");
+        assert_eq!(env["ARROWCOL_ROUTER_REFRESH_INTERVAL_MS"], "2000");
+        assert_eq!(env["ARROWCOL_ROUTER_UPSTREAM_PING_INTERVAL_SECONDS"], "0");
+        assert!(!env.contains_key("ARROWCOL_ROUTER_WORKER_THREADS"));
+
+        let invalid = Tunables {
+            router: Some(RouterTunables {
+                h2_stream_window_bytes: Some(2_097_152),
+                h2_connection_window_bytes: Some(1_048_576),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            invalid
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("h2_connection_window_bytes")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn wal_projection_uses_quiver_names_and_durability_semantics() -> Result<()> {
+        let config = Tunables {
+            wal: Some(WalTunables {
+                flush_interval_ms: Some(0),
+                retention_size_cap_bytes: Some(4_294_967_296),
+                max_age_secs: Some(60),
+                size_cap_policy: Some(WalSizeCapPolicy::DropOldest),
+                max_segment_open_duration_ms: Some(1_000),
+                poll_interval_ms: Some(100),
+                initial_retry_interval_ms: Some(250),
+                max_retry_interval_ms: Some(2_000),
+                retry_multiplier: Some(2.0),
+                max_in_flight: Some(1000),
+                otlp_handling: Some(WalOtlpHandling::PassThrough),
+            }),
+            ..Default::default()
+        };
+        config.validate_for_oat()?;
+        assert_eq!(config.durability_class(), DurabilityClass::LossyEviction);
+        assert!(serde_json::from_str::<WalSizeCapPolicy>("\"evict_oldest\"").is_err());
+        let env = config.environment_for(ComponentRole::Collector)?;
+        assert_eq!(env["ARROWCOL_WAL_FLUSH_INTERVAL"], "0s");
+        assert_eq!(env["ARROWCOL_WAL_RETENTION_SIZE_CAP"], "4 GiB");
+        assert_eq!(env["ARROWCOL_WAL_MAX_AGE"], "1m");
+        assert_eq!(env["ARROWCOL_WAL_SIZE_CAP_POLICY"], "drop_oldest");
+        assert_eq!(env["ARROWCOL_WAL_MAX_SEGMENT_OPEN_DURATION"], "1s");
+        assert_eq!(env["ARROWCOL_WAL_INITIAL_RETRY_INTERVAL"], "250ms");
+        assert_eq!(env["ARROWCOL_WAL_OTLP_HANDLING"], "pass_through");
+        assert!(!env.contains_key("ARROWCOL_WAL_FSYNC_INTERVAL_MS"));
         Ok(())
     }
 
@@ -1166,6 +1485,10 @@ mod tests {
                 max_concurrent_decoded_bytes: Some(200),
                 commit_attempts: Some(12),
                 commit_budget_secs: Some(15),
+                input_read_strategy: Some(MaintenanceInputReadStrategy::Spool),
+                catalog_runtime_threads: Some(4),
+                catalog_rpc_timeout_secs: Some(45),
+                catalog_max_decoding_message_bytes: Some(65_536),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1175,6 +1498,10 @@ mod tests {
         assert_eq!(env["ARROWCOL_MAINT_MAX_CONCURRENT_DECODED_BYTES"], "200");
         assert_eq!(env["ARROWCOL_MAINT_COMMIT_ATTEMPTS"], "12");
         assert_eq!(env["ARROWCOL_MAINT_COMMIT_BUDGET_SECS"], "15");
+        assert_eq!(env["ARROWCOL_MAINT_INPUT_READ_STRATEGY"], "spool");
+        assert_eq!(env["ARROWCOL_MAINT_CATALOG_RUNTIME_THREADS"], "4");
+        assert_eq!(env["ARROWCOL_MAINT_CATALOG_RPC_TIMEOUT_SECS"], "45");
+        assert_eq!(env["ARROWCOL_MAINT_CATALOG_MAX_DECODING_MESSAGE_BYTES"], "65536");
 
         let invalid = Tunables {
             maintenance: Some(MaintenanceTunables {
