@@ -17,6 +17,10 @@ Startup and validated table policy are emitted to stderr as
 `arrowcol_maintenance_effective_config` and `arrowcol_maintenance_table_config`
 JSON events. The optional aggregate decoded-byte budget limits the product of
 per-bin decoded limits and concurrent tables; it is not an RSS limit.
+Compaction also consumes the shared `ARROWCOL_PARQUET_CONFIG` JSON. Readback
+reports its overrides; schema compatibility is checked when rewriting files.
+`--input-read-strategy spool` streams each input to temporary local disk instead
+of buffering its compressed bytes in memory; disk space and I/O must be available.
 
 | Operation | Effect |
 | --- | --- |

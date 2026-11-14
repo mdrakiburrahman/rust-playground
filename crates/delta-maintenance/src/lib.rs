@@ -588,6 +588,7 @@ fn configuration_evidence(startup: &Settings, settings: &Settings, props: &Resol
             "catalog_max_decoding_message_bytes": startup.catalog_options.max_decoding_message_bytes,
             "max_prune_files": startup.max_prune_files,
             "output_row_group_rows": startup.optimize.output_row_group_rows,
+            "input_read_strategy": startup.optimize.input_read_strategy,
         },
         "table_policy": policy,
         "parquet_writer_overrides": arrow_deltalake::writer::process_config()?,
