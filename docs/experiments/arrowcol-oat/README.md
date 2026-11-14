@@ -140,6 +140,31 @@ npx --no-install arrowcol-oat --mode aks --stamp-config "$STAMP_CONFIG" --config
 - The run repeats preflight and refuses to start unless READY; `--preflight-only` runs just that read-only check. Setup's host assertion lasts one hour: re-run `aks setup --stamp-config "$STAMP_CONFIG"` if the run starts later.
 - Pass: `DATA FLOW: PASS` and no run-scoped namespaces or federated credentials left.
 
+### AKS run:
+
+```bash
+SUB=68fa0545-661c-4152-93f2-fc8ae1c231b8
+
+az deployment group show \
+  --subscription "$SUB" \
+  --resource-group arrow-collector-rg \
+  --name arrowcol-sandbox-stamp-87515 \
+  --query "{
+    subscription:'$SUB',
+    stamp:'87515',
+    resourceGroup:'arrow-collector-rg',
+    location:properties.parameters.location.value,
+    aks:properties.parameters.aksConfig.value,
+    storageReadLogDestination:properties.parameters.readLogStorageAccountName.value && 'storage' || 'log-analytics',
+    publisherFederatedCredentials:properties.parameters.publisherFederatedCredentials.value
+  }" \
+  --output yaml --only-show-errors
+
+export STAMP_CONFIG=.temp/stamp-87515.yaml
+npx --no-install arrowcol-oat aks setup --stamp 87515 --stamp-config "$STAMP_CONFIG"
+npx --no-install arrowcol-oat --mode aks --stamp-config "$STAMP_CONFIG" --config out/arrowcol-oat/oat-config.aks.json
+```
+
 ### AKS destroy
 
 **Destructive:** `--confirm` deletes all of `arrow-collector-rg` and its AKS-managed resource groups, every stamp included. It is not per-run cleanup.
