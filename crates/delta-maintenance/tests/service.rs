@@ -230,6 +230,35 @@ fn invalid_parquet_policy_fails_before_maintenance_mutates_tables() -> Result<()
 }
 
 #[test]
+fn purge_file_bound_is_applied_and_invalid_operation_limits_are_rejected() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("events");
+    table(&path)?;
+    let before = version(&path)?;
+    let output = service(root.path())?
+        .env("ARROWCOL_MAINT_PURGE_MAX_FILES_PER_COMMIT", "1")
+        .args(["--operation", "purge", "--apply"])
+        .output()?;
+    assert!(!output.status.success());
+    assert_eq!(lines(&output.stdout)?[0]["error_kind"], "resource_limit");
+    assert_eq!(version(&path)?, before);
+    let stderr = std::str::from_utf8(&output.stderr)?;
+    let config: serde_json::Value = serde_json::from_str(
+        stderr
+            .lines()
+            .find_map(|line| line.strip_prefix("arrowcol_maintenance_effective_config "))
+            .context("missing startup configuration")?,
+    )?;
+    assert_eq!(config["startup"]["operation_limits"]["purge_max_files_per_commit"], 1);
+    let invalid = service(root.path())?
+        .args(["--operation", "vacuum", "--vacuum-delete-chunk", "0"])
+        .output()?;
+    assert!(!invalid.status.success());
+    assert_eq!(version(&path)?, before);
+    Ok(())
+}
+
+#[test]
 fn ordinary_short_vacuum_requires_explicit_acknowledgement_and_does_not_authorize_pruning() -> Result<()> {
     let root = tempfile::tempdir()?;
     let path = root.path().join("events");
@@ -284,6 +313,15 @@ fn ordinary_short_vacuum_requires_explicit_acknowledgement_and_does_not_authoriz
     }
     let negative = vacuum(&["--vacuum-retention-secs=-1", "--allow-short-vacuum-retention"])?;
     assert_eq!(negative.status.code(), Some(2), "negative durations fail CLI parsing");
+    let bounded = vacuum(&[
+        "--vacuum-retention-secs",
+        "0",
+        "--allow-short-vacuum-retention",
+        "--replay-max-log-files",
+        "1",
+    ])?;
+    assert!(!bounded.status.success());
+    assert_eq!(lines(&bounded.stdout)?[0]["error_kind"], "resource_limit");
     let acknowledged = vacuum(&[
         "--vacuum-retention-secs",
         "0",
