@@ -380,7 +380,7 @@ async fn run_phase(
                 }
                 if sequence.is_multiple_of(10) {
                     println!(
-                        "[loadgen] {phase} {:>4}s: {} batches sent",
+                        "[loadgen] {phase} {:>4}s: {} batches scheduled",
                         started.elapsed().as_secs(),
                         scheduled
                     );
@@ -408,12 +408,13 @@ async fn run_phase(
         .context("driver progress task failed")
         .and_then(|result| result);
     println!(
-        "[loadgen] {phase} finished: {} batches sent",
+        "[loadgen] {phase} finished: {} batches scheduled",
         scheduler.scheduled().saturating_sub(first_ordinal)
     );
     let elapsed = metrics_started.elapsed().as_secs_f64();
     let metrics = serde_json::json!({
         "version": 1, "run_id": run_id, "scenario": scenario.as_str(), "phase": phase,
+        "status": if outcome.is_ok() && progress_outcome.is_ok() { "completed" } else { "failed" },
         "scope": "phase_including_inflight_drain_not_exact_measurement_window",
         "completion_semantics": "validated_admission_response_not_delta_commit",
         "attempt_semantics": "started_client_transport_attempt_not_proven_wire_delivery",
@@ -598,7 +599,7 @@ impl LaneMetrics {
             "generation_encode_proof_lookup_wall_us": self.generation_us.load(Ordering::Relaxed),
             "cache_hits": self.cache_hits.load(Ordering::Relaxed), "cache_misses": self.cache_misses.load(Ordering::Relaxed),
             "send_latency": {"samples": samples, "p50_us": percentile(50), "p95_us": percentile(95), "p99_us": percentile(99),
-                "scope": "all_physical_attempts_log2_microsecond_upper_bound"},
+                "scope": "resolved_physical_attempts_log2_microsecond_upper_bound_cancelled_excluded"},
         }))
     }
 }

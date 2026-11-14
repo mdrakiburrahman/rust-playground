@@ -5,21 +5,20 @@ use std::io::Write;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let threads = match &cli.command {
-        Command::Run(arguments) if arguments.client_tuning.runtime_threads > 0 => {
-            arguments.client_tuning.runtime_threads
-        }
-        _ => std::thread::available_parallelism()?.get(),
-    };
-    anyhow::ensure!(
-        (1..=1024).contains(&threads),
-        "runtime-threads must resolve to 1..=1024"
-    );
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(threads)
-        .enable_all()
-        .build()?
-        .block_on(run(cli))
+    let mut runtime = tokio::runtime::Builder::new_multi_thread();
+    runtime.enable_all();
+    if let Command::Run(arguments) = &cli.command {
+        let threads = match arguments.client_tuning.runtime_threads {
+            0 => std::thread::available_parallelism()?.get(),
+            threads => threads,
+        };
+        anyhow::ensure!(
+            (1..=1024).contains(&threads),
+            "runtime-threads must resolve to 1..=1024"
+        );
+        runtime.worker_threads(threads);
+    }
+    runtime.build()?.block_on(run(cli))
 }
 
 async fn run(cli: Cli) -> Result<()> {
