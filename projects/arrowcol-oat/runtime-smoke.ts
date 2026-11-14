@@ -94,7 +94,11 @@ async function main(): Promise<void> {
   ['--warehouse-root', '/onelake/dataflow', '--ingestion-layout',
     '--ddl-identity-secret-file', '/run/oat/internal-hmac']);
   startCatalog();
-  await waitReady(catalog, ['/usr/local/bin/arrowcol-catalog-rust', '--healthcheck']);
+  await waitReady(catalog, [
+    '/usr/local/bin/arrowcol-catalog-rust',
+    '--ddl-identity-secret-file', '/run/oat/internal-hmac',
+    '--healthcheck',
+  ]);
   const routerName = `${prefix}-router`;
   run(routerName, secretMount, images.router, ['--config', '/run/oat/router.yaml']);
   const tables = ['sqlserver_wait_stats', 'sqlserver_cpu_utilization'];
@@ -156,7 +160,11 @@ async function main(): Promise<void> {
     }
   }
   stop(catalog); startCatalog();
-  await waitReady(catalog, ['/usr/local/bin/arrowcol-catalog-rust', '--healthcheck']);
+  await waitReady(catalog, [
+    '/usr/local/bin/arrowcol-catalog-rust',
+    '--ddl-identity-secret-file', '/run/oat/internal-hmac',
+    '--healthcheck',
+  ]);
   stop(catalog); stop(routerName);
   console.log('PASS catalog persistence/restart and repeated SQL migrations; no cloud benchmark evidence produced.');
 }
