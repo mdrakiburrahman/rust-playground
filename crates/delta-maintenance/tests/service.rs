@@ -94,6 +94,7 @@ fn effective_configuration_is_reported_for_a_negative_probe() -> Result<()> {
     table(&root.path().join("events"))?;
     let output = service(root.path())?
         .env("ARROWCOL_MAINT_MIN_FILES", "4")
+        .env("ARROWCOL_PARQUET_CONFIG", r#"{"defaults":{"compression":"snappy"}}"#)
         .args(["--operation", "optimize", "--min-files", "3"])
         .output()?;
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
@@ -112,6 +113,10 @@ fn effective_configuration_is_reported_for_a_negative_probe() -> Result<()> {
     assert_eq!(table["table"], "events");
     assert_eq!(table["config"]["table_policy"]["arrowcol.optimize.minFiles"], 3);
     assert_eq!(table["config"]["operation_settings"]["layout_mode"], "automatic");
+    assert_eq!(
+        table["config"]["parquet_writer_overrides"]["defaults"]["compression"],
+        "snappy"
+    );
     let env_only = service(root.path())?
         .env("ARROWCOL_MAINT_MIN_FILES", "4")
         .args(["--operation", "optimize"])
