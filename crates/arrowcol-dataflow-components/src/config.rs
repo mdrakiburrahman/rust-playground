@@ -7,9 +7,96 @@ use arrowcol_catalog::{CatalogControlPlane, CatalogStore, DdlParser, FlightSqlDd
 use arrowcol_flight::{RuntimeLimits, RuntimeResult};
 use arrowcol_protocol::{PositiveMeasurement, UnixMillis};
 use arrowcol_routing::{MemoryRoutingStore, RoutingStore, SqlServerRoutingConfig, SqlServerRoutingStore};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 static CLOUD_GENERATION: OnceLock<String> = OnceLock::new();
+
+#[cfg(test)]
+mod override_tests {
+    use super::*;
+
+    #[test]
+    fn nested_override_preserves_yaml_values_and_validates_final_budget() -> Result<(), String> {
+        let config = FileBatchConfig {
+            max_age: Duration::from_secs(5),
+            ..Default::default()
+        };
+        let merged = merge_config(
+            &config,
+            r#"{"per_table_capacity":{"rows":1234},"max_rows_per_flush":1000}"#,
+            None,
+        )?;
+        assert_eq!(merged.max_age, config.max_age);
+        assert_eq!(merged.per_table_capacity.bytes, config.per_table_capacity.bytes);
+        assert_eq!(merged.per_table_capacity.rows, 1234);
+        merged.validate()?;
+        let invalid = merge_config(&config, r#"{"max_rows_per_flush":0}"#, None)?;
+        assert!(invalid.validate().is_err());
+        assert!(merge_config(&config, r#"{"max_row_per_flush":10}"#, None).is_err());
+        assert!(merge_config(&config, r#"{"per_table_capacity":{"extra":1}}"#, None).is_err());
+        assert!(merge_config(&config, "[]", None).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn pressure_overrides_cannot_change_identity() {
+        assert!(
+            merge_config(
+                &serde_json::json!({"instance_key": "original"}),
+                r#"{"instance_key":"replacement"}"#,
+                Some(&["rss_limit_bytes"]),
+            )
+            .is_err()
+        );
+    }
+}
+
+fn apply_json_environment<T: Serialize + serde::de::DeserializeOwned>(
+    config: &mut T,
+    name: &str,
+    allowed: Option<&[&str]>,
+) -> Result<(), String> {
+    let json = match std::env::var(name) {
+        Ok(json) => json,
+        Err(std::env::VarError::NotPresent) => return Ok(()),
+        Err(error) => return Err(format!("{name}: {error}")),
+    };
+    *config = merge_config(config, &json, allowed).map_err(|error| format!("{name}: {error}"))?;
+    Ok(())
+}
+
+fn merge_config<T: Serialize + serde::de::DeserializeOwned>(
+    config: &T,
+    json: &str,
+    allowed: Option<&[&str]>,
+) -> Result<T, String> {
+    fn merge(base: &mut serde_json::Value, patch: serde_json::Value) {
+        match (base, patch) {
+            (serde_json::Value::Object(base), serde_json::Value::Object(patch)) => {
+                for (key, value) in patch {
+                    if let Some(existing) = base.get_mut(&key) {
+                        merge(existing, value);
+                    } else {
+                        base.insert(key, value);
+                    }
+                }
+            }
+            (base, patch) => *base = patch,
+        }
+    }
+    let patch: serde_json::Value = serde_json::from_str(json).map_err(|error| error.to_string())?;
+    let object = patch.as_object().ok_or("collector override must be a JSON object")?;
+    if let Some(allowed) = allowed {
+        for key in object.keys() {
+            if !allowed.contains(&key.as_str()) {
+                return Err(format!("unsupported pressure override {key}"));
+            }
+        }
+    }
+    let mut base = serde_json::to_value(config).map_err(|error| error.to_string())?;
+    merge(&mut base, patch);
+    serde_json::from_value(base).map_err(|error| error.to_string())
+}
 
 /// Freezes the embedding collector's validated cloud epoch before DFE admission.
 ///
@@ -237,7 +324,7 @@ impl RoutingStoreConfig {
 }
 
 /// Declarative Arrow Flight runtime limits.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeLimitsConfig {
     /// Maximum aggregate gRPC metadata bytes.
@@ -294,7 +381,7 @@ impl RuntimeLimitsConfig {
 }
 
 /// Collector registration and pressure-publication settings.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RegistrationConfig {
     /// Stable deployment key.
@@ -391,6 +478,22 @@ pub struct FlightReceiverConfig {
 }
 
 impl FlightReceiverConfig {
+    pub(crate) fn apply_environment(&mut self) -> Result<(), String> {
+        apply_json_environment(&mut self.limits, "ARROWCOL_COLLECTOR_LIMITS_CONFIG", None)?;
+        apply_json_environment(
+            &mut self.registration,
+            "ARROWCOL_COLLECTOR_PRESSURE_CONFIG",
+            Some(&[
+                "max_concurrent_streams",
+                "rss_limit_bytes",
+                "buffered_bytes_limit",
+                "buffered_rows_limit",
+                "buffered_batches_limit",
+                "pressure_interval",
+            ]),
+        )
+    }
+
     pub(crate) fn validate(&self) -> Result<(), String> {
         if self.listening_addr.port() == 0
             || self.admin_listening_addr.port() == 0
@@ -407,7 +510,7 @@ impl FlightReceiverConfig {
 }
 
 /// Bounded Delta publication settings.
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, Hash, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct CommitConfig {
     /// Maximum batching delay.
@@ -462,6 +565,11 @@ pub struct DeltaExporterConfig {
 }
 
 impl DeltaExporterConfig {
+    pub(crate) fn apply_environment(&mut self) -> Result<(), String> {
+        apply_json_environment(&mut self.batching, "ARROWCOL_COLLECTOR_BATCHING_CONFIG", None)?;
+        apply_json_environment(&mut self.commit, "ARROWCOL_COLLECTOR_COMMIT_CONFIG", None)
+    }
+
     pub(crate) fn validate(&self) -> Result<(), String> {
         if !self.base_path.is_absolute() && !self.base_path.to_string_lossy().starts_with("abfss://") {
             return Err("Delta base_path must be absolute or an abfss URI".to_owned());
@@ -477,7 +585,7 @@ impl DeltaExporterConfig {
 }
 
 /// Logical Arrow capacity retained until publication finishes.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct BatchCapacity {
     /// Logical Arrow bytes.
@@ -489,9 +597,11 @@ pub struct BatchCapacity {
 }
 
 /// Bounded file grouping, independent of delivery receipt semantics.
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct FileBatchConfig {
+    /// Combine publications only through replay-safe atomic file groups.
+    pub coalesce_publications: bool,
     /// Process-wide queued and in-flight capacity.
     pub global_capacity: BatchCapacity,
     /// Per-table queued and in-flight capacity.
@@ -514,6 +624,7 @@ pub struct FileBatchConfig {
 impl Default for FileBatchConfig {
     fn default() -> Self {
         Self {
+            coalesce_publications: false,
             global_capacity: BatchCapacity {
                 bytes: 2 * 1024 * 1024 * 1024,
                 rows: 10_000_000,
@@ -567,7 +678,7 @@ impl FileBatchConfig {
 }
 
 /// Configuration for the shared compressed-file size estimator.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct AdaptiveFileConfig {
     /// Desired compressed Parquet bytes.
