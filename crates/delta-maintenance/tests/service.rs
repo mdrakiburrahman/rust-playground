@@ -94,6 +94,7 @@ fn effective_configuration_is_reported_for_a_negative_probe() -> Result<()> {
     table(&root.path().join("events"))?;
     let output = service(root.path())?
         .env("ARROWCOL_MAINT_MIN_FILES", "4")
+        .env("ARROWCOL_MAINT_INPUT_READ_STRATEGY", "spool")
         .env("ARROWCOL_PARQUET_CONFIG", r#"{"defaults":{"compression":"snappy"}}"#)
         .args(["--operation", "optimize", "--min-files", "3"])
         .output()?;
@@ -110,6 +111,7 @@ fn effective_configuration_is_reported_for_a_negative_probe() -> Result<()> {
     let startup = event("arrowcol_maintenance_effective_config ")?;
     let table = event("arrowcol_maintenance_table_config ")?;
     assert_eq!(startup["table_policy"]["arrowcol.optimize.minFiles"], 3);
+    assert_eq!(startup["startup"]["input_read_strategy"], "spool");
     assert_eq!(table["table"], "events");
     assert_eq!(table["config"]["table_policy"]["arrowcol.optimize.minFiles"], 3);
     assert_eq!(table["config"]["operation_settings"]["layout_mode"], "automatic");
@@ -129,12 +131,24 @@ fn effective_configuration_is_reported_for_a_negative_probe() -> Result<()> {
         .ok_or_else(|| anyhow!("missing startup configuration"))?;
     let config: serde_json::Value = serde_json::from_str(config)?;
     assert_eq!(config["table_policy"]["arrowcol.optimize.minFiles"], 4);
+    assert_eq!(config["startup"]["input_read_strategy"], "memory");
+    let invalid = service(root.path())?
+        .args(["--operation", "optimize", "--input-read-strategy", "invalid"])
+        .output()?;
+    assert!(!invalid.status.success());
     Ok(())
 }
 
 #[test]
 fn shared_parquet_policy_controls_sorted_and_unsorted_compaction() -> Result<()> {
-    for sorted in [false, true] {
+    for (sorted, strategy) in [
+        (false, "memory"),
+        (true, "memory"),
+        (false, "spool"),
+        (true, "spool"),
+        (false, "range"),
+        (true, "range"),
+    ] {
         let root = tempfile::tempdir()?;
         let path = root.path().join("events");
         table(&path)?;
@@ -148,6 +162,8 @@ fn shared_parquet_policy_controls_sorted_and_unsorted_compaction() -> Result<()>
                 "optimize",
                 "--sealed-final",
                 "--apply",
+                "--input-read-strategy",
+                strategy,
                 "--layout-enabled",
                 if sorted { "true" } else { "false" },
                 "--layout-sort-columns",
@@ -160,7 +176,7 @@ fn shared_parquet_policy_controls_sorted_and_unsorted_compaction() -> Result<()>
         let reports = lines(&output.stdout)?;
         let outputs = reports[0]["report"]["outputs"].as_array().context("missing outputs")?;
         assert_eq!(outputs.len(), 4);
-        let mut total_rows = 0;
+        let mut all_ids = Vec::new();
         for output in outputs {
             let relative = output.as_str().context("output path")?;
             let url = Url::from_directory_path(&path)
@@ -186,9 +202,10 @@ fn shared_parquet_policy_controls_sorted_and_unsorted_compaction() -> Result<()>
             if sorted {
                 assert!(ids.windows(2).all(|pair| pair[0] <= pair[1]));
             }
-            total_rows += ids.len();
+            all_ids.extend(ids);
         }
-        assert_eq!(total_rows, 8);
+        all_ids.sort_unstable();
+        assert_eq!(all_ids, [0, 1, 10, 11, 20, 21, 30, 31]);
     }
     Ok(())
 }

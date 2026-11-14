@@ -21,6 +21,7 @@ opentelemetry = { workspace = true, optional = true }
 arrowcol-props = { path = "../arrowcol-props" }
 arrow = { version = "58.3", default-features = false }
 arrow-json = { version = "58.3", default-features = false }
+bytes = "1"
 parquet = { version = "58.3", default-features = false, features = ["arrow", "async", "snap", "brotli", "flate2-zlib-rs", "lz4", "zstd"] }
 tokio = { version = "1", features = ["fs", "io-util", "process", "rt-multi-thread", "sync", "time", "macros"] }
 uuid = { version = "1", features = ["v4"] }
@@ -38,6 +39,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 sha2 = "0.10"
 async-trait = "0.1"
 tracing.workspace = true
+tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["process"] }
@@ -45,7 +47,6 @@ rustix = { version = "1", features = ["process"] }
 [dev-dependencies]
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tracing-subscriber.workspace = true
-tempfile = "3"
 tokio = { version = "1", features = ["macros"] }
 
 [lints]

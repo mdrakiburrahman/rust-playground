@@ -1,7 +1,7 @@
 //! `delta-maintenance` command line: dry-run plans by default, `--apply` to mutate.
 
 use anyhow::{Context, Result, anyhow};
-use arrow_deltalake::maintenance::{Granularity, OptimizeConfig};
+use arrow_deltalake::maintenance::{Granularity, InputReadStrategy, OptimizeConfig};
 use clap::Parser;
 use delta_kernel::metrics::WithMetricsReporterLayer;
 use delta_maintenance::{Metrics, Operation, Settings, run, serve_metrics, startup_configuration};
@@ -136,6 +136,9 @@ struct Cli {
     max_batch_bytes: usize,
     #[arg(long, env = "ARROWCOL_MAINT_BATCH_ROWS", default_value_t = 8192)]
     batch_rows: usize,
+    /// Buffer in memory, spool to disk, or fetch ETag-fenced ranges.
+    #[arg(long, env = "ARROWCOL_MAINT_INPUT_READ_STRATEGY",     value_parser = ["memory", "spool", "range"], default_value = "memory")]
+    input_read_strategy: String,
     #[arg(long, env = "ARROWCOL_MAINT_OUTPUT_ROW_GROUP_ROWS", default_value_t = 65_536)]
     output_row_group_rows: usize,
     #[arg(long, env = "ARROWCOL_MAINT_MAX_OUTPUT_FILE_BYTES", default_value_t = 1023 * 1024 * 1024)]
@@ -257,6 +260,12 @@ fn settings(cli: Cli) -> Result<Settings> {
             max_row_group_bytes: cli.max_row_group_bytes,
             max_batch_bytes: cli.max_batch_bytes,
             batch_rows: cli.batch_rows,
+            input_read_strategy: match cli.input_read_strategy.as_str() {
+                "memory" => InputReadStrategy::Memory,
+                "spool" => InputReadStrategy::Spool,
+                "range" => InputReadStrategy::Range,
+                value => return Err(anyhow!("invalid input read strategy: {value}")),
+            },
             output_row_group_rows: cli.output_row_group_rows,
             max_output_file_bytes: cli.max_output_file_bytes,
             max_active_files: cli.max_active_files,
