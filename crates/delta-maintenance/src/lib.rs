@@ -61,6 +61,34 @@ impl Operation {
     }
 }
 
+/// Process-level bounds for existing non-OPTIMIZE operations.
+#[derive(Clone, Debug, Serialize)]
+pub struct OperationLimits {
+    pub purge_max_files_per_commit: usize,
+    pub purge_max_plan_bytes: usize,
+    pub vacuum_delete_chunk: usize,
+    pub vacuum_max_plan_bytes: usize,
+    pub replay_max_log_files: usize,
+    pub replay_max_log_file_bytes: u64,
+    pub replay_max_checkpoint_bytes: u64,
+    pub operation_max_active_files: usize,
+}
+
+impl Default for OperationLimits {
+    fn default() -> Self {
+        Self {
+            purge_max_files_per_commit: 10_000,
+            purge_max_plan_bytes: 4 * 1024 * 1024,
+            vacuum_delete_chunk: 256,
+            vacuum_max_plan_bytes: 8 * 1024 * 1024,
+            replay_max_log_files: 100_000,
+            replay_max_log_file_bytes: 64 * 1024 * 1024,
+            replay_max_checkpoint_bytes: 256 * 1024 * 1024,
+            operation_max_active_files: 1_000_000,
+        }
+    }
+}
+
 /// Validated service settings.
 #[derive(Clone, Debug)]
 pub struct Settings {
@@ -95,6 +123,7 @@ pub struct Settings {
     pub log_retention_ms: Option<i64>,
     /// Maximum log objects one `prune-log` apply deletes.
     pub max_prune_files: usize,
+    pub operation_limits: OperationLimits,
 }
 
 impl Settings {
@@ -131,6 +160,18 @@ impl Settings {
         }
         if self.max_prune_files == 0 {
             bail!("--max-prune-files must be nonzero");
+        }
+        let limits = &self.operation_limits;
+        if limits.purge_max_files_per_commit == 0
+            || limits.purge_max_plan_bytes < 1024
+            || limits.vacuum_delete_chunk == 0
+            || limits.vacuum_max_plan_bytes < 1024
+            || limits.replay_max_log_files == 0
+            || limits.replay_max_log_file_bytes == 0
+            || limits.replay_max_checkpoint_bytes == 0
+            || limits.operation_max_active_files == 0
+        {
+            bail!("operation limits must be positive; plan byte limits must be at least 1024");
         }
         if self.log_retention_ms.is_some_and(|retention| retention < 0) {
             bail!("log retention must not be negative");
@@ -589,6 +630,7 @@ fn configuration_evidence(startup: &Settings, settings: &Settings, props: &Resol
             "max_prune_files": startup.max_prune_files,
             "output_row_group_rows": startup.optimize.output_row_group_rows,
             "input_read_strategy": startup.optimize.input_read_strategy,
+            "operation_limits": startup.operation_limits,
         },
         "table_policy": policy,
         "parquet_writer_overrides": arrow_deltalake::writer::process_config()?,
@@ -986,6 +1028,10 @@ fn run_operation(
                 log_retention_ms: settings.log_retention_ms,
                 unsafe_allow_short_retention_for_tests: settings.unsafe_short_vacuum_for_tests,
                 max_prune_files: settings.max_prune_files,
+                max_log_files: settings.operation_limits.replay_max_log_files,
+                max_log_file_bytes: settings.operation_limits.replay_max_log_file_bytes,
+                max_checkpoint_bytes: settings.operation_limits.replay_max_checkpoint_bytes,
+                max_active_files: settings.operation_limits.operation_max_active_files,
                 ..PruneConfig::new(anchor)
             };
             let plan = table.plan_prune_log(&config)?;
@@ -1012,7 +1058,12 @@ fn run_operation(
         Operation::Purge => {
             let granularity = settings.granularity.context("purge granularity")?;
             let retention = settings.purge_retention_ms.context("purge retention")?;
-            let config = PurgeConfig::new(retention, anchor, granularity);
+            let config = PurgeConfig {
+                max_files_per_commit: settings.operation_limits.purge_max_files_per_commit,
+                max_plan_bytes: settings.operation_limits.purge_max_plan_bytes,
+                max_active_files: settings.operation_limits.operation_max_active_files,
+                ..PurgeConfig::new(retention, anchor, granularity)
+            };
             let prepared = table.prepare_purge(&config)?;
             if settings.apply {
                 return table.apply_prepared_purge(&prepared, &config, control);
@@ -1024,6 +1075,12 @@ fn run_operation(
             config.allow_short_vacuum_retention = settings.allow_short_vacuum_retention;
             config.unsafe_allow_short_retention_for_tests = settings.unsafe_short_vacuum_for_tests;
             config.max_deletes = usize::try_from(props.unsigned("arrowcol.vacuum.maxDeletes")?)?;
+            config.delete_chunk = settings.operation_limits.vacuum_delete_chunk;
+            config.max_plan_bytes = settings.operation_limits.vacuum_max_plan_bytes;
+            config.max_log_files = settings.operation_limits.replay_max_log_files;
+            config.max_log_file_bytes = settings.operation_limits.replay_max_log_file_bytes;
+            config.max_checkpoint_bytes = settings.operation_limits.replay_max_checkpoint_bytes;
+            config.max_active_files = settings.operation_limits.operation_max_active_files;
             return table.vacuum_once(&config, settings.apply, control);
         }
     };

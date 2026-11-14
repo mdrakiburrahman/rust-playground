@@ -74,6 +74,7 @@ fn fixture() -> Result<(tempfile::TempDir, Settings, CatalogTable)> {
         checkpoint_every_commits: 100,
         log_retention_ms: None,
         max_prune_files: 100,
+        operation_limits: Default::default(),
     };
     let source = CatalogTable(DiscoveredTable {
         name: "events".into(),
