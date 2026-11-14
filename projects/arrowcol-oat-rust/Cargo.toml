@@ -17,6 +17,7 @@ arrow = { version = "58.3", default-features = false }
 arrowcol-protocol = { path = "../../crates/arrowcol-protocol" }
 arrowcol-routing = { path = "../../crates/arrowcol-routing" }
 arrow-deltalake = { path = "../../crates/arrow-deltalake" }
+arrowcol-tunables = { path = "../../crates/arrowcol-tunables" }
 arrowcol-loadgen = { path = "../loadtest/loadgen" }
 chrono = "0.4"
 axum = "0.8"

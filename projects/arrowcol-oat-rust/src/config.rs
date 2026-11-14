@@ -1,3 +1,4 @@
+use arrowcol_tunables::Tunables;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -7,6 +8,8 @@ use url::Url;
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OatConfig {
+    #[serde(default)]
+    pub tunables: Tunables,
     pub platform: PlatformConfig,
     pub stamp: Option<String>,
     pub warmup_seconds: u64,
@@ -132,6 +135,7 @@ impl OatConfig {
     ///
     /// Returns an error when a setting is invalid or a requested DMV table is unsupported.
     pub fn validate(&self) -> Result<()> {
+        self.tunables.validate()?;
         if self.warmup_seconds > 300 || !(1..=600).contains(&self.measure_seconds) {
             bail!("warmup_seconds must be at most 300 and measure_seconds must be between 1 and 600");
         }
@@ -593,6 +597,7 @@ mod tests {
                 .unwrap_or_else(|error| panic!("write isolated OAT config fixture {}: {error}", path.display()));
         }
         let config = OatConfig {
+            tunables: Tunables::default(),
             platform: PlatformConfig {
                 kind: OatMode::Aks,
                 compose_file: None,
