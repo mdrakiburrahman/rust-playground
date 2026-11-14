@@ -629,6 +629,7 @@ fn test_config(listen: SocketAddr, state_directory: String) -> RouterConfig {
             listen,
             threads: 2,
             listener_tasks_per_fd: 1,
+            upstream_keepalive_pool_size: 1024,
             grace_period_seconds: 1,
             graceful_shutdown_timeout_seconds: 15,
             state_directory: state_directory.into(),

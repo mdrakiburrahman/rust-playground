@@ -28,7 +28,7 @@ start_collector() {
   local admin="$3"
   local output="$work/$name"
   mkdir -p "$output"
-  ARROWCOL_QUIVER_PATH="$output/quiver" \
+  ARROWCOL_WAL_PATH="$output/quiver" \
     "$binary" --num-cores 1 --config "$project/$config" >"$output/collector.log" 2>&1 &
   pid=$!
 
