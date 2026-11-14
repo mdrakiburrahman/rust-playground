@@ -23,6 +23,7 @@ test('real Compose merge removes fixed networking and preserves daemon-selected 
       encoding: 'utf8',
       env: {
         ...process.env,
+        GIT_SHA: 'a'.repeat(40),
         LOADTEST_UID: '10001', LOADTEST_GID: '10001', LOADTEST_WORKSPACE: repo, LOADTEST_BIN_HOST_PATH: repo,
         ONELAKE_HOST_PATH: temporary, OAT_CONTROL_HOST_PATH: temporary, OAT_PIN_INIT_CONFIG_HOST_PATH: secret,
         SQLSERVER_SA_PASSWORD_FILE: secret, ARROWCOL_APP_PASSWORD_FILE: secret, ARROWCOL_MIGRATOR_PASSWORD_FILE: secret,
@@ -35,6 +36,7 @@ test('real Compose merge removes fixed networking and preserves daemon-selected 
     assert.equal(result.status, 0, result.stderr);
     const resolved = JSON.parse(result.stdout) as {
       services: Record<string, {
+        build?: { args?: Record<string, string> };
         environment?: Record<string, string>;
         networks: Record<string, { ipv4_address?: string }>;
         ports?: Array<{ host_ip: string; published: string }>;
@@ -52,6 +54,9 @@ test('real Compose merge removes fixed networking and preserves daemon-selected 
       resolved.services['arrowcol-catalog']?.environment?.ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE,
       '/run/secrets/internal-hmac',
     );
+    for (const service of ['arrowcol-catalog', 'dataflow-1', 'router']) {
+      assert.equal(resolved.services[service]?.build?.args?.VCS_REF, 'a'.repeat(40), service);
+    }
     assert.equal(resolved.networks.default?.ipam?.config?.length ?? 0, 0);
   } finally {
     await rm(temporary, { recursive: true, force: true });
