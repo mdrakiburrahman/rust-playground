@@ -1,14 +1,14 @@
 # ArrowCol OAT benchmark results
 
-| File | Purpose |
-| --- | --- |
-| `index.html` | Static, Excel-like heatmap viewer using Hyparquet in the browser, with a live numbered architecture diagram and config-to-stack mapping. |
-| `architecture.svg` | Full-width layered architecture displayed on the live page, with embedded official icons and numbered parts 1–6. |
-| `results.parquet` | Sanitized, compact benchmark summary published by the OAT server. |
-| `oat-config.example.json` | Validated configuration template with no credentials. |
-| `architecture.drawio` / `architecture.drawio.png` | Editable source and rendered companion for the same layered architecture. |
-| [Runtime setup](RUNTIME.md) | Isolated internal-only Kubernetes stack, image digests, workload identity, SQL bootstrap, secret files and local rehearsal. |
-| [E1-E5 input preparation](EXPERIMENTS.md) | Offline binding of private AKS settings and reviewed pilot windows into five comparable 32-table runs. |
+| File                                              | Purpose                                                                                                                                  |
+| ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `index.html`                                      | Static, Excel-like heatmap viewer using Hyparquet in the browser, with a live numbered architecture diagram and config-to-stack mapping. |
+| `architecture.svg`                                | Full-width layered architecture displayed on the live page, with embedded official icons and numbered parts 1–6.                         |
+| `results.parquet`                                 | Sanitized, compact benchmark summary published by the OAT server.                                                                        |
+| `oat-config.example.json`                         | Validated configuration template with no credentials.                                                                                    |
+| `architecture.drawio` / `architecture.drawio.png` | Editable source and rendered companion for the same layered architecture.                                                                |
+| [Runtime setup](RUNTIME.md)                       | Isolated internal-only Kubernetes stack, image digests, workload identity, SQL bootstrap, secret files and local rehearsal.              |
+| [E1-E5 input preparation](EXPERIMENTS.md)         | Offline binding of private AKS settings and reviewed pilot windows into five comparable 32-table runs.                                   |
 
 The viewer's six numbered stack parts match the diagram badges. Their numbers appear beside every OAT JSON field and Parquet result column that they affect. Preserve these IDs and titles when updating the diagram, configuration reference, or heatmap.
 
@@ -39,44 +39,44 @@ ownership violation; only observed invariant loss or an explicit router
 pinning rejection warrants `pinning_violation`. The viewer labels these states
 separately and continues displaying null metrics as a dash, not zero.
 
-| Column | Type | Nullability | Meaning |
-| --- | --- | --- | --- |
-| `schema_version` | 32-bit signed integer | Required | Contract version; currently `2`. |
-| `mode` | UTF-8 string | Required | `local` or `aks`. |
-| `stamp` | UTF-8 string | Nullable | Deployment stamp, when available. |
-| `host` | UTF-8 string | Required | Host running the OAT workload. |
-| `experiment` | UTF-8 string | Required | Named tunable combination. |
-| `started_at` | Timestamp (milliseconds, UTC) | Required | Experiment start time. |
-| `measure_seconds` | 64-bit float | Required | Steady-state measurement window. |
-| `arrowcols` | 32-bit signed integer | Required | ArrowCol replica count. |
-| `clients` | 32-bit signed integer | Required | Client fleet size. |
-| `tables` | 32-bit signed integer | Required | Number of selected tables. |
-| `table_owner` | UTF-8 string | Nullable | Stable ArrowCol owner for this table. |
-| `pinning_ok` | Boolean | Required | True only when the owner remains valid and unchanged for the full experiment. |
-| `status` | UTF-8 string | Required | Result status; pinning violations use `pinning_violation`. |
-| `git_sha` | UTF-8 string | Required | Owned-server build revision from a clean, unchanged Git checkout; `unknown` for uncommitted source. External servers retain their own provenance. |
-| `tunables_json` | UTF-8 string | Required | JSON object containing the experiment tunables. |
+| Column            | Type                          | Nullability | Meaning                                                                                                                                           |
+| ----------------- | ----------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `schema_version`  | 32-bit signed integer         | Required    | Contract version; currently `2`.                                                                                                                  |
+| `mode`            | UTF-8 string                  | Required    | `local` or `aks`.                                                                                                                                 |
+| `stamp`           | UTF-8 string                  | Nullable    | Deployment stamp, when available.                                                                                                                 |
+| `host`            | UTF-8 string                  | Required    | Host running the OAT workload.                                                                                                                    |
+| `experiment`      | UTF-8 string                  | Required    | Named tunable combination.                                                                                                                        |
+| `started_at`      | Timestamp (milliseconds, UTC) | Required    | Experiment start time.                                                                                                                            |
+| `measure_seconds` | 64-bit float                  | Required    | Steady-state measurement window.                                                                                                                  |
+| `arrowcols`       | 32-bit signed integer         | Required    | ArrowCol replica count.                                                                                                                           |
+| `clients`         | 32-bit signed integer         | Required    | Client fleet size.                                                                                                                                |
+| `tables`          | 32-bit signed integer         | Required    | Number of selected tables.                                                                                                                        |
+| `table_owner`     | UTF-8 string                  | Nullable    | Stable ArrowCol owner for this table.                                                                                                             |
+| `pinning_ok`      | Boolean                       | Required    | True only when the owner remains valid and unchanged for the full experiment.                                                                     |
+| `status`          | UTF-8 string                  | Required    | Result status; pinning violations use `pinning_violation`.                                                                                        |
+| `git_sha`         | UTF-8 string                  | Required    | Owned-server build revision from a clean, unchanged Git checkout; `unknown` for uncommitted source. External servers retain their own provenance. |
+| `tunables_json`   | UTF-8 string                  | Required    | JSON object containing the experiment tunables.                                                                                                   |
 
 The producer retains these original result columns:
 
-| Column | Type | Meaning |
-| --- | --- | --- |
-| `run_id` | UTF-8 string | Benchmark run identifier. |
-| `replicas` | 64-bit unsigned integer | ArrowCol replica count. |
-| `dfe_worker_concurrency` | 64-bit unsigned integer | DFE `--num-cores` setting. |
-| `table` | UTF-8 string | DMV table used as the table-scoped routing key. |
-| `rows` | Nullable 64-bit unsigned integer | Rows sent by the standalone DMV client; null if no complete measurement. |
-| `duration_ms` | Nullable 64-bit unsigned integer | Shared fleet measurement duration; excludes preflight and warm-up; null if unmeasured. |
-| `rows_per_second` | Nullable 64-bit float | Total table rows completed during the shared window divided by its duration; null if unmeasured. |
-| `cpu_millicores` | Nullable 64-bit float | Unique collector/DFE pod CPU from `kubectl top`; integrated pods are counted once. |
-| `memory_bytes` | Nullable 64-bit unsigned integer | Unique collector/DFE pod memory from `kubectl top`; integrated pods are counted once. |
-| `qap_observation_complete` | 64-bit unsigned integer | 1 only when all expected QAP tables and required fields were measured; otherwise 0. |
-| `qap_observed_tables` | 64-bit unsigned integer | Number of expected QAP tables observed. |
-| `qap_completion_percent` | Nullable 64-bit float | Minimum reported completion percentage across the selected tables. |
-| `qap_pending_artifacts` | Nullable 64-bit unsigned integer | Sum of pending artifacts across selected tables. |
-| `qap_cached_bytes` | Nullable 64-bit unsigned integer | Sum of QAP `HotSize` bytes across selected tables. |
-| `qap_unhealthy_catalogs` | Nullable 64-bit unsigned integer | Sum of unhealthy catalog counts across selected tables. |
-| `qap_lag_seconds` | Nullable 64-bit float | Maximum reported QAP lag across selected tables. |
+| Column                     | Type                             | Meaning                                                                                          |
+| -------------------------- | -------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `run_id`                   | UTF-8 string                     | Benchmark run identifier.                                                                        |
+| `replicas`                 | 64-bit unsigned integer          | ArrowCol replica count.                                                                          |
+| `dfe_worker_concurrency`   | 64-bit unsigned integer          | DFE `--num-cores` setting.                                                                       |
+| `table`                    | UTF-8 string                     | DMV table used as the table-scoped routing key.                                                  |
+| `rows`                     | Nullable 64-bit unsigned integer | Rows sent by the standalone DMV client; null if no complete measurement.                         |
+| `duration_ms`              | Nullable 64-bit unsigned integer | Shared fleet measurement duration; excludes preflight and warm-up; null if unmeasured.           |
+| `rows_per_second`          | Nullable 64-bit float            | Total table rows completed during the shared window divided by its duration; null if unmeasured. |
+| `cpu_millicores`           | Nullable 64-bit float            | Unique collector/DFE pod CPU from `kubectl top`; integrated pods are counted once.               |
+| `memory_bytes`             | Nullable 64-bit unsigned integer | Unique collector/DFE pod memory from `kubectl top`; integrated pods are counted once.            |
+| `qap_observation_complete` | 64-bit unsigned integer          | 1 only when all expected QAP tables and required fields were measured; otherwise 0.              |
+| `qap_observed_tables`      | 64-bit unsigned integer          | Number of expected QAP tables observed.                                                          |
+| `qap_completion_percent`   | Nullable 64-bit float            | Minimum reported completion percentage across the selected tables.                               |
+| `qap_pending_artifacts`    | Nullable 64-bit unsigned integer | Sum of pending artifacts across selected tables.                                                 |
+| `qap_cached_bytes`         | Nullable 64-bit unsigned integer | Sum of QAP `HotSize` bytes across selected tables.                                               |
+| `qap_unhealthy_catalogs`   | Nullable 64-bit unsigned integer | Sum of unhealthy catalog counts across selected tables.                                          |
+| `qap_lag_seconds`          | Nullable 64-bit float            | Maximum reported QAP lag across selected tables.                                                 |
 
 The viewer reads `results.parquet` from the same origin using HTTP range requests; it does not need CORS configuration. Azure Storage static website hosting on the HNS-enabled account serves `$web` anonymously, even when account-level blob public access is disabled. The AKS defaults target `abfss://experiments@arrowcollector<stamp>.dfs.core.windows.net/arrowcol-oat/results.parquet` and the root `results.parquet` in that stamp's `$web`; explicit destinations may override them. `aks setup` publishes the checked-in viewer and its architecture SVG to `$web/index.html` and `$web/architecture.svg` through the federated `arrow-collector` identity so the static-site root can render the diagram and load same-origin results. The producer uses conditional ETag updates, deduplicates every write by `(run_id, table)` (last row wins), and verifies the website copy matches the authoritative results object before success. Local writers serialize read/merge/rename through a cross-process file lock with a 15-second timeout. Empty results files preserve the full schema and accept later appends. Publish only approved nonsensitive summary metrics there—never credentials, raw payloads, or sensitive identifiers.
 
@@ -139,6 +139,31 @@ npx --no-install arrowcol-oat --mode aks --stamp-config "$STAMP_CONFIG" --config
 - Flags: `--what-if` read-only preview; `--network cilium` enforces NetworkPolicy (the default Azure dataplane prints `network: NOT ENFORCED`); `--stamp NNNNN` pins the stamp.
 - The run repeats preflight and refuses to start unless READY; `--preflight-only` runs just that read-only check. Setup's host assertion lasts one hour: re-run `aks setup --stamp-config "$STAMP_CONFIG"` if the run starts later.
 - Pass: `DATA FLOW: PASS` and no run-scoped namespaces or federated credentials left.
+
+### AKS run:
+
+```bash
+SUB=68fa0545-661c-4152-93f2-fc8ae1c231b8
+
+az deployment group show \
+  --subscription "$SUB" \
+  --resource-group arrow-collector-rg \
+  --name arrowcol-sandbox-stamp-87515 \
+  --query "{
+    subscription:'$SUB',
+    stamp:'87515',
+    resourceGroup:'arrow-collector-rg',
+    location:properties.parameters.location.value,
+    aks:properties.parameters.aksConfig.value,
+    storageReadLogDestination:properties.parameters.readLogStorageAccountName.value && 'storage' || 'log-analytics',
+    publisherFederatedCredentials:properties.parameters.publisherFederatedCredentials.value
+  }" \
+  --output yaml --only-show-errors
+
+export STAMP_CONFIG=.temp/stamp-87515.yaml
+npx --no-install arrowcol-oat aks setup --stamp 87515 --stamp-config "$STAMP_CONFIG"
+npx --no-install arrowcol-oat --mode aks --stamp-config "$STAMP_CONFIG" --config out/arrowcol-oat/oat-config.aks.json
+```
 
 ### AKS destroy
 
