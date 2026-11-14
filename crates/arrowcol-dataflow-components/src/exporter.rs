@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 
@@ -521,6 +521,9 @@ impl QueuedBatch {
         let reply = self.reply.take();
         let result = match result {
             Ok(()) => Ok(()),
+            Err(ExportFailure::TerminalConfiguration(message)) => {
+                Err(ExportFailure::TerminalConfiguration(message.clone()))
+            }
             Err(error) if error.permanent() => Err(ExportFailure::Permanent(error.to_string())),
             Err(error) => Err(ExportFailure::Transient(error.to_string())),
         };
@@ -760,31 +763,57 @@ impl GroupPublisher<'_> {
                             .map_err(|error| ExportFailure::Transient(error.to_string()))?,
                     ));
                 }
-                let prepared = table.stage_coalesced_publications(inputs).await.map_err(|error| {
-                    worker_failed = true;
-                    ExportFailure::Transient(format!("coalesced staging failed: {error:#}"))
-                })?;
-                published_files = prepared.appends.len() as u64;
-                for append in &prepared.appends {
-                    updated_estimator.observe(append.observation()).map_err(|error| {
-                        ExportFailure::Permanent(format!("file sizing observation failed: {error}"))
-                    })?;
+                let mut pending_groups = VecDeque::from([inputs]);
+                let mut version = 0;
+                while let Some(mut inputs) = pending_groups.pop_front() {
+                    let prepared = match table.stage_coalesced_publications(inputs.clone()).await {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            let capacity = error.downcast_ref::<CommitReceiptError>().and_then(|error| match error {
+                                CommitReceiptError::GroupCapacityExceeded {
+                                    required_files,
+                                    max_files,
+                                } => Some((*required_files, *max_files)),
+                                _ => None,
+                            });
+                            if capacity.is_some() && inputs.len() > 1 {
+                                let right = inputs.split_off(inputs.len() / 2);
+                                pending_groups.push_front(right);
+                                pending_groups.push_front(inputs);
+                                continue;
+                            }
+                            if let Some((required_files, max_files)) = capacity {
+                                return Err(ExportFailure::TerminalConfiguration(format!(
+                                    "one logical publication requires at least {required_files} files, exceeding max_files_per_commit={max_files}; exporter stopped without acknowledging or rejecting the publication; increase the commit limit before restarting"
+                                )));
+                            }
+                            worker_failed = true;
+                            return Err(ExportFailure::Transient(format!("coalesced staging failed: {error:#}")));
+                        }
+                    };
+                    published_files += prepared.appends.len() as u64;
+                    for append in &prepared.appends {
+                        updated_estimator.observe(append.observation()).map_err(|error| {
+                            ExportFailure::Permanent(format!("file sizing observation failed: {error}"))
+                        })?;
+                    }
+                    let committed = table
+                        .submit_prepared_group(prepared, true)
+                        .await
+                        .map_err(|error| {
+                            worker_failed = true;
+                            ExportFailure::Transient(format!("atomic group submission failed: {error:#}"))
+                        })?
+                        .wait()
+                        .await
+                        .map_err(|error| {
+                            worker_failed = true;
+                            ExportFailure::Transient(format!("atomic group commit failed: {error:#}"))
+                        })?;
+                    version = version.max(committed.version);
                 }
-                let committed = table
-                    .submit_prepared_group(prepared, true)
-                    .await
-                    .map_err(|error| {
-                        worker_failed = true;
-                        ExportFailure::Transient(format!("atomic group submission failed: {error:#}"))
-                    })?
-                    .wait()
-                    .await
-                    .map_err(|error| {
-                        worker_failed = true;
-                        ExportFailure::Transient(format!("atomic group commit failed: {error:#}"))
-                    })?;
                 *estimator = updated_estimator;
-                return Ok(committed.version);
+                return Ok(version);
             }
             for entry in group.iter() {
                 if let Some(stamp) = publications.insert(entry.publication_id, entry.ingested_at_ms) {
@@ -952,6 +981,9 @@ impl Drop for PendingOwner {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ExportFailure {
+    /// Stop the node without feedback so durable input stays unresolved for operator recovery.
+    #[error("{0}")]
+    TerminalConfiguration(String),
     #[error("{0}")]
     Permanent(String),
     #[error("{0}")]
@@ -998,16 +1030,17 @@ fn create_exporter(
         config.base_path = PathBuf::from(root);
     }
     config.validate().map_err(config_error)?;
+    let effective_config = config.effective_config_json();
     eprintln!(
         "arrowcol_effective_config {}",
         serde_json::json!({
             "component": "exporter",
-            "config": {"batching": config.batching, "commit": config.commit}
+            "config": effective_config.clone()
         })
     );
     tracing::info!(
         component = "exporter",
-        effective_config = %serde_json::json!({"batching": config.batching, "commit": config.commit}),
+        effective_config = %effective_config,
         "arrowcol_effective_config"
     );
     let exporter = GenericDeltaExporter::shared(config, global_metrics()).map_err(config_error)?;
@@ -1102,6 +1135,12 @@ pub(crate) async fn complete_publication(
     }
     match result {
         Ok(()) => effect_handler.notify_ack(AckMsg::new(pdata)).await,
+        Err(ExportFailure::TerminalConfiguration(message)) => Err(Error::ExporterError {
+            exporter: effect_handler.exporter_id(),
+            kind: ExporterErrorKind::Configuration,
+            error: arrowcol_buffer::safe_error_message(&message),
+            source_detail: String::new(),
+        }),
         Err(error) if error.permanent() => {
             effect_handler
                 .notify_nack(NackMsg::new_permanent_with_cause(
@@ -1340,6 +1379,350 @@ mod tests {
         .expect("batch");
         let records = encode_record_batch(envelope, batch).expect("records");
         OtapPdata::new_todo_context(otel_arrow_dfe_pdata::OtapPayload::from_pdata_arrow(records))
+    }
+
+    fn partitioned_envelope_pdata(envelope: ArrowcolBatchEnvelope, regions: &[String]) -> OtapPdata {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new("region", DataType::Utf8, false),
+        ]));
+        let rows = u64::try_from(regions.len()).expect("region count fits row ids");
+        let batch = arrow_array::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from_iter_values(0..rows)) as ArrayRef,
+                Arc::new(StringArray::from(regions.to_vec())) as ArrayRef,
+            ],
+        )
+        .expect("partitioned batch");
+        let records = encode_record_batch(envelope, batch).expect("records");
+        OtapPdata::new_todo_context(otel_arrow_dfe_pdata::OtapPayload::from_pdata_arrow(records))
+    }
+
+    fn add_file_count(root: &std::path::Path) -> usize {
+        std::fs::read_dir(root.join("_delta_log"))
+            .expect("Delta log")
+            .map(|entry| entry.expect("log entry").path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "json"))
+            .map(|path| {
+                std::fs::read_to_string(path)
+                    .expect("log contents")
+                    .lines()
+                    .filter(|line| {
+                        serde_json::from_str::<serde_json::Value>(line)
+                            .expect("action")
+                            .get("add")
+                            .is_some()
+                    })
+                    .count()
+            })
+            .sum()
+    }
+
+    fn initialize_region_partition(root: &std::path::Path) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new("region", DataType::Utf8, false),
+        ]));
+        let table = arrow_deltalake::delta::DeltaTable::open_url(
+            format!("file://{}/", root.display()).parse().expect("table URL"),
+            schema,
+            vec!["region".to_owned()],
+        )
+        .expect("partitioned table");
+        drop(table);
+    }
+
+    fn coalescing_exporter(
+        directory: &std::path::Path,
+        store: &Arc<MemoryRoutingStore>,
+        holder: CollectorInstanceId,
+    ) -> GenericDeltaExporter {
+        GenericDeltaExporter::with_batching(
+            directory.to_path_buf(),
+            Arc::clone(store) as Arc<dyn RoutingStore>,
+            arrow_deltalake::commit::CommitOptions {
+                max_files_per_commit: 1,
+                max_pending_files: 2,
+                ..Default::default()
+            },
+            FileBatchConfig {
+                coalesce_publications: true,
+                max_batches_per_flush: 16,
+                max_age: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+            Arc::new(RuntimeMetrics::new(holder)),
+        )
+        .expect("coalescing exporter")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn coalesced_publications_split_over_commit_cap_at_identity_boundaries_and_replay() {
+        let directory = tempfile::tempdir().expect("directory");
+        let root = directory.path().join("demo/generated/events");
+        initialize_region_partition(&root);
+        let store = Arc::new(MemoryRoutingStore::default());
+        let holder = CollectorInstanceId::new();
+        let lease = lease(&store, holder).await;
+        let exporter = coalescing_exporter(directory.path(), &store, holder);
+        let first = partitioned_envelope_pdata(envelope_for(&lease), &["north".to_owned()]);
+        let second = partitioned_envelope_pdata(envelope_for(&lease), &["south".to_owned()]);
+        let first_receipt = exporter.stage(first.clone()).await.expect("first publication");
+        let second_receipt = exporter.stage(second.clone()).await.expect("second publication");
+        exporter.backend.flush_pending().await.expect("flush");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            first_receipt.wait().await?;
+            second_receipt.wait().await
+        })
+        .await
+        .expect("split group commits")
+        .expect("both publications commit");
+        assert_eq!(add_file_count(&root), 2);
+
+        let first_replay = exporter.stage(first).await.expect("first replay");
+        let second_replay = exporter.stage(second).await.expect("second replay");
+        exporter.backend.flush_pending().await.expect("replay flush");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            first_replay.wait().await?;
+            second_replay.wait().await
+        })
+        .await
+        .expect("replay resolves")
+        .expect("replays deduplicate");
+        assert_eq!(add_file_count(&root), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn coalesced_single_publication_over_cap_stops_without_finalizing_delivery() {
+        let directory = tempfile::tempdir().expect("directory");
+        let root = directory.path().join("demo/generated/events");
+        initialize_region_partition(&root);
+        let store = Arc::new(MemoryRoutingStore::default());
+        let holder = CollectorInstanceId::new();
+        let lease = lease(&store, holder).await;
+        let exporter = coalescing_exporter(directory.path(), &store, holder);
+        let regions = (0..256).map(|value| format!("region-{value}")).collect::<Vec<_>>();
+        let receipt = exporter
+            .stage(partitioned_envelope_pdata(envelope_for(&lease), &regions))
+            .await
+            .expect("stage high-cardinality publication");
+        exporter.backend.flush_pending().await.expect("flush");
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), receipt.wait())
+            .await
+            .expect("capacity failure is bounded")
+            .expect_err("one logical publication must not be split");
+        assert!(matches!(error, ExportFailure::TerminalConfiguration(_)), "{error}");
+        assert!(
+            !error.permanent(),
+            "terminal capacity errors must not reject durable input"
+        );
+        assert!(error.to_string().contains("at least 2 files"), "{error}");
+        assert_eq!(add_file_count(&root), 0, "preflight rejection must write no output");
+    }
+
+    fn native_durable_buffer(
+        runtime: &otel_arrow_dfe_engine::testing::processor::TestRuntime<OtapPdata>,
+        path: &std::path::Path,
+    ) -> otel_arrow_dfe_engine::processor::ProcessorWrapper<OtapPdata> {
+        use otel_arrow_dfe_core_nodes::processors::durable_buffer_processor::{
+            DURABLE_BUFFER_URN, create_durable_buffer,
+        };
+        use otel_arrow_dfe_engine::config::ProcessorConfig;
+        use otel_arrow_dfe_engine::context::ControllerContext;
+        use otel_arrow_dfe_engine::testing::test_node;
+
+        let controller = ControllerContext::new(runtime.metrics_registry());
+        let context = controller.pipeline_context_with("capacity-retention".into(), "test".into(), 0, 1, 0);
+        let mut config = NodeUserConfig::new_processor_config(DURABLE_BUFFER_URN);
+        config.config = serde_json::json!({
+            "path": path,
+            "retention_size_cap": "256 MiB",
+            "poll_interval": "10ms",
+            "max_segment_open_duration": "1ms",
+            "wal_flush_interval": "1ms"
+        });
+        create_durable_buffer(
+            context,
+            test_node("durable"),
+            Arc::new(config),
+            &ProcessorConfig::new("durable"),
+            &otel_arrow_dfe_engine::capability::registry::Capabilities::empty(),
+        )
+        .expect("native durable buffer")
+    }
+
+    async fn next_durable_batch(
+        context: &mut otel_arrow_dfe_engine::testing::processor::TestContext<OtapPdata>,
+    ) -> OtapPdata {
+        for _ in 0..100 {
+            context
+                .process(Message::Control(NodeControlMsg::TimerTick {}))
+                .await
+                .expect("durable tick");
+            let mut output = context.drain_pdata().await;
+            if !output.is_empty() {
+                assert_eq!(output.len(), 1);
+                return output.remove(0);
+            }
+            context.sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("native Quiver did not produce the retained publication");
+    }
+
+    #[test]
+    fn coalesced_capacity_node_error_preserves_native_quiver_for_restart() {
+        use otel_arrow_dfe_engine::Interests;
+        use otel_arrow_dfe_engine::control::{
+            PipelineCompletionMsg, pipeline_completion_msg_channel, runtime_ctrl_msg_channel,
+        };
+        use otel_arrow_dfe_engine::local::message::LocalReceiver;
+        use otel_arrow_dfe_engine::message::Receiver;
+        use otel_arrow_dfe_engine::node::NodeWithPDataReceiver;
+        use otel_arrow_dfe_engine::testing::processor::TestRuntime;
+        use otel_arrow_dfe_engine::testing::{create_not_send_channel, test_node, test_pipeline_runtime_services};
+
+        let directory = tempfile::tempdir().expect("directory");
+        let durable_path = directory.path().join("DurableData");
+        let root = directory.path().join("demo/generated/events");
+        initialize_region_partition(&root);
+        let original = Arc::new(Mutex::new(None));
+        let first_original = Arc::clone(&original);
+        let first_directory = directory.path().to_path_buf();
+        let runtime = TestRuntime::new();
+        let processor = native_durable_buffer(&runtime, &durable_path);
+        let reporter = runtime.metrics_reporter();
+        runtime
+            .set_processor(processor)
+            .run_test(move |mut context| async move {
+                let (buffer_completions, _buffer_feedback) = pipeline_completion_msg_channel(10);
+                context.set_pipeline_completion_sender(buffer_completions);
+                let store = Arc::new(MemoryRoutingStore::default());
+                let holder = CollectorInstanceId::new();
+                let lease = lease(&store, holder).await;
+                let envelope = envelope_for(&lease);
+                *first_original.lock().expect("original envelope") = Some(envelope.clone());
+                let input = partitioned_envelope_pdata(envelope, &["north".to_owned(), "south".to_owned()]);
+                context.process(Message::PData(input)).await.expect("durable admission");
+                let durable = next_durable_batch(&mut context).await;
+
+                let metrics = durable_metrics(holder, Some("test"));
+                metrics.durable_backlog_admitted(&table(), 2, 32);
+                let exporter = GenericDeltaExporter::with_batching(
+                    first_directory.clone(),
+                    store as Arc<dyn RoutingStore>,
+                    arrow_deltalake::commit::CommitOptions {
+                        max_files_per_commit: 1,
+                        max_pending_files: 2,
+                        ..Default::default()
+                    },
+                    FileBatchConfig {
+                        coalesce_publications: true,
+                        max_batches_per_flush: 1,
+                        ..Default::default()
+                    },
+                    Arc::clone(&metrics),
+                )
+                .expect("exporter");
+                let config = NodeUserConfig::new_exporter_config(ARROW_DELTALAKE_EXPORTER_URN);
+                let mut wrapper = ExporterWrapper::local(
+                    exporter,
+                    test_node("capacity-exporter"),
+                    Arc::new(config),
+                    &ExporterConfig::new("capacity-exporter"),
+                );
+                let (sender, receiver) = create_not_send_channel(2);
+                wrapper
+                    .set_pdata_receiver(test_node("durable"), Receiver::Local(LocalReceiver::mpsc(receiver)))
+                    .expect("exporter input");
+                sender.send(durable).expect("forward durable bundle");
+                let (runtime_control, _runtime_feedback) = runtime_ctrl_msg_channel(10);
+                let (completions, mut feedback) = pipeline_completion_msg_channel(10);
+                let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    tokio::select! {
+                        result = wrapper.start(
+                            runtime_control,
+                            completions,
+                            reporter,
+                            Interests::empty(),
+                            test_pipeline_runtime_services(),
+                        ) => result,
+                        message = feedback.recv() => {
+                            let message = message.expect("exporter feedback");
+                            let message = match message {
+                                PipelineCompletionMsg::DeliverAck { ack } => NodeControlMsg::Ack(ack),
+                                PipelineCompletionMsg::DeliverNack { nack } => NodeControlMsg::Nack(nack),
+                            };
+                            context.process(Message::Control(message)).await.expect("native feedback");
+                            panic!("capacity failure must not resolve or retry native Quiver input");
+                        }
+                    }
+                })
+                .await
+                .expect("capacity failure must terminate the exporter without retry");
+                assert!(
+                    matches!(
+                        result,
+                        Err(Error::ExporterError {
+                            kind: ExporterErrorKind::Configuration,
+                            ..
+                        })
+                    ),
+                    "capacity failure must surface as a terminal configuration error: {:?}",
+                    result.as_ref().err()
+                );
+                assert!(
+                    feedback.try_recv().is_err(),
+                    "terminal capacity errors must not send ACK, permanent NACK, or retry NACK"
+                );
+                assert!(
+                    metrics
+                        .prometheus()
+                        .contains("arrowcol_dataflow_durable_backlog_batches 1\n"),
+                    "unresolved durable input must remain in backlog accounting"
+                );
+                context
+                    .process(Message::Control(NodeControlMsg::TimerTick {}))
+                    .await
+                    .expect("post-error tick");
+                assert!(context.drain_pdata().await.is_empty(), "held bundle must not hot-retry");
+                assert_eq!(add_file_count(&first_directory.join("demo/generated/events")), 0);
+                // Match a failing data-path task: drop the processor without a graceful ACK/drain.
+            })
+            .validate(|_| async {});
+
+        let runtime = TestRuntime::new();
+        let processor = native_durable_buffer(&runtime, &durable_path);
+        runtime
+            .set_processor(processor)
+            .run_test(move |mut context| async move {
+                let recovered = next_durable_batch(&mut context).await;
+                let (_, payload) = recovered.into_parts();
+                let PayloadData::PdataArrowRecords(records) = payload.into_data() else {
+                    panic!("recovered publication lost its Arrow representation");
+                };
+                let decoded = decode_record_set(*records).expect("recovered envelope");
+                assert_eq!(decoded.len(), 1);
+                assert_eq!(
+                    Some(&decoded[0].envelope),
+                    original.lock().expect("original envelope").as_ref(),
+                    "restart must retain the exact publication identity, admission stamp, and lease"
+                );
+                assert_eq!(decoded[0].batch.num_rows(), 2);
+                assert_eq!(
+                    decoded[0].batch.column(1).as_any().downcast_ref::<StringArray>(),
+                    Some(&StringArray::from(vec!["north", "south"])),
+                    "restart must recover every original row, not just transaction metadata"
+                );
+                context
+                    .process(Message::Control(NodeControlMsg::Shutdown {
+                        deadline: std::time::Instant::now(),
+                        reason: "retention verified".to_owned(),
+                    }))
+                    .await
+                    .expect("recovered shutdown");
+            })
+            .validate(|_| async {});
     }
 
     /// Re-issues the table lease with a new lineage and the next epoch, as a reclaim, transfer, or
