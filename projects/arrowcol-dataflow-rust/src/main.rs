@@ -42,7 +42,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     propagate(result, shutdown_error.take())
 }
 
-
 /// Keeps the engine's own error (for example `IncompatiblePdataWiring`) as the process error
 /// and fails a run that otherwise succeeded when its shutdown hook failed.
 fn propagate(
@@ -85,7 +84,6 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
-
 
     #[test]
     fn clean_shutdown_closes_publisher_before_terminal_write() {
