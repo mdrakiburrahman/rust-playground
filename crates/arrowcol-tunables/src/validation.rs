@@ -1142,6 +1142,7 @@ mod tests {
                 operations: Some(vec![MaintenanceOperation::Optimize]),
                 max_concurrent_tables: Some(2),
                 max_decoded_bytes_per_bin: Some(100),
+                max_batch_bytes: Some(50),
                 max_concurrent_decoded_bytes: Some(199),
                 ..Default::default()
             }),
@@ -1161,6 +1162,7 @@ mod tests {
                 operations: Some(vec![MaintenanceOperation::Optimize]),
                 max_concurrent_tables: Some(2),
                 max_decoded_bytes_per_bin: Some(100),
+                max_batch_bytes: Some(50),
                 max_concurrent_decoded_bytes: Some(200),
                 commit_attempts: Some(12),
                 commit_budget_secs: Some(15),
