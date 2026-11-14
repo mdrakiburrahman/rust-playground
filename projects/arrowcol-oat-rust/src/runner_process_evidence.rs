@@ -184,12 +184,61 @@ fn contains_requested(observed: &Value, requested: &Value) -> bool {
     }
 }
 
+fn router_readback_path(variable: &str) -> Result<String> {
+    let field = variable
+        .strip_prefix("ARROWCOL_ROUTER_")
+        .context("not a router environment name")?;
+    let path = match field {
+        "WORKERS" | "LISTENER_TASKS_PER_FD" | "KEEPALIVE_POOL_SIZE" | "EDGE_REPLAY_MAX_NONCES" => {
+            format!("/{}", field.to_ascii_lowercase())
+        }
+        "H2_MAX_CONCURRENT_STREAMS"
+        | "H2_STREAM_WINDOW_BYTES"
+        | "H2_CONNECTION_WINDOW_BYTES"
+        | "H2_IDLE_TIMEOUT_SECONDS" => format!(
+            "/downstream_h2/{}",
+            field.trim_start_matches("H2_").to_ascii_lowercase()
+        ),
+        "SQL_CONNECT_TIMEOUT_MS" | "SQL_COMMAND_TIMEOUT_MS" => format!(
+            "/sql_timeouts/{}",
+            field.trim_start_matches("SQL_").to_ascii_lowercase()
+        ),
+        "REFRESH_INTERVAL_MS"
+        | "MAX_SNAPSHOT_AGE_MS"
+        | "MAX_FUTURE_SKEW_MS"
+        | "MAX_TABLE_ENTRIES"
+        | "MAX_OLDEST_BUFFER_AGE_MS"
+        | "HARD_PRESSURE_BPS"
+        | "WARMUP_MS"
+        | "MINIMUM_WARMUP_BPS"
+        | "LEASE_TTL_MS"
+        | "OAT_RUN_PIN_TTL_MS"
+        | "READINESS_MAX_STALENESS_MS"
+        | "DISTINCT_TABLE_OWNERS" => format!("/routing/{}", field.to_ascii_lowercase()),
+        "UPSTREAM_MAX_H2_STREAMS"
+        | "UPSTREAM_STREAM_WINDOW_BYTES"
+        | "UPSTREAM_CONNECTION_WINDOW_BYTES"
+        | "UPSTREAM_CONNECTION_TIMEOUT_MS"
+        | "UPSTREAM_TOTAL_CONNECTION_TIMEOUT_MS"
+        | "UPSTREAM_IDLE_TIMEOUT_SECONDS"
+        | "UPSTREAM_PING_INTERVAL_SECONDS" => format!(
+            "/upstream/{}",
+            field.trim_start_matches("UPSTREAM_").to_ascii_lowercase()
+        ),
+        _ => bail!("router environment has no checked effective-config adapter: {variable}"),
+    };
+    Ok(path)
+}
+
 fn verify_process_configuration(config: &OatConfig, role: ComponentRole, observed: &Value) -> Result<()> {
     if matches!(role, ComponentRole::Maintenance) && maintenance_enabled(config) {
         verify_maintenance_controls(config, observed)?;
     }
     for (name, expected) in role_environment(config, role)? {
-        let expected = serde_json::from_str::<Value>(&expected).unwrap_or(Value::String(expected));
+        let mut expected = serde_json::from_str::<Value>(&expected).unwrap_or(Value::String(expected));
+        if name == "ARROWCOL_ROUTER_UPSTREAM_PING_INTERVAL_SECONDS" && expected == 0 {
+            expected = Value::Null;
+        }
         if matches!(role, ComponentRole::Maintenance) && name.starts_with("ARROWCOL_MAINT_") {
             let (actual, expected) = maintenance_readback_value(observed, &name, expected)?;
             if !contains_requested(&actual, &expected) {
@@ -198,6 +247,9 @@ fn verify_process_configuration(config: &OatConfig, role: ComponentRole, observe
             continue;
         }
         let path = match name.as_str() {
+            "ARROWCOL_PARQUET_CONFIG" if matches!(role, ComponentRole::Maintenance) => {
+                "/parquet_writer_overrides".to_owned()
+            }
             "ARROWCOL_PARQUET_CONFIG" => "/parquet_writer".to_owned(),
             "ARROWCOL_COLLECTOR_BATCHING_CONFIG" => "/batching".to_owned(),
             "ARROWCOL_COLLECTOR_COMMIT_CONFIG" => "/commit".to_owned(),
@@ -212,10 +264,7 @@ fn verify_process_configuration(config: &OatConfig, role: ComponentRole, observe
                 "/{}",
                 variable.trim_start_matches("ARROWCOL_CLIENT_").to_ascii_lowercase()
             ),
-            variable if variable.starts_with("ARROWCOL_ROUTER_") => format!(
-                "/{}",
-                variable.trim_start_matches("ARROWCOL_ROUTER_").to_ascii_lowercase()
-            ),
+            variable if variable.starts_with("ARROWCOL_ROUTER_") => router_readback_path(variable)?,
             variable if variable.starts_with("ARROWCOL_WAL_") => format!(
                 "/wal/{}",
                 variable.trim_start_matches("ARROWCOL_WAL_").to_ascii_lowercase()

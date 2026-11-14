@@ -387,4 +387,48 @@ mod maintenance_topology_tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn maintenance_readback_converts_units_without_truncation_and_preserves_table_overrides() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tunables = serde_json::from_value(
+            json!({"maintenance":{"enabled":true,"operations":["optimize"],"target_file_mib":17}}),
+        )?;
+        let startup = json!({"startup":{"apply":false,"operations":["optimize"],"interval_secs":60},
+            "table_policy":{"arrowcol.optimize.targetFileSize":17_u64*1024*1024},"active":true});
+        verify_process_configuration(&config, ComponentRole::Maintenance, &startup)?;
+        let (actual, expected) = maintenance_readback_value(&startup, "ARROWCOL_MAINT_TARGET_FILE_MIB", json!(17))?;
+        assert_eq!(actual, expected);
+        assert!(maintenance_readback_value(&startup, "ARROWCOL_MAINT_TARGET_FILE_MIB", json!(u64::MAX)).is_err());
+        let mut text = String::new();
+        for table in &config.tables {
+            let mut policy = startup.clone();
+            policy["table_policy"]["arrowcol.optimize.targetFileSize"] = json!(32_u64 * 1024 * 1024);
+            text.push_str(&format!(
+                "arrowcol_maintenance_table_config {}\n",
+                json!({
+                    "table": canonical_dmv_table_name(table)?, "config": policy,
+                })
+            ));
+        }
+        let policies = maintenance_table_evidence(&config, &text)?;
+        let table = canonical_dmv_table_name(&config.tables[0])?;
+        assert_eq!(
+            policies["tables"][&table]["table_policy"]["arrowcol.optimize.targetFileSize"],
+            32_u64 * 1024 * 1024
+        );
+        assert!(maintenance_table_evidence(&config, "").is_err());
+        assert!(
+            maintenance_table_evidence(
+                &config,
+                &format!(
+                    "{text}arrowcol_maintenance_table_config {{\"table\":\"other.schema.table\",\"config\":{{}}}}\n"
+                )
+            )
+            .is_err()
+        );
+        Ok(())
+    }
 }
