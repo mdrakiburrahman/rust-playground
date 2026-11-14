@@ -169,7 +169,7 @@ fn shared_parquet_policy_controls_sorted_and_unsorted_compaction() -> Result<()>
         let reports = lines(&output.stdout)?;
         let outputs = reports[0]["report"]["outputs"].as_array().context("missing outputs")?;
         assert_eq!(outputs.len(), 4);
-        let mut total_rows = 0;
+        let mut all_ids = Vec::new();
         for output in outputs {
             let relative = output.as_str().context("output path")?;
             let url = Url::from_directory_path(&path)
@@ -195,9 +195,10 @@ fn shared_parquet_policy_controls_sorted_and_unsorted_compaction() -> Result<()>
             if sorted {
                 assert!(ids.windows(2).all(|pair| pair[0] <= pair[1]));
             }
-            total_rows += ids.len();
+            all_ids.extend(ids);
         }
-        assert_eq!(total_rows, 8);
+        all_ids.sort_unstable();
+        assert_eq!(all_ids, [0, 1, 10, 11, 20, 21, 30, 31]);
     }
     Ok(())
 }
