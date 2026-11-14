@@ -17,6 +17,8 @@ pub struct Tunables {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<TransportTunables>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arrow_ipc: Option<ArrowIpcTunables>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router: Option<RouterTunables>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collector: Option<CollectorTunables>,
@@ -83,6 +85,12 @@ pub struct TransportTunables {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct ArrowIpcTunables {
+    pub compression: Option<ArrowIpcCompression>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RouterTunables {
     pub workers: Option<usize>,
     pub listener_tasks_per_fd: Option<usize>,
@@ -119,10 +127,32 @@ pub struct RouterTunables {
 #[serde(default, deny_unknown_fields)]
 pub struct CollectorTunables {
     pub batching: Option<BatchingTunables>,
+    pub catalog: Option<CatalogTunables>,
     pub commit: Option<CommitTunables>,
+    pub exporter: Option<ExporterTunables>,
     pub limits: Option<LimitsTunables>,
     pub pressure: Option<PressureTunables>,
+    pub routing: Option<RoutingTunables>,
     pub runtime: Option<RuntimeTunables>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CatalogTunables {
+    pub maximum_cache_age: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RoutingTunables {
+    pub connect_timeout: Option<String>,
+    pub command_timeout: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExporterTunables {
+    pub authority_timeout: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -189,6 +219,8 @@ pub struct PressureTunables {
     pub buffered_rows_limit: Option<u64>,
     pub buffered_batches_limit: Option<u64>,
     pub pressure_interval: Option<String>,
+    pub heartbeat_interval: Option<String>,
+    pub registration_ttl: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -314,6 +346,16 @@ pub struct MaintenanceTunables {
     pub checkpoint_every_commits: Option<u64>,
     pub log_retention_secs: Option<u64>,
     pub max_prune_files: Option<usize>,
+    pub purge_max_files_per_commit: Option<usize>,
+    pub purge_max_plan_bytes: Option<usize>,
+    pub vacuum_delete_chunk: Option<usize>,
+    pub vacuum_max_plan_bytes: Option<usize>,
+    pub replay_max_log_files: Option<usize>,
+    pub replay_max_log_file_bytes: Option<u64>,
+    pub replay_max_checkpoint_bytes: Option<u64>,
+    pub operation_max_active_files: Option<usize>,
+    pub discovery_max_log_files: Option<usize>,
+    pub discovery_max_log_file_bytes: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -321,6 +363,7 @@ pub struct MaintenanceTunables {
 pub enum MaintenanceInputReadStrategy {
     Memory,
     Spool,
+    Range,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
