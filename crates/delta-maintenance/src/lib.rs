@@ -73,6 +73,8 @@ pub struct Settings {
     pub max_cycles: Option<u64>,
     pub max_concurrent_tables: usize,
     pub operation_timeout: Duration,
+    pub commit_attempts: u32,
+    pub commit_budget: Duration,
     pub granularity: Option<Granularity>,
     pub purge_retention_ms: Option<i64>,
     pub anchor_ms: Option<i64>,
@@ -154,6 +156,7 @@ impl Settings {
             bail!("VACUUM retention must not be negative");
         }
         self.optimize.validate()?;
+        MaintenanceControl::default().with_commit_retry_limits(self.commit_attempts, self.commit_budget)?;
         resolve(&BTreeMap::new(), &process_defaults(self))?;
         Ok(())
     }
@@ -1000,9 +1003,10 @@ fn maintain_table(
             Ok(Some((_, effective, _, _, _))) => effective,
             _ => settings,
         };
-        let control = MaintenanceControl::new(Arc::clone(cancel), Some(started + effective.operation_timeout));
         let outcome = match &setup {
             Ok(Some((discovered, effective, props, probe, _))) => (|| {
+                let control = MaintenanceControl::new(Arc::clone(cancel), Some(started + effective.operation_timeout))
+                    .with_commit_retry_limits(effective.commit_attempts, effective.commit_budget)?;
                 let token = probe.probe_log_token(100_000)?;
                 if observed_token.as_ref().is_some_and(|previous| *previous != token)
                     && !policy_matches(settings, &probe.maintenance_properties()?, props)?

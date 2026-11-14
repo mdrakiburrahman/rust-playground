@@ -153,16 +153,45 @@ pub fn error_kind(error: &anyhow::Error) -> Option<MaintenanceErrorKind> {
 }
 
 /// Cooperative cancellation and deadline shared with the caller.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct MaintenanceControl {
     cancel: Arc<AtomicBool>,
     deadline: Option<Instant>,
+    commit_attempts: u32,
+    commit_budget: Duration,
+}
+
+impl Default for MaintenanceControl {
+    fn default() -> Self {
+        Self::new(Arc::new(AtomicBool::new(false)), None)
+    }
 }
 
 impl MaintenanceControl {
     #[must_use]
     pub const fn new(cancel: Arc<AtomicBool>, deadline: Option<Instant>) -> Self {
-        Self { cancel, deadline }
+        Self {
+            cancel,
+            deadline,
+            commit_attempts: MAX_COMMIT_ATTEMPTS,
+            commit_budget: COMMIT_BUDGET,
+        }
+    }
+
+    /// Set bounded publication retry limits without weakening reconciliation.
+    ///
+    /// # Errors
+    /// Rejects zero or excessive limits.
+    pub fn with_commit_retry_limits(mut self, attempts: u32, budget: Duration) -> Result<Self> {
+        if !(1..=1000).contains(&attempts) || budget.is_zero() || budget > Duration::from_secs(3600) {
+            return Err(fail(
+                MaintenanceErrorKind::InvalidPlan,
+                "commit retries require 1..=1000 attempts and a budget within (0, 3600s]",
+            ));
+        }
+        self.commit_attempts = attempts;
+        self.commit_budget = budget;
+        Ok(self)
     }
 
     /// True once cancellation was requested or the deadline passed.
@@ -1236,7 +1265,7 @@ impl DeltaTable {
         let app_id = header.app_id(&operation.to_ascii_lowercase());
         let started = Instant::now();
         let mut uncertain = false;
-        for attempt in 0..MAX_COMMIT_ATTEMPTS {
+        for attempt in 0..control.commit_attempts {
             report.attempts = attempt + 1;
             let mut in_flight = false;
             let result = (|| -> Result<Option<Published>> {
@@ -1318,7 +1347,7 @@ impl DeltaTable {
                     return self.unknown_outcome(&app_id, outputs, report, &format!("{error:#}"));
                 }
             }
-            if started.elapsed() > COMMIT_BUDGET {
+            if started.elapsed() > control.commit_budget {
                 break;
             }
             collision_backoff(attempt);
@@ -1334,8 +1363,9 @@ impl DeltaTable {
         let error = fail_with(
             MaintenanceErrorKind::Exhausted,
             format!(
-                "maintenance commit budget exhausted ({MAX_COMMIT_ATTEMPTS} attempts / {}s)",
-                COMMIT_BUDGET.as_secs()
+                "maintenance commit budget exhausted ({} attempts / {}s)",
+                control.commit_attempts,
+                control.commit_budget.as_secs()
             ),
             report,
         );

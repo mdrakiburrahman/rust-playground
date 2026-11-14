@@ -61,6 +61,10 @@ struct Cli {
     /// Per-operation time budget; work stops between bounded steps once exceeded.
     #[arg(long, env = "ARROWCOL_MAINT_OPERATION_TIMEOUT_SECS", default_value_t = 900)]
     operation_timeout_secs: u64,
+    #[arg(long, env = "ARROWCOL_MAINT_COMMIT_ATTEMPTS", default_value_t = 8)]
+    commit_attempts: u32,
+    #[arg(long, env = "ARROWCOL_MAINT_COMMIT_BUDGET_SECS", default_value_t = 10)]
+    commit_budget_secs: u64,
     /// Ingestion partition granularity (minute, hour, day).
     #[arg(long, env = "ARROWCOL_MAINT_GRANULARITY")]
     granularity: Option<String>,
@@ -203,6 +207,8 @@ fn settings(cli: Cli) -> Result<Settings> {
         max_cycles: cli.max_cycles,
         max_concurrent_tables: cli.max_concurrent_tables,
         operation_timeout: Duration::from_secs(cli.operation_timeout_secs),
+        commit_attempts: cli.commit_attempts,
+        commit_budget: Duration::from_secs(cli.commit_budget_secs),
         granularity: cli
             .granularity
             .as_deref()
@@ -370,6 +376,16 @@ mod tests {
             "0",
         ];
         assert!(settings(Cli::try_parse_from(invalid)?).is_err());
+        let invalid_retries = [
+            "delta-maintenance",
+            "--root",
+            "file:///tmp/",
+            "--operation",
+            "optimize",
+            "--commit-attempts",
+            "0",
+        ];
+        assert!(settings(Cli::try_parse_from(invalid_retries)?).is_err());
         Ok(())
     }
 }

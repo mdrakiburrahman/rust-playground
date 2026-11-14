@@ -59,6 +59,8 @@ fn fixture() -> Result<(tempfile::TempDir, Settings, CatalogTable)> {
         max_cycles: None,
         max_concurrent_tables: 1,
         operation_timeout: Duration::from_secs(30),
+        commit_attempts: 8,
+        commit_budget: Duration::from_secs(10),
         granularity: Some(Granularity::Minute),
         purge_retention_ms: None,
         anchor_ms: Some(BASE + 3 * 60_000),
