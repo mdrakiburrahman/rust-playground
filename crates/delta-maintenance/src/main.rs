@@ -4,7 +4,7 @@ use anyhow::{Context, Result, anyhow};
 use arrow_deltalake::maintenance::{Granularity, OptimizeConfig};
 use clap::Parser;
 use delta_kernel::metrics::WithMetricsReporterLayer;
-use delta_maintenance::{Metrics, Operation, Settings, run, serve_metrics};
+use delta_maintenance::{Metrics, Operation, Settings, run, serve_metrics, startup_configuration};
 use delta_maintenance::{catalog::CatalogDiscovery, run_with_discovery};
 use opentelemetry_otlp::{Protocol, WithExportConfig};
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
@@ -310,6 +310,10 @@ fn main_inner() -> Result<bool> {
     let catalog_endpoint = cli.catalog_endpoint.clone();
     let (listen, no_listener) = (cli.listen, cli.no_metrics_listener);
     let settings = settings(cli)?;
+    eprintln!(
+        "arrowcol_maintenance_effective_config {}",
+        startup_configuration(&settings)?
+    );
     let provider = telemetry()?;
     let cancel = Arc::new(AtomicBool::new(false));
     let handler = Arc::clone(&cancel);

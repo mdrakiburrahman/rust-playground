@@ -11,7 +11,7 @@ use arrow_deltalake::maintenance::{
     NegativeProbeConfig, OptimizeConfig, OptimizePlan, Outcome, ProbeOperation, PruneConfig, PurgeConfig, VacuumConfig,
     error_details, now_ms,
 };
-use arrowcol_props::{ResolvedProps, resolve};
+use arrowcol_props::{PropValue, ResolvedProps, resolve};
 use serde::Serialize;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
@@ -529,6 +529,82 @@ fn effective_settings(settings: &Settings, properties: &BTreeMap<String, String>
     Ok((effective, props))
 }
 
+fn configuration_evidence(startup: &Settings, settings: &Settings, props: &ResolvedProps) -> Result<serde_json::Value> {
+    let mut policy = serde_json::Map::new();
+    for key in arrowcol_props::REGISTRY {
+        let name = key.name;
+        if !(name.starts_with("arrowcol.maintenance.")
+            || name.starts_with("arrowcol.optimize.")
+            || name.starts_with("arrowcol.layout.")
+            || name.starts_with("arrowcol.vacuum.")
+            || name.starts_with("arrowcol.purge.")
+            || name.starts_with("arrowcol.partition.")
+            || matches!(
+                name,
+                "delta.targetFileSize"
+                    | "delta.deletedFileRetentionDuration"
+                    | "delta.logRetentionDuration"
+                    | "delta.checkpointInterval"
+            ))
+        {
+            continue;
+        }
+        let value = match props
+            .get(name)
+            .with_context(|| format!("resolved property missing: {name}"))?
+        {
+            PropValue::Bool(value) => serde_json::json!(value),
+            PropValue::Unsigned(value) => serde_json::json!(value),
+            PropValue::Float(value) => serde_json::json!(value),
+            PropValue::Text(value) => serde_json::json!(value),
+            PropValue::StringList(value) => serde_json::json!(value),
+        };
+        policy.insert(name.to_owned(), value);
+    }
+    let enabled = props.boolean("arrowcol.maintenance.enabled")?;
+    let layout_mode = if settings.optimize.layout.is_some() {
+        "explicit"
+    } else if settings.optimize.use_default_layout {
+        "automatic"
+    } else {
+        "disabled"
+    };
+    Ok(serde_json::json!({
+        "startup": {
+            "apply": startup.apply,
+            "operations": startup.operations,
+            "interval_secs": startup.interval.map(|value| value.as_secs()),
+            "max_idle_backoff_secs": startup.max_idle_backoff.as_secs(),
+            "max_cycles": startup.max_cycles,
+            "max_concurrent_tables": startup.max_concurrent_tables,
+            "max_concurrent_decoded_bytes": startup.max_concurrent_decoded_bytes,
+            "commit_attempts": startup.commit_attempts,
+            "commit_budget_secs": startup.commit_budget.as_secs(),
+            "max_prune_files": startup.max_prune_files,
+            "output_row_group_rows": startup.optimize.output_row_group_rows,
+        },
+        "table_policy": policy,
+        "active": enabled,
+        "operation_settings": enabled.then(|| serde_json::json!({
+            "layout_mode": layout_mode,
+            "vacuum_retention_ms": settings.vacuum_retention_ms,
+            "log_retention_ms": settings.log_retention_ms,
+            "allow_short_vacuum_retention": settings.allow_short_vacuum_retention,
+            "unsafe_short_vacuum_for_tests": settings.unsafe_short_vacuum_for_tests,
+        })),
+    }))
+}
+
+/// Validated startup defaults, before any table-level overrides.
+///
+/// # Errors
+/// Returns invalid setting or property errors.
+pub fn startup_configuration(settings: &Settings) -> Result<serde_json::Value> {
+    settings.validate()?;
+    let (effective, props) = effective_settings(settings, &BTreeMap::new())?;
+    configuration_evidence(settings, &effective, &props)
+}
+
 fn policy_matches(settings: &Settings, actual: &BTreeMap<String, String>, expected: &ResolvedProps) -> Result<bool> {
     let (_, actual) = effective_settings(settings, actual)?;
     Ok(arrowcol_props::REGISTRY
@@ -992,6 +1068,11 @@ fn maintain_table(
             bail!("table properties changed after discovery; retry");
         }
         discovered.log_token = Some(token);
+        let config = configuration_evidence(settings, &effective, &props)?;
+        eprintln!(
+            "arrowcol_maintenance_table_config {}",
+            serde_json::json!({ "table": name, "config": config })
+        );
         Ok(Some((discovered, effective, props, probe, gate)))
     })();
     if matches!(&setup, Ok(None)) {
