@@ -146,7 +146,33 @@ impl Options {
     /// # Errors
     ///
     /// Rejects invalid bounds, floating-point values, combinations, and overflow.
-    pub fn resolve(mut self, rows: usize, concurrency: usize) -> Result<Self> {
+    pub fn resolve(self, rows: usize, concurrency: usize) -> Result<Self> {
+        Ok(self.resolve_with_evidence(rows, concurrency)?.0)
+    }
+
+    /// Resolves from a single CPU-availability observation while retaining the exact requested sentinels.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation failures as `resolve`, including unavailable CPU discovery.
+    pub fn resolve_with_evidence(mut self, rows: usize, concurrency: usize) -> Result<(Self, serde_json::Value)> {
+        let requested = serde_json::json!({
+            "workers": self.workers, "runtime_threads": self.runtime_threads,
+            "batch_rows": self.batch_rows, "corpus_rows": self.corpus_rows,
+            "corpus_bytes": self.corpus_bytes, "streams_per_worker": self.streams_per_worker,
+        });
+        let corpus_rows_source = if self.corpus_bytes > 0 {
+            "corpus_bytes_estimate_deferred_until_preparation"
+        } else if self.corpus_rows == 0 {
+            "legacy_rows"
+        } else {
+            "explicit_rows"
+        };
+        let available_parallelism = std::thread::available_parallelism()?.get();
+        anyhow::ensure!(
+            matches!(self.dictionary_handling, Dictionaries::Hydrate),
+            "dictionary-handling=resend is unsupported for the plain DMV synthetic schemas; no dictionary-bearing workload is generated"
+        );
         anyhow::ensure!(rows > 0 && concurrency > 0, "rows and concurrency must be positive");
         anyhow::ensure!(
             self.corpus_rows == 0 || self.corpus_bytes == 0,
@@ -159,10 +185,10 @@ impl Options {
             self.corpus_rows = rows;
         }
         if self.workers == 0 {
-            self.workers = std::thread::available_parallelism()?.get();
+            self.workers = available_parallelism;
         }
         if self.runtime_threads == 0 {
-            self.runtime_threads = std::thread::available_parallelism()?.get();
+            self.runtime_threads = available_parallelism;
         }
         if self.streams_per_worker == 0 {
             self.streams_per_worker = concurrency;
@@ -238,7 +264,17 @@ impl Options {
         ] {
             anyhow::ensure!(value <= 86_400_000, "transport durations must not exceed one day");
         }
-        Ok(self)
+        let evidence = serde_json::json!({
+            "version": 1, "available_parallelism": available_parallelism,
+            "requested": requested, "legacy": {"rows": rows, "concurrency": concurrency},
+            "resolved": {
+                "workers": self.workers, "runtime_threads": self.runtime_threads,
+                "batch_rows": self.batch_rows, "corpus_rows": self.corpus_rows,
+                "corpus_bytes": self.corpus_bytes, "streams_per_worker": self.streams_per_worker,
+            },
+            "corpus_rows_source": corpus_rows_source,
+        });
+        Ok((self, evidence))
     }
 
     fn endpoint(&self, address: &str) -> Result<Endpoint> {
@@ -1243,10 +1279,42 @@ mod tests {
             vec!["--corpus-rows", "100", "--corpus-bytes", "100"],
             vec!["--max-memory-bytes", "0"],
             vec!["--stream-window-bytes", "2147483648"],
+            vec!["--dictionary-handling", "resend"],
         ] {
             let parsed = Cli::try_parse_from(std::iter::once("test").chain(args));
             assert!(parsed.map(|cli| cli.options.resolve(10, 1).is_err()).unwrap_or(true));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn resolution_retains_auto_and_legacy_sources_without_guessing_byte_target_rows() -> Result<()> {
+        let requested_options = Cli::try_parse_from(["test", "--workers", "0", "--runtime-threads", "0"])?.options;
+        let (resolved, evidence) = requested_options.resolve_with_evidence(123, 7)?;
+        assert_eq!(evidence["requested"]["workers"], 0);
+        assert_eq!(evidence["requested"]["runtime_threads"], 0);
+        assert_eq!(evidence["requested"]["batch_rows"], 0);
+        assert_eq!(evidence["requested"]["corpus_rows"], 0);
+        assert_eq!(evidence["requested"]["streams_per_worker"], 0);
+        assert_eq!(evidence["available_parallelism"], resolved.workers);
+        assert_eq!(resolved.workers, resolved.runtime_threads);
+        assert_eq!(evidence["legacy"]["rows"], 123);
+        assert_eq!(evidence["legacy"]["concurrency"], 7);
+        assert_eq!(evidence["resolved"]["batch_rows"], 123);
+        assert_eq!(evidence["resolved"]["corpus_rows"], 123);
+        assert_eq!(evidence["resolved"]["streams_per_worker"], 7);
+        assert_eq!(evidence["corpus_rows_source"], "legacy_rows");
+
+        let mut options = options()?;
+        options.corpus_rows = 0;
+        options.corpus_bytes = 10000;
+        let (resolved, evidence) = options.resolve_with_evidence(123, 7)?;
+        assert_eq!(resolved.corpus_rows, 0);
+        assert_eq!(evidence["resolved"]["corpus_rows"], 0);
+        assert_eq!(
+            evidence["corpus_rows_source"],
+            "corpus_bytes_estimate_deferred_until_preparation"
+        );
         Ok(())
     }
 

@@ -45,7 +45,9 @@ struct Args {
 
 fn main() -> Result<()> {
     let mut args = Args::parse();
-    args.tuning = args.tuning.resolve(args.rows, args.concurrency)?;
+    let (tuning, resolution) = args.tuning.resolve_with_evidence(args.rows, args.concurrency)?;
+    args.tuning = tuning;
+    println!("OAT_CLIENT_RESOLUTION {resolution}");
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(args.tuning.runtime_threads)
         .enable_all()
@@ -73,7 +75,7 @@ async fn run(args: Args) -> Result<()> {
             "pilot mode requires a 30-second-multiple measurement from 60 to 600 seconds and a total warm-up plus measurement of at most 600 seconds"
         );
     }
-    let options = args.tuning.clone().resolve(args.rows, args.concurrency)?;
+    let options = args.tuning.clone();
     println!("OAT_CLIENT_EFFECTIVE_CONFIG {}", serde_json::to_string(&options)?);
     let client = dmv::client::PreparedClient::prepare(
         &args.endpoint,
