@@ -39,6 +39,7 @@ pub mod qap_http;
 pub mod sizing;
 #[cfg(feature = "delta")]
 pub mod telemetry;
+pub mod writer;
 
 /// Stable size and row counters for one completed Parquet file.
 ///
@@ -105,6 +106,11 @@ impl ParquetFileWriter {
         schema: SchemaRef,
         properties: Option<WriterProperties>,
     ) -> Result<Self> {
+        let properties = writer::process_config()?.writer_properties(
+            &schema,
+            properties.clone(),
+            &writer::sorting_from_properties(&schema, properties.as_ref())?,
+        )?;
         let path = path.as_ref().to_path_buf();
         let durable_handle = OpenOptions::new()
             .write(true)
@@ -112,7 +118,7 @@ impl ParquetFileWriter {
             .open(&path)
             .with_context(|| format!("create Parquet {}", path.display()))?;
         let output = tokio::fs::File::from_std(durable_handle.try_clone()?);
-        let writer = AsyncArrowWriter::try_new(output, schema, properties)?;
+        let writer = AsyncArrowWriter::try_new(output, schema, Some(properties))?;
         Ok(Self {
             writer,
             durable_handle,
