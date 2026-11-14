@@ -213,7 +213,11 @@ fn maintenance_readback_value(observed: &Value, variable: &str, expected: Value)
         | "COMMIT_BUDGET_SECS"
         | "OUTPUT_ROW_GROUP_ROWS"
         | "MAX_PRUNE_FILES"
-        | "ANCHOR_MS" => (format!("/startup/{}", field.to_ascii_lowercase()), 1, false),
+        | "ANCHOR_MS"
+        | "INPUT_READ_STRATEGY"
+        | "CATALOG_RUNTIME_THREADS"
+        | "CATALOG_RPC_TIMEOUT_SECS"
+        | "CATALOG_MAX_DECODING_MESSAGE_BYTES" => (format!("/startup/{}", field.to_ascii_lowercase()), 1, false),
         "OPERATION_TIMEOUT_SECS" => (
             "/table_policy/arrowcol.maintenance.operationTimeout".to_owned(),
             1000,
@@ -350,9 +354,79 @@ fn maintenance_table_evidence(config: &OatConfig, text: &str) -> Result<Value> {
             bail!("maintenance omitted effective per-table policy, including negative/no-op probes");
         }
     }
-    Ok(
-        json!({ "source":"validated_consumer_per_table_policy", "precedence":"table_properties_override_process_defaults", "tables":tables }),
-    )
+    let mut reports = Vec::new();
+    let mut dropped = 0_u64;
+    for line in text.lines().filter(|line| line.starts_with('{')) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if !value["operation"].is_string() || !value["applied"].is_boolean() {
+            continue;
+        }
+        let table = value["table"]
+            .as_str()
+            .context("maintenance operation report omitted its table")?;
+        if !tables.contains_key(table) {
+            bail!("maintenance operation report is outside the benchmark allowlist");
+        }
+        let settings = config
+            .tunables
+            .maintenance
+            .as_ref()
+            .context("maintenance settings missing")?;
+        let operations = serde_json::to_value(&settings.operations)?;
+        if value["applied"] != settings.apply.unwrap_or(false)
+            || !operations
+                .as_array()
+                .is_some_and(|operations| operations.contains(&value["operation"]))
+        {
+            bail!("maintenance operation receipt disagrees with explicit operation/apply authorization");
+        }
+        if value.get("error").is_some_and(|error| !error.is_null())
+            || value.get("error_kind").is_some_and(|error| !error.is_null())
+        {
+            bail!("allowlisted maintenance operation failed; inspect run-owned private operation logs");
+        }
+        let mut counts = serde_json::Map::new();
+        for field in [
+            "files_added",
+            "files_removed",
+            "bytes_added",
+            "bytes_removed",
+            "rows_added",
+            "rows_removed",
+            "files_deleted",
+            "files_already_absent",
+            "backlog_files",
+            "attempts",
+            "collisions",
+            "retries",
+        ] {
+            if let Some(count) = value
+                .get("report")
+                .and_then(|report| report.get(field))
+                .and_then(Value::as_u64)
+            {
+                counts.insert(field.to_owned(), json!(count));
+            }
+        }
+        if reports.len() == 256 {
+            reports.remove(0);
+            dropped += 1;
+        }
+        reports.push(json!({
+            "table": table, "operation": value["operation"], "negative_probe": value["negative_probe"].as_bool(),
+            "mutation_mode": if value["applied"] == true { "apply_authorized_not_proof_of_mutation" } else { "dry_run_predicted_not_applied" },
+            "consumer_reported_counts": counts, "duration_ms": value["duration_ms"].as_u64(),
+            "report_outcome": value.pointer("/report/outcome").and_then(Value::as_str),
+        }));
+    }
+    Ok(json!({
+        "source":"validated_consumer_per_table_policy", "precedence":"table_properties_override_process_defaults", "tables":tables,
+        "operation_reports": reports, "operation_reports_dropped": dropped,
+        "rewrite_proof_scope": "consumer_operation_receipts_not_independent_physical_file_validation",
+        "operation_report_timing_scope": "process_lifetime_including_warmup_and_drain_not_shared_measurement_window",
+    }))
 }
 
 #[cfg(test)]
@@ -429,6 +503,36 @@ mod maintenance_topology_tests {
             )
             .is_err()
         );
+        let report = json!({"table":table,"operation":"optimize","applied":false,"negative_probe":false,
+            "report":{"files_added":2,"rows_added":257,"outputs":["private-object-path"]},"duration_ms":12});
+        let reports = maintenance_table_evidence(&config, &format!("{text}{report}\n"))?;
+        assert_eq!(
+            reports["operation_reports"][0]["consumer_reported_counts"]["rows_added"],
+            257
+        );
+        assert_eq!(
+            reports["operation_reports"][0]["mutation_mode"],
+            "dry_run_predicted_not_applied"
+        );
+        assert!(!reports.to_string().contains("private-object-path"));
+        let mut failed = report.clone();
+        failed["error_kind"] = json!("commit");
+        assert!(maintenance_table_evidence(&config, &format!("{text}{failed}\n")).is_err());
+        failed = report;
+        failed["applied"] = json!(true);
+        assert!(maintenance_table_evidence(&config, &format!("{text}{failed}\n")).is_err());
+        for (variable, expected) in [
+            ("CATALOG_RUNTIME_THREADS", json!(3)),
+            ("CATALOG_RPC_TIMEOUT_SECS", json!(17)),
+            ("CATALOG_MAX_DECODING_MESSAGE_BYTES", json!(1048576)),
+            ("INPUT_READ_STRATEGY", json!("spool")),
+        ] {
+            let mut observed = json!({"startup":{}});
+            observed["startup"][variable.to_ascii_lowercase()] = expected.clone();
+            let (actual, requested) =
+                maintenance_readback_value(&observed, &format!("ARROWCOL_MAINT_{variable}"), expected)?;
+            assert_eq!(actual, requested);
+        }
         Ok(())
     }
 }

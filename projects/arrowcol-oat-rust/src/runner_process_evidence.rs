@@ -99,9 +99,10 @@ fn public_tuning_value(value: &Value) -> Option<Value> {
                 .iter()
                 .filter_map(|(name, value)| {
                     let lower = name.to_ascii_lowercase();
-                    if ["secret", "password", "token", "endpoint", "listen", "address", "auth"]
-                        .iter()
-                        .any(|private| lower.contains(private))
+                    if lower != "authority_timeout"
+                        && ["secret", "password", "token", "endpoint", "listen", "address", "auth"]
+                            .iter()
+                            .any(|private| lower.contains(private))
                     {
                         return None;
                     }
@@ -306,6 +307,9 @@ fn process_evidence(config: &OatConfig, logs: &[ProcessLog]) -> Result<Value> {
             bail!("configured {} has no running consumer/readback", role_name(role));
         }
         for log in selected {
+            if matches!(role, ComponentRole::Maintenance) && !log.complete {
+                bail!("maintenance operation log was truncated; safety outcomes cannot be established");
+            }
             let resolved = process_configurations(&log.text)?;
             verify_process_configuration(config, role, &resolved)?;
             let observed = !resolved.as_object().is_none_or(serde_json::Map::is_empty);
@@ -314,9 +318,18 @@ fn process_evidence(config: &OatConfig, logs: &[ProcessLog]) -> Result<Value> {
             } else {
                 None
             };
+            let mut effective = resolved;
+            let fields = effective
+                .as_object_mut()
+                .context("consumer startup configuration is not an object")?;
+            let writer_policy = fields
+                .remove("parquet_writer")
+                .or_else(|| fields.remove("parquet_writer_overrides"));
             result.push(json!({
                 "component": role_name(role),
-                "effective_config": observed.then_some(resolved),
+                "effective_config": observed.then_some(effective),
+                "writer_policy_overrides": writer_policy,
+                "writer_policy_scope": "configured_startup_overrides_not_complete_schema_resolved_or_exercised_file_properties",
                 "effective_config_source": observed.then_some("consumer_startup_readback"),
                 "effective_config_unavailable_reason": (!observed).then_some("consumer_did_not_emit_startup_readback"),
                 "image": log.image,
@@ -501,6 +514,28 @@ mod startup_readback_tests {
             "OAT_CLIENT_EFFECTIVE_CONFIG {\"batch_rows\":1,\"secret_file\":\"private\",\"endpoint\":\"https://private\"}\n",
         )?;
         assert_eq!(readback, json!({"batch_rows":1}));
+        Ok(())
+    }
+
+    #[test]
+    fn writer_overrides_are_not_claimed_as_schema_resolved_or_exercised_properties() -> Result<()> {
+        let config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        let evidence = process_evidence(&config, &[ProcessLog {
+            role: ComponentRole::Collector, image: None, image_id: None, source_revision: None, complete: true,
+            text: "arrowcol_effective_config {\"runtime\":{\"batch_rows\":8192},\"parquet_writer\":{\"defaults\":{\"compression\":null}}}\n".to_owned(),
+        }])?;
+        assert_eq!(evidence[0]["effective_config"]["runtime"]["batch_rows"], 8192);
+        assert!(evidence[0]["effective_config"].get("parquet_writer").is_none());
+        assert_eq!(
+            evidence[0]["writer_policy_overrides"],
+            json!({"defaults":{"compression":null}})
+        );
+        assert_eq!(
+            public_tuning_value(&json!({"authority_timeout":"13s","auth_secret":"private"})),
+            Some(json!({"authority_timeout":"13s"}))
+        );
         Ok(())
     }
 }
