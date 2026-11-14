@@ -108,6 +108,60 @@ pub(crate) struct RunTimingBudget {
 }
 
 impl OatConfig {
+    fn validate_selected_parquet_schemas(&self) -> Result<()> {
+        let Some(writer) = &self.tunables.parquet_writer else {
+            return Ok(());
+        };
+        let selected = self.tables.iter().map(String::as_str).collect::<HashSet<_>>();
+        for table in collector_chain::dmv::tables()? {
+            let name = table.identity().table().as_str();
+            if selected.contains(name) {
+                writer
+                    .writer_properties(table.schema(), None, &[])
+                    .with_context(|| format!("Parquet writer settings are invalid for selected DMV table {name}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_selected_layout_schemas(&self) -> Result<()> {
+        let Some(layout) = self
+            .tunables
+            .collector
+            .as_ref()
+            .and_then(|collector| collector.layout.as_ref())
+        else {
+            return Ok(());
+        };
+        if layout.enabled == Some(false) {
+            return Ok(());
+        }
+        let policy = arrow_deltalake::layout::LayoutPolicy {
+            sort_columns: layout
+                .sort_columns
+                .clone()
+                .unwrap_or_else(|| vec!["customer_id".to_owned()]),
+            bloom_columns: layout
+                .bloom_columns
+                .clone()
+                .unwrap_or_else(|| vec!["customer_id".to_owned()]),
+            max_rows: layout.max_rows.unwrap_or(262_144),
+            max_input_bytes: layout.max_input_bytes.unwrap_or(67_108_864),
+            row_group_rows: layout.row_group_rows.unwrap_or(16_384),
+            page_rows: layout.page_rows.unwrap_or(2_048),
+        };
+        let selected = self.tables.iter().map(String::as_str).collect::<HashSet<_>>();
+        for table in collector_chain::dmv::tables()? {
+            let name = table.identity().table().as_str();
+            if selected.contains(name) {
+                policy
+                    .validate(table.schema())
+                    .with_context(|| format!("collector layout is invalid for selected DMV table {name}"))?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn timing_budget(&self) -> Result<RunTimingBudget> {
         let schedule_wait_seconds = self
             .client_ready_timeout_seconds
@@ -138,6 +192,8 @@ impl OatConfig {
     /// Returns an error when a setting is invalid or a requested DMV table is unsupported.
     pub fn validate(&self) -> Result<()> {
         self.tunables.validate_for_oat()?;
+        self.validate_selected_parquet_schemas()?;
+        self.validate_selected_layout_schemas()?;
         if self
             .tunables
             .maintenance
@@ -675,6 +731,66 @@ mod tests {
     #[test]
     fn accepts_the_initial_matrix_and_separate_adls_paths() -> Result<()> {
         valid().validate()
+    }
+
+    #[test]
+    fn parquet_writer_overrides_are_validated_against_selected_dmv_schemas() -> Result<()> {
+        let mut missing_column = valid();
+        missing_column.tunables.parquet_writer = Some(arrowcol_tunables::ParquetWriterConfig {
+            columns: std::collections::BTreeMap::from([(
+                "not_a_dmv_column".to_owned(),
+                arrowcol_tunables::ParquetColumnOptions::default(),
+            )]),
+            ..Default::default()
+        });
+        assert!(matches!(
+            missing_column.validate(),
+            Err(error) if format!("{error:#}").contains("unknown physical Parquet column not_a_dmv_column")
+        ));
+
+        let table = collector_chain::dmv::tables()?
+            .into_iter()
+            .next()
+            .context("DMV fixture must contain a table")?;
+        let string_column = table
+            .schema()
+            .fields()
+            .iter()
+            .find(|field| field.data_type() == &arrow::datatypes::DataType::Utf8)
+            .context("DMV fixture must contain a UTF-8 field")?
+            .name()
+            .clone();
+        let mut type_mismatch = valid();
+        type_mismatch.tables = vec![table.identity().table().as_str().to_owned()];
+        type_mismatch.tunables.parquet_writer = Some(arrowcol_tunables::ParquetWriterConfig {
+            columns: std::collections::BTreeMap::from([(
+                string_column,
+                arrowcol_tunables::ParquetColumnOptions {
+                    encoding: Some(arrowcol_tunables::ParquetValueEncoding::ByteStreamSplit),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        });
+        assert!(matches!(
+            type_mismatch.validate(),
+            Err(error) if format!("{error:#}").contains("invalid for physical type BYTE_ARRAY")
+        ));
+
+        let mut invalid_layout = valid();
+        invalid_layout.tunables.collector = Some(arrowcol_tunables::CollectorTunables {
+            layout: Some(arrowcol_tunables::LayoutTunables {
+                enabled: Some(true),
+                sort_columns: Some(vec!["not_a_dmv_column".to_owned()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert!(matches!(
+            invalid_layout.validate(),
+            Err(error) if format!("{error:#}").contains("unknown sort column not_a_dmv_column")
+        ));
+        Ok(())
     }
 
     #[test]

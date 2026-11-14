@@ -43,6 +43,8 @@ cargo run --locked --package arrowcol-oat-rust -- --validate-config <config.json
 | Settings | Adapter and constraints |
 | --- | --- |
 | Collector catalog | `catalog.maximum_cache_age` is emitted as `ARROWCOL_COLLECTOR_CATALOG_CONFIG` (default `10s`, remote catalog only). Readback identifies `catalog.type` and the resolved cache age. |
+| Collector layout | `layout.enabled`, `sort_columns`, `bloom_columns`, and `layout.*` limits map to `ARROWCOL_COLLECTOR_LAYOUT_ENABLED`, `SORT_COLUMNS`, `BLOOM_COLUMNS`, and `LAYOUT_*`. Defaults are customer-id sort/Bloom, 262144 rows, 67108864 input bytes, 16384 rows per group, and 2048 rows per page. Selected DMV schemas are checked before deployment; `enabled: false` cannot be combined with layout overrides. |
+| Parquet schema checks | Every selected DMV schema is checked against Parquet physical column paths and encodings before side effects. Sorting metadata remains rejected unless OAT can prove the exact file order; startup writer readback does not claim per-schema resolved properties. |
 | SQL routing | `routing.connect_timeout` / `command_timeout` are emitted as `ARROWCOL_COLLECTOR_ROUTING_CONFIG` (defaults `15s` / `30s`) to receiver and exporter; they apply only to SQL Server routing. Readback identifies SQL Server, memory or standalone routing. |
 | Exporter authority | `exporter.authority_timeout` is emitted as `ARROWCOL_COLLECTOR_EXPORTER_CONFIG` (default `10s`). |
 | Pressure registration | `pressure.heartbeat_interval` / `registration_ttl` share `ARROWCOL_COLLECTOR_PRESSURE_CONFIG` (defaults `5s` / `20s`). TTL must exceed heartbeat, be at least `1ms`, and have a representable Unix-millisecond expiry. |
@@ -52,6 +54,7 @@ cargo run --locked --package arrowcol-oat-rust -- --validate-config <config.json
 | WAL topology | Omitted `wal` keeps the non-Quiver profile; explicit `wal: {}` or typed overrides select `config.quiver.yaml` in both paths. Neither environment injection nor client upload acknowledgement proves WAL fsync. Every processor core must appear in consumer aggregate readback; actual class is rederived from those values. |
 | WAL storage | Local state is a run-owned bind mount with separate hostname directories. AKS uses one writable `emptyDir` per pod. Filesystem fsync classes do not imply survival of pod/node loss or durable Delta delivery; storage scope is recorded separately. Existing durable WAL defaults remain unchanged. |
 | Local worker count | Both profiles are rendered into run-owned configuration without resource-policy overrides that could shadow `--num-cores`; source profiles are not edited. |
+| Client automatic values | Explicit zero workers/runtime threads require the consumer's matching available-parallelism observation. Zero batch/corpus rows and streams use verified legacy rows/concurrency; byte-target corpus sizing remains deferred until preparation. Arbitrary positive values are not accepted as automatic-resolution proof. |
 
 ## Result evidence (schema v3)
 
@@ -79,3 +82,9 @@ permit downstream degradation: its required QAP verdict gates remain strict.
 Exact historical v2 schemas append into v3 by widening the existing nullable
 measurement amendment and adding null `evidence_json`; historical version
 numbers and zero values are preserved. Other schema changes are rejected.
+
+The viewer summarizes commit-window output, Parquet size/compression and commit
+percentiles separately from admission. The v3 verdict requires complete
+collector image/log/capability evidence and consistent output timing/counters.
+Known zero commits pass without a delivery claim; unavailable telemetry does
+not. Legacy v2 admission results remain readable, with no durable backfill.
