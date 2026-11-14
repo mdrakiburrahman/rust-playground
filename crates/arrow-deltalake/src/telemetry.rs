@@ -253,21 +253,33 @@ pub(crate) fn data_commit(
     tracing::info!(commit = %event, "arrowcol_data_commit");
 }
 
-pub(crate) fn ambiguous_commit_reconciled() {
+pub(crate) fn ambiguous_commit_reconciled(table_id: &str, table_name: Option<&str>, elapsed: Duration) {
     publication_event("commit_attribution_uncertain");
-    let event = serde_json::json!({
-        "schema_version": 1,
-        "outcome": "reconciled",
-        "rows": null,
-        "files": null,
-        "parquet_bytes": null,
-        "reason": "uncertain_commit_version_attribution"
-    });
+    let event = ambiguous_commit_event(table_id, table_name, elapsed);
     eprintln!("arrowcol_data_commit {event}");
     tracing::warn!(
         commit = %event,
         "arrowcol_data_commit"
     );
+}
+
+fn ambiguous_commit_event(table_id: &str, table_name: Option<&str>, elapsed: Duration) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "outcome": "reconciled",
+        "table_id": table_id,
+        "table_name": table_name,
+        "delta_version": null,
+        "rows": null,
+        "files": null,
+        "input_bytes": null,
+        "parquet_bytes": null,
+        "min_ingested_at_ms": null,
+        "max_ingested_at_ms": null,
+        "finished_at_unix_ms": chrono::Utc::now().timestamp_millis(),
+        "elapsed_seconds": elapsed.as_secs_f64(),
+        "reason": "uncertain_commit_version_attribution"
+    })
 }
 
 /// Count a publication-side event outside a timed publication attempt.
@@ -305,5 +317,32 @@ impl Drop for PublicationObservation {
             self.started.elapsed().as_secs_f64(),
             &[KeyValue::new("outcome", self.outcome)],
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ambiguous_commit_event_has_table_boundary_and_null_attribution() {
+        let event = ambiguous_commit_event("sha256-id", Some("catalog.schema.table"), Duration::from_secs(2));
+        assert_eq!(event["table_id"], "sha256-id");
+        assert_eq!(event["table_name"], "catalog.schema.table");
+        assert_eq!(event["outcome"], "reconciled");
+        assert_eq!(event["reason"], "uncertain_commit_version_attribution");
+        for field in [
+            "delta_version",
+            "rows",
+            "files",
+            "input_bytes",
+            "parquet_bytes",
+            "min_ingested_at_ms",
+            "max_ingested_at_ms",
+        ] {
+            assert!(event[field].is_null(), "{field}");
+        }
+        assert!(event["finished_at_unix_ms"].as_i64().is_some());
+        assert_eq!(event["elapsed_seconds"], 2.0);
     }
 }

@@ -9,6 +9,14 @@ use sha2::{Digest, Sha256};
 pub(crate) type PartitionValues = BTreeMap<String, Option<String>>;
 
 pub(crate) fn split(batch: &RecordBatch, names: &[String]) -> Result<Vec<(RecordBatch, PartitionValues)>> {
+    split_with_new_partition(batch, names, |_| Ok(()))
+}
+
+pub(crate) fn split_with_new_partition(
+    batch: &RecordBatch,
+    names: &[String],
+    mut on_new_partition: impl FnMut(&PartitionValues) -> Result<()>,
+) -> Result<Vec<(RecordBatch, PartitionValues)>> {
     let columns = names
         .iter()
         .map(|name| {
@@ -23,6 +31,9 @@ pub(crate) fn split(batch: &RecordBatch, names: &[String]) -> Result<Vec<(Record
         let mut values = BTreeMap::new();
         for (name, column) in names.iter().zip(&columns) {
             values.insert(name.clone(), value(batch.column(*column).as_ref(), row)?);
+        }
+        if !groups.contains_key(&values) {
+            on_new_partition(&values)?;
         }
         groups.entry(values).or_default().push(u64::try_from(row)?);
     }

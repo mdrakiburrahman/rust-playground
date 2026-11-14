@@ -6,7 +6,10 @@
 | `ARROWCOL_COLLECTOR_BATCHING_CONFIG` | Deep JSON override of exporter `batching`: byte/row/batch capacities and flush limits, age, flush concurrency, adaptive sizing, `coalesce_publications` | Startup |
 | `ARROWCOL_COLLECTOR_COMMIT_CONFIG` | Deep JSON override of exporter `commit`: `batch_window`, `max_files_per_commit`, `max_pending_files` | Startup |
 | `ARROWCOL_COLLECTOR_LIMITS_CONFIG` | Deep JSON override of receiver `limits`: Flight sizes, channels and deadlines | Startup |
-| `ARROWCOL_COLLECTOR_PRESSURE_CONFIG` | `max_concurrent_streams`, RSS/buffered byte/row/batch limits, `pressure_interval` only | Startup |
+| `ARROWCOL_COLLECTOR_PRESSURE_CONFIG` | Stream/RSS/buffered limits, pressure/heartbeat intervals and registration TTL; no identities/endpoints | Startup |
+| `ARROWCOL_COLLECTOR_CATALOG_CONFIG` | Remote catalog `maximum_cache_age`; rejects memory catalog | Startup |
+| `ARROWCOL_COLLECTOR_ROUTING_CONFIG` | SQL routing `connect_timeout` and `command_timeout` for receiver/exporter; rejects other backends | Startup |
+| `ARROWCOL_COLLECTOR_EXPORTER_CONFIG` | Exporter `authority_timeout` | Startup |
 | `ARROWCOL_COLLECTOR_RUNTIME_WORKERS`, `BLOCKING_WORKERS`, `UPLOAD_LIMIT`, `TASK_LIMIT`, `READ_AHEAD`, `BATCH_ROWS`, `CPU_WORKERS` | Independently bounded Delta async, blocking, upload, Kernel task, scan and dedicated CPU resources; each suffix uses the full `ARROWCOL_COLLECTOR_` prefix | Startup |
 | Cargo feature `allocator-mimalloc` | Opt-in mimalloc allocator for the collector binary; system allocator remains default | Rebuild |
 | `RUSTFLAGS="-C target-cpu=native"` | Host-specific compiler ISA optimization; not a Cargo feature or per-cell runtime setting | Rebuild |
@@ -16,6 +19,12 @@ keys, malformed numbers, zero capacities, invalid timeouts and inconsistent
 budgets fail validation. Durations use humantime strings; sizes use bytes.
 Runtime scalar inputs are unsigned decimal integers, never silently clamped.
 Effective startup policy is printed as `arrowcol_effective_config <JSON>`.
+Pressure overrides also accept `heartbeat_interval` and `registration_ttl`.
+Resolved TTL must exceed heartbeat and fit the millisecond lease clock; all
+control-plane durations must be positive and clock-representable. These
+overrides cannot change identities, endpoints, authentication or fencing.
+Readback includes safe catalog/routing backend names and resolved timeouts,
+never backend addresses or credentials.
 
 Example (workload-dependent, not a universal performance recommendation):
 
@@ -41,8 +50,12 @@ conflicting requests fail instead of silently ignoring the setting.
 Cross-publication coalescing is disabled by default. When enabled, replay IDs
 and all output files form one indivisible Delta commit unit. Already committed
 IDs are filtered before encoding; a mixed-ID race rejects and rebuilds on retry.
-Groups exceeding commit/pending-file caps reject before queueing. Schema,
-partition, retention, fencing, no-overwrite and durability boundaries remain.
+Over-cap multi-publication groups fall back to intact publication units.
+A single indivisible publication that cannot fit fails with an actionable
+non-retryable limit error before queueing; it never records IDs for partial
+output. Partition lookup is keyed and staging checks file caps early, before
+encoding high-cardinality output. Schema, partition, retention, fencing,
+no-overwrite and durability boundaries remain.
 Increasing a flush target alone does not coalesce publications.
 
 `arrowcol_data_commit <JSON>` records new durable AddFiles, their rows/bytes,
@@ -52,7 +65,8 @@ counts newly durable AddFiles finished in `[start,end)`, including any warmup
 backlog committed inside that window. Ingress-cohort attribution is separate:
 require admission stamps wholly within cohort boundaries and report mixed or
 unknown cohorts as uncertain. Reconciled uncertain commit attribution has null
-counters and a fixed reason. Deduplicate table/version observations and require
+version/counters/stamps, table identity, finish/elapsed time and a fixed reason.
+Deduplicate table/version observations and require
 complete logs; global counters alone do not establish either measurement.
 Startup `commit_telemetry` identifies schema 1, new ingestion AddFiles after sync,
 and system Unix-millisecond finish timestamps. Rewrite/OPTIMIZE events are excluded.
