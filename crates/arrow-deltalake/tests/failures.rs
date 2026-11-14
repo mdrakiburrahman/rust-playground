@@ -212,7 +212,7 @@ async fn identified_unknown_success(fault: Fault, succeeds: bool) -> Result<()> 
 }
 
 /// Scenario: reopening a table must replay many commits before reaching its original metadata.
-/// Guarantees: read-ahead stays at eight, replay remains fresh, and historic corruption is visible.
+/// Guarantees: read-ahead obeys configuration, replay remains fresh, and historic corruption is visible.
 #[tokio::test(flavor = "current_thread")]
 async fn history_replay_has_bounded_readahead_and_detects_corruption() -> Result<()> {
     let directory = tempfile::tempdir()?;
@@ -241,7 +241,12 @@ async fn history_replay_has_bounded_readahead_and_detects_corruption() -> Result
     let table = DeltaTable::open_with_store(directory.path(), Arc::<FaultStore>::clone(&store))?;
     assert_eq!(table.version()?, 39);
     assert!(store.reads.load(Ordering::SeqCst) >= 40);
-    assert!((2..=8).contains(&store.peak_reads.load(Ordering::SeqCst)));
+    let read_ahead = arrow_deltalake::runtime_config()?.read_ahead;
+    let peak_reads = store.peak_reads.load(Ordering::SeqCst);
+    assert!(
+        (read_ahead.min(2)..=read_ahead).contains(&peak_reads),
+        "observed {peak_reads} concurrent reads with configured read-ahead {read_ahead}"
+    );
     let prepared = table.new_file(input.schema())?;
     std::fs::write(directory.path().join("_delta_log/00000000000000000000.json"), "corrupt")?;
     assert!(table.version().is_err());
