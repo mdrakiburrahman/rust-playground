@@ -34,6 +34,9 @@ fallback encoding. FPP must be finite and strictly between zero and one.
 Sorting metadata must match a verified physical sort; it cannot assert ordering
 for an unsorted file. Explicit `sorting_columns: []` clears inherited metadata.
 Row-group byte and page limits are estimates, not process-memory ceilings.
+Disabling offset indexes requires `statistics: "none"` or `"chunk"` on every
+physical column; page statistics force offset indexes in Parquet 58.4, so
+conflicting requests fail instead of silently ignoring the setting.
 
 Cross-publication coalescing is disabled by default. When enabled, replay IDs
 and all output files form one indivisible Delta commit unit. Already committed
@@ -44,10 +47,15 @@ Increasing a flush target alone does not coalesce publications.
 
 `arrowcol_data_commit <JSON>` records new durable AddFiles, their rows/bytes,
 version, table identity, min/max admission stamps and individual commit elapsed
-time. It is not client acknowledgement throughput. Reconciled uncertain commit
-attribution reports null counters and a fixed reason. Exclude warmup/preflight,
-mixed boundary groups, duplicates and uncertainty before deriving per-cell
-durable throughput; global process counters alone do not establish it.
+time. It is not client acknowledgement throughput. Primary commit-window output
+counts newly durable AddFiles finished in `[start,end)`, including any warmup
+backlog committed inside that window. Ingress-cohort attribution is separate:
+require admission stamps wholly within cohort boundaries and report mixed or
+unknown cohorts as uncertain. Reconciled uncertain commit attribution has null
+counters and a fixed reason. Deduplicate table/version observations and require
+complete logs; global counters alone do not establish either measurement.
+Startup `commit_telemetry` identifies schema 1, new ingestion AddFiles after sync,
+and system Unix-millisecond finish timestamps. Rewrite/OPTIMIZE events are excluded.
 
 Multipart sizing is deliberately unsupported: pinned object_store 0.13.2 does
 not expose conditional multipart completion, while this writer requires
