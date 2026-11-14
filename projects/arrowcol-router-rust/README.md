@@ -152,6 +152,11 @@ target/debug/arrowcol-router-rust \
   --config projects/arrowcol-router-rust/config.yaml
 ```
 
+
+Performance settings are startup-only. The effective values (excluding addresses, credentials, and file paths) are emitted to stderr as `arrowcol_router_effective_config <JSON>`. Configuration precedence is YAML, then `ARROWCOL_ROUTER_*` environment overrides, then command-line overrides. Invalid numeric values and incompatible HTTP/2 windows fail validation before listeners start. Router body message-size limits are enforced by the selected receiver (`ARROWCOL_MAX_MESSAGE_BYTES`), not by the streaming proxy; the router does not decode or buffer Flight bodies.
+
+The command-line equivalents use kebab-case: `--workers`, `--listener-tasks-per-fd`, `--keepalive-pool-size`, `--h2-*`, `--sql-*-timeout-ms`, the routing policy field names, and `--upstream-*`. They accept the same values and bounds as the corresponding `ARROWCOL_ROUTER_*` variables.
+
 The image smoke validates both embedded configs, starts Pingora without cloud
 credentials, proves HTTP/2 prior-knowledge capability serving, checks health
 and fail-closed readiness, and then requires bounded shutdown:

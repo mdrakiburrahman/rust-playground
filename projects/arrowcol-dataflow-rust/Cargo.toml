@@ -16,6 +16,9 @@ otel-arrow-dfe-telemetry = { path = "../../submodules/otel-arrow/rust/otap-dataf
 tracing-subscriber = { workspace = true, features = ["registry"] }
 arrowcol-dataflow-components = { path = "../../crates/arrowcol-dataflow-components" }
 otel-arrow-dfe = { path = "../../submodules/otel-arrow/rust/otap-dataflow", default-features = false, features = ["durable-buffer", "crypto-ring"] }
+serde_json = "1"
+serde_yaml = "0.9"
+humantime = "2"
 
 [lints]
 workspace = true

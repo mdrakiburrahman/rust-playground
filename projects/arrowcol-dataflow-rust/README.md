@@ -85,7 +85,7 @@ npx --no-install nx run arrowcol-dataflow-rust:run
 For the durable topology, add a writable Quiver directory and use `run-quiver`:
 
 ```bash
-ARROWCOL_QUIVER_PATH="$PWD/onelake/arrowcol-dataflow-quiver" \
+ARROWCOL_WAL_PATH="$PWD/onelake/arrowcol-dataflow-quiver" \
 ARROWCOL_SQL_HOST=127.0.0.1 \
 ARROWCOL_SQL_PORT=14333 \
 ARROWCOL_SQL_PASSWORD_FILE=projects/arrowcol-infra/secrets/arrowcol-app-password.txt \
@@ -166,15 +166,25 @@ Delta batches, publishes final pressure, and then relinquishes registration.
 and the exporter. The buffer persists `arrowcol.flight@1.1` record sets
 unchanged and replays unacknowledged ones after a restart. Its settings:
 
-| Setting | Value | Purpose |
-| --- | --- | --- |
-| `path` | `${ARROWCOL_QUIVER_PATH:-/var/lib/arrowcol/quiver}` | Per-core WAL and segment storage; must persist across restarts |
-| `wal_flush_interval` | `0s` | Fsync before every acknowledgement |
-| `retention_size_cap` | `${ARROWCOL_QUIVER_CAPACITY:-4 GiB}` | Disk budget; each core needs at least 192 MiB |
-| `size_cap_policy` | `backpressure` | Refuse new data instead of dropping old data |
-| `max_segment_open_duration` | `1s` | Upper bound on the delay before replay-visible segments |
-| `poll_interval` | `100ms` | Downstream forwarding cadence |
-| `initial_retry_interval`, `max_retry_interval` | `250ms`, `2s` | Backoff for transiently refused batches |
+| Setting | Environment variable | Profile default | Runtime effect |
+| --- | --- | --- | --- |
+| `path` | `ARROWCOL_WAL_PATH` | `/var/lib/arrowcol/quiver` | Startup-only; per-core persistent WAL and segment directory |
+| `wal_flush_interval` | `ARROWCOL_WAL_FLUSH_INTERVAL` | `0s` | Startup-only; fsync cadence before acknowledging data |
+| `retention_size_cap` | `ARROWCOL_WAL_RETENTION_SIZE_CAP` | `4 GiB` | Startup-only; total disk budget, divided evenly across cores |
+| `max_age` | `ARROWCOL_WAL_MAX_AGE` | unset | Startup-only; expiry can delete unconsumed segments |
+| `size_cap_policy` | `ARROWCOL_WAL_SIZE_CAP_POLICY` | `backpressure` | Startup-only; `backpressure` or lossy `drop_oldest` |
+| `max_segment_open_duration` | `ARROWCOL_WAL_MAX_SEGMENT_OPEN_DURATION` | `1s` | Startup-only; delay before replay-visible segments |
+| `poll_interval` | `ARROWCOL_WAL_POLL_INTERVAL` | `100ms` | Startup-only; downstream forwarding cadence |
+| `initial_retry_interval` | `ARROWCOL_WAL_INITIAL_RETRY_INTERVAL` | `250ms` | Startup-only; retry backoff base |
+| `max_retry_interval` | `ARROWCOL_WAL_MAX_RETRY_INTERVAL` | `2s` | Startup-only; retry backoff ceiling |
+| `retry_multiplier` | `ARROWCOL_WAL_RETRY_MULTIPLIER` | `2.0` | Startup-only; exponential retry multiplier |
+| `max_in_flight` | `ARROWCOL_WAL_MAX_IN_FLIGHT` | `1000` | Startup-only; maximum downstream bundles in flight |
+| `otlp_handling` | `ARROWCOL_WAL_OTLP_HANDLING` | `pass_through` | Startup-only; `pass_through` or `convert_to_arrow` |
+
+
+The effective config is emitted to stderr as one compact `arrowcol_wal_effective_config <JSON>` line. It omits the storage path. `durability_class` is derived as `lossy_eviction` when `max_age` is set or `size_cap_policy=drop_oldest`; otherwise a nonzero flush interval is `fsync_batched`, and zero is `durable`. The defaults above retain the durable behavior. A nonzero flush interval can lose acknowledged data not yet fsynced; expiry and `drop_oldest` can discard unconsumed data.
+
+The processor does not expose Quiver engine settings for WAL max size, rotated-file count, rotation target, segment target size, or segment stream count. These remain unsupported rather than parsed-but-unused. The processor's supported `max_segment_open_duration` controls time-based finalization, not segment size.
 
 Restart recovery depends on a stable identity: run the restarted process with
 the same `registration.instance_key` (`ARROWCOL_INSTANCE_KEY`) and the same
