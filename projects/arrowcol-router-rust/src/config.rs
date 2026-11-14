@@ -714,10 +714,12 @@ mod routing_policy_tests {
         let mut config = RouterConfig::from_yaml(include_bytes!("../config.yaml"))
             .unwrap_or_else(|error| panic!("parse default router configuration: {error}"));
         let malformed = HashMap::from([("ARROWCOL_ROUTER_WORKERS", "many")]);
-        let error = apply_environment_overrides(&mut config, |name| {
+        let error = match apply_environment_overrides(&mut config, |name| {
             Ok(malformed.get(name).map(|value| (*value).to_owned()))
-        })
-        .expect_err("non-numeric worker count must fail");
+        }) {
+            Ok(()) => panic!("non-numeric worker count must fail"),
+            Err(error) => error,
+        };
         assert!(error.to_string().contains("ARROWCOL_ROUTER_WORKERS"));
 
         let incompatible = HashMap::from([
