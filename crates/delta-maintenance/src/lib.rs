@@ -574,6 +574,7 @@ fn configuration_evidence(startup: &Settings, settings: &Settings, props: &Resol
     Ok(serde_json::json!({
         "startup": {
             "apply": startup.apply,
+            "anchor_ms": startup.anchor_ms,
             "operations": startup.operations,
             "interval_secs": startup.interval.map(|value| value.as_secs()),
             "max_idle_backoff_secs": startup.max_idle_backoff.as_secs(),
@@ -589,6 +590,7 @@ fn configuration_evidence(startup: &Settings, settings: &Settings, props: &Resol
             "output_row_group_rows": startup.optimize.output_row_group_rows,
         },
         "table_policy": policy,
+        "parquet_writer_overrides": arrow_deltalake::writer::process_config()?,
         "active": enabled,
         "operation_settings": enabled.then(|| serde_json::json!({
             "layout_mode": layout_mode,
