@@ -685,7 +685,10 @@ mod tests {
             operations: Some(vec![arrowcol_tunables::MaintenanceOperation::Optimize]),
             ..Default::default()
         });
-        assert!(config.validate().unwrap_err().to_string().contains("maintenance_image"));
+        assert!(matches!(
+            config.validate(),
+            Err(error) if error.to_string().contains("maintenance_image")
+        ));
 
         config.maintenance_image = Some(format!(
             "ghcr.io/mdrakiburrahman/rust-playground/delta-maintenance@sha256:{}",
@@ -693,7 +696,10 @@ mod tests {
         ));
         config.validate()?;
         config.maintenance_image = Some("ghcr.io/example/delta-maintenance:latest".to_owned());
-        assert!(config.validate().unwrap_err().to_string().contains("@sha256"));
+        assert!(matches!(
+            config.validate(),
+            Err(error) if error.to_string().contains("@sha256")
+        ));
         Ok(())
     }
 

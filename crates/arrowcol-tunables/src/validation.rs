@@ -1690,20 +1690,30 @@ fn flatten_environment(value: &Value, prefix: &str, output: &mut BTreeMap<String
 
 #[cfg(test)]
 mod tests {
+    fn error_text<T, E: std::fmt::Display>(result: std::result::Result<T, E>) -> String {
+        match result {
+            Ok(_) => String::new(),
+            Err(error) => error.to_string(),
+        }
+    }
+
     use super::*;
 
     #[test]
     fn strict_writer_config_parsing_and_validation() -> Result<()> {
-        let error =
-            serde_json::from_str::<ParquetWriterConfig>(r#"{"defaults":{"compression":"brotliish"}}"#).unwrap_err();
-        assert!(error.to_string().contains("unknown variant"));
+        assert!(
+            error_text(serde_json::from_str::<ParquetWriterConfig>(
+                r#"{"defaults":{"compression":"brotliish"}}"#
+            ))
+            .contains("unknown variant")
+        );
 
         let mut valid: ParquetWriterConfig = serde_json::from_str(
             r#"{"defaults":{"compression":"zstd","compression_level":22},"max_row_group_rows":1000}"#,
         )?;
         valid.validate()?;
         valid.defaults.compression_level = Some(23);
-        assert!(format!("{:#}", valid.validate().unwrap_err()).contains("zstd"));
+        assert!(error_text(valid.validate()).contains("zstd"));
 
         for probability in [0.0, 1.0, f64::NAN] {
             let mut invalid = ParquetWriterConfig::default();
@@ -1763,7 +1773,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(invalid.validate().unwrap_err().to_string().contains("max_memory_bytes"));
+        assert!(error_text(invalid.validate()).contains("max_memory_bytes"));
         let invalid = Tunables {
             collector: Some(CollectorTunables {
                 pressure: Some(PressureTunables {
@@ -1775,7 +1785,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(invalid.validate().unwrap_err().to_string().contains("rss_limit"));
+        assert!(error_text(invalid.validate()).contains("rss_limit"));
         let invalid = Tunables {
             wal: Some(WalTunables {
                 initial_retry_interval_ms: Some(2_001),
@@ -1784,13 +1794,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(
-            invalid
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("initial_retry_interval_ms")
-        );
+        assert!(error_text(invalid.validate()).contains("initial_retry_interval_ms"));
         let invalid = Tunables {
             transport: Some(TransportTunables {
                 stream_window_bytes: Some(16_777_217),
@@ -1798,13 +1802,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(
-            invalid
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("connection_window_bytes")
-        );
+        assert!(error_text(invalid.validate()).contains("connection_window_bytes"));
         let invalid = Tunables {
             collector: Some(CollectorTunables {
                 batching: Some(BatchingTunables {
@@ -1818,13 +1816,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(
-            invalid
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("per_table_capacity")
-        );
+        assert!(error_text(invalid.validate()).contains("per_table_capacity"));
         let invalid = Tunables {
             maintenance: Some(MaintenanceTunables {
                 enabled: Some(true),
@@ -1834,7 +1826,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(invalid.validate().unwrap_err().to_string().contains("target_file_mib"));
+        assert!(error_text(invalid.validate()).contains("target_file_mib"));
         let invalid = Tunables {
             collector: Some(CollectorTunables {
                 commit: Some(CommitTunables {
@@ -1845,13 +1837,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(
-            invalid
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("max_pending_files")
-        );
+        assert!(error_text(invalid.validate()).contains("max_pending_files"));
         let auto_workers = Tunables {
             client: Some(ClientTunables {
                 workers: Some(0),
@@ -1904,13 +1890,7 @@ mod tests {
 
         let duplicate: Tunables =
             serde_json::from_str(r#"{"arrow_ipc":{"compression":"zstd"},"transport":{"ipc_compression":"zstd"}}"#)?;
-        assert!(
-            duplicate
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("not in both sections")
-        );
+        assert!(error_text(duplicate.validate()).contains("not in both sections"));
         Ok(())
     }
 
@@ -1950,13 +1930,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(
-            invalid
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("h2_connection_window_bytes")
-        );
+        assert!(error_text(invalid.validate()).contains("h2_connection_window_bytes"));
         Ok(())
     }
 
@@ -2007,13 +1981,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(
-            invalid
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("max_concurrent_decoded_bytes")
-        );
+        assert!(error_text(invalid.validate()).contains("max_concurrent_decoded_bytes"));
 
         let tunables = Tunables {
             maintenance: Some(MaintenanceTunables {
@@ -2065,13 +2033,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(
-            invalid
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("must not exceed 1000")
-        );
+        assert!(error_text(invalid.validate()).contains("must not exceed 1000"));
         Ok(())
     }
 
@@ -2085,7 +2047,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(disabled.validate().unwrap_err().to_string().contains("enabled=true"));
+        assert!(error_text(disabled.validate()).contains("enabled=true"));
         let enabled_without_operations = Tunables {
             maintenance: Some(MaintenanceTunables {
                 enabled: Some(true),
@@ -2093,13 +2055,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(
-            enabled_without_operations
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("operations")
-        );
+        assert!(error_text(enabled_without_operations.validate()).contains("operations"));
         let supported = Tunables {
             maintenance: Some(MaintenanceTunables {
                 enabled: Some(true),
@@ -2143,6 +2099,7 @@ mod tests {
                     batch_rows: Some(16_384),
                     ..Default::default()
                 }),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -2221,9 +2178,9 @@ mod tests {
         let routing: Value = serde_json::from_str(&env["ARROWCOL_COLLECTOR_ROUTING_CONFIG"])?;
         assert_eq!(batching["max_age"], "1s");
         assert_eq!(catalog["maximum_cache_age"], "10s");
-        assert_eq!(commit["batch_window"], "2.5s");
+        assert_eq!(commit["batch_window"], "2s 500ms");
         assert_eq!(exporter["authority_timeout"], "10s");
-        assert_eq!(limits["max_stream_duration"], "60s");
+        assert_eq!(limits["max_stream_duration"], "1m");
         assert_eq!(limits["admission_timeout"], "5s");
         assert_eq!(pressure["pressure_interval"], "2s");
         assert_eq!(pressure["heartbeat_interval"], "5s");
@@ -2242,13 +2199,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(
-            invalid
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("must exceed heartbeat_interval")
-        );
+        assert!(error_text(invalid.validate()).contains("must exceed heartbeat_interval"));
         let invalid = Tunables {
             collector: Some(CollectorTunables {
                 pressure: Some(PressureTunables {
@@ -2259,13 +2210,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(
-            invalid
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("at least 1 millisecond")
-        );
+        assert!(error_text(invalid.validate()).contains("at least 1 millisecond"));
         Ok(())
     }
 
@@ -2295,13 +2240,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(
-            invalid
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("at least 1024 bytes")
-        );
+        assert!(error_text(invalid.validate()).contains("at least 1024 bytes"));
         Ok(())
     }
 
@@ -2320,13 +2259,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(
-            invalid
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("per_table_capacity")
-        );
+        assert!(error_text(invalid.validate()).contains("per_table_capacity"));
         let invalid = Tunables {
             collector: Some(CollectorTunables {
                 batching: Some(BatchingTunables {
@@ -2337,7 +2270,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(invalid.validate().unwrap_err().to_string().contains("flush limits"));
+        assert!(error_text(invalid.validate()).contains("flush limits"));
         let invalid = Tunables {
             collector: Some(CollectorTunables {
                 commit: Some(CommitTunables {
@@ -2348,13 +2281,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(
-            invalid
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("max_pending_files")
-        );
+        assert!(error_text(invalid.validate()).contains("max_pending_files"));
         let invalid = Tunables {
             collector: Some(CollectorTunables {
                 limits: Some(LimitsTunables {
@@ -2365,7 +2292,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(invalid.validate().unwrap_err().to_string().contains("max_schema_bytes"));
+        assert!(error_text(invalid.validate()).contains("max_schema_bytes"));
     }
 
     #[test]
@@ -2387,13 +2314,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(
-            invalid
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("mutually exclusive")
-        );
+        assert!(error_text(invalid.validate()).contains("mutually exclusive"));
         let invalid = Tunables {
             client: Some(ClientTunables {
                 workers: Some(1_025),
@@ -2401,7 +2322,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(invalid.validate().unwrap_err().to_string().contains("workers"));
+        assert!(error_text(invalid.validate()).contains("workers"));
         let invalid = Tunables {
             client: Some(ClientTunables {
                 entropy: Some(f64::INFINITY),
@@ -2409,7 +2330,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(invalid.validate().unwrap_err().to_string().contains("entropy"));
+        assert!(error_text(invalid.validate()).contains("entropy"));
     }
 
     #[test]
@@ -2425,16 +2346,19 @@ mod tests {
     #[test]
     fn maintenance_input_read_strategy_is_strict_and_supports_range() {
         assert_eq!(
-            serde_json::from_str::<MaintenanceInputReadStrategy>("\"range\"").unwrap(),
-            MaintenanceInputReadStrategy::Range
+            serde_json::from_str::<MaintenanceInputReadStrategy>("\"range\""),
+            Ok(MaintenanceInputReadStrategy::Range)
         );
         assert!(serde_json::from_str::<MaintenanceInputReadStrategy>("\"invalid\"").is_err());
     }
 
     #[test]
     fn unknown_fields_are_rejected_in_each_section() {
-        let error =
-            serde_json::from_str::<Tunables>(r#"{"client":{"batch_rows":1,"compression":"gzip"}}"#).unwrap_err();
-        assert!(error.to_string().contains("unknown field"));
+        assert!(
+            error_text(serde_json::from_str::<Tunables>(
+                r#"{"client":{"batch_rows":1,"compression":"gzip"}}"#
+            ))
+            .contains("unknown field")
+        );
     }
 }
