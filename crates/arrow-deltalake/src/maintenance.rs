@@ -2026,6 +2026,9 @@ impl DeltaTable {
                 .set_max_row_group_row_count(Some(config.output_row_group_rows))
                 .build(),
         };
+        let verified_sort = crate::writer::sorting_from_properties(&physical, Some(&properties))?;
+        let properties =
+            crate::writer::process_config()?.writer_properties(&physical, Some(properties), &verified_sort)?;
         let mut writer = BinWriter {
             table: self,
             snapshot,
