@@ -141,7 +141,14 @@ fn effective_configuration_is_reported_for_a_negative_probe() -> Result<()> {
 
 #[test]
 fn shared_parquet_policy_controls_sorted_and_unsorted_compaction() -> Result<()> {
-    for (sorted, strategy) in [(false, "memory"), (true, "memory"), (false, "spool"), (true, "spool")] {
+    for (sorted, strategy) in [
+        (false, "memory"),
+        (true, "memory"),
+        (false, "spool"),
+        (true, "spool"),
+        (false, "range"),
+        (true, "range"),
+    ] {
         let root = tempfile::tempdir()?;
         let path = root.path().join("events");
         table(&path)?;

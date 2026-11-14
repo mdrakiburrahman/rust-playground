@@ -21,6 +21,8 @@ Compaction also consumes the shared `ARROWCOL_PARQUET_CONFIG` JSON. Readback
 reports its overrides; schema compatibility is checked when rewriting files.
 `--input-read-strategy spool` streams each input to temporary local disk instead
 of buffering its compressed bytes in memory; disk space and I/O must be available.
+`--input-read-strategy range` streams Parquet ranges and requires a strong
+object ETag for every conditional request; unsupported or changed objects fail.
 
 | Operation | Effect |
 | --- | --- |

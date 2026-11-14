@@ -426,6 +426,7 @@ dependencies = [
  "arrow-json 58.4.0",
  "arrowcol-props",
  "async-trait",
+ "bytes",
  "chrono",
  "delta_kernel",
  "delta_kernel_default_engine",
