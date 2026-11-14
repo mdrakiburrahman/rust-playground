@@ -113,6 +113,7 @@ async function main(): Promise<void> {
         run(name, [...secretMount, '-v', `${volumes[2]}:/onelake`,
           '-e', `ARROWCOL_SQL_HOST=${sql}`, '-e', 'ARROWCOL_SQL_PASSWORD_FILE=/run/oat/app-password',
           '-e', `ARROWCOL_CATALOG_ENDPOINT=http://${catalog}:8817`,
+          '-e', 'ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE=/run/oat/internal-hmac',
           '-e', `ARROWCOL_INSTANCE_KEY=${name}`, '-e', 'ARROWCOL_DELTA_ROOT=/onelake/dataflow',
           '-e', 'ARROWCOL_PARTITION_GRANULARITY=hour',
           '--entrypoint', '/bin/sh'], images.dataflow,
