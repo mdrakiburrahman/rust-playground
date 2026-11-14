@@ -58,7 +58,10 @@ fn fixture() -> Result<(tempfile::TempDir, Settings, CatalogTable)> {
         max_idle_backoff: Duration::from_secs(300),
         max_cycles: None,
         max_concurrent_tables: 1,
+        max_concurrent_decoded_bytes: None,
         operation_timeout: Duration::from_secs(30),
+        commit_attempts: 8,
+        commit_budget: Duration::from_secs(10),
         granularity: Some(Granularity::Minute),
         purge_retention_ms: None,
         anchor_ms: Some(BASE + 3 * 60_000),
@@ -66,6 +69,7 @@ fn fixture() -> Result<(tempfile::TempDir, Settings, CatalogTable)> {
         allow_short_vacuum_retention: false,
         unsafe_short_vacuum_for_tests: false,
         optimize: OptimizeConfig::default(),
+        process_properties: BTreeMap::new(),
         checkpoint_every_commits: 100,
         log_retention_ms: None,
         max_prune_files: 100,
@@ -217,6 +221,9 @@ fn idle_catalog_policy_passes_have_no_log_checkpoint_or_progress_rewrites() -> R
 fn table_policy_overrides_process_minimum_and_only_compacts_sealed_pair() -> Result<()> {
     let (root, mut settings, mut source) = fixture()?;
     settings.operations = vec![Operation::Optimize];
+    settings
+        .process_properties
+        .insert("arrowcol.optimize.minFiles".into(), "4".into());
     source
         .0
         .properties
@@ -230,6 +237,40 @@ fn table_policy_overrides_process_minimum_and_only_compacts_sealed_pair() -> Res
         std::fs::read_dir(root.path().join("events").join("__arrowcol_ingestion=2024-01-01-00-01"))?.count(),
         2
     );
+    Ok(())
+}
+
+#[test]
+fn invalid_process_properties_are_rejected_before_a_pass() -> Result<()> {
+    let (_, mut settings, _) = fixture()?;
+    settings
+        .process_properties
+        .insert("arrowcol.optimize.minFiles".into(), "1".into());
+    assert!(settings.validate().is_err());
+    Ok(())
+}
+
+#[test]
+fn decoded_budget_rejects_table_override_without_mutating_data() -> Result<()> {
+    let (root, mut settings, mut source) = fixture()?;
+    settings.operations = vec![Operation::Optimize];
+    settings.max_concurrent_tables = 2;
+    settings.max_concurrent_decoded_bytes = Some(2 * 1024 * 1024 * 1024);
+    settings.validate()?;
+    source
+        .0
+        .properties
+        .insert("arrowcol.optimize.maxDecodedSizePerBin".into(), "2 GiB".into());
+    persist_policy(&source)?;
+    let before = inventory(root.path())?;
+    let results = run_cycle_with_discovery(&settings, &source, &Metrics::new(), &Arc::new(AtomicBool::new(false)))?;
+    assert!(
+        results[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("aggregate decode budget"))
+    );
+    assert_eq!(before, inventory(root.path())?);
     Ok(())
 }
 
