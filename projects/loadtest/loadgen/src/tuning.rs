@@ -36,7 +36,7 @@ mod tests {
             vec!["--precompute-batches-per-table", "17"],
             vec!["--connections-per-worker", "0"],
             vec!["--max-memory-bytes", "0"],
-            vec!["--max-flight-data-bytes", "16777217"],
+            vec!["--max-flight-data-bytes", "33554433"],
             vec!["--stream-window-bytes", "2147483648"],
             vec!["--retry-initial-backoff-ms", "2001"],
         ] {
@@ -90,9 +90,9 @@ pub struct ClientTuning {
     pub entropy: f64,
     #[arg(long, env = "ARROWCOL_CLIENT_IPC_COMPRESSION", value_enum, default_value_t = IpcCompression::None)]
     pub ipc_compression: IpcCompression,
-    #[arg(long, env = "ARROWCOL_CLIENT_MAX_FLIGHT_DATA_BYTES", default_value_t = 2_097_152)]
+    #[arg(long, env = "ARROWCOL_CLIENT_MAX_FLIGHT_DATA_BYTES", default_value_t = 32_505_856)]
     pub max_flight_data_bytes: usize,
-    #[arg(long, env = "ARROWCOL_CLIENT_MAX_MESSAGE_BYTES", default_value_t = 16_777_216)]
+    #[arg(long, env = "ARROWCOL_CLIENT_MAX_MESSAGE_BYTES", default_value_t = 33_554_432)]
     pub max_message_bytes: usize,
     /// Zero inherits the existing --request-timeout.
     #[arg(long, env = "ARROWCOL_CLIENT_CONNECT_TIMEOUT_MS", default_value_t = 0)]
@@ -133,8 +133,8 @@ impl Default for ClientTuning {
             string_width: 0,
             entropy: 1.0,
             ipc_compression: IpcCompression::None,
-            max_flight_data_bytes: 2_097_152,
-            max_message_bytes: 16_777_216,
+            max_flight_data_bytes: 32_505_856,
+            max_message_bytes: 33_554_432,
             connect_timeout_ms: 0,
             stream_window_bytes: 1_048_576,
             connection_window_bytes: 16_777_216,

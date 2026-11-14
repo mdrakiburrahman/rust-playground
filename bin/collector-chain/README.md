@@ -32,7 +32,7 @@ explicit CLI values win. Run `arrowcol-dmv --help` for the complete reference.
 | `--string-width`, `--cardinality`, `--null-fraction`, `--skew`, `--entropy`, `--seed` | Fixed-width strings (zero uses field/key formatting), value cardinality, nullable-field null probability, hot-key probability, variable string fraction, deterministic seed. `customer_id` always retains the client ID. |
 | `--interval-us`, `--max-rows` | Per-stream-slot cooldown; zero never sleeps. Row limit bounds whole-batch attempts across preflight, warm-up and measurement; zero is unlimited and a remainder smaller than a batch is not sent. |
 | `--connections-per-worker` | Persistent independent channels; stream slots round-robin across them. |
-| `--ipc-compression`, `--dictionary-handling` | IPC `none`, `lz4_frame`, `zstd`; Flight dictionary `hydrate`/`resend`. The DMV fixture has no dictionary fields, so the latter does not dictionary-encode strings. |
+| `--ipc-compression`, `--dictionary-handling` | IPC `none`, `lz4_frame`, `zstd`. Plain DMV schemas do not support dictionary workloads: only the compatibility default `hydrate` is accepted; `resend` fails explicitly. |
 | `--grpc-send-compression`, `--grpc-accept-compression` | `none`, `gzip`, `zstd`; sending compressed gRPC requires receiver support. This codec runs per send, separately from precomputed IPC. |
 | Transport flags | Message/frame/header limits, HTTP/2 windows/adaptation, keepalive, TCP settings, endpoint concurrency/buffering, per-connection rate limit and timeouts are exposed in `--help`. |
 | `--connect-retries`, `--retry-backoff-ms` | Only retry connection establishment. Ambiguous `DoPut` uploads are never automatically retried; doing so could duplicate admitted rows. |

@@ -575,6 +575,7 @@ mod tests {
                     ipc_compression: codec,
                     string_width: 257,
                     entropy: 0.5,
+                    max_flight_data_bytes: 1024,
                     ..ClientTuning::default()
                 };
                 let cache = PreparedCorpus::prepare(&[Arc::clone(&table)], CUSTOMER_COUNT, 7, 2, &tuning).await?;
@@ -605,8 +606,13 @@ mod tests {
                         ))
                         .try_collect::<Vec<_>>()
                         .await?;
-                        assert_eq!(decoded, vec![expected.record_batch.clone()]);
-                        let label = decoded[0]
+                        assert!(
+                            decoded.len() > 1,
+                            "small split target must change Flight batch encoding"
+                        );
+                        let concatenated = arrow::compute::concat_batches(&table.schema, &decoded)?;
+                        assert_eq!(concatenated, expected.record_batch);
+                        let label = concatenated
                             .column(4)
                             .as_any()
                             .downcast_ref::<StringArray>()
@@ -616,7 +622,7 @@ mod tests {
                         let mut writer = arrow_deltalake::delta::DeltaTableWriter::open(
                             directory.path().join(table.identity.to_string()),
                         )?;
-                        writer.write(&decoded[0]).await?;
+                        writer.write(&concatenated).await?;
                         writer.close().await?;
                         let snapshot = delta_inspect::summarize(directory.path()).await?;
                         assert_eq!(

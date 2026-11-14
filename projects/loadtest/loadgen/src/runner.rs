@@ -257,14 +257,14 @@ async fn run_phase(
         .map(|_| Arc::new(LaneMetrics::new()))
         .collect::<Vec<_>>();
     let metrics_started = Instant::now();
-    for lane in 0..arguments.lanes {
+    for (lane, metrics) in lane_metrics.iter().enumerate() {
         let scheduler = Arc::clone(&scheduler);
         let batch_rows = arguments.batch_rows;
         let seed = arguments.seed;
         let transport = transport.for_lane(lane)?;
         let tuning = arguments.client_tuning.clone();
         let corpus = Arc::clone(&corpus);
-        let metrics = Arc::clone(&lane_metrics[lane]);
+        let metrics = Arc::clone(metrics);
         let manifests = manifests.clone();
         let cancellation = cancellation.clone();
         let run_id = run_id.to_owned();
@@ -411,13 +411,15 @@ async fn run_phase(
         "[loadgen] {phase} finished: {} batches sent",
         scheduler.scheduled().saturating_sub(first_ordinal)
     );
+    let elapsed = metrics_started.elapsed().as_secs_f64();
     let metrics = serde_json::json!({
         "version": 1, "run_id": run_id, "scenario": scenario.as_str(), "phase": phase,
         "scope": "phase_including_inflight_drain_not_exact_measurement_window",
         "completion_semantics": "validated_admission_response_not_delta_commit",
+        "attempt_semantics": "started_client_transport_attempt_not_proven_wire_delivery",
         "bytes_semantics": "protobuf_flight_data_lengths_excluding_grpc_http2",
-        "elapsed_seconds": metrics_started.elapsed().as_secs_f64(),
-        "workers": lane_metrics.iter().enumerate().map(|(lane, metrics)| metrics.snapshot(lane)).collect::<Result<Vec<_>>>()?,
+        "elapsed_seconds": elapsed,
+        "workers": lane_metrics.iter().enumerate().map(|(lane, metrics)| metrics.snapshot(lane, elapsed)).collect::<Result<Vec<_>>>()?,
     });
     manifests
         .write_json(&format!("{}-{phase}-client-metrics.json", scenario.as_str()), &metrics)
@@ -562,7 +564,7 @@ impl LaneMetrics {
         }
     }
 
-    fn snapshot(&self, lane: usize) -> Result<serde_json::Value> {
+    fn snapshot(&self, lane: usize, elapsed: f64) -> Result<serde_json::Value> {
         let histogram = self
             .latency
             .lock()
@@ -586,6 +588,7 @@ impl LaneMetrics {
             "worker": lane,
             "attempted_rows": self.attempted_rows.load(Ordering::Relaxed),
             "completed_rows": self.completed_rows.load(Ordering::Relaxed),
+            "completed_rows_per_second": self.completed_rows.load(Ordering::Relaxed) as f64 / elapsed.max(f64::MIN_POSITIVE),
             "error_rows": self.error_rows.load(Ordering::Relaxed),
             "cancelled_uncertain_rows": self.cancelled_rows.load(Ordering::Relaxed),
             "attempted_bytes": self.attempted_bytes.load(Ordering::Relaxed),
