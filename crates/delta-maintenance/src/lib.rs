@@ -77,6 +77,7 @@ pub struct Settings {
     pub operation_timeout: Duration,
     pub commit_attempts: u32,
     pub commit_budget: Duration,
+    pub catalog_options: catalog::CatalogOptions,
     pub granularity: Option<Granularity>,
     pub purge_retention_ms: Option<i64>,
     pub anchor_ms: Option<i64>,
@@ -158,6 +159,7 @@ impl Settings {
             bail!("VACUUM retention must not be negative");
         }
         self.optimize.validate()?;
+        self.catalog_options.validate()?;
         self.validate_decoded_budget(self.optimize.max_decoded_bytes_per_bin)?;
         MaintenanceControl::default().with_commit_retry_limits(self.commit_attempts, self.commit_budget)?;
         resolve(&BTreeMap::new(), &process_defaults(self))?;
@@ -580,6 +582,9 @@ fn configuration_evidence(startup: &Settings, settings: &Settings, props: &Resol
             "max_concurrent_decoded_bytes": startup.max_concurrent_decoded_bytes,
             "commit_attempts": startup.commit_attempts,
             "commit_budget_secs": startup.commit_budget.as_secs(),
+            "catalog_runtime_threads": startup.catalog_options.runtime_threads,
+            "catalog_rpc_timeout_secs": startup.catalog_options.rpc_timeout.as_secs(),
+            "catalog_max_decoding_message_bytes": startup.catalog_options.max_decoding_message_bytes,
             "max_prune_files": startup.max_prune_files,
             "output_row_group_rows": startup.optimize.output_row_group_rows,
         },

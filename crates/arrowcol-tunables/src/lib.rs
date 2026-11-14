@@ -246,7 +246,10 @@ pub struct MaintenanceTunables {
     pub max_idle_backoff_secs: Option<u64>,
     pub max_cycles: Option<u64>,
     pub max_concurrent_tables: Option<usize>,
+    pub max_concurrent_decoded_bytes: Option<u64>,
     pub operation_timeout_secs: Option<u64>,
+    pub commit_attempts: Option<u32>,
+    pub commit_budget_secs: Option<u64>,
     pub granularity: Option<MaintenanceGranularity>,
     pub purge_retention_secs: Option<u64>,
     pub anchor_ms: Option<i64>,
@@ -290,7 +293,7 @@ pub enum MaintenanceGranularity {
     Day,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum MaintenanceOperation {
     Purge,

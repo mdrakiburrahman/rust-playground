@@ -62,6 +62,7 @@ fn fixture() -> Result<(tempfile::TempDir, Settings, CatalogTable)> {
         operation_timeout: Duration::from_secs(30),
         commit_attempts: 8,
         commit_budget: Duration::from_secs(10),
+        catalog_options: Default::default(),
         granularity: Some(Granularity::Minute),
         purge_retention_ms: None,
         anchor_ms: Some(BASE + 3 * 60_000),
@@ -514,10 +515,15 @@ fn real_catalog_ddl_discovery_refreshes_policy_without_idle_writes() -> Result<(
         "CREATE TABLE arrowcol.default.events (id BIGINT NOT NULL, __arrowcol_ingestion STRING NOT NULL) USING DELTA PARTITIONED BY (__arrowcol_ingestion) TBLPROPERTIES ('arrowcol.optimize.minFiles'='3', 'arrowcol.partition.granularity'='minute', 'delta.checkpointInterval'='100')".into(),
         None,
     ))?;
-    let source = CatalogDiscovery::connect_with_signer(
+    let source = CatalogDiscovery::connect_with_signer_and_options(
         &endpoint,
         Vec::new(),
         InternalRequestSigner::from_secret(b"catalog-integration-key-at-least-32-bytes".to_vec())?,
+        delta_maintenance::catalog::CatalogOptions {
+            runtime_threads: 1,
+            rpc_timeout: Duration::from_secs(5),
+            max_decoding_message_bytes: 1024 * 1024,
+        },
     )?;
     let names = source.tables()?;
     assert_eq!(names, ["arrowcol.default.events"]);
