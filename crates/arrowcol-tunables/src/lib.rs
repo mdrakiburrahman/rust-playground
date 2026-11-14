@@ -84,15 +84,35 @@ pub struct TransportTunables {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouterTunables {
-    pub worker_threads: Option<usize>,
-    pub listener_threads: Option<usize>,
-    pub max_downstream_streams: Option<usize>,
-    pub max_upstream_streams: Option<usize>,
-    pub stream_window_bytes: Option<u32>,
-    pub connection_window_bytes: Option<u32>,
-    pub request_timeout_ms: Option<u64>,
-    pub idle_timeout_ms: Option<u64>,
-    pub connect_timeout_ms: Option<u64>,
+    pub workers: Option<usize>,
+    pub listener_tasks_per_fd: Option<usize>,
+    pub keepalive_pool_size: Option<usize>,
+    pub h2_max_concurrent_streams: Option<u32>,
+    pub h2_stream_window_bytes: Option<u32>,
+    pub h2_connection_window_bytes: Option<u32>,
+    pub h2_idle_timeout_seconds: Option<u64>,
+    pub sql_connect_timeout_ms: Option<u64>,
+    pub sql_command_timeout_ms: Option<u64>,
+    pub refresh_interval_ms: Option<u64>,
+    pub max_snapshot_age_ms: Option<u64>,
+    pub max_future_skew_ms: Option<u64>,
+    pub max_table_entries: Option<usize>,
+    pub max_oldest_buffer_age_ms: Option<u64>,
+    pub hard_pressure_bps: Option<u16>,
+    pub warmup_ms: Option<u64>,
+    pub minimum_warmup_bps: Option<u16>,
+    pub lease_ttl_ms: Option<u64>,
+    pub oat_run_pin_ttl_ms: Option<u64>,
+    pub readiness_max_staleness_ms: Option<u64>,
+    pub distinct_table_owners: Option<bool>,
+    pub edge_replay_max_nonces: Option<usize>,
+    pub upstream_max_h2_streams: Option<usize>,
+    pub upstream_stream_window_bytes: Option<u32>,
+    pub upstream_connection_window_bytes: Option<u32>,
+    pub upstream_connection_timeout_ms: Option<u64>,
+    pub upstream_total_connection_timeout_ms: Option<u64>,
+    pub upstream_idle_timeout_seconds: Option<u64>,
+    pub upstream_ping_interval_seconds: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -216,24 +236,31 @@ pub enum GrpcCompression {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WalTunables {
-    pub enabled: Option<bool>,
-    pub fsync_interval_ms: Option<u64>,
-    pub capacity_bytes: Option<u64>,
-    pub segment_size_bytes: Option<u64>,
+    pub flush_interval_ms: Option<u64>,
+    pub retention_size_cap_bytes: Option<u64>,
+    pub max_age_secs: Option<u64>,
+    pub size_cap_policy: Option<WalSizeCapPolicy>,
+    pub max_segment_open_duration_ms: Option<u64>,
     pub poll_interval_ms: Option<u64>,
-    pub retry_min_ms: Option<u64>,
-    pub retry_max_ms: Option<u64>,
-    pub max_retries: Option<u32>,
-    pub overflow_policy: Option<WalOverflowPolicy>,
+    pub initial_retry_interval_ms: Option<u64>,
+    pub max_retry_interval_ms: Option<u64>,
+    pub retry_multiplier: Option<f64>,
+    pub max_in_flight: Option<usize>,
+    pub otlp_handling: Option<WalOtlpHandling>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
-pub enum WalOverflowPolicy {
-    #[default]
+pub enum WalSizeCapPolicy {
     Backpressure,
-    Reject,
-    EvictOldest,
+    DropOldest,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum WalOtlpHandling {
+    PassThrough,
+    ConvertToArrow,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -250,6 +277,10 @@ pub struct MaintenanceTunables {
     pub operation_timeout_secs: Option<u64>,
     pub commit_attempts: Option<u32>,
     pub commit_budget_secs: Option<u64>,
+    pub catalog_runtime_threads: Option<usize>,
+    pub catalog_rpc_timeout_secs: Option<u64>,
+    pub catalog_max_decoding_message_bytes: Option<usize>,
+    pub input_read_strategy: Option<MaintenanceInputReadStrategy>,
     pub granularity: Option<MaintenanceGranularity>,
     pub purge_retention_secs: Option<u64>,
     pub anchor_ms: Option<i64>,
@@ -283,6 +314,13 @@ pub struct MaintenanceTunables {
     pub checkpoint_every_commits: Option<u64>,
     pub log_retention_secs: Option<u64>,
     pub max_prune_files: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum MaintenanceInputReadStrategy {
+    Memory,
+    Spool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
