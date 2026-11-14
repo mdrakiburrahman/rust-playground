@@ -255,6 +255,11 @@ fn purge_file_bound_is_applied_and_invalid_operation_limits_are_rejected() -> Re
         .output()?;
     assert!(!invalid.status.success());
     assert_eq!(version(&path)?, before);
+    let bounded_discovery = service(root.path())?
+        .args(["--operation", "purge", "--apply", "--discovery-max-log-files", "1"])
+        .output()?;
+    assert!(!bounded_discovery.status.success());
+    assert_eq!(version(&path)?, before);
     Ok(())
 }
 
