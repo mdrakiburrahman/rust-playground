@@ -4,8 +4,8 @@ use anyhow::{Context, Result, ensure};
 use arrow::datatypes::SchemaRef;
 use parquet::arrow::ArrowSchemaConverter;
 use parquet::basic::{BrotliLevel, Compression, Encoding, GzipLevel, Type, ZstdLevel};
-use parquet::file::metadata::SortingColumn;
 use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterPropertiesBuilder, WriterVersion};
+use parquet::file::metadata::SortingColumn;
 use parquet::schema::types::ColumnPath;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -112,10 +112,7 @@ pub struct ColumnOptions {
 impl ColumnOptions {
     fn compression(&self) -> Result<Option<Compression>> {
         let Some(codec) = self.compression else {
-            ensure!(
-                self.compression_level.is_none(),
-                "compression_level requires compression"
-            );
+            ensure!(self.compression_level.is_none(), "compression_level requires compression");
             return Ok(None);
         };
         let level = self.compression_level;
@@ -159,19 +156,13 @@ impl ColumnOptions {
             }
         }
         if let Some(fpp) = self.bloom_filter_fpp {
-            ensure!(
-                fpp.is_finite() && fpp > 0.0 && fpp < 1.0,
-                "bloom_filter_fpp must be in (0,1)"
-            );
+            ensure!(fpp.is_finite() && fpp > 0.0 && fpp < 1.0, "bloom_filter_fpp must be in (0,1)");
         }
         if let Some(ndv) = self.bloom_filter_ndv {
             ensure!(ndv > 0, "bloom_filter_ndv must be positive");
         }
         if let Some(ratio) = self.data_page_v2_compression_ratio_threshold {
-            ensure!(
-                ratio.is_finite() && ratio > 0.0,
-                "V2 compression ratio threshold must be finite and positive"
-            );
+            ensure!(ratio.is_finite() && ratio > 0.0, "V2 compression ratio threshold must be finite and positive");
         }
         ensure!(
             self.bloom_filter_enabled != Some(false)
@@ -181,11 +172,7 @@ impl ColumnOptions {
         Ok(())
     }
 
-    fn apply(
-        &self,
-        mut builder: WriterPropertiesBuilder,
-        column: Option<&ColumnPath>,
-    ) -> Result<WriterPropertiesBuilder> {
+    fn apply(&self, mut builder: WriterPropertiesBuilder, column: Option<&ColumnPath>) -> Result<WriterPropertiesBuilder> {
         macro_rules! setting {
             ($value:expr, $global:ident, $per_column:ident) => {
                 if let Some(value) = $value {
@@ -197,48 +184,16 @@ impl ColumnOptions {
             };
         }
         setting!(self.compression()?, set_compression, set_column_compression);
-        setting!(
-            self.encoding.map(ValueEncoding::parquet),
-            set_encoding,
-            set_column_encoding
-        );
-        setting!(
-            self.dictionary_enabled,
-            set_dictionary_enabled,
-            set_column_dictionary_enabled
-        );
-        setting!(
-            self.dictionary_page_size_limit,
-            set_dictionary_page_size_limit,
-            set_column_dictionary_page_size_limit
-        );
-        setting!(
-            self.data_page_size_limit,
-            set_data_page_size_limit,
-            set_column_data_page_size_limit
-        );
-        setting!(
-            self.statistics.map(Statistics::parquet),
-            set_statistics_enabled,
-            set_column_statistics_enabled
-        );
-        setting!(
-            self.write_page_header_statistics,
-            set_write_page_header_statistics,
-            set_column_write_page_header_statistics
-        );
+        setting!(self.encoding.map(ValueEncoding::parquet), set_encoding, set_column_encoding);
+        setting!(self.dictionary_enabled, set_dictionary_enabled, set_column_dictionary_enabled);
+        setting!(self.dictionary_page_size_limit, set_dictionary_page_size_limit, set_column_dictionary_page_size_limit);
+        setting!(self.data_page_size_limit, set_data_page_size_limit, set_column_data_page_size_limit);
+        setting!(self.statistics.map(Statistics::parquet), set_statistics_enabled, set_column_statistics_enabled);
+        setting!(self.write_page_header_statistics, set_write_page_header_statistics, set_column_write_page_header_statistics);
         setting!(self.bloom_filter_fpp, set_bloom_filter_fpp, set_column_bloom_filter_fpp);
         setting!(self.bloom_filter_ndv, set_bloom_filter_ndv, set_column_bloom_filter_ndv);
-        setting!(
-            self.bloom_filter_enabled,
-            set_bloom_filter_enabled,
-            set_column_bloom_filter_enabled
-        );
-        setting!(
-            self.data_page_v2_compression_ratio_threshold,
-            set_data_page_v2_compression_ratio_threshold,
-            set_column_data_page_v2_compression_ratio_threshold
-        );
+        setting!(self.bloom_filter_enabled, set_bloom_filter_enabled, set_column_bloom_filter_enabled);
+        setting!(self.data_page_v2_compression_ratio_threshold, set_data_page_v2_compression_ratio_threshold, set_column_data_page_v2_compression_ratio_threshold);
         Ok(builder)
     }
 }
@@ -310,33 +265,25 @@ impl ParquetWriterConfig {
         self.validate()?;
         let descriptor = ArrowSchemaConverter::new().convert(schema)?;
         let leaves = descriptor.columns();
+        let leaf_index = |path: &str| -> Result<usize> {
+            let mut matching = leaves.iter().enumerate().filter(|(_, leaf)| leaf.path().string() == path);
+            let (index, _) = matching.next().with_context(|| format!("unknown physical Parquet column {path}"))?;
+            ensure!(matching.next().is_none(), "ambiguous physical Parquet column selector {path}");
+            Ok(index)
+        };
         for path in self.columns.keys() {
-            ensure!(
-                leaves.iter().any(|leaf| leaf.path().string() == *path),
-                "unknown physical Parquet column {path}"
-            );
+            leaf_index(path)?;
         }
         for leaf in leaves {
             let path = leaf.path().string();
-            let encoding = self
-                .columns
-                .get(&path)
-                .and_then(|column| column.encoding)
-                .or(self.defaults.encoding);
+            let encoding = self.columns.get(&path).and_then(|column| column.encoding).or(self.defaults.encoding);
             if let Some(encoding) = encoding {
-                encoding
-                    .validate(leaf.physical_type())
-                    .with_context(|| format!("Parquet column {path}"))?;
+                encoding.validate(leaf.physical_type()).with_context(|| format!("Parquet column {path}"))?;
             }
         }
         let mut builder = self.defaults.apply(base.unwrap_or_default().into(), None)?;
         for (path, options) in &self.columns {
-            builder = options.apply(
-                builder,
-                Some(&ColumnPath::from(
-                    path.split('.').map(str::to_owned).collect::<Vec<_>>(),
-                )),
-            )?;
+            builder = options.apply(builder, Some(leaves[leaf_index(path)?].path()))?;
         }
         if let Some(version) = self.writer_version {
             builder = builder.set_writer_version(match version {
@@ -366,26 +313,15 @@ impl ParquetWriterConfig {
             builder = builder.set_statistics_truncate_length(Some(length));
         }
         let sorting = self.sorting_columns.as_deref().unwrap_or(verified_sort);
-        ensure!(
-            sorting.is_empty() || sorting == verified_sort,
-            "sorting metadata must match the actual file sort order"
-        );
+        ensure!(sorting.is_empty() || sorting == verified_sort, "sorting metadata must match the actual file sort order");
         if !sorting.is_empty() {
-            let columns = sorting
-                .iter()
-                .map(|sort| {
-                    let index = leaves
-                        .iter()
-                        .position(|leaf| leaf.path().string() == sort.path)
-                        .with_context(|| format!("unknown sorting column {}", sort.path))?;
-                    Ok(SortingColumn {
-                        column_idx: i32::try_from(index)?,
-                        descending: sort.descending,
-                        nulls_first: sort.nulls_first,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let columns = sorting.iter().map(|sort| {
+                let index = leaf_index(&sort.path)?;
+                Ok(SortingColumn { column_idx: i32::try_from(index)?, descending: sort.descending, nulls_first: sort.nulls_first })
+            }).collect::<Result<Vec<_>>>()?;
             builder = builder.set_sorting_columns(Some(columns));
+        } else {
+            builder = builder.set_sorting_columns(None);
         }
         Ok(builder.build())
     }
@@ -405,36 +341,40 @@ pub fn process_config() -> Result<&'static ParquetWriterConfig> {
             };
             config.validate()?;
             Ok(config)
-        })()
-        .map_err(|error| format!("{error:#}"))
+        })().map_err(|error| format!("{error:#}"))
     }) {
         Ok(config) => Ok(config),
         Err(error) => anyhow::bail!("{error}"),
     }
 }
 
-pub(crate) fn sorting_from_properties(
-    schema: &SchemaRef,
-    properties: Option<&WriterProperties>,
-) -> Result<Vec<SortColumn>> {
+/// Return sanitized startup policy for experiment provenance; null fields inherit
+/// the documented layout/Parquet defaults and are resolved per physical schema.
+///
+/// # Errors
+/// Returns invalid startup configuration or JSON serialization errors.
+pub fn effective_startup_config_json() -> Result<String> {
+    let value = serde_json::json!({"parquet_writer": process_config()?});
+    #[cfg(feature = "delta")]
+    let value = {
+        let mut value = value;
+        value["runtime"] = serde_json::to_value(crate::delta_io::runtime_config()?)?;
+        value
+    };
+    Ok(serde_json::to_string(&value)?)
+}
+
+pub(crate) fn sorting_from_properties(schema: &SchemaRef, properties: Option<&WriterProperties>) -> Result<Vec<SortColumn>> {
     let descriptor = ArrowSchemaConverter::new().convert(schema)?;
-    properties
-        .and_then(WriterProperties::sorting_columns)
-        .map_or(&[][..], Vec::as_slice)
-        .iter()
-        .map(|column| {
-            let index = usize::try_from(column.column_idx)?;
-            let leaf = descriptor
-                .columns()
-                .get(index)
-                .context("sorting column index outside schema")?;
-            Ok(SortColumn {
-                path: leaf.path().string(),
-                descending: column.descending,
-                nulls_first: column.nulls_first,
-            })
+    properties.and_then(WriterProperties::sorting_columns).map_or(&[][..], Vec::as_slice).iter().map(|column| {
+        let index = usize::try_from(column.column_idx)?;
+        let leaf = descriptor.columns().get(index).context("sorting column index outside schema")?;
+        Ok(SortColumn {
+            path: leaf.path().string(),
+            descending: column.descending,
+            nulls_first: column.nulls_first,
         })
-        .collect()
+    }).collect()
 }
 
 #[cfg(test)]
@@ -454,6 +394,36 @@ mod tests {
     }
 
     #[test]
+    fn literal_dotted_paths_apply_and_ambiguous_selectors_fail() -> Result<()> {
+        let literal = Arc::new(Schema::new(vec![Field::new("a.b", DataType::Int32, false)]));
+        let config: ParquetWriterConfig = serde_json::from_str(
+            r#"{"columns":{"a.b":{"compression":"snappy"}}}"#,
+        )?;
+        let properties = config.writer_properties(&literal, None, &[])?;
+        assert_eq!(
+            properties.compression(&ColumnPath::from(vec!["a.b".to_owned()])),
+            Compression::SNAPPY
+        );
+        let ambiguous = Arc::new(Schema::new(vec![
+            Field::new("a.b", DataType::Int32, false),
+            Field::new("a", DataType::Struct(vec![Field::new("b", DataType::Int32, false)].into()), false),
+        ]));
+        assert!(config.writer_properties(&ambiguous, None, &[]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_empty_sorting_metadata_clears_the_base() -> Result<()> {
+        let base = WriterProperties::builder().set_sorting_columns(Some(vec![SortingColumn {
+            column_idx: 0, descending: false, nulls_first: false,
+        }])).build();
+        let config = ParquetWriterConfig { sorting_columns: Some(vec![]), ..Default::default() };
+        let verified = vec![SortColumn { path: "id".into(), descending: false, nulls_first: false }];
+        assert!(config.writer_properties(&schema(), Some(base), &verified)?.sorting_columns().is_none());
+        Ok(())
+    }
+
+    #[test]
     fn rejects_invalid_levels_unknown_fields_and_type_mismatches() -> Result<()> {
         for json in [
             r#"{"defaults":{"compression":"gzip","compression_level":10}}"#,
@@ -462,15 +432,11 @@ mod tests {
             r#"{"defaults":{"bloom_filter_fpp":1.0}}"#,
             r#"{"max_row_group_rows":0}"#,
         ] {
-            assert!(
-                serde_json::from_str::<ParquetWriterConfig>(json)?.validate().is_err(),
-                "{json}"
-            );
+            assert!(serde_json::from_str::<ParquetWriterConfig>(json)?.validate().is_err(), "{json}");
         }
         assert!(serde_json::from_str::<ParquetWriterConfig>(r#"{"unknown":1}"#).is_err());
         assert!(serde_json::from_str::<ParquetWriterConfig>(r#"{"defaults":{"encoding":"rle_dictionary"}}"#).is_err());
-        let config: ParquetWriterConfig =
-            serde_json::from_str(r#"{"columns":{"value":{"encoding":"delta_binary_packed"}}}"#)?;
+        let config: ParquetWriterConfig = serde_json::from_str(r#"{"columns":{"value":{"encoding":"delta_binary_packed"}}}"#)?;
         assert!(config.writer_properties(&schema(), None, &[]).is_err());
         let config: ParquetWriterConfig = serde_json::from_str(r#"{"sorting_columns":[{"path":"id"}]}"#)?;
         assert!(config.writer_properties(&schema(), None, &[]).is_err());
@@ -480,13 +446,10 @@ mod tests {
     #[test]
     fn all_codecs_round_trip_rows_and_schema_with_column_overrides() -> Result<()> {
         let schema = schema();
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
-                Arc::new(StringArray::from(vec!["repeat"; 4])),
-            ],
-        )?;
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+            Arc::new(StringArray::from(vec!["repeat"; 4])),
+        ])?;
         for codec in ["uncompressed", "snappy", "gzip", "brotli", "zstd", "lz4_raw", "lz4"] {
             let config: ParquetWriterConfig = serde_json::from_value(serde_json::json!({
                 "defaults": {"compression": codec},
@@ -496,8 +459,7 @@ mod tests {
             let properties = config.writer_properties(&schema, None, &[])?;
             let directory = tempfile::tempdir()?;
             let path = directory.path().join("codec.parquet");
-            let mut writer =
-                ArrowWriter::try_new(std::fs::File::create(&path)?, Arc::clone(&schema), Some(properties))?;
+            let mut writer = ArrowWriter::try_new(std::fs::File::create(&path)?, Arc::clone(&schema), Some(properties))?;
             writer.write(&batch)?;
             writer.close()?;
             let reader = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&path)?)?.build()?;

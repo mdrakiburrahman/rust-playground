@@ -1,0 +1,66 @@
+# Collector performance controls
+
+| Interface | Effect | Timing |
+| --- | --- | --- |
+| `ARROWCOL_PARQUET_CONFIG` | Strict `arrow_deltalake::writer::ParquetWriterConfig` JSON: global/per-physical-column codecs, levels, encoding, dictionary, statistics/page indexes, offset index, Bloom filters, pages, row groups, sorting metadata | Startup |
+| `ARROWCOL_COLLECTOR_BATCHING_CONFIG` | Deep JSON override of exporter `batching`: byte/row/batch capacities and flush limits, age, flush concurrency, adaptive sizing, `coalesce_publications` | Startup |
+| `ARROWCOL_COLLECTOR_COMMIT_CONFIG` | Deep JSON override of exporter `commit`: `batch_window`, `max_files_per_commit`, `max_pending_files` | Startup |
+| `ARROWCOL_COLLECTOR_LIMITS_CONFIG` | Deep JSON override of receiver `limits`: Flight sizes, channels and deadlines | Startup |
+| `ARROWCOL_COLLECTOR_PRESSURE_CONFIG` | `max_concurrent_streams`, RSS/buffered byte/row/batch limits, `pressure_interval` only | Startup |
+| `ARROWCOL_COLLECTOR_RUNTIME_WORKERS`, `BLOCKING_WORKERS`, `UPLOAD_LIMIT`, `TASK_LIMIT`, `READ_AHEAD`, `BATCH_ROWS`, `CPU_WORKERS` | Independently bounded Delta async, blocking, upload, Kernel task, scan and dedicated CPU resources; each suffix uses the full `ARROWCOL_COLLECTOR_` prefix | Startup |
+| Cargo feature `allocator-mimalloc` | Opt-in mimalloc allocator for the collector binary; system allocator remains default | Rebuild |
+| `RUSTFLAGS="-C target-cpu=native"` | Host-specific compiler ISA optimization; not a Cargo feature or per-cell runtime setting | Rebuild |
+
+JSON collector overrides preserve unspecified pipeline YAML values. Unknown
+keys, malformed numbers, zero capacities, invalid timeouts and inconsistent
+budgets fail validation. Durations use humantime strings; sizes use bytes.
+Runtime scalar inputs are unsigned decimal integers, never silently clamped.
+Effective startup policy is printed as `arrowcol_effective_config <JSON>`.
+
+Example (workload-dependent, not a universal performance recommendation):
+
+```bash
+ARROWCOL_PARQUET_CONFIG='{"defaults":{"compression":"zstd","compression_level":1},"max_row_group_rows":65536}' \
+ARROWCOL_COLLECTOR_BATCHING_CONFIG='{"max_age":"2s","max_concurrent_flushes":4}' \
+cargo run --locked --package arrowcol-dataflow-rust -- --config projects/arrowcol-dataflow-rust/config.quiver.yaml
+```
+
+Parquet compression accepts uncompressed, snappy, gzip (0..9), brotli (0..11),
+zstd (1..22), lz4_raw and legacy lz4. Levels are forbidden on codecs without a
+level. `defaults` and `columns` accept the same `ColumnOptions`; column selectors
+must uniquely resolve to an actual physical Parquet leaf, after normalization
+and partition projection. Dictionary encoding is controlled separately from
+fallback encoding. FPP must be finite and strictly between zero and one.
+Sorting metadata must match a verified physical sort; it cannot assert ordering
+for an unsorted file. Explicit `sorting_columns: []` clears inherited metadata.
+Row-group byte and page limits are estimates, not process-memory ceilings.
+
+Cross-publication coalescing is disabled by default. When enabled, replay IDs
+and all output files form one indivisible Delta commit unit. Already committed
+IDs are filtered before encoding; a mixed-ID race rejects and rebuilds on retry.
+Groups exceeding commit/pending-file caps reject before queueing. Schema,
+partition, retention, fencing, no-overwrite and durability boundaries remain.
+Increasing a flush target alone does not coalesce publications.
+
+`arrowcol_data_commit <JSON>` records new durable AddFiles, their rows/bytes,
+version, table identity, min/max admission stamps and individual commit elapsed
+time. It is not client acknowledgement throughput. Reconciled uncertain commit
+attribution reports null counters and a fixed reason. Exclude warmup/preflight,
+mixed boundary groups, duplicates and uncertainty before deriving per-cell
+durable throughput; global process counters alone do not establish it.
+
+Multipart sizing is deliberately unsupported: pinned object_store 0.13.2 does
+not expose conditional multipart completion, while this writer requires
+`PutMode::Create`. Unconditional multipart completion would weaken no-overwrite.
+
+Build allocator/ISA variants separately and record their image/source identity:
+
+```bash
+cargo build --locked --release --package arrowcol-dataflow-rust --features allocator-mimalloc
+RUSTFLAGS="-C target-cpu=native" cargo build --locked --release --package arrowcol-dataflow-rust
+```
+
+Native-CPU binaries must run only on compatible CPUs. Jemalloc was considered;
+this build offers one opt-in alternative allocator rather than introducing two
+native allocator dependencies without comparative workload evidence. No
+allocator, compression or concurrency setting is claimed universally faster.

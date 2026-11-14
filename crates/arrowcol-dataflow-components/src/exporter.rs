@@ -932,7 +932,8 @@ fn map_receipt_error(error: CommitReceiptError) -> ExportFailure {
 }
 
 fn validate_exporter_config(value: &serde_json::Value) -> Result<(), otel_arrow_dfe_config::error::Error> {
-    let config: DeltaExporterConfig = parse_config(value)?;
+    let mut config: DeltaExporterConfig = parse_config(value)?;
+    config.apply_environment().map_err(config_error)?;
     config.validate().map_err(config_error)
 }
 
@@ -944,10 +945,20 @@ fn create_exporter(
     _capabilities: &otel_arrow_dfe_engine::capability::registry::Capabilities,
 ) -> Result<ExporterWrapper<OtapPdata>, otel_arrow_dfe_config::error::Error> {
     let mut config: DeltaExporterConfig = parse_config(&node_config.config)?;
+    config.apply_environment().map_err(config_error)?;
     if let Some(root) = std::env::var_os("ARROWCOL_DELTA_ROOT") {
         config.base_path = PathBuf::from(root);
     }
     config.validate().map_err(config_error)?;
+    eprintln!("arrowcol_effective_config {}", serde_json::json!({
+        "component": "exporter",
+        "config": {"batching": config.batching, "commit": config.commit}
+    }));
+    tracing::info!(
+        component = "exporter",
+        effective_config = %serde_json::json!({"batching": config.batching, "commit": config.commit}),
+        "arrowcol_effective_config"
+    );
     let exporter = GenericDeltaExporter::shared(config, global_metrics()).map_err(config_error)?;
     Ok(ExporterWrapper::local(exporter, node, node_config, exporter_config))
 }
