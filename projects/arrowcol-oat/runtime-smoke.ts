@@ -107,6 +107,7 @@ async function main(): Promise<void> {
   for (const replicas of [1, 2]) {
     for (const cores of [1, 2]) {
       const collectors: string[] = [];
+      const collectorIds: string[] = [];
       for (let i = 0; i < replicas; i++) {
         const name = `${prefix}-r${replicas}-c${cores}-${i}`;
         collectors.push(name);
@@ -119,6 +120,9 @@ async function main(): Promise<void> {
           '--entrypoint', '/bin/sh'], images.dataflow,
         ['-ec', `export ARROWCOL_ADVERTISED_FLIGHT_ENDPOINT="$(hostname -i):32010"; exec /usr/bin/tini -- /usr/local/bin/arrowcol-dataflow-rust --config /run/oat/dataflow.yaml --num-cores ${cores}`]);
         await waitReady(name, http(32011, '/readyz'));
+        const capabilities = JSON.parse(docker(['exec', name, ...http(32011, '/v1/capabilities')])) as { instance_id: unknown };
+        if (typeof capabilities.instance_id !== 'string') throw new Error(name + ' did not expose a collector instance ID');
+        collectorIds.push(capabilities.instance_id);
         const listeners = docker(['exec', name, 'sh', '-c', 'cat /proc/net/tcp /proc/net/tcp6']);
         // 32010=7D0A, 32011=7D0B. Every worker must bind both SO_REUSEPORT listeners.
         for (const port of ['7D0A', '7D0B']) {
@@ -150,7 +154,7 @@ async function main(): Promise<void> {
         assert.equal(lines.length, 1, `${table} must have exactly one active SQL lease`);
         return /collector="([^"]+)"/.exec(lines[0])?.[1];
       });
-      assert.ok(owners.every((owner) => collectors.includes(owner ?? '')), 'every table must have one active owner');
+      assert.ok(owners.every((owner) => collectorIds.includes(owner ?? '')), 'every table must have one active owner');
       for (const name of collectors) stop(name);
       // Check physical output, not merely admission acknowledgements.
       const files = docker(['exec', catalog, 'sh', '-c', 'find /onelake/dataflow -name "*.parquet" -type f']);
