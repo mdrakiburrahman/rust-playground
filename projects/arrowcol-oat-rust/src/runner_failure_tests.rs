@@ -168,6 +168,7 @@ mod failure_evidence_tests {
                     },
                     qap_tables: Vec::new(),
                     failure: None,
+                    evidence: CellEvidence::default(),
                 },
                 started_at_ms: 1_794_173_400_000,
                 qap: QapMetrics::default(),
@@ -271,6 +272,7 @@ mod failure_evidence_tests {
                     pinning,
                     qap_tables: Vec::new(),
                     failure: None,
+                    evidence: CellEvidence::default(),
                 },
                 started_at_ms: 0,
                 qap: QapMetrics::default(),
@@ -454,7 +456,9 @@ mod failure_evidence_tests {
     fn exact_legacy_v2_schema_upgrades_without_reinterpreting_old_zero_values() -> Result<()> {
         let config = config()?;
         let measured = parquet_batch(&completed(&config, "old-zero", 1, 0)?)?;
-        let legacy = RecordBatch::try_new(legacy_result_schema(), measured.columns().to_vec())?;
+        let mut columns = measured.columns()[..31].to_vec();
+        columns[0] = Arc::new(Int32Array::from(vec![2]));
+        let legacy = RecordBatch::try_new(legacy_result_schema(), columns)?;
         let failure = finish_matrix_cell(
             &config,
             "orchestration",

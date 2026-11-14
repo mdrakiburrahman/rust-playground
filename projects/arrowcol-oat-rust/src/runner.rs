@@ -34,6 +34,7 @@ use url::Url;
 
 #[cfg(test)]
 include!("runner_failure_tests.rs");
+include!("runner_evidence.rs");
 
 #[derive(Clone, Debug)]
 struct OatResult {
@@ -54,6 +55,7 @@ struct OatResult {
     status: String,
     git_sha: String,
     tunables_json: String,
+    evidence_json: Option<String>,
     replicas: u64,
     dfe_worker_concurrency: u64,
     table: String,
@@ -76,7 +78,7 @@ struct QapMetrics {
     lag_seconds: Option<f64>,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 struct ResourceMetrics {
     cpu_millicores: f64,
     memory_bytes: u64,
@@ -436,7 +438,10 @@ impl Platform for LocalPlatform {
         self.daemon_endpoint = Some(local_docker_daemon().await?);
         prepare_local_platform(config, self).await?;
         self.router_metrics_url = Some(local_compose_endpoint(config, self, "router", "50050", "/metrics").await?);
-        self.qap_url = Some(local_compose_endpoint(config, self, "kusto", "8080", "").await?);
+        match local_compose_endpoint(config, self, "kusto", "8080", "").await {
+            Ok(endpoint) => self.qap_url = Some(endpoint),
+            Err(_) => tracing::warn!("local downstream unavailable; collector-only measurement remains enabled"),
+        }
         Ok(())
     }
 
@@ -487,7 +492,9 @@ impl Platform for LocalPlatform {
             .with_context(|| format!("create local QAP result directory {}", results.display()))?;
         let database = self.qap_database(config)?;
         arrowcol_loadgen::initialize_local_qap(
-            &self.qap_endpoint(config),
+            self.qap_url
+                .as_deref()
+                .context("local downstream endpoint is unavailable")?,
             &results,
             &database,
             &local_bindings,
@@ -1705,6 +1712,7 @@ fn finish_matrix_cell(
                             pinning: PinningReport::default(),
                             qap_tables: Vec::new(),
                             failure: Some(format!("{error:#}")),
+                            evidence: CellEvidence::default(),
                         },
                         started_at_ms,
                         qap: QapMetrics::default(),
@@ -1976,10 +1984,13 @@ async fn run_matrix_cell(
         && client_run.pinning.verification_error.is_none()
         && client_run.failure.is_none();
     let mut qap = QapMetrics::default();
-    let mut metrics = None;
+    let metrics = client_run.evidence.resource_summary();
     if pinning_ok {
-        local_progress(config, "clients finished; observing Kusto QAP and sampling resources");
+        local_progress(config, "clients finished; observing Kusto QAP");
         let observation = async {
+            if client_run.qap_tables.is_empty() {
+                bail!("downstream initialization did not complete");
+            }
             qap = observe_qap(
                 &platform.qap_endpoint(config),
                 &platform.qap_observation_mode(),
@@ -1989,12 +2000,17 @@ async fn run_matrix_cell(
                 config.qap_timeout_seconds,
             )
             .await?;
-            metrics = Some(platform.sample_resources(config).await?);
             Ok::<_, anyhow::Error>(())
         }
         .await;
         if let Err(error) = observation {
-            client_run.failure = Some(format!("observe completed matrix cell: {error:#}"));
+            if local_downstream_optional(platform.kind()) {
+                client_run
+                    .evidence
+                    .downstream_unavailable("local_qap_observation_unavailable");
+            } else {
+                client_run.failure = Some(format!("observe completed matrix cell: {error:#}"));
+            }
         }
     }
     result_rows(
@@ -2126,6 +2142,7 @@ fn result_rows(
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| "unknown".to_owned()),
             tunables_json: serde_json::to_string(&table_tunables)?,
+            evidence_json: Some(serde_json::to_string(&client_run.evidence.for_table(client))?),
             replicas: u64::from(replicas),
             dfe_worker_concurrency: u64::from(concurrency),
             table,
@@ -2174,6 +2191,7 @@ struct ClientRun {
     pinning: PinningReport,
     qap_tables: Vec<String>,
     failure: Option<String>,
+    evidence: CellEvidence,
 }
 
 #[derive(Default)]
@@ -2205,6 +2223,7 @@ async fn run_clients(
                 pinning,
                 qap_tables: Vec::new(),
                 failure: Some(format!("{error:#}")),
+                evidence: CellEvidence::default(),
             })
         }
     }
@@ -2387,8 +2406,13 @@ async fn run_clients_inner(
             "run-scoped QAP preparation exceeded qap_timeout_seconds; operation outcome may be indeterminate and is not retried"
         )),
     };
+    let mut evidence = CellEvidence::default();
     let qap_tables = match qap_result {
         Ok(qap_tables) => qap_tables,
+        Err(_) if local_downstream_optional(platform.kind()) => {
+            evidence.downstream_unavailable("local_qap_initialization_unavailable");
+            Vec::new()
+        }
         Err(error) => {
             platform.mark_qap_outcome_unresolved();
             let cleanup = cancel_clients(platform, config, &handles).await;
@@ -2483,6 +2507,9 @@ async fn run_clients_inner(
     let mut completed_clients = HashSet::new();
     let mut active_clients = vec![true; handles.len()];
     while completed_clients.len() < handles.len() {
+        evidence
+            .sample_resources(platform, config, measurement_start_unix_ms, measurement_end_unix_ms)
+            .await;
         let pending_indices = handles
             .iter()
             .enumerate()
@@ -2659,6 +2686,7 @@ async fn run_clients_inner(
         pinning: std::mem::take(pinning),
         failure: None,
         qap_tables,
+        evidence,
     })
 }
 
@@ -3858,13 +3886,26 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
         "600",
         "arrowcol-catalog",
         "dataflow-1",
-        "kusto",
         "lgtm",
         "router",
     ]);
     run_streaming_command(up, "start remaining local OAT stack")
         .await
         .context("local compose stack is a per-run project; results are not touched by stack cleanup")?;
+    let mut downstream = compose_command(
+        compose_file,
+        config.platform.compose_override_file.as_deref(),
+        &project,
+        "benchmark",
+    );
+    platform.add_compose_environment(&mut downstream);
+    downstream.args(["up", "--detach", "--no-deps", "--wait", "--wait-timeout", "60", "kusto"]);
+    if run_streaming_command(downstream, "start optional local Kustainer")
+        .await
+        .is_err()
+    {
+        tracing::warn!("local Kustainer did not become ready; collector-only measurements remain enabled");
+    }
     Ok(())
 }
 
@@ -6294,8 +6335,11 @@ fn merge_parquet_bytes(existing_bytes: &[u8], incoming: &RecordBatch) -> Result<
         .context("read existing benchmark Parquet object")?;
     let schema = result_schema();
     let existing_schema = existing_reader.schema();
+    let existing_v3 = existing_schema.as_ref() == schema.as_ref();
     if incoming.schema().as_ref() != schema.as_ref()
-        || (existing_schema.as_ref() != schema.as_ref() && existing_schema.as_ref() != legacy_result_schema().as_ref())
+        || (existing_schema.as_ref() != schema.as_ref()
+            && existing_schema.as_ref() != v2_result_schema().as_ref()
+            && existing_schema.as_ref() != legacy_result_schema().as_ref())
     {
         bail!("existing benchmark Parquet schema changed");
     }
@@ -6307,10 +6351,17 @@ fn merge_parquet_bytes(existing_bytes: &[u8], incoming: &RecordBatch) -> Result<
                 .column_by_name("schema_version")
                 .and_then(|column| column.as_any().downcast_ref::<Int32Array>())
                 .context("result Parquet has no int32 schema_version")?;
-            if versions.iter().any(|version| version != Some(2)) {
+            if versions
+                .iter()
+                .any(|version| version != Some(2) && !(existing_v3 && version == Some(3)))
+            {
                 bail!("existing benchmark Parquet contains an unsupported schema_version");
             }
-            Ok(RecordBatch::try_new(Arc::clone(&schema), batch.columns().to_vec())?)
+            let mut columns = batch.columns().to_vec();
+            if columns.len() < schema.fields().len() {
+                columns.push(Arc::new(StringArray::from(vec![None::<&str>; batch.num_rows()])));
+            }
+            Ok(RecordBatch::try_new(Arc::clone(&schema), columns)?)
         })
         .collect::<Result<Vec<_>>>()?;
     batches.push(incoming.clone());
@@ -6352,7 +6403,7 @@ fn deduplicate_results(batch: &RecordBatch) -> Result<RecordBatch> {
 fn parquet_batch(results: &[OatResult]) -> Result<RecordBatch> {
     let schema = result_schema();
     let columns: Vec<ArrayRef> = vec![
-        Arc::new(Int32Array::from_iter_values(results.iter().map(|_| 2))),
+        Arc::new(Int32Array::from_iter_values(results.iter().map(|_| 3))),
         Arc::new(StringArray::from_iter_values(
             results.iter().map(|row| row.mode.as_str()),
         )),
@@ -6436,6 +6487,12 @@ fn parquet_batch(results: &[OatResult]) -> Result<RecordBatch> {
         Arc::new(Float64Array::from(
             results.iter().map(|row| row.qap.lag_seconds).collect::<Vec<_>>(),
         )),
+        Arc::new(StringArray::from(
+            results
+                .iter()
+                .map(|row| row.evidence_json.as_deref())
+                .collect::<Vec<_>>(),
+        )),
     ];
     Ok(RecordBatch::try_new(Arc::clone(&schema), columns)?)
 }
@@ -6477,12 +6534,17 @@ fn result_schema() -> Arc<Schema> {
         Field::new("qap_cached_bytes", DataType::UInt64, true),
         Field::new("qap_unhealthy_catalogs", DataType::UInt64, true),
         Field::new("qap_lag_seconds", DataType::Float64, true),
+        Field::new("evidence_json", DataType::Utf8, true),
     ]))
+}
+
+fn v2_result_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(result_schema().fields()[..31].to_vec()))
 }
 
 fn legacy_result_schema() -> Arc<Schema> {
     Arc::new(Schema::new(
-        result_schema()
+        v2_result_schema()
             .fields()
             .iter()
             .map(|field| {
@@ -7485,7 +7547,7 @@ mod tests {
     }
 
     #[test]
-    fn parquet_schema_v2_matches_the_full_frozen_column_contract() -> Result<()> {
+    fn parquet_schema_v3_preserves_v2_and_appends_nullable_evidence() -> Result<()> {
         let expected = vec![
             ("schema_version", DataType::Int32, false),
             ("mode", DataType::Utf8, false),
@@ -7522,6 +7584,7 @@ mod tests {
             ("qap_cached_bytes", DataType::UInt64, true),
             ("qap_unhealthy_catalogs", DataType::UInt64, true),
             ("qap_lag_seconds", DataType::Float64, true),
+            ("evidence_json", DataType::Utf8, true),
         ];
         let schema = result_schema();
         let actual = schema
@@ -8054,6 +8117,7 @@ mod tests {
             status: "succeeded".to_owned(),
             git_sha: "test".to_owned(),
             tunables_json: "{}".to_owned(),
+            evidence_json: None,
             replicas: 1,
             dfe_worker_concurrency: 2,
             table: table.to_owned(),

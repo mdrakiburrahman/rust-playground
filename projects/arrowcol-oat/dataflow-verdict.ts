@@ -72,7 +72,7 @@ export function evaluateDataFlow(
   const cellIds = new Map<string, string>();
   for (const row of rows) {
     const label = String(row.table);
-    if (row.schema_version !== 2) reasons.push(`${label}: unsupported result schema`);
+    if (row.schema_version !== 2 && row.schema_version !== 3) reasons.push(`${label}: unsupported result schema`);
     if (row.mode !== mode) reasons.push(`${label}: result mode mismatch`);
     if (mode === 'aks' && row.stamp !== config.stamp) reasons.push(`${label}: result stamp mismatch`);
     if (typeof row.run_id !== 'string' || !UUID.test(row.run_id)) reasons.push(`${label}: invalid cell run_id`);
