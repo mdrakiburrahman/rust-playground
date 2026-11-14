@@ -649,6 +649,14 @@ impl DeltaTable {
     /// # Errors
     /// Rejects absent local tables and storage/session authority failures.
     pub fn open_for_maintenance_probe(url: &Url) -> Result<Arc<Self>> {
+        Self::open_for_maintenance_probe_with_limit(url, 100_000)
+    }
+
+    /// Open a read-only probe with an explicit log listing bound.
+    ///
+    /// # Errors
+    /// Rejects absent tables, authority failures and bounded listing failures.
+    pub fn open_for_maintenance_probe_with_limit(url: &Url, max_log_files: usize) -> Result<Arc<Self>> {
         if url.scheme() == "file" {
             let root = url.to_file_path().map_err(|()| anyhow::anyhow!("invalid table URL"))?;
             if !root.join("_delta_log").is_dir() {
@@ -656,7 +664,7 @@ impl DeltaTable {
             }
         }
         let table = Self::open_connection(url.clone(), Vec::new(), None, None)?;
-        table.probe_log_version(100_000)?;
+        table.probe_log_version(max_log_files)?;
         Ok(table)
     }
 
@@ -686,7 +694,19 @@ impl DeltaTable {
     /// # Errors
     /// Rejects corrupt JSON, incomplete logs and concurrent metadata advancement.
     pub fn maintenance_properties(&self) -> Result<BTreeMap<String, String>> {
-        let names = self.list_log(100_000)?;
+        self.maintenance_properties_with_limits(100_000, 64 * 1024 * 1024)
+    }
+
+    /// Read table properties with explicit log listing and commit byte bounds.
+    ///
+    /// # Errors
+    /// Rejects corrupt JSON, incomplete logs and concurrent metadata advancement.
+    pub fn maintenance_properties_with_limits(
+        &self,
+        max_log_files: usize,
+        max_log_file_bytes: u64,
+    ) -> Result<BTreeMap<String, String>> {
+        let names = self.list_log(max_log_files)?;
         let version = probe_version(&names)?;
         let token = log_token(&names)?;
         for (name, _) in names.iter().rev() {
@@ -694,7 +714,7 @@ impl DeltaTable {
                 continue;
             }
             let number = name[..20].parse::<u64>()?;
-            let bytes = self.read_commit(number, 64 * 1024 * 1024)?;
+            let bytes = self.read_commit(number, max_log_file_bytes)?;
             let mut configuration = None;
             for line in bytes.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()) {
                 let action: serde_json::Value = serde_json::from_slice(line)?;
@@ -708,7 +728,7 @@ impl DeltaTable {
                 }
             }
             if let Some(configuration) = configuration {
-                self.require_probe_token(&token, 100_000)?;
+                self.require_probe_token(&token, max_log_files)?;
                 return Ok(configuration);
             }
         }
@@ -720,7 +740,7 @@ impl DeltaTable {
             ));
         }
         let configuration = TableFingerprint::of(&snapshot).configuration;
-        self.require_probe_token(&token, 100_000)?;
+        self.require_probe_token(&token, max_log_files)?;
         Ok(configuration)
     }
 

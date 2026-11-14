@@ -72,6 +72,8 @@ pub struct OperationLimits {
     pub replay_max_log_file_bytes: u64,
     pub replay_max_checkpoint_bytes: u64,
     pub operation_max_active_files: usize,
+    pub discovery_max_log_files: usize,
+    pub discovery_max_log_file_bytes: u64,
 }
 
 impl Default for OperationLimits {
@@ -85,6 +87,8 @@ impl Default for OperationLimits {
             replay_max_log_file_bytes: 64 * 1024 * 1024,
             replay_max_checkpoint_bytes: 256 * 1024 * 1024,
             operation_max_active_files: 1_000_000,
+            discovery_max_log_files: 100_000,
+            discovery_max_log_file_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -170,6 +174,8 @@ impl Settings {
             || limits.replay_max_log_file_bytes == 0
             || limits.replay_max_checkpoint_bytes == 0
             || limits.operation_max_active_files == 0
+            || limits.discovery_max_log_files == 0
+            || limits.discovery_max_log_file_bytes == 0
         {
             bail!("operation limits must be positive; plan byte limits must be at least 1024");
         }
@@ -255,6 +261,8 @@ pub struct FilesystemDiscovery {
     root: Url,
     allowlist: Vec<String>,
     cache: Mutex<PropertyCache>,
+    max_log_files: usize,
+    max_log_file_bytes: u64,
 }
 
 impl FilesystemDiscovery {
@@ -264,7 +272,16 @@ impl FilesystemDiscovery {
             root,
             allowlist,
             cache: Mutex::new(BTreeMap::new()),
+            max_log_files: 100_000,
+            max_log_file_bytes: 64 * 1024 * 1024,
         }
+    }
+
+    #[must_use]
+    pub fn with_log_limits(mut self, max_log_files: usize, max_log_file_bytes: u64) -> Self {
+        self.max_log_files = max_log_files;
+        self.max_log_file_bytes = max_log_file_bytes;
+        self
     }
 
     fn url(&self, name: &str) -> Result<Url> {
@@ -306,8 +323,8 @@ impl TableDiscovery for FilesystemDiscovery {
 
     fn table(&self, name: &str) -> Result<DiscoveredTable> {
         let url = self.url(name)?;
-        let probe = DeltaTable::open_for_maintenance_probe(&url)?;
-        let token = probe.probe_log_token(100_000)?;
+        let probe = DeltaTable::open_for_maintenance_probe_with_limit(&url, self.max_log_files)?;
+        let token = probe.probe_log_token(self.max_log_files)?;
         let mut cache = self
             .cache
             .lock()
@@ -315,8 +332,9 @@ impl TableDiscovery for FilesystemDiscovery {
         let properties = match cache.get(name) {
             Some((cached_token, properties)) if *cached_token == token => properties.clone(),
             _ => {
-                let properties = probe.maintenance_properties()?;
-                ensure_property_token_unchanged(&token, &probe.probe_log_token(100_000)?)?;
+                let properties =
+                    probe.maintenance_properties_with_limits(self.max_log_files, self.max_log_file_bytes)?;
+                ensure_property_token_unchanged(&token, &probe.probe_log_token(self.max_log_files)?)?;
                 if cache.len() >= MAX_TABLES && !cache.contains_key(name) {
                     cache.clear();
                 }
@@ -1125,10 +1143,18 @@ fn maintain_table(
             }
             schedule.insert(name.into(), (now, policy));
         }
-        let probe = DeltaTable::open_for_maintenance_probe(&discovered.url)?;
-        let token = probe.probe_log_token(100_000)?;
+        let limits = &settings.operation_limits;
+        let probe = DeltaTable::open_for_maintenance_probe_with_limit(&discovered.url, limits.discovery_max_log_files)?;
+        let token = probe.probe_log_token(limits.discovery_max_log_files)?;
         if discovered.log_token.as_ref().is_none_or(|previous| *previous != token)
-            && !policy_matches(settings, &probe.maintenance_properties()?, &props)?
+            && !policy_matches(
+                settings,
+                &probe.maintenance_properties_with_limits(
+                    limits.discovery_max_log_files,
+                    limits.discovery_max_log_file_bytes,
+                )?,
+                &props,
+            )?
         {
             bail!("table properties changed after discovery; retry");
         }
@@ -1170,9 +1196,16 @@ fn maintain_table(
             Ok(Some((discovered, effective, props, probe, _))) => (|| {
                 let control = MaintenanceControl::new(Arc::clone(cancel), Some(started + effective.operation_timeout))
                     .with_commit_retry_limits(effective.commit_attempts, effective.commit_budget)?;
-                let token = probe.probe_log_token(100_000)?;
+                let token = probe.probe_log_token(settings.operation_limits.discovery_max_log_files)?;
                 if observed_token.as_ref().is_some_and(|previous| *previous != token)
-                    && !policy_matches(settings, &probe.maintenance_properties()?, props)?
+                    && !policy_matches(
+                        settings,
+                        &probe.maintenance_properties_with_limits(
+                            settings.operation_limits.discovery_max_log_files,
+                            settings.operation_limits.discovery_max_log_file_bytes,
+                        )?,
+                        props,
+                    )?
                 {
                     bail!("table properties changed during the maintenance pass; retry discovery");
                 }
@@ -1276,7 +1309,10 @@ fn maintain_table(
 /// Run one maintenance cycle over every allowlisted table with bounded concurrency.
 #[must_use]
 pub fn run_cycle(settings: &Settings, metrics: &Metrics, cancel: &Arc<AtomicBool>) -> Vec<OperationResult> {
-    let source = FilesystemDiscovery::new(settings.root.clone(), settings.tables.clone());
+    let source = FilesystemDiscovery::new(settings.root.clone(), settings.tables.clone()).with_log_limits(
+        settings.operation_limits.discovery_max_log_files,
+        settings.operation_limits.discovery_max_log_file_bytes,
+    );
     match cycle_with_discovery(settings, &source, metrics, cancel, None) {
         Ok(results) => results,
         Err(error) => {
@@ -1368,7 +1404,10 @@ fn cycle_with_discovery(
 /// Returns `false` if any operation failed.
 #[must_use]
 pub fn run(settings: &Settings, metrics: &Metrics, cancel: &Arc<AtomicBool>) -> bool {
-    let source = FilesystemDiscovery::new(settings.root.clone(), settings.tables.clone());
+    let source = FilesystemDiscovery::new(settings.root.clone(), settings.tables.clone()).with_log_limits(
+        settings.operation_limits.discovery_max_log_files,
+        settings.operation_limits.discovery_max_log_file_bytes,
+    );
     run_with_discovery(settings, &source, metrics, cancel)
 }
 

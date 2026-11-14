@@ -177,6 +177,10 @@ struct Cli {
     replay_max_checkpoint_bytes: u64,
     #[arg(long, env = "ARROWCOL_MAINT_OPERATION_MAX_ACTIVE_FILES", default_value_t = 1_000_000)]
     operation_max_active_files: usize,
+    #[arg(long, env = "ARROWCOL_MAINT_DISCOVERY_MAX_LOG_FILES", default_value_t = 100_000)]
+    discovery_max_log_files: usize,
+    #[arg(long, env = "ARROWCOL_MAINT_DISCOVERY_MAX_LOG_FILE_BYTES", default_value_t = 64 * 1024 * 1024)]
+    discovery_max_log_file_bytes: u64,
     /// Prometheus listen address.
     #[arg(long, env = "ARROWCOL_MAINT_LISTEN", default_value = "127.0.0.1:9467")]
     listen: SocketAddr,
@@ -274,6 +278,8 @@ fn settings(cli: Cli) -> Result<Settings> {
             replay_max_log_file_bytes: cli.replay_max_log_file_bytes,
             replay_max_checkpoint_bytes: cli.replay_max_checkpoint_bytes,
             operation_max_active_files: cli.operation_max_active_files,
+            discovery_max_log_files: cli.discovery_max_log_files,
+            discovery_max_log_file_bytes: cli.discovery_max_log_file_bytes,
         },
         process_properties,
         optimize: OptimizeConfig {
