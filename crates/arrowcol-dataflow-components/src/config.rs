@@ -39,6 +39,20 @@ mod override_tests {
     }
 
     #[test]
+    fn channels_reject_capacity_that_would_panic_at_startup() {
+        let limits = RuntimeLimitsConfig {
+            batch_channel_capacity: usize::MAX,
+            ..Default::default()
+        };
+        assert!(limits.build().is_err());
+        let batching = FileBatchConfig {
+            max_concurrent_flushes: usize::MAX,
+            ..Default::default()
+        };
+        assert!(batching.validate().is_err());
+    }
+
+    #[test]
     fn pressure_overrides_cannot_change_identity() {
         assert!(
             merge_config(
@@ -376,6 +390,21 @@ impl RuntimeLimitsConfig {
             max_ddl_bytes: self.max_ddl_bytes,
         };
         limits.validate()?;
+        if self.batch_channel_capacity > tokio::sync::Semaphore::MAX_PERMITS
+            || self.put_result_channel_capacity > tokio::sync::Semaphore::MAX_PERMITS
+            || tokio::time::Instant::now()
+                .checked_add(self.max_stream_duration)
+                .is_none()
+            || tokio::time::Instant::now()
+                .checked_add(self.admission_timeout)
+                .is_none()
+        {
+            return Err(arrowcol_flight::RuntimeError::new(
+                arrowcol_protocol::ErrorCode::Internal,
+                tonic::Code::Internal,
+                "Flight channel capacity exceeds semaphore bounds or timeout exceeds clock bounds",
+            ));
+        }
         Ok(limits)
     }
 }
@@ -421,6 +450,7 @@ impl RegistrationConfig {
             || self.instance_key.chars().any(char::is_control)
             || self.flight_endpoint.port() == 0
             || self.max_concurrent_streams == 0
+            || self.max_concurrent_streams > tokio::sync::Semaphore::MAX_PERMITS
             || self.heartbeat_interval.is_zero()
             || self.pressure_interval.is_zero()
             || self.registration_ttl <= self.heartbeat_interval
@@ -670,6 +700,7 @@ impl FileBatchConfig {
             || self.max_age.is_zero()
             || tokio::time::Instant::now().checked_add(self.max_age).is_none()
             || self.max_concurrent_flushes == 0
+            || self.max_concurrent_flushes > tokio::sync::Semaphore::MAX_PERMITS
         {
             return Err("invalid bounded Arrow file batching capacities or flush policy".to_owned());
         }
