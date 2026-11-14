@@ -659,6 +659,11 @@ fn validate_maintenance(maintenance: &MaintenanceTunables) -> Result<()> {
         ),
         ("layout_page_rows", maintenance.layout_page_rows.is_some(), has_optimize),
         (
+            "max_concurrent_decoded_bytes",
+            maintenance.max_concurrent_decoded_bytes.is_some(),
+            has_optimize,
+        ),
+        (
             "max_files_per_bin",
             maintenance.max_files_per_bin.is_some(),
             has_optimize,
@@ -722,6 +727,35 @@ fn validate_maintenance(maintenance: &MaintenanceTunables) -> Result<()> {
         "maintenance.operation_timeout_secs",
         maintenance.operation_timeout_secs.or(Some(900)),
     )?;
+    positive(
+        "maintenance.max_concurrent_decoded_bytes",
+        maintenance.max_concurrent_decoded_bytes,
+    )?;
+    positive("maintenance.commit_attempts", maintenance.commit_attempts.or(Some(8)))?;
+    positive(
+        "maintenance.commit_budget_secs",
+        maintenance.commit_budget_secs.or(Some(10)),
+    )?;
+    if maintenance.commit_attempts.is_some_and(|attempts| attempts > 1_000) {
+        bail!("maintenance.commit_attempts must not exceed 1000");
+    }
+    if maintenance.commit_budget_secs.is_some_and(|seconds| seconds > 86_400) {
+        bail!("maintenance.commit_budget_secs must not exceed 86400 seconds");
+    }
+    if let Some(budget) = maintenance.max_concurrent_decoded_bytes {
+        let concurrency = u64::try_from(maintenance.max_concurrent_tables.unwrap_or(1))
+            .context("maintenance.max_concurrent_tables does not fit u64")?;
+        let required = maintenance
+            .max_decoded_bytes_per_bin
+            .unwrap_or(1_073_741_824)
+            .checked_mul(concurrency)
+            .context("maintenance concurrent decoded-byte budget overflows u64")?;
+        if required > budget {
+            bail!(
+                "maintenance.max_concurrent_decoded_bytes must cover max_decoded_bytes_per_bin times max_concurrent_tables"
+            );
+        }
+    }
     positive("maintenance.interval_secs", maintenance.interval_secs)?;
     positive("maintenance.purge_retention_secs", maintenance.purge_retention_secs)?;
     positive(
@@ -1096,6 +1130,65 @@ mod tests {
         assert_eq!(
             config.environment_for(ComponentRole::Collector)?["ARROWCOL_WAL_FSYNC_INTERVAL_MS"],
             "15"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_budget_and_commit_controls_are_projected_and_validated() -> Result<()> {
+        let invalid = Tunables {
+            maintenance: Some(MaintenanceTunables {
+                enabled: Some(true),
+                operations: Some(vec![MaintenanceOperation::Optimize]),
+                max_concurrent_tables: Some(2),
+                max_decoded_bytes_per_bin: Some(100),
+                max_concurrent_decoded_bytes: Some(199),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            invalid
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("max_concurrent_decoded_bytes")
+        );
+
+        let tunables = Tunables {
+            maintenance: Some(MaintenanceTunables {
+                enabled: Some(true),
+                operations: Some(vec![MaintenanceOperation::Optimize]),
+                max_concurrent_tables: Some(2),
+                max_decoded_bytes_per_bin: Some(100),
+                max_concurrent_decoded_bytes: Some(200),
+                commit_attempts: Some(12),
+                commit_budget_secs: Some(15),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        tunables.validate_for_oat()?;
+        let env = tunables.environment_for(ComponentRole::Maintenance)?;
+        assert_eq!(env["ARROWCOL_MAINT_MAX_CONCURRENT_DECODED_BYTES"], "200");
+        assert_eq!(env["ARROWCOL_MAINT_COMMIT_ATTEMPTS"], "12");
+        assert_eq!(env["ARROWCOL_MAINT_COMMIT_BUDGET_SECS"], "15");
+
+        let invalid = Tunables {
+            maintenance: Some(MaintenanceTunables {
+                enabled: Some(true),
+                operations: Some(vec![MaintenanceOperation::Optimize]),
+                commit_attempts: Some(1_001),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            invalid
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("must not exceed 1000")
         );
         Ok(())
     }
