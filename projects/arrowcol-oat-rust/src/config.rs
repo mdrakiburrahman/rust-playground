@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use arrowcol_tunables::Tunables;
+use otel_arrow_dfe_quiver::{DiskBudget, QuiverConfig};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::Path;
@@ -99,6 +100,7 @@ fn default_client_ready_timeout_seconds() -> u64 {
 pub(crate) const SCHEDULE_DELIVERY_TIMEOUT_SECONDS: u64 = 180;
 pub(crate) const PIN_INIT_SETUP_TIMEOUT_SECONDS: u64 = 180;
 const CLIENT_JOB_CLEANUP_GRACE_SECONDS: u64 = 300;
+const DEFAULT_WAL_RETENTION_SIZE_CAP_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RunTimingBudget {
@@ -157,6 +159,31 @@ impl OatConfig {
                 policy
                     .validate(table.schema())
                     .with_context(|| format!("collector layout is invalid for selected DMV table {name}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_wal_capacity_for_cores(&self) -> Result<()> {
+        let retention_cap = self
+            .tunables
+            .wal
+            .as_ref()
+            .and_then(|wal| wal.retention_size_cap_bytes)
+            .unwrap_or(DEFAULT_WAL_RETENTION_SIZE_CAP_BYTES);
+        let quiver = QuiverConfig::default();
+        let segment_size = quiver.segment.target_size_bytes.get();
+        let wal_max = DiskBudget::effective_wal_size(&quiver);
+        let minimum_per_core = DiskBudget::minimum_hard_cap(segment_size, wal_max);
+
+        for &cores in &self.dfe_worker_concurrency {
+            let cores = u64::from(cores);
+            let per_core_cap = retention_cap / cores;
+            if per_core_cap < minimum_per_core {
+                let minimum_total = minimum_per_core.saturating_mul(cores);
+                bail!(
+                    "wal.retention_size_cap_bytes ({retention_cap} bytes) cannot support dfe_worker_concurrency={cores}: per-core capacity is {per_core_cap} bytes, below the pinned Quiver minimum of {minimum_per_core} bytes (WAL max {wal_max} + 2 * segment size {segment_size}); increase the cap to at least {minimum_total} bytes or reduce concurrency"
+                );
             }
         }
         Ok(())
@@ -481,6 +508,7 @@ impl OatConfig {
         {
             bail!("dfe_worker_concurrency must contain 1 to 16 distinct values from 1 through 256");
         }
+        self.validate_wal_capacity_for_cores()?;
         if self.replica_counts.len() * self.dfe_worker_concurrency.len() > 25 {
             bail!("the OAT experiment matrix may contain at most 25 combinations");
         }
@@ -726,6 +754,34 @@ mod tests {
             website_url: "abfss://$web@account.dfs.core.windows.net/results.parquet".to_owned(),
         };
         TestConfig { config, directory }
+    }
+
+    #[test]
+    fn rejects_wal_capacity_below_the_pinned_quiver_minimum_before_effects() {
+        let mut config = valid();
+        config.dfe_worker_concurrency = vec![1];
+        config.tunables.wal = Some(arrowcol_tunables::WalTunables {
+            retention_size_cap_bytes: Some(1),
+            ..Default::default()
+        });
+        assert!(matches!(
+            config.validate(),
+            Err(error) if format!("{error:#}").contains("pinned Quiver minimum")
+        ));
+    }
+
+    #[test]
+    fn validates_default_wal_capacity_for_each_requested_worker_count() -> Result<()> {
+        let mut config = valid();
+        config.dfe_worker_concurrency = vec![21];
+        config.validate()?;
+
+        config.dfe_worker_concurrency = vec![22];
+        assert!(matches!(
+            config.validate(),
+            Err(error) if format!("{error:#}").contains("dfe_worker_concurrency=22")
+        ));
+        Ok(())
     }
 
     #[test]

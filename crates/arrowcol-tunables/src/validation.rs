@@ -898,15 +898,12 @@ fn validate_wal(wal: Option<&WalTunables>) -> Result<()> {
     }
     if wal
         .retry_multiplier
-        .is_some_and(|value| !value.is_finite() || value <= 0.0)
+        .is_some_and(|value| !value.is_finite() || !(1.0..=10.0).contains(&value))
     {
-        bail!("wal.retry_multiplier must be finite and positive");
+        bail!("wal.retry_multiplier must be finite and between 1.0 and 10.0");
     }
-    if wal
-        .max_in_flight
-        .is_some_and(|value| value == 0 || value > (usize::MAX >> 3))
-    {
-        bail!("wal.max_in_flight must be positive and not exceed Semaphore::MAX_PERMITS");
+    if wal.max_in_flight.is_some_and(|value| value == 0 || value > 1_000_000) {
+        bail!("wal.max_in_flight must be between 1 and 1000000");
     }
     Ok(())
 }
@@ -2059,6 +2056,42 @@ mod tests {
         assert_eq!(env["ARROWCOL_WAL_INITIAL_RETRY_INTERVAL"], "250ms");
         assert_eq!(env["ARROWCOL_WAL_OTLP_HANDLING"], "pass_through");
         assert!(!env.contains_key("ARROWCOL_WAL_FSYNC_INTERVAL_MS"));
+        Ok(())
+    }
+
+    #[test]
+    fn wal_retry_and_in_flight_bounds_match_the_consumer() -> Result<()> {
+        for (retry_multiplier, max_in_flight) in [(1.0, 1), (10.0, 1_000_000)] {
+            Tunables {
+                wal: Some(WalTunables {
+                    retry_multiplier: Some(retry_multiplier),
+                    max_in_flight: Some(max_in_flight),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+            .validate_for_oat()?;
+        }
+
+        for retry_multiplier in [0.99, 10.01] {
+            let invalid = Tunables {
+                wal: Some(WalTunables {
+                    retry_multiplier: Some(retry_multiplier),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert!(error_text(invalid.validate_for_oat()).contains("wal.retry_multiplier"));
+        }
+
+        let invalid = Tunables {
+            wal: Some(WalTunables {
+                max_in_flight: Some(1_000_001),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(error_text(invalid.validate_for_oat()).contains("wal.max_in_flight"));
         Ok(())
     }
 
