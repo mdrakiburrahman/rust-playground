@@ -17,6 +17,8 @@ pub struct Tunables {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<TransportTunables>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arrow_ipc: Option<ArrowIpcTunables>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router: Option<RouterTunables>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collector: Option<CollectorTunables>,
@@ -79,6 +81,12 @@ pub struct TransportTunables {
     pub endpoint_buffer_size: Option<usize>,
     pub connect_retries: Option<u32>,
     pub retry_backoff_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArrowIpcTunables {
+    pub compression: Option<ArrowIpcCompression>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

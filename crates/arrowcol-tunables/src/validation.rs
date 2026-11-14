@@ -106,6 +106,17 @@ impl Tunables {
                 }
             }
         }
+        if self
+            .arrow_ipc
+            .as_ref()
+            .is_some_and(|settings| settings.compression.is_some())
+            && self
+                .transport
+                .as_ref()
+                .is_some_and(|settings| settings.ipc_compression.is_some())
+        {
+            bail!("configure Arrow IPC compression in arrow_ipc.compression, not in both sections");
+        }
         if let Some(transport) = &self.transport {
             let message_bytes = transport.max_message_bytes.unwrap_or(16_777_216);
             let flight_bytes = transport.max_flight_data_bytes.unwrap_or(2_097_152);
@@ -306,6 +317,17 @@ impl Tunables {
                     "ARROWCOL_PARQUET_CONFIG".to_owned(),
                     canonicalize(section_value.clone()).to_string(),
                 );
+                continue;
+            }
+            if section == "arrow_ipc" {
+                if let Some(compression) = self.arrow_ipc.as_ref().and_then(|settings| settings.compression) {
+                    let value = match compression {
+                        ArrowIpcCompression::None => "none",
+                        ArrowIpcCompression::Lz4Frame => "lz4_frame",
+                        ArrowIpcCompression::Zstd => "zstd",
+                    };
+                    output.insert("ARROWCOL_CLIENT_IPC_COMPRESSION".to_owned(), value.to_owned());
+                }
                 continue;
             }
             if section == "wal" {
@@ -1371,6 +1393,28 @@ mod tests {
             "15ms"
         );
         assert_eq!(Tunables::default().durability_class(), DurabilityClass::Durable);
+        Ok(())
+    }
+
+    #[test]
+    fn arrow_ipc_has_a_canonical_strict_section() -> Result<()> {
+        let config: Tunables = serde_json::from_str(r#"{"arrow_ipc":{"compression":"lz4_frame"}}"#)?;
+        config.validate_for_oat()?;
+        assert_eq!(
+            config.environment_for(ComponentRole::Client)?["ARROWCOL_CLIENT_IPC_COMPRESSION"],
+            "lz4_frame"
+        );
+        assert!(serde_json::from_str::<Tunables>(r#"{"arrow_ipc":{"compression":"brotli"}}"#).is_err());
+
+        let duplicate: Tunables =
+            serde_json::from_str(r#"{"arrow_ipc":{"compression":"zstd"},"transport":{"ipc_compression":"zstd"}}"#)?;
+        assert!(
+            duplicate
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("not in both sections")
+        );
         Ok(())
     }
 
