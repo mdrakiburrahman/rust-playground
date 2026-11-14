@@ -518,7 +518,7 @@ impl Platform for LocalPlatform {
             Duration::from_secs(config.qap_timeout_seconds),
         )
         .await
-        .map_err(|error| error.context(LocalDownstreamUnavailable))
+        .map_err(classify_local_qap_error)
         .context("initialize run-local Kusto QAP tables and policies")?;
         Ok(bindings.iter().map(|binding| binding.external_table.clone()).collect())
     }
@@ -2045,8 +2045,7 @@ async fn run_matrix_cell(
             )
             .await?;
             if qap.observation_complete != 1 {
-                qap = QapMetrics::default();
-                return Err(anyhow::anyhow!(LocalDownstreamUnavailable));
+                bail!("QAP observation omitted required table statistics");
             }
             Ok::<_, anyhow::Error>(())
         }
@@ -2465,6 +2464,7 @@ async fn run_clients_inner(
     let qap_tables = match qap_result {
         Ok(qap_tables) => qap_tables,
         Err(error) if local_downstream_optional(platform.kind()) && error.is::<LocalDownstreamUnavailable>() => {
+            platform.mark_qap_outcome_unresolved();
             evidence.downstream_unavailable("local_qap_initialization_unavailable");
             Vec::new()
         }
@@ -3232,7 +3232,7 @@ async fn observe_qap(
             ))
             .map_err(|error| {
                 if matches!(mode, arrowcol_loadgen::ObservationMode::Local) {
-                    error.context(LocalDownstreamUnavailable)
+                    classify_local_qap_error(error)
                 } else {
                     error
                 }
@@ -3241,6 +3241,20 @@ async fn observe_qap(
     })
     .await
     .context("join Kusto QAP observer")??;
+    if let Some(tables) = observation.get("tables").and_then(Value::as_object) {
+        let failures = tables
+            .values()
+            .filter(|table| table["available"] == false)
+            .collect::<Vec<_>>();
+        if !failures.is_empty() {
+            if matches!(mode, arrowcol_loadgen::ObservationMode::Local)
+                && failures.iter().all(|table| table["temporary_unavailable"] == true)
+            {
+                return Err(anyhow::anyhow!(LocalDownstreamUnavailable));
+            }
+            bail!("QAP table metadata/statistics observation failed; not a temporary service-availability failure");
+        }
+    }
     aggregate_qap(&observation, qap_tables)
 }
 

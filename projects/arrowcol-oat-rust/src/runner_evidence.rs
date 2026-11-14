@@ -31,6 +31,14 @@ impl std::fmt::Display for LocalDownstreamUnavailable {
 
 impl std::error::Error for LocalDownstreamUnavailable {}
 
+fn classify_local_qap_error(error: anyhow::Error) -> anyhow::Error {
+    if error.is::<arrowcol_loadgen::QapUnavailable>() {
+        error.context(LocalDownstreamUnavailable)
+    } else {
+        error
+    }
+}
+
 impl CellEvidence {
     fn downstream_unavailable(&mut self, reason: &'static str) {
         self.downstream_comment.get_or_insert(reason);
@@ -356,6 +364,8 @@ mod downstream_runner_tests {
         InitRequired,
         InitTimeout,
         ObservationUnavailable,
+        InitBindingRejected,
+        ObservationBindingRejected,
         Collector,
         Pinning,
     }
@@ -401,7 +411,25 @@ mod downstream_runner_tests {
             match self.fault {
                 Fault::InitRequired => bail!("required_binding_setup_failed"),
                 Fault::InitTimeout => std::future::pending().await,
-                Fault::ObservationUnavailable => Ok(vec!["observed".to_owned()]),
+                Fault::InitUnavailable | Fault::InitBindingRejected => {
+                    let results = std::env::temp_dir().join(format!("oat-qap-init-{}", uuid::Uuid::new_v4()));
+                    fs::create_dir(&results)?;
+                    let outcome = arrowcol_loadgen::initialize_local_qap(
+                        &self.endpoint,
+                        &results,
+                        "loadtest",
+                        &[(
+                            "observed".to_owned(),
+                            "/delta/dataflow/telemetry/sqlserver/sqlserver_active_sessions".to_owned(),
+                        )],
+                        Duration::from_secs(5),
+                    )
+                    .await;
+                    fs::remove_dir_all(&results)?;
+                    outcome.map_err(classify_local_qap_error)?;
+                    Ok(vec!["observed".to_owned()])
+                }
+                Fault::ObservationUnavailable | Fault::ObservationBindingRejected => Ok(vec!["observed".to_owned()]),
                 _ => Err(anyhow::anyhow!(LocalDownstreamUnavailable)),
             }
         }
@@ -466,12 +494,17 @@ mod downstream_runner_tests {
         } else {
             "arrowcol_router_table_owners{pool=\"dataflow\",catalog=\"telemetry\",schema=\"sqlserver\",table=\"sqlserver_active_sessions\",collector=\"collector-a\",state=\"active\"} 1\n"
         };
+        let downstream_status = if matches!(fault, Fault::InitBindingRejected | Fault::ObservationBindingRejected) {
+            axum::http::StatusCode::BAD_REQUEST
+        } else {
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        };
         let server = tokio::spawn(async move {
             axum::serve(
                 listener,
                 axum::Router::new()
                     .route("/metrics", axum::routing::get(move || async move { metric }))
-                    .fallback(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
+                    .fallback(move || async move { downstream_status }),
             )
             .await
         });
@@ -524,7 +557,13 @@ mod downstream_runner_tests {
 
     #[tokio::test]
     async fn local_degradation_never_hides_required_setup_collector_or_pinning_failures() -> Result<()> {
-        for fault in [Fault::InitRequired, Fault::Collector, Fault::Pinning] {
+        for fault in [
+            Fault::InitRequired,
+            Fault::InitBindingRejected,
+            Fault::ObservationBindingRejected,
+            Fault::Collector,
+            Fault::Pinning,
+        ] {
             let (rows, _) = run_fault(fault, crate::config::OatMode::Local).await?;
             assert_ne!(rows[0].status, "succeeded");
             assert!(rows[0].failure.is_some());

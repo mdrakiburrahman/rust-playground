@@ -34,6 +34,28 @@ use tokio_util::sync::CancellationToken;
 use crate::{cli::RunArgs, transport::now_unix_millis};
 
 const DATABASE: &str = "loadtest";
+
+/// A transport/service deadline or explicit temporary service unavailability, not a binding or query failure.
+#[derive(Debug)]
+pub struct QapUnavailable;
+
+impl std::fmt::Display for QapUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Kusto observation service is temporarily unavailable")
+    }
+}
+
+impl std::error::Error for QapUnavailable {}
+
+fn request_failure(error: &reqwest::Error) -> anyhow::Error {
+    let diagnostic = format!("Kusto HTTP request failed: {}", redact_text(&error.to_string()));
+    if error.is_connect() || error.is_timeout() {
+        anyhow::Error::new(QapUnavailable).context(diagnostic)
+    } else {
+        anyhow::anyhow!(diagnostic)
+    }
+}
+
 const STATUS: &str = "kusto-status.json";
 const BACKEND: &str = "native-qap";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -208,12 +230,13 @@ impl KustoClient {
         if let Some(token) = self.token().await? {
             builder = builder.bearer_auth(token);
         }
-        let response = builder
-            .send()
-            .await
-            .map_err(|error| anyhow::anyhow!("Kusto HTTP request failed: {}", redact_text(&error.to_string())))?;
+        let response = builder.send().await.map_err(|error| request_failure(&error))?;
         let status = response.status();
-        let text = response.text().await.context("Kusto response body failed")?;
+        let text = response
+            .text()
+            .await
+            .map_err(|error| request_failure(&error))
+            .context("Kusto response body failed")?;
         let body: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({"error": text}));
         let public = sanitize(&body);
         append(
@@ -229,6 +252,9 @@ impl KustoClient {
             }),
         )?;
         self.queries_completed.fetch_add(1, Ordering::Relaxed);
+        if matches!(status.as_u16(), 502 | 503 | 504) {
+            return Err(anyhow::Error::new(QapUnavailable).context(format!("Kusto HTTP {status}")));
+        }
         ensure!(status.is_success(), "Kusto HTTP {status}: {public}");
         decode_response(&body).map_err(|error| anyhow::anyhow!(redact_text(&format!("{error:#}"))))
     }
@@ -1986,7 +2012,7 @@ pub async fn observe_qap_with_mode(
                         observed.insert(name, table);
                     }
                     Err(error) => {
-                        observed.insert(name, json!({"available": false, "error": short_error(&error)}));
+                        observed.insert(name, json!({"available": false, "temporary_unavailable": error.is::<QapUnavailable>(), "error": short_error(&error)}));
                     }
                 }
             }
@@ -2008,7 +2034,7 @@ pub async fn observe_qap_with_mode(
                     }
                     Err(error) => {
                         for name in policies.keys() {
-                            observed.insert(name.clone(), json!({"available": false, "error": short_error(&error)}));
+                            observed.insert(name.clone(), json!({"available": false, "temporary_unavailable": error.is::<QapUnavailable>(), "error": short_error(&error)}));
                         }
                     }
                 }
@@ -2022,7 +2048,7 @@ pub async fn observe_qap_with_mode(
         .await
         .map_err(|_| {
             timed_out = true;
-            anyhow::anyhow!("QAP observation exceeded its {deadline:?} deadline")
+            anyhow::Error::new(QapUnavailable).context(format!("QAP observation exceeded its {deadline:?} deadline"))
         })?
     }
     .await;
@@ -2089,7 +2115,10 @@ pub async fn initialize_local_qap(
         Ok(())
     })
     .await
-    .map_err(|_| anyhow::anyhow!("local QAP initialization exceeded its {deadline:?} deadline"))?
+    .map_err(|_| {
+        anyhow::Error::new(QapUnavailable)
+            .context(format!("local QAP initialization exceeded its {deadline:?} deadline"))
+    })?
 }
 
 /// Samples QAP until every requested table is fully cached and healthy, or the
@@ -2149,11 +2178,11 @@ pub async fn observe_qap_until_ready(
                 }
                 last = Some(observation);
             }
-            Ok(Err(error)) if started.elapsed() < budget => break Err(error),
-            Ok(Err(_)) | Err(_) => {
-                break last
-                    .map(|observation| (observation, false))
-                    .context("QAP catch-up deadline elapsed before any observation");
+            Ok(Err(error)) => break Err(error),
+            Err(_) => {
+                break last.map(|observation| (observation, false)).ok_or_else(|| {
+                    anyhow::Error::new(QapUnavailable).context("QAP catch-up deadline elapsed before any observation")
+                });
             }
         }
         tokio::time::sleep(Duration::from_secs(1).min(budget.saturating_sub(started.elapsed()))).await;

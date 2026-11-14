@@ -1,0 +1,80 @@
+{
+  "platform": {
+    "kind": "local",
+    "compose_file": "projects/loadtest/compose.yaml",
+    "compose_override_file": "projects/loadtest/compose.oat.yaml",
+    "compose_project": "arrowcol-oat-tuned",
+    "compose_state_root": "out/arrowcol-oat/tuned"
+  },
+  "warmup_seconds": 5,
+  "measure_seconds": 30,
+  "client_ready_timeout_seconds": 600,
+  "run_pin_ttl_ms": 3600000,
+  "namespace": "arrowcol-oat",
+  "arrowcol_deployment": "arrowcol",
+  "arrowcol_container": "dataflow",
+  "dfe_deployment": "arrowcol",
+  "dfe_container": "dataflow",
+  "arrowcol_pod_selector": "app=arrowcol",
+  "dfe_pod_selector": "app=arrowcol",
+  "arrowcol_endpoint": "http://router:50050",
+  "router_metrics_endpoint": "http://127.0.0.1:15050/metrics",
+  "dmv_client_binary": "target/debug/arrowcol-dmv",
+  "edge_secret_file": "/run/secrets/edge-hmac",
+  "tables": ["sqlserver_active_sessions"],
+  "rows_per_table": 4096,
+  "clients_per_table": 1,
+  "dmv_concurrency": 2,
+  "qap_endpoint": "http://127.0.0.1:8080",
+  "qap_timeout_seconds": 60,
+  "replica_counts": [1],
+  "dfe_worker_concurrency": [2],
+  "result_url": "file:///tmp/arrowcol-oat-tuned/results.parquet",
+  "website_url": "file:///tmp/arrowcol-oat-tuned/site/results.parquet",
+  "tunables": {
+    "client": {
+      "corpus_rows": 65536,
+      "batch_rows": 4096,
+      "workers": 2,
+      "string_width": 32,
+      "cardinality": 1024,
+      "null_fraction": 0.05,
+      "max_memory_bytes": 536870912,
+      "connections_per_worker": 1,
+      "streams_per_worker": 2
+    },
+    "transport": {
+      "ipc_compression": "zstd",
+      "grpc_send_compression": "none",
+      "max_flight_data_bytes": 2097152,
+      "max_message_bytes": 16777216
+    },
+    "collector": {
+      "batching": {
+        "coalesce_publications": true,
+        "max_age": "1s",
+        "max_concurrent_flushes": 2
+      },
+      "runtime": {
+        "workers": 4,
+        "blocking_workers": 64,
+        "upload_limit": 8,
+        "task_limit": 128,
+        "read_ahead": 8,
+        "batch_rows": 16384,
+        "cpu_workers": 4
+      }
+    },
+    "parquet_writer": {
+      "defaults": { "compression": "zstd", "compression_level": 3 },
+      "max_row_group_rows": 16384
+    },
+    "maintenance": {
+      "enabled": true,
+      "operations": ["optimize", "checkpoint"],
+      "apply": false,
+      "interval_secs": 60,
+      "target_file_mib": 128
+    }
+  }
+}
