@@ -4,7 +4,7 @@ use anyhow::{Context, Result, anyhow};
 use arrow_deltalake::maintenance::{Granularity, InputReadStrategy, OptimizeConfig};
 use clap::Parser;
 use delta_kernel::metrics::WithMetricsReporterLayer;
-use delta_maintenance::{Metrics, Operation, Settings, run, serve_metrics, startup_configuration};
+use delta_maintenance::{Metrics, Operation, OperationLimits, Settings, run, serve_metrics, startup_configuration};
 use delta_maintenance::{
     catalog::{CatalogDiscovery, CatalogOptions},
     run_with_discovery,
@@ -160,6 +160,27 @@ struct Cli {
     /// Maximum log objects one `prune-log` apply deletes; the rest is backlog.
     #[arg(long, env = "ARROWCOL_MAINT_MAX_PRUNE_FILES", default_value_t = 10_000)]
     max_prune_files: usize,
+    #[arg(long, env = "ARROWCOL_MAINT_PURGE_MAX_FILES_PER_COMMIT", default_value_t = 10_000)]
+    purge_max_files_per_commit: usize,
+    #[arg(long, env = "ARROWCOL_MAINT_PURGE_MAX_PLAN_BYTES", default_value_t = 4 * 1024 * 1024)]
+    purge_max_plan_bytes: usize,
+    #[arg(long, env = "ARROWCOL_MAINT_VACUUM_DELETE_CHUNK", default_value_t = 256)]
+    vacuum_delete_chunk: usize,
+    #[arg(long, env = "ARROWCOL_MAINT_VACUUM_MAX_PLAN_BYTES", default_value_t = 8 * 1024 * 1024)]
+    vacuum_max_plan_bytes: usize,
+    /// Bounds log replay in VACUUM and prune-log; discovery has a separate bound.
+    #[arg(long, env = "ARROWCOL_MAINT_REPLAY_MAX_LOG_FILES", default_value_t = 100_000)]
+    replay_max_log_files: usize,
+    #[arg(long, env = "ARROWCOL_MAINT_REPLAY_MAX_LOG_FILE_BYTES", default_value_t = 64 * 1024 * 1024)]
+    replay_max_log_file_bytes: u64,
+    #[arg(long, env = "ARROWCOL_MAINT_REPLAY_MAX_CHECKPOINT_BYTES", default_value_t = 256 * 1024 * 1024)]
+    replay_max_checkpoint_bytes: u64,
+    #[arg(long, env = "ARROWCOL_MAINT_OPERATION_MAX_ACTIVE_FILES", default_value_t = 1_000_000)]
+    operation_max_active_files: usize,
+    #[arg(long, env = "ARROWCOL_MAINT_DISCOVERY_MAX_LOG_FILES", default_value_t = 100_000)]
+    discovery_max_log_files: usize,
+    #[arg(long, env = "ARROWCOL_MAINT_DISCOVERY_MAX_LOG_FILE_BYTES", default_value_t = 64 * 1024 * 1024)]
+    discovery_max_log_file_bytes: u64,
     /// Prometheus listen address.
     #[arg(long, env = "ARROWCOL_MAINT_LISTEN", default_value = "127.0.0.1:9467")]
     listen: SocketAddr,
@@ -248,6 +269,18 @@ fn settings(cli: Cli) -> Result<Settings> {
         checkpoint_every_commits: cli.checkpoint_every_commits,
         log_retention_ms: cli.log_retention_secs.map(millis).transpose()?,
         max_prune_files: cli.max_prune_files,
+        operation_limits: OperationLimits {
+            purge_max_files_per_commit: cli.purge_max_files_per_commit,
+            purge_max_plan_bytes: cli.purge_max_plan_bytes,
+            vacuum_delete_chunk: cli.vacuum_delete_chunk,
+            vacuum_max_plan_bytes: cli.vacuum_max_plan_bytes,
+            replay_max_log_files: cli.replay_max_log_files,
+            replay_max_log_file_bytes: cli.replay_max_log_file_bytes,
+            replay_max_checkpoint_bytes: cli.replay_max_checkpoint_bytes,
+            operation_max_active_files: cli.operation_max_active_files,
+            discovery_max_log_files: cli.discovery_max_log_files,
+            discovery_max_log_file_bytes: cli.discovery_max_log_file_bytes,
+        },
         process_properties,
         optimize: OptimizeConfig {
             target_file_bytes: target,
