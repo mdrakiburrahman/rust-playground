@@ -218,6 +218,20 @@ fn maintenance_readback_value(observed: &Value, variable: &str, expected: Value)
         | "CATALOG_RUNTIME_THREADS"
         | "CATALOG_RPC_TIMEOUT_SECS"
         | "CATALOG_MAX_DECODING_MESSAGE_BYTES" => (format!("/startup/{}", field.to_ascii_lowercase()), 1, false),
+        "PURGE_MAX_FILES_PER_COMMIT"
+        | "PURGE_MAX_PLAN_BYTES"
+        | "VACUUM_DELETE_CHUNK"
+        | "VACUUM_MAX_PLAN_BYTES"
+        | "REPLAY_MAX_LOG_FILES"
+        | "REPLAY_MAX_LOG_FILE_BYTES"
+        | "REPLAY_MAX_CHECKPOINT_BYTES"
+        | "OPERATION_MAX_ACTIVE_FILES"
+        | "DISCOVERY_MAX_LOG_FILES"
+        | "DISCOVERY_MAX_LOG_FILE_BYTES" => (
+            format!("/startup/operation_limits/{}", field.to_ascii_lowercase()),
+            1,
+            false,
+        ),
         "OPERATION_TIMEOUT_SECS" => (
             "/table_policy/arrowcol.maintenance.operationTimeout".to_owned(),
             1000,

@@ -23,6 +23,24 @@ test('rejects mutable images, QAP namespace, wrong stamp and unknown fields', ()
   assert.throws(() => validateRuntime({ ...config(), stamp: 89152 }));
   const c = config(); c.images.dataflow = 'example:latest';
   assert.throws(() => validateRuntime(c));
+  assert.throws(() => validateRuntime({ ...config(), quiver: 'true' }), /explicit boolean/);
+});
+
+test('only explicit Quiver topology installs the durable processor and isolated pod storage', async () => {
+  for (const quiver of [false, true]) {
+    const objects = await renderRuntime({ ...config(), quiver }, 'workload');
+    const engine = parse(objects.find(o => o.kind === 'ConfigMap')!.data['dataflow.yaml']);
+    const pipeline = engine.groups.arrowcol.pipelines.ingest;
+    assert.equal(pipeline.nodes.flight.config.native_quiver, quiver);
+    assert.equal(Boolean(pipeline.nodes.durable), quiver);
+    assert.equal(engine.policies.resources, undefined);
+    assert.deepEqual(pipeline.connections.map((connection: { from: string; to: string }) => `${connection.from}:${connection.to}`),
+      quiver ? ['flight:durable', 'durable:delta'] : ['flight:delta']);
+    const pod = objects.find(o => o.kind === 'Deployment' && o.metadata.name === 'arrowcol')!.spec.template.spec;
+    assert.equal(pod.volumes.some((volume: { name: string }) => volume.name === 'quiver'), quiver);
+    assert.equal(pod.containers[0].volumeMounts.some((mount: { name: string; readOnly: boolean }) =>
+      mount.name === 'quiver' && !mount.readOnly), quiver);
+  }
 });
 
 test('maintenance requires a pinned sixth image and explicit allowlist/operation/apply controls', async () => {

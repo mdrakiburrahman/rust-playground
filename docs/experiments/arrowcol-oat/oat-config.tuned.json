@@ -8,6 +8,7 @@
   },
   "warmup_seconds": 5,
   "measure_seconds": 30,
+  "pilot_mode": false,
   "client_ready_timeout_seconds": 600,
   "run_pin_ttl_ms": 3600000,
   "namespace": "arrowcol-oat",

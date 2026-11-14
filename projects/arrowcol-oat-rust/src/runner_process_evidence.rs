@@ -125,7 +125,6 @@ fn process_configurations(text: &str) -> Result<Value> {
         let value = [
             "arrowcol_effective_config ",
             "arrowcol_router_effective_config ",
-            "arrowcol_wal_effective_config ",
             "arrowcol_maintenance_effective_config ",
             "OAT_CLIENT_EFFECTIVE_CONFIG ",
         ]
@@ -151,6 +150,9 @@ fn process_configurations(text: &str) -> Result<Value> {
             let value = public_tuning_value(&value).context("process tuning readback was not public")?;
             merge_observed_configuration(&mut configuration, value)?;
         }
+    }
+    if let Some(wal) = wal_process_configuration(text)? {
+        configuration["wal"] = public_tuning_value(&wal).context("WAL readback was not public")?;
     }
     Ok(configuration)
 }
@@ -232,10 +234,16 @@ fn router_readback_path(variable: &str) -> Result<String> {
 }
 
 fn verify_process_configuration(config: &OatConfig, role: ComponentRole, observed: &Value) -> Result<()> {
+    if matches!(role, ComponentRole::Collector) {
+        verify_wal_configuration(config, observed)?;
+    }
     if matches!(role, ComponentRole::Maintenance) && maintenance_enabled(config) {
         verify_maintenance_controls(config, observed)?;
     }
     for (name, expected) in role_environment(config, role)? {
+        if name.starts_with("ARROWCOL_WAL_") {
+            continue;
+        }
         let mut expected = serde_json::from_str::<Value>(&expected).unwrap_or(Value::String(expected));
         if name == "ARROWCOL_ROUTER_UPSTREAM_PING_INTERVAL_SECONDS" && expected == 0 {
             expected = Value::Null;
@@ -256,6 +264,9 @@ fn verify_process_configuration(config: &OatConfig, role: ComponentRole, observe
             "ARROWCOL_COLLECTOR_COMMIT_CONFIG" => "/commit".to_owned(),
             "ARROWCOL_COLLECTOR_LIMITS_CONFIG" => "/limits".to_owned(),
             "ARROWCOL_COLLECTOR_PRESSURE_CONFIG" => "/pressure".to_owned(),
+            "ARROWCOL_COLLECTOR_CATALOG_CONFIG" => "/catalog".to_owned(),
+            "ARROWCOL_COLLECTOR_ROUTING_CONFIG" => "/routing".to_owned(),
+            "ARROWCOL_COLLECTOR_EXPORTER_CONFIG" => String::new(),
             "ARROWCOL_COLLECTOR_RUNTIME_WORKERS" => "/runtime/runtime_workers".to_owned(),
             variable if variable.starts_with("ARROWCOL_COLLECTOR_") => format!(
                 "/runtime/{}",
@@ -266,10 +277,6 @@ fn verify_process_configuration(config: &OatConfig, role: ComponentRole, observe
                 variable.trim_start_matches("ARROWCOL_CLIENT_").to_ascii_lowercase()
             ),
             variable if variable.starts_with("ARROWCOL_ROUTER_") => router_readback_path(variable)?,
-            variable if variable.starts_with("ARROWCOL_WAL_") => format!(
-                "/wal/{}",
-                variable.trim_start_matches("ARROWCOL_WAL_").to_ascii_lowercase()
-            ),
             variable if variable.starts_with("ARROWCOL_MAINT_") => format!(
                 "/{}",
                 variable.trim_start_matches("ARROWCOL_MAINT_").to_ascii_lowercase()
@@ -301,7 +308,8 @@ fn process_evidence(config: &OatConfig, logs: &[ProcessLog]) -> Result<Value> {
             .filter(|log| role_name(log.role) == role_name(role))
             .collect::<Vec<_>>();
         if (!role_environment(config, role)?.is_empty()
-            || (matches!(role, ComponentRole::Maintenance) && maintenance_enabled(config)))
+            || (matches!(role, ComponentRole::Maintenance) && maintenance_enabled(config))
+            || (matches!(role, ComponentRole::Collector) && config.tunables.wal.is_some()))
             && selected.is_empty()
         {
             bail!("configured {} has no running consumer/readback", role_name(role));
@@ -325,11 +333,20 @@ fn process_evidence(config: &OatConfig, logs: &[ProcessLog]) -> Result<Value> {
             let writer_policy = fields
                 .remove("parquet_writer")
                 .or_else(|| fields.remove("parquet_writer_overrides"));
+            let wal_storage_scope =
+                fields
+                    .contains_key("wal")
+                    .then_some(if config.platform.kind == crate::config::OatMode::Local {
+                        "run_owned_bind_mount_per_container_instance_not_node_failure_durable"
+                    } else {
+                        "per_pod_empty_dir_not_persistent_across_pod_or_node_loss"
+                    });
             result.push(json!({
                 "component": role_name(role),
                 "effective_config": observed.then_some(effective),
                 "writer_policy_overrides": writer_policy,
                 "writer_policy_scope": "configured_startup_overrides_not_complete_schema_resolved_or_exercised_file_properties",
+                "wal_storage_scope": wal_storage_scope,
                 "effective_config_source": observed.then_some("consumer_startup_readback"),
                 "effective_config_unavailable_reason": (!observed).then_some("consumer_did_not_emit_startup_readback"),
                 "image": log.image,

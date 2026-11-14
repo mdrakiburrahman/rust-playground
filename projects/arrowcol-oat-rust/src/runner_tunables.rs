@@ -38,6 +38,28 @@ fn compose_tunables(config: &OatConfig) -> Result<Value> {
     Ok(json!({ "services": services }))
 }
 
+fn local_dataflow_overlay(config: &OatConfig, state_dir: &Path, overlay: &mut Value) -> Result<()> {
+    let services = overlay["services"]
+        .as_object_mut()
+        .context("Compose tunable services missing")?;
+    let collector = services.entry("dataflow-1").or_insert_with(|| json!({}));
+    collector["entrypoint"] = json!(["/bin/sh", "-ec"]);
+    collector["command"] = json!([concat!(
+        "export ARROWCOL_INSTANCE_KEY=\"oat-$(hostname)\"; ",
+        "export ARROWCOL_ADVERTISED_FLIGHT_ENDPOINT=\"$(hostname -i):32010\"; ",
+        "export ARROWCOL_QUIVER_PATH=\"/oat-quiver/$(hostname)\"; ",
+        "exec /usr/bin/tini -- /usr/local/bin/arrowcol-dataflow-rust --num-cores \"${LOADTEST_CPUS:-2}\" --config /etc/oat/dataflow.yaml"
+    )]);
+    let mut volumes = vec![json!({"type":"bind", "source":state_dir.join("dataflow.yaml"),
+        "target":"/etc/oat/dataflow.yaml", "read_only":true, "bind":{"create_host_path":false}})];
+    if config.tunables.wal.is_some() {
+        volumes.push(json!({"type":"bind", "source":state_dir.join("quiver"),
+            "target":"/oat-quiver", "bind":{"create_host_path":false}}));
+    }
+    collector["volumes"] = json!(volumes);
+    Ok(())
+}
+
 fn inject_container_environment(
     container: &mut Value,
     variables: &std::collections::BTreeMap<String, String>,
@@ -160,6 +182,35 @@ mod tunable_injection_tests {
             Some("257")
         );
         assert!(inject_deployment_environment(&mut workload, "missing", &variables).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn local_quiver_storage_is_run_owned_and_partitioned_by_process_instance() -> Result<()> {
+        let mut config = config()?;
+        let state = Path::new("/owned/run");
+        let mut overlay = compose_tunables(&config)?;
+        local_dataflow_overlay(&config, state, &mut overlay)?;
+        assert_eq!(
+            overlay["services"]["dataflow-1"]["volumes"]
+                .as_array()
+                .context("missing mounts")?
+                .len(),
+            1
+        );
+        config.tunables = serde_json::from_value(json!({"wal":{"flush_interval_ms":7}}))?;
+        let mut overlay = compose_tunables(&config)?;
+        local_dataflow_overlay(&config, state, &mut overlay)?;
+        let collector = &overlay["services"]["dataflow-1"];
+        assert_eq!(collector["environment"]["ARROWCOL_WAL_FLUSH_INTERVAL"], "7ms");
+        assert_eq!(collector["volumes"][1]["source"], "/owned/run/quiver");
+        assert_eq!(collector["volumes"][1]["bind"]["create_host_path"], false);
+        assert!(
+            collector["command"][0]
+                .as_str()
+                .context("missing command")?
+                .contains("/oat-quiver/$(hostname)")
+        );
         Ok(())
     }
 }

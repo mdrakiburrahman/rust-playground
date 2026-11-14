@@ -39,6 +39,7 @@ include!("runner_tunables.rs");
 include!("runner_process_evidence.rs");
 include!("runner_commit_evidence.rs");
 include!("runner_maintenance.rs");
+include!("runner_wal.rs");
 
 #[derive(Clone, Debug)]
 struct OatResult {
@@ -634,14 +635,16 @@ impl LocalPlatform {
 }
 
 fn prepare_local_state(config: &OatConfig, state_dir: &Path, run_id: &str) -> Result<HashMap<String, String>> {
-    fs::write(
-        state_dir.join("tunables.compose.json"),
-        serde_json::to_vec(&compose_tunables(config)?)?,
-    )
-    .context("write typed run-owned Compose tunable overlay")?;
+    let mut overlay = compose_tunables(config)?;
+    local_dataflow_overlay(config, state_dir, &mut overlay)?;
+    fs::write(state_dir.join("tunables.compose.json"), serde_json::to_vec(&overlay)?)
+        .context("write typed run-owned Compose tunable overlay")?;
     for directory in ["catalog-state", "dataflow", "router-state", "control"] {
         fs::create_dir(state_dir.join(directory))
             .with_context(|| format!("create local OAT state directory {directory}"))?;
+    }
+    if config.tunables.wal.is_some() {
+        fs::create_dir(state_dir.join("quiver")).context("create run-owned per-instance WAL state")?;
     }
     fs::write(state_dir.join("control/schedule"), "pending\n")
         .context("initialize local OAT client schedule barrier")?;
@@ -2121,7 +2124,7 @@ fn result_rows(
         "pinning_verification_error": client_run.pinning.verification_error.as_ref().map(|_| "ownership_verification_failed"),
         "delta_delivery": "not_established",
         "requested_tunables": serde_json::from_str::<Value>(&config.tunables.canonical_json()?)?,
-        "requested_durability_class": config.tunables.durability_class(),
+        "requested_durability_class": config.tunables.wal.as_ref().map(|_| config.tunables.durability_class()),
         "capabilities": capability_evidence(),
     });
     let details = [
@@ -3906,6 +3909,20 @@ async fn wait_for_aks_pin_setup(config: &OatConfig, job_name: &str, run_id: &str
 }
 
 async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
+    run_npx_runtime(
+        &std::env::current_dir()?.join("projects/arrowcol-oat/runtime.ts"),
+        &[
+            "render-dataflow",
+            if config.tunables.wal.is_some() {
+                "quiver"
+            } else {
+                "direct"
+            },
+            platform.state_dir.join("dataflow.yaml").to_string_lossy().as_ref(),
+        ],
+    )
+    .await
+    .context("render run-owned dataflow profile before starting local workloads")?;
     let base_project = config
         .platform
         .compose_project
@@ -4886,6 +4903,7 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
     runtime_config["deltaRoot"] = json!(run_data_root);
     runtime_config["namespace"] = json!(config.namespace);
     runtime_config["oatRunId"] = json!(platform.run_id);
+    runtime_config["quiver"] = json!(config.tunables.wal.is_some());
     if let Some(maintenance) = maintenance_runtime(config)? {
         runtime_config["maintenance"] = maintenance;
         runtime_config["images"]["maintenance"] = json!(

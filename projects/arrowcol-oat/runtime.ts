@@ -14,6 +14,7 @@ export interface RuntimeConfig {
   deltaRoot: string;
   images: { sqlserver: string; catalog: string; router: string; dataflow: string; maintenance?: string };
   maintenance?: { tables: string[]; operations: string[]; apply: boolean };
+  quiver?: boolean;
 }
 type Resource = Record<string, any>;
 export type Phase = 'identity' | 'foundation' | 'bootstrap' | 'workload';
@@ -25,9 +26,10 @@ export function validateRuntime(input: unknown, allowUnpublishedImages = false):
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('runtime config must be an object');
   const c = input as RuntimeConfig;
   const required = ['deltaRoot', 'images', 'namespace', 'oatRunId', 'workloadIdentityClientId', 'subscriptionId', 'stamp'];
-  if (required.some((key) => !Object.hasOwn(c, key)) || Object.keys(c).some((key) => ![...required, 'serviceAccount', 'maintenance'].includes(key))) {
+  if (required.some((key) => !Object.hasOwn(c, key)) || Object.keys(c).some((key) => ![...required, 'serviceAccount', 'maintenance', 'quiver'].includes(key))) {
     throw new Error('runtime config has missing or unknown fields');
   }
+  if (Object.hasOwn(c, 'quiver') && typeof c.quiver !== 'boolean') throw new Error('quiver must be an explicit boolean');
   if (typeof c.namespace !== 'string' || !dns.test(c.namespace) || c.namespace.startsWith('kube-') || ['default', 'azure-qap'].includes(c.namespace)) {
     throw new Error('use a dedicated OAT namespace (not the QAP namespace)');
   }
@@ -74,6 +76,13 @@ const security = {
   runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001,
   allowPrivilegeEscalation: false, capabilities: { drop: ['ALL'] },
 };
+
+export async function renderDataflow(quiver: boolean): Promise<string> {
+  const profile = quiver ? 'config.quiver.yaml' : 'config.yaml';
+  const dataflow = parse(await readFile(`projects/arrowcol-dataflow-rust/${profile}`, 'utf8'));
+  delete dataflow.policies.resources;
+  return stringify(dataflow);
+}
 const env = (name: string, value: string) => ({ name, value });
 const secretEnv = (name: string, secret: string, key: string) => ({
   name, valueFrom: { secretKeyRef: { name: secret, key } },
@@ -169,9 +178,7 @@ export async function renderRuntime(input: unknown, phase: Phase): Promise<Resou
     }];
     return [object('batch/v1', 'Job', 'arrowcol-migrate-v11', { spec: { backoffLimit: 0, activeDeadlineSeconds: 600, template } })];
   }
-  const dataflow = parse(await readFile('projects/arrowcol-dataflow-rust/config.yaml', 'utf8'));
-  // --num-cores owns the effective policy; no group/pipeline override may shadow it.
-  delete dataflow.policies.resources;
+  const dataflow = await renderDataflow(c.quiver === true);
   const router = parse(await readFile('projects/arrowcol-router-rust/config.docker.yaml', 'utf8'));
   router.auth.authenticator = 'dev_only_allow_all';
   router.sql_server.host = 'arrowcol-sql';
@@ -195,7 +202,7 @@ export async function renderRuntime(input: unknown, phase: Phase): Promise<Resou
     secretEnv('ARROWCOL_RESET_GENERATION', 'arrowcol-generation', 'generation'),
   ];
   const workload = [
-    object('v1', 'ConfigMap', 'arrowcol-config', { data: { 'dataflow.yaml': stringify(dataflow), 'router.yaml': stringify(router) } }),
+    object('v1', 'ConfigMap', 'arrowcol-config', { data: { 'dataflow.yaml': dataflow, 'router.yaml': stringify(router) } }),
     service('arrowcol-catalog', 8817), service('arrowcol-router', 50050),
     deployment('arrowcol-catalog', [{
       name: 'catalog', image: c.images.catalog, securityContext: security,
@@ -223,8 +230,10 @@ export async function renderRuntime(input: unknown, phase: Phase): Promise<Resou
       ports: [{ containerPort: 32010 }, { containerPort: 32011 }], resources: resources('2', '4Gi', '2', '6Gi'),
       startupProbe: { ...httpProbe('/readyz', 32011), failureThreshold: 120 },
       readinessProbe: httpProbe('/readyz', 32011), livenessProbe: httpProbe('/healthz', 32011),
-      volumeMounts: [mount('config', '/etc/oat'), mount('app', '/run/app'), mount('auth', '/run/auth')],
-    }], [{ name: 'config', configMap: { name: 'arrowcol-config' } }, secretVolume('app', 'arrowcol-sql-runtime'), secretVolume('auth', 'arrowcol-router-auth')], true),
+      volumeMounts: [mount('config', '/etc/oat'), mount('app', '/run/app'), mount('auth', '/run/auth'),
+        ...(c.quiver ? [mount('quiver', '/var/lib/arrowcol/quiver', false)] : [])],
+    }], [{ name: 'config', configMap: { name: 'arrowcol-config' } }, secretVolume('app', 'arrowcol-sql-runtime'), secretVolume('auth', 'arrowcol-router-auth'),
+      ...(c.quiver ? [{ name: 'quiver', emptyDir: {} }] : [])], true),
     deployment('arrowcol-router', [{
       name: 'router', image: c.images.router, securityContext: security,
       args: ['--config', '/etc/oat/router.yaml'],
@@ -405,7 +414,9 @@ export async function generatePrivateInputs(input: PrivateInputs): Promise<{
 }
 
 async function main(args: string[]): Promise<void> {
-  if (args[0] === 'prepare-secrets' && args.length === 3) {
+  if (args[0] === 'render-dataflow' && args.length === 3 && ['direct', 'quiver'].includes(args[1])) {
+    await writeFile(args[2], await renderDataflow(args[1] === 'quiver'), { flag: 'wx' });
+  } else if (args[0] === 'prepare-secrets' && args.length === 3) {
     await prepareSecrets(args[2], args[1]);
     console.log('Private runtime secret files ready; no cluster changes made.');
   } else if (args[0] === 'render' && args.length === 4) {
@@ -413,7 +424,7 @@ async function main(args: string[]): Promise<void> {
     await writeFile(args[3], JSON.stringify({ apiVersion: 'v1', kind: 'List', items }, null, 2));
     console.log(`Rendered ${items.length} resources; no cluster changes made.`);
   } else {
-    throw new Error('Usage: runtime.ts render <runtime.json> <identity|foundation|bootstrap|workload> <output.json> | prepare-secrets <supported-bootstrap.env> <private-directory>');
+    throw new Error('Usage: runtime.ts render <runtime.json> <identity|foundation|bootstrap|workload> <output.json> | render-dataflow <direct|quiver> <output.yaml> | prepare-secrets <supported-bootstrap.env> <private-directory>');
   }
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

@@ -355,12 +355,21 @@ mod commit_evidence_tests {
         let crossing = event(&config, 99, 101);
         let mut late = event(&config, 110, 199);
         late["delta_version"] = json!(8);
-        let logs = [log(&[crossing.clone(), crossing, late])];
+        let mut at_start = event(&config, 98, 99);
+        at_start["delta_version"] = json!(9);
+        let mut before_start = event(&config, 90, 98);
+        before_start["delta_version"] = json!(10);
+        let mut rewrite = log(&[event(&config, 110, 150)]);
+        rewrite.role = ComponentRole::Maintenance;
+        let logs = [
+            log(&[crossing.clone(), crossing, late, at_start, before_start]),
+            rewrite,
+        ];
         let evidence = durable_commit_evidence(&config, &logs, Some((100, 200)))?;
         let table = &evidence[&config.tables[0]];
         assert!(table["rows"].is_null());
-        assert_eq!(table["output_throughput"]["rows"], 10);
-        assert_eq!(table["output_throughput"]["rows_per_second"], 100.0);
+        assert_eq!(table["output_throughput"]["rows"], 20);
+        assert_eq!(table["output_throughput"]["rows_per_second"], 200.0);
         assert!(table["output_throughput"]["unique_delivered_rows"].is_null());
         let zero = durable_commit_evidence(&config, &[log(&[])], Some((100, 200)))?;
         assert_eq!(zero[&config.tables[0]]["output_throughput"]["rows"], 0);
