@@ -2,91 +2,102 @@ use collector_chain::dmv;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use std::cell::Cell;
-use std::future::Future;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::time::Instant;
 
 const MAX_SCHEDULE_TIMEOUT_SECS: u64 = 2_160;
 
 #[derive(Parser)]
 #[command(about = "Generate deterministic DMV Arrow batches and upload them to ArrowCol")]
 struct Args {
-    #[arg(long)]
+    #[command(flatten)]
+    tuning: dmv::client::Options,
+    #[arg(long, env = "ARROWCOL_CLIENT_ENDPOINT")]
     endpoint: String,
-    #[arg(long, default_value = "oat-benchmark")]
+    #[arg(long, env = "ARROWCOL_CLIENT_CLIENT_ID", default_value = "oat-benchmark")]
     client_id: String,
-    #[arg(long, default_value_t = 1_000)]
+    #[arg(long, env = "ARROWCOL_CLIENT_ROWS", default_value_t = 1_000)]
     rows: usize,
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, env = "ARROWCOL_CLIENT_CONCURRENCY", default_value_t = 4)]
     concurrency: usize,
-    #[arg(long)]
+    #[arg(long, env = "ARROWCOL_CLIENT_TABLE")]
     table: Option<String>,
-    #[arg(long)]
+    #[arg(long, env = "ARROWCOL_CLIENT_EDGE_SECRET_FILE")]
     edge_secret_file: Option<std::path::PathBuf>,
     /// Send repeated batches for this measured duration; zero keeps one-shot behavior.
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, env = "ARROWCOL_CLIENT_DURATION_SECS", default_value_t = 0)]
     duration_secs: u64,
     /// Continue sending during warm-up, but exclude this time from the reported rate.
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, env = "ARROWCOL_CLIENT_WARMUP_SECS", default_value_t = 0)]
     warmup_secs: u64,
     /// Shared future Unix-millisecond run start used to align all fleet clients.
-    #[arg(long)]
+    #[arg(long, env = "ARROWCOL_CLIENT_RUN_START_UNIX_MS")]
     run_start_unix_ms: Option<u64>,
     /// Run-scoped schedule file armed only after the complete client fleet is ready.
-    #[arg(long)]
+    #[arg(long, env = "ARROWCOL_CLIENT_SCHEDULE_FILE")]
     schedule_file: Option<std::path::PathBuf>,
     /// Maximum time to wait for the orchestrator to arm this client's schedule.
-    #[arg(long, default_value_t = 600)]
+    #[arg(long, env = "ARROWCOL_CLIENT_SCHEDULE_TIMEOUT_SECS", default_value_t = 600)]
     schedule_timeout_secs: u64,
     /// Emit 30-second throughput windows and the earliest <=5% stable horizon.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, env = "ARROWCOL_CLIENT_PILOT", default_value_t = false)]
     pilot: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let args = Args::parse();
+fn main() -> Result<()> {
+    let mut args = Args::parse();
+    args.tuning = args.tuning.resolve(args.rows, args.concurrency)?;
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(args.tuning.runtime_threads)
+        .enable_all()
+        .build()?
+        .block_on(run(args))
+}
+
+async fn run(args: Args) -> Result<()> {
     if args.duration_secs > 600 || args.warmup_secs > 300 {
         anyhow::bail!("duration_secs must be at most 600 and warmup_secs at most 300");
     }
     validate_schedule_timeout(args.schedule_timeout_secs)?;
+    if args.duration_secs > 0 && args.schedule_file.is_some() == args.run_start_unix_ms.is_some() {
+        anyhow::bail!("duration-based clients require exactly one of --schedule-file or --run-start-unix-ms");
+    }
+    if args.duration_secs == 0 && args.warmup_secs > 0 {
+        anyhow::bail!("warmup-secs requires a positive duration-secs");
+    }
     if args.pilot
         && (!(60..=600).contains(&args.duration_secs)
-            || args.duration_secs % 30 != 0
+            || !args.duration_secs.is_multiple_of(30)
             || args.warmup_secs + args.duration_secs > 600)
     {
         anyhow::bail!(
             "pilot mode requires a 30-second-multiple measurement from 60 to 600 seconds and a total warm-up plus measurement of at most 600 seconds"
         );
     }
-    let admissions = Cell::new((0_usize, 0_usize));
-    let mut admission_accounting_complete = true;
-    let send = || async {
-        let report = dmv::send_authenticated_report(
-            &args.endpoint,
-            &args.client_id,
-            args.table.as_deref(),
-            args.rows,
-            args.concurrency,
-            args.edge_secret_file.as_deref(),
-        )
-        .await?;
-        let (best_effort, durable) = admissions.get();
-        admissions.set((
-            best_effort
-                .checked_add(report.best_effort_streams)
-                .context("best-effort admission count overflow")?,
-            durable
-                .checked_add(report.durable_streams)
-                .context("durable admission count overflow")?,
-        ));
-        Ok::<_, anyhow::Error>(report.tables)
-    };
+    let options = args.tuning.clone().resolve(args.rows, args.concurrency)?;
+    println!("OAT_CLIENT_EFFECTIVE_CONFIG {}", serde_json::to_string(&options)?);
+    let client = dmv::client::PreparedClient::prepare(
+        &args.endpoint,
+        &args.client_id,
+        args.table.as_deref(),
+        args.edge_secret_file.as_deref(),
+        options,
+    )
+    .await?;
+    println!("OAT_CLIENT_METRICS {}", client.metrics("prepared"));
+    let result = run_prepared(&args, &client).await;
+    if result.is_err() {
+        eprintln!("OAT_CLIENT_METRICS {}", client.metrics("failed"));
+    }
+    result
+}
+
+async fn run_prepared(args: &Args, client: &std::sync::Arc<dmv::client::PreparedClient>) -> Result<()> {
     let table_count = if args.duration_secs == 0 {
-        send().await?
+        client.send_once().await?;
+        client.table_count
     } else {
-        let preflight_table_count = send().await?;
+        client.send_round().await?;
+        let preflight_table_count = client.table_count;
         let run_start_unix_ms = match (&args.schedule_file, args.run_start_unix_ms) {
             (Some(_), Some(_)) => anyhow::bail!("use either --schedule-file or --run-start-unix-ms, not both"),
             (Some(schedule_file), None) => {
@@ -113,92 +124,41 @@ async fn main() -> Result<()> {
             .checked_add(args.duration_secs.saturating_mul(1_000))
             .ok_or_else(|| anyhow::anyhow!("shared measurement end timestamp overflow"))?;
         wait_until_unix_ms(run_start_unix_ms, unix_time_ms).await?;
-        admission_accounting_complete = !warmup_until(measurement_window_start_unix_ms, &send).await?;
-        let measurement_started_unix_ms = unix_time_ms()?;
-        if measurement_started_unix_ms.abs_diff(measurement_window_start_unix_ms) > 250 {
-            anyhow::bail!(
-                "client did not start within 250ms of the shared measurement interval: expected={measurement_window_start_unix_ms}, actual={measurement_started_unix_ms}"
-            );
-        }
-        let measured_at = Instant::now()
-            .checked_sub(Duration::from_millis(
-                measurement_started_unix_ms.saturating_sub(measurement_window_start_unix_ms),
-            ))
-            .ok_or_else(|| anyhow::anyhow!("measurement start is out of range"))?;
-        let deadline = measured_at
-            .checked_add(Duration::from_secs(args.duration_secs))
-            .ok_or_else(|| anyhow::anyhow!("measurement deadline is out of range"))?;
-        let mut measured_rows = 0_u64;
-        let mut pilot_window_rows = 0_u64;
-        let mut pilot_window_index = 0_u64;
+        let report = client
+            .run_continuous(measurement_window_start_unix_ms, measurement_window_end_unix_ms)
+            .await?;
+        let measured_rows = report.completed_rows;
+        let measurement_started_unix_ms = report.measurement_started_unix_ms;
         let mut pilot_rates = Vec::new();
-        loop {
-            let count = send().await?;
-            let completed_at = Instant::now();
-            let batch_rows = u64::try_from(args.rows)?
-                .checked_mul(u64::try_from(count)?)
-                .ok_or_else(|| anyhow::anyhow!("measured batch row count overflow"))?;
-            if completed_at >= measured_at && completed_at < deadline {
-                measured_rows = measured_rows
-                    .checked_add(batch_rows)
-                    .ok_or_else(|| anyhow::anyhow!("measured row count overflow"))?;
-                if args.pilot {
-                    let elapsed = completed_at.duration_since(measured_at).as_secs();
-                    let completed_window = elapsed / 30;
-                    while pilot_window_index < completed_window {
-                        record_pilot_window(
-                            pilot_window_index,
-                            pilot_window_rows,
-                            measurement_window_start_unix_ms,
-                            &mut pilot_rates,
-                        );
-                        pilot_window_index += 1;
-                        pilot_window_rows = 0;
-                    }
-                    pilot_window_rows = pilot_window_rows
-                        .checked_add(batch_rows)
-                        .ok_or_else(|| anyhow::anyhow!("pilot window row count overflow"))?;
-                }
+        if args.pilot {
+            for (index, rows) in report.pilot_window_rows.into_iter().enumerate() {
+                record_pilot_window(index as u64, rows, measurement_window_start_unix_ms, &mut pilot_rates);
             }
-            if completed_at >= deadline {
-                if args.pilot {
-                    let window_count = args.duration_secs / 30;
-                    while pilot_window_index < window_count {
-                        record_pilot_window(
-                            pilot_window_index,
-                            pilot_window_rows,
-                            measurement_window_start_unix_ms,
-                            &mut pilot_rates,
-                        );
-                        pilot_window_index += 1;
-                        pilot_window_rows = 0;
-                    }
-                    let stable_from_seconds = stable_window_horizon(&pilot_rates)
-                        .map_or_else(|| "none".to_owned(), |seconds| seconds.to_string());
-                    println!("pilot_stable_from_seconds={stable_from_seconds}");
-                }
-                println!(
-                    "measured_rows={measured_rows} measured_seconds={:.3} rows_per_second={:.3} measurement_window_start_unix_ms={measurement_window_start_unix_ms} measurement_window_end_unix_ms={measurement_window_end_unix_ms} measurement_started_unix_ms={measurement_started_unix_ms}",
-                    args.duration_secs as f64,
-                    measured_rows as f64 / args.duration_secs as f64,
-                );
-                break preflight_table_count;
-            }
+            let stable_from_seconds =
+                stable_window_horizon(&pilot_rates).map_or_else(|| "none".to_owned(), |seconds| seconds.to_string());
+            println!("pilot_stable_from_seconds={stable_from_seconds}");
         }
+        println!(
+            "measured_rows={measured_rows} measured_seconds={:.3} rows_per_second={:.3} measurement_window_start_unix_ms={measurement_window_start_unix_ms} measurement_window_end_unix_ms={measurement_window_end_unix_ms} measurement_started_unix_ms={measurement_started_unix_ms}",
+            args.duration_secs as f64,
+            measured_rows as f64 / args.duration_secs as f64,
+        );
+        preflight_table_count
     };
-    let (best_effort_streams, durable_streams) = admissions.get();
+    let (best_effort_streams, durable_streams) = client.admission_counts();
     println!(
         "OAT_COLLECTOR_COMPLETION {}",
         serde_json::json!({
             "best_effort_streams": best_effort_streams,
             "durable_streams": durable_streams,
-            "admission_accounting_complete": admission_accounting_complete,
+            "admission_accounting_complete": true,
             "completed_at_unix_ms": unix_time_ms()?,
         })
     );
+    println!("OAT_CLIENT_METRICS {}", client.metrics("completed"));
     println!(
-        "uploaded {table_count} DMV tables with {} rows each using concurrency {}",
-        args.rows, args.concurrency
+        "prepared {table_count} DMV tables; workers={} streams_per_worker={} batch_rows={}",
+        client.options.workers, client.options.streams_per_worker, client.options.batch_rows
     );
     Ok(())
 }
@@ -291,42 +251,9 @@ async fn wait_until_unix_ms(deadline: u64, mut now: impl FnMut() -> Result<u64>)
     }
 }
 
-/// Reports whether the boundary cancelled an upload, leaving admission counts incomplete.
-async fn warmup_until<F, Fut>(measurement_start_unix_ms: u64, mut send: F) -> Result<bool>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<usize>>,
-{
-    loop {
-        if unix_time_ms()? >= measurement_start_unix_ms {
-            return Ok(false);
-        }
-        tokio::select! {
-            biased;
-            result = send() => {
-                result?;
-                if unix_time_ms()? >= measurement_start_unix_ms {
-                    return Ok(false);
-                }
-            }
-            // Dropping this owned DoPut future cancels the streams; no upload is detached.
-            result = wait_until_unix_ms(measurement_start_unix_ms, unix_time_ms) => {
-                result?;
-                return Ok(true);
-            },
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        MAX_SCHEDULE_TIMEOUT_SECS, stable_window_horizon, unix_time_ms, validate_schedule_timeout, wait_until_unix_ms,
-        warmup_until,
-    };
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::time::Duration;
+    use super::{MAX_SCHEDULE_TIMEOUT_SECS, stable_window_horizon, validate_schedule_timeout, wait_until_unix_ms};
 
     #[tokio::test]
     async fn shared_start_wait_rechecks_backward_clock_steps() -> anyhow::Result<()> {
@@ -362,113 +289,5 @@ mod tests {
         assert!(validate_schedule_timeout(MAX_SCHEDULE_TIMEOUT_SECS).is_ok());
         assert!(validate_schedule_timeout(0).is_err());
         assert!(validate_schedule_timeout(MAX_SCHEDULE_TIMEOUT_SECS + 1).is_err());
-    }
-
-    #[tokio::test]
-    async fn warmup_cancellation_marks_partial_concurrent_accounting_incomplete() -> anyhow::Result<()> {
-        struct DropFlag(Arc<AtomicBool>);
-
-        impl Drop for DropFlag {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
-
-        let started = Arc::new(AtomicBool::new(false));
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let completed = Arc::new(AtomicBool::new(false));
-        let observed_streams = Arc::new(AtomicUsize::new(0));
-        let reported_streams = Arc::new(AtomicUsize::new(0));
-        let deadline = unix_time_ms()? + 40;
-        let cancelled_upload = warmup_until(deadline, {
-            let started = Arc::clone(&started);
-            let cancelled = Arc::clone(&cancelled);
-            let completed = Arc::clone(&completed);
-            let observed_streams = Arc::clone(&observed_streams);
-            let reported_streams = Arc::clone(&reported_streams);
-            move || {
-                let started = Arc::clone(&started);
-                let cancelled = Arc::clone(&cancelled);
-                let completed = Arc::clone(&completed);
-                let observed_streams = Arc::clone(&observed_streams);
-                let reported_streams = Arc::clone(&reported_streams);
-                async move {
-                    started.store(true, Ordering::SeqCst);
-                    tokio::join!(
-                        async {
-                            observed_streams.fetch_add(1, Ordering::SeqCst);
-                        },
-                        async {
-                            let _drop_flag = DropFlag(cancelled);
-                            std::future::pending::<()>().await;
-                        },
-                    );
-                    reported_streams.fetch_add(observed_streams.load(Ordering::SeqCst), Ordering::SeqCst);
-                    completed.store(true, Ordering::SeqCst);
-                    Ok(2)
-                }
-            }
-        })
-        .await?;
-
-        assert!(started.load(Ordering::SeqCst));
-        assert!(cancelled.load(Ordering::SeqCst));
-        assert!(!completed.load(Ordering::SeqCst));
-        assert_eq!(observed_streams.load(Ordering::SeqCst), 1);
-        assert_eq!(reported_streams.load(Ordering::SeqCst), 0);
-        assert!(cancelled_upload);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn warmup_runs_completed_sends_until_the_boundary() -> anyhow::Result<()> {
-        let sends = Arc::new(AtomicUsize::new(0));
-        let deadline = unix_time_ms()? + 60;
-        warmup_until(deadline, {
-            let sends = Arc::clone(&sends);
-            move || {
-                let sends = Arc::clone(&sends);
-                async move {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                    sends.fetch_add(1, Ordering::SeqCst);
-                    Ok(1)
-                }
-            }
-        })
-        .await?;
-
-        assert!(sends.load(Ordering::SeqCst) >= 1);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn warmup_propagates_send_errors() -> anyhow::Result<()> {
-        let error = match warmup_until(unix_time_ms()? + 1_000, || async {
-            anyhow::bail!("warm-up upload failed");
-        })
-        .await
-        {
-            Err(error) => error,
-            Ok(_) => anyhow::bail!("warm-up send unexpectedly succeeded"),
-        };
-
-        assert_eq!(error.to_string(), "warm-up upload failed");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn zero_warmup_does_not_start_a_send() -> anyhow::Result<()> {
-        let sends = Arc::new(AtomicUsize::new(0));
-        warmup_until(unix_time_ms()?, {
-            let sends = Arc::clone(&sends);
-            move || {
-                sends.fetch_add(1, Ordering::SeqCst);
-                async { Ok(1) }
-            }
-        })
-        .await?;
-
-        assert_eq!(sends.load(Ordering::SeqCst), 0);
-        Ok(())
     }
 }

@@ -18,14 +18,17 @@ use arrowcol_flight::{DeliveryGuarantee, PutResultMetadata, decode_ddl_completio
 const OAT_RUN_ID_ENV: &str = "ARROWCOL_OAT_RUN_ID";
 const OAT_RUN_ID_HEADER: &str = "x-arrowcol-oat-run-id";
 use arrowcol_protocol::{
-    ClaimedSchemaFingerprint, ImplementationPool, IngestMetadata, ProtocolVersion, TableIdentity, UnixMillis,
-    fingerprint_schema,
+    ClaimedSchemaFingerprint, ImplementationPool, IngestMetadata, ProtocolVersion, SchemaFingerprint, TableIdentity,
+    UnixMillis, fingerprint_schema,
 };
 use arrowcol_router_rust::{EdgeRequestSigner, insert_edge_signature_headers, read_secret_file};
 use futures::{StreamExt, TryStreamExt, stream};
 use prost::Message as _;
 use tonic::Request;
 use tonic::transport::{Channel, Endpoint};
+
+#[path = "dmv_client.rs"]
+pub mod client;
 
 const SCHEMA_DDL: &str = include_str!("../../../projects/loadtest/schemas/sqlserver.sql");
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
@@ -34,6 +37,7 @@ pub struct DmvTable {
     ddl: String,
     identity: TableIdentity,
     schema: SchemaRef,
+    fingerprint: SchemaFingerprint,
 }
 
 impl DmvTable {
@@ -77,10 +81,12 @@ pub fn tables() -> Result<Vec<DmvTable>> {
             .iter()
             .map(|field| field.to_arrow())
             .collect::<Result<Vec<_>, _>>()?;
+        let schema = Arc::new(Schema::new(fields));
         tables.push(DmvTable {
             ddl: statement.to_owned(),
             identity: create.identity().clone(),
-            schema: Arc::new(Schema::new(fields)),
+            fingerprint: fingerprint_schema(schema.as_ref()),
+            schema,
         });
     }
     Ok(tables)
@@ -192,6 +198,8 @@ pub struct UploadReport {
     pub best_effort_streams: usize,
     /// Streams completed with a local durable-buffer acknowledgement.
     pub durable_streams: usize,
+    /// Rows whose streams completed with a validated admission response.
+    pub completed_rows: u64,
 }
 
 /// Uploads DMV data and preserves the actual admission guarantees.
@@ -297,6 +305,7 @@ async fn send_tables_report(
     .await?;
     Ok(UploadReport {
         tables: count,
+        completed_rows: rows as u64 * count as u64,
         best_effort_streams: admissions
             .iter()
             .filter(|value| **value == DeliveryGuarantee::BestEffort)
@@ -321,7 +330,7 @@ fn request_metadata<T>(request: &mut Request<T>, table: &DmvTable, signer: Optio
         ProtocolVersion::CURRENT,
         ImplementationPool::Dataflow,
         table.identity.clone(),
-        ClaimedSchemaFingerprint::new(fingerprint_schema(table.schema.as_ref())),
+        ClaimedSchemaFingerprint::new(table.fingerprint),
     );
     let mut headers = http::HeaderMap::new();
     for (key, value) in metadata.to_ascii_pairs() {
