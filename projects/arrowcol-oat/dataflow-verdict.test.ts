@@ -34,6 +34,33 @@ function row(overrides: Record<string, unknown> = {}) {
 }
 const ok = (stdout: string) => ({ returncode: 0, stdout, stderr: '' });
 
+function outputEvidence() {
+  return {
+    version: 1, downstream_status: 'observed_or_not_attempted',
+    commit_window_output_throughput: {
+      scope: 'new_ingestion_commits_finished_in_half_open_shared_window_not_client_cohort',
+      clock: 'collector_system_unix_ms_shared_schedule_clock_skew_not_measured',
+      warmup_backlog: 'included_when_commit_finishes_in_window',
+      rewrite_commits: 'excluded_by_ingestion_only_producer_capability',
+      unique_delivered_rows: null, complete_delivery_established: false,
+      measurement_start_unix_ms: 1000, measurement_end_unix_ms: 2000, window_seconds: 1,
+      rows: 10, files: 1, input_bytes: 100, parquet_bytes: 50, commits: 1, rows_per_second: 10,
+      bytes_per_row: 5 as number | null, compression_ratio: 2 as number | null,
+      compression_ratio_numerator: 'collector_reported_input_bytes',
+      compression_ratio_denominator: 'committed_parquet_file_bytes_including_metadata',
+      commit_latency_seconds: {
+        p50: 0.1 as number | null, p95: 0.2 as number | null, p99: 0.3 as number | null,
+        samples: 1, scope: 'commit_retry_and_sync_not_encoding_or_admission',
+      },
+    },
+    processes: [{
+      component: 'collector', image: 'dataflow:source-pinned', image_id: `sha256:${'a'.repeat(64)}`,
+      source_revision: sha, log_complete: true, effective_config_source: 'consumer_startup_readback',
+      effective_config: { commit_telemetry: { schema_version: 1, scope: 'new_ingestion_addfiles_after_sync', clock: 'system_unix_ms' } },
+    }],
+  };
+}
+
 function resultParquet(mode: 'local' | 'aks', revision = sha): Uint8Array {
   const table = tableFromArrays({
     schema_version: [2], run_id: [cell], mode: [mode], stamp: ['00000'],
@@ -110,8 +137,8 @@ test('network summary retains the explicit accepted-risk warning and preflight w
 
 test('v3 preserves local degraded evidence without relaxing AKS or pinning gates', () => {
   const degraded = {
-    schema_version: 3, mode: 'local', qap_completion_percent: null,
-    evidence_json: JSON.stringify({ version: 1, downstream_status: 'unavailable' }),
+    schema_version: 3, mode: 'local', measure_seconds: 1, qap_completion_percent: null,
+    evidence_json: JSON.stringify({ ...outputEvidence(), downstream_status: 'unavailable' }),
   };
   const local = evaluateDataFlow(status, [row(degraded)], sha, 'local', config);
   assert.equal(local.pass, true);
@@ -119,6 +146,38 @@ test('v3 preserves local degraded evidence without relaxing AKS or pinning gates
   assert.equal(evaluateDataFlow(status, [row({ ...degraded, pinning_ok: false })], sha, 'local', config).pass, false);
   assert.equal(evaluateDataFlow(status, [row({ ...degraded, mode: 'aks' })], sha, 'aks', config).pass, false);
   assert.equal(evaluateDataFlow(status, [row({ ...degraded, evidence_json: null })], sha, 'local', config).pass, false);
+});
+
+test('v3 requires evidenced collector output, but known zero commits remain valid without delivery claims', () => {
+  const evaluate = (evidence: unknown) => evaluateDataFlow(status,
+    [row({ schema_version: 3, measure_seconds: 1, evidence_json: JSON.stringify(evidence) })], sha, 'aks', config);
+  assert.equal(evaluate(outputEvidence()).pass, true);
+  const zero = outputEvidence();
+  Object.assign(zero.commit_window_output_throughput, {
+    rows: 0, files: 0, input_bytes: 0, parquet_bytes: 0, commits: 0, rows_per_second: 0,
+    bytes_per_row: null, compression_ratio: null,
+    commit_latency_seconds: { p50: null, p95: null, p99: null, samples: 0, scope: 'commit_retry_and_sync_not_encoding_or_admission' },
+  });
+  assert.equal(evaluate(zero).pass, true);
+  assert.match(formatDataFlow(evaluate(zero)), /known-zero.*not a delivery\/drain proof/);
+  for (const change of [
+    (value: ReturnType<typeof outputEvidence>) => { value.processes = []; },
+    (value: ReturnType<typeof outputEvidence>) => { value.processes[0].log_complete = false; },
+    (value: ReturnType<typeof outputEvidence>) => { value.processes[0].source_revision = 'b'.repeat(40); },
+    (value: ReturnType<typeof outputEvidence>) => { value.processes[0].effective_config.commit_telemetry.scope = 'all_rewrites'; },
+    (value: ReturnType<typeof outputEvidence>) => { value.commit_window_output_throughput.rows_per_second = 100; },
+    (value: ReturnType<typeof outputEvidence>) => { value.commit_window_output_throughput.measurement_end_unix_ms = 2001; },
+    (value: ReturnType<typeof outputEvidence>) => { value.commit_window_output_throughput.compression_ratio = 10; },
+    (value: ReturnType<typeof outputEvidence>) => { value.commit_window_output_throughput.commit_latency_seconds.p95 = 0.01; },
+  ]) {
+    const invalid = outputEvidence(); change(invalid);
+    assert.equal(evaluate(invalid).pass, false);
+  }
+  const unavailable = { ...outputEvidence(), commit_window_output_throughput: {
+    rows: null, rows_per_second: null, unavailable_reason: 'collector_commit_log_incomplete',
+  } };
+  assert.match(evaluate(unavailable).reasons.join(), /output telemetry unavailable/);
+  assert.equal(evaluate({ version: 1 }).pass, false);
 });
 
 test('run reporting returns failure exit status for a runner exception and success only after evidence passes', async (t) => {

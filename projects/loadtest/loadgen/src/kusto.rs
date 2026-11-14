@@ -252,7 +252,7 @@ impl KustoClient {
             }),
         )?;
         self.queries_completed.fetch_add(1, Ordering::Relaxed);
-        if matches!(status.as_u16(), 502 | 503 | 504) {
+        if matches!(status.as_u16(), 502..=504) {
             return Err(anyhow::Error::new(QapUnavailable).context(format!("Kusto HTTP {status}")));
         }
         ensure!(status.is_success(), "Kusto HTTP {status}: {public}");

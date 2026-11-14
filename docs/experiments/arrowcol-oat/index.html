@@ -85,8 +85,8 @@
   <section class="stats" aria-label="Benchmark summary">
     <div class="stat"><span class="stat-label">Rows</span><strong id="stat-rows" class="stat-value">—</strong></div>
     <div class="stat"><span class="stat-label">Configurations</span><strong id="stat-configs" class="stat-value">—</strong></div>
-    <div class="stat"><span class="stat-label">Peak admission rate (filtered)</span><strong id="stat-throughput" class="stat-value">—</strong></div>
-    <div class="stat"><span class="stat-label">Median admission duration (filtered)</span><strong id="stat-latency" class="stat-value">—</strong></div>
+    <div class="stat"><span class="stat-label">Peak commit-window output (filtered)</span><strong id="stat-throughput" class="stat-value">—</strong></div>
+    <div class="stat"><span class="stat-label">Median per-result commit p95 (filtered)</span><strong id="stat-latency" class="stat-value">—</strong></div>
   </section>
   <section class="filters" aria-labelledby="filter-title">
     <div class="filter-heading"><h2 id="filter-title">Explore results</h2><button id="clear" type="button">Clear all</button></div>
@@ -102,13 +102,14 @@
         <th data-column="mode" scope="col">Mode</th><th data-column="stamp" scope="col">Stamp</th><th data-column="experiment" scope="col">Experiment</th><th data-column="status" scope="col">Status</th><th data-column="pinning_ok" scope="col">Pinning</th>
         <th data-result="run_id" scope="col">Run</th><th data-result="replicas" scope="col">ArrowCol replicas</th><th data-result="dfe_worker_concurrency" scope="col">DFE workers</th><th data-result="table" scope="col">Pinned table</th>
         <th data-column="table_owner" scope="col">Table owner</th><th data-column="clients" scope="col">Clients</th>
-        <th data-result="rows" scope="col">Rows</th><th data-result="duration_ms" scope="col">Duration (ms)</th><th data-result="rows_per_second" scope="col">Rows/s</th><th data-result="cpu_millicores" scope="col">CPU (mCPU)</th><th data-result="memory_bytes" scope="col">Memory (MiB)</th><th data-result="qap_observation_complete" scope="col">QAP fields complete</th><th data-result="qap_observed_tables" scope="col">QAP tables</th><th data-result="qap_completion_percent" scope="col">QAP complete (%)</th><th data-result="qap_pending_artifacts" scope="col">Pending artifacts</th><th data-result="qap_cached_bytes" scope="col">Cached (MiB)</th><th data-result="qap_unhealthy_catalogs" scope="col">Unhealthy catalogs</th><th data-result="qap_lag_seconds" scope="col">QAP lag (s)</th>
+        <th data-result="committed_rows_per_second" scope="col">Commit-window rows/s</th><th data-result="committed_rows" scope="col">Committed rows</th><th data-result="committed_files" scope="col">Committed files</th><th data-result="parquet_bytes" scope="col">Parquet (MiB)</th><th data-result="parquet_bytes_per_row" scope="col">Parquet bytes/row</th><th data-result="compression_ratio" scope="col">Input/Parquet ratio</th><th data-result="commit_p50_ms" scope="col">Commit p50 (ms)</th><th data-result="commit_p95_ms" scope="col">Commit p95 (ms)</th><th data-result="commit_p99_ms" scope="col">Commit p99 (ms)</th>
+        <th data-result="rows" scope="col">Admission rows</th><th data-result="duration_ms" scope="col">Admission duration (ms)</th><th data-result="rows_per_second" scope="col">Admission rows/s</th><th data-result="cpu_millicores" scope="col">CPU (mCPU)</th><th data-result="memory_bytes" scope="col">Memory (MiB)</th><th data-result="qap_observation_complete" scope="col">QAP fields complete</th><th data-result="qap_observed_tables" scope="col">QAP tables</th><th data-result="qap_completion_percent" scope="col">QAP complete (%)</th><th data-result="qap_pending_artifacts" scope="col">Pending artifacts</th><th data-result="qap_cached_bytes" scope="col">Cached (MiB)</th><th data-result="qap_unhealthy_catalogs" scope="col">Unhealthy catalogs</th><th data-result="qap_lag_seconds" scope="col">QAP lag (s)</th>
         <th data-column="host" scope="col">Host</th><th data-column="started_at" scope="col">Started (UTC)</th><th data-column="measure_seconds" scope="col">Measure (s)</th><th data-column="tables" scope="col">Tables</th><th data-column="git_sha" scope="col">Git SHA</th><th scope="col">Tunables</th>
       </tr></thead>
-      <tbody id="results"><tr><td class="empty" colspan="29">Loading…</td></tr></tbody>
+      <tbody id="results"><tr><td class="empty" colspan="38">Loading…</td></tr></tbody>
     </table>
   </div>
-  <p class="note">Summary values and heatmap ranges use all rows matching the current filters, including failed and pinning-violation rows; they are not success-only performance claims. Throughput and duration measure client admission, not durable Delta/QAP publication. Missing metrics appear as —, not zero. “QAP fields complete” is 1 only when all required telemetry fields were observed; it is separate from QAP completion percentage.</p>
+  <p class="note">Summary values and heatmap ranges use all filtered rows, including failed and pinning-violation rows. Primary output counts synced ingestion commits finished in the shared half-open window, including warm-up backlog, not unique client delivery or OPTIMIZE rewrites. Compression is collector input bytes / committed Parquet bytes including metadata. Commit latency covers commit/retry/sync only; the summary is a median of per-result p95s, not a pooled percentile. Admission remains separate. Missing and historical v2 output metrics appear as —, never admission backfills. “QAP fields complete” is separate from QAP completion percentage.</p>
   <p class="note">The static site and its Parquet file are anonymously readable. Only publish approved, nonsensitive benchmark summaries here; never include credentials, raw payloads, or sensitive identifiers. The viewer loads <code>results.parquet</code> from this same origin, so no cross-origin request or CORS rule is required.</p>
   <section class="architecture" aria-labelledby="architecture-title">
     <h2 id="architecture-title">Benchmark architecture</h2>
@@ -165,7 +166,10 @@ const resultParts = {
   rows: [2], duration_ms: [2], rows_per_second: [2], cpu_millicores: [3, 4],
   memory_bytes: [3, 4], qap_observation_complete: [5], qap_observed_tables: [5],
   qap_completion_percent: [5], qap_pending_artifacts: [5], qap_cached_bytes: [5],
-  qap_unhealthy_catalogs: [5], qap_lag_seconds: [5]
+  qap_unhealthy_catalogs: [5], qap_lag_seconds: [5],
+  committed_rows_per_second: [4, 6], committed_rows: [4, 6], committed_files: [4, 6],
+  parquet_bytes: [4, 6], parquet_bytes_per_row: [4, 6], compression_ratio: [4],
+  commit_p50_ms: [4, 6], commit_p95_ms: [4, 6], commit_p99_ms: [4, 6]
 };
 const statusNode = document.querySelector('#status');
 const bodyNode = document.querySelector('#results');
@@ -242,6 +246,37 @@ function median(values) {
   const middle = Math.floor(sorted.length / 2);
   return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
 }
+const outputCache = new WeakMap();
+function outputMetrics(row) {
+  if (outputCache.has(row)) return outputCache.get(row);
+  let metrics = {};
+  try {
+    const evidence = number(row.schema_version) === 3 ? JSON.parse(row.evidence_json) : null;
+    const output = evidence?.commit_window_output_throughput;
+    const collectors = evidence?.processes?.filter(process => process?.component === 'collector');
+    const proven = collectors?.length && collectors.every(process => process.log_complete === true &&
+      process.effective_config_source === 'consumer_startup_readback' &&
+      /(?:^|@|:\/\/)sha256:[a-f0-9]{64}$/.test(process.image_id || '') &&
+      process.effective_config?.commit_telemetry?.schema_version === 1 &&
+      process.effective_config.commit_telemetry.scope === 'new_ingestion_addfiles_after_sync' &&
+      process.effective_config.commit_telemetry.clock === 'system_unix_ms');
+    if (evidence?.version === 1 && proven && output &&
+        output.scope === 'new_ingestion_commits_finished_in_half_open_shared_window_not_client_cohort' &&
+        !output.unavailable_reason) {
+      const metric = value => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+      const millis = value => metric(value) === null ? null : value * 1000;
+      metrics = { committed_rows_per_second: metric(output.rows_per_second), committed_rows: metric(output.rows),
+        committed_files: metric(output.files), parquet_bytes: metric(output.parquet_bytes),
+        parquet_bytes_per_row: metric(output.bytes_per_row), compression_ratio: metric(output.compression_ratio),
+        commit_p50_ms: millis(output.commit_latency_seconds?.p50), commit_p95_ms: millis(output.commit_latency_seconds?.p95),
+        commit_p99_ms: millis(output.commit_latency_seconds?.p99) };
+    }
+  } catch { metrics = {}; }
+  outputCache.set(row, metrics);
+  return metrics;
+}
+const outputColumns = new Set(['committed_rows_per_second', 'committed_rows', 'committed_files', 'parquet_bytes',
+  'parquet_bytes_per_row', 'compression_ratio', 'commit_p50_ms', 'commit_p95_ms', 'commit_p99_ms']);
 const facets = [
   ['mode', 'Mode'], ['stamp', 'Stamp'], ['experiment', 'Experiment'],
   ['arrowcols', 'ArrowCols'], ['dfe_worker_concurrency', 'DFE concurrency'],
@@ -252,7 +287,8 @@ const state = { filters: {}, search: '', sort: 'replicas', direction: 'asc' };
 let allRows = [];
 let loadMessage = 'No published results are available yet.';
 const missing = 'n';
-const valueFor = (row, key) => key === 'replicas' || key === 'arrowcols' ? (row.arrowcols ?? row.replicas) : row[key];
+const valueFor = (row, key) => outputColumns.has(key) ? (outputMetrics(row)[key] ?? null) :
+  key === 'replicas' || key === 'arrowcols' ? (row.arrowcols ?? row.replicas) : row[key];
 const facetValue = value => value === null || value === undefined ? missing : `v${String(value)}`;
 const facetLabel = value => value === missing ? 'Not available' : value.slice(1);
 
@@ -320,13 +356,14 @@ function render() {
   renderFacets();
   const rows = allRows.filter(row => matches(row)).sort(compareRows);
   const values = key => rows.map(row => number(valueFor(row, key))).filter(value => value !== null);
-  const throughput = values('rows_per_second');
+  const throughput = values('committed_rows_per_second');
+  const commitP95 = values('commit_p95_ms');
   const durations = values('duration_ms');
   const configs = new Set(rows.map(row => JSON.stringify([row.mode, row.stamp, row.experiment, valueFor(row, 'arrowcols'), row.dfe_worker_concurrency, row.clients, row.tables, row.tunables_json], (_, value) => typeof value === 'bigint' ? value.toString() : value)));
   document.querySelector('#stat-rows').textContent = numberFormat.format(rows.length);
   document.querySelector('#stat-configs').textContent = numberFormat.format(configs.size);
   document.querySelector('#stat-throughput').textContent = throughput.length ? `${show(throughput.reduce((best, value) => Math.max(best, value), -Infinity))} rows/s` : '—';
-  document.querySelector('#stat-latency').textContent = durations.length ? `${show(median(durations))} ms` : '—';
+  document.querySelector('#stat-latency').textContent = commitP95.length ? `${show(median(commitP95))} ms` : '—';
   document.querySelector('#filtered-count').textContent = `${numberFormat.format(rows.length)} of ${numberFormat.format(allRows.length)} rows${rows.length > MAX_RENDERED_ROWS ? ` (showing first ${MAX_RENDERED_ROWS}; filter to narrow)` : ''}`;
   for (const header of document.querySelectorAll('.results-table th[data-result], .results-table th[data-column]')) {
     const key = header.dataset.column || header.dataset.result;
@@ -334,11 +371,14 @@ function render() {
     else header.removeAttribute('aria-sort');
   }
   if (!rows.length) {
-    bodyNode.innerHTML = `<tr><td class="empty" colspan="29">${safeText(allRows.length ? 'No results match these filters. Try clearing or changing them.' : loadMessage)}</td></tr>`;
+    bodyNode.innerHTML = `<tr><td class="empty" colspan="38">${safeText(allRows.length ? 'No results match these filters. Try clearing or changing them.' : loadMessage)}</td></tr>`;
     return;
   }
   const heatColumns = {
-    duration_ms: [durations, true, 1], rows_per_second: [throughput, false, 1],
+    duration_ms: [durations, true, 1], rows_per_second: [values('rows_per_second'), false, 1],
+    committed_rows_per_second: [throughput, false, 1], parquet_bytes: [values('parquet_bytes').map(v => v / 1048576), false, 1048576],
+    parquet_bytes_per_row: [values('parquet_bytes_per_row'), true, 1], compression_ratio: [values('compression_ratio'), false, 1],
+    commit_p50_ms: [values('commit_p50_ms'), true, 1], commit_p95_ms: [commitP95, true, 1], commit_p99_ms: [values('commit_p99_ms'), true, 1],
     cpu_millicores: [values('cpu_millicores'), true, 1], memory_bytes: [values('memory_bytes').map(v => v / 1048576), true, 1048576],
     qap_completion_percent: [values('qap_completion_percent'), false, 1], qap_pending_artifacts: [values('qap_pending_artifacts'), true, 1],
     qap_cached_bytes: [values('qap_cached_bytes').map(v => v / 1048576), false, 1048576],
@@ -361,6 +401,7 @@ function render() {
       <td><span class="badge ${statusClass}">${safeText(row.status)}</span></td><td><span class="badge ${row.pinning_ok === false ? 'badge-alert' : row.pinning_ok === true ? 'badge-ok' : ''}">${pinning}</span></td>
       <td class="key">${safeText(row.run_id)}</td>${numericCell(row, 'replicas', 0)}${numericCell(row, 'dfe_worker_concurrency', 0)}
       <td class="key">${safeText(row.table)}</td><td>${safeText(row.table_owner)}</td>${numericCell(row, 'clients', 0)}
+      ${numericCell(row, 'committed_rows_per_second')}${numericCell(row, 'committed_rows', 0)}${numericCell(row, 'committed_files', 0)}${numericCell(row, 'parquet_bytes')}${numericCell(row, 'parquet_bytes_per_row')}${numericCell(row, 'compression_ratio')}${numericCell(row, 'commit_p50_ms')}${numericCell(row, 'commit_p95_ms')}${numericCell(row, 'commit_p99_ms')}
       ${numericCell(row, 'rows', 0)}${numericCell(row, 'duration_ms')}${numericCell(row, 'rows_per_second')}${numericCell(row, 'cpu_millicores')}${numericCell(row, 'memory_bytes')}
       ${numericCell(row, 'qap_observation_complete', 0)}${numericCell(row, 'qap_observed_tables', 0)}${numericCell(row, 'qap_completion_percent')}${numericCell(row, 'qap_pending_artifacts', 0)}${numericCell(row, 'qap_cached_bytes')}${numericCell(row, 'qap_unhealthy_catalogs', 0)}${numericCell(row, 'qap_lag_seconds')}
       <td>${safeText(row.host)}</td><td>${safeText(timestamp(row.started_at))}</td>${numericCell(row, 'measure_seconds')}${numericCell(row, 'tables', 0)}<td>${safeText(row.git_sha)}</td>
@@ -370,7 +411,7 @@ function render() {
 async function loadResults() {
   document.querySelector('#reload').disabled = true;
   statusNode.textContent = 'Loading benchmark results…';
-  bodyNode.innerHTML = '<tr><td class="empty" colspan="29">Loading…</td></tr>';
+  bodyNode.innerHTML = '<tr><td class="empty" colspan="38">Loading…</td></tr>';
   try {
     const response = await fetch(resultUrl, { cache: 'no-store' });
     if (response.status === 404 || (response.ok && response.headers.get('content-length') === '0')) {

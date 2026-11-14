@@ -45,6 +45,60 @@ function tunables(row: RecordValue): RecordValue | undefined {
   }
 }
 
+function collectorOutputIssue(evidence: RecordValue, row: RecordValue): string | undefined {
+  const output = evidence.commit_window_output_throughput;
+  if (!record(output)) return 'missing collector commit-window output evidence';
+  if (output.unavailable_reason != null) return 'collector output telemetry unavailable';
+  if (output.scope !== 'new_ingestion_commits_finished_in_half_open_shared_window_not_client_cohort' ||
+      output.clock !== 'collector_system_unix_ms_shared_schedule_clock_skew_not_measured' ||
+      output.warmup_backlog !== 'included_when_commit_finishes_in_window' ||
+      output.rewrite_commits !== 'excluded_by_ingestion_only_producer_capability' ||
+      output.unique_delivered_rows !== null || output.complete_delivery_established !== false) {
+    return 'invalid collector output attribution/provenance';
+  }
+  const start = integer(output.measurement_start_unix_ms), end = integer(output.measurement_end_unix_ms);
+  const seconds = output.window_seconds;
+  const finite = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 0;
+  const near = (value: unknown, expected: number) => finite(value) && Math.abs(value - expected) <= Math.max(1e-9, Math.abs(expected) * 1e-9);
+  if (start === undefined || end === undefined || end <= start || !finite(seconds) || seconds === 0 ||
+      !near(seconds, Number(end - start) / 1000) || integer(row.measure_seconds) !== (end - start) / 1000n ||
+      (end - start) % 1000n !== 0n) return 'invalid collector output measurement window';
+  const rows = integer(output.rows), files = integer(output.files), input = integer(output.input_bytes);
+  const bytes = integer(output.parquet_bytes), commits = integer(output.commits);
+  if ([rows, files, input, bytes, commits].some(value => value === undefined) ||
+      !near(output.rows_per_second, Number(rows) / seconds)) return 'invalid collector output counters/rate';
+  const latency = output.commit_latency_seconds;
+  if (!record(latency) || integer(latency.samples) !== commits ||
+      latency.scope !== 'commit_retry_and_sync_not_encoding_or_admission') return 'invalid commit latency evidence';
+  if (rows === 0n) {
+    if (files !== 0n || input !== 0n || bytes !== 0n || commits !== 0n || output.bytes_per_row !== null ||
+        output.compression_ratio !== null || [latency.p50, latency.p95, latency.p99].some(value => value !== null)) {
+      return 'invalid known-zero collector output evidence';
+    }
+  } else if (files === 0n || bytes === 0n || commits === 0n ||
+      !near(output.bytes_per_row, Number(bytes) / Number(rows)) ||
+      !near(output.compression_ratio, Number(input) / Number(bytes)) ||
+      !finite(latency.p50) || !finite(latency.p95) || !finite(latency.p99) ||
+      latency.p50 > latency.p95 || latency.p95 > latency.p99) return 'invalid collector output size/compression/latency';
+  if (output.compression_ratio_numerator !== 'collector_reported_input_bytes' ||
+      output.compression_ratio_denominator !== 'committed_parquet_file_bytes_including_metadata') {
+    return 'invalid collector compression denominator';
+  }
+  const collectors = Array.isArray(evidence.processes) ? evidence.processes.filter(process =>
+    record(process) && process.component === 'collector') : [];
+  if (BigInt(collectors.length) !== integer(row.replicas) || !collectors.length || collectors.some(process => {
+    if (!record(process) || process.log_complete !== true || process.effective_config_source !== 'consumer_startup_readback' ||
+        typeof process.image !== 'string' || !process.image || typeof process.image_id !== 'string' ||
+        !/(?:^|@|:\/\/)sha256:[a-f0-9]{64}$/.test(process.image_id) ||
+        (process.source_revision != null && process.source_revision !== row.git_sha)) return true;
+    const config = process.effective_config;
+    const telemetry = record(config) ? config.commit_telemetry : undefined;
+    return !record(telemetry) || telemetry.schema_version !== 1 || telemetry.scope !== 'new_ingestion_addfiles_after_sync' ||
+      telemetry.clock !== 'system_unix_ms';
+  })) return 'missing or inconsistent collector image/log/capability provenance';
+  return undefined;
+}
+
 export function evaluateDataFlow(
   status: OatRunStatus,
   allRows: RecordValue[],
@@ -71,6 +125,8 @@ export function evaluateDataFlow(
   const cells = new Map<string, string>();
   const cellIds = new Map<string, string>();
   let localDownstreamUnavailable = false;
+  let knownZeroOutputs = 0;
+  let legacyOutputs = 0;
   for (const row of rows) {
     const label = String(row.table);
     if (row.schema_version !== 2 && row.schema_version !== 3) reasons.push(`${label}: unsupported result schema`);
@@ -78,14 +134,20 @@ export function evaluateDataFlow(
       try {
         const evidence: unknown = JSON.parse(String(row.evidence_json));
         if (!record(evidence) || evidence.version !== 1) reasons.push(`${label}: invalid measurement evidence`);
-        else if (evidence.downstream_status === 'unavailable') {
-          if (mode === 'aks') reasons.push(`${label}: AKS downstream evidence unavailable`);
-          else localDownstreamUnavailable = true;
+        else {
+          const issue = collectorOutputIssue(evidence, row);
+          if (issue) reasons.push(`${label}: ${issue}`);
+          else if (record(evidence.commit_window_output_throughput) && integer(evidence.commit_window_output_throughput.rows) === 0n) knownZeroOutputs++;
+          if (evidence.downstream_status === 'unavailable') {
+            if (mode === 'aks') reasons.push(`${label}: AKS downstream evidence unavailable`);
+            else localDownstreamUnavailable = true;
+          }
         }
       } catch {
         reasons.push(`${label}: invalid measurement evidence`);
       }
     }
+    if (row.schema_version === 2) legacyOutputs++;
     if (row.mode !== mode) reasons.push(`${label}: result mode mismatch`);
     if (mode === 'aks' && row.stamp !== config.stamp) reasons.push(`${label}: result stamp mismatch`);
     if (typeof row.run_id !== 'string' || !UUID.test(row.run_id)) reasons.push(`${label}: invalid cell run_id`);
@@ -119,6 +181,8 @@ export function evaluateDataFlow(
   ];
   if (mode === 'aks') lines.push(`QAP database: ${String(config.qap_database)}; observation only, NOT ADX row-count proof`);
   if (localDownstreamUnavailable) lines.push('WARNING: local Kustainer/QAP unavailable; collector-only evidence, downstream metrics are null');
+  if (knownZeroOutputs) lines.push(`commit-window output: ${knownZeroOutputs} known-zero result(s); buffered output may commit later; not a delivery/drain proof`);
+  if (legacyOutputs) lines.push(`WARNING: ${legacyOutputs} legacy result(s) have no committed-output telemetry; admission is not durability`);
   return { pass: !reasons.length, reasons: [...new Set(reasons)], rows, lines };
 }
 
