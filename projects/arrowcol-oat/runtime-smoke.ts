@@ -68,7 +68,7 @@ async function main(): Promise<void> {
   router.upstream.tls = false;
   router.upstream.sni = '';
   router.upstream.max_h2_streams = 1;
-  router.upstream.idle_timeout_seconds = 0;
+  router.upstream.idle_timeout_seconds = 1;
   router.routing.distinct_table_owners = false;
   router.routing.warmup_ms = 1000;
   for (const [name, data] of [['dataflow.yaml', dataflow], ['router.yaml', router]] as const) {
