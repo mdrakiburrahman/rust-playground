@@ -290,7 +290,7 @@ pub enum MaintenanceGranularity {
     Day,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum MaintenanceOperation {
     Purge,
