@@ -240,7 +240,8 @@ export async function setup(
     namespace: 'arrow-collector', serviceAccount: 'arrow-collector', oatRunId: randomUUID(),
     workloadIdentityClientId: clientId, subscriptionId: live.subscription, stamp: live.stamp,
     deltaRoot: `${config.table_root}dataflow`,
-    images: { sqlserver: 'unpublished', catalog: 'unpublished', router: 'unpublished', dataflow: 'unpublished' },
+    images: { sqlserver: 'unpublished', catalog: 'unpublished', router: 'unpublished', dataflow: 'unpublished',
+      ...(options.maintenance ? { maintenance: 'unpublished' } : {}) },
   };
   const revision = await checked(runner, ['git', 'rev-parse', 'HEAD'], 15, 'Read source revision');
   if (!/^[a-f0-9]{40}$/.test(revision)) throw new Error('Git returned an invalid full source revision.');
@@ -252,19 +253,19 @@ export async function setup(
   let runtime: RuntimeConfig;
   let clientImage: string;
   try {
-    const published = await imagesApi.readPublishedImages({ ...imageOptions, revision }, runner);
+    const published = await imagesApi.readPublishedImages({ ...imageOptions, revision, maintenance: options.maintenance }, runner);
     runtime = validateRuntime({ ...draft, images: published.images });
     clientImage = published.client;
-    console.log(`Reusing five revision-verified images for ${revision}.`);
+    console.log(`Reusing ${options.maintenance ? 'six' : 'five'} revision-verified images for ${revision}.`);
   } catch (error) {
     if (!(error instanceof imagesApi.MissingPublishedImagesError)) throw error;
     if (options.skipImages) throw new Error(`Revision-pinned images are missing; run \`${setupCommand}\` without --skip-images.`, { cause: error });
     try {
       await writePrivateFile(imageOptions.runtimeConfig, `${JSON.stringify(validateRuntime(draft, true), null, 2)}\n`);
-      await imagesApi.buildLocalImages({ revision }, runner);
+      await imagesApi.buildLocalImages({ revision, maintenance: options.maintenance }, runner);
       await imagesApi.publishImages(imageOptions, runner);
       await imagesApi.publishClientImage(imageOptions, runner);
-      const verified = await imagesApi.readPublishedImages({ ...imageOptions, revision }, runner);
+      const verified = await imagesApi.readPublishedImages({ ...imageOptions, revision, maintenance: options.maintenance }, runner);
       runtime = validateRuntime({ ...draft, images: verified.images });
       clientImage = verified.client;
     } finally { await rm(imageOptions.runtimeConfig, { force: true }); }
@@ -275,6 +276,9 @@ export async function setup(
     'api://AzureADTokenExchange', '--duration', '1h'], 90, 'Mint host federation assertion');
   const oatTemplate = JSON.parse(await readFile(resolve(ROOT,
     'docs/experiments/arrowcol-oat/oat-config.aks.quick.json'), 'utf8')) as Record<string, unknown>;
+  if (options.maintenance) oatTemplate.tunables = {
+    maintenance: { enabled: true, apply: false, operations: ['optimize'] },
+  };
   const files = await generatePrivateInputs({ directory, runtime, bootstrapValues, resetGeneration: generation,
     tenantId, assertion, clientImage, qapEndpoint: config.uri, oatTemplate });
   let preflightReady = false;
@@ -289,7 +293,7 @@ export async function setup(
     }
     if (!preflightReady) throw new Error(`AKS preflight did not become READY in three bounded passes; correct the reported gates and run \`${setupCommand}\`.`);
   }
-  console.log(`AKS setup ${preflightReady ? 'READY' : 'prepared (preflight skipped)'}: stamp ${live.stamp}, ${live.clusterName}, five digest-pinned images.`);
+  console.log(`AKS setup ${preflightReady ? 'READY' : 'prepared (preflight skipped)'}: stamp ${live.stamp}, ${live.clusterName}, ${options.maintenance ? 'six' : 'five'} digest-pinned images.`);
   console.log('Host assertion lasts one hour; rerun setup before it expires. Next: npx --no-install arrowcol-oat --mode aks --stamp-config ' + relative(ROOT, stampConfigPath));
   return { stamp: live.stamp, clusterName: live.clusterName, images: { ...runtime.images, client: clientImage },
     ...files, preflightReady };
@@ -299,10 +303,11 @@ export async function main(args: string[], runner: typeof run_tree = run_tree): 
   const { values } = parseArgs({ args, strict: true, allowPositionals: false, options: {
     stamp: { type: 'string' }, 'stamp-config': { type: 'string' }, tag: { type: 'string' },
     'skip-images': { type: 'boolean', default: false }, 'skip-preflight': { type: 'boolean', default: false },
+    maintenance: { type: 'boolean', default: false },
   } });
   await setup({ stamp: values.stamp === undefined ? undefined : stampNumber(values.stamp),
     stampConfig: values['stamp-config'], tag: values.tag,
-    skipImages: values['skip-images'], skipPreflight: values['skip-preflight'] }, runner);
+    skipImages: values['skip-images'], skipPreflight: values['skip-preflight'], maintenance: values.maintenance }, runner);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

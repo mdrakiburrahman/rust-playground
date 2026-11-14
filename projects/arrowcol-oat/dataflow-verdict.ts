@@ -70,9 +70,22 @@ export function evaluateDataFlow(
   const seen = new Set<string>();
   const cells = new Map<string, string>();
   const cellIds = new Map<string, string>();
+  let localDownstreamUnavailable = false;
   for (const row of rows) {
     const label = String(row.table);
-    if (row.schema_version !== 2) reasons.push(`${label}: unsupported result schema`);
+    if (row.schema_version !== 2 && row.schema_version !== 3) reasons.push(`${label}: unsupported result schema`);
+    if (row.schema_version === 3) {
+      try {
+        const evidence: unknown = JSON.parse(String(row.evidence_json));
+        if (!record(evidence) || evidence.version !== 1) reasons.push(`${label}: invalid measurement evidence`);
+        else if (evidence.downstream_status === 'unavailable') {
+          if (mode === 'aks') reasons.push(`${label}: AKS downstream evidence unavailable`);
+          else localDownstreamUnavailable = true;
+        }
+      } catch {
+        reasons.push(`${label}: invalid measurement evidence`);
+      }
+    }
     if (row.mode !== mode) reasons.push(`${label}: result mode mismatch`);
     if (mode === 'aks' && row.stamp !== config.stamp) reasons.push(`${label}: result stamp mismatch`);
     if (typeof row.run_id !== 'string' || !UUID.test(row.run_id)) reasons.push(`${label}: invalid cell run_id`);
@@ -105,6 +118,7 @@ export function evaluateDataFlow(
     `git_sha: ${expectedSha ?? 'unavailable'}`,
   ];
   if (mode === 'aks') lines.push(`QAP database: ${String(config.qap_database)}; observation only, NOT ADX row-count proof`);
+  if (localDownstreamUnavailable) lines.push('WARNING: local Kustainer/QAP unavailable; collector-only evidence, downstream metrics are null');
   return { pass: !reasons.length, reasons: [...new Set(reasons)], rows, lines };
 }
 

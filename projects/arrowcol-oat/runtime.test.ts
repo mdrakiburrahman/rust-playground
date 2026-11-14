@@ -25,6 +25,31 @@ test('rejects mutable images, QAP namespace, wrong stamp and unknown fields', ()
   assert.throws(() => validateRuntime(c));
 });
 
+test('maintenance requires a pinned sixth image and explicit allowlist/operation/apply controls', async () => {
+  const c = config();
+  c.maintenance = { tables: ['telemetry.sqlserver.sqlserver_cpu_utilization'], operations: ['optimize'], apply: false };
+  assert.throws(() => validateRuntime(c), /pinned maintenance image/);
+  c.images.maintenance = 'example:latest';
+  assert.throws(() => validateRuntime(c), /registry manifest digest/);
+  c.images.maintenance = `arrowcollector89152.azurecr.io/delta-maintenance@sha256:${'b'.repeat(64)}`;
+  const objects = await renderRuntime(c, 'workload');
+  const worker = objects.find(o => o.kind === 'Deployment' && o.metadata.name === 'delta-maintenance')!;
+  assert.equal(worker.spec.replicas, 0);
+  const process = worker.spec.template.spec.containers[0];
+  assert.equal(process.image, c.images.maintenance);
+  assert.ok(process.args.includes(c.maintenance.tables[0]));
+  assert.ok(!process.args.includes('--apply') && !process.args.includes('--root'));
+  assert.equal(process.env.find((value: { name: string }) => value.name === 'ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE').value, '/run/auth/internal-hmac');
+  assert.equal(worker.spec.template.metadata.labels['azure.workload.identity/use'], 'true');
+  assert.equal(worker.spec.template.spec.automountServiceAccountToken, false);
+  const catalog = objects.find(o => o.metadata.name === 'catalog-internal')!;
+  assert.ok(catalog.spec.ingress[0].from.some((source: { podSelector: { matchLabels: { app: string } } }) => source.podSelector.matchLabels.app === 'delta-maintenance'));
+  for (const bad of [{ ...c.maintenance, tables: [] }, { ...c.maintenance, tables: ['*'] },
+    { ...c.maintenance, operations: ['unknown'] }, { ...c.maintenance, apply: undefined }]) {
+    assert.throws(() => validateRuntime({ ...c, maintenance: bad }), /explicit qualified table/);
+  }
+});
+
 test('isolated integrated topology pins images, WI, identity, probes and pooled table ownership', async () => {
   const c = config();
   const objects = await renderRuntime(c, 'workload');

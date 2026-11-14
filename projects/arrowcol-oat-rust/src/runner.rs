@@ -34,6 +34,11 @@ use url::Url;
 
 #[cfg(test)]
 include!("runner_failure_tests.rs");
+include!("runner_evidence.rs");
+include!("runner_tunables.rs");
+include!("runner_process_evidence.rs");
+include!("runner_commit_evidence.rs");
+include!("runner_maintenance.rs");
 
 #[derive(Clone, Debug)]
 struct OatResult {
@@ -54,6 +59,7 @@ struct OatResult {
     status: String,
     git_sha: String,
     tunables_json: String,
+    evidence_json: Option<String>,
     replicas: u64,
     dfe_worker_concurrency: u64,
     table: String,
@@ -76,7 +82,7 @@ struct QapMetrics {
     lag_seconds: Option<f64>,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 struct ResourceMetrics {
     cpu_millicores: f64,
     memory_bytes: u64,
@@ -151,7 +157,12 @@ trait Platform: Send + Sync {
     async fn arm_clients(&self, config: &OatConfig, run_id: &str, run_start_unix_ms: u64) -> Result<()>;
     async fn finish_client(&self, config: &OatConfig, handle: ClientHandle) -> Result<String>;
     async fn cancel_client(&self, config: &OatConfig, handle: &ClientHandle) -> Result<()>;
-    async fn sample_resources(&self, config: &OatConfig) -> Result<ResourceMetrics>;
+    fn resource_sampler_source(&self) -> Option<ResourceSamplerSource> {
+        None
+    }
+    async fn process_logs(&self, _config: &OatConfig) -> Result<Vec<ProcessLog>> {
+        Ok(Vec::new())
+    }
     async fn cleanup(&mut self, config: &OatConfig) -> Result<()>;
 }
 
@@ -197,6 +208,10 @@ struct LocalPlatform {
 impl Platform for AksPlatform {
     fn kind(&self) -> crate::config::OatMode {
         crate::config::OatMode::Aks
+    }
+
+    async fn process_logs(&self, config: &OatConfig) -> Result<Vec<ProcessLog>> {
+        aks_process_logs(config).await
     }
 
     fn workload_endpoint(&self, config: &OatConfig) -> String {
@@ -250,7 +265,8 @@ impl Platform for AksPlatform {
             expires_at_unix_ms,
             now_unix_ms,
         )
-        .await
+        .await?;
+        start_aks_maintenance(config).await
     }
 
     fn qap_observation_mode(&self) -> arrowcol_loadgen::ObservationMode {
@@ -403,8 +419,8 @@ impl Platform for AksPlatform {
         cancel_aks_client_job(config, handle).await
     }
 
-    async fn sample_resources(&self, config: &OatConfig) -> Result<ResourceMetrics> {
-        collect_aks_metrics(config).await
+    fn resource_sampler_source(&self) -> Option<ResourceSamplerSource> {
+        Some(ResourceSamplerSource::Aks)
     }
 
     async fn cleanup(&mut self, config: &OatConfig) -> Result<()> {
@@ -416,6 +432,10 @@ impl Platform for AksPlatform {
 impl Platform for LocalPlatform {
     fn kind(&self) -> crate::config::OatMode {
         crate::config::OatMode::Local
+    }
+
+    async fn process_logs(&self, config: &OatConfig) -> Result<Vec<ProcessLog>> {
+        local_process_logs(config, self).await
     }
 
     fn workload_endpoint(&self, _config: &OatConfig) -> String {
@@ -436,7 +456,10 @@ impl Platform for LocalPlatform {
         self.daemon_endpoint = Some(local_docker_daemon().await?);
         prepare_local_platform(config, self).await?;
         self.router_metrics_url = Some(local_compose_endpoint(config, self, "router", "50050", "/metrics").await?);
-        self.qap_url = Some(local_compose_endpoint(config, self, "kusto", "8080", "").await?);
+        match local_compose_endpoint(config, self, "kusto", "8080", "").await {
+            Ok(endpoint) => self.qap_url = Some(endpoint),
+            Err(_) => tracing::warn!("local downstream unavailable; collector-only measurement remains enabled"),
+        }
         Ok(())
     }
 
@@ -460,7 +483,8 @@ impl Platform for LocalPlatform {
             expires_at_unix_ms,
             now_unix_ms,
         )
-        .await
+        .await?;
+        start_local_maintenance(config, self).await
     }
 
     fn qap_observation_mode(&self) -> arrowcol_loadgen::ObservationMode {
@@ -487,13 +511,14 @@ impl Platform for LocalPlatform {
             .with_context(|| format!("create local QAP result directory {}", results.display()))?;
         let database = self.qap_database(config)?;
         arrowcol_loadgen::initialize_local_qap(
-            &self.qap_endpoint(config),
+            self.qap_url.as_deref().context(LocalDownstreamUnavailable)?,
             &results,
             &database,
             &local_bindings,
             Duration::from_secs(config.qap_timeout_seconds),
         )
         .await
+        .map_err(|error| error.context(LocalDownstreamUnavailable))
         .context("initialize run-local Kusto QAP tables and policies")?;
         Ok(bindings.iter().map(|binding| binding.external_table.clone()).collect())
     }
@@ -541,8 +566,11 @@ impl Platform for LocalPlatform {
         cancel_local_client(handle).await
     }
 
-    async fn sample_resources(&self, config: &OatConfig) -> Result<ResourceMetrics> {
-        collect_local_metrics(config, self).await
+    fn resource_sampler_source(&self) -> Option<ResourceSamplerSource> {
+        Some(ResourceSamplerSource::Local {
+            run_id: self.run_id.clone(),
+            environment: self.environment.clone(),
+        })
     }
 
     async fn cleanup(&mut self, config: &OatConfig) -> Result<()> {
@@ -601,10 +629,16 @@ impl LocalPlatform {
 
     fn add_compose_environment(&self, command: &mut Command) {
         command.envs(&self.environment);
+        command.arg("--file").arg(self.state_dir.join("tunables.compose.json"));
     }
 }
 
 fn prepare_local_state(config: &OatConfig, state_dir: &Path, run_id: &str) -> Result<HashMap<String, String>> {
+    fs::write(
+        state_dir.join("tunables.compose.json"),
+        serde_json::to_vec(&compose_tunables(config)?)?,
+    )
+    .context("write typed run-owned Compose tunable overlay")?;
     for directory in ["catalog-state", "dataflow", "router-state", "control"] {
         fs::create_dir(state_dir.join(directory))
             .with_context(|| format!("create local OAT state directory {directory}"))?;
@@ -918,9 +952,13 @@ async fn finish_local_client(handle: ClientHandle) -> Result<String> {
         );
     }
     let mut remove = Command::new("docker");
+    let provenance = local_client_image_evidence(container_id).await?;
     remove.args(["rm", container_id]);
     run_command(remove, "remove completed local OAT client container").await?;
-    Ok(progress.output)
+    Ok(format!(
+        "{}\nOAT_CLIENT_IMAGE_PROVENANCE {provenance}\n",
+        progress.output
+    ))
 }
 
 async fn cancel_local_client(handle: &ClientHandle) -> Result<()> {
@@ -1007,7 +1045,7 @@ async fn start_aks_client_job(
     let job_name = format!("oat-{run_label}-{table_label}-c{client_index}");
     let run_seconds = i64::try_from(config.timing_budget()?.client_job_lifetime_seconds)
         .context("OAT client Job lifetime exceeds Kubernetes range")?;
-    let job = build_aks_client_job(AksClientJobSpec {
+    let mut job = build_aks_client_job(AksClientJobSpec {
         namespace: &config.namespace,
         client_image: &config.dmv_client_image,
         router_auth_secret_name: &config.edge_secret_name,
@@ -1018,6 +1056,11 @@ async fn start_aks_client_job(
         args,
         run_seconds,
     });
+    inject_container_environment(
+        job.pointer_mut("/spec/template/spec/containers/0")
+            .context("AKS client container is missing")?,
+        &role_environment(config, ComponentRole::Client)?,
+    )?;
     let payload = serde_json::to_vec(&job)?;
     kubectl(
         config,
@@ -1300,6 +1343,7 @@ async fn finish_aks_client_job(config: &OatConfig, handle: ClientHandle) -> Resu
     if !progress.completed {
         bail!("AKS DMV client Job {job_name} was not complete at finish");
     }
+    let provenance = aks_client_image_evidence(config, job_name).await?;
     kubectl(
         config,
         vec![
@@ -1316,7 +1360,10 @@ async fn finish_aks_client_job(config: &OatConfig, handle: ClientHandle) -> Resu
     )
     .await
     .context("delete completed AKS DMV client Job")?;
-    Ok(progress.output)
+    Ok(format!(
+        "{}\nOAT_CLIENT_IMAGE_PROVENANCE {provenance}\n",
+        progress.output
+    ))
 }
 
 async fn cancel_aks_client_job(config: &OatConfig, handle: &ClientHandle) -> Result<()> {
@@ -1705,6 +1752,7 @@ fn finish_matrix_cell(
                             pinning: PinningReport::default(),
                             qap_tables: Vec::new(),
                             failure: Some(format!("{error:#}")),
+                            evidence: CellEvidence::default(),
                         },
                         started_at_ms,
                         qap: QapMetrics::default(),
@@ -1972,14 +2020,21 @@ async fn run_matrix_cell(
         .await?;
     let started_at_ms = i64::try_from(unix_time_ms()).context("run start timestamp exceeds Arrow timestamp range")?;
     let mut client_run = run_clients(config, run_id, &assigned_tables, platform).await?;
+    let logs = platform.process_logs(config).await?;
+    client_run.evidence.processes = Some(process_evidence(config, &logs)?);
+    client_run.evidence.durable_commits =
+        durable_commit_evidence(config, &logs, client_run.evidence.measurement_window)?;
     let pinning_ok = client_run.pinning.violation.is_none()
         && client_run.pinning.verification_error.is_none()
         && client_run.failure.is_none();
     let mut qap = QapMetrics::default();
-    let mut metrics = None;
+    let metrics = client_run.evidence.resource_summary();
     if pinning_ok {
-        local_progress(config, "clients finished; observing Kusto QAP and sampling resources");
+        local_progress(config, "clients finished; observing Kusto QAP");
         let observation = async {
+            if client_run.qap_tables.is_empty() {
+                return Err(anyhow::anyhow!(LocalDownstreamUnavailable));
+            }
             qap = observe_qap(
                 &platform.qap_endpoint(config),
                 &platform.qap_observation_mode(),
@@ -1989,12 +2044,21 @@ async fn run_matrix_cell(
                 config.qap_timeout_seconds,
             )
             .await?;
-            metrics = Some(platform.sample_resources(config).await?);
+            if qap.observation_complete != 1 {
+                qap = QapMetrics::default();
+                return Err(anyhow::anyhow!(LocalDownstreamUnavailable));
+            }
             Ok::<_, anyhow::Error>(())
         }
         .await;
         if let Err(error) = observation {
-            client_run.failure = Some(format!("observe completed matrix cell: {error:#}"));
+            if local_downstream_optional(platform.kind()) && error.is::<LocalDownstreamUnavailable>() {
+                client_run
+                    .evidence
+                    .downstream_unavailable("local_qap_observation_unavailable");
+            } else {
+                client_run.failure = Some(format!("observe completed matrix cell: {error:#}"));
+            }
         }
     }
     result_rows(
@@ -2057,6 +2121,9 @@ fn result_rows(
         "pinning_violation": client_run.pinning.violation.is_some(),
         "pinning_verification_error": client_run.pinning.verification_error.as_ref().map(|_| "ownership_verification_failed"),
         "delta_delivery": "not_established",
+        "requested_tunables": serde_json::from_str::<Value>(&config.tunables.canonical_json()?)?,
+        "requested_durability_class": config.tunables.durability_class(),
+        "capabilities": capability_evidence(),
     });
     let details = [
         client_run.failure.clone(),
@@ -2126,6 +2193,7 @@ fn result_rows(
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| "unknown".to_owned()),
             tunables_json: serde_json::to_string(&table_tunables)?,
+            evidence_json: Some(serde_json::to_string(&client_run.evidence.for_table(&table, client))?),
             replicas: u64::from(replicas),
             dfe_worker_concurrency: u64::from(concurrency),
             table,
@@ -2174,6 +2242,7 @@ struct ClientRun {
     pinning: PinningReport,
     qap_tables: Vec<String>,
     failure: Option<String>,
+    evidence: CellEvidence,
 }
 
 #[derive(Default)]
@@ -2205,6 +2274,7 @@ async fn run_clients(
                 pinning,
                 qap_tables: Vec::new(),
                 failure: Some(format!("{error:#}")),
+                evidence: CellEvidence::default(),
             })
         }
     }
@@ -2383,12 +2453,21 @@ async fn run_clients_inner(
     .await;
     let qap_result = match qap_result {
         Ok(result) => result,
+        Err(_) if local_downstream_optional(platform.kind()) => {
+            platform.mark_qap_outcome_unresolved();
+            Err(anyhow::anyhow!(LocalDownstreamUnavailable))
+        }
         Err(_) => Err(anyhow::anyhow!(
             "run-scoped QAP preparation exceeded qap_timeout_seconds; operation outcome may be indeterminate and is not retried"
         )),
     };
+    let mut evidence = CellEvidence::default();
     let qap_tables = match qap_result {
         Ok(qap_tables) => qap_tables,
+        Err(error) if local_downstream_optional(platform.kind()) && error.is::<LocalDownstreamUnavailable>() => {
+            evidence.downstream_unavailable("local_qap_initialization_unavailable");
+            Vec::new()
+        }
         Err(error) => {
             platform.mark_qap_outcome_unresolved();
             let cleanup = cancel_clients(platform, config, &handles).await;
@@ -2479,6 +2558,13 @@ async fn run_clients_inner(
     let measurement_end_unix_ms = measurement_start_unix_ms
         .checked_add(config.measure_seconds.saturating_mul(1_000))
         .context("shared OAT measurement end timestamp overflow")?;
+    evidence.measurement_window = Some((measurement_start_unix_ms, measurement_end_unix_ms));
+    let sampler = ResourceSampler::start(
+        platform.resource_sampler_source(),
+        config.clone(),
+        measurement_start_unix_ms,
+        measurement_end_unix_ms,
+    );
     let mut client_metrics = HashMap::<String, Vec<ClientMeasurement>>::with_capacity(tables.len());
     let mut completed_clients = HashSet::new();
     let mut active_clients = vec![true; handles.len()];
@@ -2565,6 +2651,15 @@ async fn run_clients_inner(
                         };
                     }
                 };
+                if let Err(error) = evidence.record_client(config, &handle.table, &output) {
+                    let cleanup = cancel_active_clients(platform, config, &handles, &active_clients).await;
+                    return match cleanup {
+                        Ok(()) => Err(error),
+                        Err(cleanup_error) => Err(error.context(format!(
+                            "cancelling clients after invalid effective-config evidence failed: {cleanup_error:#}"
+                        ))),
+                    };
+                }
                 client_metrics
                     .entry(handle.table.clone())
                     .or_default()
@@ -2589,6 +2684,7 @@ async fn run_clients_inner(
         true,
     );
     let mut metrics = HashMap::with_capacity(tables.len());
+    sampler.finish(&mut evidence).await?;
     for table in tables {
         let reports = client_metrics
             .remove(table)
@@ -2659,6 +2755,7 @@ async fn run_clients_inner(
         pinning: std::mem::take(pinning),
         failure: None,
         qap_tables,
+        evidence,
     })
 }
 
@@ -3133,6 +3230,13 @@ async fn observe_qap(
                 &observer_tables,
                 timeout,
             ))
+            .map_err(|error| {
+                if matches!(mode, arrowcol_loadgen::ObservationMode::Local) {
+                    error.context(LocalDownstreamUnavailable)
+                } else {
+                    error
+                }
+            })
             .context("observe Kusto Query Acceleration Policy")
     })
     .await
@@ -3807,7 +3911,11 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
     );
     platform.add_compose_environment(&mut build_client);
     build_client.args(["build", "oat-client"]);
+    if maintenance_enabled(config) && config.maintenance_image.is_none() {
+        build_client.arg("delta-maintenance");
+    }
     run_streaming_command(build_client, "build OAT client container").await?;
+    pin_local_maintenance_image(config, platform).await?;
     verify_local_bind_mount(config, platform).await?;
 
     let mut up = compose_command(
@@ -3858,13 +3966,26 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
         "600",
         "arrowcol-catalog",
         "dataflow-1",
-        "kusto",
         "lgtm",
         "router",
     ]);
     run_streaming_command(up, "start remaining local OAT stack")
         .await
         .context("local compose stack is a per-run project; results are not touched by stack cleanup")?;
+    let mut downstream = compose_command(
+        compose_file,
+        config.platform.compose_override_file.as_deref(),
+        &project,
+        "benchmark",
+    );
+    platform.add_compose_environment(&mut downstream);
+    downstream.args(["up", "--detach", "--no-deps", "--wait", "--wait-timeout", "60", "kusto"]);
+    if run_streaming_command(downstream, "start optional local Kustainer")
+        .await
+        .is_err()
+    {
+        tracing::warn!("local Kustainer did not become ready; collector-only measurements remain enabled");
+    }
     Ok(())
 }
 
@@ -4340,7 +4461,11 @@ async fn destroy_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
     Ok(())
 }
 
-async fn collect_local_metrics(config: &OatConfig, platform: &LocalPlatform) -> Result<ResourceMetrics> {
+async fn collect_local_metrics(
+    config: &OatConfig,
+    run_id: &str,
+    environment: &HashMap<String, String>,
+) -> Result<ResourceMetrics> {
     let base_project = config
         .platform
         .compose_project
@@ -4351,14 +4476,14 @@ async fn collect_local_metrics(config: &OatConfig, platform: &LocalPlatform) -> 
         .compose_file
         .as_deref()
         .context("local compose file is missing")?;
-    let project = scoped_compose_project(base_project, &platform.run_id);
+    let project = scoped_compose_project(base_project, run_id);
     let mut list = compose_command(
         compose_file,
         config.platform.compose_override_file.as_deref(),
         &project,
         "benchmark",
     );
-    list.envs(&platform.environment);
+    list.envs(environment);
     list.args(["ps", "--quiet", "dataflow-1"]);
     let ids = String::from_utf8(run_command(list, "list local ArrowCol containers").await?.stdout)?;
     let ids = ids
@@ -4421,6 +4546,11 @@ async fn configure_deployments(config: &OatConfig, replicas: u32, concurrency: u
         }
         if name == config.dfe_deployment {
             configure_workers(&mut desired, &config.dfe_container, concurrency)?;
+            inject_deployment_environment(
+                &mut desired,
+                &config.dfe_container,
+                &role_environment(config, ComponentRole::Collector)?,
+            )?;
         }
         apply_deployment(config, desired).await?;
     }
@@ -4742,6 +4872,20 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
     runtime_config["deltaRoot"] = json!(run_data_root);
     runtime_config["namespace"] = json!(config.namespace);
     runtime_config["oatRunId"] = json!(platform.run_id);
+    if let Some(maintenance) = maintenance_runtime(config)? {
+        runtime_config["maintenance"] = maintenance;
+        runtime_config["images"]["maintenance"] = json!(
+            config
+                .maintenance_image
+                .as_deref()
+                .context("enabled AKS maintenance requires its pinned image")?
+        );
+    } else {
+        runtime_config
+            .as_object_mut()
+            .context("runtime config must be an object")?
+            .remove("maintenance");
+    }
     let generated_config = runtime_dir.join("runtime-config.json");
     tokio::fs::write(&generated_config, serde_json::to_vec(&runtime_config)?)
         .await
@@ -4890,7 +5034,8 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
     .await
     .context("remove completed run-scoped bootstrap Job")?;
 
-    let workload = render_runtime_phase(&runtime_script, &generated_config, "workload", &runtime_dir).await?;
+    let mut workload = render_runtime_phase(&runtime_script, &generated_config, "workload", &runtime_dir).await?;
+    inject_workload_environment(config, &mut workload)?;
     platform.router_yaml = Some(rendered_router_yaml(&workload)?);
     apply_runtime_resources(config, without_identity_resources(workload)).await?;
     for name in ["arrowcol-catalog", "arrowcol", "arrowcol-router"] {
@@ -6294,8 +6439,11 @@ fn merge_parquet_bytes(existing_bytes: &[u8], incoming: &RecordBatch) -> Result<
         .context("read existing benchmark Parquet object")?;
     let schema = result_schema();
     let existing_schema = existing_reader.schema();
+    let existing_v3 = existing_schema.as_ref() == schema.as_ref();
     if incoming.schema().as_ref() != schema.as_ref()
-        || (existing_schema.as_ref() != schema.as_ref() && existing_schema.as_ref() != legacy_result_schema().as_ref())
+        || (existing_schema.as_ref() != schema.as_ref()
+            && existing_schema.as_ref() != v2_result_schema().as_ref()
+            && existing_schema.as_ref() != legacy_result_schema().as_ref())
     {
         bail!("existing benchmark Parquet schema changed");
     }
@@ -6307,10 +6455,17 @@ fn merge_parquet_bytes(existing_bytes: &[u8], incoming: &RecordBatch) -> Result<
                 .column_by_name("schema_version")
                 .and_then(|column| column.as_any().downcast_ref::<Int32Array>())
                 .context("result Parquet has no int32 schema_version")?;
-            if versions.iter().any(|version| version != Some(2)) {
+            if versions
+                .iter()
+                .any(|version| version != Some(2) && !(existing_v3 && version == Some(3)))
+            {
                 bail!("existing benchmark Parquet contains an unsupported schema_version");
             }
-            Ok(RecordBatch::try_new(Arc::clone(&schema), batch.columns().to_vec())?)
+            let mut columns = batch.columns().to_vec();
+            if columns.len() < schema.fields().len() {
+                columns.push(Arc::new(StringArray::from(vec![None::<&str>; batch.num_rows()])));
+            }
+            Ok(RecordBatch::try_new(Arc::clone(&schema), columns)?)
         })
         .collect::<Result<Vec<_>>>()?;
     batches.push(incoming.clone());
@@ -6352,7 +6507,7 @@ fn deduplicate_results(batch: &RecordBatch) -> Result<RecordBatch> {
 fn parquet_batch(results: &[OatResult]) -> Result<RecordBatch> {
     let schema = result_schema();
     let columns: Vec<ArrayRef> = vec![
-        Arc::new(Int32Array::from_iter_values(results.iter().map(|_| 2))),
+        Arc::new(Int32Array::from_iter_values(results.iter().map(|_| 3))),
         Arc::new(StringArray::from_iter_values(
             results.iter().map(|row| row.mode.as_str()),
         )),
@@ -6436,6 +6591,12 @@ fn parquet_batch(results: &[OatResult]) -> Result<RecordBatch> {
         Arc::new(Float64Array::from(
             results.iter().map(|row| row.qap.lag_seconds).collect::<Vec<_>>(),
         )),
+        Arc::new(StringArray::from(
+            results
+                .iter()
+                .map(|row| row.evidence_json.as_deref())
+                .collect::<Vec<_>>(),
+        )),
     ];
     Ok(RecordBatch::try_new(Arc::clone(&schema), columns)?)
 }
@@ -6477,12 +6638,17 @@ fn result_schema() -> Arc<Schema> {
         Field::new("qap_cached_bytes", DataType::UInt64, true),
         Field::new("qap_unhealthy_catalogs", DataType::UInt64, true),
         Field::new("qap_lag_seconds", DataType::Float64, true),
+        Field::new("evidence_json", DataType::Utf8, true),
     ]))
+}
+
+fn v2_result_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(result_schema().fields()[..31].to_vec()))
 }
 
 fn legacy_result_schema() -> Arc<Schema> {
     Arc::new(Schema::new(
-        result_schema()
+        v2_result_schema()
             .fields()
             .iter()
             .map(|field| {
@@ -7485,7 +7651,7 @@ mod tests {
     }
 
     #[test]
-    fn parquet_schema_v2_matches_the_full_frozen_column_contract() -> Result<()> {
+    fn parquet_schema_v3_preserves_v2_and_appends_nullable_evidence() -> Result<()> {
         let expected = vec![
             ("schema_version", DataType::Int32, false),
             ("mode", DataType::Utf8, false),
@@ -7522,6 +7688,7 @@ mod tests {
             ("qap_cached_bytes", DataType::UInt64, true),
             ("qap_unhealthy_catalogs", DataType::UInt64, true),
             ("qap_lag_seconds", DataType::Float64, true),
+            ("evidence_json", DataType::Utf8, true),
         ];
         let schema = result_schema();
         let actual = schema
@@ -8054,6 +8221,7 @@ mod tests {
             status: "succeeded".to_owned(),
             git_sha: "test".to_owned(),
             tunables_json: "{}".to_owned(),
+            evidence_json: None,
             replicas: 1,
             dfe_worker_concurrency: 2,
             table: table.to_owned(),
