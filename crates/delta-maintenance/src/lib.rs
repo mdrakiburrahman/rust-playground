@@ -11,7 +11,7 @@ use arrow_deltalake::maintenance::{
     NegativeProbeConfig, OptimizeConfig, OptimizePlan, Outcome, ProbeOperation, PruneConfig, PurgeConfig, VacuumConfig,
     error_details, now_ms,
 };
-use arrowcol_props::{ResolvedProps, resolve};
+use arrowcol_props::{PropValue, ResolvedProps, resolve};
 use serde::Serialize;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
@@ -72,7 +72,12 @@ pub struct Settings {
     pub max_idle_backoff: Duration,
     pub max_cycles: Option<u64>,
     pub max_concurrent_tables: usize,
+    /// Optional aggregate budget for per-bin decoded-byte limits, not an RSS cap.
+    pub max_concurrent_decoded_bytes: Option<u64>,
     pub operation_timeout: Duration,
+    pub commit_attempts: u32,
+    pub commit_budget: Duration,
+    pub catalog_options: catalog::CatalogOptions,
     pub granularity: Option<Granularity>,
     pub purge_retention_ms: Option<i64>,
     pub anchor_ms: Option<i64>,
@@ -81,6 +86,8 @@ pub struct Settings {
     pub allow_short_vacuum_retention: bool,
     pub unsafe_short_vacuum_for_tests: bool,
     pub optimize: OptimizeConfig,
+    /// Explicit process defaults for registered table properties.
+    pub process_properties: BTreeMap<String, String>,
     /// Minimum commits after the hinted checkpoint before `checkpoint` writes one.
     pub checkpoint_every_commits: u64,
     /// `prune-log` commit-age retention; `None` uses `delta.logRetentionDuration`
@@ -151,7 +158,25 @@ impl Settings {
         if self.vacuum_retention_ms < 0 {
             bail!("VACUUM retention must not be negative");
         }
-        self.optimize.validate()
+        self.optimize.validate()?;
+        self.catalog_options.validate()?;
+        self.validate_decoded_budget(self.optimize.max_decoded_bytes_per_bin)?;
+        MaintenanceControl::default().with_commit_retry_limits(self.commit_attempts, self.commit_budget)?;
+        resolve(&BTreeMap::new(), &process_defaults(self))?;
+        Ok(())
+    }
+
+    fn validate_decoded_budget(&self, per_bin: u64) -> Result<()> {
+        if let Some(budget) = self.max_concurrent_decoded_bytes {
+            let concurrency = u64::try_from(self.max_concurrent_tables)?;
+            let total = per_bin
+                .checked_mul(concurrency)
+                .context("concurrent decode budget overflow")?;
+            if budget == 0 || total > budget {
+                bail!("per-bin decoded limit times concurrent tables exceeds the aggregate decode budget");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -425,6 +450,7 @@ fn process_defaults(settings: &Settings) -> BTreeMap<String, String> {
             props.insert(key.into(), value);
         }
     }
+    props.extend(settings.process_properties.clone());
     props
 }
 
@@ -432,6 +458,9 @@ fn effective_settings(settings: &Settings, properties: &BTreeMap<String, String>
     let mut defaults = process_defaults(settings);
     if (properties.contains_key("arrowcol.optimize.targetFileSize") || properties.contains_key("delta.targetFileSize"))
         && !properties.contains_key("arrowcol.optimize.smallFileSize")
+        && !settings
+            .process_properties
+            .contains_key("arrowcol.optimize.smallFileSize")
     {
         // The CLI small-file default is derived from its target, not an
         // independently supplied policy. Re-derive it from a table target.
@@ -479,6 +508,7 @@ fn effective_settings(settings: &Settings, properties: &BTreeMap<String, String>
         usize::try_from(props.unsigned("arrowcol.optimize.maxActionsPerCommit")?)?;
     effective.optimize.max_plan_bytes = usize::try_from(props.unsigned("arrowcol.optimize.maxPlanSize")?)?;
     effective.optimize.max_decoded_bytes_per_bin = props.unsigned("arrowcol.optimize.maxDecodedSizePerBin")?;
+    effective.validate_decoded_budget(effective.optimize.max_decoded_bytes_per_bin)?;
     effective.optimize.max_output_file_bytes = props.unsigned("arrowcol.optimize.maxOutputFileSize")?;
     effective.optimize.max_active_files = usize::try_from(props.unsigned("arrowcol.optimize.maxActiveFiles")?)?;
     effective.optimize.max_row_group_bytes = props.unsigned("arrowcol.optimize.maxRowGroupSize")?;
@@ -492,8 +522,92 @@ fn effective_settings(settings: &Settings, properties: &BTreeMap<String, String>
     } else {
         None
     };
+    if properties.contains_key("arrowcol.layout.enabled")
+        || settings.process_properties.contains_key("arrowcol.layout.enabled")
+    {
+        effective.optimize.use_default_layout = false;
+    }
     effective.optimize.validate()?;
     Ok((effective, props))
+}
+
+fn configuration_evidence(startup: &Settings, settings: &Settings, props: &ResolvedProps) -> Result<serde_json::Value> {
+    let mut policy = serde_json::Map::new();
+    for key in arrowcol_props::REGISTRY {
+        let name = key.name;
+        if !(name.starts_with("arrowcol.maintenance.")
+            || name.starts_with("arrowcol.optimize.")
+            || name.starts_with("arrowcol.layout.")
+            || name.starts_with("arrowcol.vacuum.")
+            || name.starts_with("arrowcol.purge.")
+            || name.starts_with("arrowcol.partition.")
+            || matches!(
+                name,
+                "delta.targetFileSize"
+                    | "delta.deletedFileRetentionDuration"
+                    | "delta.logRetentionDuration"
+                    | "delta.checkpointInterval"
+            ))
+        {
+            continue;
+        }
+        let value = match props
+            .get(name)
+            .with_context(|| format!("resolved property missing: {name}"))?
+        {
+            PropValue::Bool(value) => serde_json::json!(value),
+            PropValue::Unsigned(value) => serde_json::json!(value),
+            PropValue::Float(value) => serde_json::json!(value),
+            PropValue::Text(value) => serde_json::json!(value),
+            PropValue::StringList(value) => serde_json::json!(value),
+        };
+        policy.insert(name.to_owned(), value);
+    }
+    let enabled = props.boolean("arrowcol.maintenance.enabled")?;
+    let layout_mode = if settings.optimize.layout.is_some() {
+        "explicit"
+    } else if settings.optimize.use_default_layout {
+        "automatic"
+    } else {
+        "disabled"
+    };
+    Ok(serde_json::json!({
+        "startup": {
+            "apply": startup.apply,
+            "operations": startup.operations,
+            "interval_secs": startup.interval.map(|value| value.as_secs()),
+            "max_idle_backoff_secs": startup.max_idle_backoff.as_secs(),
+            "max_cycles": startup.max_cycles,
+            "max_concurrent_tables": startup.max_concurrent_tables,
+            "max_concurrent_decoded_bytes": startup.max_concurrent_decoded_bytes,
+            "commit_attempts": startup.commit_attempts,
+            "commit_budget_secs": startup.commit_budget.as_secs(),
+            "catalog_runtime_threads": startup.catalog_options.runtime_threads,
+            "catalog_rpc_timeout_secs": startup.catalog_options.rpc_timeout.as_secs(),
+            "catalog_max_decoding_message_bytes": startup.catalog_options.max_decoding_message_bytes,
+            "max_prune_files": startup.max_prune_files,
+            "output_row_group_rows": startup.optimize.output_row_group_rows,
+        },
+        "table_policy": policy,
+        "active": enabled,
+        "operation_settings": enabled.then(|| serde_json::json!({
+            "layout_mode": layout_mode,
+            "vacuum_retention_ms": settings.vacuum_retention_ms,
+            "log_retention_ms": settings.log_retention_ms,
+            "allow_short_vacuum_retention": settings.allow_short_vacuum_retention,
+            "unsafe_short_vacuum_for_tests": settings.unsafe_short_vacuum_for_tests,
+        })),
+    }))
+}
+
+/// Validated startup defaults, before any table-level overrides.
+///
+/// # Errors
+/// Returns invalid setting or property errors.
+pub fn startup_configuration(settings: &Settings) -> Result<serde_json::Value> {
+    settings.validate()?;
+    let (effective, props) = effective_settings(settings, &BTreeMap::new())?;
+    configuration_evidence(settings, &effective, &props)
 }
 
 fn policy_matches(settings: &Settings, actual: &BTreeMap<String, String>, expected: &ResolvedProps) -> Result<bool> {
@@ -580,6 +694,8 @@ impl OptimizeEvidence {
                 "max_row_group_bytes": config.max_row_group_bytes,
                 "max_batch_bytes": config.max_batch_bytes,
                 "batch_rows": config.batch_rows,
+                "output_row_group_rows": config.output_row_group_rows,
+                "use_default_layout": config.use_default_layout,
                 "max_output_file_bytes": config.max_output_file_bytes,
                 "max_active_files": config.max_active_files,
                 "layout": config.layout.as_ref().map(|layout| serde_json::json!({
@@ -957,6 +1073,11 @@ fn maintain_table(
             bail!("table properties changed after discovery; retry");
         }
         discovered.log_token = Some(token);
+        let config = configuration_evidence(settings, &effective, &props)?;
+        eprintln!(
+            "arrowcol_maintenance_table_config {}",
+            serde_json::json!({ "table": name, "config": config })
+        );
         Ok(Some((discovered, effective, props, probe, gate)))
     })();
     if matches!(&setup, Ok(None)) {
@@ -985,9 +1106,10 @@ fn maintain_table(
             Ok(Some((_, effective, _, _, _))) => effective,
             _ => settings,
         };
-        let control = MaintenanceControl::new(Arc::clone(cancel), Some(started + effective.operation_timeout));
         let outcome = match &setup {
             Ok(Some((discovered, effective, props, probe, _))) => (|| {
+                let control = MaintenanceControl::new(Arc::clone(cancel), Some(started + effective.operation_timeout))
+                    .with_commit_retry_limits(effective.commit_attempts, effective.commit_budget)?;
                 let token = probe.probe_log_token(100_000)?;
                 if observed_token.as_ref().is_some_and(|previous| *previous != token)
                     && !policy_matches(settings, &probe.maintenance_properties()?, props)?

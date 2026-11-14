@@ -10,7 +10,40 @@ use std::time::Duration;
 use tonic::transport::Channel;
 use url::Url;
 
-const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+/// Startup limits for catalog discovery.
+#[derive(Clone, Debug)]
+pub struct CatalogOptions {
+    pub runtime_threads: usize,
+    pub rpc_timeout: Duration,
+    pub max_decoding_message_bytes: usize,
+}
+
+impl Default for CatalogOptions {
+    fn default() -> Self {
+        Self {
+            runtime_threads: 2,
+            rpc_timeout: Duration::from_secs(30),
+            max_decoding_message_bytes: 32 * 1024 * 1024,
+        }
+    }
+}
+
+impl CatalogOptions {
+    /// Validate bounded catalog transport resources.
+    ///
+    /// # Errors
+    /// Rejects zero or excessive runtime, timeout and message limits.
+    pub fn validate(&self) -> Result<()> {
+        if !(1..=64).contains(&self.runtime_threads)
+            || self.rpc_timeout.is_zero()
+            || self.rpc_timeout > Duration::from_secs(3600)
+            || !(1024..=1024 * 1024 * 1024).contains(&self.max_decoding_message_bytes)
+        {
+            bail!("invalid catalog runtime threads, RPC timeout or decoding message limit");
+        }
+        Ok(())
+    }
+}
 
 /// One atomic catalog snapshot per scheduling pass, shared by all table workers.
 /// Uses the generated catalog-client protocol, not a separate discovery endpoint.
@@ -20,6 +53,7 @@ pub struct CatalogDiscovery {
     signer: InternalRequestSigner,
     allowlist: Vec<String>,
     tables: Mutex<BTreeMap<String, DiscoveredTable>>,
+    rpc_timeout: Duration,
 }
 
 impl CatalogDiscovery {
@@ -28,10 +62,18 @@ impl CatalogDiscovery {
     /// # Errors
     /// Returns endpoint, timeout or transport failures without falling back to disk.
     pub fn connect(endpoint: &str, allowlist: Vec<String>) -> Result<Self> {
+        Self::connect_with_options(endpoint, allowlist, CatalogOptions::default())
+    }
+
+    /// Connect with explicit catalog transport resource limits.
+    ///
+    /// # Errors
+    /// Returns invalid options, identity, timeout or transport failures.
+    pub fn connect_with_options(endpoint: &str, allowlist: Vec<String>, options: CatalogOptions) -> Result<Self> {
         let secret_file = std::env::var_os("ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE")
             .context("ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE is required for catalog reads")?;
         let signer = InternalRequestSigner::from_file(secret_file)?;
-        Self::connect_with_signer(endpoint, allowlist, signer)
+        Self::connect_with_signer_and_options(endpoint, allowlist, signer, options)
     }
 
     /// Connects with an explicitly provided internal request signer.
@@ -39,21 +81,36 @@ impl CatalogDiscovery {
     /// # Errors
     /// Returns endpoint, timeout or transport failures without falling back to disk.
     pub fn connect_with_signer(endpoint: &str, allowlist: Vec<String>, signer: InternalRequestSigner) -> Result<Self> {
+        Self::connect_with_signer_and_options(endpoint, allowlist, signer, CatalogOptions::default())
+    }
+
+    /// Connect with an explicit signer and catalog resource limits.
+    ///
+    /// # Errors
+    /// Returns invalid options, timeout or transport failures.
+    pub fn connect_with_signer_and_options(
+        endpoint: &str,
+        allowlist: Vec<String>,
+        signer: InternalRequestSigner,
+        options: CatalogOptions,
+    ) -> Result<Self> {
+        options.validate()?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(options.runtime_threads)
             .enable_all()
             .build()?;
         let client = runtime
             .block_on(async {
-                tokio::time::timeout(RPC_TIMEOUT, SchemaCatalogClient::connect(endpoint.to_owned())).await
+                tokio::time::timeout(options.rpc_timeout, SchemaCatalogClient::connect(endpoint.to_owned())).await
             })
             .context("catalog connection timeout")??;
         Ok(Self {
             runtime,
-            client: Mutex::new(client.max_decoding_message_size(32 * 1024 * 1024)),
+            client: Mutex::new(client.max_decoding_message_size(options.max_decoding_message_bytes)),
             signer,
             allowlist,
             tables: Mutex::new(BTreeMap::new()),
+            rpc_timeout: options.rpc_timeout,
         })
     }
 }
@@ -116,10 +173,10 @@ impl TableDiscovery for CatalogDiscovery {
         let mut request = tonic::Request::new(rpc::Empty {});
         self.signer
             .sign_message(&mut request, "/arrowcol.catalog.v1.SchemaCatalog/GetSnapshot")?;
-        request.set_timeout(RPC_TIMEOUT);
+        request.set_timeout(self.rpc_timeout);
         let snapshot = self
             .runtime
-            .block_on(async { tokio::time::timeout(RPC_TIMEOUT, client.get_snapshot(request)).await })
+            .block_on(async { tokio::time::timeout(self.rpc_timeout, client.get_snapshot(request)).await })
             .context("catalog snapshot timeout")??
             .into_inner();
         let selected = selected_tables(snapshot, &self.allowlist)?;

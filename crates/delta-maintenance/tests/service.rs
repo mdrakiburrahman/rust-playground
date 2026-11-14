@@ -87,6 +87,32 @@ fn service(root: &Path) -> Result<Command> {
 }
 
 #[test]
+fn effective_configuration_is_reported_for_a_negative_probe() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    table(&root.path().join("events"))?;
+    let output = service(root.path())?
+        .args(["--operation", "optimize", "--min-files", "3"])
+        .output()?;
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(lines(&output.stdout)?[0]["negative_probe"], true);
+    let stderr = std::str::from_utf8(&output.stderr)?;
+    let event = |prefix: &str| -> Result<serde_json::Value> {
+        let json = stderr
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .ok_or_else(|| anyhow!("missing configuration event {prefix}"))?;
+        Ok(serde_json::from_str(json)?)
+    };
+    let startup = event("arrowcol_maintenance_effective_config ")?;
+    let table = event("arrowcol_maintenance_table_config ")?;
+    assert_eq!(startup["table_policy"]["arrowcol.optimize.minFiles"], 3);
+    assert_eq!(table["table"], "events");
+    assert_eq!(table["config"]["table_policy"]["arrowcol.optimize.minFiles"], 3);
+    assert_eq!(table["config"]["operation_settings"]["layout_mode"], "automatic");
+    Ok(())
+}
+
+#[test]
 fn ordinary_short_vacuum_requires_explicit_acknowledgement_and_does_not_authorize_pruning() -> Result<()> {
     let root = tempfile::tempdir()?;
     let path = root.path().join("events");
