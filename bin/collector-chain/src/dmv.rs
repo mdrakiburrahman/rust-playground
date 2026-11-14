@@ -27,6 +27,9 @@ use prost::Message as _;
 use tonic::Request;
 use tonic::transport::{Channel, Endpoint};
 
+#[path = "dmv_client.rs"]
+pub mod client;
+
 const SCHEMA_DDL: &str = include_str!("../../../projects/loadtest/schemas/sqlserver.sql");
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -192,6 +195,8 @@ pub struct UploadReport {
     pub best_effort_streams: usize,
     /// Streams completed with a local durable-buffer acknowledgement.
     pub durable_streams: usize,
+    /// Rows whose streams completed with a validated admission response.
+    pub completed_rows: u64,
 }
 
 /// Uploads DMV data and preserves the actual admission guarantees.
@@ -297,6 +302,7 @@ async fn send_tables_report(
     .await?;
     Ok(UploadReport {
         tables: count,
+        completed_rows: rows as u64 * count as u64,
         best_effort_streams: admissions
             .iter()
             .filter(|value| **value == DeliveryGuarantee::BestEffort)
