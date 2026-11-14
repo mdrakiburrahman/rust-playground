@@ -52,8 +52,11 @@ and all output files form one indivisible Delta commit unit. Already committed
 IDs are filtered before encoding; a mixed-ID race rejects and rebuilds on retry.
 Over-cap multi-publication groups fall back to intact publication units.
 A single indivisible publication that cannot fit fails with an actionable
-non-retryable limit error before queueing; it never records IDs for partial
-output. Partition lookup is keyed and staging checks file caps early, before
+exporter configuration error before queueing; the node stops without sending
+ACK/NACK, so native Quiver leaves its durable bundle unresolved for recovery
+after the operator increases the commit limit and restarts. It does not enter
+automatic NACK retry or permanently reject the bundle, and never records IDs
+for partial output. Partition lookup is keyed and staging checks file caps early, before
 encoding high-cardinality output. Schema, partition, retention, fencing,
 no-overwrite and durability boundaries remain.
 Increasing a flush target alone does not coalesce publications.

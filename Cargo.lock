@@ -840,6 +840,7 @@ dependencies = [
  "linkme",
  "otel-arrow-dfe-channel",
  "otel-arrow-dfe-config",
+ "otel-arrow-dfe-core-nodes",
  "otel-arrow-dfe-engine",
  "otel-arrow-dfe-otap",
  "otel-arrow-dfe-pdata",

@@ -16,7 +16,7 @@
       "{workspaceRoot}/Cargo.toml",
       "{workspaceRoot}/Cargo.lock",
       "{workspaceRoot}/rust-toolchain.toml",
-      "{workspaceRoot}/submodules/otel-arrow/rust/otap-dataflow/crates/{config,engine,otap,pdata}/**/*"
+      "{workspaceRoot}/submodules/otel-arrow/rust/otap-dataflow/crates/{config,core-nodes,engine,otap,pdata,quiver}/**/*"
     ]
   },
   "targets": {

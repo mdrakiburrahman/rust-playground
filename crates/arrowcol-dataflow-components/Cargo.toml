@@ -43,6 +43,8 @@ tonic = "0.14"
 tracing.workspace = true
 
 [dev-dependencies]
+otel-arrow-dfe-core-nodes = { path = "../../submodules/otel-arrow/rust/otap-dataflow/crates/core-nodes", default-features = false, features = ["durable-buffer"] }
+otel-arrow-dfe-engine = { path = "../../submodules/otel-arrow/rust/otap-dataflow/crates/engine", features = ["test-utils"] }
 parquet = { version = "58.3", default-features = false, features = ["arrow"] }
 tempfile = "3"
 uuid = { version = "1", features = ["v5"] }
