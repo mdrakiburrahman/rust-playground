@@ -1,7 +1,7 @@
 //! Local, append-only Delta tables backed exclusively by Delta Kernel.
 
 pub use crate::delta_io::spawn_shared_io;
-use crate::delta_io::{BATCH_ROWS, READ_AHEAD, SharedExecutor, shared_executor};
+use crate::delta_io::{SharedExecutor, runtime_config, shared_executor};
 use crate::publisher::{PublisherSession, SessionMode};
 use crate::{
     CompletedFile, CompletedFileObservation, ParquetFileWriter, normalize, record_batch_logical_bytes, sync_ancestors,
@@ -25,6 +25,7 @@ use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder, build_add
 use fs2::FileExt;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode};
 use parquet::file::properties::WriterProperties;
+use sha2::Digest;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -40,26 +41,74 @@ type LocalEngine = DefaultEngine<SharedExecutor>;
 
 fn process_writer_properties(schema: &SchemaRef) -> Result<BTreeMap<String, String>> {
     let mut process = BTreeMap::new();
-    for (environment, key) in [
-        ("ARROWCOL_LAYOUT_SORT_COLUMNS", "arrowcol.layout.sortColumns"),
-        ("ARROWCOL_LAYOUT_BLOOM_COLUMNS", "arrowcol.layout.bloomColumns"),
-        ("ARROWCOL_LAYOUT_MAX_ROWS", "arrowcol.layout.maxRows"),
-        ("ARROWCOL_LAYOUT_MAX_INPUT_BYTES", "arrowcol.layout.maxInputSize"),
-        ("ARROWCOL_LAYOUT_ROW_GROUP_ROWS", "arrowcol.layout.rowGroupRows"),
-        ("ARROWCOL_LAYOUT_PAGE_ROWS", "arrowcol.layout.pageRows"),
-        ("ARROWCOL_PARTITION_GRANULARITY", "arrowcol.partition.granularity"),
+    for (legacy, collector, key) in [
+        (
+            "ARROWCOL_LAYOUT_ENABLED",
+            "ARROWCOL_COLLECTOR_LAYOUT_ENABLED",
+            "arrowcol.layout.enabled",
+        ),
+        (
+            "ARROWCOL_LAYOUT_SORT_COLUMNS",
+            "ARROWCOL_COLLECTOR_SORT_COLUMNS",
+            "arrowcol.layout.sortColumns",
+        ),
+        (
+            "ARROWCOL_LAYOUT_BLOOM_COLUMNS",
+            "ARROWCOL_COLLECTOR_BLOOM_COLUMNS",
+            "arrowcol.layout.bloomColumns",
+        ),
+        (
+            "ARROWCOL_LAYOUT_MAX_ROWS",
+            "ARROWCOL_COLLECTOR_LAYOUT_MAX_ROWS",
+            "arrowcol.layout.maxRows",
+        ),
+        (
+            "ARROWCOL_LAYOUT_MAX_INPUT_BYTES",
+            "ARROWCOL_COLLECTOR_LAYOUT_MAX_INPUT_BYTES",
+            "arrowcol.layout.maxInputSize",
+        ),
+        (
+            "ARROWCOL_LAYOUT_ROW_GROUP_ROWS",
+            "ARROWCOL_COLLECTOR_LAYOUT_ROW_GROUP_ROWS",
+            "arrowcol.layout.rowGroupRows",
+        ),
+        (
+            "ARROWCOL_LAYOUT_PAGE_ROWS",
+            "ARROWCOL_COLLECTOR_LAYOUT_PAGE_ROWS",
+            "arrowcol.layout.pageRows",
+        ),
     ] {
-        match std::env::var(environment) {
-            Ok(value) => {
-                process.insert(key.to_owned(), value);
-            }
-            Err(std::env::VarError::NotPresent) => {}
+        let legacy_value = match std::env::var(legacy) {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
             Err(error) => return Err(error.into()),
+        };
+        let collector_value = match std::env::var(collector) {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(error) => return Err(error.into()),
+        };
+        if let (Some(legacy_value), Some(collector_value)) = (&legacy_value, &collector_value)
+            && legacy_value != collector_value
+        {
+            bail!("conflicting values for {legacy} and {collector}");
         }
+        if let Some(value) = collector_value.or(legacy_value) {
+            process.insert(key.to_owned(), value);
+        }
+    }
+    match std::env::var("ARROWCOL_PARTITION_GRANULARITY") {
+        Ok(value) => {
+            process.insert("arrowcol.partition.granularity".into(), value);
+        }
+        Err(std::env::VarError::NotPresent) => {}
+        Err(error) => return Err(error.into()),
     }
     // Preserve the legacy opt-in for customer_id and explicit sort columns.
     if schema.field_with_name("customer_id").is_ok() || process.contains_key("arrowcol.layout.sortColumns") {
-        process.insert("arrowcol.layout.enabled".into(), "true".into());
+        process
+            .entry("arrowcol.layout.enabled".into())
+            .or_insert_with(|| "true".into());
     }
     Ok(process)
 }
@@ -229,11 +278,39 @@ fn format_ingestion_partition(stamp: i64, granularity: &str) -> Result<String> {
     Ok(timestamp.format(format).to_string())
 }
 
-fn validate_transaction_id(app_id: &str, version: i64) -> Result<()> {
+pub(crate) fn validate_transaction_id(app_id: &str, version: i64) -> Result<()> {
     if app_id.is_empty() || app_id.len() > 256 || app_id.starts_with("arrowcol.purge") || version < 0 {
         bail!("invalid or reserved publication transaction identity");
     }
     Ok(())
+}
+
+fn telemetry_table_name(url: &Url) -> Option<String> {
+    let segments = url
+        .path_segments()?
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let last = segments.get(segments.len().checked_sub(3)?..)?;
+    if last.len() != 3
+        || last
+            .iter()
+            .any(|segment| !segment.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'))
+    {
+        return None;
+    }
+    Some(last.join("."))
+}
+
+fn physical_writer_schema(schema: &SchemaRef, partition_values: &BTreeMap<String, Option<String>>) -> SchemaRef {
+    Arc::new(arrow::datatypes::Schema::new_with_metadata(
+        schema
+            .fields()
+            .iter()
+            .filter(|field| !partition_values.contains_key(field.name()))
+            .cloned()
+            .collect::<Vec<_>>(),
+        schema.metadata().clone(),
+    ))
 }
 
 pub(crate) fn collision_backoff(attempt: u32) {
@@ -284,6 +361,49 @@ mod io_tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
     use std::collections::HashSet;
+
+    #[test]
+    fn physical_writer_schema_removes_partitions_before_sort_metadata() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("partition", DataType::Utf8, false),
+            Field::new("sort_key", DataType::Int32, false),
+            Field::new("payload", DataType::Int32, false),
+        ]));
+        let values = BTreeMap::from([("partition".into(), Some("p".into()))]);
+        let physical = physical_writer_schema(&schema, &values);
+        assert_eq!(
+            physical
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            vec!["sort_key", "payload"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn telemetry_table_name_only_exposes_safe_last_three_segments() -> Result<()> {
+        assert_eq!(
+            telemetry_table_name(&Url::parse(
+                "abfss://container@account.dfs.core.windows.net/root/catalog/schema/table"
+            )?),
+            Some("catalog.schema.table".to_owned())
+        );
+        assert_eq!(
+            telemetry_table_name(&Url::parse(
+                "abfss://container@account.dfs.core.windows.net/catalog/schema/table%20name"
+            )?),
+            None
+        );
+        assert_eq!(
+            telemetry_table_name(&Url::parse(
+                "abfss://container@account.dfs.core.windows.net/catalog/schema"
+            )?),
+            None
+        );
+        Ok(())
+    }
 
     #[derive(Debug)]
     struct StageControl(std::sync::Mutex<crate::publisher::MetadataSnapshot>);
@@ -1518,7 +1638,7 @@ mod io_tests {
         for batch in batches {
             let batch = batch?;
             let batch = batch.try_into_record_batch()?;
-            assert!((1..=BATCH_ROWS).contains(&batch.num_rows()));
+            assert!((1..=runtime_config()?.batch_rows).contains(&batch.num_rows()));
             let ids = batch
                 .column(0)
                 .as_any()
@@ -1645,6 +1765,61 @@ pub trait PublicationFence: Send + Sync + 'static {
         &self,
         context: &PublicationFenceContext<'_>,
     ) -> std::result::Result<(), PublicationFenceError>;
+}
+
+pub(crate) struct CoalescedCommitGroup {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) identities: Vec<(String, i64, i64)>,
+}
+
+#[derive(Debug)]
+pub(crate) struct PartialPublicationGroup {
+    pub(crate) committed: usize,
+    pub(crate) total: usize,
+}
+
+impl Display for PartialPublicationGroup {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "coalesced publication group is partially committed ({}/{} identities); rebuild the group and retry",
+            self.committed, self.total
+        )
+    }
+}
+
+impl Error for PartialPublicationGroup {}
+
+struct CoalescedPartitionOutput {
+    values: BTreeMap<String, Option<String>>,
+    files: Vec<Vec<RecordBatch>>,
+    file_rows: Vec<usize>,
+    file_bytes: Vec<usize>,
+}
+
+fn fitting_sort_chunk(
+    batch: &RecordBatch,
+    start: usize,
+    max_rows: usize,
+    max_bytes: usize,
+) -> Result<Option<RecordBatch>> {
+    let remaining = batch.num_rows().saturating_sub(start);
+    let mut low = 0;
+    let mut high = max_rows.min(remaining);
+    while low < high {
+        let rows = low + (high - low).div_ceil(2);
+        let candidate = owned_for_sort(batch.slice(start, rows))?;
+        if candidate.get_array_memory_size() <= max_bytes {
+            low = rows;
+        } else {
+            high = rows - 1;
+        }
+    }
+    if low == 0 {
+        return Ok(None);
+    }
+    Ok(Some(owned_for_sort(batch.slice(start, low))?))
 }
 
 /// Local table ownership and Kernel engine. Hold one instance per table.
@@ -2020,10 +2195,11 @@ impl DeltaTable {
             fs::create_dir_all(&path)?;
             path
         };
+        let config = runtime_config()?;
         let engine = DefaultEngineBuilder::new(Arc::clone(&store))
             .with_task_executor(shared_executor()?)
-            .with_buffer_size(NonZeroUsize::new(READ_AHEAD).context("invalid read ahead")?)
-            .with_batch_size(NonZeroUsize::new(BATCH_ROWS).context("invalid batch size")?)
+            .with_buffer_size(NonZeroUsize::new(config.read_ahead).context("invalid read ahead")?)
+            .with_batch_size(NonZeroUsize::new(config.batch_rows).context("invalid batch size")?)
             .build();
         let table = Arc::new(Self {
             root,
@@ -2070,6 +2246,32 @@ impl DeltaTable {
         let snapshot = self.snapshot()?;
         Self::validate_retention(&snapshot)?;
         Ok(snapshot.get_app_id_version(app_id, &self.engine)?)
+    }
+
+    /// Return whether each exact logical publication ID/version is already committed.
+    ///
+    /// # Errors
+    /// Rejects invalid IDs, newer committed versions, expired transaction history, or read failures.
+    pub fn lookup_publications(&self, publications: &[(String, i64)]) -> Result<Vec<bool>> {
+        let snapshot = self.snapshot()?;
+        Self::validate_retention(&snapshot)?;
+        let mut unique = std::collections::HashSet::with_capacity(publications.len());
+        publications
+            .iter()
+            .map(|(app_id, version)| {
+                validate_transaction_id(app_id, *version)?;
+                if !unique.insert(app_id.as_str()) {
+                    bail!("duplicate application identity in publication lookup");
+                }
+                match snapshot.get_app_id_version(app_id, &self.engine)? {
+                    Some(previous) if previous > *version => {
+                        bail!("publication transaction fenced by newer application version")
+                    }
+                    Some(previous) => Ok(previous == *version),
+                    None => Ok(false),
+                }
+            })
+            .collect()
     }
 
     /// Write a classic V1 Kernel checkpoint, retaining application transactions.
@@ -2258,10 +2460,11 @@ impl DeltaTable {
             .with_context(|| format!("Delta table already has a writer: {}", root.display()))?;
         let lock = WriterLock(lock);
         let url = Url::from_directory_path(&root).map_err(|()| anyhow::anyhow!("invalid table path"))?;
+        let config = runtime_config()?;
         let engine = DefaultEngineBuilder::new(Arc::clone(&store))
             .with_task_executor(shared_executor()?)
-            .with_buffer_size(NonZeroUsize::new(READ_AHEAD).context("invalid Delta read-ahead")?)
-            .with_batch_size(NonZeroUsize::new(BATCH_ROWS).context("invalid Delta batch size")?)
+            .with_buffer_size(NonZeroUsize::new(config.read_ahead).context("invalid Delta read-ahead")?)
+            .with_batch_size(NonZeroUsize::new(config.batch_rows).context("invalid Delta batch size")?)
             .build();
         let mut table = Self {
             root,
@@ -2630,9 +2833,11 @@ impl DeltaTable {
         } else {
             input
         };
+        let normalized = normalize::schema(&input)?;
+        let physical = physical_writer_schema(&normalized, &values);
         let properties = layout
             .as_ref()
-            .map(|policy| policy.writer_properties(&normalize::schema(&input)?))
+            .map(|policy| policy.writer_properties(&physical))
             .transpose()?;
         let mut writer = self.new_file_partitioned_inner(input, values, properties)?;
         if let Some(policy) = layout {
@@ -2701,9 +2906,10 @@ impl DeltaTable {
         for (batch, values) in groups {
             let result = (|| -> Result<DeltaFileWriter> {
                 let partition_app_id = crate::partition::publication_id(&app_id, &values, batch.schema().as_ref())?;
+                let physical = physical_writer_schema(&batch.schema(), &values);
                 let properties = layout
                     .as_ref()
-                    .map(|policy| policy.writer_properties(&batch.schema()))
+                    .map(|policy| policy.writer_properties(&physical))
                     .transpose()?;
                 let mut writer = self.new_file_bound(batch.schema(), values, properties, true)?;
                 if writer.table_properties != table_properties {
@@ -2735,6 +2941,239 @@ impl DeltaTable {
             }
         }
         Ok(files)
+    }
+
+    pub(crate) async fn stage_coalesced_publications(
+        self: &Arc<Self>,
+        entries: Vec<(RecordBatch, String, i64, i64)>,
+        max_files: usize,
+    ) -> Result<(Vec<StagedAppend>, Vec<(String, i64, i64)>, Vec<(String, i64, i64)>)> {
+        let Some((first_batch, _, _, _)) = entries.first() else {
+            bail!("coalesced publication group requires at least one entry");
+        };
+        let snapshot = self.existing_snapshot()?;
+        let partitions = snapshot.as_ref().map_or_else(
+            || self.partition_columns.clone(),
+            |snapshot| snapshot.table_configuration().metadata().partition_columns().to_vec(),
+        );
+        let table_properties = snapshot.as_ref().map_or_else(BTreeMap::new, |snapshot| {
+            snapshot
+                .table_configuration()
+                .metadata()
+                .configuration()
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        });
+        let first = normalize::batch(first_batch)?;
+        let resolved = arrowcol_props::resolve(&table_properties, &process_writer_properties(&first.schema())?)?;
+        let layout = publication_layout(&first.schema(), &resolved)?;
+        if let Some(policy) = &layout {
+            for name in policy.sort_columns.iter().chain(&policy.bloom_columns) {
+                if partitions.contains(name) {
+                    bail!("layout column {name} is a partition column and has no physical Parquet column");
+                }
+            }
+        }
+        let granularity = resolved.text("arrowcol.partition.granularity")?.to_owned();
+        let partitioned_ingestion = partitions.iter().any(|name| name == INGESTION_PARTITION);
+        let mut identities = Vec::with_capacity(entries.len());
+        let mut committed_identities = Vec::with_capacity(entries.len());
+        let mut unique = std::collections::HashSet::with_capacity(entries.len());
+        let mut schema: Option<SchemaRef> = None;
+        let mut output: Vec<CoalescedPartitionOutput> = Vec::new();
+        let mut pending_input_rows = 0_usize;
+        for (mut batch, app_id, version, stamp) in entries {
+            validate_transaction_id(&app_id, version)?;
+            if stamp < 0 || !unique.insert(app_id.clone()) {
+                bail!("invalid or duplicate coalesced publication identity");
+            }
+            batch = normalize::batch(&batch)?;
+            let identity_schema = batch.schema();
+            let expected_ingestion = if partitioned_ingestion {
+                Some(format_ingestion_partition(stamp, &granularity)?)
+            } else {
+                None
+            };
+            if let Some(expected) = &expected_ingestion
+                && batch.schema().field_with_name(INGESTION_PARTITION).is_err()
+            {
+                let mut fields = batch.schema().fields().to_vec();
+                fields.push(Arc::new(arrow::datatypes::Field::new(
+                    INGESTION_PARTITION,
+                    arrow::datatypes::DataType::Utf8,
+                    false,
+                )));
+                let mut columns = batch.columns().to_vec();
+                columns.push(Arc::new(arrow::array::StringArray::from(vec![
+                    expected.as_str();
+                    batch.num_rows()
+                ])));
+                batch = RecordBatch::try_new(Arc::new(arrow::datatypes::Schema::new(fields)), columns)?;
+            }
+            if let Some(schema) = &schema {
+                if schema.as_ref() != batch.schema().as_ref() {
+                    bail!("coalesced publications cross an input schema boundary");
+                }
+            } else {
+                schema = Some(batch.schema());
+            }
+            let batch_rows = batch.num_rows();
+            let splits = if partitions.is_empty() {
+                vec![(batch, BTreeMap::new())]
+            } else {
+                crate::partition::split(&batch, &partitions)?
+            };
+            if splits.is_empty() && batch_rows == 0 && !partitions.is_empty() {
+                bail!("empty custom-partitioned publications must use the existing progress path");
+            }
+            for (batch, values) in splits {
+                if let Some(expected) = &expected_ingestion
+                    && values.get(INGESTION_PARTITION).and_then(Option::as_deref) != Some(expected.as_str())
+                {
+                    bail!("coalesced input ingestion partition does not match its admission stamp");
+                }
+                let identity = if partitions.is_empty() || partitions == [INGESTION_PARTITION] || snapshot.is_none() {
+                    app_id.clone()
+                } else {
+                    crate::partition::publication_id(&app_id, &values, identity_schema.as_ref())?
+                };
+                let previous = snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.get_app_id_version(&identity, &self.engine))
+                    .transpose()?
+                    .flatten();
+                if let Some(previous) = previous {
+                    if previous > version {
+                        bail!("publication transaction fenced by newer application version");
+                    }
+                    if previous == version {
+                        committed_identities.push((identity, version, stamp));
+                        continue;
+                    }
+                }
+                identities.push((identity, version, stamp));
+                pending_input_rows = pending_input_rows
+                    .checked_add(batch.num_rows())
+                    .context("coalesced input row count overflow")?;
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                let index = output
+                    .iter()
+                    .position(|partition| partition.values == values)
+                    .unwrap_or_else(|| {
+                        output.push(CoalescedPartitionOutput {
+                            values: values.clone(),
+                            files: Vec::new(),
+                            file_rows: Vec::new(),
+                            file_bytes: Vec::new(),
+                        });
+                        output.len() - 1
+                    });
+                let partition = &mut output[index];
+                if layout.is_none() {
+                    if partition.files.is_empty() {
+                        partition.files.push(Vec::new());
+                        partition.file_rows.push(0);
+                        partition.file_bytes.push(0);
+                    }
+                    let rows = batch.num_rows();
+                    partition.files[0].push(batch);
+                    partition.file_rows[0] = partition.file_rows[0]
+                        .checked_add(rows)
+                        .context("coalesced partition row count overflow")?;
+                    continue;
+                }
+                let policy = layout.as_ref().context("missing layout policy")?;
+                let mut start = 0;
+                while start < batch.num_rows() {
+                    if partition.files.is_empty() {
+                        partition.files.push(Vec::new());
+                        partition.file_rows.push(0);
+                        partition.file_bytes.push(0);
+                    }
+                    let file = partition.files.len() - 1;
+                    let row_capacity = policy.max_rows.saturating_sub(partition.file_rows[file]);
+                    let byte_capacity = policy.max_input_bytes.saturating_sub(partition.file_bytes[file]);
+                    let chunk = fitting_sort_chunk(&batch, start, row_capacity, byte_capacity)?;
+                    let Some(chunk) = chunk else {
+                        if partition.file_rows[file] == 0 {
+                            bail!("one coalesced row exceeds the sorted-file resource budget");
+                        }
+                        partition.files.push(Vec::new());
+                        partition.file_rows.push(0);
+                        partition.file_bytes.push(0);
+                        continue;
+                    };
+                    let rows = chunk.num_rows();
+                    let bytes = chunk.get_array_memory_size();
+                    partition.file_rows[file] = partition.file_rows[file]
+                        .checked_add(rows)
+                        .context("coalesced partition row count overflow")?;
+                    partition.file_bytes[file] = partition.file_bytes[file]
+                        .checked_add(bytes)
+                        .context("coalesced partition memory count overflow")?;
+                    partition.files[file].push(chunk);
+                    start += rows;
+                }
+            }
+        }
+        let schema = schema.context("coalesced publication has no input schema")?;
+        let planned_files = output
+            .iter()
+            .try_fold(0_usize, |total, partition| total.checked_add(partition.files.len()))
+            .context("coalesced output file count overflow")?;
+        if planned_files > max_files {
+            bail!(
+                "coalesced publication requires {planned_files} files, exceeding the atomic commit capacity {max_files}"
+            );
+        }
+        let planned_rows = output
+            .iter()
+            .flat_map(|partition| &partition.file_rows)
+            .try_fold(0_usize, |total, rows| total.checked_add(*rows))
+            .context("coalesced output row count overflow")?;
+        if planned_rows != pending_input_rows {
+            bail!("coalesced partition preparation did not preserve every input row");
+        }
+        if identities.is_empty() && committed_identities.is_empty() {
+            bail!("coalesced publications produced no replay identities");
+        }
+        let mut staged = Vec::with_capacity(planned_files);
+        for partition in output {
+            for batches in partition.files {
+                let properties = layout
+                    .as_ref()
+                    .map(|policy| policy.writer_properties(&physical_writer_schema(&schema, &partition.values)))
+                    .transpose()?;
+                let result = async {
+                    let mut writer =
+                        self.new_file_bound(Arc::clone(&schema), partition.values.clone(), properties, true)?;
+                    if writer.table_properties != table_properties {
+                        writer.discard_empty()?;
+                        bail!("table properties changed while preparing coalesced publication; retry");
+                    }
+                    if let Some(policy) = &layout {
+                        let physical = Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?);
+                        writer.sorter = Some(crate::layout::FileSortBuffer::new(physical, policy.clone())?);
+                    }
+                    for batch in &batches {
+                        writer.write(batch).await?;
+                    }
+                    writer.stage().await
+                }
+                .await;
+                match result {
+                    Ok(append) => staged.push(append),
+                    Err(error) => {
+                        self.reclaim_unsubmitted(&staged);
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        Ok((staged, identities, committed_identities))
     }
 
     /// Bind one file to explicit string-valued Hive partitions.
@@ -2891,7 +3330,18 @@ impl DeltaTable {
         if files.is_empty() {
             bail!("cannot publish an empty Delta data commit");
         }
-        self.commit_files_inner(files, None)
+        self.commit_files_inner(files, None, &[])
+    }
+
+    pub(crate) fn commit_files_with_groups(
+        &self,
+        files: &[StagedAppend],
+        groups: &[CoalescedCommitGroup],
+    ) -> Result<u64> {
+        if groups.is_empty() {
+            bail!("coalesced Delta commit requires logical identities");
+        }
+        self.commit_files_inner(files, None, groups)
     }
 
     /// Publish a batch under one stable application transaction, including empty progress batches.
@@ -2900,11 +3350,16 @@ impl DeltaTable {
     /// Rejects stale/fenced identities, changed schemas and exhausted collision budgets.
     pub fn commit_files_with_transaction(&self, files: &[StagedAppend], app_id: &str, version: i64) -> Result<u64> {
         validate_transaction_id(app_id, version)?;
-        self.commit_files_inner(files, Some((app_id, version)))
+        self.commit_files_inner(files, Some((app_id, version)), &[])
     }
 
-    fn commit_files_inner(&self, files: &[StagedAppend], identity: Option<(&str, i64)>) -> Result<u64> {
-        let version = self.publish_files(files, identity)?;
+    fn commit_files_inner(
+        &self,
+        files: &[StagedAppend],
+        identity: Option<(&str, i64)>,
+        groups: &[CoalescedCommitGroup],
+    ) -> Result<u64> {
+        let version = self.publish_files(files, identity, groups)?;
         self.reclaim_unsubmitted(files);
         Ok(version)
     }
@@ -2960,7 +3415,12 @@ impl DeltaTable {
         }
     }
 
-    fn publish_files(&self, files: &[StagedAppend], identity: Option<(&str, i64)>) -> Result<u64> {
+    fn publish_files(
+        &self,
+        files: &[StagedAppend],
+        identity: Option<(&str, i64)>,
+        groups: &[CoalescedCommitGroup],
+    ) -> Result<u64> {
         let mut observation = crate::telemetry::PublicationObservation::start();
         let _guard = self
             .commit_lock
@@ -2985,9 +3445,67 @@ impl DeltaTable {
                 }
             }
             let mut pending = Vec::new();
+            let mut pending_indices = Vec::new();
             let mut identities = std::collections::HashSet::new();
+            let mut skipped = std::collections::HashSet::new();
+            let mut group_pending_indices = std::collections::HashSet::new();
+            let mut group_transaction_ids = Vec::new();
             let purge_before = snapshot.get_app_id_version(PURGE_WATERMARK, &self.engine)?;
-            for append in files {
+            let mut previous_end = 0;
+            for group in groups {
+                if group.start < previous_end
+                    || group.start > group.end
+                    || group.end > files.len()
+                    || group.identities.is_empty()
+                {
+                    bail!("invalid coalesced publication group boundaries or identities");
+                }
+                previous_end = group.end;
+                let mut group_ids = std::collections::HashSet::with_capacity(group.identities.len());
+                let mut committed = 0;
+                for (app_id, version, stamp) in &group.identities {
+                    validate_transaction_id(app_id, *version)?;
+                    if *stamp < 0 || !group_ids.insert(app_id.as_str()) {
+                        bail!("invalid or duplicate coalesced publication identity");
+                    }
+                    if let Some(previous) = snapshot.get_app_id_version(app_id, &self.engine)? {
+                        if previous > *version {
+                            bail!("publication transaction fenced by newer application version");
+                        }
+                        if previous == *version {
+                            committed += 1;
+                        }
+                    }
+                }
+                if committed != 0 && committed != group.identities.len() {
+                    return Err(anyhow::Error::new(PartialPublicationGroup {
+                        committed,
+                        total: group.identities.len(),
+                    }));
+                }
+                if committed == group.identities.len() {
+                    skipped.extend(group.start..group.end);
+                    continue;
+                }
+                for (_, _, stamp) in &group.identities {
+                    if let Some(cutoff) = purge_before
+                        && *stamp < cutoff
+                    {
+                        bail!("publication ingestion stamp is beyond the retained recovery horizon (purge fence)");
+                    }
+                }
+                group_pending_indices.extend(group.start..group.end);
+                group_transaction_ids.extend(
+                    group
+                        .identities
+                        .iter()
+                        .map(|(app_id, version, stamp)| (app_id.clone(), *version, *stamp)),
+                );
+            }
+            for (index, append) in files.iter().enumerate() {
+                if skipped.contains(&index) {
+                    continue;
+                }
                 if let Some((app_id, version)) = &append.publication {
                     if !identities.insert(app_id.as_str()) {
                         bail!("duplicate application identity in commit");
@@ -3007,8 +3525,9 @@ impl DeltaTable {
                     bail!("publication ingestion stamp is beyond the retained recovery horizon (purge fence)");
                 }
                 pending.push(append);
+                pending_indices.push(index);
             }
-            if pending.is_empty() && identity.is_none() {
+            if pending.is_empty() && group_transaction_ids.is_empty() && identity.is_none() {
                 self.sync_replayed_local_state(snapshot.version())?;
                 observation.finish("deduplicated");
                 return Ok(snapshot.version());
@@ -3019,6 +3538,36 @@ impl DeltaTable {
             for append in &pending {
                 append.claim_submission()?;
             }
+            let (rows, input_bytes, parquet_bytes, min_ingested_at_ms, max_ingested_at_ms) = pending.iter().try_fold(
+                (0_u64, 0_u64, 0_u64, None::<i64>, None::<i64>),
+                |(rows, input_bytes, parquet_bytes, min_stamp, max_stamp), append| {
+                    let stamp = append.ingested_at_ms;
+                    Ok::<_, anyhow::Error>((
+                        rows.checked_add(u64::try_from(append.file.rows)?)
+                            .context("Delta commit row count overflow")?,
+                        input_bytes
+                            .checked_add(append.file.input_bytes)
+                            .context("Delta commit input byte count overflow")?,
+                        parquet_bytes
+                            .checked_add(append.file.bytes)
+                            .context("Delta commit Parquet byte count overflow")?,
+                        stamp.map_or(min_stamp, |value| Some(min_stamp.map_or(value, |old| old.min(value)))),
+                        stamp.map_or(max_stamp, |value| Some(max_stamp.map_or(value, |old| old.max(value)))),
+                    ))
+                },
+            )?;
+            let (min_ingested_at_ms, max_ingested_at_ms) = group_transaction_ids.iter().fold(
+                (min_ingested_at_ms, max_ingested_at_ms),
+                |(min_stamp, max_stamp), (_, _, stamp)| {
+                    (
+                        Some(min_stamp.map_or(*stamp, |old| old.min(*stamp))),
+                        Some(max_stamp.map_or(*stamp, |old| old.max(*stamp))),
+                    )
+                },
+            );
+            let files_count = u64::try_from(pending.len()).context("Delta commit file count overflow")?;
+            let table_id = format!("{:x}", sha2::Sha256::digest(self.url.as_str().as_bytes()));
+            let table_name = telemetry_table_name(&self.url);
             let read_version = snapshot.version();
             let proposed_version = read_version.checked_add(1).context("Delta version overflow")?;
             let canonical: arrow::datatypes::Schema = snapshot.schema().as_ref().try_into_arrow()?;
@@ -3050,6 +3599,14 @@ impl DeltaTable {
                 let metadata =
                     DataFileMetadata::new(FileMeta::new(url, modified, append.file.bytes), append.stats.clone());
                 transaction.add_files(build_add_file_metadata(metadata, &append.context)?);
+            }
+            for (app_id, version, _) in &group_transaction_ids {
+                if !identities.insert(app_id.as_str()) {
+                    bail!("duplicate application identity in commit");
+                }
+                transaction = transaction.with_transaction_id(app_id.clone(), *version);
+            }
+            for append in &pending {
                 if let Some((app_id, version)) = &append.publication {
                     transaction = transaction.with_transaction_id(app_id.clone(), *version);
                 }
@@ -3067,7 +3624,11 @@ impl DeltaTable {
                     })
                     .map_err(anyhow::Error::new)?;
             }
-            let identifiable = identity.is_some() || pending.iter().all(|append| append.publication.is_some());
+            let identifiable = identity.is_some()
+                || pending
+                    .iter()
+                    .zip(&pending_indices)
+                    .all(|(append, index)| append.publication.is_some() || group_pending_indices.contains(index));
             let reconcile = || -> Result<Option<u64>> {
                 let latest = self
                     .snapshot()
@@ -3075,27 +3636,66 @@ impl DeltaTable {
                 Self::validate_retention(&latest)?;
                 let mut ids = pending
                     .iter()
-                    .filter_map(|append| append.publication.as_ref().map(|(id, version)| (id.as_str(), *version)))
+                    .filter_map(|append| {
+                        append
+                            .publication
+                            .as_ref()
+                            .map(|(id, version)| (id.as_str(), *version, false))
+                    })
                     .collect::<Vec<_>>();
+                ids.extend(
+                    group_transaction_ids
+                        .iter()
+                        .map(|(id, version, _)| (id.as_str(), *version, true)),
+                );
                 if let Some(id) = identity {
-                    ids.push(id);
+                    ids.push((id.0, id.1, false));
                 }
-                for (id, version) in ids {
+                let mut group_committed = 0;
+                let group_total = group_transaction_ids.len();
+                let mut all_committed = true;
+                for (id, version, is_group) in ids {
                     match latest.get_app_id_version(id, &self.engine)? {
                         Some(previous) if previous > version => {
                             bail!("publication transaction fenced by newer application version")
                         }
-                        Some(previous) if previous == version => {}
-                        _ => return Ok(None),
+                        Some(previous) if previous == version => {
+                            if is_group {
+                                group_committed += 1;
+                            }
+                        }
+                        _ => all_committed = false,
                     }
+                }
+                if group_committed != 0 && group_committed != group_total {
+                    return Err(anyhow::Error::new(PartialPublicationGroup {
+                        committed: group_committed,
+                        total: group_total,
+                    }));
+                }
+                if !all_committed {
+                    return Ok(None);
                 }
                 // Visibility is not proof of local durability after an I/O error.
                 self.sync_replayed_local_state(latest.version())?;
+                crate::telemetry::ambiguous_commit_reconciled();
                 Ok(Some(latest.version()))
             };
             match transaction.commit(&self.engine) {
                 Ok(CommitResult::Committed(commit)) => {
                     sync_directory(&self.root)?;
+                    crate::telemetry::data_commit(
+                        commit.commit_version(),
+                        rows,
+                        input_bytes,
+                        parquet_bytes,
+                        files_count,
+                        min_ingested_at_ms,
+                        max_ingested_at_ms,
+                        started.elapsed(),
+                        &table_id,
+                        table_name.as_deref(),
+                    );
                     observation.finish("committed");
                     return Ok(commit.commit_version());
                 }
@@ -3187,7 +3787,7 @@ pub struct AppendResult {
 /// A durable Parquet file that is not yet visible in a Delta snapshot.
 pub struct StagedAppend {
     pub(crate) table: Arc<DeltaTable>,
-    schema: SchemaRef,
+    pub(crate) schema: SchemaRef,
     context: BoundWriteContext,
     pub(crate) file: CompletedFile,
     pub(crate) stats: StructArray,

@@ -8,7 +8,12 @@ license.workspace = true
 repository.workspace = true
 description = "DFE-based arbitrary Arrow Flight collector"
 
+[features]
+default = []
+allocator-mimalloc = ["dep:mimalloc"]
+
 [dependencies]
+mimalloc = { version = "0.1", default-features = false, optional = true }
 arrowcol-buffer = { path = "../../crates/arrowcol-buffer" }
 arrow-deltalake = { path = "../../crates/arrow-deltalake" }
 delta_kernel = { version = "=0.29.0", default-features = false }
