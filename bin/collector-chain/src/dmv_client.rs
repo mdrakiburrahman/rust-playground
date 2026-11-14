@@ -147,6 +147,10 @@ impl Options {
     ///
     /// Rejects invalid bounds, floating-point values, combinations, and overflow.
     pub fn resolve(mut self, rows: usize, concurrency: usize) -> Result<Self> {
+        anyhow::ensure!(
+            matches!(self.dictionary_handling, Dictionaries::Hydrate),
+            "dictionary-handling=resend is unsupported for the plain DMV synthetic schemas; no dictionary-bearing workload is generated"
+        );
         anyhow::ensure!(rows > 0 && concurrency > 0, "rows and concurrency must be positive");
         anyhow::ensure!(
             self.corpus_rows == 0 || self.corpus_bytes == 0,
@@ -1243,6 +1247,7 @@ mod tests {
             vec!["--corpus-rows", "100", "--corpus-bytes", "100"],
             vec!["--max-memory-bytes", "0"],
             vec!["--stream-window-bytes", "2147483648"],
+            vec!["--dictionary-handling", "resend"],
         ] {
             let parsed = Cli::try_parse_from(std::iter::once("test").chain(args));
             assert!(parsed.map(|cli| cli.options.resolve(10, 1).is_err()).unwrap_or(true));

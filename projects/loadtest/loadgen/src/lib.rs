@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod cli;
+pub mod corpus;
 pub mod final_compaction;
 pub mod generator;
 pub mod initialize;
@@ -13,6 +14,7 @@ pub mod runner;
 pub mod schema;
 pub mod sdk;
 pub mod transport;
+pub mod tuning;
 pub mod validation;
 
 pub use cli::{Cli, Command};

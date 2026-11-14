@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeSet,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::{
     cli::{RunArgs, Scenario},
-    generator::{LogicalBatch, Scheduler, build_logical_batch, scheduled_batch_seed},
+    generator::{LogicalBatch, Scheduler, build_logical_batch_with_tuning, scheduled_batch_seed},
     manifest::{
         AckOutcome, CAPABILITY_EVIDENCE_FILE, ManifestWriter, ROUTING_EVIDENCE_FILE, RUN_METADATA_FILE,
         SendManifestEntry, run_metadata,
@@ -32,8 +32,27 @@ use crate::{
 /// # Errors
 ///
 /// Returns invalid configuration, dependency, delivery, receipt, or evidence failures.
-pub async fn run(arguments: RunArgs) -> Result<()> {
+pub async fn run(mut arguments: RunArgs) -> Result<()> {
+    if arguments.lanes == 0 {
+        arguments.lanes = std::thread::available_parallelism()?.get();
+    }
+    if arguments.client_tuning.runtime_threads == 0 {
+        arguments.client_tuning.runtime_threads = std::thread::available_parallelism()?.get();
+    }
+    if arguments.client_tuning.connect_timeout_ms == 0 {
+        arguments.client_tuning.connect_timeout_ms = u64::try_from(arguments.request_timeout.get().as_millis())?;
+    }
     validate_arguments(&arguments)?;
+    println!(
+        "LOADGEN_CLIENT_EFFECTIVE_CONFIG {}",
+        serde_json::json!({
+            "lanes": arguments.lanes, "batch_rows": arguments.batch_rows, "seed": arguments.seed,
+            "request_timeout_ms": arguments.request_timeout.get().as_millis(),
+            "max_attempts": arguments.max_attempts,
+            "retry_window_ms": arguments.retry_window.map(|window| window.get().as_millis()),
+            "tuning": arguments.client_tuning,
+        })
+    );
     let run_id = format!("run-{}-{}", now_unix_millis(), Uuid::new_v4().simple());
     let manifests = ManifestWriter::create(&arguments.results).await?;
     let schema_digest = schema_contract_sha256()?;
@@ -41,12 +60,14 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
         .write_json(RUN_METADATA_FILE, &run_metadata(&run_id, &arguments, &schema_digest))
         .await?;
 
-    let transport = FlightTransport::connect(
+    let transport = FlightTransport::connect_tuned(
         &arguments.router_endpoint,
         &arguments.catalog_endpoint,
         &arguments.edge_secret_file,
         &arguments.internal_secret_file,
         arguments.request_timeout.get(),
+        arguments.client_tuning.clone(),
+        arguments.lanes * arguments.client_tuning.connections_per_worker,
     )
     .await?;
     let tables = prepare_tables(&arguments, &run_id, &transport, &manifests).await?;
@@ -66,6 +87,20 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
         "dataflow": transport.capability_evidence(&arguments.dataflow_admin_endpoints).await?,
     });
     manifests.write_json(CAPABILITY_EVIDENCE_FILE, &capabilities).await?;
+    let corpus = Arc::new(
+        crate::corpus::PreparedCorpus::prepare(
+            &load_tables,
+            arguments.batch_rows,
+            arguments.seed,
+            arguments.lanes,
+            &arguments.client_tuning,
+        )
+        .await?,
+    );
+    manifests
+        .write_json("client-preparation.json", &corpus.evidence)
+        .await?;
+    println!("LOADGEN_CLIENT_PREPARATION {}", corpus.evidence);
 
     if !arguments.capture_settle.get().is_zero() {
         tokio::time::sleep(arguments.capture_settle.get()).await;
@@ -100,6 +135,7 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
                 manifests.clone(),
                 cancellation.clone(),
                 scheduled_table_count,
+                Arc::clone(&corpus),
             )
             .await
         {
@@ -123,6 +159,7 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
             manifests.clone(),
             cancellation.clone(),
             scheduled_table_count,
+            Arc::clone(&corpus),
         )
         .await
         {
@@ -171,6 +208,9 @@ pub async fn run(arguments: RunArgs) -> Result<()> {
 }
 
 fn validate_arguments(arguments: &RunArgs) -> Result<()> {
+    arguments
+        .client_tuning
+        .validate(arguments.lanes, arguments.batch_rows)?;
     if arguments.lanes == 0 || arguments.batch_rows == 0 || arguments.max_attempts == 0 {
         bail!("lanes, batch rows, and max attempts must be positive");
     }
@@ -202,6 +242,7 @@ async fn run_phase(
     manifests: ManifestWriter,
     cancellation: CancellationToken,
     table_count: usize,
+    corpus: Arc<crate::corpus::PreparedCorpus>,
 ) -> Result<()> {
     let phase_started_at = now_unix_millis();
     let phase_duration_ms = duration
@@ -212,11 +253,18 @@ async fn run_phase(
     let first_ordinal = scheduler.scheduled();
     let mut lanes = JoinSet::new();
     let send_policy_failures = Arc::new(AtomicU64::new(0));
+    let lane_metrics = (0..arguments.lanes)
+        .map(|_| Arc::new(LaneMetrics::new()))
+        .collect::<Vec<_>>();
+    let metrics_started = Instant::now();
     for lane in 0..arguments.lanes {
         let scheduler = Arc::clone(&scheduler);
         let batch_rows = arguments.batch_rows;
         let seed = arguments.seed;
-        let transport = transport.clone();
+        let transport = transport.for_lane(lane)?;
+        let tuning = arguments.client_tuning.clone();
+        let corpus = Arc::clone(&corpus);
+        let metrics = Arc::clone(&lane_metrics[lane]);
         let manifests = manifests.clone();
         let cancellation = cancellation.clone();
         let run_id = run_id.to_owned();
@@ -235,7 +283,25 @@ async fn run_phase(
                 }
                 let scheduled = scheduler.next();
                 let batch_seed = scheduled_batch_seed(seed, scheduled.table_batch_ordinal)?;
-                let batch = Arc::new(build_logical_batch(Arc::clone(&scheduled.table), batch_rows, batch_seed).await?);
+                let generation_started = Instant::now();
+                let batch = if let Some(batch) = corpus.get(
+                    &scheduled.table.identity.to_string(),
+                    lane,
+                    scheduled.table_batch_ordinal,
+                ) {
+                    metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
+                    batch
+                } else {
+                    metrics.cache_misses.fetch_add(1, Ordering::Relaxed);
+                    Arc::new(
+                        build_logical_batch_with_tuning(Arc::clone(&scheduled.table), batch_rows, batch_seed, &tuning)
+                            .await?,
+                    )
+                };
+                metrics.generation_us.fetch_add(
+                    u64::try_from(generation_started.elapsed().as_micros())?,
+                    Ordering::Relaxed,
+                );
                 let logical_batch_id = format!("{}:{}:{}:{}", run_id, scenario.as_str(), phase, scheduled.ordinal);
                 let sent = send_pool_with_retry(
                     &run_id,
@@ -251,11 +317,20 @@ async fn run_phase(
                     &manifests,
                     request_timeout,
                     retry,
+                    &metrics,
                 )
                 .await;
                 sent.inspect_err(|_| {
                     send_policy_failures.fetch_add(1, Ordering::Relaxed);
                 })?;
+                if tuning.interval_us > 0 {
+                    let delay = Duration::from_micros(tuning.interval_us);
+                    let delay = deadline.map_or(delay, |end| delay.min(end.saturating_duration_since(Instant::now())));
+                    tokio::select! {
+                        () = cancellation.cancelled() => break,
+                        () = tokio::time::sleep(delay) => {}
+                    }
+                }
             }
             Ok::<(), anyhow::Error>(())
         });
@@ -336,6 +411,18 @@ async fn run_phase(
         "[loadgen] {phase} finished: {} batches sent",
         scheduler.scheduled().saturating_sub(first_ordinal)
     );
+    let metrics = serde_json::json!({
+        "version": 1, "run_id": run_id, "scenario": scenario.as_str(), "phase": phase,
+        "scope": "phase_including_inflight_drain_not_exact_measurement_window",
+        "completion_semantics": "validated_admission_response_not_delta_commit",
+        "bytes_semantics": "protobuf_flight_data_lengths_excluding_grpc_http2",
+        "elapsed_seconds": metrics_started.elapsed().as_secs_f64(),
+        "workers": lane_metrics.iter().enumerate().map(|(lane, metrics)| metrics.snapshot(lane)).collect::<Result<Vec<_>>>()?,
+    });
+    manifests
+        .write_json(&format!("{}-{phase}-client-metrics.json", scenario.as_str()), &metrics)
+        .await?;
+    println!("LOADGEN_CLIENT_METRICS {metrics}");
     outcome.and(progress_outcome)
 }
 
@@ -354,16 +441,19 @@ async fn send_pool_with_retry(
     manifests: &ManifestWriter,
     request_timeout: Duration,
     retry: RetryPolicy,
+    metrics: &LaneMetrics,
 ) -> Result<()> {
     let started = Instant::now();
     let mut attempt = 0_u32;
     loop {
         attempt = attempt.saturating_add(1);
         let sent_at = now_unix_millis();
-        match transport
+        let mut observation = SendObservation::new(metrics, &batch);
+        let result = transport
             .send_batch(&batch.table, pool, Arc::clone(&batch.encoded), request_timeout)
-            .await
-        {
+            .await;
+        observation.finish(result.is_ok())?;
+        match result {
             Ok(acknowledgement) => {
                 let acknowledged_at = now_unix_millis();
                 let outcome = match acknowledgement {
@@ -429,7 +519,7 @@ async fn send_pool_with_retry(
                 if !retry.allows_another(attempt, started.elapsed()) {
                     return Err(error.context("delivery attempts exhausted"));
                 }
-                tokio::time::sleep(RetryPolicy::backoff(attempt)).await;
+                tokio::time::sleep(retry.backoff(attempt)).await;
             }
         }
     }
@@ -439,10 +529,138 @@ async fn send_pool_with_retry(
 ///
 /// `max_attempts` is the floor; an optional window keeps retrying past it so a
 /// load run can ride out a deliberate collector outage (the Quiver crash demo).
+struct LaneMetrics {
+    attempted_rows: AtomicU64,
+    completed_rows: AtomicU64,
+    error_rows: AtomicU64,
+    cancelled_rows: AtomicU64,
+    attempted_bytes: AtomicU64,
+    completed_bytes: AtomicU64,
+    error_bytes: AtomicU64,
+    cancelled_bytes: AtomicU64,
+    generation_us: AtomicU64,
+    cache_hits: AtomicU64,
+    cache_misses: AtomicU64,
+    latency: Mutex<[u64; 64]>,
+}
+
+impl LaneMetrics {
+    fn new() -> Self {
+        Self {
+            attempted_rows: AtomicU64::new(0),
+            completed_rows: AtomicU64::new(0),
+            error_rows: AtomicU64::new(0),
+            cancelled_rows: AtomicU64::new(0),
+            attempted_bytes: AtomicU64::new(0),
+            completed_bytes: AtomicU64::new(0),
+            error_bytes: AtomicU64::new(0),
+            cancelled_bytes: AtomicU64::new(0),
+            generation_us: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
+            cache_misses: AtomicU64::new(0),
+            latency: Mutex::new([0; 64]),
+        }
+    }
+
+    fn snapshot(&self, lane: usize) -> Result<serde_json::Value> {
+        let histogram = self
+            .latency
+            .lock()
+            .map_err(|_| anyhow::anyhow!("send latency histogram poisoned"))?;
+        let samples = histogram.iter().sum::<u64>();
+        let percentile = |percent: u64| {
+            if samples == 0 {
+                return None;
+            }
+            let target = samples.saturating_mul(percent).div_ceil(100);
+            let mut observed = 0;
+            histogram
+                .iter()
+                .position(|count| {
+                    observed += count;
+                    observed >= target
+                })
+                .map(|index| 1_u64 << index)
+        };
+        Ok(serde_json::json!({
+            "worker": lane,
+            "attempted_rows": self.attempted_rows.load(Ordering::Relaxed),
+            "completed_rows": self.completed_rows.load(Ordering::Relaxed),
+            "error_rows": self.error_rows.load(Ordering::Relaxed),
+            "cancelled_uncertain_rows": self.cancelled_rows.load(Ordering::Relaxed),
+            "attempted_bytes": self.attempted_bytes.load(Ordering::Relaxed),
+            "completed_bytes": self.completed_bytes.load(Ordering::Relaxed),
+            "error_bytes": self.error_bytes.load(Ordering::Relaxed),
+            "cancelled_uncertain_bytes": self.cancelled_bytes.load(Ordering::Relaxed),
+            "generation_encode_proof_lookup_wall_us": self.generation_us.load(Ordering::Relaxed),
+            "cache_hits": self.cache_hits.load(Ordering::Relaxed), "cache_misses": self.cache_misses.load(Ordering::Relaxed),
+            "send_latency": {"samples": samples, "p50_us": percentile(50), "p95_us": percentile(95), "p99_us": percentile(99),
+                "scope": "all_physical_attempts_log2_microsecond_upper_bound"},
+        }))
+    }
+}
+
+struct SendObservation<'a> {
+    metrics: &'a LaneMetrics,
+    rows: u64,
+    bytes: u64,
+    started: Instant,
+    finished: bool,
+}
+
+impl<'a> SendObservation<'a> {
+    fn new(metrics: &'a LaneMetrics, batch: &LogicalBatch) -> Self {
+        let rows = batch.rows as u64;
+        let bytes = batch
+            .encoded
+            .iter()
+            .map(|message| prost::Message::encoded_len(message) as u64)
+            .sum();
+        metrics.attempted_rows.fetch_add(rows, Ordering::Relaxed);
+        metrics.attempted_bytes.fetch_add(bytes, Ordering::Relaxed);
+        Self {
+            metrics,
+            rows,
+            bytes,
+            started: Instant::now(),
+            finished: false,
+        }
+    }
+
+    fn finish(&mut self, completed: bool) -> Result<()> {
+        self.finished = true;
+        let (rows, bytes) = if completed {
+            (&self.metrics.completed_rows, &self.metrics.completed_bytes)
+        } else {
+            (&self.metrics.error_rows, &self.metrics.error_bytes)
+        };
+        rows.fetch_add(self.rows, Ordering::Relaxed);
+        bytes.fetch_add(self.bytes, Ordering::Relaxed);
+        let micros = u64::try_from(self.started.elapsed().as_micros())?.max(1);
+        let bucket = (64 - (micros - 1).leading_zeros() as usize).min(63);
+        self.metrics
+            .latency
+            .lock()
+            .map_err(|_| anyhow::anyhow!("send latency histogram poisoned"))?[bucket] += 1;
+        Ok(())
+    }
+}
+
+impl Drop for SendObservation<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.metrics.cancelled_rows.fetch_add(self.rows, Ordering::Relaxed);
+            self.metrics.cancelled_bytes.fetch_add(self.bytes, Ordering::Relaxed);
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RetryPolicy {
     max_attempts: u32,
     window: Option<Duration>,
+    initial_backoff_ms: u64,
+    max_backoff_ms: u64,
 }
 
 impl RetryPolicy {
@@ -450,6 +668,8 @@ impl RetryPolicy {
         Self {
             max_attempts: arguments.max_attempts,
             window: arguments.retry_window.map(|window| window.get()),
+            initial_backoff_ms: arguments.client_tuning.retry_initial_backoff_ms,
+            max_backoff_ms: arguments.client_tuning.retry_max_backoff_ms,
         }
     }
 
@@ -457,9 +677,13 @@ impl RetryPolicy {
         attempts < self.max_attempts || self.window.is_some_and(|window| elapsed < window)
     }
 
-    fn backoff(attempt: u32) -> Duration {
-        let exponent = attempt.saturating_sub(1).min(5);
-        Duration::from_millis(100_u64.saturating_mul(1_u64 << exponent).min(2_000))
+    fn backoff(&self, attempt: u32) -> Duration {
+        let exponent = attempt.saturating_sub(1).min(63);
+        Duration::from_millis(
+            self.initial_backoff_ms
+                .saturating_mul(1_u64 << exponent)
+                .min(self.max_backoff_ms),
+        )
     }
 }
 
@@ -554,6 +778,8 @@ mod tests {
         let policy = RetryPolicy {
             max_attempts: 3,
             window: None,
+            initial_backoff_ms: 100,
+            max_backoff_ms: 2000,
         };
         assert!(policy.allows_another(2, Duration::from_secs(3_600)));
         assert!(!policy.allows_another(3, Duration::ZERO));
@@ -564,6 +790,8 @@ mod tests {
         let policy = RetryPolicy {
             max_attempts: 3,
             window: Some(Duration::from_secs(120)),
+            initial_backoff_ms: 100,
+            max_backoff_ms: 2000,
         };
         assert!(policy.allows_another(50, Duration::from_secs(119)));
         assert!(!policy.allows_another(50, Duration::from_secs(120)));
@@ -575,8 +803,14 @@ mod tests {
 
     #[test]
     fn retry_backoff_is_capped() {
-        assert_eq!(RetryPolicy::backoff(1), Duration::from_millis(100));
-        assert_eq!(RetryPolicy::backoff(5), Duration::from_millis(1_600));
-        assert_eq!(RetryPolicy::backoff(40), Duration::from_millis(2_000));
+        let policy = RetryPolicy {
+            max_attempts: 3,
+            window: None,
+            initial_backoff_ms: 100,
+            max_backoff_ms: 2000,
+        };
+        assert_eq!(policy.backoff(1), Duration::from_millis(100));
+        assert_eq!(policy.backoff(5), Duration::from_millis(1_600));
+        assert_eq!(policy.backoff(40), Duration::from_millis(2_000));
     }
 }
