@@ -72,6 +72,8 @@ pub struct Settings {
     pub max_idle_backoff: Duration,
     pub max_cycles: Option<u64>,
     pub max_concurrent_tables: usize,
+    /// Optional aggregate budget for per-bin decoded-byte limits, not an RSS cap.
+    pub max_concurrent_decoded_bytes: Option<u64>,
     pub operation_timeout: Duration,
     pub commit_attempts: u32,
     pub commit_budget: Duration,
@@ -156,8 +158,22 @@ impl Settings {
             bail!("VACUUM retention must not be negative");
         }
         self.optimize.validate()?;
+        self.validate_decoded_budget(self.optimize.max_decoded_bytes_per_bin)?;
         MaintenanceControl::default().with_commit_retry_limits(self.commit_attempts, self.commit_budget)?;
         resolve(&BTreeMap::new(), &process_defaults(self))?;
+        Ok(())
+    }
+
+    fn validate_decoded_budget(&self, per_bin: u64) -> Result<()> {
+        if let Some(budget) = self.max_concurrent_decoded_bytes {
+            let concurrency = u64::try_from(self.max_concurrent_tables)?;
+            let total = per_bin
+                .checked_mul(concurrency)
+                .context("concurrent decode budget overflow")?;
+            if budget == 0 || total > budget {
+                bail!("per-bin decoded limit times concurrent tables exceeds the aggregate decode budget");
+            }
+        }
         Ok(())
     }
 }
@@ -490,6 +506,7 @@ fn effective_settings(settings: &Settings, properties: &BTreeMap<String, String>
         usize::try_from(props.unsigned("arrowcol.optimize.maxActionsPerCommit")?)?;
     effective.optimize.max_plan_bytes = usize::try_from(props.unsigned("arrowcol.optimize.maxPlanSize")?)?;
     effective.optimize.max_decoded_bytes_per_bin = props.unsigned("arrowcol.optimize.maxDecodedSizePerBin")?;
+    effective.validate_decoded_budget(effective.optimize.max_decoded_bytes_per_bin)?;
     effective.optimize.max_output_file_bytes = props.unsigned("arrowcol.optimize.maxOutputFileSize")?;
     effective.optimize.max_active_files = usize::try_from(props.unsigned("arrowcol.optimize.maxActiveFiles")?)?;
     effective.optimize.max_row_group_bytes = props.unsigned("arrowcol.optimize.maxRowGroupSize")?;

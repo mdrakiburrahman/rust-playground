@@ -58,6 +58,7 @@ fn fixture() -> Result<(tempfile::TempDir, Settings, CatalogTable)> {
         max_idle_backoff: Duration::from_secs(300),
         max_cycles: None,
         max_concurrent_tables: 1,
+        max_concurrent_decoded_bytes: None,
         operation_timeout: Duration::from_secs(30),
         commit_attempts: 8,
         commit_budget: Duration::from_secs(10),
@@ -246,6 +247,30 @@ fn invalid_process_properties_are_rejected_before_a_pass() -> Result<()> {
         .process_properties
         .insert("arrowcol.optimize.minFiles".into(), "1".into());
     assert!(settings.validate().is_err());
+    Ok(())
+}
+
+#[test]
+fn decoded_budget_rejects_table_override_without_mutating_data() -> Result<()> {
+    let (root, mut settings, mut source) = fixture()?;
+    settings.operations = vec![Operation::Optimize];
+    settings.max_concurrent_tables = 2;
+    settings.max_concurrent_decoded_bytes = Some(2 * 1024 * 1024 * 1024);
+    settings.validate()?;
+    source
+        .0
+        .properties
+        .insert("arrowcol.optimize.maxDecodedSizePerBin".into(), "2 GiB".into());
+    persist_policy(&source)?;
+    let before = inventory(root.path())?;
+    let results = run_cycle_with_discovery(&settings, &source, &Metrics::new(), &Arc::new(AtomicBool::new(false)))?;
+    assert!(
+        results[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("aggregate decode budget"))
+    );
+    assert_eq!(before, inventory(root.path())?);
     Ok(())
 }
 

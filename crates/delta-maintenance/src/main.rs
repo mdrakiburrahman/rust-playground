@@ -58,6 +58,9 @@ struct Cli {
     max_cycles: Option<u64>,
     #[arg(long, env = "ARROWCOL_MAINT_MAX_CONCURRENT_TABLES", default_value_t = 1)]
     max_concurrent_tables: usize,
+    /// Bound concurrent per-bin decoded limits; this is not a process RSS limit.
+    #[arg(long, env = "ARROWCOL_MAINT_MAX_CONCURRENT_DECODED_BYTES")]
+    max_concurrent_decoded_bytes: Option<u64>,
     /// Per-operation time budget; work stops between bounded steps once exceeded.
     #[arg(long, env = "ARROWCOL_MAINT_OPERATION_TIMEOUT_SECS", default_value_t = 900)]
     operation_timeout_secs: u64,
@@ -206,6 +209,7 @@ fn settings(cli: Cli) -> Result<Settings> {
         max_idle_backoff: Duration::from_secs(cli.max_idle_backoff_secs),
         max_cycles: cli.max_cycles,
         max_concurrent_tables: cli.max_concurrent_tables,
+        max_concurrent_decoded_bytes: cli.max_concurrent_decoded_bytes,
         operation_timeout: Duration::from_secs(cli.operation_timeout_secs),
         commit_attempts: cli.commit_attempts,
         commit_budget: Duration::from_secs(cli.commit_budget_secs),
