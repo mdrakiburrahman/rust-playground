@@ -310,11 +310,22 @@ impl ParquetWriterConfig {
         self.validate()?;
         let descriptor = ArrowSchemaConverter::new().convert(schema)?;
         let leaves = descriptor.columns();
-        for path in self.columns.keys() {
+        let leaf_index = |path: &str| -> Result<usize> {
+            let mut matching = leaves
+                .iter()
+                .enumerate()
+                .filter(|(_, leaf)| leaf.path().string() == path);
+            let (index, _) = matching
+                .next()
+                .with_context(|| format!("unknown physical Parquet column {path}"))?;
             ensure!(
-                leaves.iter().any(|leaf| leaf.path().string() == *path),
-                "unknown physical Parquet column {path}"
+                matching.next().is_none(),
+                "ambiguous physical Parquet column selector {path}"
             );
+            Ok(index)
+        };
+        for path in self.columns.keys() {
+            leaf_index(path)?;
         }
         for leaf in leaves {
             let path = leaf.path().string();
@@ -331,12 +342,7 @@ impl ParquetWriterConfig {
         }
         let mut builder = self.defaults.apply(base.unwrap_or_default().into(), None)?;
         for (path, options) in &self.columns {
-            builder = options.apply(
-                builder,
-                Some(&ColumnPath::from(
-                    path.split('.').map(str::to_owned).collect::<Vec<_>>(),
-                )),
-            )?;
+            builder = options.apply(builder, Some(leaves[leaf_index(path)?].path()))?;
         }
         if let Some(version) = self.writer_version {
             builder = builder.set_writer_version(match version {
@@ -374,10 +380,7 @@ impl ParquetWriterConfig {
             let columns = sorting
                 .iter()
                 .map(|sort| {
-                    let index = leaves
-                        .iter()
-                        .position(|leaf| leaf.path().string() == sort.path)
-                        .with_context(|| format!("unknown sorting column {}", sort.path))?;
+                    let index = leaf_index(&sort.path)?;
                     Ok(SortingColumn {
                         column_idx: i32::try_from(index)?,
                         descending: sort.descending,
@@ -386,6 +389,8 @@ impl ParquetWriterConfig {
                 })
                 .collect::<Result<Vec<_>>>()?;
             builder = builder.set_sorting_columns(Some(columns));
+        } else {
+            builder = builder.set_sorting_columns(None);
         }
         Ok(builder.build())
     }
@@ -411,6 +416,27 @@ pub fn process_config() -> Result<&'static ParquetWriterConfig> {
         Ok(config) => Ok(config),
         Err(error) => anyhow::bail!("{error}"),
     }
+}
+
+/// Return sanitized startup policy for experiment provenance; null fields inherit
+/// the documented layout/Parquet defaults and are resolved per physical schema.
+///
+/// # Errors
+/// Returns invalid startup configuration or JSON serialization errors.
+pub fn effective_startup_config_json() -> Result<String> {
+    let value = serde_json::json!({"parquet_writer": process_config()?});
+    #[cfg(feature = "delta")]
+    let value = {
+        let mut value = value;
+        value["runtime"] = serde_json::to_value(crate::delta_io::runtime_config()?)?;
+        value["commit_telemetry"] = serde_json::json!({
+            "schema_version": 1,
+            "scope": "new_ingestion_addfiles_after_sync",
+            "clock": "system_unix_ms"
+        });
+        value
+    };
+    Ok(serde_json::to_string(&value)?)
 }
 
 pub(crate) fn sorting_from_properties(
@@ -451,6 +477,54 @@ mod tests {
             Field::new("id", DataType::Int32, false),
             Field::new("value", DataType::Utf8, false),
         ]))
+    }
+
+    #[test]
+    fn literal_dotted_paths_apply_and_ambiguous_selectors_fail() -> Result<()> {
+        let literal = Arc::new(Schema::new(vec![Field::new("a.b", DataType::Int32, false)]));
+        let config: ParquetWriterConfig = serde_json::from_str(r#"{"columns":{"a.b":{"compression":"snappy"}}}"#)?;
+        let properties = config.writer_properties(&literal, None, &[])?;
+        assert_eq!(
+            properties.compression(&ColumnPath::from(vec!["a.b".to_owned()])),
+            Compression::SNAPPY
+        );
+        let ambiguous = Arc::new(Schema::new(vec![
+            Field::new("a.b", DataType::Int32, false),
+            Field::new(
+                "a",
+                DataType::Struct(vec![Field::new("b", DataType::Int32, false)].into()),
+                false,
+            ),
+        ]));
+        assert!(config.writer_properties(&ambiguous, None, &[]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_empty_sorting_metadata_clears_the_base() -> Result<()> {
+        let base = WriterProperties::builder()
+            .set_sorting_columns(Some(vec![SortingColumn {
+                column_idx: 0,
+                descending: false,
+                nulls_first: false,
+            }]))
+            .build();
+        let config = ParquetWriterConfig {
+            sorting_columns: Some(vec![]),
+            ..Default::default()
+        };
+        let verified = vec![SortColumn {
+            path: "id".into(),
+            descending: false,
+            nulls_first: false,
+        }];
+        assert!(
+            config
+                .writer_properties(&schema(), Some(base), &verified)?
+                .sorting_columns()
+                .is_none()
+        );
+        Ok(())
     }
 
     #[test]

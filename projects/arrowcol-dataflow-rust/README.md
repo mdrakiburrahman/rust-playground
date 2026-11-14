@@ -24,6 +24,10 @@ constant and varies replicas and `--num-cores`, not an unused side deployment.
 
 ## Build and validate
 
+| Reference | Contents |
+| --- | --- |
+| [Performance controls](../../docs/arrowcol-dataflow/PERFORMANCE.md) | Parquet, runtime, bounded batching and rebuild-only allocator/CPU settings |
+
 ```bash
 npx --no-install nx run arrowcol-dataflow-rust:build
 npx --no-install nx run arrowcol-dataflow-rust:config-check

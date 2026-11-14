@@ -566,6 +566,7 @@ async fn run_batch_worker(
         metrics: &metrics,
         identity: &identity,
         max_pending_files,
+        coalesce_publications: policy.coalesce_publications,
         adaptive_defaults: policy.adaptive_file.build(),
     };
     loop {
@@ -685,6 +686,7 @@ struct GroupPublisher<'a> {
     metrics: &'a RuntimeMetrics,
     identity: &'a arrowcol_protocol::TableIdentity,
     max_pending_files: usize,
+    coalesce_publications: bool,
     adaptive_defaults: arrow_deltalake::sizing::AdaptiveFileSizeConfig,
 }
 
@@ -738,6 +740,52 @@ impl GroupPublisher<'_> {
             let mut staged = Vec::with_capacity(group.len());
             let mut updated_estimator = estimator.clone();
             let mut publications = HashMap::with_capacity(group.len());
+            if self.coalesce_publications {
+                let mut inputs = Vec::with_capacity(group.len());
+                for entry in group.iter() {
+                    if let Some(stamp) = publications.insert(entry.publication_id, entry.ingested_at_ms) {
+                        if stamp != entry.ingested_at_ms {
+                            return Err(ExportFailure::Transient(
+                                "replayed publication has conflicting ingestion timestamps; retained for reconciliation"
+                                    .to_owned(),
+                            ));
+                        }
+                        continue;
+                    }
+                    inputs.push((
+                        entry.batch.clone(),
+                        format!("arrowcol.publication.{}", entry.publication_id),
+                        0,
+                        i64::try_from(entry.ingested_at_ms.get())
+                            .map_err(|error| ExportFailure::Transient(error.to_string()))?,
+                    ));
+                }
+                let prepared = table.stage_coalesced_publications(inputs).await.map_err(|error| {
+                    worker_failed = true;
+                    ExportFailure::Transient(format!("coalesced staging failed: {error:#}"))
+                })?;
+                published_files = prepared.appends.len() as u64;
+                for append in &prepared.appends {
+                    updated_estimator.observe(append.observation()).map_err(|error| {
+                        ExportFailure::Permanent(format!("file sizing observation failed: {error}"))
+                    })?;
+                }
+                let committed = table
+                    .submit_prepared_group(prepared, true)
+                    .await
+                    .map_err(|error| {
+                        worker_failed = true;
+                        ExportFailure::Transient(format!("atomic group submission failed: {error:#}"))
+                    })?
+                    .wait()
+                    .await
+                    .map_err(|error| {
+                        worker_failed = true;
+                        ExportFailure::Transient(format!("atomic group commit failed: {error:#}"))
+                    })?;
+                *estimator = updated_estimator;
+                return Ok(committed.version);
+            }
             for entry in group.iter() {
                 if let Some(stamp) = publications.insert(entry.publication_id, entry.ingested_at_ms) {
                     if stamp != entry.ingested_at_ms {
@@ -932,7 +980,8 @@ fn map_receipt_error(error: CommitReceiptError) -> ExportFailure {
 }
 
 fn validate_exporter_config(value: &serde_json::Value) -> Result<(), otel_arrow_dfe_config::error::Error> {
-    let config: DeltaExporterConfig = parse_config(value)?;
+    let mut config: DeltaExporterConfig = parse_config(value)?;
+    config.apply_environment().map_err(config_error)?;
     config.validate().map_err(config_error)
 }
 
@@ -944,10 +993,23 @@ fn create_exporter(
     _capabilities: &otel_arrow_dfe_engine::capability::registry::Capabilities,
 ) -> Result<ExporterWrapper<OtapPdata>, otel_arrow_dfe_config::error::Error> {
     let mut config: DeltaExporterConfig = parse_config(&node_config.config)?;
+    config.apply_environment().map_err(config_error)?;
     if let Some(root) = std::env::var_os("ARROWCOL_DELTA_ROOT") {
         config.base_path = PathBuf::from(root);
     }
     config.validate().map_err(config_error)?;
+    eprintln!(
+        "arrowcol_effective_config {}",
+        serde_json::json!({
+            "component": "exporter",
+            "config": {"batching": config.batching, "commit": config.commit}
+        })
+    );
+    tracing::info!(
+        component = "exporter",
+        effective_config = %serde_json::json!({"batching": config.batching, "commit": config.commit}),
+        "arrowcol_effective_config"
+    );
     let exporter = GenericDeltaExporter::shared(config, global_metrics()).map_err(config_error)?;
     Ok(ExporterWrapper::local(exporter, node, node_config, exporter_config))
 }
@@ -1449,64 +1511,69 @@ mod tests {
     /// Scenario: Durable replay regroups a publication after equal independent
     /// payloads have already committed.
     /// Guarantees: Only the original publication UUID is deduplicated; each
-    /// independent admission retains its own file transaction and timestamp.
+    /// independent admission retains its logical transaction and timestamp even
+    /// when opt-in coalescing shares the physical file.
     #[tokio::test]
     async fn replay_identity_is_independent_of_flush_grouping() {
-        let directory = tempfile::tempdir().expect("directory");
-        let store = Arc::new(MemoryRoutingStore::default());
-        let holder = CollectorInstanceId::new();
-        let lease = lease(&store, holder).await;
-        let exporter = GenericDeltaExporter::with_batching(
-            directory.path().to_path_buf(),
-            store as Arc<dyn RoutingStore>,
-            arrow_deltalake::commit::CommitOptions {
-                batch_window: std::time::Duration::from_millis(5),
-                ..Default::default()
-            },
-            FileBatchConfig {
-                max_age: std::time::Duration::from_secs(60),
-                ..Default::default()
-            },
-            Arc::new(RuntimeMetrics::new(holder)),
-        )
-        .expect("exporter");
-        let original = envelope_for(&lease);
-        let mut independent = original.clone();
-        independent.publication_id = Some(arrowcol_protocol::PublicationId::new());
-        let first = exporter.stage(envelope_pdata(original.clone())).await.expect("first");
-        let second = exporter.stage(envelope_pdata(independent)).await.expect("independent");
-        let same_group_replay = exporter
-            .stage(envelope_pdata(original.clone()))
-            .await
-            .expect("same-group replay");
-        exporter.backend.flush_pending().await.expect("group flush");
-        first.wait().await.expect("first published");
-        second.wait().await.expect("independent published");
-        same_group_replay.wait().await.expect("same-group replay deduplicated");
-        let replay = exporter.stage(envelope_pdata(original)).await.expect("replay");
-        exporter.backend.flush_pending().await.expect("replay flush");
-        replay.wait().await.expect("idempotent replay");
-        let adds = std::fs::read_dir(directory.path().join("demo/generated/events/_delta_log"))
-            .expect("log")
-            .map(|entry| entry.expect("log entry").path())
-            .filter(|path| path.extension().is_some_and(|extension| extension == "json"))
-            .map(|path| {
-                std::fs::read_to_string(path)
-                    .expect("read log")
-                    .lines()
-                    .filter(|line| {
-                        serde_json::from_str::<serde_json::Value>(line)
-                            .expect("JSON")
-                            .get("add")
-                            .is_some()
-                    })
-                    .count()
-            })
-            .sum::<usize>();
-        assert_eq!(
-            adds, 2,
-            "replay must not duplicate rows or merge independent admissions"
-        );
+        for coalesce_publications in [false, true] {
+            let directory = tempfile::tempdir().expect("directory");
+            let store = Arc::new(MemoryRoutingStore::default());
+            let holder = CollectorInstanceId::new();
+            let lease = lease(&store, holder).await;
+            let exporter = GenericDeltaExporter::with_batching(
+                directory.path().to_path_buf(),
+                store as Arc<dyn RoutingStore>,
+                arrow_deltalake::commit::CommitOptions {
+                    batch_window: std::time::Duration::from_millis(5),
+                    ..Default::default()
+                },
+                FileBatchConfig {
+                    coalesce_publications,
+                    max_age: std::time::Duration::from_secs(60),
+                    ..Default::default()
+                },
+                Arc::new(RuntimeMetrics::new(holder)),
+            )
+            .expect("exporter");
+            let original = envelope_for(&lease);
+            let mut independent = original.clone();
+            independent.publication_id = Some(arrowcol_protocol::PublicationId::new());
+            let first = exporter.stage(envelope_pdata(original.clone())).await.expect("first");
+            let second = exporter.stage(envelope_pdata(independent)).await.expect("independent");
+            let same_group_replay = exporter
+                .stage(envelope_pdata(original.clone()))
+                .await
+                .expect("same-group replay");
+            exporter.backend.flush_pending().await.expect("group flush");
+            first.wait().await.expect("first published");
+            second.wait().await.expect("independent published");
+            same_group_replay.wait().await.expect("same-group replay deduplicated");
+            let replay = exporter.stage(envelope_pdata(original)).await.expect("replay");
+            exporter.backend.flush_pending().await.expect("replay flush");
+            replay.wait().await.expect("idempotent replay");
+            let adds = std::fs::read_dir(directory.path().join("demo/generated/events/_delta_log"))
+                .expect("log")
+                .map(|entry| entry.expect("log entry").path())
+                .filter(|path| path.extension().is_some_and(|extension| extension == "json"))
+                .map(|path| {
+                    std::fs::read_to_string(path)
+                        .expect("read log")
+                        .lines()
+                        .filter(|line| {
+                            serde_json::from_str::<serde_json::Value>(line)
+                                .expect("JSON")
+                                .get("add")
+                                .is_some()
+                        })
+                        .count()
+                })
+                .sum::<usize>();
+            assert_eq!(
+                adds,
+                if coalesce_publications { 1 } else { 2 },
+                "replay must not duplicate physical output"
+            );
+        }
     }
 
     /// Scenario: Legacy durable pdata has no stable identity or ingestion time.

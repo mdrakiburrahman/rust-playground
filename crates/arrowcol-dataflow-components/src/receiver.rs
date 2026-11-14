@@ -416,7 +416,8 @@ struct ArrowFlightReceiver {
 }
 
 fn validate_receiver_config(value: &serde_json::Value) -> Result<(), otel_arrow_dfe_config::error::Error> {
-    let config: FlightReceiverConfig = parse_config(value)?;
+    let mut config: FlightReceiverConfig = parse_config(value)?;
+    config.apply_environment().map_err(config_error)?;
     config.validate().map_err(config_error)
 }
 
@@ -428,10 +429,43 @@ fn create_receiver(
     _capabilities: &otel_arrow_dfe_engine::capability::registry::Capabilities,
 ) -> Result<ReceiverWrapper<OtapPdata>, otel_arrow_dfe_config::error::Error> {
     let mut config: FlightReceiverConfig = parse_config(&node_config.config)?;
+    config.apply_environment().map_err(config_error)?;
     if let Some(generation) = crate::config::process_cloud_generation() {
         config.registration.instance_key = format!("{}|cloud={generation}", config.registration.instance_key);
     }
     config.validate().map_err(config_error)?;
+    eprintln!(
+        "arrowcol_effective_config {}",
+        serde_json::json!({
+            "component": "receiver",
+            "config": {
+                "limits": config.limits,
+                "pressure": {
+                    "max_concurrent_streams": config.registration.max_concurrent_streams,
+                    "rss_limit_bytes": config.registration.rss_limit_bytes,
+                    "buffered_bytes_limit": config.registration.buffered_bytes_limit,
+                    "buffered_rows_limit": config.registration.buffered_rows_limit,
+                    "buffered_batches_limit": config.registration.buffered_batches_limit,
+                    "pressure_interval": format!("{:?}", config.registration.pressure_interval)
+                }
+            }
+        })
+    );
+    tracing::info!(
+        component = "receiver",
+        effective_config = %serde_json::json!({
+            "limits": config.limits,
+            "pressure": {
+                "max_concurrent_streams": config.registration.max_concurrent_streams,
+                "rss_limit_bytes": config.registration.rss_limit_bytes,
+                "buffered_bytes_limit": config.registration.buffered_bytes_limit,
+                "buffered_rows_limit": config.registration.buffered_rows_limit,
+                "buffered_batches_limit": config.registration.buffered_batches_limit,
+                "pressure_interval": format!("{:?}", config.registration.pressure_interval)
+            }
+        }),
+        "arrowcol_effective_config"
+    );
     let routing = config.routing.build().map_err(config_error)?;
     let metrics = global_metrics();
     metrics
