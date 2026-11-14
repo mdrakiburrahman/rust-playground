@@ -18,7 +18,7 @@ fn capability_evidence() -> Vec<Value> {
 }
 
 fn role_environment(config: &OatConfig, role: ComponentRole) -> Result<std::collections::BTreeMap<String, String>> {
-    config.tunables.validate()?;
+    config.tunables.validate_for_oat()?;
     config.tunables.environment_for(role)
 }
 
@@ -159,6 +159,26 @@ mod tunable_injection_tests {
         inject_container_environment(&mut client, &role_environment(&config, ComponentRole::Client)?)?;
         assert_eq!(client["env"][1]["value"], "257");
         assert_eq!(client["env"][0]["value"], "owned");
+        Ok(())
+    }
+
+    #[test]
+    fn dmv_transport_defaults_remain_valid_through_compose_and_aks_projection() -> Result<()> {
+        let mut config = config()?;
+        config.tunables = serde_json::from_value(json!({"transport":{"max_message_bytes":4_194_304}}))?;
+        config.validate()?;
+        assert!(config.tunables.validate().is_err());
+        let environment = role_environment(&config, ComponentRole::Client)?;
+        assert!(environment.values().any(|value| value == "4194304"));
+        let compose = compose_tunables(&config)?;
+        assert_eq!(compose["services"]["oat-client"]["environment"], json!(environment));
+        let mut client = json!({"env":[]});
+        inject_container_environment(&mut client, &environment)?;
+        let expected = environment
+            .iter()
+            .map(|(name, value)| json!({"name":name,"value":value}))
+            .collect::<Vec<_>>();
+        assert_eq!(client["env"], json!(expected));
         Ok(())
     }
 
