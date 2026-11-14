@@ -45,6 +45,11 @@ impl DmvTable {
     pub fn identity(&self) -> &TableIdentity {
         &self.identity
     }
+
+    #[must_use]
+    pub fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
 }
 
 /// Returns the names of the DMV tables in the embedded fixture.

@@ -165,6 +165,22 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.routing.connect_timeout", "15s; SQL Server routing only"),
     capability!("collector.routing.command_timeout", "30s; SQL Server routing only"),
     capability!("collector.exporter.authority_timeout", "10s"),
+    capability!(
+        "collector.layout.enabled",
+        "automatic for customer_id schemas or explicit sort columns"
+    ),
+    capability!(
+        "collector.layout.sort_columns",
+        "customer_id (comma-separated, ordered)"
+    ),
+    capability!(
+        "collector.layout.bloom_columns",
+        "customer_id (comma-separated; empty disables Bloom filters)"
+    ),
+    capability!("collector.layout.max_rows", "262144"),
+    capability!("collector.layout.max_input_bytes", "67108864"),
+    capability!("collector.layout.row_group_rows", "16384"),
+    capability!("collector.layout.page_rows", "2048"),
     capability!("collector.commit.batch_window", "10s"),
     capability!("collector.commit.max_files_per_commit", "64"),
     capability!("collector.commit.max_pending_files", "256"),
@@ -510,6 +526,7 @@ impl Tunables {
         validate_router(self.router.as_ref())?;
         if let Some(collector) = &self.collector {
             validate_collector_controls(collector)?;
+            validate_collector_layout(collector.layout.as_ref())?;
             validate_batching(collector.batching.as_ref())?;
             validate_commit(collector.commit.as_ref())?;
             validate_limits(collector.limits.as_ref())?;
@@ -660,6 +677,27 @@ impl Tunables {
                     canonicalize_optional_duration(&mut value.connect_timeout, "collector.routing.connect_timeout")?;
                     canonicalize_optional_duration(&mut value.command_timeout, "collector.routing.command_timeout")?;
                     insert_json_config("ARROWCOL_COLLECTOR_ROUTING_CONFIG", &value, &mut output)?;
+                }
+                if let Some(layout) = &collector.layout {
+                    if let Some(enabled) = layout.enabled {
+                        output.insert("ARROWCOL_COLLECTOR_LAYOUT_ENABLED".to_owned(), enabled.to_string());
+                    }
+                    if let Some(columns) = &layout.sort_columns {
+                        output.insert("ARROWCOL_COLLECTOR_SORT_COLUMNS".to_owned(), columns.join(","));
+                    }
+                    if let Some(columns) = &layout.bloom_columns {
+                        output.insert("ARROWCOL_COLLECTOR_BLOOM_COLUMNS".to_owned(), columns.join(","));
+                    }
+                    for (suffix, value) in [
+                        ("LAYOUT_MAX_ROWS", layout.max_rows),
+                        ("LAYOUT_MAX_INPUT_BYTES", layout.max_input_bytes),
+                        ("LAYOUT_ROW_GROUP_ROWS", layout.row_group_rows),
+                        ("LAYOUT_PAGE_ROWS", layout.page_rows),
+                    ] {
+                        if let Some(value) = value {
+                            output.insert(format!("ARROWCOL_COLLECTOR_{suffix}"), value.to_string());
+                        }
+                    }
                 }
                 if let Some(runtime) = &collector.runtime {
                     for (field, value) in [
@@ -960,6 +998,56 @@ fn canonicalize_optional_duration(value: &mut Option<String>, name: &str) -> Res
     if let Some(value) = value {
         let duration = validate_duration(name, Some(value), "1s")?;
         *value = humantime::format_duration(duration).to_string();
+    }
+    Ok(())
+}
+
+fn validate_collector_layout(layout: Option<&LayoutTunables>) -> Result<()> {
+    let Some(layout) = layout else {
+        return Ok(());
+    };
+    let has_overrides = layout.sort_columns.is_some()
+        || layout.bloom_columns.is_some()
+        || layout.max_rows.is_some()
+        || layout.max_input_bytes.is_some()
+        || layout.row_group_rows.is_some()
+        || layout.page_rows.is_some();
+    if layout.enabled == Some(false) && has_overrides {
+        bail!("collector.layout settings require enabled=true; disabled layout would ignore them");
+    }
+    let max_rows = layout.max_rows.unwrap_or(262_144);
+    if max_rows == 0 || max_rows > u32::MAX as usize {
+        bail!("collector.layout.max_rows must fit a positive u32");
+    }
+    for (name, value) in [
+        (
+            "collector.layout.max_input_bytes",
+            layout.max_input_bytes.unwrap_or(67_108_864),
+        ),
+        (
+            "collector.layout.row_group_rows",
+            layout.row_group_rows.unwrap_or(16_384),
+        ),
+        ("collector.layout.page_rows", layout.page_rows.unwrap_or(2_048)),
+    ] {
+        positive(name, Some(value))?;
+    }
+    for (name, columns, required) in [
+        ("collector.layout.sort_columns", layout.sort_columns.as_deref(), true),
+        ("collector.layout.bloom_columns", layout.bloom_columns.as_deref(), false),
+    ] {
+        if let Some(columns) = columns {
+            if required && columns.is_empty() {
+                bail!("{name} must not be empty");
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            if columns
+                .iter()
+                .any(|column| column.trim().is_empty() || column.contains(',') || !seen.insert(column))
+            {
+                bail!("{name} must contain unique nonempty column names without commas");
+            }
+        }
     }
     Ok(())
 }
@@ -2101,6 +2189,13 @@ mod tests {
                     pressure_interval: Some("3s".to_owned()),
                     ..Default::default()
                 }),
+                layout: Some(LayoutTunables {
+                    enabled: Some(true),
+                    sort_columns: Some(vec!["customer_id".to_owned(), "row_id".to_owned()]),
+                    bloom_columns: Some(Vec::new()),
+                    max_rows: Some(100_000),
+                    ..Default::default()
+                }),
                 runtime: Some(RuntimeTunables {
                     workers: Some(8),
                     batch_rows: Some(16_384),
@@ -2120,6 +2215,10 @@ mod tests {
             env["ARROWCOL_COLLECTOR_PRESSURE_CONFIG"],
             r#"{"pressure_interval":"3s"}"#
         );
+        assert_eq!(env["ARROWCOL_COLLECTOR_LAYOUT_ENABLED"], "true");
+        assert_eq!(env["ARROWCOL_COLLECTOR_SORT_COLUMNS"], "customer_id,row_id");
+        assert_eq!(env["ARROWCOL_COLLECTOR_BLOOM_COLUMNS"], "");
+        assert_eq!(env["ARROWCOL_COLLECTOR_LAYOUT_MAX_ROWS"], "100000");
         assert_eq!(env["ARROWCOL_COLLECTOR_RUNTIME_WORKERS"], "8");
         assert_eq!(env["ARROWCOL_COLLECTOR_BATCH_ROWS"], "16384");
         Ok(())

@@ -130,6 +130,7 @@ pub struct CollectorTunables {
     pub catalog: Option<CatalogTunables>,
     pub commit: Option<CommitTunables>,
     pub exporter: Option<ExporterTunables>,
+    pub layout: Option<LayoutTunables>,
     pub limits: Option<LimitsTunables>,
     pub pressure: Option<PressureTunables>,
     pub routing: Option<RoutingTunables>,
@@ -195,6 +196,18 @@ pub struct CommitTunables {
     pub batch_window: Option<String>,
     pub max_files_per_commit: Option<usize>,
     pub max_pending_files: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LayoutTunables {
+    pub enabled: Option<bool>,
+    pub sort_columns: Option<Vec<String>>,
+    pub bloom_columns: Option<Vec<String>>,
+    pub max_rows: Option<usize>,
+    pub max_input_bytes: Option<usize>,
+    pub row_group_rows: Option<usize>,
+    pub page_rows: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
