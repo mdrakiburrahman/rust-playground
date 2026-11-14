@@ -1791,6 +1791,24 @@ impl Display for PartialPublicationGroup {
 
 impl Error for PartialPublicationGroup {}
 
+#[derive(Debug)]
+pub(crate) struct CoalescedGroupCapacityExceeded {
+    pub(crate) required_files: usize,
+    pub(crate) max_files: usize,
+}
+
+impl Display for CoalescedGroupCapacityExceeded {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "coalesced publication group requires at least {} files, exceeding the atomic commit capacity {}; increase max_files_per_commit or reduce the publication's partition count",
+            self.required_files, self.max_files
+        )
+    }
+}
+
+impl Error for CoalescedGroupCapacityExceeded {}
+
 struct CoalescedPartitionOutput {
     values: BTreeMap<String, Option<String>>,
     files: Vec<Vec<RecordBatch>>,
@@ -2981,7 +2999,8 @@ impl DeltaTable {
         let mut committed_identities = Vec::with_capacity(entries.len());
         let mut unique = std::collections::HashSet::with_capacity(entries.len());
         let mut schema: Option<SchemaRef> = None;
-        let mut output: Vec<CoalescedPartitionOutput> = Vec::new();
+        let mut output: BTreeMap<crate::partition::PartitionValues, CoalescedPartitionOutput> = BTreeMap::new();
+        let mut planned_files = 0_usize;
         let mut pending_input_rows = 0_usize;
         for (mut batch, app_id, version, stamp) in entries {
             validate_transaction_id(&app_id, version)?;
@@ -3019,38 +3038,69 @@ impl DeltaTable {
                 schema = Some(batch.schema());
             }
             let batch_rows = batch.num_rows();
-            let splits = if partitions.is_empty() {
-                vec![(batch, BTreeMap::new())]
-            } else {
-                crate::partition::split(&batch, &partitions)?
+            let mut partition_identities = BTreeMap::new();
+            let mut new_partition_files = 0_usize;
+            let splits = {
+                let mut register_partition = |values: &crate::partition::PartitionValues| -> Result<()> {
+                    if let Some(expected) = &expected_ingestion
+                        && values.get(INGESTION_PARTITION).and_then(Option::as_deref) != Some(expected.as_str())
+                    {
+                        bail!("coalesced input ingestion partition does not match its admission stamp");
+                    }
+                    let identity = if partitions.is_empty() || partitions == [INGESTION_PARTITION] || snapshot.is_none()
+                    {
+                        app_id.clone()
+                    } else {
+                        crate::partition::publication_id(&app_id, values, identity_schema.as_ref())?
+                    };
+                    let previous = snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.get_app_id_version(&identity, &self.engine))
+                        .transpose()?
+                        .flatten();
+                    if let Some(previous) = previous
+                        && previous > version
+                    {
+                        bail!("publication transaction fenced by newer application version");
+                    }
+                    if previous != Some(version) && !output.contains_key(values) {
+                        let required_files = planned_files
+                            .checked_add(new_partition_files)
+                            .and_then(|files| files.checked_add(1))
+                            .context("coalesced output file count overflow")?;
+                        if required_files > max_files {
+                            return Err(anyhow::Error::new(CoalescedGroupCapacityExceeded {
+                                required_files,
+                                max_files,
+                            }));
+                        }
+                        new_partition_files = new_partition_files
+                            .checked_add(1)
+                            .context("coalesced output file count overflow")?;
+                    }
+                    partition_identities.insert(values.clone(), (identity, previous));
+                    Ok(())
+                };
+                if partitions.is_empty() {
+                    let values = BTreeMap::new();
+                    register_partition(&values)?;
+                    vec![(batch, values)]
+                } else {
+                    crate::partition::split_with_new_partition(&batch, &partitions, &mut register_partition)?
+                }
             };
             if splits.is_empty() && batch_rows == 0 && !partitions.is_empty() {
                 bail!("empty custom-partitioned publications must use the existing progress path");
             }
             for (batch, values) in splits {
-                if let Some(expected) = &expected_ingestion
-                    && values.get(INGESTION_PARTITION).and_then(Option::as_deref) != Some(expected.as_str())
+                let (identity, previous) = partition_identities
+                    .remove(&values)
+                    .context("coalesced partition identity was not prepared")?;
+                if let Some(previous) = previous
+                    && previous == version
                 {
-                    bail!("coalesced input ingestion partition does not match its admission stamp");
-                }
-                let identity = if partitions.is_empty() || partitions == [INGESTION_PARTITION] || snapshot.is_none() {
-                    app_id.clone()
-                } else {
-                    crate::partition::publication_id(&app_id, &values, identity_schema.as_ref())?
-                };
-                let previous = snapshot
-                    .as_ref()
-                    .map(|snapshot| snapshot.get_app_id_version(&identity, &self.engine))
-                    .transpose()?
-                    .flatten();
-                if let Some(previous) = previous {
-                    if previous > version {
-                        bail!("publication transaction fenced by newer application version");
-                    }
-                    if previous == version {
-                        committed_identities.push((identity, version, stamp));
-                        continue;
-                    }
+                    committed_identities.push((identity, version, stamp));
+                    continue;
                 }
                 identities.push((identity, version, stamp));
                 pending_input_rows = pending_input_rows
@@ -3059,24 +3109,30 @@ impl DeltaTable {
                 if batch.num_rows() == 0 {
                     continue;
                 }
-                let index = output
-                    .iter()
-                    .position(|partition| partition.values == values)
-                    .unwrap_or_else(|| {
-                        output.push(CoalescedPartitionOutput {
-                            values: values.clone(),
-                            files: Vec::new(),
-                            file_rows: Vec::new(),
-                            file_bytes: Vec::new(),
-                        });
-                        output.len() - 1
+                let partition = output
+                    .entry(values.clone())
+                    .or_insert_with(|| CoalescedPartitionOutput {
+                        values: values.clone(),
+                        files: Vec::new(),
+                        file_rows: Vec::new(),
+                        file_bytes: Vec::new(),
                     });
-                let partition = &mut output[index];
                 if layout.is_none() {
                     if partition.files.is_empty() {
+                        if planned_files >= max_files {
+                            return Err(anyhow::Error::new(CoalescedGroupCapacityExceeded {
+                                required_files: planned_files
+                                    .checked_add(1)
+                                    .context("coalesced output file count overflow")?,
+                                max_files,
+                            }));
+                        }
                         partition.files.push(Vec::new());
                         partition.file_rows.push(0);
                         partition.file_bytes.push(0);
+                        planned_files = planned_files
+                            .checked_add(1)
+                            .context("coalesced output file count overflow")?;
                     }
                     let rows = batch.num_rows();
                     partition.files[0].push(batch);
@@ -3089,9 +3145,20 @@ impl DeltaTable {
                 let mut start = 0;
                 while start < batch.num_rows() {
                     if partition.files.is_empty() {
+                        if planned_files >= max_files {
+                            return Err(anyhow::Error::new(CoalescedGroupCapacityExceeded {
+                                required_files: planned_files
+                                    .checked_add(1)
+                                    .context("coalesced output file count overflow")?,
+                                max_files,
+                            }));
+                        }
                         partition.files.push(Vec::new());
                         partition.file_rows.push(0);
                         partition.file_bytes.push(0);
+                        planned_files = planned_files
+                            .checked_add(1)
+                            .context("coalesced output file count overflow")?;
                     }
                     let file = partition.files.len() - 1;
                     let row_capacity = policy.max_rows.saturating_sub(partition.file_rows[file]);
@@ -3101,9 +3168,20 @@ impl DeltaTable {
                         if partition.file_rows[file] == 0 {
                             bail!("one coalesced row exceeds the sorted-file resource budget");
                         }
+                        if planned_files >= max_files {
+                            return Err(anyhow::Error::new(CoalescedGroupCapacityExceeded {
+                                required_files: planned_files
+                                    .checked_add(1)
+                                    .context("coalesced output file count overflow")?,
+                                max_files,
+                            }));
+                        }
                         partition.files.push(Vec::new());
                         partition.file_rows.push(0);
                         partition.file_bytes.push(0);
+                        planned_files = planned_files
+                            .checked_add(1)
+                            .context("coalesced output file count overflow")?;
                         continue;
                     };
                     let rows = chunk.num_rows();
@@ -3120,17 +3198,21 @@ impl DeltaTable {
             }
         }
         let schema = schema.context("coalesced publication has no input schema")?;
-        let planned_files = output
-            .iter()
+        let counted_files = output
+            .values()
             .try_fold(0_usize, |total, partition| total.checked_add(partition.files.len()))
             .context("coalesced output file count overflow")?;
+        if counted_files != planned_files {
+            bail!("coalesced output file count changed during bounded preparation");
+        }
         if planned_files > max_files {
-            bail!(
-                "coalesced publication requires {planned_files} files, exceeding the atomic commit capacity {max_files}"
-            );
+            return Err(anyhow::Error::new(CoalescedGroupCapacityExceeded {
+                required_files: planned_files,
+                max_files,
+            }));
         }
         let planned_rows = output
-            .iter()
+            .values()
             .flat_map(|partition| &partition.file_rows)
             .try_fold(0_usize, |total, rows| total.checked_add(*rows))
             .context("coalesced output row count overflow")?;
@@ -3141,7 +3223,7 @@ impl DeltaTable {
             bail!("coalesced publications produced no replay identities");
         }
         let mut staged = Vec::with_capacity(planned_files);
-        for partition in output {
+        for partition in output.into_values() {
             for batches in partition.files {
                 let properties = layout
                     .as_ref()
@@ -3678,7 +3760,7 @@ impl DeltaTable {
                 }
                 // Visibility is not proof of local durability after an I/O error.
                 self.sync_replayed_local_state(latest.version())?;
-                crate::telemetry::ambiguous_commit_reconciled();
+                crate::telemetry::ambiguous_commit_reconciled(&table_id, table_name.as_deref(), started.elapsed());
                 Ok(Some(latest.version()))
             };
             match transaction.commit(&self.engine) {

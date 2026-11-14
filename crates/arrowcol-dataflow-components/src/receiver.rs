@@ -438,32 +438,12 @@ fn create_receiver(
         "arrowcol_effective_config {}",
         serde_json::json!({
             "component": "receiver",
-            "config": {
-                "limits": config.limits,
-                "pressure": {
-                    "max_concurrent_streams": config.registration.max_concurrent_streams,
-                    "rss_limit_bytes": config.registration.rss_limit_bytes,
-                    "buffered_bytes_limit": config.registration.buffered_bytes_limit,
-                    "buffered_rows_limit": config.registration.buffered_rows_limit,
-                    "buffered_batches_limit": config.registration.buffered_batches_limit,
-                    "pressure_interval": format!("{:?}", config.registration.pressure_interval)
-                }
-            }
+            "config": config.effective_config_json()
         })
     );
     tracing::info!(
         component = "receiver",
-        effective_config = %serde_json::json!({
-            "limits": config.limits,
-            "pressure": {
-                "max_concurrent_streams": config.registration.max_concurrent_streams,
-                "rss_limit_bytes": config.registration.rss_limit_bytes,
-                "buffered_bytes_limit": config.registration.buffered_bytes_limit,
-                "buffered_rows_limit": config.registration.buffered_rows_limit,
-                "buffered_batches_limit": config.registration.buffered_batches_limit,
-                "pressure_interval": format!("{:?}", config.registration.pressure_interval)
-            }
-        }),
+        effective_config = %config.effective_config_json(),
         "arrowcol_effective_config"
     );
     let routing = config.routing.build().map_err(config_error)?;

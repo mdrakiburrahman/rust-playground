@@ -149,6 +149,8 @@ pub enum CommitReceiptError {
     WorkerStopped,
     /// A replay race committed only part of an atomic coalesced publication group.
     RetryablePublicationGroup { committed: usize, total: usize },
+    /// Preparation found that the group needs more files than one atomic commit permits.
+    GroupCapacityExceeded { required_files: usize, max_files: usize },
 }
 
 impl CommitReceiptError {
@@ -165,6 +167,11 @@ impl CommitReceiptError {
             Self::RetryablePublicationGroup {
                 committed: error.committed,
                 total: error.total,
+            }
+        } else if let Some(error) = error.downcast_ref::<crate::delta::CoalescedGroupCapacityExceeded>() {
+            Self::GroupCapacityExceeded {
+                required_files: error.required_files,
+                max_files: error.max_files,
             }
         } else {
             Self::commit_failed(format!("{error:#}"))
@@ -186,6 +193,13 @@ impl Display for CommitReceiptError {
                 formatter,
                 "coalesced publication group is partially committed ({committed}/{total} identities); rebuild the group and retry"
             ),
+            Self::GroupCapacityExceeded {
+                required_files,
+                max_files,
+            } => write!(
+                formatter,
+                "coalesced publication group requires at least {required_files} files, exceeding the atomic commit capacity {max_files}; increase max_files_per_commit or reduce the publication's partition count"
+            ),
         }
     }
 }
@@ -194,7 +208,10 @@ impl Error for CommitReceiptError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::PublicationFenced(error) => Some(error),
-            Self::CommitFailed { .. } | Self::WorkerStopped | Self::RetryablePublicationGroup { .. } => None,
+            Self::CommitFailed { .. }
+            | Self::WorkerStopped
+            | Self::RetryablePublicationGroup { .. }
+            | Self::GroupCapacityExceeded { .. } => None,
         }
     }
 }
@@ -1005,12 +1022,10 @@ mod tests {
                 .version,
             1
         );
-        let error = table
-            .submit_prepared_group(group, true)
-            .await?
-            .wait_typed()
-            .await
-            .unwrap_err();
+        let error = match table.submit_prepared_group(group, true).await?.wait_typed().await {
+            Err(error) => error,
+            Ok(_) => bail!("partially committed coalesced group unexpectedly succeeded"),
+        };
         assert!(matches!(
             error,
             CommitReceiptError::RetryablePublicationGroup { committed: 1, total: 2 }

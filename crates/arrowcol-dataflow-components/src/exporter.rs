@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 
@@ -760,31 +760,57 @@ impl GroupPublisher<'_> {
                             .map_err(|error| ExportFailure::Transient(error.to_string()))?,
                     ));
                 }
-                let prepared = table.stage_coalesced_publications(inputs).await.map_err(|error| {
-                    worker_failed = true;
-                    ExportFailure::Transient(format!("coalesced staging failed: {error:#}"))
-                })?;
-                published_files = prepared.appends.len() as u64;
-                for append in &prepared.appends {
-                    updated_estimator.observe(append.observation()).map_err(|error| {
-                        ExportFailure::Permanent(format!("file sizing observation failed: {error}"))
-                    })?;
+                let mut pending_groups = VecDeque::from([inputs]);
+                let mut version = 0;
+                while let Some(mut inputs) = pending_groups.pop_front() {
+                    let prepared = match table.stage_coalesced_publications(inputs.clone()).await {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            let capacity = error.downcast_ref::<CommitReceiptError>().and_then(|error| match error {
+                                CommitReceiptError::GroupCapacityExceeded {
+                                    required_files,
+                                    max_files,
+                                } => Some((*required_files, *max_files)),
+                                _ => None,
+                            });
+                            if capacity.is_some() && inputs.len() > 1 {
+                                let right = inputs.split_off(inputs.len() / 2);
+                                pending_groups.push_front(right);
+                                pending_groups.push_front(inputs);
+                                continue;
+                            }
+                            if let Some((required_files, max_files)) = capacity {
+                                return Err(ExportFailure::Permanent(format!(
+                                    "one logical publication requires at least {required_files} files, exceeding max_files_per_commit={max_files}; increase the commit limit or reduce the publication's partition count; its durable input remains available for remediation"
+                                )));
+                            }
+                            worker_failed = true;
+                            return Err(ExportFailure::Transient(format!("coalesced staging failed: {error:#}")));
+                        }
+                    };
+                    published_files += prepared.appends.len() as u64;
+                    for append in &prepared.appends {
+                        updated_estimator.observe(append.observation()).map_err(|error| {
+                            ExportFailure::Permanent(format!("file sizing observation failed: {error}"))
+                        })?;
+                    }
+                    let committed = table
+                        .submit_prepared_group(prepared, true)
+                        .await
+                        .map_err(|error| {
+                            worker_failed = true;
+                            ExportFailure::Transient(format!("atomic group submission failed: {error:#}"))
+                        })?
+                        .wait()
+                        .await
+                        .map_err(|error| {
+                            worker_failed = true;
+                            ExportFailure::Transient(format!("atomic group commit failed: {error:#}"))
+                        })?;
+                    version = version.max(committed.version);
                 }
-                let committed = table
-                    .submit_prepared_group(prepared, true)
-                    .await
-                    .map_err(|error| {
-                        worker_failed = true;
-                        ExportFailure::Transient(format!("atomic group submission failed: {error:#}"))
-                    })?
-                    .wait()
-                    .await
-                    .map_err(|error| {
-                        worker_failed = true;
-                        ExportFailure::Transient(format!("atomic group commit failed: {error:#}"))
-                    })?;
                 *estimator = updated_estimator;
-                return Ok(committed.version);
+                return Ok(version);
             }
             for entry in group.iter() {
                 if let Some(stamp) = publications.insert(entry.publication_id, entry.ingested_at_ms) {
@@ -998,16 +1024,17 @@ fn create_exporter(
         config.base_path = PathBuf::from(root);
     }
     config.validate().map_err(config_error)?;
+    let effective_config = config.effective_config_json();
     eprintln!(
         "arrowcol_effective_config {}",
         serde_json::json!({
             "component": "exporter",
-            "config": {"batching": config.batching, "commit": config.commit}
+            "config": effective_config.clone()
         })
     );
     tracing::info!(
         component = "exporter",
-        effective_config = %serde_json::json!({"batching": config.batching, "commit": config.commit}),
+        effective_config = %effective_config,
         "arrowcol_effective_config"
     );
     let exporter = GenericDeltaExporter::shared(config, global_metrics()).map_err(config_error)?;
@@ -1340,6 +1367,145 @@ mod tests {
         .expect("batch");
         let records = encode_record_batch(envelope, batch).expect("records");
         OtapPdata::new_todo_context(otel_arrow_dfe_pdata::OtapPayload::from_pdata_arrow(records))
+    }
+
+    fn partitioned_envelope_pdata(envelope: ArrowcolBatchEnvelope, regions: &[String]) -> OtapPdata {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new("region", DataType::Utf8, false),
+        ]));
+        let rows = u64::try_from(regions.len()).expect("region count fits row ids");
+        let batch = arrow_array::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from_iter_values(0..rows)) as ArrayRef,
+                Arc::new(StringArray::from(regions.to_vec())) as ArrayRef,
+            ],
+        )
+        .expect("partitioned batch");
+        let records = encode_record_batch(envelope, batch).expect("records");
+        OtapPdata::new_todo_context(otel_arrow_dfe_pdata::OtapPayload::from_pdata_arrow(records))
+    }
+
+    fn add_file_count(root: &std::path::Path) -> usize {
+        std::fs::read_dir(root.join("_delta_log"))
+            .expect("Delta log")
+            .map(|entry| entry.expect("log entry").path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "json"))
+            .map(|path| {
+                std::fs::read_to_string(path)
+                    .expect("log contents")
+                    .lines()
+                    .filter(|line| {
+                        serde_json::from_str::<serde_json::Value>(line)
+                            .expect("action")
+                            .get("add")
+                            .is_some()
+                    })
+                    .count()
+            })
+            .sum()
+    }
+
+    fn initialize_region_partition(root: &std::path::Path) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new("region", DataType::Utf8, false),
+        ]));
+        let table = arrow_deltalake::delta::DeltaTable::open_url(
+            format!("file://{}/", root.display()).parse().expect("table URL"),
+            schema,
+            vec!["region".to_owned()],
+        )
+        .expect("partitioned table");
+        drop(table);
+    }
+
+    fn coalescing_exporter(
+        directory: &std::path::Path,
+        store: &Arc<MemoryRoutingStore>,
+        holder: CollectorInstanceId,
+    ) -> GenericDeltaExporter {
+        GenericDeltaExporter::with_batching(
+            directory.to_path_buf(),
+            Arc::clone(store) as Arc<dyn RoutingStore>,
+            arrow_deltalake::commit::CommitOptions {
+                max_files_per_commit: 1,
+                max_pending_files: 2,
+                ..Default::default()
+            },
+            FileBatchConfig {
+                coalesce_publications: true,
+                max_batches_per_flush: 16,
+                max_age: std::time::Duration::from_secs(60),
+                ..Default::default()
+            },
+            Arc::new(RuntimeMetrics::new(holder)),
+        )
+        .expect("coalescing exporter")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn coalesced_publications_split_over_commit_cap_at_identity_boundaries_and_replay() {
+        let directory = tempfile::tempdir().expect("directory");
+        let root = directory.path().join("demo/generated/events");
+        initialize_region_partition(&root);
+        let store = Arc::new(MemoryRoutingStore::default());
+        let holder = CollectorInstanceId::new();
+        let lease = lease(&store, holder).await;
+        let exporter = coalescing_exporter(directory.path(), &store, holder);
+        let first = partitioned_envelope_pdata(envelope_for(&lease), &["north".to_owned()]);
+        let second = partitioned_envelope_pdata(envelope_for(&lease), &["south".to_owned()]);
+        let first_receipt = exporter.stage(first.clone()).await.expect("first publication");
+        let second_receipt = exporter.stage(second.clone()).await.expect("second publication");
+        exporter.backend.flush_pending().await.expect("flush");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            first_receipt.wait().await?;
+            second_receipt.wait().await
+        })
+        .await
+        .expect("split group commits")
+        .expect("both publications commit");
+        assert_eq!(add_file_count(&root), 2);
+
+        let first_replay = exporter.stage(first).await.expect("first replay");
+        let second_replay = exporter.stage(second).await.expect("second replay");
+        exporter.backend.flush_pending().await.expect("replay flush");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            first_replay.wait().await?;
+            second_replay.wait().await
+        })
+        .await
+        .expect("replay resolves")
+        .expect("replays deduplicate");
+        assert_eq!(add_file_count(&root), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn coalesced_single_publication_over_cap_fails_permanently_before_staging() {
+        let directory = tempfile::tempdir().expect("directory");
+        let root = directory.path().join("demo/generated/events");
+        initialize_region_partition(&root);
+        let store = Arc::new(MemoryRoutingStore::default());
+        let holder = CollectorInstanceId::new();
+        let lease = lease(&store, holder).await;
+        let exporter = coalescing_exporter(directory.path(), &store, holder);
+        let regions = (0..256).map(|value| format!("region-{value}")).collect::<Vec<_>>();
+        let receipt = exporter
+            .stage(partitioned_envelope_pdata(envelope_for(&lease), &regions))
+            .await
+            .expect("stage high-cardinality publication");
+        exporter.backend.flush_pending().await.expect("flush");
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), receipt.wait())
+            .await
+            .expect("capacity failure is bounded")
+            .expect_err("one logical publication must not be split");
+        assert!(
+            error.permanent(),
+            "oversized logical publication must not be retried: {error}"
+        );
+        assert!(error.to_string().contains("at least 2 files"), "{error}");
+        assert_eq!(add_file_count(&root), 0, "preflight rejection must write no output");
     }
 
     /// Re-issues the table lease with a new lineage and the next epoch, as a reclaim, transfer, or

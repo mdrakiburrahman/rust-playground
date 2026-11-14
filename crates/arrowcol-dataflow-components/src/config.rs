@@ -63,6 +63,90 @@ mod override_tests {
             .is_err()
         );
     }
+
+    #[test]
+    fn control_plane_overrides_reject_wrong_backends_and_identity_changes() -> Result<(), String> {
+        assert!(CatalogConfig::Memory.apply_override("{}").is_err());
+        assert!(RoutingStoreConfig::Standalone.apply_override("{}").is_err());
+        assert!(RoutingStoreConfig::Memory.apply_override("{}").is_err());
+        let mut catalog = CatalogConfig::Remote {
+            endpoint: "http://localhost:8817".to_owned(),
+            maximum_cache_age: Duration::from_secs(10),
+        };
+        catalog.apply_override(r#"{"maximum_cache_age":"3s"}"#)?;
+        catalog.validate()?;
+        assert_eq!(catalog.effective_config_json()["maximum_cache_age"], "3s");
+        assert!(catalog.apply_override(r#"{"endpoint":"http://localhost:1"}"#).is_err());
+        catalog.apply_override(r#"{"maximum_cache_age":"0s"}"#)?;
+        assert!(catalog.validate().is_err());
+
+        let mut routing: RoutingStoreConfig = serde_json::from_value(serde_json::json!({
+            "type": "sql_server",
+            "connection": {
+                "host": "localhost", "port": 1433, "database": "test",
+                "username": "test-user", "password_file": "test-password-file"
+            }
+        }))
+        .map_err(|error| error.to_string())?;
+        routing.apply_override(r#"{"connect_timeout":"2s"}"#)?;
+        routing.validate()?;
+        let effective = routing.effective_config_json();
+        assert_eq!(effective["connect_timeout"], "2s");
+        assert_eq!(effective["command_timeout"], "30s");
+        assert!(!effective.to_string().contains("password"));
+        assert!(routing.apply_override(r#"{"host":"replacement"}"#).is_err());
+        routing.apply_override(r#"{"command_timeout":"0s"}"#)?;
+        assert!(routing.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn lease_overrides_validate_resolved_ttl_and_clock_bounds() -> Result<(), String> {
+        let registration: RegistrationConfig = serde_json::from_value(serde_json::json!({
+            "instance_key": "test", "flight_endpoint": "127.0.0.1:8815"
+        }))
+        .map_err(|error| error.to_string())?;
+        let invalid = merge_config(&registration, r#"{"registration_ttl":"4s"}"#, None)?;
+        assert!(invalid.validate().is_err());
+        let valid = merge_config(
+            &registration,
+            r#"{"heartbeat_interval":"2s","registration_ttl":"4s"}"#,
+            None,
+        )?;
+        valid.validate()?;
+        assert!(validate_duration("deadline", Duration::ZERO).is_err());
+        assert!(validate_duration("deadline", Duration::MAX).is_err());
+        let sub_millisecond = RegistrationConfig {
+            heartbeat_interval: Duration::from_nanos(1),
+            registration_ttl: Duration::from_nanos(2),
+            ..registration
+        };
+        assert!(sub_millisecond.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn exporter_authority_override_is_bounded_and_read_back_without_paths() -> Result<(), String> {
+        let mut config = DeltaExporterConfig {
+            base_path: std::env::temp_dir(),
+            routing: RoutingStoreConfig::Standalone,
+            commit: CommitConfig::default(),
+            batching: FileBatchConfig::default(),
+            authority_timeout: Duration::from_secs(10),
+        };
+        let current = ExporterOverrides {
+            authority_timeout: config.authority_timeout,
+        };
+        let resolved = merge_config(&current, r#"{"authority_timeout":"250ms"}"#, None)?;
+        config.authority_timeout = resolved.authority_timeout;
+        config.validate()?;
+        assert_eq!(config.effective_config_json()["authority_timeout"], "250ms");
+        assert!(config.effective_config_json().get("base_path").is_none());
+        assert!(merge_config(&current, r#"{"base_path":"replacement"}"#, None).is_err());
+        config.authority_timeout = Duration::MAX;
+        assert!(config.validate().is_err());
+        Ok(())
+    }
 }
 
 fn apply_json_environment<T: Serialize + serde::de::DeserializeOwned>(
@@ -70,13 +154,50 @@ fn apply_json_environment<T: Serialize + serde::de::DeserializeOwned>(
     name: &str,
     allowed: Option<&[&str]>,
 ) -> Result<(), String> {
-    let json = match std::env::var(name) {
-        Ok(json) => json,
-        Err(std::env::VarError::NotPresent) => return Ok(()),
-        Err(error) => return Err(format!("{name}: {error}")),
+    let Some(json) = environment_json(name)? else {
+        return Ok(());
     };
     *config = merge_config(config, &json, allowed).map_err(|error| format!("{name}: {error}"))?;
     Ok(())
+}
+
+fn environment_json(name: &str) -> Result<Option<String>, String> {
+    match std::env::var(name) {
+        Ok(json) => Ok(Some(json)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(format!("{name}: {error}")),
+    }
+}
+
+fn validate_duration(name: &str, value: Duration) -> Result<(), String> {
+    if value.is_zero() || std::time::Instant::now().checked_add(value).is_none() {
+        return Err(format!("{name} must be positive and fit clock bounds"));
+    }
+    duration_millis(value).map_err(|error| format!("{name}: {error}"))?;
+    Ok(())
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogOverrides {
+    #[serde(with = "humantime_serde")]
+    maximum_cache_age: Duration,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RoutingOverrides {
+    #[serde(with = "humantime_serde")]
+    connect_timeout: Duration,
+    #[serde(with = "humantime_serde")]
+    command_timeout: Duration,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ExporterOverrides {
+    #[serde(with = "humantime_serde")]
+    authority_timeout: Duration,
 }
 
 fn merge_config<T: Serialize + serde::de::DeserializeOwned>(
@@ -103,7 +224,7 @@ fn merge_config<T: Serialize + serde::de::DeserializeOwned>(
     if let Some(allowed) = allowed {
         for key in object.keys() {
             if !allowed.contains(&key.as_str()) {
-                return Err(format!("unsupported pressure override {key}"));
+                return Err(format!("unsupported collector override {key}"));
             }
         }
     }
@@ -215,6 +336,8 @@ impl SqlServerConnectionConfig {
                 "SQL Server host, port, database, username, password file, and timeouts must be set".to_owned(),
             );
         }
+        validate_duration("connect_timeout", self.connect_timeout)?;
+        validate_duration("command_timeout", self.command_timeout)?;
         Ok(())
     }
 
@@ -252,6 +375,41 @@ fn default_catalog_cache_age() -> Duration {
 }
 
 impl CatalogConfig {
+    fn apply_override(&mut self, json: &str) -> Result<(), String> {
+        match self {
+            Self::Remote { maximum_cache_age, .. } => {
+                let resolved = merge_config(
+                    &CatalogOverrides {
+                        maximum_cache_age: *maximum_cache_age,
+                    },
+                    json,
+                    None,
+                )?;
+                *maximum_cache_age = resolved.maximum_cache_age;
+                Ok(())
+            }
+            Self::Memory => Err("catalog override requires a remote catalog".to_owned()),
+        }
+    }
+
+    fn apply_environment(&mut self) -> Result<(), String> {
+        let name = "ARROWCOL_COLLECTOR_CATALOG_CONFIG";
+        if let Some(json) = environment_json(name)? {
+            self.apply_override(&json).map_err(|error| format!("{name}: {error}"))?;
+        }
+        Ok(())
+    }
+
+    fn effective_config_json(&self) -> serde_json::Value {
+        match self {
+            Self::Remote { maximum_cache_age, .. } => serde_json::json!({
+                "type": "remote",
+                "maximum_cache_age": format!("{maximum_cache_age:?}")
+            }),
+            Self::Memory => serde_json::json!({"type": "memory"}),
+        }
+    }
+
     pub(crate) fn validate(&self) -> Result<(), String> {
         match self {
             Self::Remote {
@@ -264,7 +422,7 @@ impl CatalogConfig {
                         "remote catalog endpoint must be HTTP(S) and maximum_cache_age must be positive".to_owned(),
                     );
                 }
-                Ok(())
+                validate_duration("maximum_cache_age", *maximum_cache_age)
             }
             Self::Memory => Ok(()),
         }
@@ -314,6 +472,45 @@ pub enum RoutingStoreConfig {
 }
 
 impl RoutingStoreConfig {
+    fn apply_override(&mut self, json: &str) -> Result<(), String> {
+        match self {
+            Self::SqlServer { connection } => {
+                let resolved = merge_config(
+                    &RoutingOverrides {
+                        connect_timeout: connection.connect_timeout,
+                        command_timeout: connection.command_timeout,
+                    },
+                    json,
+                    None,
+                )?;
+                connection.connect_timeout = resolved.connect_timeout;
+                connection.command_timeout = resolved.command_timeout;
+                Ok(())
+            }
+            Self::Memory | Self::Standalone => Err("routing timeout override requires SQL Server routing".to_owned()),
+        }
+    }
+
+    fn apply_environment(&mut self) -> Result<(), String> {
+        let name = "ARROWCOL_COLLECTOR_ROUTING_CONFIG";
+        if let Some(json) = environment_json(name)? {
+            self.apply_override(&json).map_err(|error| format!("{name}: {error}"))?;
+        }
+        Ok(())
+    }
+
+    fn effective_config_json(&self) -> serde_json::Value {
+        match self {
+            Self::SqlServer { connection } => serde_json::json!({
+                "type": "sql_server",
+                "connect_timeout": format!("{:?}", connection.connect_timeout),
+                "command_timeout": format!("{:?}", connection.command_timeout)
+            }),
+            Self::Memory => serde_json::json!({"type": "memory"}),
+            Self::Standalone => serde_json::json!({"type": "standalone"}),
+        }
+    }
+
     pub(crate) fn validate(&self) -> Result<(), String> {
         match self {
             Self::Memory | Self::Standalone => Ok(()),
@@ -473,7 +670,17 @@ impl RegistrationConfig {
         ] {
             PositiveMeasurement::new(value).map_err(|error| error.to_string())?;
         }
-        duration_millis(self.registration_ttl)?;
+        for (name, value) in [
+            ("heartbeat_interval", self.heartbeat_interval),
+            ("pressure_interval", self.pressure_interval),
+            ("registration_ttl", self.registration_ttl),
+        ] {
+            validate_duration(name, value)?;
+        }
+        if duration_millis(self.registration_ttl)? == 0 {
+            return Err("registration_ttl must be at least one millisecond".to_owned());
+        }
+        checked_add_millis(now_unix_millis()?, self.registration_ttl)?;
         Ok(())
     }
 }
@@ -520,8 +727,30 @@ impl FlightReceiverConfig {
                 "buffered_rows_limit",
                 "buffered_batches_limit",
                 "pressure_interval",
+                "heartbeat_interval",
+                "registration_ttl",
             ]),
-        )
+        )?;
+        self.catalog.apply_environment()?;
+        self.routing.apply_environment()
+    }
+
+    pub(crate) fn effective_config_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "limits": self.limits,
+            "pressure": {
+                "max_concurrent_streams": self.registration.max_concurrent_streams,
+                "rss_limit_bytes": self.registration.rss_limit_bytes,
+                "buffered_bytes_limit": self.registration.buffered_bytes_limit,
+                "buffered_rows_limit": self.registration.buffered_rows_limit,
+                "buffered_batches_limit": self.registration.buffered_batches_limit,
+                "pressure_interval": format!("{:?}", self.registration.pressure_interval),
+                "heartbeat_interval": format!("{:?}", self.registration.heartbeat_interval),
+                "registration_ttl": format!("{:?}", self.registration.registration_ttl)
+            },
+            "catalog": self.catalog.effective_config_json(),
+            "routing": self.routing.effective_config_json()
+        })
     }
 
     pub(crate) fn validate(&self) -> Result<(), String> {
@@ -597,7 +826,23 @@ pub struct DeltaExporterConfig {
 impl DeltaExporterConfig {
     pub(crate) fn apply_environment(&mut self) -> Result<(), String> {
         apply_json_environment(&mut self.batching, "ARROWCOL_COLLECTOR_BATCHING_CONFIG", None)?;
-        apply_json_environment(&mut self.commit, "ARROWCOL_COLLECTOR_COMMIT_CONFIG", None)
+        apply_json_environment(&mut self.commit, "ARROWCOL_COLLECTOR_COMMIT_CONFIG", None)?;
+        self.routing.apply_environment()?;
+        let mut overrides = ExporterOverrides {
+            authority_timeout: self.authority_timeout,
+        };
+        apply_json_environment(&mut overrides, "ARROWCOL_COLLECTOR_EXPORTER_CONFIG", None)?;
+        self.authority_timeout = overrides.authority_timeout;
+        Ok(())
+    }
+
+    pub(crate) fn effective_config_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "batching": self.batching,
+            "commit": self.commit,
+            "routing": self.routing.effective_config_json(),
+            "authority_timeout": format!("{:?}", self.authority_timeout)
+        })
     }
 
     pub(crate) fn validate(&self) -> Result<(), String> {
@@ -607,6 +852,7 @@ impl DeltaExporterConfig {
         if self.authority_timeout.is_zero() {
             return Err("Delta authority_timeout must be positive".to_owned());
         }
+        validate_duration("authority_timeout", self.authority_timeout)?;
         self.routing.validate()?;
         self.commit.build()?;
         self.batching.validate()?;
