@@ -218,13 +218,16 @@ impl Options {
             self.connect_timeout_ms > 0
                 && self.request_timeout_ms > 0
                 && self.keepalive_timeout_ms > 0
-                && self.endpoint_concurrency_limit > 0
-                && self.endpoint_buffer_size > 0
+                && (1..=65536).contains(&self.endpoint_concurrency_limit)
+                && (1..=65536).contains(&self.endpoint_buffer_size)
                 && self.connect_retries <= 100,
-            "timeouts and endpoint capacities must be positive; connect-retries <=100"
+            "timeouts must be positive; endpoint capacities must be 1..=65536; connect-retries <=100"
+        );
+        anyhow::ensure!(
+            self.interval_us <= 86_400_000_000,
+            "interval-us must not exceed one day"
         );
         for value in [
-            self.interval_us / 1000,
             self.connect_timeout_ms,
             self.request_timeout_ms,
             self.keepalive_interval_ms,
@@ -389,6 +392,59 @@ struct Attempt<'a> {
     finished: bool,
 }
 
+struct Measurement {
+    start_unix_ms: u64,
+    end_unix_ms: u64,
+    rows: AtomicU64,
+    bytes: AtomicU64,
+    worker_rows: Vec<AtomicU64>,
+    pilot_rows: Vec<AtomicU64>,
+}
+
+impl Measurement {
+    fn new(start_unix_ms: u64, end_unix_ms: u64, workers: usize) -> Result<Self> {
+        anyhow::ensure!(end_unix_ms > start_unix_ms, "measurement window must be positive");
+        Ok(Self {
+            start_unix_ms,
+            end_unix_ms,
+            rows: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            worker_rows: (0..workers).map(|_| AtomicU64::new(0)).collect(),
+            pilot_rows: (0..(end_unix_ms - start_unix_ms).div_ceil(30_000))
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+        })
+    }
+
+    fn record_completion(&self, worker: usize, rows: u64, bytes: u64, observed_unix_ms: u64) {
+        if observed_unix_ms >= self.start_unix_ms && observed_unix_ms < self.end_unix_ms {
+            self.rows.fetch_add(rows, Ordering::Relaxed);
+            self.bytes.fetch_add(bytes, Ordering::Relaxed);
+            self.worker_rows[worker].fetch_add(rows, Ordering::Relaxed);
+            self.pilot_rows[((observed_unix_ms - self.start_unix_ms) / 30_000) as usize]
+                .fetch_add(rows, Ordering::Relaxed);
+        }
+    }
+
+    fn snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "start_unix_ms": self.start_unix_ms, "end_unix_ms": self.end_unix_ms,
+            "completed_rows": self.rows.load(Ordering::Relaxed),
+            "completed_bytes": self.bytes.load(Ordering::Relaxed),
+            "worker_completed_rows": self.worker_rows.iter().map(|value| value.load(Ordering::Relaxed)).collect::<Vec<_>>(),
+            "pilot_window_rows": self.pilot_rows.iter().map(|value| value.load(Ordering::Relaxed)).collect::<Vec<_>>(),
+            "scope": "per_stream_admission_completion_observed_in_half_open_shared_unix_window",
+        })
+    }
+}
+
+/// Exact completion-window counters after persistent workers have stopped and their requests have drained.
+pub struct ContinuousReport {
+    pub completed_rows: u64,
+    pub measurement_started_unix_ms: u64,
+    pub pilot_window_rows: Vec<u64>,
+}
+
 impl Drop for Attempt<'_> {
     fn drop(&mut self) {
         if !self.finished {
@@ -410,7 +466,9 @@ pub struct PreparedClient {
     signer: Option<EdgeRequestSigner>,
     counters: Vec<Counters>,
     next: AtomicU64,
+    worker_next: Vec<AtomicU64>,
     reserved_rows: AtomicU64,
+    measurement: Mutex<Option<Arc<Measurement>>>,
     pub table_count: usize,
     preparation: serde_json::Value,
     started: Instant,
@@ -456,12 +514,35 @@ impl PreparedClient {
             DataMode::Shared => 1,
             DataMode::Independent => options.workers,
         };
+        anyhow::ensure!(
+            options.max_rows == 0 || options.max_rows >= rows.min(options.batch_rows) as u64,
+            "max-rows must fit at least one complete corpus batch"
+        );
         let estimate = memory_estimate(&tables, rows, row_bytes, copies, &options)?;
         anyhow::ensure!(
             estimate <= options.max_memory_bytes,
             "corpus needs a conservative {estimate} bytes including encoding scratch, exceeding max-memory-bytes={}",
             options.max_memory_bytes
         );
+        for table in &tables {
+            for field in table.schema.fields() {
+                if field.data_type() == &DataType::Utf8 {
+                    let width = if field.name() == "customer_id" {
+                        client_id.len()
+                    } else if options.string_width == 0 {
+                        field.name().len() + 32
+                    } else {
+                        options.string_width
+                    };
+                    anyhow::ensure!(
+                        rows.min(options.batch_rows)
+                            .checked_mul(width)
+                            .is_some_and(|bytes| bytes <= i32::MAX as usize),
+                        "batch-rows and string-width exceed Arrow Utf8's 2147483647-byte column limit"
+                    );
+                }
+            }
+        }
         let signer = edge_secret_file.map(edge_signer_from_file).transpose()?;
         let mut registration = options.client(options.connect(endpoint).await?);
         let mut versions = Vec::new();
@@ -556,16 +637,142 @@ impl PreparedClient {
         });
         Ok(Arc::new(Self {
             counters: (0..options.workers).map(|_| Counters::default()).collect(),
+            worker_next: (0..options.workers).map(|_| AtomicU64::new(0)).collect(),
             options,
             corpus,
             channels,
             signer,
             next: AtomicU64::new(0),
             reserved_rows: AtomicU64::new(0),
+            measurement: Mutex::new(None),
             table_count,
             preparation,
             started: Instant::now(),
         }))
+    }
+
+    fn next_batch(&self, worker: usize) -> &EncodedBatch {
+        let (corpus, cursor) = match self.options.data_mode {
+            DataMode::Shared => (&self.corpus[0], &self.next),
+            DataMode::Independent => (&self.corpus[worker], &self.worker_next[worker]),
+        };
+        if corpus.len() == 1 {
+            &corpus[0]
+        } else {
+            &corpus[cursor.fetch_add(1, Ordering::Relaxed) as usize % corpus.len()]
+        }
+    }
+
+    /// Continuously replenish each worker's independent stream slots through warm-up and measurement.
+    ///
+    /// In-flight uploads are not cancelled at the warm-up or measurement boundary. Their actual observed
+    /// completion time determines attribution; after the end, bounded requests drain before returning.
+    ///
+    /// # Errors
+    ///
+    /// Propagates clock, send, worker, or schedule failures after aborting and joining owned tasks.
+    pub async fn run_continuous(
+        self: &Arc<Self>,
+        measurement_start_unix_ms: u64,
+        measurement_end_unix_ms: u64,
+    ) -> Result<ContinuousReport> {
+        let measurement = Arc::new(Measurement::new(
+            measurement_start_unix_ms,
+            measurement_end_unix_ms,
+            self.options.workers,
+        )?);
+        *self
+            .measurement
+            .lock()
+            .map_err(|_| anyhow::anyhow!("measurement state poisoned"))? = Some(Arc::clone(&measurement));
+        let mut tasks = JoinSet::new();
+        for worker in 0..self.options.workers {
+            for slot in 0..self.options.streams_per_worker {
+                let this = Arc::clone(self);
+                let measurement = Arc::clone(&measurement);
+                tasks.spawn(async move {
+                    let channel = this.channels[worker][slot % this.channels[worker].len()].clone();
+                    replenish_until(measurement.end_unix_ms, this.options.interval_us, || async {
+                        this.send_one(worker, channel.clone(), this.next_batch(worker), Some(&measurement))
+                            .await
+                            .map(|result| result.is_some())
+                    })
+                    .await
+                });
+            }
+        }
+        let phase = async {
+            while unix_ms()? < measurement_start_unix_ms {
+                tokio::time::sleep(Duration::from_millis(
+                    measurement_start_unix_ms.saturating_sub(unix_ms()?).min(10),
+                ))
+                .await;
+            }
+            let observed = unix_ms()?;
+            anyhow::ensure!(
+                observed.abs_diff(measurement_start_unix_ms) <= 250,
+                "client did not start within 250ms of the shared measurement interval"
+            );
+            println!("OAT_CLIENT_METRICS {}", self.metrics("measurement_start"));
+            Ok::<u64, anyhow::Error>(observed)
+        };
+        tokio::pin!(phase);
+        let mut measurement_started = None;
+        loop {
+            tokio::select! {
+                result = &mut phase, if measurement_started.is_none() => {
+                    match result {
+                        Ok(started) => measurement_started = Some(started),
+                        Err(error) => {
+                            tasks.abort_all();
+                            while tasks.join_next().await.is_some() {}
+                            return Err(error);
+                        }
+                    }
+                }
+                result = tasks.join_next(), if !tasks.is_empty() => {
+                    match result {
+                        Some(Ok(Ok(()))) => {}
+                        Some(result) => {
+                            tasks.abort_all();
+                            while tasks.join_next().await.is_some() {}
+                            return match result {
+                                Ok(Err(error)) => Err(error),
+                                Err(error) => Err(error).context("persistent client worker failed"),
+                                Ok(Ok(())) => unreachable!(),
+                            };
+                        }
+                        None => {}
+                    }
+                }
+                else => break,
+            }
+        }
+        while unix_ms()? < measurement_end_unix_ms {
+            tokio::time::sleep(Duration::from_millis(
+                measurement_end_unix_ms.saturating_sub(unix_ms()?).min(10),
+            ))
+            .await;
+        }
+        Ok(ContinuousReport {
+            completed_rows: measurement.rows.load(Ordering::Relaxed),
+            measurement_started_unix_ms: measurement_started.context("measurement phase never started")?,
+            pilot_window_rows: measurement
+                .pilot_rows
+                .iter()
+                .map(|value| value.load(Ordering::Relaxed))
+                .collect(),
+        })
+    }
+
+    #[must_use]
+    pub fn admission_counts(&self) -> (u64, u64) {
+        self.counters.iter().fold((0, 0), |(best_effort, durable), counters| {
+            (
+                best_effort + counters.best_effort_streams.load(Ordering::Relaxed),
+                durable + counters.durable_streams.load(Ordering::Relaxed),
+            )
+        })
     }
 
     /// Send independently scheduled streams on all workers; dropping this future aborts every owned task.
@@ -602,13 +809,20 @@ impl PreparedClient {
                     }
                 } else {
                     (0..this.options.streams_per_worker)
-                        .map(|_| this.next.fetch_add(1, Ordering::Relaxed) as usize % corpus.len())
+                        .map(|_| {
+                            match this.options.data_mode {
+                                DataMode::Shared => &this.next,
+                                DataMode::Independent => &this.worker_next[worker],
+                            }
+                            .fetch_add(1, Ordering::Relaxed) as usize
+                                % corpus.len()
+                        })
                         .collect()
                 };
                 let streams = stream::iter(indices.into_iter().enumerate()).map(|(stream_index, index)| {
                     let batch = &corpus[index];
                     let channel = this.channels[worker][stream_index % this.channels[worker].len()].clone();
-                    this.send_one(worker, channel, batch)
+                    this.send_one(worker, channel, batch, None)
                 });
                 streams
                     .buffer_unordered(this.options.streams_per_worker)
@@ -621,7 +835,15 @@ impl PreparedClient {
             ..UploadReport::default()
         };
         while let Some(result) = tasks.join_next().await {
-            for admission in result.context("client worker failed")??.into_iter().flatten() {
+            let admissions = match result.context("client worker failed").and_then(std::convert::identity) {
+                Ok(admissions) => admissions,
+                Err(error) => {
+                    tasks.abort_all();
+                    while tasks.join_next().await.is_some() {}
+                    return Err(error);
+                }
+            };
+            for admission in admissions.into_iter().flatten() {
                 let (guarantee, rows) = admission;
                 report.completed_rows += rows;
                 match guarantee {
@@ -638,6 +860,7 @@ impl PreparedClient {
         worker: usize,
         channel: Channel,
         batch: &EncodedBatch,
+        measurement: Option<&Measurement>,
     ) -> Result<Option<(DeliveryGuarantee, u64)>> {
         if self.options.max_rows > 0
             && self
@@ -663,14 +886,19 @@ impl PreparedClient {
         };
         let mut request = Request::new(stream::iter(batch.data.as_ref().clone()));
         let timeout = Duration::from_millis(self.options.request_timeout_ms);
-        request.set_timeout(timeout);
         let result = tokio::time::timeout(timeout, async {
             request_metadata(&mut request, &batch.table, self.signer.as_ref())?;
+            request.set_timeout(timeout);
             completed_admission(self.options.client(channel).do_put(request).await?.into_inner()).await
         })
         .await
         .context("DMV upload timeout")
         .and_then(std::convert::identity);
+        let completed_unix_ms = if result.is_ok() && measurement.is_some() {
+            Some(unix_ms()?)
+        } else {
+            None
+        };
         attempt.finished = true;
         let micros = u64::try_from(attempt.started.elapsed().as_micros()).unwrap_or(u64::MAX);
         let bucket = (64 - micros.leading_zeros()) as usize;
@@ -680,6 +908,9 @@ impl PreparedClient {
             .map_err(|_| anyhow::anyhow!("latency histogram poisoned"))?[bucket.min(63)] += 1;
         match result {
             Ok(guarantee) => {
+                if let Some((measurement, completed_unix_ms)) = measurement.zip(completed_unix_ms) {
+                    measurement.record_completion(worker, batch.rows, batch.encoded_bytes, completed_unix_ms);
+                }
                 counters.completed_rows.fetch_add(batch.rows, Ordering::Relaxed);
                 counters
                     .completed_bytes
@@ -689,9 +920,6 @@ impl PreparedClient {
                     DeliveryGuarantee::DurableAdmission => &counters.durable_streams,
                 }
                 .fetch_add(1, Ordering::Relaxed);
-                if self.options.interval_us > 0 {
-                    tokio::time::sleep(Duration::from_micros(self.options.interval_us)).await;
-                }
                 Ok(Some((guarantee, batch.rows)))
             }
             Err(error) => {
@@ -704,12 +932,18 @@ impl PreparedClient {
 
     #[must_use]
     pub fn metrics(&self, phase: &str) -> serde_json::Value {
+        let measurement = self.measurement.lock().unwrap_or_else(|error| {
+            eprintln!("measurement state was poisoned; retaining recorded counters");
+            error.into_inner()
+        });
         serde_json::json!({
             "version": 1, "phase": phase, "scope": "process_cumulative",
             "completion_semantics": "validated_admission_response_not_delta_commit",
+            "send_latency_scope": "request_metadata_protobuf_grpc_compression_network_and_acknowledgement_excluding_interval",
             "bytes_semantics": "sum_of_protobuf_flight_data_encoded_lengths_excluding_grpc_http2",
             "elapsed_seconds": self.started.elapsed().as_secs_f64(),
             "preparation": self.preparation,
+            "measurement_window": measurement.as_ref().map(|value| value.snapshot()),
             "workers": self.counters.iter().enumerate().map(|(id, counters)| {
                 let mut value = counters.snapshot(self.started.elapsed().as_secs_f64());
                 value["worker"] = serde_json::json!(id);
@@ -717,6 +951,32 @@ impl PreparedClient {
             }).collect::<Vec<_>>(),
         })
     }
+}
+
+fn unix_ms() -> Result<u64> {
+    Ok(u64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
+    )?)
+}
+
+async fn replenish_until<F, Fut>(end_unix_ms: u64, interval_us: u64, mut send: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<bool>>,
+{
+    while unix_ms()? < end_unix_ms {
+        if !send().await? {
+            break;
+        }
+        if interval_us > 0 {
+            let remaining_ms = end_unix_ms.saturating_sub(unix_ms()?);
+            tokio::time::sleep(Duration::from_micros(
+                interval_us.min(remaining_ms.saturating_mul(1000)),
+            ))
+            .await;
+        }
+    }
+    Ok(())
 }
 
 fn estimated_row_bytes(table: &DmvTable, client_id: &str, options: &Options) -> u64 {
@@ -825,7 +1085,7 @@ fn synthetic_batch(
                         }
                     })
                 }))),
-                DataType::Boolean => primitive!(BooleanArray, |row| key(row) % 2 == 0),
+                DataType::Boolean => primitive!(BooleanArray, |row| key(row).is_multiple_of(2)),
                 DataType::UInt8 => primitive!(UInt8Array, |row| (key(row) % 255) as u8),
                 DataType::Int16 => primitive!(Int16Array, |row| (key(row) % 32767) as i16),
                 DataType::Int32 => primitive!(Int32Array, |row| (key(row) % i32::MAX as u64) as i32),
@@ -902,7 +1162,59 @@ fn thread_cpu_seconds() -> Result<Option<f64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrowcol_flight::{
+        BatchAdmission, PutResultEmitter, RuntimeResult, StreamAbortReason, StreamCompletion, StreamContext,
+        StreamLifecycle, StreamSummary,
+    };
     use clap::Parser;
+    use std::sync::atomic::AtomicBool;
+
+    #[derive(Default)]
+    struct SmokeState {
+        slow_next: AtomicBool,
+        fast_completions: AtomicU64,
+        rows: AtomicU64,
+    }
+
+    struct SmokeAdmission(Arc<SmokeState>);
+    struct SmokeStream {
+        state: Arc<SmokeState>,
+        slow: bool,
+        rows: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl BatchAdmission for SmokeAdmission {
+        async fn begin(
+            &self,
+            _: StreamContext,
+            _: Arc<dyn PutResultEmitter>,
+        ) -> RuntimeResult<Box<dyn StreamLifecycle>> {
+            Ok(Box::new(SmokeStream {
+                state: Arc::clone(&self.0),
+                slow: self.0.slow_next.swap(false, Ordering::SeqCst),
+                rows: 0,
+            }))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StreamLifecycle for SmokeStream {
+        async fn push_batch(&mut self, batch: RecordBatch) -> RuntimeResult<()> {
+            self.rows += batch.num_rows() as u64;
+            Ok(())
+        }
+        async fn complete(&mut self, _: StreamSummary) -> RuntimeResult<StreamCompletion> {
+            if self.slow {
+                tokio::time::sleep(Duration::from_millis(350)).await;
+            } else {
+                self.state.fast_completions.fetch_add(1, Ordering::Relaxed);
+            }
+            self.state.rows.fetch_add(self.rows, Ordering::Relaxed);
+            Ok(StreamCompletion::best_effort())
+        }
+        async fn abort(self: Box<Self>, _: StreamAbortReason) {}
+    }
 
     #[derive(Parser)]
     struct Cli {
@@ -971,6 +1283,247 @@ mod tests {
             .err()
             .context("expected memory error")?;
         assert!(error.to_string().contains("memory"));
+        Ok(())
+    }
+
+    #[test]
+    fn nullability_width_skew_and_entropy_are_applied_without_changing_customer_identity() -> Result<()> {
+        use arrow_schema::Field;
+        let mut table = table_named("sqlserver_wait_stats")?;
+        table.schema = Arc::new(Schema::new(vec![
+            Field::new("customer_id", DataType::Utf8, false),
+            Field::new("text", DataType::Utf8, true),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let mut options = options()?;
+        options.string_width = 23;
+        options.null_fraction = 1.0;
+        let nullable = synthetic_batch(&table, "client", 7, 0, 0, &options)?;
+        assert_eq!(nullable.column(1).null_count(), 7);
+        assert_eq!(nullable.column(2).null_count(), 0);
+        let ids = nullable
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .context("customer array")?;
+        assert!(ids.iter().all(|value| value == Some("client")));
+        options.null_fraction = 0.0;
+        options.entropy = 0.0;
+        options.skew = 1.0;
+        let repeated = synthetic_batch(&table, "client", 7, 0, 0, &options)?;
+        let strings = repeated
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .context("string array")?;
+        assert!(strings.iter().all(|value| value == Some("aaaaaaaaaaaaaaaaaaaaaaa")));
+        let values = repeated
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .context("value array")?;
+        assert!(values.iter().all(|value| value == Some(0)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn terminal_send_failure_is_not_retried_and_row_budget_counts_attempts() -> Result<()> {
+        let mut options = options()?;
+        options.workers = 1;
+        options.streams_per_worker = 1;
+        options.max_rows = 10;
+        options.request_timeout_ms = 100;
+        let table = Arc::new(table_named("sqlserver_wait_stats")?);
+        let record = synthetic_batch(&table, "client", 8, 0, 0, &options)?;
+        let data = encode(&table, "v1", record, &options).await?;
+        let encoded_bytes = data.iter().map(|message| message.encoded_len() as u64).sum();
+        let channel = options.endpoint("http://127.0.0.1:0")?.connect_lazy();
+        let client = Arc::new(PreparedClient {
+            corpus: vec![Arc::new(vec![EncodedBatch {
+                table,
+                data: Arc::new(data),
+                rows: 8,
+                encoded_bytes,
+            }])],
+            channels: vec![vec![channel]],
+            signer: None,
+            counters: vec![Counters::default()],
+            next: AtomicU64::new(0),
+            worker_next: vec![AtomicU64::new(0)],
+            reserved_rows: AtomicU64::new(0),
+            measurement: Mutex::new(None),
+            table_count: 1,
+            preparation: serde_json::json!({}),
+            started: Instant::now(),
+            options,
+        });
+        assert!(client.send_round().await.is_err());
+        assert_eq!(client.send_round().await?.completed_rows, 0);
+        let metrics = client.metrics("failed");
+        assert_eq!(metrics["workers"][0]["attempted_rows"], 8);
+        assert_eq!(metrics["workers"][0]["error_rows"], 8);
+        assert_eq!(metrics["workers"][0]["completed_rows"], 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fast_slot_replenishes_while_another_worker_is_still_waiting() -> Result<()> {
+        let sends = AtomicU64::new(0);
+        let release = tokio::sync::Semaphore::new(0);
+        let deadline = unix_ms()? + 2_000;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::try_join!(
+                replenish_until(deadline, 0, || async {
+                    let sent = sends.fetch_add(1, Ordering::SeqCst) + 1;
+                    if sent == 10 {
+                        release.add_permits(1);
+                    }
+                    tokio::task::yield_now().await;
+                    Ok(sent < 12)
+                }),
+                replenish_until(deadline, 0, || async {
+                    let _permit = release.acquire().await?;
+                    assert!(sends.load(Ordering::SeqCst) >= 10);
+                    Ok(false)
+                }),
+            )
+        })
+        .await
+        .context("fast worker was blocked behind the slow worker")??;
+        assert_eq!(sends.load(Ordering::SeqCst), 12);
+        Ok(())
+    }
+
+    #[test]
+    fn individual_stream_completions_are_attributed_even_when_a_peer_spans_the_window() -> Result<()> {
+        let measurement = Measurement::new(10_000, 70_000, 2)?;
+        measurement.record_completion(0, 100, 1000, 9_999);
+        measurement.record_completion(0, 200, 2000, 10_000);
+        measurement.record_completion(0, 300, 3000, 69_999);
+        measurement.record_completion(1, 400, 4000, 70_000);
+        let snapshot = measurement.snapshot();
+        assert_eq!(snapshot["completed_rows"], 500);
+        assert_eq!(snapshot["completed_bytes"], 5000);
+        assert_eq!(snapshot["worker_completed_rows"], serde_json::json!([500, 0]));
+        assert_eq!(snapshot["pilot_window_rows"], serde_json::json!([200, 300]));
+        Ok(())
+    }
+
+    #[test]
+    fn independent_worker_cursors_visit_their_complete_corpus() -> Result<()> {
+        let mut options = options()?;
+        options.data_mode = DataMode::Independent;
+        let table = Arc::new(table_named("sqlserver_wait_stats")?);
+        let corpus = || {
+            Arc::new(
+                (1..=4)
+                    .map(|rows| EncodedBatch {
+                        table: Arc::clone(&table),
+                        data: Arc::new(Vec::new()),
+                        rows,
+                        encoded_bytes: 0,
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let client = PreparedClient {
+            corpus: vec![corpus(), corpus()],
+            channels: vec![],
+            signer: None,
+            counters: vec![],
+            next: AtomicU64::new(0),
+            worker_next: vec![AtomicU64::new(0), AtomicU64::new(0)],
+            reserved_rows: AtomicU64::new(0),
+            measurement: Mutex::new(None),
+            table_count: 1,
+            preparation: serde_json::json!({}),
+            started: Instant::now(),
+            options,
+        };
+        let mut observed = [Vec::new(), Vec::new()];
+        for _ in 0..4 {
+            for (worker, rows) in observed.iter_mut().enumerate() {
+                rows.push(client.next_batch(worker).rows);
+            }
+        }
+        assert_eq!(observed, [vec![1, 2, 3, 4], vec![1, 2, 3, 4]]);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_flight_smoke_keeps_fast_worker_busy_and_drains_late_acknowledgement() -> Result<()> {
+        use arrowcol_catalog::{CatalogControlPlane, CatalogStore, MemoryCatalogStore};
+        use arrowcol_flight::{AllowAllAuthenticator, ArrowColFlightService, RuntimeLimits};
+        use arrowcol_protocol::{AuthContext, AuthMethod, AuthenticatedPrincipal, PrincipalId, PrincipalIssuer};
+        let store: Arc<dyn CatalogStore> = Arc::new(MemoryCatalogStore::new());
+        let principal = AuthenticatedPrincipal::new(
+            PrincipalId::new("smoke")?,
+            PrincipalIssuer::new("smoke")?,
+            Default::default(),
+        )?;
+        let auth = AuthContext::new(principal, AuthMethod::WorkloadIdentity, UnixMillis::new(1)?, None)?;
+        let state = Arc::new(SmokeState::default());
+        let service = ArrowColFlightService::new(
+            ImplementationPool::Dataflow,
+            Arc::clone(&store),
+            Arc::new(AllowAllAuthenticator::new(auth)),
+            Arc::new(SmokeAdmission(Arc::clone(&state))),
+            RuntimeLimits::default(),
+        )?
+        .with_ddl_handler(Arc::new(CatalogControlPlane::new(DdlParser::default(), store)))
+        .into_tonic_service()
+        .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
+        .send_compressed(tonic::codec::CompressionEncoding::Gzip);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let incoming = stream::unfold(listener, |listener| async {
+            Some((listener.accept().await.map(|(socket, _)| socket), listener))
+        });
+        let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming_shutdown(incoming, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+        let mut options = options()?;
+        options.corpus_rows = 32;
+        options.batch_rows = 8;
+        options.streams_per_worker = 1;
+        options.ipc_compression = IpcCompression::Zstd;
+        options.grpc_send_compression = GrpcCompression::Gzip;
+        options.grpc_accept_compression = GrpcCompression::Gzip;
+        let client = PreparedClient::prepare(&endpoint, "smoke", Some("sqlserver_wait_stats"), None, options).await?;
+        assert_eq!(client.send_once().await?.completed_rows, 32);
+        assert_eq!(state.rows.load(Ordering::Relaxed), 32);
+        state.fast_completions.store(0, Ordering::Relaxed);
+        state.slow_next.store(true, Ordering::SeqCst);
+        let start = unix_ms()? + 25;
+        let report = client.run_continuous(start, start + 175).await?;
+        assert!(
+            state.fast_completions.load(Ordering::Relaxed) >= 3,
+            "a slow peer stalled the fast worker"
+        );
+        assert!(report.completed_rows > 8, "fast worker did not replenish its slot");
+        let metrics = client.metrics("completed");
+        let total = metrics["workers"]
+            .as_array()
+            .context("missing workers")?
+            .iter()
+            .map(|worker| worker["completed_rows"].as_u64().context("missing completed rows"))
+            .sum::<Result<u64>>()?;
+        assert_eq!(total, state.rows.load(Ordering::Relaxed));
+        assert!(
+            total >= report.completed_rows + 40,
+            "late slow acknowledgement must be drained but excluded from measurement"
+        );
+        drop(client);
+        shutdown
+            .send(())
+            .map_err(|()| anyhow::anyhow!("smoke server stopped early"))?;
+        tokio::time::timeout(Duration::from_secs(2), server).await???;
         Ok(())
     }
 }

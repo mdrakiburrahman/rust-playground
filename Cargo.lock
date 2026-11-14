@@ -1823,6 +1823,7 @@ dependencies = [
  "arrowcol-flight",
  "arrowcol-protocol",
  "arrowcol-router-rust",
+ "async-trait",
  "clap",
  "futures",
  "http",
