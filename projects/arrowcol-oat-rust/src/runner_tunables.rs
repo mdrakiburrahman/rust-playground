@@ -28,13 +28,13 @@ fn compose_tunables(config: &OatConfig) -> Result<Value> {
         ("oat-client", ComponentRole::Client),
         ("router", ComponentRole::Router),
         ("dataflow-1", ComponentRole::Collector),
-        ("delta-maintenance", ComponentRole::Maintenance),
     ] {
         let environment = role_environment(config, role)?;
         if !environment.is_empty() {
             services.insert(service.to_owned(), json!({ "environment": environment }));
         }
     }
+    compose_maintenance(config, &mut services)?;
     Ok(json!({ "services": services }))
 }
 
@@ -97,6 +97,7 @@ fn inject_workload_environment(config: &OatConfig, resources: &mut [Value]) -> R
         if resource["kind"].as_str() != Some("Deployment") {
             continue;
         }
+        inject_maintenance_arguments(config, resource)?;
         let role_and_container = match resource.pointer("/metadata/name").and_then(Value::as_str) {
             Some("arrowcol-router") => Some((ComponentRole::Router, "router")),
             Some(name) if name == config.dfe_deployment => {

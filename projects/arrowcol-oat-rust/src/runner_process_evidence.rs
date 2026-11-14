@@ -99,11 +99,9 @@ fn public_tuning_value(value: &Value) -> Option<Value> {
                 .iter()
                 .filter_map(|(name, value)| {
                     let lower = name.to_ascii_lowercase();
-                    if [
-                        "secret", "password", "token", "endpoint", "path", "root", "listen", "address", "auth",
-                    ]
-                    .iter()
-                    .any(|private| lower.contains(private))
+                    if ["secret", "password", "token", "endpoint", "listen", "address", "auth"]
+                        .iter()
+                        .any(|private| lower.contains(private))
                     {
                         return None;
                     }
@@ -187,15 +185,25 @@ fn contains_requested(observed: &Value, requested: &Value) -> bool {
 }
 
 fn verify_process_configuration(config: &OatConfig, role: ComponentRole, observed: &Value) -> Result<()> {
+    if matches!(role, ComponentRole::Maintenance) && maintenance_enabled(config) {
+        verify_maintenance_controls(config, observed)?;
+    }
     for (name, expected) in role_environment(config, role)? {
         let expected = serde_json::from_str::<Value>(&expected).unwrap_or(Value::String(expected));
+        if matches!(role, ComponentRole::Maintenance) && name.starts_with("ARROWCOL_MAINT_") {
+            let (actual, expected) = maintenance_readback_value(observed, &name, expected)?;
+            if !contains_requested(&actual, &expected) {
+                bail!("maintenance startup does not match applied tunable {name}");
+            }
+            continue;
+        }
         let path = match name.as_str() {
             "ARROWCOL_PARQUET_CONFIG" => "/parquet_writer".to_owned(),
             "ARROWCOL_COLLECTOR_BATCHING_CONFIG" => "/batching".to_owned(),
             "ARROWCOL_COLLECTOR_COMMIT_CONFIG" => "/commit".to_owned(),
             "ARROWCOL_COLLECTOR_LIMITS_CONFIG" => "/limits".to_owned(),
             "ARROWCOL_COLLECTOR_PRESSURE_CONFIG" => "/pressure".to_owned(),
-            "ARROWCOL_COLLECTOR_RUNTIME_WORKERS" => "/runtime/workers".to_owned(),
+            "ARROWCOL_COLLECTOR_RUNTIME_WORKERS" => "/runtime/runtime_workers".to_owned(),
             variable if variable.starts_with("ARROWCOL_COLLECTOR_") => format!(
                 "/runtime/{}",
                 variable.trim_start_matches("ARROWCOL_COLLECTOR_").to_ascii_lowercase()
@@ -242,13 +250,21 @@ fn process_evidence(config: &OatConfig, logs: &[ProcessLog]) -> Result<Value> {
             .iter()
             .filter(|log| role_name(log.role) == role_name(role))
             .collect::<Vec<_>>();
-        if !role_environment(config, role)?.is_empty() && selected.is_empty() {
+        if (!role_environment(config, role)?.is_empty()
+            || (matches!(role, ComponentRole::Maintenance) && maintenance_enabled(config)))
+            && selected.is_empty()
+        {
             bail!("configured {} has no running consumer/readback", role_name(role));
         }
         for log in selected {
             let resolved = process_configurations(&log.text)?;
             verify_process_configuration(config, role, &resolved)?;
             let observed = !resolved.as_object().is_none_or(serde_json::Map::is_empty);
+            let maintenance_tables = if matches!(role, ComponentRole::Maintenance) {
+                Some(maintenance_table_evidence(config, &log.text)?)
+            } else {
+                None
+            };
             result.push(json!({
                 "component": role_name(role),
                 "effective_config": observed.then_some(resolved),
@@ -258,6 +274,7 @@ fn process_evidence(config: &OatConfig, logs: &[ProcessLog]) -> Result<Value> {
                 "image_id": log.image_id,
                 "source_revision": log.source_revision,
                 "log_complete": log.complete,
+                "maintenance_table_policies": maintenance_tables,
             }));
         }
     }

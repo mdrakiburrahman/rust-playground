@@ -38,6 +38,7 @@ include!("runner_evidence.rs");
 include!("runner_tunables.rs");
 include!("runner_process_evidence.rs");
 include!("runner_commit_evidence.rs");
+include!("runner_maintenance.rs");
 
 #[derive(Clone, Debug)]
 struct OatResult {
@@ -264,7 +265,8 @@ impl Platform for AksPlatform {
             expires_at_unix_ms,
             now_unix_ms,
         )
-        .await
+        .await?;
+        start_aks_maintenance(config).await
     }
 
     fn qap_observation_mode(&self) -> arrowcol_loadgen::ObservationMode {
@@ -481,7 +483,8 @@ impl Platform for LocalPlatform {
             expires_at_unix_ms,
             now_unix_ms,
         )
-        .await
+        .await?;
+        start_local_maintenance(config, self).await
     }
 
     fn qap_observation_mode(&self) -> arrowcol_loadgen::ObservationMode {
@@ -3908,7 +3911,11 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
     );
     platform.add_compose_environment(&mut build_client);
     build_client.args(["build", "oat-client"]);
+    if maintenance_enabled(config) && config.maintenance_image.is_none() {
+        build_client.arg("delta-maintenance");
+    }
     run_streaming_command(build_client, "build OAT client container").await?;
+    pin_local_maintenance_image(config, platform).await?;
     verify_local_bind_mount(config, platform).await?;
 
     let mut up = compose_command(
@@ -4865,6 +4872,20 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
     runtime_config["deltaRoot"] = json!(run_data_root);
     runtime_config["namespace"] = json!(config.namespace);
     runtime_config["oatRunId"] = json!(platform.run_id);
+    if let Some(maintenance) = maintenance_runtime(config)? {
+        runtime_config["maintenance"] = maintenance;
+        runtime_config["images"]["maintenance"] = json!(
+            config
+                .maintenance_image
+                .as_deref()
+                .context("enabled AKS maintenance requires its pinned image")?
+        );
+    } else {
+        runtime_config
+            .as_object_mut()
+            .context("runtime config must be an object")?
+            .remove("maintenance");
+    }
     let generated_config = runtime_dir.join("runtime-config.json");
     tokio::fs::write(&generated_config, serde_json::to_vec(&runtime_config)?)
         .await

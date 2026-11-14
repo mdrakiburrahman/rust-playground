@@ -10,6 +10,7 @@ import { validateRuntime, type RuntimeConfig } from './runtime.js';
 const repositories = {
   sqlserver: 'arrowcol-sqlserver', catalog: 'arrowcol-catalog-rust',
   router: 'arrowcol-router-rust', dataflow: 'arrowcol-dataflow-rust',
+  maintenance: 'delta-maintenance',
 } as const;
 type Options = ImageOptions & { runtimeConfig: string };
 
@@ -18,6 +19,7 @@ const revisionLabel = 'org.opencontainers.image.revision';
 const localImages = {
   sqlserver: 'arrowcol-oat/sqlserver:local', catalog: 'arrowcol-oat/catalog:local',
   router: 'arrowcol-oat/router:local', dataflow: 'arrowcol-oat/dataflow:local', client: 'arrowcol-oat/client:local',
+  maintenance: 'arrowcol-oat/maintenance:local',
 } as const;
 const imageBuilds = [
   ['sqlserver', 'projects/arrowcol-infra/docker/sqlserver/Dockerfile', 'projects/arrowcol-infra'],
@@ -25,6 +27,7 @@ const imageBuilds = [
   ['router', 'projects/arrowcol-router-rust/Dockerfile', '.'],
   ['dataflow', 'projects/arrowcol-dataflow-rust/Dockerfile', '.'],
   ['client', 'projects/arrowcol-oat-rust/Dockerfile.client', '.'],
+  ['maintenance', 'crates/delta-maintenance/Dockerfile', '.'],
 ] as const;
 
 export class MissingPublishedImagesError extends Error {
@@ -96,12 +99,13 @@ async function publishedDigest(session: PublisherSession, options: ImageOptions,
   return digest;
 }
 
-export async function buildLocalImages({ revision }: { revision: string }, runner: typeof run_tree = run_tree): Promise<void> {
+export async function buildLocalImages({ revision, maintenance = false }: { revision: string; maintenance?: boolean }, runner: typeof run_tree = run_tree): Promise<void> {
   const source = requireRevision(revision);
   if (await getSourceRevision(runner) !== source) throw new Error('Image revision does not match the checked-out source.');
   const status = await runner(['git', 'status', '--porcelain'], 15, ROOT);
   if (status.returncode || status.stdout.trim()) throw new Error('Commit the source changes before building revision-proven images.');
   for (const [role, dockerfile, context] of imageBuilds) {
+    if (role === 'maintenance' && !maintenance) continue;
     const result = await runner(['docker', 'buildx', 'build', '--pull', '--platform', 'linux/amd64', '--load',
       '--tag', localImages[role], '--label', `${revisionLabel}=${source}`, '--file', dockerfile, context], 3600, ROOT);
     if (result.returncode) throw new Error(`Docker build failed for ${role} (${result.returncode}): ${result.stderr.trim() || 'no diagnostic output'}`);
@@ -150,7 +154,7 @@ export async function publishClientImage(options: ImageOptions, runner: typeof r
 }
 
 export async function readPublishedImages(
-  options: ImageOptions & { revision: string }, runner: typeof run_tree = run_tree,
+  options: ImageOptions & { revision: string; maintenance?: boolean }, runner: typeof run_tree = run_tree,
 ): Promise<{ images: RuntimeConfig['images']; client: string }> {
   if (!options.federated) throw new Error('OAT image verification requires --federated.');
   const source = requireRevision(options.revision);
@@ -163,7 +167,8 @@ export async function readPublishedImages(
     let client = '';
     const missing: string[] = [];
     const allRepositories: Array<[keyof typeof repositories | 'client', string]> = [
-      ...(Object.entries(repositories) as Array<[keyof typeof repositories, string]>), ['client', clientRepository],
+      ...(Object.entries(repositories) as Array<[keyof typeof repositories, string]>)
+        .filter(([role]) => role !== 'maintenance' || options.maintenance), ['client', clientRepository],
     ];
     const repositoryNames = await listRepositories(session, options);
     for (const [role, repository] of allRepositories) {
@@ -213,14 +218,16 @@ export async function publishImages(options: Options, runner: typeof run_tree = 
     throw new Error('Runtime configuration must reuse the selected stamp namespace, ServiceAccount and UAMI.');
   }
   const source = await getSourceRevision(runner);
-  for (const role of Object.keys(repositories) as Array<keyof typeof repositories>) {
+  const selectedRepositories = (Object.entries(repositories) as Array<[keyof typeof repositories, string]>)
+    .filter(([role]) => role !== 'maintenance' || config.images.maintenance !== undefined);
+  for (const [role] of selectedRepositories) {
     await verifyLocalImage(role, localImages[role], source, runner);
   }
   const images = await withPublisherIdentity(options, async ({ run, clean, revision, loginServer, subscription }) => {
     if (!source.startsWith(revision.toLowerCase())) throw new Error('Source revision changed during image publication.');
     const published = {} as RuntimeConfig['images'];
     const tag = options.tag ?? revisionTag(source);
-    for (const [role, repository] of Object.entries(repositories) as Array<[keyof typeof repositories, string]>) {
+    for (const [role, repository] of selectedRepositories) {
       const tagged = `${loginServer}/${repository}:${tag}`;
       clean(`docker tag ${role}`, await run(['docker', 'tag', `arrowcol-oat/${role}:local`, tagged], 30));
       clean(`docker push ${role}`, await run(['docker', 'push', tagged], 3600));

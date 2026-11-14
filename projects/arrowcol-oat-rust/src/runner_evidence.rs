@@ -79,12 +79,28 @@ impl CellEvidence {
         Ok(())
     }
 
+    fn client_snapshot_total(&self, table: &str, field: &str) -> Option<u64> {
+        let reports = self.client_reports.get(table)?;
+        if reports.is_empty() {
+            return None;
+        }
+        reports.iter().try_fold(0_u64, |total, report| {
+            report
+                .pointer("/phase_counters/workers")?
+                .as_array()?
+                .iter()
+                .try_fold(total, |total, worker| total.checked_add(worker.get(field)?.as_u64()?))
+        })
+    }
+
     fn for_table(&self, table: &str, client: Option<&ClientMetrics>) -> Value {
         let durable = self.durable_commits.get(table);
+        let output = durable.and_then(|value| value.get("output_throughput"));
         json!({
             "version": 1,
             "processes": self.processes,
             "durable_commits": self.durable_commits.get(table),
+            "commit_window_output_throughput": output,
             "client_phase_reports": self.client_reports.get(table),
             "downstream_status": if self.downstream_comment.is_some() { "unavailable" } else { "observed_or_not_attempted" },
             "downstream_comment": self.downstream_comment,
@@ -101,22 +117,26 @@ impl CellEvidence {
                 "unavailable_reason": self.resource_samples.is_empty().then_some("no_measurement_window_resource_samples"),
             },
             "rows": {
-                "attempted": null,
+                "attempted": self.client_snapshot_total(table, "attempted_rows"),
+                "attempted_scope": "measurement_start_to_completed_process_snapshot_interval_not_exact_window",
                 "sent": null,
+                "sent_unavailable_reason": "no_transport_write_completion_counter",
                 "client_completed": client.map(|metrics| metrics.rows),
                 "wal_acked": null,
-                "delta_committed": durable.and_then(|value| value["rows"].as_u64()),
-                "delta_committed_scope": "observed_new_commits_with_ingress_wholly_in_window_not_all_delivered_rows",
+                "delta_committed": output.and_then(|value| value["rows"].as_u64()),
+                "delta_committed_scope": "ingestion_commit_finish_window_includes_warmup_backlog_not_client_cohort",
                 "unique_delivered": null,
-                "unavailable_reason": "no_cell_scoped_commit_or_unique_delivery_evidence",
+                "unique_delivery_unavailable_reason": "commit_counts_do_not_prove_unique_client_delivery",
+                "wal_ack_unavailable_reason": "admission_response_is_not_a_wal_fsync_receipt",
                 "retry_semantics": "upload_completion_does_not_establish_exactly_once_delivery",
             },
-            "durable_files": durable.and_then(|value| value["files"].as_u64()),
-            "durable_bytes": durable.and_then(|value| value["parquet_bytes"].as_u64()),
-            "durable_bytes_per_row": durable.and_then(|value| value["bytes_per_row"].as_f64()),
-            "compression_ratio": durable.and_then(|value| value["compression_ratio"].as_f64()),
+            "durable_rows_per_second": output.and_then(|value| value["rows_per_second"].as_f64()),
+            "durable_files": output.and_then(|value| value["files"].as_u64()),
+            "durable_bytes": output.and_then(|value| value["parquet_bytes"].as_u64()),
+            "durable_bytes_per_row": output.and_then(|value| value["bytes_per_row"].as_f64()),
+            "compression_ratio": output.and_then(|value| value["compression_ratio"].as_f64()),
             "compression_ratio_denominator": "committed_parquet_file_bytes_including_metadata",
-            "stage_latency_percentiles": { "commit_seconds": durable.and_then(|value| value.get("commit_latency_seconds")) },
+            "stage_latency_percentiles": { "commit_seconds": output.and_then(|value| value.get("commit_latency_seconds")) },
             "backlog": null,
         })
     }

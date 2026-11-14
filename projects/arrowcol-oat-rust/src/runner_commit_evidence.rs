@@ -48,6 +48,88 @@ fn canonical_dmv_table_name(table: &str) -> Result<String> {
     ))
 }
 
+fn commit_window_output(
+    events: &std::collections::BTreeMap<(String, u64), CommitEvent>,
+    table: &str,
+    start: u64,
+    end: u64,
+    unavailable: Option<&str>,
+) -> Result<Value> {
+    let seconds = end
+        .checked_sub(start)
+        .filter(|duration| *duration > 0)
+        .context("invalid shared commit measurement window")? as f64
+        / 1000.0;
+    let mut result = json!({
+        "scope": "new_ingestion_commits_finished_in_half_open_shared_window_not_client_cohort",
+        "measurement_start_unix_ms": start, "measurement_end_unix_ms": end, "window_seconds": seconds,
+        "clock": "collector_system_unix_ms_shared_schedule_clock_skew_not_measured",
+        "rows": null, "files": null, "input_bytes": null, "parquet_bytes": null, "rows_per_second": null,
+        "bytes_per_row": null, "compression_ratio": null, "commit_latency_seconds": null,
+        "unique_delivered_rows": null, "complete_delivery_established": false,
+        "warmup_backlog": "included_when_commit_finishes_in_window",
+        "rewrite_commits": "excluded_by_ingestion_only_producer_capability",
+    });
+    if let Some(reason) = unavailable {
+        result["unavailable_reason"] = json!(reason);
+        return Ok(result);
+    }
+    let mut rows = 0_u64;
+    let mut files = 0_u64;
+    let mut input_bytes = 0_u64;
+    let mut parquet_bytes = 0_u64;
+    let mut latencies = Vec::new();
+    for event in events
+        .values()
+        .filter(|event| event.table_name.as_deref() == Some(table))
+    {
+        let Some(finished) = event.finished_at_unix_ms.and_then(|time| u64::try_from(time).ok()) else {
+            result["unavailable_reason"] = json!("commit_finish_time_unavailable");
+            return Ok(result);
+        };
+        if finished < start || finished >= end {
+            continue;
+        }
+        let (Some(event_rows), Some(event_files), Some(event_input), Some(event_bytes), Some(elapsed)) = (
+            event.rows,
+            event.files,
+            event.input_bytes,
+            event.parquet_bytes,
+            event.elapsed_seconds,
+        ) else {
+            bail!("commit-window event omitted row/file/byte/timing evidence");
+        };
+        if event_rows == 0 || event_files == 0 || event_bytes == 0 || !elapsed.is_finite() || elapsed < 0.0 {
+            bail!("invalid commit-window row/file/byte/timing evidence");
+        }
+        rows = rows.checked_add(event_rows).context("commit output row overflow")?;
+        files = files.checked_add(event_files).context("commit output file overflow")?;
+        input_bytes = input_bytes
+            .checked_add(event_input)
+            .context("commit output input-byte overflow")?;
+        parquet_bytes = parquet_bytes
+            .checked_add(event_bytes)
+            .context("commit output byte overflow")?;
+        latencies.push(elapsed);
+    }
+    latencies.sort_by(f64::total_cmp);
+    result["rows"] = json!(rows);
+    result["files"] = json!(files);
+    result["input_bytes"] = json!(input_bytes);
+    result["parquet_bytes"] = json!(parquet_bytes);
+    result["rows_per_second"] = json!(rows as f64 / seconds);
+    result["commits"] = json!(latencies.len());
+    result["bytes_per_row"] = json!((rows > 0).then(|| parquet_bytes as f64 / rows as f64));
+    result["compression_ratio"] = json!((parquet_bytes > 0).then(|| input_bytes as f64 / parquet_bytes as f64));
+    result["compression_ratio_numerator"] = json!("collector_reported_input_bytes");
+    result["compression_ratio_denominator"] = json!("committed_parquet_file_bytes_including_metadata");
+    result["commit_latency_seconds"] = json!({
+        "p50": percentile(&latencies, 50), "p95": percentile(&latencies, 95), "p99": percentile(&latencies, 99),
+        "samples": latencies.len(), "scope": "commit_retry_and_sync_not_encoding_or_admission",
+    });
+    Ok(result)
+}
+
 fn durable_commit_evidence(
     config: &OatConfig,
     logs: &[ProcessLog],
@@ -67,6 +149,14 @@ fn durable_commit_evidence(
     let mut unavailable = collector_logs.is_empty().then_some("collector_commit_log_unavailable");
     if collector_logs.iter().any(|log| !log.complete) {
         unavailable = Some("collector_commit_log_incomplete");
+    }
+    let mut capability_observed = !collector_logs.is_empty();
+    for log in &collector_logs {
+        let readback = process_configurations(&log.text)?;
+        capability_observed &= readback["commit_telemetry"]
+            == json!({
+                "schema_version":1,"scope":"new_ingestion_addfiles_after_sync","clock":"system_unix_ms",
+            });
     }
     let mut events = std::collections::BTreeMap::new();
     for log in collector_logs {
@@ -184,6 +274,15 @@ fn durable_commit_evidence(
             }));
         }
     }
+    for (table, evidence) in &mut result {
+        evidence["output_throughput"] = commit_window_output(
+            &events,
+            &canonical_dmv_table_name(table)?,
+            start,
+            end,
+            unavailable.or((!capability_observed).then_some("ingestion_commit_producer_capability_unavailable")),
+        )?;
+    }
     Ok(result)
 }
 
@@ -210,10 +309,13 @@ mod commit_evidence_tests {
             image_id: None,
             source_revision: None,
             complete: true,
-            text: events
-                .iter()
-                .map(|event| format!("arrowcol_data_commit {event}\n"))
-                .collect(),
+            text: format!(
+                "arrowcol_effective_config {{\"commit_telemetry\":{{\"schema_version\":1,\"scope\":\"new_ingestion_addfiles_after_sync\",\"clock\":\"system_unix_ms\"}}}}\n{}",
+                events
+                    .iter()
+                    .map(|event| format!("arrowcol_data_commit {event}\n"))
+                    .collect::<String>()
+            ),
         }
     }
 
@@ -244,6 +346,28 @@ mod commit_evidence_tests {
         let mut conflicting = first.clone();
         conflicting["rows"] = json!(11);
         assert!(durable_commit_evidence(&config, &[log(&[first, conflicting])], Some((100, 200))).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn output_window_includes_boundary_crossing_backlog_but_not_late_or_rewrite_commits() -> Result<()> {
+        let config = config()?;
+        let crossing = event(&config, 99, 101);
+        let mut late = event(&config, 110, 199);
+        late["delta_version"] = json!(8);
+        let logs = [log(&[crossing.clone(), crossing, late])];
+        let evidence = durable_commit_evidence(&config, &logs, Some((100, 200)))?;
+        let table = &evidence[&config.tables[0]];
+        assert!(table["rows"].is_null());
+        assert_eq!(table["output_throughput"]["rows"], 10);
+        assert_eq!(table["output_throughput"]["rows_per_second"], 100.0);
+        assert!(table["output_throughput"]["unique_delivered_rows"].is_null());
+        let zero = durable_commit_evidence(&config, &[log(&[])], Some((100, 200)))?;
+        assert_eq!(zero[&config.tables[0]]["output_throughput"]["rows"], 0);
+        let mut absent = log(&[]);
+        absent.text.clear();
+        let absent = durable_commit_evidence(&config, &[absent], Some((100, 200)))?;
+        assert!(absent[&config.tables[0]]["output_throughput"]["rows"].is_null());
         Ok(())
     }
 }
