@@ -10,6 +10,10 @@ Standalone Delta Kernel service; separate from collector appends. Dry run by def
 | Apply | Add `--apply` to the plan command. |
 | Test | `cargo test -p delta-maintenance` |
 
+CLI settings are also available as `ARROWCOL_MAINT_*` environment variables;
+see `--help` for names and defaults. Comma-separate tables and operations in
+the environment. Table properties override corresponding process defaults.
+
 | Operation | Effect |
 | --- | --- |
 | `optimize` | Compact closed Hive partitions; atomic `dataChange=false` rewrite. |

@@ -218,6 +218,9 @@ fn idle_catalog_policy_passes_have_no_log_checkpoint_or_progress_rewrites() -> R
 fn table_policy_overrides_process_minimum_and_only_compacts_sealed_pair() -> Result<()> {
     let (root, mut settings, mut source) = fixture()?;
     settings.operations = vec![Operation::Optimize];
+    settings
+        .process_properties
+        .insert("arrowcol.optimize.minFiles".into(), "4".into());
     source
         .0
         .properties
@@ -231,6 +234,16 @@ fn table_policy_overrides_process_minimum_and_only_compacts_sealed_pair() -> Res
         std::fs::read_dir(root.path().join("events").join("__arrowcol_ingestion=2024-01-01-00-01"))?.count(),
         2
     );
+    Ok(())
+}
+
+#[test]
+fn invalid_process_properties_are_rejected_before_a_pass() -> Result<()> {
+    let (_, mut settings, _) = fixture()?;
+    settings
+        .process_properties
+        .insert("arrowcol.optimize.minFiles".into(), "1".into());
+    assert!(settings.validate().is_err());
     Ok(())
 }
 

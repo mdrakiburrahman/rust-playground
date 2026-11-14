@@ -120,6 +120,8 @@ struct Cli {
     max_batch_bytes: usize,
     #[arg(long, env = "ARROWCOL_MAINT_BATCH_ROWS", default_value_t = 8192)]
     batch_rows: usize,
+    #[arg(long, env = "ARROWCOL_MAINT_OUTPUT_ROW_GROUP_ROWS", default_value_t = 65_536)]
+    output_row_group_rows: usize,
     #[arg(long, env = "ARROWCOL_MAINT_MAX_OUTPUT_FILE_BYTES", default_value_t = 1023 * 1024 * 1024)]
     max_output_file_bytes: u64,
     #[arg(long, env = "ARROWCOL_MAINT_MAX_ACTIVE_FILES", default_value_t = 1_000_000)]
@@ -231,6 +233,7 @@ fn settings(cli: Cli) -> Result<Settings> {
             max_row_group_bytes: cli.max_row_group_bytes,
             max_batch_bytes: cli.max_batch_bytes,
             batch_rows: cli.batch_rows,
+            output_row_group_rows: cli.output_row_group_rows,
             max_output_file_bytes: cli.max_output_file_bytes,
             max_active_files: cli.max_active_files,
             latest_partitions: cli.latest_partitions,
@@ -326,4 +329,47 @@ fn main_inner() -> Result<bool> {
             .map_err(|error| anyhow!("telemetry shutdown failed: {error}"))?;
     }
     Ok(healthy)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_limits_are_validated_and_propagated() -> Result<()> {
+        let args = [
+            "delta-maintenance",
+            "--root",
+            "file:///tmp/",
+            "--operation",
+            "optimize",
+            "--max-files-per-bin",
+            "7",
+            "--min-files",
+            "3",
+            "--output-row-group-rows",
+            "1024",
+        ];
+        let config = settings(Cli::try_parse_from(args)?)?;
+        assert_eq!(config.optimize.max_files_per_bin, 7);
+        assert_eq!(config.optimize.output_row_group_rows, 1024);
+        assert_eq!(
+            config
+                .process_properties
+                .get("arrowcol.optimize.minFiles")
+                .map(String::as_str),
+            Some("3")
+        );
+        let invalid = [
+            "delta-maintenance",
+            "--root",
+            "file:///tmp/",
+            "--operation",
+            "optimize",
+            "--output-row-group-rows",
+            "0",
+        ];
+        assert!(settings(Cli::try_parse_from(invalid)?).is_err());
+        Ok(())
+    }
 }

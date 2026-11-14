@@ -1517,6 +1517,10 @@ pub struct OptimizeConfig {
     pub max_active_files: usize,
     /// Whole-output sort using the shared layout helper.
     pub layout: Option<LayoutPolicy>,
+    /// Use the publication layout when no explicit layout is configured.
+    pub use_default_layout: bool,
+    /// Unsorted output row-group row limit.
+    pub output_row_group_rows: usize,
 }
 
 impl Default for OptimizeConfig {
@@ -1539,6 +1543,8 @@ impl Default for OptimizeConfig {
             max_output_file_bytes: 1023 * 1024 * 1024,
             max_active_files: 1_000_000,
             layout: None,
+            use_default_layout: true,
+            output_row_group_rows: 65_536,
         }
     }
 }
@@ -1570,6 +1576,9 @@ impl OptimizeConfig {
         }
         if self.latest_partitions == Some(0) {
             return invalid("latest partition count must be positive");
+        }
+        if self.output_row_group_rows == 0 {
+            return invalid("output row-group rows must be positive");
         }
         Ok(())
     }
@@ -1975,7 +1984,8 @@ impl DeltaTable {
         // customer's whole-file sort order instead of concatenating inputs.
         let layout = match &config.layout {
             Some(layout) => Some(layout.clone()),
-            None => crate::delta::configured_publication_layout(&logical)?,
+            None if config.use_default_layout => crate::delta::configured_publication_layout(&logical)?,
+            None => None,
         };
         let properties = match &layout {
             Some(layout) => {
@@ -1983,7 +1993,7 @@ impl DeltaTable {
                 layout.writer_properties(&physical)?
             }
             None => WriterProperties::builder()
-                .set_max_row_group_row_count(Some(65_536))
+                .set_max_row_group_row_count(Some(config.output_row_group_rows))
                 .build(),
         };
         let mut writer = BinWriter {

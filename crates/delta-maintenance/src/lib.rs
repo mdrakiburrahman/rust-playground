@@ -500,6 +500,11 @@ fn effective_settings(settings: &Settings, properties: &BTreeMap<String, String>
     } else {
         None
     };
+    if properties.contains_key("arrowcol.layout.enabled")
+        || settings.process_properties.contains_key("arrowcol.layout.enabled")
+    {
+        effective.optimize.use_default_layout = false;
+    }
     effective.optimize.validate()?;
     Ok((effective, props))
 }
@@ -588,6 +593,8 @@ impl OptimizeEvidence {
                 "max_row_group_bytes": config.max_row_group_bytes,
                 "max_batch_bytes": config.max_batch_bytes,
                 "batch_rows": config.batch_rows,
+                "output_row_group_rows": config.output_row_group_rows,
+                "use_default_layout": config.use_default_layout,
                 "max_output_file_bytes": config.max_output_file_bytes,
                 "max_active_files": config.max_active_files,
                 "layout": config.layout.as_ref().map(|layout| serde_json::json!({
