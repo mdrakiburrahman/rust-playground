@@ -131,7 +131,9 @@ async function main(): Promise<void> {
       for (const table of tables.slice(0, replicas)) {
         const args = ['run', '--rm', '--network', network, ...secretMount,
           '-e', 'LOADTEST_INTERNAL_SECRET_FILE=/run/oat/internal-hmac', images.client,
-          '--endpoint', `http://${routerName}:50050`, '--table', table, '--rows', '10000', '--concurrency', '4'];
+          '--endpoint', `http://${routerName}:50050`, '--table', table, '--rows', '10000',
+          '--batch-rows', '2500',
+          '--workers', '4', '--streams-per-worker', '1', '--concurrency', '4'];
         const unsigned = spawnSync('docker', args, { encoding: 'utf8' });
         assert.notEqual(unsigned.status, 0, 'router must reject unsigned requests');
         docker([...args, '--edge-secret-file', '/run/oat/edge-hmac']);
