@@ -143,15 +143,16 @@ npx --no-install arrowcol-oat --mode aks --stamp-config "$STAMP_CONFIG" --config
 ### AKS run:
 
 ```bash
-SUB=68fa0545-661c-4152-93f2-fc8ae1c231b8
+export SUB=68fa0545-661c-4152-93f2-fc8ae1c231b8
+export STAMP_NUM="68590"
 
 az deployment group show \
   --subscription "$SUB" \
   --resource-group arrow-collector-rg \
-  --name arrowcol-sandbox-stamp-87515 \
+  --name "arrowcol-sandbox-stamp-${STAMP_NUM}" \
   --query "{
     subscription:'$SUB',
-    stamp:'87515',
+    stamp:'${STAMP_NUM}',
     resourceGroup:'arrow-collector-rg',
     location:properties.parameters.location.value,
     aks:properties.parameters.aksConfig.value,
@@ -160,8 +161,8 @@ az deployment group show \
   }" \
   --output yaml --only-show-errors
 
-export STAMP_CONFIG=.temp/stamp-87515.yaml
-npx --no-install arrowcol-oat aks setup --stamp 87515 --stamp-config "$STAMP_CONFIG"
+export STAMP_CONFIG=".temp/stamp-${STAMP_NUM}.yaml"
+npx --no-install arrowcol-oat aks setup --stamp ${STAMP_NUM} --stamp-config "$STAMP_CONFIG"
 npx --no-install arrowcol-oat --mode aks --stamp-config "$STAMP_CONFIG" --config out/arrowcol-oat/oat-config.aks.json
 ```
 
