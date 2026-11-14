@@ -392,7 +392,15 @@ impl ParquetWriterConfig {
         } else {
             builder = builder.set_sorting_columns(None);
         }
-        Ok(builder.build())
+        let properties = builder.build();
+        ensure!(
+            self.offset_index_enabled != Some(false)
+                || leaves
+                    .iter()
+                    .all(|leaf| properties.statistics_enabled(leaf.path()) != EnabledStatistics::Page),
+            "offset_index_enabled=false requires statistics=none or chunk for every column; page statistics force offset indexes"
+        );
+        Ok(properties)
     }
 }
 
@@ -497,6 +505,37 @@ mod tests {
             ),
         ]));
         assert!(config.writer_properties(&ambiguous, None, &[]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn disabling_offset_indexes_rejects_page_statistics_instead_of_being_ignored() -> Result<()> {
+        let config: ParquetWriterConfig = serde_json::from_str(r#"{"offset_index_enabled":false}"#)?;
+        assert!(config.writer_properties(&schema(), None, &[]).is_err());
+        let config: ParquetWriterConfig = serde_json::from_str(
+            r#"{"offset_index_enabled":false,"defaults":{"statistics":"chunk"},"columns":{"value":{"statistics":"page"}}}"#,
+        )?;
+        assert!(config.writer_properties(&schema(), None, &[]).is_err());
+        let config: ParquetWriterConfig =
+            serde_json::from_str(r#"{"offset_index_enabled":false,"defaults":{"statistics":"chunk"}}"#)?;
+        let schema = schema();
+        let properties = config.writer_properties(&schema, None, &[])?;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )?;
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("no-offset-index.parquet");
+        let mut writer = ArrowWriter::try_new(std::fs::File::create(&path)?, schema, Some(properties))?;
+        writer.write(&batch)?;
+        writer.close()?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&path)?)?;
+        for column in reader.metadata().row_group(0).columns() {
+            assert!(column.offset_index_offset().is_none());
+        }
         Ok(())
     }
 
