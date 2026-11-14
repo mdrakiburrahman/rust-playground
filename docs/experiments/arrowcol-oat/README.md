@@ -14,7 +14,12 @@ The viewer's six numbered stack parts match the diagram badges. Their numbers ap
 
 ## Parquet contract
 
-Schema version 2 keeps every existing column and adds run/platform and pinning metadata. `started_at` is an Arrow `timestamp[ms, tz=UTC]`; nullable fields are written as null when unavailable, never as synthetic zeroes.
+Schema version 3 preserves the existing 31 columns and appends nullable
+`evidence_json`. It records consumer startup readback, execution image identities,
+phase-scoped counters, observed commit evidence and bounded resource samples.
+See [tunable and measurement semantics](TUNABLES.md).
+`started_at` is an Arrow `timestamp[ms, tz=UTC]`; unavailable measurements are null,
+never synthetic zeroes.
 
 The failure-evidence amendment makes `rows`, `duration_ms` and
 `rows_per_second` nullable without changing their names, order or logical types.
@@ -22,7 +27,8 @@ Uncompleted measurements are null; completed measurements and historical zero
 values remain values, never retroactively inferred as missing. The producer
 accepts the exact prior 31-column v2 schema (including field/schema metadata)
 only by widening these three fields from required to nullable during append.
-All other schema differences are rejected; the output retains `schema_version: 2`.
+All other schema differences are rejected. Historical rows retain
+`schema_version: 2` and receive null `evidence_json`; new rows use version 3.
 This is an explicit nullability amendment, not the unchanged original strict
 schema. Readers must accept null measurements, including failed-cell records.
 
@@ -41,7 +47,7 @@ separately and continues displaying null metrics as a dash, not zero.
 
 | Column            | Type                          | Nullability | Meaning                                                                                                                                           |
 | ----------------- | ----------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `schema_version`  | 32-bit signed integer         | Required    | Contract version; currently `2`.                                                                                                                  |
+| `schema_version`  | 32-bit signed integer         | Required    | Contract version; new rows use `3`, historical `2` remains readable.                                                                               |
 | `mode`            | UTF-8 string                  | Required    | `local` or `aks`.                                                                                                                                 |
 | `stamp`           | UTF-8 string                  | Nullable    | Deployment stamp, when available.                                                                                                                 |
 | `host`            | UTF-8 string                  | Required    | Host running the OAT workload.                                                                                                                    |
@@ -65,11 +71,11 @@ The producer retains these original result columns:
 | `replicas`                 | 64-bit unsigned integer          | ArrowCol replica count.                                                                          |
 | `dfe_worker_concurrency`   | 64-bit unsigned integer          | DFE `--num-cores` setting.                                                                       |
 | `table`                    | UTF-8 string                     | DMV table used as the table-scoped routing key.                                                  |
-| `rows`                     | Nullable 64-bit unsigned integer | Rows sent by the standalone DMV client; null if no complete measurement.                         |
+| `rows`                     | Nullable 64-bit unsigned integer | Client admission completions in the shared measurement window; not Delta commits or unique delivery. |
 | `duration_ms`              | Nullable 64-bit unsigned integer | Shared fleet measurement duration; excludes preflight and warm-up; null if unmeasured.           |
 | `rows_per_second`          | Nullable 64-bit float            | Total table rows completed during the shared window divided by its duration; null if unmeasured. |
-| `cpu_millicores`           | Nullable 64-bit float            | Unique collector/DFE pod CPU from `kubectl top`; integrated pods are counted once.               |
-| `memory_bytes`             | Nullable 64-bit unsigned integer | Unique collector/DFE pod memory from `kubectl top`; integrated pods are counted once.            |
+| `cpu_millicores`           | Nullable 64-bit float            | Mean of observed collector-fleet samples inside measurement; not an end-of-run snapshot.       |
+| `memory_bytes`             | Nullable 64-bit unsigned integer | Maximum observed collector-fleet sample; not an asserted peak RSS.                              |
 | `qap_observation_complete` | 64-bit unsigned integer          | 1 only when all expected QAP tables and required fields were measured; otherwise 0.              |
 | `qap_observed_tables`      | 64-bit unsigned integer          | Number of expected QAP tables observed.                                                          |
 | `qap_completion_percent`   | Nullable 64-bit float            | Minimum reported completion percentage across the selected tables.                               |
@@ -77,6 +83,7 @@ The producer retains these original result columns:
 | `qap_cached_bytes`         | Nullable 64-bit unsigned integer | Sum of QAP `HotSize` bytes across selected tables.                                               |
 | `qap_unhealthy_catalogs`   | Nullable 64-bit unsigned integer | Sum of unhealthy catalog counts across selected tables.                                          |
 | `qap_lag_seconds`          | Nullable 64-bit float            | Maximum reported QAP lag across selected tables.                                                 |
+| `evidence_json`            | Nullable UTF-8 string            | Versioned sanitized configuration, provenance, counters, commit and resource evidence; null on historical rows. |
 
 The viewer reads `results.parquet` from the same origin using HTTP range requests; it does not need CORS configuration. Azure Storage static website hosting on the HNS-enabled account serves `$web` anonymously, even when account-level blob public access is disabled. The AKS defaults target `abfss://experiments@arrowcollector<stamp>.dfs.core.windows.net/arrowcol-oat/results.parquet` and the root `results.parquet` in that stamp's `$web`; explicit destinations may override them. `aks setup` publishes the checked-in viewer and its architecture SVG to `$web/index.html` and `$web/architecture.svg` through the federated `arrow-collector` identity so the static-site root can render the diagram and load same-origin results. The producer uses conditional ETag updates, deduplicates every write by `(run_id, table)` (last row wins), and verifies the website copy matches the authoritative results object before success. Local writers serialize read/merge/rename through a cross-process file lock with a 15-second timeout. Empty results files preserve the full schema and accept later appends. Publish only approved nonsensitive summary metrics there—never credentials, raw payloads, or sensitive identifiers.
 

@@ -5,6 +5,9 @@ struct CellEvidence {
     resource_sampling_failures: u64,
     resource_samples_dropped: u64,
     client_reports: HashMap<String, Vec<Value>>,
+    processes: Option<Value>,
+    measurement_window: Option<(u64, u64)>,
+    durable_commits: HashMap<String, Value>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -56,17 +59,32 @@ impl CellEvidence {
         })
     }
 
-    fn record_client(&mut self, table: &str, output: &str) -> Result<()> {
-        self.client_reports
-            .entry(table.to_owned())
-            .or_default()
-            .push(client_phase_evidence(output)?);
+    fn record_client(&mut self, config: &OatConfig, table: &str, output: &str) -> Result<()> {
+        let effective = process_configurations(output)?;
+        verify_process_configuration(config, ComponentRole::Client, &effective)?;
+        let counters = client_phase_evidence(output)?;
+        if let Some(window) = counters.get("measurement_window").filter(|value| !value.is_null()) {
+            let report = parse_client_metrics(output)?;
+            if self.measurement_window != window["start_unix_ms"].as_u64().zip(window["end_unix_ms"].as_u64())
+                || window["completed_rows"].as_u64() != Some(report.rows)
+            {
+                bail!("client phase counters disagree with the armed window or measured-row report");
+            }
+        }
+        self.client_reports.entry(table.to_owned()).or_default().push(json!({
+            "phase_counters": counters,
+            "consumer_effective_config": effective,
+            "execution_image": client_image_evidence(output)?,
+        }));
         Ok(())
     }
 
     fn for_table(&self, table: &str, client: Option<&ClientMetrics>) -> Value {
+        let durable = self.durable_commits.get(table);
         json!({
             "version": 1,
+            "processes": self.processes,
+            "durable_commits": self.durable_commits.get(table),
             "client_phase_reports": self.client_reports.get(table),
             "downstream_status": if self.downstream_comment.is_some() { "unavailable" } else { "observed_or_not_attempted" },
             "downstream_comment": self.downstream_comment,
@@ -87,17 +105,18 @@ impl CellEvidence {
                 "sent": null,
                 "client_completed": client.map(|metrics| metrics.rows),
                 "wal_acked": null,
-                "delta_committed": null,
+                "delta_committed": durable.and_then(|value| value["rows"].as_u64()),
+                "delta_committed_scope": "observed_new_commits_with_ingress_wholly_in_window_not_all_delivered_rows",
                 "unique_delivered": null,
                 "unavailable_reason": "no_cell_scoped_commit_or_unique_delivery_evidence",
                 "retry_semantics": "upload_completion_does_not_establish_exactly_once_delivery",
             },
-            "durable_files": null,
-            "durable_bytes": null,
-            "durable_bytes_per_row": null,
-            "compression_ratio": null,
-            "compression_ratio_denominator": null,
-            "stage_latency_percentiles": null,
+            "durable_files": durable.and_then(|value| value["files"].as_u64()),
+            "durable_bytes": durable.and_then(|value| value["parquet_bytes"].as_u64()),
+            "durable_bytes_per_row": durable.and_then(|value| value["bytes_per_row"].as_f64()),
+            "compression_ratio": durable.and_then(|value| value["compression_ratio"].as_f64()),
+            "compression_ratio_denominator": "committed_parquet_file_bytes_including_metadata",
+            "stage_latency_percentiles": { "commit_seconds": durable.and_then(|value| value.get("commit_latency_seconds")) },
             "backlog": null,
         })
     }
@@ -234,6 +253,64 @@ struct ClientCounterSnapshot {
     scope: String,
     elapsed_seconds: f64,
     workers: Vec<WorkerCounterSnapshot>,
+    preparation: Option<Value>,
+    measurement_window: Option<ClientMeasurementWindow>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct ClientMeasurementWindow {
+    start_unix_ms: u64,
+    end_unix_ms: u64,
+    completed_rows: u64,
+    completed_bytes: u64,
+    worker_completed_rows: Vec<u64>,
+    pilot_window_rows: Vec<u64>,
+    scope: String,
+}
+
+fn client_preparation(value: Option<&Value>) -> Result<Value> {
+    let Some(value) = value else {
+        return Ok(Value::Null);
+    };
+    let object = value.as_object().context("client preparation must be an object")?;
+    let mut result = serde_json::Map::new();
+    for key in [
+        "corpus_rows",
+        "corpus_decoded_bytes",
+        "corpus_encoded_bytes",
+        "retained_encoded_bytes",
+        "memory_reservation_bytes",
+    ] {
+        if let Some(value) = object.get(key) {
+            if value.as_u64().is_none() {
+                bail!("client preparation byte/row evidence must be unsigned");
+            }
+            result.insert(key.to_owned(), value.clone());
+        }
+    }
+    for key in [
+        "generation_wall_seconds",
+        "generation_cpu_seconds",
+        "encoding_wall_seconds",
+        "encoding_cpu_seconds",
+        "preparation_wall_seconds",
+        "preparation_cpu_seconds",
+        "generator_rows_per_second",
+    ] {
+        if let Some(value) = object.get(key) {
+            if !value.is_null() && value.as_f64().is_none_or(|value| !value.is_finite() || value < 0.0) {
+                bail!("client preparation timing/rate evidence must be finite and nonnegative");
+            }
+            result.insert(key.to_owned(), value.clone());
+        }
+    }
+    if let Some(value) = object.get("steady_state_generation") {
+        if value.as_bool() != Some(false) {
+            bail!("unexpected hot-path generation in prepared client");
+        }
+        result.insert("steady_state_generation".to_owned(), value.clone());
+    }
+    Ok(Value::Object(result))
 }
 
 fn client_phase_evidence(output: &str) -> Result<Value> {
@@ -459,6 +536,19 @@ fn client_snapshot_delta(snapshots: &[ClientCounterSnapshot]) -> Result<Value> {
     }
     let start = phase("measurement_start")?;
     let end = phase("completed")?;
+    if let Some(window) = &end.measurement_window {
+        if window.scope != "per_stream_admission_completion_observed_in_half_open_shared_unix_window"
+            || window.start_unix_ms >= window.end_unix_ms
+            || window.worker_completed_rows.len() != end.workers.len()
+            || window
+                .worker_completed_rows
+                .iter()
+                .try_fold(0_u64, |sum, rows| sum.checked_add(*rows))
+                != Some(window.completed_rows)
+        {
+            bail!("invalid exact client measurement-window accounting");
+        }
+    }
     if end.elapsed_seconds < start.elapsed_seconds || end.workers.len() != start.workers.len() {
         bail!("client counter interval or worker count changed");
     }
@@ -504,6 +594,8 @@ fn client_snapshot_delta(snapshots: &[ClientCounterSnapshot]) -> Result<Value> {
         "bytes_semantics": "sum_of_protobuf_flight_data_encoded_lengths_excluding_grpc_http2",
         "latency_scope": "process_cumulative_includes_preflight_and_warmup_not_phase_percentiles",
         "workers": deltas,
+        "preparation": client_preparation(end.preparation.as_ref())?,
+        "measurement_window": end.measurement_window,
     }))
 }
 
