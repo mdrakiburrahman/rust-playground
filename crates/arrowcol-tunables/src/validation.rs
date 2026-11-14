@@ -218,45 +218,7 @@ impl Tunables {
             validate_coalescing(collector.coalescing.as_ref())?;
         }
         if let Some(writer) = &self.parquet_writer {
-            if let Some(compression) = &writer.compression {
-                compression.validate("parquet_writer.compression")?;
-            }
-            if let Some(columns) = &writer.columns {
-                let mut names = std::collections::HashSet::new();
-                for column in columns {
-                    if column.name.trim().is_empty() || !names.insert(column.name.to_ascii_lowercase()) {
-                        bail!("parquet_writer.columns must have nonempty, unique column names");
-                    }
-                    if let Some(compression) = &column.compression {
-                        compression.validate("parquet_writer.columns.compression")?;
-                    }
-                    if let Some(encoding) = column.encoding {
-                        validate_encoding(column.physical_type, encoding)?;
-                    }
-                }
-            }
-            positive(
-                "parquet_writer.dictionary_page_size_bytes",
-                writer.dictionary_page_size_bytes,
-            )?;
-            positive("parquet_writer.row_group_rows", writer.row_group_rows)?;
-            positive("parquet_writer.row_group_bytes", writer.row_group_bytes)?;
-            positive("parquet_writer.data_page_bytes", writer.data_page_bytes)?;
-            positive("parquet_writer.data_page_rows", writer.data_page_rows)?;
-            if let Some(bloom) = &writer.bloom_filter {
-                if bloom
-                    .false_positive_probability
-                    .is_some_and(|value| !value.is_finite() || value <= 0.0 || value >= 1.0)
-                {
-                    bail!(
-                        "parquet_writer.bloom_filter.false_positive_probability must be finite and greater than 0 and less than 1"
-                    );
-                }
-                positive("parquet_writer.bloom_filter.ndv", bloom.ndv)?;
-                if bloom.enabled == Some(false) && (bloom.false_positive_probability.is_some() || bloom.ndv.is_some()) {
-                    bail!("disabled Bloom filters cannot specify false_positive_probability or ndv");
-                }
-            }
+            writer.validate()?;
         }
         if let Some(wal) = &self.wal {
             positive("wal.capacity_bytes", wal.capacity_bytes)?;
@@ -306,31 +268,6 @@ impl Tunables {
                 > maintenance.max_decoded_bytes_per_bin.unwrap_or(1_073_741_824)
             {
                 bail!("maintenance.max_decoded_batch_bytes must not exceed max_decoded_bytes_per_bin");
-            }
-        }
-        Ok(())
-    }
-
-    /// Checks per-column declarations against the actual normalized schema before writer construction.
-    pub fn validate_column_types(&self, actual: &BTreeMap<String, PhysicalType>) -> Result<()> {
-        self.validate()?;
-        if let Some(columns) = self.parquet_writer.as_ref().and_then(|writer| writer.columns.as_ref()) {
-            for column in columns {
-                let name = column.name.to_ascii_lowercase();
-                let physical_type = actual
-                    .get(&name)
-                    .ok_or_else(|| anyhow::anyhow!("Parquet override references unknown column {:?}", column.name))?;
-                if *physical_type != column.physical_type {
-                    bail!(
-                        "Parquet override for {:?} declares {:?}, actual normalized physical type is {:?}",
-                        column.name,
-                        column.physical_type,
-                        physical_type
-                    );
-                }
-                if let Some(encoding) = column.encoding {
-                    validate_encoding(*physical_type, encoding)?;
-                }
             }
         }
         Ok(())
@@ -399,6 +336,13 @@ impl Tunables {
             return Ok(output);
         };
         for (section, section_value) in sections {
+            if section == "parquet_writer" {
+                output.insert(
+                    "ARROWCOL_PARQUET_CONFIG".to_owned(),
+                    canonicalize(section_value.clone()).to_string(),
+                );
+                continue;
+            }
             let prefix = match section.as_str() {
                 "client" => "ARROWCOL_CLIENT",
                 "transport" => "ARROWCOL_CLIENT",
@@ -415,53 +359,9 @@ impl Tunables {
     }
 }
 
-impl Compression {
-    fn validate(&self, field: &str) -> Result<()> {
-        match (self.codec, self.level) {
-            (CompressionCodec::Gzip, Some(level)) if level <= 9 => {}
-            (CompressionCodec::Brotli, Some(level)) if level <= 11 => {}
-            (CompressionCodec::Zstd, Some(level)) if (1..=22).contains(&level) => {}
-            (CompressionCodec::Gzip | CompressionCodec::Brotli | CompressionCodec::Zstd, None) => {}
-            (
-                CompressionCodec::Uncompressed
-                | CompressionCodec::Snappy
-                | CompressionCodec::Lz4Raw
-                | CompressionCodec::Lz4,
-                None,
-            ) => {}
-            (CompressionCodec::Gzip, Some(_)) => bail!("{field}.level must be between 0 and 9 for gzip"),
-            (CompressionCodec::Brotli, Some(_)) => bail!("{field}.level must be between 0 and 11 for brotli"),
-            (CompressionCodec::Zstd, Some(_)) => bail!("{field}.level must be between 1 and 22 for zstd"),
-            (_, Some(_)) => bail!("{field}.level is only supported for gzip, brotli, or zstd"),
-        }
-        Ok(())
-    }
-}
-
 fn validate_h2_window(field: &str, window: u32) -> Result<()> {
     if window == 0 || window > 2_147_483_647 {
         bail!("{field} must be between 1 and 2147483647 bytes");
-    }
-    Ok(())
-}
-
-fn validate_encoding(physical_type: PhysicalType, encoding: Encoding) -> Result<()> {
-    let supported = match encoding {
-        Encoding::Plain => true,
-        Encoding::Rle => physical_type == PhysicalType::Boolean,
-        Encoding::DeltaBinaryPacked => matches!(physical_type, PhysicalType::Int32 | PhysicalType::Int64),
-        Encoding::ByteStreamSplit => matches!(
-            physical_type,
-            PhysicalType::Int32
-                | PhysicalType::Int64
-                | PhysicalType::Float
-                | PhysicalType::Double
-                | PhysicalType::FixedLenByteArray
-        ),
-        Encoding::DeltaLengthByteArray | Encoding::DeltaByteArray => physical_type == PhysicalType::ByteArray,
-    };
-    if !supported {
-        bail!("encoding {encoding:?} is not supported for physical type {physical_type:?}");
     }
     Ok(())
 }
@@ -602,95 +502,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn strict_enum_parsing_rejects_unknown_codec_and_encoding() {
-        let error = serde_json::from_str::<Compression>(r#"{"codec":"brotliish","level":5}"#).unwrap_err();
+    fn strict_writer_config_parsing_and_validation() -> Result<()> {
+        let error =
+            serde_json::from_str::<ParquetWriterConfig>(r#"{"defaults":{"compression":"brotliish"}}"#).unwrap_err();
         assert!(error.to_string().contains("unknown variant"));
-        let error = serde_json::from_str::<ColumnOverride>(
-            r#"{"name":"x","physical_type":"int64","encoding":"dictionary","compression":null}"#,
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("unknown variant"));
+
+        let mut valid: ParquetWriterConfig = serde_json::from_str(
+            r#"{"defaults":{"compression":"zstd","compression_level":22},"max_row_group_rows":1000}"#,
+        )?;
+        valid.validate()?;
+        valid.defaults.compression_level = Some(23);
+        assert!(format!("{:#}", valid.validate().unwrap_err()).contains("zstd"));
+
+        for probability in [0.0, 1.0, f64::NAN] {
+            let mut invalid = ParquetWriterConfig::default();
+            invalid.defaults.bloom_filter_fpp = Some(probability);
+            assert!(invalid.validate().is_err());
+        }
+        Ok(())
     }
 
     #[test]
-    fn validates_compression_bounds_bloom_probability_and_physical_encoding() -> Result<()> {
-        let valid = Tunables {
-            parquet_writer: Some(ParquetWriterTunables {
-                compression: Some(Compression {
-                    codec: CompressionCodec::Zstd,
-                    level: Some(22),
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        valid.validate()?;
-        let invalid = Tunables {
-            parquet_writer: Some(ParquetWriterTunables {
-                compression: Some(Compression {
-                    codec: CompressionCodec::Zstd,
-                    level: Some(23),
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        assert!(invalid.validate().unwrap_err().to_string().contains("zstd"));
-        for probability in [0.0, 1.0, f64::NAN] {
-            let invalid = Tunables {
-                parquet_writer: Some(ParquetWriterTunables {
-                    bloom_filter: Some(BloomFilterTunables {
-                        enabled: Some(true),
-                        false_positive_probability: Some(probability),
-                        ndv: None,
-                    }),
+    fn parquet_environment_uses_authoritative_json_config() -> Result<()> {
+        let tunables = Tunables {
+            parquet_writer: Some(ParquetWriterConfig {
+                defaults: ParquetColumnOptions {
+                    compression: Some(ParquetCodec::Zstd),
+                    compression_level: Some(5),
                     ..Default::default()
-                }),
-                ..Default::default()
-            };
-            assert!(
-                invalid
-                    .validate()
-                    .unwrap_err()
-                    .to_string()
-                    .contains("false_positive_probability")
-            );
-        }
-        let invalid = Tunables {
-            parquet_writer: Some(ParquetWriterTunables {
-                columns: Some(vec![ColumnOverride {
-                    name: "x".to_owned(),
-                    physical_type: PhysicalType::Boolean,
-                    compression: None,
-                    encoding: Some(Encoding::DeltaBinaryPacked),
-                }]),
+                },
                 ..Default::default()
             }),
             ..Default::default()
         };
-        assert!(invalid.validate().unwrap_err().to_string().contains("physical type"));
-        let declared = Tunables {
-            parquet_writer: Some(ParquetWriterTunables {
-                columns: Some(vec![ColumnOverride {
-                    name: "x".to_owned(),
-                    physical_type: PhysicalType::Int64,
-                    compression: None,
-                    encoding: Some(Encoding::DeltaBinaryPacked),
-                }]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        assert!(
-            declared
-                .validate_column_types(&BTreeMap::from([("x".to_owned(), PhysicalType::Int32)]))
-                .is_err()
-        );
-        assert!(
-            declared
-                .validate_column_types(&BTreeMap::from([("x".to_owned(), PhysicalType::Int64)]))
-                .is_ok()
-        );
+        let env = tunables.environment_for(ComponentRole::Collector)?;
+        let config: ParquetWriterConfig = serde_json::from_str(&env["ARROWCOL_PARQUET_CONFIG"])?;
+        assert_eq!(config.defaults.compression, Some(ParquetCodec::Zstd));
+        assert_eq!(config.defaults.compression_level, Some(5));
+        assert_eq!(env.len(), 1);
         Ok(())
     }
 
