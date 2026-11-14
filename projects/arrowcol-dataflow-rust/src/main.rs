@@ -8,10 +8,17 @@ use arrowcol_dataflow_components as _;
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("arrowcol_effective_config {}", arrow_deltalake::writer::effective_startup_config_json()?);
+    eprintln!(
+        "arrowcol_effective_config {}",
+        arrow_deltalake::writer::effective_startup_config_json()?
+    );
     eprintln!(
         "arrowcol_effective_config {{\"component\":\"build\",\"config\":{{\"allocator\":\"{}\"}}}}",
-        if cfg!(feature = "allocator-mimalloc") { "mimalloc" } else { "system" }
+        if cfg!(feature = "allocator-mimalloc") {
+            "mimalloc"
+        } else {
+            "system"
+        }
     );
     otel_arrow_dfe::initialize_crypto_provider()?;
     let metrics = arrowcol_buffer::MetricsGuard::install("arrowcol-dataflow-rust")?;

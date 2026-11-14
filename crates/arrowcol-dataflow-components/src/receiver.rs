@@ -434,20 +434,23 @@ fn create_receiver(
         config.registration.instance_key = format!("{}|cloud={generation}", config.registration.instance_key);
     }
     config.validate().map_err(config_error)?;
-    eprintln!("arrowcol_effective_config {}", serde_json::json!({
-        "component": "receiver",
-        "config": {
-            "limits": config.limits,
-            "pressure": {
-                "max_concurrent_streams": config.registration.max_concurrent_streams,
-                "rss_limit_bytes": config.registration.rss_limit_bytes,
-                "buffered_bytes_limit": config.registration.buffered_bytes_limit,
-                "buffered_rows_limit": config.registration.buffered_rows_limit,
-                "buffered_batches_limit": config.registration.buffered_batches_limit,
-                "pressure_interval": format!("{:?}", config.registration.pressure_interval)
+    eprintln!(
+        "arrowcol_effective_config {}",
+        serde_json::json!({
+            "component": "receiver",
+            "config": {
+                "limits": config.limits,
+                "pressure": {
+                    "max_concurrent_streams": config.registration.max_concurrent_streams,
+                    "rss_limit_bytes": config.registration.rss_limit_bytes,
+                    "buffered_bytes_limit": config.registration.buffered_bytes_limit,
+                    "buffered_rows_limit": config.registration.buffered_rows_limit,
+                    "buffered_batches_limit": config.registration.buffered_batches_limit,
+                    "pressure_interval": format!("{:?}", config.registration.pressure_interval)
+                }
             }
-        }
-    }));
+        })
+    );
     tracing::info!(
         component = "receiver",
         effective_config = %serde_json::json!({
