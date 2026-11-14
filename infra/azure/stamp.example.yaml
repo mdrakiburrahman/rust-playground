@@ -4,7 +4,7 @@ subscription: 00000000-0000-0000-0000-000000000000
 stamp: 1
 storageReadLogDestination: storage
 resourceGroup: arrow-collector-rg
-location: eastus2
+location: canadacentral
 aks:
   version: 1.35.6
   skuTier: Free

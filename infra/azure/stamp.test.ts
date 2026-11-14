@@ -9,7 +9,7 @@ test('loads the approved resource group, stamp and AKS baseline from YAML', () =
   const config = parseStampConfig(example);
   assert.equal(config.stamp, '1');
   assert.equal(config.resourceGroup, 'arrow-collector-rg');
-  assert.equal(config.location, 'eastus2');
+  assert.equal(config.location, 'canadacentral');
   assert.equal(config.aks.version, '1.35.6');
   assert.equal(config.aks.systemPool.vmSize, 'Standard_D8ds_v6');
   const defaults = defaultStampConfig();
@@ -84,11 +84,11 @@ test('accepts both approved stamp regions without broadening the resource-group 
   assert.equal(defaultStampConfig().stamp, '1');
   for (const location of ['eastus2', 'canadacentral']) {
     assert.equal(defaultStampConfig({ AZURE_LOCATION: location }).location, location);
-    assert.equal(parseStampConfig(example.replace('location: eastus2', 'location: ' + location)).location, location);
+    assert.equal(parseStampConfig(example.replace('location: canadacentral', 'location: ' + location)).location, location);
   }
   assert.throws(() => defaultStampConfig({ AZURE_RESOURCE_GROUP: 'rust-playground' }), /exact arrow-collector-rg/);
   assert.throws(() => defaultStampConfig({ AZURE_LOCATION: 'westus2' }), /approved eastus2 and canadacentral/);
-  assert.throws(() => parseStampConfig(example.replace('location: eastus2', 'location: westus2')), /location is invalid/);
+  assert.throws(() => parseStampConfig(example.replace('location: canadacentral', 'location: westus2')), /location is invalid/);
 });
 test('validates independently configured IPv4 and IPv6 egress allocation tags', () => {
   const configured = example.replace('egressIpv4IpTags: []',
