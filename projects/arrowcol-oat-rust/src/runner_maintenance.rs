@@ -357,10 +357,10 @@ fn maintenance_table_evidence(config: &OatConfig, text: &str) -> Result<Value> {
             bail!("maintenance table readback omitted resolved table policy");
         }
         verify_maintenance_controls(config, &policy)?;
-        if let Some(previous) = tables.insert(table.to_owned(), policy.clone()) {
-            if previous != policy {
-                bail!("maintenance table policy changed during the measured cell");
-            }
+        if let Some(previous) = tables.insert(table.to_owned(), policy.clone())
+            && previous != policy
+        {
+            bail!("maintenance table policy changed during the measured cell");
         }
     }
     for table in &config.tables {

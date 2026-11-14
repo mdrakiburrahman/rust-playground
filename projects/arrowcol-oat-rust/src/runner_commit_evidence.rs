@@ -180,10 +180,10 @@ fn durable_commit_evidence(
                 .context("committed event omitted canonical table hash")?;
             let version = event.delta_version.context("committed event omitted Delta version")?;
             let key = (table_id.to_owned(), version);
-            if let Some(previous) = events.insert(key, event.clone()) {
-                if previous != event {
-                    bail!("conflicting evidence for the same Delta commit identity");
-                }
+            if let Some(previous) = events.insert(key, event.clone())
+                && previous != event
+            {
+                bail!("conflicting evidence for the same Delta commit identity");
             }
         }
     }
@@ -296,10 +296,12 @@ mod commit_evidence_tests {
         ))?)
     }
 
-    fn event(config: &OatConfig, min: i64, max: i64) -> Value {
-        json!({"schema_version":1,"outcome":"committed","table_id":"a".repeat(64),"table_name":canonical_dmv_table_name(&config.tables[0]).unwrap(),
+    fn event(config: &OatConfig, min: i64, max: i64) -> Result<Value> {
+        Ok(
+            json!({"schema_version":1,"outcome":"committed","table_id":"a".repeat(64),"table_name":canonical_dmv_table_name(&config.tables[0])?,
             "delta_version":7,"rows":10,"files":1,"input_bytes":100,"parquet_bytes":50,
-            "min_ingested_at_ms":min,"max_ingested_at_ms":max,"finished_at_unix_ms":max+1,"elapsed_seconds":0.5})
+            "min_ingested_at_ms":min,"max_ingested_at_ms":max,"finished_at_unix_ms":max+1,"elapsed_seconds":0.5}),
+        )
     }
 
     fn log(events: &[Value]) -> ProcessLog {
@@ -322,7 +324,7 @@ mod commit_evidence_tests {
     #[test]
     fn commit_identity_deduplicates_replay_without_claiming_unique_delivery() -> Result<()> {
         let config = config()?;
-        let commit = event(&config, 100, 199);
+        let commit = event(&config, 100, 199)?;
         let evidence = durable_commit_evidence(&config, &[log(&[commit.clone(), commit])], Some((100, 200)))?;
         let evidence = &evidence[&config.tables[0]];
         assert_eq!(evidence["rows"], 10);
@@ -336,13 +338,13 @@ mod commit_evidence_tests {
     fn mixed_windows_unknown_outcomes_and_conflicting_replays_are_not_counted() -> Result<()> {
         let config = config()?;
         for events in [
-            vec![event(&config, 99, 101)],
+            vec![event(&config, 99, 101)?],
             vec![json!({"schema_version":1,"outcome":"reconciled"})],
         ] {
             let evidence = durable_commit_evidence(&config, &[log(&events)], Some((100, 200)))?;
             assert!(evidence[&config.tables[0]]["rows"].is_null());
         }
-        let first = event(&config, 100, 101);
+        let first = event(&config, 100, 101)?;
         let mut conflicting = first.clone();
         conflicting["rows"] = json!(11);
         assert!(durable_commit_evidence(&config, &[log(&[first, conflicting])], Some((100, 200))).is_err());
@@ -352,14 +354,14 @@ mod commit_evidence_tests {
     #[test]
     fn output_window_includes_boundary_crossing_backlog_but_not_late_or_rewrite_commits() -> Result<()> {
         let config = config()?;
-        let crossing = event(&config, 99, 101);
-        let mut late = event(&config, 110, 199);
+        let crossing = event(&config, 99, 101)?;
+        let mut late = event(&config, 110, 199)?;
         late["delta_version"] = json!(8);
-        let mut at_start = event(&config, 98, 99);
+        let mut at_start = event(&config, 98, 99)?;
         at_start["delta_version"] = json!(9);
-        let mut before_start = event(&config, 90, 98);
+        let mut before_start = event(&config, 90, 98)?;
         before_start["delta_version"] = json!(10);
-        let mut rewrite = log(&[event(&config, 110, 150)]);
+        let mut rewrite = log(&[event(&config, 110, 150)?]);
         rewrite.role = ComponentRole::Maintenance;
         let logs = [
             log(&[crossing.clone(), crossing, late, at_start, before_start]),

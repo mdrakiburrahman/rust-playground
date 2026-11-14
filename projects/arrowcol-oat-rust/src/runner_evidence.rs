@@ -595,18 +595,17 @@ fn client_snapshot_delta(snapshots: &[ClientCounterSnapshot]) -> Result<Value> {
     }
     let start = phase("measurement_start")?;
     let end = phase("completed")?;
-    if let Some(window) = &end.measurement_window {
-        if window.scope != "per_stream_admission_completion_observed_in_half_open_shared_unix_window"
+    if let Some(window) = &end.measurement_window
+        && (window.scope != "per_stream_admission_completion_observed_in_half_open_shared_unix_window"
             || window.start_unix_ms >= window.end_unix_ms
             || window.worker_completed_rows.len() != end.workers.len()
             || window
                 .worker_completed_rows
                 .iter()
                 .try_fold(0_u64, |sum, rows| sum.checked_add(*rows))
-                != Some(window.completed_rows)
-        {
-            bail!("invalid exact client measurement-window accounting");
-        }
+                != Some(window.completed_rows))
+    {
+        bail!("invalid exact client measurement-window accounting");
     }
     if end.elapsed_seconds < start.elapsed_seconds || end.workers.len() != start.workers.len() {
         bail!("client counter interval or worker count changed");
@@ -619,17 +618,16 @@ fn client_snapshot_delta(snapshots: &[ClientCounterSnapshot]) -> Result<Value> {
             .find(|before| before.worker == worker.worker)
             .context("client counter worker identity changed")?;
         let difference = |after: u64, before: u64| after.checked_sub(before).context("client counter reset");
-        if let Some(latency) = &worker.send_latency_us {
-            if latency.precision != "power_of_two_upper_bound"
+        if let Some(latency) = &worker.send_latency_us
+            && (latency.precision != "power_of_two_upper_bound"
                 || [latency.p50, latency.p95, latency.p99]
                     .into_iter()
                     .flatten()
                     .collect::<Vec<_>>()
                     .windows(2)
-                    .any(|pair| pair[0] > pair[1])
-            {
-                bail!("invalid client latency evidence");
-            }
+                    .any(|pair| pair[0] > pair[1]))
+        {
+            bail!("invalid client latency evidence");
         }
         deltas.push(json!({
             "worker": worker.worker,
@@ -659,7 +657,7 @@ fn client_snapshot_delta(snapshots: &[ClientCounterSnapshot]) -> Result<Value> {
 }
 
 #[test]
-fn resource_summary_is_observed_mean_and_max_not_an_end_snapshot() {
+fn resource_summary_is_observed_mean_and_max_not_an_end_snapshot() -> Result<()> {
     let mut evidence = CellEvidence::default();
     assert!(evidence.resource_summary().is_none());
     for (cpu_millicores, memory_bytes) in [(100.0, 200), (300.0, 100)] {
@@ -671,7 +669,10 @@ fn resource_summary_is_observed_mean_and_max_not_an_end_snapshot() {
             },
         });
     }
-    let metrics = evidence.resource_summary().unwrap();
+    let metrics = evidence
+        .resource_summary()
+        .context("missing observed resource summary")?;
     assert_eq!(metrics.cpu_millicores, 200.0);
     assert_eq!(metrics.memory_bytes, 200);
+    Ok(())
 }

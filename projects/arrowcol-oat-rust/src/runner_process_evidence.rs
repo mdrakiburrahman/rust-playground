@@ -99,7 +99,7 @@ fn public_tuning_value(value: &Value) -> Option<Value> {
                 .iter()
                 .filter_map(|(name, value)| {
                     let lower = name.to_ascii_lowercase();
-                    if lower != "authority_timeout"
+                    if !matches!(lower.as_str(), "authority_timeout" | "listener_tasks_per_fd")
                         && ["secret", "password", "token", "endpoint", "listen", "address", "auth"]
                             .iter()
                             .any(|private| lower.contains(private))
@@ -553,6 +553,32 @@ mod startup_readback_tests {
             public_tuning_value(&json!({"authority_timeout":"13s","auth_secret":"private"})),
             Some(json!({"authority_timeout":"13s"}))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn real_router_and_collector_control_plane_shapes_preserve_public_tunables() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tunables = serde_json::from_value(json!({
+            "router":{"workers":3,"listener_tasks_per_fd":7,"sql_connect_timeout_ms":17000},
+            "collector":{"catalog":{"maximum_cache_age":"13000ms"},
+                "routing":{"connect_timeout":"17000ms","command_timeout":"31000ms"},
+                "exporter":{"authority_timeout":"19000ms"},
+                "pressure":{"heartbeat_interval":"6000ms","registration_ttl":"24000ms"}}
+        }))?;
+        let router = process_configurations(concat!(
+            "arrowcol_router_effective_config ",
+            "{\"workers\":3,\"listener_tasks_per_fd\":7,\"sql_timeouts\":{\"connect_timeout_ms\":17000},\"listen\":\"private\"}\n"
+        ))?;
+        verify_process_configuration(&config, ComponentRole::Router, &router)?;
+        assert!(router.get("listen").is_none());
+        let collector = process_configurations(concat!(
+            "arrowcol_effective_config {\"component\":\"receiver\",\"config\":{\"catalog\":{\"type\":\"remote\",\"maximum_cache_age\":\"13s\"},\"routing\":{\"type\":\"sql_server\",\"connect_timeout\":\"17s\",\"command_timeout\":\"31s\"},\"pressure\":{\"heartbeat_interval\":\"6s\",\"registration_ttl\":\"24s\"}}}\n",
+            "arrowcol_effective_config {\"component\":\"exporter\",\"config\":{\"routing\":{\"type\":\"sql_server\",\"connect_timeout\":\"17s\",\"command_timeout\":\"31s\"},\"authority_timeout\":\"19s\"}}\n"
+        ))?;
+        verify_process_configuration(&config, ComponentRole::Collector, &collector)?;
         Ok(())
     }
 }
