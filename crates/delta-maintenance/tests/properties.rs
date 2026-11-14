@@ -66,6 +66,7 @@ fn fixture() -> Result<(tempfile::TempDir, Settings, CatalogTable)> {
         allow_short_vacuum_retention: false,
         unsafe_short_vacuum_for_tests: false,
         optimize: OptimizeConfig::default(),
+        process_properties: BTreeMap::new(),
         checkpoint_every_commits: 100,
         log_retention_ms: None,
         max_prune_files: 100,

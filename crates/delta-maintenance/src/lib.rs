@@ -81,6 +81,8 @@ pub struct Settings {
     pub allow_short_vacuum_retention: bool,
     pub unsafe_short_vacuum_for_tests: bool,
     pub optimize: OptimizeConfig,
+    /// Explicit process defaults for registered table properties.
+    pub process_properties: BTreeMap<String, String>,
     /// Minimum commits after the hinted checkpoint before `checkpoint` writes one.
     pub checkpoint_every_commits: u64,
     /// `prune-log` commit-age retention; `None` uses `delta.logRetentionDuration`
@@ -151,7 +153,9 @@ impl Settings {
         if self.vacuum_retention_ms < 0 {
             bail!("VACUUM retention must not be negative");
         }
-        self.optimize.validate()
+        self.optimize.validate()?;
+        resolve(&BTreeMap::new(), &process_defaults(self))?;
+        Ok(())
     }
 }
 
@@ -425,6 +429,7 @@ fn process_defaults(settings: &Settings) -> BTreeMap<String, String> {
             props.insert(key.into(), value);
         }
     }
+    props.extend(settings.process_properties.clone());
     props
 }
 
@@ -432,6 +437,9 @@ fn effective_settings(settings: &Settings, properties: &BTreeMap<String, String>
     let mut defaults = process_defaults(settings);
     if (properties.contains_key("arrowcol.optimize.targetFileSize") || properties.contains_key("delta.targetFileSize"))
         && !properties.contains_key("arrowcol.optimize.smallFileSize")
+        && !settings
+            .process_properties
+            .contains_key("arrowcol.optimize.smallFileSize")
     {
         // The CLI small-file default is derived from its target, not an
         // independently supplied policy. Re-derive it from a table target.

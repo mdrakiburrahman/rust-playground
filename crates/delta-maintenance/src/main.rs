@@ -8,6 +8,7 @@ use delta_maintenance::{Metrics, Operation, Settings, run, serve_metrics};
 use delta_maintenance::{catalog::CatalogDiscovery, run_with_discovery};
 use opentelemetry_otlp::{Protocol, WithExportConfig};
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -83,6 +84,26 @@ struct Cli {
     target_file_mib: u64,
     #[arg(long, env = "ARROWCOL_MAINT_SMALL_FILE_BYTES")]
     small_file_bytes: Option<u64>,
+    #[arg(long, env = "ARROWCOL_MAINT_MIN_FILES")]
+    min_files: Option<usize>,
+    #[arg(long, env = "ARROWCOL_MAINT_VACUUM_MAX_DELETES")]
+    vacuum_max_deletes: Option<usize>,
+    #[arg(long, env = "ARROWCOL_MAINT_VACUUM_MAX_LISTED_FILES")]
+    vacuum_max_listed_files: Option<usize>,
+    #[arg(long, env = "ARROWCOL_MAINT_LAYOUT_ENABLED")]
+    layout_enabled: Option<bool>,
+    #[arg(long, env = "ARROWCOL_MAINT_LAYOUT_SORT_COLUMNS")]
+    layout_sort_columns: Option<String>,
+    #[arg(long, env = "ARROWCOL_MAINT_LAYOUT_BLOOM_COLUMNS")]
+    layout_bloom_columns: Option<String>,
+    #[arg(long, env = "ARROWCOL_MAINT_LAYOUT_MAX_ROWS")]
+    layout_max_rows: Option<usize>,
+    #[arg(long, env = "ARROWCOL_MAINT_LAYOUT_MAX_INPUT_BYTES")]
+    layout_max_input_bytes: Option<usize>,
+    #[arg(long, env = "ARROWCOL_MAINT_LAYOUT_ROW_GROUP_ROWS")]
+    layout_row_group_rows: Option<usize>,
+    #[arg(long, env = "ARROWCOL_MAINT_LAYOUT_PAGE_ROWS")]
+    layout_page_rows: Option<usize>,
     #[arg(long, env = "ARROWCOL_MAINT_MAX_FILES_PER_BIN", default_value_t = 64)]
     max_files_per_bin: usize,
     #[arg(long, env = "ARROWCOL_MAINT_MAX_BINS_PER_COMMIT", default_value_t = 16)]
@@ -133,6 +154,39 @@ fn settings(cli: Cli) -> Result<Settings> {
     let catalog = cli.catalog_endpoint.is_some();
     let target = cli.target_file_mib.checked_mul(MIB).context("target overflow")?;
     let defaults = OptimizeConfig::default();
+    let mut process_properties = BTreeMap::new();
+    for (key, value) in [
+        (
+            "arrowcol.optimize.smallFileSize",
+            cli.small_file_bytes.map(|v| v.to_string()),
+        ),
+        ("arrowcol.optimize.minFiles", cli.min_files.map(|v| v.to_string())),
+        (
+            "arrowcol.vacuum.maxDeletes",
+            cli.vacuum_max_deletes.map(|v| v.to_string()),
+        ),
+        (
+            "arrowcol.vacuum.maxListedFiles",
+            cli.vacuum_max_listed_files.map(|v| v.to_string()),
+        ),
+        ("arrowcol.layout.enabled", cli.layout_enabled.map(|v| v.to_string())),
+        ("arrowcol.layout.sortColumns", cli.layout_sort_columns.clone()),
+        ("arrowcol.layout.bloomColumns", cli.layout_bloom_columns.clone()),
+        ("arrowcol.layout.maxRows", cli.layout_max_rows.map(|v| v.to_string())),
+        (
+            "arrowcol.layout.maxInputSize",
+            cli.layout_max_input_bytes.map(|v| v.to_string()),
+        ),
+        (
+            "arrowcol.layout.rowGroupRows",
+            cli.layout_row_group_rows.map(|v| v.to_string()),
+        ),
+        ("arrowcol.layout.pageRows", cli.layout_page_rows.map(|v| v.to_string())),
+    ] {
+        if let Some(value) = value {
+            process_properties.insert(key.to_owned(), value);
+        }
+    }
     let settings = Settings {
         root: match cli.root {
             Some(root) => root,
@@ -165,6 +219,7 @@ fn settings(cli: Cli) -> Result<Settings> {
         checkpoint_every_commits: cli.checkpoint_every_commits,
         log_retention_ms: cli.log_retention_secs.map(millis).transpose()?,
         max_prune_files: cli.max_prune_files,
+        process_properties,
         optimize: OptimizeConfig {
             target_file_bytes: target,
             small_file_bytes: cli.small_file_bytes.unwrap_or_else(|| (target / 2).max(1)),
