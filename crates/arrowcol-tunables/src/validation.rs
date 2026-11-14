@@ -241,7 +241,7 @@ impl Tunables {
     #[must_use]
     pub fn durability_class(&self) -> DurabilityClass {
         let Some(wal) = &self.wal else {
-            return DurabilityClass::FsyncPerWrite;
+            return DurabilityClass::Durable;
         };
         if wal.max_age_secs.is_some() || wal.size_cap_policy == Some(WalSizeCapPolicy::DropOldest) {
             return DurabilityClass::LossyEviction;
