@@ -329,6 +329,7 @@ pub struct MaintenanceTunables {
 pub enum MaintenanceInputReadStrategy {
     Memory,
     Spool,
+    Range,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]

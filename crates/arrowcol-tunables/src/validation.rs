@@ -35,7 +35,294 @@ pub enum DurabilityClass {
     LossyEviction,
 }
 
-const CAPABILITIES: &[Capability] = &[];
+macro_rules! capability {
+    ($name:literal, $default:literal) => {
+        Capability {
+            name: $name,
+            default: $default,
+            boundary: ApplyBoundary::ProcessStartup,
+        }
+    };
+    ($name:literal, $default:literal, $boundary:ident) => {
+        Capability {
+            name: $name,
+            default: $default,
+            boundary: ApplyBoundary::$boundary,
+        }
+    };
+}
+
+const CAPABILITIES: &[Capability] = &[
+    capability!("client.corpus_rows", "component default"),
+    capability!("client.corpus_bytes", "component default"),
+    capability!("client.batch_rows", "8192"),
+    capability!("client.workers", "0 (available parallelism)"),
+    capability!("client.runtime_threads", "0 (automatic)"),
+    capability!("client.data_mode", "shared"),
+    capability!("client.string_width", "0 (canonical fallback)"),
+    capability!("client.cardinality", "1024"),
+    capability!("client.null_fraction", "0"),
+    capability!("client.skew", "0"),
+    capability!("client.entropy", "1"),
+    capability!("client.seed", "component default"),
+    capability!("client.max_memory_bytes", "536870912"),
+    capability!("client.interval_us", "0"),
+    capability!("client.connections_per_worker", "1"),
+    capability!("client.streams_per_worker", "0 (legacy concurrency)"),
+    capability!("client.max_rows", "component default"),
+    capability!("transport.ipc_compression", "none (compatibility alias)"),
+    capability!("arrow_ipc.compression", "none"),
+    capability!(
+        "transport.dictionary_handling",
+        "hydrate; resend rejected for current DMV schema"
+    ),
+    capability!("transport.max_flight_data_bytes", "2097152"),
+    capability!("transport.max_message_bytes", "16777216"),
+    capability!("transport.grpc_send_compression", "disabled"),
+    capability!("transport.grpc_accept_compression", "disabled"),
+    capability!("transport.max_frame_bytes", "16384"),
+    capability!("transport.header_table_bytes", "component default"),
+    capability!("transport.max_header_list_bytes", "16384"),
+    capability!("transport.stream_window_bytes", "1048576"),
+    capability!("transport.connection_window_bytes", "16777216"),
+    capability!("transport.adaptive_window", "false"),
+    capability!("transport.keepalive_interval_ms", "10000"),
+    capability!("transport.keepalive_timeout_ms", "20000"),
+    capability!("transport.keepalive_while_idle", "true"),
+    capability!("transport.connect_timeout_ms", "0 (inherit request timeout)"),
+    capability!("transport.request_timeout_ms", "component default"),
+    capability!("transport.tcp_nodelay", "true"),
+    capability!("transport.tcp_keepalive_ms", "component default"),
+    capability!("transport.tcp_keepalive_interval_ms", "component default"),
+    capability!("transport.tcp_keepalive_retries", "component default"),
+    capability!("transport.rate_limit_rps", "disabled"),
+    capability!("transport.endpoint_concurrency_limit", "256"),
+    capability!("transport.endpoint_buffer_size", "1024"),
+    capability!("transport.connect_retries", "component default"),
+    capability!("transport.retry_backoff_ms", "100"),
+    capability!(
+        "transport.receiver_ipc_decode_support",
+        "build-gated: IPC codec feature graph",
+        RebuildOnly
+    ),
+    capability!(
+        "transport.receiver_grpc_decode_support",
+        "build-gated: gRPC codec feature graph",
+        RebuildOnly
+    ),
+    capability!("router.workers", "2"),
+    capability!("router.listener_tasks_per_fd", "1"),
+    capability!("router.keepalive_pool_size", "1024"),
+    capability!("router.h2_max_concurrent_streams", "256"),
+    capability!("router.h2_stream_window_bytes", "1048576"),
+    capability!("router.h2_connection_window_bytes", "16777216"),
+    capability!("router.h2_idle_timeout_seconds", "60"),
+    capability!("router.sql_connect_timeout_ms", "5000"),
+    capability!("router.sql_command_timeout_ms", "15000"),
+    capability!("router.refresh_interval_ms", "1000"),
+    capability!("router.max_snapshot_age_ms", "15000"),
+    capability!("router.max_future_skew_ms", "2000"),
+    capability!("router.max_table_entries", "256"),
+    capability!("router.max_oldest_buffer_age_ms", "86400000"),
+    capability!("router.hard_pressure_bps", "9500"),
+    capability!("router.warmup_ms", "60000"),
+    capability!("router.minimum_warmup_bps", "1000"),
+    capability!("router.lease_ttl_ms", "30000"),
+    capability!("router.oat_run_pin_ttl_ms", "consumer default"),
+    capability!("router.readiness_max_staleness_ms", "30000"),
+    capability!("router.distinct_table_owners", "false"),
+    capability!("router.edge_replay_max_nonces", "consumer default"),
+    capability!("router.upstream_max_h2_streams", "128"),
+    capability!("router.upstream_stream_window_bytes", "1048576"),
+    capability!("router.upstream_connection_window_bytes", "16777216"),
+    capability!("router.upstream_connection_timeout_ms", "1000"),
+    capability!("router.upstream_total_connection_timeout_ms", "3000"),
+    capability!("router.upstream_idle_timeout_seconds", "60"),
+    capability!("router.upstream_ping_interval_seconds", "15; 0 disables"),
+    capability!("collector.batching.coalesce_publications", "false"),
+    capability!("collector.batching.global_capacity.bytes", "2147483648"),
+    capability!("collector.batching.global_capacity.rows", "10000000"),
+    capability!("collector.batching.global_capacity.batches", "4096"),
+    capability!("collector.batching.per_table_capacity.bytes", "536870912"),
+    capability!("collector.batching.per_table_capacity.rows", "2000000"),
+    capability!("collector.batching.per_table_capacity.batches", "1024"),
+    capability!("collector.batching.max_arrow_memory_per_flush", "536870912"),
+    capability!("collector.batching.max_rows_per_flush", "1000000"),
+    capability!("collector.batching.max_batches_per_flush", "512"),
+    capability!("collector.batching.max_age", "30s"),
+    capability!("collector.batching.max_concurrent_flushes", "4"),
+    capability!("collector.batching.adaptive_file.target_parquet_bytes", "134217728"),
+    capability!("collector.batching.adaptive_file.min_input_bytes", "16777216"),
+    capability!("collector.batching.adaptive_file.max_input_bytes", "1073741824"),
+    capability!("collector.batching.adaptive_file.cold_start_parquet_ratio", "0.25"),
+    capability!("collector.batching.adaptive_file.ewma_weight", "0.2"),
+    capability!("collector.batching.adaptive_file.min_parquet_ratio", "0.015625"),
+    capability!("collector.batching.adaptive_file.max_parquet_ratio", "4"),
+    capability!("collector.commit.batch_window", "10s"),
+    capability!("collector.commit.max_files_per_commit", "64"),
+    capability!("collector.commit.max_pending_files", "256"),
+    capability!("collector.limits.max_metadata_bytes", "16384"),
+    capability!("collector.limits.max_schema_bytes", "1048576"),
+    capability!("collector.limits.max_message_bytes", "16777216"),
+    capability!("collector.limits.batch_channel_capacity", "4"),
+    capability!("collector.limits.put_result_channel_capacity", "8"),
+    capability!("collector.limits.max_stream_duration", "300s"),
+    capability!("collector.limits.admission_timeout", "30s"),
+    capability!("collector.limits.max_ddl_bytes", "65536"),
+    capability!("collector.pressure.max_concurrent_streams", "128"),
+    capability!("collector.pressure.rss_limit_bytes", "2147483648"),
+    capability!("collector.pressure.buffered_bytes_limit", "536870912"),
+    capability!("collector.pressure.buffered_rows_limit", "10000000"),
+    capability!("collector.pressure.buffered_batches_limit", "4096"),
+    capability!("collector.pressure.pressure_interval", "2s"),
+    capability!("collector.runtime.workers", "clamp(c/4,2,16)"),
+    capability!("collector.runtime.blocking_workers", "clamp(2c,32,128)"),
+    capability!("collector.runtime.upload_limit", "clamp(2c,8,32)"),
+    capability!("collector.runtime.task_limit", "clamp(4c,64,256)"),
+    capability!("collector.runtime.read_ahead", "clamp(c,4,16)"),
+    capability!("collector.runtime.batch_rows", "clamp(1024c,4096,32768)"),
+    capability!("collector.runtime.cpu_workers", "clamp(c-1,1,32)"),
+    capability!("parquet_writer.defaults.compression", "inherit component default"),
+    capability!("parquet_writer.defaults.compression_level", "codec default"),
+    capability!("parquet_writer.defaults.encoding", "inherit component default"),
+    capability!(
+        "parquet_writer.defaults.dictionary_enabled",
+        "inherit component default"
+    ),
+    capability!(
+        "parquet_writer.defaults.dictionary_page_size_limit",
+        "inherit component default"
+    ),
+    capability!(
+        "parquet_writer.defaults.data_page_size_limit",
+        "inherit component default"
+    ),
+    capability!("parquet_writer.defaults.statistics", "inherit component default"),
+    capability!(
+        "parquet_writer.defaults.write_page_header_statistics",
+        "inherit component default"
+    ),
+    capability!(
+        "parquet_writer.defaults.bloom_filter_enabled",
+        "inherit component default"
+    ),
+    capability!("parquet_writer.defaults.bloom_filter_fpp", "inherit component default"),
+    capability!("parquet_writer.defaults.bloom_filter_ndv", "inherit component default"),
+    capability!(
+        "parquet_writer.defaults.data_page_v2_compression_ratio_threshold",
+        "inherit component default"
+    ),
+    capability!("parquet_writer.columns.*.compression", "inherit defaults"),
+    capability!("parquet_writer.columns.*.compression_level", "codec default"),
+    capability!("parquet_writer.columns.*.encoding", "inherit defaults"),
+    capability!("parquet_writer.columns.*.dictionary_enabled", "inherit defaults"),
+    capability!(
+        "parquet_writer.columns.*.dictionary_page_size_limit",
+        "inherit defaults"
+    ),
+    capability!("parquet_writer.columns.*.data_page_size_limit", "inherit defaults"),
+    capability!("parquet_writer.columns.*.statistics", "inherit defaults"),
+    capability!(
+        "parquet_writer.columns.*.write_page_header_statistics",
+        "inherit defaults"
+    ),
+    capability!("parquet_writer.columns.*.bloom_filter_enabled", "inherit defaults"),
+    capability!("parquet_writer.columns.*.bloom_filter_fpp", "inherit defaults"),
+    capability!("parquet_writer.columns.*.bloom_filter_ndv", "inherit defaults"),
+    capability!(
+        "parquet_writer.columns.*.data_page_v2_compression_ratio_threshold",
+        "inherit defaults"
+    ),
+    capability!("parquet_writer.writer_version", "inherit component default"),
+    capability!("parquet_writer.max_row_group_rows", "inherit component default"),
+    capability!("parquet_writer.max_row_group_bytes", "inherit component default"),
+    capability!("parquet_writer.data_page_row_count_limit", "inherit component default"),
+    capability!("parquet_writer.write_batch_size", "inherit component default"),
+    capability!(
+        "parquet_writer.offset_index_enabled",
+        "inherit component default; Page statistics require offset index"
+    ),
+    capability!(
+        "parquet_writer.column_index_truncate_length",
+        "inherit component default"
+    ),
+    capability!("parquet_writer.statistics_truncate_length", "inherit component default"),
+    capability!("parquet_writer.sorting_columns", "inherit verified table layout"),
+    capability!(
+        "collector.parquet_codec_support",
+        "requires compiled codec features",
+        RebuildOnly
+    ),
+    capability!(
+        "collector.allocator",
+        "system; mimalloc requires a rebuilt collector image",
+        RebuildOnly
+    ),
+    capability!(
+        "collector.multipart_upload",
+        "unsupported: pinned backend lacks conditional completion",
+        RebuildOnly
+    ),
+    capability!("wal.flush_interval_ms", "0s"),
+    capability!("wal.retention_size_cap_bytes", "4 GiB"),
+    capability!("wal.max_age_secs", "unset"),
+    capability!("wal.size_cap_policy", "backpressure"),
+    capability!("wal.max_segment_open_duration_ms", "1s"),
+    capability!("wal.poll_interval_ms", "100ms"),
+    capability!("wal.initial_retry_interval_ms", "250ms"),
+    capability!("wal.max_retry_interval_ms", "2s"),
+    capability!("wal.retry_multiplier", "2.0"),
+    capability!("wal.max_in_flight", "1000"),
+    capability!("wal.otlp_handling", "pass_through"),
+    capability!("maintenance.enabled", "false"),
+    capability!("maintenance.operations", "unset"),
+    capability!("maintenance.apply", "false"),
+    capability!("maintenance.interval_secs", "one-shot"),
+    capability!("maintenance.max_idle_backoff_secs", "3600"),
+    capability!("maintenance.max_cycles", "unlimited"),
+    capability!("maintenance.max_concurrent_tables", "1"),
+    capability!("maintenance.max_concurrent_decoded_bytes", "unset"),
+    capability!("maintenance.operation_timeout_secs", "900"),
+    capability!("maintenance.commit_attempts", "8"),
+    capability!("maintenance.commit_budget_secs", "10"),
+    capability!("maintenance.catalog_runtime_threads", "2"),
+    capability!("maintenance.catalog_rpc_timeout_secs", "30"),
+    capability!("maintenance.catalog_max_decoding_message_bytes", "33554432"),
+    capability!("maintenance.input_read_strategy", "memory; spool or range"),
+    capability!("maintenance.granularity", "catalog default; hour"),
+    capability!("maintenance.purge_retention_secs", "catalog default; 2592000"),
+    capability!("maintenance.anchor_ms", "current time"),
+    capability!("maintenance.vacuum_retention_secs", "604800"),
+    capability!("maintenance.allow_short_vacuum_retention", "false"),
+    capability!("maintenance.target_file_mib", "128"),
+    capability!("maintenance.small_file_bytes", "half target"),
+    capability!("maintenance.min_files", "2"),
+    capability!("maintenance.vacuum_max_deletes", "10000"),
+    capability!("maintenance.vacuum_max_listed_files", "100000"),
+    capability!("maintenance.layout_enabled", "automatic"),
+    capability!("maintenance.layout_sort_columns", "customer_id"),
+    capability!("maintenance.layout_bloom_columns", "customer_id"),
+    capability!("maintenance.layout_max_rows", "262144"),
+    capability!("maintenance.layout_max_input_bytes", "67108864"),
+    capability!("maintenance.layout_row_group_rows", "16384"),
+    capability!("maintenance.layout_page_rows", "2048"),
+    capability!("maintenance.max_files_per_bin", "64"),
+    capability!("maintenance.max_bins_per_commit", "16"),
+    capability!("maintenance.max_actions_per_commit", "2048"),
+    capability!("maintenance.max_plan_bytes", "1048576"),
+    capability!("maintenance.max_decoded_bytes_per_bin", "1073741824"),
+    capability!("maintenance.max_row_group_bytes", "134217728"),
+    capability!("maintenance.max_batch_bytes", "67108864"),
+    capability!("maintenance.batch_rows", "8192"),
+    capability!("maintenance.output_row_group_rows", "65536"),
+    capability!("maintenance.max_output_file_bytes", "1072693248"),
+    capability!("maintenance.max_active_files", "1000000"),
+    capability!("maintenance.latest_partitions", "all"),
+    capability!("maintenance.sealed_final", "false"),
+    capability!("maintenance.checkpoint_every_commits", "100"),
+    capability!("maintenance.log_retention_secs", "table policy or 2592000"),
+    capability!("maintenance.max_prune_files", "10000"),
+];
 
 #[must_use]
 pub fn capability_table() -> &'static [Capability] {
@@ -1543,6 +1830,19 @@ mod tests {
         assert_eq!(env["ARROWCOL_MAINT_COMMIT_ATTEMPTS"], "12");
         assert_eq!(env["ARROWCOL_MAINT_COMMIT_BUDGET_SECS"], "15");
         assert_eq!(env["ARROWCOL_MAINT_INPUT_READ_STRATEGY"], "spool");
+        let range = Tunables {
+            maintenance: Some(MaintenanceTunables {
+                enabled: Some(true),
+                operations: Some(vec![MaintenanceOperation::Optimize]),
+                input_read_strategy: Some(MaintenanceInputReadStrategy::Range),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            range.environment_for(ComponentRole::Maintenance)?["ARROWCOL_MAINT_INPUT_READ_STRATEGY"],
+            "range"
+        );
         assert_eq!(env["ARROWCOL_MAINT_CATALOG_RUNTIME_THREADS"], "4");
         assert_eq!(env["ARROWCOL_MAINT_CATALOG_RPC_TIMEOUT_SECS"], "45");
         assert_eq!(env["ARROWCOL_MAINT_CATALOG_MAX_DECODING_MESSAGE_BYTES"], "65536");
@@ -1757,6 +2057,25 @@ mod tests {
             ..Default::default()
         };
         assert!(invalid.validate().unwrap_err().to_string().contains("entropy"));
+    }
+
+    #[test]
+    fn capability_catalog_is_populated_and_unique() {
+        let names = capability_table()
+            .iter()
+            .map(|capability| capability.name)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(!capability_table().is_empty());
+        assert_eq!(names.len(), capability_table().len());
+    }
+
+    #[test]
+    fn maintenance_input_read_strategy_is_strict_and_supports_range() {
+        assert_eq!(
+            serde_json::from_str::<MaintenanceInputReadStrategy>("\"range\"").unwrap(),
+            MaintenanceInputReadStrategy::Range
+        );
+        assert!(serde_json::from_str::<MaintenanceInputReadStrategy>("\"invalid\"").is_err());
     }
 
     #[test]
