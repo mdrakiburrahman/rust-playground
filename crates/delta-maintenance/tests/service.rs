@@ -1,10 +1,12 @@
 //! End-to-end evidence for the standalone service binary.
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow_deltalake::delta::{DeltaTable, INGESTION_PARTITION};
 use assert_cmd::Command;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::basic::Compression;
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -91,6 +93,8 @@ fn effective_configuration_is_reported_for_a_negative_probe() -> Result<()> {
     let root = tempfile::tempdir()?;
     table(&root.path().join("events"))?;
     let output = service(root.path())?
+        .env("ARROWCOL_MAINT_MIN_FILES", "4")
+        .env("ARROWCOL_PARQUET_CONFIG", r#"{"defaults":{"compression":"snappy"}}"#)
         .args(["--operation", "optimize", "--min-files", "3"])
         .output()?;
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
@@ -109,6 +113,102 @@ fn effective_configuration_is_reported_for_a_negative_probe() -> Result<()> {
     assert_eq!(table["table"], "events");
     assert_eq!(table["config"]["table_policy"]["arrowcol.optimize.minFiles"], 3);
     assert_eq!(table["config"]["operation_settings"]["layout_mode"], "automatic");
+    assert_eq!(
+        table["config"]["parquet_writer_overrides"]["defaults"]["compression"],
+        "snappy"
+    );
+    let env_only = service(root.path())?
+        .env("ARROWCOL_MAINT_MIN_FILES", "4")
+        .args(["--operation", "optimize"])
+        .output()?;
+    assert!(env_only.status.success());
+    let stderr = std::str::from_utf8(&env_only.stderr)?;
+    let config = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("arrowcol_maintenance_effective_config "))
+        .ok_or_else(|| anyhow!("missing startup configuration"))?;
+    let config: serde_json::Value = serde_json::from_str(config)?;
+    assert_eq!(config["table_policy"]["arrowcol.optimize.minFiles"], 4);
+    Ok(())
+}
+
+#[test]
+fn shared_parquet_policy_controls_sorted_and_unsorted_compaction() -> Result<()> {
+    for sorted in [false, true] {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("events");
+        table(&path)?;
+        let output = service(root.path())?
+            .env(
+                "ARROWCOL_PARQUET_CONFIG",
+                r#"{"defaults":{"compression":"snappy"},"max_row_group_rows":1}"#,
+            )
+            .args([
+                "--operation",
+                "optimize",
+                "--sealed-final",
+                "--apply",
+                "--layout-enabled",
+                if sorted { "true" } else { "false" },
+                "--layout-sort-columns",
+                "id",
+                "--layout-bloom-columns",
+                "",
+            ])
+            .output()?;
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let reports = lines(&output.stdout)?;
+        let outputs = reports[0]["report"]["outputs"].as_array().context("missing outputs")?;
+        assert_eq!(outputs.len(), 4);
+        let mut total_rows = 0;
+        for output in outputs {
+            let relative = output.as_str().context("output path")?;
+            let url = Url::from_directory_path(&path)
+                .map_err(|()| anyhow!("table URL"))?
+                .join(relative)?;
+            let path = url.to_file_path().map_err(|()| anyhow!("output file path"))?;
+            let reader = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path)?)?;
+            for group in reader.metadata().row_groups() {
+                assert_eq!(group.num_rows(), 1);
+                assert_eq!(group.column(0).compression(), Compression::SNAPPY);
+                assert_eq!(group.sorting_columns().is_some(), sorted);
+            }
+            let mut ids = Vec::new();
+            for batch in reader.build()? {
+                let batch = batch?;
+                let column = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .context("id array")?;
+                ids.extend(column.values().iter().copied());
+            }
+            if sorted {
+                assert!(ids.windows(2).all(|pair| pair[0] <= pair[1]));
+            }
+            total_rows += ids.len();
+        }
+        assert_eq!(total_rows, 8);
+    }
+    Ok(())
+}
+
+#[test]
+fn invalid_parquet_policy_fails_before_maintenance_mutates_tables() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("events");
+    table(&path)?;
+    let before = version(&path)?;
+    let output = service(root.path())?
+        .env(
+            "ARROWCOL_PARQUET_CONFIG",
+            r#"{"defaults":{"compression":"gzip","compression_level":10}}"#,
+        )
+        .args(["--operation", "optimize", "--apply"])
+        .output()?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("compression level"));
+    assert_eq!(version(&path)?, before);
     Ok(())
 }
 
