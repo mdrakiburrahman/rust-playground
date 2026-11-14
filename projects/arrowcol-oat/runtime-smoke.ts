@@ -131,7 +131,7 @@ async function main(): Promise<void> {
       for (const table of tables.slice(0, replicas)) {
         const args = ['run', '--rm', '--network', network, ...secretMount,
           '-e', 'LOADTEST_INTERNAL_SECRET_FILE=/run/oat/internal-hmac', images.client,
-          '--endpoint', `http://${routerName}:50050`, '--table', table, '--rows', '100', '--concurrency', '4'];
+          '--endpoint', `http://${routerName}:50050`, '--table', table, '--rows', '10000', '--concurrency', '4'];
         const unsigned = spawnSync('docker', args, { encoding: 'utf8' });
         assert.notEqual(unsigned.status, 0, 'router must reject unsigned requests');
         docker([...args, '--edge-secret-file', '/run/oat/edge-hmac']);
@@ -140,7 +140,7 @@ async function main(): Promise<void> {
       const assignments = docker(['exec', routerName, ...http(50050, '/metrics')]);
       assert.match(assignments, /arrowcol_router_distinct_table_owners 0/);
       const connections = Number(/^arrowcol_router_upstream_connections_total\{reused="false"\} (\d+)$/m.exec(assignments)?.[1]);
-      assert.ok(connections - upstreamConnections >= replicas * 4, 'router must preserve independent upstream connections');
+      assert.ok(connections - upstreamConnections >= replicas * 4, "router must preserve independent upstream connections (observed " + (connections - upstreamConnections) + ")");
       upstreamConnections = connections;
       const owners = tables.slice(0, replicas).map((table) => {
         const lines = assignments.split('\n').filter((line) => line.startsWith('arrowcol_router_table_owners{') &&
