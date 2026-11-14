@@ -1,5 +1,5 @@
-use arrowcol_tunables::Tunables;
 use anyhow::{Context, Result, bail};
+use arrowcol_tunables::Tunables;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::Path;
@@ -42,6 +42,8 @@ pub struct OatConfig {
     pub edge_secret_file: String,
     #[serde(default)]
     pub dmv_client_image: String,
+    #[serde(default)]
+    pub maintenance_image: Option<String>,
     #[serde(default)]
     pub edge_secret_name: String,
     pub tables: Vec<String>,
@@ -135,7 +137,29 @@ impl OatConfig {
     ///
     /// Returns an error when a setting is invalid or a requested DMV table is unsupported.
     pub fn validate(&self) -> Result<()> {
-        self.tunables.validate()?;
+        self.tunables.validate_for_oat()?;
+        if self
+            .tunables
+            .maintenance
+            .as_ref()
+            .is_some_and(|settings| settings.enabled == Some(true))
+            && self.platform.kind == OatMode::Aks
+        {
+            let image = self
+                .maintenance_image
+                .as_deref()
+                .context("AKS maintenance requires maintenance_image pinned by @sha256 digest")?;
+            let (repository, digest) = image
+                .rsplit_once("@sha256:")
+                .context("AKS maintenance_image must be pinned by @sha256 digest")?;
+            if repository.is_empty()
+                || digest.len() != 64
+                || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || repository.contains("@sha256:")
+            {
+                bail!("AKS maintenance_image must be a nonempty image reference pinned by a 64-digit sha256 digest");
+            }
+        }
         if self.warmup_seconds > 300 || !(1..=600).contains(&self.measure_seconds) {
             bail!("warmup_seconds must be at most 300 and measure_seconds must be between 1 and 600");
         }
@@ -628,6 +652,7 @@ mod tests {
             dmv_client_binary: "target/debug/arrowcol-dmv".to_owned(),
             edge_secret_file: "/run/secrets/edge-hmac".to_owned(),
             dmv_client_image: "ghcr.io/mdrakiburrahman/rust-playground/arrowcol-oat-client:dev".to_owned(),
+            maintenance_image: None,
             edge_secret_name: "arrowcol-router-auth".to_owned(),
             tables: vec![
                 "sqlserver_wait_stats".to_owned(),
@@ -650,6 +675,26 @@ mod tests {
     #[test]
     fn accepts_the_initial_matrix_and_separate_adls_paths() -> Result<()> {
         valid().validate()
+    }
+
+    #[test]
+    fn enabled_aks_maintenance_requires_a_digest_pinned_image() -> Result<()> {
+        let mut config = valid();
+        config.tunables.maintenance = Some(arrowcol_tunables::MaintenanceTunables {
+            enabled: Some(true),
+            operations: Some(vec![arrowcol_tunables::MaintenanceOperation::Optimize]),
+            ..Default::default()
+        });
+        assert!(config.validate().unwrap_err().to_string().contains("maintenance_image"));
+
+        config.maintenance_image = Some(format!(
+            "ghcr.io/mdrakiburrahman/rust-playground/delta-maintenance@sha256:{}",
+            "a".repeat(64)
+        ));
+        config.validate()?;
+        config.maintenance_image = Some("ghcr.io/example/delta-maintenance:latest".to_owned());
+        assert!(config.validate().unwrap_err().to_string().contains("@sha256"));
+        Ok(())
     }
 
     #[test]

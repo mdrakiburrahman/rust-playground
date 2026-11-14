@@ -35,6 +35,7 @@ pub struct ClientTunables {
     pub corpus_bytes: Option<u64>,
     pub batch_rows: Option<usize>,
     pub workers: Option<usize>,
+    pub runtime_threads: Option<usize>,
     pub data_mode: Option<DataMode>,
     pub string_width: Option<usize>,
     pub cardinality: Option<usize>,
@@ -56,7 +57,6 @@ pub struct TransportTunables {
     pub dictionary_handling: Option<DictionaryHandling>,
     pub max_flight_data_bytes: Option<u64>,
     pub max_message_bytes: Option<u64>,
-    pub runtime_threads: Option<usize>,
     pub grpc_send_compression: Option<GrpcCompression>,
     pub grpc_accept_compression: Option<GrpcCompression>,
     pub max_frame_bytes: Option<u32>,
@@ -96,87 +96,91 @@ pub struct RouterTunables {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct CollectorTunables {
-    pub dataflow_cores: Option<usize>,
-    pub pdata_channel_capacity: Option<usize>,
-    pub flight_max_bytes: Option<u64>,
-    pub batch_channel_capacity: Option<usize>,
-    pub result_channel_capacity: Option<usize>,
-    pub max_active_streams: Option<usize>,
-    pub admission_timeout_ms: Option<u64>,
-    pub stream_timeout_ms: Option<u64>,
-    pub rss_limit_bytes: Option<u64>,
-    pub buffered_bytes_limit: Option<u64>,
-    pub max_batches: Option<usize>,
-    pub max_rows: Option<usize>,
-    pub max_bytes: Option<u64>,
-    pub per_table_max_batches: Option<usize>,
-    pub per_table_max_rows: Option<usize>,
-    pub per_table_max_bytes: Option<u64>,
-    pub flush: Option<FlushTunables>,
+    pub batching: Option<BatchingTunables>,
     pub commit: Option<CommitTunables>,
+    pub limits: Option<LimitsTunables>,
+    pub pressure: Option<PressureTunables>,
     pub runtime: Option<RuntimeTunables>,
-    pub sort: Option<SortTunables>,
-    pub layout: Option<LayoutTunables>,
-    pub coalescing: Option<CoalescingTunables>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct FlushTunables {
-    pub max_bytes: Option<u64>,
-    pub max_rows: Option<usize>,
-    pub max_batches: Option<usize>,
-    pub max_age_ms: Option<u64>,
-    pub concurrency: Option<usize>,
+#[serde(default, deny_unknown_fields)]
+pub struct QueueCapacityTunables {
+    pub bytes: Option<u32>,
+    pub rows: Option<u32>,
+    pub batches: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
+pub struct AdaptiveFileTunables {
+    pub target_parquet_bytes: Option<u64>,
+    pub min_input_bytes: Option<u64>,
+    pub max_input_bytes: Option<u64>,
+    pub cold_start_parquet_ratio: Option<f64>,
+    pub ewma_weight: Option<f64>,
+    pub min_parquet_ratio: Option<f64>,
+    pub max_parquet_ratio: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BatchingTunables {
+    pub coalesce_publications: Option<bool>,
+    pub global_capacity: Option<QueueCapacityTunables>,
+    pub per_table_capacity: Option<QueueCapacityTunables>,
+    pub max_arrow_memory_per_flush: Option<u64>,
+    pub max_rows_per_flush: Option<u64>,
+    pub max_batches_per_flush: Option<u64>,
+    pub max_age: Option<String>,
+    pub max_concurrent_flushes: Option<usize>,
+    pub adaptive_file: Option<AdaptiveFileTunables>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct CommitTunables {
-    pub window_ms: Option<u64>,
+    pub batch_window: Option<String>,
     pub max_files_per_commit: Option<usize>,
     pub max_pending_files: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
+pub struct LimitsTunables {
+    pub max_metadata_bytes: Option<usize>,
+    pub max_schema_bytes: Option<usize>,
+    pub max_message_bytes: Option<usize>,
+    pub batch_channel_capacity: Option<usize>,
+    pub put_result_channel_capacity: Option<usize>,
+    pub max_stream_duration: Option<String>,
+    pub admission_timeout: Option<String>,
+    pub max_ddl_bytes: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PressureTunables {
+    pub max_concurrent_streams: Option<usize>,
+    pub rss_limit_bytes: Option<u64>,
+    pub buffered_bytes_limit: Option<u64>,
+    pub buffered_rows_limit: Option<u64>,
+    pub buffered_batches_limit: Option<u64>,
+    pub pressure_interval: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct RuntimeTunables {
-    pub async_workers: Option<usize>,
+    pub workers: Option<usize>,
     pub blocking_workers: Option<usize>,
-    pub upload_concurrency: Option<usize>,
-    pub kernel_task_concurrency: Option<usize>,
+    pub upload_limit: Option<usize>,
+    pub task_limit: Option<usize>,
     pub read_ahead: Option<usize>,
     pub batch_rows: Option<usize>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SortTunables {
-    pub enabled: Option<bool>,
-    pub max_rows: Option<usize>,
-    pub max_bytes: Option<u64>,
-    pub concurrency: Option<usize>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct LayoutTunables {
-    pub row_group_rows: Option<usize>,
-    pub page_rows: Option<usize>,
-    pub max_row_group_bytes: Option<u64>,
-    pub max_page_bytes: Option<u64>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CoalescingTunables {
-    pub enabled: Option<bool>,
-    pub target_rows: Option<usize>,
-    pub target_bytes: Option<u64>,
-    pub max_age_ms: Option<u64>,
-    pub max_pending_batches: Option<usize>,
+    pub cpu_workers: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -233,20 +237,65 @@ pub enum WalOverflowPolicy {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct MaintenanceTunables {
-    pub interval_ms: Option<u64>,
-    pub timeout_ms: Option<u64>,
-    pub target_file_bytes: Option<u64>,
+    pub enabled: Option<bool>,
+    pub operations: Option<Vec<MaintenanceOperation>>,
+    pub apply: Option<bool>,
+    pub interval_secs: Option<u64>,
+    pub max_idle_backoff_secs: Option<u64>,
+    pub max_cycles: Option<u64>,
+    pub max_concurrent_tables: Option<usize>,
+    pub operation_timeout_secs: Option<u64>,
+    pub granularity: Option<MaintenanceGranularity>,
+    pub purge_retention_secs: Option<u64>,
+    pub anchor_ms: Option<i64>,
+    pub vacuum_retention_secs: Option<u64>,
+    pub allow_short_vacuum_retention: Option<bool>,
+    pub target_file_mib: Option<u64>,
     pub small_file_bytes: Option<u64>,
-    pub files_per_bin: Option<usize>,
-    pub bins_per_commit: Option<usize>,
+    pub min_files: Option<usize>,
+    pub vacuum_max_deletes: Option<usize>,
+    pub vacuum_max_listed_files: Option<usize>,
+    pub layout_enabled: Option<bool>,
+    pub layout_sort_columns: Option<Vec<String>>,
+    pub layout_bloom_columns: Option<Vec<String>>,
+    pub layout_max_rows: Option<usize>,
+    pub layout_max_input_bytes: Option<usize>,
+    pub layout_row_group_rows: Option<usize>,
+    pub layout_page_rows: Option<usize>,
+    pub max_files_per_bin: Option<usize>,
+    pub max_bins_per_commit: Option<usize>,
+    pub max_actions_per_commit: Option<usize>,
+    pub max_plan_bytes: Option<usize>,
     pub max_decoded_bytes_per_bin: Option<u64>,
-    pub max_decoded_batch_bytes: Option<u64>,
     pub max_row_group_bytes: Option<u64>,
-    pub table_concurrency: Option<usize>,
-    pub max_table_concurrency: Option<usize>,
-    pub max_partitions: Option<usize>,
-    pub purge_enabled: Option<bool>,
-    pub vacuum_enabled: Option<bool>,
+    pub max_batch_bytes: Option<usize>,
+    pub batch_rows: Option<usize>,
+    pub output_row_group_rows: Option<usize>,
+    pub max_output_file_bytes: Option<u64>,
+    pub max_active_files: Option<usize>,
+    pub latest_partitions: Option<usize>,
+    pub sealed_final: Option<bool>,
+    pub checkpoint_every_commits: Option<u64>,
+    pub log_retention_secs: Option<u64>,
+    pub max_prune_files: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum MaintenanceGranularity {
+    Minute,
+    Hour,
+    Day,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum MaintenanceOperation {
+    Purge,
+    Optimize,
+    Vacuum,
+    Checkpoint,
+    PruneLog,
 }
