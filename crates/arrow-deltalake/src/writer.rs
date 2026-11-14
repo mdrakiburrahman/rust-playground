@@ -436,6 +436,7 @@ pub fn effective_startup_config_json() -> Result<String> {
     #[cfg(feature = "delta")]
     let value = {
         let mut value = value;
+        value["layout"] = crate::delta::effective_layout_startup_config()?;
         value["runtime"] = serde_json::to_value(crate::delta_io::runtime_config()?)?;
         value["commit_telemetry"] = serde_json::json!({
             "schema_version": 1,

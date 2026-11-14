@@ -16,7 +16,7 @@ use parquet::schema::types::ColumnPath;
 use std::sync::Arc;
 
 /// Configurable controls applied at the actual Parquet file boundary.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LayoutPolicy {
     pub sort_columns: Vec<String>,
     pub max_rows: usize,
@@ -46,13 +46,28 @@ impl LayoutPolicy {
     /// # Errors
     /// Returns property type or platform-size conversion errors.
     pub fn from_properties(props: &arrowcol_props::ResolvedProps) -> Result<Self> {
-        Ok(Self {
+        let policy = Self {
             sort_columns: props.string_list("arrowcol.layout.sortColumns")?.to_vec(),
             bloom_columns: props.string_list("arrowcol.layout.bloomColumns")?.to_vec(),
             max_rows: usize::try_from(props.unsigned("arrowcol.layout.maxRows")?)?,
             max_input_bytes: usize::try_from(props.unsigned("arrowcol.layout.maxInputSize")?)?,
             row_group_rows: usize::try_from(props.unsigned("arrowcol.layout.rowGroupRows")?)?,
             page_rows: usize::try_from(props.unsigned("arrowcol.layout.pageRows")?)?,
+        };
+        policy.validate_limits()?;
+        Ok(policy)
+    }
+
+    #[cfg(feature = "delta")]
+    pub(crate) fn config_json(&self, enabled: Option<bool>) -> serde_json::Value {
+        serde_json::json!({
+            "enabled": enabled,
+            "sort_columns": self.sort_columns,
+            "bloom_columns": self.bloom_columns,
+            "max_rows": self.max_rows,
+            "max_input_bytes": self.max_input_bytes,
+            "row_group_rows": self.row_group_rows,
+            "page_rows": self.page_rows,
         })
     }
 
@@ -61,16 +76,7 @@ impl LayoutPolicy {
     /// # Errors
     /// Rejects missing or duplicate sort columns and invalid limits.
     pub fn validate(&self, schema: &SchemaRef) -> Result<()> {
-        ensure!(
-            self.max_rows > 0 && self.max_rows <= u32::MAX as usize,
-            "file row limit must fit u32"
-        );
-        ensure!(self.max_input_bytes > 0, "file input memory limit must be positive");
-        ensure!(
-            self.row_group_rows > 0 && self.page_rows > 0,
-            "row group and page limits must be positive"
-        );
-        ensure!(!self.sort_columns.is_empty(), "at least one sort column is required");
+        self.validate_limits()?;
         let mut names = std::collections::BTreeSet::new();
         for column in &self.sort_columns {
             schema
@@ -83,6 +89,20 @@ impl LayoutPolicy {
                 .index_of(column)
                 .with_context(|| format!("unknown Bloom filter column {column}"))?;
         }
+        Ok(())
+    }
+
+    fn validate_limits(&self) -> Result<()> {
+        ensure!(
+            self.max_rows > 0 && self.max_rows <= u32::MAX as usize,
+            "file row limit must fit u32"
+        );
+        ensure!(self.max_input_bytes > 0, "file input memory limit must be positive");
+        ensure!(
+            self.row_group_rows > 0 && self.page_rows > 0,
+            "row group and page limits must be positive"
+        );
+        ensure!(!self.sort_columns.is_empty(), "at least one sort column is required");
         Ok(())
     }
 

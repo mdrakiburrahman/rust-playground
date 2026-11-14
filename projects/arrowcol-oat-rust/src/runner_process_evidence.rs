@@ -149,6 +149,9 @@ fn process_configurations(text: &str) -> Result<Value> {
             if !value.is_object() {
                 bail!("process effective configuration must be an object");
             }
+            if value["component"] == "layout" && value["scope"] == "table_effective" {
+                continue;
+            }
             if let Some(component) = value.get("component").and_then(Value::as_str) {
                 if !matches!(component, "receiver" | "exporter" | "build") {
                     bail!("unknown component effective-config envelope");
@@ -351,6 +354,27 @@ fn verify_process_configuration(config: &OatConfig, role: ComponentRole, observe
             "ARROWCOL_COLLECTOR_CATALOG_CONFIG" => "/catalog".to_owned(),
             "ARROWCOL_COLLECTOR_ROUTING_CONFIG" => "/routing".to_owned(),
             "ARROWCOL_COLLECTOR_EXPORTER_CONFIG" => String::new(),
+            "ARROWCOL_COLLECTOR_LAYOUT_ENABLED" => "/layout/process_policy/enabled".to_owned(),
+            "ARROWCOL_COLLECTOR_SORT_COLUMNS" | "ARROWCOL_COLLECTOR_BLOOM_COLUMNS" => {
+                expected = json!(
+                    expected
+                        .as_str()
+                        .context("collector columns must be comma separated")?
+                        .split(',')
+                        .filter(|value| !value.is_empty())
+                        .collect::<Vec<_>>()
+                );
+                format!(
+                    "/layout/process_policy/{}",
+                    name.trim_start_matches("ARROWCOL_COLLECTOR_").to_ascii_lowercase()
+                )
+            }
+            variable if variable.starts_with("ARROWCOL_COLLECTOR_LAYOUT_") => format!(
+                "/layout/process_policy/{}",
+                variable
+                    .trim_start_matches("ARROWCOL_COLLECTOR_LAYOUT_")
+                    .to_ascii_lowercase()
+            ),
             "ARROWCOL_COLLECTOR_RUNTIME_WORKERS" => "/runtime/runtime_workers".to_owned(),
             variable if variable.starts_with("ARROWCOL_COLLECTOR_") => format!(
                 "/runtime/{}",
@@ -378,6 +402,83 @@ fn verify_process_configuration(config: &OatConfig, role: ComponentRole, observe
         }
     }
     Ok(())
+}
+
+fn collector_layout_records(config: &OatConfig, text: &str) -> Result<Vec<Value>> {
+    let tables = config
+        .tables
+        .iter()
+        .map(|table| canonical_dmv_table_name(table))
+        .collect::<Result<Vec<_>>>()?;
+    let mut records = Vec::new();
+    for line in text
+        .lines()
+        .filter_map(|line| line.strip_prefix("arrowcol_effective_config "))
+    {
+        let value: Value = serde_json::from_str(line).context("invalid collector layout readback")?;
+        if value["component"] != "layout" || value["scope"] != "table_effective" {
+            continue;
+        }
+        let Some(table) = value["table_name"]
+            .as_str()
+            .filter(|table| tables.iter().any(|allowed| allowed.as_str() == *table))
+        else {
+            continue;
+        };
+        let id = value["table_id"]
+            .as_str()
+            .filter(|id| {
+                id.len() == 64
+                    && id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            .context("collector layout omitted canonical table hash")?;
+        let enabled = value["config"]["enabled"]
+            .as_bool()
+            .context("collector layout omitted enabled state")?;
+        let mut policy = serde_json::Map::from_iter([("enabled".to_owned(), json!(enabled))]);
+        for field in [
+            "sort_columns",
+            "bloom_columns",
+            "max_rows",
+            "max_input_bytes",
+            "row_group_rows",
+            "page_rows",
+        ] {
+            let actual = value["config"]
+                .get(field)
+                .context("collector layout omitted resolved field")?;
+            if !enabled {
+                if !actual.is_null() {
+                    bail!("disabled collector layout reported applicable settings");
+                }
+            } else if matches!(field, "sort_columns" | "bloom_columns") {
+                let columns = actual.as_array().context("collector layout columns must be arrays")?;
+                if !columns.iter().all(|column| {
+                    column.as_str().is_some_and(|name| {
+                        !name.is_empty()
+                            && name.len() <= 128
+                            && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                    })
+                }) {
+                    bail!("collector layout reported invalid column names");
+                }
+            } else if actual.as_u64().is_none_or(|value| value == 0) {
+                bail!("collector layout reported invalid resolved limit");
+            }
+            policy.insert(field.to_owned(), actual.clone());
+        }
+        let record = json!({"table_id":id,"table_name":table,"config":policy,
+            "scope":"table_effective_at_file_construction_not_full_run_history"});
+        if !records.contains(&record) {
+            if records.len() >= 256 {
+                bail!("collector layout policy history exceeded evidence bound");
+            }
+            records.push(record);
+        }
+    }
+    Ok(records)
 }
 
 fn process_evidence(config: &OatConfig, logs: &[ProcessLog]) -> Result<Value> {
@@ -410,6 +511,11 @@ fn process_evidence(config: &OatConfig, logs: &[ProcessLog]) -> Result<Value> {
             } else {
                 None
             };
+            let layout_tables = if matches!(role, ComponentRole::Collector) {
+                Some(collector_layout_records(config, &log.text)?)
+            } else {
+                None
+            };
             let mut effective = resolved;
             let fields = effective
                 .as_object_mut()
@@ -438,7 +544,35 @@ fn process_evidence(config: &OatConfig, logs: &[ProcessLog]) -> Result<Value> {
                 "source_revision": log.source_revision,
                 "log_complete": log.complete,
                 "maintenance_table_policies": maintenance_tables,
+                "layout_table_policies": layout_tables,
+                "layout_policy_scope": "startup_process_policy_only_table_properties_and_parquet_overlays_may_override",
             }));
+        }
+    }
+    if role_environment(config, ComponentRole::Collector)?.keys().any(|name| {
+        name.starts_with("ARROWCOL_COLLECTOR_LAYOUT_")
+            || matches!(
+                name.as_str(),
+                "ARROWCOL_COLLECTOR_SORT_COLUMNS" | "ARROWCOL_COLLECTOR_BLOOM_COLUMNS"
+            )
+    }) {
+        let mut identities = std::collections::BTreeMap::new();
+        for process in &result {
+            for record in process["layout_table_policies"].as_array().into_iter().flatten() {
+                let table = record["table_name"].as_str().context("layout table identity missing")?;
+                let id = record["table_id"].as_str().context("layout table hash missing")?;
+                if identities.insert(table, id).is_some_and(|previous| previous != id) {
+                    bail!("collector layout table identity is ambiguous across processes");
+                }
+                if process["log_complete"] != true {
+                    bail!("collector layout log is incomplete");
+                }
+            }
+        }
+        for table in &config.tables {
+            if !identities.contains_key(canonical_dmv_table_name(table)?.as_str()) {
+                bail!("configured collector layout has no matching table-effective file-construction evidence");
+            }
         }
     }
     Ok(json!(result))
@@ -587,6 +721,75 @@ async fn aks_process_logs(config: &OatConfig) -> Result<Vec<ProcessLog>> {
 #[cfg(test)]
 mod startup_readback_tests {
     use super::*;
+
+    #[test]
+    fn collector_layout_requires_separate_matching_table_proof_and_never_merges_it_into_startup() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        let policy = json!({"enabled":true,"sort_columns":["customer_id"],"bloom_columns":[],
+            "max_rows":777,"max_input_bytes":1_048_576,"row_group_rows":123,"page_rows":17});
+        config.tunables = serde_json::from_value(json!({"collector":{"layout":policy}}))?;
+        let startup = format!(
+            "arrowcol_effective_config {}\n",
+            json!({"layout":{"process_policy":policy,"table_properties_override":true}})
+        );
+        let readback = process_configurations(&startup)?;
+        verify_process_configuration(&config, ComponentRole::Collector, &readback)?;
+        let mut log = ProcessLog {
+            role: ComponentRole::Collector,
+            image: None,
+            image_id: None,
+            source_revision: None,
+            complete: true,
+            text: startup.clone(),
+        };
+        assert!(process_evidence(&config, std::slice::from_ref(&log)).is_err());
+        let mut event = json!({"component":"layout","scope":"table_effective","table_id":"a".repeat(64),
+            "table_name":canonical_dmv_table_name(&config.tables[0])?,"config":policy,"secret_path":"/private"});
+        log.text.push_str(&format!(
+            "arrowcol_effective_config {event}\narrowcol_effective_config {event}\n"
+        ));
+        let readback = process_configurations(&log.text)?;
+        assert_eq!(readback["layout"]["process_policy"], policy);
+        assert!(readback.get("table_id").is_none());
+        let evidence = process_evidence(&config, std::slice::from_ref(&log))?;
+        assert_eq!(
+            evidence[0]["layout_table_policies"]
+                .as_array()
+                .context("missing table proof")?
+                .len(),
+            1
+        );
+        assert_eq!(evidence[0]["layout_table_policies"][0]["config"], policy);
+        assert!(evidence[0]["layout_table_policies"][0].get("secret_path").is_none());
+        let valid_log = log.text.clone();
+        event["table_name"] = json!("another.catalog.table");
+        log.text = format!("{startup}arrowcol_effective_config {event}\n");
+        assert!(process_evidence(&config, std::slice::from_ref(&log)).is_err());
+        event["table_name"] = json!(canonical_dmv_table_name(&config.tables[0])?);
+        event["table_id"] = json!("b".repeat(64));
+        log.text = format!("{valid_log}arrowcol_effective_config {event}\n");
+        assert!(process_evidence(&config, &[log]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn disabled_table_layout_has_only_null_inapplicable_fields() -> Result<()> {
+        let config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        let mut event = json!({"component":"layout","scope":"table_effective","table_id":"a".repeat(64),
+            "table_name":canonical_dmv_table_name(&config.tables[0])?,
+            "config":{"enabled":false,"sort_columns":null,"bloom_columns":null,"max_rows":null,
+                "max_input_bytes":null,"row_group_rows":null,"page_rows":null}});
+        let records = collector_layout_records(&config, &format!("arrowcol_effective_config {event}\n"))?;
+        assert_eq!(records[0]["config"]["enabled"], false);
+        assert!(records[0]["config"]["row_group_rows"].is_null());
+        event["config"]["row_group_rows"] = json!(123);
+        assert!(collector_layout_records(&config, &format!("arrowcol_effective_config {event}\n")).is_err());
+        Ok(())
+    }
 
     #[test]
     fn requested_nondefault_is_not_effective_without_matching_consumer_readback() -> Result<()> {
