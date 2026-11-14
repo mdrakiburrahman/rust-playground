@@ -10,6 +10,7 @@ use arrow::array::RecordBatch;
 use arrow::compute::{SortColumn, SortOptions, concat_batches, lexsort_to_indices, take};
 use arrow::datatypes::SchemaRef;
 use parquet::basic::Compression;
+use parquet::file::metadata::SortingColumn;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::schema::types::ColumnPath;
 use std::sync::Arc;
@@ -98,6 +99,24 @@ impl LayoutPolicy {
             .set_write_batch_size(self.page_rows.min(1_024))
             .set_statistics_enabled(EnabledStatistics::Page)
             .set_offset_index_disabled(false);
+        let descriptor = parquet::arrow::ArrowSchemaConverter::new().convert(schema)?;
+        let sorting = self
+            .sort_columns
+            .iter()
+            .map(|name| {
+                let index = descriptor
+                    .columns()
+                    .iter()
+                    .position(|column| column.path().parts() == [name.as_str()])
+                    .with_context(|| format!("sort column {name} must be a physical scalar column"))?;
+                Ok(SortingColumn {
+                    column_idx: i32::try_from(index)?,
+                    descending: false,
+                    nulls_first: false,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        builder = builder.set_sorting_columns(Some(sorting));
         for column in &self.bloom_columns {
             builder = builder
                 .set_column_bloom_filter_enabled(ColumnPath::from(column.as_str()), true)
