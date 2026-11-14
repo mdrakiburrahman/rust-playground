@@ -165,11 +165,11 @@ impl OatConfig {
     }
 
     fn validate_wal_capacity_for_cores(&self) -> Result<()> {
-        let retention_cap = self
-            .tunables
-            .wal
-            .as_ref()
-            .and_then(|wal| wal.retention_size_cap_bytes)
+        let Some(wal) = self.tunables.wal.as_ref() else {
+            return Ok(());
+        };
+        let retention_cap = wal
+            .retention_size_cap_bytes
             .unwrap_or(DEFAULT_WAL_RETENTION_SIZE_CAP_BYTES);
         let quiver = QuiverConfig::default();
         let segment_size = quiver.segment.target_size_bytes.get();
@@ -773,6 +773,7 @@ mod tests {
     #[test]
     fn validates_default_wal_capacity_for_each_requested_worker_count() -> Result<()> {
         let mut config = valid();
+        config.tunables.wal = Some(arrowcol_tunables::WalTunables::default());
         config.dfe_worker_concurrency = vec![21];
         config.validate()?;
 
@@ -782,6 +783,30 @@ mod tests {
             Err(error) if format!("{error:#}").contains("dfe_worker_concurrency=22")
         ));
         Ok(())
+    }
+
+    #[test]
+    fn wal_capacity_validation_follows_selected_topology() -> Result<()> {
+        let mut config = valid();
+        config.dfe_worker_concurrency = vec![256];
+        config.validate()?;
+
+        config.tunables.wal = Some(arrowcol_tunables::WalTunables::default());
+        assert!(matches!(
+            config.validate(),
+            Err(error) if format!("{error:#}").contains("dfe_worker_concurrency=256")
+        ));
+
+        let quiver = QuiverConfig::default();
+        let minimum_per_core = DiskBudget::minimum_hard_cap(
+            quiver.segment.target_size_bytes.get(),
+            DiskBudget::effective_wal_size(&quiver),
+        );
+        config.tunables.wal = Some(arrowcol_tunables::WalTunables {
+            retention_size_cap_bytes: Some(minimum_per_core.saturating_mul(256)),
+            ..Default::default()
+        });
+        config.validate()
     }
 
     #[test]
