@@ -2143,6 +2143,7 @@ mod tests {
                     batch_rows: Some(16_384),
                     ..Default::default()
                 }),
+                ..Default::default()
             }),
             ..Default::default()
         };
