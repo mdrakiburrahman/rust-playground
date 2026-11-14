@@ -1524,6 +1524,7 @@ mod tests {
     fn native_durable_buffer(
         runtime: &otel_arrow_dfe_engine::testing::processor::TestRuntime<OtapPdata>,
         path: &std::path::Path,
+        deployment_generation: u64,
     ) -> otel_arrow_dfe_engine::processor::ProcessorWrapper<OtapPdata> {
         use otel_arrow_dfe_core_nodes::processors::durable_buffer_processor::{
             DURABLE_BUFFER_URN, create_durable_buffer,
@@ -1533,7 +1534,14 @@ mod tests {
         use otel_arrow_dfe_engine::testing::test_node;
 
         let controller = ControllerContext::new(runtime.metrics_registry());
-        let context = controller.pipeline_context_with("capacity-retention".into(), "test".into(), 0, 1, 0);
+        let context = controller.pipeline_context_with_generation(
+            "capacity-retention".into(),
+            "test".into(),
+            0,
+            1,
+            0,
+            deployment_generation,
+        );
         let mut config = NodeUserConfig::new_processor_config(DURABLE_BUFFER_URN);
         config.config = serde_json::json!({
             "path": path,
@@ -1590,7 +1598,7 @@ mod tests {
         let first_original = Arc::clone(&original);
         let first_directory = directory.path().to_path_buf();
         let runtime = TestRuntime::new();
-        let processor = native_durable_buffer(&runtime, &durable_path);
+        let processor = native_durable_buffer(&runtime, &durable_path, 0);
         let reporter = runtime.metrics_reporter();
         runtime
             .set_processor(processor)
@@ -1692,7 +1700,8 @@ mod tests {
             .validate(|_| async {});
 
         let runtime = TestRuntime::new();
-        let processor = native_durable_buffer(&runtime, &durable_path);
+        // A restart is a new deployment generation even though the WAL path and node identity persist.
+        let processor = native_durable_buffer(&runtime, &durable_path, 1);
         runtime
             .set_processor(processor)
             .run_test(move |mut context| async move {
