@@ -5,7 +5,10 @@ use arrow_deltalake::maintenance::{Granularity, OptimizeConfig};
 use clap::Parser;
 use delta_kernel::metrics::WithMetricsReporterLayer;
 use delta_maintenance::{Metrics, Operation, Settings, run, serve_metrics, startup_configuration};
-use delta_maintenance::{catalog::CatalogDiscovery, run_with_discovery};
+use delta_maintenance::{
+    catalog::{CatalogDiscovery, CatalogOptions},
+    run_with_discovery,
+};
 use opentelemetry_otlp::{Protocol, WithExportConfig};
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use std::collections::BTreeMap;
@@ -32,6 +35,12 @@ struct Cli {
     /// Shared schema-catalog gRPC endpoint (for example http://catalog:8817).
     #[arg(long, env = "ARROWCOL_MAINT_CATALOG_ENDPOINT")]
     catalog_endpoint: Option<String>,
+    #[arg(long, env = "ARROWCOL_MAINT_CATALOG_RUNTIME_THREADS", default_value_t = 2)]
+    catalog_runtime_threads: usize,
+    #[arg(long, env = "ARROWCOL_MAINT_CATALOG_RPC_TIMEOUT_SECS", default_value_t = 30)]
+    catalog_rpc_timeout_secs: u64,
+    #[arg(long, env = "ARROWCOL_MAINT_CATALOG_MAX_DECODING_MESSAGE_BYTES", default_value_t = 32 * 1024 * 1024)]
+    catalog_max_decoding_message_bytes: usize,
     /// Allowlisted table directory names under the root (repeatable).
     #[arg(long = "table", env = "ARROWCOL_MAINT_TABLES", value_delimiter = ',')]
     tables: Vec<String>,
@@ -213,6 +222,11 @@ fn settings(cli: Cli) -> Result<Settings> {
         operation_timeout: Duration::from_secs(cli.operation_timeout_secs),
         commit_attempts: cli.commit_attempts,
         commit_budget: Duration::from_secs(cli.commit_budget_secs),
+        catalog_options: CatalogOptions {
+            runtime_threads: cli.catalog_runtime_threads,
+            rpc_timeout: Duration::from_secs(cli.catalog_rpc_timeout_secs),
+            max_decoding_message_bytes: cli.catalog_max_decoding_message_bytes,
+        },
         granularity: cli
             .granularity
             .as_deref()
@@ -325,7 +339,11 @@ fn main_inner() -> Result<bool> {
         None
     };
     let healthy = if let Some(endpoint) = catalog_endpoint {
-        let discovery = CatalogDiscovery::connect(&endpoint, settings.tables.clone())?;
+        let discovery = CatalogDiscovery::connect_with_options(
+            &endpoint,
+            settings.tables.clone(),
+            settings.catalog_options.clone(),
+        )?;
         run_with_discovery(&settings, &discovery, &metrics, &cancel)
     } else {
         run(&settings, &metrics, &cancel)
@@ -394,6 +412,16 @@ mod tests {
             "0",
         ];
         assert!(settings(Cli::try_parse_from(invalid_retries)?).is_err());
+        let invalid_catalog = [
+            "delta-maintenance",
+            "--root",
+            "file:///tmp/",
+            "--operation",
+            "optimize",
+            "--catalog-runtime-threads",
+            "0",
+        ];
+        assert!(settings(Cli::try_parse_from(invalid_catalog)?).is_err());
         Ok(())
     }
 }
