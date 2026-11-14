@@ -114,6 +114,10 @@ impl RouterConfig {
     }
 
     /// Loads YAML, applies environment and CLI overrides, then validates the effective config.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unreadable YAML, unknown fields, invalid overrides, or invalid bounds.
     pub fn load_with_cli(path: impl AsRef<Path>, overrides: &RouterOverrides) -> Result<Self> {
         let path = path.as_ref();
         let bytes = std::fs::read(path).with_context(|| format!("read router config {}", path.display()))?;
@@ -641,6 +645,7 @@ pub struct TelemetryConfig {
 
 #[cfg(test)]
 mod routing_policy_tests {
+    use clap::Parser;
     use super::{Cli, RouterConfig, RoutingConfig, apply_cli_overrides, apply_environment_overrides};
 
     #[test]
