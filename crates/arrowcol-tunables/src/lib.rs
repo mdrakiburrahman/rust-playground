@@ -2,6 +2,11 @@ mod validation;
 
 pub use validation::{ApplyBoundary, Capability, ComponentRole, DurabilityClass, capability_table};
 
+pub use arrow_deltalake::writer::{
+    Codec as ParquetCodec, ColumnOptions as ParquetColumnOptions, ParquetWriterConfig, SortColumn as ParquetSortColumn,
+    Statistics as ParquetStatistics, ValueEncoding as ParquetValueEncoding, Version as ParquetWriterVersion,
+};
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -16,7 +21,7 @@ pub struct Tunables {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collector: Option<CollectorTunables>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parquet_writer: Option<ParquetWriterTunables>,
+    pub parquet_writer: Option<ParquetWriterConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wal: Option<WalTunables>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -172,101 +177,6 @@ pub struct CoalescingTunables {
     pub target_bytes: Option<u64>,
     pub max_age_ms: Option<u64>,
     pub max_pending_batches: Option<usize>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ParquetWriterTunables {
-    pub compression: Option<Compression>,
-    pub columns: Option<Vec<ColumnOverride>>,
-    pub dictionary_enabled: Option<bool>,
-    pub dictionary_page_size_bytes: Option<u64>,
-    pub writer_version: Option<WriterVersion>,
-    pub statistics: Option<StatisticsLevel>,
-    pub page_index_enabled: Option<bool>,
-    pub bloom_filter: Option<BloomFilterTunables>,
-    pub row_group_rows: Option<usize>,
-    pub row_group_bytes: Option<u64>,
-    pub data_page_bytes: Option<u64>,
-    pub data_page_rows: Option<usize>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Compression {
-    pub codec: CompressionCodec,
-    pub level: Option<u8>,
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum CompressionCodec {
-    #[default]
-    Uncompressed,
-    Snappy,
-    Gzip,
-    Brotli,
-    Zstd,
-    Lz4Raw,
-    Lz4,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ColumnOverride {
-    pub name: String,
-    pub physical_type: PhysicalType,
-    pub compression: Option<Compression>,
-    pub encoding: Option<Encoding>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum PhysicalType {
-    Boolean,
-    Int32,
-    Int64,
-    Int96,
-    Float,
-    Double,
-    ByteArray,
-    FixedLenByteArray,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum Encoding {
-    Plain,
-    Rle,
-    DeltaBinaryPacked,
-    ByteStreamSplit,
-    DeltaLengthByteArray,
-    DeltaByteArray,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct BloomFilterTunables {
-    pub enabled: Option<bool>,
-    pub false_positive_probability: Option<f64>,
-    pub ndv: Option<u64>,
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum WriterVersion {
-    #[default]
-    V1,
-    V2,
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum StatisticsLevel {
-    None,
-    #[default]
-    Chunk,
-    Page,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]

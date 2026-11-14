@@ -1100,6 +1100,7 @@ name = "arrowcol-tunables"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arrow-deltalake",
  "serde",
  "serde_json",
 ]
