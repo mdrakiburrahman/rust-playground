@@ -40,6 +40,21 @@ use url::Url;
 type LocalEngine = DefaultEngine<SharedExecutor>;
 
 fn process_writer_properties(schema: &SchemaRef) -> Result<BTreeMap<String, String>> {
+    read_process_writer_properties(Some(schema))
+}
+
+fn read_process_writer_properties(schema: Option<&SchemaRef>) -> Result<BTreeMap<String, String>> {
+    process_writer_properties_from(schema, |name| match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(error.into()),
+    })
+}
+
+fn process_writer_properties_from(
+    schema: Option<&SchemaRef>,
+    mut read: impl FnMut(&str) -> Result<Option<String>>,
+) -> Result<BTreeMap<String, String>> {
     let mut process = BTreeMap::new();
     for (legacy, collector, key) in [
         (
@@ -78,16 +93,8 @@ fn process_writer_properties(schema: &SchemaRef) -> Result<BTreeMap<String, Stri
             "arrowcol.layout.pageRows",
         ),
     ] {
-        let legacy_value = match std::env::var(legacy) {
-            Ok(value) => Some(value),
-            Err(std::env::VarError::NotPresent) => None,
-            Err(error) => return Err(error.into()),
-        };
-        let collector_value = match std::env::var(collector) {
-            Ok(value) => Some(value),
-            Err(std::env::VarError::NotPresent) => None,
-            Err(error) => return Err(error.into()),
-        };
+        let legacy_value = read(legacy)?;
+        let collector_value = read(collector)?;
         if let (Some(legacy_value), Some(collector_value)) = (&legacy_value, &collector_value)
             && legacy_value != collector_value
         {
@@ -97,20 +104,40 @@ fn process_writer_properties(schema: &SchemaRef) -> Result<BTreeMap<String, Stri
             process.insert(key.to_owned(), value);
         }
     }
-    match std::env::var("ARROWCOL_PARTITION_GRANULARITY") {
-        Ok(value) => {
-            process.insert("arrowcol.partition.granularity".into(), value);
-        }
-        Err(std::env::VarError::NotPresent) => {}
-        Err(error) => return Err(error.into()),
+    if let Some(value) = read("ARROWCOL_PARTITION_GRANULARITY")? {
+        process.insert("arrowcol.partition.granularity".into(), value);
     }
     // Preserve the legacy opt-in for customer_id and explicit sort columns.
-    if schema.field_with_name("customer_id").is_ok() || process.contains_key("arrowcol.layout.sortColumns") {
+    if schema.is_some_and(|schema| schema.field_with_name("customer_id").is_ok())
+        || process.contains_key("arrowcol.layout.sortColumns")
+    {
         process
             .entry("arrowcol.layout.enabled".into())
             .or_insert_with(|| "true".into());
     }
     Ok(process)
+}
+
+/// Return validated process layout policy, not a claim about a table's applied layout.
+/// A null `enabled` preserves schema-dependent auto enablement.
+///
+/// # Errors
+/// Rejects conflicting aliases, invalid lists and out-of-range resource limits.
+pub fn effective_layout_startup_config() -> Result<serde_json::Value> {
+    layout_startup_config(&read_process_writer_properties(None)?)
+}
+
+fn layout_startup_config(process: &BTreeMap<String, String>) -> Result<serde_json::Value> {
+    let properties = arrowcol_props::resolve(&BTreeMap::new(), process)?;
+    let policy = crate::layout::LayoutPolicy::from_properties(&properties)?;
+    let enabled = process
+        .contains_key("arrowcol.layout.enabled")
+        .then(|| properties.boolean("arrowcol.layout.enabled"))
+        .transpose()?;
+    Ok(serde_json::json!({
+        "process_policy": policy.config_json(enabled),
+        "table_properties_override": true,
+    }))
 }
 
 fn resolve_adaptive_file_config(
@@ -1852,8 +1879,88 @@ pub struct DeltaTable {
     session: Option<Arc<PublisherSession>>,
     bootstrap_only: bool,
     snapshot_cache: Mutex<Option<CachedSnapshot>>,
+    layout_readback: Mutex<Option<LayoutReadback>>,
     reuse_snapshots: bool,
     publication_fence: Option<Arc<dyn PublicationFence>>,
+}
+
+#[derive(PartialEq, Eq)]
+struct LayoutReadback {
+    schema: SchemaRef,
+    enabled: bool,
+    policy: crate::layout::LayoutPolicy,
+    table_property_overrides: Vec<String>,
+}
+
+impl LayoutReadback {
+    fn new(
+        schema: SchemaRef,
+        properties: &arrowcol_props::ResolvedProps,
+        table: &BTreeMap<String, String>,
+        enabled: bool,
+    ) -> Result<Self> {
+        Ok(Self {
+            schema,
+            enabled,
+            policy: crate::layout::LayoutPolicy::from_properties(properties)?,
+            table_property_overrides: table
+                .keys()
+                .filter(|key| key.starts_with("arrowcol.layout."))
+                .cloned()
+                .collect(),
+        })
+    }
+
+    fn event(&self, url: &Url, parquet_config: &crate::writer::ParquetWriterConfig) -> Result<serde_json::Value> {
+        let mut config = self.policy.config_json(Some(self.enabled));
+        if self.enabled {
+            let base = Some(self.policy.writer_properties(&self.schema)?);
+            let properties = parquet_config.writer_properties(
+                &self.schema,
+                base.clone(),
+                &crate::writer::sorting_from_properties(&self.schema, base.as_ref())?,
+            )?;
+            let descriptor = parquet::arrow::ArrowSchemaConverter::new().convert(&self.schema)?;
+            let bloom_columns = descriptor
+                .columns()
+                .iter()
+                .filter(|column| properties.bloom_filter_properties(column.path()).is_some())
+                .map(|column| column.path().string())
+                .collect::<Vec<_>>();
+            config["bloom_columns"] = serde_json::json!(bloom_columns);
+            config["row_group_rows"] = serde_json::json!(
+                properties
+                    .max_row_group_row_count()
+                    .context("missing Parquet row-group row limit")?
+            );
+            config["page_rows"] = serde_json::json!(properties.data_page_row_count_limit());
+        } else {
+            for name in [
+                "sort_columns",
+                "bloom_columns",
+                "max_rows",
+                "max_input_bytes",
+                "row_group_rows",
+                "page_rows",
+            ] {
+                config[name] = serde_json::Value::Null;
+            }
+        }
+        Ok(serde_json::json!({
+            "component": "layout",
+            "scope": "table_effective",
+            "table_id": format!("{:x}", sha2::Sha256::digest(url.as_str().as_bytes())),
+            "table_name": telemetry_table_name(url),
+            "applied": self.enabled,
+            "inactive_controls": if self.enabled { Vec::<&str>::new() } else {
+                vec!["sort_columns", "bloom_columns", "max_rows", "max_input_bytes", "row_group_rows", "page_rows"]
+            },
+            "precedence": ["table_properties", "process_policy", "registry_defaults"],
+            "encoding_precedence": ["parquet_config", "resolved_layout", "parquet_defaults"],
+            "table_property_overrides": self.table_property_overrides,
+            "config": config,
+        }))
+    }
 }
 
 /// Exclusive local writer ownership, released when its owner drops.
@@ -2228,6 +2335,7 @@ impl DeltaTable {
             _lock: None,
             commit_lock: Mutex::new(()),
             snapshot_cache: Mutex::new(None),
+            layout_readback: Mutex::new(None),
             reuse_snapshots: false,
             publication_fence,
             session,
@@ -2497,6 +2605,7 @@ impl DeltaTable {
             },
             commit_lock: Mutex::new(()),
             snapshot_cache: Mutex::new(None),
+            layout_readback: Mutex::new(None),
             reuse_snapshots,
             publication_fence,
             session: None,
@@ -2512,6 +2621,31 @@ impl DeltaTable {
         {
             // Process partition defaults apply only to new tables.
             self.partition_columns = snapshot.table_configuration().metadata().partition_columns().to_vec();
+        }
+        Ok(())
+    }
+
+    fn record_layout_readback(
+        &self,
+        physical: SchemaRef,
+        properties: &arrowcol_props::ResolvedProps,
+        table: &BTreeMap<String, String>,
+        enabled: bool,
+    ) -> Result<()> {
+        let next = LayoutReadback::new(physical, properties, table, enabled)?;
+        let mut previous = self
+            .layout_readback
+            .lock()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        if previous.as_ref() != Some(&next) {
+            let event = next.event(&self.url, crate::writer::process_config()?)?;
+            eprintln!("arrowcol_effective_config {event}");
+            tracing::info!(
+                component = "layout",
+                effective_config = %event,
+                "arrowcol_effective_config"
+            );
+            *previous = Some(next);
         }
         Ok(())
     }
@@ -2769,6 +2903,7 @@ impl DeltaTable {
         });
         let properties = arrowcol_props::resolve(&table_properties, &process_writer_properties(&normalized)?)?;
         let layout = publication_layout(&normalized, &properties)?;
+        let enabled = layout.is_some();
         let partitioned = self.partition_columns == [INGESTION_PARTITION];
         let granularity = properties.text("arrowcol.partition.granularity")?;
         let writer =
@@ -2777,6 +2912,12 @@ impl DeltaTable {
             writer.discard_empty()?;
             bail!("table properties changed while preparing publication; retry with refreshed policy");
         }
+        self.record_layout_readback(
+            Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?),
+            &properties,
+            &table_properties,
+            enabled,
+        )?;
         Ok(writer)
     }
 
@@ -2957,6 +3098,14 @@ impl DeltaTable {
                     return Err(error);
                 }
             }
+        }
+        if let Some((writer, _)) = files.first() {
+            self.record_layout_readback(
+                Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?),
+                &resolved,
+                &table_properties,
+                layout.is_some(),
+            )?;
         }
         Ok(files)
     }
@@ -3239,6 +3388,14 @@ impl DeltaTable {
                     if let Some(policy) = &layout {
                         let physical = Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?);
                         writer.sorter = Some(crate::layout::FileSortBuffer::new(physical, policy.clone())?);
+                    }
+                    if staged.is_empty() {
+                        self.record_layout_readback(
+                            Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?),
+                            &resolved,
+                            &table_properties,
+                            layout.is_some(),
+                        )?;
                     }
                     for batch in &batches {
                         writer.write(batch).await?;
@@ -4276,5 +4433,177 @@ impl DeltaTableWriter {
     /// Returns completion/commit errors.
     pub async fn close(mut self) -> Result<Option<AppendResult>> {
         self.flush().await
+    }
+}
+#[cfg(test)]
+mod layout_readback_tests {
+    use super::*;
+
+    #[test]
+    fn layout_readback_resolves_both_aliases_and_preserves_schema_auto() -> Result<()> {
+        let aliases = [
+            ("ARROWCOL_LAYOUT_ENABLED", "ARROWCOL_COLLECTOR_LAYOUT_ENABLED", "false"),
+            (
+                "ARROWCOL_LAYOUT_SORT_COLUMNS",
+                "ARROWCOL_COLLECTOR_SORT_COLUMNS",
+                "customer_id,value",
+            ),
+            (
+                "ARROWCOL_LAYOUT_BLOOM_COLUMNS",
+                "ARROWCOL_COLLECTOR_BLOOM_COLUMNS",
+                "value",
+            ),
+            ("ARROWCOL_LAYOUT_MAX_ROWS", "ARROWCOL_COLLECTOR_LAYOUT_MAX_ROWS", "256"),
+            (
+                "ARROWCOL_LAYOUT_MAX_INPUT_BYTES",
+                "ARROWCOL_COLLECTOR_LAYOUT_MAX_INPUT_BYTES",
+                "3145728",
+            ),
+            (
+                "ARROWCOL_LAYOUT_ROW_GROUP_ROWS",
+                "ARROWCOL_COLLECTOR_LAYOUT_ROW_GROUP_ROWS",
+                "32",
+            ),
+            ("ARROWCOL_LAYOUT_PAGE_ROWS", "ARROWCOL_COLLECTOR_LAYOUT_PAGE_ROWS", "8"),
+        ];
+        let resolve = |environment: &BTreeMap<&str, &str>| {
+            process_writer_properties_from(None, |name| Ok(environment.get(name).map(|value| (*value).to_owned())))
+        };
+        let legacy = aliases.iter().map(|(legacy, _, value)| (*legacy, *value)).collect();
+        let collector = aliases
+            .iter()
+            .map(|(_, collector, value)| (*collector, *value))
+            .collect();
+        let layout = layout_startup_config(&resolve(&legacy)?)?;
+        assert_eq!(layout, layout_startup_config(&resolve(&collector)?)?);
+        assert_eq!(layout["table_properties_override"], true);
+        let config = &layout["process_policy"];
+        assert_eq!(config["enabled"], false);
+        assert_eq!(config["sort_columns"], serde_json::json!(["customer_id", "value"]));
+        assert_eq!(config["bloom_columns"], serde_json::json!(["value"]));
+        assert_eq!(config["max_rows"], 256);
+        assert_eq!(config["max_input_bytes"], 3_145_728);
+        assert_eq!(config["row_group_rows"], 32);
+        assert_eq!(config["page_rows"], 8);
+        for (legacy, collector, value) in aliases {
+            let matching = BTreeMap::from([(legacy, value), (collector, value)]);
+            assert!(resolve(&matching).is_ok());
+            let conflicting = BTreeMap::from([(legacy, value), (collector, "conflict")]);
+            assert!(
+                resolve(&conflicting).is_err(),
+                "{legacy} must reject conflicting aliases"
+            );
+        }
+        assert!(layout_startup_config(&resolve(&BTreeMap::new())?)?["process_policy"]["enabled"].is_null());
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
+            "customer_id",
+            arrow::datatypes::DataType::Utf8,
+            false,
+        )]));
+        let inferred = process_writer_properties_from(Some(&schema), |_| Ok(None))?;
+        assert!(arrowcol_props::resolve(&BTreeMap::new(), &inferred)?.boolean("arrowcol.layout.enabled")?);
+        let explicit_sort = resolve(&BTreeMap::from([("ARROWCOL_COLLECTOR_SORT_COLUMNS", "value")]))?;
+        assert_eq!(
+            layout_startup_config(&explicit_sort)?["process_policy"]["enabled"],
+            true
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn layout_readback_rejects_invalid_process_controls_before_schema_resolution() -> Result<()> {
+        for (name, value) in [
+            ("ARROWCOL_COLLECTOR_LAYOUT_ENABLED", "1"),
+            ("ARROWCOL_COLLECTOR_LAYOUT_MAX_ROWS", "0"),
+            ("ARROWCOL_COLLECTOR_LAYOUT_MAX_ROWS", "4294967296"),
+            ("ARROWCOL_COLLECTOR_LAYOUT_MAX_INPUT_BYTES", "0"),
+            ("ARROWCOL_COLLECTOR_LAYOUT_ROW_GROUP_ROWS", "0"),
+            ("ARROWCOL_COLLECTOR_LAYOUT_PAGE_ROWS", "0"),
+            ("ARROWCOL_COLLECTOR_SORT_COLUMNS", ""),
+            ("ARROWCOL_COLLECTOR_SORT_COLUMNS", "x,x"),
+            ("ARROWCOL_COLLECTOR_SORT_COLUMNS", "x,,y"),
+            ("ARROWCOL_COLLECTOR_BLOOM_COLUMNS", "x,x"),
+        ] {
+            let process = process_writer_properties_from(None, |key| Ok((key == name).then(|| value.to_owned())))?;
+            assert!(
+                layout_startup_config(&process).is_err(),
+                "{name}={value} must fail at startup"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn layout_readback_reports_table_precedence_and_final_physical_encoding() -> Result<()> {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("customer_id", arrow::datatypes::DataType::Utf8, false),
+            arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int32, false),
+        ]));
+        let process = BTreeMap::from([
+            ("arrowcol.layout.enabled".into(), "true".into()),
+            ("arrowcol.layout.maxRows".into(), "128".into()),
+            ("arrowcol.layout.rowGroupRows".into(), "64".into()),
+        ]);
+        let mut table = BTreeMap::from([
+            ("arrowcol.layout.maxRows".into(), "7".into()),
+            ("arrowcol.layout.rowGroupRows".into(), "4".into()),
+            ("arrowcol.layout.pageRows".into(), "2".into()),
+            ("arrowcol.layout.sortColumns".into(), "value".into()),
+            ("arrowcol.layout.bloomColumns".into(), String::new()),
+        ]);
+        let resolved = arrowcol_props::resolve(&table, &process)?;
+        let enabled = publication_layout(&schema, &resolved)?.is_some();
+        let readback = LayoutReadback::new(Arc::clone(&schema), &resolved, &table, enabled)?;
+        let parquet: crate::writer::ParquetWriterConfig = serde_json::from_value(serde_json::json!({
+            "max_row_group_rows": 3,
+            "data_page_row_count_limit": 1,
+            "columns": {"customer_id": {"bloom_filter_enabled": true}}
+        }))?;
+        let url = Url::parse("file:///safe/catalog/schema/events/")?;
+        let event = readback.event(&url, &parquet)?;
+        assert_eq!(event["table_name"], "catalog.schema.events");
+        assert_eq!(
+            event["table_id"],
+            format!("{:x}", sha2::Sha256::digest(url.as_str().as_bytes()))
+        );
+        assert_eq!(event["applied"], true);
+        assert_eq!(event["config"]["max_rows"], 7);
+        assert_eq!(event["config"]["sort_columns"], serde_json::json!(["value"]));
+        assert_eq!(event["config"]["bloom_columns"], serde_json::json!(["customer_id"]));
+        assert_eq!(event["config"]["row_group_rows"], 3);
+        assert_eq!(event["config"]["page_rows"], 1);
+        assert_eq!(
+            event["precedence"],
+            serde_json::json!(["table_properties", "process_policy", "registry_defaults"])
+        );
+        assert!(
+            event["table_property_overrides"]
+                .as_array()
+                .is_some_and(|keys| { keys.contains(&serde_json::json!("arrowcol.layout.maxRows")) })
+        );
+        table.insert("arrowcol.layout.enabled".into(), "false".into());
+        let resolved = arrowcol_props::resolve(&table, &process)?;
+        assert!(publication_layout(&schema, &resolved)?.is_none());
+        let disabled = LayoutReadback::new(schema, &resolved, &table, false)?;
+        let event = disabled.event(&url, &parquet)?;
+        assert_eq!(event["applied"], false);
+        assert_eq!(event["config"]["enabled"], false);
+        for name in [
+            "sort_columns",
+            "bloom_columns",
+            "max_rows",
+            "max_input_bytes",
+            "row_group_rows",
+            "page_rows",
+        ] {
+            assert!(
+                event["config"][name].is_null(),
+                "disabled layout must not claim {name} was applied"
+            );
+        }
+        assert!(event["inactive_controls"].as_array().is_some_and(|keys| {
+            keys.contains(&serde_json::json!("max_rows")) && keys.contains(&serde_json::json!("max_input_bytes"))
+        }));
+        Ok(())
     }
 }

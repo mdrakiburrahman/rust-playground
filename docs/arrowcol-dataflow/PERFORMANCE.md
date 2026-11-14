@@ -61,6 +61,52 @@ encoding high-cardinality output. Schema, partition, retention, fencing,
 no-overwrite and durability boundaries remain.
 Increasing a flush target alone does not coalesce publications.
 
+### Layout readback
+
+Startup `arrowcol_effective_config <JSON>` includes a root `layout` object with
+`process_policy: {enabled, sort_columns, bloom_columns, max_rows, max_input_bytes,
+row_group_rows, page_rows}` and `table_properties_override: true`.
+It validates the existing legacy/collector aliases,
+numeric bounds and column lists before DFE initialization. `enabled: null`
+means schema-dependent auto enablement, not disabled or applied. Column existence
+is validated later against the table's physical schema.
+
+Publication writers emit a separate change-only event at file preparation:
+
+```json
+{
+  "component": "layout",
+  "scope": "table_effective",
+  "table_id": "<same SHA256 identity as arrowcol_data_commit>",
+  "table_name": "catalog.schema.table",
+  "applied": true,
+  "inactive_controls": [],
+  "precedence": ["table_properties", "process_policy", "registry_defaults"],
+  "encoding_precedence": ["parquet_config", "resolved_layout", "parquet_defaults"],
+  "table_property_overrides": ["arrowcol.layout.maxRows"],
+  "config": {
+    "enabled": true,
+    "sort_columns": ["customer_id"],
+    "bloom_columns": ["customer_id"],
+    "max_rows": 262144,
+    "max_input_bytes": 67108864,
+    "row_group_rows": 16384,
+    "page_rows": 2048
+  }
+}
+```
+
+The startup `layout.process_policy` object has the same typed config fields;
+it has no table identity or application claim. All numeric controls are integer
+row counts except `max_input_bytes`, which is bytes. Table-property overrides
+win over process layout defaults; reported row-group/page/Bloom controls also
+include final `ARROWCOL_PARQUET_CONFIG` overrides. With layout disabled,
+`config.enabled` and `applied` are false, all six remaining config fields are
+null, and `inactive_controls` lists them; independently configured encoding
+controls are not claimed as applied layout. Events are emitted only when resolved policy or physical
+schema changes, not for individual rows/batches. They prove resolved file policy,
+not successful publication; correlate actual output with commit events.
+
 `arrowcol_data_commit <JSON>` records new durable AddFiles, their rows/bytes,
 version, table identity, min/max admission stamps and individual commit elapsed
 time. It is not client acknowledgement throughput. Primary commit-window output
