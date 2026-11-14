@@ -1223,9 +1223,7 @@ mod tests {
     }
 
     fn options() -> Result<Options> {
-        Ok(Cli::try_parse_from(["test", "--workers", "2"])?
-            .options
-            .resolve(100, 1)?)
+        Cli::try_parse_from(["test", "--workers", "2"])?.options.resolve(100, 1)
     }
 
     #[test]
