@@ -1102,6 +1102,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow-deltalake",
+ "humantime",
  "serde",
  "serde_json",
 ]
