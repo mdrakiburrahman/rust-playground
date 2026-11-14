@@ -38,6 +38,10 @@ explicit CLI values win. Run `arrowcol-dmv --help` for the complete reference.
 | `--connect-retries`, `--retry-backoff-ms` | Only retry connection establishment. Ambiguous `DoPut` uploads are never automatically retried; doing so could duplicate admitted rows. |
 | `--duration-secs`, `--warmup-secs` | Zero duration uploads the corpus once. A positive duration requires a shared future `--run-start-unix-ms` or OAT-armed `--schedule-file`; pilot mode preserves 30-second windows. |
 
+`OAT_CLIENT_RESOLUTION` records requested sentinel values, legacy row/concurrency
+inputs, resolved values and the actual single CPU-availability observation before
+runtime creation or network activity. Byte-target row sizing is explicitly
+deferred to corpus preparation, not guessed from a positive value.
 `OAT_CLIENT_EFFECTIVE_CONFIG` emits non-secret resolved tuning JSON. No payloads,
 endpoint, identity, key or file paths are included. `OAT_CLIENT_METRICS` emits
 versioned JSON at preparation, measurement start, completion and failures.
