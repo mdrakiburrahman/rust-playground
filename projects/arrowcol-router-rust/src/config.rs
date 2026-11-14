@@ -117,8 +117,8 @@ impl RouterConfig {
     pub fn load_with_cli(path: impl AsRef<Path>, overrides: &RouterOverrides) -> Result<Self> {
         let path = path.as_ref();
         let bytes = std::fs::read(path).with_context(|| format!("read router config {}", path.display()))?;
-        let mut config: Self = serde_yaml::from_slice(&bytes)
-            .with_context(|| format!("parse strict YAML {}", path.display()))?;
+        let mut config: Self =
+            serde_yaml::from_slice(&bytes).with_context(|| format!("parse strict YAML {}", path.display()))?;
         apply_environment_overrides(&mut config, |name| match std::env::var(name) {
             Ok(value) => Ok(Some(value)),
             Err(std::env::VarError::NotPresent) => Ok(None),
@@ -246,7 +246,6 @@ impl RouterConfig {
     }
 }
 
-
 fn apply_environment_overrides(
     config: &mut RouterConfig,
     mut get: impl FnMut(&str) -> Result<Option<String>>,
@@ -254,9 +253,9 @@ fn apply_environment_overrides(
     macro_rules! set_from_env {
         ($field:expr, $name:literal, $kind:ty) => {
             if let Some(value) = get($name)? {
-                *$field = value.parse::<$kind>().with_context(|| {
-                    format!("parse environment variable {} as {}", $name, stringify!($kind))
-                })?;
+                *$field = value
+                    .parse::<$kind>()
+                    .with_context(|| format!("parse environment variable {} as {}", $name, stringify!($kind)))?;
             }
         };
     }
@@ -338,11 +337,7 @@ fn apply_environment_overrides(
         "ARROWCOL_ROUTER_MINIMUM_WARMUP_BPS",
         u16
     );
-    set_from_env!(
-        &mut config.routing.lease_ttl_ms,
-        "ARROWCOL_ROUTER_LEASE_TTL_MS",
-        u64
-    );
+    set_from_env!(&mut config.routing.lease_ttl_ms, "ARROWCOL_ROUTER_LEASE_TTL_MS", u64);
     set_from_env!(
         &mut config.routing.oat_run_pin_ttl_ms,
         "ARROWCOL_ROUTER_OAT_RUN_PIN_TTL_MS",
@@ -436,9 +431,15 @@ fn apply_cli_overrides(config: &mut RouterConfig, overrides: &RouterOverrides) {
     set_from_cli!(edge_replay_max_nonces, config.auth.edge_replay_max_nonces);
     set_from_cli!(upstream_max_h2_streams, config.upstream.max_h2_streams);
     set_from_cli!(upstream_stream_window_bytes, config.upstream.stream_window_bytes);
-    set_from_cli!(upstream_connection_window_bytes, config.upstream.connection_window_bytes);
+    set_from_cli!(
+        upstream_connection_window_bytes,
+        config.upstream.connection_window_bytes
+    );
     set_from_cli!(upstream_connection_timeout_ms, config.upstream.connection_timeout_ms);
-    set_from_cli!(upstream_total_connection_timeout_ms, config.upstream.total_connection_timeout_ms);
+    set_from_cli!(
+        upstream_total_connection_timeout_ms,
+        config.upstream.total_connection_timeout_ms
+    );
     set_from_cli!(upstream_idle_timeout_seconds, config.upstream.idle_timeout_seconds);
     if let Some(seconds) = overrides.upstream_ping_interval_seconds {
         config.upstream.ping_interval_seconds = (seconds != 0).then_some(seconds);
@@ -655,7 +656,6 @@ mod routing_policy_tests {
         assert!(!routing.distinct_table_owners);
     }
 
-
     #[test]
     fn router_cli_overrides_are_typed_and_disable_zero_ping_interval() {
         let overrides = Cli::try_parse_from([
@@ -688,8 +688,10 @@ mod routing_policy_tests {
             ("ARROWCOL_ROUTER_UPSTREAM_PING_INTERVAL_SECONDS", "0"),
             ("ARROWCOL_ROUTER_DISTINCT_TABLE_OWNERS", "true"),
         ]);
-        apply_environment_overrides(&mut config, |name| Ok(overrides.get(name).map(|value| (*value).to_owned())))
-            .unwrap_or_else(|error| panic!("apply typed router overrides: {error}"));
+        apply_environment_overrides(&mut config, |name| {
+            Ok(overrides.get(name).map(|value| (*value).to_owned()))
+        })
+        .unwrap_or_else(|error| panic!("apply typed router overrides: {error}"));
         config
             .validate()
             .unwrap_or_else(|error| panic!("validate router overrides: {error}"));
