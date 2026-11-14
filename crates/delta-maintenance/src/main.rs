@@ -136,8 +136,8 @@ struct Cli {
     max_batch_bytes: usize,
     #[arg(long, env = "ARROWCOL_MAINT_BATCH_ROWS", default_value_t = 8192)]
     batch_rows: usize,
-    /// Buffer each input in memory or stream it to a temporary local file.
-    #[arg(long, env = "ARROWCOL_MAINT_INPUT_READ_STRATEGY", value_parser = ["memory", "spool"], default_value = "memory")]
+    /// Buffer in memory, spool to disk, or fetch ETag-fenced ranges.
+    #[arg(long, env = "ARROWCOL_MAINT_INPUT_READ_STRATEGY",     value_parser = ["memory", "spool", "range"], default_value = "memory")]
     input_read_strategy: String,
     #[arg(long, env = "ARROWCOL_MAINT_OUTPUT_ROW_GROUP_ROWS", default_value_t = 65_536)]
     output_row_group_rows: usize,
@@ -263,6 +263,7 @@ fn settings(cli: Cli) -> Result<Settings> {
             input_read_strategy: match cli.input_read_strategy.as_str() {
                 "memory" => InputReadStrategy::Memory,
                 "spool" => InputReadStrategy::Spool,
+                "range" => InputReadStrategy::Range,
                 value => return Err(anyhow!("invalid input read strategy: {value}")),
             },
             output_row_group_rows: cli.output_row_group_rows,
