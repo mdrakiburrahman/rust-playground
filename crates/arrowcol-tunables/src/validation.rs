@@ -76,8 +76,11 @@ const CAPABILITIES: &[Capability] = &[
         "transport.dictionary_handling",
         "hydrate; resend rejected for current DMV schema"
     ),
-    capability!("transport.max_flight_data_bytes", "32505856 (31 MiB)"),
-    capability!("transport.max_message_bytes", "33554432 (32 MiB)"),
+    capability!(
+        "transport.max_flight_data_bytes",
+        "OAT DMV=2097152; standalone=32505856"
+    ),
+    capability!("transport.max_message_bytes", "OAT DMV=16777216; standalone=33554432"),
     capability!("transport.grpc_send_compression", "disabled"),
     capability!("transport.grpc_accept_compression", "disabled"),
     capability!("transport.max_frame_bytes", "16384"),
@@ -354,7 +357,7 @@ impl Tunables {
     /// # Errors
     /// Returns an error for invalid values, unsupported settings, or an unprojectable configuration.
     pub fn validate_for_oat(&self) -> Result<()> {
-        self.validate()?;
+        self.validate_with_transport_defaults(16_777_216, 2_097_152)?;
         for role in [
             ComponentRole::Client,
             ComponentRole::Router,
@@ -371,6 +374,10 @@ impl Tunables {
     /// # Errors
     /// Returns an error when a setting is out of bounds, unsupported, or inconsistent with another setting.
     pub fn validate(&self) -> Result<()> {
+        self.validate_with_transport_defaults(33_554_432, 32_505_856)
+    }
+
+    fn validate_with_transport_defaults(&self, default_message_bytes: u64, default_flight_bytes: u64) -> Result<()> {
         if let Some(client) = &self.client {
             let cardinality = client.cardinality.unwrap_or(1_024);
             let memory = client.max_memory_bytes.unwrap_or(536_870_912);
@@ -430,8 +437,8 @@ impl Tunables {
             bail!("configure Arrow IPC compression in arrow_ipc.compression, not in both sections");
         }
         if let Some(transport) = &self.transport {
-            let message_bytes = transport.max_message_bytes.unwrap_or(33_554_432);
-            let flight_bytes = transport.max_flight_data_bytes.unwrap_or(32_505_856);
+            let message_bytes = transport.max_message_bytes.unwrap_or(default_message_bytes);
+            let flight_bytes = transport.max_flight_data_bytes.unwrap_or(default_flight_bytes);
             if message_bytes == 0 || message_bytes > i32::MAX as u64 {
                 bail!("transport.max_message_bytes must be between 1 and i32::MAX");
             }
@@ -534,7 +541,7 @@ impl Tunables {
     /// # Errors
     /// Returns an error if defaults are not an object, the settings are invalid, or JSON serialization fails.
     pub fn canonical_effective_json(&self, resolved_defaults: &Value) -> Result<String> {
-        self.validate()?;
+        self.validate_for_oat()?;
         let mut effective = resolved_defaults.clone();
         if !effective.is_object() {
             bail!("resolved component defaults must be a JSON object");
@@ -1693,7 +1700,7 @@ mod tests {
     fn error_text<T, E: std::fmt::Display>(result: std::result::Result<T, E>) -> String {
         match result {
             Ok(_) => String::new(),
-            Err(error) => error.to_string(),
+            Err(error) => format!("{error:#}"),
         }
     }
 
@@ -2128,6 +2135,23 @@ mod tests {
             ..Default::default()
         };
         assert!(tunables.validate().is_ok());
+        let oat_invalid = Tunables {
+            transport: Some(TransportTunables {
+                max_flight_data_bytes: Some(20_000_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(oat_invalid.validate_for_oat().is_err());
+
+        let oat_valid = Tunables {
+            transport: Some(TransportTunables {
+                max_message_bytes: Some(4_194_304),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(oat_valid.validate_for_oat().is_ok());
     }
 
     #[test]
@@ -2345,10 +2369,10 @@ mod tests {
 
     #[test]
     fn maintenance_input_read_strategy_is_strict_and_supports_range() {
-        assert_eq!(
+        assert!(matches!(
             serde_json::from_str::<MaintenanceInputReadStrategy>("\"range\""),
             Ok(MaintenanceInputReadStrategy::Range)
-        );
+        ));
         assert!(serde_json::from_str::<MaintenanceInputReadStrategy>("\"invalid\"").is_err());
     }
 
