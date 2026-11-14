@@ -13,7 +13,8 @@ use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config = RouterConfig::load(&cli.config)?;
+    let config = RouterConfig::load_with_cli(&cli.config, &cli.router)?;
+    emit_effective_config(&config);
     initialize_tracing(&config)?;
     if cli.validate_and_exit {
         info!(config = %cli.config.display(), "router configuration is valid");
@@ -71,6 +72,49 @@ fn main() -> Result<()> {
     let server = build_server(&config, router, control_loop)?;
     info!(listen = %config.server.listen, "starting Arrowcol production router behind external TLS termination");
     server.run_forever();
+}
+
+fn emit_effective_config(config: &RouterConfig) {
+    let effective = serde_json::json!({
+        "workers": config.server.threads,
+        "listener_tasks_per_fd": config.server.listener_tasks_per_fd,
+        "keepalive_pool_size": config.server.upstream_keepalive_pool_size,
+        "downstream_h2": {
+            "max_concurrent_streams": config.server.h2.max_concurrent_streams,
+            "stream_window_bytes": config.server.h2.stream_window_bytes,
+            "connection_window_bytes": config.server.h2.connection_window_bytes,
+            "idle_timeout_seconds": config.server.h2.idle_timeout_seconds,
+        },
+        "sql_timeouts": {
+            "connect_timeout_ms": config.sql_server.connect_timeout_ms,
+            "command_timeout_ms": config.sql_server.command_timeout_ms,
+        },
+        "routing": {
+            "refresh_interval_ms": config.routing.refresh_interval_ms,
+            "max_snapshot_age_ms": config.routing.max_snapshot_age_ms,
+            "max_future_skew_ms": config.routing.max_future_skew_ms,
+            "max_table_entries": config.routing.max_table_entries,
+            "max_oldest_buffer_age_ms": config.routing.max_oldest_buffer_age_ms,
+            "hard_pressure_bps": config.routing.hard_pressure_bps,
+            "warmup_ms": config.routing.warmup_ms,
+            "minimum_warmup_bps": config.routing.minimum_warmup_bps,
+            "lease_ttl_ms": config.routing.lease_ttl_ms,
+            "oat_run_pin_ttl_ms": config.routing.oat_run_pin_ttl_ms,
+            "readiness_max_staleness_ms": config.routing.readiness_max_staleness_ms,
+            "distinct_table_owners": config.routing.distinct_table_owners,
+        },
+        "edge_replay_max_nonces": config.auth.edge_replay_max_nonces,
+        "upstream": {
+            "max_h2_streams": config.upstream.max_h2_streams,
+            "stream_window_bytes": config.upstream.stream_window_bytes,
+            "connection_window_bytes": config.upstream.connection_window_bytes,
+            "connection_timeout_ms": config.upstream.connection_timeout_ms,
+            "total_connection_timeout_ms": config.upstream.total_connection_timeout_ms,
+            "idle_timeout_seconds": config.upstream.idle_timeout_seconds,
+            "ping_interval_seconds": config.upstream.ping_interval_seconds,
+        },
+    });
+    eprintln!("arrowcol_router_effective_config {effective}");
 }
 
 fn initialize_tracing(config: &RouterConfig) -> Result<()> {

@@ -631,7 +631,7 @@ pub fn build_server(
         // Pingora counts the first upstream attempt in this value. One means
         // exactly one attempt; the error hooks above also force retry=false.
         max_retries: 1,
-        upstream_keepalive_pool_size: 1_024,
+        upstream_keepalive_pool_size: config.server.upstream_keepalive_pool_size,
         pid_file: config
             .server
             .state_directory
