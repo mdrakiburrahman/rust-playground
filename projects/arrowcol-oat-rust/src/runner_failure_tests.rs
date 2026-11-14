@@ -2,6 +2,51 @@
 mod failure_evidence_tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_setup_streams_both_outputs_before_exit_and_retains_failure_diagnostics() -> Result<()> {
+        let directory = std::env::temp_dir().join(format!("oat-progress-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory)?;
+        let result = async {
+            for exit_code in [0, 7] {
+                let stdout_path = directory.join("stdout");
+                let stderr_path = directory.join("stderr");
+                let mut command = Command::new("sh");
+                command.args([
+                    "-c",
+                    "printf 'build progress\\n'; printf 'build diagnostic\\n' >&2; while [ ! -s \"$1\" ] || [ ! -s \"$2\" ]; do sleep 0.01; done; exit \"$3\"",
+                    "oat-progress", stdout_path.to_str().context("stdout path")?,
+                    stderr_path.to_str().context("stderr path")?, &exit_code.to_string(),
+                ]);
+                let result = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    run_streaming_command_to(
+                        command,
+                        "build test image",
+                        fs::File::create(&stdout_path)?,
+                        fs::File::create(&stderr_path)?,
+                    ),
+                )
+                .await
+                .context("output was buffered until process exit")?;
+                assert_eq!(fs::read_to_string(stdout_path)?, "build progress\n");
+                assert_eq!(fs::read_to_string(stderr_path)?, "build diagnostic\n");
+                if exit_code == 0 {
+                    result?;
+                } else {
+                    let error = result.err().context("nonzero command must fail")?.to_string();
+                    assert!(error.contains("build test image failed"));
+                    assert!(error.contains("7"));
+                    assert!(error.contains("build diagnostic"));
+                }
+            }
+            Ok(())
+        }
+        .await;
+        fs::remove_dir_all(&directory)?;
+        result
+    }
+
     #[test]
     fn compose_project_keeps_full_cell_uuid_even_when_prefixes_collide() {
         let first = scoped_compose_project("arrowcol-oat-quick", "123e4567-e89b-42d3-a456-426614174000");

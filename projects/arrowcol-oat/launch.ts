@@ -508,8 +508,11 @@ export async function launchOat(
       const response = await fetcher(new URL('/runs/' + encodeURIComponent(status.id), server), {
         signal: AbortSignal.timeout(30_000),
       });
-      status = await readStatus(response, 'poll OAT run');
-      onProgress(status);
+      const next = await readStatus(response, 'poll OAT run');
+      const changed = next.state !== status.state || next.progress !== status.progress ||
+        next.result_count !== status.result_count || next.error !== status.error;
+      status = next;
+      if (changed) onProgress(status);
     }
   } catch (error) {
     if (startFailure) {
@@ -668,7 +671,9 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
   const serverEnvironment = mode === 'aks'
     ? { ARROWCOL_AKS_STAMP_CONFIG_FILE: requestedStampConfigPath ?? 'infra/azure/stamp.yaml' }
     : {};
+  console.log('[oat] Building benchmark server...');
   const server = await startLocalServer(runner, serverEnvironment);
+  console.log(`[oat] Benchmark server: ${server.url} (PID ${server.child.pid}; logs in this terminal)`);
   let markerContext: LocalRunMarkerContext | undefined;
   try {
     if (mode === 'local') markerContext = await prepareLocalRunMarker(config, server);
@@ -959,9 +964,9 @@ export async function buildOwnedServer(
 ): Promise<{ executable: string; gitSha: string }> {
   const root = await realpath(workspace);
   const run = async (command: string[]): Promise<string> => {
-    const result = await runner(command, command[0] === 'cargo' ? 600 : 15, root);
+    const result = await runner(command, command[0] === 'cargo' ? 600 : 15, root, undefined,
+      command[0] === 'cargo' ? (chunk) => { process.stderr.write(chunk); } : undefined);
     if (result.returncode) throw new Error(`OAT ${command[0]} failed: ${result.stderr.trim()}`);
-    if (command[0] === 'cargo' && result.stderr) process.stderr.write(result.stderr);
     return result.stdout;
   };
   const source = async () => ({
