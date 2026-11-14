@@ -2222,9 +2222,9 @@ mod tests {
         let routing: Value = serde_json::from_str(&env["ARROWCOL_COLLECTOR_ROUTING_CONFIG"])?;
         assert_eq!(batching["max_age"], "1s");
         assert_eq!(catalog["maximum_cache_age"], "10s");
-        assert_eq!(commit["batch_window"], "2.5s");
+        assert_eq!(commit["batch_window"], "2s 500ms");
         assert_eq!(exporter["authority_timeout"], "10s");
-        assert_eq!(limits["max_stream_duration"], "60s");
+        assert_eq!(limits["max_stream_duration"], "1m");
         assert_eq!(limits["admission_timeout"], "5s");
         assert_eq!(pressure["pressure_interval"], "2s");
         assert_eq!(pressure["heartbeat_interval"], "5s");
