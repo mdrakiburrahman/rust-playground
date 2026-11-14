@@ -50,6 +50,43 @@ and control characters must not cross the client export boundary. Independent
 committed-Delta observations, not successful Flight completion, establish
 publication and row correctness.
 
+## Standalone client tuning
+
+`arrowcol-loadgen run` retains its existing `LOADTEST_*` settings. New flags use
+`ARROWCOL_CLIENT_<UPPER_SNAKE>` (for example,
+`--precompute-batches-per-table` / `ARROWCOL_CLIENT_PRECOMPUTE_BATCHES_PER_TABLE`).
+All are startup settings; CLI values override environment values.
+
+| Controls | Behavior |
+| --- | --- |
+| `--lanes 0`, `--runtime-threads 0` | Use all available cores; lanes otherwise retain default `4`. Independent lanes continuously replenish one logical batch each, without a round barrier. |
+| `--precompute-batches-per-table 0..16` | Default `0` generates on demand. `16` caches the complete existing seed cycle, removing generation, proof hashing and IPC encoding from steady-state sends. Partial caches generate misses with the original seed. |
+| `--max-memory-bytes`, `--data-mode shared\|independent` | Default 512 MiB conservative corpus-plus-active-generation budget, not process RSS or transport memory. Shared immutable Arrow/IPC/proof data uses `Arc`; independent mode allocates identical proof-compatible copies per lane. Rejects an oversized reservation before generating the corpus. |
+| `--batch-rows`, `--seed`, `--string-width`, `--entropy` | Existing row/seed controls; width `0` preserves existing values, otherwise up to 65,536 ASCII bytes for non-GUID/non-customer strings. Entropy `0..1` controls seed-varying positions, not measured Shannon entropy. |
+| `--interval-us`, `--connections-per-worker` | Zero-default per-lane cooldown after logical completion; persistent channel pool per lane. Connections are round-robin, not extra concurrent streams; increase lanes for in-flight concurrency. |
+| `--ipc-compression`, `--max-flight-data-bytes`, `--max-message-bytes` | `none` (default), `lz4_frame`, `zstd`; preserves the existing 31 MiB split target and the standalone stack's 32 MiB message bound. Receiver must support the codec/cap; no downgrade. |
+| `--stream-window-bytes`, `--connection-window-bytes`, `--adaptive-window` | HTTP/2 defaults 1 MiB / 16 MiB / false. |
+| `--connect-timeout-ms`, `--keepalive-interval-ms`, `--keepalive-timeout-ms`, `--keepalive-while-idle`, `--tcp-nodelay` | Connect timeout `0` inherits existing request timeout; keepalive defaults 10s / 20s / true; TCP_NODELAY true. Zero keepalive interval disables probes. Boolean flags take explicit true/false. |
+| `--endpoint-concurrency-limit`, `--endpoint-buffer-size` | Per-connection bounds, defaults 256 / 1024. |
+| `--max-attempts`, `--retry-window`, `--retry-initial-backoff-ms`, `--retry-max-backoff-ms` | Existing attempt floor/window and immutable retry identity remain unchanged. Backoff defaults 100ms exponential capped at 2000ms. Every physical attempt retains the original manifest evidence. |
+
+`LOADGEN_CLIENT_EFFECTIVE_CONFIG` excludes identities, endpoints, secrets and
+paths. `LOADGEN_CLIENT_PREPARATION` and `client-preparation.json` retain actual
+decoded/encoded sizes, conservative memory reservation and preparation wall/CPU
+time (caller-thread Linux CPU; null elsewhere).
+`LOADGEN_CLIENT_METRICS` and `<scenario>-<phase>-client-metrics.json` separate
+physical attempted/completed/error/cancelled-uncertain rows and encoded protobuf
+payload bytes (not measured network traffic)
+per lane, completed rate, cache hits/misses, generation/proof/encoding wall time,
+and logarithmic send-latency percentiles. Phase totals include in-flight drain,
+not exact shared measurement-window completions. Completion means validated
+admission, never Delta commit or proof of generator saturation.
+
+Arbitrary null fractions, cardinality/skew changes and dictionary-bearing
+representations are unsupported for this proof workload. It deliberately keeps
+16 customer rows times 16 seed variants within the independent reader's
+256-distinct-row guard; GUID and timestamp normalization remain unchanged.
+
 ## Test fixture isolation
 
 Tests that need repository ancestry allocate unique trees through

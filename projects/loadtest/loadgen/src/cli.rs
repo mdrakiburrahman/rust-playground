@@ -186,6 +186,8 @@ impl std::error::Error for DurationParseError {}
 /// Runtime and connection settings.
 #[derive(Clone, Debug, Args)]
 pub struct RunArgs {
+    #[command(flatten)]
+    pub client_tuning: crate::tuning::ClientTuning,
     /// Warmup duration.
     #[arg(long, env = "LOADTEST_WARMUP", default_value = "2m")]
     pub warmup: DurationArg,
@@ -227,7 +229,7 @@ pub struct RunArgs {
     #[arg(long = "table", env = "LOADTEST_TABLES", value_delimiter = ',')]
     pub tables: Vec<String>,
 
-    /// Concurrent scheduling lanes. Each lane has at most one logical batch in flight.
+    /// Concurrent scheduling lanes; zero uses all available cores. Each lane has one logical batch in flight.
     #[arg(long, env = "LOADTEST_LANES", default_value_t = 4)]
     pub lanes: usize,
 
@@ -498,6 +500,7 @@ mod tests {
     #[test]
     fn continuous_mode_forces_dataflow_scheduling() {
         let arguments = RunArgs {
+            client_tuning: crate::tuning::ClientTuning::default(),
             warmup: DurationArg(Duration::ZERO),
             measure: DurationArg(Duration::from_secs(1)),
             capture_settle: DurationArg(Duration::ZERO),

@@ -15,7 +15,7 @@ arrowcol-catalog = { path = "../../../crates/arrowcol-catalog" }
 anyhow.workspace = true
 arrow = { version = "58.3", default-features = false, features = ["ipc"] }
 arrow-flight = { version = "58.3", default-features = false, features = ["flight-sql"] }
-arrow-ipc = { version = "58.3", default-features = false }
+arrow-ipc = { version = "58.3", default-features = false, features = ["lz4", "zstd"] }
 arrow-schema = { version = "58.3", default-features = false }
 arrow-deltalake = { path = "../../../crates/arrow-deltalake" }
 arrowcol-catalog-client = { path = "../../../crates/arrowcol-catalog-client" }
