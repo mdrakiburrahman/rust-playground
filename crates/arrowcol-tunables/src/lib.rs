@@ -1,6 +1,6 @@
 mod validation;
 
-pub use validation::{ApplyBoundary, Capability, DurabilityClass, capability_table};
+pub use validation::{ApplyBoundary, Capability, ComponentRole, DurabilityClass, capability_table};
 
 use serde::{Deserialize, Serialize};
 
@@ -18,8 +18,6 @@ pub struct Tunables {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parquet_writer: Option<ParquetWriterTunables>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub arrow_ipc: Option<ArrowIpcTunables>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wal: Option<WalTunables>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maintenance: Option<MaintenanceTunables>,
@@ -28,32 +26,54 @@ pub struct Tunables {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientTunables {
-    pub clients_per_table: Option<usize>,
-    pub generator_workers: Option<usize>,
-    pub rows_per_upload: Option<usize>,
-    pub seed: Option<u64>,
-    pub send_interval_ms: Option<u64>,
-    pub request_timeout_ms: Option<u64>,
-    pub max_attempts: Option<u32>,
-    pub precache_max_bytes: Option<u64>,
-    pub memory_budget_bytes: Option<u64>,
-    pub customer_cardinality: Option<usize>,
+    pub corpus_rows: Option<u64>,
+    pub corpus_bytes: Option<u64>,
+    pub batch_rows: Option<usize>,
+    pub workers: Option<usize>,
+    pub data_mode: Option<DataMode>,
+    pub string_width: Option<usize>,
+    pub cardinality: Option<usize>,
     pub null_fraction: Option<f64>,
-    pub payload_bytes: Option<usize>,
-    pub value_entropy: Option<ValueEntropy>,
-    pub key_skew: Option<f64>,
+    pub skew: Option<f64>,
+    pub entropy: Option<f64>,
+    pub seed: Option<u64>,
+    pub max_memory_bytes: Option<u64>,
+    pub interval_us: Option<u64>,
+    pub connections_per_worker: Option<usize>,
+    pub streams_per_worker: Option<usize>,
+    pub max_rows: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TransportTunables {
-    pub connections: Option<usize>,
-    pub keepalive_interval_ms: Option<u64>,
-    pub request_timeout_ms: Option<u64>,
-    pub max_frame_bytes: Option<u64>,
+    pub ipc_compression: Option<ArrowIpcCompression>,
+    pub dictionary_handling: Option<DictionaryHandling>,
+    pub max_flight_data_bytes: Option<u64>,
+    pub max_message_bytes: Option<u64>,
+    pub runtime_threads: Option<usize>,
+    pub grpc_send_compression: Option<GrpcCompression>,
+    pub grpc_accept_compression: Option<GrpcCompression>,
+    pub max_frame_bytes: Option<u32>,
+    pub header_table_bytes: Option<u32>,
+    pub max_header_list_bytes: Option<u32>,
     pub stream_window_bytes: Option<u32>,
     pub connection_window_bytes: Option<u32>,
-    pub grpc_compression: Option<GrpcCompression>,
+    pub adaptive_window: Option<bool>,
+    pub keepalive_interval_ms: Option<u64>,
+    pub keepalive_timeout_ms: Option<u64>,
+    pub keepalive_while_idle: Option<bool>,
+    pub connect_timeout_ms: Option<u64>,
+    pub request_timeout_ms: Option<u64>,
+    pub tcp_nodelay: Option<bool>,
+    pub tcp_keepalive_ms: Option<u64>,
+    pub tcp_keepalive_interval_ms: Option<u64>,
+    pub tcp_keepalive_retries: Option<u32>,
+    pub rate_limit_rps: Option<u64>,
+    pub endpoint_concurrency_limit: Option<usize>,
+    pub endpoint_buffer_size: Option<usize>,
+    pub connect_retries: Option<u32>,
+    pub retry_backoff_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -249,17 +269,33 @@ pub enum StatisticsLevel {
     Page,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ArrowIpcTunables {
-    pub compression: Option<ArrowIpcCompression>,
-}
-
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ArrowIpcCompression {
     None,
     Lz4Frame,
+    Zstd,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum DictionaryHandling {
+    Hydrate,
+    Resend,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum DataMode {
+    Shared,
+    Independent,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum GrpcCompression {
+    None,
+    Gzip,
     Zstd,
 }
 
@@ -303,20 +339,4 @@ pub struct MaintenanceTunables {
     pub max_partitions: Option<usize>,
     pub purge_enabled: Option<bool>,
     pub vacuum_enabled: Option<bool>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum ValueEntropy {
-    Low,
-    Medium,
-    High,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum GrpcCompression {
-    None,
-    Gzip,
-    Zstd,
 }

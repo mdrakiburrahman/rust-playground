@@ -954,6 +954,7 @@ dependencies = [
  "arrowcol-loadgen",
  "arrowcol-protocol",
  "arrowcol-routing",
+ "arrowcol-tunables",
  "async-trait",
  "axum",
  "bytes",
@@ -1092,6 +1093,15 @@ dependencies = [
  "tiberius",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "arrowcol-tunables"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
