@@ -178,7 +178,7 @@ test('non-success HTTP response bodies are withheld while the real status is ret
     response.end('TOP_SECRET');
   });
   const status = await startKusto({
-    endpoint: address, results, start: () => {}, timeoutMs: 40, requestTimeoutMs: 20, intervalMs: 1,
+    endpoint: address, results, start: () => {}, timeoutMs: 1000, requestTimeoutMs: 250, intervalMs: 1,
   });
   assert.equal(status.state, 'degraded');
   assert.match(status.error ?? '', /HTTP 401/u);

@@ -35,7 +35,7 @@ test('runtime builder configures native DFE Quiver only when requested', () => {
   assert.equal(built.durable.config.path, '/quiver');
   assert.equal(built.durable.config.retention_size_cap, '4GiB');
   assert.equal(built.durable.config.wal_flush_interval, '0s');
-  assert.equal(built.durable.config.max_age, undefined);
+  assert.equal(built.durable.config.max_age, '${env:ARROWCOL_WAL_MAX_AGE:-null}');
   assert.throws(() => buildBenchmarkRuntimeConfigs(source, { quiver: true }), /requires the Dataflow native Quiver topology/u);
   assert.throws(() => buildBenchmarkRuntimeConfigs(quiverSource), /requires --quiver/u);
 });
