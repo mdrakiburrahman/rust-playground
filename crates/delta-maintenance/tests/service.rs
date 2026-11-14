@@ -94,6 +94,7 @@ fn effective_configuration_is_reported_for_a_negative_probe() -> Result<()> {
     table(&root.path().join("events"))?;
     let output = service(root.path())?
         .env("ARROWCOL_MAINT_MIN_FILES", "4")
+        .env("ARROWCOL_MAINT_INPUT_READ_STRATEGY", "spool")
         .env("ARROWCOL_PARQUET_CONFIG", r#"{"defaults":{"compression":"snappy"}}"#)
         .args(["--operation", "optimize", "--min-files", "3"])
         .output()?;
@@ -110,6 +111,7 @@ fn effective_configuration_is_reported_for_a_negative_probe() -> Result<()> {
     let startup = event("arrowcol_maintenance_effective_config ")?;
     let table = event("arrowcol_maintenance_table_config ")?;
     assert_eq!(startup["table_policy"]["arrowcol.optimize.minFiles"], 3);
+    assert_eq!(startup["startup"]["input_read_strategy"], "spool");
     assert_eq!(table["table"], "events");
     assert_eq!(table["config"]["table_policy"]["arrowcol.optimize.minFiles"], 3);
     assert_eq!(table["config"]["operation_settings"]["layout_mode"], "automatic");
@@ -129,12 +131,17 @@ fn effective_configuration_is_reported_for_a_negative_probe() -> Result<()> {
         .ok_or_else(|| anyhow!("missing startup configuration"))?;
     let config: serde_json::Value = serde_json::from_str(config)?;
     assert_eq!(config["table_policy"]["arrowcol.optimize.minFiles"], 4);
+    assert_eq!(config["startup"]["input_read_strategy"], "memory");
+    let invalid = service(root.path())?
+        .args(["--operation", "optimize", "--input-read-strategy", "invalid"])
+        .output()?;
+    assert!(!invalid.status.success());
     Ok(())
 }
 
 #[test]
 fn shared_parquet_policy_controls_sorted_and_unsorted_compaction() -> Result<()> {
-    for sorted in [false, true] {
+    for (sorted, strategy) in [(false, "memory"), (true, "memory"), (false, "spool"), (true, "spool")] {
         let root = tempfile::tempdir()?;
         let path = root.path().join("events");
         table(&path)?;
@@ -148,6 +155,8 @@ fn shared_parquet_policy_controls_sorted_and_unsorted_compaction() -> Result<()>
                 "optimize",
                 "--sealed-final",
                 "--apply",
+                "--input-read-strategy",
+                strategy,
                 "--layout-enabled",
                 if sorted { "true" } else { "false" },
                 "--layout-sort-columns",

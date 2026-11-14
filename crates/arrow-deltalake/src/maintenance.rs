@@ -24,10 +24,12 @@ use delta_kernel_default_engine::executor::TaskExecutor;
 use delta_kernel_default_engine::parquet::DataFileMetadata;
 use delta_kernel_default_engine::stats::FileStatsAccumulator;
 use delta_kernel_default_engine::{DefaultEngineBuilder, build_add_file_metadata};
+use futures::TryStreamExt;
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::properties::WriterProperties;
+use parquet::file::reader::ChunkReader;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::{self, Display, Formatter};
@@ -36,6 +38,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::io::AsyncWriteExt;
 use url::Url;
 
 /// Serialized plan format understood by this build.
@@ -1514,6 +1517,17 @@ fn tracing_note(message: &str) {
     }
 }
 
+/// OPTIMIZE input buffering strategy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InputReadStrategy {
+    /// Fetch each complete input into memory.
+    #[default]
+    Memory,
+    /// Stream one object response into a temporary local file.
+    Spool,
+}
+
 /// OPTIMIZE bounds. Every limit is enforced on plan and again on apply.
 #[derive(Clone, Debug)]
 pub struct OptimizeConfig {
@@ -1543,6 +1557,8 @@ pub struct OptimizeConfig {
     /// Decoded Arrow bytes per input batch.
     pub max_batch_bytes: usize,
     pub batch_rows: usize,
+    /// Input buffering strategy; spool uses temporary local disk.
+    pub input_read_strategy: InputReadStrategy,
     pub max_output_file_bytes: u64,
     pub max_active_files: usize,
     /// Whole-output sort using the shared layout helper.
@@ -1570,6 +1586,7 @@ impl Default for OptimizeConfig {
             max_row_group_bytes: 128 * 1024 * 1024,
             max_batch_bytes: 64 * 1024 * 1024,
             batch_rows: 8192,
+            input_read_strategy: InputReadStrategy::Memory,
             max_output_file_bytes: 1023 * 1024 * 1024,
             max_active_files: 1_000_000,
             layout: None,
@@ -2080,17 +2097,64 @@ impl DeltaTable {
         let store = Arc::clone(&self.store);
         let limit = config.small_file_bytes;
         let expected = file.size;
-        let bytes = shared_executor()?.block_on(async move {
-            let object = store.get(&path).await?;
-            if object.meta.size != expected || object.meta.size >= limit {
-                return Err(fail(
-                    MaintenanceErrorKind::StalePlan,
-                    "input object size differs from the planned size",
-                ));
+        match config.input_read_strategy {
+            InputReadStrategy::Memory => {
+                let bytes = shared_executor()?.block_on(async move {
+                    let object = store.get(&path).await?;
+                    if object.meta.size != expected || object.meta.size >= limit {
+                        return Err(fail(
+                            MaintenanceErrorKind::StalePlan,
+                            "input object size differs from the planned size",
+                        ));
+                    }
+                    Ok(object.bytes().await?)
+                })?;
+                self.decode_input(bytes, file, config, decoded, logical, writer)
             }
-            Ok(object.bytes().await?)
-        })?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)?;
+            InputReadStrategy::Spool => {
+                let temp = tempfile::tempfile().context("create temporary OPTIMIZE input")?;
+                let temp = shared_executor()?.block_on(async move {
+                    let object = store.get(&path).await?;
+                    if object.meta.size != expected || object.meta.size >= limit {
+                        return Err(fail(
+                            MaintenanceErrorKind::StalePlan,
+                            "input object size differs from the planned size",
+                        ));
+                    }
+                    let mut stream = object.into_stream();
+                    let mut temp = tokio::fs::File::from_std(temp);
+                    let mut size = 0_u64;
+                    while let Some(chunk) = stream.try_next().await? {
+                        size = size.checked_add(chunk.len() as u64).context("input size overflow")?;
+                        if size > expected {
+                            return Err(fail(MaintenanceErrorKind::StalePlan, "input object grew during read"));
+                        }
+                        temp.write_all(&chunk).await.context("write temporary OPTIMIZE input")?;
+                    }
+                    if size != expected {
+                        return Err(fail(
+                            MaintenanceErrorKind::StalePlan,
+                            "input object was truncated during read",
+                        ));
+                    }
+                    temp.flush().await.context("flush temporary OPTIMIZE input")?;
+                    Ok(temp.into_std().await)
+                })?;
+                self.decode_input(temp, file, config, decoded, logical, writer)
+            }
+        }
+    }
+
+    fn decode_input<T: ChunkReader + 'static>(
+        &self,
+        input: T,
+        file: &DataFile,
+        config: &OptimizeConfig,
+        decoded: &mut u64,
+        logical: &SchemaRef,
+        writer: &mut BinWriter<'_>,
+    ) -> Result<u64> {
+        let builder = ParquetRecordBatchReaderBuilder::try_new(input)?;
         for group in builder.metadata().row_groups() {
             if u64::try_from(group.total_byte_size()).unwrap_or(u64::MAX) > config.max_row_group_bytes {
                 return Err(fail(
