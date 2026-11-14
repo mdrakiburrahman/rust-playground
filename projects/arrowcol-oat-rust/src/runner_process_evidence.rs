@@ -121,7 +121,21 @@ fn public_tuning_value(value: &Value) -> Option<Value> {
 
 fn process_configurations(text: &str) -> Result<Value> {
     let mut configuration = json!({});
+    let mut resolution_seen = false;
     for line in text.lines() {
+        if let Some(value) = line.strip_prefix("OAT_CLIENT_RESOLUTION ") {
+            if resolution_seen {
+                bail!("duplicate client resolution source");
+            }
+            resolution_seen = true;
+            let value: Value = serde_json::from_str(value).context("invalid client resolution source")?;
+            if !value.is_object() || value["version"] != 1 {
+                bail!("unsupported client resolution source");
+            }
+            configuration["resolution"] =
+                public_tuning_value(&value).context("client resolution source was not public")?;
+            continue;
+        }
         let value = [
             "arrowcol_effective_config ",
             "arrowcol_router_effective_config ",
@@ -187,6 +201,71 @@ fn contains_requested(observed: &Value, requested: &Value) -> bool {
     }
 }
 
+fn client_sentinel_value(
+    config: &OatConfig,
+    variable: &str,
+    requested: &Value,
+    observed: &Value,
+) -> Result<Option<Value>> {
+    if *requested != 0 {
+        return Ok(None);
+    }
+    let field = match variable {
+        "ARROWCOL_CLIENT_WORKERS" => "workers",
+        "ARROWCOL_CLIENT_RUNTIME_THREADS" => "runtime_threads",
+        "ARROWCOL_CLIENT_BATCH_ROWS" => "batch_rows",
+        "ARROWCOL_CLIENT_CORPUS_ROWS" => "corpus_rows",
+        "ARROWCOL_CLIENT_STREAMS_PER_WORKER" => "streams_per_worker",
+        _ => return Ok(None),
+    };
+    let proof = observed
+        .get("resolution")
+        .context("automatic client tuning requires consumer resolution-source evidence")?;
+    if proof["version"] != 1
+        || proof["requested"][field] != 0
+        || proof["legacy"]["rows"] != config.rows_per_table
+        || proof["legacy"]["concurrency"] != config.dmv_concurrency
+    {
+        bail!("client sentinel resolution source disagrees with requested tuning or legacy inputs");
+    }
+    let resolved = match field {
+        "workers" | "runtime_threads" => {
+            let cores = proof["available_parallelism"]
+                .as_u64()
+                .filter(|cores| (1..=1024).contains(cores))
+                .context("automatic client tuning has no bounded available-parallelism observation")?;
+            json!(cores)
+        }
+        "batch_rows" => json!(config.rows_per_table),
+        "streams_per_worker" => json!(config.dmv_concurrency),
+        "corpus_rows" => {
+            let bytes = config
+                .tunables
+                .client
+                .as_ref()
+                .and_then(|client| client.corpus_bytes)
+                .unwrap_or(0);
+            if proof["requested"]["corpus_bytes"] != bytes || proof["resolved"]["corpus_bytes"] != bytes {
+                bail!("client corpus resolution source disagrees with configured byte budget");
+            }
+            let (source, rows) = if bytes > 0 {
+                ("corpus_bytes_estimate_deferred_until_preparation", 0)
+            } else {
+                ("legacy_rows", config.rows_per_table)
+            };
+            if proof["corpus_rows_source"] != source {
+                bail!("client corpus resolution source is inconsistent");
+            }
+            json!(rows)
+        }
+        _ => bail!("client sentinel adapter is missing"),
+    };
+    if proof["resolved"][field] != resolved {
+        bail!("client resolved tuning contradicts its observed resolution inputs");
+    }
+    Ok(Some(resolved))
+}
+
 fn router_readback_path(variable: &str) -> Result<String> {
     let field = variable
         .strip_prefix("ARROWCOL_ROUTER_")
@@ -245,6 +324,11 @@ fn verify_process_configuration(config: &OatConfig, role: ComponentRole, observe
             continue;
         }
         let mut expected = serde_json::from_str::<Value>(&expected).unwrap_or(Value::String(expected));
+        if matches!(role, ComponentRole::Client)
+            && let Some(resolved) = client_sentinel_value(config, &name, &expected, observed)?
+        {
+            expected = resolved;
+        }
         if name == "ARROWCOL_ROUTER_UPSTREAM_PING_INTERVAL_SECONDS" && expected == 0 {
             expected = Value::Null;
         }
@@ -579,6 +663,102 @@ mod startup_readback_tests {
             "arrowcol_effective_config {\"component\":\"exporter\",\"config\":{\"routing\":{\"type\":\"sql_server\",\"connect_timeout\":\"17s\",\"command_timeout\":\"31s\"},\"authority_timeout\":\"19s\"}}\n"
         ))?;
         verify_process_configuration(&config, ComponentRole::Collector, &collector)?;
+        Ok(())
+    }
+
+    #[test]
+    fn client_zero_sentinels_require_matching_consumer_resolution_inputs() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tunables = serde_json::from_value(json!({"client":{
+            "workers":0,"runtime_threads":0,"batch_rows":0,"corpus_rows":0,"streams_per_worker":0
+        }}))?;
+        let proof = json!({"version":1,"available_parallelism":3,
+            "requested":{"workers":0,"runtime_threads":0,"batch_rows":0,"corpus_rows":0,"corpus_bytes":0,"streams_per_worker":0},
+            "legacy":{"rows":config.rows_per_table,"concurrency":config.dmv_concurrency},
+            "resolved":{"workers":3,"runtime_threads":3,"batch_rows":config.rows_per_table,
+                "corpus_rows":config.rows_per_table,"corpus_bytes":0,"streams_per_worker":config.dmv_concurrency},
+            "corpus_rows_source":"legacy_rows"});
+        let text = format!(
+            "OAT_CLIENT_RESOLUTION {proof}\nOAT_CLIENT_EFFECTIVE_CONFIG {}\n",
+            proof["resolved"]
+        );
+        let observed = process_configurations(&text)?;
+        verify_process_configuration(&config, ComponentRole::Client, &observed)?;
+        let mut invalid = observed.clone();
+        invalid
+            .as_object_mut()
+            .context("missing readback")?
+            .remove("resolution");
+        assert!(verify_process_configuration(&config, ComponentRole::Client, &invalid).is_err());
+        invalid = observed.clone();
+        invalid["resolution"]["available_parallelism"] = json!(4);
+        assert!(verify_process_configuration(&config, ComponentRole::Client, &invalid).is_err());
+        invalid = observed.clone();
+        invalid["resolution"]["legacy"]["rows"] = json!(config.rows_per_table + 1);
+        assert!(verify_process_configuration(&config, ComponentRole::Client, &invalid).is_err());
+        invalid = observed;
+        invalid["runtime_threads"] = json!(4);
+        assert!(verify_process_configuration(&config, ComponentRole::Client, &invalid).is_err());
+        config.tunables = serde_json::from_value(json!({"client":{"corpus_rows":0,"corpus_bytes":4096}}))?;
+        let deferred = json!({"corpus_rows":0,"corpus_bytes":4096,"resolution":{
+            "version":1,"requested":{"corpus_rows":0,"corpus_bytes":4096},
+            "legacy":{"rows":config.rows_per_table,"concurrency":config.dmv_concurrency},
+            "resolved":{"corpus_rows":0,"corpus_bytes":4096},
+            "corpus_rows_source":"corpus_bytes_estimate_deferred_until_preparation"}});
+        verify_process_configuration(&config, ComponentRole::Client, &deferred)?;
+        assert!(process_configurations(&format!("{text}OAT_CLIENT_RESOLUTION {proof}\n")).is_err());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires cargo build --package collector-chain --bin arrowcol-dmv"]
+    fn automatic_values_are_accepted_from_actual_client_binary() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tunables = serde_json::from_value(json!({"client":{
+            "workers":0,"runtime_threads":0,"batch_rows":0,"corpus_rows":0,"streams_per_worker":0
+        }}))?;
+        let binary = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join("debug")
+            .join(format!("arrowcol-dmv{}", std::env::consts::EXE_SUFFIX));
+        let mut command = std::process::Command::new(binary);
+        command.args([
+            "--endpoint",
+            "http://127.0.0.1:0",
+            "--table",
+            &config.tables[0],
+            "--rows",
+            &config.rows_per_table.to_string(),
+            "--concurrency",
+            &config.dmv_concurrency.to_string(),
+        ]);
+        command.envs(role_environment(&config, ComponentRole::Client)?);
+        let output = command
+            .output()
+            .context("launch actual client binary for startup propagation smoke")?;
+        assert!(
+            !output.status.success(),
+            "unreachable endpoint must not look successful"
+        );
+        let text = format!(
+            "{}\n{}",
+            String::from_utf8(output.stdout)?,
+            String::from_utf8(output.stderr)?
+        );
+        let observed = process_configurations(&text)?;
+        verify_process_configuration(&config, ComponentRole::Client, &observed)?;
+        assert!(observed["workers"].as_u64().is_some_and(|workers| workers > 0));
+        assert_eq!(observed["workers"], observed["resolution"]["available_parallelism"]);
+        assert_eq!(
+            observed["runtime_threads"],
+            observed["resolution"]["available_parallelism"]
+        );
         Ok(())
     }
 }
