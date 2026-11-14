@@ -165,6 +165,7 @@ impl CpuPool {
         Ok(Self { sender })
     }
 
+    #[cfg(test)]
     fn run<F, T>(&self, task: F) -> Result<T>
     where
         F: FnOnce() -> T + Send + 'static,
@@ -221,6 +222,7 @@ fn cpu_pool() -> Result<&'static CpuPool> {
 ///
 /// # Errors
 /// Returns invalid startup configuration or CPU pool initialization failure.
+#[cfg(test)]
 pub fn run_cpu<F, T>(task: F) -> Result<T>
 where
     F: FnOnce() -> T + Send + 'static,
@@ -549,7 +551,8 @@ mod tests {
                 (maximum + 1).to_string(),
             ] {
                 let error = DeltaRuntimeConfig::from_lookup(|name| Ok((name == knob).then(|| value.clone())))
-                    .expect_err("invalid override must fail");
+                    .err()
+                    .context("invalid override must fail")?;
                 assert!(format!("{error:#}").contains(&knob));
             }
         }
@@ -575,7 +578,8 @@ mod tests {
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = pool.run(|| std::panic::panic_any(73_u32));
         }))
-        .expect_err("CPU panic must reach the caller");
+        .err()
+        .context("CPU panic must reach the caller")?;
         assert_eq!(panic.downcast_ref::<u32>(), Some(&73));
         assert_eq!(pool.run(|| 42)?, 42);
         Ok(())
@@ -589,9 +593,10 @@ mod tests {
         let active_pool = Arc::clone(&pool);
         let caller = std::thread::spawn(move || {
             active_pool.run(move || {
-                started.send(()).expect("notify test");
-                wait_release.recv().expect("release test");
-            })
+                started.send(()).context("notify CPU test")?;
+                wait_release.recv().context("release CPU test")?;
+                Ok::<_, anyhow::Error>(())
+            })?
         });
         wait_started.recv_timeout(Duration::from_secs(5))?;
         pool.sender
@@ -602,7 +607,7 @@ mod tests {
             Err(tokio::sync::mpsc::error::TrySendError::Full(_))
         ));
         release.send(())?;
-        caller.join().expect("CPU caller panicked")?;
+        caller.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
         assert_eq!(pool.run(|| 42)?, 42);
         Ok(())
     }
@@ -615,9 +620,10 @@ mod tests {
         let active_pool = Arc::clone(&pool);
         let caller = std::thread::spawn(move || {
             active_pool.run(move || {
-                started.send(()).expect("notify test");
-                wait_release.recv().expect("release test");
-            })
+                started.send(()).context("notify CPU test")?;
+                wait_release.recv().context("release CPU test")?;
+                Ok::<_, anyhow::Error>(())
+            })?
         });
         wait_started.recv_timeout(Duration::from_secs(5))?;
         pool.sender
@@ -628,7 +634,7 @@ mod tests {
         assert!(!pending.is_finished());
         release.send(())?;
         assert_eq!(tokio::time::timeout(Duration::from_secs(5), pending).await???, 42);
-        caller.join().expect("CPU caller panicked")?;
+        caller.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
         Ok(())
     }
 
@@ -648,7 +654,8 @@ mod tests {
         assert_eq!(answer, 42);
         let panic = tokio::spawn(run_cpu_async(|| std::panic::panic_any(73_u32)))
             .await
-            .expect_err("CPU panic must reach the async caller");
+            .err()
+            .context("CPU panic must reach the async caller")?;
         assert_eq!(panic.into_panic().downcast_ref::<u32>(), Some(&73));
         assert_eq!(run_cpu_async(|| 42).await?, 42);
         Ok(())
