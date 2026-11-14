@@ -3,6 +3,8 @@ struct CellEvidence {
     downstream_comment: Option<&'static str>,
     resource_samples: Vec<ResourceSample>,
     resource_sampling_failures: u64,
+    resource_samples_dropped: u64,
+    client_reports: HashMap<String, Vec<Value>>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -15,32 +17,24 @@ fn local_downstream_optional(kind: crate::config::OatMode) -> bool {
     kind == crate::config::OatMode::Local
 }
 
+#[derive(Debug)]
+struct LocalDownstreamUnavailable;
+
+impl std::fmt::Display for LocalDownstreamUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("local Kustainer observation is unavailable")
+    }
+}
+
+impl std::error::Error for LocalDownstreamUnavailable {}
+
 impl CellEvidence {
     fn downstream_unavailable(&mut self, reason: &'static str) {
         self.downstream_comment.get_or_insert(reason);
-        tracing::warn!(reason, "downstream observation unavailable; preserving local collector evidence");
-    }
-
-    async fn sample_resources(&mut self, platform: &dyn Platform, config: &OatConfig, start: u64, end: u64) {
-        let Ok(now) = unix_time_ms_u64() else {
-            self.resource_sampling_failures += 1;
-            return;
-        };
-        if now < start || now >= end {
-            return;
-        }
-        match platform.sample_resources(config).await {
-            Ok(metrics) => match unix_time_ms_u64() {
-                Ok(sampled_at_unix_ms) if sampled_at_unix_ms < end => {
-                    self.resource_samples.push(ResourceSample { sampled_at_unix_ms, metrics });
-                }
-                _ => self.resource_sampling_failures += 1,
-            },
-            Err(_) => {
-                self.resource_sampling_failures += 1;
-                tracing::warn!("resource sample unavailable");
-            }
-        }
+        tracing::warn!(
+            reason,
+            "downstream observation unavailable; preserving local collector evidence"
+        );
     }
 
     fn resource_summary(&self) -> Option<ResourceMetrics> {
@@ -48,15 +42,32 @@ impl CellEvidence {
             return None;
         }
         Some(ResourceMetrics {
-            cpu_millicores: self.resource_samples.iter().map(|sample| sample.metrics.cpu_millicores).sum::<f64>()
+            cpu_millicores: self
+                .resource_samples
+                .iter()
+                .map(|sample| sample.metrics.cpu_millicores)
+                .sum::<f64>()
                 / self.resource_samples.len() as f64,
-            memory_bytes: self.resource_samples.iter().map(|sample| sample.metrics.memory_bytes).max()?,
+            memory_bytes: self
+                .resource_samples
+                .iter()
+                .map(|sample| sample.metrics.memory_bytes)
+                .max()?,
         })
     }
 
-    fn for_table(&self, client: Option<&ClientMetrics>) -> Value {
+    fn record_client(&mut self, table: &str, output: &str) -> Result<()> {
+        self.client_reports
+            .entry(table.to_owned())
+            .or_default()
+            .push(client_phase_evidence(output)?);
+        Ok(())
+    }
+
+    fn for_table(&self, table: &str, client: Option<&ClientMetrics>) -> Value {
         json!({
             "version": 1,
+            "client_phase_reports": self.client_reports.get(table),
             "downstream_status": if self.downstream_comment.is_some() { "unavailable" } else { "observed_or_not_attempted" },
             "downstream_comment": self.downstream_comment,
             "resources": {
@@ -65,6 +76,10 @@ impl CellEvidence {
                 "memory_summary": "maximum_observed_sample_not_peak_rss",
                 "samples": self.resource_samples,
                 "sampling_failures": self.resource_sampling_failures,
+                "samples_dropped": self.resource_samples_dropped,
+                "retention": "most_recent_4096_samples",
+                "cadence_seconds": 1,
+                "sample_timeout_seconds": 3,
                 "unavailable_reason": self.resource_samples.is_empty().then_some("no_measurement_window_resource_samples"),
             },
             "rows": {
@@ -88,6 +103,88 @@ impl CellEvidence {
     }
 }
 
+enum ResourceSamplerSource {
+    Aks,
+    Local {
+        run_id: String,
+        environment: HashMap<String, String>,
+    },
+}
+
+struct ResourceSampler(Option<JoinHandle<Result<CellEvidence>>>);
+
+impl Drop for ResourceSampler {
+    fn drop(&mut self) {
+        if let Some(task) = &self.0 {
+            task.abort();
+        }
+    }
+}
+
+impl ResourceSampler {
+    fn start(source: Option<ResourceSamplerSource>, config: OatConfig, start: u64, end: u64) -> Self {
+        Self(source.map(|source| {
+            tokio::spawn(async move {
+                let mut evidence = CellEvidence::default();
+                let mut interval = tokio::time::interval(Duration::from_secs(1));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    interval.tick().await;
+                    let now = unix_time_ms_u64()?;
+                    if now >= end {
+                        break;
+                    }
+                    if now < start {
+                        continue;
+                    }
+                    let sample = async {
+                        match &source {
+                            ResourceSamplerSource::Aks => collect_aks_metrics(&config).await,
+                            ResourceSamplerSource::Local { run_id, environment } => {
+                                collect_local_metrics(&config, run_id, environment).await
+                            }
+                        }
+                    };
+                    let timeout_ms = 3_000.min(end - now);
+                    match tokio::time::timeout(Duration::from_millis(timeout_ms), sample).await {
+                        Ok(Ok(metrics)) => {
+                            let sampled_at_unix_ms = unix_time_ms_u64()?;
+                            if sampled_at_unix_ms < end {
+                                if evidence.resource_samples.len() == 4096 {
+                                    evidence.resource_samples.remove(0);
+                                    evidence.resource_samples_dropped += 1;
+                                }
+                                evidence.resource_samples.push(ResourceSample {
+                                    sampled_at_unix_ms,
+                                    metrics,
+                                });
+                            } else {
+                                evidence.resource_sampling_failures += 1;
+                            }
+                        }
+                        _ => {
+                            evidence.resource_sampling_failures += 1;
+                            tracing::warn!("resource sample unavailable or exceeded its bounded deadline");
+                        }
+                    }
+                }
+                Ok(evidence)
+            })
+        }))
+    }
+
+    async fn finish(mut self, evidence: &mut CellEvidence) -> Result<()> {
+        if let Some(task) = self.0.as_mut() {
+            let sampled = task.await.context("resource sampler task failed")??;
+            self.0.take();
+            evidence.resource_samples = sampled.resource_samples;
+            evidence.resource_sampling_failures = sampled.resource_sampling_failures;
+            evidence.resource_samples_dropped = sampled.resource_samples_dropped;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod measurement_evidence_tests {
     use super::*;
@@ -98,24 +195,332 @@ mod measurement_evidence_tests {
         assert!(!local_downstream_optional(crate::config::OatMode::Aks));
         let mut evidence = CellEvidence::default();
         evidence.downstream_unavailable("local_qap_initialization_unavailable");
-        let public = evidence.for_table(None);
+        let public = evidence.for_table("table", None);
         assert_eq!(public["downstream_status"], "unavailable");
         assert!(public["rows"]["delta_committed"].is_null());
         assert!(public["compression_ratio"].is_null());
     }
+}
 
-    #[test]
-    fn resource_summary_is_observed_mean_and_max_not_an_end_snapshot() {
-        let mut evidence = CellEvidence::default();
-        assert!(evidence.resource_summary().is_none());
-        for (cpu_millicores, memory_bytes) in [(100.0, 200), (300.0, 100)] {
-            evidence.resource_samples.push(ResourceSample {
-                sampled_at_unix_ms: 1,
-                metrics: ResourceMetrics { cpu_millicores, memory_bytes },
-            });
-        }
-        let metrics = evidence.resource_summary().unwrap();
-        assert_eq!(metrics.cpu_millicores, 200.0);
-        assert_eq!(metrics.memory_bytes, 200);
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct WorkerCounterSnapshot {
+    worker: u64,
+    attempted_rows: u64,
+    attempted_bytes: u64,
+    completed_rows: u64,
+    completed_bytes: u64,
+    error_rows: u64,
+    error_bytes: u64,
+    cancelled_rows: u64,
+    cancelled_bytes: u64,
+    best_effort_streams: u64,
+    durable_streams: u64,
+    send_latency_us: Option<ClientLatency>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct ClientLatency {
+    p50: Option<u64>,
+    p95: Option<u64>,
+    p99: Option<u64>,
+    samples: u64,
+    precision: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ClientCounterSnapshot {
+    version: u64,
+    phase: String,
+    scope: String,
+    elapsed_seconds: f64,
+    workers: Vec<WorkerCounterSnapshot>,
+}
+
+fn client_phase_evidence(output: &str) -> Result<Value> {
+    let snapshots = output
+        .lines()
+        .filter_map(|line| line.strip_prefix("OAT_CLIENT_METRICS "))
+        .map(serde_json::from_str::<ClientCounterSnapshot>)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("invalid client counter snapshot")?;
+    if snapshots.is_empty() {
+        return Ok(json!({ "unavailable_reason": "client_did_not_report_phase_counters" }));
     }
+    client_snapshot_delta(&snapshots)
+}
+
+#[cfg(test)]
+mod downstream_runner_tests {
+    use super::*;
+
+    #[derive(Clone, Copy)]
+    enum Fault {
+        InitUnavailable,
+        InitRequired,
+        InitTimeout,
+        ObservationUnavailable,
+        Collector,
+        Pinning,
+    }
+
+    struct FaultPlatform {
+        kind: crate::config::OatMode,
+        fault: Fault,
+        endpoint: String,
+        start: std::sync::atomic::AtomicU64,
+        unresolved: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Platform for FaultPlatform {
+        fn kind(&self) -> crate::config::OatMode {
+            self.kind
+        }
+        fn workload_endpoint(&self, _: &OatConfig) -> String {
+            self.endpoint.clone()
+        }
+        fn router_metrics_endpoint(&self, _: &OatConfig) -> Result<String> {
+            Ok(format!("{}/metrics", self.endpoint))
+        }
+        fn qap_endpoint(&self, _: &OatConfig) -> String {
+            self.endpoint.clone()
+        }
+        async fn ensure_stack(&mut self, _: &OatConfig) -> Result<()> {
+            Ok(())
+        }
+        async fn scale_arrowcols(&mut self, _: &OatConfig, _: u32, _: u32) -> Result<()> {
+            Ok(())
+        }
+        async fn initialize_run_table_pins(&self, _: &OatConfig, _: &str, _: &str, _: u64, _: u64) -> Result<()> {
+            Ok(())
+        }
+        fn qap_observation_mode(&self) -> arrowcol_loadgen::ObservationMode {
+            arrowcol_loadgen::ObservationMode::Local
+        }
+        fn qap_database(&self, _: &OatConfig) -> Result<String> {
+            Ok("loadtest".to_owned())
+        }
+        async fn initialize_qap(&mut self, _: &OatConfig, _: &str, _: &[String]) -> Result<Vec<String>> {
+            match self.fault {
+                Fault::InitRequired => bail!("required_binding_setup_failed"),
+                Fault::InitTimeout => std::future::pending().await,
+                Fault::ObservationUnavailable => Ok(vec!["observed".to_owned()]),
+                _ => Err(anyhow::anyhow!(LocalDownstreamUnavailable)),
+            }
+        }
+        fn mark_qap_outcome_unresolved(&mut self) {
+            self.unresolved = true;
+        }
+        async fn prepare_client_fleet(&self, _: &OatConfig, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn start_client(
+            &self,
+            _: &OatConfig,
+            _: &str,
+            table: &str,
+            _: usize,
+            _: &[String],
+        ) -> Result<ClientHandle> {
+            Ok(ClientHandle {
+                client_id: "client".to_owned(),
+                table: table.to_owned(),
+                process: ClientProcess::Local {
+                    container_id: "fake".to_owned(),
+                },
+            })
+        }
+        async fn poll_client(&self, _: &OatConfig, _: &ClientHandle) -> Result<ClientProgress> {
+            let armed = self.start.load(std::sync::atomic::Ordering::SeqCst) != 0;
+            Ok(ClientProgress {
+                ready: true,
+                schedule_received: armed,
+                completed: armed,
+                failure: matches!(self.fault, Fault::Collector).then(|| "collector_failed".to_owned()),
+                output: String::new(),
+            })
+        }
+        async fn arm_clients(&self, _: &OatConfig, _: &str, start: u64) -> Result<()> {
+            self.start.store(start, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn finish_client(&self, config: &OatConfig, _: ClientHandle) -> Result<String> {
+            let start = self.start.load(std::sync::atomic::Ordering::SeqCst) + config.warmup_seconds * 1000;
+            let end = start + config.measure_seconds * 1000;
+            Ok(format!(
+                "measured_rows=100 measured_seconds={} rows_per_second={} measurement_window_start_unix_ms={start} measurement_window_end_unix_ms={end} measurement_started_unix_ms={start}\n",
+                config.measure_seconds,
+                100.0 / config.measure_seconds as f64
+            ))
+        }
+        async fn cancel_client(&self, _: &OatConfig, _: &ClientHandle) -> Result<()> {
+            Ok(())
+        }
+        async fn cleanup(&mut self, _: &OatConfig) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn run_fault(fault: Fault, kind: crate::config::OatMode) -> Result<(Vec<OatResult>, FaultPlatform)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let metric = if matches!(fault, Fault::Pinning) {
+            "arrowcol_router_failures_total{reason=\"pinning_violation\"} 1\n"
+        } else {
+            "arrowcol_router_table_owners{pool=\"dataflow\",catalog=\"telemetry\",schema=\"sqlserver\",table=\"sqlserver_active_sessions\",collector=\"collector-a\",state=\"active\"} 1\n"
+        };
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new()
+                    .route("/metrics", axum::routing::get(move || async move { metric }))
+                    .fallback(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
+            )
+            .await
+        });
+        let mut platform = FaultPlatform {
+            kind,
+            fault,
+            endpoint,
+            start: std::sync::atomic::AtomicU64::new(0),
+            unresolved: false,
+        };
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.platform.kind = kind;
+        config.qap_timeout_seconds = 1;
+        let result = run_matrix_cell(
+            &config,
+            "orchestration",
+            "11111111-1111-4111-8111-111111111111",
+            1,
+            1,
+            &mut platform,
+        )
+        .await;
+        server.abort();
+        Ok((result?, platform))
+    }
+
+    #[tokio::test]
+    async fn unavailable_initialization_and_observation_preserve_local_measurements_only() -> Result<()> {
+        for fault in [
+            Fault::InitUnavailable,
+            Fault::InitTimeout,
+            Fault::ObservationUnavailable,
+        ] {
+            let (rows, platform) = run_fault(fault, crate::config::OatMode::Local).await?;
+            assert_eq!(rows[0].status, "succeeded");
+            assert_eq!(rows[0].rows, Some(100));
+            assert!(rows[0].qap.completion_percent.is_none());
+            let evidence: Value = serde_json::from_str(rows[0].evidence_json.as_deref().context("evidence")?)?;
+            assert_eq!(evidence["downstream_status"], "unavailable");
+            if matches!(fault, Fault::InitTimeout) {
+                assert!(platform.unresolved);
+            }
+            let (rows, _) = run_fault(fault, crate::config::OatMode::Aks).await?;
+            assert_eq!(rows[0].status, "failed");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_degradation_never_hides_required_setup_collector_or_pinning_failures() -> Result<()> {
+        for fault in [Fault::InitRequired, Fault::Collector, Fault::Pinning] {
+            let (rows, _) = run_fault(fault, crate::config::OatMode::Local).await?;
+            assert_ne!(rows[0].status, "succeeded");
+            assert!(rows[0].failure.is_some());
+        }
+        Ok(())
+    }
+}
+fn client_snapshot_delta(snapshots: &[ClientCounterSnapshot]) -> Result<Value> {
+    let phase = |name| -> Result<&ClientCounterSnapshot> {
+        let mut matches = snapshots.iter().filter(|snapshot| snapshot.phase == name);
+        let snapshot = matches.next().context("missing client counter phase")?;
+        if matches.next().is_some() {
+            bail!("duplicate client counter phase");
+        }
+        Ok(snapshot)
+    };
+    for snapshot in snapshots {
+        if snapshot.version != 1
+            || snapshot.scope != "process_cumulative"
+            || !snapshot.elapsed_seconds.is_finite()
+            || snapshot.elapsed_seconds < 0.0
+        {
+            bail!("unsupported client counter contract");
+        }
+        let mut workers = HashSet::new();
+        if snapshot.workers.is_empty() || snapshot.workers.iter().any(|worker| !workers.insert(worker.worker)) {
+            bail!("empty or duplicate client counter workers");
+        }
+    }
+    let start = phase("measurement_start")?;
+    let end = phase("completed")?;
+    if end.elapsed_seconds < start.elapsed_seconds || end.workers.len() != start.workers.len() {
+        bail!("client counter interval or worker count changed");
+    }
+    let mut deltas = Vec::new();
+    for worker in &end.workers {
+        let before = start
+            .workers
+            .iter()
+            .find(|before| before.worker == worker.worker)
+            .context("client counter worker identity changed")?;
+        let difference = |after: u64, before: u64| after.checked_sub(before).context("client counter reset");
+        if let Some(latency) = &worker.send_latency_us {
+            if latency.precision != "power_of_two_upper_bound"
+                || [latency.p50, latency.p95, latency.p99]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .windows(2)
+                    .any(|pair| pair[0] > pair[1])
+            {
+                bail!("invalid client latency evidence");
+            }
+        }
+        deltas.push(json!({
+            "worker": worker.worker,
+            "attempted_rows": difference(worker.attempted_rows, before.attempted_rows)?,
+            "attempted_bytes": difference(worker.attempted_bytes, before.attempted_bytes)?,
+            "client_completed_rows": difference(worker.completed_rows, before.completed_rows)?,
+            "client_completed_bytes": difference(worker.completed_bytes, before.completed_bytes)?,
+            "error_rows": difference(worker.error_rows, before.error_rows)?,
+            "error_bytes": difference(worker.error_bytes, before.error_bytes)?,
+            "cancelled_rows": difference(worker.cancelled_rows, before.cancelled_rows)?,
+            "cancelled_bytes": difference(worker.cancelled_bytes, before.cancelled_bytes)?,
+            "best_effort_streams": difference(worker.best_effort_streams, before.best_effort_streams)?,
+            "durable_streams": difference(worker.durable_streams, before.durable_streams)?,
+            "process_cumulative_send_latency_us": worker.send_latency_us,
+        }));
+    }
+    Ok(json!({
+        "scope": "measurement_start_to_completed_snapshot_delta_not_unique_delivery",
+        "elapsed_seconds": end.elapsed_seconds - start.elapsed_seconds,
+        "completion_semantics": "validated_admission_response_not_delta_commit",
+        "bytes_semantics": "sum_of_protobuf_flight_data_encoded_lengths_excluding_grpc_http2",
+        "latency_scope": "process_cumulative_includes_preflight_and_warmup_not_phase_percentiles",
+        "workers": deltas,
+    }))
+}
+
+#[test]
+fn resource_summary_is_observed_mean_and_max_not_an_end_snapshot() {
+    let mut evidence = CellEvidence::default();
+    assert!(evidence.resource_summary().is_none());
+    for (cpu_millicores, memory_bytes) in [(100.0, 200), (300.0, 100)] {
+        evidence.resource_samples.push(ResourceSample {
+            sampled_at_unix_ms: 1,
+            metrics: ResourceMetrics {
+                cpu_millicores,
+                memory_bytes,
+            },
+        });
+    }
+    let metrics = evidence.resource_summary().unwrap();
+    assert_eq!(metrics.cpu_millicores, 200.0);
+    assert_eq!(metrics.memory_bytes, 200);
 }

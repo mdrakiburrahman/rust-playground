@@ -108,6 +108,19 @@ test('network summary retains the explicit accepted-risk warning and preflight w
   assert.doesNotMatch(formatDataFlow(result), /network:/);
 });
 
+test('v3 preserves local degraded evidence without relaxing AKS or pinning gates', () => {
+  const degraded = {
+    schema_version: 3, mode: 'local', qap_completion_percent: null,
+    evidence_json: JSON.stringify({ version: 1, downstream_status: 'unavailable' }),
+  };
+  const local = evaluateDataFlow(status, [row(degraded)], sha, 'local', config);
+  assert.equal(local.pass, true);
+  assert.match(formatDataFlow(local), /collector-only evidence/);
+  assert.equal(evaluateDataFlow(status, [row({ ...degraded, pinning_ok: false })], sha, 'local', config).pass, false);
+  assert.equal(evaluateDataFlow(status, [row({ ...degraded, mode: 'aks' })], sha, 'aks', config).pass, false);
+  assert.equal(evaluateDataFlow(status, [row({ ...degraded, evidence_json: null })], sha, 'local', config).pass, false);
+});
+
 test('run reporting returns failure exit status for a runner exception and success only after evidence passes', async (t) => {
   const output: string[] = [];
   t.mock.method(console, 'log', (message: string) => output.push(message));

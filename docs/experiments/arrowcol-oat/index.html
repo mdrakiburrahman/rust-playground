@@ -364,7 +364,7 @@ function render() {
       ${numericCell(row, 'rows', 0)}${numericCell(row, 'duration_ms')}${numericCell(row, 'rows_per_second')}${numericCell(row, 'cpu_millicores')}${numericCell(row, 'memory_bytes')}
       ${numericCell(row, 'qap_observation_complete', 0)}${numericCell(row, 'qap_observed_tables', 0)}${numericCell(row, 'qap_completion_percent')}${numericCell(row, 'qap_pending_artifacts', 0)}${numericCell(row, 'qap_cached_bytes')}${numericCell(row, 'qap_unhealthy_catalogs', 0)}${numericCell(row, 'qap_lag_seconds')}
       <td>${safeText(row.host)}</td><td>${safeText(timestamp(row.started_at))}</td>${numericCell(row, 'measure_seconds')}${numericCell(row, 'tables', 0)}<td>${safeText(row.git_sha)}</td>
-      <td><details><summary>View</summary><pre>${safeText(formattedTunables(row.tunables_json))}</pre></details></td></tr>`;
+      <td><details><summary>Tunables</summary><pre>${safeText(formattedTunables(row.tunables_json))}</pre></details><details><summary>Measurement evidence</summary><pre>${safeText(formattedTunables(row.evidence_json))}</pre></details></td></tr>`;
   }).join('');
 }
 async function loadResults() {

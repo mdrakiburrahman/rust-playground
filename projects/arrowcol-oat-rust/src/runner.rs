@@ -153,7 +153,9 @@ trait Platform: Send + Sync {
     async fn arm_clients(&self, config: &OatConfig, run_id: &str, run_start_unix_ms: u64) -> Result<()>;
     async fn finish_client(&self, config: &OatConfig, handle: ClientHandle) -> Result<String>;
     async fn cancel_client(&self, config: &OatConfig, handle: &ClientHandle) -> Result<()>;
-    async fn sample_resources(&self, config: &OatConfig) -> Result<ResourceMetrics>;
+    fn resource_sampler_source(&self) -> Option<ResourceSamplerSource> {
+        None
+    }
     async fn cleanup(&mut self, config: &OatConfig) -> Result<()>;
 }
 
@@ -405,8 +407,8 @@ impl Platform for AksPlatform {
         cancel_aks_client_job(config, handle).await
     }
 
-    async fn sample_resources(&self, config: &OatConfig) -> Result<ResourceMetrics> {
-        collect_aks_metrics(config).await
+    fn resource_sampler_source(&self) -> Option<ResourceSamplerSource> {
+        Some(ResourceSamplerSource::Aks)
     }
 
     async fn cleanup(&mut self, config: &OatConfig) -> Result<()> {
@@ -492,15 +494,14 @@ impl Platform for LocalPlatform {
             .with_context(|| format!("create local QAP result directory {}", results.display()))?;
         let database = self.qap_database(config)?;
         arrowcol_loadgen::initialize_local_qap(
-            self.qap_url
-                .as_deref()
-                .context("local downstream endpoint is unavailable")?,
+            self.qap_url.as_deref().context(LocalDownstreamUnavailable)?,
             &results,
             &database,
             &local_bindings,
             Duration::from_secs(config.qap_timeout_seconds),
         )
         .await
+        .map_err(|error| error.context(LocalDownstreamUnavailable))
         .context("initialize run-local Kusto QAP tables and policies")?;
         Ok(bindings.iter().map(|binding| binding.external_table.clone()).collect())
     }
@@ -548,8 +549,11 @@ impl Platform for LocalPlatform {
         cancel_local_client(handle).await
     }
 
-    async fn sample_resources(&self, config: &OatConfig) -> Result<ResourceMetrics> {
-        collect_local_metrics(config, self).await
+    fn resource_sampler_source(&self) -> Option<ResourceSamplerSource> {
+        Some(ResourceSamplerSource::Local {
+            run_id: self.run_id.clone(),
+            environment: self.environment.clone(),
+        })
     }
 
     async fn cleanup(&mut self, config: &OatConfig) -> Result<()> {
@@ -2142,7 +2146,7 @@ fn result_rows(
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| "unknown".to_owned()),
             tunables_json: serde_json::to_string(&table_tunables)?,
-            evidence_json: Some(serde_json::to_string(&client_run.evidence.for_table(client))?),
+            evidence_json: Some(serde_json::to_string(&client_run.evidence.for_table(&table, client))?),
             replicas: u64::from(replicas),
             dfe_worker_concurrency: u64::from(concurrency),
             table,
@@ -2402,6 +2406,10 @@ async fn run_clients_inner(
     .await;
     let qap_result = match qap_result {
         Ok(result) => result,
+        Err(_) if local_downstream_optional(platform.kind()) => {
+            platform.mark_qap_outcome_unresolved();
+            Err(anyhow::anyhow!(LocalDownstreamUnavailable))
+        }
         Err(_) => Err(anyhow::anyhow!(
             "run-scoped QAP preparation exceeded qap_timeout_seconds; operation outcome may be indeterminate and is not retried"
         )),
@@ -2409,7 +2417,7 @@ async fn run_clients_inner(
     let mut evidence = CellEvidence::default();
     let qap_tables = match qap_result {
         Ok(qap_tables) => qap_tables,
-        Err(_) if local_downstream_optional(platform.kind()) => {
+        Err(error) if local_downstream_optional(platform.kind()) && error.is::<LocalDownstreamUnavailable>() => {
             evidence.downstream_unavailable("local_qap_initialization_unavailable");
             Vec::new()
         }
@@ -2503,13 +2511,16 @@ async fn run_clients_inner(
     let measurement_end_unix_ms = measurement_start_unix_ms
         .checked_add(config.measure_seconds.saturating_mul(1_000))
         .context("shared OAT measurement end timestamp overflow")?;
+    let sampler = ResourceSampler::start(
+        platform.resource_sampler_source(),
+        config.clone(),
+        measurement_start_unix_ms,
+        measurement_end_unix_ms,
+    );
     let mut client_metrics = HashMap::<String, Vec<ClientMeasurement>>::with_capacity(tables.len());
     let mut completed_clients = HashSet::new();
     let mut active_clients = vec![true; handles.len()];
     while completed_clients.len() < handles.len() {
-        evidence
-            .sample_resources(platform, config, measurement_start_unix_ms, measurement_end_unix_ms)
-            .await;
         let pending_indices = handles
             .iter()
             .enumerate()
@@ -2592,6 +2603,7 @@ async fn run_clients_inner(
                         };
                     }
                 };
+                evidence.record_client(&handle.table, &output)?;
                 client_metrics
                     .entry(handle.table.clone())
                     .or_default()
@@ -2616,6 +2628,7 @@ async fn run_clients_inner(
         true,
     );
     let mut metrics = HashMap::with_capacity(tables.len());
+    sampler.finish(&mut evidence).await?;
     for table in tables {
         let reports = client_metrics
             .remove(table)
@@ -4381,7 +4394,11 @@ async fn destroy_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
     Ok(())
 }
 
-async fn collect_local_metrics(config: &OatConfig, platform: &LocalPlatform) -> Result<ResourceMetrics> {
+async fn collect_local_metrics(
+    config: &OatConfig,
+    run_id: &str,
+    environment: &HashMap<String, String>,
+) -> Result<ResourceMetrics> {
     let base_project = config
         .platform
         .compose_project
@@ -4392,14 +4409,14 @@ async fn collect_local_metrics(config: &OatConfig, platform: &LocalPlatform) -> 
         .compose_file
         .as_deref()
         .context("local compose file is missing")?;
-    let project = scoped_compose_project(base_project, &platform.run_id);
+    let project = scoped_compose_project(base_project, run_id);
     let mut list = compose_command(
         compose_file,
         config.platform.compose_override_file.as_deref(),
         &project,
         "benchmark",
     );
-    list.envs(&platform.environment);
+    list.envs(environment);
     list.args(["ps", "--quiet", "dataflow-1"]);
     let ids = String::from_utf8(run_command(list, "list local ArrowCol containers").await?.stdout)?;
     let ids = ids
