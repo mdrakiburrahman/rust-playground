@@ -645,8 +645,8 @@ pub struct TelemetryConfig {
 
 #[cfg(test)]
 mod routing_policy_tests {
-    use clap::Parser;
     use super::{Cli, RouterConfig, RoutingConfig, apply_cli_overrides, apply_environment_overrides};
+    use clap::Parser;
 
     #[test]
     fn distinct_table_owners_is_opt_in_and_disabled_for_single_collector_loadtest() {
