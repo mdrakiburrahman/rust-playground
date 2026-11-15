@@ -88,6 +88,7 @@
     <div class="stat"><span class="stat-label">Peak commit-window output (filtered)</span><strong id="stat-throughput" class="stat-value">—</strong></div>
     <div class="stat"><span class="stat-label">Median per-result commit p95 (filtered)</span><strong id="stat-latency" class="stat-value">—</strong></div>
   </section>
+  <p id="commit-window-note" class="lede" role="status" aria-live="polite"></p>
   <section class="filters" aria-labelledby="filter-title">
     <div class="filter-heading"><h2 id="filter-title">Explore results</h2><button id="clear" type="button">Clear all</button></div>
     <div id="filter-grid" class="filter-grid">
@@ -275,6 +276,22 @@ function outputMetrics(row) {
   outputCache.set(row, metrics);
   return metrics;
 }
+function commitWindowNote(rows) {
+  const zeroOutput = rows.filter(row => outputMetrics(row).committed_rows_per_second === 0);
+  if (!zeroOutput.length) return '';
+  const explanation = 'No commits finished inside the selected measurement window. Admission and later settled commits are separate measurements.';
+  if (rows.length !== 1) return `${zeroOutput.length} results have no commits inside their measurement windows. Admission and later settled commits are separate measurements.`;
+  const row = rows[0];
+  let cumulative = null;
+  try {
+    const output = JSON.parse(row.evidence_json)?.durable_commits?.run_cumulative_output;
+    if (output?.scope === 'all_new_ingestion_commits_from_this_cell_including_warmup' &&
+        output.settled === true && typeof output.rows === 'number' && Number.isFinite(output.rows) && output.rows >= 0) {
+      cumulative = output.rows;
+    }
+  } catch { cumulative = null; }
+  return `${explanation} Window admission: ${show(row.rows)} rows. Whole-cell committed rows after settling (not window throughput): ${show(cumulative)}.`;
+}
 const outputColumns = new Set(['committed_rows_per_second', 'committed_rows', 'committed_files', 'parquet_bytes',
   'parquet_bytes_per_row', 'compression_ratio', 'commit_p50_ms', 'commit_p95_ms', 'commit_p99_ms']);
 const facets = [
@@ -363,6 +380,7 @@ function render() {
   document.querySelector('#stat-rows').textContent = numberFormat.format(rows.length);
   document.querySelector('#stat-configs').textContent = numberFormat.format(configs.size);
   document.querySelector('#stat-throughput').textContent = throughput.length ? `${show(throughput.reduce((best, value) => Math.max(best, value), -Infinity))} rows/s` : '—';
+  document.querySelector('#commit-window-note').textContent = commitWindowNote(rows);
   document.querySelector('#stat-latency').textContent = commitP95.length ? `${show(median(commitP95))} ms` : '—';
   document.querySelector('#filtered-count').textContent = `${numberFormat.format(rows.length)} of ${numberFormat.format(allRows.length)} rows${rows.length > MAX_RENDERED_ROWS ? ` (showing first ${MAX_RENDERED_ROWS}; filter to narrow)` : ''}`;
   for (const header of document.querySelectorAll('.results-table th[data-result], .results-table th[data-column]')) {

@@ -25,8 +25,9 @@ test('viewer derives commit-window output rather than backfilling legacy admissi
   const html = await readFile('docs/experiments/arrowcol-oat/index.html', 'utf8');
   const start = html.indexOf('function number(');
   const end = html.indexOf('const facets =', start);
-  const display = runInNewContext(`${html.slice(start, end)}; ({ outputMetrics })`) as {
+  const display = runInNewContext(`${html.slice(start, end)}; ({ outputMetrics, commitWindowNote })`) as {
     outputMetrics(row: Record<string, unknown>): Record<string, unknown>;
+    commitWindowNote(rows: Record<string, unknown>[]): string;
   };
   const evidence = {
     version: 1, processes: [{
@@ -58,4 +59,18 @@ test('viewer derives commit-window output rather than backfilling legacy admissi
   });
   assert.equal(display.outputMetrics(row()).committed_rows_per_second, 0);
   assert.equal(display.outputMetrics(row()).parquet_bytes_per_row, null);
+  const settled = { ...evidence, durable_commits: { run_cumulative_output: {
+    scope: 'all_new_ingestion_commits_from_this_cell_including_warmup',
+    settled: true, rows: 139000,
+  } } };
+  const originalQuickRun = { ...row(), rows: 107000, evidence_json: JSON.stringify(settled) };
+  assert.equal(display.outputMetrics(originalQuickRun).committed_rows_per_second, 0);
+  const note = display.commitWindowNote([originalQuickRun]);
+  assert.match(note, /No commits finished inside/);
+  assert.match(note, /107,000 rows/);
+  assert.match(note, /not window throughput.*139,000/);
+  assert.equal(display.commitWindowNote([{ ...originalQuickRun, schema_version: 2 }]), '');
+  assert.match(display.commitWindowNote([{ ...originalQuickRun, evidence_json: JSON.stringify({
+    ...settled, durable_commits: { run_cumulative_output: { ...settled.durable_commits.run_cumulative_output, settled: false } },
+  }) }]), /not window throughput.*\u2014/);
 });
