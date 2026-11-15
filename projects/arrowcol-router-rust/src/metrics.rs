@@ -236,12 +236,13 @@ mod tests {
     use arrowcol_routing::RoutingView;
 
     #[test]
-    fn exports_fixed_pressure_gauge_labels_for_diagnosis() {
-        let metrics = RouterMetrics::new().expect("router metrics");
-        metrics.update_cache_gauges(&RoutingView::empty(UnixMillis::new(1).expect("timestamp")));
-        let output = String::from_utf8(metrics.encode().expect("metrics encoding")).expect("UTF-8 metrics");
+    fn exports_fixed_pressure_gauge_labels_for_diagnosis() -> Result<(), Box<dyn std::error::Error>> {
+        let metrics = RouterMetrics::new()?;
+        metrics.update_cache_gauges(&RoutingView::empty(UnixMillis::new(1)?));
+        let output = String::from_utf8(metrics.encode()?)?;
         assert!(output.contains("arrowcol_router_collector_pressure_gauge_bps"));
         assert!(output.contains("gauge=\"cpu_utilization_bps\""));
         assert!(output.contains("gauge=\"quiver_pressure_bps\""));
+        Ok(())
     }
 }
