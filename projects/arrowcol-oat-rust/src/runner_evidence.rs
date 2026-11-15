@@ -172,6 +172,7 @@ impl CellEvidence {
             "version": 1,
             "processes": self.processes,
             "router_sql": self.router_sql,
+            "router_cpu_pressure": self.router_cpu_pressure,
             "durable_commits": self.durable_commits.get(table),
             "reconciliation": self.reconciliation(table, durable),
             "commit_window_output_throughput": output,
@@ -886,4 +887,15 @@ fn resource_summary_is_observed_mean_and_max_not_an_end_snapshot() -> Result<()>
     assert_eq!(metrics.cpu_millicores, 200.0);
     assert_eq!(metrics.memory_bytes, 200);
     Ok(())
+}
+
+#[test]
+fn cell_evidence_includes_router_cpu_pressure() {
+    let mut evidence = CellEvidence::default();
+    let cpu_pressure = json!({"status": "observed", "max_utilization_bps": 731});
+    evidence.router_cpu_pressure = Some(cpu_pressure.clone());
+
+    let cell = evidence.for_table("table", None);
+
+    assert_eq!(cell["router_cpu_pressure"], cpu_pressure);
 }

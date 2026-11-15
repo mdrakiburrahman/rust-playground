@@ -8788,6 +8788,41 @@ mod tests {
     }
 
     #[test]
+    fn collector_shutdown_evidence_records_zero_drain_after_completed_shutdown() -> Result<()> {
+        let text = concat!(
+            "otel.processor.durable_buffer::durable_buffer.shutdown.start\n",
+            "otel.processor.durable_buffer::durable_buffer.shutdown.complete\n",
+            "otel-arrow-dfe-quiver::quiver.engine.stop [force_dropped_bundles=0]\n",
+        );
+        let log = ProcessLog {
+            role: ComponentRole::Collector,
+            instance_id: "pod/dataflow".to_owned(),
+            image: None,
+            image_id: None,
+            source_revision: None,
+            complete: true,
+            raw_log_bytes: text.len() as u64,
+            raw_log_lines: 3,
+            stdout: text.to_owned(),
+            stderr: String::new(),
+            text: text.to_owned(),
+        };
+
+        let evidence = collector_shutdown_drain_evidence(
+            &log,
+            Some(1_700_000_000_000),
+            Some("2023-11-14T22:13:21Z"),
+            Some(0),
+            true,
+        );
+
+        assert_eq!(evidence["status"], "observed");
+        assert_eq!(evidence["quiver"]["bundles_drained"], 0);
+        assert_eq!(evidence["quiver"]["force_dropped_bundles"], 0);
+        Ok(())
+    }
+
+    #[test]
     fn snapshot_stop_accepts_only_maintenance_exit_one() -> Result<()> {
         let project = "owned-maintenance-run";
         let services = [

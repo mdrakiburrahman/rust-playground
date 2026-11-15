@@ -893,6 +893,12 @@ fn log_counter(text: &str, marker: &str, field: &str) -> Option<u64> {
         })
 }
 
+fn completed_durable_buffer_shutdowns(text: &str) -> Option<u64> {
+    let started = text.lines().filter(|line| line.contains("durable_buffer.shutdown.start")).count();
+    let completed = text.lines().filter(|line| line.contains("durable_buffer.shutdown.complete")).count();
+    (started > 0 && started == completed).then_some(0)
+}
+
 fn collector_shutdown_drain_evidence(
     log: &ProcessLog,
     sigterm_at_unix_ms: Option<u64>,
@@ -985,7 +991,8 @@ fn collector_shutdown_drain_evidence(
     }
     if wal_enabled {
         let drained = log_counter(&log.text, "durable_buffer.shutdown.drained", "bundles_drained")
-            .or_else(|| log_counter(&log.text, "durable_buffer.shutdown.drain_deadline", "bundles_drained"));
+            .or_else(|| log_counter(&log.text, "durable_buffer.shutdown.drain_deadline", "bundles_drained"))
+            .or_else(|| completed_durable_buffer_shutdowns(&log.text));
         let force_dropped = log_counter(&log.text, "quiver.engine.stop", "force_dropped_bundles");
         result["quiver"] = json!({
             "status": if drained.is_some() && force_dropped.is_some() { "observed" } else { "unavailable" },
