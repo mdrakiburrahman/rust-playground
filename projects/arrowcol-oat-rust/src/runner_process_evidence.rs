@@ -485,6 +485,7 @@ fn collector_layout_records(config: &OatConfig, text: &str) -> Result<Vec<Value>
     Ok(records)
 }
 
+#[cfg(test)]
 fn process_evidence(config: &OatConfig, logs: &[ProcessLog]) -> Result<Value> {
     process_evidence_for_cell(config, logs, &[])
 }
