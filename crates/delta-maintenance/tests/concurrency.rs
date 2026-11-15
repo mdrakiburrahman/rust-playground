@@ -274,6 +274,7 @@ fn record_receipt(root: &Path, app_id: &str, first: u64, replay: u64) -> Result<
 /// the original commit whenever the concurrent service committed in between; the driver
 /// proves from the log that the replay itself never committed.
 fn writer(root: &Path, base: i64) -> Result<()> {
+    let deadline = Instant::now() + DRIVER_DEADLINE;
     let table = open(root)?;
     for index in 0..PUBLICATIONS {
         let app_id = writer_app(index);
@@ -281,6 +282,11 @@ fn writer(root: &Path, base: i64) -> Result<()> {
         let first = publish(&table, base, writer_offset(index), &ids, Some(&app_id))?;
         if index == 0 {
             fs::write(root.join("writer-started"), b"1")?;
+            // A fast writer must not finish before the first service process launches.
+            while !root.join("service-started").exists() {
+                ensure!(Instant::now() < deadline, "service never started");
+                std::thread::sleep(Duration::from_millis(5));
+            }
         }
         let replay = publish(&table, base, writer_offset(index), &ids, Some(&app_id))?;
         ensure!(
@@ -355,7 +361,12 @@ fn check_writer_receipts(
     Ok(())
 }
 
-fn service(root: &Path, operations: &[&str], deadline: Instant) -> Result<Vec<serde_json::Value>> {
+fn service(
+    root: &Path,
+    operations: &[&str],
+    deadline: Instant,
+    writer: Option<&mut OwnedChild>,
+) -> Result<(Vec<serde_json::Value>, bool)> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_delta-maintenance"));
     command.env_remove("OTEL_EXPORTER_OTLP_ENDPOINT").args([
         "--root",
@@ -384,7 +395,15 @@ fn service(root: &Path, operations: &[&str], deadline: Instant) -> Result<Vec<se
         .stdin(Stdio::null())
         .stdout(fs::File::create(&stdout_path)?)
         .stderr(fs::File::create(&stderr_path)?);
-    let status = OwnedChild::spawn(&mut command)?.wait_until(deadline, "service")?;
+    let mut child = OwnedChild::spawn(&mut command)?;
+    let overlapped = if let Some(writer) = writer {
+        let running = writer.running()?;
+        fs::write(root.join("service-started"), b"1")?;
+        running
+    } else {
+        false
+    };
+    let status = child.wait_until(deadline, "service")?;
     let stdout = fs::read(&stdout_path)?;
     let stderr = fs::read(&stderr_path)?;
     let reports = std::str::from_utf8(&stdout)?
@@ -399,7 +418,7 @@ fn service(root: &Path, operations: &[&str], deadline: Instant) -> Result<Vec<se
     );
     let failed = reports.iter().any(|report| !report["error_kind"].is_null());
     ensure!(status.success() != failed, "exit status must reflect report errors");
-    Ok(reports)
+    Ok((reports, overlapped))
 }
 
 fn log_actions(root: &Path) -> Result<Vec<(u64, serde_json::Value)>> {
@@ -517,7 +536,9 @@ fn driver(root: &Path) -> Result<()> {
     let mut collisions = 0_u64;
     let mut concurrent_cycles = 0;
     for _ in 0..CYCLES {
-        for report in service(root, &operations, deadline)? {
+        let (reports, overlapped) = service(root, &operations, deadline, Some(&mut child))?;
+        concurrent_cycles += usize::from(overlapped);
+        for report in reports {
             let label = match report["error_kind"].as_str() {
                 Some(kind) => {
                     ensure!(
@@ -539,9 +560,6 @@ fn driver(root: &Path) -> Result<()> {
             };
             *outcomes.entry(label).or_default() += 1;
         }
-        if child.running()? {
-            concurrent_cycles += 1;
-        }
         std::thread::sleep(Duration::from_millis(20));
     }
     ensure!(child.wait_until(deadline, "writer")?.success(), "writer process failed");
@@ -552,14 +570,14 @@ fn driver(root: &Path) -> Result<()> {
     );
 
     std::thread::sleep(Duration::from_millis(20));
-    for report in service(root, &operations, deadline)? {
+    for report in service(root, &operations, deadline, None)?.0 {
         ensure!(report["error_kind"].is_null(), "quiescent apply failed: {report}");
     }
     std::thread::sleep(Duration::from_millis(20));
-    let settled = service(root, &["vacuum"], deadline)?;
+    let (settled, _) = service(root, &["vacuum"], deadline, None)?;
     ensure!(settled[0]["error_kind"].is_null(), "{}", settled[0]);
     let version = log_actions(root)?.last().map(|(version, _)| *version);
-    for report in service(root, &operations, deadline)? {
+    for report in service(root, &operations, deadline, None)?.0 {
         let inner = &report["report"];
         // VACUUM LITE never commits; its repeat must find nothing left to delete.
         let idle = if report["operation"] == "vacuum" {
