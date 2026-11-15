@@ -289,7 +289,13 @@ impl FilesystemDiscovery {
         if !root.path().ends_with('/') {
             root.set_path(&format!("{}/", root.path()));
         }
-        Ok(root.join(&format!("{name}/"))?)
+        let components = name.split('.').collect::<Vec<_>>();
+        let relative = if components.len() == 3 && components.iter().all(|component| !component.is_empty()) {
+            components.join("/")
+        } else {
+            name.to_owned()
+        };
+        Ok(root.join(&format!("{relative}/"))?)
     }
 }
 
@@ -366,6 +372,20 @@ fn ensure_property_token_unchanged(before: &str, after: &str) -> Result<()> {
 #[cfg(test)]
 mod property_discovery_tests {
     use super::*;
+
+    #[test]
+    fn filesystem_discovery_resolves_qualified_table_identities_as_nested_paths() -> Result<()> {
+        let discovery = FilesystemDiscovery::new(Url::parse("file:///tmp/arrowcol/dataflow")?, Vec::new());
+        assert_eq!(
+            discovery.url("telemetry.sqlserver.sqlserver_active_sessions")?.as_str(),
+            "file:///tmp/arrowcol/dataflow/telemetry/sqlserver/sqlserver_active_sessions/"
+        );
+        assert_eq!(
+            discovery.url("legacy_table")?.as_str(),
+            "file:///tmp/arrowcol/dataflow/legacy_table/"
+        );
+        Ok(())
+    }
 
     #[test]
     fn token_change_is_stale_plan_not_a_successful_probe() -> Result<()> {

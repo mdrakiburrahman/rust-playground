@@ -98,7 +98,6 @@ async fn run_prepared(args: &Args, client: &std::sync::Arc<dmv::client::Prepared
         client.send_once().await?;
         client.table_count
     } else {
-        client.send_round().await?;
         let preflight_table_count = client.table_count;
         let run_start_unix_ms = match (&args.schedule_file, args.run_start_unix_ms) {
             (Some(_), Some(_)) => anyhow::bail!("use either --schedule-file or --run-start-unix-ms, not both"),
@@ -127,7 +126,11 @@ async fn run_prepared(args: &Args, client: &std::sync::Arc<dmv::client::Prepared
             .ok_or_else(|| anyhow::anyhow!("shared measurement end timestamp overflow"))?;
         wait_until_unix_ms(run_start_unix_ms, unix_time_ms).await?;
         let report = client
-            .run_continuous(measurement_window_start_unix_ms, measurement_window_end_unix_ms)
+            .run_continuous(
+                run_start_unix_ms,
+                measurement_window_start_unix_ms,
+                measurement_window_end_unix_ms,
+            )
             .await?;
         let measured_rows = report.completed_rows;
         let measurement_started_unix_ms = report.measurement_started_unix_ms;

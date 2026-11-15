@@ -83,6 +83,7 @@ pub struct Options {
     /// Zero inherits the legacy --concurrency setting.
     #[arg(long, env = "ARROWCOL_CLIENT_STREAMS_PER_WORKER", default_value_t = 0)]
     pub streams_per_worker: usize,
+    /// One-shot total-row limit; duration-based runs ignore this cap and reuse the configured corpus.
     #[arg(long, env = "ARROWCOL_CLIENT_MAX_ROWS", default_value_t = 0)]
     pub max_rows: u64,
     #[arg(long, env = "ARROWCOL_CLIENT_IPC_COMPRESSION", value_enum, default_value_t = IpcCompression::None)]
@@ -709,6 +710,7 @@ impl PreparedClient {
     /// Propagates clock, send, worker, or schedule failures after aborting and joining owned tasks.
     pub async fn run_continuous(
         self: &Arc<Self>,
+        scheduled_start_unix_ms: u64,
         measurement_start_unix_ms: u64,
         measurement_end_unix_ms: u64,
     ) -> Result<ContinuousReport> {
@@ -721,6 +723,17 @@ impl PreparedClient {
             .measurement
             .lock()
             .map_err(|_| anyhow::anyhow!("measurement state poisoned"))? = Some(Arc::clone(&measurement));
+        while unix_ms()? < scheduled_start_unix_ms {
+            tokio::time::sleep(Duration::from_millis(
+                scheduled_start_unix_ms.saturating_sub(unix_ms()?).min(10),
+            ))
+            .await;
+        }
+        let scheduled_start_observed_unix_ms = unix_ms()?;
+        anyhow::ensure!(
+            scheduled_start_observed_unix_ms.abs_diff(scheduled_start_unix_ms) <= 250,
+            "client did not start within 250ms of the shared scheduled interval"
+        );
         let mut tasks = JoinSet::new();
         for worker in 0..self.options.workers {
             for slot in 0..self.options.streams_per_worker {
@@ -898,7 +911,8 @@ impl PreparedClient {
         batch: &EncodedBatch,
         measurement: Option<&Measurement>,
     ) -> Result<Option<(DeliveryGuarantee, u64)>> {
-        if self.options.max_rows > 0
+        if measurement.is_none()
+            && self.options.max_rows > 0
             && self
                 .reserved_rows
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |rows| {
@@ -1555,19 +1569,33 @@ mod tests {
                 .await
         });
         let mut options = options()?;
-        options.corpus_rows = 32;
+        options.corpus_rows = 8;
         options.batch_rows = 8;
         options.streams_per_worker = 1;
+        options.max_rows = 8;
         options.ipc_compression = IpcCompression::Zstd;
         options.grpc_send_compression = GrpcCompression::Gzip;
         options.grpc_accept_compression = GrpcCompression::Gzip;
         let client = PreparedClient::prepare(&endpoint, "smoke", Some("sqlserver_wait_stats"), None, options).await?;
-        assert_eq!(client.send_once().await?.completed_rows, 32);
-        assert_eq!(state.rows.load(Ordering::Relaxed), 32);
+        assert_eq!(client.send_once().await?.completed_rows, 8);
+        assert_eq!(state.rows.load(Ordering::Relaxed), 8);
         state.fast_completions.store(0, Ordering::Relaxed);
         state.slow_next.store(true, Ordering::SeqCst);
-        let start = unix_ms()? + 25;
-        let report = client.run_continuous(start, start + 175).await?;
+        let scheduled_start = unix_ms()? + 100;
+        let measurement_start = scheduled_start + 50;
+        let scheduled_client = Arc::clone(&client);
+        let run = tokio::spawn(async move {
+            scheduled_client
+                .run_continuous(scheduled_start, measurement_start, measurement_start + 175)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(
+            state.rows.load(Ordering::Relaxed),
+            8,
+            "scheduled client sent before the shared start"
+        );
+        let report = run.await??;
         assert!(
             state.fast_completions.load(Ordering::Relaxed) >= 3,
             "a slow peer stalled the fast worker"
@@ -1582,7 +1610,7 @@ mod tests {
             .sum::<Result<u64>>()?;
         assert_eq!(total, state.rows.load(Ordering::Relaxed));
         assert!(
-            total >= report.completed_rows + 40,
+            total >= report.completed_rows + 16,
             "late slow acknowledgement must be drained but excluded from measurement"
         );
         drop(client);
