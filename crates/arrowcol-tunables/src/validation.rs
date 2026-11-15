@@ -2606,8 +2606,9 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(error_text(invalid.validate())
-            .contains("maintenance.max_idle_backoff_secs must be at least interval_secs"));
+        assert!(
+            error_text(invalid.validate()).contains("maintenance.max_idle_backoff_secs must be at least interval_secs")
+        );
     }
 
     #[test]
