@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -16,8 +16,22 @@ pub(crate) static PROCESS_ROUTING_SHUTDOWN: LazyLock<RoutingShutdown> = LazyLock
 pub struct RoutingShutdown {
     registrations: Mutex<Vec<(Arc<dyn RoutingStore>, CollectorInstanceId)>>,
     failed: AtomicBool,
-    pending: Mutex<HashSet<PublicationId>>,
+    pending: Mutex<HashMap<PublicationId, PublicationState>>,
     workers: Mutex<HashMap<PathBuf, Arc<AtomicBool>>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PublicationState {
+    NeverStaged,
+    Staged,
+    Nacked,
+}
+
+#[derive(Default, Debug, PartialEq, Eq)]
+struct PendingCounts {
+    never_staged: usize,
+    staged: usize,
+    nacked: usize,
 }
 
 impl RoutingShutdown {
@@ -50,7 +64,19 @@ impl RoutingShutdown {
         if published {
             pending.remove(&publication_id);
         } else {
-            pending.insert(publication_id);
+            pending.insert(publication_id, PublicationState::Nacked);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn publication_staged(&self, publication_id: PublicationId) -> Result<()> {
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| anyhow::anyhow!("publication accounting poisoned"))?;
+        let state = pending.entry(publication_id).or_insert(PublicationState::Staged);
+        if *state != PublicationState::Nacked {
+            *state = PublicationState::Staged;
         }
         Ok(())
     }
@@ -68,7 +94,11 @@ impl RoutingShutdown {
         publication_id: PublicationId,
         send: impl Future<Output = Result<(), E>>,
     ) -> Result<Result<(), E>> {
-        self.publication_finished(publication_id, false)?;
+        self.pending
+            .lock()
+            .map_err(|_| anyhow::anyhow!("publication accounting poisoned"))?
+            .entry(publication_id)
+            .or_insert(PublicationState::NeverStaged);
         let result = send.await;
         if result.is_err() {
             self.pending
@@ -97,11 +127,21 @@ impl RoutingShutdown {
             .lock()
             .map_err(|_| anyhow::anyhow!("routing shutdown registry poisoned"))?
             .clone();
-        let pending = self
-            .pending
-            .lock()
-            .map_err(|_| anyhow::anyhow!("publication accounting poisoned"))?
-            .len();
+        let (pending_total, counts) = {
+            let pending = self
+                .pending
+                .lock()
+                .map_err(|_| anyhow::anyhow!("publication accounting poisoned"))?;
+            let mut counts = PendingCounts::default();
+            for state in pending.values() {
+                match state {
+                    PublicationState::NeverStaged => counts.never_staged += 1,
+                    PublicationState::Staged => counts.staged += 1,
+                    PublicationState::Nacked => counts.nacked += 1,
+                }
+            }
+            (pending.len(), counts)
+        };
         let retired = self
             .workers
             .lock()
@@ -109,12 +149,18 @@ impl RoutingShutdown {
             .values()
             .filter(|worker| worker.load(Ordering::Acquire))
             .count();
-        let failed = self.failed.load(Ordering::Acquire) || pending != 0 || retired != 0;
+        let failed = self.failed.load(Ordering::Acquire) || pending_total != 0 || retired != 0;
         let state = terminal_state(clean, failed);
         let now = now_unix_millis().map_err(anyhow::Error::msg)?;
         let mut errors = Vec::new();
         if failed {
-            errors.push(format!("dataflow drain incomplete: {pending} unpublished identities, {retired} retired workers, ingress failure={}", self.failed.load(Ordering::Acquire)));
+            tracing::error!(
+                never_staged = counts.never_staged,
+                staged_unpublished = counts.staged,
+                nacked = counts.nacked,
+                "dataflow shutdown publication accounting"
+            );
+            errors.push(format!("dataflow drain incomplete: {pending_total} unpublished identities (never_staged={}, staged_unpublished={}, nacked={}), {retired} retired workers, ingress failure={}", counts.never_staged, counts.staged, counts.nacked, self.failed.load(Ordering::Acquire)));
         }
         for (store, instance_id) in registrations {
             if let Err(error) = store.set_collector_state(instance_id, state, now).await {
@@ -195,6 +241,7 @@ mod tests {
         let shutdown = RoutingShutdown::default();
         let publication = PublicationId::new();
         let delivered_then_nacked = async {
+            shutdown.publication_staged(publication)?;
             shutdown.publication_finished(publication, false)?;
             std::future::pending::<Result<()>>().await
         };
@@ -206,6 +253,38 @@ mod tests {
         );
         assert!(shutdown.finish(true).await.is_err());
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_categories_reflect_exporter_progress_and_nacks() -> Result<()> {
+        let shutdown = RoutingShutdown::default();
+        let never_staged = PublicationId::new();
+        let staged = PublicationId::new();
+        let nacked = PublicationId::new();
+        for id in [never_staged, staged, nacked] {
+            shutdown
+                .admit_publication(id, async { Ok::<_, ()>(()) })
+                .await?
+                .map_err(|()| anyhow::anyhow!("send failed"))?;
+        }
+        shutdown.publication_staged(staged)?;
+        shutdown.publication_staged(nacked)?;
+        shutdown.publication_finished(nacked, false)?;
+        shutdown.publication_staged(nacked)?;
+        let error = shutdown
+            .finish(true)
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("unpublished work must fail"))?
+            .to_string();
+        assert!(
+            error.contains("3 unpublished identities (never_staged=1, staged_unpublished=1, nacked=1)"),
+            "{error}"
+        );
+        for id in [never_staged, staged, nacked] {
+            shutdown.publication_finished(id, true)?;
+        }
+        shutdown.finish(true).await
     }
 
     #[tokio::test]

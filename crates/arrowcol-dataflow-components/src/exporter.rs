@@ -175,7 +175,7 @@ impl GenericDeltaExporter {
         }
         if let Some(publication_id) = table.envelope.publication_id {
             crate::shutdown::PROCESS_ROUTING_SHUTDOWN
-                .publication_finished(publication_id, false)
+                .publication_staged(publication_id)
                 .map_err(|error| ExportFailure::Transient(error.to_string()))?;
         }
         let rows = u64::try_from(table.batch.num_rows()).unwrap_or(u64::MAX);
@@ -1220,7 +1220,17 @@ mod tests {
             if recovered {
                 record_publication_outcome(&shutdown, &pdata, true).expect("replay publication");
             }
-            assert_eq!(shutdown.finish(true).await.is_ok(), recovered);
+            let result = shutdown.finish(true).await;
+            if recovered {
+                assert!(result.is_ok());
+            } else {
+                assert!(
+                    result
+                        .expect_err("NACK must fail shutdown")
+                        .to_string()
+                        .contains("nacked=1")
+                );
+            }
             assert_eq!(
                 store.load_view(now()).await.expect("view").collectors[&holder].state,
                 if recovered {
