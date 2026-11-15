@@ -11,6 +11,94 @@ struct ProcessLog {
     text: String,
 }
 
+const MAX_RETAINED_PROCESS_LOG_BYTES: usize = 64 * 1024 * 1024;
+
+fn is_process_evidence_line(line: &str) -> bool {
+    [
+        "arrowcol_effective_config ",
+        "arrowcol_router_effective_config ",
+        "arrowcol_wal_effective_config ",
+        "arrowcol_layout_",
+        "arrowcol_data_commit ",
+        "arrowcol_maintenance_",
+        "OAT_CLIENT_",
+        "otel.controller.main::shutdown.signal_received",
+        "otel.processor.durable_buffer::durable_buffer.shutdown.",
+        "otel-arrow-dfe-quiver::quiver.engine.stop",
+    ]
+    .iter()
+    .any(|prefix| line.contains(prefix))
+        || (line.trim_start().starts_with('{')
+            && line.contains("\"operation\"")
+            && line.contains("\"applied\""))
+}
+
+fn append_process_evidence_line(
+    line: &str,
+    output: &mut String,
+    retained_bytes: &mut usize,
+    action: &str,
+) -> Result<()> {
+    if !is_process_evidence_line(line) {
+        return Ok(());
+    }
+    let bytes = line.len().saturating_add(1);
+    if retained_bytes.saturating_add(bytes) > MAX_RETAINED_PROCESS_LOG_BYTES {
+        bail!(
+            "{action} exceeded the {} byte retained evidence cap; refusing partial process logs",
+            MAX_RETAINED_PROCESS_LOG_BYTES
+        );
+    }
+    output.push_str(line);
+    output.push('\n');
+    *retained_bytes += bytes;
+    Ok(())
+}
+
+async fn filtered_process_command_output(mut command: Command, action: &str) -> Result<(String, String)> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("{action}: start process"))?;
+    let stdout = child.stdout.take().context("process log stdout is missing")?;
+    let stderr = child.stderr.take().context("process log stderr is missing")?;
+    let mut stdout = BufReader::new(stdout).lines();
+    let mut stderr = BufReader::new(stderr).lines();
+    let mut stdout_open = true;
+    let mut stderr_open = true;
+    let mut retained_bytes = 0;
+    let mut filtered_stdout = String::new();
+    let mut filtered_stderr = String::new();
+    while stdout_open || stderr_open {
+        tokio::select! {
+            line = stdout.next_line(), if stdout_open => match line? {
+                Some(line) => append_process_evidence_line(&line, &mut filtered_stdout, &mut retained_bytes, action)?,
+                None => stdout_open = false,
+            },
+            line = stderr.next_line(), if stderr_open => match line? {
+                Some(line) => append_process_evidence_line(&line, &mut filtered_stderr, &mut retained_bytes, action)?,
+                None => stderr_open = false,
+            },
+        }
+    }
+    let status = child.wait().await.with_context(|| format!("{action}: wait for process"))?;
+    if !status.success() {
+        bail!("{action} failed with {status}");
+    }
+    Ok((filtered_stdout, filtered_stderr))
+}
+
+fn filter_process_evidence_text(text: &str) -> Result<String> {
+    let mut filtered = String::new();
+    let mut retained_bytes = 0;
+    for line in text.lines() {
+        append_process_evidence_line(line, &mut filtered, &mut retained_bytes, "process log filtering")?;
+    }
+    Ok(filtered)
+}
+
 async fn local_client_image_evidence(id: &str) -> Result<Value> {
     let mut command = Command::new("docker");
     command.args(["inspect", id]);
@@ -700,10 +788,12 @@ async fn local_process_logs(config: &OatConfig, platform: &LocalPlatform) -> Res
         }
         let id = container["Id"].as_str().context("inspected container has no ID")?;
         let mut command = Command::new("docker");
-        command.args(["logs", "--tail", "20000", id]);
-        let output = run_command(command, "read owned process tuning and commit evidence").await?;
-        let stdout = String::from_utf8(output.stdout)?;
-        let stderr = String::from_utf8(output.stderr)?;
+        command.args(["logs", "--tail=-1", id]);
+        let (stdout, stderr) = filtered_process_command_output(
+            command,
+            "read full owned process logs for tuning and commit evidence",
+        )
+        .await?;
         let text = format!("{stdout}\n{stderr}");
         logs.push(ProcessLog {
             role,
@@ -717,7 +807,7 @@ async fn local_process_logs(config: &OatConfig, platform: &LocalPlatform) -> Res
                 .pointer("/Config/Labels/org.opencontainers.image.revision")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
-            complete: text.lines().count() < 20000,
+            complete: true,
             stdout,
             stderr,
             text,
@@ -763,30 +853,28 @@ async fn aks_process_logs(config: &OatConfig) -> Result<Vec<ProcessLog>> {
             if status["restartCount"].as_u64().unwrap_or(0) > 0 {
                 bail!("required AKS measurement process restarted during the cell");
             }
-            let text = kubectl(
-                config,
-                vec![
-                    "logs",
-                    pod_name,
-                    "--namespace",
-                    &config.namespace,
-                    "--container",
-                    name,
-                    "--limit-bytes",
-                    "16777216",
-                ],
-                None,
+            let mut command = Command::new("kubectl");
+            if let Some(context) = &config.kubectl_context {
+                command.args(["--context", context]);
+            }
+            command.args([
+                "logs", pod_name, "--namespace", &config.namespace, "--container", name,
+            ]);
+            let (stdout, stderr) = filtered_process_command_output(
+                command,
+                &format!("read full AKS process logs for {pod_name}/{name}"),
             )
             .await?;
+            let text = format!("{stdout}\n{stderr}");
             logs.push(ProcessLog {
                 role,
                 instance_id: format!("{pod_name}/{name}"),
                 image: status["image"].as_str().map(str::to_owned),
                 image_id: status["imageID"].as_str().map(str::to_owned),
                 source_revision: None,
-                complete: text.len() < 16777216,
-                stdout: text.clone(),
-                stderr: String::new(),
+                complete: true,
+                stdout,
+                stderr,
                 text,
             });
         }
@@ -919,6 +1007,20 @@ mod startup_readback_tests {
         verify_process_configuration(&config, ComponentRole::Client, &readback)?;
         assert_eq!(readback["workers"], 4);
         Ok(())
+    }
+
+    #[test]
+    fn process_log_filter_fails_closed_when_retained_byte_cap_is_exceeded() {
+        let mut output = String::new();
+        let mut retained_bytes = MAX_RETAINED_PROCESS_LOG_BYTES;
+        assert!(append_process_evidence_line(
+            "arrowcol_data_commit {}",
+            &mut output,
+            &mut retained_bytes,
+            "test log",
+        )
+        .is_err());
+        assert!(output.is_empty());
     }
 
     #[test]

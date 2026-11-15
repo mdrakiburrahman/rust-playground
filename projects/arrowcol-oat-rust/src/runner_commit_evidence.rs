@@ -279,9 +279,11 @@ fn durable_commit_evidence_for_cell(
         .iter()
         .filter(|log| matches!(log.role, ComponentRole::Collector))
         .collect::<Vec<_>>();
+    let collector_logs_incomplete = collector_logs.iter().any(|log| !log.complete)
+        || cell_commit_logs.iter().any(|log| !log.complete);
     let mut unavailable = (collector_logs.is_empty() || cell_commit_logs.is_empty())
         .then_some("collector_commit_log_unavailable");
-    if collector_logs.iter().any(|log| !log.complete) || cell_commit_logs.iter().any(|log| !log.complete) {
+    if collector_logs_incomplete {
         unavailable = Some("collector_commit_log_incomplete");
     }
     let mut capability_observed = !collector_logs.is_empty();
@@ -293,7 +295,8 @@ fn durable_commit_evidence_for_cell(
             });
     }
     let mut events = std::collections::BTreeMap::new();
-    for log in cell_commit_logs {
+    if !collector_logs_incomplete {
+        for log in cell_commit_logs {
         for line in log
             .text
             .lines()
@@ -319,6 +322,7 @@ fn durable_commit_evidence_for_cell(
             {
                 bail!("conflicting evidence for the same Delta commit identity");
             }
+        }
         }
     }
     if events.values().any(|event| event.table_name.is_none()) {
@@ -466,6 +470,51 @@ mod commit_evidence_tests {
                     .collect::<String>()
             ),
         }
+    }
+
+    #[test]
+    fn full_filtered_log_preserves_startup_readback_and_tail_commit() -> Result<()> {
+        let mut config = config()?;
+        config.tunables = serde_json::from_value(json!({"router":{"hard_pressure_bps":9500}}))?;
+        let commit = event(&config, 100, 199)?;
+        let mut input = String::from(
+            "arrowcol_router_effective_config {\"routing\":{\"hard_pressure_bps\":9500}}\narrowcol_effective_config {\"commit_telemetry\":{\"schema_version\":1,\"scope\":\"new_ingestion_addfiles_after_sync\",\"clock\":\"system_unix_ms\"}}\n",
+        );
+        for _ in 0..20_001 {
+            input.push_str("noise line\n");
+        }
+        input.push_str(&format!("arrowcol_data_commit {commit}\n"));
+        let filtered = filter_process_evidence_text(&input)?;
+        let readback = process_configurations(&filtered)?;
+        verify_process_configuration(&config, ComponentRole::Router, &readback)?;
+        let log = ProcessLog {
+            role: ComponentRole::Collector,
+            instance_id: "collector-test".to_owned(),
+            image: None,
+            image_id: None,
+            source_revision: None,
+            complete: true,
+            stdout: filtered.clone(),
+            stderr: String::new(),
+            text: filtered,
+        };
+        let evidence = durable_commit_evidence(&config, &[log], Some((100, 200)))?;
+        assert_eq!(evidence[&config.tables[0]]["rows"], 10);
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_collector_logs_never_count_partial_commit_events() -> Result<()> {
+        let config = config()?;
+        let mut log = log(&[event(&config, 100, 199)?]);
+        log.complete = false;
+        let evidence = durable_commit_evidence(&config, &[log], Some((100, 200)))?;
+        let table = &evidence[&config.tables[0]];
+        assert!(table["rows"].is_null());
+        assert_eq!(table["unavailable_reason"], "collector_commit_log_incomplete");
+        assert!(table["run_cumulative_output"]["rows"].is_null());
+        assert_eq!(table["run_cumulative_output"]["unavailable_reason"], "collector_commit_log_incomplete");
+        Ok(())
     }
 
     #[test]
