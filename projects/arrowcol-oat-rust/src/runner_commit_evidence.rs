@@ -201,6 +201,7 @@ fn run_cumulative_output(
     }))
 }
 
+#[cfg(test)]
 fn durable_commit_evidence(
     config: &OatConfig,
     logs: &[ProcessLog],
