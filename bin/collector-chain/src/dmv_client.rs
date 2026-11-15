@@ -1782,20 +1782,20 @@ mod tests {
         );
         assert!(report.completed_rows > 8, "fast worker did not replenish its slot");
         let metrics = client.metrics("completed");
-        let retry_counts = |name: &str| {
+        let retry_counts = |name: &str| -> Result<u64> {
             metrics["workers"]
                 .as_array()
-                .expect("worker metrics")
+                .context("missing worker metrics")?
                 .iter()
-                .map(|worker| worker[name].as_u64().expect("retry counter"))
-                .sum::<u64>()
+                .map(|worker| worker[name].as_u64().context("missing retry counter"))
+                .sum()
         };
-        assert!(retry_counts("rejected_streams") >= 2);
-        assert!(retry_counts("rejected_rows") >= 16);
-        assert!(retry_counts("retried_streams") >= 2);
-        assert!(retry_counts("retried_rows") >= 16);
-        assert_eq!(retry_counts("given_up_streams"), 0);
-        assert_eq!(retry_counts("given_up_rows"), 0);
+        assert!(retry_counts("rejected_streams")? >= 2);
+        assert!(retry_counts("rejected_rows")? >= 16);
+        assert!(retry_counts("retried_streams")? >= 2);
+        assert!(retry_counts("retried_rows")? >= 16);
+        assert_eq!(retry_counts("given_up_streams")?, 0);
+        assert_eq!(retry_counts("given_up_rows")?, 0);
         let total = metrics["workers"]
             .as_array()
             .context("missing workers")?
