@@ -35,7 +35,7 @@ fn oat_policy(run_id: &str) -> RoutingPolicy {
 async fn initialize_memory_oat_pin(engine: &RoutingEngine, run_id: &str, now: UnixMillis, expires_at: UnixMillis) {
     let expected = [LeaseKey::new(ImplementationPool::Dataflow, table())];
     let pins = engine
-        .initialize_run_table_pins(run_id, &expected, expires_at, now)
+        .initialize_run_table_pins_with_clock(run_id, &expected, expires_at, now, || Ok(now))
         .await
         .unwrap_or_else(|error| panic!("initialize complete fixture OAT pin set and owner: {error}"));
     assert_eq!(pins.len(), 1);
@@ -284,7 +284,9 @@ async fn pinned_oat_holder_at_hard_pressure_is_a_transient_overload() {
         .unwrap_or_else(|error| panic!("refresh initial routing view: {error}"));
     let expected = [LeaseKey::new(ImplementationPool::Dataflow, table())];
     let pins = engine
-        .initialize_run_table_pins(OAT_RUN_CONCURRENT, &expected, millis(200_000), millis(100_001))
+        .initialize_run_table_pins_with_clock(OAT_RUN_CONCURRENT, &expected, millis(200_000), millis(100_001), || {
+            Ok(millis(100_001))
+        })
         .await
         .unwrap_or_else(|error| panic!("initialize OAT holder pin: {error}"));
     let holder = pins[0].holder_instance_id;
@@ -298,7 +300,13 @@ async fn pinned_oat_holder_at_hard_pressure_is_a_transient_overload() {
         .unwrap_or_else(|error| panic!("refresh hard-pressure view: {error}"));
 
     let result = engine
-        .route_ingest_for_run(&metadata(), OAT_RUN_CONCURRENT, millis(200_000), millis(100_002))
+        .route_ingest_for_run_with_clock(
+            &metadata(),
+            OAT_RUN_CONCURRENT,
+            millis(200_000),
+            millis(100_002),
+            || Ok(millis(100_002)),
+        )
         .await;
     let Err(error) = result else {
         panic!("hard-pressure pin must not be assigned");
@@ -322,7 +330,13 @@ async fn oat_rejections_report_the_decision_view_and_future_snapshot() {
         .unwrap_or_else(|error| panic!("refresh: {error}"));
     initialize_memory_oat_pin(&engine, OAT_RUN_CONCURRENT, millis(100_001), millis(200_000)).await;
     let selected = engine
-        .route_ingest_for_run(&metadata(), OAT_RUN_CONCURRENT, millis(200_000), millis(100_002))
+        .route_ingest_for_run_with_clock(
+            &metadata(),
+            OAT_RUN_CONCURRENT,
+            millis(200_000),
+            millis(100_002),
+            || Ok(millis(100_002)),
+        )
         .await
         .unwrap_or_else(|error| panic!("select pinned collector: {error}"));
     store
@@ -330,7 +344,13 @@ async fn oat_rejections_report_the_decision_view_and_future_snapshot() {
         .await
         .unwrap_or_else(|error| panic!("publish pressure: {error}"));
     let initial = engine
-        .route_ingest_for_run(&metadata(), OAT_RUN_CONCURRENT, millis(200_000), millis(100_002))
+        .route_ingest_for_run_with_clock(
+            &metadata(),
+            OAT_RUN_CONCURRENT,
+            millis(200_000),
+            millis(100_002),
+            || Ok(millis(100_002)),
+        )
         .await
         .err()
         .unwrap_or_else(|| panic!("future pressure must be rejected"));
@@ -618,7 +638,9 @@ async fn concurrent_oat_router_instances_read_one_prebound_table_owner() {
         .unwrap_or_else(|error| panic!("refresh right: {error}"));
     let expected = [LeaseKey::new(ImplementationPool::Dataflow, table())];
     let prepared = left
-        .initialize_run_table_pins(OAT_RUN_CONCURRENT, &expected, millis(200_000), millis(100_001))
+        .initialize_run_table_pins_with_clock(OAT_RUN_CONCURRENT, &expected, millis(200_000), millis(100_001), || {
+            Ok(millis(100_001))
+        })
         .await
         .unwrap_or_else(|error| panic!("initialize and bind complete OAT pin set: {error}"));
     assert_eq!(prepared.len(), 1);
@@ -628,15 +650,27 @@ async fn concurrent_oat_router_instances_read_one_prebound_table_owner() {
     let left_task = {
         let left = Arc::clone(&left);
         tokio::spawn(async move {
-            left.route_ingest_for_run(&metadata(), OAT_RUN_CONCURRENT, millis(200_000), millis(100_001))
-                .await
+            left.route_ingest_for_run_with_clock(
+                &metadata(),
+                OAT_RUN_CONCURRENT,
+                millis(200_000),
+                millis(100_001),
+                || Ok(millis(100_001)),
+            )
+            .await
         })
     };
     let right_task = {
         let right = Arc::clone(&right);
         tokio::spawn(async move {
             right
-                .route_ingest_for_run(&metadata(), OAT_RUN_CONCURRENT, millis(200_000), millis(100_001))
+                .route_ingest_for_run_with_clock(
+                    &metadata(),
+                    OAT_RUN_CONCURRENT,
+                    millis(200_000),
+                    millis(100_001),
+                    || Ok(millis(100_001)),
+                )
                 .await
         })
     };
@@ -725,7 +759,9 @@ async fn trusted_oat_initializer_binds_multiple_tables_to_one_eligible_collector
     expected.sort();
 
     let pins = engine
-        .initialize_run_table_pins(OAT_RUN_CONCURRENT, &expected, millis(200_000), millis(100_001))
+        .initialize_run_table_pins_with_clock(OAT_RUN_CONCURRENT, &expected, millis(200_000), millis(100_001), || {
+            Ok(millis(100_001))
+        })
         .await
         .unwrap_or_else(|error| panic!("bind complete two-table OAT set: {error}"));
     assert_eq!(pins.len(), 2);
@@ -737,7 +773,9 @@ async fn trusted_oat_initializer_binds_multiple_tables_to_one_eligible_collector
     assert_eq!(after_initialization.bind_initial_run_table_pin, 2);
 
     let retry = engine
-        .initialize_run_table_pins(OAT_RUN_CONCURRENT, &expected, millis(200_000), millis(100_002))
+        .initialize_run_table_pins_with_clock(OAT_RUN_CONCURRENT, &expected, millis(200_000), millis(100_002), || {
+            Ok(millis(100_002))
+        })
         .await
         .unwrap_or_else(|error| panic!("retry identical complete OAT pin setup: {error}"));
     assert_eq!(retry, pins);
@@ -1044,7 +1082,9 @@ async fn oat_forwarding_rejects_deadlines_crossed_during_authority_reads() {
             .await
             .unwrap_or_else(|error| panic!("initialize fixed-clock fixture: {error}"));
         let selected = engine
-            .route_ingest_for_run(&metadata(), OAT_RUN_EXPIRY, pin_expiry, millis(100_002))
+            .route_ingest_for_run_with_clock(&metadata(), OAT_RUN_EXPIRY, pin_expiry, millis(100_002), || {
+                Ok(millis(100_002))
+            })
             .await
             .unwrap_or_else(|error| panic!("select delayed-read fixture: {error}"));
         if boundary == "lease" {
@@ -1144,11 +1184,12 @@ async fn fresh_oat_router_rejects_missing_bound_owner_even_with_a_valid_replacem
     let setup = RoutingEngine::new(setup_store, oat_policy(OAT_RUN_RESTART))
         .unwrap_or_else(|error| panic!("create OAT setup engine: {error}"));
     let pins = setup
-        .initialize_run_table_pins(
+        .initialize_run_table_pins_with_clock(
             OAT_RUN_RESTART,
             std::slice::from_ref(&key),
             millis(200_000),
             millis(100_001),
+            || Ok(millis(100_001)),
         )
         .await
         .unwrap_or_else(|error| panic!("bind real OAT owner before simulating authority loss: {error}"));
@@ -1279,7 +1320,9 @@ async fn oat_pin_fails_closed_on_lease_expiry_without_selecting_a_replacement() 
         .unwrap_or_else(|error| panic!("initial refresh: {error}"));
     initialize_memory_oat_pin(&engine, OAT_RUN_EXPIRY, millis(100_001), millis(130_000)).await;
     let initial = engine
-        .route_ingest_for_run(&metadata(), OAT_RUN_EXPIRY, millis(130_000), millis(100_001))
+        .route_ingest_for_run_with_clock(&metadata(), OAT_RUN_EXPIRY, millis(130_000), millis(100_001), || {
+            Ok(millis(100_001))
+        })
         .await
         .unwrap_or_else(|error| panic!("initial OAT route: {error}"));
     let mut pinned = initial
@@ -1325,7 +1368,9 @@ async fn oat_pin_fails_closed_when_pinned_collector_process_restarts() {
         .unwrap_or_else(|error| panic!("initial refresh: {error}"));
     initialize_memory_oat_pin(&engine, OAT_RUN_RESTART, millis(100_001), millis(200_000)).await;
     let initial = engine
-        .route_ingest_for_run(&metadata(), OAT_RUN_RESTART, millis(200_000), millis(100_001))
+        .route_ingest_for_run_with_clock(&metadata(), OAT_RUN_RESTART, millis(200_000), millis(100_001), || {
+            Ok(millis(100_001))
+        })
         .await
         .unwrap_or_else(|error| panic!("initial OAT route: {error}"));
     store
@@ -1355,7 +1400,13 @@ async fn oat_pin_rejects_an_attempt_to_replace_the_run_owner() {
         .unwrap_or_else(|error| panic!("initial refresh: {error}"));
     initialize_memory_oat_pin(&engine, OAT_RUN_REPLACEMENT, millis(100_001), millis(200_000)).await;
     let initial = engine
-        .route_ingest_for_run(&metadata(), OAT_RUN_REPLACEMENT, millis(200_000), millis(100_001))
+        .route_ingest_for_run_with_clock(
+            &metadata(),
+            OAT_RUN_REPLACEMENT,
+            millis(200_000),
+            millis(100_001),
+            || Ok(millis(100_001)),
+        )
         .await
         .unwrap_or_else(|error| panic!("initial OAT route: {error}"));
     let expected_owner = initial.instance_id;
@@ -1404,20 +1455,22 @@ async fn oat_pin_uses_canonical_full_table_identity() {
         .unwrap_or_else(|error| panic!("initial refresh: {error}"));
     initialize_memory_oat_pin(&engine, OAT_RUN_CANONICAL, millis(100_001), millis(200_000)).await;
     let lower = engine
-        .route_ingest_for_run(
+        .route_ingest_for_run_with_clock(
             &metadata_for("traces"),
             OAT_RUN_CANONICAL,
             millis(200_000),
             millis(100_001),
+            || Ok(millis(100_001)),
         )
         .await
         .unwrap_or_else(|error| panic!("route lower-case table: {error}"));
     let mixed = engine
-        .route_ingest_for_run(
+        .route_ingest_for_run_with_clock(
             &metadata_for("TrAcEs"),
             OAT_RUN_CANONICAL,
             millis(200_000),
             millis(100_002),
+            || Ok(millis(100_002)),
         )
         .await
         .unwrap_or_else(|error| panic!("route mixed-case table: {error}"));
