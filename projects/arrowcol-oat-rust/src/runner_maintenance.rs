@@ -422,9 +422,6 @@ fn maintenance_table_evidence(config: &OatConfig, text: &str) -> Result<Value> {
         let raw_error_kind = value.get("error_kind").and_then(Value::as_str);
         let operation_failed = value.get("error").is_some_and(|error| !error.is_null())
             || value.get("error_kind").is_some_and(|error| !error.is_null());
-        if operation_failed && config.platform.kind == crate::config::OatMode::Aks {
-            bail!("allowlisted maintenance operation failed; inspect run-owned private operation logs");
-        }
         let error_kind = operation_failed.then(|| sanitized_maintenance_error_kind(raw_error_kind));
         if let Some(kind) = &error_kind {
             operation_error_count = operation_error_count.saturating_add(1);
@@ -595,7 +592,11 @@ mod maintenance_topology_tests {
         config.platform.kind = crate::config::OatMode::Aks;
         let mut aks_failure = report.clone();
         aks_failure["error_kind"] = json!("commit_budget_exhausted");
-        assert!(maintenance_table_evidence(&config, &format!("{text}{aks_failure}\n")).is_err());
+        let aks_evidence = maintenance_table_evidence(&config, &format!("{text}{aks_failure}\n"))?;
+        assert_eq!(
+            aks_evidence["operation_outcomes"]["error_kind_counts"]["commit_budget_exhausted"],
+            1
+        );
         for (variable, expected) in [
             ("CATALOG_RUNTIME_THREADS", json!(3)),
             ("CATALOG_RPC_TIMEOUT_SECS", json!(17)),

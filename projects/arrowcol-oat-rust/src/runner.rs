@@ -7487,7 +7487,14 @@ mod tests {
     #[test]
     fn snapshot_stop_accepts_only_maintenance_exit_one() -> Result<()> {
         let project = "owned-maintenance-run";
-        let services = ["delta-maintenance", "dataflow-1"];
+        let services = [
+            "delta-maintenance",
+            "sqlserver",
+            "arrowcol-catalog",
+            "dataflow-1",
+            "router",
+            "oat-client",
+        ];
         let before = services
             .iter()
             .enumerate()
@@ -7525,7 +7532,7 @@ mod tests {
         invalid[0]["State"]["OOMKilled"] = json!(true);
         assert!(snapshot_container_outcomes(&before, &invalid, project).is_err());
         invalid = after.clone();
-        invalid[1]["State"]["ExitCode"] = json!(1);
+        invalid[3]["State"]["ExitCode"] = json!(1);
         assert!(snapshot_container_outcomes(&before, &invalid, project).is_err());
         Ok(())
     }

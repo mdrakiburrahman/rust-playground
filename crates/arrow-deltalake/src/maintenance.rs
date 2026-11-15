@@ -93,8 +93,10 @@ pub enum MaintenanceErrorKind {
     ResourceLimit,
     /// Commit collisions or retries exhausted the bounded budget.
     Exhausted,
-    /// Cancellation or deadline interrupted work.
+    /// Cancellation interrupted work.
     Cancelled,
+    /// The operation's wall-clock deadline expired.
+    DeadlineExceeded,
     /// A publication outcome is unknown; staged outputs were retained.
     Uncertain,
 }
@@ -112,6 +114,7 @@ impl MaintenanceErrorKind {
             Self::ResourceLimit => "resource_limit",
             Self::Exhausted => "exhausted",
             Self::Cancelled => "cancelled",
+            Self::DeadlineExceeded => "deadline_exceeded",
             Self::Uncertain => "uncertain",
         }
     }
@@ -209,16 +212,19 @@ impl MaintenanceControl {
         self.cancel.load(Ordering::SeqCst) || self.deadline.is_some_and(|deadline| Instant::now() >= deadline)
     }
 
-    /// Fail with [`MaintenanceErrorKind::Cancelled`] when interrupted.
+    /// Fail with a distinct error when the signal or deadline interrupts work.
     ///
     /// # Errors
-    /// Returns a cancellation error after cancellation or deadline expiry.
+    /// Returns a cancellation error after signal cancellation or a deadline error after expiry.
     pub fn check(&self) -> Result<()> {
-        if self.interrupted() {
+        if self.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(fail(
-                MaintenanceErrorKind::Cancelled,
-                "maintenance cancelled or deadline exceeded",
+                MaintenanceErrorKind::DeadlineExceeded,
+                "maintenance operation deadline exceeded",
             ));
+        }
+        if self.cancel.load(Ordering::SeqCst) {
+            return Err(fail(MaintenanceErrorKind::Cancelled, "maintenance cancelled"));
         }
         Ok(())
     }
@@ -5339,6 +5345,29 @@ mod durability_tests {
     use std::collections::BTreeMap;
 
     const BASE: i64 = 1_704_067_200_000;
+
+    #[test]
+    fn maintenance_control_distinguishes_deadline_from_signal_cancellation() {
+        let deadline = MaintenanceControl::new(
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Some(std::time::Instant::now() - Duration::from_secs(1)),
+        );
+        let deadline_kind = match deadline.check() {
+            Ok(()) => None,
+            Err(error) => error_kind(&error),
+        };
+        assert_eq!(deadline_kind, Some(MaintenanceErrorKind::DeadlineExceeded));
+
+        let signal = MaintenanceControl::new(
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            Some(std::time::Instant::now() + Duration::from_secs(60)),
+        );
+        let signal_kind = match signal.check() {
+            Ok(()) => None,
+            Err(error) => error_kind(&error),
+        };
+        assert_eq!(signal_kind, Some(MaintenanceErrorKind::Cancelled));
+    }
 
     /// Scenario: OPTIMIZE's JSON commit becomes visible but the log fsync fails.
     /// Guarantees: neither reconciliation nor a repeated apply acknowledges the
