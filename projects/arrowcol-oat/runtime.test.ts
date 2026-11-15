@@ -103,7 +103,7 @@ test('isolated integrated topology pins images, WI, identity, probes and pooled 
   assert.equal(router.routing.oat_run_id, c.oatRunId);
   assert.equal(router.upstream.tls, false);
   assert.equal(router.upstream.max_h2_streams, 1);
-  assert.equal(router.upstream.idle_timeout_seconds, 0);
+  assert.equal(router.upstream.idle_timeout_seconds, 60);
   assert.equal(router.routing.distinct_table_owners, false);
   assert.equal(router.routing.lease_ttl_ms, 3_600_000);
   assert.equal(router.auth.edge_secret_file, '/run/auth/edge-hmac');
