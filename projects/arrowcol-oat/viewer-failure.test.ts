@@ -25,9 +25,10 @@ test('viewer derives commit-window output rather than backfilling legacy admissi
   const html = await readFile('docs/experiments/arrowcol-oat/index.html', 'utf8');
   const start = html.indexOf('function number(');
   const end = html.indexOf('const facets =', start);
-  const display = runInNewContext(`${html.slice(start, end)}; ({ outputMetrics, commitWindowNote })`) as {
+  const display = runInNewContext(`${html.slice(start, end)}; ({ outputMetrics, commitWindowNote, peakCommitWindowRate })`) as {
     outputMetrics(row: Record<string, unknown>): Record<string, unknown>;
     commitWindowNote(rows: Record<string, unknown>[]): string;
+    peakCommitWindowRate(rows: Record<string, unknown>[]): number | null;
   };
   const evidence = {
     version: 1, processes: [{
@@ -47,6 +48,7 @@ test('viewer derives commit-window output rather than backfilling legacy admissi
   assert.equal(metrics.parquet_bytes_per_row, 5);
   assert.equal(metrics.compression_ratio, 2);
   assert.equal(metrics.commit_p95_ms, 200);
+  assert.equal(display.peakCommitWindowRate([{ ...row(), measure_seconds: 1 }]), 20);
   assert.equal(display.outputMetrics({ ...row(), schema_version: 2 }).committed_rows_per_second, undefined);
   assert.equal(display.outputMetrics({ ...row(), evidence_json: '{bad' }).committed_rows_per_second, undefined);
   assert.equal(display.outputMetrics({ ...row(), evidence_json: JSON.stringify({ ...evidence, processes: [] }) }).committed_rows_per_second, undefined);
@@ -65,6 +67,9 @@ test('viewer derives commit-window output rather than backfilling legacy admissi
   } } };
   const originalQuickRun = { ...row(), rows: 107000, evidence_json: JSON.stringify(settled) };
   assert.equal(display.outputMetrics(originalQuickRun).committed_rows_per_second, 0);
+  assert.equal(display.peakCommitWindowRate([originalQuickRun]), 0);
+  assert.equal(display.peakCommitWindowRate([{ ...originalQuickRun, schema_version: 2 }]), null);
+  assert.equal(display.peakCommitWindowRate([{ ...originalQuickRun, rows_per_second: 0 }]), 0);
   const note = display.commitWindowNote([originalQuickRun]);
   assert.match(note, /No commits finished inside/);
   assert.match(note, /107,000 rows/);

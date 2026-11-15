@@ -17,7 +17,7 @@
     .status { color: #605e5c; font-size: 13px; }
     button { border: 1px solid #8a8886; border-radius: 4px; background: #fff; padding: 7px 12px; color: #201f1e; cursor: pointer; }
     button:hover { border-color: #0078d4; color: #005a9e; }
-    .stats { display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); gap: 10px; margin: 14px 0 18px; }
+    .stats { display: grid; grid-template-columns: repeat(5, minmax(120px, 1fr)); gap: 10px; margin: 14px 0 18px; }
     .stat { border: 1px solid #d5dfe8; background: #fff; border-radius: 5px; padding: 11px 13px; }
     .stat-label { color: #605e5c; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
     .stat-value { display: block; margin-top: 5px; font-size: 18px; font-weight: 650; font-variant-numeric: tabular-nums; }
@@ -85,6 +85,7 @@
   <section class="stats" aria-label="Benchmark summary">
     <div class="stat"><span class="stat-label">Rows</span><strong id="stat-rows" class="stat-value">—</strong></div>
     <div class="stat"><span class="stat-label">Configurations</span><strong id="stat-configs" class="stat-value">—</strong></div>
+    <div class="stat"><span class="stat-label">Peak admission rate (filtered)</span><strong id="stat-admission" class="stat-value">—</strong></div>
     <div class="stat"><span class="stat-label">Peak commit-window output (filtered)</span><strong id="stat-throughput" class="stat-value">—</strong></div>
     <div class="stat"><span class="stat-label">Median per-result commit p95 (filtered)</span><strong id="stat-latency" class="stat-value">—</strong></div>
   </section>
@@ -292,6 +293,12 @@ function commitWindowNote(rows) {
   } catch { cumulative = null; }
   return `${explanation} Window admission: ${show(row.rows)} rows. Whole-cell committed rows after settling (not window throughput): ${show(cumulative)}.`;
 }
+function peakCommitWindowRate(rows) {
+  const rates = rows.map(row => outputMetrics(row).committed_rows_per_second)
+    .filter(value => typeof value === 'number' && Number.isFinite(value));
+  if (!rates.length) return null;
+  return rates.reduce((best, value) => Math.max(best, value), -Infinity);
+}
 const outputColumns = new Set(['committed_rows_per_second', 'committed_rows', 'committed_files', 'parquet_bytes',
   'parquet_bytes_per_row', 'compression_ratio', 'commit_p50_ms', 'commit_p95_ms', 'commit_p99_ms']);
 const facets = [
@@ -374,12 +381,15 @@ function render() {
   const rows = allRows.filter(row => matches(row)).sort(compareRows);
   const values = key => rows.map(row => number(valueFor(row, key))).filter(value => value !== null);
   const throughput = values('committed_rows_per_second');
+  const admission = values('rows_per_second');
+  const peakCommit = peakCommitWindowRate(rows);
   const commitP95 = values('commit_p95_ms');
   const durations = values('duration_ms');
   const configs = new Set(rows.map(row => JSON.stringify([row.mode, row.stamp, row.experiment, valueFor(row, 'arrowcols'), row.dfe_worker_concurrency, row.clients, row.tables, row.tunables_json], (_, value) => typeof value === 'bigint' ? value.toString() : value)));
   document.querySelector('#stat-rows').textContent = numberFormat.format(rows.length);
   document.querySelector('#stat-configs').textContent = numberFormat.format(configs.size);
-  document.querySelector('#stat-throughput').textContent = throughput.length ? `${show(throughput.reduce((best, value) => Math.max(best, value), -Infinity))} rows/s` : '—';
+  document.querySelector('#stat-admission').textContent = admission.length ? `${show(admission.reduce((best, value) => Math.max(best, value), -Infinity))} rows/s` : '—';
+  document.querySelector('#stat-throughput').textContent = peakCommit === null ? '—' : `${show(peakCommit)} rows/s`;
   document.querySelector('#commit-window-note').textContent = commitWindowNote(rows);
   document.querySelector('#stat-latency').textContent = commitP95.length ? `${show(median(commitP95))} ms` : '—';
   document.querySelector('#filtered-count').textContent = `${numberFormat.format(rows.length)} of ${numberFormat.format(allRows.length)} rows${rows.length > MAX_RENDERED_ROWS ? ` (showing first ${MAX_RENDERED_ROWS}; filter to narrow)` : ''}`;

@@ -13,7 +13,7 @@
     }
   },
   "stamp": null,
-  "warmup_seconds": 0,
+  "warmup_seconds": 10,
   "measure_seconds": 30,
   "client_ready_timeout_seconds": 600,
   "run_pin_ttl_ms": 3600000,

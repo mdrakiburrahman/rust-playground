@@ -50,6 +50,20 @@ For the planned zero-interval comparison, keep Profile A unpooled (`sql_pool_max
 | `reconciliation_settle_timeout_seconds` | Post-client Delta commit drain deadline; defaults to 120 seconds and accepts `0..=1800`. Zero performs one immediate read. Settling is outside the measurement window. Commit evidence uses appended-log offsets plus ingress timestamps at or after the cell start. A log-prefix mismatch/rotation safely falls back to ingress-time-only scope and records that choice; prior-cell tail events are excluded, while commits crossing the cell boundary are reported unavailable. |
 | `collector_stop_grace_seconds` | Collector shutdown grace, default 300 seconds, range `30..=3600`; projected to local Compose and AKS, verified against the effective runtime configuration, and included in the run-pin lifetime budget. |
 
+## Quick-run measurement scopes
+
+| Measurement | Interpretation |
+| --- | --- |
+| Supplied local/AKS quick profiles | 10-second warm-up, 30-second measurement, unchanged load. Shipped OAT YAML uses `batching.max_age: 5s` and `commit.batch_window: 2s`; injected settings may change these timings. |
+| Admission rows/s | Client completions within the exact shared measurement window divided by its duration; not durable output. |
+| Commit-window rows/s | Rows in new ingestion commits finished within that exact window; not a client cohort and not post-window settling. |
+| Zero commit-window output | A short run may admit rows before commits finish. Known zero remains zero in the summary/table/result with an explanation; a dash means unavailable evidence. Size-triggered flushes and warm-up backlog can still produce commits in short windows. |
+| Whole-cell reconciliation | Compare process-cumulative completed rows with committed Delta rows after settling, including warm-up. This is separate from either window rate. |
+
+Short admission/smoke runs remain supported; duration below a flush timer alone
+does not make a configuration invalid. Increase the measurement window when
+evaluating sustained durable output, and report the changed duration explicitly.
+
 ## Collector runtime compatibility
 
 | Setting | Contract |
