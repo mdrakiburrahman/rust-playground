@@ -75,6 +75,14 @@ impl RuntimeError {
         )
     }
 
+    /// Creates a deadline failure before the collector admitted the delivery.
+    #[must_use]
+    pub fn not_admitted_deadline_exceeded() -> Self {
+        let mut error = Self::deadline_exceeded();
+        error.not_admitted = true;
+        error
+    }
+
     /// Creates a graceful-drain admission failure.
     #[must_use]
     pub fn draining() -> Self {
@@ -85,6 +93,16 @@ impl RuntimeError {
         );
         error.not_admitted = true;
         error
+    }
+
+    /// Creates an unmarked shutdown failure after delivery admission.
+    #[must_use]
+    pub fn shutdown_after_admission() -> Self {
+        Self::new(
+            ErrorCode::PoolUnavailable,
+            Code::Unavailable,
+            "collector stopped after delivery admission",
+        )
     }
 
     /// Maps validated metadata failures without reflecting untrusted values.

@@ -18,6 +18,7 @@ arrowcol-protocol = { path = "../../crates/arrowcol-protocol" }
 arrowcol-routing = { path = "../../crates/arrowcol-routing" }
 arrow-deltalake = { path = "../../crates/arrow-deltalake" }
 arrowcol-tunables = { path = "../../crates/arrowcol-tunables" }
+arrowcol-router-rust = { path = "../arrowcol-router-rust" }
 arrowcol-loadgen = { path = "../loadtest/loadgen" }
 otel-arrow-dfe-quiver = { path = "../../submodules/otel-arrow/rust/otap-dataflow/crates/quiver", default-features = false }
 chrono = "0.4"

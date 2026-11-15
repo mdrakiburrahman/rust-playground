@@ -26,15 +26,15 @@ use arrowcol_catalog::{
     deterministic_table_id, generate_descriptor_artifacts,
 };
 use arrowcol_flight::{
-    ArrowColFlightService, AuthenticationRequest, Authenticator, BatchAdmission, DeliveryGuarantee, PressureEvent,
-    PressureHooks, PutResultEmitter, PutResultMetadata, RuntimeError, RuntimeLimits, RuntimeResult, StreamAbortReason,
-    StreamCompletion, StreamContext, StreamLifecycle, StreamSummary, align_record_batch,
+    ArrowColFlightService, AuthenticationRequest, Authenticator, BatchAdmission, DeliveryGuarantee, DrainController,
+    PressureEvent, PressureHooks, PutResultEmitter, PutResultMetadata, RuntimeError, RuntimeLimits, RuntimeResult,
+    StreamAbortReason, StreamCompletion, StreamContext, StreamLifecycle, StreamSummary, align_record_batch,
     decode_ddl_completion_metadata, decode_status_metadata,
 };
 use arrowcol_protocol::{
     AuthContext, AuthMethod, AuthenticatedPrincipal, CatalogName, ClaimedSchemaFingerprint, ImplementationPool,
-    IngestMetadata, PrincipalId, PrincipalIssuer, ProtocolVersion, SchemaName, TableIdentity, TableName, UnixMillis,
-    fingerprint_schema,
+    IngestMetadata, NOT_ADMITTED_METADATA_KEY, PrincipalId, PrincipalIssuer, ProtocolVersion, SchemaName,
+    TableIdentity, TableName, UnixMillis, fingerprint_schema,
 };
 use async_trait::async_trait;
 use futures::{Stream, StreamExt, TryStreamExt, stream};
@@ -339,6 +339,78 @@ async fn a_second_schema_message_aborts_the_admitted_stream() -> Result<()> {
     assert_eq!(status.code(), Code::InvalidArgument);
     assert_eq!(admission.begin_count(), 1);
     assert_eq!(admission.wait_aborted().await?, StreamAbortReason::DecodeFailure);
+    Ok(())
+}
+
+#[tokio::test]
+async fn force_stop_before_first_batch_marks_not_admitted() -> Result<()> {
+    let fixture = Fixture::with_current(false).await?;
+    let gate = Arc::new(BatchGate::new());
+    let admission = MockAdmission::new_gated_at(TestCompletion::BestEffort, Some(Arc::clone(&gate)), 1);
+    let drain = DrainController::new();
+    let service = fixture
+        .service(ImplementationPool::Dataflow, admission)?
+        .with_drain_controller(drain.clone());
+    let request = ingest_request(
+        &fixture.v1,
+        vec![v1_batch(&fixture.v1, 0)?],
+        ImplementationPool::Dataflow,
+        fixture.v1.fingerprint(),
+    )
+    .await?;
+    let response = service.handle_do_put(request).await?;
+    let task = tokio::spawn(async move { response.into_inner().try_collect::<Vec<PutResult>>().await });
+    gate.wait_entered().await?;
+    drain.force_stop();
+    let status = task
+        .await
+        .context("join force-stopped response")?
+        .expect_err("force stop returned success");
+    assert_eq!(
+        status
+            .metadata()
+            .get(NOT_ADMITTED_METADATA_KEY)
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn force_stop_after_pushed_batch_is_not_retryable() -> Result<()> {
+    let fixture = Fixture::with_current(false).await?;
+    let gate = Arc::new(BatchGate::new());
+    let admission = MockAdmission::new_gated_at(TestCompletion::BestEffort, Some(Arc::clone(&gate)), 2);
+    let drain = DrainController::new();
+    let service = fixture
+        .service(ImplementationPool::Dataflow, admission.clone())?
+        .with_drain_controller(drain.clone());
+    let batches = vec![v1_batch(&fixture.v1, 0)?, v1_batch(&fixture.v1, 10)?];
+    let request = ingest_request(
+        &fixture.v1,
+        batches,
+        ImplementationPool::Dataflow,
+        fixture.v1.fingerprint(),
+    )
+    .await?;
+    let response = service.handle_do_put(request).await?;
+    let task = tokio::spawn(async move { response.into_inner().try_collect::<Vec<PutResult>>().await });
+    gate.wait_entered().await?;
+    assert_eq!(
+        admission.batches().await.len(),
+        1,
+        "first batch must be pushed before shutdown"
+    );
+    drain.force_stop();
+    let status = task
+        .await
+        .context("join force-stopped response")?
+        .expect_err("force stop returned success");
+    assert!(
+        status.metadata().get(NOT_ADMITTED_METADATA_KEY).is_none(),
+        "post-admission shutdown must not be retried"
+    );
+    assert_eq!(admission.batches().await.len(), 1);
     Ok(())
 }
 
@@ -714,6 +786,8 @@ enum TestCompletion {
 
 struct MockAdmissionState {
     begin_count: AtomicUsize,
+    push_count: AtomicUsize,
+    gate_at_batch: usize,
     batches: Mutex<Vec<RecordBatch>>,
     aborted: Mutex<Vec<StreamAbortReason>>,
     aborted_signal: Semaphore,
@@ -728,9 +802,15 @@ struct MockAdmission {
 
 impl MockAdmission {
     fn new(completion: TestCompletion, gate: Option<Arc<BatchGate>>) -> Self {
+        Self::new_gated_at(completion, gate, 1)
+    }
+
+    fn new_gated_at(completion: TestCompletion, gate: Option<Arc<BatchGate>>, gate_at_batch: usize) -> Self {
         Self {
             state: Arc::new(MockAdmissionState {
                 begin_count: AtomicUsize::new(0),
+                push_count: AtomicUsize::new(0),
+                gate_at_batch,
                 batches: Mutex::new(Vec::new()),
                 aborted: Mutex::new(Vec::new()),
                 aborted_signal: Semaphore::new(0),
@@ -774,21 +854,19 @@ impl BatchAdmission for MockAdmission {
         self.state.begin_count.fetch_add(1, Ordering::AcqRel);
         Ok(Box::new(MockLifecycle {
             state: Arc::clone(&self.state),
-            first: true,
         }))
     }
 }
 
 struct MockLifecycle {
     state: Arc<MockAdmissionState>,
-    first: bool,
 }
 
 #[async_trait]
 impl StreamLifecycle for MockLifecycle {
     async fn push_batch(&mut self, batch: RecordBatch) -> RuntimeResult<()> {
-        if self.first {
-            self.first = false;
+        let push_number = self.state.push_count.fetch_add(1, Ordering::AcqRel) + 1;
+        if push_number == self.state.gate_at_batch {
             if let Some(gate) = &self.state.gate {
                 gate.entered.add_permits(1);
                 let permit = gate.release.acquire().await.map_err(|_| RuntimeError::internal())?;

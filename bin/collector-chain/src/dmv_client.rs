@@ -392,6 +392,8 @@ struct Counters {
     retried_rows: AtomicU64,
     given_up_streams: AtomicU64,
     given_up_rows: AtomicU64,
+    ambiguous_streams: AtomicU64,
+    ambiguous_rows: AtomicU64,
     latency: Mutex<[u64; 64]>,
 }
 
@@ -414,6 +416,8 @@ impl Default for Counters {
             retried_rows: AtomicU64::new(0),
             given_up_streams: AtomicU64::new(0),
             given_up_rows: AtomicU64::new(0),
+            ambiguous_streams: AtomicU64::new(0),
+            ambiguous_rows: AtomicU64::new(0),
             latency: Mutex::new([0; 64]),
         }
     }
@@ -457,6 +461,8 @@ impl Counters {
             "retried_rows": self.retried_rows.load(Ordering::Relaxed),
             "given_up_streams": self.given_up_streams.load(Ordering::Relaxed),
             "given_up_rows": self.given_up_rows.load(Ordering::Relaxed),
+            "ambiguous_streams": self.ambiguous_streams.load(Ordering::Relaxed),
+            "ambiguous_rows": self.ambiguous_rows.load(Ordering::Relaxed),
             "rows_per_second": self.completed_rows.load(Ordering::Relaxed) as f64 / elapsed.max(f64::MIN_POSITIVE),
             "send_latency_us": {"p50": percentile(50), "p95": percentile(95), "p99": percentile(99), "samples": count, "precision": "power_of_two_upper_bound"}
         })
@@ -483,6 +489,8 @@ struct Measurement {
     retried_rows: AtomicU64,
     given_up_streams: AtomicU64,
     given_up_rows: AtomicU64,
+    ambiguous_streams: AtomicU64,
+    ambiguous_rows: AtomicU64,
 }
 
 impl Measurement {
@@ -503,6 +511,8 @@ impl Measurement {
             retried_rows: AtomicU64::new(0),
             given_up_streams: AtomicU64::new(0),
             given_up_rows: AtomicU64::new(0),
+            ambiguous_streams: AtomicU64::new(0),
+            ambiguous_rows: AtomicU64::new(0),
         })
     }
 
@@ -529,6 +539,8 @@ impl Measurement {
             "retried_rows": self.retried_rows.load(Ordering::Relaxed),
             "given_up_streams": self.given_up_streams.load(Ordering::Relaxed),
             "given_up_rows": self.given_up_rows.load(Ordering::Relaxed),
+            "ambiguous_streams": self.ambiguous_streams.load(Ordering::Relaxed),
+            "ambiguous_rows": self.ambiguous_rows.load(Ordering::Relaxed),
             "scope": "per_stream_admission_completion_observed_in_half_open_shared_unix_window",
         })
     }
@@ -551,6 +563,13 @@ impl Measurement {
         if observed_unix_ms >= self.start_unix_ms && observed_unix_ms < self.end_unix_ms {
             self.given_up_streams.fetch_add(1, Ordering::Relaxed);
             self.given_up_rows.fetch_add(rows, Ordering::Relaxed);
+        }
+    }
+
+    fn record_ambiguous(&self, rows: u64, observed_unix_ms: u64) {
+        if observed_unix_ms >= self.start_unix_ms && observed_unix_ms < self.end_unix_ms {
+            self.ambiguous_streams.fetch_add(1, Ordering::Relaxed);
+            self.ambiguous_rows.fetch_add(rows, Ordering::Relaxed);
         }
     }
 }
@@ -1096,7 +1115,13 @@ impl PreparedClient {
                     ))
                     .await;
                 }
-                Err(error) => return Err(error),
+                Err(_) => {
+                    let counters = &self.counters[worker];
+                    counters.ambiguous_streams.fetch_add(1, Ordering::Relaxed);
+                    counters.ambiguous_rows.fetch_add(batch.rows, Ordering::Relaxed);
+                    measurement.record_ambiguous(batch.rows, unix_ms()?);
+                    return Ok(true);
+                }
             }
         }
         unreachable!("validated stream retry attempt count is positive")
@@ -1370,6 +1395,7 @@ mod tests {
     struct SmokeState {
         slow_next: AtomicBool,
         rejections_remaining: AtomicU64,
+        ambiguous_remaining: AtomicU64,
         fast_completions: AtomicU64,
         rows: AtomicU64,
     }
@@ -1417,6 +1443,14 @@ mod tests {
                 self.state.fast_completions.fetch_add(1, Ordering::Relaxed);
             }
             self.state.rows.fetch_add(self.rows, Ordering::Relaxed);
+            if self
+                .state
+                .ambiguous_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1))
+                .is_ok()
+            {
+                return Err(RuntimeError::deadline_exceeded());
+            }
             Ok(StreamCompletion::best_effort())
         }
         async fn abort(self: Box<Self>, _: StreamAbortReason) {}
@@ -1761,6 +1795,7 @@ mod tests {
         state.fast_completions.store(0, Ordering::Relaxed);
         state.slow_next.store(true, Ordering::SeqCst);
         state.rejections_remaining.store(2, Ordering::SeqCst);
+        state.ambiguous_remaining.store(1, Ordering::SeqCst);
         let scheduled_start = unix_ms()? + 100;
         let measurement_start = scheduled_start + 50;
         let scheduled_client = Arc::clone(&client);
@@ -1796,13 +1831,25 @@ mod tests {
         assert!(retry_counts("retried_rows")? >= 16);
         assert_eq!(retry_counts("given_up_streams")?, 0);
         assert_eq!(retry_counts("given_up_rows")?, 0);
+        assert!(retry_counts("ambiguous_streams")? >= 1);
+        assert!(retry_counts("ambiguous_rows")? >= 8);
+        assert!(metrics["measurement_window"]["ambiguous_streams"].as_u64().unwrap_or(0) >= 1);
         let total = metrics["workers"]
             .as_array()
             .context("missing workers")?
             .iter()
             .map(|worker| worker["completed_rows"].as_u64().context("missing completed rows"))
             .sum::<Result<u64>>()?;
-        assert_eq!(total, state.rows.load(Ordering::Relaxed));
+        let committed_rows = state.rows.load(Ordering::Relaxed);
+        let ambiguous_rows = retry_counts("ambiguous_rows")?;
+        assert!(
+            total <= committed_rows,
+            "acknowledged sends cannot exceed committed rows"
+        );
+        assert!(
+            committed_rows <= total + ambiguous_rows,
+            "committed rows must be bounded by ambiguous sends"
+        );
         assert!(
             total >= report.completed_rows + 16,
             "late slow acknowledgement must be drained but excluded from measurement"

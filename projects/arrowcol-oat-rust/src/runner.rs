@@ -5071,7 +5071,10 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
 
     let mut workload = render_runtime_phase(&runtime_script, &generated_config, "workload", &runtime_dir).await?;
     inject_workload_environment(config, &mut workload)?;
-    platform.router_yaml = Some(rendered_router_yaml(&workload)?);
+    let router_yaml = rendered_router_yaml(&workload)?;
+    arrowcol_router_rust::RouterConfig::from_yaml(router_yaml.as_bytes())
+        .context("validate rendered router YAML with the router config validator")?;
+    platform.router_yaml = Some(router_yaml);
     apply_runtime_resources(config, without_identity_resources(workload)).await?;
     for name in ["arrowcol-catalog", "arrowcol", "arrowcol-router"] {
         rollout(config, name).await?;
@@ -6023,21 +6026,191 @@ async fn apply_deployment(config: &OatConfig, mut deployment: Value) -> Result<(
 }
 
 async fn rollout(config: &OatConfig, name: &str) -> Result<()> {
-    kubectl(
+    let deployment_json = kubectl(
         config,
         vec![
-            "rollout",
-            "status",
-            &format!("deployment/{name}"),
+            "get",
+            "deployment",
+            name,
             "--namespace",
             &config.namespace,
-            "--timeout=120s",
+            "-o",
+            "json",
         ],
         None,
     )
     .await
-    .with_context(|| format!("wait for Deployment {name} rollout"))?;
-    Ok(())
+    .with_context(|| format!("read Deployment {name} rollout selector"))?;
+    let deployment: Value = serde_json::from_str(&deployment_json).context("parse Deployment rollout status")?;
+    let labels = deployment
+        .pointer("/spec/selector/matchLabels")
+        .and_then(Value::as_object)
+        .context("Deployment selector.matchLabels is missing")?;
+    let selector = labels
+        .iter()
+        .map(|(key, value)| {
+            value
+                .as_str()
+                .map(|value| format!("{key}={value}"))
+                .context("Deployment selector labels must be strings")
+        })
+        .collect::<Result<Vec<_>>>()?
+        .join(",");
+    anyhow::ensure!(!selector.is_empty(), "Deployment selector must not be empty");
+    let desired_replicas = deployment
+        .pointer("/spec/replicas")
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+    anyhow::ensure!(
+        desired_replicas > 0,
+        "Deployment {name} must request at least one replica"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(config.aks_rollout_timeout_seconds);
+    loop {
+        let pods_json = kubectl(
+            config,
+            vec![
+                "get",
+                "pods",
+                "--namespace",
+                &config.namespace,
+                "--selector",
+                &selector,
+                "-o",
+                "json",
+            ],
+            None,
+        )
+        .await
+        .with_context(|| format!("read pods for Deployment {name}"))?;
+        let pods: Value = serde_json::from_str(&pods_json).context("parse Deployment pod state")?;
+        let pod_items = pods
+            .get("items")
+            .and_then(Value::as_array)
+            .context("kubectl pod response has no items array")?;
+        for pod in pod_items {
+            if let Some(reason) = rollout_pod_failure(pod) {
+                let pod_name = pod
+                    .pointer("/metadata/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let diagnostics = rollout_failure_diagnostics(config, name, Some(pod_name)).await;
+                bail!("Deployment {name} pod {pod_name} failed readiness: {reason}\n{diagnostics}");
+            }
+        }
+
+        let status = kubectl(
+            config,
+            vec![
+                "get",
+                "deployment",
+                name,
+                "--namespace",
+                &config.namespace,
+                "-o",
+                "json",
+            ],
+            None,
+        )
+        .await
+        .with_context(|| format!("poll Deployment {name} readiness"))?;
+        let current: Value = serde_json::from_str(&status).context("parse Deployment readiness")?;
+        let ready = ["updatedReplicas", "readyReplicas", "availableReplicas"]
+            .iter()
+            .all(|field| {
+                current
+                    .pointer(&format!("/status/{field}"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    >= desired_replicas
+            });
+        if ready {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let diagnostics = rollout_failure_diagnostics(config, name, None).await;
+            bail!(
+                "Deployment {name} did not become ready within {} seconds\n{diagnostics}",
+                config.aks_rollout_timeout_seconds
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+fn rollout_pod_failure(pod: &Value) -> Option<String> {
+    const FAILURE_REASONS: [&str; 5] = [
+        "CrashLoopBackOff",
+        "Error",
+        "ImagePullBackOff",
+        "ErrImagePull",
+        "CreateContainerConfigError",
+    ];
+    for field in [
+        "initContainerStatuses",
+        "containerStatuses",
+        "ephemeralContainerStatuses",
+    ] {
+        let Some(statuses) = pod.pointer(&format!("/status/{field}")).and_then(Value::as_array) else {
+            continue;
+        };
+        for status in statuses {
+            let container = status.get("name").and_then(Value::as_str).unwrap_or("unknown");
+            let restarts = status.get("restartCount").and_then(Value::as_u64).unwrap_or(0);
+            if restarts >= 2 {
+                return Some(format!("container {container} restarted {restarts} times"));
+            }
+            for path in ["/state/waiting/reason", "/state/terminated/reason"] {
+                if let Some(reason) = status
+                    .pointer(path)
+                    .and_then(Value::as_str)
+                    .filter(|reason| FAILURE_REASONS.contains(reason))
+                {
+                    return Some(format!("container {container} entered {reason}"));
+                }
+            }
+        }
+    }
+    None
+}
+
+async fn rollout_failure_diagnostics(config: &OatConfig, deployment: &str, pod: Option<&str>) -> String {
+    let mut details = Vec::new();
+    if let Some(pod) = pod {
+        let logs = kubectl(
+            config,
+            vec![
+                "logs",
+                pod,
+                "--namespace",
+                &config.namespace,
+                "--all-containers=true",
+                "--previous",
+            ],
+            None,
+        )
+        .await
+        .unwrap_or_else(|error| format!("could not read previous pod logs: {error:#}"));
+        details.push(format!("kubectl logs --previous:\n{logs}"));
+        let description = kubectl(
+            config,
+            vec!["describe", "pod", pod, "--namespace", &config.namespace],
+            None,
+        )
+        .await
+        .unwrap_or_else(|error| format!("could not describe pod: {error:#}"));
+        details.push(format!("kubectl describe pod:\n{description}"));
+    }
+    let description = kubectl(
+        config,
+        vec!["describe", "deployment", deployment, "--namespace", &config.namespace],
+        None,
+    )
+    .await
+    .unwrap_or_else(|error| format!("could not describe Deployment: {error:#}"));
+    details.push(format!("kubectl describe deployment:\n{description}"));
+    details.join("\n")
 }
 
 async fn collect_aks_metrics(config: &OatConfig) -> Result<ResourceMetrics> {

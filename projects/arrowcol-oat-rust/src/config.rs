@@ -17,6 +17,8 @@ pub struct OatConfig {
     pub measure_seconds: u64,
     #[serde(default = "default_client_ready_timeout_seconds")]
     pub client_ready_timeout_seconds: u64,
+    #[serde(default = "default_aks_rollout_timeout_seconds")]
+    pub aks_rollout_timeout_seconds: u64,
     #[serde(default = "default_run_pin_ttl_ms")]
     pub run_pin_ttl_ms: u64,
     pub pilot_mode: bool,
@@ -94,6 +96,10 @@ pub enum OatMode {
 }
 
 fn default_client_ready_timeout_seconds() -> u64 {
+    600
+}
+
+fn default_aks_rollout_timeout_seconds() -> u64 {
     600
 }
 
@@ -248,6 +254,9 @@ impl OatConfig {
         }
         if !(30..=1_800).contains(&self.client_ready_timeout_seconds) {
             bail!("client_ready_timeout_seconds must be between 30 and 1800");
+        }
+        if !(600..=3_600).contains(&self.aks_rollout_timeout_seconds) {
+            bail!("aks_rollout_timeout_seconds must be between 600 and 3600");
         }
         if !(1..=300).contains(&self.qap_timeout_seconds) {
             bail!("qap_timeout_seconds must be between 1 and 300");
@@ -721,6 +730,7 @@ mod tests {
             warmup_seconds: 30,
             measure_seconds: 60,
             client_ready_timeout_seconds: 600,
+            aks_rollout_timeout_seconds: 600,
             run_pin_ttl_ms: 3_600_000,
             pilot_mode: false,
             namespace: "arrowcol".to_owned(),

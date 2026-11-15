@@ -29,6 +29,22 @@ pub fn collector_is_eligible(
         && pressure.maximum_pressure_bps_excluding(&policy.excluded_admission_gauges) < policy.hard_pressure_bps
 }
 
+/// Returns whether a fresh, registered holder is temporarily rejecting new work.
+#[must_use]
+pub fn collector_is_overloaded(collector: &CollectorRecord, now: UnixMillis, policy: &RoutingPolicy) -> bool {
+    if collector.state != CollectorState::Ready || !collector.registration.is_live_at(now) {
+        return false;
+    }
+    let Some(pressure) = collector.pressure.as_ref() else {
+        return false;
+    };
+    pressure.instance_id == collector.registration.instance_id
+        && pressure.validate_at(now, &policy.pressure).is_ok()
+        && (!pressure.accepting_deliveries
+            || pressure.subsystem_blocked()
+            || pressure.maximum_pressure_bps_excluding(&policy.excluded_admission_gauges) >= policy.hard_pressure_bps)
+}
+
 /// Ranks eligible collectors using weighted rendezvous hashing.
 ///
 /// The complete deterministic ordering provides stable fallback when the first

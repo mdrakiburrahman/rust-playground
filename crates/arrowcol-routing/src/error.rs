@@ -16,6 +16,9 @@ pub enum RoutingErrorKind {
     /// A table lease is draining and rejects new streams.
     #[error("table lease is draining")]
     LeaseDraining,
+    /// A valid lease holder is currently rejecting new streams under hard pressure.
+    #[error("table lease holder is overloaded")]
+    LeaseHolderOverloaded,
     /// A valid lease exists, but its holder is not safe for a new stream.
     #[error("table lease holder is unavailable")]
     LeaseHolderUnavailable,
