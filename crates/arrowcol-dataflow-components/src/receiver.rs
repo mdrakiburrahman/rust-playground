@@ -10,7 +10,7 @@ use arrowcol_flight::{
 };
 use arrowcol_protocol::{
     AuthContext, AuthMethod, AuthenticatedPrincipal, CollectorInstanceId, ErrorCode, ImplementationPool,
-    PositiveMeasurement, PrincipalId, PrincipalIssuer,
+    NOT_ADMITTED_METADATA_KEY, PositiveMeasurement, PrincipalId, PrincipalIssuer,
 };
 use arrowcol_routing::{CollectorRegistration, CollectorState, RoutingStore};
 use async_trait::async_trait;
@@ -385,7 +385,11 @@ impl StreamLifecycle for DfeStreamLifecycle {
                 Ok(())
             }
             Err(error) => Err(match error {
-                PdataSendError::Closed => RuntimeError::draining(),
+                PdataSendError::Closed => RuntimeError::new(
+                    ErrorCode::PoolUnavailable,
+                    tonic::Code::Unavailable,
+                    "DFE downstream route closed after admission",
+                ),
                 PdataSendError::Unavailable => RuntimeError::new(
                     ErrorCode::CapacityExhausted,
                     tonic::Code::Unavailable,
@@ -1021,12 +1025,12 @@ pub(crate) mod tests {
         }
     }
 
-    struct FailingSender;
+    struct FailingSender(PdataSendError);
 
     #[async_trait]
     impl PdataSender for FailingSender {
         async fn send(&self, _correlation_id: u64, _pdata: OtapPdata) -> Result<(), PdataSendError> {
-            Err(PdataSendError::Unavailable)
+            Err(self.0)
         }
     }
 
@@ -1216,7 +1220,7 @@ pub(crate) mod tests {
         let envelope = envelope();
         metrics.stream_started(&envelope.table);
         let mut lifecycle = DfeStreamLifecycle {
-            sender: Arc::new(FailingSender),
+            sender: Arc::new(FailingSender(PdataSendError::Unavailable)),
             pending,
             metrics: Arc::clone(&metrics),
             envelope,
@@ -1229,6 +1233,30 @@ pub(crate) mod tests {
         assert_eq!(error.code(), ErrorCode::CapacityExhausted);
         let pressure = metrics.pressure().expect("pressure");
         assert_eq!(pressure.rich.buffered_batches.current().get(), 0);
+    }
+
+    #[tokio::test]
+    async fn closed_downstream_route_is_not_marked_not_admitted() {
+        let metrics = Arc::new(RuntimeMetrics::new(CollectorInstanceId::new()));
+        metrics.configure_receiver(1, 1_000_000, 1_000_000, 100, 10, 1);
+        let pending = Arc::new(PendingTracker::new(Arc::clone(&metrics)));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&semaphore).acquire_owned().await.expect("permit");
+        let envelope = envelope();
+        metrics.stream_started(&envelope.table);
+        let mut lifecycle = DfeStreamLifecycle {
+            sender: Arc::new(FailingSender(PdataSendError::Closed)),
+            pending,
+            metrics,
+            envelope,
+            permit: Some(permit),
+            finished: false,
+            durable: None,
+        };
+
+        let error = lifecycle.push_batch(batch()).await.expect_err("closed route");
+        assert_eq!(error.code(), ErrorCode::PoolUnavailable);
+        assert!(error.into_status().metadata().get(NOT_ADMITTED_METADATA_KEY).is_none());
     }
 
     /// Scenario: Flight admission is cancelled while a bounded DFE route is backpressured.
@@ -1325,8 +1353,6 @@ pub(crate) mod tests {
         });
         let metrics = Arc::new(RuntimeMetrics::new(instance_id));
         metrics.configure_receiver(2, 1_000_000_000, 1_000_000, 10_000, 16, 2);
-        metrics.set_catalog_ready(true);
-        metrics.set_registered(true);
         metrics.configure_exporter(2);
         let admission = Arc::new(DfeAdmission::new(
             Arc::clone(&sender) as Arc<dyn PdataSender>,
@@ -1337,7 +1363,7 @@ pub(crate) mod tests {
             instance_id,
             "dfe-flight-test",
             2,
-            metrics,
+            Arc::clone(&metrics),
         ));
         let service = ArrowColFlightService::new(
             ImplementationPool::Dataflow,
@@ -1346,6 +1372,31 @@ pub(crate) mod tests {
             admission as Arc<dyn BatchAdmission>,
             arrowcol_flight::RuntimeLimits::default(),
         )?;
+        let status = match service
+            .handle_do_put(
+                flight_request(
+                    ddl.identity(),
+                    current.version(),
+                    Arc::clone(&schema),
+                    vec![input.clone()],
+                )
+                .await?,
+            )
+            .await
+        {
+            Ok(_) => return Err(anyhow::anyhow!("unready collector accepted a delivery")),
+            Err(status) => status,
+        };
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            status
+                .metadata()
+                .get(NOT_ADMITTED_METADATA_KEY)
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+        metrics.set_catalog_ready(true);
+        metrics.set_registered(true);
         let results = service
             .handle_do_put(flight_request(ddl.identity(), current.version(), Arc::clone(&schema), vec![input]).await?)
             .await?
