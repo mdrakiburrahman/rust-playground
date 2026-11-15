@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use arrowcol_protocol::{
     CatalogName, CollectorInstanceId, ImplementationPool, IngestMetadata, SchemaName, TableIdentity, TableName,
@@ -8,9 +9,9 @@ use arrowcol_protocol::{
 use tokio::sync::RwLock;
 
 use crate::{
-    LeaseCas, LeaseClaim, LeaseKey, LeaseState, LeaseSuccession, LeaseTransfer, RoutingError, RoutingErrorKind,
-    RoutingLease, RoutingPolicy, RoutingResult, RoutingStore, RoutingView, RunTablePin, collector_is_eligible,
-    rank_collectors,
+    LeaseCas, LeaseClaim, LeaseKey, LeaseState, LeaseSuccession, LeaseTransfer, OatRoutingDiagnostic, RoutingError,
+    RoutingErrorKind, RoutingLease, RoutingPolicy, RoutingResult, RoutingStore, RoutingView, RunTablePin,
+    collector_is_eligible, rank_collectors,
 };
 
 /// Flight SQL control operation declared before the request body.
@@ -238,13 +239,21 @@ impl RoutingEngine {
         validate_oat_run_id(run_id, run_expires_at, now)?;
         let metadata = canonical_oat_metadata(metadata)?;
         let key = LeaseKey::new(metadata.implementation_pool(), metadata.table().clone());
+        let pin_started = Instant::now();
         let pin = self.store.get_run_table_pin(run_id, &key, now).await?.ok_or_else(|| {
             RoutingError::new(
                 RoutingErrorKind::Conflict,
                 "immutable OAT run-table pin is missing; refusing to initialize on an ingest request",
             )
         })?;
-        self.assignment_for_run_pin(&pin, now).await
+        let pin_read_ms = elapsed_ms(pin_started);
+        let load_started = Instant::now();
+        let view = self.refresh(now).await?;
+        let load_view_ms = elapsed_ms(load_started);
+        self.assignment_for_run_pin_in_view(&pin, &view, now).map_err(|error| {
+            let diagnostic = oat_diagnostic(&error, &pin, &view, now, &self.policy, pin_read_ms, load_view_ms);
+            error.with_oat_diagnostic(diagnostic)
+        })
     }
 
     /// Revalidates an already selected OAT upstream immediately before forwarding.
@@ -298,6 +307,7 @@ impl RoutingEngine {
             .lease
             .as_ref()
             .ok_or_else(|| RoutingError::new(RoutingErrorKind::Conflict, "OAT ingest assignment has no table lease"))?;
+        let pin_started = Instant::now();
         let pin = self
             .store
             .get_run_table_pin(run_id, &selected.key, now)
@@ -308,7 +318,10 @@ impl RoutingEngine {
                     "immutable OAT pin disappeared before forwarding",
                 )
             })?;
+        let pin_read_ms = elapsed_ms(pin_started);
+        let load_started = Instant::now();
         let view = self.refresh(now).await?;
+        let load_view_ms = elapsed_ms(load_started);
         let checked_at = clock()?;
         if checked_at < now {
             return Err(RoutingError::new(
@@ -316,7 +329,13 @@ impl RoutingEngine {
                 "OAT forwarding clock regressed",
             ));
         }
-        let current = self.assignment_for_run_pin_in_view(&pin, &view, checked_at)?;
+        let current = self
+            .assignment_for_run_pin_in_view(&pin, &view, checked_at)
+            .map_err(|error| {
+                let diagnostic =
+                    oat_diagnostic(&error, &pin, &view, checked_at, &self.policy, pin_read_ms, load_view_ms);
+                error.with_oat_diagnostic(diagnostic)
+            })?;
         if current.instance_id != assignment.instance_id
             || current.flight_endpoint != assignment.flight_endpoint
             || pin.holder_instance_id != selected.holder_instance_id
@@ -805,6 +824,73 @@ fn validate_oat_run_id(run_id: &str, expires_at: UnixMillis, now: UnixMillis) ->
         ));
     }
     Ok(())
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn oat_diagnostic(
+    error: &RoutingError,
+    pin: &RunTablePin,
+    view: &RoutingView,
+    now: UnixMillis,
+    policy: &RoutingPolicy,
+    pin_read_ms: u64,
+    load_view_ms: u64,
+) -> OatRoutingDiagnostic {
+    let collector = view.collectors.get(&pin.holder_instance_id);
+    let pressure = collector.and_then(|collector| collector.pressure.as_ref());
+    let validation = pressure.and_then(|pressure| pressure.validate_at(now, &policy.pressure).err());
+    let reason = match error.kind() {
+        RoutingErrorKind::LeaseHolderUnavailable | RoutingErrorKind::LeaseHolderOverloaded => {
+            Some(if let Some(collector) = collector {
+                if collector.state != crate::CollectorState::Ready {
+                    "not_ready"
+                } else if !collector.registration.is_live_at(now) {
+                    "registration_not_live"
+                } else if let Some(pressure) = pressure {
+                    if pressure.instance_id != collector.registration.instance_id {
+                        "pressure_instance_mismatch"
+                    } else if pressure.observed_at_unix_ms.get()
+                        > now.get().saturating_add(policy.pressure.max_future_skew_ms)
+                    {
+                        "pressure_future"
+                    } else if now.get().saturating_sub(pressure.observed_at_unix_ms.get())
+                        > policy.pressure.max_snapshot_age_ms
+                    {
+                        "pressure_stale"
+                    } else if validation.is_some() {
+                        "pressure_invalid"
+                    } else if crate::collector_is_overloaded(collector, now, policy) {
+                        "overloaded"
+                    } else {
+                        "other"
+                    }
+                } else {
+                    "pressure_missing"
+                }
+            } else {
+                "holder_absent"
+            })
+        }
+        _ => None,
+    };
+    OatRoutingDiagnostic {
+        reason,
+        decision_unix_ms: now.get(),
+        observed_minus_decision_ms: pressure.map(|pressure| {
+            let difference = i128::from(pressure.observed_at_unix_ms.get()) - i128::from(now.get());
+            i64::try_from(difference).unwrap_or(if difference < 0 { i64::MIN } else { i64::MAX })
+        }),
+        validation_reason: validation.map(|error| error.message().to_owned()),
+        registration_started_unix_ms: collector.map(|collector| collector.registration.started_at_unix_ms.get()),
+        registration_expiry_unix_ms: collector.map(|collector| collector.registration.lease_expires_at_unix_ms.get()),
+        pin_expiry_unix_ms: pin.expires_at_unix_ms.get(),
+        lease_expiry_unix_ms: view.leases.get(&pin.key).map(|lease| lease.expires_at_unix_ms.get()),
+        pin_read_ms,
+        load_view_ms,
+    }
 }
 
 fn assignment_for_lease(

@@ -16,7 +16,7 @@ mod sql_server;
 mod store;
 
 pub use engine::{ControlOperation, ControlRoute, RebalanceReport, RouteAssignment, RouteSource, RoutingEngine};
-pub use error::{RoutingError, RoutingErrorKind, RoutingResult};
+pub use error::{OatRoutingDiagnostic, RoutingError, RoutingErrorKind, RoutingResult};
 pub use memory::{MemoryOperationCounts, MemoryRoutingStore};
 pub use model::{
     AdmissionPressureGauge, CollectorRecord, CollectorRegistration, CollectorState, LeaseKey, LeaseState,

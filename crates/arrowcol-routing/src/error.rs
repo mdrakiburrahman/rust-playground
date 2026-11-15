@@ -1,5 +1,30 @@
 use thiserror::Error;
 
+/// Bounded, non-authoritative details of a rejected OAT routing decision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OatRoutingDiagnostic {
+    /// Fixed ineligibility reason, if the holder was ineligible.
+    pub reason: Option<&'static str>,
+    /// Time used to evaluate the decision.
+    pub decision_unix_ms: u64,
+    /// Snapshot observation minus decision time.
+    pub observed_minus_decision_ms: Option<i64>,
+    /// Snapshot validation detail, if invalid.
+    pub validation_reason: Option<String>,
+    /// Collector registration start.
+    pub registration_started_unix_ms: Option<u64>,
+    /// Collector registration expiry.
+    pub registration_expiry_unix_ms: Option<u64>,
+    /// Immutable pin expiry.
+    pub pin_expiry_unix_ms: u64,
+    /// Routing lease expiry, if present.
+    pub lease_expiry_unix_ms: Option<u64>,
+    /// Time spent reading the pin.
+    pub pin_read_ms: u64,
+    /// Time spent loading the routing view.
+    pub load_view_ms: u64,
+}
+
 /// Stable category for routing-control failures.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 #[non_exhaustive]
@@ -39,6 +64,7 @@ pub enum RoutingErrorKind {
 pub struct RoutingError {
     kind: RoutingErrorKind,
     message: String,
+    oat_diagnostic: Option<Box<OatRoutingDiagnostic>>,
 }
 
 impl RoutingError {
@@ -48,6 +74,7 @@ impl RoutingError {
         Self {
             kind,
             message: message.into(),
+            oat_diagnostic: None,
         }
     }
 
@@ -61,6 +88,17 @@ impl RoutingError {
     #[must_use]
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    /// Returns decision-local evidence when available.
+    #[must_use]
+    pub fn oat_diagnostic(&self) -> Option<&OatRoutingDiagnostic> {
+        self.oat_diagnostic.as_deref()
+    }
+
+    pub(crate) fn with_oat_diagnostic(mut self, diagnostic: OatRoutingDiagnostic) -> Self {
+        self.oat_diagnostic = Some(Box::new(diagnostic));
+        self
     }
 }
 

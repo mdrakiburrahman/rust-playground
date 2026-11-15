@@ -1,5 +1,6 @@
 use std::os::fd::RawFd;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrowcol_protocol::NOT_ADMITTED_METADATA_KEY;
@@ -8,7 +9,9 @@ use arrowcol_protocol::{
     ImplementationPool, IngestMetadata, PROTOCOL_VERSION_METADATA_KEY, RawGrpcMetadata, SCHEMA_METADATA_KEY,
     TABLE_METADATA_KEY, UnixMillis,
 };
-use arrowcol_routing::{ControlOperation, ControlRoute, RouteAssignment, RouteSource, RoutingEngine, RoutingErrorKind};
+use arrowcol_routing::{
+    ControlOperation, ControlRoute, RouteAssignment, RouteSource, RoutingEngine, RoutingError, RoutingErrorKind,
+};
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::{Method, StatusCode};
@@ -47,6 +50,50 @@ pub const ROUTING_LEASE_EXPIRES_HEADER: &str = "x-arrowcol-routing-lease-expires
 pub const OAT_RUN_ID_HEADER: &str = "x-arrowcol-oat-run-id";
 
 const FLIGHT_SERVICE_PREFIX: &str = "/arrow.flight.protocol.FlightService/";
+
+static OAT_REJECTION_CLOCK: OnceLock<Instant> = OnceLock::new();
+static OAT_REJECTION_LOGGED: [AtomicU64; 33] = [const { AtomicU64::new(0) }; 33];
+
+fn oat_rejection_log_slot(phase: &str, reason: &str) -> usize {
+    let phase = match phase {
+        "initial" => 0,
+        "upstream_peer" => 1,
+        _ => 2,
+    };
+    let reason = match reason {
+        "holder_absent" => 0,
+        "not_ready" => 1,
+        "registration_not_live" => 2,
+        "pressure_missing" => 3,
+        "pressure_instance_mismatch" => 4,
+        "pressure_future" => 5,
+        "pressure_stale" => 6,
+        "pressure_invalid" => 7,
+        "overloaded" => 8,
+        "other" => 9,
+        _ => 10,
+    };
+    phase * 11 + reason
+}
+
+fn should_log_oat_rejection(phase: &str, reason: &str) -> bool {
+    let now = OAT_REJECTION_CLOCK
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_secs()
+        .saturating_add(1);
+    let last = &OAT_REJECTION_LOGGED[oat_rejection_log_slot(phase, reason)];
+    let mut previous = last.load(Ordering::Relaxed);
+    loop {
+        if previous != 0 && now.saturating_sub(previous) < 5 {
+            return false;
+        }
+        match last.compare_exchange_weak(previous, now, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(current) => previous = current,
+        }
+    }
+}
 
 /// Production Pingora proxy application.
 #[derive(Clone)]
@@ -105,6 +152,31 @@ impl ProductionRouter {
     fn record_request_latency(&self, context: &mut RequestContext) {
         if let Some(started) = context.request_started.take() {
             self.metrics.observe_request_duration(started.elapsed());
+        }
+    }
+
+    fn record_oat_rejection(&self, phase: &'static str, now: UnixMillis, error: &RoutingError) {
+        let diagnostic = error.oat_diagnostic();
+        let reason = diagnostic.and_then(|detail| detail.reason);
+        if let Some(reason) = reason {
+            self.metrics.oat_ineligibility(phase, reason);
+        }
+        if should_log_oat_rejection(phase, reason.unwrap_or("unavailable")) {
+            warn!(
+                phase,
+                kind = ?error.kind(),
+                reason = reason.unwrap_or("unavailable"),
+                decision_unix_ms = diagnostic.map_or(now.get(), |detail| detail.decision_unix_ms),
+                observed_minus_decision_ms = ?diagnostic.and_then(|detail| detail.observed_minus_decision_ms),
+                validation_reason = ?diagnostic.and_then(|detail| detail.validation_reason.as_deref()),
+                registration_started_unix_ms = ?diagnostic.and_then(|detail| detail.registration_started_unix_ms),
+                registration_expiry_unix_ms = ?diagnostic.and_then(|detail| detail.registration_expiry_unix_ms),
+                pin_expiry_unix_ms = ?diagnostic.map(|detail| detail.pin_expiry_unix_ms),
+                lease_expiry_unix_ms = ?diagnostic.and_then(|detail| detail.lease_expiry_unix_ms),
+                pin_read_ms = ?diagnostic.map(|detail| detail.pin_read_ms),
+                load_view_ms = ?diagnostic.map(|detail| detail.load_view_ms),
+                "OAT routing rejection"
+            );
         }
     }
 
@@ -188,6 +260,7 @@ impl ProductionRouter {
                 }
                 Err(error) => {
                     if is_oat {
+                        self.record_oat_rejection("initial", now, &error);
                         let (status, not_admitted) = oat_routing_response(error.kind());
                         let message = if not_admitted {
                             self.metrics.failure("doput", &pool, "lease_holder_overloaded");
@@ -260,7 +333,7 @@ impl ProductionRouter {
         context.stream_counted = true;
     }
 
-    async fn revalidate_oat_upstream(&self, context: &mut RequestContext) -> pingora::Result<()> {
+    async fn revalidate_oat_upstream(&self, context: &mut RequestContext, phase: &'static str) -> pingora::Result<()> {
         let Some(run_id) = self.routing.policy().oat_run_id.as_deref() else {
             return Ok(());
         };
@@ -279,6 +352,7 @@ impl ProductionRouter {
                 Ok(())
             }
             Err(cause) => {
+                self.record_oat_rejection(phase, now, &cause);
                 if cause.kind() == RoutingErrorKind::LeaseHolderOverloaded {
                     self.metrics.failure(
                         "doput",
@@ -422,7 +496,7 @@ impl ProxyHttp for ProductionRouter {
     }
 
     async fn upstream_peer(&self, _session: &mut Session, context: &mut Self::CTX) -> pingora::Result<Box<HttpPeer>> {
-        self.revalidate_oat_upstream(context).await?;
+        self.revalidate_oat_upstream(context, "upstream_peer").await?;
         let assignment = context.assignment.as_ref().ok_or_else(|| {
             Error::explain(
                 ErrorType::InternalError,
@@ -460,7 +534,7 @@ impl ProxyHttp for ProductionRouter {
         upstream_request: &mut RequestHeader,
         context: &mut Self::CTX,
     ) -> pingora::Result<()> {
-        self.revalidate_oat_upstream(context).await?;
+        self.revalidate_oat_upstream(context, "upstream_request_filter").await?;
         for header in [
             EDGE_TIMESTAMP_HEADER,
             EDGE_NONCE_HEADER,

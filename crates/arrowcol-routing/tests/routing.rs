@@ -243,6 +243,55 @@ async fn pinned_oat_holder_at_hard_pressure_is_a_transient_overload() {
         panic!("hard-pressure pin must not be assigned");
     };
     assert_eq!(error.kind(), RoutingErrorKind::LeaseHolderOverloaded);
+    assert_eq!(
+        error.oat_diagnostic().and_then(|detail| detail.reason),
+        Some("overloaded")
+    );
+}
+
+#[tokio::test]
+async fn oat_rejections_report_the_decision_view_and_future_snapshot() {
+    let (store, _, _) = seeded_store().await;
+    let engine_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);
+    let engine = RoutingEngine::new(engine_store, oat_policy(OAT_RUN_CONCURRENT))
+        .unwrap_or_else(|error| panic!("create OAT routing engine: {error}"));
+    engine
+        .refresh(millis(100_000))
+        .await
+        .unwrap_or_else(|error| panic!("refresh: {error}"));
+    initialize_memory_oat_pin(&engine, OAT_RUN_CONCURRENT, millis(100_001), millis(200_000)).await;
+    let selected = engine
+        .route_ingest_for_run(&metadata(), OAT_RUN_CONCURRENT, millis(200_000), millis(100_002))
+        .await
+        .unwrap_or_else(|error| panic!("select pinned collector: {error}"));
+    store
+        .publish_pressure(&snapshot(selected.instance_id, 103_003, 1_000, 0))
+        .await
+        .unwrap_or_else(|error| panic!("publish pressure: {error}"));
+    let initial = engine
+        .route_ingest_for_run(&metadata(), OAT_RUN_CONCURRENT, millis(200_000), millis(100_002))
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("future pressure must be rejected"));
+    let revalidation = engine
+        .revalidate_run_assignment_with_clock(OAT_RUN_CONCURRENT, &selected, millis(100_002), || Ok(millis(100_002)))
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("future pressure must be rejected at revalidation"));
+    for error in [initial, revalidation] {
+        assert_eq!(error.kind(), RoutingErrorKind::LeaseHolderUnavailable);
+        let detail = error.oat_diagnostic().unwrap_or_else(|| panic!("missing diagnostic"));
+        assert_eq!(detail.reason, Some("pressure_future"));
+        assert_eq!(detail.decision_unix_ms, 100_002);
+        assert_eq!(detail.observed_minus_decision_ms, Some(3_001));
+        assert_eq!(detail.registration_expiry_unix_ms, Some(200_000));
+        assert_eq!(detail.pin_expiry_unix_ms, 200_000);
+        assert!(detail.lease_expiry_unix_ms.is_some());
+        assert_eq!(
+            detail.validation_reason.as_deref(),
+            Some("collector pressure snapshot is too far in the future")
+        );
+    }
 }
 
 #[tokio::test]

@@ -17,6 +17,7 @@ pub struct RouterMetrics {
     registry: Arc<Registry>,
     decisions: IntCounterVec,
     failures: IntCounterVec,
+    oat_ineligibility: IntCounterVec,
     refreshes: IntCounterVec,
     lease_events: IntCounterVec,
     upstream_connections: IntCounterVec,
@@ -53,6 +54,14 @@ impl RouterMetrics {
         let failures = register_int_counter_vec_with_registry!(
             Opts::new("arrowcol_router_failures_total", "Structured routing failures"),
             &["operation", "pool", "reason"],
+            registry.as_ref()
+        )?;
+        let oat_ineligibility = register_int_counter_vec_with_registry!(
+            Opts::new(
+                "arrowcol_router_oat_ineligibility_total",
+                "OAT holder rejection by routing phase and bounded ineligibility reason"
+            ),
+            &["phase", "reason"],
             registry.as_ref()
         )?;
         let refreshes = register_int_counter_vec_with_registry!(
@@ -160,6 +169,7 @@ impl RouterMetrics {
             registry,
             decisions,
             failures,
+            oat_ineligibility,
             refreshes,
             lease_events,
             upstream_connections,
@@ -206,6 +216,10 @@ impl RouterMetrics {
     /// Records a structured routing failure.
     pub fn failure(&self, operation: &str, pool: &str, reason: &str) {
         self.failures.with_label_values(&[operation, pool, reason]).inc();
+    }
+
+    pub fn oat_ineligibility(&self, phase: &'static str, reason: &'static str) {
+        self.oat_ineligibility.with_label_values(&[phase, reason]).inc();
     }
 
     /// Records a cache refresh.
@@ -329,10 +343,14 @@ mod tests {
     #[test]
     fn exports_sql_connection_operation_and_latency_metrics() -> Result<(), Box<dyn std::error::Error>> {
         let metrics = RouterMetrics::new()?;
+        metrics.oat_ineligibility("initial", "pressure_future");
         metrics.connection_opened();
         metrics.operation("get_run_table_pin", Duration::from_millis(12), true);
         metrics.observe_request_duration(Duration::from_millis(25));
         let output = String::from_utf8(metrics.encode()?)?;
+        assert!(
+            output.contains("arrowcol_router_oat_ineligibility_total{phase=\"initial\",reason=\"pressure_future\"} 1")
+        );
         assert!(output.contains("arrowcol_router_sql_connections_opened_total 1"));
         assert!(
             output.contains(
