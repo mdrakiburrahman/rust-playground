@@ -167,10 +167,6 @@ fn inventory(root: &Path, directory: &Path, files: &mut Vec<SnapshotFile>) -> Re
                 .context("snapshot path is not UTF-8")?
                 .to_owned();
             ensure!(!relative.contains('\\'), "ambiguous snapshot path separator");
-            ensure!(
-                !relative.contains(".checkpoint.") && !relative.ends_with("_last_checkpoint"),
-                "checkpoint-dependent snapshots are not supported"
-            );
             let (size, sha256) = file_digest(&path)?;
             files.push(SnapshotFile {
                 path: relative,
@@ -501,7 +497,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_preserves_history_payload_bytes_and_refuses_overwrite_or_missing_history() -> Result<()> {
+    fn snapshot_preserves_history_and_checkpoint_bytes_and_refuses_incomplete_history() -> Result<()> {
         use arrow::array::{Int64Array, RecordBatch};
         use arrow::datatypes::{DataType, Field, Schema};
         use parquet::arrow::ArrowWriter;
@@ -534,6 +530,11 @@ mod tests {
         .collect::<Vec<_>>()
         .join("\n");
         fs::write(table.join("_delta_log/00000000000000000001.json"), &append)?;
+        fs::write(
+            table.join("_delta_log/00000000000000000001.checkpoint.parquet"),
+            b"checkpoint payload",
+        )?;
+        fs::write(table.join("_delta_log/_last_checkpoint"), br#"{"version":1,"size":1}"#)?;
         let destination = fixture.0.join("snapshots");
         let run = uuid::Uuid::new_v4().to_string();
         let tables = vec!["sqlserver_active_sessions".to_owned()];
@@ -543,12 +544,20 @@ mod tests {
         let manifest: Value = serde_json::from_slice(&fs::read(root.join("manifest.json"))?)?;
         assert_eq!(manifest["rowCount"], 2);
         assert_eq!(manifest["latestVersion"], 1);
-        assert_eq!(manifest["files"].as_array().context("missing inventory")?.len(), 4);
+        assert_eq!(manifest["files"].as_array().context("missing inventory")?.len(), 6);
         assert!(table.join(WRITER_LOCK).exists());
         assert!(!root.join("table").join(WRITER_LOCK).exists());
         assert_eq!(
             fs::read(root.join("table/_delta_log/00000000000000000000.json"))?,
             log.as_bytes()
+        );
+        assert_eq!(
+            fs::read(root.join("table/_delta_log/00000000000000000001.checkpoint.parquet"))?,
+            b"checkpoint payload"
+        );
+        assert_eq!(
+            fs::read(root.join("table/_delta_log/_last_checkpoint"))?,
+            br#"{"version":1,"size":1}"#
         );
         assert_eq!(
             file_digest(&table.join("part.parquet"))?,
