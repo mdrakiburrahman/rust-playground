@@ -70,7 +70,8 @@ cargo run --locked --package arrowcol-oat-rust -- --validate-config <config.json
 | AKS image | `aks setup --maintenance` builds/publishes/verifies a sixth revision-labelled image and captures its registry digest as `maintenance_image`. An enabled run requires that pinned image. |
 | Policy | Startup defaults and each table's resolved policy are recorded, including negative/no-op probes. Table properties override process defaults; those overrides remain visible. Missing per-table readback fails. |
 | Writer policy | `parquet_writer_overrides` proves startup override consumption, not full per-schema physical properties. Schema compatibility is checked by the writer; inherited/null values are not invented defaults. |
-| Operation receipts | Bounded consumer-reported counts distinguish dry-run predictions from apply authorization and no-op probes. Receipts cover process lifetime, not the throughput window, and are not independent physical-file validation. Any operation error or truncated maintenance log fails the cell. |
+| Operation outcomes | `operation_outcomes` records process-lifetime operation/error counts and sanitized `error_kind_counts`; raw error strings are omitted and a fixed comment explains the evidence. Per-cell `maintenance_operation_outcomes` uses separate stdout/stderr offsets; when logs cannot be scoped, its counts are null with a sanitized comment. Truncated maintenance logs still fail. |
+| Maintenance shutdown | `deadline_exceeded` remains a genuine operation error; `cancelled` is healthy only when the signal-driven cancel flag is set, so signal-cancelled work does not make graceful shutdown unhealthy. Local snapshot evidence records `delta-maintenance` exit 1 as `maintenance_operation_failure`; exit 2, 137 and OOM remain fatal. |
 | Mutations | Only explicit `apply: true` adds `--apply`. Supported operations and their applicable knobs are validated; normal retention protections remain active. |
 
 ## Component adapter notes
