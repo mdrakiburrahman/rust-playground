@@ -224,7 +224,7 @@ mod tunable_injection_tests {
             arrow_deltalake::delta::resolve_process_writer_properties_from_environment(&environment)?;
         let aliases = arrow_deltalake::delta::PROCESS_WRITER_PROPERTY_ENVIRONMENT_ALIASES;
         assert_eq!(
-            aliases.iter().filter(|(_, canonical, _)| environment.contains_key(canonical)).count(),
+            aliases.iter().filter(|(_, canonical, _)| environment.contains_key(*canonical)).count(),
             aliases.len(),
             "the test configuration should set every aliased layout knob"
         );
