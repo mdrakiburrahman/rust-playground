@@ -154,6 +154,8 @@ npx --no-install arrowcol-oat --mode aks --stamp-config "$STAMP_CONFIG" --config
 ```bash
 export SUB=68fa0545-661c-4152-93f2-fc8ae1c231b8
 export STAMP_NUM="68590"
+mkdir -p .temp
+export STAMP_CONFIG=".temp/stamp-${STAMP_NUM}.yaml"
 
 az deployment group show \
   --subscription "$SUB" \
@@ -168,9 +170,8 @@ az deployment group show \
     storageReadLogDestination:properties.parameters.readLogStorageAccountName.value && 'storage' || 'log-analytics',
     publisherFederatedCredentials:properties.parameters.publisherFederatedCredentials.value
   }" \
-  --output yaml --only-show-errors
+  --output yaml --only-show-errors > "$STAMP_CONFIG"
 
-export STAMP_CONFIG=".temp/stamp-${STAMP_NUM}.yaml"
 npx --no-install arrowcol-oat aks setup --stamp ${STAMP_NUM} --stamp-config "$STAMP_CONFIG"
 npx --no-install arrowcol-oat --mode aks --stamp-config "$STAMP_CONFIG" --config out/arrowcol-oat/oat-config.aks.json
 ```
