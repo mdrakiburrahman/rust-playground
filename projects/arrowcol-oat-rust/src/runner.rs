@@ -705,7 +705,7 @@ fn prepare_local_state(config: &OatConfig, state_dir: &Path, run_id: &str) -> Re
         .join("config/router.yaml");
     let router_text = fs::read_to_string(&router_config)
         .with_context(|| format!("read local router config from {}", router_config.display()))?;
-    let router_text = run_scoped_local_router_config(&router_text, run_id)?;
+    let router_text = run_scoped_local_router_config(&router_text, run_id, config.run_pin_ttl_ms)?;
     fs::write(state_dir.join("router-state/config.yaml"), router_text)
         .context("write run-scoped local OAT router config")?;
 
@@ -1018,15 +1018,18 @@ async fn cancel_local_client(handle: &ClientHandle) -> Result<()> {
     Ok(())
 }
 
-fn run_scoped_local_router_config(router_text: &str, run_id: &str) -> Result<String> {
+fn run_scoped_local_router_config(router_text: &str, run_id: &str, run_pin_ttl_ms: u64) -> Result<String> {
     let router_text = router_text.replacen("lease_ttl_ms: 86400000", "lease_ttl_ms: 3600000", 1);
-    if router_text.matches("lease_ttl_ms: 3600000").count() != 1 || router_text.contains("oat_run_id:") {
+    if router_text.matches("lease_ttl_ms: 3600000").count() != 1
+        || router_text.contains("oat_run_id:")
+        || router_text.contains("oat_run_pin_ttl_ms:")
+    {
         bail!("local router config did not contain its expected 1-hour lease TTL");
     }
     let run_id_yaml = serde_json::to_string(run_id)?;
     Ok(router_text.replacen(
         "lease_ttl_ms: 3600000",
-        &format!("lease_ttl_ms: 3600000\n  oat_run_id: {run_id_yaml}"),
+        &format!("lease_ttl_ms: 3600000\n  oat_run_pin_ttl_ms: {run_pin_ttl_ms}\n  oat_run_id: {run_id_yaml}"),
         1,
     ))
 }
@@ -2055,6 +2058,32 @@ fn routing_policy_from_yaml(router_yaml: &str, run_id: &str) -> Result<RoutingPo
         .map_err(anyhow::Error::msg)
         .context("validate rendered router routing policy")?;
     Ok(policy)
+}
+
+fn inject_router_oat_pin_ttl(resources: &mut [Value], ttl_ms: u64) -> Result<()> {
+    let config_map = resources
+        .iter_mut()
+        .find(|resource| {
+            resource.get("kind").and_then(Value::as_str) == Some("ConfigMap")
+                && resource.pointer("/metadata/name").and_then(Value::as_str) == Some("arrowcol-config")
+        })
+        .context("rendered AKS workload has no arrowcol-config ConfigMap")?;
+    let router_yaml = config_map
+        .pointer("/data/router.yaml")
+        .and_then(Value::as_str)
+        .context("rendered AKS arrowcol-config has no router.yaml")?
+        .to_owned();
+    let mut router: serde_yaml::Value = serde_yaml::from_str(&router_yaml).context("parse AKS router YAML")?;
+    let routing = router
+        .get_mut("routing")
+        .and_then(serde_yaml::Value::as_mapping_mut)
+        .context("AKS router YAML has no routing mapping")?;
+    routing.insert(
+        serde_yaml::Value::String("oat_run_pin_ttl_ms".to_owned()),
+        serde_yaml::Value::Number(ttl_ms.into()),
+    );
+    config_map["data"]["router.yaml"] = json!(serde_yaml::to_string(&router)?);
+    Ok(())
 }
 
 fn rendered_router_yaml(resources: &[Value]) -> Result<String> {
@@ -4691,6 +4720,21 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
     run_streaming_command(up, "start remaining local OAT stack")
         .await
         .context("local compose stack is a per-run project; results are not touched by stack cleanup")?;
+    let mut rendered_config = compose_command(
+        compose_file,
+        config.platform.compose_override_file.as_deref(),
+        &project,
+        "benchmark",
+    );
+    platform.add_compose_environment(&mut rendered_config);
+    rendered_config.args(["config", "--format", "json"]);
+    let rendered_config: Value = serde_json::from_slice(
+        &run_command(rendered_config, "read effective local Compose configuration")
+            .await?
+            .stdout,
+    )
+    .context("parse effective local Compose configuration")?;
+    verify_local_collector_stop_grace(&rendered_config, config.collector_stop_grace_seconds)?;
     let mut downstream = compose_command(
         compose_file,
         config.platform.compose_override_file.as_deref(),
@@ -5916,6 +5960,7 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
 
     let mut workload = render_runtime_phase(&runtime_script, &generated_config, "workload", &runtime_dir).await?;
     inject_workload_environment(config, &mut workload)?;
+    inject_router_oat_pin_ttl(&mut workload, config.run_pin_ttl_ms)?;
     let router_yaml = rendered_router_yaml(&workload)?;
     arrowcol_router_rust::RouterConfig::from_yaml(router_yaml.as_bytes())
         .context("validate rendered router YAML with the router config validator")?;
@@ -8683,7 +8728,8 @@ mod tests {
         for (_, _, run_id) in &cells {
             let parsed = uuid::Uuid::parse_str(run_id)?;
             assert_eq!(parsed.to_string(), *run_id, "run IDs use canonical lowercase UUID form");
-            let local_router = run_scoped_local_router_config("routing:\n  lease_ttl_ms: 86400000\n", run_id)?;
+            let local_router =
+                run_scoped_local_router_config("routing:\n  lease_ttl_ms: 86400000\n", run_id, config.run_pin_ttl_ms)?;
             assert!(local_router.contains(&format!("oat_run_id: \"{run_id}\"")));
         }
         Ok(())
@@ -9264,24 +9310,48 @@ mod tests {
 
     #[test]
     fn local_router_configuration_authorizes_only_its_run() -> Result<()> {
-        let generated = run_scoped_local_router_config(include_str!("../../loadtest/config/router.yaml"), "run-one")?;
+        let generated =
+            run_scoped_local_router_config(include_str!("../../loadtest/config/router.yaml"), "run-one", 4_080_000)?;
         let generated: serde_yaml::Value = serde_yaml::from_str(&generated)?;
         assert_eq!(generated["auth"]["authenticator"].as_str(), Some("dev_only_allow_all"));
         assert_eq!(generated["routing"]["oat_run_id"].as_str(), Some("run-one"));
+        assert_eq!(generated["routing"]["oat_run_pin_ttl_ms"].as_u64(), Some(4_080_000));
 
         let configured = run_scoped_local_router_config(
             "routing:\n  lease_ttl_ms: 86400000\n  readiness_max_staleness_ms: 30000\n",
             "run-one",
+            3_600_000,
         )?;
-        assert!(configured.contains("  lease_ttl_ms: 3600000\n  oat_run_id: \"run-one\"\n"));
-        assert!(run_scoped_local_router_config("routing:\n  lease_ttl_ms: 30000\n", "run-two").is_err());
+        assert!(
+            configured.contains("  lease_ttl_ms: 3600000\n  oat_run_pin_ttl_ms: 3600000\n  oat_run_id: \"run-one\"\n")
+        );
+        assert!(run_scoped_local_router_config("routing:\n  lease_ttl_ms: 30000\n", "run-two", 3_600_000).is_err());
         assert!(
             run_scoped_local_router_config(
                 "routing:\n  lease_ttl_ms: 86400000\n  oat_run_id: run-existing\n",
                 "run-one",
+                3_600_000,
             )
             .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn aks_router_pin_ttl_is_injected_without_changing_run_authorization() -> Result<()> {
+        let mut resources = vec![json!({
+            "kind":"ConfigMap",
+            "metadata":{"name":"arrowcol-config"},
+            "data":{"router.yaml":"routing:\n  oat_run_id: run-one\n"}
+        })];
+        inject_router_oat_pin_ttl(&mut resources, 4_080_000)?;
+        let yaml = resources[0]
+            .pointer("/data/router.yaml")
+            .and_then(Value::as_str)
+            .context("router yaml missing")?;
+        let router: serde_yaml::Value = serde_yaml::from_str(yaml)?;
+        assert_eq!(router["routing"]["oat_run_id"].as_str(), Some("run-one"));
+        assert_eq!(router["routing"]["oat_run_pin_ttl_ms"].as_u64(), Some(4_080_000));
         Ok(())
     }
 

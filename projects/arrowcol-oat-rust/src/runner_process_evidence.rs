@@ -1001,13 +1001,15 @@ fn collector_shutdown_drain_evidence(
     result
 }
 
-fn verify_local_collector_stop_grace(container: &Value, expected_seconds: u64) -> Result<()> {
-    let actual = container
-        .pointer("/HostConfig/StopTimeout")
-        .and_then(Value::as_u64)
-        .context("local collector inspect omitted HostConfig.StopTimeout")?;
+fn verify_local_collector_stop_grace(compose_config: &Value, expected_seconds: u64) -> Result<()> {
+    let actual = compose_config
+        .pointer("/services/dataflow-1/stop_grace_period")
+        .and_then(Value::as_str)
+        .and_then(|value| value.strip_suffix('s'))
+        .and_then(|value| value.parse::<u64>().ok())
+        .context("effective local Compose config omitted the collector stop_grace_period")?;
     if actual != expected_seconds {
-        bail!("local collector stop grace readback differs from requested value");
+        bail!("effective local Compose collector stop grace differs from requested value");
     }
     Ok(())
 }
@@ -1067,9 +1069,6 @@ async fn local_process_logs_for_role(
         };
         if role_filter.is_some_and(|filter| filter != role) {
             continue;
-        }
-        if matches!(role, ComponentRole::Collector) {
-            verify_local_collector_stop_grace(&container, config.collector_stop_grace_seconds)?;
         }
         if container["RestartCount"].as_u64().unwrap_or(0) > 0 {
             bail!("required measurement process restarted during the cell");
@@ -1209,10 +1208,10 @@ mod startup_readback_tests {
 
     #[test]
     fn local_collector_stop_grace_readback_requires_exact_value() -> Result<()> {
-        let inspect = json!({"HostConfig":{"StopTimeout":300}});
-        verify_local_collector_stop_grace(&inspect, 300)?;
-        assert!(verify_local_collector_stop_grace(&inspect, 301).is_err());
-        assert!(verify_local_collector_stop_grace(&json!({"HostConfig":{}}), 300).is_err());
+        let compose = json!({"services":{"dataflow-1":{"stop_grace_period":"300s"}}});
+        verify_local_collector_stop_grace(&compose, 300)?;
+        assert!(verify_local_collector_stop_grace(&compose, 301).is_err());
+        assert!(verify_local_collector_stop_grace(&json!({"services":{}}), 300).is_err());
         Ok(())
     }
 
