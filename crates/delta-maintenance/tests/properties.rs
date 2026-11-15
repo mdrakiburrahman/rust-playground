@@ -90,6 +90,38 @@ fn fixture() -> Result<(tempfile::TempDir, Settings, CatalogTable)> {
     Ok((root, settings, source))
 }
 
+struct MissingDiscovery;
+
+impl TableDiscovery for MissingDiscovery {
+    fn tables(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    fn table(&self, _name: &str) -> Result<DiscoveredTable> {
+        Err(anyhow!("unexpected table lookup"))
+    }
+}
+
+#[test]
+fn one_shot_rejects_missing_allowlisted_tables_before_reporting_success() -> Result<()> {
+    let (_root, settings, _) = fixture()?;
+    let error = match run_cycle_with_discovery(
+        &settings,
+        &MissingDiscovery,
+        &Metrics::new(),
+        &Arc::new(AtomicBool::new(false)),
+    ) {
+        Ok(results) => return Err(anyhow!("missing allowlisted table produced results: {results:?}")),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("allowlisted tables were missing or ambiguous")
+    );
+    Ok(())
+}
+
 type FileInventory = BTreeMap<PathBuf, (Vec<u8>, SystemTime)>;
 
 #[test]

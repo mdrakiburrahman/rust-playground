@@ -61,7 +61,7 @@ encoding high-cardinality output. Schema, partition, retention, fencing,
 no-overwrite and durability boundaries remain.
 Increasing a flush target alone does not coalesce publications.
 
-### Layout readback
+## Layout readback
 
 Startup `arrowcol_effective_config <JSON>` includes a root `layout` object with
 `process_policy: {enabled, sort_columns, bloom_columns, max_rows, max_input_bytes,

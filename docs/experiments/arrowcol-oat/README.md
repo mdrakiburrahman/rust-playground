@@ -47,7 +47,7 @@ separately and continues displaying null metrics as a dash, not zero.
 
 | Column            | Type                          | Nullability | Meaning                                                                                                                                           |
 | ----------------- | ----------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `schema_version`  | 32-bit signed integer         | Required    | Contract version; new rows use `3`, historical `2` remains readable.                                                                               |
+| `schema_version`  | 32-bit signed integer         | Required    | Contract version; new rows use `3`, historical `2` remains readable.                                                                              |
 | `mode`            | UTF-8 string                  | Required    | `local` or `aks`.                                                                                                                                 |
 | `stamp`           | UTF-8 string                  | Nullable    | Deployment stamp, when available.                                                                                                                 |
 | `host`            | UTF-8 string                  | Required    | Host running the OAT workload.                                                                                                                    |
@@ -65,24 +65,24 @@ separately and continues displaying null metrics as a dash, not zero.
 
 The producer retains these original result columns:
 
-| Column                     | Type                             | Meaning                                                                                          |
-| -------------------------- | -------------------------------- | ------------------------------------------------------------------------------------------------ |
-| `run_id`                   | UTF-8 string                     | Benchmark run identifier.                                                                        |
-| `replicas`                 | 64-bit unsigned integer          | ArrowCol replica count.                                                                          |
-| `dfe_worker_concurrency`   | 64-bit unsigned integer          | DFE `--num-cores` setting.                                                                       |
-| `table`                    | UTF-8 string                     | DMV table used as the table-scoped routing key.                                                  |
-| `rows`                     | Nullable 64-bit unsigned integer | Client admission completions in the shared measurement window; not Delta commits or unique delivery. |
-| `duration_ms`              | Nullable 64-bit unsigned integer | Shared fleet measurement duration; excludes preflight and warm-up; null if unmeasured.           |
-| `rows_per_second`          | Nullable 64-bit float            | Total table rows completed during the shared window divided by its duration; null if unmeasured. |
-| `cpu_millicores`           | Nullable 64-bit float            | Mean of observed collector-fleet samples inside measurement; not an end-of-run snapshot.       |
-| `memory_bytes`             | Nullable 64-bit unsigned integer | Maximum observed collector-fleet sample; not an asserted peak RSS.                              |
-| `qap_observation_complete` | 64-bit unsigned integer          | 1 only when all expected QAP tables and required fields were measured; otherwise 0.              |
-| `qap_observed_tables`      | 64-bit unsigned integer          | Number of expected QAP tables observed.                                                          |
-| `qap_completion_percent`   | Nullable 64-bit float            | Minimum reported completion percentage across the selected tables.                               |
-| `qap_pending_artifacts`    | Nullable 64-bit unsigned integer | Sum of pending artifacts across selected tables.                                                 |
-| `qap_cached_bytes`         | Nullable 64-bit unsigned integer | Sum of QAP `HotSize` bytes across selected tables.                                               |
-| `qap_unhealthy_catalogs`   | Nullable 64-bit unsigned integer | Sum of unhealthy catalog counts across selected tables.                                          |
-| `qap_lag_seconds`          | Nullable 64-bit float            | Maximum reported QAP lag across selected tables.                                                 |
+| Column                     | Type                             | Meaning                                                                                                         |
+| -------------------------- | -------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `run_id`                   | UTF-8 string                     | Benchmark run identifier.                                                                                       |
+| `replicas`                 | 64-bit unsigned integer          | ArrowCol replica count.                                                                                         |
+| `dfe_worker_concurrency`   | 64-bit unsigned integer          | DFE `--num-cores` setting.                                                                                      |
+| `table`                    | UTF-8 string                     | DMV table used as the table-scoped routing key.                                                                 |
+| `rows`                     | Nullable 64-bit unsigned integer | Client admission completions in the shared measurement window; not Delta commits or unique delivery.            |
+| `duration_ms`              | Nullable 64-bit unsigned integer | Shared fleet measurement duration; excludes preflight and warm-up; null if unmeasured.                          |
+| `rows_per_second`          | Nullable 64-bit float            | Total table rows completed during the shared window divided by its duration; null if unmeasured.                |
+| `cpu_millicores`           | Nullable 64-bit float            | Mean of observed collector-fleet samples inside measurement; not an end-of-run snapshot.                        |
+| `memory_bytes`             | Nullable 64-bit unsigned integer | Maximum observed collector-fleet sample; not an asserted peak RSS.                                              |
+| `qap_observation_complete` | 64-bit unsigned integer          | 1 only when all expected QAP tables and required fields were measured; otherwise 0.                             |
+| `qap_observed_tables`      | 64-bit unsigned integer          | Number of expected QAP tables observed.                                                                         |
+| `qap_completion_percent`   | Nullable 64-bit float            | Minimum reported completion percentage across the selected tables.                                              |
+| `qap_pending_artifacts`    | Nullable 64-bit unsigned integer | Sum of pending artifacts across selected tables.                                                                |
+| `qap_cached_bytes`         | Nullable 64-bit unsigned integer | Sum of QAP `HotSize` bytes across selected tables.                                                              |
+| `qap_unhealthy_catalogs`   | Nullable 64-bit unsigned integer | Sum of unhealthy catalog counts across selected tables.                                                         |
+| `qap_lag_seconds`          | Nullable 64-bit float            | Maximum reported QAP lag across selected tables.                                                                |
 | `evidence_json`            | Nullable UTF-8 string            | Versioned sanitized configuration, provenance, counters, commit and resource evidence; null on historical rows. |
 
 The viewer reads `results.parquet` from the same origin using HTTP range requests; it does not need CORS configuration. Azure Storage static website hosting on the HNS-enabled account serves `$web` anonymously, even when account-level blob public access is disabled. The AKS defaults target `abfss://experiments@arrowcollector<stamp>.dfs.core.windows.net/arrowcol-oat/results.parquet` and the root `results.parquet` in that stamp's `$web`; explicit destinations may override them. `aks setup` publishes the checked-in viewer and its architecture SVG to `$web/index.html` and `$web/architecture.svg` through the federated `arrow-collector` identity so the static-site root can render the diagram and load same-origin results. The producer uses conditional ETag updates, deduplicates every write by `(run_id, table)` (last row wins), and verifies the website copy matches the authoritative results object before success. Local writers serialize read/merge/rename through a cross-process file lock with a 15-second timeout. Empty results files preserve the full schema and accept later appends. Publish only approved nonsensitive summary metrics there—never credentials, raw payloads, or sensitive identifiers.
@@ -94,6 +94,7 @@ Complete [runtime setup](RUNTIME.md) first for AKS runs. The OAT executable star
 Run the local OAT from the repository root with `npx arrowcol-oat --config docs/experiments/arrowcol-oat/oat-config.example.json`. For bridged Docker hosts, isolated smoke settings and opt-in stopped Delta exports, see [local runtime and snapshots](RUNTIME.md#local-smoke-and-stopped-delta-snapshots). The executable starts the Rust API server, builds the local Compose images, creates run-scoped local credentials and state, submits the configuration, polls the run, then stops the stack and API server. It then serves the local results page on loopback with HTTP range support and keeps the command open until Ctrl+C. Compose assigns ephemeral host ports for the local router and Kusto; the sample endpoint values are placeholders. Rust/Cargo, Docker Compose, and npm workspace dependencies must be available. The included sample writes both result files under `/tmp`; set ADLS Gen2 URLs when publishing results to storage. Add `--server <URL>` to use an already-running OAT API server instead.
 
 ### CLI options and local cleanup
+
 Use `--no-viewer` with local benchmark runs to exit after cleanup without starting the loopback results viewer; default behavior is unchanged.
 
 Run `npx --no-install arrowcol-oat --help` for the supported options. Unknown options fail before startup with exit code 2. Failed or rejected runs exit without opening the viewer; use `--viewer-only` to inspect any previously published results, including partial failure evidence. If the local ownership marker cannot be written (for example, disk full), the CLI cancels the accepted run and waits for cleanup before reporting the write failure. In local mode, SIGINT, SIGTERM and SIGHUP request cancellation and wait for the local Compose cleanup; a second signal forces a fast exit. If only the CLI process is killed, the next local run checks its ownership marker and asks the still-running OAT server to cancel and clean up.
@@ -148,7 +149,7 @@ npx --no-install arrowcol-oat --mode aks --stamp-config "$STAMP_CONFIG" --config
 - The run repeats preflight and refuses to start unless READY; `--preflight-only` runs just that read-only check. Setup's host assertion lasts one hour: re-run `aks setup --stamp-config "$STAMP_CONFIG"` if the run starts later.
 - Pass: `DATA FLOW: PASS` and no run-scoped namespaces or federated credentials left.
 
-### AKS run:
+### AKS run
 
 ```bash
 export SUB=68fa0545-661c-4152-93f2-fc8ae1c231b8

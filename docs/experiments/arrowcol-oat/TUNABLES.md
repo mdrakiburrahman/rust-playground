@@ -17,7 +17,6 @@
 | `router.upstream_idle_timeout_seconds` | Accepts `0..=86400`; zero disables idle upstream pooling and is the value emitted by the main OAT runtime. |
 | Router downstream `server.h2.idle_timeout_seconds` | Deliberately constrained to `1..=86400`, whereas main accepted an unbounded value. Shipped router YAMLs use 30 or 60 seconds. |
 
-
 Use the existing `tunables` sections (`client`, `transport`, `router`,
 `collector`, `parquet_writer`, `wal`, `maintenance`) rather than
 component environment names. The shared `arrowcol-tunables` crate is the

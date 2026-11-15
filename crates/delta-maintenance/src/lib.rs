@@ -1425,6 +1425,23 @@ fn cycle_with_discovery(
     schedule: Option<&Mutex<ScheduledTables>>,
 ) -> Result<Vec<OperationResult>> {
     let names = discovery.tables()?;
+    if settings.interval.is_none() && !settings.tables.is_empty() {
+        let missing = settings
+            .tables
+            .iter()
+            .filter(|requested| {
+                names
+                    .iter()
+                    .filter(|name| *name == *requested || name.rsplit('.').next() == Some(requested.as_str()))
+                    .count()
+                    != 1
+            })
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            bail!("allowlisted tables were missing or ambiguous: {}", missing.join(", "));
+        }
+    }
     if names.len() > MAX_TABLES {
         bail!("catalog discovery exceeds {MAX_TABLES} tables");
     }

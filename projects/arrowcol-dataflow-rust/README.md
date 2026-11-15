@@ -185,7 +185,6 @@ unchanged and replays unacknowledged ones after a restart. Its settings:
 | `max_in_flight` | `ARROWCOL_WAL_MAX_IN_FLIGHT` | `1000` | Startup-only; maximum downstream bundles in flight |
 | `otlp_handling` | `ARROWCOL_WAL_OTLP_HANDLING` | `pass_through` | Startup-only; `pass_through` or `convert_to_arrow` |
 
-
 The effective config is emitted to stderr as one compact `arrowcol_wal_effective_config <JSON>` line. It omits the storage path. `durability_class` is derived as `lossy_eviction` when `max_age` is set or `size_cap_policy=drop_oldest`; otherwise a nonzero flush interval is `fsync_batched`, and zero is `durable`. The defaults above retain the durable behavior. A nonzero flush interval can lose acknowledged data not yet fsynced; expiry and `drop_oldest` can discard unconsumed data.
 
 The processor does not expose Quiver engine settings for WAL max size, rotated-file count, rotation target, segment target size, or segment stream count. These remain unsupported rather than parsed-but-unused. The processor's supported `max_segment_open_duration` controls time-based finalization, not segment size.
