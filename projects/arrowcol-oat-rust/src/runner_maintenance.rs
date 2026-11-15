@@ -60,6 +60,8 @@ fn maintenance_arguments(config: &OatConfig, catalog_endpoint: &str) -> Result<V
     args.extend([
         "--interval-secs".to_owned(),
         interval.to_string(),
+        "--max-idle-backoff-secs".to_owned(),
+        interval.to_string(),
         "--listen".to_owned(),
         "0.0.0.0:9467".to_owned(),
     ]);
@@ -467,6 +469,7 @@ mod maintenance_topology_tests {
         let args = maintenance_arguments(&config, "http://arrowcol-catalog:8817")?;
         assert!(!args.iter().any(|arg| arg == "--apply" || arg == "--catalog-endpoint"));
         assert!(args.windows(2).any(|pair| pair == ["--root", "file:///tmp/arrowcol-stress/dataflow"]));
+        assert!(args.windows(2).any(|pair| pair == ["--max-idle-backoff-secs", "131"]));
         assert!(args.windows(2).any(|pair| pair == ["--interval-secs", "131"]));
         let table_name = canonical_dmv_table_name(&config.tables[0])?;
         assert!(args.windows(2).any(|pair| pair == ["--table", table_name.as_str()]));

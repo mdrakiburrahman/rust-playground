@@ -302,7 +302,36 @@ impl FilesystemDiscovery {
 impl TableDiscovery for FilesystemDiscovery {
     fn tables(&self) -> Result<Vec<String>> {
         if !self.allowlist.is_empty() {
-            return Ok(self.allowlist.clone());
+            if self.root.scheme() != "file" {
+                return Ok(self.allowlist.clone());
+            }
+            let mut names = Vec::new();
+            for name in &self.allowlist {
+                let table = self.url(name)?;
+                let table_path = table
+                    .to_file_path()
+                    .map_err(|()| anyhow::anyhow!("local table URL is not a filesystem path"))?;
+                let log_path = table_path.join("_delta_log");
+                if !log_path.is_dir() {
+                    continue;
+                }
+                let mut entries = std::fs::read_dir(log_path)?;
+                let mut has_delta_state = false;
+                for entry in &mut entries {
+                    let path = entry?.path();
+                    if path
+                        .extension()
+                        .is_some_and(|extension| extension == "json" || extension == "parquet")
+                    {
+                        has_delta_state = true;
+                        break;
+                    }
+                }
+                if has_delta_state {
+                    names.push(name.clone());
+                }
+            }
+            return Ok(names);
         }
         let root = self
             .root
@@ -372,6 +401,23 @@ fn ensure_property_token_unchanged(before: &str, after: &str) -> Result<()> {
 #[cfg(test)]
 mod property_discovery_tests {
     use super::*;
+
+    #[test]
+    fn allowlisted_local_tables_are_discovered_after_their_delta_log_is_created() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let name = "telemetry.sqlserver.sqlserver_active_sessions";
+        let url = Url::from_directory_path(root.path())
+            .map_err(|()| anyhow::anyhow!("temporary root is not a filesystem URL"))?;
+        let discovery = FilesystemDiscovery::new(url, vec![name.to_owned()]);
+        assert!(discovery.tables()?.is_empty());
+        let table_path = root
+            .path()
+            .join("telemetry/sqlserver/sqlserver_active_sessions/_delta_log");
+        std::fs::create_dir_all(&table_path)?;
+        std::fs::write(table_path.join("00000000000000000000.json"), "{}")?;
+        assert_eq!(discovery.tables()?, vec![name]);
+        Ok(())
+    }
 
     #[test]
     fn filesystem_discovery_resolves_qualified_table_identities_as_nested_paths() -> Result<()> {
