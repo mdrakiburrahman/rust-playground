@@ -2019,7 +2019,7 @@ mod tests {
         config.validate_for_oat()?;
         assert_eq!(
             config.environment_for(ComponentRole::Router)?["ARROWCOL_ROUTER_EXCLUDED_ADMISSION_GAUGES"],
-            r#"["cpu_utilization_bps","active_streams"]"#
+            "cpu_utilization_bps,active_streams"
         );
         assert!(
             serde_json::from_str::<Tunables>(r#"{"router":{"excluded_admission_gauges":["unknown_gauge"]}}"#).is_err()
