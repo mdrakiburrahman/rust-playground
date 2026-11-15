@@ -10,7 +10,7 @@ use arrowcol_flight::{
 };
 use arrowcol_protocol::{
     AuthContext, AuthMethod, AuthenticatedPrincipal, CollectorInstanceId, ErrorCode, ImplementationPool,
-    NOT_ADMITTED_METADATA_KEY, PositiveMeasurement, PrincipalId, PrincipalIssuer,
+    PositiveMeasurement, PrincipalId, PrincipalIssuer,
 };
 use arrowcol_routing::{CollectorRegistration, CollectorState, RoutingStore};
 use async_trait::async_trait;
@@ -990,8 +990,8 @@ pub(crate) mod tests {
     use arrowcol_catalog::{CatalogControlPlane, CatalogStore, DdlParser, FlightSqlDdlHandler, MemoryCatalogStore};
     use arrowcol_flight::{DeliveryGuarantee, PutResultMetadata};
     use arrowcol_protocol::{
-        BasisPoints, CatalogName, ClaimedSchemaFingerprint, IngestMetadata, Measurement, PressureGauge,
-        ProtocolVersion, SchemaName, TableName, UnixMillis, fingerprint_schema,
+        BasisPoints, CatalogName, ClaimedSchemaFingerprint, IngestMetadata, Measurement, NOT_ADMITTED_METADATA_KEY,
+        PressureGauge, ProtocolVersion, SchemaName, TableName, UnixMillis, fingerprint_schema,
     };
     use arrowcol_routing::{
         CollectorRegistration, LeaseClaim, LeaseKey, MemoryRoutingStore, RichPressureSnapshot, RoutingStore,
