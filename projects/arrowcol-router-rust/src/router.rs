@@ -185,6 +185,7 @@ impl ProductionRouter {
         session: &mut Session,
         context: &mut RequestContext,
         now: UnixMillis,
+        started_at: Instant,
     ) -> pingora::Result<bool> {
         let request = session.req_header();
         if request.method != Method::POST {
@@ -248,7 +249,23 @@ impl ProductionRouter {
                         }
                     };
                     self.routing
-                        .route_ingest_for_run(&metadata, &run_id, expires_at, now)
+                        .route_ingest_for_run_with_clock(&metadata, &run_id, expires_at, now, || {
+                            let elapsed = u64::try_from(started_at.elapsed().as_millis()).map_err(|_| {
+                                RoutingError::new(
+                                    RoutingErrorKind::InvalidConfiguration,
+                                    "OAT routing elapsed time overflow",
+                                )
+                            })?;
+                            let timestamp = now.get().checked_add(elapsed).ok_or_else(|| {
+                                RoutingError::new(
+                                    RoutingErrorKind::InvalidConfiguration,
+                                    "OAT routing timestamp overflow",
+                                )
+                            })?;
+                            UnixMillis::new(timestamp).map_err(|error| {
+                                RoutingError::new(RoutingErrorKind::InvalidConfiguration, error.to_string())
+                            })
+                        })
                         .await
                 }
                 None => self.routing.route_ingest(&metadata, now).await,
@@ -475,14 +492,15 @@ impl ProxyHttp for ProductionRouter {
     }
 
     async fn request_filter(&self, session: &mut Session, context: &mut Self::CTX) -> pingora::Result<bool> {
-        context.request_started = Some(Instant::now());
+        let started_at = Instant::now();
+        context.request_started = Some(started_at);
         let now = now_unix_millis()
             .map_err(|cause| Error::because(ErrorType::InternalError, "read current timestamp", cause))?;
         let path = session.req_header().uri.path().to_owned();
         if let Some(handled) = self.handle_http_api(session, &path, now).await? {
             return Ok(handled);
         }
-        self.route_proxy_request(session, context, now).await
+        self.route_proxy_request(session, context, now, started_at).await
     }
 
     async fn response_filter(

@@ -230,6 +230,35 @@ impl RoutingEngine {
         run_expires_at: UnixMillis,
         now: UnixMillis,
     ) -> RoutingResult<RouteAssignment> {
+        let started_at = Instant::now();
+        self.route_ingest_for_run_with_clock(metadata, run_id, run_expires_at, now, move || {
+            let elapsed_ms = u64::try_from(started_at.elapsed().as_millis()).map_err(|_| {
+                RoutingError::new(
+                    RoutingErrorKind::InvalidConfiguration,
+                    "OAT routing elapsed time overflow",
+                )
+            })?;
+            add_millis(now, elapsed_ms)
+        })
+        .await
+    }
+
+    /// Routes an OAT request with an injected decision clock.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the run, pin, lease, or collector is not valid.
+    pub async fn route_ingest_for_run_with_clock<F>(
+        &self,
+        metadata: &IngestMetadata,
+        run_id: &str,
+        run_expires_at: UnixMillis,
+        now: UnixMillis,
+        clock: F,
+    ) -> RoutingResult<RouteAssignment>
+    where
+        F: Fn() -> RoutingResult<UnixMillis>,
+    {
         if self.policy.oat_run_id.as_deref() != Some(run_id) {
             return Err(RoutingError::new(
                 RoutingErrorKind::InvalidConfiguration,
@@ -250,10 +279,19 @@ impl RoutingEngine {
         let load_started = Instant::now();
         let view = self.refresh(now).await?;
         let load_view_ms = elapsed_ms(load_started);
-        self.assignment_for_run_pin_in_view(&pin, &view, now).map_err(|error| {
-            let diagnostic = oat_diagnostic(&error, &pin, &view, now, &self.policy, pin_read_ms, load_view_ms);
-            error.with_oat_diagnostic(diagnostic)
-        })
+        let checked_at = clock()?;
+        if checked_at < now {
+            return Err(RoutingError::new(
+                RoutingErrorKind::InvalidConfiguration,
+                "OAT routing clock regressed",
+            ));
+        }
+        self.assignment_for_run_pin_in_view(&pin, &view, checked_at)
+            .map_err(|error| {
+                let diagnostic =
+                    oat_diagnostic(&error, &pin, &view, checked_at, &self.policy, pin_read_ms, load_view_ms);
+                error.with_oat_diagnostic(diagnostic)
+            })
     }
 
     /// Revalidates an already selected OAT upstream immediately before forwarding.

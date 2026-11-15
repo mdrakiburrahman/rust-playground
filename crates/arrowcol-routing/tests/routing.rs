@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrowcol_protocol::{
     BasisPoints, CatalogName, ClaimedSchemaFingerprint, CollectorInstanceId, ImplementationPool, IngestMetadata,
@@ -6,9 +7,10 @@ use arrowcol_protocol::{
     TableName, UnixMillis,
 };
 use arrowcol_routing::{
-    CollectorRegistration, CollectorState, LeaseCas, LeaseClaim, LeaseKey, LeaseState, LeaseSuccession,
+    CollectorRegistration, CollectorState, LeaseCas, LeaseClaim, LeaseKey, LeaseState, LeaseSuccession, LeaseTransfer,
     MemoryRoutingStore, RebalanceReport, RichPressureSnapshot, RouteSource, RoutingEngine, RoutingErrorKind,
-    RoutingLease, RoutingPolicy, RoutingStore, SubsystemState, TablePressure, rank_collectors,
+    RoutingLease, RoutingPolicy, RoutingResult, RoutingStore, RoutingView, RunTablePin, SubsystemState, TablePressure,
+    rank_collectors,
 };
 
 const OAT_RUN_CONCURRENT: &str = "00000000-0000-0000-0000-000000000001";
@@ -211,6 +213,65 @@ async fn seeded_store() -> (Arc<MemoryRoutingStore>, CollectorInstanceId, Collec
     (store, first, second)
 }
 
+struct DelayedViewStore {
+    pin: RunTablePin,
+    view: RoutingView,
+    clock: Arc<AtomicU64>,
+    decision_at: u64,
+}
+
+#[async_trait::async_trait]
+impl RoutingStore for DelayedViewStore {
+    async fn get_run_table_pin(&self, _: &str, _: &LeaseKey, _: UnixMillis) -> RoutingResult<Option<RunTablePin>> {
+        Ok(Some(self.pin.clone()))
+    }
+
+    async fn load_view(&self, _: UnixMillis) -> RoutingResult<RoutingView> {
+        self.clock.store(self.decision_at, Ordering::SeqCst);
+        Ok(self.view.clone())
+    }
+
+    async fn register_collector(&self, _: &CollectorRegistration) -> RoutingResult<()> {
+        panic!("unexpected register")
+    }
+    async fn heartbeat_collector(&self, _: CollectorInstanceId, _: UnixMillis, _: UnixMillis) -> RoutingResult<()> {
+        panic!("unexpected heartbeat")
+    }
+    async fn set_collector_state(&self, _: CollectorInstanceId, _: CollectorState, _: UnixMillis) -> RoutingResult<()> {
+        panic!("unexpected state change")
+    }
+    async fn publish_pressure(&self, _: &RichPressureSnapshot) -> RoutingResult<()> {
+        panic!("unexpected pressure publish")
+    }
+    async fn claim_lease(&self, _: &LeaseClaim) -> RoutingResult<RoutingLease> {
+        panic!("unexpected claim")
+    }
+    async fn initialize_run_table_set(
+        &self,
+        _: &str,
+        _: &[LeaseKey],
+        _: UnixMillis,
+        _: UnixMillis,
+    ) -> RoutingResult<()> {
+        panic!("unexpected initialization")
+    }
+    async fn bind_initial_run_table_pin(&self, _: &RunTablePin, _: UnixMillis) -> RoutingResult<RunTablePin> {
+        panic!("unexpected binding")
+    }
+    async fn has_active_run_table_pin(&self, _: &LeaseKey, _: UnixMillis) -> RoutingResult<bool> {
+        panic!("unexpected pin lookup")
+    }
+    async fn begin_lease_drain(&self, _: &LeaseCas) -> RoutingResult<RoutingLease> {
+        panic!("unexpected drain")
+    }
+    async fn transfer_drained_lease(&self, _: &LeaseTransfer) -> RoutingResult<RoutingLease> {
+        panic!("unexpected transfer")
+    }
+    async fn transfer_to_successor(&self, _: &LeaseSuccession) -> RoutingResult<RoutingLease> {
+        panic!("unexpected succession")
+    }
+}
+
 #[tokio::test]
 async fn pinned_oat_holder_at_hard_pressure_is_a_transient_overload() {
     let (store, _, _) = seeded_store().await;
@@ -292,6 +353,180 @@ async fn oat_rejections_report_the_decision_view_and_future_snapshot() {
             Some("collector pressure snapshot is too far in the future")
         );
     }
+}
+
+#[tokio::test]
+async fn oat_initial_route_uses_decision_clock_after_loading_view() {
+    let (store, _, _) = seeded_store().await;
+    let engine_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);
+    let engine = RoutingEngine::new(engine_store, oat_policy(OAT_RUN_CONCURRENT))
+        .unwrap_or_else(|error| panic!("create OAT routing engine: {error}"));
+    initialize_memory_oat_pin(&engine, OAT_RUN_CONCURRENT, millis(100_001), millis(110_000)).await;
+    let pin = store
+        .get_run_table_pin(
+            OAT_RUN_CONCURRENT,
+            &LeaseKey::new(ImplementationPool::Dataflow, table()),
+            millis(100_002),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("read pin: {error}"))
+        .unwrap_or_else(|| panic!("missing pin"));
+    let mut view = store
+        .load_view(millis(100_002))
+        .await
+        .unwrap_or_else(|error| panic!("load view: {error}"));
+    view.collectors
+        .get_mut(&pin.holder_instance_id)
+        .unwrap_or_else(|| panic!("missing holder"))
+        .pressure = Some(snapshot(pin.holder_instance_id, 103_003, 1_000, 0));
+    let clock = Arc::new(AtomicU64::new(100_002));
+    let fake = Arc::new(DelayedViewStore {
+        pin: pin.clone(),
+        view,
+        clock: Arc::clone(&clock),
+        decision_at: 103_003,
+    });
+    let engine = RoutingEngine::new(fake, oat_policy(OAT_RUN_CONCURRENT))
+        .unwrap_or_else(|error| panic!("create delayed engine: {error}"));
+    let result = engine
+        .route_ingest_for_run_with_clock(
+            &metadata(),
+            OAT_RUN_CONCURRENT,
+            millis(110_000),
+            millis(100_002),
+            || Ok(millis(clock.load(Ordering::SeqCst))),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("fresh-at-decision snapshot rejected: {error}"));
+    assert_eq!(result.instance_id, pin.holder_instance_id);
+
+    let expired = engine
+        .route_ingest_for_run_with_clock(
+            &metadata(),
+            OAT_RUN_CONCURRENT,
+            millis(110_000),
+            millis(100_002),
+            || Ok(millis(110_000)),
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("pin expiry during SQL read must reject"));
+    assert_eq!(expired.kind(), RoutingErrorKind::Conflict);
+
+    let regressed = engine
+        .route_ingest_for_run_with_clock(
+            &metadata(),
+            OAT_RUN_CONCURRENT,
+            millis(110_000),
+            millis(100_002),
+            || Ok(millis(100_001)),
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("regressed decision clock must reject"));
+    assert_eq!(regressed.kind(), RoutingErrorKind::InvalidConfiguration);
+}
+
+#[tokio::test]
+async fn oat_initial_route_keeps_rejecting_invalid_pressure_and_expired_registration() {
+    let (store, _, _) = seeded_store().await;
+    let engine_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);
+    let engine = RoutingEngine::new(engine_store, oat_policy(OAT_RUN_CONCURRENT))
+        .unwrap_or_else(|error| panic!("create OAT routing engine: {error}"));
+    initialize_memory_oat_pin(&engine, OAT_RUN_CONCURRENT, millis(100_001), millis(250_000)).await;
+    let pin = store
+        .get_run_table_pin(
+            OAT_RUN_CONCURRENT,
+            &LeaseKey::new(ImplementationPool::Dataflow, table()),
+            millis(100_002),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("read pin: {error}"))
+        .unwrap_or_else(|| panic!("missing pin"));
+    store
+        .publish_pressure(&snapshot(pin.holder_instance_id, 103_003, 1_000, 0))
+        .await
+        .unwrap_or_else(|error| panic!("publish pressure: {error}"));
+    for (checked_at, reason) in [(100_500, "pressure_future"), (119_000, "pressure_stale")] {
+        let error = engine
+            .route_ingest_for_run_with_clock(
+                &metadata(),
+                OAT_RUN_CONCURRENT,
+                millis(250_000),
+                millis(100_002),
+                || Ok(millis(checked_at)),
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{reason} should reject"));
+        assert_eq!(error.kind(), RoutingErrorKind::LeaseHolderUnavailable);
+        assert_eq!(error.oat_diagnostic().and_then(|detail| detail.reason), Some(reason));
+    }
+    store
+        .publish_pressure(&snapshot(pin.holder_instance_id, 199_999, 1_000, 0))
+        .await
+        .unwrap_or_else(|error| panic!("publish fresh pressure: {error}"));
+    let error = engine
+        .route_ingest_for_run_with_clock(
+            &metadata(),
+            OAT_RUN_CONCURRENT,
+            millis(250_000),
+            millis(100_002),
+            || Ok(millis(200_000)),
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("expired registration must reject"));
+    assert_eq!(error.kind(), RoutingErrorKind::LeaseHolderUnavailable);
+    assert_eq!(
+        error.oat_diagnostic().and_then(|detail| detail.reason),
+        Some("registration_not_live")
+    );
+}
+
+#[tokio::test]
+async fn oat_initial_route_rejects_lease_expiring_during_view_read() {
+    let (store, _, _) = seeded_store().await;
+    let engine_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);
+    let engine = RoutingEngine::new(engine_store, oat_policy(OAT_RUN_CONCURRENT))
+        .unwrap_or_else(|error| panic!("create OAT routing engine: {error}"));
+    initialize_memory_oat_pin(&engine, OAT_RUN_CONCURRENT, millis(100_001), millis(200_000)).await;
+    let key = LeaseKey::new(ImplementationPool::Dataflow, table());
+    let pin = store
+        .get_run_table_pin(OAT_RUN_CONCURRENT, &key, millis(100_002))
+        .await
+        .unwrap_or_else(|error| panic!("read pin: {error}"))
+        .unwrap_or_else(|| panic!("missing pin"));
+    let mut view = store
+        .load_view(millis(100_002))
+        .await
+        .unwrap_or_else(|error| panic!("load view: {error}"));
+    view.leases
+        .get_mut(&key)
+        .unwrap_or_else(|| panic!("missing lease"))
+        .expires_at_unix_ms = millis(110_005);
+    let clock = Arc::new(AtomicU64::new(100_002));
+    let fake = Arc::new(DelayedViewStore {
+        pin,
+        view,
+        clock: Arc::clone(&clock),
+        decision_at: 110_005,
+    });
+    let engine = RoutingEngine::new(fake, oat_policy(OAT_RUN_CONCURRENT))
+        .unwrap_or_else(|error| panic!("create delayed engine: {error}"));
+    let error = engine
+        .route_ingest_for_run_with_clock(
+            &metadata(),
+            OAT_RUN_CONCURRENT,
+            millis(200_000),
+            millis(100_002),
+            || Ok(millis(clock.load(Ordering::SeqCst))),
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("expired lease must reject"));
+    assert_eq!(error.kind(), RoutingErrorKind::Conflict);
+    assert_eq!(error.message(), "immutable OAT run-table owner changed or expired");
 }
 
 #[tokio::test]
