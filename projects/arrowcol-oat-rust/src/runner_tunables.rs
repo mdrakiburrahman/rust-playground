@@ -29,7 +29,14 @@ fn compose_tunables(config: &OatConfig) -> Result<Value> {
         ("router", ComponentRole::Router),
         ("dataflow-1", ComponentRole::Collector),
     ] {
-        let environment = role_environment(config, role)?;
+        let mut environment = role_environment(config, role)?;
+        if matches!(role, ComponentRole::Collector) {
+            for &(legacy, canonical, _) in arrow_deltalake::delta::PROCESS_WRITER_PROPERTY_ENVIRONMENT_ALIASES {
+                if let Some(value) = environment.get(canonical).cloned() {
+                    environment.insert(legacy.to_owned(), value);
+                }
+            }
+        }
         if !environment.is_empty() {
             services.insert(service.to_owned(), json!({ "environment": environment }));
         }
@@ -179,6 +186,55 @@ mod tunable_injection_tests {
             .map(|(name, value)| json!({"name":name,"value":value}))
             .collect::<Vec<_>>();
         assert_eq!(client["env"], json!(expected));
+        Ok(())
+    }
+
+    #[test]
+    fn local_overlay_resolves_all_oat_layout_aliases_without_conflicts() -> Result<()> {
+        let mut config = config()?;
+        config.tunables = serde_json::from_value(json!({
+            "collector": {
+                "layout": {
+                    "enabled": true,
+                    "sort_columns": ["session_id"],
+                    "bloom_columns": ["database_name"],
+                    "max_rows": 4096,
+                    "max_input_bytes": 16777216,
+                    "row_group_rows": 1024,
+                    "page_rows": 256
+                }
+            }
+        }))?;
+        let mut overlay = compose_tunables(&config)?;
+        local_dataflow_overlay(&config, Path::new("/owned/run"), &mut overlay)?;
+        let environment = overlay["services"]["dataflow-1"]["environment"]
+            .as_object()
+            .context("local collector environment must be an object")?
+            .iter()
+            .map(|(name, value)| {
+                Ok((
+                    name.clone(),
+                    value.as_str()
+                        .context("local collector environment values must be strings")?
+                        .to_owned(),
+                ))
+            })
+            .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+        let effective =
+            arrow_deltalake::delta::resolve_process_writer_properties_from_environment(&environment)?;
+        let aliases = arrow_deltalake::delta::PROCESS_WRITER_PROPERTY_ENVIRONMENT_ALIASES;
+        assert_eq!(
+            aliases.iter().filter(|(_, canonical, _)| environment.contains_key(canonical)).count(),
+            aliases.len(),
+            "the test configuration should set every aliased layout knob"
+        );
+        for &(legacy, canonical, property) in aliases {
+            let value = environment.get(canonical).context("missing canonical OAT layout value")?;
+            assert_eq!(environment.get(legacy), Some(value));
+            assert_eq!(effective.get(property), Some(value));
+        }
+        assert_eq!(effective["arrowcol.layout.rowGroupRows"], "1024");
+        assert_eq!(effective["arrowcol.layout.pageRows"], "256");
         Ok(())
     }
 

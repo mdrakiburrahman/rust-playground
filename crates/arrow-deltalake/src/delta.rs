@@ -43,6 +43,55 @@ fn process_writer_properties(schema: &SchemaRef) -> Result<BTreeMap<String, Stri
     read_process_writer_properties(Some(schema))
 }
 
+/// Legacy and canonical collector environment names, paired with their Delta property key.
+pub const PROCESS_WRITER_PROPERTY_ENVIRONMENT_ALIASES: &[(&str, &str, &str)] = &[
+    (
+        "ARROWCOL_LAYOUT_ENABLED",
+        "ARROWCOL_COLLECTOR_LAYOUT_ENABLED",
+        "arrowcol.layout.enabled",
+    ),
+    (
+        "ARROWCOL_LAYOUT_SORT_COLUMNS",
+        "ARROWCOL_COLLECTOR_SORT_COLUMNS",
+        "arrowcol.layout.sortColumns",
+    ),
+    (
+        "ARROWCOL_LAYOUT_BLOOM_COLUMNS",
+        "ARROWCOL_COLLECTOR_BLOOM_COLUMNS",
+        "arrowcol.layout.bloomColumns",
+    ),
+    (
+        "ARROWCOL_LAYOUT_MAX_ROWS",
+        "ARROWCOL_COLLECTOR_LAYOUT_MAX_ROWS",
+        "arrowcol.layout.maxRows",
+    ),
+    (
+        "ARROWCOL_LAYOUT_MAX_INPUT_BYTES",
+        "ARROWCOL_COLLECTOR_LAYOUT_MAX_INPUT_BYTES",
+        "arrowcol.layout.maxInputSize",
+    ),
+    (
+        "ARROWCOL_LAYOUT_ROW_GROUP_ROWS",
+        "ARROWCOL_COLLECTOR_LAYOUT_ROW_GROUP_ROWS",
+        "arrowcol.layout.rowGroupRows",
+    ),
+    (
+        "ARROWCOL_LAYOUT_PAGE_ROWS",
+        "ARROWCOL_COLLECTOR_LAYOUT_PAGE_ROWS",
+        "arrowcol.layout.pageRows",
+    ),
+];
+
+/// Resolve collector writer properties from an explicit process environment map.
+///
+/// # Errors
+/// Returns an error when legacy and canonical aliases disagree.
+pub fn resolve_process_writer_properties_from_environment(
+    environment: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>> {
+    process_writer_properties_from(None, |name| Ok(environment.get(name).cloned()))
+}
+
 fn read_process_writer_properties(schema: Option<&SchemaRef>) -> Result<BTreeMap<String, String>> {
     process_writer_properties_from(schema, |name| match std::env::var(name) {
         Ok(value) => Ok(Some(value)),
@@ -56,43 +105,7 @@ fn process_writer_properties_from(
     mut read: impl FnMut(&str) -> Result<Option<String>>,
 ) -> Result<BTreeMap<String, String>> {
     let mut process = BTreeMap::new();
-    for (legacy, collector, key) in [
-        (
-            "ARROWCOL_LAYOUT_ENABLED",
-            "ARROWCOL_COLLECTOR_LAYOUT_ENABLED",
-            "arrowcol.layout.enabled",
-        ),
-        (
-            "ARROWCOL_LAYOUT_SORT_COLUMNS",
-            "ARROWCOL_COLLECTOR_SORT_COLUMNS",
-            "arrowcol.layout.sortColumns",
-        ),
-        (
-            "ARROWCOL_LAYOUT_BLOOM_COLUMNS",
-            "ARROWCOL_COLLECTOR_BLOOM_COLUMNS",
-            "arrowcol.layout.bloomColumns",
-        ),
-        (
-            "ARROWCOL_LAYOUT_MAX_ROWS",
-            "ARROWCOL_COLLECTOR_LAYOUT_MAX_ROWS",
-            "arrowcol.layout.maxRows",
-        ),
-        (
-            "ARROWCOL_LAYOUT_MAX_INPUT_BYTES",
-            "ARROWCOL_COLLECTOR_LAYOUT_MAX_INPUT_BYTES",
-            "arrowcol.layout.maxInputSize",
-        ),
-        (
-            "ARROWCOL_LAYOUT_ROW_GROUP_ROWS",
-            "ARROWCOL_COLLECTOR_LAYOUT_ROW_GROUP_ROWS",
-            "arrowcol.layout.rowGroupRows",
-        ),
-        (
-            "ARROWCOL_LAYOUT_PAGE_ROWS",
-            "ARROWCOL_COLLECTOR_LAYOUT_PAGE_ROWS",
-            "arrowcol.layout.pageRows",
-        ),
-    ] {
+    for &(legacy, collector, key) in PROCESS_WRITER_PROPERTY_ENVIRONMENT_ALIASES {
         let legacy_value = read(legacy)?;
         let collector_value = read(collector)?;
         if let (Some(legacy_value), Some(collector_value)) = (&legacy_value, &collector_value)
@@ -4443,38 +4456,20 @@ mod layout_readback_tests {
 
     #[test]
     fn layout_readback_resolves_both_aliases_and_preserves_schema_auto() -> Result<()> {
-        let aliases = [
-            ("ARROWCOL_LAYOUT_ENABLED", "ARROWCOL_COLLECTOR_LAYOUT_ENABLED", "false"),
-            (
-                "ARROWCOL_LAYOUT_SORT_COLUMNS",
-                "ARROWCOL_COLLECTOR_SORT_COLUMNS",
-                "customer_id,value",
-            ),
-            (
-                "ARROWCOL_LAYOUT_BLOOM_COLUMNS",
-                "ARROWCOL_COLLECTOR_BLOOM_COLUMNS",
-                "value",
-            ),
-            ("ARROWCOL_LAYOUT_MAX_ROWS", "ARROWCOL_COLLECTOR_LAYOUT_MAX_ROWS", "256"),
-            (
-                "ARROWCOL_LAYOUT_MAX_INPUT_BYTES",
-                "ARROWCOL_COLLECTOR_LAYOUT_MAX_INPUT_BYTES",
-                "3145728",
-            ),
-            (
-                "ARROWCOL_LAYOUT_ROW_GROUP_ROWS",
-                "ARROWCOL_COLLECTOR_LAYOUT_ROW_GROUP_ROWS",
-                "32",
-            ),
-            ("ARROWCOL_LAYOUT_PAGE_ROWS", "ARROWCOL_COLLECTOR_LAYOUT_PAGE_ROWS", "8"),
-        ];
+        let aliases = PROCESS_WRITER_PROPERTY_ENVIRONMENT_ALIASES;
+        let values = ["false", "customer_id,value", "value", "256", "3145728", "32", "8"];
         let resolve = |environment: &BTreeMap<&str, &str>| {
             process_writer_properties_from(None, |name| Ok(environment.get(name).map(|value| (*value).to_owned())))
         };
-        let legacy = aliases.iter().map(|(legacy, _, value)| (*legacy, *value)).collect();
+        let legacy = aliases
+            .iter()
+            .zip(values)
+            .map(|(alias, value)| (alias.0, value))
+            .collect();
         let collector = aliases
             .iter()
-            .map(|(_, collector, value)| (*collector, *value))
+            .zip(values)
+            .map(|(alias, value)| (alias.1, value))
             .collect();
         let layout = layout_startup_config(&resolve(&legacy)?)?;
         assert_eq!(layout, layout_startup_config(&resolve(&collector)?)?);
@@ -4487,7 +4482,8 @@ mod layout_readback_tests {
         assert_eq!(config["max_input_bytes"], 3_145_728);
         assert_eq!(config["row_group_rows"], 32);
         assert_eq!(config["page_rows"], 8);
-        for (legacy, collector, value) in aliases {
+        for (alias, value) in aliases.iter().zip(values) {
+            let (legacy, collector, _) = *alias;
             let matching = BTreeMap::from([(legacy, value), (collector, value)]);
             assert!(resolve(&matching).is_ok());
             let conflicting = BTreeMap::from([(legacy, value), (collector, "conflict")]);
