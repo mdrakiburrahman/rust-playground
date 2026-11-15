@@ -511,9 +511,6 @@ fn verify_process_configuration(config: &OatConfig, role: ComponentRole, observe
             }
             continue;
         }
-        if name == "RUST_LOG" && !matches!(role, ComponentRole::Router) {
-            continue;
-        }
         let path = match name.as_str() {
             "RUST_LOG" => "/log_filter".to_owned(),
             "ARROWCOL_PARQUET_CONFIG" if matches!(role, ComponentRole::Maintenance) => {
@@ -574,7 +571,41 @@ fn verify_process_configuration(config: &OatConfig, role: ComponentRole, observe
             );
         }
     }
+    if matches!(role, ComponentRole::Router)
+        && !role_environment(config, role)?.contains_key("RUST_LOG")
+    {
+        let expected = inherited_router_log_filter(config)?;
+        let actual = observed["log_filter"]
+            .as_str()
+            .context("router startup readback omitted the inherited YAML log filter")?;
+        if actual != expected {
+            bail!("router startup log filter does not match the inherited YAML filter");
+        }
+    }
     Ok(())
+}
+
+fn inherited_router_log_filter(config: &OatConfig) -> Result<String> {
+    let router_yaml_path = config
+        .platform
+        .compose_file
+        .as_deref()
+        .and_then(|compose_file| std::path::Path::new(compose_file).parent())
+        .map(|parent| parent.join("config/router.yaml"))
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("OAT manifest must have a projects directory")
+                .join("loadtest/config/router.yaml")
+        });
+    let content = std::fs::read_to_string(&router_yaml_path)
+        .with_context(|| format!("read inherited router configuration {}", router_yaml_path.display()))?;
+    let yaml: Value = serde_yaml::from_str(&content).context("parse inherited router YAML")?;
+    yaml.pointer("/telemetry/log_filter")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .context("router YAML omitted telemetry.log_filter")
 }
 
 fn collector_layout_records(config: &OatConfig, text: &str) -> Result<Vec<Value>> {
@@ -657,12 +688,10 @@ fn collector_layout_records(config: &OatConfig, text: &str) -> Result<Vec<Value>
 #[cfg(test)]
 fn process_evidence(config: &OatConfig, logs: &[ProcessLog]) -> Result<Value> {
     let mut logs = logs.to_vec();
+    let router_environment = config.tunables.environment_for(ComponentRole::Router)?;
     let added_router = !logs.iter().any(|log| matches!(log.role, ComponentRole::Router))
-        && config
-            .tunables
-            .environment_for(ComponentRole::Router)?
-            .keys()
-            .all(|name| name == "RUST_LOG");
+        && router_environment.contains_key("RUST_LOG")
+        && router_environment.keys().all(|name| name == "RUST_LOG");
     if added_router {
         let log_filter = config.tunables.environment_for(ComponentRole::Router)?["RUST_LOG"].clone();
         logs.push(ProcessLog {

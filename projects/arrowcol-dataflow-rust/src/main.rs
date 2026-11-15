@@ -12,14 +12,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "arrowcol_effective_config {}",
         arrow_deltalake::writer::effective_startup_config_json()?
     );
-    eprintln!(
-        "arrowcol_effective_config {{\"component\":\"build\",\"config\":{{\"allocator\":\"{}\"}}}}",
-        if cfg!(feature = "allocator-mimalloc") {
-            "mimalloc"
-        } else {
-            "system"
+    let build_config = serde_json::json!({
+        "component": "build",
+        "config": {
+            "allocator": if cfg!(feature = "allocator-mimalloc") {
+                "mimalloc"
+            } else {
+                "system"
+            },
+            "log_filter": std::env::var("RUST_LOG").ok(),
         }
-    );
+    });
+    eprintln!("arrowcol_effective_config {build_config}");
     otel_arrow_dfe::initialize_crypto_provider()?;
     let metrics = arrowcol_buffer::MetricsGuard::install("arrowcol-dataflow-rust")?;
     otel_arrow_dfe_telemetry::tracing_init::install_auxiliary_layer_factory(|| {

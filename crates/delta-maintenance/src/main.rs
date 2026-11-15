@@ -313,6 +313,13 @@ fn settings(cli: Cli) -> Result<Settings> {
 
 /// Install the OTLP http/protobuf meter provider when an endpoint is configured,
 /// then the Kernel metrics layer on the global tracing subscriber.
+fn effective_log_filter() -> String {
+    std::env::var("RUST_LOG")
+        .ok()
+        .filter(|filter| EnvFilter::try_new(filter.clone()).is_ok())
+        .unwrap_or_else(|| "warn".to_owned())
+}
+
 fn telemetry() -> Result<Option<SdkMeterProvider>> {
     let provider = if std::env::var_os("OTEL_EXPORTER_OTLP_ENDPOINT").is_some()
         || std::env::var_os("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT").is_some()
@@ -337,7 +344,7 @@ fn telemetry() -> Result<Option<SdkMeterProvider>> {
     } else {
         None
     };
-    let filter = EnvFilter::try_from_default_env().or_else(|_| EnvFilter::try_new("warn"))?;
+    let filter = EnvFilter::try_new(effective_log_filter())?;
     tracing_subscriber::registry()
         .with_metrics_reporter_layer(arrow_deltalake::telemetry::kernel_metrics_reporter())
         .with(
@@ -366,10 +373,9 @@ fn main_inner() -> Result<bool> {
     let catalog_endpoint = cli.catalog_endpoint.clone();
     let (listen, no_listener) = (cli.listen, cli.no_metrics_listener);
     let settings = settings(cli)?;
-    eprintln!(
-        "arrowcol_maintenance_effective_config {}",
-        startup_configuration(&settings)?
-    );
+    let mut startup = startup_configuration(&settings)?;
+    startup["log_filter"] = serde_json::json!(effective_log_filter());
+    eprintln!("arrowcol_maintenance_effective_config {startup}");
     let provider = telemetry()?;
     let cancel = Arc::new(AtomicBool::new(false));
     let handler = Arc::clone(&cancel);

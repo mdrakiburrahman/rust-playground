@@ -2784,13 +2784,8 @@ async fn run_clients_inner(
         }
         let sample = sample_router_metrics(platform, config, &metrics_client, tables).await;
         if let Ok(sample) = &sample {
-            let sampled_at = unix_time_ms_u64()?;
-            if sampled_at >= measurement_start_unix_ms && router_sql_start.is_none() {
-                router_sql_start = Some(sample.sql.clone());
-            }
-            if sampled_at >= measurement_end_unix_ms && router_sql_end.is_none() {
-                router_sql_end = Some(sample.sql.clone());
-            }
+            capture_router_sql_boundary(&mut router_sql_start, sample, measurement_start_unix_ms);
+            capture_router_sql_boundary(&mut router_sql_end, sample, measurement_end_unix_ms);
         }
         record_owner_observation(pinning, sample.map(|sample| sample.owners), tables, false);
         if completed_clients.len() < handles.len() {
@@ -2799,30 +2794,16 @@ async fn run_clients_inner(
     }
     let final_sample = sample_router_metrics(platform, config, &metrics_client, tables).await;
     if let Ok(sample) = &final_sample {
-        let sampled_at = unix_time_ms_u64()?;
-        if sampled_at >= measurement_start_unix_ms && router_sql_start.is_none() {
-            router_sql_start = Some(sample.sql.clone());
-        }
-        if sampled_at >= measurement_end_unix_ms && router_sql_end.is_none() {
-            router_sql_end = Some(sample.sql.clone());
-        }
+        capture_router_sql_boundary(&mut router_sql_start, sample, measurement_start_unix_ms);
+        capture_router_sql_boundary(&mut router_sql_end, sample, measurement_end_unix_ms);
     }
     record_owner_observation(pinning, final_sample.map(|sample| sample.owners), tables, true);
-    evidence.router_sql = Some(match (router_sql_start, router_sql_end) {
-        (Some(start), Some(end)) => end.delta_json(&start).map_or_else(
-            || {
-                json!({
-                    "status": "unavailable",
-                    "reason": "router_sql_counters_reset_or_disappeared_during_measurement",
-                })
-            },
-            |delta| json!({ "status": "observed", "metrics": delta }),
-        ),
-        _ => json!({
-            "status": "unavailable",
-            "reason": "router_sql_measurement_boundary_scrape_missing",
-        }),
-    });
+    evidence.router_sql = Some(router_sql_evidence(
+        router_sql_start.as_ref(),
+        router_sql_end.as_ref(),
+        measurement_start_unix_ms,
+        measurement_end_unix_ms,
+    ));
     let mut metrics = HashMap::with_capacity(tables.len());
     sampler.finish(&mut evidence).await?;
     for table in tables {
@@ -2986,7 +2967,22 @@ async fn cancel_active_clients(
 #[derive(Clone, Debug, Default)]
 struct RouterMetricSample {
     owners: HashMap<String, Vec<String>>,
-    sql: RouterSqlMetricSnapshot,
+    sql: RouterSqlMetricObservation,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RouterSqlMetricObservation {
+    snapshot: Option<RouterSqlMetricSnapshot>,
+    parse_error: Option<String>,
+    pre_scrape_unix_ms: u64,
+    post_scrape_unix_ms: u64,
+}
+
+impl RouterSqlMetricObservation {
+    fn midpoint_unix_ms(&self) -> u64 {
+        self.pre_scrape_unix_ms
+            .saturating_add(self.post_scrape_unix_ms.saturating_sub(self.pre_scrape_unix_ms) / 2)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3114,6 +3110,119 @@ fn histogram_upper_bound(buckets: &BTreeMap<String, u64>, count: u64, quantile: 
         .and_then(|(bound, _)| bound.is_finite().then_some(bound))
 }
 
+fn parse_router_metric_sample(
+    body: &str,
+    tables: &[String],
+    pre_scrape_unix_ms: u64,
+    post_scrape_unix_ms: u64,
+) -> Result<RouterMetricSample> {
+    let owners = parse_owner_metrics(body, tables)?;
+    let (snapshot, parse_error) = match parse_router_sql_metrics(body) {
+        Ok(snapshot) => (Some(snapshot), None),
+        Err(error) => (None, Some(format!("{error:#}"))),
+    };
+    Ok(RouterMetricSample {
+        owners,
+        sql: RouterSqlMetricObservation {
+            snapshot,
+            parse_error,
+            pre_scrape_unix_ms,
+            post_scrape_unix_ms,
+        },
+    })
+}
+
+fn capture_router_sql_boundary(
+    boundary: &mut Option<RouterSqlMetricObservation>,
+    sample: &RouterMetricSample,
+    measurement_boundary_unix_ms: u64,
+) {
+    if boundary.is_none() && sample.sql.post_scrape_unix_ms >= measurement_boundary_unix_ms {
+        *boundary = Some(sample.sql.clone());
+    }
+}
+
+fn router_sql_boundary_json(
+    observation: Option<&RouterSqlMetricObservation>,
+    measurement_boundary_unix_ms: u64,
+) -> Value {
+    let Some(observation) = observation else {
+        return json!({ "status": "missing", "measurement_boundary_unix_ms": measurement_boundary_unix_ms });
+    };
+    let midpoint_unix_ms = observation.midpoint_unix_ms();
+    json!({
+        "status": "observed",
+        "measurement_boundary_unix_ms": measurement_boundary_unix_ms,
+        "pre_scrape_unix_ms": observation.pre_scrape_unix_ms,
+        "post_scrape_unix_ms": observation.post_scrape_unix_ms,
+        "midpoint_unix_ms": midpoint_unix_ms,
+        "skew_ms": midpoint_unix_ms.abs_diff(measurement_boundary_unix_ms),
+    })
+}
+
+fn router_sql_evidence(
+    start: Option<&RouterSqlMetricObservation>,
+    end: Option<&RouterSqlMetricObservation>,
+    measurement_start_unix_ms: u64,
+    measurement_end_unix_ms: u64,
+) -> Value {
+    let start_boundary = router_sql_boundary_json(start, measurement_start_unix_ms);
+    let end_boundary = router_sql_boundary_json(end, measurement_end_unix_ms);
+    let window_ms = measurement_end_unix_ms.saturating_sub(measurement_start_unix_ms);
+    let max_skew_ms = 2_000_u64.max(window_ms / 20);
+    let boundary_evidence = json!({
+        "start": start_boundary,
+        "end": end_boundary,
+        "max_skew_ms": max_skew_ms,
+    });
+    let unavailable = |reason: &str| {
+        json!({
+            "status": "unavailable",
+            "reason": reason,
+            "boundaries": boundary_evidence,
+        })
+    };
+    let (Some(start), Some(end)) = (start, end) else {
+        return unavailable("router_sql_measurement_boundary_scrape_missing");
+    };
+    if let Some(reason) = start.parse_error.as_ref().or(end.parse_error.as_ref()) {
+        return json!({
+            "status": "unavailable",
+            "reason": "router_sql_metrics_parse_failed",
+            "detail": reason,
+            "boundaries": boundary_evidence,
+        });
+    }
+    let start_midpoint = start.midpoint_unix_ms();
+    let end_midpoint = end.midpoint_unix_ms();
+    if start_midpoint.abs_diff(measurement_start_unix_ms) > max_skew_ms
+        || end_midpoint.abs_diff(measurement_end_unix_ms) > max_skew_ms
+    {
+        return unavailable("router_sql_scrape_skew_exceeded_bound");
+    }
+    let snapshot_interval_ms = end_midpoint.saturating_sub(start_midpoint);
+    if snapshot_interval_ms == 0 {
+        return unavailable("router_sql_snapshot_interval_was_zero");
+    }
+    let (Some(start_snapshot), Some(end_snapshot)) = (start.snapshot.as_ref(), end.snapshot.as_ref()) else {
+        return unavailable("router_sql_metrics_snapshot_missing");
+    };
+    let Some(mut metrics) = end_snapshot.delta_json(start_snapshot) else {
+        return unavailable("router_sql_counters_reset_or_disappeared_during_measurement");
+    };
+    let interval_seconds = snapshot_interval_ms as f64 / 1_000.0;
+    let connections_opened = metrics["connections_opened"].as_u64().unwrap_or(0);
+    metrics["snapshot_interval_ms"] = json!(snapshot_interval_ms);
+    metrics["connections_opened_per_second"] = json!(connections_opened as f64 / interval_seconds);
+    if let Some(operations) = metrics["operations"].as_array_mut() {
+        for operation in operations {
+            let count = operation["count"].as_u64().unwrap_or(0);
+            operation["per_second"] = json!(count as f64 / interval_seconds);
+        }
+    }
+    json!({ "status": "observed", "metrics": metrics, "boundaries": boundary_evidence })
+}
+
 async fn sample_router_metrics(
     platform: &mut dyn Platform,
     config: &OatConfig,
@@ -3121,6 +3230,7 @@ async fn sample_router_metrics(
     tables: &[String],
 ) -> Result<RouterMetricSample> {
     let (endpoint, _) = platform.ensure_router_metrics_endpoint(config).await?;
+    let mut pre_scrape_unix_ms = unix_time_ms_u64()?;
     let body = match fetch_router_metrics(client, &endpoint).await {
         Ok(body) => body,
         Err(error) => {
@@ -3140,6 +3250,7 @@ async fn sample_router_metrics(
             if !restarted {
                 return Err(error);
             }
+            pre_scrape_unix_ms = unix_time_ms_u64()?;
             fetch_router_metrics(client, &retry_endpoint)
                 .await
                 .map_err(|retry_error| {
@@ -3147,10 +3258,8 @@ async fn sample_router_metrics(
                 })?
         }
     };
-    Ok(RouterMetricSample {
-        owners: parse_owner_metrics(&body, tables)?,
-        sql: parse_router_sql_metrics(&body)?,
-    })
+    let post_scrape_unix_ms = unix_time_ms_u64()?;
+    parse_router_metric_sample(&body, tables, pre_scrape_unix_ms, post_scrape_unix_ms)
 }
 
 async fn fetch_router_metrics(client: &reqwest::Client, endpoint: &str) -> Result<String> {
@@ -3303,8 +3412,70 @@ fn parse_router_sql_metrics(body: &str) -> Result<RouterSqlMetricSnapshot> {
 
 #[cfg(test)]
 mod router_sql_metrics_tests {
-    use super::parse_router_sql_metrics;
+    use super::{
+        RouterSqlMetricObservation, RouterSqlMetricSnapshot, parse_router_metric_sample, parse_router_sql_metrics,
+        router_sql_evidence,
+    };
     use anyhow::{Context, Result, bail};
+
+    #[test]
+    fn owner_evidence_survives_missing_sql_counter() -> Result<()> {
+        let tables = vec!["sqlserver_active_sessions".to_owned()];
+        let sample = parse_router_metric_sample(
+            "arrowcol_router_table_owners{table=\"sqlserver_active_sessions\",collector=\"collector-a\",state=\"active\"} 1\n",
+            &tables,
+            1_000,
+            1_010,
+        )?;
+        assert_eq!(
+            sample.owners.values().next().map(Vec::as_slice),
+            Some(["collector-a".to_owned()].as_slice())
+        );
+        assert!(sample.sql.snapshot.is_none());
+        assert!(
+            sample
+                .sql
+                .parse_error
+                .as_deref()
+                .is_some_and(|reason| reason.contains("SQL connection counter"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn router_sql_evidence_reports_scrape_boundaries_rates_and_skew() {
+        let start = RouterSqlMetricObservation {
+            snapshot: Some(RouterSqlMetricSnapshot {
+                connections_opened: 2,
+                ..Default::default()
+            }),
+            pre_scrape_unix_ms: 9_950,
+            post_scrape_unix_ms: 10_050,
+            ..Default::default()
+        };
+        let end = RouterSqlMetricObservation {
+            snapshot: Some(RouterSqlMetricSnapshot {
+                connections_opened: 12,
+                ..Default::default()
+            }),
+            pre_scrape_unix_ms: 19_950,
+            post_scrape_unix_ms: 20_050,
+            ..Default::default()
+        };
+        let evidence = router_sql_evidence(Some(&start), Some(&end), 10_000, 20_000);
+        assert_eq!(evidence["status"], "observed");
+        assert_eq!(evidence["metrics"]["snapshot_interval_ms"], 10_000);
+        assert_eq!(evidence["metrics"]["connections_opened_per_second"], 1.0);
+        assert_eq!(evidence["boundaries"]["start"]["pre_scrape_unix_ms"], 9_950);
+        let late_start = RouterSqlMetricObservation {
+            pre_scrape_unix_ms: 7_000,
+            post_scrape_unix_ms: 7_100,
+            ..start
+        };
+        let unavailable = router_sql_evidence(Some(&late_start), Some(&end), 10_000, 20_000);
+        assert_eq!(unavailable["status"], "unavailable");
+        assert_eq!(unavailable["reason"], "router_sql_scrape_skew_exceeded_bound");
+    }
 
     #[test]
     fn parses_and_deltas_router_sql_operation_histograms() -> Result<()> {

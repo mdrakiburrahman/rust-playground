@@ -154,11 +154,34 @@ impl LogLevel {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RouterLogLevel {
+    Inherit,
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl RouterLogLevel {
+    fn as_filter(self) -> Option<&'static str> {
+        match self {
+            Self::Inherit => None,
+            Self::Error => Some("error"),
+            Self::Warn => Some("warn"),
+            Self::Info => Some("info"),
+            Self::Debug => Some("debug"),
+            Self::Trace => Some("trace"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoggingTunables {
-    pub client: Option<LogLevel>,
-    pub router: Option<LogLevel>,
+    pub router: Option<RouterLogLevel>,
     pub collector: Option<LogLevel>,
     pub maintenance: Option<LogLevel>,
 }

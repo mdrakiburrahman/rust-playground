@@ -127,8 +127,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("router.sql_command_timeout_ms", "15000"),
     capability!("router.sql_pool_max_size", "0 (unpooled)"),
     capability!("router.sql_pool_acquire_timeout_ms", "10000"),
-    capability!("logging.client", "unset"),
-    capability!("logging.router", "warn; tiberius=error"),
+    capability!("logging.router", "warn,tiberius=error; or inherit YAML filter"),
     capability!("logging.collector", "unset"),
     capability!("logging.maintenance", "unset"),
     capability!("router.refresh_interval_ms", "1000"),
@@ -612,17 +611,25 @@ impl Tunables {
                 }
             })
             .collect();
-        let level = self.logging.as_ref().and_then(|logging| match role {
-            ComponentRole::Client => logging.client,
-            ComponentRole::Router => logging.router,
-            ComponentRole::Collector => logging.collector,
-            ComponentRole::Maintenance => logging.maintenance,
-        });
         if matches!(role, ComponentRole::Router) {
-            let level = level.unwrap_or(crate::LogLevel::Warn).as_str();
-            selected.insert("RUST_LOG".to_owned(), format!("{level},tiberius=error"));
-        } else if let Some(level) = level {
-            selected.insert("RUST_LOG".to_owned(), level.as_str().to_owned());
+            let level = self
+                .logging
+                .as_ref()
+                .and_then(|logging| logging.router)
+                .unwrap_or(crate::RouterLogLevel::Warn);
+            if let Some(level) = level.as_filter() {
+                selected.insert("RUST_LOG".to_owned(), format!("{level},tiberius=error"));
+            }
+        } else {
+            let level = self.logging.as_ref().and_then(|logging| match role {
+                ComponentRole::Client => None,
+                ComponentRole::Router => None,
+                ComponentRole::Collector => logging.collector,
+                ComponentRole::Maintenance => logging.maintenance,
+            });
+            if let Some(level) = level {
+                selected.insert("RUST_LOG".to_owned(), level.as_str().to_owned());
+            }
         }
         Ok(selected)
     }
@@ -2069,10 +2076,9 @@ mod tests {
     #[test]
     fn router_pool_bounds_and_component_log_levels_are_strict() -> Result<()> {
         let config: Tunables = serde_json::from_str(
-            r#"{"router":{"sql_pool_max_size":64,"sql_pool_acquire_timeout_ms":2500},"logging":{"client":"debug","router":"trace","collector":"info","maintenance":"warn"}}"#,
+            r#"{"router":{"sql_pool_max_size":64,"sql_pool_acquire_timeout_ms":2500},"logging":{"router":"trace","collector":"info","maintenance":"warn"}}"#,
         )?;
         config.validate_for_oat()?;
-        assert_eq!(config.environment_for(ComponentRole::Client)?["RUST_LOG"], "debug");
         assert_eq!(
             config.environment_for(ComponentRole::Router)?["RUST_LOG"],
             "trace,tiberius=error"
@@ -2088,6 +2094,13 @@ mod tests {
             assert!(config.validate_for_oat().is_err());
         }
         assert!(serde_json::from_str::<Tunables>(r#"{"logging":{"router":"verbose"}}"#).is_err());
+        let inherited: Tunables = serde_json::from_str(r#"{"logging":{"router":"inherit"}}"#)?;
+        assert!(
+            !inherited
+                .environment_for(ComponentRole::Router)?
+                .contains_key("RUST_LOG")
+        );
+        assert!(serde_json::from_str::<Tunables>(r#"{"logging":{"client":"debug"}}"#).is_err());
         Ok(())
     }
 

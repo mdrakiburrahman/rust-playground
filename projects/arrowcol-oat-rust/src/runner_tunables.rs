@@ -19,7 +19,30 @@ fn capability_evidence() -> Vec<Value> {
 
 fn role_environment(config: &OatConfig, role: ComponentRole) -> Result<std::collections::BTreeMap<String, String>> {
     config.tunables.validate_for_oat()?;
+    if matches!(role, ComponentRole::Collector)
+        && config.tunables.logging.as_ref().and_then(|logging| logging.collector).is_some()
+    {
+        let pipeline = if config.tunables.wal.is_some() {
+            include_str!("../../arrowcol-dataflow-rust/config.quiver.yaml")
+        } else {
+            include_str!("../../arrowcol-dataflow-rust/config.yaml")
+        };
+        validate_collector_pipeline_log_level(pipeline)?;
+    }
     config.tunables.environment_for(role)
+}
+
+fn validate_collector_pipeline_log_level(pipeline_yaml: &str) -> Result<()> {
+    let pipeline: serde_yaml::Value = serde_yaml::from_str(pipeline_yaml)
+        .context("parse rendered collector pipeline for logging precedence")?;
+    let explicit = pipeline
+        .get("engine")
+        .and_then(|engine| engine.get("log_level"))
+        .is_some_and(|level| !level.is_null());
+    if explicit {
+        bail!("logging.collector cannot override an explicit engine.log_level in the rendered pipeline");
+    }
+    Ok(())
 }
 
 fn compose_tunables(config: &OatConfig) -> Result<Value> {
@@ -150,6 +173,20 @@ mod tunable_injection_tests {
         Ok(serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
         ))?)
+    }
+
+    #[test]
+    fn collector_logging_rejects_an_explicit_pipeline_engine_level() -> Result<()> {
+        validate_collector_pipeline_log_level("engine: {}\n")?;
+        let error = validate_collector_pipeline_log_level("engine:\n  log_level: debug\n");
+        assert!(error.is_err());
+        let mut config = config()?;
+        config.tunables.logging = Some(arrowcol_tunables::LoggingTunables {
+            collector: Some(arrowcol_tunables::LogLevel::Debug),
+            ..Default::default()
+        });
+        assert!(role_environment(&config, ComponentRole::Collector).is_ok());
+        Ok(())
     }
 
     #[test]
