@@ -574,6 +574,7 @@ http.createServer((request, response) => {
             schedule_configmap_name: "oat-schedule-test".to_owned(),
             service_account: None,
             router_yaml: None,
+            shutdown_drain_evidence: None,
         };
         let script = script_path.clone();
         let mut command = || {

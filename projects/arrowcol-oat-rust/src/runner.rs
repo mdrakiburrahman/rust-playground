@@ -172,6 +172,9 @@ trait Platform: Send + Sync {
             .filter(|log| log.role == role)
             .collect())
     }
+    fn shutdown_drain_evidence(&self) -> Option<Value> {
+        None
+    }
     async fn cleanup(&mut self, config: &OatConfig) -> Result<()>;
 }
 
@@ -195,6 +198,7 @@ struct AksPlatform {
     schedule_configmap_name: String,
     service_account: Option<String>,
     router_yaml: Option<String>,
+    shutdown_drain_evidence: Option<Value>,
 }
 
 struct OwnedKubectlProcess {
@@ -211,6 +215,7 @@ struct LocalPlatform {
     router_metrics_url: Option<String>,
     qap_url: Option<String>,
     daemon_endpoint: Option<String>,
+    shutdown_drain_evidence: Option<Value>,
 }
 
 #[async_trait::async_trait]
@@ -437,7 +442,16 @@ impl Platform for AksPlatform {
     }
 
     async fn cleanup(&mut self, config: &OatConfig) -> Result<()> {
-        cleanup_aks_platform(config, self).await
+        let result = cleanup_aks_platform(config, self).await;
+        if self.shutdown_drain_evidence.is_none() {
+            self.shutdown_drain_evidence =
+                Some(json!({"status":"unavailable", "reason":"ordered_aks_shutdown_not_completed"}));
+        }
+        result
+    }
+
+    fn shutdown_drain_evidence(&self) -> Option<Value> {
+        self.shutdown_drain_evidence.clone()
     }
 }
 
@@ -591,7 +605,20 @@ impl Platform for LocalPlatform {
     }
 
     async fn cleanup(&mut self, config: &OatConfig) -> Result<()> {
-        cleanup_local_platform(config, self).await
+        match cleanup_local_platform(config, self).await {
+            Ok(evidence) => {
+                self.shutdown_drain_evidence = Some(evidence);
+                Ok(())
+            }
+            Err(error) => {
+                self.shutdown_drain_evidence = Some(json!({"status":"unavailable", "reason":"local_cleanup_failed"}));
+                Err(error)
+            }
+        }
+    }
+
+    fn shutdown_drain_evidence(&self) -> Option<Value> {
+        self.shutdown_drain_evidence.clone()
     }
 }
 
@@ -641,6 +668,7 @@ impl LocalPlatform {
             router_metrics_url: None,
             qap_url: None,
             daemon_endpoint: None,
+            shutdown_drain_evidence: None,
         })
     }
 
@@ -1709,6 +1737,7 @@ async fn run_isolated_cell(
         _ = wait_for_cancellation(&mut cancellation) => (Err(anyhow::anyhow!("local OAT run cancelled")), true),
     };
     let cleanup = platform.cleanup(&config).await;
+    let shutdown_drain_evidence = platform.shutdown_drain_evidence();
     if cancelled && cleanup.is_ok() {
         return MatrixOutcome {
             rows: Vec::new(),
@@ -1716,7 +1745,7 @@ async fn run_isolated_cell(
             cancelled: true,
         };
     }
-    finish_matrix_cell(
+    let mut outcome = finish_matrix_cell(
         &config,
         orchestration_id,
         &run_id,
@@ -1724,7 +1753,36 @@ async fn run_isolated_cell(
         concurrency,
         result,
         cleanup,
-    )
+    );
+    if let Some(evidence) = shutdown_drain_evidence
+        && let Err(error) = attach_shutdown_drain_evidence(&mut outcome, evidence)
+    {
+        for row in &mut outcome.rows {
+            row.status = "failed".to_owned();
+            let message = format!("serialize collector shutdown drain evidence: {error:#}");
+            row.failure = Some(match row.failure.take() {
+                Some(previous) => format!("{previous}; {message}"),
+                None => message.clone(),
+            });
+        }
+        outcome.error = Some(match outcome.error.take() {
+            Some(previous) => previous.context(format!("serialize collector shutdown drain evidence: {error:#}")),
+            None => error,
+        });
+    }
+    outcome
+}
+
+fn attach_shutdown_drain_evidence(outcome: &mut MatrixOutcome, shutdown_drain: Value) -> Result<()> {
+    for row in &mut outcome.rows {
+        let evidence_json = row.evidence_json.as_deref().context("cell evidence is missing")?;
+        let mut evidence: Value =
+            serde_json::from_str(evidence_json).context("parse cell evidence before shutdown update")?;
+        evidence["shutdown_drain"] = shutdown_drain.clone();
+        row.evidence_json =
+            Some(serde_json::to_string(&evidence).context("serialize cell evidence with shutdown drain")?);
+    }
+    Ok(())
 }
 
 async fn wait_for_cancellation(cancellation: &mut watch::Receiver<bool>) {
@@ -1872,6 +1930,7 @@ fn platform_for_run(config: &OatConfig, run_id: &str) -> Result<Box<dyn Platform
             ),
             service_account: None,
             router_yaml: None,
+            shutdown_drain_evidence: None,
         })),
     }
 }
@@ -4836,24 +4895,70 @@ async fn stop_local_snapshot_writers(config: &OatConfig, platform: &LocalPlatfor
     let ids = String::from_utf8(output.stdout)?;
     let ids = ids.split_whitespace().map(str::to_owned).collect::<Vec<_>>();
     if ids.is_empty() {
-        bail!("no owned containers to establish stopped snapshot custody");
+        if config.platform.local.snapshot_root.is_some() {
+            bail!("no owned containers to establish stopped snapshot custody");
+        }
+        return Ok(Vec::new());
     }
     let mut inspect = Command::new("docker");
     inspect.arg("inspect").args(&ids);
     let before: Vec<Value> =
         serde_json::from_slice(&run_command(inspect, "inspect local snapshot ownership").await?.stdout)?;
-    validate_snapshot_container_ownership(&before, &project)?;
-    for phase in snapshot_stop_phases(&before)? {
+    if config.platform.local.snapshot_root.is_some() {
+        validate_snapshot_container_ownership(&before, &project)?;
+    } else {
+        validate_owned_local_containers(&before, &project)?;
+    }
+    let has_maintenance = before.iter().any(|container| {
+        container
+            .pointer("/Config/Labels/com.docker.compose.service")
+            .and_then(Value::as_str)
+            == Some("delta-maintenance")
+    });
+    let has_collector = before.iter().any(|container| {
+        container
+            .pointer("/Config/Labels/com.docker.compose.service")
+            .and_then(Value::as_str)
+            == Some("dataflow-1")
+    });
+    let maintenance_baseline = if has_maintenance {
+        local_process_logs_for_role(config, platform, Some(ComponentRole::Maintenance)).await?
+    } else {
+        Vec::new()
+    };
+    let phases = snapshot_stop_phases(&before)?;
+    let mut maintenance_logs = None;
+    let mut collector_sigterm_at_unix_ms = None;
+    for (phase_index, phase) in phases.into_iter().enumerate() {
+        if phase_index == 2 && !phase.is_empty() {
+            collector_sigterm_at_unix_ms = u64::try_from(unix_time_ms()).ok();
+        }
         if !phase.is_empty() {
+            let stop_grace = if phase_index == 2 {
+                config.collector_stop_grace_seconds
+            } else {
+                30
+            };
             let mut stop = Command::new("docker");
-            stop.args(["stop", "--time", "300"]).args(phase);
-            run_command(
-                stop,
-                "stop owned local ingress, then collectors, then catalog, then dependencies",
-            )
-            .await?;
+            stop.args(["stop", "--time", &stop_grace.to_string()]).args(phase);
+            let phase_description = match phase_index {
+                0 => "stop owned local ingress before maintenance and collectors",
+                1 => "stop owned local maintenance before collectors",
+                2 => "send SIGTERM to owned local collectors and wait for drain",
+                _ => "stop owned local catalog and dependencies after collectors",
+            };
+            run_command(stop, phase_description).await?;
+        }
+        if phase_index == 1 {
+            maintenance_logs =
+                Some(local_process_logs_for_role(config, platform, Some(ComponentRole::Maintenance)).await?);
         }
     }
+    let collector_logs = if has_collector {
+        local_process_logs_for_role(config, platform, Some(ComponentRole::Collector)).await?
+    } else {
+        Vec::new()
+    };
     let mut inspect = Command::new("docker");
     inspect.arg("inspect").args(&ids);
     let after: Vec<Value> = serde_json::from_slice(
@@ -4894,12 +4999,69 @@ async fn stop_local_snapshot_writers(config: &OatConfig, platform: &LocalPlatfor
     if listed.split_whitespace().collect::<HashSet<_>>() != ids.iter().map(String::as_str).collect::<HashSet<_>>() {
         bail!("owned local container set changed while stopping; preserving state");
     }
-    snapshot_container_outcomes(&before, &after, &project)
+    let mut outcomes = snapshot_container_outcomes(&before, &after, &project)?;
+    for outcome in &mut outcomes {
+        let service = outcome["service"]
+            .as_str()
+            .context("stopped container service missing")?;
+        let id = outcome["id"].as_str().context("stopped container ID missing")?;
+        if service == "dataflow-1" {
+            let incomplete_log = ProcessLog {
+                role: ComponentRole::Collector,
+                instance_id: id.to_owned(),
+                image: None,
+                image_id: None,
+                source_revision: None,
+                complete: false,
+                raw_log_bytes: 0,
+                raw_log_lines: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+                text: String::new(),
+            };
+            let log = collector_logs
+                .iter()
+                .find(|log| log.instance_id == id)
+                .unwrap_or(&incomplete_log);
+            outcome["shutdown_drain"] = collector_shutdown_drain_evidence(
+                log,
+                outcome["was_running"]
+                    .as_bool()
+                    .unwrap_or(false)
+                    .then_some(collector_sigterm_at_unix_ms)
+                    .flatten(),
+                outcome["finished_at"].as_str(),
+                outcome["exit_code"].as_i64(),
+                config.tunables.wal.is_some(),
+            );
+        } else if service == "delta-maintenance" {
+            let incomplete_log = ProcessLog {
+                role: ComponentRole::Maintenance,
+                instance_id: id.to_owned(),
+                image: None,
+                image_id: None,
+                source_revision: None,
+                complete: false,
+                raw_log_bytes: 0,
+                raw_log_lines: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+                text: String::new(),
+            };
+            let log = maintenance_logs
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .find(|log| log.instance_id == id)
+                .unwrap_or(&incomplete_log);
+            outcome["maintenance_outcomes"] = maintenance_cell_outcome_evidence(log, &maintenance_baseline);
+        }
+    }
+    Ok(outcomes)
 }
-
 fn snapshot_container_outcomes(before: &[Value], after: &[Value], project: &str) -> Result<Vec<Value>> {
-    validate_snapshot_container_ownership(before, project)?;
-    validate_snapshot_container_ownership(after, project)?;
+    validate_owned_local_containers(before, project)?;
+    validate_owned_local_containers(after, project)?;
     let before_by_id = before
         .iter()
         .map(|container| {
@@ -4979,23 +5141,36 @@ fn snapshot_container_outcomes(before: &[Value], after: &[Value], project: &str)
     Ok(writers)
 }
 
-fn validate_snapshot_container_ownership(containers: &[Value], project: &str) -> Result<()> {
-    let mut services = HashSet::new();
+fn validate_owned_local_containers(containers: &[Value], project: &str) -> Result<()> {
+    if containers.is_empty() {
+        bail!("no owned local containers were found");
+    }
     for container in containers {
         if container
             .pointer("/Config/Labels/com.docker.compose.project")
             .and_then(Value::as_str)
             != Some(project)
         {
-            bail!("refusing snapshot stop outside the exact owned Compose project");
+            bail!("refusing local container operation outside the exact owned Compose project");
         }
-        services.insert(
+        container
+            .pointer("/Config/Labels/com.docker.compose.service")
+            .and_then(Value::as_str)
+            .context("missing owned Compose service")?;
+    }
+    Ok(())
+}
+
+fn validate_snapshot_container_ownership(containers: &[Value], project: &str) -> Result<()> {
+    validate_owned_local_containers(containers, project)?;
+    let services = containers
+        .iter()
+        .filter_map(|container| {
             container
                 .pointer("/Config/Labels/com.docker.compose.service")
                 .and_then(Value::as_str)
-                .context("missing owned Compose service")?,
-        );
-    }
+        })
+        .collect::<HashSet<_>>();
     if !services.contains("dataflow-1") || !services.contains("arrowcol-catalog") {
         bail!("snapshot requires the owned collector and catalog, not a partially prepared stack");
     }
@@ -5010,9 +5185,9 @@ fn snapshot_stop_phases(containers: &[Value]) -> Result<[Vec<String>; 4]> {
             .and_then(Value::as_str)
             .context("missing owned Compose service")?;
         let phase = match service {
-            "dataflow-1" => 1,
-            "arrowcol-catalog" => 2,
-            "sqlserver" | "kusto" | "lgtm" => 3,
+            "delta-maintenance" => 1,
+            "dataflow-1" => 2,
+            "arrowcol-catalog" | "sqlserver" | "kusto" | "lgtm" => 3,
             _ => 0,
         };
         phases[phase].push(
@@ -5026,14 +5201,34 @@ fn snapshot_stop_phases(containers: &[Value]) -> Result<[Vec<String>; 4]> {
     Ok(phases)
 }
 
-async fn cleanup_local_platform(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
-    if let Some(destination) = &config.platform.local.snapshot_root {
-        return crate::local::snapshot_then_cleanup(
-            async {
-                tokio::time::timeout(Duration::from_secs(1_440), stop_local_snapshot_writers(config, platform))
-                    .await
-                    .context("local stop deadline exceeded; outcome uncertain, retaining owned data")?
-            },
+fn build_shutdown_drain_evidence(containers: &[Value]) -> Value {
+    json!({
+        "schema_version": 1,
+        "cleanup_order": ["ingress", "maintenance", "collectors"],
+        "collectors": containers.iter().filter(|container| container["service"] == "dataflow-1").map(|container| json!({
+            "container_id": container["id"],
+            "drain": container["shutdown_drain"],
+        })).collect::<Vec<_>>(),
+        "maintenance": containers.iter().filter(|container| container["service"] == "delta-maintenance").map(|container| json!({
+            "container_id": container["id"],
+            "outcomes": container["maintenance_outcomes"],
+            "exit_code": container["exit_code"],
+        })).collect::<Vec<_>>(),
+    })
+}
+
+async fn cleanup_local_platform(config: &OatConfig, platform: &LocalPlatform) -> Result<Value> {
+    let stop = async {
+        tokio::time::timeout(
+            Duration::from_secs(1_440),
+            stop_local_snapshot_writers(config, platform),
+        )
+        .await
+        .context("local stop deadline exceeded; outcome uncertain, retaining owned data")?
+    };
+    let containers = if let Some(destination) = &config.platform.local.snapshot_root {
+        crate::local::snapshot_then_cleanup(
+            stop,
             |writers| crate::local::export_stopped(
                 &platform.state_dir, Path::new(destination), &platform.run_id, &config.tables, &writers,
             ),
@@ -5043,9 +5238,13 @@ async fn cleanup_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
         .with_context(|| format!(
             "local snapshot/cleanup failed; source recovery path: {} (stop/export failures retain it; destructive-cleanup failures may be partial)",
             platform.state_dir.display()
-        ));
-    }
-    destroy_local_platform(config, platform).await
+        ))?
+    } else {
+        let containers = stop.await?;
+        destroy_local_platform(config, platform).await?;
+        containers
+    };
+    Ok(build_shutdown_drain_evidence(&containers))
 }
 
 fn local_oat_client_list_args(project: &str) -> Vec<String> {
@@ -5209,6 +5408,8 @@ async fn configure_deployments(config: &OatConfig, replicas: u32, concurrency: u
         }
         if name == config.dfe_deployment {
             configure_workers(&mut desired, &config.dfe_container, concurrency)?;
+            desired["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] =
+                json!(config.collector_stop_grace_seconds);
             inject_deployment_environment(
                 &mut desired,
                 &config.dfe_container,
@@ -5216,6 +5417,21 @@ async fn configure_deployments(config: &OatConfig, replicas: u32, concurrency: u
             )?;
         }
         apply_deployment(config, desired).await?;
+        if name == config.dfe_deployment {
+            let applied = deployment(config, name).await?;
+            verify_aks_collector_stop_grace(&applied, config.collector_stop_grace_seconds)?;
+        }
+    }
+    Ok(())
+}
+
+fn verify_aks_collector_stop_grace(deployment: &Value, expected_seconds: u64) -> Result<()> {
+    let actual = deployment
+        .pointer("/spec/template/spec/terminationGracePeriodSeconds")
+        .and_then(Value::as_u64)
+        .context("AKS collector readback omitted terminationGracePeriodSeconds")?;
+    if actual != expected_seconds {
+        bail!("AKS collector termination grace readback differs from requested value");
     }
     Ok(())
 }
@@ -6412,6 +6628,309 @@ async fn write_workload_stop_receipt(
     Ok(())
 }
 
+async fn aks_pods_by_selector(config: &OatConfig, selector: &str) -> Result<Value> {
+    let output = kubectl(
+        config,
+        vec![
+            "get",
+            "pods",
+            "--namespace",
+            &config.namespace,
+            "--selector",
+            selector,
+            "-o",
+            "json",
+        ],
+        None,
+    )
+    .await?;
+    serde_json::from_str::<Value>(&output).context("parse run-owned workload pods")
+}
+
+async fn stop_aks_deployment_for_cleanup(
+    config: &OatConfig,
+    deployment_name: &str,
+    role: ComponentRole,
+    grace_seconds: u64,
+) -> Result<Value> {
+    let deployment: Value = serde_json::from_str(
+        &kubectl(
+            config,
+            vec![
+                "get",
+                "deployment",
+                deployment_name,
+                "--namespace",
+                &config.namespace,
+                "-o",
+                "json",
+            ],
+            None,
+        )
+        .await?,
+    )?;
+    let selector_labels = deployment
+        .pointer("/spec/selector/matchLabels")
+        .and_then(Value::as_object)
+        .context("run-owned deployment has no stable pod selector")?;
+    if selector_labels.is_empty() {
+        bail!("run-owned deployment selector is empty");
+    }
+    let selector = selector_labels
+        .iter()
+        .map(|(key, value)| {
+            value
+                .as_str()
+                .map(|value| format!("{key}={value}"))
+                .context("deployment selector label is not a string")
+        })
+        .collect::<Result<Vec<_>>>()?
+        .join(",");
+    let initial_pods = aks_pods_by_selector(config, &selector).await?;
+    let mut followers = Vec::new();
+    for pod in initial_pods["items"].as_array().into_iter().flatten() {
+        let pod_name = pod
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .context("run-owned pod has no name")?;
+        for status in pod
+            .pointer("/status/containerStatuses")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let container = status
+                .get("name")
+                .and_then(Value::as_str)
+                .context("run-owned pod container has no name")?;
+            let role_container = match role {
+                ComponentRole::Router => container == "router",
+                ComponentRole::Collector => container == config.dfe_container,
+                ComponentRole::Maintenance => container == "maintenance",
+                ComponentRole::Client => false,
+            };
+            if !role_container {
+                continue;
+            }
+            let pod_name = pod_name.to_owned();
+            let container = container.to_owned();
+            let instance_id = format!("{pod_name}/{container}");
+            let namespace = config.namespace.clone();
+            let context = config.kubectl_context.clone();
+            let image = status.get("image").and_then(Value::as_str).map(str::to_owned);
+            let image_id = status.get("imageID").and_then(Value::as_str).map(str::to_owned);
+            let action = format!("stream shutdown logs for {instance_id}");
+            let task_pod_name = pod_name.clone();
+            let task_container = container.clone();
+            let task = tokio::spawn(async move {
+                let mut command = Command::new("kubectl");
+                if let Some(context) = context {
+                    command.args(["--context", &context]);
+                }
+                command.args([
+                    "logs",
+                    &task_pod_name,
+                    "--namespace",
+                    &namespace,
+                    "--container",
+                    &task_container,
+                    "--follow",
+                ]);
+                let capture = filtered_process_command_output(command, &action).await?;
+                let text = format!("{}\n{}", capture.stdout, capture.stderr);
+                let complete = process_log_complete(&role, &text);
+                Ok::<_, anyhow::Error>(ProcessLog {
+                    role,
+                    instance_id,
+                    image,
+                    image_id,
+                    source_revision: None,
+                    complete,
+                    raw_log_bytes: capture.raw_log_bytes,
+                    raw_log_lines: capture.raw_log_lines,
+                    stdout: capture.stdout,
+                    stderr: capture.stderr,
+                    text,
+                })
+            });
+            followers.push((pod_name, container, status.pointer("/state/running").is_some(), task));
+        }
+    }
+    let sigterm_at_unix_ms = (role == ComponentRole::Collector)
+        .then(|| u64::try_from(unix_time_ms()).ok())
+        .flatten();
+    kubectl(
+        config,
+        vec![
+            "scale",
+            "deployment",
+            deployment_name,
+            "--replicas=0",
+            "--namespace",
+            &config.namespace,
+        ],
+        None,
+    )
+    .await
+    .with_context(|| format!("scale run-owned deployment {deployment_name} to zero"))?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(grace_seconds.saturating_add(120));
+    let mut terminated = HashMap::<String, Value>::new();
+    loop {
+        let pods = aks_pods_by_selector(config, &selector).await?;
+        for pod in pods["items"].as_array().into_iter().flatten() {
+            let pod_name = pod
+                .pointer("/metadata/name")
+                .and_then(Value::as_str)
+                .context("run-owned pod has no name")?;
+            for status in pod
+                .pointer("/status/containerStatuses")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(state) = status.pointer("/state/terminated") {
+                    let container = status
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .context("terminated container has no name")?;
+                    terminated.insert(format!("{pod_name}/{container}"), state.clone());
+                }
+            }
+        }
+        let current: Value = serde_json::from_str(
+            &kubectl(
+                config,
+                vec![
+                    "get",
+                    "deployment",
+                    deployment_name,
+                    "--namespace",
+                    &config.namespace,
+                    "-o",
+                    "json",
+                ],
+                None,
+            )
+            .await?,
+        )?;
+        let desired = current.pointer("/spec/replicas").and_then(Value::as_u64).unwrap_or(1);
+        let replicas = current.pointer("/status/replicas").and_then(Value::as_u64).unwrap_or(0);
+        let observed = rollout_generation_observed(&current);
+        let no_pods = pods["items"].as_array().is_some_and(Vec::is_empty);
+        if desired == 0 && replicas == 0 && observed && no_pods {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("run-owned deployment {deployment_name} did not stop within its bounded grace period");
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let mut processes = Vec::new();
+    for (pod_name, container, was_running, mut task) in followers {
+        let instance_id = format!("{pod_name}/{container}");
+        let log = match tokio::time::timeout(Duration::from_secs(30), &mut task).await {
+            Ok(Ok(Ok(log))) => Some(log),
+            _ => {
+                task.abort();
+                None
+            }
+        };
+        let terminated_state = terminated.get(&instance_id);
+        let exit_code = terminated_state
+            .and_then(|state| state.get("exitCode"))
+            .and_then(Value::as_i64);
+        let finished_at = terminated_state
+            .and_then(|state| state.get("finishedAt"))
+            .and_then(Value::as_str);
+        let process_evidence = match (role, log.as_ref()) {
+            (ComponentRole::Collector, Some(log)) => collector_shutdown_drain_evidence(
+                log,
+                was_running.then_some(sigterm_at_unix_ms).flatten(),
+                finished_at,
+                exit_code,
+                config.tunables.wal.is_some(),
+            ),
+            (ComponentRole::Collector, None) => json!({
+                "status": "unavailable", "unavailable_reason": "collector_shutdown_log_stream_unavailable",
+                "sigterm_sent": was_running, "sigterm_to_exit_seconds": null,
+                "commits_after_sigterm": null, "committed_rows_after_sigterm": null,
+                "quiver": {"status": "unavailable", "bundles_drained": null, "force_dropped_bundles": null},
+                "exit_code": exit_code,
+            }),
+            (ComponentRole::Maintenance, Some(log)) => {
+                let baseline = ProcessLog {
+                    role: ComponentRole::Maintenance,
+                    instance_id: log.instance_id.clone(),
+                    image: None,
+                    image_id: None,
+                    source_revision: None,
+                    complete: true,
+                    raw_log_bytes: 0,
+                    raw_log_lines: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    text: String::new(),
+                };
+                maintenance_cell_outcome_evidence(log, &[baseline])
+            }
+            (ComponentRole::Maintenance, None) => {
+                json!({"status":"unavailable", "error_kind_counts": null, "comment":"Maintenance log stream was unavailable; raw error text was not retained."})
+            }
+            _ => json!({"status":"observed"}),
+        };
+        processes.push(json!({
+            "pod": pod_name,
+            "container": container,
+            "was_running": was_running,
+            "exit_code": exit_code,
+            "finished_at": finished_at,
+            "log_complete": log.as_ref().is_some_and(|log| log.complete),
+            "drain": (role == ComponentRole::Collector).then_some(process_evidence.clone()),
+            "operation_outcomes": (role == ComponentRole::Maintenance).then_some(process_evidence),
+        }));
+    }
+    Ok(json!({
+        "deployment": deployment_name,
+        "role": format!("{role:?}").to_ascii_lowercase(),
+        "sigterm_at_unix_ms": sigterm_at_unix_ms,
+        "processes": processes,
+    }))
+}
+
+async fn stop_aks_workloads_in_order(config: &OatConfig) -> Result<Value> {
+    let mut ingress = Vec::new();
+    let mut maintenance = Vec::new();
+    let mut collectors = Vec::new();
+    if config.arrowcol_deployment != config.dfe_deployment {
+        ingress.push(
+            stop_aks_deployment_for_cleanup(config, &config.arrowcol_deployment, ComponentRole::Router, 60).await?,
+        );
+    }
+    if maintenance_enabled(config) {
+        maintenance
+            .push(stop_aks_deployment_for_cleanup(config, "delta-maintenance", ComponentRole::Maintenance, 60).await?);
+    }
+    collectors.push(
+        stop_aks_deployment_for_cleanup(
+            config,
+            &config.dfe_deployment,
+            ComponentRole::Collector,
+            config.collector_stop_grace_seconds,
+        )
+        .await?,
+    );
+    if config.arrowcol_deployment == config.dfe_deployment {
+        ingress.push(json!({"deployment": config.arrowcol_deployment, "status": "shared_with_collector", "comment": "Ingress and collector share one Deployment and cannot be stopped independently."}));
+    }
+    Ok(json!({
+        "schema_version": 1,
+        "cleanup_order": ["ingress", "maintenance", "collectors"],
+        "ingress": ingress,
+        "maintenance": maintenance,
+        "collectors": collectors,
+    }))
+}
+
 async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) -> Result<()> {
     let mut failures = Vec::new();
     let mut namespace_removed = false;
@@ -6442,7 +6961,18 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
                     NamespaceCleanupAction::Delete => {
                         let namespace_uid = namespace_uid_for_cleanup(&namespace, platform.namespace_uid.as_deref())?;
                         platform.namespace_uid = Some(namespace_uid.clone());
-                        if let Err(error) = delete_run_owned_namespace_with_uid(config, &namespace_uid).await {
+                        let stop_evidence = match stop_aks_workloads_in_order(config).await {
+                            Ok(evidence) => {
+                                platform.shutdown_drain_evidence = Some(evidence);
+                                Ok(())
+                            }
+                            Err(error) => Err(error),
+                        };
+                        if let Err(error) = stop_evidence {
+                            failures.push(format!(
+                                "ordered AKS workload shutdown failed; retaining run-owned namespace: {error:#}"
+                            ));
+                        } else if let Err(error) = delete_run_owned_namespace_with_uid(config, &namespace_uid).await {
                             failures.push(format!(
                                 "delete run-owned AKS namespace with UID precondition: {error:#}"
                             ));
@@ -7986,9 +8516,9 @@ mod tests {
             snapshot_stop_phases(&before)?,
             [
                 vec!["id-3".to_owned(), "id-4".to_owned()],
+                vec![],
                 vec!["id-2".to_owned()],
-                vec!["id-1".to_owned()],
-                vec!["id-0".to_owned()]
+                vec!["id-0".to_owned(), "id-1".to_owned()]
             ]
         );
         let mut after = before.clone();
@@ -8021,6 +8551,52 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn aks_collector_stop_grace_readback_requires_exact_value() {
+        let deployment = json!({"spec":{"template":{"spec":{"terminationGracePeriodSeconds":300}}}});
+        assert!(verify_aks_collector_stop_grace(&deployment, 300).is_ok());
+        assert!(verify_aks_collector_stop_grace(&deployment, 301).is_err());
+        assert!(verify_aks_collector_stop_grace(&json!({}), 300).is_err());
+    }
+
+    #[test]
+    fn collector_shutdown_evidence_records_commits_and_quiver_drain() -> Result<()> {
+        let signal = 1_700_000_000_000_u64;
+        let event = json!({
+            "schema_version": 1,
+            "outcome": "committed",
+            "rows": 120,
+            "finished_at_unix_ms": signal as i64 + 250,
+        });
+        let text = format!(
+            "arrowcol_data_commit {}\ndurable_buffer.shutdown.drained bundles_drained = 3\nquiver.engine.stop force_dropped_bundles = 0\n",
+            serde_json::to_string(&event)?
+        );
+        let log = ProcessLog {
+            role: ComponentRole::Collector,
+            instance_id: "pod/dataflow".to_owned(),
+            image: None,
+            image_id: None,
+            source_revision: None,
+            complete: true,
+            raw_log_bytes: text.len() as u64,
+            raw_log_lines: 3,
+            stdout: text.clone(),
+            stderr: String::new(),
+            text,
+        };
+        let evidence =
+            collector_shutdown_drain_evidence(&log, Some(signal), Some("2023-11-14T22:13:21Z"), Some(0), true);
+        assert_eq!(evidence["status"], "observed");
+        assert_eq!(evidence["sigterm_to_exit_seconds"], 1.0);
+        assert_eq!(evidence["commits_after_sigterm"], 1);
+        assert_eq!(evidence["committed_rows_after_sigterm"], 120);
+        assert_eq!(evidence["quiver"]["bundles_drained"], 3);
+        assert_eq!(evidence["quiver"]["force_dropped_bundles"], 0);
+        assert_eq!(evidence["exit_code"], 0);
+        Ok(())
+    }
+
+    #[test]
     fn snapshot_stop_accepts_only_maintenance_exit_one() -> Result<()> {
         let project = "owned-maintenance-run";
         let services = [
@@ -8045,6 +8621,15 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
+        assert_eq!(
+            snapshot_stop_phases(&before)?,
+            [
+                vec!["maintenance-id-4".to_owned(), "maintenance-id-5".to_owned()],
+                vec!["maintenance-id-0".to_owned()],
+                vec!["maintenance-id-3".to_owned()],
+                vec!["maintenance-id-1".to_owned(), "maintenance-id-2".to_owned()],
+            ]
+        );
         let mut after = before.clone();
         for container in &mut after {
             container["State"] = json!({
@@ -8278,9 +8863,10 @@ mod tests {
             budget.minimum_pin_ttl_ms,
             (budget.client_job_lifetime_seconds
                 + crate::config::PIN_INIT_SETUP_TIMEOUT_SECONDS
-                + config.reconciliation_settle_timeout_seconds)
+                + config.reconciliation_settle_timeout_seconds
+                + config.collector_stop_grace_seconds)
                 * 1_000,
-            "the immutable pin lifetime must cover setup, the client Job and post-client reconciliation settling"
+            "the immutable pin lifetime must cover setup, the client Job, settling, and collector drain"
         );
         Ok(())
     }

@@ -34,7 +34,7 @@ fn has_startup_envelope(text: &str, prefix: &str, required_component: Option<&st
             required_component.is_none_or(|required| {
                 object
                     .get("component")
-                    .is_none_or(|component| component.as_str() == Some(required))
+                    .is_some_and(|component| component.as_str() == Some(required))
             })
         })
     })
@@ -881,6 +881,137 @@ fn maintenance_cell_outcome_evidence(log: &ProcessLog, baseline_logs: &[ProcessL
     })
 }
 
+fn log_counter(text: &str, marker: &str, field: &str) -> Option<u64> {
+    text.lines()
+        .filter(|line| line.contains(marker))
+        .filter_map(|line| line.split_once(field).map(|(_, value)| value))
+        .find_map(|value| {
+            let value = value.trim_start().strip_prefix('=')?.trim_start();
+            let digits = value.chars().take_while(char::is_ascii_digit).collect::<String>();
+            (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
+        })
+}
+
+fn collector_shutdown_drain_evidence(
+    log: &ProcessLog,
+    sigterm_at_unix_ms: Option<u64>,
+    finished_at: Option<&str>,
+    exit_code: Option<i64>,
+    wal_enabled: bool,
+) -> Value {
+    let finished_at_unix_ms = finished_at
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .and_then(|time| u64::try_from(time.timestamp_millis()).ok());
+    let sigterm_to_exit_seconds = sigterm_at_unix_ms
+        .zip(finished_at_unix_ms)
+        .and_then(|(signal, finish)| finish.checked_sub(signal))
+        .map(|milliseconds| milliseconds as f64 / 1000.0);
+    let mut result = json!({
+        "status": "observed",
+        "sigterm_sent": sigterm_at_unix_ms.is_some(),
+        "sigterm_to_exit_seconds": sigterm_to_exit_seconds,
+        "commits_after_sigterm": null,
+        "committed_rows_after_sigterm": null,
+        "exit_code": exit_code,
+        "log_complete": log.complete,
+    });
+    if exit_code.is_none() {
+        result["status"] = json!("unavailable");
+        result["unavailable_reason"] = json!("collector_exit_code_unavailable");
+    } else if sigterm_at_unix_ms.is_some() && sigterm_to_exit_seconds.is_none() {
+        result["status"] = json!("unavailable");
+        result["unavailable_reason"] = json!("collector_exit_timestamp_unavailable");
+    }
+    if !log.complete {
+        result["status"] = json!("unavailable");
+        result["unavailable_reason"] = json!("collector_commit_log_incomplete");
+        result["quiver"] = json!({"status": if wal_enabled { "unavailable" } else { "not_applicable" }, "bundles_drained": null, "force_dropped_bundles": null});
+        return result;
+    }
+    if let Some(signal) = sigterm_at_unix_ms {
+        let mut commits = 0_u64;
+        let mut rows = 0_u64;
+        for line in log.text.lines() {
+            let Some(payload) = line.strip_prefix("arrowcol_data_commit ") else {
+                continue;
+            };
+            let event: CommitEvent = match serde_json::from_str(payload) {
+                Ok(event) => event,
+                Err(_) => {
+                    result["status"] = json!("unavailable");
+                    result["unavailable_reason"] = json!("malformed_collector_commit_event");
+                    result["commits_after_sigterm"] = Value::Null;
+                    result["committed_rows_after_sigterm"] = Value::Null;
+                    break;
+                }
+            };
+            if event.outcome != "committed" {
+                continue;
+            }
+            let Some(finished) = event.finished_at_unix_ms.and_then(|time| u64::try_from(time).ok()) else {
+                result["status"] = json!("unavailable");
+                result["unavailable_reason"] = json!("collector_commit_event_missing_finish_time");
+                result["commits_after_sigterm"] = Value::Null;
+                result["committed_rows_after_sigterm"] = Value::Null;
+                break;
+            };
+            if finished >= signal {
+                let Some(event_rows) = event.rows else {
+                    result["status"] = json!("unavailable");
+                    result["unavailable_reason"] = json!("collector_commit_event_missing_rows");
+                    result["commits_after_sigterm"] = Value::Null;
+                    result["committed_rows_after_sigterm"] = Value::Null;
+                    break;
+                };
+                let Some(next_commits) = commits.checked_add(1) else {
+                    result["status"] = json!("unavailable");
+                    result["unavailable_reason"] = json!("collector_commit_count_overflow");
+                    break;
+                };
+                let Some(next_rows) = rows.checked_add(event_rows) else {
+                    result["status"] = json!("unavailable");
+                    result["unavailable_reason"] = json!("collector_commit_row_count_overflow");
+                    break;
+                };
+                commits = next_commits;
+                rows = next_rows;
+            }
+        }
+        if result["status"] == "observed" {
+            result["commits_after_sigterm"] = json!(commits);
+            result["committed_rows_after_sigterm"] = json!(rows);
+        }
+    }
+    if wal_enabled {
+        let drained = log_counter(&log.text, "durable_buffer.shutdown.drained", "bundles_drained")
+            .or_else(|| log_counter(&log.text, "durable_buffer.shutdown.drain_deadline", "bundles_drained"));
+        let force_dropped = log_counter(&log.text, "quiver.engine.stop", "force_dropped_bundles");
+        result["quiver"] = json!({
+            "status": if drained.is_some() && force_dropped.is_some() { "observed" } else { "unavailable" },
+            "bundles_drained": drained,
+            "force_dropped_bundles": force_dropped,
+        });
+        if drained.is_none() || force_dropped.is_none() {
+            result["status"] = json!("unavailable");
+            result["unavailable_reason"] = json!("quiver_shutdown_log_unavailable");
+        }
+    } else {
+        result["quiver"] = json!({"status": "not_applicable", "bundles_drained": null, "force_dropped_bundles": null});
+    }
+    result
+}
+
+fn verify_local_collector_stop_grace(container: &Value, expected_seconds: u64) -> Result<()> {
+    let actual = container
+        .pointer("/HostConfig/StopTimeout")
+        .and_then(Value::as_u64)
+        .context("local collector inspect omitted HostConfig.StopTimeout")?;
+    if actual != expected_seconds {
+        bail!("local collector stop grace readback differs from requested value");
+    }
+    Ok(())
+}
+
 async fn local_process_logs(config: &OatConfig, platform: &LocalPlatform) -> Result<Vec<ProcessLog>> {
     local_process_logs_for_role(config, platform, None).await
 }
@@ -936,6 +1067,9 @@ async fn local_process_logs_for_role(
         };
         if role_filter.is_some_and(|filter| filter != role) {
             continue;
+        }
+        if matches!(role, ComponentRole::Collector) {
+            verify_local_collector_stop_grace(&container, config.collector_stop_grace_seconds)?;
         }
         if container["RestartCount"].as_u64().unwrap_or(0) > 0 {
             bail!("required measurement process restarted during the cell");
@@ -1070,6 +1204,15 @@ mod startup_readback_tests {
             "../../arrowcol-router-rust/config.docker.yaml"
         ))?;
         assert_eq!(actual, image_config["telemetry"]["log_filter"]);
+        Ok(())
+    }
+
+    #[test]
+    fn local_collector_stop_grace_readback_requires_exact_value() -> Result<()> {
+        let inspect = json!({"HostConfig":{"StopTimeout":300}});
+        verify_local_collector_stop_grace(&inspect, 300)?;
+        assert!(verify_local_collector_stop_grace(&inspect, 301).is_err());
+        assert!(verify_local_collector_stop_grace(&json!({"HostConfig":{}}), 300).is_err());
         Ok(())
     }
 
@@ -1212,6 +1355,10 @@ mod startup_readback_tests {
         assert!(!process_log_complete(
             &ComponentRole::Collector,
             "arrowcol_effective_config {\"component\":\"layout\",\"table_effective\":{}}\n"
+        ));
+        assert!(!process_log_complete(
+            &ComponentRole::Collector,
+            "arrowcol_effective_config {\"table_effective\":{}}\n"
         ));
         assert!(process_log_complete(
             &ComponentRole::Router,

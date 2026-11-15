@@ -21,6 +21,8 @@ pub struct OatConfig {
     pub aks_rollout_timeout_seconds: u64,
     #[serde(default = "default_reconciliation_settle_timeout_seconds")]
     pub reconciliation_settle_timeout_seconds: u64,
+    #[serde(default = "default_collector_stop_grace_seconds")]
+    pub collector_stop_grace_seconds: u64,
     #[serde(default = "default_run_pin_ttl_ms")]
     pub run_pin_ttl_ms: u64,
     pub pilot_mode: bool,
@@ -107,6 +109,10 @@ fn default_aks_rollout_timeout_seconds() -> u64 {
 
 fn default_reconciliation_settle_timeout_seconds() -> u64 {
     120
+}
+
+fn default_collector_stop_grace_seconds() -> u64 {
+    300
 }
 
 pub(crate) const SCHEDULE_DELIVERY_TIMEOUT_SECONDS: u64 = 180;
@@ -215,7 +221,8 @@ impl OatConfig {
         let minimum_pin_ttl_ms = client_job_lifetime_seconds
             .checked_add(PIN_INIT_SETUP_TIMEOUT_SECONDS)
             .and_then(|seconds| seconds.checked_add(self.reconciliation_settle_timeout_seconds))
-            .context("OAT pin initialization and reconciliation settle lifetime budget overflow")?
+            .and_then(|seconds| seconds.checked_add(self.collector_stop_grace_seconds))
+            .context("OAT pin initialization and collector drain lifetime budget overflow")?
             .checked_mul(1_000)
             .context("OAT run pin lifetime budget overflow")?;
         Ok(RunTimingBudget {
@@ -267,6 +274,9 @@ impl OatConfig {
         }
         if self.reconciliation_settle_timeout_seconds > 1_800 {
             bail!("reconciliation_settle_timeout_seconds must be between 0 and 1800");
+        }
+        if !(30..=3_600).contains(&self.collector_stop_grace_seconds) {
+            bail!("collector_stop_grace_seconds must be between 30 and 3600");
         }
         if !(1..=300).contains(&self.qap_timeout_seconds) {
             bail!("qap_timeout_seconds must be between 1 and 300");
@@ -742,6 +752,7 @@ mod tests {
             client_ready_timeout_seconds: 600,
             aks_rollout_timeout_seconds: 600,
             reconciliation_settle_timeout_seconds: 120,
+            collector_stop_grace_seconds: 300,
             run_pin_ttl_ms: 3_600_000,
             pilot_mode: false,
             namespace: "arrowcol".to_owned(),
@@ -828,6 +839,22 @@ mod tests {
             ..Default::default()
         });
         config.validate()
+    }
+
+    #[test]
+    fn collector_stop_grace_defaults_and_bounds_are_validated() -> Result<()> {
+        let mut config = valid();
+        assert_eq!(config.collector_stop_grace_seconds, 300);
+        config.collector_stop_grace_seconds = 30;
+        config.validate()?;
+        config.collector_stop_grace_seconds = 3_600;
+        config.run_pin_ttl_ms = 86_400_000;
+        config.validate()?;
+        config.collector_stop_grace_seconds = 29;
+        assert!(config.validate().is_err());
+        config.collector_stop_grace_seconds = 3_601;
+        assert!(config.validate().is_err());
+        Ok(())
     }
 
     #[test]
@@ -970,7 +997,7 @@ mod tests {
         config.qap_timeout_seconds = 300;
         config.warmup_seconds = 300;
         config.measure_seconds = 600;
-        config.run_pin_ttl_ms = 3_780_000;
+        config.run_pin_ttl_ms = 4_080_000;
         config.validate()?;
 
         config.run_pin_ttl_ms -= 1;

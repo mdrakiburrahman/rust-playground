@@ -76,6 +76,7 @@ fn local_dataflow_overlay(config: &OatConfig, state_dir: &Path, overlay: &mut Va
         .as_object_mut()
         .context("Compose tunable services missing")?;
     let collector = services.entry("dataflow-1").or_insert_with(|| json!({}));
+    collector["stop_grace_period"] = json!(format!("{}s", config.collector_stop_grace_seconds));
     collector["entrypoint"] = json!(["/bin/sh", "-ec"]);
     collector["command"] = json!([concat!(
         "export ARROWCOL_INSTANCE_KEY=\"oat-$(hostname)\"; ",

@@ -460,7 +460,7 @@ pub(crate) fn export_stopped(
     sync_directory(destination.parent().context("snapshot run has no parent")?)
 }
 
-pub(crate) async fn snapshot_then_cleanup<S, E, C>(stop: S, export: E, cleanup: C) -> Result<()>
+pub(crate) async fn snapshot_then_cleanup<S, E, C>(stop: S, export: E, cleanup: C) -> Result<Vec<Value>>
 where
     S: std::future::Future<Output = Result<Vec<Value>>>,
     E: FnOnce(Vec<Value>) -> Result<()>,
@@ -469,8 +469,9 @@ where
     let writers = stop
         .await
         .context("stop outcome uncertain; retaining owned local data")?;
-    export(writers).context("snapshot failed; retaining stopped owned local data")?;
-    cleanup.await
+    export(writers.clone()).context("snapshot failed; retaining stopped owned local data")?;
+    cleanup.await?;
+    Ok(writers)
 }
 
 #[cfg(test)]
