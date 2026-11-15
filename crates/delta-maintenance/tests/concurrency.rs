@@ -277,6 +277,12 @@ fn writer(root: &Path, base: i64) -> Result<()> {
     let deadline = Instant::now() + DRIVER_DEADLINE;
     let table = open(root)?;
     for index in 0..PUBLICATIONS {
+        if index == PUBLICATIONS - 1 {
+            while !root.join("maintenance-committed").exists() {
+                ensure!(Instant::now() < deadline, "maintenance never committed");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
         let app_id = writer_app(index);
         let ids = writer_ids(index);
         let first = publish(&table, base, writer_offset(index), &ids, Some(&app_id))?;
@@ -549,6 +555,9 @@ fn driver(root: &Path) -> Result<()> {
                 }
                 None => {
                     let inner = &report["report"];
+                    if inner["outcome"] == "committed" {
+                        fs::write(root.join("maintenance-committed"), b"1")?;
+                    }
                     max_attempts = max_attempts.max(inner["attempts"].as_u64().unwrap_or(0));
                     collisions += inner["collisions"].as_u64().unwrap_or(0);
                     format!(
@@ -649,10 +658,32 @@ fn driver(root: &Path) -> Result<()> {
         "log versions are not contiguous through {last}"
     );
     check_writer_receipts(&receipts(root)?, &txns, last)?;
+    let first_writer = txns
+        .values()
+        .flatten()
+        .map(|(version, _)| *version)
+        .min()
+        .context("no writer commits")?;
+    let last_writer = txns
+        .values()
+        .flatten()
+        .map(|(version, _)| *version)
+        .max()
+        .context("no writer commits")?;
+    let interleaved: BTreeSet<u64> = actions
+        .iter()
+        .filter(|(version, action)| *version > first_writer && *version < last_writer && action.get("remove").is_some())
+        .map(|(version, _)| *version)
+        .collect();
+    ensure!(
+        !interleaved.is_empty(),
+        "no maintenance commit interleaved writer progress"
+    );
     ensure!(Instant::now() < deadline, "run exceeded the partition model window");
     println!(
         "concurrency proof: cycles={CYCLES} overlapping={concurrent_cycles} publications={PUBLICATIONS} \
-         max_attempts={max_attempts} collisions={collisions} outcomes={outcomes:?} rows={} files={} replay_orphans={}",
+         max_attempts={max_attempts} collisions={collisions} outcomes={outcomes:?} \
+         maintenance_between_writer_commits={interleaved:?} rows={} files={} replay_orphans={}",
         expected.len(),
         files.len(),
         orphans.len()
@@ -664,6 +695,8 @@ fn driver(root: &Path) -> Result<()> {
 /// (each replayed with the same identity) into retained minute partitions while the
 /// actual service binary runs 6 fixed OPTIMIZE+PURGE+VACUUM LITE apply cycles on a
 /// marked disposable root, then one quiescent cycle and a repeat.
+/// Only startup and the last publication are gated; the log must prove a real
+/// maintenance commit between writer commits, not just overlapping process lifetimes.
 /// Guarantees: every writer publication and replay succeeds; each identity's txn is
 /// committed exactly once, at version 0, in the commit its original call reported, and
 /// its replay (which may observe later maintenance commits) never commits it again;
