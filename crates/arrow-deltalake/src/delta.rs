@@ -668,15 +668,15 @@ mod io_tests {
         Ok(())
     }
 
-    /// Scenario: 32 actual stages enter a put barrier before each put requests blocking I/O.
+    /// Scenario: every configured upload slot reaches a put barrier before nested blocking I/O.
     /// Guarantees: every stage succeeds without exhausting the shared pool, and all nested jobs finish.
     #[tokio::test(flavor = "current_thread")]
     async fn concurrent_stage_uploads_allow_nested_blocking_io() -> Result<()> {
         let _fixture = CLOUD_STAGE_FIXTURE.lock().await;
         use std::sync::atomic::{AtomicUsize, Ordering};
-        const UPLOADS: usize = 32;
+        let uploads = runtime_config()?.upload_limit;
         let nested = Arc::new(NestedStagePut {
-            barrier: tokio::sync::Barrier::new(UPLOADS),
+            barrier: tokio::sync::Barrier::new(uploads),
             entered: AtomicUsize::new(0),
             submitted: AtomicUsize::new(0),
             finished: AtomicUsize::new(0),
@@ -686,8 +686,8 @@ mod io_tests {
             ..Default::default()
         });
         let directory = tempfile::tempdir()?;
-        let mut writers = Vec::with_capacity(UPLOADS);
-        for index in 0..UPLOADS {
+        let mut writers = Vec::with_capacity(uploads);
+        for index in 0..uploads {
             let table = DeltaTable::open(directory.path().join(index.to_string()))?;
             let input = input_batch()?;
             let mut writer = table.new_file(input.schema())?;
@@ -716,9 +716,9 @@ mod io_tests {
         let submitted = nested.submitted.load(Ordering::SeqCst);
         let finished = nested.finished.load(Ordering::SeqCst);
         eprintln!("STAGE_SATURATION entered={entered} submitted={submitted} finished={finished} failed={failed}");
-        assert_eq!(entered, UPLOADS);
-        assert_eq!(submitted, UPLOADS);
-        assert_eq!(finished, UPLOADS);
+        assert_eq!(entered, uploads);
+        assert_eq!(submitted, uploads);
+        assert_eq!(finished, uploads);
         assert_eq!(failed, 0, "stage uploads must not starve nested blocking I/O");
         Ok(())
     }
@@ -730,7 +730,8 @@ mod io_tests {
         use futures::TryStreamExt;
         let _fixture = CLOUD_STAGE_FIXTURE.lock().await;
         let executor = shared_executor()?;
-        assert_eq!(executor.available_upload_slots(), 32);
+        let upload_limit = runtime_config()?.upload_limit;
+        assert_eq!(executor.available_upload_slots(), upload_limit);
         let directory = tempfile::tempdir()?;
         let table = DeltaTable::open(directory.path())?;
         let input = input_batch()?;
@@ -758,7 +759,7 @@ mod io_tests {
         store.release.notify_one();
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if executor.available_upload_slots() == 32
+                if executor.available_upload_slots() == upload_limit
                     && store.inner.list(None).try_collect::<Vec<_>>().await?.len() == 1
                 {
                     return Ok::<_, anyhow::Error>(());
@@ -769,7 +770,7 @@ mod io_tests {
         .await
         .context("cancelled stage upload did not finish and release admission")??;
         drop(DeltaTable::open(directory.path())?);
-        assert_eq!(available_during_put, 31);
+        assert_eq!(available_during_put, upload_limit - 1);
         assert!(ownership_retained, "in-flight put must retain staging ownership");
         assert!(!directory.path().join("_delta_log/00000000000000000001.json").exists());
         Ok(())
@@ -781,9 +782,10 @@ mod io_tests {
     async fn local_stage_does_not_acquire_upload_admission() -> Result<()> {
         let _fixture = CLOUD_STAGE_FIXTURE.lock().await;
         let executor = shared_executor()?;
-        let mut slots = Vec::with_capacity(32);
+        let upload_limit = runtime_config()?.upload_limit;
+        let mut slots = Vec::with_capacity(upload_limit);
         tokio::time::timeout(Duration::from_secs(5), async {
-            for _ in 0..32 {
+            for _ in 0..upload_limit {
                 slots.push(executor.upload_slot().await?);
             }
             Ok::<_, anyhow::Error>(())
@@ -801,7 +803,7 @@ mod io_tests {
         let staged = staged.context("local stage waited for cloud upload admission")??;
         assert!(staged.file.bytes > 0);
         assert_eq!(available_during_local_stage, 0);
-        assert_eq!(executor.available_upload_slots(), 32);
+        assert_eq!(executor.available_upload_slots(), upload_limit);
         Ok(())
     }
     /// Scenario: a new nested two-column Hive table publishes locally, with injected fsync faults.

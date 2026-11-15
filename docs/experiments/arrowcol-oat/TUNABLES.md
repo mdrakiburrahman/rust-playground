@@ -17,6 +17,15 @@
 | `router.upstream_idle_timeout_seconds` | Accepts `0..=86400`; zero disables idle upstream pooling and is the value emitted by the main OAT runtime. |
 | Router downstream `server.h2.idle_timeout_seconds` | Deliberately constrained to `1..=86400`, whereas main accepted an unbounded value. Shipped router YAMLs use 30 or 60 seconds. |
 
+## Collector runtime compatibility
+
+| Setting | Contract |
+| --- | --- |
+| `collector.runtime.upload_limit` | Defaults to 32 on every host, matching main's fixed upload capacity; OAT still accepts `1..=256`. |
+| `collector.runtime.read_ahead` | CPU-scaled default clamped to `8..=16`, preserving main's floor of 8. |
+| `collector.runtime.batch_rows` | CPU-scaled default clamped to `4096..=32768`; this deliberately differs from main's fixed 256. Set 256 for main-equivalent runs. |
+| `collector.runtime.cpu_workers` | Adds a dedicated CPU pool; main has no separate CPU-worker setting, so no value reproduces its runtime. |
+
 Use the existing `tunables` sections (`client`, `transport`, `router`,
 `collector`, `parquet_writer`, `wal`, `maintenance`) rather than
 component environment names. The shared `arrowcol-tunables` crate is the

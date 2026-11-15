@@ -24,11 +24,11 @@ pub struct DeltaRuntimeConfig {
     /// Blocking I/O workers: default cores * 2, clamped to 32..=128; allowed 2..=256.
     /// One worker is reserved for Tokio's filesystem handoffs.
     pub blocking_workers: usize,
-    /// Concurrent uploads: default cores * 2, clamped to 8..=32; allowed 1..=256.
+    /// Concurrent uploads: default 32 independent of CPU count; allowed 1..=256.
     pub upload_limit: usize,
     /// Admitted Kernel tasks: default cores * 4, clamped to 64..=256; allowed 2..=1024.
     pub task_limit: usize,
-    /// Kernel read-ahead batches: default cores, clamped to 4..=16; allowed 1..=128.
+    /// Kernel read-ahead batches: default cores, clamped to 8..=16; allowed 1..=128.
     pub read_ahead: usize,
     /// Rows per Kernel batch: default cores * 1024, clamped to 4096..=32768;
     /// allowed 1..=262144.
@@ -49,9 +49,9 @@ impl DeltaRuntimeConfig {
         Self {
             runtime_workers: (cores / 4).clamp(2, 16),
             blocking_workers: cores.saturating_mul(2).clamp(32, 128),
-            upload_limit: cores.saturating_mul(2).clamp(8, 32),
+            upload_limit: 32,
             task_limit: cores.saturating_mul(4).clamp(64, 256),
-            read_ahead: cores.clamp(4, 16),
+            read_ahead: cores.clamp(8, 16),
             batch_rows: cores.saturating_mul(1024).clamp(4096, 32768),
             cpu_workers: cores.saturating_sub(1).clamp(1, 32),
         }
@@ -507,13 +507,29 @@ mod tests {
     fn runtime_defaults_scale_with_cpu_bounds() -> Result<()> {
         let small = DeltaRuntimeConfig::for_cores(1);
         assert_eq!(
-            (small.runtime_workers, small.cpu_workers, small.batch_rows),
-            (2, 1, 4096)
+            (
+                small.runtime_workers,
+                small.blocking_workers,
+                small.upload_limit,
+                small.task_limit,
+                small.read_ahead,
+                small.cpu_workers,
+                small.batch_rows
+            ),
+            (2, 32, 32, 64, 8, 1, 4096)
         );
         let large = DeltaRuntimeConfig::for_cores(usize::MAX);
         assert_eq!(
-            (large.runtime_workers, large.cpu_workers, large.batch_rows),
-            (16, 32, 32768)
+            (
+                large.runtime_workers,
+                large.blocking_workers,
+                large.upload_limit,
+                large.task_limit,
+                large.read_ahead,
+                large.cpu_workers,
+                large.batch_rows
+            ),
+            (16, 128, 32, 256, 16, 32, 32768)
         );
         small.validate()?;
         large.validate()?;
