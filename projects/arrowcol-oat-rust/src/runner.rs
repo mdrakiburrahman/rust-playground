@@ -9,7 +9,7 @@ use arrow::compute::{concat_batches, take};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow_deltalake::delta::object_store_for_url;
 use arrowcol_protocol::ImplementationPool;
-use arrowcol_routing::{LeaseKey, PressurePolicy, RoutingPolicy, run_table_pin_set_digest};
+use arrowcol_routing::{AdmissionPressureGauge, LeaseKey, PressurePolicy, RoutingPolicy, run_table_pin_set_digest};
 use bytes::Bytes;
 use chrono::{DateTime, NaiveDateTime};
 use fs2::FileExt;
@@ -18,7 +18,7 @@ use object_store::{GetOptions, ObjectStore, PutMode, PutOptions, PutPayload, Upd
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -1934,6 +1934,8 @@ struct RouterRoutingYaml {
     max_table_entries: usize,
     max_oldest_buffer_age_ms: u64,
     hard_pressure_bps: u16,
+    #[serde(default)]
+    excluded_admission_gauges: BTreeSet<AdmissionPressureGauge>,
     warmup_ms: u64,
     minimum_warmup_bps: u16,
     lease_ttl_ms: u64,
@@ -1961,6 +1963,7 @@ fn routing_policy_from_yaml(router_yaml: &str, run_id: &str) -> Result<RoutingPo
             max_oldest_buffer_age_ms: routing.max_oldest_buffer_age_ms,
         },
         hard_pressure_bps: routing.hard_pressure_bps,
+        excluded_admission_gauges: routing.excluded_admission_gauges,
         warmup_ms: routing.warmup_ms,
         minimum_warmup_bps: routing.minimum_warmup_bps,
         lease_ttl_ms: routing.lease_ttl_ms,
