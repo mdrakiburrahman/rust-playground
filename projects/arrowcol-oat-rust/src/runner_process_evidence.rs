@@ -453,6 +453,10 @@ fn router_readback_path(variable: &str) -> Result<String> {
             "/sql_timeouts/{}",
             field.trim_start_matches("SQL_").to_ascii_lowercase()
         ),
+        "SQL_POOL_MAX_SIZE" | "SQL_POOL_ACQUIRE_TIMEOUT_MS" => format!(
+            "/sql_pool/{}",
+            field.trim_start_matches("SQL_POOL_").to_ascii_lowercase()
+        ),
         "REFRESH_INTERVAL_MS"
         | "MAX_SNAPSHOT_AGE_MS"
         | "MAX_FUTURE_SKEW_MS"
@@ -507,7 +511,11 @@ fn verify_process_configuration(config: &OatConfig, role: ComponentRole, observe
             }
             continue;
         }
+        if name == "RUST_LOG" && !matches!(role, ComponentRole::Router) {
+            continue;
+        }
         let path = match name.as_str() {
+            "RUST_LOG" => "/log_filter".to_owned(),
             "ARROWCOL_PARQUET_CONFIG" if matches!(role, ComponentRole::Maintenance) => {
                 "/parquet_writer_overrides".to_owned()
             }
@@ -648,7 +656,34 @@ fn collector_layout_records(config: &OatConfig, text: &str) -> Result<Vec<Value>
 
 #[cfg(test)]
 fn process_evidence(config: &OatConfig, logs: &[ProcessLog]) -> Result<Value> {
-    process_evidence_for_cell(config, logs, &[])
+    let mut logs = logs.to_vec();
+    let added_router = !logs.iter().any(|log| matches!(log.role, ComponentRole::Router))
+        && config
+            .tunables
+            .environment_for(ComponentRole::Router)?
+            .keys()
+            .all(|name| name == "RUST_LOG");
+    if added_router {
+        let log_filter = config.tunables.environment_for(ComponentRole::Router)?["RUST_LOG"].clone();
+        logs.push(ProcessLog {
+            role: ComponentRole::Router,
+            instance_id: "router-test-default".to_owned(),
+            image: None,
+            image_id: None,
+            source_revision: None,
+            complete: true,
+            raw_log_bytes: 0,
+            raw_log_lines: 1,
+            stdout: String::new(),
+            stderr: String::new(),
+            text: format!("arrowcol_router_effective_config {{\"log_filter\":{}}}\n", serde_json::to_string(&log_filter)?),
+        });
+    }
+    let mut evidence = process_evidence_for_cell(config, &logs, &[])?;
+    if added_router && let Some(entries) = evidence.as_array_mut() {
+        entries.retain(|entry| entry["component"] != "router");
+    }
+    Ok(evidence)
 }
 
 fn process_evidence_for_cell(config: &OatConfig, logs: &[ProcessLog], baseline_logs: &[ProcessLog]) -> Result<Value> {
@@ -1129,7 +1164,7 @@ mod startup_readback_tests {
         ));
         assert!(process_log_complete(
             &ComponentRole::Router,
-            "arrowcol_router_effective_config {\"workers\":2}\n"
+            "arrowcol_router_effective_config {\"workers\":2,\"log_filter\":\"warn,tiberius=error\"}\n"
         ));
         assert!(process_log_complete(
             &ComponentRole::Maintenance,
@@ -1153,7 +1188,7 @@ mod startup_readback_tests {
             raw_log_lines: 4,
             stdout: String::new(),
             stderr: String::new(),
-            text: "arrowcol_router_effective_config {\"workers\":2}\n".to_owned(),
+            text: "arrowcol_router_effective_config {\"workers\":2,\"log_filter\":\"warn,tiberius=error\"}\n".to_owned(),
         };
         let evidence = process_evidence(&config, &[log])?;
         assert_eq!(evidence[0]["raw_log_bytes"], 97);
@@ -1219,7 +1254,9 @@ mod startup_readback_tests {
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
         ))?;
         config.tunables = serde_json::from_value(json!({
-            "router":{"workers":3,"listener_tasks_per_fd":7,"sql_connect_timeout_ms":17000},
+            "router":{"workers":3,"listener_tasks_per_fd":7,"sql_connect_timeout_ms":17000,
+                "sql_pool_max_size":32,"sql_pool_acquire_timeout_ms":3000},
+            "logging":{"router":"debug"},
             "collector":{"catalog":{"maximum_cache_age":"13000ms"},
                 "routing":{"connect_timeout":"17000ms","command_timeout":"31000ms"},
                 "exporter":{"authority_timeout":"19000ms"},
@@ -1227,7 +1264,7 @@ mod startup_readback_tests {
         }))?;
         let router = process_configurations(concat!(
             "arrowcol_router_effective_config ",
-            "{\"workers\":3,\"listener_tasks_per_fd\":7,\"sql_timeouts\":{\"connect_timeout_ms\":17000},\"listen\":\"private\"}\n"
+            "{\"workers\":3,\"listener_tasks_per_fd\":7,\"sql_timeouts\":{\"connect_timeout_ms\":17000},\"sql_pool\":{\"max_size\":32,\"acquire_timeout_ms\":3000},\"log_filter\":\"debug,tiberius=error\",\"listen\":\"private\"}\n"
         ))?;
         verify_process_configuration(&config, ComponentRole::Router, &router)?;
         assert!(router.get("listen").is_none());

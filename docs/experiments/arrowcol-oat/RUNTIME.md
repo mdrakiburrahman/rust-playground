@@ -226,6 +226,14 @@ collapsing independent client connections onto one DFE worker. These settings
 are fixed across the matrix and do not change the normal router defaults.
 Keep client concurrency comfortably above the worker count (the example uses
 16); SO_REUSEPORT distributes connections by kernel hashing, not round-robin.
+
+In OAT mode, the router reads the authoritative SQL run-table pin for every
+ingest request and again during revalidation; do not cache or weaken this check.
+Therefore measured OAT router latency includes those SQL round trips, while the
+production cached-lease routing path does not. `router.sql_pool_max_size` changes
+connection reuse, not pin-read semantics. Per-cell `evidence_json.router_sql`
+contains opened-connection and operation counters plus SQL operation latency
+histogram deltas for the measurement window.
 `--num-cores` is authoritative because the rendered pipeline has no resource
 policy override. Flight success is **best-effort admission**, not publication.
 QAP observations and client timing must not be presented as a durability receipt.

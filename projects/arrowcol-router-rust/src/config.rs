@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
 use arrowcol_routing::{AdmissionPressureGauge, PressurePolicy, RoutingPolicy};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use serde::Deserialize;
 
 /// Command-line options for the router process.
@@ -43,6 +43,12 @@ pub struct RouterOverrides {
     pub sql_connect_timeout_ms: Option<u64>,
     #[arg(long)]
     pub sql_command_timeout_ms: Option<u64>,
+    #[arg(long)]
+    pub sql_pool_max_size: Option<usize>,
+    #[arg(long)]
+    pub sql_pool_acquire_timeout_ms: Option<u64>,
+    #[arg(long, value_enum)]
+    pub log_level: Option<RouterLogLevel>,
     #[arg(long)]
     pub refresh_interval_ms: Option<u64>,
     #[arg(long)]
@@ -87,6 +93,27 @@ pub struct RouterOverrides {
     /// Zero disables upstream HTTP/2 keepalive pings.
     #[arg(long)]
     pub upstream_ping_interval_seconds: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum RouterLogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl RouterLogLevel {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Debug => "debug",
+            Self::Trace => "trace",
+        }
+    }
 }
 
 /// Strict production router configuration.
@@ -238,6 +265,14 @@ impl RouterConfig {
             "SQL Server timeouts must be between 1 and 600000 milliseconds"
         );
         ensure!(
+            self.sql_server.sql_pool_max_size <= 1_024,
+            "sql_server.sql_pool_max_size must be between 0 and 1024"
+        );
+        ensure!(
+            (1..=600_000).contains(&self.sql_server.sql_pool_acquire_timeout_ms),
+            "sql_server.sql_pool_acquire_timeout_ms must be between 1 and 600000 milliseconds"
+        );
+        ensure!(
             (1..=3_600_000).contains(&self.routing.refresh_interval_ms),
             "routing.refresh_interval_ms must be between 1 and 3600000"
         );
@@ -309,6 +344,19 @@ fn apply_environment_overrides(
         "ARROWCOL_ROUTER_SQL_COMMAND_TIMEOUT_MS",
         u64
     );
+    set_from_env!(
+        &mut config.sql_server.sql_pool_max_size,
+        "ARROWCOL_ROUTER_SQL_POOL_MAX_SIZE",
+        usize
+    );
+    set_from_env!(
+        &mut config.sql_server.sql_pool_acquire_timeout_ms,
+        "ARROWCOL_ROUTER_SQL_POOL_ACQUIRE_TIMEOUT_MS",
+        u64
+    );
+    if let Some(value) = get("RUST_LOG")? {
+        config.telemetry.log_filter = value;
+    }
     set_from_env!(
         &mut config.routing.refresh_interval_ms,
         "ARROWCOL_ROUTER_REFRESH_INTERVAL_MS",
@@ -428,6 +476,14 @@ fn apply_cli_overrides(config: &mut RouterConfig, overrides: &RouterOverrides) {
     set_from_cli!(h2_idle_timeout_seconds, config.server.h2.idle_timeout_seconds);
     set_from_cli!(sql_connect_timeout_ms, config.sql_server.connect_timeout_ms);
     set_from_cli!(sql_command_timeout_ms, config.sql_server.command_timeout_ms);
+    set_from_cli!(sql_pool_max_size, config.sql_server.sql_pool_max_size);
+    set_from_cli!(
+        sql_pool_acquire_timeout_ms,
+        config.sql_server.sql_pool_acquire_timeout_ms
+    );
+    if let Some(level) = overrides.log_level {
+        config.telemetry.log_filter = format!("{},tiberius=error", level.as_str());
+    }
     set_from_cli!(refresh_interval_ms, config.routing.refresh_interval_ms);
     set_from_cli!(max_snapshot_age_ms, config.routing.max_snapshot_age_ms);
     set_from_cli!(max_future_skew_ms, config.routing.max_future_skew_ms);
@@ -522,6 +578,16 @@ pub struct SqlServerConfig {
     pub connect_timeout_ms: u64,
     /// SQL command timeout.
     pub command_timeout_ms: u64,
+    /// Maximum pooled SQL connections; zero preserves unpooled behavior.
+    #[serde(default)]
+    pub sql_pool_max_size: usize,
+    /// Maximum time to acquire a pooled SQL connection.
+    #[serde(default = "default_sql_pool_acquire_timeout_ms")]
+    pub sql_pool_acquire_timeout_ms: u64,
+}
+
+fn default_sql_pool_acquire_timeout_ms() -> u64 {
+    10_000
 }
 
 /// Cache, pressure, selection, and lease settings.
@@ -736,6 +802,12 @@ mod routing_policy_tests {
             "8",
             "--upstream-ping-interval-seconds",
             "0",
+            "--sql-pool-max-size",
+            "64",
+            "--sql-pool-acquire-timeout-ms",
+            "2500",
+            "--log-level",
+            "debug",
             "--excluded-admission-gauges",
             "cpu_utilization_bps,active_streams",
         ])
@@ -748,6 +820,9 @@ mod routing_policy_tests {
             .unwrap_or_else(|error| panic!("validate router CLI overrides: {error}"));
         assert_eq!(config.server.threads, 8);
         assert_eq!(config.upstream.ping_interval_seconds, None);
+        assert_eq!(config.sql_server.sql_pool_max_size, 64);
+        assert_eq!(config.sql_server.sql_pool_acquire_timeout_ms, 2_500);
+        assert_eq!(config.telemetry.log_filter, "debug,tiberius=error");
         assert_eq!(
             config.routing.excluded_admission_gauges,
             vec![
@@ -768,6 +843,9 @@ mod routing_policy_tests {
             ("ARROWCOL_ROUTER_H2_MAX_CONCURRENT_STREAMS", "512"),
             ("ARROWCOL_ROUTER_UPSTREAM_PING_INTERVAL_SECONDS", "0"),
             ("ARROWCOL_ROUTER_DISTINCT_TABLE_OWNERS", "true"),
+            ("ARROWCOL_ROUTER_SQL_POOL_MAX_SIZE", "32"),
+            ("ARROWCOL_ROUTER_SQL_POOL_ACQUIRE_TIMEOUT_MS", "1500"),
+            ("RUST_LOG", "info,tiberius=error"),
             (
                 "ARROWCOL_ROUTER_EXCLUDED_ADMISSION_GAUGES",
                 r#"["cpu_utilization_bps"]"#,
@@ -784,6 +862,9 @@ mod routing_policy_tests {
         assert_eq!(config.server.threads, 8);
         assert_eq!(config.server.h2.max_concurrent_streams, 512);
         assert_eq!(config.upstream.ping_interval_seconds, None);
+        assert_eq!(config.sql_server.sql_pool_max_size, 32);
+        assert_eq!(config.sql_server.sql_pool_acquire_timeout_ms, 1_500);
+        assert_eq!(config.telemetry.log_filter, "info,tiberius=error");
         assert!(config.routing.distinct_table_owners);
         assert_eq!(
             config.routing.excluded_admission_gauges,

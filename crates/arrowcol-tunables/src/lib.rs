@@ -29,6 +29,8 @@ pub struct Tunables {
     pub wal: Option<WalTunables>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maintenance: Option<MaintenanceTunables>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logging: Option<LoggingTunables>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -105,6 +107,8 @@ pub struct RouterTunables {
     pub h2_idle_timeout_seconds: Option<u64>,
     pub sql_connect_timeout_ms: Option<u64>,
     pub sql_command_timeout_ms: Option<u64>,
+    pub sql_pool_max_size: Option<usize>,
+    pub sql_pool_acquire_timeout_ms: Option<u64>,
     pub refresh_interval_ms: Option<u64>,
     pub max_snapshot_age_ms: Option<u64>,
     pub max_future_skew_ms: Option<u64>,
@@ -126,6 +130,37 @@ pub struct RouterTunables {
     pub upstream_total_connection_timeout_ms: Option<u64>,
     pub upstream_idle_timeout_seconds: Option<u64>,
     pub upstream_ping_interval_seconds: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl LogLevel {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Debug => "debug",
+            Self::Trace => "trace",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoggingTunables {
+    pub client: Option<LogLevel>,
+    pub router: Option<LogLevel>,
+    pub collector: Option<LogLevel>,
+    pub maintenance: Option<LogLevel>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

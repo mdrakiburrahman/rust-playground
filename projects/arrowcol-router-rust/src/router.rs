@@ -1,6 +1,6 @@
 use std::os::fd::RawFd;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrowcol_protocol::NOT_ADMITTED_METADATA_KEY;
 use arrowcol_protocol::{
@@ -22,7 +22,7 @@ use pingora::server::configuration::ServerConf;
 use pingora::services::background::{BackgroundService, background_service};
 use pingora::upstreams::peer::ALPN;
 use serde::Serialize;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     AuthFailure, AuthFailureKind, Authenticator, EDGE_NONCE_HEADER, EDGE_SIGNATURE_HEADER, EDGE_TIMESTAMP_HEADER,
@@ -100,6 +100,12 @@ impl ProductionRouter {
             )
             .await?;
         self.internal_signer.sign(&context, now)
+    }
+
+    fn record_request_latency(&self, context: &mut RequestContext) {
+        if let Some(started) = context.request_started.take() {
+            self.metrics.observe_request_duration(started.elapsed());
+        }
     }
 
     async fn route_proxy_request(
@@ -383,6 +389,7 @@ pub struct RequestContext {
     stream_counted: bool,
     pinning_error: Option<String>,
     overloaded_error: Option<String>,
+    request_started: Option<Instant>,
 }
 
 #[async_trait]
@@ -394,6 +401,7 @@ impl ProxyHttp for ProductionRouter {
     }
 
     async fn request_filter(&self, session: &mut Session, context: &mut Self::CTX) -> pingora::Result<bool> {
+        context.request_started = Some(Instant::now());
         let now = now_unix_millis()
             .map_err(|cause| Error::because(ErrorType::InternalError, "read current timestamp", cause))?;
         let path = session.req_header().uri.path().to_owned();
@@ -401,6 +409,16 @@ impl ProxyHttp for ProductionRouter {
             return Ok(handled);
         }
         self.route_proxy_request(session, context, now).await
+    }
+
+    async fn response_filter(
+        &self,
+        _session: &mut Session,
+        _upstream_response: &mut ResponseHeader,
+        context: &mut Self::CTX,
+    ) -> pingora::Result<()> {
+        self.record_request_latency(context);
+        Ok(())
     }
 
     async fn upstream_peer(&self, _session: &mut Session, context: &mut Self::CTX) -> pingora::Result<Box<HttpPeer>> {
@@ -524,10 +542,11 @@ impl ProxyHttp for ProductionRouter {
     }
 
     async fn fail_to_proxy(&self, session: &mut Session, error: &Error, context: &mut Self::CTX) -> FailToProxy {
+        self.record_request_latency(context);
         let code = if context.is_grpc && session.response_written().is_none() {
             if let Some(message) = context.overloaded_error.as_deref() {
                 if let Err(write_error) = write_not_admitted_grpc_error(session, 14, message).await {
-                    warn!(error = %write_error, "failed to write retryable OAT overload response");
+                    debug!(error = %write_error, "failed to write retryable OAT overload response");
                 }
             } else {
                 let (grpc_status, message) = context
@@ -535,7 +554,7 @@ impl ProxyHttp for ProductionRouter {
                     .as_deref()
                     .map_or((14, "upstream collector is unavailable"), |message| (9, message));
                 if let Err(write_error) = write_grpc_error(session, grpc_status, message).await {
-                    warn!(error = %write_error, "failed to write canonical gRPC proxy error");
+                    debug!(error = %write_error, "failed to write canonical gRPC proxy error");
                 }
             }
             200
@@ -577,7 +596,7 @@ impl ProxyHttp for ProductionRouter {
             context.stream_counted = false;
         }
         if let Some(error) = error {
-            warn!(
+            debug!(
                 operation = context.operation,
                 pool = context.pool.as_deref().unwrap_or("unknown"),
                 error = %error,

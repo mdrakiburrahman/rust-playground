@@ -125,6 +125,12 @@ const CAPABILITIES: &[Capability] = &[
     capability!("router.h2_idle_timeout_seconds", "60"),
     capability!("router.sql_connect_timeout_ms", "5000"),
     capability!("router.sql_command_timeout_ms", "15000"),
+    capability!("router.sql_pool_max_size", "0 (unpooled)"),
+    capability!("router.sql_pool_acquire_timeout_ms", "10000"),
+    capability!("logging.client", "unset"),
+    capability!("logging.router", "warn; tiberius=error"),
+    capability!("logging.collector", "unset"),
+    capability!("logging.maintenance", "unset"),
     capability!("router.refresh_interval_ms", "1000"),
     capability!("router.max_snapshot_age_ms", "15000"),
     capability!("router.max_future_skew_ms", "2000"),
@@ -588,7 +594,7 @@ impl Tunables {
     /// Returns an error if settings cannot be serialized or projected for the role.
     pub fn environment_for(&self, role: ComponentRole) -> Result<BTreeMap<String, String>> {
         let variables = self.environment()?;
-        let selected = variables
+        let mut selected: BTreeMap<String, String> = variables
             .into_iter()
             .filter(|(name, _)| match role {
                 ComponentRole::Client => name.starts_with("ARROWCOL_CLIENT_"),
@@ -606,6 +612,18 @@ impl Tunables {
                 }
             })
             .collect();
+        let level = self.logging.as_ref().and_then(|logging| match role {
+            ComponentRole::Client => logging.client,
+            ComponentRole::Router => logging.router,
+            ComponentRole::Collector => logging.collector,
+            ComponentRole::Maintenance => logging.maintenance,
+        });
+        if matches!(role, ComponentRole::Router) {
+            let level = level.unwrap_or(crate::LogLevel::Warn).as_str();
+            selected.insert("RUST_LOG".to_owned(), format!("{level},tiberius=error"));
+        } else if let Some(level) = level {
+            selected.insert("RUST_LOG".to_owned(), level.as_str().to_owned());
+        }
         Ok(selected)
     }
 
@@ -800,6 +818,18 @@ fn validate_router(router: Option<&RouterTunables>) -> Result<()> {
         if value.is_some_and(|value| !(minimum..=maximum).contains(&value)) {
             bail!("router.{name} must be between {minimum} and {maximum}");
         }
+    }
+    if router.sql_pool_max_size.is_some_and(|size| size > 1_024) {
+        bail!("router.sql_pool_max_size must be between 0 and 1024");
+    }
+    if router
+        .sql_pool_acquire_timeout_ms
+        .is_some_and(|timeout| !(1..=600_000).contains(&timeout))
+    {
+        bail!("router.sql_pool_acquire_timeout_ms must be between 1 and 600000");
+    }
+    if router.sql_pool_acquire_timeout_ms.is_some() && router.sql_pool_max_size.unwrap_or(0) == 0 {
+        bail!("router.sql_pool_acquire_timeout_ms requires router.sql_pool_max_size greater than 0");
     }
     let downstream_stream_window = router.h2_stream_window_bytes.unwrap_or(1_048_576);
     let downstream_connection_window = router.h2_connection_window_bytes.unwrap_or(16_777_216);
@@ -2000,7 +2030,10 @@ mod tests {
             config.environment_for(ComponentRole::Client)?["ARROWCOL_CLIENT_BATCH_ROWS"],
             "4"
         );
-        assert_eq!(config.environment_for(ComponentRole::Router)?.len(), 0);
+        assert_eq!(
+            config.environment_for(ComponentRole::Router)?["RUST_LOG"],
+            "warn,tiberius=error"
+        );
         assert_eq!(
             config.environment_for(ComponentRole::Collector)?["ARROWCOL_WAL_FLUSH_INTERVAL"],
             "15ms"
@@ -2030,6 +2063,31 @@ mod tests {
             ..Default::default()
         };
         assert!(error_text(invalid.validate()).contains("leave at least one"));
+        Ok(())
+    }
+
+    #[test]
+    fn router_pool_bounds_and_component_log_levels_are_strict() -> Result<()> {
+        let config: Tunables = serde_json::from_str(
+            r#"{"router":{"sql_pool_max_size":64,"sql_pool_acquire_timeout_ms":2500},"logging":{"client":"debug","router":"trace","collector":"info","maintenance":"warn"}}"#,
+        )?;
+        config.validate_for_oat()?;
+        assert_eq!(config.environment_for(ComponentRole::Client)?["RUST_LOG"], "debug");
+        assert_eq!(
+            config.environment_for(ComponentRole::Router)?["RUST_LOG"],
+            "trace,tiberius=error"
+        );
+        assert_eq!(config.environment_for(ComponentRole::Collector)?["RUST_LOG"], "info");
+        assert_eq!(config.environment_for(ComponentRole::Maintenance)?["RUST_LOG"], "warn");
+        for invalid in [
+            r#"{"router":{"sql_pool_max_size":1025}}"#,
+            r#"{"router":{"sql_pool_max_size":0,"sql_pool_acquire_timeout_ms":100}}"#,
+            r#"{"router":{"sql_pool_max_size":8,"sql_pool_acquire_timeout_ms":0}}"#,
+        ] {
+            let config: Tunables = serde_json::from_str(invalid)?;
+            assert!(config.validate_for_oat().is_err());
+        }
+        assert!(serde_json::from_str::<Tunables>(r#"{"logging":{"router":"verbose"}}"#).is_err());
         Ok(())
     }
 
@@ -2072,6 +2130,8 @@ mod tests {
                 h2_stream_window_bytes: Some(2_097_152),
                 h2_connection_window_bytes: Some(8_388_608),
                 sql_connect_timeout_ms: Some(8_000),
+                sql_pool_max_size: Some(64),
+                sql_pool_acquire_timeout_ms: Some(2_500),
                 refresh_interval_ms: Some(2_000),
                 upstream_ping_interval_seconds: Some(0),
                 upstream_idle_timeout_seconds: Some(0),
@@ -2087,6 +2147,9 @@ mod tests {
         assert_eq!(env["ARROWCOL_ROUTER_H2_STREAM_WINDOW_BYTES"], "2097152");
         assert_eq!(env["ARROWCOL_ROUTER_H2_CONNECTION_WINDOW_BYTES"], "8388608");
         assert_eq!(env["ARROWCOL_ROUTER_SQL_CONNECT_TIMEOUT_MS"], "8000");
+        assert_eq!(env["ARROWCOL_ROUTER_SQL_POOL_MAX_SIZE"], "64");
+        assert_eq!(env["ARROWCOL_ROUTER_SQL_POOL_ACQUIRE_TIMEOUT_MS"], "2500");
+        assert_eq!(env["RUST_LOG"], "warn,tiberius=error");
         assert_eq!(env["ARROWCOL_ROUTER_REFRESH_INTERVAL_MS"], "2000");
         assert_eq!(env["ARROWCOL_ROUTER_UPSTREAM_PING_INTERVAL_SECONDS"], "0");
         assert_eq!(env["ARROWCOL_ROUTER_UPSTREAM_IDLE_TIMEOUT_SECONDS"], "0");

@@ -783,6 +783,8 @@ fn test_config(listen: SocketAddr, state_directory: String) -> RouterConfig {
             trust_server_certificate: true,
             connect_timeout_ms: 100,
             command_timeout_ms: 100,
+            sql_pool_max_size: 0,
+            sql_pool_acquire_timeout_ms: 10_000,
         },
         routing: RoutingConfig {
             refresh_interval_ms: 1_000,

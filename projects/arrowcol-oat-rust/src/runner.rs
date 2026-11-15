@@ -18,7 +18,7 @@ use object_store::{GetOptions, ObjectStore, PutMode, PutOptions, PutPayload, Upd
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde_json::{Value, json};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -2126,7 +2126,7 @@ async fn run_matrix_cell(
         i64::try_from(cell_start_unix_ms).context("run start timestamp exceeds Arrow timestamp range")?;
     let baseline_logs = platform.process_logs(config).await?;
     let mut client_run = run_clients(config, run_id, &assigned_tables, platform).await?;
-    let (logs, durable_commits) = settle_cell_commit_evidence(
+    let (_collector_logs, durable_commits) = settle_cell_commit_evidence(
         config,
         platform,
         &baseline_logs,
@@ -2134,7 +2134,8 @@ async fn run_matrix_cell(
         cell_start_unix_ms,
     )
     .await?;
-    client_run.evidence.processes = Some(process_evidence_for_cell(config, &logs, &baseline_logs)?);
+    let process_logs = platform.process_logs(config).await?;
+    client_run.evidence.processes = Some(process_evidence_for_cell(config, &process_logs, &baseline_logs)?);
     client_run.evidence.durable_commits = durable_commits;
     let pinning_ok = client_run.pinning.violation.is_none()
         && client_run.pinning.verification_error.is_none()
@@ -2680,6 +2681,8 @@ async fn run_clients_inner(
     let mut client_metrics = HashMap::<String, Vec<ClientMeasurement>>::with_capacity(tables.len());
     let mut completed_clients = HashSet::new();
     let mut active_clients = vec![true; handles.len()];
+    let mut router_sql_start = None;
+    let mut router_sql_end = None;
     while completed_clients.len() < handles.len() {
         let pending_indices = handles
             .iter()
@@ -2779,22 +2782,47 @@ async fn run_clients_inner(
                 completed_clients.insert(handle.client_id.clone());
             }
         }
-        record_owner_observation(
-            pinning,
-            sample_router_table_owners(platform, config, &metrics_client, tables).await,
-            tables,
-            false,
-        );
+        let sample = sample_router_metrics(platform, config, &metrics_client, tables).await;
+        if let Ok(sample) = &sample {
+            let sampled_at = unix_time_ms_u64()?;
+            if sampled_at >= measurement_start_unix_ms && router_sql_start.is_none() {
+                router_sql_start = Some(sample.sql.clone());
+            }
+            if sampled_at >= measurement_end_unix_ms && router_sql_end.is_none() {
+                router_sql_end = Some(sample.sql.clone());
+            }
+        }
+        record_owner_observation(pinning, sample.map(|sample| sample.owners), tables, false);
         if completed_clients.len() < handles.len() {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
-    record_owner_observation(
-        pinning,
-        sample_router_table_owners(platform, config, &metrics_client, tables).await,
-        tables,
-        true,
-    );
+    let final_sample = sample_router_metrics(platform, config, &metrics_client, tables).await;
+    if let Ok(sample) = &final_sample {
+        let sampled_at = unix_time_ms_u64()?;
+        if sampled_at >= measurement_start_unix_ms && router_sql_start.is_none() {
+            router_sql_start = Some(sample.sql.clone());
+        }
+        if sampled_at >= measurement_end_unix_ms && router_sql_end.is_none() {
+            router_sql_end = Some(sample.sql.clone());
+        }
+    }
+    record_owner_observation(pinning, final_sample.map(|sample| sample.owners), tables, true);
+    evidence.router_sql = Some(match (router_sql_start, router_sql_end) {
+        (Some(start), Some(end)) => end.delta_json(&start).map_or_else(
+            || {
+                json!({
+                    "status": "unavailable",
+                    "reason": "router_sql_counters_reset_or_disappeared_during_measurement",
+                })
+            },
+            |delta| json!({ "status": "observed", "metrics": delta }),
+        ),
+        _ => json!({
+            "status": "unavailable",
+            "reason": "router_sql_measurement_boundary_scrape_missing",
+        }),
+    });
     let mut metrics = HashMap::with_capacity(tables.len());
     sampler.finish(&mut evidence).await?;
     for table in tables {
@@ -2955,31 +2983,146 @@ async fn cancel_active_clients(
     Ok(())
 }
 
-async fn sample_table_owners(
-    client: &reqwest::Client,
-    endpoint: &str,
-    tables: &[String],
-) -> Result<HashMap<String, Vec<String>>> {
-    let response = client
-        .get(endpoint)
-        .send()
-        .await
-        .with_context(|| format!("GET router metrics {endpoint}"))?
-        .error_for_status()
-        .context("router metrics endpoint returned an error status")?;
-    let body = response.text().await.context("read router metrics response")?;
-    parse_owner_metrics(&body, tables)
+#[derive(Clone, Debug, Default)]
+struct RouterMetricSample {
+    owners: HashMap<String, Vec<String>>,
+    sql: RouterSqlMetricSnapshot,
 }
 
-async fn sample_router_table_owners(
+#[derive(Clone, Debug, Default)]
+struct RouterSqlMetricSnapshot {
+    connections_opened: u64,
+    operations: BTreeMap<(String, String), u64>,
+    latency_buckets: BTreeMap<(String, String), u64>,
+    latency_counts: BTreeMap<String, u64>,
+    latency_sums: BTreeMap<String, f64>,
+    request_buckets: BTreeMap<String, u64>,
+    request_count: u64,
+    request_sum: f64,
+}
+
+impl RouterSqlMetricSnapshot {
+    fn delta_json(&self, before: &Self) -> Option<Value> {
+        let connections_opened = self.connections_opened.checked_sub(before.connections_opened)?;
+        let mut operations = Vec::new();
+        for (key, value) in &self.operations {
+            let count = value.checked_sub(*before.operations.get(key).unwrap_or(&0))?;
+            operations.push(json!({ "operation": key.0, "outcome": key.1, "count": count }));
+        }
+        if before.operations.keys().any(|key| !self.operations.contains_key(key)) {
+            return None;
+        }
+        let mut operation_names = self.latency_counts.keys().cloned().collect::<BTreeSet<_>>();
+        operation_names.extend(before.latency_counts.keys().cloned());
+        let mut latency = Vec::new();
+        for operation in operation_names {
+            let count = self
+                .latency_counts
+                .get(&operation)
+                .copied()
+                .unwrap_or(0)
+                .checked_sub(before.latency_counts.get(&operation).copied().unwrap_or(0))?;
+            let sum_seconds = self.latency_sums.get(&operation).copied().unwrap_or(0.0)
+                - before.latency_sums.get(&operation).copied().unwrap_or(0.0);
+            if !sum_seconds.is_finite() || sum_seconds < 0.0 {
+                return None;
+            }
+            let mut buckets = Vec::new();
+            for ((bucket_operation, le), value) in &self.latency_buckets {
+                if bucket_operation != &operation {
+                    continue;
+                }
+                let cumulative_count = value.checked_sub(
+                    *before
+                        .latency_buckets
+                        .get(&(bucket_operation.clone(), le.clone()))
+                        .unwrap_or(&0),
+                )?;
+                buckets.push(json!({ "le_seconds": le, "cumulative_count": cumulative_count }));
+            }
+            latency.push(json!({
+                "operation": operation,
+                "count": count,
+                "sum_seconds": sum_seconds,
+                "buckets": buckets,
+            }));
+        }
+        if before
+            .latency_buckets
+            .keys()
+            .any(|key| !self.latency_buckets.contains_key(key))
+        {
+            return None;
+        }
+        let request_count = self.request_count.checked_sub(before.request_count)?;
+        let request_sum = self.request_sum - before.request_sum;
+        if !request_sum.is_finite() || request_sum < 0.0 {
+            return None;
+        }
+        let mut request_buckets = Vec::new();
+        let mut request_bucket_deltas = BTreeMap::new();
+        for (le, value) in &self.request_buckets {
+            let cumulative_count = value.checked_sub(*before.request_buckets.get(le).unwrap_or(&0))?;
+            request_bucket_deltas.insert(le.clone(), cumulative_count);
+            request_buckets.push(json!({ "le_seconds": le, "cumulative_count": cumulative_count }));
+        }
+        if before
+            .request_buckets
+            .keys()
+            .any(|key| !self.request_buckets.contains_key(key))
+        {
+            return None;
+        }
+        Some(json!({
+            "connections_opened": connections_opened,
+            "operations": operations,
+            "latency_seconds": latency,
+            "request_latency": {
+                "count": request_count,
+                "sum_seconds": request_sum,
+                "p50_upper_bound_seconds": histogram_upper_bound(&request_bucket_deltas, request_count, 0.50),
+                "p99_upper_bound_seconds": histogram_upper_bound(&request_bucket_deltas, request_count, 0.99),
+                "percentile_method": "first_cumulative_bucket_upper_bound",
+                "buckets": request_buckets,
+                "scope": "request_filter_to_upstream_response_headers_or_proxy_failure",
+            },
+            "scope": "measurement_window_counter_and_histogram_deltas",
+        }))
+    }
+}
+
+fn histogram_upper_bound(buckets: &BTreeMap<String, u64>, count: u64, quantile: f64) -> Option<f64> {
+    if count == 0 {
+        return None;
+    }
+    let target = (count as f64 * quantile).ceil() as u64;
+    let mut ordered = buckets
+        .iter()
+        .map(|(bound, cumulative)| {
+            let numeric = if bound == "+Inf" {
+                f64::INFINITY
+            } else {
+                bound.parse().ok()?
+            };
+            Some((numeric, *cumulative))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    ordered.sort_by(|left, right| left.0.total_cmp(&right.0));
+    ordered
+        .into_iter()
+        .find(|(_, cumulative)| *cumulative >= target)
+        .and_then(|(bound, _)| bound.is_finite().then_some(bound))
+}
+
+async fn sample_router_metrics(
     platform: &mut dyn Platform,
     config: &OatConfig,
     client: &reqwest::Client,
     tables: &[String],
-) -> Result<HashMap<String, Vec<String>>> {
+) -> Result<RouterMetricSample> {
     let (endpoint, _) = platform.ensure_router_metrics_endpoint(config).await?;
-    match sample_table_owners(client, &endpoint, tables).await {
-        Ok(sample) => Ok(sample),
+    let body = match fetch_router_metrics(client, &endpoint).await {
+        Ok(body) => body,
         Err(error) => {
             if !error.chain().any(|cause| {
                 cause
@@ -2997,10 +3140,216 @@ async fn sample_router_table_owners(
             if !restarted {
                 return Err(error);
             }
-            sample_table_owners(client, &retry_endpoint, tables)
+            fetch_router_metrics(client, &retry_endpoint)
                 .await
-                .map_err(|retry_error| retry_error.context(format!("initial router metrics sample failed: {error:#}")))
+                .map_err(|retry_error| {
+                    retry_error.context(format!("initial router metrics sample failed: {error:#}"))
+                })?
         }
+    };
+    Ok(RouterMetricSample {
+        owners: parse_owner_metrics(&body, tables)?,
+        sql: parse_router_sql_metrics(&body)?,
+    })
+}
+
+async fn fetch_router_metrics(client: &reqwest::Client, endpoint: &str) -> Result<String> {
+    let response = client
+        .get(endpoint)
+        .send()
+        .await
+        .with_context(|| format!("GET router metrics {endpoint}"))?
+        .error_for_status()
+        .context("router metrics endpoint returned an error status")?;
+    response.text().await.context("read router metrics response")
+}
+
+#[cfg(test)]
+async fn sample_table_owners(
+    client: &reqwest::Client,
+    endpoint: &str,
+    tables: &[String],
+) -> Result<HashMap<String, Vec<String>>> {
+    parse_owner_metrics(&fetch_router_metrics(client, endpoint).await?, tables)
+}
+
+async fn sample_router_table_owners(
+    platform: &mut dyn Platform,
+    config: &OatConfig,
+    client: &reqwest::Client,
+    tables: &[String],
+) -> Result<HashMap<String, Vec<String>>> {
+    Ok(sample_router_metrics(platform, config, client, tables).await?.owners)
+}
+
+fn parse_router_sql_metrics(body: &str) -> Result<RouterSqlMetricSnapshot> {
+    let mut snapshot = RouterSqlMetricSnapshot::default();
+    let mut connections_seen = false;
+    for line in body.lines() {
+        let Some((name, value)) = line.split_once(' ') else {
+            continue;
+        };
+        if name == "arrowcol_router_sql_connections_opened_total" {
+            snapshot.connections_opened = value
+                .split_whitespace()
+                .next()
+                .context("router SQL connections metric omitted value")?
+                .parse()
+                .context("invalid router SQL connections metric")?;
+            connections_seen = true;
+            continue;
+        }
+        if name == "arrowcol_router_request_seconds_count" {
+            snapshot.request_count = value
+                .split_whitespace()
+                .next()
+                .context("router request latency count omitted value")?
+                .parse()
+                .context("invalid router request latency count")?;
+            continue;
+        }
+        if name == "arrowcol_router_request_seconds_sum" {
+            let sum: f64 = value
+                .split_whitespace()
+                .next()
+                .context("router request latency sum omitted value")?
+                .parse()
+                .context("invalid router request latency sum")?;
+            if !sum.is_finite() {
+                bail!("invalid router request latency sum");
+            }
+            snapshot.request_sum = sum;
+            continue;
+        }
+        let Some(open) = name.find('{') else {
+            continue;
+        };
+        let close = name.rfind('}').context("malformed router SQL metric labels")?;
+        let labels = parse_metric_labels(&name[open + 1..close])?;
+        let metric_value = value
+            .split_whitespace()
+            .next()
+            .context("router SQL metric omitted value")?;
+        match &name[..open] {
+            "arrowcol_router_sql_operations_total" => {
+                let operation = labels
+                    .get("operation")
+                    .context("SQL operation metric omitted operation")?;
+                let outcome = labels.get("outcome").context("SQL operation metric omitted outcome")?;
+                let count = metric_value.parse().context("invalid SQL operation counter")?;
+                if snapshot
+                    .operations
+                    .insert((operation.clone(), outcome.clone()), count)
+                    .is_some()
+                {
+                    bail!("duplicate SQL operation metric series");
+                }
+            }
+            "arrowcol_router_sql_operation_seconds_bucket" => {
+                let operation = labels
+                    .get("operation")
+                    .context("SQL latency bucket omitted operation")?;
+                let le = labels.get("le").context("SQL latency bucket omitted bound")?;
+                let count = metric_value.parse().context("invalid SQL latency bucket")?;
+                if snapshot
+                    .latency_buckets
+                    .insert((operation.clone(), le.clone()), count)
+                    .is_some()
+                {
+                    bail!("duplicate SQL latency bucket series");
+                }
+            }
+            "arrowcol_router_sql_operation_seconds_count" => {
+                let operation = labels.get("operation").context("SQL latency count omitted operation")?;
+                let count = metric_value.parse().context("invalid SQL latency count")?;
+                if snapshot.latency_counts.insert(operation.clone(), count).is_some() {
+                    bail!("duplicate SQL latency count series");
+                }
+            }
+            "arrowcol_router_sql_operation_seconds_sum" => {
+                let operation = labels.get("operation").context("SQL latency sum omitted operation")?;
+                let sum: f64 = metric_value.parse().context("invalid SQL latency sum")?;
+                if !sum.is_finite() || snapshot.latency_sums.insert(operation.clone(), sum).is_some() {
+                    bail!("invalid or duplicate SQL latency sum series");
+                }
+            }
+            "arrowcol_router_request_seconds_bucket" => {
+                let le = labels
+                    .get("le")
+                    .context("router request latency bucket omitted bound")?;
+                let count = metric_value.parse().context("invalid router request latency bucket")?;
+                if snapshot.request_buckets.insert(le.clone(), count).is_some() {
+                    bail!("duplicate router request latency bucket series");
+                }
+            }
+            "arrowcol_router_request_seconds_count" => {
+                snapshot.request_count = metric_value.parse().context("invalid router request latency count")?;
+            }
+            "arrowcol_router_request_seconds_sum" => {
+                let sum: f64 = metric_value.parse().context("invalid router request latency sum")?;
+                if !sum.is_finite() {
+                    bail!("invalid router request latency sum");
+                }
+                snapshot.request_sum = sum;
+            }
+            _ => {}
+        }
+    }
+    if !connections_seen {
+        bail!("router metrics omitted SQL connection counter");
+    }
+    Ok(snapshot)
+}
+
+#[cfg(test)]
+mod router_sql_metrics_tests {
+    use super::parse_router_sql_metrics;
+    use anyhow::{Context, Result, bail};
+
+    #[test]
+    fn parses_and_deltas_router_sql_operation_histograms() -> Result<()> {
+        let before = parse_router_sql_metrics(
+            "arrowcol_router_sql_connections_opened_total 3\n\
+             arrowcol_router_sql_operations_total{operation=\"get_run_table_pin\",outcome=\"success\"} 4\n\
+             arrowcol_router_sql_operation_seconds_bucket{operation=\"get_run_table_pin\",le=\"0.1\"} 3\n\
+             arrowcol_router_sql_operation_seconds_bucket{operation=\"get_run_table_pin\",le=\"+Inf\"} 4\n\
+             arrowcol_router_sql_operation_seconds_count{operation=\"get_run_table_pin\"} 4\n\
+             arrowcol_router_sql_operation_seconds_sum{operation=\"get_run_table_pin\"} 0.2\n\
+             arrowcol_router_request_seconds_bucket{le=\"0.1\"} 3\n\
+             arrowcol_router_request_seconds_bucket{le=\"+Inf\"} 4\n\
+             arrowcol_router_request_seconds_count 4\n\
+             arrowcol_router_request_seconds_sum 0.2\n",
+        )?;
+        let after = parse_router_sql_metrics(
+            "arrowcol_router_sql_connections_opened_total 7\n\
+             arrowcol_router_sql_operations_total{operation=\"get_run_table_pin\",outcome=\"success\"} 10\n\
+             arrowcol_router_sql_operation_seconds_bucket{operation=\"get_run_table_pin\",le=\"0.1\"} 8\n\
+             arrowcol_router_sql_operation_seconds_bucket{operation=\"get_run_table_pin\",le=\"+Inf\"} 10\n\
+             arrowcol_router_sql_operation_seconds_count{operation=\"get_run_table_pin\"} 10\n\
+             arrowcol_router_sql_operation_seconds_sum{operation=\"get_run_table_pin\"} 1.2\n\
+             arrowcol_router_request_seconds_bucket{le=\"0.1\"} 8\n\
+             arrowcol_router_request_seconds_bucket{le=\"+Inf\"} 10\n\
+             arrowcol_router_request_seconds_count 10\n\
+             arrowcol_router_request_seconds_sum 1.2\n",
+        )?;
+        let Some(delta) = after.delta_json(&before) else {
+            bail!("monotonic SQL metrics did not produce a delta");
+        };
+        assert_eq!(delta["connections_opened"], 4);
+        assert_eq!(delta["operations"][0]["count"], 6);
+        assert_eq!(delta["latency_seconds"][0]["count"], 6);
+        let bucket = delta["latency_seconds"][0]["buckets"]
+            .as_array()
+            .context("missing latency buckets")?
+            .iter()
+            .find(|bucket| bucket["le_seconds"] == "0.1")
+            .context("missing 0.1-second latency bucket")?;
+        assert_eq!(bucket["cumulative_count"], 5);
+        assert_eq!(delta["request_latency"]["count"], 6);
+        assert_eq!(delta["request_latency"]["p50_upper_bound_seconds"], 0.1);
+        assert!(delta["request_latency"]["p99_upper_bound_seconds"].is_null());
+        assert!(after.delta_json(&after).is_some());
+        Ok(())
     }
 }
 

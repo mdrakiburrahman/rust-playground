@@ -493,7 +493,7 @@ mod commit_evidence_tests {
         config.tunables = serde_json::from_value(json!({"router":{"hard_pressure_bps":9500}}))?;
         let commit = event(&config, 100, 199)?;
         let mut input = String::from(
-            "arrowcol_router_effective_config {\"routing\":{\"hard_pressure_bps\":9500}}\narrowcol_effective_config {\"commit_telemetry\":{\"schema_version\":1,\"scope\":\"new_ingestion_addfiles_after_sync\",\"clock\":\"system_unix_ms\"}}\n",
+            "arrowcol_router_effective_config {\"routing\":{\"hard_pressure_bps\":9500},\"log_filter\":\"warn,tiberius=error\"}\narrowcol_effective_config {\"commit_telemetry\":{\"schema_version\":1,\"scope\":\"new_ingestion_addfiles_after_sync\",\"clock\":\"system_unix_ms\"}}\n",
         );
         for _ in 0..20_001 {
             input.push_str("noise line\n");

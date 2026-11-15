@@ -8,6 +8,7 @@ struct CellEvidence {
     processes: Option<Value>,
     measurement_window: Option<(u64, u64)>,
     durable_commits: HashMap<String, Value>,
+    router_sql: Option<Value>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -169,6 +170,7 @@ impl CellEvidence {
         json!({
             "version": 1,
             "processes": self.processes,
+            "router_sql": self.router_sql,
             "durable_commits": self.durable_commits.get(table),
             "reconciliation": self.reconciliation(table, durable),
             "commit_window_output_throughput": output,
@@ -656,6 +658,21 @@ mod downstream_runner_tests {
         async fn cancel_client(&self, _: &OatConfig, _: &ClientHandle) -> Result<()> {
             Ok(())
         }
+        async fn process_logs(&self, _: &OatConfig) -> Result<Vec<ProcessLog>> {
+            Ok(vec![ProcessLog {
+                role: ComponentRole::Router,
+                instance_id: "router-fault-test".to_owned(),
+                image: None,
+                image_id: None,
+                source_revision: None,
+                complete: true,
+                raw_log_bytes: 0,
+                raw_log_lines: 1,
+                stdout: String::new(),
+                stderr: String::new(),
+                text: "arrowcol_router_effective_config {\"log_filter\":\"warn,tiberius=error\"}\n".to_owned(),
+            }])
+        }
         async fn cleanup(&mut self, _: &OatConfig) -> Result<()> {
             Ok(())
         }
@@ -669,6 +686,7 @@ mod downstream_runner_tests {
         } else {
             "arrowcol_router_table_owners{pool=\"dataflow\",catalog=\"telemetry\",schema=\"sqlserver\",table=\"sqlserver_active_sessions\",collector=\"collector-a\",state=\"active\"} 1\n"
         };
+        let metric = format!("{metric}arrowcol_router_sql_connections_opened_total 0\n");
         let downstream_status = if matches!(fault, Fault::InitBindingRejected | Fault::ObservationBindingRejected) {
             axum::http::StatusCode::BAD_REQUEST
         } else {
@@ -707,7 +725,6 @@ mod downstream_runner_tests {
         server.abort();
         Ok((result?, platform))
     }
-
     #[tokio::test]
     async fn unavailable_initialization_and_observation_preserve_local_measurements_only() -> Result<()> {
         for fault in [

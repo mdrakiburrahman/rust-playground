@@ -16,6 +16,9 @@ fn main() -> Result<()> {
     let config = RouterConfig::load_with_cli(&cli.config, &cli.router)?;
     emit_effective_config(&config);
     initialize_tracing(&config)?;
+    if !cli.validate_and_exit && config.sql_server.trust_server_certificate {
+        warn!("SQL Server routing trusts the server certificate without validation");
+    }
     if cli.validate_and_exit {
         info!(config = %cli.config.display(), "router configuration is valid");
         return Ok(());
@@ -35,9 +38,27 @@ fn main() -> Result<()> {
         Duration::from_millis(config.sql_server.connect_timeout_ms),
         Duration::from_millis(config.sql_server.command_timeout_ms),
     );
-    let routing_store: Arc<dyn RoutingStore> = Arc::new(SqlServerRoutingStore::new(routing_sql));
-    let routing = Arc::new(RoutingEngine::new(routing_store, config.routing.policy()?)?);
+    let sql_pool = if config.sql_server.sql_pool_max_size == 0 {
+        None
+    } else {
+        Some(routing_sql.create_pool(
+            config.sql_server.sql_pool_max_size,
+            Duration::from_millis(config.sql_server.sql_pool_acquire_timeout_ms),
+        )?)
+    };
+    let mut routing_store = SqlServerRoutingStore::new(routing_sql);
+    if let Some(pool) = sql_pool.as_ref() {
+        routing_store = routing_store.with_pool(pool.clone())?;
+    }
     let metrics = RouterMetrics::new()?;
+    let metrics = if let Some(pool) = sql_pool {
+        metrics.with_sql_pool(pool)
+    } else {
+        metrics
+    };
+    let routing_store = routing_store.with_operation_observer(Arc::new(metrics.clone()));
+    let routing_store: Arc<dyn RoutingStore> = Arc::new(routing_store);
+    let routing = Arc::new(RoutingEngine::new(routing_store, config.routing.policy()?)?);
     metrics.set_distinct_table_owners(config.routing.distinct_table_owners);
     let authenticator: Arc<dyn Authenticator> = match config.auth.authenticator {
         AuthenticatorMode::DevOnlyAllowAll => {
@@ -89,6 +110,11 @@ fn emit_effective_config(config: &RouterConfig) {
             "connect_timeout_ms": config.sql_server.connect_timeout_ms,
             "command_timeout_ms": config.sql_server.command_timeout_ms,
         },
+        "sql_pool": {
+            "max_size": config.sql_server.sql_pool_max_size,
+            "acquire_timeout_ms": config.sql_server.sql_pool_acquire_timeout_ms,
+        },
+        "log_filter": config.telemetry.log_filter,
         "routing": {
             "refresh_interval_ms": config.routing.refresh_interval_ms,
             "max_snapshot_age_ms": config.routing.max_snapshot_age_ms,

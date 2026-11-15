@@ -17,6 +17,17 @@
 | `router.upstream_idle_timeout_seconds` | Accepts `0..=86400`; zero disables idle upstream pooling and is the value emitted by the main OAT runtime. |
 | Router downstream `server.h2.idle_timeout_seconds` | Deliberately constrained to `1..=86400`, whereas main accepted an unbounded value. Shipped router YAMLs use 30 or 60 seconds. |
 
+## Router SQL pooling and log volume
+
+| Setting | Contract |
+| --- | --- |
+| `router.sql_pool_max_size` | Env `ARROWCOL_ROUTER_SQL_POOL_MAX_SIZE`, CLI `--sql-pool-max-size`; default `0` (unpooled, matching main), valid `0..=1024`. A positive value enables the shared pool. |
+| `router.sql_pool_acquire_timeout_ms` | Env `ARROWCOL_ROUTER_SQL_POOL_ACQUIRE_TIMEOUT_MS`, CLI `--sql-pool-acquire-timeout-ms`; defaults to `10000` in the router when pooling is enabled, valid `1..=600000`, and requires a positive pool size when explicitly set. |
+| `logging.router` | Strict enum `error | warn | info | debug | trace`, component CLI `--log-level`, projected as `RUST_LOG`; default is `warn,tiberius=error` so Tiberius certificate-trust chatter is suppressed without hiding errors. |
+| SQL evidence | `evidence_json.router_sql` records measurement-window deltas for physical connections opened, SQL operation counts by operation/outcome (cancellations count as failures), and operation-latency histogram buckets, counts and sums. A router restart/counter reset makes this evidence unavailable rather than negative. |
+
+For the planned zero-interval comparison, keep Profile A unpooled (`sql_pool_max_size: 0`) and use a positive pool size for Profile C (`64` is the documented comparison value). Pooling changes connection reuse only; it does not cache, weaken or skip authoritative pin reads.
+
 ## Overload retry and admission policy
 
 | Setting or signal | Contract |

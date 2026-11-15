@@ -161,7 +161,7 @@ mod tunable_injection_tests {
             compose["services"]["oat-client"]["environment"]["ARROWCOL_CLIENT_BATCH_ROWS"],
             "257"
         );
-        assert!(compose["services"].get("router").is_none());
+        assert_eq!(compose["services"]["router"]["environment"]["RUST_LOG"], "warn,tiberius=error");
         let mut client = json!({ "env": [{ "name": "ARROWCOL_OAT_RUN_ID", "value": "owned" }] });
         inject_container_environment(&mut client, &role_environment(&config, ComponentRole::Client)?)?;
         assert_eq!(client["env"][1]["value"], "257");

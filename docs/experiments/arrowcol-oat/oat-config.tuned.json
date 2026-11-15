@@ -44,6 +44,10 @@
       "connections_per_worker": 1,
       "streams_per_worker": 2
     },
+    "router": {
+      "sql_pool_max_size": 64,
+      "sql_pool_acquire_timeout_ms": 10000
+    },
     "transport": {
       "ipc_compression": "zstd",
       "grpc_send_compression": "none",
