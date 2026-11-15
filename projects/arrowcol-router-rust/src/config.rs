@@ -221,7 +221,7 @@ impl RouterConfig {
                 && (1..=600_000).contains(&self.upstream.connection_timeout_ms)
                 && self.upstream.total_connection_timeout_ms >= self.upstream.connection_timeout_ms
                 && self.upstream.total_connection_timeout_ms <= 600_000
-                && (1..=86_400).contains(&self.upstream.idle_timeout_seconds)
+                && (0..=86_400).contains(&self.upstream.idle_timeout_seconds)
                 && self
                     .upstream
                     .ping_interval_seconds
@@ -627,7 +627,7 @@ pub struct UpstreamConfig {
     pub connection_timeout_ms: u64,
     /// Total connection establishment timeout.
     pub total_connection_timeout_ms: u64,
-    /// Reusable connection idle timeout.
+    /// Reusable connection idle timeout; zero disables idle upstream pooling.
     pub idle_timeout_seconds: u64,
     /// Optional H2 ping interval.
     pub ping_interval_seconds: Option<u64>,
@@ -647,6 +647,31 @@ pub struct TelemetryConfig {
 mod routing_policy_tests {
     use super::{Cli, RouterConfig, RoutingConfig, apply_cli_overrides, apply_environment_overrides};
     use clap::Parser;
+
+    #[test]
+    fn every_shipped_router_configuration_validates() {
+        for (name, bytes) in [
+            ("config.yaml", &include_bytes!("../config.yaml")[..]),
+            ("config.docker.yaml", &include_bytes!("../config.docker.yaml")[..]),
+            ("config.smoke.yaml", &include_bytes!("../config.smoke.yaml")[..]),
+        ] {
+            RouterConfig::from_yaml(bytes).unwrap_or_else(|error| panic!("validate {name}: {error}"));
+        }
+    }
+
+    #[test]
+    fn accepts_main_generated_router_settings_without_idle_upstream_pooling() {
+        let mut config = RouterConfig::from_yaml(include_bytes!("../config.yaml"))
+            .unwrap_or_else(|error| panic!("parse default router configuration: {error}"));
+        config.upstream.max_h2_streams = 1;
+        config.upstream.idle_timeout_seconds = 0;
+        config
+            .validate()
+            .unwrap_or_else(|error| panic!("validate main-generated router settings: {error}"));
+
+        config.upstream.idle_timeout_seconds = 86_401;
+        assert!(config.validate().is_err());
+    }
 
     #[test]
     fn distinct_table_owners_is_opt_in_and_disabled_for_single_collector_loadtest() {

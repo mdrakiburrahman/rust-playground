@@ -821,7 +821,7 @@ fn validate_router(router: Option<&RouterTunables>) -> Result<()> {
         (
             "upstream_idle_timeout_seconds",
             router.upstream_idle_timeout_seconds,
-            1,
+            0,
             86_400,
         ),
     ] {
@@ -1998,6 +1998,7 @@ mod tests {
                 sql_connect_timeout_ms: Some(8_000),
                 refresh_interval_ms: Some(2_000),
                 upstream_ping_interval_seconds: Some(0),
+                upstream_idle_timeout_seconds: Some(0),
                 ..Default::default()
             }),
             ..Default::default()
@@ -2012,6 +2013,7 @@ mod tests {
         assert_eq!(env["ARROWCOL_ROUTER_SQL_CONNECT_TIMEOUT_MS"], "8000");
         assert_eq!(env["ARROWCOL_ROUTER_REFRESH_INTERVAL_MS"], "2000");
         assert_eq!(env["ARROWCOL_ROUTER_UPSTREAM_PING_INTERVAL_SECONDS"], "0");
+        assert_eq!(env["ARROWCOL_ROUTER_UPSTREAM_IDLE_TIMEOUT_SECONDS"], "0");
         assert!(!env.contains_key("ARROWCOL_ROUTER_WORKER_THREADS"));
 
         let invalid = Tunables {
@@ -2023,6 +2025,15 @@ mod tests {
             ..Default::default()
         };
         assert!(error_text(invalid.validate()).contains("h2_connection_window_bytes"));
+
+        let invalid_idle_timeout = Tunables {
+            router: Some(RouterTunables {
+                upstream_idle_timeout_seconds: Some(86_401),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(error_text(invalid_idle_timeout.validate()).contains("between 0 and 86400"));
         Ok(())
     }
 

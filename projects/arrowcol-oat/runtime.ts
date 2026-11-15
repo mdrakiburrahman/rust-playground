@@ -190,7 +190,7 @@ export async function renderRuntime(input: unknown, phase: Phase): Promise<Resou
   router.upstream.tls = false;
   router.upstream.sni = '';
   router.upstream.max_h2_streams = 1;
-  router.upstream.idle_timeout_seconds = 60;
+  router.upstream.idle_timeout_seconds = 0;
   router.auth.edge_secret_file = '/run/auth/edge-hmac';
   router.auth.internal_signing_secret_file = '/run/auth/internal-hmac';
   router.routing.oat_run_id = c.oatRunId;
