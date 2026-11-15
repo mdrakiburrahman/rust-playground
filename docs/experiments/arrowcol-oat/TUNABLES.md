@@ -34,7 +34,7 @@
 | Setting | Contract |
 | --- | --- |
 | `aks_rollout_timeout_seconds` | Overall Deployment readiness deadline; defaults to 600 seconds and accepts `600..=3600`. Pods fail fast on crash-loop, image/config pull errors, or at least two restarts; failure details include previous logs and `kubectl describe` output. |
-| `reconciliation_settle_timeout_seconds` | Post-client Delta commit drain deadline; defaults to 120 seconds and accepts `0..=1800`. Zero performs one immediate read. Settling is outside the measurement window. Commit evidence is scoped to logs appended during that matrix cell and ingress timestamps at or after its start; prior-cell tail events are excluded, while commits crossing the cell boundary are reported unavailable. |
+| `reconciliation_settle_timeout_seconds` | Post-client Delta commit drain deadline; defaults to 120 seconds and accepts `0..=1800`. Zero performs one immediate read. Settling is outside the measurement window. Commit evidence uses appended-log offsets plus ingress timestamps at or after the cell start. A log-prefix mismatch/rotation safely falls back to ingress-time-only scope and records that choice; prior-cell tail events are excluded, while commits crossing the cell boundary are reported unavailable. |
 
 ## Collector runtime compatibility
 

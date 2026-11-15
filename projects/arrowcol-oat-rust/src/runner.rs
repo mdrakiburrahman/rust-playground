@@ -2017,7 +2017,12 @@ async fn settle_cell_commit_evidence(
     let can_settle = evidence.measurement_window.is_some() && targets.values().all(Option::is_some);
     loop {
         let logs = platform.process_logs(config).await?;
-        let cell_commit_logs = cell_scoped_commit_logs(&logs, baseline_logs)?;
+        let (cell_commit_logs, used_log_offsets) = cell_scoped_commit_logs(&logs, baseline_logs)?;
+        let cell_scope = if used_log_offsets {
+            "process_log_offset_and_ingress_time"
+        } else {
+            "ingress_time_only"
+        };
         let mut commits = durable_commit_evidence_for_cell(
             config,
             &logs,
@@ -2054,6 +2059,7 @@ async fn settle_cell_commit_evidence(
                     .and_then(|value| value.get_mut("run_cumulative_output"));
                 if let Some(output) = output {
                     let delta = output.get("rows").and_then(Value::as_u64);
+                    output["cell_scope"] = json!(cell_scope);
                     output["settle_seconds"] = json!(elapsed.as_secs_f64());
                     output["settle_timeout_seconds"] = json!(timeout.as_secs());
                     output["settled"] = json!(target.zip(delta).is_some_and(|(completed, delta)| delta >= completed));
@@ -2061,6 +2067,12 @@ async fn settle_cell_commit_evidence(
                     output["settle_gap_rows"] = target
                         .zip(delta)
                         .map_or(Value::Null, |(completed, delta)| json!(completed.saturating_sub(delta)));
+                }
+                if let Some(output) = commits
+                    .get_mut(table)
+                    .and_then(|value| value.get_mut("output_throughput"))
+                {
+                    output["cell_scope"] = json!(cell_scope);
                 }
             }
             return Ok((logs, commits));
@@ -7672,8 +7684,11 @@ mod tests {
         );
         assert_eq!(
             budget.minimum_pin_ttl_ms,
-            (budget.client_job_lifetime_seconds + crate::config::PIN_INIT_SETUP_TIMEOUT_SECONDS) * 1_000,
-            "the immutable pin lifetime starts before bounded pin setup and must outlive the entire client Job"
+            (budget.client_job_lifetime_seconds
+                + crate::config::PIN_INIT_SETUP_TIMEOUT_SECONDS
+                + config.reconciliation_settle_timeout_seconds)
+                * 1_000,
+            "the immutable pin lifetime must cover setup, the client Job and post-client reconciliation settling"
         );
         Ok(())
     }

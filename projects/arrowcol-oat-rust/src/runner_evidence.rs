@@ -148,6 +148,7 @@ impl CellEvidence {
             "settle_seconds": settle,
             "settle_timeout_seconds": delta_evidence.and_then(|value| value.get("settle_timeout_seconds")),
             "settled": settled,
+            "cell_scope": delta_evidence.and_then(|value| value.get("cell_scope")),
             "delta_rows": delta_rows,
             "completed_rows": completed_rows,
             "ambiguous_rows": ambiguous_rows,

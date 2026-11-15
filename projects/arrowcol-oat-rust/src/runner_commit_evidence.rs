@@ -209,7 +209,7 @@ fn durable_commit_evidence(
     durable_commit_evidence_for_cell(config, logs, logs, window, None)
 }
 
-fn cell_scoped_commit_logs(current: &[ProcessLog], baseline: &[ProcessLog]) -> Result<Vec<ProcessLog>> {
+fn cell_scoped_commit_logs(current: &[ProcessLog], baseline: &[ProcessLog]) -> Result<(Vec<ProcessLog>, bool)> {
     let mut baseline_by_id = HashMap::new();
     for log in baseline.iter().filter(|log| matches!(log.role, ComponentRole::Collector)) {
         if baseline_by_id.insert(log.instance_id.as_str(), log).is_some() {
@@ -218,21 +218,28 @@ fn cell_scoped_commit_logs(current: &[ProcessLog], baseline: &[ProcessLog]) -> R
     }
     let mut current_ids = HashSet::new();
     let mut scoped = Vec::new();
+    let mut used_log_offsets = true;
     for log in current.iter().filter(|log| matches!(log.role, ComponentRole::Collector)) {
         if !current_ids.insert(log.instance_id.as_str()) {
             bail!("collector process identity is duplicated in the current snapshot");
         }
         let prior = baseline_by_id.get(log.instance_id.as_str());
         let (text, complete) = match prior {
-            Some(prior) if !prior.complete || !log.complete => (String::new(), false),
-            Some(prior) => (
-                log.text
-                    .strip_prefix(&prior.text)
-                    .with_context(|| format!("collector log for {} was truncated or rotated during the cell", log.instance_id))?
-                    .to_owned(),
-                true,
-            ),
-            None => (log.text.clone(), log.complete),
+            Some(prior) if prior.complete && log.complete => match log.text.strip_prefix(&prior.text) {
+                Some(suffix) => (suffix.to_owned(), true),
+                None => {
+                    used_log_offsets = false;
+                    (log.text.clone(), log.complete)
+                }
+            },
+            Some(_) => {
+                used_log_offsets = false;
+                (log.text.clone(), log.complete)
+            }
+            None => {
+                used_log_offsets = false;
+                (log.text.clone(), log.complete)
+            }
         };
         scoped.push(ProcessLog {
             role: log.role,
@@ -244,7 +251,7 @@ fn cell_scoped_commit_logs(current: &[ProcessLog], baseline: &[ProcessLog]) -> R
             text,
         });
     }
-    Ok(scoped)
+    Ok((scoped, used_log_offsets))
 }
 
 fn durable_commit_evidence_for_cell(
@@ -467,8 +474,31 @@ mod commit_evidence_tests {
         let baseline = log(&[previous]);
         let mut full = baseline.clone();
         full.text.push_str(&format!("arrowcol_data_commit {}\narrowcol_data_commit {}\n", late_previous, current));
-        let scoped = cell_scoped_commit_logs(&[full.clone()], &[baseline])?;
+        let (scoped, used_offsets) = cell_scoped_commit_logs(&[full.clone()], &[baseline])?;
+        assert!(used_offsets);
         let evidence = durable_commit_evidence_for_cell(&config, &[full], &scoped, Some((200, 300)), Some(200))?;
+        assert_eq!(evidence[&config.tables[0]]["run_cumulative_output"]["rows"], 10);
+        assert_eq!(evidence[&config.tables[0]]["rows"], 10);
+        Ok(())
+    }
+
+    #[test]
+    fn cell_scoped_logs_fall_back_when_stdout_and_stderr_grow() -> Result<()> {
+        let config = config()?;
+        let previous = event(&config, 10, 20)?;
+        let mut late_previous = event(&config, 100, 150)?;
+        late_previous["delta_version"] = json!(8);
+        let mut current = event(&config, 210, 220)?;
+        current["delta_version"] = json!(9);
+        let baseline = log(&[previous]);
+        let mut current_log = baseline.clone();
+        current_log.text = format!("stdout1stdout2\nstderr1stderr2\n{}", current_log.text);
+        current_log.text.push_str(&format!("arrowcol_data_commit {}\narrowcol_data_commit {}\n", late_previous, current));
+        let mut baseline_log = baseline;
+        baseline_log.text = format!("stdout1\nstderr1\n{}", baseline_log.text);
+        let (scoped, used_offsets) = cell_scoped_commit_logs(&[current_log.clone()], &[baseline_log])?;
+        assert!(!used_offsets);
+        let evidence = durable_commit_evidence_for_cell(&config, &[current_log], &scoped, Some((200, 300)), Some(200))?;
         assert_eq!(evidence[&config.tables[0]]["run_cumulative_output"]["rows"], 10);
         assert_eq!(evidence[&config.tables[0]]["rows"], 10);
         Ok(())
