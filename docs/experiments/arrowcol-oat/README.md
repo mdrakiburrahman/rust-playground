@@ -117,6 +117,20 @@ For AKS, copy the example and set `platform.kind` to `aks`, remove the local Com
 
 The server never creates, deletes, or scales AKS node pools. Run `cargo run --locked --package arrowcol-oat-rust -- --validate-config docs/experiments/arrowcol-oat/oat-config.example.json` before submission to validate the shape without changing cluster state; placeholders still need replacing. The `az://container/object` URL form is also accepted when Azure account authentication is already configured for the process.
 
+## Known limitations
+
+- An all-core 16-worker × 16-stream, zero-interval blast can produce client
+  `pinning_violation` failures. The router evaluates lease-holder eligibility
+  using the request-start time after SQL pin and view reads. A candidate
+  decision-clock fix is on the separate
+  `wip/arrowcol-router-decision-clock` branch, not in this PR.
+- Under that backlog, collector shutdown can exit 1 with
+  `dataflow drain incomplete: N unpublished identities`. This is fail-closed;
+  the count alone does not establish data loss. Category diagnostics are also
+  on the separate scratch branch, not in this PR.
+- The tested operating point is lower concurrency, such as 8 workers × 16
+  streams.
+
 ## Mode-based quick bug bash
 
 From the repository root. Local needs Docker Compose, Rust/Cargo and the npm dependencies.

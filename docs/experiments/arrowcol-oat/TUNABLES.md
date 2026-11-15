@@ -23,6 +23,8 @@
 | --- | --- |
 | `router.sql_pool_max_size` | Env `ARROWCOL_ROUTER_SQL_POOL_MAX_SIZE`, CLI `--sql-pool-max-size`; default `0` (unpooled, matching main), valid `0..=1024`. A positive value enables the shared pool. |
 | `router.sql_pool_acquire_timeout_ms` | Env `ARROWCOL_ROUTER_SQL_POOL_ACQUIRE_TIMEOUT_MS`, CLI `--sql-pool-acquire-timeout-ms`; defaults to `10000` in the router when pooling is enabled, valid `1..=600000`, and requires a positive pool size when explicitly set. |
+| `router.max_future_skew_ms` | Default `2000`; increasing it permits more future-dated pressure observations, weakening the clock-skew guard. It does not repair stale observations or expired ownership. |
+| `router.refresh_interval_ms` | Default `1000`; controls background refresh, not per-request OAT authority reads. Increasing it can reduce background SQL traffic but increase cache staleness and readiness risk. |
 | `logging.router` | Strict enum `error`, `warn`, `info`, `debug`, `trace`, or `inherit`, component CLI `--log-level`, projected as `RUST_LOG`; default is `warn,tiberius=error` so Tiberius certificate-trust chatter is suppressed without hiding errors. |
 | SQL evidence | `evidence_json.router_sql` records measurement-window deltas for physical connections opened, SQL operation counts by operation/outcome (cancellations count as failures), and operation-latency histogram buckets, counts and sums. Request p50/p99 are histogram upper bounds; connection and operation rates use the recorded start/end scrape-midpoint interval. A router restart/counter reset makes this evidence unavailable rather than negative. |
 
@@ -44,7 +46,7 @@ For the planned zero-interval comparison, keep Profile A unpooled (`sql_pool_max
 
 | Setting | Contract |
 | --- | --- |
-| `aks_rollout_timeout_seconds` | Overall Deployment readiness deadline; defaults to 600 seconds and accepts `600..=3600`. Pods fail fast on crash-loop, image/config pull errors, or at least two restarts; failure details include previous logs and `kubectl describe` output. |
+| `aks_rollout_timeout_seconds` | Overall Deployment readiness deadline; defaults to 600 seconds and accepts `600..=3600`. Image-pull and container-config errors fail immediately; an unready container fails at four or more restarts. Failure details include previous logs and `kubectl describe` output. |
 | `reconciliation_settle_timeout_seconds` | Post-client Delta commit drain deadline; defaults to 120 seconds and accepts `0..=1800`. Zero performs one immediate read. Settling is outside the measurement window. Commit evidence uses appended-log offsets plus ingress timestamps at or after the cell start. A log-prefix mismatch/rotation safely falls back to ingress-time-only scope and records that choice; prior-cell tail events are excluded, while commits crossing the cell boundary are reported unavailable. |
 | `collector_stop_grace_seconds` | Collector shutdown grace, default 300 seconds, range `30..=3600`; projected to local Compose and AKS, verified against the effective runtime configuration, and included in the run-pin lifetime budget. |
 

@@ -45,6 +45,11 @@ For AKS prerequisites, continue below. Local runs use the following independent 
 Collector routing-store SQL remains unpooled; unlike the router's per-request
 authoritative OAT pin reads, its heartbeat/pressure operations are periodic.
 Collector pool tunables are a follow-up, not part of the router pooling evidence.
+Router SQL pooling can reduce login overhead, but pool acquisition and SQL
+latency can still delay requests. A larger future-skew allowance also accepts
+more genuine clock skew, while a longer background refresh interval risks
+staler cache and readiness data; neither removes per-request authority reads.
+See [router tunables](TUNABLES.md#router-sql-pooling-and-log-volume).
 
 AKS starts SQL and completes migration before applying workload ConfigMaps,
 Services, NetworkPolicies and the catalog Deployment. Catalog rollout must be
