@@ -1325,6 +1325,8 @@ pub(crate) mod tests {
         });
         let metrics = Arc::new(RuntimeMetrics::new(instance_id));
         metrics.configure_receiver(2, 1_000_000_000, 1_000_000, 10_000, 16, 2);
+        metrics.set_catalog_ready(true);
+        metrics.set_registered(true);
         metrics.configure_exporter(2);
         let admission = Arc::new(DfeAdmission::new(
             Arc::clone(&sender) as Arc<dyn PdataSender>,
@@ -1784,6 +1786,8 @@ pub(crate) mod tests {
         });
         let metrics = Arc::new(RuntimeMetrics::new(instance_id));
         metrics.configure_receiver(2, u64::MAX / 4, 1_000_000, 10_000, 16, 2);
+        metrics.set_catalog_ready(true);
+        metrics.set_registered(true);
         metrics
             .configure_admission("dfe-flight-test", true)
             .map_err(anyhow::Error::msg)?;
