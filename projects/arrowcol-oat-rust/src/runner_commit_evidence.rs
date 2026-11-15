@@ -258,6 +258,8 @@ fn cell_scoped_commit_logs(current: &[ProcessLog], baseline: &[ProcessLog]) -> R
             image_id: log.image_id.clone(),
             source_revision: log.source_revision.clone(),
             complete,
+            raw_log_bytes: log.raw_log_bytes,
+            raw_log_lines: log.raw_log_lines,
             stdout: log.stdout.clone(),
             stderr: log.stderr.clone(),
             text,
@@ -295,13 +297,15 @@ fn durable_commit_evidence_for_cell(
     if collector_logs_incomplete {
         unavailable = Some("collector_commit_log_incomplete");
     }
-    let mut capability_observed = !collector_logs.is_empty();
-    for log in &collector_logs {
-        let readback = process_configurations(&log.text)?;
-        capability_observed &= readback["commit_telemetry"]
-            == json!({
-                "schema_version":1,"scope":"new_ingestion_addfiles_after_sync","clock":"system_unix_ms",
-            });
+    let mut capability_observed = !collector_logs.is_empty() && !collector_logs_incomplete;
+    if !collector_logs_incomplete {
+        for log in &collector_logs {
+            let readback = process_configurations(&log.text)?;
+            capability_observed &= readback["commit_telemetry"]
+                == json!({
+                    "schema_version":1,"scope":"new_ingestion_addfiles_after_sync","clock":"system_unix_ms",
+                });
+        }
     }
     let mut events = std::collections::BTreeMap::new();
     if !collector_logs_incomplete {
@@ -469,6 +473,8 @@ mod commit_evidence_tests {
             image_id: None,
             source_revision: None,
             complete: true,
+            raw_log_bytes: 0,
+            raw_log_lines: 0,
             stdout: String::new(),
             stderr: String::new(),
             text: format!(
@@ -503,6 +509,8 @@ mod commit_evidence_tests {
             image_id: None,
             source_revision: None,
             complete: true,
+            raw_log_bytes: 0,
+            raw_log_lines: 0,
             stdout: filtered.clone(),
             stderr: String::new(),
             text: filtered,
@@ -515,8 +523,13 @@ mod commit_evidence_tests {
     #[test]
     fn incomplete_collector_logs_never_count_partial_commit_events() -> Result<()> {
         let config = config()?;
-        let mut log = log(&[event(&config, 100, 199)?]);
-        log.complete = false;
+        let mut log = log(&[]);
+        let commit = event(&config, 100, 199)?;
+        log.text = format!(
+            "arrowcol_effective_config {{\"component\":\"layout\",\"table_effective\":{{}}}}\narrowcol_data_commit {commit}\n"
+        );
+        log.complete = process_log_complete(&log.role, &log.text);
+        assert!(!log.complete);
         let evidence = durable_commit_evidence(&config, &[log], Some((100, 200)))?;
         let table = &evidence[&config.tables[0]];
         assert!(table["rows"].is_null());

@@ -6,6 +6,8 @@ struct ProcessLog {
     image_id: Option<String>,
     source_revision: Option<String>,
     complete: bool,
+    raw_log_bytes: u64,
+    raw_log_lines: u64,
     stdout: String,
     stderr: String,
     text: String,
@@ -13,8 +15,38 @@ struct ProcessLog {
 
 const MAX_RETAINED_PROCESS_LOG_BYTES: usize = 64 * 1024 * 1024;
 
+struct FilteredProcessOutput {
+    stdout: String,
+    stderr: String,
+    raw_log_bytes: u64,
+    raw_log_lines: u64,
+}
+
+fn has_startup_envelope(text: &str, prefix: &str, required_component: Option<&str>) -> bool {
+    text.lines().any(|line| {
+        let Some(json) = line.strip_prefix(prefix) else {
+            return false;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(json) else {
+            return false;
+        };
+        value.as_object().is_some_and(|object| {
+            required_component.is_none_or(|required| {
+                object
+                    .get("component")
+                    .is_none_or(|component| component.as_str() == Some(required))
+            })
+        })
+    })
+}
+
 fn process_log_complete(role: &ComponentRole, text: &str) -> bool {
-    !matches!(role, ComponentRole::Collector) || text.contains("arrowcol_effective_config ")
+    match role {
+        ComponentRole::Client => true,
+        ComponentRole::Router => has_startup_envelope(text, "arrowcol_router_effective_config ", None),
+        ComponentRole::Collector => has_startup_envelope(text, "arrowcol_effective_config ", Some("receiver")),
+        ComponentRole::Maintenance => has_startup_envelope(text, "arrowcol_maintenance_effective_config ", None),
+    }
 }
 
 fn is_process_evidence_line(line: &str) -> bool {
@@ -57,7 +89,14 @@ fn append_process_evidence_line(
     Ok(())
 }
 
-async fn filtered_process_command_output(mut command: Command, action: &str) -> Result<(String, String)> {
+fn append_process_record(bytes: &[u8], output: &mut String, retained_bytes: &mut usize, action: &str) -> Result<()> {
+    let without_lf = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    let line = without_lf.strip_suffix(b"\r").unwrap_or(without_lf);
+    let line = std::str::from_utf8(line).context("process log contains a non-UTF-8 line")?;
+    append_process_evidence_line(line, output, retained_bytes, action)
+}
+
+async fn filtered_process_command_output(mut command: Command, action: &str) -> Result<FilteredProcessOutput> {
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -66,22 +105,50 @@ async fn filtered_process_command_output(mut command: Command, action: &str) -> 
         .with_context(|| format!("{action}: start process"))?;
     let stdout = child.stdout.take().context("process log stdout is missing")?;
     let stderr = child.stderr.take().context("process log stderr is missing")?;
-    let mut stdout = BufReader::new(stdout).lines();
-    let mut stderr = BufReader::new(stderr).lines();
+    let mut stdout = BufReader::new(stdout);
+    let mut stderr = BufReader::new(stderr);
     let mut stdout_open = true;
     let mut stderr_open = true;
+    let mut stdout_line = Vec::new();
+    let mut stderr_line = Vec::new();
     let mut retained_bytes = 0;
-    let mut filtered_stdout = String::new();
-    let mut filtered_stderr = String::new();
+    let mut output = FilteredProcessOutput {
+        stdout: String::new(),
+        stderr: String::new(),
+        raw_log_bytes: 0,
+        raw_log_lines: 0,
+    };
     while stdout_open || stderr_open {
         tokio::select! {
-            line = stdout.next_line(), if stdout_open => match line? {
-                Some(line) => append_process_evidence_line(&line, &mut filtered_stdout, &mut retained_bytes, action)?,
-                None => stdout_open = false,
+            result = stdout.read_until(b'\n', &mut stdout_line), if stdout_open => {
+                let bytes_read = result?;
+                if bytes_read == 0 {
+                    stdout_open = false;
+                } else {
+                    output.raw_log_bytes = output.raw_log_bytes
+                        .checked_add(u64::try_from(bytes_read).context("raw log byte count overflow")?)
+                        .context("raw log byte count overflow")?;
+                    output.raw_log_lines = output.raw_log_lines
+                        .checked_add(1)
+                        .context("raw log line count overflow")?;
+                    append_process_record(&stdout_line, &mut output.stdout, &mut retained_bytes, action)?;
+                    stdout_line.clear();
+                }
             },
-            line = stderr.next_line(), if stderr_open => match line? {
-                Some(line) => append_process_evidence_line(&line, &mut filtered_stderr, &mut retained_bytes, action)?,
-                None => stderr_open = false,
+            result = stderr.read_until(b'\n', &mut stderr_line), if stderr_open => {
+                let bytes_read = result?;
+                if bytes_read == 0 {
+                    stderr_open = false;
+                } else {
+                    output.raw_log_bytes = output.raw_log_bytes
+                        .checked_add(u64::try_from(bytes_read).context("raw log byte count overflow")?)
+                        .context("raw log byte count overflow")?;
+                    output.raw_log_lines = output.raw_log_lines
+                        .checked_add(1)
+                        .context("raw log line count overflow")?;
+                    append_process_record(&stderr_line, &mut output.stderr, &mut retained_bytes, action)?;
+                    stderr_line.clear();
+                }
             },
         }
     }
@@ -92,7 +159,7 @@ async fn filtered_process_command_output(mut command: Command, action: &str) -> 
     if !status.success() {
         bail!("{action} failed with {status}");
     }
-    Ok((filtered_stdout, filtered_stderr))
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -648,6 +715,8 @@ fn process_evidence_for_cell(config: &OatConfig, logs: &[ProcessLog], baseline_l
                 "image_id": log.image_id,
                 "source_revision": log.source_revision,
                 "log_complete": log.complete,
+            "raw_log_bytes": log.raw_log_bytes,
+            "raw_log_lines": log.raw_log_lines,
                 "maintenance_table_policies": maintenance_tables,
                 "maintenance_operation_outcomes": maintenance_outcomes,
                 "layout_table_policies": layout_tables,
@@ -743,6 +812,14 @@ fn maintenance_cell_outcome_evidence(log: &ProcessLog, baseline_logs: &[ProcessL
 }
 
 async fn local_process_logs(config: &OatConfig, platform: &LocalPlatform) -> Result<Vec<ProcessLog>> {
+    local_process_logs_for_role(config, platform, None).await
+}
+
+async fn local_process_logs_for_role(
+    config: &OatConfig,
+    platform: &LocalPlatform,
+    role_filter: Option<ComponentRole>,
+) -> Result<Vec<ProcessLog>> {
     let project = scoped_compose_project(
         config
             .platform
@@ -787,15 +864,24 @@ async fn local_process_logs(config: &OatConfig, platform: &LocalPlatform) -> Res
             Some("delta-maintenance") => ComponentRole::Maintenance,
             _ => continue,
         };
+        if role_filter.is_some_and(|filter| filter != role) {
+            continue;
+        }
         if container["RestartCount"].as_u64().unwrap_or(0) > 0 {
             bail!("required measurement process restarted during the cell");
         }
         let id = container["Id"].as_str().context("inspected container has no ID")?;
         let mut command = Command::new("docker");
         command.args(["logs", "--tail=-1", id]);
-        let (stdout, stderr) =
+        let capture =
             filtered_process_command_output(command, "read full owned process logs for tuning and commit evidence")
                 .await?;
+        let FilteredProcessOutput {
+            stdout,
+            stderr,
+            raw_log_bytes,
+            raw_log_lines,
+        } = capture;
         let text = format!("{stdout}\n{stderr}");
         logs.push(ProcessLog {
             role,
@@ -810,6 +896,8 @@ async fn local_process_logs(config: &OatConfig, platform: &LocalPlatform) -> Res
                 .and_then(Value::as_str)
                 .map(str::to_owned),
             complete: process_log_complete(&role, &text),
+            raw_log_bytes,
+            raw_log_lines,
             stdout,
             stderr,
             text,
@@ -819,6 +907,10 @@ async fn local_process_logs(config: &OatConfig, platform: &LocalPlatform) -> Res
 }
 
 async fn aks_process_logs(config: &OatConfig) -> Result<Vec<ProcessLog>> {
+    aks_process_logs_for_role(config, None).await
+}
+
+async fn aks_process_logs_for_role(config: &OatConfig, role_filter: Option<ComponentRole>) -> Result<Vec<ProcessLog>> {
     let pods: Value = serde_json::from_str(
         &kubectl(
             config,
@@ -852,6 +944,9 @@ async fn aks_process_logs(config: &OatConfig) -> Result<Vec<ProcessLog>> {
             } else {
                 continue;
             };
+            if role_filter.is_some_and(|filter| filter != role) {
+                continue;
+            }
             if status["restartCount"].as_u64().unwrap_or(0) > 0 {
                 bail!("required AKS measurement process restarted during the cell");
             }
@@ -860,9 +955,15 @@ async fn aks_process_logs(config: &OatConfig) -> Result<Vec<ProcessLog>> {
                 command.args(["--context", context]);
             }
             command.args(["logs", pod_name, "--namespace", &config.namespace, "--container", name]);
-            let (stdout, stderr) =
+            let capture =
                 filtered_process_command_output(command, &format!("read full AKS process logs for {pod_name}/{name}"))
                     .await?;
+            let FilteredProcessOutput {
+                stdout,
+                stderr,
+                raw_log_bytes,
+                raw_log_lines,
+            } = capture;
             let text = format!("{stdout}\n{stderr}");
             logs.push(ProcessLog {
                 role,
@@ -871,6 +972,8 @@ async fn aks_process_logs(config: &OatConfig) -> Result<Vec<ProcessLog>> {
                 image_id: status["imageID"].as_str().map(str::to_owned),
                 source_revision: None,
                 complete: process_log_complete(&role, &text),
+                raw_log_bytes,
+                raw_log_lines,
                 stdout,
                 stderr,
                 text,
@@ -895,6 +998,8 @@ mod startup_readback_tests {
             image_id: None,
             source_revision: None,
             complete: true,
+            raw_log_bytes: 0,
+            raw_log_lines: 0,
             stdout: format!("{previous}\n"),
             stderr: "prior stderr\n".to_owned(),
             text: String::new(),
@@ -944,6 +1049,8 @@ mod startup_readback_tests {
             image_id: None,
             source_revision: None,
             complete: true,
+            raw_log_bytes: 0,
+            raw_log_lines: 0,
             stdout: startup.clone(),
             stderr: String::new(),
             text: startup.clone(),
@@ -1011,6 +1118,50 @@ mod startup_readback_tests {
     }
 
     #[test]
+    fn log_completeness_requires_role_specific_startup_envelopes() {
+        assert!(process_log_complete(
+            &ComponentRole::Collector,
+            "arrowcol_effective_config {\"component\":\"receiver\"}\n"
+        ));
+        assert!(!process_log_complete(
+            &ComponentRole::Collector,
+            "arrowcol_effective_config {\"component\":\"layout\",\"table_effective\":{}}\n"
+        ));
+        assert!(process_log_complete(
+            &ComponentRole::Router,
+            "arrowcol_router_effective_config {\"workers\":2}\n"
+        ));
+        assert!(process_log_complete(
+            &ComponentRole::Maintenance,
+            "arrowcol_maintenance_effective_config {\"maintenance\":{}}\n"
+        ));
+    }
+
+    #[test]
+    fn process_evidence_records_raw_log_bytes_and_lines() -> Result<()> {
+        let config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        let log = ProcessLog {
+            role: ComponentRole::Router,
+            instance_id: "router-test".to_owned(),
+            image: None,
+            image_id: None,
+            source_revision: None,
+            complete: true,
+            raw_log_bytes: 97,
+            raw_log_lines: 4,
+            stdout: String::new(),
+            stderr: String::new(),
+            text: "arrowcol_router_effective_config {\"workers\":2}\n".to_owned(),
+        };
+        let evidence = process_evidence(&config, &[log])?;
+        assert_eq!(evidence[0]["raw_log_bytes"], 97);
+        assert_eq!(evidence[0]["raw_log_lines"], 4);
+        Ok(())
+    }
+
+    #[test]
     fn process_log_filter_fails_closed_when_retained_byte_cap_is_exceeded() {
         let mut output = String::new();
         let mut retained_bytes = MAX_RETAINED_PROCESS_LOG_BYTES;
@@ -1043,6 +1194,8 @@ mod startup_readback_tests {
         ))?;
         let evidence = process_evidence(&config, &[ProcessLog {
             role: ComponentRole::Collector, instance_id: "collector-test".to_owned(), image: None, image_id: None, source_revision: None, complete: true,
+            raw_log_bytes: 0,
+            raw_log_lines: 0,
             stdout: String::new(),
             stderr: String::new(),
             text: "arrowcol_effective_config {\"runtime\":{\"batch_rows\":8192},\"parquet_writer\":{\"defaults\":{\"compression\":null}}}\n".to_owned(),

@@ -164,6 +164,14 @@ trait Platform: Send + Sync {
     async fn process_logs(&self, _config: &OatConfig) -> Result<Vec<ProcessLog>> {
         Ok(Vec::new())
     }
+    async fn process_logs_for_role(&self, config: &OatConfig, role: ComponentRole) -> Result<Vec<ProcessLog>> {
+        Ok(self
+            .process_logs(config)
+            .await?
+            .into_iter()
+            .filter(|log| log.role == role)
+            .collect())
+    }
     async fn cleanup(&mut self, config: &OatConfig) -> Result<()>;
 }
 
@@ -213,6 +221,10 @@ impl Platform for AksPlatform {
 
     async fn process_logs(&self, config: &OatConfig) -> Result<Vec<ProcessLog>> {
         aks_process_logs(config).await
+    }
+
+    async fn process_logs_for_role(&self, config: &OatConfig, role: ComponentRole) -> Result<Vec<ProcessLog>> {
+        aks_process_logs_for_role(config, Some(role)).await
     }
 
     fn workload_endpoint(&self, config: &OatConfig) -> String {
@@ -437,6 +449,10 @@ impl Platform for LocalPlatform {
 
     async fn process_logs(&self, config: &OatConfig) -> Result<Vec<ProcessLog>> {
         local_process_logs(config, self).await
+    }
+
+    async fn process_logs_for_role(&self, config: &OatConfig, role: ComponentRole) -> Result<Vec<ProcessLog>> {
+        local_process_logs_for_role(config, self, Some(role)).await
     }
 
     fn workload_endpoint(&self, _config: &OatConfig) -> String {
@@ -2016,7 +2032,7 @@ async fn settle_cell_commit_evidence(
         .collect::<HashMap<_, _>>();
     let can_settle = evidence.measurement_window.is_some() && targets.values().all(Option::is_some);
     loop {
-        let logs = platform.process_logs(config).await?;
+        let logs = platform.process_logs_for_role(config, ComponentRole::Collector).await?;
         let (cell_commit_logs, used_log_offsets) = cell_scoped_commit_logs(&logs, baseline_logs)?;
         let cell_scope = if used_log_offsets {
             "process_log_offset_and_ingress_time"
