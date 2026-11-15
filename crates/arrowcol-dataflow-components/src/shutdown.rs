@@ -94,13 +94,21 @@ impl RoutingShutdown {
         publication_id: PublicationId,
         send: impl Future<Output = Result<(), E>>,
     ) -> Result<Result<(), E>> {
-        self.pending
-            .lock()
-            .map_err(|_| anyhow::anyhow!("publication accounting poisoned"))?
-            .entry(publication_id)
-            .or_insert(PublicationState::NeverStaged);
+        let created_entry = {
+            let mut pending = self
+                .pending
+                .lock()
+                .map_err(|_| anyhow::anyhow!("publication accounting poisoned"))?;
+            match pending.entry(publication_id) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(PublicationState::NeverStaged);
+                    true
+                }
+                std::collections::hash_map::Entry::Occupied(_) => false,
+            }
+        };
         let result = send.await;
-        if result.is_err() {
+        if created_entry && result.is_err() {
             self.pending
                 .lock()
                 .map_err(|_| anyhow::anyhow!("publication accounting poisoned"))?
@@ -233,6 +241,31 @@ mod tests {
                 .await?;
             assert_eq!(sent, Err(error));
         }
+        shutdown.finish(true).await
+    }
+
+    #[tokio::test]
+    async fn returned_retry_preserves_preexisting_nacked_identity() -> Result<()> {
+        let shutdown = RoutingShutdown::default();
+        let publication = PublicationId::new();
+        shutdown.publication_finished(publication, false)?;
+
+        let sent = shutdown
+            .admit_publication(publication, async { Err("route full") })
+            .await?;
+        assert_eq!(sent, Err("route full"));
+        let error = shutdown
+            .finish(true)
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("the preexisting NACK must remain unpublished"))?
+            .to_string();
+        assert!(
+            error.contains("1 unpublished identities (never_staged=0, staged_unpublished=0, nacked=1)"),
+            "{error}"
+        );
+
+        shutdown.publication_finished(publication, true)?;
         shutdown.finish(true).await
     }
 
