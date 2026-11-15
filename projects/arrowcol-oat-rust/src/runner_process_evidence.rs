@@ -991,11 +991,13 @@ fn collector_shutdown_drain_evidence(
     }
     if wal_enabled {
         let drained = log_counter(&log.text, "durable_buffer.shutdown.drained", "bundles_drained")
-            .or_else(|| log_counter(&log.text, "durable_buffer.shutdown.drain_deadline", "bundles_drained"))
-            .or_else(|| completed_durable_buffer_shutdowns(&log.text));
+            .or_else(|| log_counter(&log.text, "durable_buffer.shutdown.drain_deadline", "bundles_drained"));
+        let inferred = drained.is_none() && completed_durable_buffer_shutdowns(&log.text).is_some();
+        let drained = drained.or_else(|| inferred.then_some(0));
         let force_dropped = log_counter(&log.text, "quiver.engine.stop", "force_dropped_bundles");
         result["quiver"] = json!({
-            "status": if drained.is_some() && force_dropped.is_some() { "observed" } else { "unavailable" },
+            "status": if drained.is_some() && force_dropped.is_some() { if inferred { "inferred" } else { "observed" } } else { "unavailable" },
+            "bundles_drained_source": drained.map(|_| if inferred { "matched_shutdown_start_complete" } else { "explicit_counter" }),
             "bundles_drained": drained,
             "force_dropped_bundles": force_dropped,
         });

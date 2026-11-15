@@ -5124,13 +5124,12 @@ async fn stop_local_snapshot_writers(config: &OatConfig, platform: &LocalPlatfor
             collector_sigterm_at_unix_ms = u64::try_from(unix_time_ms()).ok();
         }
         if !phase.is_empty() {
-            let stop_grace = if phase_index == 2 {
-                config.collector_stop_grace_seconds
-            } else {
-                30
-            };
             let mut stop = Command::new("docker");
-            stop.args(["stop", "--time", &stop_grace.to_string()]).args(phase);
+            stop.args(local_phase_stop_args(
+                phase_index,
+                config.collector_stop_grace_seconds,
+                phase,
+            ));
             let phase_description = match phase_index {
                 0 => "stop owned local ingress before maintenance and collectors",
                 1 => "stop owned local maintenance before collectors",
@@ -5309,11 +5308,18 @@ fn snapshot_container_outcomes(before: &[Value], after: &[Value], project: &str)
             .and_then(Value::as_i64)
             .context("container exit code missing")?;
         let maintenance_operation_failure = service == "delta-maintenance" && exit == 1;
-        if !(exit == 0 || (was_running && exit == 143) || maintenance_operation_failure)
-            || state.get("OOMKilled").and_then(Value::as_bool) != Some(false)
-        {
-            bail!("owned container {service} failed or was forcibly stopped ({exit}); preserving data");
-        }
+        let role = if service == "delta-maintenance" {
+            ComponentRole::Maintenance
+        } else {
+            ComponentRole::Collector
+        };
+        shutdown_exit_outcome(
+            role,
+            was_running,
+            Some(exit),
+            state.get("OOMKilled").and_then(Value::as_bool) != Some(false),
+        )
+        .with_context(|| format!("owned container {service} failed while stopping"))?;
         let finished_at = state
             .get("FinishedAt")
             .and_then(Value::as_str)
@@ -5407,14 +5413,39 @@ fn build_shutdown_drain_evidence(containers: &[Value]) -> Value {
     })
 }
 
+fn local_phase_stop_args(phase: usize, collector_grace: u64, containers: Vec<String>) -> Vec<String> {
+    let grace = if phase == 2 { collector_grace } else { 300 };
+    let mut args = vec!["stop".to_owned(), "--time".to_owned(), grace.to_string()];
+    args.extend(containers);
+    args
+}
+
+fn local_stop_deadline(collector_grace: u64) -> Duration {
+    Duration::from_secs(collector_grace + 3 * 300 + 120)
+}
+
+async fn stop_then_destroy<T>(
+    stop: impl std::future::Future<Output = Result<T>>,
+    destroy: impl std::future::Future<Output = Result<()>>,
+) -> Result<T> {
+    let stopped = stop.await;
+    let destroyed = destroy.await;
+    match (stopped, destroyed) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(stop), Ok(())) => Err(stop),
+        (Ok(_), Err(destroy)) => Err(destroy),
+        (Err(stop), Err(destroy)) => Err(anyhow::anyhow!("stop failed: {stop:#}; cleanup failed: {destroy:#}")),
+    }
+}
+
 async fn cleanup_local_platform(config: &OatConfig, platform: &LocalPlatform) -> Result<Value> {
     let stop = async {
         tokio::time::timeout(
-            Duration::from_secs(1_440),
+            local_stop_deadline(config.collector_stop_grace_seconds),
             stop_local_snapshot_writers(config, platform),
         )
         .await
-        .context("local stop deadline exceeded; outcome uncertain, retaining owned data")?
+        .context("local stop deadline exceeded; stopped outcome uncertain")?
     };
     let containers = if let Some(destination) = &config.platform.local.snapshot_root {
         crate::local::snapshot_then_cleanup(
@@ -5430,9 +5461,7 @@ async fn cleanup_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
             platform.state_dir.display()
         ))?
     } else {
-        let containers = stop.await?;
-        destroy_local_platform(config, platform).await?;
-        containers
+        stop_then_destroy(stop, destroy_local_platform(config, platform)).await?
     };
     Ok(build_shutdown_drain_evidence(&containers))
 }
@@ -6844,22 +6873,24 @@ async fn stop_aks_deployment_for_cleanup(
     role: ComponentRole,
     grace_seconds: u64,
 ) -> Result<Value> {
-    let deployment: Value = serde_json::from_str(
-        &kubectl(
-            config,
-            vec![
-                "get",
-                "deployment",
-                deployment_name,
-                "--namespace",
-                &config.namespace,
-                "-o",
-                "json",
-            ],
-            None,
-        )
-        .await?,
-    )?;
+    let output = kubectl(
+        config,
+        vec![
+            "get",
+            "deployment",
+            deployment_name,
+            "--namespace",
+            &config.namespace,
+            "--ignore-not-found",
+            "-o",
+            "json",
+        ],
+        None,
+    )
+    .await?;
+    let Some(deployment) = optional_shutdown_deployment(&output)? else {
+        return Ok(json!({"deployment": deployment_name, "status": "nothing_to_stop", "processes": []}));
+    };
     let selector_labels = deployment
         .pointer("/spec/selector/matchLabels")
         .and_then(Value::as_object)
@@ -6879,6 +6910,7 @@ async fn stop_aks_deployment_for_cleanup(
         .join(",");
     let initial_pods = aks_pods_by_selector(config, &selector).await?;
     let mut followers = Vec::new();
+    let mut terminated = HashMap::<String, Value>::new();
     for pod in initial_pods["items"].as_array().into_iter().flatten() {
         let pod_name = pod
             .pointer("/metadata/name")
@@ -6906,6 +6938,9 @@ async fn stop_aks_deployment_for_cleanup(
             let pod_name = pod_name.to_owned();
             let container = container.to_owned();
             let instance_id = format!("{pod_name}/{container}");
+            if let Some(state) = status.pointer("/state/terminated") {
+                terminated.insert(instance_id.clone(), state.clone());
+            }
             let namespace = config.namespace.clone();
             let context = config.kubectl_context.clone();
             let image = status.get("image").and_then(Value::as_str).map(str::to_owned);
@@ -6965,7 +7000,6 @@ async fn stop_aks_deployment_for_cleanup(
     .await
     .with_context(|| format!("scale run-owned deployment {deployment_name} to zero"))?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(grace_seconds.saturating_add(120));
-    let mut terminated = HashMap::<String, Value>::new();
     loop {
         let pods = aks_pods_by_selector(config, &selector).await?;
         for pod in pods["items"].as_array().into_iter().flatten() {
@@ -7017,6 +7051,7 @@ async fn stop_aks_deployment_for_cleanup(
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     let mut processes = Vec::new();
+    let mut outcome_failures = Vec::new();
     for (pod_name, container, was_running, mut task) in followers {
         let instance_id = format!("{pod_name}/{container}");
         let log = match tokio::time::timeout(Duration::from_secs(30), &mut task).await {
@@ -7033,6 +7068,22 @@ async fn stop_aks_deployment_for_cleanup(
         let finished_at = terminated_state
             .and_then(|state| state.get("finishedAt"))
             .and_then(Value::as_str);
+        let outcome = shutdown_exit_outcome(
+            role,
+            was_running,
+            exit_code,
+            terminated_state
+                .and_then(|state| state.get("reason"))
+                .and_then(Value::as_str)
+                == Some("OOMKilled"),
+        );
+        let exit_evidence = match outcome {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                outcome_failures.push(format!("{instance_id}: {error:#}"));
+                json!({"status": "failed", "exit_code": exit_code})
+            }
+        };
         let process_evidence = match (role, log.as_ref()) {
             (ComponentRole::Collector, Some(log)) => collector_shutdown_drain_evidence(
                 log,
@@ -7074,17 +7125,58 @@ async fn stop_aks_deployment_for_cleanup(
             "container": container,
             "was_running": was_running,
             "exit_code": exit_code,
+            "exit_outcome": exit_evidence,
             "finished_at": finished_at,
             "log_complete": log.as_ref().is_some_and(|log| log.complete),
             "drain": (role == ComponentRole::Collector).then_some(process_evidence.clone()),
             "operation_outcomes": (role == ComponentRole::Maintenance).then_some(process_evidence),
         }));
     }
+    if !outcome_failures.is_empty() {
+        bail!(
+            "run-owned deployment {deployment_name} failed during shutdown: {}",
+            outcome_failures.join("; ")
+        );
+    }
     Ok(json!({
         "deployment": deployment_name,
         "role": format!("{role:?}").to_ascii_lowercase(),
         "sigterm_at_unix_ms": sigterm_at_unix_ms,
         "processes": processes,
+    }))
+}
+
+fn optional_shutdown_deployment(output: &str) -> Result<Option<Value>> {
+    if output.trim().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(
+            serde_json::from_str(output).context("parse deployment during shutdown")?,
+        ))
+    }
+}
+
+fn shutdown_exit_outcome(
+    role: ComponentRole,
+    was_running: bool,
+    exit_code: Option<i64>,
+    oom_killed: bool,
+) -> Result<Value> {
+    if oom_killed {
+        bail!("container was OOMKilled during shutdown");
+    }
+    let Some(exit) = exit_code else {
+        return Ok(
+            json!({"status": "unavailable", "reason": "terminated_container_state_not_observed", "exit_code": null}),
+        );
+    };
+    let maintenance_failure = role == ComponentRole::Maintenance && exit == 1;
+    if !(exit == 0 || (was_running && exit == 143) || maintenance_failure) {
+        bail!("container failed or was forcibly stopped ({exit})");
+    }
+    Ok(json!({
+        "status": "observed", "exit_code": exit,
+        "maintenance_operation_failure": maintenance_failure,
     }))
 }
 
@@ -7152,32 +7244,24 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
                     NamespaceCleanupAction::Delete => {
                         let namespace_uid = namespace_uid_for_cleanup(&namespace, platform.namespace_uid.as_deref())?;
                         platform.namespace_uid = Some(namespace_uid.clone());
-                        let stop_evidence = match stop_aks_workloads_in_order(config).await {
-                            Ok(evidence) => {
-                                platform.shutdown_drain_evidence = Some(evidence);
-                                Ok(())
-                            }
-                            Err(error) => Err(error),
-                        };
-                        if let Err(error) = stop_evidence {
-                            failures.push(format!(
-                                "ordered AKS workload shutdown failed; retaining run-owned namespace: {error:#}"
-                            ));
-                        } else if let Err(error) = delete_run_owned_namespace_with_uid(config, &namespace_uid).await {
-                            failures.push(format!(
-                                "delete run-owned AKS namespace with UID precondition: {error:#}"
-                            ));
-                        } else if let Err(error) = wait_for_run_owned_namespace_absence(config).await {
-                            failures.push(format!(
-                                "confirm run-owned AKS namespace absence after deletion: {error:#}"
-                            ));
-                        } else if let Err(error) = write_workload_stop_receipt(config, platform, &namespace_uid).await {
-                            failures.push(format!("write exact-run workload stop receipt: {error:#}"));
-                        } else {
+                        let cleanup = async {
+                            delete_run_owned_namespace_with_uid(config, &namespace_uid)
+                                .await
+                                .context("delete run-owned AKS namespace with UID precondition")?;
+                            wait_for_run_owned_namespace_absence(config)
+                                .await
+                                .context("confirm run-owned AKS namespace absence after deletion")?;
                             namespace_removed = true;
                             platform.namespace_created = false;
                             platform.namespace_create_attempted = false;
                             platform.namespace_uid = None;
+                            write_workload_stop_receipt(config, platform, &namespace_uid)
+                                .await
+                                .context("write exact-run workload stop receipt")
+                        };
+                        match stop_then_destroy(stop_aks_workloads_in_order(config), cleanup).await {
+                            Ok(evidence) => platform.shutdown_drain_evidence = Some(evidence),
+                            Err(error) => failures.push(format!("ordered AKS shutdown/cleanup failed: {error:#}")),
                         }
                     }
                     NamespaceCleanupAction::Ignore => {
@@ -8749,6 +8833,264 @@ mod tests {
         assert!(verify_aks_collector_stop_grace(&json!({}), 300).is_err());
     }
 
+    #[tokio::test]
+    async fn non_snapshot_cleanup_destroys_after_stop_failure_and_keeps_both_errors() -> Result<()> {
+        let actions = std::cell::RefCell::new(Vec::new());
+        let result = stop_then_destroy(
+            async {
+                actions.borrow_mut().push("stop");
+                Err::<(), _>(anyhow::anyhow!("stop failed with exit 137"))
+            },
+            async {
+                actions.borrow_mut().push("destroy");
+                Err(anyhow::anyhow!("owned volume deletion failed"))
+            },
+        )
+        .await;
+        assert_eq!(*actions.borrow(), ["stop", "destroy"]);
+        let error = format!("{:#}", result.err().context("both operations must fail")?);
+        assert!(error.contains("exit 137"));
+        assert!(error.contains("owned volume deletion failed"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_snapshot_cleanup_destroys_after_stop_timeout() -> Result<()> {
+        let destroyed = std::sync::atomic::AtomicBool::new(false);
+        let result = stop_then_destroy(
+            async {
+                tokio::time::timeout(Duration::from_millis(1), std::future::pending::<Result<()>>())
+                    .await
+                    .context("stop deadline exceeded")?
+            },
+            async {
+                destroyed.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
+        assert!(destroyed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(format!("{:#}", result.err().context("stop must time out")?).contains("stop deadline exceeded"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_failure_paths_destroy_owned_resources_and_gate_aks_exits() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = match std::env::var_os("OAT_CLEANUP_FIXTURE_ROOT") {
+            Some(root) => PathBuf::from(root),
+            None => {
+                let root = std::env::temp_dir().join(format!("oat-cleanup-{}", uuid::Uuid::new_v4()));
+                fs::create_dir(&root)?;
+                fs::create_dir(root.join("bin"))?;
+                let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cleanup-platform.ts");
+                for tool in ["docker", "kubectl"] {
+                    let path = root.join("bin").join(tool);
+                    fs::write(
+                        &path,
+                        format!(
+                            "#!/bin/sh\nexec node --import tsx '{}' {tool} \"$@\"\n",
+                            script.display()
+                        ),
+                    )?;
+                    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+                }
+                let mut command = Command::new(std::env::current_exe()?);
+                command.args([
+                    "--exact",
+                    "runner::tests::cleanup_failure_paths_destroy_owned_resources_and_gate_aks_exits",
+                    "--nocapture",
+                ]);
+                command.env("OAT_CLEANUP_FIXTURE_ROOT", &root);
+                let mut paths = vec![root.join("bin")];
+                paths.extend(std::env::split_paths(
+                    &std::env::var_os("PATH").context("fixture PATH")?,
+                ));
+                command.env("PATH", std::env::join_paths(paths)?);
+                let result = tokio::time::timeout(
+                    Duration::from_secs(60),
+                    run_command(command, "isolated cleanup regression fixture"),
+                )
+                .await;
+                fs::remove_dir_all(&root)?;
+                result.context("cleanup regression timed out")??;
+                return Ok(());
+            }
+        };
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.example.json"
+        ))?;
+        config.platform.local.snapshot_root = None;
+        let state = fixture.join("local-state");
+        fs::create_dir(&state)?;
+        let local = LocalPlatform {
+            run_id: "fixture-run".to_owned(),
+            state_dir: state.clone(),
+            environment: HashMap::new(),
+            control_dir: state.clone(),
+            client_progress: std::sync::Mutex::new(HashMap::new()),
+            router_metrics_url: None,
+            qap_url: None,
+            daemon_endpoint: None,
+            shutdown_drain_evidence: None,
+        };
+        fs::write(fixture.join("mode"), "stop_failure")?;
+        let error = cleanup_local_platform(&config, &local)
+            .await
+            .err()
+            .context("local stop must fail")?;
+        assert!(format!("{error:#}").contains("fixture stop listing failed"));
+        assert!(!state.exists(), "non-snapshot state leaked after stop failure");
+        assert!(fixture.join("compose-destroyed").exists(), "Compose down was skipped");
+
+        config.platform.kind = crate::config::OatMode::Aks;
+        config.namespace = "fixture-owned".to_owned();
+        config.kubectl_context = None;
+        config.arrowcol_deployment = "fixture".to_owned();
+        config.dfe_deployment = "fixture".to_owned();
+        config.dfe_container = "dataflow".to_owned();
+        config.tunables.maintenance = None;
+        let runtime = fixture.join("runtime");
+        fs::create_dir(&runtime)?;
+        let ownership = runtime.join("ready.json");
+        fs::write(
+            &ownership,
+            serde_json::to_vec(&json!({
+                "phase": "ready", "runId": "fixture-run", "namespace": config.namespace,
+                "namespaceUid": "fixture-uid", "namespaceOwner": "fixture-owner",
+                "aksId": "/fixture/aks", "server": "https://fixture.invalid",
+            }))?,
+        )?;
+        fs::write(
+            fixture.join("namespace.json"),
+            serde_json::to_vec(&json!({
+                "metadata": {"uid": "fixture-uid",
+                    "labels": {"arrowcol-oat/run-id": "fixture-run", "arrowcol-oat/owner-token": "fixture-owner"},
+                    "annotations": {"arrowcol-oat/run-id": "fixture-run", "arrowcol-oat/owner-token": "fixture-owner"},
+                },
+            }))?,
+        )?;
+        let mut platform = AksPlatform {
+            run_id: "fixture-run".to_owned(),
+            namespace_created: true,
+            namespace_create_attempted: true,
+            namespace_owner_token: "fixture-owner".to_owned(),
+            namespace_uid: Some("fixture-uid".to_owned()),
+            runtime_dir: Some(runtime.clone()),
+            qap_relative_data_root: None,
+            router_metrics_url: None,
+            router_tunnel: None,
+            fic_record_path: None,
+            fic_ready_snapshot_path: Some(ownership),
+            fic_prepare_attempted: true,
+            qap_record_path: None,
+            qap_bind_attempted: true,
+            qap_outcome_unresolved: false,
+            workload_stop_record_path: None,
+            schedule_configmap_name: String::new(),
+            service_account: None,
+            router_yaml: None,
+            shutdown_drain_evidence: None,
+        };
+        let error = cleanup_aks_platform(&config, &mut platform)
+            .await
+            .err()
+            .context("AKS stop must fail")?;
+        let error = format!("{error:#}");
+        assert!(error.contains("fixture deployment stop failed"));
+        assert!(
+            error.contains("QAP cleanup requires"),
+            "QAP cleanup was skipped: {error}"
+        );
+        assert!(
+            error.contains("workload identity cleanup has no"),
+            "FIC cleanup was skipped: {error}"
+        );
+        assert!(!platform.namespace_created);
+        assert!(!fixture.join("namespace.json").exists(), "run-owned namespace leaked");
+        let options: Value = serde_json::from_slice(&fs::read(fixture.join("delete-options.json"))?)?;
+        assert_eq!(options["preconditions"]["uid"], "fixture-uid");
+        let receipt: Value = serde_json::from_slice(&fs::read(runtime.join("workload-stop-receipt.json"))?)?;
+        assert_eq!(receipt["absence_confirmed"], true);
+
+        fs::write(fixture.join("mode"), "absent_deployment")?;
+        let missing = stop_aks_deployment_for_cleanup(&config, "fixture", ComponentRole::Collector, 30).await?;
+        assert_eq!(missing["status"], "nothing_to_stop");
+        fs::write(fixture.join("mode"), "exit_137")?;
+        let error = stop_aks_deployment_for_cleanup(&config, "fixture", ComponentRole::Collector, 30)
+            .await
+            .err()
+            .context("AKS exit 137 must fail")?;
+        assert!(format!("{error:#}").contains("forcibly stopped (137)"));
+        fs::remove_file(fixture.join("pods-read"))?;
+        fs::write(fixture.join("mode"), "missing_exit")?;
+        let evidence = stop_aks_deployment_for_cleanup(&config, "fixture", ComponentRole::Collector, 30).await?;
+        assert_eq!(evidence["processes"][0]["exit_outcome"]["status"], "unavailable");
+        assert_eq!(evidence["processes"][0]["drain"]["exit_code"], Value::Null);
+        Ok(())
+    }
+
+    #[test]
+    fn local_stop_arguments_preserve_noncollector_ceilings() {
+        for (phase, grace) in [(0, 300), (1, 300), (2, 3600), (3, 300)] {
+            assert_eq!(
+                local_phase_stop_args(phase, 3600, vec!["owned-container".to_owned()]),
+                vec![
+                    "stop".to_owned(),
+                    "--time".to_owned(),
+                    grace.to_string(),
+                    "owned-container".to_owned()
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn local_stop_deadline_covers_maximum_collector_grace_and_all_other_phases() {
+        let deadline = local_stop_deadline(3600);
+        assert!(deadline > Duration::from_secs(3600 + 3 * 300));
+        assert!(deadline > Duration::from_secs(1440));
+    }
+
+    #[test]
+    fn absent_shutdown_deployment_is_nothing_to_stop_not_a_parse_failure() -> Result<()> {
+        assert!(optional_shutdown_deployment("")?.is_none());
+        assert!(optional_shutdown_deployment(" \n")?.is_none());
+        assert_eq!(
+            optional_shutdown_deployment(r#"{"spec":{"replicas":1}}"#)?.context("deployment was present")?["spec"]["replicas"],
+            1
+        );
+        assert!(optional_shutdown_deployment("invalid JSON").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn aks_shutdown_exit_gate_rejects_forced_death_and_marks_missing_state_unavailable() -> Result<()> {
+        for role in [
+            ComponentRole::Collector,
+            ComponentRole::Router,
+            ComponentRole::Maintenance,
+        ] {
+            assert!(shutdown_exit_outcome(role, true, Some(137), false).is_err());
+            assert!(shutdown_exit_outcome(role, true, Some(2), false).is_err());
+            assert!(shutdown_exit_outcome(role, true, Some(0), true).is_err());
+            assert!(shutdown_exit_outcome(role, true, None, true).is_err());
+            assert_eq!(shutdown_exit_outcome(role, true, None, false)?["status"], "unavailable");
+            assert_eq!(
+                shutdown_exit_outcome(role, true, Some(143), false)?["status"],
+                "observed"
+            );
+            assert!(shutdown_exit_outcome(role, false, Some(143), false).is_err());
+        }
+        assert!(shutdown_exit_outcome(ComponentRole::Collector, true, Some(1), false).is_err());
+        assert_eq!(
+            shutdown_exit_outcome(ComponentRole::Maintenance, true, Some(1), false)?["maintenance_operation_failure"],
+            true,
+        );
+        Ok(())
+    }
+
     #[test]
     fn collector_shutdown_evidence_records_commits_and_quiver_drain() -> Result<()> {
         let signal = 1_700_000_000_000_u64;
@@ -8782,6 +9124,7 @@ mod tests {
         assert_eq!(evidence["commits_after_sigterm"], 1);
         assert_eq!(evidence["committed_rows_after_sigterm"], 120);
         assert_eq!(evidence["quiver"]["bundles_drained"], 3);
+        assert_eq!(evidence["quiver"]["status"], "observed");
         assert_eq!(evidence["quiver"]["force_dropped_bundles"], 0);
         assert_eq!(evidence["exit_code"], 0);
         Ok(())
@@ -8818,6 +9161,11 @@ mod tests {
 
         assert_eq!(evidence["status"], "observed");
         assert_eq!(evidence["quiver"]["bundles_drained"], 0);
+        assert_eq!(evidence["quiver"]["status"], "inferred");
+        assert_eq!(
+            evidence["quiver"]["bundles_drained_source"],
+            "matched_shutdown_start_complete"
+        );
         assert_eq!(evidence["quiver"]["force_dropped_bundles"], 0);
         Ok(())
     }
