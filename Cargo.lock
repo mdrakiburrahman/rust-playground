@@ -869,6 +869,7 @@ dependencies = [
  "mimalloc",
  "otel-arrow-dfe",
  "otel-arrow-dfe-telemetry",
+ "serde_json",
  "tracing-subscriber",
 ]
 

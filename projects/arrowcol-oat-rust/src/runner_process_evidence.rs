@@ -586,6 +586,10 @@ fn verify_process_configuration(config: &OatConfig, role: ComponentRole, observe
 }
 
 fn inherited_router_log_filter(config: &OatConfig) -> Result<String> {
+    let default_router_yaml_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(|parent| parent.join("loadtest/config/router.yaml"))
+        .context("OAT manifest must have a projects directory")?;
     let router_yaml_path = config
         .platform
         .compose_file
@@ -593,12 +597,7 @@ fn inherited_router_log_filter(config: &OatConfig) -> Result<String> {
         .and_then(|compose_file| std::path::Path::new(compose_file).parent())
         .map(|parent| parent.join("config/router.yaml"))
         .filter(|path| path.is_file())
-        .unwrap_or_else(|| {
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .expect("OAT manifest must have a projects directory")
-                .join("loadtest/config/router.yaml")
-        });
+        .unwrap_or(default_router_yaml_path);
     let content = std::fs::read_to_string(&router_yaml_path)
         .with_context(|| format!("read inherited router configuration {}", router_yaml_path.display()))?;
     let yaml: Value = serde_yaml::from_str(&content).context("parse inherited router YAML")?;
