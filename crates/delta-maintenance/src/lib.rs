@@ -27,6 +27,7 @@ pub const MAX_TABLES: usize = 256;
 /// Maximum concurrently maintained tables.
 pub const MAX_CONCURRENT_TABLES: usize = 16;
 const MAX_HTTP_REQUEST: usize = 8 * 1024;
+const MAX_STALE_DISCOVERY_RETRIES: usize = 2;
 
 /// Maintenance operation, run one at a time per table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, clap::ValueEnum)]
@@ -384,31 +385,33 @@ impl TableDiscovery for FilesystemDiscovery {
     }
 
     fn table(&self, name: &str) -> Result<DiscoveredTable> {
-        let url = self.url(name)?;
-        let probe = DeltaTable::open_for_maintenance_probe_with_limit(&url, self.max_log_files)?;
-        let token = probe.probe_log_token(self.max_log_files)?;
-        let mut cache = self
-            .cache
-            .lock()
-            .map_err(|_| anyhow::anyhow!("property cache poisoned"))?;
-        let properties = match cache.get(name) {
-            Some((cached_token, properties)) if *cached_token == token => properties.clone(),
-            _ => {
-                let properties =
-                    probe.maintenance_properties_with_limits(self.max_log_files, self.max_log_file_bytes)?;
-                ensure_property_token_unchanged(&token, &probe.probe_log_token(self.max_log_files)?)?;
-                if cache.len() >= MAX_TABLES && !cache.contains_key(name) {
-                    cache.clear();
+        retry_stale_table_discovery(name, || {
+            let url = self.url(name)?;
+            let probe = DeltaTable::open_for_maintenance_probe_with_limit(&url, self.max_log_files)?;
+            let token = probe.probe_log_token(self.max_log_files)?;
+            let mut cache = self
+                .cache
+                .lock()
+                .map_err(|_| anyhow::anyhow!("property cache poisoned"))?;
+            let properties = match cache.get(name) {
+                Some((cached_token, properties)) if *cached_token == token => properties.clone(),
+                _ => {
+                    let properties =
+                        probe.maintenance_properties_with_limits(self.max_log_files, self.max_log_file_bytes)?;
+                    ensure_property_token_unchanged(&token, &probe.probe_log_token(self.max_log_files)?)?;
+                    if cache.len() >= MAX_TABLES && !cache.contains_key(name) {
+                        cache.clear();
+                    }
+                    cache.insert(name.into(), (token.clone(), properties.clone()));
+                    properties
                 }
-                cache.insert(name.into(), (token.clone(), properties.clone()));
-                properties
-            }
-        };
-        Ok(DiscoveredTable {
-            name: name.into(),
-            url,
-            properties,
-            log_token: Some(token),
+            };
+            Ok(DiscoveredTable {
+                name: name.into(),
+                url,
+                properties,
+                log_token: Some(token),
+            })
         })
     }
 }
@@ -494,6 +497,37 @@ mod property_discovery_tests {
             report: None,
         };
         assert!(negative_probe_result::<()>(Err(error.into())).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn stale_table_discovery_retries_only_typed_stale_plan() -> Result<()> {
+        let attempts = std::cell::Cell::new(0);
+        let value = retry_stale_table_discovery("test_table", || {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() == 1 {
+                Err(MaintenanceError {
+                    kind: MaintenanceErrorKind::StalePlan,
+                    message: "table advanced during property discovery".into(),
+                    report: None,
+                }
+                .into())
+            } else {
+                Ok(attempts.get())
+            }
+        })?;
+        assert_eq!(value, 2);
+        assert_eq!(attempts.get(), 2);
+
+        let attempts = std::cell::Cell::new(0);
+        let Err(error) = retry_stale_table_discovery::<()>("test_table", || {
+            attempts.set(attempts.get() + 1);
+            Err(anyhow::anyhow!("invalid configuration"))
+        }) else {
+            bail!("non-stale discovery error was swallowed");
+        };
+        assert!(error.to_string().contains("invalid configuration"));
+        assert_eq!(attempts.get(), 1);
         Ok(())
     }
 }
@@ -1241,10 +1275,25 @@ fn run_operation(
 fn negative_probe_result<T>(result: Result<Option<T>>) -> Result<(Option<T>, bool)> {
     match result {
         Ok(report) => Ok((report, false)),
-        Err(error) if error_details(&error).is_some_and(|details| details.kind == MaintenanceErrorKind::StalePlan) => {
-            Ok((None, true))
-        }
+        Err(error) if is_stale_plan(&error) => Ok((None, true)),
         Err(error) => Err(error),
+    }
+}
+
+fn is_stale_plan(error: &anyhow::Error) -> bool {
+    error_details(error).is_some_and(|details| details.kind == MaintenanceErrorKind::StalePlan)
+}
+
+fn retry_stale_table_discovery<T>(table: &str, mut discover: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut retries = 0;
+    loop {
+        match discover() {
+            Err(error) if retries < MAX_STALE_DISCOVERY_RETRIES && is_stale_plan(&error) => {
+                retries += 1;
+                eprintln!("delta-maintenance table discovery became stale; retrying table={table} attempt={retries}");
+            }
+            result => return result,
+        }
     }
 }
 
