@@ -21,6 +21,10 @@ fn unavailable_commits(reason: &str) -> Value {
         "rows": null, "files": null, "input_bytes": null, "parquet_bytes": null,
         "bytes_per_row": null, "compression_ratio": null, "commit_latency_seconds": null,
         "complete_delivery_established": false, "unique_delivered_rows": null,
+        "run_cumulative_output": {
+            "scope": "all_new_ingestion_commits_from_this_cell_including_warmup",
+            "rows": null, "unavailable_reason": reason,
+        },
         "unavailable_reason": reason,
     })
 }
@@ -128,6 +132,39 @@ fn commit_window_output(
         "samples": latencies.len(), "scope": "commit_retry_and_sync_not_encoding_or_admission",
     });
     Ok(result)
+}
+
+fn run_cumulative_output(
+    events: &std::collections::BTreeMap<(String, u64), CommitEvent>,
+    table: &str,
+    unavailable: Option<&str>,
+) -> Result<Value> {
+    if let Some(reason) = unavailable {
+        return Ok(json!({
+            "scope": "all_new_ingestion_commits_from_this_cell_including_warmup",
+            "rows": null,
+            "unavailable_reason": reason,
+        }));
+    }
+    let mut rows = 0_u64;
+    let mut commits = 0_u64;
+    for event in events.values().filter(|event| event.table_name.as_deref() == Some(table)) {
+        let Some(event_rows) = event.rows else {
+            return Ok(json!({
+                "scope": "all_new_ingestion_commits_from_this_cell_including_warmup",
+                "rows": null,
+                "unavailable_reason": "cumulative_commit_rows_unavailable",
+            }));
+        };
+        rows = rows.checked_add(event_rows).context("cumulative commit row overflow")?;
+        commits = commits.checked_add(1).context("cumulative commit count overflow")?;
+    }
+    Ok(json!({
+        "scope": "all_new_ingestion_commits_from_this_cell_including_warmup",
+        "rows": rows,
+        "commits": commits,
+        "complete_delivery_established": false,
+    }))
 }
 
 fn durable_commit_evidence(
@@ -275,12 +312,20 @@ fn durable_commit_evidence(
         }
     }
     for (table, evidence) in &mut result {
+        let canonical_table_name = canonical_dmv_table_name(table)?;
+        let cumulative_unavailable = unavailable.or((!capability_observed)
+            .then_some("ingestion_commit_producer_capability_unavailable"));
         evidence["output_throughput"] = commit_window_output(
             &events,
-            &canonical_dmv_table_name(table)?,
+            &canonical_table_name,
             start,
             end,
-            unavailable.or((!capability_observed).then_some("ingestion_commit_producer_capability_unavailable")),
+            cumulative_unavailable,
+        )?;
+        evidence["run_cumulative_output"] = run_cumulative_output(
+            &events,
+            &canonical_table_name,
+            cumulative_unavailable,
         )?;
     }
     Ok(result)
@@ -372,6 +417,7 @@ mod commit_evidence_tests {
         assert!(table["rows"].is_null());
         assert_eq!(table["output_throughput"]["rows"], 20);
         assert_eq!(table["output_throughput"]["rows_per_second"], 200.0);
+        assert_eq!(table["run_cumulative_output"]["rows"], 40);
         assert!(table["output_throughput"]["unique_delivered_rows"].is_null());
         let zero = durable_commit_evidence(&config, &[log(&[])], Some((100, 200)))?;
         assert_eq!(zero[&config.tables[0]]["output_throughput"]["rows"], 0);

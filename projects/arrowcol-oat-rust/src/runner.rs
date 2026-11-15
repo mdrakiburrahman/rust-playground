@@ -6026,81 +6026,9 @@ async fn apply_deployment(config: &OatConfig, mut deployment: Value) -> Result<(
 }
 
 async fn rollout(config: &OatConfig, name: &str) -> Result<()> {
-    let deployment_json = kubectl(
-        config,
-        vec![
-            "get",
-            "deployment",
-            name,
-            "--namespace",
-            &config.namespace,
-            "-o",
-            "json",
-        ],
-        None,
-    )
-    .await
-    .with_context(|| format!("read Deployment {name} rollout selector"))?;
-    let deployment: Value = serde_json::from_str(&deployment_json).context("parse Deployment rollout status")?;
-    let labels = deployment
-        .pointer("/spec/selector/matchLabels")
-        .and_then(Value::as_object)
-        .context("Deployment selector.matchLabels is missing")?;
-    let selector = labels
-        .iter()
-        .map(|(key, value)| {
-            value
-                .as_str()
-                .map(|value| format!("{key}={value}"))
-                .context("Deployment selector labels must be strings")
-        })
-        .collect::<Result<Vec<_>>>()?
-        .join(",");
-    anyhow::ensure!(!selector.is_empty(), "Deployment selector must not be empty");
-    let desired_replicas = deployment
-        .pointer("/spec/replicas")
-        .and_then(Value::as_u64)
-        .unwrap_or(1);
-    anyhow::ensure!(
-        desired_replicas > 0,
-        "Deployment {name} must request at least one replica"
-    );
-
     let deadline = tokio::time::Instant::now() + Duration::from_secs(config.aks_rollout_timeout_seconds);
     loop {
-        let pods_json = kubectl(
-            config,
-            vec![
-                "get",
-                "pods",
-                "--namespace",
-                &config.namespace,
-                "--selector",
-                &selector,
-                "-o",
-                "json",
-            ],
-            None,
-        )
-        .await
-        .with_context(|| format!("read pods for Deployment {name}"))?;
-        let pods: Value = serde_json::from_str(&pods_json).context("parse Deployment pod state")?;
-        let pod_items = pods
-            .get("items")
-            .and_then(Value::as_array)
-            .context("kubectl pod response has no items array")?;
-        for pod in pod_items {
-            if let Some(reason) = rollout_pod_failure(pod) {
-                let pod_name = pod
-                    .pointer("/metadata/name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown");
-                let diagnostics = rollout_failure_diagnostics(config, name, Some(pod_name)).await;
-                bail!("Deployment {name} pod {pod_name} failed readiness: {reason}\n{diagnostics}");
-            }
-        }
-
-        let status = kubectl(
+        let deployment_json = kubectl(
             config,
             vec![
                 "get",
@@ -6114,18 +6042,86 @@ async fn rollout(config: &OatConfig, name: &str) -> Result<()> {
             None,
         )
         .await
-        .with_context(|| format!("poll Deployment {name} readiness"))?;
-        let current: Value = serde_json::from_str(&status).context("parse Deployment readiness")?;
-        let ready = ["updatedReplicas", "readyReplicas", "availableReplicas"]
+        .with_context(|| format!("read Deployment {name} rollout state"))?;
+        let deployment: Value = serde_json::from_str(&deployment_json).context("parse Deployment rollout state")?;
+        let labels = deployment
+            .pointer("/spec/selector/matchLabels")
+            .and_then(Value::as_object)
+            .context("Deployment selector.matchLabels is missing")?;
+        let selector = labels
             .iter()
-            .all(|field| {
-                current
-                    .pointer(&format!("/status/{field}"))
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0)
-                    >= desired_replicas
-            });
-        if ready {
+            .map(|(key, value)| {
+                value
+                    .as_str()
+                    .map(|value| format!("{key}={value}"))
+                    .context("Deployment selector labels must be strings")
+            })
+            .collect::<Result<Vec<_>>>()?
+            .join(",");
+        anyhow::ensure!(!selector.is_empty(), "Deployment selector must not be empty");
+        let desired_replicas = deployment
+            .pointer("/spec/replicas")
+            .and_then(Value::as_u64)
+            .unwrap_or(1);
+        anyhow::ensure!(
+            desired_replicas > 0,
+            "Deployment {name} must request at least one replica"
+        );
+
+        let replica_sets_json = kubectl(
+            config,
+            vec![
+                "get",
+                "replicasets",
+                "--namespace",
+                &config.namespace,
+                "--selector",
+                &selector,
+                "-o",
+                "json",
+            ],
+            None,
+        )
+        .await
+        .with_context(|| format!("read ReplicaSets for Deployment {name}"))?;
+        let replica_sets: Value = serde_json::from_str(&replica_sets_json).context("parse Deployment ReplicaSets")?;
+        let current_hash = rollout_replica_set_hash(&deployment, &replica_sets);
+        if let Some(hash) = current_hash.as_deref() {
+            let pod_selector = format!("{selector},pod-template-hash={hash}");
+            let pods_json = kubectl(
+                config,
+                vec![
+                    "get",
+                    "pods",
+                    "--namespace",
+                    &config.namespace,
+                    "--selector",
+                    &pod_selector,
+                    "-o",
+                    "json",
+                ],
+                None,
+            )
+            .await
+            .with_context(|| format!("read current-revision pods for Deployment {name}"))?;
+            let pods: Value = serde_json::from_str(&pods_json).context("parse Deployment pod state")?;
+            let pod_items = pods
+                .get("items")
+                .and_then(Value::as_array)
+                .context("kubectl pod response has no items array")?;
+            for pod in pod_items {
+                if let Some(reason) = rollout_pod_failure_for_hash(pod, hash) {
+                    let pod_name = pod
+                        .pointer("/metadata/name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    let diagnostics = rollout_failure_diagnostics(config, name, Some(pod_name)).await;
+                    bail!("Deployment {name} pod {pod_name} failed readiness: {reason}\n{diagnostics}");
+                }
+            }
+        }
+
+        if current_hash.is_some() && rollout_generation_ready(&deployment) {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
@@ -6137,6 +6133,70 @@ async fn rollout(config: &OatConfig, name: &str) -> Result<()> {
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
+}
+
+fn rollout_generation_ready(deployment: &Value) -> bool {
+    let Some(generation) = deployment.pointer("/metadata/generation").and_then(Value::as_u64) else {
+        return false;
+    };
+    let Some(observed_generation) = deployment.pointer("/status/observedGeneration").and_then(Value::as_u64) else {
+        return false;
+    };
+    let Some(desired) = deployment.pointer("/spec/replicas").and_then(Value::as_u64) else {
+        return false;
+    };
+    let status = &deployment["status"];
+    let updated = status["updatedReplicas"].as_u64().unwrap_or(0);
+    let replicas = status["replicas"].as_u64().unwrap_or(0);
+    let available = status["availableReplicas"].as_u64().unwrap_or(0);
+    observed_generation >= generation && updated == desired && replicas == updated && available >= updated
+}
+
+fn rollout_replica_set_hash(deployment: &Value, replica_sets: &Value) -> Option<String> {
+    let revision = deployment
+        .pointer("/metadata/annotations/deployment.kubernetes.io~1revision")?
+        .as_str()?;
+    let deployment_name = deployment.pointer("/metadata/name")?.as_str()?;
+    let deployment_uid = deployment.pointer("/metadata/uid").and_then(Value::as_str);
+    replica_sets.get("items")?.as_array()?.iter().find_map(|replica_set| {
+        let matching_owner = replica_set
+            .pointer("/metadata/ownerReferences")
+            .and_then(Value::as_array)
+            .is_some_and(|owners| {
+                owners.iter().any(|owner| {
+                    owner["kind"].as_str() == Some("Deployment")
+                        && owner["name"].as_str() == Some(deployment_name)
+                        && deployment_uid.is_none_or(|uid| owner["uid"].as_str() == Some(uid))
+                })
+            });
+        if !matching_owner
+            || replica_set
+                .pointer("/metadata/annotations/deployment.kubernetes.io~1revision")
+                .and_then(Value::as_str)
+                != Some(revision)
+        {
+            return None;
+        }
+        replica_set
+            .pointer("/spec/selector/matchLabels/pod-template-hash")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    })
+}
+
+fn rollout_pod_failure_for_hash(pod: &Value, expected_hash: &str) -> Option<String> {
+    if pod
+        .pointer("/metadata/deletionTimestamp")
+        .and_then(Value::as_str)
+        .is_some()
+        || pod
+            .pointer("/metadata/labels/pod-template-hash")
+            .and_then(Value::as_str)
+            != Some(expected_hash)
+    {
+        return None;
+    }
+    rollout_pod_failure(pod)
 }
 
 fn rollout_pod_failure(pod: &Value) -> Option<String> {
@@ -6887,6 +6947,89 @@ fn platform_host_label(kind: crate::config::OatMode) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rollout_readiness_waits_for_current_generation_and_removal_of_old_replicas() {
+        let stale_generation = serde_json::json!({
+            "metadata":{"generation":4},"spec":{"replicas":2},
+            "status":{"observedGeneration":3,"updatedReplicas":2,"replicas":2,"availableReplicas":2}
+        });
+        assert!(!super::rollout_generation_ready(&stale_generation));
+        let old_replicas_remain = serde_json::json!({
+            "metadata":{"generation":4},"spec":{"replicas":2},
+            "status":{"observedGeneration":4,"updatedReplicas":2,"replicas":3,"availableReplicas":2}
+        });
+        assert!(!super::rollout_generation_ready(&old_replicas_remain));
+        let current = serde_json::json!({
+            "metadata":{"generation":4},"spec":{"replicas":2},
+            "status":{"observedGeneration":4,"updatedReplicas":2,"replicas":2,"availableReplicas":2}
+        });
+        assert!(super::rollout_generation_ready(&current));
+    }
+
+    #[test]
+    fn rollout_failure_scan_uses_current_replica_set_and_skips_terminating_pods() {
+        let deployment = serde_json::json!({
+            "metadata":{"name":"router","uid":"deployment-uid","annotations":{"deployment.kubernetes.io/revision":"8"}}
+        });
+        let replica_sets = serde_json::json!({"items":[
+            {"metadata":{"annotations":{"deployment.kubernetes.io/revision":"7"},"ownerReferences":[
+                {"kind":"Deployment","name":"router","uid":"deployment-uid"}]},
+             "spec":{"selector":{"matchLabels":{"pod-template-hash":"old-hash"}}}},
+            {"metadata":{"annotations":{"deployment.kubernetes.io/revision":"8"},"ownerReferences":[
+                {"kind":"Deployment","name":"router","uid":"deployment-uid"}]},
+             "spec":{"selector":{"matchLabels":{"pod-template-hash":"current-hash"}}}}
+        ]});
+        let current_hash = super::rollout_replica_set_hash(&deployment, &replica_sets);
+        assert_eq!(current_hash.as_deref(), Some("current-hash"));
+        let old_crash = serde_json::json!({
+            "metadata":{"labels":{"pod-template-hash":"old-hash"}},
+            "status":{"containerStatuses":[{"name":"router","restartCount":0,
+                "state":{"waiting":{"reason":"CrashLoopBackOff"}}}]}
+        });
+        assert!(super::rollout_pod_failure_for_hash(&old_crash, "current-hash").is_none());
+        let terminating = serde_json::json!({
+            "metadata":{"deletionTimestamp":"2026-11-15T00:00:00Z","labels":{"pod-template-hash":"current-hash"}},
+            "status":{"containerStatuses":[{"name":"router","restartCount":0,
+                "state":{"waiting":{"reason":"CrashLoopBackOff"}}}]}
+        });
+        assert!(super::rollout_pod_failure_for_hash(&terminating, "current-hash").is_none());
+        let new_crash = serde_json::json!({
+            "metadata":{"labels":{"pod-template-hash":"current-hash"}},
+            "status":{"containerStatuses":[{"name":"router","restartCount":0,
+                "state":{"waiting":{"reason":"CrashLoopBackOff"}}}]}
+        });
+        assert!(super::rollout_pod_failure_for_hash(&new_crash, "current-hash").is_some());
+    }
+
+    #[test]
+    fn rollout_pod_failure_detects_expected_states_and_restart_threshold() {
+        for reason in [
+            "CrashLoopBackOff",
+            "Error",
+            "ImagePullBackOff",
+            "ErrImagePull",
+            "CreateContainerConfigError",
+        ] {
+            let pod = serde_json::json!({"status":{"containerStatuses":[{
+                "name":"dataflow","restartCount":0,"state":{"waiting":{"reason":reason}}
+            }]}});
+            let failure = super::rollout_pod_failure(&pod).unwrap_or_default();
+            assert!(failure.contains(reason), "unexpected failure for {reason}: {failure}");
+        }
+        let terminated = serde_json::json!({"status":{"initContainerStatuses":[{
+            "name":"setup","restartCount":0,"state":{"terminated":{"reason":"Error"}}
+        }]}});
+        assert!(super::rollout_pod_failure(&terminated).is_some());
+        let restarted = serde_json::json!({"status":{"containerStatuses":[{
+            "name":"dataflow","restartCount":2,"state":{"running":{}}
+        }]}});
+        assert!(super::rollout_pod_failure(&restarted).is_some_and(|failure| failure.contains("restarted 2 times")));
+        let healthy = serde_json::json!({"status":{"containerStatuses":[{
+            "name":"dataflow","restartCount":1,"state":{"running":{}}
+        }]}});
+        assert!(super::rollout_pod_failure(&healthy).is_none());
+    }
+
     #[test]
     fn selected_aks_stamp_config_is_workspace_contained() -> Result<()> {
         let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");

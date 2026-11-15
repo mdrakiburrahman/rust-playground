@@ -27,6 +27,7 @@
 | Pressure gauge | `arrowcol_router_collector_pressure_gauge_bps{pool,gauge}` reports each admission gauge separately, including the gauge driving the hard-pressure maximum. |
 | Ambiguous outcomes | Continuous mode does not retry unmarked failures and keeps running. Process-cumulative and measurement-window `ambiguous_streams` / `ambiguous_rows` bound uncertain delivery; one-shot and round modes remain terminal. |
 | Attempt counters | `error_rows` and `rejected_rows` count attempts, not unique rows. A retry of the same encoded batch is another attempt. |
+| Counter readback | Rejected, retried, given-up and ambiguous stream/row counters are retained per worker for the measurement-start delta and, where available, the shared measurement window. Older clients default missing counters to zero. |
 
 ## AKS rollout readiness
 
@@ -101,6 +102,7 @@ cargo run --locked --package arrowcol-oat-rust -- --validate-config <config.json
 | Layout application | Table-effective layout records are kept separate from startup policy, including catalog/Parquet overlay precedence. Disabled layout has null inapplicable limits. Records cover observed file construction, not a full-run policy history or proof those files committed. Missing table proof, ambiguous table hashes or truncated policy evidence fail explicitly. |
 | Primary durable output throughput | Newly committed, synced ingestion AddFiles whose producer commit-finished timestamp lies in `[start,end)`, deduplicated by table hash and Delta version. Rows/files/bytes and rows per exact window second include warm-up backlog committed in-window. OPTIMIZE rewrites are excluded. Complete logs and observed ingestion-only telemetry/clock capability are required; known zero differs from missing telemetry. Cross-node clock skew is not measured. |
 | Ingress-cohort commit evidence | Separately retains commits whose ingestion stamps lie wholly within the client window. Prior/warm-up commits are excluded here; mixed-window or uncertain reconciliation yields null plus a reason. This stricter attribution is not the primary output-throughput metric. |
+| Cumulative reconciliation | Compares process-cumulative client completions with this cell's cumulative new-ingestion Delta rows, including warm-up: `completed_rows <= delta_rows <= completed_rows + ambiguous_rows`. Zero ambiguity requires equality. Unknown Delta rows report `reconciliation: unavailable` with a reason. |
 | Delivery completeness | Commit log readback is a bounded observation, not an end-to-end drain barrier. Missing late commits, client retries and replay do not establish unique delivered rows; that field remains null. |
 | Compression | Collector-reported input bytes divided by committed Parquet file bytes (including metadata). This is not a wire ratio or a pure codec-only savings estimate. |
 | Commit latency | Event elapsed time for commit/retry/sync, not encoding, admission or end-to-end visibility. Percentiles use actual observed commit samples only. |

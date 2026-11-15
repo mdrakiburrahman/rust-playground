@@ -820,6 +820,20 @@ mod tests {
     }
 
     #[test]
+    fn aks_rollout_timeout_preserves_main_deadline_and_has_a_bounded_upper_limit() -> Result<()> {
+        let mut config = valid();
+        config.aks_rollout_timeout_seconds = 599;
+        assert!(config.validate().is_err());
+        config.aks_rollout_timeout_seconds = 600;
+        config.validate()?;
+        config.aks_rollout_timeout_seconds = 3_600;
+        config.validate()?;
+        config.aks_rollout_timeout_seconds = 3_601;
+        assert!(config.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
     fn accepts_the_initial_matrix_and_separate_adls_paths() -> Result<()> {
         valid().validate()
     }

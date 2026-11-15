@@ -361,11 +361,10 @@ async fn force_stop_before_first_batch_marks_not_admitted() -> Result<()> {
     )?;
     let response = service.handle_do_put(request).await?;
     drain.force_stop();
-    let status = response
-        .into_inner()
-        .try_collect::<Vec<PutResult>>()
-        .await
-        .expect_err("force stop returned success");
+    let result = response.into_inner().try_collect::<Vec<PutResult>>().await;
+    let Err(status) = result else {
+        return Err(anyhow::anyhow!("force stop returned success"));
+    };
     assert_eq!(
         status
             .metadata()
@@ -402,10 +401,10 @@ async fn force_stop_after_pushed_batch_is_not_retryable() -> Result<()> {
         "first batch must be pushed before shutdown"
     );
     drain.force_stop();
-    let status = task
-        .await
-        .context("join force-stopped response")?
-        .expect_err("force stop returned success");
+    let result = task.await.context("join force-stopped response")?;
+    let Err(status) = result else {
+        return Err(anyhow::anyhow!("force stop returned success"));
+    };
     assert!(
         status.metadata().get(NOT_ADMITTED_METADATA_KEY).is_none(),
         "post-admission shutdown must not be retried"
@@ -866,12 +865,12 @@ struct MockLifecycle {
 impl StreamLifecycle for MockLifecycle {
     async fn push_batch(&mut self, batch: RecordBatch) -> RuntimeResult<()> {
         let push_number = self.state.push_count.fetch_add(1, Ordering::AcqRel) + 1;
-        if push_number == self.state.gate_at_batch {
-            if let Some(gate) = &self.state.gate {
-                gate.entered.add_permits(1);
-                let permit = gate.release.acquire().await.map_err(|_| RuntimeError::internal())?;
-                permit.forget();
-            }
+        if push_number == self.state.gate_at_batch
+            && let Some(gate) = &self.state.gate
+        {
+            gate.entered.add_permits(1);
+            let permit = gate.release.acquire().await.map_err(|_| RuntimeError::internal())?;
+            permit.forget();
         }
         self.state.batches.lock().await.push(batch);
         Ok(())

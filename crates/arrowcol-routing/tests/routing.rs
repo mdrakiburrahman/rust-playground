@@ -236,10 +236,12 @@ async fn pinned_oat_holder_at_hard_pressure_is_a_transient_overload() {
         .await
         .unwrap_or_else(|error| panic!("refresh hard-pressure view: {error}"));
 
-    let error = engine
+    let result = engine
         .route_ingest_for_run(&metadata(), OAT_RUN_CONCURRENT, millis(200_000), millis(100_002))
-        .await
-        .expect_err("hard-pressure pin must not be assigned");
+        .await;
+    let Err(error) = result else {
+        panic!("hard-pressure pin must not be assigned");
+    };
     assert_eq!(error.kind(), RoutingErrorKind::LeaseHolderOverloaded);
 }
 

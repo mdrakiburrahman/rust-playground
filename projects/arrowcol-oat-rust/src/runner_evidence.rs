@@ -101,6 +101,53 @@ impl CellEvidence {
         })
     }
 
+    fn client_cumulative_total(&self, table: &str, field: &str) -> Option<u64> {
+        let reports = self.client_reports.get(table)?;
+        if reports.is_empty() {
+            return None;
+        }
+        reports.iter().try_fold(0_u64, |total, report| {
+            total.checked_add(report.pointer(&format!("/phase_counters/process_cumulative/{field}"))?.as_u64()?)
+        })
+    }
+
+    fn reconciliation(&self, table: &str, durable: Option<&Value>) -> Value {
+        let delta_evidence = durable.and_then(|value| value.get("run_cumulative_output"));
+        let Some(delta_rows) = delta_evidence.and_then(|value| value.get("rows")).and_then(Value::as_u64) else {
+            return json!({
+                "status": "unavailable",
+                "reason": delta_evidence
+                    .and_then(|value| value.get("unavailable_reason"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("cumulative_delta_rows_unavailable"),
+            });
+        };
+        let Some(completed_rows) = self.client_cumulative_total(table, "completed_rows") else {
+            return json!({"status": "unavailable", "reason": "client_cumulative_completed_rows_unavailable"});
+        };
+        let Some(ambiguous_rows) = self.client_cumulative_total(table, "ambiguous_rows") else {
+            return json!({"status": "unavailable", "reason": "client_cumulative_ambiguous_rows_unavailable"});
+        };
+        let Some(maximum_delta_rows) = completed_rows.checked_add(ambiguous_rows) else {
+            return json!({"status": "unavailable", "reason": "client_reconciliation_bound_overflow"});
+        };
+        let lower_bound_met = completed_rows <= delta_rows;
+        let upper_bound_met = delta_rows <= maximum_delta_rows;
+        json!({
+            "status": if lower_bound_met && upper_bound_met { "within_bound" } else { "outside_bound" },
+            "delta_rows": delta_rows,
+            "completed_rows": completed_rows,
+            "ambiguous_rows": ambiguous_rows,
+            "minimum_delta_rows": completed_rows,
+            "maximum_delta_rows": maximum_delta_rows,
+            "lower_bound_met": lower_bound_met,
+            "upper_bound_met": upper_bound_met,
+            "exact_match_required": ambiguous_rows == 0,
+            "exact_match": delta_rows == completed_rows,
+            "scope": "process_cumulative_client_rows_vs_this_cells_new_ingestion_commits_including_warmup",
+        })
+    }
+
     fn for_table(&self, table: &str, client: Option<&ClientMetrics>) -> Value {
         let durable = self.durable_commits.get(table);
         let output = durable.and_then(|value| value.get("output_throughput"));
@@ -108,6 +155,7 @@ impl CellEvidence {
             "version": 1,
             "processes": self.processes,
             "durable_commits": self.durable_commits.get(table),
+            "reconciliation": self.reconciliation(table, durable),
             "commit_window_output_throughput": output,
             "client_phase_reports": self.client_reports.get(table),
             "downstream_status": if self.downstream_comment.is_some() { "unavailable" } else { "observed_or_not_attempted" },
@@ -245,7 +293,70 @@ mod measurement_evidence_tests {
         let public = evidence.for_table("table", None);
         assert_eq!(public["downstream_status"], "unavailable");
         assert!(public["rows"]["delta_committed"].is_null());
+        assert_eq!(public["reconciliation"]["status"], "unavailable");
+        assert_eq!(public["reconciliation"]["reason"], "cumulative_delta_rows_unavailable");
         assert!(public["compression_ratio"].is_null());
+    }
+
+
+    #[test]
+    fn legacy_client_snapshots_default_retry_counters_to_zero() -> Result<()> {
+        let worker = json!({
+            "worker": 0, "attempted_rows": 5, "attempted_bytes": 25,
+            "completed_rows": 5, "completed_bytes": 25, "error_rows": 0,
+            "error_bytes": 0, "cancelled_rows": 0, "cancelled_bytes": 0,
+            "best_effort_streams": 0, "durable_streams": 5, "send_latency_us": null,
+        });
+        let start = json!({
+            "version": 1, "phase": "measurement_start", "scope": "process_cumulative",
+            "elapsed_seconds": 0.0, "workers": [worker.clone()],
+        });
+        let end = json!({
+            "version": 1, "phase": "completed", "scope": "process_cumulative",
+            "elapsed_seconds": 1.0, "workers": [worker],
+            "measurement_window": {
+                "start_unix_ms": 10, "end_unix_ms": 20, "completed_rows": 5,
+                "completed_bytes": 25, "worker_completed_rows": [5], "pilot_window_rows": [],
+                "scope": "per_stream_admission_completion_observed_in_half_open_shared_unix_window",
+            },
+        });
+        let snapshots = [start, end]
+            .into_iter()
+            .map(serde_json::from_value::<ClientCounterSnapshot>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let output = client_snapshot_delta(&snapshots)?;
+        assert_eq!(output["workers"][0]["rejected_rows"], 0);
+        assert_eq!(output["workers"][0]["retried_streams"], 0);
+        assert_eq!(output["measurement_window"]["ambiguous_rows"], 0);
+        assert_eq!(output["process_cumulative"]["ambiguous_rows"], 0);
+        Ok(())
+    }
+
+    #[test]
+    fn reconciliation_uses_cumulative_rows_and_ambiguity_bound() {
+        let mut evidence = CellEvidence::default();
+        evidence.client_reports.insert("table".to_owned(), vec![json!({
+            "phase_counters": {"process_cumulative": {"completed_rows": 10, "ambiguous_rows": 2}}
+        })]);
+        evidence.durable_commits.insert("table".to_owned(), json!({
+            "run_cumulative_output": {"rows": 12}
+        }));
+        let reconciliation = evidence.for_table("table", None)["reconciliation"].clone();
+        assert_eq!(reconciliation["status"], "within_bound");
+        assert_eq!(reconciliation["minimum_delta_rows"], 10);
+        assert_eq!(reconciliation["maximum_delta_rows"], 12);
+        assert_eq!(reconciliation["exact_match_required"], false);
+
+        evidence.client_reports.insert("table".to_owned(), vec![json!({
+            "phase_counters": {"process_cumulative": {"completed_rows": 10, "ambiguous_rows": 0}}
+        })]);
+        evidence.durable_commits.insert("table".to_owned(), json!({
+            "run_cumulative_output": {"rows": 10}
+        }));
+        let reconciliation = evidence.for_table("table", None)["reconciliation"].clone();
+        assert_eq!(reconciliation["status"], "within_bound");
+        assert_eq!(reconciliation["exact_match_required"], true);
+        assert_eq!(reconciliation["exact_match"], true);
     }
 }
 
@@ -262,6 +373,22 @@ struct WorkerCounterSnapshot {
     cancelled_bytes: u64,
     best_effort_streams: u64,
     durable_streams: u64,
+    #[serde(default)]
+    rejected_streams: u64,
+    #[serde(default)]
+    rejected_rows: u64,
+    #[serde(default)]
+    retried_streams: u64,
+    #[serde(default)]
+    retried_rows: u64,
+    #[serde(default)]
+    given_up_streams: u64,
+    #[serde(default)]
+    given_up_rows: u64,
+    #[serde(default)]
+    ambiguous_streams: u64,
+    #[serde(default)]
+    ambiguous_rows: u64,
     send_latency_us: Option<ClientLatency>,
 }
 
@@ -291,6 +418,22 @@ struct ClientMeasurementWindow {
     end_unix_ms: u64,
     completed_rows: u64,
     completed_bytes: u64,
+    #[serde(default)]
+    rejected_streams: u64,
+    #[serde(default)]
+    rejected_rows: u64,
+    #[serde(default)]
+    retried_streams: u64,
+    #[serde(default)]
+    retried_rows: u64,
+    #[serde(default)]
+    given_up_streams: u64,
+    #[serde(default)]
+    given_up_rows: u64,
+    #[serde(default)]
+    ambiguous_streams: u64,
+    #[serde(default)]
+    ambiguous_rows: u64,
     worker_completed_rows: Vec<u64>,
     pilot_window_rows: Vec<u64>,
     scope: String,
@@ -641,11 +784,29 @@ fn client_snapshot_delta(snapshots: &[ClientCounterSnapshot]) -> Result<Value> {
             "cancelled_bytes": difference(worker.cancelled_bytes, before.cancelled_bytes)?,
             "best_effort_streams": difference(worker.best_effort_streams, before.best_effort_streams)?,
             "durable_streams": difference(worker.durable_streams, before.durable_streams)?,
+            "rejected_streams": difference(worker.rejected_streams, before.rejected_streams)?,
+            "rejected_rows": difference(worker.rejected_rows, before.rejected_rows)?,
+            "retried_streams": difference(worker.retried_streams, before.retried_streams)?,
+            "retried_rows": difference(worker.retried_rows, before.retried_rows)?,
+            "given_up_streams": difference(worker.given_up_streams, before.given_up_streams)?,
+            "given_up_rows": difference(worker.given_up_rows, before.given_up_rows)?,
+            "ambiguous_streams": difference(worker.ambiguous_streams, before.ambiguous_streams)?,
+            "ambiguous_rows": difference(worker.ambiguous_rows, before.ambiguous_rows)?,
             "process_cumulative_send_latency_us": worker.send_latency_us,
         }));
     }
+    let cumulative_total = |field: fn(&WorkerCounterSnapshot) -> u64| -> Result<u64> {
+        end.workers
+            .iter()
+            .try_fold(0_u64, |total, worker| total.checked_add(field(worker)))
+            .context("client cumulative counter overflow")
+    };
     Ok(json!({
         "scope": "measurement_start_to_completed_snapshot_delta_not_unique_delivery",
+        "process_cumulative": {
+            "completed_rows": cumulative_total(|worker| worker.completed_rows)?,
+            "ambiguous_rows": cumulative_total(|worker| worker.ambiguous_rows)?,
+        },
         "elapsed_seconds": end.elapsed_seconds - start.elapsed_seconds,
         "completion_semantics": "validated_admission_response_not_delta_commit",
         "bytes_semantics": "sum_of_protobuf_flight_data_encoded_lengths_excluding_grpc_http2",

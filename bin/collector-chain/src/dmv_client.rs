@@ -1115,13 +1115,14 @@ impl PreparedClient {
                     ))
                     .await;
                 }
-                Err(_) => {
+                Err(error) if is_ambiguous_continuous_error(&error) => {
                     let counters = &self.counters[worker];
                     counters.ambiguous_streams.fetch_add(1, Ordering::Relaxed);
                     counters.ambiguous_rows.fetch_add(batch.rows, Ordering::Relaxed);
                     measurement.record_ambiguous(batch.rows, unix_ms()?);
                     return Ok(true);
                 }
+                Err(error) => return Err(error),
             }
         }
         unreachable!("validated stream retry attempt count is positive")
@@ -1148,6 +1149,23 @@ impl PreparedClient {
             }).collect::<Vec<_>>(),
         })
     }
+}
+
+fn is_ambiguous_continuous_error(error: &anyhow::Error) -> bool {
+    let Some(status) = error.chain().find_map(|cause| cause.downcast_ref::<tonic::Status>()) else {
+        return true;
+    };
+    matches!(
+        status.code(),
+        tonic::Code::Unavailable
+            | tonic::Code::DeadlineExceeded
+            | tonic::Code::Cancelled
+            | tonic::Code::ResourceExhausted
+            | tonic::Code::Aborted
+            | tonic::Code::Internal
+            | tonic::Code::Unknown
+            | tonic::Code::DataLoss
+    )
 }
 
 fn is_not_admitted(error: &anyhow::Error) -> bool {
@@ -1472,6 +1490,38 @@ mod tests {
         let ambiguous = anyhow::Error::new(tonic::Status::unavailable("upstream failure"));
         assert!(is_not_admitted(&marked));
         assert!(!is_not_admitted(&ambiguous));
+    }
+
+    #[test]
+    fn continuous_errors_keep_definitive_statuses_terminal_and_count_only_ambiguous_outcomes() {
+        for code in [
+            tonic::Code::Unavailable,
+            tonic::Code::DeadlineExceeded,
+            tonic::Code::Cancelled,
+            tonic::Code::ResourceExhausted,
+            tonic::Code::Aborted,
+            tonic::Code::Internal,
+            tonic::Code::Unknown,
+            tonic::Code::DataLoss,
+        ] {
+            let error = anyhow::Error::new(tonic::Status::new(code, "ambiguous delivery"));
+            assert!(is_ambiguous_continuous_error(&error), "{code:?} must be ambiguous");
+        }
+        for code in [
+            tonic::Code::FailedPrecondition,
+            tonic::Code::InvalidArgument,
+            tonic::Code::Unauthenticated,
+            tonic::Code::PermissionDenied,
+            tonic::Code::NotFound,
+            tonic::Code::Unimplemented,
+            tonic::Code::AlreadyExists,
+            tonic::Code::OutOfRange,
+        ] {
+            let error = anyhow::Error::new(tonic::Status::new(code, "definitive rejection"));
+            assert!(!is_ambiguous_continuous_error(&error), "{code:?} must remain terminal");
+        }
+        let transport = anyhow::anyhow!("connection reset without a gRPC status");
+        assert!(is_ambiguous_continuous_error(&transport));
     }
 
     #[test]
