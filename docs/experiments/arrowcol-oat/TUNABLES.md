@@ -54,11 +54,11 @@ For the planned zero-interval comparison, keep Profile A unpooled (`sql_pool_max
 
 | Measurement | Interpretation |
 | --- | --- |
-| Supplied local/AKS quick profiles | 10-second warm-up, 30-second measurement, unchanged load. Shipped OAT YAML uses `batching.max_age: 5s` and `commit.batch_window: 2s`; injected settings may change these timings. |
+| Supplied local/AKS quick profiles | 10-second warm-up, 30-second measurement, unchanged load, explicit 300-second post-client reconciliation budget. Shipped OAT YAML uses `batching.max_age: 5s` and `commit.batch_window: 2s`; injected settings may change these timings. |
 | Admission rows/s | Client completions within the exact shared measurement window divided by its duration; not durable output. |
 | Commit-window rows/s | Rows in new ingestion commits finished within that exact window; not a client cohort and not post-window settling. |
 | Zero commit-window output | A short run may admit rows before commits finish. Known zero remains zero in the summary/table/result with an explanation; a dash means unavailable evidence. Size-triggered flushes and warm-up backlog can still produce commits in short windows. |
-| Whole-cell reconciliation | Compare process-cumulative completed rows with committed Delta rows after settling, including warm-up. This is separate from either window rate. |
+| Whole-cell reconciliation | Compare process-cumulative completed rows with committed Delta rows after settling, including warm-up. This is separate from either window rate. The quick profiles extend observation of continuing backlog commits, not the measurement window; the generic settle default remains 120 seconds. |
 
 Short admission/smoke runs remain supported; duration below a flush timer alone
 does not make a configuration invalid. Increase the measurement window when
