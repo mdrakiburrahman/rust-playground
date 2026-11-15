@@ -214,7 +214,8 @@ impl OatConfig {
             .context("OAT client Job lifetime budget overflow")?;
         let minimum_pin_ttl_ms = client_job_lifetime_seconds
             .checked_add(PIN_INIT_SETUP_TIMEOUT_SECONDS)
-            .context("OAT pin initialization lifetime budget overflow")?
+            .and_then(|seconds| seconds.checked_add(self.reconciliation_settle_timeout_seconds))
+            .context("OAT pin initialization and reconciliation settle lifetime budget overflow")?
             .checked_mul(1_000)
             .context("OAT run pin lifetime budget overflow")?;
         Ok(RunTimingBudget {
@@ -273,7 +274,7 @@ impl OatConfig {
         let minimum_pin_ttl_ms = self.timing_budget()?.minimum_pin_ttl_ms;
         if !(60_000..=86_400_000).contains(&self.run_pin_ttl_ms) || self.run_pin_ttl_ms < minimum_pin_ttl_ms {
             bail!(
-                "run_pin_ttl_ms must cover pin setup, readiness, QAP preparation, schedule delivery, workload, and Job cleanup margin, and be between 60,000 and 86,400,000"
+                "run_pin_ttl_ms must cover pin setup, readiness, QAP preparation, schedule delivery, workload, reconciliation settling and Job cleanup margin, and be between 60,000 and 86,400,000"
             );
         }
         if self.pilot_mode
@@ -969,7 +970,7 @@ mod tests {
         config.qap_timeout_seconds = 300;
         config.warmup_seconds = 300;
         config.measure_seconds = 600;
-        config.run_pin_ttl_ms = 3_660_000;
+        config.run_pin_ttl_ms = 3_780_000;
         config.validate()?;
 
         config.run_pin_ttl_ms -= 1;

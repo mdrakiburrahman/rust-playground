@@ -88,6 +88,13 @@ fn commit_window_output(
         .values()
         .filter(|event| event.table_name.as_deref() == Some(table))
     {
+        let Some(finished) = event.finished_at_unix_ms.and_then(|time| u64::try_from(time).ok()) else {
+            result["unavailable_reason"] = json!("commit_finish_time_unavailable");
+            return Ok(result);
+        };
+        if finished < start || finished >= end {
+            continue;
+        }
         if let Some(cell_start) = cell_start_unix_ms {
             let (Some(first), Some(last)) = (event.min_ingested_at_ms, event.max_ingested_at_ms) else {
                 result["unavailable_reason"] = json!("commit_ingress_boundary_unavailable");
@@ -100,13 +107,6 @@ fn commit_window_output(
                 result["unavailable_reason"] = json!("commit_crosses_cell_ingress_boundary");
                 return Ok(result);
             }
-        }
-        let Some(finished) = event.finished_at_unix_ms.and_then(|time| u64::try_from(time).ok()) else {
-            result["unavailable_reason"] = json!("commit_finish_time_unavailable");
-            return Ok(result);
-        };
-        if finished < start || finished >= end {
-            continue;
         }
         let (Some(event_rows), Some(event_files), Some(event_input), Some(event_bytes), Some(elapsed)) = (
             event.rows,
