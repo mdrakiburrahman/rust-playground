@@ -41,12 +41,9 @@ fn maintenance_runtime(config: &OatConfig) -> Result<Option<Value>> {
 
 fn maintenance_arguments(config: &OatConfig, catalog_endpoint: &str) -> Result<Vec<String>> {
     let policy = maintenance_runtime(config)?.context("maintenance is disabled")?;
-    let interval = config
-        .tunables
-        .maintenance
-        .as_ref()
-        .and_then(|settings| settings.interval_secs)
-        .unwrap_or(60);
+    let settings = config.tunables.maintenance.as_ref().context("maintenance settings missing")?;
+    let interval = settings.interval_secs.unwrap_or(60);
+    let max_idle_backoff = settings.max_idle_backoff_secs.unwrap_or(interval);
     let mut args = match config.platform.kind {
         crate::config::OatMode::Local => vec![
             "--root".to_owned(),
@@ -61,7 +58,7 @@ fn maintenance_arguments(config: &OatConfig, catalog_endpoint: &str) -> Result<V
         "--interval-secs".to_owned(),
         interval.to_string(),
         "--max-idle-backoff-secs".to_owned(),
-        interval.to_string(),
+        max_idle_backoff.to_string(),
         "--listen".to_owned(),
         "0.0.0.0:9467".to_owned(),
     ]);
@@ -464,12 +461,12 @@ mod maintenance_topology_tests {
         ))?;
         assert!(maintenance_runtime(&config)?.is_none());
         config.tunables = serde_json::from_value(json!({"maintenance":{
-            "enabled":true,"operations":["optimize"],"interval_secs":131,"target_file_mib":17
+            "enabled":true,"operations":["optimize"],"interval_secs":131,"max_idle_backoff_secs":144,"target_file_mib":17
         }}))?;
         let args = maintenance_arguments(&config, "http://arrowcol-catalog:8817")?;
         assert!(!args.iter().any(|arg| arg == "--apply" || arg == "--catalog-endpoint"));
         assert!(args.windows(2).any(|pair| pair == ["--root", "file:///tmp/arrowcol-stress/dataflow"]));
-        assert!(args.windows(2).any(|pair| pair == ["--max-idle-backoff-secs", "131"]));
+        assert!(args.windows(2).any(|pair| pair == ["--max-idle-backoff-secs", "144"]));
         assert!(args.windows(2).any(|pair| pair == ["--interval-secs", "131"]));
         let table_name = canonical_dmv_table_name(&config.tables[0])?;
         assert!(args.windows(2).any(|pair| pair == ["--table", table_name.as_str()]));
