@@ -1497,10 +1497,8 @@ fn validate_maintenance(maintenance: &MaintenanceTunables) -> Result<()> {
         bail!("maintenance.commit_budget_secs must not exceed 3600 seconds");
     }
     let idle_backoff = maintenance.max_idle_backoff_secs.unwrap_or(3_600);
-    if maintenance
-        .interval_secs
-        .is_some_and(|interval| interval > idle_backoff)
-    {
+    let interval = maintenance.interval_secs.unwrap_or(60);
+    if interval > idle_backoff {
         bail!("maintenance.max_idle_backoff_secs must be at least interval_secs");
     }
     let catalog_threads = maintenance.catalog_runtime_threads.unwrap_or(2);
@@ -2595,6 +2593,21 @@ mod tests {
             Ok(MaintenanceInputReadStrategy::Range)
         ));
         assert!(serde_json::from_str::<MaintenanceInputReadStrategy>("\"invalid\"").is_err());
+    }
+
+    #[test]
+    fn enabled_maintenance_backoff_covers_default_interval() {
+        let invalid = Tunables {
+            maintenance: Some(MaintenanceTunables {
+                enabled: Some(true),
+                operations: Some(vec![MaintenanceOperation::Optimize]),
+                max_idle_backoff_secs: Some(30),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(error_text(invalid.validate())
+            .contains("maintenance.max_idle_backoff_secs must be at least interval_secs"));
     }
 
     #[test]
