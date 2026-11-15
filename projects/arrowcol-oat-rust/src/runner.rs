@@ -2118,7 +2118,7 @@ async fn run_matrix_cell(
         cell_start_unix_ms,
     )
     .await?;
-    client_run.evidence.processes = Some(process_evidence(config, &logs)?);
+    client_run.evidence.processes = Some(process_evidence_for_cell(config, &logs, &baseline_logs)?);
     client_run.evidence.durable_commits = durable_commits;
     let pinning_ok = client_run.pinning.violation.is_none()
         && client_run.pinning.verification_error.is_none()
@@ -4420,7 +4420,8 @@ fn snapshot_container_outcomes(before: &[Value], after: &[Value], project: &str)
             .get("ExitCode")
             .and_then(Value::as_i64)
             .context("container exit code missing")?;
-        if !(exit == 0 || (was_running && exit == 143))
+        let maintenance_operation_failure = service == "delta-maintenance" && exit == 1;
+        if !(exit == 0 || (was_running && exit == 143) || maintenance_operation_failure)
             || state.get("OOMKilled").and_then(Value::as_bool) != Some(false)
         {
             bail!("owned container {service} failed or was forcibly stopped ({exit}); preserving data");
@@ -4435,6 +4436,8 @@ fn snapshot_container_outcomes(before: &[Value], after: &[Value], project: &str)
         writers.push(json!({
             "id": id, "service": service, "was_running": was_running, "exit_code": exit,
             "finished_at": finished_at, "oom_killed": state["OOMKilled"],
+            "maintenance_operation_failure": maintenance_operation_failure,
+            "comment": maintenance_operation_failure.then_some("Maintenance operation errors are retained by error_kind in the cell evidence; raw error text is omitted."),
         }));
     }
     Ok(writers)
@@ -7481,6 +7484,52 @@ mod tests {
         assert!(snapshot_container_outcomes(&already_failed, &after, project).is_err());
         Ok(())
     }
+    #[test]
+    fn snapshot_stop_accepts_only_maintenance_exit_one() -> Result<()> {
+        let project = "owned-maintenance-run";
+        let services = ["delta-maintenance", "dataflow-1"];
+        let before = services
+            .iter()
+            .enumerate()
+            .map(|(index, service)| {
+                json!({
+                    "Id": format!("maintenance-id-{index}"),
+                    "Config": {"Labels": {
+                        "com.docker.compose.project": project,
+                        "com.docker.compose.service": service
+                    }},
+                    "State": {"Running": true}
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut after = before.clone();
+        for container in &mut after {
+            container["State"] = json!({
+                "Running": false, "Paused": false, "Dead": false, "Status": "exited",
+                "Error": "", "ExitCode": 0, "OOMKilled": false,
+                "FinishedAt": "2026-01-01T00:00:00Z"
+            });
+        }
+
+        after[0]["State"]["ExitCode"] = json!(1);
+        let outcomes = snapshot_container_outcomes(&before, &after, project)?;
+        assert_eq!(outcomes[0]["maintenance_operation_failure"], true);
+        assert!(outcomes[0]["comment"].as_str().is_some());
+
+        for exit in [2, 137] {
+            let mut invalid = after.clone();
+            invalid[0]["State"]["ExitCode"] = json!(exit);
+            assert!(snapshot_container_outcomes(&before, &invalid, project).is_err());
+        }
+        let mut invalid = after.clone();
+        invalid[0]["State"]["OOMKilled"] = json!(true);
+        assert!(snapshot_container_outcomes(&before, &invalid, project).is_err());
+        invalid = after.clone();
+        invalid[1]["State"]["ExitCode"] = json!(1);
+        assert!(snapshot_container_outcomes(&before, &invalid, project).is_err());
+        Ok(())
+    }
+
     include!("runner_publication_tests.rs");
 
     fn router_yaml_for_pin_test(run_id: &str) -> String {

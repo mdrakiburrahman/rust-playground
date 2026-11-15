@@ -249,6 +249,8 @@ fn cell_scoped_commit_logs(current: &[ProcessLog], baseline: &[ProcessLog]) -> R
             image_id: log.image_id.clone(),
             source_revision: log.source_revision.clone(),
             complete,
+            stdout: log.stdout.clone(),
+            stderr: log.stderr.clone(),
             text,
         });
     }
@@ -454,6 +456,8 @@ mod commit_evidence_tests {
             image_id: None,
             source_revision: None,
             complete: true,
+            stdout: String::new(),
+            stderr: String::new(),
             text: format!(
                 "arrowcol_effective_config {{\"commit_telemetry\":{{\"schema_version\":1,\"scope\":\"new_ingestion_addfiles_after_sync\",\"clock\":\"system_unix_ms\"}}}}\n{}",
                 events

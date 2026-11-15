@@ -338,6 +338,18 @@ fn verify_maintenance_controls(config: &OatConfig, observed: &Value) -> Result<(
     Ok(())
 }
 
+fn sanitized_maintenance_error_kind(kind: Option<&str>) -> String {
+    kind.filter(|kind| {
+        !kind.is_empty()
+            && kind.len() <= 64
+            && kind
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    })
+    .unwrap_or("unknown")
+    .to_owned()
+}
+
 fn maintenance_table_evidence(config: &OatConfig, text: &str) -> Result<Value> {
     let mut tables = serde_json::Map::new();
     for line in text
@@ -377,6 +389,9 @@ fn maintenance_table_evidence(config: &OatConfig, text: &str) -> Result<Value> {
     }
     let mut reports = Vec::new();
     let mut dropped = 0_u64;
+    let mut operation_count = 0_u64;
+    let mut operation_error_count = 0_u64;
+    let mut error_kind_counts = serde_json::Map::new();
     for line in text.lines().filter(|line| line.starts_with('{')) {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -403,10 +418,18 @@ fn maintenance_table_evidence(config: &OatConfig, text: &str) -> Result<Value> {
         {
             bail!("maintenance operation receipt disagrees with explicit operation/apply authorization");
         }
-        if value.get("error").is_some_and(|error| !error.is_null())
-            || value.get("error_kind").is_some_and(|error| !error.is_null())
-        {
+        operation_count = operation_count.saturating_add(1);
+        let raw_error_kind = value.get("error_kind").and_then(Value::as_str);
+        let operation_failed = value.get("error").is_some_and(|error| !error.is_null())
+            || value.get("error_kind").is_some_and(|error| !error.is_null());
+        if operation_failed && config.platform.kind == crate::config::OatMode::Aks {
             bail!("allowlisted maintenance operation failed; inspect run-owned private operation logs");
+        }
+        let error_kind = operation_failed.then(|| sanitized_maintenance_error_kind(raw_error_kind));
+        if let Some(kind) = &error_kind {
+            operation_error_count = operation_error_count.saturating_add(1);
+            let count = error_kind_counts.entry(kind.clone()).or_insert_with(|| json!(0));
+            *count = json!(count.as_u64().unwrap_or(0).saturating_add(1));
         }
         let mut counts = serde_json::Map::new();
         for field in [
@@ -438,6 +461,7 @@ fn maintenance_table_evidence(config: &OatConfig, text: &str) -> Result<Value> {
         reports.push(json!({
             "table": table, "operation": value["operation"], "negative_probe": value["negative_probe"].as_bool(),
             "mutation_mode": if value["applied"] == true { "apply_authorized_not_proof_of_mutation" } else { "dry_run_predicted_not_applied" },
+            "operation_failed": operation_failed, "error_kind": error_kind,
             "consumer_reported_counts": counts, "duration_ms": value["duration_ms"].as_u64(),
             "report_outcome": value.pointer("/report/outcome").and_then(Value::as_str),
         }));
@@ -445,6 +469,17 @@ fn maintenance_table_evidence(config: &OatConfig, text: &str) -> Result<Value> {
     Ok(json!({
         "source":"validated_consumer_per_table_policy", "precedence":"table_properties_override_process_defaults", "tables":tables,
         "operation_reports": reports, "operation_reports_dropped": dropped,
+        "operation_outcomes": {
+            "scope": "process_lifetime",
+            "operation_count": operation_count,
+            "error_count": operation_error_count,
+            "error_kind_counts": error_kind_counts,
+            "comment": if operation_error_count == 0 {
+                "No maintenance operation errors were observed in the process log."
+            } else {
+                "Maintenance failures are counted by sanitized error_kind; raw error text is omitted."
+            },
+        },
         "rewrite_proof_scope": "consumer_operation_receipts_not_independent_physical_file_validation",
         "operation_report_timing_scope": "process_lifetime_including_warmup_and_drain_not_shared_measurement_window",
     }))
@@ -459,6 +494,7 @@ mod maintenance_topology_tests {
         let mut config: OatConfig = serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
         ))?;
+        config.platform.kind = crate::config::OatMode::Local;
         assert!(maintenance_runtime(&config)?.is_none());
         config.tunables = serde_json::from_value(json!({"maintenance":{
             "enabled":true,"operations":["optimize"],"interval_secs":131,"max_idle_backoff_secs":144,"target_file_mib":17
@@ -543,11 +579,23 @@ mod maintenance_topology_tests {
         );
         assert!(!reports.to_string().contains("private-object-path"));
         let mut failed = report.clone();
-        failed["error_kind"] = json!("commit");
-        assert!(maintenance_table_evidence(&config, &format!("{text}{failed}\n")).is_err());
-        failed = report;
+        failed["error_kind"] = json!("commit_budget_exhausted");
+        failed["error"] = json!("private operation error");
+        let failure_evidence = maintenance_table_evidence(&config, &format!("{text}{failed}\n"))?;
+        assert_eq!(failure_evidence["operation_outcomes"]["error_count"], 1);
+        assert_eq!(
+            failure_evidence["operation_outcomes"]["error_kind_counts"]["commit_budget_exhausted"],
+            1
+        );
+        assert!(failure_evidence["operation_outcomes"]["comment"].as_str().is_some());
+        assert!(!failure_evidence.to_string().contains("private operation error"));
+        failed = report.clone();
         failed["applied"] = json!(true);
         assert!(maintenance_table_evidence(&config, &format!("{text}{failed}\n")).is_err());
+        config.platform.kind = crate::config::OatMode::Aks;
+        let mut aks_failure = report.clone();
+        aks_failure["error_kind"] = json!("commit_budget_exhausted");
+        assert!(maintenance_table_evidence(&config, &format!("{text}{aks_failure}\n")).is_err());
         for (variable, expected) in [
             ("CATALOG_RUNTIME_THREADS", json!(3)),
             ("CATALOG_RPC_TIMEOUT_SECS", json!(17)),

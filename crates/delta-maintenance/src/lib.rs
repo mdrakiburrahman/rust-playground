@@ -1625,6 +1625,13 @@ pub fn run(settings: &Settings, metrics: &Metrics, cancel: &Arc<AtomicBool>) -> 
     run_with_discovery(settings, &source, metrics, cancel)
 }
 
+fn cycle_results_are_healthy(results: &[OperationResult], signal_cancellation_requested: bool) -> bool {
+    results.iter().all(|result| {
+        result.error_kind.is_none()
+            || (signal_cancellation_requested && result.error_kind == Some(MaintenanceErrorKind::Cancelled.label()))
+    })
+}
+
 /// Run the same bounded scheduler over catalog-client discovery.
 #[must_use]
 pub fn run_with_discovery(
@@ -1652,7 +1659,7 @@ pub fn run_with_discovery(
             }
         };
         cycles += 1;
-        healthy &= results.iter().all(|result| result.error_kind.is_none());
+        healthy &= cycle_results_are_healthy(&results, cancel.load(Ordering::SeqCst));
         let pending_count = match discovery.pending_tables() {
             Ok(mut pending) => {
                 pending.sort();
@@ -1701,4 +1708,34 @@ pub fn run_with_discovery(
         }
     }
     healthy
+}
+
+#[cfg(test)]
+mod signal_cancellation_tests {
+    use super::*;
+
+    fn result_with_error_kind(error_kind: Option<&'static str>) -> OperationResult {
+        OperationResult {
+            table: "test_table".to_owned(),
+            operation: Operation::Optimize,
+            applied: false,
+            negative_probe: false,
+            report: None,
+            optimize: None,
+            vacuum: None,
+            error_kind,
+            error: error_kind.map(|_| "operation failed".to_owned()),
+            duration_ms: 0,
+        }
+    }
+
+    #[test]
+    fn signal_cancellation_is_healthy_without_masking_operation_failures() {
+        let cancelled = result_with_error_kind(Some(MaintenanceErrorKind::Cancelled.label()));
+        assert!(cycle_results_are_healthy(std::slice::from_ref(&cancelled), true));
+        assert!(!cycle_results_are_healthy(std::slice::from_ref(&cancelled), false));
+
+        let failed = result_with_error_kind(Some("commit_budget_exhausted"));
+        assert!(!cycle_results_are_healthy(std::slice::from_ref(&failed), true));
+    }
 }

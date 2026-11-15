@@ -6,6 +6,8 @@ struct ProcessLog {
     image_id: Option<String>,
     source_revision: Option<String>,
     complete: bool,
+    stdout: String,
+    stderr: String,
     text: String,
 }
 
@@ -484,6 +486,14 @@ fn collector_layout_records(config: &OatConfig, text: &str) -> Result<Vec<Value>
 }
 
 fn process_evidence(config: &OatConfig, logs: &[ProcessLog]) -> Result<Value> {
+    process_evidence_for_cell(config, logs, &[])
+}
+
+fn process_evidence_for_cell(
+    config: &OatConfig,
+    logs: &[ProcessLog],
+    baseline_logs: &[ProcessLog],
+) -> Result<Value> {
     let mut result = Vec::new();
     for role in [
         ComponentRole::Router,
@@ -513,6 +523,8 @@ fn process_evidence(config: &OatConfig, logs: &[ProcessLog]) -> Result<Value> {
             } else {
                 None
             };
+            let maintenance_outcomes = matches!(role, ComponentRole::Maintenance)
+                .then(|| maintenance_cell_outcome_evidence(log, baseline_logs));
             let layout_tables = if matches!(role, ComponentRole::Collector) {
                 Some(collector_layout_records(config, &log.text)?)
             } else {
@@ -546,6 +558,7 @@ fn process_evidence(config: &OatConfig, logs: &[ProcessLog]) -> Result<Value> {
                 "source_revision": log.source_revision,
                 "log_complete": log.complete,
                 "maintenance_table_policies": maintenance_tables,
+                "maintenance_operation_outcomes": maintenance_outcomes,
                 "layout_table_policies": layout_tables,
                 "layout_policy_scope": "startup_process_policy_only_table_properties_and_parquet_overlays_may_override",
             }));
@@ -578,6 +591,62 @@ fn process_evidence(config: &OatConfig, logs: &[ProcessLog]) -> Result<Value> {
         }
     }
     Ok(json!(result))
+}
+
+fn maintenance_cell_outcome_evidence(log: &ProcessLog, baseline_logs: &[ProcessLog]) -> Value {
+    let unavailable = |comment| json!({
+        "status": "unavailable",
+        "cell_scope": "unavailable",
+        "operation_count": null,
+        "error_kind_counts": null,
+        "comment": comment,
+    });
+    let Some(baseline) = baseline_logs.iter().find(|baseline| {
+        baseline.role == ComponentRole::Maintenance && baseline.instance_id == log.instance_id
+    }) else {
+        return unavailable("No matching maintenance process baseline was available for this cell.");
+    };
+    if !baseline.complete || !log.complete {
+        return unavailable("Maintenance process logs were truncated, so cell outcomes could not be isolated.");
+    }
+    let Some(stdout) = log.stdout.strip_prefix(&baseline.stdout) else {
+        return unavailable("Maintenance stdout changed or rotated, so cell outcomes could not be isolated.");
+    };
+    let Some(stderr) = log.stderr.strip_prefix(&baseline.stderr) else {
+        return unavailable("Maintenance stderr changed or rotated, so cell outcomes could not be isolated.");
+    };
+    let appended = format!("{stdout}\n{stderr}");
+    let mut operation_count = 0_u64;
+    let mut error_kind_counts = serde_json::Map::new();
+    for line in appended.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if !value["operation"].is_string() || !value["applied"].is_boolean() {
+            continue;
+        }
+        operation_count = operation_count.saturating_add(1);
+        let error_kind = value.get("error_kind").and_then(Value::as_str);
+        let failed = error_kind.is_some()
+            || value.get("error").is_some_and(|error| !error.is_null());
+        if failed {
+            let kind = sanitized_maintenance_error_kind(error_kind);
+            let count = error_kind_counts.entry(kind).or_insert_with(|| json!(0));
+            *count = json!(count.as_u64().unwrap_or(0).saturating_add(1));
+        }
+    }
+    let comment = if error_kind_counts.is_empty() {
+        "No maintenance operation errors were observed during this cell."
+    } else {
+        "Cell-scoped maintenance errors are counted by sanitized error_kind; raw error text is omitted."
+    };
+    json!({
+        "status": "observed",
+        "cell_scope": "stdout_stderr_append_offsets",
+        "operation_count": operation_count,
+        "error_kind_counts": error_kind_counts,
+        "comment": comment,
+    })
 }
 
 async fn local_process_logs(config: &OatConfig, platform: &LocalPlatform) -> Result<Vec<ProcessLog>> {
@@ -632,11 +701,9 @@ async fn local_process_logs(config: &OatConfig, platform: &LocalPlatform) -> Res
         let mut command = Command::new("docker");
         command.args(["logs", "--tail", "20000", id]);
         let output = run_command(command, "read owned process tuning and commit evidence").await?;
-        let text = format!(
-            "{}\n{}",
-            String::from_utf8(output.stdout)?,
-            String::from_utf8(output.stderr)?
-        );
+        let stdout = String::from_utf8(output.stdout)?;
+        let stderr = String::from_utf8(output.stderr)?;
+        let text = format!("{stdout}\n{stderr}");
         logs.push(ProcessLog {
             role,
             instance_id: id.to_owned(),
@@ -650,6 +717,8 @@ async fn local_process_logs(config: &OatConfig, platform: &LocalPlatform) -> Res
                 .and_then(Value::as_str)
                 .map(str::to_owned),
             complete: text.lines().count() < 20000,
+            stdout,
+            stderr,
             text,
         });
     }
@@ -715,6 +784,8 @@ async fn aks_process_logs(config: &OatConfig) -> Result<Vec<ProcessLog>> {
                 image_id: status["imageID"].as_str().map(str::to_owned),
                 source_revision: None,
                 complete: text.len() < 16777216,
+                stdout: text.clone(),
+                stderr: String::new(),
                 text,
             });
         }
@@ -725,6 +796,42 @@ async fn aks_process_logs(config: &OatConfig) -> Result<Vec<ProcessLog>> {
 #[cfg(test)]
 mod startup_readback_tests {
     use super::*;
+
+    #[test]
+    fn maintenance_outcomes_use_separate_stream_offsets_and_omit_raw_errors() -> Result<()> {
+        let previous = json!({"table":"t","operation":"optimize","applied":true,
+            "error_kind":"previous_failure","error":"private previous error"});
+        let baseline = ProcessLog {
+            role: ComponentRole::Maintenance,
+            instance_id: "maintenance-test".to_owned(),
+            image: None,
+            image_id: None,
+            source_revision: None,
+            complete: true,
+            stdout: format!("{previous}\n"),
+            stderr: "prior stderr\n".to_owned(),
+            text: String::new(),
+        };
+        let current_stdout = json!({"table":"t","operation":"optimize","applied":true,
+            "error_kind":"commit_budget_exhausted","error":"private stdout error"});
+        let current_stderr = json!({"table":"t","operation":"optimize","applied":true,
+            "error_kind":"collision","error":"private stderr error"});
+        let mut current = baseline.clone();
+        current.stdout.push_str(&format!("{current_stdout}\n"));
+        current.stderr.push_str(&format!("{current_stderr}\n"));
+        let evidence = maintenance_cell_outcome_evidence(&current, std::slice::from_ref(&baseline));
+        assert_eq!(evidence["status"], "observed");
+        assert_eq!(evidence["operation_count"], 2);
+        assert_eq!(evidence["error_kind_counts"], json!({"commit_budget_exhausted":1,"collision":1}));
+        assert!(!evidence.to_string().contains("private"));
+
+        current.stderr = "rotated stderr\n".to_owned();
+        let unavailable = maintenance_cell_outcome_evidence(&current, std::slice::from_ref(&baseline));
+        assert_eq!(unavailable["status"], "unavailable");
+        assert!(unavailable["error_kind_counts"].is_null());
+        assert!(unavailable["comment"].as_str().is_some());
+        Ok(())
+    }
 
     #[test]
     fn collector_layout_requires_separate_matching_table_proof_and_never_merges_it_into_startup() -> Result<()> {
@@ -747,6 +854,8 @@ mod startup_readback_tests {
             image_id: None,
             source_revision: None,
             complete: true,
+            stdout: startup.clone(),
+            stderr: String::new(),
             text: startup.clone(),
         };
         assert!(process_evidence(&config, std::slice::from_ref(&log)).is_err());
@@ -833,6 +942,8 @@ mod startup_readback_tests {
         ))?;
         let evidence = process_evidence(&config, &[ProcessLog {
             role: ComponentRole::Collector, instance_id: "collector-test".to_owned(), image: None, image_id: None, source_revision: None, complete: true,
+            stdout: String::new(),
+            stderr: String::new(),
             text: "arrowcol_effective_config {\"runtime\":{\"batch_rows\":8192},\"parquet_writer\":{\"defaults\":{\"compression\":null}}}\n".to_owned(),
         }])?;
         assert_eq!(evidence[0]["effective_config"]["runtime"]["batch_rows"], 8192);
