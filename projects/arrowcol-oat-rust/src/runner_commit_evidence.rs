@@ -163,7 +163,10 @@ fn run_cumulative_output(
     }
     let mut rows = 0_u64;
     let mut commits = 0_u64;
-    for event in events.values().filter(|event| event.table_name.as_deref() == Some(table)) {
+    for event in events
+        .values()
+        .filter(|event| event.table_name.as_deref() == Some(table))
+    {
         if let Some(cell_start) = cell_start_unix_ms {
             let (Some(first), Some(last)) = (event.min_ingested_at_ms, event.max_ingested_at_ms) else {
                 return Ok(json!({
@@ -212,7 +215,10 @@ fn durable_commit_evidence(
 
 fn cell_scoped_commit_logs(current: &[ProcessLog], baseline: &[ProcessLog]) -> Result<(Vec<ProcessLog>, bool)> {
     let mut baseline_by_id = HashMap::new();
-    for log in baseline.iter().filter(|log| matches!(log.role, ComponentRole::Collector)) {
+    for log in baseline
+        .iter()
+        .filter(|log| matches!(log.role, ComponentRole::Collector))
+    {
         if baseline_by_id.insert(log.instance_id.as_str(), log).is_some() {
             bail!("collector process identity is duplicated in the cell baseline");
         }
@@ -220,7 +226,10 @@ fn cell_scoped_commit_logs(current: &[ProcessLog], baseline: &[ProcessLog]) -> R
     let mut current_ids = HashSet::new();
     let mut scoped = Vec::new();
     let mut used_log_offsets = true;
-    for log in current.iter().filter(|log| matches!(log.role, ComponentRole::Collector)) {
+    for log in current
+        .iter()
+        .filter(|log| matches!(log.role, ComponentRole::Collector))
+    {
         if !current_ids.insert(log.instance_id.as_str()) {
             bail!("collector process identity is duplicated in the current snapshot");
         }
@@ -279,10 +288,10 @@ fn durable_commit_evidence_for_cell(
         .iter()
         .filter(|log| matches!(log.role, ComponentRole::Collector))
         .collect::<Vec<_>>();
-    let collector_logs_incomplete = collector_logs.iter().any(|log| !log.complete)
-        || cell_commit_logs.iter().any(|log| !log.complete);
-    let mut unavailable = (collector_logs.is_empty() || cell_commit_logs.is_empty())
-        .then_some("collector_commit_log_unavailable");
+    let collector_logs_incomplete =
+        collector_logs.iter().any(|log| !log.complete) || cell_commit_logs.iter().any(|log| !log.complete);
+    let mut unavailable =
+        (collector_logs.is_empty() || cell_commit_logs.is_empty()).then_some("collector_commit_log_unavailable");
     if collector_logs_incomplete {
         unavailable = Some("collector_commit_log_incomplete");
     }
@@ -297,32 +306,32 @@ fn durable_commit_evidence_for_cell(
     let mut events = std::collections::BTreeMap::new();
     if !collector_logs_incomplete {
         for log in cell_commit_logs {
-        for line in log
-            .text
-            .lines()
-            .filter_map(|line| line.strip_prefix("arrowcol_data_commit "))
-        {
-            let event: CommitEvent = serde_json::from_str(line).context("invalid collector commit event")?;
-            if event.schema_version != 1 {
-                bail!("unsupported collector commit event version");
-            }
-            if event.outcome != "committed" {
-                unavailable = Some("uncertain_commit_version_attribution");
-                continue;
-            }
-            let table_id = event
-                .table_id
-                .as_deref()
-                .filter(|id| id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
-                .context("committed event omitted canonical table hash")?;
-            let version = event.delta_version.context("committed event omitted Delta version")?;
-            let key = (table_id.to_owned(), version);
-            if let Some(previous) = events.insert(key, event.clone())
-                && previous != event
+            for line in log
+                .text
+                .lines()
+                .filter_map(|line| line.strip_prefix("arrowcol_data_commit "))
             {
-                bail!("conflicting evidence for the same Delta commit identity");
+                let event: CommitEvent = serde_json::from_str(line).context("invalid collector commit event")?;
+                if event.schema_version != 1 {
+                    bail!("unsupported collector commit event version");
+                }
+                if event.outcome != "committed" {
+                    unavailable = Some("uncertain_commit_version_attribution");
+                    continue;
+                }
+                let table_id = event
+                    .table_id
+                    .as_deref()
+                    .filter(|id| id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                    .context("committed event omitted canonical table hash")?;
+                let version = event.delta_version.context("committed event omitted Delta version")?;
+                let key = (table_id.to_owned(), version);
+                if let Some(previous) = events.insert(key, event.clone())
+                    && previous != event
+                {
+                    bail!("conflicting evidence for the same Delta commit identity");
+                }
             }
-        }
         }
     }
     if events.values().any(|event| event.table_name.is_none()) {
@@ -414,8 +423,8 @@ fn durable_commit_evidence_for_cell(
     }
     for (table, evidence) in &mut result {
         let canonical_table_name = canonical_dmv_table_name(table)?;
-        let cumulative_unavailable = unavailable.or((!capability_observed)
-            .then_some("ingestion_commit_producer_capability_unavailable"));
+        let cumulative_unavailable =
+            unavailable.or((!capability_observed).then_some("ingestion_commit_producer_capability_unavailable"));
         evidence["output_throughput"] = commit_window_output(
             &events,
             &canonical_table_name,
@@ -513,7 +522,10 @@ mod commit_evidence_tests {
         assert!(table["rows"].is_null());
         assert_eq!(table["unavailable_reason"], "collector_commit_log_incomplete");
         assert!(table["run_cumulative_output"]["rows"].is_null());
-        assert_eq!(table["run_cumulative_output"]["unavailable_reason"], "collector_commit_log_incomplete");
+        assert_eq!(
+            table["run_cumulative_output"]["unavailable_reason"],
+            "collector_commit_log_incomplete"
+        );
         Ok(())
     }
 
@@ -527,7 +539,10 @@ mod commit_evidence_tests {
         current["delta_version"] = json!(9);
         let baseline = log(&[previous]);
         let mut full = baseline.clone();
-        full.text.push_str(&format!("arrowcol_data_commit {}\narrowcol_data_commit {}\n", late_previous, current));
+        full.text.push_str(&format!(
+            "arrowcol_data_commit {}\narrowcol_data_commit {}\n",
+            late_previous, current
+        ));
         let (scoped, used_offsets) = cell_scoped_commit_logs(&[full.clone()], &[baseline])?;
         assert!(used_offsets);
         let evidence = durable_commit_evidence_for_cell(&config, &[full], &scoped, Some((200, 300)), Some(200))?;
@@ -547,7 +562,10 @@ mod commit_evidence_tests {
         let baseline = log(&[previous]);
         let mut current_log = baseline.clone();
         current_log.text = format!("stdout1stdout2\nstderr1stderr2\n{}", current_log.text);
-        current_log.text.push_str(&format!("arrowcol_data_commit {}\narrowcol_data_commit {}\n", late_previous, current));
+        current_log.text.push_str(&format!(
+            "arrowcol_data_commit {}\narrowcol_data_commit {}\n",
+            late_previous, current
+        ));
         let mut baseline_log = baseline;
         baseline_log.text = format!("stdout1\nstderr1\n{}", baseline_log.text);
         let (scoped, used_offsets) = cell_scoped_commit_logs(&[current_log.clone()], &[baseline_log])?;

@@ -13,6 +13,10 @@ struct ProcessLog {
 
 const MAX_RETAINED_PROCESS_LOG_BYTES: usize = 64 * 1024 * 1024;
 
+fn process_log_complete(role: &ComponentRole, text: &str) -> bool {
+    !matches!(role, ComponentRole::Collector) || text.contains("arrowcol_effective_config ")
+}
+
 fn is_process_evidence_line(line: &str) -> bool {
     [
         "arrowcol_effective_config ",
@@ -28,9 +32,7 @@ fn is_process_evidence_line(line: &str) -> bool {
     ]
     .iter()
     .any(|prefix| line.contains(prefix))
-        || (line.trim_start().starts_with('{')
-            && line.contains("\"operation\"")
-            && line.contains("\"applied\""))
+        || (line.trim_start().starts_with('{') && line.contains("\"operation\"") && line.contains("\"applied\""))
 }
 
 fn append_process_evidence_line(
@@ -83,13 +85,17 @@ async fn filtered_process_command_output(mut command: Command, action: &str) -> 
             },
         }
     }
-    let status = child.wait().await.with_context(|| format!("{action}: wait for process"))?;
+    let status = child
+        .wait()
+        .await
+        .with_context(|| format!("{action}: wait for process"))?;
     if !status.success() {
         bail!("{action} failed with {status}");
     }
     Ok((filtered_stdout, filtered_stderr))
 }
 
+#[cfg(test)]
 fn filter_process_evidence_text(text: &str) -> Result<String> {
     let mut filtered = String::new();
     let mut retained_bytes = 0;
@@ -578,11 +584,7 @@ fn process_evidence(config: &OatConfig, logs: &[ProcessLog]) -> Result<Value> {
     process_evidence_for_cell(config, logs, &[])
 }
 
-fn process_evidence_for_cell(
-    config: &OatConfig,
-    logs: &[ProcessLog],
-    baseline_logs: &[ProcessLog],
-) -> Result<Value> {
+fn process_evidence_for_cell(config: &OatConfig, logs: &[ProcessLog], baseline_logs: &[ProcessLog]) -> Result<Value> {
     let mut result = Vec::new();
     for role in [
         ComponentRole::Router,
@@ -683,16 +685,19 @@ fn process_evidence_for_cell(
 }
 
 fn maintenance_cell_outcome_evidence(log: &ProcessLog, baseline_logs: &[ProcessLog]) -> Value {
-    let unavailable = |comment| json!({
-        "status": "unavailable",
-        "cell_scope": "unavailable",
-        "operation_count": null,
-        "error_kind_counts": null,
-        "comment": comment,
-    });
-    let Some(baseline) = baseline_logs.iter().find(|baseline| {
-        baseline.role == ComponentRole::Maintenance && baseline.instance_id == log.instance_id
-    }) else {
+    let unavailable = |comment| {
+        json!({
+            "status": "unavailable",
+            "cell_scope": "unavailable",
+            "operation_count": null,
+            "error_kind_counts": null,
+            "comment": comment,
+        })
+    };
+    let Some(baseline) = baseline_logs
+        .iter()
+        .find(|baseline| baseline.role == ComponentRole::Maintenance && baseline.instance_id == log.instance_id)
+    else {
         return unavailable("No matching maintenance process baseline was available for this cell.");
     };
     if !baseline.complete || !log.complete {
@@ -716,8 +721,7 @@ fn maintenance_cell_outcome_evidence(log: &ProcessLog, baseline_logs: &[ProcessL
         }
         operation_count = operation_count.saturating_add(1);
         let error_kind = value.get("error_kind").and_then(Value::as_str);
-        let failed = error_kind.is_some()
-            || value.get("error").is_some_and(|error| !error.is_null());
+        let failed = error_kind.is_some() || value.get("error").is_some_and(|error| !error.is_null());
         if failed {
             let kind = sanitized_maintenance_error_kind(error_kind);
             let count = error_kind_counts.entry(kind).or_insert_with(|| json!(0));
@@ -789,11 +793,9 @@ async fn local_process_logs(config: &OatConfig, platform: &LocalPlatform) -> Res
         let id = container["Id"].as_str().context("inspected container has no ID")?;
         let mut command = Command::new("docker");
         command.args(["logs", "--tail=-1", id]);
-        let (stdout, stderr) = filtered_process_command_output(
-            command,
-            "read full owned process logs for tuning and commit evidence",
-        )
-        .await?;
+        let (stdout, stderr) =
+            filtered_process_command_output(command, "read full owned process logs for tuning and commit evidence")
+                .await?;
         let text = format!("{stdout}\n{stderr}");
         logs.push(ProcessLog {
             role,
@@ -807,7 +809,7 @@ async fn local_process_logs(config: &OatConfig, platform: &LocalPlatform) -> Res
                 .pointer("/Config/Labels/org.opencontainers.image.revision")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
-            complete: true,
+            complete: process_log_complete(&role, &text),
             stdout,
             stderr,
             text,
@@ -857,14 +859,10 @@ async fn aks_process_logs(config: &OatConfig) -> Result<Vec<ProcessLog>> {
             if let Some(context) = &config.kubectl_context {
                 command.args(["--context", context]);
             }
-            command.args([
-                "logs", pod_name, "--namespace", &config.namespace, "--container", name,
-            ]);
-            let (stdout, stderr) = filtered_process_command_output(
-                command,
-                &format!("read full AKS process logs for {pod_name}/{name}"),
-            )
-            .await?;
+            command.args(["logs", pod_name, "--namespace", &config.namespace, "--container", name]);
+            let (stdout, stderr) =
+                filtered_process_command_output(command, &format!("read full AKS process logs for {pod_name}/{name}"))
+                    .await?;
             let text = format!("{stdout}\n{stderr}");
             logs.push(ProcessLog {
                 role,
@@ -872,7 +870,7 @@ async fn aks_process_logs(config: &OatConfig) -> Result<Vec<ProcessLog>> {
                 image: status["image"].as_str().map(str::to_owned),
                 image_id: status["imageID"].as_str().map(str::to_owned),
                 source_revision: None,
-                complete: true,
+                complete: process_log_complete(&role, &text),
                 stdout,
                 stderr,
                 text,
@@ -911,7 +909,10 @@ mod startup_readback_tests {
         let evidence = maintenance_cell_outcome_evidence(&current, std::slice::from_ref(&baseline));
         assert_eq!(evidence["status"], "observed");
         assert_eq!(evidence["operation_count"], 2);
-        assert_eq!(evidence["error_kind_counts"], json!({"commit_budget_exhausted":1,"collision":1}));
+        assert_eq!(
+            evidence["error_kind_counts"],
+            json!({"commit_budget_exhausted":1,"collision":1})
+        );
         assert!(!evidence.to_string().contains("private"));
 
         current.stderr = "rotated stderr\n".to_owned();
@@ -1013,13 +1014,10 @@ mod startup_readback_tests {
     fn process_log_filter_fails_closed_when_retained_byte_cap_is_exceeded() {
         let mut output = String::new();
         let mut retained_bytes = MAX_RETAINED_PROCESS_LOG_BYTES;
-        assert!(append_process_evidence_line(
-            "arrowcol_data_commit {}",
-            &mut output,
-            &mut retained_bytes,
-            "test log",
-        )
-        .is_err());
+        assert!(
+            append_process_evidence_line("arrowcol_data_commit {}", &mut output, &mut retained_bytes, "test log",)
+                .is_err()
+        );
         assert!(output.is_empty());
     }
 
