@@ -357,7 +357,7 @@ impl RuntimeMetrics {
                 .process_cpu_sampler
                 .lock()
                 .map_err(|_| "process CPU sampler lock is poisoned".to_owned())?
-                .sample(),
+                .sample()?,
         };
         self.cpu_utilization_bps
             .store(u64::from(utilization), Ordering::Release);
