@@ -46,6 +46,17 @@ Collector routing-store SQL remains unpooled; unlike the router's per-request
 authoritative OAT pin reads, its heartbeat/pressure operations are periodic.
 Collector pool tunables are a follow-up, not part of the router pooling evidence.
 
+AKS starts SQL and completes migration before applying workload ConfigMaps,
+Services, NetworkPolicies and the catalog Deployment. Catalog rollout must be
+ready before collector/router Deployments are applied; maintenance remains at
+zero replicas until table pins are established. Rollout permits startup crashes
+below four restarts, fails immediately on image-pull/container-config errors,
+and is bounded by `aks_rollout_timeout_seconds`, including stalled API calls.
+Failures capture bounded current/previous logs and descriptions for every
+workload role, namespace pods/services/endpoints and events before cleanup.
+Teardown logs per-Deployment stop, namespace deletion/absence and QAP/FIC cleanup
+durations; a failed cell's total elapsed time alone cannot identify its slow step.
+
 Functional smoke only (not E1-E5 or Kustainer performance evidence), from the
 repository root in the devcontainer. Rust, Node workspace dependencies and Docker
 Compose are required; image pulls/builds can require registry access. On a

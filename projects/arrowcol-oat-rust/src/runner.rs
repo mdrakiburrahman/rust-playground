@@ -6140,12 +6140,33 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
     arrowcol_router_rust::RouterConfig::from_yaml(router_yaml.as_bytes())
         .context("validate rendered router YAML with the router config validator")?;
     platform.router_yaml = Some(router_yaml);
-    apply_runtime_resources(config, without_identity_resources(workload)).await?;
-    for name in ["arrowcol-catalog", "arrowcol", "arrowcol-router"] {
+    let (catalog, data_plane) = partition_aks_workload_resources(without_identity_resources(workload))?;
+    apply_runtime_resources(config, catalog).await?;
+    rollout(config, "arrowcol-catalog").await?;
+    apply_runtime_resources(config, data_plane).await?;
+    for name in ["arrowcol", "arrowcol-router"] {
         rollout(config, name).await?;
     }
     start_router_metrics_tunnel(config, platform).await?;
     Ok(())
+}
+
+fn partition_aks_workload_resources(resources: Vec<Value>) -> Result<(Vec<Value>, Vec<Value>)> {
+    if resources
+        .iter()
+        .filter(|resource| {
+            resource["kind"] == "Deployment"
+                && resource.pointer("/metadata/name").and_then(Value::as_str) == Some("arrowcol-catalog")
+        })
+        .count()
+        != 1
+    {
+        bail!("AKS workload requires exactly one catalog Deployment before data-plane startup");
+    }
+    Ok(resources.into_iter().partition(|resource| {
+        resource["kind"] != "Deployment"
+            || resource.pointer("/metadata/name").and_then(Value::as_str) == Some("arrowcol-catalog")
+    }))
 }
 
 fn use_operator_cli_identity(command: &mut Command) {
@@ -6873,6 +6894,34 @@ async fn stop_aks_deployment_for_cleanup(
     role: ComponentRole,
     grace_seconds: u64,
 ) -> Result<Value> {
+    timed_aks_cleanup_step(
+        &format!("stop AKS Deployment {deployment_name}"),
+        stop_aks_deployment_until_stopped(config, deployment_name, role, grace_seconds),
+    )
+    .await
+}
+
+async fn timed_aks_cleanup_step<T>(
+    description: &str,
+    operation: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    let started = std::time::Instant::now();
+    eprintln!("[oat] {description}...");
+    let result = operation.await;
+    let seconds = started.elapsed().as_secs_f64();
+    eprintln!(
+        "[oat] {description}: {} ({seconds:.1}s)",
+        if result.is_ok() { "done" } else { "failed" }
+    );
+    result.with_context(|| format!("{description} after {seconds:.1}s"))
+}
+
+async fn stop_aks_deployment_until_stopped(
+    config: &OatConfig,
+    deployment_name: &str,
+    role: ComponentRole,
+    grace_seconds: u64,
+) -> Result<Value> {
     let output = kubectl(
         config,
         vec![
@@ -7245,19 +7294,28 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
                         let namespace_uid = namespace_uid_for_cleanup(&namespace, platform.namespace_uid.as_deref())?;
                         platform.namespace_uid = Some(namespace_uid.clone());
                         let cleanup = async {
-                            delete_run_owned_namespace_with_uid(config, &namespace_uid)
-                                .await
-                                .context("delete run-owned AKS namespace with UID precondition")?;
-                            wait_for_run_owned_namespace_absence(config)
-                                .await
-                                .context("confirm run-owned AKS namespace absence after deletion")?;
+                            timed_aks_cleanup_step(
+                                "delete run-owned AKS namespace",
+                                delete_run_owned_namespace_with_uid(config, &namespace_uid),
+                            )
+                            .await
+                            .context("delete run-owned AKS namespace with UID precondition")?;
+                            timed_aks_cleanup_step(
+                                "wait for run-owned AKS namespace absence",
+                                wait_for_run_owned_namespace_absence(config),
+                            )
+                            .await
+                            .context("confirm run-owned AKS namespace absence after deletion")?;
                             namespace_removed = true;
                             platform.namespace_created = false;
                             platform.namespace_create_attempted = false;
                             platform.namespace_uid = None;
-                            write_workload_stop_receipt(config, platform, &namespace_uid)
-                                .await
-                                .context("write exact-run workload stop receipt")
+                            timed_aks_cleanup_step(
+                                "write exact-run workload stop receipt",
+                                write_workload_stop_receipt(config, platform, &namespace_uid),
+                            )
+                            .await
+                            .context("write exact-run workload stop receipt")
                         };
                         match stop_then_destroy(stop_aks_workloads_in_order(config), cleanup).await {
                             Ok(evidence) => platform.shutdown_drain_evidence = Some(evidence),
@@ -7283,14 +7341,17 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
                         {
                             let cleanup_result = match configured_bootstrap_env_file(config) {
                                 Ok(bootstrap_env_file) => {
-                                    run_oat_qap_helper(
-                                        "cleanup-oat-qap",
-                                        &platform.run_id,
-                                        None,
-                                        None,
-                                        Some(stop_record_path),
-                                        record_path,
-                                        bootstrap_env_file,
+                                    timed_aks_cleanup_step(
+                                        "clean run-owned QAP bindings",
+                                        run_oat_qap_helper(
+                                            "cleanup-oat-qap",
+                                            &platform.run_id,
+                                            None,
+                                            None,
+                                            Some(stop_record_path),
+                                            record_path,
+                                            bootstrap_env_file,
+                                        ),
                                     )
                                     .await
                                 }
@@ -7311,14 +7372,17 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
         if let Some(record_path) = platform.fic_record_path.as_deref() {
             let cleanup_result = match configured_bootstrap_env_file(config) {
                 Ok(bootstrap_env_file) => {
-                    run_run_fic_helper(
-                        "cleanup-run-fic",
-                        &platform.run_id,
-                        None,
-                        None,
-                        record_path,
-                        None,
-                        bootstrap_env_file,
+                    timed_aks_cleanup_step(
+                        "clean run-owned federated credential",
+                        run_run_fic_helper(
+                            "cleanup-run-fic",
+                            &platform.run_id,
+                            None,
+                            None,
+                            record_path,
+                            None,
+                            bootstrap_env_file,
+                        ),
                     )
                     .await
                 }
@@ -7460,6 +7524,28 @@ async fn apply_deployment(config: &OatConfig, mut deployment: Value) -> Result<(
 }
 
 async fn rollout(config: &OatConfig, name: &str) -> Result<()> {
+    let result = tokio::time::timeout(
+        Duration::from_secs(config.aks_rollout_timeout_seconds),
+        rollout_until_ready(config, name),
+    )
+    .await;
+    let result = match result {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
+            "Deployment {name} did not become ready within {} seconds",
+            config.aks_rollout_timeout_seconds
+        )),
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let diagnostics = rollout_failure_diagnostics(config).await;
+            Err(error.context(diagnostics))
+        }
+    }
+}
+
+async fn rollout_until_ready(config: &OatConfig, name: &str) -> Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(config.aks_rollout_timeout_seconds);
     loop {
         let deployment_json = kubectl(
@@ -7551,8 +7637,7 @@ async fn rollout(config: &OatConfig, name: &str) -> Result<()> {
                         .pointer("/metadata/name")
                         .and_then(Value::as_str)
                         .unwrap_or("unknown");
-                    let diagnostics = rollout_failure_diagnostics(config, name, Some(pod_name)).await;
-                    bail!("Deployment {name} pod {pod_name} failed readiness: {reason}\n{diagnostics}");
+                    bail!("Deployment {name} pod {pod_name} failed readiness: {reason}");
                 }
             }
         }
@@ -7561,9 +7646,8 @@ async fn rollout(config: &OatConfig, name: &str) -> Result<()> {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
-            let diagnostics = rollout_failure_diagnostics(config, name, None).await;
             bail!(
-                "Deployment {name} did not become ready within {} seconds\n{diagnostics}",
+                "Deployment {name} did not become ready within {} seconds",
                 config.aks_rollout_timeout_seconds
             );
         }
@@ -7641,13 +7725,7 @@ fn rollout_pod_failure_for_hash(pod: &Value, expected_hash: &str) -> Option<Stri
 }
 
 fn rollout_pod_failure(pod: &Value) -> Option<String> {
-    const FAILURE_REASONS: [&str; 5] = [
-        "CrashLoopBackOff",
-        "Error",
-        "ImagePullBackOff",
-        "ErrImagePull",
-        "CreateContainerConfigError",
-    ];
+    const IMMEDIATE_FAILURE_REASONS: [&str; 3] = ["ImagePullBackOff", "ErrImagePull", "CreateContainerConfigError"];
     for field in [
         "initContainerStatuses",
         "containerStatuses",
@@ -7659,58 +7737,136 @@ fn rollout_pod_failure(pod: &Value) -> Option<String> {
         for status in statuses {
             let container = status.get("name").and_then(Value::as_str).unwrap_or("unknown");
             let restarts = status.get("restartCount").and_then(Value::as_u64).unwrap_or(0);
-            if restarts >= 2 {
-                return Some(format!("container {container} restarted {restarts} times"));
-            }
             for path in ["/state/waiting/reason", "/state/terminated/reason"] {
                 if let Some(reason) = status
                     .pointer(path)
                     .and_then(Value::as_str)
-                    .filter(|reason| FAILURE_REASONS.contains(reason))
+                    .filter(|reason| IMMEDIATE_FAILURE_REASONS.contains(reason))
                 {
                     return Some(format!("container {container} entered {reason}"));
                 }
+            }
+            if restarts >= 4 && status.get("ready").and_then(Value::as_bool) != Some(true) {
+                return Some(format!(
+                    "container {container} restarted {restarts} times without becoming ready"
+                ));
             }
         }
     }
     None
 }
 
-async fn rollout_failure_diagnostics(config: &OatConfig, deployment: &str, pod: Option<&str>) -> String {
-    let mut details = Vec::new();
-    if let Some(pod) = pod {
-        let logs = kubectl(
-            config,
+fn rollout_diagnostic_commands(config: &OatConfig) -> Vec<(String, Vec<String>)> {
+    let mut commands = vec![
+        (
+            "namespace pods/services/endpoints".to_owned(),
             vec![
-                "logs",
-                pod,
-                "--namespace",
-                &config.namespace,
-                "--all-containers=true",
-                "--previous",
+                "get".to_owned(),
+                "pods,svc,endpoints".to_owned(),
+                "-o".to_owned(),
+                "wide".to_owned(),
             ],
-            None,
-        )
-        .await
-        .unwrap_or_else(|error| format!("could not read previous pod logs: {error:#}"));
-        details.push(format!("kubectl logs --previous:\n{logs}"));
-        let description = kubectl(
-            config,
-            vec!["describe", "pod", pod, "--namespace", &config.namespace],
-            None,
-        )
-        .await
-        .unwrap_or_else(|error| format!("could not describe pod: {error:#}"));
-        details.push(format!("kubectl describe pod:\n{description}"));
+        ),
+        (
+            "namespace events".to_owned(),
+            vec![
+                "get".to_owned(),
+                "events".to_owned(),
+                "-o".to_owned(),
+                "wide".to_owned(),
+            ],
+        ),
+    ];
+    let mut deployments = BTreeSet::from([
+        "arrowcol-catalog".to_owned(),
+        "arrowcol-sql".to_owned(),
+        "arrowcol-router".to_owned(),
+        "arrowcol".to_owned(),
+        config.arrowcol_deployment.clone(),
+        config.dfe_deployment.clone(),
+    ]);
+    if maintenance_enabled(config) {
+        deployments.insert("delta-maintenance".to_owned());
     }
-    let description = kubectl(
-        config,
-        vec!["describe", "deployment", deployment, "--namespace", &config.namespace],
-        None,
+    for deployment in deployments {
+        let selector = format!("app={deployment}");
+        commands.push((
+            format!("Deployment {deployment}"),
+            vec!["describe".to_owned(), "deployment".to_owned(), deployment.clone()],
+        ));
+        commands.push((
+            format!("Deployment {deployment}: all pods"),
+            vec![
+                "describe".to_owned(),
+                "pods".to_owned(),
+                "--selector".to_owned(),
+                selector.clone(),
+            ],
+        ));
+        for previous in [false, true] {
+            let mut args = vec![
+                "logs".to_owned(),
+                "--selector".to_owned(),
+                selector.clone(),
+                "--all-containers=true".to_owned(),
+                "--prefix=true".to_owned(),
+                "--tail=200".to_owned(),
+                "--limit-bytes=65536".to_owned(),
+            ];
+            if previous {
+                args.push("--previous".to_owned());
+            }
+            commands.push((
+                format!(
+                    "Deployment {deployment}: {} logs (bounded diagnostic tail)",
+                    if previous { "previous" } else { "current" }
+                ),
+                args,
+            ));
+        }
+    }
+    commands
+}
+
+async fn rollout_failure_diagnostics(config: &OatConfig) -> String {
+    let details = join_all(
+        rollout_diagnostic_commands(config)
+            .into_iter()
+            .map(|(label, args)| async move {
+                let mut command = Command::new("kubectl");
+                if let Some(context) = &config.kubectl_context {
+                    command.args(["--context", context]);
+                }
+                command
+                    .args(["--request-timeout=5s", "--namespace", &config.namespace])
+                    .args(args);
+                command.kill_on_drop(true);
+                let output = match tokio::time::timeout(Duration::from_secs(10), command.output()).await {
+                    Ok(Ok(output)) => format!(
+                        "exit={}\n{}\n{}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    ),
+                    Ok(Err(error)) => format!("diagnostic command unavailable: {error}"),
+                    Err(_) => "diagnostic command exceeded 10-second deadline".to_owned(),
+                };
+                let mut boundary = output.len().min(65_536);
+                while !output.is_char_boundary(boundary) {
+                    boundary -= 1;
+                }
+                format!(
+                    "{label}:\n{}{}",
+                    &output[..boundary],
+                    if boundary < output.len() {
+                        "\n[diagnostic truncated at retained-byte cap]"
+                    } else {
+                        ""
+                    }
+                )
+            }),
     )
-    .await
-    .unwrap_or_else(|error| format!("could not describe Deployment: {error:#}"));
-    details.push(format!("kubectl describe deployment:\n{description}"));
+    .await;
     details.join("\n")
 }
 
@@ -8442,7 +8598,7 @@ mod tests {
         assert!(super::rollout_pod_failure_for_hash(&terminating, "current-hash").is_none());
         let new_crash = serde_json::json!({
             "metadata":{"labels":{"pod-template-hash":"current-hash"}},
-            "status":{"containerStatuses":[{"name":"router","restartCount":0,
+            "status":{"containerStatuses":[{"name":"router","restartCount":4,
                 "state":{"waiting":{"reason":"CrashLoopBackOff"}}}]}
         });
         assert!(super::rollout_pod_failure_for_hash(&new_crash, "current-hash").is_some());
@@ -8450,13 +8606,7 @@ mod tests {
 
     #[test]
     fn rollout_pod_failure_detects_expected_states_and_restart_threshold() {
-        for reason in [
-            "CrashLoopBackOff",
-            "Error",
-            "ImagePullBackOff",
-            "ErrImagePull",
-            "CreateContainerConfigError",
-        ] {
+        for reason in ["ImagePullBackOff", "ErrImagePull", "CreateContainerConfigError"] {
             let pod = serde_json::json!({"status":{"containerStatuses":[{
                 "name":"dataflow","restartCount":0,"state":{"waiting":{"reason":reason}}
             }]}});
@@ -8466,11 +8616,25 @@ mod tests {
         let terminated = serde_json::json!({"status":{"initContainerStatuses":[{
             "name":"setup","restartCount":0,"state":{"terminated":{"reason":"Error"}}
         }]}});
-        assert!(super::rollout_pod_failure(&terminated).is_some());
+        assert!(super::rollout_pod_failure(&terminated).is_none());
         let restarted = serde_json::json!({"status":{"containerStatuses":[{
             "name":"dataflow","restartCount":2,"state":{"running":{}}
         }]}});
-        assert!(super::rollout_pod_failure(&restarted).is_some_and(|failure| failure.contains("restarted 2 times")));
+        assert!(super::rollout_pod_failure(&restarted).is_none());
+        for restarts in 0..4 {
+            let recovering = serde_json::json!({"status":{"containerStatuses":[{
+                "name":"dataflow","restartCount":restarts,"state":{"waiting":{"reason":"CrashLoopBackOff"}}
+            }]}});
+            assert!(super::rollout_pod_failure(&recovering).is_none());
+        }
+        let persistent = serde_json::json!({"status":{"containerStatuses":[{
+            "name":"router","restartCount":4,"ready":false,"state":{"waiting":{"reason":"CrashLoopBackOff"}}
+        }]}});
+        assert!(super::rollout_pod_failure(&persistent).is_some_and(|failure| failure.contains("restarted 4 times")));
+        let recovered = serde_json::json!({"status":{"containerStatuses":[{
+            "name":"router","restartCount":4,"ready":true,"state":{"running":{}}
+        }]}});
+        assert!(super::rollout_pod_failure(&recovered).is_none());
         let healthy = serde_json::json!({"status":{"containerStatuses":[{
             "name":"dataflow","restartCount":1,"state":{"running":{}}
         }]}});
@@ -8487,6 +8651,86 @@ mod tests {
     }
 
     use super::*;
+
+    #[tokio::test]
+    async fn rendered_aks_workload_waits_for_catalog_before_starting_data_plane() -> Result<()> {
+        let directory = std::env::temp_dir().join(format!("oat-rollout-order-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory)?;
+        let result = async {
+            let images = ["sqlserver", "catalog", "router", "dataflow", "maintenance"].into_iter().map(|role| {
+                (role.to_owned(), json!(format!("arrowcollector89152.azurecr.io/{role}@sha256:{}", "a".repeat(64))))
+            }).collect::<serde_json::Map<_, _>>();
+            let input = json!({
+                "namespace": "fixture-owned", "oatRunId": "00000000-0000-0000-0000-000000000003",
+                "workloadIdentityClientId": "00000000-0000-0000-0000-000000000001",
+                "subscriptionId": "00000000-0000-0000-0000-000000000002", "stamp": "89152",
+                "deltaRoot": "abfss://onelake@arrowcollector89152.dfs.core.windows.net/dataflow", "images": images,
+                "maintenance": {"tables": ["telemetry.sqlserver.sqlserver_active_sessions"], "operations": ["optimize"], "apply": false},
+            });
+            let input_path = directory.join("runtime.json");
+            fs::write(&input_path, serde_json::to_vec(&input)?)?;
+            let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../arrowcol-oat/runtime.ts");
+            let output_path = directory.join("workload.json");
+            let mut command = Command::new("npx");
+            command.current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."));
+            command.args(["--no-install", "tsx"]).arg(&script).arg("render")
+                .arg(&input_path).arg("workload").arg(&output_path);
+            run_command(command, "render workload from the real runtime author").await?;
+            let list: Value = serde_json::from_slice(&fs::read(output_path)?)?;
+            let rendered = list["items"].as_array().context("rendered workload items missing")?.clone();
+            let original_len = rendered.len();
+            let (first, second) = partition_aks_workload_resources(rendered)?;
+            assert_eq!(first.len() + second.len(), original_len);
+            assert_eq!(first.iter().filter(|resource| resource["kind"] == "Deployment").map(|resource| resource["metadata"]["name"].as_str()).collect::<Vec<_>>(), [Some("arrowcol-catalog")]);
+            for kind in ["ConfigMap", "Service", "NetworkPolicy"] {
+                assert!(first.iter().any(|resource| resource["kind"] == kind));
+                assert!(!second.iter().any(|resource| resource["kind"] == kind));
+            }
+            assert_eq!(second.iter().map(|resource| resource["metadata"]["name"].as_str()).collect::<BTreeSet<_>>(),
+                BTreeSet::from([Some("arrowcol"), Some("arrowcol-router"), Some("delta-maintenance")]));
+            assert!(second.iter().all(|resource| resource["kind"] == "Deployment"));
+            let worker = second.iter().find(|resource| resource["metadata"]["name"] == "delta-maintenance").context("rendered maintenance missing")?;
+            assert_eq!(worker["spec"]["replicas"], 0);
+            assert!(partition_aks_workload_resources(second).is_err());
+            Ok(())
+        }.await;
+        fs::remove_dir_all(directory)?;
+        result
+    }
+
+    #[test]
+    fn rollout_diagnostics_cover_all_workload_pods_and_namespace_network_state() -> Result<()> {
+        let config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.example.json"
+        ))?;
+        let commands = rollout_diagnostic_commands(&config);
+        assert!(
+            commands
+                .iter()
+                .any(|(_, args)| args.iter().any(|arg| arg == "pods,svc,endpoints"))
+        );
+        assert!(commands.iter().any(|(_, args)| args.iter().any(|arg| arg == "events")));
+        for deployment in ["arrowcol-sql", "arrowcol-catalog", "arrowcol-router", "arrowcol"] {
+            let selector = format!("app={deployment}");
+            assert!(
+                commands
+                    .iter()
+                    .any(|(_, args)| args.first().is_some_and(|arg| arg == "describe")
+                        && args.iter().any(|arg| arg == &selector))
+            );
+            for previous in [false, true] {
+                assert!(commands.iter().any(|(label, args)| {
+                    label.contains(deployment)
+                        && args.first().is_some_and(|arg| arg == "logs")
+                        && args.iter().any(|arg| arg == &selector)
+                        && args.iter().any(|arg| arg == "--previous") == previous
+                        && args.iter().any(|arg| arg == "--all-containers=true")
+                        && args.iter().any(|arg| arg == "--tail=200")
+                }));
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn run_fic_helper_uses_operator_cli_identity_for_every_phase() -> Result<()> {
@@ -9028,6 +9272,32 @@ mod tests {
         let evidence = stop_aks_deployment_for_cleanup(&config, "fixture", ComponentRole::Collector, 30).await?;
         assert_eq!(evidence["processes"][0]["exit_outcome"]["status"], "unavailable");
         assert_eq!(evidence["processes"][0]["drain"]["exit_code"], Value::Null);
+        fs::write(fixture.join("mode"), "rollout_recovers")?;
+        config.aks_rollout_timeout_seconds = 30;
+        rollout(&config, "fixture").await?;
+        fs::write(fixture.join("mode"), "rollout_persistent")?;
+        let started = std::time::Instant::now();
+        let failure = rollout(&config, "fixture")
+            .await
+            .err()
+            .context("persistent crash must fail")?;
+        let detail = format!("{failure:#}");
+        assert!(detail.contains("restarted 4 times"));
+        assert!(detail.contains("namespace pods/services/endpoints"));
+        assert!(detail.contains("namespace events"));
+        for role in ["arrowcol-catalog", "arrowcol-router", "arrowcol-sql", "arrowcol"] {
+            assert!(detail.contains(&format!("Deployment {role}: previous logs")));
+        }
+        assert!(started.elapsed() < Duration::from_secs(15));
+        fs::write(fixture.join("mode"), "rollout_hang")?;
+        config.aks_rollout_timeout_seconds = 1;
+        let started = std::time::Instant::now();
+        let failure = rollout(&config, "fixture")
+            .await
+            .err()
+            .context("hung API request must time out")?;
+        assert!(format!("{failure:#}").contains("did not become ready within 1 seconds"));
+        assert!(started.elapsed() < Duration::from_secs(15));
         Ok(())
     }
 

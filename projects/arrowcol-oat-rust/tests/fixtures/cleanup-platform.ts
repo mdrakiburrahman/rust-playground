@@ -46,18 +46,40 @@ if (args.includes('proxy')) {
   else if (!args.includes('--ignore-not-found=true')) fail('unexpected missing namespace');
 } else if (args.includes('get') && args.includes('deployment')) {
   if (mode === 'stop_failure') fail('fixture deployment stop failed');
-  if (mode === 'absent_deployment') {
+  if (mode === 'rollout_hang') {
+    setInterval(() => {}, 1000);
+  } else if (mode === 'absent_deployment') {
     if (!args.includes('--ignore-not-found')) fail('NotFound');
   } else {
+    const rollout = mode.startsWith('rollout_');
+    const recovering = mode === 'rollout_recovers';
+    const ready = recovering && existsSync(join(root, 'deployment-read'));
+    if (recovering) writeFileSync(join(root, 'deployment-read'), '');
     console.log(JSON.stringify({
-      metadata: { generation: 1 },
-      spec: { replicas: 0, selector: { matchLabels: { app: 'fixture' } } },
-      status: { replicas: 0, observedGeneration: 1 },
+      metadata: { name: 'fixture', uid: 'fixture-deployment', generation: 1,
+        annotations: { 'deployment.kubernetes.io/revision': '1' } },
+      spec: { replicas: rollout ? 1 : 0, selector: { matchLabels: { app: 'fixture' } } },
+      status: { replicas: rollout ? 1 : 0, updatedReplicas: rollout ? 1 : 0,
+        availableReplicas: ready ? 1 : 0, observedGeneration: 1 },
     }));
   }
+} else if (args.includes('get') && args.includes('replicasets')) {
+  console.log(JSON.stringify({ items: [{
+    metadata: { annotations: { 'deployment.kubernetes.io/revision': '1' },
+      ownerReferences: [{ kind: 'Deployment', name: 'fixture', uid: 'fixture-deployment' }] },
+    spec: { selector: { matchLabels: { 'pod-template-hash': 'fixture-hash' } } },
+  }] }));
 } else if (args.includes('get') && args.includes('pods')) {
   const marker = join(root, 'pods-read');
-  if (existsSync(marker)) console.log('{"items":[]}');
+  if (mode.startsWith('rollout_')) {
+    console.log(JSON.stringify({ items: [{
+      metadata: { name: 'fixture-pod', labels: { 'pod-template-hash': 'fixture-hash' } },
+      status: { containerStatuses: [{
+        name: 'dataflow', restartCount: mode === 'rollout_persistent' ? 4 : 1,
+        ready: false, state: { waiting: { reason: 'CrashLoopBackOff' } },
+      }] },
+    }] }));
+  } else if (existsSync(marker)) console.log('{"items":[]}');
   else {
     writeFileSync(marker, '');
     console.log(JSON.stringify({ items: [{
