@@ -1001,12 +1001,37 @@ fn collector_shutdown_drain_evidence(
     result
 }
 
+fn parse_compose_duration_seconds(value: &str) -> Option<u64> {
+    let mut total = 0_u64;
+    let mut number = 0_u64;
+    let mut has_number = false;
+    for character in value.chars() {
+        if let Some(digit) = character.to_digit(10) {
+            number = number.checked_mul(10)?.checked_add(u64::from(digit))?;
+            has_number = true;
+            continue;
+        }
+        let multiplier = match character {
+            'h' => 3_600,
+            'm' => 60,
+            's' => 1,
+            _ => return None,
+        };
+        if !has_number {
+            return None;
+        }
+        total = total.checked_add(number.checked_mul(multiplier)?)?;
+        number = 0;
+        has_number = false;
+    }
+    (!has_number).then_some(total)
+}
+
 fn verify_local_collector_stop_grace(compose_config: &Value, expected_seconds: u64) -> Result<()> {
     let actual = compose_config
         .pointer("/services/dataflow-1/stop_grace_period")
         .and_then(Value::as_str)
-        .and_then(|value| value.strip_suffix('s'))
-        .and_then(|value| value.parse::<u64>().ok())
+        .and_then(parse_compose_duration_seconds)
         .context("effective local Compose config omitted the collector stop_grace_period")?;
     if actual != expected_seconds {
         bail!("effective local Compose collector stop grace differs from requested value");
@@ -1208,10 +1233,13 @@ mod startup_readback_tests {
 
     #[test]
     fn local_collector_stop_grace_readback_requires_exact_value() -> Result<()> {
-        let compose = json!({"services":{"dataflow-1":{"stop_grace_period":"300s"}}});
+        let compose = json!({"services":{"dataflow-1":{"stop_grace_period":"5m0s"}}});
         verify_local_collector_stop_grace(&compose, 300)?;
         assert!(verify_local_collector_stop_grace(&compose, 301).is_err());
         assert!(verify_local_collector_stop_grace(&json!({"services":{}}), 300).is_err());
+        assert_eq!(parse_compose_duration_seconds("30s"), Some(30));
+        assert_eq!(parse_compose_duration_seconds("1h0m0s"), Some(3_600));
+        assert_eq!(parse_compose_duration_seconds("invalid"), None);
         Ok(())
     }
 
